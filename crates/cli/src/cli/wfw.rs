@@ -83,6 +83,7 @@ fn firings_from_items(items: &[WaitItem]) -> Vec<HookFiring> {
             WaitItem::Idle { .. }
             | WaitItem::AdHocReview { .. }
             | WaitItem::AdHocRevise { .. }
+            | WaitItem::FixCommitTag { .. }
             | WaitItem::PromoteFromQueue { .. }
             | WaitItem::Blocked { .. }
             | WaitItem::Unblocked { .. }
@@ -94,6 +95,21 @@ fn firings_from_items(items: &[WaitItem]) -> Vec<HookFiring> {
             | WaitItem::PrMaster { .. } => None,
         })
         .collect()
+}
+
+/// HEAD-tag fixup for master (adhoc-commits-and-plan-tag-validation):
+/// reads HEAD's subject and returns a `FixCommitTag` item if it's
+/// tagged for a non-active plan (adopted-gated, HEAD-only). All the
+/// policy lives in `clank_core::wait::head_tag_fixup`; this just feeds
+/// it the live HEAD subject.
+fn master_head_fixup(
+    repo: &Path,
+    state: &crate::repo_state::RepoState,
+) -> Option<clank_core::wait::WaitItem> {
+    let head = state.head.as_ref()?;
+    let subject = crate::git_io::commit_subject(repo, head).unwrap_or_default();
+    let known: std::collections::BTreeSet<PlanKey> = state.fold.plans.keys().cloned().collect();
+    clank_core::wait::head_tag_fixup(state.fold.adopted, head, &subject, &known)
 }
 
 pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
@@ -186,6 +202,16 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
             // an idle reviewer via the `!items.is_empty()` gate below
             // for nothing (`finish-does-not-wake-reviewers`).
             if role == Role::Master {
+                // A mistyped HEAD tag preempts everything: master must
+                // fix the commit message before continuing
+                // (adhoc-commits-and-plan-tag-validation).
+                if let Some(fixup) = master_head_fixup(&repo, &initial_state) {
+                    for firing in &firings_from_items(std::slice::from_ref(&fixup)) {
+                        hook_config::run_hook(&repo, &hook_config, firing);
+                    }
+                    emit(std::slice::from_ref(&fixup), args.json);
+                    return Ok(());
+                }
                 items.extend(detect_finished(&snapshot, &initial_state.fold));
             }
             if !items.is_empty() {
@@ -340,6 +366,13 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
             // initial-pass rationale above
             // (`finish-does-not-wake-reviewers`).
             if role == Role::Master {
+                if let Some(fixup) = master_head_fixup(&repo, &state) {
+                    for firing in &firings_from_items(std::slice::from_ref(&fixup)) {
+                        hook_config::run_hook(&repo, &hook_config, firing);
+                    }
+                    emit(std::slice::from_ref(&fixup), args.json);
+                    return Ok(());
+                }
                 items.extend(detect_finished(&snapshot, &state.fold));
             }
             if !items.is_empty() {
@@ -531,6 +564,11 @@ fn render_json(item: &WaitItem) -> serde_json::Value {
             "kind": "adhoc_revise",
             "sha": sha.as_str(),
         }),
+        WaitItem::FixCommitTag { sha, unknown } => serde_json::json!({
+            "kind": "fix_commit_tag",
+            "sha": sha.as_str(),
+            "unknown": unknown,
+        }),
         WaitItem::PromoteFromQueue { name, priority } => serde_json::json!({
             "kind": "promote_from_queue",
             "name": name,
@@ -603,6 +641,12 @@ fn render_human(item: &WaitItem) -> String {
             format!("adhoc-review  {}  write feedback", short(sha),)
         }
         WaitItem::AdHocRevise { sha } => format!("adhoc-revise  {}  address changes", short(sha)),
+        WaitItem::FixCommitTag { sha, unknown } => format!(
+            "fix-commit-tag  {}  [{}] names no active plan — amend to a real \
+             plan tag, or drop the tag (no tag = ad-hoc)",
+            short(sha),
+            unknown.join(",")
+        ),
         WaitItem::PromoteFromQueue { name, priority } => {
             format!("promote  {name}  (priority {priority:03})")
         }

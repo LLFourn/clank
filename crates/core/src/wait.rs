@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use crate::ids::{AgentLabel, CommitSha, PlanKey};
 use crate::plan_view::{PlanBlock, WaitingOn};
 use crate::repo_state::RepoState;
+use crate::repo_state::{TitlePrefix, parse_title_prefix};
 use crate::vocab::{Role, WaitingReason};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,6 +94,15 @@ pub enum WaitItem {
     AdHocRevise {
         sha: CommitSha,
     },
+    /// Master's HEAD commit is tagged `[unknown]` — a plan prefix that
+    /// names no active plan. Master must amend the message to a real
+    /// plan tag, or drop the tag (no tag = ad-hoc). HEAD-only, and only
+    /// when the repo is adopted (adhoc-commits-and-plan-tag-validation).
+    FixCommitTag {
+        sha: CommitSha,
+        /// The `[...]` names that aren't active plans.
+        unknown: Vec<String>,
+    },
     PromoteFromQueue {
         name: String,
         priority: u16,
@@ -122,6 +132,49 @@ pub enum WaitItem {
         round: u64,
         next: PrMasterNext,
     },
+}
+
+/// HEAD-only plan-tag check (adhoc-commits-and-plan-tag-validation).
+/// If the commit master just made carries a `[tag]` naming a plan that
+/// isn't active, return the fixup item so `wfw` nags master to amend
+/// the message (or drop the tag — no tag = ad-hoc). Returns `None`
+/// when:
+/// - the repo isn't `adopted` (clank is a local guest on a repo whose
+///   `.clank` isn't committed — never police its commit conventions),
+/// - HEAD is untagged, or
+/// - every name in HEAD's tag is an active plan.
+///
+/// HEAD-only by design: history is tolerated; mistakes are caught when
+/// made. Host conventions (`[app]`/`[ci]`) are ancestors, never the
+/// commit master just made, so they never trip this.
+pub fn head_tag_fixup(
+    adopted: bool,
+    head_sha: &CommitSha,
+    head_subject: &str,
+    known_plans: &BTreeSet<PlanKey>,
+) -> Option<WaitItem> {
+    if !adopted {
+        return None;
+    }
+    let Some(TitlePrefix::Plans(names)) = parse_title_prefix(head_subject) else {
+        return None;
+    };
+    let unknown: Vec<String> = names
+        .into_iter()
+        .filter(|n| {
+            PlanKey::parse(n)
+                .map(|k| !known_plans.contains(&k))
+                .unwrap_or(true)
+        })
+        .collect();
+    if unknown.is_empty() {
+        None
+    } else {
+        Some(WaitItem::FixCommitTag {
+            sha: head_sha.clone(),
+            unknown,
+        })
+    }
 }
 
 /// Snapshot taken once at `wfw` startup. `detect_finished` compares
@@ -870,6 +923,31 @@ mod tests {
     }
     fn label(s: &str) -> AgentLabel {
         AgentLabel::parse(s).unwrap()
+    }
+
+    #[test]
+    fn head_tag_fixup_flags_unknown_tag_only_when_adopted() {
+        let known: BTreeSet<PlanKey> = std::iter::once(plan("foo")).collect();
+        let h = sha("aaaa");
+
+        // Unknown tag on an adopted repo → fixup naming the bad tag.
+        assert!(matches!(
+            head_tag_fixup(true, &h, "[bar] work", &known),
+            Some(WaitItem::FixCommitTag { unknown, .. }) if unknown == vec!["bar".to_string()]
+        ));
+        // `[misc]` is no longer special — it's just an unknown tag.
+        assert!(head_tag_fixup(true, &h, "[misc] one-off", &known).is_some());
+        // Known active plan → no fixup.
+        assert!(head_tag_fixup(true, &h, "[foo] work", &known).is_none());
+        // No tag → ad-hoc, fine.
+        assert!(head_tag_fixup(true, &h, "just code", &known).is_none());
+        // NOT adopted (local-guest repo) → never police, even on `[bar]`.
+        assert!(head_tag_fixup(false, &h, "[bar] work", &known).is_none());
+        // Multi-tag with one unknown → flag only the unknown name.
+        assert!(matches!(
+            head_tag_fixup(true, &h, "[foo,bar] x", &known),
+            Some(WaitItem::FixCommitTag { unknown, .. }) if unknown == vec!["bar".to_string()]
+        ));
     }
 
     fn entry(verdict: crate::vocab::Verdict, who: &str) -> ReviewEntry {
