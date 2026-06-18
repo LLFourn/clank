@@ -589,15 +589,24 @@ async fn recent_log_rows(repo: &Path, state: &RepoState) -> Vec<crate::cli::log:
     crate::cli::log::oneline_rows(&newest_first, &reviews)
 }
 
-/// Decides which filesystem events wake the status loops. Wakes on:
-/// anything under `.clank/` (feedback/queue/agent state are load-
-/// bearing wake sources even though gitignored); anything under the
-/// git dir (HEAD moves, ref updates, checkpoint-adjacent churn);
-/// any `.gitignore` change (which also refreshes the matcher); and
-/// any worktree path the gitignore rules do NOT match. Drops
-/// gitignore-matched worktree paths — a `cargo build` writing
-/// thousands of `target/` files says nothing about clank state or
-/// worktree dirt.
+/// Decides which filesystem events wake the status loops. This is an
+/// ALLOWLIST, not "anything under `.clank`" (status-tui-watch-cpu):
+/// wakes on
+/// - the workflow-state signal dirs under `.clank` ([`CLANK_WAKE_DIRS`]:
+///   plans/queue/blocks/agents/finished/config) — feedback/queue/agent
+///   state are load-bearing even though gitignored;
+/// - anything under the git dir (HEAD moves, ref updates);
+/// - any `.gitignore` change (which also refreshes the matcher);
+/// - any worktree path the gitignore rules do NOT match (keeps
+///   `dirty:` fresh on tracked edits).
+///
+/// It deliberately does NOT wake on the rest of `.clank`: the derived
+/// fold `cache`, generated `html`, the `zellij` layout, and — the big
+/// one — nested worktrees under `.clank/worktrees/<name>/`, which are
+/// whole separate repos whose builds + caches would otherwise wake
+/// this pane. Gitignore-matched worktree paths (`target/`, `*.log`)
+/// are dropped too — a `cargo build`'s thousands of `target/` files
+/// say nothing about clank state or worktree dirt.
 ///
 /// The matcher anchors at the repo root's `.gitignore` (plus
 /// `.git/info/exclude`); nested `.gitignore` files aren't modeled —
