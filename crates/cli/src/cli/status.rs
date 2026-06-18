@@ -561,7 +561,12 @@ async fn recent_log_rows(repo: &Path, state: &RepoState) -> Vec<crate::cli::log:
     let filtered: Vec<&LogEvent> = events
         .iter()
         .filter(|e| match e {
-            LogEvent::AdHoc { .. } => plan_filter.is_none(),
+            // Ad-hoc commits are real, uncategorized activity — always
+            // show them (show-adhoc-commits-in-status). Only the PLAN
+            // timeline is narrowed to the single active plan; dropping
+            // ad-hoc here made `status` look idle while ad-hoc work
+            // (e.g. `[non-plan-tag]` commits) piled up.
+            LogEvent::AdHoc { .. } => true,
             LogEvent::PlanIntro { plan, .. }
             | LogEvent::PlanCommit { plan, .. }
             | LogEvent::PlanFinalized { plan, .. }
@@ -1136,6 +1141,54 @@ mod dirty_and_wake_tests {
         git(r, &["add", "-A"]);
         git(r, &["commit", "--quiet", "-m", "base"]);
         dir
+    }
+
+    #[tokio::test]
+    async fn status_shows_adhoc_commits_with_one_active_plan() {
+        // show-adhoc-commits-in-status (reproduce-first): with exactly
+        // ONE active plan, recent_log_rows auto-applied a single-plan
+        // filter that DROPPED ad-hoc events. An ad-hoc commit (no
+        // `[plan]` tag) must still appear in the status log.
+        let dir = fixture_repo();
+        let r = dir.path();
+        // Plan intro → adopts the repo AND makes `foo` the lone active
+        // plan (so the single-plan filter engages).
+        std::fs::create_dir_all(r.join(".clank/plans")).unwrap();
+        std::fs::write(r.join(".clank/plans/foo.md"), "# foo\n").unwrap();
+        git(r, &["add", "-A"]);
+        git(r, &["commit", "--quiet", "-m", "[foo] intro"]);
+        // Post-adoption ad-hoc commit. Tagged `[bar]` — a NON-plan tag
+        // (no `.clank/plans/bar.md`), which is what makes it ad-hoc
+        // rather than inherited into `foo` via the active-plan hint
+        // (this is exactly the real `[animations]` case). `foo` stays
+        // the lone active plan, so the single-plan filter engages.
+        std::fs::write(r.join("scratch.txt"), "scratch\n").unwrap();
+        git(r, &["add", "-A"]);
+        git(r, &["commit", "--quiet", "-m", "[bar] sketch the thing"]);
+
+        let snap = StatusSnapshot::build_async(
+            r,
+            "repo",
+            None,
+            crate::rebuild::CachePolicy::Bypass,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let subjects: Vec<&str> = snap
+            .log_rows
+            .iter()
+            .filter_map(|row| match row {
+                crate::cli::log::OnelineRow::Commit { subject, .. } => Some(subject.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            subjects.iter().any(|s| s.contains("sketch the thing")),
+            "ad-hoc commit must appear in status log even with one active plan; got subjects: {subjects:?}"
+        );
     }
 
     #[test]

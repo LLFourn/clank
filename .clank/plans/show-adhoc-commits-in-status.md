@@ -17,10 +17,15 @@ LogEvent::PlanIntro/Commit/Finalized/Deleted { plan, .. }
 
 Observed in `frostsnap`'s `device-prompt-animations` worktree: the only
 active plan is `device-look-animation`, but the real work landed as
-`[animations]`-tagged commits (ad-hoc, since `animations` is not a
-plan). `clank status` therefore shows none of it — the pane looks idle
-while real work piles up. `clank log` has no such filter and shows them,
-confirming the status filter is the cause.
+`[animations]`-tagged commits — ad-hoc, since `animations` is not a
+plan, so they aren't inherited into `device-look-animation` via the
+active-plan hint. `clank status` therefore shows none of it — the pane
+looks idle while real work piles up. `clank log` applies the SAME
+filter (log.rs:51) but only under an explicit `--plan`; with no
+`--plan` it shows them — so the bug is `status` AUTO-applying the
+single-plan filter, which `log` never does by default. (Out of scope:
+whether `log --plan foo` should also stop dropping ad-hoc — that's an
+explicit scope request, left as-is.)
 
 ## Fix
 
