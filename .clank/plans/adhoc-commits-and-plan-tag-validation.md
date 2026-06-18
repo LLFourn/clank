@@ -14,28 +14,57 @@ commit after a plan's intro is currently attributed to that plan). It
 also subsumes the earlier `[misc]` idea — the ad-hoc opt-in is simply
 *not tagging*, so there's no special tag to add.
 
-## Part 1 — fold: the tag is the association (drop hint-inheritance)
+## Part 1 — collapse the classifier (strip the inheritance + ambiguity machinery)
 
-Change `apply_commit` (clank-core `repo_state.rs`) classification:
-- tagged `[X]` where `X` is an active plan → `PlanCommit(X)` (as today
-  via touches/tag);
-- EVERYTHING ELSE — untagged, OR `[X]` where `X` is not an active plan
-  → `AdHoc` (post-adoption, as today).
+The `classify` fold (clank-core `repo_state.rs`) is an 8-case engine
+with hint inheritance, a `[misc]` special case, and a prefix-ambiguity
+warnings system. Use this plan to **strip it to the invariant** (lloyd:
+"get rid of all the crazy inheritance stuff"). A commit is attributed
+to plan `X` iff it **touches `.clank/plans/X.md`** (lifecycle — keeps
+intro/finalize/delete detection and plan-body edits) **or is tagged
+`[X]` where `X` is a known plan**. Everything else → `AdHoc`.
 
-Concretely: stop attributing untagged commits to the active plan via
-`active_plan_hint`. (That hint is exactly why a bare post-intro commit
-folds to the plan today — the show-adhoc reproduction test had to use a
-`[bar]` tag to force ad-hoc.)
+REMOVE:
+- `active_plan_hint` (field on `RepoState`, `ClassifierInputs`, and
+  `next_active_plan_hint`) — the entire untagged-inherits-the-active-
+  plan mechanism. This is why a bare post-intro commit folds to the
+  plan today (the show-adhoc test needed `[bar]` to force ad-hoc).
+- `TitlePrefix::Misc` — `[misc]` is NOT special. `misc` isn't a plan,
+  so `[misc]` is just an unknown-plan tag → ad-hoc, and flagged at HEAD
+  (Part 2). The ONLY ad-hoc opt-in is *no tag*.
+- The prefix-ambiguity warnings `UnknownPlanPrefix`, `MissingPrefix`,
+  `AttributionMismatch` (and `classify`'s `warnings` output entirely).
+  We do NOT retroactively warn "this commit 10 back was ambiguous" —
+  non-compliant history just folds as ad-hoc, silently. The live HEAD
+  nag (Part 2) catches ~99% of mistakes when they're made.
+
+KEEP (NOT part of this complexity):
+- Touches-based attribution + the intro/finalize/delete lifecycle.
+- `Warning::DanglingPlanRef` + `RepoState.warnings` + `RepoWarning` —
+  a separate concern (a plan ref that dangles), surfaced by
+  `clank open` and hashed into the cache. classify simply stops
+  contributing warnings; the enum keeps `DanglingPlanRef`.
+
+Resulting `classify`: `[X…]` → the known subset (unknown → ∅); no
+prefix → ∅. No hint, no misc, no warnings. (Touches are applied in
+`apply_commit` as today.)
+
+### Consumers to update
+
+- `preview.rs` replays classification with `known_plans` + the hint —
+  drop the hint from the replay.
+- `log.rs` matches `TitlePrefix` — confirm it compiles without `Misc`.
+- `open.rs` warning display + the cache-hash over `fold.warnings` —
+  unaffected in shape (only `DanglingPlanRef` remains).
 
 ### Blast radius — verify, don't assume
 
-The fold's attribution feeds status, log, AND reviews. Dropping
-inheritance means a master's UNTAGGED commit is now ad-hoc, not part of
-the active plan's gate — so a master must tag `[plan]` on each commit it
-wants reviewed under that plan (agents already do; every gix milestone
-was `[actually-replace-git-with-gix] …`). Audit the in-process flows
-(derive_status, plan timelines, the review gate) for anything that
-relied on untagged inheritance before landing this.
+A master's UNTAGGED code commit is now ad-hoc, not part of the active
+plan's gate — so each commit must be tagged `[plan]` to be reviewed
+under that plan (agents already do; every gix milestone was
+`[actually-replace-git-with-gix] …`). Audit derive_status, plan
+timelines, and the review gate for anything that leaned on untagged
+inheritance before landing.
 
 ## Part 2 — wfw flags a mistyped tag
 
