@@ -54,18 +54,32 @@ turns each such write into a wake for every folding process, and (c)
 concurrent folders race so they don't all cleanly hit. Fixing (a) and
 (b) makes "no commit ⇒ no cache change ⇒ no wake" actually hold.
 
-## Fix 1 (primary, modeling) — the cache is not a wake source
+## Fix 1 (primary, modeling) — wake only on real signals (allowlist)
 
-`WakeFilter::wakes` must NOT wake on `.clank/cache/`. Keep waking on
-the rest of `.clank/` (feedback/blocks/plans/queue/config are the real
-signals) and on the git dir.
+`WakeFilter::wakes` must wake ONLY on the workflow-state signal dirs
+under `.clank` — `plans`, `queue`, `blocks`, `agents` (feedback),
+`finished`, `config.json` — plus the git dir, plus tracked working-
+tree edits (via the existing gitignore matcher, so `dirty:` stays
+fresh). Everything ELSE under `.clank` must NOT wake.
 
-- Concretely: the unconditional `path.starts_with(clank_root)` branch
-  gains a `&& !path.starts_with(clank_root/"cache")` guard (or the
-  watch is scoped to the specific source subdirs). Either way, cache
-  writes stop waking the loop.
-- This alone breaks the storm: cache writes no longer fan out into a
-  re-fold across every process.
+This must be an ALLOWLIST, not the original "anything under `.clank`
+wakes except `cache`" denylist — that denylist had a hole ruthless
+caught: `path.starts_with(clank_root)` short-circuits BEFORE the
+gitignore matcher, so a nested worktree's build
+(`.clank/worktrees/<name>/target/*`) and a nested worktree's OWN cache
+(`.clank/worktrees/<name>/.clank/cache/*`, a different prefix than the
+top-level `cache_root`) BOTH woke the main pane. With ~12 worktrees
+under `.clank/worktrees`, every worktree `cargo build` was waking the
+main tui. The allowlist closes worktree builds, worktree caches, the
+derived `cache`/`html`, and the `zellij` layout by construction —
+matching the plan's own "derived / other-repo activity is not a wake
+source" model.
+
+- Breaks the self-trigger storm (cache writes no longer fan out into a
+  re-fold) AND the cross-worktree storm in one rule.
+- Working-tree paths still go through the matcher, so a tracked source
+  edit still wakes (instant `dirty:`); build artifacts (`target/`,
+  `*.log`) still don't.
 
 ## Fix 2 (idempotent write) — no rewrite when nothing changed
 
@@ -104,33 +118,43 @@ FSEvents monitor `target/` during `cargo build`, by watching only
 
 Dropped after review, for two reasons:
 
-1. **It wasn't the cause.** The idle CPU was the cache-churn → wake
-   loop (Fixes 1–2), which needs no build at all. `WakeFilter` already
-   drops `target/` events, so monitoring `target/` never drove
-   renders; FSEvents coalesces those writes and filtering them is
-   cheap. The expensive part was the renders the loop forced — already
-   gone. So the build-time monitoring cost is marginal.
+1. **It wasn't the cause, and the wake side is now handled.** The idle
+   CPU was the cache-churn → wake loop (Fixes 1–2) plus the
+   cross-worktree wakes (Fix 1's allowlist) — none of which need a
+   build. Fix 4 only targets the *residual FSEvents cost*: the watch is
+   whole-repo recursive, so FSEvents still MONITORS the worktree trees
+   under `.clank/worktrees` and DELIVERS their `target/` events during
+   a build — the loop just drops them now (allowlist), so they no
+   longer drive renders. The leftover cost is event delivery+filtering,
+   which FSEvents coalesces; it's build-only and modest next to the
+   render storm that's already gone. (Earlier drafts of this note
+   wrongly claimed the *denylist* already dropped those events — it did
+   not; that was the hole Fix 1's allowlist closes.)
 
 2. **The clean version has a real regression; the no-regression
    version is fiddly.** A recursive OS watch can't exclude a subtree —
    there's no "watch worktree but skip `target/`" knob; you either
    watch the whole tree (current) or watch narrower roots. Narrowing
-   to `.clank` + git makes `dirty:` stop refreshing on source saves
-   (it would lag to the 60s heartbeat) — a UX regression on a monitor
-   pane. Keeping `dirty:` fresh while still skipping `target/` would
-   mean watching each top-level entry except `target/`, which is a
-   gitignore-inexact heuristic (misses nested `target/`), misses
-   newly-created top-level dirs, and is more machinery than the
-   build-only benefit justifies.
+   the WATCH to `.clank` + git wouldn't even help here — `.clank`
+   contains `.clank/worktrees`, so it'd still monitor every worktree
+   tree. Truly excluding them means watching each top-level entry
+   except `target/`/`worktrees`, a gitignore-inexact heuristic that
+   misses nested dirs and newly-created top-level dirs — more machinery
+   than the build-only benefit justifies.
 
 If build-time FSEvents load ever proves material in practice, revisit
-with the per-sibling watch — but it's out of scope here.
+with the per-sibling watch — but it's out of scope here. The WAKE
+storm (the actual CPU) is fully closed by Fixes 1–3.
 
 ## Testing (in-process; no binary spawning — [[no-binary-spawning-tests]])
 
-- `WakeFilter`: a path under `.clank/cache/` does NOT wake; paths
-  under `.clank/agents/<>/feedback`, `blocks`, `plans`, `queue` DO
-  wake; a git-ref path wakes. (Pure — `WakeFilter::with_rules`.)
+- `WakeFilter`: signal dirs (`plans`/`queue`/`blocks`/`agents`/
+  `finished`/`config.json`) + git refs + tracked working-tree edits
+  wake; `.clank/cache`, `.clank/html`, `.clank/zellij`, and — the
+  regression case — `.clank/worktrees/<name>/target/*` and
+  `.clank/worktrees/<name>/.clank/cache/*` do NOT wake; gitignored
+  worktree paths (`target/`, `*.log`) do NOT wake. (Pure —
+  `WakeFilter::with_rules`.)
 - `state_cache::write`: writing a checkpoint whose `(head, depth)`
   file already exists is a no-op — assert the file's mtime/inode is
   unchanged (or that no rename occurred via a seam).

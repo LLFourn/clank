@@ -604,14 +604,24 @@ pub(crate) struct WakeFilter {
     repo_root: PathBuf,
     git_dir: PathBuf,
     clank_root: PathBuf,
-    /// `.clank/cache` — the DERIVED fold cache. Excluded from waking:
-    /// it's clank's own re-derivable output, not a state signal, and
-    /// waking on it self-triggers a render→write-cache→wake loop
-    /// (status-tui-watch-cpu). The real signals (feedback/blocks/
-    /// plans/queue) live elsewhere under `.clank`.
-    cache_root: PathBuf,
     matcher: ignore::gitignore::Gitignore,
 }
+
+/// The first path component under `.clank/` that carries a real
+/// workflow signal. Everything else under `.clank` is derived or
+/// foreign and must NOT wake the loop (status-tui-watch-cpu): the
+/// fold `cache`, generated `html`, the `zellij` layout, queue
+/// `stubs` — and, critically, nested worktrees under
+/// `.clank/worktrees/<name>/`, which are whole separate repos with
+/// their own `src/`, `target/`, `.git`, and `.clank/cache`.
+const CLANK_WAKE_DIRS: &[&str] = &[
+    "plans",
+    "queue",
+    "blocks",
+    "agents", // agents/<label>/feedback — the gate signal
+    "finished",
+    "config.json",
+];
 
 impl WakeFilter {
     pub(crate) fn new(repo_root: &Path, git_dir: &Path) -> Self {
@@ -622,7 +632,6 @@ impl WakeFilter {
         let git_dir = dunce::canonicalize(git_dir).unwrap_or_else(|_| git_dir.to_path_buf());
         Self {
             clank_root: repo_root.join(".clank"),
-            cache_root: repo_root.join(".clank").join("cache"),
             matcher: Self::build_matcher(&repo_root, &git_dir),
             repo_root,
             git_dir,
@@ -640,16 +649,21 @@ impl WakeFilter {
 
     /// True → the event at `path` should wake the loop.
     pub(crate) fn wakes(&mut self, path: &Path) -> bool {
-        // The fold cache is DERIVED state, not a signal. Waking on it
-        // would self-trigger (a render writes the cache, which would
-        // wake the next render) and amplify across every process
-        // folding the repo (status-tui-watch-cpu). Checked BEFORE the
-        // `.clank` wake since the cache lives under `.clank`.
-        if path.starts_with(&self.cache_root) {
-            return false;
-        }
-        if path.starts_with(&self.clank_root) || path.starts_with(&self.git_dir) {
+        // Commits move refs and the fold reads them. (Object churn
+        // during a commit is bursty, not a sustained storm.)
+        if path.starts_with(&self.git_dir) {
             return true;
+        }
+        // Under `.clank`, wake ONLY on the workflow-state signal dirs
+        // (`CLANK_WAKE_DIRS`). This is an ALLOWLIST, not "anything under
+        // `.clank`": the repo is watched recursively, and `.clank`
+        // holds the derived `cache`/`html`, the `zellij` layout, and
+        // nested worktrees under `.clank/worktrees/<name>/` whose own
+        // builds + caches would otherwise wake this pane on every
+        // `cargo build` across a dozen worktrees (status-tui-watch-cpu).
+        if let Ok(rel) = path.strip_prefix(&self.clank_root) {
+            let head = rel.components().next().and_then(|c| c.as_os_str().to_str());
+            return head.is_some_and(|h| CLANK_WAKE_DIRS.contains(&h));
         }
         if path.file_name().is_some_and(|n| n == ".gitignore") {
             self.matcher = Self::build_matcher(&self.repo_root, &self.git_dir);
@@ -660,8 +674,10 @@ impl WakeFilter {
         if !path.starts_with(&self.repo_root) {
             return true;
         }
-        // `is_dir` races with deletion; a vanished path reads as
-        // non-dir, which only loosens matching toward a wake.
+        // Working-tree path: wake unless gitignored — keeps `dirty:`
+        // fresh on tracked edits while dropping build artifacts
+        // (`target/`, `*.log`, …). `is_dir` races with deletion; a
+        // vanished path reads as non-dir, only loosening toward a wake.
         !self
             .matcher
             .matched_path_or_any_parents(path, path.is_dir())
@@ -678,7 +694,6 @@ impl WakeFilter {
             repo_root: repo_root.to_path_buf(),
             git_dir: git_dir.to_path_buf(),
             clank_root: repo_root.join(".clank"),
-            cache_root: repo_root.join(".clank").join("cache"),
             matcher: builder.build().expect("test matcher"),
         }
     }
@@ -1056,18 +1071,39 @@ mod dirty_and_wake_tests {
         let root = Path::new("/repo");
         let git_dir = Path::new("/repo/.git");
         let mut f = WakeFilter::with_rules(root, git_dir, &["/target/", "*.log"]);
-        // .clank state signals and .git are exempt from ignore rules.
+
+        // .clank workflow-state SIGNAL dirs + .git wake.
         assert!(f.wakes(Path::new("/repo/.clank/agents/codex/feedback/abc.md")));
         assert!(f.wakes(Path::new("/repo/.clank/blocks/q.md")));
         assert!(f.wakes(Path::new("/repo/.clank/plans/foo.md")));
         assert!(f.wakes(Path::new("/repo/.clank/queue/500-foo.md")));
+        assert!(f.wakes(Path::new("/repo/.clank/finished/foo.md")));
+        assert!(f.wakes(Path::new("/repo/.clank/config.json")));
         assert!(f.wakes(Path::new("/repo/.git/HEAD")));
-        // The DERIVED fold cache must NOT wake — waking on it
-        // self-triggers a render→write-cache→wake loop
-        // (status-tui-watch-cpu). Checked even though it's under
-        // `.clank`.
+
+        // DERIVED / foreign state under `.clank` must NOT wake — this
+        // is the allowlist, not "anything under .clank"
+        // (status-tui-watch-cpu). The fold cache self-triggers a
+        // render→write-cache→wake loop; html/zellij are generated.
         assert!(!f.wakes(Path::new("/repo/.clank/cache/repo-state/abc123.7.v10.bin")));
-        // Worktree paths: ignored → drop, tracked-ish → wake.
+        assert!(!f.wakes(Path::new("/repo/.clank/html/index.html")));
+        assert!(!f.wakes(Path::new("/repo/.clank/zellij/layout.kdl")));
+
+        // NESTED WORKTREES under `.clank/worktrees/<name>/` are whole
+        // separate repos. Their builds AND their own caches must NOT
+        // wake this pane — the regression ruthless caught: the old
+        // `starts_with(.clank)` short-circuit woke on all of these.
+        assert!(!f.wakes(Path::new("/repo/.clank/worktrees/wt1/target/debug/junk.o")));
+        assert!(!f.wakes(Path::new(
+            "/repo/.clank/worktrees/wt1/.clank/cache/repo-state/x.v10.bin"
+        )));
+        assert!(!f.wakes(Path::new("/repo/.clank/worktrees/wt1/src/lib.rs")));
+        // ...even a worktree's OWN plan file: it's that worktree's
+        // tui's job, not ours.
+        assert!(!f.wakes(Path::new("/repo/.clank/worktrees/wt1/.clank/plans/bar.md")));
+
+        // Top-level working tree: gitignored → drop, tracked → wake
+        // (keeps `dirty:` fresh on source saves).
         assert!(!f.wakes(Path::new("/repo/target/debug/build/junk.o")));
         assert!(!f.wakes(Path::new("/repo/build.log")));
         assert!(f.wakes(Path::new("/repo/src/lib.rs")));
