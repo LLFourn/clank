@@ -51,7 +51,11 @@ const CACHE_MAGIC: &[u8] = b"CLANK-STATE\n";
 ///   Payload unchanged; the bump retires v9 names so the new
 ///   depth-aware listing never sees depthless files (mtime aging
 ///   reclaims them).
-const CACHE_FORMAT_VERSION: u32 = 10;
+/// - v11: `RepoState` dropped the `active_plan_hint` field (the
+///   classifier collapse — adhoc-commits-and-plan-tag-validation), so
+///   the wincode payload shape changed; bump forces v10 caches to be
+///   reclaimed rather than mis-deserialized.
+const CACHE_FORMAT_VERSION: u32 = 11;
 const CLANK_CACHE_GENERATION: u32 = 1;
 
 const HEADER_LEN: usize = CACHE_MAGIC.len() + 4 + 4 + 40;

@@ -58,15 +58,6 @@ impl RepoState {
                 .unwrap_or("")
                 .as_bytes(),
         );
-        hasher.update(b"\nfold.hint=");
-        hasher.update(
-            self.fold
-                .active_plan_hint
-                .as_ref()
-                .map(|k| k.as_str())
-                .unwrap_or("")
-                .as_bytes(),
-        );
         hasher.update(b"\nfold.plans[");
         for (key, ps) in &self.fold.plans {
             hasher.update(key.as_str().as_bytes());
