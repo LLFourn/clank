@@ -53,6 +53,23 @@ bookkeeping needed.
 - Resolution = amend HEAD's message. (Amending deeper history needs a
   rewrite — out of scope; only HEAD is flagged.)
 
+### Guard — enforce ONLY when `.clank` is committed (lloyd)
+
+The nag is enforced ONLY when `.clank` is committed/tracked in git. If
+`.clank` is gitignored or untracked, clank is a LOCAL GUEST on a repo
+with its own commit conventions: the fold can't see the plans (they're
+not in history), so it can't tell a real `[X]` from a typo, and the
+host's `[app]`/`[ci]` commits are legitimately tagged. In that mode the
+wfw flag MUST be disabled — never police a repo whose clank state isn't
+committed. (This guards the case HEAD-scope alone doesn't: a repo where
+the operator runs clank locally without committing `.clank`.)
+
+Detection: `.clank` is tracked in git (the standard `clank init` layout
+commits `plans/`+`finished/`, gitignores `cache/`+`queue/`). If nothing
+under `.clank` is tracked, skip the flag entirely. The fold
+classification (Part 1) is unaffected — with no committed plans
+everything is already ad-hoc; only the ENFORCEMENT is gated.
+
 ## Testing (reproduce-first; in-process; no binary spawning — [[no-binary-spawning-tests]])
 
 - Fold classification (the core change):
@@ -64,6 +81,8 @@ bookkeeping needed.
 - `wfw`: master's fresh HEAD `[bar]` (not a plan) → yields the
   fix-commit work item; `[foo]` → none; untagged → none; a `[app]`
   ANCESTOR (not HEAD) → none.
+- Guard: the SAME `[bar]` HEAD in a repo where `.clank` is NOT tracked
+  → no flag (local-guest mode).
 
 ## Non-goals
 
