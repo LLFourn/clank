@@ -136,13 +136,19 @@ pub enum WaitItem {
 
 /// HEAD-only plan-tag check (adhoc-commits-and-plan-tag-validation).
 /// If the commit master just made carries a `[tag]` naming a plan that
-/// isn't active, return the fixup item so `wfw` nags master to amend
-/// the message (or drop the tag — no tag = ad-hoc). Returns `None`
-/// when:
+/// is neither active NOR one HEAD itself touched, return the fixup item
+/// so `wfw` nags master to amend the message (or drop the tag — no tag
+/// = ad-hoc). Returns `None` when:
 /// - the repo isn't `adopted` (clank is a local guest on a repo whose
 ///   `.clank` isn't committed — never police its commit conventions),
 /// - HEAD is untagged, or
-/// - every name in HEAD's tag is an active plan.
+/// - every name in HEAD's tag is an active plan or a plan HEAD touched.
+///
+/// `head_touched` is the set of plans whose `.clank/plans/<x>.md` HEAD's
+/// diff changed — the lifecycle plan(s) HEAD is acting on. A
+/// `[foo] finish` / `[foo] delete` removes `foo` from the active set, so
+/// without this the legitimate finalize/delete commit would be flagged
+/// (codex 1ea61ae).
 ///
 /// HEAD-only by design: history is tolerated; mistakes are caught when
 /// made. Host conventions (`[app]`/`[ci]`) are ancestors, never the
@@ -151,7 +157,8 @@ pub fn head_tag_fixup(
     adopted: bool,
     head_sha: &CommitSha,
     head_subject: &str,
-    known_plans: &BTreeSet<PlanKey>,
+    active_plans: &BTreeSet<PlanKey>,
+    head_touched: &BTreeSet<PlanKey>,
 ) -> Option<WaitItem> {
     if !adopted {
         return None;
@@ -161,10 +168,9 @@ pub fn head_tag_fixup(
     };
     let unknown: Vec<String> = names
         .into_iter()
-        .filter(|n| {
-            PlanKey::parse(n)
-                .map(|k| !known_plans.contains(&k))
-                .unwrap_or(true)
+        .filter(|n| match PlanKey::parse(n) {
+            Ok(k) => !active_plans.contains(&k) && !head_touched.contains(&k),
+            Err(_) => true,
         })
         .collect();
     if unknown.is_empty() {
@@ -927,27 +933,46 @@ mod tests {
 
     #[test]
     fn head_tag_fixup_flags_unknown_tag_only_when_adopted() {
-        let known: BTreeSet<PlanKey> = std::iter::once(plan("foo")).collect();
+        let active: BTreeSet<PlanKey> = std::iter::once(plan("foo")).collect();
+        let none: BTreeSet<PlanKey> = BTreeSet::new();
         let h = sha("aaaa");
+        let fixup = |adopted, subj| head_tag_fixup(adopted, &h, subj, &active, &none);
 
         // Unknown tag on an adopted repo → fixup naming the bad tag.
         assert!(matches!(
-            head_tag_fixup(true, &h, "[bar] work", &known),
+            fixup(true, "[bar] work"),
             Some(WaitItem::FixCommitTag { unknown, .. }) if unknown == vec!["bar".to_string()]
         ));
         // `[misc]` is no longer special — it's just an unknown tag.
-        assert!(head_tag_fixup(true, &h, "[misc] one-off", &known).is_some());
+        assert!(fixup(true, "[misc] one-off").is_some());
         // Known active plan → no fixup.
-        assert!(head_tag_fixup(true, &h, "[foo] work", &known).is_none());
+        assert!(fixup(true, "[foo] work").is_none());
         // No tag → ad-hoc, fine.
-        assert!(head_tag_fixup(true, &h, "just code", &known).is_none());
+        assert!(fixup(true, "just code").is_none());
         // NOT adopted (local-guest repo) → never police, even on `[bar]`.
-        assert!(head_tag_fixup(false, &h, "[bar] work", &known).is_none());
+        assert!(fixup(false, "[bar] work").is_none());
         // Multi-tag with one unknown → flag only the unknown name.
         assert!(matches!(
-            head_tag_fixup(true, &h, "[foo,bar] x", &known),
+            fixup(true, "[foo,bar] x"),
             Some(WaitItem::FixCommitTag { unknown, .. }) if unknown == vec!["bar".to_string()]
         ));
+    }
+
+    #[test]
+    fn head_tag_fixup_allows_finalize_of_a_now_removed_plan() {
+        // codex 1ea61ae: a `[foo] finish` (or delete) removes foo from
+        // the ACTIVE set, but HEAD touched foo's plan file — so the
+        // legitimate lifecycle commit must NOT be flagged.
+        let active: BTreeSet<PlanKey> = BTreeSet::new(); // foo finalized → gone from active
+        let touched: BTreeSet<PlanKey> = std::iter::once(plan("foo")).collect();
+        let h = sha("bbbb");
+        assert!(
+            head_tag_fixup(true, &h, "[foo] finish", &active, &touched).is_none(),
+            "finalize of a removed plan must not be flagged"
+        );
+        // ...but a code commit tagged for a plan it neither activates
+        // nor touches IS still flagged.
+        assert!(head_tag_fixup(true, &h, "[ghost] code", &active, &touched).is_some());
     }
 
     fn entry(verdict: crate::vocab::Verdict, who: &str) -> ReviewEntry {

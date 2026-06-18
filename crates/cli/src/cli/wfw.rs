@@ -98,18 +98,38 @@ fn firings_from_items(items: &[WaitItem]) -> Vec<HookFiring> {
 }
 
 /// HEAD-tag fixup for master (adhoc-commits-and-plan-tag-validation):
-/// reads HEAD's subject and returns a `FixCommitTag` item if it's
-/// tagged for a non-active plan (adopted-gated, HEAD-only). All the
-/// policy lives in `clank_core::wait::head_tag_fixup`; this just feeds
-/// it the live HEAD subject.
+/// reads HEAD's subject + the plan files HEAD touched, and returns a
+/// `FixCommitTag` item if it's tagged for a plan that's neither active
+/// nor touched by HEAD (adopted-gated, HEAD-only). All the policy lives
+/// in `clank_core::wait::head_tag_fixup`; this just feeds it the live
+/// HEAD facts.
 fn master_head_fixup(
     repo: &Path,
     state: &crate::repo_state::RepoState,
 ) -> Option<clank_core::wait::WaitItem> {
     let head = state.head.as_ref()?;
     let subject = crate::git_io::commit_subject(repo, head).unwrap_or_default();
-    let known: std::collections::BTreeSet<PlanKey> = state.fold.plans.keys().cloned().collect();
-    clank_core::wait::head_tag_fixup(state.fold.adopted, head, &subject, &known)
+    let active: std::collections::BTreeSet<PlanKey> = state.fold.plans.keys().cloned().collect();
+    let touched = head_touched_plans(repo, head);
+    clank_core::wait::head_tag_fixup(state.fold.adopted, head, &subject, &active, &touched)
+}
+
+/// Plans whose `.clank/plans/<x>.md` HEAD's diff changed — the
+/// lifecycle plan(s) HEAD is acting on. A `[foo] finish`/`delete`
+/// removes `foo` from the active set, so this keeps its own tag valid.
+fn head_touched_plans(repo: &Path, head: &CommitSha) -> std::collections::BTreeSet<PlanKey> {
+    let from = crate::git_io::parent_of(repo, head).ok().flatten();
+    crate::git_io::commit_events_between(repo, from.as_ref(), head)
+        .ok()
+        .and_then(|evs| evs.into_iter().last())
+        .map(|ev| {
+            ev.changes
+                .plan_touches
+                .into_iter()
+                .map(|t| t.plan)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
