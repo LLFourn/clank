@@ -53,22 +53,21 @@ bookkeeping needed.
 - Resolution = amend HEAD's message. (Amending deeper history needs a
   rewrite — out of scope; only HEAD is flagged.)
 
-### Guard — enforce ONLY when `.clank` is committed (lloyd)
+### Guard — enforce ONLY when clank is adopted (lloyd)
 
-The nag is enforced ONLY when `.clank` is committed/tracked in git. If
-`.clank` is gitignored or untracked, clank is a LOCAL GUEST on a repo
-with its own commit conventions: the fold can't see the plans (they're
-not in history), so it can't tell a real `[X]` from a typo, and the
-host's `[app]`/`[ci]` commits are legitimately tagged. In that mode the
-wfw flag MUST be disabled — never police a repo whose clank state isn't
-committed. (This guards the case HEAD-scope alone doesn't: a repo where
-the operator runs clank locally without committing `.clank`.)
+The nag is enforced ONLY when clank's plan state is committed. If
+`.clank` is gitignored/untracked, clank is a LOCAL GUEST on a repo with
+its own commit conventions: the fold can't see the plans (they're not
+in history), so it can't tell a real `[X]` from a typo and the host's
+`[app]`/`[ci]` commits are legitimate. The flag MUST be off there.
 
-Detection: `.clank` is tracked in git (the standard `clank init` layout
-commits `plans/`+`finished/`, gitignores `cache/`+`queue/`). If nothing
-under `.clank` is tracked, skip the flag entirely. The fold
-classification (Part 1) is unaffected — with no committed plans
-everything is already ad-hoc; only the ENFORCEMENT is gated.
+Use the EXISTING notion — **`RepoState.adopted`** — do NOT invent a new
+"is `.clank` tracked" check (lloyd). `adopted` is already set at the
+first COMMITTED plan event and is false when there's no committed plan
+history (i.e. `.clank` uncommitted), which is exactly this gate. Gate
+the wfw flag on `state.fold.adopted`. The fold classification (Part 1)
+is unaffected — pre-adoption everything is already ad-hoc; only the
+ENFORCEMENT is gated.
 
 ## Testing (reproduce-first; in-process; no binary spawning — [[no-binary-spawning-tests]])
 
@@ -81,8 +80,8 @@ everything is already ad-hoc; only the ENFORCEMENT is gated.
 - `wfw`: master's fresh HEAD `[bar]` (not a plan) → yields the
   fix-commit work item; `[foo]` → none; untagged → none; a `[app]`
   ANCESTOR (not HEAD) → none.
-- Guard: the SAME `[bar]` HEAD in a repo where `.clank` is NOT tracked
-  → no flag (local-guest mode).
+- Guard: the SAME `[bar]` HEAD in a NOT-adopted repo (no committed plan
+  history, `state.fold.adopted == false`) → no flag (local-guest mode).
 
 ## Non-goals
 
