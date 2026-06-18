@@ -7,9 +7,11 @@
 use std::path::{Path, PathBuf};
 
 /// The managed entries of `.clank/.gitignore` — everything
-/// local-only: agent state, caches, the queue, rendered html,
-/// shelved-plan state (plan-lifecycle-verbs), fork worktrees
-/// (clank-fork-worktree-sessions), generated zellij layouts.
+/// local-only: agent state, caches, the queue, queue-add stubs
+/// (the `.clank/stubs/<name>.md` staging area for `queue add`),
+/// rendered html, shelved-plan state (plan-lifecycle-verbs), fork
+/// worktrees (clank-fork-worktree-sessions), generated zellij
+/// layouts.
 ///
 /// The file is validated and repaired by SET MEMBERSHIP, not
 /// exact string match (ruthless 02da305): three commands mutate
@@ -26,6 +28,7 @@ pub const CLANK_GITIGNORE_ENTRIES: &[&str] = &[
     "/cache/",
     "/feedback/",
     "/queue/",
+    "/stubs/",
     "/html/",
     "/pr-reviews/",
     "/shelved/",
@@ -274,6 +277,32 @@ mod tests {
     }
 
     #[test]
+    fn stubs_is_a_managed_gitignore_entry_with_legacy_repair() {
+        // `.clank/stubs/` is the queue-add staging area and MUST be
+        // gitignored everywhere (stubs-gitignored).
+        assert!(
+            clank_gitignore_body().contains("/stubs/\n"),
+            "stubs in the canonical body"
+        );
+        // A repo whose .clank/.gitignore predates /stubs/ (the prior
+        // canonical set) classifies Legacy, and the shared ensure
+        // repairs it back to canonical without disturbing the rest.
+        let dir = tempdir();
+        std::fs::create_dir_all(dir.path().join(".clank")).unwrap();
+        let prior = "/agents/\n/cache/\n/feedback/\n/queue/\n/html/\n\
+                     /pr-reviews/\n/shelved/\n/worktrees/\n/zellij/\n";
+        std::fs::write(clank_gitignore_path(dir.path()), prior).unwrap();
+        assert_eq!(classify_clank_gitignore(dir.path()), GitignoreState::Legacy);
+
+        ensure_clank_gitignore_entry(dir.path(), "/stubs/").unwrap();
+        assert_eq!(
+            classify_clank_gitignore(dir.path()),
+            GitignoreState::Canonical,
+            "repaired to canonical after adding /stubs/"
+        );
+    }
+
+    #[test]
     fn ensure_entry_appends_and_is_idempotent() {
         // The shared single-entry ensure (fork: /worktrees/,
         // open zellij: /zellij/) — append once, never duplicate,
@@ -400,7 +429,8 @@ mod tests {
 /// Idempotently ensure `<repo>/.clank/.gitignore` contains
 /// `entry` (one line). Shared by the commands that create
 /// local-only state in repos whose gitignore may predate the
-/// entry (fork: /worktrees/, open zellij: /zellij/).
+/// entry (fork: /worktrees/, open zellij: /zellij/, queue add:
+/// /stubs/).
 pub fn ensure_clank_gitignore_entry(repo: &Path, entry: &str) -> std::io::Result<()> {
     let path = clank_gitignore_path(repo);
     if let Some(parent) = path.parent() {
