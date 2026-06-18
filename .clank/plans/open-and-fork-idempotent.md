@@ -57,15 +57,26 @@ become thin callers of `ensure_tab_open`.
 
 ## Part 3 — `clank open --all`
 
-- Enumerate worktrees (the `.clank/worktrees/*` entries from
-  `git worktree list`), and `ensure_tab_open` each — opening only the
-  ones not already on screen.
-- Loud about what it skipped vs opened (so "nothing happened" is
-  legible when everything was already open).
-- COST NOTE: each fork tab spawns its full team (master + reviewers) +
-  a `status --tui` watcher. `--all` across many forks is heavy (this is
-  the fleet that loaded the zellij servers in status-tui-watch-cpu).
-  Keep it explicit/opt-in; do not auto-open-all anywhere.
+Open the pwd repo AND all its worktrees, each as a tab (lloyd). Targets
+= **`git worktree list`** from the cwd's repo — the main checkout plus
+every linked worktree — NOT just `.clank/worktrees/*` (so it works from
+any worktree and includes the repo itself).
+
+Two modes by context:
+- **Inside a session**: reconcile — `ensure_tab_open` each target in the
+  CURRENT session, skipping any tab already open. (Doesn't matter which
+  repo the current session "belongs to".) The in-session tab spawn is
+  non-blocking, so the loop completes.
+- **Outside a session**: open them ALL in ONE fresh session — a single
+  multi-tab layout (one `tab name="<worktree>"` block per target, each
+  with that worktree's own team panes), spawned via
+  `--new-session-with-layout`. This is the primary use case: spin up
+  zellij with every worktree tab in one go. (NB: an outside loop of
+  per-target attach/create would block on the first — codex 03be1fb —
+  hence the single multi-tab session.)
+- COST NOTE: each tab spawns a full team + `status --tui` watcher;
+  `--all` across many worktrees is heavy (the fleet from
+  status-tui-watch-cpu). Explicit/opt-in only.
 
 ## Part 4 — make `clank fork` idempotent
 
@@ -87,9 +98,12 @@ become thin callers of `ensure_tab_open`.
   idempotent `fork`'s job (Part 4) — keeping the two verbs distinct is
   clearer than overloading `open`. (Redirectable if you'd rather `open`
   fall through to `fork`.)
-- **Outside zellij**: mirror today's `clank open` — attach-or-create
-  `clank-<repo>`, THEN open the requested tab(s); after attach the
-  same `query-tab-names` reconcile applies (no double-open).
+- **Outside zellij**: a SINGLE target (`--fork`/`--pr`/bare) attaches-
+  or-creates its own session (today's `clank open`, one blocking spawn).
+  `--all` outside spawns ONE fresh session with a tab per target (the
+  multi-tab layout above) — never a per-target loop (that would block on
+  the first). Inside a session, everything reconciles into the current
+  one via `query-tab-names` (no double-open).
 - **Which session's tabs count**: the CURRENT session only (a fork open
   in another session still opens a tab here).
 

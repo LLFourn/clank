@@ -13,25 +13,38 @@ use super::{repo_basename, resolve_repo};
 
 pub async fn run(args: OpenZellijArgs) -> anyhow::Result<()> {
     let source = resolve_repo(args.repo.as_deref())?;
-    // Resolve the target worktree(s): --all = every fork, --fork/--pr =
-    // one named fork (must exist), bare = the source repo itself.
-    let targets: Vec<PathBuf> = if args.all {
-        let forks = fork_worktrees(&source);
-        if forks.is_empty() {
-            eprintln!("no forks under `{}/.clank/worktrees`", source.display());
+    let in_zellij = std::env::var_os("ZELLIJ").is_some();
+
+    // --all = the pwd repo AND all its worktrees (`git worktree list`),
+    // regardless of which session/worktree we're in.
+    if args.all {
+        let targets = worktree_paths(&source)?;
+        if in_zellij {
+            // Inside a session: reconcile — add each target's tab to the
+            // CURRENT session, skipping any already open. `open_one`'s
+            // in-session tab spawn is non-blocking, so the loop runs to
+            // completion (unlike an outside attach/create per target,
+            // which would block on the first — codex 03be1fb).
+            for target in &targets {
+                open_one(target, args.print)?;
+            }
+        } else {
+            // Outside: one fresh session with a tab per target.
+            open_all_in_fresh_session(&source, &targets, args.print)?;
         }
-        forks
-    } else if let Some(name) = args.fork.as_deref() {
-        vec![fork_path(&source, name)?]
-    } else if let Some(pr) = args.pr {
-        vec![fork_path(&source, &format!("pr-{pr}"))?]
-    } else {
-        vec![source]
-    };
-    for target in &targets {
-        open_one(target, args.print)?;
+        return Ok(());
     }
-    Ok(())
+
+    // Single target: --fork/--pr name an existing worktree, bare = the
+    // source repo. `open_one` works inside (tab) or outside (session).
+    let target = if let Some(name) = args.fork.as_deref() {
+        fork_path(&source, name)?
+    } else if let Some(pr) = args.pr {
+        fork_path(&source, &format!("pr-{pr}"))?
+    } else {
+        source
+    };
+    open_one(&target, args.print)
 }
 
 /// Resolve an EXISTING fork worktree `<source>/.clank/worktrees/<name>`,
@@ -48,18 +61,151 @@ fn fork_path(source: &Path, name: &str) -> anyhow::Result<PathBuf> {
     Ok(p)
 }
 
-/// Every fork worktree directly under `<source>/.clank/worktrees/`,
-/// sorted. (Run from the main checkout; a fork's own tree has none.)
-fn fork_worktrees(source: &Path) -> Vec<PathBuf> {
-    let mut out: Vec<PathBuf> = std::fs::read_dir(source.join(".clank/worktrees"))
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.is_dir())
-        .collect();
-    out.sort();
-    out
+/// Every worktree of `repo`'s repository — the main checkout PLUS every
+/// linked worktree — via `git worktree list --porcelain`. This is the
+/// `--all` target set: the repo itself and all its forks.
+fn worktree_paths(repo: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["worktree", "list", "--porcelain"])
+        .output()
+        .context("running `git worktree list`")?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "`git worktree list` failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(parse_worktree_list(&String::from_utf8_lossy(&out.stdout)))
+}
+
+/// Parse `git worktree list --porcelain` stdout → worktree paths
+/// (the `worktree <path>` lines, in listed order: main first).
+fn parse_worktree_list(porcelain: &str) -> Vec<PathBuf> {
+    porcelain
+        .lines()
+        .filter_map(|l| l.strip_prefix("worktree "))
+        .map(PathBuf::from)
+        .collect()
+}
+
+/// One tab in a multi-tab `--all` layout: a worktree's name + the
+/// agent panes to spawn for it.
+struct TabSpec {
+    name: String,
+    repo_path: String,
+    master: String,
+    reviewers: Vec<String>,
+}
+
+/// `--all` outside a session: open every target worktree in ONE fresh
+/// zellij session, a tab per target. Worktrees without a clank team are
+/// skipped (with a notice); errors only if none are openable.
+fn open_all_in_fresh_session(
+    source: &Path,
+    targets: &[PathBuf],
+    print: bool,
+) -> anyhow::Result<()> {
+    let mut tabs: Vec<TabSpec> = Vec::new();
+    for t in targets {
+        let Some(set) = crate::agent_store::try_resolve_via_team(t)? else {
+            eprintln!("skipping `{}` (no team configured)", t.display());
+            continue;
+        };
+        let reviewers = set
+            .commit_reviewers
+            .iter()
+            .chain(set.gate_reviewers.iter())
+            .map(|a| a.label.as_str().to_string())
+            .collect();
+        tabs.push(TabSpec {
+            name: repo_basename(t)?,
+            repo_path: t.display().to_string(),
+            master: set.master.as_str().to_string(),
+            reviewers,
+        });
+    }
+    if tabs.is_empty() {
+        anyhow::bail!("no openable worktrees (none have a clank team configured)");
+    }
+
+    let (rows, cols) = crate::cli::status_tui::term_size();
+    let kdl = compose_multitab(&tabs, (cols, rows))?;
+    let name = session_name(&repo_basename(source)?);
+    let layout_path = layout_file_path(source);
+    let listing = zellij_list_sessions();
+    let (pre_argv, spawn_argv) = match decide_session(&listing, &name) {
+        SessionPlan::Attach => (None, attach_argv(&name)),
+        SessionPlan::Create => (None, create_argv(&layout_path, &name)),
+        SessionPlan::DeleteDeadThenCreate => {
+            (Some(delete_argv(&name)), create_argv(&layout_path, &name))
+        }
+    };
+
+    if print {
+        println!("{kdl}");
+        if let Some(pre) = &pre_argv {
+            eprintln!("pre-spawn: {}", pre.join(" "));
+        }
+        eprintln!("spawn: {}", spawn_argv.join(" "));
+        return Ok(());
+    }
+
+    write_layout_file(source, &kdl)?;
+    crate::init_facts::ensure_clank_gitignore_entry(source, "/zellij/")
+        .context("ensuring /zellij/ gitignore entry")?;
+    if let Some(pre) = &pre_argv {
+        let _ = std::process::Command::new(&pre[0]).args(&pre[1..]).status();
+    }
+    let status = std::process::Command::new(&spawn_argv[0])
+        .args(&spawn_argv[1..])
+        .status()
+        .context("spawning zellij")?;
+    if !status.success() {
+        anyhow::bail!("zellij exited {status}");
+    }
+    Ok(())
+}
+
+/// Compose a multi-tab layout: the shared `default_tab_template` plus
+/// one `tab name="<worktree>" { <agent panes> }` per target. Unlike the
+/// single-tab `compose_kdl` this drops the alt-[/] swap variants —
+/// they're a layout-root construct that can't represent N tabs of
+/// different agents — and uses the built-in tab structure (no per-tab
+/// user template). The result is parse-validated as KDL.
+fn compose_multitab(tabs: &[TabSpec], term: (u16, u16)) -> anyhow::Result<String> {
+    let orientation = Orientation::detect(term);
+    let mut s = String::from(
+        "layout {\n    \
+         default_tab_template {\n        \
+         pane size=1 borderless=true {\n            \
+         plugin location=\"zellij:tab-bar\"\n        }\n        \
+         children\n        \
+         pane size=2 borderless=true {\n            \
+         plugin location=\"zellij:status-bar\"\n        }\n    }\n",
+    );
+    for tab in tabs {
+        s.push_str(&format!("    tab name=\"{}\" {{\n", kdl_escape(&tab.name)));
+        for line in
+            agent_group_kdl(&tab.repo_path, &tab.master, &tab.reviewers, orientation).lines()
+        {
+            if line.is_empty() {
+                s.push('\n');
+            } else {
+                s.push_str("        ");
+                s.push_str(line);
+                s.push('\n');
+            }
+        }
+        s.push_str("    }\n");
+    }
+    s.push_str("}\n");
+    // Fail loudly if we somehow produced invalid KDL rather than handing
+    // zellij a broken layout.
+    s.parse::<kdl::KdlDocument>()
+        .map_err(|e| anyhow::anyhow!("composed multi-tab layout is invalid KDL: {e}"))?;
+    Ok(s)
 }
 
 /// Open (or, inside a session, idempotently ensure) the agent
@@ -1190,20 +1336,43 @@ dead-one [Created 10h ago] (EXITED - attach to resurrect)
     }
 
     #[test]
-    fn fork_worktrees_lists_dirs_sorted() {
-        let dir = tempfile::tempdir().unwrap();
-        let src = dir.path();
-        assert!(fork_worktrees(src).is_empty(), "none when dir missing");
-        for n in ["zed", "abc", "mid"] {
-            std::fs::create_dir_all(src.join(".clank/worktrees").join(n)).unwrap();
-        }
-        // A stray file under worktrees/ is not a fork.
-        std::fs::write(src.join(".clank/worktrees/afile"), "x").unwrap();
-        let got: Vec<String> = fork_worktrees(src)
-            .iter()
-            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(got, vec!["abc", "mid", "zed"]);
+    fn parse_worktree_list_extracts_paths_main_first() {
+        let porcelain = "worktree /repo\nHEAD abc\nbranch refs/heads/main\n\n\
+             worktree /repo/.clank/worktrees/foo\nHEAD def\nbranch refs/heads/foo\n";
+        assert_eq!(
+            parse_worktree_list(porcelain),
+            vec![
+                PathBuf::from("/repo"),
+                PathBuf::from("/repo/.clank/worktrees/foo"),
+            ]
+        );
+    }
+
+    #[test]
+    fn compose_multitab_has_a_tab_per_target_and_is_valid_kdl() {
+        let tabs = vec![
+            TabSpec {
+                name: "main".into(),
+                repo_path: "/repo".into(),
+                master: "alice".into(),
+                reviewers: vec!["bob".into()],
+            },
+            TabSpec {
+                name: "foo".into(),
+                repo_path: "/repo/.clank/worktrees/foo".into(),
+                master: "alice".into(),
+                reviewers: vec![],
+            },
+        ];
+        let kdl = compose_multitab(&tabs, LANDSCAPE).unwrap();
+        assert!(kdl.contains("tab name=\"main\""));
+        assert!(kdl.contains("tab name=\"foo\""));
+        // Each tab pins its OWN --repo.
+        assert!(kdl.contains("\"--repo\" \"/repo\""));
+        assert!(kdl.contains("\"--repo\" \"/repo/.clank/worktrees/foo\""));
+        // One shared template, no per-orientation swaps for multi-tab.
+        assert_eq!(kdl.matches("default_tab_template").count(), 1);
+        assert!(!kdl.contains("swap_tiled_layout"));
     }
 
     #[test]
