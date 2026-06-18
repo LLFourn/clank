@@ -12,7 +12,60 @@ use super::OpenZellijArgs;
 use super::{repo_basename, resolve_repo};
 
 pub async fn run(args: OpenZellijArgs) -> anyhow::Result<()> {
-    let repo = resolve_repo(args.repo.as_deref())?;
+    let source = resolve_repo(args.repo.as_deref())?;
+    // Resolve the target worktree(s): --all = every fork, --fork/--pr =
+    // one named fork (must exist), bare = the source repo itself.
+    let targets: Vec<PathBuf> = if args.all {
+        let forks = fork_worktrees(&source);
+        if forks.is_empty() {
+            eprintln!("no forks under `{}/.clank/worktrees`", source.display());
+        }
+        forks
+    } else if let Some(name) = args.fork.as_deref() {
+        vec![fork_path(&source, name)?]
+    } else if let Some(pr) = args.pr {
+        vec![fork_path(&source, &format!("pr-{pr}"))?]
+    } else {
+        vec![source]
+    };
+    for target in &targets {
+        open_one(target, args.print)?;
+    }
+    Ok(())
+}
+
+/// Resolve an EXISTING fork worktree `<source>/.clank/worktrees/<name>`,
+/// erroring if it's absent — `open` opens, `clank fork` creates
+/// (open-and-fork-idempotent).
+fn fork_path(source: &Path, name: &str) -> anyhow::Result<PathBuf> {
+    let p = source.join(".clank/worktrees").join(name);
+    if !p.is_dir() {
+        anyhow::bail!(
+            "no fork `{name}` at `{}` — create it with `clank fork {name}`",
+            p.display()
+        );
+    }
+    Ok(p)
+}
+
+/// Every fork worktree directly under `<source>/.clank/worktrees/`,
+/// sorted. (Run from the main checkout; a fork's own tree has none.)
+fn fork_worktrees(source: &Path) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = std::fs::read_dir(source.join(".clank/worktrees"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
+    out.sort();
+    out
+}
+
+/// Open (or, inside a session, idempotently ensure) the agent
+/// workspace for one repo/worktree.
+fn open_one(repo: &Path, print: bool) -> anyhow::Result<()> {
+    let repo = repo.to_path_buf();
     let basename = repo_basename(&repo)?;
     // Registration is the resolved team set
     // (`teams-based-agent-registration`): exactly one master plus
@@ -68,7 +121,7 @@ pub async fn run(args: OpenZellijArgs) -> anyhow::Result<()> {
         }
     };
 
-    if args.print {
+    if print {
         println!("{kdl}");
         if let Some(pre) = &pre_argv {
             eprintln!("pre-spawn: {}", pre.join(" "));
@@ -1119,6 +1172,38 @@ dead-one [Created 10h ago] (EXITED - attach to resurrect)
         // A worktree with no open tab is not "open".
         assert!(!tab_is_open("frostsnap", &open));
         assert!(!tab_is_open("clan", &open), "no prefix match");
+    }
+
+    #[test]
+    fn fork_path_errors_when_absent_resolves_when_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path();
+        // Absent → error pointing at `clank fork`.
+        let err = fork_path(src, "ghost").unwrap_err().to_string();
+        assert!(err.contains("ghost") && err.contains("clank fork"), "{err}");
+        // Present → the worktree path.
+        std::fs::create_dir_all(src.join(".clank/worktrees/foo")).unwrap();
+        assert_eq!(
+            fork_path(src, "foo").unwrap(),
+            src.join(".clank/worktrees/foo")
+        );
+    }
+
+    #[test]
+    fn fork_worktrees_lists_dirs_sorted() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path();
+        assert!(fork_worktrees(src).is_empty(), "none when dir missing");
+        for n in ["zed", "abc", "mid"] {
+            std::fs::create_dir_all(src.join(".clank/worktrees").join(n)).unwrap();
+        }
+        // A stray file under worktrees/ is not a fork.
+        std::fs::write(src.join(".clank/worktrees/afile"), "x").unwrap();
+        let got: Vec<String> = fork_worktrees(src)
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(got, vec!["abc", "mid", "zed"]);
     }
 
     #[test]

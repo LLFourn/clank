@@ -276,6 +276,20 @@ pub struct OpenZellijArgs {
     /// Repo root override. Defaults to the cwd's git toplevel.
     #[arg(long, value_name = "PATH")]
     pub repo: Option<PathBuf>,
+    /// Open an EXISTING fork (linked worktree under
+    /// `.clank/worktrees/<name>`) as a tab, idempotently — no-op if
+    /// its tab is already open. Errors if the fork doesn't exist
+    /// (`clank fork <name>` creates it).
+    #[arg(long, value_name = "NAME", conflicts_with_all = ["pr", "all"])]
+    pub fork: Option<String>,
+    /// Open the existing `pr-<N>` fork's tab (same as `--fork pr-<N>`).
+    #[arg(long, value_name = "N", conflicts_with_all = ["fork", "all"])]
+    pub pr: Option<u32>,
+    /// Open a tab for every fork under `.clank/worktrees/` that isn't
+    /// already open. Heavy: each fork spawns its full team — use
+    /// deliberately.
+    #[arg(long, conflicts_with_all = ["fork", "pr"])]
+    pub all: bool,
     /// Emit the composed KDL on stdout + the would-be-spawned
     /// argv on stderr, exit 0, don't shell out to zellij. Mirrors
     /// `clank diff --print` / `clank agent start --print`.

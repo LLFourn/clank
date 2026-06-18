@@ -88,6 +88,9 @@ pub async fn run(args: ForkArgs) -> anyhow::Result<()> {
     if should_open(inside_zellij, args.no_open) {
         super::open_zellij::run(super::OpenZellijArgs {
             repo: Some(dest),
+            fork: None,
+            pr: None,
+            all: false,
             print: false,
         })
         .await?;
