@@ -292,6 +292,26 @@ fn install_codex_rule(path: &Path, dry_run: bool, summary: &mut Vec<String>) -> 
     Ok(())
 }
 
+/// Our Stop-hook entry, merged into the user's `settings.local.json`
+/// (typed-json-not-json-macro). Only the fragment WE contribute is
+/// typed; the surrounding read-modify-write stays `Value`-level since
+/// the file is user-owned.
+#[derive(serde::Serialize)]
+struct StopHookEntry<'a> {
+    id: &'a str,
+    #[serde(rename = "type")]
+    kind: &'a str,
+    command: &'a str,
+    timeout: u64,
+    #[serde(rename = "statusMessage", skip_serializing_if = "Option::is_none")]
+    status_message: Option<&'a str>,
+}
+
+#[derive(serde::Serialize)]
+struct StopHookWrapper<'a> {
+    hooks: [StopHookEntry<'a>; 1],
+}
+
 /// Tool-specific knowledge for the hook merger.
 trait HookKind {
     /// What goes into the `command` field of the JSON entry.
@@ -343,7 +363,9 @@ fn merge_hook_into_settings(
     let mut value: serde_json::Value = match std::fs::read_to_string(path) {
         Ok(s) => serde_json::from_str(&s)
             .with_context(|| format!("parsing `{}` as JSON", path.display()))?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            serde_json::Value::Object(serde_json::Map::new())
+        }
         Err(e) => return Err(e.into()),
     };
 
@@ -352,13 +374,13 @@ fn merge_hook_into_settings(
         .ok_or_else(|| anyhow::anyhow!("{} is not a JSON object", path.display()))?;
     let hooks = obj
         .entry("hooks".to_string())
-        .or_insert_with(|| serde_json::json!({}));
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
     let hooks = hooks
         .as_object_mut()
         .ok_or_else(|| anyhow::anyhow!("`hooks` is not a JSON object"))?;
     let stop = hooks
         .entry("Stop".to_string())
-        .or_insert_with(|| serde_json::json!([]));
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
     let stop = stop
         .as_array_mut()
         .ok_or_else(|| anyhow::anyhow!("`hooks.Stop` is not a JSON array"))?;
@@ -374,21 +396,14 @@ fn merge_hook_into_settings(
     // Add our fresh entry, tagged with HOOK_ID so future re-runs
     // (with whatever command shape we evolve to) can still find
     // and replace it.
-    let mut inner_hook = serde_json::json!({
-        "id": HOOK_ID,
-        "type": "command",
-        "command": kind.command(),
-        "timeout": HOOK_TIMEOUT_SECS,
-    });
-    if let Some(msg) = kind.status_message() {
-        inner_hook.as_object_mut().unwrap().insert(
-            "statusMessage".to_string(),
-            serde_json::Value::String(msg.into()),
-        );
-    }
-    stop.push(serde_json::json!({
-        "hooks": [inner_hook],
-    }));
+    let entry = StopHookEntry {
+        id: HOOK_ID,
+        kind: "command",
+        command: kind.command(),
+        timeout: HOOK_TIMEOUT_SECS,
+        status_message: kind.status_message(),
+    };
+    stop.push(serde_json::to_value(StopHookWrapper { hooks: [entry] })?);
 
     if !dry_run {
         if let Some(parent) = path.parent() {

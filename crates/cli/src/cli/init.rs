@@ -317,7 +317,9 @@ fn write_claude_perms(repo: &Path) -> anyhow::Result<()> {
     let mut value: serde_json::Value = match std::fs::read_to_string(&path) {
         Ok(s) => serde_json::from_str(&s)
             .with_context(|| format!("parsing `{}` as JSON", path.display()))?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            serde_json::Value::Object(serde_json::Map::new())
+        }
         Err(e) => return Err(e.into()),
     };
 
@@ -326,13 +328,13 @@ fn write_claude_perms(repo: &Path) -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("{} is not a JSON object", path.display()))?;
     let permissions = obj
         .entry("permissions".to_string())
-        .or_insert_with(|| serde_json::json!({}));
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
     let permissions = permissions
         .as_object_mut()
         .ok_or_else(|| anyhow::anyhow!("`permissions` is not a JSON object"))?;
     let allow = permissions
         .entry("allow".to_string())
-        .or_insert_with(|| serde_json::json!([]));
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
     let allow = allow
         .as_array_mut()
         .ok_or_else(|| anyhow::anyhow!("`permissions.allow` is not a JSON array"))?;
