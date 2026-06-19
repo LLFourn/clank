@@ -56,8 +56,22 @@ code.
   referenced name is missing OR the config is the old shape (message →
   `clank init --team`).
 - Drop `promoted`; master = `team.master`.
+- **BOOTSTRAP (ruthless ad14e7f — design requirement, not just
+  rollout):** the no-compat fail-close needs a from-scratch escape, or
+  migration is circular (`init --team <name>` needs a NEW-shape global
+  template that won't exist until the first `team save`, and the user
+  global is also old-shape). So bare `clank init` (no `--team`) MUST
+  write a VALID, possibly-empty new-shape `RepoConfigFile` (empty
+  `agents`, empty `team`) WITHOUT requiring any global template. The
+  from-scratch path: `clank init` → `agent add` + `team set-master` /
+  `team add` (M2) → operational → `team save` mints the first template.
+- Resolver fail-closes with DISTINCT messages: old-shape config →
+  "re-run `clank init`"; valid-but-empty team (no master) → "set up the
+  team (`clank team set-master …`)". The empty case is normal for a
+  freshly-bootstrapped repo, not an error to panic on.
 - Tests: resolve `{agents, team}` → registered set; missing-ref errors;
-  old-shape errors with the re-init hint.
+  old-shape errors with the re-init hint; empty bootstrapped config
+  parses + resolves to a clear no-master error.
 
 ## M2 — command reshuffle
 

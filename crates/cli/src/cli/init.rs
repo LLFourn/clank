@@ -7,7 +7,9 @@
 //! - install the `post-rewrite` git hook,
 //! - warn if the root gitignore swallows any `.clank/` path the
 //!   plan needs tracked,
-//! - with `--team <name>`, record the repo's chosen team.
+//! - write a self-contained repo config: bare init writes an
+//!   empty new-shape config; `--team <name>` copies a user-scope
+//!   team's composition + referenced agents into it.
 //!
 //! It does NOT bind a session, read agent env vars
 //! (`CLAUDE_CODE_SESSION_ID` / `CODEX_THREAD_ID`), prompt for an
@@ -41,62 +43,81 @@ pub async fn run(args: InitArgs) -> anyhow::Result<()> {
 
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
     match args.team.as_deref() {
-        // Explicit `--team <name>`: authoritative. Validates the
-        // team exists in user-scope and writes it (overwriting any
-        // prior selection).
+        // Explicit `--team <name>`: copy the named user-scope team's
+        // composition + its referenced agent descriptions into THIS
+        // repo's self-contained config (overwriting any prior team).
         Some(team_name) => {
             let home_ref = home.as_deref().ok_or_else(|| {
                 anyhow::anyhow!("$HOME not set; --team requires a user-scope config")
             })?;
             register_repo_team(home_ref, &repo, team_name)?;
         }
-        // Bare `clank init`: adopt the user's `default` team so the
-        // next workflow command works
-        // (`clank-init-defaults-to-default-team`). Three guards:
-        //   - never CLOBBER an existing selection (re-init on a repo
-        //     that already chose a team is a no-op for the team),
-        //   - never INVENT a team (only the literal `default`),
-        //   - never HARD-FAIL the scaffold (warn to stderr instead).
+        // Bare `clank init`: write a VALID empty new-shape config
+        // (empty agents, default team) WITHOUT requiring any global
+        // template. This is the from-scratch escape from the
+        // no-compat chicken-and-egg. Never CLOBBER an existing team
+        // selection on re-init.
         None => {
             if repo_has_team(&repo)? {
-                // Already chose a team; bare re-init preserves it.
-            } else if let Some(home_ref) = home.as_deref() {
-                let user_cfg = crate::cli::team::read_user_config(home_ref)?;
-                if user_cfg.teams.contains_key("default") {
-                    register_repo_team(home_ref, &repo, "default")?;
-                } else {
-                    eprintln!(
-                        "note: no `default` team in ~/.clank/config.json — this repo has no \
-                         team configured. Run `clank init --team <name>`, or create a default \
-                         team with `clank team create default` + `clank team set-master \
-                         default <agent>` / `clank team add default <agent>`."
-                    );
-                }
+                // Already configured; bare re-init preserves it.
             } else {
-                eprintln!(
-                    "note: $HOME not set; no team configured for this repo. \
-                     Run `clank init --team <name>`."
-                );
+                bootstrap_empty_repo_config(&repo)?;
             }
         }
     }
     Ok(())
 }
 
-/// True iff `<repo>/.clank/config.json` already has a `team`
-/// field. Keeps bare `clank init` from clobbering an existing
-/// team selection on re-init (ruthless cc4c7c8). Missing config →
-/// no team; malformed → fails closed (same policy as
-/// `register_repo_team`).
+/// Write a valid empty new-shape [`RepoConfigFile`] (empty
+/// `agents`, default [`TeamComposition`]). Standalone — needs no
+/// user-scope template. The repo then has a parseable config; the
+/// user designates a master via `clank team set-master <agent>` /
+/// `clank agent add` before any workflow command works.
+///
+/// Called only when there's no VALID new-shape config (the
+/// `repo_has_team` guard already ran), so an OLD-shape config is
+/// overwritten here — this is the "re-run `clank init` to
+/// recreate it" recovery path the loader error points users at.
+fn bootstrap_empty_repo_config(repo: &Path) -> anyhow::Result<()> {
+    use crate::cli::teams_config::RepoConfigFile;
+    let repo_cfg_path = repo.join(".clank/config.json");
+    write_repo_config(&repo_cfg_path, &RepoConfigFile::default())?;
+    eprintln!(
+        "wrote empty team config to {} — set a master with \
+         `clank team set-master <agent>` (or `clank agent add <label> --tool <claude|codex>`)",
+        repo_cfg_path.display()
+    );
+    Ok(())
+}
+
+/// Atomic write of a typed config via tempfile + rename.
+fn write_repo_config<T: serde::Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
+    use std::io::Write;
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("no parent for `{}`", path.display()))?;
+    std::fs::create_dir_all(parent)?;
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".clank-config-")
+        .suffix(".json.tmp")
+        .tempfile_in(parent)?;
+    tmp.write_all(serde_json::to_string_pretty(value)?.as_bytes())?;
+    tmp.write_all(b"\n")?;
+    tmp.as_file_mut().sync_all()?;
+    tmp.persist(path).map_err(|e| e.error)?;
+    Ok(())
+}
+
+/// True iff `<repo>/.clank/config.json` already exists and parses
+/// as a new-shape [`RepoConfigFile`]. Keeps bare `clank init`
+/// from clobbering a VALID existing repo config on re-init (the
+/// team composition lives in this file now). Missing config OR an
+/// OLD-shape config → false, so bare init writes/recreates a
+/// fresh empty config (the documented recovery path).
 fn repo_has_team(repo: &Path) -> anyhow::Result<bool> {
-    use anyhow::Context;
     let path = repo.join(".clank/config.json");
     match std::fs::read_to_string(&path) {
-        Ok(s) => {
-            let cfg: crate::cli::teams_config::RepoConfigFile =
-                serde_json::from_str(&s).with_context(|| format!("parsing {}", path.display()))?;
-            Ok(cfg.team.is_some())
-        }
+        Ok(s) => Ok(serde_json::from_str::<crate::cli::teams_config::RepoConfigFile>(&s).is_ok()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(e) => Err(anyhow::Error::from(e).context(format!("reading {}", path.display()))),
     }
@@ -354,23 +375,25 @@ fn matched_by_clank_gitignore(record: &str) -> bool {
         && p.parent().is_some_and(|parent| parent.ends_with(".clank"))
 }
 
-/// Select a team for a repo: write `team: "<name>"` to
-/// `<repo>/.clank/config.json`. `pub`, env-free core (takes
+/// Select a team for a repo by COPYING the named user-scope
+/// team's composition + its referenced agent descriptions into
+/// `<repo>/.clank/config.json` (the repo config is
+/// self-contained — no `include`). `pub`, env-free core (takes
 /// `home` + `repo` explicitly) — both `clank init --team` and
-/// integration-test setup call it. Plan:
-/// dogfood-init-setup-in-tests (Phase A).
+/// integration-test setup call it.
 ///
 /// Validations:
 /// - The named team must exist in user-scope
-///   `~/.clank/config.json#/teams`. Reading nothing → error
-///   (the user needs to `clank team create <name>` first).
+///   `~/.clank/config.json#/teams`.
+/// - Every agent it references (master + reviewers) must be
+///   declared in user-scope `agents`.
 /// - Existing repo config round-trips through the new schema's
 ///   `extra` flatten catchall, so unknown fields
 ///   (review/hooks/diff sections, etc.) are preserved.
 pub fn register_repo_team(home: &Path, repo: &Path, team_name: &str) -> anyhow::Result<()> {
-    use crate::cli::teams_config::{RepoConfigFile, TeamField, UserConfigFile};
+    use crate::cli::teams_config::{RepoConfigFile, UserConfigFile};
     use anyhow::Context;
-    use std::io::Write;
+    use clank_core::ids::AgentLabel;
 
     // Validate against user-scope teams.
     let user_path = home.join(".clank/config.json");
@@ -386,12 +409,38 @@ pub fn register_repo_team(home: &Path, repo: &Path, team_name: &str) -> anyhow::
             return Err(anyhow::Error::from(e).context(format!("reading {}", user_path.display())));
         }
     };
-    if !user_cfg.teams.contains_key(team_name) {
-        anyhow::bail!(
+    let team = user_cfg.teams.get(team_name).ok_or_else(|| {
+        anyhow::anyhow!(
             "team `{team_name}` not declared in user-scope teams. Create it with \
              `clank team create {team_name}` (and optionally `clank team set-master \
              {team_name} <agent>` + `clank team add {team_name} <agent>`) first."
-        );
+        )
+    })?;
+
+    // Copy the referenced agent descriptions into the repo so it
+    // is self-contained.
+    let mut agents = std::collections::BTreeMap::new();
+    let mut copy_agent = |label: &AgentLabel| -> anyhow::Result<()> {
+        let desc = user_cfg.agents.get(label).ok_or_else(|| {
+            anyhow::anyhow!(
+                "team `{team_name}` references agent `{}`, which is not declared in user-scope \
+                 `agents`. Add it with `clank agent add --global {} --tool <claude|codex>`.",
+                label.as_str(),
+                label.as_str()
+            )
+        })?;
+        agents.insert(label.clone(), desc.clone());
+        Ok(())
+    };
+    if let Some(master) = &team.master {
+        copy_agent(master)?;
+    }
+    for r in team
+        .commit_reviewers
+        .iter()
+        .chain(team.gate_reviewers.iter())
+    {
+        copy_agent(r)?;
     }
 
     let repo_cfg_path = repo.join(".clank/config.json");
@@ -409,23 +458,12 @@ pub fn register_repo_team(home: &Path, repo: &Path, team_name: &str) -> anyhow::
             );
         }
     };
-    repo_cfg.team = Some(TeamField::Single(team_name.to_string()));
+    repo_cfg.agents = agents;
+    repo_cfg.team = team.clone();
 
-    // Atomic write via tempfile + rename.
-    let parent = repo_cfg_path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("no parent for `{}`", repo_cfg_path.display()))?;
-    std::fs::create_dir_all(parent)?;
-    let mut tmp = tempfile::Builder::new()
-        .prefix(".clank-config-")
-        .suffix(".json.tmp")
-        .tempfile_in(parent)?;
-    tmp.write_all(serde_json::to_string_pretty(&repo_cfg)?.as_bytes())?;
-    tmp.write_all(b"\n")?;
-    tmp.as_file_mut().sync_all()?;
-    tmp.persist(&repo_cfg_path).map_err(|e| e.error)?;
+    write_repo_config(&repo_cfg_path, &repo_cfg)?;
     eprintln!(
-        "wrote `team: \"{team_name}\"` to {}",
+        "wrote team `{team_name}` composition to {}",
         repo_cfg_path.display()
     );
     Ok(())
@@ -710,17 +748,98 @@ mod tests {
 
     #[test]
     fn write_repo_team_field_records_team_in_new_schema() {
-        use crate::cli::teams_config::{RepoConfigFile, TeamField};
+        // `--team dev` copies dev's composition + referenced
+        // agent descriptions into the self-contained repo config.
+        use crate::cli::teams_config::{
+            AgentDescription, RepoConfigFile, TeamComposition, UserConfigFile,
+        };
+        use clank_core::ids::AgentLabel;
+        use clank_core::vocab::Tool;
         let user_home = tempfile::tempdir().unwrap();
-        write_user_teams(user_home.path(), &["dev"]);
+        let mut cfg = UserConfigFile::default();
+        cfg.agents.insert(
+            AgentLabel::parse("claude").unwrap(),
+            AgentDescription {
+                tool: Tool::Claude,
+                launch: None,
+                initial_prompt: None,
+            },
+        );
+        cfg.agents.insert(
+            AgentLabel::parse("codex").unwrap(),
+            AgentDescription {
+                tool: Tool::Codex,
+                launch: None,
+                initial_prompt: None,
+            },
+        );
+        cfg.teams.insert(
+            "dev".to_string(),
+            TeamComposition {
+                master: Some(AgentLabel::parse("claude").unwrap()),
+                commit_reviewers: vec![AgentLabel::parse("codex").unwrap()],
+                gate_reviewers: vec![],
+            },
+        );
+        let path = user_home.path().join(".clank/config.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, serde_json::to_string_pretty(&cfg).unwrap()).unwrap();
+
         let repo = init_repo();
         register_repo_team(user_home.path(), repo.path(), "dev").unwrap();
         let body = std::fs::read_to_string(repo.path().join(".clank/config.json")).unwrap();
         let parsed: RepoConfigFile = serde_json::from_str(&body).unwrap();
-        match parsed.team {
-            Some(TeamField::Single(ref s)) => assert_eq!(s, "dev"),
-            other => panic!("expected Single(dev); got {other:?}"),
-        }
+        assert_eq!(parsed.team.master.as_ref().unwrap().as_str(), "claude");
+        assert_eq!(parsed.team.commit_reviewers[0].as_str(), "codex");
+        // Referenced agent descriptions were copied in.
+        assert_eq!(parsed.agents.len(), 2);
+        assert!(
+            parsed
+                .agents
+                .contains_key(&AgentLabel::parse("claude").unwrap())
+        );
+        assert!(
+            parsed
+                .agents
+                .contains_key(&AgentLabel::parse("codex").unwrap())
+        );
+    }
+
+    #[test]
+    fn bare_init_writes_empty_valid_repo_config() {
+        // From-scratch path: bare init must produce a VALID
+        // new-shape config (empty agents, default team) with no
+        // user-scope template.
+        use crate::cli::teams_config::{RepoConfigFile, ResolutionError, resolve_registered_set};
+        let repo = init_repo();
+        bootstrap_empty_repo_config(repo.path()).unwrap();
+        let body = std::fs::read_to_string(repo.path().join(".clank/config.json")).unwrap();
+        let parsed: RepoConfigFile = serde_json::from_str(&body).unwrap();
+        assert!(parsed.agents.is_empty());
+        assert!(parsed.team.master.is_none());
+        // It resolves to NoMaster (the expected bootstrapped state).
+        assert!(matches!(
+            resolve_registered_set(&parsed).unwrap_err(),
+            ResolutionError::NoMaster
+        ));
+    }
+
+    #[test]
+    fn repo_has_team_false_for_old_shape_so_bare_init_recreates() {
+        // An old-shape config (legacy `team: "name"`) is NOT a
+        // valid new-shape config → repo_has_team is false, so
+        // bare init overwrites it with a fresh empty config (the
+        // documented "re-run `clank init`" recovery path).
+        use crate::cli::teams_config::RepoConfigFile;
+        let repo = init_repo();
+        std::fs::create_dir_all(repo.path().join(".clank")).unwrap();
+        std::fs::write(repo.path().join(".clank/config.json"), r#"{"team":"dev"}"#).unwrap();
+        assert!(!repo_has_team(repo.path()).unwrap());
+        bootstrap_empty_repo_config(repo.path()).unwrap();
+        let body = std::fs::read_to_string(repo.path().join(".clank/config.json")).unwrap();
+        let parsed: RepoConfigFile = serde_json::from_str(&body).unwrap();
+        assert!(parsed.team.master.is_none());
+        assert!(parsed.agents.is_empty());
     }
 
     #[test]

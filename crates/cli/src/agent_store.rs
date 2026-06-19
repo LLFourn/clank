@@ -136,35 +136,8 @@ pub fn reviewer_tiers_for_render_with(
     }
 }
 
-/// Plan: teams-based-agent-registration (phase 6b).
-///
-/// Shared dispatch helper for `load_reviewer_tiers`,
-/// `reviewer_tiers_for_render`, and `resolve_role`. Returns:
-/// - `Ok(Some(RegisteredSet))` when the repo config parses
-///   AND has a `team` field. The set is the result of running
-///   `resolve_registered_set` against the new typed schemas.
-/// - `Ok(None)` when the repo has no `team` field set (or no
-///   repo config exists). This is "no team configured" — the
-///   callers handle it per the render-vs-workflow boundary:
-///   workflow commands error (`no_team_configured()`),
-///   read-only renderers degrade to empty tiers. There is no
-///   legacy fallback.
-///
-/// Failure modes:
-/// - Repo config exists but new-schema parse fails (a
-///   strongly-typed field like `team` has the wrong shape, e.g.
-///   `team: 42`): returns an error (fail-closed). A legacy
-///   `agents` array does NOT trigger this — the new
-///   `RepoConfigFile` has no `agents` field, so the array lands
-///   in the `extra` flatten catchall, parse SUCCEEDS, and the
-///   repo falls through to `Ok(None)` (no team).
-/// - User config doesn't parse as new-schema when team is
-///   set: error propagates (fail-closed).
-/// - `resolve_registered_set` returns error (UnknownTeam,
-///   NoMaster, etc.): error propagates.
-/// Plan: teams-based-agent-registration (codex b59dafb pure
-/// helper). Derive a role from a resolved registered set.
-/// Pure: no $HOME, no filesystem. Testable directly.
+/// Derive a role from a resolved registered set. Pure: no
+/// $HOME, no filesystem. Testable directly.
 pub fn role_from_registered_set(
     set: &crate::cli::teams_config::RegisteredSet,
     label: &AgentLabel,
@@ -192,57 +165,95 @@ pub fn try_resolve_via_team(
     try_resolve_via_team_with(repo, home.as_deref())
 }
 
-/// Plan: teams-based-agent-registration (ruthless pin 1).
+/// Shared dispatch helper for `load_reviewer_tiers`,
+/// `reviewer_tiers_for_render`, and `resolve_role`. Returns:
+/// - `Ok(Some(RegisteredSet))` when the repo config parses and
+///   resolves (a master is set).
+/// - `Ok(None)` when there's no repo config OR the repo has no
+///   master yet (`ResolutionError::NoMaster`). This is "no team
+///   configured" — workflow commands error
+///   (`no_team_configured()`), read-only renderers degrade to
+///   empty tiers.
+/// - `Err(_)` (fail-closed) when the config is malformed, uses
+///   the old team schema (re-init hint), or resolution fails for
+///   any reason other than `NoMaster` (e.g. `UnknownAgent`).
 ///
-/// Testable workhorse that the production [`try_resolve_via_team`]
-/// wraps with `$HOME`. Same semantics; explicit `home`
-/// parameter so tests and in-process query cores can seed both
-/// repo and user configs without env mutation.
+/// The `home` parameter is unused: the repo config is now
+/// self-contained (it carries its own `agents`). It's kept so
+/// the many workflow callers need no signature changes.
 pub fn try_resolve_via_team_with(
     repo: &Path,
-    home: Option<&Path>,
+    _home: Option<&Path>,
 ) -> anyhow::Result<Option<crate::cli::teams_config::RegisteredSet>> {
-    use crate::cli::teams_config::{RepoConfigFile, UserConfigFile, resolve_registered_set};
+    use crate::cli::teams_config::{ResolutionError, resolve_registered_set};
 
     let repo_cfg_path = repo.join(".clank/config.json");
-    let body = match std::fs::read_to_string(&repo_cfg_path) {
+    let Some(repo_cfg) = load_repo_config(&repo_cfg_path)? else {
+        return Ok(None);
+    };
+
+    // The repo is self-contained: master + reviewers reference
+    // labels in the repo's own `agents`. A bootstrapped repo
+    // (no master yet) resolves to `NoMaster` — surfaced as
+    // `Ok(None)` so workflow callers report "no team configured"
+    // and read-only renderers degrade to empty tiers, rather
+    // than every command erroring before the user has set a
+    // master.
+    match resolve_registered_set(&repo_cfg) {
+        Ok(set) => Ok(Some(set)),
+        Err(ResolutionError::NoMaster) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Load + parse `<repo>/.clank/config.json` as the new-shape
+/// [`RepoConfigFile`]. Returns `Ok(None)` if the file doesn't
+/// exist. Fail-closed: an old-shape config (legacy `team:
+/// "name"` / `team: [array]` / `promoted`) no longer parses as
+/// `TeamComposition`/`agents`, so rather than surface a cryptic
+/// serde message we map it to an actionable re-init hint.
+fn load_repo_config(
+    repo_cfg_path: &Path,
+) -> anyhow::Result<Option<crate::cli::teams_config::RepoConfigFile>> {
+    use crate::cli::teams_config::RepoConfigFile;
+    let body = match std::fs::read_to_string(repo_cfg_path) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.into()),
     };
-    // Fail-closed on parse error (codex b59dafb catch). A
-    // leftover legacy `agents` array DOES parse here — the new
-    // schema has no `agents` field, so the array lands in
-    // `extra`. A real parse error means the file is genuinely
-    // malformed (invalid JSON, or a strongly-typed field like
-    // `team` with the wrong shape) and must surface, not be
-    // turned into a silent `Ok(None)`.
-    let repo_cfg: RepoConfigFile = serde_json::from_str(&body).map_err(|e| {
-        anyhow::anyhow!(
+    match serde_json::from_str::<RepoConfigFile>(&body) {
+        Ok(cfg) => Ok(Some(cfg)),
+        Err(_) if is_legacy_repo_shape(&body) => Err(legacy_repo_schema_error(repo_cfg_path)),
+        Err(e) => Err(anyhow::anyhow!(
             "parsing {} as new-schema RepoConfigFile: {e}",
             repo_cfg_path.display()
-        )
-    })?;
-    if repo_cfg.team.is_none() {
-        return Ok(None);
+        )),
     }
+}
 
-    // Team is set: read user-scope new schema and resolve.
-    let user_cfg: UserConfigFile = match home {
-        Some(h) => {
-            let p = h.join(".clank/config.json");
-            match std::fs::read_to_string(&p) {
-                Ok(s) => serde_json::from_str(&s).map_err(|e| {
-                    anyhow::anyhow!("parsing {} as new-schema UserConfigFile: {e}", p.display())
-                })?,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => UserConfigFile::default(),
-                Err(e) => return Err(e.into()),
-            }
-        }
-        None => UserConfigFile::default(),
+/// Detect the old repo team schema: `team` as a string/array, or
+/// a top-level `promoted` field. The new schema stores `team` as
+/// an object ([`TeamComposition`]) and has no `promoted`, so
+/// either shape is unambiguously legacy.
+fn is_legacy_repo_shape(body: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
     };
+    let Some(obj) = value.as_object() else {
+        return false;
+    };
+    if obj.contains_key("promoted") {
+        return true;
+    }
+    matches!(obj.get("team"), Some(t) if t.is_string() || t.is_array())
+}
 
-    Ok(Some(resolve_registered_set(&user_cfg, &repo_cfg)?))
+fn legacy_repo_schema_error(repo_cfg_path: &Path) -> anyhow::Error {
+    anyhow::anyhow!(
+        "{}: this repo's `.clank/config.json` uses the old team schema; \
+         re-run `clank init` to recreate it",
+        repo_cfg_path.display()
+    )
 }
 
 /// Same as [`load_all_agent_configs`] but silently drops agents
@@ -497,47 +508,12 @@ mod tests {
     //    (ruthless pin 1 on 8c0fdb2: the dispatch helper had
     //    no tests despite codex catching two bugs in it). ──
 
-    use crate::cli::teams_config::{TeamComposition, UserConfigFile};
-    use std::collections::BTreeMap;
     use tempfile::TempDir;
 
     fn write_repo_config(repo: &Path, body: &str) {
         let p = repo.join(".clank/config.json");
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         std::fs::write(&p, body).unwrap();
-    }
-
-    fn write_user_config_with_team(home: &Path) {
-        let mut user_cfg = UserConfigFile::default();
-        user_cfg.agents.insert(
-            label("codex"),
-            AgentDescription {
-                tool: Tool::Codex,
-                launch: None,
-                initial_prompt: None,
-            },
-        );
-        user_cfg.agents.insert(
-            label("claude"),
-            AgentDescription {
-                tool: Tool::Claude,
-                launch: None,
-                initial_prompt: None,
-            },
-        );
-        let mut teams = BTreeMap::new();
-        teams.insert(
-            "dev".to_string(),
-            TeamComposition {
-                master: Some(label("codex")),
-                commit_reviewers: vec![label("claude")],
-                gate_reviewers: vec![],
-            },
-        );
-        user_cfg.teams = teams;
-        let p = home.join(".clank/config.json");
-        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-        std::fs::write(&p, serde_json::to_string_pretty(&user_cfg).unwrap()).unwrap();
     }
 
     #[test]
@@ -549,24 +525,33 @@ mod tests {
     }
 
     #[test]
-    fn try_resolve_via_team_with_returns_none_when_no_team_field() {
-        // Repo config exists but has no `team` field set.
+    fn try_resolve_via_team_with_returns_none_when_empty_config() {
+        // Bootstrapped repo (empty agents, default team) has no
+        // master yet → None (no team configured).
         let repo = TempDir::new().unwrap();
         let home = TempDir::new().unwrap();
         write_repo_config(repo.path(), "{}");
         let r = try_resolve_via_team_with(repo.path(), Some(home.path())).unwrap();
-        assert!(r.is_none(), "no team field → None (no team configured)");
+        assert!(r.is_none(), "empty config → None (no master yet)");
     }
 
     #[test]
     fn try_resolve_via_team_with_returns_set_when_team_resolves() {
         let repo = TempDir::new().unwrap();
         let home = TempDir::new().unwrap();
-        write_user_config_with_team(home.path());
-        write_repo_config(repo.path(), r#"{"team": "dev"}"#);
+        write_repo_config(
+            repo.path(),
+            r#"{
+                "agents": {
+                    "codex": { "tool": "codex" },
+                    "claude": { "tool": "claude" }
+                },
+                "team": { "master": "codex", "commit_reviewers": ["claude"] }
+            }"#,
+        );
         let set = try_resolve_via_team_with(repo.path(), Some(home.path()))
             .unwrap()
-            .expect("team field present → Some(set)");
+            .expect("master set → Some(set)");
         assert_eq!(set.master.as_str(), "codex");
         assert_eq!(set.commit_reviewers.len(), 1);
         assert_eq!(set.commit_reviewers[0].label.as_str(), "claude");
@@ -574,19 +559,45 @@ mod tests {
 
     #[test]
     fn try_resolve_via_team_with_propagates_resolver_errors() {
-        // Team is set but the named team doesn't exist in
-        // user-scope → ResolutionError::UnknownTeam propagates.
+        // Master references an agent not defined in the repo's
+        // `agents` → ResolutionError::UnknownAgent propagates.
         let repo = TempDir::new().unwrap();
         let home = TempDir::new().unwrap();
-        // user-scope has no teams.
-        std::fs::create_dir_all(home.path().join(".clank")).unwrap();
-        std::fs::write(home.path().join(".clank/config.json"), "{}").unwrap();
-        write_repo_config(repo.path(), r#"{"team": "phantom"}"#);
+        write_repo_config(repo.path(), r#"{"team": {"master": "phantom"}}"#);
         let err = try_resolve_via_team_with(repo.path(), Some(home.path())).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("phantom") || msg.contains("not declared") || msg.contains("UnknownTeam"),
-            "expected UnknownTeam error; got: {msg}"
+            msg.contains("phantom") || msg.contains("not defined"),
+            "expected UnknownAgent error; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn try_resolve_via_team_with_fails_closed_on_old_team_string_shape() {
+        let repo = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        write_repo_config(repo.path(), r#"{"team": "dev"}"#);
+        let err = try_resolve_via_team_with(repo.path(), Some(home.path())).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("old team schema") && msg.contains("clank init"),
+            "expected re-init hint; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn try_resolve_via_team_with_fails_closed_on_old_promoted_shape() {
+        let repo = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        write_repo_config(
+            repo.path(),
+            r#"{"team": [{"include": "dev"}], "promoted": "codex"}"#,
+        );
+        let err = try_resolve_via_team_with(repo.path(), Some(home.path())).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("old team schema") && msg.contains("clank init"),
+            "expected re-init hint; got: {msg}"
         );
     }
 }

@@ -263,10 +263,11 @@ fn master_agents_empty_when_no_team_master() {
     let dir = init_repo();
     let repo = dir.path();
     let cfg = serde_json::json!({
-        "team": [
-            {"label": "a", "tool": "claude", "review": "commit"},
-            {"label": "b", "tool": "claude", "review": "commit"}
-        ]
+        "agents": {
+            "a": {"tool": "claude"},
+            "b": {"tool": "claude"}
+        },
+        "team": { "commit_reviewers": ["a", "b"] }
     });
     write(
         repo,
