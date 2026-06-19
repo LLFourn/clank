@@ -537,9 +537,12 @@ async fn run_watch(
 /// (last `LOG_WINDOW` commits; gix-backed reads, no per-event
 /// subprocess — ruthless 54c37f6 concern 1) rendered through the
 /// shared `clank log --oneline` row producer to PLAIN lines (the
-/// TUI styles them). Scope: the single active plan's events when
-/// exactly one plan is active, repo-wide otherwise. Best-effort:
-/// any failure yields an empty pane, never a status error.
+/// TUI styles them). Scope: repo-wide recent activity, ALWAYS — the
+/// pane shows the same window regardless of how many plans are active
+/// (status-tui-unified-log; the old single-active-plan narrowing made
+/// a just-finished plan's commits vanish the moment one plan was
+/// active). Best-effort: any failure yields an empty pane, never a
+/// status error.
 async fn recent_log_rows(repo: &Path, state: &RepoState) -> Vec<crate::cli::log::OnelineRow> {
     use clank_core::repo_state::LogEvent;
     const LOG_WINDOW: usize = 30;
@@ -553,28 +556,7 @@ async fn recent_log_rows(repo: &Path, state: &RepoState) -> Vec<crate::cli::log:
         return Vec::new();
     };
 
-    let active: Vec<&PlanKey> = state.fold.plans.keys().collect();
-    let plan_filter: Option<&PlanKey> = match active.as_slice() {
-        [only] => Some(only),
-        _ => None,
-    };
-    let filtered: Vec<&LogEvent> = events
-        .iter()
-        .filter(|e| match e {
-            // Ad-hoc commits are real, uncategorized activity — always
-            // show them (show-adhoc-commits-in-status). Only the PLAN
-            // timeline is narrowed to the single active plan; dropping
-            // ad-hoc here made `status` look idle while ad-hoc work
-            // (e.g. `[non-plan-tag]` commits) piled up.
-            LogEvent::AdHoc { .. } => true,
-            LogEvent::PlanIntro { plan, .. }
-            | LogEvent::PlanCommit { plan, .. }
-            | LogEvent::PlanFinalized { plan, .. }
-            | LogEvent::PlanDeleted { plan, .. } => plan_filter.is_none_or(|f| f == plan),
-        })
-        .collect();
-
-    let reviewable: Vec<crate::lifecycle::CommitSha> = filtered
+    let reviewable: Vec<crate::lifecycle::CommitSha> = events
         .iter()
         .filter_map(|e| match e {
             LogEvent::PlanCommit { sha, .. }
@@ -585,7 +567,7 @@ async fn recent_log_rows(repo: &Path, state: &RepoState) -> Vec<crate::cli::log:
         .collect();
     let reviews = crate::cli::log::collect_reviews(repo, &reviewable);
     // Newest first, like `clank log` — the pane reads top-down.
-    let newest_first: Vec<&LogEvent> = filtered.into_iter().rev().collect();
+    let newest_first: Vec<&LogEvent> = events.iter().rev().collect();
     crate::cli::log::oneline_rows(&newest_first, &reviews)
 }
 
