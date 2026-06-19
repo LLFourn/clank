@@ -615,15 +615,17 @@ pub fn define_repo_agent(
 fn remove(args: AgentRemoveArgs) -> anyhow::Result<()> {
     let label = AgentLabel::parse(&args.label)
         .map_err(|e| anyhow::anyhow!("invalid agent label `{}`: {e}", args.label))?;
-    let repo = resolve_repo(args.repo.as_deref())?;
 
     if args.global {
+        // User-scope op: needs only $HOME, never repo discovery (mirror
+        // `agent add --global`) — codex ec37092.
         let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
         let home_ref = home
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("--global requires $HOME"))?;
         remove_global_agent(home_ref, &label)?;
     } else {
+        let repo = resolve_repo(args.repo.as_deref())?;
         remove_repo_agent(&repo, &label)?;
     }
     Ok(())
