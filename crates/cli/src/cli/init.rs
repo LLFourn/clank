@@ -50,7 +50,7 @@ pub async fn run(args: InitArgs) -> anyhow::Result<()> {
             let home_ref = home.as_deref().ok_or_else(|| {
                 anyhow::anyhow!("$HOME not set; --team requires a user-scope config")
             })?;
-            register_repo_team(home_ref, &repo, team_name)?;
+            register_repo_team_guarded(home_ref, &repo, team_name, args.force)?;
         }
         // Bare `clank init`: write a VALID empty new-shape config
         // (empty agents, default team) WITHOUT requiring any global
@@ -375,6 +375,32 @@ fn matched_by_clank_gitignore(record: &str) -> bool {
         && p.parent().is_some_and(|parent| parent.ends_with(".clank"))
 }
 
+/// `clank init --team`'s entry point: apply the overwrite guard,
+/// then copy the team down. Refuses to clobber a repo that already
+/// has a CONFIGURED team (a non-default [`TeamComposition`]) unless
+/// `force`. The check reads through [`crate::agent_store::repo_config_if_valid`],
+/// which ignores the legacy shape — an old-shape config is the
+/// documented "re-run `clank init`" recovery path, so it's allowed
+/// to be overwritten. A freshly-bootstrapped empty team is not
+/// "configured", so the first `--team` after a bare `clank init`
+/// is unaffected. `pub`, env-free (explicit `home`/`repo`).
+pub fn register_repo_team_guarded(
+    home: &Path,
+    repo: &Path,
+    team_name: &str,
+    force: bool,
+) -> anyhow::Result<()> {
+    let configured = crate::agent_store::repo_config_if_valid(repo)?
+        .is_some_and(|c| !crate::cli::teams_config::is_default_team(&c.team));
+    if configured && !force {
+        anyhow::bail!(
+            "repo already has a team; run `clank team save {team_name}` first to keep \
+             local edits, or pass --force to replace"
+        );
+    }
+    register_repo_team(home, repo, team_name)
+}
+
 /// Select a team for a repo by COPYING the named user-scope
 /// team's composition + its referenced agent descriptions into
 /// `<repo>/.clank/config.json` (the repo config is
@@ -390,6 +416,11 @@ fn matched_by_clank_gitignore(record: &str) -> bool {
 /// - Existing repo config round-trips through the new schema's
 ///   `extra` flatten catchall, so unknown fields
 ///   (review/hooks/diff sections, etc.) are preserved.
+///
+/// This is the env-free copy-down core, reused by integration-test
+/// setup. The `clank init --team` overwrite guard lives in
+/// [`register_repo_team_guarded`], not here, so the dogfood helpers
+/// keep a stable signature.
 pub fn register_repo_team(home: &Path, repo: &Path, team_name: &str) -> anyhow::Result<()> {
     use crate::cli::teams_config::{RepoConfigFile, UserConfigFile};
     use anyhow::Context;
@@ -874,5 +905,79 @@ mod tests {
             body, "something/else\n",
             "drifted file must not be overwritten"
         );
+    }
+
+    // ── clank init --team overwrite guard (M3) ───────────────
+
+    fn seed_user_team_dev(home: &Path) {
+        use crate::cli::teams_config::{AgentDescription, TeamComposition, UserConfigFile};
+        use clank_core::ids::AgentLabel;
+        use clank_core::vocab::Tool;
+        let mut cfg = UserConfigFile::default();
+        cfg.agents.insert(
+            AgentLabel::parse("claude").unwrap(),
+            AgentDescription {
+                tool: Tool::Claude,
+                launch: None,
+                initial_prompt: None,
+            },
+        );
+        cfg.teams.insert(
+            "dev".to_string(),
+            TeamComposition {
+                master: Some(AgentLabel::parse("claude").unwrap()),
+                commit_reviewers: vec![],
+                gate_reviewers: vec![],
+            },
+        );
+        let path = home.join(".clank/config.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, serde_json::to_string_pretty(&cfg).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn register_repo_team_guarded_refuses_overwrite_of_configured_team() {
+        use crate::cli::teams_config::RepoConfigFile;
+        let home = tempfile::tempdir().unwrap();
+        seed_user_team_dev(home.path());
+        let repo = init_repo();
+        // First registration: succeeds (no prior team).
+        register_repo_team_guarded(home.path(), repo.path(), "dev", false).unwrap();
+        let before = std::fs::read_to_string(repo.path().join(".clank/config.json")).unwrap();
+
+        // Second registration without force: refuse, leave config
+        // untouched.
+        let err = register_repo_team_guarded(home.path(), repo.path(), "dev", false).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("repo already has a team"));
+        assert!(msg.contains("clank team save"));
+        let after = std::fs::read_to_string(repo.path().join(".clank/config.json")).unwrap();
+        assert_eq!(before, after, "config must not change on refusal");
+
+        // With force: replace.
+        register_repo_team_guarded(home.path(), repo.path(), "dev", true).unwrap();
+        let parsed: RepoConfigFile = serde_json::from_str(
+            &std::fs::read_to_string(repo.path().join(".clank/config.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(parsed.team.master.as_ref().unwrap().as_str(), "claude");
+    }
+
+    #[test]
+    fn register_repo_team_guarded_allows_first_team_after_bare_init() {
+        // A freshly-bootstrapped empty repo config is NOT a
+        // configured team, so the first `--team` is allowed.
+        use crate::cli::teams_config::RepoConfigFile;
+        let home = tempfile::tempdir().unwrap();
+        seed_user_team_dev(home.path());
+        let repo = init_repo();
+        bootstrap_empty_repo_config(repo.path()).unwrap();
+
+        register_repo_team_guarded(home.path(), repo.path(), "dev", false).unwrap();
+        let parsed: RepoConfigFile = serde_json::from_str(
+            &std::fs::read_to_string(repo.path().join(".clank/config.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(parsed.team.master.as_ref().unwrap().as_str(), "claude");
     }
 }

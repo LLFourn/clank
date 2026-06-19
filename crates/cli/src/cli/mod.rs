@@ -16,6 +16,7 @@ pub mod block;
 pub mod config;
 pub mod diff;
 pub mod doctor;
+pub mod export;
 pub mod feedback;
 pub mod finish;
 pub mod fork;
@@ -104,6 +105,12 @@ pub struct InitArgs {
     /// Overwrite an existing foreign `post-rewrite` hook.
     #[arg(long)]
     pub force_hooks: bool,
+    /// With `--team <name>`: replace an existing VALID repo team.
+    /// Without it, `--team` refuses to clobber a configured repo
+    /// team (run `clank team save <name>` first to keep local
+    /// edits). Bare `clank init` ignores this flag.
+    #[arg(long)]
+    pub force: bool,
     /// Pick a user-scope team template for this repo. Copies the
     /// named team's composition + referenced agent definitions
     /// into `<repo>/.clank/config.json`. The team must exist in
@@ -113,6 +120,13 @@ pub struct InitArgs {
     /// one and tell you to re-run with `--team`.
     #[arg(long, value_name = "NAME")]
     pub team: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct ExportArgs {
+    /// Repo root. Defaults to the cwd's git toplevel.
+    #[arg(long, value_name = "PATH")]
+    pub repo: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -973,6 +987,13 @@ pub enum TeamCmd {
     /// Set THIS repo's team master; the previous master (if any)
     /// is demoted into commit_reviewers.
     SetMaster(TeamSetMasterArgs),
+    /// Publish THIS repo's operating team as a reusable global
+    /// template under `<name>` (user-scope `teams`), copying the
+    /// team's referenced agent definitions into user-scope
+    /// `agents`. Refuses if a referenced agent already exists
+    /// globally with a different body; pass `--force` to overwrite
+    /// an existing team name.
+    Save(TeamSaveArgs),
     /// List the global team-template library (user-scope).
     List(TeamListArgs),
     /// Delete a global team template. Refuses without `--force`
@@ -1036,6 +1057,21 @@ pub struct TeamSetMasterArgs {
     /// from repo `agents`, else copied down from user-scope
     /// `agents`.
     pub agent: String,
+    /// Repo root. Defaults to the cwd's git toplevel.
+    #[arg(long, value_name = "PATH")]
+    pub repo: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub struct TeamSaveArgs {
+    /// Name to publish THIS repo's team under in the global
+    /// library (`~/.clank/config.json#/teams`).
+    pub name: String,
+    /// Overwrite an existing user-scope team of the same name.
+    /// Does NOT bypass the agent-body collision check — that's a
+    /// hard error regardless.
+    #[arg(long)]
+    pub force: bool,
     /// Repo root. Defaults to the cwd's git toplevel.
     #[arg(long, value_name = "PATH")]
     pub repo: Option<PathBuf>,

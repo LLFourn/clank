@@ -206,6 +206,48 @@ pub fn try_resolve_via_team_with(
     }
 }
 
+/// Load `<repo>/.clank/config.json` through the same fail-closed
+/// loader the resolver uses, requiring the file to exist. Missing
+/// file OR old-shape config → re-init hint. Used by `clank team
+/// save` and `clank export`, which need the repo's self-contained
+/// config and must reject the legacy shape rather than silently
+/// publishing/dumping a half-parsed one.
+pub fn load_repo_config_required(
+    repo: &Path,
+) -> anyhow::Result<crate::cli::teams_config::RepoConfigFile> {
+    let repo_cfg_path = repo.join(".clank/config.json");
+    load_repo_config(&repo_cfg_path)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "{}: no repo config found. Run `clank init` first.",
+            repo_cfg_path.display()
+        )
+    })
+}
+
+/// Load `<repo>/.clank/config.json` ONLY if it is a VALID
+/// new-shape config. Returns `Ok(None)` for a missing file AND
+/// for an old-shape / unparseable config — both mean "no
+/// configured team here" for callers that decide whether to
+/// overwrite (`clank init --team`'s overwrite guard). Unlike
+/// [`load_repo_config_required`], this never errors on the legacy
+/// shape: an old-shape config is the documented "re-run `clank
+/// init`" recovery path, so `init` is allowed to recreate it.
+pub fn repo_config_if_valid(
+    repo: &Path,
+) -> anyhow::Result<Option<crate::cli::teams_config::RepoConfigFile>> {
+    let repo_cfg_path = repo.join(".clank/config.json");
+    match std::fs::read_to_string(&repo_cfg_path) {
+        Ok(body) => {
+            if is_legacy_repo_shape(&body) {
+                return Ok(None);
+            }
+            Ok(serde_json::from_str::<crate::cli::teams_config::RepoConfigFile>(&body).ok())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// Load + parse `<repo>/.clank/config.json` as the new-shape
 /// [`RepoConfigFile`]. Returns `Ok(None)` if the file doesn't
 /// exist. Fail-closed: an old-shape config (legacy `team:

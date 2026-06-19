@@ -19,8 +19,8 @@ use clank_core::ids::AgentLabel;
 
 use crate::cli::teams_config::{AgentDescription, ReviewKind, TeamComposition, UserConfigFile};
 use crate::cli::{
-    TeamAddArgs, TeamArgs, TeamCmd, TeamListArgs, TeamRemoveArgs, TeamSetMasterArgs, TeamShowArgs,
-    resolve_repo,
+    TeamAddArgs, TeamArgs, TeamCmd, TeamListArgs, TeamRemoveArgs, TeamSaveArgs, TeamSetMasterArgs,
+    TeamShowArgs, resolve_repo,
 };
 
 pub async fn run(args: TeamArgs) -> anyhow::Result<()> {
@@ -33,6 +33,7 @@ pub async fn run(args: TeamArgs) -> anyhow::Result<()> {
         TeamCmd::Add(a) => team_add(a),
         TeamCmd::Remove(a) => team_remove(a),
         TeamCmd::SetMaster(a) => team_set_master(a),
+        TeamCmd::Save(a) => team_save(a),
         // Global library subcommands operate on user-scope teams.
         TeamCmd::List(a) => list(&home_dir()?, a),
         TeamCmd::Delete(a) => delete_team(&home_dir()?, &a.team, a.force),
@@ -228,6 +229,13 @@ fn team_set_master(args: TeamSetMasterArgs) -> anyhow::Result<()> {
     set_repo_team_master(&repo, home.as_deref(), &label)
 }
 
+/// `clank team save <name> [--force]` — thin shell. Publishes THIS
+/// repo's operating team as a reusable global template.
+fn team_save(args: TeamSaveArgs) -> anyhow::Result<()> {
+    let repo = resolve_repo(args.repo.as_deref())?;
+    save_team(&home_dir()?, &repo, &args.name, args.force)
+}
+
 // ── repo-team cores ──────────────────────────────────────────
 //
 // Operate on `<repo>/.clank/config.json#/team`. `pub`, env-free
@@ -347,6 +355,108 @@ pub fn set_repo_team_master(
     if !crate::cli::agent::promote_repo_master(repo, home, label)? {
         anyhow::bail!("this repo has no config. Run `clank init` first.");
     }
+    Ok(())
+}
+
+/// Publish THIS repo's operating team as a reusable GLOBAL
+/// template named `name`. `pub`, env-free (explicit `home` +
+/// `repo`), args-free.
+///
+/// The agents published are exactly the team's referenced labels
+/// (master if set + every commit/gate reviewer), looked up in the
+/// repo's own `agents`. Repo agents NOT on the team are not
+/// published.
+///
+/// Fail-closed, collision check BEFORE any write — no partial
+/// writes:
+/// - The repo config is read through the same fail-closed loader
+///   the resolver uses ([`crate::agent_store::load_repo_config_required`]),
+///   so an old-shape repo config yields the re-init hint.
+/// - For each referenced agent, its repo body is compared to any
+///   identically-named user-scope agent: absent → will insert;
+///   equal → no-op; DIFFERENT → HARD ERROR (not `--force`-able).
+/// - An existing user-scope team of the same `name` requires
+///   `--force` (clank's non-interactive confirm idiom).
+/// - A team with NO master is allowed (a faithful partial
+///   snapshot).
+pub fn save_team(home: &Path, repo: &Path, name: &str, force: bool) -> anyhow::Result<()> {
+    let repo_cfg = crate::agent_store::load_repo_config_required(repo)?;
+    let mut user_cfg = read_user_config(home)?;
+
+    // The agents to publish = the team's referenced labels, looked
+    // up in the repo's own `agents`. A label referenced by the team
+    // but absent from repo `agents` is a corrupt repo config — fail
+    // closed rather than publish a dangling template.
+    let referenced: Vec<&AgentLabel> = repo_cfg
+        .team
+        .master
+        .iter()
+        .chain(repo_cfg.team.commit_reviewers.iter())
+        .chain(repo_cfg.team.gate_reviewers.iter())
+        .collect();
+
+    let mut to_resolve: Vec<(&AgentLabel, &AgentDescription)> = Vec::new();
+    for label in &referenced {
+        let desc = repo_cfg.agents.get(*label).ok_or_else(|| {
+            anyhow::anyhow!(
+                "team references agent `{}`, which is not defined in this repo's `agents`; \
+                 re-run `clank init` to recreate the config",
+                label.as_str()
+            )
+        })?;
+        to_resolve.push((label, desc));
+    }
+
+    // Collision check FIRST, before any write (fail-closed). The
+    // team-name overwrite check is also done here so the whole
+    // operation either fully succeeds or leaves the user config
+    // untouched.
+    if user_cfg.teams.contains_key(name) && !force {
+        anyhow::bail!("team `{name}` already exists in user-scope; pass --force to overwrite");
+    }
+
+    let mut to_insert: Vec<(AgentLabel, AgentDescription)> = Vec::new();
+    let mut already_present: Vec<&AgentLabel> = Vec::new();
+    for (label, repo_desc) in &to_resolve {
+        match user_cfg.agents.get(*label) {
+            None => to_insert.push(((*label).clone(), (*repo_desc).clone())),
+            Some(global_desc) if global_desc == *repo_desc => already_present.push(label),
+            Some(_) => anyhow::bail!(
+                "agent `{}` already exists in user-scope `agents` with a different definition; \
+                 rename it or reconcile before saving",
+                label.as_str()
+            ),
+        }
+    }
+
+    // All checks passed — apply (single write).
+    for (label, desc) in &to_insert {
+        user_cfg.agents.insert(label.clone(), desc.clone());
+    }
+    user_cfg
+        .teams
+        .insert(name.to_string(), repo_cfg.team.clone());
+    write_user_config(home, &user_cfg)?;
+
+    let added: Vec<&str> = to_insert.iter().map(|(l, _)| l.as_str()).collect();
+    let present: Vec<&str> = already_present.iter().map(|l| l.as_str()).collect();
+    eprintln!("published team `{name}` to user-scope `teams`");
+    eprintln!(
+        "  agents added:           {}",
+        if added.is_empty() {
+            "—".to_string()
+        } else {
+            added.join(", ")
+        }
+    );
+    eprintln!(
+        "  agents already present: {}",
+        if present.is_empty() {
+            "—".to_string()
+        } else {
+            present.join(", ")
+        }
+    );
     Ok(())
 }
 
@@ -937,5 +1047,180 @@ mod tests {
         let err = remove_member(home, "dev", "claude").unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("master"));
+    }
+
+    // ── team save (M3) ───────────────────────────────────────────
+
+    #[test]
+    fn save_team_publishes_new_template_and_copies_referenced_agents() {
+        let home_dir = setup_home();
+        let home = home_dir.path();
+        // Empty global config to start.
+        seed_user_config(home, &[], &[]);
+        let repo = tempfile::tempdir().unwrap();
+        // `spare` is defined in repo agents but NOT on the team —
+        // it must NOT be published.
+        seed_repo_config(
+            repo.path(),
+            r#"{
+                "agents": {
+                    "claude": { "tool": "claude" },
+                    "codex": { "tool": "codex" },
+                    "spare": { "tool": "codex" }
+                },
+                "team": { "master": "claude", "commit_reviewers": ["codex"] }
+            }"#,
+        );
+
+        save_team(home, repo.path(), "dev", false).unwrap();
+
+        let cfg = read_user_config(home).unwrap();
+        let dev = cfg.teams.get("dev").unwrap();
+        assert_eq!(dev.master.as_ref().unwrap().as_str(), "claude");
+        assert_eq!(dev.commit_reviewers[0].as_str(), "codex");
+        // Only referenced agents copied; `spare` excluded.
+        assert!(
+            cfg.agents
+                .contains_key(&AgentLabel::parse("claude").unwrap())
+        );
+        assert!(
+            cfg.agents
+                .contains_key(&AgentLabel::parse("codex").unwrap())
+        );
+        assert!(
+            !cfg.agents
+                .contains_key(&AgentLabel::parse("spare").unwrap())
+        );
+    }
+
+    #[test]
+    fn save_team_identical_agent_resave_is_noop_not_error() {
+        let home_dir = setup_home();
+        let home = home_dir.path();
+        // `claude` already in global with the SAME body as the repo.
+        seed_user_config(home, &[("claude", Tool::Claude)], &[]);
+        let repo = tempfile::tempdir().unwrap();
+        seed_repo_config(
+            repo.path(),
+            r#"{
+                "agents": { "claude": { "tool": "claude" } },
+                "team": { "master": "claude" }
+            }"#,
+        );
+
+        // Identical agent → no error.
+        save_team(home, repo.path(), "dev", false).unwrap();
+        let cfg = read_user_config(home).unwrap();
+        assert!(cfg.teams.contains_key("dev"));
+        assert_eq!(cfg.agents.len(), 1);
+    }
+
+    #[test]
+    fn save_team_different_agent_body_is_hard_error_even_with_force() {
+        let home_dir = setup_home();
+        let home = home_dir.path();
+        // Global `claude` is a codex (DIFFERENT body from the repo's).
+        seed_user_config(home, &[("claude", Tool::Codex)], &[]);
+        let repo = tempfile::tempdir().unwrap();
+        seed_repo_config(
+            repo.path(),
+            r#"{
+                "agents": { "claude": { "tool": "claude" } },
+                "team": { "master": "claude" }
+            }"#,
+        );
+
+        // Not bypassable by --force.
+        for force in [false, true] {
+            let err = save_team(home, repo.path(), "dev", force).unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(msg.contains("different definition"), "force={force}: {msg}");
+        }
+        // No partial write: team not created, global agent unchanged.
+        let cfg = read_user_config(home).unwrap();
+        assert!(!cfg.teams.contains_key("dev"));
+        assert_eq!(
+            cfg.agents[&AgentLabel::parse("claude").unwrap()].tool,
+            Tool::Codex
+        );
+    }
+
+    #[test]
+    fn save_team_existing_name_requires_force() {
+        let home_dir = setup_home();
+        let home = home_dir.path();
+        let existing = TeamComposition::default();
+        seed_user_config(home, &[], &[("dev", &existing)]);
+        let repo = tempfile::tempdir().unwrap();
+        seed_repo_config(
+            repo.path(),
+            r#"{
+                "agents": { "claude": { "tool": "claude" } },
+                "team": { "master": "claude" }
+            }"#,
+        );
+
+        // Without --force: refuse.
+        let err = save_team(home, repo.path(), "dev", false).unwrap_err();
+        assert!(format!("{err:#}").contains("--force"));
+        // The existing (empty) team is untouched.
+        let cfg = read_user_config(home).unwrap();
+        assert!(cfg.teams.get("dev").unwrap().master.is_none());
+
+        // With --force: overwrite.
+        save_team(home, repo.path(), "dev", true).unwrap();
+        let cfg = read_user_config(home).unwrap();
+        assert_eq!(
+            cfg.teams
+                .get("dev")
+                .unwrap()
+                .master
+                .as_ref()
+                .unwrap()
+                .as_str(),
+            "claude"
+        );
+    }
+
+    #[test]
+    fn save_team_without_master_is_allowed() {
+        let home_dir = setup_home();
+        let home = home_dir.path();
+        seed_user_config(home, &[], &[]);
+        let repo = tempfile::tempdir().unwrap();
+        // No master, just a commit reviewer.
+        seed_repo_config(
+            repo.path(),
+            r#"{
+                "agents": { "codex": { "tool": "codex" } },
+                "team": { "commit_reviewers": ["codex"] }
+            }"#,
+        );
+
+        save_team(home, repo.path(), "partial", false).unwrap();
+        let cfg = read_user_config(home).unwrap();
+        let team = cfg.teams.get("partial").unwrap();
+        assert!(team.master.is_none());
+        assert_eq!(team.commit_reviewers[0].as_str(), "codex");
+        assert!(
+            cfg.agents
+                .contains_key(&AgentLabel::parse("codex").unwrap())
+        );
+    }
+
+    #[test]
+    fn save_team_fails_closed_on_old_shape_repo_config() {
+        let home_dir = setup_home();
+        let home = home_dir.path();
+        seed_user_config(home, &[], &[]);
+        let repo = tempfile::tempdir().unwrap();
+        seed_repo_config(repo.path(), r#"{"team": "dev", "promoted": "codex"}"#);
+
+        let err = save_team(home, repo.path(), "dev", false).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("old team schema") && msg.contains("clank init"),
+            "expected re-init hint; got: {msg}"
+        );
     }
 }

@@ -84,7 +84,11 @@ pub struct ZellijSection {
 /// One agent's description: which tool to spawn + optional
 /// launch profile + optional initial prompt. NO role, NO team
 /// affiliation — those are per-team properties.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+///
+/// `PartialEq`/`Eq` back the `clank team save` collision check
+/// (a referenced repo agent must match an identically-named
+/// user-scope agent before it is published).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct AgentDescription {
     pub tool: Tool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -149,7 +153,7 @@ pub struct RepoConfigFile {
     pub extra: BTreeMap<String, serde_json::Value>,
 }
 
-fn is_default_team(team: &TeamComposition) -> bool {
+pub(crate) fn is_default_team(team: &TeamComposition) -> bool {
     team.master.is_none() && team.commit_reviewers.is_empty() && team.gate_reviewers.is_empty()
 }
 

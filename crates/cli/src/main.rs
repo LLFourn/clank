@@ -28,9 +28,13 @@ enum Command {
     /// under `clank team`.
     Agent(cli::AgentArgs),
     /// Compose THIS repo's operating team (`team add` / `remove` /
-    /// `set-master` / `show`) and inspect/delete the global
+    /// `set-master` / `show` / `save`) and inspect/delete the global
     /// team-template library (`team list` / `team delete`).
     Team(cli::TeamArgs),
+    /// Serialize this repo's self-contained config (`agents` +
+    /// `team`) as pretty JSON to stdout. Fail-closed on the old
+    /// shape (re-init hint).
+    Export(cli::ExportArgs),
     /// Strip a plan's `.clank/` artifacts from history.
     Purge(cli::PurgeArgs),
     /// Launch the configured editor on a plan or commit-range
@@ -115,6 +119,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Queue(args) => cli::queue::run(args).await,
         Command::Agent(args) => cli::agent::run(args).await,
         Command::Team(args) => cli::team::run(args).await,
+        Command::Export(args) => cli::export::run(args).await,
         Command::Purge(args) => cli::purge::run(args).await,
         Command::Diff(args) => cli::diff::run(args).await,
         Command::Shelve(args) => match args.command {
