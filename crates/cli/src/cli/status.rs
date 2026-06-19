@@ -56,6 +56,13 @@ pub struct StatusSnapshot {
     /// Active GitHub PR reviews (clank-pr-review-mode), for the
     /// `pr` gauge. Empty in the common (no-PR-review) case.
     pub(crate) pr_reviews: Vec<clank_core::wait::PrReviewWorkState>,
+    /// A broken HEAD commit tag, when present
+    /// (commit-tag-fixup-is-first-class-state). The SINGLE source the
+    /// renderers read so the correction is visible even when NO active
+    /// plan row carries it — the unknown-tag-only case, where `T = ∅`
+    /// and the tag names no real plan, has no row to mark (codex
+    /// 2bf46d9).
+    pub(crate) head_correction: Option<clank_core::wait::HeadCorrection>,
 }
 
 /// One shelved plan as the renderers see it.
@@ -209,6 +216,7 @@ impl StatusSnapshot {
             shelved,
             log_rows,
             pr_reviews: work_status.pr_reviews,
+            head_correction: work_status.head_correction,
         })
     }
 
@@ -306,6 +314,19 @@ impl StatusSnapshot {
                     .collect::<Vec<_>>()
             );
         }
+        if let Some(c) = &self.head_correction {
+            let plans = |ks: &[PlanKey]| {
+                ks.iter()
+                    .map(|k| k.as_str().to_string())
+                    .collect::<Vec<_>>()
+            };
+            obj["head_correction"] = serde_json::json!({
+                "sha": c.sha.as_str(),
+                "unknown": c.violation.unknown,
+                "untagged_touched": plans(&c.violation.untagged_touched),
+                "extra_named": plans(&c.violation.extra_named),
+            });
+        }
         obj
     }
 
@@ -319,6 +340,16 @@ impl StatusSnapshot {
         }
         if let Some(s) = &self.head_sha {
             let _ = writeln!(out, "head:   {s}");
+        }
+        // A broken HEAD commit tag dominates: shown even when no active
+        // plan row carries it (unknown-tag-only — codex 2bf46d9).
+        if let Some(c) = &self.head_correction {
+            let _ = writeln!(
+                out,
+                "fix-tag: HEAD {} — amend the tag ({})",
+                c.sha.as_str(),
+                describe_head_violation(&c.violation)
+            );
         }
         let _ = writeln!(
             out,
@@ -828,6 +859,33 @@ pub(crate) fn waiting_actor(w: &WaitingOn) -> String {
         | WaitingOn::MasterToCommit
         | WaitingOn::MasterToFixCommitTag => "master".into(),
     }
+}
+
+/// Human one-liner for a broken HEAD commit tag
+/// (commit-tag-fixup-is-first-class-state) — shared by `clank status`
+/// and the TUI so the wording can't drift.
+pub(crate) fn describe_head_violation(v: &clank_core::wait::HeadTagViolation) -> String {
+    let plans = |ks: &[PlanKey]| ks.iter().map(|k| k.as_str()).collect::<Vec<_>>().join(", ");
+    let mut parts = Vec::new();
+    if !v.untagged_touched.is_empty() {
+        parts.push(format!(
+            "touches plan file(s) [{}] the tag omits",
+            plans(&v.untagged_touched)
+        ));
+    }
+    if !v.extra_named.is_empty() {
+        parts.push(format!(
+            "tag names [{}] whose plan file it didn't touch",
+            plans(&v.extra_named)
+        ));
+    }
+    if !v.unknown.is_empty() {
+        parts.push(format!(
+            "tag names unknown plan(s) [{}]",
+            v.unknown.join(", ")
+        ));
+    }
+    parts.join("; ")
 }
 
 /// Max chars of block-message body shown on the per-plan `reason:`

@@ -158,6 +158,22 @@ pub(crate) fn render(snap: &StatusSnapshot, rows: u16, cols: u16) -> Vec<String>
         }
     }
 
+    // `fix` — a broken HEAD commit tag the master must amend, shown even
+    // when no plan row carries it (unknown-tag-only — codex 2bf46d9).
+    // The bar already reads orange via `attention_state`.
+    if let Some(c) = &snap.head_correction {
+        let msg = format!(
+            "fix tag: {}",
+            super::status::describe_head_violation(&c.violation)
+        );
+        for (i, line) in wrap(&msg, ask_width).into_iter().enumerate() {
+            body.push(vec![
+                label(if i == 0 { "fix" } else { "" }),
+                Span(Style::Accent, line),
+            ]);
+        }
+    }
+
     // `gate` — state + the sha under review. The bar already names
     // the actor, so the waiting-reason is NOT repeated here.
     if let [v] = snap.plans.as_slice() {
@@ -483,12 +499,16 @@ pub(crate) fn attention_state(snap: &StatusSnapshot) -> AttentionState {
         return AttentionState::Blocked;
     }
     // Below Blocked, above Active: a broken HEAD tag is a warning the
-    // master must self-correct before work resumes.
-    let needs_correction = snap
-        .plans
-        .iter()
-        .any(|v| matches!(v.waiting_on, WaitingOn::MasterToFixCommitTag));
-    if needs_correction {
+    // master must self-correct before work resumes. Read the
+    // `head_correction` SOURCE (set on every real violation, including
+    // the unknown-tag-only case that marks no plan row — codex 2bf46d9);
+    // a per-plan `MasterToFixCommitTag` row is an additional signal.
+    if snap.head_correction.is_some()
+        || snap
+            .plans
+            .iter()
+            .any(|v| matches!(v.waiting_on, WaitingOn::MasterToFixCommitTag))
+    {
         return AttentionState::NeedsCorrection;
     }
     let nothing_in_flight =
@@ -1200,6 +1220,7 @@ pub(crate) mod tests {
             shelved: Vec::new(),
             log_rows: Vec::new(),
             pr_reviews: Vec::new(),
+            head_correction: None,
         }
     }
 
@@ -1693,6 +1714,34 @@ terminal_3  terminal  ruthless (reviewer)
             AttentionState::Blocked,
             "a human block outranks the tag correction"
         );
+    }
+
+    #[test]
+    fn unknown_tag_only_correction_is_visible_without_a_plan_row() {
+        // codex 2bf46d9: a `[ghost]`-tagged code-only HEAD has NO plan
+        // row to mark, but the correction must still surface — orange
+        // lamp + a top-level `fix` line — not idle. Display reads the
+        // `head_correction` source directly, not only the rows.
+        use clank_core::wait::{HeadCorrection, HeadTagViolation};
+        let mut s = snap(vec![], vec![]);
+        // Baseline: no plans/queue/correction → Idle.
+        assert_eq!(attention_state(&s), AttentionState::Idle);
+        s.head_correction = Some(HeadCorrection {
+            sha: crate::lifecycle::CommitSha::parse(&"a".repeat(40)).unwrap(),
+            violation: HeadTagViolation {
+                unknown: vec!["ghost".to_string()],
+                untagged_touched: vec![],
+                extra_named: vec![],
+            },
+        });
+        assert_eq!(
+            attention_state(&s),
+            AttentionState::NeedsCorrection,
+            "head_correction with no plan row still flags the lamp"
+        );
+        let out = render(&s, 24, 80).join("\n");
+        assert!(out.contains("fix"), "top-level fix line shown: {out}");
+        assert!(out.contains("ghost"), "names the bad tag: {out}");
     }
 
     #[test]
