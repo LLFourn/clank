@@ -451,20 +451,71 @@ fn print_oneline(events: &[&LogEvent], repo: &Path, shas: &[CommitSha]) -> anyho
     Ok(())
 }
 
+/// Typed rows for `clank log --json` (typed-json-not-json-macro,
+/// replacing ad-hoc `json!`). `#[serde(tag = "kind")]` emits the
+/// discriminant alongside the fields, matching the prior shape's keys +
+/// values (key order is irrelevant — consumers parse the JSON).
+#[derive(serde::Serialize)]
+#[serde(tag = "kind")]
+enum LogJsonRow<'a> {
+    #[serde(rename = "intro")]
+    Intro {
+        plan: &'a str,
+        sha: &'a str,
+        ts: i64,
+        subject: &'a str,
+    },
+    #[serde(rename = "commit")]
+    Commit {
+        plan: &'a str,
+        sha: &'a str,
+        ts: i64,
+        touched_plan: bool,
+        touched_code: bool,
+        subject: &'a str,
+    },
+    #[serde(rename = "finalized")]
+    Finalized {
+        plan: &'a str,
+        sha: &'a str,
+        ts: i64,
+    },
+    #[serde(rename = "deleted")]
+    Deleted {
+        plan: &'a str,
+        sha: &'a str,
+        ts: i64,
+    },
+    #[serde(rename = "ad-hoc")]
+    AdHoc {
+        sha: &'a str,
+        ts: i64,
+        subject: &'a str,
+    },
+    #[serde(rename = "review")]
+    Review {
+        sha: &'a str,
+        author: &'a str,
+        verdict: Verdict,
+    },
+}
+
 fn print_json(events: &[&LogEvent], repo: &Path, shas: &[CommitSha]) -> anyhow::Result<()> {
     let reviews = collect_reviews(repo, shas);
-    let mut out: Vec<serde_json::Value> = Vec::new();
+    let mut out: Vec<LogJsonRow> = Vec::new();
     for event in events {
-        let obj = match event {
+        out.push(match event {
             LogEvent::PlanIntro {
                 plan,
                 sha,
                 ts,
                 subject,
-            } => serde_json::json!({
-                "kind": "intro", "plan": plan.as_str(), "sha": sha.as_str(),
-                "ts": ts, "subject": subject,
-            }),
+            } => LogJsonRow::Intro {
+                plan: plan.as_str(),
+                sha: sha.as_str(),
+                ts: *ts,
+                subject,
+            },
             LogEvent::PlanCommit {
                 plan,
                 sha,
@@ -472,23 +523,30 @@ fn print_json(events: &[&LogEvent], repo: &Path, shas: &[CommitSha]) -> anyhow::
                 touched_plan,
                 touched_code,
                 subject,
-            } => serde_json::json!({
-                "kind": "commit", "plan": plan.as_str(), "sha": sha.as_str(),
-                "ts": ts, "touched_plan": touched_plan, "touched_code": touched_code,
-                "subject": subject,
-            }),
-            LogEvent::PlanFinalized { plan, sha, ts } => serde_json::json!({
-                "kind": "finalized", "plan": plan.as_str(), "sha": sha.as_str(), "ts": ts,
-            }),
-            LogEvent::PlanDeleted { plan, sha, ts } => serde_json::json!({
-                "kind": "deleted", "plan": plan.as_str(), "sha": sha.as_str(), "ts": ts,
-            }),
-            LogEvent::AdHoc { sha, ts, subject } => serde_json::json!({
-                "kind": "ad-hoc", "sha": sha.as_str(), "ts": ts,
-                "subject": subject,
-            }),
-        };
-        out.push(obj);
+            } => LogJsonRow::Commit {
+                plan: plan.as_str(),
+                sha: sha.as_str(),
+                ts: *ts,
+                touched_plan: *touched_plan,
+                touched_code: *touched_code,
+                subject,
+            },
+            LogEvent::PlanFinalized { plan, sha, ts } => LogJsonRow::Finalized {
+                plan: plan.as_str(),
+                sha: sha.as_str(),
+                ts: *ts,
+            },
+            LogEvent::PlanDeleted { plan, sha, ts } => LogJsonRow::Deleted {
+                plan: plan.as_str(),
+                sha: sha.as_str(),
+                ts: *ts,
+            },
+            LogEvent::AdHoc { sha, ts, subject } => LogJsonRow::AdHoc {
+                sha: sha.as_str(),
+                ts: *ts,
+                subject,
+            },
+        });
         let sha_str = match event {
             LogEvent::PlanIntro { sha, .. }
             | LogEvent::PlanCommit { sha, .. }
@@ -498,15 +556,93 @@ fn print_json(events: &[&LogEvent], repo: &Path, shas: &[CommitSha]) -> anyhow::
         };
         if let Some(rs) = reviews.get(sha_str) {
             for r in rs {
-                out.push(serde_json::json!({
-                    "kind": "review", "sha": sha_str,
-                    "author": r.author, "verdict": r.verdict,
-                }));
+                out.push(LogJsonRow::Review {
+                    sha: sha_str,
+                    author: &r.author,
+                    verdict: r.verdict,
+                });
             }
         }
     }
     println!("{}", serde_json::to_string_pretty(&out)?);
     Ok(())
+}
+
+#[cfg(test)]
+mod json_output_tests {
+    use super::*;
+
+    #[test]
+    fn log_json_rows_serialize_to_the_stable_shape() {
+        // typed-json-not-json-macro: each typed row must serialize to
+        // the same keys+values the old `json!` produced — the `clank log
+        // --json` wire contract. (`json!` here expresses the EXPECTED
+        // value; the ban is on production output code. Key order is
+        // irrelevant — `to_value` equality is order-independent.)
+        let cases = [
+            (
+                serde_json::to_value(LogJsonRow::Intro {
+                    plan: "p",
+                    sha: "abc",
+                    ts: 5,
+                    subject: "hi",
+                })
+                .unwrap(),
+                serde_json::json!({"kind":"intro","plan":"p","sha":"abc","ts":5,"subject":"hi"}),
+            ),
+            (
+                serde_json::to_value(LogJsonRow::Commit {
+                    plan: "p",
+                    sha: "abc",
+                    ts: 5,
+                    touched_plan: true,
+                    touched_code: false,
+                    subject: "x",
+                })
+                .unwrap(),
+                serde_json::json!({"kind":"commit","plan":"p","sha":"abc","ts":5,"touched_plan":true,"touched_code":false,"subject":"x"}),
+            ),
+            (
+                serde_json::to_value(LogJsonRow::Finalized {
+                    plan: "p",
+                    sha: "abc",
+                    ts: 5,
+                })
+                .unwrap(),
+                serde_json::json!({"kind":"finalized","plan":"p","sha":"abc","ts":5}),
+            ),
+            (
+                serde_json::to_value(LogJsonRow::Deleted {
+                    plan: "p",
+                    sha: "abc",
+                    ts: 5,
+                })
+                .unwrap(),
+                serde_json::json!({"kind":"deleted","plan":"p","sha":"abc","ts":5}),
+            ),
+            (
+                serde_json::to_value(LogJsonRow::AdHoc {
+                    sha: "abc",
+                    ts: 5,
+                    subject: "x",
+                })
+                .unwrap(),
+                serde_json::json!({"kind":"ad-hoc","sha":"abc","ts":5,"subject":"x"}),
+            ),
+            (
+                serde_json::to_value(LogJsonRow::Review {
+                    sha: "abc",
+                    author: "codex",
+                    verdict: Verdict::Approve,
+                })
+                .unwrap(),
+                serde_json::json!({"kind":"review","sha":"abc","author":"codex","verdict":Verdict::Approve}),
+            ),
+        ];
+        for (got, want) in cases {
+            assert_eq!(got, want);
+        }
+    }
 }
 
 #[cfg(test)]
