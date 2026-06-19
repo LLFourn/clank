@@ -477,12 +477,12 @@ pub fn register_repo_team(home: &Path, repo: &Path, team_name: &str) -> anyhow::
 
     let repo_cfg_path = repo.join(".clank/config.json");
     let mut repo_cfg: RepoConfigFile = match std::fs::read_to_string(&repo_cfg_path) {
-        Ok(s) => serde_json::from_str(&s).with_context(|| {
-            format!(
-                "parsing {} as new-schema RepoConfigFile",
-                repo_cfg_path.display()
-            )
-        })?,
+        // A VALID new-shape config: keep it so its `extra`
+        // (review/hooks/diff) survives the team swap. A LEGACY or
+        // unparseable config: this is the recreate path (`init --team`
+        // overwriting old shape, which the guard already permits) —
+        // start from default rather than parse-erroring (codex 76b9df6).
+        Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => RepoConfigFile::default(),
         Err(e) => {
             return Err(
@@ -978,6 +978,28 @@ mod tests {
             &std::fs::read_to_string(repo.path().join(".clank/config.json")).unwrap(),
         )
         .unwrap();
+        assert_eq!(parsed.team.master.as_ref().unwrap().as_str(), "claude");
+    }
+
+    #[test]
+    fn register_repo_team_recreates_over_old_shape_config() {
+        // codex 76b9df6: `init --team` over a LEGACY repo config must
+        // RECREATE it, not parse-error. The guard already treats
+        // old-shape as overwriteable, so the copy-down core must
+        // tolerate it too (was: serde parse error).
+        use crate::cli::teams_config::RepoConfigFile;
+        let home = tempfile::tempdir().unwrap();
+        seed_user_team_dev(home.path());
+        let repo = init_repo();
+        let cfg_path = repo.path().join(".clank/config.json");
+        std::fs::create_dir_all(cfg_path.parent().unwrap()).unwrap();
+        std::fs::write(&cfg_path, r#"{"team": "dev"}"#).unwrap(); // OLD shape
+
+        register_repo_team(home.path(), repo.path(), "dev").unwrap();
+
+        let parsed: RepoConfigFile =
+            serde_json::from_str(&std::fs::read_to_string(&cfg_path).unwrap())
+                .expect("recreated as new-shape");
         assert_eq!(parsed.team.master.as_ref().unwrap().as_str(), "claude");
     }
 }
