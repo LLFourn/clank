@@ -490,11 +490,19 @@ fn check_blocks(repo: &Path, author: &AgentLabel) -> BlockResult {
     result
 }
 
+/// `clank wfw --json` envelope. The stop-hook parses this; the
+/// contract is keys + values (not key order). Typed in place of the
+/// former ad-hoc `json!` (typed-json-not-json-macro).
+#[derive(serde::Serialize)]
+struct WfwEnvelope<'a> {
+    items: Vec<WfwJsonItem<'a>>,
+}
+
 fn emit(items: &[WaitItem], json: bool) {
     if json {
-        let envelope = serde_json::json!({
-            "items": items.iter().map(render_json).collect::<Vec<_>>(),
-        });
+        let envelope = WfwEnvelope {
+            items: items.iter().map(render_json).collect(),
+        };
         println!(
             "{}",
             serde_json::to_string(&envelope).expect("serialize wfw envelope")
@@ -516,7 +524,83 @@ fn short(sha: &CommitSha) -> &str {
     &sha.as_str()[..sha.as_str().len().min(12)]
 }
 
-fn render_json(item: &WaitItem) -> serde_json::Value {
+/// Typed rows for `clank wfw --json` (typed-json-not-json-macro,
+/// replacing per-variant `json!`). `#[serde(tag = "kind")]` emits the
+/// discriminant alongside the fields. Borrows from the source
+/// `WaitItem` (no clones); the computed `plan_path` is the one owned
+/// field. Same keys + values as the prior shape — key order is
+/// irrelevant (the stop-hook parses the JSON).
+#[derive(serde::Serialize)]
+#[serde(tag = "kind")]
+enum WfwJsonItem<'a> {
+    #[serde(rename = "master")]
+    Master {
+        plan: &'a str,
+        plan_path: String,
+        sha: &'a str,
+        next: &'a clank_core::wait::MasterNext,
+        reason: &'a clank_core::vocab::WaitingReason,
+        gate: &'a str,
+    },
+    #[serde(rename = "reviewer")]
+    Reviewer {
+        plan: &'a str,
+        plan_path: String,
+        sha: &'a str,
+        feedback_path: &'a str,
+    },
+    #[serde(rename = "finished")]
+    Finished {
+        plan: &'a str,
+        plan_path: String,
+        finalized_at: &'a str,
+    },
+    #[serde(rename = "idle")]
+    Idle { prompt: &'a str },
+    #[serde(rename = "adhoc_review")]
+    AdHocReview {
+        sha: &'a str,
+        feedback_path: &'a str,
+    },
+    #[serde(rename = "adhoc_revise")]
+    AdHocRevise { sha: &'a str },
+    #[serde(rename = "fix_commit_tag")]
+    FixCommitTag {
+        sha: &'a str,
+        unknown: &'a [String],
+        untagged_touched: Vec<&'a str>,
+        extra_named: Vec<&'a str>,
+    },
+    #[serde(rename = "promote_from_queue")]
+    PromoteFromQueue { name: &'a str, priority: u16 },
+    #[serde(rename = "blocked")]
+    Blocked {
+        agent: &'a str,
+        name: &'a str,
+        plan: Option<&'a str>,
+        question: &'a str,
+    },
+    #[serde(rename = "unblocked")]
+    Unblocked {
+        name: &'a str,
+        plan: Option<&'a str>,
+        answer: &'a str,
+    },
+    #[serde(rename = "pr_reviewer")]
+    PrReviewer { pr: u32, round: u64 },
+    #[serde(rename = "pr_master")]
+    PrMaster {
+        pr: u32,
+        round: u64,
+        next: &'a clank_core::wait::PrMasterNext,
+    },
+}
+
+fn plan_path(plan: &PlanKey) -> String {
+    format!(".clank/plans/{}.md", plan.as_str())
+}
+
+fn render_json(item: &WaitItem) -> WfwJsonItem<'_> {
     match item {
         WaitItem::Master {
             plan,
@@ -524,94 +608,74 @@ fn render_json(item: &WaitItem) -> serde_json::Value {
             next,
             reason,
             gate,
-        } => serde_json::json!({
-            "kind": "master",
-            "plan": plan.as_str(),
-            "plan_path": format!(".clank/plans/{}.md", plan.as_str()),
-            "sha": sha.as_str(),
-            "next": next,
-            "reason": reason,
-            "gate": gate.as_str(),
-        }),
+        } => WfwJsonItem::Master {
+            plan: plan.as_str(),
+            plan_path: plan_path(plan),
+            sha: sha.as_str(),
+            next,
+            reason,
+            gate: gate.as_str(),
+        },
         WaitItem::Reviewer {
             plan,
             sha,
             feedback_path,
-        } => serde_json::json!({
-            "kind": "reviewer",
-            "plan": plan.as_str(),
-            "plan_path": format!(".clank/plans/{}.md", plan.as_str()),
-            "sha": sha.as_str(),
-            "feedback_path": feedback_path,
-        }),
-        WaitItem::Finished { plan, finalized_at } => serde_json::json!({
-            "kind": "finished",
-            "plan": plan.as_str(),
-            "plan_path": format!(".clank/plans/{}.md", plan.as_str()),
-            "finalized_at": finalized_at.as_str(),
-        }),
-        WaitItem::Idle { prompt } => serde_json::json!({
-            "kind": "idle",
-            "prompt": prompt,
-        }),
-        WaitItem::AdHocReview { sha, feedback_path } => serde_json::json!({
-            "kind": "adhoc_review",
-            "sha": sha.as_str(),
-            "feedback_path": feedback_path,
-        }),
-        WaitItem::AdHocRevise { sha } => serde_json::json!({
-            "kind": "adhoc_revise",
-            "sha": sha.as_str(),
-        }),
-        WaitItem::FixCommitTag { sha, violation } => serde_json::json!({
-            "kind": "fix_commit_tag",
-            "sha": sha.as_str(),
-            "unknown": violation.unknown,
-            "untagged_touched": violation
+        } => WfwJsonItem::Reviewer {
+            plan: plan.as_str(),
+            plan_path: plan_path(plan),
+            sha: sha.as_str(),
+            feedback_path,
+        },
+        WaitItem::Finished { plan, finalized_at } => WfwJsonItem::Finished {
+            plan: plan.as_str(),
+            plan_path: plan_path(plan),
+            finalized_at: finalized_at.as_str(),
+        },
+        WaitItem::Idle { prompt } => WfwJsonItem::Idle { prompt },
+        WaitItem::AdHocReview { sha, feedback_path } => WfwJsonItem::AdHocReview {
+            sha: sha.as_str(),
+            feedback_path,
+        },
+        WaitItem::AdHocRevise { sha } => WfwJsonItem::AdHocRevise { sha: sha.as_str() },
+        WaitItem::FixCommitTag { sha, violation } => WfwJsonItem::FixCommitTag {
+            sha: sha.as_str(),
+            unknown: &violation.unknown,
+            untagged_touched: violation
                 .untagged_touched
                 .iter()
                 .map(|p| p.as_str())
-                .collect::<Vec<_>>(),
-            "extra_named": violation
-                .extra_named
-                .iter()
-                .map(|p| p.as_str())
-                .collect::<Vec<_>>(),
-        }),
-        WaitItem::PromoteFromQueue { name, priority } => serde_json::json!({
-            "kind": "promote_from_queue",
-            "name": name,
-            "priority": priority,
-        }),
+                .collect(),
+            extra_named: violation.extra_named.iter().map(|p| p.as_str()).collect(),
+        },
+        WaitItem::PromoteFromQueue { name, priority } => WfwJsonItem::PromoteFromQueue {
+            name,
+            priority: *priority,
+        },
         WaitItem::Blocked {
             agent,
             name,
             plan,
             question,
-        } => serde_json::json!({
-            "kind": "blocked",
-            "agent": agent,
-            "name": name,
-            "plan": plan,
-            "question": question,
-        }),
-        WaitItem::Unblocked { name, plan, answer } => serde_json::json!({
-            "kind": "unblocked",
-            "name": name,
-            "plan": plan,
-            "answer": answer,
-        }),
-        WaitItem::PrReviewer { pr, round } => serde_json::json!({
-            "kind": "pr_reviewer",
-            "pr": pr,
-            "round": round,
-        }),
-        WaitItem::PrMaster { pr, round, next } => serde_json::json!({
-            "kind": "pr_master",
-            "pr": pr,
-            "round": round,
-            "next": next,
-        }),
+        } => WfwJsonItem::Blocked {
+            agent,
+            name,
+            plan: plan.as_deref(),
+            question,
+        },
+        WaitItem::Unblocked { name, plan, answer } => WfwJsonItem::Unblocked {
+            name,
+            plan: plan.as_deref(),
+            answer,
+        },
+        WaitItem::PrReviewer { pr, round } => WfwJsonItem::PrReviewer {
+            pr: *pr,
+            round: *round,
+        },
+        WaitItem::PrMaster { pr, round, next } => WfwJsonItem::PrMaster {
+            pr: *pr,
+            round: *round,
+            next,
+        },
     }
 }
 
@@ -938,18 +1002,206 @@ mod tests {
         // 3): json keeps the structured fields a consumer needs —
         // the FULL sha and the block question — while tutorial
         // STRINGS exist in neither view.
-        let j = render_json(&WaitItem::Reviewer {
+        let j = serde_json::to_value(render_json(&WaitItem::Reviewer {
             plan: PlanKey::parse("foo").unwrap(),
             sha: sha("abc"),
             feedback_path: ".clank/agents/x/feedback/abc.md".into(),
-        });
+        }))
+        .unwrap();
         assert_eq!(j["sha"].as_str().unwrap().len(), 40, "full sha in json");
-        let j = render_json(&WaitItem::Blocked {
+        let j = serde_json::to_value(render_json(&WaitItem::Blocked {
             agent: "claude".into(),
             name: "q".into(),
             plan: Some("foo".into()),
             question: "should we?".into(),
-        });
+        }))
+        .unwrap();
         assert_eq!(j["question"], "should we?", "question stays a json field");
+    }
+
+    // ── typed-json-not-json-macro: wfw --json wire contract ──────
+    //
+    // Each typed `WfwJsonItem` must serialize to the same keys+values
+    // the old per-variant `json!` produced — the `clank wfw --json`
+    // contract the stop-hook parses. `json!` here expresses the
+    // EXPECTED value (the ban is on production output code); key order
+    // is irrelevant — `to_value` equality is order-independent.
+    #[test]
+    fn wfw_json_items_serialize_to_the_stable_shape() {
+        use clank_core::vocab::WaitingReason;
+        use clank_core::wait::{MasterNext, PrMasterNext};
+
+        let cases = [
+            (
+                serde_json::to_value(render_json(&WaitItem::Master {
+                    plan: PlanKey::parse("foo").unwrap(),
+                    sha: sha("abc"),
+                    next: MasterNext::Revise,
+                    reason: WaitingReason::AddressCommitChanges,
+                    gate: clank_core::vocab::CommitGateState::ChangesRequested,
+                }))
+                .unwrap(),
+                serde_json::json!({
+                    "kind": "master",
+                    "plan": "foo",
+                    "plan_path": ".clank/plans/foo.md",
+                    "sha": sha("abc").as_str(),
+                    "next": MasterNext::Revise,
+                    "reason": WaitingReason::AddressCommitChanges,
+                    "gate": "changes_requested",
+                }),
+            ),
+            (
+                serde_json::to_value(render_json(&WaitItem::Reviewer {
+                    plan: PlanKey::parse("foo").unwrap(),
+                    sha: sha("abc"),
+                    feedback_path: ".clank/agents/x/feedback/abc.md".into(),
+                }))
+                .unwrap(),
+                serde_json::json!({
+                    "kind": "reviewer",
+                    "plan": "foo",
+                    "plan_path": ".clank/plans/foo.md",
+                    "sha": sha("abc").as_str(),
+                    "feedback_path": ".clank/agents/x/feedback/abc.md",
+                }),
+            ),
+            (
+                serde_json::to_value(render_json(&WaitItem::Finished {
+                    plan: PlanKey::parse("foo").unwrap(),
+                    finalized_at: sha("abc"),
+                }))
+                .unwrap(),
+                serde_json::json!({
+                    "kind": "finished",
+                    "plan": "foo",
+                    "plan_path": ".clank/plans/foo.md",
+                    "finalized_at": sha("abc").as_str(),
+                }),
+            ),
+            (
+                serde_json::to_value(render_json(&WaitItem::Idle {
+                    prompt: "go".into(),
+                }))
+                .unwrap(),
+                serde_json::json!({ "kind": "idle", "prompt": "go" }),
+            ),
+            (
+                serde_json::to_value(render_json(&WaitItem::AdHocReview {
+                    sha: sha("abc"),
+                    feedback_path: "p".into(),
+                }))
+                .unwrap(),
+                serde_json::json!({
+                    "kind": "adhoc_review",
+                    "sha": sha("abc").as_str(),
+                    "feedback_path": "p",
+                }),
+            ),
+            (
+                serde_json::to_value(render_json(&WaitItem::AdHocRevise { sha: sha("abc") }))
+                    .unwrap(),
+                serde_json::json!({ "kind": "adhoc_revise", "sha": sha("abc").as_str() }),
+            ),
+            (
+                serde_json::to_value(render_json(&WaitItem::FixCommitTag {
+                    sha: sha("abc"),
+                    violation: clank_core::wait::HeadTagViolation {
+                        unknown: vec!["ghost".into()],
+                        untagged_touched: vec![PlanKey::parse("real").unwrap()],
+                        extra_named: vec![PlanKey::parse("extra").unwrap()],
+                    },
+                }))
+                .unwrap(),
+                serde_json::json!({
+                    "kind": "fix_commit_tag",
+                    "sha": sha("abc").as_str(),
+                    "unknown": ["ghost"],
+                    "untagged_touched": ["real"],
+                    "extra_named": ["extra"],
+                }),
+            ),
+            (
+                serde_json::to_value(render_json(&WaitItem::PromoteFromQueue {
+                    name: "some-plan".into(),
+                    priority: 300,
+                }))
+                .unwrap(),
+                serde_json::json!({
+                    "kind": "promote_from_queue",
+                    "name": "some-plan",
+                    "priority": 300,
+                }),
+            ),
+            (
+                serde_json::to_value(render_json(&WaitItem::Blocked {
+                    agent: "claude".into(),
+                    name: "q".into(),
+                    plan: Some("foo".into()),
+                    question: "should we?".into(),
+                }))
+                .unwrap(),
+                serde_json::json!({
+                    "kind": "blocked",
+                    "agent": "claude",
+                    "name": "q",
+                    "plan": "foo",
+                    "question": "should we?",
+                }),
+            ),
+            (
+                // `plan: None` must serialize to `null`, matching the
+                // old `&Option<String>` value.
+                serde_json::to_value(render_json(&WaitItem::Unblocked {
+                    name: "q".into(),
+                    plan: None,
+                    answer: "yes".into(),
+                }))
+                .unwrap(),
+                serde_json::json!({
+                    "kind": "unblocked",
+                    "name": "q",
+                    "plan": null,
+                    "answer": "yes",
+                }),
+            ),
+            (
+                serde_json::to_value(render_json(&WaitItem::PrReviewer { pr: 7, round: 2 }))
+                    .unwrap(),
+                serde_json::json!({ "kind": "pr_reviewer", "pr": 7, "round": 2 }),
+            ),
+            (
+                serde_json::to_value(render_json(&WaitItem::PrMaster {
+                    pr: 7,
+                    round: 2,
+                    next: PrMasterNext::Submit,
+                }))
+                .unwrap(),
+                serde_json::json!({
+                    "kind": "pr_master",
+                    "pr": 7,
+                    "round": 2,
+                    "next": PrMasterNext::Submit,
+                }),
+            ),
+        ];
+        for (got, want) in cases {
+            assert_eq!(got, want);
+        }
+    }
+
+    #[test]
+    fn wfw_json_envelope_wraps_items_under_items_key() {
+        let item = WaitItem::Idle {
+            prompt: "go".into(),
+        };
+        let envelope = WfwEnvelope {
+            items: vec![render_json(&item)],
+        };
+        let got = serde_json::to_value(&envelope).unwrap();
+        assert_eq!(
+            got,
+            serde_json::json!({ "items": [{ "kind": "idle", "prompt": "go" }] }),
+        );
     }
 }
