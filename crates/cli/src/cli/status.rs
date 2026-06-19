@@ -74,6 +74,90 @@ pub(crate) struct ShelvedView {
     pub(crate) ready: bool,
 }
 
+/// Typed `status --json` shape (typed-json-not-json-macro,
+/// replacing the old `json!` builder in `to_json`). The keys +
+/// values here ARE the wire contract `status --json` consumers
+/// parse; key order is irrelevant. Conditional keys are
+/// `Option`/empty-skipped, populated under the SAME conditions as
+/// before. Borrows from `&StatusSnapshot`.
+#[derive(serde::Serialize)]
+struct StatusJson<'a> {
+    repo_basename: &'a str,
+    branch: Option<&'a str>,
+    head_sha: Option<&'a str>,
+    head_subject: Option<&'a str>,
+    worktree_dirty: bool,
+    plans: Vec<PlanJson<'a>>,
+    finished_plans: Vec<FinishedPlanJson<'a>>,
+    blocks: Vec<BlockJson<'a>>,
+    /// Only when the worktree is dirty (tui-event-driven-dirty-stats).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dirty_stats: Option<DirtyStatsJson>,
+    /// Emitted with `queue` only when the queue is non-empty
+    /// (clank-status-tui); kept for consumers that read the count.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    queue_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    queue: Option<&'a [String]>,
+    /// Only when non-empty (plan-lifecycle-verbs).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    shelved: Vec<ShelvedJson<'a>>,
+    /// Only when a HEAD commit-tag violation is present
+    /// (commit-tag-fixup-is-first-class-state).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    head_correction: Option<HeadCorrectionJson<'a>>,
+}
+
+#[derive(serde::Serialize)]
+struct PlanJson<'a> {
+    plan: &'a str,
+    /// `None` when the plan is blocked with no reviewable commit yet.
+    latest_reviewable_sha: Option<&'a str>,
+    gate_state: CommitGateState,
+    /// Structured `WaitingOn` via its serde derive (per
+    /// status-blocks-dominate-gate).
+    waiting_on: &'a WaitingOn,
+}
+
+#[derive(serde::Serialize)]
+struct FinishedPlanJson<'a> {
+    plan: &'a str,
+    intro: &'a str,
+    finalized_at: &'a str,
+}
+
+#[derive(serde::Serialize)]
+struct BlockJson<'a> {
+    agent: &'a str,
+    name: &'a str,
+    plan: Option<&'a str>,
+    question: &'a str,
+    answer: Option<&'a str>,
+    pending: bool,
+}
+
+#[derive(serde::Serialize)]
+struct DirtyStatsJson {
+    insertions: u64,
+    deletions: u64,
+    untracked: u64,
+}
+
+#[derive(serde::Serialize)]
+struct ShelvedJson<'a> {
+    plan: &'a str,
+    waiting_for: Option<&'a str>,
+    ready: bool,
+}
+
+#[derive(serde::Serialize)]
+struct HeadCorrectionJson<'a> {
+    sha: &'a str,
+    unknown: &'a [String],
+    untagged_touched: Vec<&'a str>,
+    extra_named: Vec<&'a str>,
+}
+
 /// In-process convenience for tests / callers that want a status
 /// snapshot from just `(repo, home)`: cache enabled, no plan
 /// filter, not watch mode. Hides `CachePolicy`/basename plumbing.
@@ -227,107 +311,94 @@ impl StatusSnapshot {
     }
 
     pub fn to_json(&self) -> serde_json::Value {
-        let plans: Vec<serde_json::Value> = self
+        let plans = self
             .plans
             .iter()
-            .map(|v| {
-                serde_json::json!({
-                    "plan": v.plan.as_str(),
-                    // None when plan is blocked with no reviewable commit yet.
-                    "latest_reviewable_sha": v.sha.as_ref().map(|s| s.as_str()),
-                    "gate_state": v.gate,
-                    // Structured `WaitingOn` via existing serde derive
-                    // (was a `Debug` string — never a stable contract).
-                    // Per status-blocks-dominate-gate.
-                    "waiting_on": v.waiting_on,
-                })
+            .map(|v| PlanJson {
+                plan: v.plan.as_str(),
+                latest_reviewable_sha: v.sha.as_ref().map(|s| s.as_str()),
+                gate_state: v.gate,
+                waiting_on: &v.waiting_on,
             })
             .collect();
 
-        let finished: Vec<serde_json::Value> = if self.plans.is_empty() {
+        // Mirror the prior shape: the finished-plan row appears only
+        // when there are no active plans.
+        let finished_plans = if self.plans.is_empty() {
             self.last_finished
                 .as_ref()
-                .map(|fp| {
-                    vec![serde_json::json!({
-                        "plan": fp.plan.as_str(),
-                        "intro": fp.intro.as_str(),
-                        "finalized_at": fp.finalized_at.as_str(),
-                    })]
+                .map(|fp| FinishedPlanJson {
+                    plan: fp.plan.as_str(),
+                    intro: fp.intro.as_str(),
+                    finalized_at: fp.finalized_at.as_str(),
                 })
-                .unwrap_or_default()
+                .into_iter()
+                .collect()
         } else {
             Vec::new()
         };
 
-        let all_blocks: Vec<serde_json::Value> = self
+        let blocks = self
             .blocks
             .iter()
-            .map(|b| {
-                serde_json::json!({
-                    "agent": b.agent,
-                    "name": b.name,
-                    "plan": b.plan,
-                    "question": b.question,
-                    "answer": b.answer,
-                    "pending": b.answer.is_none(),
-                })
+            .map(|b| BlockJson {
+                agent: &b.agent,
+                name: &b.name,
+                plan: b.plan.as_deref(),
+                question: &b.question,
+                answer: b.answer.as_deref(),
+                pending: b.answer.is_none(),
             })
             .collect();
 
-        let mut obj = serde_json::json!({
-            "repo_basename": self.basename,
-            "branch": self.branch,
-            "head_sha": self.head_sha,
-            "head_subject": self.head_subject,
-            "worktree_dirty": self.dirty.is_some(),
-            "plans": plans,
-            "finished_plans": finished,
-            "blocks": all_blocks,
-        });
-        if let Some(d) = &self.dirty {
-            // Additive (tui-event-driven-dirty-stats);
-            // worktree_dirty kept for existing consumers.
-            obj["dirty_stats"] = serde_json::json!({
-                "insertions": d.insertions,
-                "deletions": d.deletions,
-                "untracked": d.untracked,
-            });
-        }
-        if !self.queue.is_empty() {
-            obj["queue_count"] = serde_json::json!(self.queue.len());
-            // Names in priority order. Additive wire-format change
-            // (clank-status-tui); queue_count kept for consumers.
-            obj["queue"] = serde_json::json!(self.queue);
-        }
-        if !self.shelved.is_empty() {
-            // Additive (plan-lifecycle-verbs).
-            obj["shelved"] = serde_json::json!(
-                self.shelved
+        let shelved = self
+            .shelved
+            .iter()
+            .map(|sv| ShelvedJson {
+                plan: &sv.stem,
+                waiting_for: sv.waiting_for.as_deref(),
+                ready: sv.ready,
+            })
+            .collect();
+
+        let json = StatusJson {
+            repo_basename: &self.basename,
+            branch: self.branch.as_deref(),
+            head_sha: self.head_sha.as_deref(),
+            head_subject: self.head_subject.as_deref(),
+            worktree_dirty: self.dirty.is_some(),
+            plans,
+            finished_plans,
+            blocks,
+            dirty_stats: self.dirty.map(|d| DirtyStatsJson {
+                insertions: d.insertions,
+                deletions: d.deletions,
+                untracked: d.untracked,
+            }),
+            // queue_count + queue travel together, present only when
+            // the queue is non-empty (clank-status-tui).
+            queue_count: (!self.queue.is_empty()).then_some(self.queue.len()),
+            queue: (!self.queue.is_empty()).then_some(self.queue.as_slice()),
+            shelved,
+            head_correction: self.head_correction.as_ref().map(|c| HeadCorrectionJson {
+                sha: c.sha.as_str(),
+                unknown: &c.violation.unknown,
+                untagged_touched: c
+                    .violation
+                    .untagged_touched
                     .iter()
-                    .map(|sv| {
-                        serde_json::json!({
-                            "plan": sv.stem,
-                            "waiting_for": sv.waiting_for,
-                            "ready": sv.ready,
-                        })
-                    })
-                    .collect::<Vec<_>>()
-            );
-        }
-        if let Some(c) = &self.head_correction {
-            let plans = |ks: &[PlanKey]| {
-                ks.iter()
-                    .map(|k| k.as_str().to_string())
-                    .collect::<Vec<_>>()
-            };
-            obj["head_correction"] = serde_json::json!({
-                "sha": c.sha.as_str(),
-                "unknown": c.violation.unknown,
-                "untagged_touched": plans(&c.violation.untagged_touched),
-                "extra_named": plans(&c.violation.extra_named),
-            });
-        }
-        obj
+                    .map(PlanKey::as_str)
+                    .collect(),
+                extra_named: c
+                    .violation
+                    .extra_named
+                    .iter()
+                    .map(PlanKey::as_str)
+                    .collect(),
+            }),
+        };
+
+        serde_json::to_value(&json).expect("StatusJson serializes")
     }
 
     pub fn to_human(&self) -> String {
@@ -1319,6 +1390,166 @@ mod dirty_and_wake_tests {
         assert!(
             rx.recv_timeout(Duration::from_secs(5)).is_ok(),
             "tracked edit did not wake the loop"
+        );
+    }
+
+    fn sha(s: &str) -> clank_core::ids::CommitSha {
+        clank_core::ids::CommitSha::parse(s).unwrap()
+    }
+
+    fn plan_key(s: &str) -> PlanKey {
+        PlanKey::parse(s).unwrap()
+    }
+
+    fn minimal_snapshot() -> StatusSnapshot {
+        StatusSnapshot {
+            repo_path: PathBuf::from("/repo"),
+            basename: "repo".to_string(),
+            branch: Some("main".to_string()),
+            head_sha: Some("abcd123".to_string()),
+            head_subject: Some("do the thing".to_string()),
+            dirty: None,
+            plans: vec![PlanWorkState {
+                plan: plan_key("foo"),
+                sha: Some(sha("0123456789abcdef0123456789abcdef01234567")),
+                gate: CommitGateState::Unreviewed,
+                waiting_on: WaitingOn::MasterToContinue,
+                touched_code: true,
+            }],
+            last_finished: None,
+            blocks: vec![crate::cli::block::BlockEntry {
+                agent: "codex".to_string(),
+                name: "q".to_string(),
+                plan: Some("foo".to_string()),
+                question: "why?".to_string(),
+                answer: None,
+            }],
+            queue: Vec::new(),
+            master: None,
+            shelved: Vec::new(),
+            log_rows: Vec::new(),
+            pr_reviews: Vec::new(),
+            head_correction: None,
+        }
+    }
+
+    #[test]
+    fn to_json_minimal_omits_conditional_keys() {
+        // typed-json-not-json-macro: the typed `StatusJson` must
+        // serialize to the SAME shape the old `json!` builder
+        // produced. Minimal case: every conditional key is ABSENT.
+        // (`json!` expresses the expected value; the ban is on
+        // production output. `to_value` equality is order-independent.)
+        let snap = minimal_snapshot();
+        let got = snap.to_json();
+
+        let want = serde_json::json!({
+            "repo_basename": "repo",
+            "branch": "main",
+            "head_sha": "abcd123",
+            "head_subject": "do the thing",
+            "worktree_dirty": false,
+            "plans": [{
+                "plan": "foo",
+                "latest_reviewable_sha": "0123456789abcdef0123456789abcdef01234567",
+                "gate_state": "unreviewed",
+                "waiting_on": WaitingOn::MasterToContinue,
+            }],
+            "finished_plans": [],
+            "blocks": [{
+                "agent": "codex",
+                "name": "q",
+                "plan": "foo",
+                "question": "why?",
+                "answer": null,
+                "pending": true,
+            }],
+        });
+        assert_eq!(got, want);
+
+        let obj = got.as_object().unwrap();
+        for absent in [
+            "dirty_stats",
+            "queue_count",
+            "queue",
+            "shelved",
+            "head_correction",
+        ] {
+            assert!(
+                !obj.contains_key(absent),
+                "key `{absent}` must be absent when empty"
+            );
+        }
+    }
+
+    #[test]
+    fn to_json_populated_includes_conditional_keys() {
+        // typed-json-not-json-macro: dirty + queue + shelved +
+        // head_correction all present — every conditional key fires.
+        let mut snap = minimal_snapshot();
+        snap.dirty = Some(DirtyStats {
+            insertions: 3,
+            deletions: 1,
+            untracked: 2,
+        });
+        snap.queue = vec!["bar".to_string(), "baz".to_string()];
+        snap.shelved = vec![ShelvedView {
+            stem: "old".to_string(),
+            waiting_for: Some("bar".to_string()),
+            ready: true,
+        }];
+        snap.head_correction = Some(clank_core::wait::HeadCorrection {
+            sha: sha("deadbeef"),
+            violation: clank_core::wait::HeadTagViolation {
+                unknown: vec!["ghost".to_string()],
+                untagged_touched: vec![plan_key("foo")],
+                extra_named: vec![plan_key("bar")],
+            },
+        });
+        let got = snap.to_json();
+
+        assert_eq!(got["worktree_dirty"], true);
+        assert_eq!(
+            got["dirty_stats"],
+            serde_json::json!({"insertions": 3, "deletions": 1, "untracked": 2})
+        );
+        assert_eq!(got["queue_count"], 2);
+        assert_eq!(got["queue"], serde_json::json!(["bar", "baz"]));
+        assert_eq!(
+            got["shelved"],
+            serde_json::json!([{"plan": "old", "waiting_for": "bar", "ready": true}])
+        );
+        assert_eq!(
+            got["head_correction"],
+            serde_json::json!({
+                "sha": "deadbeef",
+                "unknown": ["ghost"],
+                "untagged_touched": ["foo"],
+                "extra_named": ["bar"],
+            })
+        );
+    }
+
+    #[test]
+    fn to_json_finished_plan_only_when_no_active_plans() {
+        // The finished-plan row appears only when there are no active
+        // plans (mirrors the old `if self.plans.is_empty()` guard).
+        let mut snap = minimal_snapshot();
+        snap.plans = Vec::new();
+        snap.blocks = Vec::new();
+        snap.last_finished = Some(clank_core::repo_state::FinishedPlan {
+            plan: plan_key("foo"),
+            intro: sha("aaaaaaa"),
+            finalized_at: sha("bbbbbbb"),
+        });
+        let got = snap.to_json();
+        assert_eq!(
+            got["finished_plans"],
+            serde_json::json!([{
+                "plan": "foo",
+                "intro": "aaaaaaa",
+                "finalized_at": "bbbbbbb",
+            }])
         );
     }
 }
