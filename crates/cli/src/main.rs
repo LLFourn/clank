@@ -22,13 +22,14 @@ enum Command {
     Unfinish(cli::UnfinishArgs),
     /// Manage the plan queue.
     Queue(cli::QueueArgs),
-    /// Read-only inspection of the repo's registered agents
-    /// (`clank agent list`).
+    /// Manage agent DEFINITIONS (the registry): `agent add` /
+    /// `agent remove` / `agent list` / `agent start`. Definitions
+    /// carry the tool + launch profile; team membership lives
+    /// under `clank team`.
     Agent(cli::AgentArgs),
-    /// Manage user-scope team compositions. Teams group agents
-    /// declared in `~/.clank/config.json#/agents` into a master
-    /// + commit/gate reviewer tiers, so repos can pick one via
-    /// `clank init --team <name>`.
+    /// Compose THIS repo's operating team (`team add` / `remove` /
+    /// `set-master` / `show`) and inspect/delete the global
+    /// team-template library (`team list` / `team delete`).
     Team(cli::TeamArgs),
     /// Strip a plan's `.clank/` artifacts from history.
     Purge(cli::PurgeArgs),

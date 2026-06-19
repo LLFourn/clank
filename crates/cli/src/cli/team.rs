@@ -1,13 +1,16 @@
-//! `clank team` — manage user-scope team compositions.
+//! `clank team` — compose THIS repo's operating team and inspect
+//! the global team-template library.
 //!
-//! Teams live in `~/.clank/config.json#/teams` and group agents
-//! from `~/.clank/config.json#/agents` into a master + two
-//! reviewer tiers (commit + gate). Plan:
-//! `teams-based-agent-registration`.
+//! - REPO TEAM (`show` / `add` / `remove` / `set-master`):
+//!   operate on `<repo>/.clank/config.json#/team`, the repo's
+//!   single operating roster (by-name refs into the repo's own
+//!   `agents`). No team-name argument.
+//! - GLOBAL LIBRARY (`list` / `delete`): named team templates in
+//!   `~/.clank/config.json#/teams`. Templates are no longer edited
+//!   in place — they are minted (M3 `team save`) and consumed by
+//!   `clank init --team`.
 //!
-//! All operations implicitly target user-scope — teams live
-//! nowhere else. Read/write goes through the typed
-//! [`crate::cli::teams_config::UserConfigFile`].
+//! Plan: `teams-based-agent-registration`.
 
 use std::path::{Path, PathBuf};
 
@@ -15,21 +18,24 @@ use anyhow::Context;
 use clank_core::ids::AgentLabel;
 
 use crate::cli::teams_config::{AgentDescription, ReviewKind, TeamComposition, UserConfigFile};
-use crate::cli::{TeamArgs, TeamCmd, TeamListArgs, TeamShowArgs};
+use crate::cli::{
+    TeamAddArgs, TeamArgs, TeamCmd, TeamListArgs, TeamRemoveArgs, TeamSetMasterArgs, TeamShowArgs,
+    resolve_repo,
+};
 
 pub async fn run(args: TeamArgs) -> anyhow::Result<()> {
-    let home = home_dir()?;
-    // `run` is the thin imperative shell: resolve `$HOME`, unpack
-    // clap args, call the env-free/args-free `pub` cores below.
-    // Plan: dogfood-init-setup-in-tests (Phase A).
+    // `run` is the thin imperative shell: resolve `$HOME` / repo,
+    // unpack clap args, call the env-free/args-free `pub` cores
+    // below. Plan: dogfood-init-setup-in-tests (Phase A).
     match args.command {
-        TeamCmd::List(a) => list(&home, a),
-        TeamCmd::Show(a) => show(&home, a),
-        TeamCmd::Create(a) => create_team(&home, &a.team),
-        TeamCmd::Delete(a) => delete_team(&home, &a.team, a.force),
-        TeamCmd::Add(a) => add_member(&home, &a.team, &a.agent, a.review.into()),
-        TeamCmd::Remove(a) => remove_member(&home, &a.team, &a.agent),
-        TeamCmd::SetMaster(a) => set_master(&home, &a.team, &a.agent),
+        // Repo-team subcommands operate on the repo's single team.
+        TeamCmd::Show(a) => show_repo_team(a),
+        TeamCmd::Add(a) => team_add(a),
+        TeamCmd::Remove(a) => team_remove(a),
+        TeamCmd::SetMaster(a) => team_set_master(a),
+        // Global library subcommands operate on user-scope teams.
+        TeamCmd::List(a) => list(&home_dir()?, a),
+        TeamCmd::Delete(a) => delete_team(&home_dir()?, &a.team, a.force),
     }
 }
 
@@ -74,8 +80,12 @@ pub(crate) fn resolve_effective_auto_mode(
 }
 
 fn write_user_config(home: &Path, file: &UserConfigFile) -> anyhow::Result<()> {
+    write_typed_config(&user_config_path(home), file)
+}
+
+/// Atomic write of a typed config via tempfile + rename.
+fn write_typed_config<T: serde::Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
     use std::io::Write;
-    let path = user_config_path(home);
     let parent = path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("no parent for `{}`", path.display()))?;
@@ -84,10 +94,10 @@ fn write_user_config(home: &Path, file: &UserConfigFile) -> anyhow::Result<()> {
         .prefix(".clank-config-")
         .suffix(".json.tmp")
         .tempfile_in(parent)?;
-    tmp.write_all(serde_json::to_string_pretty(file)?.as_bytes())?;
+    tmp.write_all(serde_json::to_string_pretty(value)?.as_bytes())?;
     tmp.write_all(b"\n")?;
     tmp.as_file_mut().sync_all()?;
-    tmp.persist(&path).map_err(|e| e.error)?;
+    tmp.persist(path).map_err(|e| e.error)?;
     Ok(())
 }
 
@@ -148,17 +158,17 @@ fn list(home: &Path, args: TeamListArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn show(home: &Path, args: TeamShowArgs) -> anyhow::Result<()> {
-    let cfg = read_user_config(home)?;
-    let comp = cfg
-        .teams
-        .get(&args.team)
-        .ok_or_else(|| anyhow::anyhow!("team `{}` not in user-scope `teams`", args.team))?;
+/// `clank team show` — print THIS repo's operating team (master +
+/// both reviewer tiers). Replaces the old global `team show
+/// <name>`. Reads the repo config's own `agents` for tool labels.
+fn show_repo_team(args: TeamShowArgs) -> anyhow::Result<()> {
+    let repo = resolve_repo(args.repo.as_deref())?;
+    let cfg = read_repo_config(&repo)?;
+    let comp = &cfg.team;
     if args.json {
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
-                "name": args.team,
                 "master": comp.master.as_ref().map(|l| l.as_str()),
                 "commit_reviewers": comp.commit_reviewers.iter().map(|l| l.as_str()).collect::<Vec<_>>(),
                 "gate_reviewers": comp.gate_reviewers.iter().map(|l| l.as_str()).collect::<Vec<_>>(),
@@ -166,7 +176,7 @@ fn show(home: &Path, args: TeamShowArgs) -> anyhow::Result<()> {
         );
         return Ok(());
     }
-    println!("team `{}`:", args.team);
+    println!("this repo's team:");
     println!(
         "  master:           {}",
         comp.master
@@ -190,15 +200,190 @@ fn show(home: &Path, args: TeamShowArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-// ── mutation cores ───────────────────────────────────────────
+// ── repo-team shells (clank team add / remove / set-master) ──
+
+/// `clank team add <label> [--review ...]` — thin shell.
+fn team_add(args: TeamAddArgs) -> anyhow::Result<()> {
+    let repo = resolve_repo(args.repo.as_deref())?;
+    let label = parse_label(&args.agent)?;
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    add_to_repo_team(&repo, home.as_deref(), &label, args.review.into())
+}
+
+/// `clank team remove <label>` — thin shell.
+fn team_remove(args: TeamRemoveArgs) -> anyhow::Result<()> {
+    let repo = resolve_repo(args.repo.as_deref())?;
+    let label = parse_label(&args.agent)?;
+    remove_from_repo_team(&repo, &label)
+}
+
+/// `clank team set-master <label>` — thin shell. Reuses
+/// `agent::promote_repo_master`'s validated body (the old `clank
+/// agent promote` logic). Resolves/copies-down the label first so
+/// the repo stays self-contained.
+fn team_set_master(args: TeamSetMasterArgs) -> anyhow::Result<()> {
+    let repo = resolve_repo(args.repo.as_deref())?;
+    let label = parse_label(&args.agent)?;
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    set_repo_team_master(&repo, home.as_deref(), &label)
+}
+
+// ── repo-team cores ──────────────────────────────────────────
 //
-// `pub`, env-free (take an explicit `home: &Path`), args-free
-// (take primitives, not clap `Args`). Both `run()` above and the
-// integration-test setup call these, so the test model and the
-// production model are THE SAME CODE. Plan:
-// dogfood-init-setup-in-tests (Phase A). These still do file IO
-// (read/write `~/.clank/config.json`) — "core" means no env/clap,
-// not pure.
+// Operate on `<repo>/.clank/config.json#/team`. `pub`, env-free
+// (explicit `repo`/`home`), args-free.
+
+/// Add an existing agent to THIS repo's team's commit (default)
+/// or gate reviewer list. Resolves `label`: if defined in the
+/// repo's `agents`, use it; else if declared in user-scope
+/// `agents`, copy the description DOWN into repo `agents` first;
+/// else error. Refuses if already in the team (master or a list).
+pub fn add_to_repo_team(
+    repo: &Path,
+    home: Option<&Path>,
+    label: &AgentLabel,
+    review: ReviewKind,
+) -> anyhow::Result<()> {
+    let mut repo_cfg = read_repo_config(repo)?;
+
+    if repo_cfg.team.master.as_ref() == Some(label)
+        || repo_cfg.team.commit_reviewers.contains(label)
+        || repo_cfg.team.gate_reviewers.contains(label)
+    {
+        anyhow::bail!("agent `{}` is already in this repo's team", label.as_str());
+    }
+
+    // Resolve the definition: repo-local wins, else copy down from
+    // user-scope, else error.
+    if !repo_cfg.agents.contains_key(label) {
+        let user_desc = home
+            .map(|h| -> anyhow::Result<Option<AgentDescription>> {
+                Ok(read_user_config(h)?.agents.get(label).cloned())
+            })
+            .transpose()?
+            .flatten();
+        let desc = user_desc.ok_or_else(|| {
+            anyhow::anyhow!(
+                "unknown agent `{}` (define it with `clank agent add`)",
+                label.as_str()
+            )
+        })?;
+        repo_cfg.agents.insert(label.clone(), desc);
+    }
+
+    match review {
+        ReviewKind::Commit => repo_cfg.team.commit_reviewers.push(label.clone()),
+        ReviewKind::Gate => repo_cfg.team.gate_reviewers.push(label.clone()),
+    }
+    write_repo_config(repo, &repo_cfg)?;
+    eprintln!(
+        "added `{}` to this repo's team as a `{}` reviewer",
+        label.as_str(),
+        match review {
+            ReviewKind::Commit => "commit",
+            ReviewKind::Gate => "gate",
+        }
+    );
+    Ok(())
+}
+
+/// Remove an agent from THIS repo's team: clear master if it's the
+/// master, else drop it from whichever reviewer list holds it.
+/// LEAVES the definition in `agents`. Errors if not in the team.
+pub fn remove_from_repo_team(repo: &Path, label: &AgentLabel) -> anyhow::Result<()> {
+    let mut repo_cfg = read_repo_config(repo)?;
+
+    let was_master = repo_cfg.team.master.as_ref() == Some(label);
+    if was_master {
+        repo_cfg.team.master = None;
+    }
+    let before = repo_cfg.team.commit_reviewers.len() + repo_cfg.team.gate_reviewers.len();
+    repo_cfg.team.commit_reviewers.retain(|l| l != label);
+    repo_cfg.team.gate_reviewers.retain(|l| l != label);
+    let dropped_reviewer =
+        before != repo_cfg.team.commit_reviewers.len() + repo_cfg.team.gate_reviewers.len();
+
+    if !was_master && !dropped_reviewer {
+        anyhow::bail!("agent `{}` is not in this repo's team", label.as_str());
+    }
+    write_repo_config(repo, &repo_cfg)?;
+    eprintln!(
+        "removed `{}` from this repo's team (definition kept in `agents`)",
+        label.as_str()
+    );
+    Ok(())
+}
+
+/// Set THIS repo's team master, demoting the previous master into
+/// commit_reviewers. Resolves/copies-down `label` like
+/// [`add_to_repo_team`], then delegates the validated promote body
+/// to [`crate::cli::agent::promote_repo_master`] (the old `clank
+/// agent promote` logic).
+pub fn set_repo_team_master(
+    repo: &Path,
+    home: Option<&Path>,
+    label: &AgentLabel,
+) -> anyhow::Result<()> {
+    // Copy the definition down first if it only exists user-scope,
+    // so promote_repo_master's resolver validation passes.
+    let mut repo_cfg = read_repo_config(repo)?;
+    if !repo_cfg.agents.contains_key(label) {
+        let user_desc = home
+            .map(|h| -> anyhow::Result<Option<AgentDescription>> {
+                Ok(read_user_config(h)?.agents.get(label).cloned())
+            })
+            .transpose()?
+            .flatten();
+        let desc = user_desc.ok_or_else(|| {
+            anyhow::anyhow!(
+                "unknown agent `{}` (define it with `clank agent add`)",
+                label.as_str()
+            )
+        })?;
+        repo_cfg.agents.insert(label.clone(), desc);
+        write_repo_config(repo, &repo_cfg)?;
+    }
+
+    if !crate::cli::agent::promote_repo_master(repo, home, label)? {
+        anyhow::bail!("this repo has no config. Run `clank init` first.");
+    }
+    Ok(())
+}
+
+/// Read `<repo>/.clank/config.json` as the typed
+/// [`crate::cli::teams_config::RepoConfigFile`]. Missing file →
+/// default; malformed JSON → error.
+fn read_repo_config(repo: &Path) -> anyhow::Result<crate::cli::teams_config::RepoConfigFile> {
+    use crate::cli::teams_config::RepoConfigFile;
+    let path = repo.join(".clank/config.json");
+    match std::fs::read_to_string(&path) {
+        Ok(s) => serde_json::from_str(&s).with_context(|| format!("parsing {}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(RepoConfigFile::default()),
+        Err(e) => Err(anyhow::Error::from(e).context(format!("reading {}", path.display()))),
+    }
+}
+
+/// Atomic write of `<repo>/.clank/config.json`.
+fn write_repo_config(
+    repo: &Path,
+    file: &crate::cli::teams_config::RepoConfigFile,
+) -> anyhow::Result<()> {
+    write_typed_config(&repo.join(".clank/config.json"), file)
+}
+
+// ── global team-template library cores ───────────────────────
+//
+// `pub`, env-free (take an explicit `home: &Path`), args-free.
+// `list` / `delete` are wired to `run()`; `create_team` /
+// `set_master` / `add_member` / `remove_member` MINT a named
+// user-scope template (the path `clank init --team` consumes and
+// M3's `team save` will formalize). They are no longer wired to a
+// `clank team` subcommand — in-place template editing was dropped
+// — but remain the dogfood builders the integration-test setup
+// uses to construct a template before `register_repo_team` copies
+// it down. Plan: dogfood-init-setup-in-tests (Phase A). These do
+// file IO (read/write `~/.clank/config.json`) — "core" means no
+// env/clap, not pure.
 
 /// Create an empty user-scope team. Errors if it already exists.
 pub fn create_team(home: &Path, team: &str) -> anyhow::Result<()> {
@@ -209,9 +394,7 @@ pub fn create_team(home: &Path, team: &str) -> anyhow::Result<()> {
     cfg.teams
         .insert(team.to_string(), TeamComposition::default());
     write_user_config(home, &cfg)?;
-    eprintln!(
-        "created empty team `{team}` in user-scope (use `clank team set-master {team} <agent>` to designate the master)"
-    );
+    eprintln!("created empty team template `{team}` in user-scope");
     Ok(())
 }
 
@@ -392,6 +575,214 @@ mod tests {
             cfg.teams.insert(name.to_string(), (*comp).clone());
         }
         write_user_config(home, &cfg).unwrap();
+    }
+
+    fn seed_repo_config(repo: &Path, body: &str) {
+        std::fs::create_dir_all(repo.join(".clank")).unwrap();
+        std::fs::write(repo.join(".clank/config.json"), body).unwrap();
+    }
+
+    fn read_repo(repo: &Path) -> crate::cli::teams_config::RepoConfigFile {
+        let body = std::fs::read_to_string(repo.join(".clank/config.json")).unwrap();
+        serde_json::from_str(&body).unwrap()
+    }
+
+    // ── repo-team cores (clank team add / remove / set-master) ──
+
+    #[test]
+    fn add_to_repo_team_appends_local_agent_to_commit_tier() {
+        let repo = tempfile::tempdir().unwrap();
+        seed_repo_config(
+            repo.path(),
+            r#"{
+                "agents": { "claude": { "tool": "claude" }, "codex": { "tool": "codex" } },
+                "team": { "master": "claude" }
+            }"#,
+        );
+        let codex = AgentLabel::parse("codex").unwrap();
+        add_to_repo_team(repo.path(), None, &codex, ReviewKind::Commit).unwrap();
+        let parsed = read_repo(repo.path());
+        assert_eq!(parsed.team.commit_reviewers, vec![codex]);
+    }
+
+    #[test]
+    fn add_to_repo_team_copies_global_only_agent_down() {
+        // The label is NOT in repo `agents` but IS in user-scope
+        // `agents` → its description is copied down, then added.
+        let home_dir = setup_home();
+        let home = home_dir.path();
+        seed_user_config(home, &[("ruthless", Tool::Claude)], &[]);
+        let repo = tempfile::tempdir().unwrap();
+        seed_repo_config(
+            repo.path(),
+            r#"{
+                "agents": { "claude": { "tool": "claude" } },
+                "team": { "master": "claude" }
+            }"#,
+        );
+        let ruthless = AgentLabel::parse("ruthless").unwrap();
+        add_to_repo_team(repo.path(), Some(home), &ruthless, ReviewKind::Gate).unwrap();
+        let parsed = read_repo(repo.path());
+        // Description copied down so the repo stays self-contained.
+        assert!(parsed.agents.contains_key(&ruthless));
+        assert_eq!(parsed.agents[&ruthless].tool, Tool::Claude);
+        assert_eq!(parsed.team.gate_reviewers, vec![ruthless]);
+    }
+
+    #[test]
+    fn add_to_repo_team_errors_on_unknown_agent() {
+        let home_dir = setup_home();
+        let repo = tempfile::tempdir().unwrap();
+        seed_repo_config(
+            repo.path(),
+            r#"{
+                "agents": { "claude": { "tool": "claude" } },
+                "team": { "master": "claude" }
+            }"#,
+        );
+        let phantom = AgentLabel::parse("phantom").unwrap();
+        let err = add_to_repo_team(
+            repo.path(),
+            Some(home_dir.path()),
+            &phantom,
+            ReviewKind::Commit,
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("unknown agent `phantom`"));
+        assert!(msg.contains("clank agent add"));
+    }
+
+    #[test]
+    fn add_to_repo_team_refuses_agent_already_in_team() {
+        let repo = tempfile::tempdir().unwrap();
+        seed_repo_config(
+            repo.path(),
+            r#"{
+                "agents": { "claude": { "tool": "claude" }, "codex": { "tool": "codex" } },
+                "team": { "master": "claude", "commit_reviewers": ["codex"] }
+            }"#,
+        );
+        let codex = AgentLabel::parse("codex").unwrap();
+        let err = add_to_repo_team(repo.path(), None, &codex, ReviewKind::Gate).unwrap_err();
+        assert!(format!("{err:#}").contains("already in this repo's team"));
+        // master is also refused.
+        let claude = AgentLabel::parse("claude").unwrap();
+        let err = add_to_repo_team(repo.path(), None, &claude, ReviewKind::Commit).unwrap_err();
+        assert!(format!("{err:#}").contains("already in this repo's team"));
+    }
+
+    #[test]
+    fn remove_from_repo_team_drops_reviewer_but_keeps_definition() {
+        let repo = tempfile::tempdir().unwrap();
+        seed_repo_config(
+            repo.path(),
+            r#"{
+                "agents": { "claude": { "tool": "claude" }, "codex": { "tool": "codex" } },
+                "team": { "master": "claude", "commit_reviewers": ["codex"] }
+            }"#,
+        );
+        let codex = AgentLabel::parse("codex").unwrap();
+        remove_from_repo_team(repo.path(), &codex).unwrap();
+        let parsed = read_repo(repo.path());
+        assert!(parsed.team.commit_reviewers.is_empty());
+        // Definition is kept.
+        assert!(parsed.agents.contains_key(&codex));
+    }
+
+    #[test]
+    fn remove_from_repo_team_clears_master() {
+        let repo = tempfile::tempdir().unwrap();
+        seed_repo_config(
+            repo.path(),
+            r#"{
+                "agents": { "claude": { "tool": "claude" } },
+                "team": { "master": "claude" }
+            }"#,
+        );
+        let claude = AgentLabel::parse("claude").unwrap();
+        remove_from_repo_team(repo.path(), &claude).unwrap();
+        let parsed = read_repo(repo.path());
+        assert!(parsed.team.master.is_none());
+        // Definition kept.
+        assert!(parsed.agents.contains_key(&claude));
+    }
+
+    #[test]
+    fn remove_from_repo_team_errors_when_not_in_team() {
+        let repo = tempfile::tempdir().unwrap();
+        seed_repo_config(
+            repo.path(),
+            r#"{
+                "agents": { "claude": { "tool": "claude" }, "spare": { "tool": "codex" } },
+                "team": { "master": "claude" }
+            }"#,
+        );
+        // `spare` is defined but not in the team.
+        let spare = AgentLabel::parse("spare").unwrap();
+        let err = remove_from_repo_team(repo.path(), &spare).unwrap_err();
+        assert!(format!("{err:#}").contains("not in this repo's team"));
+    }
+
+    #[test]
+    fn set_repo_team_master_sets_master_and_demotes_previous() {
+        let repo = tempfile::tempdir().unwrap();
+        seed_repo_config(
+            repo.path(),
+            r#"{
+                "agents": { "claude": { "tool": "claude" }, "codex": { "tool": "codex" } },
+                "team": { "master": "claude", "commit_reviewers": ["codex"] }
+            }"#,
+        );
+        let codex = AgentLabel::parse("codex").unwrap();
+        set_repo_team_master(repo.path(), None, &codex).unwrap();
+        let parsed = read_repo(repo.path());
+        assert_eq!(
+            parsed.team.master.as_ref().map(|l| l.as_str()),
+            Some("codex")
+        );
+        // Previous master (claude) demoted to commit_reviewers;
+        // codex removed from there.
+        let cr: Vec<_> = parsed
+            .team
+            .commit_reviewers
+            .iter()
+            .map(|l| l.as_str())
+            .collect();
+        assert!(cr.contains(&"claude"));
+        assert!(!cr.contains(&"codex"));
+    }
+
+    #[test]
+    fn set_repo_team_master_copies_global_only_agent_down() {
+        let home_dir = setup_home();
+        let home = home_dir.path();
+        seed_user_config(home, &[("boss", Tool::Claude)], &[]);
+        let repo = tempfile::tempdir().unwrap();
+        seed_repo_config(
+            repo.path(),
+            r#"{
+                "agents": { "claude": { "tool": "claude" } },
+                "team": { "master": "claude" }
+            }"#,
+        );
+        let boss = AgentLabel::parse("boss").unwrap();
+        set_repo_team_master(repo.path(), Some(home), &boss).unwrap();
+        let parsed = read_repo(repo.path());
+        // boss copied down + set as master.
+        assert!(parsed.agents.contains_key(&boss));
+        assert_eq!(
+            parsed.team.master.as_ref().map(|l| l.as_str()),
+            Some("boss")
+        );
+        // claude demoted.
+        assert!(
+            parsed
+                .team
+                .commit_reviewers
+                .iter()
+                .any(|l| l.as_str() == "claude")
+        );
     }
 
     #[test]

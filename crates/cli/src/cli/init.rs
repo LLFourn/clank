@@ -411,9 +411,10 @@ pub fn register_repo_team(home: &Path, repo: &Path, team_name: &str) -> anyhow::
     };
     let team = user_cfg.teams.get(team_name).ok_or_else(|| {
         anyhow::anyhow!(
-            "team `{team_name}` not declared in user-scope teams. Create it with \
-             `clank team create {team_name}` (and optionally `clank team set-master \
-             {team_name} <agent>` + `clank team add {team_name} <agent>`) first."
+            "team `{team_name}` not declared in user-scope teams \
+             (`~/.clank/config.json#/teams`). Run bare `clank init` to start from an \
+             empty repo team, then compose it with `clank agent add` + `clank team add` / \
+             `clank team set-master`."
         )
     })?;
 
@@ -850,7 +851,7 @@ mod tests {
         let err = register_repo_team(user_home.path(), repo.path(), "nonexistent").unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("not declared"));
-        assert!(msg.contains("clank team create"));
+        assert!(msg.contains("clank init") && msg.contains("clank team add"));
         assert!(
             !repo.path().join(".clank/config.json").exists() || {
                 let body = std::fs::read_to_string(repo.path().join(".clank/config.json"))
