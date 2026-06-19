@@ -80,10 +80,29 @@ fn firings_from_items(items: &[WaitItem]) -> Vec<HookFiring> {
                 gate: None,
                 next: None,
             }),
+            // A broken HEAD tag proactively pulls master back to amend
+            // (commit-tag-fixup-is-first-class-state) — previously it
+            // yielded no firing, so the bad commit woke the REVIEWER
+            // while the master correction sat passive. Keyed to the
+            // first real plan the violation implicates (the touched
+            // plan, then a named-but-untouched one); the pure
+            // unknown-tag case names no real plan, so it has no hook
+            // key and stays a self-poll pull.
+            WaitItem::FixCommitTag { sha, violation } => violation
+                .untagged_touched
+                .iter()
+                .chain(violation.extra_named.iter())
+                .next()
+                .map(|plan| HookFiring {
+                    event: HookEvent::MasterWork,
+                    plan: plan.clone(),
+                    sha: sha.clone(),
+                    gate: None,
+                    next: Some("fix-commit-tag".to_string()),
+                }),
             WaitItem::Idle { .. }
             | WaitItem::AdHocReview { .. }
             | WaitItem::AdHocRevise { .. }
-            | WaitItem::FixCommitTag { .. }
             | WaitItem::PromoteFromQueue { .. }
             | WaitItem::Blocked { .. }
             | WaitItem::Unblocked { .. }
@@ -95,41 +114,6 @@ fn firings_from_items(items: &[WaitItem]) -> Vec<HookFiring> {
             | WaitItem::PrMaster { .. } => None,
         })
         .collect()
-}
-
-/// HEAD-tag fixup for master (adhoc-commits-and-plan-tag-validation):
-/// reads HEAD's subject + the plan files HEAD touched, and returns a
-/// `FixCommitTag` item if it's tagged for a plan that's neither active
-/// nor touched by HEAD (adopted-gated, HEAD-only). All the policy lives
-/// in `clank_core::wait::head_tag_fixup`; this just feeds it the live
-/// HEAD facts.
-fn master_head_fixup(
-    repo: &Path,
-    state: &crate::repo_state::RepoState,
-) -> Option<clank_core::wait::WaitItem> {
-    let head = state.head.as_ref()?;
-    let subject = crate::git_io::commit_subject(repo, head).unwrap_or_default();
-    let active: std::collections::BTreeSet<PlanKey> = state.fold.plans.keys().cloned().collect();
-    let touched = head_touched_plans(repo, head);
-    clank_core::wait::head_tag_fixup(state.fold.adopted, head, &subject, &active, &touched)
-}
-
-/// Plans whose `.clank/plans/<x>.md` HEAD's diff changed — the
-/// lifecycle plan(s) HEAD is acting on. A `[foo] finish`/`delete`
-/// removes `foo` from the active set, so this keeps its own tag valid.
-fn head_touched_plans(repo: &Path, head: &CommitSha) -> std::collections::BTreeSet<PlanKey> {
-    let from = crate::git_io::parent_of(repo, head).ok().flatten();
-    crate::git_io::commit_events_between(repo, from.as_ref(), head)
-        .ok()
-        .and_then(|evs| evs.into_iter().last())
-        .map(|ev| {
-            ev.changes
-                .plan_touches
-                .into_iter()
-                .map(|t| t.plan)
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
@@ -205,7 +189,15 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
                 &repo,
                 initial_state.head.as_ref(),
             );
-            let status = initial_state.fold.derive_status(&reviews, &work_policy);
+            // A broken HEAD tag is now a derived, dominating state
+            // (commit-tag-fixup-is-first-class-state): derive_status
+            // yields the correction and work_for routes master to the
+            // FixCommitTag item / withholds reviewer wakes — no bespoke
+            // side-check.
+            let head = crate::git_io::head_commit(&repo, &initial_state);
+            let status = initial_state
+                .fold
+                .derive_status(&reviews, &work_policy, head.as_ref());
             let mut items = status.work_for(&author, role);
             if !br.suppressed_plans.is_empty() {
                 items.retain(|item| match item {
@@ -222,16 +214,6 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
             // an idle reviewer via the `!items.is_empty()` gate below
             // for nothing (`finish-does-not-wake-reviewers`).
             if role == Role::Master {
-                // A mistyped HEAD tag preempts everything: master must
-                // fix the commit message before continuing
-                // (adhoc-commits-and-plan-tag-validation).
-                if let Some(fixup) = master_head_fixup(&repo, &initial_state) {
-                    for firing in &firings_from_items(std::slice::from_ref(&fixup)) {
-                        hook_config::run_hook(&repo, &hook_config, firing);
-                    }
-                    emit(std::slice::from_ref(&fixup), args.json);
-                    return Ok(());
-                }
                 items.extend(detect_finished(&snapshot, &initial_state.fold));
             }
             if !items.is_empty() {
@@ -372,7 +354,11 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
                 .map_err(|e| anyhow::anyhow!("failed to fold repo `{}`: {e}", repo.display()))?;
             let reviews =
                 crate::fs_plan_state_lookup::FsPlanStateLookup::new(&repo, state.head.as_ref());
-            let status = state.fold.derive_status(&reviews, &work_policy);
+            // Commit-tag correction is derived (see initial-pass note).
+            let head = crate::git_io::head_commit(&repo, &state);
+            let status = state
+                .fold
+                .derive_status(&reviews, &work_policy, head.as_ref());
             let mut items = status.work_for(&author, role);
             if !br.suppressed_plans.is_empty() {
                 items.retain(|item| match item {
@@ -386,13 +372,6 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
             // initial-pass rationale above
             // (`finish-does-not-wake-reviewers`).
             if role == Role::Master {
-                if let Some(fixup) = master_head_fixup(&repo, &state) {
-                    for firing in &firings_from_items(std::slice::from_ref(&fixup)) {
-                        hook_config::run_hook(&repo, &hook_config, firing);
-                    }
-                    emit(std::slice::from_ref(&fixup), args.json);
-                    return Ok(());
-                }
                 items.extend(detect_finished(&snapshot, &state.fold));
             }
             if !items.is_empty() {
@@ -584,10 +563,20 @@ fn render_json(item: &WaitItem) -> serde_json::Value {
             "kind": "adhoc_revise",
             "sha": sha.as_str(),
         }),
-        WaitItem::FixCommitTag { sha, unknown } => serde_json::json!({
+        WaitItem::FixCommitTag { sha, violation } => serde_json::json!({
             "kind": "fix_commit_tag",
             "sha": sha.as_str(),
-            "unknown": unknown,
+            "unknown": violation.unknown,
+            "untagged_touched": violation
+                .untagged_touched
+                .iter()
+                .map(|p| p.as_str())
+                .collect::<Vec<_>>(),
+            "extra_named": violation
+                .extra_named
+                .iter()
+                .map(|p| p.as_str())
+                .collect::<Vec<_>>(),
         }),
         WaitItem::PromoteFromQueue { name, priority } => serde_json::json!({
             "kind": "promote_from_queue",
@@ -661,12 +650,39 @@ fn render_human(item: &WaitItem) -> String {
             format!("adhoc-review  {}  write feedback", short(sha),)
         }
         WaitItem::AdHocRevise { sha } => format!("adhoc-revise  {}  address changes", short(sha)),
-        WaitItem::FixCommitTag { sha, unknown } => format!(
-            "fix-commit-tag  {}  [{}] names no active plan — amend to a real \
-             plan tag, or drop the tag (no tag = ad-hoc)",
-            short(sha),
-            unknown.join(",")
-        ),
+        WaitItem::FixCommitTag { sha, violation } => {
+            let mut parts: Vec<String> = Vec::new();
+            if !violation.untagged_touched.is_empty() {
+                let names = violation
+                    .untagged_touched
+                    .iter()
+                    .map(|p| p.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                parts.push(format!("touched but not tagged: {names}"));
+            }
+            if !violation.extra_named.is_empty() {
+                let names = violation
+                    .extra_named
+                    .iter()
+                    .map(|p| p.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                parts.push(format!("tagged but not touched: {names}"));
+            }
+            if !violation.unknown.is_empty() {
+                parts.push(format!(
+                    "names no active plan: {}",
+                    violation.unknown.join(",")
+                ));
+            }
+            format!(
+                "fix-commit-tag  {}  {} — amend the tag to EXACTLY the plan files \
+                 the commit touches (no tag = ad-hoc)",
+                short(sha),
+                parts.join("; ")
+            )
+        }
         WaitItem::PromoteFromQueue { name, priority } => {
             format!("promote  {name}  (priority {priority:03})")
         }
@@ -821,6 +837,64 @@ mod tests {
     fn parse_timeout_rejects_garbage() {
         assert!(parse_timeout("abc").is_err());
         assert!(parse_timeout("5x").is_err());
+    }
+
+    // ── commit-tag-fixup-is-first-class-state ──────────────────
+
+    #[test]
+    fn fix_commit_tag_fires_master_hook_keyed_to_touched_plan() {
+        // Previously FixCommitTag yielded no firing — the bad commit
+        // woke the REVIEWER while the master correction sat passive.
+        // Now it proactively pulls master back, keyed to the touched
+        // plan.
+        let item = WaitItem::FixCommitTag {
+            sha: sha("aaaa"),
+            violation: clank_core::wait::HeadTagViolation {
+                unknown: vec!["plan".into()],
+                untagged_touched: vec![PlanKey::parse("real").unwrap()],
+                extra_named: vec![],
+            },
+        };
+        let firings = firings_from_items(std::slice::from_ref(&item));
+        assert_eq!(firings.len(), 1, "a proactive master firing");
+        assert_eq!(firings[0].event, HookEvent::MasterWork);
+        assert_eq!(firings[0].plan.as_str(), "real");
+        assert_eq!(firings[0].next.as_deref(), Some("fix-commit-tag"));
+    }
+
+    #[test]
+    fn fix_commit_tag_unknown_only_has_no_hook_key() {
+        // T = ∅ unknown-tag case names no real plan → no HookFiring
+        // (nothing to key it to), as before.
+        let item = WaitItem::FixCommitTag {
+            sha: sha("aaaa"),
+            violation: clank_core::wait::HeadTagViolation {
+                unknown: vec!["ghost".into()],
+                untagged_touched: vec![],
+                extra_named: vec![],
+            },
+        };
+        assert!(firings_from_items(std::slice::from_ref(&item)).is_empty());
+    }
+
+    #[test]
+    fn fix_commit_tag_human_line_names_all_three_kinds() {
+        let item = WaitItem::FixCommitTag {
+            sha: sha("aaaa"),
+            violation: clank_core::wait::HeadTagViolation {
+                unknown: vec!["plan".into()],
+                untagged_touched: vec![PlanKey::parse("real").unwrap()],
+                extra_named: vec![PlanKey::parse("extra").unwrap()],
+            },
+        };
+        let line = render_human(&item);
+        assert!(line.contains("fix-commit-tag"));
+        assert!(line.contains("real"), "names the touched-but-untagged plan");
+        assert!(
+            line.contains("extra"),
+            "names the tagged-but-untouched plan"
+        );
+        assert!(line.contains("plan"), "names the unknown tag");
     }
 
     // ── minimal-hint rendering (wfw-output-is-a-minimal-hint) ──

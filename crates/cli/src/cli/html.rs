@@ -1034,6 +1034,7 @@ fn waiting_on_label(w: &clank_core::plan_view::WaitingOn) -> String {
         W::MasterToContinue => "master to continue".to_string(),
         W::MasterToFinalize => "master to finalize".to_string(),
         W::MasterToCommit => "master to commit".to_string(),
+        W::MasterToFixCommitTag => "master to fix commit tag".to_string(),
     }
 }
 

@@ -151,7 +151,13 @@ impl StatusSnapshot {
         };
         let reviews =
             crate::fs_plan_state_lookup::FsPlanStateLookup::new(repo, state.head.as_ref());
-        let work_status = state.fold.derive_status(&reviews, &work_policy);
+        // HEAD facts feed the commit-tag invariant
+        // (commit-tag-fixup-is-first-class-state): a violation renders
+        // as the dominating `MasterToFixCommitTag` correction.
+        let head = crate::git_io::head_commit(repo, state);
+        let work_status = state
+            .fold
+            .derive_status(&reviews, &work_policy, head.as_ref());
 
         let (plans, last_finished) = select_plans_and_finished(
             &work_status.plans,
@@ -819,7 +825,8 @@ pub(crate) fn waiting_actor(w: &WaitingOn) -> String {
         WaitingOn::MasterToRevise { .. }
         | WaitingOn::MasterToContinue
         | WaitingOn::MasterToFinalize
-        | WaitingOn::MasterToCommit => "master".into(),
+        | WaitingOn::MasterToCommit
+        | WaitingOn::MasterToFixCommitTag => "master".into(),
     }
 }
 
@@ -887,6 +894,9 @@ pub(crate) fn waiting_reason(w: &WaitingOn) -> String {
         }
         WaitingOn::MasterToFinalize => "gate FINISHED — run `clank finish`".into(),
         WaitingOn::MasterToCommit => "gate approved but plan file dirty".into(),
+        WaitingOn::MasterToFixCommitTag => {
+            "HEAD tag doesn't match touched plan files — amend the commit message".into()
+        }
     }
 }
 

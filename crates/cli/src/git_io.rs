@@ -167,6 +167,39 @@ pub fn commit_subject(repo: &Path, sha: &CommitSha) -> Result<String, GitIoError
     Ok(msg.summary().to_string())
 }
 
+/// Live HEAD facts for the commit-tag invariant
+/// (`commit-tag-fixup-is-first-class-state`): HEAD's subject + the
+/// plan files its diff touched + repo adoption, packaged as a
+/// [`clank_core::wait::HeadCommit`] for `derive_status`. Returns
+/// `None` when the repo has no HEAD (fresh repo). Errors reading the
+/// subject/diff degrade to empty (no subject) / no touches — the
+/// invariant then simply finds nothing to flag, never a false alarm.
+pub fn head_commit(
+    repo: &Path,
+    state: &crate::repo_state::RepoState,
+) -> Option<clank_core::wait::HeadCommit> {
+    let head = state.head.as_ref()?;
+    let subject = commit_subject(repo, head).unwrap_or_default();
+    let from = parent_of(repo, head).ok().flatten();
+    let touched = commit_events_between(repo, from.as_ref(), head)
+        .ok()
+        .and_then(|evs| evs.into_iter().last())
+        .map(|ev| {
+            ev.changes
+                .plan_touches
+                .into_iter()
+                .map(|t| t.plan)
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(clank_core::wait::HeadCommit {
+        sha: head.clone(),
+        subject,
+        touched,
+        adopted: state.fold.adopted,
+    })
+}
+
 /// The commit's body (`%b`) — everything after the subject and its
 /// blank line, or `""` if none. Replaces `git log -1 --format=%b
 /// <sha>`.

@@ -94,14 +94,16 @@ pub enum WaitItem {
     AdHocRevise {
         sha: CommitSha,
     },
-    /// Master's HEAD commit is tagged `[unknown]` — a plan prefix that
-    /// names no active plan. Master must amend the message to a real
-    /// plan tag, or drop the tag (no tag = ad-hoc). HEAD-only, and only
-    /// when the repo is adopted (adhoc-commits-and-plan-tag-validation).
+    /// Master's HEAD commit's `[..]` tag doesn't match the plan files
+    /// its diff touched (`commit-tag-fixup-is-first-class-state`).
+    /// Master must amend the message before any review motion
+    /// continues. HEAD-only, adopted-gated. The three independent
+    /// violation kinds are reported together so one amend fixes them
+    /// all (`adhoc-commits-and-plan-tag-validation` was the original
+    /// unknown-tag-only check).
     FixCommitTag {
         sha: CommitSha,
-        /// The `[...]` names that aren't active plans.
-        unknown: Vec<String>,
+        violation: HeadTagViolation,
     },
     PromoteFromQueue {
         name: String,
@@ -134,51 +136,114 @@ pub enum WaitItem {
     },
 }
 
-/// HEAD-only plan-tag check (adhoc-commits-and-plan-tag-validation).
-/// If the commit master just made carries a `[tag]` naming a plan that
-/// is neither active NOR one HEAD itself touched, return the fixup item
-/// so `wfw` nags master to amend the message (or drop the tag — no tag
-/// = ad-hoc). Returns `None` when:
-/// - the repo isn't `adopted` (clank is a local guest on a repo whose
-///   `.clank` isn't committed — never police its commit conventions),
-/// - HEAD is untagged, or
-/// - every name in HEAD's tag is an active plan or a plan HEAD touched.
+/// All facts about HEAD the invariant check needs, sans-io. The CLI
+/// builds this from live git (`head_tag_violation` is pure over it);
+/// tests construct it directly. `None` (no HEAD) means a fresh repo —
+/// no commit to police.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeadCommit {
+    pub sha: CommitSha,
+    pub subject: String,
+    /// `T` — plans whose `.clank/plans/<x>.md` HEAD's diff touched
+    /// (intro/revise/finish/delete; cross-stem renames count as a
+    /// touch of both stems). The objective ground truth for which
+    /// plan(s) HEAD acts on.
+    pub touched: BTreeSet<PlanKey>,
+    /// Repo adoption (`RepoState::adopted`). Off → clank is a guest
+    /// on an un-committed `.clank`; never police commit conventions.
+    pub adopted: bool,
+}
+
+/// A structured HEAD commit-tag invariant violation. The three kinds
+/// are independent and reported together so one amend fixes them all.
+/// At least one field is non-empty whenever a `HeadTagViolation` is
+/// produced. (`commit-tag-fixup-is-first-class-state`.)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeadTagViolation {
+    /// `G ⊄ active∪introduced` — tag names that resolve to no real
+    /// plan (the original unknown-tag check).
+    pub unknown: Vec<String>,
+    /// `T ⊄ G` — plans HEAD's diff touched that the tag fails to
+    /// name. Must add these to the tag.
+    pub untagged_touched: Vec<PlanKey>,
+    /// `G ⊋ T` on a plan-touching commit — named plans HEAD did NOT
+    /// touch. A planning commit must tag EXACTLY its touched plans;
+    /// these extras must be dropped (genuine code for them goes in
+    /// its own commit). Empty when `T = ∅`.
+    pub extra_named: Vec<PlanKey>,
+}
+
+/// HEAD-only commit-tag invariant check
+/// (`commit-tag-fixup-is-first-class-state`). Let `G` be the plans the
+/// `[..]` tag names and `T = head.touched`:
+/// - `T ≠ ∅` (HEAD touched plan file[s]): require `G == T` exactly —
+///   tag the touched plans, no extras. Splits the legit
+///   `[foo] finish`/`delete` carve-out out for free (the rename/delete
+///   IS a touch of `foo`, so `T={foo}=G`).
+/// - `T = ∅` (pure code / ad-hoc): every name in `G` must resolve to a
+///   real plan (`active ∪ introduced`); untagged is fine (ad-hoc).
+///   `G == T` does NOT apply (that would ban legit implementation
+///   tags).
 ///
-/// `head_touched` is the set of plans whose `.clank/plans/<x>.md` HEAD's
-/// diff changed — the lifecycle plan(s) HEAD is acting on. A
-/// `[foo] finish` / `[foo] delete` removes `foo` from the active set, so
-/// without this the legitimate finalize/delete commit would be flagged
-/// (codex 1ea61ae).
+/// Always: every name in `G` must resolve to a real plan.
 ///
-/// HEAD-only by design: history is tolerated; mistakes are caught when
-/// made. Host conventions (`[app]`/`[ci]`) are ancestors, never the
-/// commit master just made, so they never trip this.
-pub fn head_tag_fixup(
-    adopted: bool,
-    head_sha: &CommitSha,
-    head_subject: &str,
-    active_plans: &BTreeSet<PlanKey>,
-    head_touched: &BTreeSet<PlanKey>,
-) -> Option<WaitItem> {
-    if !adopted {
+/// Returns `None` (no violation) when: the repo isn't `adopted`; HEAD
+/// is untagged with `T = ∅`; or `G` and `T` satisfy the rule above.
+/// HEAD-only by design — history is tolerated, mistakes caught when
+/// made; host conventions (`[app]`/`[ci]`) are ancestors, never HEAD.
+///
+/// `known_plans` is `active ∪ plans HEAD introduced` — a `[foo] intro`
+/// must accept its own brand-new tag.
+pub fn head_tag_violation(
+    head: &HeadCommit,
+    known_plans: &BTreeSet<PlanKey>,
+) -> Option<HeadTagViolation> {
+    if !head.adopted {
         return None;
     }
-    let Some(TitlePrefix::Plans(names)) = parse_title_prefix(head_subject) else {
-        return None;
-    };
-    let unknown: Vec<String> = names
-        .into_iter()
-        .filter(|n| match PlanKey::parse(n) {
-            Ok(k) => !active_plans.contains(&k) && !head_touched.contains(&k),
-            Err(_) => true,
-        })
+    // G = the plan set the tag names. An unparsable name (e.g. one
+    // with illegal chars) can't be a real plan → unknown.
+    let mut unknown: Vec<String> = Vec::new();
+    let mut named: BTreeSet<PlanKey> = BTreeSet::new();
+    if let Some(TitlePrefix::Plans(names)) = parse_title_prefix(&head.subject) {
+        for n in names {
+            match PlanKey::parse(&n) {
+                Ok(k) if known_plans.contains(&k) => {
+                    named.insert(k);
+                }
+                _ => unknown.push(n),
+            }
+        }
+    }
+
+    // `T ⊆ G`: every touched plan must be named.
+    let untagged_touched: Vec<PlanKey> = head
+        .touched
+        .iter()
+        .filter(|t| !named.contains(t))
+        .cloned()
         .collect();
-    if unknown.is_empty() {
+
+    // `G ⊆ T` only when the commit touches a plan file (strict
+    // `G == T`). On a `T = ∅` (pure-code) commit, named active plans
+    // are legit implementation attribution — not extras.
+    let extra_named: Vec<PlanKey> = if head.touched.is_empty() {
+        Vec::new()
+    } else {
+        named
+            .iter()
+            .filter(|g| !head.touched.contains(g))
+            .cloned()
+            .collect()
+    };
+
+    if unknown.is_empty() && untagged_touched.is_empty() && extra_named.is_empty() {
         None
     } else {
-        Some(WaitItem::FixCommitTag {
-            sha: head_sha.clone(),
+        Some(HeadTagViolation {
             unknown,
+            untagged_touched,
+            extra_named,
         })
     }
 }
@@ -299,6 +364,23 @@ pub struct WorkStatus {
     /// Active GitHub PR reviews (clank-pr-review-mode), projected
     /// from `.clank/pr-reviews/` via `PlanStateLookup::pr_reviews`.
     pub pr_reviews: Vec<PrReviewWorkState>,
+    /// `Some` iff HEAD's `[..]` tag violates the commit-tag invariant
+    /// (`commit-tag-fixup-is-first-class-state`). This is the SINGLE
+    /// derived source of the master's "fix the commit tag"
+    /// correction: `work_for` routes master to it (dominating review
+    /// motion) and withholds reviewer wakes while it's set. Affected
+    /// active plan rows also carry `WaitingOn::MasterToFixCommitTag`
+    /// (same computation) so status/TUI render the correction. Empty
+    /// when no HEAD facts were supplied or the tag is valid.
+    pub head_correction: Option<HeadCorrection>,
+}
+
+/// A HEAD commit-tag violation paired with the SHA to amend, ready to
+/// route to the master as a `WaitItem::FixCommitTag`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeadCorrection {
+    pub sha: CommitSha,
+    pub violation: HeadTagViolation,
 }
 
 #[derive(Debug, Clone)]
@@ -443,8 +525,47 @@ pub fn compute_gate(
 }
 
 impl RepoState {
-    pub fn derive_status(&self, reviews: &impl PlanStateLookup, policy: &WorkPolicy) -> WorkStatus {
+    /// Derive the role-flavored wait surface. `head` carries the live
+    /// HEAD facts the commit-tag invariant needs
+    /// (`commit-tag-fixup-is-first-class-state`); pass `None` on a
+    /// fresh repo or where HEAD facts aren't available (the
+    /// correction simply won't be derived). The violation is computed
+    /// ONCE here and is the single source for both `head_correction`
+    /// (master routing) and the `MasterToFixCommitTag` marking on
+    /// affected plan rows (status/TUI display).
+    pub fn derive_status(
+        &self,
+        reviews: &impl PlanStateLookup,
+        policy: &WorkPolicy,
+        head: Option<&HeadCommit>,
+    ) -> WorkStatus {
         use crate::vocab::{CommitGateState, PlanWorktreeStatus};
+
+        // Commit-tag invariant: compute the violation once. `known`
+        // is active ∪ plans HEAD introduced so a `[foo] intro` accepts
+        // its own brand-new tag (mirrors `apply_commit`'s known set).
+        let head_correction = head.and_then(|h| {
+            let mut known: BTreeSet<PlanKey> = self.plans.keys().cloned().collect();
+            known.extend(h.touched.iter().cloned());
+            head_tag_violation(h, &known).map(|violation| HeadCorrection {
+                sha: h.sha.clone(),
+                violation,
+            })
+        });
+        // Active plans the violation implicates: those HEAD touched or
+        // named with a real plan. Their rows get `MasterToFixCommitTag`
+        // (below `Blocked`, above review/master-action states) so the
+        // correction renders uniformly.
+        let correction_plans: BTreeSet<PlanKey> = match (&head_correction, head) {
+            (Some(c), Some(h)) => {
+                let mut s: BTreeSet<PlanKey> = h.touched.iter().cloned().collect();
+                s.extend(c.violation.untagged_touched.iter().cloned());
+                s.extend(c.violation.extra_named.iter().cloned());
+                s.retain(|k| self.plans.contains_key(k));
+                s
+            }
+            _ => BTreeSet::new(),
+        };
 
         let mut plans = Vec::new();
         {
@@ -633,6 +754,16 @@ impl RepoState {
                     }
                 };
 
+                // Commit-tag correction dominates review/master-action
+                // states (but not Blocked — handled by the `continue`
+                // above). Marked from the SAME violation that produced
+                // `head_correction`, so display and routing can't drift.
+                let waiting_on = if correction_plans.contains(key) {
+                    WaitingOn::MasterToFixCommitTag
+                } else {
+                    waiting_on
+                };
+
                 plans.push(PlanWorkState {
                     plan: key.clone(),
                     sha: Some(latest_sha),
@@ -701,6 +832,7 @@ impl RepoState {
             plans,
             ad_hoc,
             pr_reviews,
+            head_correction,
         }
     }
 }
@@ -733,6 +865,23 @@ fn missing_for_gate(
 
 impl WorkStatus {
     pub fn work_for(&self, author: &AgentLabel, role: Role) -> Vec<WaitItem> {
+        // A broken HEAD tag preempts everything
+        // (`commit-tag-fixup-is-first-class-state`): master fixes the
+        // commit message before any review motion; reviewers are NOT
+        // woken until it's fixed. This is the SINGLE source for the
+        // master's fixup item (the per-plan `MasterToFixCommitTag`
+        // marking below is for display only). Blocked entries are
+        // co-surfaced by the caller (`wfw`), as for ordinary items.
+        if let Some(correction) = &self.head_correction {
+            return match role {
+                Role::Master => vec![WaitItem::FixCommitTag {
+                    sha: correction.sha.clone(),
+                    violation: correction.violation.clone(),
+                }],
+                Role::Reviewer => Vec::new(),
+            };
+        }
+
         let mut out = Vec::new();
         for ps in &self.plans {
             // Safe: only non-blocked plans reach the WaitItem-emitting
@@ -931,48 +1080,89 @@ mod tests {
         AgentLabel::parse(s).unwrap()
     }
 
-    #[test]
-    fn head_tag_fixup_flags_unknown_tag_only_when_adopted() {
-        let active: BTreeSet<PlanKey> = std::iter::once(plan("foo")).collect();
-        let none: BTreeSet<PlanKey> = BTreeSet::new();
-        let h = sha("aaaa");
-        let fixup = |adopted, subj| head_tag_fixup(adopted, &h, subj, &active, &none);
+    fn pset(names: &[&str]) -> BTreeSet<PlanKey> {
+        names.iter().map(|n| plan(n)).collect()
+    }
 
-        // Unknown tag on an adopted repo → fixup naming the bad tag.
-        assert!(matches!(
-            fixup(true, "[bar] work"),
-            Some(WaitItem::FixCommitTag { unknown, .. }) if unknown == vec!["bar".to_string()]
-        ));
-        // `[misc]` is no longer special — it's just an unknown tag.
-        assert!(fixup(true, "[misc] one-off").is_some());
-        // Known active plan → no fixup.
-        assert!(fixup(true, "[foo] work").is_none());
-        // No tag → ad-hoc, fine.
-        assert!(fixup(true, "just code").is_none());
-        // NOT adopted (local-guest repo) → never police, even on `[bar]`.
-        assert!(fixup(false, "[bar] work").is_none());
-        // Multi-tag with one unknown → flag only the unknown name.
-        assert!(matches!(
-            fixup(true, "[foo,bar] x"),
-            Some(WaitItem::FixCommitTag { unknown, .. }) if unknown == vec!["bar".to_string()]
-        ));
+    /// Build a `HeadCommit` + run `head_tag_violation` against
+    /// `known = active ∪ touched` (the set `derive_status` uses).
+    fn violate(
+        adopted: bool,
+        subject: &str,
+        active: &[&str],
+        touched: &[&str],
+    ) -> Option<HeadTagViolation> {
+        let head = HeadCommit {
+            sha: sha("aaaa"),
+            subject: subject.to_string(),
+            touched: pset(touched),
+            adopted,
+        };
+        let mut known: BTreeSet<PlanKey> = pset(active);
+        known.extend(head.touched.iter().cloned());
+        head_tag_violation(&head, &known)
     }
 
     #[test]
-    fn head_tag_fixup_allows_finalize_of_a_now_removed_plan() {
-        // codex 1ea61ae: a `[foo] finish` (or delete) removes foo from
-        // the ACTIVE set, but HEAD touched foo's plan file — so the
-        // legitimate lifecycle commit must NOT be flagged.
-        let active: BTreeSet<PlanKey> = BTreeSet::new(); // foo finalized → gone from active
-        let touched: BTreeSet<PlanKey> = std::iter::once(plan("foo")).collect();
-        let h = sha("bbbb");
-        assert!(
-            head_tag_fixup(true, &h, "[foo] finish", &active, &touched).is_none(),
-            "finalize of a removed plan must not be flagged"
-        );
-        // ...but a code commit tagged for a plan it neither activates
-        // nor touches IS still flagged.
-        assert!(head_tag_fixup(true, &h, "[ghost] code", &active, &touched).is_some());
+    fn head_tag_unknown_name_flagged_only_when_adopted() {
+        // T = ∅ (pure code): an unknown tag name is the original
+        // unknown-tag check. Flagged on an adopted repo, tolerated on
+        // a guest repo.
+        let v = violate(true, "[bar] work", &["foo"], &[]).expect("unknown tag flagged");
+        assert_eq!(v.unknown, vec!["bar".to_string()]);
+        assert!(v.untagged_touched.is_empty() && v.extra_named.is_empty());
+        // `[misc]` is no longer special — just an unknown tag.
+        assert!(violate(true, "[misc] one-off", &["foo"], &[]).is_some());
+        // Known active plan, no touch → legit implementation tag.
+        assert!(violate(true, "[foo] work", &["foo"], &[]).is_none());
+        // No tag, no touch → ad-hoc, fine.
+        assert!(violate(true, "just code", &["foo"], &[]).is_none());
+        // NOT adopted → never police.
+        assert!(violate(false, "[bar] work", &["foo"], &[]).is_none());
+        // Multi-tag, one unknown (T = ∅) → flag only the unknown name.
+        let v = violate(true, "[foo,bar] x", &["foo"], &[]).expect("partial unknown flagged");
+        assert_eq!(v.unknown, vec!["bar".to_string()]);
+    }
+
+    #[test]
+    fn head_tag_touched_but_unnamed_is_flagged() {
+        // T ⊄ G: HEAD touched a plan file the tag doesn't name.
+        // `[plan]` placeholder touching `real.md` (the motivating bug).
+        let v = violate(true, "[plan] fix it", &["real"], &["real"])
+            .expect("placeholder over real plan flagged");
+        assert_eq!(v.untagged_touched, vec![plan("real")]);
+        assert_eq!(v.unknown, vec!["plan".to_string()]);
+        // untagged touching real.md → T={real}, G=∅.
+        let v = violate(true, "fix it", &["real"], &["real"]).expect("untagged touch flagged");
+        assert_eq!(v.untagged_touched, vec![plan("real")]);
+        // `[a]` touching a.md + b.md → b unnamed.
+        let v = violate(true, "[a] cross", &["a", "b"], &["a", "b"])
+            .expect("second touched plan must be named");
+        assert_eq!(v.untagged_touched, vec![plan("b")]);
+        assert!(v.extra_named.is_empty());
+    }
+
+    #[test]
+    fn head_tag_extra_named_on_plan_touch_is_flagged() {
+        // G ⊋ T on a plan-touching commit: `[a,b]` but only a.md
+        // touched. `b` rides along unverifiably — strict G == T bans it.
+        let v = violate(true, "[a,b] x", &["a", "b"], &["a"]).expect("extra named flagged");
+        assert_eq!(v.extra_named, vec![plan("b")]);
+        assert!(v.untagged_touched.is_empty() && v.unknown.is_empty());
+    }
+
+    #[test]
+    fn head_tag_strict_equality_when_touch_is_satisfied() {
+        // T = G exactly → valid.
+        assert!(violate(true, "[a,b] both", &["a", "b"], &["a", "b"]).is_none());
+        // codex 1ea61ae: `[foo] finish`/`delete` IS a touch of foo, so
+        // T={foo}=G even though finalize removes foo from active. The
+        // carve-out falls out for free.
+        assert!(violate(true, "[foo] finish", &[], &["foo"]).is_none());
+        assert!(violate(true, "[foo] delete", &[], &["foo"]).is_none());
+        // intro of a brand-new plan: its own tag is accepted via
+        // known = active ∪ touched.
+        assert!(violate(true, "[new] intro", &[], &["new"]).is_none());
     }
 
     fn entry(verdict: crate::vocab::Verdict, who: &str) -> ReviewEntry {
@@ -1273,6 +1463,7 @@ mod tests {
             }],
             ad_hoc: Vec::new(),
             pr_reviews: Vec::new(),
+            head_correction: None,
         }
     }
 
@@ -1589,7 +1780,7 @@ mod tests {
     fn pr_state(input: PrReviewInput) -> PrReviewWorkState {
         let state = RepoState::default();
         state
-            .derive_status(&MockPrReviews(vec![input]), &two_tier_policy())
+            .derive_status(&MockPrReviews(vec![input]), &two_tier_policy(), None)
             .pr_reviews
             .into_iter()
             .next()
@@ -1643,6 +1834,7 @@ mod tests {
             plans: Vec::new(),
             ad_hoc: Vec::new(),
             pr_reviews: vec![s],
+            head_correction: None,
         };
         assert_eq!(
             ws.work_for(&label("claude"), Role::Master),
@@ -1677,6 +1869,7 @@ mod tests {
                 gate,
                 missing_reviewers: missing.iter().map(|l| label(l)).collect(),
             }],
+            head_correction: None,
         }
     }
 
@@ -1781,6 +1974,199 @@ mod tests {
         }
     }
 
+    // ── commit-tag-fixup-is-first-class-state ──────────────────
+    //
+    // HEAD's tag must match the plan files it touched. A violation is
+    // a dominating derived state: master gets a FixCommitTag item,
+    // reviewers get nothing, and the implicated plan row renders the
+    // correction.
+
+    fn head(subject: &str, touched: &[&str]) -> HeadCommit {
+        HeadCommit {
+            sha: sha("aaaa"),
+            subject: subject.to_string(),
+            touched: touched.iter().map(|t| plan(t)).collect(),
+            adopted: true,
+        }
+    }
+
+    /// A plan with one reviewable commit at `aaaa`, two registered
+    /// commit reviewers (so absent the correction it would be
+    /// Unreviewed → reviewers woken).
+    fn state_one_plan(stem: &str) -> RepoState {
+        let mut state = RepoState::default();
+        state
+            .plans
+            .insert(plan(stem), make_plan_with_one_reviewable(sha("aaaa")));
+        state
+    }
+
+    #[test]
+    fn derive_status_placeholder_tag_over_real_plan_is_correction() {
+        // `[plan]` placeholder touching real.md → T={real}, G={plan}.
+        // Reproduce-first: the OLD one-directional check (`G ⊆
+        // active∪touched`) never fired here because `plan` parses; only
+        // the new `T ⊆ G` direction catches it.
+        let state = state_one_plan("real");
+        let status = state.derive_status(
+            &MockReviews(vec![]),
+            &plan_policy(),
+            Some(&head("[plan] fix", &["real"])),
+        );
+        assert!(
+            status.head_correction.is_some(),
+            "violation must be derived"
+        );
+        assert_eq!(status.plans[0].waiting_on, WaitingOn::MasterToFixCommitTag);
+        // Master routed to fix; reviewers NOT woken.
+        let master = status.work_for(&label("lloyd"), Role::Master);
+        assert_eq!(master.len(), 1);
+        assert!(matches!(master[0], WaitItem::FixCommitTag { .. }));
+        assert!(status.work_for(&label("codex"), Role::Reviewer).is_empty());
+        assert!(
+            status
+                .work_for(&label("ruthless"), Role::Reviewer)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn derive_status_untagged_touch_is_correction() {
+        // untagged commit touching real.md → T={real}, G=∅.
+        let state = state_one_plan("real");
+        let status = state.derive_status(
+            &MockReviews(vec![]),
+            &plan_policy(),
+            Some(&head("fix it", &["real"])),
+        );
+        assert!(status.head_correction.is_some());
+        assert_eq!(status.plans[0].waiting_on, WaitingOn::MasterToFixCommitTag);
+        assert!(status.work_for(&label("codex"), Role::Reviewer).is_empty());
+    }
+
+    #[test]
+    fn derive_status_tag_missing_second_touched_plan_is_correction() {
+        // `[a]` touching a.md + b.md → b unnamed. Both plans active.
+        let mut state = RepoState::default();
+        state
+            .plans
+            .insert(plan("a"), make_plan_with_one_reviewable(sha("aaaa")));
+        state
+            .plans
+            .insert(plan("b"), make_plan_with_one_reviewable(sha("bbbb")));
+        let status = state.derive_status(
+            &MockReviews(vec![]),
+            &plan_policy(),
+            Some(&head("[a] cross", &["a", "b"])),
+        );
+        assert!(status.head_correction.is_some());
+        // Both implicated plans carry the correction.
+        for ps in &status.plans {
+            assert_eq!(
+                ps.waiting_on,
+                WaitingOn::MasterToFixCommitTag,
+                "plan {} must carry the correction",
+                ps.plan.as_str()
+            );
+        }
+        let master = status.work_for(&label("lloyd"), Role::Master);
+        assert_eq!(master.len(), 1, "exactly one fixup, not one per plan");
+    }
+
+    #[test]
+    fn derive_status_valid_multi_tag_stays_valid() {
+        // `[a,b]` touching a.md + b.md → T == G → no correction; normal
+        // review resumes (reviewers woken on the Unreviewed gate).
+        let mut state = RepoState::default();
+        state
+            .plans
+            .insert(plan("a"), make_plan_with_one_reviewable(sha("aaaa")));
+        state
+            .plans
+            .insert(plan("b"), make_plan_with_one_reviewable(sha("bbbb")));
+        let status = state.derive_status(
+            &MockReviews(vec![]),
+            &plan_policy(),
+            Some(&head("[a,b] both", &["a", "b"])),
+        );
+        assert!(status.head_correction.is_none(), "T == G is valid");
+        for ps in &status.plans {
+            assert!(matches!(
+                ps.waiting_on,
+                WaitingOn::ReviewerApprovalsMissing { .. }
+            ));
+        }
+        assert_eq!(status.work_for(&label("codex"), Role::Reviewer).len(), 2);
+    }
+
+    #[test]
+    fn derive_status_finish_delete_carveout_stays_valid() {
+        // `[foo] finish` removes foo from active but IS a touch of foo,
+        // so T={foo}=G → valid (no correction). (foo already gone from
+        // `plans` post-finalize; the violation check is fold-independent
+        // and reads only HEAD facts.)
+        let state = RepoState::default();
+        let status = state.derive_status(
+            &MockReviews(vec![]),
+            &plan_policy(),
+            Some(&head("[foo] finish", &["foo"])),
+        );
+        assert!(status.head_correction.is_none());
+    }
+
+    #[test]
+    fn derive_status_adhoc_code_and_impl_tag_stay_valid() {
+        // T = ∅: untagged ad-hoc is fine, and a `[foo]` implementation
+        // commit (active, no plan touch) is the common case — must stay
+        // valid (G == T does NOT apply when T = ∅).
+        let state = state_one_plan("foo");
+        // untagged code commit, no plan touch.
+        let s1 = state.derive_status(
+            &MockReviews(vec![]),
+            &plan_policy(),
+            Some(&head("just code", &[])),
+        );
+        assert!(s1.head_correction.is_none(), "ad-hoc untagged is valid");
+        // `[foo]` implementation commit, no plan touch.
+        let s2 = state.derive_status(
+            &MockReviews(vec![]),
+            &plan_policy(),
+            Some(&head("[foo] implement", &[])),
+        );
+        assert!(s2.head_correction.is_none(), "implementation tag is valid");
+        assert_eq!(s2.work_for(&label("codex"), Role::Reviewer).len(), 1);
+    }
+
+    #[test]
+    fn derive_status_correction_yields_to_block() {
+        // Precedence: a plan-scoped block dominates even the tag
+        // correction (a human-blocking issue still wins). The blocked
+        // plan stays Blocked; the violation still routes master.
+        let state = state_one_plan("real");
+        let blocks = std::collections::BTreeMap::from([(
+            plan("real"),
+            vec![mkblock("claude", "halt", "hold")],
+        )]);
+        let status = state.derive_status(
+            &MockBlocks(blocks),
+            &plan_policy(),
+            Some(&head("[plan] fix", &["real"])),
+        );
+        assert!(matches!(
+            status.plans[0].waiting_on,
+            WaitingOn::Blocked { .. }
+        ));
+    }
+
+    #[test]
+    fn derive_status_no_head_no_correction() {
+        // No HEAD facts (fresh repo / caller didn't supply) → never a
+        // correction; normal review path.
+        let state = state_one_plan("real");
+        let status = state.derive_status(&MockReviews(vec![]), &plan_policy(), None);
+        assert!(status.head_correction.is_none());
+    }
+
     #[test]
     fn derive_status_routine_code_commit_does_not_wake_gate_reviewer() {
         // THE REGRESSION GUARANTEE, end-to-end (compute_gate →
@@ -1797,7 +2183,7 @@ mod tests {
             sha("aaaa"),
             vec![entry(crate::vocab::Verdict::Approve, "codex")],
         )]);
-        let status = state.derive_status(&reviews, &master_gate_policy());
+        let status = state.derive_status(&reviews, &master_gate_policy(), None);
 
         assert_eq!(
             status.plans[0].gate,
@@ -1824,7 +2210,7 @@ mod tests {
             sha("bbbb"),
             vec![entry(crate::vocab::Verdict::Approve, "codex")],
         )]);
-        let status = state.derive_status(&reviews, &master_gate_policy());
+        let status = state.derive_status(&reviews, &master_gate_policy(), None);
 
         assert_eq!(status.plans[0].gate, CommitGateState::ApprovedPendingGate);
         assert_eq!(
@@ -1846,7 +2232,7 @@ mod tests {
             plan("foo"),
             vec![mkblock("claude", "halt", "checking the design")],
         )]);
-        let status = state.derive_status(&MockBlocks(blocks), &plan_policy());
+        let status = state.derive_status(&MockBlocks(blocks), &plan_policy(), None);
         assert_eq!(status.plans.len(), 1);
         let ps = &status.plans[0];
         assert_eq!(ps.gate, CommitGateState::Blocked);
@@ -1876,7 +2262,7 @@ mod tests {
             plan("foo"),
             vec![mkblock("claude", "halt", "intro only")],
         )]);
-        let status = state.derive_status(&MockBlocks(blocks), &plan_policy());
+        let status = state.derive_status(&MockBlocks(blocks), &plan_policy(), None);
         assert_eq!(status.plans.len(), 1);
         let ps = &status.plans[0];
         assert_eq!(ps.gate, CommitGateState::Blocked);
@@ -1894,7 +2280,7 @@ mod tests {
         state
             .plans
             .insert(plan("foo"), make_plan_with_one_reviewable(sha("aaaa")));
-        let status = state.derive_status(&MockBlocks(Default::default()), &plan_policy());
+        let status = state.derive_status(&MockBlocks(Default::default()), &plan_policy(), None);
         assert_eq!(status.plans.len(), 1);
         assert_eq!(status.plans[0].gate, CommitGateState::Unreviewed);
     }
@@ -1918,7 +2304,7 @@ mod tests {
                 mkblock("codex", "alpha", "a"),
             ],
         )]);
-        let status = state.derive_status(&MockBlocks(blocks), &plan_policy());
+        let status = state.derive_status(&MockBlocks(blocks), &plan_policy(), None);
         let block_creator = match &status.plans[0].waiting_on {
             WaitingOn::Blocked { block } => block.creator.as_str().to_string(),
             other => panic!("expected Blocked; got: {other:?}"),
@@ -1944,7 +2330,7 @@ mod tests {
             plan("foo"),
             vec![mkblock("claude", "halt", "wait")],
         )]);
-        let status = state.derive_status(&MockBlocks(blocks), &plan_policy());
+        let status = state.derive_status(&MockBlocks(blocks), &plan_policy(), None);
         // Master gets nothing.
         let master_items = status.work_for(&label("claude"), Role::Master);
         assert_eq!(master_items.len(), 0);
@@ -1982,7 +2368,7 @@ mod tests {
                 verdict: crate::vocab::Verdict::RequestChanges,
             }],
         )]);
-        let status = state.derive_status(&reviews, &adhoc_policy());
+        let status = state.derive_status(&reviews, &adhoc_policy(), None);
         assert_eq!(status.ad_hoc.len(), 1);
         assert_eq!(status.ad_hoc[0].sha, sha("2222"));
     }
@@ -2016,7 +2402,7 @@ mod tests {
                 }],
             ),
         ]);
-        let status = state.derive_status(&reviews, &adhoc_policy());
+        let status = state.derive_status(&reviews, &adhoc_policy(), None);
         let work = status.work_for(&label("master"), Role::Master);
         assert!(
             work.is_empty(),
@@ -2080,7 +2466,7 @@ mod tests {
             .plans
             .insert(plan("foo"), make_plan_with_one_reviewable(sha("aaaa")));
         // No reviews → Unreviewed gate.
-        let status = state.derive_status(&MockDirty::new(), &plan_policy());
+        let status = state.derive_status(&MockDirty::new(), &plan_policy(), None);
         let work = status.work_for(&label("lloyd"), Role::Master);
         assert_eq!(work.len(), 1, "master must get exactly one item");
         match &work[0] {
@@ -2110,7 +2496,7 @@ mod tests {
             }],
         )];
         let mock = MockDirty::new().with_reviews(reviews);
-        let status = state.derive_status(&mock, &plan_policy());
+        let status = state.derive_status(&mock, &plan_policy(), None);
         let work = status.work_for(&label("lloyd"), Role::Master);
         assert_eq!(work.len(), 1);
         match &work[0] {
@@ -2149,7 +2535,7 @@ mod tests {
             ],
         )];
         let mock = MockDirty::new().with_reviews(reviews);
-        let status = state.derive_status(&mock, &plan_policy());
+        let status = state.derive_status(&mock, &plan_policy(), None);
         let work = status.work_for(&label("lloyd"), Role::Master);
         assert_eq!(work.len(), 1);
         assert!(matches!(
@@ -2173,7 +2559,7 @@ mod tests {
             .insert(plan("foo"), make_plan_with_one_reviewable(sha("aaaa")));
         let mock =
             MockDirty::new().with_block(plan("foo"), vec![mkblock("claude", "halt", "hold")]);
-        let status = state.derive_status(&mock, &plan_policy());
+        let status = state.derive_status(&mock, &plan_policy(), None);
         assert_eq!(status.plans[0].gate, CommitGateState::Blocked);
         // Blocked plans emit no work for any role.
         let master_work = status.work_for(&label("lloyd"), Role::Master);
@@ -2201,7 +2587,7 @@ mod tests {
             .insert(plan("foo"), make_plan_with_one_reviewable(sha("aaaa")));
         // No reviews → Unreviewed gate. Pre-fix this would have
         // woken reviewers via ReviewerApprovalsMissing.
-        let status = state.derive_status(&MockDirty::new(), &plan_policy());
+        let status = state.derive_status(&MockDirty::new(), &plan_policy(), None);
         let codex_work = status.work_for(&label("codex"), Role::Reviewer);
         let ruthless_work = status.work_for(&label("ruthless"), Role::Reviewer);
         assert!(

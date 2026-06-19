@@ -70,4 +70,12 @@ pub enum WaitingOn {
     /// variants regardless of review state on the latest
     /// reviewable commit.
     Blocked { block: PlanBlock },
+    /// HEAD's `[..]` tag doesn't match the plan files HEAD's diff
+    /// touched (`commit-tag-fixup-is-first-class-state`). Master must
+    /// amend the commit message before any review motion continues.
+    /// Dominates review-driven variants but yields to `Blocked` (a
+    /// human-blocking issue still wins). Reviewers are NOT woken
+    /// while a plan row carries this. Set on every active plan
+    /// implicated by the violation (those HEAD touched or named).
+    MasterToFixCommitTag,
 }

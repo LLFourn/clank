@@ -695,7 +695,10 @@ async fn fold_summary(
     };
     let reviews =
         crate::fs_plan_state_lookup::FsPlanStateLookup::new(repo_root, state.head.as_ref());
-    let work_status = state.fold.derive_status(&reviews, &work_policy);
+    let head = crate::git_io::head_commit(repo_root, &state);
+    let work_status = state
+        .fold
+        .derive_status(&reviews, &work_policy, head.as_ref());
     let active_plans = work_status.plans.len();
     let waiting_on = if work_status.plans.len() == 1 {
         Some(format_waiting_on(&work_status.plans[0].waiting_on))
@@ -717,6 +720,7 @@ fn format_waiting_on(w: &clank_core::plan_view::WaitingOn) -> String {
         MasterToContinue => "master to continue".to_string(),
         MasterToFinalize => "master to finalize".to_string(),
         MasterToCommit => "master to commit".to_string(),
+        MasterToFixCommitTag => "master to fix commit tag".to_string(),
     }
 }
 

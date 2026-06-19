@@ -499,6 +499,23 @@ impl RepoState {
             }
         }
 
+        // Attribution sources: `touches` (the diff edited
+        // `.clank/plans/<x>.md` — objective) and `plan_attribution`
+        // (the `[..]` tag — author claim). These are ORTHOGONAL facts,
+        // not a contradictory dual source: `touched_plan` records the
+        // file edit, `touched_code` records tag-attributed code. The
+        // HEAD commit-tag invariant
+        // (`commit-tag-fixup-is-first-class-state`) now forces the two
+        // to AGREE at HEAD — a tag that names a different plan than the
+        // diff touched is a dominating `MasterToFixCommitTag`
+        // correction in `derive_status`, caught before reviewability
+        // matters. The fold itself is over ALL history, which is
+        // deliberately NOT policed (HEAD-only semantics), so a
+        // historical `[b]`-tagged commit that touched `a.md` must still
+        // land on BOTH timelines as it did before — collapsing the
+        // union here would silently rewrite tolerated history. The
+        // collapse is therefore enforced at the HEAD gate, not in the
+        // fold (see the plan's "leave a clear note" escape hatch).
         let mut affected: BTreeSet<PlanKey> = BTreeSet::new();
         affected.extend(touches.keys().cloned());
         affected.extend(classified.plan_attribution.iter().cloned());

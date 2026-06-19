@@ -454,18 +454,23 @@ pub(crate) fn bar_emoji(snap: &StatusSnapshot) -> String {
 /// for a zellij tab indicator (spike-zellij-tab-attention):
 /// - `Blocked`: a human must act (an unanswered block, or a plan
 ///   parked on one).
+/// - `NeedsCorrection`: HEAD's commit tag doesn't match the plan
+///   files it touched (commit-tag-fixup-is-first-class-state) — a
+///   self-correctable warning that dominates ordinary work but yields
+///   to a human block.
 /// - `Idle`: nothing in flight (no active plans, PR reviews, or
 ///   queued work) — the "asleep" state.
 /// - `Active`: anything else (work progressing).
 ///
-/// `state_color` derives its red (blocked) and dim (idle) hues from
-/// this, so the bar lamp and any tab indicator can never disagree on
-/// what "blocked" or "idle" means.
+/// `state_color` derives ALL its hues from this, so the bar lamp and
+/// any tab indicator can never disagree on what "blocked" /
+/// "needs-correction" / "idle" means.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AttentionState {
     Active,
     Idle,
     Blocked,
+    NeedsCorrection,
 }
 
 pub(crate) fn attention_state(snap: &StatusSnapshot) -> AttentionState {
@@ -476,6 +481,15 @@ pub(crate) fn attention_state(snap: &StatusSnapshot) -> AttentionState {
         || snap.blocks.iter().any(|b| b.answer.is_none());
     if blocked {
         return AttentionState::Blocked;
+    }
+    // Below Blocked, above Active: a broken HEAD tag is a warning the
+    // master must self-correct before work resumes.
+    let needs_correction = snap
+        .plans
+        .iter()
+        .any(|v| matches!(v.waiting_on, WaitingOn::MasterToFixCommitTag));
+    if needs_correction {
+        return AttentionState::NeedsCorrection;
     }
     let nothing_in_flight =
         snap.plans.is_empty() && snap.pr_reviews.is_empty() && snap.queue.is_empty();
@@ -493,8 +507,12 @@ pub(crate) fn attention_state(snap: &StatusSnapshot) -> AttentionState {
 /// queue-ready / clean-PR state must NOT count as master-active while
 /// a plan still awaits reviewers.
 pub(crate) fn master_is_active(snap: &StatusSnapshot) -> bool {
-    if attention_state(snap) != AttentionState::Active {
-        return false; // blocked or idle
+    match attention_state(snap) {
+        // A broken HEAD tag is master's to fix — master is the active
+        // agent (the per-pane 🔨), even though the bar paints orange.
+        AttentionState::NeedsCorrection => return true,
+        AttentionState::Blocked | AttentionState::Idle => return false,
+        AttentionState::Active => {}
     }
     match snap.plans.as_slice() {
         // No plans: PR reviews take precedence over the queue.
@@ -516,17 +534,22 @@ pub(crate) fn master_is_active(snap: &StatusSnapshot) -> bool {
                     | WaitingOn::MasterToContinue
                     | WaitingOn::MasterToCommit
                     | WaitingOn::MasterToFinalize
+                    | WaitingOn::MasterToFixCommitTag
             )
         }),
     }
 }
 
-/// The frame's one hue: red = a human must act (blocked), yellow
-/// = reviewers, green = master working, cyan = promote, dim idle.
+/// The frame's one hue: red = a human must act (blocked), orange =
+/// HEAD tag needs correction, yellow = reviewers, green = master
+/// working, cyan = promote, dim idle. The orange is a 256-color SGR
+/// (`38;5;208`) — true orange has no 16-color code, and only this
+/// branch needs one.
 fn state_color(snap: &StatusSnapshot) -> &'static str {
     match attention_state(snap) {
-        AttentionState::Blocked => "31", // red
-        AttentionState::Idle => "2",     // dim
+        AttentionState::Blocked => "31",               // red
+        AttentionState::NeedsCorrection => "38;5;208", // orange (256-color)
+        AttentionState::Idle => "2",                   // dim
         AttentionState::Active => {
             if master_is_active(snap) {
                 // cyan for the queue-promote branch (no plans, no
@@ -605,6 +628,7 @@ fn emoji_of(w: &WaitingOn) -> &'static str {
         | WaitingOn::MasterToContinue
         | WaitingOn::MasterToCommit => "🔨",
         WaitingOn::MasterToFinalize => "🏁",
+        WaitingOn::MasterToFixCommitTag => "⚠️",
         WaitingOn::Blocked { .. } => "🙋",
     }
 }
@@ -617,6 +641,7 @@ fn verb_of(w: &WaitingOn) -> &'static str {
         WaitingOn::MasterToContinue => "continuing",
         WaitingOn::MasterToCommit => "committing",
         WaitingOn::MasterToFinalize => "finalizing",
+        WaitingOn::MasterToFixCommitTag => "fixing tag",
         WaitingOn::Blocked { .. } => "blocked",
     }
 }
@@ -1635,6 +1660,38 @@ terminal_3  terminal  ruthless (reviewer)
             attention_state(&s),
             AttentionState::Blocked,
             "an unanswered block outranks active work"
+        );
+    }
+
+    #[test]
+    fn needs_correction_is_orange_above_active_below_blocked() {
+        // commit-tag-fixup-is-first-class-state: a MasterToFixCommitTag
+        // plan row → NeedsCorrection (orange), above ordinary Active.
+        let s = snap(
+            vec![plan_state("foo", WaitingOn::MasterToFixCommitTag)],
+            vec![],
+        );
+        assert_eq!(attention_state(&s), AttentionState::NeedsCorrection);
+        assert_eq!(state_color(&s), "38;5;208", "orange 256-color SGR");
+        // Master is the actor (per-pane 🔨), and the bar emoji is ⚠️ —
+        // bar lamp + tab indicator both derived from attention_state,
+        // so they can't disagree.
+        assert!(master_is_active(&s));
+        assert_eq!(emoji_of(&WaitingOn::MasterToFixCommitTag), "⚠️");
+
+        // ...but a human block still outranks the correction.
+        let mut blocked = s;
+        blocked.blocks = vec![crate::cli::block::BlockEntry {
+            agent: "claude".into(),
+            name: "q".into(),
+            plan: None,
+            question: "halt?".into(),
+            answer: None,
+        }];
+        assert_eq!(
+            attention_state(&blocked),
+            AttentionState::Blocked,
+            "a human block outranks the tag correction"
         );
     }
 
