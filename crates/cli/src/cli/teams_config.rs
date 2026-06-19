@@ -141,9 +141,10 @@ pub struct RepoConfigFile {
     pub hooks: Option<crate::cli::config::HooksSection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diff: Option<crate::cli::config::DiffConfig>,
-    /// Forward-compat catchall. A leftover legacy repo-scope
-    /// `agents` array (from a pre-hard-cut config) lands here and
-    /// is ignored — there is no migration that reads it.
+    /// Forward-compat catchall for unknown OBJECT fields. Old-shape
+    /// markers do NOT reach here: the loader's legacy-shape check
+    /// fail-closes a `promoted` key or an array-typed `team`/`agents`
+    /// before the typed parse is accepted (codex c1e6749).
     #[serde(flatten)]
     pub extra: BTreeMap<String, serde_json::Value>,
 }

@@ -221,20 +221,30 @@ fn load_repo_config(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.into()),
     };
-    match serde_json::from_str::<RepoConfigFile>(&body) {
-        Ok(cfg) => Ok(Some(cfg)),
-        Err(_) if is_legacy_repo_shape(&body) => Err(legacy_repo_schema_error(repo_cfg_path)),
-        Err(e) => Err(anyhow::anyhow!(
-            "parsing {} as new-schema RepoConfigFile: {e}",
-            repo_cfg_path.display()
-        )),
+    // Fail-closed BEFORE accepting the parse: a config can parse yet
+    // still carry a legacy marker the typed struct silently swallows —
+    // a stray `promoted` lands in the `extra` flatten map and would be
+    // ignored (codex c1e6749). Checking the raw shape first means any
+    // legacy marker yields the re-init hint, parse-success or not.
+    if is_legacy_repo_shape(&body) {
+        return Err(legacy_repo_schema_error(repo_cfg_path));
     }
+    serde_json::from_str::<RepoConfigFile>(&body)
+        .map(Some)
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "parsing {} as new-schema RepoConfigFile: {e}",
+                repo_cfg_path.display()
+            )
+        })
 }
 
-/// Detect the old repo team schema: `team` as a string/array, or
-/// a top-level `promoted` field. The new schema stores `team` as
-/// an object ([`TeamComposition`]) and has no `promoted`, so
-/// either shape is unambiguously legacy.
+/// Detect the old repo schema by raw shape. The new schema has no
+/// `promoted`, stores `team` as an object ([`TeamComposition`]), and
+/// `agents` as a map — so a `promoted` key, a string/array `team`, or
+/// an array `agents` is unambiguously legacy. Checked on the raw JSON
+/// (not the typed struct) so a marker the typed parse would swallow
+/// into `extra` (e.g. `promoted`) still fail-closes.
 fn is_legacy_repo_shape(body: &str) -> bool {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
         return false;
@@ -242,10 +252,9 @@ fn is_legacy_repo_shape(body: &str) -> bool {
     let Some(obj) = value.as_object() else {
         return false;
     };
-    if obj.contains_key("promoted") {
-        return true;
-    }
-    matches!(obj.get("team"), Some(t) if t.is_string() || t.is_array())
+    obj.contains_key("promoted")
+        || matches!(obj.get("team"), Some(t) if t.is_string() || t.is_array())
+        || matches!(obj.get("agents"), Some(a) if a.is_array())
 }
 
 fn legacy_repo_schema_error(repo_cfg_path: &Path) -> anyhow::Error {
@@ -593,6 +602,41 @@ mod tests {
             repo.path(),
             r#"{"team": [{"include": "dev"}], "promoted": "codex"}"#,
         );
+        let err = try_resolve_via_team_with(repo.path(), Some(home.path())).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("old team schema") && msg.contains("clank init"),
+            "expected re-init hint; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn try_resolve_via_team_with_fails_closed_on_parseable_promoted() {
+        // codex c1e6749: a config with a VALID new-shape `team` object
+        // PLUS a stray `promoted` parses fine (promoted → `extra`), so
+        // checking legacy shape only on parse-failure silently swallowed
+        // it. It must fail closed with the re-init hint.
+        let repo = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        write_repo_config(
+            repo.path(),
+            r#"{"agents": {"claude": {"tool": "claude"}}, "team": {"master": "claude"}, "promoted": "codex"}"#,
+        );
+        let err = try_resolve_via_team_with(repo.path(), Some(home.path())).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("old team schema") && msg.contains("clank init"),
+            "expected re-init hint; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn try_resolve_via_team_with_fails_closed_on_legacy_agents_array() {
+        // A pre-team `agents` array (old shape) → re-init hint, not a
+        // cryptic serde error.
+        let repo = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        write_repo_config(repo.path(), r#"{"agents": ["claude", "codex"]}"#);
         let err = try_resolve_via_team_with(repo.path(), Some(home.path())).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
