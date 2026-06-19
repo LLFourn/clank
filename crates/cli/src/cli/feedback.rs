@@ -158,18 +158,7 @@ async fn run_read(args: FeedbackReadArgs) -> anyhow::Result<()> {
     }
 
     if args.json {
-        let json: Vec<serde_json::Value> = entries
-            .iter()
-            .map(|e| {
-                serde_json::json!({
-                    "author": e.author,
-                    "verdict": e.verdict.as_str(),
-                    "summary": e.summary,
-                    "details": e.details,
-                    "source_path": e.source_path,
-                })
-            })
-            .collect();
+        let json: Vec<FeedbackEntryJson> = entries.iter().map(FeedbackEntryJson::from).collect();
         println!("{}", serde_json::to_string_pretty(&json)?);
     } else {
         let short = &full_sha[..full_sha.len().min(7)];
@@ -205,4 +194,58 @@ struct FeedbackEntry {
     summary: String,
     details: String,
     source_path: String,
+}
+
+/// `clank feedback read --json` row. Borrows from a
+/// [`FeedbackEntry`]; `verdict` is the lowercase wire string (not
+/// the typed enum's Serialize) to match the prior `json!` shape
+/// (typed-json-not-json-macro).
+#[derive(serde::Serialize)]
+struct FeedbackEntryJson<'a> {
+    author: &'a str,
+    verdict: &'a str,
+    summary: &'a str,
+    details: &'a str,
+    source_path: &'a str,
+}
+
+impl<'a> From<&'a FeedbackEntry> for FeedbackEntryJson<'a> {
+    fn from(e: &'a FeedbackEntry) -> Self {
+        Self {
+            author: &e.author,
+            verdict: e.verdict.as_str(),
+            summary: &e.summary,
+            details: &e.details,
+            source_path: &e.source_path,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn feedback_entry_json_matches_prior_shape() {
+        // typed-json-not-json-macro: FeedbackEntryJson serializes to
+        // the same keys+values the old `json!` produced. `verdict` is
+        // the lowercase wire string, not the typed enum.
+        let entry = FeedbackEntry {
+            author: "codex".to_string(),
+            verdict: clank_core::Verdict::RequestChanges,
+            summary: "needs work".to_string(),
+            details: "line one\nline two".to_string(),
+            source_path: ".clank/agents/codex/feedback/abc.md".to_string(),
+        };
+        assert_eq!(
+            serde_json::to_value(FeedbackEntryJson::from(&entry)).unwrap(),
+            serde_json::json!({
+                "author": "codex",
+                "verdict": clank_core::Verdict::RequestChanges.as_str(),
+                "summary": "needs work",
+                "details": "line one\nline two",
+                "source_path": ".clank/agents/codex/feedback/abc.md",
+            })
+        );
+    }
 }

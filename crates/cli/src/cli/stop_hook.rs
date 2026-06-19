@@ -191,16 +191,44 @@ fn resolve_hook_repo(repo_override: Option<&Path>, input: &HookInput) -> Result<
     })
 }
 
-fn parse_wfw_json(raw: &[u8]) -> Result<Vec<serde_json::Value>, String> {
-    let envelope: serde_json::Value =
+/// Owned, presence-tolerant mirror of `wfw`'s `--json` envelope.
+/// The stop hook consumes its OWN subprocess output across a
+/// process boundary, so it deserializes into typed rows rather than
+/// walking a `serde_json::Value` (typed-json-not-json-macro). Every
+/// field is optional and unknown `kind`s fall through to the loose
+/// renderer arm: the boundary stays fail-soft — a future `wfw` kind
+/// or field never breaks parsing.
+#[derive(serde::Deserialize)]
+struct WfwEnvelope {
+    items: Vec<WfwItem>,
+}
+
+/// One `wfw --json` item as the stop hook reads it. `kind` is the
+/// `#[serde(tag = "kind")]` discriminant `wfw` emits; the remaining
+/// fields are the ones [`render_wfw_items`] projects into the
+/// minimal wake hint (`wfw-output-is-a-minimal-hint`). Anything
+/// `wfw` adds is ignored; anything absent stays `None`.
+#[derive(serde::Deserialize)]
+struct WfwItem {
+    kind: Option<String>,
+    plan: Option<String>,
+    sha: Option<String>,
+    finalized_at: Option<String>,
+    next: Option<String>,
+    reason: Option<String>,
+    prompt: Option<String>,
+    name: Option<String>,
+    priority: Option<u64>,
+    agent: Option<String>,
+    answer: Option<String>,
+    pr: Option<u64>,
+    round: Option<u64>,
+}
+
+fn parse_wfw_json(raw: &[u8]) -> Result<Vec<WfwItem>, String> {
+    let envelope: WfwEnvelope =
         serde_json::from_slice(raw).map_err(|e| format!("not valid JSON: {e}"))?;
-    let items = envelope
-        .get("items")
-        .ok_or_else(|| "missing `items` field".to_string())?;
-    items
-        .as_array()
-        .cloned()
-        .ok_or_else(|| "`items` is not an array".to_string())
+    Ok(envelope.items)
 }
 
 /// Render wfw's JSON `items` array into the continuation prompt
@@ -210,7 +238,7 @@ fn parse_wfw_json(raw: &[u8]) -> Result<Vec<serde_json::Value>, String> {
 /// the HOW (feedback-write form, verdicts, promote evaluation,
 /// unblock) lives in the agent's skill doc, not re-taught per
 /// wake.
-fn render_wfw_items(items: &[serde_json::Value], label: &AgentLabel, role: Role) -> String {
+fn render_wfw_items(items: &[WfwItem], label: &AgentLabel, role: Role) -> String {
     let mut out = String::new();
     out.push_str(&format!(
         "Clank wfw returned work for `{label}` ({role}). Items:\n",
@@ -218,12 +246,12 @@ fn render_wfw_items(items: &[serde_json::Value], label: &AgentLabel, role: Role)
         role = role.as_str(),
     ));
     for item in items {
-        let kind = item.get("kind").and_then(|v| v.as_str()).unwrap_or("?");
-        let plan = item.get("plan").and_then(|v| v.as_str()).unwrap_or("?");
+        let kind = item.kind.as_deref().unwrap_or("?");
+        let plan = item.plan.as_deref().unwrap_or("?");
         let full = item
-            .get("sha")
-            .or_else(|| item.get("finalized_at"))
-            .and_then(|v| v.as_str())
+            .sha
+            .as_deref()
+            .or(item.finalized_at.as_deref())
             .unwrap_or("");
         let short = short_sha(full);
         // Minimal hints (`wfw-output-is-a-minimal-hint`): one line
@@ -236,46 +264,46 @@ fn render_wfw_items(items: &[serde_json::Value], label: &AgentLabel, role: Role)
         match kind {
             "reviewer" => out.push_str(&format!("  - reviewer: review {plan} @ {short}\n")),
             "master" => {
-                let next = item.get("next").and_then(|v| v.as_str()).unwrap_or("?");
-                let reason = item.get("reason").and_then(|v| v.as_str()).unwrap_or("?");
+                let next = item.next.as_deref().unwrap_or("?");
+                let reason = item.reason.as_deref().unwrap_or("?");
                 out.push_str(&format!("  - master: {next} {plan} @ {short} ({reason})\n"));
             }
             "finished" => out.push_str(&format!("  - finished: {plan} @ {short}\n")),
             "idle" => {
-                let prompt = item.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
+                let prompt = item.prompt.as_deref().unwrap_or("");
                 out.push_str(&format!("  - idle: {prompt}\n"));
             }
             "adhoc_review" => out.push_str(&format!("  - adhoc-review: {short}\n")),
             "adhoc_revise" => out.push_str(&format!("  - adhoc-revise: {short}\n")),
             "promote_from_queue" => {
-                let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("?");
-                let priority = item.get("priority").and_then(|v| v.as_u64()).unwrap_or(0);
+                let name = item.name.as_deref().unwrap_or("?");
+                let priority = item.priority.unwrap_or(0);
                 out.push_str(&format!("  - promote: {name} (priority {priority:03})\n"));
             }
             "blocked" => {
-                let agent = item.get("agent").and_then(|v| v.as_str()).unwrap_or("?");
-                let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("?");
-                let scope = item.get("plan").and_then(|v| v.as_str()).unwrap_or("repo");
+                let agent = item.agent.as_deref().unwrap_or("?");
+                let name = item.name.as_deref().unwrap_or("?");
+                let scope = item.plan.as_deref().unwrap_or("repo");
                 out.push_str(&format!(
                     "  - blocked: {agent}/{name} on {scope} (awaiting human)\n"
                 ));
             }
             "unblocked" => {
-                let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                let name = item.name.as_deref().unwrap_or("?");
                 // The answer is the action payload (the human's
                 // instruction) — signal, not tutorial.
-                let answer = item.get("answer").and_then(|v| v.as_str()).unwrap_or("");
+                let answer = item.answer.as_deref().unwrap_or("");
                 out.push_str(&format!("  - unblocked: {name}: {answer}\n"));
             }
             "pr_reviewer" => {
-                let pr = item.get("pr").and_then(|v| v.as_u64()).unwrap_or(0);
-                let round = item.get("round").and_then(|v| v.as_u64()).unwrap_or(0);
+                let pr = item.pr.unwrap_or(0);
+                let round = item.round.unwrap_or(0);
                 out.push_str(&format!("  - pr-review: review #{pr} round {round}\n"));
             }
             "pr_master" => {
-                let pr = item.get("pr").and_then(|v| v.as_u64()).unwrap_or(0);
-                let round = item.get("round").and_then(|v| v.as_u64()).unwrap_or(0);
-                let next = item.get("next").and_then(|v| v.as_str()).unwrap_or("?");
+                let pr = item.pr.unwrap_or(0);
+                let round = item.round.unwrap_or(0);
+                let next = item.next.as_deref().unwrap_or("?");
                 out.push_str(&format!(
                     "  - pr-review: master {next} #{pr} round {round}\n"
                 ));
@@ -329,8 +357,19 @@ fn emit_and_exit(outcome: HookOutcome, tool: Tool) -> ! {
 mod tests {
     use super::*;
 
+    /// Deserialize `json!` values through the real `WfwItem` path —
+    /// the same typed parse the production stop hook uses — then
+    /// render. Exercises both the deserialize and the projection.
     fn items_text(items: &[serde_json::Value]) -> String {
-        render_wfw_items(items, &AgentLabel::parse("codex").unwrap(), Role::Reviewer)
+        let parsed: Vec<WfwItem> = items
+            .iter()
+            .map(|v| serde_json::from_value(v.clone()).unwrap())
+            .collect();
+        render_wfw_items(
+            &parsed,
+            &AgentLabel::parse("codex").unwrap(),
+            Role::Reviewer,
+        )
     }
 
     const FULL_SHA: &str = "f6feba231685eb198eb412e5d014de836c4ddf81";
@@ -396,6 +435,47 @@ mod tests {
         assert!(
             out.contains("  - unblocked: q: yes, proceed with B\n"),
             "the human's answer is the action payload; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn parse_wfw_json_reads_typed_envelope() {
+        // typed-json-not-json-macro: the stop hook deserializes wfw's
+        // `--json` envelope into typed `WfwItem`s rather than walking
+        // a `serde_json::Value`. `json!` here expresses the wfw output
+        // the hook consumes across the subprocess boundary.
+        let raw = serde_json::json!({
+            "items": [
+                {"kind": "reviewer", "plan": "p", "sha": FULL_SHA},
+                {"kind": "master", "plan": "p", "sha": FULL_SHA,
+                 "next": "revise", "reason": "address_commit_changes"},
+            ]
+        })
+        .to_string();
+        let items = parse_wfw_json(raw.as_bytes()).unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].kind.as_deref(), Some("reviewer"));
+        assert_eq!(items[1].next.as_deref(), Some("revise"));
+    }
+
+    #[test]
+    fn parse_wfw_json_is_fail_soft_on_unknown_kind_and_extra_fields() {
+        // The subprocess boundary must stay loose: a future wfw kind
+        // or extra field can NEVER break parsing (the hook never fails
+        // the agent). Unknown `kind` renders via the catchall arm;
+        // unknown fields are ignored.
+        let raw = serde_json::json!({
+            "items": [
+                {"kind": "future_kind", "plan": "p", "sha": FULL_SHA,
+                 "some_new_field": {"nested": 1}},
+            ]
+        })
+        .to_string();
+        let items = parse_wfw_json(raw.as_bytes()).unwrap();
+        let out = render_wfw_items(&items, &AgentLabel::parse("codex").unwrap(), Role::Reviewer);
+        assert!(
+            out.contains("  - future_kind: p @ f6feba231685\n"),
+            "unknown kind must render via the catchall arm; got:\n{out}"
         );
     }
 }

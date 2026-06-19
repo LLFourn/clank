@@ -102,6 +102,36 @@ fn write_typed_config<T: serde::Serialize>(path: &Path, value: &T) -> anyhow::Re
     Ok(())
 }
 
+/// `master` + both reviewer tiers as wire strings. The shared
+/// `--json` shape for `clank team show` and (flattened under each
+/// entry's `name`) `clank team list` (typed-json-not-json-macro).
+#[derive(serde::Serialize)]
+struct TeamCompJson<'a> {
+    master: Option<&'a str>,
+    commit_reviewers: Vec<&'a str>,
+    gate_reviewers: Vec<&'a str>,
+}
+
+impl<'a> TeamCompJson<'a> {
+    fn from_comp(comp: &'a TeamComposition) -> Self {
+        Self {
+            master: comp.master.as_ref().map(|l| l.as_str()),
+            commit_reviewers: comp.commit_reviewers.iter().map(|l| l.as_str()).collect(),
+            gate_reviewers: comp.gate_reviewers.iter().map(|l| l.as_str()).collect(),
+        }
+    }
+}
+
+/// `clank team list --json` row: the team `name` plus its
+/// composition flattened to the top level (matching the prior
+/// `json!` which put `name` alongside the three comp keys).
+#[derive(serde::Serialize)]
+struct TeamListJson<'a> {
+    name: &'a str,
+    #[serde(flatten)]
+    team: TeamCompJson<'a>,
+}
+
 fn parse_label(s: &str) -> anyhow::Result<AgentLabel> {
     AgentLabel::parse(s).map_err(|e| anyhow::anyhow!("invalid label `{s}`: {e}"))
 }
@@ -118,15 +148,14 @@ fn fmt_agent_with_tool(label: &AgentLabel, desc: Option<&AgentDescription>) -> S
 fn list(home: &Path, args: TeamListArgs) -> anyhow::Result<()> {
     let cfg = read_user_config(home)?;
     if args.json {
-        let mut rows: Vec<serde_json::Value> = Vec::new();
-        for (name, comp) in &cfg.teams {
-            rows.push(serde_json::json!({
-                "name": name,
-                "master": comp.master.as_ref().map(|l| l.as_str()),
-                "commit_reviewers": comp.commit_reviewers.iter().map(|l| l.as_str()).collect::<Vec<_>>(),
-                "gate_reviewers": comp.gate_reviewers.iter().map(|l| l.as_str()).collect::<Vec<_>>(),
-            }));
-        }
+        let rows: Vec<TeamListJson> = cfg
+            .teams
+            .iter()
+            .map(|(name, comp)| TeamListJson {
+                name,
+                team: TeamCompJson::from_comp(comp),
+            })
+            .collect();
         println!("{}", serde_json::to_string_pretty(&rows)?);
         return Ok(());
     }
@@ -169,11 +198,7 @@ fn show_repo_team(args: TeamShowArgs) -> anyhow::Result<()> {
     if args.json {
         println!(
             "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "master": comp.master.as_ref().map(|l| l.as_str()),
-                "commit_reviewers": comp.commit_reviewers.iter().map(|l| l.as_str()).collect::<Vec<_>>(),
-                "gate_reviewers": comp.gate_reviewers.iter().map(|l| l.as_str()).collect::<Vec<_>>(),
-            }))?
+            serde_json::to_string_pretty(&TeamCompJson::from_comp(comp))?
         );
         return Ok(());
     }
@@ -695,6 +720,57 @@ mod tests {
     fn read_repo(repo: &Path) -> crate::cli::teams_config::RepoConfigFile {
         let body = std::fs::read_to_string(repo.join(".clank/config.json")).unwrap();
         serde_json::from_str(&body).unwrap()
+    }
+
+    // ── typed-json-not-json-macro: team --json wire shapes ──────
+
+    #[test]
+    fn team_json_shapes_match_prior() {
+        // TeamCompJson (clank team show --json) and TeamListJson
+        // (clank team list --json, name flattened with the comp) must
+        // serialize to the same keys+values the old `json!` produced.
+        // `json!` expresses the expected value; key order is
+        // irrelevant (`to_value` equality is order-independent).
+        let mut comp = TeamComposition::default();
+        comp.master = Some(AgentLabel::parse("claude").unwrap());
+        comp.commit_reviewers
+            .push(AgentLabel::parse("codex").unwrap());
+        comp.gate_reviewers
+            .push(AgentLabel::parse("ruthless").unwrap());
+
+        assert_eq!(
+            serde_json::to_value(TeamCompJson::from_comp(&comp)).unwrap(),
+            serde_json::json!({
+                "master": "claude",
+                "commit_reviewers": ["codex"],
+                "gate_reviewers": ["ruthless"],
+            })
+        );
+
+        let row = TeamListJson {
+            name: "dev",
+            team: TeamCompJson::from_comp(&comp),
+        };
+        assert_eq!(
+            serde_json::to_value(row).unwrap(),
+            serde_json::json!({
+                "name": "dev",
+                "master": "claude",
+                "commit_reviewers": ["codex"],
+                "gate_reviewers": ["ruthless"],
+            })
+        );
+
+        // master unset → null (matches the prior Option mapping).
+        let empty = TeamComposition::default();
+        assert_eq!(
+            serde_json::to_value(TeamCompJson::from_comp(&empty)).unwrap(),
+            serde_json::json!({
+                "master": null,
+                "commit_reviewers": [],
+                "gate_reviewers": [],
+            })
+        );
     }
 
     // ── repo-team cores (clank team add / remove / set-master) ──

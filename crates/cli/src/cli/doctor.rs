@@ -34,7 +34,8 @@ impl std::fmt::Display for DoctorFailed {
 
 impl std::error::Error for DoctorFailed {}
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum CheckStatus {
     Ok,
     Warn,
@@ -742,27 +743,32 @@ fn describe_identity_source(
     format!("resolved to `{}` (source unknown)", resolved.as_str())
 }
 
+/// `clank doctor --json` row (one per check). Borrows from a
+/// [`CheckResult`]; `status` is the lowercase wire string via
+/// `CheckStatus`'s rename_all (typed-json-not-json-macro).
+#[derive(serde::Serialize)]
+struct CheckJson<'a> {
+    section: &'a str,
+    name: &'a str,
+    status: CheckStatus,
+    message: &'a str,
+}
+
 /// Serialize checks to the `--json` wire array (one object per
 /// check). `pub` so in-process callers (tests) assert on the
 /// exact shape `clank doctor --json` emits without a spawn.
 /// Plan: dogfood-init-setup-in-tests (Phase B).
 pub fn checks_to_json(results: &[CheckResult]) -> serde_json::Value {
-    let payload: Vec<_> = results
+    let payload: Vec<CheckJson> = results
         .iter()
-        .map(|r| {
-            serde_json::json!({
-                "section": r.section,
-                "name": r.name,
-                "status": match r.status {
-                    CheckStatus::Ok => "ok",
-                    CheckStatus::Warn => "warn",
-                    CheckStatus::Fail => "fail",
-                },
-                "message": r.message,
-            })
+        .map(|r| CheckJson {
+            section: r.section,
+            name: &r.name,
+            status: r.status,
+            message: &r.message,
         })
         .collect();
-    serde_json::Value::Array(payload)
+    serde_json::to_value(payload).expect("serialize doctor checks")
 }
 
 fn render(results: &[CheckResult], json: bool) -> anyhow::Result<()> {
@@ -801,6 +807,28 @@ mod tests {
             .unwrap();
         assert!(s.success());
         dir
+    }
+
+    #[test]
+    fn checks_to_json_matches_prior_shape() {
+        // typed-json-not-json-macro: checks_to_json must serialize to
+        // the same keys+values the old `json!` produced — the
+        // `clank doctor --json` array the integration test parses.
+        // `json!` here expresses the expected value; key order is
+        // irrelevant (`to_value` equality is order-independent).
+        let results = vec![
+            CheckResult::ok("repo", "a".to_string(), "all good".to_string()),
+            CheckResult::warn("user", "b".to_string(), "heads up".to_string()),
+            CheckResult::fail("session", "c".to_string(), "broken".to_string()),
+        ];
+        assert_eq!(
+            checks_to_json(&results),
+            serde_json::json!([
+                {"section": "repo", "name": "a", "status": "ok", "message": "all good"},
+                {"section": "user", "name": "b", "status": "warn", "message": "heads up"},
+                {"section": "session", "name": "c", "status": "fail", "message": "broken"},
+            ])
+        );
     }
 
     #[test]

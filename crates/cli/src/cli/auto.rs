@@ -18,6 +18,19 @@ use crate::agent_env::resolve_identity_from_env;
 use crate::agent_store::{load_agent_config, save_agent_config};
 use clank_core::vocab::AutoMode;
 
+/// `clank auto status --json` wire shape. `auto_mode` is the
+/// EFFECTIVE mode; `auto_mode_explicit` is `null` when no per-agent
+/// override is set. Borrowed fields; consumers parse JSON so key
+/// order is free (typed-json-not-json-macro).
+#[derive(serde::Serialize)]
+struct AutoStatusJson<'a> {
+    label: &'a str,
+    auto_mode: &'a str,
+    auto_mode_explicit: Option<&'a str>,
+    wfw_timeout: Option<&'a str>,
+    role: &'a str,
+}
+
 pub async fn run(args: AutoArgs) -> anyhow::Result<()> {
     match args.command {
         AutoCmd::On(a) => run_on(a).await,
@@ -85,13 +98,13 @@ async fn run_status(args: AutoStatusArgs) -> anyhow::Result<()> {
         .unwrap_or_else(|_| "unknown (no team configured)".to_string());
 
     if args.json {
-        let payload = serde_json::json!({
-            "label": label.as_str(),
-            "auto_mode": effective.as_str(),
-            "auto_mode_explicit": cfg.auto_mode.map(|m| m.as_str()),
-            "wfw_timeout": cfg.wfw_timeout,
-            "role": role,
-        });
+        let payload = AutoStatusJson {
+            label: label.as_str(),
+            auto_mode: effective.as_str(),
+            auto_mode_explicit: cfg.auto_mode.map(|m| m.as_str()),
+            wfw_timeout: cfg.wfw_timeout.as_deref(),
+            role: &role,
+        };
         println!("{}", serde_json::to_string(&payload)?);
     } else {
         println!("agent: {}", label.as_str());
@@ -103,4 +116,54 @@ async fn run_status(args: AutoStatusArgs) -> anyhow::Result<()> {
         println!("  role:        {role}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auto_status_json_matches_prior_shape() {
+        // typed-json-not-json-macro: AutoStatusJson must serialize to
+        // the same keys+values the old `json!` produced. `json!` here
+        // expresses the expected value; key order is irrelevant
+        // (`to_value` equality is order-independent).
+        let with_explicit = AutoStatusJson {
+            label: "codex",
+            auto_mode: "on",
+            auto_mode_explicit: Some("on"),
+            wfw_timeout: Some("30s"),
+            role: "reviewer",
+        };
+        assert_eq!(
+            serde_json::to_value(&with_explicit).unwrap(),
+            serde_json::json!({
+                "label": "codex",
+                "auto_mode": "on",
+                "auto_mode_explicit": "on",
+                "wfw_timeout": "30s",
+                "role": "reviewer",
+            })
+        );
+
+        // Unset explicit + timeout serialize to `null`, matching the
+        // old `Option` values.
+        let unset = AutoStatusJson {
+            label: "claude",
+            auto_mode: "off",
+            auto_mode_explicit: None,
+            wfw_timeout: None,
+            role: "master",
+        };
+        assert_eq!(
+            serde_json::to_value(&unset).unwrap(),
+            serde_json::json!({
+                "label": "claude",
+                "auto_mode": "off",
+                "auto_mode_explicit": null,
+                "wfw_timeout": null,
+                "role": "master",
+            })
+        );
+    }
 }

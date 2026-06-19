@@ -575,6 +575,68 @@ fn key_to_json_path(key: &str) -> Option<&'static [&'static str]> {
 
 use super::{ConfigArgs, ConfigKey, ConfigKeyArgs};
 
+/// `clank config --json` (no subcommand) wire shape — the effective
+/// merged config. Borrows from a [`Config`]; each hook is the
+/// effective command or `null` (both "absent" and "explicitly
+/// disabled" render `null`, matching the prior `Option<&Option<_>>`
+/// serialization). typed-json-not-json-macro.
+#[derive(serde::Serialize)]
+struct ConfigJson<'a> {
+    review: ReviewJson,
+    hooks: HooksJson<'a>,
+    diff: DiffJson<'a>,
+}
+
+#[derive(serde::Serialize)]
+struct ReviewJson {
+    adhoc_feedback: bool,
+    plan_feedback: bool,
+    require_commit_prefix: bool,
+}
+
+#[derive(serde::Serialize)]
+struct HooksJson<'a> {
+    master_work: Option<&'a str>,
+    reviewer_work: Option<&'a str>,
+    plan_finalized: Option<&'a str>,
+    idle: Option<&'a str>,
+    blocked: Option<&'a str>,
+}
+
+#[derive(serde::Serialize)]
+struct DiffJson<'a> {
+    editor: Option<&'a LaunchConfig>,
+    wait: Option<bool>,
+}
+
+impl<'a> From<&'a Config> for ConfigJson<'a> {
+    fn from(cfg: &'a Config) -> Self {
+        // The prior `json!` serialized `cfg.hooks.get(..)` =
+        // `Option<&Option<String>>`: a missing key OR an explicit
+        // null both rendered `null`; a set command rendered the
+        // string. Flatten both layers to `Option<&str>`.
+        let hook = |event| cfg.hooks.get(&event).and_then(|v| v.as_deref());
+        Self {
+            review: ReviewJson {
+                adhoc_feedback: cfg.review.adhoc_feedback,
+                plan_feedback: cfg.review.plan_feedback,
+                require_commit_prefix: cfg.review.require_commit_prefix,
+            },
+            hooks: HooksJson {
+                master_work: hook(HookEvent::MasterWork),
+                reviewer_work: hook(HookEvent::ReviewerWork),
+                plan_finalized: hook(HookEvent::PlanFinalized),
+                idle: hook(HookEvent::Idle),
+                blocked: hook(HookEvent::Blocked),
+            },
+            diff: DiffJson {
+                editor: cfg.diff.editor.as_ref(),
+                wait: cfg.diff.wait,
+            },
+        }
+    }
+}
+
 fn key_name(cmd: &ConfigKey) -> &'static str {
     match cmd {
         ConfigKey::ReviewAdhocFeedback(_) => "review.adhoc_feedback",
@@ -620,24 +682,7 @@ pub async fn run(args: ConfigArgs) -> anyhow::Result<()> {
     let Some(cmd) = &args.command else {
         if args.json {
             let cfg = load(&repo);
-            let obj = serde_json::json!({
-                "review": {
-                    "adhoc_feedback": cfg.review.adhoc_feedback,
-                    "plan_feedback": cfg.review.plan_feedback,
-                    "require_commit_prefix": cfg.review.require_commit_prefix,
-                },
-                "hooks": {
-                    "master_work": cfg.hooks.get(&HookEvent::MasterWork),
-                    "reviewer_work": cfg.hooks.get(&HookEvent::ReviewerWork),
-                    "plan_finalized": cfg.hooks.get(&HookEvent::PlanFinalized),
-                    "idle": cfg.hooks.get(&HookEvent::Idle),
-                    "blocked": cfg.hooks.get(&HookEvent::Blocked),
-                },
-                "diff": {
-                    "editor": cfg.diff.editor,
-                    "wait": cfg.diff.wait,
-                }
-            });
+            let obj = ConfigJson::from(&cfg);
             println!("{}", serde_json::to_string_pretty(&obj)?);
         } else {
             let kvs = resolve_key_values(&repo);
@@ -1298,6 +1343,51 @@ mod tests {
         assert!(out.contains(r#""adhoc_feedback":true"#));
         assert!(out.contains(r#""plan_feedback":true"#));
         assert!(!out.contains("force_review_on"));
+    }
+
+    #[test]
+    fn config_json_matches_prior_shape() {
+        // typed-json-not-json-macro: ConfigJson must serialize to the
+        // same keys+values the old `json!` produced for `clank config
+        // --json`. `json!` expresses the expected value; key order is
+        // irrelevant (`to_value` equality is order-independent).
+        //
+        // A set hook, an explicitly-disabled hook (Some(None)), and
+        // absent hooks must all match the prior
+        // `Option<&Option<String>>` serialization: set → string,
+        // disabled/absent → null.
+        let mut cfg = Config::default();
+        cfg.hooks
+            .insert(HookEvent::MasterWork, Some("notify".to_string()));
+        cfg.hooks.insert(HookEvent::Idle, None); // explicitly disabled
+        cfg.diff.editor = Some(LaunchConfig {
+            command: Some("vim".to_string()),
+            args: vec!["-c".to_string()],
+            env: Default::default(),
+        });
+        cfg.diff.wait = Some(true);
+
+        assert_eq!(
+            serde_json::to_value(ConfigJson::from(&cfg)).unwrap(),
+            serde_json::json!({
+                "review": {
+                    "adhoc_feedback": cfg.review.adhoc_feedback,
+                    "plan_feedback": cfg.review.plan_feedback,
+                    "require_commit_prefix": cfg.review.require_commit_prefix,
+                },
+                "hooks": {
+                    "master_work": cfg.hooks.get(&HookEvent::MasterWork),
+                    "reviewer_work": cfg.hooks.get(&HookEvent::ReviewerWork),
+                    "plan_finalized": cfg.hooks.get(&HookEvent::PlanFinalized),
+                    "idle": cfg.hooks.get(&HookEvent::Idle),
+                    "blocked": cfg.hooks.get(&HookEvent::Blocked),
+                },
+                "diff": {
+                    "editor": cfg.diff.editor,
+                    "wait": cfg.diff.wait,
+                }
+            })
+        );
     }
 
     #[test]
