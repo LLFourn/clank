@@ -429,9 +429,15 @@ pub fn register_repo_team(home: &Path, repo: &Path, team_name: &str) -> anyhow::
     // Validate against user-scope teams.
     let user_path = home.join(".clank/config.json");
     let user_cfg: UserConfigFile = match std::fs::read_to_string(&user_path) {
+        // Legacy keys (e.g. a pre-hard-cut `default_agents`) land in the
+        // `extra` flatten catchall and are ignored — `agents`/`teams`
+        // are unchanged from the old schema, so an existing global
+        // config reads fine. A genuine parse failure means a corrupt
+        // file; point at the fix rather than a raw serde error.
         Ok(s) => serde_json::from_str(&s).with_context(|| {
             format!(
-                "parsing {} as new-schema UserConfigFile",
+                "user-scope config {} is unreadable; fix or remove it \
+                 (a fresh one is written by `clank team save`)",
                 user_path.display()
             )
         })?,
@@ -443,9 +449,10 @@ pub fn register_repo_team(home: &Path, repo: &Path, team_name: &str) -> anyhow::
     let team = user_cfg.teams.get(team_name).ok_or_else(|| {
         anyhow::anyhow!(
             "team `{team_name}` not declared in user-scope teams \
-             (`~/.clank/config.json#/teams`). Run bare `clank init` to start from an \
-             empty repo team, then compose it with `clank agent add` + `clank team add` / \
-             `clank team set-master`."
+             (`~/.clank/config.json#/teams`). Either run bare `clank init` and compose a \
+             team locally (`clank agent add` + `clank team set-master` / `clank team add`), \
+             or — to make `{team_name}` a reusable template — compose it in a repo and \
+             publish with `clank team save {team_name}`."
         )
     })?;
 
@@ -1000,6 +1007,33 @@ mod tests {
         let parsed: RepoConfigFile =
             serde_json::from_str(&std::fs::read_to_string(&cfg_path).unwrap())
                 .expect("recreated as new-shape");
+        assert_eq!(parsed.team.master.as_ref().unwrap().as_str(), "claude");
+    }
+
+    #[test]
+    fn register_repo_team_reads_global_config_with_legacy_keys() {
+        // ruthless 4fc8bc3: the GLOBAL config is NOT blocked by legacy
+        // shape. A pre-hard-cut `default_agents` key lands in `extra`
+        // and is ignored; `agents`/`teams` are unchanged, so
+        // `init --team` reads it fine. (Verified against the real
+        // ~/.clank/config.json, which carries `default_agents`.)
+        use crate::cli::teams_config::RepoConfigFile;
+        let home = tempfile::tempdir().unwrap();
+        let upath = home.path().join(".clank/config.json");
+        std::fs::create_dir_all(upath.parent().unwrap()).unwrap();
+        std::fs::write(
+            &upath,
+            r#"{"default_agents":["claude"],"agents":{"claude":{"tool":"claude"}},"teams":{"dev":{"master":"claude"}}}"#,
+        )
+        .unwrap();
+        let repo = init_repo();
+
+        register_repo_team(home.path(), repo.path(), "dev").unwrap();
+
+        let parsed: RepoConfigFile = serde_json::from_str(
+            &std::fs::read_to_string(repo.path().join(".clank/config.json")).unwrap(),
+        )
+        .unwrap();
         assert_eq!(parsed.team.master.as_ref().unwrap().as_str(), "claude");
     }
 }

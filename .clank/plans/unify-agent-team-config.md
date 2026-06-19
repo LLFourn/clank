@@ -104,11 +104,36 @@ code.
 All milestones tested against in-process config structs + temp dirs;
 never spawn the clank binary.
 
+## Global bootstrap (documented path)
+
+The user-scope config is schema-compatible: legacy keys (e.g. a
+pre-hard-cut `default_agents`) land in the `extra` flatten catchall and
+are ignored; `agents`/`teams` are unchanged from the old schema, so an
+existing global config reads fine (verified against the real
+`~/.clank/config.json`). Global TEMPLATES are minted by `clank team
+save <name>` (the removed `team create` is replaced by it): compose a
+repo's team, `clank team save <name>`, then `clank init --team <name>`
+in other repos. A fresh machine with no global config: `clank team
+save` writes one.
+
 ## Rollout (operational, NOT reviewable plan code)
 
-After finish + `cargo install`, the new binary rejects old-shape
-configs. Re-init clank's OWN repo immediately, then sweep `~/src` for
-other clank repos and `clank init --team <name>` each.
+The new binary rejects old-shape REPO configs, so migrate them BEFORE
+making it the default — lloyd: do NOT `cargo install` until the
+existing repos' configs are updated (otherwise the live global binary
+faces incompatible on-disk configs across every repo at once):
+
+1. `clank finish` the plan (old binary on the old config — still
+   compatible).
+2. Build the new binary WITHOUT installing (`cargo build --release`).
+3. With that built binary, migrate each clank repo under `~/src`
+   (including clank's own): re-create its new-shape config PRESERVING
+   its team — `clank init --team <its-team> --force` where the repo
+   used a global template (check each repo's old `team` value), else
+   recompose (`clank init` + `agent add` + `team set-master`/`team
+   add`). Bare `clank init` alone would write an EMPTY team — don't
+   lose the roster.
+4. THEN `cargo install` to make the now-compatible binary the default.
 
 ## Non-goals
 
