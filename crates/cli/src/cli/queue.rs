@@ -256,6 +256,14 @@ fn add(repo: &Path, name: &str, priority: u16, source: BodySource) -> anyhow::Re
              Delete it from .clank/queue/ first or pick a different name."
         );
     }
+    // Consume the stub after a successful write (below): capture its
+    // path before `normalize_and_validate` takes `source`. ONLY the
+    // stubs-dir source is consumed — `--from`/`-m`/stdin name files we
+    // don't own (queue-add-consumes-stub).
+    let stub_to_consume = match &source.kind {
+        BodySourceKind::StubsDir(p) => Some(p.clone()),
+        _ => None,
+    };
     let body = normalize_and_validate(name, source)?;
     // `.clank/stubs/` is this command's staging area; self-heal its
     // gitignore the first time queue add runs in a repo that predates
@@ -267,6 +275,17 @@ fn add(repo: &Path, name: &str, priority: u16, source: BodySource) -> anyhow::Re
     std::fs::create_dir_all(&dir)?;
     let dest = dir.join(format!("{priority:03}-{name}.md"));
     std::fs::write(&dest, body)?;
+    // The queue entry is the record now — consume the stub. Strictly
+    // after the write so a failed write leaves the stub for a retry;
+    // best-effort, since the add itself already succeeded.
+    if let Some(stub) = stub_to_consume {
+        if let Err(e) = std::fs::remove_file(&stub) {
+            eprintln!(
+                "note: could not remove consumed stub `{}`: {e}",
+                stub.display()
+            );
+        }
+    }
     println!(
         "queued `{name}` at priority {priority:03} ({})",
         dest.display()
@@ -421,6 +440,47 @@ mod tests {
         add(dir.path(), "foo", 400, inline("real body\n")).unwrap();
         let gi = std::fs::read_to_string(dir.path().join(".clank/.gitignore")).unwrap();
         assert!(gi.contains("/stubs/"), "queue add ignores /stubs/: {gi}");
+    }
+
+    #[test]
+    fn add_consumes_a_stub_dir_source() {
+        // queue-add-consumes-stub: a stub-sourced add deletes the stub
+        // once the queue entry is written, so the staging dir
+        // self-empties (no more leftover stubs piling up).
+        let dir = tempfile::tempdir().unwrap();
+        let stub = dir.path().join(".clank/stubs/foo.md");
+        std::fs::create_dir_all(stub.parent().unwrap()).unwrap();
+        std::fs::write(&stub, "# foo\nreal body\n").unwrap();
+
+        let source = BodySource {
+            raw: std::fs::read_to_string(&stub).unwrap(),
+            kind: BodySourceKind::StubsDir(stub.clone()),
+        };
+        add(dir.path(), "foo", 400, source).unwrap();
+
+        assert!(
+            dir.path().join(".clank/queue/400-foo.md").is_file(),
+            "queue entry written"
+        );
+        assert!(!stub.exists(), "stub consumed (deleted) after queue add");
+    }
+
+    #[test]
+    fn add_does_not_delete_a_from_path_source() {
+        // Only the stubs-dir source is consumed; `--from <file>` names a
+        // user-owned file that must survive (queue-add-consumes-stub).
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("elsewhere.md");
+        std::fs::write(&src, "# foo\nreal body\n").unwrap();
+
+        let source = BodySource {
+            raw: std::fs::read_to_string(&src).unwrap(),
+            kind: BodySourceKind::FromPath(src.clone()),
+        };
+        add(dir.path(), "foo", 400, source).unwrap();
+
+        assert!(dir.path().join(".clank/queue/400-foo.md").is_file());
+        assert!(src.exists(), "--from source file must NOT be deleted");
     }
 
     #[test]
