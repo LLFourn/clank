@@ -12,17 +12,83 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
+use clank_core::vocab::{Role, Tool};
 
 use super::SetupArgs;
 
-// Pub so `clank doctor` can compare on-disk skill files against
-// the expected embedded content without recomputing the paths.
-pub const CLAUDE_SKILL_BODY: &str = include_str!("setup_assets/claude_skill.md");
-pub const CODEX_SKILL_BODY: &str = include_str!("setup_assets/codex_skill.md");
+// The `clank` skill is split by ROLE, not by tool: one tool hosts
+// multiple roles (claude runs both the master and a reviewer), so a
+// per-tool skill can't be role-specific. Each role's SKILL.md is
+// composed from a shared core + a role body (+ a claude-only slash
+// command) with the few tool-specific bits substituted, so there is
+// ONE source per role. See [`compose_skill`].
+const SKILL_SHARED_CORE: &str = include_str!("setup_assets/skill_shared_core.md");
+const SKILL_MASTER_BODY: &str = include_str!("setup_assets/skill_master.md");
+const SKILL_REVIEWER_BODY: &str = include_str!("setup_assets/skill_reviewer.md");
+const SKILL_SLASH_COMMAND: &str = include_str!("setup_assets/skill_slash_command.md");
+
 /// PR-review mode skill (clank-pr-review-mode). Tool-neutral — the
 /// gh incantations are identical for claude and codex — so one body
 /// installs to both skill dirs.
 pub const PR_REVIEW_SKILL_BODY: &str = include_str!("setup_assets/pr_review_skill.md");
+
+/// The two role skills, by their `~/.<tool>/skills/<name>/` dir name.
+const MASTER_SKILL: &str = "clank-master";
+const REVIEWER_SKILL: &str = "clank-reviewer";
+/// The pre-split single skill, removed on setup.
+const OBSOLETE_SKILL: &str = "clank";
+
+/// `description:` frontmatter — the PRIMARY lever for role selection.
+/// Lead with the role guard ("Use ONLY when … Do NOT use …") and name
+/// the other skill, so an agent never loads the wrong role's skill (and
+/// runs commands it must never touch).
+const MASTER_DESC: &str = "Clank multi-agent workflow, MASTER role. Use ONLY when you are the master in a clank repo (implement plan milestones, promote/finish plans, manage the roster). Do NOT use as a reviewer — use clank-reviewer instead.";
+const REVIEWER_DESC: &str = "Clank multi-agent workflow, REVIEWER role. Use ONLY when you are a reviewer in a clank repo (review commits and write verdicts). Do NOT use as the master — use clank-master instead.";
+
+/// Compose a role's `SKILL.md` for a tool from the shared single-source
+/// fragments: frontmatter (role-guarded description) + a role-guard
+/// line + shared core + the role body, plus the claude-only `/clank`
+/// slash command. Tool differences (`{{SHELL}}`, the codex stop-hook
+/// note) are substituted, never duplicated. Pure — unit-tested without
+/// touching the filesystem.
+pub fn compose_skill(role: Role, tool: Tool) -> String {
+    let (name, description, body, other) = match role {
+        Role::Master => (MASTER_SKILL, MASTER_DESC, SKILL_MASTER_BODY, REVIEWER_SKILL),
+        Role::Reviewer => (
+            REVIEWER_SKILL,
+            REVIEWER_DESC,
+            SKILL_REVIEWER_BODY,
+            MASTER_SKILL,
+        ),
+    };
+    let mut out = String::new();
+    out.push_str("---\n");
+    out.push_str(&format!("name: {name}\n"));
+    out.push_str(&format!("description: {description}\n"));
+    out.push_str("---\n\n");
+    out.push_str(&format!(
+        "> ROLE GUARD: this skill is for the **{role}** role. If your role \
+         in this repo is not {role}, stop and use `{other}` instead — your \
+         role is what `clank status` and the Stop-hook hint report.\n\n",
+        role = role.as_str(),
+    ));
+    out.push_str(SKILL_SHARED_CORE);
+    out.push_str(body);
+    if tool == Tool::Claude {
+        out.push_str(SKILL_SLASH_COMMAND);
+    }
+
+    let shell = match tool {
+        Tool::Claude => "Bash",
+        Tool::Codex => "shell",
+    };
+    let stop_hook_note = match tool {
+        Tool::Claude => "",
+        Tool::Codex => " codex surfaces this as a `Stop hook (blocked) feedback:` message.",
+    };
+    out.replace("{{SHELL}}", shell)
+        .replace("{{STOP_HOOK_NOTE}}", stop_hook_note)
+}
 
 /// Stable identifier we write onto every clank-owned hook entry
 /// as `"id": "<HOOK_ID>"`. The plan's D8 ownership model says
@@ -50,20 +116,29 @@ pub async fn run(args: SetupArgs) -> anyhow::Result<()> {
     let home = home_dir()?;
     let mut summary = Vec::<String>::new();
 
-    install_skill(
-        &home.join(".claude/skills/clank/SKILL.md"),
-        CLAUDE_SKILL_BODY,
-        args.force,
-        args.dry_run,
-        &mut summary,
-    )?;
-    install_skill(
-        &home.join(".codex/skills/clank/SKILL.md"),
-        CODEX_SKILL_BODY,
-        args.force,
-        args.dry_run,
-        &mut summary,
-    )?;
+    // Role skills: clank-master + clank-reviewer, both to both tools
+    // (tool != role). Composed per (role, tool) from one source each.
+    for (tool, tool_dir) in [(Tool::Claude, ".claude"), (Tool::Codex, ".codex")] {
+        for (role, skill) in [
+            (Role::Master, MASTER_SKILL),
+            (Role::Reviewer, REVIEWER_SKILL),
+        ] {
+            install_skill(
+                &home.join(format!("{tool_dir}/skills/{skill}/SKILL.md")),
+                &compose_skill(role, tool),
+                args.force,
+                args.dry_run,
+                &mut summary,
+            )?;
+        }
+        // Drop the pre-split single `clank` skill so it can't shadow the
+        // role skills with stale, role-jamming guidance.
+        remove_obsolete_skill(
+            &home.join(format!("{tool_dir}/skills/{OBSOLETE_SKILL}")),
+            args.dry_run,
+            &mut summary,
+        )?;
+    }
     install_skill(
         &home.join(".claude/skills/clank-pr-review/SKILL.md"),
         PR_REVIEW_SKILL_BODY,
@@ -155,6 +230,28 @@ fn install_skill(
             summary.push(format!("  write {}", path.display()));
         }
         Err(e) => return Err(e.into()),
+    }
+    Ok(())
+}
+
+/// Remove a clank-owned skill dir that the binary no longer ships
+/// (the pre-split single `clank` skill). The dir is clank-owned, so we
+/// remove it outright when its `SKILL.md` is present; a no-op when
+/// already gone. Records the action in the summary.
+fn remove_obsolete_skill(
+    dir: &Path,
+    dry_run: bool,
+    summary: &mut Vec<String>,
+) -> anyhow::Result<()> {
+    if dir.join("SKILL.md").exists() {
+        if !dry_run {
+            std::fs::remove_dir_all(dir)
+                .with_context(|| format!("removing obsolete skill `{}`", dir.display()))?;
+        }
+        summary.push(format!(
+            "  remove {} (split into clank-master / clank-reviewer)",
+            dir.display()
+        ));
     }
     Ok(())
 }
@@ -461,42 +558,141 @@ mod tests {
     }
 
     #[test]
-    fn claude_codex_skills_define_finished_identically() {
-        // Divergence guard (finished-means-impl-done-not-plan-text,
-        // ruthless): the FINISHED definition MUST be byte-identical
-        // across the claude and codex skill assets, so the two
-        // agents never drift on what FINISHED means. Editing one
-        // skill's FINISHED bullet without the other fails here.
+    fn finished_defined_once_in_reviewer_and_tool_independent() {
+        // finished-means-impl-done-not-plan-text: FINISHED is a REVIEWER
+        // verdict, defined in ONE source (the reviewer body), so the two
+        // tools can't drift on what it means; the master never defines a
+        // verdict. Single-source replaces the old per-tool equality guard.
+        let rc = compose_skill(Role::Reviewer, Tool::Claude);
+        let rx = compose_skill(Role::Reviewer, Tool::Codex);
         assert_eq!(
-            finished_block(CLAUDE_SKILL_BODY),
-            finished_block(CODEX_SKILL_BODY),
-            "claude and codex skills must define FINISHED identically"
+            finished_block(&rc),
+            finished_block(&rx),
+            "FINISHED must read identically across tools (single source)"
         );
-        // And the definition must be the implementation-complete
-        // one, not the old plan-text-done phrasing.
         assert!(
-            finished_block(CLAUDE_SKILL_BODY).contains("fully\n    implemented and merge-ready"),
+            finished_block(&rc).contains("implemented and merge-ready"),
             "FINISHED must mean the work is implemented, not the plan text written"
+        );
+        assert!(
+            !compose_skill(Role::Master, Tool::Claude).contains("- **FINISHED**:"),
+            "the master skill must not define verdicts (reviewer-only)"
         );
     }
 
     #[test]
+    fn role_skills_are_lean_each_lacks_the_other_roles_commands() {
+        for tool in [Tool::Claude, Tool::Codex] {
+            let master = compose_skill(Role::Master, tool);
+            let reviewer = compose_skill(Role::Reviewer, tool);
+            // Master owns finish + roster; never writes verdicts.
+            assert!(
+                master.contains("clank finish"),
+                "master must document finish"
+            );
+            assert!(
+                master.contains("clank agent set-master"),
+                "master must document roster commands"
+            );
+            assert!(
+                !master.contains("--verdict"),
+                "master must not carry verdict-writing mechanics"
+            );
+            // Reviewer writes verdicts; never finishes/promotes.
+            assert!(
+                reviewer.contains("clank feedback write") && reviewer.contains("--verdict"),
+                "reviewer must document the verdict-write command"
+            );
+            for verdict in ["APPROVE", "FINISHED", "REQUEST_CHANGES"] {
+                assert!(reviewer.contains(verdict), "reviewer must define {verdict}");
+            }
+            assert!(
+                !reviewer.contains("clank finish") && !reviewer.contains("queue promote"),
+                "reviewer must not carry master-only commands"
+            );
+        }
+    }
+
+    #[test]
+    fn role_invariants_lead_each_body() {
+        // Guard against silent drift of the behaviours this split exists
+        // to encode.
+        let master = compose_skill(Role::Master, Tool::Claude);
+        assert!(
+            master.contains("Commit → STOP → get woken") && master.contains("PROMOTING"),
+            "master must encode the commit->yield loop incl. promotion"
+        );
+        let reviewer = compose_skill(Role::Reviewer, Tool::Claude);
+        assert!(
+            reviewer.contains("NEVER withhold APPROVE or FINISHED waiting on a manual/external"),
+            "reviewer must encode the committable-scope invariant"
+        );
+        assert!(
+            reviewer.contains("ARCHITECTURE-FIRST"),
+            "reviewer must encode architecture-first review"
+        );
+        for body in [&master, &reviewer] {
+            assert!(
+                body.contains("NEVER poll"),
+                "both roles must forbid polling"
+            );
+        }
+    }
+
+    #[test]
+    fn role_guard_descriptions_are_unambiguous_both_ways() {
+        let m = compose_skill(Role::Master, Tool::Claude);
+        assert!(m.contains("name: clank-master"));
+        assert!(
+            m.contains("Use ONLY when you are the master") && m.contains("use clank-reviewer"),
+            "master description must guard its role and redirect the other"
+        );
+        let r = compose_skill(Role::Reviewer, Tool::Claude);
+        assert!(r.contains("name: clank-reviewer"));
+        assert!(
+            r.contains("Use ONLY when you are a reviewer") && r.contains("use clank-master"),
+            "reviewer description must guard its role and redirect the other"
+        );
+    }
+
+    #[test]
+    fn tool_specific_bits_are_substituted() {
+        let mc = compose_skill(Role::Master, Tool::Claude);
+        let mx = compose_skill(Role::Master, Tool::Codex);
+        assert!(mc.contains("run via Bash"));
+        assert!(mx.contains("run via shell"));
+        assert!(
+            !mc.contains("{{") && !mx.contains("{{"),
+            "all tokens substituted"
+        );
+        // Slash command is claude-only.
+        assert!(
+            mc.contains("$ARGUMENTS"),
+            "claude skill has the /clank slash command"
+        );
+        assert!(
+            !mx.contains("$ARGUMENTS"),
+            "codex skill omits the slash command"
+        );
+        // Codex carries the stop-hook phrasing note; claude does not.
+        assert!(mx.contains("Stop hook (blocked) feedback:"));
+        assert!(!mc.contains("Stop hook (blocked) feedback:"));
+    }
+
+    #[test]
     fn skills_teach_compose_from_hint_not_verbatim() {
-        // wfw-output-is-a-minimal-hint (ruthless 201e498 concern
-        // 1): the wake no longer carries a verbatim command, so
-        // neither skill may promise one — and both must teach the
-        // same compose-from-the-hint behavior (lockstep, like the
-        // FINISHED-definition guard above).
+        // wfw-output-is-a-minimal-hint: the wake carries no verbatim
+        // command; the shared core teaches composing from the hint.
         const HINT_SENTENCE: &str = "Each item is a one-line hint: kind, plan, short sha.";
-        for (name, body) in [("claude", CLAUDE_SKILL_BODY), ("codex", CODEX_SKILL_BODY)] {
-            assert!(
-                !body.contains("run it verbatim"),
-                "{name} skill still promises a verbatim command"
-            );
-            assert!(
-                body.contains(HINT_SENTENCE),
-                "{name} skill must teach composing from the one-line hint"
-            );
+        for role in [Role::Master, Role::Reviewer] {
+            for tool in [Tool::Claude, Tool::Codex] {
+                let body = compose_skill(role, tool);
+                assert!(!body.contains("run it verbatim"), "no verbatim promise");
+                assert!(
+                    body.contains(HINT_SENTENCE),
+                    "must teach composing from the one-line hint"
+                );
+            }
         }
     }
 
@@ -591,32 +787,27 @@ mod tests {
     }
 
     #[test]
-    fn embedded_skills_use_scoped_block_create_recipe() {
-        // Regression for block-create-explicit-scope: both skill
-        // assets used to embed `clank block create <name> -m
-        // "question"` with no scope flag. After CLI flipped to
-        // require explicit scope, that recipe became a no-op
-        // error. Lock in the scoped recipe so future skill
-        // edits don't silently regress.
-        for (name, body) in [
-            ("CLAUDE_SKILL_BODY", CLAUDE_SKILL_BODY),
-            ("CODEX_SKILL_BODY", CODEX_SKILL_BODY),
-        ] {
+    fn master_skill_uses_scoped_block_create_recipe() {
+        // block-create-explicit-scope: the recipe must carry `--plan`
+        // (the bare no-scope form errors at runtime). `block create` is
+        // a MASTER command — reviewers must not carry it.
+        for tool in [Tool::Claude, Tool::Codex] {
+            let body = compose_skill(Role::Master, tool);
             assert!(
                 body.contains("clank block create"),
-                "{name} should still document block create"
+                "master must document block create"
             );
             assert!(
                 body.contains("--plan"),
-                "{name} must document `--plan` as the primary scope flag; \
-                 forgetting it makes the recipe error at runtime"
+                "block create recipe must carry --plan (the primary scope flag)"
             );
-            // The bare invocation pattern (with no flag immediately
-            // after the name) is what regressed. Guard against it
-            // returning verbatim.
             assert!(
                 !body.contains(r#"clank block create <name> -m "question""#),
-                "{name} must not embed the legacy no-scope recipe"
+                "must not embed the legacy no-scope recipe"
+            );
+            assert!(
+                !compose_skill(Role::Reviewer, tool).contains("clank block create"),
+                "reviewer must not carry the master-only block-create command"
             );
         }
     }

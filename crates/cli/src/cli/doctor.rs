@@ -448,17 +448,35 @@ fn user_checks() -> Vec<CheckResult> {
         }
     };
 
-    // Skill files.
-    out.push(check_skill_file(
-        &home.join(".claude/skills/clank/SKILL.md"),
-        crate::cli::setup::CLAUDE_SKILL_BODY,
-        "~/.claude/skills/clank/SKILL.md",
-    ));
-    out.push(check_skill_file(
-        &home.join(".codex/skills/clank/SKILL.md"),
-        crate::cli::setup::CODEX_SKILL_BODY,
-        "~/.codex/skills/clank/SKILL.md",
-    ));
+    // Skill files. The `clank` skill is split by role (clank-master /
+    // clank-reviewer), both composed per tool from a single source.
+    use clank_core::vocab::{Role, Tool};
+    for (tool, tool_dir) in [(Tool::Claude, ".claude"), (Tool::Codex, ".codex")] {
+        for (role, skill) in [
+            (Role::Master, "clank-master"),
+            (Role::Reviewer, "clank-reviewer"),
+        ] {
+            let rel = format!("~/{tool_dir}/skills/{skill}/SKILL.md");
+            out.push(check_skill_file(
+                &home.join(format!("{tool_dir}/skills/{skill}/SKILL.md")),
+                &crate::cli::setup::compose_skill(role, tool),
+                &rel,
+            ));
+        }
+        // The pre-split `clank` skill must be gone — left in place it
+        // shadows the role skills with stale, role-jamming guidance.
+        let obsolete = home.join(format!("{tool_dir}/skills/clank"));
+        if obsolete.join("SKILL.md").exists() {
+            out.push(CheckResult::warn(
+                SECTION,
+                "skills",
+                format!(
+                    "~/{tool_dir}/skills/clank is the obsolete pre-split skill; \
+                     run `clank setup --force` to remove it (now clank-master / clank-reviewer)"
+                ),
+            ));
+        }
+    }
     out.push(check_skill_file(
         &home.join(".claude/skills/clank-pr-review/SKILL.md"),
         crate::cli::setup::PR_REVIEW_SKILL_BODY,
