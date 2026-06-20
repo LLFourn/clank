@@ -362,16 +362,15 @@ pub(crate) fn oneline_rows(
             } else {
                 subject.clone()
             };
-            out.push(OnelineRow::Commit {
-                sha: sha.clone(),
-                subject,
-            });
-            // AdHoc rows carried no review sub-lines before the
-            // factoring; keep that shape.
-            if matches!(event, LogEvent::AdHoc { .. }) {
-                continue;
-            }
-            if let Some(rs) = reviews.get(sha.as_str()) {
+            // Reviews render ABOVE their commit: a review happens AFTER
+            // its commit, so in a newest-first list it belongs above it
+            // (time order — status-timeline-progress). AdHoc rows carry
+            // no reviews. Multiple reviews of one commit keep
+            // `collect_reviews`' deterministic by-author order — `Review`
+            // carries no timestamp to sort chronologically.
+            if !matches!(event, LogEvent::AdHoc { .. })
+                && let Some(rs) = reviews.get(sha.as_str())
+            {
                 for r in rs {
                     out.push(OnelineRow::Review {
                         verdict: r.verdict,
@@ -380,6 +379,10 @@ pub(crate) fn oneline_rows(
                     });
                 }
             }
+            out.push(OnelineRow::Commit {
+                sha: sha.clone(),
+                subject,
+            });
         }
     }
     out
@@ -708,8 +711,10 @@ mod tests {
             lines,
             vec![
                 "foo".to_string(),
-                "  aa00000 intro".to_string(),
+                // review renders ABOVE its commit (newest-first time
+                // order — status-timeline-progress)
                 "    ✓ codex: lgtm".to_string(),
+                "  aa00000 intro".to_string(),
                 "  bb00000 finish".to_string(),
                 "adhoc".to_string(),
                 "  cc00000 drive-by".to_string(),
