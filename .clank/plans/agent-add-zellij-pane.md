@@ -16,18 +16,26 @@ a zellij failure must never fail (or roll back) the add/remove.
 
 ### Single source of truth (do this first — architecture)
 
-The launch-time layout encodes how an agent pane is launched as a KDL
-string in `push_agent_pane` (open_zellij.rs:765): `command "clank"` /
-`args "agent" "start" "<label>" "--repo" "<repo>"`, with the pane name
-from `agent_pane_title(label, role)` (open_zellij.rs:761). The live
+**`clank agent start` (agent.rs) is UNCHANGED — it is NOT made
+zellij-aware.** It already does the right thing: launch the agent's tool
+in whatever pane it runs in. All zellij behavior lives in `agent
+add`/`remove`. The new pane simply *runs* `clank agent start` as its
+command, exactly as the launch-time layout already does.
+
+The only shared concern is the *argv that invokes* `agent start`. The
+launch-time layout encodes it as a KDL string in `push_agent_pane`
+(open_zellij.rs:765): `command "clank"` / `args "agent" "start"
+"<label>" "--repo" "<repo>"`, with the pane name from
+`agent_pane_title(label, role)` (open_zellij.rs:761). The live
 `new-pane` path needs the SAME argv (as a `Vec<String>`, not KDL) and
 the SAME title, or layout-spawned and live-spawned panes drift and
 `parse_agent_panes` (status_tui.rs:1019) stops matching one of them.
 
-Factor the launch argv into one helper (e.g. `agent_start_argv(label,
-repo) -> Vec<String>`) and have BOTH `push_agent_pane` and the new live
-path build from it. Title stays centralized in `agent_pane_title`. No new
-copy of either format.
+Factor that invocation argv into one helper (e.g. `agent_start_argv(label,
+repo) -> Vec<String>`) **in open_zellij.rs** and have BOTH
+`push_agent_pane` and the new live path build from it. This touches the
+layout builder only — not `agent start` itself. Title stays centralized
+in `agent_pane_title`. No new copy of either format.
 
 ## Behavior
 
@@ -52,6 +60,9 @@ and close it by id. No pane found → no-op.
   of scope for now — do not spawn/close the master/stage pane.
 - **Repo scope only.** `--global` add/remove (the user-scope definition
   library) must NOT touch zellij.
+- **`clank agent start` is unchanged** — not zellij-aware. The feature
+  lives entirely in `add`/`remove`; `start` is only invoked as the new
+  pane's command.
 - Both add modes (by-name copy-down and `--tool` inline) fire.
 - Non-zellij invocations and any `zellij` failure are silent no-ops
   (mirror the fail-soft `.output()`-discard pattern used by the
