@@ -292,7 +292,7 @@ fn load_repo_config(
 /// into `extra` (e.g. `team`/`promoted`) still fail-closes. A
 /// role-less `agents` map (the just-shipped `{agents, team}` shape
 /// minus the `team`) is caught by the typed parse instead.
-fn is_legacy_repo_shape(body: &str) -> bool {
+pub(crate) fn is_legacy_repo_shape(body: &str) -> bool {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
         return false;
     };
@@ -304,7 +304,7 @@ fn is_legacy_repo_shape(body: &str) -> bool {
         || matches!(obj.get("agents"), Some(a) if a.is_array())
 }
 
-fn legacy_repo_schema_error(repo_cfg_path: &Path) -> anyhow::Error {
+pub(crate) fn legacy_repo_schema_error(repo_cfg_path: &Path) -> anyhow::Error {
     anyhow::anyhow!(
         "{}: this repo's `.clank/config.json` uses the old team schema; \
          re-run `clank init` to recreate it",

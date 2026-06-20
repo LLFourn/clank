@@ -22,18 +22,20 @@ enum Command {
     Unfinish(cli::UnfinishArgs),
     /// Manage the plan queue.
     Queue(cli::QueueArgs),
-    /// Manage agent DEFINITIONS (the registry): `agent add` /
-    /// `agent remove` / `agent list` / `agent start`. Definitions
-    /// carry the tool + launch profile; team membership lives
-    /// under `clank team`.
+    /// Manage THIS repo's agent ROSTER (the operating list):
+    /// `agent add` / `agent set-master` / `agent remove` /
+    /// `agent list` / `agent start`. Each agent carries its tool +
+    /// launch profile AND role; `agent add <name>` adds by name from
+    /// the global library, or `--tool` defines one inline.
     Agent(cli::AgentArgs),
-    /// Compose THIS repo's operating team (`team add` / `remove` /
-    /// `set-master` / `show` / `save`) and inspect/delete the global
-    /// team-template library (`team list` / `team delete`).
+    /// Manage the GLOBAL team-template library (a team is a saved
+    /// roster): `team save` (capture this repo's roster as a
+    /// template) / `team list` / `team show <name>` / `team delete`.
+    /// Seed a repo from a template with `clank init --team <name>`.
     Team(cli::TeamArgs),
-    /// Serialize this repo's self-contained config (`agents` +
-    /// `team`) as pretty JSON to stdout. Fail-closed on the old
-    /// shape (re-init hint).
+    /// Serialize this repo's self-contained config (the `agents`
+    /// roster) as pretty JSON to stdout. Fail-closed on the old shape
+    /// (re-init hint).
     Export(cli::ExportArgs),
     /// Strip a plan's `.clank/` artifacts from history.
     Purge(cli::PurgeArgs),

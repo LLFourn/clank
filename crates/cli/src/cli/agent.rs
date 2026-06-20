@@ -874,6 +874,14 @@ fn write_user_config(home: &Path, file: &UserConfigFile) -> anyhow::Result<()> {
 fn read_repo_config(repo: &Path) -> anyhow::Result<RepoConfigFile> {
     let path = repo.join(".clank/config.json");
     match std::fs::read_to_string(&path) {
+        // Fail-closed on an old-shape config BEFORE accepting the parse:
+        // a legacy `{"team":"dev"}` / stray `promoted` would otherwise
+        // deserialize (the key lands in `extra`) and a roster mutation
+        // would rewrite a mixed old/new config. Use the same raw guard
+        // as `agent_store::load_repo_config` (codex a52d486).
+        Ok(s) if crate::agent_store::is_legacy_repo_shape(&s) => {
+            Err(crate::agent_store::legacy_repo_schema_error(&path))
+        }
         Ok(s) => serde_json::from_str(&s).with_context(|| format!("parsing {}", path.display())),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(RepoConfigFile::default()),
         Err(e) => Err(anyhow::Error::from(e).context(format!("reading {}", path.display()))),
@@ -909,6 +917,22 @@ mod tests {
 
     fn label(s: &str) -> AgentLabel {
         AgentLabel::parse(s).unwrap()
+    }
+
+    #[test]
+    fn read_repo_config_fails_closed_on_legacy_shape() {
+        // codex a52d486: a legacy `{"team":"dev"}` would deserialize (the
+        // `team` key lands in `extra`) and a roster mutation would rewrite
+        // a mixed old/new config. read_repo_config must fail closed with
+        // the re-init hint instead, so agent add/remove/set-master refuse.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".clank")).unwrap();
+        std::fs::write(dir.path().join(".clank/config.json"), r#"{"team":"dev"}"#).unwrap();
+        let err = read_repo_config(dir.path()).unwrap_err().to_string();
+        assert!(
+            err.contains("old team schema") && err.contains("clank init"),
+            "expected re-init hint; got: {err}"
+        );
     }
 
     fn make_session() -> Session {
