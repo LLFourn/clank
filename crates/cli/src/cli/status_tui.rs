@@ -70,6 +70,7 @@ enum Style {
     Italic,
 }
 
+#[derive(Clone)]
 struct Span(Style, String);
 
 fn dim(s: impl Into<String>) -> Span {
@@ -156,22 +157,13 @@ pub(crate) fn render_at(
     // to read as a lamp, but only once the pane can afford it.
     let breath = rows >= 4;
 
-    // `ask` — a pending block's question is the single case where
-    // detail outranks state: a human must act. Word-wrapped (not
-    // first-line-truncated) so the reason is fully readable
-    // (tui-block-reason-wrap); accent-colored. The label gutter is 7
-    // cols (`{:>5}  `), so the text wraps to the remaining width and
-    // continuation lines sit under it with a blank gutter.
+    // The block `ask` was here in the FIXED header, but a long question
+    // could overflow a short pane and become unreadable. It now renders
+    // in the SCROLLABLE content below (see `block_ask_spans` + the
+    // timeline window) so it can be paged. The gutter width is still
+    // needed for the `fix` line.
     let gutter = display_width(&label("ask").1);
     let ask_width = cols.saturating_sub(gutter).max(1);
-    for b in snap.blocks.iter().filter(|b| b.answer.is_none()) {
-        for (i, line) in wrap(b.question.trim(), ask_width).into_iter().enumerate() {
-            body.push(vec![
-                label(if i == 0 { "ask" } else { "" }),
-                Span(Style::Accent, line),
-            ]);
-        }
-    }
 
     // `fix` — a broken HEAD commit tag the master must amend, shown even
     // when no plan row carries it (unknown-tag-only — codex 2bf46d9).
@@ -297,11 +289,16 @@ pub(crate) fn render_at(
     // line styled per row kind + display-width truncated via the
     // same emit path as the gauges. A blank separator when there's
     // room for it plus at least one line.
-    // The timeline = live in-progress rows (top) then the historical
-    // log. `offset` windows the COMBINED sequence so in-progress rows
-    // scroll like any other (and go off-screen when scrolled past).
+    // Scrollable content, windowed by `offset` so it ALL pages:
+    //   [block ask] ++ [live in-progress rows] ++ [historical log].
+    // The ask sits at the top (a pending block has no in-progress rows,
+    // so in practice it's ask ++ log); in-progress rows and the log
+    // scroll like any other content and go off-screen when scrolled past.
+    let ask_lines = block_ask_spans(snap, cols);
     let in_prog = in_progress_rows(snap);
-    let total = in_prog.len() + snap.log_rows.len();
+    let a = ask_lines.len();
+    let p = in_prog.len();
+    let total = a + p + snap.log_rows.len();
     let mut log_capacity = 0usize;
     if out.len() < rows && total > 0 {
         let mut avail = rows - out.len();
@@ -310,31 +307,40 @@ pub(crate) fn render_at(
             avail -= 1;
         }
         log_capacity = avail;
-        // Window into the timeline starting `offset` rows down from
-        // newest, clamped so the last page still fills.
+        // Window starting `offset` rows down, clamped so the last page
+        // still fills.
         let off = offset.min(total.saturating_sub(1));
         let end = (off + avail).min(total);
         // Align summaries at one column: pad authors to the widest name
-        // among the windowed rows — done reviews AND pending spinners.
+        // among the windowed rows — done reviews AND pending spinners
+        // (ask lines have no author column).
         let author_width = (off..end)
-            .filter_map(|idx| match idx.checked_sub(in_prog.len()) {
-                Some(li) => match &snap.log_rows[li] {
-                    crate::cli::log::OnelineRow::Review { author, .. } => {
-                        Some(display_width(author))
+            .filter_map(|idx| {
+                if idx < a {
+                    None
+                } else if idx < a + p {
+                    match &in_prog[idx - a] {
+                        InProgress::PendingReview(label) => Some(display_width(label)),
+                        InProgress::MasterWorking => None,
                     }
-                    _ => None,
-                },
-                None => match &in_prog[idx] {
-                    InProgress::PendingReview(label) => Some(display_width(label)),
-                    InProgress::MasterWorking => None,
-                },
+                } else {
+                    match &snap.log_rows[idx - a - p] {
+                        crate::cli::log::OnelineRow::Review { author, .. } => {
+                            Some(display_width(author))
+                        }
+                        _ => None,
+                    }
+                }
             })
             .max()
             .unwrap_or(0);
         for idx in off..end {
-            let spans = match idx.checked_sub(in_prog.len()) {
-                Some(li) => log_row_spans(&snap.log_rows[li], author_width),
-                None => in_progress_spans(&in_prog[idx], frame, author_width),
+            let spans = if idx < a {
+                ask_lines[idx].clone()
+            } else if idx < a + p {
+                in_progress_spans(&in_prog[idx - a], frame, author_width)
+            } else {
+                log_row_spans(&snap.log_rows[idx - a - p], author_width)
             };
             out.push(emit(&spans, color, cols));
         }
@@ -475,6 +481,26 @@ fn in_progress_spans(item: &InProgress, frame: usize, author_width: usize) -> Ve
             Span(Style::Italic, "working…".to_string()),
         ],
     }
+}
+
+/// Wrapped lines for every pending (unanswered) block ask, with the
+/// `ask` label gutter + accent style — the same look the fixed header
+/// used, now produced as SCROLLABLE content so a long question can be
+/// paged. Pure (word-wrap only): safe to call on an animation tick.
+/// Empty when no ask is pending (reserves no space).
+fn block_ask_spans(snap: &StatusSnapshot, cols: usize) -> Vec<Vec<Span>> {
+    let gutter = display_width(&label("ask").1);
+    let ask_width = cols.saturating_sub(gutter).max(1);
+    let mut lines = Vec::new();
+    for b in snap.blocks.iter().filter(|b| b.answer.is_none()) {
+        for (i, line) in wrap(b.question.trim(), ask_width).into_iter().enumerate() {
+            lines.push(vec![
+                label(if i == 0 { "ask" } else { "" }),
+                Span(Style::Accent, line),
+            ]);
+        }
+    }
+    lines
 }
 
 /// The signal lamp: `{emoji} {ACTOR} {verb}` left, plan stem
@@ -1413,10 +1439,18 @@ pub(crate) async fn run_tui(
         let (rows, cols) = term_size();
         let capacity = render_at(&snapshot, rows, cols, offset, frame).1;
 
+        // Scrollable content = block-ask lines + in-progress rows + log.
+        // The ask/in-progress rows depend on blocks/waiting_on (not the
+        // log fetch), so compute them before filling. In-progress rows
+        // sit at indices [ask .. ask+in_prog).
+        let ask = block_ask_spans(&snapshot, cols as usize).len();
+        let in_prog = in_progress_rows(&snapshot).len();
+        let head = ask + in_prog;
+
         // Load enough log to fill the viewport AT this scroll position.
         // Gated on `needs_fill` so an animation tick never reaches it.
         if needs_fill {
-            while !log_complete && snapshot.log_rows.len() < offset + capacity {
+            while !log_complete && head + snapshot.log_rows.len() < offset + capacity {
                 log_window += capacity.max(1);
                 let before = snapshot.log_rows.len();
                 snapshot.log_rows = crate::cli::status::tui_log_rows(&repo, log_window).await;
@@ -1427,19 +1461,16 @@ pub(crate) async fn run_tui(
             needs_fill = false;
         }
 
-        // The timeline length includes the live in-progress rows that sit
-        // above the log.
-        let in_prog = in_progress_rows(&snapshot).len();
-        let total = in_prog + snapshot.log_rows.len();
+        let total = head + snapshot.log_rows.len();
         // Max offset pins the last row at the BOTTOM of the viewport.
         let max_off = total.saturating_sub(capacity.max(1));
         offset = offset.min(max_off);
         paint(&render_at(&snapshot, rows, cols, offset, frame).0);
 
-        // An in-progress (spinner) row is on screen iff one of the
-        // top-of-timeline in-progress rows is within the window. Only
-        // then is there anything to animate, so only then do we tick.
-        let spinner_visible = in_prog > 0 && offset < in_prog;
+        // A spinner row is on screen iff the in-progress band
+        // [ask, ask+in_prog) intersects the window [offset, offset+cap).
+        // Only then is there anything to animate, so only then do we tick.
+        let spinner_visible = in_prog > 0 && offset < ask + in_prog && offset + capacity > ask;
         let wait = if spinner_visible {
             Duration::from_millis(120)
         } else {
@@ -2365,13 +2396,53 @@ terminal_3  terminal  ruthless (reviewer)
             question: "is this right?\nmore detail".into(),
             answer: None,
         }];
-        let texts: Vec<String> = render(&s, 6, 60).iter().map(|l| visible(l)).collect();
+        // Tall pane so the (now scrollable) ask is fully on screen.
+        let texts: Vec<String> = render(&s, 12, 60).iter().map(|l| visible(l)).collect();
         assert!(texts[0].starts_with("🙋 HUMAN blocked"), "got {texts:?}");
-        // The reason WORD-WRAPS now — the second line ("more detail")
-        // is no longer dropped, and continuation aligns under the text
-        // with a blank gutter (tui-block-reason-wrap).
-        assert_eq!(texts[2], "  ask  is this right?");
-        assert_eq!(texts[3], "       more detail");
+        // The ask now renders in the SCROLLABLE region (below the compact
+        // gauges), still word-wrapped under an `ask` gutter — both lines
+        // present, position-independent (status-tui-block-ask-scroll).
+        let joined = texts.join("\n");
+        assert!(
+            joined.contains("  ask  is this right?"),
+            "ask line present: {texts:?}"
+        );
+        assert!(
+            joined.contains("       more detail"),
+            "wrapped continuation present: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn long_block_ask_scrolls_into_view() {
+        // A long ask overflows a short pane; the tail must be reachable by
+        // scrolling (it's scrollable content, not a clipped fixed header).
+        let q = "AAAA BBBB CCCC DDDD EEEE FFFF GGGG HHHH IIII JJJJ KKKK LAST";
+        let mut s = snap(vec![plan_state("foo", WaitingOn::MasterToFinalize)], vec![]);
+        s.blocks = vec![crate::cli::block::BlockEntry {
+            agent: "claude".into(),
+            name: "q".into(),
+            plan: None,
+            question: q.into(),
+            answer: None,
+        }];
+        // Narrow + short so the ask wraps to many lines and overflows.
+        let top = render_at(&s, 8, 24, 0, 0).0.join("\n");
+        assert!(top.contains("AAAA"), "ask head visible at offset 0: {top}");
+        assert!(!top.contains("LAST"), "ask tail off-screen at offset 0");
+        // Scrolling down reveals the tail.
+        let revealed =
+            (1..30).any(|off| render_at(&s, 8, 24, off, 0).0.join("\n").contains("LAST"));
+        assert!(revealed, "scrolling brings the ask tail into view");
+    }
+
+    #[test]
+    fn no_pending_block_reserves_no_ask_space() {
+        let s = snap(vec![plan_state("foo", WaitingOn::MasterToFinalize)], vec![]);
+        assert!(
+            block_ask_spans(&s, 60).is_empty(),
+            "no pending block → no ask rows"
+        );
     }
 
     #[test]
