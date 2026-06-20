@@ -771,16 +771,33 @@ fn push_agent_pane(
     repo_path: &str,
 ) {
     let name_esc = kdl_escape(&agent_pane_title(label, role_str));
-    let label_esc = kdl_escape(label);
     let repo_esc = kdl_escape(repo_path);
     out.push_str(&format!(
         "{indent}pane{extra_attrs} name=\"{name_esc}\" cwd=\"{repo_esc}\" {{\n"
     ));
     out.push_str(&format!("{indent}    command \"clank\"\n"));
-    out.push_str(&format!(
-        "{indent}    args \"agent\" \"start\" \"{label_esc}\" \"--repo\" \"{repo_esc}\"\n"
-    ));
+    let args_kdl = agent_start_argv(label, repo_path)
+        .iter()
+        .map(|tok| format!("\"{}\"", kdl_escape(tok)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    out.push_str(&format!("{indent}    args {args_kdl}\n"));
     out.push_str(&format!("{indent}}}\n"));
+}
+
+/// The argv (after `clank`) that launches an agent's pane: `agent start
+/// <label> --repo <repo>`. The single source of truth for the launch-time
+/// KDL layout ([`push_agent_pane`]) AND the live `new-pane` path — and
+/// the exact `terminal_command` zellij reports for that pane, which is how
+/// the live add/remove path finds it.
+pub(crate) fn agent_start_argv(label: &str, repo_path: &str) -> Vec<String> {
+    vec![
+        "agent".to_string(),
+        "start".to_string(),
+        label.to_string(),
+        "--repo".to_string(),
+        repo_path.to_string(),
+    ]
 }
 
 /// Escape a string for use inside a KDL `"..."` quoted string.
@@ -992,6 +1009,14 @@ mod tests {
         assert!(kdl.contains(&format!(
             "args \"agent\" \"start\" \"carol\" \"--repo\" \"{TEST_REPO}\""
         )));
+    }
+
+    #[test]
+    fn agent_start_argv_is_the_pane_launch_invocation() {
+        assert_eq!(
+            agent_start_argv("bob", "/repo"),
+            vec!["agent", "start", "bob", "--repo", "/repo"]
+        );
     }
 
     #[test]

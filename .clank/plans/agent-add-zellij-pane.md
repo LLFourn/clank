@@ -26,10 +26,20 @@ The only shared concern is the *argv that invokes* `agent start`. The
 launch-time layout encodes it as a KDL string in `push_agent_pane`
 (open_zellij.rs:765): `command "clank"` / `args "agent" "start"
 "<label>" "--repo" "<repo>"`, with the pane name from
-`agent_pane_title(label, role)` (open_zellij.rs:761). The live
-`new-pane` path needs the SAME argv (as a `Vec<String>`, not KDL) and
-the SAME title, or layout-spawned and live-spawned panes drift and
-`parse_agent_panes` (status_tui.rs:1019) stops matching one of them.
+`agent_pane_title(label, role)` (open_zellij.rs:761). The live `new-pane`
+path must reuse BOTH, for two DISTINCT reasons:
+
+- **Same title → protects the matcher.** `parse_agent_panes`
+  (status_tui.rs:1019) keys on the pane title (`list-panes` is `PANE_ID
+  TYPE TITLE`); a live pane with a different title is invisible to
+  `remove` and the TUI. Title is already centralized in
+  `agent_pane_title` — reuse it.
+- **Same argv → protects launch behavior.** `list-panes` does NOT carry
+  the running command, so an argv difference is invisible to the matcher
+  — this is not a matcher concern. It matters because a live-added
+  reviewer must INVOKE `agent start` identically to a layout-spawned one
+  (same cwd/--repo/label), or the two paths diverge in how the agent
+  boots.
 
 Factor that invocation argv into one helper (e.g. `agent_start_argv(label,
 repo) -> Vec<String>`) **in open_zellij.rs** and have BOTH
