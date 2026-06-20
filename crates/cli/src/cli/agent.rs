@@ -594,7 +594,28 @@ fn add(args: AgentAddArgs) -> anyhow::Result<()> {
             add_repo_roster_agent_by_name(&repo, home.as_deref(), &label, role)?;
         }
     }
+    // `agent add` only ever adds a reviewer (master is set via
+    // set-master). Best-effort: project it onto the live zellij stack.
+    let other_reviewers = repo_reviewer_labels(&repo, Some(&label));
+    crate::cli::open_zellij::add_reviewer_pane(&repo, label.as_str(), &other_reviewers);
     Ok(())
+}
+
+/// Labels of this repo's reviewers (roster role `commit`/`gate`),
+/// optionally excluding `exclude`. Best-effort (empty on read error) —
+/// used only to anchor a live zellij pane onto the existing stack.
+fn repo_reviewer_labels(repo: &Path, exclude: Option<&AgentLabel>) -> Vec<String> {
+    read_repo_config(repo)
+        .map(|cfg| {
+            cfg.agents
+                .iter()
+                .filter(|(l, a)| {
+                    Some(*l) != exclude && matches!(a.role, RosterRole::Commit | RosterRole::Gate)
+                })
+                .map(|(l, _)| l.as_str().to_string())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 // ── agent mutation cores ─────────────────────────────────────
@@ -756,7 +777,16 @@ fn remove(args: AgentRemoveArgs) -> anyhow::Result<()> {
         remove_global_agent(home_ref, &label)?;
     } else {
         let repo = resolve_repo(args.repo.as_deref())?;
+        // Capture the role BEFORE removal: only a reviewer's pane is in
+        // scope (master panes are deliberately left alone).
+        let was_reviewer = read_repo_config(&repo)
+            .ok()
+            .and_then(|cfg| cfg.agents.get(&label).map(|a| a.role))
+            .is_some_and(|r| matches!(r, RosterRole::Commit | RosterRole::Gate));
         remove_repo_agent(&repo, &label)?;
+        if was_reviewer {
+            crate::cli::open_zellij::remove_reviewer_pane(&repo, label.as_str());
+        }
     }
     Ok(())
 }

@@ -800,6 +800,146 @@ pub(crate) fn agent_start_argv(label: &str, repo_path: &str) -> Vec<String> {
     ]
 }
 
+/// The command string zellij reports as a pane's `terminal_command` when
+/// launched from [`agent_start_argv`]: `clank agent start <label> --repo
+/// <repo>`. This is an agent pane's UNIQUE identity within a session —
+/// the bare label repeats across worktree tabs, but the absolute
+/// `--repo` path disambiguates them.
+fn agent_start_command(label: &str, repo_path: &str) -> String {
+    format!("clank {}", agent_start_argv(label, repo_path).join(" "))
+}
+
+/// Subset of a `zellij action list-panes --json --command` element.
+/// Extra fields are ignored (serde skips unknown keys by default).
+#[derive(Debug, serde::Deserialize)]
+struct ZellijPane {
+    id: u32,
+    #[serde(default)]
+    is_plugin: bool,
+    #[serde(default)]
+    is_focused: bool,
+    #[serde(default)]
+    terminal_command: Option<String>,
+}
+
+impl ZellijPane {
+    /// The pane-id string zellij's `focus-pane-id` / `close-pane
+    /// --pane-id` accept (`terminal_<id>` / `plugin_<id>`).
+    fn pane_id(&self) -> String {
+        let kind = if self.is_plugin { "plugin" } else { "terminal" };
+        format!("{kind}_{}", self.id)
+    }
+}
+
+/// The terminal pane whose running command is exactly `cmd`, if any.
+fn find_pane_by_command<'a>(panes: &'a [ZellijPane], cmd: &str) -> Option<&'a ZellijPane> {
+    panes
+        .iter()
+        .find(|p| !p.is_plugin && p.terminal_command.as_deref() == Some(cmd))
+}
+
+/// The first terminal pane running any of `cmds` — used to anchor a new
+/// reviewer pane onto the EXISTING reviewer stack (focus a current stack
+/// member, then `new-pane --stacked` joins that stack).
+fn find_anchor_pane<'a>(panes: &'a [ZellijPane], cmds: &[String]) -> Option<&'a ZellijPane> {
+    panes.iter().find(|p| {
+        !p.is_plugin
+            && p.terminal_command
+                .as_deref()
+                .is_some_and(|c| cmds.iter().any(|x| x == c))
+    })
+}
+
+fn focused_pane_id(panes: &[ZellijPane]) -> Option<String> {
+    panes.iter().find(|p| p.is_focused).map(ZellijPane::pane_id)
+}
+
+/// Run `zellij action <args>`, swallowing output and errors. Best-effort
+/// by construction: a zellij hiccup must never fail the caller (the
+/// roster mutation already persisted) nor bleed onto a pane. Returns
+/// stdout on success.
+fn zellij_action(args: &[&str]) -> Option<Vec<u8>> {
+    let out = std::process::Command::new("zellij")
+        .arg("action")
+        .args(args)
+        .output()
+        .ok()?;
+    out.status.success().then_some(out.stdout)
+}
+
+fn list_agent_panes() -> Option<Vec<ZellijPane>> {
+    let stdout = zellij_action(&["list-panes", "--json", "--command"])?;
+    serde_json::from_slice(&stdout).ok()
+}
+
+/// Best-effort: inside a zellij session, open a pane for a newly-added
+/// reviewer in the current reviewer stack. `repo` is the absolute repo
+/// path (it must match the pane's `--repo`); `other_reviewers` are the
+/// repo's OTHER reviewer labels, used to anchor onto the existing stack.
+/// No-op outside zellij, on any zellij failure, or if the pane already
+/// exists (idempotent).
+pub(crate) fn add_reviewer_pane(repo: &Path, label: &str, other_reviewers: &[String]) {
+    if std::env::var_os("ZELLIJ").is_none() {
+        return;
+    }
+    let repo_str = repo.to_string_lossy();
+    let Some(panes) = list_agent_panes() else {
+        return;
+    };
+    if find_pane_by_command(&panes, &agent_start_command(label, &repo_str)).is_some() {
+        return;
+    }
+    let restore = focused_pane_id(&panes);
+    let anchor_cmds: Vec<String> = other_reviewers
+        .iter()
+        .map(|l| agent_start_command(l, &repo_str))
+        .collect();
+    let anchor = find_anchor_pane(&panes, &anchor_cmds).map(ZellijPane::pane_id);
+
+    let title = agent_pane_title(label, "reviewer");
+    let mut new_pane: Vec<String> = vec![
+        "new-pane".to_string(),
+        "--name".to_string(),
+        title,
+        "--cwd".to_string(),
+        repo_str.to_string(),
+    ];
+    // `--stacked` only with a reviewer anchor focused: stacking onto the
+    // master (the fallback focus) would fold the stage into a stack.
+    if anchor.is_some() {
+        new_pane.push("--stacked".to_string());
+    }
+    new_pane.push("--".to_string());
+    new_pane.push("clank".to_string());
+    new_pane.extend(agent_start_argv(label, &repo_str));
+
+    if let Some(anchor_id) = &anchor {
+        zellij_action(&["focus-pane-id", anchor_id]);
+    }
+    let refs: Vec<&str> = new_pane.iter().map(String::as_str).collect();
+    zellij_action(&refs);
+    // new-pane steals focus; return it to where the caller was.
+    if let Some(id) = restore {
+        zellij_action(&["focus-pane-id", &id]);
+    }
+}
+
+/// Best-effort: inside a zellij session, close the pane of a just-removed
+/// reviewer, matched by its exact launch command. No-op outside zellij,
+/// on any failure, or if no pane matches.
+pub(crate) fn remove_reviewer_pane(repo: &Path, label: &str) {
+    if std::env::var_os("ZELLIJ").is_none() {
+        return;
+    }
+    let repo_str = repo.to_string_lossy();
+    let Some(panes) = list_agent_panes() else {
+        return;
+    };
+    if let Some(pane) = find_pane_by_command(&panes, &agent_start_command(label, &repo_str)) {
+        zellij_action(&["close-pane", "--pane-id", &pane.pane_id()]);
+    }
+}
+
 /// Escape a string for use inside a KDL `"..."` quoted string.
 /// KDL's escape syntax matches C-style: `\\`, `\"`, `\n`, `\r`,
 /// `\t`, plus `\u{XXXX}` for other control characters.
@@ -1017,6 +1157,66 @@ mod tests {
             agent_start_argv("bob", "/repo"),
             vec!["agent", "start", "bob", "--repo", "/repo"]
         );
+        assert_eq!(
+            agent_start_command("bob", "/repo"),
+            "clank agent start bob --repo /repo"
+        );
+    }
+
+    // A realistic `list-panes --json --command` (subset of fields per
+    // pane; serde must ignore the rest). Two `codex (reviewer)` panes in
+    // DIFFERENT repos prove command-identity disambiguates labels that
+    // repeat across worktree tabs.
+    const LIST_PANES_JSON: &str = r#"[
+      {"id":0,"is_plugin":true,"is_focused":false,"title":"(.) - zellij:link","terminal_command":null,"plugin_url":"zellij:link","tab_id":0},
+      {"id":0,"is_plugin":false,"is_focused":true,"title":"claude (master)","terminal_command":"clank agent start claude --repo /a","pane_x":0,"tab_id":0},
+      {"id":1,"is_plugin":false,"is_focused":false,"title":"codex (reviewer)","terminal_command":"clank agent start codex --repo /a","tab_id":0},
+      {"id":2,"is_plugin":false,"is_focused":false,"title":"status","terminal_command":"clank status --repo /a --tui","tab_id":0},
+      {"id":7,"is_plugin":false,"is_focused":false,"title":"codex (reviewer)","terminal_command":"clank agent start codex --repo /b","tab_id":1}
+    ]"#;
+
+    fn parse_panes() -> Vec<ZellijPane> {
+        serde_json::from_str(LIST_PANES_JSON).expect("real list-panes shape parses")
+    }
+
+    #[test]
+    fn pane_id_targets_terminal_vs_plugin() {
+        let panes = parse_panes();
+        assert_eq!(panes[0].pane_id(), "plugin_0");
+        assert_eq!(panes[1].pane_id(), "terminal_0");
+    }
+
+    #[test]
+    fn find_pane_by_command_disambiguates_same_label_across_repos() {
+        let panes = parse_panes();
+        assert_eq!(
+            find_pane_by_command(&panes, &agent_start_command("codex", "/a"))
+                .unwrap()
+                .pane_id(),
+            "terminal_1"
+        );
+        assert_eq!(
+            find_pane_by_command(&panes, &agent_start_command("codex", "/b"))
+                .unwrap()
+                .pane_id(),
+            "terminal_7"
+        );
+        assert!(find_pane_by_command(&panes, &agent_start_command("ghost", "/a")).is_none());
+    }
+
+    #[test]
+    fn find_anchor_pane_picks_an_existing_reviewer_for_this_repo() {
+        let panes = parse_panes();
+        let anchor = find_anchor_pane(&panes, &[agent_start_command("codex", "/a")]);
+        assert_eq!(anchor.unwrap().pane_id(), "terminal_1");
+        // No reviewer of this repo present → no anchor (first reviewer case).
+        assert!(find_anchor_pane(&panes, &[agent_start_command("codex", "/c")]).is_none());
+    }
+
+    #[test]
+    fn focused_pane_id_finds_the_focused_pane() {
+        let panes = parse_panes();
+        assert_eq!(focused_pane_id(&panes).as_deref(), Some("terminal_0"));
     }
 
     #[test]
