@@ -289,16 +289,13 @@ pub(crate) fn render_at(
     // line styled per row kind + display-width truncated via the
     // same emit path as the gauges. A blank separator when there's
     // room for it plus at least one line.
-    // Scrollable content, windowed by `offset` so it ALL pages:
-    //   [block ask] ++ [live in-progress rows] ++ [historical log].
-    // The ask sits at the top (a pending block has no in-progress rows,
-    // so in practice it's ask ++ log); in-progress rows and the log
-    // scroll like any other content and go off-screen when scrolled past.
+    // Scrollable content, windowed by `offset` so it ALL pages: the block
+    // ask, then the log with in-progress placeholders spliced into their
+    // final slots (see `build_scroll`).
     let ask_lines = block_ask_spans(snap, cols);
     let in_prog = in_progress_rows(snap);
-    let a = ask_lines.len();
-    let p = in_prog.len();
-    let total = a + p + snap.log_rows.len();
+    let seq = build_scroll(snap, &ask_lines, &in_prog);
+    let total = seq.len();
     let mut log_capacity = 0usize;
     if out.len() < rows && total > 0 {
         let mut avail = rows - out.len();
@@ -311,36 +308,25 @@ pub(crate) fn render_at(
         // still fills.
         let off = offset.min(total.saturating_sub(1));
         let end = (off + avail).min(total);
-        // Align summaries at one column: pad authors to the widest name
-        // among the windowed rows — done reviews AND pending spinners
-        // (ask lines have no author column).
-        let author_width = (off..end)
-            .filter_map(|idx| {
-                if idx < a {
-                    None
-                } else if idx < a + p {
-                    match &in_prog[idx - a] {
-                        InProgress::PendingReview(label) => Some(display_width(label)),
-                        InProgress::MasterWorking => None,
-                    }
-                } else {
-                    match &snap.log_rows[idx - a - p] {
-                        crate::cli::log::OnelineRow::Review { author, .. } => {
-                            Some(display_width(author))
-                        }
-                        _ => None,
-                    }
+        // Align summaries at one column: widest name among the windowed
+        // rows — done reviews AND pending spinners (ask lines / the master
+        // row have no author column).
+        let author_width = seq[off..end]
+            .iter()
+            .filter_map(|s| match s {
+                Seg::Log(crate::cli::log::OnelineRow::Review { author, .. }) => {
+                    Some(display_width(author))
                 }
+                Seg::InProg(InProgress::PendingReview { label, .. }) => Some(display_width(label)),
+                _ => None,
             })
             .max()
             .unwrap_or(0);
-        for idx in off..end {
-            let spans = if idx < a {
-                ask_lines[idx].clone()
-            } else if idx < a + p {
-                in_progress_spans(&in_prog[idx - a], frame, author_width)
-            } else {
-                log_row_spans(&snap.log_rows[idx - a - p], author_width)
+        for s in &seq[off..end] {
+            let spans = match s {
+                Seg::Ask(line) => (*line).clone(),
+                Seg::Log(row) => log_row_spans(row, author_width),
+                Seg::InProg(item) => in_progress_spans(item, frame, author_width),
             };
             out.push(emit(&spans, color, cols));
         }
@@ -420,10 +406,13 @@ fn log_row_spans(row: &crate::cli::log::OnelineRow, author_width: usize) -> Vec<
 /// the TOP of the timeline and carry the only animated glyph on screen.
 enum InProgress {
     /// A registered reviewer who still owes a verdict on the latest
-    /// reviewable commit — a spinner where their ✓/✗ will land.
-    PendingReview(String),
-    /// Master is producing the next commit/revision.
-    MasterWorking,
+    /// reviewable commit — a spinner where their ✓/✗ will land. `verb`
+    /// is the italic wait-text ("reviewing" / "gate-reviewing").
+    PendingReview { label: String, verb: &'static str },
+    /// Master is producing the next commit — a spinner where that commit
+    /// will land. `verb` says which (working/revising/committing/
+    /// finalizing) via [`verb_of`].
+    MasterWorking { name: String, verb: &'static str },
 }
 
 /// The braille spinner cycle — width-1 glyphs so it drops into the
@@ -435,25 +424,36 @@ fn spinner_glyph(frame: usize) -> &'static str {
     SPINNER[frame % SPINNER.len()]
 }
 
-/// In-progress rows for the active plan, top-of-timeline order. Derived
-/// from `WaitingOn`: pending reviewers get a spinner row each; a master
-/// actively producing the next commit gets a single working row. Empty
-/// for multi-plan, idle, blocked, or finalize/fix states (nothing is
-/// being actively produced). Pure — unit-tested.
+/// In-progress rows for the active plan. THE INVARIANT: whenever the gate
+/// is waiting on an agent to produce something, emit a placeholder for it.
+/// Pending reviewers each get a spinner row; any master-producing state —
+/// incl. `MasterToFinalize` (the finish commit) — gets one master row.
+/// Excluded: `Blocked` (a human's turn, shown by the block ask) and
+/// `MasterToFixCommitTag` (surfaced by the `fix` gauge). The match is
+/// exhaustive (no catch-all) so a new producing state can't silently slip
+/// through without a placeholder. Pure — unit-tested.
 fn in_progress_rows(snap: &StatusSnapshot) -> Vec<InProgress> {
     let [v] = snap.plans.as_slice() else {
         return Vec::new();
     };
+    let verb = verb_of(&v.waiting_on);
     match &v.waiting_on {
         WaitingOn::ReviewerApprovalsMissing { missing }
         | WaitingOn::GateReviewersMissing { missing } => missing
             .iter()
-            .map(|l| InProgress::PendingReview(l.as_str().to_string()))
+            .map(|l| InProgress::PendingReview {
+                label: l.as_str().to_string(),
+                verb,
+            })
             .collect(),
         WaitingOn::MasterToContinue
         | WaitingOn::MasterToRevise { .. }
-        | WaitingOn::MasterToCommit => vec![InProgress::MasterWorking],
-        _ => Vec::new(),
+        | WaitingOn::MasterToCommit
+        | WaitingOn::MasterToFinalize => vec![InProgress::MasterWorking {
+            name: snap.master.as_deref().unwrap_or("master").to_string(),
+            verb,
+        }],
+        WaitingOn::Blocked { .. } | WaitingOn::MasterToFixCommitTag => Vec::new(),
     }
 }
 
@@ -463,7 +463,7 @@ fn in_progress_rows(snap: &StatusSnapshot) -> Vec<InProgress> {
 /// italic "working…" and a leading spinner for liveness.
 fn in_progress_spans(item: &InProgress, frame: usize, author_width: usize) -> Vec<Span> {
     match item {
-        InProgress::PendingReview(label) => {
+        InProgress::PendingReview { label, verb } => {
             let mark = spinner_glyph(frame);
             let after_mark = MARK_FIELD.saturating_sub(display_width(mark)) + 1;
             let author_pad = author_width.saturating_sub(display_width(label));
@@ -472,15 +472,84 @@ fn in_progress_spans(item: &InProgress, frame: usize, author_width: usize) -> Ve
                 dim(mark.to_string()),
                 plain(" ".repeat(after_mark)),
                 dim(format!("{label}{}", " ".repeat(author_pad))),
-                dim(" reviewing…".to_string()),
+                // The wait-verb is what's italic — "what we await".
+                Span(Style::Italic, format!(" {verb}…")),
             ]
         }
-        InProgress::MasterWorking => vec![
+        InProgress::MasterWorking { name, verb } => vec![
             dim(format!("{} ", spinner_glyph(frame))),
             dim("------- ".to_string()),
-            Span(Style::Italic, "working…".to_string()),
+            dim(format!("{name} ")),
+            Span(Style::Italic, format!("{verb}…")),
         ],
     }
+}
+
+/// One row of scrollable content: a wrapped block-ask line, a historical
+/// log row, or a live in-progress placeholder.
+enum Seg<'a> {
+    Ask(&'a Vec<Span>),
+    Log(&'a crate::cli::log::OnelineRow),
+    InProg(&'a InProgress),
+}
+
+/// The scrollable sequence: ask lines, then the log with in-progress
+/// placeholders SPLICED into their final slots — a master row right after
+/// the active plan's umbrella header (its next commit), pending reviews
+/// into the latest reviewable commit's review block (above that commit).
+/// So each placeholder sits exactly where its real row will appear and is
+/// replaced in place when the work lands. Pure, and the SINGLE source of
+/// both the rendered order and the in-progress indices the tick checks.
+fn build_scroll<'a>(
+    snap: &'a StatusSnapshot,
+    ask_lines: &'a [Vec<Span>],
+    in_prog: &'a [InProgress],
+) -> Vec<Seg<'a>> {
+    use crate::cli::log::OnelineRow;
+    let mut seq: Vec<Seg> = ask_lines.iter().map(Seg::Ask).collect();
+
+    let master: Vec<&InProgress> = in_prog
+        .iter()
+        .filter(|r| matches!(r, InProgress::MasterWorking { .. }))
+        .collect();
+    let reviews: Vec<&InProgress> = in_prog
+        .iter()
+        .filter(|r| matches!(r, InProgress::PendingReview { .. }))
+        .collect();
+    let active = snap.plans.first();
+    let active_stem = active.map(|v| v.plan.as_str());
+    let review_sha = active.and_then(|v| v.sha.as_ref());
+
+    let mut master_done = false;
+    let mut reviews_done = false;
+    for row in &snap.log_rows {
+        match row {
+            OnelineRow::Header { plan }
+                if !master_done && !master.is_empty() && plan.as_deref() == active_stem =>
+            {
+                seq.push(Seg::Log(row));
+                seq.extend(master.iter().map(|m| Seg::InProg(m)));
+                master_done = true;
+            }
+            OnelineRow::Commit { sha, .. }
+                if !reviews_done && !reviews.is_empty() && review_sha == Some(sha) =>
+            {
+                seq.extend(reviews.iter().map(|r| Seg::InProg(r)));
+                reviews_done = true;
+                seq.push(Seg::Log(row));
+            }
+            _ => seq.push(Seg::Log(row)),
+        }
+    }
+    // Anchor not found (e.g. no commit yet) → still show the placeholder
+    // so a waiting state is never invisible.
+    if !master_done {
+        seq.extend(master.iter().map(|m| Seg::InProg(m)));
+    }
+    if !reviews_done {
+        seq.extend(reviews.iter().map(|r| Seg::InProg(r)));
+    }
+    seq
 }
 
 /// Wrapped lines for every pending (unanswered) block ask, with the
@@ -1439,13 +1508,13 @@ pub(crate) async fn run_tui(
         let (rows, cols) = term_size();
         let capacity = render_at(&snapshot, rows, cols, offset, frame).1;
 
-        // Scrollable content = block-ask lines + in-progress rows + log.
-        // The ask/in-progress rows depend on blocks/waiting_on (not the
-        // log fetch), so compute them before filling. In-progress rows
-        // sit at indices [ask .. ask+in_prog).
-        let ask = block_ask_spans(&snapshot, cols as usize).len();
-        let in_prog = in_progress_rows(&snapshot).len();
-        let head = ask + in_prog;
+        // The ask + in-progress rows depend on blocks/waiting_on (not the
+        // log fetch), so compute them before filling. `head` is the count
+        // of scrollable rows that aren't log rows (ask lines + in-progress
+        // placeholders); the total scrollable length is head + log.
+        let ask_lines = block_ask_spans(&snapshot, cols as usize);
+        let in_prog = in_progress_rows(&snapshot);
+        let head = ask_lines.len() + in_prog.len();
 
         // Load enough log to fill the viewport AT this scroll position.
         // Gated on `needs_fill` so an animation tick never reaches it.
@@ -1467,10 +1536,15 @@ pub(crate) async fn run_tui(
         offset = offset.min(max_off);
         paint(&render_at(&snapshot, rows, cols, offset, frame).0);
 
-        // A spinner row is on screen iff the in-progress band
-        // [ask, ask+in_prog) intersects the window [offset, offset+cap).
-        // Only then is there anything to animate, so only then do we tick.
-        let spinner_visible = in_prog > 0 && offset < ask + in_prog && offset + capacity > ask;
+        // The in-progress rows now sit at SCATTERED indices (master after
+        // the plan header; reviews in the latest commit's review block), so
+        // ask `build_scroll` (the same arrangement render uses) for their
+        // positions and tick iff ANY of them is within the window.
+        let win = offset..offset + capacity;
+        let spinner_visible = build_scroll(&snapshot, &ask_lines, &in_prog)
+            .iter()
+            .enumerate()
+            .any(|(i, s)| matches!(s, Seg::InProg(_)) && win.contains(&i));
         let wait = if spinner_visible {
             Duration::from_millis(120)
         } else {
@@ -1573,19 +1647,31 @@ pub(crate) mod tests {
 
     #[test]
     fn in_progress_rows_derive_from_waiting_on() {
-        // Pending reviewers → one spinner row each.
+        // Pending reviewers → one spinner row each, verb "reviewing".
         let s = snap(vec![plan_state("foo", reviewer_missing("codex"))], vec![]);
-        assert!(
-            matches!(in_progress_rows(&s).as_slice(), [InProgress::PendingReview(l)] if l == "codex")
-        );
-        // Master producing the next commit → one working row.
+        assert!(matches!(
+            in_progress_rows(&s).as_slice(),
+            [InProgress::PendingReview { label, verb }] if label == "codex" && *verb == "reviewing"
+        ));
+        // Master producing the next commit → one master row, per-state verb.
         let s = snap(vec![plan_state("foo", WaitingOn::MasterToContinue)], vec![]);
         assert!(matches!(
             in_progress_rows(&s).as_slice(),
-            [InProgress::MasterWorking]
+            [InProgress::MasterWorking { verb, .. }] if *verb == "continuing"
         ));
-        // Nothing actively produced (just needs to run finish) → none.
+        // FLIP (reproduce-first): finalizing IS making the finish commit,
+        // so it now produces a master row — shipped M2 wrongly returned
+        // none for MasterToFinalize.
         let s = snap(vec![plan_state("foo", WaitingOn::MasterToFinalize)], vec![]);
+        assert!(matches!(
+            in_progress_rows(&s).as_slice(),
+            [InProgress::MasterWorking { verb, .. }] if *verb == "finalizing"
+        ));
+        // MasterToFixCommitTag → surfaced by the `fix` gauge, no spinner.
+        let s = snap(
+            vec![plan_state("foo", WaitingOn::MasterToFixCommitTag)],
+            vec![],
+        );
         assert!(in_progress_rows(&s).is_empty());
     }
 
@@ -1595,15 +1681,97 @@ pub(crate) mod tests {
         let out = render(&s, 40, 80).join("\n");
         assert!(out.contains(SPINNER[0]), "frame-0 spinner glyph shown");
         assert!(out.contains("codex"), "reviewer named");
-        assert!(out.contains("reviewing"), "in-progress label");
+        assert!(out.contains("reviewing"), "italic wait-verb");
     }
 
     #[test]
-    fn master_working_row_shows_dashes_and_working() {
+    fn master_row_shows_dashes_name_and_per_state_verb() {
         let s = snap(vec![plan_state("foo", WaitingOn::MasterToContinue)], vec![]);
         let out = render(&s, 40, 80).join("\n");
         assert!(out.contains("-------"), "dashes where the sha would be");
-        assert!(out.contains("working"), "italic working label");
+        assert!(out.contains("continuing"), "per-state italic verb");
+        // The finalizing case (the gap M2 missed): master named + verb.
+        let mut s = snap(vec![plan_state("foo", WaitingOn::MasterToFinalize)], vec![]);
+        s.master = Some("claude".into());
+        let out = render(&s, 40, 80).join("\n");
+        assert!(out.contains("claude"), "master named");
+        assert!(out.contains("finalizing"), "finalizing verb shown");
+    }
+
+    // A log of [Header(foo), Commit(latest reviewable sha)] for the active
+    // plan `foo`, used to check WHERE placeholders get spliced.
+    fn snap_with_header_and_commit(waiting: WaitingOn) -> StatusSnapshot {
+        use crate::cli::log::OnelineRow;
+        let mut s = snap(vec![plan_state("foo", waiting)], vec![]);
+        let sha = s.plans[0].sha.clone().unwrap();
+        s.log_rows = vec![
+            OnelineRow::Header {
+                plan: Some("foo".into()),
+            },
+            OnelineRow::Commit {
+                sha,
+                subject: "do a thing".into(),
+            },
+        ];
+        s
+    }
+
+    fn seg_kind(s: &Seg) -> &'static str {
+        use crate::cli::log::OnelineRow;
+        match s {
+            Seg::Ask(_) => "ask",
+            Seg::Log(OnelineRow::Header { .. }) => "header",
+            Seg::Log(OnelineRow::Commit { .. }) => "commit",
+            Seg::Log(_) => "log",
+            Seg::InProg(_) => "inprog",
+        }
+    }
+
+    #[test]
+    fn placeholders_inject_under_the_plan_not_at_the_top() {
+        // Review placeholder lands in the latest commit's review block:
+        // header, THEN the spinner, THEN the commit — under the plan,
+        // never floating at index 0.
+        let s = snap_with_header_and_commit(reviewer_missing("codex"));
+        let ask = block_ask_spans(&s, 80);
+        let inp = in_progress_rows(&s);
+        let kinds: Vec<&str> = build_scroll(&s, &ask, &inp).iter().map(seg_kind).collect();
+        assert_eq!(
+            kinds,
+            ["header", "inprog", "commit"],
+            "review under the plan"
+        );
+
+        // Master placeholder lands right after the plan header (its next
+        // commit), above the latest commit.
+        let s = snap_with_header_and_commit(WaitingOn::MasterToContinue);
+        let ask = block_ask_spans(&s, 80);
+        let inp = in_progress_rows(&s);
+        let kinds: Vec<&str> = build_scroll(&s, &ask, &inp).iter().map(seg_kind).collect();
+        assert_eq!(
+            kinds,
+            ["header", "inprog", "commit"],
+            "master under the header"
+        );
+    }
+
+    #[test]
+    fn tick_visibility_tracks_scattered_index() {
+        // The in-progress row sits at index 1 (after the header), NOT 0.
+        let s = snap_with_header_and_commit(WaitingOn::MasterToContinue);
+        let ask = block_ask_spans(&s, 80);
+        let inp = in_progress_rows(&s);
+        let seq = build_scroll(&s, &ask, &inp);
+        let visible = |off: usize, cap: usize| {
+            seq.iter()
+                .enumerate()
+                .any(|(i, sg)| matches!(sg, Seg::InProg(_)) && (off..off + cap).contains(&i))
+        };
+        assert!(visible(0, 3), "in view from the top");
+        assert!(
+            !visible(5, 2),
+            "scrolled past the placeholder → not in view"
+        );
     }
 
     pub(crate) fn plan_state(stem: &str, waiting_on: WaitingOn) -> PlanWorkState {
@@ -2418,7 +2586,11 @@ terminal_3  terminal  ruthless (reviewer)
         // A long ask overflows a short pane; the tail must be reachable by
         // scrolling (it's scrollable content, not a clipped fixed header).
         let q = "AAAA BBBB CCCC DDDD EEEE FFFF GGGG HHHH IIII JJJJ KKKK LAST";
-        let mut s = snap(vec![plan_state("foo", WaitingOn::MasterToFinalize)], vec![]);
+        // FixCommitTag → no in-progress row, so this isolates ask scrolling.
+        let mut s = snap(
+            vec![plan_state("foo", WaitingOn::MasterToFixCommitTag)],
+            vec![],
+        );
         s.blocks = vec![crate::cli::block::BlockEntry {
             agent: "claude".into(),
             name: "q".into(),
@@ -2438,7 +2610,10 @@ terminal_3  terminal  ruthless (reviewer)
 
     #[test]
     fn no_pending_block_reserves_no_ask_space() {
-        let s = snap(vec![plan_state("foo", WaitingOn::MasterToFinalize)], vec![]);
+        let s = snap(
+            vec![plan_state("foo", WaitingOn::MasterToFixCommitTag)],
+            vec![],
+        );
         assert!(
             block_ask_spans(&s, 60).is_empty(),
             "no pending block → no ask rows"
@@ -2491,9 +2666,12 @@ mod log_tier_tests {
     }
 
     fn snap_with_log(subjects: &[&str]) -> StatusSnapshot {
-        // MasterToFinalize → no in-progress timeline row, so these tests
-        // isolate LOG layout (in-progress rows are covered separately).
-        let mut s = snap(vec![plan_state("foo", WaitingOn::MasterToFinalize)], vec![]);
+        // MasterToFixCommitTag → no in-progress timeline row, so these
+        // tests isolate LOG layout (in-progress rows covered separately).
+        let mut s = snap(
+            vec![plan_state("foo", WaitingOn::MasterToFixCommitTag)],
+            vec![],
+        );
         s.log_rows = subjects.iter().map(|l| commit_row(l)).collect();
         s
     }
@@ -2618,9 +2796,12 @@ mod log_tier_tests {
             author: author.into(),
             summary: "why".into(),
         };
-        // MasterToFinalize → no in-progress row; this test isolates the
-        // alignment of review marks against shas.
-        let mut s = snap(vec![plan_state("foo", WaitingOn::MasterToFinalize)], vec![]);
+        // MasterToFixCommitTag → no in-progress row; this test isolates
+        // the alignment of review marks against shas.
+        let mut s = snap(
+            vec![plan_state("foo", WaitingOn::MasterToFixCommitTag)],
+            vec![],
+        );
         s.log_rows = vec![
             commit_row("intro"),
             review(Verdict::Approve, "codex"), // ✓  (1-wide mark, mid name)
