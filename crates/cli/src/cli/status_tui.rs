@@ -65,6 +65,9 @@ enum Style {
     /// fixed bold + dark-grey-background SGR so a plan name reads as
     /// a section divider (tui-log-plan-highlight-align).
     Highlight,
+    /// Italic — the master "working…" in-progress row
+    /// (status-timeline-progress).
+    Italic,
 }
 
 struct Span(Style, String);
@@ -138,6 +141,7 @@ pub(crate) fn render_at(
     rows: u16,
     cols: u16,
     offset: usize,
+    frame: usize,
 ) -> (Vec<String>, usize) {
     let rows = rows.max(1) as usize;
     let cols = cols.max(1) as usize;
@@ -293,32 +297,46 @@ pub(crate) fn render_at(
     // line styled per row kind + display-width truncated via the
     // same emit path as the gauges. A blank separator when there's
     // room for it plus at least one line.
+    // The timeline = live in-progress rows (top) then the historical
+    // log. `offset` windows the COMBINED sequence so in-progress rows
+    // scroll like any other (and go off-screen when scrolled past).
+    let in_prog = in_progress_rows(snap);
+    let total = in_prog.len() + snap.log_rows.len();
     let mut log_capacity = 0usize;
-    if out.len() < rows && !snap.log_rows.is_empty() {
+    if out.len() < rows && total > 0 {
         let mut avail = rows - out.len();
         if avail >= 2 {
             out.push(String::new());
             avail -= 1;
         }
         log_capacity = avail;
-        // Window into the log starting `offset` rows
-        // down from newest, clamped so the last page still fills.
-        let len = snap.log_rows.len();
-        let off = offset.min(len.saturating_sub(1));
-        let end = (off + avail).min(len);
-        let shown = &snap.log_rows[off..end];
-        // Align every summary at one column: pad authors to the widest
-        // among the rows actually shown.
-        let author_width = shown
-            .iter()
-            .filter_map(|r| match r {
-                crate::cli::log::OnelineRow::Review { author, .. } => Some(display_width(author)),
-                _ => None,
+        // Window into the timeline starting `offset` rows down from
+        // newest, clamped so the last page still fills.
+        let off = offset.min(total.saturating_sub(1));
+        let end = (off + avail).min(total);
+        // Align summaries at one column: pad authors to the widest name
+        // among the windowed rows — done reviews AND pending spinners.
+        let author_width = (off..end)
+            .filter_map(|idx| match idx.checked_sub(in_prog.len()) {
+                Some(li) => match &snap.log_rows[li] {
+                    crate::cli::log::OnelineRow::Review { author, .. } => {
+                        Some(display_width(author))
+                    }
+                    _ => None,
+                },
+                None => match &in_prog[idx] {
+                    InProgress::PendingReview(label) => Some(display_width(label)),
+                    InProgress::MasterWorking => None,
+                },
             })
             .max()
             .unwrap_or(0);
-        for row in shown {
-            out.push(emit(&log_row_spans(row, author_width), color, cols));
+        for idx in off..end {
+            let spans = match idx.checked_sub(in_prog.len()) {
+                Some(li) => log_row_spans(&snap.log_rows[li], author_width),
+                None => in_progress_spans(&in_prog[idx], frame, author_width),
+            };
+            out.push(emit(&spans, color, cols));
         }
     }
     (out, log_capacity)
@@ -328,7 +346,7 @@ pub(crate) fn render_at(
 /// tests exercise. Test-only; the live loop calls [`render_at`] directly.
 #[cfg(test)]
 fn render(snap: &StatusSnapshot, rows: u16, cols: u16) -> Vec<String> {
-    render_at(snap, rows, cols, 0).0
+    render_at(snap, rows, cols, 0, 0).0
 }
 
 /// Widest verdict mark in display columns: `✓✓` (Finished) is 2,
@@ -388,6 +406,74 @@ fn log_row_spans(row: &crate::cli::log::OnelineRow, author_width: usize) -> Vec<
                 plain(snip),
             ]
         }
+    }
+}
+
+/// A live, in-flight timeline row synthesized from the active plan's
+/// `WaitingOn` (NOT from `log_rows`, which is historical). These sit at
+/// the TOP of the timeline and carry the only animated glyph on screen.
+enum InProgress {
+    /// A registered reviewer who still owes a verdict on the latest
+    /// reviewable commit — a spinner where their ✓/✗ will land.
+    PendingReview(String),
+    /// Master is producing the next commit/revision.
+    MasterWorking,
+}
+
+/// The braille spinner cycle — width-1 glyphs so it drops into the
+/// verdict-mark column without disturbing alignment. One moving element,
+/// per the design brief.
+const SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
+
+fn spinner_glyph(frame: usize) -> &'static str {
+    SPINNER[frame % SPINNER.len()]
+}
+
+/// In-progress rows for the active plan, top-of-timeline order. Derived
+/// from `WaitingOn`: pending reviewers get a spinner row each; a master
+/// actively producing the next commit gets a single working row. Empty
+/// for multi-plan, idle, blocked, or finalize/fix states (nothing is
+/// being actively produced). Pure — unit-tested.
+fn in_progress_rows(snap: &StatusSnapshot) -> Vec<InProgress> {
+    let [v] = snap.plans.as_slice() else {
+        return Vec::new();
+    };
+    match &v.waiting_on {
+        WaitingOn::ReviewerApprovalsMissing { missing }
+        | WaitingOn::GateReviewersMissing { missing } => missing
+            .iter()
+            .map(|l| InProgress::PendingReview(l.as_str().to_string()))
+            .collect(),
+        WaitingOn::MasterToContinue
+        | WaitingOn::MasterToRevise { .. }
+        | WaitingOn::MasterToCommit => vec![InProgress::MasterWorking],
+        _ => Vec::new(),
+    }
+}
+
+/// Spans for one in-progress row. The pending spinner sits in the SAME
+/// verdict-mark column as finished reviews (so done and in-flight align);
+/// the master row mirrors a commit row (`-------` under the shas) with an
+/// italic "working…" and a leading spinner for liveness.
+fn in_progress_spans(item: &InProgress, frame: usize, author_width: usize) -> Vec<Span> {
+    match item {
+        InProgress::PendingReview(label) => {
+            let mark = spinner_glyph(frame);
+            let after_mark = MARK_FIELD.saturating_sub(display_width(mark)) + 1;
+            let author_pad = author_width.saturating_sub(display_width(label));
+            vec![
+                plain("  ".to_string()),
+                dim(mark.to_string()),
+                plain(" ".repeat(after_mark)),
+                dim(format!("{label}{}", " ".repeat(author_pad))),
+                dim(" reviewing…".to_string()),
+            ]
+        }
+        InProgress::MasterWorking => vec![
+            dim(format!("{} ", spinner_glyph(frame))),
+            dim("------- ".to_string()),
+            Span(Style::Italic, "working…".to_string()),
+        ],
     }
 }
 
@@ -770,6 +856,7 @@ fn emit(spans: &[Span], color: &str, cols: usize) -> String {
             // OSC 8 hyperlink: ESC ] 8 ; ; <url> ST <text> ESC ] 8 ; ; ST
             Style::Link(url) => out.push_str(&format!("\x1b]8;;{url}\x1b\\{piece}\x1b]8;;\x1b\\")),
             Style::Highlight => out.push_str(&format!("\x1b[1;48;5;238m{piece}\x1b[0m")),
+            Style::Italic => out.push_str(&format!("\x1b[3m{piece}\x1b[0m")),
         }
         if truncated_here {
             break;
@@ -1314,26 +1401,52 @@ pub(crate) async fn run_tui(
     let mut snapshot =
         StatusSnapshot::build_async(&repo, &basename, home.as_deref(), policy, None, true).await?;
     let mut offset: usize = 0;
+    // Spinner animation frame. The ONLY state an animation tick mutates.
+    let mut frame: usize = 0;
+    // Whether this iteration may do IO to top up the log. Set ONLY by
+    // scroll (Key) and data-change (Refresh) — NEVER by an animation
+    // tick. This is the structural guarantee that a tick is a pure
+    // repaint: with `needs_fill == false` the fill block (the only IO in
+    // the loop body besides the Refresh arm) is skipped entirely.
+    let mut needs_fill = true;
     loop {
         let (rows, cols) = term_size();
-        let capacity = render_at(&snapshot, rows, cols, offset).1;
+        let capacity = render_at(&snapshot, rows, cols, offset, frame).1;
 
         // Load enough log to fill the viewport AT this scroll position.
-        while !log_complete && snapshot.log_rows.len() < offset + capacity {
-            log_window += capacity.max(1);
-            let before = snapshot.log_rows.len();
-            snapshot.log_rows = crate::cli::status::tui_log_rows(&repo, log_window).await;
-            if snapshot.log_rows.len() == before {
-                log_complete = true; // hit the root — stop growing
+        // Gated on `needs_fill` so an animation tick never reaches it.
+        if needs_fill {
+            while !log_complete && snapshot.log_rows.len() < offset + capacity {
+                log_window += capacity.max(1);
+                let before = snapshot.log_rows.len();
+                snapshot.log_rows = crate::cli::status::tui_log_rows(&repo, log_window).await;
+                if snapshot.log_rows.len() == before {
+                    log_complete = true; // hit the root — stop growing
+                }
             }
+            needs_fill = false;
         }
 
+        // The timeline length includes the live in-progress rows that sit
+        // above the log.
+        let in_prog = in_progress_rows(&snapshot).len();
+        let total = in_prog + snapshot.log_rows.len();
         // Max offset pins the last row at the BOTTOM of the viewport.
-        let max_off = snapshot.log_rows.len().saturating_sub(capacity.max(1));
+        let max_off = total.saturating_sub(capacity.max(1));
         offset = offset.min(max_off);
-        paint(&render_at(&snapshot, rows, cols, offset).0);
+        paint(&render_at(&snapshot, rows, cols, offset, frame).0);
 
-        match ev_rx.recv_timeout(Duration::from_secs(60)) {
+        // An in-progress (spinner) row is on screen iff one of the
+        // top-of-timeline in-progress rows is within the window. Only
+        // then is there anything to animate, so only then do we tick.
+        let spinner_visible = in_prog > 0 && offset < in_prog;
+        let wait = if spinner_visible {
+            Duration::from_millis(120)
+        } else {
+            Duration::from_secs(60)
+        };
+
+        match ev_rx.recv_timeout(wait) {
             // Keys only move the viewport; the loop top loads more if the
             // new position needs it.
             Ok(Ev::Key(k)) => {
@@ -1347,6 +1460,7 @@ pub(crate) async fn run_tui(
                     Key::Top => offset = 0,
                     Key::Bottom => offset = max_off,
                 }
+                needs_fill = true;
             }
             Ok(Ev::Refresh) => {
                 snapshot = StatusSnapshot::build_async(
@@ -1362,12 +1476,19 @@ pub(crate) async fn run_tui(
                 // case history grew; the loop top tops up the viewport.
                 snapshot.log_rows = crate::cli::status::tui_log_rows(&repo, log_window).await;
                 log_complete = false;
+                needs_fill = true;
                 if let Some(tab) = tab.as_mut() {
                     tab.update(&bar_emoji(&snapshot));
                 }
                 if let Some(panes) = panes.as_mut() {
                     panes.update(&snapshot);
                 }
+            }
+            // Animation tick: advance the frame ONLY. `needs_fill` stays
+            // false, so the next iteration is a PURE repaint — render_at
+            // (pure) + paint — with zero disk/git/zellij work.
+            Err(mpsc::RecvTimeoutError::Timeout) if spinner_visible => {
+                frame = frame.wrapping_add(1);
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -1408,6 +1529,50 @@ pub(crate) mod tests {
             .collect();
         assert_eq!(csi, want_csi, "arrows + page keys");
         assert!(parse_keys(b"xyz").is_empty(), "unmapped bytes are ignored");
+    }
+
+    #[test]
+    fn spinner_glyph_cycles_and_is_width_one() {
+        assert_eq!(spinner_glyph(0), spinner_glyph(SPINNER.len()), "wraps");
+        assert_ne!(spinner_glyph(0), spinner_glyph(1), "advances");
+        for f in 0..SPINNER.len() {
+            assert_eq!(display_width(spinner_glyph(f)), 1, "fits the mark column");
+        }
+    }
+
+    #[test]
+    fn in_progress_rows_derive_from_waiting_on() {
+        // Pending reviewers → one spinner row each.
+        let s = snap(vec![plan_state("foo", reviewer_missing("codex"))], vec![]);
+        assert!(
+            matches!(in_progress_rows(&s).as_slice(), [InProgress::PendingReview(l)] if l == "codex")
+        );
+        // Master producing the next commit → one working row.
+        let s = snap(vec![plan_state("foo", WaitingOn::MasterToContinue)], vec![]);
+        assert!(matches!(
+            in_progress_rows(&s).as_slice(),
+            [InProgress::MasterWorking]
+        ));
+        // Nothing actively produced (just needs to run finish) → none.
+        let s = snap(vec![plan_state("foo", WaitingOn::MasterToFinalize)], vec![]);
+        assert!(in_progress_rows(&s).is_empty());
+    }
+
+    #[test]
+    fn pending_review_row_shows_spinner_name_and_reviewing() {
+        let s = snap(vec![plan_state("foo", reviewer_missing("codex"))], vec![]);
+        let out = render(&s, 40, 80).join("\n");
+        assert!(out.contains(SPINNER[0]), "frame-0 spinner glyph shown");
+        assert!(out.contains("codex"), "reviewer named");
+        assert!(out.contains("reviewing"), "in-progress label");
+    }
+
+    #[test]
+    fn master_working_row_shows_dashes_and_working() {
+        let s = snap(vec![plan_state("foo", WaitingOn::MasterToContinue)], vec![]);
+        let out = render(&s, 40, 80).join("\n");
+        assert!(out.contains("-------"), "dashes where the sha would be");
+        assert!(out.contains("working"), "italic working label");
     }
 
     pub(crate) fn plan_state(stem: &str, waiting_on: WaitingOn) -> PlanWorkState {
@@ -2103,8 +2268,10 @@ terminal_3  terminal  ruthless (reviewer)
         assert_eq!(texts[2], " gate  unreviewed @ abc1230");
         assert_eq!(texts[3], " next  q1");
         assert_eq!(texts[4], "  git  master deadbee");
-        // No body line repeats the actor or the plan stem.
-        for t in &texts[1..] {
+        // No GAUGE line repeats the actor or the plan stem (the timeline
+        // below legitimately names a pending reviewer, so scope the check
+        // to the gauge cluster).
+        for t in &texts[1..5] {
             assert!(!t.contains("codex") && !t.contains("foo"), "repeat: `{t}`");
         }
     }
@@ -2253,7 +2420,9 @@ mod log_tier_tests {
     }
 
     fn snap_with_log(subjects: &[&str]) -> StatusSnapshot {
-        let mut s = snap(vec![plan_state("foo", reviewer_missing("codex"))], vec![]);
+        // MasterToFinalize → no in-progress timeline row, so these tests
+        // isolate LOG layout (in-progress rows are covered separately).
+        let mut s = snap(vec![plan_state("foo", WaitingOn::MasterToFinalize)], vec![]);
         s.log_rows = subjects.iter().map(|l| commit_row(l)).collect();
         s
     }
@@ -2265,14 +2434,14 @@ mod log_tier_tests {
         ];
         let s = snap_with_log(&subs);
         // Tall pane: capacity covers the whole log; newest shown at top.
-        let (lines, cap) = render_at(&s, 40, 80, 0);
+        let (lines, cap) = render_at(&s, 40, 80, 0, 0);
         assert!(cap >= subs.len(), "viewport capacity reported");
         assert!(
             lines.join("\n").contains("row-aa"),
             "newest at top, offset 0"
         );
         // Scrolled down: the newest rows leave the window, older ones enter.
-        let body = render_at(&s, 40, 80, 3).0.join("\n");
+        let body = render_at(&s, 40, 80, 3, 0).0.join("\n");
         assert!(
             !body.contains("row-aa"),
             "offset 3 scrolled past the newest"
@@ -2378,7 +2547,9 @@ mod log_tier_tests {
             author: author.into(),
             summary: "why".into(),
         };
-        let mut s = snap(vec![plan_state("foo", reviewer_missing("codex"))], vec![]);
+        // MasterToFinalize → no in-progress row; this test isolates the
+        // alignment of review marks against shas.
+        let mut s = snap(vec![plan_state("foo", WaitingOn::MasterToFinalize)], vec![]);
         s.log_rows = vec![
             commit_row("intro"),
             review(Verdict::Approve, "codex"), // ✓  (1-wide mark, mid name)
