@@ -33,31 +33,103 @@ mechanics. It has also drifted from the roster model.
   is the implementer's call; the invariant is one source per role with
   tool bits substituted (a `compose_skill(role, tool) -> String`).
 
-## Skill content
+## Invariants the skills MUST encode (the heart of this work)
 
-**clank-master** (`description`: you are the MASTER in a clank repo):
-- the master loop: take wfw work → implement plan milestones → commit
-  per milestone → address review feedback.
-- queue promote (EVALUATE readiness, don't blind-promote), plan
-  authoring/rescoping, `clank finish`, shelve / unshelve / `purge
-  --drop`.
-- roster management: `clank agent add` / `remove` / `set-master` /
-  `list` (NEW — currently undocumented anywhere).
-- blocks (ask the human when contentious / drifting from intent).
-- understands verdicts as INPUT (reads feedback, acts on gate state) but
-  never WRITES them.
+The loops — not the command list — are what agents get wrong today. Each
+role body MUST lead with its invariants, MUST/MUST-NOT/STOP-style (caps
+for the hard rules, imperative, no hedging — see best practices below).
 
-**clank-reviewer** (`description`: you are a REVIEWER in a clank repo):
-- the reviewer loop: take wfw work → review the commit → run the exact
-  `clank feedback write --commit <sha> --verdict … -m "…"`.
-- the verdict semantics (APPROVE / FINISHED / REQUEST_CHANGES) — today
-  the bulk of the shared file — live HERE.
-- never runs finish / promote / roster commands.
+### Shared (both roles)
+- Bind once: `clank as <label>` at session start. Role is ROSTER-derived
+  — you are master/reviewer because the repo roster says so, not a flag.
+- Act on Stop-hook work IMMEDIATELY, then YIELD. NEVER manually poll
+  (`clank wfw` / `status` in a loop) — the Stop hook re-invokes you when
+  there is work. You WILL be woken; do not spin.
+- Load ONLY the skill for your role; do not follow the other role's
+  instructions.
+
+### Master — the commit→yield loop (THE central invariant, currently undocumented)
+- After you COMMIT ANYTHING, STOP and yield to the Stop hook for review.
+  This includes an implementation milestone, a plan revision, AND
+  PROMOTING A PLAN FROM THE QUEUE (promotion is a plan commit that must
+  clear intro review). Do NOT keep working past a commit — you will be
+  woken when the gate has acted.
+- NEVER run `clank finish` on your own judgment. Finalize ONLY when the
+  Stop hook hands you a finalize item (the gate reached FINISHED).
+- Gate on REVIEWERS, not humans. The queue is an instruction, not a
+  question — never block the queue to ask permission to do queued work.
+  Use `clank block` only when reviews are contentious, the plan is
+  drifting from intent, or the work seems unwise.
+- EVALUATE a queue item before promoting (read it, rescope/split if
+  needed); promote only when ready — then it is a commit, so yield.
+- On REQUEST_CHANGES: address it, commit, yield.
+- You never WRITE verdicts; you read feedback and act on gate state.
+
+### Reviewer — scope and the verdict
+- You review ONLY committable artifacts — code, tests, docs in the repo.
+  That is the ENTIRE scope of your verdict.
+- NEVER withhold APPROVE or FINISHED waiting on a manual/external action
+  a plan lists as a verification step (a human smoke test, an on-device
+  check, a deploy). You cannot observe it and the workflow has no signal
+  for its completion — blocking on it stalls the plan forever. If the
+  committable work is complete and correct, that is FINISHED **even if a
+  human still has to smoke-test it**. (Surfacing external steps to the
+  human is the master's concern, never your gate.)
+- Write exactly ONE verdict via the exact `clank feedback write --commit
+  <sha> --verdict … -m "…"`, then YIELD — you'll be woken for the next.
+- Review ARCHITECTURE-FIRST. When you find several issues, step back and
+  ask whether they are SYMPTOMS of one wrong/missing model. If so, LEAD
+  with the architectural mismatch — name the violated invariant and the
+  structural change that makes the whole class of bugs hard to write —
+  instead of listing the symptoms. A structural fix beats a symptom
+  list. (Cite files/lines, but don't let line-level nits bury the real
+  issue.)
+- You never run finish / promote / roster / plan-authoring commands.
+
+## Skill content (inventory per role)
+
+**clank-master**: the master invariants above + the commands only a
+master runs — `queue promote`, plan authoring/rescoping, `clank finish`,
+`shelve` / `unshelve` / `purge --drop`, roster management (`clank agent
+add` / `remove` / `set-master` / `list` — NEW, currently undocumented
+anywhere), and `clank block`. Verdicts appear only as INPUT it reads.
+
+**clank-reviewer**: the reviewer invariants above + `clank feedback
+write` and the verdict semantics (APPROVE = good, mid-flight / FINISHED =
+the committable work the plan DESCRIBES is complete & merge-ready, NOT
+"plan text written" / REQUEST_CHANGES = something committable must
+change). Today these verdict definitions are the bulk of the shared
+file; they live HERE now.
 
 **shared core** (both): clank intro; `.clank/` layout; `status` / `wfw`
 / `as` / `auto`. Drift fixes folded in: `config.json` is a ROSTER of
 agents-with-roles (NOT "designated master agent"); `clank auto --role`
 is a no-op (note it).
+
+## Skill-authoring best practices (apply)
+
+Sources: `code.claude.com/docs/en/skills`,
+`platform.claude.com/docs/en/agents-and-tools/agent-skills/best-practices`.
+- **Description = the role guard.** Lead with it: "Use ONLY when you are
+  the <role> in a clank repo … Do NOT use when you are the <other
+  role>." Third person; keep the discriminator short (the listing
+  truncates ~1536 chars). This is the PRIMARY lever stopping a reviewer
+  from loading the master skill (and running finish/promote it must
+  never run).
+- **Reinforce selection in-body**: an early role-check line ("If your
+  role here is not <role>, stop and use `clank-<other>`."). The
+  stop-hook hint and `clank status` already name the role, so the agent
+  has the signal.
+- **Conciseness**: each SKILL.md is a SINGLE file, well under 500 lines
+  (target ~150). At this size DO NOT split into progressive-disclosure
+  reference files — keep setup/doctor's one-file-per-skill model. Cut
+  anything not acted on.
+- **Invariants first, MUST/STOP-style**, caps for hard rules, imperative.
+- **Loop language**: "STOP — the Stop hook re-invokes you when there is
+  work," NOT "wait for…". No polling instructions.
+- **Anti-patterns to avoid**: vague descriptions, wait-without-STOP,
+  nested reference files, "do X unless…" hedging, documenting commands
+  the role never runs.
 
 ## Implementation
 
@@ -80,6 +152,14 @@ Pure string-composition tests:
   set-master`; does NOT contain `feedback write --verdict`.
 - `compose_skill(Reviewer, _)` contains `feedback write --verdict` + all
   three verdicts; does NOT contain `clank finish` / `queue promote`.
+- **Invariants present** (guard against silent drift of the behaviours
+  that motivated this work): the master body asserts the commit→yield
+  loop (e.g. contains both "promot" and a STOP/yield instruction); the
+  reviewer body asserts the committable-scope rule (never block
+  APPROVE/FINISHED on a manual/external step). Assert by stable
+  substrings.
+- **Role-guard descriptions**: each role's `description` contains "ONLY"
+  + its own role and names the other role as excluded.
 - tool substitution: claude → "via Bash", codex → "via shell"; the
   `/clank` block is present for claude, absent for codex.
 - FINISHED semantics defined ONCE (today's
@@ -95,4 +175,10 @@ Pure string-composition tests:
   `--role` no-op noted.
 - Lean roles: reviewer has no master-only commands; master has no
   verdict-writing mechanics.
+- Invariants encoded MUST/STOP-style and lead each body: master
+  commit→yield (incl. promotion); reviewer committable-scope (no blocking
+  on manual/external steps) + architecture-first review (lead with the
+  modeling mismatch, not a symptom list); shared no-poll/act-immediately.
+- Role-guard descriptions ("Use ONLY when … Do NOT use when …") so a
+  reviewer never loads the master skill.
 - `clank-pr-review` unchanged.
