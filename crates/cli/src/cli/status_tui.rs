@@ -512,7 +512,7 @@ fn build_scroll<'a>(
         .iter()
         .filter(|r| matches!(r, InProgress::MasterWorking { .. }))
         .collect();
-    let reviews: Vec<&InProgress> = in_prog
+    let pending: Vec<&InProgress> = in_prog
         .iter()
         .filter(|r| matches!(r, InProgress::PendingReview { .. }))
         .collect();
@@ -521,35 +521,73 @@ fn build_scroll<'a>(
     let review_sha = active.and_then(|v| v.sha.as_ref());
 
     let mut master_done = false;
-    let mut reviews_done = false;
+    let mut pending_done = false;
+    // Review rows render ABOVE their commit (M1), so they arrive before
+    // the commit; buffer them and flush the whole block at the commit.
+    let mut review_buf: Vec<&OnelineRow> = Vec::new();
     for row in &snap.log_rows {
         match row {
-            OnelineRow::Header { plan }
-                if !master_done && !master.is_empty() && plan.as_deref() == active_stem =>
-            {
+            OnelineRow::Review { .. } => review_buf.push(row),
+            OnelineRow::Commit { sha, .. } => {
+                if review_sha == Some(sha) && !pending.is_empty() {
+                    // MERGE pending placeholders INTO the review block in
+                    // the same author order the done reviews use (entries
+                    // is a BTreeMap by AgentLabel), so a pending reviewer
+                    // occupies the EXACT slot its finished ✓/✗ will take —
+                    // replaced in place, never moved.
+                    seq.extend(merge_review_block(&review_buf, &pending));
+                    pending_done = true;
+                } else {
+                    seq.extend(review_buf.iter().map(|r| Seg::Log(r)));
+                }
+                review_buf.clear();
                 seq.push(Seg::Log(row));
-                seq.extend(master.iter().map(|m| Seg::InProg(m)));
-                master_done = true;
             }
-            OnelineRow::Commit { sha, .. }
-                if !reviews_done && !reviews.is_empty() && review_sha == Some(sha) =>
-            {
-                seq.extend(reviews.iter().map(|r| Seg::InProg(r)));
-                reviews_done = true;
+            OnelineRow::Header { plan } => {
+                // flush any stray buffered reviews across a section break
+                seq.extend(review_buf.drain(..).map(Seg::Log));
                 seq.push(Seg::Log(row));
+                if !master_done && !master.is_empty() && plan.as_deref() == active_stem {
+                    seq.extend(master.iter().map(|m| Seg::InProg(m)));
+                    master_done = true;
+                }
             }
-            _ => seq.push(Seg::Log(row)),
         }
     }
-    // Anchor not found (e.g. no commit yet) → still show the placeholder
-    // so a waiting state is never invisible.
+    seq.extend(review_buf.iter().map(|r| Seg::Log(r)));
+    // Anchor not found (e.g. no commit/header yet) → still show the
+    // placeholder so a waiting state is never invisible.
     if !master_done {
         seq.extend(master.iter().map(|m| Seg::InProg(m)));
     }
-    if !reviews_done {
-        seq.extend(reviews.iter().map(|r| Seg::InProg(r)));
+    if !pending_done {
+        seq.extend(merge_review_block(&[], &pending));
     }
     seq
+}
+
+/// Merge a commit's finished review rows with its pending-reviewer
+/// placeholders into ONE block, sorted by author label — the same order
+/// `collect_reviews` emits done reviews (its `entries` is a
+/// `BTreeMap<AgentLabel, _>`). So a pending reviewer sits exactly where
+/// its finished row will land, and the spinner is replaced in place.
+fn merge_review_block<'a>(
+    done: &[&'a crate::cli::log::OnelineRow],
+    pending: &[&'a InProgress],
+) -> Vec<Seg<'a>> {
+    let mut block: Vec<(&str, Seg<'a>)> = Vec::new();
+    for r in done {
+        if let crate::cli::log::OnelineRow::Review { author, .. } = r {
+            block.push((author.as_str(), Seg::Log(r)));
+        }
+    }
+    for p in pending {
+        if let InProgress::PendingReview { label, .. } = p {
+            block.push((label.as_str(), Seg::InProg(p)));
+        }
+    }
+    block.sort_by(|a, b| a.0.cmp(b.0));
+    block.into_iter().map(|(_, seg)| seg).collect()
 }
 
 /// Wrapped lines for every pending (unanswered) block ask, with the
@@ -864,7 +902,7 @@ fn verb_of(w: &WaitingOn) -> &'static str {
         WaitingOn::ReviewerApprovalsMissing { .. } => "reviewing",
         WaitingOn::GateReviewersMissing { .. } => "gate-reviewing",
         WaitingOn::MasterToRevise { .. } => "revising",
-        WaitingOn::MasterToContinue => "continuing",
+        WaitingOn::MasterToContinue => "working",
         WaitingOn::MasterToCommit => "committing",
         WaitingOn::MasterToFinalize => "finalizing",
         WaitingOn::MasterToFixCommitTag => "fixing tag",
@@ -1657,7 +1695,7 @@ pub(crate) mod tests {
         let s = snap(vec![plan_state("foo", WaitingOn::MasterToContinue)], vec![]);
         assert!(matches!(
             in_progress_rows(&s).as_slice(),
-            [InProgress::MasterWorking { verb, .. }] if *verb == "continuing"
+            [InProgress::MasterWorking { verb, .. }] if *verb == "working"
         ));
         // FLIP (reproduce-first): finalizing IS making the finish commit,
         // so it now produces a master row — shipped M2 wrongly returned
@@ -1689,7 +1727,7 @@ pub(crate) mod tests {
         let s = snap(vec![plan_state("foo", WaitingOn::MasterToContinue)], vec![]);
         let out = render(&s, 40, 80).join("\n");
         assert!(out.contains("-------"), "dashes where the sha would be");
-        assert!(out.contains("continuing"), "per-state italic verb");
+        assert!(out.contains("working"), "per-state italic verb");
         // The finalizing case (the gap M2 missed): master named + verb.
         let mut s = snap(vec![plan_state("foo", WaitingOn::MasterToFinalize)], vec![]);
         s.master = Some("claude".into());
@@ -1753,6 +1791,43 @@ pub(crate) mod tests {
             ["header", "inprog", "commit"],
             "master under the header"
         );
+    }
+
+    #[test]
+    fn pending_and_finished_reviews_merge_in_author_order() {
+        use crate::cli::log::OnelineRow;
+        use clank_core::vocab::Verdict;
+        // Active plan waits on reviewer "aaa"; the commit already has a
+        // finished review from "zzz". The pending "aaa" must sort BEFORE
+        // the done "zzz" (author order) — the exact slot its own finished
+        // row would take — so the spinner is replaced in place, not moved.
+        let mut s = snap(vec![plan_state("foo", reviewer_missing("aaa"))], vec![]);
+        let sha = s.plans[0].sha.clone().unwrap();
+        s.log_rows = vec![
+            OnelineRow::Header {
+                plan: Some("foo".into()),
+            },
+            OnelineRow::Review {
+                verdict: Verdict::Approve,
+                author: "zzz".into(),
+                summary: "ok".into(),
+            },
+            OnelineRow::Commit {
+                sha,
+                subject: "x".into(),
+            },
+        ];
+        let ask = block_ask_spans(&s, 80);
+        let inp = in_progress_rows(&s);
+        let seq = build_scroll(&s, &ask, &inp);
+        // header, aaa(pending), zzz(done), commit
+        assert!(matches!(&seq[0], Seg::Log(OnelineRow::Header { .. })));
+        assert!(
+            matches!(&seq[1], Seg::InProg(InProgress::PendingReview { label, .. }) if label == "aaa"),
+            "pending aaa sorts before done zzz"
+        );
+        assert!(matches!(&seq[2], Seg::Log(OnelineRow::Review { author, .. }) if author == "zzz"),);
+        assert!(matches!(&seq[3], Seg::Log(OnelineRow::Commit { .. })));
     }
 
     #[test]
