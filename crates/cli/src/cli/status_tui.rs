@@ -26,6 +26,7 @@
 
 use std::io::Write as _;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -124,10 +125,20 @@ fn dirty_spans(d: &super::status::DirtyStats) -> Vec<Span> {
 
 // ── pure layout ─────────────────────────────────────────────
 
-/// Render the snapshot into at most `rows` lines, each at most
-/// `cols` display columns. Priority-ordered sections, greedy fit.
-/// The who's-active bar ALWAYS renders — even at `rows == 1`.
-pub(crate) fn render(snap: &StatusSnapshot, rows: u16, cols: u16) -> Vec<String> {
+/// Render the snapshot into at most `rows` lines, each at most `cols`
+/// display columns. Priority-ordered sections, greedy fit. The
+/// who's-active bar ALWAYS renders — even at `rows == 1`.
+///
+/// The log tier is scrolled down by `offset` rows (0 = newest at top,
+/// the live default). Returns the painted lines AND the log viewport
+/// capacity (how many log rows fit) so the caller can clamp the offset
+/// and know when to page in older rows.
+pub(crate) fn render_at(
+    snap: &StatusSnapshot,
+    rows: u16,
+    cols: u16,
+    offset: usize,
+) -> (Vec<String>, usize) {
     let rows = rows.max(1) as usize;
     let cols = cols.max(1) as usize;
     let color = state_color(snap);
@@ -282,13 +293,20 @@ pub(crate) fn render(snap: &StatusSnapshot, rows: u16, cols: u16) -> Vec<String>
     // line styled per row kind + display-width truncated via the
     // same emit path as the gauges. A blank separator when there's
     // room for it plus at least one line.
+    let mut log_capacity = 0usize;
     if out.len() < rows && !snap.log_rows.is_empty() {
         let mut avail = rows - out.len();
         if avail >= 2 {
             out.push(String::new());
             avail -= 1;
         }
-        let shown = &snap.log_rows[..avail.min(snap.log_rows.len())];
+        log_capacity = avail;
+        // Window into the log starting `offset` rows
+        // down from newest, clamped so the last page still fills.
+        let len = snap.log_rows.len();
+        let off = offset.min(len.saturating_sub(1));
+        let end = (off + avail).min(len);
+        let shown = &snap.log_rows[off..end];
         // Align every summary at one column: pad authors to the widest
         // among the rows actually shown.
         let author_width = shown
@@ -303,7 +321,14 @@ pub(crate) fn render(snap: &StatusSnapshot, rows: u16, cols: u16) -> Vec<String>
             out.push(emit(&log_row_spans(row, author_width), color, cols));
         }
     }
-    out
+    (out, log_capacity)
+}
+
+/// Newest-at-top render with no scroll — the common case the layout
+/// tests exercise. Test-only; the live loop calls [`render_at`] directly.
+#[cfg(test)]
+fn render(snap: &StatusSnapshot, rows: u16, cols: u16) -> Vec<String> {
+    render_at(snap, rows, cols, 0).0
 }
 
 /// Widest verdict mark in display columns: `✓✓` (Finished) is 2,
@@ -823,15 +848,39 @@ const RESTORE_SEQ: &str = "\x1b[?25h\x1b[?1049l"; // show cursor + leave alt-scr
 /// a SIGINT/SIGTERM handler covers Ctrl-C in a direct terminal
 /// (ruthless 9d01e47 concern 3 — without it the user's terminal is
 /// left wedged on alt-screen with a hidden cursor).
-struct AltScreen;
+struct AltScreen {
+    /// The cooked-mode termios to restore on exit.
+    orig: libc::termios,
+}
+
+/// The original termios as a leaked pointer so the (async-signal-
+/// safe) SIGINT/SIGTERM handler can restore it without touching a
+/// `static mut` (banned refs in edition 2024) or allocating.
+static TERMIOS_PTR: AtomicPtr<libc::termios> = AtomicPtr::new(std::ptr::null_mut());
 
 impl AltScreen {
     fn enter() -> Self {
+        // Raw-ish input so keystrokes are READ, not
+        // echoed onto the alt-screen as `^[[B`. ICANON+ECHO off; VMIN=1
+        // so a stdin read blocks until ≥1 byte (the kernel notification
+        // the reader thread waits on — no polling).
+        let mut orig: libc::termios = unsafe { std::mem::zeroed() };
+        unsafe {
+            libc::tcgetattr(libc::STDIN_FILENO, &mut orig);
+            TERMIOS_PTR.store(Box::into_raw(Box::new(orig)), Ordering::Relaxed);
+            let mut raw = orig;
+            raw.c_lflag &= !(libc::ICANON | libc::ECHO);
+            raw.c_cc[libc::VMIN] = 1;
+            raw.c_cc[libc::VTIME] = 0;
+            libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw);
+        }
+
         print!("{ENTER_SEQ}");
         let _ = std::io::stdout().flush();
 
         let prev = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
+            unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &orig) };
             let mut out = std::io::stdout();
             let _ = out.write_all(RESTORE_SEQ.as_bytes());
             let _ = out.flush();
@@ -839,19 +888,20 @@ impl AltScreen {
         }));
 
         // SAFETY: installing a handler that only calls
-        // async-signal-safe functions (write, _exit).
+        // async-signal-safe functions (tcsetattr, write, _exit).
         let handler =
             restore_and_exit as extern "C" fn(libc::c_int) as *const () as libc::sighandler_t;
         unsafe {
             libc::signal(libc::SIGINT, handler);
             libc::signal(libc::SIGTERM, handler);
         }
-        AltScreen
+        AltScreen { orig }
     }
 }
 
 impl Drop for AltScreen {
     fn drop(&mut self) {
+        unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.orig) };
         print!("{RESTORE_SEQ}");
         let _ = std::io::stdout().flush();
     }
@@ -859,11 +909,71 @@ impl Drop for AltScreen {
 
 extern "C" fn restore_and_exit(sig: libc::c_int) {
     const RESTORE: &[u8] = b"\x1b[?25h\x1b[?1049l";
-    // SAFETY: write + _exit are async-signal-safe.
+    // SAFETY: tcsetattr, write, _exit are async-signal-safe; the ptr is
+    // a leaked Box set once in `enter`, read atomically here.
     unsafe {
+        let p = TERMIOS_PTR.load(Ordering::Relaxed);
+        if !p.is_null() {
+            libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, p);
+        }
         libc::write(1, RESTORE.as_ptr().cast(), RESTORE.len());
         libc::_exit(128 + sig);
     }
+}
+
+/// What wakes the `--tui` loop.
+enum Ev {
+    /// A status/data change — rebuild the snapshot.
+    Refresh,
+    /// A keystroke from the stdin reader thread.
+    Key(Key),
+}
+
+#[derive(Clone, Copy)]
+enum Key {
+    Up,
+    Down,
+    PageUp,
+    PageDown,
+    Top,
+    Bottom,
+    Quit,
+}
+
+/// Parse a burst of stdin bytes into scroll keys — arrow keys,
+/// PgUp/PgDn, plus vi-ish `j`/`k`/`g`/`G`, space (page down), `q` (quit).
+fn parse_keys(bytes: &[u8]) -> Vec<Key> {
+    let mut keys = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let rest = &bytes[i..];
+        if rest.starts_with(b"\x1b[A") {
+            keys.push(Key::Up);
+            i += 3;
+        } else if rest.starts_with(b"\x1b[B") {
+            keys.push(Key::Down);
+            i += 3;
+        } else if rest.starts_with(b"\x1b[5~") {
+            keys.push(Key::PageUp);
+            i += 4;
+        } else if rest.starts_with(b"\x1b[6~") {
+            keys.push(Key::PageDown);
+            i += 4;
+        } else {
+            match bytes[i] {
+                b'k' => keys.push(Key::Up),
+                b'j' => keys.push(Key::Down),
+                b'g' => keys.push(Key::Top),
+                b'G' => keys.push(Key::Bottom),
+                b' ' => keys.push(Key::PageDown),
+                b'b' => keys.push(Key::PageUp),
+                b'q' => keys.push(Key::Quit),
+                _ => {}
+            }
+            i += 1;
+        }
+    }
+    keys
 }
 
 /// One frame: cursor home, each line + clear-to-EOL, then clear
@@ -1154,31 +1264,118 @@ pub(crate) async fn run_tui(
     spawn_sigwinch_forwarder(tx)?;
 
     let _guard = AltScreen::enter();
-    // When inside zellij: mirror the bar's lamp emoji into the tab
-    // name, and each agent's status glyph onto its own pane name.
+
+    // Unify the existing watcher/SIGWINCH wake
+    // channel with a stdin reader into one event stream. A blocking
+    // `read` on stdin IS the notification (no polling); both producers
+    // feed `ev_rx`, which the loop drains — the same channel-driven
+    // shape the watcher already uses.
+    let (ev_tx, ev_rx) = mpsc::channel::<Ev>();
+    {
+        let ev_tx = ev_tx.clone();
+        std::thread::spawn(move || {
+            while rx.recv().is_ok() {
+                if ev_tx.send(Ev::Refresh).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 16];
+        loop {
+            // SAFETY: reading our own stdin (fd 0) into a local buffer.
+            let n = unsafe { libc::read(0, buf.as_mut_ptr().cast(), buf.len()) };
+            if n <= 0 {
+                break;
+            }
+            for key in parse_keys(&buf[..n as usize]) {
+                if ev_tx.send(Ev::Key(key)).is_err() {
+                    return;
+                }
+            }
+        }
+    });
+
+    // The log grows on demand via fresh, larger
+    // windowed rebuilds (the fold replays from a base, so this is
+    // re-fetch-bigger, not incremental). ONE rule drives it: keep at
+    // least `offset + viewport` rows loaded — that both FILLS a tall pane
+    // on first paint and PAGES IN older rows as you scroll. Growth is a
+    // screenful of commits per rebuild (≈ one rebuild per page, not per
+    // row). `log_complete` latches once a grow returns no new rows (root).
+    let mut log_window: usize = 30;
+    let mut log_complete = false;
+
+    // When inside zellij: mirror the bar's lamp emoji into the tab name,
+    // and each agent's status glyph onto its own pane name.
     let mut tab = TabIndicator::new();
     let mut panes = PaneStatus::new();
+    let mut snapshot =
+        StatusSnapshot::build_async(&repo, &basename, home.as_deref(), policy, None, true).await?;
+    let mut offset: usize = 0;
     loop {
-        let snapshot =
-            StatusSnapshot::build_async(&repo, &basename, home.as_deref(), policy, None, true)
-                .await?;
         let (rows, cols) = term_size();
-        paint(&render(&snapshot, rows, cols));
-        if let Some(tab) = tab.as_mut() {
-            tab.update(&bar_emoji(&snapshot));
-        }
-        if let Some(panes) = panes.as_mut() {
-            panes.update(&snapshot);
+        let capacity = render_at(&snapshot, rows, cols, offset).1;
+
+        // Load enough log to fill the viewport AT this scroll position.
+        while !log_complete && snapshot.log_rows.len() < offset + capacity {
+            log_window += capacity.max(1);
+            let before = snapshot.log_rows.len();
+            snapshot.log_rows = crate::cli::status::tui_log_rows(&repo, log_window).await;
+            if snapshot.log_rows.len() == before {
+                log_complete = true; // hit the root — stop growing
+            }
         }
 
-        match rx.recv_timeout(Duration::from_secs(60)) {
-            Ok(()) => while rx.recv_timeout(Duration::from_millis(200)).is_ok() {},
+        // Max offset pins the last row at the BOTTOM of the viewport.
+        let max_off = snapshot.log_rows.len().saturating_sub(capacity.max(1));
+        offset = offset.min(max_off);
+        paint(&render_at(&snapshot, rows, cols, offset).0);
+
+        match ev_rx.recv_timeout(Duration::from_secs(60)) {
+            // Keys only move the viewport; the loop top loads more if the
+            // new position needs it.
+            Ok(Ev::Key(k)) => {
+                let page = (rows as usize).saturating_sub(3).max(1);
+                match k {
+                    Key::Quit => break,
+                    Key::Up => offset = offset.saturating_sub(1),
+                    Key::Down => offset += 1,
+                    Key::PageUp => offset = offset.saturating_sub(page),
+                    Key::PageDown => offset += page,
+                    Key::Top => offset = 0,
+                    Key::Bottom => offset = max_off,
+                }
+            }
+            Ok(Ev::Refresh) => {
+                snapshot = StatusSnapshot::build_async(
+                    &repo,
+                    &basename,
+                    home.as_deref(),
+                    policy,
+                    None,
+                    true,
+                )
+                .await?;
+                // Restore the user's scroll depth and re-open paging in
+                // case history grew; the loop top tops up the viewport.
+                snapshot.log_rows = crate::cli::status::tui_log_rows(&repo, log_window).await;
+                log_complete = false;
+                if let Some(tab) = tab.as_mut() {
+                    tab.update(&bar_emoji(&snapshot));
+                }
+                if let Some(panes) = panes.as_mut() {
+                    panes.update(&snapshot);
+                }
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                anyhow::bail!("filesystem watcher disconnected")
+                anyhow::bail!("event channel disconnected")
             }
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1187,6 +1384,31 @@ pub(crate) mod tests {
     use crate::lifecycle::{AgentLabel, CommitSha, PlanKey};
     use clank_core::repo_state::NonEmptyVec;
     use clank_core::vocab::CommitGateState;
+
+    #[test]
+    fn parse_keys_recognizes_arrows_paging_and_vi_keys() {
+        use Key::*;
+        let got: Vec<_> = parse_keys(b"jk gGq")
+            .iter()
+            .map(|k| std::mem::discriminant(k))
+            .collect();
+        let want: Vec<_> = [Down, Up, PageDown, Top, Bottom, Quit]
+            .iter()
+            .map(std::mem::discriminant)
+            .collect();
+        assert_eq!(got, want, "vi keys + space");
+        // CSI escape sequences (arrows, PgUp/PgDn), even back-to-back.
+        let csi: Vec<_> = parse_keys(b"\x1b[A\x1b[B\x1b[5~\x1b[6~")
+            .iter()
+            .map(std::mem::discriminant)
+            .collect();
+        let want_csi: Vec<_> = [Up, Down, PageUp, PageDown]
+            .iter()
+            .map(std::mem::discriminant)
+            .collect();
+        assert_eq!(csi, want_csi, "arrows + page keys");
+        assert!(parse_keys(b"xyz").is_empty(), "unmapped bytes are ignored");
+    }
 
     pub(crate) fn plan_state(stem: &str, waiting_on: WaitingOn) -> PlanWorkState {
         PlanWorkState {
@@ -2034,6 +2256,28 @@ mod log_tier_tests {
         let mut s = snap(vec![plan_state("foo", reviewer_missing("codex"))], vec![]);
         s.log_rows = subjects.iter().map(|l| commit_row(l)).collect();
         s
+    }
+
+    #[test]
+    fn render_at_windows_the_log_and_reports_capacity() {
+        let subs = [
+            "row-aa", "row-bb", "row-cc", "row-dd", "row-ee", "row-ff", "row-gg", "row-hh",
+        ];
+        let s = snap_with_log(&subs);
+        // Tall pane: capacity covers the whole log; newest shown at top.
+        let (lines, cap) = render_at(&s, 40, 80, 0);
+        assert!(cap >= subs.len(), "viewport capacity reported");
+        assert!(
+            lines.join("\n").contains("row-aa"),
+            "newest at top, offset 0"
+        );
+        // Scrolled down: the newest rows leave the window, older ones enter.
+        let body = render_at(&s, 40, 80, 3).0.join("\n");
+        assert!(
+            !body.contains("row-aa"),
+            "offset 3 scrolled past the newest"
+        );
+        assert!(body.contains("row-dd"), "offset 3 starts at the 4th-newest");
     }
 
     #[test]

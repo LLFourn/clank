@@ -652,15 +652,34 @@ async fn run_watch(
 /// active). Best-effort: any failure yields an empty pane, never a
 /// status error.
 async fn recent_log_rows(repo: &Path, state: &RepoState) -> Vec<crate::cli::log::OnelineRow> {
-    use clank_core::repo_state::LogEvent;
     const LOG_WINDOW: usize = 30;
+    match state.head.clone() {
+        Some(head) => log_rows_windowed(repo, &head, LOG_WINDOW).await,
+        None => Vec::new(),
+    }
+}
 
-    let Some(head) = state.head.clone() else {
-        return Vec::new();
-    };
-    let from = crate::cli::log::git_rev_parse(repo, &format!("HEAD~{LOG_WINDOW}"));
-    let Ok((_state, events)) = crate::rebuild::rebuild_from(repo, from.as_ref(), &head).await
-    else {
+/// Log rows for the last `window` commits, with HEAD
+/// taken from git directly — the `--tui` pager calls this with a growing
+/// window to pull older history on demand (a fresh windowed rebuild each
+/// time, NOT an incremental fold continuation).
+pub(crate) async fn tui_log_rows(repo: &Path, window: usize) -> Vec<crate::cli::log::OnelineRow> {
+    match crate::cli::log::git_rev_parse(repo, "HEAD") {
+        Some(head) => log_rows_windowed(repo, &head, window).await,
+        None => Vec::new(),
+    }
+}
+
+/// Build oneline log rows for `HEAD~window..head`, newest first.
+async fn log_rows_windowed(
+    repo: &Path,
+    head: &crate::lifecycle::CommitSha,
+    window: usize,
+) -> Vec<crate::cli::log::OnelineRow> {
+    use clank_core::repo_state::LogEvent;
+
+    let from = crate::cli::log::git_rev_parse(repo, &format!("HEAD~{window}"));
+    let Ok((_state, events)) = crate::rebuild::rebuild_from(repo, from.as_ref(), head).await else {
         return Vec::new();
     };
 
