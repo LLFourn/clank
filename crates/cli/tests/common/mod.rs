@@ -1,11 +1,11 @@
-//! Shared integration-test helpers for the team-based
-//! registration model (`teams-based-agent-registration`).
+//! Shared integration-test helpers for the roster model
+//! (`repo-agents-no-team`).
 //!
 //! Setup goes through [`TestEnv`] + [`register_team`]: build the
-//! team via the REAL library cores, in a HOME distinct from the
-//! repo — the dogfood path (`dogfood-init-setup-in-tests`). The
-//! old repo-only raw-JSON helpers (`write_team_config` /
-//! `add_reviewer`) were deleted once every test moved over.
+//! repo ROSTER via the REAL library cores (`clank agent add` /
+//! `clank agent set-master`), in a HOME distinct from the repo.
+//! The repo's `agents` IS the operating team — there's no separate
+//! `team` field.
 
 #![allow(dead_code)]
 
@@ -68,17 +68,15 @@ fn git(repo: &Path, args: &[&str]) {
     assert!(status.success(), "git {args:?} failed");
 }
 
-/// Register a team THE REAL WAY — through the same library cores
-/// the CLI handlers call, so the test setup and production share
-/// one code path (the dogfood payoff of
-/// `dogfood-init-setup-in-tests`). It writes BOTH scopes
-/// (user-scope agents/team + the repo's team field), so `home`
-/// MUST be a separate dir from `repo` — a test that set
-/// `HOME=repo` would collide the two on one `.clank/config.json`.
+/// Build a repo ROSTER THE REAL WAY — through the same library
+/// cores the CLI handlers call, so test setup and production share
+/// one code path. `home` is accepted for signature stability (some
+/// callers build a user-scope library too) but the roster lives in
+/// the repo config; the two MUST be separate dirs.
 ///
-/// Sequence mirrors what a user would run:
-/// `clank agent add --global` (declare each agent) →
-/// `clank team create/set-master/add` → `clank init --team`.
+/// Sequence mirrors what a user would run on a fresh repo:
+/// `clank agent add <name> --tool …` for each agent, then
+/// `clank agent set-master <master>`.
 pub fn register_team(
     home: &Path,
     repo: &Path,
@@ -86,7 +84,8 @@ pub fn register_team(
     commit_reviewers: &[&str],
     gate_reviewers: &[&str],
 ) {
-    use clank::cli::teams_config::{AgentDescription, ReviewKind};
+    let _ = home;
+    use clank::cli::teams_config::{AgentDescription, RosterRole};
     use clank_core::ids::AgentLabel;
     use clank_core::vocab::Tool;
 
@@ -97,22 +96,16 @@ pub fn register_team(
     };
     let lbl = |s: &str| AgentLabel::parse(s).unwrap();
 
-    // Declare every agent in user-scope `agents`.
-    for a in std::iter::once(master)
-        .chain(commit_reviewers.iter().copied())
-        .chain(gate_reviewers.iter().copied())
-    {
-        clank::cli::agent::declare_global_agent(home, &lbl(a), desc()).unwrap();
-    }
-    // Build the `default` team via the team cores.
-    clank::cli::team::create_team(home, "default").unwrap();
-    clank::cli::team::set_master(home, "default", master).unwrap();
+    // Add the master + reviewers to the repo roster (inline
+    // definitions), then designate the master.
+    clank::cli::agent::add_repo_roster_agent(repo, &lbl(master), desc(), RosterRole::Commit)
+        .unwrap();
     for r in commit_reviewers {
-        clank::cli::team::add_member(home, "default", r, ReviewKind::Commit).unwrap();
+        clank::cli::agent::add_repo_roster_agent(repo, &lbl(r), desc(), RosterRole::Commit)
+            .unwrap();
     }
     for r in gate_reviewers {
-        clank::cli::team::add_member(home, "default", r, ReviewKind::Gate).unwrap();
+        clank::cli::agent::add_repo_roster_agent(repo, &lbl(r), desc(), RosterRole::Gate).unwrap();
     }
-    // Point the repo at the team.
-    clank::cli::init::register_repo_team(home, repo, "default").unwrap();
+    clank::cli::agent::set_repo_master(repo, &lbl(master)).unwrap();
 }

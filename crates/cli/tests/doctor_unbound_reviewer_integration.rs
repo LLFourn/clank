@@ -67,33 +67,32 @@ fn register_agents(env: &TestEnv, agents: &[(&str, clank_core::vocab::Role)]) {
     env.register_team(master_label, &reviewers, &[]);
 }
 
-/// Register a single master agent carrying a launch profile —
-/// via the real cores (`declare_global_agent` with a launch
-/// `AgentDescription`, then a one-member team). `register_team`
-/// uses a default desc, so this case is built explicitly.
+/// Register a single master agent carrying a launch profile — via
+/// the real cores: add it to the repo roster (inline, with the
+/// launch profile) then designate it master. `register_team` uses
+/// a default desc, so this case is built explicitly.
 fn register_agent_with_launch(
     env: &TestEnv,
     label: &str,
     _role: clank_core::vocab::Role,
     launch: clank_core::agent_config::LaunchConfig,
 ) {
-    use clank::cli::teams_config::AgentDescription;
+    use clank::cli::teams_config::{AgentDescription, RosterRole};
     use clank_core::ids::AgentLabel;
     use clank_core::vocab::Tool;
     let lbl = AgentLabel::parse(label).unwrap();
-    clank::cli::agent::declare_global_agent(
-        env.home(),
+    clank::cli::agent::add_repo_roster_agent(
+        env.repo(),
         &lbl,
         AgentDescription {
             tool: Tool::Claude,
             launch: Some(launch),
             initial_prompt: None,
         },
+        RosterRole::Commit,
     )
     .unwrap();
-    clank::cli::team::create_team(env.home(), "default").unwrap();
-    clank::cli::team::set_master(env.home(), "default", label).unwrap();
-    clank::cli::init::register_repo_team(env.home(), env.repo(), "default").unwrap();
+    clank::cli::agent::set_repo_master(env.repo(), &lbl).unwrap();
 }
 
 /// Run doctor's repo-scope checks IN-PROCESS

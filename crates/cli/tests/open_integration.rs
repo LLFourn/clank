@@ -256,18 +256,17 @@ fn clank_initialized_subdir_resolves_to_repo_root() {
 
 #[test]
 fn master_agents_empty_when_no_team_master() {
-    // A repo whose team has reviewers but no master designated
+    // A repo whose roster has reviewers but no master designated
     // → the resolver yields no master, so `master_agents` is
-    // empty (`teams-based-agent-registration`).
+    // empty (`repo-agents-no-team`).
     let home = tempfile::tempdir().unwrap();
     let dir = init_repo();
     let repo = dir.path();
     let cfg = serde_json::json!({
         "agents": {
-            "a": {"tool": "claude"},
-            "b": {"tool": "claude"}
-        },
-        "team": { "commit_reviewers": ["a", "b"] }
+            "a": {"tool": "claude", "role": "commit"},
+            "b": {"tool": "claude", "role": "commit"}
+        }
     });
     write(
         repo,

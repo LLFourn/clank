@@ -56,18 +56,21 @@ pub fn load_all_agent_configs(repo: &Path) -> anyhow::Result<Vec<(AgentLabel, Ag
     Ok(out)
 }
 
-/// Error returned by the team-based resolvers when a repo has no
-/// `team` field configured. No legacy fallback exists: a repo
-/// without a team is a setup error, not a master-only default.
+/// Error returned by the roster resolvers when a repo has no
+/// master designated. No legacy fallback exists: a repo without a
+/// master is a setup error, not a master-only default.
 fn no_team_configured() -> anyhow::Error {
-    anyhow::anyhow!("this repo has no team configured. Run `clank init --team <name>` to set one.")
+    anyhow::anyhow!(
+        "this repo has no master agent. Run `clank init --team <name>` or \
+         `clank agent set-master <agent>` to set one."
+    )
 }
 
-/// Resolve an agent's role for this repo via the team-based
+/// Resolve an agent's role for this repo via the roster-resolved
 /// registered set: `label == master` → `Master`; in either
 /// reviewer tier → `Reviewer`; otherwise the default role.
 ///
-/// Errors if the repo has no `team` field set — there is no
+/// Errors if the repo has no master designated — there is no
 /// legacy fallback.
 pub fn resolve_role(repo: &Path, label: &AgentLabel) -> anyhow::Result<clank_core::vocab::Role> {
     match try_resolve_via_team(repo)? {
@@ -176,11 +179,11 @@ pub fn try_resolve_via_team(
 ///   empty tiers.
 /// - `Err(_)` (fail-closed) when the config is malformed, uses
 ///   the old team schema (re-init hint), or resolution fails for
-///   any reason other than `NoMaster` (e.g. `UnknownAgent`).
+///   any reason other than `NoMaster` (e.g. `MultipleMasters`).
 ///
-/// The `home` parameter is unused: the repo config is now
-/// self-contained (it carries its own `agents`). It's kept so
-/// the many workflow callers need no signature changes.
+/// The `home` parameter is unused: the repo's roster is
+/// self-contained (each agent carries its definition + role). It's
+/// kept so the many workflow callers need no signature changes.
 pub fn try_resolve_via_team_with(
     repo: &Path,
     _home: Option<&Path>,
@@ -192,13 +195,13 @@ pub fn try_resolve_via_team_with(
         return Ok(None);
     };
 
-    // The repo is self-contained: master + reviewers reference
-    // labels in the repo's own `agents`. A bootstrapped repo
-    // (no master yet) resolves to `NoMaster` — surfaced as
-    // `Ok(None)` so workflow callers report "no team configured"
-    // and read-only renderers degrade to empty tiers, rather
-    // than every command erroring before the user has set a
-    // master.
+    // The repo's roster is self-contained: every agent carries its
+    // definition + role. A bootstrapped repo (no master yet)
+    // resolves to `NoMaster` — surfaced as `Ok(None)` so workflow
+    // callers report "no master configured" and read-only renderers
+    // degrade to empty tiers, rather than every command erroring
+    // before the user has set a master. A `MultipleMasters`
+    // misconfiguration fails closed.
     match resolve_registered_set(&repo_cfg) {
         Ok(set) => Ok(Some(set)),
         Err(ResolutionError::NoMaster) => Ok(None),
@@ -249,11 +252,12 @@ pub fn repo_config_if_valid(
 }
 
 /// Load + parse `<repo>/.clank/config.json` as the new-shape
-/// [`RepoConfigFile`]. Returns `Ok(None)` if the file doesn't
-/// exist. Fail-closed: an old-shape config (legacy `team:
-/// "name"` / `team: [array]` / `promoted`) no longer parses as
-/// `TeamComposition`/`agents`, so rather than surface a cryptic
-/// serde message we map it to an actionable re-init hint.
+/// [`RepoConfigFile`] (a flat ROSTER). Returns `Ok(None)` if the
+/// file doesn't exist. Fail-closed: an old-shape config (legacy
+/// `team: "name"` / a `team` field / `promoted` / an old-shape
+/// `agents` map of role-less descriptions) no longer parses as a
+/// roster, so rather than surface a cryptic serde message we map
+/// it to an actionable re-init hint.
 fn load_repo_config(
     repo_cfg_path: &Path,
 ) -> anyhow::Result<Option<crate::cli::teams_config::RepoConfigFile>> {
@@ -265,28 +269,29 @@ fn load_repo_config(
     };
     // Fail-closed BEFORE accepting the parse: a config can parse yet
     // still carry a legacy marker the typed struct silently swallows —
-    // a stray `promoted` lands in the `extra` flatten map and would be
-    // ignored (codex c1e6749). Checking the raw shape first means any
+    // a stray `promoted` or `team` lands in the `extra` flatten map
+    // and would be ignored. Checking the raw shape first means any
     // legacy marker yields the re-init hint, parse-success or not.
     if is_legacy_repo_shape(&body) {
         return Err(legacy_repo_schema_error(repo_cfg_path));
     }
+    // An old `{agents: <role-less descriptions>}` config that has no
+    // `team`/`promoted` marker still fails here: a `RosterAgent`
+    // value requires a `role` field the old `AgentDescription`
+    // lacks. Map that serde failure to the same re-init hint.
     serde_json::from_str::<RepoConfigFile>(&body)
         .map(Some)
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "parsing {} as new-schema RepoConfigFile: {e}",
-                repo_cfg_path.display()
-            )
-        })
+        .map_err(|_| legacy_repo_schema_error(repo_cfg_path))
 }
 
-/// Detect the old repo schema by raw shape. The new schema has no
-/// `promoted`, stores `team` as an object ([`TeamComposition`]), and
-/// `agents` as a map — so a `promoted` key, a string/array `team`, or
-/// an array `agents` is unambiguously legacy. Checked on the raw JSON
+/// Detect the old repo schema by raw shape. The new (roster)
+/// schema has NO `team` field and NO `promoted`, and stores
+/// `agents` as a map — so a `team` key, a `promoted` key, or an
+/// array `agents` is unambiguously legacy. Checked on the raw JSON
 /// (not the typed struct) so a marker the typed parse would swallow
-/// into `extra` (e.g. `promoted`) still fail-closes.
+/// into `extra` (e.g. `team`/`promoted`) still fail-closes. A
+/// role-less `agents` map (the just-shipped `{agents, team}` shape
+/// minus the `team`) is caught by the typed parse instead.
 fn is_legacy_repo_shape(body: &str) -> bool {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
         return false;
@@ -295,7 +300,7 @@ fn is_legacy_repo_shape(body: &str) -> bool {
         return false;
     };
     obj.contains_key("promoted")
-        || matches!(obj.get("team"), Some(t) if t.is_string() || t.is_array())
+        || obj.contains_key("team")
         || matches!(obj.get("agents"), Some(a) if a.is_array())
 }
 
@@ -587,17 +592,16 @@ mod tests {
     }
 
     #[test]
-    fn try_resolve_via_team_with_returns_set_when_team_resolves() {
+    fn try_resolve_via_team_with_returns_set_when_roster_resolves() {
         let repo = TempDir::new().unwrap();
         let home = TempDir::new().unwrap();
         write_repo_config(
             repo.path(),
             r#"{
                 "agents": {
-                    "codex": { "tool": "codex" },
-                    "claude": { "tool": "claude" }
-                },
-                "team": { "master": "codex", "commit_reviewers": ["claude"] }
+                    "codex": { "tool": "codex", "role": "master" },
+                    "claude": { "tool": "claude", "role": "commit" }
+                }
             }"#,
         );
         let set = try_resolve_via_team_with(repo.path(), Some(home.path()))
@@ -609,17 +613,25 @@ mod tests {
     }
 
     #[test]
-    fn try_resolve_via_team_with_propagates_resolver_errors() {
-        // Master references an agent not defined in the repo's
-        // `agents` → ResolutionError::UnknownAgent propagates.
+    fn try_resolve_via_team_with_propagates_multiple_masters() {
+        // Two `master`-role entries → ResolutionError::MultipleMasters
+        // propagates (fail-closed).
         let repo = TempDir::new().unwrap();
         let home = TempDir::new().unwrap();
-        write_repo_config(repo.path(), r#"{"team": {"master": "phantom"}}"#);
+        write_repo_config(
+            repo.path(),
+            r#"{
+                "agents": {
+                    "claude": { "tool": "claude", "role": "master" },
+                    "codex": { "tool": "codex", "role": "master" }
+                }
+            }"#,
+        );
         let err = try_resolve_via_team_with(repo.path(), Some(home.path())).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("phantom") || msg.contains("not defined"),
-            "expected UnknownAgent error; got: {msg}"
+            msg.contains("multiple masters"),
+            "expected MultipleMasters error; got: {msg}"
         );
     }
 
@@ -637,12 +649,14 @@ mod tests {
     }
 
     #[test]
-    fn try_resolve_via_team_with_fails_closed_on_old_promoted_shape() {
+    fn try_resolve_via_team_with_fails_closed_on_just_shipped_agents_team_shape() {
+        // The just-shipped `{agents: <role-less descriptions>, team: ...}`
+        // shape must fail closed (the `team` field marks it legacy).
         let repo = TempDir::new().unwrap();
         let home = TempDir::new().unwrap();
         write_repo_config(
             repo.path(),
-            r#"{"team": [{"include": "dev"}], "promoted": "codex"}"#,
+            r#"{"agents": {"claude": {"tool": "claude"}}, "team": {"master": "claude"}}"#,
         );
         let err = try_resolve_via_team_with(repo.path(), Some(home.path())).unwrap_err();
         let msg = format!("{err:#}");
@@ -653,16 +667,28 @@ mod tests {
     }
 
     #[test]
-    fn try_resolve_via_team_with_fails_closed_on_parseable_promoted() {
-        // codex c1e6749: a config with a VALID new-shape `team` object
-        // PLUS a stray `promoted` parses fine (promoted → `extra`), so
-        // checking legacy shape only on parse-failure silently swallowed
-        // it. It must fail closed with the re-init hint.
+    fn try_resolve_via_team_with_fails_closed_on_role_less_agents_map() {
+        // An `agents` map of role-less descriptions (no `team` marker)
+        // still fails closed: a RosterAgent requires `role`. The serde
+        // failure maps to the re-init hint, not a cryptic message.
+        let repo = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        write_repo_config(repo.path(), r#"{"agents": {"claude": {"tool": "claude"}}}"#);
+        let err = try_resolve_via_team_with(repo.path(), Some(home.path())).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("old team schema") && msg.contains("clank init"),
+            "expected re-init hint; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn try_resolve_via_team_with_fails_closed_on_old_promoted_shape() {
         let repo = TempDir::new().unwrap();
         let home = TempDir::new().unwrap();
         write_repo_config(
             repo.path(),
-            r#"{"agents": {"claude": {"tool": "claude"}}, "team": {"master": "claude"}, "promoted": "codex"}"#,
+            r#"{"team": [{"include": "dev"}], "promoted": "codex"}"#,
         );
         let err = try_resolve_via_team_with(repo.path(), Some(home.path())).unwrap_err();
         let msg = format!("{err:#}");

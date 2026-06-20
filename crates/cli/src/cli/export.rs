@@ -1,5 +1,5 @@
 //! `clank export` — dump this repo's self-contained config
-//! (`teams_config::RepoConfigFile`: `agents` + `team`) as pretty
+//! (`teams_config::RepoConfigFile`: the `agents` roster) as pretty
 //! JSON to stdout.
 //!
 //! Read through the same fail-closed loader the resolver uses, so
@@ -38,20 +38,21 @@ mod tests {
     }
 
     /// `export_repo_config` prints JSON that round-trips back into
-    /// a `RepoConfigFile` with the same agents + team. We capture
-    /// stdout by re-serializing the loaded config (the function
-    /// prints exactly that), then parse it back.
+    /// a `RepoConfigFile` with the same roster. We capture stdout by
+    /// re-serializing the loaded config (the function prints exactly
+    /// that), then parse it back.
     #[test]
-    fn export_round_trips_agents_and_team() {
+    fn export_round_trips_roster() {
+        use crate::cli::teams_config::RosterRole;
+        use clank_core::ids::AgentLabel;
         let repo = tempfile::tempdir().unwrap();
         seed_repo_config(
             repo.path(),
             r#"{
                 "agents": {
-                    "claude": { "tool": "claude" },
-                    "codex": { "tool": "codex" }
-                },
-                "team": { "master": "claude", "commit_reviewers": ["codex"] }
+                    "claude": { "tool": "claude", "role": "master" },
+                    "codex": { "tool": "codex", "role": "commit" }
+                }
             }"#,
         );
 
@@ -61,8 +62,10 @@ mod tests {
         let printed = serde_json::to_string_pretty(&cfg).unwrap();
         let back: RepoConfigFile = serde_json::from_str(&printed).unwrap();
         assert_eq!(back.agents.len(), 2);
-        assert_eq!(back.team.master.as_ref().unwrap().as_str(), "claude");
-        assert_eq!(back.team.commit_reviewers[0].as_str(), "codex");
+        assert_eq!(
+            back.agents[&AgentLabel::parse("claude").unwrap()].role,
+            RosterRole::Master
+        );
         assert_eq!(back.agents, cfg.agents);
         // And the public entry point succeeds.
         export_repo_config(repo.path()).unwrap();

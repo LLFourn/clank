@@ -853,24 +853,29 @@ pub struct AgentArgs {
 
 #[derive(clap::Subcommand, Debug)]
 pub enum AgentCmd {
-    /// Enumerate the repo's registered agents (resolved from its
-    /// team) with their role, review tier, and bind state.
+    /// Enumerate the repo's roster (master + reviewers) with their
+    /// role, review tier, and bind state.
     List(AgentListArgs),
     /// Launch an agent's CLI tool with its session restored and
     /// any configured `launch` profile applied. Requires the
     /// agent to have a bound session (`clank as <name>`).
     Start(AgentStartArgs),
-    /// Declare an agent DEFINITION: `--global` writes a description
-    /// to user-scope `agents`; otherwise writes it into THIS repo's
-    /// `agents` map. Does NOT touch the team — compose the operating
-    /// team with `clank team add` / `clank team set-master`.
+    /// Add an agent to the repo's roster (ONE step — definition +
+    /// role). Three modes: `--global --tool` writes a reusable
+    /// DESCRIPTION to the user-scope library (no repo change);
+    /// repo-scope `--tool` defines a fresh agent inline; repo-scope
+    /// by-name (no `--tool`) copies a description from the
+    /// user-scope library. `--review commit|gate` sets the role
+    /// (default `commit`).
     Add(AgentAddArgs),
-    /// Remove an agent DEFINITION: `--global` drops it from
-    /// user-scope `agents` (and scrubs any team referencing it);
-    /// otherwise removes it from THIS repo's `agents` map. At repo
-    /// scope, refuses while the agent is still in the repo's team
-    /// (`clank team remove <label>` first). Per-agent skeleton dir
-    /// + feedback history are preserved.
+    /// Set the repo's master: `repo.agents[<name>].role = master`,
+    /// demoting the previous master to `commit`. The agent must
+    /// already be on the roster.
+    SetMaster(AgentSetMasterArgs),
+    /// Remove an agent from the repo's roster. `--global` instead
+    /// drops a DESCRIPTION from the user-scope `agents` library
+    /// (and scrubs any team template referencing it). Per-agent
+    /// skeleton dir + feedback history are preserved.
     Remove(AgentRemoveArgs),
 }
 
@@ -902,17 +907,22 @@ pub struct AgentStartArgs {
 
 #[derive(Args, Debug)]
 pub struct AgentAddArgs {
-    /// Agent label to register.
+    /// Agent label to add.
     pub label: String,
-    /// Tool this agent runs (`claude` / `codex`). REQUIRED — a
-    /// definition needs a tool. Review tier is a team property; set
-    /// it via `clank team add --review`.
+    /// Tool this agent runs (`claude` / `codex`). REQUIRED with
+    /// `--global` (a library description needs a tool) and to
+    /// define a fresh agent inline at repo scope. OMIT at repo
+    /// scope to add `<label>` BY NAME — its description is copied
+    /// from the user-scope `agents` library.
     #[arg(long, value_enum)]
-    pub tool: ToolArg,
-    /// Write the agent DEFINITION to user-scope
-    /// `~/.clank/config.json#/agents` (reusable across teams).
-    /// Without `--global`, the definition is written into THIS
-    /// repo's `agents` map. Neither touches the team.
+    pub tool: Option<ToolArg>,
+    /// Role for the new roster entry: `commit` (default) or `gate`
+    /// reviewer. Ignored with `--global` (the library has no role).
+    #[arg(long, value_enum, default_value = "commit")]
+    pub review: ReviewKindArg,
+    /// Write the agent DESCRIPTION to the user-scope library
+    /// (`~/.clank/config.json#/agents`, reusable, NO role) instead
+    /// of the repo roster. Requires `--tool`. No repo change.
     #[arg(long)]
     pub global: bool,
     /// Override the executable used by `clank agent start`. If
@@ -943,15 +953,23 @@ pub struct AgentAddArgs {
 }
 
 #[derive(Args, Debug)]
+pub struct AgentSetMasterArgs {
+    /// Agent label to designate as the repo's master. Must already
+    /// be on the roster (`clank agent add <name>` first).
+    pub name: String,
+    /// Repo root. Defaults to the cwd's git toplevel.
+    #[arg(long, value_name = "PATH")]
+    pub repo: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
 pub struct AgentRemoveArgs {
     /// Agent label to remove.
     pub label: String,
-    /// Remove the DEFINITION from user-scope
-    /// `~/.clank/config.json#/agents` (and scrub it from any team
-    /// that references it). Without `--global`, removes the
-    /// definition from THIS repo's `agents` map — which refuses
-    /// while the label is still in the repo's team (run
-    /// `clank team remove <label>` first).
+    /// Remove the DESCRIPTION from the user-scope library
+    /// (`~/.clank/config.json#/agents`) and scrub it from any team
+    /// template that references it. Without `--global`, removes the
+    /// agent from THIS repo's roster.
     #[arg(long)]
     pub global: bool,
     /// Repo root. Defaults to the cwd's git toplevel.
@@ -959,12 +977,11 @@ pub struct AgentRemoveArgs {
     pub repo: Option<PathBuf>,
 }
 
-/// `clank team` — compose THIS repo's operating team (its single
-/// `<repo>/.clank/config.json#/team`) plus inspect/delete the
-/// global team-template LIBRARY (`~/.clank/config.json#/teams`).
-/// Plan: `teams-based-agent-registration`. `add` / `remove` /
-/// `set-master` / `show` operate on the repo team; `list` /
-/// `delete` operate on the global library.
+/// `clank team` — GLOBAL roster-template library only
+/// (`~/.clank/config.json#/teams`). A "team" is no longer a repo
+/// concept: the repo's roster (`clank agent …`) is the operating
+/// team. `save` captures the repo roster as a template; `init
+/// --team` seeds a repo from one. Plan: `repo-agents-no-team`.
 #[derive(Args, Debug)]
 pub struct TeamArgs {
     #[command(subcommand)]
@@ -973,29 +990,16 @@ pub struct TeamArgs {
 
 #[derive(clap::Subcommand, Debug)]
 pub enum TeamCmd {
-    /// Show THIS repo's operating team: master + both reviewer
-    /// tiers (replaces the old global `team show <name>`).
-    Show(TeamShowArgs),
-    /// Add an existing agent (by name) to THIS repo's team's
-    /// commit (default) or gate reviewer list. Resolves the label
-    /// from repo `agents`, else copies the description down from
-    /// user-scope `agents`.
-    Add(TeamAddArgs),
-    /// Remove an agent from THIS repo's team (master or a reviewer
-    /// list). Leaves the definition in `agents`.
-    Remove(TeamRemoveArgs),
-    /// Set THIS repo's team master; the previous master (if any)
-    /// is demoted into commit_reviewers.
-    SetMaster(TeamSetMasterArgs),
-    /// Publish THIS repo's operating team as a reusable global
-    /// template under `<name>` (user-scope `teams`), copying the
-    /// team's referenced agent definitions into user-scope
-    /// `agents`. Refuses if a referenced agent already exists
-    /// globally with a different body; pass `--force` to overwrite
-    /// an existing team name.
+    /// Publish THIS repo's roster as a reusable global template
+    /// under `<name>` (user-scope `teams`), copying the roster's
+    /// agent definitions into user-scope `agents`. Refuses if a
+    /// referenced agent already exists globally with a different
+    /// body; pass `--force` to overwrite an existing team name.
     Save(TeamSaveArgs),
     /// List the global team-template library (user-scope).
     List(TeamListArgs),
+    /// Show a single global team template (its roster).
+    Show(TeamShowArgs),
     /// Delete a global team template. Refuses without `--force`
     /// (clank can't introspect which repos reference it).
     Delete(TeamDeleteArgs),
@@ -1010,9 +1014,8 @@ pub struct TeamListArgs {
 
 #[derive(Args, Debug)]
 pub struct TeamShowArgs {
-    /// Repo root. Defaults to the cwd's git toplevel.
-    #[arg(long, value_name = "PATH")]
-    pub repo: Option<PathBuf>,
+    /// Team template name to show (user-scope `teams`).
+    pub team: String,
     /// Emit machine-readable JSON instead of human text.
     #[arg(short = 'j', long)]
     pub json: bool,
@@ -1022,44 +1025,11 @@ pub struct TeamShowArgs {
 pub struct TeamDeleteArgs {
     /// Team name to delete.
     pub team: String,
-    /// Delete even if the team is potentially referenced by a
-    /// repo's `team` field (clank can't introspect that, so
-    /// this is the explicit user opt-in).
+    /// Delete even if a repo may be seeded from this template
+    /// (clank can't introspect that, so this is the explicit user
+    /// opt-in).
     #[arg(long)]
     pub force: bool,
-}
-
-#[derive(Args, Debug)]
-pub struct TeamAddArgs {
-    /// Agent label to add to THIS repo's team. Resolved from repo
-    /// `agents`, else copied down from user-scope `agents`.
-    pub agent: String,
-    /// Which review kind this agent does. Default `commit`.
-    #[arg(long, value_enum, default_value = "commit")]
-    pub review: ReviewKindArg,
-    /// Repo root. Defaults to the cwd's git toplevel.
-    #[arg(long, value_name = "PATH")]
-    pub repo: Option<PathBuf>,
-}
-
-#[derive(Args, Debug)]
-pub struct TeamRemoveArgs {
-    /// Agent label to remove from THIS repo's team.
-    pub agent: String,
-    /// Repo root. Defaults to the cwd's git toplevel.
-    #[arg(long, value_name = "PATH")]
-    pub repo: Option<PathBuf>,
-}
-
-#[derive(Args, Debug)]
-pub struct TeamSetMasterArgs {
-    /// Agent label to designate as THIS repo's master. Resolved
-    /// from repo `agents`, else copied down from user-scope
-    /// `agents`.
-    pub agent: String,
-    /// Repo root. Defaults to the cwd's git toplevel.
-    #[arg(long, value_name = "PATH")]
-    pub repo: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -1418,11 +1388,12 @@ mod agent_team_cli_parse_tests {
     }
 
     #[test]
-    fn agent_add_requires_tool() {
-        // M2: `--tool` is now REQUIRED on `agent add`.
+    fn agent_add_tool_is_optional_for_by_name() {
+        // repo-agents-no-team: `agent add <name>` BY NAME (no
+        // `--tool`) is valid (copy-down from the library).
         assert!(
-            AgentT::try_parse_from(["t", "add", "claude"]).is_err(),
-            "agent add without --tool must be a clap error"
+            AgentT::try_parse_from(["t", "add", "claude"]).is_ok(),
+            "agent add by-name (no --tool) must parse"
         );
         assert!(
             AgentT::try_parse_from(["t", "add", "claude", "--tool", "claude"]).is_ok(),
@@ -1431,38 +1402,64 @@ mod agent_team_cli_parse_tests {
     }
 
     #[test]
-    fn agent_add_no_longer_accepts_review_flag() {
-        // `--review` moved to `clank team add`.
+    fn agent_add_accepts_review_flag() {
+        // `--review` is back on `agent add` (one-step define + role).
         assert!(
             AgentT::try_parse_from(["t", "add", "claude", "--tool", "claude", "--review", "gate"])
-                .is_err(),
-            "agent add --review must no longer parse"
+                .is_ok(),
+            "agent add --review gate must parse"
         );
-    }
-
-    #[test]
-    fn agent_promote_no_longer_parses() {
-        // M2: `clank agent promote` is removed (moved to
-        // `clank team set-master`).
         assert!(
-            AgentT::try_parse_from(["t", "promote", "codex"]).is_err(),
-            "agent promote must no longer be a subcommand"
+            AgentT::try_parse_from(["t", "add", "claude", "--review", "commit"]).is_ok(),
+            "agent add --review commit (by name) must parse"
         );
     }
 
     #[test]
-    fn team_repo_subcommands_take_no_team_name() {
-        // Repo-team subcommands take ONLY a label (no team-name arg).
-        assert!(TeamT::try_parse_from(["t", "add", "codex"]).is_ok());
-        assert!(TeamT::try_parse_from(["t", "add", "codex", "--review", "gate"]).is_ok());
-        assert!(TeamT::try_parse_from(["t", "remove", "codex"]).is_ok());
-        assert!(TeamT::try_parse_from(["t", "set-master", "codex"]).is_ok());
-        assert!(TeamT::try_parse_from(["t", "show"]).is_ok());
+    fn agent_set_master_parses() {
+        assert!(
+            AgentT::try_parse_from(["t", "set-master", "codex"]).is_ok(),
+            "agent set-master <name> must parse"
+        );
+    }
+
+    #[test]
+    fn agent_global_requires_tool_handled_at_runtime() {
+        // `--global` without `--tool` PARSES (the requirement is
+        // enforced at runtime, not by clap, so the by-name path can
+        // omit --tool).
+        assert!(AgentT::try_parse_from(["t", "add", "claude", "--global"]).is_ok());
+        assert!(
+            AgentT::try_parse_from(["t", "add", "claude", "--global", "--tool", "claude"]).is_ok()
+        );
+    }
+
+    #[test]
+    fn team_repo_subcommands_are_removed() {
+        // repo-agents-no-team: team {add,remove,set-master,show <none>}
+        // are gone (they moved to `clank agent …`).
+        assert!(
+            TeamT::try_parse_from(["t", "add", "codex"]).is_err(),
+            "team add must no longer be a subcommand"
+        );
+        assert!(
+            TeamT::try_parse_from(["t", "remove", "codex"]).is_err(),
+            "team remove must no longer be a subcommand"
+        );
+        assert!(
+            TeamT::try_parse_from(["t", "set-master", "codex"]).is_err(),
+            "team set-master must no longer be a subcommand"
+        );
+        // `team show` now REQUIRES a template name (global only).
+        assert!(
+            TeamT::try_parse_from(["t", "show"]).is_err(),
+            "team show now requires a <name>"
+        );
+        assert!(TeamT::try_parse_from(["t", "show", "dev"]).is_ok());
     }
 
     #[test]
     fn team_create_is_removed() {
-        // M2: `clank team create` is removed.
         assert!(
             TeamT::try_parse_from(["t", "create", "dev"]).is_err(),
             "team create must no longer be a subcommand"
@@ -1471,6 +1468,8 @@ mod agent_team_cli_parse_tests {
 
     #[test]
     fn team_library_subcommands_still_parse() {
+        assert!(TeamT::try_parse_from(["t", "save", "dev"]).is_ok());
+        assert!(TeamT::try_parse_from(["t", "save", "dev", "--force"]).is_ok());
         assert!(TeamT::try_parse_from(["t", "list"]).is_ok());
         assert!(TeamT::try_parse_from(["t", "delete", "dev"]).is_ok());
         assert!(TeamT::try_parse_from(["t", "delete", "dev", "--force"]).is_ok());

@@ -1,14 +1,17 @@
-//! `clank agent` — enumerate / launch / declare agents under the
-//! team-based registration model (`teams-based-agent-registration`).
+//! `clank agent` — the repo's ROSTER plus the user-scope agent
+//! library (`repo-agents-no-team`).
 //!
-//! Source of truth for "who is registered in this repo" is the
-//! TEAM RESOLVER (`agent_store::try_resolve_via_team`): the
-//! repo's own `agents` map + its single `team` composition (the
-//! repo config is self-contained).
+//! The repo config's `agents` IS the operating roster: a flat
+//! `BTreeMap<AgentLabel, RosterAgent>` where each entry carries
+//! its definition (tool / launch / initial_prompt) AND its role
+//! (master / commit / gate). There is no separate `team`.
+//! `agent add` is ONE step (definition + role); `agent set-master`
+//! picks the master; the ROLE RESOLVER
+//! (`agent_store::try_resolve_via_team`) reads the roster directly.
 //! The per-agent skeleton at `.clank/agents/<label>/config.json`
 //! holds ONLY per-machine state (`auto_mode`, `wfw_timeout`,
-//! `session`) — no role / tool / launch declaration. `list`
-//! joins the resolved set with each agent's skeleton session.
+//! `session`). `list` joins the resolved set with each agent's
+//! skeleton session.
 
 use std::path::Path;
 
@@ -16,14 +19,17 @@ use anyhow::Context;
 use serde::Serialize;
 
 use crate::agent_store::load_agent_config;
-use crate::cli::teams_config::{AgentDescription, RepoConfigFile, UserConfigFile};
+use crate::cli::teams_config::{
+    AgentDescription, RepoConfigFile, RosterAgent, RosterRole, UserConfigFile,
+};
 use clank_core::agent_config::{LaunchConfig, Session};
 use clank_core::ids::AgentLabel;
 use clank_core::vocab::{AutoMode, Tool};
 use std::collections::BTreeMap;
 
 use super::{
-    AgentAddArgs, AgentArgs, AgentCmd, AgentListArgs, AgentRemoveArgs, AgentStartArgs, resolve_repo,
+    AgentAddArgs, AgentArgs, AgentCmd, AgentListArgs, AgentRemoveArgs, AgentSetMasterArgs,
+    AgentStartArgs, resolve_repo,
 };
 
 pub async fn run(args: AgentArgs) -> anyhow::Result<()> {
@@ -31,6 +37,7 @@ pub async fn run(args: AgentArgs) -> anyhow::Result<()> {
         AgentCmd::List(a) => list(a),
         AgentCmd::Start(a) => start(a),
         AgentCmd::Add(a) => add(a),
+        AgentCmd::SetMaster(a) => set_master(a),
         AgentCmd::Remove(a) => remove(a),
     }
 }
@@ -77,11 +84,12 @@ impl AgentRow {
 
 fn list(args: AgentListArgs) -> anyhow::Result<()> {
     let repo = resolve_repo(args.repo.as_deref())?;
-    // Registration is the resolved team set; skeleton supplies
+    // Registration is the resolved roster set; skeleton supplies
     // session state only.
     let Some(set) = crate::agent_store::try_resolve_via_team(&repo)? else {
         anyhow::bail!(
-            "this repo has no team configured. Run `clank init --team <name>` to set one."
+            "this repo has no master agent. Run `clank init --team <name>` or \
+             `clank agent set-master <agent>` to set one."
         );
     };
     let mut rows: Vec<AgentRow> = Vec::new();
@@ -182,17 +190,18 @@ fn start(args: AgentStartArgs) -> anyhow::Result<()> {
     let label = AgentLabel::parse(&args.name)
         .map_err(|e| anyhow::anyhow!("invalid agent label `{}`: {e}", args.name))?;
 
-    // Registration is the resolved team set. The agent's
+    // Registration is the resolved roster set. The agent's
     // description (tool / launch / initial_prompt) comes from
     // there; the skeleton supplies only session + auto_mode.
     let Some(set) = crate::agent_store::try_resolve_via_team(&repo)? else {
         anyhow::bail!(
-            "this repo has no team configured. Run `clank init --team <name>` to set one."
+            "this repo has no master agent. Run `clank init --team <name>` or \
+             `clank agent set-master <agent>` to set one."
         );
     };
     let desc = find_in_set(&set, &label).ok_or_else(|| {
         anyhow::anyhow!(
-            "no agent `{}` registered in this repo's team (master/reviewers: {})",
+            "no agent `{}` on this repo's roster (master/reviewers: {})",
             args.name,
             registered_labels(&set).join(", ")
         )
@@ -526,38 +535,64 @@ fn exec_composed(c: ComposedLaunch) -> anyhow::Result<()> {
     Ok(())
 }
 
-// ── clank agent add / remove (definition registry) ───────────
+// ── clank agent add / set-master / remove ────────────────────
 //
-// `clank agent` is the agent DEFINITION registry. `--global`
-// edits user-scope `~/.clank/config.json#/agents`; repo-scope
-// (default) edits THIS repo's own `agents` map. NEITHER touches
-// the team — composing the operating team is `clank team`'s job.
+// The repo's `agents` IS the roster. `agent add` is ONE step
+// (definition + role). Three modes:
+//   - `--global --tool`: write a role-free DESCRIPTION into the
+//     user-scope `agents` LIBRARY (no repo change);
+//   - repo `--tool`: define a fresh agent inline → insert a
+//     RosterAgent with the `--review` role;
+//   - repo by-name (no `--tool`): copy a description from the
+//     user-scope library → insert a RosterAgent with the role.
 // Per-agent skeletons hold only state (session / auto_mode /
 // wfw_timeout) — never declaration.
 
-/// `clank agent add <label> --tool <...> [...]` — thin shell:
-/// resolve env, build the launch profile, dispatch to a `pub`
-/// core. `--tool` is required (a definition needs a tool).
+/// `clank agent add <label> [--global] [--tool ...] [--review ...]`
+/// — thin shell: parse the label + role, build the launch profile,
+/// dispatch to the matching `pub` core by scope/tool.
 fn add(args: AgentAddArgs) -> anyhow::Result<()> {
     let label = AgentLabel::parse(&args.label)
         .map_err(|e| anyhow::anyhow!("invalid agent label `{}`: {e}", args.label))?;
-    let env = parse_env_overrides(&args.launch_envs)?;
-    let launch = build_launch(args.launch_cmd, args.launch_args, env);
-    let desc = AgentDescription {
-        tool: args.tool.into(),
-        launch,
-        initial_prompt: args.initial_prompt.clone(),
-    };
+    let role: RosterRole = crate::cli::teams_config::ReviewKind::from(args.review).into();
 
     if args.global {
+        let tool = args.tool.ok_or_else(|| {
+            anyhow::anyhow!("--global requires --tool (a library description needs a tool)")
+        })?;
+        let env = parse_env_overrides(&args.launch_envs)?;
+        let launch = build_launch(args.launch_cmd, args.launch_args, env);
+        let desc = AgentDescription {
+            tool: tool.into(),
+            launch,
+            initial_prompt: args.initial_prompt.clone(),
+        };
         let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
         let home_ref = home
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("--global requires $HOME"))?;
         declare_global_agent(home_ref, &label, desc)?;
-    } else {
-        let repo = resolve_repo(args.repo.as_deref())?;
-        define_repo_agent(&repo, &label, desc)?;
+        return Ok(());
+    }
+
+    let repo = resolve_repo(args.repo.as_deref())?;
+    match args.tool {
+        // Inline definition: a fresh agent built from CLI flags.
+        Some(tool) => {
+            let env = parse_env_overrides(&args.launch_envs)?;
+            let launch = build_launch(args.launch_cmd, args.launch_args, env);
+            let desc = AgentDescription {
+                tool: tool.into(),
+                launch,
+                initial_prompt: args.initial_prompt.clone(),
+            };
+            add_repo_roster_agent(&repo, &label, desc, role)?;
+        }
+        // By-name: copy the description from the user-scope library.
+        None => {
+            let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+            add_repo_roster_agent_by_name(&repo, home.as_deref(), &label, role)?;
+        }
     }
     Ok(())
 }
@@ -565,11 +600,10 @@ fn add(args: AgentAddArgs) -> anyhow::Result<()> {
 // ── agent mutation cores ─────────────────────────────────────
 //
 // `pub`, env-free (explicit `home`/`repo`), args-free. Both
-// `run()` and integration-test setup call these. Plan:
-// dogfood-init-setup-in-tests (Phase A).
+// `run()` and integration-test setup call these.
 
-/// Declare an agent DESCRIPTION in user-scope `agents`. Errors if
-/// the label already exists there.
+/// Declare an agent DESCRIPTION in the user-scope `agents`
+/// library (role-free). Errors if the label already exists there.
 pub fn declare_global_agent(
     home: &Path,
     label: &AgentLabel,
@@ -588,26 +622,122 @@ pub fn declare_global_agent(
     Ok(())
 }
 
-/// Write an agent DEFINITION into THIS repo's `agents` map.
-/// Does NOT touch the team — composing the operating team is
-/// `clank team`'s job. Errors if the label is already defined in
-/// the repo (a definition is never silently overwritten).
-pub fn define_repo_agent(
+/// Insert a fresh agent (built inline from a description) into
+/// THIS repo's roster with the given role. Errors if the label is
+/// already on the roster (a roster entry is never silently
+/// overwritten).
+pub fn add_repo_roster_agent(
     repo: &Path,
     label: &AgentLabel,
     desc: AgentDescription,
+    role: RosterRole,
 ) -> anyhow::Result<()> {
     let mut repo_cfg = read_repo_config(repo)?;
     if repo_cfg.agents.contains_key(label) {
         anyhow::bail!(
-            "agent `{label}` is already defined in this repo's `agents`. \
+            "agent `{label}` is already on this repo's roster. \
              Remove it with `clank agent remove {label}` first, or pick a different name.",
             label = label.as_str()
         );
     }
-    repo_cfg.agents.insert(label.clone(), desc);
+    repo_cfg
+        .agents
+        .insert(label.clone(), RosterAgent::from_description(desc, role));
     write_repo_config(repo, &repo_cfg)?;
-    eprintln!("defined `{}` in this repo's `agents`", label.as_str());
+    eprintln!(
+        "added `{}` to this repo's roster as a `{}` reviewer",
+        label.as_str(),
+        role_word(role)
+    );
+    Ok(())
+}
+
+/// Add `<label>` to THIS repo's roster BY NAME: copy its
+/// description from the user-scope `agents` library and insert it
+/// with the given role. Errors if the label isn't in the library
+/// (suggesting `--tool` to define it inline, or `agent add
+/// --global --tool` to populate the library first).
+pub fn add_repo_roster_agent_by_name(
+    repo: &Path,
+    home: Option<&Path>,
+    label: &AgentLabel,
+    role: RosterRole,
+) -> anyhow::Result<()> {
+    let mut repo_cfg = read_repo_config(repo)?;
+    if repo_cfg.agents.contains_key(label) {
+        anyhow::bail!(
+            "agent `{label}` is already on this repo's roster. \
+             Remove it with `clank agent remove {label}` first, or pick a different name.",
+            label = label.as_str()
+        );
+    }
+    let user_desc = home
+        .map(|h| -> anyhow::Result<Option<AgentDescription>> {
+            Ok(read_user_config(h)?.agents.get(label).cloned())
+        })
+        .transpose()?
+        .flatten();
+    let desc = user_desc.ok_or_else(|| {
+        anyhow::anyhow!(
+            "unknown agent `{label}`: not in the user-scope `agents` library. \
+             Define it inline with `clank agent add {label} --tool <claude|codex>`, \
+             or add it to the library first with \
+             `clank agent add {label} --global --tool <claude|codex>`.",
+            label = label.as_str()
+        )
+    })?;
+    repo_cfg
+        .agents
+        .insert(label.clone(), RosterAgent::from_description(desc, role));
+    write_repo_config(repo, &repo_cfg)?;
+    eprintln!(
+        "added `{}` to this repo's roster as a `{}` reviewer (copied from the library)",
+        label.as_str(),
+        role_word(role)
+    );
+    Ok(())
+}
+
+/// `clank agent set-master <name>` — thin shell.
+fn set_master(args: AgentSetMasterArgs) -> anyhow::Result<()> {
+    let label = AgentLabel::parse(&args.name)
+        .map_err(|e| anyhow::anyhow!("invalid agent label `{}`: {e}", args.name))?;
+    let repo = resolve_repo(args.repo.as_deref())?;
+    set_repo_master(&repo, &label)
+}
+
+/// Set THIS repo's master to `<label>`:
+/// `repo.agents[<label>].role = Master`, demoting the previous
+/// master (if any, and different) to `Commit`. The agent must
+/// already be on the roster.
+pub fn set_repo_master(repo: &Path, label: &AgentLabel) -> anyhow::Result<()> {
+    let mut repo_cfg = read_repo_config(repo)?;
+    if !repo_cfg.agents.contains_key(label) {
+        anyhow::bail!(
+            "agent `{label}` is not on this repo's roster. \
+             Add it first with `clank agent add {label} --tool <claude|codex>` \
+             (or by name: `clank agent add {label}`).",
+            label = label.as_str()
+        );
+    }
+
+    // Already the master → no-op.
+    if repo_cfg.agents.get(label).map(|a| a.role) == Some(RosterRole::Master) {
+        eprintln!("note: `{}` is already this repo's master", label.as_str());
+        return Ok(());
+    }
+
+    // Demote the previous master to commit.
+    for (other, agent) in repo_cfg.agents.iter_mut() {
+        if other != label && agent.role == RosterRole::Master {
+            agent.role = RosterRole::Commit;
+        }
+    }
+    if let Some(agent) = repo_cfg.agents.get_mut(label) {
+        agent.role = RosterRole::Master;
+    }
+    write_repo_config(repo, &repo_cfg)?;
+    eprintln!("set `{}` as this repo's master", label.as_str());
     Ok(())
 }
 
@@ -618,7 +748,7 @@ fn remove(args: AgentRemoveArgs) -> anyhow::Result<()> {
 
     if args.global {
         // User-scope op: needs only $HOME, never repo discovery (mirror
-        // `agent add --global`) — codex ec37092.
+        // `agent add --global`).
         let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
         let home_ref = home
             .as_deref()
@@ -631,28 +761,17 @@ fn remove(args: AgentRemoveArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Remove an agent DESCRIPTION from user-scope `agents` and scrub
-/// it from every team composition (master + both reviewer tiers)
-/// so no dangling reference survives.
+/// Remove an agent DESCRIPTION from the user-scope `agents`
+/// library and scrub it from every team template (a Roster) so no
+/// dangling reference survives.
 pub fn remove_global_agent(home: &Path, label: &AgentLabel) -> anyhow::Result<()> {
     let mut file = read_user_config(home)?;
     if file.agents.remove(label).is_none() {
         anyhow::bail!("agent `{}` not in user-scope `agents`", label.as_str());
     }
     let mut touched = Vec::new();
-    for (name, team) in file.teams.iter_mut() {
-        let before = team.commit_reviewers.len()
-            + team.gate_reviewers.len()
-            + usize::from(team.master.is_some());
-        if team.master.as_ref() == Some(label) {
-            team.master = None;
-        }
-        team.commit_reviewers.retain(|l| l != label);
-        team.gate_reviewers.retain(|l| l != label);
-        let after = team.commit_reviewers.len()
-            + team.gate_reviewers.len()
-            + usize::from(team.master.is_some());
-        if before != after {
+    for (name, roster) in file.teams.iter_mut() {
+        if roster.remove(label).is_some() {
             touched.push(name.clone());
         }
     }
@@ -669,103 +788,26 @@ pub fn remove_global_agent(home: &Path, label: &AgentLabel) -> anyhow::Result<()
     Ok(())
 }
 
-/// Remove an agent DEFINITION from THIS repo's `agents` map.
-/// Refuses while the label is still referenced by the repo team
-/// (master or either reviewer list) — the team is the operating
-/// roster, so the user must `clank team remove <label>` first.
-/// Leaves the team untouched.
+/// Remove an agent from THIS repo's roster. Errors if the label
+/// isn't on the roster.
 pub fn remove_repo_agent(repo: &Path, label: &AgentLabel) -> anyhow::Result<()> {
     let mut repo_cfg = read_repo_config(repo)?;
-    let in_team = repo_cfg.team.master.as_ref() == Some(label)
-        || repo_cfg.team.commit_reviewers.contains(label)
-        || repo_cfg.team.gate_reviewers.contains(label);
-    if in_team {
-        anyhow::bail!(
-            "`{label}` is in this repo's team; run `clank team remove {label}` first",
-            label = label.as_str()
-        );
-    }
     if repo_cfg.agents.remove(label).is_none() {
-        anyhow::bail!(
-            "agent `{}` is not defined in this repo's `agents`",
-            label.as_str()
-        );
+        anyhow::bail!("agent `{}` is not on this repo's roster", label.as_str());
     }
     write_repo_config(repo, &repo_cfg)?;
-    eprintln!("removed `{}` from this repo's `agents`", label.as_str());
+    eprintln!("removed `{}` from this repo's roster", label.as_str());
     Ok(())
 }
 
-/// Set THIS repo's team master to `promoted`. The agent must
-/// already be defined in `repo.agents` (the repo is
-/// self-contained). The previous master, if different, is
-/// demoted into `commit_reviewers`. Validated via the resolver
-/// before persisting, so an unknown/invalid target errors before
-/// the config is mutated.
-///
-/// Used by `clank team set-master` (the CLI entry moved there
-/// from the removed `clank agent promote`).
-///
-/// `home` is unused (kept for signature stability with the
-/// previous user-scope-aware version).
-///
-/// Returns:
-/// - `Ok(true)` when written (or a no-op).
-/// - `Ok(false)` when the repo has no config file at all (the
-///   caller then errors with the no-config message).
-/// - `Err(_)` on parse failure or an invalid promote target.
-pub fn promote_repo_master(
-    repo: &Path,
-    _home: Option<&Path>,
-    promoted: &AgentLabel,
-) -> anyhow::Result<bool> {
-    use crate::cli::teams_config::RepoConfigFile;
-    use anyhow::Context;
-
-    let repo_cfg_path = repo.join(".clank/config.json");
-    let body = match std::fs::read_to_string(&repo_cfg_path) {
-        Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(e) => return Err(e.into()),
-    };
-    let mut repo_cfg: RepoConfigFile = serde_json::from_str(&body).map_err(|e| {
-        anyhow::anyhow!(
-            "parsing {} as new-schema RepoConfigFile: {e}",
-            repo_cfg_path.display()
-        )
-    })?;
-
-    // No-op short-circuit: already the master.
-    if repo_cfg.team.master.as_ref() == Some(promoted) {
-        eprintln!(
-            "note: `{}` is already this repo's master",
-            promoted.as_str()
-        );
-        return Ok(true);
+/// Human word for a non-master roster role (used in `add`
+/// confirmations).
+fn role_word(role: RosterRole) -> &'static str {
+    match role {
+        RosterRole::Master => "master",
+        RosterRole::Commit => "commit",
+        RosterRole::Gate => "gate",
     }
-
-    // Build the proposed team in a clone and validate via the
-    // resolver before persisting. Demote the previous master (if
-    // any, and different) into commit_reviewers; promote the
-    // target out of whatever reviewer list it was in.
-    let mut probe = repo_cfg.clone();
-    if let Some(prev) = probe.team.master.take()
-        && &prev != promoted
-        && !probe.team.commit_reviewers.contains(&prev)
-    {
-        probe.team.commit_reviewers.push(prev);
-    }
-    probe.team.commit_reviewers.retain(|l| l != promoted);
-    probe.team.gate_reviewers.retain(|l| l != promoted);
-    probe.team.master = Some(promoted.clone());
-
-    crate::cli::teams_config::resolve_registered_set(&probe)
-        .with_context(|| format!("validating `promote {}`", promoted.as_str()))?;
-
-    repo_cfg = probe;
-    write_repo_config(repo, &repo_cfg)?;
-    eprintln!("promoted `{}` to this repo's master", promoted.as_str());
-    Ok(true)
 }
 
 fn parse_env_overrides(raw: &[String]) -> anyhow::Result<BTreeMap<String, String>> {
@@ -805,7 +847,15 @@ fn build_launch(
 fn read_user_config(home: &Path) -> anyhow::Result<UserConfigFile> {
     let path = home.join(".clank/config.json");
     match std::fs::read_to_string(&path) {
-        Ok(s) => serde_json::from_str(&s).with_context(|| format!("parsing {}", path.display())),
+        Ok(s) => serde_json::from_str(&s).map_err(|e| {
+            // An OLD-shape `teams` value (a TeamComposition, not a
+            // roster) fails to parse here — fail closed with the
+            // re-save hint instead of a cryptic serde message.
+            match crate::cli::teams_config::old_teams_shape_hint(&s) {
+                Some(hint) => anyhow::anyhow!("{hint}"),
+                None => anyhow::Error::from(e).context(format!("parsing {}", path.display())),
+            }
+        }),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(UserConfigFile::default()),
         Err(e) => Err(anyhow::Error::from(e).context(format!("reading {}", path.display()))),
     }
@@ -892,105 +942,9 @@ mod tests {
         std::fs::write(repo.join(".clank/config.json"), body).unwrap();
     }
 
-    #[test]
-    fn promote_sets_team_master_and_demotes_previous() {
-        // `clank promote codex` sets team.master = codex and
-        // demotes the previous master (claude) into
-        // commit_reviewers.
-        use crate::cli::teams_config::RepoConfigFile;
-        let repo = tempfile::tempdir().unwrap();
-        seed_repo_config(
-            repo.path(),
-            r#"{
-                "agents": {
-                    "claude": { "tool": "claude" },
-                    "codex": { "tool": "codex" }
-                },
-                "team": { "master": "claude", "commit_reviewers": ["codex"] }
-            }"#,
-        );
-
-        let codex_label = AgentLabel::parse("codex").unwrap();
-        let handled = promote_repo_master(repo.path(), None, &codex_label).unwrap();
-
-        assert!(handled, "config exists → handled");
-        let body = std::fs::read_to_string(repo.path().join(".clank/config.json")).unwrap();
-        let parsed: RepoConfigFile = serde_json::from_str(&body).unwrap();
-        assert_eq!(
-            parsed.team.master.as_ref().map(|l| l.as_str()),
-            Some("codex")
-        );
-        // claude (prev master) demoted to commit_reviewers; codex
-        // removed from there.
-        let cr: Vec<_> = parsed
-            .team
-            .commit_reviewers
-            .iter()
-            .map(|l| l.as_str())
-            .collect();
-        assert!(cr.contains(&"claude"));
-        assert!(!cr.contains(&"codex"));
-    }
-
-    #[test]
-    fn promote_returns_false_when_no_repo_config() {
-        let repo = tempfile::tempdir().unwrap();
-        let label = AgentLabel::parse("codex").unwrap();
-        let handled = promote_repo_master(repo.path(), None, &label).unwrap();
-        assert!(!handled);
-    }
-
-    #[test]
-    fn promote_rejects_nonexistent_label_before_persisting() {
-        // Probe-resolve-before-persist: a label not defined in
-        // `agents` must error BEFORE the config is mutated.
-        use crate::cli::teams_config::RepoConfigFile;
-        let repo = tempfile::tempdir().unwrap();
-        seed_repo_config(
-            repo.path(),
-            r#"{
-                "agents": { "claude": { "tool": "claude" } },
-                "team": { "master": "claude" }
-            }"#,
-        );
-
-        let phantom = AgentLabel::parse("phantom").unwrap();
-        let err = promote_repo_master(repo.path(), None, &phantom).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("validating") || msg.contains("phantom") || msg.contains("not defined"),
-            "expected resolver-rejection error; got: {msg}"
-        );
-        // Repo config was NOT mutated — master still claude.
-        let body = std::fs::read_to_string(repo.path().join(".clank/config.json")).unwrap();
-        let parsed: RepoConfigFile = serde_json::from_str(&body).unwrap();
-        assert_eq!(
-            parsed.team.master.as_ref().map(|l| l.as_str()),
-            Some("claude")
-        );
-    }
-
-    #[test]
-    fn promote_no_op_when_already_master() {
-        use crate::cli::teams_config::RepoConfigFile;
-        let repo = tempfile::tempdir().unwrap();
-        seed_repo_config(
-            repo.path(),
-            r#"{
-                "agents": { "claude": { "tool": "claude" } },
-                "team": { "master": "claude" }
-            }"#,
-        );
-
-        let claude = AgentLabel::parse("claude").unwrap();
-        let handled = promote_repo_master(repo.path(), None, &claude).unwrap();
-        assert!(handled, "no-op short-circuit should return true");
-        let body = std::fs::read_to_string(repo.path().join(".clank/config.json")).unwrap();
-        let parsed: RepoConfigFile = serde_json::from_str(&body).unwrap();
-        assert_eq!(
-            parsed.team.master.as_ref().map(|l| l.as_str()),
-            Some("claude")
-        );
+    fn read_repo(repo: &Path) -> crate::cli::teams_config::RepoConfigFile {
+        let body = std::fs::read_to_string(repo.join(".clank/config.json")).unwrap();
+        serde_json::from_str(&body).unwrap()
     }
 
     fn desc(tool: Tool) -> AgentDescription {
@@ -1001,118 +955,240 @@ mod tests {
         }
     }
 
+    // ── agent add (inline) ───────────────────────────────────
+
     #[test]
-    fn define_repo_agent_writes_agents_only_not_team() {
-        // `clank agent add` (repo scope) writes the definition into
-        // `agents` and leaves the team completely untouched.
-        use crate::cli::teams_config::RepoConfigFile;
+    fn add_repo_roster_agent_inserts_with_role() {
         let repo = tempfile::tempdir().unwrap();
         seed_repo_config(
             repo.path(),
-            r#"{
-                "agents": { "claude": { "tool": "claude" } },
-                "team": { "master": "claude" }
-            }"#,
+            r#"{ "agents": { "claude": { "tool": "claude", "role": "master" } } }"#,
         );
         let codex = AgentLabel::parse("codex").unwrap();
-        define_repo_agent(repo.path(), &codex, desc(Tool::Codex)).unwrap();
-        let body = std::fs::read_to_string(repo.path().join(".clank/config.json")).unwrap();
-        let parsed: RepoConfigFile = serde_json::from_str(&body).unwrap();
-        assert!(parsed.agents.contains_key(&codex));
+        add_repo_roster_agent(repo.path(), &codex, desc(Tool::Codex), RosterRole::Commit).unwrap();
+        let parsed = read_repo(repo.path());
         assert_eq!(parsed.agents[&codex].tool, Tool::Codex);
-        // Team is untouched: master still claude, no reviewers added.
+        assert_eq!(parsed.agents[&codex].role, RosterRole::Commit);
+        // master untouched.
         assert_eq!(
-            parsed.team.master.as_ref().map(|l| l.as_str()),
-            Some("claude")
+            parsed.agents[&AgentLabel::parse("claude").unwrap()].role,
+            RosterRole::Master
         );
-        assert!(parsed.team.commit_reviewers.is_empty());
-        assert!(parsed.team.gate_reviewers.is_empty());
     }
 
     #[test]
-    fn define_repo_agent_rejects_duplicate_label() {
+    fn add_repo_roster_agent_gate_role() {
         let repo = tempfile::tempdir().unwrap();
         seed_repo_config(
             repo.path(),
-            r#"{
-                "agents": { "claude": { "tool": "claude" }, "codex": { "tool": "codex" } },
-                "team": { "master": "claude", "commit_reviewers": ["codex"] }
-            }"#,
+            r#"{ "agents": { "claude": { "tool": "claude", "role": "master" } } }"#,
+        );
+        let ruthless = AgentLabel::parse("ruthless").unwrap();
+        add_repo_roster_agent(repo.path(), &ruthless, desc(Tool::Claude), RosterRole::Gate)
+            .unwrap();
+        let parsed = read_repo(repo.path());
+        assert_eq!(parsed.agents[&ruthless].role, RosterRole::Gate);
+    }
+
+    #[test]
+    fn add_repo_roster_agent_rejects_duplicate_label() {
+        let repo = tempfile::tempdir().unwrap();
+        seed_repo_config(
+            repo.path(),
+            r#"{ "agents": {
+                "claude": { "tool": "claude", "role": "master" },
+                "codex": { "tool": "codex", "role": "commit" }
+            } }"#,
         );
         let codex = AgentLabel::parse("codex").unwrap();
-        let err = define_repo_agent(repo.path(), &codex, desc(Tool::Codex)).unwrap_err();
+        let err = add_repo_roster_agent(repo.path(), &codex, desc(Tool::Codex), RosterRole::Gate)
+            .unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("already defined"));
+        assert!(msg.contains("already on this repo's roster"));
         assert!(msg.contains("clank agent remove"));
     }
 
-    #[test]
-    fn remove_repo_agent_drops_definition_when_not_in_team() {
-        use crate::cli::teams_config::RepoConfigFile;
-        let repo = tempfile::tempdir().unwrap();
-        // `spare` is defined but NOT in the team → removable.
-        seed_repo_config(
-            repo.path(),
-            r#"{
-                "agents": { "claude": { "tool": "claude" }, "spare": { "tool": "codex" } },
-                "team": { "master": "claude" }
-            }"#,
-        );
-        let spare = AgentLabel::parse("spare").unwrap();
-        remove_repo_agent(repo.path(), &spare).unwrap();
-        let body = std::fs::read_to_string(repo.path().join(".clank/config.json")).unwrap();
-        let parsed: RepoConfigFile = serde_json::from_str(&body).unwrap();
-        assert!(!parsed.agents.contains_key(&spare));
-        // master untouched.
-        assert_eq!(
-            parsed.team.master.as_ref().map(|l| l.as_str()),
-            Some("claude")
-        );
+    // ── agent add (by name, copy-down) ───────────────────────
+
+    fn seed_user_config(home: &Path, agents: &[(&str, Tool)]) {
+        let mut cfg = UserConfigFile::default();
+        for (l, t) in agents {
+            cfg.agents.insert(AgentLabel::parse(l).unwrap(), desc(*t));
+        }
+        std::fs::create_dir_all(home.join(".clank")).unwrap();
+        std::fs::write(
+            home.join(".clank/config.json"),
+            serde_json::to_string_pretty(&cfg).unwrap(),
+        )
+        .unwrap();
     }
 
     #[test]
-    fn remove_repo_agent_refuses_when_referenced_by_team() {
-        use crate::cli::teams_config::RepoConfigFile;
+    fn add_by_name_copies_description_from_library() {
+        let home = tempfile::tempdir().unwrap();
+        seed_user_config(home.path(), &[("ruthless", Tool::Claude)]);
         let repo = tempfile::tempdir().unwrap();
         seed_repo_config(
             repo.path(),
-            r#"{
-                "agents": { "claude": { "tool": "claude" }, "codex": { "tool": "codex" } },
-                "team": { "master": "claude", "commit_reviewers": ["codex"] }
-            }"#,
+            r#"{ "agents": { "claude": { "tool": "claude", "role": "master" } } }"#,
         );
-        // Reviewer is refused.
-        let codex = AgentLabel::parse("codex").unwrap();
-        let err = remove_repo_agent(repo.path(), &codex).unwrap_err();
+        let ruthless = AgentLabel::parse("ruthless").unwrap();
+        add_repo_roster_agent_by_name(repo.path(), Some(home.path()), &ruthless, RosterRole::Gate)
+            .unwrap();
+        let parsed = read_repo(repo.path());
+        assert_eq!(parsed.agents[&ruthless].tool, Tool::Claude);
+        assert_eq!(parsed.agents[&ruthless].role, RosterRole::Gate);
+    }
+
+    #[test]
+    fn add_by_name_errors_when_not_in_library() {
+        let home = tempfile::tempdir().unwrap();
+        seed_user_config(home.path(), &[]);
+        let repo = tempfile::tempdir().unwrap();
+        seed_repo_config(
+            repo.path(),
+            r#"{ "agents": { "claude": { "tool": "claude", "role": "master" } } }"#,
+        );
+        let phantom = AgentLabel::parse("phantom").unwrap();
+        let err = add_repo_roster_agent_by_name(
+            repo.path(),
+            Some(home.path()),
+            &phantom,
+            RosterRole::Commit,
+        )
+        .unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("is in this repo's team"));
-        assert!(msg.contains("clank team remove codex"));
-
-        // Master is refused too.
-        let claude = AgentLabel::parse("claude").unwrap();
-        let err = remove_repo_agent(repo.path(), &claude).unwrap_err();
-        assert!(format!("{err:#}").contains("clank team remove claude"));
-
-        // Config unchanged — both definitions survive.
-        let body = std::fs::read_to_string(repo.path().join(".clank/config.json")).unwrap();
-        let parsed: RepoConfigFile = serde_json::from_str(&body).unwrap();
-        assert!(parsed.agents.contains_key(&codex));
-        assert!(parsed.agents.contains_key(&claude));
+        assert!(msg.contains("unknown agent `phantom`"));
+        assert!(msg.contains("--tool"));
+        assert!(msg.contains("--global"));
     }
 
     #[test]
-    fn remove_repo_agent_errors_when_not_defined() {
+    fn add_by_name_rejects_duplicate_label() {
+        let home = tempfile::tempdir().unwrap();
+        seed_user_config(home.path(), &[("codex", Tool::Codex)]);
         let repo = tempfile::tempdir().unwrap();
         seed_repo_config(
             repo.path(),
-            r#"{
-                "agents": { "claude": { "tool": "claude" } },
-                "team": { "master": "claude" }
-            }"#,
+            r#"{ "agents": {
+                "claude": { "tool": "claude", "role": "master" },
+                "codex": { "tool": "codex", "role": "commit" }
+            } }"#,
+        );
+        let codex = AgentLabel::parse("codex").unwrap();
+        let err =
+            add_repo_roster_agent_by_name(repo.path(), Some(home.path()), &codex, RosterRole::Gate)
+                .unwrap_err();
+        assert!(format!("{err:#}").contains("already on this repo's roster"));
+    }
+
+    // ── agent set-master ─────────────────────────────────────
+
+    #[test]
+    fn set_repo_master_sets_and_demotes_previous() {
+        let repo = tempfile::tempdir().unwrap();
+        seed_repo_config(
+            repo.path(),
+            r#"{ "agents": {
+                "claude": { "tool": "claude", "role": "master" },
+                "codex": { "tool": "codex", "role": "commit" }
+            } }"#,
+        );
+        let codex = AgentLabel::parse("codex").unwrap();
+        set_repo_master(repo.path(), &codex).unwrap();
+        let parsed = read_repo(repo.path());
+        assert_eq!(parsed.agents[&codex].role, RosterRole::Master);
+        // Previous master demoted to commit.
+        assert_eq!(
+            parsed.agents[&AgentLabel::parse("claude").unwrap()].role,
+            RosterRole::Commit
+        );
+    }
+
+    #[test]
+    fn set_repo_master_errors_when_not_on_roster() {
+        let repo = tempfile::tempdir().unwrap();
+        seed_repo_config(
+            repo.path(),
+            r#"{ "agents": { "claude": { "tool": "claude", "role": "master" } } }"#,
+        );
+        let phantom = AgentLabel::parse("phantom").unwrap();
+        let err = set_repo_master(repo.path(), &phantom).unwrap_err();
+        assert!(format!("{err:#}").contains("not on this repo's roster"));
+    }
+
+    #[test]
+    fn set_repo_master_no_op_when_already_master() {
+        let repo = tempfile::tempdir().unwrap();
+        seed_repo_config(
+            repo.path(),
+            r#"{ "agents": { "claude": { "tool": "claude", "role": "master" } } }"#,
+        );
+        let claude = AgentLabel::parse("claude").unwrap();
+        set_repo_master(repo.path(), &claude).unwrap();
+        let parsed = read_repo(repo.path());
+        assert_eq!(parsed.agents[&claude].role, RosterRole::Master);
+    }
+
+    // ── agent remove ─────────────────────────────────────────
+
+    #[test]
+    fn remove_repo_agent_drops_from_roster() {
+        let repo = tempfile::tempdir().unwrap();
+        seed_repo_config(
+            repo.path(),
+            r#"{ "agents": {
+                "claude": { "tool": "claude", "role": "master" },
+                "codex": { "tool": "codex", "role": "commit" }
+            } }"#,
+        );
+        let codex = AgentLabel::parse("codex").unwrap();
+        remove_repo_agent(repo.path(), &codex).unwrap();
+        let parsed = read_repo(repo.path());
+        assert!(!parsed.agents.contains_key(&codex));
+        assert!(
+            parsed
+                .agents
+                .contains_key(&AgentLabel::parse("claude").unwrap())
+        );
+    }
+
+    #[test]
+    fn remove_repo_agent_errors_when_not_on_roster() {
+        let repo = tempfile::tempdir().unwrap();
+        seed_repo_config(
+            repo.path(),
+            r#"{ "agents": { "claude": { "tool": "claude", "role": "master" } } }"#,
         );
         let phantom = AgentLabel::parse("phantom").unwrap();
         let err = remove_repo_agent(repo.path(), &phantom).unwrap_err();
-        assert!(format!("{err:#}").contains("not defined"));
+        assert!(format!("{err:#}").contains("not on this repo's roster"));
+    }
+
+    #[test]
+    fn remove_global_agent_scrubs_team_templates() {
+        let home = tempfile::tempdir().unwrap();
+        let mut cfg = UserConfigFile::default();
+        cfg.agents
+            .insert(AgentLabel::parse("codex").unwrap(), desc(Tool::Codex));
+        let mut dev: crate::cli::teams_config::Roster = BTreeMap::new();
+        dev.insert(
+            AgentLabel::parse("codex").unwrap(),
+            RosterAgent::from_description(desc(Tool::Codex), RosterRole::Commit),
+        );
+        cfg.teams.insert("dev".to_string(), dev);
+        std::fs::create_dir_all(home.path().join(".clank")).unwrap();
+        std::fs::write(
+            home.path().join(".clank/config.json"),
+            serde_json::to_string_pretty(&cfg).unwrap(),
+        )
+        .unwrap();
+
+        let codex = AgentLabel::parse("codex").unwrap();
+        remove_global_agent(home.path(), &codex).unwrap();
+        let back = read_user_config(home.path()).unwrap();
+        assert!(!back.agents.contains_key(&codex));
+        assert!(!back.teams.get("dev").unwrap().contains_key(&codex));
     }
 
     #[test]
