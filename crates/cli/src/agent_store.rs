@@ -577,13 +577,13 @@ mod tests {
         let repo = TempDir::new().unwrap();
         let home = TempDir::new().unwrap();
         let r = try_resolve_via_team_with(repo.path(), Some(home.path())).unwrap();
-        assert!(r.is_none(), "no repo config → None (no team configured)");
+        assert!(r.is_none(), "no repo config → None (no master configured)");
     }
 
     #[test]
     fn try_resolve_via_team_with_returns_none_when_empty_config() {
-        // Bootstrapped repo (empty agents, default team) has no
-        // master yet → None (no team configured).
+        // Bootstrapped repo (empty roster) has no master yet →
+        // None (no master configured).
         let repo = TempDir::new().unwrap();
         let home = TempDir::new().unwrap();
         write_repo_config(repo.path(), "{}");

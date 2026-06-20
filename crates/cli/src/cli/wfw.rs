@@ -135,10 +135,9 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
         None => crate::agent_env::resolve_identity_from_env(&repo)?,
     };
 
-    // Resolve --role from the team when omitted: `resolve_role`
-    // returns Master for the team's master and Reviewer for any
-    // tier member (`teams-based-agent-registration`). Errors if
-    // the repo has no team configured.
+    // Resolve --role from the roster when omitted: `resolve_role`
+    // returns Master for the roster's master and Reviewer for any
+    // tier member. Errors if the repo has no master configured.
     let role: Role = match args.role {
         Some(explicit) => explicit.into(),
         None => crate::agent_store::resolve_role(&repo, &author)?,

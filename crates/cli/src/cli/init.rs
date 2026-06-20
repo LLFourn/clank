@@ -14,7 +14,7 @@
 //! It does NOT bind a session, read agent env vars
 //! (`CLAUDE_CODE_SESSION_ID` / `CODEX_THREAD_ID`), prompt for an
 //! identity, or assign a role. Session binding is `clank as`'s
-//! sole job; roles are team-derived.
+//! sole job; roles are roster-derived.
 
 use std::path::Path;
 

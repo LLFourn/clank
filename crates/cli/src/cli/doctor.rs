@@ -307,7 +307,7 @@ pub fn repo_checks(repo: &Path, home: Option<&Path>) -> Vec<CheckResult> {
                             format!("agent: {}", skel_label.as_str()),
                             format!(
                                 "found `.clank/agents/{}/config.json` but `{}` is not in this repo's \
-                                 registered team set (orphan state); add it via `clank agent add {}`, or `rm -rf .clank/agents/{}/` to remove it",
+                                 agent roster (orphan state); add it via `clank agent add {}`, or `rm -rf .clank/agents/{}/` to remove it",
                                 skel_label.as_str(),
                                 skel_label.as_str(),
                                 skel_label.as_str(),

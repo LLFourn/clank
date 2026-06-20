@@ -540,8 +540,8 @@ async fn clank_info_for_repo(
     let agent_configs =
         crate::agent_store::load_all_agent_configs_lossy(repo_root).unwrap_or_default();
 
-    // Master is team-derived (`teams-based-agent-registration`).
-    // Best-effort: a repo with no team configured has no master.
+    // Master is roster-derived. Best-effort: a repo with no
+    // master configured has no master.
     let mut master_agents = Vec::<String>::new();
     if let Ok(Some(set)) = crate::agent_store::try_resolve_via_team_with(repo_root, home) {
         master_agents.push(set.master.as_str().to_string());

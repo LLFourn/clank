@@ -320,8 +320,8 @@ fn doctor_warns_on_orphan_skeleton() {
     );
     let msg = orphan_check["message"].as_str().unwrap_or("");
     assert!(
-        msg.contains("registered team set"),
-        "diagnostic should mention the agent isn't in the registered team set; got: {msg}"
+        msg.contains("agent roster"),
+        "diagnostic should mention the agent isn't in the agent roster; got: {msg}"
     );
     assert!(
         msg.contains("clank agent add"),

@@ -6,8 +6,8 @@
 //! if the session isn't bound — `clank auto` is NOT a bootstrap
 //! path (that's `clank as`).
 //!
-//! `auto_mode` is per-agent STATE. Role is NOT — under
-//! `teams-based-agent-registration` roles are team-derived, so
+//! `auto_mode` is per-agent STATE. Role is NOT — roles are
+//! roster-derived (an agent's entry in the repo roster), so
 //! the `--role` flag here is an accepted no-op (kept only so
 //! older invocations don't hard-error; it prints a note). Change
 //! roles via `clank agent set-master` / `clank agent add`.
@@ -56,7 +56,7 @@ async fn run_on(args: AutoOnArgs) -> anyhow::Result<()> {
         // longer writes anything; change roles via
         // `clank agent set-master` / `clank agent add`.
         eprintln!(
-            "note: `--role` is ignored; roles are team-derived now (use `clank agent set-master`)"
+            "note: `--role` is ignored; roles are roster-derived now (use `clank agent set-master`)"
         );
     }
     Ok(())
@@ -73,7 +73,7 @@ async fn run_off(args: AutoOffArgs) -> anyhow::Result<()> {
     println!("auto-mode for `{}` set to off", label.as_str());
     if args.role.is_some() {
         eprintln!(
-            "note: `--role` is ignored; roles are team-derived now (use `clank agent set-master`)"
+            "note: `--role` is ignored; roles are roster-derived now (use `clank agent set-master`)"
         );
     }
     Ok(())

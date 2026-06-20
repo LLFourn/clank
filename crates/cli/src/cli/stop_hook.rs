@@ -70,9 +70,9 @@ async fn compute_outcome(tool: Tool, repo_override: Option<&Path>) -> HookOutcom
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
     let effective = crate::cli::team::resolve_effective_auto_mode(cfg.as_ref(), home.as_deref());
 
-    // Role is team-derived (`teams-based-agent-registration`).
-    // The hook path is fail-soft: if the repo has no team
-    // configured (or resolution errors), default to Reviewer —
+    // Role is roster-derived. The hook path is fail-soft: if the
+    // repo has no master configured (or resolution errors),
+    // default to Reviewer —
     // a misconfigured repo shouldn't block the agent's session,
     // and Reviewer is the conservative default (won't spuriously
     // drive master-only actions).

@@ -328,7 +328,7 @@ fn compose_multitab(tabs: &[TabSpec], term: (u16, u16)) -> anyhow::Result<String
 fn open_one(repo: &Path, print: bool) -> anyhow::Result<()> {
     let repo = repo.to_path_buf();
     let basename = repo_basename(&repo)?;
-    // Registration is the resolved team set
+    // Registration is the resolved roster
     // (`teams-based-agent-registration`): exactly one master plus
     // its reviewers, no role-triage needed.
     let Some(set) = crate::agent_store::try_resolve_via_team(&repo)? else {
