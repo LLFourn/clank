@@ -15,33 +15,44 @@ flight, positioned exactly where the real row will appear, so when the
 work lands the spinner is simply REPLACED IN PLACE by the result (no
 positional jump).
 
-## Design
+## Invariant (the core rule)
 
-- **Pending review = a review placeholder.** For the latest reviewable
-  commit, show its review block (above the commit, UNDER the plan header)
-  with one row PER REGISTERED REVIEWER: a finished reviewer shows their
-  `✓ / ✓✓ / ✗` row (as today); a reviewer who still owes a verdict shows
-  a spinner in the SAME verdict-mark column + "<name> reviewing…". When
-  that reviewer finishes, the placeholder becomes their verdict row in
-  the same slot — continuous, no jump. Net effect: the latest commit's
-  review block always shows the full reviewer picture (done + in-flight).
-- **Master working = a next-commit placeholder.** When master is
-  producing the next commit, show a placeholder at the TOP of the active
-  plan's section — under the umbrella header, above the latest commit —
-  labeled "<master> working…" using `snap.master` (fallback "master"),
-  with the spinner for liveness. This covers ALL master-producing states:
-  - `MasterToContinue` / `MasterToRevise` / `MasterToCommit` (impl /
-    revision in flight), AND
-  - **`MasterToFinalize`** — finalizing IS making the finish commit, so
-    it gets a spinner placeholder too (the shipped M2 wrongly excluded
-    it, so the gate-FINISHED → master-finalizing moment shows nothing).
-    The row may read "<master> finalizing…" to distinguish the finish
-    commit, or stay "<master> working…"; either way it animates.
-  (Still excluded: `Blocked` — that's the block ask, a human's turn, no
-  spinner — and `MasterToFixCommitTag`, an amend already surfaced by the
-  `fix` gauge.)
-- **Both live UNDER the plan umbrella header**, never above it. Remove
-  M2's prepend-to-whole-timeline placement.
+**Whenever the gate is WAITING ON AN AGENT to produce something, the
+timeline shows a spinner in the EXACT slot that output will occupy, with
+ITALIC text saying what we're waiting on them for.** When the work lands,
+the spinner row is REPLACED IN PLACE by the real row — no positional
+jump. One rule for every waiting state; the two cases below are instances
+of it. Row shape: `<spinner> <agent-name(dim)> <wait-verb(italic)…>`,
+positioned so it becomes the real row. (The wait-verb — not the name — is
+what's italic: it's "what we're waiting on them for.")
+
+## Design (instances of the invariant)
+
+- **Waiting on a reviewer → review placeholder.** For the latest
+  reviewable commit, render its review block (above the commit, UNDER the
+  plan header) with one row PER REGISTERED reviewer: finished reviewers
+  show their `✓ / ✓✓ / ✗` row; a reviewer who still owes a verdict shows
+  a spinner in the SAME verdict-mark column + the name (dim) + italic
+  "reviewing…". When they finish it becomes their verdict row in the same
+  slot. The block always shows the full reviewer picture (done +
+  in-flight).
+- **Waiting on master → next-commit placeholder.** When master is
+  producing the next commit, render a placeholder at the top of the
+  active plan's section (under the header, above the latest commit) for
+  the commit it will become: a spinner + `-------` where the sha will be
+  + `snap.master` name (dim, fallback "master") + an italic wait-verb.
+  The verb says what we await, per state:
+  - `MasterToContinue` → "working…"
+  - `MasterToRevise` → "revising…" (addressing review feedback)
+  - `MasterToCommit` → "committing…"
+  - `MasterToFinalize` → "finalizing…" (making the finish commit) —
+    the shipped M2 produced NO row here; this closes that gap.
+  (Excluded: `Blocked` → a human's turn, shown by the block ask, no
+  spinner; `MasterToFixCommitTag` → already surfaced by the `fix` gauge.)
+- **Italic wait-verb in BOTH cases** — review "reviewing…" becomes italic
+  too (M2 had it dim), so the invariant reads uniformly.
+- **Everything lives UNDER the plan umbrella header**, never above it.
+  Remove M2's prepend-to-whole-timeline placement.
 
 ## Implementation notes
 
@@ -60,12 +71,15 @@ positional jump).
   `GateReviewersMissing { missing }` (as today); master from
   `snap.master`.
 - **Animation tick (carry the invariant forward):** the
-  viewport-conditional tick currently assumes in-progress rows are at
-  offset 0 (`offset < in_prog_count`). They now sit at computed indices,
-  so the tick must fire iff ANY in-progress row index falls within the
-  visible window `[offset, offset + capacity)`. The tick stays a PURE
-  repaint (frame advance + render_at + paint, zero IO) — unchanged and
-  still verified structurally.
+  viewport-conditional tick currently assumes in-progress rows are a
+  CONTIGUOUS block (`offset < in_prog`, or the ask-band intersection).
+  After this change they sit at SCATTERED, NON-CONTIGUOUS indices (master
+  after the header; reviews inside the latest commit's review block), so
+  the check must track the SET of injected indices and fire iff ANY of
+  them falls within `[offset, offset + capacity)` — and correctly
+  SUPPRESS the tick when all are scrolled off despite being
+  non-contiguous. The tick stays a PURE repaint (frame advance +
+  render_at + paint, zero IO) — verified structurally.
 - Keep it TUI-only and ephemeral; do not touch `OnelineRow` / `clank
   log` (static output has no pending state).
 
@@ -79,25 +93,34 @@ which is exactly what makes the in-place replacement read as continuous.
 
 Pure rendering/placement tests:
 - a pending reviewer renders as a placeholder WITHIN the latest commit's
-  review block, under the plan header (not above it), in the verdict
-  column;
+  review block, under the plan header (not above it), spinner in the
+  verdict column, with the wait-verb ITALIC;
 - a finished + a pending reviewer on the same commit both appear in that
   block (full reviewer picture);
-- master-working renders "<master> working…" under the header, above the
-  latest commit, using `snap.master` — for EACH producing state, incl.
-  `MasterToFinalize` (the finish-commit case the shipped code missed);
-- tick visibility: given an offset that scrolls the in-progress rows out
-  of `[offset, offset+capacity)`, the tick is suppressed.
+- master placeholder renders under the header, above the latest commit,
+  with `snap.master` + the per-state italic verb, for EACH producing
+  state;
+- **`MasterToFinalize`: the existing test that pins NO row must FLIP
+  (reproduce-first) to assert a "finalizing…" placeholder** — close the
+  gap explicitly, not silently;
+- tick visibility with SCATTERED indices: an offset that scrolls every
+  injected in-progress row out of `[offset, offset+capacity)` suppresses
+  the tick (and one that leaves any visible keeps it).
 
 ## Acceptance
 
-- A pending review shows as a spinner in the slot its `✓/✗` will occupy —
-  above the commit, under the plan header — and is replaced in place when
-  the review lands (no positional jump).
-- The master-working row reads "<master> working…" (the master's label),
-  under the plan header.
+- **The invariant holds**: for EVERY "waiting on an agent" state there is
+  a spinner in the slot that agent's output will occupy, with an italic
+  wait-verb saying what we await — and when the work lands the spinner is
+  replaced in place (no positional jump).
+- A pending review shows as a spinner in the slot its `✓/✗` will occupy,
+  above the commit, under the plan header, with italic "reviewing…".
+- The master placeholder shows `<master>` + the per-state italic verb
+  (working… / revising… / committing… / finalizing…), under the plan
+  header — including the previously-missing `MasterToFinalize` case.
 - No in-progress row floats above the plan umbrella header.
 - The animation tick still fires only when an in-progress row is actually
-  on screen, and remains a pure (IO-free) repaint.
-- Existing status TUI tests green; clippy within budget (cli ≤30); fmt
-  clean.
+  on screen (scattered-index visibility), and remains a pure (IO-free)
+  repaint.
+- Existing status TUI tests green (incl. the flipped `MasterToFinalize`
+  test); clippy within budget (cli ≤30); fmt clean.
