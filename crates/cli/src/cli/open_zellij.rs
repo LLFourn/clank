@@ -209,7 +209,7 @@ fn open_all(source: &Path, targets: &[PathBuf], print: bool) -> anyhow::Result<(
     };
     let tabs = resolve_tabs(targets, include)?;
     if tabs.is_empty() {
-        anyhow::bail!("no openable worktrees (none have a clank team configured)");
+        anyhow::bail!("no openable worktrees (none have clank agents configured)");
     }
 
     let (rows, cols) = crate::cli::status_tui::term_size();
@@ -252,7 +252,7 @@ fn resolve_tabs(targets: &[PathBuf], include: Option<&[String]>) -> anyhow::Resu
             continue;
         }
         let Some(set) = crate::agent_store::try_resolve_via_team(t)? else {
-            eprintln!("skipping `{}` (no team configured)", t.display());
+            eprintln!("skipping `{}` (no agents configured)", t.display());
             continue;
         };
         let reviewers = set
@@ -332,7 +332,11 @@ fn open_one(repo: &Path, print: bool) -> anyhow::Result<()> {
     // (`teams-based-agent-registration`): exactly one master plus
     // its reviewers, no role-triage needed.
     let Some(set) = crate::agent_store::try_resolve_via_team(&repo)? else {
-        anyhow::bail!("this repo has no team configured. Run `clank init --team <name>` first.");
+        anyhow::bail!(
+            "this repo has no agents configured. Run `clank agent add <name>` + \
+             `clank agent set-master <name>` to build a roster, or `clank init --team <name>` \
+             to seed one from a template."
+        );
     };
     let master_label = set.master.as_str().to_string();
     let reviewer_labels: Vec<String> = set

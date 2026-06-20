@@ -812,7 +812,10 @@ fn require_master(
     verb: &str,
 ) -> anyhow::Result<()> {
     let set = crate::agent_store::try_resolve_via_team_with(repo, home)?.ok_or_else(|| {
-        anyhow::anyhow!("no team configured; cannot authorize `pr-review {verb}`")
+        anyhow::anyhow!(
+            "no master agent configured; cannot authorize `pr-review {verb}`. \
+             Build a roster with `clank agent add` / `clank agent set-master`."
+        )
     })?;
     if crate::agent_store::role_from_registered_set(&set, caller) == Role::Master {
         Ok(())

@@ -205,7 +205,11 @@ pub async fn run_fork_pinned(
     // bound session in the source repo — a fork with nothing to
     // fork is meaningless.
     let Some(set) = crate::agent_store::try_resolve_via_team_with(&source, home)? else {
-        anyhow::bail!("this repo has no team configured. Run `clank init --team <name>` first.");
+        anyhow::bail!(
+            "this repo has no agents configured. Run `clank agent add <name>` + \
+             `clank agent set-master <name>` to build a roster, or `clank init --team <name>` \
+             to seed one from a template."
+        );
     };
     let mut members: Vec<AgentLabel> = vec![set.master.clone()];
     members.extend(set.commit_reviewers.iter().map(|a| a.label.clone()));

@@ -182,7 +182,8 @@ pub fn repo_checks(repo: &Path, home: Option<&Path>) -> Vec<CheckResult> {
             out.push(CheckResult::warn(
                 SECTION,
                 "agents",
-                "this repo has no team configured; run `clank init --team <name>` to register agents"
+                "this repo has no agents configured; run `clank agent add <name>` + \
+                 `clank agent set-master <name>` (or `clank init --team <name>`) to register agents"
                     .to_string(),
             ));
             return out;
@@ -685,11 +686,11 @@ fn session_checks(repo: Option<&Path>) -> Vec<CheckResult> {
     let source = describe_identity_source(repo, &resolved, &detected, &explicit);
     out.push(CheckResult::ok(SECTION, "identity", source));
 
-    // Inferred role from the team resolver (best-effort: a repo
-    // with no team configured has no resolvable role).
+    // Inferred role from the roster resolver (best-effort: a repo
+    // with no master configured has no resolvable role).
     let role = crate::agent_store::resolve_role(repo, &resolved)
         .map(|r| r.as_str().to_string())
-        .unwrap_or_else(|_| "unknown (no team configured)".to_string());
+        .unwrap_or_else(|_| "unknown (no master configured)".to_string());
     out.push(CheckResult::ok(
         SECTION,
         "role",

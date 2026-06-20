@@ -153,19 +153,20 @@ Identity is keyed by the agent's session id (`CLAUDE_CODE_SESSION_ID` /
 `CODEX_THREAD_ID`). Two same-tool sessions in the same repo can bind to
 different labels.
 
-Roles are a property of the repo's **team**, not a per-agent flag. An
-agent is master / commit-reviewer / gate-reviewer because the team says
-so. Change roles with:
+Roles are a property of the repo's **agent roster**, not a per-agent
+flag. An agent is master / commit-reviewer / gate-reviewer because of
+its entry in the roster. Build and change the roster with:
 
 ```sh
-clank team set-master <team> <agent>   # team-level master
-clank team add <team> <agent> [--review commit|gate]
-clank promote <agent>                  # per-repo master override
+clank agent add <agent> --tool claude            # define one inline
+clank agent add <agent> [--review commit|gate]    # add by name from the global library
+clank agent set-master <agent>                    # make <agent> the master (demotes the old one)
+clank agent remove <agent>                         # drop from the roster
 ```
 
 `clank auto on|off` toggles an agent's auto-mode (Stop-hook behavior),
 which is independent per-agent state. (It still accepts a legacy
-`--role` flag, but that's now a no-op — roles are team-derived.)
+`--role` flag, but that's now a no-op — roles are roster-derived.)
 
 ## Layout
 

@@ -105,19 +105,19 @@ pub struct InitArgs {
     /// Overwrite an existing foreign `post-rewrite` hook.
     #[arg(long)]
     pub force_hooks: bool,
-    /// With `--team <name>`: replace an existing VALID repo team.
+    /// With `--team <name>`: replace an existing VALID repo roster.
     /// Without it, `--team` refuses to clobber a configured repo
-    /// team (run `clank team save <name>` first to keep local
+    /// roster (run `clank team save <name>` first to keep local
     /// edits). Bare `clank init` ignores this flag.
     #[arg(long)]
     pub force: bool,
-    /// Pick a user-scope team template for this repo. Copies the
-    /// named team's composition + referenced agent definitions
-    /// into `<repo>/.clank/config.json`. The team must exist in
-    /// `~/.clank/config.json#/teams`. Plan:
-    /// `teams-based-agent-registration`. When omitted, no team is
-    /// set — workflow commands (`wfw`, `finish`) will then require
-    /// one and tell you to re-run with `--team`.
+    /// Seed this repo's roster from a user-scope team template.
+    /// Copies the named template's roster + referenced agent
+    /// definitions into `<repo>/.clank/config.json`. The template
+    /// must exist in `~/.clank/config.json#/teams`. When omitted, the
+    /// repo starts with no roster — build one with `clank agent add`
+    /// / `clank agent set-master`; workflow commands (`wfw`,
+    /// `finish`) require a master until you do.
     #[arg(long, value_name = "NAME")]
     pub team: Option<String>,
 }
