@@ -854,6 +854,27 @@ fn focused_pane_id(panes: &[ZellijPane]) -> Option<String> {
     panes.iter().find(|p| p.is_focused).map(ZellijPane::pane_id)
 }
 
+/// The pane the current clank process runs in, identified authoritatively
+/// from the `ZELLIJ_PANE_ID` env var zellij sets per-pane. A clank command
+/// always runs in a terminal pane (never the plugin pane that can share
+/// the same numeric id), so the ref is `terminal_<id>`. `None` when unset.
+fn caller_pane_id() -> Option<String> {
+    let id = std::env::var("ZELLIJ_PANE_ID").ok()?;
+    (!id.is_empty()).then(|| format!("terminal_{id}"))
+}
+
+/// Where to return focus after a focus-stealing zellij op. Prefer the
+/// caller's own pane (`caller_id`, authoritative across tabs); fall back to
+/// the first focused pane in the listing only when the caller is unknown —
+/// that scan is ambiguous in a multi-tab session (each tab reports its own
+/// `is_focused` pane, so the first in listing order is whichever tab comes
+/// first, not necessarily the caller's) and is correct only single-tab.
+fn restore_target(panes: &[ZellijPane], caller_id: Option<&str>) -> Option<String> {
+    caller_id
+        .map(str::to_owned)
+        .or_else(|| focused_pane_id(panes))
+}
+
 /// Run `zellij action <args>`, swallowing output and errors. Best-effort
 /// by construction: a zellij hiccup must never fail the caller (the
 /// roster mutation already persisted) nor bleed onto a pane. Returns
@@ -889,7 +910,7 @@ pub(crate) fn add_reviewer_pane(repo: &Path, label: &str, other_reviewers: &[Str
     if find_pane_by_command(&panes, &agent_start_command(label, &repo_str)).is_some() {
         return;
     }
-    let restore = focused_pane_id(&panes);
+    let restore = restore_target(&panes, caller_pane_id().as_deref());
     let anchor_cmds: Vec<String> = other_reviewers
         .iter()
         .map(|l| agent_start_command(l, &repo_str))
@@ -937,6 +958,14 @@ pub(crate) fn remove_reviewer_pane(repo: &Path, label: &str) {
     };
     if let Some(pane) = find_pane_by_command(&panes, &agent_start_command(label, &repo_str)) {
         zellij_action(&["close-pane", "--pane-id", &pane.pane_id()]);
+        // close-pane can shift focus (notably when the target is in a
+        // different tab than the caller); return focus to the caller's own
+        // pane so `agent remove` from any tab leaves you where you ran it.
+        // No-op if the caller closed its own pane (the ref no longer
+        // resolves).
+        if let Some(id) = caller_pane_id() {
+            zellij_action(&["focus-pane-id", &id]);
+        }
     }
 }
 
@@ -1217,6 +1246,32 @@ mod tests {
     fn focused_pane_id_finds_the_focused_pane() {
         let panes = parse_panes();
         assert_eq!(focused_pane_id(&panes).as_deref(), Some("terminal_0"));
+    }
+
+    #[test]
+    fn restore_target_prefers_caller_over_first_focused_across_tabs() {
+        // Realistic multi-tab `list-panes`: EACH tab marks its own active
+        // pane focused. The agents' tab (tab 0) lists first, so the bare
+        // focus scan picks terminal_0 — the wrong tab when the command ran
+        // from tab 1. (The single-focus `parse_panes` fixture never
+        // exercised this — it's exactly why the bug slipped through.)
+        let panes: Vec<ZellijPane> = serde_json::from_str(
+            r#"[
+              {"id":0,"is_plugin":false,"is_focused":true,"title":"claude (master)","terminal_command":"clank agent start claude --repo /a","tab_id":0},
+              {"id":1,"is_plugin":false,"is_focused":false,"title":"codex (reviewer)","terminal_command":"clank agent start codex --repo /a","tab_id":0},
+              {"id":7,"is_plugin":false,"is_focused":true,"title":"shell","terminal_command":null,"tab_id":1}
+            ]"#,
+        )
+        .unwrap();
+        // Caller ran the command from its own pane in tab 1.
+        assert_eq!(
+            restore_target(&panes, Some("terminal_7")).as_deref(),
+            Some("terminal_7"),
+            "must restore to the caller's pane, not the first is_focused (terminal_0)"
+        );
+        // Defensive fallback when the caller is unknown: the ambiguous
+        // first-focused scan (the pre-fix behavior).
+        assert_eq!(restore_target(&panes, None).as_deref(), Some("terminal_0"));
     }
 
     #[test]
