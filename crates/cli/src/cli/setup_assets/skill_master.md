@@ -34,6 +34,11 @@ review gate.
 ### Commands you own
 
 - `clank queue promote <name>` — promote a ready queued plan
+- `clank queue add <name>` — queue a new plan: write its body to
+  `.clank/stubs/<name>.md`, then run `clank queue add <name>` (the stubs
+  dir is the gitignored staging area and the stub is consumed on add —
+  don't stage plan bodies in `/tmp`). `--priority <N>` orders it
+  (default 500; lower promotes first).
 - `clank finish <plan>` — finalize a FINISHED plan
 - `clank shelve <plan>` / `clank unshelve <plan>` — set a plan's commits
   aside / restore them (reviews reset on restore); `clank purge --drop
