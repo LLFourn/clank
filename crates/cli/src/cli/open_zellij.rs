@@ -1199,12 +1199,19 @@ pub(crate) fn relocate_for_promote(
         return;
     };
     let path_str = path.display().to_string();
-    zellij_action(&[
+    // No-op-on-failure: only stamp titles if the override actually applied,
+    // so a failed override leaves the layout untouched rather than a partial
+    // mutation (titles changed but panes not relocated).
+    if zellij_action(&[
         "override-layout",
         &path_str,
         "--apply-only-to-active-tab",
         "--retain-existing-plugin-panes",
-    ]);
+    ])
+    .is_none()
+    {
+        return;
+    }
 
     // Stamp the new roles into the two changed panes' titles. This is
     // REQUIRED, not cosmetic: `override-layout` keeps matched panes' existing
