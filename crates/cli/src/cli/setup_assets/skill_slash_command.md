@@ -9,8 +9,9 @@ User invoked `/clank` with arguments: "$ARGUMENTS"
   - "Enable auto-mode" → `clank auto on`
   - "Disable auto-mode" → `clank auto off`
   Run the chosen command, then re-print state. (Role is roster-derived —
-  change it with `clank agent set-master` / `clank agent add`, NOT via
-  `clank auto`.)
+  change it with `clank agent promote` (elevates an agent to master — a
+  roster op, distinct from promoting a queued plan) / `clank agent add`,
+  NOT via `clank auto`.)
 - **Otherwise**: run `clank $ARGUMENTS` and relay the full stdout.
 
 No commentary; just the command output. The user cannot see tool results

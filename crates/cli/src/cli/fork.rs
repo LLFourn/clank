@@ -207,7 +207,7 @@ pub async fn run_fork_pinned(
     let Some(set) = crate::agent_store::try_resolve_via_team_with(&source, home)? else {
         anyhow::bail!(
             "this repo has no agents configured. Run `clank agent add <name>` + \
-             `clank agent set-master <name>` to build a roster, or `clank init --team <name>` \
+             `clank agent promote <name>` to build a roster, or `clank init --team <name>` \
              to seed one from a template."
         );
     };

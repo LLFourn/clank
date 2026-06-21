@@ -10,7 +10,7 @@
 //! roster-derived (an agent's entry in the repo roster), so
 //! the `--role` flag here is an accepted no-op (kept only so
 //! older invocations don't hard-error; it prints a note). Change
-//! roles via `clank agent set-master` / `clank agent add`.
+//! roles via `clank agent promote` / `clank agent add`.
 
 use super::{AutoArgs, AutoCmd, AutoOffArgs, AutoOnArgs, AutoStatusArgs, resolve_repo};
 use crate::agent_env::resolve_identity_from_env;
@@ -54,9 +54,9 @@ async fn run_on(args: AutoOnArgs) -> anyhow::Result<()> {
         // Plan: teams-based-agent-registration — role is now a
         // per-team property, not per-agent state. `--role` no
         // longer writes anything; change roles via
-        // `clank agent set-master` / `clank agent add`.
+        // `clank agent promote` / `clank agent add`.
         eprintln!(
-            "note: `--role` is ignored; roles are roster-derived now (use `clank agent set-master`)"
+            "note: `--role` is ignored; roles are roster-derived now (use `clank agent promote`)"
         );
     }
     Ok(())
@@ -73,7 +73,7 @@ async fn run_off(args: AutoOffArgs) -> anyhow::Result<()> {
     println!("auto-mode for `{}` set to off", label.as_str());
     if args.role.is_some() {
         eprintln!(
-            "note: `--role` is ignored; roles are roster-derived now (use `clank agent set-master`)"
+            "note: `--role` is ignored; roles are roster-derived now (use `clank agent promote`)"
         );
     }
     Ok(())

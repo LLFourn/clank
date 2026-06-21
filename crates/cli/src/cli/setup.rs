@@ -591,7 +591,7 @@ mod tests {
                 "master must document finish"
             );
             assert!(
-                master.contains("clank agent set-master"),
+                master.contains("clank agent promote"),
                 "master must document roster commands"
             );
             assert!(

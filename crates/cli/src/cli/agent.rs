@@ -5,7 +5,7 @@
 //! `BTreeMap<AgentLabel, RosterAgent>` where each entry carries
 //! its definition (tool / launch / initial_prompt) AND its role
 //! (master / commit / gate). There is no separate `team`.
-//! `agent add` is ONE step (definition + role); `agent set-master`
+//! `agent add` is ONE step (definition + role); `agent promote`
 //! picks the master; the ROLE RESOLVER
 //! (`agent_store::try_resolve_via_team`) reads the roster directly.
 //! The per-agent skeleton at `.clank/agents/<label>/config.json`
@@ -28,7 +28,7 @@ use clank_core::vocab::{AutoMode, Tool};
 use std::collections::BTreeMap;
 
 use super::{
-    AgentAddArgs, AgentArgs, AgentCmd, AgentListArgs, AgentRemoveArgs, AgentSetMasterArgs,
+    AgentAddArgs, AgentArgs, AgentCmd, AgentListArgs, AgentPromoteArgs, AgentRemoveArgs,
     AgentStartArgs, resolve_repo,
 };
 
@@ -37,7 +37,7 @@ pub async fn run(args: AgentArgs) -> anyhow::Result<()> {
         AgentCmd::List(a) => list(a),
         AgentCmd::Start(a) => start(a),
         AgentCmd::Add(a) => add(a),
-        AgentCmd::SetMaster(a) => set_master(a),
+        AgentCmd::Promote(a) => promote(a),
         AgentCmd::Remove(a) => remove(a),
     }
 }
@@ -89,7 +89,7 @@ fn list(args: AgentListArgs) -> anyhow::Result<()> {
     let Some(set) = crate::agent_store::try_resolve_via_team(&repo)? else {
         anyhow::bail!(
             "this repo has no master agent. Run `clank init --team <name>` or \
-             `clank agent set-master <agent>` to set one."
+             `clank agent promote <agent>` to set one."
         );
     };
     let mut rows: Vec<AgentRow> = Vec::new();
@@ -196,7 +196,7 @@ fn start(args: AgentStartArgs) -> anyhow::Result<()> {
     let Some(set) = crate::agent_store::try_resolve_via_team(&repo)? else {
         anyhow::bail!(
             "this repo has no master agent. Run `clank init --team <name>` or \
-             `clank agent set-master <agent>` to set one."
+             `clank agent promote <agent>` to set one."
         );
     };
     let desc = find_in_set(&set, &label).ok_or_else(|| {
@@ -535,7 +535,7 @@ fn exec_composed(c: ComposedLaunch) -> anyhow::Result<()> {
     Ok(())
 }
 
-// ── clank agent add / set-master / remove ────────────────────
+// ── clank agent add / promote / remove ────────────────────
 //
 // The repo's `agents` IS the roster. `agent add` is ONE step
 // (definition + role). Three modes:
@@ -595,7 +595,7 @@ fn add(args: AgentAddArgs) -> anyhow::Result<()> {
         }
     }
     // `agent add` only ever adds a reviewer (master is set via
-    // set-master). Best-effort: project it onto the live zellij stack.
+    // promote). Best-effort: project it onto the live zellij stack.
     let other_reviewers = repo_reviewer_labels(&repo, Some(&label));
     crate::cli::open_zellij::add_reviewer_pane(&repo, label.as_str(), &other_reviewers);
     Ok(())
@@ -719,8 +719,8 @@ pub fn add_repo_roster_agent_by_name(
     Ok(())
 }
 
-/// `clank agent set-master <name>` — thin shell.
-fn set_master(args: AgentSetMasterArgs) -> anyhow::Result<()> {
+/// `clank agent promote <name>` — thin shell.
+fn promote(args: AgentPromoteArgs) -> anyhow::Result<()> {
     let label = AgentLabel::parse(&args.name)
         .map_err(|e| anyhow::anyhow!("invalid agent label `{}`: {e}", args.name))?;
     let repo = resolve_repo(args.repo.as_deref())?;
@@ -954,7 +954,7 @@ mod tests {
         // codex a52d486: a legacy `{"team":"dev"}` would deserialize (the
         // `team` key lands in `extra`) and a roster mutation would rewrite
         // a mixed old/new config. read_repo_config must fail closed with
-        // the re-init hint instead, so agent add/remove/set-master refuse.
+        // the re-init hint instead, so agent add/remove/promote refuse.
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".clank")).unwrap();
         std::fs::write(dir.path().join(".clank/config.json"), r#"{"team":"dev"}"#).unwrap();
@@ -1136,7 +1136,7 @@ mod tests {
         assert!(format!("{err:#}").contains("already on this repo's roster"));
     }
 
-    // ── agent set-master ─────────────────────────────────────
+    // ── agent promote ─────────────────────────────────────
 
     #[test]
     fn set_repo_master_sets_and_demotes_previous() {

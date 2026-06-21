@@ -72,7 +72,7 @@ pub async fn run(args: InitArgs) -> anyhow::Result<()> {
 /// roster). Standalone — needs no user-scope template. The repo
 /// then has a parseable config; the user adds agents via
 /// `clank agent add <label> --tool <claude|codex>` and designates
-/// a master via `clank agent set-master <agent>` before any
+/// a master via `clank agent promote <agent>` before any
 /// workflow command works.
 ///
 /// Called only when there's no VALID new-shape config (the
@@ -86,7 +86,7 @@ fn bootstrap_empty_repo_config(repo: &Path) -> anyhow::Result<()> {
     eprintln!(
         "wrote empty roster to {} — add agents with \
          `clank agent add <label> --tool <claude|codex>` and pick a master with \
-         `clank agent set-master <agent>`",
+         `clank agent promote <agent>`",
         repo_cfg_path.display()
     );
     Ok(())
@@ -483,7 +483,7 @@ fn load_user_team_roster(
         anyhow::bail!(
             "team `{team_name}` not declared in user-scope teams \
              (`~/.clank/config.json#/teams`). Either run bare `clank init` and build a \
-             roster locally (`clank agent add` + `clank agent set-master`), or — to make \
+             roster locally (`clank agent add` + `clank agent promote`), or — to make \
              `{team_name}` a reusable template — build it in a repo and publish with \
              `clank team save {team_name}`."
         );

@@ -240,11 +240,11 @@ pub struct ResolvedAgent {
 /// structurally impossible — those variants are gone.
 #[derive(Debug, thiserror::Error)]
 pub enum ResolutionError {
-    #[error("no master set; run `clank agent set-master <agent>`")]
+    #[error("no master set; run `clank agent promote <agent>`")]
     NoMaster,
     #[error(
         "multiple masters in the roster ({0}); exactly one agent may have role `master` — \
-         run `clank agent set-master <agent>` to pick one"
+         run `clank agent promote <agent>` to pick one"
     )]
     MultipleMasters(String),
 }
@@ -491,7 +491,7 @@ mod tests {
         let err = resolve_registered_set(&repo).unwrap_err();
         assert!(matches!(err, ResolutionError::NoMaster));
         let msg = err.to_string();
-        assert!(msg.contains("clank agent set-master"));
+        assert!(msg.contains("clank agent promote"));
     }
 
     #[test]

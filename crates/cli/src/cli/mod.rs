@@ -116,7 +116,7 @@ pub struct InitArgs {
     /// definitions into `<repo>/.clank/config.json`. The template
     /// must exist in `~/.clank/config.json#/teams`. When omitted, the
     /// repo starts with no roster — build one with `clank agent add`
-    /// / `clank agent set-master`; workflow commands (`wfw`,
+    /// / `clank agent promote`; workflow commands (`wfw`,
     /// `finish`) require a master until you do.
     #[arg(long, value_name = "NAME")]
     pub team: Option<String>,
@@ -868,10 +868,13 @@ pub enum AgentCmd {
     /// user-scope library. `--review commit|gate` sets the role
     /// (default `commit`).
     Add(AgentAddArgs),
-    /// Set the repo's master: `repo.agents[<name>].role = master`,
-    /// demoting the previous master to `commit`. The agent must
-    /// already be on the roster.
-    SetMaster(AgentSetMasterArgs),
+    /// Promote an agent to the repo's master:
+    /// `repo.agents[<name>].role = master`, demoting the previous
+    /// master to `commit`. The agent must already be on the roster.
+    /// (Distinct from `clank queue promote`, which activates a queued
+    /// plan.)
+    #[command(visible_alias = "set-master")]
+    Promote(AgentPromoteArgs),
     /// Remove an agent from the repo's roster. `--global` instead
     /// drops a DESCRIPTION from the user-scope `agents` library
     /// (and scrubs any team template referencing it). Per-agent
@@ -953,7 +956,7 @@ pub struct AgentAddArgs {
 }
 
 #[derive(Args, Debug)]
-pub struct AgentSetMasterArgs {
+pub struct AgentPromoteArgs {
     /// Agent label to designate as the repo's master. Must already
     /// be on the roster (`clank agent add <name>` first).
     pub name: String,
@@ -1416,10 +1419,15 @@ mod agent_team_cli_parse_tests {
     }
 
     #[test]
-    fn agent_set_master_parses() {
+    fn agent_promote_parses() {
+        assert!(
+            AgentT::try_parse_from(["t", "promote", "codex"]).is_ok(),
+            "agent promote <name> must parse"
+        );
+        // The `set-master` alias still parses for backward compat.
         assert!(
             AgentT::try_parse_from(["t", "set-master", "codex"]).is_ok(),
-            "agent set-master <name> must parse"
+            "agent set-master alias must still parse"
         );
     }
 

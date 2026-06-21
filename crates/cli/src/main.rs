@@ -23,7 +23,7 @@ enum Command {
     /// Manage the plan queue.
     Queue(cli::QueueArgs),
     /// Manage THIS repo's agent ROSTER (the operating list):
-    /// `agent add` / `agent set-master` / `agent remove` /
+    /// `agent add` / `agent promote` / `agent remove` /
     /// `agent list` / `agent start`. Each agent carries its tool +
     /// launch profile AND role; `agent add <name>` adds by name from
     /// the global library, or `--tool` defines one inline.

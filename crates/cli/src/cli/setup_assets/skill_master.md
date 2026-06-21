@@ -40,8 +40,9 @@ review gate.
   <plan>` fully deletes a plan (commits + body)
 - roster: `clank agent add <name> [--tool claude|codex] [--review
   commit|gate]` (by name from the global library, or `--tool` to define
-  inline), `clank agent set-master <name>`, `clank agent remove <name>`,
-  `clank agent list`
+  inline), `clank agent promote <name>` (elevate an agent to master,
+  demoting the current one — NOT `clank queue promote`, which activates a
+  queued plan), `clank agent remove <name>`, `clank agent list`
 - `clank block create <name> --plan <stem> -m "question"` — ask the
   human. Scope is mandatory: `--plan <stem>` targets one plan (usual);
   `--all` suppresses every item (rare). `clank block clean` acknowledges
