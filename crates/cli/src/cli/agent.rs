@@ -29,7 +29,7 @@ use std::collections::BTreeMap;
 
 use super::{
     AgentAddArgs, AgentArgs, AgentCmd, AgentListArgs, AgentPromoteArgs, AgentRemoveArgs,
-    AgentStartArgs, resolve_repo,
+    AgentSetReviewArgs, AgentStartArgs, resolve_repo,
 };
 
 pub async fn run(args: AgentArgs) -> anyhow::Result<()> {
@@ -39,6 +39,7 @@ pub async fn run(args: AgentArgs) -> anyhow::Result<()> {
         AgentCmd::Add(a) => add(a),
         AgentCmd::Promote(a) => promote(a),
         AgentCmd::Remove(a) => remove(a),
+        AgentCmd::SetReview(a) => set_review(a),
     }
 }
 
@@ -762,6 +763,60 @@ pub fn set_repo_master(repo: &Path, label: &AgentLabel) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `clank agent set-review <name> <commit|gate>` — thin shell.
+fn set_review(args: AgentSetReviewArgs) -> anyhow::Result<()> {
+    let label = AgentLabel::parse(&args.name)
+        .map_err(|e| anyhow::anyhow!("invalid agent label `{}`: {e}", args.name))?;
+    let repo = resolve_repo(args.repo.as_deref())?;
+    let tier = RosterRole::from(crate::cli::teams_config::ReviewKind::from(args.review));
+    set_repo_review(&repo, &label, tier)
+}
+
+/// Change a reviewer's tier (`Commit` ↔ `Gate`) IN PLACE — a pure config
+/// edit, so the agent's bound session and zellij pane are untouched (the
+/// pane title is `"<name> (reviewer)"` for both tiers — nothing visual
+/// changes). `tier` is always a reviewer tier (the shell maps from
+/// `ReviewKind`, never `Master`). Refuses if `<label>` is the master
+/// (changing the master is `clank agent promote`, which auto-demotes the
+/// old one) or isn't on the roster; no-op if already at `tier`.
+pub fn set_repo_review(repo: &Path, label: &AgentLabel, tier: RosterRole) -> anyhow::Result<()> {
+    let mut repo_cfg = read_repo_config(repo)?;
+    let current = match repo_cfg.agents.get(label) {
+        Some(a) => a.role,
+        None => anyhow::bail!(
+            "agent `{label}` is not on this repo's roster. \
+             Add it with `clank agent add {label}` first.",
+            label = label.as_str()
+        ),
+    };
+    if current == RosterRole::Master {
+        anyhow::bail!(
+            "agent `{}` is the master, not a reviewer. To change the master, \
+             promote a different agent with `clank agent promote <other>` \
+             (which demotes the current master).",
+            label.as_str()
+        );
+    }
+    if current == tier {
+        eprintln!(
+            "note: `{}` is already a `{}` reviewer",
+            label.as_str(),
+            role_word(tier)
+        );
+        return Ok(());
+    }
+    if let Some(agent) = repo_cfg.agents.get_mut(label) {
+        agent.role = tier;
+    }
+    write_repo_config(repo, &repo_cfg)?;
+    eprintln!(
+        "set `{}` as a `{}` reviewer",
+        label.as_str(),
+        role_word(tier)
+    );
+    Ok(())
+}
+
 /// `clank agent remove <label> [--global]` — thin shell.
 fn remove(args: AgentRemoveArgs) -> anyhow::Result<()> {
     let label = AgentLabel::parse(&args.label)
@@ -1182,6 +1237,93 @@ mod tests {
         set_repo_master(repo.path(), &claude).unwrap();
         let parsed = read_repo(repo.path());
         assert_eq!(parsed.agents[&claude].role, RosterRole::Master);
+    }
+
+    // ── agent set-review ─────────────────────────────────────
+
+    #[test]
+    fn set_repo_review_flips_tier_both_ways_preserving_other_fields() {
+        let repo = tempfile::tempdir().unwrap();
+        seed_repo_config(
+            repo.path(),
+            r#"{ "agents": {
+                "claude": { "tool": "claude", "role": "master" },
+                "codex": { "tool": "codex", "role": "commit", "initial_prompt": "go" }
+            } }"#,
+        );
+        let codex = AgentLabel::parse("codex").unwrap();
+        // commit -> gate
+        set_repo_review(repo.path(), &codex, RosterRole::Gate).unwrap();
+        let parsed = read_repo(repo.path());
+        assert_eq!(parsed.agents[&codex].role, RosterRole::Gate);
+        // other fields preserved, master untouched
+        assert_eq!(parsed.agents[&codex].initial_prompt.as_deref(), Some("go"));
+        assert_eq!(
+            parsed.agents[&AgentLabel::parse("claude").unwrap()].role,
+            RosterRole::Master
+        );
+        // gate -> commit
+        set_repo_review(repo.path(), &codex, RosterRole::Commit).unwrap();
+        assert_eq!(
+            read_repo(repo.path()).agents[&codex].role,
+            RosterRole::Commit
+        );
+    }
+
+    #[test]
+    fn set_repo_review_refuses_master() {
+        let repo = tempfile::tempdir().unwrap();
+        seed_repo_config(
+            repo.path(),
+            r#"{ "agents": { "claude": { "tool": "claude", "role": "master" } } }"#,
+        );
+        let claude = AgentLabel::parse("claude").unwrap();
+        let err = set_repo_review(repo.path(), &claude, RosterRole::Gate).unwrap_err();
+        let msg = format!("{err:#}");
+        // Points only at the command that exists (promote), never `demote`.
+        assert!(
+            msg.contains("is the master") && msg.contains("clank agent promote"),
+            "{msg}"
+        );
+        assert!(
+            !msg.contains("agent demote"),
+            "must not suggest a nonexistent command: {msg}"
+        );
+        // Master role unchanged.
+        assert_eq!(
+            read_repo(repo.path()).agents[&claude].role,
+            RosterRole::Master
+        );
+    }
+
+    #[test]
+    fn set_repo_review_errors_when_not_on_roster() {
+        let repo = tempfile::tempdir().unwrap();
+        seed_repo_config(
+            repo.path(),
+            r#"{ "agents": { "claude": { "tool": "claude", "role": "master" } } }"#,
+        );
+        let phantom = AgentLabel::parse("phantom").unwrap();
+        let err = set_repo_review(repo.path(), &phantom, RosterRole::Commit).unwrap_err();
+        assert!(format!("{err:#}").contains("not on this repo's roster"));
+    }
+
+    #[test]
+    fn set_repo_review_no_op_when_already_at_tier() {
+        let repo = tempfile::tempdir().unwrap();
+        seed_repo_config(
+            repo.path(),
+            r#"{ "agents": {
+                "claude": { "tool": "claude", "role": "master" },
+                "codex": { "tool": "codex", "role": "commit" }
+            } }"#,
+        );
+        let codex = AgentLabel::parse("codex").unwrap();
+        set_repo_review(repo.path(), &codex, RosterRole::Commit).unwrap();
+        assert_eq!(
+            read_repo(repo.path()).agents[&codex].role,
+            RosterRole::Commit
+        );
     }
 
     // ── agent remove ─────────────────────────────────────────

@@ -880,6 +880,10 @@ pub enum AgentCmd {
     /// (and scrubs any team template referencing it). Per-agent
     /// skeleton dir + feedback history are preserved.
     Remove(AgentRemoveArgs),
+    /// Change a reviewer's tier (`commit` ↔ `gate`) in place — no
+    /// remove/re-add, so the agent's session and zellij pane are
+    /// undisturbed. Refuses on the master (not a reviewer tier).
+    SetReview(AgentSetReviewArgs),
 }
 
 #[derive(Args, Debug)]
@@ -975,6 +979,18 @@ pub struct AgentRemoveArgs {
     /// agent from THIS repo's roster.
     #[arg(long)]
     pub global: bool,
+    /// Repo root. Defaults to the cwd's git toplevel.
+    #[arg(long, value_name = "PATH")]
+    pub repo: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub struct AgentSetReviewArgs {
+    /// Reviewer label whose tier to change.
+    pub name: String,
+    /// New tier: `commit` or `gate`.
+    #[arg(value_enum)]
+    pub review: ReviewKindArg,
     /// Repo root. Defaults to the cwd's git toplevel.
     #[arg(long, value_name = "PATH")]
     pub repo: Option<PathBuf>,
@@ -1428,6 +1444,23 @@ mod agent_team_cli_parse_tests {
         assert!(
             AgentT::try_parse_from(["t", "set-master", "codex"]).is_ok(),
             "agent set-master alias must still parse"
+        );
+    }
+
+    #[test]
+    fn agent_set_review_parses() {
+        assert!(
+            AgentT::try_parse_from(["t", "set-review", "codex", "gate"]).is_ok(),
+            "agent set-review <name> <tier> must parse"
+        );
+        assert!(
+            AgentT::try_parse_from(["t", "set-review", "codex", "commit"]).is_ok(),
+            "commit tier must parse"
+        );
+        // Bad tier is rejected by the value-enum.
+        assert!(
+            AgentT::try_parse_from(["t", "set-review", "codex", "nope"]).is_err(),
+            "invalid tier must be rejected"
         );
     }
 

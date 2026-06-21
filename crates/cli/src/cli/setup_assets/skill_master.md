@@ -42,7 +42,9 @@ review gate.
   commit|gate]` (by name from the global library, or `--tool` to define
   inline), `clank agent promote <name>` (elevate an agent to master,
   demoting the current one — NOT `clank queue promote`, which activates a
-  queued plan), `clank agent remove <name>`, `clank agent list`
+  queued plan), `clank agent set-review <name> commit|gate` (change a
+  reviewer's tier in place), `clank agent remove <name>`, `clank agent
+  list`
 - `clank block create <name> --plan <stem> -m "question"` — ask the
   human. Scope is mandatory: `--plan <stem>` targets one plan (usual);
   `--all` suppresses every item (rare). `clank block clean` acknowledges
