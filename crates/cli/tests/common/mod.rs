@@ -3,7 +3,7 @@
 //!
 //! Setup goes through [`TestEnv`] + [`register_team`]: build the
 //! repo ROSTER via the REAL library cores (`clank agent add` /
-//! `clank agent set-master`), in a HOME distinct from the repo.
+//! `clank agent promote`), in a HOME distinct from the repo.
 //! The repo's `agents` IS the operating team — there's no separate
 //! `team` field.
 
@@ -76,7 +76,7 @@ fn git(repo: &Path, args: &[&str]) {
 ///
 /// Sequence mirrors what a user would run on a fresh repo:
 /// `clank agent add <name> --tool …` for each agent, then
-/// `clank agent set-master <master>`.
+/// `clank agent promote <master>`.
 pub fn register_team(
     home: &Path,
     repo: &Path,
