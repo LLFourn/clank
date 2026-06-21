@@ -40,6 +40,11 @@ details. The tool prepends the verdict to the file.
 
 ### Verdicts
 
+**DO NOT** APPROVE a commit while gating on a change you raised in the
+approval message — if something must change before the plan can finish,
+use REQUEST_CHANGES (noting what still REMAINS to implement, or a clearly
+optional non-gating suggestion, stays a valid APPROVE).
+
 - **APPROVE**: this commit's work is good. Mid-flight signal — the master
   keeps going. If you approve but the plan isn't fully IMPLEMENTED yet,
   add a one-sentence reason it's not FINISHED (e.g. "tests still
