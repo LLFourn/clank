@@ -873,7 +873,6 @@ pub enum AgentCmd {
     /// master to `commit`. The agent must already be on the roster.
     /// (Distinct from `clank queue promote`, which activates a queued
     /// plan.)
-    #[command(visible_alias = "set-master")]
     Promote(AgentPromoteArgs),
     /// Remove an agent from the repo's roster. `--global` instead
     /// drops a DESCRIPTION from the user-scope `agents` library
@@ -1440,10 +1439,11 @@ mod agent_team_cli_parse_tests {
             AgentT::try_parse_from(["t", "promote", "codex"]).is_ok(),
             "agent promote <name> must parse"
         );
-        // The `set-master` alias still parses for backward compat.
+        // The `set-master` alias was DROPPED — it must no longer parse
+        // (regression guard, inverted from the old back-compat assertion).
         assert!(
-            AgentT::try_parse_from(["t", "set-master", "codex"]).is_ok(),
-            "agent set-master alias must still parse"
+            AgentT::try_parse_from(["t", "set-master", "codex"]).is_err(),
+            "agent set-master alias must no longer parse (dropped)"
         );
     }
 

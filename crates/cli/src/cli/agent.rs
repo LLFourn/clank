@@ -725,7 +725,45 @@ fn promote(args: AgentPromoteArgs) -> anyhow::Result<()> {
     let label = AgentLabel::parse(&args.name)
         .map_err(|e| anyhow::anyhow!("invalid agent label `{}`: {e}", args.name))?;
     let repo = resolve_repo(args.repo.as_deref())?;
-    set_repo_master(&repo, &label)
+    // Capture the outgoing master BEFORE the flip so the relocation can
+    // title the demoted pane. Best-effort: empty when there was no prior
+    // master or the read fails.
+    let old_master = read_repo_config(&repo)
+        .ok()
+        .and_then(|cfg| current_master_label(&cfg));
+    set_repo_master(&repo, &label)?;
+    // Best-effort: project the role flip onto the live zellij layout (new
+    // master → 65% stage, old master → reviewer stack). Never fails promote.
+    if let Some(old_master) = old_master
+        && old_master != args.name
+    {
+        let roster_labels = repo_roster_labels(&repo);
+        crate::cli::open_zellij::relocate_for_promote(
+            &repo,
+            label.as_str(),
+            &old_master,
+            &roster_labels,
+        );
+    }
+    Ok(())
+}
+
+/// This repo's current master label (the one roster entry with role
+/// `Master`), if any.
+fn current_master_label(cfg: &RepoConfigFile) -> Option<String> {
+    cfg.agents
+        .iter()
+        .find(|(_, a)| a.role == RosterRole::Master)
+        .map(|(l, _)| l.as_str().to_string())
+}
+
+/// Every label on this repo's roster (master + reviewers). Best-effort
+/// (empty on read error) — used to classify live zellij panes for the
+/// promote relocation.
+fn repo_roster_labels(repo: &Path) -> Vec<String> {
+    read_repo_config(repo)
+        .map(|cfg| cfg.agents.keys().map(|l| l.as_str().to_string()).collect())
+        .unwrap_or_default()
 }
 
 /// Set THIS repo's master to `<label>`:

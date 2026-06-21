@@ -820,6 +820,10 @@ struct ZellijPane {
     is_focused: bool,
     #[serde(default)]
     terminal_command: Option<String>,
+    /// Which tab the pane lives in — `list-panes --json` spans ALL tabs,
+    /// so this scopes a relocation to the caller's active tab.
+    #[serde(default)]
+    tab_id: u32,
 }
 
 impl ZellijPane {
@@ -967,6 +971,250 @@ pub(crate) fn remove_reviewer_pane(repo: &Path, label: &str) {
             zellij_action(&["focus-pane-id", &id]);
         }
     }
+}
+
+/// Outcome of [`compose_promote_layout`]: a ready-to-apply layout KDL, or
+/// a deliberate no-op (the skip-on-unrecognized safety rule — see the
+/// `agent-promote-zellij-relocation` plan).
+#[derive(Debug, PartialEq)]
+enum PromoteRelayout {
+    Apply(String),
+    Skip,
+}
+
+/// PURE core of the promote relocation: project the config role flip onto
+/// the live zellij panes by composing a fresh stage(new master 65%) + stack
+/// (other agents) + status layout, reusing the SAME composition `clank open`
+/// emits so every slot's command byte-matches the live `invoked_with`.
+///
+/// `override-layout` re-flows the WHOLE active tab with no positional
+/// fallback (a slot whose command is off by one byte spawns a new pane AND
+/// lets the unmatched original get closed), so classification is
+/// all-or-nothing, decided here before anything is applied:
+/// - Find the caller pane by `pane_id == caller_pane_ref`; its `tab_id` is
+///   the active tab. Absent → [`PromoteRelayout::Skip`] (no anchor for the
+///   active-tab filter, and declarative focus would have nowhere to land).
+/// - Every live terminal (non-plugin) pane in the active tab must classify
+///   as a roster-agent pane (command byte-equals `agent_start_command`) or
+///   the status pane. ANY unclassified live pane → Skip.
+/// - The new master must have a live pane in the active tab, else → Skip.
+/// - reviewers = live agent labels minus the new master, in on-screen
+///   (list-panes) order. A roster agent with no live pane is simply omitted
+///   (omit ≠ skip) — relocation still proceeds.
+///
+/// The composed KDL marks the caller's own pane `focus=true` so the
+/// override doesn't yank focus elsewhere.
+fn compose_promote_layout(
+    panes: &[ZellijPane],
+    caller_pane_ref: Option<&str>,
+    roster_labels: &[String],
+    new_master: &str,
+    repo_path: &str,
+    term: (u16, u16),
+) -> PromoteRelayout {
+    // The caller pane anchors the active-tab filter AND declarative focus.
+    let Some(caller_ref) = caller_pane_ref else {
+        return PromoteRelayout::Skip;
+    };
+    let Some(caller) = panes.iter().find(|p| p.pane_id() == caller_ref) else {
+        return PromoteRelayout::Skip;
+    };
+    let active_tab = caller.tab_id;
+    let caller_command = caller.terminal_command.clone();
+
+    // Pre-compute each roster label's launch command once for matching.
+    let agent_commands: Vec<(String, &String)> = roster_labels
+        .iter()
+        .map(|l| (agent_start_command(l, repo_path), l))
+        .collect();
+    let status_command = format!("clank status --repo {repo_path} --tui");
+
+    // Classify every live terminal pane in the active tab, preserving the
+    // on-screen order so the stack keeps its current arrangement.
+    let mut live_agents: Vec<String> = Vec::new();
+    for pane in panes
+        .iter()
+        .filter(|p| !p.is_plugin && p.tab_id == active_tab)
+    {
+        let cmd = pane.terminal_command.as_deref();
+        if cmd == Some(status_command.as_str()) {
+            continue;
+        }
+        match cmd.and_then(|c| {
+            agent_commands
+                .iter()
+                .find(|(start, _)| start == c)
+                .map(|(_, label)| (*label).clone())
+        }) {
+            Some(label) => live_agents.push(label),
+            // An unclassified live terminal pane (manual shell/editor, null
+            // command, or an agent pane whose command doesn't byte-match) —
+            // the whole relocation is unsafe, skip it.
+            None => return PromoteRelayout::Skip,
+        }
+    }
+
+    // The new master must actually have a live pane to reposition.
+    if !live_agents.iter().any(|l| l == new_master) {
+        return PromoteRelayout::Skip;
+    }
+
+    let reviewers: Vec<String> = live_agents
+        .into_iter()
+        .filter(|l| l != new_master)
+        .collect();
+
+    let kdl = match compose_kdl(
+        &caller_tab_name(repo_path),
+        repo_path,
+        new_master,
+        &reviewers,
+        None,
+        term,
+    ) {
+        Ok(k) => k,
+        Err(_) => return PromoteRelayout::Skip,
+    };
+
+    // Declarative focus: mark the caller's own pane focus=true so the
+    // override keeps focus where the operator ran promote. Matched by the
+    // caller pane's command (the byte-identical slot in the composed KDL).
+    match inject_focus_on_command(&kdl, caller_command.as_deref()) {
+        Ok(k) => PromoteRelayout::Apply(k),
+        Err(_) => PromoteRelayout::Skip,
+    }
+}
+
+/// Tab name for the composed promote layout. `override-layout
+/// --apply-only-to-active-tab` re-flows the existing tab in place, so the
+/// name is cosmetic; derive it from the repo basename to match `clank open`.
+fn caller_tab_name(repo_path: &str) -> String {
+    Path::new(repo_path)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| repo_path.to_string())
+}
+
+/// Mark the agent/status pane whose `command "clank"` + `args …` reproduce
+/// `caller_command` with `focus=true`, editing the parsed KDL tree (never
+/// string-spliced). A no-match is fine — focus just isn't pinned — but a
+/// `None` caller command (the caller pane has no `invoked_with`) can't be
+/// matched, so callers that need focus should treat that as a skip upstream.
+fn inject_focus_on_command(kdl: &str, caller_command: Option<&str>) -> anyhow::Result<String> {
+    let Some(caller_command) = caller_command else {
+        return Ok(kdl.to_string());
+    };
+    let mut doc: kdl::KdlDocument = kdl.parse().map_err(|e: kdl::KdlError| {
+        anyhow::anyhow!("composed promote layout is not valid KDL: {e}")
+    })?;
+    mark_focus_in_doc(&mut doc, caller_command);
+    Ok(doc.to_string())
+}
+
+/// Depth-first: set `focus=true` on the first `pane` node whose
+/// `command`/`args` children reproduce `caller_command`. Returns whether a
+/// match was set so recursion can stop after the first hit.
+fn mark_focus_in_doc(doc: &mut kdl::KdlDocument, caller_command: &str) -> bool {
+    for node in doc.nodes_mut() {
+        if node.name().value() == "pane" && pane_command(node).as_deref() == Some(caller_command) {
+            node.entries_mut()
+                .retain(|e| e.name().map(|n| n.value()) != Some("focus"));
+            node.push(kdl::KdlEntry::new_prop("focus", true));
+            return true;
+        }
+        if let Some(children) = node.children_mut()
+            && mark_focus_in_doc(children, caller_command)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Reconstruct the `clank …` command string a composed agent pane launches,
+/// from its `command "clank"` + `args "…" "…"` child nodes — the form
+/// zellij reports as that pane's `terminal_command` once live.
+fn pane_command(node: &kdl::KdlNode) -> Option<String> {
+    let children = node.children()?;
+    let command = children
+        .nodes()
+        .iter()
+        .find(|n| n.name().value() == "command")?
+        .entries()
+        .first()?
+        .value()
+        .as_string()?
+        .to_string();
+    let args_node = children.nodes().iter().find(|n| n.name().value() == "args");
+    let mut parts = vec![command];
+    if let Some(args_node) = args_node {
+        for entry in args_node.entries() {
+            if entry.name().is_none()
+                && let Some(s) = entry.value().as_string()
+            {
+                parts.push(s.to_string());
+            }
+        }
+    }
+    Some(parts.join(" "))
+}
+
+/// Best-effort: inside a zellij session, project a just-applied master
+/// promotion onto the live layout — the new master becomes the 65% STAGE
+/// and the demoted old master joins the reviewer STACK, reusing the running
+/// panes (no respawn — `override-layout` matches on `invoked_with`).
+///
+/// No-op outside zellij, on any zellij failure, or when
+/// [`compose_promote_layout`] declines (the skip-on-unrecognized rule). The
+/// config role change is the source of truth and stands regardless.
+/// `roster_labels` is the full post-flip roster (master + reviewers);
+/// `old_master` titles the demoted pane.
+pub(crate) fn relocate_for_promote(
+    repo: &Path,
+    new_master: &str,
+    old_master: &str,
+    roster_labels: &[String],
+) {
+    if std::env::var_os("ZELLIJ").is_none() {
+        return;
+    }
+    let repo_str = repo.to_string_lossy().into_owned();
+    let Some(panes) = list_agent_panes() else {
+        return;
+    };
+    let (rows, cols) = crate::cli::status_tui::term_size();
+    let kdl = match compose_promote_layout(
+        &panes,
+        caller_pane_id().as_deref(),
+        roster_labels,
+        new_master,
+        &repo_str,
+        (cols, rows),
+    ) {
+        PromoteRelayout::Apply(kdl) => kdl,
+        PromoteRelayout::Skip => return,
+    };
+
+    let Ok(path) = write_layout_file(repo, &kdl) else {
+        return;
+    };
+    let path_str = path.display().to_string();
+    zellij_action(&[
+        "override-layout",
+        &path_str,
+        "--apply-only-to-active-tab",
+        "--retain-existing-plugin-panes",
+    ]);
+
+    // Titles are best-effort. `override-layout` keeps matched panes' EXISTING
+    // titles, so the new master would still read "(reviewer)" and the old
+    // master "(master)". `zellij action rename-pane` on 0.44.3 targets the
+    // FOCUSED pane only (no by-id form), and focus is now pinned on the
+    // caller's pane — renaming the new/old master would require stealing
+    // focus to each and restoring it, disrupting the operator. Titles are
+    // explicitly best-effort, so leave them as-is rather than yank focus.
+    // TODO: revisit on a zellij with `rename-pane --pane-id` (0.45+).
+    let _ = old_master;
 }
 
 /// Escape a string for use inside a KDL `"..."` quoted string.
@@ -1879,5 +2127,249 @@ dead-one [Created 10h ago] (EXITED - attach to resurrect)
     fn session_name_is_deterministic_per_repo() {
         assert_eq!(session_name("clank"), "clank-clank");
         assert_eq!(session_name("bindex-fun"), "clank-bindex-fun");
+    }
+
+    // ── agent-promote-zellij-relocation: compose_promote_layout ──
+
+    fn labels(ls: &[&str]) -> Vec<String> {
+        ls.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// A live agent pane in `/a`, tab 0. `focused` marks the caller pane.
+    fn agent_pane(id: u32, label: &str, focused: bool) -> String {
+        format!(
+            r#"{{"id":{id},"is_plugin":false,"is_focused":{focused},"title":"{label} (x)","terminal_command":"clank agent start {label} --repo /a","tab_id":0}}"#
+        )
+    }
+
+    fn status_pane(id: u32) -> String {
+        format!(
+            r#"{{"id":{id},"is_plugin":false,"is_focused":false,"title":"status","terminal_command":"clank status --repo /a --tui","tab_id":0}}"#
+        )
+    }
+
+    fn panes_from(parts: &[String]) -> Vec<ZellijPane> {
+        let json = format!("[{}]", parts.join(","));
+        serde_json::from_str(&json).expect("fixture parses")
+    }
+
+    #[test]
+    fn compose_promote_all_classified_makes_new_master_the_stage() {
+        // claude (current master, the caller pane) + codex reviewer + status.
+        // Promote codex → codex becomes the 65% stage, claude joins the
+        // stack; both panes are reused (slot commands byte-match the live
+        // terminal_commands).
+        let panes = panes_from(&[
+            agent_pane(0, "claude", true),
+            agent_pane(1, "codex", false),
+            status_pane(2),
+        ]);
+        let out = compose_promote_layout(
+            &panes,
+            Some("terminal_0"),
+            &labels(&["claude", "codex"]),
+            "codex",
+            "/a",
+            LANDSCAPE,
+        );
+        let PromoteRelayout::Apply(kdl) = out else {
+            panic!("expected Apply, got {out:?}");
+        };
+        // codex is the 65% stage.
+        assert!(
+            kdl.contains("pane size=\"65%\" name=\"codex (master)\""),
+            "codex must be the stage:\n{kdl}"
+        );
+        // claude is stacked (a reviewer slot).
+        assert!(kdl.contains("pane stacked=true"), "stack region:\n{kdl}");
+        assert!(
+            kdl.contains("name=\"claude (reviewer)\""),
+            "claude must join the stack:\n{kdl}"
+        );
+        // status pane present.
+        assert!(kdl.contains("name=\"status\""), "status pane:\n{kdl}");
+        // Slot commands byte-match the live terminal_commands.
+        assert!(kdl.contains("args \"agent\" \"start\" \"codex\" \"--repo\" \"/a\""));
+        assert!(kdl.contains("args \"agent\" \"start\" \"claude\" \"--repo\" \"/a\""));
+        // Multi-line KDL (zellij's parser rejects the compact form).
+        assert!(kdl.lines().count() > 5, "multi-line KDL:\n{kdl}");
+        // Caller's pane (claude) carries focus=true.
+        assert!(
+            kdl.contains("name=\"claude (reviewer)\" cwd=\"/a\" focus=true")
+                || focus_on_claude(&kdl),
+            "caller pane must have focus=true:\n{kdl}"
+        );
+        let _: kdl::KdlDocument = kdl.parse().expect("composed promote layout is valid KDL");
+    }
+
+    /// `focus=true` lands on the (claude) pane node regardless of attribute
+    /// order in the serialized KDL.
+    fn focus_on_claude(kdl: &str) -> bool {
+        let doc: kdl::KdlDocument = kdl.parse().unwrap();
+        fn walk(doc: &kdl::KdlDocument) -> bool {
+            for n in doc.nodes() {
+                if n.name().value() == "pane"
+                    && pane_command(n).as_deref() == Some("clank agent start claude --repo /a")
+                    && n.entries().iter().any(|e| {
+                        e.name().map(|x| x.value()) == Some("focus")
+                            && e.value().as_bool() == Some(true)
+                    })
+                {
+                    return true;
+                }
+                if let Some(c) = n.children() {
+                    if walk(c) {
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+        walk(&doc)
+    }
+
+    #[test]
+    fn compose_promote_omits_roster_agent_with_no_live_pane() {
+        // glm is on the roster but has no live pane — it's omitted from the
+        // composed layout, and relocation still proceeds (omit ≠ skip).
+        let panes = panes_from(&[
+            agent_pane(0, "claude", true),
+            agent_pane(1, "codex", false),
+            status_pane(2),
+        ]);
+        let out = compose_promote_layout(
+            &panes,
+            Some("terminal_0"),
+            &labels(&["claude", "codex", "glm"]),
+            "codex",
+            "/a",
+            LANDSCAPE,
+        );
+        let PromoteRelayout::Apply(kdl) = out else {
+            panic!("expected Apply, got {out:?}");
+        };
+        assert!(
+            !kdl.contains("\"glm\""),
+            "absent roster agent must be omitted:\n{kdl}"
+        );
+        assert!(kdl.contains("name=\"codex (master)\""));
+    }
+
+    #[test]
+    fn compose_promote_skips_on_unclassified_live_pane() {
+        // A manual shell pane (null terminal_command) in the active tab →
+        // Skip the whole relocation (config role change still stands).
+        let shell = r#"{"id":3,"is_plugin":false,"is_focused":false,"title":"zsh","terminal_command":null,"tab_id":0}"#.to_string();
+        let panes = panes_from(&[
+            agent_pane(0, "claude", true),
+            agent_pane(1, "codex", false),
+            status_pane(2),
+            shell,
+        ]);
+        let out = compose_promote_layout(
+            &panes,
+            Some("terminal_0"),
+            &labels(&["claude", "codex"]),
+            "codex",
+            "/a",
+            LANDSCAPE,
+        );
+        assert_eq!(out, PromoteRelayout::Skip);
+    }
+
+    #[test]
+    fn compose_promote_skips_on_command_byte_mismatch() {
+        // An agent pane whose command doesn't byte-match agent_start_command
+        // (here it carries the running foreground process, NOT invoked_with)
+        // → Skip (it would be unclassified, and override would close it).
+        let mismatch = r#"{"id":1,"is_plugin":false,"is_focused":false,"title":"codex (reviewer)","terminal_command":"codex resume abc-123","tab_id":0}"#.to_string();
+        let panes = panes_from(&[agent_pane(0, "claude", true), mismatch, status_pane(2)]);
+        let out = compose_promote_layout(
+            &panes,
+            Some("terminal_0"),
+            &labels(&["claude", "codex"]),
+            "codex",
+            "/a",
+            LANDSCAPE,
+        );
+        assert_eq!(out, PromoteRelayout::Skip);
+    }
+
+    #[test]
+    fn compose_promote_ignores_panes_in_other_tabs() {
+        // A pane in a DIFFERENT tab (tab 1) — even an unclassified one —
+        // must be ignored by the active-tab filter; relocation proceeds on
+        // the caller's tab (tab 0).
+        let other_tab_shell = r#"{"id":9,"is_plugin":false,"is_focused":true,"title":"shell","terminal_command":null,"tab_id":1}"#.to_string();
+        let panes = panes_from(&[
+            agent_pane(0, "claude", true),
+            agent_pane(1, "codex", false),
+            status_pane(2),
+            other_tab_shell,
+        ]);
+        let out = compose_promote_layout(
+            &panes,
+            Some("terminal_0"),
+            &labels(&["claude", "codex"]),
+            "codex",
+            "/a",
+            LANDSCAPE,
+        );
+        let PromoteRelayout::Apply(kdl) = out else {
+            panic!("expected Apply (other-tab pane ignored), got {out:?}");
+        };
+        assert!(kdl.contains("name=\"codex (master)\""));
+    }
+
+    #[test]
+    fn compose_promote_skips_when_new_master_has_no_live_pane() {
+        // Promote `glm`, which has no live pane → Skip (nothing to make the
+        // stage).
+        let panes = panes_from(&[
+            agent_pane(0, "claude", true),
+            agent_pane(1, "codex", false),
+            status_pane(2),
+        ]);
+        let out = compose_promote_layout(
+            &panes,
+            Some("terminal_0"),
+            &labels(&["claude", "codex", "glm"]),
+            "glm",
+            "/a",
+            LANDSCAPE,
+        );
+        assert_eq!(out, PromoteRelayout::Skip);
+    }
+
+    #[test]
+    fn compose_promote_skips_when_caller_pane_not_found() {
+        // The caller pane id isn't among the live panes (no active-tab
+        // anchor, no focus target) → Skip.
+        let panes = panes_from(&[
+            agent_pane(0, "claude", false),
+            agent_pane(1, "codex", false),
+            status_pane(2),
+        ]);
+        let out = compose_promote_layout(
+            &panes,
+            Some("terminal_99"),
+            &labels(&["claude", "codex"]),
+            "codex",
+            "/a",
+            LANDSCAPE,
+        );
+        assert_eq!(out, PromoteRelayout::Skip);
+        // Same for an absent caller ref (outside-zellij-ish).
+        assert_eq!(
+            compose_promote_layout(
+                &panes,
+                None,
+                &labels(&["claude", "codex"]),
+                "codex",
+                "/a",
+                LANDSCAPE,
+            ),
+            PromoteRelayout::Skip
+        );
     }
 }
