@@ -20,7 +20,7 @@ use serde::Serialize;
 
 use crate::agent_store::load_agent_config;
 use crate::cli::teams_config::{
-    AgentDescription, RepoConfigFile, RosterAgent, RosterRole, UserConfigFile,
+    AgentDescription, RepoConfigFile, ReviewKind, RosterAgent, RosterRole, UserConfigFile,
 };
 use clank_core::agent_config::{LaunchConfig, Session};
 use clank_core::ids::AgentLabel;
@@ -555,7 +555,7 @@ fn exec_composed(c: ComposedLaunch) -> anyhow::Result<()> {
 fn add(args: AgentAddArgs) -> anyhow::Result<()> {
     let label = AgentLabel::parse(&args.label)
         .map_err(|e| anyhow::anyhow!("invalid agent label `{}`: {e}", args.label))?;
-    let role: RosterRole = crate::cli::teams_config::ReviewKind::from(args.review).into();
+    let role: RosterRole = ReviewKind::from(args.review).into();
 
     if args.global {
         let tool = args.tool.ok_or_else(|| {
@@ -768,28 +768,29 @@ fn set_review(args: AgentSetReviewArgs) -> anyhow::Result<()> {
     let label = AgentLabel::parse(&args.name)
         .map_err(|e| anyhow::anyhow!("invalid agent label `{}`: {e}", args.name))?;
     let repo = resolve_repo(args.repo.as_deref())?;
-    let tier = RosterRole::from(crate::cli::teams_config::ReviewKind::from(args.review));
-    set_repo_review(&repo, &label, tier)
+    set_repo_review(&repo, &label, ReviewKind::from(args.review))
 }
 
 /// Change a reviewer's tier (`Commit` ↔ `Gate`) IN PLACE — a pure config
 /// edit, so the agent's bound session and zellij pane are untouched (the
 /// pane title is `"<name> (reviewer)"` for both tiers — nothing visual
-/// changes). `tier` is always a reviewer tier (the shell maps from
-/// `ReviewKind`, never `Master`). Refuses if `<label>` is the master
-/// (changing the master is `clank agent promote`, which auto-demotes the
-/// old one) or isn't on the roster; no-op if already at `tier`.
-pub fn set_repo_review(repo: &Path, label: &AgentLabel, tier: RosterRole) -> anyhow::Result<()> {
+/// changes). Takes [`ReviewKind`] (which has no `Master` variant) so the
+/// "this only ever sets a reviewer tier" invariant is compiler-enforced —
+/// a caller cannot ask to write a second master. Refuses if `<label>` is
+/// the master (changing the master is `clank agent promote`, which
+/// auto-demotes the old one) or isn't on the roster; no-op if already at
+/// `tier`.
+pub fn set_repo_review(repo: &Path, label: &AgentLabel, tier: ReviewKind) -> anyhow::Result<()> {
     let mut repo_cfg = read_repo_config(repo)?;
-    let current = match repo_cfg.agents.get(label) {
-        Some(a) => a.role,
+    let agent = match repo_cfg.agents.get_mut(label) {
+        Some(a) => a,
         None => anyhow::bail!(
             "agent `{label}` is not on this repo's roster. \
              Add it with `clank agent add {label}` first.",
             label = label.as_str()
         ),
     };
-    if current == RosterRole::Master {
+    if agent.role == RosterRole::Master {
         anyhow::bail!(
             "agent `{}` is the master, not a reviewer. To change the master, \
              promote a different agent with `clank agent promote <other>` \
@@ -797,22 +798,21 @@ pub fn set_repo_review(repo: &Path, label: &AgentLabel, tier: RosterRole) -> any
             label.as_str()
         );
     }
-    if current == tier {
+    let new_role = RosterRole::from(tier);
+    if agent.role == new_role {
         eprintln!(
             "note: `{}` is already a `{}` reviewer",
             label.as_str(),
-            role_word(tier)
+            role_word(new_role)
         );
         return Ok(());
     }
-    if let Some(agent) = repo_cfg.agents.get_mut(label) {
-        agent.role = tier;
-    }
+    agent.role = new_role;
     write_repo_config(repo, &repo_cfg)?;
     eprintln!(
         "set `{}` as a `{}` reviewer",
         label.as_str(),
-        role_word(tier)
+        role_word(new_role)
     );
     Ok(())
 }
@@ -1253,7 +1253,7 @@ mod tests {
         );
         let codex = AgentLabel::parse("codex").unwrap();
         // commit -> gate
-        set_repo_review(repo.path(), &codex, RosterRole::Gate).unwrap();
+        set_repo_review(repo.path(), &codex, ReviewKind::Gate).unwrap();
         let parsed = read_repo(repo.path());
         assert_eq!(parsed.agents[&codex].role, RosterRole::Gate);
         // other fields preserved, master untouched
@@ -1263,7 +1263,7 @@ mod tests {
             RosterRole::Master
         );
         // gate -> commit
-        set_repo_review(repo.path(), &codex, RosterRole::Commit).unwrap();
+        set_repo_review(repo.path(), &codex, ReviewKind::Commit).unwrap();
         assert_eq!(
             read_repo(repo.path()).agents[&codex].role,
             RosterRole::Commit
@@ -1278,7 +1278,7 @@ mod tests {
             r#"{ "agents": { "claude": { "tool": "claude", "role": "master" } } }"#,
         );
         let claude = AgentLabel::parse("claude").unwrap();
-        let err = set_repo_review(repo.path(), &claude, RosterRole::Gate).unwrap_err();
+        let err = set_repo_review(repo.path(), &claude, ReviewKind::Gate).unwrap_err();
         let msg = format!("{err:#}");
         // Points only at the command that exists (promote), never `demote`.
         assert!(
@@ -1304,7 +1304,7 @@ mod tests {
             r#"{ "agents": { "claude": { "tool": "claude", "role": "master" } } }"#,
         );
         let phantom = AgentLabel::parse("phantom").unwrap();
-        let err = set_repo_review(repo.path(), &phantom, RosterRole::Commit).unwrap_err();
+        let err = set_repo_review(repo.path(), &phantom, ReviewKind::Commit).unwrap_err();
         assert!(format!("{err:#}").contains("not on this repo's roster"));
     }
 
@@ -1319,7 +1319,7 @@ mod tests {
             } }"#,
         );
         let codex = AgentLabel::parse("codex").unwrap();
-        set_repo_review(repo.path(), &codex, RosterRole::Commit).unwrap();
+        set_repo_review(repo.path(), &codex, ReviewKind::Commit).unwrap();
         assert_eq!(
             read_repo(repo.path()).agents[&codex].role,
             RosterRole::Commit
