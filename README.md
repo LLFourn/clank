@@ -160,7 +160,7 @@ its entry in the roster. Build and change the roster with:
 ```sh
 clank agent add <agent> --tool claude            # define one inline
 clank agent add <agent> [--review commit|gate]    # add by name from the global library
-clank agent set-master <agent>                    # make <agent> the master (demotes the old one)
+clank agent promote <agent>                       # make <agent> the master (demotes the old one)
 clank agent remove <agent>                         # drop from the roster
 ```
 
