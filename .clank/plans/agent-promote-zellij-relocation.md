@@ -123,11 +123,16 @@ all-or-nothing, decided BEFORE applying:
   marks `focus=true`. Mark the caller's own pane (`caller_pane_id()` from
   [zellij-focus-restore], read from `ZELLIJ_PANE_ID`) `focus=true` in the
   composed KDL so promote doesn't yank the user elsewhere.
-- **Titles.** override kept existing titles in the spike (matched panes
-  retain their title). Update to the new roles ("<new> (master)" / "<old>
-  (reviewer)") via `agent_pane_title`. Resolve at impl whether the KDL
-  `name=` renames a reused pane; if not, a focus-free rename path. Titles
-  best-effort.
+- **Titles — REQUIRED, not cosmetic.** override keeps matched panes'
+  existing titles, and the status-TUI retitle loop derives each agent's
+  role by PARSING its pane title (`parse_agent_panes` reads the `(master)`
+  / `(reviewer)` suffix), NOT from config — so a stale title makes the TUI
+  re-affirm the OLD role forever. After the override, rename the two
+  role-changed panes via `zellij action rename-pane --pane-id <id>
+  "<label> (<role>)"` (`agent_pane_title`). This is **by-id, no focus
+  change** (`rename-pane --pane-id` IS supported on 0.44.3 — the status TUI
+  already uses it). The TUI re-adds the status emoji on its next refresh.
+  Best-effort (skip a pane that isn't live).
 
 ## Also — drop the `set-master` alias
 

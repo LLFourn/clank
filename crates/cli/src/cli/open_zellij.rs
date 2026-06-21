@@ -1206,15 +1206,29 @@ pub(crate) fn relocate_for_promote(
         "--retain-existing-plugin-panes",
     ]);
 
-    // Titles are best-effort. `override-layout` keeps matched panes' EXISTING
-    // titles, so the new master would still read "(reviewer)" and the old
-    // master "(master)". `zellij action rename-pane` on 0.44.3 targets the
-    // FOCUSED pane only (no by-id form), and focus is now pinned on the
-    // caller's pane — renaming the new/old master would require stealing
-    // focus to each and restoring it, disrupting the operator. Titles are
-    // explicitly best-effort, so leave them as-is rather than yank focus.
-    // TODO: revisit on a zellij with `rename-pane --pane-id` (0.45+).
-    let _ = old_master;
+    // Stamp the new roles into the two changed panes' titles. This is
+    // REQUIRED, not cosmetic: `override-layout` keeps matched panes' existing
+    // titles, and the status-TUI retitle loop derives each agent's role by
+    // PARSING its pane title (`parse_agent_panes`) — so a stale title makes
+    // the TUI re-affirm the OLD role forever. `rename-pane --pane-id` targets
+    // by id (no focus change); the TUI re-adds the status emoji on its next
+    // refresh. Best-effort.
+    rename_agent_pane(&panes, new_master, &repo_str, "master");
+    rename_agent_pane(&panes, old_master, &repo_str, "reviewer");
+}
+
+/// Best-effort `rename-pane --pane-id` of the pane running
+/// `agent_start_command(label, repo)` to `agent_pane_title(label, role)`.
+/// By-id, so no focus change; no-op if no such pane is live.
+fn rename_agent_pane(panes: &[ZellijPane], label: &str, repo_path: &str, role: &str) {
+    if let Some(pane) = find_pane_by_command(panes, &agent_start_command(label, repo_path)) {
+        zellij_action(&[
+            "rename-pane",
+            "--pane-id",
+            &pane.pane_id(),
+            &agent_pane_title(label, role),
+        ]);
+    }
 }
 
 /// Escape a string for use inside a KDL `"..."` quoted string.
