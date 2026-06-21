@@ -5,6 +5,20 @@ promote in a zellij session MOVE the promoted agent's pane out of the
 reviewer stack into the master/stage pane (swapping the demoted old master
 the other way).
 
+## SCOPE / STATUS
+
+**This plan delivers Part 1 (the rename). Part 2 (zellij pane relocation)
+is DEFERRED to a follow-up** — exactly the plan's own "ship Part 1 alone if
+no clean in-place move exists" branch. The spike (read-only zellij 0.44
+check) found NO clean swap verb: only direction-based `move-pane`
+(`right|left|up|down` / rotate), `move-pane-backwards`, and swap-*layout*
+cycling — none of which cleanly pops a pane out of the stacked reviewer
+group into the 65% stage (and the master into the stack) without a fragile
+move sequence or a banned session-destroying respawn. Confirming/finding a
+working sequence needs a LIVE move-pane spike (disruptive to the session),
+so it's tracked as a follow-up: **`agent-promote-zellij-relocation`**. The
+Part 2 section below stays as the design notes for that follow-up.
+
 ## Part 1 — rename set-master → promote (mechanical, broad)
 
 `clank agent set-master <name>` becomes `clank agent promote <name>`
@@ -76,12 +90,16 @@ session-destroying respawn.
   captured `list-panes --json`; the live `move`/`zellij action` calls
   stay untested like the other zellij glue.
 
-## Acceptance
+## Acceptance (Part 1 — the deliverable)
 
 - `clank agent promote <name>` works (with `set-master` as a transitional
   alias); all docs/skills/errors say "promote".
-- In zellij, promoting moves the agent's pane to the stage and the old
-  master's into the stack (or, if the spike shows no clean in-place move,
-  Part 1 ships and relocation is a documented follow-up — never a
-  session-destroying respawn).
+- No stranded `set-master` user-facing strings (only the alias + the
+  team-command-gone tests remain).
 - Existing tests green; clippy within budget (cli ≤30); fmt clean.
+
+## Deferred (Part 2 — follow-up `agent-promote-zellij-relocation`)
+
+- The spike confirmed no clean in-place zellij swap, so per this plan's
+  own branch Part 1 ships alone and the pane relocation is a documented
+  follow-up — NOT done here, never via a session-destroying respawn.
