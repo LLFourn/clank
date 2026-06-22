@@ -205,7 +205,11 @@ impl StatusSnapshot {
         log_rows: Vec<crate::cli::log::OnelineRow>,
     ) -> anyhow::Result<Self> {
         let (branch, head_sha, head_subject) = head_info(repo);
-        let dirty = dirty_stats(repo)?;
+        // One ODB handle for the whole snapshot: the dirty walk and
+        // every per-plan worktree diff share it (no per-read/per-plan
+        // re-open).
+        let git = gix::open(repo)?;
+        let dirty = dirty_stats_gix(&git)?;
 
         let config = crate::cli::config::load_with_home(repo, home);
         // Plan: teams-based-agent-registration. `status` is a
@@ -240,8 +244,11 @@ impl StatusSnapshot {
             commit_reviewers,
             gate_reviewers,
         };
-        let reviews =
-            crate::fs_plan_state_lookup::FsPlanStateLookup::new(repo, state.head.as_ref());
+        let reviews = crate::fs_plan_state_lookup::FsPlanStateLookup::with_git(
+            repo,
+            state.head.as_ref(),
+            &git,
+        );
         // HEAD facts feed the commit-tag invariant
         // (commit-tag-fixup-is-first-class-state): a violation renders
         // as the dominating `MasterToFixCommitTag` correction.

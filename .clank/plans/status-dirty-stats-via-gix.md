@@ -60,4 +60,8 @@ incremental model's `dirty` updater then calls this gix path. Pairs with
   unborn-HEAD degrade, `worktree_status` clean/dirty.
 - `+N/-M` line count is display-only: best-effort match to `--shortstat`
   (verified on fixtures), may drift where gix's diff legitimately differs.
-- One gix handle reused across the dirty/worktree computation's reads.
+- One gix handle per snapshot, threaded through BOTH `dirty_stats` (status
+  walk + per-path diffs) and the per-plan `worktree_status` body diffs — the
+  rebuild opens the ODB once (`from_state` via `FsPlanStateLookup::with_git`).
+  Standalone callers (preview/open/wfw, and the `dirty_stats(&Path)` entry for
+  pr_review/tests) still open their own — they're not the per-repaint hot path.

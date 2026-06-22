@@ -13,10 +13,15 @@ use clank_core::wait::{PlanStateLookup, ReviewEntry};
 pub struct FsPlanStateLookup<'a> {
     pub repo: &'a Path,
     head: Option<&'a CommitSha>,
-    /// Opened on first `worktree_status` and reused across every
-    /// plan in a single derive (was a `git diff` subprocess per
-    /// plan). Lazy so review-only uses don't pay for it.
-    git: OnceCell<Option<gix::Repository>>,
+    /// A handle shared with the rest of the rebuild (status's
+    /// `from_state` threads one through both `dirty_stats` and this
+    /// lookup, so a snapshot opens the ODB once). `None` for callers
+    /// that don't hold one — then `git_owned` opens lazily.
+    git: Option<&'a gix::Repository>,
+    /// Lazily opened on first `worktree_status` when no shared handle
+    /// was given, reused across every plan in a derive (was a `git
+    /// diff` subprocess per plan). Lazy so review-only uses don't pay.
+    git_owned: OnceCell<Option<gix::Repository>>,
 }
 
 impl<'a> FsPlanStateLookup<'a> {
@@ -24,12 +29,30 @@ impl<'a> FsPlanStateLookup<'a> {
         Self {
             repo,
             head,
-            git: OnceCell::new(),
+            git: None,
+            git_owned: OnceCell::new(),
+        }
+    }
+
+    /// Like [`new`](Self::new) but reuses a handle the caller already
+    /// opened, so the whole rebuild shares one ODB.
+    pub fn with_git(repo: &'a Path, head: Option<&'a CommitSha>, git: &'a gix::Repository) -> Self {
+        Self {
+            repo,
+            head,
+            git: Some(git),
+            git_owned: OnceCell::new(),
         }
     }
 
     fn git(&self) -> Option<&gix::Repository> {
-        self.git.get_or_init(|| gix::open(self.repo).ok()).as_ref()
+        match self.git {
+            Some(git) => Some(git),
+            None => self
+                .git_owned
+                .get_or_init(|| gix::open(self.repo).ok())
+                .as_ref(),
+        }
     }
 }
 
