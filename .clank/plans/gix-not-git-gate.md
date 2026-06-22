@@ -1,81 +1,83 @@
 # gix-not-git-gate
 
-Despite several plans to purge `git` shell-outs in favor of gix, agents keep
-reintroducing `std::process::Command::new("git")` (e.g. `dirty_stats`,
-`worktree_status`, found in the status-tui CPU investigation) because gix's
-APIs are less ergonomic and NOTHING stops the regression. This is an
-enforcement gap, not a one-site fix — the reason the same problem recurs.
+**Centralize ALL git access (gix AND subprocess) behind one module, then a
+test forbids raw `git`/`gix` outside it.** Despite several plans to purge
+`git` shell-outs for gix, agents keep reintroducing
+`std::process::Command::new("git")` (most recently `dirty_stats`,
+`worktree_status` in the status-tui CPU investigation) because nothing stops
+it AND there's no obvious home for git logic — so each command module grows
+its own ad-hoc `run_git`. The fix isn't a one-site patch or a scattered
+allowlist; it's a clean BOUNDARY: one layer owns the backend choice, callers
+are unaware whether a call is gix or a subprocess.
 
-## Reality (measured before scoping)
+## The model
 
-A single sanctioned shim is NOT viable: there are ~57 `Command::new("git")`
-sites across 19 files; roughly 30 are PRODUCTION (non-test) code, spread
-across `purge`, `rewrite`, `unfinish`, `finish`, `fork`, `pr_review`, `log`,
-`diff`, `queue`, `shelve`, `html`, `doctor`, `init`, `open`, `open_zellij`.
-They split three ways:
-- **Genuinely not gix-able yet** — `git worktree add` (fork), history rewrite
-  (purge/rewrite/unfinish/finish). These must stay shell-outs.
-- **Convertible, not yet converted** — `status --porcelain` (unfinish),
-  `log -1 --format` (log), `remote get-url` (pr_review). Future gix work.
-- **Borderline** — `git diff <range>` patch synthesis (diff), where git's
-  exact textual patch is the contract.
+- ONE module is the sole git authority (extend `git_io.rs` — already the gix
+  read layer — broadening its contract from "reads only" to "all git access,
+  read+write, gix-or-subprocess"; rename if clearer).
+- Every caller uses a TYPED function there (`commit_subject`, `worktree_add`,
+  `status_porcelain`, …). No caller constructs `Command::new("git")` or calls
+  `gix::*` directly — including the gix calls the recent dirty-stats work
+  scattered into `status.rs` / `worktree_facts.rs` / `fs_plan_state_lookup.rs`,
+  which fold back in.
+- Inside the layer, each function picks the backend. gix where viable;
+  subprocess only where gix genuinely can't (yet). The boundary makes a later
+  git→gix swap INVISIBLE to callers — that's the payoff.
 
-So the gate canNOT demand "one shim" and canNOT fail on every existing site
-(converting them is explicitly out of scope). The right model is an
-ALLOWLIST BASELINE that RATCHETS DOWN: record today's sites, fail on NEW
-ones, shrink as conversions land.
+## Scope of this plan
 
-## Fix — an allowlist-baseline ratchet
+Centralize + convert-the-easy-ones + the boundary test. Convert in the SAME
+pass where an equivalent already exists or is trivial; keep the hard ops as
+subprocess *inside the layer* (convert later, behind the stable API).
 
-Runs under `cargo test` (there is no separate "gauntlet"/CI in this repo, so
-it must be a normal test).
+**Convert to gix now** (equivalent exists in `git_io.rs` or trivial):
+- `rev-parse HEAD` → existing `rev_parse_head` (purge, rewrite)
+- `log -1 --format=%s` / `show -s --format=%s` → existing `commit_subject`
+  (rewrite; finish tests)
+- `diff-tree --name-status -r` → existing `diff_tree_changes` (unfinish)
+- `status --porcelain` → the gix status path from `status-dirty-stats-via-gix`
+  (purge, unfinish, shelve, open)
+- `rev-list` (first-parent/reverse), `ls-tree -r --name-only`,
+  `remote get-url origin`, `log -1 --format=<author/date/body>` (log.rs),
+  `check-ignore` → straightforward gix (revwalk / tree traversal / config /
+  commit metadata / gix-ignore, now available via the `status` feature).
 
-- A test scans PRODUCTION source under `crates/*/src` for git shell-outs:
-  `Command::new("git")` and equivalent `"git"`-as-program constructions.
-  - It EXCLUDES test code — `#[cfg(test)]` modules and `crates/*/tests/` —
-    because test fixtures legitimately spawn `git` to build repos (the
-    no-binary-spawning rule bans spawning the *clank* binary, not `git`).
-    Suggested mechanism: brace-track from each `#[cfg(test)]` attribute to
-    skip that module; skip integration-test dirs wholesale.
-- It compares the found sites to a checked-in allowlist. Recommended shape:
-  a per-file EXPECTED COUNT plus a one-line reason (line numbers churn; an
-  exact-count-per-file ratchet does not). Example:
-  `fork.rs = 4   # git worktree add — gix worktree support insufficient`.
-- FAIL conditions:
-  - A file's actual count EXCEEDS its allowlisted count → a NEW shell-out
-    (the regression we're stopping).
-  - A file's actual count is BELOW its allowlisted count → a site was removed
-    without updating the allowlist → update it DOWN (keeps the ratchet honest;
-    the baseline can only shrink).
-  - A git shell-out in a file with NO allowlist entry → fail.
-- Growing the allowlist (raising a count / adding a file) is the REVIEWED
-  event: it requires a justification reason in the allowlist, which reviewers
-  scrutinize against "is this genuinely not gix-able?".
-- Document the rule where agents see it (CLAUDE.md + the master skill): prefer
-  gix; a new `git` shell-out requires (a) it's genuinely not gix-able yet, and
-  (b) an allowlist entry with a justifying reason.
+**Keep as subprocess, but moved into the layer as typed fns** (gix can't, or
+not safely, today):
+- `worktree add` / `worktree list --porcelain` (fork, open_zellij)
+- `fetch origin` (fork), `checkout -b` (pr_review)
+- `commit` / `--amend` / `rm --cached` / `add` (purge, queue)
+- `cherry-pick` (shelve), and the history-rewrite engine (rewrite, purge)
+
+## The boundary test (no-binary-spawning — in-process scan)
+
+- A `cargo test` (this repo has no separate gauntlet/CI) scans PRODUCTION
+  source under `crates/*/src` and FAILS on `Command::new("git")` or `gix::`
+  usage outside the one layer module.
+- EXCLUDES test code (`#[cfg(test)]` modules and `crates/*/tests/`) — fixtures
+  legitimately spawn `git` and open gix repos. Suggested mechanism:
+  brace-track from each `#[cfg(test)]` attribute; skip integration dirs.
+- Because everything is centralized, the test is a simple single-file
+  boundary check — no allowlist, no per-file counts.
+- Tests: the scan flags a planted raw `git`/`gix` use in a non-test fixture
+  and ignores one in a `#[cfg(test)]` module; the real tree passes.
+
+## Documentation
+
+- CLAUDE.md + the master skill: all git/gix access goes through the layer;
+  adding a subprocess there needs a one-line justification (gix can't do X).
 
 ## Out of scope
 
-- Converting the not-yet-converted sites — separate plans, as encountered.
-  This plan is the GATE that stops NEW shell-outs and ENUMERATES existing ones
-  (with reasons); it does not rewrite them. The baseline is expected to be
-  large at first and shrink over time.
-- A single `git_shim` module — rejected above as infeasible given the spread
-  of legitimate, necessarily-separate git operations.
-
-## Testing (no-binary-spawning — in-process scan, never a spawned binary)
-
-- The scanner flags a planted `Command::new("git")` in a non-test fixture
-  string and IGNORES one inside a `#[cfg(test)]` module.
-- The real tree PASSES against the checked-in baseline allowlist.
-- A count mismatch (a fixture with one extra / one fewer site) fails as
-  described.
+- Converting the must-stay-subprocess ops to gix (worktree, fetch, checkout,
+  history rewrite). They live behind the layer now; convert later without
+  touching callers.
 
 ## Acceptance
 
-- A NEW production `git` shell-out outside the allowlist FAILS `cargo test`.
-- Test fixtures remain free to spawn `git` (test code is excluded).
-- The current production sites are recorded in the allowlist, each with a
-  reason; the baseline can only ratchet DOWN without review.
-- The rule is documented for agents (CLAUDE.md + skill).
+- One module is the sole site of `Command::new("git")` and `gix::` use;
+  callers use typed functions and are backend-agnostic.
+- The listed easy ops are gix; the hard ops are subprocess inside the layer.
+- A raw `git`/`gix` use outside the layer (in production code) FAILS
+  `cargo test`; test fixtures are unaffected.
+- The rule is documented for agents.
