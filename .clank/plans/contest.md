@@ -21,9 +21,14 @@ knob: minimal → benchmark planning; detailed → benchmark implementation.
 
 ## Simplicity first (v1 scope + honest non-goals)
 
-- **Scorers are the originating session's own agents** — no separate judge,
-  no blinding, no model-affinity defense (dropped: not worth it unless free;
-  a juror scoring work from a team that shares its model is accepted).
+- **Scorers are the originating REVIEWERS** — no separate judge, no
+  blinding, no model-affinity defense (dropped: not worth it unless free).
+  Model-affinity bias in a SCORE is tolerated ONLY because the HUMAN — not
+  the scores — picks the winner, and picks by inspecting the actual work
+  (diff + plan) with the scores as ADVISORY summaries (see EXIT). So a
+  scorer whose own model appears in a contestant's team is allowed; the
+  optional cheap defense (a scorer skips a contestant containing its own
+  model) is deferred, since heavy overlap could leave a contestant unscored.
 - **No automatic winner** — the contest BLOCKS on the human; `clank contest
   winner <id>` is the decision point.
 - **No active copy-defenses; passive discovery accepted.** Agents are never
@@ -42,15 +47,16 @@ work. It's the contest analogue of `pr-review` (where agents review a PR);
 a `clank-contest` skill guides the scoring. Removing the marker (on winner
 selection / teardown) exits the mode.
 
-- **Reviewers SCORE** each finished contestant (v1 default — confirm):
-  they review the contestant's implementation diff + its plan and write a
-  numeric score. The MASTER convenes (runs `start`, surfaces status) and is
-  the conduit for the human's winner choice.
-- **Trigger = incremental** (v1 default — confirm): an originating agent is
-  woken to score a contestant AS IT FINISHES, not after the whole field —
-  matches the `wfw` model (work arrives when a contestant reaches
-  `[stem] finish`). The human compares scores at winner-time.
-- **Score scale = /10** (v1 default — confirm).
+- **Reviewers SCORE** each finished contestant; the MASTER does NOT score —
+  it convenes (runs `start`, surfaces status) and relays the human's winner
+  choice. (Master-doesn't-score avoids a master scoring a contestant built
+  around its own model.) Each reviewer reviews the contestant's
+  implementation diff + plan and writes a numeric score.
+- **Trigger = incremental:** an originating reviewer is woken to score a
+  contestant AS IT FINISHES, not after the whole field — matches the `wfw`
+  model (work arrives when a contestant reaches `[stem] finish`). The human
+  compares at winner-time.
+- **Score scale = /10.**
 
 ## Directory structures
 
@@ -129,8 +135,11 @@ OBSERVE git/`.clank` output — they never manage the contestant processes.
      detection is a known hard problem, deferred.)
 
 3. **EXIT — human picks the winner; graft; teardown.**
-   - The human reads the scores (in `status --tui`) and runs `clank contest
-     winner <contestant-id>`.
+   - The human picks by INSPECTING THE WORK: `clank contest winner <id>`
+     (and the status surface) present/link each contestant's DIFF + plan,
+     with the reviewers' scores as ADVISORY summaries — NOT the verdict.
+     Judging the actual work (not the score line) is what keeps the accepted
+     model-affinity bias from deciding the outcome.
    - GRAFT the winner's `[stem]` stack + its `.clank/finished/<stem>` trail
      onto main (reuse `purge`/`shelve` rewrite; conflicts if main moved).
    - TEARDOWN per Teardown safety: close the contest tab/panes, remove all
@@ -197,13 +206,15 @@ status` shows the same, richer (per-contestant gate detail).
   graft step, the `.clank/contest/` manifest + `~/.clank/contest` marker, a
   `clank-contest` skill.
 
-## v1 decisions to CONFIRM (flagged for the human + reviewers)
+## v1 decisions (resolved — both reviewers endorsed)
 
-- Score scale `/10`?
-- Scorers = originating REVIEWERS only (master convenes + relays the human's
-  winner choice), or ALL originating agents incl. the master?
-- Trigger = score each contestant incrementally as it finishes, or wait for
-  the whole field then score comparatively?
+- **Score scale: /10.**
+- **Scorers: originating REVIEWERS only** — the master convenes + relays the
+  human's winner choice and does NOT score (so a master never scores a
+  contestant built around its own model).
+- **Trigger: incremental** — score each contestant as it finishes (matches
+  `wfw`); comparative whole-field scoring deferred (revisit only if
+  incremental proves to bias early/late finishers).
 
 ## Deferred / Out of scope
 
@@ -223,5 +234,7 @@ status` shows the same, richer (per-contestant gate detail).
 - Carries the validated invariants: crash-safe idempotent teardown
   (gating), fail-closed cap, atomic ENTER, liveness via `waiting_on`,
   graft-with-trail.
-- The three v1 decisions are resolved (here or via review).
+- The three v1 decisions are RESOLVED (/10; reviewers-only scoring;
+  incremental trigger) and the model-affinity acceptance is mitigated by the
+  winner flow presenting the contestant's DIFF + plan (scores advisory).
 - NO code — research only.
