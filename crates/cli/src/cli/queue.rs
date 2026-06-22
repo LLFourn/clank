@@ -330,29 +330,10 @@ fn promote(repo: &Path, name: &str) -> anyhow::Result<()> {
     }
     std::fs::create_dir_all(dest.parent().unwrap())?;
     std::fs::rename(&entry.path, &dest)?;
-    let status = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["add", "--", &format!(".clank/plans/{name}.md")])
-        .status()?;
-    if !status.success() {
-        anyhow::bail!("git add failed");
-    }
+    let plan_path = format!(".clank/plans/{name}.md");
+    crate::git_plumbing::run(repo, &["add", "--", &plan_path])?;
     let msg = format!("[{name}] intro");
-    let status = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args([
-            "commit",
-            "--quiet",
-            &format!(".clank/plans/{name}.md"),
-            "-m",
-            &msg,
-        ])
-        .status()?;
-    if !status.success() {
-        anyhow::bail!("git commit failed");
-    }
+    crate::git_plumbing::run(repo, &["commit", "--quiet", &plan_path, "-m", &msg])?;
     println!("promoted `{name}` to active plan");
     Ok(())
 }

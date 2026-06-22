@@ -312,13 +312,7 @@ pub async fn run_unshelve(args: UnshelveArgs) -> anyhow::Result<()> {
     // and shelve state are NOT touched (fail-closed) — finishing
     // by hand + `clank shelve clean` completes the restore.
     for sha in &shelve_state.shas {
-        let status = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&repo)
-            .args(["cherry-pick", "--allow-empty", sha])
-            .status()
-            .context("spawning git cherry-pick")?;
-        if !status.success() {
+        if !crate::git_plumbing::cherry_pick(&repo, sha)? {
             anyhow::bail!(
                 "cherry-pick of {sha} stopped (conflict?). Resolve with git \
                  (`git cherry-pick --continue` / `--abort`); the shelved ref \

@@ -272,18 +272,7 @@ pub fn checkout_with(repo: &Path, pr: u32) -> anyhow::Result<PathBuf> {
     // threaded into start_with so the review pins the SAME head the
     // branch was checked out to — one fetch (ruthless b88ae34).
     let sha = super::fork::fetch_pr_head(repo, pr)?;
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["checkout", "-b", &branch, &sha])
-        .output()
-        .context("spawning git checkout")?;
-    if !out.status.success() {
-        anyhow::bail!(
-            "git checkout failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
+    crate::git_plumbing::checkout_new_branch(repo, &branch, &sha)?;
     start_with(repo, &slug, pr, None, Some(&sha))
 }
 

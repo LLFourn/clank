@@ -268,20 +268,7 @@ pub async fn run_fork_pinned(
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating `{}`", parent.display()))?;
     }
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(&source)
-        .args(["worktree", "add", "-b", name])
-        .arg(&dest)
-        .arg(base)
-        .output()
-        .context("spawning git worktree add")?;
-    if !out.status.success() {
-        anyhow::bail!(
-            "git worktree add failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
+    crate::git_plumbing::worktree_add(&source, name, &dest, base)?;
 
     // ── Seed the worktree's gitignored .clank/ ──
     // Repo config (team selection) is per-worktree + gitignored,
@@ -392,18 +379,8 @@ fn default_pr_purpose(pr: u32, title: Option<&str>) -> String {
 /// worktree on the sha, not the symref.
 pub(crate) fn fetch_pr_head(source: &Path, pr: u32) -> anyhow::Result<String> {
     let refspec = format!("pull/{pr}/head");
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(source)
-        .args(["fetch", "origin", &refspec])
-        .output()
-        .context("spawning git fetch")?;
-    if !out.status.success() {
-        anyhow::bail!(
-            "fetching PR #{pr} (`git fetch origin {refspec}`) failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
+    crate::git_plumbing::fetch_refspec(source, &refspec)
+        .with_context(|| format!("fetching PR #{pr}"))?;
     // The fetch itself stays on git (network/credentials); resolving
     // the resulting FETCH_HEAD is a plain rev read.
     crate::git_io::resolve_commit(source, "FETCH_HEAD")
@@ -418,19 +395,8 @@ pub(crate) fn fetch_pr_head(source: &Path, pr: u32) -> anyhow::Result<String> {
 /// flat under `<main>/.clank/worktrees/` instead of nesting under the
 /// current one (fork-worktree-nesting).
 fn main_repo_root(repo: &Path) -> anyhow::Result<PathBuf> {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["worktree", "list", "--porcelain"])
-        .output()
-        .context("spawning git worktree list")?;
-    if !out.status.success() {
-        anyhow::bail!(
-            "resolving the main worktree (`git worktree list`) failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stdout = crate::git_plumbing::worktree_list_porcelain(repo)
+        .context("resolving the main worktree")?;
     let path = stdout
         .lines()
         .next()
@@ -457,23 +423,13 @@ fn resolve_dest(path_arg: Option<&Path>, default: PathBuf, cwd: &Path) -> PathBu
 /// idempotent re-fork from a genuine collision (open-and-fork-
 /// idempotent Part 4).
 fn registered_worktree_branch(repo: &Path, worktree_path: &Path) -> anyhow::Result<Option<String>> {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["worktree", "list", "--porcelain"])
-        .output()
-        .context("spawning git worktree list")?;
-    if !out.status.success() {
-        anyhow::bail!(
-            "resolving worktrees (`git worktree list`) failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
+    let stdout =
+        crate::git_plumbing::worktree_list_porcelain(repo).context("resolving worktrees")?;
     // git records worktree paths absolute + symlink-resolved, so a
     // symlinked or `..`-laden `dest` won't match textually —
     // canonicalize both sides before comparing (codex d86f702).
     let target = canonical(worktree_path);
-    Ok(parse_worktrees(&String::from_utf8_lossy(&out.stdout))
+    Ok(parse_worktrees(&stdout)
         .into_iter()
         .find(|(path, _)| canonical(Path::new(path)) == target)
         .map(|(_, branch)| branch.to_string()))

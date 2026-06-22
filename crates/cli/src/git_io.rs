@@ -70,7 +70,33 @@ pub fn working_tree_dirty_at(repo: &Path) -> Result<Option<DirtyStats>, GitIoErr
 /// and no untracked files (the `git status --porcelain` empty test the
 /// `clank unfinish` / `shelve` / `open` / `purge` guards used).
 pub fn working_tree_clean(repo: &Path) -> Result<bool, GitIoError> {
-    Ok(working_tree_dirty_at(repo)?.is_none())
+    Ok(working_tree_status(repo)?.is_clean())
+}
+
+/// The structured working-tree status, so callers can apply their own
+/// policy (e.g. `rewrite` ignores untracked `.clank/` scratch). Replaces
+/// parsing `git status --porcelain` lines. `changed` is the tracked
+/// paths differing from HEAD (staged + unstaged), sorted; `untracked`
+/// is the untracked file paths.
+pub struct WorkingTreeStatus {
+    pub changed: Vec<String>,
+    pub untracked: Vec<String>,
+}
+
+impl WorkingTreeStatus {
+    pub fn is_clean(&self) -> bool {
+        self.changed.is_empty() && self.untracked.is_empty()
+    }
+}
+
+/// Structured `git status` via gix. Opens its own handle.
+pub fn working_tree_status(repo: &Path) -> Result<WorkingTreeStatus, GitIoError> {
+    let h = open(repo)?;
+    let w = status_walk(&h.0)?;
+    Ok(WorkingTreeStatus {
+        changed: w.changed.into_iter().collect(),
+        untracked: w.untracked,
+    })
 }
 
 /// `None` = clean. Computed in-process via gix — no `git` subprocess.
@@ -117,10 +143,9 @@ pub fn working_tree_dirty(h: &Repo) -> Result<Option<DirtyStats>, GitIoError> {
 /// Opens its own handle. For guards that show WHAT is dirty (e.g.
 /// `clank unfinish`'s clean-worktree check).
 pub fn working_tree_dirty_paths(repo: &Path) -> Result<Vec<String>, GitIoError> {
-    let h = open(repo)?;
-    let walk = status_walk(&h.0)?;
-    let mut paths: Vec<String> = walk.changed.into_iter().collect();
-    paths.extend(walk.untracked);
+    let s = working_tree_status(repo)?;
+    let mut paths = s.changed;
+    paths.extend(s.untracked);
     paths.sort();
     paths.dedup();
     Ok(paths)

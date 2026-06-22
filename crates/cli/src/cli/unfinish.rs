@@ -153,17 +153,5 @@ fn short(sha: &str) -> &str {
 }
 
 fn git_run(repo: &Path, args: &[&str]) -> anyhow::Result<()> {
-    let status = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .status()?;
-    if !status.success() {
-        anyhow::bail!(
-            "git {} failed (exit {})",
-            args.join(" "),
-            status.code().unwrap_or(-1)
-        );
-    }
-    Ok(())
+    crate::git_plumbing::run(repo, args)
 }

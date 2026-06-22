@@ -529,7 +529,7 @@ async fn apply_squash(
 }
 
 fn working_tree_dirty(repo: &Path) -> anyhow::Result<bool> {
-    let stdout = git_capture(repo, &["status", "--porcelain"])?;
+    let status = crate::git_io::working_tree_status(repo)?;
     // Clank's OWN untracked scratch under `.clank/` (cache, agent
     // configs, queue, a freshly-written `.gitignore`, …) is local
     // runtime state, not the operator's work — it must NOT block a
@@ -537,11 +537,12 @@ fn working_tree_dirty(repo: &Path) -> anyhow::Result<bool> {
     // irrelevant to the rewrite, which only edits COMMITTED history.
     // Tracked modifications anywhere (incl. committed `.clank/` plan
     // files) and untracked files OUTSIDE `.clank/` still count.
-    Ok(stdout.lines().any(|line| {
-        let untracked = line.starts_with("??");
-        let path = line.get(3..).unwrap_or("");
-        !(untracked && path.starts_with(".clank/"))
-    }))
+    // gix's dirwalk COLLAPSES a wholly-untracked `.clank/` to a single
+    // entry `.clank` (no trailing slash), where `git status --porcelain`
+    // emitted `.clank/` — so match both the dir itself and its contents.
+    let under_clank = |p: &str| p == ".clank" || p.starts_with(".clank/");
+    let untracked_outside_clank = status.untracked.iter().any(|p| !under_clank(p));
+    Ok(!status.changed.is_empty() || untracked_outside_clank)
 }
 
 fn branch_exists(repo: &Path, branch: &str) -> anyhow::Result<bool> {
@@ -561,35 +562,7 @@ fn current_branch(repo: &Path) -> anyhow::Result<String> {
 }
 
 fn git_run(repo: &Path, args: &[&str]) -> anyhow::Result<()> {
-    let status = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .status()?;
-    if !status.success() {
-        anyhow::bail!(
-            "git {} failed (exit {})",
-            args.join(" "),
-            status.code().unwrap_or(-1)
-        );
-    }
-    Ok(())
-}
-
-fn git_capture(repo: &Path, args: &[&str]) -> anyhow::Result<String> {
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .output()?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "git {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    Ok(String::from_utf8(output.stdout)?)
+    crate::git_plumbing::run(repo, args)
 }
 
 fn short(sha: &str) -> String {

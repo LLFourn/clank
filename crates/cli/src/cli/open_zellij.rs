@@ -67,19 +67,8 @@ fn fork_path(source: &Path, name: &str) -> anyhow::Result<PathBuf> {
 /// linked worktree — via `git worktree list --porcelain`. This is the
 /// `--all` target set: the repo itself and all its forks.
 fn worktree_paths(repo: &Path) -> anyhow::Result<Vec<PathBuf>> {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["worktree", "list", "--porcelain"])
-        .output()
-        .context("running `git worktree list`")?;
-    if !out.status.success() {
-        anyhow::bail!(
-            "`git worktree list` failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    Ok(parse_worktree_list(&String::from_utf8_lossy(&out.stdout)))
+    let stdout = crate::git_plumbing::worktree_list_porcelain(repo)?;
+    Ok(parse_worktree_list(&stdout))
 }
 
 /// Parse `git worktree list --porcelain` stdout → worktree paths

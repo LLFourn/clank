@@ -281,23 +281,9 @@ pub(crate) fn execute_amend(repo: &std::path::Path, program: &AmendProgram) -> a
     }
 
     for p in &program.strip_paths {
-        let status = std::process::Command::new("git")
-            .arg("-C")
-            .arg(repo)
-            .args(["rm", "--cached", "-q", p])
-            .status()?;
-        if !status.success() {
-            anyhow::bail!("git rm --cached {p} failed");
-        }
+        crate::git_plumbing::run(repo, &["rm", "--cached", "-q", p])?;
     }
-    let status = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["commit", "--amend", "--no-edit", "--allow-empty"])
-        .status()?;
-    if !status.success() {
-        anyhow::bail!("git commit --amend failed");
-    }
+    crate::git_plumbing::run(repo, &["commit", "--amend", "--no-edit", "--allow-empty"])?;
     println!(
         "amended HEAD: stripped {} path(s)",
         program.strip_paths.len()

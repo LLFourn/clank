@@ -214,3 +214,140 @@ pub fn delete_ref(repo: &Path, full_name: &str) -> anyhow::Result<()> {
         .with_context(|| format!("delete `{full_name}`"))?;
     Ok(())
 }
+
+// ── subprocess mutations ──
+// gix can't (yet) do these — worktree management, network fetch,
+// working-tree checkout/cherry-pick, and the index/commit operations
+// the history-rewrite engine drives. They stay `git` subprocesses, but
+// live HERE behind the boundary so callers never spawn `git` directly.
+
+use std::process::Command;
+
+/// Run `git -C <repo> <args>`, erroring on non-zero exit. The
+/// sanctioned subprocess passthrough for the history-rewrite engine
+/// (`finish` / `rewrite` / `unfinish` / `purge`), which drives many
+/// one-off plumbing commands; discrete operations get typed fns below.
+pub fn run(repo: &Path, args: &[&str]) -> anyhow::Result<()> {
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .status()
+        .with_context(|| format!("spawning git {}", args.join(" ")))?;
+    if !status.success() {
+        anyhow::bail!(
+            "git {} failed (exit {})",
+            args.join(" "),
+            status.code().unwrap_or(-1)
+        );
+    }
+    Ok(())
+}
+
+/// Like [`run`] but captures stdout (trimmed). Errors on non-zero exit.
+pub fn capture(repo: &Path, args: &[&str]) -> anyhow::Result<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .with_context(|| format!("spawning git {}", args.join(" ")))?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// `git worktree add -b <name> <dest> <base>` — gix has no worktree
+/// creation.
+pub fn worktree_add(source: &Path, name: &str, dest: &Path, base: &str) -> anyhow::Result<()> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(source)
+        .args(["worktree", "add", "-b", name])
+        .arg(dest)
+        .arg(base)
+        .output()
+        .context("spawning git worktree add")?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "git worktree add failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// Raw `git worktree list --porcelain` stdout — callers parse the
+/// `worktree <path>` lines. gix's linked-worktree enumeration is
+/// insufficient, so this stays git.
+pub fn worktree_list_porcelain(repo: &Path) -> anyhow::Result<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["worktree", "list", "--porcelain"])
+        .output()
+        .context("spawning git worktree list")?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "`git worktree list` failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// `git fetch origin <refspec>`. gix CAN fetch, but only with its
+/// network+TLS features (a real dependency/binary-size cost) AND
+/// explicit credential-helper wiring; the subprocess inherits the
+/// user's git credentials for free. So this is a deliberate cost/auth
+/// call, not a gix limitation — reconsiderable if we take on gix net.
+pub fn fetch_refspec(source: &Path, refspec: &str) -> anyhow::Result<()> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(source)
+        .args(["fetch", "origin", refspec])
+        .output()
+        .context("spawning git fetch")?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "`git fetch origin {refspec}` failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// `git checkout -b <branch> <sha>` — working-tree checkout stays git.
+pub fn checkout_new_branch(repo: &Path, branch: &str, sha: &str) -> anyhow::Result<()> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["checkout", "-b", branch, sha])
+        .output()
+        .context("spawning git checkout")?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "git checkout failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// `git cherry-pick --allow-empty <sha>`. Returns `false` on conflict
+/// (git leaves the cherry-pick in progress for the caller to resolve),
+/// `true` on success. Working-tree replay stays git.
+pub fn cherry_pick(repo: &Path, sha: &str) -> anyhow::Result<bool> {
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["cherry-pick", "--allow-empty", sha])
+        .status()
+        .context("spawning git cherry-pick")?;
+    Ok(status.success())
+}
