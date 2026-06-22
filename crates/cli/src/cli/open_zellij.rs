@@ -824,6 +824,17 @@ struct ZellijPane {
     /// so this scopes a relocation to the caller's active tab.
     #[serde(default)]
     tab_id: u32,
+    /// Pane geometry (terminal cells) from `list-panes --json`: top-left
+    /// position + size. Feeds [`tab_dims`] so orientation is read from the
+    /// tab's true extent, not the caller's own pane. Default 0 when absent.
+    #[serde(default)]
+    pane_x: u16,
+    #[serde(default)]
+    pane_y: u16,
+    #[serde(default)]
+    pane_columns: u16,
+    #[serde(default)]
+    pane_rows: u16,
 }
 
 impl ZellijPane {
@@ -895,6 +906,24 @@ fn zellij_action(args: &[&str]) -> Option<Vec<u8>> {
 fn list_agent_panes() -> Option<Vec<ZellijPane>> {
     let stdout = zellij_action(&["list-panes", "--json", "--command"])?;
     serde_json::from_slice(&stdout).ok()
+}
+
+/// The full `(cols, rows)` extent of a zellij tab, from the live
+/// `list-panes` geometry: the max right/bottom edge over every pane in that
+/// tab (terminal AND plugin — the tab/status-bar plugins span the full width,
+/// so they pin the true extent). This is what `clank open`'s orientation
+/// detection wants, as opposed to `term_size()` which is the caller's OWN
+/// pane (the 65% stage) and mis-reads a portrait tab as landscape. `(0, 0)`
+/// when the tab has no panes or the geometry fields are absent (callers fall
+/// back to `term_size`).
+fn tab_dims(panes: &[ZellijPane], tab_id: u32) -> (u16, u16) {
+    let mut cols = 0u16;
+    let mut rows = 0u16;
+    for p in panes.iter().filter(|p| p.tab_id == tab_id) {
+        cols = cols.max(p.pane_x.saturating_add(p.pane_columns));
+        rows = rows.max(p.pane_y.saturating_add(p.pane_rows));
+    }
+    (cols, rows)
 }
 
 /// Best-effort: inside a zellij session, open a pane for a newly-added
@@ -1182,14 +1211,27 @@ pub(crate) fn relocate_for_promote(
     let Some(panes) = list_agent_panes() else {
         return;
     };
-    let (rows, cols) = crate::cli::status_tui::term_size();
+    // Orientation comes from the caller tab's full extent (what `clank open`
+    // sees), not `term_size()` (the caller's own pane = the 65% stage, which
+    // mis-reads a portrait tab as landscape). Fall back to `term_size` when
+    // the caller pane, its tab, or the geometry is unavailable / degenerate.
+    let caller_ref = caller_pane_id();
+    let term = caller_ref
+        .as_deref()
+        .and_then(|r| panes.iter().find(|p| p.pane_id() == r).map(|p| p.tab_id))
+        .map(|tab_id| tab_dims(&panes, tab_id))
+        .filter(|(cols, rows)| *cols != 0 && *rows != 0)
+        .unwrap_or_else(|| {
+            let (rows, cols) = crate::cli::status_tui::term_size();
+            (cols, rows)
+        });
     let kdl = match compose_promote_layout(
         &panes,
-        caller_pane_id().as_deref(),
+        caller_ref.as_deref(),
         roster_labels,
         new_master,
         &repo_str,
-        (cols, rows),
+        term,
     ) {
         PromoteRelayout::Apply(kdl) => kdl,
         PromoteRelayout::Skip => return,
@@ -2172,6 +2214,65 @@ dead-one [Created 10h ago] (EXITED - attach to resurrect)
     fn panes_from(parts: &[String]) -> Vec<ZellijPane> {
         let json = format!("[{}]", parts.join(","));
         serde_json::from_str(&json).expect("fixture parses")
+    }
+
+    #[test]
+    fn tab_dims_reads_tab_extent_for_orientation() {
+        // A portrait tab: two stacked panes spanning 80 cols × (68 + 69) rows.
+        // `term_size` (the caller's stage pane alone, 80×68) would read
+        // landscape (80 >= 2*68? no — but the real flip case is a wide stage
+        // in a portrait tab); the TAB extent (80×137) reads portrait.
+        let portrait: Vec<ZellijPane> = serde_json::from_str(
+            r#"[
+              {"id":0,"is_plugin":false,"is_focused":true,"terminal_command":"clank agent start claude --repo /a","tab_id":0,"pane_x":0,"pane_y":0,"pane_columns":80,"pane_rows":68},
+              {"id":1,"is_plugin":false,"is_focused":false,"terminal_command":"clank agent start codex --repo /a","tab_id":0,"pane_x":0,"pane_y":68,"pane_columns":80,"pane_rows":69}
+            ]"#,
+        )
+        .unwrap();
+        let (cols, rows) = tab_dims(&portrait, 0);
+        assert_eq!((cols, rows), (80, 137));
+        assert_eq!(Orientation::detect((cols, rows)), Orientation::Portrait);
+
+        // A landscape tab.
+        let landscape: Vec<ZellijPane> = serde_json::from_str(
+            r#"[
+              {"id":0,"is_plugin":false,"is_focused":true,"terminal_command":"x","tab_id":0,"pane_x":0,"pane_y":0,"pane_columns":200,"pane_rows":50}
+            ]"#,
+        )
+        .unwrap();
+        let (cols, rows) = tab_dims(&landscape, 0);
+        assert_eq!((cols, rows), (200, 50));
+        assert_eq!(Orientation::detect((cols, rows)), Orientation::Landscape);
+
+        // Scoped to tab_id: a pane in ANOTHER tab is ignored.
+        let mixed: Vec<ZellijPane> = serde_json::from_str(
+            r#"[
+              {"id":0,"is_plugin":false,"is_focused":true,"terminal_command":"x","tab_id":0,"pane_x":0,"pane_y":0,"pane_columns":80,"pane_rows":137},
+              {"id":1,"is_plugin":false,"is_focused":false,"terminal_command":"y","tab_id":1,"pane_x":0,"pane_y":0,"pane_columns":300,"pane_rows":300}
+            ]"#,
+        )
+        .unwrap();
+        assert_eq!(tab_dims(&mixed, 0), (80, 137));
+
+        // A plugin pane (tab bar, full width) pins the true extent; included.
+        let with_plugin: Vec<ZellijPane> = serde_json::from_str(
+            r#"[
+              {"id":0,"is_plugin":true,"is_focused":false,"terminal_command":null,"tab_id":0,"pane_x":0,"pane_y":0,"pane_columns":178,"pane_rows":1},
+              {"id":1,"is_plugin":false,"is_focused":true,"terminal_command":"x","tab_id":0,"pane_x":0,"pane_y":1,"pane_columns":178,"pane_rows":136}
+            ]"#,
+        )
+        .unwrap();
+        assert_eq!(tab_dims(&with_plugin, 0), (178, 137));
+
+        // Geometry absent (older/odd list-panes) → (0,0); relocate_for_promote
+        // falls back to term_size rather than mis-orienting.
+        let no_geo: Vec<ZellijPane> = serde_json::from_str(
+            r#"[
+              {"id":0,"is_plugin":false,"is_focused":true,"terminal_command":"x","tab_id":0}
+            ]"#,
+        )
+        .unwrap();
+        assert_eq!(tab_dims(&no_geo, 0), (0, 0));
     }
 
     #[test]
