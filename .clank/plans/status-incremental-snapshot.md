@@ -17,8 +17,10 @@ wake pays for inputs that didn't change. (This is the sustained-33%-CPU bug.)
 **The right model:** `StatusSnapshot` is a MATERIALIZED VIEW over a set of
 INDEPENDENT INPUTS, and the watcher is a stream of typed DELTAS. Each event
 already tells us which input changed (its path). Apply a TARGETED update to
-just that input, then re-derive the (pure, cheap) display. No full rebuild
-except at startup or a signalled rescan. **Use what the watcher tells us.**
+just that input, then re-derive the (pure, cheap) display. The per-event
+fast path NEVER does a full rebuild; the only full input re-reads are at
+startup, on a signalled rescan, and on a slow periodic backstop (below).
+**Use what the watcher tells us.**
 
 ## Inputs (each independently maintained, with its delta source)
 
@@ -56,14 +58,21 @@ caches were treating symptoms of the missing model.
 
 ## Resolved (round 1)
 
-- **Correctness vs missed events — TWO-LAYER fallback.** (1) SIGNALLED drops
+- **Correctness vs missed events — TWO-LAYER fallback.** Both layers are the
+  SAME operation — a full **input re-init** (today's `build_async`: re-fold,
+  re-read `dirty`, re-read all displayed `reviews`, re-open gix), the thing
+  the fast path avoids. They differ only in trigger. (1) SIGNALLED drops
   (notify queue overflow / rescan / error / an `Unknown` path) → immediate
   full re-init. (2) SILENT staleness (a misclassified or silently-dropped
-  event) → a SLOW periodic full re-derive (≈30–60s). Because it's amortized,
-  not per-event, it does NOT reintroduce the per-wake CPU we're removing — it
-  just guarantees the view can't stay stale longer than the period. Both
-  layers ship; the periodic backstop is the correctness guarantee that makes
-  the incremental fast-path safe.
+  event) → the same full re-init on a SLOW periodic timer (≈30–60s). It must
+  be a full re-init, NOT a pure display re-derive: only re-READING the inputs
+  can repair an input change whose event we missed (a re-derive from stale
+  cached inputs would reproduce the staleness). Because it's amortized (one
+  `build_async` per ≈30–60s ≈ a few-% duty cycle, vs many per second today),
+  it does NOT reintroduce the per-wake CPU we're removing — it just guarantees
+  the view can't stay stale longer than the period. Both layers ship; this
+  periodic backstop is the correctness guarantee that makes the incremental
+  fast-path safe.
 - **Classification must be EXHAUSTIVE-or-rescan.** Every displayed input maps
   to a delta class, and any unmapped path falls to `Unknown → rescan`
   (correct, just non-incremental). High-frequency paths (`feedback/<sha>.md`,
@@ -93,9 +102,12 @@ caches were treating symptoms of the missing model.
 
 - The architecture is fully specified: `StatusSnapshot` as a materialized
   view over independent inputs; the watcher as a typed-delta stream; targeted
-  per-input updates; no full rebuild except startup / signalled rescan.
+  per-input updates. The per-event fast path does NO full rebuild; the only
+  full input re-inits are startup, a signalled rescan, and the slow periodic
+  backstop — one operation, three triggers (consistent with §Resolved).
 - Round-1 challenges RESOLVED (above): two-layer missed-event fallback
-  (signalled rescan + slow periodic re-derive); exhaustive-or-rescan
+  (signalled rescan + slow periodic full re-init, NOT a display-only re-derive);
+  exhaustive-or-rescan
   classification; fold reuse (no duplicate fold); big deltas accept the
   freeze; no new sources of truth.
 - Reviewed from first principles; the doc reflects the challenges.
