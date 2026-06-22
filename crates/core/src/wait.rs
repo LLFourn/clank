@@ -456,30 +456,23 @@ pub fn compute_gate(
         .filter(|r| expected.contains(&r.author))
         .collect();
 
-    // ChangesRequested: any reviewer (commit OR gate) voted
-    // Request-Changes or Unmarked. Trumps everything.
-    if reviews
-        .iter()
-        .any(|r| r.verdict == Verdict::RequestChanges || r.verdict == Verdict::Unmarked)
-    {
-        return CommitGateState::ChangesRequested;
-    }
-
-    // Build label → verdict map for the "all approved/finished"
-    // checks.
+    // Build label → verdict map for the per-tier coverage checks.
     let by_label: std::collections::HashMap<&AgentLabel, &Verdict> =
         reviews.iter().map(|r| (&r.author, &r.verdict)).collect();
 
-    let positive = |label: &AgentLabel| -> bool {
-        matches!(
-            by_label.get(label),
-            Some(Verdict::Approve | Verdict::Finished)
-        )
-    };
-
-    let all_commit_positive = commit_reviewers.iter().all(positive);
-    if !all_commit_positive {
-        return CommitGateState::Unreviewed;
+    // Commit tier first. A non-positive verdict (Request-Changes OR
+    // Unmarked) wakes the master to revise ONLY once EVERY commit reviewer
+    // has verdicted (wait-for-all). While any is still pending, the gate
+    // stays in the reviewers-wake / master-sleeps posture (`Unreviewed`)
+    // and the non-positive verdict is HELD — acting on the first
+    // Request-Changes before the others weigh in is the bug this fixes.
+    let commit = tier_coverage(commit_reviewers, &by_label);
+    if !commit.all_positive() {
+        return if commit.all_submitted() {
+            CommitGateState::ChangesRequested
+        } else {
+            CommitGateState::Unreviewed
+        };
     }
 
     let finished =
@@ -507,10 +500,18 @@ pub fn compute_gate(
         return CommitGateState::Approved;
     }
 
-    // Milestone: the gate tier now contributes.
-    let all_gate_positive = gate_reviewers.iter().all(positive);
-    if !all_gate_positive {
-        return CommitGateState::ApprovedPendingGate;
+    // Milestone: the gate tier now contributes — same wait-for-all rule.
+    // A non-positive gate verdict wakes the master only once every gate
+    // reviewer has verdicted; while any is pending the master sleeps and
+    // the gate reviewers wake (`ApprovedPendingGate`). An empty gate tier
+    // is vacuously positive (no gate review configured).
+    let gate = tier_coverage(gate_reviewers, &by_label);
+    if !gate.all_positive() {
+        return if gate.all_submitted() {
+            CommitGateState::ChangesRequested
+        } else {
+            CommitGateState::ApprovedPendingGate
+        };
     }
 
     // Both tiers positive at a milestone. Decide Finished vs Approved
@@ -521,6 +522,55 @@ pub fn compute_gate(
         CommitGateState::Finished
     } else {
         CommitGateState::Approved
+    }
+}
+
+/// Review coverage for ONE reviewer tier on a commit — the single, named
+/// answer to "have all expected reviewers of this tier verdicted, and are
+/// they all positive?". Consumed by [`compute_gate`] and [`missing_for_gate`]
+/// so the "all-done" question is computed once, never re-derived per gate
+/// branch (the centralization that makes "acted on partial reviews" hard to
+/// write).
+struct TierCoverage {
+    /// Expected reviewers of the tier with NO submitted verdict yet.
+    pending: Vec<AgentLabel>,
+    /// Submitted reviewers who are not positive — Request-Changes OR
+    /// Unmarked (the two verdicts that route to `ChangesRequested`).
+    non_positive: Vec<AgentLabel>,
+}
+
+impl TierCoverage {
+    /// Every expected reviewer of the tier has submitted a verdict.
+    fn all_submitted(&self) -> bool {
+        self.pending.is_empty()
+    }
+    /// Every expected reviewer has submitted AND is positive.
+    fn all_positive(&self) -> bool {
+        self.pending.is_empty() && self.non_positive.is_empty()
+    }
+}
+
+/// Partition a reviewer tier by verdict coverage. `by_label` maps each
+/// SUBMITTED expected reviewer to its verdict; a tier label absent from it
+/// is pending. Reviewers not in `tier` are ignored (stale/foreign feedback
+/// never gates).
+fn tier_coverage(
+    tier: &[AgentLabel],
+    by_label: &std::collections::HashMap<&AgentLabel, &crate::vocab::Verdict>,
+) -> TierCoverage {
+    use crate::vocab::Verdict;
+    let mut pending = Vec::new();
+    let mut non_positive = Vec::new();
+    for label in tier {
+        match by_label.get(label) {
+            None => pending.push(label.clone()),
+            Some(Verdict::Approve | Verdict::Finished) => {}
+            Some(Verdict::RequestChanges | Verdict::Unmarked) => non_positive.push(label.clone()),
+        }
+    }
+    TierCoverage {
+        pending,
+        non_positive,
     }
 }
 
@@ -693,61 +743,33 @@ impl RepoState {
                         CommitGateState::Finished => WaitingOn::MasterToFinalize,
                         CommitGateState::Approved => WaitingOn::MasterToContinue,
                         CommitGateState::ApprovedPendingGate => {
-                            // All commit-reviewers signed off; gate-
-                            // reviewers haven't all voted yet. Master
-                            // sleeps; gate-reviewers wake.
-                            let approved_by: std::collections::HashSet<&AgentLabel> =
-                                filtered_entries
-                                    .iter()
-                                    .filter(|r| {
-                                        matches!(
-                                            r.verdict,
-                                            crate::vocab::Verdict::Approve
-                                                | crate::vocab::Verdict::Finished
-                                        )
-                                    })
-                                    .map(|r| &r.author)
-                                    .collect();
-                            let missing_gate: Vec<AgentLabel> = policy
-                                .gate_reviewers
-                                .iter()
-                                .filter(|label| !approved_by.contains(label))
-                                .cloned()
-                                .collect();
-                            let missing = crate::repo_state::NonEmptyVec::new(missing_gate)
-                                .expect(
-                                    "ApprovedPendingGate state implies a non-empty missing gate-reviewer set",
-                                );
+                            // All commit-reviewers signed off; some gate-
+                            // reviewer hasn't voted yet. Master sleeps; the
+                            // PENDING gate-reviewers wake. Single-source via
+                            // `missing_for_gate` (→ `tier_coverage`) — a
+                            // gate-reviewer who already filed Request-Changes
+                            // is HELD, not re-summoned.
+                            let missing = crate::repo_state::NonEmptyVec::new(missing_for_gate(
+                                gate, &entries, policy,
+                            ))
+                            .expect(
+                                "ApprovedPendingGate state implies a non-empty pending gate-reviewer set",
+                            );
                             WaitingOn::GateReviewersMissing { missing }
                         }
                         CommitGateState::Unreviewed => {
-                            // Compute the set of commit-reviewers that
-                            // haven't posted Approve or Finished. Stale
-                            // RequestChanges from removed authors don't
-                            // count because the filter dropped them.
-                            let approved_by: std::collections::HashSet<&AgentLabel> =
-                                filtered_entries
-                                    .iter()
-                                    .filter(|r| {
-                                        matches!(
-                                            r.verdict,
-                                            crate::vocab::Verdict::Approve
-                                                | crate::vocab::Verdict::Finished
-                                        )
-                                    })
-                                    .map(|r| &r.author)
-                                    .collect();
-                            let missing: Vec<AgentLabel> = policy
-                                .commit_reviewers
-                                .iter()
-                                .filter(|label| !approved_by.contains(label))
-                                .cloned()
-                                .collect();
-                            // `missing` is non-empty here: Unreviewed is
-                            // reached only when at least one
-                            // commit-reviewer hasn't posted positive.
-                            let missing = crate::repo_state::NonEmptyVec::new(missing).expect(
-                                "Unreviewed gate state implies a non-empty missing commit-reviewer set",
+                            // Some commit-reviewer hasn't verdicted yet. The
+                            // PENDING reviewers wake; master sleeps. A
+                            // commit-reviewer who already filed Request-Changes
+                            // /Unmarked is HELD (not pending), so it is NOT in
+                            // the wake set — its verdict surfaces to the master
+                            // once everyone has spoken. Single-source via
+                            // `missing_for_gate` (→ `tier_coverage`).
+                            let missing = crate::repo_state::NonEmptyVec::new(missing_for_gate(
+                                gate, &entries, policy,
+                            ))
+                            .expect(
+                                "Unreviewed gate state implies a non-empty pending commit-reviewer set",
                             );
                             WaitingOn::ReviewerApprovalsMissing { missing }
                         }
@@ -837,30 +859,32 @@ impl RepoState {
     }
 }
 
-/// The active tier's reviewers who still owe a current verdict,
-/// given the gate state. `Unreviewed` → commit reviewers not yet
-/// positive; `ApprovedPendingGate` → gate reviewers not yet
-/// positive; any master-turn state → empty.
+/// The active tier's reviewers to WAKE for the current commit, given the
+/// gate state: the tier's PENDING reviewers (those who haven't submitted a
+/// verdict yet). `Unreviewed` → pending commit reviewers; `ApprovedPendingGate`
+/// → pending gate reviewers; any master-turn state → empty.
+///
+/// Pending — NOT "not-yet-positive" — is the right wake set under
+/// wait-for-all: a reviewer who already filed Request-Changes/Unmarked has
+/// verdicted (their verdict is HELD until everyone has spoken), so they must
+/// not be re-summoned to review the same commit. Same single-source coverage
+/// (`tier_coverage`) as `compute_gate`.
 fn missing_for_gate(
     gate: crate::vocab::CommitGateState,
     current_verdicts: &[ReviewEntry],
     policy: &WorkPolicy,
 ) -> Vec<AgentLabel> {
-    use crate::vocab::{CommitGateState, Verdict};
-    let positive: std::collections::HashSet<&AgentLabel> = current_verdicts
-        .iter()
-        .filter(|r| matches!(r.verdict, Verdict::Approve | Verdict::Finished))
-        .map(|r| &r.author)
-        .collect();
+    use crate::vocab::CommitGateState;
     let tier = match gate {
         CommitGateState::Unreviewed => &policy.commit_reviewers,
         CommitGateState::ApprovedPendingGate => &policy.gate_reviewers,
         _ => return Vec::new(),
     };
-    tier.iter()
-        .filter(|label| !positive.contains(label))
-        .cloned()
-        .collect()
+    let by_label: std::collections::HashMap<&AgentLabel, &crate::vocab::Verdict> = current_verdicts
+        .iter()
+        .map(|r| (&r.author, &r.verdict))
+        .collect();
+    tier_coverage(tier, &by_label).pending
 }
 
 impl WorkStatus {
@@ -1229,6 +1253,96 @@ mod tests {
         ];
         assert_eq!(
             compute_gate(&reviews, &[label("codex"), label("ruthless")], &[], false),
+            // Both reviewers have submitted (codex approve, ruthless RC) →
+            // master woken with the full set.
+            CommitGateState::ChangesRequested
+        );
+    }
+
+    #[test]
+    fn compute_gate_request_changes_held_while_another_pending_is_unreviewed() {
+        // THE FIX: codex requests changes, ruthless hasn't verdicted →
+        // master must NOT be woken on partial feedback. Gate stays Unreviewed
+        // (reviewers wake, master sleeps); the RC is HELD until ruthless
+        // verdicts.
+        let reviews = [entry(crate::vocab::Verdict::RequestChanges, "codex")];
+        assert_eq!(
+            compute_gate(&reviews, &[label("codex"), label("ruthless")], &[], false),
+            CommitGateState::Unreviewed
+        );
+    }
+
+    #[test]
+    fn compute_gate_two_request_changes_all_submitted_is_changes_requested() {
+        let reviews = [
+            entry(crate::vocab::Verdict::RequestChanges, "codex"),
+            entry(crate::vocab::Verdict::RequestChanges, "ruthless"),
+        ];
+        assert_eq!(
+            compute_gate(&reviews, &[label("codex"), label("ruthless")], &[], false),
+            CommitGateState::ChangesRequested
+        );
+    }
+
+    #[test]
+    fn compute_gate_unmarked_held_while_another_pending_is_unreviewed() {
+        // Unmarked parity: an unparseable verdict is non-positive, held like
+        // RequestChanges while another reviewer is still pending.
+        let reviews = [entry(crate::vocab::Verdict::Unmarked, "codex")];
+        assert_eq!(
+            compute_gate(&reviews, &[label("codex"), label("ruthless")], &[], false),
+            CommitGateState::Unreviewed
+        );
+    }
+
+    #[test]
+    fn compute_gate_unmarked_with_all_submitted_is_changes_requested() {
+        // Unmarked does NOT slip through to a positive state once all in.
+        let reviews = [
+            entry(crate::vocab::Verdict::Unmarked, "codex"),
+            entry(crate::vocab::Verdict::Approve, "ruthless"),
+        ];
+        assert_eq!(
+            compute_gate(&reviews, &[label("codex"), label("ruthless")], &[], false),
+            CommitGateState::ChangesRequested
+        );
+    }
+
+    #[test]
+    fn compute_gate_gate_tier_request_changes_held_while_pending_is_pending_gate() {
+        // At a milestone (commit tier approved): one gate reviewer requests
+        // changes, another gate reviewer pending → master sleeps, gate
+        // reviewers wake (ApprovedPendingGate), the gate RC held until all
+        // gate reviewers verdict.
+        let reviews = [
+            entry(crate::vocab::Verdict::Approve, "codex"),
+            entry(crate::vocab::Verdict::RequestChanges, "ruthless"),
+        ];
+        assert_eq!(
+            compute_gate(
+                &reviews,
+                &[label("codex")],
+                &[label("ruthless"), label("glm")],
+                true,
+            ),
+            CommitGateState::ApprovedPendingGate
+        );
+    }
+
+    #[test]
+    fn compute_gate_gate_tier_request_changes_all_submitted_is_changes_requested() {
+        let reviews = [
+            entry(crate::vocab::Verdict::Approve, "codex"),
+            entry(crate::vocab::Verdict::RequestChanges, "ruthless"),
+            entry(crate::vocab::Verdict::Approve, "glm"),
+        ];
+        assert_eq!(
+            compute_gate(
+                &reviews,
+                &[label("codex")],
+                &[label("ruthless"), label("glm")],
+                true,
+            ),
             CommitGateState::ChangesRequested
         );
     }
@@ -1736,6 +1850,22 @@ mod tests {
             commit_reviewers: vec![label("codex"), label("ruthless")],
             gate_reviewers: vec![],
         }
+    }
+
+    #[test]
+    fn missing_for_gate_wakes_only_pending_not_held_request_changes() {
+        // The wake-set fix: under wait-for-all, a commit reviewer who filed
+        // RequestChanges has verdicted (HELD) — the wake set is the PENDING
+        // reviewer only, NEVER the RC reviewer (who would otherwise be
+        // re-summoned to re-review a commit they already verdicted on).
+        // plan_policy()'s commit tier is [codex, ruthless].
+        let verdicts = [entry(crate::vocab::Verdict::RequestChanges, "codex")];
+        let missing = missing_for_gate(
+            crate::vocab::CommitGateState::Unreviewed,
+            &verdicts,
+            &plan_policy(),
+        );
+        assert_eq!(missing, vec![label("ruthless")]);
     }
 
     // ============ PR review wait surface ============
