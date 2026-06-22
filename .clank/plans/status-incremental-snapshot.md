@@ -54,26 +54,54 @@ review cache) are all FACETS of this one model — they fall out of "maintain
 inputs, apply deltas," instead of being bolt-on caches on a full-rebuild. The
 caches were treating symptoms of the missing model.
 
-## First-principles questions for review
+## Resolved (round 1)
 
-- **Correctness vs missed events.** notify drops events on queue overflow →
-  a missed delta = stale view. The Unknown/rescan → full-rebuild fallback
-  covers the SIGNALLED drop; is a periodic full re-derive needed as
-  belt-and-suspenders, or does that reintroduce the cost we're removing? What
-  guarantees no silent staleness?
-- **Fold reuse.** Hold a live `RepoState` and extend it, or call the existing
-  cached rebuild per ref-delta? (Don't duplicate the checkpoint incrementality.)
+- **Correctness vs missed events — TWO-LAYER fallback.** (1) SIGNALLED drops
+  (notify queue overflow / rescan / error / an `Unknown` path) → immediate
+  full re-init. (2) SILENT staleness (a misclassified or silently-dropped
+  event) → a SLOW periodic full re-derive (≈30–60s). Because it's amortized,
+  not per-event, it does NOT reintroduce the per-wake CPU we're removing — it
+  just guarantees the view can't stay stale longer than the period. Both
+  layers ship; the periodic backstop is the correctness guarantee that makes
+  the incremental fast-path safe.
+- **Classification must be EXHAUSTIVE-or-rescan.** Every displayed input maps
+  to a delta class, and any unmapped path falls to `Unknown → rescan`
+  (correct, just non-incremental). High-frequency paths (`feedback/<sha>.md`,
+  working-tree, ref/HEAD) get targeted deltas — they drive the CPU.
+  Low-frequency displayed inputs (`.clank/plans/`, `finished/`, `queue/`,
+  config, blocks) may take a COARSE re-derive of their part (or fall to
+  rescan) — fine, they're rare. The impl plan must enumerate the displayed
+  inputs and prove the mapping is total (mapped-or-rescan).
+- **Fold reuse — don't duplicate the checkpoint incrementality.** The model
+  holds the latest `RepoState` (the fold's OUTPUT); a ref/HEAD delta calls
+  the EXISTING cached/incremental rebuild to extend it. No second fold.
+- **Big deltas (rebase / huge HEAD jump) — accept the freeze.** Keep fold
+  extension on the render loop; a rare big delta freezes the spinner briefly,
+  which is the intended busy signal. Chunking/off-loop is DEFERRED (revisit
+  only if big deltas prove common) — consistent with "keep work on the loop."
 - **Displayed-set scoping + eviction.** reviews/log scoped to (plan tips +
   log window); the window grows on pager; evict off-window shas; re-scope on
   HEAD move / history rewrite (the post-rewrite hook migrates feedback onto
   equivalent commits — re-associate the affected shas).
-- **Startup.** First build is full (today's `build_async`), then incremental —
-  clean initialization.
-- **Keep work ON the render loop** (the spinner-freeze busy signal is
-  intended and load-bearing — it's how this was caught). Per-delta work is
-  now tiny; do rare big deltas (a huge HEAD jump) still need handling?
-- **No new sources of truth.** The model holds inputs, not a second copy of
-  state the fold already owns — avoid drift.
+- **Startup.** First build is full (today's `build_async`), then incremental.
+- **No new sources of truth (load-bearing).** The model holds the fold's
+  OUTPUT (`RepoState`) plus the live inputs (`dirty`, `reviews`-by-sha) — and
+  NEVER a second copy of state the fold owns. The display is derived from
+  these; no parallel state to drift, which is the trap the bolt-on caches had.
+
+## Acceptance
+
+- The architecture is fully specified: `StatusSnapshot` as a materialized
+  view over independent inputs; the watcher as a typed-delta stream; targeted
+  per-input updates; no full rebuild except startup / signalled rescan.
+- Round-1 challenges RESOLVED (above): two-layer missed-event fallback
+  (signalled rescan + slow periodic re-derive); exhaustive-or-rescan
+  classification; fold reuse (no duplicate fold); big deltas accept the
+  freeze; no new sources of truth.
+- Reviewed from first principles; the doc reflects the challenges.
+- NO code — research only; splits into impl plans (classified-wake channel;
+  materialized model + delta application; per-input updaters; rescan +
+  periodic-backstop correctness).
 
 ## Out of scope
 
