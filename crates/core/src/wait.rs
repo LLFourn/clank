@@ -663,25 +663,18 @@ impl RepoState {
                 let latest_touched_plan = latest_event.map_or(false, |e| e.touched_plan);
 
                 let entries = reviews.reviews_for(&latest_sha);
-                let gate = if policy.plan_feedback {
-                    compute_gate(
-                        &entries,
-                        &policy.commit_reviewers,
-                        &policy.gate_reviewers,
-                        latest_touched_plan,
-                    )
-                } else {
-                    // When plan review is disabled, treat as approved
-                    // so master isn't blocked.
-                    if entries
-                        .iter()
-                        .any(|r| r.verdict == crate::vocab::Verdict::RequestChanges)
-                    {
-                        CommitGateState::ChangesRequested
+                // SINGLE gate-state decision: always `compute_gate`. When
+                // plan review is disabled, route through it with EMPTY tiers
+                // (→ `Approved`) so the master isn't blocked — rather than a
+                // duplicate inline verdict check that would re-implement (and
+                // drift from) the gate logic.
+                let (commit_tier, gate_tier): (&[AgentLabel], &[AgentLabel]) =
+                    if policy.plan_feedback {
+                        (&policy.commit_reviewers, &policy.gate_reviewers)
                     } else {
-                        CommitGateState::Approved
-                    }
-                };
+                        (&[], &[])
+                    };
+                let gate = compute_gate(&entries, commit_tier, gate_tier, latest_touched_plan);
 
                 // Filter to expected reviewers for any downstream uses
                 // (MasterToRevise payload, missing-set computation). Same
