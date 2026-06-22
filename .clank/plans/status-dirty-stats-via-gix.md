@@ -31,9 +31,17 @@ This is exactly the git→gix anti-pattern prior plans tried to purge.
    (`head_commit`/`commit_events_between`, which also re-open) is the broader
    `replace-git-io-with-gix` migration — OUT of scope here; leave them noted
    for a follow-up.
-3. Preserve current semantics EXACTLY: the `dirty: +N/-M` line, untracked
-   count, unborn-HEAD degrade-to-0/0, and the `--quiet`-equivalent
-   clean/dirty for `worktree_status`.
+3. Preserve current semantics, split into two tiers (glm intro note):
+   - **Must-be-exact (functional / path-level, no diff-algorithm dependence):**
+     the clean/dirty boolean, the untracked count, unborn-HEAD degrade-to-0/0,
+     and the `--quiet`-equivalent clean/dirty for `worktree_status`. These feed
+     behavior, so they match git exactly.
+   - **Best-effort (display-only):** the `+N/-M` line count. It comes from
+     git's `--shortstat` diff algorithm; gix's `blob-diff` may split hunks or
+     pick a different algorithm and drift by a line on some changes. The dirty
+     line is DISPLAY-only (not a gate input), so best-effort is acceptable —
+     verify it matches `--shortstat` on the fixtures, and relax the claim if
+     gix's diff legitimately drifts.
 
 Independently valuable (lands with or without the incremental model); the
 incremental model's `dirty` updater then calls this gix path. Pairs with
@@ -48,5 +56,8 @@ incremental model's `dirty` updater then calls this gix path. Pairs with
 ## Acceptance
 
 - No `git` subprocess in the status dirty/worktree path.
-- Output (dirty line, gate inputs) unchanged.
-- One gix handle reused across a rebuild's reads.
+- Functional facts unchanged EXACTLY: clean/dirty boolean, untracked count,
+  unborn-HEAD degrade, `worktree_status` clean/dirty.
+- `+N/-M` line count is display-only: best-effort match to `--shortstat`
+  (verified on fixtures), may drift where gix's diff legitimately differs.
+- One gix handle reused across the dirty/worktree computation's reads.

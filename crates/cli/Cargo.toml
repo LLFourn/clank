@@ -69,6 +69,7 @@ gix = { version = "0.84", default-features = false, features = [
     "sha1",                  # required: at least one hash backend
     "revision",              # rev_parse, rev_walk, merge_base
     "blob-diff",             # diff_tree_to_tree with rename detection
+    "status",                # in-process worktree status (dirty_stats); pulls dirwalk+index
     "tree-editor",           # edit_tree: build stripped trees for the rewrite engine
     "max-performance-safe",  # zlib-rs + parallel without C deps
     "parallel",              # Repository: Send under parallel feature

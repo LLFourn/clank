@@ -2,6 +2,7 @@
 //!
 //! Scans `.clank/agents/*/feedback/<sha>.md` for review files.
 
+use std::cell::OnceCell;
 use std::path::Path;
 
 use clank_core::ids::{CommitSha, PlanKey};
@@ -12,11 +13,23 @@ use clank_core::wait::{PlanStateLookup, ReviewEntry};
 pub struct FsPlanStateLookup<'a> {
     pub repo: &'a Path,
     head: Option<&'a CommitSha>,
+    /// Opened on first `worktree_status` and reused across every
+    /// plan in a single derive (was a `git diff` subprocess per
+    /// plan). Lazy so review-only uses don't pay for it.
+    git: OnceCell<Option<gix::Repository>>,
 }
 
 impl<'a> FsPlanStateLookup<'a> {
     pub fn new(repo: &'a Path, head: Option<&'a CommitSha>) -> Self {
-        Self { repo, head }
+        Self {
+            repo,
+            head,
+            git: OnceCell::new(),
+        }
+    }
+
+    fn git(&self) -> Option<&gix::Repository> {
+        self.git.get_or_init(|| gix::open(self.repo).ok()).as_ref()
     }
 }
 
@@ -83,28 +96,17 @@ impl PlanStateLookup for FsPlanStateLookup<'_> {
     }
 
     fn worktree_status(&self, plan: &PlanKey) -> PlanWorktreeStatus {
-        let plan_path = self.repo.join(format!(".clank/plans/{}.md", plan.as_str()));
-        if !plan_path.exists() {
+        let rel = format!(".clank/plans/{}.md", plan.as_str());
+        if !self.repo.join(&rel).exists() {
             return PlanWorktreeStatus::PlanFileMissing;
         }
         let Some(head) = self.head else {
             return PlanWorktreeStatus::Clean;
         };
-        let output = std::process::Command::new("git")
-            .arg("-C")
-            .arg(self.repo)
-            .args([
-                "diff",
-                "--quiet",
-                head.as_str(),
-                "--",
-                &format!(".clank/plans/{}.md", plan.as_str()),
-            ])
-            .status();
-        match output {
-            Ok(s) if s.success() => PlanWorktreeStatus::Clean,
-            _ => PlanWorktreeStatus::BodyDirty,
-        }
+        let Some(git) = self.git() else {
+            return PlanWorktreeStatus::Clean;
+        };
+        crate::worktree_facts::body_status_vs_commit(git, head, &rel)
     }
 }
 

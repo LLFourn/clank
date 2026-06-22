@@ -1086,43 +1086,121 @@ pub(crate) struct DirtyStats {
     pub(crate) untracked: u64,
 }
 
-/// `None` = clean. Both probes run `--no-optional-locks`: they
-/// execute on every watcher-driven repaint, and a plain
-/// `git status` opportunistically rewrites `.git/index` (stat
-/// refresh) — an event the watcher would see, waking the loop the
-/// probe itself was serving (self-wake feedback).
+/// `None` = clean. Computed in-process via gix — no `git`
+/// subprocess. One repo handle drives a single working-tree status
+/// walk plus the per-path line diffs (no per-read ODB re-open).
+///
+/// We never write the index back (gix only does so on an explicit
+/// `Outcome::write_changes()`), so this can't trigger the self-wake
+/// the old `--no-optional-locks` shell-out guarded against: a probe
+/// that refreshed `.git/index` would fire the very watcher that
+/// drove the probe.
 pub(crate) fn dirty_stats(repo: &Path) -> anyhow::Result<Option<DirtyStats>> {
-    let porcelain = git_nol(repo, &["status", "--porcelain"])?;
-    if porcelain.is_empty() {
+    let git = gix::open(repo)?;
+    dirty_stats_gix(&git)
+}
+
+/// gix backend for [`dirty_stats`], taking an already-open handle so
+/// the status walk and every per-path blob diff share one ODB.
+pub(crate) fn dirty_stats_gix(git: &gix::Repository) -> anyhow::Result<Option<DirtyStats>> {
+    use gix::bstr::ByteSlice;
+
+    let workdir = git
+        .workdir()
+        .ok_or_else(|| anyhow::anyhow!("bare repo has no working tree"))?
+        .to_path_buf();
+
+    // One status walk yields HEAD↔index (staged) and index↔worktree
+    // (unstaged + untracked) changes. `git diff HEAD` is HEAD vs the
+    // files on disk, so we collect the union of changed TRACKED paths
+    // and later diff each path's HEAD blob against its current
+    // worktree content (captures staged + unstaged together).
+    // Untracked paths are counted separately and excluded from the
+    // line counts, exactly as `git diff HEAD` ignores them.
+    let mut dirty = false;
+    let mut untracked: u64 = 0;
+    let mut changed: std::collections::BTreeSet<String> = Default::default();
+
+    let patterns: Vec<gix::bstr::BString> = Vec::new();
+    let iter = git.status(gix::progress::Discard)?.into_iter(patterns)?;
+    for item in iter {
+        match item? {
+            gix::status::Item::TreeIndex(change) => {
+                dirty = true;
+                changed.insert(change.location().to_str_lossy().into_owned());
+            }
+            gix::status::Item::IndexWorktree(iw) => {
+                use gix::status::index_worktree::iter::Summary;
+                match iw.summary() {
+                    // NeedsUpdate (stat-only) / ignored — not a real change.
+                    None => {}
+                    // The dirwalk only surfaces untracked files as `Added`.
+                    Some(Summary::Added) => {
+                        dirty = true;
+                        untracked += 1;
+                    }
+                    Some(_) => {
+                        dirty = true;
+                        changed.insert(iw.rela_path().to_str_lossy().into_owned());
+                    }
+                }
+            }
+        }
+    }
+
+    if !dirty {
         return Ok(None);
     }
-    // `diff HEAD` fails on an unborn HEAD — degrade to 0/0 (the
-    // untracked count still tells the story there).
-    let shortstat = git_nol(repo, &["diff", "HEAD", "--shortstat"]).unwrap_or_default();
-    let (insertions, deletions) = parse_shortstat(&shortstat);
+
+    // Line counts mirror `git diff HEAD --shortstat` (display-only;
+    // not a gate input). On an unborn HEAD there's no tree to diff
+    // against — degrade to 0/0, matching the old shell-out where
+    // `git diff HEAD` errored (the untracked count still tells the
+    // story). gix's diff algorithm may drift by a line from git's on
+    // some changes; that's accepted for a display figure.
+    let (insertions, deletions) = match git.head_commit().ok().and_then(|c| c.tree().ok()) {
+        Some(head_tree) => count_dirty_lines(git, &head_tree, &workdir, &changed),
+        None => (0, 0),
+    };
+
     Ok(Some(DirtyStats {
         insertions,
         deletions,
-        untracked: count_untracked(&porcelain),
+        untracked,
     }))
 }
 
-/// Run git with `--no-optional-locks`, returning stdout. Errors on
-/// spawn failure or non-zero exit.
-fn git_nol(repo: &Path, args: &[&str]) -> anyhow::Result<String> {
-    let output = std::process::Command::new("git")
-        .arg("--no-optional-locks")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .output()?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "git {args:?}: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
+/// Sum inserted/deleted lines across `changed` paths, diffing each
+/// path's HEAD blob against its current worktree content (the
+/// `git diff HEAD` shape). Renames aren't tracked — best-effort, as
+/// the dirty line is display-only.
+fn count_dirty_lines(
+    git: &gix::Repository,
+    head_tree: &gix::Tree<'_>,
+    workdir: &Path,
+    changed: &std::collections::BTreeSet<String>,
+) -> (u64, u64) {
+    use gix::diff::blob::{Algorithm, InternedInput, diff_with_slider_heuristics};
+
+    let (mut insertions, mut deletions) = (0u64, 0u64);
+    for rel in changed {
+        let old: Vec<u8> = head_tree
+            .lookup_entry_by_path(rel)
+            .ok()
+            .flatten()
+            .and_then(|e| git.find_blob(e.oid()).ok())
+            .map(|b| b.data.clone())
+            .unwrap_or_default();
+        let new: Vec<u8> = std::fs::read(workdir.join(rel)).unwrap_or_default();
+        if old == new {
+            continue;
+        }
+        let input = InternedInput::new(old.as_slice(), new.as_slice());
+        let diff = diff_with_slider_heuristics(Algorithm::Histogram, &input);
+        insertions += u64::from(diff.count_additions());
+        deletions += u64::from(diff.count_removals());
     }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    (insertions, deletions)
 }
 
 /// The PR's GitHub URL from its `owner/name` slug + number. The one
@@ -1148,60 +1226,46 @@ pub(crate) fn dirty_summary(d: &DirtyStats) -> String {
     parts.join(" · ")
 }
 
-fn count_untracked(porcelain: &str) -> u64 {
-    porcelain.lines().filter(|l| l.starts_with("??")).count() as u64
-}
-
-/// Parse `git diff --shortstat` output, e.g.
-/// ` 3 files changed, 12 insertions(+), 3 deletions(-)` → (12, 3).
-/// Either clause may be absent; empty input → (0, 0).
-fn parse_shortstat(s: &str) -> (u64, u64) {
-    let (mut insertions, mut deletions) = (0, 0);
-    for part in s.trim().split(',') {
-        let Some((num, rest)) = part.trim().split_once(' ') else {
-            continue;
-        };
-        let Ok(n) = num.parse::<u64>() else {
-            continue;
-        };
-        if rest.starts_with("insertion") {
-            insertions = n;
-        } else if rest.starts_with("deletion") {
-            deletions = n;
-        }
-    }
-    (insertions, deletions)
-}
-
 #[cfg(test)]
 mod dirty_and_wake_tests {
     use super::*;
     use std::process::Command;
 
     #[test]
-    fn parse_shortstat_matrix() {
-        let cases = [
-            ("", (0, 0)),
-            (
-                " 3 files changed, 12 insertions(+), 3 deletions(-)\n",
-                (12, 3),
-            ),
-            (" 1 file changed, 1 insertion(+)\n", (1, 0)),
-            (" 1 file changed, 5 deletions(-)\n", (0, 5)),
-            (" 2 files changed\n", (0, 0)),
-        ];
-        for (input, want) in cases {
-            assert_eq!(parse_shortstat(input), want, "input: {input:?}");
-        }
+    fn dirty_stats_unborn_head_degrades_lines_to_zero() {
+        // No commit yet: a staged add has no HEAD tree to diff
+        // against, so +/− degrade to 0/0 while the tree still reads
+        // dirty (matching the old `git diff HEAD` error path).
+        let dir = tempfile::tempdir().unwrap();
+        let r = dir.path();
+        git(r, &["init", "--quiet", "-b", "main"]);
+        git(r, &["config", "user.email", "t@t"]);
+        git(r, &["config", "user.name", "t"]);
+        std::fs::write(r.join("staged.txt"), "a\nb\n").unwrap();
+        git(r, &["add", "-A"]);
+        let d = dirty_stats(r)
+            .unwrap()
+            .expect("unborn HEAD with staged add is dirty");
+        assert_eq!((d.insertions, d.deletions), (0, 0));
     }
 
     #[test]
-    fn count_untracked_reads_porcelain() {
-        assert_eq!(
-            count_untracked(" M src/a.rs\n?? new.rs\n?? dir/\nA  staged.rs\n"),
-            2
-        );
-        assert_eq!(count_untracked(""), 0);
+    fn dirty_stats_counts_staged_and_unstaged_together() {
+        // `git diff HEAD` is HEAD-vs-worktree: a staged edit on one
+        // file plus an unstaged edit on another must both count.
+        let dir = fixture_repo();
+        let r = dir.path();
+        std::fs::write(r.join("b.txt"), "x\n").unwrap();
+        git(r, &["add", "-A"]);
+        git(r, &["commit", "--quiet", "-m", "add b"]);
+
+        // a.txt: unstaged (+1). b.txt: staged (+1 −1).
+        std::fs::write(r.join("a.txt"), "one\ntwo\nthree\nfour\n").unwrap();
+        std::fs::write(r.join("b.txt"), "y\n").unwrap();
+        git(r, &["add", "b.txt"]);
+        let d = dirty_stats(r).unwrap().expect("dirty");
+        assert_eq!((d.insertions, d.deletions), (2, 1));
+        assert_eq!(d.untracked, 0);
     }
 
     #[test]

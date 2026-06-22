@@ -37,8 +37,6 @@ pub enum PreviewError {
     Git(#[from] GitIoError),
     #[error("feedback scan: {0}")]
     FeedbackScan(#[from] crate::feedback_scan::FeedbackScanError),
-    #[error("worktree facts: {0}")]
-    WorktreeFacts(#[from] crate::worktree_facts::WorktreeFactsError),
     #[error("loading registered reviewers: {0}")]
     AgentLoad(anyhow::Error),
 }
@@ -68,7 +66,7 @@ pub async fn build_finish_preview(
 
     let head = state.head.as_ref();
     let worktree_status = read_worktree_facts(repo_root, &plan_path, head)
-        .await?
+        .await
         .status;
 
     // Active plans need their file in the worktree to be eligible
