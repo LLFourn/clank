@@ -34,21 +34,11 @@ pub async fn run(args: UnfinishArgs) -> anyhow::Result<()> {
 /// Bail if the worktree or index has any changes. `git reset
 /// --hard HEAD~` would otherwise obliterate them.
 fn require_clean_worktree(repo: &Path) -> anyhow::Result<()> {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["status", "--porcelain"])
-        .output()?;
-    if !out.status.success() {
-        anyhow::bail!(
-            "git status failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    if !out.stdout.is_empty() {
+    let dirty = crate::git_io::working_tree_dirty_paths(repo)?;
+    if !dirty.is_empty() {
         anyhow::bail!(
             "worktree or index is dirty — commit or stash your changes before running `clank unfinish`.\n\n{}",
-            String::from_utf8_lossy(&out.stdout).trim()
+            dirty.join("\n")
         );
     }
     Ok(())

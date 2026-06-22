@@ -331,16 +331,7 @@ async fn run_amend(repo: &std::path::Path, basename: &str, args: &PurgeArgs) -> 
         return Ok(());
     }
 
-    let status_out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["status", "--porcelain"])
-        .output()?;
-    if !status_out.status.success()
-        || !String::from_utf8_lossy(&status_out.stdout)
-            .trim()
-            .is_empty()
-    {
+    if !crate::git_io::working_tree_clean(repo)? {
         anyhow::bail!("working tree dirty; commit or stash first");
     }
     if !args.allow_rewrite_protected {

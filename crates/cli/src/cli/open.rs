@@ -508,15 +508,8 @@ fn head_branch_info(path: &Path) -> (Option<String>, bool) {
 }
 
 fn worktree_dirty(path: &Path) -> bool {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(path)
-        .args(["status", "--porcelain"])
-        .output();
-    match out {
-        Ok(o) => o.status.success() && !o.stdout.is_empty(),
-        Err(_) => false,
-    }
+    // Degrade to "not dirty" on error, matching the old shell-out.
+    !crate::git_io::working_tree_clean(path).unwrap_or(true)
 }
 
 fn directory_is_empty(path: &Path) -> bool {

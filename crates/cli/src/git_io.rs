@@ -66,6 +66,13 @@ pub fn working_tree_dirty_at(repo: &Path) -> Result<Option<DirtyStats>, GitIoErr
     working_tree_dirty(&open(repo)?)
 }
 
+/// `true` iff the working tree + index are clean — no tracked changes
+/// and no untracked files (the `git status --porcelain` empty test the
+/// `clank unfinish` / `shelve` / `open` / `purge` guards used).
+pub fn working_tree_clean(repo: &Path) -> Result<bool, GitIoError> {
+    Ok(working_tree_dirty_at(repo)?.is_none())
+}
+
 /// `None` = clean. Computed in-process via gix — no `git` subprocess.
 /// One handle drives a single working-tree status walk plus the
 /// per-path line diffs (no per-read ODB re-open).
@@ -76,7 +83,6 @@ pub fn working_tree_dirty_at(repo: &Path) -> Result<Option<DirtyStats>, GitIoErr
 /// that refreshed `.git/index` would fire the very watcher that drove
 /// the probe.
 pub fn working_tree_dirty(h: &Repo) -> Result<Option<DirtyStats>, GitIoError> {
-    use gix::bstr::ByteSlice;
     let git = &h.0;
 
     let workdir = git
@@ -84,49 +90,8 @@ pub fn working_tree_dirty(h: &Repo) -> Result<Option<DirtyStats>, GitIoError> {
         .ok_or_else(|| nonzero("working_tree_dirty", "bare repo has no working tree"))?
         .to_path_buf();
 
-    // One status walk yields HEAD↔index (staged) and index↔worktree
-    // (unstaged + untracked) changes. `git diff HEAD` is HEAD vs the
-    // files on disk, so we collect the union of changed TRACKED paths
-    // and later diff each path's HEAD blob against its current worktree
-    // content (captures staged + unstaged together). Untracked paths
-    // are counted separately and excluded from the line counts, exactly
-    // as `git diff HEAD` ignores them.
-    let mut dirty = false;
-    let mut untracked: u64 = 0;
-    let mut changed: std::collections::BTreeSet<String> = Default::default();
-
-    let patterns: Vec<gix::bstr::BString> = Vec::new();
-    let iter = git
-        .status(gix::progress::Discard)
-        .map_err(|e| nonzero("git status", e))?
-        .into_iter(patterns)
-        .map_err(|e| nonzero("git status iter", e))?;
-    for item in iter {
-        match item.map_err(|e| nonzero("git status item", e))? {
-            gix::status::Item::TreeIndex(change) => {
-                dirty = true;
-                changed.insert(change.location().to_str_lossy().into_owned());
-            }
-            gix::status::Item::IndexWorktree(iw) => {
-                use gix::status::index_worktree::iter::Summary;
-                match iw.summary() {
-                    // NeedsUpdate (stat-only) / ignored — not a real change.
-                    None => {}
-                    // The dirwalk only surfaces untracked files as `Added`.
-                    Some(Summary::Added) => {
-                        dirty = true;
-                        untracked += 1;
-                    }
-                    Some(_) => {
-                        dirty = true;
-                        changed.insert(iw.rela_path().to_str_lossy().into_owned());
-                    }
-                }
-            }
-        }
-    }
-
-    if !dirty {
+    let walk = status_walk(git)?;
+    if walk.changed.is_empty() && walk.untracked.is_empty() {
         return Ok(None);
     }
 
@@ -137,15 +102,75 @@ pub fn working_tree_dirty(h: &Repo) -> Result<Option<DirtyStats>, GitIoError> {
     // algorithm may drift by a line from git's on some changes; that's
     // accepted for a display figure.
     let (insertions, deletions) = match git.head_commit().ok().and_then(|c| c.tree().ok()) {
-        Some(head_tree) => count_dirty_lines(git, &head_tree, &workdir, &changed),
+        Some(head_tree) => count_dirty_lines(git, &head_tree, &workdir, &walk.changed),
         None => (0, 0),
     };
 
     Ok(Some(DirtyStats {
         insertions,
         deletions,
-        untracked,
+        untracked: walk.untracked.len() as u64,
     }))
+}
+
+/// Every dirty path — tracked changes plus untracked files — sorted.
+/// Opens its own handle. For guards that show WHAT is dirty (e.g.
+/// `clank unfinish`'s clean-worktree check).
+pub fn working_tree_dirty_paths(repo: &Path) -> Result<Vec<String>, GitIoError> {
+    let h = open(repo)?;
+    let walk = status_walk(&h.0)?;
+    let mut paths: Vec<String> = walk.changed.into_iter().collect();
+    paths.extend(walk.untracked);
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+}
+
+/// The raw working-tree status: tracked paths differing from HEAD
+/// (staged + unstaged together) and untracked file paths.
+struct WtStatus {
+    changed: std::collections::BTreeSet<String>,
+    untracked: Vec<String>,
+}
+
+/// One status walk yields HEAD↔index (staged) and index↔worktree
+/// (unstaged + untracked) changes. `git diff HEAD` is HEAD vs the
+/// files on disk, so callers diff each changed TRACKED path's HEAD
+/// blob against its worktree content (staged + unstaged together).
+/// Untracked paths are kept separate — `git diff HEAD` ignores them.
+fn status_walk(git: &gix::Repository) -> Result<WtStatus, GitIoError> {
+    use gix::bstr::ByteSlice;
+    let mut changed: std::collections::BTreeSet<String> = Default::default();
+    let mut untracked: Vec<String> = Vec::new();
+
+    let patterns: Vec<gix::bstr::BString> = Vec::new();
+    let iter = git
+        .status(gix::progress::Discard)
+        .map_err(|e| nonzero("git status", e))?
+        .into_iter(patterns)
+        .map_err(|e| nonzero("git status iter", e))?;
+    for item in iter {
+        match item.map_err(|e| nonzero("git status item", e))? {
+            gix::status::Item::TreeIndex(change) => {
+                changed.insert(change.location().to_str_lossy().into_owned());
+            }
+            gix::status::Item::IndexWorktree(iw) => {
+                use gix::status::index_worktree::iter::Summary;
+                match iw.summary() {
+                    // NeedsUpdate (stat-only) / ignored — not a real change.
+                    None => {}
+                    // The dirwalk only surfaces untracked files as `Added`.
+                    Some(Summary::Added) => {
+                        untracked.push(iw.rela_path().to_str_lossy().into_owned())
+                    }
+                    Some(_) => {
+                        changed.insert(iw.rela_path().to_str_lossy().into_owned());
+                    }
+                }
+            }
+        }
+    }
+    Ok(WtStatus { changed, untracked })
 }
 
 /// Sum inserted/deleted lines across `changed` paths, diffing each

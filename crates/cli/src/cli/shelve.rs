@@ -382,13 +382,7 @@ fn git_delete_ref(repo: &Path, name: &str) -> anyhow::Result<()> {
 }
 
 fn worktree_dirty(repo: &Path) -> anyhow::Result<bool> {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["status", "--porcelain"])
-        .output()
-        .context("spawning git status")?;
-    Ok(!out.stdout.is_empty())
+    Ok(!crate::git_io::working_tree_clean(repo)?)
 }
 
 fn confirm(prompt: &str) -> anyhow::Result<bool> {
