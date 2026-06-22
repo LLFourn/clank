@@ -41,19 +41,36 @@ partial reviews" bugs — not patching this one arm.
 ## Approach
 
 1. Add a single-source review-coverage summary for the active tier (expected
-   / submitted / pending / positive / changes), computed ONCE. `compute_gate`,
-   the `waiting_on` derive (wait.rs:665-754), and `missing_for_gate`
-   (wait.rs:844) all consume it — no re-derivation across branches.
-2. Restructure `compute_gate` so `ChangesRequested` (a master-turn state) is
-   reached ONLY when all expected reviewers of the active tier have
-   submitted. A Request-Changes while reviewers are still pending →
-   reviewers-wake / master-sleeps (the pending reviewer is in the missing
-   set; the held Request-Changes is carried so the master sees the full set
-   once the last verdict lands).
+   / submitted / pending / positive / **non-positive** ), computed ONCE.
+   `compute_gate`, the `waiting_on` derive (wait.rs:665-754), and
+   `missing_for_gate` (wait.rs:844) all consume it — no re-derivation across
+   branches.
+   - **The "non-positive" bucket groups BOTH `RequestChanges` AND `Unmarked`**
+     — the two verdicts the current code co-routes to `ChangesRequested`
+     (wait.rs:463). `Unmarked` (a filed-but-unparseable verdict) is a
+     SUBMITTED entry that is not positive, so it is treated identically to
+     `RequestChanges` throughout: held while reviewers are pending,
+     contributes to `ChangesRequested` once all have verdicted. No new
+     `Ambiguous` state — the master is woken to deal with the unparseable
+     verdict, same as a requested change. (Every verdict the old code routes
+     to `ChangesRequested` is handled; none is left on the early-trigger
+     path.)
+2. **Determine the milestone / active tier FIRST, then run the coverage
+   check** — the current order is inverted: the any-`ChangesRequested` check
+   (wait.rs:459) runs BEFORE the milestone/tier determination (wait.rs:504-508),
+   so "all expected reviewers of the active tier" can't be evaluated in place.
+   Reorder so the active tier is known, then `compute_gate` reaches
+   `ChangesRequested` (a master-turn state) ONLY when all expected reviewers
+   **of that tier** have submitted. A non-positive verdict while reviewers
+   are still pending → reviewers-wake / master-sleeps (the pending reviewer
+   is in the missing set; the held verdict is carried so the master sees the
+   full set once the last verdict lands).
 3. Preserve the existing milestone/tier semantics (gate tier consulted only
    at milestones; the empty-commit-tier devolve rule at wait.rs:423-427,
-   499-504) — the coverage summary must respect them so routine WIP commits
-   still bypass the gate tier straight to `Approved`.
+   499-504) — the coverage summary must respect them. On a ROUTINE (non-
+   milestone) commit the gate tier is not consulted, so the wait-for-all must
+   wait for the **commit tier only**, never the gate reviewers — routine WIP
+   commits still bypass the gate tier straight to `Approved`.
 
 ## Testing (no-binary-spawning)
 
@@ -62,6 +79,10 @@ partial reviews" bugs — not patching this one arm.
   (`MasterToRevise`) with both. A requests + B requests → master wakes with
   both. Single reviewer requests → master wakes (no regression of the
   common case).
+- Unmarked parity: A `Unmarked` while B is silent → master SLEEPS, B wakes
+  (Unmarked is held just like RequestChanges). A `Unmarked` + B verdicted
+  (all in) → master wakes (`ChangesRequested`) — Unmarked does NOT slip
+  through the fix on the early-trigger path.
 - Coverage-summary unit tests: expected/submitted/pending/positive/changes
   partition; gate-tier milestone conditioning (routine commit → gate tier
   not consulted).
