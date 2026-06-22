@@ -5,6 +5,7 @@
 use std::cell::OnceCell;
 use std::path::Path;
 
+use crate::git_io;
 use clank_core::ids::{CommitSha, PlanKey};
 use clank_core::plan_view::PlanBlock;
 use clank_core::vocab::{PlanWorktreeStatus, Verdict};
@@ -14,14 +15,14 @@ pub struct FsPlanStateLookup<'a> {
     pub repo: &'a Path,
     head: Option<&'a CommitSha>,
     /// A handle shared with the rest of the rebuild (status's
-    /// `from_state` threads one through both `dirty_stats` and this
+    /// `from_state` threads one through both the dirty walk and this
     /// lookup, so a snapshot opens the ODB once). `None` for callers
     /// that don't hold one — then `git_owned` opens lazily.
-    git: Option<&'a gix::Repository>,
+    git: Option<&'a git_io::Repo>,
     /// Lazily opened on first `worktree_status` when no shared handle
     /// was given, reused across every plan in a derive (was a `git
     /// diff` subprocess per plan). Lazy so review-only uses don't pay.
-    git_owned: OnceCell<Option<gix::Repository>>,
+    git_owned: OnceCell<Option<git_io::Repo>>,
 }
 
 impl<'a> FsPlanStateLookup<'a> {
@@ -36,7 +37,7 @@ impl<'a> FsPlanStateLookup<'a> {
 
     /// Like [`new`](Self::new) but reuses a handle the caller already
     /// opened, so the whole rebuild shares one ODB.
-    pub fn with_git(repo: &'a Path, head: Option<&'a CommitSha>, git: &'a gix::Repository) -> Self {
+    pub fn with_handle(repo: &'a Path, head: Option<&'a CommitSha>, git: &'a git_io::Repo) -> Self {
         Self {
             repo,
             head,
@@ -45,12 +46,12 @@ impl<'a> FsPlanStateLookup<'a> {
         }
     }
 
-    fn git(&self) -> Option<&gix::Repository> {
+    fn git(&self) -> Option<&git_io::Repo> {
         match self.git {
             Some(git) => Some(git),
             None => self
                 .git_owned
-                .get_or_init(|| gix::open(self.repo).ok())
+                .get_or_init(|| git_io::open(self.repo).ok())
                 .as_ref(),
         }
     }
@@ -129,7 +130,7 @@ impl PlanStateLookup for FsPlanStateLookup<'_> {
         let Some(git) = self.git() else {
             return PlanWorktreeStatus::Clean;
         };
-        crate::worktree_facts::body_status_vs_commit(git, head, &rel)
+        git_io::plan_body_status(git, head, &rel)
     }
 }
 

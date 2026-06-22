@@ -99,7 +99,7 @@ fn label(name: &str) -> Span {
 /// don't "unify" them by routing the TUI through `dirty_summary` —
 /// it would reintroduce the `−0`. Only the `changes` fallback is
 /// shared behavior.
-fn dirty_spans(d: &super::status::DirtyStats) -> Vec<Span> {
+fn dirty_spans(d: &crate::git_io::DirtyStats) -> Vec<Span> {
     let mut spans = vec![label("dirty")];
     let mut wrote = false;
     if d.insertions > 0 {
@@ -2407,7 +2407,7 @@ terminal_3  terminal  ruthless (reviewer)
 
     #[test]
     fn dirty_stats_get_their_own_github_colored_line() {
-        use crate::cli::status::DirtyStats;
+        use crate::git_io::DirtyStats;
         let mut s = snap(vec![], vec![]);
         s.dirty = Some(DirtyStats {
             insertions: 160,
@@ -2436,7 +2436,7 @@ terminal_3  terminal  ruthless (reviewer)
 
     #[test]
     fn dirty_line_omits_zeros_and_falls_back_to_changes() {
-        use crate::cli::status::DirtyStats;
+        use crate::git_io::DirtyStats;
         let mut s = snap(vec![], vec![]);
 
         // Only insertions → no `−0`, no red.

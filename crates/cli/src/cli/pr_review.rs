@@ -253,7 +253,7 @@ pub fn start_with(
 /// slug, or an existing `pr-<n>` branch — all before any mutation.
 /// Returns the scaffolded review dir.
 pub fn checkout_with(repo: &Path, pr: u32) -> anyhow::Result<PathBuf> {
-    if crate::cli::status::dirty_stats(repo)?.is_some() {
+    if crate::git_io::working_tree_dirty_at(repo)?.is_some() {
         anyhow::bail!("worktree is dirty — commit or stash first; `--checkout` switches branches");
     }
     if pr_dir(repo, pr).exists() {

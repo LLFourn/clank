@@ -27,6 +27,195 @@ fn parse_sha(context: &str, s: &str) -> Result<CommitSha, GitIoError> {
     })
 }
 
+fn nonzero(context: impl Into<String>, e: impl std::fmt::Display) -> GitIoError {
+    GitIoError::NonZero {
+        context: context.into(),
+        code: None,
+        stderr: e.to_string(),
+    }
+}
+
+/// An opened repository handle. Wraps `gix` so callers can reuse one
+/// open ODB across several reads WITHOUT naming `gix` themselves —
+/// this module is the git-access boundary, and the handle is how the
+/// status snapshot opens the ODB once (`from_state`) and threads it
+/// through both the dirty walk and the per-plan worktree-status reads.
+pub struct Repo(gix::Repository);
+
+/// Open `repo` for reuse across reads. See [`Repo`].
+pub fn open(repo: &Path) -> Result<Repo, GitIoError> {
+    gix::open(repo)
+        .map(Repo)
+        .map_err(|e| nonzero(format!("gix open `{}`", repo.display()), e))
+}
+
+/// Worktree dirt summary: +/− line counts vs HEAD (staged and
+/// unstaged together) and the untracked-file count. Untracked lines
+/// are NOT folded into the +/− numbers — a diff against HEAD doesn't
+/// see them, and pretending otherwise lies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DirtyStats {
+    pub insertions: u64,
+    pub deletions: u64,
+    pub untracked: u64,
+}
+
+/// `None` = clean. Opens its own handle; prefer [`working_tree_dirty`]
+/// when you already hold a [`Repo`].
+pub fn working_tree_dirty_at(repo: &Path) -> Result<Option<DirtyStats>, GitIoError> {
+    working_tree_dirty(&open(repo)?)
+}
+
+/// `None` = clean. Computed in-process via gix — no `git` subprocess.
+/// One handle drives a single working-tree status walk plus the
+/// per-path line diffs (no per-read ODB re-open).
+///
+/// We never write the index back (gix only does so on an explicit
+/// `Outcome::write_changes()`), so this can't trigger the self-wake
+/// the old `--no-optional-locks` shell-out guarded against: a probe
+/// that refreshed `.git/index` would fire the very watcher that drove
+/// the probe.
+pub fn working_tree_dirty(h: &Repo) -> Result<Option<DirtyStats>, GitIoError> {
+    use gix::bstr::ByteSlice;
+    let git = &h.0;
+
+    let workdir = git
+        .workdir()
+        .ok_or_else(|| nonzero("working_tree_dirty", "bare repo has no working tree"))?
+        .to_path_buf();
+
+    // One status walk yields HEAD↔index (staged) and index↔worktree
+    // (unstaged + untracked) changes. `git diff HEAD` is HEAD vs the
+    // files on disk, so we collect the union of changed TRACKED paths
+    // and later diff each path's HEAD blob against its current worktree
+    // content (captures staged + unstaged together). Untracked paths
+    // are counted separately and excluded from the line counts, exactly
+    // as `git diff HEAD` ignores them.
+    let mut dirty = false;
+    let mut untracked: u64 = 0;
+    let mut changed: std::collections::BTreeSet<String> = Default::default();
+
+    let patterns: Vec<gix::bstr::BString> = Vec::new();
+    let iter = git
+        .status(gix::progress::Discard)
+        .map_err(|e| nonzero("git status", e))?
+        .into_iter(patterns)
+        .map_err(|e| nonzero("git status iter", e))?;
+    for item in iter {
+        match item.map_err(|e| nonzero("git status item", e))? {
+            gix::status::Item::TreeIndex(change) => {
+                dirty = true;
+                changed.insert(change.location().to_str_lossy().into_owned());
+            }
+            gix::status::Item::IndexWorktree(iw) => {
+                use gix::status::index_worktree::iter::Summary;
+                match iw.summary() {
+                    // NeedsUpdate (stat-only) / ignored — not a real change.
+                    None => {}
+                    // The dirwalk only surfaces untracked files as `Added`.
+                    Some(Summary::Added) => {
+                        dirty = true;
+                        untracked += 1;
+                    }
+                    Some(_) => {
+                        dirty = true;
+                        changed.insert(iw.rela_path().to_str_lossy().into_owned());
+                    }
+                }
+            }
+        }
+    }
+
+    if !dirty {
+        return Ok(None);
+    }
+
+    // Line counts mirror `git diff HEAD --shortstat` (display-only; not
+    // a gate input). On an unborn HEAD there's no tree to diff against —
+    // degrade to 0/0, matching the old shell-out where `git diff HEAD`
+    // errored (the untracked count still tells the story). gix's diff
+    // algorithm may drift by a line from git's on some changes; that's
+    // accepted for a display figure.
+    let (insertions, deletions) = match git.head_commit().ok().and_then(|c| c.tree().ok()) {
+        Some(head_tree) => count_dirty_lines(git, &head_tree, &workdir, &changed),
+        None => (0, 0),
+    };
+
+    Ok(Some(DirtyStats {
+        insertions,
+        deletions,
+        untracked,
+    }))
+}
+
+/// Sum inserted/deleted lines across `changed` paths, diffing each
+/// path's HEAD blob against its current worktree content (the
+/// `git diff HEAD` shape). Renames aren't tracked — best-effort, as
+/// the dirty line is display-only.
+fn count_dirty_lines(
+    git: &gix::Repository,
+    head_tree: &gix::Tree<'_>,
+    workdir: &Path,
+    changed: &std::collections::BTreeSet<String>,
+) -> (u64, u64) {
+    use gix::diff::blob::{Algorithm, InternedInput, diff_with_slider_heuristics};
+
+    let (mut insertions, mut deletions) = (0u64, 0u64);
+    for rel in changed {
+        let old: Vec<u8> = head_tree
+            .lookup_entry_by_path(rel)
+            .ok()
+            .flatten()
+            .and_then(|e| git.find_blob(e.oid()).ok())
+            .map(|b| b.data.clone())
+            .unwrap_or_default();
+        let new: Vec<u8> = std::fs::read(workdir.join(rel)).unwrap_or_default();
+        if old == new {
+            continue;
+        }
+        let input = InternedInput::new(old.as_slice(), new.as_slice());
+        let diff = diff_with_slider_heuristics(Algorithm::Histogram, &input);
+        insertions += u64::from(diff.count_additions());
+        deletions += u64::from(diff.count_removals());
+    }
+    (insertions, deletions)
+}
+
+/// Is `rel_path`'s worktree copy dirty vs its blob at `commit`? The
+/// one definition shared by the status-derive path
+/// (`FsPlanStateLookup::worktree_status`) and the preview path. The
+/// blob is the source of truth: a worktree file that differs is
+/// `BodyDirty`; a missing worktree file whose blob exists at `commit`
+/// is `PlanFileMissing`; a path absent at `commit` is `Clean`
+/// regardless of the worktree (matching `git diff HEAD`, which ignores
+/// paths not in the commit). Reuses the [`Repo`] handle.
+pub fn plan_body_status(
+    h: &Repo,
+    commit: &CommitSha,
+    rel_path: &str,
+) -> clank_core::vocab::PlanWorktreeStatus {
+    use clank_core::vocab::PlanWorktreeStatus;
+    let worktree =
+        h.0.workdir()
+            .map(|w| w.join(rel_path))
+            .and_then(|abs| std::fs::read(abs).ok());
+    match (commit_blob_bytes(&h.0, commit, rel_path), worktree) {
+        (Some(b), Some(w)) if b == w => PlanWorktreeStatus::Clean,
+        (Some(_), Some(_)) => PlanWorktreeStatus::BodyDirty,
+        (Some(_), None) => PlanWorktreeStatus::PlanFileMissing,
+        (None, _) => PlanWorktreeStatus::Clean,
+    }
+}
+
+/// `rel_path`'s blob bytes at `commit`, or `None` if the commit/path
+/// can't be resolved (absent path, bad oid, unreadable object).
+fn commit_blob_bytes(git: &gix::Repository, commit: &CommitSha, rel_path: &str) -> Option<Vec<u8>> {
+    let oid = gix::ObjectId::from_hex(commit.as_str().as_bytes()).ok()?;
+    let tree = git.find_commit(oid).ok()?.tree().ok()?;
+    let entry = tree.lookup_entry_by_path(rel_path).ok().flatten()?;
+    Some(git.find_blob(entry.oid()).ok()?.data.clone())
+}
+
 /// Resolve HEAD to its commit SHA. Returns `Ok(None)` for an empty
 /// repo (unborn HEAD) or when the path isn't a git repository.
 ///

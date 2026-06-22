@@ -12,17 +12,24 @@ are unaware whether a call is gix or a subprocess.
 
 ## The model
 
-- ONE module is the sole git authority (extend `git_io.rs` — already the gix
-  read layer — broadening its contract from "reads only" to "all git access,
-  read+write, gix-or-subprocess"; rename if clearer).
-- Every caller uses a TYPED function there (`commit_subject`, `worktree_add`,
-  `status_porcelain`, …). No caller constructs `Command::new("git")` or calls
-  `gix::*` directly — including the gix calls the recent dirty-stats work
-  scattered into `status.rs` / `worktree_facts.rs` / `fs_plan_state_lookup.rs`,
-  which fold back in.
-- Inside the layer, each function picks the backend. gix where viable;
-  subprocess only where gix genuinely can't (yet). The boundary makes a later
-  git→gix swap INVISIBLE to callers — that's the payoff.
+Two sanctioned layer files already exist and are kept (lloyd) — the
+reads/writes split is intentional (`git_io`'s doc keeps reads read-only for
+the filesystem-truth model):
+- `git_io.rs` — ALL git READS (gix).
+- `git_plumbing.rs` — ALL git MUTATIONS. Today gix object/tree/ref writes;
+  this plan also moves the subprocess-only mutations here (worktree add/list,
+  fetch, checkout, commit/amend/rm/add, cherry-pick) since gix can't do them
+  yet — gix-or-subprocess, the caller can't tell.
+- Every caller uses a TYPED function in one of those two. No caller constructs
+  `Command::new("git")` or calls `gix::*` directly — including the gix calls
+  the recent dirty-stats work scattered into `status.rs` / `worktree_facts.rs`
+  / `fs_plan_state_lookup.rs`, which fold back into `git_io`.
+- To keep the single-handle-per-snapshot optimization without leaking `gix::`
+  to callers, `git_io` exposes an OPAQUE handle (e.g. `git_io::Repo` wrapping
+  `gix::Repository`); `from_state` opens it once and passes it to the dirty
+  walk and the per-plan worktree-status reads.
+- The boundary makes a later git→gix swap (worktree, fetch, …) INVISIBLE to
+  callers — that's the payoff.
 
 ## Scope of this plan
 
@@ -53,12 +60,12 @@ not safely, today):
 
 - A `cargo test` (this repo has no separate gauntlet/CI) scans PRODUCTION
   source under `crates/*/src` and FAILS on `Command::new("git")` or `gix::`
-  usage outside the one layer module.
+  usage outside the two layer files (`git_io.rs`, `git_plumbing.rs`).
 - EXCLUDES test code (`#[cfg(test)]` modules and `crates/*/tests/`) — fixtures
   legitimately spawn `git` and open gix repos. Suggested mechanism:
   brace-track from each `#[cfg(test)]` attribute; skip integration dirs.
-- Because everything is centralized, the test is a simple single-file
-  boundary check — no allowlist, no per-file counts.
+- Because everything is centralized, the test is a simple two-file boundary
+  check — no allowlist, no per-file counts.
 - Tests: the scan flags a planted raw `git`/`gix` use in a non-test fixture
   and ignores one in a `#[cfg(test)]` module; the real tree passes.
 
@@ -75,8 +82,8 @@ not safely, today):
 
 ## Acceptance
 
-- One module is the sole site of `Command::new("git")` and `gix::` use;
-  callers use typed functions and are backend-agnostic.
+- `git_io.rs` + `git_plumbing.rs` are the sole sites of `Command::new("git")`
+  and `gix::` use; callers use typed functions and are backend-agnostic.
 - The listed easy ops are gix; the hard ops are subprocess inside the layer.
 - A raw `git`/`gix` use outside the layer (in production code) FAILS
   `cargo test`; test fixtures are unaffected.
