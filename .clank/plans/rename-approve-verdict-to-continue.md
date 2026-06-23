@@ -1,7 +1,9 @@
 # rename-approve-verdict-to-continue
 
 Rename the clank review verdict **APPROVE → CONTINUE** everywhere user- and
-code-facing; keep `approve` as an UNDOCUMENTED alias. The "dumb first" fix for
+code-facing. The CLI rejects `approve` (agents learn from the rejection); only
+the on-disk feedback-file parser still reads legacy `APPROVE` (read-compat for
+review files written before the rename). The "dumb first" fix for
 reviewers picking APPROVE when they mean FINISHED (a codex got stuck doing
 exactly this). "APPROVE" carries a ship-it/sign-off connotation, so a reviewer
 who judges the work *good* reaches for it — precisely when the work is *done*
@@ -47,8 +49,9 @@ So the alias MUST live on the READ/parse path, not just CLI input:
   hint / html; nothing reads it back). So `approve → continue`,
   `approved → continued`, `gate_approved → gate_continue` change freely; just
   update the wire assertions (`crates/core/tests/round_trip.rs:63`, etc.). No
-  `serde(alias = …)` anywhere — the ONLY back-compat is `parse_verdict` (the
-  on-disk feedback parser, not serde) + the CLI clap alias.
+  `serde(alias = …)` anywhere — the ONLY back-compat is the on-disk parsers
+  (`parse_verdict` for gate feedback + the PR-review frontmatter parser), not
+  serde and not the CLI.
 - **wincode (state cache)** — `Verdict` and `CommitGateState` derive
   `wincode::SchemaRead/Write`, which is POSITION-encoded. Renaming a variant in
   place keeps its position, so cached payloads stay decodable — do NOT reorder
@@ -73,10 +76,11 @@ CLI-alias test — the CLI deliberately rejects `approve`.)
   `feedback.rs` (write headers + render), `wait.rs` + `status` hint rendering,
   `stop_hook` wake text, README / RELEASE-CHECKLIST.
 - Tests: mechanical `Verdict::Approve` → `Verdict::Continue`; update assertions
-  on `"approved"`/`"gate_approved"` strings. KEEP: the `approve` alias + its
-  test, the legacy-feedback back-compat test, the PR-event `approve`. Do NOT add
-  a test asserting the old `APPROVE` verdict variant is "gone" (the framework
-  enforces absence — test the kept alias path instead).
+  on `"approved"`/`"gate_approved"` strings. KEEP: the legacy-feedback back-compat
+  test (on-disk `APPROVE` → `Continue`) and the PR-event `approve` (GitHub). NO
+  CLI-alias test — the CLI rejects `approve`, and per no-tests-for-removed we do
+  NOT add a test asserting the dropped alias / old variant is "gone" (clap + the
+  framework enforce absence). Test the kept on-disk read path instead.
 
 ## Rollout
 
@@ -93,8 +97,9 @@ both — flag for the reviewers.)
 ## Acceptance
 
 - The clank verdict is `CONTINUE` across skills, CLI, code, docs. `approve` is
-  accepted ONLY by the on-disk feedback-file parser (read-compat); the CLI
-  `--verdict approve` is rejected (agents learn). Both pinned by tests.
+  accepted ONLY by the on-disk feedback-file parser (read-compat), pinned by a
+  test; the CLI `--verdict approve` is rejected by clap (no alias — enforced
+  structurally, not a separate test, per no-tests-for-removed).
 - A legacy `APPROVE` feedback file parses + gates identically to `CONTINUE`.
 - Gate states / waiting reason renamed to track the verb; wincode positions
   unchanged so caches stay valid.
