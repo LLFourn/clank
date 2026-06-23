@@ -614,27 +614,41 @@ async fn run_watch(
     let _watcher = watch_status_paths(tx, &repo)?;
 
     let mut last_emitted: Option<String> = None;
+    let mut last_sig: Option<InputSignature> = None;
 
     loop {
-        let snapshot =
-            StatusSnapshot::build_async(&repo, &basename, home.as_deref(), policy, plan_arg, true)
-                .await?;
+        // Nothing-changed gate (lloyd's invariant): only rebuild when an
+        // input the snapshot depends on actually changed. The signature
+        // probe is far cheaper than the fold + render it guards.
+        let sig = input_signature(&repo)?;
+        if last_sig.as_ref() != Some(&sig) {
+            let snapshot = StatusSnapshot::build_async(
+                &repo,
+                &basename,
+                home.as_deref(),
+                policy,
+                plan_arg,
+                true,
+            )
+            .await?;
 
-        let output = if json {
-            snapshot.to_json_compact()
-        } else {
-            snapshot.to_human()
-        };
+            let output = if json {
+                snapshot.to_json_compact()
+            } else {
+                snapshot.to_human()
+            };
 
-        if last_emitted.as_deref() != Some(&output) {
-            let stdout = std::io::stdout();
-            let mut out = stdout.lock();
-            if last_emitted.is_some() {
-                writeln!(out)?;
+            if last_emitted.as_deref() != Some(&output) {
+                let stdout = std::io::stdout();
+                let mut out = stdout.lock();
+                if last_emitted.is_some() {
+                    writeln!(out)?;
+                }
+                writeln!(out, "{output}")?;
+                out.flush()?;
+                last_emitted = Some(output);
             }
-            writeln!(out, "{output}")?;
-            out.flush()?;
-            last_emitted = Some(output);
+            last_sig = Some(sig);
         }
 
         // Event-driven: worktree edits, .clank writes, and git-dir
@@ -755,6 +769,80 @@ const CLANK_WAKE_DIRS: &[&str] = &[
     "finished",
     "config.json",
 ];
+
+/// A cheap fingerprint of everything a [`StatusSnapshot`] is derived
+/// from — the SAME inputs the [`WakeFilter`] wakes on: committed
+/// history (HEAD), the working tree (`dirty`), and the gitignored
+/// `.clank` workflow dirs ([`CLANK_WAKE_DIRS`]). The watch loops reuse
+/// the previous snapshot while this is unchanged, so a wake that
+/// touched nothing the snapshot depends on costs only this probe, not
+/// a rebuild + render.
+///
+/// Keyed on the FULL set, NOT just HEAD+dirty (ruthless): a review
+/// verdict lands as a gitignored `.clank/agents/<label>/feedback/<sha>`
+/// that changes neither HEAD nor the working tree, yet must refresh the
+/// pane — exactly what the master watches the TUI for. A reuse key
+/// narrower than the wake set would hide such changes; this key IS the
+/// wake set ([`CLANK_WAKE_DIRS`] is the shared source of truth).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InputSignature {
+    head: Option<String>,
+    dirty: Option<crate::git_io::DirtyStats>,
+    clank: u64,
+}
+
+/// Compute the current [`InputSignature`]. One ODB open (HEAD + the
+/// dirty walk); the `.clank` fingerprint is stat-only (no file reads).
+pub(crate) fn input_signature(repo: &Path) -> anyhow::Result<InputSignature> {
+    let git = crate::git_io::open(repo)?;
+    let head = git.head_sha()?.map(|s| s.as_str().to_string());
+    let dirty = git.working_tree_dirty()?;
+    Ok(InputSignature {
+        head,
+        dirty,
+        clank: clank_input_fingerprint(repo),
+    })
+}
+
+/// Stat-only hash of (relative path, mtime) over the workflow-state
+/// paths the [`WakeFilter`] wakes on ([`CLANK_WAKE_DIRS`]). A new,
+/// edited, or removed feedback / block / queue entry / plan / finished
+/// marker / config flips it. Recursive but cheap — paths + mtimes, no
+/// file contents.
+fn clank_input_fingerprint(repo: &Path) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let clank = repo.join(".clank");
+    let mut entries: Vec<(PathBuf, Option<std::time::SystemTime>)> = Vec::new();
+    for dir in CLANK_WAKE_DIRS {
+        collect_fingerprint(&clank.join(dir), &mut entries);
+    }
+    // readdir order isn't stable; sort for a deterministic hash.
+    entries.sort();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for (path, mtime) in &entries {
+        path.hash(&mut hasher);
+        match mtime.and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()) {
+            Some(d) => d.as_nanos().hash(&mut hasher),
+            None => 0u8.hash(&mut hasher),
+        }
+    }
+    hasher.finish()
+}
+
+fn collect_fingerprint(path: &Path, out: &mut Vec<(PathBuf, Option<std::time::SystemTime>)>) {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return; // absent path contributes nothing (its removal flips the set)
+    };
+    if meta.is_dir() {
+        if let Ok(rd) = std::fs::read_dir(path) {
+            for entry in rd.flatten() {
+                collect_fingerprint(&entry.path(), out);
+            }
+        }
+    } else {
+        out.push((path.to_path_buf(), meta.modified().ok()));
+    }
+}
 
 impl WakeFilter {
     pub(crate) fn new(repo_root: &Path, git_dir: &Path) -> Self {
@@ -1322,6 +1410,68 @@ mod dirty_and_wake_tests {
             crate::git_io::OPEN_COUNT.with(|c| c.get()),
             3,
             "status build opens once per phase: main fold + log-window fold + snapshot"
+        );
+    }
+
+    /// The reuse probe (`input_signature`) must be far cheaper than the
+    /// build it guards: ONE ODB open (HEAD + the dirty walk share a
+    /// handle; the `.clank` fingerprint is stat-only). A wake that
+    /// changed nothing pays only this, not the 3-phase build above.
+    #[test]
+    fn input_signature_opens_the_odb_once() {
+        let dir = fixture_repo();
+        let r = dir.path();
+        std::fs::create_dir_all(r.join(".clank/plans")).unwrap();
+        std::fs::write(r.join(".clank/plans/foo.md"), "# foo\n").unwrap();
+        git(r, &["add", "-A"]);
+        git(r, &["commit", "--quiet", "-m", "[foo] intro"]);
+
+        crate::git_io::OPEN_COUNT.with(|c| c.set(0));
+        let _ = input_signature(r).unwrap();
+        assert_eq!(
+            crate::git_io::OPEN_COUNT.with(|c| c.get()),
+            1,
+            "the reuse probe opens the ODB once"
+        );
+    }
+
+    #[test]
+    fn input_signature_is_stable_when_nothing_changes() {
+        let dir = fixture_repo();
+        let r = dir.path();
+        std::fs::create_dir_all(r.join(".clank/plans")).unwrap();
+        std::fs::write(r.join(".clank/plans/foo.md"), "# foo\n").unwrap();
+        git(r, &["add", "-A"]);
+        git(r, &["commit", "--quiet", "-m", "[foo] intro"]);
+        assert_eq!(
+            input_signature(r).unwrap(),
+            input_signature(r).unwrap(),
+            "stable across calls when nothing changed — the gate reuses"
+        );
+    }
+
+    /// The reuse key must cover the FULL input set, not just HEAD+dirty
+    /// (ruthless). A review verdict is a gitignored
+    /// `.clank/agents/<label>/feedback/<sha>.md`: it changes neither
+    /// HEAD nor the working tree, so a HEAD+dirty-only key would reuse a
+    /// stale snapshot and the verdict would be INVISIBLE in the TUI —
+    /// exactly what the master is watching for. The `.clank` fingerprint
+    /// must flip.
+    #[test]
+    fn clank_fingerprint_flips_on_a_new_review_verdict() {
+        let dir = fixture_repo();
+        let r = dir.path();
+        let before = clank_input_fingerprint(r);
+        std::fs::create_dir_all(r.join(".clank/agents/codex/feedback")).unwrap();
+        std::fs::write(
+            r.join(".clank/agents/codex/feedback/abc123.md"),
+            "APPROVE\n",
+        )
+        .unwrap();
+        let after = clank_input_fingerprint(r);
+        assert_ne!(
+            before, after,
+            "a new gitignored feedback file must flip the fingerprint"
         );
     }
 

@@ -75,12 +75,21 @@ for an explicit write boundary over a hidden flag.)
 
 > "it shouldn't write the cache if nothing has happened."
 
-In `build_async`: if NOTHING the snapshot depends on changed since the last
-snapshot, REUSE it — zero re-fold, zero write, zero fsync. ONE gate, named at
-the snapshot level — NOT a `cp.sha==h` fast path bolted onto `rebuild_from`
-(that only mirrors `rebuild_with_diagnostics` and leaves the render-writes-cache
-smell). This is the first concrete slice of the incremental-snapshot model: the
-per-event fast path does no full rebuild.
+If NOTHING the snapshot depends on changed since the last snapshot, REUSE it —
+zero re-fold, zero write, zero render. Implemented as a loop-level gate: a
+cheap `input_signature(repo)` probe (one ODB open: HEAD + the dirty walk; the
+`.clank` fingerprint is stat-only) that the watch loops (`run_watch`,
+`run_tui`) compare against the last; rebuild only on a difference. This keeps
+`build_async`/`from_state` untouched (the 3-open fitness test stays valid) and
+the gate explicit at the call site rather than hidden inside the builder. This
+is the first concrete slice of the incremental-snapshot model: the per-event
+fast path does no full rebuild.
+
+(Trade-off: on a wake that DID change something, the dirty walk runs twice — once
+in the probe, once in the rebuild's `from_state`. Bounded — dominated by the
+rebuild, and the churning case can't gate anyway (below). Threading the probe's
+result into `build_async` to drop the second walk is a later cleanup, not needed
+for the fix.)
 
 **The reuse key MUST be the FULL snapshot input set, not just HEAD+dirty
 (ruthless, intro review — load-bearing).** `StatusSnapshot` reflects head_sha,
@@ -114,12 +123,14 @@ Kills the latent per-fold fsync everywhere, independent of the render fix.
 - **Render is read-only:** a `log_rows_windowed`-equivalent over a fixture repo
   writes and deletes ZERO files under `.clank/cache/` (snapshot the dir before/
   after).
-- **Nothing-changed reuse:** a second `build_async` with the FULL input set
-  unchanged performs no fold and no cache write (assert via the existing
-  ODB-open / cache-write fitness counters — extend
-  `status_build_opens_the_odb_once_per_phase`). And the dual: mutating a
-  gitignored input the watcher wakes on (drop a `feedback/<sha>.md`) does NOT
-  reuse — the new verdict appears (guards against a HEAD+dirty-only key).
+- **Cheap probe:** `input_signature_opens_the_odb_once` — the reuse probe is one
+  ODB open, far cheaper than the 3-phase build it guards
+  (`status_build_opens_the_odb_once_per_phase` stays at 3, unchanged).
+- **Stable when idle:** `input_signature_is_stable_when_nothing_changes` — the
+  gate reuses across no-op wakes.
+- **Full-input key (the dual):** `clank_fingerprint_flips_on_a_new_review_verdict`
+  — a gitignored `feedback/<sha>.md` flips the signature, so a HEAD+dirty-only
+  key can't reuse-away a verdict.
 
 ## Reproduce-first, then validate (settles design Q1 empirically)
 
@@ -141,8 +152,8 @@ re-sample and confirm the process sits at idle CPU when nothing changes.
   NOT a claim that continuous tracked churn goes idle. The reproduce-first
   sample names which case the live bug was.
 - A render NEVER mutates `.clank/cache/` (Fix 1, pinned by test).
-- `build_async` reuses the prior snapshot IFF the full input signature is
-  unchanged, and does NOT reuse when a gitignored watched input changes
+- The watch loops reuse the prior snapshot IFF the full input signature is
+  unchanged, and do NOT reuse when a gitignored watched input changes
   (Fix 2, pinned by both directions of the test).
 - `should_checkpoint` and `prune_plan` agree on the survivor set (Fix 3, pinned
   by the fold-then-prune-is-a-fixed-point test).

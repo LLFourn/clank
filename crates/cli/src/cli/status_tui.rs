@@ -1531,6 +1531,9 @@ pub(crate) async fn run_tui(
     // and each agent's status glyph onto its own pane name.
     let mut tab = TabIndicator::new();
     let mut panes = PaneStatus::new();
+    // Probe the input signature BEFORE the first build so any change
+    // racing the build re-builds next wake (under-gate, never over-gate).
+    let mut last_sig = crate::cli::status::input_signature(&repo).ok();
     let mut snapshot =
         StatusSnapshot::build_async(&repo, &basename, home.as_deref(), policy, None, true).await?;
     let mut offset: usize = 0;
@@ -1606,25 +1609,33 @@ pub(crate) async fn run_tui(
                 needs_fill = true;
             }
             Ok(Ev::Refresh) => {
-                snapshot = StatusSnapshot::build_async(
-                    &repo,
-                    &basename,
-                    home.as_deref(),
-                    policy,
-                    None,
-                    true,
-                )
-                .await?;
-                // Restore the user's scroll depth and re-open paging in
-                // case history grew; the loop top tops up the viewport.
-                snapshot.log_rows = crate::cli::status::tui_log_rows(&repo, log_window).await;
-                log_complete = false;
-                needs_fill = true;
-                if let Some(tab) = tab.as_mut() {
-                    tab.update(&bar_emoji(&snapshot));
-                }
-                if let Some(panes) = panes.as_mut() {
-                    panes.update(&snapshot);
+                // Nothing-changed gate (lloyd's invariant): a wake that
+                // touched no snapshot input is dropped — no rebuild, no
+                // log re-fold, no repaint. The probe is far cheaper than
+                // the work it guards.
+                let sig = crate::cli::status::input_signature(&repo).ok();
+                if sig != last_sig {
+                    snapshot = StatusSnapshot::build_async(
+                        &repo,
+                        &basename,
+                        home.as_deref(),
+                        policy,
+                        None,
+                        true,
+                    )
+                    .await?;
+                    // Restore the user's scroll depth and re-open paging in
+                    // case history grew; the loop top tops up the viewport.
+                    snapshot.log_rows = crate::cli::status::tui_log_rows(&repo, log_window).await;
+                    last_sig = sig;
+                    log_complete = false;
+                    needs_fill = true;
+                    if let Some(tab) = tab.as_mut() {
+                        tab.update(&bar_emoji(&snapshot));
+                    }
+                    if let Some(panes) = panes.as_mut() {
+                        panes.update(&snapshot);
+                    }
                 }
             }
             // Animation tick: advance the frame ONLY. `needs_fill` stays
