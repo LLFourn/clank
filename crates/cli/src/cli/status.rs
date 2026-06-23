@@ -1053,7 +1053,8 @@ pub(crate) fn waiting_reason(w: &WaitingOn) -> String {
         WaitingOn::MasterToFinalize => "gate FINISHED — run `clank finish`".into(),
         WaitingOn::MasterToCommit => "gate approved but plan file dirty".into(),
         WaitingOn::MasterToFixCommitTag => {
-            "HEAD tag doesn't match touched plan files — amend the commit message".into()
+            "HEAD tags don't match the plans it touches — amend (re-tag, or drop the tag if ad-hoc)"
+                .into()
         }
     }
 }

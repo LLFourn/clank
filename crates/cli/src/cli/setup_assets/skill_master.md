@@ -20,6 +20,22 @@ review gate.
   drifting from user intent, or the work seems unwise.
 - You never WRITE verdicts. You read feedback and act on the gate state.
 
+### Commit tagging
+
+Tag your implementation commits by SET EQUALITY: a commit's `[<plan>]`
+subject tags must EQUAL the set of ACTIVE plans whose files it touches.
+- Touches plan `foo`'s files → subject `[foo] …`.
+- Touches no active plan's files (ad-hoc fix, scratch) → NO tag.
+- (clank tags its own promote/finish commits — you only tag your own
+  implementation commits.)
+
+Break that equality and clank hands you a `fix-commit-tag` correction you
+must amend BEFORE anything else proceeds. Three ways to break it:
+- **tag names no active plan** → if the commit was ad-hoc, amend to REMOVE
+  the tag; otherwise re-tag to the right active plan.
+- **tagged a plan whose files you didn't touch** → drop that tag.
+- **touched a plan's files but didn't tag it** → add that plan's tag.
+
 ### The loop
 
 `clank wfw` (or the Stop hook) hands you work. Common kinds:

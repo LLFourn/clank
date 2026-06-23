@@ -740,8 +740,9 @@ fn render_human(item: &WaitItem) -> String {
                 ));
             }
             format!(
-                "fix-commit-tag  {}  {} — amend the tag to EXACTLY the plan files \
-                 the commit touches (no tag = ad-hoc)",
+                "fix-commit-tag  {}  {} — make the commit's [tag]s EQUAL the active \
+                 plans whose files it touches: re-tag to the right plan(s), or REMOVE \
+                 the tag if the commit is ad-hoc (not plan work)",
                 short(sha),
                 parts.join("; ")
             )
@@ -958,6 +959,25 @@ mod tests {
             "names the tagged-but-untouched plan"
         );
         assert!(line.contains("plan"), "names the unknown tag");
+    }
+
+    #[test]
+    fn fix_commit_tag_hint_offers_dropping_the_tag() {
+        // The unknown-tag case (committed `[plan]` for a plan that doesn't
+        // exist) is usually an ad-hoc commit that shouldn't be tagged at
+        // all — the hint must surface REMOVING the tag as an explicit
+        // option, not bury it (commit-tag-guidance).
+        let item = WaitItem::FixCommitTag {
+            sha: sha("bbbb"),
+            violation: clank_core::wait::HeadTagViolation {
+                unknown: vec!["nope".into()],
+                untagged_touched: vec![],
+                extra_named: vec![],
+            },
+        };
+        let line = render_human(&item).to_lowercase();
+        assert!(line.contains("remove"), "offers removing the tag: {line}");
+        assert!(line.contains("ad-hoc"), "names the ad-hoc case: {line}");
     }
 
     // ── minimal-hint rendering (wfw-output-is-a-minimal-hint) ──
