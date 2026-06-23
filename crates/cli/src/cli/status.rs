@@ -744,7 +744,7 @@ pub(crate) struct WakeFilter {
 /// workflow signal. Everything else under `.clank` is derived or
 /// foreign and must NOT wake the loop (status-tui-watch-cpu): the
 /// fold `cache`, generated `html`, the `zellij` layout, queue
-/// `stubs` — and, critically, nested worktrees under
+/// `drafts` — and, critically, nested worktrees under
 /// `.clank/worktrees/<name>/`, which are whole separate repos with
 /// their own `src/`, `target/`, `.git`, and `.clank/cache`.
 const CLANK_WAKE_DIRS: &[&str] = &[

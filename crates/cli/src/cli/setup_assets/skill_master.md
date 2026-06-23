@@ -51,10 +51,11 @@ must amend BEFORE anything else proceeds. Three ways to break it:
 
 - `clank queue promote <name>` — promote a ready queued plan
 - `clank queue add <name>` — queue a new plan: write its body to
-  `.clank/stubs/<name>.md`, then run `clank queue add <name>` (the stubs
-  dir is the gitignored staging area and the stub is consumed on add —
-  don't stage plan bodies in `/tmp`). `--priority <N>` orders it
-  (default 500; lower promotes first).
+  `.clank/drafts/<name>.md`, then run `clank queue add <name>` (the
+  drafts dir is the gitignored staging area and the draft is consumed on
+  add). Write the body to the drafts dir, not `/tmp`; `-m "<body>"` works
+  for a trivial inline one. `--priority <N>` orders it (default 500;
+  lower promotes first).
 - `clank finish <plan>` — finalize a FINISHED plan
 - `clank shelve <plan>` / `clank unshelve <plan>` — set a plan's commits
   aside / restore them (reviews reset on restore); `clank purge --drop

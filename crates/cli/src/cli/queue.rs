@@ -1,4 +1,3 @@
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use super::{QueueArgs, QueueCmd, resolve_repo};
@@ -15,10 +14,8 @@ pub async fn run(args: QueueArgs) -> anyhow::Result<()> {
 
 /// Top-level orchestrator for `queue add`. Runs all cheap
 /// validation (name shape, priority range, duplicate-name
-/// conflict) BEFORE touching the body source — `--from -`
-/// would otherwise block on stdin and `--from <missing>`
-/// would fail on IO before we knew the queue item couldn't
-/// land.
+/// conflict) BEFORE touching the body source, so a missing/empty
+/// draft body fails only after we know the queue item could land.
 fn add_cmd(repo: &Path, args: super::QueueAddArgs) -> anyhow::Result<()> {
     validate_name(&args.name)?;
     if args.priority > 999 {
@@ -42,23 +39,19 @@ fn add_cmd(repo: &Path, args: super::QueueAddArgs) -> anyhow::Result<()> {
     add(repo, &args.name, args.priority, source)
 }
 
-/// Where a queued stub's body came from. Used for error
+/// Where a queued draft's body came from. Used for error
 /// messages so the user knows what to fix.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BodySourceKind {
     Inline,
-    FromPath(PathBuf),
-    Stdin,
-    StubsDir(PathBuf),
+    DraftsDir(PathBuf),
 }
 
 impl BodySourceKind {
     fn describe(&self) -> String {
         match self {
             BodySourceKind::Inline => "-m".to_string(),
-            BodySourceKind::Stdin => "--from -".to_string(),
-            BodySourceKind::FromPath(p) => format!("--from {}", p.display()),
-            BodySourceKind::StubsDir(p) => format!("`{}`", p.display()),
+            BodySourceKind::DraftsDir(p) => format!("`{}`", p.display()),
         }
     }
 }
@@ -73,44 +66,31 @@ fn pick_body_source(
     name: &str,
     args: &super::QueueAddArgs,
 ) -> anyhow::Result<BodySource> {
-    if let Some(path) = &args.from {
-        if path == &PathBuf::from("-") {
-            let mut buf = String::new();
-            std::io::stdin()
-                .read_to_string(&mut buf)
-                .map_err(|e| anyhow::anyhow!("reading stdin: {e}"))?;
-            return Ok(BodySource {
-                raw: buf,
-                kind: BodySourceKind::Stdin,
-            });
-        }
-        let raw = std::fs::read_to_string(path)
-            .map_err(|e| anyhow::anyhow!("reading `{}`: {e}", path.display()))?;
-        return Ok(BodySource {
-            raw,
-            kind: BodySourceKind::FromPath(path.clone()),
-        });
-    }
     if let Some(msg) = &args.message {
         return Ok(BodySource {
             raw: msg.clone(),
             kind: BodySourceKind::Inline,
         });
     }
-    let stubs_path = repo.join(format!(".clank/stubs/{name}.md"));
-    if stubs_path.is_file() {
-        let raw = std::fs::read_to_string(&stubs_path)
-            .map_err(|e| anyhow::anyhow!("reading `{}`: {e}", stubs_path.display()))?;
+    // The body lives in the drafts dir: write `.clank/drafts/<name>.md`,
+    // then `queue add <name>` consumes it. Legacy `.clank/stubs/` is read
+    // as a one-release fallback so an un-migrated repo's in-flight drafts
+    // aren't orphaned — REMOVE this fallback once repos are migrated.
+    let drafts_path = repo.join(format!(".clank/drafts/{name}.md"));
+    let legacy = repo.join(format!(".clank/stubs/{name}.md"));
+    let path = [drafts_path, legacy].into_iter().find(|p| p.is_file());
+    if let Some(path) = path {
+        let raw = std::fs::read_to_string(&path)
+            .map_err(|e| anyhow::anyhow!("reading `{}`: {e}", path.display()))?;
         return Ok(BodySource {
             raw,
-            kind: BodySourceKind::StubsDir(stubs_path),
+            kind: BodySourceKind::DraftsDir(path),
         });
     }
     anyhow::bail!(
-        "no body for `{name}`. Pass one of:\n  \
-         --from <path>   read body from a file (or `--from -` for stdin)\n  \
-         -m \"<body>\"   inline body\n  \
-         or write `.clank/stubs/{name}.md` and re-run."
+        "no body for `{name}`. Either:\n  \
+         write `.clank/drafts/{name}.md` and re-run, or\n  \
+         pass -m \"<body>\" for a trivial inline body."
     );
 }
 
@@ -256,33 +236,33 @@ fn add(repo: &Path, name: &str, priority: u16, source: BodySource) -> anyhow::Re
              Delete it from .clank/queue/ first or pick a different name."
         );
     }
-    // Consume the stub after a successful write (below): capture its
+    // Consume the draft after a successful write (below): capture its
     // path before `normalize_and_validate` takes `source`. ONLY the
-    // stubs-dir source is consumed — `--from`/`-m`/stdin name files we
-    // don't own (queue-add-consumes-stub).
-    let stub_to_consume = match &source.kind {
-        BodySourceKind::StubsDir(p) => Some(p.clone()),
+    // drafts-dir source is consumed — `-m` names no file we own
+    // (queue-add-consumes-draft).
+    let draft_to_consume = match &source.kind {
+        BodySourceKind::DraftsDir(p) => Some(p.clone()),
         _ => None,
     };
     let body = normalize_and_validate(name, source)?;
-    // `.clank/stubs/` is this command's staging area; self-heal its
+    // `.clank/drafts/` is this command's staging area; self-heal its
     // gitignore the first time queue add runs in a repo that predates
-    // the `/stubs/` entry, mirroring fork (`/worktrees/`) and open
-    // zellij (`/zellij/`) (stubs-gitignored).
-    crate::init_facts::ensure_clank_gitignore_entry(repo, "/stubs/")
-        .map_err(|e| anyhow::anyhow!("ensuring /stubs/ gitignore entry: {e}"))?;
+    // the `/drafts/` entry, mirroring fork (`/worktrees/`) and open
+    // zellij (`/zellij/`) (drafts-gitignored).
+    crate::init_facts::ensure_clank_gitignore_entry(repo, "/drafts/")
+        .map_err(|e| anyhow::anyhow!("ensuring /drafts/ gitignore entry: {e}"))?;
     let dir = queue_dir(repo);
     std::fs::create_dir_all(&dir)?;
     let dest = dir.join(format!("{priority:03}-{name}.md"));
     std::fs::write(&dest, body)?;
-    // The queue entry is the record now — consume the stub. Strictly
-    // after the write so a failed write leaves the stub for a retry;
+    // The queue entry is the record now — consume the draft. Strictly
+    // after the write so a failed write leaves the draft for a retry;
     // best-effort, since the add itself already succeeded.
-    if let Some(stub) = stub_to_consume {
-        if let Err(e) = std::fs::remove_file(&stub) {
+    if let Some(draft) = draft_to_consume {
+        if let Err(e) = std::fs::remove_file(&draft) {
             eprintln!(
-                "note: could not remove consumed stub `{}`: {e}",
-                stub.display()
+                "note: could not remove consumed draft `{}`: {e}",
+                draft.display()
             );
         }
     }
@@ -404,7 +384,7 @@ mod tests {
     }
 
     #[test]
-    fn add_writes_stub_with_header_prepended() {
+    fn add_writes_draft_with_header_prepended() {
         let dir = tempfile::tempdir().unwrap();
         add(dir.path(), "foo", 400, inline("real body\n")).unwrap();
         let path = dir.path().join(".clank/queue/400-foo.md");
@@ -414,28 +394,28 @@ mod tests {
 
     #[test]
     fn add_ensures_its_staging_dir_is_gitignored() {
-        // queue add self-heals `.clank/.gitignore` to ignore `/stubs/`
+        // queue add self-heals `.clank/.gitignore` to ignore `/drafts/`
         // (its staging area) even on a repo that predates the entry —
-        // and even when the body came inline (stubs-gitignored).
+        // and even when the body came inline (drafts-gitignored).
         let dir = tempfile::tempdir().unwrap();
         add(dir.path(), "foo", 400, inline("real body\n")).unwrap();
         let gi = std::fs::read_to_string(dir.path().join(".clank/.gitignore")).unwrap();
-        assert!(gi.contains("/stubs/"), "queue add ignores /stubs/: {gi}");
+        assert!(gi.contains("/drafts/"), "queue add ignores /drafts/: {gi}");
     }
 
     #[test]
-    fn add_consumes_a_stub_dir_source() {
-        // queue-add-consumes-stub: a stub-sourced add deletes the stub
+    fn add_consumes_a_draft_dir_source() {
+        // queue-add-consumes-draft: a draft-sourced add deletes the draft
         // once the queue entry is written, so the staging dir
-        // self-empties (no more leftover stubs piling up).
+        // self-empties (no more leftover drafts piling up).
         let dir = tempfile::tempdir().unwrap();
-        let stub = dir.path().join(".clank/stubs/foo.md");
-        std::fs::create_dir_all(stub.parent().unwrap()).unwrap();
-        std::fs::write(&stub, "# foo\nreal body\n").unwrap();
+        let draft = dir.path().join(".clank/drafts/foo.md");
+        std::fs::create_dir_all(draft.parent().unwrap()).unwrap();
+        std::fs::write(&draft, "# foo\nreal body\n").unwrap();
 
         let source = BodySource {
-            raw: std::fs::read_to_string(&stub).unwrap(),
-            kind: BodySourceKind::StubsDir(stub.clone()),
+            raw: std::fs::read_to_string(&draft).unwrap(),
+            kind: BodySourceKind::DraftsDir(draft.clone()),
         };
         add(dir.path(), "foo", 400, source).unwrap();
 
@@ -443,25 +423,35 @@ mod tests {
             dir.path().join(".clank/queue/400-foo.md").is_file(),
             "queue entry written"
         );
-        assert!(!stub.exists(), "stub consumed (deleted) after queue add");
+        assert!(!draft.exists(), "draft consumed (deleted) after queue add");
     }
 
     #[test]
-    fn add_does_not_delete_a_from_path_source() {
-        // Only the stubs-dir source is consumed; `--from <file>` names a
-        // user-owned file that must survive (queue-add-consumes-stub).
+    fn body_source_prefers_drafts_then_falls_back_to_legacy_stubs() {
         let dir = tempfile::tempdir().unwrap();
-        let src = dir.path().join("elsewhere.md");
-        std::fs::write(&src, "# foo\nreal body\n").unwrap();
-
-        let source = BodySource {
-            raw: std::fs::read_to_string(&src).unwrap(),
-            kind: BodySourceKind::FromPath(src.clone()),
+        let args = crate::cli::QueueAddArgs {
+            name: "foo".into(),
+            priority: 500,
+            message: None,
         };
-        add(dir.path(), "foo", 400, source).unwrap();
 
-        assert!(dir.path().join(".clank/queue/400-foo.md").is_file());
-        assert!(src.exists(), "--from source file must NOT be deleted");
+        // Legacy `.clank/stubs/` is read when `.clank/drafts/` is absent
+        // (the one-release migration shim).
+        let legacy = dir.path().join(".clank/stubs/foo.md");
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, "# foo\nfrom stubs\n").unwrap();
+        let src = pick_body_source(dir.path(), "foo", &args).unwrap();
+        assert!(src.raw.contains("from stubs"), "reads legacy stubs dir");
+
+        // `.clank/drafts/` wins when both exist.
+        let draft = dir.path().join(".clank/drafts/foo.md");
+        std::fs::create_dir_all(draft.parent().unwrap()).unwrap();
+        std::fs::write(&draft, "# foo\nfrom drafts\n").unwrap();
+        let src = pick_body_source(dir.path(), "foo", &args).unwrap();
+        assert!(
+            src.raw.contains("from drafts"),
+            "drafts dir takes precedence"
+        );
     }
 
     #[test]

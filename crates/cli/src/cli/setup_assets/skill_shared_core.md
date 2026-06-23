@@ -3,7 +3,7 @@
 Clank is a peer-review workflow for multi-agent development. Each repo's
 `.clank/` holds:
 - `plans/` — one `.md` per active plan; `finished/` — finalized plans
-- `queue/` — queued plan stubs awaiting promotion
+- `queue/` — queued plan drafts awaiting promotion
 - `config.json` — the repo ROSTER: a flat list of agents, each with a
   role (`master` / `commit` / `gate`). NOT a single "master" setting.
 - `agents/<label>/config.json` — per-agent local state, gitignored

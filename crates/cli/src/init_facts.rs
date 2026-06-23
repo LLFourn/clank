@@ -7,8 +7,8 @@
 use std::path::{Path, PathBuf};
 
 /// The managed entries of `.clank/.gitignore` — everything
-/// local-only: agent state, caches, the queue, queue-add stubs
-/// (the `.clank/stubs/<name>.md` staging area for `queue add`),
+/// local-only: agent state, caches, the queue, queue-add drafts
+/// (the `.clank/drafts/<name>.md` staging area for `queue add`),
 /// rendered html, shelved-plan state (plan-lifecycle-verbs), fork
 /// worktrees (clank-fork-worktree-sessions), generated zellij
 /// layouts.
@@ -28,7 +28,7 @@ pub const CLANK_GITIGNORE_ENTRIES: &[&str] = &[
     "/cache/",
     "/feedback/",
     "/queue/",
-    "/stubs/",
+    "/drafts/",
     "/html/",
     "/pr-reviews/",
     "/shelved/",
@@ -277,14 +277,14 @@ mod tests {
     }
 
     #[test]
-    fn stubs_is_a_managed_gitignore_entry_with_legacy_repair() {
-        // `.clank/stubs/` is the queue-add staging area and MUST be
-        // gitignored everywhere (stubs-gitignored).
+    fn drafts_is_a_managed_gitignore_entry_with_legacy_repair() {
+        // `.clank/drafts/` is the queue-add staging area and MUST be
+        // gitignored everywhere (drafts-gitignored).
         assert!(
-            clank_gitignore_body().contains("/stubs/\n"),
-            "stubs in the canonical body"
+            clank_gitignore_body().contains("/drafts/\n"),
+            "drafts in the canonical body"
         );
-        // A repo whose .clank/.gitignore predates /stubs/ (the prior
+        // A repo whose .clank/.gitignore predates /drafts/ (the prior
         // canonical set) classifies Legacy, and the shared ensure
         // repairs it back to canonical without disturbing the rest.
         let dir = tempdir();
@@ -294,11 +294,11 @@ mod tests {
         std::fs::write(clank_gitignore_path(dir.path()), prior).unwrap();
         assert_eq!(classify_clank_gitignore(dir.path()), GitignoreState::Legacy);
 
-        ensure_clank_gitignore_entry(dir.path(), "/stubs/").unwrap();
+        ensure_clank_gitignore_entry(dir.path(), "/drafts/").unwrap();
         assert_eq!(
             classify_clank_gitignore(dir.path()),
             GitignoreState::Canonical,
-            "repaired to canonical after adding /stubs/"
+            "repaired to canonical after adding /drafts/"
         );
     }
 
@@ -430,7 +430,7 @@ mod tests {
 /// `entry` (one line). Shared by the commands that create
 /// local-only state in repos whose gitignore may predate the
 /// entry (fork: /worktrees/, open zellij: /zellij/, queue add:
-/// /stubs/).
+/// /drafts/).
 pub fn ensure_clank_gitignore_entry(repo: &Path, entry: &str) -> std::io::Result<()> {
     let path = clank_gitignore_path(repo);
     if let Some(parent) = path.parent() {
