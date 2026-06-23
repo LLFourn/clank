@@ -106,7 +106,6 @@ fn fold_events(
     checkpoint: bool,
 ) -> Vec<LogEvent> {
     let mut log_events = Vec::new();
-    let mut last_checkpoint = base_depth;
     let mut depth = base_depth;
     for event in events {
         let sha = event.commit.clone();
@@ -114,13 +113,10 @@ fn fold_events(
         depth += 1;
         state.head = Some(sha);
         if checkpoint
-            && clank_core::checkpoint::should_checkpoint(
-                depth - last_checkpoint,
-                tip_depth.saturating_sub(depth),
-            )
+            && clank_core::checkpoint::should_checkpoint(tip_depth.saturating_sub(depth))
         {
             match state_cache::write(repo_root, state, depth) {
-                Ok(()) => last_checkpoint = depth,
+                Ok(()) => {}
                 Err(e) => tracing::warn!(
                     repo = %repo_root.display(),
                     depth,

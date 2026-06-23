@@ -65,12 +65,28 @@ bug, not just this instance.
 
 > "it shouldn't write the cache if nothing has happened."
 
-In `build_async`: if HEAD sha AND working-tree dirty-state are unchanged since
-the last snapshot, REUSE the last snapshot — zero re-fold, zero write, zero
-fsync. ONE gate, named at the snapshot level — NOT a `cp.sha==h` fast path
-bolted onto `rebuild_from` (that only mirrors `rebuild_with_diagnostics` and
-leaves the render-writes-cache smell). This is the first concrete slice of the
-incremental-snapshot model: the per-event fast path does no full rebuild.
+In `build_async`: if NOTHING the snapshot depends on changed since the last
+snapshot, REUSE it — zero re-fold, zero write, zero fsync. ONE gate, named at
+the snapshot level — NOT a `cp.sha==h` fast path bolted onto `rebuild_from`
+(that only mirrors `rebuild_with_diagnostics` and leaves the render-writes-cache
+smell). This is the first concrete slice of the incremental-snapshot model: the
+per-event fast path does no full rebuild.
+
+**The reuse key MUST be the FULL snapshot input set, not just HEAD+dirty
+(ruthless, intro review — load-bearing).** `StatusSnapshot` reflects head_sha,
+dirty, blocks, queue, master/config, the LOG (commits AND reviews/feedback), and
+pr_reviews (status.rs:26-59). Of those, blocks, queue, reviews/feedback, and
+config live in gitignored `.clank/` and change WITHOUT touching HEAD or the git
+working-tree dirty state. A HEAD+dirty-only gate would reuse a stale snapshot on
+a new review verdict (a gitignored `.clank/agents/<label>/feedback` file) — the
+verdict would be INVISIBLE in the TUI, exactly what the master watches for — and
+likewise on a new block / queued-or-promoted plan / roster change. So the gate
+reuses IFF nothing the snapshot depends on changed: ONE signature over ALL inputs
+(HEAD, dirty, blocks, queue, reviews/feedback, config, pr_reviews), made EQUAL to
+the watcher's wake-worthy set (fs_watcher already wakes on exactly these `.clank/`
+paths; it ignores cache/, done/, non-clank, outside-root). A reuse key narrower
+than the watcher's wake set hides real changes; wider just costs a rebuild. Name
+that one signature; do not let HEAD+dirty stand in for the whole snapshot.
 
 ### Fix 3 — align write & evict policies (do regardless)
 
@@ -88,9 +104,12 @@ Kills the latent per-fold fsync everywhere, independent of the render fix.
 - **Render is read-only:** a `log_rows_windowed`-equivalent over a fixture repo
   writes and deletes ZERO files under `.clank/cache/` (snapshot the dir before/
   after).
-- **Nothing-changed reuse:** a second `build_async` with unchanged HEAD+dirty
-  performs no fold and no cache write (assert via the existing ODB-open /
-  cache-write fitness counters — extend `status_build_opens_the_odb_once_per_phase`).
+- **Nothing-changed reuse:** a second `build_async` with the FULL input set
+  unchanged performs no fold and no cache write (assert via the existing
+  ODB-open / cache-write fitness counters — extend
+  `status_build_opens_the_odb_once_per_phase`). And the dual: mutating a
+  gitignored input the watcher wakes on (drop a `feedback/<sha>.md`) does NOT
+  reuse — the new verdict appears (guards against a HEAD+dirty-only key).
 
 ## Reproduce-first, then validate (settles design Q1 empirically)
 
@@ -102,11 +121,19 @@ re-sample and confirm the process sits at idle CPU when nothing changes.
 
 ## Acceptance
 
-- `clank status --tui` sits at idle CPU on a churning repo when HEAD/dirty are
-  unchanged (no per-frame fsync).
+- `clank status --tui` sits at idle CPU when nothing the snapshot depends on
+  changes (no per-frame fsync). Honesty about "churning repo" (ruthless): if the
+  churn is TRACKED, git-dirty changes every frame so Fix 2 can't gate in that
+  window — Fix 1 (render reads, no fsync) is what kills the dominant cost there,
+  and a per-frame log re-fold remains as residual CPU (the deferred per-input
+  incremental model removes that). If the churn is GITIGNORED, the watcher
+  shouldn't wake at all. So this line means idle-when-nothing-relevant-changed,
+  NOT a claim that continuous tracked churn goes idle. The reproduce-first
+  sample names which case the live bug was.
 - A render NEVER mutates `.clank/cache/` (Fix 1, pinned by test).
-- `build_async` reuses the prior snapshot when HEAD+dirty are unchanged
-  (Fix 2, pinned by test).
+- `build_async` reuses the prior snapshot IFF the full input signature is
+  unchanged, and does NOT reuse when a gitignored watched input changes
+  (Fix 2, pinned by both directions of the test).
 - `should_checkpoint` and `prune_plan` agree on the survivor set (Fix 3, pinned
   by the fold-then-prune-is-a-fixed-point test).
 - Reproduced on the fresh binary before the fix; re-sampled idle after.

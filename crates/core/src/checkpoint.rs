@@ -12,12 +12,6 @@
 //!
 //! [`repo_state`]: crate::repo_state
 
-/// Gap allowed between checkpoints at `distance_from_tip` commits
-/// behind the fold's tip: 1 at the tip, doubling with distance.
-fn allowed_gap(distance_from_tip: u64) -> u64 {
-    (distance_from_tip / 2).max(1)
-}
-
 /// Distance bucket a surviving checkpoint occupies: power-of-two
 /// bands behind the tip (`0` for the tip itself and distance 1,
 /// then `[2,4)`, `[4,8)`, …). [`prune_plan`] keeps one checkpoint
@@ -29,12 +23,17 @@ fn bucket(distance_from_tip: u64) -> u32 {
     }
 }
 
-/// Should the fold persist a checkpoint after applying the commit
-/// at `distance_from_tip` commits behind the fold's tip, when the
-/// last persisted (or starting) checkpoint is `gap_since_last`
-/// commits back? Always true at the tip itself.
-pub fn should_checkpoint(gap_since_last: u64, distance_from_tip: u64) -> bool {
-    gap_since_last >= allowed_gap(distance_from_tip)
+/// The canonical checkpoint distances behind the tip: the tip (`0`),
+/// its parent (`1`), then powers of two (`2, 4, 8, …`). This is
+/// EXACTLY the set [`prune_plan`] keeps — each canonical distance is
+/// the sole member of its [`bucket`] — so the write policy and the
+/// evict policy share one survivor set. A fold therefore never writes
+/// a checkpoint its own trailing prune would immediately delete
+/// (`fold_then_prune_is_a_fixed_point`); the previous gap-based policy
+/// wrote tip-3 (and tip-5..7, …) only for prune to evict them every
+/// frame — a write→fsync→delete churn that pegged the status TUI.
+pub fn should_checkpoint(distance_from_tip: u64) -> bool {
+    distance_from_tip == 0 || distance_from_tip.is_power_of_two()
 }
 
 /// Depths to DELETE so the surviving checkpoints keep one entry
@@ -76,24 +75,24 @@ mod tests {
 
     #[test]
     fn should_checkpoint_matrix() {
-        // (gap_since_last, distance_from_tip) → decision
+        // distance_from_tip → decision. Canonical = {0, 1, 2, 4, 8, …};
+        // tip-3 is NOT written (prune would evict it — the storm).
         let cases = [
-            // at and near the tip: every commit checkpoints
-            (1, 0, true),
-            (1, 1, true),
-            (1, 2, true),
-            (1, 3, true),
-            // far back: gap must reach distance/2
-            (4, 10, false),
-            (5, 10, true),
-            (499, 1000, false),
-            (500, 1000, true),
-            // zero gap never checkpoints (same commit)
-            (0, 0, false),
-            (0, 1000, false),
+            (0, true),  // tip
+            (1, true),  // tip's parent
+            (2, true),
+            (3, false), // the regression: was written, prune deleted it
+            (4, true),
+            (5, false),
+            (6, false),
+            (7, false),
+            (8, true),
+            (16, true),
+            (1000, false),
+            (1024, true),
         ];
-        for (gap, dist, want) in cases {
-            assert_eq!(should_checkpoint(gap, dist), want, "gap={gap} dist={dist}");
+        for (dist, want) in cases {
+            assert_eq!(should_checkpoint(dist), want, "dist={dist}");
         }
     }
 
@@ -103,11 +102,9 @@ mod tests {
     fn cold_fold_write_pattern_is_logarithmic() {
         for n in [1u64, 2, 10, 100, 1_000, 10_000] {
             let mut written = Vec::new();
-            let mut last = 0u64;
             for depth in 1..=n {
-                if should_checkpoint(depth - last, n - depth) {
+                if should_checkpoint(n - depth) {
                     written.push(depth);
-                    last = depth;
                 }
             }
             assert_eq!(*written.last().unwrap(), n, "tip checkpointed (n={n})");
@@ -116,6 +113,25 @@ mod tests {
                 (written.len() as u64) <= bound,
                 "O(log n) writes: n={n} wrote {} (bound {bound})",
                 written.len()
+            );
+        }
+    }
+
+    /// The write policy and the evict policy share ONE survivor set:
+    /// every checkpoint a fresh fold writes must SURVIVE the trailing
+    /// prune. Regression guard for the status-TUI fsync storm — the
+    /// gap-based `should_checkpoint` wrote tip-3 while `prune_plan`
+    /// evicted it, so every render re-wrote and re-deleted it with a
+    /// full F_FULLFSYNC. Nothing previously pinned the two policies'
+    /// AGREEMENT.
+    #[test]
+    fn fold_then_prune_is_a_fixed_point() {
+        for n in [1u64, 2, 3, 4, 5, 8, 13, 100, 1_000, 9_999] {
+            let written: Vec<u64> = (1..=n).filter(|&depth| should_checkpoint(n - depth)).collect();
+            assert_eq!(
+                prune_plan(&written, n),
+                Vec::<u64>::new(),
+                "fold to tip {n} wrote {written:?}; prune deleted some — policies disagree"
             );
         }
     }
