@@ -281,9 +281,9 @@ pub(crate) fn execute_amend(repo: &std::path::Path, program: &AmendProgram) -> a
     }
 
     for p in &program.strip_paths {
-        crate::git_plumbing::run(repo, &["rm", "--cached", "-q", p])?;
+        crate::git_plumbing::remove_cached(repo, p)?;
     }
-    crate::git_plumbing::run(repo, &["commit", "--amend", "--no-edit", "--allow-empty"])?;
+    crate::git_plumbing::amend_no_edit(repo)?;
     println!(
         "amended HEAD: stripped {} path(s)",
         program.strip_paths.len()

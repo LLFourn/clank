@@ -21,7 +21,7 @@ pub async fn run(args: UnfinishArgs) -> anyhow::Result<()> {
 
     let dropped = head_sha(&repo)?;
 
-    git_run(&repo, &["reset", "--hard", "--quiet", "HEAD~"])?;
+    crate::git_plumbing::reset_hard(&repo, "HEAD~")?;
 
     println!(
         "unfinished `{}`; dropped finalize commit {}",
@@ -150,8 +150,4 @@ fn head_sha(repo: &Path) -> anyhow::Result<String> {
 
 fn short(sha: &str) -> &str {
     &sha[..sha.len().min(7)]
-}
-
-fn git_run(repo: &Path, args: &[&str]) -> anyhow::Result<()> {
-    crate::git_plumbing::run(repo, args)
 }

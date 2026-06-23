@@ -173,7 +173,7 @@ pub async fn run(opts: RewriteOpts<'_>) -> anyhow::Result<RewriteOutcome> {
             // Re-sync the worktree to the new tip. Kept on git: a
             // worktree-state checkout whose exact semantics
             // (gitignore/fileMode/autocrlf) must match git's.
-            git_run(opts.repo, &["reset", "--hard", "HEAD"])?;
+            git_plumbing::reset_hard(opts.repo, "HEAD")?;
             current
         }
     };
@@ -559,10 +559,6 @@ fn parent_of(repo: &Path, sha: &str) -> anyhow::Result<Option<String>> {
 fn current_branch(repo: &Path) -> anyhow::Result<String> {
     crate::git_io::current_branch(repo)?
         .ok_or_else(|| anyhow::anyhow!("HEAD is detached; cannot determine the branch to rewrite"))
-}
-
-fn git_run(repo: &Path, args: &[&str]) -> anyhow::Result<()> {
-    crate::git_plumbing::run(repo, args)
 }
 
 fn short(sha: &str) -> String {

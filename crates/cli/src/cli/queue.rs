@@ -331,9 +331,9 @@ fn promote(repo: &Path, name: &str) -> anyhow::Result<()> {
     std::fs::create_dir_all(dest.parent().unwrap())?;
     std::fs::rename(&entry.path, &dest)?;
     let plan_path = format!(".clank/plans/{name}.md");
-    crate::git_plumbing::run(repo, &["add", "--", &plan_path])?;
+    crate::git_plumbing::stage(repo, &plan_path)?;
     let msg = format!("[{name}] intro");
-    crate::git_plumbing::run(repo, &["commit", "--quiet", &plan_path, "-m", &msg])?;
+    crate::git_plumbing::commit_pathspec(repo, &plan_path, &msg)?;
     println!("promoted `{name}` to active plan");
     Ok(())
 }

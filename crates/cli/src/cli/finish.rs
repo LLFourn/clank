@@ -307,23 +307,19 @@ async fn finalize(
 
     let rel_plan = format!(".clank/plans/{stem}.md");
     let rel_finished = format!(".clank/finished/{stem}.md");
-    git_run(repo, &["rm", "--quiet", "--force", "--", &rel_plan])?;
-    git_run(repo, &["add", "--", &rel_finished])?;
+    crate::git_plumbing::remove_path(repo, &rel_plan)?;
+    crate::git_plumbing::stage(repo, &rel_finished)?;
 
     let default_msg = format!("[{stem}] finish");
     let msg = message.unwrap_or(&default_msg);
-    let mut commit_args: Vec<&str> = vec!["commit", "--quiet", "-m", msg];
-    if amend {
-        commit_args.push("--amend");
-    }
-    git_run(repo, &commit_args)?;
+    crate::git_plumbing::commit(repo, msg, amend)?;
     Ok(())
 }
 
 fn amend_already_finished(repo: &Path, stem: &str, message: Option<&str>) -> anyhow::Result<()> {
     let default_msg = format!("[{stem}] finish");
     let msg = message.unwrap_or(&default_msg);
-    git_run(repo, &["commit", "--amend", "--quiet", "-m", msg])
+    crate::git_plumbing::commit(repo, msg, true)
 }
 
 fn require_head_is_finalize(repo: &Path, stem: &str) -> anyhow::Result<()> {
@@ -344,10 +340,6 @@ fn head_is_finalize_for(repo: &Path, stem: &str) -> anyhow::Result<bool> {
     Ok(crate::git_io::diff_tree_changes(repo, &head)
         .map(|c| c.clank_paths_touched.contains(&finished_path))
         .unwrap_or(false))
-}
-
-fn git_run(repo: &Path, args: &[&str]) -> anyhow::Result<()> {
-    crate::git_plumbing::run(repo, args)
 }
 
 #[cfg(test)]

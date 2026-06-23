@@ -223,11 +223,10 @@ pub fn delete_ref(repo: &Path, full_name: &str) -> anyhow::Result<()> {
 
 use std::process::Command;
 
-/// Run `git -C <repo> <args>`, erroring on non-zero exit. The
-/// sanctioned subprocess passthrough for the history-rewrite engine
-/// (`finish` / `rewrite` / `unfinish` / `purge`), which drives many
-/// one-off plumbing commands; discrete operations get typed fns below.
-pub fn run(repo: &Path, args: &[&str]) -> anyhow::Result<()> {
+/// Run `git -C <repo> <args>`, erroring on non-zero exit. PRIVATE — the
+/// shared spawn helper for the typed operations below; callers use the
+/// typed fns so they never construct raw git argv (gix-not-git-gate).
+fn run(repo: &Path, args: &[&str]) -> anyhow::Result<()> {
     let status = Command::new("git")
         .arg("-C")
         .arg(repo)
@@ -244,22 +243,50 @@ pub fn run(repo: &Path, args: &[&str]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Like [`run`] but captures stdout (trimmed). Errors on non-zero exit.
-pub fn capture(repo: &Path, args: &[&str]) -> anyhow::Result<String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .output()
-        .with_context(|| format!("spawning git {}", args.join(" ")))?;
-    if !out.status.success() {
-        anyhow::bail!(
-            "git {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
+/// `git reset --hard --quiet <rev>` — re-sync the worktree to `rev`. A
+/// worktree-state checkout whose exact gitignore/fileMode/autocrlf
+/// semantics must match git's, so it stays a subprocess.
+pub fn reset_hard(repo: &Path, rev: &str) -> anyhow::Result<()> {
+    run(repo, &["reset", "--hard", "--quiet", rev])
+}
+
+/// `git rm --cached -q -- <pathspec>` — drop a path from the index only
+/// (used by `purge --amend` to strip Clank artifacts from HEAD's tree).
+pub fn remove_cached(repo: &Path, pathspec: &str) -> anyhow::Result<()> {
+    run(repo, &["rm", "--cached", "-q", "--", pathspec])
+}
+
+/// `git rm --quiet --force -- <pathspec>` — remove a tracked path from
+/// both index and worktree.
+pub fn remove_path(repo: &Path, pathspec: &str) -> anyhow::Result<()> {
+    run(repo, &["rm", "--quiet", "--force", "--", pathspec])
+}
+
+/// `git add -- <pathspec>` — stage a path.
+pub fn stage(repo: &Path, pathspec: &str) -> anyhow::Result<()> {
+    run(repo, &["add", "--", pathspec])
+}
+
+/// `git commit --quiet -m <msg>`, optionally `--amend`. Commits the
+/// staged index (no pathspec).
+pub fn commit(repo: &Path, msg: &str, amend: bool) -> anyhow::Result<()> {
+    let mut args = vec!["commit", "--quiet", "-m", msg];
+    if amend {
+        args.push("--amend");
     }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    run(repo, &args)
+}
+
+/// `git commit --quiet -- <pathspec> -m <msg>` — commit exactly the
+/// given path (used to promote a queued plan file).
+pub fn commit_pathspec(repo: &Path, pathspec: &str, msg: &str) -> anyhow::Result<()> {
+    run(repo, &["commit", "--quiet", pathspec, "-m", msg])
+}
+
+/// `git commit --amend --no-edit --allow-empty` — re-commit HEAD's
+/// (possibly now-empty) tree keeping its message, after an index edit.
+pub fn amend_no_edit(repo: &Path) -> anyhow::Result<()> {
+    run(repo, &["commit", "--amend", "--no-edit", "--allow-empty"])
 }
 
 /// `git worktree add -b <name> <dest> <base>` — gix has no worktree
