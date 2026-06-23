@@ -1581,6 +1581,125 @@ fn is_plan_path(rel: &Path) -> bool {
     comps.next().is_none() && third.ends_with(".md")
 }
 
+/// The `origin` remote's fetch URL, or `None` if unset. gix-backed
+/// (config), replacing `git remote get-url origin`.
+pub fn origin_url(repo: &Path) -> Option<String> {
+    let r = gix::open(repo).ok()?;
+    let remote = r.find_remote("origin").ok()?;
+    let url = remote.url(gix::remote::Direction::Fetch)?;
+    Some(url.to_bstring().to_string())
+}
+
+/// Blob content of `rel` at `rev` (e.g. `"HEAD"`, `"HEAD~"`). gix-backed
+/// (resolve + [`show_blob`]), replacing `git show <rev>:<rel>`. Errors
+/// if the rev or path can't be resolved.
+pub fn blob_at_rev(repo: &Path, rev: &str, rel: &str) -> Result<String, GitIoError> {
+    let sha = resolve_commit(repo, rev)
+        .ok_or_else(|| nonzero(format!("resolve `{rev}`"), "no such revision"))?;
+    show_blob(repo, &sha, Path::new(rel))
+}
+
+// ── subprocess reads (gix can't reproduce git's exact OUTPUT yet) ──
+// These stay `git` subprocesses behind the boundary: each depends on
+// git's precise textual output (a unified-diff patch, `--name-status`
+// with git's rename semantics, `check-ignore -v`'s matching rule, or
+// the `%ai` date format) that gix doesn't reproduce cheaply. Converting
+// them to gix is future work, invisible to callers behind these fns.
+
+fn read_git_stdout(repo: &Path, args: &[&str]) -> Result<Vec<u8>, GitIoError> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .map_err(|e| nonzero(format!("git {}", args.join(" ")), e))?;
+    if !out.status.success() {
+        return Err(nonzero(
+            format!("git {}", args.join(" ")),
+            String::from_utf8_lossy(&out.stderr).trim(),
+        ));
+    }
+    Ok(out.stdout)
+}
+
+/// `git diff-tree --no-commit-id --name-status [-M] -r HEAD` → the
+/// non-empty `<status>\t<path>[\t<path2>]` lines. `detect_renames`
+/// adds `-M`. Used by `purge --amend` and `unfinish`'s finish-shape
+/// guards, which depend on git's exact name-status + rename semantics.
+pub fn diff_tree_name_status(repo: &Path, detect_renames: bool) -> Result<Vec<String>, GitIoError> {
+    let mut args = vec!["diff-tree", "--no-commit-id", "--name-status"];
+    if detect_renames {
+        args.push("-M");
+    }
+    args.extend(["-r", "HEAD"]);
+    let stdout = read_git_stdout(repo, &args)?;
+    Ok(String::from_utf8_lossy(&stdout)
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+/// `git check-ignore -v <rel>`: `Some(rule)` (the first `-v` line — the
+/// matching gitignore source) if git ignores `rel`, else `None`. The
+/// path needn't exist; git matches patterns. `None` on spawn failure.
+pub fn check_ignore(repo: &Path, rel: &str) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["check-ignore", "-v"])
+        .arg(repo.join(rel))
+        .output()
+        .ok()?;
+    if out.status.code() != Some(0) {
+        return None;
+    }
+    Some(
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .next()
+            .unwrap_or("")
+            .trim_end()
+            .to_string(),
+    )
+}
+
+/// `git diff <range>` patch text (range is `a..b` or a single rev).
+/// git's exact unified-diff format is the contract (it's written to a
+/// patch file), so this stays git.
+pub fn diff_range_patch(repo: &Path, range: &str) -> Result<Vec<u8>, GitIoError> {
+    read_git_stdout(repo, &["diff", range])
+}
+
+/// `git show --format=fuller --patch <sha>` — a commit's patch with a
+/// fuller header (for stacked-diff synthesis).
+pub fn commit_show_patch(repo: &Path, sha: &str) -> Result<Vec<u8>, GitIoError> {
+    read_git_stdout(repo, &["show", "--format=fuller", "--patch", sha])
+}
+
+/// `git show --no-color --pretty=format: <sha>` — just a commit's diff
+/// (empty pretty header), for the HTML renderer's unified-diff parser.
+pub fn commit_diff_text(repo: &Path, sha: &str) -> Result<Vec<u8>, GitIoError> {
+    read_git_stdout(repo, &["show", "--no-color", "--pretty=format:", sha])
+}
+
+/// `(author "Name <email>", date "%ai", body)` for `sha`, all empty on
+/// failure. Kept on git for the `%ai` date format `clank log` displays.
+pub fn commit_meta(repo: &Path, sha: &CommitSha) -> (String, String, String) {
+    let Ok(stdout) = read_git_stdout(
+        repo,
+        &["log", "-1", "--format=%an <%ae>%n%ai%n%B", sha.as_str()],
+    ) else {
+        return (String::new(), String::new(), String::new());
+    };
+    let text = String::from_utf8_lossy(&stdout);
+    let mut lines = text.lines();
+    let author = lines.next().unwrap_or("").to_string();
+    let date = lines.next().unwrap_or("").to_string();
+    let body = lines.collect::<Vec<_>>().join("\n").trim().to_string();
+    (author, date, body)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

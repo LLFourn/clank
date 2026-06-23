@@ -333,19 +333,8 @@ fn synthesize_patch_file(repo: &Path, kind: &DiffKind) -> anyhow::Result<PathBuf
                 Some(f) => format!("{}..{}", f.as_str(), to.as_str()),
                 None => to.as_str().to_string(),
             };
-            let out = Command::new("git")
-                .arg("-C")
-                .arg(repo)
-                .args(["diff", &range_str])
-                .output()
-                .context("invoking git diff for patch synthesis")?;
-            if !out.status.success() {
-                anyhow::bail!(
-                    "git diff `{range_str}` failed: {}",
-                    String::from_utf8_lossy(&out.stderr).trim()
-                );
-            }
-            out.stdout
+            crate::git_io::diff_range_patch(repo, &range_str)
+                .context("git diff for patch synthesis")?
         }
         DiffKind::Plan { commits, .. } => {
             // Stacked diff: per-commit `git show --format= --patch`
@@ -353,20 +342,9 @@ fn synthesize_patch_file(repo: &Path, kind: &DiffKind) -> anyhow::Result<PathBuf
             // mail headers.
             let mut combined = Vec::new();
             for sha in commits {
-                let out = Command::new("git")
-                    .arg("-C")
-                    .arg(repo)
-                    .args(["show", "--format=fuller", "--patch", sha.as_str()])
-                    .output()
-                    .context("invoking git show for plan patch synthesis")?;
-                if !out.status.success() {
-                    anyhow::bail!(
-                        "git show `{}` failed: {}",
-                        sha.as_str(),
-                        String::from_utf8_lossy(&out.stderr).trim()
-                    );
-                }
-                combined.extend_from_slice(&out.stdout);
+                let patch = crate::git_io::commit_show_patch(repo, sha.as_str())
+                    .context("git show for plan patch synthesis")?;
+                combined.extend_from_slice(&patch);
                 combined.push(b'\n');
             }
             combined

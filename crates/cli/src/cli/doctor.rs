@@ -334,28 +334,8 @@ pub fn repo_checks(repo: &Path, home: Option<&Path>) -> Vec<CheckResult> {
 /// git matches patterns, not files.
 fn check_gitignore_probe(repo: &Path, rel: &str, expect_tracked: bool) -> CheckResult {
     const SECTION: &str = "repo";
-    let probe = repo.join(rel);
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["check-ignore", "-v"])
-        .arg(probe.as_path())
-        .output();
-    let Ok(output) = output else {
-        return CheckResult::warn(
-            SECTION,
-            format!("gitignore probe: {rel}"),
-            "git check-ignore failed to run".to_string(),
-        );
-    };
-    let ignored = output.status.code() == Some(0);
-    if expect_tracked && ignored {
-        let line = String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .next()
-            .unwrap_or("")
-            .trim_end()
-            .to_string();
+    let ignored_by = crate::git_io::check_ignore(repo, rel);
+    if let (true, Some(line)) = (expect_tracked, ignored_by) {
         CheckResult::warn(
             SECTION,
             format!("gitignore probe: {rel}"),

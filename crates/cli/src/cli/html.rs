@@ -1069,16 +1069,10 @@ fn parse_hunk_header(line: &str) -> Option<(u32, u32)> {
 }
 
 fn commit_diff(repo: &Path, sha: &CommitSha) -> Vec<FilePatch> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["show", "--no-color", "--pretty=format:", sha.as_str()])
-        .output();
-    let Ok(out) = out else { return Vec::new() };
-    if !out.status.success() {
+    let Ok(out) = crate::git_io::commit_diff_text(repo, sha.as_str()) else {
         return Vec::new();
-    }
-    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    };
+    let text = String::from_utf8_lossy(&out).to_string();
     parse_unified_diff(&text)
 }
 

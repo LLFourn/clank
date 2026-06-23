@@ -269,32 +269,10 @@ fn warn_if_globally_excluded(repo: &Path) {
 }
 
 fn check_one(repo: &Path, rel: &str) {
-    let probe = repo.join(rel);
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["check-ignore", "-v"])
-        .arg(probe.as_path())
-        .output();
-    let Ok(output) = output else { return };
-    match output.status.code() {
-        Some(0) => {}
-        Some(1) => return,
-        _ => {
-            tracing::debug!(
-                stderr = %String::from_utf8_lossy(&output.stderr).trim(),
-                rel,
-                "check-ignore probe failed unexpectedly"
-            );
-            return;
-        }
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let line = stdout.lines().next().unwrap_or("").trim_end();
-    if line.is_empty() {
+    let Some(line) = crate::git_io::check_ignore(repo, rel) else {
         return;
-    }
-    if matched_by_clank_gitignore(line) {
+    };
+    if line.is_empty() || matched_by_clank_gitignore(&line) {
         return;
     }
     eprintln!(

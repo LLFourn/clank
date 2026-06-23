@@ -108,22 +108,7 @@ fn parse_range(repo: &Path, range: &str) -> anyhow::Result<(Option<CommitSha>, C
 }
 
 fn commit_info(repo: &Path, sha: &CommitSha) -> (String, String, String) {
-    let o = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["log", "-1", "--format=%an <%ae>%n%ai%n%B", sha.as_str()])
-        .output();
-    match o {
-        Ok(o) if o.status.success() => {
-            let text = String::from_utf8_lossy(&o.stdout).to_string();
-            let mut lines = text.lines();
-            let author = lines.next().unwrap_or("").to_string();
-            let date = lines.next().unwrap_or("").to_string();
-            let body: String = lines.collect::<Vec<_>>().join("\n").trim().to_string();
-            (author, date, body)
-        }
-        _ => (String::new(), String::new(), String::new()),
-    }
+    crate::git_io::commit_meta(repo, sha)
 }
 
 pub(crate) fn short(sha: &CommitSha) -> &str {

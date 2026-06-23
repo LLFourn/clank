@@ -116,16 +116,9 @@ fn resolve_pr(repo: &Path, explicit: Option<u32>) -> anyhow::Result<u32> {
 
 /// Parse `owner/name` from the `origin` remote URL (ssh or https).
 pub(crate) fn repo_slug(repo: &Path) -> anyhow::Result<String> {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["remote", "get-url", "origin"])
-        .output()
-        .context("spawning git remote get-url origin")?;
-    if !out.status.success() {
-        anyhow::bail!("no `origin` remote; cannot determine owner/name for the gh API");
-    }
-    let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let url = crate::git_io::origin_url(repo).ok_or_else(|| {
+        anyhow::anyhow!("no `origin` remote; cannot determine owner/name for the gh API")
+    })?;
     parse_slug(&url).ok_or_else(|| anyhow::anyhow!("cannot parse owner/name from origin `{url}`"))
 }
 

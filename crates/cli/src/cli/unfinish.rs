@@ -54,20 +54,9 @@ fn require_head_is_trivial_finish(repo: &Path, stem: &str) -> anyhow::Result<()>
     let plans_rel = format!(".clank/plans/{stem}.md");
     let finished_rel = format!(".clank/finished/{stem}.md");
 
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["diff-tree", "--no-commit-id", "--name-status", "-r", "HEAD"])
-        .output()?;
-    if !out.status.success() {
-        anyhow::bail!(
-            "git diff-tree failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    let raw = String::from_utf8_lossy(&out.stdout);
+    let lines = crate::git_io::diff_tree_name_status(repo, false)?;
     let mut entries: Vec<(char, String)> = Vec::new();
-    for line in raw.lines() {
+    for line in &lines {
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -116,29 +105,14 @@ fn require_head_is_trivial_finish(repo: &Path, stem: &str) -> anyhow::Result<()>
     // HEAD:finished/<stem>.md byte-for-byte. A rename that
     // also edited content would silently lose the edit on
     // `git reset --hard HEAD~`.
-    let before = git_show(repo, &format!("HEAD~:{plans_rel}"))?;
-    let after = git_show(repo, &format!("HEAD:{finished_rel}"))?;
+    let before = crate::git_io::blob_at_rev(repo, "HEAD~", &plans_rel)?;
+    let after = crate::git_io::blob_at_rev(repo, "HEAD", &finished_rel)?;
     if before != after {
         anyhow::bail!(
             "HEAD's finish commit changed plan body in addition to renaming it. Fix the history manually first."
         );
     }
     Ok(())
-}
-
-fn git_show(repo: &Path, spec: &str) -> anyhow::Result<Vec<u8>> {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["show", spec])
-        .output()?;
-    if !out.status.success() {
-        anyhow::bail!(
-            "git show {spec} failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    Ok(out.stdout)
 }
 
 fn head_sha(repo: &Path) -> anyhow::Result<String> {

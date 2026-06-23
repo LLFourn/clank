@@ -193,27 +193,7 @@ pub(crate) fn build_amend_program(
     repo: &std::path::Path,
     plan_key: Option<&PlanKey>,
 ) -> anyhow::Result<AmendProgram> {
-    let head_files = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args([
-            "diff-tree",
-            "--no-commit-id",
-            "--name-status",
-            "-M",
-            "-r",
-            "HEAD",
-        ])
-        .output()?;
-    let head_lines: Vec<String> = if head_files.status.success() {
-        String::from_utf8_lossy(&head_files.stdout)
-            .lines()
-            .filter(|l| !l.is_empty())
-            .map(str::to_string)
-            .collect()
-    } else {
-        Vec::new()
-    };
+    let head_lines = crate::git_io::diff_tree_name_status(repo, true).unwrap_or_default();
     let head_is_finalize = is_finish_diff(&head_lines, plan_key);
     if !head_is_finalize {
         let desc = match plan_key {

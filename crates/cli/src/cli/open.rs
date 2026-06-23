@@ -423,19 +423,9 @@ fn probe_ancestor_gitignore_advisory(repo: &Path) -> Vec<String> {
     const TRACKED_PROBES: &[&str] = &[".clank/plans", ".clank/finished"];
     let mut out = Vec::new();
     for rel in TRACKED_PROBES {
-        let probe = repo.join(rel);
-        let output = std::process::Command::new("git")
-            .arg("-C")
-            .arg(repo)
-            .args(["check-ignore", "-v"])
-            .arg(probe.as_path())
-            .output();
-        let Ok(output) = output else { continue };
-        if output.status.code() != Some(0) {
+        let Some(line) = crate::git_io::check_ignore(repo, rel) else {
             continue;
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let line = stdout.lines().next().unwrap_or("").trim_end();
+        };
         if line.is_empty() {
             continue;
         }
