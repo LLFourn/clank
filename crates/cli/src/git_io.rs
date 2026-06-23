@@ -79,6 +79,15 @@ impl Repo {
         }
     }
 
+    /// `None` = clean. Computed in-process via gix — no `git` subprocess.
+    /// One handle drives a single working-tree status walk plus the
+    /// per-path line diffs (no per-read ODB re-open).
+    ///
+    /// We never write the index back (gix only does so on an explicit
+    /// `Outcome::write_changes()`), so this can't trigger the self-wake
+    /// the old `--no-optional-locks` shell-out guarded against: a probe
+    /// that refreshed `.git/index` would fire the very watcher that drove
+    /// the probe.
     pub fn working_tree_dirty(&self) -> Result<Option<DirtyStats>, GitIoError> {
         let git = &self.0;
 
@@ -110,6 +119,14 @@ impl Repo {
         }))
     }
 
+    /// Is `rel_path`'s worktree copy dirty vs its blob at `commit`? The
+    /// one definition shared by the status-derive path
+    /// (`FsPlanStateLookup::worktree_status`) and the preview path. The
+    /// blob is the source of truth: a worktree file that differs is
+    /// `BodyDirty`; a missing worktree file whose blob exists at `commit`
+    /// is `PlanFileMissing`; a path absent at `commit` is `Clean`
+    /// regardless of the worktree (matching `git diff HEAD`, which ignores
+    /// paths not in the commit). Reuses the [`Repo`] handle.
     pub fn plan_body_status(
         &self,
         commit: &CommitSha,
@@ -158,6 +175,13 @@ impl Repo {
         Ok(msg.summary().to_string())
     }
 
+    /// Live HEAD facts for the commit-tag invariant
+    /// (`commit-tag-fixup-is-first-class-state`): HEAD's subject + the
+    /// plan files its diff touched + repo adoption, packaged as a
+    /// [`clank_core::wait::HeadCommit`] for `derive_status`. Returns
+    /// `None` when the repo has no HEAD (fresh repo). Errors reading the
+    /// subject/diff degrade to empty (no subject) / no touches — the
+    /// invariant then simply finds nothing to flag, never a false alarm.
     pub fn head_commit(
         &self,
         state: &crate::repo_state::RepoState,
@@ -185,6 +209,9 @@ impl Repo {
         })
     }
 
+    /// The commit's body (`%b`) — everything after the subject and its
+    /// blank line, or `""` if none. Replaces `git log -1 --format=%b
+    /// <sha>`.
     pub fn commit_body(&self, sha: &CommitSha) -> Result<String, GitIoError> {
         let oid =
             gix::ObjectId::from_hex(sha.as_str().as_bytes()).map_err(|e| GitIoError::Parse {
@@ -201,6 +228,10 @@ impl Repo {
         Ok(msg.body().map(|b| b.to_string()).unwrap_or_default())
     }
 
+    /// First parent of the given commit. Returns `Ok(None)` for the
+    /// root commit (no parent) or when the commit / repo can't be
+    /// opened (preserves the legacy shell-out's lenient semantics —
+    /// missing commits map to None, not an error).
     pub fn parent_of(&self, sha: &CommitSha) -> Result<Option<CommitSha>, GitIoError> {
         let parent_opt: Option<gix::ObjectId> = (|| {
             let oid = gix::ObjectId::from_hex(sha.as_str().as_bytes()).ok()?;
@@ -349,10 +380,10 @@ impl Repo {
                 DiffGate::NoChanges
             } else {
                 let parent_clank = match parent_tree {
-                    Some(t) => clank_entry_oid(&repo, t, CONTEXT)?,
+                    Some(t) => clank_entry_oid(repo, t, CONTEXT)?,
                     None => None,
                 };
-                let child_clank = clank_entry_oid(&repo, raw.tree, CONTEXT)?;
+                let child_clank = clank_entry_oid(repo, raw.tree, CONTEXT)?;
                 diff_gate(roots_equal, parent_clank, child_clank)
             };
             let changes = match gate {
@@ -376,7 +407,7 @@ impl Repo {
                         code: None,
                         stderr: format!("find_tree: {e}"),
                     })?;
-                    diff_trees_changes(&repo, parent.as_ref(), &child, CONTEXT)?
+                    diff_trees_changes(repo, parent.as_ref(), &child, CONTEXT)?
                 }
             };
             prev = Some((raw.oid, raw.tree));
@@ -388,6 +419,153 @@ impl Repo {
             });
         }
         Ok(out)
+    }
+
+    /// All commits along the first-parent chain from the root up to
+    /// HEAD, oldest-first. Used for the attribution walk. Each entry
+    /// carries the author timestamp (unix seconds) and the commit
+    /// subject (first line) via gix's `rev_walk` with
+    /// `first_parent_only`.
+    ///
+    /// We deliberately don't try to bound by an `<intro>..HEAD` range: with
+    /// multiple sessions each having their own intro, identifying the
+    /// topologically earliest plan_intro requires a separate query. Clank
+    /// repos are small enough that walking from the root is cheap and avoids
+    /// a correctness footgun.
+    /// List a single plan's strippable `.clank/` paths in the tree
+    /// at `sha`: `.clank/plans/<stem>.md` (when present) plus, when
+    /// `include_finalize` is true, every path under
+    /// `.clank/finished/<stem>/`. Sorted. Used by the single-plan
+    /// rewrite preview so classification can be tree-based instead of
+    /// diff-touch based.
+    pub fn tree_plan_paths(
+        &self,
+        sha: &CommitSha,
+        stem: &str,
+        include_finalize: bool,
+    ) -> Result<Vec<String>, GitIoError> {
+        let candidates: Vec<String> = {
+            let mut v = vec![format!(".clank/plans/{stem}.md")];
+            if include_finalize {
+                v.push(format!(".clank/finished/{stem}.md"));
+            }
+            v
+        };
+        let paths_opt: Option<Vec<String>> = (|| {
+            let oid = gix::ObjectId::from_hex(sha.as_str().as_bytes()).ok()?;
+            let tree = self.0.find_commit(oid).ok()?.tree().ok()?;
+            let mut found: Vec<String> = candidates
+                .into_iter()
+                .filter(|path| {
+                    tree.lookup_entry_by_path(path)
+                        .ok()
+                        .flatten()
+                        .filter(|e| e.mode().is_blob())
+                        .is_some()
+                })
+                .collect();
+            found.sort();
+            Some(found)
+        })();
+        Ok(paths_opt.unwrap_or_default())
+    }
+
+    /// List every blob path under `.clank/` in the tree at `sha`.
+    /// Returned sorted. Empty when the tree has no `.clank/` paths.
+    /// Used by the all-plans rewrite preview to compute strip_paths
+    /// from what's actually IN the tree, not what the commit's diff
+    /// touched — because every post-intro commit's tree inherits
+    /// `.clank/` content from its parent even when the commit's diff
+    /// didn't touch `.clank/`.
+    pub fn tree_clank_paths(&self, sha: &CommitSha) -> Result<Vec<String>, GitIoError> {
+        let paths_opt: Option<Vec<String>> = (|| {
+            let oid = gix::ObjectId::from_hex(sha.as_str().as_bytes()).ok()?;
+            let tree = self.0.find_commit(oid).ok()?.tree().ok()?;
+            let mut recorder = gix::traverse::tree::Recorder::default();
+            tree.traverse().breadthfirst(&mut recorder).ok()?;
+            let mut paths: Vec<String> = recorder
+                .records
+                .into_iter()
+                .filter(|e| e.mode.is_blob() && e.filepath.starts_with(b".clank/"))
+                .map(|e| String::from_utf8_lossy(&e.filepath).into_owned())
+                .collect();
+            paths.sort();
+            Some(paths)
+        })();
+        Ok(paths_opt.unwrap_or_default())
+    }
+
+    /// Number of parents on `sha`. Two or more = merge commit. Errors
+    /// if the repo or commit can't be opened.
+    pub fn commit_parent_count(&self, sha: &CommitSha) -> Result<usize, GitIoError> {
+        let context = format!("commit_parent_count {}", sha.as_str());
+        let oid =
+            gix::ObjectId::from_hex(sha.as_str().as_bytes()).map_err(|e| GitIoError::Parse {
+                context: context.clone(),
+                detail: format!("oid hex: {e}"),
+            })?;
+        let commit = self
+            .0
+            .find_commit(oid)
+            .map_err(|e| nonzero(context, format!("find_commit: {e}")))?;
+        Ok(commit.parent_ids().count())
+    }
+
+    /// First-parent walk pinned to a specific tip SHA. Unlike
+    /// `first_parent_commits` (which walks live HEAD), this anchors to
+    /// the caller's snapshot so the resulting range never disagrees
+    /// with a value the daemon already projected.
+    pub fn first_parent_commits_to(&self, tip: &CommitSha) -> Result<Vec<CommitMeta>, GitIoError> {
+        const CONTEXT: &str = "first_parent_commits_to";
+        let tip_oid =
+            gix::ObjectId::from_hex(tip.as_str().as_bytes()).map_err(|e| GitIoError::Parse {
+                context: CONTEXT.into(),
+                detail: format!("tip oid hex: {e}"),
+            })?;
+        first_parent_walk(&self.0, None, tip_oid, CONTEXT)
+    }
+
+    /// Structured changes for `sha` against its first parent (or the
+    /// empty tree for the root commit), translated into a
+    /// `CommitChanges`.
+    ///
+    /// gix backend via `repo.diff_tree_to_tree` with
+    /// `Rewrites::default()` (50% similarity — matches the legacy
+    /// `-M` flag). Tree-level entries are filtered out via
+    /// `EntryMode::is_no_tree()`; the legacy parser implicitly did
+    /// the same by only seeing leaf records from
+    /// `diff-tree --name-status`.
+    ///
+    /// First-parent semantics for merge commits fall out from
+    /// `parent_ids().next()` being the first parent (matches the
+    /// legacy `-m --first-parent` flag combination).
+    pub fn diff_tree_changes(&self, sha: &CommitSha) -> Result<CommitChanges, GitIoError> {
+        let context = format!("diff_tree_changes {}", sha.as_str());
+        let repo = &self.0;
+        let oid =
+            gix::ObjectId::from_hex(sha.as_str().as_bytes()).map_err(|e| GitIoError::Parse {
+                context: context.clone(),
+                detail: format!("oid hex: {e}"),
+            })?;
+        let commit = repo
+            .find_commit(oid)
+            .map_err(|e| nonzero(context.clone(), format!("find_commit: {e}")))?;
+        let this_tree = commit
+            .tree()
+            .map_err(|e| nonzero(context.clone(), format!("commit.tree: {e}")))?;
+        // First-parent semantics fall out: `parent_ids().next()` IS
+        // the first parent for merges. Root commit → no parent →
+        // diff against the empty tree (matches legacy `--root`).
+        let parent_tree_owned = match commit.parent_ids().next() {
+            Some(p) => Some(
+                repo.find_commit(p.detach())
+                    .map_err(|e| nonzero(context.clone(), format!("parent find_commit: {e}")))?
+                    .tree()
+                    .map_err(|e| nonzero(context.clone(), format!("parent tree: {e}")))?,
+            ),
+            None => None,
+        };
+        diff_trees_changes(repo, parent_tree_owned.as_ref(), &this_tree, &context)
     }
 }
 
@@ -440,16 +618,6 @@ pub fn working_tree_status(repo: &Path) -> Result<WorkingTreeStatus, GitIoError>
         untracked: w.untracked,
     })
 }
-
-/// `None` = clean. Computed in-process via gix — no `git` subprocess.
-/// One handle drives a single working-tree status walk plus the
-/// per-path line diffs (no per-read ODB re-open).
-///
-/// We never write the index back (gix only does so on an explicit
-/// `Outcome::write_changes()`), so this can't trigger the self-wake
-/// the old `--no-optional-locks` shell-out guarded against: a probe
-/// that refreshed `.git/index` would fire the very watcher that drove
-/// the probe.
 
 /// Every dirty path — tracked changes plus untracked files — sorted.
 /// Opens its own handle. For guards that show WHAT is dirty (e.g.
@@ -542,15 +710,6 @@ fn count_dirty_lines(
     }
     (insertions, deletions)
 }
-
-/// Is `rel_path`'s worktree copy dirty vs its blob at `commit`? The
-/// one definition shared by the status-derive path
-/// (`FsPlanStateLookup::worktree_status`) and the preview path. The
-/// blob is the source of truth: a worktree file that differs is
-/// `BodyDirty`; a missing worktree file whose blob exists at `commit`
-/// is `PlanFileMissing`; a path absent at `commit` is `Clean`
-/// regardless of the worktree (matching `git diff HEAD`, which ignores
-/// paths not in the commit). Reuses the [`Repo`] handle.
 
 /// `rel_path`'s blob bytes at `commit`, or `None` if the commit/path
 /// can't be resolved (absent path, bad oid, unreadable object).
@@ -666,14 +825,6 @@ pub fn commit_subject_at(repo: &Path, sha: &CommitSha) -> Result<String, GitIoEr
     open(repo)?.commit_subject(sha)
 }
 
-/// Live HEAD facts for the commit-tag invariant
-/// (`commit-tag-fixup-is-first-class-state`): HEAD's subject + the
-/// plan files its diff touched + repo adoption, packaged as a
-/// [`clank_core::wait::HeadCommit`] for `derive_status`. Returns
-/// `None` when the repo has no HEAD (fresh repo). Errors reading the
-/// subject/diff degrade to empty (no subject) / no touches — the
-/// invariant then simply finds nothing to flag, never a false alarm.
-
 /// [`Repo::head_commit`] opening its own handle.
 pub fn head_commit_at(
     repo: &Path,
@@ -681,10 +832,6 @@ pub fn head_commit_at(
 ) -> Option<clank_core::wait::HeadCommit> {
     open(repo).ok()?.head_commit(state)
 }
-
-/// The commit's body (`%b`) — everything after the subject and its
-/// blank line, or `""` if none. Replaces `git log -1 --format=%b
-/// <sha>`.
 
 /// [`Repo::commit_body`] opening its own handle.
 pub fn commit_body_at(repo: &Path, sha: &CommitSha) -> Result<String, GitIoError> {
@@ -897,133 +1044,14 @@ pub fn first_parent_commits_between(
     first_parent_walk(&repo, Some(base_oid), tip_oid, CONTEXT)
 }
 
-/// First parent of the given commit. Returns `Ok(None)` for the
-/// root commit (no parent) or when the commit / repo can't be
-/// opened (preserves the legacy shell-out's lenient semantics —
-/// missing commits map to None, not an error).
-
 /// [`Repo::parent_of`] opening its own handle.
 pub fn parent_of_at(repo: &Path, sha: &CommitSha) -> Result<Option<CommitSha>, GitIoError> {
     open(repo)?.parent_of(sha)
 }
 
-/// All commits along the first-parent chain from the root up to
-/// HEAD, oldest-first. Used for the attribution walk. Each entry
-/// carries the author timestamp (unix seconds) and the commit
-/// subject (first line) via gix's `rev_walk` with
-/// `first_parent_only`.
-///
-/// We deliberately don't try to bound by an `<intro>..HEAD` range: with
-/// multiple sessions each having their own intro, identifying the
-/// topologically earliest plan_intro requires a separate query. Clank
-/// repos are small enough that walking from the root is cheap and avoids
-/// a correctness footgun.
-/// List a single plan's strippable `.clank/` paths in the tree
-/// at `sha`: `.clank/plans/<stem>.md` (when present) plus, when
-/// `include_finalize` is true, every path under
-/// `.clank/finished/<stem>/`. Sorted. Used by the single-plan
-/// rewrite preview so classification can be tree-based instead of
-/// diff-touch based.
-pub fn tree_plan_paths(
-    repo: &Path,
-    sha: &CommitSha,
-    stem: &str,
-    include_finalize: bool,
-) -> Result<Vec<String>, GitIoError> {
-    let candidates: Vec<String> = {
-        let mut v = vec![format!(".clank/plans/{stem}.md")];
-        if include_finalize {
-            v.push(format!(".clank/finished/{stem}.md"));
-        }
-        v
-    };
-    let paths_opt: Option<Vec<String>> = (|| {
-        let repo = gix::open(repo).ok()?;
-        let oid = gix::ObjectId::from_hex(sha.as_str().as_bytes()).ok()?;
-        let tree = repo.find_commit(oid).ok()?.tree().ok()?;
-        let mut found: Vec<String> = candidates
-            .into_iter()
-            .filter(|path| {
-                tree.lookup_entry_by_path(path)
-                    .ok()
-                    .flatten()
-                    .filter(|e| e.mode().is_blob())
-                    .is_some()
-            })
-            .collect();
-        found.sort();
-        Some(found)
-    })();
-    Ok(paths_opt.unwrap_or_default())
-}
-
-/// List every blob path under `.clank/` in the tree at `sha`.
-/// Returned sorted. Empty when the tree has no `.clank/` paths.
-/// Used by the all-plans rewrite preview to compute strip_paths
-/// from what's actually IN the tree, not what the commit's diff
-/// touched — because every post-intro commit's tree inherits
-/// `.clank/` content from its parent even when the commit's diff
-/// didn't touch `.clank/`.
-pub fn tree_clank_paths(repo: &Path, sha: &CommitSha) -> Result<Vec<String>, GitIoError> {
-    let paths_opt: Option<Vec<String>> = (|| {
-        let repo = gix::open(repo).ok()?;
-        let oid = gix::ObjectId::from_hex(sha.as_str().as_bytes()).ok()?;
-        let tree = repo.find_commit(oid).ok()?.tree().ok()?;
-        let mut recorder = gix::traverse::tree::Recorder::default();
-        tree.traverse().breadthfirst(&mut recorder).ok()?;
-        let mut paths: Vec<String> = recorder
-            .records
-            .into_iter()
-            .filter(|e| e.mode.is_blob() && e.filepath.starts_with(b".clank/"))
-            .map(|e| String::from_utf8_lossy(&e.filepath).into_owned())
-            .collect();
-        paths.sort();
-        Some(paths)
-    })();
-    Ok(paths_opt.unwrap_or_default())
-}
-
-/// Number of parents on `sha`. Two or more = merge commit. Errors
-/// if the repo or commit can't be opened.
-pub fn commit_parent_count(repo: &Path, sha: &CommitSha) -> Result<usize, GitIoError> {
-    let context = format!("commit_parent_count {}", sha.as_str());
-    let repo = gix::open(repo).map_err(|e| GitIoError::NonZero {
-        context: context.clone(),
-        code: None,
-        stderr: format!("gix open: {e}"),
-    })?;
-    let oid = gix::ObjectId::from_hex(sha.as_str().as_bytes()).map_err(|e| GitIoError::Parse {
-        context: context.clone(),
-        detail: format!("oid hex: {e}"),
-    })?;
-    let commit = repo.find_commit(oid).map_err(|e| GitIoError::NonZero {
-        context,
-        code: None,
-        stderr: format!("find_commit: {e}"),
-    })?;
-    Ok(commit.parent_ids().count())
-}
-
-/// First-parent walk pinned to a specific tip SHA. Unlike
-/// `first_parent_commits` (which walks live HEAD), this anchors to
-/// the caller's snapshot so the resulting range never disagrees
-/// with a value the daemon already projected.
-pub fn first_parent_commits_to(
-    repo: &Path,
-    tip: &CommitSha,
-) -> Result<Vec<CommitMeta>, GitIoError> {
-    const CONTEXT: &str = "first_parent_commits_to";
-    let repo = gix::open(repo).map_err(|e| GitIoError::NonZero {
-        context: CONTEXT.into(),
-        code: None,
-        stderr: format!("gix open: {e}"),
-    })?;
-    let tip_oid =
-        gix::ObjectId::from_hex(tip.as_str().as_bytes()).map_err(|e| GitIoError::Parse {
-            context: CONTEXT.into(),
-            detail: format!("tip oid hex: {e}"),
-        })?;
-    first_parent_walk(&repo, None, tip_oid, CONTEXT)
+/// [`Repo::tree_clank_paths`] opening its own handle.
+pub fn tree_clank_paths_at(repo: &Path, sha: &CommitSha) -> Result<Vec<String>, GitIoError> {
+    open(repo)?.tree_clank_paths(sha)
 }
 
 pub fn first_parent_commits(repo: &Path) -> Result<Vec<CommitMeta>, GitIoError> {
@@ -1146,62 +1174,9 @@ pub fn commit_events_between_at(
     open(repo_path)?.commit_events_between(base, tip)
 }
 
-/// Structured changes for `sha` against its first parent (or the
-/// empty tree for the root commit), translated into a
-/// `CommitChanges`.
-///
-/// gix backend via `repo.diff_tree_to_tree` with
-/// `Rewrites::default()` (50% similarity — matches the legacy
-/// `-M` flag). Tree-level entries are filtered out via
-/// `EntryMode::is_no_tree()`; the legacy parser implicitly did
-/// the same by only seeing leaf records from
-/// `diff-tree --name-status`.
-///
-/// First-parent semantics for merge commits fall out from
-/// `parent_ids().next()` being the first parent (matches the
-/// legacy `-m --first-parent` flag combination).
-pub fn diff_tree_changes(repo: &Path, sha: &CommitSha) -> Result<CommitChanges, GitIoError> {
-    let context = format!("diff_tree_changes {}", sha.as_str());
-    let repo = gix::open(repo).map_err(|e| GitIoError::NonZero {
-        context: context.clone(),
-        code: None,
-        stderr: format!("gix open: {e}"),
-    })?;
-    let oid = gix::ObjectId::from_hex(sha.as_str().as_bytes()).map_err(|e| GitIoError::Parse {
-        context: context.clone(),
-        detail: format!("oid hex: {e}"),
-    })?;
-    let commit = repo.find_commit(oid).map_err(|e| GitIoError::NonZero {
-        context: context.clone(),
-        code: None,
-        stderr: format!("find_commit: {e}"),
-    })?;
-    let this_tree = commit.tree().map_err(|e| GitIoError::NonZero {
-        context: context.clone(),
-        code: None,
-        stderr: format!("commit.tree: {e}"),
-    })?;
-    // First-parent semantics fall out: `parent_ids().next()` IS
-    // the first parent for merges. Root commit → no parent →
-    // diff against the empty tree (matches legacy `--root`).
-    let parent_tree_owned = match commit.parent_ids().next() {
-        Some(p) => Some(
-            repo.find_commit(p.detach())
-                .map_err(|e| GitIoError::NonZero {
-                    context: context.clone(),
-                    code: None,
-                    stderr: format!("parent find_commit: {e}"),
-                })?
-                .tree()
-                .map_err(|e| GitIoError::NonZero {
-                    context: context.clone(),
-                    code: None,
-                    stderr: format!("parent tree: {e}"),
-                })?,
-        ),
-        None => None,
-    };
-    diff_trees_changes(&repo, parent_tree_owned.as_ref(), &this_tree, &context)
+/// [`Repo::diff_tree_changes`] opening its own handle.
+pub fn diff_tree_changes_at(repo: &Path, sha: &CommitSha) -> Result<CommitChanges, GitIoError> {
+    open(repo)?.diff_tree_changes(sha)
 }
 
 /// Recursive rename-tracking diff of two trees → `CommitChanges`.
@@ -2113,11 +2088,12 @@ mod tests {
         }
 
         fn legacy_events(repo: &Path, tip: &CommitSha) -> Vec<CommitEvent> {
-            first_parent_commits_to(repo, tip)
+            let git = open(repo).unwrap();
+            git.first_parent_commits_to(tip)
                 .unwrap()
                 .into_iter()
                 .map(|meta| CommitEvent {
-                    changes: diff_tree_changes(repo, &meta.sha).unwrap(),
+                    changes: git.diff_tree_changes(&meta.sha).unwrap(),
                     commit: meta.sha,
                     author_ts: meta.author_ts,
                     subject: meta.subject,

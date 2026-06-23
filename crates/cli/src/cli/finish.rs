@@ -337,7 +337,7 @@ fn head_is_finalize_for(repo: &Path, stem: &str) -> anyhow::Result<bool> {
         return Ok(false);
     };
     let finished_path = format!(".clank/finished/{stem}.md");
-    Ok(crate::git_io::diff_tree_changes(repo, &head)
+    Ok(crate::git_io::diff_tree_changes_at(repo, &head)
         .map(|c| c.clank_paths_touched.contains(&finished_path))
         .unwrap_or(false))
 }

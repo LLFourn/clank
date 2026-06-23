@@ -219,14 +219,14 @@ pub(crate) fn build_amend_program(
             let s = k.as_str();
             let plan_p = format!(".clank/plans/{s}.md");
             let finished_p = format!(".clank/finished/{s}.md");
-            crate::git_io::tree_clank_paths(repo, &head)
+            crate::git_io::tree_clank_paths_at(repo, &head)
                 .unwrap_or_default()
                 .into_iter()
                 .filter(|p| *p == plan_p || *p == finished_p)
                 .collect()
         }
         // Whole-repo amend: every `.clank/` path in HEAD's tree.
-        None => crate::git_io::tree_clank_paths(repo, &head).unwrap_or_default(),
+        None => crate::git_io::tree_clank_paths_at(repo, &head).unwrap_or_default(),
     };
 
     Ok(AmendProgram {
