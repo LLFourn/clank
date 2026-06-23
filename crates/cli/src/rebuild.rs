@@ -112,8 +112,7 @@ fn fold_events(
         log_events.extend(apply_commit(state, &event));
         depth += 1;
         state.head = Some(sha);
-        if checkpoint
-            && clank_core::checkpoint::should_checkpoint(tip_depth.saturating_sub(depth))
+        if checkpoint && clank_core::checkpoint::should_checkpoint(tip_depth.saturating_sub(depth))
         {
             match state_cache::write(repo_root, state, depth) {
                 Ok(()) => {}

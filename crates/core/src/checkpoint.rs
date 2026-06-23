@@ -78,8 +78,8 @@ mod tests {
         // distance_from_tip → decision. Canonical = {0, 1, 2, 4, 8, …};
         // tip-3 is NOT written (prune would evict it — the storm).
         let cases = [
-            (0, true),  // tip
-            (1, true),  // tip's parent
+            (0, true), // tip
+            (1, true), // tip's parent
             (2, true),
             (3, false), // the regression: was written, prune deleted it
             (4, true),
@@ -127,7 +127,9 @@ mod tests {
     #[test]
     fn fold_then_prune_is_a_fixed_point() {
         for n in [1u64, 2, 3, 4, 5, 8, 13, 100, 1_000, 9_999] {
-            let written: Vec<u64> = (1..=n).filter(|&depth| should_checkpoint(n - depth)).collect();
+            let written: Vec<u64> = (1..=n)
+                .filter(|&depth| should_checkpoint(n - depth))
+                .collect();
             assert_eq!(
                 prune_plan(&written, n),
                 Vec::<u64>::new(),
