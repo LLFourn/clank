@@ -257,34 +257,15 @@ pub async fn run(args: WaitArgs) -> anyhow::Result<()> {
                 Vec::new()
             }
         };
-        // Scan to the first queue item NOT suppressed by a plan-scoped
-        // block. A block on the top-priority queued plan must not hide
-        // lower-priority unblocked items — that would defeat the
-        // queue. Repo-wide blocks short-circuit upstream
-        // (`initial_suppress_all`) and don't reach this branch.
-        let first_unsuppressed = queue.iter().find(|q| {
-            !initial_suppressed_plans
-                .iter()
-                .any(|k| k.as_str() == q.name)
-        });
-        if let Some(first) = first_unsuppressed {
-            let mut items = initial_block_items.clone();
-            items.push(WaitItem::PromoteFromQueue {
-                name: first.name.clone(),
-                priority: first.priority,
-            });
+        // Promote the first unsuppressed queued item (+ any Blocked
+        // context). If every queued item is suppressed by a pending
+        // plan-scoped block, the outcome is Blocked-only — NOT
+        // wake-worthy — so we PARK rather than return on a
+        // non-actionable human block (wait-ignores-queue-only-blocks).
+        // Repo-wide blocks short-circuit upstream (`initial_suppress_all`).
+        let items = queue_promote_outcome(&initial_block_items, &initial_suppressed_plans, &queue);
+        if wake_worthy(&items) {
             emit(&items, args.json);
-            return Ok(());
-        }
-        // Codex 62f22c2: when the queue is non-empty but every item
-        // is suppressed by a plan-scoped block, we still emit the
-        // Blocked items so the agent sees what's holding the queue.
-        // (Empty-queue + plan-blocked behavior unchanged from today
-        // — wait parks. The change is scoped to "queue had items we
-        // filtered out," matching the acceptance "plan-scoped blocks
-        // continue to emit alongside the now-filtered promote scan.")
-        if !queue.is_empty() && !initial_block_items.is_empty() {
-            emit(&initial_block_items, args.json);
             return Ok(());
         }
         hook_config::run_idle_hook(&repo, &hook_config);
@@ -405,27 +386,14 @@ pub async fn run(args: WaitArgs) -> anyhow::Result<()> {
                         Vec::new()
                     }
                 };
-                // Same scan-to-first-unsuppressed semantic as the
-                // initial promote site above. Blocks on the top
-                // priority queued plan must not hide lower-priority
-                // unblocked items.
-                let first_unsuppressed = queue
-                    .iter()
-                    .find(|q| !br.suppressed_plans.iter().any(|k| k.as_str() == q.name));
-                if let Some(first) = first_unsuppressed {
-                    let mut items = br.items.clone();
-                    items.push(WaitItem::PromoteFromQueue {
-                        name: first.name.clone(),
-                        priority: first.priority,
-                    });
+                // Same single-sourced rule as the initial pass: promote
+                // the first unsuppressed queued item (+ Blocked context),
+                // but PARK on Blocked-only (all queued items suppressed)
+                // rather than waking on a non-actionable human block
+                // (wait-ignores-queue-only-blocks).
+                let items = queue_promote_outcome(&br.items, &br.suppressed_plans, &queue);
+                if wake_worthy(&items) {
                     emit(&items, args.json);
-                    return Ok(());
-                }
-                // Codex 62f22c2: queue had items but every one was
-                // suppressed — surface the Blocked items so the agent
-                // sees the holding cause. Empty-queue path unchanged.
-                if !queue.is_empty() && !br.items.is_empty() {
-                    emit(&br.items, args.json);
                     return Ok(());
                 }
             }
@@ -487,6 +455,44 @@ fn check_blocks(repo: &Path, author: &AgentLabel) -> BlockResult {
     }
 
     result
+}
+
+/// A pending human `Block` is attachable CONTEXT — co-surfaced beside
+/// real work — but NEVER wake-worthy on its own. A wait result is
+/// wake-worthy iff it carries at least one non-`Blocked` item
+/// (actionable Master/Reviewer work, `PromoteFromQueue`, `Unblocked`,
+/// `Finished`, a commit-tag fix, …). Returning on `Blocked`-alone wakes
+/// an agent that has nothing to do and churns the stop-hook / wait loop
+/// on a non-actionable condition (wait-ignores-queue-only-blocks) — the
+/// caller PARKS instead. Single source so neither the initial pass nor
+/// the watch-loop pass can re-introduce the emit-on-Blocked bug.
+fn wake_worthy(items: &[WaitItem]) -> bool {
+    items.iter().any(|i| !matches!(i, WaitItem::Blocked { .. }))
+}
+
+/// The master-with-no-actionable-active-work outcome: any pending-Blocked
+/// context, plus a `PromoteFromQueue` for the first queue item NOT
+/// suppressed by a plan-scoped block (a block on the top queued item
+/// must not hide a lower-priority unblocked one). If EVERY queued item
+/// is suppressed — or the queue is empty — the result is Blocked-only
+/// (or empty), which [`wake_worthy`] rejects, so the caller parks.
+/// Shared by both the initial pass and the watch-loop pass.
+fn queue_promote_outcome(
+    block_items: &[WaitItem],
+    suppressed_plans: &std::collections::BTreeSet<PlanKey>,
+    queue: &[crate::cli::queue::QueueEntry],
+) -> Vec<WaitItem> {
+    let mut items = block_items.to_vec();
+    if let Some(first) = queue
+        .iter()
+        .find(|q| !suppressed_plans.iter().any(|k| k.as_str() == q.name))
+    {
+        items.push(WaitItem::PromoteFromQueue {
+            name: first.name.clone(),
+            priority: first.priority,
+        });
+    }
+    items
 }
 
 /// `clank wait --json` envelope. The stop-hook parses this; the
@@ -901,6 +907,95 @@ mod tests {
     fn parse_timeout_rejects_garbage() {
         assert!(parse_timeout("abc").is_err());
         assert!(parse_timeout("5x").is_err());
+    }
+
+    // ── wait-ignores-queue-only-blocks ─────────────────────────
+    // A pending human Block is attachable context, never wake-worthy
+    // alone: Blocked-only parks (times out), but a block must not hide
+    // a lower-priority unblocked queue item.
+
+    fn blocked(name: &str, plan: Option<&str>) -> WaitItem {
+        WaitItem::Blocked {
+            agent: "claude".into(),
+            name: name.into(),
+            plan: plan.map(Into::into),
+            question: "?".into(),
+        }
+    }
+
+    fn qentry(name: &str, priority: u16) -> crate::cli::queue::QueueEntry {
+        crate::cli::queue::QueueEntry {
+            priority,
+            name: name.into(),
+            path: std::path::PathBuf::new(),
+        }
+    }
+
+    fn suppressed(names: &[&str]) -> std::collections::BTreeSet<PlanKey> {
+        names.iter().map(|n| PlanKey::parse(n).unwrap()).collect()
+    }
+
+    #[test]
+    fn wake_worthy_rejects_blocked_alone_and_empty() {
+        assert!(!wake_worthy(&[]), "empty is not wake-worthy");
+        assert!(
+            !wake_worthy(&[blocked("d", Some("p"))]),
+            "a pending Block alone must not wake"
+        );
+        // Anything non-Blocked alongside makes it wake-worthy.
+        assert!(wake_worthy(&[
+            blocked("d", Some("p")),
+            WaitItem::PromoteFromQueue {
+                name: "x".into(),
+                priority: 1
+            },
+        ]));
+        assert!(wake_worthy(&[WaitItem::Unblocked {
+            name: "d".into(),
+            plan: Some("p".into()),
+            answer: "go".into(),
+        }]));
+    }
+
+    #[test]
+    fn queue_only_block_parks_does_not_wake() {
+        // The Frostsnap repro: one queued plan (`simctl-up`), one
+        // pending block scoped to it → every queued item suppressed →
+        // Blocked-only → caller parks (wait times out).
+        let items = queue_promote_outcome(
+            &[blocked("simctl-up-design-decisions", Some("simctl-up"))],
+            &suppressed(&["simctl-up"]),
+            &[qentry("simctl-up", 500)],
+        );
+        assert!(
+            !wake_worthy(&items),
+            "queue-only pending block must park, got {items:?}"
+        );
+    }
+
+    #[test]
+    fn block_on_top_queue_item_still_promotes_lower_unblocked() {
+        // First queued plan blocked, second unblocked → promote the
+        // second (a block must not hide lower-priority work).
+        let items = queue_promote_outcome(
+            &[blocked("d", Some("blocked-plan"))],
+            &suppressed(&["blocked-plan"]),
+            &[qentry("blocked-plan", 400), qentry("free-plan", 500)],
+        );
+        assert!(wake_worthy(&items));
+        assert!(
+            items.iter().any(|i| matches!(
+                i,
+                WaitItem::PromoteFromQueue { name, .. } if name == "free-plan"
+            )),
+            "lower-priority unblocked item must promote, got {items:?}"
+        );
+    }
+
+    #[test]
+    fn empty_queue_with_no_blocks_parks() {
+        let items = queue_promote_outcome(&[], &suppressed(&[]), &[]);
+        assert!(!wake_worthy(&items));
     }
 
     // ── commit-tag-fixup-is-first-class-state ──────────────────
