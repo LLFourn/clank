@@ -193,7 +193,7 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
             // yields the correction and work_for routes master to the
             // FixCommitTag item / withholds reviewer wakes — no bespoke
             // side-check.
-            let head = crate::git_io::head_commit(&repo, &initial_state);
+            let head = crate::git_io::head_commit_at(&repo, &initial_state);
             let status = initial_state
                 .fold
                 .derive_status(&reviews, &work_policy, head.as_ref());
@@ -354,7 +354,7 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
             let reviews =
                 crate::fs_plan_state_lookup::FsPlanStateLookup::new(&repo, state.head.as_ref());
             // Commit-tag correction is derived (see initial-pass note).
-            let head = crate::git_io::head_commit(&repo, &state);
+            let head = crate::git_io::head_commit_at(&repo, &state);
             let status = state
                 .fold
                 .derive_status(&reviews, &work_policy, head.as_ref());

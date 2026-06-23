@@ -553,11 +553,11 @@ fn parent_of(repo: &Path, sha: &str) -> anyhow::Result<Option<String>> {
     let sha = CommitSha::parse(sha).map_err(|e| anyhow::anyhow!("parse sha `{sha}`: {e}"))?;
     // `git_io::parent_of` returns `None` for a root commit, matching
     // the old `rev-parse <sha>^` failure.
-    Ok(crate::git_io::parent_of(repo, &sha)?.map(|p| p.as_str().to_string()))
+    Ok(crate::git_io::parent_of_at(repo, &sha)?.map(|p| p.as_str().to_string()))
 }
 
 fn current_branch(repo: &Path) -> anyhow::Result<String> {
-    crate::git_io::current_branch(repo)?
+    crate::git_io::current_branch_at(repo)?
         .ok_or_else(|| anyhow::anyhow!("HEAD is detached; cannot determine the branch to rewrite"))
 }
 

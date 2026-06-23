@@ -397,49 +397,45 @@ pub fn resolve_commit(repo: &Path, rev: &str) -> Option<CommitSha> {
     CommitSha::parse(&id.detach().to_string()).ok()
 }
 
-/// The short name of the branch HEAD points to (e.g. `master`), or
-/// `None` when HEAD is detached or unborn. Replaces
-/// `git symbolic-ref --short HEAD` (which exits non-zero when
-/// detached — callers map `None` to their own fallback/error).
-pub fn current_branch(repo: &Path) -> Result<Option<String>, GitIoError> {
-    let r = gix::open(repo).map_err(|e| GitIoError::NonZero {
-        context: "current_branch".into(),
-        code: None,
-        stderr: format!("open: {e}"),
-    })?;
-    match r.head_name() {
-        Ok(opt) => Ok(opt.map(|name| name.shorten().to_string())),
-        Err(e) => Err(GitIoError::NonZero {
-            context: "current_branch".into(),
-            code: None,
-            stderr: format!("head_name: {e}"),
-        }),
+impl Repo {
+    /// The short name of the branch HEAD points to (e.g. `master`), or
+    /// `None` when HEAD is detached or unborn. Replaces
+    /// `git symbolic-ref --short HEAD` (which exits non-zero when
+    /// detached — callers map `None` to their own fallback/error).
+    pub fn current_branch(&self) -> Result<Option<String>, GitIoError> {
+        match self.0.head_name() {
+            Ok(opt) => Ok(opt.map(|name| name.shorten().to_string())),
+            Err(e) => Err(nonzero("current_branch", format!("head_name: {e}"))),
+        }
+    }
+
+    /// The commit's subject line — gix `summary()`, matching git's `%s`
+    /// subject folding. Replaces `git log -1 --format=%s <sha>`.
+    pub fn commit_subject(&self, sha: &CommitSha) -> Result<String, GitIoError> {
+        let oid =
+            gix::ObjectId::from_hex(sha.as_str().as_bytes()).map_err(|e| GitIoError::Parse {
+                context: "commit_subject".into(),
+                detail: format!("oid hex: {e}"),
+            })?;
+        let commit = self
+            .0
+            .find_commit(oid)
+            .map_err(|e| nonzero("commit_subject", format!("find_commit: {e}")))?;
+        let msg = commit
+            .message()
+            .map_err(|e| nonzero("commit_subject", format!("message: {e}")))?;
+        Ok(msg.summary().to_string())
     }
 }
 
-/// The commit's subject line — gix `summary()`, matching git's `%s`
-/// subject folding. Replaces `git log -1 --format=%s <sha>`.
-pub fn commit_subject(repo: &Path, sha: &CommitSha) -> Result<String, GitIoError> {
-    let r = gix::open(repo).map_err(|e| GitIoError::NonZero {
-        context: "commit_subject".into(),
-        code: None,
-        stderr: format!("open: {e}"),
-    })?;
-    let oid = gix::ObjectId::from_hex(sha.as_str().as_bytes()).map_err(|e| GitIoError::Parse {
-        context: "commit_subject".into(),
-        detail: format!("oid hex: {e}"),
-    })?;
-    let commit = r.find_commit(oid).map_err(|e| GitIoError::NonZero {
-        context: "commit_subject".into(),
-        code: None,
-        stderr: format!("find_commit: {e}"),
-    })?;
-    let msg = commit.message().map_err(|e| GitIoError::NonZero {
-        context: "commit_subject".into(),
-        code: None,
-        stderr: format!("message: {e}"),
-    })?;
-    Ok(msg.summary().to_string())
+/// [`Repo::current_branch`] opening its own handle.
+pub fn current_branch_at(repo: &Path) -> Result<Option<String>, GitIoError> {
+    open(repo)?.current_branch()
+}
+
+/// [`Repo::commit_subject`] opening its own handle.
+pub fn commit_subject_at(repo: &Path, sha: &CommitSha) -> Result<String, GitIoError> {
+    open(repo)?.commit_subject(sha)
 }
 
 /// Live HEAD facts for the commit-tag invariant
@@ -449,30 +445,41 @@ pub fn commit_subject(repo: &Path, sha: &CommitSha) -> Result<String, GitIoError
 /// `None` when the repo has no HEAD (fresh repo). Errors reading the
 /// subject/diff degrade to empty (no subject) / no touches — the
 /// invariant then simply finds nothing to flag, never a false alarm.
-pub fn head_commit(
+impl Repo {
+    pub fn head_commit(
+        &self,
+        state: &crate::repo_state::RepoState,
+    ) -> Option<clank_core::wait::HeadCommit> {
+        let head = state.head.as_ref()?;
+        let subject = self.commit_subject(head).unwrap_or_default();
+        let from = self.parent_of(head).ok().flatten();
+        let touched = self
+            .commit_events_between(from.as_ref(), head)
+            .ok()
+            .and_then(|evs| evs.into_iter().last())
+            .map(|ev| {
+                ev.changes
+                    .plan_touches
+                    .into_iter()
+                    .map(|t| t.plan)
+                    .collect()
+            })
+            .unwrap_or_default();
+        Some(clank_core::wait::HeadCommit {
+            sha: head.clone(),
+            subject,
+            touched,
+            adopted: state.fold.adopted,
+        })
+    }
+}
+
+/// [`Repo::head_commit`] opening its own handle.
+pub fn head_commit_at(
     repo: &Path,
     state: &crate::repo_state::RepoState,
 ) -> Option<clank_core::wait::HeadCommit> {
-    let head = state.head.as_ref()?;
-    let subject = commit_subject(repo, head).unwrap_or_default();
-    let from = parent_of(repo, head).ok().flatten();
-    let touched = commit_events_between_at(repo, from.as_ref(), head)
-        .ok()
-        .and_then(|evs| evs.into_iter().last())
-        .map(|ev| {
-            ev.changes
-                .plan_touches
-                .into_iter()
-                .map(|t| t.plan)
-                .collect()
-        })
-        .unwrap_or_default();
-    Some(clank_core::wait::HeadCommit {
-        sha: head.clone(),
-        subject,
-        touched,
-        adopted: state.fold.adopted,
-    })
+    open(repo).ok()?.head_commit(state)
 }
 
 /// The commit's body (`%b`) — everything after the subject and its
@@ -711,17 +718,23 @@ pub fn first_parent_commits_between(
 /// root commit (no parent) or when the commit / repo can't be
 /// opened (preserves the legacy shell-out's lenient semantics —
 /// missing commits map to None, not an error).
-pub fn parent_of(repo: &Path, sha: &CommitSha) -> Result<Option<CommitSha>, GitIoError> {
-    let parent_opt: Option<gix::ObjectId> = (|| {
-        let repo = gix::open(repo).ok()?;
-        let oid = gix::ObjectId::from_hex(sha.as_str().as_bytes()).ok()?;
-        let commit = repo.find_commit(oid).ok()?;
-        commit.parent_ids().next().map(|id| id.detach())
-    })();
-    match parent_opt {
-        None => Ok(None),
-        Some(oid) => Ok(Some(parse_sha("parent_of", &oid.to_string())?)),
+impl Repo {
+    pub fn parent_of(&self, sha: &CommitSha) -> Result<Option<CommitSha>, GitIoError> {
+        let parent_opt: Option<gix::ObjectId> = (|| {
+            let oid = gix::ObjectId::from_hex(sha.as_str().as_bytes()).ok()?;
+            let commit = self.0.find_commit(oid).ok()?;
+            commit.parent_ids().next().map(|id| id.detach())
+        })();
+        match parent_opt {
+            None => Ok(None),
+            Some(oid) => Ok(Some(parse_sha("parent_of", &oid.to_string())?)),
+        }
     }
+}
+
+/// [`Repo::parent_of`] opening its own handle.
+pub fn parent_of_at(repo: &Path, sha: &CommitSha) -> Result<Option<CommitSha>, GitIoError> {
+    open(repo)?.parent_of(sha)
 }
 
 /// All commits along the first-parent chain from the root up to
@@ -1943,7 +1956,7 @@ mod tests {
         );
 
         let head = rev_parse_head(r).unwrap().unwrap();
-        assert_eq!(commit_subject(r, &head).unwrap(), "the subject");
+        assert_eq!(commit_subject_at(r, &head).unwrap(), "the subject");
         assert_eq!(commit_body(r, &head).unwrap().trim(), "line 1\nline 2");
     }
 
@@ -1971,12 +1984,12 @@ mod tests {
         git(r, &["add", "-A"]);
         git(r, &["commit", "--quiet", "-m", "c"]);
 
-        assert_eq!(current_branch(r).unwrap().as_deref(), Some("main"));
+        assert_eq!(current_branch_at(r).unwrap().as_deref(), Some("main"));
 
         // Detached HEAD → None (the old `symbolic-ref` exited non-zero).
         let head = rev_parse_head(r).unwrap().unwrap();
         git(r, &["checkout", "--quiet", head.as_str()]);
-        assert_eq!(current_branch(r).unwrap(), None);
+        assert_eq!(current_branch_at(r).unwrap(), None);
     }
 
     #[test]

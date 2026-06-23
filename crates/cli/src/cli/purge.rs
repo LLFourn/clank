@@ -303,7 +303,7 @@ async fn run_amend(repo: &std::path::Path, basename: &str, args: &PurgeArgs) -> 
     if !args.allow_rewrite_protected {
         // Detached HEAD → no branch name → not protected-by-name
         // (matches the old empty `symbolic-ref` output).
-        let branch = crate::git_io::current_branch(repo)
+        let branch = crate::git_io::current_branch_at(repo)
             .ok()
             .flatten()
             .unwrap_or_default();

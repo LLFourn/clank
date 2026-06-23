@@ -1345,7 +1345,7 @@ fn head_sha(repo: &Path) -> anyhow::Result<Option<CommitSha>> {
 }
 
 fn commit_subject(repo: &Path, sha: &CommitSha) -> String {
-    crate::git_io::commit_subject(repo, sha)
+    crate::git_io::commit_subject_at(repo, sha)
         .map(|s| s.trim().to_string())
         .unwrap_or_default()
 }

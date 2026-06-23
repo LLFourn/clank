@@ -205,12 +205,13 @@ impl StatusSnapshot {
         watch_mode: bool,
         log_rows: Vec<crate::cli::log::OnelineRow>,
     ) -> anyhow::Result<Self> {
-        let (branch, head_sha, head_subject) = head_info(repo);
-        // One ODB handle for the whole snapshot: the dirty walk and
-        // every per-plan worktree diff share it (no per-read/per-plan
-        // re-open). Opaque `git_io::Repo` so this stays off the gix
-        // boundary (gix-not-git-gate).
+        // One ODB handle for the whole snapshot: HEAD facts, the dirty
+        // walk, the commit-tag HEAD read, and every per-plan worktree
+        // diff share it (no per-read/per-plan re-open). Opaque
+        // `git_io::Repo` so this stays off the gix boundary
+        // (gix-not-git-gate).
         let git = crate::git_io::open(repo)?;
+        let (branch, head_sha, head_subject) = head_info(&git);
         let dirty = git.working_tree_dirty()?;
 
         let config = crate::cli::config::load_with_home(repo, home);
@@ -254,7 +255,7 @@ impl StatusSnapshot {
         // HEAD facts feed the commit-tag invariant
         // (commit-tag-fixup-is-first-class-state): a violation renders
         // as the dominating `MasterToFixCommitTag` correction.
-        let head = crate::git_io::head_commit(repo, state);
+        let head = git.head_commit(state);
         let work_status = state
             .fold
             .derive_status(&reviews, &work_policy, head.as_ref());
@@ -1074,13 +1075,11 @@ pub(crate) fn short_sha(s: &str) -> &str {
     &s[..s.len().min(7)]
 }
 
-fn head_info(repo: &Path) -> (Option<String>, Option<String>, Option<String>) {
-    let branch = crate::git_io::current_branch(repo).ok().flatten();
-    let head = crate::git_io::rev_parse_head(repo).ok().flatten();
+fn head_info(git: &crate::git_io::Repo) -> (Option<String>, Option<String>, Option<String>) {
+    let branch = git.current_branch().ok().flatten();
+    let head = git.head_sha().ok().flatten();
     let sha = head.as_ref().map(|s| s.as_str().to_string());
-    let subject = head
-        .as_ref()
-        .and_then(|s| crate::git_io::commit_subject(repo, s).ok());
+    let subject = head.as_ref().and_then(|s| git.commit_subject(s).ok());
     (branch, sha, subject)
 }
 

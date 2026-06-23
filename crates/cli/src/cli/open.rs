@@ -491,7 +491,7 @@ fn probe_git(path: &Path) -> Option<GitProbe> {
 
 fn head_branch_info(path: &Path) -> (Option<String>, bool) {
     // (branch, detached). Detached/unborn/unresolvable → no branch.
-    match crate::git_io::current_branch(path).ok().flatten() {
+    match crate::git_io::current_branch_at(path).ok().flatten() {
         Some(branch) => (Some(branch), false),
         None => (None, true),
     }
@@ -678,7 +678,7 @@ async fn fold_summary(
     };
     let reviews =
         crate::fs_plan_state_lookup::FsPlanStateLookup::new(repo_root, state.head.as_ref());
-    let head = crate::git_io::head_commit(repo_root, &state);
+    let head = crate::git_io::head_commit_at(repo_root, &state);
     let work_status = state
         .fold
         .derive_status(&reviews, &work_policy, head.as_ref());
