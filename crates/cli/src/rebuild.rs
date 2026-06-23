@@ -91,43 +91,75 @@ fn find_base_checkpoint(
     }
 }
 
-/// Apply `events` to `state` oldest-first, persisting spaced
-/// checkpoints along the way when `checkpoint` is true.
+/// A checkpoint a fold PROPOSES persisting: the folded [`RepoState`]
+/// at `depth`. [`fold_events`] returns these; the caller writes them
+/// ([`persist_checkpoints`]) or drops them.
+struct PendingCheckpoint {
+    depth: u64,
+    state: RepoState,
+}
+
+/// What a fold produced: the log events, plus the policy-spaced
+/// checkpoints it PROPOSES persisting.
+struct FoldOutput {
+    log_events: Vec<LogEvent>,
+    checkpoints: Vec<PendingCheckpoint>,
+}
+
+/// Apply `events` to `state` oldest-first. PURE — touches no disk.
+/// Returns the log events AND the policy-spaced checkpoints the fold
+/// proposes (one snapshot per `should_checkpoint` depth). The CALLER
+/// decides whether to persist them ([`persist_checkpoints`]) or drop
+/// them, so every cache write is explicit at a call site rather than a
+/// side effect hidden inside the fold.
 ///
-/// `base_depth` is `state`'s depth before the first event;
-/// `tip_depth` is the depth of the overall fold target — greater
-/// than `base_depth + events.len()` when a later phase continues
-/// the same fold, so spacing is computed against the real tip.
-/// Returns the log events the fold emitted.
+/// `base_depth` is `state`'s depth before the first event; `tip_depth`
+/// is the depth of the overall fold target — greater than `base_depth
+/// + events.len()` when a later phase continues the same fold, so
+/// spacing is computed against the real tip.
 fn fold_events(
-    repo_root: &Path,
     state: &mut RepoState,
     events: Vec<crate::disk_snapshot::CommitEvent>,
     base_depth: u64,
     tip_depth: u64,
-    checkpoint: bool,
-) -> Vec<LogEvent> {
+) -> FoldOutput {
     let mut log_events = Vec::new();
+    let mut checkpoints = Vec::new();
     let mut depth = base_depth;
     for event in events {
         let sha = event.commit.clone();
         log_events.extend(apply_commit(state, &event));
         depth += 1;
         state.head = Some(sha);
-        if checkpoint && clank_core::checkpoint::should_checkpoint(tip_depth.saturating_sub(depth))
-        {
-            match state_cache::write(repo_root, state, depth) {
-                Ok(()) => {}
-                Err(e) => tracing::warn!(
-                    repo = %repo_root.display(),
-                    depth,
-                    error = ?e,
-                    "checkpoint write failed",
-                ),
-            }
+        if clank_core::checkpoint::should_checkpoint(tip_depth.saturating_sub(depth)) {
+            checkpoints.push(PendingCheckpoint {
+                depth,
+                state: state.clone(),
+            });
         }
     }
-    log_events
+    FoldOutput {
+        log_events,
+        checkpoints,
+    }
+}
+
+/// Write a fold's proposed checkpoints — the explicit counterpart to
+/// [`fold_events`]' pure proposal. Only deliberate rebuilds call this;
+/// the render path drops the proposals so it can't touch the cache.
+/// (`state_cache::write` is itself idempotent: an existing checkpoint
+/// file is left in place.)
+fn persist_checkpoints(repo_root: &Path, checkpoints: &[PendingCheckpoint]) {
+    for cp in checkpoints {
+        if let Err(e) = state_cache::write(repo_root, &cp.state, cp.depth) {
+            tracing::warn!(
+                repo = %repo_root.display(),
+                depth = cp.depth,
+                error = ?e,
+                "checkpoint write failed",
+            );
+        }
+    }
 }
 
 /// Thin checkpoints to the spacing policy relative to `tip_depth`,
@@ -184,8 +216,8 @@ pub async fn rebuild_from(
 
     // Two phases: a SILENT fold from the resume base up through `from`
     // to rebuild context (events discarded), then a COLLECTING fold of
-    // `(from, to]`. Depths feed fold_events' shared signature but are
-    // inert here — this render path never checkpoints.
+    // `(from, to]`. fold_events proposes checkpoints; this render path
+    // DROPS them — only a deliberate rebuild writes the cache.
     let silent_target = from.cloned();
     let phase1 = match silent_target.as_ref() {
         Some(target) => git.commit_events_between(state.head.as_ref(), target)?,
@@ -196,19 +228,18 @@ pub async fn rebuild_from(
     let mid_depth = base_depth + phase1.len() as u64;
     let tip_depth = mid_depth + phase2.len() as u64;
 
-    // Phase 1 (silent): fold through `from` to build context;
-    // events discarded. checkpoint=false — read-only render path.
-    let _ = fold_events(repo_root, &mut state, phase1, base_depth, tip_depth, false);
+    // Phase 1 (silent): build context up to `from`; events AND proposed
+    // checkpoints discarded.
+    let _ = fold_events(&mut state, phase1, base_depth, tip_depth);
     if let Some(target) = silent_target {
         state.head = Some(target);
     }
 
-    // Phase 2 (collecting): fold `(from, to]`, still read-only.
-    let log_events = fold_events(repo_root, &mut state, phase2, mid_depth, tip_depth, false);
+    // Phase 2 (collecting): keep the log events, drop the checkpoints —
+    // the render never writes or prunes the cache.
+    let FoldOutput { log_events, .. } = fold_events(&mut state, phase2, mid_depth, tip_depth);
     state.head = Some(to.clone());
 
-    // No checkpoint write, no prune: the cache is owned by
-    // rebuild_with_diagnostics, not the render.
     Ok((state, log_events))
 }
 
@@ -248,11 +279,14 @@ pub async fn rebuild_with_diagnostics(
         if cp.sha == h {
             return Ok((state, RebuildDiagnostics { cache_hit: true }));
         }
-        // Fold-forward from the checkpoint to HEAD.
+        // Fold-forward from the checkpoint to HEAD. We are in the
+        // CachePolicy::Use branch, so persist the proposed checkpoints
+        // and prune — this is the deliberate rebuild that owns the cache.
         match git.commit_events_between(Some(&cp.sha), &h) {
             Ok(events) => {
                 let tip_depth = cp.depth + events.len() as u64;
-                let _ = fold_events(repo_root, &mut state, events, cp.depth, tip_depth, true);
+                let folded = fold_events(&mut state, events, cp.depth, tip_depth);
+                persist_checkpoints(repo_root, &folded.checkpoints);
                 state.head = Some(h.clone());
                 prune_checkpoints(repo_root, tip_depth);
                 return Ok((state, RebuildDiagnostics { cache_hit: true }));
@@ -273,10 +307,11 @@ pub async fn rebuild_with_diagnostics(
     let events = git.commit_events_between(None, &h)?;
     let tip_depth = events.len() as u64;
     let mut state = RepoState::empty(repo_root.to_path_buf());
-    let checkpoint = policy == CachePolicy::Use;
-    let _ = fold_events(repo_root, &mut state, events, 0, tip_depth, checkpoint);
+    let folded = fold_events(&mut state, events, 0, tip_depth);
     state.head = Some(h);
-    if checkpoint {
+    // CachePolicy::Bypass folds without touching the cache.
+    if policy == CachePolicy::Use {
+        persist_checkpoints(repo_root, &folded.checkpoints);
         prune_checkpoints(repo_root, tip_depth);
     }
 

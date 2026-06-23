@@ -47,19 +47,29 @@ masked off the hot path elsewhere.
 
 ## The fixes (all three; the first two are the model, the third is hygiene)
 
-### Fix 1 — render reads, fold writes (strongest; structural)
+### Fix 1 — the fold is pure; callers write the cache explicitly
 
-`log_rows_windowed` is a RENDER path but calls `rebuild_from`, which folds with
-`checkpoint=true` AND prunes — a read with the side effect of writing and
-deleting cache files. `fold_events` already takes `checkpoint: bool`.
+`log_rows_windowed` is a RENDER path but called `rebuild_from`, which folded
+with checkpoint writes AND pruned — a read with the side effect of writing and
+deleting cache files. A flag-based fix (`checkpoint: bool` buried in
+`fold_events`) just hides the write behind which function you call; "the cache
+is written only by `rebuild_with_diagnostics`" is no more deliberate-sounding
+than `rebuild_from` (lloyd). Make the write EXPLICIT at the call site instead:
 
-- The render must fold READ-ONLY: take a path through `rebuild_from`/
-  `fold_events` with `checkpoint=false` and NO `prune_checkpoints`.
-- The checkpoint cache is mutated ONLY by a deliberate rebuild
-  (`rebuild_with_diagnostics`).
+- `fold_events` is PURE: it returns the log events and the policy-spaced
+  checkpoints it PROPOSES (`FoldOutput { log_events, checkpoints }`), touching
+  no disk.
+- A deliberate rebuild (`rebuild_with_diagnostics`) calls `persist_checkpoints`
+  + `prune_checkpoints` in its own body — every cache write is a visible line.
+- The render (`rebuild_from`, and one-shot `clank log` / `clank html`) DROPS
+  the proposed checkpoints. It cannot write the cache because it never calls the
+  writer — no flag to get wrong.
 
-This makes "a render mutates the cache" structurally impossible — the class of
-bug, not just this instance.
+This deletes the `checkpoint: bool` flag and makes "a render mutates the cache"
+structurally impossible — the class of bug, not just this instance. (Cost: the
+render clones state at the ~O(log window) proposed-checkpoint depths and drops
+them — a few clones per frame, dominated by Fix 2 making renders rare. Worth it
+for an explicit write boundary over a hidden flag.)
 
 ### Fix 2 — nothing-changed gate at the snapshot level (lloyd's invariant)
 
