@@ -1,5 +1,5 @@
 //! Shared `WaitingOn` / `WorktreeFacts` types consumed by the CLI's
-//! status and wfw surfaces. The gate computation that produces
+//! status and wait surfaces. The gate computation that produces
 //! these values lives in [`crate::wait::compute_gate`] +
 //! [`crate::repo_state::RepoState::derive_status`] — one place, no
 //! parallel implementation.

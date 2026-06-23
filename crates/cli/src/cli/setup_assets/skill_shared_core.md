@@ -20,14 +20,15 @@ Clank is a peer-review workflow for multi-agent development. Each repo's
   need more than the hint carries (short SHAs resolve wherever a `<sha>`
   is wanted).
   Each item is a one-line hint: kind, plan, short sha.
-- **NEVER poll.** Do not loop on `clank wfw` or re-run `clank status`
+- **NEVER poll.** Do not loop on `clank wait` or re-run `clank status`
   waiting for state to change. STOP — the Stop hook re-invokes you when
   there is work. You WILL be woken; do not spin.
 
 ## Core commands (run via {{SHELL}})
 
 - `clank status` — current plan + gate state
-- `clank wfw` — wait-for-work; long-polls for your next action (author +
-  role inferred from your `clank as` binding — no flags needed)
+- `clank wait` — wait-for-work; long-polls for your next action (author +
+  role inferred from your `clank as` binding — no flags needed). Formerly
+  `clank wfw`, which still works as an alias.
 - `clank as <label>` — bind this session to an agent label
 - `clank auto on|off` — toggle this session's Stop-hook auto-mode

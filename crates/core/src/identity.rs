@@ -2,7 +2,7 @@
 //! [`AgentLabel`].
 //!
 //! Every CLI surface that needs to know "who am I" (the stop-hook
-//! adapter, `clank auto`, `clank wfw`, `clank doctor`) builds
+//! adapter, `clank auto`, `clank wait`, `clank doctor`) builds
 //! [`IdentityInputs`] from env + stdin + on-disk config and calls
 //! [`resolve_agent_identity`]. The function is pure: no I/O, no
 //! clock, no env access — the CLI does all of that, then hands

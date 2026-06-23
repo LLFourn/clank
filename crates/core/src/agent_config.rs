@@ -8,7 +8,7 @@
 //!
 //! There is intentionally no repo-shared config type. Master is
 //! a per-user preference: whoever wrote the plan wants their
-//! `wfw` to default to master's view; everyone else wants
+//! `wait` to default to master's view; everyone else wants
 //! reviewers. There's no useful repo-wide assertion of "alice is
 //! THE master" — gate state is computed from the cumulative
 //! participant set, not from role claims.
@@ -44,11 +44,19 @@ pub struct AgentConfig {
     /// Wait-for-work timeout as a duration string (`"30m"`,
     /// `"5m"`, `"45s"`). `None` means indefinite. Stringly typed
     /// so users editing JSON see the same form
-    /// `clank wfw --timeout` accepts; validated by the CLI's
+    /// `clank wait --timeout` accepts; validated by the CLI's
     /// existing `parse_timeout` at use site, not load site (one
     /// source of truth for the format).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub wfw_timeout: Option<String>,
+    ///
+    /// `alias = "wfw_timeout"` so configs written before the
+    /// `wfw`→`wait` rename keep loading; new writes use the
+    /// `wait_timeout` key.
+    #[serde(
+        default,
+        alias = "wfw_timeout",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub wait_timeout: Option<String>,
     /// Session this agent label is currently bound to. Written by
     /// `clank as <label>` (or `clank init` phase 2) using the
     /// `CLAUDE_CODE_SESSION_ID` / `CODEX_THREAD_ID` env var.
@@ -142,7 +150,7 @@ mod tests {
         let back: AgentConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(cfg, back);
         assert_eq!(back.auto_mode, None, "fresh skeleton is unset, not Off");
-        assert!(back.wfw_timeout.is_none());
+        assert!(back.wait_timeout.is_none());
         assert!(back.session.is_none());
     }
 
@@ -150,7 +158,7 @@ mod tests {
     fn agent_config_round_trips_populated() {
         let cfg = AgentConfig {
             auto_mode: Some(AutoMode::On),
-            wfw_timeout: Some("30m".into()),
+            wait_timeout: Some("30m".into()),
             session: Some(Session {
                 id: session_id("742f6a04-f174-409a-ab01-419a16c5f372"),
                 tool: Tool::Claude,
@@ -160,6 +168,16 @@ mod tests {
         let json = serde_json::to_string(&cfg).unwrap();
         let back: AgentConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(cfg, back);
+    }
+
+    #[test]
+    fn wait_timeout_reads_legacy_wfw_timeout_key() {
+        // Back-compat: configs written before the wfw→wait rename
+        // stored the value under `wfw_timeout`. The serde alias keeps
+        // them loading with the value intact.
+        let json = r#"{ "wfw_timeout": "30m" }"#;
+        let cfg: AgentConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.wait_timeout.as_deref(), Some("30m"));
     }
 
     #[test]
@@ -200,7 +218,7 @@ mod tests {
         let json = r#"{ "auto_mode": "wait" }"#;
         let cfg: AgentConfig = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.auto_mode, Some(AutoMode::On));
-        assert!(cfg.wfw_timeout.is_none());
+        assert!(cfg.wait_timeout.is_none());
         assert!(cfg.session.is_none());
     }
 
@@ -213,8 +231,8 @@ mod tests {
         let json = serde_json::to_string(&cfg).unwrap();
         assert!(!json.contains("session"), "expected no session key: {json}");
         assert!(
-            !json.contains("wfw_timeout"),
-            "expected no wfw_timeout key: {json}"
+            !json.contains("wait_timeout"),
+            "expected no wait_timeout key: {json}"
         );
     }
 

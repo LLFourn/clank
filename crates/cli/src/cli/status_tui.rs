@@ -2514,7 +2514,7 @@ terminal_3  terminal  ruthless (reviewer)
         // lloyd (reopen round): no active plan + non-empty queue is
         // MASTER's turn — promote. Names the agent; queue head on
         // the right with the remainder count.
-        let s = snap(vec![], vec!["zellij-layout", "wfw-hint"]);
+        let s = snap(vec![], vec!["zellij-layout", "wait-hint"]);
         let v = visible(&render(&s, 1, 60)[0]);
         assert!(v.starts_with("📋 CLAUDE promote"), "got `{v}`");
         assert!(v.ends_with("zellij-layout +1"), "got `{v}`");

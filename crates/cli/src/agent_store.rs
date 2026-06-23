@@ -82,7 +82,7 @@ pub fn resolve_role(repo: &Path, label: &AgentLabel) -> anyhow::Result<clank_cor
 /// Plan: teams-based-agent-registration.
 ///
 /// Two-tier reviewer split for a repo. Used by `WorkPolicy`
-/// construction sites (status, wfw, open) to feed the
+/// construction sites (status, wait, open) to feed the
 /// two-tier gate state machine.
 ///
 /// Returns `(commit_reviewers, gate_reviewers)` from the
@@ -402,7 +402,7 @@ pub struct BindOutcome {
 /// identify stale, write the target FIRST (so a partial failure
 /// on stale-clear leaves a ghost binding rather than no
 /// binding), then clear stale. Preserves auto_mode and
-/// wfw_timeout on the target's existing config.
+/// wait_timeout on the target's existing config.
 pub fn bind_session_to_agent(
     repo: &Path,
     label: &AgentLabel,
@@ -525,7 +525,7 @@ mod tests {
         // resolver was reading the legacy merged declaration
         // and returning Role::Reviewer for a team master whose
         // legacy entry said reviewer — leading to master work
-        // items never emitting via wfw.
+        // items never emitting via wait.
         let set = registered_set("codex", &["claude"], &["ruthless"]);
         assert_eq!(
             role_from_registered_set(&set, &label("codex")),

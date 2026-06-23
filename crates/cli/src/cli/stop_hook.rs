@@ -82,25 +82,25 @@ async fn compute_outcome(tool: Tool, repo_override: Option<&Path>) -> HookOutcom
     match effective {
         AutoMode::Off => HookOutcome::Silent,
         AutoMode::On => {
-            let wfw_timeout = cfg.as_ref().and_then(|c| c.wfw_timeout.clone());
-            compute_wait_outcome(&repo, &label, role, wfw_timeout.as_deref()).await
+            let wait_timeout = cfg.as_ref().and_then(|c| c.wait_timeout.clone());
+            compute_wait_outcome(&repo, &label, role, wait_timeout.as_deref()).await
         }
     }
 }
 
-/// Long-poll via a self-spawned `clank wfw --json`.
+/// Long-poll via a self-spawned `clank wait --json`.
 /// Reuses the watcher loop without refactoring it. On items →
 /// Continue. On timeout (exit 2) → Silent. Anything else →
 /// Diagnostic.
 ///
 /// Self-spawning has one advantage over factoring out the loop:
-/// the wfw process is a clean child that gets killed if the
+/// the wait process is a clean child that gets killed if the
 /// agent kills the hook (Stdio::piped + drop kills the child).
 async fn compute_wait_outcome(
     repo: &Path,
     label: &AgentLabel,
     role: Role,
-    wfw_timeout: Option<&str>,
+    wait_timeout: Option<&str>,
 ) -> HookOutcome {
     use tokio::process::Command;
 
@@ -117,10 +117,10 @@ async fn compute_wait_outcome(
         Role::Master => "master",
         Role::Reviewer => "reviewer",
     };
-    let timeout_arg = wfw_timeout.unwrap_or("0");
+    let timeout_arg = wait_timeout.unwrap_or("0");
 
     let mut cmd = Command::new(&exe);
-    cmd.arg("wfw")
+    cmd.arg("wait")
         .arg("--repo")
         .arg(repo)
         .arg("--author")
@@ -139,25 +139,25 @@ async fn compute_wait_outcome(
         Ok(o) => o,
         Err(e) => {
             return HookOutcome::Diagnostic {
-                message: format!("hook: spawning wfw failed: {e}"),
+                message: format!("hook: spawning wait failed: {e}"),
             };
         }
     };
 
     match output.status.code() {
-        Some(0) => match parse_wfw_json(&output.stdout) {
+        Some(0) => match parse_wait_json(&output.stdout) {
             Ok(items) if items.is_empty() => HookOutcome::Silent,
             Ok(items) => HookOutcome::Continue {
-                reason: render_wfw_items(&items, label, role),
+                reason: render_wait_items(&items, label, role),
             },
             Err(e) => HookOutcome::Diagnostic {
-                message: format!("hook: wfw stdout malformed: {e}"),
+                message: format!("hook: wait stdout malformed: {e}"),
             },
         },
-        Some(2) => HookOutcome::Silent, // wfw timeout
+        Some(2) => HookOutcome::Silent, // wait timeout
         other => HookOutcome::Diagnostic {
             message: format!(
-                "hook: wfw exited {} stderr={}",
+                "hook: wait exited {} stderr={}",
                 other
                     .map(|c| c.to_string())
                     .unwrap_or_else(|| "(signaled)".into()),
@@ -191,25 +191,25 @@ fn resolve_hook_repo(repo_override: Option<&Path>, input: &HookInput) -> Result<
     })
 }
 
-/// Owned, presence-tolerant mirror of `wfw`'s `--json` envelope.
+/// Owned, presence-tolerant mirror of `wait`'s `--json` envelope.
 /// The stop hook consumes its OWN subprocess output across a
 /// process boundary, so it deserializes into typed rows rather than
 /// walking a `serde_json::Value` (typed-json-not-json-macro). Every
 /// field is optional and unknown `kind`s fall through to the loose
-/// renderer arm: the boundary stays fail-soft — a future `wfw` kind
+/// renderer arm: the boundary stays fail-soft — a future `wait` kind
 /// or field never breaks parsing.
 #[derive(serde::Deserialize)]
-struct WfwEnvelope {
-    items: Vec<WfwItem>,
+struct WaitEnvelope {
+    items: Vec<WaitItem>,
 }
 
-/// One `wfw --json` item as the stop hook reads it. `kind` is the
-/// `#[serde(tag = "kind")]` discriminant `wfw` emits; the remaining
-/// fields are the ones [`render_wfw_items`] projects into the
+/// One `wait --json` item as the stop hook reads it. `kind` is the
+/// `#[serde(tag = "kind")]` discriminant `wait` emits; the remaining
+/// fields are the ones [`render_wait_items`] projects into the
 /// minimal wake hint (`wfw-output-is-a-minimal-hint`). Anything
-/// `wfw` adds is ignored; anything absent stays `None`.
+/// `wait` adds is ignored; anything absent stays `None`.
 #[derive(serde::Deserialize)]
-struct WfwItem {
+struct WaitItem {
     kind: Option<String>,
     plan: Option<String>,
     sha: Option<String>,
@@ -225,23 +225,23 @@ struct WfwItem {
     round: Option<u64>,
 }
 
-fn parse_wfw_json(raw: &[u8]) -> Result<Vec<WfwItem>, String> {
-    let envelope: WfwEnvelope =
+fn parse_wait_json(raw: &[u8]) -> Result<Vec<WaitItem>, String> {
+    let envelope: WaitEnvelope =
         serde_json::from_slice(raw).map_err(|e| format!("not valid JSON: {e}"))?;
     Ok(envelope.items)
 }
 
-/// Render wfw's JSON `items` array into the continuation prompt
+/// Render wait's JSON `items` array into the continuation prompt
 /// body. Loose stringly-typed projection because we're consuming
 /// our own JSON output via subprocess. One MINIMAL line per item
 /// — who/verb + plan + 12-char sha (`wfw-output-is-a-minimal-hint`):
 /// the HOW (feedback-write form, verdicts, promote evaluation,
 /// unblock) lives in the agent's skill doc, not re-taught per
 /// wake.
-fn render_wfw_items(items: &[WfwItem], label: &AgentLabel, role: Role) -> String {
+fn render_wait_items(items: &[WaitItem], label: &AgentLabel, role: Role) -> String {
     let mut out = String::new();
     out.push_str(&format!(
-        "Clank wfw returned work for `{label}` ({role}). Items:\n",
+        "Clank wait returned work for `{label}` ({role}). Items:\n",
         label = label.as_str(),
         role = role.as_str(),
     ));
@@ -315,7 +315,7 @@ fn render_wfw_items(items: &[WfwItem], label: &AgentLabel, role: Role) -> String
     out
 }
 
-/// 12 chars, matching wfw's hint width: agents compose
+/// 12 chars, matching wait's hint width: agents compose
 /// `feedback write --commit <sha>` from this, and 12 hex chars
 /// can't realistically be ambiguous (ruthless 201e498 concern 2).
 fn short_sha(s: &str) -> &str {
@@ -357,15 +357,15 @@ fn emit_and_exit(outcome: HookOutcome, tool: Tool) -> ! {
 mod tests {
     use super::*;
 
-    /// Deserialize `json!` values through the real `WfwItem` path —
+    /// Deserialize `json!` values through the real `WaitItem` path —
     /// the same typed parse the production stop hook uses — then
     /// render. Exercises both the deserialize and the projection.
     fn items_text(items: &[serde_json::Value]) -> String {
-        let parsed: Vec<WfwItem> = items
+        let parsed: Vec<WaitItem> = items
             .iter()
             .map(|v| serde_json::from_value(v.clone()).unwrap())
             .collect();
-        render_wfw_items(
+        render_wait_items(
             &parsed,
             &AgentLabel::parse("codex").unwrap(),
             Role::Reviewer,
@@ -439,10 +439,10 @@ mod tests {
     }
 
     #[test]
-    fn parse_wfw_json_reads_typed_envelope() {
-        // typed-json-not-json-macro: the stop hook deserializes wfw's
-        // `--json` envelope into typed `WfwItem`s rather than walking
-        // a `serde_json::Value`. `json!` here expresses the wfw output
+    fn parse_wait_json_reads_typed_envelope() {
+        // typed-json-not-json-macro: the stop hook deserializes wait's
+        // `--json` envelope into typed `WaitItem`s rather than walking
+        // a `serde_json::Value`. `json!` here expresses the wait output
         // the hook consumes across the subprocess boundary.
         let raw = serde_json::json!({
             "items": [
@@ -452,15 +452,15 @@ mod tests {
             ]
         })
         .to_string();
-        let items = parse_wfw_json(raw.as_bytes()).unwrap();
+        let items = parse_wait_json(raw.as_bytes()).unwrap();
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].kind.as_deref(), Some("reviewer"));
         assert_eq!(items[1].next.as_deref(), Some("revise"));
     }
 
     #[test]
-    fn parse_wfw_json_is_fail_soft_on_unknown_kind_and_extra_fields() {
-        // The subprocess boundary must stay loose: a future wfw kind
+    fn parse_wait_json_is_fail_soft_on_unknown_kind_and_extra_fields() {
+        // The subprocess boundary must stay loose: a future wait kind
         // or extra field can NEVER break parsing (the hook never fails
         // the agent). Unknown `kind` renders via the catchall arm;
         // unknown fields are ignored.
@@ -471,8 +471,8 @@ mod tests {
             ]
         })
         .to_string();
-        let items = parse_wfw_json(raw.as_bytes()).unwrap();
-        let out = render_wfw_items(&items, &AgentLabel::parse("codex").unwrap(), Role::Reviewer);
+        let items = parse_wait_json(raw.as_bytes()).unwrap();
+        let out = render_wait_items(&items, &AgentLabel::parse("codex").unwrap(), Role::Reviewer);
         assert!(
             out.contains("  - future_kind: p @ f6feba231685\n"),
             "unknown kind must render via the catchall arm; got:\n{out}"

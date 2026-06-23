@@ -6,7 +6,7 @@
 //!   ChangesRequested}`](crate::vocab::CommitGateState).
 //! - [`RepoState::derive_status`] (impl on `RepoState`) — folds
 //!   `compute_gate` over every plan and produces the
-//!   role-flavored [`WaitItem`]s `clank wfw` emits.
+//!   role-flavored [`WaitItem`]s `clank wait` emits.
 //! - [`detect_finished`] — pure comparison between a startup
 //!   snapshot of watched plans and the current `RepoState`.
 //!   Emits `WaitItem::Finished` for every watched plan that
@@ -61,7 +61,7 @@ pub enum PrMasterNext {
     Continue,
 }
 
-/// Flat tagged list `wfw` returns from one refold round.
+/// Flat tagged list `wait` returns from one refold round.
 /// Actionable items (`Master`, `Reviewer`) and terminal events
 /// (`Finished`) sit at the same level. Empty list at the call
 /// site means "no outcome, keep blocking."
@@ -248,12 +248,12 @@ pub fn head_tag_violation(
     }
 }
 
-/// Snapshot taken once at `wfw` startup. `detect_finished` compares
+/// Snapshot taken once at `wait` startup. `detect_finished` compares
 /// the current state against this to decide which watched plans
 /// newly transitioned to finished.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StartupSnapshot {
-    /// Plan keys this wfw is responsible for: the active plan keys
+    /// Plan keys this wait is responsible for: the active plan keys
     /// at startup. (All team members watch every plan — there is no
     /// per-agent plan filter.)
     pub watched: BTreeSet<PlanKey>,
@@ -888,7 +888,7 @@ impl WorkStatus {
         // woken until it's fixed. This is the SINGLE source for the
         // master's fixup item (the per-plan `MasterToFixCommitTag`
         // marking below is for display only). Blocked entries are
-        // co-surfaced by the caller (`wfw`), as for ordinary items.
+        // co-surfaced by the caller (`wait`), as for ordinary items.
         if let Some(correction) = &self.head_correction {
             return match role {
                 Role::Master => vec![WaitItem::FixCommitTag {

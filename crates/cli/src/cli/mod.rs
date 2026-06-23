@@ -40,7 +40,7 @@ pub mod stop_hook;
 pub mod team;
 pub mod teams_config;
 pub mod unfinish;
-pub mod wfw;
+pub mod wait;
 
 #[derive(Args, Debug)]
 pub struct ConfigArgs {
@@ -116,7 +116,7 @@ pub struct InitArgs {
     /// definitions into `<repo>/.clank/config.json`. The template
     /// must exist in `~/.clank/config.json#/teams`. When omitted, the
     /// repo starts with no roster — build one with `clank agent add`
-    /// / `clank agent promote`; workflow commands (`wfw`,
+    /// / `clank agent promote`; workflow commands (`wait`,
     /// `finish`) require a master until you do.
     #[arg(long, value_name = "NAME")]
     pub team: Option<String>,
@@ -384,11 +384,11 @@ pub struct StatusArgs {
 }
 
 #[derive(Args, Debug)]
-pub struct WfwArgs {
+pub struct WaitArgs {
     /// Repo root. Defaults to the cwd's git toplevel.
     #[arg(long, value_name = "PATH")]
     pub repo: Option<PathBuf>,
-    /// Agent label this caller is wfw-ing as. Keys feedback files
+    /// Agent label this caller is waiting as. Keys feedback files
     /// and the participant set. Optional: defaults via the shared
     /// identity resolver (CLANK_AGENT env > session lookup via
     /// CLAUDE_CODE_SESSION_ID / CODEX_THREAD_ID). Pass explicitly
@@ -399,7 +399,7 @@ pub struct WfwArgs {
     /// defaults to `master` iff the resolved label matches
     /// `.clank/config.json`'s `master` field, else `reviewer`.
     #[arg(long, value_enum)]
-    pub role: Option<WfwRole>,
+    pub role: Option<WaitRole>,
     /// Maximum wait. Accepts `30s`, `5m`, `1h`. `0` (default) means
     /// wait indefinitely.
     #[arg(long, default_value = "0", value_name = "DURATION")]
@@ -424,7 +424,7 @@ pub struct WfwArgs {
     pub no_poll: bool,
 }
 
-impl WfwArgs {
+impl WaitArgs {
     /// Resolve the explicit poll flag (Some) vs absent (None) for
     /// `resolve_poll`. clap can't directly produce
     /// `Option<bool>` with `--poll` / `--no-poll`, so we
@@ -456,7 +456,7 @@ pub fn resolve_poll(explicit: Option<bool>, codex_sandbox: Option<&str>) -> bool
 
 #[cfg(test)]
 mod role_arg_alias_tests {
-    use super::{RoleArg, WfwRole};
+    use super::{RoleArg, WaitRole};
     use clap::ValueEnum;
 
     #[test]
@@ -474,14 +474,14 @@ mod role_arg_alias_tests {
     }
 
     #[test]
-    fn wfw_role_accepts_both_forms() {
+    fn wait_role_accepts_both_forms() {
         assert!(matches!(
-            WfwRole::from_str("reviewer", false).unwrap(),
-            WfwRole::Reviewer
+            WaitRole::from_str("reviewer", false).unwrap(),
+            WaitRole::Reviewer
         ));
         assert!(matches!(
-            WfwRole::from_str("reviewers", false).unwrap(),
-            WfwRole::Reviewer
+            WaitRole::from_str("reviewers", false).unwrap(),
+            WaitRole::Reviewer
         ));
     }
 
@@ -530,20 +530,20 @@ mod resolve_poll_tests {
 }
 
 #[derive(Copy, Clone, Debug, clap::ValueEnum)]
-pub enum WfwRole {
+pub enum WaitRole {
     Master,
     /// Singular per `role-reviewers-to-reviewer-rename`.
     /// `alias = "reviewers"` preserves backwards compat for
-    /// users typing `--role reviewers` on `clank wfw`.
+    /// users typing `--role reviewers` on `clank wait`.
     #[clap(alias = "reviewers")]
     Reviewer,
 }
 
-impl From<WfwRole> for clank_core::Role {
-    fn from(r: WfwRole) -> Self {
+impl From<WaitRole> for clank_core::Role {
+    fn from(r: WaitRole) -> Self {
         match r {
-            WfwRole::Master => clank_core::Role::Master,
-            WfwRole::Reviewer => clank_core::Role::Reviewer,
+            WaitRole::Master => clank_core::Role::Master,
+            WaitRole::Reviewer => clank_core::Role::Reviewer,
         }
     }
 }
@@ -713,7 +713,7 @@ pub struct AsArgs {
     #[arg(long, value_name = "PATH")]
     pub repo: Option<PathBuf>,
     /// The agent label to bind this session to. Subsequent calls
-    /// to `clank wfw` / `clank auto` / the stop-hook resolve to
+    /// to `clank wait` / `clank auto` / the stop-hook resolve to
     /// this label for the duration of this agent session.
     pub label: String,
 }
@@ -747,9 +747,10 @@ pub struct AutoOnArgs {
     pub role: Option<RoleArg>,
     /// Override the wait-for-work timeout (e.g. `30m`, `5m`,
     /// `45s`). Omit to leave unchanged; `null` in the underlying
-    /// config means "indefinite".
-    #[arg(long, value_name = "DUR")]
-    pub wfw_timeout: Option<String>,
+    /// config means "indefinite". `--wfw-timeout` stays as an alias
+    /// for pre-rename muscle memory.
+    #[arg(long, value_name = "DUR", visible_alias = "wfw-timeout")]
+    pub wait_timeout: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -1253,7 +1254,7 @@ pub struct BlockCreateArgs {
     /// `--all`. Exactly one is required.
     #[arg(long, value_name = "PLAN")]
     pub plan: Option<String>,
-    /// Scope the block to the entire repo (suppresses every wfw item
+    /// Scope the block to the entire repo (suppresses every wait item
     /// for the calling agent across all plans + queue items). Mutually
     /// exclusive with `--plan`. Exactly one is required. Use sparingly
     /// — most blocks should be plan-scoped.

@@ -38,10 +38,10 @@
 //!   builders.
 //! - [`agent_config`] — typed schema for per-agent, per-machine
 //!   state (`.clank/agents/<label>/config.json`): session
-//!   binding, auto-mode, and wfw timeout.
+//!   binding, auto-mode, and wait timeout.
 //! - [`identity`] — pure `resolve_agent_identity` function +
 //!   `IdentityInputs` / `ResolveError` types. The single
-//!   "who am I" resolver shared by stop-hook, auto, wfw, doctor.
+//!   "who am I" resolver shared by stop-hook, auto, wait, doctor.
 //! - [`hook_io`] — typed Stop-hook stdin (`HookInput`) and the
 //!   adapter's decision (`HookOutcome`); plus the codex
 //!   `{decision:"block",reason:...}` wire shape.

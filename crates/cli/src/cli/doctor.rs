@@ -602,7 +602,7 @@ fn session_checks(repo: Option<&Path>) -> Vec<CheckResult> {
     // Read CLANK_AGENT FIRST. The pure resolver's precedence
     // says the explicit override wins before any session env is
     // touched; doctor must mirror that or it'll report failures
-    // for states `clank wfw` / `clank auto` happily accept.
+    // for states `clank wait` / `clank auto` happily accept.
     let explicit = match explicit_label_from_env() {
         Ok(e) => e,
         Err(e) => {
@@ -670,7 +670,7 @@ fn session_checks(repo: Option<&Path>) -> Vec<CheckResult> {
     };
 
     // Identity resolution: go through the SAME resolver `clank
-    // wfw` / `clank auto` use, so doctor never disagrees with
+    // wait` / `clank auto` use, so doctor never disagrees with
     // what those commands would do. Critically, this honors the
     // CLANK_AGENT > session-binding precedence — an explicit
     // override succeeds even without a matching session config.
@@ -978,7 +978,7 @@ mod tests {
         // config had a matching session binding. The pure
         // resolver succeeds in that case (override > session
         // lookup), and doctor must mirror that — otherwise it
-        // disagrees with `clank wfw` / `clank auto` which both
+        // disagrees with `clank wait` / `clank auto` which both
         // happily run with just the override.
         let dir = init_git_repo();
         let repo = dir.path().to_path_buf();

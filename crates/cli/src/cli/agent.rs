@@ -9,7 +9,7 @@
 //! picks the master; the ROLE RESOLVER
 //! (`agent_store::try_resolve_via_team`) reads the roster directly.
 //! The per-agent skeleton at `.clank/agents/<label>/config.json`
-//! holds ONLY per-machine state (`auto_mode`, `wfw_timeout`,
+//! holds ONLY per-machine state (`auto_mode`, `wait_timeout`,
 //! `session`). `list` joins the resolved set with each agent's
 //! skeleton session.
 
@@ -386,7 +386,7 @@ struct ComposedLaunch {
 /// `agent-start-initial-prompt` Phase 3:
 /// - Triggers turn-end with minimum surface (both tools produce
 ///   a one-line ack).
-/// - Does NOT instruct the agent to run `clank wfw` itself (the
+/// - Does NOT instruct the agent to run `clank wait` itself (the
 ///   stop hook is the orchestrator; double-trigger to avoid).
 /// - Does NOT expose orchestration internals (no "stop hook",
 ///   no "work loop") — agent only learns contextual location.
@@ -547,7 +547,7 @@ fn exec_composed(c: ComposedLaunch) -> anyhow::Result<()> {
 //   - repo by-name (no `--tool`): copy a description from the
 //     user-scope library → insert a RosterAgent with the role.
 // Per-agent skeletons hold only state (session / auto_mode /
-// wfw_timeout) — never declaration.
+// wait_timeout) — never declaration.
 
 /// `clank agent add <label> [--global] [--tool ...] [--review ...]`
 /// — thin shell: parse the label + role, build the launch profile,

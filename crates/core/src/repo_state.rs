@@ -87,7 +87,7 @@ impl PlanState {
     /// "reviewable" — anything that touched the plan file or
     /// touched code attributed to the plan. This IS the
     /// definition; every site that needs the list (status,
-    /// wfw, feedback write, preview builders) should call this
+    /// wait, feedback write, preview builders) should call this
     /// rather than hand-rolling the filter so the rule stays
     /// in one place.
     pub fn reviewable_shas(&self) -> Vec<CommitSha> {
@@ -177,7 +177,7 @@ pub enum Warning {
     ///
     /// (Prefix-ambiguity warnings — unknown/missing/mismatched tags —
     /// were removed with the classifier collapse: history is tolerated
-    /// silently and mistakes are caught live at HEAD by wfw, not
+    /// silently and mistakes are caught live at HEAD by wait, not
     /// retroactively. adhoc-commits-and-plan-tag-validation.)
     DanglingPlanRef { plan: PlanKey },
 }
@@ -408,7 +408,7 @@ pub fn parse_title_prefix(subject: &str) -> Option<TitlePrefix> {
 /// empty) from the title prefix and active-plan hint; emits
 /// warnings for unknown / mismatched / missing prefixes;
 /// emits no warnings (history is tolerated; mistakes are caught live
-/// at HEAD by wfw — adhoc-commits-and-plan-tag-validation).
+/// at HEAD by wait — adhoc-commits-and-plan-tag-validation).
 ///
 /// The tag is the ONLY attribution signal: `[a,b,…]` → the subset of
 /// the named plans that are known; an untagged commit or a tag naming

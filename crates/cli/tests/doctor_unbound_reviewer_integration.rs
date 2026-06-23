@@ -23,7 +23,7 @@ fn skeleton(
 ) -> clank_core::agent_config::AgentConfig {
     clank_core::agent_config::AgentConfig {
         auto_mode: Some(auto_mode),
-        wfw_timeout: None,
+        wait_timeout: None,
         session,
     }
 }

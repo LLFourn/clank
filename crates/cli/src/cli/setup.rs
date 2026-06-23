@@ -107,7 +107,7 @@ const HOOK_ID: &str = "clank-stop-hook";
 const LEGACY_COMMAND_PREFIX: &str = "clank stop-hook";
 
 /// Per-tool hook timeout we write into the agent's hook config.
-/// 24 hours — effectively infinite. The clank-side `wfw_timeout`
+/// 24 hours — effectively infinite. The clank-side `wait_timeout`
 /// in the agent's local AgentConfig is the real timer; this just
 /// stops the agent's hook runner from killing the process early.
 const HOOK_TIMEOUT_SECS: u64 = 86400;

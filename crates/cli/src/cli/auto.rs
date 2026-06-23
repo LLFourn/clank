@@ -26,7 +26,7 @@ struct AutoStatusJson<'a> {
     label: &'a str,
     auto_mode: &'a str,
     auto_mode_explicit: Option<&'a str>,
-    wfw_timeout: Option<&'a str>,
+    wait_timeout: Option<&'a str>,
     role: &'a str,
 }
 
@@ -44,8 +44,8 @@ async fn run_on(args: AutoOnArgs) -> anyhow::Result<()> {
 
     let mut cfg = load_agent_config(&repo, &label)?.unwrap_or_default();
     cfg.auto_mode = Some(AutoMode::On);
-    if let Some(t) = args.wfw_timeout.as_deref() {
-        cfg.wfw_timeout = Some(t.to_string());
+    if let Some(t) = args.wait_timeout.as_deref() {
+        cfg.wait_timeout = Some(t.to_string());
     }
     save_agent_config(&repo, &label, &cfg)?;
 
@@ -100,7 +100,7 @@ async fn run_status(args: AutoStatusArgs) -> anyhow::Result<()> {
             label: label.as_str(),
             auto_mode: effective.as_str(),
             auto_mode_explicit: cfg.auto_mode.map(|m| m.as_str()),
-            wfw_timeout: cfg.wfw_timeout.as_deref(),
+            wait_timeout: cfg.wait_timeout.as_deref(),
             role: &role,
         };
         println!("{}", serde_json::to_string(&payload)?);
@@ -108,8 +108,8 @@ async fn run_status(args: AutoStatusArgs) -> anyhow::Result<()> {
         println!("agent: {}", label.as_str());
         println!("  auto_mode:   {}", effective.as_str());
         println!(
-            "  wfw_timeout: {}",
-            cfg.wfw_timeout.as_deref().unwrap_or("(indefinite)")
+            "  wait_timeout: {}",
+            cfg.wait_timeout.as_deref().unwrap_or("(indefinite)")
         );
         println!("  role:        {role}");
     }
@@ -130,7 +130,7 @@ mod tests {
             label: "codex",
             auto_mode: "on",
             auto_mode_explicit: Some("on"),
-            wfw_timeout: Some("30s"),
+            wait_timeout: Some("30s"),
             role: "reviewer",
         };
         assert_eq!(
@@ -139,7 +139,7 @@ mod tests {
                 "label": "codex",
                 "auto_mode": "on",
                 "auto_mode_explicit": "on",
-                "wfw_timeout": "30s",
+                "wait_timeout": "30s",
                 "role": "reviewer",
             })
         );
@@ -150,7 +150,7 @@ mod tests {
             label: "claude",
             auto_mode: "off",
             auto_mode_explicit: None,
-            wfw_timeout: None,
+            wait_timeout: None,
             role: "master",
         };
         assert_eq!(
@@ -159,7 +159,7 @@ mod tests {
                 "label": "claude",
                 "auto_mode": "off",
                 "auto_mode_explicit": null,
-                "wfw_timeout": null,
+                "wait_timeout": null,
                 "role": "master",
             })
         );

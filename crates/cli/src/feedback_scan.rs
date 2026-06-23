@@ -1,5 +1,5 @@
 //! CLI-side IO: walk `.clank/agents/<author>/feedback/<sha>.md`
-//! into a typed [`FeedbackView`]. Both `status` / `wfw` and the
+//! into a typed [`FeedbackView`]. Both `status` / `wait` and the
 //! `preview` gate-computation consume the result.
 
 use std::collections::BTreeMap;

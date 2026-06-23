@@ -38,7 +38,7 @@ must amend BEFORE anything else proceeds. Three ways to break it:
 
 ### The loop
 
-`clank wfw` (or the Stop hook) hands you work. Common kinds:
+`clank wait` (or the Stop hook) hands you work. Common kinds:
 - **implement / continue** — do the next plan milestone, commit, STOP.
 - **address feedback** (REQUEST_CHANGES) — make the change, commit, STOP.
 - **promote** — EVALUATE the queued plan FIRST: read it, confirm it is

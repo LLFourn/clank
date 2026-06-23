@@ -211,8 +211,8 @@ impl Tool {
 /// Auto-mode setting for an agent's stop-hook behavior.
 ///
 /// - `Off`: hook exits immediately.
-/// - `On`: hook long-polls `clank wfw` until work arrives or
-///   `wfw_timeout` elapses.
+/// - `On`: hook long-polls `clank wait` until work arrives or
+///   `wait_timeout` elapses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AutoMode {
@@ -231,7 +231,7 @@ impl AutoMode {
     }
 }
 
-/// Role an agent plays — their default perspective for `wfw`,
+/// Role an agent plays — their default perspective for `wait`,
 /// `stop-hook`, etc. Per-user preference stored on the agent's
 /// own [`AgentConfig`]; not a repo-shared assertion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]

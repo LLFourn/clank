@@ -64,7 +64,7 @@ pub enum HookOutcome {
     /// The agent runs another turn against this text.
     Continue { reason: String },
     /// Let the agent stop normally. No output to either tool.
-    /// Used for: `auto_mode=off`, wfw timed out with no work.
+    /// Used for: `auto_mode=off`, wait timed out with no work.
     Silent,
     /// Internal problem (config parse, identity unresolvable,
     /// projection failure). The hook NEVER fails the agent —
@@ -205,9 +205,9 @@ mod tests {
 
     #[test]
     fn codex_block_decision_serializes_correctly() {
-        let decision = CodexBlockDecision::from_reason("run wfw now");
+        let decision = CodexBlockDecision::from_reason("run wait now");
         let json = serde_json::to_string(&decision).unwrap();
-        assert_eq!(json, r#"{"decision":"block","reason":"run wfw now"}"#);
+        assert_eq!(json, r#"{"decision":"block","reason":"run wait now"}"#);
     }
 
     #[test]

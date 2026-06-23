@@ -12,8 +12,8 @@ pub async fn run(args: BlockArgs) -> anyhow::Result<()> {
 
 async fn run_create(args: BlockCreateArgs) -> anyhow::Result<()> {
     // Scope is explicit-or-error: forgetting to scope would
-    // silently suppress every wfw item for this agent across
-    // every plan + queue item (because `wfw::check_blocks`
+    // silently suppress every wait item for this agent across
+    // every plan + queue item (because `wait::check_blocks`
     // reads `plan: None` as `suppress_all = true`). Make the
     // user choose. `--plan` and `--all` are mutually exclusive
     // (clap enforces via `conflicts_with`); at least one must
@@ -21,7 +21,7 @@ async fn run_create(args: BlockCreateArgs) -> anyhow::Result<()> {
     if args.plan.is_none() && !args.all {
         anyhow::bail!(
             "block scope is required: pass `--plan <plan-stem>` to scope to a single plan, \
-             or `--all` to suppress every wfw item for this agent (rarely the right call)"
+             or `--all` to suppress every wait item for this agent (rarely the right call)"
         );
     }
 
@@ -41,7 +41,7 @@ async fn run_create(args: BlockCreateArgs) -> anyhow::Result<()> {
         // --all path. Print the warning on stderr so the user
         // sees it even when the success line is captured.
         eprintln!(
-            "REPO-WIDE BLOCK: this will suppress every wfw item for `{}` until the block is answered",
+            "REPO-WIDE BLOCK: this will suppress every wait item for `{}` until the block is answered",
             author.as_str()
         );
         agents_root(&repo).join(author.as_str()).join("blocks")

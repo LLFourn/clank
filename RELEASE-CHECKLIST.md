@@ -32,9 +32,9 @@ investigated while authoring this checklist and need no plan.
 ## 2. Notifications & presence
 
 - [ ] **`per-event-notifications-not-per-agent`** — hooks fire
-  from each agent's own wfw process (wfw.rs `run_hook` call
+  from each agent's own wait process (wait.rs `run_hook` call
   sites), so one event (a new reviewable commit) wakes N
-  reviewers' wfw processes and fires N hooks: a `say` hook
+  reviewers' wait processes and fires N hooks: a `say` hook
   announces the same commit several times. The model fix: a hook
   channel keyed by EVENT, not by woken agent — e.g. fire
   user-facing notification hooks once per (event, sha) via a
@@ -126,7 +126,7 @@ investigated while authoring this checklist and need no plan.
   user-authored zellij layout chrome (`zellij.layout` +
   `clank_agents` marker) with the `--tui` pane as the documented
   example.
-- Wake payloads: stop-hook/wfw emit one-line hints; the HOW
+- Wake payloads: stop-hook/wait emit one-line hints; the HOW
   lives in the skills.
 
 ## Suggested order

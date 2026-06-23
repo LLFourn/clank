@@ -43,7 +43,7 @@ fn bind_session(env: &TestEnv, label: &str, tool: clank_core::vocab::Tool, id: &
     let l = clank_core::ids::AgentLabel::parse(label).unwrap();
     let cfg = clank_core::agent_config::AgentConfig {
         auto_mode: None,
-        wfw_timeout: None,
+        wait_timeout: None,
         session: Some(clank_core::agent_config::Session {
             id: clank_core::ids::SessionId::parse(id).unwrap(),
             tool,
@@ -181,13 +181,13 @@ fn fork_carbon_copies_per_agent_settings_not_session() {
     let repo = env.repo();
     let claude = clank_core::ids::AgentLabel::parse("claude").unwrap();
 
-    // Source claude: explicit auto OFF + a wfw_timeout (on top of its
+    // Source claude: explicit auto OFF + a wait_timeout (on top of its
     // bound session).
     let mut src = clank::agent_store::load_agent_config(repo, &claude)
         .unwrap()
         .unwrap();
     src.auto_mode = Some(AutoMode::Off);
-    src.wfw_timeout = Some("5m".into());
+    src.wait_timeout = Some("5m".into());
     clank::agent_store::save_agent_config(repo, &claude, &src).unwrap();
 
     let dest = block_on(clank::cli::fork::run_fork(
@@ -201,7 +201,7 @@ fn fork_carbon_copies_per_agent_settings_not_session() {
         .unwrap()
         .unwrap();
     assert_eq!(dst.auto_mode, Some(AutoMode::Off), "explicit auto carried");
-    assert_eq!(dst.wfw_timeout.as_deref(), Some("5m"), "timeout carried");
+    assert_eq!(dst.wait_timeout.as_deref(), Some("5m"), "timeout carried");
     assert!(dst.session.is_none(), "session is NOT copied");
 
     // codex (source auto unset, no timeout) → nothing to carry, so no
@@ -230,7 +230,7 @@ fn fork_carbon_copies_per_agent_settings_not_session() {
         .unwrap();
     assert_eq!(after.auto_mode, Some(AutoMode::Off), "auto survives bind");
     assert_eq!(
-        after.wfw_timeout.as_deref(),
+        after.wait_timeout.as_deref(),
         Some("5m"),
         "timeout survives bind"
     );
@@ -270,7 +270,7 @@ fn fork_from_worktree_lands_sibling_under_main_not_nested() {
         let l = clank_core::ids::AgentLabel::parse(label).unwrap();
         let cfg = clank_core::agent_config::AgentConfig {
             auto_mode: None,
-            wfw_timeout: None,
+            wait_timeout: None,
             session: Some(clank_core::agent_config::Session {
                 id: clank_core::ids::SessionId::parse(id).unwrap(),
                 tool,

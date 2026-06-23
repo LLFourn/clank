@@ -1,4 +1,4 @@
-//! `clank wfw` — block until the calling agent has wait-surface
+//! `clank wait` — block until the calling agent has wait-surface
 //! items to print.
 //!
 //! Two roles. `--role master` watches for plans where the gate
@@ -11,7 +11,7 @@
 //! reviewer action, so it never wakes a reviewer
 //! (`finish-does-not-wake-reviewers`).
 //!
-//! `wfw` folds the repo, runs `RepoState::derive_status` (which
+//! `wait` folds the repo, runs `RepoState::derive_status` (which
 //! threads `wait::compute_gate` over every plan), filters the
 //! result through `RepoState::work_for` for the agent's
 //! perspective, then — for master only — concatenates any
@@ -27,7 +27,7 @@ use std::time::Duration;
 
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 
-use super::{WfwArgs, resolve_repo};
+use super::{WaitArgs, resolve_repo};
 use crate::cli::block::scan_blocks;
 use crate::hook_config::{self, HookFiring};
 use crate::lifecycle::{AgentLabel, CommitSha, PlanKey};
@@ -41,13 +41,13 @@ use clank_core::wait::{StartupSnapshot, WaitItem, detect_finished};
 /// a sentinel error type instead of `process::exit` so `main` can
 /// translate it cleanly.
 #[derive(Debug)]
-pub struct WfwTimeout;
-impl std::fmt::Display for WfwTimeout {
+pub struct WaitTimeout;
+impl std::fmt::Display for WaitTimeout {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("wfw timed out")
+        f.write_str("wait timed out")
     }
 }
-impl std::error::Error for WfwTimeout {}
+impl std::error::Error for WaitTimeout {}
 
 fn firings_from_items(items: &[WaitItem]) -> Vec<HookFiring> {
     items
@@ -106,7 +106,7 @@ fn firings_from_items(items: &[WaitItem]) -> Vec<HookFiring> {
             | WaitItem::PromoteFromQueue { .. }
             | WaitItem::Blocked { .. }
             | WaitItem::Unblocked { .. }
-            // PR-review items surface via the stop-hook's `clank wfw`
+            // PR-review items surface via the stop-hook's `clank wait`
             // pull (like ad-hoc/queue items) rather than a dedicated
             // proactive OS hook — HookFiring is plan+sha keyed and PR
             // items are pr+round keyed.
@@ -116,7 +116,7 @@ fn firings_from_items(items: &[WaitItem]) -> Vec<HookFiring> {
         .collect()
 }
 
-pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
+pub async fn run(args: WaitArgs) -> anyhow::Result<()> {
     let timeout = parse_timeout(&args.timeout)?;
     // One env read for the entire process, here at the CLI
     // boundary. Downstream takes a plain `bool`.
@@ -154,7 +154,7 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
 
     let config = crate::cli::config::load(&repo);
     let hook_config = config.hooks.clone();
-    // Reviewer tiers from the team resolver. wfw is a workflow
+    // Reviewer tiers from the team resolver. wait is a workflow
     // command, so it hard-errors when no team is configured
     // (`teams-based-agent-registration` render-vs-workflow
     // boundary).
@@ -253,7 +253,7 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
         let queue = match crate::cli::queue::scan_queue_no_dups(&repo) {
             Ok(q) => q,
             Err(e) => {
-                eprintln!("wfw: {e}");
+                eprintln!("wait: {e}");
                 Vec::new()
             }
         };
@@ -280,7 +280,7 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
         // is suppressed by a plan-scoped block, we still emit the
         // Blocked items so the agent sees what's holding the queue.
         // (Empty-queue + plan-blocked behavior unchanged from today
-        // — wfw parks. The change is scoped to "queue had items we
+        // — wait parks. The change is scoped to "queue had items we
         // filtered out," matching the acceptance "plan-scoped blocks
         // continue to emit alongside the now-filtered promote scan.")
         if !queue.is_empty() && !initial_block_items.is_empty() {
@@ -309,7 +309,7 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
         let wait = match deadline {
             None => tick,
             Some(end) => match end.checked_duration_since(std::time::Instant::now()) {
-                None => return Err(WfwTimeout.into()),
+                None => return Err(WaitTimeout.into()),
                 Some(remaining) => remaining.min(tick),
             },
         };
@@ -319,7 +319,7 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
                 // Could be deadline-expiry or heartbeat-tick. Distinguish.
                 if let Some(end) = deadline {
                     if std::time::Instant::now() >= end {
-                        return Err(WfwTimeout.into());
+                        return Err(WaitTimeout.into());
                     }
                 }
                 false
@@ -401,7 +401,7 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
                 let queue = match crate::cli::queue::scan_queue_no_dups(&repo) {
                     Ok(q) => q,
                     Err(e) => {
-                        eprintln!("wfw: {e}");
+                        eprintln!("wait: {e}");
                         Vec::new()
                     }
                 };
@@ -489,22 +489,22 @@ fn check_blocks(repo: &Path, author: &AgentLabel) -> BlockResult {
     result
 }
 
-/// `clank wfw --json` envelope. The stop-hook parses this; the
+/// `clank wait --json` envelope. The stop-hook parses this; the
 /// contract is keys + values (not key order). Typed in place of the
 /// former ad-hoc `json!` (typed-json-not-json-macro).
 #[derive(serde::Serialize)]
-struct WfwEnvelope<'a> {
-    items: Vec<WfwJsonItem<'a>>,
+struct WaitEnvelope<'a> {
+    items: Vec<WaitJsonItem<'a>>,
 }
 
 fn emit(items: &[WaitItem], json: bool) {
     if json {
-        let envelope = WfwEnvelope {
+        let envelope = WaitEnvelope {
             items: items.iter().map(render_json).collect(),
         };
         println!(
             "{}",
-            serde_json::to_string(&envelope).expect("serialize wfw envelope")
+            serde_json::to_string(&envelope).expect("serialize wait envelope")
         );
     } else {
         for item in items {
@@ -523,7 +523,7 @@ fn short(sha: &CommitSha) -> &str {
     &sha.as_str()[..sha.as_str().len().min(12)]
 }
 
-/// Typed rows for `clank wfw --json` (typed-json-not-json-macro,
+/// Typed rows for `clank wait --json` (typed-json-not-json-macro,
 /// replacing per-variant `json!`). `#[serde(tag = "kind")]` emits the
 /// discriminant alongside the fields. Borrows from the source
 /// `WaitItem` (no clones); the computed `plan_path` is the one owned
@@ -531,7 +531,7 @@ fn short(sha: &CommitSha) -> &str {
 /// irrelevant (the stop-hook parses the JSON).
 #[derive(serde::Serialize)]
 #[serde(tag = "kind")]
-enum WfwJsonItem<'a> {
+enum WaitJsonItem<'a> {
     #[serde(rename = "master")]
     Master {
         plan: &'a str,
@@ -599,7 +599,7 @@ fn plan_path(plan: &PlanKey) -> String {
     format!(".clank/plans/{}.md", plan.as_str())
 }
 
-fn render_json(item: &WaitItem) -> WfwJsonItem<'_> {
+fn render_json(item: &WaitItem) -> WaitJsonItem<'_> {
     match item {
         WaitItem::Master {
             plan,
@@ -607,7 +607,7 @@ fn render_json(item: &WaitItem) -> WfwJsonItem<'_> {
             next,
             reason,
             gate,
-        } => WfwJsonItem::Master {
+        } => WaitJsonItem::Master {
             plan: plan.as_str(),
             plan_path: plan_path(plan),
             sha: sha.as_str(),
@@ -619,24 +619,24 @@ fn render_json(item: &WaitItem) -> WfwJsonItem<'_> {
             plan,
             sha,
             feedback_path,
-        } => WfwJsonItem::Reviewer {
+        } => WaitJsonItem::Reviewer {
             plan: plan.as_str(),
             plan_path: plan_path(plan),
             sha: sha.as_str(),
             feedback_path,
         },
-        WaitItem::Finished { plan, finalized_at } => WfwJsonItem::Finished {
+        WaitItem::Finished { plan, finalized_at } => WaitJsonItem::Finished {
             plan: plan.as_str(),
             plan_path: plan_path(plan),
             finalized_at: finalized_at.as_str(),
         },
-        WaitItem::Idle { prompt } => WfwJsonItem::Idle { prompt },
-        WaitItem::AdHocReview { sha, feedback_path } => WfwJsonItem::AdHocReview {
+        WaitItem::Idle { prompt } => WaitJsonItem::Idle { prompt },
+        WaitItem::AdHocReview { sha, feedback_path } => WaitJsonItem::AdHocReview {
             sha: sha.as_str(),
             feedback_path,
         },
-        WaitItem::AdHocRevise { sha } => WfwJsonItem::AdHocRevise { sha: sha.as_str() },
-        WaitItem::FixCommitTag { sha, violation } => WfwJsonItem::FixCommitTag {
+        WaitItem::AdHocRevise { sha } => WaitJsonItem::AdHocRevise { sha: sha.as_str() },
+        WaitItem::FixCommitTag { sha, violation } => WaitJsonItem::FixCommitTag {
             sha: sha.as_str(),
             unknown: &violation.unknown,
             untagged_touched: violation
@@ -646,7 +646,7 @@ fn render_json(item: &WaitItem) -> WfwJsonItem<'_> {
                 .collect(),
             extra_named: violation.extra_named.iter().map(|p| p.as_str()).collect(),
         },
-        WaitItem::PromoteFromQueue { name, priority } => WfwJsonItem::PromoteFromQueue {
+        WaitItem::PromoteFromQueue { name, priority } => WaitJsonItem::PromoteFromQueue {
             name,
             priority: *priority,
         },
@@ -655,22 +655,22 @@ fn render_json(item: &WaitItem) -> WfwJsonItem<'_> {
             name,
             plan,
             question,
-        } => WfwJsonItem::Blocked {
+        } => WaitJsonItem::Blocked {
             agent,
             name,
             plan: plan.as_deref(),
             question,
         },
-        WaitItem::Unblocked { name, plan, answer } => WfwJsonItem::Unblocked {
+        WaitItem::Unblocked { name, plan, answer } => WaitJsonItem::Unblocked {
             name,
             plan: plan.as_deref(),
             answer,
         },
-        WaitItem::PrReviewer { pr, round } => WfwJsonItem::PrReviewer {
+        WaitItem::PrReviewer { pr, round } => WaitJsonItem::PrReviewer {
             pr: *pr,
             round: *round,
         },
-        WaitItem::PrMaster { pr, round, next } => WfwJsonItem::PrMaster {
+        WaitItem::PrMaster { pr, round, next } => WaitJsonItem::PrMaster {
             pr: *pr,
             round: *round,
             next,
@@ -1038,15 +1038,15 @@ mod tests {
         assert_eq!(j["question"], "should we?", "question stays a json field");
     }
 
-    // ── typed-json-not-json-macro: wfw --json wire contract ──────
+    // ── typed-json-not-json-macro: wait --json wire contract ──────
     //
-    // Each typed `WfwJsonItem` must serialize to the same keys+values
-    // the old per-variant `json!` produced — the `clank wfw --json`
+    // Each typed `WaitJsonItem` must serialize to the same keys+values
+    // the old per-variant `json!` produced — the `clank wait --json`
     // contract the stop-hook parses. `json!` here expresses the
     // EXPECTED value (the ban is on production output code); key order
     // is irrelevant — `to_value` equality is order-independent.
     #[test]
-    fn wfw_json_items_serialize_to_the_stable_shape() {
+    fn wait_json_items_serialize_to_the_stable_shape() {
         use clank_core::vocab::WaitingReason;
         use clank_core::wait::{MasterNext, PrMasterNext};
 
@@ -1210,11 +1210,11 @@ mod tests {
     }
 
     #[test]
-    fn wfw_json_envelope_wraps_items_under_items_key() {
+    fn wait_json_envelope_wraps_items_under_items_key() {
         let item = WaitItem::Idle {
             prompt: "go".into(),
         };
-        let envelope = WfwEnvelope {
+        let envelope = WaitEnvelope {
             items: vec![render_json(&item)],
         };
         let got = serde_json::to_value(&envelope).unwrap();

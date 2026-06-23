@@ -216,7 +216,7 @@ pub async fn run_fork_pinned(
     members.extend(set.gate_reviewers.iter().map(|a| a.label.clone()));
 
     // Keep each member's FULL source config: the session drives the
-    // fork spec, and auto_mode/wfw_timeout get carbon-copied into the
+    // fork spec, and auto_mode/wait_timeout get carbon-copied into the
     // fork (fork-carbon-copy-agent-config).
     let mut sessions: Vec<(AgentLabel, clank_core::agent_config::AgentConfig)> = Vec::new();
     let mut missing: Vec<String> = Vec::new();
@@ -311,10 +311,10 @@ pub async fn run_fork_pinned(
         // carries the source's explicit override
         // (fork-carbon-copy-agent-config). `clank as` later MERGES the
         // new session into this config, preserving these fields.
-        if src_cfg.auto_mode.is_some() || src_cfg.wfw_timeout.is_some() {
+        if src_cfg.auto_mode.is_some() || src_cfg.wait_timeout.is_some() {
             let carried = clank_core::agent_config::AgentConfig {
                 auto_mode: src_cfg.auto_mode,
-                wfw_timeout: src_cfg.wfw_timeout.clone(),
+                wait_timeout: src_cfg.wait_timeout.clone(),
                 session: None,
             };
             crate::agent_store::save_agent_config(&dest, label, &carried).with_context(|| {

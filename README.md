@@ -67,7 +67,7 @@ clank auto on           # enable the Stop hook
 
 (`clank init` does both interactively if you'd rather.)
 
-Now `clank wfw`, `clank feedback write`, etc. all infer `--author alice`
+Now `clank wait`, `clank feedback write`, etc. all infer `--author alice`
 from the session.
 
 ### Master: write a plan
@@ -79,11 +79,11 @@ git add .clank/plans/my-feature.md
 git commit -m "[my-feature] intro"
 ```
 
-Reviewer wfw fires on the new commit.
+Reviewer wait fires on the new commit.
 
 ### Reviewers: review
 
-A reviewer waiting on work (`clank wfw`, or the Stop hook auto-mode)
+A reviewer waiting on work (`clank wait`, or the Stop hook auto-mode)
 gets told there's a commit to review. They write feedback via:
 
 ```sh
@@ -101,7 +101,7 @@ Or `REQUEST_CHANGES` with notes. The header (`APPROVE` /
 
 ### Master: address feedback
 
-If anyone requested changes, master's wfw says so. Edit the plan or
+If anyone requested changes, master's wait says so. Edit the plan or
 code, commit, and the cycle repeats. Once everyone has approved the
 latest reviewable commit, master implements:
 
@@ -125,7 +125,7 @@ and commits the finalize.
 `clank setup` installs a Stop hook into your claude / codex config that
 runs whenever the agent would end a turn. Two modes:
 
-When enabled, the hook long-polls `clank wfw`. The agent's turn
+When enabled, the hook long-polls `clank wait`. The agent's turn
 doesn't end until work arrives or the timeout expires. When there's
 no work and no active plans, the hook exits silently.
 
@@ -202,7 +202,7 @@ finalized seal.
 clank status                       # current plan + gate state
 clank status --all                  # every plan including finished
 clank doctor                        # diagnose setup across all scopes
-clank wfw                           # block for work for this agent
+clank wait                           # block for work for this agent
 clank feedback write ...            # write a review
 clank finish <plan>                 # finalize an approved plan
 clank purge <plan>                  # strip a plan's artifacts from git history

@@ -136,7 +136,7 @@ pub struct QueueEntry {
 /// Validate that no two entries share the same `name`. Returns
 /// the entry list on success, or a loud error naming every
 /// conflicting file pair. Callers that act on a queue item
-/// (wfw promote, queue remove/promote) should use this; callers
+/// (wait promote, queue remove/promote) should use this; callers
 /// that merely render (list, status count) can stay on
 /// `scan_queue`.
 pub fn scan_queue_no_dups(repo: &Path) -> anyhow::Result<Vec<QueueEntry>> {

@@ -74,7 +74,8 @@ enum Command {
     Status(cli::StatusArgs),
     /// Wait-for-work: block until the calling agent has actionable
     /// work on one of the repo's active plans.
-    Wfw(cli::WfwArgs),
+    #[command(visible_alias = "wfw")]
+    Wait(cli::WaitArgs),
     /// Read / write feedback files via a typed CLI surface (vs.
     /// editing the on-disk paths directly).
     Feedback(cli::FeedbackArgs),
@@ -136,7 +137,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Open(args) => cli::open::run(args).await,
         Command::Rewire(args) => cli::rewire::run(args).await,
         Command::Status(args) => cli::status::run(args).await,
-        Command::Wfw(args) => cli::wfw::run(args).await,
+        Command::Wait(args) => cli::wait::run(args).await,
         Command::Feedback(args) => cli::feedback::run(args).await,
         Command::As(args) => cli::as_cmd::run(args).await,
         Command::Auto(args) => cli::auto::run(args).await,
@@ -155,16 +156,35 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Map error variants to exit codes. Defaults to 1; `wfw` timeout
+/// Map error variants to exit codes. Defaults to 1; `wait` timeout
 /// returns 2; status's "ambiguous active plans" returns 3.
 fn exit_code_for(err: &anyhow::Error) -> i32 {
-    if err.downcast_ref::<cli::wfw::WfwTimeout>().is_some() {
+    if err.downcast_ref::<cli::wait::WaitTimeout>().is_some() {
         return 2;
     }
     if err.downcast_ref::<cli::doctor::DoctorFailed>().is_some() {
         return 1;
     }
     1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wait_command_keeps_wfw_alias() {
+        // The command is `clank wait`; `clank wfw` must keep parsing
+        // to it through the rename (visible alias, pinned here).
+        assert!(matches!(
+            Cli::try_parse_from(["clank", "wait"]).unwrap().command,
+            Command::Wait(_)
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["clank", "wfw"]).unwrap().command,
+            Command::Wait(_)
+        ));
+    }
 }
 
 fn init_tracing() {

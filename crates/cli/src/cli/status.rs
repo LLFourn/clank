@@ -220,7 +220,7 @@ impl StatusSnapshot {
         // DEGRADES on a team-less / misconfigured repo: no team →
         // empty reviewer tiers → gate computes as zero-reviewer
         // (Approved). It never hard-errors the way the
-        // workflow-driving commands (wfw / finish / promote) do.
+        // workflow-driving commands (wait / finish / promote) do.
         let registered = crate::agent_store::try_resolve_via_team_with(repo, home)
             .ok()
             .flatten();

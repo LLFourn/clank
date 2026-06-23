@@ -122,7 +122,7 @@ impl std::error::Error for EnvError {}
 /// High-level wrapper: read env, load this repo's agent configs,
 /// and call the pure `resolve_agent_identity`. The single way
 /// any non-hook CLI command finds out "who am I" — used by
-/// `clank auto`, `clank wfw`, `clank feedback write` (later),
+/// `clank auto`, `clank wait`, `clank feedback write` (later),
 /// and `clank doctor`.
 ///
 /// Stop-hook callers go through a different path because they
