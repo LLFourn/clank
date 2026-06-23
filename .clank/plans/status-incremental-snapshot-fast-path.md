@@ -1,0 +1,120 @@
+# status-incremental-snapshot-fast-path
+
+Implement the core of the finished `status-incremental-snapshot` design (which
+was DESIGN-ONLY — it specified the model and never shipped code, which is why
+`clank status --tui` still pegs the CPU). This plan delivers the high-leverage
+slice that actually kills the bug. The full materialized-view delta stream
+(classified-wake channel, per-input updaters) from that design remains a
+follow-up; it is NOT required to stop the storm.
+
+Sharpened by the intro-review derivation ruthless did on the (now-dropped)
+`status-tui-fsync-storm-research` plan — that research is subsumed here.
+
+## The bug (live evidence)
+
+`clank status --tui` in a worktree whose files churn (a running app) sat at
+**35.5% CPU for 3h17m**. `sample` collapsed onto one path:
+
+```
+status::run → build_async → log_rows_windowed → rebuild_from → fold_events
+  → state_cache::write → File::sync_all → fcntl(F_FULLFSYNC)   729/821 samples
+```
+
+Every watcher event throws the whole snapshot away and `build_async` re-gathers
+every input from scratch; the log-window rebuild re-folds and the fold writes a
+checkpoint with a full fsync — per frame. (This is the "sustained-33%-CPU bug"
+the design already named.)
+
+## Root cause (ruthless, independently derived)
+
+The write policy and the evict policy DISAGREE on the survivor set:
+
+- `should_checkpoint` (write, `crates/core/src/checkpoint.rs`) allows a gap of
+  `distance/2`, so near the tip (distances 0,1,2,3) it writes EVERY commit:
+  tip, tip-1, tip-2, tip-3.
+- `prune_plan` (evict) keeps one checkpoint per power-of-two distance bucket
+  (bucket0={0,1}, bucket1={2,3}, …), keeping the deepest per bucket — so it
+  keeps tip, tip-1, tip-2 but **DELETES tip-3** (and deeper bucket collisions).
+
+So every `rebuild_from` rewrites depth tip-3 (write + F_FULLFSYNC), and the
+trailing `prune_checkpoints` deletes tip-3 again. Next frame: identical. The
+idempotency guard `status-tui-watch-cpu` added (`final_path.exists()` at
+`state_cache.rs:197`) CANNOT help — prune removed the file between frames, so
+`exists()` is false every time. Eviction-policy-fights-the-write-policy.
+
+This thrash is latent on EVERY fold, not just the TUI render; it is merely
+masked off the hot path elsewhere.
+
+## The fixes (all three; the first two are the model, the third is hygiene)
+
+### Fix 1 — render reads, fold writes (strongest; structural)
+
+`log_rows_windowed` is a RENDER path but calls `rebuild_from`, which folds with
+`checkpoint=true` AND prunes — a read with the side effect of writing and
+deleting cache files. `fold_events` already takes `checkpoint: bool`.
+
+- The render must fold READ-ONLY: take a path through `rebuild_from`/
+  `fold_events` with `checkpoint=false` and NO `prune_checkpoints`.
+- The checkpoint cache is mutated ONLY by a deliberate rebuild
+  (`rebuild_with_diagnostics`).
+
+This makes "a render mutates the cache" structurally impossible — the class of
+bug, not just this instance.
+
+### Fix 2 — nothing-changed gate at the snapshot level (lloyd's invariant)
+
+> "it shouldn't write the cache if nothing has happened."
+
+In `build_async`: if HEAD sha AND working-tree dirty-state are unchanged since
+the last snapshot, REUSE the last snapshot — zero re-fold, zero write, zero
+fsync. ONE gate, named at the snapshot level — NOT a `cp.sha==h` fast path
+bolted onto `rebuild_from` (that only mirrors `rebuild_with_diagnostics` and
+leaves the render-writes-cache smell). This is the first concrete slice of the
+incremental-snapshot model: the per-event fast path does no full rebuild.
+
+### Fix 3 — align write & evict policies (do regardless)
+
+Make `should_checkpoint` and `prune_plan` agree on the SAME survivor set so a
+fresh fold's output survives its own trailing prune (no write→delete→rewrite).
+Kills the latent per-fold fsync everywhere, independent of the render fix.
+
+## Testing (no-binary-spawning; in-process cores)
+
+- **Policy fixed-point (would have caught the storm):** write a fold's
+  checkpoints, run `prune`, assert ZERO deletions among the just-written
+  depths. (Today `cold_fold_write_pattern`, `prune_rebalances`,
+  `prune_is_idempotent` each check one policy in isolation; nothing pins their
+  AGREEMENT.)
+- **Render is read-only:** a `log_rows_windowed`-equivalent over a fixture repo
+  writes and deletes ZERO files under `.clank/cache/` (snapshot the dir before/
+  after).
+- **Nothing-changed reuse:** a second `build_async` with unchanged HEAD+dirty
+  performs no fold and no cache write (assert via the existing ODB-open /
+  cache-write fitness counters — extend `status_build_opens_the_odb_once_per_phase`).
+
+## Reproduce-first, then validate (settles design Q1 empirically)
+
+ruthless's falsifiable prediction: the mechanism is independent of the guard,
+so the FRESH binary still thrashes. Before fixing: restart `clank status --tui`
+on the freshly-installed binary in a churning worktree and re-`sample` to
+confirm the fsync thrash (proves live bug, not stale binary). After fixing:
+re-sample and confirm the process sits at idle CPU when nothing changes.
+
+## Acceptance
+
+- `clank status --tui` sits at idle CPU on a churning repo when HEAD/dirty are
+  unchanged (no per-frame fsync).
+- A render NEVER mutates `.clank/cache/` (Fix 1, pinned by test).
+- `build_async` reuses the prior snapshot when HEAD+dirty are unchanged
+  (Fix 2, pinned by test).
+- `should_checkpoint` and `prune_plan` agree on the survivor set (Fix 3, pinned
+  by the fold-then-prune-is-a-fixed-point test).
+- Reproduced on the fresh binary before the fix; re-sampled idle after.
+
+## Out of scope (follow-ups from the status-incremental-snapshot design)
+
+- The full typed-delta wake stream: classified-wake channel, per-input updaters
+  (`dirty`, per-sha `reviews`, `blocks`/config), burst coalescing into a delta
+  union. Fix 2 is the reuse-gate that makes these incremental updates the next
+  step, not a prerequisite.
+- gix conversion of dirty/worktree (`status-dirty-stats-via-gix`).
