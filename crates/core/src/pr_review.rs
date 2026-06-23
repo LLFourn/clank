@@ -247,6 +247,20 @@ mod tests {
     }
 
     #[test]
+    fn verdict_continue_parses_and_legacy_approve_is_continue() {
+        // New PR-review files write `verdict: continue`.
+        let now = ReviewerVerdict::parse("verdict: continue\nround: 2\n\nlgtm\n").unwrap();
+        assert_eq!(now.verdict, Verdict::Continue);
+        // Back-compat: a reviews file written before the APPROVE→CONTINUE
+        // rename carries `verdict: approve`. This is the custom frontmatter
+        // parser (ReviewerVerdict is NOT serde), so the alias lives here —
+        // it must still read as Continue or an in-flight PR review loses
+        // that verdict.
+        let legacy = ReviewerVerdict::parse("verdict: approve\nround: 2\n\nlgtm\n").unwrap();
+        assert_eq!(legacy.verdict, Verdict::Continue);
+    }
+
+    #[test]
     fn verdict_rejects_corrupt_files() {
         assert_eq!(
             ReviewerVerdict::parse("round: 1\n\nx"),

@@ -36,6 +36,13 @@ So the alias MUST live on the READ/parse path, not just CLI input:
   `CONTINUE`/`CONTINUE ` (new) AND legacy `APPROVE`/`APPROVE ` → `Verdict::Continue`
   (and the summary-extraction at :53). Without this, every historical feedback
   file mis-gates.
+- **PR-review `ReviewerVerdict::parse` (`crates/core/src/pr_review.rs:135`)** —
+  the SAME shape on the PR-review path: a `reviews/<label>.md` frontmatter
+  `verdict:` value. `ReviewerVerdict` is NOT serde-derived (it has a custom
+  text parser/renderer), so the legacy `approve` alias lives in that parser
+  (`"continue" | "approve"` → `Continue`), NOT in a serde alias. Without it an
+  in-flight PR review that recorded `verdict: approve` pre-rename loses its
+  verdict.
 - **Write side (`crates/cli/src/cli/feedback.rs:29,168`)** — the header clank
   WRITES becomes `Continue => "CONTINUE"`. New files say `CONTINUE`.
 - **CLI `--verdict`** — `continue` is the ONLY positive value; NO clap alias
@@ -57,9 +64,13 @@ So the alias MUST live on the READ/parse path, not just CLI input:
   place keeps its position, so cached payloads stay decodable — do NOT reorder
   variants. (No `CACHE_FORMAT_VERSION` bump needed; the rename is name-only.)
 
-Pin the persisted alias with a test: a feedback body of `"APPROVE\n\nLGTM\n"`
-parses to `Verdict::Continue` and gates identically to a `CONTINUE` body. (No
-CLI-alias test — the CLI deliberately rejects `approve`.)
+Pin BOTH read-path aliases with tests: a gate feedback body of
+`"APPROVE\n\nLGTM\n"` parses to `Verdict::Continue`
+(`parse_verdict_legacy_approve_is_continue`), and a PR-review frontmatter
+`verdict: approve` parses to `Verdict::Continue`
+(`verdict_continue_parses_and_legacy_approve_is_continue`). (No CLI-alias test —
+the CLI deliberately rejects `approve`; no serde-alias test — there is no serde
+verdict path to alias.)
 
 ## Out of scope — do NOT rename
 
@@ -97,9 +108,11 @@ both — flag for the reviewers.)
 ## Acceptance
 
 - The clank verdict is `CONTINUE` across skills, CLI, code, docs. `approve` is
-  accepted ONLY by the on-disk feedback-file parser (read-compat), pinned by a
-  test; the CLI `--verdict approve` is rejected by clap (no alias — enforced
-  structurally, not a separate test, per no-tests-for-removed).
+  accepted ONLY by the two on-disk parsers — `parse_verdict` (gate feedback) and
+  `ReviewerVerdict::parse` (PR-review frontmatter) — each pinned by a legacy-
+  `approve` test. The CLI `--verdict approve` is rejected by clap (no alias —
+  enforced structurally, not a separate test, per no-tests-for-removed); there
+  is no serde verdict path, so no serde alias.
 - A legacy `APPROVE` feedback file parses + gates identically to `CONTINUE`.
 - Gate states / waiting reason renamed to track the verb; wincode positions
   unchanged so caches stay valid.
