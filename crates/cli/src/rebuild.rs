@@ -47,6 +47,7 @@ pub async fn rebuild_repo(repo_root: &Path) -> Result<RepoState, RebuildError> {
 /// resume point for a first-parent fold (codex 6b1c549).
 fn find_base_checkpoint(
     repo_root: &Path,
+    git: &git_io::Repo,
     target: &CommitSha,
 ) -> Option<(state_cache::CheckpointRef, RepoState)> {
     let mut checkpoints = state_cache::list_checkpoints(repo_root);
@@ -55,7 +56,7 @@ fn find_base_checkpoint(
     loop {
         let candidates: std::collections::HashSet<CommitSha> =
             checkpoints.iter().map(|c| c.sha.clone()).collect();
-        let hit = match git_io::first_parent_chain_find(repo_root, target, &candidates) {
+        let hit = match git_io::first_parent_chain_find(git, target, &candidates) {
             Ok(Some(sha)) => sha,
             Ok(None) => return None,
             Err(e) => {
@@ -170,7 +171,9 @@ pub async fn rebuild_from(
     from: Option<&CommitSha>,
     to: &CommitSha,
 ) -> Result<(RepoState, Vec<LogEvent>), RebuildError> {
-    let base = from.and_then(|f| find_base_checkpoint(repo_root, f));
+    // One handle for both range walks (and the checkpoint probe).
+    let git = git_io::open(repo_root)?;
+    let base = from.and_then(|f| find_base_checkpoint(repo_root, &git, f));
     let (mut state, base_depth) = match base {
         Some((cp, s)) => (s, cp.depth),
         None => (RepoState::empty(repo_root.to_path_buf()), 0),
@@ -180,11 +183,11 @@ pub async fn rebuild_from(
     // computed against the real tip (`to`), not the phase boundary.
     let silent_target = from.cloned();
     let phase1 = match silent_target.as_ref() {
-        Some(target) => git_io::commit_events_between(repo_root, state.head.as_ref(), target)?,
+        Some(target) => git_io::commit_events_between(&git, state.head.as_ref(), target)?,
         None => Vec::new(),
     };
     let phase2_base = silent_target.clone().or_else(|| state.head.clone());
-    let phase2 = git_io::commit_events_between(repo_root, phase2_base.as_ref(), to)?;
+    let phase2 = git_io::commit_events_between(&git, phase2_base.as_ref(), to)?;
     let mid_depth = base_depth + phase1.len() as u64;
     let tip_depth = mid_depth + phase2.len() as u64;
 
@@ -215,8 +218,17 @@ pub async fn rebuild_with_diagnostics(
     repo_root: &Path,
     policy: CachePolicy,
 ) -> Result<(RepoState, RebuildDiagnostics), RebuildError> {
-    let head = git_io::rev_parse_head(repo_root)?;
-    let Some(h) = head else {
+    // One handle for the whole fold: HEAD read, checkpoint-ancestry
+    // probe, and every range walk reuse it (no per-call re-open). A
+    // non-repo path degrades to empty state, matching the old lenient
+    // `rev_parse_head` → `None`.
+    let Ok(git) = git_io::open(repo_root) else {
+        return Ok((
+            RepoState::empty(repo_root.to_path_buf()),
+            RebuildDiagnostics { cache_hit: false },
+        ));
+    };
+    let Some(h) = git_io::head_sha(&git)? else {
         // Unborn HEAD / no commits: nothing to fold.
         return Ok((
             RepoState::empty(repo_root.to_path_buf()),
@@ -225,13 +237,13 @@ pub async fn rebuild_with_diagnostics(
     };
 
     if policy == CachePolicy::Use
-        && let Some((cp, mut state)) = find_base_checkpoint(repo_root, &h)
+        && let Some((cp, mut state)) = find_base_checkpoint(repo_root, &git, &h)
     {
         if cp.sha == h {
             return Ok((state, RebuildDiagnostics { cache_hit: true }));
         }
         // Fold-forward from the checkpoint to HEAD.
-        match git_io::commit_events_between(repo_root, Some(&cp.sha), &h) {
+        match git_io::commit_events_between(&git, Some(&cp.sha), &h) {
             Ok(events) => {
                 let tip_depth = cp.depth + events.len() as u64;
                 let _ = fold_events(repo_root, &mut state, events, cp.depth, tip_depth, true);
@@ -252,7 +264,7 @@ pub async fn rebuild_with_diagnostics(
     }
 
     // Cold fold from the repo root.
-    let events = git_io::commit_events_between(repo_root, None, &h)?;
+    let events = git_io::commit_events_between(&git, None, &h)?;
     let tip_depth = events.len() as u64;
     let mut state = RepoState::empty(repo_root.to_path_buf());
     let checkpoint = policy == CachePolicy::Use;
@@ -537,7 +549,8 @@ mod tests {
         for k in [1u64, 3, 5, 10] {
             let target_depth = 40 - k;
             let target = &shas[(target_depth - 1) as usize];
-            let (cp, _) = find_base_checkpoint(dir.path(), target)
+            let git = git_io::open(dir.path()).unwrap();
+            let (cp, _) = find_base_checkpoint(dir.path(), &git, target)
                 .unwrap_or_else(|| panic!("base for HEAD~{k}"));
             let gap = target_depth - cp.depth;
             assert!(
@@ -588,7 +601,8 @@ mod tests {
         );
 
         // Second identical fold resumes from a nearby checkpoint…
-        let (cp, _) = find_base_checkpoint(dir.path(), &from).expect("base exists now");
+        let git = git_io::open(dir.path()).unwrap();
+        let (cp, _) = find_base_checkpoint(dir.path(), &git, &from).expect("base exists now");
         assert!(cp.depth >= 24, "dense-near-tip base, got {}", cp.depth);
         // …and produces the identical result.
         let (state_warm, events_warm) = rebuild_from(dir.path(), Some(&from), &head).await.unwrap();
@@ -633,9 +647,10 @@ mod tests {
             git_io::is_ancestor(repo, &side_tip, &head).unwrap(),
             "precondition: side tip IS a graph ancestor (the trap)"
         );
+        let git = git_io::open(repo).unwrap();
         assert!(
-            find_base_checkpoint(repo, &head).is_none()
-                || find_base_checkpoint(repo, &head).unwrap().0.sha != side_tip,
+            find_base_checkpoint(repo, &git, &head).is_none()
+                || find_base_checkpoint(repo, &git, &head).unwrap().0.sha != side_tip,
             "side-branch checkpoint offered as resume base"
         );
 
@@ -684,5 +699,44 @@ mod tests {
         // one-per-bucket relative to the new tip.
         let old_cluster = depths.iter().filter(|&&d| (25..=30).contains(&d)).count();
         assert!(old_cluster <= 2, "stale density remains: {depths:?}");
+    }
+
+    /// The fitness function for thread-gix-repo-handle: a fold opens the
+    /// ODB EXACTLY once (HEAD read + checkpoint probe + range walks all
+    /// reuse one handle). An exact count, not a loose bound — a stray
+    /// re-open fails loudly. `#[tokio::test]` is current-thread, so the
+    /// fold's `git_io::open` calls land on this test's thread, where the
+    /// thread-local counter observes them.
+    #[tokio::test]
+    async fn fold_opens_the_odb_once() {
+        let dir = init_repo();
+        write_file(dir.path(), ".clank/plans/foo.md", "# foo\n");
+        commit(dir.path(), "[foo] intro");
+        many_commits(dir.path(), 8);
+
+        // Cold fold (cache bypassed): HEAD read + cold range walk, one open.
+        git_io::OPEN_COUNT.with(|c| c.set(0));
+        let _ = rebuild_with_diagnostics(dir.path(), CachePolicy::Bypass)
+            .await
+            .unwrap();
+        assert_eq!(
+            git_io::OPEN_COUNT.with(|c| c.get()),
+            1,
+            "cold fold must open the ODB exactly once"
+        );
+
+        // Prime the cache, add commits, then a warm fold-forward: HEAD
+        // read + checkpoint-ancestry probe + fold-forward walk, still one.
+        let _ = rebuild_repo(dir.path()).await.unwrap();
+        many_commits(dir.path(), 4);
+        git_io::OPEN_COUNT.with(|c| c.set(0));
+        let _ = rebuild_with_diagnostics(dir.path(), CachePolicy::Use)
+            .await
+            .unwrap();
+        assert_eq!(
+            git_io::OPEN_COUNT.with(|c| c.get()),
+            1,
+            "warm fold-forward must open the ODB exactly once"
+        );
     }
 }

@@ -37,16 +37,45 @@ fn nonzero(context: impl Into<String>, e: impl std::fmt::Display) -> GitIoError 
 
 /// An opened repository handle. Wraps `gix` so callers can reuse one
 /// open ODB across several reads WITHOUT naming `gix` themselves —
-/// this module is the git-access boundary, and the handle is how the
-/// status snapshot opens the ODB once (`from_state`) and threads it
-/// through both the dirty walk and the per-plan worktree-status reads.
+/// this module is the git-access boundary, and the handle is how a fold
+/// / status build / log render opens the ODB ONCE and threads it through
+/// every read, instead of re-opening (and re-reading pack indexes) per
+/// call.
 pub struct Repo(gix::Repository);
 
-/// Open `repo` for reuse across reads. See [`Repo`].
+// Counts `open` calls, for the open-once fitness tests. Thread-local so
+// parallel tests don't interfere (each `#[tokio::test]` is current-thread,
+// so a fold's `open`s land on the test's thread).
+#[cfg(test)]
+thread_local! {
+    pub static OPEN_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Open `repo` for reuse across reads. See [`Repo`]. Sets a warm object
+/// cache: the fold walk + gated diffs revisit parent trees/commits, so
+/// caching makes those re-reads near-free across the handle's lifetime.
 pub fn open(repo: &Path) -> Result<Repo, GitIoError> {
-    gix::open(repo)
-        .map(Repo)
-        .map_err(|e| nonzero(format!("gix open `{}`", repo.display()), e))
+    #[cfg(test)]
+    OPEN_COUNT.with(|c| c.set(c.get() + 1));
+    let mut r =
+        gix::open(repo).map_err(|e| nonzero(format!("gix open `{}`", repo.display()), e))?;
+    r.object_cache_size_if_unset(16 * 1024 * 1024);
+    Ok(Repo(r))
+}
+
+/// HEAD's commit sha via an existing handle (`None` on unborn HEAD) —
+/// the [`rev_parse_head`] read for callers that already hold a [`Repo`].
+pub fn head_sha(h: &Repo) -> Result<Option<CommitSha>, GitIoError> {
+    match h
+        .0
+        .head()
+        .ok()
+        .and_then(|head| head.id())
+        .map(|id| id.detach())
+    {
+        None => Ok(None),
+        Some(oid) => Ok(Some(parse_sha("head_id", &oid.to_string())?)),
+    }
 }
 
 /// Worktree dirt summary: +/− line counts vs HEAD (staged and
@@ -420,7 +449,7 @@ pub fn head_commit(
     let head = state.head.as_ref()?;
     let subject = commit_subject(repo, head).unwrap_or_default();
     let from = parent_of(repo, head).ok().flatten();
-    let touched = commit_events_between(repo, from.as_ref(), head)
+    let touched = commit_events_between_at(repo, from.as_ref(), head)
         .ok()
         .and_then(|evs| evs.into_iter().last())
         .map(|ev| {
@@ -893,8 +922,18 @@ fn clank_entry_oid(
 /// merges in is a graph ancestor, but resuming from it mixes
 /// side-branch folded state with the first-parent walk and
 /// duplicates the merge's `.clank` changes (codex 6b1c549).
-pub fn first_parent_chain_find(
+pub fn first_parent_chain_find_at(
     repo_path: &Path,
+    tip: &CommitSha,
+    candidates: &std::collections::HashSet<CommitSha>,
+) -> Result<Option<CommitSha>, GitIoError> {
+    first_parent_chain_find(&open(repo_path)?, tip, candidates)
+}
+
+/// Handle-based [`first_parent_chain_find_at`] — the fold reuses its one
+/// [`Repo`] for the checkpoint-ancestry probe.
+pub fn first_parent_chain_find(
+    repo: &Repo,
     tip: &CommitSha,
     candidates: &std::collections::HashSet<CommitSha>,
 ) -> Result<Option<CommitSha>, GitIoError> {
@@ -902,12 +941,7 @@ pub fn first_parent_chain_find(
     if candidates.is_empty() {
         return Ok(None);
     }
-    let mut repo = gix::open(repo_path).map_err(|e| GitIoError::NonZero {
-        context: CONTEXT.into(),
-        code: None,
-        stderr: format!("gix open: {e}"),
-    })?;
-    repo.object_cache_size_if_unset(4 * 1024 * 1024);
+    let repo = &repo.0;
     let mut cursor =
         gix::ObjectId::from_hex(tip.as_str().as_bytes()).map_err(|e| GitIoError::Parse {
             context: CONTEXT.into(),
@@ -948,8 +982,18 @@ pub fn first_parent_chain_find(
 /// (plan resurrected from outside, plan file moved out) must keep
 /// their rename pairing so `CommitChanges` matches
 /// `diff_tree_changes` exactly. Such commits are the rare case.
-pub fn commit_events_between(
+pub fn commit_events_between_at(
     repo_path: &Path,
+    base: Option<&CommitSha>,
+    tip: &CommitSha,
+) -> Result<Vec<CommitEvent>, GitIoError> {
+    commit_events_between(&open(repo_path)?, base, tip)
+}
+
+/// Handle-based [`commit_events_between_at`] — the fold opens one [`Repo`]
+/// and reuses it across every range walk (warm object cache included).
+pub fn commit_events_between(
+    repo: &Repo,
     base: Option<&CommitSha>,
     tip: &CommitSha,
 ) -> Result<Vec<CommitEvent>, GitIoError> {
@@ -959,10 +1003,7 @@ pub fn commit_events_between(
         code: None,
         stderr: format!("{stage}: {e}"),
     };
-    let mut repo = gix::open(repo_path).map_err(|e| walk_err(&e, "gix open"))?;
-    // The walk and gated diffs revisit parent commits and trees;
-    // an in-memory object cache makes those re-reads near-free.
-    repo.object_cache_size_if_unset(16 * 1024 * 1024);
+    let repo = &repo.0;
 
     let tip_oid =
         gix::ObjectId::from_hex(tip.as_str().as_bytes()).map_err(|e| GitIoError::Parse {
@@ -2079,7 +2120,7 @@ mod tests {
         fn walker_matches_legacy_producer_from_root() {
             let dir = build_fixture();
             let tip = head(dir.path());
-            let walked = commit_events_between(dir.path(), None, &tip).unwrap();
+            let walked = commit_events_between_at(dir.path(), None, &tip).unwrap();
             let legacy = legacy_events(dir.path(), &tip);
             assert_eq!(walked.len(), legacy.len(), "same commit count");
             for (w, l) in walked.iter().zip(&legacy) {
@@ -2097,7 +2138,7 @@ mod tests {
             let all = legacy_events(dir.path(), &tip);
             for start in [1, all.len() / 2, all.len() - 1] {
                 let base = all[start - 1].commit.clone();
-                let walked = commit_events_between(dir.path(), Some(&base), &tip).unwrap();
+                let walked = commit_events_between_at(dir.path(), Some(&base), &tip).unwrap();
                 assert_eq!(
                     walked,
                     all[start..],
@@ -2111,7 +2152,7 @@ mod tests {
             let dir = build_fixture();
             let tip = head(dir.path());
             assert_eq!(
-                commit_events_between(dir.path(), Some(&tip), &tip).unwrap(),
+                commit_events_between_at(dir.path(), Some(&tip), &tip).unwrap(),
                 Vec::new()
             );
         }
