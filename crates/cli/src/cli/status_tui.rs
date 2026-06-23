@@ -641,12 +641,29 @@ fn bar_text(snap: &StatusSnapshot) -> (String, String) {
         },
         [] if !snap.queue.is_empty() => {
             let master = snap.master.as_deref().unwrap_or("master").to_uppercase();
-            let right = if snap.queue.len() > 1 {
-                format!("{} +{}", snap.queue[0], snap.queue.len() - 1)
-            } else {
-                snap.queue[0].clone()
+            // Mirror the wait promote scan (wait-ignores-queue-only-blocks):
+            // a queued plan is promotable only if no PENDING block
+            // suppresses it — a repo-wide block (plan = None) suppresses
+            // ALL, a plan-scoped one suppresses its plan. Block > promote:
+            // if nothing is promotable the queue is STOPPED on a human ask,
+            // so show the block lamp (🙋), not the promote lamp.
+            let pending = |name: &str| {
+                snap.blocks.iter().any(|b| {
+                    b.answer.is_none() && (b.plan.is_none() || b.plan.as_deref() == Some(name))
+                })
             };
-            (format!("📋 {master} promote"), right)
+            let promotable = snap.queue.iter().find(|name| !pending(name)).cloned();
+            let head = promotable.clone().unwrap_or_else(|| snap.queue[0].clone());
+            let right = if snap.queue.len() > 1 {
+                format!("{head} +{}", snap.queue.len() - 1)
+            } else {
+                head
+            };
+            if promotable.is_some() {
+                (format!("📋 {master} promote"), right)
+            } else {
+                (format!("🙋 {master} blocked"), right)
+            }
         }
         [] => ("💤 idle".to_string(), String::new()),
         [v] => (
@@ -2553,6 +2570,41 @@ terminal_3  terminal  ruthless (reviewer)
         let v = visible(&render(&s, 1, 60)[0]);
         assert!(v.starts_with("📋 CLAUDE promote"), "got `{v}`");
         assert!(v.ends_with("zellij-layout +1"), "got `{v}`");
+    }
+
+    #[test]
+    fn blocked_queued_plan_shows_block_lamp_not_promote() {
+        // wait-ignores-queue-only-blocks: the only queued plan is
+        // suppressed by a pending plan-scoped block — the queue is
+        // STOPPED on a human ask, so the bar shows the block lamp
+        // (🙋 … blocked), NOT the promote lamp.
+        let mut s = snap(vec![], vec!["simctl-up"]);
+        s.blocks = vec![crate::cli::block::BlockEntry {
+            agent: "claude".into(),
+            name: "simctl-up-design-decisions".into(),
+            plan: Some("simctl-up".into()),
+            question: "which sims?".into(),
+            answer: None,
+        }];
+        let v = visible(&render(&s, 1, 60)[0]);
+        assert!(v.starts_with("🙋 CLAUDE blocked"), "got `{v}`");
+    }
+
+    #[test]
+    fn block_on_head_queue_item_still_shows_promote_for_lower() {
+        // A block on the head queued plan must not hide a lower unblocked
+        // one: block > promote applies ONLY when nothing is promotable.
+        let mut s = snap(vec![], vec!["blocked-plan", "free-plan"]);
+        s.blocks = vec![crate::cli::block::BlockEntry {
+            agent: "claude".into(),
+            name: "q".into(),
+            plan: Some("blocked-plan".into()),
+            question: "?".into(),
+            answer: None,
+        }];
+        let v = visible(&render(&s, 1, 60)[0]);
+        assert!(v.starts_with("📋 CLAUDE promote"), "got `{v}`");
+        assert!(v.contains("free-plan"), "names the promotable item: `{v}`");
     }
 
     #[test]
