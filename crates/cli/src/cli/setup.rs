@@ -624,7 +624,7 @@ mod tests {
         );
         let reviewer = compose_skill(Role::Reviewer, Tool::Claude);
         assert!(
-            reviewer.contains("NEVER withhold APPROVE or FINISHED waiting on a manual/external"),
+            reviewer.contains("NEVER withhold CONTINUE or FINISHED waiting on a manual/external"),
             "reviewer must encode the committable-scope invariant"
         );
         assert!(

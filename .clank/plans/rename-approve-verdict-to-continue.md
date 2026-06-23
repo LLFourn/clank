@@ -36,8 +36,10 @@ So the alias MUST live on the READ/parse path, not just CLI input:
   file mis-gates.
 - **Write side (`crates/cli/src/cli/feedback.rs:29,168`)** — the header clank
   WRITES becomes `Continue => "CONTINUE"`. New files say `CONTINUE`.
-- **CLI `--verdict`** — `continue` is the primary value; `approve` kept as an
-  undocumented clap alias → `Continue`.
+- **CLI `--verdict`** — `continue` is the ONLY positive value; NO clap alias
+  (lloyd: agents that type `approve` learn from the rejection). `clank feedback
+  write --verdict approve` now errors. (Input-compat is dropped; on-disk
+  read-compat below is the only back-compat kept.)
 - **serde — break it, NO aliases (lloyd).** The serde wire strings (`Verdict`,
   `CommitGateState`, `WaitingReason` all derive `rename_all = "snake_case"`) are
   render-only / computed-fresh — confirmed there is NO deserialize-from-persisted
@@ -53,8 +55,8 @@ So the alias MUST live on the READ/parse path, not just CLI input:
   variants. (No `CACHE_FORMAT_VERSION` bump needed; the rename is name-only.)
 
 Pin the persisted alias with a test: a feedback body of `"APPROVE\n\nLGTM\n"`
-parses to `Verdict::Continue` and gates identically to a `CONTINUE` body. Plus a
-CLI parse test that `--verdict approve` still resolves (the kept alias).
+parses to `Verdict::Continue` and gates identically to a `CONTINUE` body. (No
+CLI-alias test — the CLI deliberately rejects `approve`.)
 
 ## Out of scope — do NOT rename
 
@@ -90,8 +92,9 @@ both — flag for the reviewers.)
 
 ## Acceptance
 
-- The clank verdict is `CONTINUE` across skills, CLI, code, docs; `approve` works
-  as an undocumented alias on BOTH the CLI and the feedback-file parser (pinned).
+- The clank verdict is `CONTINUE` across skills, CLI, code, docs. `approve` is
+  accepted ONLY by the on-disk feedback-file parser (read-compat); the CLI
+  `--verdict approve` is rejected (agents learn). Both pinned by tests.
 - A legacy `APPROVE` feedback file parses + gates identically to `CONTINUE`.
 - Gate states / waiting reason renamed to track the verb; wincode positions
   unchanged so caches stay valid.
