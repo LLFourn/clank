@@ -74,7 +74,7 @@ must amend BEFORE anything else proceeds. Three ways to break it:
 
 ### Reading feedback
 
-Reviewers write APPROVE / FINISHED / REQUEST_CHANGES on your commits;
-read them with `clank feedback read --commit <sha>`. APPROVE → keep
+Reviewers write CONTINUE / FINISHED / REQUEST_CHANGES on your commits;
+read them with `clank feedback read --commit <sha>`. CONTINUE → keep
 going. REQUEST_CHANGES → address it, re-commit, STOP. Gate FINISHED →
 the Stop hook will hand you a finalize item.

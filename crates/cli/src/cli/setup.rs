@@ -603,7 +603,7 @@ mod tests {
                 reviewer.contains("clank feedback write") && reviewer.contains("--verdict"),
                 "reviewer must document the verdict-write command"
             );
-            for verdict in ["APPROVE", "FINISHED", "REQUEST_CHANGES"] {
+            for verdict in ["CONTINUE", "FINISHED", "REQUEST_CHANGES"] {
                 assert!(reviewer.contains(verdict), "reviewer must define {verdict}");
             }
             assert!(

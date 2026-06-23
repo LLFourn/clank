@@ -176,7 +176,7 @@ fn kind_label(tp: bool, tc: bool) -> &'static str {
 
 pub(crate) fn verdict_mark(v: Verdict, c: bool) -> String {
     let (mark, col) = match v {
-        Verdict::Approve => ("✓", G),
+        Verdict::Continue => ("✓", G),
         Verdict::Finished => ("✓✓", C),
         Verdict::RequestChanges => ("✗", R),
         Verdict::Unmarked => ("?", Z),
@@ -621,10 +621,10 @@ mod json_output_tests {
                 serde_json::to_value(LogJsonRow::Review {
                     sha: "abc",
                     author: "codex",
-                    verdict: Verdict::Approve,
+                    verdict: Verdict::Continue,
                 })
                 .unwrap(),
-                serde_json::json!({"kind":"review","sha":"abc","author":"codex","verdict":Verdict::Approve}),
+                serde_json::json!({"kind":"review","sha":"abc","author":"codex","verdict":Verdict::Continue}),
             ),
         ];
         for (got, want) in cases {
@@ -672,7 +672,7 @@ mod tests {
             sha("aa").as_str().to_string(),
             vec![Review {
                 author: "codex".into(),
-                verdict: Verdict::Approve,
+                verdict: Verdict::Continue,
                 summary: "lgtm".into(),
                 body: String::new(),
             }],
@@ -683,7 +683,7 @@ mod tests {
             sha("cc").as_str().to_string(),
             vec![Review {
                 author: "codex".into(),
-                verdict: Verdict::Approve,
+                verdict: Verdict::Continue,
                 summary: "x".into(),
                 body: String::new(),
             }],

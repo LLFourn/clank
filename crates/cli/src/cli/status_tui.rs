@@ -372,7 +372,7 @@ fn log_row_spans(row: &crate::cli::log::OnelineRow, author_width: usize) -> Vec<
             summary,
         } => {
             let mark_color = match verdict {
-                Verdict::Approve => "32",
+                Verdict::Continue => "32",
                 Verdict::Finished => "36",
                 Verdict::RequestChanges => "31",
                 Verdict::Unmarked => "2",
@@ -675,7 +675,7 @@ fn pr_bar_text(pr: &clank_core::wait::PrReviewWorkState, master: &str) -> (Strin
     }
     let (emoji, actor, verb) = if let Some(reviewer) = pr.missing_reviewers.first() {
         let emoji = match pr.gate {
-            CommitGateState::ApprovedPendingGate => "🔍",
+            CommitGateState::ContinuedPendingGate => "🔍",
             _ => "👀",
         };
         (emoji, reviewer.as_str().to_string(), "reviewing")
@@ -1843,7 +1843,7 @@ pub(crate) mod tests {
                 plan: Some("foo".into()),
             },
             OnelineRow::Review {
-                verdict: Verdict::Approve,
+                verdict: Verdict::Continue,
                 author: "zzz".into(),
                 summary: "ok".into(),
             },
@@ -2865,7 +2865,7 @@ mod log_tier_tests {
             },
             commit_row("intro"),
             OnelineRow::Review {
-                verdict: Verdict::Approve,
+                verdict: Verdict::Continue,
                 author: "codex".into(),
                 summary: "lgtm".into(),
             },
@@ -2885,11 +2885,11 @@ mod log_tier_tests {
             raw.contains("\x1b[1;48;5;238mfoo\x1b[0m"),
             "header background-highlighted: {raw:?}"
         );
-        // The verdict tick is COLORED (green for approve) in the raw
+        // The verdict tick is COLORED (green for continue) in the raw
         // ANSI output — lloyd's "make the ticks pop".
         assert!(
             raw.contains("\x1b[32m✓\x1b[0m"),
-            "approve tick must be green: {raw:?}"
+            "continue tick must be green: {raw:?}"
         );
         assert!(
             texts.iter().any(|t| t.contains("✓  codex: lgtm")),
@@ -2914,7 +2914,7 @@ mod log_tier_tests {
         );
         s.log_rows = vec![
             commit_row("intro"),
-            review(Verdict::Approve, "codex"), // ✓  (1-wide mark, mid name)
+            review(Verdict::Continue, "codex"), // ✓  (1-wide mark, mid name)
             review(Verdict::Finished, "ruthless"), // ✓✓ (2-wide mark, long name)
             review(Verdict::RequestChanges, "zz"), // ✗  (1-wide mark, short name)
         ];

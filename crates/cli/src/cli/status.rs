@@ -219,7 +219,7 @@ impl StatusSnapshot {
         // read-only renderer (also reused by `clank html`), so it
         // DEGRADES on a team-less / misconfigured repo: no team →
         // empty reviewer tiers → gate computes as zero-reviewer
-        // (Approved). It never hard-errors the way the
+        // (Continued). It never hard-errors the way the
         // workflow-driving commands (wait / finish / promote) do.
         let registered = crate::agent_store::try_resolve_via_team_with(repo, home)
             .ok()
@@ -1110,7 +1110,7 @@ pub(crate) fn waiting_reason(w: &WaitingOn) -> String {
                 .map(|a| a.as_str())
                 .collect::<Vec<_>>()
                 .join(", ");
-            format!("commit-tier reviewers approved; waiting on gate-tier {names}")
+            format!("commit-tier reviewers continued; waiting on gate-tier {names}")
         }
         WaitingOn::MasterToRevise {
             requesters,
@@ -1136,10 +1136,11 @@ pub(crate) fn waiting_reason(w: &WaitingOn) -> String {
             parts.join("; ")
         }
         WaitingOn::MasterToContinue => {
-            "gate approved (not FINISHED) — continue work or ask a reviewer to mark FINISHED".into()
+            "gate continued (not FINISHED) — continue work or ask a reviewer to mark FINISHED"
+                .into()
         }
         WaitingOn::MasterToFinalize => "gate FINISHED — run `clank finish`".into(),
-        WaitingOn::MasterToCommit => "gate approved but plan file dirty".into(),
+        WaitingOn::MasterToCommit => "gate continued but plan file dirty".into(),
         WaitingOn::MasterToFixCommitTag => {
             "HEAD tags don't match the plans it touches — amend (re-tag, or drop the tag if ad-hoc)"
                 .into()
@@ -1465,7 +1466,7 @@ mod dirty_and_wake_tests {
         std::fs::create_dir_all(r.join(".clank/agents/codex/feedback")).unwrap();
         std::fs::write(
             r.join(".clank/agents/codex/feedback/abc123.md"),
-            "APPROVE\n",
+            "CONTINUE\n",
         )
         .unwrap();
         let after = clank_input_fingerprint(r);

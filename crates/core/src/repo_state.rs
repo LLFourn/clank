@@ -43,7 +43,7 @@ pub struct RepoState {
     pub plans: BTreeMap<PlanKey, PlanState>,
 
     /// Ordered log of finalize events: "plan X was finalized at
-    /// SHA Y." Body at freeze / approver count / full historical
+    /// SHA Y." Body at freeze / continuer count / full historical
     /// commit timeline are recoverable via `git_io`. `PlanKey` may
     /// repeat (a plan can be re-introduced and re-finalized).
     pub finished_plans: Vec<FinishedPlan>,
@@ -119,7 +119,7 @@ pub struct PlanTimelineEvent {
 /// Entry in `RepoState.finished_plans`. Stores plan identity plus
 /// the two boundary SHAs (intro = first commit of this instance,
 /// finalized_at = commit whose tree fired the freeze predicate).
-/// Body / approver count / full historical timeline are recoverable
+/// Body / continuer count / full historical timeline are recoverable
 /// via git_io.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(

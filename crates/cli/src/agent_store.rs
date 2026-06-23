@@ -115,7 +115,7 @@ pub fn load_reviewer_tiers_with(
 /// errors: a repo with no team (or a misconfigured one) degrades
 /// to empty tiers so a read-only renderer never crashes on
 /// config absence. The gate then computes as zero-reviewer
-/// (Approved). `clank doctor` is the surface that reports the
+/// (Continued). `clank doctor` is the surface that reports the
 /// underlying misconfiguration. Plan:
 /// `teams-based-agent-registration`.
 pub fn reviewer_tiers_for_render(repo: &Path) -> (Vec<AgentLabel>, Vec<AgentLabel>) {

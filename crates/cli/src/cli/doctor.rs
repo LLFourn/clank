@@ -488,7 +488,7 @@ fn user_checks() -> Vec<CheckResult> {
 
 /// Check that codex's command-rules file contains a bare `clank`
 /// allow rule. Warn if missing — without it, codex sessions
-/// prompt the user to approve each `clank <subcommand>`
+/// prompt the user to continue each `clank <subcommand>`
 /// invocation it sees for the first time.
 fn check_codex_rule(path: &Path, display: &str) -> CheckResult {
     const SECTION: &str = "user";
@@ -499,7 +499,7 @@ fn check_codex_rule(path: &Path, display: &str) -> CheckResult {
                 SECTION,
                 display,
                 "missing — run `clank setup` to add the `clank` allow rule \
-                 (without it, codex prompts to approve every new clank subcommand)"
+                 (without it, codex prompts to continue every new clank subcommand)"
                     .to_string(),
             );
         }

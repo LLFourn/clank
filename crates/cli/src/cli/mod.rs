@@ -582,7 +582,7 @@ pub struct FeedbackWriteArgs {
     /// known commits; ambiguous prefixes are an error.
     #[arg(long, value_name = "SHA")]
     pub commit: String,
-    /// Verdict. Prepended to the body as `APPROVE <body>` or
+    /// Verdict. Prepended to the body as `CONTINUE <body>` or
     /// `REQUEST_CHANGES <body>`.
     #[arg(long, value_enum)]
     pub verdict: VerdictArg,
@@ -601,7 +601,7 @@ pub struct FeedbackWriteArgs {
 /// real verdict.
 #[derive(Copy, Clone, Debug, clap::ValueEnum)]
 pub enum VerdictArg {
-    Approve,
+    Continue,
     Finished,
     RequestChanges,
 }
@@ -609,7 +609,7 @@ pub enum VerdictArg {
 impl From<VerdictArg> for clank_core::Verdict {
     fn from(v: VerdictArg) -> Self {
         match v {
-            VerdictArg::Approve => clank_core::Verdict::Approve,
+            VerdictArg::Continue => clank_core::Verdict::Continue,
             VerdictArg::Finished => clank_core::Verdict::Finished,
             VerdictArg::RequestChanges => clank_core::Verdict::RequestChanges,
         }

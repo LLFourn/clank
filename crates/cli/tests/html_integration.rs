@@ -186,11 +186,11 @@ fn html_commit_page_renders_feedback_with_verdict_marks() {
     let sha = head_sha(repo);
     let short = &sha[..7];
 
-    // Two reviews on the same commit: APPROVE and FINISHED.
+    // Two reviews on the same commit: CONTINUE and FINISHED.
     write(
         repo,
         &format!(".clank/agents/alice/feedback/{short}.md"),
-        "APPROVE looks good\n",
+        "CONTINUE looks good\n",
     );
     write(
         repo,
@@ -202,12 +202,12 @@ fn html_commit_page_renders_feedback_with_verdict_marks() {
     let page =
         std::fs::read_to_string(repo.join(format!(".clank/html/commit/{sha}.html"))).unwrap();
     assert!(
-        page.contains("verdict-approve") && page.contains("verdict-finished"),
+        page.contains("verdict-continue") && page.contains("verdict-finished"),
         "expected both verdict classes on the page"
     );
     assert!(page.contains("alice"));
     assert!(page.contains("bob"));
-    assert!(page.contains("APPROVE"));
+    assert!(page.contains("CONTINUE"));
     assert!(page.contains("FINISHED"));
 }
 
@@ -226,7 +226,7 @@ fn html_escapes_user_content_in_feedback_bodies() {
     write(
         repo,
         &format!(".clank/agents/alice/feedback/{short}.md"),
-        "APPROVE looks good\n\n<script>alert('xss')</script>\n",
+        "CONTINUE looks good\n\n<script>alert('xss')</script>\n",
     );
 
     build_html(repo);
@@ -1007,7 +1007,7 @@ fn html_writes_plan_page_for_each_active_plan() {
 fn html_writes_plan_page_for_finished_plans() {
     let dir = init_repo();
     let repo = dir.path();
-    // Seed an intro, approve+finish the commit, then finalize.
+    // Seed an intro, continue+finish the commit, then finalize.
     write(repo, ".clank/plans/foo.md", "# Foo Plan\n\nBody.\n");
     commit(repo, "[foo] intro");
     let intro = head_sha(repo);

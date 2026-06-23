@@ -38,8 +38,15 @@ So the alias MUST live on the READ/parse path, not just CLI input:
   WRITES becomes `Continue => "CONTINUE"`. New files say `CONTINUE`.
 - **CLI `--verdict`** — `continue` is the primary value; `approve` kept as an
   undocumented clap alias → `Continue`.
-- **serde** — `#[serde(rename_all = "snake_case")]` makes `Continue → "continue"`;
-  add `#[serde(alias = "approve")]` on the variant for any JSON deser path.
+- **serde — break it, NO aliases (lloyd).** The serde wire strings (`Verdict`,
+  `CommitGateState`, `WaitingReason` all derive `rename_all = "snake_case"`) are
+  render-only / computed-fresh — confirmed there is NO deserialize-from-persisted
+  path (`WaitingReason` is built by the gate logic and only rendered to the wake
+  hint / html; nothing reads it back). So `approve → continue`,
+  `approved → continued`, `gate_approved → gate_continue` change freely; just
+  update the wire assertions (`crates/core/tests/round_trip.rs:63`, etc.). No
+  `serde(alias = …)` anywhere — the ONLY back-compat is `parse_verdict` (the
+  on-disk feedback parser, not serde) + the CLI clap alias.
 - **wincode (state cache)** — `Verdict` and `CommitGateState` derive
   `wincode::SchemaRead/Write`, which is POSITION-encoded. Renaming a variant in
   place keeps its position, so cached payloads stay decodable — do NOT reorder

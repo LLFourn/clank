@@ -39,7 +39,7 @@ fn plan_worktree_status_wire_strings() {
 
 #[test]
 fn verdict_wire_strings() {
-    assert_wire(Verdict::Approve, "approve");
+    assert_wire(Verdict::Continue, "continue");
     assert_wire(Verdict::RequestChanges, "request_changes");
     assert_wire(Verdict::Unmarked, "unmarked");
 }
@@ -47,7 +47,7 @@ fn verdict_wire_strings() {
 #[test]
 fn commit_gate_state_wire_strings() {
     assert_wire(CommitGateState::Unreviewed, "unreviewed");
-    assert_wire(CommitGateState::Approved, "approved");
+    assert_wire(CommitGateState::Continued, "continued");
     assert_wire(CommitGateState::ChangesRequested, "changes_requested");
 }
 
@@ -60,7 +60,7 @@ fn waiting_reason_wire_strings() {
         "address_commit_changes",
     );
     assert_wire(WaitingReason::ReadyToFinalize, "ready_to_finalize");
-    assert_wire(WaitingReason::GateApproved, "gate_approved");
+    assert_wire(WaitingReason::GateContinue, "gate_continue");
     assert_wire(WaitingReason::CommitNeedsReview, "commit_needs_review");
 }
 
@@ -79,7 +79,7 @@ fn as_str_agrees_with_wire() {
     check!(PlanLifecycle::Active);
     check!(PlanLifecycle::Finished);
     check!(PlanWorktreeStatus::PlanFileMissing);
-    check!(Verdict::Approve);
+    check!(Verdict::Continue);
     check!(CommitGateState::ChangesRequested);
     check!(WaitingReason::CommitNeedsReview);
     check!(WaitingReason::ReadyToFinalize);

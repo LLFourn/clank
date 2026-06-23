@@ -26,7 +26,7 @@ async fn run_write(args: FeedbackWriteArgs) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("invalid --author `{}`: {e}", args.author))?;
     let expected_verdict: clank_core::Verdict = args.verdict.into();
     let verdict_header = match expected_verdict {
-        clank_core::Verdict::Approve => "APPROVE",
+        clank_core::Verdict::Continue => "CONTINUE",
         clank_core::Verdict::Finished => "FINISHED",
         clank_core::Verdict::RequestChanges => "REQUEST_CHANGES",
         clank_core::Verdict::Unmarked => {
@@ -165,7 +165,7 @@ async fn run_read(args: FeedbackReadArgs) -> anyhow::Result<()> {
         println!("commit {short}");
         for e in &entries {
             let verdict_str = match e.verdict {
-                clank_core::Verdict::Approve => "APPROVE",
+                clank_core::Verdict::Continue => "CONTINUE",
                 clank_core::Verdict::Finished => "FINISHED",
                 clank_core::Verdict::RequestChanges => "REQUEST_CHANGES",
                 clank_core::Verdict::Unmarked => "UNMARKED",

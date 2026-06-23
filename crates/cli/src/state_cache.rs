@@ -42,7 +42,7 @@ const CACHE_MAGIC: &[u8] = b"CLANK-STATE\n";
 ///   position-encoded; existing v7 payloads would technically
 ///   decode, but bumping forces stale caches to be reclaimed via
 ///   filename mismatch — clean invalidation, no error path needed.
-/// - v9: `CommitGateState::ApprovedPendingGate` variant added
+/// - v9: `CommitGateState::ContinuedPendingGate` variant added
 ///   (appended at position 5) for `teams-based-agent-registration`.
 ///   Same position-encoded discipline; bump forces clean
 ///   invalidation.

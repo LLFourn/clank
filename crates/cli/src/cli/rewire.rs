@@ -255,7 +255,7 @@ mod tests {
                 ".clank/agents/alice/feedback/{}.md",
                 old_a.as_str()
             )),
-            "APPROVE\n",
+            "CONTINUE\n",
         );
         let plan = plan_actions(dir.path(), &pairs);
         assert!(
@@ -286,7 +286,7 @@ mod tests {
                 ".clank/agents/alice/feedback/{}.md",
                 old_b.as_str()
             )),
-            "APPROVE bob\n",
+            "CONTINUE bob\n",
         );
         let plan = plan_actions(dir.path(), &pairs);
         assert_eq!(plan.actions.len(), 1);
@@ -313,7 +313,7 @@ mod tests {
         write(
             &dir.path()
                 .join(format!(".clank/agents/alice/feedback/{}.md", old.as_str())),
-            "APPROVE\n",
+            "CONTINUE\n",
         );
         let plan = plan_actions(dir.path(), &pairs);
         assert_eq!(plan.actions.len(), 1);
@@ -334,7 +334,7 @@ mod tests {
         write(
             &dir.path()
                 .join(format!(".clank/agents/alice/feedback/{short}.md")),
-            "APPROVE\n",
+            "CONTINUE\n",
         );
         let plan = plan_actions(dir.path(), &pairs);
         assert_eq!(plan.actions.len(), 1);
@@ -369,7 +369,7 @@ mod tests {
         write(
             &dir.path()
                 .join(format!(".clank/agents/alice/feedback/{}.md", old.as_str())),
-            "APPROVE\n",
+            "CONTINUE\n",
         );
         write(
             &dir.path()

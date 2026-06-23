@@ -999,12 +999,12 @@ fn render_plan_page(
 fn verdict_gate_label(g: clank_core::vocab::CommitGateState) -> &'static str {
     use clank_core::vocab::CommitGateState as G;
     match g {
-        G::Approved => "approved",
+        G::Continued => "continued",
         G::Finished => "finished",
         G::ChangesRequested => "changes-requested",
         G::Unreviewed => "unreviewed",
         G::Blocked => "blocked",
-        G::ApprovedPendingGate => "approved-pending-gate",
+        G::ContinuedPendingGate => "continued-pending-gate",
     }
 }
 
@@ -1301,7 +1301,7 @@ fn render_markdown(md: &str) -> String {
 
 fn verdict_label(v: Verdict) -> &'static str {
     match v {
-        Verdict::Approve => "APPROVE",
+        Verdict::Continue => "CONTINUE",
         Verdict::Finished => "FINISHED",
         Verdict::RequestChanges => "REQUEST_CHANGES",
         Verdict::Unmarked => "(no verdict)",
@@ -1310,7 +1310,7 @@ fn verdict_label(v: Verdict) -> &'static str {
 
 fn verdict_slug(v: Verdict) -> &'static str {
     match v {
-        Verdict::Approve => "approve",
+        Verdict::Continue => "continue",
         Verdict::Finished => "finished",
         Verdict::RequestChanges => "request-changes",
         Verdict::Unmarked => "unmarked",
@@ -1321,7 +1321,7 @@ fn verdict_marks_html(reviews: &[Review]) -> String {
     let mut s = String::new();
     for r in reviews {
         let (mark, title) = match r.verdict {
-            Verdict::Approve => ("✓", format!("APPROVE by {}", r.author)),
+            Verdict::Continue => ("✓", format!("CONTINUE by {}", r.author)),
             Verdict::Finished => ("✓✓", format!("FINISHED by {}", r.author)),
             Verdict::RequestChanges => ("✗", format!("REQUEST_CHANGES by {}", r.author)),
             Verdict::Unmarked => ("●", format!("unmarked by {}", r.author)),
@@ -1566,7 +1566,7 @@ a.plan-pill:hover { filter: brightness(0.96); }
 .plan-header h1 { margin: .25rem 0; }
 .plan-state { color: var(--fg-dim); font-size: .9rem; margin-top: .25rem; }
 .gate { font-size: .8rem; padding: 0 .35rem; border-radius: 4px; }
-.gate-approved { color: var(--approve); }
+.gate-continued { color: var(--approve); }
 .gate-finished { color: var(--finished); }
 .gate-changes_requested { color: var(--changes); }
 h2 { font-size: 1rem; text-transform: uppercase; letter-spacing: .05em; color: var(--fg-dim); margin: 1rem 0 .5rem; }
@@ -1622,7 +1622,7 @@ h2 { font-size: 1rem; text-transform: uppercase; letter-spacing: .05em; color: v
 .subject { color: var(--fg); }
 .marks { display: inline-flex; gap: .25rem; }
 .mark { font: 600 .8rem/1 var(--mono); padding: 0 .2rem; border-radius: 3px; }
-.mark-approve { color: var(--approve); }
+.mark-continue { color: var(--approve); }
 .mark-finished { color: var(--finished); }
 .mark-request-changes { color: var(--changes); }
 .mark-unmarked { color: var(--fg-dim); }
@@ -1649,7 +1649,7 @@ section h3 { font-size: .9rem; text-transform: uppercase; letter-spacing: .05em;
 .review { padding: .75rem 1rem; border: 1px solid var(--rule); border-radius: 6px; margin-bottom: .75rem; }
 .review header { margin-bottom: .35rem; }
 .review .verdict { font: 600 .75rem/1 var(--mono); margin-left: .35rem; padding: .15rem .35rem; border-radius: 3px; }
-.review.verdict-approve .verdict { color: var(--approve); background: rgba(21, 122, 62, 0.1); }
+.review.verdict-continue .verdict { color: var(--approve); background: rgba(21, 122, 62, 0.1); }
 .review.verdict-finished .verdict { color: var(--finished); background: rgba(58, 76, 200, 0.1); }
 .review.verdict-request-changes .verdict { color: var(--changes); background: rgba(177, 62, 44, 0.1); }
 .review .summary { margin: .25rem 0 .5rem; font-weight: 500; }

@@ -414,8 +414,8 @@ pub fn classify_from_tree(
 
 /// Compute finalize readiness from the observable signals.
 /// Finalize requires a FINISHED gate on the latest reviewable
-/// commit — APPROVE alone is not enough. Exception: a master-only
-/// repo (empty `expected_reviewers`) can finalize on an APPROVED
+/// commit — CONTINUE alone is not enough. Exception: a master-only
+/// repo (empty `expected_reviewers`) can finalize on an CONTINUED
 /// gate since `Finished` is unreachable there.
 pub fn compute_finalize_readiness(
     is_finished: bool,
@@ -431,7 +431,7 @@ pub fn compute_finalize_readiness(
     if latest_reviewable_sha.is_none() {
         reasons.push(FinalizeBlockReason::NoReviewableCommit);
     }
-    // Master-only repo: Approved is sufficient for finalize because
+    // Master-only repo: Continued is sufficient for finalize because
     // the all-Finished rule is unreachable without registered reviewers.
     if gate_state != CommitGateState::Finished && any_registered_reviewers {
         reasons.push(FinalizeBlockReason::NotFinished { state: gate_state });
@@ -566,12 +566,12 @@ mod tests {
     }
 
     #[test]
-    fn finalize_blocked_on_approved_gate_with_not_finished() {
+    fn finalize_blocked_on_continued_gate_with_not_finished() {
         let sha = CommitSha::parse(&"a".repeat(40)).unwrap();
         let readiness = compute_finalize_readiness(
             false,
             Some(&sha),
-            CommitGateState::Approved,
+            CommitGateState::Continued,
             PlanWorktreeStatus::Clean,
             true,
         );
@@ -579,9 +579,9 @@ mod tests {
             FinalizeReadiness::Blocked { reasons } => {
                 assert!(
                     reasons.contains(&FinalizeBlockReason::NotFinished {
-                        state: CommitGateState::Approved
+                        state: CommitGateState::Continued
                     }),
-                    "expected NotFinished {{state: Approved}}; got {reasons:?}"
+                    "expected NotFinished {{state: Continued}}; got {reasons:?}"
                 );
             }
             other => panic!("expected Blocked, got {other:?}"),
@@ -602,14 +602,14 @@ mod tests {
     }
 
     #[test]
-    fn finalize_ready_on_approved_gate_when_no_reviewers() {
-        // Master-only repo: Approved is sufficient because the
+    fn finalize_ready_on_continued_gate_when_no_reviewers() {
+        // Master-only repo: Continued is sufficient because the
         // all-Finished rule is unreachable without registered reviewers.
         let sha = CommitSha::parse(&"a".repeat(40)).unwrap();
         let readiness = compute_finalize_readiness(
             false,
             Some(&sha),
-            CommitGateState::Approved,
+            CommitGateState::Continued,
             PlanWorktreeStatus::Clean,
             false,
         );

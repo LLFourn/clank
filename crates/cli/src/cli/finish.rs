@@ -1,4 +1,4 @@
-//! `clank finish` — finalize an approved plan.
+//! `clank finish` — finalize an continued plan.
 //!
 //! Fully local: folds the repo with `rebuild::rebuild_repo`, builds
 //! a typed `FinishPreviewResponse` via `crate::preview`, dispatches
@@ -239,8 +239,8 @@ fn reason_to_msg(reason: &FinalizeBlockReason) -> String {
             "no reviewable commit attributed to this plan yet".into()
         }
         FinalizeBlockReason::NotFinished { state } => match state {
-            clank_core::vocab::CommitGateState::Approved => {
-                "latest reviewable commit is approved but not FINISHED — \
+            clank_core::vocab::CommitGateState::Continued => {
+                "latest reviewable commit is continued but not FINISHED — \
                  a reviewer needs to mark FINISHED before finalize"
                     .into()
             }
@@ -260,8 +260,8 @@ fn reason_to_msg(reason: &FinalizeBlockReason) -> String {
             clank_core::vocab::CommitGateState::Blocked => {
                 "plan has an open block — clear the block before finalize".into()
             }
-            clank_core::vocab::CommitGateState::ApprovedPendingGate => {
-                "latest reviewable commit is approved by commit-tier reviewers; \
+            clank_core::vocab::CommitGateState::ContinuedPendingGate => {
+                "latest reviewable commit is continued by commit-tier reviewers; \
                  gate-tier reviewers haven't all weighed in yet — wait for their FINISHED \
                  before running finalize"
                     .into()
@@ -379,7 +379,7 @@ mod tests {
             plan_id: "clank/foo.md".into(),
             plan_path: ".clank/plans/foo.md".into(),
             readiness: FinalizeReadiness::Ready,
-            gate_state: CommitGateState::Approved,
+            gate_state: CommitGateState::Continued,
             latest_reviewable_sha: None,
             plan_worktree_status: PlanWorktreeStatus::Clean,
             is_finished: false,
@@ -456,7 +456,7 @@ mod tests {
         run_git(dir.path(), &["commit", "--quiet", "-m", "seed"]);
 
         // Simulate a pre-existing legacy directory-style marker.
-        write_at(dir.path(), ".clank/finished/foo/codex.md", "APPROVE\n");
+        write_at(dir.path(), ".clank/finished/foo/codex.md", "CONTINUE\n");
 
         let preview = mk_preview_ready();
         finalize(dir.path(), "foo", &preview, false, None)

@@ -51,9 +51,9 @@ pub enum WaitingOn {
         requesters: Vec<AgentLabel>,
         ambiguous: Vec<AgentLabel>,
     },
-    /// Gate is APPROVED (not FINISHED) on the latest reviewable
+    /// Gate is CONTINUED (not FINISHED) on the latest reviewable
     /// commit. Master keeps working — more impl, more docs, more
-    /// tests, or prompting a reviewer to upgrade their APPROVE to
+    /// tests, or prompting a reviewer to upgrade their CONTINUE to
     /// FINISHED. `clank finish` is blocked until someone marks
     /// FINISHED.
     MasterToContinue,
@@ -61,7 +61,7 @@ pub enum WaitingOn {
     /// plan worktree is clean — master just needs to run
     /// `clank finish`.
     MasterToFinalize,
-    /// Gate is approved but the plan file has uncommitted edits.
+    /// Gate is continued but the plan file has uncommitted edits.
     /// Master needs to commit the next revision.
     MasterToCommit,
     /// Plan has an open (unanswered) plan-scoped block. The block

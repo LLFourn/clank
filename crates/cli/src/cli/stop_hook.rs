@@ -403,7 +403,7 @@ mod tests {
         for tutorial in [
             "feedback write", // the spelled-out command
             "FINISHED",       // the verdict essay
-            "approve|finished|request-changes",
+            "continue|finished|request-changes",
             "clank unblock",      // the spelled-out unblock
             "evaluate whether",   // the promote walkthrough
             "full question text", // block question is for the human

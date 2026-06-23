@@ -122,7 +122,7 @@ mod tests {
         write(
             repo,
             &format!(".clank/agents/alice/feedback/{}.md", &s1.as_str()[..7]),
-            "APPROVE\n\nlgtm\n",
+            "CONTINUE\n\nlgtm\n",
         );
         write(
             repo,
@@ -132,7 +132,7 @@ mod tests {
         write(
             repo,
             &format!(".clank/agents/alice/feedback/{}.md", &s2.as_str()[..7]),
-            "APPROVE\n\nstill lgtm\n",
+            "CONTINUE\n\nstill lgtm\n",
         );
 
         let view = scan_feedback(repo, &[s1.clone(), s2.clone()]).unwrap();
@@ -148,7 +148,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let repo = dir.path();
         let s1 = full_sha("abcdef0");
-        write(repo, ".clank/agents/alice/feedback/abcdef0.md", "APPROVE\n");
+        write(
+            repo,
+            ".clank/agents/alice/feedback/abcdef0.md",
+            "CONTINUE\n",
+        );
         let view = scan_feedback(repo, &[s1.clone()]).unwrap();
         assert_eq!(view.per_commit[0].entries.len(), 1);
     }
@@ -161,7 +165,7 @@ mod tests {
         write(
             repo,
             &format!(".clank/agents/alice/feedback/{}.md", s1.as_str()),
-            "APPROVE\n",
+            "CONTINUE\n",
         );
         let view = scan_feedback(repo, &[s1.clone()]).unwrap();
         assert_eq!(view.per_commit[0].entries.len(), 1);
@@ -172,7 +176,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let repo = dir.path();
         let s1 = full_sha("1111111");
-        write(repo, ".clank/agents/alice/feedback/deadbee.md", "APPROVE\n");
+        write(
+            repo,
+            ".clank/agents/alice/feedback/deadbee.md",
+            "CONTINUE\n",
+        );
         let view = scan_feedback(repo, &[s1.clone()]).unwrap();
         assert_eq!(view.per_commit[0].entries.len(), 0);
     }
@@ -193,7 +201,7 @@ mod tests {
         write(
             repo,
             &format!(".clank/agents/alice/feedback/{}.md", &s1.as_str()[..7]),
-            "APPROVE\n",
+            "CONTINUE\n",
         );
         write(repo, ".clank/agents/alice/feedback/notes.txt", "ignore me");
         let view = scan_feedback(repo, &[s1]).unwrap();
@@ -208,12 +216,12 @@ mod tests {
         write(
             repo,
             &format!(".clank/agents/alice/feedback/{}.md", &s1.as_str()[..7]),
-            "APPROVE\n",
+            "CONTINUE\n",
         );
         write(
             repo,
             &format!(".clank/agents/alice/feedback/bar/{}.md", &s1.as_str()[..7]),
-            "APPROVE\n",
+            "CONTINUE\n",
         );
         let view = scan_feedback(repo, &[s1]).unwrap();
         assert_eq!(view.per_commit[0].entries.len(), 1);

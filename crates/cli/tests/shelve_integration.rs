@@ -165,7 +165,7 @@ fn unshelve_restores_and_resets_reviews() {
     assert!(!git_out(repo, &["show-ref"]).contains("refs/clank/shelved/foo"));
 
     // Reviews reset by design: the snapshot sees foo active again.
-    // (Master-only team → gate computes zero-reviewer Approved; the
+    // (Master-only team → gate computes zero-reviewer Continued; the
     // load-bearing assertion is that foo is an ACTIVE plan again
     // with its latest reviewable = the replayed head.)
     let snap = block_on(clank::cli::status::snapshot(repo, Some(env.home()))).unwrap();

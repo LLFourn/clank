@@ -83,7 +83,7 @@ impl std::fmt::Display for ReviewerVerdictError {
             ReviewerVerdictError::MissingRound => f.write_str("missing `round:` field"),
             ReviewerVerdictError::UnknownVerdict(v) => write!(
                 f,
-                "unknown verdict `{v}` (want approve|finished|request_changes)"
+                "unknown verdict `{v}` (want continue|finished|request_changes)"
             ),
             ReviewerVerdictError::BadRound(v) => {
                 write!(f, "round `{v}` is not a non-negative integer")
@@ -132,7 +132,9 @@ impl ReviewerVerdict {
             match key.trim().to_ascii_lowercase().as_str() {
                 "verdict" => {
                     verdict = Some(match value {
-                        "approve" => Verdict::Approve,
+                        // `approve` is the legacy spelling of `continue`
+                        // (pre-rename PR-review files keep parsing).
+                        "continue" | "approve" => Verdict::Continue,
                         "finished" => Verdict::Finished,
                         "request_changes" => Verdict::RequestChanges,
                         other => return Err(ReviewerVerdictError::UnknownVerdict(other.into())),
@@ -224,7 +226,11 @@ mod tests {
 
     #[test]
     fn verdict_round_trips() {
-        for v in [Verdict::Approve, Verdict::Finished, Verdict::RequestChanges] {
+        for v in [
+            Verdict::Continue,
+            Verdict::Finished,
+            Verdict::RequestChanges,
+        ] {
             let rv = ReviewerVerdict::new(v, 3, "a multi-line\n\nsummary here");
             let parsed = ReviewerVerdict::parse(&rv.render()).unwrap();
             assert_eq!(parsed, rv, "round-trip for {v:?}");

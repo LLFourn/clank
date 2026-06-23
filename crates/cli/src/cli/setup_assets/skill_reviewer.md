@@ -31,7 +31,7 @@ Compose the command yourself:
 
 ```
 clank feedback write --commit <sha> \
-  --verdict approve|finished|request-changes \
+  --verdict continue|finished|request-changes \
   --author <label> -m "<message>"
 ```
 
@@ -40,21 +40,30 @@ details. The tool prepends the verdict to the file.
 
 ### Verdicts
 
-**DO NOT** APPROVE a commit while gating on a change you raised in the
-approval message — if something must change before the plan can finish,
-use REQUEST_CHANGES (noting what still REMAINS to implement, or a clearly
-optional non-gating suggestion, stays a valid APPROVE).
+Three verdicts, no overlap: **CONTINUE** (good, more to do) / **FINISHED**
+(good, done) / **REQUEST_CHANGES** (not good). The positive mid-flight verdict
+is CONTINUE — it literally tells the master to keep going. (It was once called
+APPROVE; that read as "ship it" and pulled reviewers toward it when the work
+was actually done and the verdict should have been FINISHED. If you think the
+plan is finished, you would not say "continue" — say FINISHED.)
 
-- **APPROVE**: this commit's work is good. Mid-flight signal — the master
-  keeps going. If you approve but the plan isn't fully IMPLEMENTED yet,
-  add a one-sentence reason it's not FINISHED (e.g. "tests still
-  missing") to keep the master oriented on what's left.
-- **FINISHED**: the committable work the plan DESCRIBES is fully
-  implemented and merge-ready — code written, tests passing, review
-  satisfied — so the plan is ready to finalize (the master runs the
-  finalize step). FINISHED does NOT mean "the plan text is written": a
-  complete plan document is the START of implementation, not the end.
-  (Exception: a plan whose ONLY deliverable is a document — research or
-  design with no code to write — IS finished when the document is done.)
-- **REQUEST_CHANGES**: something committable must change before this
-  commit can be approved.
+**DO NOT** CONTINUE while gating on a change you raised in the message — CONTINUE
+means good AND not gating on anything. If something must change before the plan
+can finish, use REQUEST_CHANGES. (Naming what still REMAINS to implement, or a
+clearly optional non-gating suggestion, stays a valid CONTINUE.)
+
+- **CONTINUE**: this commit's work is good and there is more to do — the master
+  keeps going. Add a one-sentence reason it's not FINISHED yet (e.g. "tests
+  still missing") to keep the master oriented on what's left. Before choosing
+  CONTINUE over FINISHED, name the plan deliverable still missing or wrong; if
+  you can't name one against the plan's acceptance, the verdict is FINISHED.
+- **FINISHED**: the committable work the plan DESCRIBES is
+  implemented and merge-ready — code written, tests passing, review satisfied —
+  so the plan is ready to finalize (the master runs the finalize step). FINISHED
+  does NOT mean
+  "the plan text is written": a complete plan document is the START of
+  implementation, not the end. (Exception: a plan whose ONLY deliverable is a
+  document — research or design with no code to write — IS finished when the
+  document is done.)
+- **REQUEST_CHANGES**: something committable must change before this commit can
+  be accepted.

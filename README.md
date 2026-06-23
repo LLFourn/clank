@@ -1,8 +1,8 @@
 # clank
 
 Multi-agent peer review around plans. One agent writes a plan, others
-review it, the first agent implements it, reviewers approve the
-implementation commit-by-commit, finalize. Everything lives in
+review it, the first agent implements it, reviewers sign off
+commit-by-commit (CONTINUE / FINISHED), finalize. Everything lives in
 `.clank/` and `git`; there's no daemon and no server.
 
 ## Install
@@ -36,8 +36,8 @@ clank doctor
 Two roles:
 
 - **master** — author of a plan. Writes it, implements it, finalizes it.
-- **reviewers** — everyone else. Reads the plan, approves or requests
-  changes on each commit master makes.
+- **reviewers** — everyone else. Reads the plan, continues (or finishes,
+  or requests changes) on each commit master makes.
 
 Both roles are just regular agent sessions running `clank`. The role of
 the calling agent is inferred from `.clank/config.json` (which names the
@@ -87,22 +87,23 @@ A reviewer waiting on work (`clank wait`, or the Stop hook auto-mode)
 gets told there's a commit to review. They write feedback via:
 
 ```sh
-echo "APPROVE
+echo "CONTINUE
 
 Looks good." | clank feedback write \
     --plan my-feature \
     --commit abc1234... \
-    --verdict approve \
+    --verdict continue \
     --author alice
 ```
 
-Or `REQUEST_CHANGES` with notes. The header (`APPROVE` /
-`REQUEST_CHANGES`) is validated against the `--verdict` flag.
+Or `REQUEST_CHANGES` with notes. The header (`CONTINUE` /
+`REQUEST_CHANGES`) is validated against the `--verdict` flag. (`CONTINUE`
+means good-but-more-to-do; `FINISHED` means the plan is done.)
 
 ### Master: address feedback
 
 If anyone requested changes, master's wait says so. Edit the plan or
-code, commit, and the cycle repeats. Once everyone has approved the
+code, commit, and the cycle repeats. Once everyone has CONTINUE'd the
 latest reviewable commit, master implements:
 
 ```sh
@@ -110,7 +111,7 @@ latest reviewable commit, master implements:
 git commit -m "[my-feature] implement"
 ```
 
-When the implementation commit is approved by all participants, master
+When the implementation commit is FINISHED by all participants, master
 finalizes:
 
 ```sh
@@ -204,7 +205,7 @@ clank status --all                  # every plan including finished
 clank doctor                        # diagnose setup across all scopes
 clank wait                           # block for work for this agent
 clank feedback write ...            # write a review
-clank finish <plan>                 # finalize an approved plan
+clank finish <plan>                 # finalize a finished plan
 clank purge <plan>                  # strip a plan's artifacts from git history
 ```
 

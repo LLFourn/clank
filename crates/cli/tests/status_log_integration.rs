@@ -48,7 +48,7 @@ fn snapshot_carries_recent_oneline_log_with_reviews() {
     write(
         repo,
         &format!(".clank/agents/codex/feedback/{intro}.md"),
-        "APPROVE lgtm\n",
+        "CONTINUE lgtm\n",
     );
     write(repo, "src/a.rs", "// a\n");
     commit(repo, "[foo] impl a");

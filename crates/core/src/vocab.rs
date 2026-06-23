@@ -68,12 +68,18 @@ impl PlanWorktreeStatus {
 }
 
 /// Verdict on a single feedback file. Parsed from the file's first
-/// non-blank line: `APPROVE` → `Approve`, `FINISHED` → `Finished`,
+/// non-blank line: `CONTINUE` → `Continue`, `FINISHED` → `Finished`,
 /// `REQUEST_CHANGES` → `RequestChanges`, anything else → `Unmarked`.
+/// Legacy `APPROVE` is still accepted as `Continue` (the verdict was
+/// renamed APPROVE→CONTINUE; on-disk feedback predating the rename must
+/// keep gating).
 ///
-/// `Finished` is the "ship it — finalize this plan" signal,
-/// distinct from `Approve` which just blesses the commit's work.
-/// Reviewers explicitly opt into `Finished`; clank never infers it.
+/// `Finished` is the "ship it — finalize this plan" signal, distinct
+/// from `Continue` which blesses the commit's work but says there is
+/// more to do. Reviewers explicitly opt into `Finished`; clank never
+/// infers it. The name CONTINUE (vs the old APPROVE) is deliberate:
+/// "approve" reads as sign-off, pulling reviewers toward it exactly
+/// when the work is done and the verdict should be FINISHED.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[cfg_attr(
@@ -81,7 +87,7 @@ impl PlanWorktreeStatus {
     derive(wincode::SchemaWrite, wincode::SchemaRead)
 )]
 pub enum Verdict {
-    Approve,
+    Continue,
     Finished,
     RequestChanges,
     Unmarked,
@@ -90,7 +96,7 @@ pub enum Verdict {
 impl Verdict {
     pub fn as_str(self) -> &'static str {
         match self {
-            Verdict::Approve => "approve",
+            Verdict::Continue => "continue",
             Verdict::Finished => "finished",
             Verdict::RequestChanges => "request_changes",
             Verdict::Unmarked => "unmarked",
@@ -104,7 +110,7 @@ impl Verdict {
 /// the highest matching state):
 /// - `ChangesRequested`: ≥1 reviewer voted REQUEST_CHANGES.
 /// - `Finished`: ≥1 reviewer voted FINISHED, none requested changes.
-/// - `Approved`: ≥1 reviewer voted APPROVE, none FINISHED or
+/// - `Continued`: ≥1 reviewer voted CONTINUE, none FINISHED or
 ///   request-changes.
 /// - `Unreviewed`: no recognized verdict yet on this commit.
 ///
@@ -127,28 +133,28 @@ impl Verdict {
 )]
 pub enum CommitGateState {
     Unreviewed,
-    Approved,
+    Continued,
     Finished,
     ChangesRequested,
     Blocked,
-    /// All commit-reviewers voted approve/finished; at least
+    /// All commit-reviewers voted continue/finished; at least
     /// one gate-reviewer hasn't voted yet (no Request-Changes
     /// from anyone). Master sleeps in this state — it's the
     /// gate-reviewers' window. Plan:
     /// `teams-based-agent-registration`. Appended at the end
     /// per the wincode position-encoding comment above.
-    ApprovedPendingGate,
+    ContinuedPendingGate,
 }
 
 impl CommitGateState {
     pub fn as_str(self) -> &'static str {
         match self {
             CommitGateState::Unreviewed => "unreviewed",
-            CommitGateState::Approved => "approved",
+            CommitGateState::Continued => "continued",
             CommitGateState::Finished => "finished",
             CommitGateState::ChangesRequested => "changes_requested",
             CommitGateState::Blocked => "blocked",
-            CommitGateState::ApprovedPendingGate => "approved_pending_gate",
+            CommitGateState::ContinuedPendingGate => "continued_pending_gate",
         }
     }
 }
@@ -168,10 +174,10 @@ pub enum WaitingReason {
     /// Gate is FINISHED + worktree clean — master should run
     /// `clank finish`.
     ReadyToFinalize,
-    /// Latest reviewable commit is APPROVE (not FINISHED). Master
+    /// Latest reviewable commit is CONTINUE (not FINISHED). Master
     /// keeps working — more impl, more docs, more tests, or
     /// nudge a reviewer to upgrade to FINISHED.
-    GateApproved,
+    GateContinue,
     /// Latest reviewable commit hasn't been reviewed yet.
     CommitNeedsReview,
 }
@@ -183,7 +189,7 @@ impl WaitingReason {
             WaitingReason::CommitPlanRevision => "commit_plan_revision",
             WaitingReason::AddressCommitChanges => "address_commit_changes",
             WaitingReason::ReadyToFinalize => "ready_to_finalize",
-            WaitingReason::GateApproved => "gate_approved",
+            WaitingReason::GateContinue => "gate_continue",
             WaitingReason::CommitNeedsReview => "commit_needs_review",
         }
     }

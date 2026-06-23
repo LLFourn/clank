@@ -108,7 +108,7 @@ pub enum FinalizeBlockReason {
     NoReviewableCommit,
     /// Gate state on the latest reviewable commit is something
     /// other than `Finished`. Holds the actual state so the
-    /// caller can render a helpful message ("approved — needs a
+    /// caller can render a helpful message ("continued — needs a
     /// FINISHED vote", "changes requested — address them",
     /// etc.).
     NotFinished {
@@ -119,7 +119,7 @@ pub enum FinalizeBlockReason {
 }
 
 /// One approving feedback the CLI's preview projected as part of
-/// the approved gate.
+/// the continued gate.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SealedApproval {
     pub author: crate::ids::AgentLabel,
