@@ -1286,6 +1286,44 @@ mod dirty_and_wake_tests {
         );
     }
 
+    /// Fitness function for the status path (mirrors the fold's
+    /// `fold_opens_the_odb_once`): a whole status build opens the ODB a
+    /// FIXED, small number of times — once PER PHASE, not once per read.
+    /// The three phases each open their own handle and reuse it
+    /// internally: (1) the main fold (`rebuild_with_diagnostics`), (2)
+    /// the log-window fold (`rebuild_from` in `log_rows_windowed`), and
+    /// (3) the snapshot's live reads (dirty walk + HEAD facts + per-plan
+    /// worktree status all share that handle). Collapsing the three into
+    /// one would mean threading a handle through `rebuild`'s many callers
+    /// — deferred (clean-hangers scope keeps cold/one-shot simple). The
+    /// EXACT assert catches a regression that re-adds a per-read open.
+    #[tokio::test]
+    async fn status_build_opens_the_odb_once_per_phase() {
+        let dir = fixture_repo();
+        let r = dir.path();
+        std::fs::create_dir_all(r.join(".clank/plans")).unwrap();
+        std::fs::write(r.join(".clank/plans/foo.md"), "# foo\n").unwrap();
+        git(r, &["add", "-A"]);
+        git(r, &["commit", "--quiet", "-m", "[foo] intro"]);
+
+        crate::git_io::OPEN_COUNT.with(|c| c.set(0));
+        let _ = StatusSnapshot::build_async(
+            r,
+            "repo",
+            None,
+            crate::rebuild::CachePolicy::Bypass,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            crate::git_io::OPEN_COUNT.with(|c| c.get()),
+            3,
+            "status build opens once per phase: main fold + log-window fold + snapshot"
+        );
+    }
+
     #[test]
     fn dirty_stats_reports_lines_and_untracked() {
         let dir = fixture_repo();

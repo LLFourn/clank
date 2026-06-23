@@ -56,9 +56,34 @@ worktree status via `git_io::Repo`); the rest still re-opens.
   (assert via a counting wrapper or by construction — one `Repo` created).
 - Read results are unchanged (existing fold/status/log tests stay green).
 
+## Resolved — clean-hangers scope (lloyd)
+
+The point is CLEAN code, not chasing opens: every git READ is hung on the
+`Repo` handle as a method, in ONE `impl Repo` block, with thin `*_at(&Path)`
+openers for path callers (the method is the canonical logic; the wrapper just
+opens + delegates). Threading then falls out for the paths that actually
+re-read:
+- **Fold** — `rebuild` opens once; `fold_opens_the_odb_once` pins it EXACTLY
+  (cold + warm).
+- **Status build** — opens ONCE PER PHASE (main fold + log-window fold +
+  snapshot live reads), pinned by `status_build_opens_the_odb_once_per_phase`.
+  Collapsing the phases into one open would thread a handle through `rebuild`'s
+  many callers — deferred.
+- **preview / log** — render from the fold's rebuilt state; they do NO direct
+  git reads, so there's nothing to thread.
+- **html** — the one COLD render path doing direct reads; it keeps the `*_at`
+  openers (method-backed logic) rather than threading a handle through its many
+  render fns. Deliberate, not an omission.
+- A few one-shot reads elsewhere (`resolve_commit`, `is_ancestor`, `show_blob`,
+  `origin_url`, `blob_at_rev`, `commit_meta`) stay path-based free fns; they
+  migrate to methods as their caller paths are touched.
+
 ## Acceptance
 
-- `git_io`'s hot reads are handle-first (`&Repo`); top-level ops open once and
-  thread it.
-- No behavior change; the re-open-per-call pattern is gone from the fold and
-  status/log/preview paths.
+- `git_io` reads are methods on a single `impl Repo` block; handle-holders call
+  methods, path callers use thin `*_at` openers — no floating read function as
+  the canonical home.
+- The re-open-PER-READ pattern is gone from the fold and status paths (each
+  phase opens once, pinned by exact-count tests). Cold render paths (html) use
+  method-backed `*_at` openers by design.
+- No behavior change; full suite + boundary test green.
