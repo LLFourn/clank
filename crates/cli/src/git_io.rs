@@ -841,33 +841,45 @@ pub fn commit_body_at(repo: &Path, sha: &CommitSha) -> Result<String, GitIoError
 /// All commits reachable from `head`, as a `full-sha -> subject` map
 /// — matches `git log --format=%H<TAB>%s <head>` (all ancestors, not
 /// first-parent). For batch subject lookups (the html log view).
-pub fn ancestor_subjects(
+impl Repo {
+    pub fn ancestor_subjects(
+        &self,
+        head: &CommitSha,
+    ) -> Result<std::collections::BTreeMap<String, String>, GitIoError> {
+        let err = |stage: &str, e: &dyn std::fmt::Display| {
+            nonzero("ancestor_subjects", format!("{stage}: {e}"))
+        };
+        let tip =
+            gix::ObjectId::from_hex(head.as_str().as_bytes()).map_err(|e| GitIoError::Parse {
+                context: "ancestor_subjects".into(),
+                detail: format!("oid hex: {e}"),
+            })?;
+        let walk = self
+            .0
+            .rev_walk([tip])
+            .all()
+            .map_err(|e| err("rev_walk", &e))?;
+        let mut out = std::collections::BTreeMap::new();
+        for info in walk {
+            let info = info.map_err(|e| err("walk iter", &e))?;
+            let commit = info.object().map_err(|e| err("info.object", &e))?;
+            let subject = commit
+                .message()
+                .map_err(|e| err("message", &e))?
+                .summary()
+                .to_string();
+            out.insert(info.id.to_string(), subject);
+        }
+        Ok(out)
+    }
+}
+
+/// [`Repo::ancestor_subjects`] opening its own handle.
+pub fn ancestor_subjects_at(
     repo: &Path,
     head: &CommitSha,
 ) -> Result<std::collections::BTreeMap<String, String>, GitIoError> {
-    let err = |stage: &str, e: &dyn std::fmt::Display| GitIoError::NonZero {
-        context: "ancestor_subjects".into(),
-        code: None,
-        stderr: format!("{stage}: {e}"),
-    };
-    let r = gix::open(repo).map_err(|e| err("open", &e))?;
-    let tip = gix::ObjectId::from_hex(head.as_str().as_bytes()).map_err(|e| GitIoError::Parse {
-        context: "ancestor_subjects".into(),
-        detail: format!("oid hex: {e}"),
-    })?;
-    let walk = r.rev_walk([tip]).all().map_err(|e| err("rev_walk", &e))?;
-    let mut out = std::collections::BTreeMap::new();
-    for info in walk {
-        let info = info.map_err(|e| err("walk iter", &e))?;
-        let commit = info.object().map_err(|e| err("info.object", &e))?;
-        let subject = commit
-            .message()
-            .map_err(|e| err("message", &e))?
-            .summary()
-            .to_string();
-        out.insert(info.id.to_string(), subject);
-    }
-    Ok(out)
+    open(repo)?.ancestor_subjects(head)
 }
 
 /// Return the blob content at `rel_path` in the tree of `rev`.

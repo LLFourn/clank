@@ -1363,7 +1363,7 @@ fn commit_body(repo: &Path, sha: &CommitSha) -> String {
 /// index doesn't shell out per row.
 fn collect_subjects(repo: &Path, head: Option<&CommitSha>) -> BTreeMap<String, String> {
     match head {
-        Some(head) => crate::git_io::ancestor_subjects(repo, head).unwrap_or_default(),
+        Some(head) => crate::git_io::ancestor_subjects_at(repo, head).unwrap_or_default(),
         None => BTreeMap::new(),
     }
 }
