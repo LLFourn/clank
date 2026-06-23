@@ -1,9 +1,11 @@
-//! The fold drivers. Every rebuild — cold start, HEAD change, or
-//! range query — is the same loop: resume [`RepoState`] from the
-//! deepest usable checkpoint (`state_cache`), apply the missing
-//! commits via `git_io::commit_events_between`, and persist spaced
-//! checkpoints as it goes (`clank_core::checkpoint` policy), so
-//! every fold both benefits from and feeds the cache.
+//! The fold drivers. Every rebuild resumes [`RepoState`] from the
+//! deepest usable checkpoint (`state_cache`) and applies the missing
+//! commits via `git_io::commit_events_between`. Only the DELIBERATE
+//! rebuilds (cold start, HEAD change — [`rebuild_with_diagnostics`])
+//! persist spaced checkpoints (`clank_core::checkpoint` policy) and
+//! prune, feeding the cache. The range/render query ([`rebuild_from`])
+//! is READ-ONLY: it benefits from the cache but never writes or prunes
+//! it, so a status render cannot churn the cache.
 //!
 //! Feedback files are NOT folded into state; consumers project them
 //! on demand via `git_io::collect_feedback_files`.
@@ -158,9 +160,15 @@ fn prune_checkpoints(repo_root: &Path, tip_depth: u64) {
 
 /// Rebuild a range `(from, to]` collecting log events. `from` is
 /// exclusive (`None` = repo root), `to` is inclusive. Resumes from
-/// the deepest checkpoint at-or-before `from` and writes spaced
-/// checkpoints as it folds — the cache is invisible to callers but
-/// every fold both benefits from and feeds it.
+/// the deepest checkpoint at-or-before `from` to stay cheap.
+///
+/// READ-ONLY: this is the log-window render path, so it READS the
+/// checkpoint cache to resume but never writes or prunes it — only a
+/// deliberate [`rebuild_with_diagnostics`] mutates the cache. A render
+/// that wrote the cache is what pegged the status TUI (a write the
+/// trailing prune then deleted, fsync'd every frame); keeping the
+/// render incapable of touching the cache makes that class of bug
+/// structurally impossible.
 pub async fn rebuild_from(
     repo_root: &Path,
     from: Option<&CommitSha>,
@@ -174,8 +182,10 @@ pub async fn rebuild_from(
         None => (RepoState::empty(repo_root.to_path_buf()), 0),
     };
 
-    // Enumerate both phases up front so checkpoint spacing is
-    // computed against the real tip (`to`), not the phase boundary.
+    // Two phases: a SILENT fold from the resume base up through `from`
+    // to rebuild context (events discarded), then a COLLECTING fold of
+    // `(from, to]`. Depths feed fold_events' shared signature but are
+    // inert here — this render path never checkpoints.
     let silent_target = from.cloned();
     let phase1 = match silent_target.as_ref() {
         Some(target) => git.commit_events_between(state.head.as_ref(), target)?,
@@ -187,17 +197,18 @@ pub async fn rebuild_from(
     let tip_depth = mid_depth + phase2.len() as u64;
 
     // Phase 1 (silent): fold through `from` to build context;
-    // events discarded.
-    let _ = fold_events(repo_root, &mut state, phase1, base_depth, tip_depth, true);
+    // events discarded. checkpoint=false — read-only render path.
+    let _ = fold_events(repo_root, &mut state, phase1, base_depth, tip_depth, false);
     if let Some(target) = silent_target {
         state.head = Some(target);
     }
 
-    // Phase 2 (collecting): fold `(from, to]`.
-    let log_events = fold_events(repo_root, &mut state, phase2, mid_depth, tip_depth, true);
+    // Phase 2 (collecting): fold `(from, to]`, still read-only.
+    let log_events = fold_events(repo_root, &mut state, phase2, mid_depth, tip_depth, false);
     state.head = Some(to.clone());
 
-    prune_checkpoints(repo_root, tip_depth);
+    // No checkpoint write, no prune: the cache is owned by
+    // rebuild_with_diagnostics, not the render.
     Ok((state, log_events))
 }
 
@@ -403,22 +414,20 @@ mod tests {
         );
     }
 
-    /// Reproduces status-tui-watch-cpu at the engine level. The status
-    /// snapshot's `recent_log_rows` calls `rebuild_from` on EVERY
-    /// render, and `rebuild_from` has no warm-cache fast path — it
-    /// re-folds the recent window and writes spaced checkpoints each
-    /// call. At a STABLE head those checkpoint files already exist, so
-    /// the temp+rename rewrites them, churning their inode/mtime. The
-    /// status watcher sees the `.clank/cache` write and wakes → render
-    /// → rewrite → wake. The cache MUST stay inode-stable across
-    /// repeated stable-head folds. (Verified to FAIL before the
-    /// idempotent-write fix: 6 files churned per round.)
+    /// Fix 1 (render reads, fold writes): `rebuild_from` is the
+    /// log-window RENDER path the status snapshot calls on EVERY frame.
+    /// It must never write OR prune the checkpoint cache — only a
+    /// deliberate `rebuild_with_diagnostics` mutates it. A render that
+    /// wrote the cache is what pegged the status TUI: it wrote a
+    /// checkpoint the trailing prune then deleted, fsync'd every frame
+    /// (the watcher saw the `.clank/cache` write and re-woke). Making
+    /// the render incapable of touching the cache makes that class of
+    /// bug structurally impossible.
     #[cfg(unix)]
     #[tokio::test]
-    async fn repeated_rebuild_from_at_stable_head_does_not_churn_cache() {
+    async fn rebuild_from_never_mutates_cache() {
         let dir = init_repo();
-        // More than the log window so `from = HEAD~30` resolves and
-        // the recent slice is dense with checkpoints.
+        // More than the log window so `from = HEAD~30` resolves.
         for i in 0..40 {
             write_file(dir.path(), ".clank/plans/foo.md", &format!("# foo v{i}\n"));
             commit(dir.path(), &format!("[foo] step {i}"));
@@ -429,20 +438,39 @@ mod tests {
         let from = crate::git_io::resolve_commit(dir.path(), "HEAD~30");
 
         let cache = dir.path().join(".clank/cache/repo-state");
-        // Prime the checkpoint set exactly as a render does.
+        // Cold cache: a render-path fold writes NOTHING.
         rebuild_from(dir.path(), from.as_ref(), &head)
             .await
             .unwrap();
-        let before = cache_fingerprint(&cache);
-        assert!(!before.is_empty(), "priming wrote at least one checkpoint");
+        assert!(
+            cache_fingerprint(&cache).is_empty(),
+            "rebuild_from wrote a checkpoint — the render path must be read-only"
+        );
 
-        // Repeated renders at the SAME head must not rewrite anything.
+        // A deliberate rebuild OWNS the cache; prime it.
+        rebuild_with_diagnostics(dir.path(), CachePolicy::Use)
+            .await
+            .unwrap();
+        let before = cache_fingerprint(&cache);
+        assert!(
+            !before.is_empty(),
+            "the deliberate rebuild primed the cache"
+        );
+
+        // Repeated renders against the primed cache neither rewrite nor
+        // prune any file.
         for _ in 0..5 {
             rebuild_from(dir.path(), from.as_ref(), &head)
                 .await
                 .unwrap();
         }
-        assert_no_churn(&before, &cache_fingerprint(&cache));
+        let after = cache_fingerprint(&cache);
+        assert_no_churn(&before, &after);
+        assert_eq!(
+            before.len(),
+            after.len(),
+            "rebuild_from added or deleted a checkpoint — it must not prune"
+        );
     }
 
     /// The same guarantee through the FULL render path: building a
@@ -576,7 +604,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rebuild_from_resumes_from_checkpoints_and_seeds_them() {
+    async fn rebuild_from_resumes_from_checkpoints_read_only() {
         let dir = init_repo();
         write_file(dir.path(), ".clank/plans/foo.md", "# foo\n");
         commit(dir.path(), "[foo] intro");
@@ -585,21 +613,25 @@ mod tests {
         let from = shas[26].clone(); // HEAD~3
         let head = shas[29].clone();
 
-        // Cold range fold on an empty cache: must seed checkpoints
-        // (the old code wrote nothing here — every TUI frame
-        // re-folded from root).
+        // Render-path fold on an empty cache: correct events, but it
+        // seeds NO checkpoints (Fix 1 — only a deliberate rebuild owns
+        // the cache).
         let (state_cold, events_cold) = rebuild_from(dir.path(), Some(&from), &head).await.unwrap();
         assert_eq!(events_cold.len(), 3);
         assert!(
-            !state_cache::list_checkpoints(dir.path()).is_empty(),
-            "range fold seeds checkpoints"
+            state_cache::list_checkpoints(dir.path()).is_empty(),
+            "the render path must not seed checkpoints"
         );
 
-        // Second identical fold resumes from a nearby checkpoint…
+        // A deliberate rebuild seeds the cache; the render then RESUMES
+        // from a nearby checkpoint…
+        rebuild_with_diagnostics(dir.path(), CachePolicy::Use)
+            .await
+            .unwrap();
         let git = git_io::open(dir.path()).unwrap();
         let (cp, _) = find_base_checkpoint(dir.path(), &git, &from).expect("base exists now");
         assert!(cp.depth >= 24, "dense-near-tip base, got {}", cp.depth);
-        // …and produces the identical result.
+        // …and produces the identical result it folded cold.
         let (state_warm, events_warm) = rebuild_from(dir.path(), Some(&from), &head).await.unwrap();
         assert_eq!(state_cold.fold, state_warm.fold);
         assert_eq!(events_cold, events_warm);
