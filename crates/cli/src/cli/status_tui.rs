@@ -1143,8 +1143,12 @@ extern "C" fn restore_and_exit(sig: libc::c_int) {
 
 /// What wakes the `--tui` loop.
 enum Ev {
-    /// A status/data change — rebuild the snapshot.
+    /// A status/data change — probe the signature; rebuild iff it moved.
     Refresh,
+    /// A terminal resize (SIGWINCH). NOT a data change: top up the
+    /// (possibly taller) viewport and repaint, but never rebuild — so a
+    /// resize is never swallowed by the nothing-changed gate.
+    Resize,
     /// A keystroke from the stdin reader thread.
     Key(Key),
 }
@@ -1480,22 +1484,35 @@ pub(crate) async fn run_tui(
     policy: crate::rebuild::CachePolicy,
 ) -> anyhow::Result<()> {
     let (tx, rx) = mpsc::channel::<()>();
-    let _watcher = watch_status_paths(tx.clone(), &repo)?;
-    spawn_sigwinch_forwarder(tx)?;
+    let _watcher = watch_status_paths(tx, &repo)?;
+    // Resize is NOT a data change, so SIGWINCH gets its OWN channel and
+    // maps to `Ev::Resize` — otherwise the nothing-changed gate (which
+    // only fires on `Ev::Refresh`) would swallow it and leave a taller
+    // pane underfilled until the next keypress.
+    let (winch_tx, winch_rx) = mpsc::channel::<()>();
+    spawn_sigwinch_forwarder(winch_tx)?;
 
     let _guard = AltScreen::enter();
 
-    // Unify the existing watcher/SIGWINCH wake
-    // channel with a stdin reader into one event stream. A blocking
-    // `read` on stdin IS the notification (no polling); both producers
-    // feed `ev_rx`, which the loop drains — the same channel-driven
-    // shape the watcher already uses.
+    // Merge the watcher (data), SIGWINCH (resize), and stdin (keys) into
+    // one event stream the loop drains. A blocking `read` on stdin IS
+    // the notification (no polling).
     let (ev_tx, ev_rx) = mpsc::channel::<Ev>();
     {
         let ev_tx = ev_tx.clone();
         std::thread::spawn(move || {
             while rx.recv().is_ok() {
                 if ev_tx.send(Ev::Refresh).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    {
+        let ev_tx = ev_tx.clone();
+        std::thread::spawn(move || {
+            while winch_rx.recv().is_ok() {
+                if ev_tx.send(Ev::Resize).is_err() {
                     break;
                 }
             }
@@ -1637,6 +1654,13 @@ pub(crate) async fn run_tui(
                         panes.update(&snapshot);
                     }
                 }
+            }
+            // Resize: not a data change, so no signature probe and no
+            // rebuild — just top up the (possibly taller) viewport and
+            // repaint. The loop top re-reads `term_size`; the fill is a
+            // no-op when the viewport is already full.
+            Ok(Ev::Resize) => {
+                needs_fill = true;
             }
             // Animation tick: advance the frame ONLY. `needs_fill` stays
             // false, so the next iteration is a PURE repaint — render_at
