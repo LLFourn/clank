@@ -1354,7 +1354,7 @@ fn commit_subject(repo: &Path, sha: &CommitSha) -> String {
 /// and its trailing blank). Empty when the commit has only a
 /// subject.
 fn commit_body(repo: &Path, sha: &CommitSha) -> String {
-    crate::git_io::commit_body(repo, sha)
+    crate::git_io::commit_body_at(repo, sha)
         .map(|b| b.trim().to_string())
         .unwrap_or_default()
 }
