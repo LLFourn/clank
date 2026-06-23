@@ -130,7 +130,7 @@ impl PlanStateLookup for FsPlanStateLookup<'_> {
         let Some(git) = self.git() else {
             return PlanWorktreeStatus::Clean;
         };
-        git_io::plan_body_status(git, head, &rel)
+        git.plan_body_status(head, &rel)
     }
 }
 

@@ -211,7 +211,7 @@ impl StatusSnapshot {
         // re-open). Opaque `git_io::Repo` so this stays off the gix
         // boundary (gix-not-git-gate).
         let git = crate::git_io::open(repo)?;
-        let dirty = crate::git_io::working_tree_dirty(&git)?;
+        let dirty = git.working_tree_dirty()?;
 
         let config = crate::cli::config::load_with_home(repo, home);
         // Plan: teams-based-agent-registration. `status` is a

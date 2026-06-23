@@ -63,18 +63,20 @@ pub fn open(repo: &Path) -> Result<Repo, GitIoError> {
     Ok(Repo(r))
 }
 
-/// HEAD's commit sha via an existing handle (`None` on unborn HEAD) —
-/// the [`rev_parse_head`] read for callers that already hold a [`Repo`].
-pub fn head_sha(h: &Repo) -> Result<Option<CommitSha>, GitIoError> {
-    match h
-        .0
-        .head()
-        .ok()
-        .and_then(|head| head.id())
-        .map(|id| id.detach())
-    {
-        None => Ok(None),
-        Some(oid) => Ok(Some(parse_sha("head_id", &oid.to_string())?)),
+impl Repo {
+    /// HEAD's commit sha (`None` on unborn HEAD) — the [`rev_parse_head`]
+    /// read for callers that already hold a handle.
+    pub fn head_sha(&self) -> Result<Option<CommitSha>, GitIoError> {
+        match self
+            .0
+            .head()
+            .ok()
+            .and_then(|head| head.id())
+            .map(|id| id.detach())
+        {
+            None => Ok(None),
+            Some(oid) => Ok(Some(parse_sha("head_id", &oid.to_string())?)),
+        }
     }
 }
 
@@ -92,7 +94,7 @@ pub struct DirtyStats {
 /// `None` = clean. Opens its own handle; prefer [`working_tree_dirty`]
 /// when you already hold a [`Repo`].
 pub fn working_tree_dirty_at(repo: &Path) -> Result<Option<DirtyStats>, GitIoError> {
-    working_tree_dirty(&open(repo)?)
+    open(repo)?.working_tree_dirty()
 }
 
 /// `true` iff the working tree + index are clean — no tracked changes
@@ -137,35 +139,37 @@ pub fn working_tree_status(repo: &Path) -> Result<WorkingTreeStatus, GitIoError>
 /// the old `--no-optional-locks` shell-out guarded against: a probe
 /// that refreshed `.git/index` would fire the very watcher that drove
 /// the probe.
-pub fn working_tree_dirty(h: &Repo) -> Result<Option<DirtyStats>, GitIoError> {
-    let git = &h.0;
+impl Repo {
+    pub fn working_tree_dirty(&self) -> Result<Option<DirtyStats>, GitIoError> {
+        let git = &self.0;
 
-    let workdir = git
-        .workdir()
-        .ok_or_else(|| nonzero("working_tree_dirty", "bare repo has no working tree"))?
-        .to_path_buf();
+        let workdir = git
+            .workdir()
+            .ok_or_else(|| nonzero("working_tree_dirty", "bare repo has no working tree"))?
+            .to_path_buf();
 
-    let walk = status_walk(git)?;
-    if walk.changed.is_empty() && walk.untracked.is_empty() {
-        return Ok(None);
+        let walk = status_walk(git)?;
+        if walk.changed.is_empty() && walk.untracked.is_empty() {
+            return Ok(None);
+        }
+
+        // Line counts mirror `git diff HEAD --shortstat` (display-only; not
+        // a gate input). On an unborn HEAD there's no tree to diff against —
+        // degrade to 0/0, matching the old shell-out where `git diff HEAD`
+        // errored (the untracked count still tells the story). gix's diff
+        // algorithm may drift by a line from git's on some changes; that's
+        // accepted for a display figure.
+        let (insertions, deletions) = match git.head_commit().ok().and_then(|c| c.tree().ok()) {
+            Some(head_tree) => count_dirty_lines(git, &head_tree, &workdir, &walk.changed),
+            None => (0, 0),
+        };
+
+        Ok(Some(DirtyStats {
+            insertions,
+            deletions,
+            untracked: walk.untracked.len() as u64,
+        }))
     }
-
-    // Line counts mirror `git diff HEAD --shortstat` (display-only; not
-    // a gate input). On an unborn HEAD there's no tree to diff against —
-    // degrade to 0/0, matching the old shell-out where `git diff HEAD`
-    // errored (the untracked count still tells the story). gix's diff
-    // algorithm may drift by a line from git's on some changes; that's
-    // accepted for a display figure.
-    let (insertions, deletions) = match git.head_commit().ok().and_then(|c| c.tree().ok()) {
-        Some(head_tree) => count_dirty_lines(git, &head_tree, &workdir, &walk.changed),
-        None => (0, 0),
-    };
-
-    Ok(Some(DirtyStats {
-        insertions,
-        deletions,
-        untracked: walk.untracked.len() as u64,
-    }))
 }
 
 /// Every dirty path — tracked changes plus untracked files — sorted.
@@ -268,21 +272,24 @@ fn count_dirty_lines(
 /// is `PlanFileMissing`; a path absent at `commit` is `Clean`
 /// regardless of the worktree (matching `git diff HEAD`, which ignores
 /// paths not in the commit). Reuses the [`Repo`] handle.
-pub fn plan_body_status(
-    h: &Repo,
-    commit: &CommitSha,
-    rel_path: &str,
-) -> clank_core::vocab::PlanWorktreeStatus {
-    use clank_core::vocab::PlanWorktreeStatus;
-    let worktree =
-        h.0.workdir()
+impl Repo {
+    pub fn plan_body_status(
+        &self,
+        commit: &CommitSha,
+        rel_path: &str,
+    ) -> clank_core::vocab::PlanWorktreeStatus {
+        use clank_core::vocab::PlanWorktreeStatus;
+        let worktree = self
+            .0
+            .workdir()
             .map(|w| w.join(rel_path))
             .and_then(|abs| std::fs::read(abs).ok());
-    match (commit_blob_bytes(&h.0, commit, rel_path), worktree) {
-        (Some(b), Some(w)) if b == w => PlanWorktreeStatus::Clean,
-        (Some(_), Some(_)) => PlanWorktreeStatus::BodyDirty,
-        (Some(_), None) => PlanWorktreeStatus::PlanFileMissing,
-        (None, _) => PlanWorktreeStatus::Clean,
+        match (commit_blob_bytes(&self.0, commit, rel_path), worktree) {
+            (Some(b), Some(w)) if b == w => PlanWorktreeStatus::Clean,
+            (Some(_), Some(_)) => PlanWorktreeStatus::BodyDirty,
+            (Some(_), None) => PlanWorktreeStatus::PlanFileMissing,
+            (None, _) => PlanWorktreeStatus::Clean,
+        }
     }
 }
 
@@ -927,39 +934,41 @@ pub fn first_parent_chain_find_at(
     tip: &CommitSha,
     candidates: &std::collections::HashSet<CommitSha>,
 ) -> Result<Option<CommitSha>, GitIoError> {
-    first_parent_chain_find(&open(repo_path)?, tip, candidates)
+    open(repo_path)?.first_parent_chain_find(tip, candidates)
 }
 
-/// Handle-based [`first_parent_chain_find_at`] — the fold reuses its one
-/// [`Repo`] for the checkpoint-ancestry probe.
-pub fn first_parent_chain_find(
-    repo: &Repo,
-    tip: &CommitSha,
-    candidates: &std::collections::HashSet<CommitSha>,
-) -> Result<Option<CommitSha>, GitIoError> {
-    const CONTEXT: &str = "first_parent_chain_find";
-    if candidates.is_empty() {
-        return Ok(None);
-    }
-    let repo = &repo.0;
-    let mut cursor =
-        gix::ObjectId::from_hex(tip.as_str().as_bytes()).map_err(|e| GitIoError::Parse {
-            context: CONTEXT.into(),
-            detail: format!("tip oid hex: {e}"),
-        })?;
-    loop {
-        let sha = parse_sha(CONTEXT, &cursor.to_string())?;
-        if candidates.contains(&sha) {
-            return Ok(Some(sha));
+impl Repo {
+    /// Handle-based [`first_parent_chain_find_at`] — the fold reuses its
+    /// one handle for the checkpoint-ancestry probe.
+    pub fn first_parent_chain_find(
+        &self,
+        tip: &CommitSha,
+        candidates: &std::collections::HashSet<CommitSha>,
+    ) -> Result<Option<CommitSha>, GitIoError> {
+        const CONTEXT: &str = "first_parent_chain_find";
+        if candidates.is_empty() {
+            return Ok(None);
         }
-        let commit = repo.find_commit(cursor).map_err(|e| GitIoError::NonZero {
-            context: CONTEXT.into(),
-            code: None,
-            stderr: format!("find_commit: {e}"),
-        })?;
-        match commit.parent_ids().next() {
-            Some(p) => cursor = p.detach(),
-            None => return Ok(None),
+        let repo = &self.0;
+        let mut cursor =
+            gix::ObjectId::from_hex(tip.as_str().as_bytes()).map_err(|e| GitIoError::Parse {
+                context: CONTEXT.into(),
+                detail: format!("tip oid hex: {e}"),
+            })?;
+        loop {
+            let sha = parse_sha(CONTEXT, &cursor.to_string())?;
+            if candidates.contains(&sha) {
+                return Ok(Some(sha));
+            }
+            let commit = repo.find_commit(cursor).map_err(|e| GitIoError::NonZero {
+                context: CONTEXT.into(),
+                code: None,
+                stderr: format!("find_commit: {e}"),
+            })?;
+            match commit.parent_ids().next() {
+                Some(p) => cursor = p.detach(),
+                None => return Ok(None),
+            }
         }
     }
 }
@@ -987,150 +996,152 @@ pub fn commit_events_between_at(
     base: Option<&CommitSha>,
     tip: &CommitSha,
 ) -> Result<Vec<CommitEvent>, GitIoError> {
-    commit_events_between(&open(repo_path)?, base, tip)
+    open(repo_path)?.commit_events_between(base, tip)
 }
 
-/// Handle-based [`commit_events_between_at`] — the fold opens one [`Repo`]
-/// and reuses it across every range walk (warm object cache included).
-pub fn commit_events_between(
-    repo: &Repo,
-    base: Option<&CommitSha>,
-    tip: &CommitSha,
-) -> Result<Vec<CommitEvent>, GitIoError> {
-    const CONTEXT: &str = "commit_events_between";
-    let walk_err = |e: &dyn std::fmt::Display, stage: &str| GitIoError::NonZero {
-        context: CONTEXT.to_string(),
-        code: None,
-        stderr: format!("{stage}: {e}"),
-    };
-    let repo = &repo.0;
+impl Repo {
+    /// Handle-based [`commit_events_between_at`] — the fold reuses one
+    /// handle across every range walk (warm object cache included).
+    pub fn commit_events_between(
+        &self,
+        base: Option<&CommitSha>,
+        tip: &CommitSha,
+    ) -> Result<Vec<CommitEvent>, GitIoError> {
+        const CONTEXT: &str = "commit_events_between";
+        let walk_err = |e: &dyn std::fmt::Display, stage: &str| GitIoError::NonZero {
+            context: CONTEXT.to_string(),
+            code: None,
+            stderr: format!("{stage}: {e}"),
+        };
+        let repo = &self.0;
 
-    let tip_oid =
-        gix::ObjectId::from_hex(tip.as_str().as_bytes()).map_err(|e| GitIoError::Parse {
-            context: CONTEXT.into(),
-            detail: format!("tip oid hex: {e}"),
-        })?;
-    let base_oid = base
-        .map(|b| {
-            gix::ObjectId::from_hex(b.as_str().as_bytes()).map_err(|e| GitIoError::Parse {
+        let tip_oid =
+            gix::ObjectId::from_hex(tip.as_str().as_bytes()).map_err(|e| GitIoError::Parse {
                 context: CONTEXT.into(),
-                detail: format!("base oid hex: {e}"),
+                detail: format!("tip oid hex: {e}"),
+            })?;
+        let base_oid = base
+            .map(|b| {
+                gix::ObjectId::from_hex(b.as_str().as_bytes()).map_err(|e| GitIoError::Parse {
+                    context: CONTEXT.into(),
+                    detail: format!("base oid hex: {e}"),
+                })
             })
-        })
-        .transpose()?;
-    if base_oid == Some(tip_oid) {
-        return Ok(Vec::new());
-    }
+            .transpose()?;
+        if base_oid == Some(tip_oid) {
+            return Ok(Vec::new());
+        }
 
-    struct RawCommit {
-        oid: gix::ObjectId,
-        tree: gix::ObjectId,
-        first_parent: Option<gix::ObjectId>,
-        sha: CommitSha,
-        author_ts: i64,
-        subject: String,
-    }
-    let mut builder = repo.rev_walk([tip_oid]).first_parent_only();
-    if let Some(b) = base_oid {
-        builder = builder.with_hidden([b]);
-    }
-    let walk = builder.all().map_err(|e| walk_err(&e, "rev_walk"))?;
-    let mut raws = Vec::new();
-    for info in walk {
-        let info = info.map_err(|e| walk_err(&e, "walk iter"))?;
-        let commit = info.object().map_err(|e| walk_err(&e, "info.object"))?;
-        let author = commit.author().map_err(|e| walk_err(&e, "commit.author"))?;
-        let author_ts = author
-            .time()
-            .map_err(|e| walk_err(&e, "author.time parse"))?
-            .seconds;
-        let subject = commit
-            .message()
-            .map_err(|e| walk_err(&e, "commit.message"))?
-            .summary()
-            .to_string();
-        let tree = commit
-            .tree_id()
-            .map_err(|e| walk_err(&e, "commit.tree_id"))?
-            .detach();
-        let first_parent = commit.parent_ids().next().map(|p| p.detach());
-        let sha = parse_sha(CONTEXT, &info.id.to_string())?;
-        raws.push(RawCommit {
-            oid: info.id,
-            tree,
-            first_parent,
-            sha,
-            author_ts,
-            subject,
-        });
-    }
-    // gix walks newest-first; the fold applies oldest-first.
-    raws.reverse();
+        struct RawCommit {
+            oid: gix::ObjectId,
+            tree: gix::ObjectId,
+            first_parent: Option<gix::ObjectId>,
+            sha: CommitSha,
+            author_ts: i64,
+            subject: String,
+        }
+        let mut builder = repo.rev_walk([tip_oid]).first_parent_only();
+        if let Some(b) = base_oid {
+            builder = builder.with_hidden([b]);
+        }
+        let walk = builder.all().map_err(|e| walk_err(&e, "rev_walk"))?;
+        let mut raws = Vec::new();
+        for info in walk {
+            let info = info.map_err(|e| walk_err(&e, "walk iter"))?;
+            let commit = info.object().map_err(|e| walk_err(&e, "info.object"))?;
+            let author = commit.author().map_err(|e| walk_err(&e, "commit.author"))?;
+            let author_ts = author
+                .time()
+                .map_err(|e| walk_err(&e, "author.time parse"))?
+                .seconds;
+            let subject = commit
+                .message()
+                .map_err(|e| walk_err(&e, "commit.message"))?
+                .summary()
+                .to_string();
+            let tree = commit
+                .tree_id()
+                .map_err(|e| walk_err(&e, "commit.tree_id"))?
+                .detach();
+            let first_parent = commit.parent_ids().next().map(|p| p.detach());
+            let sha = parse_sha(CONTEXT, &info.id.to_string())?;
+            raws.push(RawCommit {
+                oid: info.id,
+                tree,
+                first_parent,
+                sha,
+                author_ts,
+                subject,
+            });
+        }
+        // gix walks newest-first; the fold applies oldest-first.
+        raws.reverse();
 
-    let mut out = Vec::with_capacity(raws.len());
-    // (commit, root tree) of the previously processed commit — in a
-    // first-parent walk that IS the next commit's first parent,
-    // except across the hidden-`base` boundary.
-    let mut prev: Option<(gix::ObjectId, gix::ObjectId)> = None;
-    for raw in raws {
-        let parent_tree = match raw.first_parent {
-            None => None, // root commit: diff against the empty tree
-            Some(p) => match prev {
-                Some((prev_oid, prev_tree)) if prev_oid == p => Some(prev_tree),
-                // Walk start (parent hidden behind `base`): one lookup.
-                _ => Some(
-                    repo.find_commit(p)
-                        .map_err(|e| walk_err(&e, "parent find_commit"))?
-                        .tree_id()
-                        .map_err(|e| walk_err(&e, "parent tree_id"))?
-                        .detach(),
-                ),
-            },
-        };
-        let roots_equal = parent_tree == Some(raw.tree);
-        let gate = if roots_equal {
-            DiffGate::NoChanges
-        } else {
-            let parent_clank = match parent_tree {
-                Some(t) => clank_entry_oid(&repo, t, CONTEXT)?,
-                None => None,
+        let mut out = Vec::with_capacity(raws.len());
+        // (commit, root tree) of the previously processed commit — in a
+        // first-parent walk that IS the next commit's first parent,
+        // except across the hidden-`base` boundary.
+        let mut prev: Option<(gix::ObjectId, gix::ObjectId)> = None;
+        for raw in raws {
+            let parent_tree = match raw.first_parent {
+                None => None, // root commit: diff against the empty tree
+                Some(p) => match prev {
+                    Some((prev_oid, prev_tree)) if prev_oid == p => Some(prev_tree),
+                    // Walk start (parent hidden behind `base`): one lookup.
+                    _ => Some(
+                        repo.find_commit(p)
+                            .map_err(|e| walk_err(&e, "parent find_commit"))?
+                            .tree_id()
+                            .map_err(|e| walk_err(&e, "parent tree_id"))?
+                            .detach(),
+                    ),
+                },
             };
-            let child_clank = clank_entry_oid(&repo, raw.tree, CONTEXT)?;
-            diff_gate(roots_equal, parent_clank, child_clank)
-        };
-        let changes = match gate {
-            DiffGate::NoChanges => CommitChanges::default(),
-            DiffGate::CodeOnly => CommitChanges {
-                has_non_plan_code_changes: true,
-                ..Default::default()
-            },
-            DiffGate::FullDiff => {
-                let parent = parent_tree
-                    .map(|t| {
-                        repo.find_tree(t).map_err(|e| GitIoError::NonZero {
-                            context: CONTEXT.to_string(),
-                            code: None,
-                            stderr: format!("parent find_tree: {e}"),
+            let roots_equal = parent_tree == Some(raw.tree);
+            let gate = if roots_equal {
+                DiffGate::NoChanges
+            } else {
+                let parent_clank = match parent_tree {
+                    Some(t) => clank_entry_oid(&repo, t, CONTEXT)?,
+                    None => None,
+                };
+                let child_clank = clank_entry_oid(&repo, raw.tree, CONTEXT)?;
+                diff_gate(roots_equal, parent_clank, child_clank)
+            };
+            let changes = match gate {
+                DiffGate::NoChanges => CommitChanges::default(),
+                DiffGate::CodeOnly => CommitChanges {
+                    has_non_plan_code_changes: true,
+                    ..Default::default()
+                },
+                DiffGate::FullDiff => {
+                    let parent = parent_tree
+                        .map(|t| {
+                            repo.find_tree(t).map_err(|e| GitIoError::NonZero {
+                                context: CONTEXT.to_string(),
+                                code: None,
+                                stderr: format!("parent find_tree: {e}"),
+                            })
                         })
-                    })
-                    .transpose()?;
-                let child = repo.find_tree(raw.tree).map_err(|e| GitIoError::NonZero {
-                    context: CONTEXT.to_string(),
-                    code: None,
-                    stderr: format!("find_tree: {e}"),
-                })?;
-                diff_trees_changes(&repo, parent.as_ref(), &child, CONTEXT)?
-            }
-        };
-        prev = Some((raw.oid, raw.tree));
-        out.push(CommitEvent {
-            commit: raw.sha,
-            author_ts: raw.author_ts,
-            subject: raw.subject,
-            changes,
-        });
+                        .transpose()?;
+                    let child = repo.find_tree(raw.tree).map_err(|e| GitIoError::NonZero {
+                        context: CONTEXT.to_string(),
+                        code: None,
+                        stderr: format!("find_tree: {e}"),
+                    })?;
+                    diff_trees_changes(&repo, parent.as_ref(), &child, CONTEXT)?
+                }
+            };
+            prev = Some((raw.oid, raw.tree));
+            out.push(CommitEvent {
+                commit: raw.sha,
+                author_ts: raw.author_ts,
+                subject: raw.subject,
+                changes,
+            });
+        }
+        Ok(out)
     }
-    Ok(out)
 }
 
 /// Structured changes for `sha` against its first parent (or the

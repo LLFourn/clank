@@ -22,7 +22,7 @@ pub async fn read_worktree_facts(
 ) -> WorktreeFacts {
     let status = match head {
         Some(h) => match git_io::open(repo) {
-            Ok(git) => git_io::plan_body_status(&git, h, plan_path),
+            Ok(git) => git.plan_body_status(h, plan_path),
             // An unreadable repo can't have a blob to be dirty against.
             Err(_) => PlanWorktreeStatus::Clean,
         },

@@ -56,7 +56,7 @@ fn find_base_checkpoint(
     loop {
         let candidates: std::collections::HashSet<CommitSha> =
             checkpoints.iter().map(|c| c.sha.clone()).collect();
-        let hit = match git_io::first_parent_chain_find(git, target, &candidates) {
+        let hit = match git.first_parent_chain_find(target, &candidates) {
             Ok(Some(sha)) => sha,
             Ok(None) => return None,
             Err(e) => {
@@ -183,11 +183,11 @@ pub async fn rebuild_from(
     // computed against the real tip (`to`), not the phase boundary.
     let silent_target = from.cloned();
     let phase1 = match silent_target.as_ref() {
-        Some(target) => git_io::commit_events_between(&git, state.head.as_ref(), target)?,
+        Some(target) => git.commit_events_between(state.head.as_ref(), target)?,
         None => Vec::new(),
     };
     let phase2_base = silent_target.clone().or_else(|| state.head.clone());
-    let phase2 = git_io::commit_events_between(&git, phase2_base.as_ref(), to)?;
+    let phase2 = git.commit_events_between(phase2_base.as_ref(), to)?;
     let mid_depth = base_depth + phase1.len() as u64;
     let tip_depth = mid_depth + phase2.len() as u64;
 
@@ -228,7 +228,7 @@ pub async fn rebuild_with_diagnostics(
             RebuildDiagnostics { cache_hit: false },
         ));
     };
-    let Some(h) = git_io::head_sha(&git)? else {
+    let Some(h) = git.head_sha()? else {
         // Unborn HEAD / no commits: nothing to fold.
         return Ok((
             RepoState::empty(repo_root.to_path_buf()),
@@ -243,7 +243,7 @@ pub async fn rebuild_with_diagnostics(
             return Ok((state, RebuildDiagnostics { cache_hit: true }));
         }
         // Fold-forward from the checkpoint to HEAD.
-        match git_io::commit_events_between(&git, Some(&cp.sha), &h) {
+        match git.commit_events_between(Some(&cp.sha), &h) {
             Ok(events) => {
                 let tip_depth = cp.depth + events.len() as u64;
                 let _ = fold_events(repo_root, &mut state, events, cp.depth, tip_depth, true);
@@ -264,7 +264,7 @@ pub async fn rebuild_with_diagnostics(
     }
 
     // Cold fold from the repo root.
-    let events = git_io::commit_events_between(&git, None, &h)?;
+    let events = git.commit_events_between(None, &h)?;
     let tip_depth = events.len() as u64;
     let mut state = RepoState::empty(repo_root.to_path_buf());
     let checkpoint = policy == CachePolicy::Use;
