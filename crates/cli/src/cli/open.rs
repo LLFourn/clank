@@ -857,10 +857,11 @@ mod open_args_tests {
     }
 
     #[test]
-    fn bare_open_routes_to_zellij_with_flags() {
-        // clank-open-zellij-context: bare `clank open` = the
-        // zellij opener; its flags work on the bare form via the
-        // flattened (shared, drift-proof) OpenZellijArgs.
+    fn bare_open_accepts_the_flattened_zellij_flags() {
+        // clank-open-zellij-context: the zellij flags work on the
+        // bare `clank open` form via the flattened (shared,
+        // drift-proof) OpenZellijArgs. (Routing — console vs zellij —
+        // is decided at run time from $ZELLIJ + these flags.)
         let o = parse(&["t", "open"]);
         assert!(o.command.is_none());
         assert!(!o.zellij.print);

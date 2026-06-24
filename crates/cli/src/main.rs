@@ -61,10 +61,11 @@ enum Command {
     /// `.clank/html/`. Use `clank html open` to build and
     /// launch the result in your browser.
     Html(cli::HtmlArgs),
-    /// Open your agent workspace (zellij), context-aware: a new
-    /// tab inside a session, attach-or-create `clank-<repo>`
-    /// outside. `clank open dry <path>` is the read-only path
-    /// classifier
+    /// Open your agent workspace, context-aware: the self-managed
+    /// console in a fresh terminal, or a zellij tab when you're
+    /// already in a session. `clank open zellij` forces the zellij
+    /// layout; `clank open dry <path>` is the read-only path
+    /// classifier.
     Open(cli::OpenArgs),
     /// Rewire feedback files after a rebase / amend. Installed
     /// as a `post-rewrite` git hook by `clank init`; reads

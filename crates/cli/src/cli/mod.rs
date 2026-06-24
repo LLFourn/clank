@@ -246,11 +246,12 @@ pub struct HtmlOpenArgs {
 pub struct OpenArgs {
     #[command(subcommand)]
     pub command: Option<OpenCmd>,
-    /// Bare `clank open` = `clank open zellij` (the context-aware
-    /// opener: new tab inside a session, attach-or-create
-    /// outside). The SAME OpenZellijArgs is flattened here so the
-    /// bare form's flags can't drift from the subcommand's
-    /// (ruthless 8c2206d). Plan: clank-open-zellij-context.
+    /// Bare `clank open`: launches the self-managed console in a
+    /// fresh terminal, or the zellij opener when `$ZELLIJ` is set or
+    /// a zellij-specific flag (--all/--fork/--pr/--print) is given.
+    /// The SAME OpenZellijArgs is flattened here so the bare form's
+    /// flags can't drift from the `zellij` subcommand's (ruthless
+    /// 8c2206d). Plan: clank-open-zellij-context, clank-console.
     #[command(flatten)]
     pub zellij: OpenZellijArgs,
 }
