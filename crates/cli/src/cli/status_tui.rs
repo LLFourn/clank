@@ -87,6 +87,51 @@ fn label(name: &str) -> Span {
     dim(format!("{name:>5}  "))
 }
 
+/// The focus rail: a state-coloured left edge (`▌`) drawn down every
+/// row of the region that owns the keyboard, and a blank on the
+/// inactive one. A contiguous coloured left edge is the strongest
+/// "this block is live" cue in a monospace pane — the primary of the
+/// three redundant focus signals (rail, header marker, header hint).
+fn rail(focused: bool) -> Span {
+    if focused {
+        Span(Style::Accent, "▌".to_string())
+    } else {
+        plain(" ".to_string())
+    }
+}
+
+/// One focusable section's header: rail + a filled/hollow marker +
+/// the title (bright+UPPER when focused, dim+lower when not) + a
+/// mode-specific key hint. The header is the second focus cue and the
+/// hint the third.
+fn section_header(focused: bool, title: &str, hint: &str) -> Vec<Span> {
+    let (style, marker, title) = if focused {
+        (Style::Highlight, "◉ ", title.to_uppercase())
+    } else {
+        (Style::Dim, "○ ", title.to_lowercase())
+    };
+    vec![
+        rail(focused),
+        Span(style, format!("{marker}{title}")),
+        dim(format!("  {hint}")),
+    ]
+}
+
+/// The armed auto-mode mark in a FIXED [`MARK_FIELD`]-wide field —
+/// `▶` (playing, green) when auto runs the agent's loop, `⏸` (paused,
+/// dim) when parked. Padding the glyph into a fixed field (not relying
+/// on the two glyphs happening to share a width) is what keeps the
+/// name column from jittering between on/off rows.
+fn auto_mark(mode: clank_core::vocab::AutoMode) -> Span {
+    use clank_core::vocab::AutoMode;
+    let (style, glyph) = match mode {
+        AutoMode::On => (Style::Color("32"), "▶"),
+        AutoMode::Off => (Style::Dim, "⏸"),
+    };
+    let pad = MARK_FIELD.saturating_sub(display_width(glyph));
+    Span(style, format!("{glyph}{}", " ".repeat(pad)))
+}
+
 /// The `dirty` gauge: `+12` green, `−3` red (GitHub convention),
 /// `· 2 untracked` dim; an all-zero (mode-only) change falls back to
 /// a dim `changes`.
@@ -143,7 +188,7 @@ pub(crate) fn render_at(
     cols: u16,
     offset: usize,
     frame: usize,
-    panel_focus: Option<usize>,
+    mode: Mode,
 ) -> (Vec<String>, usize) {
     let rows = rows.max(1) as usize;
     let cols = cols.max(1) as usize;
@@ -228,53 +273,6 @@ pub(crate) fn render_at(
         }
     }
 
-    // `auto` — the team roster with each agent's ARMED auto-mode. The
-    // lamp is the EFFECTIVE auto-mode (what governs that agent's NEXT
-    // Stop-hook decision) — NOT a live run/stop indicator: toggling it
-    // neither starts a stopped agent nor kills an in-flight wait. Focus
-    // (Tab) puts a cursor here; SPC toggles the selected agent.
-    if !snap.agents.is_empty() {
-        let focused = panel_focus.is_some();
-        for (i, a) in snap.agents.iter().enumerate() {
-            let selected = panel_focus == Some(i);
-            let (lamp_style, lamp) = match a.auto_mode {
-                clank_core::vocab::AutoMode::On => (Style::Color("32"), "●"),
-                clank_core::vocab::AutoMode::Off => (Style::Dim, "○"),
-            };
-            let role = match a.role {
-                clank_core::vocab::Role::Master => "master",
-                clank_core::vocab::Role::Reviewer => "reviewer",
-            };
-            let mut line = vec![
-                label(if i == 0 { "auto" } else { "" }),
-                plain(if selected { "▸ " } else { "  " }.to_string()),
-                Span(lamp_style, lamp.to_string()),
-                Span(
-                    if selected {
-                        Style::Accent
-                    } else {
-                        Style::Plain
-                    },
-                    format!(" {}", a.label),
-                ),
-                dim(format!("  {role}")),
-            ];
-            // Key hint on the first row only, switching with focus so
-            // the active bindings are always the ones shown.
-            if i == 0 {
-                line.push(dim(format!(
-                    "   {}",
-                    if focused {
-                        "SPC toggle · Esc back"
-                    } else {
-                        "Tab to select"
-                    }
-                )));
-            }
-            body.push(line);
-        }
-    }
-
     // `shelf` — shelved plans; the unshelve nudge once a `--for`
     // dependency finishes (plan-lifecycle-verbs).
     for sv in &snap.shelved {
@@ -320,6 +318,44 @@ pub(crate) fn render_at(
         }
     }
 
+    // AGENTS — the focusable roster section. Each agent's armed
+    // auto-mode reads as ▶ play / ⏸ pause (the EFFECTIVE mode that
+    // governs its NEXT Stop-hook decision — NOT a live run/stop
+    // indicator). When the panel owns the keyboard it carries the
+    // focus rail + a bright header; Tab toggles control with the log.
+    // Gated on a non-empty roster so a teamless repo (and every
+    // panel-less render path) is byte-for-byte unchanged.
+    let agents_focused = mode.agents_focused();
+    if !snap.agents.is_empty() {
+        let hint = if agents_focused {
+            "↑↓ move · SPC play/pause · Tab → log"
+        } else {
+            "Tab to manage"
+        };
+        body.push(section_header(agents_focused, "agents", hint));
+        for (i, a) in snap.agents.iter().enumerate() {
+            let selected = mode.selected() == Some(i);
+            let role = match a.role {
+                clank_core::vocab::Role::Master => "master",
+                clank_core::vocab::Role::Reviewer => "reviewer",
+            };
+            body.push(vec![
+                rail(agents_focused),
+                plain(if selected { "▸ " } else { "  " }.to_string()),
+                auto_mark(a.auto_mode),
+                Span(
+                    if selected {
+                        Style::Accent
+                    } else {
+                        Style::Plain
+                    },
+                    format!(" {}", a.label),
+                ),
+                dim(format!("  {role}")),
+            ]);
+        }
+    }
+
     // Greedy fit: bar (+breath) then body lines until rows run out.
     if breath && out.len() < rows && !body.is_empty() {
         out.push(String::new());
@@ -345,38 +381,68 @@ pub(crate) fn render_at(
     let seq = build_scroll(snap, &ask_lines, &in_prog);
     let total = seq.len();
     let mut log_capacity = 0usize;
-    if out.len() < rows && total > 0 {
+    // The log is a focusable region ONLY when there's an agents panel to
+    // switch focus with — so a panel-less render keeps the bare log
+    // (no header, no rail), unchanged.
+    let has_panel = !snap.agents.is_empty();
+    let log_focused = mode.log_focused();
+    // Render the log region when it has content OR when there's a panel
+    // to switch focus with (so both focusable regions, and which one is
+    // live, stay visible even with an empty log).
+    if out.len() < rows && (total > 0 || has_panel) {
         let mut avail = rows - out.len();
         if avail >= 2 {
             out.push(String::new());
             avail -= 1;
         }
-        log_capacity = avail;
-        // Window starting `offset` rows down, clamped so the last page
-        // still fills.
-        let off = offset.min(total.saturating_sub(1));
-        let end = (off + avail).min(total);
-        // Align summaries at one column: widest name among the windowed
-        // rows — done reviews AND pending spinners (ask lines / the master
-        // row have no author column).
-        let author_width = seq[off..end]
-            .iter()
-            .filter_map(|s| match s {
-                Seg::Log(crate::cli::log::OnelineRow::Review { author, .. }) => {
-                    Some(display_width(author))
-                }
-                Seg::InProg(InProgress::PendingReview { label, .. }) => Some(display_width(label)),
-                _ => None,
-            })
-            .max()
-            .unwrap_or(0);
-        for s in &seq[off..end] {
-            let spans = match s {
-                Seg::Ask(line) => (*line).clone(),
-                Seg::Log(row) => log_row_spans(row, author_width),
-                Seg::InProg(item) => in_progress_spans(item, frame, author_width),
+        if has_panel && avail >= 1 {
+            let hint = if log_focused {
+                "↑↓ scroll · Tab → agents"
+            } else {
+                "Tab to focus"
             };
-            out.push(emit(&spans, color, cols));
+            out.push(emit(&section_header(log_focused, "log", hint), color, cols));
+            avail -= 1;
+        }
+        log_capacity = avail;
+        if total > 0 {
+            // Window starting `offset` rows down, clamped so the last page
+            // still fills.
+            let off = offset.min(total.saturating_sub(1));
+            let end = (off + avail).min(total);
+            // Align summaries at one column: widest name among the windowed
+            // rows — done reviews AND pending spinners (ask lines / the
+            // master row have no author column).
+            let author_width = seq[off..end]
+                .iter()
+                .filter_map(|s| match s {
+                    Seg::Log(crate::cli::log::OnelineRow::Review { author, .. }) => {
+                        Some(display_width(author))
+                    }
+                    Seg::InProg(InProgress::PendingReview { label, .. }) => {
+                        Some(display_width(label))
+                    }
+                    _ => None,
+                })
+                .max()
+                .unwrap_or(0);
+            for s in &seq[off..end] {
+                let spans = match s {
+                    Seg::Ask(line) => (*line).clone(),
+                    Seg::Log(row) => log_row_spans(row, author_width),
+                    Seg::InProg(item) => in_progress_spans(item, frame, author_width),
+                };
+                // Prefix the focus rail when the log is a focusable region,
+                // so the active edge runs the full height of the log too.
+                let row = if has_panel {
+                    let mut r = vec![rail(log_focused)];
+                    r.extend(spans);
+                    r
+                } else {
+                    spans
+                };
+                out.push(emit(&row, color, cols));
+            }
         }
     }
     (out, log_capacity)
@@ -386,7 +452,7 @@ pub(crate) fn render_at(
 /// tests exercise. Test-only; the live loop calls [`render_at`] directly.
 #[cfg(test)]
 fn render(snap: &StatusSnapshot, rows: u16, cols: u16) -> Vec<String> {
-    render_at(snap, rows, cols, 0, 0, None).0
+    render_at(snap, rows, cols, 0, 0, Mode::LogScroll).0
 }
 
 /// Widest verdict mark in display columns: `✓✓` (Finished) is 2,
@@ -1238,6 +1304,37 @@ enum Key {
     Escape,
 }
 
+/// Which region owns the keyboard. The backbone of key routing: each
+/// key is interpreted in exactly ONE place per mode, so an unbound key
+/// does nothing and a key can't mean two things at once. Plan
+/// tui-agents-panel-manage M2 adds `AddPicker`/`Confirm` variants on
+/// top of this; M1 ships the two-state machine that replaces the old
+/// `focus: Option<usize>` flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Mode {
+    /// Default: keys scroll the log.
+    LogScroll,
+    /// The agent panel owns the keys; `sel` is the cursor row (an
+    /// index into `snapshot.agents`).
+    AgentPanel { sel: usize },
+}
+
+impl Mode {
+    fn agents_focused(self) -> bool {
+        matches!(self, Mode::AgentPanel { .. })
+    }
+    fn log_focused(self) -> bool {
+        matches!(self, Mode::LogScroll)
+    }
+    /// The cursor row when the agent panel is focused, else `None`.
+    fn selected(self) -> Option<usize> {
+        match self {
+            Mode::AgentPanel { sel } => Some(sel),
+            Mode::LogScroll => None,
+        }
+    }
+}
+
 /// Parse a burst of stdin bytes into scroll keys — arrow keys,
 /// PgUp/PgDn, plus vi-ish `j`/`k`/`g`/`G`, space (page down), `q` (quit).
 fn parse_keys(bytes: &[u8]) -> Vec<Key> {
@@ -1291,6 +1388,17 @@ fn flip_auto(mode: clank_core::vocab::AutoMode) -> clank_core::vocab::AutoMode {
     match mode {
         AutoMode::On => AutoMode::Off,
         AutoMode::Off => AutoMode::On,
+    }
+}
+
+/// The Tab/focus-key transition: from the log, enter the panel at row
+/// 0 (only if there's a roster to enter); from the panel, return to the
+/// log. The single focus-toggle rule, shared by both handler arms.
+fn toggle_focus(mode: Mode, agents_len: usize) -> Mode {
+    match mode {
+        Mode::LogScroll if agents_len > 0 => Mode::AgentPanel { sel: 0 },
+        Mode::LogScroll => Mode::LogScroll,
+        Mode::AgentPanel { .. } => Mode::LogScroll,
     }
 }
 
@@ -1660,10 +1768,9 @@ pub(crate) async fn run_tui(
     let mut snapshot =
         StatusSnapshot::build_async(&repo, &basename, home.as_deref(), policy, None, true).await?;
     let mut offset: usize = 0;
-    // Agent-panel focus: `None` = keys scroll the log (default);
-    // `Some(i)` = the panel is focused with agent row `i` selected, so
-    // j/k move the cursor and SPC toggles. Tab enters/leaves it.
-    let mut focus: Option<usize> = None;
+    // Which region owns the keyboard. Starts on the log; Tab moves it to
+    // the agent panel. The single source of key-routing truth.
+    let mut mode = Mode::LogScroll;
     // Spinner animation frame. The ONLY state an animation tick mutates.
     let mut frame: usize = 0;
     // Whether this iteration may do IO to top up the log. Set ONLY by
@@ -1674,7 +1781,7 @@ pub(crate) async fn run_tui(
     let mut needs_fill = true;
     loop {
         let (rows, cols) = term_size();
-        let capacity = render_at(&snapshot, rows, cols, offset, frame, focus).1;
+        let capacity = render_at(&snapshot, rows, cols, offset, frame, mode).1;
 
         // The ask + in-progress rows depend on blocks/waiting_on (not the
         // log fetch), so compute them before filling. `head` is the count
@@ -1702,7 +1809,7 @@ pub(crate) async fn run_tui(
         // Max offset pins the last row at the BOTTOM of the viewport.
         let max_off = total.saturating_sub(capacity.max(1));
         offset = offset.min(max_off);
-        paint(&render_at(&snapshot, rows, cols, offset, frame, focus).0);
+        paint(&render_at(&snapshot, rows, cols, offset, frame, mode).0);
 
         // The in-progress rows now sit at SCATTERED indices (master after
         // the plan header; reviews in the latest commit's review block), so
@@ -1724,14 +1831,27 @@ pub(crate) async fn run_tui(
             // new position needs it.
             Ok(Ev::Key(k)) => {
                 let page = (rows as usize).saturating_sub(3).max(1);
-                match focus {
+                // `mode` is Copy: matching it copies, so reassigning `mode`
+                // inside an arm is free of borrow conflicts. Each key is
+                // resolved in exactly one arm per mode.
+                match mode {
                     // Agent panel focused: keys drive the cursor + toggle,
                     // not the log scroll.
-                    Some(sel) => match k {
+                    Mode::AgentPanel { sel } => match k {
                         Key::Quit => break,
-                        Key::Focus | Key::Escape => focus = None,
-                        Key::Up => focus = Some(move_selection(sel, snapshot.agents.len(), false)),
-                        Key::Down => focus = Some(move_selection(sel, snapshot.agents.len(), true)),
+                        Key::Focus | Key::Escape => {
+                            mode = toggle_focus(mode, snapshot.agents.len())
+                        }
+                        Key::Up => {
+                            mode = Mode::AgentPanel {
+                                sel: move_selection(sel, snapshot.agents.len(), false),
+                            }
+                        }
+                        Key::Down => {
+                            mode = Mode::AgentPanel {
+                                sel: move_selection(sel, snapshot.agents.len(), true),
+                            }
+                        }
                         Key::Space => {
                             if let Some(row) = snapshot.agents.get(sel) {
                                 let next = flip_auto(row.auto_mode);
@@ -1754,13 +1874,9 @@ pub(crate) async fn run_tui(
                         Key::PageUp | Key::PageDown | Key::Top | Key::Bottom => {}
                     },
                     // Default: keys scroll the log.
-                    None => match k {
+                    Mode::LogScroll => match k {
                         Key::Quit => break,
-                        Key::Focus => {
-                            if !snapshot.agents.is_empty() {
-                                focus = Some(0);
-                            }
-                        }
+                        Key::Focus => mode = toggle_focus(mode, snapshot.agents.len()),
                         Key::Escape => {}
                         Key::Up => offset = offset.saturating_sub(1),
                         Key::Down => offset += 1,
@@ -1796,10 +1912,12 @@ pub(crate) async fn run_tui(
                     needs_fill = true;
                     // Keep the panel cursor in range if the roster changed
                     // (or vanished) under us.
-                    focus = match focus {
-                        Some(_) if snapshot.agents.is_empty() => None,
-                        Some(sel) => Some(sel.min(snapshot.agents.len() - 1)),
-                        None => None,
+                    mode = match mode {
+                        Mode::AgentPanel { .. } if snapshot.agents.is_empty() => Mode::LogScroll,
+                        Mode::AgentPanel { sel } => Mode::AgentPanel {
+                            sel: sel.min(snapshot.agents.len() - 1),
+                        },
+                        Mode::LogScroll => Mode::LogScroll,
                     };
                     if let Some(tab) = tab.as_mut() {
                         tab.update(&bar_emoji(&snapshot));
@@ -1892,6 +2010,22 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn toggle_focus_enters_panel_only_with_a_roster() {
+        // From the log: enter the panel at row 0 — but only if there are
+        // agents to focus; an empty roster stays on the log.
+        assert_eq!(
+            toggle_focus(Mode::LogScroll, 2),
+            Mode::AgentPanel { sel: 0 }
+        );
+        assert_eq!(toggle_focus(Mode::LogScroll, 0), Mode::LogScroll);
+        // From the panel: always back to the log.
+        assert_eq!(
+            toggle_focus(Mode::AgentPanel { sel: 1 }, 2),
+            Mode::LogScroll
+        );
+    }
+
+    #[test]
     fn move_selection_saturates_at_both_ends() {
         assert_eq!(move_selection(0, 3, false), 0, "up at top stays put");
         assert_eq!(move_selection(0, 3, true), 1, "down advances");
@@ -1913,7 +2047,27 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn agent_panel_shows_lamps_and_focus_cursor() {
+    fn auto_mark_play_pause_share_a_fixed_width_field() {
+        use clank_core::vocab::AutoMode;
+        // The on/off marks MUST occupy the same display width or the name
+        // column jitters between rows. The fixed MARK_FIELD guarantees it.
+        let on = auto_mark(AutoMode::On);
+        let off = auto_mark(AutoMode::Off);
+        assert_eq!(
+            display_width(&on.1),
+            MARK_FIELD,
+            "play mark fills the field"
+        );
+        assert_eq!(
+            display_width(&off.1),
+            MARK_FIELD,
+            "pause mark fills the field"
+        );
+        assert_eq!(display_width(&on.1), display_width(&off.1), "equal width");
+    }
+
+    #[test]
+    fn agent_panel_shows_play_pause_and_focus_cursor() {
         use clank_core::vocab::{AutoMode, Role};
         let mut s = snap(vec![], vec![]);
         s.agents = vec![
@@ -1921,24 +2075,35 @@ pub(crate) mod tests {
             agent_row("codex", Role::Reviewer, AutoMode::Off),
         ];
 
-        // Unfocused: both agents listed, both lamp states drawn, the
-        // Tab hint shows, and there is no cursor.
-        let plain = render_at(&s, 40, 80, 0, 0, None).0.join("\n");
-        assert!(plain.contains("claude"), "master listed: {plain}");
-        assert!(plain.contains("codex"), "reviewer listed");
-        assert!(plain.contains('●'), "on lamp drawn");
-        assert!(plain.contains('○'), "off lamp drawn");
-        assert!(plain.contains("Tab to select"), "focus hint when unfocused");
-        assert!(!plain.contains('▸'), "no cursor when unfocused");
-
-        // Focused on the second row: a cursor appears and the hint
-        // switches to the in-panel bindings.
-        let focused = render_at(&s, 40, 80, 0, 0, Some(1)).0.join("\n");
-        assert!(focused.contains('▸'), "cursor present when focused");
-        assert!(focused.contains("SPC toggle"), "toggle hint when focused");
+        // Log-focused: roster listed with play/pause marks; the AGENTS
+        // header reads dim+hollow (not focused) and there is no cursor on
+        // an agent row.
+        let log = render_at(&s, 40, 80, 0, 0, Mode::LogScroll).0.join("\n");
+        assert!(log.contains("claude"), "master listed: {log}");
+        assert!(log.contains("codex"), "reviewer listed");
+        assert!(log.contains('▶'), "play mark (auto on) drawn");
+        assert!(log.contains('⏸'), "pause mark (auto off) drawn");
         assert!(
-            !focused.contains("Tab to select"),
-            "unfocused hint replaced when focused"
+            log.contains("○ agents"),
+            "agents header hollow when unfocused"
+        );
+        assert!(log.contains("◉ LOG"), "log header filled when focused");
+        assert!(!log.contains('▸'), "no agent cursor when log-focused");
+
+        // Agents-focused on the second row: the headers swap emphasis, a
+        // cursor marks codex, and the focus rail appears.
+        let agents = render_at(&s, 40, 80, 0, 0, Mode::AgentPanel { sel: 1 })
+            .0
+            .join("\n");
+        assert!(
+            agents.contains("◉ AGENTS"),
+            "agents header filled when focused"
+        );
+        assert!(agents.contains("○ log"), "log header hollow when unfocused");
+        assert!(agents.contains('▸'), "cursor present when agents-focused");
+        assert!(
+            agents.contains('▌'),
+            "focus rail drawn on the active region"
         );
     }
 
@@ -2978,12 +3143,12 @@ terminal_3  terminal  ruthless (reviewer)
             answer: None,
         }];
         // Narrow + short so the ask wraps to many lines and overflows.
-        let top = render_at(&s, 8, 24, 0, 0, None).0.join("\n");
+        let top = render_at(&s, 8, 24, 0, 0, Mode::LogScroll).0.join("\n");
         assert!(top.contains("AAAA"), "ask head visible at offset 0: {top}");
         assert!(!top.contains("LAST"), "ask tail off-screen at offset 0");
         // Scrolling down reveals the tail.
         let revealed = (1..30).any(|off| {
-            render_at(&s, 8, 24, off, 0, None)
+            render_at(&s, 8, 24, off, 0, Mode::LogScroll)
                 .0
                 .join("\n")
                 .contains("LAST")
@@ -3066,14 +3231,14 @@ mod log_tier_tests {
         ];
         let s = snap_with_log(&subs);
         // Tall pane: capacity covers the whole log; newest shown at top.
-        let (lines, cap) = render_at(&s, 40, 80, 0, 0, None);
+        let (lines, cap) = render_at(&s, 40, 80, 0, 0, Mode::LogScroll);
         assert!(cap >= subs.len(), "viewport capacity reported");
         assert!(
             lines.join("\n").contains("row-aa"),
             "newest at top, offset 0"
         );
         // Scrolled down: the newest rows leave the window, older ones enter.
-        let body = render_at(&s, 40, 80, 3, 0, None).0.join("\n");
+        let body = render_at(&s, 40, 80, 3, 0, Mode::LogScroll).0.join("\n");
         assert!(
             !body.contains("row-aa"),
             "offset 3 scrolled past the newest"
