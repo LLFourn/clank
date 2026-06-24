@@ -27,6 +27,8 @@ use std::sync::mpsc;
 
 use super::ConsoleArgs;
 use super::term::{AltScreen, term_size};
+// `enter_raw` (full cfmakeraw) so Ctrl-C and friends forward to the
+// active child rather than acting on the console.
 use mux::{Action, Mode};
 use screen::{Event as ScreenEvent, Screen, Spec};
 
@@ -40,24 +42,77 @@ enum Ev {
 
 pub async fn run(args: ConsoleArgs) -> anyhow::Result<()> {
     let repo = super::resolve_repo(args.repo.as_deref())?;
-    // M1 skeleton: hardcoded screens prove the multiplexer end to
-    // end. A later milestone swaps this for the roster (a `clank
-    // agent start` per agent plus a `clank status --tui` screen).
-    let specs = skeleton_specs();
+    let specs = roster_specs(&repo);
     run_console(&repo, specs)
 }
 
-/// Throwaway screens for the M1 skeleton: two login shells. Replaced
-/// by the roster-derived screen list in the next milestone.
-fn skeleton_specs() -> Vec<Spec> {
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-    (1..=2)
-        .map(|n| Spec {
-            label: format!("shell-{n}"),
-            program: shell.clone(),
-            args: vec![],
-        })
+/// The screen list, derived from the one source of truth — the repo
+/// roster ([`RegisteredSet`]): the master first, then commit
+/// reviewers, then gate reviewers (deduped), each running the SAME
+/// `clank agent start <label> --repo <repo>` the zellij layout runs
+/// in a pane. A final `clank status --tui` screen is always present,
+/// so a bootstrapped repo with no master yet still has something to
+/// show.
+///
+/// [`RegisteredSet`]: crate::cli::teams_config::RegisteredSet
+fn roster_specs(repo: &Path) -> Vec<Spec> {
+    let exe = clank_exe();
+    let repo_str = repo.display().to_string();
+    let agent_spec = |label: &str| Spec {
+        label: label.to_string(),
+        program: exe.clone(),
+        args: vec![
+            "agent".into(),
+            "start".into(),
+            label.into(),
+            "--repo".into(),
+            repo_str.clone(),
+        ],
+    };
+
+    let mut specs = Vec::new();
+    // `home` is unused by the resolver (the roster is self-contained).
+    if let Ok(Some(set)) = crate::agent_store::try_resolve_via_team_with(repo, None) {
+        specs.extend(ordered_roster_labels(&set).iter().map(|l| agent_spec(l)));
+    }
+
+    specs.push(Spec {
+        label: "status".into(),
+        program: exe,
+        args: vec!["status".into(), "--tui".into(), "--repo".into(), repo_str],
+    });
+    specs
+}
+
+/// The roster's labels in display order — master, then commit
+/// reviewers, then gate reviewers — deduped so the screen list is
+/// 1:1 with agents even if the one-role-per-agent invariant ever
+/// slips. Pure so the ordering is unit-tested headless.
+fn ordered_roster_labels(set: &crate::cli::teams_config::RegisteredSet) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    std::iter::once(set.master.as_str().to_string())
+        .chain(
+            set.commit_reviewers
+                .iter()
+                .map(|a| a.label.as_str().to_string()),
+        )
+        .chain(
+            set.gate_reviewers
+                .iter()
+                .map(|a| a.label.as_str().to_string()),
+        )
+        .filter(|l| seen.insert(l.clone()))
         .collect()
+}
+
+/// Path to the running clank binary, so spawned screens use the
+/// EXACT same version as the console (not whatever `clank` resolves
+/// to on `$PATH`). Falls back to the bare name.
+fn clank_exe() -> String {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.to_str().map(String::from))
+        .unwrap_or_else(|| "clank".to_string())
 }
 
 fn run_console(repo: &Path, specs: Vec<Spec>) -> anyhow::Result<()> {
@@ -65,7 +120,7 @@ fn run_console(repo: &Path, specs: Vec<Spec>) -> anyhow::Result<()> {
         anyhow::bail!("clank console: no screens to show");
     }
 
-    let _guard = AltScreen::enter();
+    let _guard = AltScreen::enter_raw();
     let (rows, cols) = term_size();
     let (crows, ccols) = mux::content_rect(rows, cols);
 
@@ -227,5 +282,53 @@ fn teardown(screens: &mut [Screen]) {
     for s in screens.iter_mut() {
         let _ = s.child.wait();
         pty::close(s.master);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::teams_config::{AgentDescription, RegisteredSet, ResolvedAgent};
+    use clank_core::ids::AgentLabel;
+    use clank_core::vocab::Tool;
+
+    fn fixture(master: &str, commit: &[&str], gate: &[&str]) -> RegisteredSet {
+        let label = |s: &str| AgentLabel::parse(s).unwrap();
+        let desc = || AgentDescription {
+            tool: Tool::Claude,
+            launch: None,
+            initial_prompt: None,
+        };
+        let agents = |ls: &[&str]| {
+            ls.iter()
+                .map(|l| ResolvedAgent {
+                    label: label(l),
+                    desc: desc(),
+                })
+                .collect()
+        };
+        RegisteredSet {
+            master: label(master),
+            master_desc: desc(),
+            commit_reviewers: agents(commit),
+            gate_reviewers: agents(gate),
+        }
+    }
+
+    #[test]
+    fn roster_labels_are_master_then_commit_then_gate() {
+        let set = fixture("claude", &["codex"], &["ruthless"]);
+        assert_eq!(
+            ordered_roster_labels(&set),
+            vec!["claude", "codex", "ruthless"]
+        );
+    }
+
+    #[test]
+    fn roster_labels_dedupe_keeping_first_occurrence() {
+        // Should the one-role-per-agent invariant ever slip, a label
+        // in two tiers still yields exactly one screen.
+        let set = fixture("claude", &["codex", "claude"], &["codex"]);
+        assert_eq!(ordered_roster_labels(&set), vec!["claude", "codex"]);
     }
 }

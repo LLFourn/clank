@@ -49,18 +49,42 @@ pub(crate) struct AltScreen {
 /// `static mut` (banned refs in edition 2024) or allocating.
 static TERMIOS_PTR: AtomicPtr<libc::termios> = AtomicPtr::new(std::ptr::null_mut());
 
+/// How aggressively to put the terminal into raw mode.
+enum RawLevel {
+    /// ICANON+ECHO off, signals (Ctrl-C) still act locally.
+    CookedSignals,
+    /// Everything off (cfmakeraw) — bytes pass straight through.
+    Full,
+}
+
 impl AltScreen {
+    /// Status-view raw mode: ICANON+ECHO off so keystrokes are read
+    /// (not echoed), but ISIG kept so Ctrl-C still exits the
+    /// read-only view. For `status --tui`.
     pub(crate) fn enter() -> Self {
-        // Raw-ish input so keystrokes are READ, not echoed onto the
-        // alt-screen as `^[[B`. ICANON+ECHO off; VMIN=1 so a stdin
-        // read blocks until ≥1 byte (the kernel notification the
-        // reader thread waits on — no polling).
+        Self::enter_with(RawLevel::CookedSignals)
+    }
+
+    /// Full raw mode (cfmakeraw): ISIG/IXON/ICRNL/OPOST off too, so
+    /// EVERY byte — including Ctrl-C — is forwarded verbatim to the
+    /// active child instead of acting on the console itself. For
+    /// `clank console`, which is a transparent multiplexer.
+    pub(crate) fn enter_raw() -> Self {
+        Self::enter_with(RawLevel::Full)
+    }
+
+    fn enter_with(level: RawLevel) -> Self {
+        // VMIN=1 so a stdin read blocks until ≥1 byte (the kernel
+        // notification the reader thread waits on — no polling).
         let mut orig: libc::termios = unsafe { std::mem::zeroed() };
         unsafe {
             libc::tcgetattr(libc::STDIN_FILENO, &mut orig);
             TERMIOS_PTR.store(Box::into_raw(Box::new(orig)), Ordering::Relaxed);
             let mut raw = orig;
-            raw.c_lflag &= !(libc::ICANON | libc::ECHO);
+            match level {
+                RawLevel::CookedSignals => raw.c_lflag &= !(libc::ICANON | libc::ECHO),
+                RawLevel::Full => libc::cfmakeraw(&mut raw),
+            }
             raw.c_cc[libc::VMIN] = 1;
             raw.c_cc[libc::VTIME] = 0;
             libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw);
