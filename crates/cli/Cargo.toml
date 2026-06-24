@@ -17,6 +17,13 @@ ignore = "0.4"
 # SIGWINCH forwarding for the event-driven TUI.
 signal-hook = "0.3"
 
+# Terminal emulation for `clank console`: one vt100::Parser per
+# child PTY maintains that agent's screen grid, so switching screens
+# is a repaint-from-grid (not a lossy byte-replay). The one part of
+# a multiplexer that is a multi-thousand-line minefield to hand-roll;
+# everything else (PTY via libc, input routing, chrome) stays dep-free.
+vt100 = "0.16"
+
 # Hashing
 blake3 = "1"
 

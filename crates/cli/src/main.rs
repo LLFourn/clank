@@ -103,6 +103,11 @@ enum Command {
     Block(cli::BlockArgs),
     /// Answer a pending block.
     Unblock(cli::UnblockArgs),
+    /// Self-managed agent multiplexer (experimental): one PTY per
+    /// roster agent plus a `clank status --tui` screen, switched
+    /// with a prefix hotkey. An alternative to `clank open`'s
+    /// zellij layout that clank draws itself.
+    Console(cli::ConsoleArgs),
 }
 
 #[tokio::main]
@@ -121,6 +126,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Unfinish(args) => cli::unfinish::run(args).await,
         Command::Queue(args) => cli::queue::run(args).await,
         Command::Agent(args) => cli::agent::run(args).await,
+        Command::Console(args) => cli::console::run(args).await,
         Command::Team(args) => cli::team::run(args).await,
         Command::Export(args) => cli::export::run(args).await,
         Command::Purge(args) => cli::purge::run(args).await,

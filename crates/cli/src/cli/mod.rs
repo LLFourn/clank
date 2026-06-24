@@ -14,6 +14,7 @@ pub mod as_cmd;
 pub mod auto;
 pub mod block;
 pub mod config;
+pub mod console;
 pub mod diff;
 pub mod doctor;
 pub mod export;
@@ -382,6 +383,18 @@ pub struct StatusArgs {
     /// to exit. Conflicts with --json/--watch/--plan.
     #[arg(long, conflicts_with_all = ["json", "watch", "plan"])]
     pub tui: bool,
+}
+
+/// `clank console` — a self-managed agent multiplexer
+/// (experimental). Runs one PTY per roster agent plus a full
+/// `clank status --tui` screen, switching between them with a
+/// prefix hotkey (default `Ctrl-a`, then `n`/`p`/digit/`q`). See
+/// the clank-console plan.
+#[derive(Args, Debug)]
+pub struct ConsoleArgs {
+    /// Repo root. Defaults to the cwd's git toplevel.
+    #[arg(long, value_name = "PATH")]
+    pub repo: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
