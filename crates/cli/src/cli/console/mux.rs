@@ -109,6 +109,39 @@ pub(crate) fn prefix_label(prefix: u8) -> String {
     }
 }
 
+/// Parse a human-written prefix spec into its control byte. Accepts
+/// `C-a` / `c-a` / `ctrl-a` / `^a` (case-insensitive letter) for a
+/// control char, or a single printable ASCII char taken literally.
+/// `None` on anything else, so a bad override falls back to the
+/// default rather than wedging input on an unreachable prefix. The
+/// override knob for the experimental console is the
+/// `CLANK_CONSOLE_PREFIX` env var (a persistent config key is a
+/// follow-up once the default is settled).
+pub(crate) fn parse_prefix(spec: &str) -> Option<u8> {
+    let spec = spec.trim();
+    let ctrl_of = |rest: &str| -> Option<u8> {
+        let mut chars = rest.chars();
+        let c = chars.next()?;
+        if chars.next().is_some() {
+            return None; // exactly one letter after the modifier
+        }
+        let lc = c.to_ascii_lowercase();
+        lc.is_ascii_lowercase().then(|| (lc as u8) - b'a' + 1)
+    };
+    for modi in ["ctrl-", "Ctrl-", "C-", "c-", "^"] {
+        if let Some(rest) = spec.strip_prefix(modi) {
+            return ctrl_of(rest);
+        }
+    }
+    // A single printable ASCII char, taken literally.
+    let mut chars = spec.chars();
+    let c = chars.next()?;
+    if chars.next().is_none() && c.is_ascii() && !c.is_ascii_control() {
+        return Some(c as u8);
+    }
+    None
+}
+
 /// The bottom chrome bar: a numbered tab strip on the left (active in
 /// reverse video, the rest dim, a dead child marked `✗`) and a dim
 /// right-aligned keybinding hint so the prefix is discoverable — the
@@ -302,6 +335,22 @@ mod tests {
     fn prefix_label_renders_control_bytes() {
         assert_eq!(prefix_label(0x01), "^A");
         assert_eq!(prefix_label(0x02), "^B");
+    }
+
+    #[test]
+    fn parse_prefix_accepts_control_forms_and_literals() {
+        for spec in ["C-a", "c-a", "ctrl-a", "Ctrl-A", "^a", "^A", " C-a "] {
+            assert_eq!(parse_prefix(spec), Some(0x01), "{spec:?}");
+        }
+        assert_eq!(parse_prefix("C-b"), Some(0x02));
+        assert_eq!(parse_prefix("ctrl-z"), Some(0x1a));
+        // A single printable char is taken literally.
+        assert_eq!(parse_prefix("`"), Some(b'`'));
+        // Garbage falls back (None → caller keeps the default).
+        assert_eq!(parse_prefix(""), None);
+        assert_eq!(parse_prefix("C-ab"), None);
+        assert_eq!(parse_prefix("C-1"), None);
+        assert_eq!(parse_prefix("hello"), None);
     }
 
     #[test]

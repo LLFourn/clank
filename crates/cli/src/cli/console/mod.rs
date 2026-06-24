@@ -183,7 +183,12 @@ fn run_console(repo: &Path, specs: Vec<Spec>) -> anyhow::Result<()> {
     let mut frame = render::Frame::new(rows, cols);
     let mut active = 0usize;
     let mut mode = Mode::Passthrough;
-    let prefix = mux::DEFAULT_PREFIX;
+    // Escape hatch for the experiment: rebind the prefix without a
+    // recompile if Ctrl-a collides with the active agent's own keys.
+    let prefix = std::env::var("CLANK_CONSOLE_PREFIX")
+        .ok()
+        .and_then(|s| mux::parse_prefix(&s))
+        .unwrap_or(mux::DEFAULT_PREFIX);
     let hint = format!("{} n·p·q", mux::prefix_label(prefix));
 
     repaint(&mut frame, &screens, active, &hint);
