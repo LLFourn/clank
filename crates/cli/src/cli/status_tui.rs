@@ -172,6 +172,7 @@ pub(crate) fn render_at(
 ) -> (Vec<String>, usize) {
     let mode = view.mode;
     let picker = view.picker;
+    let log_cursor = view.log_cursor;
     let rows = rows.max(1) as usize;
     let cols = cols.max(1) as usize;
     let color = state_color(snap);
@@ -453,13 +454,19 @@ pub(crate) fn render_at(
                 })
                 .max()
                 .unwrap_or(0);
-            for s in &seq[off..end] {
+            for (local, s) in seq[off..end].iter().enumerate() {
                 let spans = match s {
                     Seg::Ask(line) => (*line).clone(),
                     Seg::Log(row) => log_row_spans(row, author_width),
                     Seg::InProg(item) => in_progress_spans(item, frame, author_width),
                 };
-                out.push(emit(&spans, color, cols));
+                // The selected timeline entry gets the unified selection
+                // band — the same "selected" style as the panel/picker —
+                // while the log is the focused region. Gated on `has_panel`
+                // (the log is only a focusable region when there's a panel
+                // to switch with), so a panel-less log renders bare.
+                let selected = log_focused && has_panel && off + local == log_cursor;
+                out.push(row_line(&spans, selected, color, cols));
             }
         }
     }
@@ -1693,14 +1700,21 @@ impl Mode {
 pub(crate) struct PanelView<'a> {
     pub(crate) mode: Mode,
     pub(crate) picker: &'a [crate::cli::status::AvailableAgent],
+    /// The selected log ENTRY (index into the scroll sequence) — drawn
+    /// with the unified selection band when the log is focused.
+    pub(crate) log_cursor: usize,
 }
 
 impl<'a> PanelView<'a> {
-    /// A view with just a mode (no picker) — the common case for tests
-    /// and the log-scroll default.
+    /// A view with just a mode (no picker, cursor at 0) — the common
+    /// case for tests and the log-scroll default.
     #[cfg(test)]
     fn just(mode: Mode) -> Self {
-        Self { mode, picker: &[] }
+        Self {
+            mode,
+            picker: &[],
+            log_cursor: 0,
+        }
     }
 }
 
@@ -1755,11 +1769,30 @@ fn agent_panel_action(
 }
 
 /// The log-side half of continuous navigation: pressing `Up` in the
-/// log returns `Some(panel_row)` when already at the top (cross back
-/// into the panel, landing on the "+ add" row adjacent to the log),
-/// else `None` (just scroll up). Pure so the boundary stays tested.
-fn log_up_target(offset: usize, agents_len: usize) -> Option<usize> {
-    (offset == 0 && agents_len > 0).then_some(agents_len)
+/// log returns `Some(panel_row)` when the CURSOR is on the first entry
+/// (cross back into the panel, landing on the "+ add" row adjacent to
+/// the log), else `None` (move the cursor up). Pure so the boundary
+/// stays tested.
+fn log_up_target(cursor: usize, agents_len: usize) -> Option<usize> {
+    (cursor == 0 && agents_len > 0).then_some(agents_len)
+}
+
+/// Derive the viewport top so the cursor entry stays visible, moving the
+/// previous `offset` as little as possible and never past the last-page
+/// clamp (so the final page stays full). The two constraints are
+/// compatible because the caller clamps `cursor` to `total - 1` first,
+/// so the offset that reveals the cursor is always ≤ the clamp.
+fn scroll_to_show(cursor: usize, offset: usize, capacity: usize, total: usize) -> usize {
+    let cap = capacity.max(1);
+    let max_off = total.saturating_sub(cap);
+    let off = if cursor < offset {
+        cursor // cursor above the window → scroll up to it
+    } else if cursor >= offset + cap {
+        cursor + 1 - cap // cursor below → scroll down to it
+    } else {
+        offset // already visible → don't move
+    };
+    off.min(max_off)
 }
 
 /// Resolve a Confirm keystroke: `Some(true)` confirm, `Some(false)`
@@ -2301,6 +2334,12 @@ pub(crate) async fn run_tui(
     let mut snapshot =
         StatusSnapshot::build_async(&repo, &basename, home.as_deref(), policy, None, true).await?;
     let mut offset: usize = 0;
+    // The selected log ENTRY (index into the scroll sequence). The log is
+    // a selectable timeline: this is the cursor; `offset` (the viewport
+    // top) is DERIVED from it each frame via `scroll_to_show`, so
+    // scrolling happens only when the cursor reaches the window edge.
+    // Only meaningful while focused on the log (Mode::LogScroll).
+    let mut log_cursor: usize = 0;
     // Which region owns the keyboard. Starts on the log; Tab moves it to
     // the agent panel. The single source of key-routing truth.
     let mut mode = Mode::LogScroll;
@@ -2319,9 +2358,11 @@ pub(crate) async fn run_tui(
     let mut needs_fill = true;
     loop {
         let (rows, cols) = term_size();
+        let log_focused = matches!(mode, Mode::LogScroll);
         let view = PanelView {
             mode,
             picker: &picker,
+            log_cursor,
         };
         let capacity = render_at(&snapshot, rows, cols, offset, frame, &view).1;
 
@@ -2333,10 +2374,12 @@ pub(crate) async fn run_tui(
         let in_prog = in_progress_rows(&snapshot);
         let head = ask_lines.len() + in_prog.len();
 
-        // Load enough log to fill the viewport AT this scroll position.
-        // Gated on `needs_fill` so an animation tick never reaches it.
+        // Load enough log to fill the viewport AND reach the cursor (the
+        // cursor can move past the loaded tail). Gated on `needs_fill` so
+        // an animation tick never reaches it.
         if needs_fill {
-            while !log_complete && head + snapshot.log_rows.len() < offset + capacity {
+            let want = (offset + capacity).max(log_cursor + 1);
+            while !log_complete && head + snapshot.log_rows.len() < want {
                 log_window += capacity.max(1);
                 let before = snapshot.log_rows.len();
                 snapshot.log_rows = crate::cli::status::tui_log_rows(&repo, log_window).await;
@@ -2348,9 +2391,22 @@ pub(crate) async fn run_tui(
         }
 
         let total = head + snapshot.log_rows.len();
-        // Max offset pins the last row at the BOTTOM of the viewport.
+        // Derive the viewport from the cursor when the log is focused
+        // (clamp the cursor to the loaded length first, so it's always
+        // showable); otherwise just keep the last page full.
         let max_off = total.saturating_sub(capacity.max(1));
-        offset = offset.min(max_off);
+        if log_focused {
+            log_cursor = log_cursor.min(total.saturating_sub(1));
+            offset = scroll_to_show(log_cursor, offset, capacity, total);
+        } else {
+            offset = offset.min(max_off);
+        }
+        // Rebuild the view with the clamped cursor/offset for the paint.
+        let view = PanelView {
+            mode,
+            picker: &picker,
+            log_cursor,
+        };
         paint(&render_at(&snapshot, rows, cols, offset, frame, &view).0);
 
         // The in-progress rows now sit at SCATTERED indices (master after
@@ -2387,7 +2443,8 @@ pub(crate) async fn run_tui(
                             }
                             PanelAction::MoveCursor(s) => mode = Mode::AgentPanel { sel: s },
                             PanelAction::EnterLog => {
-                                // Cross into the log at the top.
+                                // Cross into the log at the FIRST entry.
+                                log_cursor = 0;
                                 offset = 0;
                                 mode = Mode::LogScroll;
                             }
@@ -2492,20 +2549,22 @@ pub(crate) async fn run_tui(
                             };
                         }
                     }
-                    // Default: keys scroll the log. `Up` at the very top
-                    // crosses back into the panel (continuous nav).
+                    // Default: the log is a selectable timeline — keys move
+                    // the CURSOR entry (the viewport follows via
+                    // scroll_to_show at the loop top). `Up` on the first
+                    // entry crosses back into the panel (continuous nav).
                     Mode::LogScroll => match k {
                         Key::Quit => break,
                         Key::Focus => mode = toggle_focus(mode, snapshot.agents.len()),
-                        Key::Up => match log_up_target(offset, snapshot.agents.len()) {
+                        Key::Up => match log_up_target(log_cursor, snapshot.agents.len()) {
                             Some(sel) => mode = Mode::AgentPanel { sel },
-                            None => offset = offset.saturating_sub(1),
+                            None => log_cursor = log_cursor.saturating_sub(1),
                         },
-                        Key::Down => offset += 1,
-                        Key::PageUp => offset = offset.saturating_sub(page),
-                        Key::Space | Key::PageDown => offset += page,
-                        Key::Top => offset = 0,
-                        Key::Bottom => offset = max_off,
+                        Key::Down => log_cursor += 1,
+                        Key::PageUp => log_cursor = log_cursor.saturating_sub(page),
+                        Key::Space | Key::PageDown => log_cursor += page,
+                        Key::Top => log_cursor = 0,
+                        Key::Bottom => log_cursor = total.saturating_sub(1),
                         Key::Escape | Key::Enter | Key::Delete | Key::Yes | Key::No => {}
                     },
                 }
@@ -2876,6 +2935,7 @@ pub(crate) mod tests {
             &PanelView {
                 mode: Mode::AddPicker { sel: 0 },
                 picker: &picker,
+                log_cursor: 0,
             },
         )
         .0;
@@ -2914,6 +2974,7 @@ pub(crate) mod tests {
         let view = PanelView {
             mode: Mode::AddPicker { sel: 0 },
             picker: &picker,
+            log_cursor: 0,
         };
 
         // Tiny pane: never more lines than rows, and no element spans
@@ -2998,6 +3059,7 @@ pub(crate) mod tests {
                     action: ConfirmAction::AddCandidate { idx: 0 },
                 },
                 picker: &picker,
+                log_cursor: 0,
             },
         )
         .0
@@ -3220,11 +3282,101 @@ pub(crate) mod tests {
 
     #[test]
     fn log_up_target_crosses_to_panel_only_at_the_top() {
-        // At the top of the log, Up crosses back to the panel's +add row
-        // (index == agents.len()); otherwise it scrolls (None).
-        assert_eq!(log_up_target(0, 2), Some(2), "top → +add row");
-        assert_eq!(log_up_target(3, 2), None, "mid-log → scroll");
+        // With the CURSOR on the first entry, Up crosses back to the
+        // panel's +add row (index == agents.len()); otherwise it moves
+        // the cursor up (None).
+        assert_eq!(log_up_target(0, 2), Some(2), "cursor 0 → +add row");
+        assert_eq!(log_up_target(3, 2), None, "mid-log → move cursor up");
         assert_eq!(log_up_target(0, 0), None, "no roster → nothing to cross to");
+    }
+
+    #[test]
+    fn scroll_to_show_follows_cursor_and_respects_last_page() {
+        // Already visible → don't move.
+        assert_eq!(scroll_to_show(3, 2, 5, 20), 2);
+        // Above the window → scroll up onto it.
+        assert_eq!(scroll_to_show(1, 5, 5, 20), 1);
+        // Below the window → scroll down so it's the last visible row.
+        assert_eq!(scroll_to_show(9, 2, 5, 20), 5);
+        // Last-page clamp AND cursor-visible together: total 12, cap 5 →
+        // max_off 7; a cursor near the end can't push offset past 7, and
+        // is STILL inside the painted window.
+        let off = scroll_to_show(11, 0, 5, 12);
+        assert_eq!(off, 7, "clamped to the last page");
+        assert!(
+            (off..off + 5).contains(&11),
+            "cursor still painted under the clamp"
+        );
+        // Log shorter than the viewport → offset 0, cursor visible.
+        assert_eq!(scroll_to_show(2, 0, 10, 3), 0);
+    }
+
+    #[test]
+    fn cursor_derived_window_tracks_spinner_visibility() {
+        // The loop computes spinner-visibility from `offset..offset+cap`
+        // with the CURSOR-derived offset. So an in-progress row at seq
+        // index 1 is "visible" only while the cursor keeps it in the
+        // window — scrolling the cursor away takes it out (no wasted
+        // animation ticks), and back in resumes them.
+        let cap = 5;
+        let total = 30;
+        let near = scroll_to_show(2, 0, cap, total);
+        assert!(
+            (near..near + cap).contains(&1),
+            "spinner in view near the top"
+        );
+        let far = scroll_to_show(25, near, cap, total);
+        assert!(
+            !(far..far + cap).contains(&1),
+            "spinner scrolled off → window excludes it"
+        );
+    }
+
+    fn commit_row(subject: &str) -> crate::cli::log::OnelineRow {
+        crate::cli::log::OnelineRow::Commit {
+            sha: crate::lifecycle::CommitSha::parse(&format!("{:0<40}", "abc1234")).unwrap(),
+            subject: subject.to_string(),
+        }
+    }
+
+    #[test]
+    fn log_focused_highlights_the_cursor_entry() {
+        let mut s = two_agent_snap(); // has_panel
+        s.log_rows = vec![
+            commit_row("first"),
+            commit_row("second"),
+            commit_row("third"),
+        ];
+        // Log focused, cursor on the SECOND entry (seq index 1, since
+        // two_agent_snap has no ask/in-progress rows).
+        let view = PanelView {
+            mode: Mode::LogScroll,
+            picker: &[],
+            log_cursor: 1,
+        };
+        let lines = render_at(&s, 40, 80, 0, 0, &view).0;
+        assert!(
+            line_with(&lines, "second").contains(REVERSE),
+            "the cursor entry carries the unified selection band"
+        );
+        assert!(
+            !line_with(&lines, "first").contains(REVERSE),
+            "non-cursor entries are not banded"
+        );
+        // Focus the panel instead: no log entry is banded.
+        let panel = render_at(
+            &s,
+            40,
+            80,
+            0,
+            0,
+            &PanelView::just(Mode::AgentPanel { sel: 0 }),
+        )
+        .0;
+        assert!(
+            !line_with(&panel, "second").contains(REVERSE),
+            "no log cursor band when the panel is focused"
+        );
     }
 
     #[test]
