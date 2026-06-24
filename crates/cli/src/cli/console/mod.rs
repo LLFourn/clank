@@ -1,4 +1,6 @@
-//! `clank console` — a self-managed agent multiplexer (experimental).
+//! The console — a self-managed agent multiplexer (experimental).
+//! It has no command of its own: `clank open` launches it as the
+//! default workspace when you're not already in a zellij session.
 //! See the plan: clank-console.
 //!
 //! The console is a thin VT multiplexer over the UNCHANGED
@@ -25,7 +27,6 @@ mod screen;
 use std::path::Path;
 use std::sync::mpsc;
 
-use super::ConsoleArgs;
 use super::term::{AltScreen, term_size};
 // `enter_raw` (full cfmakeraw) so Ctrl-C and friends forward to the
 // active child rather than acting on the console.
@@ -40,8 +41,10 @@ enum Ev {
     Resize,
 }
 
-pub async fn run(args: ConsoleArgs) -> anyhow::Result<()> {
-    let repo = super::resolve_repo(args.repo.as_deref())?;
+/// Launch the console for a repo. Invoked by `clank open` (outside a
+/// zellij session) — the console has no command of its own.
+pub fn run(repo: Option<&Path>) -> anyhow::Result<()> {
+    let repo = super::resolve_repo(repo)?;
     let specs = roster_specs(&repo);
     run_console(&repo, specs)
 }
@@ -117,7 +120,7 @@ fn clank_exe() -> String {
 
 fn run_console(repo: &Path, specs: Vec<Spec>) -> anyhow::Result<()> {
     if specs.is_empty() {
-        anyhow::bail!("clank console: no screens to show");
+        anyhow::bail!("clank open (console): no screens to show");
     }
 
     let _guard = AltScreen::enter_raw();

@@ -385,18 +385,6 @@ pub struct StatusArgs {
     pub tui: bool,
 }
 
-/// `clank console` — a self-managed agent multiplexer
-/// (experimental). Runs one PTY per roster agent plus a full
-/// `clank status --tui` screen, switching between them with a
-/// prefix hotkey (default `Ctrl-a`, then `n`/`p`/digit/`q`). See
-/// the clank-console plan.
-#[derive(Args, Debug)]
-pub struct ConsoleArgs {
-    /// Repo root. Defaults to the cwd's git toplevel.
-    #[arg(long, value_name = "PATH")]
-    pub repo: Option<PathBuf>,
-}
-
 #[derive(Args, Debug)]
 pub struct WaitArgs {
     /// Repo root. Defaults to the cwd's git toplevel.

@@ -13,10 +13,27 @@ use clank_core::vocab::Tool;
 pub async fn run(args: OpenArgs) -> anyhow::Result<()> {
     match args.command {
         Some(OpenCmd::Dry(dry)) => run_dry(dry).await,
+        // Explicit escape hatch: force the zellij layout even outside
+        // a session.
         Some(OpenCmd::Zellij(zellij)) => super::open_zellij::run(zellij).await,
-        // Bare `clank open`: the zellij opener with the flattened
-        // flags (clank-open-zellij-context).
-        None => super::open_zellij::run(args.zellij).await,
+        // Bare `clank open`: the console IS the default workspace.
+        // Inside a live zellij session (`$ZELLIJ` set), or for the
+        // zellij-specific multi-worktree / layout flags, keep the
+        // zellij opener (add-a-tab, --all, --fork/--pr, --print).
+        // Otherwise — a plain `clank open` in a fresh terminal —
+        // launch the self-managed console.
+        None => {
+            let in_zellij = std::env::var_os("ZELLIJ").is_some();
+            let z = &args.zellij;
+            let console_default =
+                !in_zellij && z.fork.is_none() && z.pr.is_none() && !z.all && !z.print;
+            let repo = z.repo.clone();
+            if console_default {
+                super::console::run(repo.as_deref())
+            } else {
+                super::open_zellij::run(args.zellij).await
+            }
+        }
     }
 }
 

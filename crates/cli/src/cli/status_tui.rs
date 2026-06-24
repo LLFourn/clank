@@ -1411,7 +1411,7 @@ fn truncate_to(s: &str, cols: usize) -> String {
 
 // ── terminal plumbing ───────────────────────────────────────
 // The raw-mode alt-screen lifecycle, the size probe, and the frame
-// painter live in `super::term` (shared with `clank console`).
+// painter live in `super::term` (shared with the console).
 
 /// What wakes the `--tui` loop.
 enum Ev {

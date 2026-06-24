@@ -1,5 +1,5 @@
 //! Shared raw-terminal plumbing for the full-screen TUIs (`clank
-//! status --tui` and `clank console`).
+//! status --tui` and the `clank open` console).
 //!
 //! Hand-rolled on `libc` (no crossterm/termion): the alt-screen +
 //! raw-mode lifecycle, the `TIOCGWINSZ` size probe, and the
@@ -67,8 +67,8 @@ impl AltScreen {
 
     /// Full raw mode (cfmakeraw): ISIG/IXON/ICRNL/OPOST off too, so
     /// EVERY byte — including Ctrl-C — is forwarded verbatim to the
-    /// active child instead of acting on the console itself. For
-    /// `clank console`, which is a transparent multiplexer.
+    /// active child instead of acting on the console itself. For the
+    /// console, which is a transparent multiplexer.
     pub(crate) fn enter_raw() -> Self {
         Self::enter_with(RawLevel::Full)
     }
