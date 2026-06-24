@@ -188,9 +188,11 @@ pub(crate) fn render_at(
     cols: u16,
     offset: usize,
     frame: usize,
-    mode: Mode,
-    picker: &[crate::cli::status::AvailableAgent],
+    view: &PanelView,
 ) -> (Vec<String>, usize) {
+    let mode = view.mode;
+    let picker = view.picker;
+    let notice = view.notice;
     let rows = rows.max(1) as usize;
     let cols = cols.max(1) as usize;
     let color = state_color(snap);
@@ -372,6 +374,15 @@ pub(crate) fn render_at(
             ),
         ]);
 
+        // A transient notice (e.g. DEL on the master row), set by the
+        // last keystroke and cleared by the next.
+        if let Some(msg) = notice {
+            body.push(vec![
+                rail(agents_focused),
+                Span(Style::Accent, format!("  {msg}")),
+            ]);
+        }
+
         // AddPicker overlay — the freshly-read candidate list.
         if let Mode::AddPicker { sel } = mode {
             body.push(vec![
@@ -533,7 +544,7 @@ pub(crate) fn render_at(
 /// tests exercise. Test-only; the live loop calls [`render_at`] directly.
 #[cfg(test)]
 fn render(snap: &StatusSnapshot, rows: u16, cols: u16) -> Vec<String> {
-    render_at(snap, rows, cols, 0, 0, Mode::LogScroll, &[]).0
+    render_at(snap, rows, cols, 0, 0, &PanelView::just(Mode::LogScroll)).0
 }
 
 /// Widest verdict mark in display columns: `✓✓` (Finished) is 2,
@@ -1458,6 +1469,91 @@ impl Mode {
     }
 }
 
+/// The interactive state `render_at` needs beyond the snapshot: which
+/// mode owns the keyboard, the freshly-read add-picker candidates, and
+/// any transient one-line notice. Bundled so the render signature stays
+/// small (and future interactive bits land here, not as more args).
+pub(crate) struct PanelView<'a> {
+    pub(crate) mode: Mode,
+    pub(crate) picker: &'a [crate::cli::status::AvailableAgent],
+    pub(crate) notice: Option<&'a str>,
+}
+
+impl<'a> PanelView<'a> {
+    /// A view with just a mode (no picker, no notice) — the common
+    /// case for tests and the log-scroll default.
+    #[cfg(test)]
+    fn just(mode: Mode) -> Self {
+        Self {
+            mode,
+            picker: &[],
+            notice: None,
+        }
+    }
+}
+
+/// What an `AgentPanel` keystroke means — PURE routing over the cursor
+/// position and the selected row's role, so every case is unit-tested
+/// and the loop only executes the result (the sole place IO happens).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PanelAction {
+    None,
+    Quit,
+    /// Tab/Esc — hand focus back to the log.
+    LeaveFocus,
+    /// Move the cursor to this row.
+    MoveCursor(usize),
+    /// Toggle auto on the agent at this index.
+    ToggleAuto(usize),
+    /// Open the add picker (Enter/Space on the "+ add" row).
+    OpenPicker,
+    /// Begin a remove-confirm for the reviewer at this index.
+    RequestRemove(usize),
+    /// DEL on the master row — master isn't removable here.
+    MasterNotice,
+}
+
+/// Pure key routing for the agent panel. `agents` is the roster; the
+/// "+ add" row sits at index `agents.len()`.
+fn agent_panel_action(
+    sel: usize,
+    agents: &[crate::cli::status::AgentAutoRow],
+    key: Key,
+) -> PanelAction {
+    let add_row = agents.len();
+    let on_add = sel == add_row;
+    match key {
+        Key::Quit => PanelAction::Quit,
+        Key::Focus | Key::Escape => PanelAction::LeaveFocus,
+        Key::Up => PanelAction::MoveCursor(move_selection(sel, add_row + 1, false)),
+        Key::Down => PanelAction::MoveCursor(move_selection(sel, add_row + 1, true)),
+        // Enter/Space activate the "+ add" row; Space also toggles auto
+        // on an agent row (Enter on an agent row is a no-op).
+        Key::Enter if on_add => PanelAction::OpenPicker,
+        Key::Space if on_add => PanelAction::OpenPicker,
+        Key::Space => PanelAction::ToggleAuto(sel),
+        Key::Delete => match agents.get(sel).map(|a| a.role) {
+            Some(clank_core::vocab::Role::Reviewer) => PanelAction::RequestRemove(sel),
+            Some(clank_core::vocab::Role::Master) => PanelAction::MasterNotice,
+            None => PanelAction::None,
+        },
+        _ => PanelAction::None,
+    }
+}
+
+/// Resolve a Confirm keystroke: `Some(true)` confirm, `Some(false)`
+/// cancel, `None` ignore. In a confirm `q` CANCELS (it does not quit
+/// the TUI), and Enter follows the action's default — so a destructive
+/// default is never confirmed by Enter.
+fn confirm_decision(action: ConfirmAction, key: Key) -> Option<bool> {
+    match key {
+        Key::Yes => Some(true),
+        Key::No | Key::Escape | Key::Quit => Some(false),
+        Key::Enter => Some(action.default_yes()),
+        _ => None,
+    }
+}
+
 /// Parse a burst of stdin bytes into scroll keys — arrow keys,
 /// PgUp/PgDn, plus vi-ish `j`/`k`/`g`/`G`, space (page down), `q` (quit).
 fn parse_keys(bytes: &[u8]) -> Vec<Key> {
@@ -1943,6 +2039,9 @@ pub(crate) async fn run_tui(
     // --global` elsewhere shows up at once), referenced by index while
     // AddPicker/Confirm(Add) is active, cleared when the picker closes.
     let mut picker: Vec<crate::cli::status::AvailableAgent> = Vec::new();
+    // A transient one-line notice (e.g. "master can't be removed"). Set
+    // by a keystroke, shown on the next repaint, cleared by the next key.
+    let mut notice: Option<&'static str> = None;
     // Spinner animation frame. The ONLY state an animation tick mutates.
     let mut frame: usize = 0;
     // Whether this iteration may do IO to top up the log. Set ONLY by
@@ -1953,7 +2052,12 @@ pub(crate) async fn run_tui(
     let mut needs_fill = true;
     loop {
         let (rows, cols) = term_size();
-        let capacity = render_at(&snapshot, rows, cols, offset, frame, mode, &picker).1;
+        let view = PanelView {
+            mode,
+            picker: &picker,
+            notice,
+        };
+        let capacity = render_at(&snapshot, rows, cols, offset, frame, &view).1;
 
         // The ask + in-progress rows depend on blocks/waiting_on (not the
         // log fetch), so compute them before filling. `head` is the count
@@ -1981,7 +2085,7 @@ pub(crate) async fn run_tui(
         // Max offset pins the last row at the BOTTOM of the viewport.
         let max_off = total.saturating_sub(capacity.max(1));
         offset = offset.min(max_off);
-        paint(&render_at(&snapshot, rows, cols, offset, frame, mode, &picker).0);
+        paint(&render_at(&snapshot, rows, cols, offset, frame, &view).0);
 
         // The in-progress rows now sit at SCATTERED indices (master after
         // the plan header; reviews in the latest commit's review block), so
@@ -2003,78 +2107,63 @@ pub(crate) async fn run_tui(
             // new position needs it.
             Ok(Ev::Key(k)) => {
                 let page = (rows as usize).saturating_sub(3).max(1);
+                // A keystroke clears the previous transient notice; the
+                // arm below may set a new one.
+                notice = None;
                 // `mode` is Copy: matching it copies, so reassigning `mode`
-                // inside an arm is free of borrow conflicts. Each key is
-                // resolved in exactly one arm per mode.
-                // The "+ add" row sits at index `agents.len()`, so the
-                // panel cursor ranges over `agents.len() + 1` rows.
-                let panel_rows = snapshot.agents.len() + 1;
+                // inside an arm is free of borrow conflicts. The per-mode
+                // routing is PURE (agent_panel_action / confirm_decision);
+                // the loop only executes the result (where IO happens).
                 match mode {
-                    // Agent panel: cursor + per-row actions, not log scroll.
-                    Mode::AgentPanel { sel } => match k {
-                        Key::Quit => break,
-                        Key::Focus | Key::Escape => {
-                            mode = toggle_focus(mode, snapshot.agents.len())
-                        }
-                        Key::Up => {
-                            mode = Mode::AgentPanel {
-                                sel: move_selection(sel, panel_rows, false),
+                    Mode::AgentPanel { sel } => {
+                        match agent_panel_action(sel, &snapshot.agents, k) {
+                            PanelAction::Quit => break,
+                            PanelAction::LeaveFocus => {
+                                mode = toggle_focus(mode, snapshot.agents.len())
                             }
-                        }
-                        Key::Down => {
-                            mode = Mode::AgentPanel {
-                                sel: move_selection(sel, panel_rows, true),
-                            }
-                        }
-                        Key::Space => {
-                            // Toggle auto on an agent row (the +add row, at
-                            // index agents.len(), has no auto to toggle).
-                            if let Some(row) = snapshot.agents.get(sel) {
-                                let next = flip_auto(row.auto_mode);
-                                if let Ok(label) = clank_core::ids::AgentLabel::parse(&row.label) {
-                                    // Single source for the write (preserves
-                                    // wait_timeout). On success, flip the
-                                    // in-memory lamp for an immediate repaint;
-                                    // the config write also bumps the input
-                                    // signature, so the watcher Refresh
-                                    // reconciles to the same value.
-                                    if crate::agent_store::set_auto_mode(&repo, &label, next)
-                                        .is_ok()
+                            PanelAction::MoveCursor(s) => mode = Mode::AgentPanel { sel: s },
+                            PanelAction::ToggleAuto(i) => {
+                                if let Some(row) = snapshot.agents.get(i) {
+                                    let next = flip_auto(row.auto_mode);
+                                    if let Ok(label) =
+                                        clank_core::ids::AgentLabel::parse(&row.label)
                                     {
-                                        snapshot.agents[sel].auto_mode = next;
+                                        // Single source for the write
+                                        // (preserves wait_timeout). On
+                                        // success, flip the in-memory lamp
+                                        // for an immediate repaint; the
+                                        // config write also bumps the input
+                                        // signature, so the watcher Refresh
+                                        // reconciles to the same value.
+                                        if crate::agent_store::set_auto_mode(&repo, &label, next)
+                                            .is_ok()
+                                        {
+                                            snapshot.agents[i].auto_mode = next;
+                                        }
                                     }
                                 }
                             }
-                        }
-                        Key::Enter => {
-                            // Enter on the +add row opens the picker, read
-                            // FRESH from the library right now.
-                            if sel == snapshot.agents.len() {
+                            PanelAction::OpenPicker => {
+                                // Read the candidates FRESH right now.
                                 picker = crate::cli::status::available_agents(
                                     home.as_deref(),
                                     &snapshot.agents,
                                 );
                                 mode = Mode::AddPicker { sel: 0 };
                             }
-                        }
-                        Key::Delete => {
-                            // Remove the selected REVIEWER (master is never
-                            // removable here — use `clank agent promote`).
-                            if let Some(row) = snapshot.agents.get(sel)
-                                && matches!(row.role, clank_core::vocab::Role::Reviewer)
-                            {
+                            PanelAction::RequestRemove(i) => {
                                 mode = Mode::Confirm {
-                                    action: ConfirmAction::RemoveAgent { idx: sel },
+                                    action: ConfirmAction::RemoveAgent { idx: i },
                                 };
                             }
+                            PanelAction::MasterNotice => {
+                                notice = Some(
+                                    "master can't be removed here — use `clank agent promote`",
+                                );
+                            }
+                            PanelAction::None => {}
                         }
-                        Key::PageUp
-                        | Key::PageDown
-                        | Key::Top
-                        | Key::Bottom
-                        | Key::Yes
-                        | Key::No => {}
-                    },
+                    }
                     // Picker: choose a candidate to add.
                     Mode::AddPicker { sel } => match k {
                         Key::Quit => break,
@@ -2111,17 +2200,9 @@ pub(crate) async fn run_tui(
                         | Key::Yes
                         | Key::No => {}
                     },
-                    // Confirm: one decision. Enter follows the default, so a
-                    // remove (default No) is never confirmed by Enter.
+                    // Confirm: one decision, resolved in one place.
                     Mode::Confirm { action } => {
-                        let decision = match k {
-                            Key::Yes => Some(true),
-                            Key::No | Key::Escape => Some(false),
-                            Key::Enter => Some(action.default_yes()),
-                            Key::Quit => break,
-                            _ => None,
-                        };
-                        if let Some(go) = decision {
+                        if let Some(go) = confirm_decision(action, k) {
                             if go {
                                 apply_confirm(action, &repo, home.as_deref(), &snapshot, &picker);
                             }
@@ -2358,7 +2439,7 @@ pub(crate) mod tests {
         // Log-focused: roster listed with play/pause marks; the AGENTS
         // header reads dim+hollow (not focused) and there is no cursor on
         // an agent row.
-        let log = render_at(&s, 40, 80, 0, 0, Mode::LogScroll, &[])
+        let log = render_at(&s, 40, 80, 0, 0, &PanelView::just(Mode::LogScroll))
             .0
             .join("\n");
         assert!(log.contains("claude"), "master listed: {log}");
@@ -2374,9 +2455,16 @@ pub(crate) mod tests {
 
         // Agents-focused on the second row: the headers swap emphasis, a
         // cursor marks codex, and the focus rail appears.
-        let agents = render_at(&s, 40, 80, 0, 0, Mode::AgentPanel { sel: 1 }, &[])
-            .0
-            .join("\n");
+        let agents = render_at(
+            &s,
+            40,
+            80,
+            0,
+            0,
+            &PanelView::just(Mode::AgentPanel { sel: 1 }),
+        )
+        .0
+        .join("\n");
         assert!(
             agents.contains("◉ AGENTS"),
             "agents header filled when focused"
@@ -2402,14 +2490,28 @@ pub(crate) mod tests {
     #[test]
     fn agent_panel_renders_the_add_button_and_cursor() {
         let s = two_agent_snap();
-        let on_agent = render_at(&s, 40, 80, 0, 0, Mode::AgentPanel { sel: 0 }, &[])
-            .0
-            .join("\n");
+        let on_agent = render_at(
+            &s,
+            40,
+            80,
+            0,
+            0,
+            &PanelView::just(Mode::AgentPanel { sel: 0 }),
+        )
+        .0
+        .join("\n");
         assert!(on_agent.contains("+ add agent"), "add button present");
         // Cursor on the +add row (index == agents.len()).
-        let on_add = render_at(&s, 40, 80, 0, 0, Mode::AgentPanel { sel: 2 }, &[])
-            .0
-            .join("\n");
+        let on_add = render_at(
+            &s,
+            40,
+            80,
+            0,
+            0,
+            &PanelView::just(Mode::AgentPanel { sel: 2 }),
+        )
+        .0
+        .join("\n");
         assert!(
             on_add
                 .lines()
@@ -2431,9 +2533,20 @@ pub(crate) mod tests {
                 tool: "gemini".to_string(),
             },
         ];
-        let out = render_at(&s, 40, 80, 0, 0, Mode::AddPicker { sel: 0 }, &picker)
-            .0
-            .join("\n");
+        let out = render_at(
+            &s,
+            40,
+            80,
+            0,
+            0,
+            &PanelView {
+                mode: Mode::AddPicker { sel: 0 },
+                picker: &picker,
+                notice: None,
+            },
+        )
+        .0
+        .join("\n");
         assert!(out.contains("add agent"), "picker header");
         assert!(out.contains("ruthless"), "candidate listed");
         assert!(out.contains("gemini"), "candidate + its tool listed");
@@ -2443,9 +2556,16 @@ pub(crate) mod tests {
     #[test]
     fn add_picker_empty_state_points_at_global() {
         let s = two_agent_snap();
-        let out = render_at(&s, 40, 80, 0, 0, Mode::AddPicker { sel: 0 }, &[])
-            .0
-            .join("\n");
+        let out = render_at(
+            &s,
+            40,
+            80,
+            0,
+            0,
+            &PanelView::just(Mode::AddPicker { sel: 0 }),
+        )
+        .0
+        .join("\n");
         assert!(
             out.contains("none available") && out.contains("--global"),
             "empty picker points at `clank agent add --global`: {out}"
@@ -2462,10 +2582,9 @@ pub(crate) mod tests {
             80,
             0,
             0,
-            Mode::Confirm {
+            &PanelView::just(Mode::Confirm {
                 action: ConfirmAction::RemoveAgent { idx: 1 },
-            },
-            &[],
+            }),
         )
         .0
         .join("\n");
@@ -2491,10 +2610,13 @@ pub(crate) mod tests {
             80,
             0,
             0,
-            Mode::Confirm {
-                action: ConfirmAction::AddCandidate { idx: 0 },
+            &PanelView {
+                mode: Mode::Confirm {
+                    action: ConfirmAction::AddCandidate { idx: 0 },
+                },
+                picker: &picker,
+                notice: None,
             },
-            &picker,
         )
         .0
         .join("\n");
@@ -2502,6 +2624,91 @@ pub(crate) mod tests {
         assert!(
             add.contains("[Y]es") && add.contains("⏎ = yes"),
             "add default is Yes"
+        );
+    }
+
+    #[test]
+    fn agent_panel_action_routes_keys_by_row_and_role() {
+        use clank_core::vocab::{AutoMode, Role};
+        let agents = vec![
+            agent_row("claude", Role::Master, AutoMode::On),
+            agent_row("codex", Role::Reviewer, AutoMode::Off),
+        ];
+        // "+ add" row is index 2 (== agents.len()): Enter AND Space open
+        // the picker; DEL there is a no-op.
+        assert_eq!(
+            agent_panel_action(2, &agents, Key::Enter),
+            PanelAction::OpenPicker
+        );
+        assert_eq!(
+            agent_panel_action(2, &agents, Key::Space),
+            PanelAction::OpenPicker
+        );
+        assert_eq!(
+            agent_panel_action(2, &agents, Key::Delete),
+            PanelAction::None
+        );
+        // Agent rows: Space toggles auto; Enter is a no-op.
+        assert_eq!(
+            agent_panel_action(1, &agents, Key::Space),
+            PanelAction::ToggleAuto(1)
+        );
+        assert_eq!(
+            agent_panel_action(1, &agents, Key::Enter),
+            PanelAction::None
+        );
+        // DEL: a reviewer asks to confirm-remove; the master shows a notice.
+        assert_eq!(
+            agent_panel_action(1, &agents, Key::Delete),
+            PanelAction::RequestRemove(1)
+        );
+        assert_eq!(
+            agent_panel_action(0, &agents, Key::Delete),
+            PanelAction::MasterNotice
+        );
+        // Navigation clamps at the +add row; Tab/Esc leave; q quits.
+        assert_eq!(
+            agent_panel_action(0, &agents, Key::Down),
+            PanelAction::MoveCursor(1)
+        );
+        assert_eq!(
+            agent_panel_action(2, &agents, Key::Down),
+            PanelAction::MoveCursor(2)
+        );
+        assert_eq!(
+            agent_panel_action(1, &agents, Key::Focus),
+            PanelAction::LeaveFocus
+        );
+        assert_eq!(agent_panel_action(1, &agents, Key::Quit), PanelAction::Quit);
+    }
+
+    #[test]
+    fn confirm_decision_q_cancels_and_enter_follows_default() {
+        let rm = ConfirmAction::RemoveAgent { idx: 0 };
+        let add = ConfirmAction::AddCandidate { idx: 0 };
+        // In a confirm, q CANCELS — it must not quit the TUI.
+        assert_eq!(confirm_decision(rm, Key::Quit), Some(false));
+        assert_eq!(confirm_decision(rm, Key::Escape), Some(false));
+        assert_eq!(confirm_decision(rm, Key::No), Some(false));
+        assert_eq!(confirm_decision(rm, Key::Yes), Some(true));
+        // Enter follows the default: remove cancels, add confirms.
+        assert_eq!(confirm_decision(rm, Key::Enter), Some(false));
+        assert_eq!(confirm_decision(add, Key::Enter), Some(true));
+        assert_eq!(confirm_decision(rm, Key::Up), None);
+    }
+
+    #[test]
+    fn master_delete_notice_renders() {
+        let s = two_agent_snap();
+        let view = PanelView {
+            mode: Mode::AgentPanel { sel: 0 },
+            picker: &[],
+            notice: Some("master can't be removed here — use `clank agent promote`"),
+        };
+        let out = render_at(&s, 40, 80, 0, 0, &view).0.join("\n");
+        assert!(
+            out.contains("clank agent promote"),
+            "master notice rendered: {out}"
         );
     }
 
@@ -3615,14 +3822,14 @@ terminal_3  terminal  ruthless (reviewer)
             answer: None,
         }];
         // Narrow + short so the ask wraps to many lines and overflows.
-        let top = render_at(&s, 8, 24, 0, 0, Mode::LogScroll, &[])
+        let top = render_at(&s, 8, 24, 0, 0, &PanelView::just(Mode::LogScroll))
             .0
             .join("\n");
         assert!(top.contains("AAAA"), "ask head visible at offset 0: {top}");
         assert!(!top.contains("LAST"), "ask tail off-screen at offset 0");
         // Scrolling down reveals the tail.
         let revealed = (1..30).any(|off| {
-            render_at(&s, 8, 24, off, 0, Mode::LogScroll, &[])
+            render_at(&s, 8, 24, off, 0, &PanelView::just(Mode::LogScroll))
                 .0
                 .join("\n")
                 .contains("LAST")
@@ -3705,14 +3912,14 @@ mod log_tier_tests {
         ];
         let s = snap_with_log(&subs);
         // Tall pane: capacity covers the whole log; newest shown at top.
-        let (lines, cap) = render_at(&s, 40, 80, 0, 0, Mode::LogScroll, &[]);
+        let (lines, cap) = render_at(&s, 40, 80, 0, 0, &PanelView::just(Mode::LogScroll));
         assert!(cap >= subs.len(), "viewport capacity reported");
         assert!(
             lines.join("\n").contains("row-aa"),
             "newest at top, offset 0"
         );
         // Scrolled down: the newest rows leave the window, older ones enter.
-        let body = render_at(&s, 40, 80, 3, 0, Mode::LogScroll, &[])
+        let body = render_at(&s, 40, 80, 3, 0, &PanelView::just(Mode::LogScroll))
             .0
             .join("\n");
         assert!(
