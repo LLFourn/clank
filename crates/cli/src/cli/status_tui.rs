@@ -189,6 +189,7 @@ pub(crate) fn render_at(
     offset: usize,
     frame: usize,
     mode: Mode,
+    picker: &[crate::cli::status::AvailableAgent],
 ) -> (Vec<String>, usize) {
     let rows = rows.max(1) as usize;
     let cols = cols.max(1) as usize;
@@ -354,6 +355,86 @@ pub(crate) fn render_at(
                 dim(format!("  {role}")),
             ]);
         }
+        // "+ add" button — the last selectable row (cursor index
+        // `agents.len()`). Reads as a button: dim until the cursor lands
+        // on it, then accent.
+        let add_selected = mode.selected() == Some(snap.agents.len());
+        body.push(vec![
+            rail(agents_focused),
+            plain(if add_selected { "▸ " } else { "  " }.to_string()),
+            Span(
+                if add_selected {
+                    Style::Accent
+                } else {
+                    Style::Dim
+                },
+                "+ add agent".to_string(),
+            ),
+        ]);
+
+        // AddPicker overlay — the freshly-read candidate list.
+        if let Mode::AddPicker { sel } = mode {
+            body.push(vec![
+                rail(true),
+                Span(Style::Highlight, "  add agent".to_string()),
+                dim("  ⏎ choose · Esc cancel".to_string()),
+            ]);
+            if picker.is_empty() {
+                body.push(vec![
+                    rail(true),
+                    dim("  none available — clank agent add --global".to_string()),
+                ]);
+            } else {
+                for (i, c) in picker.iter().enumerate() {
+                    let selected = sel == i;
+                    body.push(vec![
+                        rail(true),
+                        plain(if selected { "▸ " } else { "  " }.to_string()),
+                        Span(
+                            if selected {
+                                Style::Accent
+                            } else {
+                                Style::Plain
+                            },
+                            c.label.clone(),
+                        ),
+                        dim(format!("  {}", c.tool)),
+                    ]);
+                }
+            }
+        }
+
+        // Confirm modal — names the action, the committed-config
+        // consequence, and which key is the (safe) default.
+        if let Mode::Confirm { action } = mode {
+            let (verb, who) = match action {
+                ConfirmAction::AddCandidate { idx } => (
+                    "add reviewer",
+                    picker.get(idx).map(|c| c.label.as_str()).unwrap_or("?"),
+                ),
+                ConfirmAction::RemoveAgent { idx } => (
+                    "remove reviewer",
+                    snap.agents
+                        .get(idx)
+                        .map(|a| a.label.as_str())
+                        .unwrap_or("?"),
+                ),
+            };
+            let keys = if action.default_yes() {
+                "[Y]es  [n]o  (⏎ = yes)"
+            } else {
+                "[y]es  [N]o  (⏎ = no)"
+            };
+            body.push(vec![
+                rail(true),
+                Span(Style::Highlight, format!("confirm: {verb} “{who}”")),
+            ]);
+            body.push(vec![
+                rail(true),
+                dim("edits the committed team config · ".to_string()),
+                Span(Style::Accent, keys.to_string()),
+            ]);
+        }
     }
 
     // Greedy fit: bar (+breath) then body lines until rows run out.
@@ -452,7 +533,7 @@ pub(crate) fn render_at(
 /// tests exercise. Test-only; the live loop calls [`render_at`] directly.
 #[cfg(test)]
 fn render(snap: &StatusSnapshot, rows: u16, cols: u16) -> Vec<String> {
-    render_at(snap, rows, cols, 0, 0, Mode::LogScroll).0
+    render_at(snap, rows, cols, 0, 0, Mode::LogScroll, &[]).0
 }
 
 /// Widest verdict mark in display columns: `✓✓` (Finished) is 2,
@@ -1300,37 +1381,79 @@ enum Key {
     /// Tab / `a` — move keyboard focus between the log and the agent
     /// panel.
     Focus,
-    /// Esc — leave the agent panel (back to log scroll).
+    /// Esc — back out one level (leave the panel / cancel a picker or
+    /// confirm).
     Escape,
+    /// Enter — activate the row under the cursor (open the picker on
+    /// "+ add", choose a candidate) or, in a confirm, follow the
+    /// default.
+    Enter,
+    /// Backspace / DEL — remove the selected reviewer.
+    Delete,
+    /// `y` — confirm.
+    Yes,
+    /// `n` — decline.
+    No,
 }
 
-/// Which region owns the keyboard. The backbone of key routing: each
-/// key is interpreted in exactly ONE place per mode, so an unbound key
-/// does nothing and a key can't mean two things at once. Plan
-/// tui-agents-panel-manage M2 adds `AddPicker`/`Confirm` variants on
-/// top of this; M1 ships the two-state machine that replaces the old
-/// `focus: Option<usize>` flag.
+/// Which region (and sub-state) owns the keyboard. The backbone of key
+/// routing: each key is interpreted in exactly ONE place per mode, so
+/// an unbound key does nothing and a key can't mean two things at once.
+/// `Confirm` as its own mode is what makes "Enter silently confirms a
+/// destructive default" unwritable — Enter is resolved in one place.
+///
+/// `Copy` is preserved by storing INDICES (into `snapshot.agents` /
+/// the freshly-read picker list), never owned labels; the label is
+/// resolved at action time. A data-changing Refresh resets the picker/
+/// confirm modes (see the Refresh arm) so an index can't act on a
+/// reordered target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Mode {
     /// Default: keys scroll the log.
     LogScroll,
-    /// The agent panel owns the keys; `sel` is the cursor row (an
-    /// index into `snapshot.agents`).
+    /// The agent panel owns the keys; `sel` is the cursor row. Rows are
+    /// `agents` followed by the "+ add" row at index `agents.len()`.
     AgentPanel { sel: usize },
+    /// Choosing a library agent to add; `sel` indexes the freshly-read
+    /// candidate list the loop holds.
+    AddPicker { sel: usize },
+    /// A mutating decision is pending; the action carries the target by
+    /// index.
+    Confirm { action: ConfirmAction },
+}
+
+/// A pending roster mutation, by index (keeps [`Mode`] `Copy`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConfirmAction {
+    /// Add the candidate at this index in the loop's picker list.
+    AddCandidate { idx: usize },
+    /// Remove the agent at this index in `snapshot.agents`.
+    RemoveAgent { idx: usize },
+}
+
+impl ConfirmAction {
+    /// Add defaults to Yes (non-destructive); remove defaults to No —
+    /// so Enter (which follows the default) never confirms a removal.
+    fn default_yes(self) -> bool {
+        matches!(self, ConfirmAction::AddCandidate { .. })
+    }
 }
 
 impl Mode {
+    /// True for every agent-region sub-state (panel, picker, confirm) —
+    /// the log is the only non-agents mode. Drives the focus rail/header.
     fn agents_focused(self) -> bool {
-        matches!(self, Mode::AgentPanel { .. })
+        !matches!(self, Mode::LogScroll)
     }
     fn log_focused(self) -> bool {
         matches!(self, Mode::LogScroll)
     }
-    /// The cursor row when the agent panel is focused, else `None`.
+    /// The agent-panel cursor row, else `None` (picker/confirm/log have
+    /// no agent-row cursor).
     fn selected(self) -> Option<usize> {
         match self {
             Mode::AgentPanel { sel } => Some(sel),
-            Mode::LogScroll => None,
+            _ => None,
         }
     }
 }
@@ -1372,6 +1495,10 @@ fn parse_keys(bytes: &[u8]) -> Vec<Key> {
                 b' ' => keys.push(Key::Space),
                 b'b' => keys.push(Key::PageUp),
                 b'\t' | b'a' => keys.push(Key::Focus),
+                b'\r' | b'\n' => keys.push(Key::Enter),
+                0x7f | 0x08 => keys.push(Key::Delete),
+                b'y' => keys.push(Key::Yes),
+                b'n' => keys.push(Key::No),
                 0x1b => keys.push(Key::Escape),
                 b'q' => keys.push(Key::Quit),
                 _ => {}
@@ -1392,13 +1519,53 @@ fn flip_auto(mode: clank_core::vocab::AutoMode) -> clank_core::vocab::AutoMode {
 }
 
 /// The Tab/focus-key transition: from the log, enter the panel at row
-/// 0 (only if there's a roster to enter); from the panel, return to the
-/// log. The single focus-toggle rule, shared by both handler arms.
+/// 0 (only if there's a roster to enter); from any agent-region mode,
+/// return to the log. The single focus-toggle rule, shared by every
+/// handler arm.
 fn toggle_focus(mode: Mode, agents_len: usize) -> Mode {
     match mode {
         Mode::LogScroll if agents_len > 0 => Mode::AgentPanel { sel: 0 },
         Mode::LogScroll => Mode::LogScroll,
-        Mode::AgentPanel { .. } => Mode::LogScroll,
+        _ => Mode::LogScroll,
+    }
+}
+
+/// Execute a confirmed roster mutation via the existing `clank agent`
+/// cores — the TUI is a FRONT-END to add/remove, never a second write
+/// path. The target label is resolved from the snapshot/picker by the
+/// action's index at apply time. Adds go in as a commit reviewer
+/// (parity with `clank agent add`). Best-effort: a failed core leaves
+/// the roster unchanged (the panel just won't move); surfacing modal
+/// errors is out of scope. The mutated `.clank/config.json` is tracked,
+/// so this dirties the tree — the deliberate, committed-config change
+/// the confirm modal warned about.
+fn apply_confirm(
+    action: ConfirmAction,
+    repo: &std::path::Path,
+    home: Option<&std::path::Path>,
+    snap: &StatusSnapshot,
+    picker: &[crate::cli::status::AvailableAgent],
+) {
+    match action {
+        ConfirmAction::AddCandidate { idx } => {
+            if let Some(c) = picker.get(idx)
+                && let Ok(label) = clank_core::ids::AgentLabel::parse(&c.label)
+            {
+                let _ = crate::cli::agent::add_repo_roster_agent_by_name(
+                    repo,
+                    home,
+                    &label,
+                    crate::cli::teams_config::RosterRole::Commit,
+                );
+            }
+        }
+        ConfirmAction::RemoveAgent { idx } => {
+            if let Some(a) = snap.agents.get(idx)
+                && let Ok(label) = clank_core::ids::AgentLabel::parse(&a.label)
+            {
+                let _ = crate::cli::agent::remove_repo_agent(repo, &label);
+            }
+        }
     }
 }
 
@@ -1771,6 +1938,11 @@ pub(crate) async fn run_tui(
     // Which region owns the keyboard. Starts on the log; Tab moves it to
     // the agent panel. The single source of key-routing truth.
     let mut mode = Mode::LogScroll;
+    // The "+ add" candidate list — read FRESH from the global library
+    // the moment the picker opens (never cached, so a `clank agent add
+    // --global` elsewhere shows up at once), referenced by index while
+    // AddPicker/Confirm(Add) is active, cleared when the picker closes.
+    let mut picker: Vec<crate::cli::status::AvailableAgent> = Vec::new();
     // Spinner animation frame. The ONLY state an animation tick mutates.
     let mut frame: usize = 0;
     // Whether this iteration may do IO to top up the log. Set ONLY by
@@ -1781,7 +1953,7 @@ pub(crate) async fn run_tui(
     let mut needs_fill = true;
     loop {
         let (rows, cols) = term_size();
-        let capacity = render_at(&snapshot, rows, cols, offset, frame, mode).1;
+        let capacity = render_at(&snapshot, rows, cols, offset, frame, mode, &picker).1;
 
         // The ask + in-progress rows depend on blocks/waiting_on (not the
         // log fetch), so compute them before filling. `head` is the count
@@ -1809,7 +1981,7 @@ pub(crate) async fn run_tui(
         // Max offset pins the last row at the BOTTOM of the viewport.
         let max_off = total.saturating_sub(capacity.max(1));
         offset = offset.min(max_off);
-        paint(&render_at(&snapshot, rows, cols, offset, frame, mode).0);
+        paint(&render_at(&snapshot, rows, cols, offset, frame, mode, &picker).0);
 
         // The in-progress rows now sit at SCATTERED indices (master after
         // the plan header; reviews in the latest commit's review block), so
@@ -1834,9 +2006,11 @@ pub(crate) async fn run_tui(
                 // `mode` is Copy: matching it copies, so reassigning `mode`
                 // inside an arm is free of borrow conflicts. Each key is
                 // resolved in exactly one arm per mode.
+                // The "+ add" row sits at index `agents.len()`, so the
+                // panel cursor ranges over `agents.len() + 1` rows.
+                let panel_rows = snapshot.agents.len() + 1;
                 match mode {
-                    // Agent panel focused: keys drive the cursor + toggle,
-                    // not the log scroll.
+                    // Agent panel: cursor + per-row actions, not log scroll.
                     Mode::AgentPanel { sel } => match k {
                         Key::Quit => break,
                         Key::Focus | Key::Escape => {
@@ -1844,15 +2018,17 @@ pub(crate) async fn run_tui(
                         }
                         Key::Up => {
                             mode = Mode::AgentPanel {
-                                sel: move_selection(sel, snapshot.agents.len(), false),
+                                sel: move_selection(sel, panel_rows, false),
                             }
                         }
                         Key::Down => {
                             mode = Mode::AgentPanel {
-                                sel: move_selection(sel, snapshot.agents.len(), true),
+                                sel: move_selection(sel, panel_rows, true),
                             }
                         }
                         Key::Space => {
+                            // Toggle auto on an agent row (the +add row, at
+                            // index agents.len(), has no auto to toggle).
                             if let Some(row) = snapshot.agents.get(sel) {
                                 let next = flip_auto(row.auto_mode);
                                 if let Ok(label) = clank_core::ids::AgentLabel::parse(&row.label) {
@@ -1870,20 +2046,106 @@ pub(crate) async fn run_tui(
                                 }
                             }
                         }
-                        // Paging keys are inert while the panel is focused.
-                        Key::PageUp | Key::PageDown | Key::Top | Key::Bottom => {}
+                        Key::Enter => {
+                            // Enter on the +add row opens the picker, read
+                            // FRESH from the library right now.
+                            if sel == snapshot.agents.len() {
+                                picker = crate::cli::status::available_agents(
+                                    home.as_deref(),
+                                    &snapshot.agents,
+                                );
+                                mode = Mode::AddPicker { sel: 0 };
+                            }
+                        }
+                        Key::Delete => {
+                            // Remove the selected REVIEWER (master is never
+                            // removable here — use `clank agent promote`).
+                            if let Some(row) = snapshot.agents.get(sel)
+                                && matches!(row.role, clank_core::vocab::Role::Reviewer)
+                            {
+                                mode = Mode::Confirm {
+                                    action: ConfirmAction::RemoveAgent { idx: sel },
+                                };
+                            }
+                        }
+                        Key::PageUp
+                        | Key::PageDown
+                        | Key::Top
+                        | Key::Bottom
+                        | Key::Yes
+                        | Key::No => {}
                     },
+                    // Picker: choose a candidate to add.
+                    Mode::AddPicker { sel } => match k {
+                        Key::Quit => break,
+                        // Esc/Tab close the picker back onto the +add row.
+                        Key::Escape | Key::Focus => {
+                            picker.clear();
+                            mode = Mode::AgentPanel {
+                                sel: snapshot.agents.len(),
+                            };
+                        }
+                        Key::Up => {
+                            mode = Mode::AddPicker {
+                                sel: move_selection(sel, picker.len(), false),
+                            }
+                        }
+                        Key::Down => {
+                            mode = Mode::AddPicker {
+                                sel: move_selection(sel, picker.len(), true),
+                            }
+                        }
+                        Key::Enter => {
+                            if sel < picker.len() {
+                                mode = Mode::Confirm {
+                                    action: ConfirmAction::AddCandidate { idx: sel },
+                                };
+                            }
+                        }
+                        Key::Space
+                        | Key::PageUp
+                        | Key::PageDown
+                        | Key::Top
+                        | Key::Bottom
+                        | Key::Delete
+                        | Key::Yes
+                        | Key::No => {}
+                    },
+                    // Confirm: one decision. Enter follows the default, so a
+                    // remove (default No) is never confirmed by Enter.
+                    Mode::Confirm { action } => {
+                        let decision = match k {
+                            Key::Yes => Some(true),
+                            Key::No | Key::Escape => Some(false),
+                            Key::Enter => Some(action.default_yes()),
+                            Key::Quit => break,
+                            _ => None,
+                        };
+                        if let Some(go) = decision {
+                            if go {
+                                apply_confirm(action, &repo, home.as_deref(), &snapshot, &picker);
+                            }
+                            picker.clear();
+                            // Back to the panel (on the +add row); the
+                            // config write (if any) triggers a Refresh that
+                            // rebuilds the roster, and its clamp re-bounds
+                            // this cursor if the roster shrank.
+                            mode = Mode::AgentPanel {
+                                sel: snapshot.agents.len(),
+                            };
+                        }
+                    }
                     // Default: keys scroll the log.
                     Mode::LogScroll => match k {
                         Key::Quit => break,
                         Key::Focus => mode = toggle_focus(mode, snapshot.agents.len()),
-                        Key::Escape => {}
                         Key::Up => offset = offset.saturating_sub(1),
                         Key::Down => offset += 1,
                         Key::PageUp => offset = offset.saturating_sub(page),
                         Key::Space | Key::PageDown => offset += page,
                         Key::Top => offset = 0,
                         Key::Bottom => offset = max_off,
+                        Key::Escape | Key::Enter | Key::Delete | Key::Yes | Key::No => {}
                     },
                 }
                 needs_fill = true;
@@ -1910,14 +2172,22 @@ pub(crate) async fn run_tui(
                     last_sig = sig;
                     log_complete = false;
                     needs_fill = true;
-                    // Keep the panel cursor in range if the roster changed
-                    // (or vanished) under us.
+                    // The data changed under us, so any in-flight picker/
+                    // confirm (which reference now-possibly-stale indices)
+                    // is cancelled back to the panel, and the panel cursor
+                    // is re-bounded to the new row count (agents + the +add
+                    // row). An empty roster drops focus to the log.
+                    picker.clear();
                     mode = match mode {
-                        Mode::AgentPanel { .. } if snapshot.agents.is_empty() => Mode::LogScroll,
-                        Mode::AgentPanel { sel } => Mode::AgentPanel {
-                            sel: sel.min(snapshot.agents.len() - 1),
-                        },
                         Mode::LogScroll => Mode::LogScroll,
+                        _ if snapshot.agents.is_empty() => Mode::LogScroll,
+                        Mode::AgentPanel { sel } => Mode::AgentPanel {
+                            sel: sel.min(snapshot.agents.len()),
+                        },
+                        // Cancel a picker/confirm onto the +add row.
+                        Mode::AddPicker { .. } | Mode::Confirm { .. } => Mode::AgentPanel {
+                            sel: snapshot.agents.len(),
+                        },
                     };
                     if let Some(tab) = tab.as_mut() {
                         tab.update(&bar_emoji(&snapshot));
@@ -1978,7 +2248,7 @@ pub(crate) mod tests {
             .map(std::mem::discriminant)
             .collect();
         assert_eq!(csi, want_csi, "arrows + page keys");
-        assert!(parse_keys(b"xyz").is_empty(), "unmapped bytes are ignored");
+        assert!(parse_keys(b"xz.").is_empty(), "unmapped bytes are ignored");
     }
 
     #[test]
@@ -2018,9 +2288,19 @@ pub(crate) mod tests {
             Mode::AgentPanel { sel: 0 }
         );
         assert_eq!(toggle_focus(Mode::LogScroll, 0), Mode::LogScroll);
-        // From the panel: always back to the log.
+        // From any agent-region mode (panel, picker, confirm): back to log.
         assert_eq!(
             toggle_focus(Mode::AgentPanel { sel: 1 }, 2),
+            Mode::LogScroll
+        );
+        assert_eq!(toggle_focus(Mode::AddPicker { sel: 0 }, 2), Mode::LogScroll);
+        assert_eq!(
+            toggle_focus(
+                Mode::Confirm {
+                    action: ConfirmAction::RemoveAgent { idx: 0 }
+                },
+                2
+            ),
             Mode::LogScroll
         );
     }
@@ -2078,7 +2358,9 @@ pub(crate) mod tests {
         // Log-focused: roster listed with play/pause marks; the AGENTS
         // header reads dim+hollow (not focused) and there is no cursor on
         // an agent row.
-        let log = render_at(&s, 40, 80, 0, 0, Mode::LogScroll).0.join("\n");
+        let log = render_at(&s, 40, 80, 0, 0, Mode::LogScroll, &[])
+            .0
+            .join("\n");
         assert!(log.contains("claude"), "master listed: {log}");
         assert!(log.contains("codex"), "reviewer listed");
         assert!(log.contains('▶'), "play mark (auto on) drawn");
@@ -2092,7 +2374,7 @@ pub(crate) mod tests {
 
         // Agents-focused on the second row: the headers swap emphasis, a
         // cursor marks codex, and the focus rail appears.
-        let agents = render_at(&s, 40, 80, 0, 0, Mode::AgentPanel { sel: 1 })
+        let agents = render_at(&s, 40, 80, 0, 0, Mode::AgentPanel { sel: 1 }, &[])
             .0
             .join("\n");
         assert!(
@@ -2104,6 +2386,196 @@ pub(crate) mod tests {
         assert!(
             agents.contains('▌'),
             "focus rail drawn on the active region"
+        );
+    }
+
+    fn two_agent_snap() -> StatusSnapshot {
+        use clank_core::vocab::{AutoMode, Role};
+        let mut s = snap(vec![], vec![]);
+        s.agents = vec![
+            agent_row("claude", Role::Master, AutoMode::On),
+            agent_row("codex", Role::Reviewer, AutoMode::Off),
+        ];
+        s
+    }
+
+    #[test]
+    fn agent_panel_renders_the_add_button_and_cursor() {
+        let s = two_agent_snap();
+        let on_agent = render_at(&s, 40, 80, 0, 0, Mode::AgentPanel { sel: 0 }, &[])
+            .0
+            .join("\n");
+        assert!(on_agent.contains("+ add agent"), "add button present");
+        // Cursor on the +add row (index == agents.len()).
+        let on_add = render_at(&s, 40, 80, 0, 0, Mode::AgentPanel { sel: 2 }, &[])
+            .0
+            .join("\n");
+        assert!(
+            on_add
+                .lines()
+                .any(|l| l.contains("+ add agent") && l.contains('▸')),
+            "cursor on the add button: {on_add}"
+        );
+    }
+
+    #[test]
+    fn add_picker_lists_candidates_with_tools() {
+        let s = two_agent_snap();
+        let picker = vec![
+            crate::cli::status::AvailableAgent {
+                label: "ruthless".to_string(),
+                tool: "claude".to_string(),
+            },
+            crate::cli::status::AvailableAgent {
+                label: "gemini".to_string(),
+                tool: "gemini".to_string(),
+            },
+        ];
+        let out = render_at(&s, 40, 80, 0, 0, Mode::AddPicker { sel: 0 }, &picker)
+            .0
+            .join("\n");
+        assert!(out.contains("add agent"), "picker header");
+        assert!(out.contains("ruthless"), "candidate listed");
+        assert!(out.contains("gemini"), "candidate + its tool listed");
+        assert!(out.contains("Esc cancel"), "picker hint");
+    }
+
+    #[test]
+    fn add_picker_empty_state_points_at_global() {
+        let s = two_agent_snap();
+        let out = render_at(&s, 40, 80, 0, 0, Mode::AddPicker { sel: 0 }, &[])
+            .0
+            .join("\n");
+        assert!(
+            out.contains("none available") && out.contains("--global"),
+            "empty picker points at `clank agent add --global`: {out}"
+        );
+    }
+
+    #[test]
+    fn confirm_modal_names_action_consequence_and_default() {
+        let s = two_agent_snap();
+        // Remove: default No, Enter cancels.
+        let rm = render_at(
+            &s,
+            40,
+            80,
+            0,
+            0,
+            Mode::Confirm {
+                action: ConfirmAction::RemoveAgent { idx: 1 },
+            },
+            &[],
+        )
+        .0
+        .join("\n");
+        assert!(rm.contains("remove reviewer"), "names the action");
+        assert!(rm.contains("codex"), "names the target");
+        assert!(
+            rm.contains("committed team config"),
+            "names the consequence"
+        );
+        assert!(
+            rm.contains("[N]o") && rm.contains("⏎ = no"),
+            "remove default is No"
+        );
+
+        // Add: default Yes.
+        let picker = vec![crate::cli::status::AvailableAgent {
+            label: "ruthless".to_string(),
+            tool: "claude".to_string(),
+        }];
+        let add = render_at(
+            &s,
+            40,
+            80,
+            0,
+            0,
+            Mode::Confirm {
+                action: ConfirmAction::AddCandidate { idx: 0 },
+            },
+            &picker,
+        )
+        .0
+        .join("\n");
+        assert!(add.contains("add reviewer") && add.contains("ruthless"));
+        assert!(
+            add.contains("[Y]es") && add.contains("⏎ = yes"),
+            "add default is Yes"
+        );
+    }
+
+    #[test]
+    fn confirm_action_default_is_safe_for_remove() {
+        assert!(
+            !ConfirmAction::RemoveAgent { idx: 0 }.default_yes(),
+            "a destructive remove defaults to No"
+        );
+        assert!(
+            ConfirmAction::AddCandidate { idx: 0 }.default_yes(),
+            "a non-destructive add defaults to Yes"
+        );
+    }
+
+    #[test]
+    fn apply_confirm_remove_drops_the_reviewer_via_the_core() {
+        let repo = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(repo.path().join(".clank")).unwrap();
+        std::fs::write(
+            repo.path().join(".clank/config.json"),
+            r#"{"agents":{"claude":{"tool":"claude","role":"master"},"codex":{"tool":"codex","role":"commit"}}}"#,
+        )
+        .unwrap();
+        let s = two_agent_snap();
+        // idx 1 == codex (the reviewer).
+        apply_confirm(
+            ConfirmAction::RemoveAgent { idx: 1 },
+            repo.path(),
+            None,
+            &s,
+            &[],
+        );
+        let cfg = std::fs::read_to_string(repo.path().join(".clank/config.json")).unwrap();
+        assert!(
+            !cfg.contains("codex"),
+            "reviewer removed from the committed roster via the core: {cfg}"
+        );
+        assert!(cfg.contains("claude"), "master untouched");
+    }
+
+    #[test]
+    fn apply_confirm_add_inserts_from_the_library_via_the_core() {
+        let repo = tempfile::TempDir::new().unwrap();
+        let home = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(repo.path().join(".clank")).unwrap();
+        std::fs::write(
+            repo.path().join(".clank/config.json"),
+            r#"{"agents":{"claude":{"tool":"claude","role":"master"}}}"#,
+        )
+        .unwrap();
+        // The global library holds `ruthless` to add by name.
+        std::fs::create_dir_all(home.path().join(".clank")).unwrap();
+        std::fs::write(
+            home.path().join(".clank/config.json"),
+            r#"{"agents":{"ruthless":{"tool":"claude"}},"teams":{}}"#,
+        )
+        .unwrap();
+        let s = two_agent_snap();
+        let picker = vec![crate::cli::status::AvailableAgent {
+            label: "ruthless".to_string(),
+            tool: "claude".to_string(),
+        }];
+        apply_confirm(
+            ConfirmAction::AddCandidate { idx: 0 },
+            repo.path(),
+            Some(home.path()),
+            &s,
+            &picker,
+        );
+        let cfg = std::fs::read_to_string(repo.path().join(".clank/config.json")).unwrap();
+        assert!(
+            cfg.contains("ruthless"),
+            "candidate added to the committed roster via the core: {cfg}"
         );
     }
 
@@ -3143,12 +3615,14 @@ terminal_3  terminal  ruthless (reviewer)
             answer: None,
         }];
         // Narrow + short so the ask wraps to many lines and overflows.
-        let top = render_at(&s, 8, 24, 0, 0, Mode::LogScroll).0.join("\n");
+        let top = render_at(&s, 8, 24, 0, 0, Mode::LogScroll, &[])
+            .0
+            .join("\n");
         assert!(top.contains("AAAA"), "ask head visible at offset 0: {top}");
         assert!(!top.contains("LAST"), "ask tail off-screen at offset 0");
         // Scrolling down reveals the tail.
         let revealed = (1..30).any(|off| {
-            render_at(&s, 8, 24, off, 0, Mode::LogScroll)
+            render_at(&s, 8, 24, off, 0, Mode::LogScroll, &[])
                 .0
                 .join("\n")
                 .contains("LAST")
@@ -3231,14 +3705,16 @@ mod log_tier_tests {
         ];
         let s = snap_with_log(&subs);
         // Tall pane: capacity covers the whole log; newest shown at top.
-        let (lines, cap) = render_at(&s, 40, 80, 0, 0, Mode::LogScroll);
+        let (lines, cap) = render_at(&s, 40, 80, 0, 0, Mode::LogScroll, &[]);
         assert!(cap >= subs.len(), "viewport capacity reported");
         assert!(
             lines.join("\n").contains("row-aa"),
             "newest at top, offset 0"
         );
         // Scrolled down: the newest rows leave the window, older ones enter.
-        let body = render_at(&s, 40, 80, 3, 0, Mode::LogScroll).0.join("\n");
+        let body = render_at(&s, 40, 80, 3, 0, Mode::LogScroll, &[])
+            .0
+            .join("\n");
         assert!(
             !body.contains("row-aa"),
             "offset 3 scrolled past the newest"

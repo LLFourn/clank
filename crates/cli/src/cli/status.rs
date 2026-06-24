@@ -85,6 +85,16 @@ pub(crate) struct AgentAutoRow {
     pub(crate) auto_mode: clank_core::vocab::AutoMode,
 }
 
+/// A global-library agent that is NOT yet on this repo's roster — a
+/// candidate the `--tui` "+ add" picker can add as a reviewer. `tool`
+/// is shown so you know what you're adding. Read FRESH from the
+/// `~/.clank` library when the picker opens (not cached in the
+/// snapshot), so it can't go stale. Plan: tui-agents-panel-manage.
+pub(crate) struct AvailableAgent {
+    pub(crate) label: String,
+    pub(crate) tool: String,
+}
+
 /// Build the roster's auto-mode rows: master first, then reviewers in
 /// tier order, deduped (an agent in both tiers — or matching master —
 /// appears once). Each row's auto-mode is the EFFECTIVE mode (the
@@ -119,6 +129,34 @@ fn roster_auto_rows(
         });
     }
     rows
+}
+
+/// Global-library agents (`~/.clank` `agents`) not already on `roster`
+/// — the "+ add" candidates, each with its tool. Read FRESH from the
+/// library by the `--tui` loop when the picker opens (never cached), so
+/// a `clank agent add --global` made elsewhere shows up immediately.
+/// Empty without a resolvable home or library (read-only degrade; the
+/// picker then shows its empty-state hint).
+pub(crate) fn available_agents(
+    home: Option<&Path>,
+    roster: &[AgentAutoRow],
+) -> Vec<AvailableAgent> {
+    let Some(home) = home else {
+        return Vec::new();
+    };
+    let Ok(cfg) = crate::cli::team::read_user_config(home) else {
+        return Vec::new();
+    };
+    let on_roster: std::collections::HashSet<&str> =
+        roster.iter().map(|a| a.label.as_str()).collect();
+    cfg.agents
+        .iter()
+        .filter(|(label, _)| !on_roster.contains(label.as_str()))
+        .map(|(label, desc)| AvailableAgent {
+            label: label.as_str().to_string(),
+            tool: desc.tool.as_str().to_string(),
+        })
+        .collect()
 }
 
 /// One shelved plan as the renderers see it.
@@ -1564,6 +1602,38 @@ mod dirty_and_wake_tests {
             before, after,
             "an agent config.json write must flip the fingerprint (toggle repaint)"
         );
+    }
+
+    #[test]
+    fn available_agents_is_library_minus_roster() {
+        use clank_core::vocab::{AutoMode, Role};
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".clank")).unwrap();
+        // Global library declares three agents (tool ∈ {claude, codex}).
+        std::fs::write(
+            home.path().join(".clank/config.json"),
+            r#"{"agents":{"codex":{"tool":"codex"},"ruthless":{"tool":"claude"},"scout":{"tool":"codex"}},"teams":{}}"#,
+        )
+        .unwrap();
+        // codex is already on the roster, so it's NOT a candidate.
+        let roster = vec![AgentAutoRow {
+            label: "codex".to_string(),
+            role: Role::Reviewer,
+            auto_mode: AutoMode::Off,
+        }];
+        let avail = available_agents(Some(home.path()), &roster);
+        let labels: Vec<&str> = avail.iter().map(|a| a.label.as_str()).collect();
+        assert!(labels.contains(&"ruthless"), "library agent offered");
+        assert!(labels.contains(&"scout"), "library agent offered");
+        assert!(!labels.contains(&"codex"), "on-roster agent excluded");
+        // Tool travels with the candidate (shown in the picker).
+        let ruthless = avail.iter().find(|a| a.label == "ruthless").unwrap();
+        assert_eq!(ruthless.tool, "claude");
+    }
+
+    #[test]
+    fn available_agents_empty_without_home() {
+        assert!(available_agents(None, &[]).is_empty());
     }
 
     #[test]
