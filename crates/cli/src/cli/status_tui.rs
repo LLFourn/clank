@@ -1168,11 +1168,29 @@ fn row_line(spans: &[Span], selected: bool, color: &str, cols: usize) -> String 
     }
 }
 
+/// Collapse a possibly-multiline / control-laden string to ONE display
+/// line: first line only, control chars dropped, truncated to `cols`.
+/// Every line a renderer emits must be a single terminal row — a raw
+/// `initial_prompt` with newlines would otherwise inject extra rows and
+/// break the clamp.
+fn one_line(s: &str, cols: usize) -> String {
+    let first: String = s
+        .lines()
+        .next()
+        .unwrap_or("")
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect();
+    truncate_to(&first, cols)
+}
+
 /// The full-screen "+ add" picker: a title rule, one block per
 /// candidate (label + tool + the invocation that runs it, with its
-/// `initial_prompt` as a dim description when present), and a footer.
-/// The selected candidate gets the unified selection band. Returns
-/// `(lines, 0)` — a picker has no scrollable log.
+/// `initial_prompt` as a dim ONE-LINE description when present), and a
+/// footer. The selected candidate gets the unified selection band.
+/// Output is hard-clamped to `rows` and every line is single-row, so a
+/// tiny pane or a multiline prompt can never overflow the terminal.
+/// Returns `(lines, 0)` — a picker has no scrollable log.
 fn render_add_screen(
     picker: &[crate::cli::status::AvailableAgent],
     rows: usize,
@@ -1192,26 +1210,39 @@ fn render_add_screen(
         ));
     } else {
         for (i, c) in picker.iter().enumerate() {
+            // Leave room for the blank + footer below.
             if out.len() >= rows.saturating_sub(2) {
                 break;
             }
             let spans = vec![
                 plain(format!("  {}", c.label)),
                 dim(format!("  [{}]", c.tool)),
-                plain(format!("  {}", c.invocation)),
+                plain(format!("  {}", one_line(&c.invocation, cols))),
             ];
             out.push(row_line(&spans, i == sel, "", cols));
-            if let Some(desc) = &c.description {
-                out.push(emit(&[dim(format!("      {desc}"))], "", cols));
+            if let Some(desc) = &c.description
+                && out.len() < rows.saturating_sub(2)
+            {
+                out.push(emit(
+                    &[dim(format!("      {}", one_line(desc, cols)))],
+                    "",
+                    cols,
+                ));
             }
         }
     }
-    out.push(String::new());
-    out.push(emit(
-        &[dim("  ↑↓ move · ⏎ add · Esc cancel".to_string())],
-        "",
-        cols,
-    ));
+    if out.len() < rows {
+        out.push(String::new());
+    }
+    if out.len() < rows {
+        out.push(emit(
+            &[dim("  ↑↓ move · ⏎ add · Esc cancel".to_string())],
+            "",
+            cols,
+        ));
+    }
+    // Hard backstop: never hand back more lines than the pane has.
+    out.truncate(rows);
     (out, 0)
 }
 
@@ -2626,6 +2657,45 @@ pub(crate) mod tests {
         assert!(
             line_with(&out, "ruthless").contains(REVERSE),
             "selected candidate is the band"
+        );
+    }
+
+    #[test]
+    fn add_picker_clamps_to_rows_and_collapses_multiline_descriptions() {
+        let s = two_agent_snap();
+        let mut multiline = cand("ruthless", "claude", "claude --model opus");
+        multiline.description = Some("first line\nsecond line\nthird line".to_string());
+        let picker = vec![
+            multiline,
+            cand("scout", "codex", "codex"),
+            cand("gizmo", "claude", "claude"),
+        ];
+        let view = PanelView {
+            mode: Mode::AddPicker { sel: 0 },
+            picker: &picker,
+            notice: None,
+        };
+
+        // Tiny pane: never more lines than rows, and no element spans
+        // multiple terminal rows (no embedded newline).
+        let tiny = render_at(&s, 4, 40, 0, 0, &view).0;
+        assert!(
+            tiny.len() <= 4,
+            "picker clamped to rows: got {}",
+            tiny.len()
+        );
+        assert!(
+            tiny.iter().all(|l| !l.contains('\n')),
+            "every picker line is a single terminal row"
+        );
+
+        // Roomy pane: the multiline initial_prompt collapses to its
+        // first line — later lines never reach the screen.
+        let big = render_at(&s, 40, 60, 0, 0, &view).0.join("\n");
+        assert!(big.contains("first line"), "description first line shown");
+        assert!(
+            !big.contains("second line") && !big.contains("third line"),
+            "later description lines dropped: {big}"
         );
     }
 
