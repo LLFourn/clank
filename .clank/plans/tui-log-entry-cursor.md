@@ -84,3 +84,18 @@ window range — keep it correct once offset is cursor-derived.
 - Actions on a selected log entry (e.g. Enter on a commit/review to
   open details) — this plan delivers selection + cursor-driven scroll
   only; entry actions are a later step.
+
+---
+
+## Addendum — drop the section highlight (post-ship feedback)
+
+Now that the selected ITEM is highlighted (the band on the cursor
+row/entry), the SECTION highlight is redundant. Remove it: `region_rule`
+no longer renders the focused region as a reverse-video bar — it is
+ALWAYS a thin dim labelled rule. The focused region's rule still carries
+the key hint (a quiet aid, not a highlight). Focus is shown solely by
+the item band, which always sits in the focused region (the panel's
+selected agent/`+ add`, or the log's cursor entry). No circles, no rail,
+no section bar — one cue, the item. Test updated to assert no
+reverse-video region rule (`\x1b[1;7m`) in either focus state, with the
+item band as the focus cue.

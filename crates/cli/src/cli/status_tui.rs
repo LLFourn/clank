@@ -1352,26 +1352,19 @@ fn render_agent_detail(
     (out, 0)
 }
 
-/// A full-width titled rule marking a focusable region — the region
-/// focus cue (selection is [`emit_selected`]). The FOCUSED region is a
-/// solid reverse-video band carrying the title + active-key hint; the
-/// unfocused one is a thin dim rule. This replaces the per-row rail and
-/// the ◉/○ markers.
+/// A full-width titled rule labelling a region. Always a thin DIM rule
+/// — the region is NOT highlighted; focus is shown by the selected ITEM
+/// (the [`emit_selected`] band on the cursor row/entry), which always
+/// sits in the focused region. The focused region's rule still carries
+/// the active-key hint (a quiet aid, not a highlight).
 fn region_rule(title: &str, hint: &str, focused: bool, cols: usize) -> String {
-    if focused {
-        let head = if hint.is_empty() {
-            format!(" {} ", title.to_uppercase())
-        } else {
-            format!(" {}   {hint} ", title.to_uppercase())
-        };
-        let head = truncate_to(&head, cols);
-        let pad = cols.saturating_sub(display_width(&head));
-        format!("\x1b[1;7m{head}{}\x1b[0m", " ".repeat(pad))
-    } else {
-        let head = truncate_to(&format!("── {} ", title.to_uppercase()), cols);
-        let fill = cols.saturating_sub(display_width(&head));
-        format!("\x1b[2m{head}{}\x1b[0m", "─".repeat(fill))
+    let mut head = format!("── {} ", title.to_uppercase());
+    if focused && !hint.is_empty() {
+        head.push_str(&format!("· {hint} "));
     }
+    let head = truncate_to(&head, cols);
+    let fill = cols.saturating_sub(display_width(&head));
+    format!("\x1b[2m{head}{}\x1b[0m", "─".repeat(fill))
 }
 
 /// Display columns a char occupies in the terminal. Not a full
@@ -2797,12 +2790,12 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn agent_panel_play_pause_and_region_focus() {
+    fn focus_is_shown_by_the_item_band_not_a_section_highlight() {
         let s = two_agent_snap();
 
-        // Log-focused: roster listed with play/pause marks; the LOG rule
-        // is the highlighted (focused) one, AGENTS is the dim rule; no
-        // circles, no rail, no selection band on an agent row.
+        // The region rules are NEVER highlighted (no reverse-video bar);
+        // focus is shown by the selected ITEM band, which sits in the
+        // focused region. No circles, no rail either.
         let log = render_at(&s, 40, 80, 0, 0, &PanelView::just(Mode::LogScroll)).0;
         let log_j = log.join("\n");
         assert!(
@@ -2810,20 +2803,16 @@ pub(crate) mod tests {
             "play/pause marks"
         );
         assert!(
-            line_with(&log, "LOG").contains(RULE_FOCUSED),
-            "LOG rule highlighted when log-focused"
-        );
-        assert!(
-            !line_with(&log, "AGENTS").contains(RULE_FOCUSED),
-            "AGENTS rule dim when log-focused"
+            !log_j.contains("\x1b[1;7m"),
+            "no section highlight (reverse-video rule): {log_j}"
         );
         assert!(
             !log_j.contains('○') && !log_j.contains('◉') && !log_j.contains('▌'),
-            "no circle markers, no rail (M3)"
+            "no circle markers, no rail"
         );
 
-        // Agents-focused on codex (row 1): AGENTS rule highlights, LOG
-        // dims, and the codex row is the full-row selection band.
+        // Agents-focused on codex (row 1): the focus cue is the codex
+        // row's selection band — and STILL no section highlight.
         let ag = render_at(
             &s,
             40,
@@ -2833,17 +2822,14 @@ pub(crate) mod tests {
             &PanelView::just(Mode::AgentPanel { sel: 1 }),
         )
         .0;
+        let ag_j = ag.join("\n");
         assert!(
-            line_with(&ag, "AGENTS").contains(RULE_FOCUSED),
-            "AGENTS rule highlighted when agents-focused"
-        );
-        assert!(
-            !line_with(&ag, "LOG").contains(RULE_FOCUSED),
-            "LOG rule dim when agents-focused"
+            !ag_j.contains("\x1b[1;7m"),
+            "no section highlight when agents-focused either"
         );
         assert!(
             line_with(&ag, "codex").contains(REVERSE),
-            "selected agent row is the unified selection band"
+            "the selected item band is the focus cue"
         );
     }
 
@@ -2879,7 +2865,6 @@ pub(crate) mod tests {
     }
 
     const REVERSE: &str = "\x1b[7m"; // emit_selected band
-    const RULE_FOCUSED: &str = "\x1b[1;7m"; // focused region_rule bar
 
     #[test]
     fn agent_panel_add_button_uses_the_unified_selection_band() {
