@@ -40,6 +40,15 @@ pub struct StatusSnapshot {
     /// degrades to None on a teamless repo). The TUI's idle+queue
     /// headline names master as the agent whose turn it is.
     pub(crate) master: Option<String>,
+    /// The team roster (master first, then reviewers; deduped) with
+    /// each agent's EFFECTIVE auto-mode — the armed/disarmed state the
+    /// `--tui` agent panel renders and toggles. Empty on a teamless
+    /// repo (mirrors `master: None`). Built in the snapshot (not read
+    /// ad hoc in render) so the nothing-changed gate covers it: every
+    /// agent's `config.json` lives under the fingerprinted `agents/`
+    /// dir, so an external `clank auto` flip repaints. Plan:
+    /// tui-agent-auto-toggle.
+    pub(crate) agents: Vec<AgentAutoRow>,
     /// Shelved plans (stem, what they're waiting for if `--for`
     /// was used, and whether that wait is over). Plan:
     /// plan-lifecycle-verbs.
@@ -64,6 +73,52 @@ pub struct StatusSnapshot {
     /// and the tag names no real plan, has no row to mark (codex
     /// 2bf46d9).
     pub(crate) head_correction: Option<clank_core::wait::HeadCorrection>,
+}
+
+/// One team agent as the `--tui` agent panel sees it: its label,
+/// roster role, and EFFECTIVE auto-mode. The auto-mode is the
+/// *armed* state (takes effect at that agent's next Stop-hook
+/// decision), NOT a live run indicator.
+pub(crate) struct AgentAutoRow {
+    pub(crate) label: String,
+    pub(crate) role: clank_core::vocab::Role,
+    pub(crate) auto_mode: clank_core::vocab::AutoMode,
+}
+
+/// Build the roster's auto-mode rows: master first, then reviewers in
+/// tier order, deduped (an agent in both tiers — or matching master —
+/// appears once). Each row's auto-mode is the EFFECTIVE mode (the
+/// same `resolve_effective_auto_mode` the stop hook reads), so the
+/// panel shows exactly what would govern that agent's next Stop.
+fn roster_auto_rows(
+    repo: &Path,
+    home: Option<&Path>,
+    set: &crate::cli::teams_config::RegisteredSet,
+) -> Vec<AgentAutoRow> {
+    use clank_core::vocab::Role;
+    let roster = std::iter::once((&set.master, Role::Master)).chain(
+        set.commit_reviewers
+            .iter()
+            .chain(set.gate_reviewers.iter())
+            .map(|a| (&a.label, Role::Reviewer)),
+    );
+    let mut seen = std::collections::HashSet::new();
+    let mut rows = Vec::new();
+    for (label, role) in roster {
+        if !seen.insert(label.as_str()) {
+            continue;
+        }
+        let cfg = crate::agent_store::load_agent_config(repo, label)
+            .ok()
+            .flatten();
+        let auto_mode = crate::cli::team::resolve_effective_auto_mode(cfg.as_ref(), home);
+        rows.push(AgentAutoRow {
+            label: label.as_str().to_string(),
+            role,
+            auto_mode,
+        });
+    }
+    rows
 }
 
 /// One shelved plan as the renderers see it.
@@ -227,6 +282,15 @@ impl StatusSnapshot {
         let master = registered
             .as_ref()
             .map(|set| set.master.as_str().to_string());
+        // The roster as the agent panel sees it: master first, then
+        // reviewers (deduped across the two tiers and against master),
+        // each carrying its EFFECTIVE auto-mode. Built here so the
+        // snapshot — not an ad-hoc render-time read — is the single
+        // input the nothing-changed gate covers.
+        let agents = registered
+            .as_ref()
+            .map(|set| roster_auto_rows(repo, home, set))
+            .unwrap_or_default();
         let (commit_reviewers, gate_reviewers) = registered
             .map(|set| {
                 (
@@ -307,6 +371,7 @@ impl StatusSnapshot {
             blocks,
             queue,
             master,
+            agents,
             shelved,
             log_rows,
             pr_reviews: work_status.pr_reviews,
@@ -1476,6 +1541,31 @@ mod dirty_and_wake_tests {
         );
     }
 
+    /// The agent-panel auto toggle (`status --tui` SPC, or an external
+    /// `clank auto`) writes `agents/<label>/config.json`. The repaint
+    /// rests on the fingerprint covering that file — which it does only
+    /// because the fingerprint recurses over ALL of `agents/`, not
+    /// because config.json is named. This pins that coverage so a future
+    /// scoping optimization (e.g. hashing only `feedback/`) can't
+    /// silently kill the toggle repaint. Plan: tui-agent-auto-toggle.
+    #[test]
+    fn clank_fingerprint_flips_on_an_agent_config_write() {
+        let dir = fixture_repo();
+        let r = dir.path();
+        let before = clank_input_fingerprint(r);
+        std::fs::create_dir_all(r.join(".clank/agents/codex")).unwrap();
+        std::fs::write(
+            r.join(".clank/agents/codex/config.json"),
+            r#"{"auto_mode":"on"}"#,
+        )
+        .unwrap();
+        let after = clank_input_fingerprint(r);
+        assert_ne!(
+            before, after,
+            "an agent config.json write must flip the fingerprint (toggle repaint)"
+        );
+    }
+
     #[test]
     fn dirty_stats_reports_lines_and_untracked() {
         let dir = fixture_repo();
@@ -1587,6 +1677,7 @@ mod dirty_and_wake_tests {
             }],
             queue: Vec::new(),
             master: None,
+            agents: Vec::new(),
             shelved: Vec::new(),
             log_rows: Vec::new(),
             pr_reviews: Vec::new(),

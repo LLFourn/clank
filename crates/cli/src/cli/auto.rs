@@ -14,7 +14,7 @@
 
 use super::{AutoArgs, AutoCmd, AutoOffArgs, AutoOnArgs, AutoStatusArgs, resolve_repo};
 use crate::agent_env::resolve_identity_from_env;
-use crate::agent_store::{load_agent_config, save_agent_config};
+use crate::agent_store::{load_agent_config, set_auto_mode, update_agent_config};
 use clank_core::vocab::AutoMode;
 
 /// `clank auto status --json` wire shape. `auto_mode` is the
@@ -42,12 +42,12 @@ async fn run_on(args: AutoOnArgs) -> anyhow::Result<()> {
     let repo = resolve_repo(args.repo.as_deref())?;
     let label = resolve_identity_from_env(&repo)?;
 
-    let mut cfg = load_agent_config(&repo, &label)?.unwrap_or_default();
-    cfg.auto_mode = Some(AutoMode::On);
-    if let Some(t) = args.wait_timeout.as_deref() {
-        cfg.wait_timeout = Some(t.to_string());
-    }
-    save_agent_config(&repo, &label, &cfg)?;
+    update_agent_config(&repo, &label, |cfg| {
+        cfg.auto_mode = Some(AutoMode::On);
+        if let Some(t) = args.wait_timeout.as_deref() {
+            cfg.wait_timeout = Some(t.to_string());
+        }
+    })?;
 
     println!("auto-mode for `{}` set to on", label.as_str());
     if args.role.is_some() {
@@ -66,9 +66,7 @@ async fn run_off(args: AutoOffArgs) -> anyhow::Result<()> {
     let repo = resolve_repo(args.repo.as_deref())?;
     let label = resolve_identity_from_env(&repo)?;
 
-    let mut cfg = load_agent_config(&repo, &label)?.unwrap_or_default();
-    cfg.auto_mode = Some(AutoMode::Off);
-    save_agent_config(&repo, &label, &cfg)?;
+    set_auto_mode(&repo, &label, AutoMode::Off)?;
 
     println!("auto-mode for `{}` set to off", label.as_str());
     if args.role.is_some() {

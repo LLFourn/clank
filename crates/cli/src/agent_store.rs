@@ -14,7 +14,7 @@ use time::format_description::well_known::Rfc3339;
 
 use clank_core::agent_config::{AgentConfig, Session};
 use clank_core::ids::{AgentLabel, SessionId};
-use clank_core::vocab::Tool;
+use clank_core::vocab::{AutoMode, Tool};
 
 /// Repo-relative path: `.clank/agents`.
 pub fn agents_root(repo: &Path) -> PathBuf {
@@ -39,6 +39,28 @@ pub fn load_agent_config(repo: &Path, label: &AgentLabel) -> anyhow::Result<Opti
 pub fn save_agent_config(repo: &Path, label: &AgentLabel, cfg: &AgentConfig) -> anyhow::Result<()> {
     let path = agent_config_path(repo, label);
     save_json(&path, cfg).with_context(|| format!("writing `{}`", path.display()))
+}
+
+/// Read-modify-write one agent's config, defaulting a missing file.
+/// The single mutation primitive: every field-level edit goes through
+/// here so unrelated fields (notably `wait_timeout`) are preserved
+/// across a partial update instead of being clobbered.
+pub fn update_agent_config(
+    repo: &Path,
+    label: &AgentLabel,
+    edit: impl FnOnce(&mut AgentConfig),
+) -> anyhow::Result<()> {
+    let mut cfg = load_agent_config(repo, label)?.unwrap_or_default();
+    edit(&mut cfg);
+    save_agent_config(repo, label, &cfg)
+}
+
+/// Set this agent's auto-mode, preserving the rest of its config.
+/// The single write path for arming/disarming auto — `clank auto`
+/// and the `status --tui` toggle both call it, so neither can drop
+/// `wait_timeout` on a flip.
+pub fn set_auto_mode(repo: &Path, label: &AgentLabel, mode: AutoMode) -> anyhow::Result<()> {
+    update_agent_config(repo, label, |cfg| cfg.auto_mode = Some(mode))
 }
 
 /// List every agent in this repo's `.clank/agents/`, propagating
@@ -711,5 +733,46 @@ mod tests {
             msg.contains("old team schema") && msg.contains("clank init"),
             "expected re-init hint; got: {msg}"
         );
+    }
+
+    #[test]
+    fn set_auto_mode_round_trips_and_preserves_wait_timeout() {
+        let repo = TempDir::new().unwrap();
+        let lbl = label("codex");
+        // Seed a config that already carries a wait_timeout — the field
+        // the toggle must never clobber.
+        let seed = AgentConfig {
+            wait_timeout: Some("45s".to_string()),
+            ..AgentConfig::default()
+        };
+        save_agent_config(repo.path(), &lbl, &seed).unwrap();
+
+        set_auto_mode(repo.path(), &lbl, AutoMode::On).unwrap();
+        let armed = load_agent_config(repo.path(), &lbl).unwrap().unwrap();
+        assert_eq!(armed.auto_mode, Some(AutoMode::On));
+        assert_eq!(
+            armed.wait_timeout.as_deref(),
+            Some("45s"),
+            "wait_timeout preserved on arm"
+        );
+
+        set_auto_mode(repo.path(), &lbl, AutoMode::Off).unwrap();
+        let disarmed = load_agent_config(repo.path(), &lbl).unwrap().unwrap();
+        assert_eq!(disarmed.auto_mode, Some(AutoMode::Off));
+        assert_eq!(
+            disarmed.wait_timeout.as_deref(),
+            Some("45s"),
+            "wait_timeout preserved on disarm"
+        );
+    }
+
+    #[test]
+    fn set_auto_mode_defaults_a_missing_config() {
+        let repo = TempDir::new().unwrap();
+        let lbl = label("codex");
+        // No file yet: the RMW defaults, sets the mode, and writes.
+        set_auto_mode(repo.path(), &lbl, AutoMode::On).unwrap();
+        let cfg = load_agent_config(repo.path(), &lbl).unwrap().unwrap();
+        assert_eq!(cfg.auto_mode, Some(AutoMode::On));
     }
 }

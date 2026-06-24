@@ -143,6 +143,7 @@ pub(crate) fn render_at(
     cols: u16,
     offset: usize,
     frame: usize,
+    panel_focus: Option<usize>,
 ) -> (Vec<String>, usize) {
     let rows = rows.max(1) as usize;
     let cols = cols.max(1) as usize;
@@ -222,6 +223,53 @@ pub(crate) fn render_at(
             let mut line = vec![label("next"), plain(snap.queue[0].clone())];
             if snap.queue.len() > 1 {
                 line.push(dim(format!(" +{}", snap.queue.len() - 1)));
+            }
+            body.push(line);
+        }
+    }
+
+    // `auto` — the team roster with each agent's ARMED auto-mode. The
+    // lamp is the EFFECTIVE auto-mode (what governs that agent's NEXT
+    // Stop-hook decision) — NOT a live run/stop indicator: toggling it
+    // neither starts a stopped agent nor kills an in-flight wait. Focus
+    // (Tab) puts a cursor here; SPC toggles the selected agent.
+    if !snap.agents.is_empty() {
+        let focused = panel_focus.is_some();
+        for (i, a) in snap.agents.iter().enumerate() {
+            let selected = panel_focus == Some(i);
+            let (lamp_style, lamp) = match a.auto_mode {
+                clank_core::vocab::AutoMode::On => (Style::Color("32"), "●"),
+                clank_core::vocab::AutoMode::Off => (Style::Dim, "○"),
+            };
+            let role = match a.role {
+                clank_core::vocab::Role::Master => "master",
+                clank_core::vocab::Role::Reviewer => "reviewer",
+            };
+            let mut line = vec![
+                label(if i == 0 { "auto" } else { "" }),
+                plain(if selected { "▸ " } else { "  " }.to_string()),
+                Span(lamp_style, lamp.to_string()),
+                Span(
+                    if selected {
+                        Style::Accent
+                    } else {
+                        Style::Plain
+                    },
+                    format!(" {}", a.label),
+                ),
+                dim(format!("  {role}")),
+            ];
+            // Key hint on the first row only, switching with focus so
+            // the active bindings are always the ones shown.
+            if i == 0 {
+                line.push(dim(format!(
+                    "   {}",
+                    if focused {
+                        "SPC toggle · Esc back"
+                    } else {
+                        "Tab to select"
+                    }
+                )));
             }
             body.push(line);
         }
@@ -338,7 +386,7 @@ pub(crate) fn render_at(
 /// tests exercise. Test-only; the live loop calls [`render_at`] directly.
 #[cfg(test)]
 fn render(snap: &StatusSnapshot, rows: u16, cols: u16) -> Vec<String> {
-    render_at(snap, rows, cols, 0, 0).0
+    render_at(snap, rows, cols, 0, 0, None).0
 }
 
 /// Widest verdict mark in display columns: `✓✓` (Finished) is 2,
@@ -1170,7 +1218,7 @@ enum Ev {
     Key(Key),
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Key {
     Up,
     Down,
@@ -1179,6 +1227,15 @@ enum Key {
     Top,
     Bottom,
     Quit,
+    /// Space — page-down while scrolling the log; toggle auto on the
+    /// selected agent while the agent panel is focused. Context-free
+    /// parse; the loop resolves the meaning from focus.
+    Space,
+    /// Tab / `a` — move keyboard focus between the log and the agent
+    /// panel.
+    Focus,
+    /// Esc — leave the agent panel (back to log scroll).
+    Escape,
 }
 
 /// Parse a burst of stdin bytes into scroll keys — arrow keys,
@@ -1200,14 +1257,25 @@ fn parse_keys(bytes: &[u8]) -> Vec<Key> {
         } else if rest.starts_with(b"\x1b[6~") {
             keys.push(Key::PageDown);
             i += 4;
+        } else if rest.starts_with(b"\x1b[") {
+            // Unknown CSI (e.g. left/right arrows, F-keys): consume
+            // through its final byte so a lone Esc isn't misread out of
+            // the sequence's leading bytes.
+            let mut j = 2;
+            while j < rest.len() && !(0x40..=0x7e).contains(&rest[j]) {
+                j += 1;
+            }
+            i += (j + 1).min(rest.len());
         } else {
             match bytes[i] {
                 b'k' => keys.push(Key::Up),
                 b'j' => keys.push(Key::Down),
                 b'g' => keys.push(Key::Top),
                 b'G' => keys.push(Key::Bottom),
-                b' ' => keys.push(Key::PageDown),
+                b' ' => keys.push(Key::Space),
                 b'b' => keys.push(Key::PageUp),
+                b'\t' | b'a' => keys.push(Key::Focus),
+                0x1b => keys.push(Key::Escape),
                 b'q' => keys.push(Key::Quit),
                 _ => {}
             }
@@ -1215,6 +1283,27 @@ fn parse_keys(bytes: &[u8]) -> Vec<Key> {
         }
     }
     keys
+}
+
+/// The opposite armed state — what a SPC toggle writes.
+fn flip_auto(mode: clank_core::vocab::AutoMode) -> clank_core::vocab::AutoMode {
+    use clank_core::vocab::AutoMode;
+    match mode {
+        AutoMode::On => AutoMode::Off,
+        AutoMode::Off => AutoMode::On,
+    }
+}
+
+/// Move the agent-panel cursor within `[0, len)`, saturating at both
+/// ends (no wrap). `len == 0` pins it at 0 (an empty roster has no
+/// selectable rows; the panel can't be focused then anyway).
+fn move_selection(sel: usize, len: usize, down: bool) -> usize {
+    let last = len.saturating_sub(1);
+    if down {
+        (sel + 1).min(last)
+    } else {
+        sel.saturating_sub(1)
+    }
 }
 
 /// One frame: cursor home, each line + clear-to-EOL, then clear
@@ -1571,6 +1660,10 @@ pub(crate) async fn run_tui(
     let mut snapshot =
         StatusSnapshot::build_async(&repo, &basename, home.as_deref(), policy, None, true).await?;
     let mut offset: usize = 0;
+    // Agent-panel focus: `None` = keys scroll the log (default);
+    // `Some(i)` = the panel is focused with agent row `i` selected, so
+    // j/k move the cursor and SPC toggles. Tab enters/leaves it.
+    let mut focus: Option<usize> = None;
     // Spinner animation frame. The ONLY state an animation tick mutates.
     let mut frame: usize = 0;
     // Whether this iteration may do IO to top up the log. Set ONLY by
@@ -1581,7 +1674,7 @@ pub(crate) async fn run_tui(
     let mut needs_fill = true;
     loop {
         let (rows, cols) = term_size();
-        let capacity = render_at(&snapshot, rows, cols, offset, frame).1;
+        let capacity = render_at(&snapshot, rows, cols, offset, frame, focus).1;
 
         // The ask + in-progress rows depend on blocks/waiting_on (not the
         // log fetch), so compute them before filling. `head` is the count
@@ -1609,7 +1702,7 @@ pub(crate) async fn run_tui(
         // Max offset pins the last row at the BOTTOM of the viewport.
         let max_off = total.saturating_sub(capacity.max(1));
         offset = offset.min(max_off);
-        paint(&render_at(&snapshot, rows, cols, offset, frame).0);
+        paint(&render_at(&snapshot, rows, cols, offset, frame, focus).0);
 
         // The in-progress rows now sit at SCATTERED indices (master after
         // the plan header; reviews in the latest commit's review block), so
@@ -1631,14 +1724,51 @@ pub(crate) async fn run_tui(
             // new position needs it.
             Ok(Ev::Key(k)) => {
                 let page = (rows as usize).saturating_sub(3).max(1);
-                match k {
-                    Key::Quit => break,
-                    Key::Up => offset = offset.saturating_sub(1),
-                    Key::Down => offset += 1,
-                    Key::PageUp => offset = offset.saturating_sub(page),
-                    Key::PageDown => offset += page,
-                    Key::Top => offset = 0,
-                    Key::Bottom => offset = max_off,
+                match focus {
+                    // Agent panel focused: keys drive the cursor + toggle,
+                    // not the log scroll.
+                    Some(sel) => match k {
+                        Key::Quit => break,
+                        Key::Focus | Key::Escape => focus = None,
+                        Key::Up => focus = Some(move_selection(sel, snapshot.agents.len(), false)),
+                        Key::Down => focus = Some(move_selection(sel, snapshot.agents.len(), true)),
+                        Key::Space => {
+                            if let Some(row) = snapshot.agents.get(sel) {
+                                let next = flip_auto(row.auto_mode);
+                                if let Ok(label) = clank_core::ids::AgentLabel::parse(&row.label) {
+                                    // Single source for the write (preserves
+                                    // wait_timeout). On success, flip the
+                                    // in-memory lamp for an immediate repaint;
+                                    // the config write also bumps the input
+                                    // signature, so the watcher Refresh
+                                    // reconciles to the same value.
+                                    if crate::agent_store::set_auto_mode(&repo, &label, next)
+                                        .is_ok()
+                                    {
+                                        snapshot.agents[sel].auto_mode = next;
+                                    }
+                                }
+                            }
+                        }
+                        // Paging keys are inert while the panel is focused.
+                        Key::PageUp | Key::PageDown | Key::Top | Key::Bottom => {}
+                    },
+                    // Default: keys scroll the log.
+                    None => match k {
+                        Key::Quit => break,
+                        Key::Focus => {
+                            if !snapshot.agents.is_empty() {
+                                focus = Some(0);
+                            }
+                        }
+                        Key::Escape => {}
+                        Key::Up => offset = offset.saturating_sub(1),
+                        Key::Down => offset += 1,
+                        Key::PageUp => offset = offset.saturating_sub(page),
+                        Key::Space | Key::PageDown => offset += page,
+                        Key::Top => offset = 0,
+                        Key::Bottom => offset = max_off,
+                    },
                 }
                 needs_fill = true;
             }
@@ -1664,6 +1794,13 @@ pub(crate) async fn run_tui(
                     last_sig = sig;
                     log_complete = false;
                     needs_fill = true;
+                    // Keep the panel cursor in range if the roster changed
+                    // (or vanished) under us.
+                    focus = match focus {
+                        Some(_) if snapshot.agents.is_empty() => None,
+                        Some(sel) => Some(sel.min(snapshot.agents.len() - 1)),
+                        None => None,
+                    };
                     if let Some(tab) = tab.as_mut() {
                         tab.update(&bar_emoji(&snapshot));
                     }
@@ -1708,7 +1845,7 @@ pub(crate) mod tests {
             .iter()
             .map(|k| std::mem::discriminant(k))
             .collect();
-        let want: Vec<_> = [Down, Up, PageDown, Top, Bottom, Quit]
+        let want: Vec<_> = [Down, Up, Space, Top, Bottom, Quit]
             .iter()
             .map(std::mem::discriminant)
             .collect();
@@ -1724,6 +1861,85 @@ pub(crate) mod tests {
             .collect();
         assert_eq!(csi, want_csi, "arrows + page keys");
         assert!(parse_keys(b"xyz").is_empty(), "unmapped bytes are ignored");
+    }
+
+    #[test]
+    fn parse_keys_recognizes_panel_focus_keys() {
+        use Key::*;
+        // Tab and `a` both focus the agent panel; lone Esc leaves it.
+        let got: Vec<_> = parse_keys(b"\ta\x1b")
+            .iter()
+            .map(std::mem::discriminant)
+            .collect();
+        let want: Vec<_> = [Focus, Focus, Escape]
+            .iter()
+            .map(std::mem::discriminant)
+            .collect();
+        assert_eq!(got, want, "tab/a focus, esc leaves");
+        // An unknown CSI (left arrow) is consumed whole — NOT misread as a
+        // lone Esc that would spuriously close the panel.
+        assert!(
+            parse_keys(b"\x1b[D").is_empty(),
+            "left arrow consumed, no stray Escape"
+        );
+    }
+
+    #[test]
+    fn flip_auto_inverts() {
+        use clank_core::vocab::AutoMode;
+        assert_eq!(flip_auto(AutoMode::On), AutoMode::Off);
+        assert_eq!(flip_auto(AutoMode::Off), AutoMode::On);
+    }
+
+    #[test]
+    fn move_selection_saturates_at_both_ends() {
+        assert_eq!(move_selection(0, 3, false), 0, "up at top stays put");
+        assert_eq!(move_selection(0, 3, true), 1, "down advances");
+        assert_eq!(move_selection(2, 3, true), 2, "down at bottom stays put");
+        assert_eq!(move_selection(2, 3, false), 1, "up retreats");
+        assert_eq!(move_selection(0, 0, true), 0, "empty roster pins at 0");
+    }
+
+    fn agent_row(
+        label: &str,
+        role: clank_core::vocab::Role,
+        auto: clank_core::vocab::AutoMode,
+    ) -> crate::cli::status::AgentAutoRow {
+        crate::cli::status::AgentAutoRow {
+            label: label.to_string(),
+            role,
+            auto_mode: auto,
+        }
+    }
+
+    #[test]
+    fn agent_panel_shows_lamps_and_focus_cursor() {
+        use clank_core::vocab::{AutoMode, Role};
+        let mut s = snap(vec![], vec![]);
+        s.agents = vec![
+            agent_row("claude", Role::Master, AutoMode::On),
+            agent_row("codex", Role::Reviewer, AutoMode::Off),
+        ];
+
+        // Unfocused: both agents listed, both lamp states drawn, the
+        // Tab hint shows, and there is no cursor.
+        let plain = render_at(&s, 40, 80, 0, 0, None).0.join("\n");
+        assert!(plain.contains("claude"), "master listed: {plain}");
+        assert!(plain.contains("codex"), "reviewer listed");
+        assert!(plain.contains('●'), "on lamp drawn");
+        assert!(plain.contains('○'), "off lamp drawn");
+        assert!(plain.contains("Tab to select"), "focus hint when unfocused");
+        assert!(!plain.contains('▸'), "no cursor when unfocused");
+
+        // Focused on the second row: a cursor appears and the hint
+        // switches to the in-panel bindings.
+        let focused = render_at(&s, 40, 80, 0, 0, Some(1)).0.join("\n");
+        assert!(focused.contains('▸'), "cursor present when focused");
+        assert!(focused.contains("SPC toggle"), "toggle hint when focused");
+        assert!(
+            !focused.contains("Tab to select"),
+            "unfocused hint replaced when focused"
+        );
     }
 
     #[test]
@@ -1930,6 +2146,7 @@ pub(crate) mod tests {
             blocks: Vec::new(),
             queue: queue.into_iter().map(str::to_string).collect(),
             master: Some("claude".into()),
+            agents: Vec::new(),
             shelved: Vec::new(),
             log_rows: Vec::new(),
             pr_reviews: Vec::new(),
@@ -2761,12 +2978,16 @@ terminal_3  terminal  ruthless (reviewer)
             answer: None,
         }];
         // Narrow + short so the ask wraps to many lines and overflows.
-        let top = render_at(&s, 8, 24, 0, 0).0.join("\n");
+        let top = render_at(&s, 8, 24, 0, 0, None).0.join("\n");
         assert!(top.contains("AAAA"), "ask head visible at offset 0: {top}");
         assert!(!top.contains("LAST"), "ask tail off-screen at offset 0");
         // Scrolling down reveals the tail.
-        let revealed =
-            (1..30).any(|off| render_at(&s, 8, 24, off, 0).0.join("\n").contains("LAST"));
+        let revealed = (1..30).any(|off| {
+            render_at(&s, 8, 24, off, 0, None)
+                .0
+                .join("\n")
+                .contains("LAST")
+        });
         assert!(revealed, "scrolling brings the ask tail into view");
     }
 
@@ -2845,14 +3066,14 @@ mod log_tier_tests {
         ];
         let s = snap_with_log(&subs);
         // Tall pane: capacity covers the whole log; newest shown at top.
-        let (lines, cap) = render_at(&s, 40, 80, 0, 0);
+        let (lines, cap) = render_at(&s, 40, 80, 0, 0, None);
         assert!(cap >= subs.len(), "viewport capacity reported");
         assert!(
             lines.join("\n").contains("row-aa"),
             "newest at top, offset 0"
         );
         // Scrolled down: the newest rows leave the window, older ones enter.
-        let body = render_at(&s, 40, 80, 3, 0).0.join("\n");
+        let body = render_at(&s, 40, 80, 3, 0, None).0.join("\n");
         assert!(
             !body.contains("row-aa"),
             "offset 3 scrolled past the newest"
