@@ -201,7 +201,7 @@ fn open_all(source: &Path, targets: &[PathBuf], print: bool) -> anyhow::Result<(
         anyhow::bail!("no openable worktrees (none have clank agents configured)");
     }
 
-    let (rows, cols) = crate::cli::status_tui::term_size();
+    let (rows, cols) = crate::cli::term::term_size();
     let kdl = compose_multitab(&tabs, (cols, rows))?;
     let layout_path = layout_file_path(source);
     let (pre, spawn) = match plan {
@@ -347,7 +347,7 @@ fn open_one(repo: &Path, print: bool) -> anyhow::Result<()> {
     // Orientation from the SPAWNING terminal's dimensions
     // (zellij-default-layout); ioctl stays at the shell, compose
     // stays pure over (cols, rows).
-    let (rows, cols) = crate::cli::status_tui::term_size();
+    let (rows, cols) = crate::cli::term::term_size();
     let kdl = compose_kdl(
         &basename,
         &repo_path_str,
@@ -1211,7 +1211,7 @@ pub(crate) fn relocate_for_promote(
         .map(|tab_id| tab_dims(&panes, tab_id))
         .filter(|(cols, rows)| *cols != 0 && *rows != 0)
         .unwrap_or_else(|| {
-            let (rows, cols) = crate::cli::status_tui::term_size();
+            let (rows, cols) = crate::cli::term::term_size();
             (cols, rows)
         });
     let kdl = match compose_promote_layout(
