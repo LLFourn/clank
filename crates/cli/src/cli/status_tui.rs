@@ -1627,6 +1627,15 @@ enum DetailNav {
     Activate(DetailAction),
 }
 
+/// Re-locate an open detail page by LABEL after a roster rebuild:
+/// the same agent's new index, or `None` if it's gone (close the page).
+/// Identity is by label, never by a kept index — an external promote /
+/// tier change reorders rows, so a kept index could retarget a
+/// different agent.
+fn relocate_detail(label: &str, agents: &[crate::cli::status::AgentAutoRow]) -> Option<usize> {
+    agents.iter().position(|a| a.label == label)
+}
+
 /// Pure key routing for the detail page over its action menu.
 fn agent_detail_nav(sel: usize, actions: &[DetailAction], key: Key) -> DetailNav {
     match key {
@@ -2509,6 +2518,17 @@ pub(crate) async fn run_tui(
                 // the work it guards.
                 let sig = crate::cli::status::input_signature(&repo).ok();
                 if sig != last_sig {
+                    // Capture the detail page's target by LABEL from the
+                    // OLD roster before rebuilding — an external promote /
+                    // tier change can REORDER rows (master, then commit,
+                    // then gate), so a kept index could silently retarget a
+                    // different agent. We re-locate the same label below.
+                    let detail_label = match mode {
+                        Mode::AgentDetail { idx, .. } => {
+                            snapshot.agents.get(idx).map(|a| a.label.clone())
+                        }
+                        _ => None,
+                    };
                     snapshot = StatusSnapshot::build_async(
                         &repo,
                         &basename,
@@ -2536,16 +2556,22 @@ pub(crate) async fn run_tui(
                         Mode::AgentPanel { sel } => Mode::AgentPanel {
                             sel: sel.min(snapshot.agents.len()),
                         },
-                        // The detail page tracks one agent by index; keep
-                        // it only while that index is still in range (the
-                        // user's own tier/promote actions already left the
-                        // page), else fall back to the panel.
-                        Mode::AgentDetail { idx, sel } if idx < snapshot.agents.len() => {
-                            Mode::AgentDetail { idx, sel }
+                        // The detail page tracks ONE agent by identity:
+                        // re-locate the captured label in the (possibly
+                        // reordered) new roster, so an external reorder can
+                        // never retarget it; if the agent is gone, close to
+                        // the panel.
+                        Mode::AgentDetail { sel, .. } => {
+                            match detail_label
+                                .as_deref()
+                                .and_then(|l| relocate_detail(l, &snapshot.agents))
+                            {
+                                Some(idx) => Mode::AgentDetail { idx, sel },
+                                None => Mode::AgentPanel {
+                                    sel: snapshot.agents.len(),
+                                },
+                            }
                         }
-                        Mode::AgentDetail { .. } => Mode::AgentPanel {
-                            sel: snapshot.agents.len(),
-                        },
                         // Cancel a picker/confirm onto the +add row.
                         Mode::AddPicker { .. } | Mode::Confirm { .. } => Mode::AgentPanel {
                             sel: snapshot.agents.len(),
@@ -3009,6 +3035,35 @@ pub(crate) mod tests {
         assert!(out.contains("commit"), "commit tier shown");
         assert!(out.contains("gate"), "gate tier shown");
         assert!(!out.contains("reviewer"), "no flat 'reviewer' label: {out}");
+    }
+
+    #[test]
+    fn detail_page_relocates_by_label_across_a_reorder() {
+        use crate::cli::teams_config::RosterRole;
+        use clank_core::vocab::AutoMode;
+        // Detail is open on "codex", currently at index 1.
+        let before = [
+            agent_row("claude", RosterRole::Master, AutoMode::On),
+            agent_row("codex", RosterRole::Commit, AutoMode::Off),
+            agent_row("ruthless", RosterRole::Gate, AutoMode::On),
+        ];
+        // After an external promote, codex moved to index 0 — relocating by
+        // label finds it there, NOT whatever now sits at index 1.
+        let after = [
+            agent_row("codex", RosterRole::Master, AutoMode::Off),
+            agent_row("claude", RosterRole::Commit, AutoMode::On),
+            agent_row("ruthless", RosterRole::Gate, AutoMode::On),
+        ];
+        let label = before[1].label.clone();
+        assert_eq!(relocate_detail(&label, &before), Some(1));
+        assert_eq!(
+            relocate_detail(&label, &after),
+            Some(0),
+            "follows the agent by label across a reorder"
+        );
+        // Removed entirely → None (the page should close).
+        let removed = [agent_row("claude", RosterRole::Master, AutoMode::On)];
+        assert_eq!(relocate_detail(&label, &removed), None);
     }
 
     #[test]
