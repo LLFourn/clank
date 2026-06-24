@@ -16,7 +16,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 
-use super::mux::Tab;
 use super::pty;
 
 /// What to run in a screen: a chrome label plus the argv. The
@@ -101,13 +100,6 @@ impl Screen {
 
     pub(crate) fn is_alive(&self) -> bool {
         self.alive.load(Ordering::Relaxed)
-    }
-
-    pub(crate) fn tab(&self) -> Tab {
-        Tab {
-            label: self.label.clone(),
-            alive: self.is_alive(),
-        }
     }
 }
 

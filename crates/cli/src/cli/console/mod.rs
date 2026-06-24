@@ -34,11 +34,15 @@ use mux::{Action, Mode};
 use screen::{Event as ScreenEvent, Screen, Spec};
 
 /// One merged event stream feeds the loop, exactly like `status_tui`:
-/// child output, raw stdin, and resize all arrive as `Ev`.
+/// child output, raw stdin, resize, and the periodic work-state poll
+/// all arrive as `Ev`.
 enum Ev {
     Screen(ScreenEvent),
     Stdin(Vec<u8>),
     Resize,
+    /// The set of agent labels clank currently expects to act (whose
+    /// turn it is) — the "working" set, from the work-state poller.
+    Working(std::collections::HashSet<String>),
 }
 
 /// Launch the console for a repo. Invoked by `clank open` (outside a
@@ -183,8 +187,15 @@ fn run_console(repo: &Path, specs: Vec<Spec>) -> anyhow::Result<()> {
         });
     }
 
+    // Work-state poller → Ev::Working. Folds clank's state (only when
+    // the `.clank` signature changes) to learn whose turn it is, and
+    // pushes the set when it moves. A dedicated thread with its own
+    // runtime keeps the async fold off the sync event loop.
+    spawn_work_poller(repo, tx.clone());
+
     let mut frame = render::Frame::new(rows, cols);
     let mut active = 0usize;
+    let mut working: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut mode = Mode::Passthrough;
     // Escape hatch for the experiment: rebind the prefix without a
     // recompile if Ctrl-a collides with the active agent's own keys.
@@ -194,7 +205,7 @@ fn run_console(repo: &Path, specs: Vec<Spec>) -> anyhow::Result<()> {
         .unwrap_or(mux::DEFAULT_PREFIX);
     let hint = format!("{} n·p·q", mux::prefix_label(prefix));
 
-    repaint(&mut frame, &screens, active, &hint);
+    repaint(&mut frame, &screens, active, &working, &hint);
 
     // Batch each wakeup: drain everything currently queued, apply it,
     // and repaint at most once. This coalesces the repaint SIGNAL
@@ -263,6 +274,12 @@ fn run_console(repo: &Path, specs: Vec<Spec>) -> anyhow::Result<()> {
                     frame.resize(rows, cols);
                     need_repaint = true;
                 }
+                Ev::Working(set) => {
+                    if set != working {
+                        working = set;
+                        need_repaint = true;
+                    }
+                }
             }
         }
 
@@ -270,7 +287,7 @@ fn run_console(repo: &Path, specs: Vec<Spec>) -> anyhow::Result<()> {
             break;
         }
         if need_repaint {
-            repaint(&mut frame, &screens, active, &hint);
+            repaint(&mut frame, &screens, active, &working, &hint);
         }
     }
 
@@ -278,8 +295,21 @@ fn run_console(repo: &Path, specs: Vec<Spec>) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn repaint(frame: &mut render::Frame, screens: &[Screen], active: usize, hint: &str) {
-    let tabs: Vec<mux::Tab> = screens.iter().map(Screen::tab).collect();
+fn repaint(
+    frame: &mut render::Frame,
+    screens: &[Screen],
+    active: usize,
+    working: &std::collections::HashSet<String>,
+    hint: &str,
+) {
+    let tabs: Vec<mux::Tab> = screens
+        .iter()
+        .map(|s| mux::Tab {
+            label: s.label.clone(),
+            alive: s.is_alive(),
+            working: working.contains(&s.label),
+        })
+        .collect();
     let bytes = if screens[active].is_alive() {
         match screens[active].parser.lock() {
             Ok(p) => frame.draw(p.screen(), &tabs, active, hint),
@@ -292,6 +322,79 @@ fn repaint(frame: &mut render::Frame, screens: &[Screen], active: usize, hint: &
     let mut out = std::io::stdout();
     let _ = out.write_all(&bytes);
     let _ = out.flush();
+}
+
+/// Poll clank's work-state in a dedicated thread and push the
+/// "working" set (whose turn it is) to the loop when it changes.
+/// Re-folds only when the `.clank` input signature moves, so an idle
+/// repo costs one cheap signature hash per tick.
+fn spawn_work_poller(repo: &Path, tx: mpsc::Sender<Ev>) {
+    let repo = repo.to_path_buf();
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    std::thread::spawn(move || {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
+            return;
+        };
+        let mut last_sig = None;
+        let mut last_working: Option<std::collections::HashSet<String>> = None;
+        let mut first = true;
+        loop {
+            let sig = crate::cli::status::input_signature(&repo).ok();
+            if first || sig != last_sig {
+                first = false;
+                last_sig = sig;
+                let working = rt.block_on(working_labels(&repo, home.as_deref()));
+                if last_working.as_ref() != Some(&working) {
+                    last_working = Some(working.clone());
+                    if tx.send(Ev::Working(working)).is_err() {
+                        return;
+                    }
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(800));
+        }
+    });
+}
+
+/// The set of agent labels clank currently expects to act, folded
+/// from the same status snapshot `clank status` uses. Master-action
+/// states map to the master's label; the reviewer-missing states map
+/// to those reviewers; a blocked plan has nobody working. Empty on
+/// any fold/roster error (the indicator just shows no one working).
+async fn working_labels(repo: &Path, home: Option<&Path>) -> std::collections::HashSet<String> {
+    use clank_core::plan_view::WaitingOn;
+    let mut working = std::collections::HashSet::new();
+    let Ok(snap) = crate::cli::status::snapshot(repo, home).await else {
+        return working;
+    };
+    let master = crate::agent_store::try_resolve_via_team_with(repo, home)
+        .ok()
+        .flatten()
+        .map(|s| s.master.as_str().to_string());
+    for plan in &snap.plans {
+        match &plan.waiting_on {
+            WaitingOn::ReviewerApprovalsMissing { missing }
+            | WaitingOn::GateReviewersMissing { missing } => {
+                for label in missing.iter() {
+                    working.insert(label.as_str().to_string());
+                }
+            }
+            WaitingOn::MasterToRevise { .. }
+            | WaitingOn::MasterToContinue
+            | WaitingOn::MasterToFinalize
+            | WaitingOn::MasterToCommit
+            | WaitingOn::MasterToFixCommitTag => {
+                if let Some(m) = &master {
+                    working.insert(m.clone());
+                }
+            }
+            WaitingOn::Blocked { .. } => {}
+        }
+    }
+    working
 }
 
 /// Relaunch screen `idx` from its stored spec, replacing the dead

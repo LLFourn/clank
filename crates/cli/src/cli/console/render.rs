@@ -178,6 +178,7 @@ mod tests {
         let tab = |l: &str| Tab {
             label: l.into(),
             alive: true,
+            working: false,
         };
         let tabs = [tab("a"), tab("b")];
 
@@ -207,6 +208,7 @@ mod tests {
         let tabs = [Tab {
             label: "codex".into(),
             alive: false,
+            working: false,
         }];
 
         physical.process(&frame.draw_dead("codex", &tabs, 0, ""));

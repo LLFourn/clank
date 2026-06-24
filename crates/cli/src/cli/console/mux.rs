@@ -97,6 +97,10 @@ pub(crate) fn content_rect(rows: u16, cols: u16) -> (u16, u16) {
 pub(crate) struct Tab {
     pub(crate) label: String,
     pub(crate) alive: bool,
+    /// The agent clank currently expects to act (whose turn it is).
+    /// Marked with a `●` so you can see who's working at a glance —
+    /// independent of which tab you're focused on.
+    pub(crate) working: bool,
 }
 
 /// A printable label for the prefix byte (`0x01` → `^A`), for the
@@ -142,15 +146,21 @@ pub(crate) fn parse_prefix(spec: &str) -> Option<u8> {
     None
 }
 
-/// The bottom chrome bar: a numbered tab strip on the left (active in
-/// reverse video, the rest dim, a dead child marked `✗`) and a dim
+/// The bottom chrome bar: a numbered tab strip on the left and a dim
 /// right-aligned keybinding hint so the prefix is discoverable — the
 /// console is meant to be a gentle entrypoint, and a new user must be
-/// able to find "how do I switch / quit" without a manual. Padded to
-/// exactly `cols` visible columns. Labels + hint are ASCII (the `✗`
-/// and `·` are width-1), so visible width is the char count. Tabs
-/// that don't fit are dropped from the right; the hint is dropped
-/// only if it alone wouldn't fit.
+/// able to find "how do I switch / quit" without a manual.
+///
+/// Per tab: the focused one is reverse-video (where you're looking),
+/// the rest dim; a dead child is marked `✗`; and the agent currently
+/// WORKING gets a green `●` just left of its number — rendered
+/// outside the dim styling so it stands out even on an unfocused tab
+/// (the working agent usually isn't the one you're watching).
+///
+/// Padded to exactly `cols` visible columns. Labels + hint + marks
+/// are width-1, so visible width is the char count. Tabs that don't
+/// fit are dropped from the right; the hint is dropped only if it
+/// alone wouldn't fit.
 pub(crate) fn chrome_line(tabs: &[Tab], active: usize, hint: &str, cols: usize) -> String {
     let hint_seg = if hint.is_empty() {
         String::new()
@@ -170,19 +180,26 @@ pub(crate) fn chrome_line(tabs: &[Tab], active: usize, hint: &str, cols: usize) 
     let mut used = 0usize;
     for (i, tab) in tabs.iter().enumerate() {
         let mark = if tab.alive { "" } else { " ✗" };
-        let seg = format!(" {}:{}{} ", i + 1, tab.label, mark);
-        let w = seg.chars().count();
+        let body = format!("{}:{}{} ", i + 1, tab.label, mark);
+        // visible width = leading separator + optional ● + body
+        let w = 1 + usize::from(tab.working) + body.chars().count();
         if used + w > tab_budget {
             break;
         }
-        // Active = reverse video; others dim. The band is the focus
+        out.push(' ');
+        if tab.working {
+            // Green ● OUTSIDE the dim/reverse styling so it pops on
+            // any tab, focused or not.
+            out.push_str("\x1b[32m●\x1b[0m");
+        }
+        // Focused = reverse video; others dim. The band is the focus
         // cue, consistent with the status panel's `emit_selected`.
         if i == active {
             out.push_str("\x1b[7m");
         } else {
             out.push_str("\x1b[2m");
         }
-        out.push_str(&seg);
+        out.push_str(&body);
         out.push_str("\x1b[0m");
         used += w;
     }
@@ -225,6 +242,14 @@ mod tests {
             }
         }
         out
+    }
+
+    fn tab(label: &str, alive: bool, working: bool) -> Tab {
+        Tab {
+            label: label.into(),
+            alive,
+            working,
+        }
     }
 
     #[test]
@@ -294,32 +319,36 @@ mod tests {
     #[test]
     fn chrome_line_is_exactly_cols_wide_with_an_active_band() {
         let tabs = vec![
-            Tab {
-                label: "claude (master)".into(),
-                alive: true,
-            },
-            Tab {
-                label: "codex".into(),
-                alive: true,
-            },
-            Tab {
-                label: "status".into(),
-                alive: true,
-            },
+            tab("claude (master)", true, false),
+            tab("codex", true, false),
+            tab("status", true, false),
         ];
         let line = chrome_line(&tabs, 1, "", 80);
         assert_eq!(strip(&line).chars().count(), 80, "padded to full width");
-        // The active tab is wrapped in reverse-video; inactive in dim.
-        assert!(line.contains("\x1b[7m 2:codex \x1b[0m"));
-        assert!(line.contains("\x1b[2m 1:claude (master) \x1b[0m"));
+        // The focused tab's body is wrapped in reverse-video; inactive
+        // in dim. (The leading separator space is outside the band.)
+        assert!(line.contains("\x1b[7m2:codex \x1b[0m"));
+        assert!(line.contains("\x1b[2m1:claude (master) \x1b[0m"));
+    }
+
+    #[test]
+    fn chrome_line_marks_the_working_agent() {
+        let tabs = vec![tab("claude", true, true), tab("codex", true, false)];
+        let line = chrome_line(&tabs, 1, "", 80);
+        // A green ● sits left of the working (but unfocused) tab.
+        assert!(
+            line.contains("\x1b[32m●\x1b[0m"),
+            "working agent gets a green dot: {line:?}"
+        );
+        // The dot is rendered OUTSIDE the dim styling so it stays
+        // visible on an unfocused tab.
+        assert!(strip(&line).contains("●1:claude"));
+        assert_eq!(strip(&line).chars().count(), 80);
     }
 
     #[test]
     fn chrome_line_shows_a_right_aligned_hint() {
-        let tabs = vec![Tab {
-            label: "claude".into(),
-            alive: true,
-        }];
+        let tabs = vec![tab("claude", true, false)];
         let line = chrome_line(&tabs, 0, "^A n·p·q", 80);
         let plain = strip(&line);
         assert_eq!(plain.chars().count(), 80);
@@ -355,26 +384,14 @@ mod tests {
 
     #[test]
     fn chrome_line_marks_dead_children() {
-        let tabs = vec![Tab {
-            label: "codex".into(),
-            alive: false,
-        }];
+        let tabs = vec![tab("codex", false, false)];
         let line = chrome_line(&tabs, 0, "", 40);
         assert!(strip(&line).contains("1:codex ✗"));
     }
 
     #[test]
     fn chrome_line_drops_tabs_that_dont_fit() {
-        let tabs = vec![
-            Tab {
-                label: "aaaaaaaa".into(),
-                alive: true,
-            },
-            Tab {
-                label: "bbbbbbbb".into(),
-                alive: true,
-            },
-        ];
+        let tabs = vec![tab("aaaaaaaa", true, false), tab("bbbbbbbb", true, false)];
         // Width 14 fits only the first " 1:aaaaaaaa " (12 cols).
         let line = chrome_line(&tabs, 0, "", 14);
         let plain = strip(&line);
