@@ -125,8 +125,8 @@ mod tests {
             program: "printf".into(),
             args: vec!["hello console".into()],
         };
-        let screen = Screen::spawn(&spec, Path::new("/"), 24, 80, 0, tx)
-            .expect("spawn printf in a pty");
+        let screen =
+            Screen::spawn(&spec, Path::new("/"), 24, 80, 0, tx).expect("spawn printf in a pty");
 
         // Wait (bounded) for the child to write + exit.
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -140,11 +140,14 @@ mod tests {
         }
 
         let parser = screen.parser.lock().unwrap();
-        let row0 = parser.screen().contents().lines().next().unwrap_or("").to_string();
-        assert!(
-            row0.starts_with("hello console"),
-            "grid row 0 was {row0:?}"
-        );
+        let row0 = parser
+            .screen()
+            .contents()
+            .lines()
+            .next()
+            .unwrap_or("")
+            .to_string();
+        assert!(row0.starts_with("hello console"), "grid row 0 was {row0:?}");
     }
 
     #[test]

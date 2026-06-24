@@ -37,10 +37,10 @@ pub mod setup;
 pub mod shelve;
 pub mod status;
 pub(crate) mod status_tui;
-pub(crate) mod term;
 pub mod stop_hook;
 pub mod team;
 pub mod teams_config;
+pub(crate) mod term;
 pub mod unfinish;
 pub mod wait;
 

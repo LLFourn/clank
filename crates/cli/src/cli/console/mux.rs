@@ -224,9 +224,18 @@ mod tests {
     #[test]
     fn chrome_line_is_exactly_cols_wide_with_an_active_band() {
         let tabs = vec![
-            Tab { label: "claude (master)".into(), alive: true },
-            Tab { label: "codex".into(), alive: true },
-            Tab { label: "status".into(), alive: true },
+            Tab {
+                label: "claude (master)".into(),
+                alive: true,
+            },
+            Tab {
+                label: "codex".into(),
+                alive: true,
+            },
+            Tab {
+                label: "status".into(),
+                alive: true,
+            },
         ];
         let line = chrome_line(&tabs, 1, 80);
         assert_eq!(strip(&line).chars().count(), 80, "padded to full width");
@@ -237,7 +246,10 @@ mod tests {
 
     #[test]
     fn chrome_line_marks_dead_children() {
-        let tabs = vec![Tab { label: "codex".into(), alive: false }];
+        let tabs = vec![Tab {
+            label: "codex".into(),
+            alive: false,
+        }];
         let line = chrome_line(&tabs, 0, 40);
         assert!(strip(&line).contains("1:codex ✗"));
     }
@@ -245,8 +257,14 @@ mod tests {
     #[test]
     fn chrome_line_drops_tabs_that_dont_fit() {
         let tabs = vec![
-            Tab { label: "aaaaaaaa".into(), alive: true },
-            Tab { label: "bbbbbbbb".into(), alive: true },
+            Tab {
+                label: "aaaaaaaa".into(),
+                alive: true,
+            },
+            Tab {
+                label: "bbbbbbbb".into(),
+                alive: true,
+            },
         ];
         // Width 14 fits only the first " 1:aaaaaaaa " (12 cols).
         let line = chrome_line(&tabs, 0, 14);

@@ -84,8 +84,15 @@ pub(crate) fn spawn(
     // The parent never reads or writes the slave; the child has its
     // own copy via the fork. Close ours regardless of spawn result.
     unsafe { libc::close(slave) };
-    let child = spawned?;
-    Ok((master, child))
+    match spawned {
+        Ok(child) => Ok((master, child)),
+        Err(e) => {
+            // Don't leak the master fd when the program is missing /
+            // exec fails.
+            unsafe { libc::close(master) };
+            Err(e)
+        }
+    }
 }
 
 /// Resize a child's PTY. The kernel delivers SIGWINCH to the child's

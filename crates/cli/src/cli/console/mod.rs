@@ -206,9 +206,7 @@ fn run_console(repo: &Path, specs: Vec<Spec>) -> anyhow::Result<()> {
                         let (m, action) = mux::route(mode, b, prefix);
                         mode = m;
                         match action {
-                            Action::Forward(data) => {
-                                pty::write_all(screens[active].master, &data)
-                            }
+                            Action::Forward(data) => pty::write_all(screens[active].master, &data),
                             Action::Quit => {
                                 quit = true;
                                 break;
