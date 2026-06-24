@@ -49,8 +49,15 @@ impl Frame {
         clear_screen();
     }
 
-    /// Repaint from the active screen's grid plus the tab strip.
-    pub(crate) fn draw(&mut self, active: &vt100::Screen, tabs: &[Tab], active_idx: usize) {
+    /// Repaint from the active screen's grid plus the tab strip. The
+    /// `hint` is the dim right-aligned keybinding reminder.
+    pub(crate) fn draw(
+        &mut self,
+        active: &vt100::Screen,
+        tabs: &[Tab],
+        active_idx: usize,
+        hint: &str,
+    ) {
         let mut buf: Vec<u8> = Vec::new();
 
         // 1. Content region: the minimal diff from what's there now.
@@ -61,7 +68,7 @@ impl Frame {
         self.painted.process(&diff);
 
         // 2. Chrome bar at the bottom row — only when it changed.
-        let chrome = mux::chrome_line(tabs, active_idx, self.cols as usize);
+        let chrome = mux::chrome_line(tabs, active_idx, hint, self.cols as usize);
         if chrome != self.chrome {
             buf.extend_from_slice(format!("\x1b[{};1H", self.rows).as_bytes());
             buf.extend_from_slice(chrome.as_bytes());

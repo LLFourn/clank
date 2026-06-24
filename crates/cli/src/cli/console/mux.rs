@@ -99,19 +99,47 @@ pub(crate) struct Tab {
     pub(crate) alive: bool,
 }
 
-/// The bottom chrome bar: a numbered tab strip, active screen in
-/// reverse video, the rest dim, a dead child marked `✗`. Padded to
-/// exactly `cols` visible columns. Labels are ASCII (agent label +
-/// role + "status") and the mark is width-1, so visible width is the
-/// char count. Tabs that don't fit are dropped from the right.
-pub(crate) fn chrome_line(tabs: &[Tab], active: usize, cols: usize) -> String {
+/// A printable label for the prefix byte (`0x01` → `^A`), for the
+/// chrome hint. Falls back to hex for a non-control prefix.
+pub(crate) fn prefix_label(prefix: u8) -> String {
+    if (1..=26).contains(&prefix) {
+        format!("^{}", (b'A' + prefix - 1) as char)
+    } else {
+        format!("0x{prefix:02x}")
+    }
+}
+
+/// The bottom chrome bar: a numbered tab strip on the left (active in
+/// reverse video, the rest dim, a dead child marked `✗`) and a dim
+/// right-aligned keybinding hint so the prefix is discoverable — the
+/// console is meant to be a gentle entrypoint, and a new user must be
+/// able to find "how do I switch / quit" without a manual. Padded to
+/// exactly `cols` visible columns. Labels + hint are ASCII (the `✗`
+/// and `·` are width-1), so visible width is the char count. Tabs
+/// that don't fit are dropped from the right; the hint is dropped
+/// only if it alone wouldn't fit.
+pub(crate) fn chrome_line(tabs: &[Tab], active: usize, hint: &str, cols: usize) -> String {
+    let hint_seg = if hint.is_empty() {
+        String::new()
+    } else {
+        format!(" {hint} ")
+    };
+    let hint_w = hint_seg.chars().count();
+    // Reserve the hint on the right only if it fits with room to spare
+    // for at least part of a tab; otherwise give tabs the full width.
+    let tab_budget = if hint_w > 0 && hint_w < cols {
+        cols - hint_w
+    } else {
+        cols
+    };
+
     let mut out = String::new();
     let mut used = 0usize;
     for (i, tab) in tabs.iter().enumerate() {
         let mark = if tab.alive { "" } else { " ✗" };
         let seg = format!(" {}:{}{} ", i + 1, tab.label, mark);
         let w = seg.chars().count();
-        if used + w > cols {
+        if used + w > tab_budget {
             break;
         }
         // Active = reverse video; others dim. The band is the focus
@@ -124,6 +152,15 @@ pub(crate) fn chrome_line(tabs: &[Tab], active: usize, cols: usize) -> String {
         out.push_str(&seg);
         out.push_str("\x1b[0m");
         used += w;
+    }
+
+    if tab_budget < cols {
+        // Pad the gap, then the dim hint, flush right.
+        out.push_str(&" ".repeat(tab_budget - used));
+        out.push_str("\x1b[2m");
+        out.push_str(&hint_seg);
+        out.push_str("\x1b[0m");
+        used = cols;
     }
     if used < cols {
         out.push_str(&" ".repeat(cols - used));
@@ -237,11 +274,34 @@ mod tests {
                 alive: true,
             },
         ];
-        let line = chrome_line(&tabs, 1, 80);
+        let line = chrome_line(&tabs, 1, "", 80);
         assert_eq!(strip(&line).chars().count(), 80, "padded to full width");
         // The active tab is wrapped in reverse-video; inactive in dim.
         assert!(line.contains("\x1b[7m 2:codex \x1b[0m"));
         assert!(line.contains("\x1b[2m 1:claude (master) \x1b[0m"));
+    }
+
+    #[test]
+    fn chrome_line_shows_a_right_aligned_hint() {
+        let tabs = vec![Tab {
+            label: "claude".into(),
+            alive: true,
+        }];
+        let line = chrome_line(&tabs, 0, "^A n·p·q", 80);
+        let plain = strip(&line);
+        assert_eq!(plain.chars().count(), 80);
+        assert!(plain.contains("1:claude"));
+        // The hint is flush right.
+        assert!(
+            plain.ends_with("^A n·p·q "),
+            "hint at the right edge: {plain:?}"
+        );
+    }
+
+    #[test]
+    fn prefix_label_renders_control_bytes() {
+        assert_eq!(prefix_label(0x01), "^A");
+        assert_eq!(prefix_label(0x02), "^B");
     }
 
     #[test]
@@ -250,7 +310,7 @@ mod tests {
             label: "codex".into(),
             alive: false,
         }];
-        let line = chrome_line(&tabs, 0, 40);
+        let line = chrome_line(&tabs, 0, "", 40);
         assert!(strip(&line).contains("1:codex ✗"));
     }
 
@@ -267,7 +327,7 @@ mod tests {
             },
         ];
         // Width 14 fits only the first " 1:aaaaaaaa " (12 cols).
-        let line = chrome_line(&tabs, 0, 14);
+        let line = chrome_line(&tabs, 0, "", 14);
         let plain = strip(&line);
         assert!(plain.contains("1:aaaaaaaa"));
         assert!(!plain.contains("2:bbbbbbbb"));

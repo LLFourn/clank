@@ -184,8 +184,9 @@ fn run_console(repo: &Path, specs: Vec<Spec>) -> anyhow::Result<()> {
     let mut active = 0usize;
     let mut mode = Mode::Passthrough;
     let prefix = mux::DEFAULT_PREFIX;
+    let hint = format!("{} n·p·q", mux::prefix_label(prefix));
 
-    repaint(&mut frame, &screens, active);
+    repaint(&mut frame, &screens, active, &hint);
 
     // Batch each wakeup: drain everything currently queued, apply it,
     // and repaint at most once. This coalesces the repaint SIGNAL
@@ -251,7 +252,7 @@ fn run_console(repo: &Path, specs: Vec<Spec>) -> anyhow::Result<()> {
             break;
         }
         if need_repaint {
-            repaint(&mut frame, &screens, active);
+            repaint(&mut frame, &screens, active, &hint);
         }
     }
 
@@ -259,10 +260,10 @@ fn run_console(repo: &Path, specs: Vec<Spec>) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn repaint(frame: &mut render::Frame, screens: &[Screen], active: usize) {
+fn repaint(frame: &mut render::Frame, screens: &[Screen], active: usize, hint: &str) {
     let tabs: Vec<mux::Tab> = screens.iter().map(Screen::tab).collect();
     if let Ok(p) = screens[active].parser.lock() {
-        frame.draw(p.screen(), &tabs, active);
+        frame.draw(p.screen(), &tabs, active, hint);
     }
 }
 
