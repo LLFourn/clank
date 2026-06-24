@@ -86,13 +86,19 @@ pub(crate) struct AgentAutoRow {
 }
 
 /// A global-library agent that is NOT yet on this repo's roster — a
-/// candidate the `--tui` "+ add" picker can add as a reviewer. `tool`
-/// is shown so you know what you're adding. Read FRESH from the
-/// `~/.clank` library when the picker opens (not cached in the
-/// snapshot), so it can't go stale. Plan: tui-agents-panel-manage.
+/// candidate the `--tui` "+ add" picker can add as a reviewer. Read
+/// FRESH from the `~/.clank` library when the picker opens (not cached
+/// in the snapshot), so it can't go stale. `invocation` is the launch
+/// command + args (or the bare tool name) — what actually runs — and
+/// `description` is the agent's `initial_prompt`, the closest thing
+/// clank has to "what is this agent for" (there is no semantic purpose
+/// field yet). Plan: tui-agents-panel-manage.
+#[derive(Default)]
 pub(crate) struct AvailableAgent {
     pub(crate) label: String,
     pub(crate) tool: String,
+    pub(crate) invocation: String,
+    pub(crate) description: Option<String>,
 }
 
 /// Build the roster's auto-mode rows: master first, then reviewers in
@@ -152,9 +158,30 @@ pub(crate) fn available_agents(
     cfg.agents
         .iter()
         .filter(|(label, _)| !on_roster.contains(label.as_str()))
-        .map(|(label, desc)| AvailableAgent {
-            label: label.as_str().to_string(),
-            tool: desc.tool.as_str().to_string(),
+        .map(|(label, desc)| {
+            // The invocation that actually runs: launch command (or the
+            // bare tool name) + any launch args.
+            let cmd = desc
+                .launch
+                .as_ref()
+                .and_then(|l| l.command.clone())
+                .unwrap_or_else(|| desc.tool.as_str().to_string());
+            let args = desc
+                .launch
+                .as_ref()
+                .map(|l| l.args.join(" "))
+                .unwrap_or_default();
+            let invocation = if args.is_empty() {
+                cmd
+            } else {
+                format!("{cmd} {args}")
+            };
+            AvailableAgent {
+                label: label.as_str().to_string(),
+                tool: desc.tool.as_str().to_string(),
+                invocation,
+                description: desc.initial_prompt.clone(),
+            }
         })
         .collect()
 }

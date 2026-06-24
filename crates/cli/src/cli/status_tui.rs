@@ -87,36 +87,6 @@ fn label(name: &str) -> Span {
     dim(format!("{name:>5}  "))
 }
 
-/// The focus rail: a state-coloured left edge (`▌`) drawn down every
-/// row of the region that owns the keyboard, and a blank on the
-/// inactive one. A contiguous coloured left edge is the strongest
-/// "this block is live" cue in a monospace pane — the primary of the
-/// three redundant focus signals (rail, header marker, header hint).
-fn rail(focused: bool) -> Span {
-    if focused {
-        Span(Style::Accent, "▌".to_string())
-    } else {
-        plain(" ".to_string())
-    }
-}
-
-/// One focusable section's header: rail + a filled/hollow marker +
-/// the title (bright+UPPER when focused, dim+lower when not) + a
-/// mode-specific key hint. The header is the second focus cue and the
-/// hint the third.
-fn section_header(focused: bool, title: &str, hint: &str) -> Vec<Span> {
-    let (style, marker, title) = if focused {
-        (Style::Highlight, "◉ ", title.to_uppercase())
-    } else {
-        (Style::Dim, "○ ", title.to_lowercase())
-    };
-    vec![
-        rail(focused),
-        Span(style, format!("{marker}{title}")),
-        dim(format!("  {hint}")),
-    ]
-}
-
 /// The armed auto-mode mark in a FIXED [`MARK_FIELD`]-wide field —
 /// `▶` (playing, green) when auto runs the agent's loop, `⏸` (paused,
 /// dim) when parked. Padding the glyph into a fixed field (not relying
@@ -196,6 +166,13 @@ pub(crate) fn render_at(
     let rows = rows.max(1) as usize;
     let cols = cols.max(1) as usize;
     let color = state_color(snap);
+
+    // The add picker is a DEDICATED full screen — it replaces the normal
+    // bar/gauges/log layout while open, with room to show each
+    // candidate's invocation + description.
+    if let Mode::AddPicker { sel } = mode {
+        return render_add_screen(picker, rows, cols, sel);
+    }
 
     let mut out: Vec<String> = Vec::with_capacity(rows);
     out.push(bar(snap, color, cols));
@@ -321,100 +298,63 @@ pub(crate) fn render_at(
         }
     }
 
-    // AGENTS — the focusable roster section. Each agent's armed
-    // auto-mode reads as ▶ play / ⏸ pause (the EFFECTIVE mode that
-    // governs its NEXT Stop-hook decision — NOT a live run/stop
-    // indicator). When the panel owns the keyboard it carries the
-    // focus rail + a bright header; Tab toggles control with the log.
-    // Gated on a non-empty roster so a teamless repo (and every
-    // panel-less render path) is byte-for-byte unchanged.
+    // Greedy fit: bar (+breath) then the gauge body until rows run out.
+    // (The AGENTS + LOG sections render below, after the gauges.)
+    if breath && out.len() < rows && !body.is_empty() {
+        out.push(String::new());
+    }
+    for line in body {
+        if out.len() >= rows {
+            break;
+        }
+        out.push(emit(&line, color, cols));
+    }
+
+    // AGENTS — the focusable roster section, rendered directly so it can
+    // carry the full-width focus rule and the full-row selection band.
+    // The armed auto-mode reads as ▶ play / ⏸ pause (the EFFECTIVE mode
+    // governing each agent's NEXT Stop-hook decision — NOT a live
+    // run/stop indicator). Gated on a non-empty roster so a teamless
+    // repo (and every panel-less render) is byte-for-byte unchanged.
     let agents_focused = mode.agents_focused();
-    if !snap.agents.is_empty() {
-        let hint = if agents_focused {
-            "↑↓ move · SPC play/pause · Tab → log"
-        } else {
-            "Tab to manage"
-        };
-        body.push(section_header(agents_focused, "agents", hint));
+    if !snap.agents.is_empty() && out.len() < rows {
+        let hint = "↑↓ move · SPC play/pause · ⏎ add · DEL remove";
+        out.push(region_rule("agents", hint, agents_focused, cols));
+        // Each agent row; the cursor row gets the unified selection band.
         for (i, a) in snap.agents.iter().enumerate() {
-            let selected = mode.selected() == Some(i);
+            if out.len() >= rows {
+                break;
+            }
             let role = match a.role {
                 clank_core::vocab::Role::Master => "master",
                 clank_core::vocab::Role::Reviewer => "reviewer",
             };
-            body.push(vec![
-                rail(agents_focused),
-                plain(if selected { "▸ " } else { "  " }.to_string()),
+            let spans = vec![
+                plain("  ".to_string()),
                 auto_mark(a.auto_mode),
-                Span(
-                    if selected {
-                        Style::Accent
-                    } else {
-                        Style::Plain
-                    },
-                    format!(" {}", a.label),
-                ),
+                plain(format!(" {}", a.label)),
                 dim(format!("  {role}")),
-            ]);
+            ];
+            out.push(row_line(&spans, mode.selected() == Some(i), color, cols));
         }
         // "+ add" button — the last selectable row (cursor index
-        // `agents.len()`). Reads as a button: dim until the cursor lands
-        // on it, then accent.
-        let add_selected = mode.selected() == Some(snap.agents.len());
-        body.push(vec![
-            rail(agents_focused),
-            plain(if add_selected { "▸ " } else { "  " }.to_string()),
-            Span(
-                if add_selected {
-                    Style::Accent
-                } else {
-                    Style::Dim
-                },
-                "+ add agent".to_string(),
-            ),
-        ]);
-
+        // `agents.len()`).
+        if out.len() < rows {
+            let add_selected = mode.selected() == Some(snap.agents.len());
+            let spans = vec![plain("  + add agent".to_string())];
+            out.push(row_line(&spans, add_selected, color, cols));
+        }
         // A transient notice (e.g. DEL on the master row), set by the
         // last keystroke and cleared by the next.
-        if let Some(msg) = notice {
-            body.push(vec![
-                rail(agents_focused),
-                Span(Style::Accent, format!("  {msg}")),
-            ]);
+        if let Some(msg) = notice
+            && out.len() < rows
+        {
+            out.push(emit(
+                &[Span(Style::Accent, format!("  {msg}"))],
+                color,
+                cols,
+            ));
         }
-
-        // AddPicker overlay — the freshly-read candidate list.
-        if let Mode::AddPicker { sel } = mode {
-            body.push(vec![
-                rail(true),
-                Span(Style::Highlight, "  add agent".to_string()),
-                dim("  ⏎ choose · Esc cancel".to_string()),
-            ]);
-            if picker.is_empty() {
-                body.push(vec![
-                    rail(true),
-                    dim("  none available — clank agent add --global".to_string()),
-                ]);
-            } else {
-                for (i, c) in picker.iter().enumerate() {
-                    let selected = sel == i;
-                    body.push(vec![
-                        rail(true),
-                        plain(if selected { "▸ " } else { "  " }.to_string()),
-                        Span(
-                            if selected {
-                                Style::Accent
-                            } else {
-                                Style::Plain
-                            },
-                            c.label.clone(),
-                        ),
-                        dim(format!("  {}", c.tool)),
-                    ]);
-                }
-            }
-        }
-
         // Confirm modal — names the action, the committed-config
         // consequence, and which key is the (safe) default.
         if let Mode::Confirm { action } = mode {
@@ -436,27 +376,24 @@ pub(crate) fn render_at(
             } else {
                 "[y]es  [N]o  (⏎ = no)"
             };
-            body.push(vec![
-                rail(true),
-                Span(Style::Highlight, format!("confirm: {verb} “{who}”")),
-            ]);
-            body.push(vec![
-                rail(true),
-                dim("edits the committed team config · ".to_string()),
-                Span(Style::Accent, keys.to_string()),
-            ]);
+            if out.len() < rows {
+                out.push(emit(
+                    &[Span(Style::Highlight, format!("confirm: {verb} “{who}”"))],
+                    color,
+                    cols,
+                ));
+            }
+            if out.len() < rows {
+                out.push(emit(
+                    &[
+                        dim("edits the committed team config · ".to_string()),
+                        Span(Style::Accent, keys.to_string()),
+                    ],
+                    color,
+                    cols,
+                ));
+            }
         }
-    }
-
-    // Greedy fit: bar (+breath) then body lines until rows run out.
-    if breath && out.len() < rows && !body.is_empty() {
-        out.push(String::new());
-    }
-    for line in body {
-        if out.len() >= rows {
-            break;
-        }
-        out.push(emit(&line, color, cols));
     }
 
     // `log` — the LOWEST tier (status-tui-live-log): recent
@@ -475,25 +412,21 @@ pub(crate) fn render_at(
     let mut log_capacity = 0usize;
     // The log is a focusable region ONLY when there's an agents panel to
     // switch focus with — so a panel-less render keeps the bare log
-    // (no header, no rail), unchanged.
+    // (no rule), unchanged.
     let has_panel = !snap.agents.is_empty();
     let log_focused = mode.log_focused();
     // Render the log region when it has content OR when there's a panel
     // to switch focus with (so both focusable regions, and which one is
-    // live, stay visible even with an empty log).
+    // live, stay visible even with an empty log). When a panel is
+    // present the LOG rule is also the breaker between panel and log.
     if out.len() < rows && (total > 0 || has_panel) {
         let mut avail = rows - out.len();
-        if avail >= 2 {
-            out.push(String::new());
-            avail -= 1;
-        }
         if has_panel && avail >= 1 {
-            let hint = if log_focused {
-                "↑↓ scroll · Tab → agents"
-            } else {
-                "Tab to focus"
-            };
-            out.push(emit(&section_header(log_focused, "log", hint), color, cols));
+            out.push(region_rule("log", "↑↓ scroll", log_focused, cols));
+            avail -= 1;
+        } else if avail >= 2 {
+            // Panel-less: keep the old blank separator, unchanged.
+            out.push(String::new());
             avail -= 1;
         }
         log_capacity = avail;
@@ -524,16 +457,7 @@ pub(crate) fn render_at(
                     Seg::Log(row) => log_row_spans(row, author_width),
                     Seg::InProg(item) => in_progress_spans(item, frame, author_width),
                 };
-                // Prefix the focus rail when the log is a focusable region,
-                // so the active edge runs the full height of the log too.
-                let row = if has_panel {
-                    let mut r = vec![rail(log_focused)];
-                    r.extend(spans);
-                    r
-                } else {
-                    spans
-                };
-                out.push(emit(&row, color, cols));
+                out.push(emit(&spans, color, cols));
             }
         }
     }
@@ -1221,6 +1145,98 @@ fn emit(spans: &[Span], color: &str, cols: usize) -> String {
     out
 }
 
+/// The unified "selected" indicator: render a row as one solid
+/// full-width reverse-video band, padding to `cols` so the WHOLE line
+/// reads as selected. Per-span styling is dropped — the band is the
+/// emphasis — and the width is display-aware (no ragged edge on a wide
+/// glyph or trailing pad). One selection style, drawn one way, for
+/// agent / "+ add" / picker rows alike.
+fn emit_selected(spans: &[Span], cols: usize) -> String {
+    let text: String = spans.iter().map(|Span(_, t)| t.as_str()).collect();
+    let text = truncate_to(&text, cols);
+    let pad = cols.saturating_sub(display_width(&text));
+    format!("\x1b[7m{text}{}\x1b[0m", " ".repeat(pad))
+}
+
+/// Emit a panel row: the unified selection band when it's the cursor
+/// row, else normal per-span styling.
+fn row_line(spans: &[Span], selected: bool, color: &str, cols: usize) -> String {
+    if selected {
+        emit_selected(spans, cols)
+    } else {
+        emit(spans, color, cols)
+    }
+}
+
+/// The full-screen "+ add" picker: a title rule, one block per
+/// candidate (label + tool + the invocation that runs it, with its
+/// `initial_prompt` as a dim description when present), and a footer.
+/// The selected candidate gets the unified selection band. Returns
+/// `(lines, 0)` — a picker has no scrollable log.
+fn render_add_screen(
+    picker: &[crate::cli::status::AvailableAgent],
+    rows: usize,
+    cols: usize,
+    sel: usize,
+) -> (Vec<String>, usize) {
+    let mut out: Vec<String> = Vec::new();
+    out.push(region_rule("add a reviewer", "", true, cols));
+    out.push(String::new());
+    if picker.is_empty() {
+        out.push(emit(
+            &[dim(
+                "  no agents available — declare one with `clank agent add --global`".to_string(),
+            )],
+            "",
+            cols,
+        ));
+    } else {
+        for (i, c) in picker.iter().enumerate() {
+            if out.len() >= rows.saturating_sub(2) {
+                break;
+            }
+            let spans = vec![
+                plain(format!("  {}", c.label)),
+                dim(format!("  [{}]", c.tool)),
+                plain(format!("  {}", c.invocation)),
+            ];
+            out.push(row_line(&spans, i == sel, "", cols));
+            if let Some(desc) = &c.description {
+                out.push(emit(&[dim(format!("      {desc}"))], "", cols));
+            }
+        }
+    }
+    out.push(String::new());
+    out.push(emit(
+        &[dim("  ↑↓ move · ⏎ add · Esc cancel".to_string())],
+        "",
+        cols,
+    ));
+    (out, 0)
+}
+
+/// A full-width titled rule marking a focusable region — the region
+/// focus cue (selection is [`emit_selected`]). The FOCUSED region is a
+/// solid reverse-video band carrying the title + active-key hint; the
+/// unfocused one is a thin dim rule. This replaces the per-row rail and
+/// the ◉/○ markers.
+fn region_rule(title: &str, hint: &str, focused: bool, cols: usize) -> String {
+    if focused {
+        let head = if hint.is_empty() {
+            format!(" {} ", title.to_uppercase())
+        } else {
+            format!(" {}   {hint} ", title.to_uppercase())
+        };
+        let head = truncate_to(&head, cols);
+        let pad = cols.saturating_sub(display_width(&head));
+        format!("\x1b[1;7m{head}{}\x1b[0m", " ".repeat(pad))
+    } else {
+        let head = truncate_to(&format!("── {} ", title.to_uppercase()), cols);
+        let fill = cols.saturating_sub(display_width(&head));
+        format!("\x1b[2m{head}{}\x1b[0m", "─".repeat(fill))
+    }
+}
+
 /// Display columns a char occupies in the terminal. Not a full
 /// unicode-width implementation: rendered content is validated
 /// ASCII (plan stems, agent labels, gate names) plus the fixed
@@ -1503,6 +1519,8 @@ enum PanelAction {
     LeaveFocus,
     /// Move the cursor to this row.
     MoveCursor(usize),
+    /// `Down` past the last panel row ("+ add") — cross into the log.
+    EnterLog,
     /// Toggle auto on the agent at this index.
     ToggleAuto(usize),
     /// Open the add picker (Enter/Space on the "+ add" row).
@@ -1526,6 +1544,9 @@ fn agent_panel_action(
         Key::Quit => PanelAction::Quit,
         Key::Focus | Key::Escape => PanelAction::LeaveFocus,
         Key::Up => PanelAction::MoveCursor(move_selection(sel, add_row + 1, false)),
+        // `Down` past the bottom row ("+ add") flows into the log —
+        // continuous navigation across the panel↔log boundary.
+        Key::Down if on_add => PanelAction::EnterLog,
         Key::Down => PanelAction::MoveCursor(move_selection(sel, add_row + 1, true)),
         // Enter/Space activate the "+ add" row; Space also toggles auto
         // on an agent row (Enter on an agent row is a no-op).
@@ -1539,6 +1560,14 @@ fn agent_panel_action(
         },
         _ => PanelAction::None,
     }
+}
+
+/// The log-side half of continuous navigation: pressing `Up` in the
+/// log returns `Some(panel_row)` when already at the top (cross back
+/// into the panel, landing on the "+ add" row adjacent to the log),
+/// else `None` (just scroll up). Pure so the boundary stays tested.
+fn log_up_target(offset: usize, agents_len: usize) -> Option<usize> {
+    (offset == 0 && agents_len > 0).then_some(agents_len)
 }
 
 /// Resolve a Confirm keystroke: `Some(true)` confirm, `Some(false)`
@@ -2122,6 +2151,11 @@ pub(crate) async fn run_tui(
                                 mode = toggle_focus(mode, snapshot.agents.len())
                             }
                             PanelAction::MoveCursor(s) => mode = Mode::AgentPanel { sel: s },
+                            PanelAction::EnterLog => {
+                                // Cross into the log at the top.
+                                offset = 0;
+                                mode = Mode::LogScroll;
+                            }
                             PanelAction::ToggleAuto(i) => {
                                 if let Some(row) = snapshot.agents.get(i) {
                                     let next = flip_auto(row.auto_mode);
@@ -2216,11 +2250,15 @@ pub(crate) async fn run_tui(
                             };
                         }
                     }
-                    // Default: keys scroll the log.
+                    // Default: keys scroll the log. `Up` at the very top
+                    // crosses back into the panel (continuous nav).
                     Mode::LogScroll => match k {
                         Key::Quit => break,
                         Key::Focus => mode = toggle_focus(mode, snapshot.agents.len()),
-                        Key::Up => offset = offset.saturating_sub(1),
+                        Key::Up => match log_up_target(offset, snapshot.agents.len()) {
+                            Some(sel) => mode = Mode::AgentPanel { sel },
+                            None => offset = offset.saturating_sub(1),
+                        },
                         Key::Down => offset += 1,
                         Key::PageUp => offset = offset.saturating_sub(page),
                         Key::Space | Key::PageDown => offset += page,
@@ -2428,34 +2466,34 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn agent_panel_shows_play_pause_and_focus_cursor() {
-        use clank_core::vocab::{AutoMode, Role};
-        let mut s = snap(vec![], vec![]);
-        s.agents = vec![
-            agent_row("claude", Role::Master, AutoMode::On),
-            agent_row("codex", Role::Reviewer, AutoMode::Off),
-        ];
+    fn agent_panel_play_pause_and_region_focus() {
+        let s = two_agent_snap();
 
-        // Log-focused: roster listed with play/pause marks; the AGENTS
-        // header reads dim+hollow (not focused) and there is no cursor on
-        // an agent row.
-        let log = render_at(&s, 40, 80, 0, 0, &PanelView::just(Mode::LogScroll))
-            .0
-            .join("\n");
-        assert!(log.contains("claude"), "master listed: {log}");
-        assert!(log.contains("codex"), "reviewer listed");
-        assert!(log.contains('▶'), "play mark (auto on) drawn");
-        assert!(log.contains('⏸'), "pause mark (auto off) drawn");
+        // Log-focused: roster listed with play/pause marks; the LOG rule
+        // is the highlighted (focused) one, AGENTS is the dim rule; no
+        // circles, no rail, no selection band on an agent row.
+        let log = render_at(&s, 40, 80, 0, 0, &PanelView::just(Mode::LogScroll)).0;
+        let log_j = log.join("\n");
         assert!(
-            log.contains("○ agents"),
-            "agents header hollow when unfocused"
+            log_j.contains('▶') && log_j.contains('⏸'),
+            "play/pause marks"
         );
-        assert!(log.contains("◉ LOG"), "log header filled when focused");
-        assert!(!log.contains('▸'), "no agent cursor when log-focused");
+        assert!(
+            line_with(&log, "LOG").contains(RULE_FOCUSED),
+            "LOG rule highlighted when log-focused"
+        );
+        assert!(
+            !line_with(&log, "AGENTS").contains(RULE_FOCUSED),
+            "AGENTS rule dim when log-focused"
+        );
+        assert!(
+            !log_j.contains('○') && !log_j.contains('◉') && !log_j.contains('▌'),
+            "no circle markers, no rail (M3)"
+        );
 
-        // Agents-focused on the second row: the headers swap emphasis, a
-        // cursor marks codex, and the focus rail appears.
-        let agents = render_at(
+        // Agents-focused on codex (row 1): AGENTS rule highlights, LOG
+        // dims, and the codex row is the full-row selection band.
+        let ag = render_at(
             &s,
             40,
             80,
@@ -2463,17 +2501,18 @@ pub(crate) mod tests {
             0,
             &PanelView::just(Mode::AgentPanel { sel: 1 }),
         )
-        .0
-        .join("\n");
+        .0;
         assert!(
-            agents.contains("◉ AGENTS"),
-            "agents header filled when focused"
+            line_with(&ag, "AGENTS").contains(RULE_FOCUSED),
+            "AGENTS rule highlighted when agents-focused"
         );
-        assert!(agents.contains("○ log"), "log header hollow when unfocused");
-        assert!(agents.contains('▸'), "cursor present when agents-focused");
         assert!(
-            agents.contains('▌'),
-            "focus rail drawn on the active region"
+            !line_with(&ag, "LOG").contains(RULE_FOCUSED),
+            "LOG rule dim when agents-focused"
+        );
+        assert!(
+            line_with(&ag, "codex").contains(REVERSE),
+            "selected agent row is the unified selection band"
         );
     }
 
@@ -2487,9 +2526,34 @@ pub(crate) mod tests {
         s
     }
 
+    /// The candidate list the picker renders, with invocation + desc.
+    fn cand(label: &str, tool: &str, invocation: &str) -> crate::cli::status::AvailableAgent {
+        crate::cli::status::AvailableAgent {
+            label: label.to_string(),
+            tool: tool.to_string(),
+            invocation: invocation.to_string(),
+            description: None,
+        }
+    }
+
+    /// The single line containing `needle` (for SGR-on-the-right-line
+    /// assertions), or "" if none.
+    fn line_with<'a>(lines: &'a [String], needle: &str) -> &'a str {
+        lines
+            .iter()
+            .find(|l| l.contains(needle))
+            .map(String::as_str)
+            .unwrap_or("")
+    }
+
+    const REVERSE: &str = "\x1b[7m"; // emit_selected band
+    const RULE_FOCUSED: &str = "\x1b[1;7m"; // focused region_rule bar
+
     #[test]
-    fn agent_panel_renders_the_add_button_and_cursor() {
+    fn agent_panel_add_button_uses_the_unified_selection_band() {
         let s = two_agent_snap();
+        // Cursor on an agent row: the "+ add" line is present but NOT the
+        // selection band.
         let on_agent = render_at(
             &s,
             40,
@@ -2498,10 +2562,17 @@ pub(crate) mod tests {
             0,
             &PanelView::just(Mode::AgentPanel { sel: 0 }),
         )
-        .0
-        .join("\n");
-        assert!(on_agent.contains("+ add agent"), "add button present");
-        // Cursor on the +add row (index == agents.len()).
+        .0;
+        assert!(
+            line_with(&on_agent, "+ add agent").contains("+ add agent"),
+            "add button present"
+        );
+        assert!(
+            !line_with(&on_agent, "+ add agent").contains(REVERSE),
+            "+ add not banded when an agent row is selected"
+        );
+        // Cursor on the "+ add" row (index == agents.len()): it gets the
+        // SAME full-row band as a selected agent — so it's unmistakable.
         let on_add = render_at(
             &s,
             40,
@@ -2510,29 +2581,19 @@ pub(crate) mod tests {
             0,
             &PanelView::just(Mode::AgentPanel { sel: 2 }),
         )
-        .0
-        .join("\n");
+        .0;
         assert!(
-            on_add
-                .lines()
-                .any(|l| l.contains("+ add agent") && l.contains('▸')),
-            "cursor on the add button: {on_add}"
+            line_with(&on_add, "+ add agent").contains(REVERSE),
+            "+ add row is the unified selection band when selected"
         );
     }
 
     #[test]
-    fn add_picker_lists_candidates_with_tools() {
+    fn add_picker_is_full_screen_with_invocation_and_selection() {
         let s = two_agent_snap();
-        let picker = vec![
-            crate::cli::status::AvailableAgent {
-                label: "ruthless".to_string(),
-                tool: "claude".to_string(),
-            },
-            crate::cli::status::AvailableAgent {
-                label: "gemini".to_string(),
-                tool: "gemini".to_string(),
-            },
-        ];
+        let mut ruthless = cand("ruthless", "claude", "claude --model opus");
+        ruthless.description = Some("tears through code".to_string());
+        let picker = vec![ruthless, cand("scout", "codex", "codex")];
         let out = render_at(
             &s,
             40,
@@ -2545,12 +2606,27 @@ pub(crate) mod tests {
                 notice: None,
             },
         )
-        .0
-        .join("\n");
-        assert!(out.contains("add agent"), "picker header");
-        assert!(out.contains("ruthless"), "candidate listed");
-        assert!(out.contains("gemini"), "candidate + its tool listed");
-        assert!(out.contains("Esc cancel"), "picker hint");
+        .0;
+        let j = out.join("\n");
+        assert!(j.contains("ADD A REVIEWER"), "full-screen title");
+        // It REPLACES the normal layout: no gauges/log leak through.
+        assert!(
+            !j.contains("git"),
+            "full screen, not the normal layout: {j}"
+        );
+        // Each candidate shows its invocation args + (when set) a desc.
+        assert!(j.contains("claude --model opus"), "invocation args shown");
+        assert!(
+            j.contains("tears through code"),
+            "initial_prompt description"
+        );
+        assert!(j.contains("scout"), "second candidate listed");
+        assert!(j.contains("Esc cancel"), "footer hint");
+        // The selected candidate is the unified selection band.
+        assert!(
+            line_with(&out, "ruthless").contains(REVERSE),
+            "selected candidate is the band"
+        );
     }
 
     #[test]
@@ -2567,7 +2643,7 @@ pub(crate) mod tests {
         .0
         .join("\n");
         assert!(
-            out.contains("none available") && out.contains("--global"),
+            out.contains("no agents available") && out.contains("--global"),
             "empty picker points at `clank agent add --global`: {out}"
         );
     }
@@ -2600,10 +2676,7 @@ pub(crate) mod tests {
         );
 
         // Add: default Yes.
-        let picker = vec![crate::cli::status::AvailableAgent {
-            label: "ruthless".to_string(),
-            tool: "claude".to_string(),
-        }];
+        let picker = vec![cand("ruthless", "claude", "claude")];
         let add = render_at(
             &s,
             40,
@@ -2666,20 +2739,37 @@ pub(crate) mod tests {
             agent_panel_action(0, &agents, Key::Delete),
             PanelAction::MasterNotice
         );
-        // Navigation clamps at the +add row; Tab/Esc leave; q quits.
+        // Navigation: Down within the panel moves; Down at the +add row
+        // (index 2 == agents.len()) crosses into the log; Tab/Esc leave;
+        // q quits.
         assert_eq!(
             agent_panel_action(0, &agents, Key::Down),
             PanelAction::MoveCursor(1)
         );
         assert_eq!(
             agent_panel_action(2, &agents, Key::Down),
-            PanelAction::MoveCursor(2)
+            PanelAction::EnterLog,
+            "Down past +add flows into the log"
+        );
+        assert_eq!(
+            agent_panel_action(0, &agents, Key::Up),
+            PanelAction::MoveCursor(0),
+            "Up at the top stays put"
         );
         assert_eq!(
             agent_panel_action(1, &agents, Key::Focus),
             PanelAction::LeaveFocus
         );
         assert_eq!(agent_panel_action(1, &agents, Key::Quit), PanelAction::Quit);
+    }
+
+    #[test]
+    fn log_up_target_crosses_to_panel_only_at_the_top() {
+        // At the top of the log, Up crosses back to the panel's +add row
+        // (index == agents.len()); otherwise it scrolls (None).
+        assert_eq!(log_up_target(0, 2), Some(2), "top → +add row");
+        assert_eq!(log_up_target(3, 2), None, "mid-log → scroll");
+        assert_eq!(log_up_target(0, 0), None, "no roster → nothing to cross to");
     }
 
     #[test]
@@ -2768,10 +2858,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         let s = two_agent_snap();
-        let picker = vec![crate::cli::status::AvailableAgent {
-            label: "ruthless".to_string(),
-            tool: "claude".to_string(),
-        }];
+        let picker = vec![cand("ruthless", "claude", "claude")];
         apply_confirm(
             ConfirmAction::AddCandidate { idx: 0 },
             repo.path(),
