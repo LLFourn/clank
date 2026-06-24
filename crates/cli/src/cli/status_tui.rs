@@ -87,6 +87,16 @@ fn label(name: &str) -> Span {
     dim(format!("{name:>5}  "))
 }
 
+/// The roster tier as shown in the UI: `master` / `commit` / `gate`.
+fn tier_label(role: crate::cli::teams_config::RosterRole) -> &'static str {
+    use crate::cli::teams_config::RosterRole;
+    match role {
+        RosterRole::Master => "master",
+        RosterRole::Commit => "commit",
+        RosterRole::Gate => "gate",
+    }
+}
+
 /// The armed auto-mode mark in a FIXED [`MARK_FIELD`]-wide field —
 /// `▶` (playing, green) when auto runs the agent's loop, `⏸` (paused,
 /// dim) when parked. Padding the glyph into a fixed field (not relying
@@ -162,16 +172,22 @@ pub(crate) fn render_at(
 ) -> (Vec<String>, usize) {
     let mode = view.mode;
     let picker = view.picker;
-    let notice = view.notice;
     let rows = rows.max(1) as usize;
     let cols = cols.max(1) as usize;
     let color = state_color(snap);
 
-    // The add picker is a DEDICATED full screen — it replaces the normal
-    // bar/gauges/log layout while open, with room to show each
-    // candidate's invocation + description.
+    // The add picker and the per-agent detail page are DEDICATED full
+    // screens — they replace the normal bar/gauges/log layout while open.
     if let Mode::AddPicker { sel } = mode {
         return render_add_screen(picker, rows, cols, sel);
+    }
+    // (A stale `idx` — roster shrank under us — falls through to the
+    // panel; the loop's Refresh reset moves the mode off detail next tick.)
+    if let Mode::AgentDetail { idx, sel } = mode
+        && let Some(agent) = snap.agents.get(idx)
+    {
+        let actions = detail_actions(agent.role);
+        return render_agent_detail(agent, &actions, sel, rows, cols);
     }
 
     let mut out: Vec<String> = Vec::with_capacity(rows);
@@ -318,22 +334,19 @@ pub(crate) fn render_at(
     // repo (and every panel-less render) is byte-for-byte unchanged.
     let agents_focused = mode.agents_focused();
     if !snap.agents.is_empty() && out.len() < rows {
-        let hint = "↑↓ move · SPC play/pause · ⏎ add · DEL remove";
+        let hint = "↑↓ move · SPC play/pause · ⏎ details";
         out.push(region_rule("agents", hint, agents_focused, cols));
         // Each agent row; the cursor row gets the unified selection band.
+        // The tier (master/commit/gate) distinguishes the kinds.
         for (i, a) in snap.agents.iter().enumerate() {
             if out.len() >= rows {
                 break;
             }
-            let role = match a.role {
-                clank_core::vocab::Role::Master => "master",
-                clank_core::vocab::Role::Reviewer => "reviewer",
-            };
             let spans = vec![
                 plain("  ".to_string()),
                 auto_mark(a.auto_mode),
                 plain(format!(" {}", a.label)),
-                dim(format!("  {role}")),
+                dim(format!("  {}", tier_label(a.role))),
             ];
             out.push(row_line(&spans, mode.selected() == Some(i), color, cols));
         }
@@ -343,17 +356,6 @@ pub(crate) fn render_at(
             let add_selected = mode.selected() == Some(snap.agents.len());
             let spans = vec![plain("  + add agent".to_string())];
             out.push(row_line(&spans, add_selected, color, cols));
-        }
-        // A transient notice (e.g. DEL on the master row), set by the
-        // last keystroke and cleared by the next.
-        if let Some(msg) = notice
-            && out.len() < rows
-        {
-            out.push(emit(
-                &[Span(Style::Accent, format!("  {msg}"))],
-                color,
-                cols,
-            ));
         }
         // Confirm modal — names the action, the committed-config
         // consequence, and which key is the (safe) default.
@@ -1246,6 +1248,103 @@ fn render_add_screen(
     (out, 0)
 }
 
+/// The label for a detail-page action, given the agent it acts on
+/// (so "switch tier" and "toggle auto" name their destination).
+fn detail_action_label(action: DetailAction, agent: &crate::cli::status::AgentAutoRow) -> String {
+    use clank_core::vocab::AutoMode;
+    match action {
+        DetailAction::ToggleAuto => format!(
+            "toggle auto (→ {})",
+            if agent.auto_mode == AutoMode::On {
+                "off"
+            } else {
+                "on"
+            }
+        ),
+        DetailAction::SwitchTier => {
+            let to = match agent.role {
+                crate::cli::teams_config::RosterRole::Commit => "gate",
+                _ => "commit",
+            };
+            format!("switch tier → {to}")
+        }
+        DetailAction::PromoteToMaster => "promote to master".to_string(),
+        DetailAction::Remove => "remove from team".to_string(),
+        DetailAction::Back => "← back".to_string(),
+    }
+}
+
+/// The full-screen per-agent detail/config page: an info block (tool,
+/// tier, auto, invocation, purpose) then the selectable action menu.
+/// Like the picker it is hard-clamped to `rows` with single-line fields,
+/// so a multiline `initial_prompt` cannot overflow. The selected action
+/// gets the unified selection band. Returns `(lines, 0)` — no log.
+fn render_agent_detail(
+    agent: &crate::cli::status::AgentAutoRow,
+    actions: &[DetailAction],
+    sel: usize,
+    rows: usize,
+    cols: usize,
+) -> (Vec<String>, usize) {
+    use clank_core::vocab::AutoMode;
+    let mut out: Vec<String> = Vec::new();
+    out.push(region_rule(
+        &format!("agent · {}", agent.label),
+        "",
+        true,
+        cols,
+    ));
+    out.push(String::new());
+    let auto = if agent.auto_mode == AutoMode::On {
+        "▶ on"
+    } else {
+        "⏸ off"
+    };
+    let purpose = agent
+        .description
+        .as_deref()
+        .filter(|d| !d.trim().is_empty())
+        .unwrap_or("—");
+    let info = [
+        ("tool", agent.tool.clone()),
+        ("tier", tier_label(agent.role).to_string()),
+        ("auto", auto.to_string()),
+        ("invocation", one_line(&agent.invocation, cols)),
+        ("purpose", one_line(purpose, cols)),
+    ];
+    for (k, v) in info {
+        if out.len() >= rows {
+            break;
+        }
+        out.push(emit(&[dim(format!("   {k:<11}")), plain(v)], "", cols));
+    }
+    if out.len() < rows {
+        out.push(String::new());
+    }
+    if out.len() < rows {
+        out.push(region_rule("actions", "", false, cols));
+    }
+    for (i, a) in actions.iter().enumerate() {
+        if out.len() >= rows.saturating_sub(1) {
+            break;
+        }
+        let spans = vec![plain(format!("  {}", detail_action_label(*a, agent)))];
+        out.push(row_line(&spans, i == sel, "", cols));
+    }
+    if out.len() < rows {
+        out.push(String::new());
+    }
+    if out.len() < rows {
+        out.push(emit(
+            &[dim("  ↑↓ move · ⏎ select · Esc back".to_string())],
+            "",
+            cols,
+        ));
+    }
+    out.truncate(rows);
+    (out, 0)
+}
+
 /// A full-width titled rule marking a focusable region — the region
 /// focus cue (selection is [`emit_selected`]). The FOCUSED region is a
 /// solid reverse-video band carrying the title + active-key hint; the
@@ -1475,9 +1574,71 @@ pub(crate) enum Mode {
     /// Choosing a library agent to add; `sel` indexes the freshly-read
     /// candidate list the loop holds.
     AddPicker { sel: usize },
+    /// The per-agent detail/config page; `idx` is the agent in
+    /// `snapshot.agents`, `sel` the cursor over its action menu.
+    AgentDetail { idx: usize, sel: usize },
     /// A mutating decision is pending; the action carries the target by
     /// index.
     Confirm { action: ConfirmAction },
+}
+
+/// One row of an agent's detail-page action menu (the actions are data
+/// the cursor moves over, not a keymap). Availability depends on role —
+/// see [`detail_actions`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DetailAction {
+    /// Arm/disarm the agent's auto-mode.
+    ToggleAuto,
+    /// Flip a reviewer between the commit and gate tiers.
+    SwitchTier,
+    /// Promote a reviewer to master (the core also demotes the old one).
+    PromoteToMaster,
+    /// Remove the agent from the team (behind the confirm).
+    Remove,
+    /// Leave the detail page.
+    Back,
+}
+
+/// The detail-page actions for `role`, in display order. Master gets a
+/// reduced set (no tier-switch / promote / remove): the UI hide is
+/// primary, and the cores refuse anyway (defense in depth).
+fn detail_actions(role: crate::cli::teams_config::RosterRole) -> Vec<DetailAction> {
+    use crate::cli::teams_config::RosterRole;
+    use DetailAction::*;
+    match role {
+        RosterRole::Master => vec![ToggleAuto, Back],
+        RosterRole::Commit | RosterRole::Gate => {
+            vec![ToggleAuto, SwitchTier, PromoteToMaster, Remove, Back]
+        }
+    }
+}
+
+/// What a detail-page keystroke means — PURE, like `agent_panel_action`:
+/// the loop executes the result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DetailNav {
+    None,
+    Quit,
+    /// Esc/Tab — return to the panel.
+    Back,
+    /// Move the action cursor to this row.
+    MoveCursor(usize),
+    /// Activate the action under the cursor.
+    Activate(DetailAction),
+}
+
+/// Pure key routing for the detail page over its action menu.
+fn agent_detail_nav(sel: usize, actions: &[DetailAction], key: Key) -> DetailNav {
+    match key {
+        Key::Quit => DetailNav::Quit,
+        Key::Escape | Key::Focus => DetailNav::Back,
+        Key::Up => DetailNav::MoveCursor(move_selection(sel, actions.len(), false)),
+        Key::Down => DetailNav::MoveCursor(move_selection(sel, actions.len(), true)),
+        Key::Enter | Key::Space => {
+            DetailNav::Activate(actions.get(sel).copied().unwrap_or(DetailAction::Back))
+        }
+        _ => DetailNav::None,
+    }
 }
 
 /// A pending roster mutation, by index (keeps [`Mode`] `Copy`).
@@ -1517,25 +1678,20 @@ impl Mode {
 }
 
 /// The interactive state `render_at` needs beyond the snapshot: which
-/// mode owns the keyboard, the freshly-read add-picker candidates, and
-/// any transient one-line notice. Bundled so the render signature stays
-/// small (and future interactive bits land here, not as more args).
+/// mode owns the keyboard and the freshly-read add-picker candidates.
+/// Bundled so the render signature stays small (and future interactive
+/// bits land here, not as more args).
 pub(crate) struct PanelView<'a> {
     pub(crate) mode: Mode,
     pub(crate) picker: &'a [crate::cli::status::AvailableAgent],
-    pub(crate) notice: Option<&'a str>,
 }
 
 impl<'a> PanelView<'a> {
-    /// A view with just a mode (no picker, no notice) — the common
-    /// case for tests and the log-scroll default.
+    /// A view with just a mode (no picker) — the common case for tests
+    /// and the log-scroll default.
     #[cfg(test)]
     fn just(mode: Mode) -> Self {
-        Self {
-            mode,
-            picker: &[],
-            notice: None,
-        }
+        Self { mode, picker: &[] }
     }
 }
 
@@ -1552,18 +1708,17 @@ enum PanelAction {
     MoveCursor(usize),
     /// `Down` past the last panel row ("+ add") — cross into the log.
     EnterLog,
-    /// Toggle auto on the agent at this index.
+    /// Toggle auto on the agent at this index (SPC, quick path).
     ToggleAuto(usize),
+    /// Open the per-agent detail page (Enter on an agent row).
+    OpenDetail(usize),
     /// Open the add picker (Enter/Space on the "+ add" row).
     OpenPicker,
-    /// Begin a remove-confirm for the reviewer at this index.
-    RequestRemove(usize),
-    /// DEL on the master row — master isn't removable here.
-    MasterNotice,
 }
 
 /// Pure key routing for the agent panel. `agents` is the roster; the
-/// "+ add" row sits at index `agents.len()`.
+/// "+ add" row sits at index `agents.len()`. Removal/role/tier are no
+/// longer panel actions — Enter opens the detail page where they live.
 fn agent_panel_action(
     sel: usize,
     agents: &[crate::cli::status::AgentAutoRow],
@@ -1579,16 +1734,13 @@ fn agent_panel_action(
         // continuous navigation across the panel↔log boundary.
         Key::Down if on_add => PanelAction::EnterLog,
         Key::Down => PanelAction::MoveCursor(move_selection(sel, add_row + 1, true)),
-        // Enter/Space activate the "+ add" row; Space also toggles auto
-        // on an agent row (Enter on an agent row is a no-op).
+        // Enter activates the row: the picker on "+ add", the detail page
+        // on an agent. Space is the quick inline auto-toggle (or the
+        // picker on "+ add").
         Key::Enter if on_add => PanelAction::OpenPicker,
+        Key::Enter => PanelAction::OpenDetail(sel),
         Key::Space if on_add => PanelAction::OpenPicker,
         Key::Space => PanelAction::ToggleAuto(sel),
-        Key::Delete => match agents.get(sel).map(|a| a.role) {
-            Some(clank_core::vocab::Role::Reviewer) => PanelAction::RequestRemove(sel),
-            Some(clank_core::vocab::Role::Master) => PanelAction::MasterNotice,
-            None => PanelAction::None,
-        },
         _ => PanelAction::None,
     }
 }
@@ -1722,6 +1874,55 @@ fn apply_confirm(
                 let _ = crate::cli::agent::remove_repo_agent(repo, &label);
             }
         }
+    }
+}
+
+/// Execute a detail-page action via the existing `clank agent` cores
+/// and return the next mode. ToggleAuto stays on the page (auto doesn't
+/// reorder the roster); SwitchTier/Promote return to the panel (the
+/// roster reorders, so leave by index and let the Refresh rebuild
+/// re-bound the cursor); Remove defers to the Confirm modal. The TUI is
+/// a front-end to the cores, never a reimplemented write.
+fn apply_detail_action(
+    action: DetailAction,
+    idx: usize,
+    sel: usize,
+    snapshot: &mut StatusSnapshot,
+    repo: &std::path::Path,
+) -> Mode {
+    use crate::cli::teams_config::{ReviewKind, RosterRole};
+    // Copy out what we need so the &mut write below doesn't conflict.
+    let (auto_mode, role, label_str) = match snapshot.agents.get(idx) {
+        Some(a) => (a.auto_mode, a.role, a.label.clone()),
+        None => return Mode::AgentPanel { sel: 0 },
+    };
+    let Ok(label) = clank_core::ids::AgentLabel::parse(&label_str) else {
+        return Mode::AgentPanel { sel: idx };
+    };
+    match action {
+        DetailAction::ToggleAuto => {
+            let next = flip_auto(auto_mode);
+            if crate::agent_store::set_auto_mode(repo, &label, next).is_ok() {
+                snapshot.agents[idx].auto_mode = next;
+            }
+            Mode::AgentDetail { idx, sel }
+        }
+        DetailAction::SwitchTier => {
+            let to = match role {
+                RosterRole::Commit => ReviewKind::Gate,
+                _ => ReviewKind::Commit,
+            };
+            let _ = crate::cli::agent::set_repo_review(repo, &label, to);
+            Mode::AgentPanel { sel: idx }
+        }
+        DetailAction::PromoteToMaster => {
+            let _ = crate::cli::agent::set_repo_master(repo, &label);
+            Mode::AgentPanel { sel: 0 }
+        }
+        DetailAction::Remove => Mode::Confirm {
+            action: ConfirmAction::RemoveAgent { idx },
+        },
+        DetailAction::Back => Mode::AgentPanel { sel: idx },
     }
 }
 
@@ -2099,9 +2300,6 @@ pub(crate) async fn run_tui(
     // --global` elsewhere shows up at once), referenced by index while
     // AddPicker/Confirm(Add) is active, cleared when the picker closes.
     let mut picker: Vec<crate::cli::status::AvailableAgent> = Vec::new();
-    // A transient one-line notice (e.g. "master can't be removed"). Set
-    // by a keystroke, shown on the next repaint, cleared by the next key.
-    let mut notice: Option<&'static str> = None;
     // Spinner animation frame. The ONLY state an animation tick mutates.
     let mut frame: usize = 0;
     // Whether this iteration may do IO to top up the log. Set ONLY by
@@ -2115,7 +2313,6 @@ pub(crate) async fn run_tui(
         let view = PanelView {
             mode,
             picker: &picker,
-            notice,
         };
         let capacity = render_at(&snapshot, rows, cols, offset, frame, &view).1;
 
@@ -2167,13 +2364,11 @@ pub(crate) async fn run_tui(
             // new position needs it.
             Ok(Ev::Key(k)) => {
                 let page = (rows as usize).saturating_sub(3).max(1);
-                // A keystroke clears the previous transient notice; the
-                // arm below may set a new one.
-                notice = None;
                 // `mode` is Copy: matching it copies, so reassigning `mode`
                 // inside an arm is free of borrow conflicts. The per-mode
-                // routing is PURE (agent_panel_action / confirm_decision);
-                // the loop only executes the result (where IO happens).
+                // routing is PURE (agent_panel_action / agent_detail_nav /
+                // confirm_decision); the loop only executes the result
+                // (where IO happens).
                 match mode {
                     Mode::AgentPanel { sel } => {
                         match agent_panel_action(sel, &snapshot.agents, k) {
@@ -2216,17 +2411,24 @@ pub(crate) async fn run_tui(
                                 );
                                 mode = Mode::AddPicker { sel: 0 };
                             }
-                            PanelAction::RequestRemove(i) => {
-                                mode = Mode::Confirm {
-                                    action: ConfirmAction::RemoveAgent { idx: i },
-                                };
-                            }
-                            PanelAction::MasterNotice => {
-                                notice = Some(
-                                    "master can't be removed here — use `clank agent promote`",
-                                );
+                            PanelAction::OpenDetail(i) => {
+                                mode = Mode::AgentDetail { idx: i, sel: 0 };
                             }
                             PanelAction::None => {}
+                        }
+                    }
+                    // Detail page: a selectable action menu over one agent.
+                    Mode::AgentDetail { idx, sel } => {
+                        let role = snapshot.agents.get(idx).map(|a| a.role);
+                        let actions = role.map(detail_actions).unwrap_or_default();
+                        match agent_detail_nav(sel, &actions, k) {
+                            DetailNav::Quit => break,
+                            DetailNav::Back => mode = Mode::AgentPanel { sel: idx },
+                            DetailNav::MoveCursor(s) => mode = Mode::AgentDetail { idx, sel: s },
+                            DetailNav::Activate(action) => {
+                                mode = apply_detail_action(action, idx, sel, &mut snapshot, &repo);
+                            }
+                            DetailNav::None => {}
                         }
                     }
                     // Picker: choose a candidate to add.
@@ -2333,6 +2535,16 @@ pub(crate) async fn run_tui(
                         _ if snapshot.agents.is_empty() => Mode::LogScroll,
                         Mode::AgentPanel { sel } => Mode::AgentPanel {
                             sel: sel.min(snapshot.agents.len()),
+                        },
+                        // The detail page tracks one agent by index; keep
+                        // it only while that index is still in range (the
+                        // user's own tier/promote actions already left the
+                        // page), else fall back to the panel.
+                        Mode::AgentDetail { idx, sel } if idx < snapshot.agents.len() => {
+                            Mode::AgentDetail { idx, sel }
+                        }
+                        Mode::AgentDetail { .. } => Mode::AgentPanel {
+                            sel: snapshot.agents.len(),
                         },
                         // Cancel a picker/confirm onto the +add row.
                         Mode::AddPicker { .. } | Mode::Confirm { .. } => Mode::AgentPanel {
@@ -2466,13 +2678,16 @@ pub(crate) mod tests {
 
     fn agent_row(
         label: &str,
-        role: clank_core::vocab::Role,
+        role: crate::cli::teams_config::RosterRole,
         auto: clank_core::vocab::AutoMode,
     ) -> crate::cli::status::AgentAutoRow {
         crate::cli::status::AgentAutoRow {
             label: label.to_string(),
             role,
             auto_mode: auto,
+            tool: "claude".to_string(),
+            invocation: "claude".to_string(),
+            description: None,
         }
     }
 
@@ -2548,11 +2763,12 @@ pub(crate) mod tests {
     }
 
     fn two_agent_snap() -> StatusSnapshot {
-        use clank_core::vocab::{AutoMode, Role};
+        use crate::cli::teams_config::RosterRole;
+        use clank_core::vocab::AutoMode;
         let mut s = snap(vec![], vec![]);
         s.agents = vec![
-            agent_row("claude", Role::Master, AutoMode::On),
-            agent_row("codex", Role::Reviewer, AutoMode::Off),
+            agent_row("claude", RosterRole::Master, AutoMode::On),
+            agent_row("codex", RosterRole::Commit, AutoMode::Off),
         ];
         s
     }
@@ -2634,7 +2850,6 @@ pub(crate) mod tests {
             &PanelView {
                 mode: Mode::AddPicker { sel: 0 },
                 picker: &picker,
-                notice: None,
             },
         )
         .0;
@@ -2673,7 +2888,6 @@ pub(crate) mod tests {
         let view = PanelView {
             mode: Mode::AddPicker { sel: 0 },
             picker: &picker,
-            notice: None,
         };
 
         // Tiny pane: never more lines than rows, and no element spans
@@ -2758,7 +2972,6 @@ pub(crate) mod tests {
                     action: ConfirmAction::AddCandidate { idx: 0 },
                 },
                 picker: &picker,
-                notice: None,
             },
         )
         .0
@@ -2771,14 +2984,139 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn panel_shows_reviewer_tiers() {
+        use crate::cli::teams_config::RosterRole;
+        use clank_core::vocab::AutoMode;
+        let mut s = two_agent_snap();
+        s.agents = vec![
+            agent_row("claude", RosterRole::Master, AutoMode::On),
+            agent_row("codex", RosterRole::Commit, AutoMode::Off),
+            agent_row("ruthless", RosterRole::Gate, AutoMode::On),
+        ];
+        let out = render_at(
+            &s,
+            40,
+            80,
+            0,
+            0,
+            &PanelView::just(Mode::AgentPanel { sel: 0 }),
+        )
+        .0
+        .join("\n");
+        // The kinds are distinguishable: master / commit / gate, not a
+        // flat "reviewer".
+        assert!(out.contains("master"), "master tier shown");
+        assert!(out.contains("commit"), "commit tier shown");
+        assert!(out.contains("gate"), "gate tier shown");
+        assert!(!out.contains("reviewer"), "no flat 'reviewer' label: {out}");
+    }
+
+    #[test]
+    fn detail_actions_are_reduced_for_master() {
+        use crate::cli::teams_config::RosterRole;
+        use DetailAction::*;
+        assert_eq!(detail_actions(RosterRole::Master), vec![ToggleAuto, Back]);
+        assert_eq!(
+            detail_actions(RosterRole::Commit),
+            vec![ToggleAuto, SwitchTier, PromoteToMaster, Remove, Back]
+        );
+        assert_eq!(
+            detail_actions(RosterRole::Gate),
+            vec![ToggleAuto, SwitchTier, PromoteToMaster, Remove, Back]
+        );
+    }
+
+    #[test]
+    fn agent_detail_nav_routes_menu_keys() {
+        use DetailAction::*;
+        let actions = [ToggleAuto, SwitchTier, Remove, Back];
+        assert_eq!(
+            agent_detail_nav(0, &actions, Key::Down),
+            DetailNav::MoveCursor(1)
+        );
+        assert_eq!(
+            agent_detail_nav(0, &actions, Key::Up),
+            DetailNav::MoveCursor(0),
+            "up at the top stays"
+        );
+        assert_eq!(
+            agent_detail_nav(1, &actions, Key::Enter),
+            DetailNav::Activate(SwitchTier)
+        );
+        assert_eq!(agent_detail_nav(0, &actions, Key::Escape), DetailNav::Back);
+        assert_eq!(agent_detail_nav(0, &actions, Key::Quit), DetailNav::Quit);
+    }
+
+    #[test]
+    fn detail_page_renders_info_actions_and_reduced_master_set() {
+        use crate::cli::teams_config::RosterRole;
+        use clank_core::vocab::AutoMode;
+        let mut s = two_agent_snap();
+        let mut codex = agent_row("codex", RosterRole::Commit, AutoMode::Off);
+        codex.invocation = "codex --profile deep".to_string();
+        codex.description = Some("line one\nline two".to_string());
+        s.agents = vec![agent_row("claude", RosterRole::Master, AutoMode::On), codex];
+
+        // Reviewer detail (idx 1): info + full action set; the multiline
+        // purpose collapses to one line; the selected action is banded.
+        let rev = render_at(
+            &s,
+            40,
+            80,
+            0,
+            0,
+            &PanelView::just(Mode::AgentDetail { idx: 1, sel: 1 }),
+        )
+        .0;
+        let rev_j = rev.join("\n");
+        assert!(rev_j.contains("AGENT · CODEX"), "detail title");
+        assert!(rev_j.contains("codex --profile deep"), "invocation shown");
+        assert!(
+            rev_j.contains("line one") && !rev_j.contains("line two"),
+            "purpose one-lined"
+        );
+        assert!(
+            rev_j.contains("switch tier → gate"),
+            "tier action names the target"
+        );
+        assert!(rev_j.contains("promote to master") && rev_j.contains("remove from team"));
+        assert!(
+            line_with(&rev, "switch tier").contains(REVERSE),
+            "selected action is the unified band"
+        );
+        // Full screen: not the normal layout.
+        assert!(!rev_j.contains("git"), "detail replaces the normal layout");
+
+        // Master detail (idx 0): reduced — no tier/promote/remove.
+        let mas = render_at(
+            &s,
+            40,
+            80,
+            0,
+            0,
+            &PanelView::just(Mode::AgentDetail { idx: 0, sel: 0 }),
+        )
+        .0
+        .join("\n");
+        assert!(mas.contains("toggle auto"), "master keeps auto");
+        assert!(
+            !mas.contains("switch tier")
+                && !mas.contains("promote to master")
+                && !mas.contains("remove from team"),
+            "master's action set is reduced: {mas}"
+        );
+    }
+
+    #[test]
     fn agent_panel_action_routes_keys_by_row_and_role() {
-        use clank_core::vocab::{AutoMode, Role};
+        use crate::cli::teams_config::RosterRole;
+        use clank_core::vocab::AutoMode;
         let agents = vec![
-            agent_row("claude", Role::Master, AutoMode::On),
-            agent_row("codex", Role::Reviewer, AutoMode::Off),
+            agent_row("claude", RosterRole::Master, AutoMode::On),
+            agent_row("codex", RosterRole::Commit, AutoMode::Off),
         ];
         // "+ add" row is index 2 (== agents.len()): Enter AND Space open
-        // the picker; DEL there is a no-op.
+        // the picker.
         assert_eq!(
             agent_panel_action(2, &agents, Key::Enter),
             PanelAction::OpenPicker
@@ -2787,27 +3125,19 @@ pub(crate) mod tests {
             agent_panel_action(2, &agents, Key::Space),
             PanelAction::OpenPicker
         );
+        // Agent rows: Enter opens the detail page; Space toggles auto.
         assert_eq!(
-            agent_panel_action(2, &agents, Key::Delete),
-            PanelAction::None
+            agent_panel_action(1, &agents, Key::Enter),
+            PanelAction::OpenDetail(1)
         );
-        // Agent rows: Space toggles auto; Enter is a no-op.
         assert_eq!(
             agent_panel_action(1, &agents, Key::Space),
             PanelAction::ToggleAuto(1)
         );
-        assert_eq!(
-            agent_panel_action(1, &agents, Key::Enter),
-            PanelAction::None
-        );
-        // DEL: a reviewer asks to confirm-remove; the master shows a notice.
+        // DEL is no longer a panel action (removal lives on the detail page).
         assert_eq!(
             agent_panel_action(1, &agents, Key::Delete),
-            PanelAction::RequestRemove(1)
-        );
-        assert_eq!(
-            agent_panel_action(0, &agents, Key::Delete),
-            PanelAction::MasterNotice
+            PanelAction::None
         );
         // Navigation: Down within the panel moves; Down at the +add row
         // (index 2 == agents.len()) crosses into the log; Tab/Esc leave;
@@ -2855,21 +3185,6 @@ pub(crate) mod tests {
         assert_eq!(confirm_decision(rm, Key::Enter), Some(false));
         assert_eq!(confirm_decision(add, Key::Enter), Some(true));
         assert_eq!(confirm_decision(rm, Key::Up), None);
-    }
-
-    #[test]
-    fn master_delete_notice_renders() {
-        let s = two_agent_snap();
-        let view = PanelView {
-            mode: Mode::AgentPanel { sel: 0 },
-            picker: &[],
-            notice: Some("master can't be removed here — use `clank agent promote`"),
-        };
-        let out = render_at(&s, 40, 80, 0, 0, &view).0.join("\n");
-        assert!(
-            out.contains("clank agent promote"),
-            "master notice rendered: {out}"
-        );
     }
 
     #[test]
@@ -2940,6 +3255,88 @@ pub(crate) mod tests {
         assert!(
             cfg.contains("ruthless"),
             "candidate added to the committed roster via the core: {cfg}"
+        );
+    }
+
+    /// A repo whose roster is claude(master) + codex(commit), matching
+    /// `two_agent_snap`, for the detail-action reuse tests.
+    fn detail_repo() -> tempfile::TempDir {
+        let repo = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(repo.path().join(".clank")).unwrap();
+        std::fs::write(
+            repo.path().join(".clank/config.json"),
+            r#"{"agents":{"claude":{"tool":"claude","role":"master"},"codex":{"tool":"codex","role":"commit"}}}"#,
+        )
+        .unwrap();
+        repo
+    }
+
+    #[test]
+    fn apply_detail_action_switch_tier_uses_the_core() {
+        let repo = detail_repo();
+        let mut s = two_agent_snap(); // idx 1 == codex (commit)
+        let next = apply_detail_action(DetailAction::SwitchTier, 1, 1, &mut s, repo.path());
+        let parsed: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(repo.path().join(".clank/config.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            parsed["agents"]["codex"]["role"], "gate",
+            "commit → gate via set_repo_review"
+        );
+        assert!(
+            matches!(next, Mode::AgentPanel { .. }),
+            "returns to the panel (the roster reorders)"
+        );
+    }
+
+    #[test]
+    fn apply_detail_action_promote_uses_the_core_and_demotes_old_master() {
+        let repo = detail_repo();
+        let mut s = two_agent_snap();
+        apply_detail_action(DetailAction::PromoteToMaster, 1, 0, &mut s, repo.path());
+        let parsed: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(repo.path().join(".clank/config.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            parsed["agents"]["codex"]["role"], "master",
+            "codex promoted"
+        );
+        assert_ne!(
+            parsed["agents"]["claude"]["role"], "master",
+            "old master demoted"
+        );
+    }
+
+    #[test]
+    fn apply_detail_action_toggle_auto_flips_and_stays_on_the_page() {
+        use clank_core::vocab::AutoMode;
+        let repo = detail_repo();
+        let mut s = two_agent_snap(); // codex auto Off
+        let next = apply_detail_action(DetailAction::ToggleAuto, 1, 2, &mut s, repo.path());
+        assert_eq!(
+            s.agents[1].auto_mode,
+            AutoMode::On,
+            "in-memory lamp flipped"
+        );
+        assert_eq!(
+            next,
+            Mode::AgentDetail { idx: 1, sel: 2 },
+            "auto doesn't reorder, so the page persists"
+        );
+    }
+
+    #[test]
+    fn apply_detail_action_remove_defers_to_confirm() {
+        let repo = detail_repo();
+        let mut s = two_agent_snap();
+        let next = apply_detail_action(DetailAction::Remove, 1, 3, &mut s, repo.path());
+        assert_eq!(
+            next,
+            Mode::Confirm {
+                action: ConfirmAction::RemoveAgent { idx: 1 }
+            }
         );
     }
 

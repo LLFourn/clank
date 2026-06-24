@@ -81,8 +81,38 @@ pub struct StatusSnapshot {
 /// decision), NOT a live run indicator.
 pub(crate) struct AgentAutoRow {
     pub(crate) label: String,
-    pub(crate) role: clank_core::vocab::Role,
+    /// The roster TIER — Master / Commit / Gate — so the panel can
+    /// distinguish the kinds of reviewers (not just master vs reviewer).
+    pub(crate) role: crate::cli::teams_config::RosterRole,
     pub(crate) auto_mode: clank_core::vocab::AutoMode,
+    /// Roster `AgentDescription` facts the detail page surfaces: the
+    /// tool, the invocation that runs it (launch command + args, or the
+    /// bare tool), and its `initial_prompt` as the only "what is this
+    /// for" clank has (no semantic purpose field yet).
+    pub(crate) tool: String,
+    pub(crate) invocation: String,
+    pub(crate) description: Option<String>,
+}
+
+/// The invocation that runs an agent: launch command (or the bare tool
+/// name) + any launch args. Shared by the roster rows and the "+ add"
+/// candidates so both render the same string.
+pub(crate) fn agent_invocation(desc: &crate::cli::teams_config::AgentDescription) -> String {
+    let cmd = desc
+        .launch
+        .as_ref()
+        .and_then(|l| l.command.clone())
+        .unwrap_or_else(|| desc.tool.as_str().to_string());
+    let args = desc
+        .launch
+        .as_ref()
+        .map(|l| l.args.join(" "))
+        .unwrap_or_default();
+    if args.is_empty() {
+        cmd
+    } else {
+        format!("{cmd} {args}")
+    }
 }
 
 /// A global-library agent that is NOT yet on this repo's roster — a
@@ -111,16 +141,26 @@ fn roster_auto_rows(
     home: Option<&Path>,
     set: &crate::cli::teams_config::RegisteredSet,
 ) -> Vec<AgentAutoRow> {
-    use clank_core::vocab::Role;
-    let roster = std::iter::once((&set.master, Role::Master)).chain(
-        set.commit_reviewers
-            .iter()
-            .chain(set.gate_reviewers.iter())
-            .map(|a| (&a.label, Role::Reviewer)),
-    );
+    use crate::cli::teams_config::RosterRole;
+    // Carry the TIER (Master/Commit/Gate), not the collapsed
+    // Master/Reviewer — the two reviewer sets already distinguish it, so
+    // the panel can show the kinds for free. The per-agent
+    // `AgentDescription` (tool/launch/initial_prompt) rides along for the
+    // detail page.
+    let roster = std::iter::once((&set.master, RosterRole::Master, &set.master_desc))
+        .chain(
+            set.commit_reviewers
+                .iter()
+                .map(|a| (&a.label, RosterRole::Commit, &a.desc)),
+        )
+        .chain(
+            set.gate_reviewers
+                .iter()
+                .map(|a| (&a.label, RosterRole::Gate, &a.desc)),
+        );
     let mut seen = std::collections::HashSet::new();
     let mut rows = Vec::new();
-    for (label, role) in roster {
+    for (label, role, desc) in roster {
         if !seen.insert(label.as_str()) {
             continue;
         }
@@ -132,6 +172,9 @@ fn roster_auto_rows(
             label: label.as_str().to_string(),
             role,
             auto_mode,
+            tool: desc.tool.as_str().to_string(),
+            invocation: agent_invocation(desc),
+            description: desc.initial_prompt.clone(),
         });
     }
     rows
@@ -158,30 +201,11 @@ pub(crate) fn available_agents(
     cfg.agents
         .iter()
         .filter(|(label, _)| !on_roster.contains(label.as_str()))
-        .map(|(label, desc)| {
-            // The invocation that actually runs: launch command (or the
-            // bare tool name) + any launch args.
-            let cmd = desc
-                .launch
-                .as_ref()
-                .and_then(|l| l.command.clone())
-                .unwrap_or_else(|| desc.tool.as_str().to_string());
-            let args = desc
-                .launch
-                .as_ref()
-                .map(|l| l.args.join(" "))
-                .unwrap_or_default();
-            let invocation = if args.is_empty() {
-                cmd
-            } else {
-                format!("{cmd} {args}")
-            };
-            AvailableAgent {
-                label: label.as_str().to_string(),
-                tool: desc.tool.as_str().to_string(),
-                invocation,
-                description: desc.initial_prompt.clone(),
-            }
+        .map(|(label, desc)| AvailableAgent {
+            label: label.as_str().to_string(),
+            tool: desc.tool.as_str().to_string(),
+            invocation: agent_invocation(desc),
+            description: desc.initial_prompt.clone(),
         })
         .collect()
 }
@@ -1633,7 +1657,8 @@ mod dirty_and_wake_tests {
 
     #[test]
     fn available_agents_is_library_minus_roster() {
-        use clank_core::vocab::{AutoMode, Role};
+        use crate::cli::teams_config::RosterRole;
+        use clank_core::vocab::AutoMode;
         let home = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(home.path().join(".clank")).unwrap();
         // Global library declares three agents (tool ∈ {claude, codex}).
@@ -1645,8 +1670,11 @@ mod dirty_and_wake_tests {
         // codex is already on the roster, so it's NOT a candidate.
         let roster = vec![AgentAutoRow {
             label: "codex".to_string(),
-            role: Role::Reviewer,
+            role: RosterRole::Commit,
             auto_mode: AutoMode::Off,
+            tool: "codex".to_string(),
+            invocation: "codex".to_string(),
+            description: None,
         }];
         let avail = available_agents(Some(home.path()), &roster);
         let labels: Vec<&str> = avail.iter().map(|a| a.label.as_str()).collect();
