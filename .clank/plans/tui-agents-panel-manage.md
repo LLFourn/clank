@@ -160,9 +160,19 @@ ASCII mock (agents panel focused, cursor on codex):
 └──────────────────────────────────┘
 ```
 
-  Remove defaults to No (`[y/N]`), add defaults to Yes (`[Y/n]`).
-  Keys: y/⏎ confirm, n/Esc/q cancel. On confirm, call the matching
-  core; the `config.json` write triggers the watcher → repaint.
+  Key semantics — `Enter` FOLLOWS THE DEFAULT (the standard `[y/N]`
+  convention; the capitalised option is the default), so it never
+  silently confirms a destructive action:
+  - `y` → confirm (always, regardless of default)
+  - `n` → cancel (always)
+  - `Esc` / `q` → cancel (always)
+  - `Enter` → choose the default: with a No-default (remove) it
+    CANCELS; with a Yes-default (add) it confirms.
+
+  So a reviewer removal (default No, `[y/N]`) requires an explicit `y`
+  — `Enter` backs out — while an add (default Yes, `[Y/n]`) confirms
+  on `Enter`. Only the confirm branch calls the matching core; the
+  `config.json` write then triggers the watcher → repaint.
 
 ## Milestones
 
@@ -187,8 +197,11 @@ ASCII mock (agents panel focused, cursor on codex):
   one, after confirm, adds it as a reviewer via the existing core.
 - DEL on a reviewer row, after confirm, removes it via the existing
   core; master is never removable here and says so.
-- Confirm modal blocks the action until y/Esc, defaults safe for
-  remove, and names the committed-config consequence.
+- Confirm modal blocks the action until decided, names the
+  committed-config consequence, and resolves keys per the spec: `y`
+  confirms, `n`/`Esc`/`q` cancel, `Enter` follows the default — so a
+  reviewer removal (default No) is CANCELLED by `Enter` and needs an
+  explicit `y`, while an add (default Yes) confirms on `Enter`.
 - After add/remove the panel repaints (config.json fingerprint) with
   no new watch wiring.
 
@@ -197,6 +210,10 @@ ASCII mock (agents panel focused, cursor on codex):
 - Mode transitions: Tab toggles LogScroll⇄AgentPanel; ⏎ on +add →
   AddPicker; DEL on reviewer → Confirm(Remove); DEL on master → no
   Confirm (notice); Esc backs out each level.
+- Confirm key resolution: in Confirm(Remove) (default No), `Enter`
+  cancels (no core call) and `y` confirms; in Confirm(Add) (default
+  Yes), `Enter` confirms; `Esc`/`q` cancel in both. This pins that a
+  destructive default is never confirmed by `Enter`.
 - Render: AGENTS/LOG headers reflect focus (rail present only on the
   focused region; filled vs hollow marker); ▶/⏸ chosen by auto-mode;
   ▶ and ⏸ have equal `display_width`; +add row present; cursor on +add
