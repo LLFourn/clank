@@ -234,3 +234,93 @@ ASCII mock (agents panel focused, cursor on codex):
   add --global`); the picker only surfaces existing ones.
 - Auto-committing the config change — the dirtied tree is the master's
   to commit, same as the CLI today.
+
+---
+
+## M3 — UX revision (post-ship feedback from lloyd)
+
+M1 + M2 shipped and were used; the feedback below reshapes the panel's
+navigation and visual language. M1/M2 mechanics (Mode machine, the
+cores reuse, the committed-config confirm, play/pause) STAY; this
+milestone changes how you move and what you see.
+
+### 1. Continuous ↑↓ navigation across the panel↔log boundary
+
+Today focus switches with Tab and the headers advertise "Tab → log".
+Drop that: the panel rows (agents, then "+ add") and the log are ONE
+vertical space the cursor flows through.
+- In the panel, `Down` past the last row ("+ add") moves focus INTO
+  the log (at the top); `Up` above the first agent stays put.
+- In the log, `Up` while already at the top (offset 0) moves focus
+  back to the panel, landing on "+ add" (the adjacent row); otherwise
+  `Up`/`Down` scroll as today.
+- Tab keeps working as a quick toggle but is no longer needed or
+  advertised — remove the "Tab → log / Tab → agents" hint text.
+- The continuous-nav decision stays PURE/tested (extend
+  `agent_panel_action` with an `EnterLog`; the log's "Up at top →
+  panel" is decided where `offset` lives).
+
+### 2. One unified "selected" indicator
+
+The `▸` caret is too weak — you can't tell when "+ add" is selected.
+Replace it everywhere with a single mechanism: the cursor row gets a
+FULL-ROW highlight (background span across the whole width), applied
+identically to agent rows, the "+ add" row, and picker rows. One
+selection style, drawn one way, so "which thing is selected" is never
+ambiguous. (Requires an `emit` path that backgrounds the entire line
+incl. padding — today `emit` only styles per-span.)
+
+### 3. A real breaker + a highlighted border for focus (drop the circles)
+
+The `○`/`◉` circles read poorly. Replace the focus cue:
+- A horizontal BREAKER (full-width rule) separates the log from the
+  panel/options area.
+- Each focusable region carries a full-width titled rule
+  (`── AGENTS ──…`). The FOCUSED region's rule is a highlighted border
+  (reverse-video / bright full width); the unfocused one is dim. The
+  highlighted bar IS the "which region is in control" signal — no more
+  circle glyph, and (likely) no more left rail, since the full-width
+  bar + the row highlight already carry focus and selection.
+
+### 4. "+ add" becomes a full SCREEN with agent detail
+
+Today the picker is a few inline rows. Make AddPicker a dedicated
+full-screen view (replacing the normal layout while open):
+- A title ("Add a reviewer"), the candidate list, a footer hint
+  (`↑↓ move · ⏎ add · Esc cancel`).
+- Each candidate shows its **invocation arguments** — the launch
+  command + args from its library `AgentDescription`
+  (`LaunchConfig{command,args}`), e.g. `claude --model opus`, or the
+  tool's bare name when no launch override. If an `initial_prompt` is
+  set, show it as a one-line description (truncated). This is the
+  pragmatic first step toward "what is this agent for" — clank has no
+  real semantic agent description yet, so surface what it HAS (args +
+  initial prompt). Note that gap explicitly.
+- Selection uses the same full-row highlight (item 2).
+- `AvailableAgent` gains the rendered invocation + optional
+  description (read fresh with the candidates when the screen opens).
+
+Future (OUT OF SCOPE here, noted for direction): a real per-agent
+purpose/description field, and "create new agent" from this screen.
+
+### M3 acceptance
+
+- No "Tab →" hint anywhere; `Down` from "+ add" focuses the log,
+  `Up` at log-top refocuses the panel on "+ add"; pure-routing tests
+  pin both boundary crossings.
+- A single full-row highlight marks the cursor row uniformly across
+  agent / "+ add" / picker rows (test: the "+ add" row, when selected,
+  renders the highlight).
+- The `○`/`◉` circles are gone; a full-width breaker separates log and
+  panel; the focused region shows a highlighted full-width rule, the
+  unfocused a dim one (test: focus moves the highlight between the
+  AGENTS and LOG rules).
+- AddPicker is full-screen and shows each candidate's invocation args
+  (and `initial_prompt` description when present); empty state still
+  points at `clank agent add --global` (test: a candidate's args
+  render; the screen omits the normal gauges/log).
+
+### M3 out of scope
+
+- A real semantic "agent purpose" field and "create new agent" in the
+  picker (named as the next direction, not built here).
