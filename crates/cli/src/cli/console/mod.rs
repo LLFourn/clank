@@ -212,7 +212,16 @@ fn run_console(repo: &Path, specs: Vec<Spec>) -> anyhow::Result<()> {
                         let (m, action) = mux::route(mode, b, prefix);
                         mode = m;
                         match action {
-                            Action::Forward(data) => pty::write_all(screens[active].master, &data),
+                            Action::Forward(data) => {
+                                if screens[active].is_alive() {
+                                    pty::write_all(screens[active].master, &data);
+                                } else if data.iter().any(|&b| b == b'\r' || b == b'\n') {
+                                    // Dead screen: Enter respawns it in place.
+                                    respawn(&mut screens, active, repo, &stx);
+                                    need_repaint = true;
+                                }
+                                // Other input to a dead screen is dropped.
+                            }
                             Action::Quit => {
                                 quit = true;
                                 break;
@@ -232,11 +241,12 @@ fn run_console(repo: &Path, specs: Vec<Spec>) -> anyhow::Result<()> {
                     }
                 }
                 Ev::Screen(ScreenEvent::Exit) => {
-                    if screens.iter().all(|s| !s.is_alive()) {
-                        quit = true;
-                    } else {
-                        need_repaint = true; // mark the dead tab ✗
-                    }
+                    // A crashed agent stays as a ✗ tab showing "press
+                    // Enter to respawn" — never auto-quit, never
+                    // auto-respawn. The user is in control (quit with
+                    // the prefix). Repaint so the ✗ / dead-screen
+                    // prompt appears.
+                    need_repaint = true;
                 }
                 Ev::Resize => {
                     let (rows, cols) = term_size();
@@ -267,8 +277,31 @@ fn run_console(repo: &Path, specs: Vec<Spec>) -> anyhow::Result<()> {
 
 fn repaint(frame: &mut render::Frame, screens: &[Screen], active: usize, hint: &str) {
     let tabs: Vec<mux::Tab> = screens.iter().map(Screen::tab).collect();
-    if let Ok(p) = screens[active].parser.lock() {
-        frame.draw(p.screen(), &tabs, active, hint);
+    let bytes = if screens[active].is_alive() {
+        match screens[active].parser.lock() {
+            Ok(p) => frame.draw(p.screen(), &tabs, active, hint),
+            Err(_) => return,
+        }
+    } else {
+        frame.draw_dead(&screens[active].label, &tabs, active, hint)
+    };
+    use std::io::Write as _;
+    let mut out = std::io::stdout();
+    let _ = out.write_all(&bytes);
+    let _ = out.flush();
+}
+
+/// Relaunch screen `idx` from its stored spec, replacing the dead
+/// one in place (same index, so its tab + position are preserved)
+/// and reaping the old child. Sized to the current terminal.
+fn respawn(screens: &mut [Screen], idx: usize, repo: &Path, stx: &mpsc::Sender<ScreenEvent>) {
+    let (rows, cols) = term_size();
+    let (crows, ccols) = mux::content_rect(rows, cols);
+    let spec = screens[idx].spec.clone();
+    if let Ok(new) = Screen::spawn(&spec, repo, crows, ccols, idx, stx.clone()) {
+        let mut old = std::mem::replace(&mut screens[idx], new);
+        let _ = old.child.wait();
+        pty::close(old.master);
     }
 }
 
@@ -334,5 +367,37 @@ mod tests {
         // in two tiers still yields exactly one screen.
         let set = fixture("claude", &["codex", "claude"], &["codex"]);
         assert_eq!(ordered_roster_labels(&set), vec!["claude", "codex"]);
+    }
+
+    #[test]
+    fn respawn_replaces_a_dead_screen_in_place() {
+        use screen::Spec;
+        use std::time::{Duration, Instant};
+
+        let (tx, rx) = mpsc::channel();
+        // `true` exits immediately; both the original and the respawn
+        // self-exit, so the test leaks no long-lived process.
+        let spec = Spec {
+            label: "x".into(),
+            program: "true".into(),
+            args: vec![],
+        };
+        let mut screens =
+            vec![Screen::spawn(&spec, Path::new("/"), 24, 80, 0, tx.clone()).expect("spawn")];
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while screens[0].is_alive() && Instant::now() < deadline {
+            let _ = rx.recv_timeout(Duration::from_millis(100));
+        }
+        assert!(!screens[0].is_alive(), "child should have exited");
+
+        let old_pid = screens[0].child.id();
+        respawn(&mut screens, 0, Path::new("/"), &tx);
+        assert_eq!(screens.len(), 1, "respawn replaces in place, never adds");
+        assert_ne!(
+            screens[0].child.id(),
+            old_pid,
+            "a fresh child replaced the dead one"
+        );
     }
 }

@@ -21,7 +21,9 @@ use super::pty;
 
 /// What to run in a screen: a chrome label plus the argv. The
 /// console builds these from the roster (`clank agent start <label>`
-/// per agent, plus a `clank status --tui` screen).
+/// per agent, plus a `clank status --tui` screen). Cloned onto the
+/// `Screen` so a dead one can be manually respawned in place.
+#[derive(Clone)]
 pub(crate) struct Spec {
     pub(crate) label: String,
     pub(crate) program: String,
@@ -43,6 +45,8 @@ pub(crate) struct Screen {
     pub(crate) child: Child,
     pub(crate) parser: Arc<Mutex<vt100::Parser>>,
     pub(crate) alive: Arc<AtomicBool>,
+    /// What this screen runs, kept so a dead screen can be respawned.
+    pub(crate) spec: Spec,
 }
 
 impl Screen {
@@ -91,6 +95,7 @@ impl Screen {
             child,
             parser,
             alive,
+            spec: spec.clone(),
         })
     }
 
