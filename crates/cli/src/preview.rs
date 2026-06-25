@@ -48,7 +48,7 @@ pub async fn build_finish_preview(
     let basename = RepoBasename::from_repo_root(repo_root)
         .ok_or_else(|| PreviewError::UnknownRepo(repo_root.display().to_string()))?;
     let plan_id_str = format!("{}/{}.md", basename.as_str(), plan_key.as_str());
-    let plan_path = format!(".clank/plans/{}.md", plan_key.as_str());
+    let plan_path = crate::init_facts::plan_md_rel(plan_key.as_str());
 
     let active = state.fold.plans.get(plan_key);
     let is_finished = active.is_none()
@@ -194,8 +194,8 @@ pub async fn build_rewrite_preview(
         let strippable_in_tree =
             git.tree_plan_paths(&meta.sha, plan_key.as_str(), include_finalize)?;
         let strip_predicate_for_diff = |p: &str| -> bool {
-            p == format!(".clank/plans/{}.md", plan_key.as_str())
-                || (include_finalize && p == format!(".clank/finished/{}.md", plan_key.as_str()))
+            p == crate::init_facts::plan_md_rel(plan_key.as_str())
+                || (include_finalize && p == crate::init_facts::finished_md_rel(plan_key.as_str()))
         };
         let contributes_non_strippable = changes.has_non_plan_code_changes
             || changes

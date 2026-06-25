@@ -115,7 +115,7 @@ pub async fn run_shelve(args: ShelveArgs) -> anyhow::Result<()> {
     // content dropped only under --force.
     safety_check(&preview.commits, args.force)?;
 
-    let plan_rel = format!(".clank/plans/{stem}.md");
+    let plan_rel = crate::init_facts::plan_md_rel(&stem);
     if plan_file_dirty(&repo, &plan_rel, preview.head_sha.as_str())? {
         anyhow::bail!(
             "`{plan_rel}` in the working tree differs from HEAD. \
@@ -297,7 +297,7 @@ pub async fn run_unshelve(args: UnshelveArgs) -> anyhow::Result<()> {
 
     // A re-promoted plan with the same stem would collide with the
     // restored plan file; fail closed.
-    if repo.join(format!(".clank/plans/{stem}.md")).exists() {
+    if repo.join(crate::init_facts::plan_md_rel(&stem)).exists() {
         anyhow::bail!(
             "plan `{stem}` is already active — its shelved commits predate the \
              current plan. `clank shelve clean {stem}` to discard them."

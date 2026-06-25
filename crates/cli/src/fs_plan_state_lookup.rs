@@ -120,7 +120,7 @@ impl PlanStateLookup for FsPlanStateLookup<'_> {
     }
 
     fn worktree_status(&self, plan: &PlanKey) -> PlanWorktreeStatus {
-        let rel = format!(".clank/plans/{}.md", plan.as_str());
+        let rel = crate::init_facts::plan_md_rel(plan.as_str());
         if !self.repo.join(&rel).exists() {
             return PlanWorktreeStatus::PlanFileMissing;
         }

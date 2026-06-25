@@ -296,7 +296,7 @@ async fn finalize(
     }
 
     // Move the plan file into finished/ to commit as a rename/move.
-    let plan_path = repo.join(format!(".clank/plans/{stem}.md"));
+    let plan_path = repo.join(crate::init_facts::plan_md_rel(stem));
     let finished_path = finished_dir.join(format!("{stem}.md"));
     if plan_path.exists() {
         std::fs::copy(&plan_path, &finished_path)?;
@@ -305,8 +305,8 @@ async fn finalize(
         std::fs::write(&finished_path, "")?;
     }
 
-    let rel_plan = format!(".clank/plans/{stem}.md");
-    let rel_finished = format!(".clank/finished/{stem}.md");
+    let rel_plan = crate::init_facts::plan_md_rel(stem);
+    let rel_finished = crate::init_facts::finished_md_rel(stem);
     crate::git_plumbing::remove_path(repo, &rel_plan)?;
     crate::git_plumbing::stage(repo, &rel_finished)?;
 
@@ -336,7 +336,7 @@ fn head_is_finalize_for(repo: &Path, stem: &str) -> anyhow::Result<bool> {
     let Some(head) = crate::git_io::rev_parse_head(repo)? else {
         return Ok(false);
     };
-    let finished_path = format!(".clank/finished/{stem}.md");
+    let finished_path = crate::init_facts::finished_md_rel(stem);
     Ok(crate::git_io::diff_tree_changes_at(repo, &head)
         .map(|c| c.clank_paths_touched.contains(&finished_path))
         .unwrap_or(false))

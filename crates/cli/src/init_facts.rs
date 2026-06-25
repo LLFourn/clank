@@ -72,6 +72,19 @@ pub fn clank_gitignore_path(repo: &Path) -> PathBuf {
     clank_dir(repo).join(".gitignore")
 }
 
+/// Repo-relative path of an ACTIVE plan's markdown
+/// (`.clank/plans/<stem>.md`). The single source for where active plan
+/// files live, so the convention isn't re-spelled at each call site.
+pub fn plan_md_rel(stem: &str) -> String {
+    format!(".clank/plans/{stem}.md")
+}
+
+/// Repo-relative path of a FINISHED plan's markdown
+/// (`.clank/finished/<stem>.md`) — the finalize move's destination.
+pub fn finished_md_rel(stem: &str) -> String {
+    format!(".clank/finished/{stem}.md")
+}
+
 pub fn claude_perms_path(repo: &Path) -> PathBuf {
     repo.join(".claude").join("settings.local.json")
 }

@@ -929,8 +929,8 @@ fn collect_plan_buckets(events: &[LogEvent]) -> BTreeMap<String, PlanLifecycle> 
 fn plan_body_at_head(repo: &Path, stem: &str, lifecycle: PlanLifecycle) -> Option<String> {
     let head = head_sha(repo).ok().flatten()?;
     let path = match lifecycle {
-        PlanLifecycle::Active => format!(".clank/plans/{stem}.md"),
-        PlanLifecycle::Finished => format!(".clank/finished/{stem}.md"),
+        PlanLifecycle::Active => crate::init_facts::plan_md_rel(stem),
+        PlanLifecycle::Finished => crate::init_facts::finished_md_rel(stem),
     };
     crate::git_io::show_blob(repo, &head, std::path::Path::new(&path)).ok()
 }
@@ -1373,12 +1373,8 @@ fn plan_body_at_commit(repo: &Path, event: &LogEvent) -> Option<String> {
     let path = match event {
         LogEvent::PlanIntro { plan, .. }
         | LogEvent::PlanCommit { plan, .. }
-        | LogEvent::PlanDeleted { plan, .. } => {
-            format!(".clank/plans/{}.md", plan.as_str())
-        }
-        LogEvent::PlanFinalized { plan, .. } => {
-            format!(".clank/finished/{}.md", plan.as_str())
-        }
+        | LogEvent::PlanDeleted { plan, .. } => crate::init_facts::plan_md_rel(plan.as_str()),
+        LogEvent::PlanFinalized { plan, .. } => crate::init_facts::finished_md_rel(plan.as_str()),
         LogEvent::AdHoc { .. } => return None,
     };
     crate::git_io::show_blob(repo, sha, std::path::Path::new(&path)).ok()

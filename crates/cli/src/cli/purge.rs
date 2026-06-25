@@ -197,7 +197,7 @@ pub(crate) fn build_amend_program(
     let head_is_finalize = is_finish_diff(&head_lines, plan_key);
     if !head_is_finalize {
         let desc = match plan_key {
-            Some(k) => format!(".clank/finished/{}.md", k.as_str()),
+            Some(k) => crate::init_facts::finished_md_rel(k.as_str()),
             None => ".clank/finished/".to_string(),
         };
         anyhow::bail!(
@@ -217,8 +217,8 @@ pub(crate) fn build_amend_program(
         // finished/ actually exists in the tree.
         Some(k) => {
             let s = k.as_str();
-            let plan_p = format!(".clank/plans/{s}.md");
-            let finished_p = format!(".clank/finished/{s}.md");
+            let plan_p = crate::init_facts::plan_md_rel(s);
+            let finished_p = crate::init_facts::finished_md_rel(s);
             crate::git_io::tree_clank_paths_at(repo, &head)
                 .unwrap_or_default()
                 .into_iter()

@@ -51,8 +51,8 @@ fn require_clean_worktree(repo: &Path) -> anyhow::Result<()> {
 /// else and we refuse to rewrite history, since `git reset
 /// --hard HEAD~` would silently drop the extra changes.
 fn require_head_is_trivial_finish(repo: &Path, stem: &str) -> anyhow::Result<()> {
-    let plans_rel = format!(".clank/plans/{stem}.md");
-    let finished_rel = format!(".clank/finished/{stem}.md");
+    let plans_rel = crate::init_facts::plan_md_rel(stem);
+    let finished_rel = crate::init_facts::finished_md_rel(stem);
 
     let lines = crate::git_io::diff_tree_name_status(repo, false)?;
     let mut entries: Vec<(char, String)> = Vec::new();

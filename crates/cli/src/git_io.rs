@@ -445,9 +445,9 @@ impl Repo {
         include_finalize: bool,
     ) -> Result<Vec<String>, GitIoError> {
         let candidates: Vec<String> = {
-            let mut v = vec![format!(".clank/plans/{stem}.md")];
+            let mut v = vec![crate::init_facts::plan_md_rel(stem)];
             if include_finalize {
-                v.push(format!(".clank/finished/{stem}.md"));
+                v.push(crate::init_facts::finished_md_rel(stem));
             }
             v
         };

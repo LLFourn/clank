@@ -304,13 +304,13 @@ fn promote(repo: &Path, name: &str) -> anyhow::Result<()> {
     validate_name(name)?;
     let entries = scan_queue(repo);
     let entry = find_unique(&entries, name)?;
-    let dest = repo.join(format!(".clank/plans/{name}.md"));
+    let plan_path = crate::init_facts::plan_md_rel(name);
+    let dest = repo.join(&plan_path);
     if dest.exists() {
         anyhow::bail!("plan `{name}` already exists in plans/");
     }
     std::fs::create_dir_all(dest.parent().unwrap())?;
     std::fs::rename(&entry.path, &dest)?;
-    let plan_path = format!(".clank/plans/{name}.md");
     crate::git_plumbing::stage(repo, &plan_path)?;
     let msg = format!("[{name}] intro");
     crate::git_plumbing::commit_pathspec(repo, &plan_path, &msg)?;

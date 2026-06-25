@@ -602,7 +602,7 @@ enum WaitJsonItem<'a> {
 }
 
 fn plan_path(plan: &PlanKey) -> String {
-    format!(".clank/plans/{}.md", plan.as_str())
+    crate::init_facts::plan_md_rel(plan.as_str())
 }
 
 fn render_json(item: &WaitItem) -> WaitJsonItem<'_> {

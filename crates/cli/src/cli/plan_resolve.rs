@@ -47,7 +47,9 @@ fn infer_single_visible_active(
         .plans
         .keys()
         .filter(|key| {
-            let path = state.root.join(format!(".clank/plans/{}.md", key.as_str()));
+            let path = state
+                .root
+                .join(crate::init_facts::plan_md_rel(key.as_str()));
             path.exists()
         })
         .collect();
