@@ -243,3 +243,24 @@ pub(super) fn truncate_to(s: &str, cols: usize) -> String {
     t.push('…');
     t
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wrap_breaks_on_words_newlines_and_long_tokens() {
+        // Word boundaries.
+        assert_eq!(wrap("a b c d", 3), vec!["a b", "c d"]);
+        // Explicit newlines preserved as hard breaks.
+        assert_eq!(wrap("a\nb", 10), vec!["a", "b"]);
+        // Blank line between segments preserved.
+        assert_eq!(wrap("a\n\nb", 10), vec!["a", "", "b"]);
+        // A token wider than the line hard-breaks.
+        assert_eq!(wrap("abcdef", 3), vec!["abc", "def"]);
+        // Display-width aware: each 🔨 is 2 cols, so width 2 fits one per line.
+        assert_eq!(wrap("🔨🔨", 2), vec!["🔨", "🔨"]);
+        // width 0 degrades to one line per newline-segment, no panic.
+        assert_eq!(wrap("a b\nc", 0), vec!["a b", "c"]);
+    }
+}
