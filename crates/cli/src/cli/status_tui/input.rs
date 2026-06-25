@@ -352,7 +352,7 @@ mod tests {
         use Key::*;
         let got: Vec<_> = parse_keys(b"jk gGq")
             .iter()
-            .map(|k| std::mem::discriminant(k))
+            .map(std::mem::discriminant)
             .collect();
         let want: Vec<_> = [Down, Up, Space, Top, Bottom, Quit]
             .iter()
