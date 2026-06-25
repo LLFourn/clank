@@ -200,6 +200,7 @@ pub(super) fn scroll_to_show(cursor: usize, offset: usize, capacity: usize, tota
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::status_tui::render::block_ask_spans;
     use crate::cli::status_tui::tests::{plan_state, reviewer_missing, snap};
     use crate::cli::status_tui::text::display_width;
 
@@ -292,5 +293,118 @@ mod tests {
             vec![],
         );
         assert!(in_progress_rows(&s).is_empty());
+    }
+
+    // A log of [Header(foo), Commit(latest reviewable sha)] for the active
+    // plan `foo`, used to check WHERE placeholders get spliced.
+    fn snap_with_header_and_commit(waiting: WaitingOn) -> StatusSnapshot {
+        use crate::cli::log::OnelineRow;
+        let mut s = snap(vec![plan_state("foo", waiting)], vec![]);
+        let sha = s.plans[0].sha.clone().unwrap();
+        s.log_rows = vec![
+            OnelineRow::Header {
+                plan: Some("foo".into()),
+            },
+            OnelineRow::Commit {
+                sha,
+                subject: "do a thing".into(),
+            },
+        ];
+        s
+    }
+
+    fn seg_kind(s: &Seg) -> &'static str {
+        use crate::cli::log::OnelineRow;
+        match s {
+            Seg::Ask(_) => "ask",
+            Seg::Log(OnelineRow::Header { .. }) => "header",
+            Seg::Log(OnelineRow::Commit { .. }) => "commit",
+            Seg::Log(_) => "log",
+            Seg::InProg(_) => "inprog",
+        }
+    }
+
+    #[test]
+    fn placeholders_inject_under_the_plan_not_at_the_top() {
+        // Review placeholder lands in the latest commit's review block:
+        // header, THEN the spinner, THEN the commit — under the plan,
+        // never floating at index 0.
+        let s = snap_with_header_and_commit(reviewer_missing("codex"));
+        let ask = block_ask_spans(&s, 80);
+        let inp = in_progress_rows(&s);
+        let kinds: Vec<&str> = build_scroll(&s, &ask, &inp).iter().map(seg_kind).collect();
+        assert_eq!(
+            kinds,
+            ["header", "inprog", "commit"],
+            "review under the plan"
+        );
+
+        // Master placeholder lands right after the plan header (its next
+        // commit), above the latest commit.
+        let s = snap_with_header_and_commit(WaitingOn::MasterToContinue);
+        let ask = block_ask_spans(&s, 80);
+        let inp = in_progress_rows(&s);
+        let kinds: Vec<&str> = build_scroll(&s, &ask, &inp).iter().map(seg_kind).collect();
+        assert_eq!(
+            kinds,
+            ["header", "inprog", "commit"],
+            "master under the header"
+        );
+    }
+
+    #[test]
+    fn pending_and_finished_reviews_merge_in_author_order() {
+        use crate::cli::log::OnelineRow;
+        use clank_core::vocab::Verdict;
+        // Active plan waits on reviewer "aaa"; the commit already has a
+        // finished review from "zzz". The pending "aaa" must sort BEFORE
+        // the done "zzz" (author order) — the exact slot its own finished
+        // row would take — so the spinner is replaced in place, not moved.
+        let mut s = snap(vec![plan_state("foo", reviewer_missing("aaa"))], vec![]);
+        let sha = s.plans[0].sha.clone().unwrap();
+        s.log_rows = vec![
+            OnelineRow::Header {
+                plan: Some("foo".into()),
+            },
+            OnelineRow::Review {
+                verdict: Verdict::Continue,
+                author: "zzz".into(),
+                summary: "ok".into(),
+            },
+            OnelineRow::Commit {
+                sha,
+                subject: "x".into(),
+            },
+        ];
+        let ask = block_ask_spans(&s, 80);
+        let inp = in_progress_rows(&s);
+        let seq = build_scroll(&s, &ask, &inp);
+        // header, aaa(pending), zzz(done), commit
+        assert!(matches!(&seq[0], Seg::Log(OnelineRow::Header { .. })));
+        assert!(
+            matches!(&seq[1], Seg::InProg(InProgress::PendingReview { label, .. }) if label == "aaa"),
+            "pending aaa sorts before done zzz"
+        );
+        assert!(matches!(&seq[2], Seg::Log(OnelineRow::Review { author, .. }) if author == "zzz"),);
+        assert!(matches!(&seq[3], Seg::Log(OnelineRow::Commit { .. })));
+    }
+
+    #[test]
+    fn tick_visibility_tracks_scattered_index() {
+        // The in-progress row sits at index 1 (after the header), NOT 0.
+        let s = snap_with_header_and_commit(WaitingOn::MasterToContinue);
+        let ask = block_ask_spans(&s, 80);
+        let inp = in_progress_rows(&s);
+        let seq = build_scroll(&s, &ask, &inp);
+        let visible = |off: usize, cap: usize| {
+            seq.iter()
+                .enumerate()
+                .any(|(i, sg)| matches!(sg, Seg::InProg(_)) && (off..off + cap).contains(&i))
+        };
+        assert!(visible(0, 3), "in view from the top");
+        assert!(
+            !visible(5, 2),
+            "scrolled past the placeholder → not in view"
+        );
     }
 }
