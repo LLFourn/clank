@@ -9,16 +9,16 @@
 
 /// Which layer owns the next stdin byte. The console is a thin
 /// pass-through: in `Passthrough` every byte goes to the active
-/// child; the prefix byte is the ONE exception, arming `Prefix` so
-/// the next byte is read as a console command.
+/// child, EXCEPT Meta (Alt) chords. `Meta-a` is the leader, arming
+/// `Leader` so the next byte is read as a console command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Mode {
     Passthrough,
-    Prefix,
+    Leader,
 }
 
-/// What a routed byte means. The loop performs these; [`route`]
-/// never touches a terminal or a PTY.
+/// What routed input means. The loop performs these; [`route`] never
+/// touches a terminal or a PTY.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Action {
     /// Write these bytes to the active child's PTY verbatim.
@@ -28,44 +28,63 @@ pub(crate) enum Action {
     /// Next / previous screen (wraps).
     Next,
     Prev,
+    /// Focus the status screen.
+    FocusStatus,
     /// Tear down every child and exit the console.
     Quit,
-    /// A recognized-but-inert prefix command (swallowed, no effect).
+    /// A recognized-but-inert command (swallowed, no effect).
     None,
 }
 
-/// `Ctrl-a`. A single rare control byte that no multi-byte key
-/// escape sequence contains, so byte-at-a-time prefix detection
-/// never splits an arrow key or a paste. Settled empirically against
-/// what claude/codex actually bind in their own editors, and
-/// overridable via config because both Ctrl-a and Ctrl-b collide
-/// with *something*.
-pub(crate) const DEFAULT_PREFIX: u8 = 0x01;
+const ESC: u8 = 0x1b;
 
-/// Route one stdin byte. Returns the next mode and the action it
-/// implies. A single-byte prefix is what keeps this byte-oriented
-/// and exhaustively testable.
-pub(crate) fn route(mode: Mode, byte: u8, prefix: u8) -> (Mode, Action) {
+/// Route the front of a stdin burst. Returns how many bytes it
+/// consumed (always ≥1), the next mode, and the action. The loop
+/// calls this repeatedly across a `read()` chunk.
+///
+/// Meta (Alt) chords arrive ESC-prefixed in a single `read()` —
+/// `Meta-a` is `ESC a`, `Meta-1` is `ESC 1`. The crux is
+/// disambiguation by READ GRANULARITY (no timer): a real Alt chord
+/// has its byte in the same burst as the `ESC`, while a bare Escape
+/// arrives as a lone `ESC`. Anything `ESC`-prefixed we don't
+/// recognize as a console chord — `ESC [`/`ESC O` (arrows, SS3), a
+/// lone `ESC` (the Escape key), an unmapped `Alt-x` — is FORWARDED,
+/// never swallowed, so the child still gets its escape sequences.
+/// (Known limitation: over SSH/mosh a chord can fragment across two
+/// reads; then the lone `ESC` is forwarded as Escape and the chord
+/// silently doesn't register — safe, never corrupting.)
+pub(crate) fn route(mode: Mode, bytes: &[u8]) -> (usize, Mode, Action) {
+    debug_assert!(!bytes.is_empty());
     match mode {
-        Mode::Passthrough => {
-            if byte == prefix {
-                (Mode::Prefix, Action::None)
-            } else {
-                (Mode::Passthrough, Action::Forward(vec![byte]))
-            }
-        }
-        Mode::Prefix => {
-            let action = match byte {
-                // Prefix-prefix sends ONE literal prefix to the child
-                // (the tmux convention for typing the prefix itself).
-                b if b == prefix => Action::Forward(vec![prefix]),
-                b'1'..=b'9' => Action::SwitchTo((byte - b'1') as usize),
+        Mode::Leader => {
+            // The byte after `Meta-a`: a console command (or cancel).
+            let action = match bytes[0] {
+                b'q' => Action::Quit,
                 b'n' | b'\t' => Action::Next,
                 b'p' => Action::Prev,
-                b'q' => Action::Quit,
+                b'1'..=b'9' => Action::SwitchTo((bytes[0] - b'1') as usize),
+                b's' => Action::FocusStatus,
                 _ => Action::None,
             };
-            (Mode::Passthrough, action)
+            (1, Mode::Passthrough, action)
+        }
+        Mode::Passthrough => {
+            if bytes[0] != ESC {
+                return (1, Mode::Passthrough, Action::Forward(vec![bytes[0]]));
+            }
+            // ESC-prefixed. Only a recognized Meta chord in the SAME
+            // burst is a console action; everything else forwards.
+            match bytes.get(1) {
+                Some(b'a') => (2, Mode::Leader, Action::None),
+                Some(&b @ b'1'..=b'9') => {
+                    (2, Mode::Passthrough, Action::SwitchTo((b - b'1') as usize))
+                }
+                Some(b's') => (2, Mode::Passthrough, Action::FocusStatus),
+                // Lone ESC, or ESC + anything else (CSI/SS3/unmapped
+                // Alt): forward just the ESC; the rest routes as plain
+                // bytes, reconstructing the full sequence at the child.
+                _ => (1, Mode::Passthrough, Action::Forward(vec![ESC])),
+            }
         }
     }
 }
@@ -101,49 +120,6 @@ pub(crate) struct Tab {
     /// Marked with a `●` so you can see who's working at a glance —
     /// independent of which tab you're focused on.
     pub(crate) working: bool,
-}
-
-/// A printable label for the prefix byte (`0x01` → `^A`), for the
-/// chrome hint. Falls back to hex for a non-control prefix.
-pub(crate) fn prefix_label(prefix: u8) -> String {
-    if (1..=26).contains(&prefix) {
-        format!("^{}", (b'A' + prefix - 1) as char)
-    } else {
-        format!("0x{prefix:02x}")
-    }
-}
-
-/// Parse a human-written prefix spec into its control byte. Accepts
-/// `C-a` / `c-a` / `ctrl-a` / `^a` (case-insensitive letter) for a
-/// control char, or a single printable ASCII char taken literally.
-/// `None` on anything else, so a bad override falls back to the
-/// default rather than wedging input on an unreachable prefix. The
-/// override knob for the experimental console is the
-/// `CLANK_CONSOLE_PREFIX` env var (a persistent config key is a
-/// follow-up once the default is settled).
-pub(crate) fn parse_prefix(spec: &str) -> Option<u8> {
-    let spec = spec.trim();
-    let ctrl_of = |rest: &str| -> Option<u8> {
-        let mut chars = rest.chars();
-        let c = chars.next()?;
-        if chars.next().is_some() {
-            return None; // exactly one letter after the modifier
-        }
-        let lc = c.to_ascii_lowercase();
-        lc.is_ascii_lowercase().then(|| (lc as u8) - b'a' + 1)
-    };
-    for modi in ["ctrl-", "Ctrl-", "C-", "c-", "^"] {
-        if let Some(rest) = spec.strip_prefix(modi) {
-            return ctrl_of(rest);
-        }
-    }
-    // A single printable ASCII char, taken literally.
-    let mut chars = spec.chars();
-    let c = chars.next()?;
-    if chars.next().is_none() && c.is_ascii() && !c.is_ascii_control() {
-        return Some(c as u8);
-    }
-    None
 }
 
 /// The bottom chrome bar: a numbered tab strip on the left and a dim
@@ -222,8 +198,6 @@ pub(crate) fn chrome_line(tabs: &[Tab], active: usize, hint: &str, cols: usize) 
 mod tests {
     use super::*;
 
-    const PFX: u8 = DEFAULT_PREFIX;
-
     /// Strip SGR escapes (`\x1b[…m`) so a styled line can be measured
     /// and read as plain text.
     fn strip(s: &str) -> String {
@@ -253,44 +227,74 @@ mod tests {
     }
 
     #[test]
-    fn passthrough_forwards_non_prefix_bytes() {
+    fn plain_bytes_forward_one_at_a_time() {
+        let (n, m, a) = route(Mode::Passthrough, b"x");
         assert_eq!(
-            route(Mode::Passthrough, b'x', PFX),
-            (Mode::Passthrough, Action::Forward(vec![b'x']))
+            (n, m, a),
+            (1, Mode::Passthrough, Action::Forward(vec![b'x']))
         );
-        // An arrow key arrives as three bytes; none is the prefix, so
-        // each forwards verbatim and the mode never flips.
-        for b in [0x1b, b'[', b'A'] {
+    }
+
+    #[test]
+    fn meta_digit_and_meta_s_switch_directly() {
+        for (bytes, want) in [
+            (b"\x1b1".as_slice(), Action::SwitchTo(0)),
+            (b"\x1b9".as_slice(), Action::SwitchTo(8)),
+            (b"\x1bs".as_slice(), Action::FocusStatus),
+        ] {
+            let (n, m, a) = route(Mode::Passthrough, bytes);
+            assert_eq!((n, m), (2, Mode::Passthrough), "{bytes:?}");
+            assert_eq!(a, want, "{bytes:?}");
+        }
+    }
+
+    #[test]
+    fn meta_a_arms_the_leader_then_resolves() {
+        // Meta-a (ESC a) → Leader, consuming both bytes.
+        assert_eq!(
+            route(Mode::Passthrough, b"\x1ba"),
+            (2, Mode::Leader, Action::None)
+        );
+        // The following byte is the command.
+        for (byte, want) in [
+            (b'q', Action::Quit),
+            (b'n', Action::Next),
+            (b'\t', Action::Next),
+            (b'p', Action::Prev),
+            (b'3', Action::SwitchTo(2)),
+            (b's', Action::FocusStatus),
+            (b'Z', Action::None),
+        ] {
             assert_eq!(
-                route(Mode::Passthrough, b, PFX),
-                (Mode::Passthrough, Action::Forward(vec![b]))
+                route(Mode::Leader, &[byte]),
+                (1, Mode::Passthrough, want),
+                "leader+{}",
+                byte as char
             );
         }
     }
 
     #[test]
-    fn prefix_arms_then_resolves_in_one_step() {
-        let (m, a) = route(Mode::Passthrough, PFX, PFX);
-        assert_eq!((m, a), (Mode::Prefix, Action::None));
-        // Every command resolves back to Passthrough.
-        for (byte, want) in [
-            (b'1', Action::SwitchTo(0)),
-            (b'9', Action::SwitchTo(8)),
-            (b'n', Action::Next),
-            (b'\t', Action::Next),
-            (b'p', Action::Prev),
-            (b'q', Action::Quit),
-            (b'Z', Action::None),
-        ] {
-            assert_eq!(route(Mode::Prefix, byte, PFX), (Mode::Passthrough, want));
-        }
-    }
-
-    #[test]
-    fn prefix_prefix_sends_one_literal_prefix() {
+    fn esc_sequences_are_forwarded_never_swallowed() {
+        // A lone ESC at the end of a burst = the Escape key.
         assert_eq!(
-            route(Mode::Prefix, PFX, PFX),
-            (Mode::Passthrough, Action::Forward(vec![PFX]))
+            route(Mode::Passthrough, b"\x1b"),
+            (1, Mode::Passthrough, Action::Forward(vec![0x1b]))
+        );
+        // ESC [ A (arrow) and ESC O P (SS3) forward the ESC; the rest
+        // routes as plain bytes, reconstructing the sequence.
+        for seq in [b"\x1b[A".as_slice(), b"\x1bOP".as_slice()] {
+            let (n, m, a) = route(Mode::Passthrough, seq);
+            assert_eq!(
+                (n, m, a),
+                (1, Mode::Passthrough, Action::Forward(vec![0x1b])),
+                "{seq:?}"
+            );
+        }
+        // An unmapped Alt chord (ESC z) likewise forwards the ESC.
+        assert_eq!(
+            route(Mode::Passthrough, b"\x1bz"),
+            (1, Mode::Passthrough, Action::Forward(vec![0x1b]))
         );
     }
 
@@ -349,37 +353,15 @@ mod tests {
     #[test]
     fn chrome_line_shows_a_right_aligned_hint() {
         let tabs = vec![tab("claude", true, false)];
-        let line = chrome_line(&tabs, 0, "^A n·p·q", 80);
+        let line = chrome_line(&tabs, 0, "M-s status", 80);
         let plain = strip(&line);
         assert_eq!(plain.chars().count(), 80);
         assert!(plain.contains("1:claude"));
         // The hint is flush right.
         assert!(
-            plain.ends_with("^A n·p·q "),
+            plain.ends_with("M-s status "),
             "hint at the right edge: {plain:?}"
         );
-    }
-
-    #[test]
-    fn prefix_label_renders_control_bytes() {
-        assert_eq!(prefix_label(0x01), "^A");
-        assert_eq!(prefix_label(0x02), "^B");
-    }
-
-    #[test]
-    fn parse_prefix_accepts_control_forms_and_literals() {
-        for spec in ["C-a", "c-a", "ctrl-a", "Ctrl-A", "^a", "^A", " C-a "] {
-            assert_eq!(parse_prefix(spec), Some(0x01), "{spec:?}");
-        }
-        assert_eq!(parse_prefix("C-b"), Some(0x02));
-        assert_eq!(parse_prefix("ctrl-z"), Some(0x1a));
-        // A single printable char is taken literally.
-        assert_eq!(parse_prefix("`"), Some(b'`'));
-        // Garbage falls back (None → caller keeps the default).
-        assert_eq!(parse_prefix(""), None);
-        assert_eq!(parse_prefix("C-ab"), None);
-        assert_eq!(parse_prefix("C-1"), None);
-        assert_eq!(parse_prefix("hello"), None);
     }
 
     #[test]

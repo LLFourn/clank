@@ -193,19 +193,17 @@ fn run_console(repo: &Path, specs: Vec<Spec>) -> anyhow::Result<()> {
     // runtime keeps the async fold off the sync event loop.
     spawn_work_poller(repo, tx.clone());
 
+    // The status screen (always last in roster_specs) — Meta-s jumps
+    // to it.
+    let status_idx = screens.iter().position(|s| s.label == "status");
+
     let mut frame = render::Frame::new(rows, cols);
     let mut active = 0usize;
     let mut working: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut mode = Mode::Passthrough;
-    // Escape hatch for the experiment: rebind the prefix without a
-    // recompile if Ctrl-a collides with the active agent's own keys.
-    let prefix = std::env::var("CLANK_CONSOLE_PREFIX")
-        .ok()
-        .and_then(|s| mux::parse_prefix(&s))
-        .unwrap_or(mux::DEFAULT_PREFIX);
-    let hint = format!("{} n·p·q", mux::prefix_label(prefix));
+    let hint = "M-1…9 switch · M-s status · M-a q quit";
 
-    repaint(&mut frame, &screens, active, &working, &hint);
+    repaint(&mut frame, &screens, active, &working, hint);
 
     // Batch each wakeup: drain everything currently queued, apply it,
     // and repaint at most once. This coalesces the repaint SIGNAL
@@ -222,9 +220,13 @@ fn run_console(repo: &Path, specs: Vec<Spec>) -> anyhow::Result<()> {
         for ev in batch {
             match ev {
                 Ev::Stdin(bytes) => {
-                    for b in bytes {
-                        let (m, action) = mux::route(mode, b, prefix);
+                    // Consume the burst left-to-right; `route` reports
+                    // how many bytes each step took (Meta chords are 2).
+                    let mut i = 0;
+                    while i < bytes.len() {
+                        let (consumed, m, action) = mux::route(mode, &bytes[i..]);
                         mode = m;
+                        i += consumed.max(1);
                         match action {
                             Action::Forward(data) => {
                                 if screens[active].is_alive() {
@@ -240,9 +242,17 @@ fn run_console(repo: &Path, specs: Vec<Spec>) -> anyhow::Result<()> {
                                 quit = true;
                                 break;
                             }
+                            Action::FocusStatus => {
+                                if let Some(idx) = status_idx
+                                    && idx != active
+                                {
+                                    active = idx;
+                                    need_repaint = true;
+                                }
+                            }
                             nav => {
-                                if let Some(i) = mux::next_active(active, screens.len(), &nav) {
-                                    active = i;
+                                if let Some(idx) = mux::next_active(active, screens.len(), &nav) {
+                                    active = idx;
                                     need_repaint = true;
                                 }
                             }
@@ -287,7 +297,7 @@ fn run_console(repo: &Path, specs: Vec<Spec>) -> anyhow::Result<()> {
             break;
         }
         if need_repaint {
-            repaint(&mut frame, &screens, active, &working, &hint);
+            repaint(&mut frame, &screens, active, &working, hint);
         }
     }
 
