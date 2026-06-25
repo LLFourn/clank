@@ -7,7 +7,8 @@
 //! spawning zellij; [`TabIndicator`] / [`PaneStatus`] own the dedup +
 //! restore lifecycle.
 
-use super::{agent_status_emoji, awaited_reviewers, strip_leading_emoji};
+use super::derive::{agent_status_emoji, awaited_reviewers};
+use super::strip_leading_emoji;
 use crate::cli::open_zellij::agent_pane_title;
 use crate::cli::status::StatusSnapshot;
 
