@@ -616,6 +616,7 @@ pub(crate) async fn run_tui(
                         | Key::Top
                         | Key::Bottom
                         | Key::Delete
+                        | Key::Left
                         | Key::Yes
                         | Key::No => {}
                     },
@@ -662,7 +663,7 @@ pub(crate) async fn run_tui(
                                 detail = fetch_commit_detail(&repo, &sha);
                             }
                         }
-                        Key::Escape | Key::Delete | Key::Yes | Key::No => {}
+                        Key::Escape | Key::Left | Key::Delete | Key::Yes | Key::No => {}
                     },
                 }
                 log.request_fill();

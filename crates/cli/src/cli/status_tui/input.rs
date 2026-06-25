@@ -27,6 +27,9 @@ pub(super) enum Key {
     /// "+ add", choose a candidate) or, in a confirm, follow the
     /// default.
     Enter,
+    /// ← (left arrow) — back out of the commit-detail overlay; a no-op
+    /// elsewhere.
+    Left,
     /// Backspace / DEL — remove the selected reviewer.
     Delete,
     /// `y` — confirm.
@@ -152,7 +155,7 @@ pub(super) enum CommitNav {
 pub(super) fn commit_detail_nav(key: Key, page: usize) -> CommitNav {
     let page = page as i32;
     match key {
-        Key::Escape | Key::Enter | Key::Quit | Key::Focus => CommitNav::Back,
+        Key::Escape | Key::Enter | Key::Quit | Key::Focus | Key::Left => CommitNav::Back,
         Key::Up => CommitNav::Scroll(-1),
         Key::Down => CommitNav::Scroll(1),
         Key::PageUp => CommitNav::Scroll(-page),
@@ -315,8 +318,11 @@ pub(super) fn parse_keys(bytes: &[u8]) -> Vec<Key> {
         } else if rest.starts_with(b"\x1b[6~") {
             keys.push(Key::PageDown);
             i += 4;
+        } else if rest.starts_with(b"\x1b[D") {
+            keys.push(Key::Left);
+            i += 3;
         } else if rest.starts_with(b"\x1b[") {
-            // Unknown CSI (e.g. left/right arrows, F-keys): consume
+            // Unknown CSI (e.g. the right arrow, F-keys): consume
             // through its final byte so a lone Esc isn't misread out of
             // the sequence's leading bytes.
             let mut j = 2;
@@ -411,11 +417,21 @@ mod tests {
             .map(std::mem::discriminant)
             .collect();
         assert_eq!(got, want, "tab/a focus, esc leaves");
-        // An unknown CSI (left arrow) is consumed whole — NOT misread as a
-        // lone Esc that would spuriously close the panel.
+        // Left arrow (← / CSI D) is its own key (the commit-detail back
+        // key) — consumed whole, NOT misread as a lone Esc from the CSI's
+        // leading bytes.
+        assert_eq!(
+            parse_keys(b"\x1b[D")
+                .iter()
+                .map(std::mem::discriminant)
+                .collect::<Vec<_>>(),
+            vec![std::mem::discriminant(&Key::Left)],
+            "left arrow → one Key::Left, no stray Escape"
+        );
+        // An unknown CSI (right arrow) is still consumed whole with no key.
         assert!(
-            parse_keys(b"\x1b[D").is_empty(),
-            "left arrow consumed, no stray Escape"
+            parse_keys(b"\x1b[C").is_empty(),
+            "right arrow consumed, no stray Escape"
         );
     }
 
@@ -608,10 +624,11 @@ mod tests {
         assert_eq!(commit_detail_nav(Key::PageDown, 10), CommitNav::Scroll(10));
         assert_eq!(commit_detail_nav(Key::Space, 10), CommitNav::Scroll(10));
         assert_eq!(commit_detail_nav(Key::PageUp, 10), CommitNav::Scroll(-10));
-        // Read-only overlay: Esc / Enter / q all dismiss back to the log.
+        // Read-only overlay: Esc / Enter / q / ← all dismiss to the log.
         assert_eq!(commit_detail_nav(Key::Escape, 10), CommitNav::Back);
         assert_eq!(commit_detail_nav(Key::Enter, 10), CommitNav::Back);
         assert_eq!(commit_detail_nav(Key::Quit, 10), CommitNav::Back);
+        assert_eq!(commit_detail_nav(Key::Left, 10), CommitNav::Back);
         // Unmapped keys do nothing.
         assert_eq!(commit_detail_nav(Key::Yes, 10), CommitNav::None);
     }
