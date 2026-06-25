@@ -67,6 +67,11 @@ impl Sel {
             return None;
         }
         let (start, end) = mux::order_cells(self.anchor, self.end);
+        if start == end {
+            // A press/click that hasn't dragged yet — nothing to show
+            // (and a fresh press thus clears the prior highlight).
+            return None;
+        }
         Some(render::Selection { status, start, end })
     }
 }
@@ -400,7 +405,26 @@ fn run_console(repo: &Path, specs: Vec<Spec>) -> anyhow::Result<()> {
                                 } else if !ev.pressed
                                     && let Some(sel) = &selection
                                 {
-                                    copy_selection(&screens[sel.idx], sel);
+                                    // Release finalizes. A drag (the end moved
+                                    // off the anchor) copies and leaves the
+                                    // highlight up; a plain click (no drag)
+                                    // just clears any prior selection.
+                                    if sel.anchor != sel.end {
+                                        copy_selection(&screens[sel.idx], sel);
+                                    } else {
+                                        selection = None;
+                                    }
+                                    need_repaint = true;
+                                }
+                            }
+                            Action::Escape => {
+                                // The Escape key clears a live selection;
+                                // otherwise it's the agent's — forward it.
+                                if selection.is_some() {
+                                    selection = None;
+                                    need_repaint = true;
+                                } else if screens[target].is_alive() {
+                                    pty::write_all(screens[target].master, &[0x1b]);
                                 }
                             }
                             Action::None => {}
@@ -847,6 +871,26 @@ mod tests {
                 .expect("status always shown")
                 .status
         );
+    }
+
+    #[test]
+    fn a_not_yet_dragged_selection_renders_nothing() {
+        // Press/click anchors a single cell; until a drag moves the end
+        // off the anchor there's nothing to highlight (so a plain click
+        // never flashes, and a fresh press clears the prior highlight).
+        let single = Sel {
+            idx: 0,
+            anchor: (2, 5),
+            end: (2, 5),
+        };
+        assert!(single.to_render(0, 9).is_none());
+        // One column of drag is enough to start showing it.
+        let dragged = Sel {
+            idx: 0,
+            anchor: (2, 5),
+            end: (2, 6),
+        };
+        assert!(dragged.to_render(0, 9).is_some());
     }
 
     #[test]

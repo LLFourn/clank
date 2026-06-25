@@ -39,6 +39,10 @@ pub(crate) enum Action {
     /// An SGR mouse event the loop must route: forward to the focused
     /// child if it grabbed the mouse, else drive console selection.
     Mouse(MouseEvent),
+    /// The bare Escape KEY (a lone `ESC`, distinguished from an escape
+    /// SEQUENCE by read-granularity). The loop clears an active
+    /// selection if there is one, else forwards `ESC` to the child.
+    Escape,
     /// Tear down every child and exit the console.
     Quit,
     /// A recognized-but-inert command (swallowed, no effect).
@@ -218,10 +222,14 @@ pub(crate) fn route(mode: Mode, bytes: &[u8]) -> (usize, Mode, Action) {
                 }
                 Some(b's') => (2, Mode::Passthrough, Action::FocusStatus),
                 Some(b'z') => (2, Mode::Passthrough, Action::ToggleZoom),
-                // Lone ESC, or ESC + anything else (CSI/SS3/unmapped
-                // Alt): forward just the ESC; the rest routes as plain
-                // bytes, reconstructing the full sequence at the child.
-                _ => (1, Mode::Passthrough, Action::Forward(vec![ESC])),
+                // A lone ESC (nothing in the burst after it) is the
+                // Escape KEY — the loop clears a live selection or
+                // forwards it.
+                None => (1, Mode::Passthrough, Action::Escape),
+                // ESC + anything else (CSI/SS3/unmapped Alt): forward
+                // just the ESC; the rest routes as plain bytes,
+                // reconstructing the full sequence at the child.
+                Some(_) => (1, Mode::Passthrough, Action::Forward(vec![ESC])),
             }
         }
     }
@@ -829,10 +837,12 @@ mod tests {
 
     #[test]
     fn esc_sequences_are_forwarded_never_swallowed() {
-        // A lone ESC at the end of a burst = the Escape key.
+        // A lone ESC at the end of a burst = the Escape KEY — its own
+        // action (the loop clears a selection or forwards it), NOT a
+        // forwarded sequence prefix.
         assert_eq!(
             route(Mode::Passthrough, b"\x1b"),
-            (1, Mode::Passthrough, Action::Forward(vec![0x1b]))
+            (1, Mode::Passthrough, Action::Escape)
         );
         // ESC [ A (arrow) and ESC O P (SS3) forward the ESC; the rest
         // routes as plain bytes, reconstructing the sequence.
