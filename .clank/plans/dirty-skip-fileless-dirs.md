@@ -46,19 +46,35 @@ dirty badge, the `unfinish` clean-worktree guard, rewrite policy, etc.).
 
 Make `status_walk`'s untracked set match git's porcelain semantics: an
 untracked **directory** is reported only if it contains at least one
-file (recursively). Inside the layer (`git_io.rs`), in the
-`Summary::Added` arm, drop an entry whose on-disk kind is a directory
-that contains no files.
+entry that is **not itself a directory** (recursively). Git surfaces a
+directory as untracked when it contains content — and to git, content is
+a regular file, a symlink, OR an exotic node (fifo/socket/device); only
+a tree of pure subdirectories is "nothing". Inside the layer
+(`git_io.rs`), in the `Summary::Added` arm, drop an entry whose on-disk
+kind is a directory with no non-directory descendant.
 
 - gix exposes the entry's `disk_kind` (`gix-dir` `entry::Kind::{File,
-  Directory,Repository,Symlink}`); use it to identify directory entries
-  rather than re-statting.
-- For a directory entry, walk it and keep it iff a file is found, with
-  **early-exit on the first file** (so a large untracked dir like
-  `node_modules/` costs one file probe, matching the work git does to
-  decide it is non-empty). A `Repository` (nested git) entry is content
-  git reports — keep it.
-- File and symlink entries are unchanged.
+  Symlink,Directory,Repository,Untrackable}`); use it to classify the
+  entry rather than re-statting.
+- **Only `disk_kind == Some(Directory)` triggers the re-walk.** `File`,
+  `Symlink`, `Repository` (nested git — content git reports), the
+  `Untrackable` exotic kinds, and a defensive `None` are all KEPT
+  unchanged.
+- The re-walk keeps the directory iff it finds **any non-directory
+  entry** (regular file, symlink, fifo/socket/device). Decide purely by
+  `std::fs::DirEntry::file_type()` — **never follow symlinks**: a
+  symlink (even one pointing at a directory) counts as a kept
+  non-directory entry and is NOT traversed, so the walk cannot cycle or
+  escape the worktree. Recurse only into entries whose `file_type()` is
+  a real directory.
+- At each level, check all non-directory entries BEFORE recursing into
+  subdirectories, so a directory that does have content exits early. The
+  genuinely fileless case (the bug) has no early exit — it must exhaust
+  the collapsed subtree to conclude "empty" — but cost is bounded by the
+  untracked set, which is fine for this display path.
+- `status_walk` holds only `git: &gix::Repository`; build the absolute
+  path to re-walk from `git.workdir()` joined with the entry's
+  rela_path.
 
 Keep the existing `CollapseDirectory` granularity (clank should keep
 reporting `dir/` collapsed, like `git status` default — not expand to
@@ -66,17 +82,24 @@ every file).
 
 ## Verify
 
-Fixture-based unit test in `git_io.rs` tests (test code may `git init`
-a temp repo; in-process library call, no binary spawn):
+Fixture-based unit tests in `git_io.rs` tests (test code may `git init`
+a temp repo; in-process library call, no binary spawn). Each fixture
+asserts clank's untracked set AGREES with `git status --porcelain` on
+the same tree:
 
-- A worktree containing only an empty nested directory tree (`a/b/`,
-  no files) → `working_tree_status().untracked` is empty AND
-  `git status --porcelain` on the same fixture is empty (assert they
-  agree).
-- Positive control: a directory with one file (`c/d.txt`) → untracked
-  contains the collapsed `c/` entry (unchanged behavior).
-- Tracked-change detection is unaffected (a modified tracked file still
-  shows in `changed`).
+- **Fileless tree (the bug):** only an empty nested directory tree
+  (`a/b/`, no files) → `working_tree_status().untracked` is empty, and
+  `git status --porcelain` is empty too.
+- **Symlink-only dir (guards the corrected predicate):** a directory
+  whose only descendant is a SYMLINK and contains no regular file
+  anywhere (`e/link -> somewhere`) → it MUST stay in `untracked`, and
+  `git status --porcelain` lists it too. (A naive "keep iff a file is
+  found" predicate would wrongly drop this — this fixture is what
+  catches that re-divergence.)
+- **Positive control:** a directory with one regular file (`c/d.txt`) →
+  untracked contains the collapsed `c/` entry (unchanged behavior).
+- **Tracked changes unaffected:** a modified tracked file still shows in
+  `changed`.
 
 ## Out of scope
 
