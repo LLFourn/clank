@@ -235,9 +235,11 @@ pub(crate) struct Tab {
 ///
 /// Per tab: the focused one is reverse-video (where you're looking),
 /// the rest dim; a dead child is marked `✗`; and the agent currently
-/// WORKING gets a green `●` just left of its number — rendered
-/// outside the dim styling so it stands out even on an unfocused tab
-/// (the working agent usually isn't the one you're watching).
+/// WORKING is framed in green thin-line edges (`▏…▕`) — a one-row
+/// "wire box" rendered outside the band so it stands out even on an
+/// unfocused tab (the working agent usually isn't the one you're
+/// watching), with breathing room instead of a dot jammed at the
+/// number.
 ///
 /// The active agent's tab gets the reverse-video band as the focus
 /// cue — but ONLY when an agent is focused. When `status_focused`, no
@@ -277,16 +279,18 @@ pub(crate) fn chrome_line(
     for (i, tab) in tabs.iter().enumerate() {
         let mark = if tab.alive { "" } else { " ✗" };
         let body = format!("{}:{}{} ", i + 1, tab.label, mark);
-        // visible width = leading separator + optional ● + body
-        let w = 1 + usize::from(tab.working) + body.chars().count();
+        // visible width = leading separator + body + (green ▏ ▕ edges
+        // when working — two extra columns, so the strip reflows for a
+        // working tab being wider than an idle one).
+        let w = 1 + body.chars().count() + if tab.working { 2 } else { 0 };
         if used + w > tab_budget {
             break;
         }
         out.push(' ');
+        // Green left edge of the working "wire box" — outside the band
+        // so it shows on any tab.
         if tab.working {
-            // Green ● OUTSIDE the dim/reverse styling so it pops on
-            // any tab, focused or not.
-            out.push_str("\x1b[32m●\x1b[0m");
+            out.push_str("\x1b[32m▏\x1b[0m");
         }
         // Reverse-video band = focus, but only when an AGENT is
         // focused; when status is focused no tab bands.
@@ -297,6 +301,10 @@ pub(crate) fn chrome_line(
         }
         out.push_str(&body);
         out.push_str("\x1b[0m");
+        // Green right edge.
+        if tab.working {
+            out.push_str("\x1b[32m▕\x1b[0m");
+        }
         used += w;
     }
 
@@ -549,17 +557,22 @@ mod tests {
     }
 
     #[test]
-    fn chrome_line_marks_the_working_agent() {
+    fn chrome_line_frames_the_working_agent_in_green() {
         let tabs = vec![tab("claude", true, true), tab("codex", true, false)];
         let line = chrome_line(&tabs, 1, false, false, "", 80);
-        // A green ● sits left of the working (but unfocused) tab.
+        // The working (unfocused) tab is framed in green thin-line
+        // edges, outside the dim styling so they stay visible.
         assert!(
-            line.contains("\x1b[32m●\x1b[0m"),
-            "working agent gets a green dot: {line:?}"
+            line.contains("\x1b[32m▏\x1b[0m"),
+            "green left edge: {line:?}"
         );
-        // The dot is rendered OUTSIDE the dim styling so it stays
-        // visible on an unfocused tab.
-        assert!(strip(&line).contains("●1:claude"));
+        assert!(
+            line.contains("\x1b[32m▕\x1b[0m"),
+            "green right edge: {line:?}"
+        );
+        // Edges hug the tab body (not jammed at the number).
+        assert!(strip(&line).contains("▏1:claude ▕"));
+        // The wider working tab still leaves the bar exactly cols wide.
         assert_eq!(strip(&line).chars().count(), 80);
     }
 
