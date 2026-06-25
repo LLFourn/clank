@@ -37,6 +37,7 @@ pub(crate) enum Action {
 }
 
 const ESC: u8 = 0x1b;
+const CTRL_BACKSLASH: u8 = 0x1c;
 
 /// Route the front of a stdin burst. Returns how many bytes it
 /// consumed (always ≥1), the next mode, and the action. The loop
@@ -69,6 +70,12 @@ pub(crate) fn route(mode: Mode, bytes: &[u8]) -> (usize, Mode, Action) {
             (1, Mode::Passthrough, action)
         }
         Mode::Passthrough => {
+            // Ctrl-\ is a meta-independent emergency quit, so you're
+            // never stuck if the terminal doesn't send Alt as Meta
+            // (then no Meta chord — including Meta-a q — would fire).
+            if bytes[0] == CTRL_BACKSLASH {
+                return (1, Mode::Passthrough, Action::Quit);
+            }
             if bytes[0] != ESC {
                 return (1, Mode::Passthrough, Action::Forward(vec![bytes[0]]));
             }
@@ -300,6 +307,15 @@ mod tests {
         assert_eq!(
             (n, m, a),
             (1, Mode::Passthrough, Action::Forward(vec![b'x']))
+        );
+    }
+
+    #[test]
+    fn ctrl_backslash_always_quits() {
+        // Meta-independent emergency exit (works without Option-as-Meta).
+        assert_eq!(
+            route(Mode::Passthrough, b"\x1c"),
+            (1, Mode::Passthrough, Action::Quit)
         );
     }
 

@@ -216,7 +216,7 @@ fn run_console(repo: &Path, specs: Vec<Spec>) -> anyhow::Result<()> {
     let mut status_focused = false; // input + cursor on the status pane
     let mut working: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut mode = Mode::Passthrough;
-    let hint = "M-1…9 switch · M-s status · M-a q quit";
+    let hint = "M-1…9 switch · M-s status · M-a q / ^\\ quit";
     let ctx = |active, status_focused, layout| RenderCtx {
         status_idx,
         active,
