@@ -45,6 +45,26 @@ enum Ev {
     Working(std::collections::HashSet<String>),
 }
 
+/// A live mouse selection: the pane it's anchored in, the press
+/// `anchor`, and the current drag `end` (pane-relative, 0-based, not
+/// yet ordered). Normalized to a [`render::Selection`] for drawing.
+struct Sel {
+    status: bool,
+    anchor: (u16, u16),
+    end: (u16, u16),
+}
+
+impl Sel {
+    fn to_render(&self) -> render::Selection {
+        let (start, end) = mux::order_cells(self.anchor, self.end);
+        render::Selection {
+            status: self.status,
+            start,
+            end,
+        }
+    }
+}
+
 /// Launch the console for a repo. Invoked by `clank open` (outside a
 /// zellij session) — the console has no command of its own.
 pub fn run(repo: Option<&Path>) -> anyhow::Result<()> {
@@ -216,15 +236,17 @@ fn run_console(repo: &Path, specs: Vec<Spec>) -> anyhow::Result<()> {
     let mut active = 0usize; // active AGENT (0..status_idx)
     let mut status_focused = false; // input + cursor on the status pane
     let mut follow = false; // follow-active mode: main pane tracks the working agent
+    let mut selection: Option<Sel> = None; // live mouse selection
     let mut working: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut mode = Mode::Passthrough;
     let hint = "M-z zoom · M-s status · M-0 follow · M-1-9 pin · ^\\ quit";
-    let ctx = |active, status_focused, follow, zoomed, layout| RenderCtx {
+    let ctx = |active, status_focused, follow, zoomed, selection: &Option<Sel>, layout| RenderCtx {
         status_idx,
         active,
         status_focused,
         follow,
         zoomed,
+        selection: selection.as_ref().map(Sel::to_render),
         layout,
         hint,
     };
@@ -233,7 +255,7 @@ fn run_console(repo: &Path, specs: Vec<Spec>) -> anyhow::Result<()> {
         &mut frame,
         &screens,
         &working,
-        ctx(active, status_focused, follow, zoomed, layout),
+        ctx(active, status_focused, follow, zoomed, &selection, layout),
     );
 
     // Batch each wakeup: drain everything currently queued, apply it,
@@ -320,12 +342,45 @@ fn run_console(repo: &Path, specs: Vec<Spec>) -> anyhow::Result<()> {
                                 relayout(&screens, status_idx, layout, &mut frame, r, c);
                                 need_repaint = true;
                             }
-                            Action::Mouse(_ev) => {
-                                // Decoded so the mouse report is NEVER
-                                // injected into an agent as stray bytes.
-                                // Pane-aware selection (and forwarding to
-                                // agents that grabbed the mouse) land in
-                                // the next milestones; consumed for now.
+                            Action::Mouse(ev) => {
+                                let hit = mux::pane_at(layout, ev.col, ev.row);
+                                // The child under the cursor (active agent
+                                // or status).
+                                let under = hit.map(|(p, _, _)| match p {
+                                    mux::Pane::Status => status_idx,
+                                    mux::Pane::Main => active,
+                                });
+                                let wheel = ev.button & 0b0100_0000 != 0;
+                                let motion = ev.button & 0b0010_0000 != 0;
+                                let left = ev.button & 0b11 == 0;
+                                // If the child grabbed the mouse, or it's a
+                                // wheel event, it's the AGENT's (forwarding
+                                // is the next milestone — swallow for now,
+                                // never inject). Otherwise it's selection.
+                                let agents_mouse =
+                                    under.is_some_and(|i| child_grabs_mouse(&screens, i));
+                                if wheel || agents_mouse {
+                                    // (forward milestone)
+                                } else if ev.pressed && left && !motion {
+                                    selection = hit.map(|(p, r, c)| Sel {
+                                        status: matches!(p, mux::Pane::Status),
+                                        anchor: (r, c),
+                                        end: (r, c),
+                                    });
+                                    need_repaint = true;
+                                } else if ev.pressed && left && motion {
+                                    if let (Some(sel), Some((p, r, c))) = (&mut selection, hit)
+                                        && matches!(p, mux::Pane::Status) == sel.status
+                                    {
+                                        sel.end = (r, c);
+                                        need_repaint = true;
+                                    }
+                                } else if !ev.pressed
+                                    && let Some(sel) = &selection
+                                {
+                                    let idx = if sel.status { status_idx } else { active };
+                                    copy_selection(&screens[idx], sel);
+                                }
                             }
                             Action::None => {}
                         }
@@ -375,7 +430,7 @@ fn run_console(repo: &Path, specs: Vec<Spec>) -> anyhow::Result<()> {
                 &mut frame,
                 &screens,
                 &working,
-                ctx(active, status_focused, follow, zoomed, layout),
+                ctx(active, status_focused, follow, zoomed, &selection, layout),
             );
         }
     }
@@ -396,6 +451,62 @@ fn primary_working_idx(
         .map(|s| s.label.clone())
         .collect();
     mux::primary_working(&labels, working)
+}
+
+/// Whether screen `idx`'s child has turned ON mouse reporting — then
+/// the mouse is the AGENT's (it gets forwarded), not the console's.
+fn child_grabs_mouse(screens: &[Screen], idx: usize) -> bool {
+    screens[idx]
+        .parser
+        .lock()
+        .is_ok_and(|p| p.screen().mouse_protocol_mode() != vt100::MouseProtocolMode::None)
+}
+
+/// Copy the selection from a screen's grid to the system clipboard via
+/// OSC 52 (best-effort — silently a no-op on terminals that don't
+/// support it; `Alt-z` zoom + native copy is the fallback).
+fn copy_selection(screen: &Screen, sel: &Sel) {
+    let (start, end) = mux::order_cells(sel.anchor, sel.end);
+    let text = match screen.parser.lock() {
+        Ok(p) => p.screen().contents_between(start.0, start.1, end.0, end.1),
+        Err(_) => return,
+    };
+    if text.is_empty() {
+        return;
+    }
+    let osc = format!("\x1b]52;c;{}\x1b\\", base64_encode(text.as_bytes()));
+    use std::io::Write as _;
+    let mut out = std::io::stdout();
+    let _ = out.write_all(osc.as_bytes());
+    let _ = out.flush();
+}
+
+/// Standard base64 (RFC 4648) — hand-rolled so OSC 52 needs no
+/// dependency (the deps-only-where-it-hurts rule; this is ~20 lines).
+fn base64_encode(data: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        out.push(T[(n >> 18 & 63) as usize] as char);
+        out.push(T[(n >> 12 & 63) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            T[(n >> 6 & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            T[(n & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
 }
 
 /// The rect a screen's CHILD is sized to: the status pane for
@@ -427,6 +538,7 @@ struct RenderCtx<'a> {
     status_focused: bool,
     follow: bool,
     zoomed: bool,
+    selection: Option<render::Selection>,
     layout: mux::Layout,
     hint: &'a str,
 }
@@ -505,6 +617,7 @@ fn repaint(
             status_screen,
             ctx.layout,
             ctx.status_focused,
+            ctx.selection,
             chrome,
         )
     } else {
@@ -513,6 +626,7 @@ fn repaint(
             status_screen,
             ctx.layout,
             ctx.status_focused,
+            ctx.selection,
             chrome,
         )
     };
@@ -660,6 +774,16 @@ mod tests {
             commit_reviewers: agents(commit),
             gate_reviewers: agents(gate),
         }
+    }
+
+    #[test]
+    fn base64_matches_known_vectors() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"hello"), "aGVsbG8=");
     }
 
     #[test]

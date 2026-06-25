@@ -23,6 +23,15 @@ pub(crate) enum MainPane<'a> {
     Dead(&'a str),
 }
 
+/// An active mouse selection: which pane it's anchored in and its
+/// pane-relative `(start, end)` range (reading order).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Selection {
+    pub(crate) status: bool,
+    pub(crate) start: (u16, u16),
+    pub(crate) end: (u16, u16),
+}
+
 /// The bottom bar's inputs: the agent tabs, which one is active, the
 /// focus + follow state, and the dim keybinding hint.
 pub(crate) struct ChromeBar<'a> {
@@ -80,13 +89,19 @@ impl Frame {
         status: &vt100::Screen,
         layout: mux::Layout,
         cursor_in_status: bool,
+        sel: Option<Selection>,
         chrome: ChromeBar,
     ) -> Vec<u8> {
         let mut buf: Vec<u8> = Vec::new();
+        // Selection range for each pane (only the one it's anchored in).
+        let main_sel = sel.filter(|s| !s.status).map(|s| (s.start, s.end));
+        let status_sel = sel.filter(|s| s.status).map(|s| (s.start, s.end));
 
         // Agent pane.
         match main {
-            MainPane::Live(grid) => blit(&mut buf, &mut self.main_rows, grid, layout.main),
+            MainPane::Live(grid) => {
+                blit(&mut buf, &mut self.main_rows, grid, layout.main, main_sel)
+            }
             MainPane::Dead(label) => blit_rows(
                 &mut buf,
                 &mut self.main_rows,
@@ -95,7 +110,13 @@ impl Frame {
             ),
         }
         // Status pane.
-        blit(&mut buf, &mut self.status_rows, status, layout.status);
+        blit(
+            &mut buf,
+            &mut self.status_rows,
+            status,
+            layout.status,
+            status_sel,
+        );
 
         // Divider between the panes — its colour is the focus cue:
         // accent when status is focused, dim otherwise.
@@ -139,10 +160,17 @@ impl Frame {
 }
 
 /// Composite a grid into `rect`, writing only the rows that changed
-/// since the last frame.
-fn blit(buf: &mut Vec<u8>, last: &mut Vec<String>, grid: &vt100::Screen, rect: Rect) {
+/// since the last frame. `sel` is the pane-relative selection range to
+/// highlight, if this pane has one.
+fn blit(
+    buf: &mut Vec<u8>,
+    last: &mut Vec<String>,
+    grid: &vt100::Screen,
+    rect: Rect,
+    sel: Option<Range>,
+) {
     let rows = (0..rect.rows)
-        .map(|r| region_row(grid, r, rect.cols))
+        .map(|r| region_row(grid, r, rect.cols, sel))
         .collect::<Vec<_>>();
     blit_rows(buf, last, rows, rect);
 }
@@ -171,19 +199,24 @@ fn blit_rows(buf: &mut Vec<u8>, last: &mut Vec<String>, rows: Vec<String>, rect:
 /// Build one pane row as a self-contained string: a glyph per column
 /// (space for a blank), SGR emitted only when it changes, reset at
 /// the end. Exactly `cols` visible columns wide. No `\x1b[K`, no
-/// absolute moves — safe to drop at any (x, y).
-fn region_row(grid: &vt100::Screen, row: u16, cols: u16) -> String {
+/// absolute moves — safe to drop at any (x, y). Cells inside `sel`
+/// (the pane-relative selection range) are flipped reverse-video.
+fn region_row(grid: &vt100::Screen, row: u16, cols: u16, sel: Option<Range>) -> String {
     let mut out = String::new();
     let mut cur_sgr = String::new();
     let mut col = 0u16;
     while col < cols {
+        let selected = sel.is_some_and(|(s, e)| mux::in_selection(row, col, s, e));
         let cell = grid.cell(row, col);
         if let Some(c) = cell {
             if c.is_wide_continuation() {
                 col += 1;
                 continue;
             }
-            let sgr = cell_sgr(c);
+            let mut sgr = cell_sgr(c);
+            if selected {
+                sgr.push_str(";7"); // reverse-video for the selection
+            }
             if sgr != cur_sgr {
                 out.push('\x1b');
                 out.push('[');
@@ -197,9 +230,12 @@ fn region_row(grid: &vt100::Screen, row: u16, cols: u16) -> String {
                 out.push(' ');
             }
         } else {
-            if !cur_sgr.is_empty() && cur_sgr != "0" {
-                out.push_str("\x1b[0m");
-                cur_sgr = "0".to_string();
+            let sgr = if selected { "0;7" } else { "0" };
+            if cur_sgr != sgr {
+                out.push_str("\x1b[");
+                out.push_str(sgr);
+                out.push('m');
+                cur_sgr = sgr.to_string();
             }
             out.push(' ');
         }
@@ -208,6 +244,9 @@ fn region_row(grid: &vt100::Screen, row: u16, cols: u16) -> String {
     out.push_str("\x1b[0m");
     out
 }
+
+/// A pane-relative selection range `(start, end)`, reading order.
+type Range = ((u16, u16), (u16, u16));
 
 /// SGR parameter string for a cell (always reset-prefixed, so each
 /// emit fully sets the style).
@@ -374,6 +413,7 @@ mod tests {
             &status,
             layout,
             false,
+            None,
             bar(&tabs, 0),
         ));
 
@@ -406,6 +446,7 @@ mod tests {
             &status,
             layout,
             false,
+            None,
             bar(&tabs, 0),
         );
         physical.process(&bytes);
@@ -443,7 +484,14 @@ mod tests {
         let tabs = [tab("a", false), tab("b", false)];
 
         let tall = feed(layout.main.rows, layout.main.cols, b"AAA\r\nBBB");
-        physical.process(&frame.draw(MainPane::Live(&tall), &status, layout, false, bar(&tabs, 0)));
+        physical.process(&frame.draw(
+            MainPane::Live(&tall),
+            &status,
+            layout,
+            false,
+            None,
+            bar(&tabs, 0),
+        ));
         assert_eq!(row_text(physical.screen(), 1, layout.main.cols), "BBB");
 
         let short = feed(layout.main.rows, layout.main.cols, b"Z");
@@ -452,6 +500,7 @@ mod tests {
             &status,
             layout,
             false,
+            None,
             bar(&tabs, 1),
         ));
         assert_eq!(row_text(physical.screen(), 0, layout.main.cols), "Z");
@@ -475,6 +524,42 @@ mod tests {
     }
 
     #[test]
+    fn selection_highlights_only_the_selected_cells() {
+        let (rows, cols) = (24u16, 80u16);
+        let layout = mux::layout(rows, cols);
+        let mut frame = Frame::new(rows, cols);
+        let agent = feed(layout.main.rows, layout.main.cols, b"HELLO WORLD");
+        let status = feed(layout.status.rows, layout.status.cols, b"s");
+        let tabs = [tab("a", false)];
+        // Select "ELLO" on row 0 (cols 1..=4) in the main pane.
+        let sel = Some(Selection {
+            status: false,
+            start: (0, 1),
+            end: (0, 4),
+        });
+        let bytes = frame.draw(
+            MainPane::Live(&agent),
+            &status,
+            layout,
+            false,
+            sel,
+            bar(&tabs, 0),
+        );
+        // Feed to a physical parser and read row 0's cells' inverse flag.
+        let mut physical = vt100::Parser::new(rows, cols, 0);
+        physical.process(&bytes);
+        let inv = |c: u16| {
+            physical
+                .screen()
+                .cell(0, c)
+                .is_some_and(|cell| cell.inverse())
+        };
+        assert!(!inv(0), "H not selected");
+        assert!(inv(1) && inv(2) && inv(3) && inv(4), "ELLO selected");
+        assert!(!inv(5), "space after not selected");
+    }
+
+    #[test]
     fn dead_agent_pane_shows_respawn_prompt() {
         let (rows, cols) = (24u16, 80u16);
         let layout = mux::layout(rows, cols);
@@ -488,6 +573,7 @@ mod tests {
             &status,
             layout,
             false,
+            None,
             bar(&tabs, 0),
         ));
 

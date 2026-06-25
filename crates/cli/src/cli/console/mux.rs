@@ -331,6 +331,53 @@ pub(crate) fn zoom_layout(rows: u16, cols: u16) -> Layout {
     }
 }
 
+/// Which pane a coordinate falls in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Pane {
+    Main,
+    Status,
+}
+
+/// Hit-test a 1-based terminal coordinate against the layout. Returns
+/// the pane it lands in plus that pane's 0-based `(row, col)`; `None`
+/// for the divider, the chrome row, or anywhere outside a pane. Pure.
+pub(crate) fn pane_at(layout: Layout, col1: u16, row1: u16) -> Option<(Pane, u16, u16)> {
+    let x = col1.checked_sub(1)?;
+    let y = row1.checked_sub(1)?;
+    let hit = |r: Rect| {
+        r.rows > 0 && r.cols > 0 && x >= r.x && x < r.x + r.cols && y >= r.y && y < r.y + r.rows
+    };
+    if hit(layout.main) {
+        Some((Pane::Main, y - layout.main.y, x - layout.main.x))
+    } else if hit(layout.status) {
+        Some((Pane::Status, y - layout.status.y, x - layout.status.x))
+    } else {
+        None
+    }
+}
+
+/// Is cell `(row, col)` inside the linewise selection `[start, end]`
+/// (reading order, `start ≤ end`)? Pure → unit-tested.
+pub(crate) fn in_selection(row: u16, col: u16, start: (u16, u16), end: (u16, u16)) -> bool {
+    let ((sr, sc), (er, ec)) = (start, end);
+    if row < sr || row > er {
+        false
+    } else if sr == er {
+        col >= sc && col <= ec
+    } else if row == sr {
+        col >= sc
+    } else if row == er {
+        col <= ec
+    } else {
+        true
+    }
+}
+
+/// Order two cells into `(start, end)` reading order.
+pub(crate) fn order_cells(a: (u16, u16), b: (u16, u16)) -> ((u16, u16), (u16, u16)) {
+    if a <= b { (a, b) } else { (b, a) }
+}
+
 /// One tab in the chrome bar.
 pub(crate) struct Tab {
     pub(crate) label: String,
@@ -562,6 +609,37 @@ mod tests {
             route(Mode::Leader, b"z"),
             (1, Mode::Passthrough, Action::ToggleZoom)
         );
+    }
+
+    #[test]
+    fn pane_at_hit_tests_panes_and_misses_the_divider() {
+        let l = layout(24, 80); // landscape: main 0..mc, divider at mc, status after
+        // Top-left of main → Main, cell (0,0).
+        assert_eq!(pane_at(l, 1, 1), Some((Pane::Main, 0, 0)));
+        // First column of the status pane → Status, cell (0,0).
+        assert_eq!(pane_at(l, l.status.x + 1, 1), Some((Pane::Status, 0, 0)));
+        // The divider column hits nothing.
+        assert_eq!(pane_at(l, l.divider.x + 1, 1), None);
+        // The chrome row hits nothing.
+        assert_eq!(pane_at(l, 1, l.chrome_row + 1), None);
+    }
+
+    #[test]
+    fn in_selection_is_linewise_reading_order() {
+        let start = (1, 3);
+        let end = (3, 5);
+        assert!(!in_selection(0, 9, start, end)); // above
+        assert!(!in_selection(1, 2, start, end)); // first row, before start col
+        assert!(in_selection(1, 3, start, end)); // first row, at start
+        assert!(in_selection(2, 0, start, end)); // middle row, any col
+        assert!(in_selection(3, 5, start, end)); // last row, at end
+        assert!(!in_selection(3, 6, start, end)); // last row, past end col
+        assert!(!in_selection(4, 0, start, end)); // below
+        // Single-line selection.
+        assert!(in_selection(1, 4, (1, 3), (1, 6)));
+        assert!(!in_selection(1, 7, (1, 3), (1, 6)));
+        // order_cells normalizes a backwards drag.
+        assert_eq!(order_cells((3, 5), (1, 3)), ((1, 3), (3, 5)));
     }
 
     #[test]
