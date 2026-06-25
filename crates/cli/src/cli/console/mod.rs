@@ -123,13 +123,23 @@ fn clank_exe() -> String {
 }
 
 fn run_console(repo: &Path, specs: Vec<Spec>) -> anyhow::Result<()> {
-    if specs.is_empty() {
-        anyhow::bail!("clank open (console): no screens to show");
-    }
+    // The status pane is the last screen (roster_specs invariant); the
+    // others are switchable agents. Require ≥1 agent — a console that's
+    // only the status pane has nothing to multiplex (and `active`
+    // would alias the status screen, double-locking it on repaint).
+    // Check before entering raw mode so the error prints cleanly.
+    let status_idx = specs.len().checked_sub(1).filter(|&i| i > 0);
+    let Some(status_idx) = status_idx else {
+        anyhow::bail!(
+            "clank open (console): no agents in this repo's roster — \
+             add one with `clank agent add <label> --tool <claude|codex>` \
+             and `clank agent promote <label>`"
+        );
+    };
 
     let _guard = AltScreen::enter_raw();
     let (rows, cols) = term_size();
-    let (crows, ccols) = mux::content_rect(rows, cols);
+    let mut layout = mux::layout(rows, cols);
 
     let (tx, rx) = mpsc::channel::<Ev>();
 
@@ -149,7 +159,15 @@ fn run_console(repo: &Path, specs: Vec<Spec>) -> anyhow::Result<()> {
 
     let mut screens = Vec::with_capacity(specs.len());
     for (i, spec) in specs.iter().enumerate() {
-        screens.push(Screen::spawn(spec, repo, crows, ccols, i, stx.clone())?);
+        let rect = screen_rect(i, status_idx, layout);
+        screens.push(Screen::spawn(
+            spec,
+            repo,
+            rect.rows,
+            rect.cols,
+            i,
+            stx.clone(),
+        )?);
     }
 
     // Raw stdin → Ev::Stdin. Blocking reads (VMIN=1 set by AltScreen)
@@ -193,17 +211,26 @@ fn run_console(repo: &Path, specs: Vec<Spec>) -> anyhow::Result<()> {
     // runtime keeps the async fold off the sync event loop.
     spawn_work_poller(repo, tx.clone());
 
-    // The status screen (always last in roster_specs) — Meta-s jumps
-    // to it.
-    let status_idx = screens.iter().position(|s| s.label == "status");
-
     let mut frame = render::Frame::new(rows, cols);
-    let mut active = 0usize;
+    let mut active = 0usize; // active AGENT (0..status_idx)
+    let mut status_focused = false; // input + cursor on the status pane
     let mut working: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut mode = Mode::Passthrough;
     let hint = "M-1…9 switch · M-s status · M-a q quit";
+    let ctx = |active, status_focused, layout| RenderCtx {
+        status_idx,
+        active,
+        status_focused,
+        layout,
+        hint,
+    };
 
-    repaint(&mut frame, &screens, active, &working, hint);
+    repaint(
+        &mut frame,
+        &screens,
+        &working,
+        ctx(active, status_focused, layout),
+    );
 
     // Batch each wakeup: drain everything currently queued, apply it,
     // and repaint at most once. This coalesces the repaint SIGNAL
@@ -227,32 +254,36 @@ fn run_console(repo: &Path, specs: Vec<Spec>) -> anyhow::Result<()> {
                         let (consumed, m, action) = mux::route(mode, &bytes[i..]);
                         mode = m;
                         i += consumed.max(1);
+                        // Input goes to the focused pane: the status
+                        // pane when status-focused, else the active agent.
+                        let target = if status_focused { status_idx } else { active };
                         match action {
                             Action::Forward(data) => {
-                                if screens[active].is_alive() {
-                                    pty::write_all(screens[active].master, &data);
+                                if screens[target].is_alive() {
+                                    pty::write_all(screens[target].master, &data);
                                 } else if data.iter().any(|&b| b == b'\r' || b == b'\n') {
-                                    // Dead screen: Enter respawns it in place.
-                                    respawn(&mut screens, active, repo, &stx);
+                                    // Dead pane: Enter respawns it in place.
+                                    respawn(&mut screens, target, repo, &stx, layout);
                                     need_repaint = true;
                                 }
-                                // Other input to a dead screen is dropped.
+                                // Other input to a dead pane is dropped.
                             }
                             Action::Quit => {
                                 quit = true;
                                 break;
                             }
                             Action::FocusStatus => {
-                                if let Some(idx) = status_idx
-                                    && idx != active
-                                {
-                                    active = idx;
+                                if !status_focused {
+                                    status_focused = true;
                                     need_repaint = true;
                                 }
                             }
                             nav => {
-                                if let Some(idx) = mux::next_active(active, screens.len(), &nav) {
+                                // Next/Prev/SwitchTo cycle the AGENTS
+                                // (0..status_idx), never the status pane.
+                                if let Some(idx) = mux::next_active(active, status_idx, &nav) {
                                     active = idx;
+                                    status_focused = false;
                                     need_repaint = true;
                                 }
                             }
@@ -260,25 +291,26 @@ fn run_console(repo: &Path, specs: Vec<Spec>) -> anyhow::Result<()> {
                     }
                 }
                 Ev::Screen(ScreenEvent::Output(i)) => {
-                    if i == active {
+                    // Both visible panes repaint on output: the active
+                    // agent and the always-on status pane.
+                    if i == active || i == status_idx {
                         need_repaint = true;
                     }
                 }
                 Ev::Screen(ScreenEvent::Exit) => {
-                    // A crashed agent stays as a ✗ tab showing "press
-                    // Enter to respawn" — never auto-quit, never
-                    // auto-respawn. The user is in control (quit with
-                    // the prefix). Repaint so the ✗ / dead-screen
-                    // prompt appears.
+                    // A crashed pane stays put showing "press Enter to
+                    // respawn" — never auto-quit, never auto-respawn.
+                    // Repaint so the ✗ / prompt appears.
                     need_repaint = true;
                 }
                 Ev::Resize => {
                     let (rows, cols) = term_size();
-                    let (crows, ccols) = mux::content_rect(rows, cols);
-                    for s in &screens {
-                        pty::set_winsize(s.master, crows, ccols);
+                    layout = mux::layout(rows, cols);
+                    for (i, s) in screens.iter().enumerate() {
+                        let rect = screen_rect(i, status_idx, layout);
+                        pty::set_winsize(s.master, rect.rows, rect.cols);
                         if let Ok(mut p) = s.parser.lock() {
-                            p.screen_mut().set_size(crows, ccols);
+                            p.screen_mut().set_size(rect.rows, rect.cols);
                         }
                     }
                     frame.resize(rows, cols);
@@ -297,7 +329,12 @@ fn run_console(repo: &Path, specs: Vec<Spec>) -> anyhow::Result<()> {
             break;
         }
         if need_repaint {
-            repaint(&mut frame, &screens, active, &working, hint);
+            repaint(
+                &mut frame,
+                &screens,
+                &working,
+                ctx(active, status_focused, layout),
+            );
         }
     }
 
@@ -305,14 +342,37 @@ fn run_console(repo: &Path, specs: Vec<Spec>) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The rect a screen renders into: the status pane for `status_idx`,
+/// the main (agent) pane for everyone else.
+fn screen_rect(idx: usize, status_idx: usize, layout: mux::Layout) -> mux::Rect {
+    if idx == status_idx {
+        layout.status
+    } else {
+        layout.main
+    }
+}
+
+/// The scalar render state the loop hands to [`repaint`]: which screen
+/// is the status pane, which agent is active, whether status has
+/// focus, the layout, and the chrome hint. (The screens + working set
+/// are passed separately — they're the data, this is the view.)
+#[derive(Clone, Copy)]
+struct RenderCtx<'a> {
+    status_idx: usize,
+    active: usize,
+    status_focused: bool,
+    layout: mux::Layout,
+    hint: &'a str,
+}
+
 fn repaint(
     frame: &mut render::Frame,
     screens: &[Screen],
-    active: usize,
     working: &std::collections::HashSet<String>,
-    hint: &str,
+    ctx: RenderCtx,
 ) {
-    let tabs: Vec<mux::Tab> = screens
+    // Tabs are the agents only (the status pane is always on, not a tab).
+    let tabs: Vec<mux::Tab> = screens[..ctx.status_idx]
         .iter()
         .map(|s| mux::Tab {
             label: s.label.clone(),
@@ -320,13 +380,40 @@ fn repaint(
             working: working.contains(&s.label),
         })
         .collect();
-    let bytes = if screens[active].is_alive() {
-        match screens[active].parser.lock() {
-            Ok(p) => frame.draw(p.screen(), &tabs, active, hint),
+    let chrome = render::ChromeBar {
+        tabs: &tabs,
+        active: ctx.active,
+        hint: ctx.hint,
+    };
+
+    // Lock the status parser for the whole frame (consistent order:
+    // status before agent), then composite both panes.
+    let status_guard = match screens[ctx.status_idx].parser.lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    let status_screen = status_guard.screen();
+
+    let bytes = if screens[ctx.active].is_alive() {
+        let agent_guard = match screens[ctx.active].parser.lock() {
+            Ok(g) => g,
             Err(_) => return,
-        }
+        };
+        frame.draw(
+            render::MainPane::Live(agent_guard.screen()),
+            status_screen,
+            ctx.layout,
+            ctx.status_focused,
+            chrome,
+        )
     } else {
-        frame.draw_dead(&screens[active].label, &tabs, active, hint)
+        frame.draw(
+            render::MainPane::Dead(&screens[ctx.active].label),
+            status_screen,
+            ctx.layout,
+            ctx.status_focused,
+            chrome,
+        )
     };
     use std::io::Write as _;
     let mut out = std::io::stdout();
@@ -407,14 +494,20 @@ async fn working_labels(repo: &Path, home: Option<&Path>) -> std::collections::H
     working
 }
 
-/// Relaunch screen `idx` from its stored spec, replacing the dead
-/// one in place (same index, so its tab + position are preserved)
-/// and reaping the old child. Sized to the current terminal.
-fn respawn(screens: &mut [Screen], idx: usize, repo: &Path, stx: &mpsc::Sender<ScreenEvent>) {
-    let (rows, cols) = term_size();
-    let (crows, ccols) = mux::content_rect(rows, cols);
+/// Relaunch screen `idx` from its stored spec, replacing the dead one
+/// in place (same index, so its tab + pane are preserved) and reaping
+/// the old child. Sized to that screen's current pane rect.
+fn respawn(
+    screens: &mut [Screen],
+    idx: usize,
+    repo: &Path,
+    stx: &mpsc::Sender<ScreenEvent>,
+    layout: mux::Layout,
+) {
+    let status_idx = screens.len() - 1;
+    let rect = screen_rect(idx, status_idx, layout);
     let spec = screens[idx].spec.clone();
-    if let Ok(new) = Screen::spawn(&spec, repo, crows, ccols, idx, stx.clone()) {
+    if let Ok(new) = Screen::spawn(&spec, repo, rect.rows, rect.cols, idx, stx.clone()) {
         let mut old = std::mem::replace(&mut screens[idx], new);
         let _ = old.child.wait();
         pty::close(old.master);
@@ -508,7 +601,7 @@ mod tests {
         assert!(!screens[0].is_alive(), "child should have exited");
 
         let old_pid = screens[0].child.id();
-        respawn(&mut screens, 0, Path::new("/"), &tx);
+        respawn(&mut screens, 0, Path::new("/"), &tx, mux::layout(24, 80));
         assert_eq!(screens.len(), 1, "respawn replaces in place, never adds");
         assert_ne!(
             screens[0].child.id(),

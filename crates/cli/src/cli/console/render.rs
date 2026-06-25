@@ -1,136 +1,254 @@
-//! Frame compositing for the console. Each repaint writes only the
-//! delta to what is physically on screen, so a chatty agent doesn't
-//! flicker:
+//! Frame compositing for the console. The terminal is split into two
+//! live panes — the active agent and the always-on status pane (see
+//! [`mux::layout`]) — plus the chrome bar. Each pane is a `vt100`
+//! grid composited into its own sub-rectangle.
 //!
-//! - the content region is a `vt100` `contents_diff` of the active
-//!   grid against `painted`, an EXACT CLONE of the screen we last
-//!   drew. Cloning (not feeding the diff back into a mirror parser)
-//!   is what keeps the baseline truthful across a switch: the diff
-//!   then transforms the OLD screen's grid straight into the new
-//!   one, clearing every cell the new screen leaves blank. A
-//!   reconstructed mirror drifts and leaves stale content behind.
-//! - the chrome bar is rewritten only when its string changes;
-//! - the real cursor is synced to the active grid's cursor last, so
-//!   the agent's input caret lands in the right place.
+//! We can't use vt100's own `contents_formatted` / `rows_formatted`
+//! for a sub-rect: they emit `\x1b[K` (clears to the PHYSICAL end of
+//! line, clobbering a right-hand neighbour) and absolute grid-coord
+//! cursor moves. So we build each pane row cell-by-cell ourselves —
+//! one glyph per column, spaces for blanks (no `\x1b[K`), positioned
+//! absolutely at the rect — and diff per row so an idle pane costs
+//! nothing. The cursor is synced last to whichever pane has focus.
 
 use std::io::Write as _;
 
-use super::mux::{self, Tab};
+use super::mux::{self, Rect, Tab};
+
+/// What occupies the main (agent) pane this frame.
+pub(crate) enum MainPane<'a> {
+    /// A live agent grid.
+    Live(&'a vt100::Screen),
+    /// A crashed agent — show a centered respawn prompt instead.
+    Dead(&'a str),
+}
+
+/// The bottom bar's inputs: the agent tabs, which one is focused, and
+/// the dim keybinding hint.
+pub(crate) struct ChromeBar<'a> {
+    pub(crate) tabs: &'a [Tab],
+    pub(crate) active: usize,
+    pub(crate) hint: &'a str,
+}
 
 /// Tracks what is physically on the terminal so each frame writes
-/// only the difference. `painted` is an exact clone of the content
-/// region last drawn (`None` before the first paint / after a
-/// resize, when the next draw repaints in full); `chrome` is the
-/// last bar string.
+/// only the delta. The `*_rows` vecs are the formatted rows last
+/// drawn into each pane (cleared on resize, forcing a full repaint).
 pub(crate) struct Frame {
-    painted: Option<vt100::Screen>,
+    main_rows: Vec<String>,
+    status_rows: Vec<String>,
     chrome: String,
-    rows: u16,
     cols: u16,
 }
 
 impl Frame {
-    pub(crate) fn new(rows: u16, cols: u16) -> Self {
+    pub(crate) fn new(_rows: u16, cols: u16) -> Self {
         clear_screen();
         Frame {
-            painted: None,
+            main_rows: Vec::new(),
+            status_rows: Vec::new(),
             chrome: String::new(),
-            rows,
             cols,
         }
     }
 
-    /// Adopt a new terminal size: drop the mirror and clear the
-    /// physical screen so the next `draw` repaints in full.
-    pub(crate) fn resize(&mut self, rows: u16, cols: u16) {
-        self.painted = None;
+    /// Adopt a new terminal size: drop the per-pane caches and clear
+    /// the physical screen so the next `draw` repaints in full.
+    pub(crate) fn resize(&mut self, _rows: u16, cols: u16) {
+        self.main_rows.clear();
+        self.status_rows.clear();
         self.chrome.clear();
-        self.rows = rows;
         self.cols = cols;
         clear_screen();
     }
 
-    /// Compute the frame's bytes (content delta + chrome + cursor)
-    /// and advance the mirror. Returns the bytes for the caller to
-    /// write — keeping the terminal IO in the loop and this logic
-    /// testable. The `hint` is the dim right-aligned keybinding
-    /// reminder.
+    /// Composite the agent pane, the status pane, and the chrome bar,
+    /// then sync the cursor into the focused pane. Returns the bytes
+    /// for the caller to write (IO stays in the loop).
     pub(crate) fn draw(
         &mut self,
-        active: &vt100::Screen,
-        tabs: &[Tab],
-        active_idx: usize,
-        hint: &str,
+        main: MainPane,
+        status: &vt100::Screen,
+        layout: mux::Layout,
+        cursor_in_status: bool,
+        chrome: ChromeBar,
     ) -> Vec<u8> {
         let mut buf: Vec<u8> = Vec::new();
 
-        // 1. Content region. Against the exact previous frame, a diff
-        // transforms it into `active` (clearing vacated cells); with
-        // no previous frame, paint it in full. `contents_formatted`
-        // self-clears, so the first paint after a resize is clean.
-        match &self.painted {
-            Some(prev) => buf.extend_from_slice(&active.contents_diff(prev)),
-            None => buf.extend_from_slice(&active.contents_formatted()),
+        // Agent pane.
+        match main {
+            MainPane::Live(grid) => blit(&mut buf, &mut self.main_rows, grid, layout.main),
+            MainPane::Dead(label) => blit_rows(
+                &mut buf,
+                &mut self.main_rows,
+                dead_pane(label, layout.main),
+                layout.main,
+            ),
         }
-        self.painted = Some(active.clone());
+        // Status pane.
+        blit(&mut buf, &mut self.status_rows, status, layout.status);
 
-        // 2. Chrome bar at the bottom row — only when it changed.
-        let chrome = mux::chrome_line(tabs, active_idx, hint, self.cols as usize);
+        // Chrome bar — only when it changed.
+        let chrome = mux::chrome_line(chrome.tabs, chrome.active, chrome.hint, self.cols as usize);
         if chrome != self.chrome {
-            buf.extend_from_slice(format!("\x1b[{};1H", self.rows).as_bytes());
+            buf.extend_from_slice(format!("\x1b[{};1H", layout.chrome_row + 1).as_bytes());
             buf.extend_from_slice(chrome.as_bytes());
             self.chrome = chrome;
         }
 
-        // 3. Sync the real cursor to the active grid's cursor LAST
-        // (after the chrome write moved it). Grid coords are 0-based
-        // from the content region's top-left, which is the terminal's
-        // top-left, so +1 for the 1-based CUP. The grid is sized to
-        // exclude the chrome row, so the caret can never land on it.
-        if active.hide_cursor() {
-            buf.extend_from_slice(b"\x1b[?25l");
-        } else {
-            let (r, c) = active.cursor_position();
-            buf.extend_from_slice(format!("\x1b[{};{}H\x1b[?25h", r + 1, c + 1).as_bytes());
+        // Cursor into the focused pane, mapped to that rect's origin.
+        let (grid, rect) = match (cursor_in_status, &main) {
+            (false, MainPane::Live(g)) => (Some(*g), layout.main),
+            (true, _) => (Some(status), layout.status),
+            (false, MainPane::Dead(_)) => (None, layout.main),
+        };
+        match grid {
+            Some(g) if !g.hide_cursor() => {
+                let (r, c) = g.cursor_position();
+                buf.extend_from_slice(
+                    format!("\x1b[{};{}H\x1b[?25h", rect.y + r + 1, rect.x + c + 1).as_bytes(),
+                );
+            }
+            _ => buf.extend_from_slice(b"\x1b[?25l"),
         }
-
         buf
     }
+}
 
-    /// Paint a dead screen: clear the content region and show a
-    /// centered "press Enter to respawn" prompt. The respawn
-    /// affordance lives IN the dead terminal (not a hidden hotkey),
-    /// which is the whole point — a crashed agent is obvious and
-    /// recoverable with one keystroke. Drops the mirror so the next
-    /// live draw (after respawn) repaints in full.
-    pub(crate) fn draw_dead(
-        &mut self,
-        label: &str,
-        tabs: &[Tab],
-        active_idx: usize,
-        hint: &str,
-    ) -> Vec<u8> {
-        let mut buf: Vec<u8> = Vec::new();
-        buf.extend_from_slice(b"\x1b[2J");
-        self.painted = None;
+/// Composite a grid into `rect`, writing only the rows that changed
+/// since the last frame.
+fn blit(buf: &mut Vec<u8>, last: &mut Vec<String>, grid: &vt100::Screen, rect: Rect) {
+    let rows = (0..rect.rows)
+        .map(|r| region_row(grid, r, rect.cols))
+        .collect::<Vec<_>>();
+    blit_rows(buf, last, rows, rect);
+}
 
-        let (crows, ccols) = mux::content_rect(self.rows, self.cols);
-        let msg = format!("{label} exited · press Enter to respawn");
-        let w = msg.chars().count().min(ccols as usize);
-        let msg: String = msg.chars().take(w).collect();
-        let row = (crows / 2).max(1);
-        let col = ((ccols as usize - w) / 2) + 1;
-        buf.extend_from_slice(format!("\x1b[{row};{col}H\x1b[2m{msg}\x1b[0m").as_bytes());
-
-        // Chrome was wiped by the clear; force a redraw.
-        let chrome = mux::chrome_line(tabs, active_idx, hint, self.cols as usize);
-        buf.extend_from_slice(format!("\x1b[{};1H", self.rows).as_bytes());
-        buf.extend_from_slice(chrome.as_bytes());
-        self.chrome = chrome;
-
-        buf.extend_from_slice(b"\x1b[?25l"); // no input caret on a dead screen
-        buf
+/// Write `rows` into `rect`, diffing per row against `last`. Each row
+/// is positioned absolutely and is exactly `rect.cols` wide (spaces
+/// for blanks), so it overwrites stale content without `\x1b[K`.
+fn blit_rows(buf: &mut Vec<u8>, last: &mut Vec<String>, rows: Vec<String>, rect: Rect) {
+    for (i, row) in rows.iter().enumerate() {
+        if last.get(i).map(String::as_str) != Some(row.as_str()) {
+            buf.extend_from_slice(
+                format!("\x1b[{};{}H", rect.y as usize + i + 1, rect.x + 1).as_bytes(),
+            );
+            buf.extend_from_slice(row.as_bytes());
+        }
     }
+    *last = rows;
+}
+
+/// Build one pane row as a self-contained string: a glyph per column
+/// (space for a blank), SGR emitted only when it changes, reset at
+/// the end. Exactly `cols` visible columns wide. No `\x1b[K`, no
+/// absolute moves — safe to drop at any (x, y).
+fn region_row(grid: &vt100::Screen, row: u16, cols: u16) -> String {
+    let mut out = String::new();
+    let mut cur_sgr = String::new();
+    let mut col = 0u16;
+    while col < cols {
+        let cell = grid.cell(row, col);
+        if let Some(c) = cell {
+            if c.is_wide_continuation() {
+                col += 1;
+                continue;
+            }
+            let sgr = cell_sgr(c);
+            if sgr != cur_sgr {
+                out.push('\x1b');
+                out.push('[');
+                out.push_str(&sgr);
+                out.push('m');
+                cur_sgr = sgr;
+            }
+            if c.has_contents() {
+                out.push_str(c.contents());
+            } else {
+                out.push(' ');
+            }
+        } else {
+            if !cur_sgr.is_empty() && cur_sgr != "0" {
+                out.push_str("\x1b[0m");
+                cur_sgr = "0".to_string();
+            }
+            out.push(' ');
+        }
+        col += 1;
+    }
+    out.push_str("\x1b[0m");
+    out
+}
+
+/// SGR parameter string for a cell (always reset-prefixed, so each
+/// emit fully sets the style).
+fn cell_sgr(c: &vt100::Cell) -> String {
+    let mut p = vec!["0".to_string()];
+    if c.bold() {
+        p.push("1".into());
+    }
+    if c.dim() {
+        p.push("2".into());
+    }
+    if c.italic() {
+        p.push("3".into());
+    }
+    if c.underline() {
+        p.push("4".into());
+    }
+    if c.inverse() {
+        p.push("7".into());
+    }
+    push_color(&mut p, c.fgcolor(), true);
+    push_color(&mut p, c.bgcolor(), false);
+    p.join(";")
+}
+
+fn push_color(p: &mut Vec<String>, color: vt100::Color, fg: bool) {
+    let base: u16 = if fg { 30 } else { 40 };
+    match color {
+        vt100::Color::Default => {}
+        vt100::Color::Idx(i) if i < 8 => p.push((base + u16::from(i)).to_string()),
+        vt100::Color::Idx(i) if i < 16 => p.push((base + 60 + u16::from(i - 8)).to_string()),
+        vt100::Color::Idx(i) => {
+            p.push(if fg { "38" } else { "48" }.into());
+            p.push("5".into());
+            p.push(i.to_string());
+        }
+        vt100::Color::Rgb(r, g, b) => {
+            p.push(if fg { "38" } else { "48" }.into());
+            p.push("2".into());
+            p.push(r.to_string());
+            p.push(g.to_string());
+            p.push(b.to_string());
+        }
+    }
+}
+
+/// The crashed-agent pane: a centered, dim "press Enter to respawn"
+/// prompt, the rest blank. Same row-string shape as a composited
+/// grid so it diffs/blits identically.
+fn dead_pane(label: &str, rect: Rect) -> Vec<String> {
+    let cols = rect.cols as usize;
+    let msg = format!("{label} exited · press Enter to respawn");
+    let msg: String = msg.chars().take(cols).collect();
+    let mid = (rect.rows / 2) as usize;
+    (0..rect.rows as usize)
+        .map(|r| {
+            if r == mid {
+                let pad = (cols - msg.chars().count()) / 2;
+                let mut line = " ".repeat(pad);
+                line.push_str("\x1b[2m");
+                line.push_str(&msg);
+                line.push_str("\x1b[0m");
+                let tail = cols - pad - msg.chars().count();
+                line.push_str(&" ".repeat(tail));
+                line
+            } else {
+                " ".repeat(cols)
+            }
+        })
+        .collect()
 }
 
 fn clear_screen() {
@@ -143,84 +261,148 @@ fn clear_screen() {
 mod tests {
     use super::*;
 
-    /// Build a content-region screen of `rows`x`cols` from the bytes
-    /// a child would have written.
-    fn screen(rows: u16, cols: u16, feed: &[u8]) -> vt100::Screen {
+    fn feed(rows: u16, cols: u16, bytes: &[u8]) -> vt100::Screen {
         let mut p = vt100::Parser::new(rows, cols, 0);
-        p.process(feed);
+        p.process(bytes);
         p.screen().clone()
+    }
+
+    fn tab(label: &str, working: bool) -> Tab {
+        Tab {
+            label: label.into(),
+            alive: true,
+            working,
+        }
+    }
+
+    fn bar(tabs: &[Tab], active: usize) -> ChromeBar<'_> {
+        ChromeBar {
+            tabs,
+            active,
+            hint: "",
+        }
     }
 
     fn row_text(s: &vt100::Screen, row: u16, cols: u16) -> String {
         (0..cols)
-            .map(|c| {
-                s.cell(row, c)
-                    .map(|cell| cell.contents())
-                    .unwrap_or_default()
-            })
+            .map(|c| s.cell(row, c).map(|c| c.contents()).unwrap_or_default())
             .collect::<String>()
             .trim_end()
             .to_string()
     }
 
-    /// The bug lloyd hit: switching tabs must clear the previous
-    /// screen's content. We simulate the physical terminal with a
-    /// vt100 parser, feed it each frame's bytes, and assert that
-    /// after switching to a shorter screen no residue of the taller
-    /// one survives.
+    /// The load-bearing property: two panes side by side must not
+    /// bleed into each other. Render an agent on the left and status
+    /// on the right, feed the frame to a physical vt100 parser, and
+    /// assert each pane shows its OWN content at its own columns.
     #[test]
-    fn switching_screens_clears_the_previous_content() {
-        let (rows, cols) = (4u16, 12u16); // 3 content rows + chrome
-        let (crows, ccols) = mux::content_rect(rows, cols);
+    fn side_by_side_panes_do_not_bleed() {
+        let (rows, cols) = (24u16, 80u16);
+        let layout = mux::layout(rows, cols);
         let mut frame = Frame::new(rows, cols);
         let mut physical = vt100::Parser::new(rows, cols, 0);
 
-        let tab = |l: &str| Tab {
-            label: l.into(),
-            alive: true,
-            working: false,
-        };
-        let tabs = [tab("a"), tab("b")];
+        let agent = feed(layout.main.rows, layout.main.cols, b"AGENT-LEFT");
+        let status = feed(layout.status.rows, layout.status.cols, b"STATUS-RIGHT");
+        let tabs = [tab("claude", false)];
 
-        // Screen A fills two content rows.
-        let a = screen(crows, ccols, b"AAA\r\nBBB");
-        physical.process(&frame.draw(&a, &tabs, 0, ""));
-        assert_eq!(row_text(physical.screen(), 0, cols), "AAA");
-        assert_eq!(row_text(physical.screen(), 1, cols), "BBB");
-
-        // Switch to screen B, which only writes row 0. Row 1's "BBB"
-        // must be gone.
-        let b = screen(crows, ccols, b"Z");
-        physical.process(&frame.draw(&b, &tabs, 1, ""));
-        assert_eq!(row_text(physical.screen(), 0, cols), "Z");
-        assert_eq!(
-            row_text(physical.screen(), 1, cols),
-            "",
-            "previous screen's content must be cleared on switch"
+        let bytes = frame.draw(
+            MainPane::Live(&agent),
+            &status,
+            layout,
+            false,
+            bar(&tabs, 0),
         );
+        physical.process(&bytes);
+
+        // Agent text is in the main pane's first row.
+        assert!(
+            row_text(physical.screen(), 0, cols).starts_with("AGENT-LEFT"),
+            "main pane row: {:?}",
+            row_text(physical.screen(), 0, cols)
+        );
+        // Status text starts exactly at the status pane's x — and the
+        // agent text never reached that far.
+        let sx = layout.status.x;
+        let status_cell: String = (0..layout.status.cols.min(12))
+            .map(|c| {
+                physical
+                    .screen()
+                    .cell(0, sx + c)
+                    .map(|c| c.contents())
+                    .unwrap_or_default()
+            })
+            .collect();
+        assert_eq!(status_cell, "STATUS-RIGHT", "status pane at x={sx}");
+    }
+
+    /// Switching the agent pane clears the previous agent's content
+    /// (the bug from the MVP), and never touches the status pane.
+    #[test]
+    fn switching_agent_pane_clears_and_preserves_status() {
+        let (rows, cols) = (24u16, 80u16);
+        let layout = mux::layout(rows, cols);
+        let mut frame = Frame::new(rows, cols);
+        let mut physical = vt100::Parser::new(rows, cols, 0);
+        let status = feed(layout.status.rows, layout.status.cols, b"STATUS");
+        let tabs = [tab("a", false), tab("b", false)];
+
+        let tall = feed(layout.main.rows, layout.main.cols, b"AAA\r\nBBB");
+        physical.process(&frame.draw(MainPane::Live(&tall), &status, layout, false, bar(&tabs, 0)));
+        assert_eq!(row_text(physical.screen(), 1, layout.main.cols), "BBB");
+
+        let short = feed(layout.main.rows, layout.main.cols, b"Z");
+        physical.process(&frame.draw(
+            MainPane::Live(&short),
+            &status,
+            layout,
+            false,
+            bar(&tabs, 1),
+        ));
+        assert_eq!(row_text(physical.screen(), 0, layout.main.cols), "Z");
+        assert_eq!(
+            row_text(physical.screen(), 1, layout.main.cols),
+            "",
+            "previous agent content cleared"
+        );
+        // Status pane survived untouched.
+        let sx = layout.status.x;
+        let status_cell: String = (0..6)
+            .map(|c| {
+                physical
+                    .screen()
+                    .cell(0, sx + c)
+                    .map(|c| c.contents())
+                    .unwrap_or_default()
+            })
+            .collect();
+        assert_eq!(status_cell, "STATUS");
     }
 
     #[test]
-    fn dead_screen_shows_the_respawn_prompt() {
-        let (rows, cols) = (6u16, 40u16);
+    fn dead_agent_pane_shows_respawn_prompt() {
+        let (rows, cols) = (24u16, 80u16);
+        let layout = mux::layout(rows, cols);
         let mut frame = Frame::new(rows, cols);
         let mut physical = vt100::Parser::new(rows, cols, 0);
-        let tabs = [Tab {
-            label: "codex".into(),
-            alive: false,
-            working: false,
-        }];
+        let status = feed(layout.status.rows, layout.status.cols, b"STATUS");
+        let tabs = [tab("codex", false)];
 
-        physical.process(&frame.draw_dead("codex", &tabs, 0, ""));
+        physical.process(&frame.draw(
+            MainPane::Dead("codex"),
+            &status,
+            layout,
+            false,
+            bar(&tabs, 0),
+        ));
 
-        let shown: String = (0..rows)
-            .map(|r| row_text(physical.screen(), r, cols))
+        let shown: String = (0..layout.main.rows)
+            .map(|r| row_text(physical.screen(), r, layout.main.cols))
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
             shown.contains("press Enter to respawn"),
-            "dead screen must invite respawn: {shown:?}"
+            "dead pane prompt: {shown:?}"
         );
-        assert!(shown.contains("codex"), "names the screen: {shown:?}");
     }
 }

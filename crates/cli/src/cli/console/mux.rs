@@ -105,11 +105,79 @@ pub(crate) fn next_active(active: usize, count: usize, action: &Action) -> Optio
     }
 }
 
-/// (rows, cols) available to the active child: the terminal minus
-/// the one-row chrome bar at the bottom. Always ≥1 row so a child
-/// never gets a zero-height PTY.
-pub(crate) fn content_rect(rows: u16, cols: u16) -> (u16, u16) {
-    (rows.saturating_sub(1).max(1), cols.max(1))
+/// A sub-rectangle of the terminal, 0-based origin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Rect {
+    pub(crate) x: u16,
+    pub(crate) y: u16,
+    pub(crate) rows: u16,
+    pub(crate) cols: u16,
+}
+
+/// How the content area is split between the active agent and the
+/// pinned status pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Layout {
+    /// The active agent fills this.
+    pub(crate) main: Rect,
+    /// `clank status --tui`, always visible.
+    pub(crate) status: Rect,
+    /// 0-based row index of the chrome bar (the terminal's last row).
+    pub(crate) chrome_row: u16,
+}
+
+/// Split the terminal into the agent pane, the always-on status pane,
+/// and the chrome row. **Landscape** (wide) puts status on the right;
+/// **portrait** (tall) puts it on the bottom. We own the winsize, so
+/// this is a pure layout decision — no geometry inference. Sizes are
+/// clamped so neither pane collapses on a small terminal.
+pub(crate) fn layout(rows: u16, cols: u16) -> Layout {
+    let rows = rows.max(2); // ≥1 content row + chrome
+    let cols = cols.max(1);
+    let content_rows = rows - 1;
+    let chrome_row = rows - 1;
+
+    if cols >= rows * 2 {
+        // Landscape: status on the right.
+        let status_cols = (cols / 3).clamp(20, 48).min(cols.saturating_sub(20).max(1));
+        let main_cols = cols - status_cols;
+        Layout {
+            main: Rect {
+                x: 0,
+                y: 0,
+                rows: content_rows,
+                cols: main_cols,
+            },
+            status: Rect {
+                x: main_cols,
+                y: 0,
+                rows: content_rows,
+                cols: status_cols,
+            },
+            chrome_row,
+        }
+    } else {
+        // Portrait: status on the bottom.
+        let status_rows = (content_rows / 3)
+            .clamp(6, 16)
+            .min(content_rows.saturating_sub(3).max(1));
+        let main_rows = content_rows - status_rows;
+        Layout {
+            main: Rect {
+                x: 0,
+                y: 0,
+                rows: main_rows,
+                cols,
+            },
+            status: Rect {
+                x: 0,
+                y: main_rows,
+                rows: status_rows,
+                cols,
+            },
+            chrome_row,
+        }
+    }
 }
 
 /// One tab in the chrome bar.
@@ -313,11 +381,33 @@ mod tests {
     }
 
     #[test]
-    fn content_rect_reserves_the_chrome_row() {
-        assert_eq!(content_rect(24, 80), (23, 80));
-        // Never zero-height / zero-width.
-        assert_eq!(content_rect(1, 0), (1, 1));
-        assert_eq!(content_rect(0, 0), (1, 1));
+    fn layout_landscape_puts_status_on_the_right() {
+        let l = layout(24, 80);
+        assert_eq!(l.chrome_row, 23);
+        // main + status tile the full width; both full content height.
+        assert_eq!(l.main.x, 0);
+        assert_eq!(l.main.y, 0);
+        assert_eq!(l.main.rows, 23);
+        assert_eq!(l.status.y, 0);
+        assert_eq!(l.status.rows, 23);
+        assert_eq!(l.status.x, l.main.cols);
+        assert_eq!(l.main.cols + l.status.cols, 80);
+        assert!(l.status.cols >= 20 && l.status.cols <= 48);
+    }
+
+    #[test]
+    fn layout_portrait_puts_status_on_the_bottom() {
+        // Tall + narrow → portrait.
+        let l = layout(50, 40);
+        // main on top, status below it, stacked, both full width.
+        assert_eq!(l.main.x, 0);
+        assert_eq!(l.main.y, 0);
+        assert_eq!(l.main.cols, 40);
+        assert_eq!(l.status.x, 0);
+        assert_eq!(l.status.cols, 40);
+        assert_eq!(l.status.y, l.main.rows);
+        assert_eq!(l.main.rows + l.status.rows, 49); // content rows
+        assert_eq!(l.chrome_row, 49);
     }
 
     #[test]
