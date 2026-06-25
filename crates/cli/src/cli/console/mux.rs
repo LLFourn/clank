@@ -112,6 +112,29 @@ pub(crate) fn next_active(active: usize, count: usize, action: &Action) -> Optio
     }
 }
 
+/// Resolve an agent-nav action (`SwitchTo`/`Next`/`Prev`) against the
+/// current `(active, status_focused)`, returning the new pair iff
+/// anything changes. The key rule (the plan's "any Meta-digit returns
+/// focus to an agent"): a nav ALWAYS returns focus to the agent pane,
+/// even when it targets the already-active agent — so `Meta-<current>`
+/// un-focuses the status pane in a single-agent console too. Non-nav
+/// actions return `None`. Pure → unit-tested headless.
+pub(crate) fn resolve_nav(
+    active: usize,
+    count: usize,
+    status_focused: bool,
+    action: &Action,
+) -> Option<(usize, bool)> {
+    if !matches!(action, Action::SwitchTo(_) | Action::Next | Action::Prev) {
+        return None;
+    }
+    let new_active = next_active(active, count, action).unwrap_or(active);
+    if new_active == active && !status_focused {
+        return None; // already there, nothing to change
+    }
+    Some((new_active, false))
+}
+
 /// A sub-rectangle of the terminal, 0-based origin.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Rect {
@@ -380,6 +403,28 @@ mod tests {
             route(Mode::Passthrough, b"\x1bz"),
             (1, Mode::Passthrough, Action::Forward(vec![0x1b]))
         );
+    }
+
+    #[test]
+    fn resolve_nav_always_returns_focus_to_the_agent() {
+        // Meta-<current agent> while status-focused un-focuses status,
+        // even though the active index doesn't change (the codex bug:
+        // single-agent consoles were stuck on status).
+        assert_eq!(
+            resolve_nav(0, 1, true, &Action::SwitchTo(0)),
+            Some((0, false))
+        );
+        // Same key when NOT status-focused is a genuine no-op.
+        assert_eq!(resolve_nav(0, 1, false, &Action::SwitchTo(0)), None);
+        // Switching to a different agent always lands on it, unfocused.
+        assert_eq!(
+            resolve_nav(0, 3, true, &Action::SwitchTo(2)),
+            Some((2, false))
+        );
+        assert_eq!(resolve_nav(0, 3, false, &Action::Next), Some((1, false)));
+        // Non-nav actions never resolve.
+        assert_eq!(resolve_nav(0, 3, true, &Action::FocusStatus), None);
+        assert_eq!(resolve_nav(0, 3, true, &Action::None), None);
     }
 
     #[test]

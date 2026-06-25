@@ -280,10 +280,14 @@ fn run_console(repo: &Path, specs: Vec<Spec>) -> anyhow::Result<()> {
                             }
                             nav => {
                                 // Next/Prev/SwitchTo cycle the AGENTS
-                                // (0..status_idx), never the status pane.
-                                if let Some(idx) = mux::next_active(active, status_idx, &nav) {
+                                // (0..status_idx) and always return focus
+                                // from the status pane — even when the
+                                // target is the already-active agent.
+                                if let Some((idx, focus)) =
+                                    mux::resolve_nav(active, status_idx, status_focused, &nav)
+                                {
                                     active = idx;
-                                    status_focused = false;
+                                    status_focused = focus;
                                     need_repaint = true;
                                 }
                             }
