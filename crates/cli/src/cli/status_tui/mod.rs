@@ -639,7 +639,6 @@ pub(crate) async fn run_tui(
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use super::derive::*;
     use super::*;
     use crate::lifecycle::{AgentLabel, CommitSha, PlanKey};
     use clank_core::plan_view::WaitingOn;
@@ -702,7 +701,7 @@ pub(crate) mod tests {
         assert!(v.fill, "input/data/resize re-arm the fill");
     }
 
-    fn agent_row(
+    pub(crate) fn agent_row(
         label: &str,
         role: crate::cli::teams_config::RosterRole,
         auto: clank_core::vocab::AutoMode,
@@ -781,7 +780,7 @@ pub(crate) mod tests {
         );
     }
 
-    fn two_agent_snap() -> StatusSnapshot {
+    pub(crate) fn two_agent_snap() -> StatusSnapshot {
         use crate::cli::teams_config::RosterRole;
         use clank_core::vocab::AutoMode;
         let mut s = snap(vec![], vec![]);
@@ -793,7 +792,11 @@ pub(crate) mod tests {
     }
 
     /// The candidate list the picker renders, with invocation + desc.
-    fn cand(label: &str, tool: &str, invocation: &str) -> crate::cli::status::AvailableAgent {
+    pub(crate) fn cand(
+        label: &str,
+        tool: &str,
+        invocation: &str,
+    ) -> crate::cli::status::AvailableAgent {
         crate::cli::status::AvailableAgent {
             label: label.to_string(),
             tool: tool.to_string(),
@@ -804,7 +807,7 @@ pub(crate) mod tests {
 
     /// The single line containing `needle` (for SGR-on-the-right-line
     /// assertions), or "" if none.
-    fn line_with<'a>(lines: &'a [String], needle: &str) -> &'a str {
+    pub(crate) fn line_with<'a>(lines: &'a [String], needle: &str) -> &'a str {
         lines
             .iter()
             .find(|l| l.contains(needle))
@@ -1177,7 +1180,7 @@ pub(crate) mod tests {
         assert_eq!(agent_panel_action(1, &agents, Key::Quit), PanelAction::Quit);
     }
 
-    fn commit_row(subject: &str) -> crate::cli::log::OnelineRow {
+    pub(crate) fn commit_row(subject: &str) -> crate::cli::log::OnelineRow {
         crate::cli::log::OnelineRow::Commit {
             sha: crate::lifecycle::CommitSha::parse(&format!("{:0<40}", "abc1234")).unwrap(),
             subject: subject.to_string(),
@@ -1285,7 +1288,7 @@ pub(crate) mod tests {
 
     /// A repo whose roster is claude(master) + codex(commit), matching
     /// `two_agent_snap`, for the detail-action reuse tests.
-    fn detail_repo() -> tempfile::TempDir {
+    pub(crate) fn detail_repo() -> tempfile::TempDir {
         let repo = tempfile::TempDir::new().unwrap();
         std::fs::create_dir_all(repo.path().join(".clank")).unwrap();
         std::fs::write(
@@ -1549,7 +1552,7 @@ pub(crate) mod tests {
     /// (`ESC [ … m`) and OSC 8 hyperlinks (`ESC ] … ST`); the latter
     /// matters because a URL like `github.com` contains an `m`, so
     /// the CSI-only scan would stop mid-URL.
-    fn visible_untrimmed(line: &str) -> String {
+    pub(crate) fn visible_untrimmed(line: &str) -> String {
         let mut out = String::new();
         let mut chars = line.chars().peekable();
         while let Some(c) = chars.next() {
@@ -1610,7 +1613,7 @@ pub(crate) mod tests {
         );
     }
 
-    fn pr_work(round: u64, missing: &[&str]) -> clank_core::wait::PrReviewWorkState {
+    pub(crate) fn pr_work(round: u64, missing: &[&str]) -> clank_core::wait::PrReviewWorkState {
         clank_core::wait::PrReviewWorkState {
             pr: 5,
             repo: "LLFourn/clank".into(),
@@ -1735,396 +1738,5 @@ pub(crate) mod tests {
                 .map(|l| AgentLabel::parse(l).unwrap())
                 .collect(),
         }
-    }
-
-    #[test]
-    fn unknown_tag_only_correction_is_visible_without_a_plan_row() {
-        // codex 2bf46d9: a `[ghost]`-tagged code-only HEAD has NO plan
-        // row to mark, but the correction must still surface — orange
-        // lamp + a top-level `fix` line — not idle. Display reads the
-        // `head_correction` source directly, not only the rows.
-        use clank_core::wait::{HeadCorrection, HeadTagViolation};
-        let mut s = snap(vec![], vec![]);
-        // Baseline: no plans/queue/correction → Idle.
-        assert_eq!(attention_state(&s), AttentionState::Idle);
-        s.head_correction = Some(HeadCorrection {
-            sha: crate::lifecycle::CommitSha::parse(&"a".repeat(40)).unwrap(),
-            violation: HeadTagViolation {
-                unknown: vec!["ghost".to_string()],
-                untagged_touched: vec![],
-                extra_named: vec![],
-            },
-        });
-        assert_eq!(
-            attention_state(&s),
-            AttentionState::NeedsCorrection,
-            "head_correction with no plan row still flags the lamp"
-        );
-        let out = render(&s, 24, 80).join("\n");
-        assert!(out.contains("fix"), "top-level fix line shown: {out}");
-        assert!(out.contains("ghost"), "names the bad tag: {out}");
-    }
-
-    #[test]
-    fn dirty_stats_get_their_own_github_colored_line() {
-        use crate::git_io::DirtyStats;
-        let mut s = snap(vec![], vec![]);
-        s.dirty = Some(DirtyStats {
-            insertions: 160,
-            deletions: 45,
-            untracked: 2,
-        });
-        let lines = render(&s, 40, 80);
-
-        // The git line carries branch+head only — no dirty stats.
-        let git = lines
-            .iter()
-            .find(|l| visible(l).trim_start().starts_with("git"))
-            .unwrap();
-        assert!(!visible(git).contains("160"), "git line: {}", visible(git));
-
-        // A distinct `dirty` gauge line holds the stats.
-        let dirty = lines
-            .iter()
-            .find(|l| visible(l).starts_with("dirty"))
-            .expect("a dirty line");
-        assert_eq!(visible(dirty), "dirty  +160 −45 · 2 untracked");
-        // GitHub colors: green wraps the additions, red the deletions.
-        assert!(dirty.contains("\x1b[32m+160"), "green additions: {dirty:?}");
-        assert!(dirty.contains("\x1b[31m−45"), "red deletions: {dirty:?}");
-    }
-
-    #[test]
-    fn dirty_line_omits_zeros_and_falls_back_to_changes() {
-        use crate::git_io::DirtyStats;
-        let mut s = snap(vec![], vec![]);
-
-        // Only insertions → no `−0`, no red.
-        s.dirty = Some(DirtyStats {
-            insertions: 3,
-            deletions: 0,
-            untracked: 0,
-        });
-        let dirty = render(&s, 40, 80)
-            .into_iter()
-            .find(|l| visible(l).starts_with("dirty"))
-            .unwrap();
-        assert_eq!(visible(&dirty), "dirty  +3");
-        assert!(!dirty.contains("\x1b[31m"), "no red without deletions");
-
-        // All-zero (e.g. mode-only change) → dim `changes`, no color.
-        s.dirty = Some(DirtyStats {
-            insertions: 0,
-            deletions: 0,
-            untracked: 0,
-        });
-        let dirty = render(&s, 40, 80)
-            .into_iter()
-            .find(|l| visible(l).starts_with("dirty"))
-            .unwrap();
-        assert_eq!(visible(&dirty), "dirty  changes");
-        assert!(!dirty.contains("\x1b[32m") && !dirty.contains("\x1b[31m"));
-    }
-
-    #[test]
-    fn clean_tree_emits_no_dirty_line() {
-        let s = snap(vec![], vec![]); // dirty: None
-        let lines = render(&s, 40, 80);
-        assert!(
-            !lines.iter().any(|l| visible(l).starts_with("dirty")),
-            "clean tree must not render a dirty line"
-        );
-    }
-
-    #[test]
-    fn one_row_always_renders_active_agent_bar() {
-        // THE invariant: even at 1 row the who's-active bar renders
-        // (ruthless 9d01e47 concern 1) — actor + verb left, plan
-        // right.
-        let s = snap(vec![plan_state("foo", reviewer_missing("codex"))], vec![]);
-        let lines = render(&s, 1, 40);
-        assert_eq!(lines.len(), 1);
-        let v = visible(&lines[0]);
-        assert!(v.starts_with("👀 CODEX reviewing"), "got `{v}`");
-        assert!(v.ends_with("foo"), "plan stem right-aligned; got `{v}`");
-    }
-
-    #[test]
-    fn bar_drops_right_segment_when_too_narrow() {
-        let s = snap(
-            vec![plan_state(
-                "a-very-long-plan-name-that-will-not-fit",
-                reviewer_missing("codex"),
-            )],
-            vec![],
-        );
-        let v = visible(&render(&s, 1, 20)[0]);
-        assert_eq!(v, "👀 CODEX reviewing", "left segment only; got `{v}`");
-    }
-
-    #[test]
-    fn idle_renders_idle_even_at_one_row() {
-        // Truly idle: no plans AND empty queue.
-        let s = snap(vec![], vec![]);
-        assert_eq!(visible(&render(&s, 1, 80)[0]), "💤 idle");
-    }
-
-    #[test]
-    fn no_plan_with_queue_names_master_and_next_promote() {
-        // lloyd (reopen round): no active plan + non-empty queue is
-        // MASTER's turn — promote. Names the agent; queue head on
-        // the right with the remainder count.
-        let s = snap(vec![], vec!["zellij-layout", "wait-hint"]);
-        let v = visible(&render(&s, 1, 60)[0]);
-        assert!(v.starts_with("📋 CLAUDE promote"), "got `{v}`");
-        assert!(v.ends_with("zellij-layout +1"), "got `{v}`");
-    }
-
-    #[test]
-    fn blocked_queued_plan_shows_block_lamp_not_promote() {
-        // wait-ignores-queue-only-blocks: the only queued plan is
-        // suppressed by a pending plan-scoped block — the queue is
-        // STOPPED on a human ask, so the bar shows the block lamp
-        // (🙋 … blocked), NOT the promote lamp.
-        let mut s = snap(vec![], vec!["simctl-up"]);
-        s.blocks = vec![crate::cli::block::BlockEntry {
-            agent: "claude".into(),
-            name: "simctl-up-design-decisions".into(),
-            plan: Some("simctl-up".into()),
-            question: "which sims?".into(),
-            answer: None,
-        }];
-        let v = visible(&render(&s, 1, 60)[0]);
-        assert!(v.starts_with("🙋 CLAUDE blocked"), "got `{v}`");
-    }
-
-    #[test]
-    fn block_on_head_queue_item_still_shows_promote_for_lower() {
-        // A block on the head queued plan must not hide a lower unblocked
-        // one: block > promote applies ONLY when nothing is promotable.
-        let mut s = snap(vec![], vec!["blocked-plan", "free-plan"]);
-        s.blocks = vec![crate::cli::block::BlockEntry {
-            agent: "claude".into(),
-            name: "q".into(),
-            plan: Some("blocked-plan".into()),
-            question: "?".into(),
-            answer: None,
-        }];
-        let v = visible(&render(&s, 1, 60)[0]);
-        assert!(v.starts_with("📋 CLAUDE promote"), "got `{v}`");
-        assert!(v.contains("free-plan"), "names the promotable item: `{v}`");
-    }
-
-    #[test]
-    fn no_plan_with_queue_and_no_team_falls_back_to_master() {
-        let mut s = snap(vec![], vec!["zellij-layout"]);
-        s.master = None;
-        let v = visible(&render(&s, 1, 60)[0]);
-        assert!(v.starts_with("📋 MASTER promote"), "got `{v}`");
-    }
-
-    #[test]
-    fn single_plan_body_states_each_fact_once() {
-        // The bar names actor+verb+plan; the body must NOT repeat
-        // them — gate line carries state + sha, git line the repo.
-        let s = snap(
-            vec![plan_state("foo", reviewer_missing("codex"))],
-            vec!["q1"],
-        );
-        let lines = render(&s, 8, 60);
-        let texts: Vec<String> = lines.iter().map(|l| visible(l)).collect();
-        assert_eq!(texts[1], "", "breath line under the bar");
-        assert_eq!(texts[2], " gate  unreviewed @ abc1230");
-        assert_eq!(texts[3], " next  q1");
-        assert_eq!(texts[4], "  git  master deadbee");
-        // No GAUGE line repeats the actor or the plan stem (the timeline
-        // below legitimately names a pending reviewer, so scope the check
-        // to the gauge cluster).
-        for t in &texts[1..5] {
-            assert!(!t.contains("codex") && !t.contains("foo"), "repeat: `{t}`");
-        }
-    }
-
-    #[test]
-    fn width_truncates_every_line_by_display_width() {
-        let s = snap(
-            vec![plan_state(
-                "a-very-long-plan-name-that-will-not-fit",
-                reviewer_missing("codex"),
-            )],
-            vec!["another-quite-long-queued-name"],
-        );
-        let lines = render(&s, 24, 10);
-        for line in &lines {
-            assert!(
-                display_width(visible(line).trim_end()) <= 10,
-                "line wider than 10 display cols: `{line}`"
-            );
-        }
-    }
-
-    #[test]
-    fn bar_padding_fills_exactly_to_display_width() {
-        // The reverse-video bar must be EXACTLY cols display-wide —
-        // one more wraps the background (the bug lloyd hit live).
-        let s = snap(vec![plan_state("foo", reviewer_missing("codex"))], vec![]);
-        for cols in [9, 20, 39, 60] {
-            let lines = render(&s, 1, cols);
-            assert_eq!(
-                display_width(&visible_untrimmed(&lines[0])),
-                cols as usize,
-                "bar must be exactly {cols} display cols"
-            );
-        }
-    }
-
-    #[test]
-    fn tiny_pane_keeps_bar_and_gate_before_queue() {
-        // Greedy order: bar, gate; the queue summary only once
-        // there's room (no breath line below 4 rows).
-        let s = snap(
-            vec![plan_state("foo", reviewer_missing("codex"))],
-            vec!["q1", "q2"],
-        );
-        let texts: Vec<String> = render(&s, 2, 60).iter().map(|l| visible(l)).collect();
-        assert!(texts[1].starts_with(" gate"), "got {texts:?}");
-        let texts: Vec<String> = render(&s, 3, 60).iter().map(|l| visible(l)).collect();
-        assert!(texts[2].starts_with(" next  q1 +1"), "got {texts:?}");
-    }
-
-    #[test]
-    fn tall_pane_expands_queue_block() {
-        let s = snap(
-            vec![plan_state("foo", reviewer_missing("codex"))],
-            vec!["first", "second", "third"],
-        );
-        let texts: Vec<String> = render(&s, 14, 60).iter().map(|l| visible(l)).collect();
-        let qi = texts
-            .iter()
-            .position(|t| t.starts_with("queue  first"))
-            .expect("queue block header");
-        assert_eq!(texts[qi + 1].trim(), "second");
-        assert_eq!(texts[qi + 2].trim(), "third");
-        assert!(
-            !texts.iter().any(|t| t.contains("next")),
-            "summary line replaced by block"
-        );
-    }
-
-    #[test]
-    fn blocked_plan_bar_names_human_and_ask_carries_question() {
-        use clank_core::plan_view::PlanBlock;
-        let mut s = snap(
-            vec![plan_state(
-                "foo",
-                WaitingOn::Blocked {
-                    block: PlanBlock {
-                        creator: AgentLabel::parse("claude").unwrap(),
-                        name: "q".into(),
-                        message: "is this right?\nmore detail".into(),
-                    },
-                },
-            )],
-            vec![],
-        );
-        s.blocks = vec![crate::cli::block::BlockEntry {
-            agent: "claude".into(),
-            name: "q".into(),
-            plan: None,
-            question: "is this right?\nmore detail".into(),
-            answer: None,
-        }];
-        // Tall pane so the (now scrollable) ask is fully on screen.
-        let texts: Vec<String> = render(&s, 12, 60).iter().map(|l| visible(l)).collect();
-        assert!(texts[0].starts_with("🙋 HUMAN blocked"), "got {texts:?}");
-        // The ask now renders in the SCROLLABLE region (below the compact
-        // gauges), still word-wrapped under an `ask` gutter — both lines
-        // present, position-independent (status-tui-block-ask-scroll).
-        let joined = texts.join("\n");
-        assert!(
-            joined.contains("  ask  is this right?"),
-            "ask line present: {texts:?}"
-        );
-        assert!(
-            joined.contains("       more detail"),
-            "wrapped continuation present: {texts:?}"
-        );
-    }
-
-    #[test]
-    fn long_block_ask_scrolls_into_view() {
-        // A long ask overflows a short pane; the tail must be reachable by
-        // scrolling (it's scrollable content, not a clipped fixed header).
-        let q = "AAAA BBBB CCCC DDDD EEEE FFFF GGGG HHHH IIII JJJJ KKKK LAST";
-        // FixCommitTag → no in-progress row, so this isolates ask scrolling.
-        let mut s = snap(
-            vec![plan_state("foo", WaitingOn::MasterToFixCommitTag)],
-            vec![],
-        );
-        s.blocks = vec![crate::cli::block::BlockEntry {
-            agent: "claude".into(),
-            name: "q".into(),
-            plan: None,
-            question: q.into(),
-            answer: None,
-        }];
-        // Narrow + short so the ask wraps to many lines and overflows.
-        let top = render_at(&s, 8, 24, 0, 0, &PanelView::just(Mode::LogScroll))
-            .0
-            .join("\n");
-        assert!(top.contains("AAAA"), "ask head visible at offset 0: {top}");
-        assert!(!top.contains("LAST"), "ask tail off-screen at offset 0");
-        // Scrolling down reveals the tail.
-        let revealed = (1..30).any(|off| {
-            render_at(&s, 8, 24, off, 0, &PanelView::just(Mode::LogScroll))
-                .0
-                .join("\n")
-                .contains("LAST")
-        });
-        assert!(revealed, "scrolling brings the ask tail into view");
-    }
-
-    #[test]
-    fn no_pending_block_reserves_no_ask_space() {
-        let s = snap(
-            vec![plan_state("foo", WaitingOn::MasterToFixCommitTag)],
-            vec![],
-        );
-        assert!(
-            block_ask_spans(&s, 60).is_empty(),
-            "no pending block → no ask rows"
-        );
-    }
-
-    #[test]
-    fn two_plans_get_count_bar_and_per_plan_lines() {
-        let s = snap(
-            vec![
-                plan_state("alpha", reviewer_missing("codex")),
-                plan_state("beta", WaitingOn::MasterToContinue),
-            ],
-            vec![],
-        );
-        let texts: Vec<String> = render(&s, 8, 60).iter().map(|l| visible(l)).collect();
-        assert!(texts[0].starts_with("🔀 2 ACTIVE"), "got {texts:?}");
-        assert_eq!(texts[2], "👀 codex  alpha  unreviewed");
-        assert_eq!(texts[3], "🔨 master  beta  unreviewed");
-    }
-
-    #[test]
-    fn idle_with_done_shows_last_finished() {
-        use clank_core::repo_state::FinishedPlan;
-        let mut s = snap(vec![], vec![]);
-        s.last_finished = Some(FinishedPlan {
-            plan: PlanKey::parse("old-plan").unwrap(),
-            intro: CommitSha::parse(&format!("{:0<40}", "aa")).unwrap(),
-            finalized_at: CommitSha::parse(&format!("{:0<40}", "bb")).unwrap(),
-        });
-        let texts: Vec<String> = render(&s, 6, 60).iter().map(|l| visible(l)).collect();
-        assert_eq!(texts[0], "💤 idle");
-        assert!(
-            texts.iter().any(|t| t.starts_with(" done  old-plan @ ")),
-            "got {texts:?}"
-        );
     }
 }
