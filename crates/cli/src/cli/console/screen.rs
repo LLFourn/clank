@@ -18,6 +18,12 @@ use std::sync::{Arc, Mutex};
 
 use super::pty;
 
+/// Lines of console-owned scrollback kept per agent screen, so the
+/// wheel can page back through an agent's history (the zellij model).
+/// A main-buffer agent (e.g. claude code) parks its output here; an
+/// alt-screen pane keeps none (spawned with 0).
+pub(crate) const AGENT_SCROLLBACK: usize = 10_000;
+
 /// What to run in a screen: a chrome label plus the argv. The
 /// console builds these from the roster (`clank agent start <label>`
 /// per agent, plus a `clank status --tui` screen). Cloned onto the
@@ -50,18 +56,21 @@ pub(crate) struct Screen {
 
 impl Screen {
     /// Spawn the child in a PTY sized to the content region and start
-    /// its always-on reader thread. `idx` tags the events this
+    /// its always-on reader thread. `scrollback` is the parser's
+    /// console-owned history depth ([`AGENT_SCROLLBACK`] for an agent,
+    /// 0 for the alt-screen status pane). `idx` tags the events this
     /// screen emits so the loop knows which grid changed.
     pub(crate) fn spawn(
         spec: &Spec,
         cwd: &Path,
         rows: u16,
         cols: u16,
+        scrollback: usize,
         idx: usize,
         tx: Sender<Event>,
     ) -> std::io::Result<Self> {
         let (master, child) = pty::spawn(&spec.program, &spec.args, cwd, rows, cols)?;
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 0)));
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, scrollback)));
         let alive = Arc::new(AtomicBool::new(true));
 
         let reader_parser = parser.clone();
@@ -123,7 +132,7 @@ mod tests {
             args: vec!["hello console".into()],
         };
         let screen =
-            Screen::spawn(&spec, Path::new("/"), 24, 80, 0, tx).expect("spawn printf in a pty");
+            Screen::spawn(&spec, Path::new("/"), 24, 80, 0, 0, tx).expect("spawn printf in a pty");
 
         // Wait (bounded) for the child to write + exit.
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -156,7 +165,7 @@ mod tests {
             args: vec![],
         };
         let screen =
-            Screen::spawn(&spec, Path::new("/"), 24, 80, 7, tx).expect("spawn `true` in a pty");
+            Screen::spawn(&spec, Path::new("/"), 24, 80, 0, 7, tx).expect("spawn `true` in a pty");
 
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut saw_exit = false;
@@ -172,5 +181,33 @@ mod tests {
         }
         assert!(saw_exit, "reader must emit Exit on EOF");
         assert!(!screen.is_alive(), "alive flag cleared on EOF");
+    }
+
+    /// The scrollback mechanic the wheel handler drives, exercised on a
+    /// bare parser (no process): output past the screen height lands in
+    /// scrollback, `set_scrollback` surfaces the older rows, and offset
+    /// 0 is exactly the live view again.
+    #[test]
+    fn scrollback_reveals_history_and_zero_returns_to_live() {
+        let mut p = vt100::Parser::new(4, 20, AGENT_SCROLLBACK);
+        for i in 0..40 {
+            p.process(format!("line{i}\r\n").as_bytes());
+        }
+        let live = p.screen().contents();
+        assert!(live.contains("line39"), "live shows the newest: {live:?}");
+        assert!(
+            !live.contains("line0"),
+            "oldest scrolled off live: {live:?}"
+        );
+        // Scroll all the way back (vt100 clamps to the buffer length).
+        p.screen_mut().set_scrollback(AGENT_SCROLLBACK);
+        let back = p.screen().contents();
+        assert!(
+            back.contains("line0"),
+            "scrolled back to the oldest: {back:?}"
+        );
+        // Offset 0 is the live view again.
+        p.screen_mut().set_scrollback(0);
+        assert_eq!(p.screen().contents(), live, "offset 0 == live");
     }
 }

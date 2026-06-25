@@ -197,6 +197,7 @@ fn run_console(repo: &Path, specs: Vec<Spec>) -> anyhow::Result<()> {
             repo,
             rect.rows,
             rect.cols,
+            screen_scrollback(i, status_idx),
             i,
             stx.clone(),
         )?);
@@ -299,6 +300,11 @@ fn run_console(repo: &Path, specs: Vec<Spec>) -> anyhow::Result<()> {
                         match action {
                             Action::Forward(data) => {
                                 if screens[target].is_alive() {
+                                    // Typing returns the view to live — never
+                                    // type blindly into scrolled-up history.
+                                    if reset_scroll(&screens, target) {
+                                        need_repaint = true;
+                                    }
                                     pty::write_all(screens[target].master, &data);
                                 } else if data.iter().any(|&b| b == b'\r' || b == b'\n') {
                                     // Dead pane: Enter respawns it in place.
@@ -379,13 +385,31 @@ fn run_console(repo: &Path, specs: Vec<Spec>) -> anyhow::Result<()> {
                                 let grab = under.and_then(|(idx, r, c)| {
                                     child_grabs_mouse(&screens, idx).map(|enc| (idx, r, c, enc))
                                 });
-                                if let Some((idx, r, c, enc)) = grab {
-                                    let data = mux::encode_mouse_for_child(ev, c + 1, r + 1, enc);
-                                    pty::write_all(screens[idx].master, &data);
-                                } else if wheel {
-                                    // Wheel over a pane that isn't tracking the
-                                    // mouse: nothing to scroll (no scrollback) —
-                                    // swallow rather than misread it as a click.
+                                if wheel {
+                                    // Wheel: a mouse-grabbing agent scrolls
+                                    // itself (forward); a main-buffer agent
+                                    // scrolls the console's own scrollback; an
+                                    // alt-screen app without the mouse has none.
+                                    let alt = under
+                                        .map(|(idx, _, _)| screen_in_alt(&screens, idx))
+                                        .unwrap_or(false);
+                                    let up = ev.button & 0b1 == 0;
+                                    match mux::wheel_action(grab.is_some(), alt, up) {
+                                        mux::WheelAction::Forward => {
+                                            if let Some((idx, r, c, enc)) = grab {
+                                                forward_mouse(&screens, idx, r, c, enc, ev);
+                                            }
+                                        }
+                                        mux::WheelAction::Scroll(delta) => {
+                                            if let Some((idx, _, _)) = under {
+                                                scroll_screen(&screens, idx, delta);
+                                                need_repaint = true;
+                                            }
+                                        }
+                                        mux::WheelAction::Swallow => {}
+                                    }
+                                } else if let Some((idx, r, c, enc)) = grab {
+                                    forward_mouse(&screens, idx, r, c, enc, ev);
                                 } else if ev.pressed && left && !motion {
                                     selection = under.map(|(idx, r, c)| Sel {
                                         idx,
@@ -424,6 +448,9 @@ fn run_console(repo: &Path, specs: Vec<Spec>) -> anyhow::Result<()> {
                                     selection = None;
                                     need_repaint = true;
                                 } else if screens[target].is_alive() {
+                                    if reset_scroll(&screens, target) {
+                                        need_repaint = true;
+                                    }
                                     pty::write_all(screens[target].master, &[0x1b]);
                                 }
                             }
@@ -514,6 +541,54 @@ fn child_grabs_mouse(screens: &[Screen], idx: usize) -> Option<mux::ChildMouseEn
     })
 }
 
+/// Forward a mouse event to a child that grabbed the mouse, re-encoded
+/// into that pane's 1-based coordinates.
+fn forward_mouse(
+    screens: &[Screen],
+    idx: usize,
+    r: u16,
+    c: u16,
+    enc: mux::ChildMouseEncoding,
+    ev: mux::MouseEvent,
+) {
+    let data = mux::encode_mouse_for_child(ev, c + 1, r + 1, enc);
+    pty::write_all(screens[idx].master, &data);
+}
+
+/// Whether screen `idx`'s child is drawing on the alternate buffer (a
+/// full-screen TUI). Such a child has no meaningful console scrollback,
+/// so the wheel doesn't scroll it. `false` on a poisoned lock.
+fn screen_in_alt(screens: &[Screen], idx: usize) -> bool {
+    screens[idx]
+        .parser
+        .lock()
+        .map(|p| p.screen().alternate_screen())
+        .unwrap_or(false)
+}
+
+/// Move screen `idx`'s console scrollback view by `delta` rows (positive
+/// = back into history, negative = toward live), clamped at the live
+/// edge; vt100 clamps the far edge to the buffer length.
+fn scroll_screen(screens: &[Screen], idx: usize, delta: i32) {
+    if let Ok(mut p) = screens[idx].parser.lock() {
+        let next = (p.screen().scrollback() as i32 + delta).max(0) as usize;
+        p.screen_mut().set_scrollback(next);
+    }
+}
+
+/// Snap screen `idx` back to its live view. Returns whether it moved, so
+/// the caller can repaint — typing must always land you at the live
+/// prompt, never blindly into scrolled-up history.
+fn reset_scroll(screens: &[Screen], idx: usize) -> bool {
+    if let Ok(mut p) = screens[idx].parser.lock()
+        && p.screen().scrollback() != 0
+    {
+        p.screen_mut().set_scrollback(0);
+        return true;
+    }
+    false
+}
+
 /// Copy the selection from a screen's grid to the system clipboard via
 /// OSC 52 (best-effort — silently a no-op on terminals that don't
 /// support it; `Alt-z` zoom + native copy is the fallback).
@@ -576,6 +651,17 @@ fn screen_rect(idx: usize, status_idx: usize, layout: mux::Layout) -> mux::Rect 
         rows: r.rows.max(1),
         cols: r.cols.max(1),
         ..r
+    }
+}
+
+/// Scrollback depth for screen `idx`: agents get [`screen::AGENT_SCROLLBACK`]
+/// so the wheel can page back through their output; the status pane
+/// (`status_idx`) is an alt-screen view that keeps none.
+fn screen_scrollback(idx: usize, status_idx: usize) -> usize {
+    if idx == status_idx {
+        0
+    } else {
+        screen::AGENT_SCROLLBACK
     }
 }
 
@@ -774,7 +860,16 @@ fn respawn(
     let status_idx = screens.len() - 1;
     let rect = screen_rect(idx, status_idx, layout);
     let spec = screens[idx].spec.clone();
-    if let Ok(new) = Screen::spawn(&spec, repo, rect.rows, rect.cols, idx, stx.clone()) {
+    let scrollback = screen_scrollback(idx, status_idx);
+    if let Ok(new) = Screen::spawn(
+        &spec,
+        repo,
+        rect.rows,
+        rect.cols,
+        scrollback,
+        idx,
+        stx.clone(),
+    ) {
         let mut old = std::mem::replace(&mut screens[idx], new);
         let _ = old.child.wait();
         pty::close(old.master);
@@ -948,7 +1043,7 @@ mod tests {
             args: vec![],
         };
         let mut screens =
-            vec![Screen::spawn(&spec, Path::new("/"), 24, 80, 0, tx.clone()).expect("spawn")];
+            vec![Screen::spawn(&spec, Path::new("/"), 24, 80, 0, 0, tx.clone()).expect("spawn")];
 
         let deadline = Instant::now() + Duration::from_secs(5);
         while screens[0].is_alive() && Instant::now() < deadline {

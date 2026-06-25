@@ -235,6 +235,39 @@ pub(crate) fn route(mode: Mode, bytes: &[u8]) -> (usize, Mode, Action) {
     }
 }
 
+/// What a wheel notch resolves to, once we know whether the child
+/// under the cursor grabbed the mouse, whether its screen is the
+/// alternate buffer, and the direction. `Forward` → the agent scrolls
+/// itself (it owns the mouse); `Scroll(delta)` → move THAT pane's
+/// console scrollback view (positive = back into history, negative =
+/// toward live); `Swallow` → nothing to scroll (an alt-screen app with
+/// no mouse keeps no scrollback). Pure → unit-tested.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WheelAction {
+    Forward,
+    Scroll(i32),
+    Swallow,
+}
+
+/// Rows moved per wheel notch — a few lines, like a terminal.
+pub(crate) const WHEEL_STEP: i32 = 3;
+
+/// Resolve a wheel event over a pane. The discriminator is
+/// `alternate_screen`: a main-buffer agent (claude code) scrolls the
+/// console's scrollback, a full-screen TUI is left to forward/swallow —
+/// the standard multiplexer rule, no per-tool special-casing.
+pub(crate) fn wheel_action(grabbed_mouse: bool, alt_screen: bool, up: bool) -> WheelAction {
+    if grabbed_mouse {
+        WheelAction::Forward
+    } else if alt_screen {
+        WheelAction::Swallow
+    } else if up {
+        WheelAction::Scroll(WHEEL_STEP)
+    } else {
+        WheelAction::Scroll(-WHEEL_STEP)
+    }
+}
+
 /// The active index after a navigation action, or `None` if it
 /// doesn't move: an out-of-range or same-index `SwitchTo`, no
 /// screens, or a non-nav action. Pure so wraparound + clamping are
@@ -656,6 +689,22 @@ mod tests {
             route(Mode::Passthrough, b"\x1b[<0;5"),
             (1, Mode::Passthrough, Action::Forward(vec![0x1b]))
         );
+    }
+
+    #[test]
+    fn wheel_routes_forward_scroll_or_swallow() {
+        use WheelAction::*;
+        // A child that grabbed the mouse scrolls itself — forward,
+        // regardless of buffer or direction.
+        assert_eq!(wheel_action(true, false, true), Forward);
+        assert_eq!(wheel_action(true, true, false), Forward);
+        // Not grabbed + main buffer → scroll the console's view, signed
+        // by direction.
+        assert_eq!(wheel_action(false, false, true), Scroll(WHEEL_STEP));
+        assert_eq!(wheel_action(false, false, false), Scroll(-WHEEL_STEP));
+        // Not grabbed + alt-screen → nothing to scroll.
+        assert_eq!(wheel_action(false, true, true), Swallow);
+        assert_eq!(wheel_action(false, true, false), Swallow);
     }
 
     #[test]
