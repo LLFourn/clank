@@ -23,11 +23,15 @@ pub(crate) enum MainPane<'a> {
     Dead(&'a str),
 }
 
-/// The bottom bar's inputs: the agent tabs, which one is focused, and
-/// the dim keybinding hint.
+/// The bottom bar's inputs: the agent tabs, which one is active, the
+/// focus + follow state, and the dim keybinding hint.
 pub(crate) struct ChromeBar<'a> {
     pub(crate) tabs: &'a [Tab],
     pub(crate) active: usize,
+    /// Status pane (not an agent) has focus — so no agent tab bands.
+    pub(crate) status_focused: bool,
+    /// Follow-active mode is on.
+    pub(crate) follow: bool,
     pub(crate) hint: &'a str,
 }
 
@@ -37,6 +41,7 @@ pub(crate) struct ChromeBar<'a> {
 pub(crate) struct Frame {
     main_rows: Vec<String>,
     status_rows: Vec<String>,
+    divider_rows: Vec<String>,
     chrome: String,
     cols: u16,
 }
@@ -47,6 +52,7 @@ impl Frame {
         Frame {
             main_rows: Vec::new(),
             status_rows: Vec::new(),
+            divider_rows: Vec::new(),
             chrome: String::new(),
             cols,
         }
@@ -57,6 +63,7 @@ impl Frame {
     pub(crate) fn resize(&mut self, _rows: u16, cols: u16) {
         self.main_rows.clear();
         self.status_rows.clear();
+        self.divider_rows.clear();
         self.chrome.clear();
         self.cols = cols;
         clear_screen();
@@ -88,8 +95,21 @@ impl Frame {
         // Status pane.
         blit(&mut buf, &mut self.status_rows, status, layout.status);
 
-        // Chrome bar — only when it changed.
-        let chrome = mux::chrome_line(chrome.tabs, chrome.active, chrome.hint, self.cols as usize);
+        // Divider between the panes — its colour is the focus cue:
+        // accent when status is focused, dim otherwise.
+        let div = divider_rows(layout, cursor_in_status);
+        blit_rows(&mut buf, &mut self.divider_rows, div, layout.divider);
+
+        // Chrome bar — only when it changed. The agent tab band shows
+        // only when an agent (not status) is focused.
+        let chrome = mux::chrome_line(
+            chrome.tabs,
+            chrome.active,
+            chrome.status_focused,
+            chrome.follow,
+            chrome.hint,
+            self.cols as usize,
+        );
         if chrome != self.chrome {
             buf.extend_from_slice(format!("\x1b[{};1H", layout.chrome_row + 1).as_bytes());
             buf.extend_from_slice(chrome.as_bytes());
@@ -225,6 +245,37 @@ fn push_color(p: &mut Vec<String>, color: vt100::Color, fg: bool) {
     }
 }
 
+/// The divider rule between the panes, as blit rows. Its colour is
+/// the focus cue: an accent (cyan) when the status pane is focused,
+/// dim otherwise. Landscape draws a vertical `│` per row; portrait a
+/// horizontal `─` rule with a centered `STATUS` label.
+fn divider_rows(layout: mux::Layout, status_focused: bool) -> Vec<String> {
+    let style = if status_focused {
+        "\x1b[36m"
+    } else {
+        "\x1b[2m"
+    };
+    let d = layout.divider;
+    if layout.landscape {
+        (0..d.rows).map(|_| format!("{style}│\x1b[0m")).collect()
+    } else {
+        let cols = d.cols as usize;
+        let label = " STATUS ";
+        let line = if cols >= label.chars().count() + 2 {
+            let dash = cols - label.chars().count();
+            let left = dash / 2;
+            format!(
+                "{style}{}{label}{}\x1b[0m",
+                "─".repeat(left),
+                "─".repeat(dash - left)
+            )
+        } else {
+            format!("{style}{}\x1b[0m", "─".repeat(cols))
+        };
+        vec![line]
+    }
+}
+
 /// The crashed-agent pane: a centered, dim "press Enter to respawn"
 /// prompt, the rest blank. Same row-string shape as a composited
 /// grid so it diffs/blits identically.
@@ -279,6 +330,8 @@ mod tests {
         ChromeBar {
             tabs,
             active,
+            status_focused: false,
+            follow: false,
             hint: "",
         }
     }
@@ -289,6 +342,35 @@ mod tests {
             .collect::<String>()
             .trim_end()
             .to_string()
+    }
+
+    /// The divider rule renders between the panes, in the divider's
+    /// own column — so the status pane's edge is visible.
+    #[test]
+    fn divider_renders_between_the_panes() {
+        let (rows, cols) = (24u16, 80u16);
+        let layout = mux::layout(rows, cols);
+        let mut frame = Frame::new(rows, cols);
+        let mut physical = vt100::Parser::new(rows, cols, 0);
+        let agent = feed(layout.main.rows, layout.main.cols, b"x");
+        let status = feed(layout.status.rows, layout.status.cols, b"y");
+        let tabs = [tab("a", false)];
+
+        physical.process(&frame.draw(
+            MainPane::Live(&agent),
+            &status,
+            layout,
+            false,
+            bar(&tabs, 0),
+        ));
+
+        // A `│` sits in the divider column on a content row.
+        let cell = physical
+            .screen()
+            .cell(0, layout.divider.x)
+            .map(|c| c.contents())
+            .unwrap_or_default();
+        assert_eq!(cell, "│", "divider at x={}", layout.divider.x);
     }
 
     /// The load-bearing property: two panes side by side must not

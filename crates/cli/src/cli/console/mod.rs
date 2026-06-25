@@ -218,10 +218,11 @@ fn run_console(repo: &Path, specs: Vec<Spec>) -> anyhow::Result<()> {
     let mut working: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut mode = Mode::Passthrough;
     let hint = "M-0 follow · M-1…9 pin · M-s status · ^\\ quit";
-    let ctx = |active, status_focused, layout| RenderCtx {
+    let ctx = |active, status_focused, follow, layout| RenderCtx {
         status_idx,
         active,
         status_focused,
+        follow,
         layout,
         hint,
     };
@@ -230,7 +231,7 @@ fn run_console(repo: &Path, specs: Vec<Spec>) -> anyhow::Result<()> {
         &mut frame,
         &screens,
         &working,
-        ctx(active, status_focused, layout),
+        ctx(active, status_focused, follow, layout),
     );
 
     // Batch each wakeup: drain everything currently queued, apply it,
@@ -362,7 +363,7 @@ fn run_console(repo: &Path, specs: Vec<Spec>) -> anyhow::Result<()> {
                 &mut frame,
                 &screens,
                 &working,
-                ctx(active, status_focused, layout),
+                ctx(active, status_focused, follow, layout),
             );
         }
     }
@@ -404,6 +405,7 @@ struct RenderCtx<'a> {
     status_idx: usize,
     active: usize,
     status_focused: bool,
+    follow: bool,
     layout: mux::Layout,
     hint: &'a str,
 }
@@ -426,6 +428,8 @@ fn repaint(
     let chrome = render::ChromeBar {
         tabs: &tabs,
         active: ctx.active,
+        status_focused: ctx.status_focused,
+        follow: ctx.follow,
         hint: ctx.hint,
     };
 
