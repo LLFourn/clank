@@ -1,0 +1,343 @@
+//! The input state machine: raw stdin → [`Key`], the [`Mode`] that owns
+//! the keyboard (and its sub-states), and the PURE routing/decision
+//! functions that map a key in a mode to an action the loop executes.
+//! No IO — the effectful appliers (roster mutations) live in the loop
+//! (the IO shell), so this whole module is unit-tested headless.
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Key {
+    Up,
+    Down,
+    PageUp,
+    PageDown,
+    Top,
+    Bottom,
+    Quit,
+    /// Space — page-down while scrolling the log; toggle auto on the
+    /// selected agent while the agent panel is focused. Context-free
+    /// parse; the loop resolves the meaning from focus.
+    Space,
+    /// Tab / `a` — move keyboard focus between the log and the agent
+    /// panel.
+    Focus,
+    /// Esc — back out one level (leave the panel / cancel a picker or
+    /// confirm).
+    Escape,
+    /// Enter — activate the row under the cursor (open the picker on
+    /// "+ add", choose a candidate) or, in a confirm, follow the
+    /// default.
+    Enter,
+    /// Backspace / DEL — remove the selected reviewer.
+    Delete,
+    /// `y` — confirm.
+    Yes,
+    /// `n` — decline.
+    No,
+}
+
+/// Which region (and sub-state) owns the keyboard. The backbone of key
+/// routing: each key is interpreted in exactly ONE place per mode, so
+/// an unbound key does nothing and a key can't mean two things at once.
+/// `Confirm` as its own mode is what makes "Enter silently confirms a
+/// destructive default" unwritable — Enter is resolved in one place.
+///
+/// `Copy` is preserved by storing INDICES (into `snapshot.agents` /
+/// the freshly-read picker list), never owned labels; the label is
+/// resolved at action time. A data-changing Refresh resets the picker/
+/// confirm modes (see the Refresh arm) so an index can't act on a
+/// reordered target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Mode {
+    /// Default: keys scroll the log.
+    LogScroll,
+    /// The agent panel owns the keys; `sel` is the cursor row. Rows are
+    /// `agents` followed by the "+ add" row at index `agents.len()`.
+    AgentPanel { sel: usize },
+    /// Choosing a library agent to add; `sel` indexes the freshly-read
+    /// candidate list the loop holds.
+    AddPicker { sel: usize },
+    /// The per-agent detail/config page; `idx` is the agent in
+    /// `snapshot.agents`, `sel` the cursor over its action menu.
+    AgentDetail { idx: usize, sel: usize },
+    /// A mutating decision is pending; the action carries the target by
+    /// index.
+    Confirm { action: ConfirmAction },
+}
+
+/// One row of an agent's detail-page action menu (the actions are data
+/// the cursor moves over, not a keymap). Availability depends on role —
+/// see [`detail_actions`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DetailAction {
+    /// Arm/disarm the agent's auto-mode.
+    ToggleAuto,
+    /// Flip a reviewer between the commit and gate tiers.
+    SwitchTier,
+    /// Promote a reviewer to master (the core also demotes the old one).
+    PromoteToMaster,
+    /// Remove the agent from the team (behind the confirm).
+    Remove,
+    /// Leave the detail page.
+    Back,
+}
+
+/// The detail-page actions for `role`, in display order. Master gets a
+/// reduced set (no tier-switch / promote / remove): the UI hide is
+/// primary, and the cores refuse anyway (defense in depth).
+pub(super) fn detail_actions(role: crate::cli::teams_config::RosterRole) -> Vec<DetailAction> {
+    use crate::cli::teams_config::RosterRole;
+    use DetailAction::*;
+    match role {
+        RosterRole::Master => vec![ToggleAuto, Back],
+        RosterRole::Commit | RosterRole::Gate => {
+            vec![ToggleAuto, SwitchTier, PromoteToMaster, Remove, Back]
+        }
+    }
+}
+
+/// What a detail-page keystroke means — PURE, like `agent_panel_action`:
+/// the loop executes the result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DetailNav {
+    None,
+    Quit,
+    /// Esc/Tab — return to the panel.
+    Back,
+    /// Move the action cursor to this row.
+    MoveCursor(usize),
+    /// Activate the action under the cursor.
+    Activate(DetailAction),
+}
+
+/// Re-locate an open detail page by LABEL after a roster rebuild:
+/// the same agent's new index, or `None` if it's gone (close the page).
+/// Identity is by label, never by a kept index — an external promote /
+/// tier change reorders rows, so a kept index could retarget a
+/// different agent.
+pub(super) fn relocate_detail(
+    label: &str,
+    agents: &[crate::cli::status::AgentAutoRow],
+) -> Option<usize> {
+    agents.iter().position(|a| a.label == label)
+}
+
+/// Pure key routing for the detail page over its action menu.
+pub(super) fn agent_detail_nav(sel: usize, actions: &[DetailAction], key: Key) -> DetailNav {
+    match key {
+        Key::Quit => DetailNav::Quit,
+        Key::Escape | Key::Focus => DetailNav::Back,
+        Key::Up => DetailNav::MoveCursor(move_selection(sel, actions.len(), false)),
+        Key::Down => DetailNav::MoveCursor(move_selection(sel, actions.len(), true)),
+        Key::Enter | Key::Space => {
+            DetailNav::Activate(actions.get(sel).copied().unwrap_or(DetailAction::Back))
+        }
+        _ => DetailNav::None,
+    }
+}
+
+/// A pending roster mutation, by index (keeps [`Mode`] `Copy`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ConfirmAction {
+    /// Add the candidate at this index in the loop's picker list.
+    AddCandidate { idx: usize },
+    /// Remove the agent at this index in `snapshot.agents`.
+    RemoveAgent { idx: usize },
+}
+
+impl ConfirmAction {
+    /// Add defaults to Yes (non-destructive); remove defaults to No —
+    /// so Enter (which follows the default) never confirms a removal.
+    pub(super) fn default_yes(self) -> bool {
+        matches!(self, ConfirmAction::AddCandidate { .. })
+    }
+}
+
+impl Mode {
+    /// True for every agent-region sub-state (panel, picker, confirm) —
+    /// the log is the only non-agents mode. Drives the focus rail/header.
+    pub(super) fn agents_focused(self) -> bool {
+        !matches!(self, Mode::LogScroll)
+    }
+    pub(super) fn log_focused(self) -> bool {
+        matches!(self, Mode::LogScroll)
+    }
+    /// The agent-panel cursor row, else `None` (picker/confirm/log have
+    /// no agent-row cursor).
+    pub(super) fn selected(self) -> Option<usize> {
+        match self {
+            Mode::AgentPanel { sel } => Some(sel),
+            _ => None,
+        }
+    }
+
+    /// The Tab/focus-key transition: from the log, enter the panel at row
+    /// 0 (only if there's a roster to enter); from any agent-region mode,
+    /// return to the log. The single focus-toggle rule, shared by every
+    /// handler arm.
+    pub(super) fn toggle_focus(self, agents_len: usize) -> Mode {
+        match self {
+            Mode::LogScroll if agents_len > 0 => Mode::AgentPanel { sel: 0 },
+            _ => Mode::LogScroll,
+        }
+    }
+}
+
+/// The interactive state `render_at` needs beyond the snapshot: which
+/// mode owns the keyboard and the freshly-read add-picker candidates.
+/// Bundled so the render signature stays small (and future interactive
+/// bits land here, not as more args).
+pub(super) struct PanelView<'a> {
+    pub(super) mode: Mode,
+    pub(super) picker: &'a [crate::cli::status::AvailableAgent],
+    /// The selected log ENTRY (index into the scroll sequence) — drawn
+    /// with the unified selection band when the log is focused.
+    pub(super) log_cursor: usize,
+}
+
+impl<'a> PanelView<'a> {
+    /// A view with just a mode (no picker, cursor at 0) — the common
+    /// case for tests and the log-scroll default.
+    #[cfg(test)]
+    pub(super) fn just(mode: Mode) -> Self {
+        Self {
+            mode,
+            picker: &[],
+            log_cursor: 0,
+        }
+    }
+}
+
+/// What an `AgentPanel` keystroke means — PURE routing over the cursor
+/// position and the selected row's role, so every case is unit-tested
+/// and the loop only executes the result (the sole place IO happens).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PanelAction {
+    None,
+    Quit,
+    /// Tab/Esc — hand focus back to the log.
+    LeaveFocus,
+    /// Move the cursor to this row.
+    MoveCursor(usize),
+    /// `Down` past the last panel row ("+ add") — cross into the log.
+    EnterLog,
+    /// Toggle auto on the agent at this index (SPC, quick path).
+    ToggleAuto(usize),
+    /// Open the per-agent detail page (Enter on an agent row).
+    OpenDetail(usize),
+    /// Open the add picker (Enter/Space on the "+ add" row).
+    OpenPicker,
+}
+
+/// Pure key routing for the agent panel. `agents` is the roster; the
+/// "+ add" row sits at index `agents.len()`. Removal/role/tier are no
+/// longer panel actions — Enter opens the detail page where they live.
+pub(super) fn agent_panel_action(
+    sel: usize,
+    agents: &[crate::cli::status::AgentAutoRow],
+    key: Key,
+) -> PanelAction {
+    let add_row = agents.len();
+    let on_add = sel == add_row;
+    match key {
+        Key::Quit => PanelAction::Quit,
+        Key::Focus | Key::Escape => PanelAction::LeaveFocus,
+        Key::Up => PanelAction::MoveCursor(move_selection(sel, add_row + 1, false)),
+        // `Down` past the bottom row ("+ add") flows into the log —
+        // continuous navigation across the panel↔log boundary.
+        Key::Down if on_add => PanelAction::EnterLog,
+        Key::Down => PanelAction::MoveCursor(move_selection(sel, add_row + 1, true)),
+        // Enter activates the row: the picker on "+ add", the detail page
+        // on an agent. Space is the quick inline auto-toggle (or the
+        // picker on "+ add").
+        Key::Enter if on_add => PanelAction::OpenPicker,
+        Key::Enter => PanelAction::OpenDetail(sel),
+        Key::Space if on_add => PanelAction::OpenPicker,
+        Key::Space => PanelAction::ToggleAuto(sel),
+        _ => PanelAction::None,
+    }
+}
+
+/// Resolve a Confirm keystroke: `Some(true)` confirm, `Some(false)`
+/// cancel, `None` ignore. In a confirm `q` CANCELS (it does not quit
+/// the TUI), and Enter follows the action's default — so a destructive
+/// default is never confirmed by Enter.
+pub(super) fn confirm_decision(action: ConfirmAction, key: Key) -> Option<bool> {
+    match key {
+        Key::Yes => Some(true),
+        Key::No | Key::Escape | Key::Quit => Some(false),
+        Key::Enter => Some(action.default_yes()),
+        _ => None,
+    }
+}
+
+/// Parse a burst of stdin bytes into scroll keys — arrow keys,
+/// PgUp/PgDn, plus vi-ish `j`/`k`/`g`/`G`, space (page down), `q` (quit).
+pub(super) fn parse_keys(bytes: &[u8]) -> Vec<Key> {
+    let mut keys = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let rest = &bytes[i..];
+        if rest.starts_with(b"\x1b[A") {
+            keys.push(Key::Up);
+            i += 3;
+        } else if rest.starts_with(b"\x1b[B") {
+            keys.push(Key::Down);
+            i += 3;
+        } else if rest.starts_with(b"\x1b[5~") {
+            keys.push(Key::PageUp);
+            i += 4;
+        } else if rest.starts_with(b"\x1b[6~") {
+            keys.push(Key::PageDown);
+            i += 4;
+        } else if rest.starts_with(b"\x1b[") {
+            // Unknown CSI (e.g. left/right arrows, F-keys): consume
+            // through its final byte so a lone Esc isn't misread out of
+            // the sequence's leading bytes.
+            let mut j = 2;
+            while j < rest.len() && !(0x40..=0x7e).contains(&rest[j]) {
+                j += 1;
+            }
+            i += (j + 1).min(rest.len());
+        } else {
+            match bytes[i] {
+                b'k' => keys.push(Key::Up),
+                b'j' => keys.push(Key::Down),
+                b'g' => keys.push(Key::Top),
+                b'G' => keys.push(Key::Bottom),
+                b' ' => keys.push(Key::Space),
+                b'b' => keys.push(Key::PageUp),
+                b'\t' | b'a' => keys.push(Key::Focus),
+                b'\r' | b'\n' => keys.push(Key::Enter),
+                0x7f | 0x08 => keys.push(Key::Delete),
+                b'y' => keys.push(Key::Yes),
+                b'n' => keys.push(Key::No),
+                0x1b => keys.push(Key::Escape),
+                b'q' => keys.push(Key::Quit),
+                _ => {}
+            }
+            i += 1;
+        }
+    }
+    keys
+}
+
+/// The opposite armed state — what a SPC toggle writes.
+pub(super) fn flip_auto(mode: clank_core::vocab::AutoMode) -> clank_core::vocab::AutoMode {
+    use clank_core::vocab::AutoMode;
+    match mode {
+        AutoMode::On => AutoMode::Off,
+        AutoMode::Off => AutoMode::On,
+    }
+}
+
+/// Move the agent-panel cursor within `[0, len)`, saturating at both
+/// ends (no wrap). `len == 0` pins it at 0 (an empty roster has no
+/// selectable rows; the panel can't be focused then anyway).
+pub(super) fn move_selection(sel: usize, len: usize, down: bool) -> usize {
+    let last = len.saturating_sub(1);
+    if down {
+        (sel + 1).min(last)
+    } else {
+        sel.saturating_sub(1)
+    }
+}
