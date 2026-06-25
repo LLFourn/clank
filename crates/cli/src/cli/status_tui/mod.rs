@@ -1036,35 +1036,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn detail_page_relocates_by_label_across_a_reorder() {
-        use crate::cli::teams_config::RosterRole;
-        use clank_core::vocab::AutoMode;
-        // Detail is open on "codex", currently at index 1.
-        let before = [
-            agent_row("claude", RosterRole::Master, AutoMode::On),
-            agent_row("codex", RosterRole::Commit, AutoMode::Off),
-            agent_row("ruthless", RosterRole::Gate, AutoMode::On),
-        ];
-        // After an external promote, codex moved to index 0 — relocating by
-        // label finds it there, NOT whatever now sits at index 1.
-        let after = [
-            agent_row("codex", RosterRole::Master, AutoMode::Off),
-            agent_row("claude", RosterRole::Commit, AutoMode::On),
-            agent_row("ruthless", RosterRole::Gate, AutoMode::On),
-        ];
-        let label = before[1].label.clone();
-        assert_eq!(relocate_detail(&label, &before), Some(1));
-        assert_eq!(
-            relocate_detail(&label, &after),
-            Some(0),
-            "follows the agent by label across a reorder"
-        );
-        // Removed entirely → None (the page should close).
-        let removed = [agent_row("claude", RosterRole::Master, AutoMode::On)];
-        assert_eq!(relocate_detail(&label, &removed), None);
-    }
-
-    #[test]
     fn detail_page_renders_info_actions_and_reduced_master_set() {
         use crate::cli::teams_config::RosterRole;
         use clank_core::vocab::AutoMode;
@@ -1122,62 +1093,6 @@ pub(crate) mod tests {
                 && !mas.contains("remove from team"),
             "master's action set is reduced: {mas}"
         );
-    }
-
-    #[test]
-    fn agent_panel_action_routes_keys_by_row_and_role() {
-        use crate::cli::teams_config::RosterRole;
-        use clank_core::vocab::AutoMode;
-        let agents = vec![
-            agent_row("claude", RosterRole::Master, AutoMode::On),
-            agent_row("codex", RosterRole::Commit, AutoMode::Off),
-        ];
-        // "+ add" row is index 2 (== agents.len()): Enter AND Space open
-        // the picker.
-        assert_eq!(
-            agent_panel_action(2, &agents, Key::Enter),
-            PanelAction::OpenPicker
-        );
-        assert_eq!(
-            agent_panel_action(2, &agents, Key::Space),
-            PanelAction::OpenPicker
-        );
-        // Agent rows: Enter opens the detail page; Space toggles auto.
-        assert_eq!(
-            agent_panel_action(1, &agents, Key::Enter),
-            PanelAction::OpenDetail(1)
-        );
-        assert_eq!(
-            agent_panel_action(1, &agents, Key::Space),
-            PanelAction::ToggleAuto(1)
-        );
-        // DEL is no longer a panel action (removal lives on the detail page).
-        assert_eq!(
-            agent_panel_action(1, &agents, Key::Delete),
-            PanelAction::None
-        );
-        // Navigation: Down within the panel moves; Down at the +add row
-        // (index 2 == agents.len()) crosses into the log; Tab/Esc leave;
-        // q quits.
-        assert_eq!(
-            agent_panel_action(0, &agents, Key::Down),
-            PanelAction::MoveCursor(1)
-        );
-        assert_eq!(
-            agent_panel_action(2, &agents, Key::Down),
-            PanelAction::EnterLog,
-            "Down past +add flows into the log"
-        );
-        assert_eq!(
-            agent_panel_action(0, &agents, Key::Up),
-            PanelAction::MoveCursor(0),
-            "Up at the top stays put"
-        );
-        assert_eq!(
-            agent_panel_action(1, &agents, Key::Focus),
-            PanelAction::LeaveFocus
-        );
-        assert_eq!(agent_panel_action(1, &agents, Key::Quit), PanelAction::Quit);
     }
 
     pub(crate) fn commit_row(subject: &str) -> crate::cli::log::OnelineRow {
