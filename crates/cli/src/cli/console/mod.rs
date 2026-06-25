@@ -45,23 +45,29 @@ enum Ev {
     Working(std::collections::HashSet<String>),
 }
 
-/// A live mouse selection: the pane it's anchored in, the press
-/// `anchor`, and the current drag `end` (pane-relative, 0-based, not
-/// yet ordered). Normalized to a [`render::Selection`] for drawing.
+/// A live mouse selection bound to the CONCRETE screen it started on
+/// (`idx`) — not just "the main pane", so follow-mode swapping the
+/// active agent mid-drag can't move the highlight or copy to a
+/// different screen. `anchor`/`end` are pane-relative, 0-based, and
+/// not yet ordered.
 struct Sel {
-    status: bool,
+    idx: usize,
     anchor: (u16, u16),
     end: (u16, u16),
 }
 
 impl Sel {
-    fn to_render(&self) -> render::Selection {
-        let (start, end) = mux::order_cells(self.anchor, self.end);
-        render::Selection {
-            status: self.status,
-            start,
-            end,
+    /// The render-side selection for the CURRENT view, given which
+    /// screen is the status pane and which agent is active. `None` when
+    /// the anchored screen isn't on display (follow-mode switched the
+    /// main pane to a different agent) — there's nothing to highlight.
+    fn to_render(&self, active: usize, status_idx: usize) -> Option<render::Selection> {
+        let status = self.idx == status_idx;
+        if !status && self.idx != active {
+            return None;
         }
+        let (start, end) = mux::order_cells(self.anchor, self.end);
+        Some(render::Selection { status, start, end })
     }
 }
 
@@ -246,7 +252,9 @@ fn run_console(repo: &Path, specs: Vec<Spec>) -> anyhow::Result<()> {
         status_focused,
         follow,
         zoomed,
-        selection: selection.as_ref().map(Sel::to_render),
+        selection: selection
+            .as_ref()
+            .and_then(|s| s.to_render(active, status_idx)),
         layout,
         hint,
     };
@@ -343,34 +351,48 @@ fn run_console(repo: &Path, specs: Vec<Spec>) -> anyhow::Result<()> {
                                 need_repaint = true;
                             }
                             Action::Mouse(ev) => {
-                                let hit = mux::pane_at(layout, ev.col, ev.row);
-                                // The child under the cursor (active agent
-                                // or status).
-                                let under = hit.map(|(p, _, _)| match p {
-                                    mux::Pane::Status => status_idx,
-                                    mux::Pane::Main => active,
-                                });
                                 let wheel = ev.button & 0b0100_0000 != 0;
                                 let motion = ev.button & 0b0010_0000 != 0;
                                 let left = ev.button & 0b11 == 0;
-                                // If the child grabbed the mouse, or it's a
-                                // wheel event, it's the AGENT's (forwarding
-                                // is the next milestone — swallow for now,
-                                // never inject). Otherwise it's selection.
-                                let agents_mouse =
-                                    under.is_some_and(|i| child_grabs_mouse(&screens, i));
-                                if wheel || agents_mouse {
-                                    // (forward milestone)
+                                // Resolve the hit to the CONCRETE screen under
+                                // the cursor (which agent / the status screen),
+                                // not just "the main pane": follow-mode can swap
+                                // the active agent mid-drag, so a selection bound
+                                // to a slot would jump panes. `under` is the
+                                // screen index + its pane-relative (row, col).
+                                let under =
+                                    mux::pane_at(layout, ev.col, ev.row).map(|(p, r, c)| {
+                                        let idx = match p {
+                                            mux::Pane::Status => status_idx,
+                                            mux::Pane::Main => active,
+                                        };
+                                        (idx, r, c)
+                                    });
+                                // If that child grabbed the mouse, the event is
+                                // the AGENT's: forward it re-encoded into the
+                                // pane's coordinates.
+                                let grab = under.and_then(|(idx, r, c)| {
+                                    child_grabs_mouse(&screens, idx).map(|enc| (idx, r, c, enc))
+                                });
+                                if let Some((idx, r, c, enc)) = grab {
+                                    let data = mux::encode_mouse_for_child(ev, c + 1, r + 1, enc);
+                                    pty::write_all(screens[idx].master, &data);
+                                } else if wheel {
+                                    // Wheel over a pane that isn't tracking the
+                                    // mouse: nothing to scroll (no scrollback) —
+                                    // swallow rather than misread it as a click.
                                 } else if ev.pressed && left && !motion {
-                                    selection = hit.map(|(p, r, c)| Sel {
-                                        status: matches!(p, mux::Pane::Status),
+                                    selection = under.map(|(idx, r, c)| Sel {
+                                        idx,
                                         anchor: (r, c),
                                         end: (r, c),
                                     });
                                     need_repaint = true;
                                 } else if ev.pressed && left && motion {
-                                    if let (Some(sel), Some((p, r, c))) = (&mut selection, hit)
-                                        && matches!(p, mux::Pane::Status) == sel.status
+                                    // Extend only while the cursor is still over
+                                    // the screen the drag began on.
+                                    if let (Some(sel), Some((idx, r, c))) = (&mut selection, under)
+                                        && idx == sel.idx
                                     {
                                         sel.end = (r, c);
                                         need_repaint = true;
@@ -378,8 +400,7 @@ fn run_console(repo: &Path, specs: Vec<Spec>) -> anyhow::Result<()> {
                                 } else if !ev.pressed
                                     && let Some(sel) = &selection
                                 {
-                                    let idx = if sel.status { status_idx } else { active };
-                                    copy_selection(&screens[idx], sel);
+                                    copy_selection(&screens[sel.idx], sel);
                                 }
                             }
                             Action::None => {}
@@ -453,13 +474,20 @@ fn primary_working_idx(
     mux::primary_working(&labels, working)
 }
 
-/// Whether screen `idx`'s child has turned ON mouse reporting — then
-/// the mouse is the AGENT's (it gets forwarded), not the console's.
-fn child_grabs_mouse(screens: &[Screen], idx: usize) -> bool {
-    screens[idx]
-        .parser
-        .lock()
-        .is_ok_and(|p| p.screen().mouse_protocol_mode() != vt100::MouseProtocolMode::None)
+/// `Some(encoding)` if screen `idx`'s child has turned ON mouse
+/// reporting — then the mouse is the AGENT's (forwarded in its own
+/// encoding), not the console's. `None` means the child isn't tracking
+/// the mouse, so the console keeps it for selection.
+fn child_grabs_mouse(screens: &[Screen], idx: usize) -> Option<mux::ChildMouseEncoding> {
+    let guard = screens[idx].parser.lock().ok()?;
+    let screen = guard.screen();
+    if screen.mouse_protocol_mode() == vt100::MouseProtocolMode::None {
+        return None;
+    }
+    Some(match screen.mouse_protocol_encoding() {
+        vt100::MouseProtocolEncoding::Sgr => mux::ChildMouseEncoding::Sgr,
+        _ => mux::ChildMouseEncoding::Legacy,
+    })
 }
 
 /// Copy the selection from a screen's grid to the system clipboard via
@@ -784,6 +812,41 @@ mod tests {
         assert_eq!(base64_encode(b"foo"), "Zm9v");
         assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
         assert_eq!(base64_encode(b"hello"), "aGVsbG8=");
+    }
+
+    #[test]
+    fn selection_is_bound_to_its_screen_not_the_main_slot() {
+        // A drag started on agent screen 1. Follow-mode can switch the
+        // active agent mid-drag (the bug the reviewer caught): the
+        // highlight must track the SCREEN, not whoever is now in the
+        // main pane.
+        let status_idx = 3;
+        let sel = Sel {
+            idx: 1,
+            anchor: (0, 0),
+            end: (0, 4),
+        };
+        // Agent 1 still active → highlight in the main pane.
+        let r = sel.to_render(1, status_idx).expect("shown while active");
+        assert!(!r.status, "an agent selection is a main-pane selection");
+        // Active switched to agent 2 → the anchored screen is off-screen,
+        // so nothing is highlighted (and copy still reads screen 1).
+        assert!(
+            sel.to_render(2, status_idx).is_none(),
+            "no highlight once the anchored agent is no longer shown"
+        );
+        // A selection anchored on the status screen always renders in the
+        // status pane (it's always on screen), regardless of active.
+        let s = Sel {
+            idx: status_idx,
+            anchor: (0, 0),
+            end: (0, 1),
+        };
+        assert!(
+            s.to_render(2, status_idx)
+                .expect("status always shown")
+                .status
+        );
     }
 
     #[test]

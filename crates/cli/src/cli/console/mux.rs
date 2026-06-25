@@ -56,6 +56,18 @@ pub(crate) struct MouseEvent {
     pub(crate) pressed: bool,
 }
 
+/// How a child wants mouse reports encoded — the subset of
+/// `vt100::MouseProtocolEncoding` we re-emit when forwarding to an
+/// agent that grabbed the mouse. `Sgr` (`CSI < … M|m`) is the modern,
+/// lossless form essentially every current TUI requests; `Legacy` is
+/// the original `CSI M` + three offset bytes (best-effort: coordinates
+/// clamp at 223 and a release collapses to the all-buttons-up code).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChildMouseEncoding {
+    Sgr,
+    Legacy,
+}
+
 /// Parse one SGR mouse sequence at the front of `bytes` (`CSI < Cb ;
 /// Cx ; Cy M|m`). Returns `(consumed, event)`, or `None` if `bytes`
 /// doesn't start with a COMPLETE such sequence (so an incomplete one
@@ -101,6 +113,45 @@ fn parse_sgr_mouse(bytes: &[u8]) -> Option<(usize, MouseEvent)> {
             pressed,
         },
     ))
+}
+
+/// Re-encode a mouse event for a child that grabbed the mouse, with
+/// `col`/`row` already translated to the child's 1-based pane-relative
+/// coordinates. The button byte (including the wheel/motion flags)
+/// passes through unchanged — only the coordinates move from terminal
+/// space into pane space.
+pub(crate) fn encode_mouse_for_child(
+    ev: MouseEvent,
+    col: u16,
+    row: u16,
+    enc: ChildMouseEncoding,
+) -> Vec<u8> {
+    match enc {
+        ChildMouseEncoding::Sgr => {
+            let term = if ev.pressed { 'M' } else { 'm' };
+            format!("\x1b[<{};{};{}{}", ev.button, col, row, term).into_bytes()
+        }
+        ChildMouseEncoding::Legacy => {
+            // `CSI M` then three bytes, each offset by 32. The legacy
+            // form can't name the button on a release — it's the
+            // all-buttons-up code 3 (the wheel/motion high bits stay).
+            // Coordinates clamp at the 223 ceiling the single byte fits.
+            let btn = if ev.pressed {
+                ev.button
+            } else {
+                (ev.button & !0b11) | 0b11
+            };
+            let coord = |v: u16| (v.min(223) as u8).wrapping_add(32);
+            vec![
+                ESC,
+                b'[',
+                b'M',
+                (btn as u8).wrapping_add(32),
+                coord(col),
+                coord(row),
+            ]
+        }
+    }
 }
 
 const ESC: u8 = 0x1b;
@@ -640,6 +691,60 @@ mod tests {
         assert!(!in_selection(1, 7, (1, 3), (1, 6)));
         // order_cells normalizes a backwards drag.
         assert_eq!(order_cells((3, 5), (1, 3)), ((1, 3), (3, 5)));
+    }
+
+    #[test]
+    fn encode_mouse_for_child_sgr_round_trips_with_pane_coords() {
+        // Left press at pane-relative (col 5, row 3): same Cb + M, new
+        // coordinates.
+        let ev = MouseEvent {
+            button: 0,
+            col: 40,
+            row: 12,
+            pressed: true,
+        };
+        let out = encode_mouse_for_child(ev, 5, 3, ChildMouseEncoding::Sgr);
+        assert_eq!(out, b"\x1b[<0;5;3M");
+        // Release keeps the button code, flips terminator to `m`.
+        let rel = MouseEvent {
+            pressed: false,
+            ..ev
+        };
+        assert_eq!(
+            encode_mouse_for_child(rel, 5, 3, ChildMouseEncoding::Sgr),
+            b"\x1b[<0;5;3m"
+        );
+        // Wheel-up (Cb 64) passes its high bits through untouched.
+        let wheel = MouseEvent { button: 64, ..ev };
+        assert_eq!(
+            encode_mouse_for_child(wheel, 1, 1, ChildMouseEncoding::Sgr),
+            b"\x1b[<64;1;1M"
+        );
+    }
+
+    #[test]
+    fn encode_mouse_for_child_legacy_offsets_by_32_and_collapses_release() {
+        // CSI M + three +32 bytes; top-left (1,1) → 33, 33.
+        let press = MouseEvent {
+            button: 0,
+            col: 9,
+            row: 9,
+            pressed: true,
+        };
+        assert_eq!(
+            encode_mouse_for_child(press, 1, 1, ChildMouseEncoding::Legacy),
+            vec![0x1b, b'[', b'M', 32, 33, 33]
+        );
+        // Release can't name its button in the legacy form — it's the
+        // all-buttons-up code 3 (byte 35), coords still offset.
+        let rel = MouseEvent {
+            pressed: false,
+            ..press
+        };
+        assert_eq!(
+            encode_mouse_for_child(rel, 1, 1, ChildMouseEncoding::Legacy),
+            vec![0x1b, b'[', b'M', 35, 33, 33]
+        );
     }
 
     #[test]
