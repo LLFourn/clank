@@ -664,9 +664,29 @@ fn status_walk(git: &gix::Repository) -> Result<WtStatus, GitIoError> {
                 match iw.summary() {
                     // NeedsUpdate (stat-only) / ignored — not a real change.
                     None => {}
-                    // The dirwalk only surfaces untracked files as `Added`.
+                    // The dirwalk surfaces untracked entries as `Added`.
+                    // gix's `CollapseDirectory` mode collapses an untracked
+                    // directory into one `Added` entry even when its whole
+                    // subtree holds only further directories (no files) —
+                    // but git tracks files, not dirs, so `git status` reports
+                    // a directory only when it contains a non-directory entry.
+                    // Match git: drop a collapsed directory with no
+                    // non-directory descendant; keep everything else.
                     Some(Summary::Added) => {
-                        untracked.push(iw.rela_path().to_str_lossy().into_owned())
+                        let rela = iw.rela_path().to_str_lossy().into_owned();
+                        let disk_kind = match &iw {
+                            gix::status::index_worktree::Item::DirectoryContents {
+                                entry, ..
+                            } => entry.disk_kind,
+                            _ => None,
+                        };
+                        let keep = disk_kind != Some(gix::dir::entry::Kind::Directory)
+                            || git
+                                .workdir()
+                                .is_none_or(|wd| dir_has_nondir_descendant(&wd.join(&rela)));
+                        if keep {
+                            untracked.push(rela);
+                        }
                     }
                     Some(_) => {
                         changed.insert(iw.rela_path().to_str_lossy().into_owned());
@@ -676,6 +696,32 @@ fn status_walk(git: &gix::Repository) -> Result<WtStatus, GitIoError> {
         }
     }
     Ok(WtStatus { changed, untracked })
+}
+
+/// Whether `dir` contains any non-directory entry, recursively — git's
+/// test for whether a collapsed untracked directory is reported at all.
+/// A regular file, symlink, or exotic node (fifo/socket/device) all
+/// count as content; only a tree of pure subdirectories does not.
+/// Decided by `file_type()` alone: a symlink (even to a directory) is a
+/// kept non-directory entry and is NEVER traversed, so the walk can't
+/// cycle or escape the worktree. Non-directory entries at each level are
+/// checked before recursing, so a directory with content exits early.
+fn dir_has_nondir_descendant(dir: &Path) -> bool {
+    let Ok(read) = std::fs::read_dir(dir) else {
+        // Unreadable (vanished/permissions): treat as content rather than
+        // silently dropping — something was there.
+        return true;
+    };
+    let mut subdirs: Vec<std::path::PathBuf> = Vec::new();
+    for entry in read.flatten() {
+        match entry.file_type() {
+            Ok(ft) if ft.is_dir() => subdirs.push(entry.path()),
+            // File, symlink, exotic node, or a stat error mid-walk — all
+            // count as a non-directory entry (content).
+            _ => return true,
+        }
+    }
+    subdirs.iter().any(|sub| dir_has_nondir_descendant(sub))
 }
 
 /// Sum inserted/deleted lines across `changed` paths, diffing each
@@ -1832,6 +1878,84 @@ mod tests {
             "worktree gitdir under common/worktrees; got {gd_wt:?}"
         );
         assert!(git_dir(&wt).unwrap().is_absolute());
+    }
+
+    #[test]
+    fn untracked_matches_git_for_fileless_dirs_and_symlinks() {
+        use std::process::Command;
+        fn git(dir: &Path, args: &[&str]) {
+            let ok = Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?}");
+        }
+        // git's own porcelain untracked set, normalized (strip `?? ` and
+        // any trailing `/` so it compares to gix's collapsed paths).
+        fn git_untracked(dir: &Path) -> Vec<String> {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(["status", "--porcelain"])
+                .output()
+                .unwrap();
+            let mut v: Vec<String> = String::from_utf8(out.stdout)
+                .unwrap()
+                .lines()
+                .filter_map(|l| l.strip_prefix("?? "))
+                .map(|p| p.trim_end_matches('/').to_string())
+                .collect();
+            v.sort();
+            v
+        }
+        fn norm(mut v: Vec<String>) -> Vec<String> {
+            for p in &mut v {
+                *p = p.trim_end_matches('/').to_string();
+            }
+            v.sort();
+            v
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git(root, &["init", "--quiet", "--initial-branch=main"]);
+        git(root, &["config", "user.email", "t@t"]);
+        git(root, &["config", "user.name", "t"]);
+        std::fs::write(root.join("tracked.txt"), "v1").unwrap();
+        git(root, &["add", "-A"]);
+        git(root, &["commit", "--quiet", "-m", "base"]);
+
+        // The bug: a directory whose whole subtree is empty directories.
+        std::fs::create_dir_all(root.join("a/b")).unwrap();
+        // A directory whose ONLY descendant is a symlink (no regular file)
+        // — git counts the symlink as content, so this MUST stay untracked.
+        std::fs::create_dir_all(root.join("e")).unwrap();
+        std::os::unix::fs::symlink("tracked.txt", root.join("e/link")).unwrap();
+        // Positive control: a directory containing a regular file.
+        std::fs::create_dir_all(root.join("c")).unwrap();
+        std::fs::write(root.join("c/d.txt"), "x").unwrap();
+        // A modified tracked file lands in `changed`, not `untracked`.
+        std::fs::write(root.join("tracked.txt"), "v2").unwrap();
+
+        let st = working_tree_status(root).unwrap();
+        let untracked = norm(st.untracked.clone());
+
+        // Agrees with git exactly: `c` and `e` collapsed, `a` absent.
+        assert_eq!(untracked, git_untracked(root));
+        assert_eq!(untracked, vec!["c".to_string(), "e".to_string()]);
+        assert!(
+            !st.untracked.iter().any(|p| p.trim_end_matches('/') == "a"),
+            "fileless dir `a/b` must not be untracked: {:?}",
+            st.untracked
+        );
+        assert!(
+            st.changed.iter().any(|p| p == "tracked.txt"),
+            "modified tracked file still detected: {:?}",
+            st.changed
+        );
     }
 
     #[test]
