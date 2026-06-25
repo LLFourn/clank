@@ -28,6 +28,8 @@ pub(super) enum Style {
     /// Italic — the master "working…" in-progress row
     /// (status-timeline-progress).
     Italic,
+    /// Bold — markdown headings + `**strong**` in the plan-doc overlay.
+    Bold,
 }
 
 #[derive(Clone)]
@@ -142,6 +144,7 @@ pub(super) fn emit(spans: &[Span], color: &str, cols: usize) -> String {
             Style::Link(url) => out.push_str(&format!("\x1b]8;;{url}\x1b\\{piece}\x1b]8;;\x1b\\")),
             Style::Highlight => out.push_str(&format!("\x1b[1;48;5;238m{piece}\x1b[0m")),
             Style::Italic => out.push_str(&format!("\x1b[3m{piece}\x1b[0m")),
+            Style::Bold => out.push_str(&format!("\x1b[1m{piece}\x1b[0m")),
         }
         if truncated_here {
             break;

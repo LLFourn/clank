@@ -795,12 +795,68 @@ fn verdict_color(verdict: clank_core::vocab::Verdict) -> &'static str {
     }
 }
 
+/// The full commit-detail content (the SINGLE layout source): the
+/// commit's subject + message, then each reviewer's verdict mark + full
+/// feedback body. Records the first line of each reviewer's block by
+/// author so the review-focus scroll lands on the SAME lines the view
+/// windows (no second function re-deriving positions that could drift).
+pub(super) struct CommitLayout {
+    pub(super) lines: Vec<String>,
+    /// First content line (the verdict-mark row) of each reviewer's block.
+    pub(super) review_line: std::collections::BTreeMap<String, usize>,
+}
+
+pub(super) fn build_commit_lines(
+    short_sha: &str,
+    subject: &str,
+    body: &str,
+    reviews: &[(String, clank_core::vocab::Verdict, String)],
+    cols: usize,
+) -> CommitLayout {
+    let mut lines: Vec<String> = Vec::new();
+    let mut review_line = std::collections::BTreeMap::new();
+    // The rule title is upper-cased, so keep the (lowercase) sha out of it
+    // and on the subject line with the message.
+    lines.push(region_rule("commit", "↑↓ scroll · Esc back", true, cols));
+    lines.push(String::new());
+    lines.push(emit(
+        &[
+            dim(format!("{short_sha}  ")),
+            plain(one_line(subject, cols)),
+        ],
+        "",
+        cols,
+    ));
+    lines.push(String::new());
+    for line in wrap(body, cols) {
+        lines.push(emit(&[plain(line)], "", cols));
+    }
+    for (author, verdict, rbody) in reviews {
+        lines.push(String::new());
+        // Anchor on the verdict-mark row (after the separating blank), so
+        // focusing a reviewer puts its header at the top of the view.
+        review_line.insert(author.clone(), lines.len());
+        let mark = crate::cli::log::verdict_mark(*verdict, false);
+        lines.push(emit(
+            &[
+                colored(verdict_color(*verdict), mark),
+                plain(format!(" {author}")),
+            ],
+            "",
+            cols,
+        ));
+        for line in wrap(rbody, cols) {
+            lines.push(emit(&[dim(line)], "", cols));
+        }
+    }
+    CommitLayout { lines, review_line }
+}
+
 /// The full-window commit-detail view (the `Enter`-on-a-log-entry drill
-/// in): the commit's subject + full message, then each reviewer's
-/// verdict mark + full feedback body, scrolled by `offset`. Read-only,
-/// like the add-picker / agent-detail screens. Returns the windowed
-/// lines (clamped to `rows`) AND the TOTAL content height, so the loop
-/// clamps the scroll offset to the last page.
+/// in), scrolled by `offset`. Read-only, like the add-picker /
+/// agent-detail screens. Returns the windowed lines (clamped to `rows`)
+/// AND the TOTAL content height, so the loop clamps the scroll offset to
+/// the last page.
 pub(super) fn render_commit_detail(
     short_sha: &str,
     subject: &str,
@@ -810,37 +866,53 @@ pub(super) fn render_commit_detail(
     rows: usize,
     cols: usize,
 ) -> (Vec<String>, usize) {
+    let layout = build_commit_lines(short_sha, subject, body, reviews, cols);
+    let total = layout.lines.len();
+    let off = offset.min(total.saturating_sub(1));
+    let windowed = layout.lines.into_iter().skip(off).take(rows).collect();
+    (windowed, total)
+}
+
+/// The scroll offset that brings reviewer `author`'s feedback to the top
+/// of the commit-detail view (its block's first line), falling back to
+/// the topmost reviewer block, then 0. Derived from the SAME layout the
+/// view windows, so the focus can't drift from what's drawn.
+pub(super) fn commit_review_offset(
+    short_sha: &str,
+    subject: &str,
+    body: &str,
+    reviews: &[(String, clank_core::vocab::Verdict, String)],
+    author: &str,
+    cols: usize,
+) -> usize {
+    let layout = build_commit_lines(short_sha, subject, body, reviews, cols);
+    layout
+        .review_line
+        .get(author)
+        .copied()
+        .or_else(|| layout.review_line.values().copied().min())
+        .unwrap_or(0)
+}
+
+/// The full-window plan-document view (the `Enter`-on-a-plan-header drill
+/// in): the plan stem as the rule title, then the plan's markdown rendered
+/// to styled lines (or a dim "plan file not found" when the file is
+/// absent), scrolled by `offset`. Returns the windowed lines (clamped to
+/// `rows`) AND the TOTAL content height, so the loop clamps the offset to
+/// the last page — same shape as [`render_commit_detail`].
+pub(super) fn render_plan_doc(
+    stem: &str,
+    markdown: Option<&str>,
+    offset: usize,
+    rows: usize,
+    cols: usize,
+) -> (Vec<String>, usize) {
     let mut content: Vec<String> = Vec::new();
-    // The rule title is upper-cased, so keep the (lowercase) sha out of it
-    // and on the subject line with the message.
-    content.push(region_rule("commit", "↑↓ scroll · Esc back", true, cols));
+    content.push(region_rule(stem, "↑↓ scroll · Esc back", true, cols));
     content.push(String::new());
-    content.push(emit(
-        &[
-            dim(format!("{short_sha}  ")),
-            plain(one_line(subject, cols)),
-        ],
-        "",
-        cols,
-    ));
-    content.push(String::new());
-    for line in wrap(body, cols) {
-        content.push(emit(&[plain(line)], "", cols));
-    }
-    for (author, verdict, rbody) in reviews {
-        content.push(String::new());
-        let mark = crate::cli::log::verdict_mark(*verdict, false);
-        content.push(emit(
-            &[
-                colored(verdict_color(*verdict), mark),
-                plain(format!(" {author}")),
-            ],
-            "",
-            cols,
-        ));
-        for line in wrap(rbody, cols) {
-            content.push(emit(&[dim(line)], "", cols));
-        }
+    match markdown {
+        Some(md) => content.extend(super::markdown::render_markdown(md, cols)),
+        None => content.push(emit(&[dim("plan file not found")], "", cols)),
     }
     let total = content.len();
     let off = offset.min(total.saturating_sub(1));
@@ -2007,6 +2079,76 @@ mod tests {
             visible(&scrolled[0]),
             visible(&lines[0]),
             "offset shifts the visible window"
+        );
+    }
+
+    #[test]
+    fn commit_review_offset_lands_on_the_reviewer_block() {
+        use clank_core::vocab::Verdict;
+        let reviews = vec![
+            (
+                "aaa".to_string(),
+                Verdict::Continue,
+                "first body".to_string(),
+            ),
+            (
+                "zzz".to_string(),
+                Verdict::RequestChanges,
+                "second body".to_string(),
+            ),
+        ];
+        let cols = 60;
+        let layout = build_commit_lines("abc1234", "subject", "the message body", &reviews, cols);
+        // Each recorded line is that reviewer's header (verdict-mark) row —
+        // the SAME lines the view windows, so the focus can't drift.
+        for (author, _, _) in &reviews {
+            let at = layout.review_line[author];
+            assert!(
+                visible(&layout.lines[at]).contains(author),
+                "review_line[{author}] is the author's header row"
+            );
+        }
+        // A known author → its block; an unknown author → the topmost
+        // block; no reviews → 0.
+        let z = commit_review_offset(
+            "abc1234",
+            "subject",
+            "the message body",
+            &reviews,
+            "zzz",
+            cols,
+        );
+        assert_eq!(z, layout.review_line["zzz"]);
+        let ghost = commit_review_offset(
+            "abc1234",
+            "subject",
+            "the message body",
+            &reviews,
+            "ghost",
+            cols,
+        );
+        assert_eq!(ghost, *layout.review_line.values().min().unwrap());
+        assert_eq!(commit_review_offset("abc1234", "s", "b", &[], "x", cols), 0);
+    }
+
+    #[test]
+    fn render_plan_doc_titles_and_reports_missing() {
+        let (lines, total) = render_plan_doc("my-plan", Some("# Heading\n\nbody"), 0, 40, 60);
+        assert!(total >= 3);
+        assert!(
+            visible(&lines[0]).contains("MY-PLAN"),
+            "stem in the rule title: {:?}",
+            visible(&lines[0])
+        );
+        assert!(
+            lines.iter().any(|l| visible(l).contains("Heading")),
+            "markdown rendered into the body"
+        );
+        // A missing file degrades to a dim note, never a blank screen.
+        let (miss, _) = render_plan_doc("gone", None, 0, 40, 60);
+        assert!(
+            miss.iter()
+                .any(|l| visible(l).contains("plan file not found"))
         );
     }
 }

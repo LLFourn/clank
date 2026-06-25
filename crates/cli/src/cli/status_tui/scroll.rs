@@ -197,27 +197,55 @@ pub(super) fn scroll_to_show(cursor: usize, offset: usize, capacity: usize, tota
     off.min(max_off)
 }
 
-/// The commit a scroll entry "drills into" for the detail view, or
-/// `None` if the entry has no commit (a header, an ask line, or an
-/// in-progress placeholder). A `Commit` seg yields its own sha. A
-/// `Review` seg carries NO sha (reviews are positional), so it scans
-/// FORWARD — reviews render ABOVE their commit — to the next `Commit`,
-/// but STOPS at a section `Header` or the end of the sequence: a stray
-/// or tail review (which `build_scroll` flushes with no following commit
-/// in its section) must NOT bind to the next section's commit.
-pub(super) fn entry_commit_sha(seq: &[Seg], cursor: usize) -> Option<crate::lifecycle::CommitSha> {
+/// What pressing Enter on a scroll entry opens, or `None` for an entry
+/// with no document (an ad-hoc header, an ask line, an in-progress
+/// placeholder).
+pub(super) enum OverlayTarget {
+    /// A commit's detail view. `focus` is the reviewer whose feedback the
+    /// view should open scrolled to — set when Enter lands on a `Review`
+    /// row; `None` (a `Commit` row) opens at the top.
+    Commit {
+        sha: crate::lifecycle::CommitSha,
+        focus: Option<String>,
+    },
+    /// A plan's rendered markdown document, by stem.
+    Plan { stem: String },
+}
+
+/// The document a scroll entry "drills into", or `None` if it has none
+/// (an ad-hoc header, an ask line, an in-progress placeholder). A
+/// `Commit` seg → its own commit (no focus). A `Review` seg carries NO
+/// sha (reviews are positional), so it scans FORWARD — reviews render
+/// ABOVE their commit — to the next `Commit`, but STOPS at a section
+/// `Header` or the end of the sequence: a stray or tail review (which
+/// `build_scroll` flushes with no following commit in its section) must
+/// NOT bind to the next section's commit. The review's author rides along
+/// as the scroll focus. A plan `Header` → that plan's document.
+pub(super) fn entry_overlay_target(seq: &[Seg], cursor: usize) -> Option<OverlayTarget> {
     use crate::cli::log::OnelineRow;
     match seq.get(cursor)? {
-        Seg::Log(OnelineRow::Commit { sha, .. }) => Some(sha.clone()),
-        Seg::Log(OnelineRow::Review { .. }) => seq[cursor + 1..]
-            .iter()
-            .find_map(|s| match s {
-                Seg::Log(OnelineRow::Commit { sha, .. }) => Some(Some(sha.clone())),
-                Seg::Log(OnelineRow::Header { .. }) => Some(None), // section break
-                _ => None,                                         // skip reviews/in-progress
+        Seg::Log(OnelineRow::Commit { sha, .. }) => Some(OverlayTarget::Commit {
+            sha: sha.clone(),
+            focus: None,
+        }),
+        Seg::Log(OnelineRow::Review { author, .. }) => {
+            let sha = seq[cursor + 1..]
+                .iter()
+                .find_map(|s| match s {
+                    Seg::Log(OnelineRow::Commit { sha, .. }) => Some(Some(sha.clone())),
+                    Seg::Log(OnelineRow::Header { .. }) => Some(None), // section break
+                    _ => None,                                         // skip reviews/in-progress
+                })
+                .flatten()?;
+            Some(OverlayTarget::Commit {
+                sha,
+                focus: Some(author.clone()),
             })
-            .flatten(),
-        _ => None, // header, ask, in-progress
+        }
+        Seg::Log(OnelineRow::Header { plan: Some(stem) }) => {
+            Some(OverlayTarget::Plan { stem: stem.clone() })
+        }
+        _ => None, // ad-hoc header, ask, in-progress
     }
 }
 
@@ -433,7 +461,7 @@ mod tests {
     }
 
     #[test]
-    fn entry_commit_sha_resolves_positionally() {
+    fn entry_overlay_target_resolves_positionally() {
         use crate::cli::log::OnelineRow;
         use crate::lifecycle::CommitSha;
         use clank_core::vocab::Verdict;
@@ -451,6 +479,12 @@ mod tests {
             plan: Some("foo".into()),
         };
 
+        // Helpers to read the resolved target.
+        let commit_of = |t: Option<OverlayTarget>| match t {
+            Some(OverlayTarget::Commit { sha, focus }) => Some((sha, focus)),
+            _ => None,
+        };
+
         // Header, Review(aaa), Commit(c1), Header, Review(bbb) [tail].
         let rows = [
             header(),
@@ -460,25 +494,39 @@ mod tests {
             review("bbb"),
         ];
         let seq: Vec<Seg> = rows.iter().map(Seg::Log).collect();
-        // A commit row → its own sha.
-        assert_eq!(entry_commit_sha(&seq, 2), Some(sha("c1")));
-        // A review directly above its commit → that commit's sha.
-        assert_eq!(entry_commit_sha(&seq, 1), Some(sha("c1")));
-        // A header → None.
-        assert_eq!(entry_commit_sha(&seq, 0), None);
+        // A commit row → its own sha, no review focus.
+        assert_eq!(
+            commit_of(entry_overlay_target(&seq, 2)),
+            Some((sha("c1"), None))
+        );
+        // A review directly above its commit → that commit, focused on the
+        // review's author.
+        assert_eq!(
+            commit_of(entry_overlay_target(&seq, 1)),
+            Some((sha("c1"), Some("aaa".to_string())))
+        );
+        // A plan header → that plan's document.
+        assert!(matches!(
+            entry_overlay_target(&seq, 0),
+            Some(OverlayTarget::Plan { stem }) if stem == "foo"
+        ));
         // A TAIL review with no following commit → None (not a panic, not
         // a bind to some earlier commit).
-        assert_eq!(entry_commit_sha(&seq, 4), None);
+        assert!(entry_overlay_target(&seq, 4).is_none());
         // Out-of-range cursor → None.
-        assert_eq!(entry_commit_sha(&seq, 99), None);
+        assert!(entry_overlay_target(&seq, 99).is_none());
+
+        // An ad-hoc header (plan: None) has no document.
+        let adhoc = [OnelineRow::Header { plan: None }];
+        let seq_adhoc: Vec<Seg> = adhoc.iter().map(Seg::Log).collect();
+        assert!(entry_overlay_target(&seq_adhoc, 0).is_none());
 
         // A stray review whose section ends at a Header before any commit
         // must NOT bind to the NEXT section's commit (the wrong-entry bug).
         let rows2 = [review("zzz"), header(), commit("c2")];
         let seq2: Vec<Seg> = rows2.iter().map(Seg::Log).collect();
-        assert_eq!(
-            entry_commit_sha(&seq2, 0),
-            None,
+        assert!(
+            entry_overlay_target(&seq2, 0).is_none(),
             "review before a section break stops at the header"
         );
 
@@ -488,6 +536,6 @@ mod tests {
             verb: "working",
         };
         let seq3 = vec![Seg::InProg(&ip)];
-        assert_eq!(entry_commit_sha(&seq3, 0), None);
+        assert!(entry_overlay_target(&seq3, 0).is_none());
     }
 }

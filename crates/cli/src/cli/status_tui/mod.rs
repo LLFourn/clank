@@ -40,6 +40,8 @@ pub(crate) use text::strip_leading_emoji;
 
 mod derive;
 
+mod markdown;
+
 mod input;
 use input::*;
 
@@ -242,10 +244,9 @@ impl LogView {
     }
 }
 
-/// The open commit-detail overlay: the fetched commit + feedback for a
-/// SHA, plus the scroll offset. `Some` ⟺ the detail view is showing; the
-/// log keeps its cursor underneath, restored on dismiss. Anchored by
-/// `sha` (not a log index) so a `Refresh` re-fetches the SAME commit.
+/// The fetched DATA for a commit-detail overlay: the commit and every
+/// reviewer's verdict + full feedback body. Anchored by `sha` (not a log
+/// index) so a `Refresh` re-fetches the SAME commit.
 struct CommitDetail {
     sha: crate::lifecycle::CommitSha,
     short: String,
@@ -255,24 +256,50 @@ struct CommitDetail {
     reviews: Vec<(String, clank_core::vocab::Verdict, String)>,
 }
 
-/// The open commit-detail overlay: the fetched [`CommitDetail`] DATA and
-/// the scroll `offset`, kept SEPARATE so a background `Refresh` (which
-/// re-fetches the data, so a new verdict shows up live) swaps only the
-/// data and never resets the reader's scroll position — the watcher
-/// fires constantly in an active session. Mirrors how [`LogView`] keeps
-/// its cursor across refreshes.
-struct CommitOverlay {
-    data: CommitDetail,
+/// What a full-window document overlay is showing. Each kind carries the
+/// identity needed to re-fetch on a background `Refresh` (a commit sha; a
+/// plan stem), so the watcher firing never loses the reader's place.
+enum OverlayData {
+    Commit(CommitDetail),
+    /// A plan's markdown by stem; `markdown` is `None` when the file
+    /// isn't found.
+    Plan {
+        stem: String,
+        markdown: Option<String>,
+    },
+}
+
+/// An open document overlay: the fetched [`OverlayData`] and the scroll
+/// `offset`, kept SEPARATE so a background `Refresh` (which re-fetches the
+/// data, so a new verdict / edited plan shows up live) swaps only the data
+/// and never resets the reader's scroll position — the watcher fires
+/// constantly in an active session. `Some` ⟺ an overlay is showing; the
+/// log keeps its cursor underneath, restored on dismiss. Mirrors how
+/// [`LogView`] keeps its cursor across refreshes.
+struct Overlay {
+    data: OverlayData,
     offset: usize,
 }
 
-impl CommitOverlay {
-    fn new(data: CommitDetail) -> Self {
-        Self { data, offset: 0 }
+impl Overlay {
+    /// A commit overlay opened at `offset` (0 for a commit row; a
+    /// reviewer's block for a review row — see [`render::commit_review_offset`]).
+    fn commit(data: CommitDetail, offset: usize) -> Self {
+        Self {
+            data: OverlayData::Commit(data),
+            offset,
+        }
+    }
+    /// A plan-document overlay, opened at the top.
+    fn plan(stem: String, markdown: Option<String>) -> Self {
+        Self {
+            data: OverlayData::Plan { stem, markdown },
+            offset: 0,
+        }
     }
     /// Swap in freshly-fetched data, PRESERVING the scroll offset (the
-    /// next render's clamp handles a body that shrank).
-    fn refresh(&mut self, data: CommitDetail) {
+    /// next render's clamp handles content that shrank).
+    fn refresh(&mut self, data: OverlayData) {
         self.data = data;
     }
     /// Scroll by a signed line delta, clamped to `[0, max_off]`.
@@ -340,6 +367,22 @@ fn fetch_commit_detail(
         body,
         reviews,
     })
+}
+
+/// Read a plan stem's markdown from the WORKING TREE: the active
+/// `.clank/plans/<stem>.md`, else the finalized `.clank/finished/<stem>.md`,
+/// else `None`. A plain file read (like the feedback bodies above) — the
+/// live file, not a git blob — so an in-progress edit shows immediately.
+fn read_plan_markdown(repo: &std::path::Path, stem: &str) -> Option<String> {
+    for rel in [
+        crate::init_facts::plan_md_rel(stem),
+        crate::init_facts::finished_md_rel(stem),
+    ] {
+        if let Ok(s) = std::fs::read_to_string(repo.join(&rel)) {
+            return Some(s);
+        }
+    }
+    None
 }
 
 /// The `--tui` loop, fully event-driven: the watcher covers the
@@ -422,8 +465,9 @@ pub(crate) async fn run_tui(
     // tall pane on first paint and pages in older rows as you scroll. See
     // [`LogView`] for the invariants its methods enforce.
     let mut log = LogView::new();
-    // The commit-detail overlay, when open (Enter on a log entry).
-    let mut detail: Option<CommitOverlay> = None;
+    // The document overlay, when open (Enter on a log entry): a commit's
+    // detail or a plan's rendered markdown.
+    let mut detail: Option<Overlay> = None;
     // Which region owns the keyboard. Starts on the log; Tab moves it to
     // the agent panel. The single source of key-routing truth.
     let mut mode = Mode::LogScroll;
@@ -444,32 +488,52 @@ pub(crate) async fn run_tui(
         if detail.is_some() {
             let page = (rows as usize).saturating_sub(3).max(1);
             let overlay = detail.as_ref().unwrap();
-            let (lines, total) = render_commit_detail(
-                &overlay.data.short,
-                &overlay.data.subject,
-                &overlay.data.body,
-                &overlay.data.reviews,
-                overlay.offset,
-                rows as usize,
-                cols as usize,
-            );
+            let (lines, total) = match &overlay.data {
+                OverlayData::Commit(d) => render_commit_detail(
+                    &d.short,
+                    &d.subject,
+                    &d.body,
+                    &d.reviews,
+                    overlay.offset,
+                    rows as usize,
+                    cols as usize,
+                ),
+                OverlayData::Plan { stem, markdown } => render_plan_doc(
+                    stem,
+                    markdown.as_deref(),
+                    overlay.offset,
+                    rows as usize,
+                    cols as usize,
+                ),
+            };
             paint(&lines);
-            let sha = overlay.data.sha.clone();
             match ev_rx.recv_timeout(Duration::from_secs(60)) {
-                Ok(Ev::Key(k)) => match commit_detail_nav(k, page) {
-                    CommitNav::Back => detail = None,
-                    CommitNav::Scroll(delta) => {
+                Ok(Ev::Key(k)) => match doc_nav(k, page) {
+                    DocNav::Back => detail = None,
+                    DocNav::Scroll(delta) => {
                         let max_off = total.saturating_sub((rows as usize).max(1));
                         detail.as_mut().unwrap().scroll(delta, max_off);
                     }
-                    CommitNav::None => {}
+                    DocNav::None => {}
                 },
-                // Data changed under us — re-fetch the SAME commit, but KEEP
-                // the scroll offset (refresh swaps data, not view-state).
+                // Data changed under us — re-fetch by IDENTITY (commit sha /
+                // plan stem), but KEEP the scroll offset (refresh swaps
+                // data, not view-state).
                 Ok(Ev::Refresh) => {
-                    if let Some(data) = fetch_commit_detail(&repo, &sha)
-                        && let Some(o) = detail.as_mut()
-                    {
+                    let new = match &detail.as_ref().unwrap().data {
+                        OverlayData::Commit(d) => {
+                            let sha = d.sha.clone();
+                            fetch_commit_detail(&repo, &sha).map(OverlayData::Commit)
+                        }
+                        OverlayData::Plan { stem, .. } => {
+                            let stem = stem.clone();
+                            Some(OverlayData::Plan {
+                                markdown: read_plan_markdown(&repo, &stem),
+                                stem,
+                            })
+                        }
+                    };
+                    if let (Some(data), Some(o)) = (new, detail.as_mut()) {
                         o.refresh(data);
                     }
                 }
@@ -682,15 +746,37 @@ pub(crate) async fn run_tui(
                         Key::Space | Key::PageDown => log.page_down(page),
                         Key::Top => log.jump_top(),
                         Key::Bottom => log.jump_bottom(total),
-                        // Enter drills into the commit under the cursor:
+                        // Enter drills into the entry under the cursor:
                         // build the same scroll sequence the cursor indexes,
-                        // map the entry to its commit sha, fetch + open the
-                        // detail overlay. Non-commit rows (header, ask,
-                        // in-progress) resolve to None and do nothing.
+                        // map the entry to its document, fetch + open the
+                        // overlay. A commit/review opens the commit detail (a
+                        // review scrolled to that reviewer's feedback); a plan
+                        // header opens the plan's rendered markdown. Ask /
+                        // in-progress / ad-hoc rows resolve to None.
                         Key::Enter => {
                             let seq = build_scroll(&snapshot, &ask_lines, &in_prog);
-                            if let Some(sha) = entry_commit_sha(&seq, log.cursor) {
-                                detail = fetch_commit_detail(&repo, &sha).map(CommitOverlay::new);
+                            match entry_overlay_target(&seq, log.cursor) {
+                                Some(OverlayTarget::Commit { sha, focus }) => {
+                                    if let Some(data) = fetch_commit_detail(&repo, &sha) {
+                                        let offset = match &focus {
+                                            Some(author) => commit_review_offset(
+                                                &data.short,
+                                                &data.subject,
+                                                &data.body,
+                                                &data.reviews,
+                                                author,
+                                                cols as usize,
+                                            ),
+                                            None => 0,
+                                        };
+                                        detail = Some(Overlay::commit(data, offset));
+                                    }
+                                }
+                                Some(OverlayTarget::Plan { stem }) => {
+                                    let md = read_plan_markdown(&repo, &stem);
+                                    detail = Some(Overlay::plan(stem, md));
+                                }
+                                None => {}
                             }
                         }
                         Key::Escape | Key::Left | Key::Delete | Key::Yes | Key::No => {}
@@ -871,7 +957,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn commit_overlay_refresh_keeps_scroll_offset() {
+    fn overlay_refresh_keeps_scroll_offset() {
         let data = |subject: &str| CommitDetail {
             sha: crate::lifecycle::CommitSha::parse(&format!("{:0<40}", "abc")).unwrap(),
             short: "abc".into(),
@@ -879,20 +965,52 @@ pub(crate) mod tests {
             body: "body".into(),
             reviews: Vec::new(),
         };
-        let mut o = CommitOverlay::new(data("first"));
-        assert_eq!(o.offset, 0, "fresh overlay starts at the top");
-        o.scroll(5, 20);
-        assert_eq!(o.offset, 5);
+        let subject_of = |o: &Overlay| match &o.data {
+            OverlayData::Commit(d) => d.subject.clone(),
+            OverlayData::Plan { .. } => unreachable!(),
+        };
+        // A review row opens at a non-zero offset (commit row would be 0).
+        let mut o = Overlay::commit(data("first"), 5);
+        assert_eq!(o.offset, 5, "opened at the review-focus offset");
         // THE bug this guards: a background re-fetch (verdict landed, file
         // churn) swaps the data but must KEEP the reader's scroll position.
-        o.refresh(data("updated"));
-        assert_eq!(o.data.subject, "updated", "data was swapped");
+        o.refresh(OverlayData::Commit(data("updated")));
+        assert_eq!(subject_of(&o), "updated", "data was swapped");
         assert_eq!(o.offset, 5, "scroll offset survives a refresh");
         // Scrolling clamps to [0, max_off].
         o.scroll(100, 8);
         assert_eq!(o.offset, 8, "clamped to the last page");
         o.scroll(-100, 8);
         assert_eq!(o.offset, 0, "clamped at the top");
+        // A plan overlay opens at the top.
+        let p = Overlay::plan("foo".into(), Some("# foo".into()));
+        assert_eq!(p.offset, 0);
+    }
+
+    #[test]
+    fn read_plan_markdown_prefers_plans_then_finished() {
+        let repo = tempfile::TempDir::new().unwrap();
+        let p = repo.path();
+        std::fs::create_dir_all(p.join(".clank/plans")).unwrap();
+        std::fs::create_dir_all(p.join(".clank/finished")).unwrap();
+        // Active plan in plans/.
+        std::fs::write(p.join(".clank/plans/foo.md"), "# foo active").unwrap();
+        assert_eq!(
+            read_plan_markdown(p, "foo").as_deref(),
+            Some("# foo active")
+        );
+        // Finalized plan only in finished/.
+        std::fs::write(p.join(".clank/finished/bar.md"), "# bar done").unwrap();
+        assert_eq!(read_plan_markdown(p, "bar").as_deref(), Some("# bar done"));
+        // plans/ wins when both slots exist (an active plan shadows a stale
+        // finished copy).
+        std::fs::write(p.join(".clank/plans/bar.md"), "# bar active").unwrap();
+        assert_eq!(
+            read_plan_markdown(p, "bar").as_deref(),
+            Some("# bar active")
+        );
+        // Missing → None (the overlay shows "plan file not found").
+        assert!(read_plan_markdown(p, "nope").is_none());
     }
 
     #[test]
