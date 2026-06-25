@@ -250,12 +250,15 @@ fn push_color(p: &mut Vec<String>, color: vt100::Color, fg: bool) {
 /// dim otherwise. Landscape draws a vertical `│` per row; portrait a
 /// horizontal `─` rule with a centered `STATUS` label.
 fn divider_rows(layout: mux::Layout, status_focused: bool) -> Vec<String> {
+    let d = layout.divider;
+    if d.rows == 0 || d.cols == 0 {
+        return Vec::new(); // no divider on a too-small terminal
+    }
     let style = if status_focused {
         "\x1b[36m"
     } else {
         "\x1b[2m"
     };
-    let d = layout.divider;
     if layout.landscape {
         (0..d.rows).map(|_| format!("{style}│\x1b[0m")).collect()
     } else {

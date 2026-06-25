@@ -386,13 +386,21 @@ fn primary_working_idx(
     mux::primary_working(&labels, working)
 }
 
-/// The rect a screen renders into: the status pane for `status_idx`,
-/// the main (agent) pane for everyone else.
+/// The rect a screen's CHILD is sized to: the status pane for
+/// `status_idx`, the main (agent) pane otherwise. Clamped to ≥1×1 so a
+/// PTY/parser is never given a zero dimension on a tiny terminal
+/// (where the layout may shrink the status pane to 0 — it just isn't
+/// drawn; render uses the real layout rects).
 fn screen_rect(idx: usize, status_idx: usize, layout: mux::Layout) -> mux::Rect {
-    if idx == status_idx {
+    let r = if idx == status_idx {
         layout.status
     } else {
         layout.main
+    };
+    mux::Rect {
+        rows: r.rows.max(1),
+        cols: r.cols.max(1),
+        ..r
     }
 }
 

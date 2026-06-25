@@ -191,29 +191,36 @@ pub(crate) fn layout(rows: u16, cols: u16) -> Layout {
     let chrome_row = rows - 1;
     let rect = |x, y, rows, cols| Rect { x, y, rows, cols };
 
+    // Split an axis of length `total` into (main, divider, status) that
+    // tile EXACTLY within bounds: a 1-cell divider only when there's
+    // room for it plus a status pane, status clamped so main keeps ≥1,
+    // and main takes the remainder. On a terminal too small for all
+    // three, the divider (then status) drop to 0 — never overflow.
+    let split = |total: u16, target: u16| -> (u16, u16, u16) {
+        let divider = if total >= 3 { 1 } else { 0 };
+        let status = target.min(total.saturating_sub(divider + 1));
+        let main = total - divider - status; // ≥1 (status ≤ total-divider-1)
+        (main, divider, status)
+    };
+
     if cols >= rows * 2 {
         // Landscape: status on the right, a vertical divider between.
-        // saturating_sub + max(1) keep every region ≥1 cell on a tiny
-        // terminal (no underflow / collapse); normal sizes tile exactly.
-        let max_status = cols.saturating_sub(2); // leave ≥1 main + 1 divider
-        let status_cols = (cols / 3).clamp(20, 48).min(max_status).max(1);
-        let main_cols = cols.saturating_sub(status_cols + 1).max(1);
+        let (main_cols, divider_cols, status_cols) = split(cols, (cols / 3).clamp(20, 48));
         Layout {
             main: rect(0, 0, content_rows, main_cols),
-            divider: rect(main_cols, 0, content_rows, 1),
-            status: rect(main_cols + 1, 0, content_rows, status_cols),
+            divider: rect(main_cols, 0, content_rows, divider_cols),
+            status: rect(main_cols + divider_cols, 0, content_rows, status_cols),
             landscape: true,
             chrome_row,
         }
     } else {
         // Portrait: status on the bottom, a horizontal divider between.
-        let max_status = content_rows.saturating_sub(2); // ≥1 main + 1 divider
-        let status_rows = (content_rows / 3).clamp(6, 16).min(max_status).max(1);
-        let main_rows = content_rows.saturating_sub(status_rows + 1).max(1);
+        let (main_rows, divider_rows, status_rows) =
+            split(content_rows, (content_rows / 3).clamp(6, 16));
         Layout {
             main: rect(0, 0, main_rows, cols),
-            divider: rect(0, main_rows, 1, cols),
-            status: rect(0, main_rows + 1, status_rows, cols),
+            divider: rect(0, main_rows, divider_rows, cols),
+            status: rect(0, main_rows + divider_rows, status_rows, cols),
             landscape: false,
             chrome_row,
         }
@@ -529,20 +536,44 @@ mod tests {
     }
 
     #[test]
-    fn layout_never_collapses_a_pane_on_tiny_terminals() {
-        // term_size can return any positive size; no underflow/panic
-        // and every region stays ≥1 cell.
-        for (r, c) in [(2, 2), (3, 3), (2, 80), (4, 6), (3, 100)] {
+    fn layout_tiles_within_bounds_for_any_size() {
+        // term_size can return any positive size; the regions must tile
+        // EXACTLY within the content area (no overflow past the chrome
+        // row / terminal edge), main always ≥1, and the divider/status
+        // drop to 0 only when there's genuinely no room.
+        for (r, c) in [
+            (2, 2),
+            (3, 3),
+            (2, 80),
+            (4, 6),
+            (3, 100),
+            (24, 80),
+            (50, 40),
+        ] {
             let l = layout(r, c);
+            let content_rows = r.max(2) - 1;
+            let eff_cols = c.max(1);
             assert!(l.main.rows >= 1 && l.main.cols >= 1, "main {r}x{c}: {l:?}");
-            assert!(
-                l.status.rows >= 1 && l.status.cols >= 1,
-                "status {r}x{c}: {l:?}"
-            );
-            assert!(
-                l.divider.rows >= 1 && l.divider.cols >= 1,
-                "divider {r}x{c}"
-            );
+            if l.landscape {
+                assert_eq!(
+                    l.main.cols + l.divider.cols + l.status.cols,
+                    eff_cols,
+                    "cols tile {r}x{c}: {l:?}"
+                );
+                assert!(l.status.x + l.status.cols <= eff_cols, "in bounds {r}x{c}");
+                assert_eq!(l.main.rows, content_rows);
+            } else {
+                assert_eq!(
+                    l.main.rows + l.divider.rows + l.status.rows,
+                    content_rows,
+                    "rows tile {r}x{c}: {l:?}"
+                );
+                assert!(
+                    l.status.y + l.status.rows <= content_rows,
+                    "in bounds {r}x{c}"
+                );
+                assert_eq!(l.main.cols, eff_cols);
+            }
         }
     }
 
