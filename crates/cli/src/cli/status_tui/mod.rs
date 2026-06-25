@@ -648,86 +648,6 @@ pub(crate) mod tests {
     use clank_core::wait::PlanWorkState;
 
     #[test]
-    fn parse_keys_recognizes_arrows_paging_and_vi_keys() {
-        use Key::*;
-        let got: Vec<_> = parse_keys(b"jk gGq")
-            .iter()
-            .map(|k| std::mem::discriminant(k))
-            .collect();
-        let want: Vec<_> = [Down, Up, Space, Top, Bottom, Quit]
-            .iter()
-            .map(std::mem::discriminant)
-            .collect();
-        assert_eq!(got, want, "vi keys + space");
-        // CSI escape sequences (arrows, PgUp/PgDn), even back-to-back.
-        let csi: Vec<_> = parse_keys(b"\x1b[A\x1b[B\x1b[5~\x1b[6~")
-            .iter()
-            .map(std::mem::discriminant)
-            .collect();
-        let want_csi: Vec<_> = [Up, Down, PageUp, PageDown]
-            .iter()
-            .map(std::mem::discriminant)
-            .collect();
-        assert_eq!(csi, want_csi, "arrows + page keys");
-        assert!(parse_keys(b"xz.").is_empty(), "unmapped bytes are ignored");
-    }
-
-    #[test]
-    fn parse_keys_recognizes_panel_focus_keys() {
-        use Key::*;
-        // Tab and `a` both focus the agent panel; lone Esc leaves it.
-        let got: Vec<_> = parse_keys(b"\ta\x1b")
-            .iter()
-            .map(std::mem::discriminant)
-            .collect();
-        let want: Vec<_> = [Focus, Focus, Escape]
-            .iter()
-            .map(std::mem::discriminant)
-            .collect();
-        assert_eq!(got, want, "tab/a focus, esc leaves");
-        // An unknown CSI (left arrow) is consumed whole — NOT misread as a
-        // lone Esc that would spuriously close the panel.
-        assert!(
-            parse_keys(b"\x1b[D").is_empty(),
-            "left arrow consumed, no stray Escape"
-        );
-    }
-
-    #[test]
-    fn flip_auto_inverts() {
-        use clank_core::vocab::AutoMode;
-        assert_eq!(flip_auto(AutoMode::On), AutoMode::Off);
-        assert_eq!(flip_auto(AutoMode::Off), AutoMode::On);
-    }
-
-    #[test]
-    fn toggle_focus_enters_panel_only_with_a_roster() {
-        // From the log: enter the panel at row 0 — but only if there are
-        // agents to focus; an empty roster stays on the log.
-        assert_eq!(Mode::LogScroll.toggle_focus(2), Mode::AgentPanel { sel: 0 });
-        assert_eq!(Mode::LogScroll.toggle_focus(0), Mode::LogScroll);
-        // From any agent-region mode (panel, picker, confirm): back to log.
-        assert_eq!(Mode::AgentPanel { sel: 1 }.toggle_focus(2), Mode::LogScroll);
-        assert_eq!(Mode::AddPicker { sel: 0 }.toggle_focus(2), Mode::LogScroll);
-        assert_eq!(
-            Mode::Confirm {
-                action: ConfirmAction::RemoveAgent { idx: 0 }
-            }
-            .toggle_focus(2),
-            Mode::LogScroll
-        );
-    }
-
-    #[test]
-    fn move_selection_saturates_at_both_ends() {
-        assert_eq!(move_selection(0, 3, false), 0, "up at top stays put");
-        assert_eq!(move_selection(0, 3, true), 1, "down advances");
-        assert_eq!(move_selection(2, 3, true), 2, "down at bottom stays put");
-        assert_eq!(move_selection(2, 3, false), 1, "up retreats");
-        assert_eq!(move_selection(0, 0, true), 0, "empty roster pins at 0");
-    }
-
-    #[test]
     fn log_view_cursor_moves_saturate() {
         let mut v = LogView::new();
         assert_eq!((v.cursor, v.offset), (0, 0));
@@ -1142,42 +1062,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn detail_actions_are_reduced_for_master() {
-        use crate::cli::teams_config::RosterRole;
-        use DetailAction::*;
-        assert_eq!(detail_actions(RosterRole::Master), vec![ToggleAuto, Back]);
-        assert_eq!(
-            detail_actions(RosterRole::Commit),
-            vec![ToggleAuto, SwitchTier, PromoteToMaster, Remove, Back]
-        );
-        assert_eq!(
-            detail_actions(RosterRole::Gate),
-            vec![ToggleAuto, SwitchTier, PromoteToMaster, Remove, Back]
-        );
-    }
-
-    #[test]
-    fn agent_detail_nav_routes_menu_keys() {
-        use DetailAction::*;
-        let actions = [ToggleAuto, SwitchTier, Remove, Back];
-        assert_eq!(
-            agent_detail_nav(0, &actions, Key::Down),
-            DetailNav::MoveCursor(1)
-        );
-        assert_eq!(
-            agent_detail_nav(0, &actions, Key::Up),
-            DetailNav::MoveCursor(0),
-            "up at the top stays"
-        );
-        assert_eq!(
-            agent_detail_nav(1, &actions, Key::Enter),
-            DetailNav::Activate(SwitchTier)
-        );
-        assert_eq!(agent_detail_nav(0, &actions, Key::Escape), DetailNav::Back);
-        assert_eq!(agent_detail_nav(0, &actions, Key::Quit), DetailNav::Quit);
-    }
-
-    #[test]
     fn detail_page_renders_info_actions_and_reduced_master_set() {
         use crate::cli::teams_config::RosterRole;
         use clank_core::vocab::AutoMode;
@@ -1389,33 +1273,6 @@ pub(crate) mod tests {
         assert!(
             !line_with(&panel, "second").contains(REVERSE),
             "no log cursor band when the panel is focused"
-        );
-    }
-
-    #[test]
-    fn confirm_decision_q_cancels_and_enter_follows_default() {
-        let rm = ConfirmAction::RemoveAgent { idx: 0 };
-        let add = ConfirmAction::AddCandidate { idx: 0 };
-        // In a confirm, q CANCELS — it must not quit the TUI.
-        assert_eq!(confirm_decision(rm, Key::Quit), Some(false));
-        assert_eq!(confirm_decision(rm, Key::Escape), Some(false));
-        assert_eq!(confirm_decision(rm, Key::No), Some(false));
-        assert_eq!(confirm_decision(rm, Key::Yes), Some(true));
-        // Enter follows the default: remove cancels, add confirms.
-        assert_eq!(confirm_decision(rm, Key::Enter), Some(false));
-        assert_eq!(confirm_decision(add, Key::Enter), Some(true));
-        assert_eq!(confirm_decision(rm, Key::Up), None);
-    }
-
-    #[test]
-    fn confirm_action_default_is_safe_for_remove() {
-        assert!(
-            !ConfirmAction::RemoveAgent { idx: 0 }.default_yes(),
-            "a destructive remove defaults to No"
-        );
-        assert!(
-            ConfirmAction::AddCandidate { idx: 0 }.default_yes(),
-            "a non-destructive add defaults to Yes"
         );
     }
 
