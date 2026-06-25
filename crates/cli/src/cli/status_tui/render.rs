@@ -787,3 +787,187 @@ pub(super) fn render_agent_detail(
     out.truncate(rows);
     (out, 0)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::status_tui::tests::{plan_state, reviewer_missing, snap, visible};
+    use clank_core::plan_view::WaitingOn;
+
+    fn commit_row(subject: &str) -> crate::cli::log::OnelineRow {
+        crate::cli::log::OnelineRow::Commit {
+            sha: crate::lifecycle::CommitSha::parse(&format!("{:0<40}", "abc1234")).unwrap(),
+            subject: subject.to_string(),
+        }
+    }
+
+    fn snap_with_log(subjects: &[&str]) -> StatusSnapshot {
+        // MasterToFixCommitTag → no in-progress timeline row, so these
+        // tests isolate LOG layout (in-progress rows covered separately).
+        let mut s = snap(
+            vec![plan_state("foo", WaitingOn::MasterToFixCommitTag)],
+            vec![],
+        );
+        s.log_rows = subjects.iter().map(|l| commit_row(l)).collect();
+        s
+    }
+
+    #[test]
+    fn render_at_windows_the_log_and_reports_capacity() {
+        let subs = [
+            "row-aa", "row-bb", "row-cc", "row-dd", "row-ee", "row-ff", "row-gg", "row-hh",
+        ];
+        let s = snap_with_log(&subs);
+        // Tall pane: capacity covers the whole log; newest shown at top.
+        let (lines, cap) = render_at(&s, 40, 80, 0, 0, &PanelView::just(Mode::LogScroll));
+        assert!(cap >= subs.len(), "viewport capacity reported");
+        assert!(
+            lines.join("\n").contains("row-aa"),
+            "newest at top, offset 0"
+        );
+        // Scrolled down: the newest rows leave the window, older ones enter.
+        let body = render_at(&s, 40, 80, 3, 0, &PanelView::just(Mode::LogScroll))
+            .0
+            .join("\n");
+        assert!(
+            !body.contains("row-aa"),
+            "offset 3 scrolled past the newest"
+        );
+        assert!(body.contains("row-dd"), "offset 3 starts at the 4th-newest");
+    }
+
+    #[test]
+    fn log_fills_leftover_rows_most_recent_at_top() {
+        // 8 rows: bar + breath + gate + git = 4, separator + 3 log
+        // lines fit → the TAIL of the log (most recent) is shown.
+        // Rows arrive newest-first (e5 is the most recent commit).
+        let s = snap_with_log(&["e5", "e4", "e3", "e2", "e1"]);
+        let texts: Vec<String> = render(&s, 8, 60).iter().map(|l| visible(l)).collect();
+        assert_eq!(texts.len(), 8);
+        assert!(
+            texts[5].ends_with("e5"),
+            "most recent at the TOP of the log: {texts:?}"
+        );
+        assert!(texts[6].ends_with("e4"), "got {texts:?}");
+        assert!(texts[7].ends_with("e3"), "got {texts:?}");
+        assert!(
+            !texts.iter().any(|t| t.ends_with("e1")),
+            "oldest dropped first"
+        );
+    }
+
+    #[test]
+    fn log_absent_when_no_rows_remain() {
+        let s = snap_with_log(&["e1", "e2"]);
+        // 3 rows: bar + gate + git eat everything.
+        let texts: Vec<String> = render(&s, 3, 60).iter().map(|l| visible(l)).collect();
+        assert!(
+            !texts.iter().any(|t| t.ends_with("e1") || t.ends_with("e2")),
+            "no log rows at 3 rows: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn log_lines_truncate_by_display_width() {
+        // Wide-char commit subjects (emoji) must truncate by
+        // display columns — the same blind spot the banner had
+        // (ruthless 54c37f6 concern 3).
+        let s = snap_with_log(&["🔨🔨🔨🔨🔨🔨 a very wide subject"]);
+        let lines = render(&s, 10, 14);
+        for line in &lines {
+            assert!(
+                display_width(visible(line).trim_end()) <= 14,
+                "log line wider than 14 display cols: `{line}`"
+            );
+        }
+    }
+
+    #[test]
+    fn log_rows_styled_per_kind() {
+        use crate::cli::log::OnelineRow;
+        use clank_core::vocab::Verdict;
+        let mut s = snap(vec![plan_state("foo", reviewer_missing("codex"))], vec![]);
+        s.log_rows = vec![
+            OnelineRow::Header {
+                plan: Some("foo".into()),
+            },
+            commit_row("intro"),
+            OnelineRow::Review {
+                verdict: Verdict::Continue,
+                author: "codex".into(),
+                summary: "lgtm".into(),
+            },
+        ];
+        let lines = render(&s, 10, 60);
+        let texts: Vec<String> = lines.iter().map(|l| visible(l)).collect();
+        // Umbrella header (visible text is the bare plan name) and the
+        // commit indented under it at column 2.
+        assert!(texts.iter().any(|t| t == "foo"), "header: {texts:?}");
+        assert!(
+            texts.iter().any(|t| t.starts_with("  abc1234 intro")),
+            "commit indented: {texts:?}"
+        );
+        let raw = lines.join("");
+        // The header carries the background-highlight SGR.
+        assert!(
+            raw.contains("\x1b[1;48;5;238mfoo\x1b[0m"),
+            "header background-highlighted: {raw:?}"
+        );
+        // The verdict tick is COLORED (green for continue) in the raw
+        // ANSI output — lloyd's "make the ticks pop".
+        assert!(
+            raw.contains("\x1b[32m✓\x1b[0m"),
+            "continue tick must be green: {raw:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("✓  codex: lgtm")),
+            "review line: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn review_marks_align_with_sha_and_summaries_align() {
+        use crate::cli::log::OnelineRow;
+        use clank_core::vocab::Verdict;
+        let review = |v, author: &str| OnelineRow::Review {
+            verdict: v,
+            author: author.into(),
+            summary: "why".into(),
+        };
+        // MasterToFixCommitTag → no in-progress row; this test isolates
+        // the alignment of review marks against shas.
+        let mut s = snap(
+            vec![plan_state("foo", WaitingOn::MasterToFixCommitTag)],
+            vec![],
+        );
+        s.log_rows = vec![
+            commit_row("intro"),
+            review(Verdict::Continue, "codex"), // ✓  (1-wide mark, mid name)
+            review(Verdict::Finished, "ruthless"), // ✓✓ (2-wide mark, long name)
+            review(Verdict::RequestChanges, "zz"), // ✗  (1-wide mark, short name)
+        ];
+        let texts: Vec<String> = render(&s, 12, 80).iter().map(|l| visible(l)).collect();
+
+        // Display COLUMN (not byte offset — ✓ is 3 bytes/1 col, ✓✓ is
+        // 6 bytes/2 cols) of where `needle` begins on a line.
+        let col = |line: &str, needle: &str| display_width(&line[..line.find(needle).unwrap()]);
+
+        // The commit sha sits at column 2 (after "  ").
+        let commit = texts.iter().find(|t| t.contains("abc1234")).unwrap();
+        assert_eq!(col(commit, "abc1234"), 2, "sha at column 2: {commit:?}");
+
+        // Every review mark starts at that SAME column 2, and every
+        // summary (`: why`) starts at one shared column regardless of
+        // mark width or author length.
+        let mut summary_cols = Vec::new();
+        for (mark, name) in [("✓", "codex"), ("✓✓", "ruthless"), ("✗", "zz")] {
+            let line = texts.iter().find(|t| t.contains(name)).unwrap();
+            assert_eq!(col(line, mark), 2, "mark at sha column: {line:?}");
+            summary_cols.push(col(line, ": why"));
+        }
+        assert!(
+            summary_cols.iter().all(|c| *c == summary_cols[0]),
+            "summaries align across marks + name lengths: {summary_cols:?}"
+        );
+    }
+}
