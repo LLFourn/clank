@@ -172,6 +172,86 @@ pub(crate) fn strip_leading_emoji(name: &str) -> String {
     }
 }
 
+/// The log viewport's scroll state, bundled so the invariants that used
+/// to live in loose-variable comments are enforced by methods:
+/// - the `offset` (viewport top) is always DERIVED from the `cursor` via
+///   [`settle`](LogView::settle) — never set independently while the log
+///   is focused (the one exception, crossing in from the panel, goes
+///   through [`enter_first`](LogView::enter_first), which resets both);
+/// - `fill` (permission to do the top-up IO) is REQUESTED by input/data/
+///   resize events and consumed once per fill — an animation tick never
+///   requests it, so a tick stays a pure repaint.
+///
+/// The cursor moves are methods so the loop reads as intent
+/// (`log.page_down(page)`) and the saturation lives in one place.
+struct LogView {
+    /// Selected entry — index into the scroll sequence.
+    cursor: usize,
+    /// Viewport top, derived from `cursor`.
+    offset: usize,
+    /// Log fetch-window size; grows on demand until `complete`.
+    window: usize,
+    /// The fetch reached the root — stop growing.
+    complete: bool,
+    /// This pass may do the top-up IO. Set by input/data/resize, cleared
+    /// after one fill; a tick never sets it.
+    fill: bool,
+}
+
+impl LogView {
+    fn new() -> Self {
+        Self {
+            cursor: 0,
+            offset: 0,
+            window: 30,
+            complete: false,
+            fill: true,
+        }
+    }
+
+    /// Permit a top-up fill on this pass (input, data change, resize).
+    fn request_fill(&mut self) {
+        self.fill = true;
+    }
+
+    /// Settle the viewport for the paint: clamp the cursor into the
+    /// loaded length and DERIVE the offset from it when the log is
+    /// focused; otherwise just keep the last page full.
+    fn settle(&mut self, capacity: usize, total: usize, focused: bool) {
+        if focused {
+            self.cursor = self.cursor.min(total.saturating_sub(1));
+            self.offset = scroll_to_show(self.cursor, self.offset, capacity, total);
+        } else {
+            self.offset = self.offset.min(total.saturating_sub(capacity.max(1)));
+        }
+    }
+
+    fn up(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+    fn down(&mut self) {
+        self.cursor += 1;
+    }
+    fn page_up(&mut self, page: usize) {
+        self.cursor = self.cursor.saturating_sub(page);
+    }
+    fn page_down(&mut self, page: usize) {
+        self.cursor += page;
+    }
+    fn jump_top(&mut self) {
+        self.cursor = 0;
+    }
+    fn jump_bottom(&mut self, total: usize) {
+        self.cursor = total.saturating_sub(1);
+    }
+    /// Enter the log at its first entry (crossing in from the panel) —
+    /// the one place offset is reset directly, alongside the cursor.
+    fn enter_first(&mut self) {
+        self.cursor = 0;
+        self.offset = 0;
+    }
+}
+
 pub(crate) async fn run_tui(
     repo: PathBuf,
     basename: String,
@@ -229,16 +309,6 @@ pub(crate) async fn run_tui(
         }
     });
 
-    // The log grows on demand via fresh, larger
-    // windowed rebuilds (the fold replays from a base, so this is
-    // re-fetch-bigger, not incremental). ONE rule drives it: keep at
-    // least `offset + viewport` rows loaded — that both FILLS a tall pane
-    // on first paint and PAGES IN older rows as you scroll. Growth is a
-    // screenful of commits per rebuild (≈ one rebuild per page, not per
-    // row). `log_complete` latches once a grow returns no new rows (root).
-    let mut log_window: usize = 30;
-    let mut log_complete = false;
-
     // When inside zellij: mirror the bar's lamp emoji into the tab name,
     // and each agent's status glyph onto its own pane name.
     let mut tab = TabIndicator::new();
@@ -248,13 +318,13 @@ pub(crate) async fn run_tui(
     let mut last_sig = crate::cli::status::input_signature(&repo).ok();
     let mut snapshot =
         StatusSnapshot::build_async(&repo, &basename, home.as_deref(), policy, None, true).await?;
-    let mut offset: usize = 0;
-    // The selected log ENTRY (index into the scroll sequence). The log is
-    // a selectable timeline: this is the cursor; `offset` (the viewport
-    // top) is DERIVED from it each frame via `scroll_to_show`, so
-    // scrolling happens only when the cursor reaches the window edge.
-    // Only meaningful while focused on the log (Mode::LogScroll).
-    let mut log_cursor: usize = 0;
+    // The log viewport — cursor, derived offset, and the on-demand fetch
+    // window. The log grows via fresh, larger windowed rebuilds (the fold
+    // replays from a base, so this is re-fetch-bigger, not incremental):
+    // keep at least `offset + viewport` rows loaded, which both fills a
+    // tall pane on first paint and pages in older rows as you scroll. See
+    // [`LogView`] for the invariants its methods enforce.
+    let mut log = LogView::new();
     // Which region owns the keyboard. Starts on the log; Tab moves it to
     // the agent panel. The single source of key-routing truth.
     let mut mode = Mode::LogScroll;
@@ -265,21 +335,15 @@ pub(crate) async fn run_tui(
     let mut picker: Vec<crate::cli::status::AvailableAgent> = Vec::new();
     // Spinner animation frame. The ONLY state an animation tick mutates.
     let mut frame: usize = 0;
-    // Whether this iteration may do IO to top up the log. Set ONLY by
-    // scroll (Key) and data-change (Refresh) — NEVER by an animation
-    // tick. This is the structural guarantee that a tick is a pure
-    // repaint: with `needs_fill == false` the fill block (the only IO in
-    // the loop body besides the Refresh arm) is skipped entirely.
-    let mut needs_fill = true;
     loop {
         let (rows, cols) = term_size();
         let log_focused = matches!(mode, Mode::LogScroll);
         let view = PanelView {
             mode,
             picker: &picker,
-            log_cursor,
+            log_cursor: log.cursor,
         };
-        let capacity = render_at(&snapshot, rows, cols, offset, frame, &view).1;
+        let capacity = render_at(&snapshot, rows, cols, log.offset, frame, &view).1;
 
         // The ask + in-progress rows depend on blocks/waiting_on (not the
         // log fetch), so compute them before filling. `head` is the count
@@ -290,45 +354,38 @@ pub(crate) async fn run_tui(
         let head = ask_lines.len() + in_prog.len();
 
         // Load enough log to fill the viewport AND reach the cursor (the
-        // cursor can move past the loaded tail). Gated on `needs_fill` so
+        // cursor can move past the loaded tail). Gated on `log.fill` so
         // an animation tick never reaches it.
-        if needs_fill {
-            let want = (offset + capacity).max(log_cursor + 1);
-            while !log_complete && head + snapshot.log_rows.len() < want {
-                log_window += capacity.max(1);
+        if log.fill {
+            let want = (log.offset + capacity).max(log.cursor + 1);
+            while !log.complete && head + snapshot.log_rows.len() < want {
+                log.window += capacity.max(1);
                 let before = snapshot.log_rows.len();
-                snapshot.log_rows = crate::cli::status::tui_log_rows(&repo, log_window).await;
+                snapshot.log_rows = crate::cli::status::tui_log_rows(&repo, log.window).await;
                 if snapshot.log_rows.len() == before {
-                    log_complete = true; // hit the root — stop growing
+                    log.complete = true; // hit the root — stop growing
                 }
             }
-            needs_fill = false;
+            log.fill = false;
         }
 
         let total = head + snapshot.log_rows.len();
-        // Derive the viewport from the cursor when the log is focused
-        // (clamp the cursor to the loaded length first, so it's always
-        // showable); otherwise just keep the last page full.
-        let max_off = total.saturating_sub(capacity.max(1));
-        if log_focused {
-            log_cursor = log_cursor.min(total.saturating_sub(1));
-            offset = scroll_to_show(log_cursor, offset, capacity, total);
-        } else {
-            offset = offset.min(max_off);
-        }
+        // Derive the viewport from the cursor (focused) or keep the last
+        // page full (unfocused) — see [`LogView::settle`].
+        log.settle(capacity, total, log_focused);
         // Rebuild the view with the clamped cursor/offset for the paint.
         let view = PanelView {
             mode,
             picker: &picker,
-            log_cursor,
+            log_cursor: log.cursor,
         };
-        paint(&render_at(&snapshot, rows, cols, offset, frame, &view).0);
+        paint(&render_at(&snapshot, rows, cols, log.offset, frame, &view).0);
 
         // The in-progress rows now sit at SCATTERED indices (master after
         // the plan header; reviews in the latest commit's review block), so
         // ask `build_scroll` (the same arrangement render uses) for their
         // positions and tick iff ANY of them is within the window.
-        let win = offset..offset + capacity;
+        let win = log.offset..log.offset + capacity;
         let spinner_visible = build_scroll(&snapshot, &ask_lines, &in_prog)
             .iter()
             .enumerate()
@@ -359,8 +416,7 @@ pub(crate) async fn run_tui(
                             PanelAction::MoveCursor(s) => mode = Mode::AgentPanel { sel: s },
                             PanelAction::EnterLog => {
                                 // Cross into the log at the FIRST entry.
-                                log_cursor = 0;
-                                offset = 0;
+                                log.enter_first();
                                 mode = Mode::LogScroll;
                             }
                             PanelAction::ToggleAuto(i) => {
@@ -471,19 +527,19 @@ pub(crate) async fn run_tui(
                     Mode::LogScroll => match k {
                         Key::Quit => break,
                         Key::Focus => mode = mode.toggle_focus(snapshot.agents.len()),
-                        Key::Up => match log_up_target(log_cursor, snapshot.agents.len()) {
+                        Key::Up => match log_up_target(log.cursor, snapshot.agents.len()) {
                             Some(sel) => mode = Mode::AgentPanel { sel },
-                            None => log_cursor = log_cursor.saturating_sub(1),
+                            None => log.up(),
                         },
-                        Key::Down => log_cursor += 1,
-                        Key::PageUp => log_cursor = log_cursor.saturating_sub(page),
-                        Key::Space | Key::PageDown => log_cursor += page,
-                        Key::Top => log_cursor = 0,
-                        Key::Bottom => log_cursor = total.saturating_sub(1),
+                        Key::Down => log.down(),
+                        Key::PageUp => log.page_up(page),
+                        Key::Space | Key::PageDown => log.page_down(page),
+                        Key::Top => log.jump_top(),
+                        Key::Bottom => log.jump_bottom(total),
                         Key::Escape | Key::Enter | Key::Delete | Key::Yes | Key::No => {}
                     },
                 }
-                needs_fill = true;
+                log.request_fill();
             }
             Ok(Ev::Refresh) => {
                 // Nothing-changed gate (lloyd's invariant): a wake that
@@ -514,10 +570,10 @@ pub(crate) async fn run_tui(
                     .await?;
                     // Restore the user's scroll depth and re-open paging in
                     // case history grew; the loop top tops up the viewport.
-                    snapshot.log_rows = crate::cli::status::tui_log_rows(&repo, log_window).await;
+                    snapshot.log_rows = crate::cli::status::tui_log_rows(&repo, log.window).await;
                     last_sig = sig;
-                    log_complete = false;
-                    needs_fill = true;
+                    log.complete = false;
+                    log.request_fill();
                     // The data changed under us, so any in-flight picker/
                     // confirm (which reference now-possibly-stale indices)
                     // is cancelled back to the panel, and the panel cursor
@@ -564,7 +620,7 @@ pub(crate) async fn run_tui(
             // repaint. The loop top re-reads `term_size`; the fill is a
             // no-op when the viewport is already full.
             Ok(Ev::Resize) => {
-                needs_fill = true;
+                log.request_fill();
             }
             // Animation tick: advance the frame ONLY. `needs_fill` stays
             // false, so the next iteration is a PURE repaint — render_at
@@ -669,6 +725,61 @@ pub(crate) mod tests {
         assert_eq!(move_selection(2, 3, true), 2, "down at bottom stays put");
         assert_eq!(move_selection(2, 3, false), 1, "up retreats");
         assert_eq!(move_selection(0, 0, true), 0, "empty roster pins at 0");
+    }
+
+    #[test]
+    fn log_view_cursor_moves_saturate() {
+        let mut v = LogView::new();
+        assert_eq!((v.cursor, v.offset), (0, 0));
+        v.up(); // at top → stays
+        assert_eq!(v.cursor, 0);
+        v.page_up(5); // at top → stays
+        assert_eq!(v.cursor, 0);
+        v.down();
+        v.down();
+        assert_eq!(v.cursor, 2);
+        v.page_down(10);
+        assert_eq!(v.cursor, 12);
+        v.jump_top();
+        assert_eq!(v.cursor, 0);
+        v.jump_bottom(20); // last index of 20 entries
+        assert_eq!(v.cursor, 19);
+        v.jump_bottom(0); // empty timeline pins at 0
+        assert_eq!(v.cursor, 0);
+    }
+
+    #[test]
+    fn log_view_settle_derives_offset_and_enter_first_resets() {
+        let mut v = LogView::new();
+        // Focused: cursor below the window pulls the offset down to reveal
+        // it (matches scroll_to_show), and a cursor past the end clamps.
+        v.cursor = 50;
+        v.settle(10, 20, true);
+        assert_eq!(v.cursor, 19, "cursor clamped into the loaded length");
+        assert_eq!(v.offset, scroll_to_show(19, 0, 10, 20));
+        // Unfocused: the cursor is NOT clamped; only the offset is held to
+        // the last page.
+        let mut u = LogView::new();
+        u.cursor = 50;
+        u.offset = 999;
+        u.settle(10, 20, false);
+        assert_eq!(u.cursor, 50, "unfocused leaves the cursor alone");
+        assert_eq!(u.offset, 10, "offset held to the last full page");
+        // enter_first resets both (the one place offset is set directly).
+        v.enter_first();
+        assert_eq!((v.cursor, v.offset), (0, 0));
+    }
+
+    #[test]
+    fn log_view_fill_is_requestable_and_one_shot() {
+        // A fresh view wants its first fill; consuming it (as the loop's
+        // fill block does) clears it, and request_fill re-arms it.
+        let mut v = LogView::new();
+        assert!(v.fill, "the first pass fills");
+        v.fill = false; // loop consumes it
+        assert!(!v.fill);
+        v.request_fill();
+        assert!(v.fill, "input/data/resize re-arm the fill");
     }
 
     fn agent_row(
