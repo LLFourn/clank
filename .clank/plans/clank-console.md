@@ -1,6 +1,31 @@
 # clank-console
 # clank console — a self-managed agent multiplexer (MVP)
 
+## Status: shipped — ready to FINISH
+
+The MVP is built, tested, and installed. What landed:
+
+- The console is **`clank open`** (no separate `clank console` command):
+  a fresh terminal gets the self-managed multiplexer; inside a zellij
+  session, or with `--all/--fork/--pr/--print`, the existing zellij
+  opener; `clank open zellij` forces zellij. Gated on `$ZELLIJ`.
+- One PTY per roster agent + a `clank status --tui` screen; one new
+  dependency (`vt100`), libc PTYs, no ratatui.
+- Pure `mux` routing (prefix → switch/quit), flicker-free
+  `contents_diff` compositing (exact-clone mirror — fixes stale content
+  on switch), `term.rs` shared raw-mode plumbing.
+- Working-agent indicator: a green `●` on whichever agent clank's
+  work-state says should act (folded on `.clank`/HEAD changes).
+- Crash handling: dead screen shows "press Enter to respawn"; manual
+  respawn only.
+
+Deferred to the **console-cleanup** plan (hands-on feedback): replace
+the `Ctrl-a` prefix with Meta chords (`Meta-a` leader, `Meta-1/2/3`
+direct switch, `Meta-s`), pin the status pane always-on by orientation,
+and optional mouse. Those are a cohesive redesign (new multi-byte input
+parsing + two-grid compositing), so they get their own plan rather than
+bloating this one.
+
 ## Goal
 
 A single command, `clank console`, that takes over the terminal for one
