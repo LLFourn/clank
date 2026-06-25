@@ -196,3 +196,101 @@ pub(super) fn scroll_to_show(cursor: usize, offset: usize, capacity: usize, tota
     };
     off.min(max_off)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::status_tui::tests::{plan_state, reviewer_missing, snap};
+    use crate::cli::status_tui::text::display_width;
+
+    #[test]
+    fn log_up_target_crosses_to_panel_only_at_the_top() {
+        // With the CURSOR on the first entry, Up crosses back to the
+        // panel's +add row (index == agents.len()); otherwise it moves
+        // the cursor up (None).
+        assert_eq!(log_up_target(0, 2), Some(2), "cursor 0 → +add row");
+        assert_eq!(log_up_target(3, 2), None, "mid-log → move cursor up");
+        assert_eq!(log_up_target(0, 0), None, "no roster → nothing to cross to");
+    }
+
+    #[test]
+    fn scroll_to_show_follows_cursor_and_respects_last_page() {
+        // Already visible → don't move.
+        assert_eq!(scroll_to_show(3, 2, 5, 20), 2);
+        // Above the window → scroll up onto it.
+        assert_eq!(scroll_to_show(1, 5, 5, 20), 1);
+        // Below the window → scroll down so it's the last visible row.
+        assert_eq!(scroll_to_show(9, 2, 5, 20), 5);
+        // Last-page clamp AND cursor-visible together: total 12, cap 5 →
+        // max_off 7; a cursor near the end can't push offset past 7, and
+        // is STILL inside the painted window.
+        let off = scroll_to_show(11, 0, 5, 12);
+        assert_eq!(off, 7, "clamped to the last page");
+        assert!(
+            (off..off + 5).contains(&11),
+            "cursor still painted under the clamp"
+        );
+        // Log shorter than the viewport → offset 0, cursor visible.
+        assert_eq!(scroll_to_show(2, 0, 10, 3), 0);
+    }
+
+    #[test]
+    fn cursor_derived_window_tracks_spinner_visibility() {
+        // The loop computes spinner-visibility from `offset..offset+cap`
+        // with the CURSOR-derived offset. So an in-progress row at seq
+        // index 1 is "visible" only while the cursor keeps it in the
+        // window — scrolling the cursor away takes it out (no wasted
+        // animation ticks), and back in resumes them.
+        let cap = 5;
+        let total = 30;
+        let near = scroll_to_show(2, 0, cap, total);
+        assert!(
+            (near..near + cap).contains(&1),
+            "spinner in view near the top"
+        );
+        let far = scroll_to_show(25, near, cap, total);
+        assert!(
+            !(far..far + cap).contains(&1),
+            "spinner scrolled off → window excludes it"
+        );
+    }
+
+    #[test]
+    fn spinner_glyph_cycles_and_is_width_one() {
+        assert_eq!(spinner_glyph(0), spinner_glyph(SPINNER.len()), "wraps");
+        assert_ne!(spinner_glyph(0), spinner_glyph(1), "advances");
+        for f in 0..SPINNER.len() {
+            assert_eq!(display_width(spinner_glyph(f)), 1, "fits the mark column");
+        }
+    }
+
+    #[test]
+    fn in_progress_rows_derive_from_waiting_on() {
+        // Pending reviewers → one spinner row each, verb "reviewing".
+        let s = snap(vec![plan_state("foo", reviewer_missing("codex"))], vec![]);
+        assert!(matches!(
+            in_progress_rows(&s).as_slice(),
+            [InProgress::PendingReview { label, verb }] if label == "codex" && *verb == "reviewing"
+        ));
+        // Master producing the next commit → one master row, per-state verb.
+        let s = snap(vec![plan_state("foo", WaitingOn::MasterToContinue)], vec![]);
+        assert!(matches!(
+            in_progress_rows(&s).as_slice(),
+            [InProgress::MasterWorking { verb, .. }] if *verb == "working"
+        ));
+        // FLIP (reproduce-first): finalizing IS making the finish commit,
+        // so it now produces a master row — shipped M2 wrongly returned
+        // none for MasterToFinalize.
+        let s = snap(vec![plan_state("foo", WaitingOn::MasterToFinalize)], vec![]);
+        assert!(matches!(
+            in_progress_rows(&s).as_slice(),
+            [InProgress::MasterWorking { verb, .. }] if *verb == "finalizing"
+        ));
+        // MasterToFixCommitTag → surfaced by the `fix` gauge, no spinner.
+        let s = snap(
+            vec![plan_state("foo", WaitingOn::MasterToFixCommitTag)],
+            vec![],
+        );
+        assert!(in_progress_rows(&s).is_empty());
+    }
+}
