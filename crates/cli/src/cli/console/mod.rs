@@ -214,9 +214,10 @@ fn run_console(repo: &Path, specs: Vec<Spec>) -> anyhow::Result<()> {
     let mut frame = render::Frame::new(rows, cols);
     let mut active = 0usize; // active AGENT (0..status_idx)
     let mut status_focused = false; // input + cursor on the status pane
+    let mut follow = false; // follow-active mode: main pane tracks the working agent
     let mut working: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut mode = Mode::Passthrough;
-    let hint = "M-1…9 switch · M-s status · M-a q / ^\\ quit";
+    let hint = "M-0 follow · M-1…9 pin · M-s status · ^\\ quit";
     let ctx = |active, status_focused, layout| RenderCtx {
         status_idx,
         active,
@@ -272,25 +273,41 @@ fn run_console(repo: &Path, specs: Vec<Spec>) -> anyhow::Result<()> {
                                 quit = true;
                                 break;
                             }
+                            Action::FollowActive => {
+                                // Jump to the working agent + enable follow.
+                                // Orthogonal to status focus, so leave the
+                                // status pane and show the agent.
+                                follow = true;
+                                status_focused = false;
+                                if let Some(idx) =
+                                    primary_working_idx(&screens, status_idx, &working)
+                                {
+                                    active = idx;
+                                }
+                                need_repaint = true;
+                            }
                             Action::FocusStatus => {
                                 if !status_focused {
                                     status_focused = true;
                                     need_repaint = true;
                                 }
                             }
-                            nav => {
-                                // Next/Prev/SwitchTo cycle the AGENTS
-                                // (0..status_idx) and always return focus
-                                // from the status pane — even when the
-                                // target is the already-active agent.
+                            Action::SwitchTo(_) | Action::Next | Action::Prev => {
+                                // Manual nav PINS the pane: follow off,
+                                // even when the target is already active.
+                                if follow {
+                                    follow = false;
+                                    need_repaint = true;
+                                }
                                 if let Some((idx, focus)) =
-                                    mux::resolve_nav(active, status_idx, status_focused, &nav)
+                                    mux::resolve_nav(active, status_idx, status_focused, &action)
                                 {
                                     active = idx;
                                     status_focused = focus;
                                     need_repaint = true;
                                 }
                             }
+                            Action::None => {}
                         }
                     }
                 }
@@ -323,6 +340,14 @@ fn run_console(repo: &Path, specs: Vec<Spec>) -> anyhow::Result<()> {
                 Ev::Working(set) => {
                     if set != working {
                         working = set;
+                        // Follow-active mode: the main pane tracks
+                        // whoever is now the working agent (focus
+                        // unchanged — follow is orthogonal to it).
+                        if follow
+                            && let Some(idx) = primary_working_idx(&screens, status_idx, &working)
+                        {
+                            active = idx;
+                        }
                         need_repaint = true;
                     }
                 }
@@ -344,6 +369,20 @@ fn run_console(repo: &Path, specs: Vec<Spec>) -> anyhow::Result<()> {
 
     teardown(&mut screens);
     Ok(())
+}
+
+/// Index of the primary working agent (first in roster order whose
+/// label is in the work-state `working` set), for follow-active mode.
+fn primary_working_idx(
+    screens: &[Screen],
+    status_idx: usize,
+    working: &std::collections::HashSet<String>,
+) -> Option<usize> {
+    let labels: Vec<String> = screens[..status_idx]
+        .iter()
+        .map(|s| s.label.clone())
+        .collect();
+    mux::primary_working(&labels, working)
 }
 
 /// The rect a screen renders into: the status pane for `status_idx`,

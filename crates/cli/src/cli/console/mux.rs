@@ -28,6 +28,8 @@ pub(crate) enum Action {
     /// Next / previous screen (wraps).
     Next,
     Prev,
+    /// Jump to the working agent and enable follow-active mode.
+    FollowActive,
     /// Focus the status screen.
     FocusStatus,
     /// Tear down every child and exit the console.
@@ -63,6 +65,7 @@ pub(crate) fn route(mode: Mode, bytes: &[u8]) -> (usize, Mode, Action) {
                 b'q' => Action::Quit,
                 b'n' | b'\t' => Action::Next,
                 b'p' => Action::Prev,
+                b'0' => Action::FollowActive,
                 b'1'..=b'9' => Action::SwitchTo((bytes[0] - b'1') as usize),
                 b's' => Action::FocusStatus,
                 _ => Action::None,
@@ -83,6 +86,7 @@ pub(crate) fn route(mode: Mode, bytes: &[u8]) -> (usize, Mode, Action) {
             // burst is a console action; everything else forwards.
             match bytes.get(1) {
                 Some(b'a') => (2, Mode::Leader, Action::None),
+                Some(b'0') => (2, Mode::Passthrough, Action::FollowActive),
                 Some(&b @ b'1'..=b'9') => {
                     (2, Mode::Passthrough, Action::SwitchTo((b - b'1') as usize))
                 }
@@ -133,6 +137,17 @@ pub(crate) fn resolve_nav(
         return None; // already there, nothing to change
     }
     Some((new_active, false))
+}
+
+/// The index of the primary working agent: the first agent label (in
+/// roster order) that's in the `working` set, or `None` if none is.
+/// Used by follow-active mode (Alt-0 / a work-state change) to pick
+/// which agent the main pane tracks. Pure → unit-tested headless.
+pub(crate) fn primary_working(
+    agent_labels: &[String],
+    working: &std::collections::HashSet<String>,
+) -> Option<usize> {
+    agent_labels.iter().position(|l| working.contains(l))
 }
 
 /// A sub-rectangle of the terminal, 0-based origin.
@@ -343,8 +358,42 @@ mod tests {
     }
 
     #[test]
+    fn meta_zero_is_follow_active() {
+        // In passthrough and after the Meta-a leader.
+        assert_eq!(
+            route(Mode::Passthrough, b"\x1b0"),
+            (2, Mode::Passthrough, Action::FollowActive)
+        );
+        assert_eq!(
+            route(Mode::Leader, b"0"),
+            (1, Mode::Passthrough, Action::FollowActive)
+        );
+    }
+
+    #[test]
+    fn primary_working_is_first_in_roster_order() {
+        let labels = vec![
+            "claude".to_string(),
+            "codex".to_string(),
+            "ruthless".to_string(),
+        ];
+        let set = |ls: &[&str]| ls.iter().map(|s| s.to_string()).collect();
+        // First roster agent that's working wins (codex before ruthless).
+        assert_eq!(
+            primary_working(&labels, &set(&["ruthless", "codex"])),
+            Some(1)
+        );
+        assert_eq!(primary_working(&labels, &set(&["claude"])), Some(0));
+        // Nobody working → None.
+        assert_eq!(primary_working(&labels, &set(&[])), None);
+        // A working label that isn't an agent (shouldn't happen) → None.
+        assert_eq!(primary_working(&labels, &set(&["ghost"])), None);
+    }
+
+    #[test]
     fn meta_digit_and_meta_s_switch_directly() {
         for (bytes, want) in [
+            (b"\x1b0".as_slice(), Action::FollowActive),
             (b"\x1b1".as_slice(), Action::SwitchTo(0)),
             (b"\x1b9".as_slice(), Action::SwitchTo(8)),
             (b"\x1bs".as_slice(), Action::FocusStatus),
