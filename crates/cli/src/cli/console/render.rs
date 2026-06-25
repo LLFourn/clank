@@ -32,6 +32,8 @@ pub(crate) struct ChromeBar<'a> {
     pub(crate) status_focused: bool,
     /// Follow-active mode is on.
     pub(crate) follow: bool,
+    /// Zoom mode is on (active agent full-screen).
+    pub(crate) zoomed: bool,
     pub(crate) hint: &'a str,
 }
 
@@ -107,6 +109,7 @@ impl Frame {
             chrome.active,
             chrome.status_focused,
             chrome.follow,
+            chrome.zoomed,
             chrome.hint,
             self.cols as usize,
         );
@@ -148,6 +151,12 @@ fn blit(buf: &mut Vec<u8>, last: &mut Vec<String>, grid: &vt100::Screen, rect: R
 /// is positioned absolutely and is exactly `rect.cols` wide (spaces
 /// for blanks), so it overwrites stale content without `\x1b[K`.
 fn blit_rows(buf: &mut Vec<u8>, last: &mut Vec<String>, rows: Vec<String>, rect: Rect) {
+    // A zero-size region (e.g. the status pane / divider when zoomed or
+    // on a tiny terminal) draws nothing — no stray cursor moves.
+    if rect.rows == 0 || rect.cols == 0 {
+        last.clear();
+        return;
+    }
     for (i, row) in rows.iter().enumerate() {
         if last.get(i).map(String::as_str) != Some(row.as_str()) {
             buf.extend_from_slice(
@@ -335,6 +344,7 @@ mod tests {
             active,
             status_focused: false,
             follow: false,
+            zoomed: false,
             hint: "",
         }
     }

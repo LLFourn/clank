@@ -139,7 +139,8 @@ fn run_console(repo: &Path, specs: Vec<Spec>) -> anyhow::Result<()> {
 
     let _guard = AltScreen::enter_raw();
     let (rows, cols) = term_size();
-    let mut layout = mux::layout(rows, cols);
+    let mut zoomed = false; // active agent full-screen (for clean copy)
+    let mut layout = effective_layout(zoomed, rows, cols);
 
     let (tx, rx) = mpsc::channel::<Ev>();
 
@@ -217,12 +218,13 @@ fn run_console(repo: &Path, specs: Vec<Spec>) -> anyhow::Result<()> {
     let mut follow = false; // follow-active mode: main pane tracks the working agent
     let mut working: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut mode = Mode::Passthrough;
-    let hint = "M-0 follow · M-1…9 pin · M-s status · ^\\ quit";
-    let ctx = |active, status_focused, follow, layout| RenderCtx {
+    let hint = "M-z zoom · M-s status · M-0 follow · M-1-9 pin · ^\\ quit";
+    let ctx = |active, status_focused, follow, zoomed, layout| RenderCtx {
         status_idx,
         active,
         status_focused,
         follow,
+        zoomed,
         layout,
         hint,
     };
@@ -231,7 +233,7 @@ fn run_console(repo: &Path, specs: Vec<Spec>) -> anyhow::Result<()> {
         &mut frame,
         &screens,
         &working,
-        ctx(active, status_focused, follow, layout),
+        ctx(active, status_focused, follow, zoomed, layout),
     );
 
     // Batch each wakeup: drain everything currently queued, apply it,
@@ -308,6 +310,16 @@ fn run_console(repo: &Path, specs: Vec<Spec>) -> anyhow::Result<()> {
                                     need_repaint = true;
                                 }
                             }
+                            Action::ToggleZoom => {
+                                // Zoom is a layout change: recompute and
+                                // re-propagate winsize to every child, or
+                                // the agent draws at the old split width.
+                                zoomed = !zoomed;
+                                let (r, c) = term_size();
+                                layout = effective_layout(zoomed, r, c);
+                                relayout(&screens, status_idx, layout, &mut frame, r, c);
+                                need_repaint = true;
+                            }
                             Action::None => {}
                         }
                     }
@@ -327,15 +339,8 @@ fn run_console(repo: &Path, specs: Vec<Spec>) -> anyhow::Result<()> {
                 }
                 Ev::Resize => {
                     let (rows, cols) = term_size();
-                    layout = mux::layout(rows, cols);
-                    for (i, s) in screens.iter().enumerate() {
-                        let rect = screen_rect(i, status_idx, layout);
-                        pty::set_winsize(s.master, rect.rows, rect.cols);
-                        if let Ok(mut p) = s.parser.lock() {
-                            p.screen_mut().set_size(rect.rows, rect.cols);
-                        }
-                    }
-                    frame.resize(rows, cols);
+                    layout = effective_layout(zoomed, rows, cols);
+                    relayout(&screens, status_idx, layout, &mut frame, rows, cols);
                     need_repaint = true;
                 }
                 Ev::Working(set) => {
@@ -363,7 +368,7 @@ fn run_console(repo: &Path, specs: Vec<Spec>) -> anyhow::Result<()> {
                 &mut frame,
                 &screens,
                 &working,
-                ctx(active, status_focused, follow, layout),
+                ctx(active, status_focused, follow, zoomed, layout),
             );
         }
     }
@@ -414,8 +419,41 @@ struct RenderCtx<'a> {
     active: usize,
     status_focused: bool,
     follow: bool,
+    zoomed: bool,
     layout: mux::Layout,
     hint: &'a str,
+}
+
+/// The effective layout for the current mode: zoomed (active agent
+/// full-screen, status/divider collapsed) or the normal split.
+fn effective_layout(zoomed: bool, rows: u16, cols: u16) -> mux::Layout {
+    if zoomed {
+        mux::zoom_layout(rows, cols)
+    } else {
+        mux::layout(rows, cols)
+    }
+}
+
+/// Re-propagate a layout change to every child (PTY winsize + parser
+/// size to its new rect) and clear the frame. The winsize MUST fire on
+/// every layout change — resize OR zoom toggle — or a child draws at
+/// its old size.
+fn relayout(
+    screens: &[Screen],
+    status_idx: usize,
+    layout: mux::Layout,
+    frame: &mut render::Frame,
+    rows: u16,
+    cols: u16,
+) {
+    for (i, s) in screens.iter().enumerate() {
+        let rect = screen_rect(i, status_idx, layout);
+        pty::set_winsize(s.master, rect.rows, rect.cols);
+        if let Ok(mut p) = s.parser.lock() {
+            p.screen_mut().set_size(rect.rows, rect.cols);
+        }
+    }
+    frame.resize(rows, cols);
 }
 
 fn repaint(
@@ -438,6 +476,7 @@ fn repaint(
         active: ctx.active,
         status_focused: ctx.status_focused,
         follow: ctx.follow,
+        zoomed: ctx.zoomed,
         hint: ctx.hint,
     };
 
@@ -614,6 +653,30 @@ mod tests {
             commit_reviewers: agents(commit),
             gate_reviewers: agents(gate),
         }
+    }
+
+    #[test]
+    fn zoom_sizes_agent_full_and_status_to_a_1x1_stub() {
+        // The integration the pure layout test can't catch: under the
+        // zoom layout, screen_rect sizes the active agent to the full
+        // content area and the collapsed status pane to a ≥1×1 stub
+        // (so its PTY/parser is never zero-sized).
+        let (rows, cols) = (24u16, 80u16);
+        let status_idx = 2; // agents 0,1 + status at 2
+        let z = effective_layout(true, rows, cols);
+        let agent = screen_rect(0, status_idx, z);
+        assert_eq!((agent.rows, agent.cols), (23, 80), "agent fills content");
+        let status = screen_rect(status_idx, status_idx, z);
+        assert!(
+            status.rows >= 1 && status.cols >= 1,
+            "status PTY stays ≥1×1: {status:?}"
+        );
+        // Unzoomed, the agent is the narrower split pane.
+        let n = effective_layout(false, rows, cols);
+        assert!(
+            screen_rect(0, status_idx, n).cols < 80,
+            "split agent is narrower"
+        );
     }
 
     #[test]

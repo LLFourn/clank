@@ -32,6 +32,10 @@ pub(crate) enum Action {
     FollowActive,
     /// Focus the status screen.
     FocusStatus,
+    /// Toggle zoom: the active agent fills the whole content area (no
+    /// status pane / divider) so native terminal selection copies the
+    /// agent cleanly.
+    ToggleZoom,
     /// Tear down every child and exit the console.
     Quit,
     /// A recognized-but-inert command (swallowed, no effect).
@@ -68,6 +72,7 @@ pub(crate) fn route(mode: Mode, bytes: &[u8]) -> (usize, Mode, Action) {
                 b'0' => Action::FollowActive,
                 b'1'..=b'9' => Action::SwitchTo((bytes[0] - b'1') as usize),
                 b's' => Action::FocusStatus,
+                b'z' => Action::ToggleZoom,
                 _ => Action::None,
             };
             (1, Mode::Passthrough, action)
@@ -91,6 +96,7 @@ pub(crate) fn route(mode: Mode, bytes: &[u8]) -> (usize, Mode, Action) {
                     (2, Mode::Passthrough, Action::SwitchTo((b - b'1') as usize))
                 }
                 Some(b's') => (2, Mode::Passthrough, Action::FocusStatus),
+                Some(b'z') => (2, Mode::Passthrough, Action::ToggleZoom),
                 // Lone ESC, or ESC + anything else (CSI/SS3/unmapped
                 // Alt): forward just the ESC; the rest routes as plain
                 // bytes, reconstructing the full sequence at the child.
@@ -227,6 +233,34 @@ pub(crate) fn layout(rows: u16, cols: u16) -> Layout {
     }
 }
 
+/// Zoom layout: the active agent fills the whole content area; the
+/// status pane and divider collapse to zero (not drawn) so a native
+/// terminal selection of the agent copies cleanly, with nothing
+/// spilling in from the side. The chrome bar row is unchanged.
+pub(crate) fn zoom_layout(rows: u16, cols: u16) -> Layout {
+    let rows = rows.max(2);
+    let cols = cols.max(1);
+    let content_rows = rows - 1;
+    let zero = Rect {
+        x: cols,
+        y: 0,
+        rows: 0,
+        cols: 0,
+    };
+    Layout {
+        main: Rect {
+            x: 0,
+            y: 0,
+            rows: content_rows,
+            cols,
+        },
+        divider: zero,
+        status: zero,
+        landscape: true,
+        chrome_row: rows - 1,
+    }
+}
+
 /// One tab in the chrome bar.
 pub(crate) struct Tab {
     pub(crate) label: String,
@@ -265,17 +299,23 @@ pub(crate) fn chrome_line(
     active: usize,
     status_focused: bool,
     follow: bool,
+    zoomed: bool,
     hint: &str,
     cols: usize,
 ) -> String {
-    // Right segment: an accent [follow] marker (when on) + the hint.
-    let follow_seg = "[follow]";
-    let right_w = {
-        let mut w = hint.chars().count();
-        if follow {
-            w += follow_seg.chars().count() + 1; // marker + a space
-        }
-        if w > 0 { w + 2 } else { 0 } // surrounding spaces
+    // Right segment: accent mode markers ([follow]/[zoom]) + the hint.
+    let mut markers = String::new();
+    if follow {
+        markers.push_str("[follow] ");
+    }
+    if zoomed {
+        markers.push_str("[zoom] ");
+    }
+    let right_text_w = markers.chars().count() + hint.chars().count();
+    let right_w = if right_text_w > 0 {
+        right_text_w + 2
+    } else {
+        0
     };
     let tab_budget = if right_w > 0 && right_w < cols {
         cols - right_w
@@ -320,10 +360,10 @@ pub(crate) fn chrome_line(
     if right_w > 0 && tab_budget < cols {
         out.push_str(&" ".repeat(tab_budget - used));
         out.push(' ');
-        if follow {
+        if !markers.is_empty() {
             out.push_str("\x1b[36m");
-            out.push_str(follow_seg);
-            out.push_str("\x1b[0m ");
+            out.push_str(&markers);
+            out.push_str("\x1b[0m");
         }
         out.push_str("\x1b[2m");
         out.push_str(hint);
@@ -397,6 +437,38 @@ mod tests {
             route(Mode::Leader, b"0"),
             (1, Mode::Passthrough, Action::FollowActive)
         );
+    }
+
+    #[test]
+    fn meta_z_toggles_zoom() {
+        assert_eq!(
+            route(Mode::Passthrough, b"\x1bz"),
+            (2, Mode::Passthrough, Action::ToggleZoom)
+        );
+        assert_eq!(
+            route(Mode::Leader, b"z"),
+            (1, Mode::Passthrough, Action::ToggleZoom)
+        );
+    }
+
+    #[test]
+    fn zoom_layout_fills_with_agent_and_collapses_status() {
+        let l = zoom_layout(24, 80);
+        // Active agent fills the whole content area.
+        assert_eq!(
+            l.main,
+            Rect {
+                x: 0,
+                y: 0,
+                rows: 23,
+                cols: 80
+            }
+        );
+        // Status + divider collapse to nothing (not drawn).
+        assert_eq!((l.status.rows, l.status.cols), (0, 0));
+        assert_eq!((l.divider.rows, l.divider.cols), (0, 0));
+        // Chrome row unchanged.
+        assert_eq!(l.chrome_row, 23);
     }
 
     #[test]
@@ -476,9 +548,9 @@ mod tests {
                 "{seq:?}"
             );
         }
-        // An unmapped Alt chord (ESC z) likewise forwards the ESC.
+        // An unmapped Alt chord (ESC x) likewise forwards the ESC.
         assert_eq!(
-            route(Mode::Passthrough, b"\x1bz"),
+            route(Mode::Passthrough, b"\x1bx"),
             (1, Mode::Passthrough, Action::Forward(vec![0x1b]))
         );
     }
@@ -599,7 +671,7 @@ mod tests {
             tab("codex", true, false),
             tab("status", true, false),
         ];
-        let line = chrome_line(&tabs, 1, false, false, "", 80);
+        let line = chrome_line(&tabs, 1, false, false, false, "", 80);
         assert_eq!(strip(&line).chars().count(), 80, "padded to full width");
         // The focused tab's body is wrapped in reverse-video; inactive
         // in dim. (The leading separator space is outside the band.)
@@ -610,7 +682,7 @@ mod tests {
     #[test]
     fn chrome_line_frames_the_working_agent_in_green() {
         let tabs = vec![tab("claude", true, true), tab("codex", true, false)];
-        let line = chrome_line(&tabs, 1, false, false, "", 80);
+        let line = chrome_line(&tabs, 1, false, false, false, "", 80);
         // The working (unfocused) tab is framed in green thin-line
         // edges, outside the dim styling so they stay visible.
         assert!(
@@ -631,10 +703,10 @@ mod tests {
     fn chrome_line_bands_no_agent_when_status_focused() {
         let tabs = vec![tab("claude", true, false), tab("codex", true, false)];
         // Main focused on agent 0 → it bands.
-        let main = chrome_line(&tabs, 0, false, false, "", 80);
+        let main = chrome_line(&tabs, 0, false, false, false, "", 80);
         assert!(main.contains("\x1b[7m1:claude "));
         // Status focused → no reverse-video band on any agent tab.
-        let status = chrome_line(&tabs, 0, true, false, "", 80);
+        let status = chrome_line(&tabs, 0, true, false, false, "", 80);
         assert!(
             !status.contains("\x1b[7m"),
             "no tab bands when status is focused: {status:?}"
@@ -644,21 +716,28 @@ mod tests {
     #[test]
     fn chrome_line_shows_follow_marker() {
         let tabs = vec![tab("claude", true, false)];
-        let off = chrome_line(&tabs, 0, false, false, "h", 80);
+        let off = chrome_line(&tabs, 0, false, false, false, "h", 80);
         assert!(!strip(&off).contains("[follow]"));
-        let on = chrome_line(&tabs, 0, false, true, "h", 80);
+        let on = chrome_line(&tabs, 0, false, true, false, "h", 80);
         assert!(
             strip(&on).contains("[follow]"),
             "follow marker shown: {:?}",
             strip(&on)
         );
         assert_eq!(strip(&on).chars().count(), 80);
+        // Zoom marker is independent of follow.
+        let zoom = chrome_line(&tabs, 0, false, false, true, "h", 80);
+        assert!(strip(&zoom).contains("[zoom]"), "{:?}", strip(&zoom));
+        let both = chrome_line(&tabs, 0, false, true, true, "h", 80);
+        let p = strip(&both);
+        assert!(p.contains("[follow]") && p.contains("[zoom]"));
+        assert_eq!(p.chars().count(), 80, "both markers still full width");
     }
 
     #[test]
     fn chrome_line_shows_a_right_aligned_hint() {
         let tabs = vec![tab("claude", true, false)];
-        let line = chrome_line(&tabs, 0, false, false, "M-s status", 80);
+        let line = chrome_line(&tabs, 0, false, false, false, "M-s status", 80);
         let plain = strip(&line);
         assert_eq!(plain.chars().count(), 80);
         assert!(plain.contains("1:claude"));
@@ -672,7 +751,7 @@ mod tests {
     #[test]
     fn chrome_line_marks_dead_children() {
         let tabs = vec![tab("codex", false, false)];
-        let line = chrome_line(&tabs, 0, false, false, "", 40);
+        let line = chrome_line(&tabs, 0, false, false, false, "", 40);
         assert!(strip(&line).contains("1:codex ✗"));
     }
 
@@ -680,7 +759,7 @@ mod tests {
     fn chrome_line_drops_tabs_that_dont_fit() {
         let tabs = vec![tab("aaaaaaaa", true, false), tab("bbbbbbbb", true, false)];
         // Width 14 fits only the first " 1:aaaaaaaa " (12 cols).
-        let line = chrome_line(&tabs, 0, false, false, "", 14);
+        let line = chrome_line(&tabs, 0, false, false, false, "", 14);
         let plain = strip(&line);
         assert!(plain.contains("1:aaaaaaaa"));
         assert!(!plain.contains("2:bbbbbbbb"));
