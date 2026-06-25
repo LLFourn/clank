@@ -253,7 +253,32 @@ struct CommitDetail {
     body: String,
     /// `(author, verdict, full feedback body)` per reviewer.
     reviews: Vec<(String, clank_core::vocab::Verdict, String)>,
+}
+
+/// The open commit-detail overlay: the fetched [`CommitDetail`] DATA and
+/// the scroll `offset`, kept SEPARATE so a background `Refresh` (which
+/// re-fetches the data, so a new verdict shows up live) swaps only the
+/// data and never resets the reader's scroll position — the watcher
+/// fires constantly in an active session. Mirrors how [`LogView`] keeps
+/// its cursor across refreshes.
+struct CommitOverlay {
+    data: CommitDetail,
     offset: usize,
+}
+
+impl CommitOverlay {
+    fn new(data: CommitDetail) -> Self {
+        Self { data, offset: 0 }
+    }
+    /// Swap in freshly-fetched data, PRESERVING the scroll offset (the
+    /// next render's clamp handles a body that shrank).
+    fn refresh(&mut self, data: CommitDetail) {
+        self.data = data;
+    }
+    /// Scroll by a signed line delta, clamped to `[0, max_off]`.
+    fn scroll(&mut self, delta: i32, max_off: usize) {
+        self.offset = (self.offset as i32 + delta).clamp(0, max_off as i32) as usize;
+    }
 }
 
 /// A reviewer's feedback as shown in the detail view: the full message
@@ -314,7 +339,6 @@ fn fetch_commit_detail(
         subject,
         body,
         reviews,
-        offset: 0,
     })
 }
 
@@ -399,7 +423,7 @@ pub(crate) async fn run_tui(
     // [`LogView`] for the invariants its methods enforce.
     let mut log = LogView::new();
     // The commit-detail overlay, when open (Enter on a log entry).
-    let mut detail: Option<CommitDetail> = None;
+    let mut detail: Option<CommitOverlay> = None;
     // Which region owns the keyboard. Starts on the log; Tab moves it to
     // the agent panel. The single source of key-routing truth.
     let mut mode = Mode::LogScroll;
@@ -419,30 +443,36 @@ pub(crate) async fn run_tui(
         // the slow backstop.
         if detail.is_some() {
             let page = (rows as usize).saturating_sub(3).max(1);
-            let d = detail.as_ref().unwrap();
+            let overlay = detail.as_ref().unwrap();
             let (lines, total) = render_commit_detail(
-                &d.short,
-                &d.subject,
-                &d.body,
-                &d.reviews,
-                d.offset,
+                &overlay.data.short,
+                &overlay.data.subject,
+                &overlay.data.body,
+                &overlay.data.reviews,
+                overlay.offset,
                 rows as usize,
                 cols as usize,
             );
             paint(&lines);
-            let sha = d.sha.clone();
+            let sha = overlay.data.sha.clone();
             match ev_rx.recv_timeout(Duration::from_secs(60)) {
                 Ok(Ev::Key(k)) => match commit_detail_nav(k, page) {
                     CommitNav::Back => detail = None,
                     CommitNav::Scroll(delta) => {
-                        let max_off = total.saturating_sub((rows as usize).max(1)) as i32;
-                        let d = detail.as_mut().unwrap();
-                        d.offset = (d.offset as i32 + delta).clamp(0, max_off) as usize;
+                        let max_off = total.saturating_sub((rows as usize).max(1));
+                        detail.as_mut().unwrap().scroll(delta, max_off);
                     }
                     CommitNav::None => {}
                 },
-                // Data changed under us — re-fetch the SAME commit.
-                Ok(Ev::Refresh) => detail = fetch_commit_detail(&repo, &sha),
+                // Data changed under us — re-fetch the SAME commit, but KEEP
+                // the scroll offset (refresh swaps data, not view-state).
+                Ok(Ev::Refresh) => {
+                    if let Some(data) = fetch_commit_detail(&repo, &sha)
+                        && let Some(o) = detail.as_mut()
+                    {
+                        o.refresh(data);
+                    }
+                }
                 Ok(Ev::Resize) => {}
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -660,7 +690,7 @@ pub(crate) async fn run_tui(
                         Key::Enter => {
                             let seq = build_scroll(&snapshot, &ask_lines, &in_prog);
                             if let Some(sha) = entry_commit_sha(&seq, log.cursor) {
-                                detail = fetch_commit_detail(&repo, &sha);
+                                detail = fetch_commit_detail(&repo, &sha).map(CommitOverlay::new);
                             }
                         }
                         Key::Escape | Key::Left | Key::Delete | Key::Yes | Key::No => {}
@@ -838,6 +868,31 @@ pub(crate) mod tests {
             feedback_display_body("REQUEST_CHANGES needs work\n\ndetails here"),
             "needs work\n\ndetails here"
         );
+    }
+
+    #[test]
+    fn commit_overlay_refresh_keeps_scroll_offset() {
+        let data = |subject: &str| CommitDetail {
+            sha: crate::lifecycle::CommitSha::parse(&format!("{:0<40}", "abc")).unwrap(),
+            short: "abc".into(),
+            subject: subject.into(),
+            body: "body".into(),
+            reviews: Vec::new(),
+        };
+        let mut o = CommitOverlay::new(data("first"));
+        assert_eq!(o.offset, 0, "fresh overlay starts at the top");
+        o.scroll(5, 20);
+        assert_eq!(o.offset, 5);
+        // THE bug this guards: a background re-fetch (verdict landed, file
+        // churn) swaps the data but must KEEP the reader's scroll position.
+        o.refresh(data("updated"));
+        assert_eq!(o.data.subject, "updated", "data was swapped");
+        assert_eq!(o.offset, 5, "scroll offset survives a refresh");
+        // Scrolling clamps to [0, max_off].
+        o.scroll(100, 8);
+        assert_eq!(o.offset, 8, "clamped to the last page");
+        o.scroll(-100, 8);
+        assert_eq!(o.offset, 0, "clamped at the top");
     }
 
     #[test]
