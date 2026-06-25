@@ -414,7 +414,6 @@ pub(super) const MARK_FIELD: usize = 2;
 /// aligned column (tui-log-plan-highlight-align).
 pub(super) fn log_row_spans(row: &crate::cli::log::OnelineRow, author_width: usize) -> Vec<Span> {
     use crate::cli::log::OnelineRow;
-    use clank_core::vocab::Verdict;
     match row {
         OnelineRow::Header { plan } => {
             vec![Span(
@@ -431,12 +430,7 @@ pub(super) fn log_row_spans(row: &crate::cli::log::OnelineRow, author_width: usi
             author,
             summary,
         } => {
-            let mark_color = match verdict {
-                Verdict::Continue => "32",
-                Verdict::Finished => "36",
-                Verdict::RequestChanges => "31",
-                Verdict::Unmarked => "2",
-            };
+            let mark_color = verdict_color(*verdict);
             let mark = crate::cli::log::verdict_mark(*verdict, false);
             // Mark starts at column 2 (== the commit sha); pad it to
             // MARK_FIELD + a separating space so the author column is
@@ -786,6 +780,72 @@ pub(super) fn render_agent_detail(
     }
     out.truncate(rows);
     (out, 0)
+}
+
+/// The fixed ANSI color for a verdict mark — green continue, cyan
+/// finished, red request-changes, dim unmarked. Shared by the log
+/// review rows and the commit-detail reviewer headers.
+fn verdict_color(verdict: clank_core::vocab::Verdict) -> &'static str {
+    use clank_core::vocab::Verdict;
+    match verdict {
+        Verdict::Continue => "32",
+        Verdict::Finished => "36",
+        Verdict::RequestChanges => "31",
+        Verdict::Unmarked => "2",
+    }
+}
+
+/// The full-window commit-detail view (the `Enter`-on-a-log-entry drill
+/// in): the commit's subject + full message, then each reviewer's
+/// verdict mark + full feedback body, scrolled by `offset`. Read-only,
+/// like the add-picker / agent-detail screens. Returns the windowed
+/// lines (clamped to `rows`) AND the TOTAL content height, so the loop
+/// clamps the scroll offset to the last page.
+pub(super) fn render_commit_detail(
+    short_sha: &str,
+    subject: &str,
+    body: &str,
+    reviews: &[(String, clank_core::vocab::Verdict, String)],
+    offset: usize,
+    rows: usize,
+    cols: usize,
+) -> (Vec<String>, usize) {
+    let mut content: Vec<String> = Vec::new();
+    // The rule title is upper-cased, so keep the (lowercase) sha out of it
+    // and on the subject line with the message.
+    content.push(region_rule("commit", "↑↓ scroll · Esc back", true, cols));
+    content.push(String::new());
+    content.push(emit(
+        &[
+            dim(format!("{short_sha}  ")),
+            plain(one_line(subject, cols)),
+        ],
+        "",
+        cols,
+    ));
+    content.push(String::new());
+    for line in wrap(body, cols) {
+        content.push(emit(&[plain(line)], "", cols));
+    }
+    for (author, verdict, rbody) in reviews {
+        content.push(String::new());
+        let mark = crate::cli::log::verdict_mark(*verdict, false);
+        content.push(emit(
+            &[
+                colored(verdict_color(*verdict), mark),
+                plain(format!(" {author}")),
+            ],
+            "",
+            cols,
+        ));
+        for line in wrap(rbody, cols) {
+            content.push(emit(&[dim(line)], "", cols));
+        }
+    }
+    let total = content.len();
+    let off = offset.min(total.saturating_sub(1));
+    let windowed = content.into_iter().skip(off).take(rows).collect();
+    (windowed, total)
 }
 
 #[cfg(test)]
@@ -1885,5 +1945,68 @@ mod tests {
         }
         // Idle is the sleeping glyph specifically.
         assert_eq!(bar_emoji(&snap(vec![], vec![])), "💤");
+    }
+
+    #[test]
+    fn commit_detail_shows_message_and_each_reviewers_feedback() {
+        use clank_core::vocab::Verdict;
+        let reviews = vec![
+            (
+                "codex".to_string(),
+                Verdict::Continue,
+                "looks good to me".to_string(),
+            ),
+            (
+                "ruthless".to_string(),
+                Verdict::RequestChanges,
+                "fix the thing".to_string(),
+            ),
+        ];
+        let (lines, total) = render_commit_detail(
+            "abc1234",
+            "do the thing",
+            "a longer body paragraph",
+            &reviews,
+            0,
+            40,
+            60,
+        );
+        let joined = lines
+            .iter()
+            .map(|l| visible(l))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("abc1234"), "heading shows the short sha");
+        assert!(joined.contains("do the thing"), "subject shown");
+        assert!(
+            joined.contains("a longer body paragraph"),
+            "full body shown"
+        );
+        assert!(
+            joined.contains("codex") && joined.contains("looks good to me"),
+            "reviewer 1 verdict author + body"
+        );
+        assert!(
+            joined.contains("ruthless") && joined.contains("fix the thing"),
+            "reviewer 2 verdict author + body"
+        );
+        assert!(total >= lines.len(), "reports total content height");
+        assert!(lines.len() <= 40, "full-window: clamped to the row budget");
+
+        // Scrolling shifts the window — the heading is no longer line 0.
+        let (scrolled, _) = render_commit_detail(
+            "abc1234",
+            "do the thing",
+            "a longer body paragraph",
+            &reviews,
+            3,
+            40,
+            60,
+        );
+        assert_ne!(
+            visible(&scrolled[0]),
+            visible(&lines[0]),
+            "offset shifts the visible window"
+        );
     }
 }

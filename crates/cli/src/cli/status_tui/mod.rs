@@ -242,6 +242,60 @@ impl LogView {
     }
 }
 
+/// The open commit-detail overlay: the fetched commit + feedback for a
+/// SHA, plus the scroll offset. `Some` ⟺ the detail view is showing; the
+/// log keeps its cursor underneath, restored on dismiss. Anchored by
+/// `sha` (not a log index) so a `Refresh` re-fetches the SAME commit.
+struct CommitDetail {
+    sha: crate::lifecycle::CommitSha,
+    short: String,
+    subject: String,
+    body: String,
+    /// `(author, verdict, full feedback body)` per reviewer.
+    reviews: Vec<(String, clank_core::vocab::Verdict, String)>,
+    offset: usize,
+}
+
+/// Fetch the commit subject/body (gix) and every reviewer's verdict +
+/// full feedback body for `sha`. `FeedbackView` carries only the verdict
+/// and a repo-relative `source_path` per entry, so the body is read from
+/// that file (the same per-agent file the log's review summaries come
+/// from). `None` if the commit can't be read; a missing feedback file
+/// degrades to an empty body.
+fn fetch_commit_detail(
+    repo: &std::path::Path,
+    sha: &crate::lifecycle::CommitSha,
+) -> Option<CommitDetail> {
+    let subject = crate::git_io::commit_subject_at(repo, sha).ok()?;
+    let body = crate::git_io::commit_body_at(repo, sha).ok()?;
+    let reviews = crate::feedback_scan::scan_feedback(repo, std::slice::from_ref(sha))
+        .ok()
+        .and_then(|view| {
+            view.per_commit
+                .into_iter()
+                .find(|c| &c.sha == sha)
+                .map(|c| {
+                    c.entries
+                        .into_iter()
+                        .map(|(label, entry)| {
+                            let rbody = std::fs::read_to_string(repo.join(&entry.source_path))
+                                .unwrap_or_default();
+                            (label.as_str().to_string(), entry.verdict, rbody)
+                        })
+                        .collect()
+                })
+        })
+        .unwrap_or_default();
+    Some(CommitDetail {
+        short: crate::cli::status::short_sha(sha.as_str()).to_string(),
+        sha: sha.clone(),
+        subject,
+        body,
+        reviews,
+        offset: 0,
+    })
+}
+
 /// The `--tui` loop, fully event-driven: the watcher covers the
 /// working tree (gitignore-filtered), `.clank/`, and the git dir;
 /// SIGWINCH arrives on the same channel, so a resize is just
@@ -322,6 +376,8 @@ pub(crate) async fn run_tui(
     // tall pane on first paint and pages in older rows as you scroll. See
     // [`LogView`] for the invariants its methods enforce.
     let mut log = LogView::new();
+    // The commit-detail overlay, when open (Enter on a log entry).
+    let mut detail: Option<CommitDetail> = None;
     // Which region owns the keyboard. Starts on the log; Tab moves it to
     // the agent panel. The single source of key-routing truth.
     let mut mode = Mode::LogScroll;
@@ -334,6 +390,46 @@ pub(crate) async fn run_tui(
     let mut frame: usize = 0;
     loop {
         let (rows, cols) = term_size();
+
+        // The commit-detail overlay owns the whole pane until dismissed:
+        // render it, route its own (scroll / back) keys, and skip the
+        // normal log/panel path. Nothing here animates, so the wait is
+        // the slow backstop.
+        if detail.is_some() {
+            let page = (rows as usize).saturating_sub(3).max(1);
+            let d = detail.as_ref().unwrap();
+            let (lines, total) = render_commit_detail(
+                &d.short,
+                &d.subject,
+                &d.body,
+                &d.reviews,
+                d.offset,
+                rows as usize,
+                cols as usize,
+            );
+            paint(&lines);
+            let sha = d.sha.clone();
+            match ev_rx.recv_timeout(Duration::from_secs(60)) {
+                Ok(Ev::Key(k)) => match commit_detail_nav(k, page) {
+                    CommitNav::Back => detail = None,
+                    CommitNav::Scroll(delta) => {
+                        let max_off = total.saturating_sub((rows as usize).max(1)) as i32;
+                        let d = detail.as_mut().unwrap();
+                        d.offset = (d.offset as i32 + delta).clamp(0, max_off) as usize;
+                    }
+                    CommitNav::None => {}
+                },
+                // Data changed under us — re-fetch the SAME commit.
+                Ok(Ev::Refresh) => detail = fetch_commit_detail(&repo, &sha),
+                Ok(Ev::Resize) => {}
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    anyhow::bail!("event channel disconnected")
+                }
+            }
+            continue;
+        }
+
         let log_focused = matches!(mode, Mode::LogScroll);
         let view = PanelView {
             mode,
@@ -533,7 +629,18 @@ pub(crate) async fn run_tui(
                         Key::Space | Key::PageDown => log.page_down(page),
                         Key::Top => log.jump_top(),
                         Key::Bottom => log.jump_bottom(total),
-                        Key::Escape | Key::Enter | Key::Delete | Key::Yes | Key::No => {}
+                        // Enter drills into the commit under the cursor:
+                        // build the same scroll sequence the cursor indexes,
+                        // map the entry to its commit sha, fetch + open the
+                        // detail overlay. Non-commit rows (header, ask,
+                        // in-progress) resolve to None and do nothing.
+                        Key::Enter => {
+                            let seq = build_scroll(&snapshot, &ask_lines, &in_prog);
+                            if let Some(sha) = entry_commit_sha(&seq, log.cursor) {
+                                detail = fetch_commit_detail(&repo, &sha);
+                            }
+                        }
+                        Key::Escape | Key::Delete | Key::Yes | Key::No => {}
                     },
                 }
                 log.request_fill();

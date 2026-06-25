@@ -197,6 +197,30 @@ pub(super) fn scroll_to_show(cursor: usize, offset: usize, capacity: usize, tota
     off.min(max_off)
 }
 
+/// The commit a scroll entry "drills into" for the detail view, or
+/// `None` if the entry has no commit (a header, an ask line, or an
+/// in-progress placeholder). A `Commit` seg yields its own sha. A
+/// `Review` seg carries NO sha (reviews are positional), so it scans
+/// FORWARD — reviews render ABOVE their commit — to the next `Commit`,
+/// but STOPS at a section `Header` or the end of the sequence: a stray
+/// or tail review (which `build_scroll` flushes with no following commit
+/// in its section) must NOT bind to the next section's commit.
+pub(super) fn entry_commit_sha(seq: &[Seg], cursor: usize) -> Option<crate::lifecycle::CommitSha> {
+    use crate::cli::log::OnelineRow;
+    match seq.get(cursor)? {
+        Seg::Log(OnelineRow::Commit { sha, .. }) => Some(sha.clone()),
+        Seg::Log(OnelineRow::Review { .. }) => seq[cursor + 1..]
+            .iter()
+            .find_map(|s| match s {
+                Seg::Log(OnelineRow::Commit { sha, .. }) => Some(Some(sha.clone())),
+                Seg::Log(OnelineRow::Header { .. }) => Some(None), // section break
+                _ => None,                                         // skip reviews/in-progress
+            })
+            .flatten(),
+        _ => None, // header, ask, in-progress
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -406,5 +430,64 @@ mod tests {
             !visible(5, 2),
             "scrolled past the placeholder → not in view"
         );
+    }
+
+    #[test]
+    fn entry_commit_sha_resolves_positionally() {
+        use crate::cli::log::OnelineRow;
+        use crate::lifecycle::CommitSha;
+        use clank_core::vocab::Verdict;
+        let sha = |s: &str| CommitSha::parse(&format!("{:0<40}", s)).unwrap();
+        let commit = |s: &str| OnelineRow::Commit {
+            sha: sha(s),
+            subject: "x".into(),
+        };
+        let review = |a: &str| OnelineRow::Review {
+            verdict: Verdict::Continue,
+            author: a.into(),
+            summary: "ok".into(),
+        };
+        let header = || OnelineRow::Header {
+            plan: Some("foo".into()),
+        };
+
+        // Header, Review(aaa), Commit(c1), Header, Review(bbb) [tail].
+        let rows = [
+            header(),
+            review("aaa"),
+            commit("c1"),
+            header(),
+            review("bbb"),
+        ];
+        let seq: Vec<Seg> = rows.iter().map(Seg::Log).collect();
+        // A commit row → its own sha.
+        assert_eq!(entry_commit_sha(&seq, 2), Some(sha("c1")));
+        // A review directly above its commit → that commit's sha.
+        assert_eq!(entry_commit_sha(&seq, 1), Some(sha("c1")));
+        // A header → None.
+        assert_eq!(entry_commit_sha(&seq, 0), None);
+        // A TAIL review with no following commit → None (not a panic, not
+        // a bind to some earlier commit).
+        assert_eq!(entry_commit_sha(&seq, 4), None);
+        // Out-of-range cursor → None.
+        assert_eq!(entry_commit_sha(&seq, 99), None);
+
+        // A stray review whose section ends at a Header before any commit
+        // must NOT bind to the NEXT section's commit (the wrong-entry bug).
+        let rows2 = [review("zzz"), header(), commit("c2")];
+        let seq2: Vec<Seg> = rows2.iter().map(Seg::Log).collect();
+        assert_eq!(
+            entry_commit_sha(&seq2, 0),
+            None,
+            "review before a section break stops at the header"
+        );
+
+        // An in-progress placeholder → None.
+        let ip = InProgress::MasterWorking {
+            name: "m".into(),
+            verb: "working",
+        };
+        let seq3 = vec![Seg::InProg(&ip)];
+        assert_eq!(entry_commit_sha(&seq3, 0), None);
     }
 }

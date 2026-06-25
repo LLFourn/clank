@@ -135,6 +135,32 @@ pub(super) fn agent_detail_nav(sel: usize, actions: &[DetailAction], key: Key) -
     }
 }
 
+/// What a keystroke means in the full-window commit-detail view: dismiss
+/// it, scroll its body by a signed line delta, or nothing. The detail is
+/// READ-ONLY, so (like a pager) `q`/Esc/Enter back out to the log rather
+/// than quitting the TUI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CommitNav {
+    None,
+    Back,
+    Scroll(i32),
+}
+
+/// Pure key routing for the commit-detail view. `page` is the viewport
+/// height for PgUp/PgDn/Space. The loop clamps the resulting offset to
+/// the content height.
+pub(super) fn commit_detail_nav(key: Key, page: usize) -> CommitNav {
+    let page = page as i32;
+    match key {
+        Key::Escape | Key::Enter | Key::Quit | Key::Focus => CommitNav::Back,
+        Key::Up => CommitNav::Scroll(-1),
+        Key::Down => CommitNav::Scroll(1),
+        Key::PageUp => CommitNav::Scroll(-page),
+        Key::Space | Key::PageDown => CommitNav::Scroll(page),
+        _ => CommitNav::None,
+    }
+}
+
 /// A pending roster mutation, by index (keeps [`Mode`] `Copy`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ConfirmAction {
@@ -573,5 +599,20 @@ mod tests {
             PanelAction::LeaveFocus
         );
         assert_eq!(agent_panel_action(1, &agents, Key::Quit), PanelAction::Quit);
+    }
+
+    #[test]
+    fn commit_detail_nav_scrolls_or_backs_out() {
+        assert_eq!(commit_detail_nav(Key::Down, 10), CommitNav::Scroll(1));
+        assert_eq!(commit_detail_nav(Key::Up, 10), CommitNav::Scroll(-1));
+        assert_eq!(commit_detail_nav(Key::PageDown, 10), CommitNav::Scroll(10));
+        assert_eq!(commit_detail_nav(Key::Space, 10), CommitNav::Scroll(10));
+        assert_eq!(commit_detail_nav(Key::PageUp, 10), CommitNav::Scroll(-10));
+        // Read-only overlay: Esc / Enter / q all dismiss back to the log.
+        assert_eq!(commit_detail_nav(Key::Escape, 10), CommitNav::Back);
+        assert_eq!(commit_detail_nav(Key::Enter, 10), CommitNav::Back);
+        assert_eq!(commit_detail_nav(Key::Quit, 10), CommitNav::Back);
+        // Unmapped keys do nothing.
+        assert_eq!(commit_detail_nav(Key::Yes, 10), CommitNav::None);
     }
 }
