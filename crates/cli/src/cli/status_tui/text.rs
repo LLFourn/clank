@@ -39,6 +39,26 @@ pub(super) fn dim(s: impl Into<String>) -> Span {
 pub(super) fn plain(s: impl Into<String>) -> Span {
     Span(Style::Plain, s.into())
 }
+pub(super) fn accent(s: impl Into<String>) -> Span {
+    Span(Style::Accent, s.into())
+}
+pub(super) fn italic(s: impl Into<String>) -> Span {
+    Span(Style::Italic, s.into())
+}
+pub(super) fn highlight(s: impl Into<String>) -> Span {
+    Span(Style::Highlight, s.into())
+}
+/// A fixed-ANSI-color span — `code` is the SGR (e.g. `"32"` green).
+/// Named `colored`, not `color`, to avoid clashing with the ubiquitous
+/// `color` state-hue local in the renderers.
+pub(super) fn colored(code: &'static str, s: impl Into<String>) -> Span {
+    Span(Style::Color(code), s.into())
+}
+/// An OSC 8 hyperlink span: `url` is the (dynamic) target, `text` the
+/// visible label.
+pub(super) fn link(url: String, text: impl Into<String>) -> Span {
+    Span(Style::Link(url), text.into())
+}
 
 /// Right-aligned label gutter: 5 columns + 2 spaces, dim. The
 /// fixed gutter is what makes the cluster read as one organized

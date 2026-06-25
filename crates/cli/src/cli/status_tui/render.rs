@@ -52,14 +52,14 @@ pub(super) fn dirty_spans(d: &crate::git_io::DirtyStats) -> Vec<Span> {
     let mut spans = vec![label("dirty")];
     let mut wrote = false;
     if d.insertions > 0 {
-        spans.push(Span(Style::Color("32"), format!("+{}", d.insertions)));
+        spans.push(colored("32", format!("+{}", d.insertions)));
         wrote = true;
     }
     if d.deletions > 0 {
         if wrote {
             spans.push(dim(" "));
         }
-        spans.push(Span(Style::Color("31"), format!("−{}", d.deletions)));
+        spans.push(colored("31", format!("−{}", d.deletions)));
         wrote = true;
     }
     if d.untracked > 0 {
@@ -141,10 +141,7 @@ pub(super) fn render_at(
             crate::cli::status::describe_head_violation(&c.violation)
         );
         for (i, line) in wrap(&msg, ask_width).into_iter().enumerate() {
-            body.push(vec![
-                label(if i == 0 { "fix" } else { "" }),
-                Span(Style::Accent, line),
-            ]);
+            body.push(vec![label(if i == 0 { "fix" } else { "" }), accent(line)]);
         }
     }
 
@@ -210,7 +207,7 @@ pub(super) fn render_at(
     // actor/verb + `pr #n`; this is the addressable link.
     for pr in &snap.pr_reviews {
         let url = crate::cli::status::pr_url(&pr.repo, pr.pr);
-        body.push(vec![label("pr"), Span(Style::Link(url.clone()), url)]);
+        body.push(vec![label("pr"), link(url.clone(), url)]);
     }
 
     // `git` — branch + head, dim. When the worktree is dirty the
@@ -305,7 +302,7 @@ pub(super) fn render_at(
             };
             if out.len() < rows {
                 out.push(emit(
-                    &[Span(Style::Highlight, format!("confirm: {verb} “{who}”"))],
+                    &[highlight(format!("confirm: {verb} “{who}”"))],
                     color,
                     cols,
                 ));
@@ -314,7 +311,7 @@ pub(super) fn render_at(
                 out.push(emit(
                     &[
                         dim("edits the committed team config · ".to_string()),
-                        Span(Style::Accent, keys.to_string()),
+                        accent(keys.to_string()),
                     ],
                     color,
                     cols,
@@ -455,7 +452,7 @@ pub(super) fn log_row_spans(row: &crate::cli::log::OnelineRow, author_width: usi
             };
             vec![
                 plain("  ".to_string()),
-                Span(Style::Color(mark_color), mark),
+                colored(mark_color, mark),
                 plain(" ".repeat(after_mark)),
                 dim(format!("{author}{}", " ".repeat(author_pad))),
                 plain(snip),
@@ -480,14 +477,14 @@ pub(super) fn in_progress_spans(item: &InProgress, frame: usize, author_width: u
                 plain(" ".repeat(after_mark)),
                 dim(format!("{label}{}", " ".repeat(author_pad))),
                 // The wait-verb is what's italic — "what we await".
-                Span(Style::Italic, format!(" {verb}…")),
+                italic(format!(" {verb}…")),
             ]
         }
         InProgress::MasterWorking { name, verb } => vec![
             dim(format!("{} ", spinner_glyph(frame))),
             dim("------- ".to_string()),
             dim(format!("{name} ")),
-            Span(Style::Italic, format!("{verb}…")),
+            italic(format!("{verb}…")),
         ],
     }
 }
@@ -503,10 +500,7 @@ pub(super) fn block_ask_spans(snap: &StatusSnapshot, cols: usize) -> Vec<Vec<Spa
     let mut lines = Vec::new();
     for b in snap.blocks.iter().filter(|b| b.answer.is_none()) {
         for (i, line) in wrap(b.question.trim(), ask_width).into_iter().enumerate() {
-            lines.push(vec![
-                label(if i == 0 { "ask" } else { "" }),
-                Span(Style::Accent, line),
-            ]);
+            lines.push(vec![label(if i == 0 { "ask" } else { "" }), accent(line)]);
         }
     }
     lines
