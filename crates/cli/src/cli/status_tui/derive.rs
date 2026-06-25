@@ -212,7 +212,7 @@ pub(super) fn verb_of(w: &WaitingOn) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::status_tui::tests::{plan_state, pr_awaiting, reviewer_missing, snap};
+    use crate::cli::status_tui::fixtures::{plan_state, pr_awaiting, reviewer_missing, snap};
     use crate::lifecycle::AgentLabel;
 
     #[test]

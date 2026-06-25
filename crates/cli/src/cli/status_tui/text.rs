@@ -244,9 +244,33 @@ pub(super) fn truncate_to(s: &str, cols: usize) -> String {
     t
 }
 
+/// Strip a leading signal-lamp emoji (`"👀 frostsnap"` → `"frostsnap"`)
+/// so a prior, un-restored indicator doesn't stack. A lamp glyph is a
+/// single emoji-plane grapheme followed by a space. `pub(crate)` because
+/// the zellij tab/pane renamer in `open_zellij` strips the same prefix.
+pub(crate) fn strip_leading_emoji(name: &str) -> String {
+    let mut chars = name.chars();
+    match (chars.next(), chars.next()) {
+        // A lamp glyph (emoji-plane, width 2) followed by a space.
+        (Some(first), Some(' ')) if char_width(first) == 2 => chars.as_str().to_string(),
+        _ => name.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strip_leading_emoji_removes_a_stale_glyph_only() {
+        // A prior, un-restored indicator must not stack.
+        assert_eq!(strip_leading_emoji("👀 frostsnap"), "frostsnap");
+        assert_eq!(strip_leading_emoji("💤 clank"), "clank");
+        // A plain name is untouched.
+        assert_eq!(strip_leading_emoji("clank"), "clank");
+        // A name that merely starts with a word (no emoji) is untouched.
+        assert_eq!(strip_leading_emoji("pr-497"), "pr-497");
+    }
 
     #[test]
     fn wrap_breaks_on_words_newlines_and_long_tokens() {

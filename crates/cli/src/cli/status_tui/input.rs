@@ -345,7 +345,7 @@ pub(super) fn move_selection(sel: usize, len: usize, down: bool) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::status_tui::tests::agent_row;
+    use crate::cli::status_tui::fixtures::agent_row;
 
     #[test]
     fn parse_keys_recognizes_arrows_paging_and_vi_keys() {

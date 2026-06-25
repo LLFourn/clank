@@ -200,8 +200,8 @@ pub(super) fn scroll_to_show(cursor: usize, offset: usize, capacity: usize, tota
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::status_tui::fixtures::{plan_state, reviewer_missing, snap};
     use crate::cli::status_tui::render::block_ask_spans;
-    use crate::cli::status_tui::tests::{plan_state, reviewer_missing, snap};
     use crate::cli::status_tui::text::display_width;
 
     #[test]

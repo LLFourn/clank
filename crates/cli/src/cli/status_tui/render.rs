@@ -791,7 +791,7 @@ pub(super) fn render_agent_detail(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::status_tui::tests::{
+    use crate::cli::status_tui::fixtures::{
         REVERSE, agent_row, cand, line_with, plan_state, pr_work, reviewer_missing, snap,
         two_agent_snap, visible, visible_untrimmed,
     };

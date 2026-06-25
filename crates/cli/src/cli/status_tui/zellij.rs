@@ -255,7 +255,7 @@ impl PaneStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::status_tui::tests::{plan_state, reviewer_missing, snap};
+    use crate::cli::status_tui::fixtures::{plan_state, reviewer_missing, snap};
     use clank_core::plan_view::WaitingOn;
 
     #[test]
