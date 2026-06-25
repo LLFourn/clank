@@ -792,7 +792,8 @@ pub(super) fn render_agent_detail(
 mod tests {
     use super::*;
     use crate::cli::status_tui::tests::{
-        plan_state, reviewer_missing, snap, visible, visible_untrimmed,
+        REVERSE, agent_row, cand, line_with, plan_state, pr_work, reviewer_missing, snap,
+        two_agent_snap, visible, visible_untrimmed,
     };
     use crate::lifecycle::{AgentLabel, CommitSha, PlanKey};
     use clank_core::plan_view::WaitingOn;
@@ -1362,5 +1363,527 @@ mod tests {
             texts.iter().any(|t| t.starts_with(" done  old-plan @ ")),
             "got {texts:?}"
         );
+    }
+
+    #[test]
+    fn auto_mark_play_pause_share_a_fixed_width_field() {
+        use clank_core::vocab::AutoMode;
+        // The on/off marks MUST occupy the same display width or the name
+        // column jitters between rows. The fixed MARK_FIELD guarantees it.
+        let on = auto_mark(AutoMode::On);
+        let off = auto_mark(AutoMode::Off);
+        assert_eq!(
+            display_width(&on.1),
+            MARK_FIELD,
+            "play mark fills the field"
+        );
+        assert_eq!(
+            display_width(&off.1),
+            MARK_FIELD,
+            "pause mark fills the field"
+        );
+        assert_eq!(display_width(&on.1), display_width(&off.1), "equal width");
+    }
+
+    #[test]
+    fn focus_is_shown_by_the_item_band_not_a_section_highlight() {
+        let s = two_agent_snap();
+
+        // The region rules are NEVER highlighted (no reverse-video bar);
+        // focus is shown by the selected ITEM band, which sits in the
+        // focused region. No circles, no rail either.
+        let log = render_at(&s, 40, 80, 0, 0, &PanelView::just(Mode::LogScroll)).0;
+        let log_j = log.join("\n");
+        assert!(
+            log_j.contains('▶') && log_j.contains('⏸'),
+            "play/pause marks"
+        );
+        assert!(
+            !log_j.contains("\x1b[1;7m"),
+            "no section highlight (reverse-video rule): {log_j}"
+        );
+        assert!(
+            !log_j.contains('○') && !log_j.contains('◉') && !log_j.contains('▌'),
+            "no circle markers, no rail"
+        );
+
+        // Agents-focused on codex (row 1): the focus cue is the codex
+        // row's selection band — and STILL no section highlight.
+        let ag = render_at(
+            &s,
+            40,
+            80,
+            0,
+            0,
+            &PanelView::just(Mode::AgentPanel { sel: 1 }),
+        )
+        .0;
+        let ag_j = ag.join("\n");
+        assert!(
+            !ag_j.contains("\x1b[1;7m"),
+            "no section highlight when agents-focused either"
+        );
+        assert!(
+            line_with(&ag, "codex").contains(REVERSE),
+            "the selected item band is the focus cue"
+        );
+    }
+
+    #[test]
+    fn agent_panel_add_button_uses_the_unified_selection_band() {
+        let s = two_agent_snap();
+        // Cursor on an agent row: the "+ add" line is present but NOT the
+        // selection band.
+        let on_agent = render_at(
+            &s,
+            40,
+            80,
+            0,
+            0,
+            &PanelView::just(Mode::AgentPanel { sel: 0 }),
+        )
+        .0;
+        assert!(
+            line_with(&on_agent, "+ add agent").contains("+ add agent"),
+            "add button present"
+        );
+        assert!(
+            !line_with(&on_agent, "+ add agent").contains(REVERSE),
+            "+ add not banded when an agent row is selected"
+        );
+        // Cursor on the "+ add" row (index == agents.len()): it gets the
+        // SAME full-row band as a selected agent — so it's unmistakable.
+        let on_add = render_at(
+            &s,
+            40,
+            80,
+            0,
+            0,
+            &PanelView::just(Mode::AgentPanel { sel: 2 }),
+        )
+        .0;
+        assert!(
+            line_with(&on_add, "+ add agent").contains(REVERSE),
+            "+ add row is the unified selection band when selected"
+        );
+    }
+
+    #[test]
+    fn add_picker_is_full_screen_with_invocation_and_selection() {
+        let s = two_agent_snap();
+        let mut ruthless = cand("ruthless", "claude", "claude --model opus");
+        ruthless.description = Some("tears through code".to_string());
+        let picker = vec![ruthless, cand("scout", "codex", "codex")];
+        let out = render_at(
+            &s,
+            40,
+            80,
+            0,
+            0,
+            &PanelView {
+                mode: Mode::AddPicker { sel: 0 },
+                picker: &picker,
+                log_cursor: 0,
+            },
+        )
+        .0;
+        let j = out.join("\n");
+        assert!(j.contains("ADD A REVIEWER"), "full-screen title");
+        // It REPLACES the normal layout: no gauges/log leak through.
+        assert!(
+            !j.contains("git"),
+            "full screen, not the normal layout: {j}"
+        );
+        // Each candidate shows its invocation args + (when set) a desc.
+        assert!(j.contains("claude --model opus"), "invocation args shown");
+        assert!(
+            j.contains("tears through code"),
+            "initial_prompt description"
+        );
+        assert!(j.contains("scout"), "second candidate listed");
+        assert!(j.contains("Esc cancel"), "footer hint");
+        // The selected candidate is the unified selection band.
+        assert!(
+            line_with(&out, "ruthless").contains(REVERSE),
+            "selected candidate is the band"
+        );
+    }
+
+    #[test]
+    fn add_picker_clamps_to_rows_and_collapses_multiline_descriptions() {
+        let s = two_agent_snap();
+        let mut multiline = cand("ruthless", "claude", "claude --model opus");
+        multiline.description = Some("first line\nsecond line\nthird line".to_string());
+        let picker = vec![
+            multiline,
+            cand("scout", "codex", "codex"),
+            cand("gizmo", "claude", "claude"),
+        ];
+        let view = PanelView {
+            mode: Mode::AddPicker { sel: 0 },
+            picker: &picker,
+            log_cursor: 0,
+        };
+
+        // Tiny pane: never more lines than rows, and no element spans
+        // multiple terminal rows (no embedded newline).
+        let tiny = render_at(&s, 4, 40, 0, 0, &view).0;
+        assert!(
+            tiny.len() <= 4,
+            "picker clamped to rows: got {}",
+            tiny.len()
+        );
+        assert!(
+            tiny.iter().all(|l| !l.contains('\n')),
+            "every picker line is a single terminal row"
+        );
+
+        // Roomy pane: the multiline initial_prompt collapses to its
+        // first line — later lines never reach the screen.
+        let big = render_at(&s, 40, 60, 0, 0, &view).0.join("\n");
+        assert!(big.contains("first line"), "description first line shown");
+        assert!(
+            !big.contains("second line") && !big.contains("third line"),
+            "later description lines dropped: {big}"
+        );
+    }
+
+    #[test]
+    fn add_picker_empty_state_points_at_global() {
+        let s = two_agent_snap();
+        let out = render_at(
+            &s,
+            40,
+            80,
+            0,
+            0,
+            &PanelView::just(Mode::AddPicker { sel: 0 }),
+        )
+        .0
+        .join("\n");
+        assert!(
+            out.contains("no agents available") && out.contains("--global"),
+            "empty picker points at `clank agent add --global`: {out}"
+        );
+    }
+
+    #[test]
+    fn confirm_modal_names_action_consequence_and_default() {
+        let s = two_agent_snap();
+        // Remove: default No, Enter cancels.
+        let rm = render_at(
+            &s,
+            40,
+            80,
+            0,
+            0,
+            &PanelView::just(Mode::Confirm {
+                action: ConfirmAction::RemoveAgent { idx: 1 },
+            }),
+        )
+        .0
+        .join("\n");
+        assert!(rm.contains("remove reviewer"), "names the action");
+        assert!(rm.contains("codex"), "names the target");
+        assert!(
+            rm.contains("committed team config"),
+            "names the consequence"
+        );
+        assert!(
+            rm.contains("[N]o") && rm.contains("⏎ = no"),
+            "remove default is No"
+        );
+
+        // Add: default Yes.
+        let picker = vec![cand("ruthless", "claude", "claude")];
+        let add = render_at(
+            &s,
+            40,
+            80,
+            0,
+            0,
+            &PanelView {
+                mode: Mode::Confirm {
+                    action: ConfirmAction::AddCandidate { idx: 0 },
+                },
+                picker: &picker,
+                log_cursor: 0,
+            },
+        )
+        .0
+        .join("\n");
+        assert!(add.contains("add reviewer") && add.contains("ruthless"));
+        assert!(
+            add.contains("[Y]es") && add.contains("⏎ = yes"),
+            "add default is Yes"
+        );
+    }
+
+    #[test]
+    fn panel_shows_reviewer_tiers() {
+        use crate::cli::teams_config::RosterRole;
+        use clank_core::vocab::AutoMode;
+        let mut s = two_agent_snap();
+        s.agents = vec![
+            agent_row("claude", RosterRole::Master, AutoMode::On),
+            agent_row("codex", RosterRole::Commit, AutoMode::Off),
+            agent_row("ruthless", RosterRole::Gate, AutoMode::On),
+        ];
+        let out = render_at(
+            &s,
+            40,
+            80,
+            0,
+            0,
+            &PanelView::just(Mode::AgentPanel { sel: 0 }),
+        )
+        .0
+        .join("\n");
+        // The kinds are distinguishable: master / commit / gate, not a
+        // flat "reviewer".
+        assert!(out.contains("master"), "master tier shown");
+        assert!(out.contains("commit"), "commit tier shown");
+        assert!(out.contains("gate"), "gate tier shown");
+        assert!(!out.contains("reviewer"), "no flat 'reviewer' label: {out}");
+    }
+
+    #[test]
+    fn detail_page_renders_info_actions_and_reduced_master_set() {
+        use crate::cli::teams_config::RosterRole;
+        use clank_core::vocab::AutoMode;
+        let mut s = two_agent_snap();
+        let mut codex = agent_row("codex", RosterRole::Commit, AutoMode::Off);
+        codex.invocation = "codex --profile deep".to_string();
+        codex.description = Some("line one\nline two".to_string());
+        s.agents = vec![agent_row("claude", RosterRole::Master, AutoMode::On), codex];
+
+        // Reviewer detail (idx 1): info + full action set; the multiline
+        // purpose collapses to one line; the selected action is banded.
+        let rev = render_at(
+            &s,
+            40,
+            80,
+            0,
+            0,
+            &PanelView::just(Mode::AgentDetail { idx: 1, sel: 1 }),
+        )
+        .0;
+        let rev_j = rev.join("\n");
+        assert!(rev_j.contains("AGENT · CODEX"), "detail title");
+        assert!(rev_j.contains("codex --profile deep"), "invocation shown");
+        assert!(
+            rev_j.contains("line one") && !rev_j.contains("line two"),
+            "purpose one-lined"
+        );
+        assert!(
+            rev_j.contains("switch tier → gate"),
+            "tier action names the target"
+        );
+        assert!(rev_j.contains("promote to master") && rev_j.contains("remove from team"));
+        assert!(
+            line_with(&rev, "switch tier").contains(REVERSE),
+            "selected action is the unified band"
+        );
+        // Full screen: not the normal layout.
+        assert!(!rev_j.contains("git"), "detail replaces the normal layout");
+
+        // Master detail (idx 0): reduced — no tier/promote/remove.
+        let mas = render_at(
+            &s,
+            40,
+            80,
+            0,
+            0,
+            &PanelView::just(Mode::AgentDetail { idx: 0, sel: 0 }),
+        )
+        .0
+        .join("\n");
+        assert!(mas.contains("toggle auto"), "master keeps auto");
+        assert!(
+            !mas.contains("switch tier")
+                && !mas.contains("promote to master")
+                && !mas.contains("remove from team"),
+            "master's action set is reduced: {mas}"
+        );
+    }
+
+    #[test]
+    fn log_focused_highlights_the_cursor_entry() {
+        let mut s = two_agent_snap(); // has_panel
+        s.log_rows = vec![
+            commit_row("first"),
+            commit_row("second"),
+            commit_row("third"),
+        ];
+        // Log focused, cursor on the SECOND entry (seq index 1, since
+        // two_agent_snap has no ask/in-progress rows).
+        let view = PanelView {
+            mode: Mode::LogScroll,
+            picker: &[],
+            log_cursor: 1,
+        };
+        let lines = render_at(&s, 40, 80, 0, 0, &view).0;
+        assert!(
+            line_with(&lines, "second").contains(REVERSE),
+            "the cursor entry carries the unified selection band"
+        );
+        assert!(
+            !line_with(&lines, "first").contains(REVERSE),
+            "non-cursor entries are not banded"
+        );
+        // Focus the panel instead: no log entry is banded.
+        let panel = render_at(
+            &s,
+            40,
+            80,
+            0,
+            0,
+            &PanelView::just(Mode::AgentPanel { sel: 0 }),
+        )
+        .0;
+        assert!(
+            !line_with(&panel, "second").contains(REVERSE),
+            "no log cursor band when the panel is focused"
+        );
+    }
+
+    #[test]
+    fn pending_review_row_shows_spinner_name_and_reviewing() {
+        let s = snap(vec![plan_state("foo", reviewer_missing("codex"))], vec![]);
+        let out = render(&s, 40, 80).join("\n");
+        assert!(out.contains(SPINNER[0]), "frame-0 spinner glyph shown");
+        assert!(out.contains("codex"), "reviewer named");
+        assert!(out.contains("reviewing"), "italic wait-verb");
+    }
+
+    #[test]
+    fn master_row_shows_dashes_name_and_per_state_verb() {
+        let s = snap(vec![plan_state("foo", WaitingOn::MasterToContinue)], vec![]);
+        let out = render(&s, 40, 80).join("\n");
+        assert!(out.contains("-------"), "dashes where the sha would be");
+        assert!(out.contains("working"), "per-state italic verb");
+        // The finalizing case (the gap M2 missed): master named + verb.
+        let mut s = snap(vec![plan_state("foo", WaitingOn::MasterToFinalize)], vec![]);
+        s.master = Some("claude".into());
+        let out = render(&s, 40, 80).join("\n");
+        assert!(out.contains("claude"), "master named");
+        assert!(out.contains("finalizing"), "finalizing verb shown");
+    }
+
+    #[test]
+    fn active_pr_review_is_not_idle() {
+        // codex c04c324: a repo with an active PR review and no plans
+        // must NOT render idle, in the TUI bar OR `clank status`.
+        let mut s = snap(vec![], vec![]);
+        s.pr_reviews.push(clank_core::wait::PrReviewWorkState {
+            pr: 123,
+            repo: "o/r".into(),
+            round: 1,
+            gate: clank_core::vocab::CommitGateState::Unreviewed,
+            missing_reviewers: vec![AgentLabel::parse("codex").unwrap()],
+        });
+        let bar = visible(&render(&s, 1, 80)[0]);
+        assert!(
+            bar.contains("CODEX") && bar.contains("pr #123"),
+            "bar: {bar}"
+        );
+        assert!(!bar.contains("idle"), "bar: {bar}");
+
+        let human = s.to_human();
+        assert!(human.contains("pr #123"), "to_human: {human}");
+        assert!(
+            !human.contains("nothing pending"),
+            "to_human must not read idle: {human}"
+        );
+    }
+
+    #[test]
+    fn pr_url_renders_as_a_clickable_link_line() {
+        let mut s = snap(vec![], vec![]);
+        s.pr_reviews.push(pr_work(1, &["codex"]));
+        let lines = render(&s, 40, 80);
+        let pr = lines
+            .iter()
+            .find(|l| visible(l).trim_start().starts_with("pr "))
+            .expect("a pr url line");
+        // Visible text is the bare URL (the `com`/`m` must NOT cut it
+        // short — visible() has to skip OSC 8).
+        assert_eq!(
+            visible(pr).trim_start(),
+            "pr  https://github.com/LLFourn/clank/pull/5"
+        );
+        // The OSC 8 hyperlink wraps it with the full URL as target.
+        assert!(
+            pr.contains("\x1b]8;;https://github.com/LLFourn/clank/pull/5\x1b\\"),
+            "OSC 8 link target: {pr:?}"
+        );
+    }
+
+    #[test]
+    fn round_zero_pr_bar_says_master_drafting_not_reviewing() {
+        // The reported bug: at round 0 the bar must show master
+        // drafting, NOT a reviewer "reviewing".
+        let mut s = snap(vec![], vec![]);
+        s.master = Some("claude".into());
+        s.pr_reviews.push(pr_work(0, &[]));
+        let bar = visible(&render(&s, 1, 80)[0]);
+        assert!(
+            bar.contains("CLAUDE") && bar.contains("drafting"),
+            "bar: {bar}"
+        );
+        assert!(!bar.contains("reviewing"), "bar: {bar}");
+        // And the text surface agrees.
+        let human = s.to_human();
+        assert!(human.contains("master drafting"), "to_human: {human}");
+    }
+
+    #[test]
+    fn block_reason_wraps_across_rows_within_width() {
+        let mut s = snap(vec![], vec![]);
+        s.blocks = vec![crate::cli::block::BlockEntry {
+            agent: "claude".into(),
+            name: "q".into(),
+            plan: None,
+            question: "the first line is long enough to wrap\nsecond paragraph".into(),
+            answer: None,
+        }];
+        let cols = 24;
+        let lines = render(&s, 20, cols as u16);
+        let texts: Vec<String> = lines.iter().map(|l| visible(l)).collect();
+        // The second paragraph is NOT dropped (the bug being fixed).
+        assert!(
+            texts.iter().any(|t| t.contains("second paragraph")),
+            "continuation must survive: {texts:?}"
+        );
+        // The long first line wrapped onto multiple ask rows (the
+        // first carries the `ask` gutter; continuations are indented).
+        let ask_rows = texts.iter().filter(|t| t.contains("first")).count()
+            + texts.iter().filter(|t| t.contains("wrap")).count();
+        assert!(ask_rows >= 1, "first line present: {texts:?}");
+        // Nothing exceeds the pane width.
+        for line in &lines {
+            assert!(
+                display_width(visible(line).trim_end()) <= cols,
+                "line wider than {cols}: `{line}`"
+            );
+        }
+    }
+
+    #[test]
+    fn bar_emoji_is_the_bars_leading_glyph() {
+        // Single source: bar_emoji == the first token of the bar's
+        // left segment, for every representative state.
+        let cases = vec![
+            snap(vec![], vec![]),                                             // idle
+            snap(vec![plan_state("foo", reviewer_missing("codex"))], vec![]), // reviewers
+            snap(vec![], vec!["queued"]),                                     // promote
+        ];
+        for s in &cases {
+            let (left, _) = bar_text(s);
+            let want = left.split_whitespace().next().unwrap();
+            assert_eq!(bar_emoji(s), want, "bar_emoji must match the bar: {left:?}");
+        }
+        // Idle is the sleeping glyph specifically.
+        assert_eq!(bar_emoji(&snap(vec![], vec![])), "💤");
     }
 }
