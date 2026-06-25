@@ -193,9 +193,11 @@ pub(crate) fn layout(rows: u16, cols: u16) -> Layout {
 
     if cols >= rows * 2 {
         // Landscape: status on the right, a vertical divider between.
-        let max_status = cols.saturating_sub(2); // ≥1 col main + 1 divider
+        // saturating_sub + max(1) keep every region ≥1 cell on a tiny
+        // terminal (no underflow / collapse); normal sizes tile exactly.
+        let max_status = cols.saturating_sub(2); // leave ≥1 main + 1 divider
         let status_cols = (cols / 3).clamp(20, 48).min(max_status).max(1);
-        let main_cols = cols - status_cols - 1;
+        let main_cols = cols.saturating_sub(status_cols + 1).max(1);
         Layout {
             main: rect(0, 0, content_rows, main_cols),
             divider: rect(main_cols, 0, content_rows, 1),
@@ -205,9 +207,9 @@ pub(crate) fn layout(rows: u16, cols: u16) -> Layout {
         }
     } else {
         // Portrait: status on the bottom, a horizontal divider between.
-        let max_status = content_rows.saturating_sub(2); // ≥1 row main + 1 divider
+        let max_status = content_rows.saturating_sub(2); // ≥1 main + 1 divider
         let status_rows = (content_rows / 3).clamp(6, 16).min(max_status).max(1);
-        let main_rows = content_rows - status_rows - 1;
+        let main_rows = content_rows.saturating_sub(status_rows + 1).max(1);
         Layout {
             main: rect(0, 0, main_rows, cols),
             divider: rect(0, main_rows, 1, cols),
@@ -524,6 +526,24 @@ mod tests {
         assert_eq!(l.status.rows, 23);
         assert_eq!(l.main.cols + 1 + l.status.cols, 80, "tile exactly");
         assert!(l.status.cols >= 20 && l.status.cols <= 48);
+    }
+
+    #[test]
+    fn layout_never_collapses_a_pane_on_tiny_terminals() {
+        // term_size can return any positive size; no underflow/panic
+        // and every region stays ≥1 cell.
+        for (r, c) in [(2, 2), (3, 3), (2, 80), (4, 6), (3, 100)] {
+            let l = layout(r, c);
+            assert!(l.main.rows >= 1 && l.main.cols >= 1, "main {r}x{c}: {l:?}");
+            assert!(
+                l.status.rows >= 1 && l.status.cols >= 1,
+                "status {r}x{c}: {l:?}"
+            );
+            assert!(
+                l.divider.rows >= 1 && l.divider.cols >= 1,
+                "divider {r}x{c}"
+            );
+        }
     }
 
     #[test]
