@@ -320,6 +320,13 @@ fn run_console(repo: &Path, specs: Vec<Spec>) -> anyhow::Result<()> {
                                 relayout(&screens, status_idx, layout, &mut frame, r, c);
                                 need_repaint = true;
                             }
+                            Action::Mouse(_ev) => {
+                                // Decoded so the mouse report is NEVER
+                                // injected into an agent as stray bytes.
+                                // Pane-aware selection (and forwarding to
+                                // agents that grabbed the mouse) land in
+                                // the next milestones; consumed for now.
+                            }
                             Action::None => {}
                         }
                     }

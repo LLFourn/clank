@@ -32,7 +32,13 @@ pub(crate) fn term_size() -> (u16, u16) {
 }
 
 const ENTER_SEQ: &str = "\x1b[?1049h\x1b[?25l"; // alt-screen + hide cursor
-const RESTORE_SEQ: &str = "\x1b[?25h\x1b[?1049l"; // show cursor + leave alt-screen
+// SGR mouse reporting (button + drag) for the console's own selection.
+const MOUSE_ON: &str = "\x1b[?1002h\x1b[?1006h";
+// Restore: leave mouse modes (harmless if never enabled), show cursor,
+// leave alt-screen. Mouse-disable is FIRST and lives here — the single
+// signal-safe restore path (Drop + panic hook + signal handler) — so a
+// crash never leaves the terminal spewing mouse escapes.
+const RESTORE_SEQ: &str = "\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?25h\x1b[?1049l";
 
 /// RAII alt-screen guard. `Drop` restores on every normal exit
 /// path; a panic hook covers `panic=abort` (where Drop won't run);
@@ -91,6 +97,12 @@ impl AltScreen {
         }
 
         print!("{ENTER_SEQ}");
+        // Full raw = the console: it owns the mouse for pane-aware
+        // selection. (status --tui, CookedSignals, leaves it to the
+        // terminal.) The matching disable is in RESTORE_SEQ.
+        if matches!(level, RawLevel::Full) {
+            print!("{MOUSE_ON}");
+        }
         let _ = std::io::stdout().flush();
 
         let prev = std::panic::take_hook();
@@ -123,7 +135,10 @@ impl Drop for AltScreen {
 }
 
 extern "C" fn restore_and_exit(sig: libc::c_int) {
-    const RESTORE: &[u8] = b"\x1b[?25h\x1b[?1049l";
+    // Mirrors RESTORE_SEQ: disable mouse modes FIRST, then cursor +
+    // alt-screen. Kept in sync by hand (this is a byte literal for the
+    // async-signal-safe path).
+    const RESTORE: &[u8] = b"\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?25h\x1b[?1049l";
     // SAFETY: tcsetattr, write, _exit are async-signal-safe; the ptr is
     // a leaked Box set once in `enter`, read atomically here.
     unsafe {

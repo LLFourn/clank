@@ -36,10 +36,71 @@ pub(crate) enum Action {
     /// status pane / divider) so native terminal selection copies the
     /// agent cleanly.
     ToggleZoom,
+    /// An SGR mouse event the loop must route: forward to the focused
+    /// child if it grabbed the mouse, else drive console selection.
+    Mouse(MouseEvent),
     /// Tear down every child and exit the console.
     Quit,
     /// A recognized-but-inert command (swallowed, no effect).
     None,
+}
+
+/// A decoded SGR mouse event (`CSI < Cb ; Cx ; Cy M|m`). `col`/`row`
+/// are 1-based terminal coordinates; `button` is the raw Cb (low 2
+/// bits = button, +32 motion, +64 wheel); `pressed` is `M` vs `m`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MouseEvent {
+    pub(crate) button: u16,
+    pub(crate) col: u16,
+    pub(crate) row: u16,
+    pub(crate) pressed: bool,
+}
+
+/// Parse one SGR mouse sequence at the front of `bytes` (`CSI < Cb ;
+/// Cx ; Cy M|m`). Returns `(consumed, event)`, or `None` if `bytes`
+/// doesn't start with a COMPLETE such sequence (so an incomplete one
+/// split across reads is forwarded as a plain ESC, never mis-decoded).
+fn parse_sgr_mouse(bytes: &[u8]) -> Option<(usize, MouseEvent)> {
+    let rest = bytes.strip_prefix(b"\x1b[<")?;
+    let mut nums = [0u16; 3];
+    let mut field = 0usize;
+    let mut cur: u32 = 0;
+    let mut saw_digit = false;
+    let mut i = 0usize;
+    let pressed = loop {
+        let &b = rest.get(i)?; // None → incomplete → caller forwards ESC
+        match b {
+            b'0'..=b'9' => {
+                cur = cur * 10 + u32::from(b - b'0');
+                if cur > u32::from(u16::MAX) {
+                    return None;
+                }
+                saw_digit = true;
+            }
+            b';' if field < 2 => {
+                nums[field] = cur as u16;
+                field += 1;
+                cur = 0;
+                saw_digit = false;
+            }
+            b'M' | b'm' if field == 2 && saw_digit => {
+                nums[2] = cur as u16;
+                i += 1; // consume the terminator
+                break b == b'M';
+            }
+            _ => return None,
+        }
+        i += 1;
+    };
+    Some((
+        3 + i,
+        MouseEvent {
+            button: nums[0],
+            col: nums[1],
+            row: nums[2],
+            pressed,
+        },
+    ))
 }
 
 const ESC: u8 = 0x1b;
@@ -86,6 +147,15 @@ pub(crate) fn route(mode: Mode, bytes: &[u8]) -> (usize, Mode, Action) {
             }
             if bytes[0] != ESC {
                 return (1, Mode::Passthrough, Action::Forward(vec![bytes[0]]));
+            }
+            // SGR mouse report (CSI < …) — decode it so the loop can
+            // route it (forward to the agent or select); an incomplete
+            // one falls through and forwards the ESC.
+            if bytes.starts_with(b"\x1b[<") {
+                if let Some((consumed, ev)) = parse_sgr_mouse(bytes) {
+                    return (consumed, Mode::Passthrough, Action::Mouse(ev));
+                }
+                return (1, Mode::Passthrough, Action::Forward(vec![ESC]));
             }
             // ESC-prefixed. Only a recognized Meta chord in the SAME
             // burst is a console action; everything else forwards.
@@ -436,6 +506,49 @@ mod tests {
         assert_eq!(
             route(Mode::Leader, b"0"),
             (1, Mode::Passthrough, Action::FollowActive)
+        );
+    }
+
+    #[test]
+    fn sgr_mouse_parses_press_release_and_big_coords() {
+        // Left press at (col 5, row 10).
+        assert_eq!(
+            route(Mode::Passthrough, b"\x1b[<0;5;10M"),
+            (
+                10,
+                Mode::Passthrough,
+                Action::Mouse(MouseEvent {
+                    button: 0,
+                    col: 5,
+                    row: 10,
+                    pressed: true
+                })
+            )
+        );
+        // Release (m), and coordinates past 223 (the point of SGR mode).
+        assert_eq!(
+            route(Mode::Passthrough, b"\x1b[<0;500;300m"),
+            (
+                13,
+                Mode::Passthrough,
+                Action::Mouse(MouseEvent {
+                    button: 0,
+                    col: 500,
+                    row: 300,
+                    pressed: false
+                })
+            )
+        );
+        // Drag (motion bit 32) and wheel (bit 64) carry their bits.
+        let (_, _, drag) = route(Mode::Passthrough, b"\x1b[<32;5;10M");
+        assert!(matches!(drag, Action::Mouse(e) if e.button == 32));
+        let (_, _, wheel) = route(Mode::Passthrough, b"\x1b[<64;5;10M");
+        assert!(matches!(wheel, Action::Mouse(e) if e.button & 64 != 0));
+        // An INCOMPLETE sequence (split across reads) forwards the ESC,
+        // never mis-decodes.
+        assert_eq!(
+            route(Mode::Passthrough, b"\x1b[<0;5"),
+            (1, Mode::Passthrough, Action::Forward(vec![0x1b]))
         );
     }
 
