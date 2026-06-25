@@ -256,6 +256,24 @@ struct CommitDetail {
     offset: usize,
 }
 
+/// A reviewer's feedback as shown in the detail view: the full message
+/// MINUS the leading verdict word (the verdict is already drawn as a
+/// mark, so repeating "CONTINUE"/"REQUEST_CHANGES" would be noise). That
+/// is the summary line + the details body — parsed via `FeedbackBody`,
+/// the SAME path the log's review rows use, so the two never diverge.
+/// (`details()` alone would drop a summary-only review's only content.)
+fn feedback_display_body(raw: &str) -> String {
+    let fb = clank_core::feedback_body::FeedbackBody::parse(raw);
+    let summary = fb.summary();
+    let details = fb.details();
+    match (summary.is_empty(), details.is_empty()) {
+        (false, false) => format!("{summary}\n\n{details}"),
+        (false, true) => summary,
+        (true, false) => details,
+        (true, true) => String::new(),
+    }
+}
+
 /// Fetch the commit subject/body (gix) and every reviewer's verdict +
 /// full feedback body for `sha`. `FeedbackView` carries only the verdict
 /// and a repo-relative `source_path` per entry, so the body is read from
@@ -278,9 +296,13 @@ fn fetch_commit_detail(
                     c.entries
                         .into_iter()
                         .map(|(label, entry)| {
-                            let rbody = std::fs::read_to_string(repo.join(&entry.source_path))
+                            let raw = std::fs::read_to_string(repo.join(&entry.source_path))
                                 .unwrap_or_default();
-                            (label.as_str().to_string(), entry.verdict, rbody)
+                            (
+                                label.as_str().to_string(),
+                                entry.verdict,
+                                feedback_display_body(&raw),
+                            )
                         })
                         .collect()
                 })
@@ -799,6 +821,22 @@ pub(crate) mod tests {
         assert!(!v.fill);
         v.request_fill();
         assert!(v.fill, "input/data/resize re-arm the fill");
+    }
+
+    #[test]
+    fn feedback_display_body_drops_verdict_word_keeps_content() {
+        // The verdict is drawn as a mark, so the body must NOT repeat the
+        // verdict header — but it must keep the reviewer's full message.
+        let body = feedback_display_body("CONTINUE summary\n\nfull review");
+        assert_eq!(body, "summary\n\nfull review");
+        assert!(!body.contains("CONTINUE"), "verdict word not repeated");
+        // A summary-only review keeps its content (details() alone drops it).
+        assert_eq!(feedback_display_body("CONTINUE lgtm"), "lgtm");
+        // Request-changes with a details body.
+        assert_eq!(
+            feedback_display_body("REQUEST_CHANGES needs work\n\ndetails here"),
+            "needs work\n\ndetails here"
+        );
     }
 
     #[test]
