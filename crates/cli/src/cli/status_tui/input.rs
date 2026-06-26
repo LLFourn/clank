@@ -134,10 +134,11 @@ pub(super) fn is_toggle(action: DetailAction) -> bool {
     matches!(action, DetailAction::ToggleAuto | DetailAction::SwitchTier)
 }
 
-/// Pure key routing for the detail page. ↑↓ move the cursor; Enter/Space
-/// activate ANY row (a toggle flips in place; an action opens its flow);
-/// ←/→ flip ONLY a toggle row — so a directional key can never fire the
-/// destructive `Remove` or `PromoteToMaster`.
+/// Pure key routing for the detail page. ↑↓ move the cursor; ←/→/␣ "change"
+/// — they flip ONLY a toggle row (a no-op on an action row), so a stray
+/// directional or space key can never fire the destructive `Remove` or
+/// `PromoteToMaster`; only `Enter` "selects" (activates) an action. This
+/// matches the hint exactly (←→ ␣ change · ⏎ select).
 pub(super) fn agent_detail_nav(sel: usize, actions: &[DetailAction], key: Key) -> DetailNav {
     let current = || actions.get(sel).copied().unwrap_or(DetailAction::Back);
     match key {
@@ -145,8 +146,10 @@ pub(super) fn agent_detail_nav(sel: usize, actions: &[DetailAction], key: Key) -
         Key::Escape | Key::Focus => DetailNav::Back,
         Key::Up => DetailNav::MoveCursor(move_selection(sel, actions.len(), false)),
         Key::Down => DetailNav::MoveCursor(move_selection(sel, actions.len(), true)),
-        Key::Enter | Key::Space => DetailNav::Activate(current()),
-        Key::Left | Key::Right if is_toggle(current()) => DetailNav::Activate(current()),
+        Key::Enter => DetailNav::Activate(current()),
+        Key::Left | Key::Right | Key::Space if is_toggle(current()) => {
+            DetailNav::Activate(current())
+        }
         _ => DetailNav::None,
     }
 }
@@ -533,16 +536,14 @@ mod tests {
                 "{key:?} cycles the toggle row"
             );
         }
-        // ...but ←/→ must NEVER fire an action row (the destructive guard):
-        // a directional key on Remove is a no-op; only Enter/Space activate.
+        // ...but the "change" keys (←/→/␣) must NEVER fire an action row
+        // (the destructive guard) — they're a no-op on Remove; only Enter
+        // "selects" (activates) it, which routes to the confirm modal.
         assert_eq!(agent_detail_nav(2, &actions, Key::Left), DetailNav::None);
         assert_eq!(agent_detail_nav(2, &actions, Key::Right), DetailNav::None);
+        assert_eq!(agent_detail_nav(2, &actions, Key::Space), DetailNav::None);
         assert_eq!(
             agent_detail_nav(2, &actions, Key::Enter),
-            DetailNav::Activate(Remove)
-        );
-        assert_eq!(
-            agent_detail_nav(2, &actions, Key::Space),
             DetailNav::Activate(Remove)
         );
     }
