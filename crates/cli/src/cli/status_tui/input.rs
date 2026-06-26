@@ -4,7 +4,7 @@
 //! No IO — the effectful appliers (roster mutations) live in the loop
 //! (the IO shell), so this whole module is unit-tested headless.
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Key {
     Up,
     Down,

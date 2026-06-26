@@ -410,6 +410,34 @@ fn deferred_wait(
     }
 }
 
+/// A drained burst of loop events collapsed for ONE pass: keystrokes in
+/// arrival order, and ANY number of `Refresh`/`Resize` folded to a single
+/// flag each. So a storm of watcher wakes costs one repaint + at most one
+/// (throttled) rebuild, not one per event.
+struct Batch {
+    keys: Vec<Key>,
+    refresh: bool,
+    resize: bool,
+}
+
+/// Fold a drained event burst into a [`Batch`]. Pure → unit-tested (the
+/// "N wakes → one refresh" coalescing guarantee).
+fn coalesce(events: impl IntoIterator<Item = Ev>) -> Batch {
+    let mut b = Batch {
+        keys: Vec::new(),
+        refresh: false,
+        resize: false,
+    };
+    for ev in events {
+        match ev {
+            Ev::Key(k) => b.keys.push(k),
+            Ev::Refresh => b.refresh = true,
+            Ev::Resize => b.resize = true,
+        }
+    }
+    b
+}
+
 /// The `--tui` loop, fully event-driven: the watcher covers the
 /// working tree (gitignore-filtered), `.clank/`, and the git dir;
 /// SIGWINCH arrives on the same channel, so a resize is just
@@ -511,7 +539,9 @@ pub(crate) async fn run_tui(
         .checked_sub(REBUILD_MIN)
         .unwrap_or_else(std::time::Instant::now);
     let mut refresh_pending = false;
-    loop {
+    // Labeled so a `Quit` key inside the per-key drain loop exits the
+    // event loop, not just the inner `for`.
+    'evloop: loop {
         let (rows, cols) = term_size();
 
         // The commit-detail overlay owns the whole pane until dismissed:
@@ -640,197 +670,211 @@ pub(crate) async fn run_tui(
         let wait = deferred_wait(base, refresh_pending, last_rebuild.elapsed(), REBUILD_MIN);
 
         match ev_rx.recv_timeout(wait) {
-            // Keys only move the viewport; the loop top loads more if the
-            // new position needs it.
-            Ok(Ev::Key(k)) => {
-                let page = (rows as usize).saturating_sub(3).max(1);
-                // `mode` is Copy: matching it copies, so reassigning `mode`
-                // inside an arm is free of borrow conflicts. The per-mode
-                // routing is PURE (agent_panel_action / agent_detail_nav /
-                // confirm_decision); the loop only executes the result
-                // (where IO happens).
-                match mode {
-                    Mode::AgentPanel { sel } => {
-                        match agent_panel_action(sel, &snapshot.agents, k) {
-                            PanelAction::Quit => break,
-                            PanelAction::LeaveFocus => {
-                                mode = mode.toggle_focus(snapshot.agents.len())
-                            }
-                            PanelAction::MoveCursor(s) => mode = Mode::AgentPanel { sel: s },
-                            PanelAction::EnterLog => {
-                                // Cross into the log at the FIRST entry.
-                                log.enter_first();
-                                mode = Mode::LogScroll;
-                            }
-                            PanelAction::ToggleAuto(i) => {
-                                if let Some(row) = snapshot.agents.get(i) {
-                                    let next = flip_auto(row.auto_mode);
-                                    if let Ok(label) =
-                                        clank_core::ids::AgentLabel::parse(&row.label)
-                                    {
-                                        // Single source for the write
-                                        // (preserves wait_timeout). On
-                                        // success, flip the in-memory lamp
-                                        // for an immediate repaint; the
-                                        // config write also bumps the input
-                                        // signature, so the watcher Refresh
-                                        // reconciles to the same value.
-                                        if crate::agent_store::set_auto_mode(&repo, &label, next)
-                                            .is_ok()
+            // Drain the whole queued burst in ONE pass: keystrokes apply
+            // in arrival order, and any number of Refresh/Resize fold to a
+            // single flag (coalesce), so a watcher storm costs one repaint
+            // — not one loop turn per event.
+            Ok(first) => {
+                let batch = coalesce(
+                    std::iter::once(first).chain(std::iter::from_fn(|| ev_rx.try_recv().ok())),
+                );
+                for k in batch.keys {
+                    let page = (rows as usize).saturating_sub(3).max(1);
+                    // `mode` is Copy: matching it copies, so reassigning `mode`
+                    // inside an arm is free of borrow conflicts. The per-mode
+                    // routing is PURE (agent_panel_action / agent_detail_nav /
+                    // confirm_decision); the loop only executes the result
+                    // (where IO happens).
+                    match mode {
+                        Mode::AgentPanel { sel } => {
+                            match agent_panel_action(sel, &snapshot.agents, k) {
+                                PanelAction::Quit => break 'evloop,
+                                PanelAction::LeaveFocus => {
+                                    mode = mode.toggle_focus(snapshot.agents.len())
+                                }
+                                PanelAction::MoveCursor(s) => mode = Mode::AgentPanel { sel: s },
+                                PanelAction::EnterLog => {
+                                    // Cross into the log at the FIRST entry.
+                                    log.enter_first();
+                                    mode = Mode::LogScroll;
+                                }
+                                PanelAction::ToggleAuto(i) => {
+                                    if let Some(row) = snapshot.agents.get(i) {
+                                        let next = flip_auto(row.auto_mode);
+                                        if let Ok(label) =
+                                            clank_core::ids::AgentLabel::parse(&row.label)
                                         {
-                                            snapshot.agents[i].auto_mode = next;
+                                            // Single source for the write
+                                            // (preserves wait_timeout). On
+                                            // success, flip the in-memory lamp
+                                            // for an immediate repaint; the
+                                            // config write also bumps the input
+                                            // signature, so the watcher Refresh
+                                            // reconciles to the same value.
+                                            if crate::agent_store::set_auto_mode(
+                                                &repo, &label, next,
+                                            )
+                                            .is_ok()
+                                            {
+                                                snapshot.agents[i].auto_mode = next;
+                                            }
                                         }
                                     }
                                 }
-                            }
-                            PanelAction::OpenPicker => {
-                                // Read the candidates FRESH right now.
-                                picker = crate::cli::status::available_agents(
-                                    home.as_deref(),
-                                    &snapshot.agents,
-                                );
-                                mode = Mode::AddPicker { sel: 0 };
-                            }
-                            PanelAction::OpenDetail(i) => {
-                                mode = Mode::AgentDetail { idx: i, sel: 0 };
-                            }
-                            PanelAction::None => {}
-                        }
-                    }
-                    // Detail page: a selectable action menu over one agent.
-                    Mode::AgentDetail { idx, sel } => {
-                        let role = snapshot.agents.get(idx).map(|a| a.role);
-                        let actions = role.map(detail_actions).unwrap_or_default();
-                        match agent_detail_nav(sel, &actions, k) {
-                            DetailNav::Quit => break,
-                            DetailNav::Back => mode = Mode::AgentPanel { sel: idx },
-                            DetailNav::MoveCursor(s) => mode = Mode::AgentDetail { idx, sel: s },
-                            DetailNav::Activate(action) => {
-                                mode = apply_detail_action(action, idx, sel, &mut snapshot, &repo);
-                            }
-                            DetailNav::None => {}
-                        }
-                    }
-                    // Picker: choose a candidate to add.
-                    Mode::AddPicker { sel } => match k {
-                        Key::Quit => break,
-                        // Esc/Tab close the picker back onto the +add row.
-                        Key::Escape | Key::Focus => {
-                            picker.clear();
-                            mode = Mode::AgentPanel {
-                                sel: snapshot.agents.len(),
-                            };
-                        }
-                        Key::Up => {
-                            mode = Mode::AddPicker {
-                                sel: move_selection(sel, picker.len(), false),
+                                PanelAction::OpenPicker => {
+                                    // Read the candidates FRESH right now.
+                                    picker = crate::cli::status::available_agents(
+                                        home.as_deref(),
+                                        &snapshot.agents,
+                                    );
+                                    mode = Mode::AddPicker { sel: 0 };
+                                }
+                                PanelAction::OpenDetail(i) => {
+                                    mode = Mode::AgentDetail { idx: i, sel: 0 };
+                                }
+                                PanelAction::None => {}
                             }
                         }
-                        Key::Down => {
-                            mode = Mode::AddPicker {
-                                sel: move_selection(sel, picker.len(), true),
+                        // Detail page: a selectable action menu over one agent.
+                        Mode::AgentDetail { idx, sel } => {
+                            let role = snapshot.agents.get(idx).map(|a| a.role);
+                            let actions = role.map(detail_actions).unwrap_or_default();
+                            match agent_detail_nav(sel, &actions, k) {
+                                DetailNav::Quit => break 'evloop,
+                                DetailNav::Back => mode = Mode::AgentPanel { sel: idx },
+                                DetailNav::MoveCursor(s) => {
+                                    mode = Mode::AgentDetail { idx, sel: s }
+                                }
+                                DetailNav::Activate(action) => {
+                                    mode =
+                                        apply_detail_action(action, idx, sel, &mut snapshot, &repo);
+                                }
+                                DetailNav::None => {}
                             }
                         }
-                        Key::Enter => {
-                            if sel < picker.len() {
-                                mode = Mode::Confirm {
-                                    action: ConfirmAction::AddCandidate { idx: sel },
+                        // Picker: choose a candidate to add.
+                        Mode::AddPicker { sel } => match k {
+                            Key::Quit => break 'evloop,
+                            // Esc/Tab close the picker back onto the +add row.
+                            Key::Escape | Key::Focus => {
+                                picker.clear();
+                                mode = Mode::AgentPanel {
+                                    sel: snapshot.agents.len(),
+                                };
+                            }
+                            Key::Up => {
+                                mode = Mode::AddPicker {
+                                    sel: move_selection(sel, picker.len(), false),
+                                }
+                            }
+                            Key::Down => {
+                                mode = Mode::AddPicker {
+                                    sel: move_selection(sel, picker.len(), true),
+                                }
+                            }
+                            Key::Enter => {
+                                if sel < picker.len() {
+                                    mode = Mode::Confirm {
+                                        action: ConfirmAction::AddCandidate { idx: sel },
+                                    };
+                                }
+                            }
+                            Key::Space
+                            | Key::PageUp
+                            | Key::PageDown
+                            | Key::Top
+                            | Key::Bottom
+                            | Key::Delete
+                            | Key::Left
+                            | Key::Yes
+                            | Key::No => {}
+                        },
+                        // Confirm: one decision, resolved in one place.
+                        Mode::Confirm { action } => {
+                            if let Some(go) = confirm_decision(action, k) {
+                                if go {
+                                    apply_confirm(
+                                        action,
+                                        &repo,
+                                        home.as_deref(),
+                                        &snapshot,
+                                        &picker,
+                                    );
+                                }
+                                picker.clear();
+                                // Back to the panel (on the +add row); the
+                                // config write (if any) triggers a Refresh that
+                                // rebuilds the roster, and its clamp re-bounds
+                                // this cursor if the roster shrank.
+                                mode = Mode::AgentPanel {
+                                    sel: snapshot.agents.len(),
                                 };
                             }
                         }
-                        Key::Space
-                        | Key::PageUp
-                        | Key::PageDown
-                        | Key::Top
-                        | Key::Bottom
-                        | Key::Delete
-                        | Key::Left
-                        | Key::Yes
-                        | Key::No => {}
-                    },
-                    // Confirm: one decision, resolved in one place.
-                    Mode::Confirm { action } => {
-                        if let Some(go) = confirm_decision(action, k) {
-                            if go {
-                                apply_confirm(action, &repo, home.as_deref(), &snapshot, &picker);
-                            }
-                            picker.clear();
-                            // Back to the panel (on the +add row); the
-                            // config write (if any) triggers a Refresh that
-                            // rebuilds the roster, and its clamp re-bounds
-                            // this cursor if the roster shrank.
-                            mode = Mode::AgentPanel {
-                                sel: snapshot.agents.len(),
-                            };
-                        }
-                    }
-                    // Default: the log is a selectable timeline — keys move
-                    // the CURSOR entry (the viewport follows via
-                    // scroll_to_show at the loop top). `Up` on the first
-                    // entry crosses back into the panel (continuous nav).
-                    Mode::LogScroll => match k {
-                        Key::Quit => break,
-                        Key::Focus => mode = mode.toggle_focus(snapshot.agents.len()),
-                        Key::Up => match log_up_target(log.cursor, snapshot.agents.len()) {
-                            Some(sel) => mode = Mode::AgentPanel { sel },
-                            None => log.up(),
-                        },
-                        Key::Down => log.down(),
-                        Key::PageUp => log.page_up(page),
-                        Key::Space | Key::PageDown => log.page_down(page),
-                        Key::Top => log.jump_top(),
-                        Key::Bottom => log.jump_bottom(total),
-                        // Enter drills into the entry under the cursor:
-                        // build the same scroll sequence the cursor indexes,
-                        // map the entry to its document, fetch + open the
-                        // overlay. A commit/review opens the commit detail (a
-                        // review scrolled to that reviewer's feedback); a plan
-                        // header opens the plan's rendered markdown. Ask /
-                        // in-progress / ad-hoc rows resolve to None.
-                        Key::Enter => {
-                            let seq = build_scroll(&snapshot, &ask_lines, &in_prog);
-                            match entry_overlay_target(&seq, log.cursor) {
-                                Some(OverlayTarget::Commit { sha, focus }) => {
-                                    if let Some(data) = fetch_commit_detail(&repo, &sha) {
-                                        let offset = match &focus {
-                                            Some(author) => commit_review_offset(
-                                                &data.short,
-                                                &data.subject,
-                                                &data.body,
-                                                &data.reviews,
-                                                author,
-                                                cols as usize,
-                                            ),
-                                            None => 0,
-                                        };
-                                        detail = Some(Overlay::commit(data, offset));
+                        // Default: the log is a selectable timeline — keys move
+                        // the CURSOR entry (the viewport follows via
+                        // scroll_to_show at the loop top). `Up` on the first
+                        // entry crosses back into the panel (continuous nav).
+                        Mode::LogScroll => match k {
+                            Key::Quit => break 'evloop,
+                            Key::Focus => mode = mode.toggle_focus(snapshot.agents.len()),
+                            Key::Up => match log_up_target(log.cursor, snapshot.agents.len()) {
+                                Some(sel) => mode = Mode::AgentPanel { sel },
+                                None => log.up(),
+                            },
+                            Key::Down => log.down(),
+                            Key::PageUp => log.page_up(page),
+                            Key::Space | Key::PageDown => log.page_down(page),
+                            Key::Top => log.jump_top(),
+                            Key::Bottom => log.jump_bottom(total),
+                            // Enter drills into the entry under the cursor:
+                            // build the same scroll sequence the cursor indexes,
+                            // map the entry to its document, fetch + open the
+                            // overlay. A commit/review opens the commit detail (a
+                            // review scrolled to that reviewer's feedback); a plan
+                            // header opens the plan's rendered markdown. Ask /
+                            // in-progress / ad-hoc rows resolve to None.
+                            Key::Enter => {
+                                let seq = build_scroll(&snapshot, &ask_lines, &in_prog);
+                                match entry_overlay_target(&seq, log.cursor) {
+                                    Some(OverlayTarget::Commit { sha, focus }) => {
+                                        if let Some(data) = fetch_commit_detail(&repo, &sha) {
+                                            let offset = match &focus {
+                                                Some(author) => commit_review_offset(
+                                                    &data.short,
+                                                    &data.subject,
+                                                    &data.body,
+                                                    &data.reviews,
+                                                    author,
+                                                    cols as usize,
+                                                ),
+                                                None => 0,
+                                            };
+                                            detail = Some(Overlay::commit(data, offset));
+                                        }
                                     }
+                                    Some(OverlayTarget::Plan { stem }) => {
+                                        let md = read_plan_markdown(&repo, &stem);
+                                        detail = Some(Overlay::plan(stem, md));
+                                    }
+                                    None => {}
                                 }
-                                Some(OverlayTarget::Plan { stem }) => {
-                                    let md = read_plan_markdown(&repo, &stem);
-                                    detail = Some(Overlay::plan(stem, md));
-                                }
-                                None => {}
                             }
-                        }
-                        Key::Escape | Key::Left | Key::Delete | Key::Yes | Key::No => {}
-                    },
+                            Key::Escape | Key::Left | Key::Delete | Key::Yes | Key::No => {}
+                        },
+                    }
+                    log.request_fill();
                 }
-                log.request_fill();
-            }
-            // A data-change wake is COALESCED + THROTTLED: just flag it
-            // here; the trailing-edge flush after the match rebuilds at
-            // most once per REBUILD_MIN, so a churny tree can't drive the
-            // rebuild loop hot. (Keys/resize below are NOT throttled.)
-            Ok(Ev::Refresh) => {
-                refresh_pending = true;
-            }
-            // Resize: not a data change, so no signature probe and no
-            // rebuild — just top up the (possibly taller) viewport and
-            // repaint. The loop top re-reads `term_size`; the fill is a
-            // no-op when the viewport is already full.
-            Ok(Ev::Resize) => {
-                log.request_fill();
+                // A data-change wake is COALESCED + THROTTLED: flag it; the
+                // trailing-edge flush after the match rebuilds at most once
+                // per REBUILD_MIN, so a churny tree can't drive the rebuild
+                // loop hot. Resize tops up the (possibly taller) viewport.
+                if batch.refresh {
+                    refresh_pending = true;
+                }
+                if batch.resize {
+                    log.request_fill();
+                }
             }
             // Animation tick: advance the frame ONLY. `fill` stays false,
             // so the next iteration is a PURE repaint — render_at (pure) +
@@ -1014,6 +1058,28 @@ pub(crate) mod tests {
             deferred_wait(spinner, true, Duration::from_millis(100), min),
             spinner
         );
+    }
+
+    #[test]
+    fn coalesce_collapses_a_burst_to_one_refresh() {
+        // A storm of N Refresh (plus a key and a resize) → exactly ONE
+        // refresh flag (so at most one throttled rebuild), the key kept in
+        // order, resize folded — ONE pass, not N loop turns.
+        let b = coalesce(vec![
+            Ev::Refresh,
+            Ev::Key(Key::Down),
+            Ev::Refresh,
+            Ev::Resize,
+            Ev::Refresh,
+        ]);
+        assert!(b.refresh, "many Refresh fold to one flag");
+        assert!(b.resize, "Resize folded");
+        assert_eq!(b.keys, vec![Key::Down], "keys preserved in order");
+        // 100 wakes still yield a single refresh flag and no spurious keys.
+        let many = coalesce((0..100).map(|_| Ev::Refresh));
+        assert!(many.refresh);
+        assert!(many.keys.is_empty());
+        assert!(!many.resize);
     }
 
     #[test]
