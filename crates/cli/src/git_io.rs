@@ -631,6 +631,53 @@ pub fn working_tree_dirty_paths(repo: &Path) -> Result<Vec<String>, GitIoError> 
     Ok(paths)
 }
 
+/// A git-accurate path-ignore checker for the status watch filter.
+/// Built from `Repository::excludes` — the SAME exclude machinery
+/// `git status` uses — so it honors NESTED `.gitignore` files (plus
+/// `.git/info/exclude` and `core.excludesFile`), unlike a single
+/// root-level matcher. Built once per watch session and queried per
+/// path; the stack caches per-directory ignore state, so a burst of
+/// events in one directory (e.g. a churning `build/`) is cheap after the
+/// first descent.
+pub struct PathIgnore {
+    repo: gix::Repository,
+    stack: gix::worktree::Stack,
+}
+
+/// Open a [`PathIgnore`] over `repo`'s working tree. Reads `.gitignore`
+/// from the worktree (like `git status`); the index is read once for the
+/// skip-worktree fallback (a stale index doesn't affect a live wake
+/// filter, which errs toward waking).
+pub fn open_ignore(repo: &Path) -> Result<PathIgnore, GitIoError> {
+    let r = gix::open(repo).map_err(|e| nonzero(format!("gix open `{}`", repo.display()), e))?;
+    let index = r
+        .index_or_empty()
+        .map_err(|e| nonzero("open index for excludes", e))?;
+    let stack = r
+        .excludes(
+            &index,
+            None,
+            gix::worktree::stack::state::ignore::Source::WorktreeThenIdMappingIfNotSkipped,
+        )
+        .map_err(|e| nonzero("build exclude stack", e))?
+        .detach();
+    Ok(PathIgnore { repo: r, stack })
+}
+
+impl PathIgnore {
+    /// True if the repo-root-relative `rela` is git-ignored. `is_dir`
+    /// reflects the entry kind. An undecidable path (lookup error) errs
+    /// toward NOT ignored, so the watch filter wakes — safe, never
+    /// silently stale.
+    pub fn is_ignored(&mut self, rela: &Path, is_dir: bool) -> bool {
+        let mode = is_dir.then_some(gix::index::entry::Mode::DIR);
+        self.stack
+            .at_path(rela, mode, &self.repo.objects)
+            .map(|platform| platform.is_excluded())
+            .unwrap_or(false)
+    }
+}
+
 /// The raw working-tree status: tracked paths differing from HEAD
 /// (staged + unstaged together) and untracked file paths.
 struct WtStatus {

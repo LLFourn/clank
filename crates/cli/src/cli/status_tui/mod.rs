@@ -385,6 +385,31 @@ fn read_plan_markdown(repo: &std::path::Path, stem: &str) -> Option<String> {
     None
 }
 
+/// Minimum wall-clock between status rebuilds. Coalesces a burst of
+/// watcher wakes into at most one rebuild per interval — defense-in-depth
+/// atop the (nested-aware) ignore filter, so even non-ignored churn can't
+/// drive the rebuild loop hot.
+const REBUILD_MIN: Duration = Duration::from_secs(1);
+
+/// The loop's recv timeout: the `base` cadence (spinner tick when one is
+/// visible, else the idle backstop), shortened to the time left before a
+/// DEFERRED refresh may run — so a coalesced burst still rebuilds within
+/// [`REBUILD_MIN`] (trailing edge), and a lone deferred wake fires within
+/// the interval rather than waiting for the next unrelated event. Pure →
+/// unit-tested.
+fn deferred_wait(
+    base: Duration,
+    refresh_pending: bool,
+    since_last_rebuild: Duration,
+    min_interval: Duration,
+) -> Duration {
+    if refresh_pending {
+        base.min(min_interval.saturating_sub(since_last_rebuild))
+    } else {
+        base
+    }
+}
+
 /// The `--tui` loop, fully event-driven: the watcher covers the
 /// working tree (gitignore-filtered), `.clank/`, and the git dir;
 /// SIGWINCH arrives on the same channel, so a resize is just
@@ -478,6 +503,14 @@ pub(crate) async fn run_tui(
     let mut picker: Vec<crate::cli::status::AvailableAgent> = Vec::new();
     // Spinner animation frame. The ONLY state an animation tick mutates.
     let mut frame: usize = 0;
+    // Debounce: a watcher wake only FLAGS a refresh; the trailing-edge
+    // flush below coalesces a burst into ≤1 rebuild per REBUILD_MIN.
+    // `last_rebuild` starts a full interval in the past so the first wake
+    // rebuilds immediately (leading edge); later bursts coalesce.
+    let mut last_rebuild = std::time::Instant::now()
+        .checked_sub(REBUILD_MIN)
+        .unwrap_or_else(std::time::Instant::now);
+    let mut refresh_pending = false;
     loop {
         let (rows, cols) = term_size();
 
@@ -599,11 +632,12 @@ pub(crate) async fn run_tui(
             .iter()
             .enumerate()
             .any(|(i, s)| matches!(s, Seg::InProg(_)) && win.contains(&i));
-        let wait = if spinner_visible {
+        let base = if spinner_visible {
             Duration::from_millis(120)
         } else {
             Duration::from_secs(60)
         };
+        let wait = deferred_wait(base, refresh_pending, last_rebuild.elapsed(), REBUILD_MIN);
 
         match ev_rx.recv_timeout(wait) {
             // Keys only move the viewport; the loop top loads more if the
@@ -784,79 +818,12 @@ pub(crate) async fn run_tui(
                 }
                 log.request_fill();
             }
+            // A data-change wake is COALESCED + THROTTLED: just flag it
+            // here; the trailing-edge flush after the match rebuilds at
+            // most once per REBUILD_MIN, so a churny tree can't drive the
+            // rebuild loop hot. (Keys/resize below are NOT throttled.)
             Ok(Ev::Refresh) => {
-                // Nothing-changed gate (lloyd's invariant): a wake that
-                // touched no snapshot input is dropped — no rebuild, no
-                // log re-fold, no repaint. The probe is far cheaper than
-                // the work it guards.
-                let sig = crate::cli::status::input_signature(&repo).ok();
-                if sig != last_sig {
-                    // Capture the detail page's target by LABEL from the
-                    // OLD roster before rebuilding — an external promote /
-                    // tier change can REORDER rows (master, then commit,
-                    // then gate), so a kept index could silently retarget a
-                    // different agent. We re-locate the same label below.
-                    let detail_label = match mode {
-                        Mode::AgentDetail { idx, .. } => {
-                            snapshot.agents.get(idx).map(|a| a.label.clone())
-                        }
-                        _ => None,
-                    };
-                    snapshot = StatusSnapshot::build_async(
-                        &repo,
-                        &basename,
-                        home.as_deref(),
-                        policy,
-                        None,
-                        true,
-                    )
-                    .await?;
-                    // Restore the user's scroll depth and re-open paging in
-                    // case history grew; the loop top tops up the viewport.
-                    snapshot.log_rows = crate::cli::status::tui_log_rows(&repo, log.window).await;
-                    last_sig = sig;
-                    log.complete = false;
-                    log.request_fill();
-                    // The data changed under us, so any in-flight picker/
-                    // confirm (which reference now-possibly-stale indices)
-                    // is cancelled back to the panel, and the panel cursor
-                    // is re-bounded to the new row count (agents + the +add
-                    // row). An empty roster drops focus to the log.
-                    picker.clear();
-                    mode = match mode {
-                        Mode::LogScroll => Mode::LogScroll,
-                        _ if snapshot.agents.is_empty() => Mode::LogScroll,
-                        Mode::AgentPanel { sel } => Mode::AgentPanel {
-                            sel: sel.min(snapshot.agents.len()),
-                        },
-                        // The detail page tracks ONE agent by identity:
-                        // re-locate the captured label in the (possibly
-                        // reordered) new roster, so an external reorder can
-                        // never retarget it; if the agent is gone, close to
-                        // the panel.
-                        Mode::AgentDetail { sel, .. } => {
-                            match detail_label
-                                .as_deref()
-                                .and_then(|l| relocate_detail(l, &snapshot.agents))
-                            {
-                                Some(idx) => Mode::AgentDetail { idx, sel },
-                                None => Mode::AgentPanel {
-                                    sel: snapshot.agents.len(),
-                                },
-                            }
-                        }
-                        // Cancel a picker/confirm onto the +add row.
-                        Mode::AddPicker { .. } | Mode::Confirm { .. } => Mode::AgentPanel {
-                            sel: snapshot.agents.len(),
-                        },
-                    };
-                    if let Some(tab) = tab.as_mut() {
-                        tab.update(&bar_emoji(&snapshot));
-                    }
-                    if let Some(panes) = panes.as_mut() {
-                        panes.update(&snapshot);
-                    }
-                }
+                refresh_pending = true;
             }
             // Resize: not a data change, so no signature probe and no
             // rebuild — just top up the (possibly taller) viewport and
@@ -865,15 +832,95 @@ pub(crate) async fn run_tui(
             Ok(Ev::Resize) => {
                 log.request_fill();
             }
-            // Animation tick: advance the frame ONLY. `needs_fill` stays
-            // false, so the next iteration is a PURE repaint — render_at
-            // (pure) + paint — with zero disk/git/zellij work.
+            // Animation tick: advance the frame ONLY. `fill` stays false,
+            // so the next iteration is a PURE repaint — render_at (pure) +
+            // paint — with zero disk/git/zellij work.
             Err(mpsc::RecvTimeoutError::Timeout) if spinner_visible => {
                 frame = frame.wrapping_add(1);
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 anyhow::bail!("event channel disconnected")
+            }
+        }
+
+        // Trailing-edge refresh flush: the COALESCED snapshot rebuild, run
+        // at most once per REBUILD_MIN (the only throttled work; keys and
+        // resize above stay responsive). `deferred_wait` shortens the recv
+        // timeout so a pending flush fires within the interval.
+        if refresh_pending && last_rebuild.elapsed() >= REBUILD_MIN {
+            refresh_pending = false;
+            last_rebuild = std::time::Instant::now();
+            // Nothing-changed gate (lloyd's invariant): a wake that touched
+            // no snapshot input is dropped — no rebuild, no log re-fold, no
+            // repaint. The probe is far cheaper than the work it guards.
+            let sig = crate::cli::status::input_signature(&repo).ok();
+            if sig != last_sig {
+                // Capture the detail page's target by LABEL from the OLD
+                // roster before rebuilding — an external promote / tier
+                // change can REORDER rows (master, then commit, then gate),
+                // so a kept index could silently retarget a different agent.
+                // We re-locate the same label below.
+                let detail_label = match mode {
+                    Mode::AgentDetail { idx, .. } => {
+                        snapshot.agents.get(idx).map(|a| a.label.clone())
+                    }
+                    _ => None,
+                };
+                snapshot = StatusSnapshot::build_async(
+                    &repo,
+                    &basename,
+                    home.as_deref(),
+                    policy,
+                    None,
+                    true,
+                )
+                .await?;
+                // Restore the user's scroll depth and re-open paging in
+                // case history grew; the loop top tops up the viewport.
+                snapshot.log_rows = crate::cli::status::tui_log_rows(&repo, log.window).await;
+                last_sig = sig;
+                log.complete = false;
+                log.request_fill();
+                // The data changed under us, so any in-flight picker/
+                // confirm (which reference now-possibly-stale indices)
+                // is cancelled back to the panel, and the panel cursor
+                // is re-bounded to the new row count (agents + the +add
+                // row). An empty roster drops focus to the log.
+                picker.clear();
+                mode = match mode {
+                    Mode::LogScroll => Mode::LogScroll,
+                    _ if snapshot.agents.is_empty() => Mode::LogScroll,
+                    Mode::AgentPanel { sel } => Mode::AgentPanel {
+                        sel: sel.min(snapshot.agents.len()),
+                    },
+                    // The detail page tracks ONE agent by identity:
+                    // re-locate the captured label in the (possibly
+                    // reordered) new roster, so an external reorder can
+                    // never retarget it; if the agent is gone, close to
+                    // the panel.
+                    Mode::AgentDetail { sel, .. } => {
+                        match detail_label
+                            .as_deref()
+                            .and_then(|l| relocate_detail(l, &snapshot.agents))
+                        {
+                            Some(idx) => Mode::AgentDetail { idx, sel },
+                            None => Mode::AgentPanel {
+                                sel: snapshot.agents.len(),
+                            },
+                        }
+                    }
+                    // Cancel a picker/confirm onto the +add row.
+                    Mode::AddPicker { .. } | Mode::Confirm { .. } => Mode::AgentPanel {
+                        sel: snapshot.agents.len(),
+                    },
+                };
+                if let Some(tab) = tab.as_mut() {
+                    tab.update(&bar_emoji(&snapshot));
+                }
+                if let Some(panes) = panes.as_mut() {
+                    panes.update(&snapshot);
+                }
             }
         }
     }
@@ -938,6 +985,35 @@ pub(crate) mod tests {
         assert!(!v.fill);
         v.request_fill();
         assert!(v.fill, "input/data/resize re-arm the fill");
+    }
+
+    #[test]
+    fn deferred_wait_caps_to_the_refresh_interval() {
+        let min = Duration::from_secs(1);
+        let base = Duration::from_secs(60);
+        // No pending refresh → the base cadence, untouched.
+        assert_eq!(
+            deferred_wait(base, false, Duration::from_millis(10), min),
+            base
+        );
+        // Pending, interval not yet elapsed → wait the REMAINING time, so
+        // the coalesced burst flushes within one interval (trailing edge).
+        assert_eq!(
+            deferred_wait(base, true, Duration::from_millis(400), min),
+            Duration::from_millis(600)
+        );
+        // Pending, interval already elapsed → 0 (flush on the next tick).
+        assert_eq!(
+            deferred_wait(base, true, Duration::from_secs(5), min),
+            Duration::ZERO
+        );
+        // Pending but a shorter base (a visible spinner) wins, so the
+        // spinner keeps ticking while the refresh waits its interval.
+        let spinner = Duration::from_millis(120);
+        assert_eq!(
+            deferred_wait(spinner, true, Duration::from_millis(100), min),
+            spinner
+        );
     }
 
     #[test]

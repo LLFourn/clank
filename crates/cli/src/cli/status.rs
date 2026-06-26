@@ -895,9 +895,12 @@ async fn log_rows_windowed(
 /// are dropped too — a `cargo build`'s thousands of `target/` files
 /// say nothing about clank state or worktree dirt.
 ///
-/// The matcher anchors at the repo root's `.gitignore` (plus
-/// `.git/info/exclude`); nested `.gitignore` files aren't modeled —
-/// a path only they ignore costs a harmless debounced wake.
+/// The ignore test is git-accurate ([`crate::git_io::PathIgnore`], gix's
+/// exclude stack): it honors NESTED `.gitignore` files (plus
+/// `.git/info/exclude` and `core.excludesFile`), so churn under a
+/// subproject's ignored dir (e.g. a Flutter `frostsnapp/build/`) is
+/// recognized as ignored and dropped — not stormed on. (A root-only
+/// matcher missed nested ignores and woke ~250×/s on such a tree.)
 /// TRACKED-but-gitignored files (`git add -f`) are dropped like
 /// any ignored path: their edits refresh `dirty:` on the 60s
 /// backstop, not instantly.
@@ -905,7 +908,7 @@ pub(crate) struct WakeFilter {
     repo_root: PathBuf,
     git_dir: PathBuf,
     clank_root: PathBuf,
-    matcher: ignore::gitignore::Gitignore,
+    ignore: crate::git_io::PathIgnore,
 }
 
 /// The first path component under `.clank/` that carries a real
@@ -999,27 +1002,19 @@ fn collect_fingerprint(path: &Path, out: &mut Vec<(PathBuf, Option<std::time::Sy
 }
 
 impl WakeFilter {
-    pub(crate) fn new(repo_root: &Path, git_dir: &Path) -> Self {
+    pub(crate) fn new(repo_root: &Path, git_dir: &Path) -> anyhow::Result<Self> {
         // FSEvents delivers canonical paths (`/private/var/…`);
         // compare against canonical roots or every prefix check
         // misses on symlinked locations (e.g. macOS tempdirs).
         let repo_root = dunce::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
         let git_dir = dunce::canonicalize(git_dir).unwrap_or_else(|_| git_dir.to_path_buf());
-        Self {
+        let ignore = crate::git_io::open_ignore(&repo_root)?;
+        Ok(Self {
             clank_root: repo_root.join(".clank"),
-            matcher: Self::build_matcher(&repo_root, &git_dir),
+            ignore,
             repo_root,
             git_dir,
-        }
-    }
-
-    fn build_matcher(repo_root: &Path, git_dir: &Path) -> ignore::gitignore::Gitignore {
-        let mut builder = ignore::gitignore::GitignoreBuilder::new(repo_root);
-        let _ = builder.add(repo_root.join(".gitignore"));
-        let _ = builder.add(git_dir.join("info").join("exclude"));
-        builder
-            .build()
-            .unwrap_or_else(|_| ignore::gitignore::Gitignore::empty())
+        })
     }
 
     /// True → the event at `path` should wake the loop.
@@ -1040,37 +1035,26 @@ impl WakeFilter {
             let head = rel.components().next().and_then(|c| c.as_os_str().to_str());
             return head.is_some_and(|h| CLANK_WAKE_DIRS.contains(&h));
         }
+        // A `.gitignore` write changes what's ignored: rebuild the
+        // (nested-aware) exclude stack and wake. On a rebuild error keep
+        // the old stack — erring toward waking is safe.
         if path.file_name().is_some_and(|n| n == ".gitignore") {
-            self.matcher = Self::build_matcher(&self.repo_root, &self.git_dir);
+            if let Ok(ig) = crate::git_io::open_ignore(&self.repo_root) {
+                self.ignore = ig;
+            }
             return true;
         }
-        // Paths outside the root (the matcher would panic on them)
-        // shouldn't arrive; if one does, wake conservatively.
-        if !path.starts_with(&self.repo_root) {
+        // Paths outside the root shouldn't arrive; if one does, wake
+        // conservatively.
+        let Ok(rela) = path.strip_prefix(&self.repo_root) else {
             return true;
-        }
-        // Working-tree path: wake unless gitignored — keeps `dirty:`
-        // fresh on tracked edits while dropping build artifacts
-        // (`target/`, `*.log`, …). `is_dir` races with deletion; a
-        // vanished path reads as non-dir, only loosening toward a wake.
-        !self
-            .matcher
-            .matched_path_or_any_parents(path, path.is_dir())
-            .is_ignore()
-    }
-
-    #[cfg(test)]
-    fn with_rules(repo_root: &Path, git_dir: &Path, rules: &[&str]) -> Self {
-        let mut builder = ignore::gitignore::GitignoreBuilder::new(repo_root);
-        for rule in rules {
-            builder.add_line(None, rule).expect("test rule");
-        }
-        Self {
-            repo_root: repo_root.to_path_buf(),
-            git_dir: git_dir.to_path_buf(),
-            clank_root: repo_root.join(".clank"),
-            matcher: builder.build().expect("test matcher"),
-        }
+        };
+        // Working-tree path: wake unless git-ignored — keeps `dirty:`
+        // fresh on tracked edits while dropping build artifacts, honoring
+        // NESTED `.gitignore`s (the storm fix). `is_dir` races with
+        // deletion; a vanished path reads as non-dir, only loosening
+        // toward a wake.
+        !self.ignore.is_ignored(rela, path.is_dir())
     }
 }
 
@@ -1089,7 +1073,7 @@ pub(crate) fn watch_status_paths(
         anyhow::bail!("ensure `{}` exists: {e}", clank_root.display());
     }
     let git_dir = git_resolve_dir(repo)?;
-    let mut filter = WakeFilter::new(repo, &git_dir);
+    let mut filter = WakeFilter::new(repo, &git_dir)?;
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
         match res {
             Ok(event) => {
@@ -1412,48 +1396,63 @@ mod dirty_and_wake_tests {
 
     #[test]
     fn wake_filter_matrix() {
-        let root = Path::new("/repo");
-        let git_dir = Path::new("/repo/.git");
-        let mut f = WakeFilter::with_rules(root, git_dir, &["/target/", "*.log"]);
+        // Real on-disk repo: the filter's ignore test is now gix's
+        // exclude stack, which reads `.gitignore` from disk and honors
+        // NESTED files — so the fixture writes a root AND a nested
+        // `.gitignore` and the queried paths exist where it matters.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap();
+        git(&root, &["init", "--quiet", "-b", "main"]);
+        std::fs::write(root.join(".gitignore"), "/target/\n*.log\n").unwrap();
+        // A subproject that ignores its OWN build dir via a NESTED
+        // `.gitignore` — the storm case (Flutter `frostsnapp/build/`).
+        std::fs::create_dir_all(root.join("sub/build/macos")).unwrap();
+        std::fs::create_dir_all(root.join("sub/.dart_tool")).unwrap();
+        std::fs::write(root.join("sub/.gitignore"), "/build/\n.dart_tool/\n").unwrap();
+        std::fs::write(root.join("sub/build/macos/App"), "x").unwrap();
+        std::fs::write(root.join("sub/.dart_tool/x"), "x").unwrap();
+        let git_dir = root.join(".git");
+        let mut f = WakeFilter::new(&root, &git_dir).unwrap();
+        let p = |rel: &str| root.join(rel);
 
         // .clank workflow-state SIGNAL dirs + .git wake.
-        assert!(f.wakes(Path::new("/repo/.clank/agents/codex/feedback/abc.md")));
-        assert!(f.wakes(Path::new("/repo/.clank/blocks/q.md")));
-        assert!(f.wakes(Path::new("/repo/.clank/plans/foo.md")));
-        assert!(f.wakes(Path::new("/repo/.clank/queue/500-foo.md")));
-        assert!(f.wakes(Path::new("/repo/.clank/finished/foo.md")));
-        assert!(f.wakes(Path::new("/repo/.clank/config.json")));
-        assert!(f.wakes(Path::new("/repo/.git/HEAD")));
+        assert!(f.wakes(&p(".clank/agents/codex/feedback/abc.md")));
+        assert!(f.wakes(&p(".clank/blocks/q.md")));
+        assert!(f.wakes(&p(".clank/plans/foo.md")));
+        assert!(f.wakes(&p(".clank/queue/500-foo.md")));
+        assert!(f.wakes(&p(".clank/finished/foo.md")));
+        assert!(f.wakes(&p(".clank/config.json")));
+        assert!(f.wakes(&p(".git/HEAD")));
 
-        // DERIVED / foreign state under `.clank` must NOT wake — this
-        // is the allowlist, not "anything under .clank"
-        // (status-tui-watch-cpu). The fold cache self-triggers a
-        // render→write-cache→wake loop; html/zellij are generated.
-        assert!(!f.wakes(Path::new("/repo/.clank/cache/repo-state/abc123.7.v10.bin")));
-        assert!(!f.wakes(Path::new("/repo/.clank/html/index.html")));
-        assert!(!f.wakes(Path::new("/repo/.clank/zellij/layout.kdl")));
+        // DERIVED / foreign state under `.clank` must NOT wake — the
+        // allowlist, not "anything under .clank" (status-tui-watch-cpu).
+        assert!(!f.wakes(&p(".clank/cache/repo-state/abc123.7.v10.bin")));
+        assert!(!f.wakes(&p(".clank/html/index.html")));
+        assert!(!f.wakes(&p(".clank/zellij/layout.kdl")));
 
         // NESTED WORKTREES under `.clank/worktrees/<name>/` are whole
-        // separate repos. Their builds AND their own caches must NOT
-        // wake this pane — the regression ruthless caught: the old
-        // `starts_with(.clank)` short-circuit woke on all of these.
-        assert!(!f.wakes(Path::new("/repo/.clank/worktrees/wt1/target/debug/junk.o")));
-        assert!(!f.wakes(Path::new(
-            "/repo/.clank/worktrees/wt1/.clank/cache/repo-state/x.v10.bin"
-        )));
-        assert!(!f.wakes(Path::new("/repo/.clank/worktrees/wt1/src/lib.rs")));
-        // ...even a worktree's OWN plan file: it's that worktree's
-        // tui's job, not ours.
-        assert!(!f.wakes(Path::new("/repo/.clank/worktrees/wt1/.clank/plans/bar.md")));
+        // separate repos; their builds + caches + own plans must NOT wake.
+        assert!(!f.wakes(&p(".clank/worktrees/wt1/target/debug/junk.o")));
+        assert!(!f.wakes(&p(".clank/worktrees/wt1/.clank/cache/repo-state/x.v10.bin")));
+        assert!(!f.wakes(&p(".clank/worktrees/wt1/src/lib.rs")));
+        assert!(!f.wakes(&p(".clank/worktrees/wt1/.clank/plans/bar.md")));
 
-        // Top-level working tree: gitignored → drop, tracked → wake
-        // (keeps `dirty:` fresh on source saves).
-        assert!(!f.wakes(Path::new("/repo/target/debug/build/junk.o")));
-        assert!(!f.wakes(Path::new("/repo/build.log")));
-        assert!(f.wakes(Path::new("/repo/src/lib.rs")));
-        assert!(f.wakes(Path::new("/repo/Cargo.toml")));
-        // .gitignore changes always wake (and refresh the matcher).
-        assert!(f.wakes(Path::new("/repo/.gitignore")));
+        // Top-level working tree: root-gitignored → drop, tracked → wake.
+        assert!(!f.wakes(&p("target/debug/build/junk.o")));
+        assert!(!f.wakes(&p("build.log")));
+        assert!(f.wakes(&p("src/lib.rs")));
+        assert!(f.wakes(&p("Cargo.toml")));
+
+        // THE FIX: churn ignored only by the NESTED `sub/.gitignore`
+        // must NOT wake (a root-only matcher missed these and stormed).
+        assert!(!f.wakes(&p("sub/build/macos/App")));
+        assert!(!f.wakes(&p("sub/.dart_tool/x")));
+        // ...but a tracked file in the same subproject still wakes.
+        assert!(f.wakes(&p("sub/main.rs")));
+
+        // .gitignore changes always wake (and rebuild the exclude stack).
+        assert!(f.wakes(&p(".gitignore")));
+        assert!(f.wakes(&p("sub/.gitignore")));
     }
 
     fn git(repo: &Path, args: &[&str]) {
@@ -1743,9 +1742,14 @@ mod dirty_and_wake_tests {
         let dir = fixture_repo();
         let r = dir.path();
         std::fs::write(r.join(".gitignore"), "/target/\n").unwrap();
+        // A subproject ignoring its OWN build dir via a NESTED
+        // `.gitignore` — the storm case the root-only matcher missed.
+        std::fs::create_dir_all(r.join("sub")).unwrap();
+        std::fs::write(r.join("sub/.gitignore"), "/build/\n").unwrap();
         git(r, &["add", "-A"]);
         git(r, &["commit", "--quiet", "-m", "gitignore"]);
         std::fs::create_dir_all(r.join("target/debug")).unwrap();
+        std::fs::create_dir_all(r.join("sub/build")).unwrap();
 
         let (tx, rx) = mpsc::channel::<()>();
         let _watcher = watch_status_paths(tx, r).unwrap();
@@ -1753,11 +1757,19 @@ mod dirty_and_wake_tests {
         std::thread::sleep(Duration::from_millis(250));
         while rx.try_recv().is_ok() {}
 
-        // Ignored path: no wake.
+        // Root-ignored path: no wake.
         std::fs::write(r.join("target/debug/out.o"), "junk").unwrap();
         assert!(
             rx.recv_timeout(Duration::from_millis(500)).is_err(),
             "ignored build artifact woke the loop"
+        );
+
+        // NESTED-ignored path: no wake (THE storm fix — this is what
+        // pegged a core, ~250 wakes/s of `frostsnapp/build/` churn).
+        std::fs::write(r.join("sub/build/out.o"), "junk").unwrap();
+        assert!(
+            rx.recv_timeout(Duration::from_millis(500)).is_err(),
+            "nested-gitignored build artifact woke the loop"
         );
 
         // Tracked-file edit: wakes (this is what keeps `dirty:`
