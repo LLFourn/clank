@@ -183,6 +183,44 @@ mod tests {
         assert!(!screen.is_alive(), "alive flag cleared on EOF");
     }
 
+    /// Pins the vendored-vt100 scrollback fix (vendor/vt100/VENDOR.md): a
+    /// scroll region whose TOP is row 0 saves scrolled-off lines to
+    /// scrollback even with a bottom margin — the codex case (a fixed
+    /// bottom input bar) that upstream vt100 discarded, leaving the
+    /// console nothing to scroll. A contained region (top > 0) still does
+    /// not accumulate; the no-margin case still does. If a vt100 bump ever
+    /// loses the patch, this fails.
+    #[test]
+    fn scroll_region_top_anchored_keeps_scrollback() {
+        // `feed(top, bottom)` sets a 1-based DECSTBM region then scrolls
+        // 20 lines through a 4-row screen, returning the resulting
+        // scrollback depth (offset after scrolling fully back).
+        let feed = |region: Option<(u16, u16)>| {
+            let mut p = vt100::Parser::new(4, 20, AGENT_SCROLLBACK);
+            if let Some((top, bottom)) = region {
+                p.process(format!("\x1b[{top};{bottom}r").as_bytes());
+            }
+            for i in 0..20 {
+                p.process(format!("line{i}\r\n").as_bytes());
+            }
+            p.screen_mut().set_scrollback(AGENT_SCROLLBACK); // clamps to len
+            p.screen().scrollback()
+        };
+        // No region (default) keeps scrollback.
+        assert!(feed(None) > 0, "no margin: lines saved");
+        // Top-anchored region with a bottom bar (codex) now KEEPS it.
+        assert!(
+            feed(Some((1, 3))) > 0,
+            "top==0 with a bottom margin: lines saved (the codex fix)"
+        );
+        // A contained mid-screen region (top > 0) still discards.
+        assert_eq!(
+            feed(Some((2, 4))),
+            0,
+            "top>0: contained region, no scrollback"
+        );
+    }
+
     /// The scrollback mechanic the wheel handler drives, exercised on a
     /// bare parser (no process): output past the screen height lands in
     /// scrollback, `set_scrollback` surfaces the older rows, and offset
