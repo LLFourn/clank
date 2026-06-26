@@ -786,6 +786,7 @@ pub(crate) async fn run_tui(
                             | Key::Bottom
                             | Key::Delete
                             | Key::Left
+                            | Key::Right
                             | Key::Yes
                             | Key::No => {}
                         },
@@ -860,7 +861,12 @@ pub(crate) async fn run_tui(
                                     None => {}
                                 }
                             }
-                            Key::Escape | Key::Left | Key::Delete | Key::Yes | Key::No => {}
+                            Key::Escape
+                            | Key::Left
+                            | Key::Right
+                            | Key::Delete
+                            | Key::Yes
+                            | Key::No => {}
                         },
                     }
                     log.request_fill();

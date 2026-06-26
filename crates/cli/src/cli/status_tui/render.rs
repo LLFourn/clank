@@ -684,38 +684,80 @@ pub(super) fn render_add_screen(
 
 /// The label for a detail-page action, given the agent it acts on
 /// (so "switch tier" and "toggle auto" name their destination).
-pub(super) fn detail_action_label(
-    action: DetailAction,
-    agent: &crate::cli::status::AgentAutoRow,
-) -> String {
-    use clank_core::vocab::AutoMode;
-    match action {
-        DetailAction::ToggleAuto => format!(
-            "toggle auto (→ {})",
-            if agent.auto_mode == AutoMode::On {
-                "off"
-            } else {
-                "on"
-            }
-        ),
-        DetailAction::SwitchTier => {
-            let to = match agent.role {
-                crate::cli::teams_config::RosterRole::Commit => "gate",
-                _ => "commit",
-            };
-            format!("switch tier → {to}")
+/// A two-state segmented toggle value, e.g. `on │ off`. Positions are
+/// STABLE (the active option doesn't jump sides when flipped); the active
+/// one is bold, the other dim. When the row is selected, the segment is
+/// flanked with dim `‹ ›` to signal ←/→/␣ cycle it.
+fn toggle_segment(left: (&str, bool), right: (&str, bool), selected: bool) -> Vec<Span> {
+    let opt = |(text, active): (&str, bool)| {
+        if active {
+            bold(text.to_string())
+        } else {
+            dim(text.to_string())
         }
-        DetailAction::PromoteToMaster => "promote to master".to_string(),
-        DetailAction::Remove => "remove from team".to_string(),
-        DetailAction::Back => "← back".to_string(),
+    };
+    let mut s = Vec::new();
+    if selected {
+        s.push(dim("‹ "));
     }
+    s.push(opt(left));
+    s.push(dim(" │ "));
+    s.push(opt(right));
+    if selected {
+        s.push(dim(" ›"));
+    }
+    s
 }
 
-/// The full-screen per-agent detail/config page: an info block (tool,
-/// tier, auto, invocation, purpose) then the selectable action menu.
-/// Like the picker it is hard-clamped to `rows` with single-line fields,
-/// so a multiline `initial_prompt` cannot overflow. The selected action
-/// gets the unified selection band. Returns `(lines, 0)` — no log.
+/// One detail-page row's spans: a fixed-width caret gutter (so rows don't
+/// jitter as the cursor moves) then either a segmented toggle (auto/tier),
+/// a glyph-prefixed action, or the destructive red `✗ remove`. Selection
+/// is a `▸` caret — NOT the reverse band — so the inline toggle value and
+/// the red destructive cue stay visible. The caret turns red on the
+/// selected Remove row as an extra danger cue.
+pub(super) fn detail_row_spans(
+    action: DetailAction,
+    agent: &crate::cli::status::AgentAutoRow,
+    selected: bool,
+) -> Vec<Span> {
+    use crate::cli::teams_config::RosterRole;
+    use clank_core::vocab::AutoMode;
+    let danger = matches!(action, DetailAction::Remove);
+    // Gutter: caret+space when selected, two spaces otherwise — always 2
+    // display columns, so content never shifts horizontally.
+    let mut spans = vec![match (selected, danger) {
+        (true, true) => colored("31", "▸ "),
+        (true, false) => bold("▸ "),
+        (false, _) => plain("  "),
+    }];
+    match action {
+        DetailAction::ToggleAuto => {
+            let on = agent.auto_mode == AutoMode::On;
+            spans.push(dim(format!("{:<10}", "auto")));
+            spans.extend(toggle_segment(("on", on), ("off", !on), selected));
+        }
+        DetailAction::SwitchTier => {
+            let commit = agent.role == RosterRole::Commit;
+            spans.push(dim(format!("{:<10}", "tier")));
+            spans.extend(toggle_segment(
+                ("commit", commit),
+                ("gate", !commit),
+                selected,
+            ));
+        }
+        DetailAction::PromoteToMaster => spans.push(plain("⇧ promote to master")),
+        DetailAction::Remove => spans.push(colored("31", "✗ remove from team")),
+        DetailAction::Back => spans.push(dim("← back")),
+    }
+    spans
+}
+
+/// The full-screen per-agent detail/config page: a read-only info block
+/// (tool, invocation, purpose) then the directly-manipulable rows —
+/// auto/tier are inline toggles (←/→/␣ flip), promote/remove/back are
+/// actions, the cursor marked by a `▸` caret. Hard-clamped to `rows` with
+/// single-line fields so a multiline `initial_prompt` can't overflow.
+/// Returns `(lines, 0)` — no log.
 pub(super) fn render_agent_detail(
     agent: &crate::cli::status::AgentAutoRow,
     actions: &[DetailAction],
@@ -723,7 +765,6 @@ pub(super) fn render_agent_detail(
     rows: usize,
     cols: usize,
 ) -> (Vec<String>, usize) {
-    use clank_core::vocab::AutoMode;
     let mut out: Vec<String> = Vec::new();
     out.push(region_rule(
         &format!("agent · {}", agent.label),
@@ -732,11 +773,8 @@ pub(super) fn render_agent_detail(
         cols,
     ));
     out.push(String::new());
-    let auto = if agent.auto_mode == AutoMode::On {
-        "▶ on"
-    } else {
-        "⏸ off"
-    };
+    // Read-only info — auto/tier are NOT here; they're live toggle rows
+    // below (one place to see AND change each, no duplication).
     let purpose = agent
         .description
         .as_deref()
@@ -744,8 +782,6 @@ pub(super) fn render_agent_detail(
         .unwrap_or("—");
     let info = [
         ("tool", agent.tool.clone()),
-        ("tier", tier_label(agent.role).to_string()),
-        ("auto", auto.to_string()),
         ("invocation", one_line(&agent.invocation, cols)),
         ("purpose", one_line(purpose, cols)),
     ];
@@ -765,15 +801,16 @@ pub(super) fn render_agent_detail(
         if out.len() >= rows.saturating_sub(1) {
             break;
         }
-        let spans = vec![plain(format!("  {}", detail_action_label(*a, agent)))];
-        out.push(row_line(&spans, i == sel, "", cols));
+        out.push(emit(&detail_row_spans(*a, agent, i == sel), "", cols));
     }
     if out.len() < rows {
         out.push(String::new());
     }
     if out.len() < rows {
         out.push(emit(
-            &[dim("  ↑↓ move · ⏎ select · Esc back".to_string())],
+            &[dim(
+                "  ↑↓ move · ←→ ␣ change · ⏎ select · esc back".to_string()
+            )],
             "",
             cols,
         ));
@@ -1807,19 +1844,24 @@ mod tests {
             rev_j.contains("line one") && !rev_j.contains("line two"),
             "purpose one-lined"
         );
+        // tier is a segmented toggle (commit │ gate), not a verb naming
+        // the target; auto likewise (on │ off).
         assert!(
-            rev_j.contains("switch tier → gate"),
-            "tier action names the target"
+            rev_j.contains("commit") && rev_j.contains("gate"),
+            "tier toggle shown"
         );
         assert!(rev_j.contains("promote to master") && rev_j.contains("remove from team"));
+        // Selected row (tier, sel=1) is marked by the ▸ caret — not the
+        // reverse-video band (the detail page uses caret selection so the
+        // inline toggle value + red destructive cue stay visible).
         assert!(
-            line_with(&rev, "switch tier").contains(REVERSE),
-            "selected action is the unified band"
+            line_with(&rev, "tier").contains('▸'),
+            "selected row carries the caret"
         );
         // Full screen: not the normal layout.
         assert!(!rev_j.contains("git"), "detail replaces the normal layout");
 
-        // Master detail (idx 0): reduced — no tier/promote/remove.
+        // Master detail (idx 0): reduced — auto toggle + back only.
         let mas = render_at(
             &s,
             40,
@@ -1830,11 +1872,12 @@ mod tests {
         )
         .0
         .join("\n");
-        assert!(mas.contains("toggle auto"), "master keeps auto");
         assert!(
-            !mas.contains("switch tier")
-                && !mas.contains("promote to master")
-                && !mas.contains("remove from team"),
+            mas.contains("auto") && mas.contains("on") && mas.contains("off"),
+            "master keeps the auto toggle: {mas}"
+        );
+        assert!(
+            !mas.contains("tier") && !mas.contains("promote") && !mas.contains("remove"),
             "master's action set is reduced: {mas}"
         );
     }
@@ -2149,6 +2192,65 @@ mod tests {
         assert!(
             miss.iter()
                 .any(|l| visible(l).contains("plan file not found"))
+        );
+    }
+
+    #[test]
+    fn agent_detail_renders_toggles_red_remove_and_stable_gutter() {
+        use crate::cli::teams_config::RosterRole;
+        use clank_core::vocab::AutoMode;
+        let agent = agent_row("codex", RosterRole::Commit, AutoMode::On);
+        let actions = detail_actions(RosterRole::Commit); // auto,tier,promote,remove,back
+        // Select the auto toggle (row 0).
+        let (lines, _) = render_agent_detail(&agent, &actions, 0, 24, 60);
+        let texts: Vec<String> = lines.iter().map(|l| visible(l)).collect();
+        let raw = lines.join("\n");
+
+        // auto + tier are segmented toggles, shown ONCE each (not also a
+        // read-only info line — the duplication this redesign removes).
+        let auto = texts.iter().find(|t| t.contains("auto")).expect("auto row");
+        let tier = texts.iter().find(|t| t.contains("tier")).expect("tier row");
+        assert!(
+            auto.contains("on") && auto.contains("off"),
+            "auto segmented: {auto:?}"
+        );
+        assert!(
+            tier.contains("commit") && tier.contains("gate"),
+            "tier segmented: {tier:?}"
+        );
+        assert_eq!(
+            texts.iter().filter(|t| t.contains("auto")).count(),
+            1,
+            "auto once"
+        );
+        assert_eq!(
+            texts.iter().filter(|t| t.contains("tier")).count(),
+            1,
+            "tier once"
+        );
+
+        // auto is ON → the active "on" renders bold.
+        assert!(
+            raw.contains("\x1b[1mon\x1b[0m"),
+            "active option bold: {raw:?}"
+        );
+        // Selected row gets the ▸ caret; the gutter is a fixed 2 DISPLAY
+        // columns (▸ is one column but 3 bytes), so the label column is
+        // identical on selected and unselected rows — no horizontal jitter
+        // as the cursor moves.
+        let gutter = |row: &str, label: &str| display_width(&row[..row.find(label).unwrap()]);
+        assert_eq!(gutter(auto, "auto"), 2, "selected caret gutter is 2 cols");
+        assert_eq!(
+            gutter(tier, "tier"),
+            2,
+            "unselected gutter is the same 2 cols"
+        );
+        assert!(auto.starts_with("▸ "), "selected row caret: {auto:?}");
+
+        // remove is destructive: ✗ glyph + red SGR.
+        assert!(
+            raw.contains("\x1b[31m✗ remove from team\x1b[0m"),
+            "red remove with ✗: {raw:?}"
         );
     }
 }

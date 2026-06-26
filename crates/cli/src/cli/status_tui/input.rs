@@ -27,9 +27,12 @@ pub(super) enum Key {
     /// "+ add", choose a candidate) or, in a confirm, follow the
     /// default.
     Enter,
-    /// ← (left arrow) — back out of the commit-detail overlay; a no-op
-    /// elsewhere.
+    /// ← (left arrow) — back out of the commit-detail overlay; cycle the
+    /// selected toggle on the agent-detail page; a no-op elsewhere.
     Left,
+    /// → (right arrow) — cycle the selected toggle on the agent-detail
+    /// page; a no-op elsewhere.
+    Right,
     /// Backspace / DEL — remove the selected reviewer.
     Delete,
     /// `y` — confirm.
@@ -124,16 +127,26 @@ pub(super) fn relocate_detail(
     agents.iter().position(|a| a.label == label)
 }
 
-/// Pure key routing for the detail page over its action menu.
+/// A value-bearing row that ←/→ may flip in place (vs an action row that
+/// only Enter/Space activates). Both toggles are 2-state, so the flip is
+/// direction-agnostic.
+pub(super) fn is_toggle(action: DetailAction) -> bool {
+    matches!(action, DetailAction::ToggleAuto | DetailAction::SwitchTier)
+}
+
+/// Pure key routing for the detail page. ↑↓ move the cursor; Enter/Space
+/// activate ANY row (a toggle flips in place; an action opens its flow);
+/// ←/→ flip ONLY a toggle row — so a directional key can never fire the
+/// destructive `Remove` or `PromoteToMaster`.
 pub(super) fn agent_detail_nav(sel: usize, actions: &[DetailAction], key: Key) -> DetailNav {
+    let current = || actions.get(sel).copied().unwrap_or(DetailAction::Back);
     match key {
         Key::Quit => DetailNav::Quit,
         Key::Escape | Key::Focus => DetailNav::Back,
         Key::Up => DetailNav::MoveCursor(move_selection(sel, actions.len(), false)),
         Key::Down => DetailNav::MoveCursor(move_selection(sel, actions.len(), true)),
-        Key::Enter | Key::Space => {
-            DetailNav::Activate(actions.get(sel).copied().unwrap_or(DetailAction::Back))
-        }
+        Key::Enter | Key::Space => DetailNav::Activate(current()),
+        Key::Left | Key::Right if is_toggle(current()) => DetailNav::Activate(current()),
         _ => DetailNav::None,
     }
 }
@@ -321,10 +334,13 @@ pub(super) fn parse_keys(bytes: &[u8]) -> Vec<Key> {
         } else if rest.starts_with(b"\x1b[D") {
             keys.push(Key::Left);
             i += 3;
+        } else if rest.starts_with(b"\x1b[C") {
+            keys.push(Key::Right);
+            i += 3;
         } else if rest.starts_with(b"\x1b[") {
-            // Unknown CSI (e.g. the right arrow, F-keys): consume
-            // through its final byte so a lone Esc isn't misread out of
-            // the sequence's leading bytes.
+            // Unknown CSI (F-keys, etc.): consume through its final byte
+            // so a lone Esc isn't misread out of the sequence's leading
+            // bytes.
             let mut j = 2;
             while j < rest.len() && !(0x40..=0x7e).contains(&rest[j]) {
                 j += 1;
@@ -428,10 +444,15 @@ mod tests {
             vec![std::mem::discriminant(&Key::Left)],
             "left arrow → one Key::Left, no stray Escape"
         );
-        // An unknown CSI (right arrow) is still consumed whole with no key.
-        assert!(
-            parse_keys(b"\x1b[C").is_empty(),
-            "right arrow consumed, no stray Escape"
+        // Right arrow (→ / CSI C) is its own key (cycles a detail toggle),
+        // consumed whole like the left arrow.
+        assert_eq!(
+            parse_keys(b"\x1b[C")
+                .iter()
+                .map(std::mem::discriminant)
+                .collect::<Vec<_>>(),
+            vec![std::mem::discriminant(&Key::Right)],
+            "right arrow → one Key::Right, no stray Escape"
         );
     }
 
@@ -503,6 +524,27 @@ mod tests {
         );
         assert_eq!(agent_detail_nav(0, &actions, Key::Escape), DetailNav::Back);
         assert_eq!(agent_detail_nav(0, &actions, Key::Quit), DetailNav::Quit);
+
+        // ←/→/␣ flip a TOGGLE row in place...
+        for key in [Key::Left, Key::Right, Key::Space] {
+            assert_eq!(
+                agent_detail_nav(0, &actions, key),
+                DetailNav::Activate(ToggleAuto),
+                "{key:?} cycles the toggle row"
+            );
+        }
+        // ...but ←/→ must NEVER fire an action row (the destructive guard):
+        // a directional key on Remove is a no-op; only Enter/Space activate.
+        assert_eq!(agent_detail_nav(2, &actions, Key::Left), DetailNav::None);
+        assert_eq!(agent_detail_nav(2, &actions, Key::Right), DetailNav::None);
+        assert_eq!(
+            agent_detail_nav(2, &actions, Key::Enter),
+            DetailNav::Activate(Remove)
+        );
+        assert_eq!(
+            agent_detail_nav(2, &actions, Key::Space),
+            DetailNav::Activate(Remove)
+        );
     }
 
     #[test]

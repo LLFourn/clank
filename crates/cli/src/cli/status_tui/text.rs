@@ -47,6 +47,9 @@ pub(super) fn accent(s: impl Into<String>) -> Span {
 pub(super) fn italic(s: impl Into<String>) -> Span {
     Span(Style::Italic, s.into())
 }
+pub(super) fn bold(s: impl Into<String>) -> Span {
+    Span(Style::Bold, s.into())
+}
 pub(super) fn highlight(s: impl Into<String>) -> Span {
     Span(Style::Highlight, s.into())
 }
