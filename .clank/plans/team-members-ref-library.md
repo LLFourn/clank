@@ -50,13 +50,34 @@ pub type TeamRoster = BTreeMap<AgentLabel, TeamMember>;
 
 `UserConfigFile.teams` becomes `BTreeMap<String, TeamRoster>`.
 
-`Roster` / `RosterAgent` stay exactly as they are. A repo's
-`.clank/config.json#/agents` IS the self-contained operating roster
-— there is no library to reference there, so it keeps full inline
-entries. **References live only in `teams`** and are resolved into a
-concrete `Roster` snapshot whenever a team is consumed
-(`init --team`). This preserves the existing invariant that a repo
-is self-contained; nothing in a repo config changes.
+## HARD INVARIANT: the repo config is not touched AT ALL
+
+The repo's `.clank/config.json` is out of scope, full stop. This
+change is confined to `~/.clank/config.json#/teams` and the types
+backing it. Concretely:
+
+- `Roster` and `RosterAgent` are **unchanged** (no new fields, no new
+  variants, identical serde). The repo config's `agents` stays a
+  `BTreeMap<AgentLabel, RosterAgent>` of full inline entries — it is
+  the self-contained operating roster; there is no library to
+  reference there, and refs are NOT accepted there.
+- The `Ref` form exists **only** inside `UserConfigFile.teams`. It is
+  resolved into a concrete `Roster` of full inline `RosterAgent`s
+  *before* anything is written to a repo.
+- `init --team` still writes the **exact same** repo-config wire
+  shape it writes today (full inline agents). A team saved as refs
+  and a team saved inline must produce a **byte-identical** repo
+  `.clank/config.json` — resolution happens entirely in the home-
+  config layer.
+- No repo-config reader/writer changes:
+  `agent_store::{load_repo_config_required, repo_config_if_valid}`,
+  `resolve_registered_set`, `try_resolve_via_team_with`,
+  `RepoConfigFile`, and the repo `agent add/promote/remove` paths are
+  untouched.
+
+If any part of the implementation would change the repo config
+schema, its wire format, or what `init --team` writes into a repo,
+that is a defect against this plan.
 
 ### Untagged discrimination
 
@@ -167,6 +188,11 @@ loads with `clank team show default` / `clank team list` before
   never match `Inline`; a mistyped ref errors cleanly.
 - `init --team` resolves refs against the library into a concrete
   self-contained repo `Roster`; dangling ref → actionable error.
+- **Repo config untouched (guard test):** a team saved as refs and
+  the equivalent team saved inline produce a **byte-identical** repo
+  `.clank/config.json` via `init --team`; `RepoConfigFile` / `Roster`
+  / `RosterAgent` types and the repo-config readers/writers are
+  unchanged.
 - `team save` writes ref members (deduped against the library).
 - `team list`/`show` render ref-based teams (tool resolved for
   display, dangling shown, never panics).
