@@ -428,18 +428,26 @@ pub fn register_repo_team(home: &Path, repo: &Path, team_name: &str) -> anyhow::
     Ok(())
 }
 
-/// Load a single named team template from user-scope
-/// `~/.clank/config.json#/teams/<name>` as a [`Roster`]. Reads
-/// the global config as raw JSON and deserializes only the
-/// requested team's value, so an UNRELATED old-shape team can't
-/// block this one. Fail-closed: a missing team errors with a
-/// compose-it hint; an old-shape team value (`TeamComposition`,
-/// not a roster) errors with a re-save hint.
+/// Load a named team template from user-scope
+/// `~/.clank/config.json#/teams/<name>` and RESOLVE it into a
+/// concrete [`Roster`] of full inline agents. References
+/// ([`TeamMember::Ref`]) are resolved against the file's `agents`
+/// library here, so the repo receives a self-contained roster —
+/// references never reach a repo config.
+///
+/// Reads the global config as raw JSON and deserializes only the
+/// requested team's value (plus the library), so an UNRELATED
+/// old-shape team can't block this one. Fail-closed: a missing team
+/// errors with a compose-it hint; an old-shape team value
+/// (`TeamComposition`, not a roster) errors with a re-save hint; a
+/// dangling reference errors naming the missing library agent.
 fn load_user_team_roster(
     home: &Path,
     team_name: &str,
 ) -> anyhow::Result<crate::cli::teams_config::Roster> {
-    use crate::cli::teams_config::Roster;
+    use crate::cli::teams_config::{AgentDescription, TeamRoster, resolve_team};
+    use clank_core::ids::AgentLabel;
+    use std::collections::BTreeMap;
 
     let user_path = home.join(".clank/config.json");
     let raw: serde_json::Value = match std::fs::read_to_string(&user_path) {
@@ -467,13 +475,25 @@ fn load_user_team_roster(
         );
     };
 
-    serde_json::from_value::<Roster>(team_value.clone()).map_err(|_| {
+    let team: TeamRoster = serde_json::from_value(team_value.clone()).map_err(|_| {
         anyhow::anyhow!(
             "team `{team_name}` in user-scope `teams` uses the old team schema (a \
              `master`/`commit_reviewers`/`gate_reviewers` composition, not a roster). \
              Re-save it from a repo with `clank team save {team_name}`."
         )
-    })
+    })?;
+
+    let library: BTreeMap<AgentLabel, AgentDescription> = match raw.get("agents") {
+        Some(agents) => serde_json::from_value(agents.clone()).map_err(|e| {
+            anyhow::anyhow!(
+                "user-scope `agents` library is malformed ({e}); fix `{}`",
+                user_path.display()
+            )
+        })?,
+        None => BTreeMap::new(),
+    };
+
+    resolve_team(&team, &library).map_err(anyhow::Error::from)
 }
 
 #[cfg(test)]
@@ -741,55 +761,77 @@ mod tests {
 
     // ── Plan: repo-agents-no-team ──
 
-    fn seed_user_roster_team(home: &Path, name: &str, roster: crate::cli::teams_config::Roster) {
-        use crate::cli::teams_config::UserConfigFile;
+    /// Seed a user-scope config with a by-name library plus team
+    /// templates. Teams reference the library; resolution happens at
+    /// `register_repo_team` (init --team) time.
+    fn seed_user_config(
+        home: &Path,
+        library: &[(&str, clank_core::vocab::Tool)],
+        teams: &[(&str, crate::cli::teams_config::TeamRoster)],
+    ) {
+        use crate::cli::teams_config::{AgentDescription, UserConfigFile};
+        use clank_core::ids::AgentLabel;
         let mut cfg = UserConfigFile::default();
-        cfg.teams.insert(name.to_string(), roster);
+        for (label, tool) in library {
+            cfg.agents.insert(
+                AgentLabel::parse(label).unwrap(),
+                AgentDescription {
+                    tool: *tool,
+                    launch: None,
+                    initial_prompt: None,
+                },
+            );
+        }
+        for (name, team) in teams {
+            cfg.teams.insert(name.to_string(), team.clone());
+        }
         let path = home.join(".clank/config.json");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, serde_json::to_string_pretty(&cfg).unwrap()).unwrap();
     }
 
-    fn roster_agent(
-        tool: clank_core::vocab::Tool,
+    fn team_ref(
         role: crate::cli::teams_config::RosterRole,
-    ) -> crate::cli::teams_config::RosterAgent {
-        crate::cli::teams_config::RosterAgent {
-            tool,
-            launch: None,
-            initial_prompt: None,
+    ) -> crate::cli::teams_config::TeamMember {
+        crate::cli::teams_config::TeamMember::Ref(crate::cli::teams_config::TeamRef {
+            agent: None,
             role,
-        }
+        })
     }
 
     #[test]
-    fn register_repo_team_copies_roster_same_shape() {
-        // `--team dev` copies dev's roster (agents-with-roles)
-        // same-shape into the repo's `agents`.
-        use crate::cli::teams_config::{RepoConfigFile, Roster, RosterRole};
+    fn register_repo_team_resolves_refs_into_inline_roster() {
+        // `--team dev` resolves dev's REFERENCES against the library
+        // into the repo's `agents` as full inline agents-with-roles.
+        use crate::cli::teams_config::{RepoConfigFile, RosterRole, TeamRoster};
         use clank_core::ids::AgentLabel;
         use clank_core::vocab::Tool;
         let user_home = tempfile::tempdir().unwrap();
-        let mut dev: Roster = std::collections::BTreeMap::new();
+        let mut dev: TeamRoster = std::collections::BTreeMap::new();
         dev.insert(
             AgentLabel::parse("claude").unwrap(),
-            roster_agent(Tool::Claude, RosterRole::Master),
+            team_ref(RosterRole::Master),
         );
         dev.insert(
             AgentLabel::parse("codex").unwrap(),
-            roster_agent(Tool::Codex, RosterRole::Commit),
+            team_ref(RosterRole::Commit),
         );
-        seed_user_roster_team(user_home.path(), "dev", dev);
+        seed_user_config(
+            user_home.path(),
+            &[("claude", Tool::Claude), ("codex", Tool::Codex)],
+            &[("dev", dev)],
+        );
 
         let repo = init_repo();
         register_repo_team(user_home.path(), repo.path(), "dev").unwrap();
         let body = std::fs::read_to_string(repo.path().join(".clank/config.json")).unwrap();
+        // Parsing as RepoConfigFile (whose agents REQUIRE `tool`)
+        // proves the repo received full inline agents, not refs.
         let parsed: RepoConfigFile = serde_json::from_str(&body).unwrap();
         assert_eq!(parsed.agents.len(), 2);
-        assert_eq!(
-            parsed.agents[&AgentLabel::parse("claude").unwrap()].role,
-            RosterRole::Master
-        );
+        let claude = &parsed.agents[&AgentLabel::parse("claude").unwrap()];
+        assert_eq!(claude.role, RosterRole::Master);
+        assert_eq!(claude.tool, Tool::Claude);
         assert_eq!(
             parsed.agents[&AgentLabel::parse("codex").unwrap()].role,
             RosterRole::Commit
@@ -797,30 +839,115 @@ mod tests {
     }
 
     #[test]
+    fn register_repo_team_dangling_ref_errors() {
+        // A team referencing a library agent that doesn't exist fails
+        // closed with an actionable message at consume time.
+        use crate::cli::teams_config::{RosterRole, TeamRoster};
+        use clank_core::ids::AgentLabel;
+        let home = tempfile::tempdir().unwrap();
+        let mut dev: TeamRoster = std::collections::BTreeMap::new();
+        dev.insert(
+            AgentLabel::parse("ghost").unwrap(),
+            team_ref(RosterRole::Master),
+        );
+        seed_user_config(home.path(), &[], &[("dev", dev)]);
+
+        let repo = init_repo();
+        let err = register_repo_team(home.path(), repo.path(), "dev").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("ghost") && msg.contains("not in"),
+            "expected dangling-ref hint; got: {msg}"
+        );
+    }
+
+    #[test]
     fn register_repo_team_then_save_round_trips() {
-        // init --team copies a roster down; team save writes it back
-        // up; the two rosters are equal (round-trip equality).
-        use crate::cli::teams_config::{Roster, RosterRole};
+        // init --team resolves refs down into the repo; team save
+        // writes them back up as refs; the stored team is unchanged.
+        use crate::cli::teams_config::{RosterRole, TeamRoster};
         use clank_core::ids::AgentLabel;
         use clank_core::vocab::Tool;
         let home = tempfile::tempdir().unwrap();
-        let mut dev: Roster = std::collections::BTreeMap::new();
+        let mut dev: TeamRoster = std::collections::BTreeMap::new();
         dev.insert(
             AgentLabel::parse("claude").unwrap(),
-            roster_agent(Tool::Claude, RosterRole::Master),
+            team_ref(RosterRole::Master),
         );
         dev.insert(
             AgentLabel::parse("codex").unwrap(),
-            roster_agent(Tool::Codex, RosterRole::Commit),
+            team_ref(RosterRole::Commit),
         );
-        seed_user_roster_team(home.path(), "dev", dev.clone());
+        seed_user_config(
+            home.path(),
+            &[("claude", Tool::Claude), ("codex", Tool::Codex)],
+            &[("dev", dev.clone())],
+        );
 
         let repo = init_repo();
         register_repo_team(home.path(), repo.path(), "dev").unwrap();
-        // Save under a new name and compare the stored roster.
+        // Save under a new name and compare the stored team.
         crate::cli::team::save_team(home.path(), repo.path(), "dev2", false).unwrap();
         let user_cfg = crate::cli::team::read_user_config(home.path()).unwrap();
         assert_eq!(user_cfg.teams.get("dev2").unwrap(), &dev);
+    }
+
+    #[test]
+    fn init_team_repo_config_identical_for_ref_and_inline_teams() {
+        // HARD INVARIANT: a team saved as refs and the same team saved
+        // inline must produce a BYTE-IDENTICAL repo config — refs
+        // resolve entirely in the home-config layer.
+        use crate::cli::teams_config::{RosterAgent, RosterRole, TeamMember, TeamRoster};
+        use clank_core::ids::AgentLabel;
+        use clank_core::vocab::Tool;
+
+        let ref_home = tempfile::tempdir().unwrap();
+        let mut ref_team: TeamRoster = std::collections::BTreeMap::new();
+        ref_team.insert(
+            AgentLabel::parse("claude").unwrap(),
+            team_ref(RosterRole::Master),
+        );
+        ref_team.insert(
+            AgentLabel::parse("codex").unwrap(),
+            team_ref(RosterRole::Commit),
+        );
+        seed_user_config(
+            ref_home.path(),
+            &[("claude", Tool::Claude), ("codex", Tool::Codex)],
+            &[("dev", ref_team)],
+        );
+        let ref_repo = init_repo();
+        register_repo_team(ref_home.path(), ref_repo.path(), "dev").unwrap();
+        let ref_body = std::fs::read_to_string(ref_repo.path().join(".clank/config.json")).unwrap();
+
+        let inline_home = tempfile::tempdir().unwrap();
+        let inline = |tool, role| {
+            TeamMember::Inline(RosterAgent {
+                tool,
+                launch: None,
+                initial_prompt: None,
+                role,
+            })
+        };
+        let mut inline_team: TeamRoster = std::collections::BTreeMap::new();
+        inline_team.insert(
+            AgentLabel::parse("claude").unwrap(),
+            inline(Tool::Claude, RosterRole::Master),
+        );
+        inline_team.insert(
+            AgentLabel::parse("codex").unwrap(),
+            inline(Tool::Codex, RosterRole::Commit),
+        );
+        seed_user_config(inline_home.path(), &[], &[("dev", inline_team)]);
+        let inline_repo = init_repo();
+        register_repo_team(inline_home.path(), inline_repo.path(), "dev").unwrap();
+        let inline_body =
+            std::fs::read_to_string(inline_repo.path().join(".clank/config.json")).unwrap();
+
+        assert_eq!(
+            ref_body, inline_body,
+            "ref-based and inline-based teams must produce an identical repo config"
+        );
     }
 
     #[test]
@@ -864,7 +991,11 @@ mod tests {
     #[test]
     fn register_repo_team_rejects_unknown_team() {
         let user_home = tempfile::tempdir().unwrap();
-        seed_user_roster_team(user_home.path(), "dev", std::collections::BTreeMap::new());
+        seed_user_config(
+            user_home.path(),
+            &[],
+            &[("dev", std::collections::BTreeMap::new())],
+        );
         let repo = init_repo();
         let err = register_repo_team(user_home.path(), repo.path(), "nonexistent").unwrap_err();
         let msg = format!("{err:#}");
@@ -913,15 +1044,15 @@ mod tests {
     // ── clank init --team overwrite guard (M3) ───────────────
 
     fn seed_user_team_dev(home: &Path) {
-        use crate::cli::teams_config::{Roster, RosterRole};
+        use crate::cli::teams_config::{RosterRole, TeamRoster};
         use clank_core::ids::AgentLabel;
         use clank_core::vocab::Tool;
-        let mut dev: Roster = std::collections::BTreeMap::new();
+        let mut dev: TeamRoster = std::collections::BTreeMap::new();
         dev.insert(
             AgentLabel::parse("claude").unwrap(),
-            roster_agent(Tool::Claude, RosterRole::Master),
+            team_ref(RosterRole::Master),
         );
-        seed_user_roster_team(home, "dev", dev);
+        seed_user_config(home, &[("claude", Tool::Claude)], &[("dev", dev)]);
     }
 
     #[test]

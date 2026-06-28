@@ -17,7 +17,11 @@ use std::path::{Path, PathBuf};
 
 use clank_core::ids::AgentLabel;
 
-use crate::cli::teams_config::{AgentDescription, Roster, RosterAgent, RosterRole, UserConfigFile};
+use std::collections::BTreeMap;
+
+use crate::cli::teams_config::{
+    AgentDescription, RosterRole, TeamMember, TeamRef, TeamRoster, UserConfigFile,
+};
 use crate::cli::{
     TeamArgs, TeamCmd, TeamDeleteArgs, TeamListArgs, TeamSaveArgs, TeamShowArgs, resolve_repo,
 };
@@ -104,10 +108,11 @@ fn write_typed_config<T: serde::Serialize>(path: &Path, value: &T) -> anyhow::Re
     Ok(())
 }
 
-/// A roster's master + reviewer tiers as wire strings. The shared
+/// A team's master + reviewer tiers as wire strings. The shared
 /// `--json` shape for `clank team show` and (flattened under each
-/// entry's `name`) `clank team list`. Derived from a [`Roster`] by
-/// bucketing on each agent's role.
+/// entry's `name`) `clank team list`. Derived from a [`TeamRoster`]
+/// by bucketing on each member's role — the `--json` shape lists
+/// labels only, so it needs no library lookup.
 #[derive(serde::Serialize)]
 struct RosterJson<'a> {
     master: Option<&'a str>,
@@ -116,12 +121,12 @@ struct RosterJson<'a> {
 }
 
 impl<'a> RosterJson<'a> {
-    fn from_roster(roster: &'a Roster) -> Self {
+    fn from_team(team: &'a TeamRoster) -> Self {
         let mut master = None;
         let mut commit_reviewers = Vec::new();
         let mut gate_reviewers = Vec::new();
-        for (label, agent) in roster {
-            match agent.role {
+        for (label, member) in team {
+            match member.role() {
                 RosterRole::Master => master = Some(label.as_str()),
                 RosterRole::Commit => commit_reviewers.push(label.as_str()),
                 RosterRole::Gate => gate_reviewers.push(label.as_str()),
@@ -144,16 +149,39 @@ struct TeamListJson<'a> {
     team: RosterJson<'a>,
 }
 
-fn fmt_agent_with_tool(label: &AgentLabel, agent: &RosterAgent) -> String {
-    format!("{} ({})", label.as_str(), agent.tool.as_str())
+/// Format `label (tool)` for the human listing. A [`TeamMember::Ref`]
+/// resolves its tool from the `library`; an aliased ref shows its
+/// target, and a dangling ref shows `→target MISSING` rather than
+/// hard-failing (display must never error).
+fn fmt_member(
+    label: &AgentLabel,
+    member: &TeamMember,
+    library: &BTreeMap<AgentLabel, AgentDescription>,
+) -> String {
+    match member {
+        TeamMember::Inline(agent) => format!("{} ({})", label.as_str(), agent.tool.as_str()),
+        TeamMember::Ref(r) => {
+            let target = r.agent.as_ref().unwrap_or(label);
+            match library.get(target) {
+                Some(desc) if r.agent.is_some() => format!(
+                    "{} (→{}, {})",
+                    label.as_str(),
+                    target.as_str(),
+                    desc.tool.as_str()
+                ),
+                Some(desc) => format!("{} ({})", label.as_str(), desc.tool.as_str()),
+                None => format!("{} (→{} MISSING)", label.as_str(), target.as_str()),
+            }
+        }
+    }
 }
 
-fn print_roster(roster: &Roster) {
+fn print_roster(team: &TeamRoster, library: &BTreeMap<AgentLabel, AgentDescription>) {
     let by_role = |want: RosterRole| -> String {
-        let entries: Vec<String> = roster
+        let entries: Vec<String> = team
             .iter()
-            .filter(|(_, a)| a.role == want)
-            .map(|(l, a)| fmt_agent_with_tool(l, a))
+            .filter(|(_, m)| m.role() == want)
+            .map(|(l, m)| fmt_member(l, m, library))
             .collect();
         if entries.is_empty() {
             "—".to_string()
@@ -161,10 +189,10 @@ fn print_roster(roster: &Roster) {
             entries.join(", ")
         }
     };
-    let master = roster
+    let master = team
         .iter()
-        .find(|(_, a)| a.role == RosterRole::Master)
-        .map(|(l, a)| fmt_agent_with_tool(l, a))
+        .find(|(_, m)| m.role() == RosterRole::Master)
+        .map(|(l, m)| fmt_member(l, m, library))
         .unwrap_or_else(|| "<unset>".to_string());
     println!("  master:           {master}");
     println!("  commit reviewers: {}", by_role(RosterRole::Commit));
@@ -179,9 +207,9 @@ fn list(home: &Path, args: TeamListArgs) -> anyhow::Result<()> {
         let rows: Vec<TeamListJson> = cfg
             .teams
             .iter()
-            .map(|(name, roster)| TeamListJson {
+            .map(|(name, team)| TeamListJson {
                 name,
-                team: RosterJson::from_roster(roster),
+                team: RosterJson::from_team(team),
             })
             .collect();
         println!("{}", serde_json::to_string_pretty(&rows)?);
@@ -191,9 +219,9 @@ fn list(home: &Path, args: TeamListArgs) -> anyhow::Result<()> {
         println!("no teams defined in {}", user_config_path(home).display());
         return Ok(());
     }
-    for (name, roster) in &cfg.teams {
+    for (name, team) in &cfg.teams {
         println!("{name}");
-        print_roster(roster);
+        print_roster(team, &cfg.agents);
     }
     Ok(())
 }
@@ -202,7 +230,7 @@ fn list(home: &Path, args: TeamListArgs) -> anyhow::Result<()> {
 /// roster.
 fn show_team(home: &Path, args: TeamShowArgs) -> anyhow::Result<()> {
     let cfg = read_user_config(home)?;
-    let roster = cfg.teams.get(&args.team).ok_or_else(|| {
+    let team = cfg.teams.get(&args.team).ok_or_else(|| {
         anyhow::anyhow!(
             "team `{}` not in user-scope `teams` ({})",
             args.team,
@@ -212,12 +240,12 @@ fn show_team(home: &Path, args: TeamShowArgs) -> anyhow::Result<()> {
     if args.json {
         println!(
             "{}",
-            serde_json::to_string_pretty(&RosterJson::from_roster(roster))?
+            serde_json::to_string_pretty(&RosterJson::from_team(team))?
         );
         return Ok(());
     }
     println!("team `{}`:", args.team);
-    print_roster(roster);
+    print_roster(team, &cfg.agents);
     Ok(())
 }
 
@@ -281,14 +309,27 @@ pub fn save_team(home: &Path, repo: &Path, name: &str, force: bool) -> anyhow::R
         }
     }
 
-    // All checks passed — apply (single write). The team template
-    // is the repo's roster, copied same-shape.
+    // All checks passed — apply (single write). Every roster agent's
+    // description now lives in the library (just inserted, or already
+    // present and identical), so the team is published as REFERENCES
+    // — one source of truth, no duplicated definitions.
     for (label, desc) in &to_insert {
         user_cfg.agents.insert(label.clone(), desc.clone());
     }
-    user_cfg
-        .teams
-        .insert(name.to_string(), repo_cfg.agents.clone());
+    let team: TeamRoster = repo_cfg
+        .agents
+        .iter()
+        .map(|(label, agent)| {
+            (
+                label.clone(),
+                TeamMember::Ref(TeamRef {
+                    agent: None,
+                    role: agent.role,
+                }),
+            )
+        })
+        .collect();
+    user_cfg.teams.insert(name.to_string(), team);
     write_user_config(home, &user_cfg)?;
 
     let added: Vec<&str> = to_insert.iter().map(|(l, _)| l.as_str()).collect();
@@ -346,16 +387,11 @@ mod tests {
         AgentLabel::parse(s).unwrap()
     }
 
-    fn roster_agent(tool: Tool, role: RosterRole) -> RosterAgent {
-        RosterAgent {
-            tool,
-            launch: None,
-            initial_prompt: None,
-            role,
-        }
+    fn team_ref(role: RosterRole) -> TeamMember {
+        TeamMember::Ref(TeamRef { agent: None, role })
     }
 
-    fn seed_user_config(home: &Path, agents: &[(&str, Tool)], teams: &[(&str, Roster)]) {
+    fn seed_user_config(home: &Path, agents: &[(&str, Tool)], teams: &[(&str, TeamRoster)]) {
         let mut cfg = UserConfigFile::default();
         for (label, tool) in agents {
             cfg.agents.insert(
@@ -367,8 +403,8 @@ mod tests {
                 },
             );
         }
-        for (name, roster) in teams {
-            cfg.teams.insert(name.to_string(), roster.clone());
+        for (name, team) in teams {
+            cfg.teams.insert(name.to_string(), team.clone());
         }
         write_user_config(home, &cfg).unwrap();
     }
@@ -382,19 +418,13 @@ mod tests {
 
     #[test]
     fn team_json_shapes_bucket_by_role() {
-        let mut roster: Roster = std::collections::BTreeMap::new();
-        roster.insert(
-            lbl("claude"),
-            roster_agent(Tool::Claude, RosterRole::Master),
-        );
-        roster.insert(lbl("codex"), roster_agent(Tool::Codex, RosterRole::Commit));
-        roster.insert(
-            lbl("ruthless"),
-            roster_agent(Tool::Claude, RosterRole::Gate),
-        );
+        let mut team: TeamRoster = std::collections::BTreeMap::new();
+        team.insert(lbl("claude"), team_ref(RosterRole::Master));
+        team.insert(lbl("codex"), team_ref(RosterRole::Commit));
+        team.insert(lbl("ruthless"), team_ref(RosterRole::Gate));
 
         assert_eq!(
-            serde_json::to_value(RosterJson::from_roster(&roster)).unwrap(),
+            serde_json::to_value(RosterJson::from_team(&team)).unwrap(),
             serde_json::json!({
                 "master": "claude",
                 "commit_reviewers": ["codex"],
@@ -404,7 +434,7 @@ mod tests {
 
         let row = TeamListJson {
             name: "dev",
-            team: RosterJson::from_roster(&roster),
+            team: RosterJson::from_team(&team),
         };
         assert_eq!(
             serde_json::to_value(row).unwrap(),
@@ -417,9 +447,9 @@ mod tests {
         );
 
         // master unset → null.
-        let empty: Roster = std::collections::BTreeMap::new();
+        let empty: TeamRoster = std::collections::BTreeMap::new();
         assert_eq!(
-            serde_json::to_value(RosterJson::from_roster(&empty)).unwrap(),
+            serde_json::to_value(RosterJson::from_team(&empty)).unwrap(),
             serde_json::json!({
                 "master": null,
                 "commit_reviewers": [],
@@ -473,11 +503,8 @@ mod tests {
     fn delete_without_force_refuses() {
         let home_dir = setup_home();
         let home = home_dir.path();
-        let mut dev: Roster = std::collections::BTreeMap::new();
-        dev.insert(
-            lbl("claude"),
-            roster_agent(Tool::Claude, RosterRole::Master),
-        );
+        let mut dev: TeamRoster = std::collections::BTreeMap::new();
+        dev.insert(lbl("claude"), team_ref(RosterRole::Master));
         seed_user_config(home, &[("claude", Tool::Claude)], &[("dev", dev)]);
 
         let err = delete_team(home, "dev", false).unwrap_err();
@@ -492,11 +519,8 @@ mod tests {
     fn delete_with_force_removes() {
         let home_dir = setup_home();
         let home = home_dir.path();
-        let mut dev: Roster = std::collections::BTreeMap::new();
-        dev.insert(
-            lbl("claude"),
-            roster_agent(Tool::Claude, RosterRole::Master),
-        );
+        let mut dev: TeamRoster = std::collections::BTreeMap::new();
+        dev.insert(lbl("claude"), team_ref(RosterRole::Master));
         seed_user_config(home, &[("claude", Tool::Claude)], &[("dev", dev)]);
         delete_team(home, "dev", true).unwrap();
         assert!(!read_user_config(home).unwrap().teams.contains_key("dev"));
@@ -523,10 +547,14 @@ mod tests {
 
         let cfg = read_user_config(home).unwrap();
         let dev = cfg.teams.get("dev").unwrap();
-        // Same-shape roster copy: roles preserved.
-        assert_eq!(dev.get(&lbl("claude")).unwrap().role, RosterRole::Master);
-        assert_eq!(dev.get(&lbl("codex")).unwrap().role, RosterRole::Commit);
-        assert_eq!(dev.get(&lbl("ruthless")).unwrap().role, RosterRole::Gate);
+        // Published as REFERENCES (roles preserved, no inline tool).
+        assert_eq!(dev.get(&lbl("claude")).unwrap().role(), RosterRole::Master);
+        assert_eq!(dev.get(&lbl("codex")).unwrap().role(), RosterRole::Commit);
+        assert_eq!(dev.get(&lbl("ruthless")).unwrap().role(), RosterRole::Gate);
+        assert!(
+            matches!(dev.get(&lbl("claude")).unwrap(), TeamMember::Ref(_)),
+            "save must publish references, not inline definitions"
+        );
         // Role-free descriptions copied into the library.
         assert!(cfg.agents.contains_key(&lbl("claude")));
         assert!(cfg.agents.contains_key(&lbl("codex")));
@@ -577,7 +605,7 @@ mod tests {
     fn save_team_existing_name_requires_force() {
         let home_dir = setup_home();
         let home = home_dir.path();
-        let existing: Roster = std::collections::BTreeMap::new();
+        let existing: TeamRoster = std::collections::BTreeMap::new();
         seed_user_config(home, &[], &[("dev", existing)]);
         let repo = tempfile::tempdir().unwrap();
         seed_repo_config(
@@ -599,7 +627,7 @@ mod tests {
                 .unwrap()
                 .get(&lbl("claude"))
                 .unwrap()
-                .role,
+                .role(),
             RosterRole::Master
         );
     }
@@ -618,8 +646,8 @@ mod tests {
         save_team(home, repo.path(), "partial", false).unwrap();
         let cfg = read_user_config(home).unwrap();
         let team = cfg.teams.get("partial").unwrap();
-        assert!(!team.values().any(|a| a.role == RosterRole::Master));
-        assert_eq!(team.get(&lbl("codex")).unwrap().role, RosterRole::Commit);
+        assert!(!team.values().any(|m| m.role() == RosterRole::Master));
+        assert_eq!(team.get(&lbl("codex")).unwrap().role(), RosterRole::Commit);
         assert!(cfg.agents.contains_key(&lbl("codex")));
     }
 
@@ -684,12 +712,9 @@ mod tests {
     fn show_team_ok_for_existing_template() {
         let home_dir = setup_home();
         let home = home_dir.path();
-        let mut dev: Roster = std::collections::BTreeMap::new();
-        dev.insert(
-            lbl("claude"),
-            roster_agent(Tool::Claude, RosterRole::Master),
-        );
-        seed_user_config(home, &[], &[("dev", dev)]);
+        let mut dev: TeamRoster = std::collections::BTreeMap::new();
+        dev.insert(lbl("claude"), team_ref(RosterRole::Master));
+        seed_user_config(home, &[("claude", Tool::Claude)], &[("dev", dev)]);
         show_team(
             home,
             TeamShowArgs {

@@ -10,9 +10,14 @@
 //! User-scope keeps BOTH:
 //! - `agents`: a by-name library of reusable agent DESCRIPTIONS
 //!   (no role), so you can add an agent to a repo by name.
-//! - `teams`: named ROSTERS (= templates), the same shape as the
-//!   repo's `agents`. `init --team` / `team save` are same-shape
-//!   roster copies.
+//! - `teams`: named [`TeamRoster`] templates. A team member
+//!   ([`TeamMember`]) either REFERENCES a library agent by name
+//!   (preferred — one source of truth) or carries a full INLINE
+//!   definition for a team-only agent. `init --team` RESOLVES the
+//!   references against the library into a repo's self-contained
+//!   roster of full inline agents; `team save` publishes a repo's
+//!   roster back up as references. References live only here — they
+//!   never reach a repo config.
 //!
 //! All structs round-trip through serde with
 //! `#[derive(Deserialize, Serialize)]`. No whole-document
@@ -49,12 +54,14 @@ pub struct UserConfigFile {
     /// copies a description from here into a repo's roster.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub agents: BTreeMap<AgentLabel, AgentDescription>,
-    /// Named ROSTER templates. Each value is a [`Roster`] — the
-    /// same shape as a repo's `agents`. `init --team <name>` copies
-    /// one into a repo; `team save <name>` captures a repo's roster
-    /// up here.
+    /// Named TEAM templates. Each value is a [`TeamRoster`] — a map
+    /// of [`TeamMember`]s that either REFERENCE a library agent
+    /// (preferred) or carry an INLINE custom definition.
+    /// `init --team <name>` resolves one into a repo's self-contained
+    /// roster; `team save <name>` captures a repo's roster up here as
+    /// references.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub teams: BTreeMap<String, Roster>,
+    pub teams: BTreeMap<String, TeamRoster>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review: Option<crate::cli::config::ReviewSection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -167,6 +174,107 @@ impl RosterAgent {
             initial_prompt: self.initial_prompt.clone(),
         }
     }
+}
+
+/// A team template: members keyed by label. Each [`TeamMember`] is
+/// either a REFERENCE into the by-name `agents` library (preferred —
+/// one source of truth) or a full INLINE definition for a team-only
+/// agent not in the library. Resolved into a [`Roster`] of full
+/// inline agents when consumed by `init --team`; references never
+/// reach a repo config.
+pub type TeamRoster = BTreeMap<AgentLabel, TeamMember>;
+
+/// One team-template member: a library reference or an inline custom
+/// definition — the two kinds a team can be built from.
+///
+/// Serde is `untagged` with `Inline` FIRST: a [`RosterAgent`]
+/// requires `tool`, so a reference value (which has no `tool`) can
+/// never match `Inline` and falls through to `Ref`. This is what
+/// lets old all-inline team configs keep deserializing unchanged
+/// while new ref-shaped entries (`{"role":"gate"}`) parse as `Ref`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum TeamMember {
+    /// A full inline definition for a team-only agent not in the
+    /// library (same shape as a repo roster entry).
+    Inline(RosterAgent),
+    /// A reference to a library agent, carrying only the role.
+    Ref(TeamRef),
+}
+
+/// A reference from a team to a by-name `agents` library entry. Carries
+/// only the role; `tool`/`launch`/`initial_prompt` resolve from the
+/// library when the team is consumed.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TeamRef {
+    /// Library agent to resolve against. Defaults to the team entry's
+    /// KEY; set it only to alias a differently-named library agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<AgentLabel>,
+    pub role: RosterRole,
+}
+
+impl TeamMember {
+    /// The role this member plays, regardless of kind.
+    pub fn role(&self) -> RosterRole {
+        match self {
+            TeamMember::Inline(agent) => agent.role,
+            TeamMember::Ref(r) => r.role,
+        }
+    }
+
+    /// Resolve to a concrete [`RosterAgent`]. `key` is the team
+    /// entry's label — the default library name for a [`TeamRef`]
+    /// with no explicit `agent`.
+    pub fn resolve(
+        &self,
+        key: &AgentLabel,
+        library: &BTreeMap<AgentLabel, AgentDescription>,
+    ) -> Result<RosterAgent, TeamResolveError> {
+        match self {
+            TeamMember::Inline(agent) => Ok(agent.clone()),
+            TeamMember::Ref(r) => {
+                let target = r.agent.as_ref().unwrap_or(key);
+                let desc = library
+                    .get(target)
+                    .ok_or_else(|| TeamResolveError::UnknownRef {
+                        member: key.clone(),
+                        target: target.clone(),
+                    })?;
+                Ok(RosterAgent::from_description(desc.clone(), r.role))
+            }
+        }
+    }
+}
+
+/// Resolve a whole team template into a concrete [`Roster`] of full
+/// inline agents, resolving every [`TeamMember::Ref`] against the
+/// `agents` library. The home-config → repo-config bridge:
+/// `init --team` calls it so a repo receives a self-contained roster
+/// (references never reach a repo config).
+pub fn resolve_team(
+    team: &TeamRoster,
+    library: &BTreeMap<AgentLabel, AgentDescription>,
+) -> Result<Roster, TeamResolveError> {
+    team.iter()
+        .map(|(label, member)| Ok((label.clone(), member.resolve(label, library)?)))
+        .collect()
+}
+
+/// A [`TeamMember::Ref`] pointed at a library agent that doesn't
+/// exist. Raised when consuming a team (`init --team`).
+#[derive(Debug, thiserror::Error)]
+pub enum TeamResolveError {
+    #[error(
+        "team member `{member}` references library agent `{target}`, which is not in \
+         user-scope `agents`; add it (`clank agent add {target} --global --tool <tool>`) \
+         or define the member inline"
+    )]
+    UnknownRef {
+        member: AgentLabel,
+        target: AgentLabel,
+    },
 }
 
 /// What kind of review a reviewer does. Names what they
@@ -366,19 +474,10 @@ mod tests {
             },
         );
         let mut teams = BTreeMap::new();
-        let mut dev: Roster = BTreeMap::new();
-        dev.insert(
-            label("claude"),
-            roster_agent(Tool::Claude, RosterRole::Master),
-        );
-        dev.insert(
-            label("codex"),
-            roster_agent(Tool::Codex, RosterRole::Commit),
-        );
-        dev.insert(
-            label("ruthless"),
-            roster_agent(Tool::Claude, RosterRole::Gate),
-        );
+        let mut dev: TeamRoster = BTreeMap::new();
+        dev.insert(label("claude"), team_ref(RosterRole::Master));
+        dev.insert(label("codex"), team_ref(RosterRole::Commit));
+        dev.insert(label("ruthless"), team_ref(RosterRole::Gate));
         teams.insert("dev".to_string(), dev);
         let cfg = UserConfigFile {
             agents,
@@ -390,8 +489,112 @@ mod tests {
         assert_eq!(back.agents.len(), 2);
         assert_eq!(back.teams.len(), 1);
         let dev = back.teams.get("dev").unwrap();
-        assert_eq!(dev.get(&label("claude")).unwrap().role, RosterRole::Master);
-        assert_eq!(dev.get(&label("ruthless")).unwrap().role, RosterRole::Gate);
+        assert_eq!(
+            dev.get(&label("claude")).unwrap().role(),
+            RosterRole::Master
+        );
+        assert_eq!(
+            dev.get(&label("ruthless")).unwrap().role(),
+            RosterRole::Gate
+        );
+    }
+
+    fn team_ref(role: RosterRole) -> TeamMember {
+        TeamMember::Ref(TeamRef { agent: None, role })
+    }
+
+    #[test]
+    fn team_member_ref_round_trips_as_role_only_object() {
+        let m = team_ref(RosterRole::Gate);
+        let json = serde_json::to_string(&m).unwrap();
+        assert_eq!(json, r#"{"role":"gate"}"#);
+        assert_eq!(serde_json::from_str::<TeamMember>(&json).unwrap(), m);
+    }
+
+    #[test]
+    fn team_member_ref_with_alias_round_trips() {
+        let m = TeamMember::Ref(TeamRef {
+            agent: Some(label("ruthless")),
+            role: RosterRole::Gate,
+        });
+        let json = serde_json::to_string(&m).unwrap();
+        assert_eq!(json, r#"{"agent":"ruthless","role":"gate"}"#);
+        assert_eq!(serde_json::from_str::<TeamMember>(&json).unwrap(), m);
+    }
+
+    #[test]
+    fn team_member_inline_value_parses_as_inline_not_ref() {
+        // A value WITH `tool` is an inline custom definition — it must
+        // not be mistaken for a ref (this is the back-compat path: old
+        // all-inline team configs keep loading).
+        let m: TeamMember = serde_json::from_str(r#"{"tool":"claude","role":"commit"}"#).unwrap();
+        match m {
+            TeamMember::Inline(a) => {
+                assert_eq!(a.tool, Tool::Claude);
+                assert_eq!(a.role, RosterRole::Commit);
+            }
+            TeamMember::Ref(_) => panic!("a value with `tool` must parse as Inline"),
+        }
+    }
+
+    #[test]
+    fn team_resolve_ref_pulls_definition_from_library() {
+        let mut library = BTreeMap::new();
+        library.insert(
+            label("ruthless"),
+            AgentDescription {
+                tool: Tool::Claude,
+                launch: Some(LaunchConfig {
+                    command: None,
+                    args: vec!["--agent".into(), "ruthless-code-reviewer".into()],
+                    env: Default::default(),
+                }),
+                initial_prompt: None,
+            },
+        );
+        let mut team: TeamRoster = BTreeMap::new();
+        // Ref by key (default name) and an aliased ref.
+        team.insert(label("ruthless"), team_ref(RosterRole::Gate));
+        team.insert(
+            label("second"),
+            TeamMember::Ref(TeamRef {
+                agent: Some(label("ruthless")),
+                role: RosterRole::Commit,
+            }),
+        );
+        // Plus an inline custom member with no library entry.
+        team.insert(
+            label("oneoff"),
+            TeamMember::Inline(roster_agent(Tool::Codex, RosterRole::Master)),
+        );
+
+        let roster = resolve_team(&team, &library).unwrap();
+        let gate = roster.get(&label("ruthless")).unwrap();
+        assert_eq!(gate.role, RosterRole::Gate);
+        assert_eq!(
+            gate.launch.as_ref().unwrap().args,
+            vec!["--agent", "ruthless-code-reviewer"]
+        );
+        // Aliased ref resolves the same definition with its own role.
+        let second = roster.get(&label("second")).unwrap();
+        assert_eq!(second.role, RosterRole::Commit);
+        assert_eq!(second.tool, Tool::Claude);
+        // Inline member is copied verbatim.
+        assert_eq!(roster.get(&label("oneoff")).unwrap().tool, Tool::Codex);
+    }
+
+    #[test]
+    fn team_resolve_dangling_ref_errors() {
+        let library = BTreeMap::new();
+        let mut team: TeamRoster = BTreeMap::new();
+        team.insert(label("ghost"), team_ref(RosterRole::Gate));
+        let err = resolve_team(&team, &library).unwrap_err();
+        match err {
+            TeamResolveError::UnknownRef { member, target } => {
+                assert_eq!(member.as_str(), "ghost");
+                assert_eq!(target.as_str(), "ghost");
+            }
+        }
     }
 
     #[test]

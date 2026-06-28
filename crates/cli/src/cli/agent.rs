@@ -885,16 +885,24 @@ fn remove(args: AgentRemoveArgs) -> anyhow::Result<()> {
 }
 
 /// Remove an agent DESCRIPTION from the user-scope `agents`
-/// library and scrub it from every team template (a Roster) so no
-/// dangling reference survives.
+/// library and scrub every team member that REFERENCES it (a
+/// [`crate::cli::teams_config::TeamMember::Ref`] resolving to this
+/// label) so no dangling reference survives. Inline team members are
+/// self-contained and left untouched.
 pub fn remove_global_agent(home: &Path, label: &AgentLabel) -> anyhow::Result<()> {
+    use crate::cli::teams_config::TeamMember;
     let mut file = read_user_config(home)?;
     if file.agents.remove(label).is_none() {
         anyhow::bail!("agent `{}` not in user-scope `agents`", label.as_str());
     }
     let mut touched = Vec::new();
-    for (name, roster) in file.teams.iter_mut() {
-        if roster.remove(label).is_some() {
+    for (name, team) in file.teams.iter_mut() {
+        let before = team.len();
+        team.retain(|key, member| match member {
+            TeamMember::Ref(r) => r.agent.as_ref().unwrap_or(key) != label,
+            TeamMember::Inline(_) => true,
+        });
+        if team.len() != before {
             touched.push(name.clone());
         }
     }
@@ -1401,14 +1409,35 @@ mod tests {
 
     #[test]
     fn remove_global_agent_scrubs_team_templates() {
+        use crate::cli::teams_config::{TeamMember, TeamRef, TeamRoster};
         let home = tempfile::tempdir().unwrap();
         let mut cfg = UserConfigFile::default();
         cfg.agents
             .insert(AgentLabel::parse("codex").unwrap(), desc(Tool::Codex));
-        let mut dev: crate::cli::teams_config::Roster = BTreeMap::new();
+        let mut dev: TeamRoster = BTreeMap::new();
+        // A ref by key, plus an aliased ref pointing at the same
+        // library agent — both must be scrubbed.
         dev.insert(
             AgentLabel::parse("codex").unwrap(),
-            RosterAgent::from_description(desc(Tool::Codex), RosterRole::Commit),
+            TeamMember::Ref(TeamRef {
+                agent: None,
+                role: RosterRole::Commit,
+            }),
+        );
+        dev.insert(
+            AgentLabel::parse("reviewer").unwrap(),
+            TeamMember::Ref(TeamRef {
+                agent: Some(AgentLabel::parse("codex").unwrap()),
+                role: RosterRole::Gate,
+            }),
+        );
+        // An inline member is self-contained — it must survive.
+        dev.insert(
+            AgentLabel::parse("keep").unwrap(),
+            TeamMember::Inline(RosterAgent::from_description(
+                desc(Tool::Claude),
+                RosterRole::Master,
+            )),
         );
         cfg.teams.insert("dev".to_string(), dev);
         std::fs::create_dir_all(home.path().join(".clank")).unwrap();
@@ -1422,7 +1451,16 @@ mod tests {
         remove_global_agent(home.path(), &codex).unwrap();
         let back = read_user_config(home.path()).unwrap();
         assert!(!back.agents.contains_key(&codex));
-        assert!(!back.teams.get("dev").unwrap().contains_key(&codex));
+        let dev = back.teams.get("dev").unwrap();
+        assert!(!dev.contains_key(&codex), "ref by key must be scrubbed");
+        assert!(
+            !dev.contains_key(&AgentLabel::parse("reviewer").unwrap()),
+            "aliased ref to the removed agent must be scrubbed"
+        );
+        assert!(
+            dev.contains_key(&AgentLabel::parse("keep").unwrap()),
+            "inline member must survive"
+        );
     }
 
     #[test]
