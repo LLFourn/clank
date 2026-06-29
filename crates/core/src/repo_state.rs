@@ -296,7 +296,7 @@ pub fn umbrella_sections<'a>(
                 out.push((key, Vec::new()));
             }
             let run = &mut out.last_mut().unwrap().1;
-            run.extend(pending.drain(..));
+            run.append(&mut pending);
             run.push(e);
         }
         if !pending.is_empty() {
