@@ -978,15 +978,8 @@ fn build_launch(
 fn read_user_config(home: &Path) -> anyhow::Result<UserConfigFile> {
     let path = home.join(".clank/config.json");
     match std::fs::read_to_string(&path) {
-        Ok(s) => serde_json::from_str(&s).map_err(|e| {
-            // An OLD-shape `teams` value (a TeamComposition, not a
-            // roster) fails to parse here — fail closed with the
-            // re-save hint instead of a cryptic serde message.
-            match crate::cli::teams_config::old_teams_shape_hint(&s) {
-                Some(hint) => anyhow::anyhow!("{hint}"),
-                None => anyhow::Error::from(e).context(format!("parsing {}", path.display())),
-            }
-        }),
+        Ok(s) => serde_json::from_str(&s)
+            .map_err(|e| anyhow::Error::from(e).context(format!("parsing {}", path.display()))),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(UserConfigFile::default()),
         Err(e) => Err(anyhow::Error::from(e).context(format!("reading {}", path.display()))),
     }

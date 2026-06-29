@@ -357,39 +357,6 @@ pub enum ResolutionError {
     MultipleMasters(String),
 }
 
-/// Map a failed [`UserConfigFile`] parse to an actionable hint
-/// when the cause is an OLD-shape `teams` value (a
-/// `TeamComposition` `{master, commit_reviewers, gate_reviewers}`,
-/// not a roster) — the shape every pre-`repo-agents-no-team`
-/// global config carries. Returns `Some(message)` to substitute
-/// for the cryptic serde error, or `None` to keep the original.
-///
-/// Called by every user-config loader (`team`/`agent` scopes) so
-/// the old shape fails closed with one consistent re-save hint
-/// instead of a `invalid type: string … expected struct
-/// RosterAgent` message.
-pub fn old_teams_shape_hint(body: &str) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_str(body).ok()?;
-    let teams = value.get("teams")?.as_object()?;
-    let any_old = teams.values().any(|team| {
-        let Some(obj) = team.as_object() else {
-            return false;
-        };
-        // A roster's values are objects (RosterAgent); an old
-        // TeamComposition's `master` is a string / `commit_reviewers`
-        // is an array — neither is a roster entry.
-        obj.get("master").is_some_and(|m| !m.is_object())
-            || obj.get("commit_reviewers").is_some_and(|c| c.is_array())
-            || obj.get("gate_reviewers").is_some_and(|g| g.is_array())
-    });
-    any_old.then(|| {
-        "user-scope `~/.clank/config.json#/teams` uses the old team schema (a \
-         `master`/`commit_reviewers`/`gate_reviewers` composition, not a roster). \
-         Re-save each team from a repo with `clank team save <name>`."
-            .to_string()
-    })
-}
-
 /// Resolve the registered set from a repo's roster. The master is
 /// the single entry with `role == Master` (zero →
 /// [`ResolutionError::NoMaster`], more than one →

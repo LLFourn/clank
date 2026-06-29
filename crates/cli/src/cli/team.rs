@@ -54,15 +54,8 @@ fn user_config_path(home: &Path) -> PathBuf {
 pub fn read_user_config(home: &Path) -> anyhow::Result<UserConfigFile> {
     let path = user_config_path(home);
     match std::fs::read_to_string(&path) {
-        Ok(s) => serde_json::from_str(&s).map_err(|e| {
-            // An OLD-shape `teams` value (a TeamComposition, not a
-            // roster) fails to parse here — fail closed with the
-            // re-save hint instead of a cryptic serde message.
-            match crate::cli::teams_config::old_teams_shape_hint(&s) {
-                Some(hint) => anyhow::anyhow!("{hint}"),
-                None => anyhow::Error::from(e).context(format!("parsing {}", path.display())),
-            }
-        }),
+        Ok(s) => serde_json::from_str(&s)
+            .map_err(|e| anyhow::Error::from(e).context(format!("parsing {}", path.display()))),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(UserConfigFile::default()),
         Err(e) => Err(anyhow::Error::from(e).context(format!("reading {}", path.display()))),
     }
@@ -683,29 +676,6 @@ mod tests {
         )
         .unwrap_err();
         assert!(format!("{err:#}").contains("not in user-scope `teams`"));
-    }
-
-    #[test]
-    fn read_user_config_fails_closed_on_old_teams_shape() {
-        // The real ~/.clank/config.json shape today: `teams` values
-        // are old `TeamComposition` objects, not rosters. Reading
-        // must fail closed with the re-save hint, not a cryptic
-        // serde error. `list`/`show` go through this loader.
-        let home_dir = setup_home();
-        let home = home_dir.path();
-        let path = home.join(".clank/config.json");
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &path,
-            r#"{"teams":{"default":{"master":"claude","commit_reviewers":["codex"],"gate_reviewers":["ruthless"]}}}"#,
-        )
-        .unwrap();
-        let err = read_user_config(home).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("old team schema") && msg.contains("clank team save"),
-            "expected re-save hint; got: {msg}"
-        );
     }
 
     #[test]

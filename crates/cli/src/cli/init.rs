@@ -383,18 +383,19 @@ pub fn register_repo_team_guarded(
     register_repo_team(home, repo, team_name)
 }
 
-/// Seed a repo by COPYING the named user-scope team TEMPLATE (a
-/// [`Roster`]) into `<repo>/.clank/config.json`'s `agents`
-/// (same-shape copy — the repo config IS a roster). `pub`,
-/// env-free core (takes `home` + `repo` explicitly) — both
-/// `clank init --team` and integration-test setup call it.
+/// Seed a repo by RESOLVING the named user-scope team TEMPLATE (a
+/// [`TeamRoster`]) into `<repo>/.clank/config.json`'s `agents` — a
+/// concrete [`Roster`] of full inline agents, with references
+/// resolved against the library. `pub`, env-free core (takes explicit
+/// `home`/`repo`) — both `clank init --team` and integration-test
+/// setup call it.
 ///
 /// Validations / fail-closed:
 /// - The named team must exist in user-scope
 ///   `~/.clank/config.json#/teams`.
-/// - An OLD-shape global team (a `TeamComposition`
-///   `{master, commit_reviewers, gate_reviewers}`, not a roster)
-///   fails closed with a "re-save (`clank team save`)" hint.
+/// - A malformed team member errors naming the member and the valid
+///   shapes; a dangling reference errors naming the missing library
+///   agent.
 /// - An existing VALID repo config round-trips through the new
 ///   schema's `extra` flatten catchall, so unknown fields
 ///   (review/hooks/diff) are preserved across the swap.
@@ -437,10 +438,10 @@ pub fn register_repo_team(home: &Path, repo: &Path, team_name: &str) -> anyhow::
 ///
 /// Reads the global config as raw JSON and deserializes only the
 /// requested team's value (plus the library), so an UNRELATED
-/// old-shape team can't block this one. Fail-closed: a missing team
-/// errors with a compose-it hint; an old-shape team value
-/// (`TeamComposition`, not a roster) errors with a re-save hint; a
-/// dangling reference errors naming the missing library agent.
+/// malformed team can't block this one. Fail-closed: a missing team
+/// errors with a compose-it hint; a malformed member errors naming
+/// the member and valid shapes; a dangling reference errors naming
+/// the missing library agent.
 fn load_user_team_roster(
     home: &Path,
     team_name: &str,
@@ -475,13 +476,8 @@ fn load_user_team_roster(
         );
     };
 
-    let team: TeamRoster = serde_json::from_value(team_value.clone()).map_err(|_| {
-        anyhow::anyhow!(
-            "team `{team_name}` in user-scope `teams` uses the old team schema (a \
-             `master`/`commit_reviewers`/`gate_reviewers` composition, not a roster). \
-             Re-save it from a repo with `clank team save {team_name}`."
-        )
-    })?;
+    let team: TeamRoster = serde_json::from_value(team_value.clone())
+        .map_err(|e| team_parse_error(team_name, team_value, e))?;
 
     let library: BTreeMap<AgentLabel, AgentDescription> = match raw.get("agents") {
         Some(agents) => serde_json::from_value(agents.clone()).map_err(|e| {
@@ -494,6 +490,33 @@ fn load_user_team_roster(
     };
 
     resolve_team(&team, &library).map_err(anyhow::Error::from)
+}
+
+/// Turn a failed [`TeamRoster`] deserialize into an actionable error.
+/// The untagged `TeamMember` error is generic ("data did not match
+/// any variant"), so locate the offending member and spell out the
+/// valid member shapes.
+fn team_parse_error(
+    team_name: &str,
+    team_value: &serde_json::Value,
+    err: serde_json::Error,
+) -> anyhow::Error {
+    use crate::cli::teams_config::TeamMember;
+
+    if let Some(obj) = team_value.as_object() {
+        for (member, value) in obj {
+            if let Err(member_err) = serde_json::from_value::<TeamMember>(value.clone()) {
+                return anyhow::anyhow!(
+                    "team `{team_name}` member `{member}` in user-scope `teams` is malformed \
+                     ({member_err}); a member must be a reference \
+                     (`{{\"role\": \"<master|commit|gate>\", \"agent\"?: \"<library agent>\"}}`) \
+                     or a full inline definition (`{{\"tool\": \"<claude|codex>\", \"role\": ...}}`)"
+                );
+            }
+        }
+    }
+
+    anyhow::Error::from(err).context(format!("parsing team `{team_name}` in user-scope `teams`"))
 }
 
 #[cfg(test)]
@@ -1004,25 +1027,24 @@ mod tests {
     }
 
     #[test]
-    fn register_repo_team_fails_closed_on_old_shape_global_team() {
-        // The plan's fail-closed site: a global `teams` value in the
-        // OLD `TeamComposition` shape (not a roster) → re-save hint,
-        // not a cryptic serde error. This is the shape in the real
-        // ~/.clank/config.json today.
+    fn register_repo_team_malformed_member_names_member() {
+        // A team member that's neither a valid ref nor inline (here a
+        // mistyped `agnt` field) errors naming the offending member
+        // and the valid shapes.
         let user_home = tempfile::tempdir().unwrap();
         let upath = user_home.path().join(".clank/config.json");
         std::fs::create_dir_all(upath.parent().unwrap()).unwrap();
         std::fs::write(
             &upath,
-            r#"{"teams":{"dev":{"master":"claude","commit_reviewers":["codex"],"gate_reviewers":["ruthless"]}}}"#,
+            r#"{"agents":{"codex":{"tool":"codex"}},"teams":{"dev":{"codex":{"agnt":"codex","role":"commit"}}}}"#,
         )
         .unwrap();
         let repo = init_repo();
         let err = register_repo_team(user_home.path(), repo.path(), "dev").unwrap_err();
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("old team schema") && msg.contains("clank team save"),
-            "expected re-save hint; got: {msg}"
+            msg.contains("codex") && msg.contains("malformed"),
+            "expected the offending member named; got: {msg}"
         );
     }
 
