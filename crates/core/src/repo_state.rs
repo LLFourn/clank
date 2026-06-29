@@ -254,10 +254,18 @@ pub fn umbrella_key(event: &LogEvent) -> UmbrellaKey {
 
 /// THE umbrella rule, shared by every timeline renderer (html,
 /// `clank log --oneline`, the status TUI log pane): group
-/// CONTIGUOUS same-key events into one section. A plan
-/// interrupted by another plan's (or ad-hoc) commit opens a NEW
-/// umbrella — chronology is never reordered, so interleaved
-/// `A1 B1 A2` yields THREE sections (A, B, A), not a merged A.
+/// CONTIGUOUS events into one section per plan. A plan interrupted
+/// by ANOTHER plan's commit opens a NEW umbrella — chronology is
+/// never reordered, so interleaved `A1 B1 A2` yields THREE sections
+/// (A, B, A), not a merged A.
+///
+/// Ad-hoc commits (no `[plan]` tag) have NO umbrella of their own:
+/// they FOLD into the surrounding plan's run (the current section),
+/// and the renderer marks them per-row (the `~` ad-hoc marker) so
+/// they read inline rather than as a segregated "adhoc" block
+/// (adhoc-commit-marker). Only a LEADING ad-hoc run — ad-hoc events
+/// before any plan section exists — opens its own (header-less)
+/// section, since there is nothing to fold into.
 /// Direction-agnostic: sections come out in the order events go
 /// in (html feeds newest-first, the log/TUI oldest-first).
 pub fn umbrella_sections<'a>(events: &[&'a LogEvent]) -> Vec<(UmbrellaKey, Vec<&'a LogEvent>)> {
@@ -265,6 +273,10 @@ pub fn umbrella_sections<'a>(events: &[&'a LogEvent]) -> Vec<(UmbrellaKey, Vec<&
     for e in events {
         let key = umbrella_key(e);
         match out.last_mut() {
+            // Ad-hoc joins the current umbrella (fold into the
+            // surrounding plan); it never opens or extends a key of its
+            // own once a section exists.
+            Some((_, run)) if key == UmbrellaKey::AdHoc => run.push(e),
             Some((k, run)) if *k == key => run.push(e),
             _ => out.push((key, vec![e])),
         }
@@ -1341,14 +1353,40 @@ mod tests {
     }
 
     #[test]
-    fn umbrella_sections_group_contiguous_and_adhoc() {
+    fn umbrella_sections_adhoc_folds_into_surrounding_plan() {
+        // adhoc-commit-marker: an ad-hoc commit has no umbrella of its
+        // own — it folds into the surrounding plan's run (marked per-row
+        // by the renderer), NOT a segregated AdHoc section.
         let a1 = log_ev(Some("a"), 1);
         let a2 = log_ev(Some("a"), 2);
         let x = log_ev(None, 3);
         let events = [&a1, &a2, &x];
         let sections = umbrella_sections(&events);
+        assert_eq!(
+            sections.len(),
+            1,
+            "ad-hoc folds into plan a, not its own section"
+        );
+        assert_eq!(
+            sections[0].0,
+            UmbrellaKey::Plan(PlanKey::parse("a").unwrap())
+        );
+        assert_eq!(sections[0].1.len(), 3);
+    }
+
+    #[test]
+    fn umbrella_sections_leading_adhoc_opens_headerless_section() {
+        // Ad-hoc with NO preceding plan has nothing to fold into, so it
+        // opens its own (header-less at render) section.
+        let x = log_ev(None, 1);
+        let a1 = log_ev(Some("a"), 2);
+        let events = [&x, &a1];
+        let sections = umbrella_sections(&events);
         assert_eq!(sections.len(), 2);
-        assert_eq!(sections[0].1.len(), 2, "contiguous same-plan run groups");
-        assert_eq!(sections[1].0, UmbrellaKey::AdHoc);
+        assert_eq!(sections[0].0, UmbrellaKey::AdHoc);
+        assert_eq!(
+            sections[1].0,
+            UmbrellaKey::Plan(PlanKey::parse("a").unwrap())
+        );
     }
 }

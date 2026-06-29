@@ -424,10 +424,25 @@ pub(super) fn log_row_spans(row: &crate::cli::log::OnelineRow, author_width: usi
                 plan.clone().unwrap_or_else(|| "adhoc".to_string()),
             )]
         }
-        OnelineRow::Commit { sha, subject } => vec![
-            dim(format!("  {} ", &sha.as_str()[..7])),
-            plain(subject.clone()),
-        ],
+        OnelineRow::Commit {
+            sha,
+            subject,
+            ad_hoc,
+        } => {
+            // Fixed 1-col ad-hoc marker gutter on EVERY commit row so
+            // subjects stay column-aligned: `~` (yellow) for ad-hoc, a
+            // space otherwise (adhoc-commit-marker).
+            let marker = if *ad_hoc {
+                colored("33", "~".to_string())
+            } else {
+                plain(" ".to_string())
+            };
+            vec![
+                dim(format!("  {} ", &sha.as_str()[..7])),
+                marker,
+                plain(format!(" {subject}")),
+            ]
+        }
         OnelineRow::Review {
             verdict,
             author,
@@ -974,6 +989,7 @@ mod tests {
         crate::cli::log::OnelineRow::Commit {
             sha: crate::lifecycle::CommitSha::parse(&format!("{:0<40}", "abc1234")).unwrap(),
             subject: subject.to_string(),
+            ad_hoc: false,
         }
     }
 
@@ -1080,7 +1096,11 @@ mod tests {
         // commit indented under it at column 2.
         assert!(texts.iter().any(|t| t == "foo"), "header: {texts:?}");
         assert!(
-            texts.iter().any(|t| t.starts_with("  abc1234 intro")),
+            // plan commit: sha at col 2, empty (space) marker gutter,
+            // then the subject (adhoc-commit-marker).
+            texts
+                .iter()
+                .any(|t| t.starts_with("  abc1234") && t.contains("intro")),
             "commit indented: {texts:?}"
         );
         let raw = lines.join("");

@@ -282,6 +282,7 @@ fn print_human(events: &[&LogEvent], repo: &Path, shas: &[CommitSha]) -> anyhow:
 /// One `--oneline` display row: data only, no formatting — shared
 /// by the CLI renderer (which colors it) and the status TUI's log
 /// pane (which dims it). Plan: status-tui-live-log.
+#[derive(Debug)]
 pub(crate) enum OnelineRow {
     /// Umbrella header: the plan that groups the following commit
     /// rows, or `None` for the ad-hoc bucket
@@ -293,6 +294,11 @@ pub(crate) enum OnelineRow {
         /// matches the enclosing umbrella's plan (redundant under
         /// the header); verbatim otherwise.
         subject: String,
+        /// True for an ad-hoc commit (no `[plan]` tag) folded into the
+        /// surrounding plan's umbrella — the renderer shows the `~`
+        /// ad-hoc marker (adhoc-commit-marker). The single carrier of
+        /// ad-hoc-ness now that ad-hoc commits have no own header.
+        ad_hoc: bool,
     },
     Review {
         verdict: Verdict,
@@ -316,9 +322,15 @@ pub(crate) fn oneline_rows(
             UmbrellaKey::Plan(p) => Some(p.as_str().to_string()),
             UmbrellaKey::AdHoc => None,
         };
-        out.push(OnelineRow::Header {
-            plan: umbrella_plan.clone(),
-        });
+        // Ad-hoc commits fold into the surrounding plan and are marked
+        // per-row, so there is no "adhoc" header. A header prints only
+        // for a real plan umbrella; a leading ad-hoc run (no plan)
+        // renders its marked rows with no header (adhoc-commit-marker).
+        if umbrella_plan.is_some() {
+            out.push(OnelineRow::Header {
+                plan: umbrella_plan.clone(),
+            });
+        }
         for event in run {
             let (sha, subject) = match event {
                 LogEvent::PlanIntro { sha, subject, .. }
@@ -367,6 +379,7 @@ pub(crate) fn oneline_rows(
             out.push(OnelineRow::Commit {
                 sha: sha.clone(),
                 subject,
+                ad_hoc: matches!(event, LogEvent::AdHoc { .. }),
             });
         }
     }
@@ -379,7 +392,16 @@ pub(crate) fn oneline_plain_lines(rows: &[OnelineRow]) -> Vec<String> {
     rows.iter()
         .map(|row| match row {
             OnelineRow::Header { plan } => plan.clone().unwrap_or_else(|| "adhoc".to_string()),
-            OnelineRow::Commit { sha, subject } => format!("  {} {subject}", short(sha)),
+            // Fixed 1-col marker gutter on EVERY row (alignment): `~`
+            // for ad-hoc, a space otherwise.
+            OnelineRow::Commit {
+                sha,
+                subject,
+                ad_hoc,
+            } => {
+                let m = if *ad_hoc { '~' } else { ' ' };
+                format!("  {} {m} {subject}", short(sha))
+            }
             OnelineRow::Review {
                 verdict,
                 author,
@@ -410,11 +432,25 @@ fn print_oneline(events: &[&LogEvent], repo: &Path, shas: &[CommitSha]) -> anyho
                     println!("{name}");
                 }
             }
-            OnelineRow::Commit { sha, subject } => {
+            OnelineRow::Commit {
+                sha,
+                subject,
+                ad_hoc,
+            } => {
+                // Fixed 1-col ad-hoc marker gutter on EVERY row so
+                // subjects stay column-aligned; `~` (yellow) for ad-hoc,
+                // a space otherwise. Color is TTY-gated via `c` like the
+                // rest of this output (no ANSI when piped).
                 if c {
-                    println!("  {Y}{}{Z} {subject}", short(&sha));
+                    let marker = if ad_hoc {
+                        format!("{Y}~{Z}")
+                    } else {
+                        " ".to_string()
+                    };
+                    println!("  {Y}{}{Z} {marker} {subject}", short(&sha));
                 } else {
-                    println!("  {} {subject}", short(&sha));
+                    let marker = if ad_hoc { '~' } else { ' ' };
+                    println!("  {} {marker} {subject}", short(&sha));
                 }
             }
             OnelineRow::Review {
@@ -689,9 +725,11 @@ mod tests {
             }],
         );
         let lines = oneline_plain_lines(&oneline_rows(&refs, &reviews));
-        // Umbrella shape (log-plan-umbrellas): plan header at col
-        // 0, commits indented with matching prefixes stripped,
-        // ad-hoc commits under their own bucket.
+        // Umbrella shape (log-plan-umbrellas + adhoc-commit-marker): one
+        // plan header at col 0; commits indented with a fixed 1-col
+        // marker gutter (`~` for ad-hoc, space otherwise) so subjects
+        // stay column-aligned; the ad-hoc commit folds UNDER the plan
+        // umbrella (no separate "adhoc" header) and carries the `~`.
         assert_eq!(
             lines,
             vec![
@@ -699,12 +737,79 @@ mod tests {
                 // review renders ABOVE its commit (newest-first time
                 // order — status-timeline-progress)
                 "    ✓ codex: lgtm".to_string(),
-                "  aa00000 intro".to_string(),
-                "  bb00000 finish".to_string(),
-                "adhoc".to_string(),
-                "  cc00000 drive-by".to_string(),
+                "  aa00000   intro".to_string(),
+                "  bb00000   finish".to_string(),
+                "  cc00000 ~ drive-by".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn oneline_rows_marks_adhoc_and_folds_under_plan() {
+        // adhoc-commit-marker: an ad-hoc commit folds under the
+        // surrounding plan's umbrella (NO separate "adhoc" header) and
+        // is flagged `ad_hoc`; a plan commit is not.
+        let events = [
+            LogEvent::PlanCommit {
+                plan: PlanKey::parse("foo").unwrap(),
+                sha: sha("aa"),
+                ts: 1,
+                touched_plan: false,
+                touched_code: true,
+                subject: "[foo] work".into(),
+            },
+            LogEvent::AdHoc {
+                sha: sha("bb"),
+                ts: 2,
+                subject: "drive-by".into(),
+            },
+        ];
+        let refs: Vec<&LogEvent> = events.iter().collect();
+        let rows = oneline_rows(&refs, &Default::default());
+        // Exactly one header (foo) — no "adhoc" header.
+        let headers: Vec<_> = rows
+            .iter()
+            .filter(|r| matches!(r, OnelineRow::Header { .. }))
+            .collect();
+        assert_eq!(headers.len(), 1, "no separate adhoc header: {rows:?}");
+        assert!(matches!(headers[0], OnelineRow::Header { plan: Some(p) } if p == "foo"));
+        // The plan commit is not ad-hoc; the drive-by is.
+        let flag = |prefix: &str| {
+            rows.iter().find_map(|r| match r {
+                OnelineRow::Commit { sha, ad_hoc, .. } if sha.as_str().starts_with(prefix) => {
+                    Some(*ad_hoc)
+                }
+                _ => None,
+            })
+        };
+        assert_eq!(flag("aa"), Some(false), "plan commit not marked");
+        assert_eq!(flag("bb"), Some(true), "ad-hoc commit marked");
+    }
+
+    #[test]
+    fn oneline_marker_gutter_keeps_subjects_aligned() {
+        // The marker gutter is reserved on EVERY commit row so a marked
+        // (ad-hoc) and an unmarked (plan) subject begin at the SAME
+        // column. Prefix is ASCII, so byte index == display column.
+        let plan_row = OnelineRow::Commit {
+            sha: sha("aa"),
+            subject: "x".into(),
+            ad_hoc: false,
+        };
+        let adhoc_row = OnelineRow::Commit {
+            sha: sha("bb"),
+            subject: "x".into(),
+            ad_hoc: true,
+        };
+        let lines = oneline_plain_lines(&[plan_row, adhoc_row]);
+        let col = |line: &str| line.find('x').unwrap();
+        assert_eq!(
+            col(&lines[0]),
+            col(&lines[1]),
+            "subject column aligned across marked/unmarked: {lines:?}"
+        );
+        assert!(lines[1].contains('~'), "ad-hoc row has the marker");
+        assert!(!lines[0].contains('~'), "plan row has no marker");
     }
 
     #[test]

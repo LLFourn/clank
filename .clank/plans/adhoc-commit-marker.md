@@ -82,11 +82,26 @@ monochrome-ish panel and plain `--oneline` output.
   `--json` output (kind: "ad-hoc"); keep that untouched (the icon is a
   human-display concern only).
 
+## DECISION (resolved)
+
+- **Glyph + color:** `~` in yellow (`33`), chosen by both reviewers and
+  matching the user's instinct — ASCII, guaranteed width-1, reads as
+  "miscellaneous", never an error.
+- **Grouping (user's pick):** ad-hoc commits FOLD into the surrounding
+  plan's umbrella — `umbrella_sections` (core) now joins an ad-hoc event
+  to the current run; only a leading ad-hoc run (no preceding plan) is
+  header-less. No separate "adhoc" header anywhere.
+- Per ruthless: the per-row `ad_hoc` flag on `OnelineRow::Commit` is the
+  sole carrier; the marker gutter is reserved on EVERY commit row
+  (unmarked = a space) so subjects stay column-aligned; `--oneline`
+  keeps its TTY/`NO_COLOR` gating.
+
 ## Acceptance criteria
 
 - An ad-hoc commit renders inline as an ordinary commit row with the
-  chosen marker icon (+ color) in BOTH `clank log --oneline` and `clank
-  status --tui`, consistently.
+  `~` (yellow) marker in BOTH `clank log --oneline` and `clank
+  status --tui`, consistently; folded under the surrounding plan
+  umbrella (no "adhoc" header).
 - A non-ad-hoc (plan-tagged) commit renders WITHOUT the marker —
   unchanged.
 - The marker is produced once in the pure `oneline_rows` layer (single
