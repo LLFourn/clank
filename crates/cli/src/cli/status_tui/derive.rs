@@ -129,21 +129,39 @@ pub(super) fn state_color(snap: &StatusSnapshot) -> &'static str {
     }
 }
 
-/// Reviewers the team is currently waiting on — the union of every
-/// `missing` set (commit + gate tiers across plans, plus each PR
-/// review's `missing_reviewers`). May contain duplicates; callers
-/// test membership.
+/// Reviewers the team is currently waiting on. The candidate labels
+/// are the `missing` sets (commit + gate tiers across plans) plus each
+/// PR review's `missing_reviewers`, but the ACTIONABILITY decision is
+/// delegated to [`clank_core::wait::WorkStatus::is_actionable`] — the
+/// SAME predicate the stop-hook (`clank wait`) uses. Routing the
+/// decision through one source keeps the panel and the hook from
+/// drifting; in particular it inherits `work_for`'s GLOBAL
+/// `head_correction` preempt, so a broken HEAD tag idles every reviewer
+/// here too — even one missing on a non-implicated plan — instead of
+/// showing 👀 while their `clank wait` returns nothing. May contain
+/// duplicates; callers test membership.
 pub(super) fn awaited_reviewers(snap: &StatusSnapshot) -> Vec<&clank_core::ids::AgentLabel> {
+    use clank_core::vocab::Role;
+    // The same projection `clank wait` reduces (ad-hoc isn't carried in
+    // the snapshot and isn't a candidate here, so an empty list is
+    // faithful for the reviewer question).
+    let work = clank_core::wait::WorkStatus {
+        plans: snap.plans.clone(),
+        ad_hoc: Vec::new(),
+        pr_reviews: snap.pr_reviews.clone(),
+        head_correction: snap.head_correction.clone(),
+    };
+    let actionable = |l: &clank_core::ids::AgentLabel| work.is_actionable(l, Role::Reviewer);
     let mut out = Vec::new();
     for p in &snap.plans {
         if let WaitingOn::ReviewerApprovalsMissing { missing }
         | WaitingOn::GateReviewersMissing { missing } = &p.waiting_on
         {
-            out.extend(missing.iter());
+            out.extend(missing.iter().filter(|l| actionable(l)));
         }
     }
     for pr in &snap.pr_reviews {
-        out.extend(pr.missing_reviewers.iter());
+        out.extend(pr.missing_reviewers.iter().filter(|l| actionable(l)));
     }
     out
 }
@@ -241,6 +259,34 @@ mod tests {
         assert!(!master_is_active(&s), "PR still owes a reviewer");
         s.pr_reviews[0].missing_reviewers.clear();
         assert!(master_is_active(&s), "PR fully reviewed → master's turn");
+    }
+
+    #[test]
+    fn awaited_reviewers_idle_under_head_correction() {
+        // unify-repo-state-watcher: a broken HEAD tag is a GLOBAL preempt
+        // — `clank wait` wakes no reviewer while it stands. The panel
+        // must agree (via the shared `is_actionable`), even for a reviewer
+        // missing on a plan the tag never implicated. Without routing
+        // through the single source, this reviewer showed 👀 while their
+        // stop-hook returned nothing.
+        let mut s = snap(vec![plan_state("other", reviewer_missing("codex"))], vec![]);
+        s.head_correction = Some(clank_core::wait::HeadCorrection {
+            sha: crate::lifecycle::CommitSha::parse(&"a".repeat(40)).unwrap(),
+            violation: clank_core::wait::HeadTagViolation {
+                unknown: vec!["ghost".to_string()],
+                untagged_touched: vec![],
+                extra_named: vec![],
+            },
+        });
+        assert!(
+            awaited_reviewers(&s).is_empty(),
+            "a broken HEAD idles every reviewer, even on a non-implicated plan"
+        );
+        assert_eq!(
+            agent_status_emoji(&s, "codex", clank_core::vocab::Role::Reviewer),
+            "💤",
+            "the panel must show the reviewer idle, matching the stop-hook"
+        );
     }
 
     #[test]

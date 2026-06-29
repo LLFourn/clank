@@ -1051,6 +1051,18 @@ impl WorkStatus {
         }
         out
     }
+
+    /// Whether `author` (in `role`) has any actionable work right now —
+    /// the SINGLE predicate behind both the stop-hook (`clank wait`,
+    /// which acts iff `work_for` is non-empty) and the `status --tui`
+    /// per-agent indicator. Defining the TUI's "needs to act" as this
+    /// keeps the two from drifting: in particular it inherits
+    /// `work_for`'s GLOBAL `head_correction` preempt, so a broken HEAD
+    /// idles every reviewer (even one missing on a non-implicated
+    /// plan), exactly as the hook does.
+    pub fn is_actionable(&self, author: &AgentLabel, role: Role) -> bool {
+        !self.work_for(author, role).is_empty()
+    }
 }
 
 /// Plan-key-ordered `Finished` items for every watched plan that
@@ -2194,6 +2206,49 @@ mod tests {
         }
         let master = status.work_for(&label("lloyd"), Role::Master);
         assert_eq!(master.len(), 1, "exactly one fixup, not one per plan");
+    }
+
+    #[test]
+    fn work_for_reviewer_idle_cross_plan_under_head_correction() {
+        // A broken HEAD tag is a repo-GLOBAL preempt: while it stands NO
+        // reviewer is woken — not even one missing on a DIFFERENT,
+        // NON-implicated plan. This is the drift `unify-repo-state-watcher`
+        // closes: the TUI's per-agent indicator routes through
+        // `is_actionable` (= `work_for` non-empty), so it must agree with
+        // this here, cross-plan.
+        let mut state = RepoState::default();
+        state
+            .plans
+            .insert(plan("a"), make_plan_with_one_reviewable(sha("aaaa")));
+        state
+            .plans
+            .insert(plan("b"), make_plan_with_one_reviewable(sha("bbbb")));
+        // Untagged HEAD (sha aaaa) touches only plan a → the violation
+        // implicates a; plan b is untouched and keeps its ordinary
+        // reviewer-wait.
+        let status = state.derive_status(
+            &MockReviews(vec![]),
+            &plan_policy(),
+            Some(&head("fix it", &["a"])),
+        );
+        assert!(status.head_correction.is_some());
+        let b = status
+            .plans
+            .iter()
+            .find(|p| p.plan.as_str() == "b")
+            .expect("plan b present");
+        assert!(
+            matches!(b.waiting_on, WaitingOn::ReviewerApprovalsMissing { .. }),
+            "plan b is NOT implicated, so it keeps its reviewer-wait; got {:?}",
+            b.waiting_on
+        );
+        // Yet the reviewer is NOT actionable — the global preempt wins
+        // across plans. Both the raw `work_for` and the `is_actionable`
+        // predicate the TUI uses must agree.
+        assert!(status.work_for(&label("codex"), Role::Reviewer).is_empty());
+        assert!(!status.is_actionable(&label("codex"), Role::Reviewer));
+        // Master is routed to the fixup (the global preempt's other half).
+        assert!(status.is_actionable(&label("lloyd"), Role::Master));
     }
 
     #[test]

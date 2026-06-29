@@ -66,27 +66,36 @@ but that watcher must NOT be a source of waiting-upon state.
 
 ## Design
 
-### Part 1 — one "who acts now" reduction (fixes the symptom)
+### Part 1 — one "who acts now" reduction (fixes the symptom) — DONE
 
-Make `work_for` the single answer. `status_tui/derive.rs`'s per-agent
-"needs to act" must be defined as `!work_for(agent, role).is_empty()`
-(or both consume one shared `actionable_for`), so the TUI indicator
-and the stop-hook are equal BY CONSTRUCTION rather than by parallel
-`match` arms.
+Make `work_for` the single answer. The drift was that
+`status_tui/derive.rs::awaited_reviewers` re-derived "who is awaited"
+by matching `waiting_on` directly, so it missed what `work_for` knows.
+The fix: a single predicate **`WorkStatus::is_actionable(agent, role)`**
+(= `!work_for(...).is_empty()`), and the TUI's per-reviewer indicator
+DECIDES through it — enumerating candidate labels from the `missing`
+sets / PR is fine, but the actionability ruling is `is_actionable`, so
+the panel and the stop-hook agree by construction.
 
-Remove the display-only second source — but note `head_correction` is
-a **repo-GLOBAL preempt, not per-plan**: `work_for` checks
-`self.head_correction` and returns BEFORE the per-plan loop
-(`core/wait.rs:889`), so a broken HEAD makes master fix it and ALL
-reviewers idle, regardless of any plan's `waiting_on`. Folding it into
-the implicated plan's `waiting_on` would therefore CHANGE behavior
-(reviewers on other plans would stay active); folding it into every
-plan conflates a repo-level gate with per-plan state. So the single
-representation is a shared top-level **`actionable_for(agent, role)`**
-that both `work_for` and the TUI consume — it keeps the global
-`head_correction` preempt in one place. Delete the "for display only"
-`MasterToFixCommitTag` parallel representation; the TUI's
-fixup/attention indicator derives from `actionable_for` too.
+`head_correction` is a **repo-GLOBAL preempt, not per-plan**:
+`work_for` checks `self.head_correction` and returns BEFORE the
+per-plan loop (`core/wait.rs:892`), so a broken HEAD idles ALL
+reviewers regardless of any plan's `waiting_on`. Routing the TUI
+through `is_actionable` inherits that global preempt automatically —
+including the cross-plan case (a reviewer missing on a NON-implicated
+plan is now idle in the panel, matching the hook).
+
+**The per-plan `MasterToFixCommitTag` marking stays.** It is NOT an
+independent second source: `derive_status` computes it from the SAME
+`head_correction` (`core/wait.rs:584`), so it cannot drift, and it
+gives the implicated plan ROW its correct verb. The duplicate that
+caused the bug was the actionability *re-derivation*, now removed.
+`attention_state`/`master_is_active` already read `head_correction`
+directly, so the master/fixup indicator was never the drift; master
+keeps its existing derivation (it also models queue-promote, which
+`work_for` does not, so it is a correct superset — full master
+routing through `work_for` would need queue-promote modeled there and
+is out of scope).
 
 ### Part 2 — one core watcher (reduce three → one, shared)
 
@@ -136,14 +145,18 @@ Build the missing "notify wiring" the `fs_watcher` doc promised:
   has production callers (no longer test-only).
 - Poll-mode behavior preserved: existing `wait` poll/heartbeat tests
   pass; gitdir-watch-native-only + periodic refold intact.
-- `status --tui`'s "needs to act" per agent derives from the shared
-  `actionable_for` (= `work_for`). A test asserts the TUI indicator
-  and `work_for` agree for every `WaitingOn` variant. The
-  `head_correction` case is covered **cross-plan**: with a broken HEAD
-  tag, a reviewer on a NON-implicated plan also gets nothing (the
-  global preempt), and the TUI shows that same reviewer as idle — not
-  just the single-plan case. The display-only `MasterToFixCommitTag`
-  duplicate is gone.
+- `status --tui`'s per-reviewer "needs to act" DECIDES through
+  `WorkStatus::is_actionable` (= `work_for` non-empty), the same
+  predicate the stop-hook uses. The `head_correction` case is covered
+  **cross-plan** at two levels: a core test
+  (`work_for_reviewer_idle_cross_plan_under_head_correction`) proves a
+  reviewer missing on a NON-implicated plan is non-actionable under a
+  broken HEAD, and a derive test
+  (`awaited_reviewers_idle_under_head_correction`) proves the panel
+  shows that reviewer idle. The per-plan `MasterToFixCommitTag` marking
+  is KEPT (a derived projection of the same `head_correction`, used for
+  the implicated row's verb — not an independent source); master's
+  indicator is unchanged (already reads `head_correction` directly).
 - `status --tui` still live-updates dirty diff lines via its separate,
   explicitly-scoped diff watcher, which **retains `git_io::PathIgnore`
   filtering and the trailing-edge rebuild debounce** from
