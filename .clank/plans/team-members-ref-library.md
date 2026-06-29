@@ -150,14 +150,31 @@ repo's `Roster` and are untouched.
 
 ## Backward compatibility
 
-Non-breaking. Existing `teams` values are full inline objects with a
-`tool` field → they deserialize as `TeamMember::Inline`, so every
-current `~/.clank/config.json` keeps loading unchanged. The old
-`TeamComposition` shape (`{master, commit_reviewers,
-gate_reviewers}`) still fails to parse as a `TeamRoster` (a string /
-array value is neither variant), so `old_teams_shape_hint` and the
-`load_user_team_roster` old-shape fallback keep working — verify with
-the existing fail-closed tests, adjusting only types.
+Non-breaking for the live schema. Existing `teams` values are full
+inline objects with a `tool` field → they deserialize as
+`TeamMember::Inline`, so every current `~/.clank/config.json` keeps
+loading unchanged.
+
+The pre-`repo-agents-no-team` global `TeamComposition` shape
+(`{master, commit_reviewers, gate_reviewers}`) is **no longer
+recognized** (per direction — break and forget it). Its detectors
+`old_teams_shape_hint` / `is_old_team_composition` are **deleted**,
+and the user-config loaders (`team.rs` / `agent.rs`
+`read_user_config`) just surface serde's native parse error. A
+`TeamComposition` value still **fails closed** — it's a string /
+array where a `TeamMember` is expected — but via the ordinary parse
+error, not a re-save hint.
+
+For `init --team` specifically, a malformed team value (a
+`TeamComposition`, or a new-shape member with a mistyped field) fails
+closed through `team_parse_error`, which names the offending member
+and the valid ref/inline shapes. Note the asymmetry: that helpful
+per-member message is specific to `init --team`'s single-team
+resolution path; `clank team list`/`show` and `remove_global_agent`
+load the whole `UserConfigFile` and surface serde's native error
+(which carries line/column). The home-config migration below removes
+the only real old-shape config, so the asymmetry's blast radius is
+one stale hand-edited file.
 
 ## Home-config cleanup (after build, before install)
 
@@ -198,8 +215,11 @@ loads with `clank team show default` / `clank team list` before
   display, dangling shown, never panics).
 - `remove_global_agent` scrubs members that resolve to the removed
   agent.
-- Existing inline-shape teams still load (back-compat test);
-  old-`TeamComposition` shape still fails closed.
+- Existing inline-shape teams still load (back-compat test). The old
+  `TeamComposition` shape still fails closed, now via the ordinary
+  parse error / `team_parse_error` malformed-member path (NOT a
+  re-save hint); `old_teams_shape_hint` / `is_old_team_composition`
+  and their fail-closed tests are removed.
 - Real `~/.clank/config.json` migrated to refs and validated;
   `cargo install --path crates/cli --force`.
 
