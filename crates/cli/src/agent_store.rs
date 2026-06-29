@@ -107,10 +107,10 @@ pub fn resolve_role(repo: &Path, label: &AgentLabel) -> anyhow::Result<clank_cor
 /// construction sites (status, wait, open) to feed the
 /// two-tier gate state machine.
 ///
-/// Returns `(commit_reviewers, gate_reviewers)` from the
-/// resolved registered set. Errors if the repo has no `team`
-/// field set — there is no legacy fallback.
-pub fn load_reviewer_tiers(repo: &Path) -> anyhow::Result<(Vec<AgentLabel>, Vec<AgentLabel>)> {
+/// Returns the commit / plan / final reviewer tiers (gate folded into
+/// both plan and final) from the resolved registered set. Errors if
+/// the repo has no roster configured — there is no legacy fallback.
+pub fn load_reviewer_tiers(repo: &Path) -> anyhow::Result<ReviewerTiers> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     load_reviewer_tiers_with(repo, home.as_deref())
 }
@@ -118,17 +118,42 @@ pub fn load_reviewer_tiers(repo: &Path) -> anyhow::Result<(Vec<AgentLabel>, Vec<
 /// Home-explicit [`load_reviewer_tiers`] — for in-process callers
 /// (tests, query cores) that supply the home dir rather than
 /// reading `$HOME`. Plan: dogfood-init-setup-in-tests (Phase B).
-pub fn load_reviewer_tiers_with(
-    repo: &Path,
-    home: Option<&Path>,
-) -> anyhow::Result<(Vec<AgentLabel>, Vec<AgentLabel>)> {
+pub fn load_reviewer_tiers_with(repo: &Path, home: Option<&Path>) -> anyhow::Result<ReviewerTiers> {
     match try_resolve_via_team_with(repo, home)? {
-        Some(set) => {
-            let commit = set.commit_reviewers.into_iter().map(|a| a.label).collect();
-            let gate = set.gate_reviewers.into_iter().map(|a| a.label).collect();
-            Ok((commit, gate))
-        }
+        Some(set) => Ok(ReviewerTiers::from_registered(&set)),
         None => Err(no_team_configured()),
+    }
+}
+
+/// The three gate-compute reviewer tiers (gate reviewers folded into
+/// both `plan` and `final`), ready for `WorkPolicy` / `compute_gate`.
+/// The single conversion from a [`crate::cli::teams_config::RegisteredSet`]
+/// so every WorkPolicy builder gets the same gate-fold.
+pub struct ReviewerTiers {
+    pub commit: Vec<AgentLabel>,
+    pub plan: Vec<AgentLabel>,
+    pub final_: Vec<AgentLabel>,
+}
+
+impl ReviewerTiers {
+    pub fn from_registered(set: &crate::cli::teams_config::RegisteredSet) -> Self {
+        Self {
+            commit: set
+                .commit_reviewers
+                .iter()
+                .map(|a| a.label.clone())
+                .collect(),
+            plan: set.plan_tier(),
+            final_: set.final_tier(),
+        }
+    }
+
+    pub fn empty() -> Self {
+        Self {
+            commit: Vec::new(),
+            plan: Vec::new(),
+            final_: Vec::new(),
+        }
     }
 }
 
@@ -140,7 +165,7 @@ pub fn load_reviewer_tiers_with(
 /// (Continued). `clank doctor` is the surface that reports the
 /// underlying misconfiguration. Plan:
 /// `teams-based-agent-registration`.
-pub fn reviewer_tiers_for_render(repo: &Path) -> (Vec<AgentLabel>, Vec<AgentLabel>) {
+pub fn reviewer_tiers_for_render(repo: &Path) -> ReviewerTiers {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     reviewer_tiers_for_render_with(repo, home.as_deref())
 }
@@ -148,16 +173,10 @@ pub fn reviewer_tiers_for_render(repo: &Path) -> (Vec<AgentLabel>, Vec<AgentLabe
 /// Home-explicit [`reviewer_tiers_for_render`] — for in-process
 /// render cores that supply the home dir. Same never-errors
 /// degrade semantics. Plan: dogfood-init-setup-in-tests (Phase B).
-pub fn reviewer_tiers_for_render_with(
-    repo: &Path,
-    home: Option<&Path>,
-) -> (Vec<AgentLabel>, Vec<AgentLabel>) {
+pub fn reviewer_tiers_for_render_with(repo: &Path, home: Option<&Path>) -> ReviewerTiers {
     match try_resolve_via_team_with(repo, home) {
-        Ok(Some(set)) => (
-            set.commit_reviewers.into_iter().map(|a| a.label).collect(),
-            set.gate_reviewers.into_iter().map(|a| a.label).collect(),
-        ),
-        _ => (Vec::new(), Vec::new()),
+        Ok(Some(set)) => ReviewerTiers::from_registered(&set),
+        _ => ReviewerTiers::empty(),
     }
 }
 
@@ -171,12 +190,8 @@ pub fn role_from_registered_set(
     if &set.master == label {
         return Role::Master;
     }
-    let in_either_tier = set
-        .commit_reviewers
-        .iter()
-        .chain(set.gate_reviewers.iter())
-        .any(|a| &a.label == label);
-    if in_either_tier {
+    let is_reviewer = set.all_reviewers().iter().any(|a| &a.label == label);
+    if is_reviewer {
         Role::Reviewer
     } else {
         Role::default()
@@ -529,6 +544,8 @@ mod tests {
                     desc: desc(Tool::Claude),
                 })
                 .collect(),
+            plan_reviewers: Vec::new(),
+            final_reviewers: Vec::new(),
             gate_reviewers: gate
                 .iter()
                 .map(|l| ResolvedAgent {

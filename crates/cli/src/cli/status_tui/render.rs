@@ -11,12 +11,15 @@ use super::scroll::*;
 use super::text::*;
 use crate::cli::status::{StatusSnapshot, short_sha};
 
-/// The roster tier as shown in the UI: `master` / `commit` / `gate`.
+/// The roster tier as shown in the UI: `master` / `commit` / `plan` /
+/// `final` / `gate`.
 pub(super) fn tier_label(role: crate::cli::teams_config::RosterRole) -> &'static str {
     use crate::cli::teams_config::RosterRole;
     match role {
         RosterRole::Master => "master",
         RosterRole::Commit => "commit",
+        RosterRole::Plan => "plan",
+        RosterRole::Final => "final",
         RosterRole::Gate => "gate",
     }
 }

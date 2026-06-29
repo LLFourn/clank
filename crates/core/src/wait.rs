@@ -350,11 +350,15 @@ pub struct WorkPolicy {
     /// `teams-based-agent-registration` — replaces the prior
     /// single-list `expected_reviewers` field.
     pub commit_reviewers: Vec<AgentLabel>,
-    /// Gate-tier reviewers: only review at gate-transition
-    /// moments (when commit-reviewers are all positive). Used
-    /// for architectural / structural checks at structural
-    /// moments rather than per-commit churn.
-    pub gate_reviewers: Vec<AgentLabel>,
+    /// PLAN-milestone reviewers: consulted only when the latest
+    /// reviewable commit signed off a plan doc (`latest_touched_plan`)
+    /// and the commit tier continued it. Includes `gate` reviewers
+    /// (gate = plan + final), folded in at resolve time.
+    pub plan_reviewers: Vec<AgentLabel>,
+    /// FINISH-milestone reviewers: consulted only at the end, when the
+    /// commit tier has marked the commit FINISHED. Includes `gate`
+    /// reviewers (gate = plan + final), folded in at resolve time.
+    pub final_reviewers: Vec<AgentLabel>,
 }
 
 #[derive(Debug, Clone)]
@@ -428,7 +432,8 @@ pub struct AdHocWorkState {
 pub fn compute_gate(
     reviews: &[ReviewEntry],
     commit_reviewers: &[AgentLabel],
-    gate_reviewers: &[AgentLabel],
+    plan_reviewers: &[AgentLabel],
+    final_reviewers: &[AgentLabel],
     latest_touched_plan: bool,
 ) -> crate::vocab::CommitGateState {
     use crate::vocab::{CommitGateState, Verdict};
@@ -439,17 +444,19 @@ pub fn compute_gate(
     // finish` when they decide; auto-Finished would noise
     // every commit with "ready to finalize." Plan body
     // initially said Finished here; that was wrong — fixed
-    // during implementation.
-    if commit_reviewers.is_empty() && gate_reviewers.is_empty() {
+    // during implementation. Empty = NO second tier at all (the
+    // UNION of plan + final, since gate is folded into both).
+    if commit_reviewers.is_empty() && plan_reviewers.is_empty() && final_reviewers.is_empty() {
         return CommitGateState::Continued;
     }
 
-    // Filter reviews to expected reviewers across BOTH tiers.
+    // Filter reviews to expected reviewers across ALL tiers.
     // Stale entries from removed reviewers (or other authors
     // whose feedback dir still exists) MUST NOT gate decisions.
     let expected: std::collections::HashSet<&AgentLabel> = commit_reviewers
         .iter()
-        .chain(gate_reviewers.iter())
+        .chain(plan_reviewers.iter())
+        .chain(final_reviewers.iter())
         .collect();
     let reviews: Vec<&ReviewEntry> = reviews
         .iter()
@@ -478,34 +485,42 @@ pub fn compute_gate(
     let finished =
         |label: &AgentLabel| -> bool { matches!(by_label.get(label), Some(Verdict::Finished)) };
 
-    // The gate tier is consulted ONLY at a MILESTONE on the latest
-    // reviewable commit — never on routine WIP commits. A milestone
-    // is either:
-    //   1. the commit changed the plan document (`latest_touched_plan`)
-    //      and the commit tier continued it — plan sign-off, or
-    //   2. the commit tier marked it FINISHED — the final gate.
-    // On any other commit (pure code, merely continued) the gate tier
-    // is bypassed and the gate passes straight to `Continued` so master
-    // keeps moving. This makes "gate reviewer woken on an intermediate
-    // code commit" unrepresentable by construction.
+    // The second tier is consulted ONLY at a MILESTONE on the latest
+    // reviewable commit — never on routine WIP commits. There are two,
+    // each with its OWN reviewer tier:
+    //   1. PLAN milestone — the commit changed the plan document
+    //      (`latest_touched_plan`) and the commit tier continued it.
+    //      Consults the `plan_reviewers` tier (plan + gate).
+    //   2. FINISH milestone — the commit tier marked it FINISHED.
+    //      Consults the `final_reviewers` tier (final + gate).
+    // A plan reviewer is never woken at the finish; a final reviewer is
+    // never woken on a plan commit. On any other commit (pure code,
+    // merely continued) NO second tier is consulted → `Continued`.
     //
     // Devolve guard: with an EMPTY commit tier, "all finished" is
-    // vacuously true on the empty set — which would make every commit
-    // a FINISHED milestone and reanimate the regression for master+gate
-    // setups. With no commit reviewer to actually signal FINISHED, the
-    // milestone reduces to `latest_touched_plan` only.
+    // vacuously true on the empty set — which would make every commit a
+    // FINISHED milestone. With no commit reviewer to actually signal
+    // FINISHED, the milestone reduces to `latest_touched_plan` only, so
+    // a final-only repo (no commit tier) never reaches the finish.
     let commit_finished = !commit_reviewers.is_empty() && commit_reviewers.iter().all(&finished);
     let is_milestone = latest_touched_plan || commit_finished;
     if !is_milestone {
         return CommitGateState::Continued;
     }
 
-    // Milestone: the gate tier now contributes — same wait-for-all rule.
-    // A non-positive gate verdict wakes the master only once every gate
-    // reviewer has verdicted; while any is pending the master sleeps and
-    // the gate reviewers wake (`ContinuedPendingGate`). An empty gate tier
-    // is vacuously positive (no gate review configured).
-    let gate = tier_coverage(gate_reviewers, &by_label);
+    // The active second tier is the UNION of the milestones that fired.
+    let active = active_second_tier(
+        plan_reviewers,
+        final_reviewers,
+        latest_touched_plan,
+        commit_finished,
+    );
+
+    // Same wait-for-all rule: a non-positive verdict wakes the master
+    // only once every active reviewer has verdicted; while any is
+    // pending the master sleeps and they wake (`ContinuedPendingGate`).
+    // An empty active tier is vacuously positive.
+    let gate = tier_coverage(&active, &by_label);
     if !gate.all_positive() {
         return if gate.all_submitted() {
             CommitGateState::ChangesRequested
@@ -514,10 +529,11 @@ pub fn compute_gate(
         };
     }
 
-    // Both tiers positive at a milestone. Decide Finished vs Continued
-    // by whether every reviewer is at Finished verdict.
-    let all_finished =
-        commit_reviewers.iter().all(&finished) && gate_reviewers.iter().all(&finished);
+    // Positive at a milestone. `Finished` belongs to the FINISH path
+    // only: the commit tier finished (the milestone trigger) AND the
+    // FINAL tier all finished. Plan-only reviewers never block the
+    // finish; a plan-only milestone is a sign-off → `Continued`.
+    let all_finished = commit_finished && final_reviewers.iter().all(&finished);
     if all_finished {
         CommitGateState::Finished
     } else {
@@ -572,6 +588,36 @@ fn tier_coverage(
         pending,
         non_positive,
     }
+}
+
+/// The active second-tier reviewers for a commit at its milestone(s):
+/// `plan_reviewers` when it's a plan-doc milestone, `final_reviewers`
+/// when the commit tier has FINISHED, their UNION when both. A `gate`
+/// reviewer is in both source lists (gate = plan + final), so it is
+/// deduped. The SINGLE source for "who reviews at this milestone",
+/// shared by [`compute_gate`] and [`missing_for_gate`] so the gate
+/// decision and the wake set can't diverge.
+fn active_second_tier(
+    plan_reviewers: &[AgentLabel],
+    final_reviewers: &[AgentLabel],
+    latest_touched_plan: bool,
+    commit_finished: bool,
+) -> Vec<AgentLabel> {
+    let mut active: Vec<AgentLabel> = Vec::new();
+    let mut push_unique = |xs: &[AgentLabel]| {
+        for l in xs {
+            if !active.contains(l) {
+                active.push(l.clone());
+            }
+        }
+    };
+    if latest_touched_plan {
+        push_unique(plan_reviewers);
+    }
+    if commit_finished {
+        push_unique(final_reviewers);
+    }
+    active
 }
 
 impl RepoState {
@@ -668,21 +714,35 @@ impl RepoState {
                 // (→ `Continued`) so the master isn't blocked — rather than a
                 // duplicate inline verdict check that would re-implement (and
                 // drift from) the gate logic.
-                let (commit_tier, gate_tier): (&[AgentLabel], &[AgentLabel]) =
-                    if policy.plan_feedback {
-                        (&policy.commit_reviewers, &policy.gate_reviewers)
-                    } else {
-                        (&[], &[])
-                    };
-                let gate = compute_gate(&entries, commit_tier, gate_tier, latest_touched_plan);
+                let (commit_tier, plan_tier, final_tier): (
+                    &[AgentLabel],
+                    &[AgentLabel],
+                    &[AgentLabel],
+                ) = if policy.plan_feedback {
+                    (
+                        &policy.commit_reviewers,
+                        &policy.plan_reviewers,
+                        &policy.final_reviewers,
+                    )
+                } else {
+                    (&[], &[], &[])
+                };
+                let gate = compute_gate(
+                    &entries,
+                    commit_tier,
+                    plan_tier,
+                    final_tier,
+                    latest_touched_plan,
+                );
 
                 // Filter to expected reviewers for any downstream uses
                 // (MasterToRevise payload, missing-set computation). Same
-                // principle as compute_gate's filter. Both tiers.
+                // principle as compute_gate's filter. All tiers.
                 let expected: std::collections::HashSet<&AgentLabel> = policy
                     .commit_reviewers
                     .iter()
-                    .chain(policy.gate_reviewers.iter())
+                    .chain(policy.plan_reviewers.iter())
+                    .chain(policy.final_reviewers.iter())
                     .collect();
                 let filtered_entries: Vec<&ReviewEntry> = entries
                     .iter()
@@ -743,7 +803,10 @@ impl RepoState {
                             // gate-reviewer who already filed Request-Changes
                             // is HELD, not re-summoned.
                             let missing = crate::repo_state::NonEmptyVec::new(missing_for_gate(
-                                gate, &entries, policy,
+                                gate,
+                                &entries,
+                                policy,
+                                latest_touched_plan,
                             ))
                             .expect(
                                 "ContinuedPendingGate state implies a non-empty pending gate-reviewer set",
@@ -759,7 +822,10 @@ impl RepoState {
                             // once everyone has spoken. Single-source via
                             // `missing_for_gate` (→ `tier_coverage`).
                             let missing = crate::repo_state::NonEmptyVec::new(missing_for_gate(
-                                gate, &entries, policy,
+                                gate,
+                                &entries,
+                                policy,
+                                latest_touched_plan,
                             ))
                             .expect(
                                 "Unreviewed gate state implies a non-empty pending commit-reviewer set",
@@ -800,7 +866,8 @@ impl RepoState {
                 let gate = compute_gate(
                     &entries,
                     &policy.commit_reviewers,
-                    &policy.gate_reviewers,
+                    &policy.plan_reviewers,
+                    &policy.final_reviewers,
                     false,
                 );
                 ad_hoc.push(AdHocWorkState {
@@ -821,7 +888,8 @@ impl RepoState {
             let gate = compute_gate(
                 &input.current_verdicts,
                 &policy.commit_reviewers,
-                &policy.gate_reviewers,
+                &policy.plan_reviewers,
+                &policy.final_reviewers,
                 false,
             );
             // Round 0 = master still drafting; the review hasn't been
@@ -832,7 +900,7 @@ impl RepoState {
             let missing_reviewers = if input.round == 0 {
                 Vec::new()
             } else {
-                missing_for_gate(gate, &input.current_verdicts, policy)
+                missing_for_gate(gate, &input.current_verdicts, policy, false)
             };
             pr_reviews.push(PrReviewWorkState {
                 pr: input.pr,
@@ -866,18 +934,35 @@ fn missing_for_gate(
     gate: crate::vocab::CommitGateState,
     current_verdicts: &[ReviewEntry],
     policy: &WorkPolicy,
+    latest_touched_plan: bool,
 ) -> Vec<AgentLabel> {
-    use crate::vocab::CommitGateState;
-    let tier = match gate {
-        CommitGateState::Unreviewed => &policy.commit_reviewers,
-        CommitGateState::ContinuedPendingGate => &policy.gate_reviewers,
-        _ => return Vec::new(),
-    };
-    let by_label: std::collections::HashMap<&AgentLabel, &crate::vocab::Verdict> = current_verdicts
+    use crate::vocab::{CommitGateState, Verdict};
+    let by_label: std::collections::HashMap<&AgentLabel, &Verdict> = current_verdicts
         .iter()
         .map(|r| (&r.author, &r.verdict))
         .collect();
-    tier_coverage(tier, &by_label).pending
+    let tier: Vec<AgentLabel> = match gate {
+        CommitGateState::Unreviewed => policy.commit_reviewers.clone(),
+        CommitGateState::ContinuedPendingGate => {
+            // The pending second tier is milestone-specific: plan
+            // reviewers on a plan-doc commit, final reviewers at the
+            // finish. Mirror compute_gate's active set via the shared
+            // helper so the wake set matches the gate decision.
+            let commit_finished = !policy.commit_reviewers.is_empty()
+                && policy
+                    .commit_reviewers
+                    .iter()
+                    .all(|l| matches!(by_label.get(l), Some(Verdict::Finished)));
+            active_second_tier(
+                &policy.plan_reviewers,
+                &policy.final_reviewers,
+                latest_touched_plan,
+                commit_finished,
+            )
+        }
+        _ => return Vec::new(),
+    };
+    tier_coverage(&tier, &by_label).pending
 }
 
 impl WorkStatus {
@@ -1109,6 +1194,20 @@ mod tests {
         AgentLabel::parse(s).unwrap()
     }
 
+    /// Pre-split test shim: a `gate` reviewer reviews at BOTH milestones
+    /// (gate = plan + final), so the old (commit, gate) call sites pass
+    /// the gate tier as both `plan_reviewers` and `final_reviewers`. New
+    /// plan-only / final-only tests call `compute_gate` directly with
+    /// distinct tiers.
+    fn cg(
+        reviews: &[ReviewEntry],
+        commit: &[AgentLabel],
+        gate: &[AgentLabel],
+        latest_touched_plan: bool,
+    ) -> crate::vocab::CommitGateState {
+        compute_gate(reviews, commit, gate, gate, latest_touched_plan)
+    }
+
     fn pset(names: &[&str]) -> BTreeSet<PlanKey> {
         names.iter().map(|n| plan(n)).collect()
     }
@@ -1204,27 +1303,21 @@ mod tests {
     #[test]
     fn compute_gate_zero_reviewers_is_continued_even_with_no_reviews() {
         // Master-only repo: every commit auto-continues.
-        assert_eq!(
-            compute_gate(&[], &[], &[], false),
-            CommitGateState::Continued
-        );
+        assert_eq!(cg(&[], &[], &[], false), CommitGateState::Continued);
     }
 
     #[test]
     fn compute_gate_zero_reviewers_ignores_stale_request_changes() {
         // Removed reviewer's stale RC must not gate.
         let reviews = [entry(crate::vocab::Verdict::RequestChanges, "alice")];
-        assert_eq!(
-            compute_gate(&reviews, &[], &[], false),
-            CommitGateState::Continued
-        );
+        assert_eq!(cg(&reviews, &[], &[], false), CommitGateState::Continued);
     }
 
     #[test]
     fn compute_gate_single_expected_continue_is_continued() {
         let reviews = [entry(crate::vocab::Verdict::Continue, "codex")];
         assert_eq!(
-            compute_gate(&reviews, &[label("codex")], &[], false),
+            cg(&reviews, &[label("codex")], &[], false),
             CommitGateState::Continued
         );
     }
@@ -1233,7 +1326,7 @@ mod tests {
     fn compute_gate_single_expected_request_changes() {
         let reviews = [entry(crate::vocab::Verdict::RequestChanges, "codex")];
         assert_eq!(
-            compute_gate(&reviews, &[label("codex")], &[], false),
+            cg(&reviews, &[label("codex")], &[], false),
             CommitGateState::ChangesRequested
         );
     }
@@ -1245,7 +1338,7 @@ mod tests {
             entry(crate::vocab::Verdict::Continue, "ruthless"),
         ];
         assert_eq!(
-            compute_gate(&reviews, &[label("codex"), label("ruthless")], &[], false),
+            cg(&reviews, &[label("codex"), label("ruthless")], &[], false),
             CommitGateState::Continued
         );
     }
@@ -1257,7 +1350,7 @@ mod tests {
             entry(crate::vocab::Verdict::RequestChanges, "ruthless"),
         ];
         assert_eq!(
-            compute_gate(&reviews, &[label("codex"), label("ruthless")], &[], false),
+            cg(&reviews, &[label("codex"), label("ruthless")], &[], false),
             // Both reviewers have submitted (codex continue, ruthless RC) →
             // master woken with the full set.
             CommitGateState::ChangesRequested
@@ -1272,7 +1365,7 @@ mod tests {
         // verdicts.
         let reviews = [entry(crate::vocab::Verdict::RequestChanges, "codex")];
         assert_eq!(
-            compute_gate(&reviews, &[label("codex"), label("ruthless")], &[], false),
+            cg(&reviews, &[label("codex"), label("ruthless")], &[], false),
             CommitGateState::Unreviewed
         );
     }
@@ -1284,7 +1377,7 @@ mod tests {
             entry(crate::vocab::Verdict::RequestChanges, "ruthless"),
         ];
         assert_eq!(
-            compute_gate(&reviews, &[label("codex"), label("ruthless")], &[], false),
+            cg(&reviews, &[label("codex"), label("ruthless")], &[], false),
             CommitGateState::ChangesRequested
         );
     }
@@ -1295,7 +1388,7 @@ mod tests {
         // RequestChanges while another reviewer is still pending.
         let reviews = [entry(crate::vocab::Verdict::Unmarked, "codex")];
         assert_eq!(
-            compute_gate(&reviews, &[label("codex"), label("ruthless")], &[], false),
+            cg(&reviews, &[label("codex"), label("ruthless")], &[], false),
             CommitGateState::Unreviewed
         );
     }
@@ -1308,7 +1401,7 @@ mod tests {
             entry(crate::vocab::Verdict::Continue, "ruthless"),
         ];
         assert_eq!(
-            compute_gate(&reviews, &[label("codex"), label("ruthless")], &[], false),
+            cg(&reviews, &[label("codex"), label("ruthless")], &[], false),
             CommitGateState::ChangesRequested
         );
     }
@@ -1324,7 +1417,7 @@ mod tests {
             entry(crate::vocab::Verdict::RequestChanges, "ruthless"),
         ];
         assert_eq!(
-            compute_gate(
+            cg(
                 &reviews,
                 &[label("codex")],
                 &[label("ruthless"), label("glm")],
@@ -1342,7 +1435,7 @@ mod tests {
             entry(crate::vocab::Verdict::Continue, "glm"),
         ];
         assert_eq!(
-            compute_gate(
+            cg(
                 &reviews,
                 &[label("codex")],
                 &[label("ruthless"), label("glm")],
@@ -1356,7 +1449,7 @@ mod tests {
     fn compute_gate_two_expected_one_missing_is_unreviewed() {
         let reviews = [entry(crate::vocab::Verdict::Continue, "codex")];
         assert_eq!(
-            compute_gate(&reviews, &[label("codex"), label("ruthless")], &[], false),
+            cg(&reviews, &[label("codex"), label("ruthless")], &[], false),
             CommitGateState::Unreviewed
         );
     }
@@ -1368,7 +1461,7 @@ mod tests {
             entry(crate::vocab::Verdict::Finished, "ruthless"),
         ];
         assert_eq!(
-            compute_gate(&reviews, &[label("codex"), label("ruthless")], &[], false),
+            cg(&reviews, &[label("codex"), label("ruthless")], &[], false),
             CommitGateState::Finished
         );
     }
@@ -1381,7 +1474,7 @@ mod tests {
             entry(crate::vocab::Verdict::Continue, "ruthless"),
         ];
         assert_eq!(
-            compute_gate(&reviews, &[label("codex"), label("ruthless")], &[], false),
+            cg(&reviews, &[label("codex"), label("ruthless")], &[], false),
             CommitGateState::Continued
         );
     }
@@ -1390,7 +1483,7 @@ mod tests {
     fn compute_gate_unmarked_treated_as_changes() {
         let reviews = [entry(crate::vocab::Verdict::Unmarked, "codex")];
         assert_eq!(
-            compute_gate(&reviews, &[label("codex")], &[], false),
+            cg(&reviews, &[label("codex")], &[], false),
             CommitGateState::ChangesRequested
         );
     }
@@ -1411,13 +1504,13 @@ mod tests {
         // does NOT wake the gate reviewer (the regression this
         // guards against)...
         assert_eq!(
-            compute_gate(&[], &[], &[label("ruthless")], false),
+            cg(&[], &[], &[label("ruthless")], false),
             CommitGateState::Continued,
             "empty-commit + gate: pure-code commit must NOT wake the gate reviewer"
         );
         // ...but a PLAN-DOC commit is a milestone and does.
         assert_eq!(
-            compute_gate(&[], &[], &[label("ruthless")], true),
+            cg(&[], &[], &[label("ruthless")], true),
             CommitGateState::ContinuedPendingGate,
             "empty-commit + gate: plan-doc commit IS a milestone → gate wakes"
         );
@@ -1429,10 +1522,7 @@ mod tests {
         // (NOT Finished). Preserves pre-plan behavior; lloyd
         // 2026-06-08 directive (codex 8cb01b6 catch on the
         // earlier plan-body drift).
-        assert_eq!(
-            compute_gate(&[], &[], &[], false),
-            CommitGateState::Continued
-        );
+        assert_eq!(cg(&[], &[], &[], false), CommitGateState::Continued);
     }
 
     #[test]
@@ -1445,7 +1535,7 @@ mod tests {
             entry(crate::vocab::Verdict::RequestChanges, "ruthless"),
         ];
         assert_eq!(
-            compute_gate(&reviews, &[label("codex")], &[label("ruthless")], false),
+            cg(&reviews, &[label("codex")], &[label("ruthless")], false),
             CommitGateState::ChangesRequested
         );
     }
@@ -1462,7 +1552,7 @@ mod tests {
             entry(crate::vocab::Verdict::Continue, "ruthless"),
         ];
         assert_eq!(
-            compute_gate(&reviews, &[label("codex")], &[label("ruthless")], false),
+            cg(&reviews, &[label("codex")], &[label("ruthless")], false),
             CommitGateState::Continued
         );
     }
@@ -1476,7 +1566,7 @@ mod tests {
         // is ignored until commit-reviewers all positive.
         let reviews = [entry(crate::vocab::Verdict::Continue, "ruthless")];
         assert_eq!(
-            compute_gate(&reviews, &[label("codex")], &[label("ruthless")], false),
+            cg(&reviews, &[label("codex")], &[label("ruthless")], false),
             CommitGateState::Unreviewed
         );
     }
@@ -1490,7 +1580,7 @@ mod tests {
             entry(crate::vocab::Verdict::Finished, "ruthless"),
         ];
         assert_eq!(
-            compute_gate(&reviews, &[label("codex")], &[label("ruthless")], false),
+            cg(&reviews, &[label("codex")], &[label("ruthless")], false),
             CommitGateState::Finished
         );
     }
@@ -1506,7 +1596,7 @@ mod tests {
             entry(crate::vocab::Verdict::Continue, "ruthless"),
         ];
         assert_eq!(
-            compute_gate(&reviews, &[label("codex"), label("ruthless")], &[], false),
+            cg(&reviews, &[label("codex"), label("ruthless")], &[], false),
             CommitGateState::Continued
         );
     }
@@ -1521,7 +1611,7 @@ mod tests {
             // ruthless missing
         ];
         assert_eq!(
-            compute_gate(&reviews, &[label("codex"), label("ruthless")], &[], false),
+            cg(&reviews, &[label("codex"), label("ruthless")], &[], false),
             CommitGateState::Unreviewed
         );
     }
@@ -1538,7 +1628,7 @@ mod tests {
         // master keeps moving.
         let reviews = [entry(crate::vocab::Verdict::Continue, "codex")];
         assert_eq!(
-            compute_gate(&reviews, &[label("codex")], &[label("ruthless")], false),
+            cg(&reviews, &[label("codex")], &[label("ruthless")], false),
             CommitGateState::Continued,
             "routine code commit (continued, not a milestone) must bypass the gate tier"
         );
@@ -1550,7 +1640,7 @@ mod tests {
         // tier → gate reviewer signs off on the plan.
         let reviews = [entry(crate::vocab::Verdict::Continue, "codex")];
         assert_eq!(
-            compute_gate(&reviews, &[label("codex")], &[label("ruthless")], true),
+            cg(&reviews, &[label("codex")], &[label("ruthless")], true),
             CommitGateState::ContinuedPendingGate,
             "plan-doc commit (touched_plan) IS a milestone → gate wakes"
         );
@@ -1563,9 +1653,131 @@ mod tests {
         // gate), so the gate reviewer wakes.
         let reviews = [entry(crate::vocab::Verdict::Finished, "codex")];
         assert_eq!(
-            compute_gate(&reviews, &[label("codex")], &[label("ruthless")], false),
+            cg(&reviews, &[label("codex")], &[label("ruthless")], false),
             CommitGateState::ContinuedPendingGate,
             "FINISHED commit is a milestone → gate wakes even with no plan change"
+        );
+    }
+
+    // ====== split gate tier: plan vs final reviewer roles ======
+
+    #[test]
+    fn plan_reviewer_woken_at_plan_milestone_not_at_finish() {
+        use crate::vocab::Verdict;
+        // Plan-doc commit, commit tier continued → plan reviewer woken.
+        let reviews = [entry(Verdict::Continue, "codex")];
+        assert_eq!(
+            compute_gate(&reviews, &[label("codex")], &[label("scout")], &[], true),
+            CommitGateState::ContinuedPendingGate,
+            "plan reviewer is consulted at a plan-doc milestone"
+        );
+        // Commit tier FINISHED on a non-plan commit → finish milestone.
+        // The plan reviewer is NOT in the final tier, so it is not
+        // consulted; the (empty) final tier is vacuously positive.
+        let finished = [entry(Verdict::Finished, "codex")];
+        assert_eq!(
+            compute_gate(&finished, &[label("codex")], &[label("scout")], &[], false),
+            CommitGateState::Finished,
+            "a plan reviewer does NOT gate the finish"
+        );
+    }
+
+    #[test]
+    fn final_reviewer_woken_at_finish_not_at_plan_milestone() {
+        use crate::vocab::Verdict;
+        // Commit tier FINISHED → finish milestone → final reviewer woken.
+        let finished = [entry(Verdict::Finished, "codex")];
+        assert_eq!(
+            compute_gate(
+                &finished,
+                &[label("codex")],
+                &[],
+                &[label("shipper")],
+                false
+            ),
+            CommitGateState::ContinuedPendingGate,
+            "final reviewer is consulted at the finish milestone"
+        );
+        // Plan-doc commit, commit tier merely continued → plan milestone.
+        // The final reviewer is NOT in the plan tier → not consulted →
+        // Continued (plan sign-off).
+        let cont = [entry(Verdict::Continue, "codex")];
+        assert_eq!(
+            compute_gate(&cont, &[label("codex")], &[], &[label("shipper")], true),
+            CommitGateState::Continued,
+            "a final reviewer does NOT review plan commits"
+        );
+    }
+
+    #[test]
+    fn gate_reviewer_consulted_at_both_milestones() {
+        use crate::vocab::Verdict;
+        // gate = plan + final: the same reviewer in both tiers.
+        let r = [label("ruthless")];
+        assert_eq!(
+            compute_gate(
+                &[entry(Verdict::Continue, "codex")],
+                &[label("codex")],
+                &r,
+                &r,
+                true, // plan milestone
+            ),
+            CommitGateState::ContinuedPendingGate,
+            "gate reviewer is woken at a plan milestone"
+        );
+        assert_eq!(
+            compute_gate(
+                &[entry(Verdict::Finished, "codex")],
+                &[label("codex")],
+                &r,
+                &r,
+                false, // finish milestone
+            ),
+            CommitGateState::ContinuedPendingGate,
+            "gate reviewer is woken at the finish milestone"
+        );
+    }
+
+    #[test]
+    fn finish_decision_ignores_plan_only_reviewers() {
+        use crate::vocab::Verdict;
+        // A commit that is BOTH a plan-doc milestone AND finished. The
+        // plan reviewer only CONTINUE'd (positive, not finished); the
+        // final reviewer FINISHED. The finish belongs to the FINAL tier,
+        // so a plan-only reviewer at Continue does NOT block it.
+        let reviews = [
+            entry(Verdict::Finished, "codex"),
+            entry(Verdict::Continue, "scout"),
+            entry(Verdict::Finished, "shipper"),
+        ];
+        assert_eq!(
+            compute_gate(
+                &reviews,
+                &[label("codex")],
+                &[label("scout")],
+                &[label("shipper")],
+                true,
+            ),
+            CommitGateState::Finished,
+            "plan-only reviewer at Continue does not block the finish"
+        );
+    }
+
+    #[test]
+    fn empty_commit_tier_never_finishes_even_with_all_reviewers_finished() {
+        use crate::vocab::Verdict;
+        // Devolve guard (ruthless 36ba302): with NO commit tier the finish
+        // milestone never fires, so even a final reviewer at FINISHED on a
+        // plan-doc commit yields Continued — never Finished via vacuous
+        // all(finished) on the empty commit set.
+        let reviews = [
+            entry(Verdict::Finished, "scout"),
+            entry(Verdict::Finished, "shipper"),
+        ];
+        assert_eq!(
+            compute_gate(&reviews, &[], &[label("scout")], &[label("shipper")], true),
+            CommitGateState::Continued,
+            "empty commit tier ⇒ no finish milestone ⇒ never Finished"
         );
     }
 
@@ -1853,7 +2065,8 @@ mod tests {
             plan_feedback: true,
             adhoc_feedback: false,
             commit_reviewers: vec![label("codex"), label("ruthless")],
-            gate_reviewers: vec![],
+            plan_reviewers: vec![],
+            final_reviewers: vec![],
         }
     }
 
@@ -1869,6 +2082,7 @@ mod tests {
             crate::vocab::CommitGateState::Unreviewed,
             &verdicts,
             &plan_policy(),
+            false,
         );
         assert_eq!(missing, vec![label("ruthless")]);
     }
@@ -1876,11 +2090,13 @@ mod tests {
     // ============ PR review wait surface ============
 
     fn two_tier_policy() -> WorkPolicy {
+        // A `gate` reviewer (plan + final), pre-split semantics.
         WorkPolicy {
             plan_feedback: true,
             adhoc_feedback: false,
             commit_reviewers: vec![label("codex")],
-            gate_reviewers: vec![label("ruthless")],
+            plan_reviewers: vec![label("ruthless")],
+            final_reviewers: vec![label("ruthless")],
         }
     }
 
@@ -2065,13 +2281,10 @@ mod tests {
     fn compute_gate_unaffected_by_blocks() {
         // compute_gate is per-commit pure; blocks live a layer up
         // in derive_status. compute_gate's behavior is unchanged.
-        assert_eq!(
-            compute_gate(&[], &[], &[], false),
-            CommitGateState::Continued
-        );
+        assert_eq!(cg(&[], &[], &[], false), CommitGateState::Continued);
         let reviews = [entry(crate::vocab::Verdict::Continue, "codex")];
         assert_eq!(
-            compute_gate(&reviews, &[label("codex")], &[], false),
+            cg(&reviews, &[label("codex")], &[], false),
             CommitGateState::Continued
         );
     }
@@ -2101,11 +2314,13 @@ mod tests {
     }
 
     fn master_gate_policy() -> WorkPolicy {
+        // A `gate` reviewer (plan + final), pre-split semantics.
         WorkPolicy {
             plan_feedback: true,
             adhoc_feedback: false,
             commit_reviewers: vec![label("codex")],
-            gate_reviewers: vec![label("ruthless")],
+            plan_reviewers: vec![label("ruthless")],
+            final_reviewers: vec![label("ruthless")],
         }
     }
 
@@ -2522,7 +2737,8 @@ mod tests {
             plan_feedback: true,
             adhoc_feedback: true,
             commit_reviewers: Vec::new(),
-            gate_reviewers: Vec::new(),
+            plan_reviewers: Vec::new(),
+            final_reviewers: Vec::new(),
         }
     }
 

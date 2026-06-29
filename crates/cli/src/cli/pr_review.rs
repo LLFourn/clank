@@ -408,8 +408,7 @@ pub fn submit_with(
     // Convergence gate — fail closed on team-resolution failure,
     // and compute exactly as the wait surface does (current-round
     // verdicts through compute_gate with latest_touched_plan=false).
-    let (commit_reviewers, gate_reviewers) =
-        crate::agent_store::load_reviewer_tiers_with(repo, home)?;
+    let tiers = crate::agent_store::load_reviewer_tiers_with(repo, home)?;
     let verdicts = load_verdicts(repo, pr)?;
     let current: Vec<clank_core::wait::ReviewEntry> = verdicts
         .iter()
@@ -419,7 +418,8 @@ pub fn submit_with(
             verdict: v.verdict,
         })
         .collect();
-    let gate = clank_core::wait::compute_gate(&current, &commit_reviewers, &gate_reviewers, false);
+    let gate =
+        clank_core::wait::compute_gate(&current, &tiers.commit, &tiers.plan, &tiers.final_, false);
     if gate != clank_core::vocab::CommitGateState::Finished {
         anyhow::bail!(
             "not converged (gate: {}); run `clank pr-review status` — all reviewers must be FINISHED for round {}",
@@ -677,9 +677,11 @@ pub fn status_with(repo: &Path, home: Option<&Path>, pr: Option<u32>) -> anyhow:
     // mark the review done (codex da7ab89). The reviewer set is what
     // convergence is measured against, so its absence is an error,
     // not a degrade.
-    let (commit_reviewers, gate_reviewers) =
-        crate::agent_store::load_reviewer_tiers_with(repo, home)?;
-    let reviewers: Vec<AgentLabel> = commit_reviewers.into_iter().chain(gate_reviewers).collect();
+    // PR reviews have no plan doc, so only commit + final-tier
+    // reviewers (final + gate) ever participate; plan-only reviewers
+    // are not summoned.
+    let tiers = crate::agent_store::load_reviewer_tiers_with(repo, home)?;
+    let reviewers: Vec<AgentLabel> = tiers.commit.into_iter().chain(tiers.final_).collect();
     let verdicts = load_verdicts(repo, pr)?;
 
     let mut out = String::new();

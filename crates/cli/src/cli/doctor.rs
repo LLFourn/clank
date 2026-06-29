@@ -208,6 +208,12 @@ pub fn repo_checks(repo: &Path, home: Option<&Path>) -> Vec<CheckResult> {
     for r in &registered.commit_reviewers {
         members.push((r.label.clone(), "commit reviewer", r.desc.clone()));
     }
+    for r in &registered.plan_reviewers {
+        members.push((r.label.clone(), "plan reviewer", r.desc.clone()));
+    }
+    for r in &registered.final_reviewers {
+        members.push((r.label.clone(), "final reviewer", r.desc.clone()));
+    }
     for r in &registered.gate_reviewers {
         members.push((r.label.clone(), "gate reviewer", r.desc.clone()));
     }

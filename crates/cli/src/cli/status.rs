@@ -380,25 +380,16 @@ impl StatusSnapshot {
             .as_ref()
             .map(|set| roster_auto_rows(repo, home, set))
             .unwrap_or_default();
-        let (commit_reviewers, gate_reviewers) = registered
-            .map(|set| {
-                (
-                    set.commit_reviewers
-                        .into_iter()
-                        .map(|a| a.label)
-                        .collect::<Vec<_>>(),
-                    set.gate_reviewers
-                        .into_iter()
-                        .map(|a| a.label)
-                        .collect::<Vec<_>>(),
-                )
-            })
-            .unwrap_or_default();
+        let tiers = registered
+            .as_ref()
+            .map(crate::agent_store::ReviewerTiers::from_registered)
+            .unwrap_or_else(crate::agent_store::ReviewerTiers::empty);
         let work_policy = clank_core::wait::WorkPolicy {
             plan_feedback: config.review.plan_feedback,
             adhoc_feedback: config.review.adhoc_feedback,
-            commit_reviewers,
-            gate_reviewers,
+            commit_reviewers: tiers.commit,
+            plan_reviewers: tiers.plan,
+            final_reviewers: tiers.final_,
         };
         let reviews = crate::fs_plan_state_lookup::FsPlanStateLookup::with_handle(
             repo,

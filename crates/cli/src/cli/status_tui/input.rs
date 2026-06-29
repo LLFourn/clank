@@ -95,7 +95,7 @@ pub(super) fn detail_actions(role: crate::cli::teams_config::RosterRole) -> Vec<
     use DetailAction::*;
     match role {
         RosterRole::Master => vec![ToggleAuto, Back],
-        RosterRole::Commit | RosterRole::Gate => {
+        RosterRole::Commit | RosterRole::Plan | RosterRole::Final | RosterRole::Gate => {
             vec![ToggleAuto, SwitchTier, PromoteToMaster, Remove, Back]
         }
     }

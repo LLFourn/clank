@@ -937,6 +937,8 @@ fn role_word(role: RosterRole) -> &'static str {
     match role {
         RosterRole::Master => "master",
         RosterRole::Commit => "commit",
+        RosterRole::Plan => "plan",
+        RosterRole::Final => "final",
         RosterRole::Gate => "gate",
     }
 }

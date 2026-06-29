@@ -156,12 +156,13 @@ pub async fn run(args: WaitArgs) -> anyhow::Result<()> {
     // command, so it hard-errors when no team is configured
     // (`teams-based-agent-registration` render-vs-workflow
     // boundary).
-    let (commit_reviewers, gate_reviewers) = crate::agent_store::load_reviewer_tiers(&repo)?;
+    let tiers = crate::agent_store::load_reviewer_tiers(&repo)?;
     let work_policy = clank_core::wait::WorkPolicy {
         plan_feedback: config.review.plan_feedback,
         adhoc_feedback: config.review.adhoc_feedback,
-        commit_reviewers,
-        gate_reviewers,
+        commit_reviewers: tiers.commit,
+        plan_reviewers: tiers.plan,
+        final_reviewers: tiers.final_,
     };
 
     let snapshot = StartupSnapshot::capture(&initial_state.fold);

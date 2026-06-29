@@ -1073,14 +1073,19 @@ pub struct TeamSaveArgs {
 #[clap(rename_all = "snake_case")]
 pub enum ReviewKindArg {
     Commit,
+    Plan,
+    Final,
     Gate,
 }
 
 impl From<ReviewKindArg> for crate::cli::teams_config::ReviewKind {
     fn from(a: ReviewKindArg) -> Self {
+        use crate::cli::teams_config::ReviewKind;
         match a {
-            ReviewKindArg::Commit => crate::cli::teams_config::ReviewKind::Commit,
-            ReviewKindArg::Gate => crate::cli::teams_config::ReviewKind::Gate,
+            ReviewKindArg::Commit => ReviewKind::Commit,
+            ReviewKindArg::Plan => ReviewKind::Plan,
+            ReviewKindArg::Final => ReviewKind::Final,
+            ReviewKindArg::Gate => ReviewKind::Gate,
         }
     }
 }

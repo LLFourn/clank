@@ -110,6 +110,8 @@ fn write_typed_config<T: serde::Serialize>(path: &Path, value: &T) -> anyhow::Re
 struct RosterJson<'a> {
     master: Option<&'a str>,
     commit_reviewers: Vec<&'a str>,
+    plan_reviewers: Vec<&'a str>,
+    final_reviewers: Vec<&'a str>,
     gate_reviewers: Vec<&'a str>,
 }
 
@@ -117,17 +119,23 @@ impl<'a> RosterJson<'a> {
     fn from_team(team: &'a TeamRoster) -> Self {
         let mut master = None;
         let mut commit_reviewers = Vec::new();
+        let mut plan_reviewers = Vec::new();
+        let mut final_reviewers = Vec::new();
         let mut gate_reviewers = Vec::new();
         for (label, member) in team {
             match member.role() {
                 RosterRole::Master => master = Some(label.as_str()),
                 RosterRole::Commit => commit_reviewers.push(label.as_str()),
+                RosterRole::Plan => plan_reviewers.push(label.as_str()),
+                RosterRole::Final => final_reviewers.push(label.as_str()),
                 RosterRole::Gate => gate_reviewers.push(label.as_str()),
             }
         }
         Self {
             master,
             commit_reviewers,
+            plan_reviewers,
+            final_reviewers,
             gate_reviewers,
         }
     }
@@ -189,6 +197,8 @@ fn print_roster(team: &TeamRoster, library: &BTreeMap<AgentLabel, AgentDescripti
         .unwrap_or_else(|| "<unset>".to_string());
     println!("  master:           {master}");
     println!("  commit reviewers: {}", by_role(RosterRole::Commit));
+    println!("  plan reviewers:   {}", by_role(RosterRole::Plan));
+    println!("  final reviewers:  {}", by_role(RosterRole::Final));
     println!("  gate reviewers:   {}", by_role(RosterRole::Gate));
 }
 
@@ -414,6 +424,8 @@ mod tests {
         let mut team: TeamRoster = std::collections::BTreeMap::new();
         team.insert(lbl("claude"), team_ref(RosterRole::Master));
         team.insert(lbl("codex"), team_ref(RosterRole::Commit));
+        team.insert(lbl("scout"), team_ref(RosterRole::Plan));
+        team.insert(lbl("shipper"), team_ref(RosterRole::Final));
         team.insert(lbl("ruthless"), team_ref(RosterRole::Gate));
 
         assert_eq!(
@@ -421,6 +433,8 @@ mod tests {
             serde_json::json!({
                 "master": "claude",
                 "commit_reviewers": ["codex"],
+                "plan_reviewers": ["scout"],
+                "final_reviewers": ["shipper"],
                 "gate_reviewers": ["ruthless"],
             })
         );
@@ -435,6 +449,8 @@ mod tests {
                 "name": "dev",
                 "master": "claude",
                 "commit_reviewers": ["codex"],
+                "plan_reviewers": ["scout"],
+                "final_reviewers": ["shipper"],
                 "gate_reviewers": ["ruthless"],
             })
         );
@@ -446,6 +462,8 @@ mod tests {
             serde_json::json!({
                 "master": null,
                 "commit_reviewers": [],
+                "plan_reviewers": [],
+                "final_reviewers": [],
                 "gate_reviewers": [],
             })
         );

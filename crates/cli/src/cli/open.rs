@@ -676,22 +676,22 @@ async fn fold_summary(
     // Reviewer tiers from the team resolver
     // (`teams-based-agent-registration`); the no-team error is
     // caught below into a display message rather than crashing.
-    let (commit_reviewers, gate_reviewers) =
-        match crate::agent_store::load_reviewer_tiers_with(repo_root, home) {
-            Ok(t) => t,
-            Err(e) => {
-                return (
-                    0,
-                    None,
-                    Some(format!("loading registered reviewers failed: {e}")),
-                );
-            }
-        };
+    let tiers = match crate::agent_store::load_reviewer_tiers_with(repo_root, home) {
+        Ok(t) => t,
+        Err(e) => {
+            return (
+                0,
+                None,
+                Some(format!("loading registered reviewers failed: {e}")),
+            );
+        }
+    };
     let work_policy = clank_core::wait::WorkPolicy {
         plan_feedback: config.review.plan_feedback,
         adhoc_feedback: config.review.adhoc_feedback,
-        commit_reviewers,
-        gate_reviewers,
+        commit_reviewers: tiers.commit,
+        plan_reviewers: tiers.plan,
+        final_reviewers: tiers.final_,
     };
     let reviews =
         crate::fs_plan_state_lookup::FsPlanStateLookup::new(repo_root, state.head.as_ref());

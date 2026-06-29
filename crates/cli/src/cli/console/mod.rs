@@ -919,6 +919,8 @@ mod tests {
             master: label(master),
             master_desc: desc(),
             commit_reviewers: agents(commit),
+            plan_reviewers: Vec::new(),
+            final_reviewers: Vec::new(),
             gate_reviewers: agents(gate),
         }
     }

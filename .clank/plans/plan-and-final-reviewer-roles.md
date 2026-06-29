@@ -90,6 +90,27 @@ exactly as before. `plan` / `final` are additive opt-in roles.
   pending plan_reviewers; at a finish milestone wake the pending
   final_reviewers (their union when both).
 
+### Devolve-guard substitutions (preserve today's edge behavior)
+
+The split is NOT a single-field swap of `gate_reviewers`. Two existing
+guards must use the right set (ruthless 36ba302):
+
+- **No-second-tier early return** (`wait.rs:443`, today
+  `commit.is_empty() && gate.is_empty()` → `Continued`): becomes
+  `commit.is_empty() && plan_reviewers.is_empty() &&
+  final_reviewers.is_empty()` — the UNION of both new tiers empty.
+- **`Finished` decision** (`wait.rs:520`, today `commit all-finished
+  && gate all-finished`): becomes `commit all-finished && FINAL-tier
+  all-finished`. Plan-only reviewers are excluded from the finish.
+- **Devolve guard stays on the commit tier**: `commit_finished`
+  already requires a NON-EMPTY commit tier (an empty commit tier makes
+  `all(finished)` vacuously true and would re-animate the regression).
+  Consequence to call out: the FINISH milestone only fires when there
+  IS a commit tier to signal FINISHED, so a `final` reviewer depends on
+  a commit tier — a final-only repo with no commit reviewer reaches
+  only the plan milestone (via `latest_touched_plan`), never the
+  finish. Consistent with the existing guard; kept.
+
 ### Surfaces to update (all current two-tier consumers)
 - `compute_gate` callers: `derive_status` (status), `preview.rs`,
   `cli/pr_review.rs`.
@@ -114,6 +135,12 @@ exactly as before. `plan` / `final` are additive opt-in roles.
   - `Finished` requires the final tier (not plan-only reviewers) all
     finished; a plan-only reviewer left at Continue does NOT block the
     finish.
+  - **Empty-commit-tier guard**: a plan-doc commit (`latest_touched_plan`)
+    with a `final` reviewer already at FINISHED but NO commit tier is
+    NOT marked `Finished` (the finish milestone needs a non-empty
+    commit tier; `all(finished)` must not devolve to `Finished` via
+    vacuous truth on the empty commit set). The no-second-tier early
+    return uses the UNION of plan + final being empty.
 - Backward-compat test: an existing `role: gate` roster resolves and
   gates exactly as before (plan + final).
 - `work_for` wakes the right tier per milestone (plan vs final),

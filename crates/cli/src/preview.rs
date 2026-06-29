@@ -87,9 +87,10 @@ pub async fn build_finish_preview(
         latest_reviewable_sha.as_ref(),
         latest_touched_plan,
     )?;
-    let (commit_reviewers, gate_reviewers) =
+    let tiers =
         crate::agent_store::load_reviewer_tiers(repo_root).map_err(PreviewError::AgentLoad)?;
-    let any_registered = !commit_reviewers.is_empty() || !gate_reviewers.is_empty();
+    let any_registered =
+        !tiers.commit.is_empty() || !tiers.plan.is_empty() || !tiers.final_.is_empty();
 
     let readiness = compute_finalize_readiness(
         is_finished,
@@ -472,12 +473,13 @@ fn compute_gate(
     };
     let reviews = crate::fs_plan_state_lookup::FsPlanStateLookup::new(repo_root, Some(target));
     let entries = reviews.reviews_for(target);
-    let (commit_reviewers, gate_reviewers) =
+    let tiers =
         crate::agent_store::load_reviewer_tiers(repo_root).map_err(PreviewError::AgentLoad)?;
     Ok(clank_core::wait::compute_gate(
         &entries,
-        &commit_reviewers,
-        &gate_reviewers,
+        &tiers.commit,
+        &tiers.plan,
+        &tiers.final_,
         latest_touched_plan,
     ))
 }
