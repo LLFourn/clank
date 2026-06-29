@@ -235,19 +235,6 @@ impl LogEvent {
             LogEvent::AdHoc { .. } => None,
         }
     }
-
-    /// The commit's author timestamp — the chronological key used to
-    /// fold ad-hoc commits into the surrounding plan regardless of the
-    /// caller's feed direction (`umbrella_sections`).
-    pub fn ts(&self) -> i64 {
-        match self {
-            LogEvent::PlanIntro { ts, .. }
-            | LogEvent::PlanCommit { ts, .. }
-            | LogEvent::PlanFinalized { ts, .. }
-            | LogEvent::PlanDeleted { ts, .. }
-            | LogEvent::AdHoc { ts, .. } => *ts,
-        }
-    }
 }
 
 /// What groups a run of timeline events into one umbrella: the
@@ -280,40 +267,51 @@ pub fn umbrella_key(event: &LogEvent) -> UmbrellaKey {
 /// than every plan in the window has nothing to fold into and opens
 /// its own (header-less) section.
 ///
-/// Direction-agnostic by construction: the fold is decided in
-/// chronological (oldest-first) order via [`LogEvent::ts`], so the
-/// SAME chronological sequence yields the SAME grouping whether the
-/// caller feeds newest-first (log / status / html) or oldest-first.
-/// Sections (and the events within them) come back out in the
-/// caller's original order.
-pub fn umbrella_sections<'a>(events: &[&'a LogEvent]) -> Vec<(UmbrellaKey, Vec<&'a LogEvent>)> {
-    // Normalize to oldest-first so "fold ad-hoc into the preceding
-    // plan" is simply "join the current run". Detect the caller's
-    // direction by ts and restore it before returning.
-    let newest_first =
-        matches!((events.first(), events.last()), (Some(a), Some(b)) if a.ts() > b.ts());
-    let mut chrono: Vec<&'a LogEvent> = events.to_vec();
-    if newest_first {
-        chrono.reverse();
-    }
-
+/// `newest_first` declares the caller's EVENT ORDER explicitly — the
+/// fold uses stream position, NOT author timestamps (which are
+/// second-resolution and can tie or go backwards), so it is correct
+/// even when timestamps are equal. `clank log` / `status` / `html`
+/// pass `true` (git-log convention); pass `false` for an oldest-first
+/// stream. Sections (and events within them) come out in the caller's
+/// order.
+pub fn umbrella_sections<'a>(
+    events: &[&'a LogEvent],
+    newest_first: bool,
+) -> Vec<(UmbrellaKey, Vec<&'a LogEvent>)> {
     let mut out: Vec<(UmbrellaKey, Vec<&'a LogEvent>)> = Vec::new();
-    for e in chrono {
-        let key = umbrella_key(e);
-        match out.last_mut() {
-            // Ad-hoc folds into the current (preceding) plan run; it
-            // never opens or extends a key of its own once a section
-            // exists.
-            Some((_, run)) if key == UmbrellaKey::AdHoc => run.push(e),
-            Some((k, run)) if *k == key => run.push(e),
-            _ => out.push((key, vec![e])),
-        }
-    }
-
     if newest_first {
-        out.reverse();
-        for (_, run) in &mut out {
-            run.reverse();
+        // The chronologically-preceding plan appears AFTER an ad-hoc in
+        // a newest-first stream, so buffer ad-hocs and flush them into
+        // the NEXT plan run (newest within that run). Trailing ad-hocs
+        // (older than every plan) have nothing to fold into → own run.
+        let mut pending: Vec<&'a LogEvent> = Vec::new();
+        for e in events {
+            let key = umbrella_key(e);
+            if key == UmbrellaKey::AdHoc {
+                pending.push(e);
+                continue;
+            }
+            let same = matches!(out.last(), Some((k, _)) if *k == key);
+            if !same {
+                out.push((key, Vec::new()));
+            }
+            let run = &mut out.last_mut().unwrap().1;
+            run.extend(pending.drain(..));
+            run.push(e);
+        }
+        if !pending.is_empty() {
+            out.push((UmbrellaKey::AdHoc, pending));
+        }
+    } else {
+        // Oldest-first: the preceding plan is the current run, so an
+        // ad-hoc simply joins it.
+        for e in events {
+            let key = umbrella_key(e);
+            match out.last_mut() {
+                Some((_, run)) if key == UmbrellaKey::AdHoc => run.push(e),
+                Some((k, run)) if *k == key => run.push(e),
+                _ => out.push((key, vec![e])),
+            }
         }
     }
     out
@@ -1379,7 +1377,7 @@ mod tests {
         let b1 = log_ev(Some("b"), 2);
         let a2 = log_ev(Some("a"), 3);
         let events = [&a1, &b1, &a2];
-        let sections = umbrella_sections(&events);
+        let sections = umbrella_sections(&events, false);
         let keys: Vec<&UmbrellaKey> = sections.iter().map(|(k, _)| k).collect();
         assert_eq!(sections.len(), 3, "A1 B1 A2 → three umbrellas");
         assert_eq!(*keys[0], UmbrellaKey::Plan(PlanKey::parse("a").unwrap()));
@@ -1396,7 +1394,7 @@ mod tests {
         let a2 = log_ev(Some("a"), 2);
         let x = log_ev(None, 3);
         let events = [&a1, &a2, &x];
-        let sections = umbrella_sections(&events);
+        let sections = umbrella_sections(&events, false);
         assert_eq!(
             sections.len(),
             1,
@@ -1416,7 +1414,7 @@ mod tests {
         let x = log_ev(None, 1);
         let a1 = log_ev(Some("a"), 2);
         let events = [&x, &a1];
-        let sections = umbrella_sections(&events);
+        let sections = umbrella_sections(&events, false);
         assert_eq!(sections.len(), 2);
         assert_eq!(sections[0].0, UmbrellaKey::AdHoc);
         assert_eq!(
@@ -1426,43 +1424,65 @@ mod tests {
     }
 
     #[test]
-    fn umbrella_sections_adhoc_fold_is_direction_agnostic() {
-        // codex daaa518: callers feed NEWEST-first. For chronological
-        // A -> adhoc X -> B, the stream is [B, X, A]; X must fold under
-        // the chronologically-PRECEDING plan A, not the newer B. The
-        // fold is decided by ts, so the SAME chronology gives the SAME
-        // attribution either direction.
+    fn umbrella_sections_adhoc_folds_under_preceding_plan_both_directions() {
+        // For chronological A -> adhoc X -> B, X folds under the
+        // PRECEDING plan A (the plan active when X landed), and the
+        // result is the same fed newest- or oldest-first. Direction is
+        // EXPLICIT (no ts inference).
         let a = log_ev(Some("a"), 1);
         let x = log_ev(None, 2);
         let b = log_ev(Some("b"), 3);
         let a_key = UmbrellaKey::Plan(PlanKey::parse("a").unwrap());
+        let has_adhoc = |run: &[&LogEvent]| run.iter().any(|e| matches!(e, LogEvent::AdHoc { .. }));
 
-        // Newest-first (as log / status / html feed).
+        // Newest-first (as log / status / html feed): stream is B, X, A.
         let newest = [&b, &x, &a];
-        let s = umbrella_sections(&newest);
+        let s = umbrella_sections(&newest, true);
         assert_eq!(s.len(), 2, "B run + A run (X folded into A): {s:?}");
-        let a_run = s
-            .iter()
-            .find(|(k, _)| *k == a_key)
-            .expect("an A run exists");
+        let a_run = s.iter().find(|(k, _)| *k == a_key).expect("A run");
         assert!(
-            a_run.1.iter().any(|e| matches!(e, LogEvent::AdHoc { .. })),
-            "X folds under the preceding plan A, not the newer B: {:?}",
+            has_adhoc(&a_run.1),
+            "X folds under preceding plan A: {:?}",
             a_run.1
         );
         let b_run = s
             .iter()
             .find(|(k, _)| matches!(k, UmbrellaKey::Plan(p) if p.as_str() == "b"))
             .unwrap();
-        assert_eq!(b_run.1.len(), 1, "B run must NOT absorb the ad-hoc");
+        assert_eq!(b_run.1.len(), 1, "B must NOT absorb the ad-hoc");
 
-        // Oldest-first yields the SAME attribution.
+        // Oldest-first stream A, X, B → identical attribution.
         let oldest = [&a, &x, &b];
-        let s2 = umbrella_sections(&oldest);
+        let s2 = umbrella_sections(&oldest, false);
         let a_run2 = s2.iter().find(|(k, _)| *k == a_key).unwrap();
+        assert!(has_adhoc(&a_run2.1), "oldest-first also folds X under A");
+    }
+
+    #[test]
+    fn umbrella_sections_fold_uses_order_not_equal_timestamps() {
+        // codex 75a84c8: author timestamps are second-resolution and can
+        // tie. With ALL ts equal, a real newest-first stream B, X, A must
+        // STILL fold X under the preceding plan A — the fold uses event
+        // ORDER (explicit `newest_first`), never ts.
+        let a = log_ev(Some("a"), 1);
+        let mut x = log_ev(None, 1);
+        let mut b = log_ev(Some("b"), 1);
+        // Distinct shas, identical ts (log_ev keys sha off `n`).
+        if let LogEvent::AdHoc { sha, .. } = &mut x {
+            *sha = CommitSha::parse(&format!("{:0<40x}", 9u8)).unwrap();
+        }
+        if let LogEvent::PlanCommit { sha, .. } = &mut b {
+            *sha = CommitSha::parse(&format!("{:0<40x}", 8u8)).unwrap();
+        }
+        let newest = [&b, &x, &a];
+        let s = umbrella_sections(&newest, true);
+        let a_run = s
+            .iter()
+            .find(|(k, _)| *k == UmbrellaKey::Plan(PlanKey::parse("a").unwrap()))
+            .expect("A run");
         assert!(
-            a_run2.1.iter().any(|e| matches!(e, LogEvent::AdHoc { .. })),
-            "oldest-first also folds X under A"
+            a_run.1.iter().any(|e| matches!(e, LogEvent::AdHoc { .. })),
+            "equal-ts newest-first still folds X under A, not B: {s:?}"
         );
     }
 }

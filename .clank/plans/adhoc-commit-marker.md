@@ -89,11 +89,11 @@ monochrome-ish panel and plain `--oneline` output.
   "miscellaneous", never an error.
 - **Grouping (user's pick):** ad-hoc commits FOLD into the surrounding
   plan's umbrella. `umbrella_sections` (core) folds each ad-hoc into its
-  CHRONOLOGICALLY-PRECEDING plan, decided by `LogEvent::ts` so the
-  result is DIRECTION-AGNOSTIC — the same chronology groups identically
-  whether the caller feeds newest-first (log / status / html) or
-  oldest-first (codex daaa518). Only an ad-hoc older than every plan in
-  the window is header-less. No separate "adhoc" header anywhere.
+  PRECEDING plan using EVENT ORDER, with the caller's direction passed
+  EXPLICITLY (`newest_first`) — never inferred from author timestamps,
+  which are second-resolution and can tie (codex daaa518 / 75a84c8).
+  log / status / html pass newest-first. Only an ad-hoc older than every
+  plan in the window is header-less. No separate "adhoc" header anywhere.
 - Per ruthless: the per-row `ad_hoc` flag on `OnelineRow::Commit` is the
   sole carrier; the marker gutter is reserved on EVERY commit row
   (unmarked = a space) so subjects stay column-aligned; `--oneline`

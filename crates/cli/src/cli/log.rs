@@ -311,13 +311,17 @@ pub(crate) enum OnelineRow {
 /// fold's `LogEvent`s (carried since status-tui-live-log) — no
 /// per-event `git log -1` shelling, which matters for the live TUI
 /// pane re-rendering every refresh.
+///
+/// `events` are NEWEST-FIRST (the git-log convention every caller —
+/// `print_oneline`, the status TUI's `tui_log_rows` — uses); that
+/// order is what `umbrella_sections` folds ad-hoc commits by.
 pub(crate) fn oneline_rows(
     events: &[&LogEvent],
     reviews: &std::collections::BTreeMap<String, Vec<Review>>,
 ) -> Vec<OnelineRow> {
     use clank_core::repo_state::{UmbrellaKey, parse_subject, umbrella_sections};
     let mut out = Vec::new();
-    for (key, run) in umbrella_sections(events) {
+    for (key, run) in umbrella_sections(events, true) {
         let umbrella_plan = match &key {
             UmbrellaKey::Plan(p) => Some(p.as_str().to_string()),
             UmbrellaKey::AdHoc => None,

@@ -637,7 +637,7 @@ fn render_timeline(
     let mut out = String::from("<div class=\"timeline\">\n");
     // Group newest-first via the SHARED contiguous-run rule.
     let newest_first: Vec<&LogEvent> = events.iter().rev().collect();
-    for (key, run) in clank_core::repo_state::umbrella_sections(&newest_first) {
+    for (key, run) in clank_core::repo_state::umbrella_sections(&newest_first, true) {
         out.push_str(&render_umbrella(
             &key,
             &run,
