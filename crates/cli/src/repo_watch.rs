@@ -33,6 +33,7 @@ pub const CLANK_WAKE_DIRS: &[&str] = &[
     "agents", // agents/<label>/feedback — the gate signal
     "finished",
     "config.json",
+    "pr-reviews", // pr-reviews/<pr>/ — PrReviewer/PrMaster gate state
 ];
 
 /// Resolve `<git-common-dir>` (the worktree's gitdir for a linked
@@ -147,6 +148,12 @@ mod tests {
         assert!(is_core_wake(&p(".clank/blocks/q.md"), &git_dir, &clank));
         assert!(is_core_wake(&p(".clank/finished/foo.md"), &git_dir, &clank));
         assert!(is_core_wake(&p(".clank/config.json"), &git_dir, &clank));
+        // PR-review state (PrReviewer/PrMaster gate) lives here too.
+        assert!(is_core_wake(
+            &p(".clank/pr-reviews/123/pr.json"),
+            &git_dir,
+            &clank
+        ));
         // gitdir (commits / refs) wakes.
         assert!(is_core_wake(&p(".git/HEAD"), &git_dir, &clank));
         assert!(is_core_wake(&p(".git/refs/heads/main"), &git_dir, &clank));

@@ -1618,6 +1618,25 @@ mod dirty_and_wake_tests {
         );
     }
 
+    #[test]
+    fn clank_fingerprint_flips_on_a_pr_review_write() {
+        // PR-review state (PrReviewer/PrMaster gate) is part of the
+        // snapshot, so a `.clank/pr-reviews/<pr>/` write must flip the
+        // fingerprint (and wake the core watcher) — otherwise the TUI
+        // keeps stale PR rows after propose/note/submit/abort
+        // (codex fbd3e73). pr-reviews is in CLANK_WAKE_DIRS.
+        let dir = fixture_repo();
+        let r = dir.path();
+        let before = clank_input_fingerprint(r);
+        std::fs::create_dir_all(r.join(".clank/pr-reviews/42")).unwrap();
+        std::fs::write(r.join(".clank/pr-reviews/42/pr.json"), r#"{"round":1}"#).unwrap();
+        let after = clank_input_fingerprint(r);
+        assert_ne!(
+            before, after,
+            "a pr-reviews write must flip the fingerprint (TUI PR-row refresh)"
+        );
+    }
+
     /// The agent-panel auto toggle (`status --tui` SPC, or an external
     /// `clank auto`) writes `agents/<label>/config.json`. The repaint
     /// rests on the fingerprint covering that file — which it does only

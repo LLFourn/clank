@@ -155,6 +155,14 @@ of scope here (the runtime is not yet live-wired to a notify producer).
   is `repo_watch::is_core_wake` (gitdir + `CLANK_WAKE_DIRS` allowlist),
   unit-tested. (`path_to_signal` is NOT the wake rule — it's too narrow;
   it stays the structured classifier for the runtime, unchanged.)
+- The shared wake set covers every GATE input of `WorkStatus`: plans,
+  agents/feedback, queue, blocks, finished, config — and `pr-reviews`
+  (PrReviewer/PrMaster state; added to `CLANK_WAKE_DIRS` + the
+  fingerprint, pinned by a core-wake test and a
+  `clank_fingerprint_flips_on_a_pr_review_write` test — codex fbd3e73).
+  `.clank/shelved/` is intentionally NOT in the set: it's a display-only
+  list, not gate state (`work_for` emits nothing for it), and it was
+  never in the wake set — unchanged here.
 - Poll-mode behavior preserved: existing `wait` poll/heartbeat tests
   pass; gitdir-watch-native-only + periodic refold intact.
 - `status --tui`'s per-reviewer "needs to act" DECIDES through
