@@ -911,21 +911,10 @@ pub(crate) struct WakeFilter {
     ignore: crate::git_io::PathIgnore,
 }
 
-/// The first path component under `.clank/` that carries a real
-/// workflow signal. Everything else under `.clank` is derived or
-/// foreign and must NOT wake the loop (status-tui-watch-cpu): the
-/// fold `cache`, generated `html`, the `zellij` layout, queue
-/// `drafts` — and, critically, nested worktrees under
-/// `.clank/worktrees/<name>/`, which are whole separate repos with
-/// their own `src/`, `target/`, `.git`, and `.clank/cache`.
-const CLANK_WAKE_DIRS: &[&str] = &[
-    "plans",
-    "queue",
-    "blocks",
-    "agents", // agents/<label>/feedback — the gate signal
-    "finished",
-    "config.json",
-];
+// The `.clank/` workflow-state signal dirs the snapshot depends on —
+// the SHARED allowlist the core watcher wakes on. One source of truth
+// in `repo_watch`, so the reuse fingerprint and the wake rule agree.
+use crate::repo_watch::CLANK_WAKE_DIRS;
 
 /// A cheap fingerprint of everything a [`StatusSnapshot`] is derived
 /// from — the SAME inputs the [`WakeFilter`] wakes on: committed
@@ -1017,23 +1006,18 @@ impl WakeFilter {
         })
     }
 
-    /// True → the event at `path` should wake the loop.
+    /// True → the working-tree event at `path` should wake the DIFF
+    /// loop (refresh `dirty:`/diff).
     pub(crate) fn wakes(&mut self, path: &Path) -> bool {
-        // Commits move refs and the fold reads them. (Object churn
-        // during a commit is bursty, not a sustained storm.)
-        if path.starts_with(&self.git_dir) {
-            return true;
-        }
-        // Under `.clank`, wake ONLY on the workflow-state signal dirs
-        // (`CLANK_WAKE_DIRS`). This is an ALLOWLIST, not "anything under
-        // `.clank`": the repo is watched recursively, and `.clank`
-        // holds the derived `cache`/`html`, the `zellij` layout, and
-        // nested worktrees under `.clank/worktrees/<name>/` whose own
-        // builds + caches would otherwise wake this pane on every
-        // `cargo build` across a dozen worktrees (status-tui-watch-cpu).
-        if let Ok(rel) = path.strip_prefix(&self.clank_root) {
-            let head = rel.components().next().and_then(|c| c.as_os_str().to_str());
-            return head.is_some_and(|h| CLANK_WAKE_DIRS.contains(&h));
+        // Gate-state changes — the gitdir (commits/refs) AND anything
+        // under `.clank/` — are the CORE watcher's job
+        // (`repo_watch::is_core_wake`). The diff watcher refreshes
+        // dirty/diff from the WORKING TREE only, so it drops both: status
+        // runs both watchers on one channel, and dropping here keeps the
+        // diff side from double-waking on a gate change the core already
+        // delivered.
+        if path.starts_with(&self.git_dir) || path.starts_with(&self.clank_root) {
+            return false;
         }
         // A `.gitignore` write changes what's ignored: rebuild the
         // (nested-aware) exclude stack and wake. On a rebuild error keep
@@ -1067,12 +1051,36 @@ impl WakeFilter {
 pub(crate) fn watch_status_paths(
     tx: mpsc::Sender<()>,
     repo: &Path,
-) -> anyhow::Result<RecommendedWatcher> {
-    let clank_root = repo.join(".clank");
-    if let Err(e) = std::fs::create_dir_all(&clank_root) {
-        anyhow::bail!("ensure `{}` exists: {e}", clank_root.display());
-    }
-    let git_dir = git_resolve_dir(repo)?;
+) -> anyhow::Result<StatusWatchers> {
+    // Gate state comes from the SHARED core watcher (the same producer
+    // `clank wait` uses), so the panel and the stop-hook wake on the
+    // same changes. `status` is always native (no poll mode).
+    let core = crate::repo_watch::RepoStateWatcher::attach(repo, false, tx.clone())?;
+    let diff = watch_diff_paths(tx, repo)?;
+    Ok(StatusWatchers {
+        _core: core,
+        _diff: diff,
+    })
+}
+
+/// The two watchers `status` keeps alive together. Dropping this stops
+/// both. The SHARED core watcher feeds gate state; the status-only diff
+/// watcher feeds dirty/diff. They send on one channel; the loop's
+/// nothing-changed gate ([`InputSignature`]) coalesces.
+pub(crate) struct StatusWatchers {
+    _core: crate::repo_watch::RepoStateWatcher,
+    _diff: RecommendedWatcher,
+}
+
+/// The status-only DIFF watcher: the WHOLE working tree, recursively,
+/// waking on tracked-file edits to refresh `dirty:`/diff while dropping
+/// gitignored churn ([`WakeFilter`] holds the nested-aware
+/// `git_io::PathIgnore` — status-watch-nested-ignore). It is NEVER a
+/// source of gate state: it drops `.clank/` and the gitdir (the core
+/// watcher owns those). Watcher errors wake (one cheap rebuild beats
+/// silent staleness).
+fn watch_diff_paths(tx: mpsc::Sender<()>, repo: &Path) -> anyhow::Result<RecommendedWatcher> {
+    let git_dir = crate::repo_watch::git_state_dir(repo)?;
     let mut filter = WakeFilter::new(repo, &git_dir)?;
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
         match res {
@@ -1090,11 +1098,6 @@ pub(crate) fn watch_status_paths(
     watcher
         .watch(repo, RecursiveMode::Recursive)
         .map_err(|e| anyhow::anyhow!("watch `{}` failed: {e}", repo.display()))?;
-    if !git_dir.starts_with(repo) {
-        watcher
-            .watch(&git_dir, RecursiveMode::Recursive)
-            .map_err(|e| anyhow::anyhow!("watch `{}` failed: {e}", git_dir.display()))?;
-    }
     Ok(watcher)
 }
 
@@ -1114,11 +1117,6 @@ pub(crate) fn spawn_sigwinch_forwarder(tx: mpsc::Sender<()>) -> anyhow::Result<(
         }
     });
     Ok(())
-}
-
-fn git_resolve_dir(repo: &Path) -> anyhow::Result<std::path::PathBuf> {
-    let dir = crate::git_io::git_dir(repo)?;
-    Ok(dunce::canonicalize(&dir).unwrap_or(dir))
 }
 
 fn select_plans_and_finished(
@@ -1415,27 +1413,18 @@ mod dirty_and_wake_tests {
         let mut f = WakeFilter::new(&root, &git_dir).unwrap();
         let p = |rel: &str| root.join(rel);
 
-        // .clank workflow-state SIGNAL dirs + .git wake.
-        assert!(f.wakes(&p(".clank/agents/codex/feedback/abc.md")));
-        assert!(f.wakes(&p(".clank/blocks/q.md")));
-        assert!(f.wakes(&p(".clank/plans/foo.md")));
-        assert!(f.wakes(&p(".clank/queue/500-foo.md")));
-        assert!(f.wakes(&p(".clank/finished/foo.md")));
-        assert!(f.wakes(&p(".clank/config.json")));
-        assert!(f.wakes(&p(".git/HEAD")));
-
-        // DERIVED / foreign state under `.clank` must NOT wake — the
-        // allowlist, not "anything under .clank" (status-tui-watch-cpu).
+        // The DIFF watcher refreshes dirty/diff from the WORKING TREE
+        // only. Gate-state changes — gitdir AND everything under
+        // `.clank/` — are the CORE watcher's job
+        // (`repo_watch::is_core_wake`), so the diff filter ignores both,
+        // no matter the subpath. (This avoids double-waking: status runs
+        // both watchers on one channel.)
+        assert!(!f.wakes(&p(".clank/agents/codex/feedback/abc.md")));
+        assert!(!f.wakes(&p(".clank/plans/foo.md")));
+        assert!(!f.wakes(&p(".clank/config.json")));
         assert!(!f.wakes(&p(".clank/cache/repo-state/abc123.7.v10.bin")));
-        assert!(!f.wakes(&p(".clank/html/index.html")));
-        assert!(!f.wakes(&p(".clank/zellij/layout.kdl")));
-
-        // NESTED WORKTREES under `.clank/worktrees/<name>/` are whole
-        // separate repos; their builds + caches + own plans must NOT wake.
-        assert!(!f.wakes(&p(".clank/worktrees/wt1/target/debug/junk.o")));
-        assert!(!f.wakes(&p(".clank/worktrees/wt1/.clank/cache/repo-state/x.v10.bin")));
         assert!(!f.wakes(&p(".clank/worktrees/wt1/src/lib.rs")));
-        assert!(!f.wakes(&p(".clank/worktrees/wt1/.clank/plans/bar.md")));
+        assert!(!f.wakes(&p(".git/HEAD")));
 
         // Top-level working tree: root-gitignored → drop, tracked → wake.
         assert!(!f.wakes(&p("target/debug/build/junk.o")));

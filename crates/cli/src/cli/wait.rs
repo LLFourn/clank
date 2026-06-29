@@ -21,11 +21,9 @@
 //! plausibly flip the projection and refolds on each debounced
 //! event.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::mpsc;
 use std::time::Duration;
-
-use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 
 use super::{WaitArgs, resolve_repo};
 use crate::cli::block::scan_blocks;
@@ -271,10 +269,12 @@ pub async fn run(args: WaitArgs) -> anyhow::Result<()> {
         hook_config::run_idle_hook(&repo, &hook_config);
     }
 
-    let watch_ctx = WatchContext::resolve(&repo, poll_mode)?;
     let (tx, rx) = mpsc::channel::<()>();
-    let mut watcher = build_watcher(tx)?;
-    watch_ctx.attach(&mut watcher)?;
+    // The shared core watcher: `.clank/` gate dirs + gitdir (gitdir
+    // skipped in poll mode — the heartbeat tick below covers git then).
+    // Same producer `clank status` uses, so the panel and this loop wake
+    // on the same changes.
+    let _watcher = crate::repo_watch::RepoStateWatcher::attach(&repo, poll_mode, tx)?;
 
     // Refold cadence. Native mode uses a 1.5s heartbeat as the
     // finalize-race safety net (the watcher carries the load).
@@ -779,81 +779,6 @@ fn render_human(item: &WaitItem) -> String {
             format!("pr-review  #{pr}  round {round}  master: {next:?}")
         }
     }
-}
-
-/// Watch-time facts captured up-front. `.clank/` is always
-/// watched natively. `git_dir` is watched only in native mode;
-/// polling mode skips it and relies on the loop's periodic
-/// refold tick.
-struct WatchContext {
-    /// `<repo>/.clank`. Watched recursively in both modes.
-    clank_root: PathBuf,
-    /// Worktree-specific git dir (`.git/worktrees/<name>/` for
-    /// a linked worktree; `<repo>/.git/` for the main worktree).
-    /// `Some` in native mode, `None` in polling mode (no watch
-    /// attached at all — periodic refold handles git changes).
-    git_dir: Option<PathBuf>,
-}
-
-impl WatchContext {
-    fn resolve(repo: &Path, poll_mode: bool) -> anyhow::Result<Self> {
-        let git_dir = if poll_mode {
-            None
-        } else {
-            Some(git_resolve_dir(repo)?)
-        };
-        Ok(Self {
-            clank_root: repo.join(".clank"),
-            git_dir,
-        })
-    }
-
-    fn attach(&self, watcher: &mut RecommendedWatcher) -> anyhow::Result<()> {
-        // `<repo>/.clank` may not exist yet on a brand-new repo.
-        // `notify` refuses to watch a missing path, so create it
-        // first — Clank manages the directory anyway.
-        if let Err(e) = std::fs::create_dir_all(&self.clank_root) {
-            anyhow::bail!("ensure `{}` exists: {e}", self.clank_root.display());
-        }
-
-        watcher
-            .watch(&self.clank_root, RecursiveMode::Recursive)
-            .map_err(|e| anyhow::anyhow!("watch `{}` failed: {e}", self.clank_root.display()))?;
-        // Gitdir watch is native-mode-only. Polling mode keeps
-        // `.clank/` reactive but treats git movement as a
-        // periodic-poll concern — empirically required under
-        // the Codex tool sandbox where native gitdir events
-        // never reach notify.
-        if let Some(git_dir) = &self.git_dir {
-            watcher
-                .watch(git_dir, RecursiveMode::Recursive)
-                .map_err(|e| anyhow::anyhow!("watch `{}` failed: {e}", git_dir.display()))?;
-        }
-        Ok(())
-    }
-}
-
-fn git_resolve_dir(repo: &Path) -> anyhow::Result<PathBuf> {
-    let dir = crate::git_io::git_dir(repo)?;
-    Ok(dunce::canonicalize(&dir).unwrap_or(dir))
-}
-
-fn build_watcher(tx: mpsc::Sender<()>) -> anyhow::Result<RecommendedWatcher> {
-    Ok(notify::recommended_watcher(
-        move |res: notify::Result<notify::Event>| {
-            // Any successful event wakes us — including
-            // `EventKind::Any` and `EventKind::Other`. Codex's tool
-            // sandbox empirically delivers directory-level events
-            // without a precise kind classification; filtering on
-            // Create/Modify/Remove drops them. The cost of waking
-            // on Access events too is one extra refold per touch;
-            // the refold reads HEAD and the fold cache cheaply,
-            // and the 200ms debounce drain coalesces bursts.
-            if res.is_ok() {
-                let _ = tx.send(());
-            }
-        },
-    )?)
 }
 
 fn parse_timeout(raw: &str) -> anyhow::Result<Option<Duration>> {

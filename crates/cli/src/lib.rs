@@ -16,6 +16,7 @@ pub mod git_plumbing;
 pub mod hook_config;
 pub mod init_facts;
 pub mod preview;
+pub mod repo_watch;
 pub mod runtime;
 pub mod state_cache;
 pub mod worktree_facts;

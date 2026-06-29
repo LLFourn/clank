@@ -97,24 +97,34 @@ keeps its existing derivation (it also models queue-promote, which
 routing through `work_for` would need queue-promote modeled there and
 is out of scope).
 
-### Part 2 — one core watcher (reduce three → one, shared)
+### Part 2 — one core watcher (reduce three → one, shared) — DONE
 
-Build the missing "notify wiring" the `fs_watcher` doc promised:
+New module `crate::repo_watch` provides the shared core watcher.
 
-- A single `RepoStateWatcher` (new module, or the wiring half of
-  `fs_watcher`) that attaches `notify` to the canonical repo-state
-  roots — `.clank/` + the resolved gitdir, poll-mode-aware (preserve
-  `wait`'s Codex-sandbox behavior: gitdir watch native-only +
-  periodic refold) — and classifies every event through
-  `fs_watcher::path_to_signal`. `path_to_signal` becomes the ONE
-  definition of a wake-worthy change (it is already test-covered;
-  this finally wires it into production).
-- `clank wait` and `clank status`'s gate refold both consume this
-  watcher. Delete `status.rs::watch_status_paths` + `WakeFilter` and
-  `wait.rs::WatchContext` + `build_watcher`; both call the shared
-  watcher. The console `runtime` (already a `FilesystemSignal`
-  consumer, `runtime.rs:10`) should be fed by the same producer if
-  cheap.
+**Design note (corrected from the intro):** the intro proposed
+`fs_watcher::path_to_signal` as "the ONE wake classifier." That is too
+NARROW — `path_to_signal` only recognizes HEAD / plans / feedback, but
+the gate also wakes on `.clank/queue/`, `.clank/blocks/`, and
+`config.json`. So the shared core wake rule is
+`repo_watch::is_core_wake(path, git_dir, clank_root)` = "under the
+gitdir (commits/refs) OR under a `.clank/` gate dir
+([`CLANK_WAKE_DIRS`])" — the allowlist extracted from the old
+`WakeFilter`. `path_to_signal` stays the STRUCTURED classifier for the
+console `runtime` (HEAD/plan/feedback signals); it is unchanged and out
+of scope here (the runtime is not yet live-wired to a notify producer).
+
+- `repo_watch::RepoStateWatcher::attach(repo, poll_mode, tx)` watches
+  `.clank/` + the resolved gitdir (gitdir skipped in poll mode —
+  `wait`'s Codex-sandbox behavior, with the periodic refold as the
+  git signal) and sends a wake for each `is_core_wake` event. Storm-safe
+  by construction: it never watches the working tree.
+- `clank wait` and `clank status` both consume it. Deleted
+  `wait.rs::WatchContext` + `build_watcher` (+ `git_resolve_dir`) and
+  `status.rs`'s combined `watch_status_paths`/`WakeFilter` gate logic;
+  `watch_status_paths` now returns `StatusWatchers { core, diff }`.
+  `CLANK_WAKE_DIRS` moved to `repo_watch` (single source; `status`'s
+  reuse fingerprint imports it). The console `runtime` is left as-is
+  (not live-wired; folding it in is future work, noted not done).
 - **The TUI's working-tree/diff watcher stays separate and clearly
   scoped.** `status --tui` updates dirty diff lines from working-tree
   writes; that is a presentation concern, not gate state. Keep (or
@@ -137,12 +147,14 @@ Build the missing "notify wiring" the `fs_watcher` doc promised:
 
 ## Acceptance criteria
 
-- One notify-wiring module is the sole producer of repo-state wakes;
-  `WakeFilter`, `watch_status_paths`, `WatchContext`, and
-  `build_watcher` are deleted. `clank wait` and `clank status` both
-  use the shared watcher.
-- `fs_watcher::path_to_signal` is the single wake classifier and now
-  has production callers (no longer test-only).
+- `repo_watch::RepoStateWatcher` is the single gate-state wake producer,
+  shared by `clank wait` and `clank status`. `wait.rs::WatchContext` +
+  `build_watcher` are deleted; `status.rs`'s combined gate watcher is
+  gone (`watch_status_paths` now returns `StatusWatchers { core, diff }`
+  and `WakeFilter` is the diff-only filter). The single core wake rule
+  is `repo_watch::is_core_wake` (gitdir + `CLANK_WAKE_DIRS` allowlist),
+  unit-tested. (`path_to_signal` is NOT the wake rule — it's too narrow;
+  it stays the structured classifier for the runtime, unchanged.)
 - Poll-mode behavior preserved: existing `wait` poll/heartbeat tests
   pass; gitdir-watch-native-only + periodic refold intact.
 - `status --tui`'s per-reviewer "needs to act" DECIDES through
