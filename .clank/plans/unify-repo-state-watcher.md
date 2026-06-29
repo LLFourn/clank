@@ -74,13 +74,19 @@ Make `work_for` the single answer. `status_tui/derive.rs`'s per-agent
 and the stop-hook are equal BY CONSTRUCTION rather than by parallel
 `match` arms.
 
-Remove the display-only second source: the `head_correction` preempt
-must live in exactly one place both readers see — either folded into
-each implicated plan's `waiting_on` in `derive_status` (preferred —
-then `work_for` needs no top-level short-circuit and the TUI is
-automatically correct), or behind the shared `actionable_for`. Either
-way, delete the "for display only" `MasterToFixCommitTag` parallel
-representation.
+Remove the display-only second source — but note `head_correction` is
+a **repo-GLOBAL preempt, not per-plan**: `work_for` checks
+`self.head_correction` and returns BEFORE the per-plan loop
+(`core/wait.rs:889`), so a broken HEAD makes master fix it and ALL
+reviewers idle, regardless of any plan's `waiting_on`. Folding it into
+the implicated plan's `waiting_on` would therefore CHANGE behavior
+(reviewers on other plans would stay active); folding it into every
+plan conflates a repo-level gate with per-plan state. So the single
+representation is a shared top-level **`actionable_for(agent, role)`**
+that both `work_for` and the TUI consume — it keeps the global
+`head_correction` preempt in one place. Delete the "for display only"
+`MasterToFixCommitTag` parallel representation; the TUI's
+fixup/attention indicator derives from `actionable_for` too.
 
 ### Part 2 — one core watcher (reduce three → one, shared)
 
@@ -105,9 +111,20 @@ Build the missing "notify wiring" the `fs_watcher` doc promised:
   writes; that is a presentation concern, not gate state. Keep (or
   split out) a dedicated watcher for it that explicitly does NOT feed
   the waiting-upon projection. The core watcher watches `.clank/` +
-  gitdir only (the gate inputs); the whole-repo recursive watch that
-  `status` does today is exactly the diff/dirty concern and moves to
-  this separate watcher.
+  gitdir only (the gate inputs) — storm-safe, never the working tree;
+  the whole-repo recursive watch that `status` does today is exactly
+  the diff/dirty concern and moves to this separate watcher.
+- **Carry the storm fix onto the diff watcher.** `WakeFilter` is not
+  just a path filter — it holds the git-accurate `git_io::PathIgnore`
+  (`status.rs:911`) and feeds the trailing-edge rebuild debounce that
+  `status-watch-nested-ignore` landed to kill the ignored-`build/`
+  churn CPU storm (~250 wakes/s in the Flutter sim). The new core
+  watcher is storm-safe by construction (it never watches the working
+  tree), but the DIFF watcher inherits the working-tree watch and MUST
+  keep `PathIgnore` filtering AND the deferred-wait/trailing-edge
+  rebuild debounce. Deleting `WakeFilter` means MOVING that logic onto
+  the diff watcher, not dropping it — re-watching the working tree raw
+  reintroduces the storm (a behavior change this plan forbids).
 
 ## Acceptance criteria
 
@@ -119,15 +136,22 @@ Build the missing "notify wiring" the `fs_watcher` doc promised:
   has production callers (no longer test-only).
 - Poll-mode behavior preserved: existing `wait` poll/heartbeat tests
   pass; gitdir-watch-native-only + periodic refold intact.
-- `status --tui`'s "needs to act" per agent is `work_for`-derived; a
-  test asserts the TUI indicator and `work_for` agree for every
-  `WaitingOn` variant **including the `head_correction` case** (the
-  current drift). The display-only `MasterToFixCommitTag` duplicate
-  is gone.
+- `status --tui`'s "needs to act" per agent derives from the shared
+  `actionable_for` (= `work_for`). A test asserts the TUI indicator
+  and `work_for` agree for every `WaitingOn` variant. The
+  `head_correction` case is covered **cross-plan**: with a broken HEAD
+  tag, a reviewer on a NON-implicated plan also gets nothing (the
+  global preempt), and the TUI shows that same reviewer as idle — not
+  just the single-plan case. The display-only `MasterToFixCommitTag`
+  duplicate is gone.
 - `status --tui` still live-updates dirty diff lines via its separate,
-  explicitly-scoped diff watcher.
-- No behavior change to gate semantics, hook firings, or the
-  `WaitItem` set; this is a dedup, not a redesign.
+  explicitly-scoped diff watcher, which **retains `git_io::PathIgnore`
+  filtering and the trailing-edge rebuild debounce** from
+  `status-watch-nested-ignore` — a regression test (or the existing
+  storm test) proves the ignored-`build/`-churn storm does NOT return.
+- No behavior change to gate semantics, hook firings, the `WaitItem`
+  set, the global `head_correction` preempt, or watch CPU cost; this
+  is a dedup, not a redesign.
 
 ## Out of scope
 
@@ -145,6 +169,11 @@ Build the missing "notify wiring" the `fs_watcher` doc promised:
   `.clank/` + gitdir (same as `wait`), and only the diff watcher sees
   the working tree. Verify the TUI still reacts to plan/feedback/HEAD
   changes (it will — those are under the core roots).
+- Two behavior-preservation traps this dedup must not spring (per the
+  intro gate review): the global `head_correction` preempt (don't
+  per-plan-ize it) and the `status-watch-nested-ignore` CPU storm
+  (carry `PathIgnore` + the rebuild debounce onto the diff watcher).
+  Both are pinned in the acceptance criteria above.
 - Part 1 and Part 2 are independently committable; land Part 1 first
   (it fixes the user-visible symptom) so the watcher refactor can be
   reviewed without behavior risk riding on it.
