@@ -129,16 +129,7 @@ fn roster_specs(repo: &Path) -> Vec<Spec> {
 fn ordered_roster_labels(set: &crate::cli::teams_config::RegisteredSet) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     std::iter::once(set.master.as_str().to_string())
-        .chain(
-            set.commit_reviewers
-                .iter()
-                .map(|a| a.label.as_str().to_string()),
-        )
-        .chain(
-            set.gate_reviewers
-                .iter()
-                .map(|a| a.label.as_str().to_string()),
-        )
+        .chain(set.reviewers.iter().map(|r| r.label.as_str().to_string()))
         .filter(|l| seen.insert(l.clone()))
         .collect()
 }
@@ -896,7 +887,7 @@ fn teardown(screens: &mut [Screen]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::teams_config::{AgentDescription, RegisteredSet, ResolvedAgent};
+    use crate::cli::teams_config::{AgentDescription, RegisteredSet};
     use clank_core::ids::AgentLabel;
     use clank_core::vocab::Tool;
 
@@ -907,21 +898,26 @@ mod tests {
             launch: None,
             initial_prompt: None,
         };
-        let agents = |ls: &[&str]| {
-            ls.iter()
-                .map(|l| ResolvedAgent {
-                    label: label(l),
-                    desc: desc(),
-                })
-                .collect()
-        };
+        use crate::cli::teams_config::{RegisteredReviewer, RosterRole};
+        let mut reviewers = Vec::new();
+        for l in commit {
+            reviewers.push(RegisteredReviewer {
+                label: label(l),
+                desc: desc(),
+                role: RosterRole::Commit,
+            });
+        }
+        for l in gate {
+            reviewers.push(RegisteredReviewer {
+                label: label(l),
+                desc: desc(),
+                role: RosterRole::Gate,
+            });
+        }
         RegisteredSet {
             master: label(master),
             master_desc: desc(),
-            commit_reviewers: agents(commit),
-            plan_reviewers: Vec::new(),
-            final_reviewers: Vec::new(),
-            gate_reviewers: agents(gate),
+            reviewers,
         }
     }
 
@@ -1029,6 +1025,45 @@ mod tests {
         // in two tiers still yields exactly one screen.
         let set = fixture("claude", &["codex", "claude"], &["codex"]);
         assert_eq!(ordered_roster_labels(&set), vec!["claude", "codex"]);
+    }
+
+    #[test]
+    fn roster_labels_include_plan_and_final_reviewers() {
+        // Regression (plan-and-final-reviewer-roles): every reviewer
+        // role must surface in the console roster — the single
+        // `reviewers` collection makes dropping plan/final
+        // unrepresentable.
+        use crate::cli::teams_config::{
+            AgentDescription, RegisteredReviewer, RegisteredSet, RosterRole,
+        };
+        let label = |s: &str| AgentLabel::parse(s).unwrap();
+        let desc = || AgentDescription {
+            tool: clank_core::vocab::Tool::Claude,
+            launch: None,
+            initial_prompt: None,
+        };
+        let rev = |l: &str, role| RegisteredReviewer {
+            label: label(l),
+            desc: desc(),
+            role,
+        };
+        let set = RegisteredSet {
+            master: label("claude"),
+            master_desc: desc(),
+            reviewers: vec![
+                rev("codex", RosterRole::Commit),
+                rev("scout", RosterRole::Plan),
+                rev("shipper", RosterRole::Final),
+                rev("ruthless", RosterRole::Gate),
+            ],
+        };
+        let labels = ordered_roster_labels(&set);
+        for who in ["codex", "scout", "shipper", "ruthless"] {
+            assert!(
+                labels.iter().any(|l| l == who),
+                "{who} missing from {labels:?}"
+            );
+        }
     }
 
     #[test]

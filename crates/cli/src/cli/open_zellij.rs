@@ -245,10 +245,9 @@ fn resolve_tabs(targets: &[PathBuf], include: Option<&[String]>) -> anyhow::Resu
             continue;
         };
         let reviewers = set
-            .commit_reviewers
+            .reviewers
             .iter()
-            .chain(set.gate_reviewers.iter())
-            .map(|a| a.label.as_str().to_string())
+            .map(|r| r.label.as_str().to_string())
             .collect();
         tabs.push(TabSpec {
             name: basename,
@@ -329,10 +328,9 @@ fn open_one(repo: &Path, print: bool) -> anyhow::Result<()> {
     };
     let master_label = set.master.as_str().to_string();
     let reviewer_labels: Vec<String> = set
-        .commit_reviewers
+        .reviewers
         .iter()
-        .chain(set.gate_reviewers.iter())
-        .map(|a| a.label.as_str().to_string())
+        .map(|r| r.label.as_str().to_string())
         .collect();
     let repo_path_str = repo.display().to_string();
     // User-authored layout chrome from `~/.clank/config.json`

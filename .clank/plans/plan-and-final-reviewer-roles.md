@@ -62,18 +62,33 @@ exactly as before. `plan` / `final` are additive opt-in roles.
   for RosterRole`.
 
 ### Resolution → tiers
-- `resolve_registered_set` (`teams_config.rs`) buckets the roster by
-  role. Keep per-role lists so display shows the exact role; derive the
-  two compute tiers:
-  - `plan_tier = {role ∈ Plan, Gate}`
-  - `final_tier = {role ∈ Final, Gate}`
-  A `gate` reviewer appears in both compute tiers but is listed ONCE
-  (as `gate`) for display — no double-counting in `team show`/doctor/
-  the status panel.
+
+`RegisteredSet` stores reviewers as ONE role-tagged collection, not N
+role-keyed buckets — `reviewers: Vec<RegisteredReviewer{label, desc,
+role}>`. This is the architectural fix for the enumeration fragility
+the role split exposed (codex 0976211): with per-role buckets, every
+"enumerate all reviewers" site hand-chained `commit + gate` and
+silently dropped plan/final — a logic omission the compiler can't
+catch (status roster rows, open_zellij panes, fork session-bind,
+`clank agent` listing all had it). With one collection:
+
+- "every reviewer" is `set.reviewers` — there is nothing else to
+  chain, so dropping a role is unrepresentable.
+- the role→tier mapping (incl. the `gate = plan + final` fold) lives
+  in ONE place: `RegisteredSet::commit_tier()` / `plan_tier()`
+  (Plan|Gate) / `final_tier()` (Final|Gate), each a `match`/filter on
+  `role`. Adding a future role makes the compiler flag that one match.
+- display surfaces iterate `reviewers` and read `r.role` (a `gate`
+  reviewer is still listed ONCE).
+
+- `resolve_registered_set` (`teams_config.rs`) pushes every reviewer
+  into the single `reviewers` Vec with its role.
 - `WorkPolicy` (`core/wait.rs`): replace `gate_reviewers` with
-  `plan_reviewers` + `final_reviewers` (each already includes gate).
-  Update `RegisteredSet` / `load_reviewer_tiers`
-  (`agent_store.rs`) accordingly.
+  `plan_reviewers` + `final_reviewers` (each already includes gate),
+  built from the tier accessors via `agent_store::ReviewerTiers`.
+- Convert ALL reviewer enumerators (status `roster_auto_rows`,
+  `fork`, `open_zellij` ×2, `doctor`, `clank agent` listing,
+  `role_from_registered_set`) to iterate `reviewers`.
 
 ### Gate computation
 - `compute_gate(reviews, commit_reviewers, plan_reviewers,
@@ -125,6 +140,11 @@ guards must use the right set (ruthless 36ba302):
 
 - Roles `plan` / `final` added; `gate` kept = plan + final; CLI
   `--review plan|final|gate|commit` works.
+- `RegisteredSet` stores ONE role-tagged `reviewers` collection (not
+  per-role buckets); every enumerator (status panel, fork, zellij ×2,
+  doctor, `clank agent` list, console roster) iterates it, so no role
+  can be silently dropped. Regression test: plan/final reviewers
+  appear in the roster enumeration.
 - `compute_gate` tests:
   - a `plan` reviewer is woken at a plan-doc-commit milestone and is
     NOT consulted at a finish milestone;

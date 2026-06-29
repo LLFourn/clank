@@ -212,8 +212,7 @@ pub async fn run_fork_pinned(
         );
     };
     let mut members: Vec<AgentLabel> = vec![set.master.clone()];
-    members.extend(set.commit_reviewers.iter().map(|a| a.label.clone()));
-    members.extend(set.gate_reviewers.iter().map(|a| a.label.clone()));
+    members.extend(set.reviewers.iter().map(|r| r.label.clone()));
 
     // Keep each member's FULL source config: the session drives the
     // fork spec, and auto_mode/wait_timeout get carbon-copied into the

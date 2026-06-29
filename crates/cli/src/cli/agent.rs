@@ -105,22 +105,12 @@ fn list(args: AgentListArgs) -> anyhow::Result<()> {
             skeleton.as_ref().and_then(|c| c.session.as_ref()),
         ));
     }
-    for r in &set.commit_reviewers {
+    for r in &set.reviewers {
         let skeleton = load_agent_config(&repo, &r.label)?;
         rows.push(AgentRow::from_join(
             &r.label,
             "reviewer",
-            "commit",
-            r.desc.tool,
-            skeleton.as_ref().and_then(|c| c.session.as_ref()),
-        ));
-    }
-    for r in &set.gate_reviewers {
-        let skeleton = load_agent_config(&repo, &r.label)?;
-        rows.push(AgentRow::from_join(
-            &r.label,
-            "reviewer",
-            "gate",
+            role_word(r.role),
             r.desc.tool,
             skeleton.as_ref().and_then(|c| c.session.as_ref()),
         ));
@@ -261,21 +251,15 @@ fn find_in_set(
     if &set.master == label {
         return Some(set.master_desc.clone());
     }
-    set.commit_reviewers
+    set.reviewers
         .iter()
-        .chain(set.gate_reviewers.iter())
-        .find(|a| &a.label == label)
-        .map(|a| a.desc.clone())
+        .find(|r| &r.label == label)
+        .map(|r| r.desc.clone())
 }
 
 fn registered_labels(set: &crate::cli::teams_config::RegisteredSet) -> Vec<String> {
     let mut out = vec![set.master.as_str().to_string()];
-    out.extend(
-        set.commit_reviewers
-            .iter()
-            .chain(set.gate_reviewers.iter())
-            .map(|a| a.label.as_str().to_string()),
-    );
+    out.extend(set.reviewers.iter().map(|r| r.label.as_str().to_string()));
     out
 }
 

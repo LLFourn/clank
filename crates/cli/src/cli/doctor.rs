@@ -205,17 +205,16 @@ pub fn repo_checks(repo: &Path, home: Option<&Path>) -> Vec<CheckResult> {
         "master",
         registered.master_desc.clone(),
     ));
-    for r in &registered.commit_reviewers {
-        members.push((r.label.clone(), "commit reviewer", r.desc.clone()));
-    }
-    for r in &registered.plan_reviewers {
-        members.push((r.label.clone(), "plan reviewer", r.desc.clone()));
-    }
-    for r in &registered.final_reviewers {
-        members.push((r.label.clone(), "final reviewer", r.desc.clone()));
-    }
-    for r in &registered.gate_reviewers {
-        members.push((r.label.clone(), "gate reviewer", r.desc.clone()));
+    for r in &registered.reviewers {
+        use crate::cli::teams_config::RosterRole;
+        let role_str = match r.role {
+            RosterRole::Commit => "commit reviewer",
+            RosterRole::Plan => "plan reviewer",
+            RosterRole::Final => "final reviewer",
+            RosterRole::Gate => "gate reviewer",
+            RosterRole::Master => "master", // unreachable: master isn't a reviewer
+        };
+        members.push((r.label.clone(), role_str, r.desc.clone()));
     }
 
     for (label, role_str, desc) in &members {

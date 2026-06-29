@@ -138,11 +138,7 @@ pub struct ReviewerTiers {
 impl ReviewerTiers {
     pub fn from_registered(set: &crate::cli::teams_config::RegisteredSet) -> Self {
         Self {
-            commit: set
-                .commit_reviewers
-                .iter()
-                .map(|a| a.label.clone())
-                .collect(),
+            commit: set.commit_tier(),
             plan: set.plan_tier(),
             final_: set.final_tier(),
         }
@@ -190,7 +186,7 @@ pub fn role_from_registered_set(
     if &set.master == label {
         return Role::Master;
     }
-    let is_reviewer = set.all_reviewers().iter().any(|a| &a.label == label);
+    let is_reviewer = set.reviewers.iter().any(|r| &r.label == label);
     if is_reviewer {
         Role::Reviewer
     } else {
@@ -518,7 +514,9 @@ fn save_json<T: serde::Serialize>(path: &Path, value: &T) -> anyhow::Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::teams_config::{AgentDescription, RegisteredSet, ResolvedAgent};
+    use crate::cli::teams_config::{
+        AgentDescription, RegisteredReviewer, RegisteredSet, RosterRole,
+    };
     use clank_core::vocab::{Role, Tool};
 
     fn label(s: &str) -> AgentLabel {
@@ -534,24 +532,18 @@ mod tests {
     }
 
     fn registered_set(master: &str, commit: &[&str], gate: &[&str]) -> RegisteredSet {
+        let rev = |l: &&str, role: RosterRole| RegisteredReviewer {
+            label: label(l),
+            desc: desc(Tool::Claude),
+            role,
+        };
         RegisteredSet {
             master: label(master),
             master_desc: desc(Tool::Claude),
-            commit_reviewers: commit
+            reviewers: commit
                 .iter()
-                .map(|l| ResolvedAgent {
-                    label: label(l),
-                    desc: desc(Tool::Claude),
-                })
-                .collect(),
-            plan_reviewers: Vec::new(),
-            final_reviewers: Vec::new(),
-            gate_reviewers: gate
-                .iter()
-                .map(|l| ResolvedAgent {
-                    label: label(l),
-                    desc: desc(Tool::Claude),
-                })
+                .map(|l| rev(l, RosterRole::Commit))
+                .chain(gate.iter().map(|l| rev(l, RosterRole::Gate)))
                 .collect(),
         }
     }
@@ -647,8 +639,8 @@ mod tests {
             .unwrap()
             .expect("master set → Some(set)");
         assert_eq!(set.master.as_str(), "codex");
-        assert_eq!(set.commit_reviewers.len(), 1);
-        assert_eq!(set.commit_reviewers[0].label.as_str(), "claude");
+        assert_eq!(set.commit_tier().len(), 1);
+        assert_eq!(set.commit_tier()[0].as_str(), "claude");
     }
 
     #[test]

@@ -333,59 +333,53 @@ pub struct RepoConfigFile {
     pub extra: BTreeMap<String, serde_json::Value>,
 }
 
-/// Resolved registered set for a repo: master + the reviewer lists,
-/// one PER ROLE (a `gate` reviewer is listed once, under
-/// `gate_reviewers` — not duplicated into plan/final). Each agent has
-/// its label and description resolved at registration time. For the
-/// gate computation, fold gate into the two milestone tiers with
-/// [`RegisteredSet::plan_tier`] / [`RegisteredSet::final_tier`].
+/// Resolved registered set for a repo: the master plus ONE role-tagged
+/// reviewer collection. Reviewers are a single `Vec`, NOT per-role
+/// buckets — so "enumerate every reviewer" is just `reviewers` (nothing
+/// to chain, no role can be silently dropped), and the role→tier
+/// mapping (incl. the `gate = plan + final` fold) lives in exactly one
+/// place: the tier accessors below.
 #[derive(Debug, Clone)]
 pub struct RegisteredSet {
     pub master: AgentLabel,
     pub master_desc: AgentDescription,
-    pub commit_reviewers: Vec<ResolvedAgent>,
-    pub plan_reviewers: Vec<ResolvedAgent>,
-    pub final_reviewers: Vec<ResolvedAgent>,
-    pub gate_reviewers: Vec<ResolvedAgent>,
+    /// Every reviewer with its role. THE source of truth for reviewer
+    /// enumeration — display surfaces iterate this and read `role`.
+    pub reviewers: Vec<RegisteredReviewer>,
 }
 
 impl RegisteredSet {
-    /// The PLAN-milestone tier (plan-doc commits): `plan` + `gate`
-    /// reviewers, as labels.
+    fn labels_with_role(&self, want: impl Fn(RosterRole) -> bool) -> Vec<AgentLabel> {
+        self.reviewers
+            .iter()
+            .filter(|r| want(r.role))
+            .map(|r| r.label.clone())
+            .collect()
+    }
+
+    /// Commit-tier reviewers (every commit): role `Commit`.
+    pub fn commit_tier(&self) -> Vec<AgentLabel> {
+        self.labels_with_role(|role| role == RosterRole::Commit)
+    }
+
+    /// PLAN-milestone tier (plan-doc commits): `plan` + `gate`.
     pub fn plan_tier(&self) -> Vec<AgentLabel> {
-        self.plan_reviewers
-            .iter()
-            .chain(&self.gate_reviewers)
-            .map(|a| a.label.clone())
-            .collect()
+        self.labels_with_role(|role| matches!(role, RosterRole::Plan | RosterRole::Gate))
     }
 
-    /// The FINISH-milestone tier (the end): `final` + `gate`
-    /// reviewers, as labels.
+    /// FINISH-milestone tier (the end): `final` + `gate`.
     pub fn final_tier(&self) -> Vec<AgentLabel> {
-        self.final_reviewers
-            .iter()
-            .chain(&self.gate_reviewers)
-            .map(|a| a.label.clone())
-            .collect()
-    }
-
-    /// Every reviewer across all tiers, deduped, in a stable order
-    /// (commit, plan, final, gate). For listing / participant sets.
-    pub fn all_reviewers(&self) -> Vec<&ResolvedAgent> {
-        self.commit_reviewers
-            .iter()
-            .chain(&self.plan_reviewers)
-            .chain(&self.final_reviewers)
-            .chain(&self.gate_reviewers)
-            .collect()
+        self.labels_with_role(|role| matches!(role, RosterRole::Final | RosterRole::Gate))
     }
 }
 
+/// One resolved reviewer: its label, description, and roster role
+/// (`Commit` / `Plan` / `Final` / `Gate` — never `Master`).
 #[derive(Debug, Clone)]
-pub struct ResolvedAgent {
+pub struct RegisteredReviewer {
     pub label: AgentLabel,
     pub desc: AgentDescription,
+    pub role: RosterRole,
 }
 
 /// Errors raised while resolving the registered set for a repo.
@@ -411,16 +405,9 @@ pub enum ResolutionError {
 /// self-contained — every agent's definition lives in the roster.
 pub fn resolve_registered_set(repo: &RepoConfigFile) -> Result<RegisteredSet, ResolutionError> {
     let mut master: Option<(AgentLabel, AgentDescription)> = None;
-    let mut commit_reviewers = Vec::new();
-    let mut plan_reviewers = Vec::new();
-    let mut final_reviewers = Vec::new();
-    let mut gate_reviewers = Vec::new();
+    let mut reviewers = Vec::new();
 
     for (label, agent) in &repo.agents {
-        let resolved = || ResolvedAgent {
-            label: label.clone(),
-            desc: agent.to_description(),
-        };
         match agent.role {
             RosterRole::Master => {
                 if let Some((existing, _)) = &master {
@@ -432,10 +419,13 @@ pub fn resolve_registered_set(repo: &RepoConfigFile) -> Result<RegisteredSet, Re
                 }
                 master = Some((label.clone(), agent.to_description()));
             }
-            RosterRole::Commit => commit_reviewers.push(resolved()),
-            RosterRole::Plan => plan_reviewers.push(resolved()),
-            RosterRole::Final => final_reviewers.push(resolved()),
-            RosterRole::Gate => gate_reviewers.push(resolved()),
+            // Every non-master role is a reviewer in the single
+            // collection, tagged with its role.
+            role => reviewers.push(RegisteredReviewer {
+                label: label.clone(),
+                desc: agent.to_description(),
+                role,
+            }),
         }
     }
 
@@ -443,10 +433,7 @@ pub fn resolve_registered_set(repo: &RepoConfigFile) -> Result<RegisteredSet, Re
     Ok(RegisteredSet {
         master,
         master_desc,
-        commit_reviewers,
-        plan_reviewers,
-        final_reviewers,
-        gate_reviewers,
+        reviewers,
     })
 }
 
@@ -685,10 +672,11 @@ mod tests {
         let r = resolve_registered_set(&repo).unwrap();
         assert_eq!(r.master.as_str(), "claude");
         assert_eq!(r.master_desc.tool, Tool::Claude);
-        assert_eq!(r.commit_reviewers.len(), 1);
-        assert_eq!(r.commit_reviewers[0].label.as_str(), "codex");
-        assert_eq!(r.commit_reviewers[0].desc.tool, Tool::Codex);
-        assert!(r.gate_reviewers.is_empty());
+        assert_eq!(r.reviewers.len(), 1);
+        assert_eq!(r.reviewers[0].label.as_str(), "codex");
+        assert_eq!(r.reviewers[0].role, RosterRole::Commit);
+        assert_eq!(r.reviewers[0].desc.tool, Tool::Codex);
+        assert!(r.plan_tier().is_empty() && r.final_tier().is_empty());
     }
 
     #[test]
@@ -700,9 +688,10 @@ mod tests {
         ]);
         let r = resolve_registered_set(&repo).unwrap();
         assert_eq!(r.master.as_str(), "claude");
-        assert_eq!(r.commit_reviewers.len(), 1);
-        assert_eq!(r.gate_reviewers.len(), 1);
-        assert_eq!(r.gate_reviewers[0].label.as_str(), "ruthless");
+        assert_eq!(r.commit_tier(), vec![label("codex")]);
+        // gate folds into BOTH compute tiers.
+        assert_eq!(r.plan_tier(), vec![label("ruthless")]);
+        assert_eq!(r.final_tier(), vec![label("ruthless")]);
     }
 
     #[test]
@@ -715,11 +704,18 @@ mod tests {
             ("ruthless", Tool::Claude, RosterRole::Gate),
         ]);
         let r = resolve_registered_set(&repo).unwrap();
-        // Per-role lists (a gate reviewer is listed ONCE, under gate).
-        assert_eq!(r.commit_reviewers.len(), 1);
-        assert_eq!(r.plan_reviewers[0].label.as_str(), "scout");
-        assert_eq!(r.final_reviewers[0].label.as_str(), "shipper");
-        assert_eq!(r.gate_reviewers[0].label.as_str(), "ruthless");
+        // One role-tagged collection — a gate reviewer is listed ONCE.
+        assert_eq!(r.reviewers.len(), 4);
+        let role_of = |name: &str| {
+            r.reviewers
+                .iter()
+                .find(|x| x.label.as_str() == name)
+                .map(|x| x.role)
+        };
+        assert_eq!(role_of("codex"), Some(RosterRole::Commit));
+        assert_eq!(role_of("scout"), Some(RosterRole::Plan));
+        assert_eq!(role_of("shipper"), Some(RosterRole::Final));
+        assert_eq!(role_of("ruthless"), Some(RosterRole::Gate));
         // Compute tiers fold gate into BOTH plan and final.
         let plan_tier: Vec<String> = r
             .plan_tier()
