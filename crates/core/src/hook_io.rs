@@ -52,6 +52,42 @@ pub struct HookInput {
     pub stop_hook_active: bool,
     #[serde(default)]
     pub last_assistant_message: Option<String>,
+    /// Claude's in-flight background work at turn end:
+    /// `run_in_background` shells, subagents, MCP monitors, … . Claude
+    /// lists ONLY live tasks here (`[]` once they finish) and re-fires
+    /// Stop when one completes — that's the documented signal for "the
+    /// turn ended because the session is *paused waiting for background
+    /// work to wake it back up*," not because it's idle. See
+    /// [`HookInput::paused_for_background_work`]. Codex omits the field,
+    /// so it stays empty there.
+    #[serde(default)]
+    pub background_tasks: Vec<BackgroundTask>,
+}
+
+/// One entry of claude's Stop-hook `background_tasks` array. The adapter
+/// only reasons about *presence* (any live task → the session isn't
+/// idle), so just the identifying fields are captured; the rest
+/// (`command`, `description`, `type`, …) are ignored. Forward-compatible:
+/// every field is optional.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct BackgroundTask {
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+}
+
+impl HookInput {
+    /// True when the agent ended its turn only because it is still
+    /// waiting on its own background work. Claude Code wakes the session
+    /// back up — re-firing Stop — once those tasks finish, so the stop
+    /// hook must NOT claim the turn here: blocking in a wait (or emitting
+    /// a continuation) would stall the very session the completing task
+    /// is about to resume. Yield now; the real wait runs on the next,
+    /// genuinely-idle Stop, when `background_tasks` is empty.
+    pub fn paused_for_background_work(&self) -> bool {
+        !self.background_tasks.is_empty()
+    }
 }
 
 /// What the stop-hook adapter decides to emit after evaluating
@@ -160,6 +196,49 @@ mod tests {
             parsed.last_assistant_message.as_deref(),
             Some("Hello! How can I help you today?")
         );
+        // Empty `background_tasks` == genuinely idle turn.
+        assert!(parsed.background_tasks.is_empty());
+        assert!(!parsed.paused_for_background_work());
+    }
+
+    #[test]
+    fn live_background_task_means_paused_not_idle() {
+        // Captured claude Stop stdin while a `run_in_background` shell
+        // was still running. A non-empty `background_tasks` is claude's
+        // "paused waiting for background work to wake me back up" signal:
+        // the stop hook must yield, not wait.
+        let raw = r#"{
+            "session_id": "bcb7104f-7b4c-4715-8c3d-f1c020760d06",
+            "cwd": "/repo",
+            "stop_hook_active": false,
+            "background_tasks": [
+                {"id": "bz32mj8uz", "type": "shell", "status": "running",
+                 "description": "Sleep for 8 seconds in background", "command": "sleep 8"}
+            ],
+            "session_crons": []
+        }"#;
+        let parsed: HookInput = serde_json::from_str(raw).unwrap();
+        assert_eq!(parsed.background_tasks.len(), 1);
+        assert_eq!(parsed.background_tasks[0].id.as_deref(), Some("bz32mj8uz"));
+        assert_eq!(
+            parsed.background_tasks[0].status.as_deref(),
+            Some("running")
+        );
+        assert!(parsed.paused_for_background_work());
+    }
+
+    #[test]
+    fn missing_background_tasks_field_is_idle() {
+        // Codex omits the field entirely; absence must read as idle, not
+        // paused (so codex sessions always reach the wait).
+        let raw = r#"{
+            "session_id": "019e5385-ed97-7603-8561-dd9024328ff9",
+            "cwd": "/repo",
+            "stop_hook_active": false
+        }"#;
+        let parsed: HookInput = serde_json::from_str(raw).unwrap();
+        assert!(parsed.background_tasks.is_empty());
+        assert!(!parsed.paused_for_background_work());
     }
 
     #[test]

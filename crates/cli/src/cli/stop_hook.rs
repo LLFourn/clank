@@ -38,6 +38,19 @@ async fn compute_outcome(tool: Tool, repo_override: Option<&Path>) -> HookOutcom
         Err(e) => return HookOutcome::Diagnostic { message: e },
     };
 
+    // A turn that ends with the agent's own background work still in
+    // flight is not a turn-end clank should claim. Claude Code re-fires
+    // Stop once those tasks complete (`background_tasks` is its
+    // documented "paused, will wake back up" signal), so yield now —
+    // running the wait here would block the very session the completing
+    // task is about to resume. The real wait runs on the next, idle Stop.
+    // This is a property of the turn alone, independent of clank identity
+    // or auto-mode, so it short-circuits before any of that resolution
+    // (and avoids surfacing a config Diagnostic mid-background-run).
+    if input.paused_for_background_work() {
+        return HookOutcome::Silent;
+    }
+
     // Resolve repo: explicit --repo (testing) > hook stdin cwd.
     let repo = match resolve_hook_repo(repo_override, &input) {
         Ok(r) => r,
