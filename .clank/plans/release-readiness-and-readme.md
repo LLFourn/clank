@@ -70,11 +70,13 @@ README and surface it in `doctor`/build.
 core loop.** *(both)* A new user needs a Claude and/or Codex CLI + `git` +
 the Rust toolchain, then clone-and-`cargo install` (not on crates.io, no
 prebuilt binaries) at `0.0.1`. **Resolved the open question** ruthless
-raised: **zellij is NOT required for the core review loop.** All zellij
-*command-spawning* is confined to `cli/open_zellij.rs` (the `clank open` /
-`fork` workspace UX), and clank ships its *own* built-in console PTY
-multiplexer as the alternative backend; the core loop
-(queue/promote/wait/feedback/finish/stop-hook) spawns no zellij. **Fix:**
+raised: **zellij is NOT required for the core review loop.** zellij
+*command-spawning* lives only in **optional UX paths** — `cli/open_zellij.rs`
+(`clank open` / `fork` workspace setup) and `cli/status_tui/zellij.rs`
+(status-TUI tab/pane mirroring: tab-info, list-panes, rename-tab/pane) —
+and clank ships its *own* built-in console PTY multiplexer as the
+alternative backend; the core loop (queue/promote/wait/feedback/finish/
+stop-hook) spawns no zellij (verified). **Fix:**
 foreground the zellij-free core in onboarding and present zellij/console as
 optional UX; a `setup`/`doctor` that checks and guides each prerequisite;
 crates.io or prebuilt binaries to come.
