@@ -81,6 +81,41 @@ foreground the zellij-free core in onboarding and present zellij/console as
 optional UX; a `setup`/`doctor` that checks and guides each prerequisite;
 crates.io or prebuilt binaries to come.
 
+**A6b · Built-in console feature completeness — the default workspace is
+"experimental".** *(added by maintainer; reviewers: assess this one
+independently)* This is the flip side of A6: `clank open` drops a
+non-zellij user **into the built-in console** (`cli/open.rs`: "the console
+IS the default workspace"), yet the module is labelled **experimental**
+(`console/mod.rs`) and intentionally minimal. Verified current surface:
+switch agents (Next/Prev), zoom (`Ctrl-a z`), focus status (`Ctrl-a s`),
+scrollback, terminal-native selection/copy, and manual respawn of a
+crashed child (`✗` mark + "press Enter to respawn"; **no auto-respawn**, by
+design). Rough edges confirmed in-tree:
+
+- **Scrollback is terminal-dependent.** It rides mouse-wheel-as-SGR
+  (`mux.rs`: "no mouse keeps no scrollback"); terminals that capture the
+  wheel for their own scrollback (e.g. Terminal.app) give the user none,
+  while Ghostty works — a silent, confusing degradation for the default
+  workspace.
+- **Selection/copy is terminal-native with edges** — an active agent
+  mid-drag can't move the highlight or copy (`mod.rs`); copy depends on the
+  host terminal, not an in-app / OSC52 path.
+- **Input fragility** — keychords can fragment over SSH/mosh (`mux.rs`).
+- **Deliberately minimal** — no pane split/resize, no search; manual
+  control by design (which is fine, but must be set against "default
+  workspace" expectations).
+
+**The release decision this forces:** either (a) **harden the console** to
+be a credible default — at minimum document/enforce its terminal
+requirements, degrade scrollback gracefully, smooth copy — or (b) **default
+onboarding/docs to zellij** and mark the console **experimental** with its
+terminal requirements stated. A6's "zellij is optional, the console is the
+built-in alternative" is only as strong as the console is complete, and
+this is the *first* surface a zellij-free user touches. **Severity:
+SHOULD-HAVE**, tightly coupled to A6 and A5. Reviewers: form your own view
+on whether the console is release-ready as a default vs. should be flagged
+experimental.
+
 **A7 · Documentation: pitch + a guided walkthrough.** *(both)* README is
 reference-first (see Part B); there's no zero-to-first-review tutorial and
 no troubleshooting section.
@@ -160,6 +195,11 @@ gate.
   was high). None change the picture.
 - **Open question resolved by master:** zellij is optional for the core
   loop (A6).
+- **Added post-intro (maintainer):** A6b — built-in console feature
+  completeness. The console is the *default* zellij-free workspace yet is
+  experimental; this is pending each reviewer's own independent assessment
+  (is it release-ready as a default, or should it be flagged experimental
+  and onboarding default to zellij?).
 
 ## Release-blockers vs post-release cut line
 
@@ -167,7 +207,8 @@ gate.
   publish decision + 0.1.0), A3 (agent-CLI compat check + documented
   version range), Part B (pitch + honest caveats), A5 (platform statement).
 - **Before a *confident* release:** A4 (CI), A6 (prereq-guiding
-  setup/doctor), A7 (walkthrough).
+  setup/doctor), A6b (console: harden as default **or** flag experimental +
+  default docs to zellij), A7 (walkthrough).
 - **Post-release:** A8 (CHANGELOG, docs/, prebuilt binaries, screenshots).
 
 Each blocker is naturally its own follow-up plan once this research lands.
