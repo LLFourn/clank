@@ -86,11 +86,13 @@ crates.io or prebuilt binaries to come.
 independently)* This is the flip side of A6: `clank open` drops a
 non-zellij user **into the built-in console** (`cli/open.rs`: "the console
 IS the default workspace"), yet the module is labelled **experimental**
-(`console/mod.rs`) and intentionally minimal. Verified current surface:
-switch agents (Next/Prev), zoom (`Ctrl-a z`), focus status (`Ctrl-a s`),
-scrollback, terminal-native selection/copy, and manual respawn of a
-crashed child (`✗` mark + "press Enter to respawn"; **no auto-respawn**, by
-design). Rough edges confirmed in-tree:
+(`console/mod.rs`) and intentionally minimal. Verified current surface
+(controls are **Meta/Alt chords**, not Ctrl-a — `mux.rs`): switch agents
+(`M-1`…`M-9`, `M-0` = follow-active), zoom (`M-z`), focus status (`M-s`),
+with `M-a` as a leader prefix and `Ctrl-\` as a meta-independent emergency
+quit; plus scrollback, terminal-native selection/copy, and manual respawn
+of a crashed child (`✗` mark + Enter on the dead pane to respawn; **no
+auto-respawn**, by design). Rough edges confirmed in-tree:
 
 - **Scrollback is terminal-dependent.** It rides mouse-wheel-as-SGR
   (`mux.rs`: "no mouse keeps no scrollback"); terminals that capture the
