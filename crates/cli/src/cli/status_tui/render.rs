@@ -127,13 +127,12 @@ pub(super) fn render_at(
     // to read as a lamp, but only once the pane can afford it.
     let breath = rows >= 4;
 
-    // The block `ask` was here in the FIXED header, but a long question
-    // could overflow a short pane and become unreadable. It now renders
-    // in the SCROLLABLE content below (see `block_ask_spans` + the
-    // timeline window) so it can be paged. The gutter width is still
-    // needed for the `fix` line.
-    let gutter = display_width(&label("ask").1);
-    let ask_width = cols.saturating_sub(gutter).max(1);
+    // The block `ask` used to render here in the FIXED header; it now
+    // renders full-width in the SCROLLABLE content below (see
+    // `block_ask_spans`). The standard 7-col label gutter is still needed
+    // for the `fix` line below, so derive it from that line's own label.
+    let gutter = display_width(&label("fix").1);
+    let fix_width = cols.saturating_sub(gutter).max(1);
 
     // `fix` — a broken HEAD commit tag the master must amend, shown even
     // when no plan row carries it (unknown-tag-only — codex 2bf46d9).
@@ -143,7 +142,7 @@ pub(super) fn render_at(
             "fix tag: {}",
             crate::cli::status::describe_head_violation(&c.violation)
         );
-        for (i, line) in wrap(&msg, ask_width).into_iter().enumerate() {
+        for (i, line) in wrap(&msg, fix_width).into_iter().enumerate() {
             body.push(vec![label(if i == 0 { "fix" } else { "" }), accent(line)]);
         }
     }
@@ -501,18 +500,18 @@ pub(super) fn in_progress_spans(item: &InProgress, frame: usize, author_width: u
     }
 }
 
-/// Wrapped lines for every pending (unanswered) block ask, with the
-/// `ask` label gutter + accent style — the same look the fixed header
-/// used, now produced as SCROLLABLE content so a long question can be
-/// paged. Pure (word-wrap only): safe to call on an animation tick.
-/// Empty when no ask is pending (reserves no space).
+/// Full-width wrapped lines for every pending (unanswered) block ask, in
+/// accent style with NO label or gutter: the accent (red) already marks it
+/// as a block, and a human question often needs the whole pane. Rendered as
+/// SCROLLABLE content so a long question can be paged. Pure (word-wrap
+/// only): safe to call on an animation tick. Empty when no ask is pending
+/// (reserves no space).
 pub(super) fn block_ask_spans(snap: &StatusSnapshot, cols: usize) -> Vec<Vec<Span>> {
-    let gutter = display_width(&label("ask").1);
-    let ask_width = cols.saturating_sub(gutter).max(1);
+    let width = cols.max(1);
     let mut lines = Vec::new();
     for b in snap.blocks.iter().filter(|b| b.answer.is_none()) {
-        for (i, line) in wrap(b.question.trim(), ask_width).into_iter().enumerate() {
-            lines.push(vec![label(if i == 0 { "ask" } else { "" }), accent(line)]);
+        for line in wrap(b.question.trim(), width) {
+            lines.push(vec![accent(line)]);
         }
     }
     lines
@@ -1190,7 +1189,13 @@ mod tests {
             "head_correction with no plan row still flags the lamp"
         );
         let out = render(&s, 24, 80).join("\n");
-        assert!(out.contains("fix"), "top-level fix line shown: {out}");
+        // The `fix` line keeps its standard 7-col label gutter ("  fix  ")
+        // — pins the do-not-touch boundary after the block ask dropped its
+        // own gutter (status-tui-drop-block-ask-label).
+        assert!(
+            out.contains("  fix  "),
+            "fix line keeps its 7-col gutter: {out}"
+        );
         assert!(out.contains("ghost"), "names the bad tag: {out}");
     }
 
@@ -1466,17 +1471,20 @@ mod tests {
         // Tall pane so the (now scrollable) ask is fully on screen.
         let texts: Vec<String> = render(&s, 12, 60).iter().map(|l| visible(l)).collect();
         assert!(texts[0].starts_with("🙋 HUMAN blocked"), "got {texts:?}");
-        // The ask now renders in the SCROLLABLE region (below the compact
-        // gauges), still word-wrapped under an `ask` gutter — both lines
-        // present, position-independent (status-tui-block-ask-scroll).
+        // The ask renders FULL-WIDTH in accent with no `ask` label/gutter
+        // (status-tui-drop-block-ask-label): both lines start at column 0.
         let joined = texts.join("\n");
         assert!(
-            joined.contains("  ask  is this right?"),
-            "ask line present: {texts:?}"
+            texts.iter().any(|t| t.starts_with("is this right?")),
+            "ask first line full-width, no label: {texts:?}"
         );
         assert!(
-            joined.contains("       more detail"),
-            "wrapped continuation present: {texts:?}"
+            texts.iter().any(|t| t.starts_with("more detail")),
+            "wrapped continuation full-width, no gutter: {texts:?}"
+        );
+        assert!(
+            !joined.contains("ask  is this right?"),
+            "the `ask` label gutter is gone: {texts:?}"
         );
     }
 
@@ -1484,7 +1492,11 @@ mod tests {
     fn long_block_ask_scrolls_into_view() {
         // A long ask overflows a short pane; the tail must be reachable by
         // scrolling (it's scrollable content, not a clipped fixed header).
-        let q = "AAAA BBBB CCCC DDDD EEEE FFFF GGGG HHHH IIII JJJJ KKKK LAST";
+        // Long enough to overflow the short pane even at FULL width — the
+        // ask no longer wraps under a 7-col gutter (drop-block-ask-label),
+        // so it needs more words to still spill off-screen.
+        let q = format!("AAAA {}LAST", "MID ".repeat(40));
+        let q = q.as_str();
         // FixCommitTag → no in-progress row, so this isolates ask scrolling.
         let mut s = snap(
             vec![plan_state("foo", WaitingOn::MasterToFixCommitTag)],
@@ -2053,8 +2065,8 @@ mod tests {
             texts.iter().any(|t| t.contains("second paragraph")),
             "continuation must survive: {texts:?}"
         );
-        // The long first line wrapped onto multiple ask rows (the
-        // first carries the `ask` gutter; continuations are indented).
+        // The long first line wrapped onto multiple full-width ask rows
+        // (no `ask` gutter now — status-tui-drop-block-ask-label).
         let ask_rows = texts.iter().filter(|t| t.contains("first")).count()
             + texts.iter().filter(|t| t.contains("wrap")).count();
         assert!(ask_rows >= 1, "first line present: {texts:?}");
