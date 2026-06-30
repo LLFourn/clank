@@ -75,7 +75,6 @@ enum Command {
     Status(cli::StatusArgs),
     /// Wait-for-work: block until the calling agent has actionable
     /// work on one of the repo's active plans.
-    #[command(visible_alias = "wfw")]
     Wait(cli::WaitArgs),
     /// Read / write feedback files via a typed CLI surface (vs.
     /// editing the on-disk paths directly).
@@ -174,15 +173,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn wait_command_keeps_wfw_alias() {
-        // The command is `clank wait`; `clank wfw` must keep parsing
-        // to it through the rename (visible alias, pinned here).
+    fn wait_command_parses() {
         assert!(matches!(
             Cli::try_parse_from(["clank", "wait"]).unwrap().command,
-            Command::Wait(_)
-        ));
-        assert!(matches!(
-            Cli::try_parse_from(["clank", "wfw"]).unwrap().command,
             Command::Wait(_)
         ));
     }

@@ -28,7 +28,6 @@ Clank is a peer-review workflow for multi-agent development. Each repo's
 
 - `clank status` — current plan + gate state
 - `clank wait` — wait-for-work; long-polls for your next action (author +
-  role inferred from your `clank as` binding — no flags needed). Formerly
-  `clank wfw`, which still works as an alias.
+  role inferred from your `clank as` binding — no flags needed).
 - `clank as <label>` — bind this session to an agent label
 - `clank auto on|off` — toggle this session's Stop-hook auto-mode

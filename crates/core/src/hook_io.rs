@@ -31,6 +31,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::ids::SessionId;
+use crate::vocab::Tool;
 
 /// Common fields the stop-hook adapter reads from hook stdin.
 /// Both tools include all of these.
@@ -58,36 +59,96 @@ pub struct HookInput {
     /// Stop when one completes — that's the documented signal for "the
     /// turn ended because the session is *paused waiting for background
     /// work to wake it back up*," not because it's idle. See
-    /// [`HookInput::paused_for_background_work`]. Codex omits the field,
-    /// so it stays empty there.
+    /// [`background_gate`]. Codex omits the field, so it stays empty there.
     #[serde(default)]
     pub background_tasks: Vec<BackgroundTask>,
 }
 
-/// One entry of claude's Stop-hook `background_tasks` array. The adapter
-/// only reasons about *presence* (any live task → the session isn't
-/// idle), so just the identifying fields are captured; the rest
-/// (`command`, `description`, `type`, …) are ignored. Forward-compatible:
-/// every field is optional.
+/// One entry of claude's Stop-hook `background_tasks` array. `command`
+/// (the raw shell command line for `shell` tasks) is captured so the hook
+/// can recognize the agent's own backgrounded `clank wait`; the rest
+/// (`description`, `type`, …) are ignored. Forward-compatible: every field
+/// is optional.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct BackgroundTask {
     #[serde(default)]
     pub id: Option<String>,
     #[serde(default)]
     pub status: Option<String>,
+    #[serde(default)]
+    pub command: Option<String>,
+}
+
+impl BackgroundTask {
+    /// True if this task is the agent's own `clank wait` long-poll.
+    /// Best-effort: the program word's basename is `clank` and the first
+    /// arg is `wait`. Claude reports the raw command the agent launched, so
+    /// wrappers (`bash -lc '…'`, env prefixes) aren't unpicked — they're not
+    /// how agents start it.
+    pub fn is_clank_wait(&self) -> bool {
+        let Some(cmd) = self.command.as_deref() else {
+            return false;
+        };
+        let mut words = cmd.split_whitespace();
+        let prog = words
+            .next()
+            .map(|w| w.rsplit(['/', '\\']).next().unwrap_or(w));
+        prog == Some("clank") && words.next() == Some("wait")
+    }
 }
 
 impl HookInput {
-    /// True when the agent ended its turn only because it is still
-    /// waiting on its own background work. Claude Code wakes the session
-    /// back up — re-firing Stop — once those tasks finish, so the stop
-    /// hook must NOT claim the turn here: blocking in a wait (or emitting
-    /// a continuation) would stall the very session the completing task
-    /// is about to resume. Yield now; the real wait runs on the next,
-    /// genuinely-idle Stop, when `background_tasks` is empty.
-    pub fn paused_for_background_work(&self) -> bool {
-        !self.background_tasks.is_empty()
+    /// True if a backgrounded `clank wait` is already watching for review
+    /// work — the hook should yield to it rather than run its own wait.
+    pub fn has_background_clank_wait(&self) -> bool {
+        self.background_tasks
+            .iter()
+            .any(BackgroundTask::is_clank_wait)
     }
+
+    /// True if any in-flight background task is NOT a `clank wait` — a
+    /// process the agent is parked on. Claude Code wakes the session when it
+    /// completes, so the hook must not block in a wait while it runs.
+    pub fn has_non_wait_background_work(&self) -> bool {
+        self.background_tasks.iter().any(|t| !t.is_clank_wait())
+    }
+}
+
+/// The Stop hook's decision about the turn's background work — a pure
+/// function of the turn (no clank identity/auto-mode), so the [`BgGate::Yield`]
+/// cases can be decided before any repo/identity resolution. See
+/// [`background_gate`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BgGate {
+    /// Yield (Silent), no wait: a backgrounded `clank wait` already covers
+    /// review-work wake, OR a process is live but we've already nudged /
+    /// this isn't claude. Either way, running our own wait would block the
+    /// wake Claude Code is about to deliver.
+    Yield,
+    /// A process is live with no `clank wait` watching: if the agent is
+    /// being driven (auto on), nudge it to start `clank wait` alongside so
+    /// either wake source is armed.
+    NudgeIfDriving,
+    /// No background work — proceed to the normal idle wait.
+    NoBackgroundWork,
+}
+
+/// Pure background-work gate for the Stop hook. Claude's `background_tasks`
+/// drives it; codex omits the field, so this is always
+/// [`BgGate::NoBackgroundWork`] there. `tool` and `stop_hook_active` gate the
+/// nudge: only claude auto-wakes on its own `run_in_background` tasks, and an
+/// already-active stop chain shouldn't re-nudge.
+pub fn background_gate(tool: Tool, input: &HookInput) -> BgGate {
+    if input.has_background_clank_wait() {
+        return BgGate::Yield;
+    }
+    if input.has_non_wait_background_work() {
+        if tool != Tool::Claude || input.stop_hook_active {
+            return BgGate::Yield;
+        }
+        return BgGate::NudgeIfDriving;
+    }
+    BgGate::NoBackgroundWork
 }
 
 /// What the stop-hook adapter decides to emit after evaluating
@@ -198,7 +259,8 @@ mod tests {
         );
         // Empty `background_tasks` == genuinely idle turn.
         assert!(parsed.background_tasks.is_empty());
-        assert!(!parsed.paused_for_background_work());
+        assert!(!parsed.has_non_wait_background_work());
+        assert!(!parsed.has_background_clank_wait());
     }
 
     #[test]
@@ -224,7 +286,9 @@ mod tests {
             parsed.background_tasks[0].status.as_deref(),
             Some("running")
         );
-        assert!(parsed.paused_for_background_work());
+        // A non-wait process: live work, but no `clank wait` among it.
+        assert!(parsed.has_non_wait_background_work());
+        assert!(!parsed.has_background_clank_wait());
     }
 
     #[test]
@@ -238,7 +302,95 @@ mod tests {
         }"#;
         let parsed: HookInput = serde_json::from_str(raw).unwrap();
         assert!(parsed.background_tasks.is_empty());
-        assert!(!parsed.paused_for_background_work());
+        assert!(!parsed.has_non_wait_background_work());
+        assert!(!parsed.has_background_clank_wait());
+    }
+
+    fn task(command: &str) -> BackgroundTask {
+        BackgroundTask {
+            id: None,
+            status: Some("running".into()),
+            command: Some(command.into()),
+        }
+    }
+
+    fn input_with(tasks: Vec<BackgroundTask>, stop_hook_active: bool) -> HookInput {
+        HookInput {
+            session_id: sid("bcb7104f-7b4c-4715-8c3d-f1c020760d06"),
+            cwd: "/repo".into(),
+            transcript_path: None,
+            stop_hook_active,
+            last_assistant_message: None,
+            background_tasks: tasks,
+        }
+    }
+
+    #[test]
+    fn is_clank_wait_matches_real_command_shapes() {
+        for cmd in [
+            "clank wait",
+            "clank wait --repo /x --author claude",
+            "/Users/x/.cargo/bin/clank wait",
+            "./clank wait",
+        ] {
+            assert!(task(cmd).is_clank_wait(), "should match: {cmd}");
+        }
+        for cmd in [
+            "clank status",
+            "clank waitx",
+            "clankwait",
+            "sleep 12",
+            "git wait",
+            "clank",
+        ] {
+            assert!(!task(cmd).is_clank_wait(), "should NOT match: {cmd}");
+        }
+        // No command (non-shell task) is never a clank wait.
+        assert!(
+            !BackgroundTask {
+                id: Some("x".into()),
+                status: Some("running".into()),
+                command: None,
+            }
+            .is_clank_wait()
+        );
+    }
+
+    #[test]
+    fn background_gate_covers_the_state_machine() {
+        use Tool::{Claude, Codex};
+        // A backgrounded `clank wait` (with or without other work) → Yield.
+        assert_eq!(
+            background_gate(Claude, &input_with(vec![task("clank wait")], false)),
+            BgGate::Yield
+        );
+        assert_eq!(
+            background_gate(
+                Claude,
+                &input_with(vec![task("sleep 60"), task("clank wait")], false)
+            ),
+            BgGate::Yield
+        );
+        // A live process, no clank wait, claude, first stop → nudge.
+        assert_eq!(
+            background_gate(Claude, &input_with(vec![task("sleep 60")], false)),
+            BgGate::NudgeIfDriving
+        );
+        // Already nudged (stop_hook_active) → Yield (don't nag).
+        assert_eq!(
+            background_gate(Claude, &input_with(vec![task("sleep 60")], true)),
+            BgGate::Yield
+        );
+        // Codex has no run_in_background auto-wake → never nudge.
+        assert_eq!(
+            background_gate(Codex, &input_with(vec![task("sleep 60")], false)),
+            BgGate::Yield
+        );
+        // No background work → proceed to the normal wait.
+        assert_eq!(
+            background_gate(Claude, &input_with(vec![], false)),
+            BgGate::NoBackgroundWork
+        );
     }
 
     #[test]

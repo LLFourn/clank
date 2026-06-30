@@ -22,8 +22,8 @@ use crate::agent_env::resolve_identity_for_hook;
 use crate::agent_store::load_agent_config;
 use crate::lifecycle::AgentLabel;
 use clank_core::{
-    AutoMode, CLAUDE_CONTINUATION_EXIT, CodexBlockDecision, HOOK_OK_EXIT, HookInput, HookOutcome,
-    Role, Tool,
+    AutoMode, BgGate, CLAUDE_CONTINUATION_EXIT, CodexBlockDecision, HOOK_OK_EXIT, HookInput,
+    HookOutcome, Role, Tool, background_gate,
 };
 
 pub async fn run(args: StopHookArgs) -> anyhow::Result<()> {
@@ -38,16 +38,16 @@ async fn compute_outcome(tool: Tool, repo_override: Option<&Path>) -> HookOutcom
         Err(e) => return HookOutcome::Diagnostic { message: e },
     };
 
-    // A turn that ends with the agent's own background work still in
-    // flight is not a turn-end clank should claim. Claude Code re-fires
-    // Stop once those tasks complete (`background_tasks` is its
-    // documented "paused, will wake back up" signal), so yield now —
-    // running the wait here would block the very session the completing
-    // task is about to resume. The real wait runs on the next, idle Stop.
-    // This is a property of the turn alone, independent of clank identity
-    // or auto-mode, so it short-circuits before any of that resolution
-    // (and avoids surfacing a config Diagnostic mid-background-run).
-    if input.paused_for_background_work() {
+    // Decide how the agent's in-flight background work affects this
+    // turn-end, BEFORE any clank resolution (`background_gate` is a pure
+    // function of the turn). The `Yield` cases never run a wait — Claude
+    // Code re-fires Stop / auto-wakes when the work completes, and running
+    // our own wait here would block that wake (the `wait-alongside-
+    // background` design). Only `NudgeIfDriving` / `NoBackgroundWork` fall
+    // through to resolution, so a config Diagnostic can only surface when
+    // we were going to engage clank anyway.
+    let gate = background_gate(tool, &input);
+    if matches!(gate, BgGate::Yield) {
         return HookOutcome::Silent;
     }
 
@@ -94,11 +94,51 @@ async fn compute_outcome(tool: Tool, repo_override: Option<&Path>) -> HookOutcom
 
     match effective {
         AutoMode::Off => HookOutcome::Silent,
-        AutoMode::On => {
-            let wait_timeout = cfg.as_ref().and_then(|c| c.wait_timeout.clone());
-            compute_wait_outcome(&repo, &label, role, wait_timeout.as_deref()).await
-        }
+        AutoMode::On => match gate {
+            // A process is live with no `clank wait` watching: nudge the
+            // agent to start one alongside it, so EITHER the process
+            // finishing OR review work can wake it. We can't arm the wait
+            // ourselves — a hook-spawned `clank wait` would block (the wake
+            // never lands) or be untracked by Claude (no auto-wake on its
+            // completion). Only the agent's own `run_in_background` task gets
+            // both wakes (validated by spike).
+            BgGate::NudgeIfDriving => HookOutcome::Continue {
+                reason: nudge_reason(&input),
+            },
+            // NoBackgroundWork (Yield already returned above): genuinely idle.
+            _ => {
+                let wait_timeout = cfg.as_ref().and_then(|c| c.wait_timeout.clone());
+                compute_wait_outcome(&repo, &label, role, wait_timeout.as_deref()).await
+            }
+        },
     }
+}
+
+/// The continuation that nudges the agent to start its own backgrounded
+/// `clank wait` alongside a live process. Wording matches the spike that
+/// validated compliance — explicit and copy-pasteable (a vague hint is the
+/// failure mode). Names the live process(es) so the agent knows what it's
+/// parked on.
+fn nudge_reason(input: &HookInput) -> String {
+    let procs: Vec<&str> = input
+        .background_tasks
+        .iter()
+        .filter(|t| !t.is_clank_wait())
+        .filter_map(|t| t.command.as_deref())
+        .collect();
+    let what = if procs.is_empty() {
+        "a background task".to_string()
+    } else {
+        format!("a background task ({})", procs.join(", "))
+    };
+    format!(
+        "You ended your turn with {what} still running, but nothing is \
+         watching for clank review work. Start `clank wait` as its OWN \
+         background task now — call the Bash tool with command `clank wait` \
+         and run_in_background set to true — then end your turn. That way \
+         EITHER the background task finishing OR new clank review work will \
+         wake you."
+    )
 }
 
 /// Long-poll via a self-spawned `clank wait --json`.

@@ -43,6 +43,27 @@ Detection keys on the task's `command` being `clank wait`. The `clank wfw`
 which detection would miss. Removing it leaves one canonical command, so
 the skill doc only ever teaches `clank wait` and detection stays simple.
 
+## Spike result — nudge compliance validated
+
+The load-bearing risk (the nudge is a model-compliance assumption) was
+spiked before implementing, mirroring the prior plan's auto-wake spike. A
+capture Stop hook implementing the W/O gate, driven by a real claude
+session that launched `sleep 60` in the background:
+
+```
+Stop #1: bg=["sleep 60"], has_wait=false  → NUDGE (continuation)
+  agent → Bash(command="clank wait", run_in_background=true)   ✓ complied
+  task_started: "Wait for clank review work in background" (local_bash)
+```
+
+So the nudge reliably gets the agent to launch `clank wait` as a
+`run_in_background` task, and its command is exactly `clank wait` — what
+`is_clank_wait` keys on. (The temp dir wasn't a clank repo, so `clank wait`
+errored instantly and didn't persist to Stop #2; in a real bound repo it
+blocks and persists, and `background_tasks[].command` is the raw command —
+already verified for `sleep`.) The nudge wording in `nudge_reason` matches
+the spike's.
+
 ## Implementation
 
 ### 1. Remove the `wfw` command alias (prerequisite)
