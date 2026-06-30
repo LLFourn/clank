@@ -1,128 +1,212 @@
 # release-readiness-and-readme
 
-**Type: research / opinion plan — no code change required.** The
-deliverable is a *document*: a prioritized release-readiness gap analysis
-plus a README redesign sketch. FINISHED only when the document is
-complete **and every reviewer has contributed their own independent
-assessment** (see "Reviewer instructions" — that is the heart of this
-plan).
+**Type: research / opinion plan — no code change required.** Deliverable =
+this document: a prioritized release-readiness gap analysis (Part A) and a
+README redesign sketch (Part B), synthesizing the author's and **every
+reviewer's independent findings, with disagreements preserved as named
+dissent**. FINISHED only when both are complete and each reviewer's own
+assessment is reflected.
 
-## Why
+> Status: **findings drafted** (master synthesis below incorporates codex's
+> and ruthless's independent intro audits of `fba0cde`). Reviewers: this
+> commit is where you do your *own* due diligence again and push back —
+> correct facts, re-rank, dissent. The brief + reviewer instructions are
+> retained at the bottom unchanged.
 
-clank is dogfooded daily but has never been prepared for anyone outside
-this machine. Before any release we need two things, and both must
-reflect **multiple independent judgments, not one author's view**:
+---
 
-1. A clear-eyed, prioritized list of what's actually missing for release.
-2. A README that *sells* the idea to someone who has never seen clank.
+## Part A — release-readiness gap analysis (synthesized)
 
-## Current state (grounding — verify, don't trust)
+Severity: **BLOCKER** = cannot release. **SHOULD** = before a confident
+release. **NICE** = post-release. Each line notes consensus vs dissent.
 
-A quick survey; reviewers should re-check rather than take these as given:
+### BLOCKERS
 
-- `README.md` exists (~236 lines): install + workflow, but reads like a
-  reference manual, not a pitch.
-- **No `LICENSE` file** anywhere.
-- `crates/cli/Cargo.toml` carries only `name`/`version = 0.0.1`/`edition`
-  — no `description`, `license`, `repository`, `keywords`, `authors`,
-  `readme`.
-- **No CI** (`.github/workflows` absent), **no `CHANGELOG`**, **no
-  `docs/`**.
-- Install today = `git clone` + `cargo install --path crates/cli`. Not on
-  crates.io.
-- ~74 source/test files carry tests; heavy zellij/OS coupling (~296
-  `target_os`/`zellij` references) — the cross-platform story is unclear.
-- Hard prerequisites: a Claude Code and/or Codex CLI, `git`, a terminal
-  multiplexer (zellij), plus the gix stack.
+**A1 · No LICENSE — the single hard gate.** *(unanimous: author, codex,
+ruthless-#1)* No `LICENSE` file anywhere → the code is all-rights-reserved
+by default, so a public release is legally unusable. Not a should-have.
+**Fix:** dual **MIT OR Apache-2.0** (Rust-ecosystem norm; also matches the
+vendored `vt100`'s MIT, confirmed intact at `vendor/vt100/LICENSE`). Add
+`LICENSE-MIT` + `LICENSE-APACHE`, and the SPDX `license = "MIT OR
+Apache-2.0"` to **both** crates' `Cargo.toml`.
 
-## Part A — release-readiness gap analysis
+**A2 · Crate metadata + a publish decision.** *(codex-#1; ruthless)*
+Verified: `crates/cli/Cargo.toml` has only `name`/`version = 0.0.1`/
+`edition` — no `description`/`license`/`repository`/`keywords`/`readme`.
+`clank-core` *does* carry a description but is **`publish = false`**, which
+blocks publishing `clank` (it depends on core by path). Version is pinned
+at `0.0.1`, which itself signals "not ready." **Fix:** fill cli metadata;
+**decide the distribution story** — either (a) flip core to publishable and
+publish `core` → `cli` to crates.io, or (b) stay git-install-only and *say
+so plainly*; then cut a real **0.1.0**.
 
-Produce a **prioritized** gap list. For each gap give: **severity**
-(blocker / should-have / nice-to-have), *why it matters for an outside
-user*, and a concrete remediation. Cover at least:
+**A3 · Agent-CLI hook-schema coupling has no compatibility check.**
+*(ruthless-#2, ELEVATED — see dissent; author had this under
+onboarding/stability)* The entire review loop depends on Claude Code's and
+Codex's **hook STDIN schemas**, which clank does not control and which *do*
+change (`background_tasks` landed in claude v2.1.145+; we shipped a fix for
+it last cycle). **Verified:** `clank doctor` checks that hooks are
+*installed* but validates **no agent-CLI version and no live hook schema**;
+a repo-wide search finds *no* version/compat check anywhere. So an outside
+user on an incompatible claude/codex version gets **silent breakage or
+degraded gating** of the core loop, with no signal. **Fix:** a doctor check
+that probes the agent-CLI version + live hook schema, a documented
+supported-version range, and **loud failure rather than a silent hang**.
 
-1. **Licensing & legal** — choose/add a `LICENSE`; audit dependency
-   licenses; the vendored `vt100` fork's licensing + attribution
-   (`vendor/vt100/VENDOR.md`).
-2. **Distribution & install** — crates.io publish readiness (metadata,
-   two-crate publish order `core`→`cli`, a real version off `0.0.1`);
-   prebuilt binaries / Homebrew tap; the friction of clone-and-build.
-3. **Prerequisites & onboarding** — what a new user must install
-   (claude/codex/zellij/git); first-run experience; `init` / `setup` /
-   `doctor`; failure modes when a prerequisite is missing or the agent
-   CLIs change their hook schema.
-4. **Cross-platform** — macOS vs Linux vs Windows; the zellij / PTY /
-   console assumptions; what is actually supported vs aspirational.
-5. **Documentation** — README; per-command `--help` quality; the skill
-   docs; a guided end-to-end walkthrough/tutorial; troubleshooting.
-6. **Stability & correctness** — test-coverage gaps; known rough edges;
-   error-message quality; Stop-hook reliability (including the
-   background-work yield just shipped); behavior under misconfiguration.
-7. **Release process & versioning** — a semver path off `0.0.1`;
-   `CHANGELOG`; tagging; CI that runs tests + clippy + the git-boundary
-   gate; release automation.
-8. **Safety & footguns** — history rewrite / `purge` / `shelve`; the
-   install-replaces-the-running-binary hazard; multi-agent token cost;
-   anything that can surprise or destroy.
-9. **Positioning & scope** — the elevator pitch; the target audience; the
-   differentiator vs raw Claude/Codex or other agent orchestrators; and
-   what clank deliberately is **not**.
+### SHOULD-HAVE
 
-## Part B — README redesign sketch
+**A4 · No CI.** *(codex-#2; ruthless)* No `.github/workflows`; tests,
+clippy, fmt, and the `git_boundary` gate run only locally — nothing
+enforces them on a change. **Fix:** CI running fmt + clippy (at the agreed
+baseline) + test + the git-boundary test on PRs; release automation later.
 
-Sketch how `README.md` should change to **sell** the project — an outline
-plus key copy and positioning, not necessarily a finished rewrite.
-Address:
+**A5 · Cross-platform honesty.** *(ruthless)* Verified: `libc` PTY + the
+zellij/console UX → **macOS + Linux only**. Windows `cfg`s exist (2 sites)
+but are effectively stubs/aspirational. Releasing Unix-only is fine;
+*misrepresenting* it is not. **Fix:** state platform support plainly in the
+README and surface it in `doctor`/build.
 
-- The hook/tagline in the first three lines — what makes someone keep
-  reading.
-- The problem it solves, and for whom.
-- The core model, fast: plans, the master/reviewer roles, peer review
-  *between agents*, everything in git, no daemon/server.
-- A 60-second quickstart that actually works from zero.
-- "How it works" with a concrete example/flow (e.g. a `clank log` /
-  `status --tui` snippet showing the review gate).
-- Requirements, honest platform support, and a candid maturity/status +
-  caveats section.
-- Credibility/visual elements (asciinema or a `status --tui` screenshot).
-- Tone: opinionated, dogfooded, git-native.
+**A6 · Prerequisites & install friction — and zellij is optional for the
+core loop.** *(both)* A new user needs a Claude and/or Codex CLI + `git` +
+the Rust toolchain, then clone-and-`cargo install` (not on crates.io, no
+prebuilt binaries) at `0.0.1`. **Resolved the open question** ruthless
+raised: **zellij is NOT required for the core review loop.** All zellij
+*command-spawning* is confined to `cli/open_zellij.rs` (the `clank open` /
+`fork` workspace UX), and clank ships its *own* built-in console PTY
+multiplexer as the alternative backend; the core loop
+(queue/promote/wait/feedback/finish/stop-hook) spawns no zellij. **Fix:**
+foreground the zellij-free core in onboarding and present zellij/console as
+optional UX; a `setup`/`doctor` that checks and guides each prerequisite;
+crates.io or prebuilt binaries to come.
+
+**A7 · Documentation: pitch + a guided walkthrough.** *(both)* README is
+reference-first (see Part B); there's no zero-to-first-review tutorial and
+no troubleshooting section.
+
+### NICE-TO-HAVE (post-release)
+
+**A8 · CHANGELOG, a `docs/` site, an asciinema/`status --tui` screenshot, a
+Homebrew tap / prebuilt binaries.** *(both)*
+
+### SAFETY FOOTGUNS — document prominently *(author A.8 + ruthless)*
+
+- **Install replaces the running binary:** `cargo install --force` swaps
+  the binary the live session's own Stop hook uses, mid-flight (we hit this
+  every deploy). Surprising; must be documented.
+- **History rewrite** via `purge` / `shelve`.
+- **Multi-agent token cost:** a multi-agent review loop burns real money —
+  an outside user must be told up front. Candor here builds trust.
+
+---
+
+## Part B — README redesign sketch (synthesized; codex + ruthless largely agree)
+
+**Core move: lead with the hook, not the concept.** The current opener
+("Multi-agent peer review around plans…") states *what it is*, not *why you'd
+want it*. First three lines should land the insight: **AI agents
+peer-reviewing each other commit-by-commit, gated like a real team's PR
+process — everything in git, no daemon, no server.**
+
+**The differentiator** (vs raw claude/codex or a single agent looping): the
+structured **between-agents gate** — commit-tier + gate-tier reviewers,
+`CONTINUE` / `FINISHED` / `REQUEST_CHANGES` verdicts. *That gate is the
+product.* Say it early.
+
+**Proposed section order** (move internals off the first screen):
+
+1. **Tagline + one-paragraph hook** — the insight above.
+2. **The problem / why** — one agent can't peer-review itself; clank makes
+   agents gate each other against a plan, in git.
+3. **60-second quickstart that works from zero** — `cargo install`,
+   `clank setup`, `clank doctor`, then a first plan → review → finish.
+   *Before* any command reference.
+4. **How it works** — master/reviewer roles, plans, the gate, all-in-git /
+   no-daemon — with a concrete `clank status` / `clank log --oneline`
+   snippet showing the review gate in action.
+5. **Requirements & platform support** — Unix-only (macOS/Linux), a Claude
+   and/or Codex CLI, git, Rust toolchain; **zellij optional** (console is
+   built in).
+6. **Status & caveats (non-optional, near the top)** — dogfooded daily but
+   **pre-release (0.0.1)**, Unix-only, depends on specific agent-CLI
+   versions, multi-agent cost. Candor is a feature for this audience.
+7. **What clank is NOT** — not a hosted service, not a daemon/server, not a
+   general agent framework; a git-native multi-agent review workflow.
+   (Scoping is half the pitch.)
+8. **Command reference / deeper docs** — link out.
+
+**Credibility:** an asciinema cast or a `status --tui` screenshot of the
+gate.
+
+---
+
+## Reviewer synthesis & preserved dissent
+
+- **Consensus (unanimous):** A1 LICENSE is a hard blocker. Also agreed:
+  crate metadata + publish decision (A2), CI (A4), cross-platform honesty
+  (A5), and a pitch-first README led by the between-agents gate.
+- **Named dissent / elevation — kept, not smoothed:** ruthless **elevates
+  A3 (agent-CLI hook-schema coupling) to a top blocker**, where the
+  author's brief filed it under onboarding/stability. Master concurs after
+  verifying nothing in the codebase validates agent-CLI versions or hook
+  schemas — recorded as ruthless's position with master's agreement;
+  codex's ranking placed it third (still a release item). *Reviewers: if
+  you disagree with the elevation, say so here.*
+- **Fact corrections folded in (from ruthless's independent audit):**
+  clank-core *has* a description (only `clank`/cli lacks metadata); core is
+  `publish = false`; the vendored vt100's MIT license/attribution is
+  intact; OS/zellij coupling is ~259 refs in `cli/src` (the brief's ~296
+  was high). None change the picture.
+- **Open question resolved by master:** zellij is optional for the core
+  loop (A6).
+
+## Release-blockers vs post-release cut line
+
+- **Must-fix before ANY public release:** A1 (license), A2 (metadata +
+  publish decision + 0.1.0), A3 (agent-CLI compat check + documented
+  version range), Part B (pitch + honest caveats), A5 (platform statement).
+- **Before a *confident* release:** A4 (CI), A6 (prereq-guiding
+  setup/doctor), A7 (walkthrough).
+- **Post-release:** A8 (CHANGELOG, docs/, prebuilt binaries, screenshots).
+
+Each blocker is naturally its own follow-up plan once this research lands.
+
+---
 
 ## Reviewer instructions — INDEPENDENT due diligence is the point
 
-Do **not** rubber-stamp the author's draft, and do **not** defer to the
-other reviewer. Each reviewer must investigate independently and form
-their own opinion:
-
-- Audit the repo yourself: try a clean install path, read the code / help
-  / docs, exercise (or carefully reason about) the real flows, and hunt
-  for gaps the author missed.
-- In your review feedback, give **your own**: (a) top release blockers,
-  ranked, with severity + rationale; and (b) your own opinion on the
-  README pitch/positioning — the angle, what's missing, what you'd cut.
-- **Divergence is the goal.** Where you disagree with the author or the
-  other reviewer, say so explicitly and argue it — dissent is signal, not
-  noise. Do not converge just to agree.
-- Verdict semantics here: **REQUEST_CHANGES** if the document misses a gap
-  you consider a real blocker or misrepresents the project;
-  **CONTINUE** if it's progressing but you have more to add; **FINISHED**
-  only when you believe the document honestly and completely captures the
-  release picture *and* your independent assessment (including any
-  dissent) is reflected in it.
+Do **not** rubber-stamp this synthesis, and do **not** defer to the other
+reviewer. Re-audit yourself; give **your own** ranked blockers (severity +
+rationale) and **your own** README/positioning opinion in your feedback.
+**Divergence is the goal** — where you disagree with the author or each
+other, say so and argue it; dissent is preserved above, not smoothed.
+Verdicts: **REQUEST_CHANGES** if a real blocker is missing or the project is
+misrepresented; **CONTINUE** if it's progressing but you have more to add;
+**FINISHED** only when the document honestly and completely captures the
+release picture *and* your independent assessment (including any dissent) is
+reflected.
 
 ## Done criteria
 
-The plan document ends up containing:
-
-- A prioritized release-readiness gap table (severity, rationale,
-  remediation) that **synthesizes the author's and every reviewer's
-  independent findings, preserving disagreements as named dissent.**
-- A README redesign sketch (outline + key copy + positioning).
-- A clear "release blockers vs post-release" cut line.
-
-FINISHED when the document is complete and all reviewers have contributed
-their own independent assessments — not merely signed off.
+The document contains: a prioritized gap table (severity, rationale,
+remediation) synthesizing all independent findings with dissent preserved;
+a README redesign sketch; and a blockers-vs-post-release cut line. FINISHED
+when complete and every reviewer has contributed their own assessment — not
+merely signed off.
 
 ## Out of scope
 
 Implementing fixes, writing the final README, publishing to crates.io,
-standing up CI. Those become follow-up plans informed by this research.
+standing up CI. Those are follow-up plans informed by this research.
+
+---
+
+## Appendix — original research brief (the 9-category scope, unchanged)
+
+Part A was to cover, at minimum: (1) licensing & legal; (2) distribution &
+install / crates.io readiness; (3) prerequisites & onboarding; (4)
+cross-platform; (5) documentation; (6) stability & correctness incl.
+Stop-hook reliability; (7) release process & versioning; (8) safety &
+footguns; (9) positioning & scope. Part B was to sketch the README that
+sells the project (tagline, problem, the model, 60-second quickstart, "how
+it works" with a real flow, requirements/platform, honest status, what it's
+NOT, credibility visuals).
