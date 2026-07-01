@@ -1,9 +1,7 @@
 /target/
-.clank/*
-!.clank/plans/
-!.clank/finished/
 
 # Claude Code agent state (machine-local).
 /.claude/
-.clank/feedback/
-.clank/cache/
+
+# clank's ignore policy is the single source of truth in .clank/.gitignore
+# (an allow-list); the root carries no .clank/ rules.
