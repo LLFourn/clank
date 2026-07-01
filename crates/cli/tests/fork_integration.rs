@@ -138,10 +138,9 @@ fn fork_creates_worktree_and_seeds_team() {
         dest.join(".clank/.gitignore").is_file(),
         "tracked state checked out"
     );
-    // THE codex 335c0fc assertion: the default worktree location
-    // never pollutes main-repo status (canonical gitignore covers
-    // /worktrees/; fork also ensures the entry idempotently for
-    // repos predating it).
+    // The default worktree location never pollutes main-repo status:
+    // the allow-list gitignore (`/*`) covers `.clank/worktrees/` with
+    // no per-command help.
     assert_eq!(
         git_out(repo, &["status", "--porcelain"]).trim(),
         "",
@@ -385,13 +384,13 @@ fn fork_rejects_bad_names() {
 }
 
 #[test]
-fn fork_keeps_status_clean_even_with_stale_gitignore() {
-    // Repos initialized before /worktrees/ joined the canonical
-    // body: fork ensures the entry idempotently (codex 335c0fc).
+fn fork_worktree_ignored_by_allow_list_without_touching_gitignore() {
+    // Under the single-source allow-list (the harness writes it), the
+    // `.clank/worktrees/` dir is ignored by `/*` — so fork keeps `git status`
+    // clean WITHOUT appending anything (the old per-dir self-heal is gone).
     let env = source_with_bound_team();
     let repo = env.repo();
-    write(repo, ".clank/.gitignore", "/cache/\n/agents/\n");
-    commit(repo, "[misc] stale gitignore");
+    let before = std::fs::read_to_string(repo.join(".clank/.gitignore")).unwrap();
 
     block_on(clank::cli::fork::run_fork(
         &fork_args(&env, "wt"),
@@ -402,12 +401,12 @@ fn fork_keeps_status_clean_even_with_stale_gitignore() {
     let status = git_out(repo, &["status", "--porcelain"]);
     assert!(
         !status.contains("worktrees"),
-        "worktree dir must be ignored: {status}"
+        "worktree dir must be ignored by /*: {status}"
     );
-    let gi = std::fs::read_to_string(repo.join(".clank/.gitignore")).unwrap();
-    assert!(
-        gi.lines().any(|l| l == "/worktrees/"),
-        "entry appended: {gi}"
+    let after = std::fs::read_to_string(repo.join(".clank/.gitignore")).unwrap();
+    assert_eq!(
+        after, before,
+        "fork must not touch the allow-list gitignore"
     );
 }
 

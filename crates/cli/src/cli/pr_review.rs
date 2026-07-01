@@ -231,7 +231,8 @@ pub fn start_with(
     std::fs::create_dir_all(dir.join("reviews"))?;
     save_state(repo, pr, &PrReviewState::new(slug, pr, head_sha))?;
     write_atomic(&dir.join("master.md"), MASTER_TEMPLATE.as_bytes())?;
-    crate::init_facts::ensure_clank_gitignore_entry(repo, "/pr-reviews/")?;
+    // `.clank/pr-reviews/` is covered by the `.clank/.gitignore` allow-list
+    // (`/*`) — no per-dir entry to add.
     Ok(dir)
 }
 

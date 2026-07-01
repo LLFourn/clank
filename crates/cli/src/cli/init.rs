@@ -23,8 +23,8 @@ use anyhow::Context;
 use super::{InitArgs, resolve_repo};
 
 use crate::init_facts::{
-    CLANK_GITIGNORE_ENTRIES, CLAUDE_ALLOW_RULES, POST_REWRITE_BODY, POST_REWRITE_MARKER,
-    clank_gitignore_body, classify_gitignore_body,
+    CLAUDE_ALLOW_RULES, POST_REWRITE_BODY, POST_REWRITE_MARKER, clank_gitignore_body,
+    classify_gitignore_body,
 };
 
 /// `clank init` is pure repo setup: scaffold `.clank/`, install
@@ -215,17 +215,10 @@ fn write_scaffold(repo: &Path) -> anyhow::Result<()> {
                 println!("{} already up to date", gitignore.display());
             }
             crate::init_facts::GitignoreState::Legacy => {
-                let mut body = existing;
-                if !body.is_empty() && !body.ends_with('\n') {
-                    body.push('\n');
-                }
-                for entry in CLANK_GITIGNORE_ENTRIES {
-                    if !body.lines().any(|l| l.trim() == *entry) {
-                        body.push_str(entry);
-                        body.push('\n');
-                    }
-                }
-                std::fs::write(&gitignore, body)?;
+                // The old per-dir deny list — replace wholesale with the
+                // canonical allow-list (a Legacy body is only the recognized
+                // managed entries, so nothing user-authored is lost).
+                std::fs::write(&gitignore, clank_gitignore_body())?;
                 println!("upgraded {}", gitignore.display());
             }
             _ => {
@@ -542,10 +535,11 @@ mod tests {
         assert!(dir.path().join(".clank/plans").is_dir());
         let body = std::fs::read_to_string(dir.path().join(".clank/.gitignore")).unwrap();
         assert_eq!(body, clank_gitignore_body());
-        // Sanity: anchored patterns blanket the per-agent subtree.
-        assert!(body.contains("/agents/"));
-        assert!(body.contains("/feedback/"));
-        assert!(body.contains("/cache/"));
+        // The allow-list: ignore everything except plans/finished + self.
+        assert!(body.contains("/*"));
+        assert!(body.contains("!/plans/"));
+        assert!(body.contains("!/finished/"));
+        assert!(body.contains("!/.gitignore"));
     }
 
     #[test]
@@ -558,20 +552,16 @@ mod tests {
     }
 
     #[test]
-    fn writes_scaffold_repairs_subset_by_appending() {
-        // SET model (ruthless 02da305): a managed subset is
-        // repaired by APPENDING the missing entries — existing
-        // order preserved, result classifies Canonical.
+    fn writes_scaffold_rewrites_a_legacy_body_to_the_allow_list() {
+        // A pre-allow-list per-dir deny body classifies Legacy and is
+        // REPLACED wholesale with the canonical allow-list (not appended).
         let dir = init_repo();
         let gitignore = dir.path().join(".clank/.gitignore");
         std::fs::create_dir_all(gitignore.parent().unwrap()).unwrap();
         std::fs::write(&gitignore, "/cache/\n/agents/\n").unwrap();
         write_scaffold(dir.path()).unwrap();
         let body = std::fs::read_to_string(&gitignore).unwrap();
-        assert!(
-            body.starts_with("/cache/\n/agents/\n"),
-            "order preserved: {body}"
-        );
+        assert_eq!(body, clank_gitignore_body(), "rewritten to the allow-list");
         assert_eq!(
             classify_gitignore_body(&body),
             crate::init_facts::GitignoreState::Canonical
@@ -579,12 +569,10 @@ mod tests {
     }
 
     #[test]
-    fn writes_scaffold_survives_incremental_appends() {
-        // THE ruthless 02da305 repro: a pre-/worktrees/ repo gets
-        // `clank fork`'s append, then a later `clank init` must
-        // REPAIR (append the rest), not bail "refusing to
-        // overwrite" — append-by-entry and validate-by-set are now
-        // the same model.
+    fn writes_scaffold_migrates_an_older_legacy_body() {
+        // A repo whose `.clank/.gitignore` predates the allow-list (a partial
+        // legacy per-dir body) classifies Legacy, and `clank init` migrates
+        // it to the allow-list — it must repair, not bail.
         let dir = init_repo();
         let gitignore = dir.path().join(".clank/.gitignore");
         std::fs::create_dir_all(gitignore.parent().unwrap()).unwrap();
@@ -593,9 +581,9 @@ mod tests {
             "/agents/\n/cache/\n/feedback/\n/queue/\n/html/\n",
         )
         .unwrap();
-        crate::init_facts::ensure_clank_gitignore_entry(dir.path(), "/worktrees/").unwrap();
         write_scaffold(dir.path()).expect("init must repair, not bail");
         let body = std::fs::read_to_string(&gitignore).unwrap();
+        assert_eq!(body, clank_gitignore_body(), "migrated to the allow-list");
         assert_eq!(
             classify_gitignore_body(&body),
             crate::init_facts::GitignoreState::Canonical

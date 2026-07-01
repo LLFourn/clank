@@ -257,12 +257,8 @@ pub async fn run_fork_pinned(
     };
 
     // ── Mutation starts: the worktree. ──
-    // The default location must never pollute main-repo status —
-    // ensure /worktrees/ is gitignored even in repos whose
-    // .clank/.gitignore predates the entry (codex 335c0fc; init's
-    // canonical body now includes it).
-    crate::init_facts::ensure_clank_gitignore_entry(&main_root, "/worktrees/")
-        .context("ensuring /worktrees/ gitignore entry")?;
+    // `.clank/worktrees/` is gitignored by the `.clank/.gitignore` allow-list
+    // (`/*`) — no per-dir entry to ensure.
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating `{}`", parent.display()))?;

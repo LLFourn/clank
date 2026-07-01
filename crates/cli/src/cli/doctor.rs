@@ -138,11 +138,15 @@ pub fn repo_checks(repo: &Path, home: Option<&Path>) -> Vec<CheckResult> {
         )),
     }
 
-    // Root-gitignore carve-outs: only plans/ and finished/ need
-    // to be tracked. Everything else under .clank/ is local
-    // (per-agent configs, feedback, cache).
+    // The `.clank/.gitignore` allow-list keeps only plans/ + finished/
+    // tracked; everything else under .clank/ is local.
     out.push(check_gitignore_probe(repo, ".clank/plans/x.md", true));
     out.push(check_gitignore_probe(repo, ".clank/finished/x", true));
+
+    // The root `.gitignore` should carry NO `.clank/` rules — the
+    // single-source `.clank/.gitignore` allow-list owns them. Leftovers are
+    // redundant and a drift hazard.
+    out.push(check_root_has_no_clank_rules(repo));
 
     // .claude/settings.local.json permissions.
     out.push(check_claude_perms(repo));
@@ -354,6 +358,35 @@ fn check_gitignore_probe(repo: &Path, rel: &str, expect_tracked: bool) -> CheckR
             SECTION,
             format!("gitignore probe: {rel}"),
             format!("tracked (as expected)"),
+        )
+    }
+}
+
+/// The root `.gitignore` should own NO `.clank/` rules under the single-source
+/// allow-list — leftovers are redundant and a drift hazard. Warn (don't fail).
+fn check_root_has_no_clank_rules(repo: &Path) -> CheckResult {
+    const SECTION: &str = "repo";
+    const NAME: &str = "root .gitignore";
+    let body = match std::fs::read_to_string(repo.join(".gitignore")) {
+        Ok(b) => b,
+        Err(_) => return CheckResult::ok(SECTION, NAME, "no `.clank/` rules".to_string()),
+    };
+    let offenders: Vec<String> = body
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.strip_prefix('!').unwrap_or(l).starts_with(".clank/"))
+        .map(str::to_string)
+        .collect();
+    if offenders.is_empty() {
+        CheckResult::ok(SECTION, NAME, "no `.clank/` rules".to_string())
+    } else {
+        CheckResult::warn(
+            SECTION,
+            NAME,
+            format!(
+                "redundant `.clank/` rule(s): {} — remove them; `.clank/.gitignore` is the single source of truth",
+                offenders.join(", ")
+            ),
         )
     }
 }

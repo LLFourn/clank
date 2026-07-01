@@ -85,6 +85,12 @@ fn env_with_pr(pr: u32) -> (TestEnv, String) {
 fn start_scaffolds_and_pins_head() {
     let (env, pr_sha) = env_with_pr(123);
     let repo = env.repo();
+    // pr-review must NOT manage the gitignore — seed the canonical allow-list
+    // and assert `start` leaves it byte-identical (`.clank/pr-reviews/` is
+    // already covered by `/*`).
+    let gi_path = repo.join(".clank/.gitignore");
+    std::fs::write(&gi_path, clank::init_facts::clank_gitignore_body()).unwrap();
+    let gi_before = std::fs::read_to_string(&gi_path).unwrap();
     let dir = start_with(repo, "LLFourn/clank", 123, None, None).unwrap();
 
     assert!(dir.ends_with(".clank/pr-reviews/123"));
@@ -104,9 +110,12 @@ fn start_scaffolds_and_pins_head() {
     assert!(dir.join("master.md").is_file());
     assert!(dir.join("reviews").is_dir());
 
-    // gitignore entry ensured.
-    let gi = std::fs::read_to_string(repo.join(".clank/.gitignore")).unwrap();
-    assert!(gi.lines().any(|l| l == "/pr-reviews/"), "gitignore: {gi}");
+    // pr-review left the allow-list gitignore untouched (no per-dir append).
+    let gi_after = std::fs::read_to_string(&gi_path).unwrap();
+    assert_eq!(
+        gi_after, gi_before,
+        "pr-review must not touch the gitignore"
+    );
 }
 
 #[test]

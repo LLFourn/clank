@@ -222,8 +222,6 @@ fn open_all(source: &Path, targets: &[PathBuf], print: bool) -> anyhow::Result<(
         return Ok(());
     }
     write_layout_file(source, &kdl)?;
-    crate::init_facts::ensure_clank_gitignore_entry(source, "/zellij/")
-        .context("ensuring /zellij/ gitignore entry")?;
     if let Some(pre) = &pre {
         let _ = std::process::Command::new(&pre[0]).args(&pre[1..]).status();
     }
@@ -394,8 +392,6 @@ fn open_one(repo: &Path, print: bool) -> anyhow::Result<()> {
     }
 
     write_layout_file(&repo, &kdl)?;
-    crate::init_facts::ensure_clank_gitignore_entry(&repo, "/zellij/")
-        .context("ensuring /zellij/ gitignore entry")?;
 
     if let Some(pre) = &pre_argv {
         // Best-effort: a failed delete of a dead session just means

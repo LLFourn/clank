@@ -245,12 +245,8 @@ fn add(repo: &Path, name: &str, priority: u16, source: BodySource) -> anyhow::Re
         _ => None,
     };
     let body = normalize_and_validate(name, source)?;
-    // `.clank/drafts/` is this command's staging area; self-heal its
-    // gitignore the first time queue add runs in a repo that predates
-    // the `/drafts/` entry, mirroring fork (`/worktrees/`) and open
-    // zellij (`/zellij/`) (drafts-gitignored).
-    crate::init_facts::ensure_clank_gitignore_entry(repo, "/drafts/")
-        .map_err(|e| anyhow::anyhow!("ensuring /drafts/ gitignore entry: {e}"))?;
+    // `.clank/drafts/` (this command's staging area) is gitignored by the
+    // `.clank/.gitignore` allow-list (`/*`) — no per-dir entry to add.
     let dir = queue_dir(repo);
     std::fs::create_dir_all(&dir)?;
     let dest = dir.join(format!("{priority:03}-{name}.md"));
@@ -363,6 +359,32 @@ mod tests {
     }
 
     #[test]
+    fn queue_add_leaves_the_allow_list_gitignore_byte_identical() {
+        // Regression guard for the single-source plan (ruthless): the deleted
+        // per-dir appender means `queue add` — like fork/open/pr-review — must
+        // NOT touch `.clank/.gitignore` (an append would drift the
+        // order-sensitive allow-list out of Canonical).
+        let dir = tempfile::tempdir().unwrap();
+        let gi = dir.path().join(".clank/.gitignore");
+        write(&gi, &crate::init_facts::clank_gitignore_body());
+        add_cmd(
+            dir.path(),
+            crate::cli::QueueAddArgs {
+                name: "foo".into(),
+                priority: 500,
+                message: Some("do the thing".into()),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&gi).unwrap(),
+            crate::init_facts::clank_gitignore_body(),
+            "queue add must leave the allow-list gitignore untouched"
+        );
+        assert!(dir.path().join(".clank/queue/500-foo.md").exists());
+    }
+
+    #[test]
     fn invalid_name_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let result = add(dir.path(), ".hidden", 100, inline("body\n"));
@@ -390,17 +412,6 @@ mod tests {
         let path = dir.path().join(".clank/queue/400-foo.md");
         let body = std::fs::read_to_string(&path).unwrap();
         assert_eq!(body, "# foo\nreal body\n");
-    }
-
-    #[test]
-    fn add_ensures_its_staging_dir_is_gitignored() {
-        // queue add self-heals `.clank/.gitignore` to ignore `/drafts/`
-        // (its staging area) even on a repo that predates the entry —
-        // and even when the body came inline (drafts-gitignored).
-        let dir = tempfile::tempdir().unwrap();
-        add(dir.path(), "foo", 400, inline("real body\n")).unwrap();
-        let gi = std::fs::read_to_string(dir.path().join(".clank/.gitignore")).unwrap();
-        assert!(gi.contains("/drafts/"), "queue add ignores /drafts/: {gi}");
     }
 
     #[test]

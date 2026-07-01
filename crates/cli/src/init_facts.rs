@@ -6,24 +6,23 @@
 
 use std::path::{Path, PathBuf};
 
-/// The managed entries of `.clank/.gitignore` — everything
-/// local-only: agent state, caches, the queue, queue-add drafts
-/// (the `.clank/drafts/<name>.md` staging area for `queue add`),
-/// rendered html, shelved-plan state (plan-lifecycle-verbs), fork
-/// worktrees (clank-fork-worktree-sessions), generated zellij
-/// layouts.
+/// The canonical `.clank/.gitignore` — a single-source ALLOW-LIST: ignore
+/// everything under `.clank/` except the tracked plan docs and this file
+/// itself. `/*` must precede the `!` re-includes (gitignore order matters),
+/// so this is order-SENSITIVE and validated by exact match — the opposite of
+/// the old per-dir set model.
 ///
-/// The file is validated and repaired by SET MEMBERSHIP, not
-/// exact string match (ruthless 02da305): three commands mutate
-/// it (init writes/repairs; fork ensures `/worktrees/`;
-/// open zellij ensures `/zellij/`), so order-insensitive
-/// "contains every managed entry, nothing foreign" is the only
-/// model under which incremental appends can't drift the file
-/// out of recognition. This also killed the combinatorial
-/// legacy-bodies list (every new entry demanded enumerating its
-/// subset x ordering permutations — which is exactly how
-/// /shelved/ slipped).
-pub const CLANK_GITIGNORE_ENTRIES: &[&str] = &[
+/// Why an allow-list: (1) one tracked source of truth (no root/nested
+/// duplication that can drift); (2) future-proof — a NEW `.clank/<subdir>`
+/// is ignored by `/*` with no edit, so there are NO incremental appenders to
+/// mutate the file (the old `ensure_clank_gitignore_entry` is gone). The
+/// tracked surface is exactly `plans/` + `finished/` + this file.
+pub const CLANK_GITIGNORE_ENTRIES: &[&str] = &["/*", "!/plans/", "!/finished/", "!/.gitignore"];
+
+/// The pre-allow-list per-dir deny list — recognized so an existing repo's
+/// `.clank/.gitignore` classifies `Legacy` and `clank init` rewrites it to
+/// the allow-list. NOT written anymore.
+pub const LEGACY_GITIGNORE_ENTRIES: &[&str] = &[
     "/agents/",
     "/cache/",
     "/feedback/",
@@ -36,8 +35,7 @@ pub const CLANK_GITIGNORE_ENTRIES: &[&str] = &[
     "/zellij/",
 ];
 
-/// Canonical WRITE form for fresh files: the managed entries,
-/// one per line, in `CLANK_GITIGNORE_ENTRIES` order.
+/// Canonical WRITE form: the allow-list entries, one per line, in order.
 pub fn clank_gitignore_body() -> String {
     let mut out = String::new();
     for e in CLANK_GITIGNORE_ENTRIES {
@@ -125,24 +123,24 @@ pub fn classify_clank_gitignore(repo: &Path) -> GitignoreState {
     }
 }
 
-/// Set-membership classification (pure): every non-empty line
-/// must be a managed entry (else Drifted — foreign content we
-/// won't touch); all managed entries present → Canonical (order
-/// irrelevant); some missing → Legacy (repairable by appending).
+/// Order-AWARE classification (pure): the allow-list is order-sensitive, so
+/// `Canonical` requires an EXACT ordered match. A body made only of the old
+/// per-dir deny entries is `Legacy` (init rewrites it to the allow-list).
+/// Anything else — a foreign body, or a modified/reordered allow-list — is
+/// `Drifted` (init warns, never clobbers).
 pub fn classify_gitignore_body(body: &str) -> GitignoreState {
     let lines: Vec<&str> = body
         .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty())
         .collect();
-    if lines.iter().any(|l| !CLANK_GITIGNORE_ENTRIES.contains(l)) {
-        return GitignoreState::Drifted;
+    if lines.as_slice() == CLANK_GITIGNORE_ENTRIES {
+        return GitignoreState::Canonical;
     }
-    if CLANK_GITIGNORE_ENTRIES.iter().all(|e| lines.contains(e)) {
-        GitignoreState::Canonical
-    } else {
-        GitignoreState::Legacy
+    if !lines.is_empty() && lines.iter().all(|l| LEGACY_GITIGNORE_ENTRIES.contains(l)) {
+        return GitignoreState::Legacy;
     }
+    GitignoreState::Drifted
 }
 
 /// Classification of the resolved `post-rewrite` hook.
@@ -290,67 +288,35 @@ mod tests {
     }
 
     #[test]
-    fn drafts_is_a_managed_gitignore_entry_with_legacy_repair() {
-        // `.clank/drafts/` is the queue-add staging area and MUST be
-        // gitignored everywhere (drafts-gitignored).
-        assert!(
-            clank_gitignore_body().contains("/drafts/\n"),
-            "drafts in the canonical body"
-        );
-        // A repo whose .clank/.gitignore predates /drafts/ (the prior
-        // canonical set) classifies Legacy, and the shared ensure
-        // repairs it back to canonical without disturbing the rest.
-        let dir = tempdir();
-        std::fs::create_dir_all(dir.path().join(".clank")).unwrap();
-        let prior = "/agents/\n/cache/\n/feedback/\n/queue/\n/html/\n\
-                     /pr-reviews/\n/shelved/\n/worktrees/\n/zellij/\n";
-        std::fs::write(clank_gitignore_path(dir.path()), prior).unwrap();
-        assert_eq!(classify_clank_gitignore(dir.path()), GitignoreState::Legacy);
-
-        ensure_clank_gitignore_entry(dir.path(), "/drafts/").unwrap();
-        assert_eq!(
-            classify_clank_gitignore(dir.path()),
-            GitignoreState::Canonical,
-            "repaired to canonical after adding /drafts/"
-        );
-    }
-
-    #[test]
-    fn ensure_entry_appends_and_is_idempotent() {
-        // The shared single-entry ensure (fork: /worktrees/,
-        // open zellij: /zellij/) — append once, never duplicate,
-        // create the file when missing.
-        let dir = tempdir();
-        ensure_clank_gitignore_entry(dir.path(), "/zellij/").unwrap();
-        ensure_clank_gitignore_entry(dir.path(), "/zellij/").unwrap();
-        let body = std::fs::read_to_string(clank_gitignore_path(dir.path())).unwrap();
-        assert_eq!(body.matches("/zellij/").count(), 1, "{body}");
-
-        std::fs::write(clank_gitignore_path(dir.path()), "/agents/\n").unwrap();
-        ensure_clank_gitignore_entry(dir.path(), "/worktrees/").unwrap();
-        let body = std::fs::read_to_string(clank_gitignore_path(dir.path())).unwrap();
-        assert!(body.starts_with("/agents/\n"), "existing preserved: {body}");
-        assert!(body.contains("/worktrees/\n"), "appended: {body}");
-    }
-
-    #[test]
-    fn classify_gitignore_body_is_order_insensitive_and_set_based() {
-        // Canonical = all managed entries, ANY order.
+    fn classify_allow_list_is_order_sensitive() {
+        // Unlike the old set model, the allow-list is ORDER-sensitive: `/*`
+        // must precede the `!` re-includes, so a reordered body is NOT
+        // Canonical (it's a modified body → Drifted).
         let reversed: String = CLANK_GITIGNORE_ENTRIES
             .iter()
             .rev()
             .map(|e| format!("{e}\n"))
             .collect();
-        assert_eq!(
+        assert_ne!(
             classify_gitignore_body(&reversed),
-            GitignoreState::Canonical
+            GitignoreState::Canonical,
+            "reordered allow-list must not be Canonical"
         );
-        // A managed subset PLUS a foreign line = Drifted (foreign
-        // wins — we never touch user content).
-        assert_eq!(
-            classify_gitignore_body("/agents/\nmy-custom-thing\n"),
-            GitignoreState::Drifted
-        );
+    }
+
+    #[test]
+    fn classify_recognizes_legacy_and_flags_a_modified_allow_list() {
+        // The full pre-allow-list per-dir deny list → Legacy (init rewrites
+        // it to the allow-list).
+        let legacy: String = LEGACY_GITIGNORE_ENTRIES
+            .iter()
+            .map(|e| format!("{e}\n"))
+            .collect();
+        assert_eq!(classify_gitignore_body(&legacy), GitignoreState::Legacy);
+        // A canonical allow-list with an APPENDED entry — the exact drift the
+        // deleted appender would have caused — is Drifted, never Canonical.
+        let appended = format!("{}/drafts/\n", clank_gitignore_body());
+        assert_eq!(classify_gitignore_body(&appended), GitignoreState::Drifted);
     }
 
     #[test]
@@ -439,29 +405,8 @@ mod tests {
     }
 }
 
-/// Idempotently ensure `<repo>/.clank/.gitignore` contains
-/// `entry` (one line). Shared by the commands that create
-/// local-only state in repos whose gitignore may predate the
-/// entry (fork: /worktrees/, open zellij: /zellij/, queue add:
-/// /drafts/).
-pub fn ensure_clank_gitignore_entry(repo: &Path, entry: &str) -> std::io::Result<()> {
-    let path = clank_gitignore_path(repo);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let body = match std::fs::read_to_string(&path) {
-        Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => return Err(e),
-    };
-    if body.lines().any(|l| l.trim() == entry) {
-        return Ok(());
-    }
-    let mut new_body = body;
-    if !new_body.is_empty() && !new_body.ends_with('\n') {
-        new_body.push('\n');
-    }
-    new_body.push_str(entry);
-    new_body.push('\n');
-    std::fs::write(&path, new_body)
-}
+// `ensure_clank_gitignore_entry` (the per-dir appender) is DELETED: under the
+// allow-list every `.clank/` subdir is ignored by `/*`, so there is nothing
+// to append — and an append would drift the order-sensitive body out of
+// `Canonical`. Its former callers (fork/open-zellij/queue/pr-review) no
+// longer touch the gitignore.
