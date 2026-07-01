@@ -226,8 +226,12 @@ pub async fn run(args: WaitArgs) -> anyhow::Result<()> {
                     .cloned()
                     .collect();
                 items.extend(blocked_items);
-                for firing in &firings_from_items(&items) {
-                    hook_config::run_hook(&repo, &hook_config, firing);
+                // `--peek` is a pure probe: report work-presence, fire NO
+                // lifecycle hooks (the Stop hook may peek on every stop).
+                if !args.peek {
+                    for firing in &firings_from_items(&items) {
+                        hook_config::run_hook(&repo, &hook_config, firing);
+                    }
                 }
                 emit(&items, args.json);
                 return Ok(());
@@ -267,7 +271,17 @@ pub async fn run(args: WaitArgs) -> anyhow::Result<()> {
             emit(&items, args.json);
             return Ok(());
         }
-        hook_config::run_idle_hook(&repo, &hook_config);
+        // The idle hook is a side effect; `--peek` must not fire it.
+        if !args.peek {
+            hook_config::run_idle_hook(&repo, &hook_config);
+        }
+    }
+
+    // `--peek`: the initial pass found no actionable work → report empty
+    // and return immediately, never entering the (blocking) watcher loop.
+    if args.peek {
+        emit(&[], args.json);
+        return Ok(());
     }
 
     let (tx, rx) = mpsc::channel::<()>();

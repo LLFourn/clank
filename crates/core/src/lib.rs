@@ -80,7 +80,7 @@ pub use ids::{
 
 pub use agent_config::{AgentConfig, Session};
 pub use hook_io::{
-    BackgroundTask, BgGate, CLAUDE_CONTINUATION_EXIT, CodexBlockDecision, HOOK_OK_EXIT, HookInput,
-    HookOutcome, background_gate,
+    BackgroundTask, BgDisposition, CLAUDE_CONTINUATION_EXIT, CodexBlockDecision, HOOK_OK_EXIT,
+    HookInput, HookOutcome, background_disposition,
 };
 pub use identity::{IdentityInputs, ResolveError, resolve_agent_identity};

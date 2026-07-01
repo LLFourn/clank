@@ -410,6 +410,14 @@ pub struct WaitArgs {
     /// Emit JSON instead of the human rendering.
     #[arg(short = 'j', long)]
     pub json: bool,
+    /// One-shot, non-blocking probe: report whether the caller has
+    /// actionable work RIGHT NOW and return immediately — never enter the
+    /// watcher loop. Unlike a real wait it is SIDE-EFFECT-FREE: it fires no
+    /// lifecycle or idle hooks and promotes nothing. Emits the same output
+    /// (empty when there's no work). Used by the Stop hook to tell "still
+    /// your turn" from "idle" without blocking.
+    #[arg(long)]
+    pub peek: bool,
     /// Skip the on-disk state cache.
     #[arg(long)]
     pub no_cache: bool,

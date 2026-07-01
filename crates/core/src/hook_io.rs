@@ -59,7 +59,8 @@ pub struct HookInput {
     /// Stop when one completes — that's the documented signal for "the
     /// turn ended because the session is *paused waiting for background
     /// work to wake it back up*," not because it's idle. See
-    /// [`background_gate`]. Codex omits the field, so it stays empty there.
+    /// [`background_disposition`]. Codex omits the field, so it stays empty
+    /// there.
     #[serde(default)]
     pub background_tasks: Vec<BackgroundTask>,
 }
@@ -114,41 +115,44 @@ impl HookInput {
     }
 }
 
-/// The Stop hook's decision about the turn's background work — a pure
-/// function of the turn (no clank identity/auto-mode), so the [`BgGate::Yield`]
-/// cases can be decided before any repo/identity resolution. See
-/// [`background_gate`].
+/// How the Stop hook should treat the turn's background work — a pure
+/// function of the turn (no clank identity/auto-mode), so the
+/// [`BgDisposition::YieldArmed`] cases can be decided before any
+/// repo/identity resolution. See [`background_disposition`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BgGate {
-    /// Yield (Silent), no wait: a backgrounded `clank wait` already covers
-    /// review-work wake, OR a process is live but we've already nudged /
-    /// this isn't claude. Either way, running our own wait would block the
-    /// wake Claude Code is about to deliver.
-    Yield,
-    /// A process is live with no `clank wait` watching: if the agent is
-    /// being driven (auto on), nudge it to start `clank wait` alongside so
-    /// either wake source is armed.
-    NudgeIfDriving,
-    /// No background work — proceed to the normal idle wait.
+pub enum BgDisposition {
+    /// Yield (Silent) immediately: a backgrounded `clank wait` already
+    /// watches for review work, OR a process is live on a non-claude tool
+    /// (no `run_in_background` auto-wake to arm). Nothing more to decide.
+    YieldArmed,
+    /// A process is live (claude) with no `clank wait` watching. The cli
+    /// must peek for immediate work to tell the two cases apart: the agent
+    /// still has work (its turn, blocked on its own task) → yield; the agent
+    /// is idle (e.g. just committed, awaiting reviews) → nudge it to start
+    /// `clank wait` alongside the process.
+    NeedsWorkCheck,
+    /// No background work — proceed to the normal deliver-work / idle wait.
     NoBackgroundWork,
 }
 
-/// Pure background-work gate for the Stop hook. Claude's `background_tasks`
-/// drives it; codex omits the field, so this is always
-/// [`BgGate::NoBackgroundWork`] there. `tool` and `stop_hook_active` gate the
-/// nudge: only claude auto-wakes on its own `run_in_background` tasks, and an
-/// already-active stop chain shouldn't re-nudge.
-pub fn background_gate(tool: Tool, input: &HookInput) -> BgGate {
+/// Pure background-work disposition for the Stop hook. Claude's
+/// `background_tasks` drives it; codex omits the field, so this is always
+/// [`BgDisposition::NoBackgroundWork`] there. Note there is NO
+/// `stop_hook_active` dependence: re-nudging is prevented structurally
+/// (once a `clank wait` is armed it shows up here as `YieldArmed`), and the
+/// nudge fires only when the agent has no immediate work — precisely when a
+/// backgrounded `clank wait` would block and persist.
+pub fn background_disposition(tool: Tool, input: &HookInput) -> BgDisposition {
     if input.has_background_clank_wait() {
-        return BgGate::Yield;
+        return BgDisposition::YieldArmed;
     }
     if input.has_non_wait_background_work() {
-        if tool != Tool::Claude || input.stop_hook_active {
-            return BgGate::Yield;
+        if tool == Tool::Claude {
+            return BgDisposition::NeedsWorkCheck;
         }
-        return BgGate::NudgeIfDriving;
+        return BgDisposition::YieldArmed;
     }
-    BgGate::NoBackgroundWork
+    BgDisposition::NoBackgroundWork
 }
 
 /// What the stop-hook adapter decides to emit after evaluating
@@ -357,39 +361,39 @@ mod tests {
     }
 
     #[test]
-    fn background_gate_covers_the_state_machine() {
+    fn background_disposition_covers_the_state_machine() {
         use Tool::{Claude, Codex};
-        // A backgrounded `clank wait` (with or without other work) → Yield.
+        // A backgrounded `clank wait` (with or without other work) → yield.
         assert_eq!(
-            background_gate(Claude, &input_with(vec![task("clank wait")], false)),
-            BgGate::Yield
+            background_disposition(Claude, &input_with(vec![task("clank wait")], false)),
+            BgDisposition::YieldArmed
         );
         assert_eq!(
-            background_gate(
+            background_disposition(
                 Claude,
                 &input_with(vec![task("sleep 60"), task("clank wait")], false)
             ),
-            BgGate::Yield
+            BgDisposition::YieldArmed
         );
-        // A live process, no clank wait, claude, first stop → nudge.
+        // A live process, no clank wait, claude → cli must peek for work
+        // (regardless of stop_hook_active — no dependence on it now).
         assert_eq!(
-            background_gate(Claude, &input_with(vec![task("sleep 60")], false)),
-            BgGate::NudgeIfDriving
+            background_disposition(Claude, &input_with(vec![task("sleep 60")], false)),
+            BgDisposition::NeedsWorkCheck
         );
-        // Already nudged (stop_hook_active) → Yield (don't nag).
         assert_eq!(
-            background_gate(Claude, &input_with(vec![task("sleep 60")], true)),
-            BgGate::Yield
+            background_disposition(Claude, &input_with(vec![task("sleep 60")], true)),
+            BgDisposition::NeedsWorkCheck
         );
-        // Codex has no run_in_background auto-wake → never nudge.
+        // Codex has no run_in_background auto-wake → yield, never peek/nudge.
         assert_eq!(
-            background_gate(Codex, &input_with(vec![task("sleep 60")], false)),
-            BgGate::Yield
+            background_disposition(Codex, &input_with(vec![task("sleep 60")], false)),
+            BgDisposition::YieldArmed
         );
         // No background work → proceed to the normal wait.
         assert_eq!(
-            background_gate(Claude, &input_with(vec![], false)),
-            BgGate::NoBackgroundWork
+            background_disposition(Claude, &input_with(vec![], false)),
+            BgDisposition::NoBackgroundWork
         );
     }
 

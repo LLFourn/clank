@@ -22,8 +22,8 @@ use crate::agent_env::resolve_identity_for_hook;
 use crate::agent_store::load_agent_config;
 use crate::lifecycle::AgentLabel;
 use clank_core::{
-    AutoMode, BgGate, CLAUDE_CONTINUATION_EXIT, CodexBlockDecision, HOOK_OK_EXIT, HookInput,
-    HookOutcome, Role, Tool, background_gate,
+    AutoMode, BgDisposition, CLAUDE_CONTINUATION_EXIT, CodexBlockDecision, HOOK_OK_EXIT, HookInput,
+    HookOutcome, Role, Tool, background_disposition,
 };
 
 pub async fn run(args: StopHookArgs) -> anyhow::Result<()> {
@@ -39,15 +39,14 @@ async fn compute_outcome(tool: Tool, repo_override: Option<&Path>) -> HookOutcom
     };
 
     // Decide how the agent's in-flight background work affects this
-    // turn-end, BEFORE any clank resolution (`background_gate` is a pure
-    // function of the turn). The `Yield` cases never run a wait — Claude
-    // Code re-fires Stop / auto-wakes when the work completes, and running
-    // our own wait here would block that wake (the `wait-alongside-
-    // background` design). Only `NudgeIfDriving` / `NoBackgroundWork` fall
-    // through to resolution, so a config Diagnostic can only surface when
-    // we were going to engage clank anyway.
-    let gate = background_gate(tool, &input);
-    if matches!(gate, BgGate::Yield) {
+    // turn-end, BEFORE any clank resolution (`background_disposition` is a
+    // pure function of the turn). `YieldArmed` never runs a wait — Claude
+    // Code auto-wakes when the work completes, and running our own wait here
+    // would block that wake. Only `NeedsWorkCheck` / `NoBackgroundWork` fall
+    // through to resolution, so a config Diagnostic can only surface when we
+    // were going to engage clank anyway.
+    let disposition = background_disposition(tool, &input);
+    if matches!(disposition, BgDisposition::YieldArmed) {
         return HookOutcome::Silent;
     }
 
@@ -94,23 +93,77 @@ async fn compute_outcome(tool: Tool, repo_override: Option<&Path>) -> HookOutcom
 
     match effective {
         AutoMode::Off => HookOutcome::Silent,
-        AutoMode::On => match gate {
-            // A process is live with no `clank wait` watching: nudge the
-            // agent to start one alongside it, so EITHER the process
-            // finishing OR review work can wake it. We can't arm the wait
-            // ourselves — a hook-spawned `clank wait` would block (the wake
-            // never lands) or be untracked by Claude (no auto-wake on its
-            // completion). Only the agent's own `run_in_background` task gets
-            // both wakes (validated by spike).
-            BgGate::NudgeIfDriving => HookOutcome::Continue {
-                reason: nudge_reason(&input),
+        AutoMode::On => match disposition {
+            // A process is live with no `clank wait` watching. Peek (without
+            // blocking) whether the agent has work RIGHT NOW:
+            //  - it does → it's still its turn, blocked on its own task →
+            //    yield silently (don't nudge; that was the loop — a master
+            //    mid-plan always has "continue" work, so a nudged wait would
+            //    return instantly and never persist).
+            //  - it doesn't → idle (e.g. just committed, awaiting reviews) →
+            //    nudge it to start `clank wait` alongside the process, so
+            //    EITHER the process finishing OR review work wakes it. Safe
+            //    from looping: with no work the wait blocks and persists, and
+            //    the next Stop sees it (`YieldArmed`).
+            BgDisposition::NeedsWorkCheck => match peek_has_work(&repo, &label, role).await {
+                Ok(true) => HookOutcome::Silent,
+                Ok(false) => HookOutcome::Continue {
+                    reason: nudge_reason(&input),
+                },
+                // Fail-soft: if the peek can't run, yield rather than nudge
+                // (the process still wakes the agent; no forced turn on doubt).
+                Err(_) => HookOutcome::Silent,
             },
-            // NoBackgroundWork (Yield already returned above): genuinely idle.
+            // NoBackgroundWork (YieldArmed already returned above): genuinely idle.
             _ => {
                 let wait_timeout = cfg.as_ref().and_then(|c| c.wait_timeout.clone());
                 compute_wait_outcome(&repo, &label, role, wait_timeout.as_deref()).await
             }
         },
+    }
+}
+
+/// Non-blocking peek: does `label` have actionable clank work right now?
+/// Self-spawns `clank wait --peek --json` (side-effect-free: fires no
+/// hooks) and CAPTURES its stdout — never inherits it — so the peek's JSON
+/// envelope can't corrupt the hook's own protocol stdout (ruthless c042912).
+async fn peek_has_work(repo: &Path, label: &AgentLabel, role: Role) -> Result<bool, String> {
+    use tokio::process::Command;
+
+    let exe = std::env::current_exe().map_err(|e| format!("current_exe failed: {e}"))?;
+    let role_arg = match role {
+        Role::Master => "master",
+        Role::Reviewer => "reviewer",
+    };
+    let output = Command::new(&exe)
+        .arg("wait")
+        .arg("--peek")
+        .arg("--repo")
+        .arg(repo)
+        .arg("--author")
+        .arg(label.as_str())
+        .arg("--role")
+        .arg(role_arg)
+        .arg("--json")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .output()
+        .await
+        .map_err(|e| format!("spawning peek failed: {e}"))?;
+
+    match output.status.code() {
+        Some(0) => parse_wait_json(&output.stdout)
+            .map(|items| !items.is_empty())
+            .map_err(|e| format!("peek stdout malformed: {e}")),
+        other => Err(format!(
+            "peek exited {} stderr={}",
+            other
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "(signaled)".into()),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )),
     }
 }
 
