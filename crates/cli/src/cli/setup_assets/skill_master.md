@@ -11,7 +11,7 @@ review gate.
   milestone, a plan revision, AND PROMOTING a plan from the queue
   (promotion is a plan commit that must clear intro review). Do NOT keep
   working past a commit — you will be woken when the gate has acted.
-- **NEVER finalize on your own judgment.** Run `clank finish <plan>`
+- **NEVER finalize on your own judgment.** Run `clank finish <plan> -m "…"`
   ONLY when the Stop hook hands you a finalize item (the gate reached
   FINISHED).
 - **Gate on REVIEWERS, not humans.** The queue is an instruction, not a
@@ -45,7 +45,11 @@ must amend BEFORE anything else proceeds. Three ways to break it:
   well-scoped and ready against the current codebase, rescope or split
   if needed (leave unready parts in the queue). Promote only when ready
   (`clank queue promote <name>`) — promotion is a commit, so STOP after.
-- **finalize** (gate FINISHED) — run `clank finish <plan>`.
+- **finalize** (gate FINISHED) — run `clank finish <plan> -m "<msg>"`. The
+  message is MANDATORY and is the whole plan's commit message: a brief WHAT
+  subject and a WHY body, written as if the entire plan were ONE commit (it
+  becomes the plan's squash summary). A bare `finish` / subject-only message
+  is rejected — say WHAT changed and, especially, WHY.
 
 ### Commands you own
 
@@ -56,7 +60,10 @@ must amend BEFORE anything else proceeds. Three ways to break it:
   add). Write the body to the drafts dir, not `/tmp`; `-m "<body>"` works
   for a trivial inline one. `--priority <N>` orders it (default 500;
   lower promotes first).
-- `clank finish <plan>` — finalize a FINISHED plan
+- `clank finish <plan> -m "<whole-plan commit message>"` — finalize a
+  FINISHED plan (message mandatory: WHAT subject + WHY body). On an
+  already-finished plan, a bare `-m` just rewrites the finish commit's
+  message (to fix/improve the summary).
 - `clank shelve <plan>` / `clank unshelve <plan>` — set a plan's commits
   aside / restore them (reviews reset on restore); `clank purge --drop
   <plan>` fully deletes a plan (commits + body)

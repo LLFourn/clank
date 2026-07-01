@@ -1149,7 +1149,10 @@ pub struct FinishArgs {
     /// must already be a finalize commit for this plan.
     #[arg(long)]
     pub amend: bool,
-    /// Override the default `[<stem>] finish` commit message.
+    /// REQUIRED (when authoring the finish commit): the whole plan's commit
+    /// message — a brief WHAT subject and a WHY body, written as if the whole
+    /// plan were one commit. It becomes the plan's squash summary. A bare
+    /// `finish` / subject-only message is rejected.
     #[arg(short = 'm', long)]
     pub message: Option<String>,
     /// After finalize, strip the plan's `.clank/` artifacts

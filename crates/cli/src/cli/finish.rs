@@ -29,10 +29,24 @@ pub async fn run(args: FinishArgs) -> anyhow::Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("finish preview failed: {e}"))?;
 
+    // The finish message is the plan's whole-plan commit summary, so it's
+    // mandatory on any path that authors the FINAL finish message: the
+    // finalize create, an `--amend` re-commit, or a bare `-m` message rewrite
+    // on an already-finished plan. When `--squash` is present the final
+    // message comes from `--squash`'s own MSG (the follow-up plan unifies
+    // them), so `-m` isn't forced there; and the non-authoring paths
+    // (retroactive squash reads history; a no-op finish) are exempt.
+    let already_finished = matches!(preview.readiness, FinalizeReadiness::AlreadyFinished);
+    let authors_final_message =
+        args.squash.is_none() && (!already_finished || args.amend || args.message.is_some());
+    if authors_final_message {
+        validate_finish_message(args.message.as_deref(), &stem)?;
+    }
+
     // Amend on an already-finished plan: rewrite HEAD's commit
     // (e.g. to refresh a stale message). The finalize tree is
     // already on disk, so skip the file-moving `finalize()` path.
-    if args.amend && matches!(preview.readiness, FinalizeReadiness::AlreadyFinished) {
+    if args.amend && already_finished {
         require_head_is_finalize(&repo, &stem)?;
         if args.dry && (args.purge || args.squash.is_some()) {
             return dry_run_finish_composite(&stem, &preview, &args);
@@ -42,6 +56,26 @@ pub async fn run(args: FinishArgs) -> anyhow::Result<()> {
         if args.purge || args.squash.is_some() {
             run_post_finalize_rewrite(&repo, &plan_key, args).await?;
         }
+        return Ok(());
+    }
+
+    // A bare `-m` on an already-finished plan (no `--amend`, no purge/squash)
+    // rewrites the finalize commit's message — the ergonomic way to fix or
+    // improve the whole-plan summary after the finish landed, without the
+    // `--amend` ceremony.
+    if already_finished
+        && args.message.is_some()
+        && !args.amend
+        && !args.purge
+        && args.squash.is_none()
+    {
+        require_head_is_finalize(&repo, &stem)?;
+        if args.dry {
+            println!("# clank finish --dry: would rewrite the finish message for `{stem}`");
+            return Ok(());
+        }
+        amend_already_finished(&repo, &stem, args.message.as_deref())?;
+        println!("rewrote finish message for `{stem}`");
         return Ok(());
     }
 
@@ -55,9 +89,7 @@ pub async fn run(args: FinishArgs) -> anyhow::Result<()> {
     // must stay amend-only — this path only rewrites the range, it
     // does not touch the finalize commit. Plain `finish` (no
     // purge/squash) still falls through to the no-op below.
-    if matches!(preview.readiness, FinalizeReadiness::AlreadyFinished)
-        && (args.purge || args.squash.is_some())
-    {
+    if already_finished && (args.purge || args.squash.is_some()) {
         if args.dry {
             return dry_run_finish_composite(&stem, &preview, &args);
         }
@@ -89,6 +121,58 @@ pub async fn run(args: FinishArgs) -> anyhow::Result<()> {
         run_post_finalize_rewrite(&repo, &plan_key, args).await?;
     }
     Ok(())
+}
+
+/// Secondary guard only: catch a trivially-empty WHY body (e.g. `.` or a
+/// stray word). The PRIMARY check is body PRESENCE — a real WHY always
+/// clears this floor, so it never punishes a concise subject.
+const MIN_WHY_BODY_CHARS: usize = 12;
+
+/// Placeholder subjects that carry no summary. Compared case-insensitively
+/// against the subject with any leading `[<stem>]` and trailing dots removed.
+const FINISH_MESSAGE_PLACEHOLDERS: &[&str] =
+    &["finish", "finished", "done", "wip", "complete", "completed"];
+
+/// Enforce that the finish message reads like the whole plan's commit
+/// message: a WHAT subject AND a WHY body. Rejects an absent/empty message,
+/// the `[<stem>] finish` default, bare placeholders, and — the primary
+/// check, per the review — a subject-only message (no WHY body). Keying on
+/// the body rather than a subject-length floor is deliberate: a concise
+/// subject with a real WHY passes, and a long subject with NO why is
+/// rejected instead of landing silently.
+fn validate_finish_message(message: Option<&str>, stem: &str) -> anyhow::Result<()> {
+    let Some(msg) = message.map(str::trim).filter(|m| !m.is_empty()) else {
+        anyhow::bail!("{}", finish_message_help(stem));
+    };
+    let subject = msg.lines().next().unwrap_or("").trim();
+    let subject_core = subject
+        .strip_prefix(&format!("[{stem}]"))
+        .unwrap_or(subject)
+        .trim()
+        .trim_end_matches('.')
+        .trim();
+    let lower = subject_core.to_ascii_lowercase();
+    if subject_core.is_empty() || FINISH_MESSAGE_PLACEHOLDERS.contains(&lower.as_str()) {
+        anyhow::bail!("{}", finish_message_help(stem));
+    }
+    // PRIMARY: require a WHY body — content after the subject's blank line.
+    let body = msg.split_once("\n\n").map(|(_, b)| b.trim()).unwrap_or("");
+    if body.len() < MIN_WHY_BODY_CHARS {
+        anyhow::bail!("{}", finish_message_help(stem));
+    }
+    Ok(())
+}
+
+fn finish_message_help(stem: &str) -> String {
+    format!(
+        "finish needs the whole plan's commit message: a brief subject saying \
+         WHAT changed AND a body explaining the WHY (why the change exists — not \
+         a restatement of the diff). A bare `finish` or a subject with no body is \
+         rejected.\n\n  \
+         clank finish {stem} -m \"<subject: what changed>\" -m \"<why it exists + effects>\"\n\n\
+         The message becomes this plan's squash summary, so write it as if the \
+         whole plan were a single commit."
+    )
 }
 
 /// Dry-run preview for `finish --purge`/`--squash`. Emits a
@@ -325,8 +409,9 @@ fn amend_already_finished(repo: &Path, stem: &str, message: Option<&str>) -> any
 fn require_head_is_finalize(repo: &Path, stem: &str) -> anyhow::Result<()> {
     if !head_is_finalize_for(repo, stem)? {
         anyhow::bail!(
-            "--amend requires HEAD to be a finalize commit for plan `{stem}`; \
-             run `clank finish` without --amend instead",
+            "rewriting plan `{stem}`'s finish commit needs it to be HEAD, but HEAD \
+             is a different commit (work is stacked on top). Check out or rebase \
+             onto the finalize commit, or edit it via an interactive rebase.",
         );
     }
     Ok(())
@@ -385,6 +470,56 @@ mod tests {
             is_finished: false,
             sealed_approvals: vec![],
         }
+    }
+
+    #[test]
+    fn finish_message_accepts_what_subject_plus_why_body() {
+        // A real whole-plan message: WHAT subject + WHY body.
+        assert!(
+            validate_finish_message(
+                Some("[foo] add retry on fetch\n\nthe daemon fetch flaked on transient DNS errors"),
+                "foo",
+            )
+            .is_ok()
+        );
+        // A CONCISE subject is fine when the WHY body is present — the body is
+        // the primary check, not subject length (ruthless 3018ae6).
+        assert!(
+            validate_finish_message(
+                Some("add retry\n\nprevents a hang when the network blips mid-fetch"),
+                "foo",
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn finish_message_rejects_absent_placeholder_and_default() {
+        for bad in [
+            None,
+            Some(""),
+            Some("   "),
+            Some("finish"),
+            Some("[foo] finish"), // the old default
+            Some("done"),
+            Some("WIP"),
+        ] {
+            assert!(
+                validate_finish_message(bad, "foo").is_err(),
+                "should reject {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn finish_message_rejects_subject_only_even_when_long() {
+        // The false-accept ruthless flagged: a long, descriptive subject with
+        // NO why body must be rejected (not land silently).
+        let long_subject_no_body = "refactor the entire authentication subsystem end to end";
+        assert!(long_subject_no_body.len() > 40);
+        assert!(validate_finish_message(Some(long_subject_no_body), "foo").is_err());
+        // A trivially-empty body is also rejected (secondary floor).
+        assert!(validate_finish_message(Some("real subject here\n\n."), "foo").is_err());
     }
 
     #[tokio::test]

@@ -37,12 +37,15 @@ message at squash time (`finish --squash` reading it; a batch `clank squash
   (`finalize`, currently `message.unwrap_or("[{stem}] finish")`) and the
   `--amend` path (`amend_already_finished`). On the finalize-CREATING path,
   a message is now REQUIRED (no silent `[<stem>] finish` default).
-  - Reject when: absent/empty; equal to the `[<stem>] finish` default;
-    a bare placeholder (case-insensitive trimmed: `finish`, `finished`,
-    `done`, `wip`, `complete`, `[<stem>] finish`); or below a length floor
-    (heuristic — e.g. the subject, after stripping a leading `[<stem>] `,
-    is under ~20 chars). Length is a crude proxy; the ERROR does the real
-    teaching.
+  - Reject when: absent/empty; a bare placeholder subject (case-insensitive,
+    with a leading `[<stem>]` and trailing dots stripped: `finish`, `finished`,
+    `done`, `wip`, `complete`) — which also catches the `[<stem>] finish`
+    default; or — the PRIMARY check (ruthless 3018ae6) — a subject-only
+    message with NO WHY body. Key on the body, not a subject-length floor: a
+    length floor false-rejects a concise subject with a real WHY, and worse
+    false-ACCEPTS a long subject with no WHY (silently, since the error only
+    fires on reject). Keep a tiny body-length floor only as a secondary guard
+    against a trivially-empty body. The ERROR does the real teaching.
   - The rejection error must be educational, not just "too short": explain
     that the finish message is the whole plan's commit message — state the
     WHAT briefly and especially the WHY — and show the shape
@@ -62,6 +65,19 @@ message at squash time (`finish --squash` reading it; a batch `clank squash
   WHY in the body — because it IS the plan's squash message; never "finish".
   (`clank setup` reinstalls the skill; note in Deploy.)
 
+## Rewrite a finished plan's message with a bare `-m`
+
+Since the finish message now matters (it's the squash summary), make fixing
+it ergonomic: `clank finish <plan> -m "<better message>"` on an ALREADY-
+finished plan just rewrites the finalize commit's message — no `--amend`
+ceremony. Routes to the existing `amend_already_finished` (re-commit HEAD
+with the new message, finalize tree untouched), gated on
+`require_head_is_finalize` (HEAD must be the plan's finalize commit; clear
+error if work is stacked on top). Fires only for a bare `-m` (no `--amend`,
+no `--purge`/`--squash` — those keep their existing paths). The new message
+runs through the same `validate_finish_message`, so you can't rewrite it back
+to a placeholder.
+
 ## Decision to flag for review
 
 **Hard reject vs. warn.** The user leans reject ("reject short messages like
@@ -74,13 +90,15 @@ real need shows up.
 
 ## Tests
 
-- `validate_finish_message`: rejects empty, `finish`, `[<stem>] finish`,
-  `done`/`wip`, and a sub-floor subject; accepts a real
-  `[<stem>] <subject>\n\n<why>` message.
+- `validate_finish_message`: rejects `None`/empty, `finish`, `[<stem>] finish`,
+  `done`/`wip`; rejects a subject-only message EVEN when the subject is long
+  (the false-accept guard); accepts a concise subject + real WHY body.
 - The finalize path via `run()` (in-process, no binary spawn) bails with the
   educational error when `-m` is absent or a placeholder, and succeeds with a
   good message (finish commit lands with that message).
 - `--amend` re-commit enforces the same bar.
+- The bare-`-m`-on-finished path rewrites the finalize commit's message (and
+  still validates it).
 - Existing finalize unit tests that call `finalize(..., None)` keep passing
   (the requirement lives in `run()`, not `finalize()`).
 
@@ -90,6 +108,8 @@ real need shows up.
   rejected with a message teaching WHAT-briefly + WHY-especially; the default
   `[<stem>] finish` message can no longer land via the finalize path.
 - A good `-m` finalizes as today, with that message on the finish commit.
+- `clank finish <plan> -m "<better>"` on an already-finished plan rewrites the
+  finalize commit's message (validated), with no `--amend` needed.
 - skill_master.md instructs the whole-plan-commit-message convention.
 - clippy at baseline; tests pass.
 
