@@ -179,6 +179,59 @@ mod tests {
             Command::Wait(_)
         ));
     }
+
+    /// Pin the EXACT argv the TUI spawns to open a page (parent `html` flags
+    /// before the `open` subcommand). Exercises the real builder — a
+    /// flags-after-subcommand regression fails here at build time instead of
+    /// silently at runtime (the TUI spawns detached with nulled output).
+    #[test]
+    fn html_open_argv_parses() {
+        use cli::html::{HtmlOpenTarget, html_open_argv};
+        use cli::{HtmlCmd, HtmlOpenArgs};
+        use std::path::Path;
+
+        let parse = |argv: Vec<String>| {
+            Cli::try_parse_from(std::iter::once("clank".to_string()).chain(argv))
+                .expect("spawned argv must parse")
+                .command
+        };
+
+        // Plan target → open <stem>, --repo/--quiet on the parent.
+        match parse(html_open_argv(
+            Path::new("/r"),
+            HtmlOpenTarget::Plan("foo"),
+            false,
+        )) {
+            Command::Html(h) => {
+                assert_eq!(h.repo.as_deref(), Some(Path::new("/r")));
+                assert!(h.quiet);
+                assert!(!h.rebuild);
+                let Some(HtmlCmd::Open(HtmlOpenArgs { plan, commit, .. })) = h.command else {
+                    panic!("expected html open");
+                };
+                assert_eq!(plan.as_deref(), Some("foo"));
+                assert_eq!(commit, None);
+            }
+            _ => panic!("expected html command"),
+        }
+
+        // Commit target with rebuild → --rebuild before `open --commit <sha>`.
+        match parse(html_open_argv(
+            Path::new("/r"),
+            HtmlOpenTarget::Commit("abc123"),
+            true,
+        )) {
+            Command::Html(h) => {
+                assert!(h.rebuild);
+                let Some(HtmlCmd::Open(HtmlOpenArgs { plan, commit, .. })) = h.command else {
+                    panic!("expected html open");
+                };
+                assert_eq!(plan, None);
+                assert_eq!(commit.as_deref(), Some("abc123"));
+            }
+            _ => panic!("expected html command"),
+        }
+    }
 }
 
 fn init_tracing() {

@@ -385,6 +385,39 @@ fn read_plan_markdown(repo: &std::path::Path, stem: &str) -> Option<String> {
     None
 }
 
+/// What an open overlay can render as HTML — a plan stem or a full commit
+/// sha, owned so the overlay's borrow is released before dispatch.
+enum HtmlTarget {
+    Plan(String),
+    Commit(String),
+}
+
+/// Open the overlay's plan/commit as its rendered HTML page in the host
+/// browser. Spawns the built `clank` DETACHED with stdio nulled: the TUI
+/// owns the terminal (raw/alt-screen), so build progress must not print into
+/// the pane, and detaching lets the browser open when the incremental build
+/// finishes without freezing the loop. For a commit whose page was evicted
+/// from the incremental window, pass `--rebuild` so the open still succeeds.
+fn open_overlay_in_browser(repo: &std::path::Path, target: &HtmlTarget) {
+    use crate::cli::html::HtmlOpenTarget;
+    let (open_target, rebuild) = match target {
+        HtmlTarget::Plan(stem) => (HtmlOpenTarget::Plan(stem.as_str()), false),
+        HtmlTarget::Commit(sha) => {
+            let page = repo.join(format!(".clank/html/commit/{sha}.html"));
+            (HtmlOpenTarget::Commit(sha.as_str()), !page.exists())
+        }
+    };
+    let argv = crate::cli::html::html_open_argv(repo, open_target, rebuild);
+    if let Ok(exe) = std::env::current_exe() {
+        let _ = std::process::Command::new(exe)
+            .args(&argv)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    }
+}
+
 /// Minimum wall-clock between status rebuilds. Coalesces a burst of
 /// watcher wakes into at most one rebuild per interval — defense-in-depth
 /// atop the (nested-aware) ignore filter, so even non-ignored churn can't
@@ -569,6 +602,13 @@ pub(crate) async fn run_tui(
                     cols as usize,
                 ),
             };
+            // Extract the html-open target by value up front so the
+            // `OpenHtml` arm doesn't hold a borrow of `detail` (the `Back`
+            // arm mutates it).
+            let html_target: HtmlTarget = match &overlay.data {
+                OverlayData::Commit(d) => HtmlTarget::Commit(d.sha.as_str().to_string()),
+                OverlayData::Plan { stem, .. } => HtmlTarget::Plan(stem.clone()),
+            };
             paint(&lines);
             match ev_rx.recv_timeout(Duration::from_secs(60)) {
                 Ok(Ev::Key(k)) => match doc_nav(k, page) {
@@ -577,6 +617,7 @@ pub(crate) async fn run_tui(
                         let max_off = total.saturating_sub((rows as usize).max(1));
                         detail.as_mut().unwrap().scroll(delta, max_off);
                     }
+                    DocNav::OpenHtml => open_overlay_in_browser(&repo, &html_target),
                     DocNav::None => {}
                 },
                 // Data changed under us — re-fetch by IDENTITY (commit sha /
@@ -788,7 +829,8 @@ pub(crate) async fn run_tui(
                             | Key::Left
                             | Key::Right
                             | Key::Yes
-                            | Key::No => {}
+                            | Key::No
+                            | Key::Html => {}
                         },
                         // Confirm: one decision, resolved in one place.
                         Mode::Confirm { action } => {
@@ -866,7 +908,8 @@ pub(crate) async fn run_tui(
                             | Key::Right
                             | Key::Delete
                             | Key::Yes
-                            | Key::No => {}
+                            | Key::No
+                            | Key::Html => {}
                         },
                     }
                     log.request_fill();

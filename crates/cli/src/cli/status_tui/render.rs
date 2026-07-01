@@ -871,16 +871,40 @@ pub(super) fn build_commit_lines(
     let mut review_line = std::collections::BTreeMap::new();
     // The rule title is upper-cased, so keep the (lowercase) sha out of it
     // and on the subject line with the message.
-    lines.push(region_rule("commit", "↑↓ scroll · Esc back", true, cols));
-    lines.push(String::new());
-    lines.push(emit(
-        &[
-            dim(format!("{short_sha}  ")),
-            plain(one_line(subject, cols)),
-        ],
-        "",
+    lines.push(region_rule(
+        "commit",
+        "↑↓ scroll · o browser · Esc back",
+        true,
         cols,
     ));
+    lines.push(String::new());
+    // WRAP the subject (don't truncate) so a long summary is fully readable:
+    // the sha leads the first line; continuations align under the subject.
+    let sha_prefix = format!("{short_sha}  ");
+    let gutter = display_width(&sha_prefix);
+    let subject_line: String = subject
+        .lines()
+        .next()
+        .unwrap_or("")
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect();
+    let wrapped = wrap(&subject_line, cols.saturating_sub(gutter).max(1));
+    if wrapped.is_empty() {
+        lines.push(emit(&[dim(sha_prefix.clone())], "", cols));
+    } else {
+        for (i, seg) in wrapped.into_iter().enumerate() {
+            if i == 0 {
+                lines.push(emit(&[dim(sha_prefix.clone()), plain(seg)], "", cols));
+            } else {
+                lines.push(emit(
+                    &[plain(format!("{}{}", " ".repeat(gutter), seg))],
+                    "",
+                    cols,
+                ));
+            }
+        }
+    }
     lines.push(String::new());
     for line in wrap(body, cols) {
         lines.push(emit(&[plain(line)], "", cols));
@@ -962,7 +986,12 @@ pub(super) fn render_plan_doc(
     cols: usize,
 ) -> (Vec<String>, usize) {
     let mut content: Vec<String> = Vec::new();
-    content.push(region_rule(stem, "↑↓ scroll · Esc back", true, cols));
+    content.push(region_rule(
+        stem,
+        "↑↓ scroll · o browser · Esc back",
+        true,
+        cols,
+    ));
     content.push(String::new());
     match markdown {
         Some(md) => content.extend(super::markdown::render_markdown(md, cols)),
@@ -2158,6 +2187,45 @@ mod tests {
             visible(&lines[0]),
             "offset shifts the visible window"
         );
+    }
+
+    #[test]
+    fn commit_detail_wraps_a_long_subject_instead_of_truncating() {
+        // A subject wider than the pane must WRAP across multiple lines with
+        // every word readable — never truncated with an ellipsis.
+        let subject =
+            "[a-really-long-plan-name] make the thing work end to end without going off the screen";
+        let cols = 40;
+        let (lines, _) = render_commit_detail("abc1234", subject, "", &[], 0, 40, cols);
+        let visibles: Vec<String> = lines.iter().map(|l| visible(l)).collect();
+        let joined = visibles.join("\n");
+        // Every word of the subject survives (nothing dropped to an
+        // ellipsis) — the strongest anti-truncation check.
+        for word in subject.split_whitespace() {
+            assert!(joined.contains(word), "word `{word}` missing: {joined}");
+        }
+        // The sha still leads the first subject line, and the subject spilled
+        // onto more than one line (i.e. it actually wrapped).
+        let sha_line = visibles
+            .iter()
+            .position(|l| l.contains("abc1234"))
+            .expect("sha line present");
+        assert!(visibles[sha_line].contains("[a-really-long-plan-name]"));
+        let last_word_line = visibles
+            .iter()
+            .position(|l| l.contains("screen"))
+            .expect("last word present");
+        assert!(
+            last_word_line > sha_line,
+            "subject wrapped onto a later line: {joined}"
+        );
+        // Nothing exceeds the pane width.
+        for l in &visibles {
+            assert!(
+                display_width(l.trim_end()) <= cols,
+                "line wider than {cols}: {l:?}"
+            );
+        }
     }
 
     #[test]

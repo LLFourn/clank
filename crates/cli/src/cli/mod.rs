@@ -230,6 +230,11 @@ pub struct HtmlOpenArgs {
     /// against active plans first, then finished — same shape
     /// as `clank diff <plan>`.
     pub plan: Option<String>,
+    /// Commit sha (short or full). When supplied, the browser
+    /// opens `commit/<full_sha>.html`. Mutually exclusive with a
+    /// plan name.
+    #[arg(long, conflicts_with = "plan", value_name = "SHA")]
+    pub commit: Option<String>,
     /// Print the resolved target path on stdout and exit
     /// without launching a browser. Mirrors `--print` on
     /// `clank agent start`, `clank diff`, `clank open zellij`.

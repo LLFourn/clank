@@ -39,6 +39,9 @@ pub(super) enum Key {
     Yes,
     /// `n` — decline.
     No,
+    /// `o` — open the current plan/commit detail overlay as its rendered
+    /// HTML page in the browser. A no-op outside an overlay.
+    Html,
 }
 
 /// Which region (and sub-state) owns the keyboard. The backbone of key
@@ -163,6 +166,8 @@ pub(super) enum DocNav {
     None,
     Back,
     Scroll(i32),
+    /// `o` — open the overlay's plan/commit as its HTML page in the browser.
+    OpenHtml,
 }
 
 /// Pure key routing for a document overlay. `page` is the viewport height
@@ -176,6 +181,7 @@ pub(super) fn doc_nav(key: Key, page: usize) -> DocNav {
         Key::Down => DocNav::Scroll(1),
         Key::PageUp => DocNav::Scroll(-page),
         Key::Space | Key::PageDown => DocNav::Scroll(page),
+        Key::Html => DocNav::OpenHtml,
         _ => DocNav::None,
     }
 }
@@ -362,6 +368,7 @@ pub(super) fn parse_keys(bytes: &[u8]) -> Vec<Key> {
                 0x7f | 0x08 => keys.push(Key::Delete),
                 b'y' => keys.push(Key::Yes),
                 b'n' => keys.push(Key::No),
+                b'o' => keys.push(Key::Html),
                 0x1b => keys.push(Key::Escape),
                 b'q' => keys.push(Key::Quit),
                 _ => {}
@@ -672,7 +679,14 @@ mod tests {
         assert_eq!(doc_nav(Key::Enter, 10), DocNav::Back);
         assert_eq!(doc_nav(Key::Quit, 10), DocNav::Back);
         assert_eq!(doc_nav(Key::Left, 10), DocNav::Back);
+        // `o` opens the overlay's page in the browser.
+        assert_eq!(doc_nav(Key::Html, 10), DocNav::OpenHtml);
         // Unmapped keys do nothing.
         assert_eq!(doc_nav(Key::Yes, 10), DocNav::None);
+    }
+
+    #[test]
+    fn parse_keys_maps_o_to_html() {
+        assert_eq!(parse_keys(b"o"), vec![Key::Html]);
     }
 }

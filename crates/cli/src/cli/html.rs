@@ -99,6 +99,21 @@ async fn resolve_open_target(
     out_dir: &Path,
     args: &crate::cli::HtmlOpenArgs,
 ) -> anyhow::Result<std::path::PathBuf> {
+    // Commit target: resolve short→full and open `commit/<full>.html`.
+    // An older commit outside the incremental window has no built page, so
+    // error with a rebuild hint rather than opening a 404.
+    if let Some(raw) = args.commit.as_deref() {
+        let sha = crate::git_io::resolve_commit(repo, raw)
+            .ok_or_else(|| anyhow::anyhow!("not a known commit: `{raw}`"))?;
+        let page = out_dir.join(format!("commit/{}.html", sha.as_str()));
+        if !page.exists() {
+            anyhow::bail!(
+                "no HTML page for commit {} yet (outside the incremental window) — run `clank html --rebuild`",
+                &sha.as_str()[..sha.as_str().len().min(12)]
+            );
+        }
+        return Ok(page);
+    }
     match args.plan.as_deref() {
         Some(raw) => {
             let state =
@@ -112,6 +127,42 @@ async fn resolve_open_target(
         }
         None => Ok(out_dir.join("index.html")),
     }
+}
+
+/// The command-line target for opening a plan/commit page in the browser.
+pub enum HtmlOpenTarget<'a> {
+    Plan(&'a str),
+    Commit(&'a str),
+}
+
+/// Build the argv (after the program name) the TUI spawns to open a
+/// plan/commit page: `html --repo <repo> --quiet open <target>`. The parent
+/// `html` flags (`--repo`, `--quiet`) MUST precede the `open` subcommand —
+/// clap parses them at the parent, so `open <plan> --quiet` fails. Pure and
+/// pinned by `html_open_argv_parses` so a flags-after-subcommand regression
+/// fails at build time rather than silently at runtime (the TUI spawns
+/// detached with nulled output). See `status_tui`'s overlay handler.
+/// `rebuild` forces a full re-render (parent `--rebuild`) — used when the
+/// target's incremental page is missing so the open still succeeds.
+pub fn html_open_argv(repo: &Path, target: HtmlOpenTarget, rebuild: bool) -> Vec<String> {
+    let mut argv = vec![
+        "html".to_string(),
+        "--repo".to_string(),
+        repo.to_string_lossy().into_owned(),
+        "--quiet".to_string(),
+    ];
+    if rebuild {
+        argv.push("--rebuild".to_string());
+    }
+    argv.push("open".to_string());
+    match target {
+        HtmlOpenTarget::Plan(stem) => argv.push(stem.to_string()),
+        HtmlOpenTarget::Commit(sha) => {
+            argv.push("--commit".to_string());
+            argv.push(sha.to_string());
+        }
+    }
+    argv
 }
 
 async fn build_site(
