@@ -32,6 +32,27 @@ pub async fn run(args: HtmlArgs) -> anyhow::Result<()> {
     let out_dir = repo.join(".clank/html");
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
     let progress = Progress::new(args.quiet);
+
+    // `clank html open <target>` (without --print-path) launches the browser.
+    // Route it through the loading-page flow so a slow first build shows the
+    // browser a live progress page IMMEDIATELY instead of nothing.
+    if let Some(HtmlCmd::Open(open_args)) = &args.command
+        && !open_args.print_path
+    {
+        return run_open(
+            &repo,
+            &basename,
+            &out_dir,
+            home.as_deref(),
+            args.rebuild,
+            &progress,
+            open_args,
+        )
+        .await;
+    }
+
+    // Otherwise: build first, then note the output (bare `clank html`) or
+    // print the resolved target path (`open --print-path`).
     build_site(
         &repo,
         &basename,
@@ -39,36 +60,107 @@ pub async fn run(args: HtmlArgs) -> anyhow::Result<()> {
         home.as_deref(),
         args.rebuild,
         &progress,
+        None,
     )
     .await?;
     progress.finish();
 
-    // Under `--print-path`, stdout must contain ONLY the resolved
-    // path so callers can use `$(clank html open <plan> --print-path)`
-    // verbatim. Route the build-info line to stderr in that mode.
-    // Codex caught the dual-line stdout on dfe596d.
-    let print_path = matches!(
-        args.command,
-        Some(HtmlCmd::Open(crate::cli::HtmlOpenArgs {
-            print_path: true,
-            ..
-        }))
-    );
-    if print_path {
+    // Under `--print-path`, stdout must contain ONLY the resolved path so
+    // callers can use `$(clank html open <plan> --print-path)` verbatim; the
+    // build-info line goes to stderr (codex dfe596d).
+    if let Some(HtmlCmd::Open(open_args)) = &args.command {
         eprintln!("wrote {}", out_dir.display());
+        let target = resolve_open_target(&repo, &basename, &out_dir, open_args).await?;
+        println!("{}", target.display());
     } else {
         println!("wrote {}", out_dir.display());
     }
+    Ok(())
+}
 
-    if let Some(HtmlCmd::Open(open_args)) = args.command {
-        let target = resolve_open_target(&repo, &basename, &out_dir, &open_args).await?;
-        if open_args.print_path {
-            println!("{}", target.display());
-        } else {
-            launch_opener(&target)?;
+/// The browser-launch path of `clank html open`. Fast when the target page
+/// already exists (build → open); for a missing target (the slow first-time
+/// case) it opens the browser on a live [`LoadingPage`] FIRST, then builds
+/// behind it — the page auto-redirects into the report when the build lands,
+/// or shows an error state if it fails (the only feedback when the TUI spawns
+/// this detached).
+async fn run_open(
+    repo: &Path,
+    basename: &str,
+    out_dir: &Path,
+    home: Option<&Path>,
+    rebuild: bool,
+    progress: &Progress,
+    open_args: &crate::cli::HtmlOpenArgs,
+) -> anyhow::Result<()> {
+    let target = resolve_open_target_path(repo, basename, out_dir, open_args).await?;
+
+    if target.exists() {
+        build_site(repo, basename, out_dir, home, rebuild, progress, None).await?;
+        progress.finish();
+        println!("wrote {}", out_dir.display());
+        return launch_opener(&target);
+    }
+
+    let loading = LoadingPage::new(
+        out_dir.join("_loading.html"),
+        target_rel_url(out_dir, &target),
+        open_target_label(open_args),
+    );
+    launch_opener(&loading.path)?;
+    println!("wrote {}", out_dir.display());
+    match build_site(
+        repo,
+        basename,
+        out_dir,
+        home,
+        rebuild,
+        progress,
+        Some(&loading),
+    )
+    .await
+    {
+        Ok(()) if target.exists() => {
+            progress.finish();
+            loading.finish_ok();
+            Ok(())
+        }
+        Ok(()) => {
+            progress.finish();
+            loading.finish_err(
+                "that page isn't part of the built site yet — run `clank html --rebuild`",
+            );
+            Ok(())
+        }
+        Err(e) => {
+            progress.finish();
+            loading.finish_err(&format!("build failed: {e}"));
+            Err(e)
         }
     }
-    Ok(())
+}
+
+/// The target page RELATIVE to the html root, for the loading page's
+/// redirect meta — `_loading.html` and the target both live under `out_dir`,
+/// so the redirect must be `commit/<sha>.html` (relative), never absolute or
+/// wrong-based (a classic file:// bug). Forward slashes on every platform.
+fn target_rel_url(out_dir: &Path, target: &Path) -> String {
+    target
+        .strip_prefix(out_dir)
+        .unwrap_or(target)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+/// A short label for the open target: `commit a1b2c3d` / `plan foo`.
+fn open_target_label(args: &crate::cli::HtmlOpenArgs) -> String {
+    if let Some(sha) = &args.commit {
+        format!("commit {}", &sha[..sha.len().min(9)])
+    } else if let Some(plan) = &args.plan {
+        format!("plan {plan}")
+    } else {
+        "the report".to_string()
+    }
 }
 
 /// Generate the HTML site into `out_dir` (quietly), via the same
@@ -84,7 +176,7 @@ pub async fn generate(
 ) -> anyhow::Result<()> {
     let basename = repo_basename(repo)?;
     let progress = Progress::new(true);
-    build_site(repo, &basename, out_dir, home, rebuild, &progress).await
+    build_site(repo, &basename, out_dir, home, rebuild, &progress, None).await
 }
 
 /// Resolve the target file the browser (or `--print-path`) lands on.
@@ -99,20 +191,36 @@ async fn resolve_open_target(
     out_dir: &Path,
     args: &crate::cli::HtmlOpenArgs,
 ) -> anyhow::Result<std::path::PathBuf> {
-    // Commit target: resolve short→full and open `commit/<full>.html`.
-    // An older commit outside the incremental window has no built page, so
-    // error with a rebuild hint rather than opening a 404.
+    let page = resolve_open_target_path(repo, basename, out_dir, args).await?;
+    // Commit target outside the incremental window has no built page — error
+    // with a rebuild hint rather than opening a 404 (the browser-launch path
+    // handles the same case via the loading page's error state instead).
+    if args.commit.is_some() && !page.exists() {
+        let name = page
+            .file_stem()
+            .map(|s| s.to_string_lossy())
+            .unwrap_or_default();
+        anyhow::bail!(
+            "no HTML page for commit {} yet (outside the incremental window) — run `clank html --rebuild`",
+            &name[..name.len().min(12)]
+        );
+    }
+    Ok(page)
+}
+
+/// Resolve the target page PATH without checking that it exists yet (the
+/// loading-page flow may be about to build it). Short shas / plan names are
+/// resolved to their full page path.
+async fn resolve_open_target_path(
+    repo: &Path,
+    basename: &str,
+    out_dir: &Path,
+    args: &crate::cli::HtmlOpenArgs,
+) -> anyhow::Result<std::path::PathBuf> {
     if let Some(raw) = args.commit.as_deref() {
         let sha = crate::git_io::resolve_commit(repo, raw)
             .ok_or_else(|| anyhow::anyhow!("not a known commit: `{raw}`"))?;
-        let page = out_dir.join(format!("commit/{}.html", sha.as_str()));
-        if !page.exists() {
-            anyhow::bail!(
-                "no HTML page for commit {} yet (outside the incremental window) — run `clank html --rebuild`",
-                &sha.as_str()[..sha.as_str().len().min(12)]
-            );
-        }
-        return Ok(page);
+        return Ok(out_dir.join(format!("commit/{}.html", sha.as_str())));
     }
     match args.plan.as_deref() {
         Some(raw) => {
@@ -172,6 +280,7 @@ async fn build_site(
     home: Option<&Path>,
     mut force_rebuild: bool,
     progress: &Progress,
+    loading: Option<&LoadingPage>,
 ) -> anyhow::Result<()> {
     std::fs::create_dir_all(out_dir)?;
     std::fs::create_dir_all(out_dir.join("commit"))?;
@@ -294,28 +403,18 @@ async fn build_site(
             !exists || top_n_sha_set.contains(s)
         })
         .collect();
-    progress.begin("writing pages", writes_needed.len());
-    for (i, event) in writes_needed.iter().enumerate() {
-        let sha = event_sha(event);
-        let path = out_dir.join(format!("commit/{}.html", sha.as_str()));
-        let page = render_commit_page(repo, event, &reviews);
-        std::fs::write(&path, page)?;
-        progress.tick(i + 1);
-    }
-    progress.end();
 
-    // Plan pages. One per active or finished plan.
+    // Plan-page set. Hoisted above the commit write loop (it only needs
+    // `events` + `writes_needed`) so the loading page can announce a single
+    // accurate page total up front.
     //
-    // On full rebuild every page is rewritten. On incremental,
-    // affected = (slice plans) ∪ (plans whose commits are in
-    // writes_needed). The second term covers feedback-only
-    // rebuilds at the same HEAD: a new review on a top-N
-    // commit changes the verdict marks that the plan page
-    // also renders, so the page must refresh too. The cost is
-    // that an unrelated slice still re-renders plan pages
-    // whose commits happen to be in top-N — acceptable; they
-    // age out of top-N quickly and the rendered output is
-    // identical when reviews haven't actually changed.
+    // On full rebuild every page is rewritten. On incremental, affected =
+    // (slice plans) ∪ (plans whose commits are in writes_needed). The second
+    // term covers feedback-only rebuilds at the same HEAD: a new review on a
+    // top-N commit changes the verdict marks that the plan page also renders,
+    // so the page must refresh too. Cost: an unrelated slice re-renders plan
+    // pages whose commits happen to be in top-N — acceptable; they age out of
+    // top-N quickly and the output is identical when reviews didn't change.
     let plan_buckets = collect_plan_buckets(&events);
     let affected: std::collections::HashSet<String> = if force_rebuild {
         plan_buckets.keys().cloned().collect()
@@ -329,6 +428,28 @@ async fn build_site(
         .iter()
         .filter(|(stem, _)| affected.contains(stem.as_str()))
         .collect();
+
+    // Total pages = index (already written above) + commit pages + plan
+    // pages. Count the index as the first tick.
+    if let Some(l) = loading {
+        l.set_total(1 + writes_needed.len() + plan_writes.len());
+        l.tick();
+    }
+
+    progress.begin("writing pages", writes_needed.len());
+    for (i, event) in writes_needed.iter().enumerate() {
+        let sha = event_sha(event);
+        let path = out_dir.join(format!("commit/{}.html", sha.as_str()));
+        let page = render_commit_page(repo, event, &reviews);
+        std::fs::write(&path, page)?;
+        progress.tick(i + 1);
+        if let Some(l) = loading {
+            l.tick();
+        }
+    }
+    progress.end();
+
+    // Plan pages. One per active or finished plan.
     let work_by_stem: BTreeMap<String, &PlanWorkState> = status
         .plans
         .iter()
@@ -352,6 +473,9 @@ async fn build_site(
         );
         std::fs::write(out_dir.join(format!("plan/{stem}.html")), page)?;
         progress.tick(i + 1);
+        if let Some(l) = loading {
+            l.tick();
+        }
     }
     progress.end();
 
@@ -469,6 +593,269 @@ impl Progress {
             return;
         }
         eprint!("\x1b[2K\r");
+    }
+}
+
+/// The state the loading page renders. `clank html open` opens the browser
+/// on this page before the (slow, first-time) build and rewrites it as the
+/// build advances, so the browser has immediate feedback and auto-redirects
+/// into the finished report.
+enum LoadingState<'a> {
+    /// Build hasn't reported a page total yet.
+    Preparing,
+    /// `done` of `total` pages written.
+    Building { done: usize, total: usize },
+    /// Build finished; `url` is the target page RELATIVE to the html root.
+    Done { url: &'a str },
+    /// Build failed / the target page was never produced.
+    Error { message: &'a str },
+}
+
+/// Number of cells in the block progress bar.
+const BAR_CELLS: usize = 28;
+
+/// Render the self-contained loading page (inline CSS, system monospace —
+/// file:// is offline). A "phosphor console" watching the build happen live:
+/// warm near-black ground, one amber-phosphor accent, a block progress bar,
+/// a ring spinner. Dark bg is set inline on `<html>` + `color-scheme:dark`
+/// so the 1s meta-refresh never white-flashes; every animation is a clean 1s
+/// loop so a reload restarts it seamlessly. Pure — unit-tested.
+fn render_loading_page(label: &str, state: LoadingState) -> String {
+    // State drives the `<head>` refresh directive + the accent colour.
+    let (head_refresh, accent, is_error) = match &state {
+        LoadingState::Preparing | LoadingState::Building { .. } => (
+            "<meta http-equiv=\"refresh\" content=\"1\">".to_string(),
+            "#ffb454",
+            false,
+        ),
+        LoadingState::Done { url } => (
+            format!(
+                "<meta http-equiv=\"refresh\" content=\"0; url={}\">",
+                esc(url)
+            ),
+            "#ffb454",
+            false,
+        ),
+        // Error: NO refresh — stop the loop so it isn't an infinite spinner.
+        LoadingState::Error { .. } => (String::new(), "#f26d6d", true),
+    };
+
+    // The bar + count + status line differ per state.
+    let (filled, empty, count, status) = match &state {
+        LoadingState::Preparing => (
+            0usize,
+            BAR_CELLS,
+            "preparing…".to_string(),
+            "reading the repository",
+        ),
+        LoadingState::Building { done, total } => {
+            let total = (*total).max(1);
+            let done = (*done).min(total);
+            let filled = (done * BAR_CELLS).div_ceil(total).min(BAR_CELLS);
+            (
+                filled,
+                BAR_CELLS - filled,
+                format!("{done} / {total} pages"),
+                "building the site",
+            )
+        }
+        LoadingState::Done { .. } => (BAR_CELLS, 0, "done".to_string(), "opening your report"),
+        LoadingState::Error { message } => (0, BAR_CELLS, "failed".to_string(), *message),
+    };
+    let bar = format!(
+        "<span class=\"fill\">{}</span><span class=\"track\">{}</span>",
+        "\u{2593}".repeat(filled),
+        "\u{2591}".repeat(empty),
+    );
+    // The spinner glyph: a rotating ring while working; ✓ done; ✗ error.
+    let glyph = match &state {
+        LoadingState::Done { .. } => "<span class=\"done-mark\">\u{2713}</span>",
+        LoadingState::Error { .. } => "<span class=\"err-mark\">\u{2717}</span>",
+        _ => "<span class=\"ring\"></span>",
+    };
+
+    format!(
+        r##"<!doctype html>
+<html lang="en" style="background:#0b0b0d">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+{head_refresh}
+<title>clank · building…</title>
+<style>
+:root {{
+  --bg:#0b0b0d; --fg:#e8e4d8; --dim:#6b6660; --accent:{accent}; --track:#1c1a17;
+}}
+* {{ box-sizing:border-box; }}
+html,body {{ height:100%; margin:0; background:var(--bg); }}
+body {{
+  color:var(--fg);
+  font:15px/1.5 ui-monospace,"SF Mono","JetBrains Mono","Cascadia Code",Menlo,Consolas,monospace;
+  display:grid; place-items:center;
+  /* faint phosphor vignette + grain */
+  background:
+    radial-gradient(120% 90% at 50% 0%, rgba(255,180,84,.05), transparent 60%),
+    var(--bg);
+}}
+body::after {{ /* subtle grain */
+  content:""; position:fixed; inset:0; pointer-events:none; opacity:.035;
+  background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='120' height='120'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='2'/></filter><rect width='100%' height='100%' filter='url(%23n)'/></svg>");
+}}
+.card {{ width:min(90vw,560px); padding:8px 4px; }}
+.brand {{ color:var(--dim); letter-spacing:.28em; text-transform:uppercase; font-size:11px; }}
+.brand b {{ color:var(--accent); font-weight:600; }}
+.brand .cur {{ display:inline-block; width:.5em; height:1em; vertical-align:-.15em;
+  background:var(--accent); margin-left:.15em; animation:blink 1s steps(2) infinite;
+  box-shadow:0 0 8px var(--accent); }}
+.target {{ margin:26px 0 22px; font-size:14px; color:var(--dim); }}
+.target b {{ color:var(--fg); font-weight:500; }}
+.meter {{ display:flex; align-items:center; gap:16px; }}
+.ring {{ width:20px; height:20px; border-radius:50%; flex:0 0 auto;
+  background:conic-gradient(var(--accent) 0 90deg, transparent 90deg 360deg);
+  -webkit-mask:radial-gradient(circle 6px, transparent 98%, #000 100%);
+          mask:radial-gradient(circle 6px, transparent 98%, #000 100%);
+  animation:spin 1s linear infinite; filter:drop-shadow(0 0 5px var(--accent)); }}
+.done-mark,.err-mark {{ width:20px; text-align:center; font-size:18px; }}
+.done-mark {{ color:var(--accent); text-shadow:0 0 8px var(--accent); }}
+.err-mark {{ color:var(--accent); text-shadow:0 0 8px var(--accent); }}
+.bar {{ font-size:15px; letter-spacing:1px; white-space:nowrap; overflow:hidden; }}
+.bar .fill {{ color:var(--accent); text-shadow:0 0 6px var(--accent);
+  animation:pulse 1s ease-in-out infinite; }}
+.bar .track {{ color:var(--track); }}
+.count {{ margin-top:14px; font-size:26px; color:var(--fg); font-weight:500;
+  text-shadow:0 0 10px rgba(255,180,84,.15); }}
+.count.err {{ color:var(--accent); }}
+.status {{ margin-top:6px; color:var(--dim); font-size:13px; }}
+.foot {{ margin-top:34px; color:var(--dim); font-size:11px; opacity:.7; }}
+@keyframes spin {{ to {{ transform:rotate(360deg); }} }}
+@keyframes pulse {{ 0%,100%{{opacity:.72}} 50%{{opacity:1}} }}
+@keyframes blink {{ 50%{{opacity:0}} }}
+</style>
+</head>
+<body>
+<main class="card">
+  <div class="brand"><b>clank</b> · html report<span class="cur"></span></div>
+  <div class="target">rendering&nbsp;&nbsp;<b>{label}</b></div>
+  <div class="meter">{glyph}<div class="bar">{bar}</div></div>
+  <div class="count{count_err}">{count}</div>
+  <div class="status">{status}</div>
+  <div class="foot">this page turns into your report automatically — no need to reload.</div>
+</main>
+<script>
+// Watchdog: if the build dies without writing an error state, stop spinning
+// after 60s and tell the reader where to look (the process is detached).
+setTimeout(function(){{
+  if(!document.querySelector('meta[http-equiv="refresh"]')) return;
+  document.title='clank · still building';
+}}, 60000);
+</script>
+</body>
+</html>
+"##,
+        head_refresh = head_refresh,
+        accent = accent,
+        label = esc(label),
+        glyph = glyph,
+        bar = bar,
+        count = esc(&count),
+        count_err = if is_error { " err" } else { "" },
+        status = esc(status),
+    )
+}
+
+/// The live loading page for one `clank html open`: opened in the browser
+/// before the build, rewritten (throttled to ~1s, matching the page's own
+/// meta-refresh) as the build advances, then finalized to a redirect (or an
+/// error). Interior mutability so `build_site` can drive it through a shared
+/// reference. Writes are atomic (temp + rename) so a refresh never catches a
+/// half-written file.
+pub(crate) struct LoadingPage {
+    path: std::path::PathBuf,
+    /// The target page, RELATIVE to the html root (e.g. `commit/<sha>.html`).
+    target_rel: String,
+    label: String,
+    total: std::cell::Cell<usize>,
+    done: std::cell::Cell<usize>,
+    last_write: std::cell::Cell<Option<std::time::Instant>>,
+}
+
+impl LoadingPage {
+    /// Create + write the initial "preparing" page.
+    fn new(path: std::path::PathBuf, target_rel: String, label: String) -> Self {
+        let lp = LoadingPage {
+            path,
+            target_rel,
+            label,
+            total: std::cell::Cell::new(0),
+            done: std::cell::Cell::new(0),
+            last_write: std::cell::Cell::new(None),
+        };
+        lp.write(render_loading_page(&lp.label, LoadingState::Preparing));
+        lp
+    }
+
+    /// Record the page total once the build knows it (writes immediately).
+    fn set_total(&self, total: usize) {
+        self.total.set(total);
+        self.render_progress(std::time::Instant::now());
+    }
+
+    /// One page written. Rewrites the loading page at most once per second
+    /// (its own refresh cadence) — see [`Self::tick_at`].
+    fn tick(&self) {
+        self.tick_at(std::time::Instant::now());
+    }
+
+    fn tick_at(&self, now: std::time::Instant) {
+        self.done.set(self.done.get() + 1);
+        let due = self
+            .last_write
+            .get()
+            .is_none_or(|t| now.duration_since(t) >= std::time::Duration::from_secs(1));
+        if due {
+            self.render_progress(now);
+        }
+    }
+
+    fn render_progress(&self, now: std::time::Instant) {
+        self.last_write.set(Some(now));
+        let state = if self.total.get() == 0 {
+            LoadingState::Preparing
+        } else {
+            LoadingState::Building {
+                done: self.done.get(),
+                total: self.total.get(),
+            }
+        };
+        self.write(render_loading_page(&self.label, state));
+    }
+
+    /// Build succeeded — redirect the browser to the finished page.
+    fn finish_ok(&self) {
+        self.write(render_loading_page(
+            &self.label,
+            LoadingState::Done {
+                url: &self.target_rel,
+            },
+        ));
+    }
+
+    /// Build failed / target never produced — show the error, stop the loop.
+    fn finish_err(&self, message: &str) {
+        self.write(render_loading_page(
+            &self.label,
+            LoadingState::Error { message },
+        ));
+    }
+
+    /// Atomic write (temp + rename) so a concurrent meta-refresh can't read a
+    /// half-written page.
+    fn write(&self, html: String) {
+        let tmp = self.path.with_extension("html.tmp");
+        if std::fs::write(&tmp, html).is_ok() {
+            let _ = std::fs::rename(&tmp, &self.path);
+        }
     }
 }
 
@@ -1752,6 +2139,91 @@ section h3 { font-size: .9rem; text-transform: uppercase; letter-spacing: .05em;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loading_page_building_state_shows_count_and_refreshes() {
+        let html = render_loading_page(
+            "commit a1b2c3d",
+            LoadingState::Building { done: 7, total: 16 },
+        );
+        assert!(html.contains("7 / 16 pages"), "count: {html}");
+        assert!(html.contains("commit a1b2c3d"), "target label");
+        // Self-refreshing while building.
+        assert!(html.contains(r#"<meta http-equiv="refresh" content="1">"#));
+        // No white flash: dark bg set inline + color-scheme.
+        assert!(html.contains(r#"<html lang="en" style="background:#0b0b0d">"#));
+        assert!(html.contains(r#"content="dark""#));
+        // Some cells filled, some track.
+        assert!(html.contains('\u{2593}') && html.contains('\u{2591}'));
+    }
+
+    #[test]
+    fn loading_page_done_state_redirects_to_the_relative_target() {
+        let html = render_loading_page(
+            "commit a1b2c3d",
+            LoadingState::Done {
+                url: "commit/abcdef.html",
+            },
+        );
+        // EXACT relative redirect — never absolute / wrong-based (file://).
+        assert!(
+            html.contains(r#"<meta http-equiv="refresh" content="0; url=commit/abcdef.html">"#),
+            "redirect: {html}"
+        );
+    }
+
+    #[test]
+    fn loading_page_error_state_stops_refreshing() {
+        let html = render_loading_page(
+            "commit a1b2c3d",
+            LoadingState::Error {
+                message: "build failed: boom",
+            },
+        );
+        // No refresh META element (the watchdog script may still name the
+        // selector, so match the actual tag, not the bare string).
+        assert!(
+            !html.contains(r#"<meta http-equiv="refresh""#),
+            "no refresh meta in error state"
+        );
+        assert!(html.contains("build failed: boom"));
+        assert!(html.contains("#f26d6d"), "error accent");
+    }
+
+    #[test]
+    fn target_rel_url_is_relative_to_the_html_root() {
+        let out = Path::new("/x/.clank/html");
+        assert_eq!(
+            target_rel_url(out, Path::new("/x/.clank/html/commit/abc.html")),
+            "commit/abc.html"
+        );
+        assert_eq!(
+            target_rel_url(out, Path::new("/x/.clank/html/plan/foo.html")),
+            "plan/foo.html"
+        );
+    }
+
+    #[test]
+    fn loading_page_throttles_rewrites_to_once_per_second() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("_loading.html");
+        let lp = LoadingPage::new(path.clone(), "commit/x.html".into(), "commit x".into());
+        lp.set_total(10);
+        let t0 = std::time::Instant::now();
+        // First tick just under 1s after the set_total write → throttled (no
+        // rewrite), so the file still shows 0.
+        lp.tick_at(t0);
+        lp.tick_at(t0 + std::time::Duration::from_millis(500));
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            body.contains("0 / 10 pages"),
+            "throttled: still 0; got count line"
+        );
+        // A tick past 1s rewrites with the accumulated count (3 so far).
+        lp.tick_at(t0 + std::time::Duration::from_secs(1));
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("3 / 10 pages"), "rewrote after 1s: {body}");
+    }
 
     #[test]
     fn render_markdown_highlights_fenced_block() {
