@@ -155,9 +155,26 @@ wait not being re-armed.
 - cli: `--peek` returns immediately with work / empty and never blocks, and
   **fires no hooks** — assert `run_hook`/`run_idle_hook` are not invoked in
   peek mode (both the work-present and no-work-master paths).
-- cli real-binary: bg + a bound repo where work exists → Silent (Case B);
-  bg + no work → Continue(hint) (Case A); clank wait present → Silent;
-  codex bg → Silent.
+- cli: `--peek` fires no hooks — two in-process `wait::run` tests
+  (`stop_hook_peek_no_hooks.rs`): a reviewer with a commit to review covers
+  `run_hook`, an idle master covers `run_idle_hook`; each asserts a non-peek
+  wait fires the hook and `--peek` does not.
+
+## Verification (real-binary, manual)
+
+The full stop-hook decision can't be an automated test (no-binary-spawning
+rule), so it was checked against the built binary, using this repo's bound
+agents (claude=master with work; ruthless=claude gate-reviewer with none):
+
+| case | payload | result |
+| --- | --- | --- |
+| clank wait armed | `bg=[clank wait]` | exit 0, Silent (pre-resolution) |
+| codex + process | codex, `bg=[sleep]` | exit 0, Silent (claude-only hint) |
+| **Case B** | claude master (has work), `bg=[sleep]` | exit 0, **Silent** (the loop fix) |
+| **Case A** | ruthless (claude reviewer, no work), `bg=[sleep]` | **exit 2, Continue(hint)** |
+
+`clank wait --peek` returns the master's item for claude/master and
+`{"items":[]}` for the work-free reviewer — the discriminator.
 
 ## Acceptance criteria
 
