@@ -41,14 +41,28 @@ The HTML site already builds per-plan and per-commit pages
   - `Commit(d)` → open `commit/<full_sha>.html` (the overlay carries the
     full `CommitSha`).
 - **Mechanism (flag for review):** the TUI is in raw-mode/alt-screen, so it
-  must not print build output into the pane. Spawn `clank html open …
-  --quiet` **detached** with stdout/stderr to null (precedent: the stop hook
-  self-spawns `clank wait`; production subprocesses are allowed — the
-  no-binary-spawn rule is test-only). Detached = the browser opens when the
-  incremental build finishes without freezing the loop. *Alternative:* call
-  `html::build_site` + `launch_opener` in-process — cleaner, but the build is
-  async and the TUI loop is sync (needs a runtime handle). Reviewer's call;
-  the plan leans spawn-detached for loop-responsiveness.
+  must not print build output into the pane. Spawn the built `clank`
+  (`current_exe`) **detached** with stdout/stderr to null (precedent: the
+  stop hook self-spawns `clank wait`; production subprocesses are allowed —
+  the no-binary-spawn rule is test-only). Detached = the browser opens when
+  the incremental build finishes without freezing the loop.
+- **CRITICAL — flag ordering (codex 70fbe03):** `--repo` and `--quiet` are
+  parent `html` flags, NOT `open` flags, so they must precede the
+  subcommand. The exact argv is:
+  - plan → `clank html --repo <repo> --quiet open <stem>`
+  - commit → `clank html --repo <repo> --quiet open --commit <full_sha>`
+
+  `clank html open <stem> --quiet` FAILS to parse — and because we detach and
+  null stderr, that failure is **silent** (no browser, no error). So the
+  wiring must build argv in this order, and a clap-parse test (below) pins
+  it. *Alternative considered:* mark `--quiet`/`--repo` `global = true` so
+  ordering can't break it — reviewer's call; the plan takes the
+  fixed-order + parse-test route to avoid changing the flag surface.
+
+  *In-process alternative:* call `html::build_site` + `launch_opener`
+  directly — cleaner and no argv/ordering risk, but the build is async and
+  the TUI loop is sync (needs a runtime handle). Reviewer's call; the plan
+  leans spawn-detached for loop-responsiveness.
 - Update the overlay's key hint (footer in `render_commit_detail` /
   `render_plan_doc`) to advertise the new key (e.g. `o open in browser`).
 
@@ -79,6 +93,12 @@ Fix: render the subject with `wrap` too, so the whole summary is readable:
   (short sha accepted); `--commit` + positional `plan` conflict; a
   no-built-page commit errors with the rebuild hint. (In-process, per the
   no-binary-spawn rule — call the resolver / clap parse, not the binary.)
+- **Pin the spawned argv form** (guards the silent-failure risk): the EXACT
+  argv the TUI builds — `["clank","html","--repo",R,"--quiet","open",S]` and
+  `["clank","html","--repo",R,"--quiet","open","--commit",SHA]` — parses via
+  `Cli::try_parse_from` to the expected `Html` command. If the wiring ever
+  regresses to flags-after-subcommand, this test fails at build time instead
+  of silently at runtime.
 - `doc_nav` routes the new key to `OpenHtml` and leaves scrolling/back
   intact (pure unit test).
 
