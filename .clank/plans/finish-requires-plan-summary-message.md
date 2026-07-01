@@ -66,6 +66,14 @@ message at squash time (`finish --squash` reading it; a batch `clank squash
     `Vec<String>` composed git-style (paragraphs joined by a blank line) via
     `compose_finish_message`, so the educational error's `-m "<subject>" -m
     "<why>"` form is actually accepted and naturally yields subject+body.
+  - **Stamp the transient finalize/amend commit with the LANDING message**
+    (codex 053f9d1): `finalize`/`amend` run BEFORE the post-finalize squash,
+    which can be refused (protected branch, etc.) after the commit exists —
+    leaving `[stem] finish` on HEAD. `finalize_commit_message(squash, -m)` =
+    the squash MSG when squashing, so a refused squash leaves the validated
+    message, never the placeholder. Regression: an in-process finish-run test
+    (`--amend --squash` on protected `main`) asserts HEAD keeps the squash
+    subject, not `[foo] finish`.
   - Decision to flag (below): hard reject vs. warn, and whether to add an
     escape hatch.
 - **`crates/cli/src/cli/mod.rs`**: update the `FinishArgs.message` doc

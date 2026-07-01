@@ -48,6 +48,12 @@ pub async fn run(args: FinishArgs) -> anyhow::Result<()> {
         validate_finish_message(final_msg, &stem)?;
     }
 
+    // The transient finalize/amend commit carries the message that ultimately
+    // LANDS — the squash MSG when squashing — so a post-finalize rewrite that
+    // is refused (e.g. protected-branch) leaves the validated message on HEAD,
+    // never the `[stem] finish` placeholder (codex 053f9d1).
+    let commit_message = finalize_commit_message(args.squash.as_deref(), message.as_deref());
+
     // Amend on an already-finished plan: rewrite HEAD's commit
     // (e.g. to refresh a stale message). The finalize tree is
     // already on disk, so skip the file-moving `finalize()` path.
@@ -56,7 +62,7 @@ pub async fn run(args: FinishArgs) -> anyhow::Result<()> {
         if args.dry && (args.purge || args.squash.is_some()) {
             return dry_run_finish_composite(&stem, &preview, &args);
         }
-        amend_already_finished(&repo, &stem, message.as_deref())?;
+        amend_already_finished(&repo, &stem, commit_message)?;
         println!("amended HEAD with finalize tree for `{stem}`");
         if args.purge || args.squash.is_some() {
             run_post_finalize_rewrite(&repo, &plan_key, args).await?;
@@ -75,7 +81,7 @@ pub async fn run(args: FinishArgs) -> anyhow::Result<()> {
             println!("# clank finish --dry: would rewrite the finish message for `{stem}`");
             return Ok(());
         }
-        amend_already_finished(&repo, &stem, message.as_deref())?;
+        amend_already_finished(&repo, &stem, commit_message)?;
         println!("rewrote finish message for `{stem}`");
         return Ok(());
     }
@@ -110,7 +116,7 @@ pub async fn run(args: FinishArgs) -> anyhow::Result<()> {
         return dry_run_finish_composite(&stem, &preview, &args);
     }
 
-    finalize(&repo, &stem, &preview, args.amend, message.as_deref()).await?;
+    finalize(&repo, &stem, &preview, args.amend, commit_message).await?;
 
     if args.amend {
         println!("amended HEAD with finalize tree for `{stem}`");
@@ -164,6 +170,16 @@ fn message_requiring_validation<'a>(
     } else {
         None
     }
+}
+
+/// The message to stamp on the transient finalize/amend commit: the squash
+/// MSG when squashing (so a refused squash rewrite leaves the validated
+/// landing message, not the `[stem] finish` placeholder), else the `-m`.
+fn finalize_commit_message<'a>(
+    squash: Option<&'a str>,
+    message: Option<&'a str>,
+) -> Option<&'a str> {
+    squash.or(message)
 }
 
 /// Secondary guard only: catch a trivially-empty WHY body (e.g. `.` or a
@@ -559,6 +575,17 @@ mod tests {
         assert!(validate_finish_message(Some(long_subject_no_body), "foo").is_err());
         // A trivially-empty body is also rejected (secondary floor).
         assert!(validate_finish_message(Some("real subject here\n\n."), "foo").is_err());
+    }
+
+    #[test]
+    fn finalize_commit_message_prefers_the_squash_landing_message() {
+        // When squashing, the finalize/amend commit is stamped with the squash
+        // MSG, so a refused squash leaves the validated message — not the
+        // `[stem] finish` placeholder (codex 053f9d1).
+        assert_eq!(finalize_commit_message(Some("sq"), Some("m")), Some("sq"));
+        assert_eq!(finalize_commit_message(Some("sq"), None), Some("sq"));
+        assert_eq!(finalize_commit_message(None, Some("m")), Some("m"));
+        assert_eq!(finalize_commit_message(None, None), None);
     }
 
     #[test]
