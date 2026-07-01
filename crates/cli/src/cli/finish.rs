@@ -29,18 +29,23 @@ pub async fn run(args: FinishArgs) -> anyhow::Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("finish preview failed: {e}"))?;
 
-    // The finish message is the plan's whole-plan commit summary, so it's
-    // mandatory on any path that authors the FINAL finish message: the
-    // finalize create, an `--amend` re-commit, or a bare `-m` message rewrite
-    // on an already-finished plan. When `--squash` is present the final
-    // message comes from `--squash`'s own MSG (the follow-up plan unifies
-    // them), so `-m` isn't forced there; and the non-authoring paths
-    // (retroactive squash reads history; a no-op finish) are exempt.
+    // Repeated `-m` values compose git-style: subject, blank line, body…
+    let message = compose_finish_message(&args.message);
+
+    // Validate the message that will BECOME the final finish commit's message.
+    // With `--squash` that's the squash MSG (the finalize/amend commit made
+    // first is collapsed away by `apply_squash`), so validating `-m` there
+    // would miss the real message. A `--purge` without `--squash` drops the
+    // finalize commit, so no finish message lands — nothing to validate.
     let already_finished = matches!(preview.readiness, FinalizeReadiness::AlreadyFinished);
-    let authors_final_message =
-        args.squash.is_none() && (!already_finished || args.amend || args.message.is_some());
-    if authors_final_message {
-        validate_finish_message(args.message.as_deref(), &stem)?;
+    if let Some(final_msg) = message_requiring_validation(
+        already_finished,
+        args.amend,
+        args.purge,
+        message.as_deref(),
+        args.squash.as_deref(),
+    ) {
+        validate_finish_message(final_msg, &stem)?;
     }
 
     // Amend on an already-finished plan: rewrite HEAD's commit
@@ -51,7 +56,7 @@ pub async fn run(args: FinishArgs) -> anyhow::Result<()> {
         if args.dry && (args.purge || args.squash.is_some()) {
             return dry_run_finish_composite(&stem, &preview, &args);
         }
-        amend_already_finished(&repo, &stem, args.message.as_deref())?;
+        amend_already_finished(&repo, &stem, message.as_deref())?;
         println!("amended HEAD with finalize tree for `{stem}`");
         if args.purge || args.squash.is_some() {
             run_post_finalize_rewrite(&repo, &plan_key, args).await?;
@@ -63,18 +68,14 @@ pub async fn run(args: FinishArgs) -> anyhow::Result<()> {
     // rewrites the finalize commit's message — the ergonomic way to fix or
     // improve the whole-plan summary after the finish landed, without the
     // `--amend` ceremony.
-    if already_finished
-        && args.message.is_some()
-        && !args.amend
-        && !args.purge
-        && args.squash.is_none()
+    if already_finished && message.is_some() && !args.amend && !args.purge && args.squash.is_none()
     {
         require_head_is_finalize(&repo, &stem)?;
         if args.dry {
             println!("# clank finish --dry: would rewrite the finish message for `{stem}`");
             return Ok(());
         }
-        amend_already_finished(&repo, &stem, args.message.as_deref())?;
+        amend_already_finished(&repo, &stem, message.as_deref())?;
         println!("rewrote finish message for `{stem}`");
         return Ok(());
     }
@@ -109,7 +110,7 @@ pub async fn run(args: FinishArgs) -> anyhow::Result<()> {
         return dry_run_finish_composite(&stem, &preview, &args);
     }
 
-    finalize(&repo, &stem, &preview, args.amend, args.message.as_deref()).await?;
+    finalize(&repo, &stem, &preview, args.amend, message.as_deref()).await?;
 
     if args.amend {
         println!("amended HEAD with finalize tree for `{stem}`");
@@ -121,6 +122,48 @@ pub async fn run(args: FinishArgs) -> anyhow::Result<()> {
         run_post_finalize_rewrite(&repo, &plan_key, args).await?;
     }
     Ok(())
+}
+
+/// Join repeated `-m` values into one message, git-style: each becomes a
+/// paragraph separated by a blank line. `None` when no `-m` was given.
+fn compose_finish_message(parts: &[String]) -> Option<String> {
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("\n\n"))
+    }
+}
+
+/// The message that will BECOME the final finish commit's message and so must
+/// be validated — or `None` if this invocation lands no finish message.
+///
+/// - `--squash` collapses the range into one commit carrying the squash MSG,
+///   so THAT is validated (the transient finalize/amend commit is squashed
+///   away by `apply_squash`).
+/// - `--purge` without `--squash` strips/drops the finalize commit, so no
+///   finish message lands.
+/// - otherwise the finalize/amend message is final on any authoring path
+///   (finalize create, `--amend`, or a bare `-m` rewrite on a finished plan);
+///   a no-op finish on an already-finished plan lands nothing.
+///
+/// The inner `Option<&str>` is the message itself — `Some(None)` means "a
+/// message is required here but none was supplied", which validation rejects.
+fn message_requiring_validation<'a>(
+    already_finished: bool,
+    amend: bool,
+    purge: bool,
+    message: Option<&'a str>,
+    squash: Option<&'a str>,
+) -> Option<Option<&'a str>> {
+    if squash.is_some() {
+        Some(squash)
+    } else if purge {
+        None
+    } else if !already_finished || amend || message.is_some() {
+        Some(message)
+    } else {
+        None
+    }
 }
 
 /// Secondary guard only: catch a trivially-empty WHY body (e.g. `.` or a
@@ -192,11 +235,7 @@ fn dry_run_finish_composite(
     println!("# clank finish --dry preview");
     println!("# plan: {}", preview.plan_id);
     let already_finished = matches!(preview.readiness, FinalizeReadiness::AlreadyFinished);
-    let msg = args
-        .message
-        .as_deref()
-        .map(str::to_string)
-        .unwrap_or_else(|| format!("[{stem}] finish"));
+    let msg = compose_finish_message(&args.message).unwrap_or_else(|| format!("[{stem}] finish"));
     if already_finished && args.amend {
         // --amend re-commits the existing finalize.
         println!("# would amend HEAD finalize commit:");
@@ -520,6 +559,81 @@ mod tests {
         assert!(validate_finish_message(Some(long_subject_no_body), "foo").is_err());
         // A trivially-empty body is also rejected (secondary floor).
         assert!(validate_finish_message(Some("real subject here\n\n."), "foo").is_err());
+    }
+
+    #[test]
+    fn compose_finish_message_joins_repeated_m_as_paragraphs() {
+        assert_eq!(compose_finish_message(&[]), None);
+        assert_eq!(
+            compose_finish_message(&["subject".into()]).as_deref(),
+            Some("subject")
+        );
+        assert_eq!(
+            compose_finish_message(&["subject".into(), "why".into()]).as_deref(),
+            Some("subject\n\nwhy"),
+        );
+    }
+
+    /// Route to the message-that-lands, then validate it — the combined guard
+    /// exactly as `run()` applies it.
+    fn check(
+        already_finished: bool,
+        amend: bool,
+        purge: bool,
+        message: Option<&str>,
+        squash: Option<&str>,
+    ) -> anyhow::Result<()> {
+        match message_requiring_validation(already_finished, amend, purge, message, squash) {
+            Some(m) => validate_finish_message(m, "foo"),
+            None => Ok(()),
+        }
+    }
+
+    #[test]
+    fn squash_message_is_validated_not_the_transient_finalize_message() {
+        // codex c2122b3: `--squash` MSG is the message that LANDS, so a
+        // placeholder squash message must be rejected (the finalize commit it
+        // creates first is squashed away).
+        assert!(check(false, false, false, None, Some("finish")).is_err());
+        assert!(check(false, false, false, None, Some("just a subject no body")).is_err());
+        assert!(
+            check(
+                false,
+                false,
+                false,
+                None,
+                Some("collapse fetch retries\n\nso transient DNS blips don't wedge the daemon"),
+            )
+            .is_ok()
+        );
+        // The already-finished `--amend --squash` path has the same shape.
+        assert!(check(true, true, false, None, Some("done")).is_err());
+    }
+
+    #[test]
+    fn purge_without_squash_lands_no_finish_message_so_needs_no_m() {
+        // `--purge` (no `--squash`) drops the finalize commit — no finish
+        // message lands, so `-m` is not required (and not over-demanded).
+        assert!(check(false, false, true, None, None).is_ok());
+        assert!(check(true, false, true, None, None).is_ok());
+    }
+
+    #[test]
+    fn plain_finalize_still_requires_a_good_message() {
+        assert!(check(false, false, false, None, None).is_err()); // no -m
+        assert!(check(false, false, false, Some("finish"), None).is_err()); // placeholder
+        assert!(
+            check(
+                false,
+                false,
+                false,
+                Some("add X\n\nbecause Y needed it"),
+                None
+            )
+            .is_ok()
+        );
+        // A no-op finish on an already-finished plan validates nothing.
+        assert!(check(true, false, false, None, None).is_ok());
     }
 
     #[tokio::test]

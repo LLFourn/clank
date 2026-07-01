@@ -1152,9 +1152,10 @@ pub struct FinishArgs {
     /// REQUIRED (when authoring the finish commit): the whole plan's commit
     /// message — a brief WHAT subject and a WHY body, written as if the whole
     /// plan were one commit. It becomes the plan's squash summary. A bare
-    /// `finish` / subject-only message is rejected.
+    /// `finish` / subject-only message is rejected. Repeatable, git-style:
+    /// each `-m` becomes a paragraph (e.g. `-m "<subject>" -m "<why>"`).
     #[arg(short = 'm', long)]
-    pub message: Option<String>,
+    pub message: Vec<String>,
     /// After finalize, strip the plan's `.clank/` artifacts
     /// from history (runs the rewrite engine on the just-extended
     /// range). The finalize snapshot is included in the strip.
