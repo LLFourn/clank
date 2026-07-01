@@ -102,6 +102,10 @@ async fn run_open(
         return launch_opener(&target);
     }
 
+    // First-ever open: the html dir doesn't exist yet and the loading page
+    // is written+opened BEFORE build_site creates it. Ensure it up front so
+    // the browser lands on a real file (codex 825cb42).
+    std::fs::create_dir_all(out_dir)?;
     let loading = LoadingPage::new(
         out_dir.join("_loading.html"),
         target_rel_url(out_dir, &target),
@@ -850,8 +854,15 @@ impl LoadingPage {
     }
 
     /// Atomic write (temp + rename) so a concurrent meta-refresh can't read a
-    /// half-written page.
+    /// half-written page. Creates the html dir first: on a first-ever
+    /// `clank html open` it doesn't exist yet (build_site makes it, but the
+    /// loading page is written BEFORE the build), and without this the very
+    /// first loading page would silently fail to write and the browser would
+    /// open a 404 (codex 825cb42).
     fn write(&self, html: String) {
+        if let Some(parent) = self.path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
         let tmp = self.path.with_extension("html.tmp");
         if std::fs::write(&tmp, html).is_ok() {
             let _ = std::fs::rename(&tmp, &self.path);
@@ -2200,6 +2211,24 @@ mod tests {
         assert_eq!(
             target_rel_url(out, Path::new("/x/.clank/html/plan/foo.html")),
             "plan/foo.html"
+        );
+    }
+
+    #[test]
+    fn loading_page_writes_even_when_html_dir_is_absent() {
+        // First-ever `clank html open`: the html dir doesn't exist yet, and
+        // the loading page is written BEFORE build_site creates it. The page
+        // must still land on disk (else the browser opens a 404). codex 825cb42.
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("does/not/exist/yet");
+        let path = out.join("_loading.html");
+        let lp = LoadingPage::new(path.clone(), "commit/x.html".into(), "commit x".into());
+        assert!(path.exists(), "loading page written despite missing dir");
+        lp.set_total(4);
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("0 / 4 pages")
         );
     }
 
