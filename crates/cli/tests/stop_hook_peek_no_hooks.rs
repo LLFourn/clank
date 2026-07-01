@@ -65,7 +65,11 @@ async fn peek_does_not_fire_the_work_hook() {
     let repo = env.repo();
 
     let marker = repo.join("work_fired.marker");
-    set_hook(repo, "reviewer_work", &format!("touch '{}'", marker.display()));
+    set_hook(
+        repo,
+        "reviewer_work",
+        &format!("touch '{}'", marker.display()),
+    );
 
     // A plan intro commit → the commit reviewer `rev` has a review item.
     write(repo, ".clank/.gitignore", "/cache/\n/agents/\n/shelved/\n");
