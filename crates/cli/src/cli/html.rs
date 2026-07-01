@@ -369,7 +369,7 @@ async fn build_site(
     let subjects = collect_subjects(repo, head_sha.as_ref());
 
     // Common shared CSS file.
-    std::fs::write(out_dir.join("style.css"), CSS)?;
+    std::fs::write(out_dir.join("style.css"), css())?;
 
     // Persist the event log so the next incremental run can
     // skip the full fold.
@@ -1875,7 +1875,12 @@ fn write_doc_open_with_meta(out: &mut String, title: &str, css_rel: &str, extra_
         "<link rel=\"stylesheet\" href=\"{}/style.css\">\n",
         esc(css_rel)
     ));
+    // SYNCHRONOUS, in <head>, before <body> — applies the persisted theme
+    // before first paint so there's no flash; try/catch so a file:// storage
+    // block (Safari) falls through to the system-preference default.
+    out.push_str(THEME_HEAD_SCRIPT);
     out.push_str("</head>\n<body>\n");
+    out.push_str(THEME_TOGGLE_BTN);
 }
 
 fn write_doc_open(out: &mut String, title: &str, css_rel: &str) {
@@ -1887,7 +1892,12 @@ fn write_doc_open(out: &mut String, title: &str, css_rel: &str) {
         "<link rel=\"stylesheet\" href=\"{}/style.css\">\n",
         esc(css_rel)
     ));
+    // SYNCHRONOUS, in <head>, before <body> — applies the persisted theme
+    // before first paint so there's no flash; try/catch so a file:// storage
+    // block (Safari) falls through to the system-preference default.
+    out.push_str(THEME_HEAD_SCRIPT);
     out.push_str("</head>\n<body>\n");
+    out.push_str(THEME_TOGGLE_BTN);
 }
 
 fn write_doc_close(out: &mut String) {
@@ -1896,9 +1906,39 @@ fn write_doc_close(out: &mut String) {
     // ISO stays visible — load-bearing fallback.
     out.push_str("<script>");
     out.push_str(RELATIVE_TIME_JS);
+    out.push_str(THEME_TOGGLE_JS);
     out.push_str("</script>\n");
     out.push_str("</body></html>\n");
 }
+
+/// Applies the persisted theme choice before first paint. Synchronous and
+/// in `<head>`; only `dark`/`light` are honored (anything else / absent =
+/// follow `prefers-color-scheme`). Storage access is guarded so a `file://`
+/// block never breaks the page.
+const THEME_HEAD_SCRIPT: &str = "<script>try{var t=localStorage.getItem('clank-theme');if(t==='dark'||t==='light')document.documentElement.dataset.theme=t;}catch(e){}</script>\n";
+
+/// The corner toggle. `◐` is a placeholder; the script sets the real glyph.
+const THEME_TOGGLE_BTN: &str = "<button class=\"theme-toggle\" id=\"theme-toggle\" type=\"button\" aria-label=\"Toggle color theme\" title=\"theme\">\u{25d0}</button>\n";
+
+/// Cycles the toggle auto → light → dark, persisting best-effort (a `file://`
+/// storage throw is swallowed → session-only). `auto` removes the attribute,
+/// falling back to the `prefers-color-scheme` default.
+const THEME_TOGGLE_JS: &str = r#"
+(function(){
+  var r=document.documentElement, b=document.getElementById('theme-toggle');
+  if(!b) return;
+  function g(m){ return m==='light'?'☀':m==='dark'?'☾':'◐'; }
+  function cur(){ var d=r.getAttribute('data-theme'); return (d==='light'||d==='dark')?d:'auto'; }
+  function lbl(){ b.textContent=g(cur()); b.title='theme: '+cur()+' · click to change'; }
+  function set(m){
+    if(m==='auto'){ r.removeAttribute('data-theme'); } else { r.setAttribute('data-theme', m); }
+    try{ if(m==='auto'){ localStorage.removeItem('clank-theme'); } else { localStorage.setItem('clank-theme', m); } }catch(e){}
+    lbl();
+  }
+  lbl();
+  b.addEventListener('click', function(){ var o=['auto','light','dark']; set(o[(o.indexOf(cur())+1)%3]); });
+})();
+"#;
 
 const RELATIVE_TIME_JS: &str = r#"
 (function () {
@@ -1943,55 +1983,85 @@ const RELATIVE_TIME_JS: &str = r#"
 
 // ─────────────────────────── CSS ────────────────────────────
 
-const CSS: &str = r#":root {
-  color-scheme: light dark;
-  --fg: #1a1a1a;
-  --fg-dim: #5a5a5a;
-  --bg: #fbfbf9;
-  --rule: #e5e2dd;
-  --pill-bg: #ece7da;
-  --pill-fg: #5a4a1c;
-  --link: #0a5b8a;
-  --approve: #157a3e;
-  --finished: #3a4cc8;
-  --changes: #b13e2c;
-  --add-bg: #e5f5e9;
-  --del-bg: #fde7e3;
-  --hunk-hdr: #a0a4ac;
-  --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+/// The dark ("phosphor console") palette — the SINGLE source, injected into
+/// BOTH the `prefers-color-scheme: dark` rule and the `[data-theme="dark"]`
+/// override so the two can never drift (ruthless 68b302c). Declarations only
+/// (no selector). The dark-only visuals (grain/glow/vignette) are var toggles
+/// so no RULE is duplicated — light turns them off.
+const DARK_VARS: &str = "color-scheme: dark; \
+--fg:#e8e4d8; --fg-dim:#8a847a; --bg:#0b0b0d; --rule:#221f1a; \
+--pill-bg:rgba(255,180,84,.08); --pill-fg:#ffb454; --pill-border:rgba(255,180,84,.28); \
+--code-bg:#131017; --accent:#ffb454; --link:#ffb454; \
+--approve:#74c98a; --finished:#8ea6ff; --changes:#f07a6a; \
+--add-bg:rgba(90,190,120,.10); --del-bg:rgba(230,90,80,.10); --hunk-hdr:#6f6a60; \
+--grain:.03; --glow:0 0 14px rgba(255,180,84,.15); --glow-strong:0 0 16px rgba(255,180,84,.22); --vignette:rgba(255,180,84,.05); \
+--hl-keyword:#c678dd; --hl-storage:#c678dd; --hl-constant:#d19a66; --hl-string:#98c379; --hl-comment:#6f6a60; --hl-entity:#61afef; --hl-support:#56b6c2; --hl-variable:#e06c75; --hl-punctuation:#8e8c89;";
+
+/// The light palette (default `:root`) + the shared `--mono` and the light
+/// (off) values of the dark-only toggles.
+const LIGHT_ROOT: &str = r#":root {
+  color-scheme: light;
+  --fg:#1a1a1a; --fg-dim:#5a5a5a; --bg:#fbfbf9; --rule:#e5e2dd;
+  --pill-bg:#ece7da; --pill-fg:#5a4a1c; --pill-border:transparent;
+  --code-bg:#f4f1ea; --accent:#0a5b8a; --link:#0a5b8a;
+  --approve:#157a3e; --finished:#3a4cc8; --changes:#b13e2c;
+  --add-bg:#e5f5e9; --del-bg:#fde7e3; --hunk-hdr:#a0a4ac;
+  --grain:0; --glow:none; --glow-strong:none; --vignette:transparent;
+  --hl-keyword:#a626a4; --hl-storage:#a626a4; --hl-constant:#986801; --hl-string:#50a14f;
+  --hl-comment:#5a5a5a; --hl-entity:#4078f2; --hl-support:#0184bc; --hl-variable:#e45649; --hl-punctuation:#5a5a5a;
+  --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
+}"#;
+
+/// Assemble style.css: light `:root`, then the dark palette applied via BOTH
+/// the system-preference media query (the reliable auto-default) and the
+/// `[data-theme="dark"]` manual override — single-sourced from `DARK_VARS` —
+/// then the theme-agnostic rules.
+fn css() -> String {
+    format!(
+        "{light}\n\
+         @media (prefers-color-scheme: dark) {{ :root:not([data-theme=\"light\"]) {{ {dark} }} }}\n\
+         :root[data-theme=\"dark\"] {{ {dark} }}\n\
+         {rules}",
+        light = LIGHT_ROOT,
+        dark = DARK_VARS,
+        rules = CSS_RULES,
+    )
 }
-@media (prefers-color-scheme: dark) {
-  :root {
-    --fg: #e9e6df;
-    --fg-dim: #9b958a;
-    --bg: #181715;
-    --rule: #2c2a26;
-    --pill-bg: #3a3527;
-    --pill-fg: #d8c89c;
-    --link: #6fb5e0;
-    --approve: #6fc28e;
-    --finished: #99a8ff;
-    --changes: #ef8a78;
-    --add-bg: rgba(40, 120, 60, 0.18);
-    --del-bg: rgba(180, 60, 50, 0.18);
-    --hunk-hdr: #6f6a60;
-  }
-}
-* { box-sizing: border-box; }
-html { font-feature-settings: "tnum"; }
+
+const CSS_RULES: &str = r#"* { box-sizing: border-box; }
+html { font-feature-settings: "tnum"; background: var(--bg); }
 body {
   margin: 0;
-  font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  font: 14px/1.6 var(--mono);
   color: var(--fg);
-  background: var(--bg);
+  min-height: 100vh;
+  background:
+    radial-gradient(130% 80% at 50% -8%, var(--vignette), transparent 55%),
+    var(--bg);
 }
+/* film grain over everything — dark only (--grain is 0 in light) */
+body::after {
+  content: ""; position: fixed; inset: 0; pointer-events: none; opacity: var(--grain); z-index: 0;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='120' height='120'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='2'/></filter><rect width='100%' height='100%' filter='url(%23n)'/></svg>");
+}
+main, header.status, .plan-header, .commit-header { position: relative; z-index: 1; }
+a { color: var(--link); }
+.theme-toggle {
+  position: fixed; top: .7rem; right: .7rem; z-index: 5;
+  display: grid; place-items: center;
+  width: 2rem; height: 2rem; border-radius: 999px;
+  font: 500 1rem/1 var(--mono); color: var(--fg-dim);
+  background: var(--pill-bg); border: 1px solid var(--rule); cursor: pointer;
+}
+.theme-toggle:hover { color: var(--accent); border-color: var(--pill-border); box-shadow: var(--glow); }
 main, header.status {
   max-width: 880px;
   margin: 0 auto;
   padding: 1.25rem 1.5rem;
 }
 header.status { border-bottom: 1px solid var(--rule); }
-header.status h1 { margin: 0 0 .25rem; font-size: 1.2rem; }
+header.status h1 { margin: 0 0 .25rem; font-size: 1.2rem; letter-spacing: .04em;
+  text-shadow: var(--glow); }
 .status-meta { color: var(--fg-dim); font-size: .9rem; margin-bottom: .75rem; }
 .branch { color: var(--fg); font-weight: 600; }
 .plan-list { list-style: none; margin: 0; padding: 0; }
@@ -2003,10 +2073,11 @@ header.status h1 { margin: 0 0 .25rem; font-size: 1.2rem; }
   display: inline-block;
   font: 600 .8rem/1 var(--mono);
   background: var(--pill-bg); color: var(--pill-fg);
-  padding: .15rem .45rem; border-radius: 999px;
+  border: 1px solid var(--pill-border);
+  padding: .15rem .5rem; border-radius: 999px;
 }
 a.plan-pill { text-decoration: none; }
-a.plan-pill:hover { filter: brightness(0.96); }
+a.plan-pill:hover { border-color: var(--accent); box-shadow: var(--glow); filter: brightness(1.05); }
 .plan-header { max-width: 880px; margin: 0 auto; padding: 1rem 1.5rem; border-bottom: 1px solid var(--rule); }
 .plan-header h1 { margin: .25rem 0; }
 .plan-state { color: var(--fg-dim); font-size: .9rem; margin-top: .25rem; }
@@ -2053,7 +2124,8 @@ h2 { font-size: 1rem; text-transform: uppercase; letter-spacing: .05em; color: v
 .sha-copy.copied::after { content: " copied"; font-size: .75em; }
 .commit-body {
   font: .9rem/1.45 var(--mono);
-  background: var(--pill-bg);
+  background: var(--code-bg);
+  border: 1px solid var(--rule);
   padding: .65rem .85rem;
   border-radius: 4px;
   margin: .5rem 0;
@@ -2074,7 +2146,8 @@ h2 { font-size: 1rem; text-transform: uppercase; letter-spacing: .05em; color: v
 .ts { font: 400 .8rem/1 var(--mono); color: var(--fg-dim); }
 .crumb a { color: var(--link); text-decoration: none; font-size: .9rem; }
 .commit-header { padding: 1rem 1.5rem; border-bottom: 1px solid var(--rule); max-width: 880px; margin: 0 auto; }
-.commit-header h1 { margin: .25rem 0; font: 500 1.4rem/1 var(--mono); }
+.commit-header h1 { margin: .25rem 0; font: 500 1.4rem/1 var(--mono); color: var(--accent);
+  text-shadow: var(--glow-strong); }
 .commit-header .subject { font-size: 1.05rem; margin: .25rem 0; }
 .sha-full code { font-size: .8rem; color: var(--fg-dim); }
 section { padding: 1rem 0; border-top: 1px solid var(--rule); }
@@ -2086,20 +2159,23 @@ section h3 { font-size: .9rem; text-transform: uppercase; letter-spacing: .05em;
 .md h2 { font-size: 1.15rem; text-transform: none; color: inherit; letter-spacing: 0; }
 .md h3 { font-size: 1rem; text-transform: none; color: inherit; letter-spacing: 0; }
 .md p { margin: .65rem 0; }
-.md code { font: .9em var(--mono); background: var(--pill-bg); padding: 0 .25rem; border-radius: 3px; }
-.md pre { background: var(--pill-bg); padding: .75rem; border-radius: 4px; overflow-x: auto; }
-.md pre code { background: transparent; padding: 0; }
+.md code { font: .9em var(--mono); background: var(--code-bg); border: 1px solid var(--rule); padding: 0 .25rem; border-radius: 3px; }
+.md pre { background: var(--code-bg); border: 1px solid var(--rule); padding: .75rem; border-radius: 4px; overflow-x: auto; }
+.md pre code { background: transparent; border: 0; padding: 0; }
 .md ul, .md ol { padding-left: 1.5rem; }
 .md blockquote { border-left: 3px solid var(--rule); margin: .5rem 0; padding: .1rem .75rem; color: var(--fg-dim); }
-.review { padding: .75rem 1rem; border: 1px solid var(--rule); border-radius: 6px; margin-bottom: .75rem; }
+.review { padding: .6rem 1rem; border: 1px solid var(--rule); border-left: 3px solid var(--rule); border-radius: 4px; margin-bottom: .75rem; background: rgba(255,255,255,.012); }
+.review.verdict-continue { border-left-color: var(--approve); }
+.review.verdict-finished { border-left-color: var(--finished); }
+.review.verdict-request-changes { border-left-color: var(--changes); }
 .review header { margin-bottom: .35rem; }
-.review .verdict { font: 600 .75rem/1 var(--mono); margin-left: .35rem; padding: .15rem .35rem; border-radius: 3px; }
-.review.verdict-continue .verdict { color: var(--approve); background: rgba(21, 122, 62, 0.1); }
-.review.verdict-finished .verdict { color: var(--finished); background: rgba(58, 76, 200, 0.1); }
-.review.verdict-request-changes .verdict { color: var(--changes); background: rgba(177, 62, 44, 0.1); }
+.review .verdict { font: 600 .75rem/1 var(--mono); margin-left: .35rem; padding: .15rem .4rem; border-radius: 3px; text-transform: uppercase; letter-spacing: .04em; }
+.review.verdict-continue .verdict { color: var(--approve); background: rgba(116,201,138,.12); }
+.review.verdict-finished .verdict { color: var(--finished); background: rgba(142,166,255,.12); }
+.review.verdict-request-changes .verdict { color: var(--changes); background: rgba(240,122,106,.12); }
 .review .summary { margin: .25rem 0 .5rem; font-weight: 500; }
 .file { margin: .5rem 0; }
-.file summary { font: 500 .9rem/1.4 var(--mono); cursor: pointer; padding: .25rem .35rem; background: var(--pill-bg); border-radius: 3px; }
+.file summary { font: 500 .9rem/1.4 var(--mono); cursor: pointer; padding: .25rem .45rem; background: var(--code-bg); border: 1px solid var(--rule); border-radius: 3px; }
 .hunk { font: .8rem/1.25 var(--mono); margin: .35rem 0; background: var(--bg); border: 1px solid var(--rule); border-radius: 3px; overflow-x: auto; }
 .line {
   display: grid;
@@ -2117,30 +2193,19 @@ section h3 { font-size: .9rem; text-transform: uppercase; letter-spacing: .05em;
 .line .src { padding-right: .35em; }
 .line.add { background: var(--add-bg); }
 .line.del { background: var(--del-bg); }
-.line.hunk-hdr { background: var(--pill-bg); color: var(--hunk-hdr); padding: .1rem 0; grid-template-columns: 1fr; }
+.line.hunk-hdr { background: var(--code-bg); color: var(--hunk-hdr); padding: .1rem 0; grid-template-columns: 1fr; }
 .line.hunk-hdr .src { padding-left: .5rem; }
 .line.meta { color: var(--fg-dim); }
-/* syntect class colors (light) */
-.hl-keyword { color: #a626a4; }
-.hl-storage { color: #a626a4; }
-.hl-constant { color: #986801; }
-.hl-string { color: #50a14f; }
-.hl-comment { color: var(--fg-dim); font-style: italic; }
-.hl-entity { color: #4078f2; }
-.hl-support { color: #0184bc; }
-.hl-variable { color: #e45649; }
-.hl-punctuation { color: var(--fg-dim); }
-@media (prefers-color-scheme: dark) {
-  .hl-keyword { color: #c678dd; }
-  .hl-storage { color: #c678dd; }
-  .hl-constant { color: #d19a66; }
-  .hl-string { color: #98c379; }
-  .hl-comment { color: #7c7c7c; font-style: italic; }
-  .hl-entity { color: #61afef; }
-  .hl-support { color: #56b6c2; }
-  .hl-variable { color: #e06c75; }
-  .hl-punctuation { color: #8e8c89; }
-}
+/* syntect class colors — themed via vars (light + dark palettes) */
+.hl-keyword { color: var(--hl-keyword); }
+.hl-storage { color: var(--hl-storage); }
+.hl-constant { color: var(--hl-constant); }
+.hl-string { color: var(--hl-string); }
+.hl-comment { color: var(--hl-comment); font-style: italic; }
+.hl-entity { color: var(--hl-entity); }
+.hl-support { color: var(--hl-support); }
+.hl-variable { color: var(--hl-variable); }
+.hl-punctuation { color: var(--hl-punctuation); }
 @media print {
   .row-link:hover { background: transparent; }
   details > summary { list-style: none; }
@@ -2252,6 +2317,43 @@ mod tests {
         lp.tick_at(t0 + std::time::Duration::from_secs(1));
         let body = std::fs::read_to_string(&path).unwrap();
         assert!(body.contains("3 / 10 pages"), "rewrote after 1s: {body}");
+    }
+
+    #[test]
+    fn css_defines_light_default_and_dark_via_media_and_data_theme() {
+        let css = css();
+        // Light is the default :root.
+        assert!(css.contains("color-scheme: light;"), "light default");
+        assert!(css.contains("#fbfbf9"), "light bg present");
+        // Dark applies via BOTH the system-preference media query (the
+        // reliable auto-default) and the manual [data-theme="dark"] override.
+        assert!(css.contains("@media (prefers-color-scheme: dark)"));
+        assert!(css.contains(r#":root:not([data-theme="light"])"#));
+        assert!(css.contains(r#":root[data-theme="dark"]"#));
+        // Single-sourced from DARK_VARS → the dark palette appears in BOTH
+        // dark selectors (so they can never drift).
+        assert_eq!(
+            css.matches("--bg:#0b0b0d").count(),
+            2,
+            "dark bg injected into both dark selectors"
+        );
+    }
+
+    #[test]
+    fn theme_chrome_injects_early_script_and_toggle() {
+        let mut out = String::new();
+        write_doc_open_with_meta(&mut out, "t", ".", "");
+        // The early theme script is SYNCHRONOUS and in <head> BEFORE <body>
+        // (flash-free), and reads localStorage.
+        let head_end = out.find("</head>").expect("head closes");
+        let script = out
+            .find("localStorage.getItem('clank-theme')")
+            .expect("early theme script present");
+        assert!(script < head_end, "early script must be inside <head>");
+        // The toggle button is emitted after <body> opens.
+        let body = out.find("<body>").expect("body opens");
+        let btn = out.find(r#"class="theme-toggle""#).expect("toggle present");
+        assert!(btn > body, "toggle after <body>");
     }
 
     #[test]
