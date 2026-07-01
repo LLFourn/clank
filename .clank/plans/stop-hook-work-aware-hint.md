@@ -67,10 +67,28 @@ closed.
 returns **immediately** — items (exit 0) if the agent has work now, empty
 otherwise — never entering the watcher loop. Reuses the exact
 `derive_status` → `work_for` path and the `--json` envelope the stop hook
-already parses. (Alternative if cleaner in review: compute `WorkStatus` +
-`is_actionable` directly in the hook — but `--peek` keeps all git access in
-the existing `wait` command per the git-boundary rule and avoids
-duplicating the work construction.)
+already parses.
+
+**`--peek` MUST be side-effect-free — it is a pure probe.** The stop hook
+may call it on *every* Stop that ends with a live background task, so it
+must NOT fire any lifecycle hooks. Concretely, in peek mode suppress:
+
+- the per-item lifecycle firings (`hook_config::run_hook` on the immediate
+  items, wait.rs ≈229–231), and
+- the master no-work idle hook (`hook_config::run_idle_hook`, wait.rs
+  ≈270).
+
+So `--peek` only *reports* work-presence; it never runs a hook, never
+promotes, never touches clank state. Thread a `peek: bool` into the
+initial pass and guard those two hook calls (and skip the loop) on it.
+(Cache writes from the repo rebuild are fine — they're a read-through
+cache, not a lifecycle event; the concern codex raised is specifically the
+*hooks*.)
+
+(Alternative if reviewers prefer: compute `WorkStatus` + `is_actionable`
+directly in the hook — inherently hook-free — but that duplicates the work
+construction; `--peek` keeps git access in the `wait` command per the
+git-boundary rule. Either way the peek fires no hooks.)
 
 ### 2. Reshape the gate (`crates/core/src/hook_io.rs`)
 
@@ -134,7 +152,9 @@ wait not being re-armed.
 - core: `background_disposition` — clank-wait present → YieldArmed; non-wait
   bg + claude → NeedsWorkCheck; non-wait bg + codex → YieldArmed; no bg →
   NoBackgroundWork. (No `stop_hook_active` dependence.)
-- cli: `--peek` returns immediately with work / empty and never blocks.
+- cli: `--peek` returns immediately with work / empty and never blocks, and
+  **fires no hooks** — assert `run_hook`/`run_idle_hook` are not invoked in
+  peek mode (both the work-present and no-work-master paths).
 - cli real-binary: bg + a bound repo where work exists → Silent (Case B);
   bg + no work → Continue(hint) (Case A); clank wait present → Silent;
   codex bg → Silent.
@@ -143,6 +163,8 @@ wait not being re-armed.
 
 - No nudge loop: an agent that has immediate work + a bg task yields
   silently; the hint fires only when the agent has no immediate work.
+- `--peek` is side-effect-free: fires no lifecycle/idle hooks, promotes
+  nothing, on any path — safe to call on every Stop.
 - Once a background `clank wait` is armed, no re-hint.
 - Codex behavior byte-for-byte unchanged (no bg tasks → normal path; never
   peeks; wire form intact).
