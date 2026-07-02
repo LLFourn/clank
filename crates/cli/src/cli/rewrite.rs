@@ -7,6 +7,7 @@
 //! pure side-effect-producing infrastructure (git plumbing,
 //! ref updates, tree builds).
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use clank_core::api::{RewriteCommit, RewriteDisposition};
@@ -182,6 +183,147 @@ pub async fn run(opts: RewriteOpts<'_>) -> anyhow::Result<RewriteOutcome> {
         new_tip: Some(new_tip),
         updated_branch: Some(updated_branch),
     })
+}
+
+/// Inputs for [`reword_in_place`].
+#[derive(Debug)]
+pub struct RewordOpts<'a> {
+    pub repo: &'a Path,
+    /// The commit whose MESSAGE is being replaced. May be buried under
+    /// later first-parent commits (the off-HEAD case) — those descendants
+    /// are replayed on top of the reworded commit.
+    pub target_sha: &'a CommitSha,
+    /// Branch tip the reword was computed against — the expected-old-value
+    /// for the conditional in-place ref update.
+    pub head_sha: &'a CommitSha,
+    pub new_message: &'a str,
+    /// Permit rewriting a protected branch (`main`/`master`) in place.
+    pub allow_rewrite_protected: bool,
+    pub dry: bool,
+}
+
+/// Reword `target_sha` to `new_message` and replay every first-parent
+/// descendant up to `head_sha` on top, then move the current branch — the
+/// off-HEAD counterpart to `git commit --amend`. The target's tree, parent,
+/// and author are preserved (only the message changes); descendants keep their
+/// trees, messages, and authors (author dates intact).
+///
+/// Returns the `(old, new)` sha pairs for the reworded target and every
+/// replayed descendant (empty in `--dry`), so the caller can migrate
+/// sha-keyed state (e.g. review feedback — the git `post-rewrite` hook does
+/// NOT fire for a plumbing `update-ref`).
+///
+/// Refuses on: a merge commit in `[target, head]` (first-parent replay would
+/// drop a parent), a dirty working tree, a protected branch without
+/// `allow_rewrite_protected`, or `target_sha` not being on `head_sha`'s
+/// first-parent chain.
+pub async fn reword_in_place(opts: RewordOpts<'_>) -> anyhow::Result<Vec<(CommitSha, CommitSha)>> {
+    // The target must sit on head's first-parent chain, else the descendant
+    // walk (anchored by hiding `target`) would not be relative to it.
+    let on_chain = crate::git_io::first_parent_chain_find_at(
+        opts.repo,
+        opts.head_sha,
+        &HashSet::from([opts.target_sha.clone()]),
+    )?;
+    if on_chain.as_ref() != Some(opts.target_sha) {
+        anyhow::bail!(
+            "commit {} is not on the current branch's first-parent history; \
+             cannot reword it in place",
+            short(opts.target_sha.as_str()),
+        );
+    }
+    // Descendants: first-parent commits strictly after target, up to head.
+    let descendants =
+        crate::git_io::first_parent_commits_between(opts.repo, opts.target_sha, opts.head_sha)?;
+
+    let mut blockers = Vec::new();
+    // A merge anywhere in [target, head] means first-parent replay would drop a
+    // second parent — refuse rather than silently lose history.
+    let mut merges = Vec::new();
+    for sha in std::iter::once(opts.target_sha).chain(descendants.iter().map(|m| &m.sha)) {
+        if crate::git_io::commit_parent_count_at(opts.repo, sha)? > 1 {
+            merges.push(short(sha.as_str()));
+        }
+    }
+    if !merges.is_empty() {
+        blockers.push(format!(
+            "range contains merge commit(s) ({}); refusing to reword (first-parent \
+             replay would drop a parent)",
+            merges.join(", "),
+        ));
+    }
+    if working_tree_dirty(opts.repo)? {
+        blockers.push("working tree dirty; commit or stash first".to_string());
+    }
+    if !opts.allow_rewrite_protected {
+        let current = current_branch(opts.repo)?;
+        if is_protected_branch(opts.repo, &current)? {
+            blockers.push(format!(
+                "refusing to rewrite protected branch `{current}` in place. \
+                 Pass `--allow-rewrite-protected` to override."
+            ));
+        }
+    }
+
+    if opts.dry {
+        println!("# clank reword preview");
+        println!(
+            "# target {} → new message; {} descendant commit(s) replayed on top",
+            short(opts.target_sha.as_str()),
+            descendants.len(),
+        );
+        for b in &blockers {
+            println!("#   BLOCKER: {b}");
+        }
+        return Ok(Vec::new());
+    }
+    if let Some(first) = blockers.first() {
+        anyhow::bail!("{first}");
+    }
+
+    // Rebuild the target with the new message (tree/parent/author preserved via
+    // `squash_commit`), then replay each descendant on top.
+    let target_tree = git_plumbing::commit_tree_oid(opts.repo, opts.target_sha.as_str())?;
+    let target_parent = crate::git_io::parent_of_at(opts.repo, opts.target_sha)?;
+    let new_target = git_plumbing::squash_commit(
+        opts.repo,
+        opts.target_sha.as_str(),
+        &target_tree,
+        target_parent.as_ref().map(CommitSha::as_str),
+        opts.new_message,
+    )?;
+    let parse_new = |s: &str| {
+        CommitSha::parse(s).map_err(|e| anyhow::anyhow!("parse rewritten sha `{s}`: {e}"))
+    };
+    let mut pairs = vec![(opts.target_sha.clone(), parse_new(&new_target)?)];
+    let mut tip = new_target;
+    for d in &descendants {
+        let tree = git_plumbing::commit_tree_oid(opts.repo, d.sha.as_str())?;
+        let new = git_plumbing::replay_commit(opts.repo, d.sha.as_str(), &tree, Some(&tip))?;
+        pairs.push((d.sha.clone(), parse_new(&new)?));
+        tip = new;
+    }
+
+    // Move the current branch in place, guarding against a concurrent update.
+    let current = current_branch(opts.repo)?;
+    git_plumbing::update_ref(
+        opts.repo,
+        &format!("refs/heads/{current}"),
+        &tip,
+        ExpectedRef::Match(opts.head_sha.as_str().to_string()),
+    )
+    .map_err(|e| {
+        anyhow::anyhow!(
+            "branch `{current}` moved between preview and reword (expected {}); \
+             aborting to avoid losing commits — re-run. underlying: {e}",
+            short(opts.head_sha.as_str()),
+        )
+    })?;
+    // Re-sync the worktree to the new tip (trees are identical, so this is a
+    // no-op content-wise — it just keeps HEAD/index/worktree coherent).
+    git_plumbing::reset_hard(opts.repo, "HEAD")?;
+
+    Ok(pairs)
 }
 
 #[derive(Debug)]
@@ -1414,5 +1556,181 @@ mod tests {
         // A modified TRACKED file → dirty.
         write(repo, "src.txt", "changed\n");
         assert!(working_tree_dirty(repo).unwrap(), "tracked edit must block");
+    }
+
+    #[tokio::test]
+    async fn reword_in_place_rewords_buried_commit_and_replays_descendants() {
+        let dir = init_repo();
+        let repo = dir.path();
+        write(repo, "README.md", "seed\n");
+        let _seed = commit(repo, "seed");
+        write(repo, "a.txt", "a\n");
+        let target = commit(repo, "original finish message");
+        write(repo, "b.txt", "b\n");
+        let _b = commit(repo, "plan B commit");
+        write(repo, "c.txt", "c\n");
+        let head = commit(repo, "plan C commit");
+
+        let pairs = super::reword_in_place(RewordOpts {
+            repo,
+            target_sha: &CommitSha::parse(&target).unwrap(),
+            head_sha: &CommitSha::parse(&head).unwrap(),
+            new_message: "reworded whole-plan summary\n\nwhy it exists",
+            allow_rewrite_protected: true, // default branch `main` is protected
+            dry: false,
+        })
+        .await
+        .unwrap();
+
+        // target + 2 descendants = 3 (old, new) pairs.
+        assert_eq!(pairs.len(), 3);
+        // History stays linear and the same length (seed + 3 rewritten).
+        let chain = rev_list(repo, "main");
+        assert_eq!(chain.len(), 4, "seed + reworded target + B + C: {chain:?}");
+        let (new_target, new_b, new_c) = (&chain[1], &chain[2], &chain[3]);
+        // Reworded commit carries the new subject; descendants preserved.
+        assert_eq!(
+            show_subject(repo, new_target),
+            "reworded whole-plan summary"
+        );
+        assert_eq!(show_subject(repo, new_b), "plan B commit");
+        assert_eq!(show_subject(repo, new_c), "plan C commit");
+        // The rewrite actually changed shas.
+        assert_ne!(new_target, &target);
+        assert_ne!(new_c, &head);
+        // Trees are preserved: every file survives to the new tip.
+        assert!(tree_has(repo, new_c, "a.txt"));
+        assert!(tree_has(repo, new_c, "b.txt"));
+        assert!(tree_has(repo, new_c, "c.txt"));
+        // Pairs map old→new for the target and the final tip.
+        assert_eq!(pairs[0].0.as_str(), target);
+        assert_eq!(pairs[0].1.as_str(), *new_target);
+        assert_eq!(pairs.last().unwrap().1.as_str(), *new_c);
+    }
+
+    #[tokio::test]
+    async fn reword_in_place_refuses_dirty_tree() {
+        let dir = init_repo();
+        let repo = dir.path();
+        write(repo, "README.md", "seed\n");
+        let _seed = commit(repo, "seed");
+        write(repo, "a.txt", "a\n");
+        let target = commit(repo, "target");
+        write(repo, "b.txt", "b\n");
+        let head = commit(repo, "head");
+        write(repo, "a.txt", "uncommitted edit\n"); // dirty a tracked file
+
+        let err = super::reword_in_place(RewordOpts {
+            repo,
+            target_sha: &CommitSha::parse(&target).unwrap(),
+            head_sha: &CommitSha::parse(&head).unwrap(),
+            new_message: "x\n\nwhy",
+            allow_rewrite_protected: true,
+            dry: false,
+        })
+        .await
+        .unwrap_err();
+        assert!(format!("{err}").contains("working tree dirty"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn reword_in_place_refuses_target_off_first_parent_chain() {
+        let dir = init_repo();
+        let repo = dir.path();
+        write(repo, "README.md", "seed\n");
+        let seed = commit(repo, "seed");
+        write(repo, "a.txt", "a\n");
+        let head = commit(repo, "head");
+        // A commit on a side branch — NOT on main's first-parent chain.
+        run(repo, &["checkout", "-q", "-b", "side", &seed]);
+        write(repo, "s.txt", "s\n");
+        let off = commit(repo, "side commit");
+        run(repo, &["checkout", "-q", "main"]);
+
+        let err = super::reword_in_place(RewordOpts {
+            repo,
+            target_sha: &CommitSha::parse(&off).unwrap(),
+            head_sha: &CommitSha::parse(&head).unwrap(),
+            new_message: "x\n\nwhy",
+            allow_rewrite_protected: true,
+            dry: false,
+        })
+        .await
+        .unwrap_err();
+        assert!(format!("{err}").contains("first-parent history"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn reword_in_place_refuses_merge_in_range_live_and_reports_in_dry() {
+        // A merge among the descendants means first-parent replay would drop a
+        // parent. The LIVE run refuses; the DRY run — the same computation —
+        // reports the blocker and moves nothing.
+        let dir = init_repo();
+        let repo = dir.path();
+        write(repo, "README.md", "seed\n");
+        let seed = commit(repo, "seed");
+        write(repo, "a.txt", "a\n");
+        let target = commit(repo, "target");
+        // A side branch merged back in → merge commit above the target.
+        run(repo, &["checkout", "-q", "-b", "side", &seed]);
+        write(repo, "s.txt", "s\n");
+        commit(repo, "side work");
+        run(repo, &["checkout", "-q", "main"]);
+        run(
+            repo,
+            &["merge", "-q", "--no-ff", "-m", "merge side", "side"],
+        );
+        let head = git_head(repo);
+
+        let target_sha = CommitSha::parse(&target).unwrap();
+        let head_sha = CommitSha::parse(&head).unwrap();
+        let opts = |dry| RewordOpts {
+            repo,
+            target_sha: &target_sha,
+            head_sha: &head_sha,
+            new_message: "x\n\nwhy",
+            allow_rewrite_protected: true,
+            dry,
+        };
+        let err = super::reword_in_place(opts(false)).await.unwrap_err();
+        assert!(format!("{err}").contains("merge commit"), "{err}");
+
+        let pairs = super::reword_in_place(opts(true)).await.unwrap();
+        assert!(pairs.is_empty(), "dry returns no pairs");
+        assert_eq!(git_head(repo), head, "dry must not move the branch");
+    }
+
+    fn git_head(repo: &Path) -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+
+    #[tokio::test]
+    async fn reword_in_place_refuses_protected_branch_without_override() {
+        let dir = init_repo();
+        let repo = dir.path();
+        write(repo, "README.md", "seed\n");
+        let _seed = commit(repo, "seed");
+        write(repo, "a.txt", "a\n");
+        let target = commit(repo, "target");
+        write(repo, "b.txt", "b\n");
+        let head = commit(repo, "head");
+
+        let err = super::reword_in_place(RewordOpts {
+            repo,
+            target_sha: &CommitSha::parse(&target).unwrap(),
+            head_sha: &CommitSha::parse(&head).unwrap(),
+            new_message: "x\n\nwhy",
+            allow_rewrite_protected: false, // `main` is protected
+            dry: false,
+        })
+        .await
+        .unwrap_err();
+        assert!(format!("{err}").contains("protected branch"), "{err}");
     }
 }

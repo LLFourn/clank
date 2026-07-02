@@ -42,16 +42,10 @@ fn block_on<F: std::future::Future>(f: F) -> F::Output {
     tokio::runtime::Runtime::new().unwrap().block_on(f)
 }
 
-fn finish_args(
-    repo: &Path,
-    plan: &str,
-    squash: Option<&str>,
-    amend: bool,
-) -> clank::cli::FinishArgs {
+fn finish_args(repo: &Path, plan: &str, squash: Option<&str>) -> clank::cli::FinishArgs {
     clank::cli::FinishArgs {
         plan: Some(plan.into()),
         repo: Some(repo.to_path_buf()),
-        amend,
         message: vec![],
         purge: false,
         squash: squash.map(str::to_string),
@@ -65,36 +59,29 @@ fn finish_args(
 
 #[test]
 fn refused_squash_leaves_the_validated_message_not_the_placeholder() {
-    // codex 053f9d1: `finish --squash` stamps the finalize/amend commit with
-    // the (validated) squash message BEFORE the squash runs, so a squash that
-    // is REFUSED (here: protected `main`) leaves that message on HEAD — never
-    // the `[stem] finish` placeholder.
+    // codex 053f9d1: `finish --squash` stamps the transient finalize commit
+    // with the (validated) squash message BEFORE the squash runs, so a squash
+    // that is REFUSED (here: protected `main`) leaves that message on HEAD —
+    // never the `[stem] finish` placeholder.
     let env = TestEnv::init();
     env.register_team("claude", &["codex"], &[]);
     let repo = env.repo();
 
-    // A plan, then simulate finish by moving it into finished/ with a finalize
-    // commit at HEAD.
+    // A plan with a reviewable commit + a FINISHED review → gate Ready.
     write(repo, ".clank/plans/foo.md", "# foo\n\nbody\n");
     commit(repo, "[foo] intro");
-    std::fs::create_dir_all(repo.join(".clank/finished")).unwrap();
-    std::fs::rename(
-        repo.join(".clank/plans/foo.md"),
-        repo.join(".clank/finished/foo.md"),
-    )
-    .unwrap();
-    commit(repo, "[foo] finish");
+    let intro = git_out(repo, &["rev-parse", "HEAD"]);
+    write(
+        repo,
+        &format!(".clank/agents/codex/feedback/{}.md", &intro[..7]),
+        "FINISHED ship it\n",
+    );
 
     let msg = "collapse foo into one\n\nso the branch reads as a single commit";
-    // `--amend --squash` on the already-finished plan: amend stamps the squash
-    // message, then the squash is refused on protected `main`.
-    let err = block_on(clank::cli::finish::run(finish_args(
-        repo,
-        "foo",
-        Some(msg),
-        true,
-    )))
-    .expect_err("squash must be refused on protected main");
+    // `--squash` finalizes (stamping the squash message), then the squash is
+    // refused on protected `main` (no --allow-rewrite-protected).
+    let err = block_on(clank::cli::finish::run(finish_args(repo, "foo", Some(msg))))
+        .expect_err("squash must be refused on protected main");
     assert!(
         err.to_string().contains("protected"),
         "expected protected-branch refusal, got: {err}"
@@ -133,7 +120,7 @@ fn refused_purge_leaves_the_validated_message_not_the_placeholder() {
     );
 
     let msg = "strip foo artifacts\n\nthe plan is done and the .clank bookkeeping is noise";
-    let mut args = finish_args(repo, "foo", None, false);
+    let mut args = finish_args(repo, "foo", None);
     args.purge = true;
     args.message = vec![msg.to_string()];
     let err = block_on(clank::cli::finish::run(args))
@@ -176,7 +163,7 @@ fn finish_message_gets_the_plan_tag_even_when_untagged() {
     let repo = env.repo();
     ready_plan(&env);
 
-    let mut args = finish_args(repo, "foo", None, false);
+    let mut args = finish_args(repo, "foo", None);
     args.message = vec!["make foo work".into(), "because it was broken".into()];
     block_on(clank::cli::finish::run(args)).expect("finish should succeed");
 
@@ -198,7 +185,7 @@ fn squash_message_gets_the_plan_tag_even_when_untagged() {
     let repo = env.repo();
     ready_plan(&env);
 
-    let mut args = finish_args(repo, "foo", None, false);
+    let mut args = finish_args(repo, "foo", None);
     args.squash = Some("collapse foo\n\na single commit reads cleaner".into());
     args.allow_rewrite_protected = true; // let the squash run on `main`
     block_on(clank::cli::finish::run(args)).expect("squash finish should succeed");
@@ -247,7 +234,7 @@ fn autosquash_config_collapses_plan_to_one_tagged_commit() {
     set_autosquash(repo, true);
     ready_plan_on_base(&env);
 
-    let mut args = finish_args(repo, "foo", None, false);
+    let mut args = finish_args(repo, "foo", None);
     args.message = vec!["wrap up foo".into(), "one commit reads cleaner".into()];
     args.allow_rewrite_protected = true; // main is protected; let the squash run
     block_on(clank::cli::finish::run(args)).expect("autosquash finish should succeed");
@@ -273,7 +260,7 @@ fn without_autosquash_the_plan_keeps_its_commits() {
     set_autosquash(repo, false);
     ready_plan_on_base(&env);
 
-    let mut args = finish_args(repo, "foo", None, false);
+    let mut args = finish_args(repo, "foo", None);
     args.message = vec!["wrap up foo".into(), "keep the commits".into()];
     block_on(clank::cli::finish::run(args)).expect("finish should succeed");
 
@@ -293,7 +280,7 @@ fn no_squash_flag_opts_out_of_autosquash() {
     set_autosquash(repo, true);
     ready_plan_on_base(&env);
 
-    let mut args = finish_args(repo, "foo", None, false);
+    let mut args = finish_args(repo, "foo", None);
     args.message = vec!["wrap up foo".into(), "keep the commits this time".into()];
     args.no_squash = true;
     block_on(clank::cli::finish::run(args)).expect("finish should succeed");
@@ -312,12 +299,128 @@ fn autosquash_with_no_message_still_rejects() {
     set_autosquash(repo, true);
     ready_plan_on_base(&env);
 
-    let args = finish_args(repo, "foo", None, false); // no message
+    let args = finish_args(repo, "foo", None); // no message
     let err = block_on(clank::cli::finish::run(args))
         .expect_err("no -m must reject even with autosquash on");
     assert!(
         err.to_string().contains("finish needs"),
         "educational message-required error, got: {err}"
+    );
+}
+
+#[test]
+fn finish_dash_m_rewords_a_plan_that_is_not_at_head() {
+    // The user's complaint: `clank finish <plan> -m "..."` on a plan whose
+    // finish commit is buried under later work must DWIM — reword it in place
+    // and replay the stacked commits — not error "must be HEAD". With
+    // autosquash the default, this is the common case.
+    let env = TestEnv::init();
+    env.register_team("claude", &["codex"], &[]);
+    let repo = env.repo();
+    set_autosquash(repo, true);
+    ready_plan_on_base(&env);
+
+    // Finish foo → collapses to ONE commit at HEAD (autosquash on protected main).
+    let mut args = finish_args(repo, "foo", None);
+    args.message = vec!["wrap up foo".into(), "the original summary".into()];
+    block_on(clank::cli::finish::run(args)).expect("initial finish");
+    assert_eq!(git_out(repo, &["rev-list", "--count", "HEAD"]), "2");
+
+    // Stack a later plan's commit on top, burying foo's finalize commit.
+    write(repo, "src/later.rs", "// later work\n");
+    commit(repo, "[bar] later work");
+    assert_eq!(git_out(repo, &["rev-list", "--count", "HEAD"]), "3");
+
+    // Reword foo's (now buried) finish message. Bare -m, no --squash.
+    let mut args = finish_args(repo, "foo", None);
+    args.message = vec![
+        "reworded foo summary".into(),
+        "a clearer whole-plan why".into(),
+    ];
+    block_on(clank::cli::finish::run(args)).expect("off-head reword should DWIM, not error");
+
+    // History unchanged in length; foo's finalize (HEAD~1) carries the new
+    // message; the stacked `[bar]` commit is preserved on top.
+    assert_eq!(git_out(repo, &["rev-list", "--count", "HEAD"]), "3");
+    assert_eq!(
+        git_out(repo, &["log", "-1", "--format=%s", "HEAD~1"]),
+        "[foo] reworded foo summary",
+        "buried finalize was reworded in place"
+    );
+    assert_eq!(
+        git_out(repo, &["log", "-1", "--format=%s"]),
+        "[bar] later work",
+        "the stacked commit is replayed unchanged on top"
+    );
+}
+
+#[test]
+fn finish_dash_m_rewords_when_the_finalize_is_head() {
+    // Reword goes through ONE engine path regardless of position: when the
+    // finalize IS HEAD it's a zero-descendant reword — message replaced,
+    // finished file untouched, history length unchanged.
+    let env = TestEnv::init();
+    env.register_team("claude", &["codex"], &[]);
+    let repo = env.repo();
+    set_autosquash(repo, true);
+    ready_plan_on_base(&env);
+
+    let mut args = finish_args(repo, "foo", None);
+    args.message = vec!["wrap up foo".into(), "the original summary".into()];
+    block_on(clank::cli::finish::run(args)).expect("initial finish");
+    assert_eq!(git_out(repo, &["rev-list", "--count", "HEAD"]), "2");
+    let finished_body = std::fs::read_to_string(repo.join(".clank/finished/foo.md")).unwrap();
+
+    let mut args = finish_args(repo, "foo", None);
+    args.message = vec![
+        "better foo summary".into(),
+        "a clearer why for the plan".into(),
+    ];
+    block_on(clank::cli::finish::run(args)).expect("at-HEAD reword");
+
+    assert_eq!(
+        git_out(repo, &["log", "-1", "--format=%s"]),
+        "[foo] better foo summary"
+    );
+    assert_eq!(git_out(repo, &["rev-list", "--count", "HEAD"]), "2");
+    assert_eq!(
+        std::fs::read_to_string(repo.join(".clank/finished/foo.md")).unwrap(),
+        finished_body,
+        "reword must not touch the finished file"
+    );
+}
+
+#[test]
+fn finish_dash_m_dry_previews_the_reword_without_changing_anything() {
+    // --dry threads into the engine's dry mode — the SAME computation the live
+    // run applies, printed instead of executed. Nothing may move.
+    let env = TestEnv::init();
+    env.register_team("claude", &["codex"], &[]);
+    let repo = env.repo();
+    set_autosquash(repo, true);
+    ready_plan_on_base(&env);
+
+    let mut args = finish_args(repo, "foo", None);
+    args.message = vec!["wrap up foo".into(), "the original summary".into()];
+    block_on(clank::cli::finish::run(args)).expect("initial finish");
+    write(repo, "src/later.rs", "// later work\n");
+    commit(repo, "[bar] later work");
+    let head_before = git_out(repo, &["rev-parse", "HEAD"]);
+
+    let mut args = finish_args(repo, "foo", None);
+    args.message = vec!["reworded".into(), "a clearer whole-plan why".into()];
+    args.dry = true;
+    block_on(clank::cli::finish::run(args)).expect("dry reword");
+
+    assert_eq!(
+        git_out(repo, &["rev-parse", "HEAD"]),
+        head_before,
+        "--dry must not move any ref"
+    );
+    assert_eq!(
+        git_out(repo, &["log", "-1", "--format=%s", "HEAD~1"]),
+        "[foo] wrap up foo",
+        "--dry must not rewrite the finalize message"
     );
 }
 
@@ -332,7 +435,7 @@ fn autosquash_squashes_on_protected_main_without_the_flag() {
     set_autosquash(repo, true);
     ready_plan_on_base(&env);
 
-    let mut args = finish_args(repo, "foo", None, false);
+    let mut args = finish_args(repo, "foo", None);
     args.message = vec!["wrap up foo".into(), "one commit on main".into()];
     // allow_rewrite_protected stays FALSE — autosquash must supply it.
     assert!(!args.allow_rewrite_protected);

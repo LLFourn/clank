@@ -1154,6 +1154,11 @@ pub fn parent_of_at(repo: &Path, sha: &CommitSha) -> Result<Option<CommitSha>, G
     open(repo)?.parent_of(sha)
 }
 
+/// [`Repo::commit_parent_count`] opening its own handle.
+pub fn commit_parent_count_at(repo: &Path, sha: &CommitSha) -> Result<usize, GitIoError> {
+    open(repo)?.commit_parent_count(sha)
+}
+
 /// [`Repo::tree_clank_paths`] opening its own handle.
 pub fn tree_clank_paths_at(repo: &Path, sha: &CommitSha) -> Result<Vec<String>, GitIoError> {
     open(repo)?.tree_clank_paths(sha)

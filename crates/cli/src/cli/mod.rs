@@ -1155,10 +1155,6 @@ pub struct FinishArgs {
     /// Repo root. Defaults to the cwd's git toplevel.
     #[arg(long, value_name = "PATH")]
     pub repo: Option<PathBuf>,
-    /// Amend HEAD instead of creating a new finalize commit. HEAD
-    /// must already be a finalize commit for this plan.
-    #[arg(long)]
-    pub amend: bool,
     /// REQUIRED (when authoring the finish commit): the whole plan's commit
     /// message — a brief WHAT subject and a WHY body, written as if the whole
     /// plan were one commit. It becomes the plan's squash summary. A bare
@@ -1189,9 +1185,11 @@ pub struct FinishArgs {
     /// combined with `--purge`/`--squash`.
     #[arg(long)]
     pub allow_rewrite_protected: bool,
-    /// Dry-run for `--purge`/`--squash`: emit the rebase-todo
-    /// without creating the finalize commit or moving any refs.
-    /// Ignored on plain `clank finish`.
+    /// Preview any history edit this finish would perform, without creating
+    /// commits or moving refs: the `--purge`/`--squash` rewrite plan, or the
+    /// reword plan for a bare `-m` on an already-finished plan (the same
+    /// computation the live run applies). Ignored on a plain fresh finish
+    /// (no history rewrite happens there).
     #[arg(long)]
     pub dry: bool,
     /// Skip the on-disk state cache: don't read it, don't write it.

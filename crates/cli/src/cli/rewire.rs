@@ -20,13 +20,7 @@ pub async fn run(args: RewireArgs) -> anyhow::Result<()> {
         .read_to_string(&mut input)
         .map_err(|e| anyhow::anyhow!("reading stdin: {e}"))?;
     let pairs = parse_pairs(&input);
-    let plan = plan_actions(&repo, &pairs);
-    let mut copied = 0usize;
-    for action in &plan.actions {
-        if copy_file(action)? {
-            copied += 1;
-        }
-    }
+    let copied = apply_pairs(&repo, &pairs)?;
     if copied > 0 {
         eprintln!(
             "clank rewire: copied feedback for {copied} commit{}",
@@ -34,6 +28,38 @@ pub async fn run(args: RewireArgs) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// Copy feedback for each `(old, new)` sha pair. Shared by the `post-rewrite`
+/// hook path ([`run`]) and in-process rewriters.
+fn apply_pairs(repo: &Path, pairs: &[RewritePair]) -> anyhow::Result<usize> {
+    let plan = plan_actions(repo, pairs);
+    let mut copied = 0usize;
+    for action in &plan.actions {
+        if copy_file(action)? {
+            copied += 1;
+        }
+    }
+    Ok(copied)
+}
+
+/// Migrate review feedback from each `old` sha to its `new` sha after an
+/// in-process history rewrite (e.g. `finish -m` rewording a buried finalize
+/// and replaying the work stacked on top). The git `post-rewrite` hook only
+/// fires for `git` rebase/amend, so a rewrite done via plumbing (`update-ref`)
+/// must call this to keep sha-keyed feedback attached to its commit.
+pub(crate) fn migrate_feedback_pairs(
+    repo: &Path,
+    pairs: &[(CommitSha, CommitSha)],
+) -> anyhow::Result<usize> {
+    let pairs: Vec<RewritePair> = pairs
+        .iter()
+        .map(|(old, new)| RewritePair {
+            old: old.clone(),
+            new: new.clone(),
+        })
+        .collect();
+    apply_pairs(repo, &pairs)
 }
 
 /// One stdin line, parsed.
@@ -391,6 +417,33 @@ mod tests {
             .collect();
         assert!(labels.iter().any(|l| l == "alice"));
         assert!(labels.iter().any(|l| l == "bob"));
+    }
+
+    #[test]
+    fn migrate_feedback_pairs_copies_forward() {
+        // The in-process entry point (used by `finish -m` off-head reword)
+        // migrates feedback to the new sha, same as the hook path.
+        let dir = make_repo();
+        let old = sha_full('a');
+        let new = sha_full('b');
+        write(
+            &dir.path()
+                .join(format!(".clank/agents/alice/feedback/{}.md", old.as_str())),
+            "CONTINUE\n",
+        );
+        let copied = migrate_feedback_pairs(dir.path(), &[(old, new.clone())]).unwrap();
+        assert_eq!(copied, 1);
+        let short = &new.as_str()[..7];
+        let full = dir
+            .path()
+            .join(format!(".clank/agents/alice/feedback/{}.md", new.as_str()));
+        let short_p = dir
+            .path()
+            .join(format!(".clank/agents/alice/feedback/{short}.md"));
+        assert!(
+            full.is_file() || short_p.is_file(),
+            "feedback must be migrated to the new sha"
+        );
     }
 
     #[test]

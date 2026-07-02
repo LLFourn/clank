@@ -31,6 +31,7 @@ pub async fn run(mut args: FinishArgs) -> anyhow::Result<()> {
 
     // Repeated `-m` values compose git-style: subject, blank line, body…
     let message = compose_finish_message(&args.message);
+    let already_finished = matches!(preview.readiness, FinalizeReadiness::AlreadyFinished);
 
     // `finish.autosquash`: treat a plain finish as `--squash <the -m message>`
     // — collapse the plan into one commit carrying the whole-plan message.
@@ -38,6 +39,11 @@ pub async fn run(mut args: FinishArgs) -> anyhow::Result<()> {
     // (respect its explicit rewrite), and `--no-squash` isn't given (per-finish
     // opt-out). `-m` stays MANDATORY: an empty `-m` composes to None, so
     // `args.squash` stays None → the normal path → validation rejects.
+    //
+    // NOT for an already-finished plan: there a bare `-m` is a REWORD of the
+    // finish message (handled below), not a re-collapse — auto-squashing it
+    // would route to the retroactive-squash path instead. Retroactive collapse
+    // stays available via an EXPLICIT `--squash`.
     //
     // Autosquash also implies `allow_rewrite_protected` (option A): the natural
     // clank workflow finalizes on the working branch, which is often
@@ -49,28 +55,29 @@ pub async fn run(mut args: FinishArgs) -> anyhow::Result<()> {
     // `clank finish --squash` is UNCHANGED (still needs
     // `--allow-rewrite-protected`).
     let cfg = crate::cli::config::load(&repo);
-    if cfg.finish.autosquash && args.squash.is_none() && !args.purge && !args.no_squash {
+    if cfg.finish.autosquash
+        && !already_finished
+        && args.squash.is_none()
+        && !args.purge
+        && !args.no_squash
+    {
         args.squash = message.clone();
         args.allow_rewrite_protected = true;
     }
 
     // Validate the message that will BECOME the final finish commit's message.
-    // With `--squash` that's the squash MSG (the finalize/amend commit made
+    // With `--squash` that's the squash MSG (the transient finalize commit made
     // first is collapsed away by `apply_squash`), so validating `-m` there
     // would miss the real message. `--purge` is NOT exempt: it authors a
     // finalize commit that survives a refused strip rewrite (see
     // `message_requiring_validation`).
-    let already_finished = matches!(preview.readiness, FinalizeReadiness::AlreadyFinished);
-    if let Some(final_msg) = message_requiring_validation(
-        already_finished,
-        args.amend,
-        message.as_deref(),
-        args.squash.as_deref(),
-    ) {
+    if let Some(final_msg) =
+        message_requiring_validation(already_finished, message.as_deref(), args.squash.as_deref())
+    {
         validate_finish_message(final_msg, &stem)?;
     }
 
-    // The transient finalize/amend commit carries the message that ultimately
+    // The transient finalize commit carries the message that ultimately
     // LANDS — the squash MSG when squashing — so a post-finalize rewrite that
     // is refused (e.g. protected-branch) leaves the validated message on HEAD,
     // never the `[stem] finish` placeholder (codex 053f9d1). It also renames
@@ -80,51 +87,48 @@ pub async fn run(mut args: FinishArgs) -> anyhow::Result<()> {
     let commit_message = finalize_commit_message(args.squash.as_deref(), message.as_deref())
         .map(|m| ensure_plan_tag(m, &stem));
 
-    // Amend on an already-finished plan: rewrite HEAD's commit
-    // (e.g. to refresh a stale message). The finalize tree is
-    // already on disk, so skip the file-moving `finalize()` path.
-    if args.amend && already_finished {
-        require_head_is_finalize(&repo, &stem)?;
-        if args.dry && (args.purge || args.squash.is_some()) {
-            return dry_run_finish_composite(&stem, &preview, &args);
-        }
-        amend_already_finished(&repo, &stem, commit_message.as_deref())?;
-        println!("amended HEAD with finalize tree for `{stem}`");
-        if args.purge || args.squash.is_some() {
-            run_post_finalize_rewrite(&repo, &plan_key, args).await?;
-        }
+    // A bare `-m` on an already-finished plan (no purge/squash) rewrites the
+    // finalize commit's message — the ergonomic way to fix or improve the
+    // whole-plan summary after the finish landed. ONE path regardless of where
+    // the finalize sits: `reword_in_place` rewords it (a no-descendant reword
+    // when it's HEAD; reword-and-replay when it's buried under later work — the
+    // common case once autosquash collapses each plan to one commit). No
+    // "must be HEAD" refusal, and no `--dry` short-circuit: the engine's `dry`
+    // flag prints the SAME plan the live run applies, so preview and execution
+    // cannot drift (ruthless a2314e9).
+    if already_finished && message.is_some() && !args.purge && args.squash.is_none() {
+        let target = state
+            .fold
+            .finished_plans
+            .iter()
+            .rev()
+            .find(|f| f.plan == plan_key)
+            .map(|f| f.finalized_at.clone())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no finalize commit recorded for `{stem}`; cannot reword its message"
+                )
+            })?;
+        reword_finalize(&repo, &stem, &target, commit_message.as_deref(), args.dry).await?;
         return Ok(());
     }
 
-    // A bare `-m` on an already-finished plan (no `--amend`, no purge/squash)
-    // rewrites the finalize commit's message — the ergonomic way to fix or
-    // improve the whole-plan summary after the finish landed, without the
-    // `--amend` ceremony.
-    if already_finished && message.is_some() && !args.amend && !args.purge && args.squash.is_none()
-    {
-        require_head_is_finalize(&repo, &stem)?;
-        if args.dry {
-            println!("# clank finish --dry: would rewrite the finish message for `{stem}`");
-            return Ok(());
-        }
-        amend_already_finished(&repo, &stem, commit_message.as_deref())?;
-        println!("rewrote finish message for `{stem}`");
-        return Ok(());
-    }
-
-    // Non-amend `--squash`/`--purge` on an already-finished plan:
-    // the finalize tree is already on disk, so skip `finalize()`
-    // (it would no-op) and run the rewrite directly. This un-blocks
-    // a keep-`.clank/` squash decided AFTER the finish landed
-    // (`finish-squash-idempotent-on-finished`). NOT factored with
-    // the `--amend` branch above: the load-bearing difference is
-    // that branch's `amend_already_finished` HEAD re-commit, which
-    // must stay amend-only — this path only rewrites the range, it
-    // does not touch the finalize commit. Plain `finish` (no
-    // purge/squash) still falls through to the no-op below.
+    // `--squash`/`--purge` on an already-finished plan: the finalize
+    // tree is already on disk, so skip `finalize()` (it would no-op)
+    // and run the rewrite directly. This un-blocks a keep-`.clank/`
+    // squash decided AFTER the finish landed
+    // (`finish-squash-idempotent-on-finished`). This path only
+    // rewrites the range; it does not touch the finalize commit.
+    // Plain `finish` (no purge/squash) still falls through to the
+    // no-op below. `--dry` is NOT short-circuited here: the engine's
+    // own dry mode prints the faithful plan (same computation the
+    // live run applies); the one finish-level fact it can't know is
+    // framed first.
     if already_finished && (args.purge || args.squash.is_some()) {
         if args.dry {
-            return dry_run_finish_composite(&stem, &preview, &args);
+            println!(
+                "# plan already finished; finalize commit left as-is (only the range is rewritten)."
+            );
         }
         run_post_finalize_rewrite(&repo, &plan_key, args).await?;
         return Ok(());
@@ -134,28 +138,12 @@ pub async fn run(mut args: FinishArgs) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    if args.amend {
-        require_head_is_finalize(&repo, &stem)?;
-    }
-
     if args.dry && (args.purge || args.squash.is_some()) {
         return dry_run_finish_composite(&stem, &preview, &args);
     }
 
-    finalize(
-        &repo,
-        &stem,
-        &preview,
-        args.amend,
-        commit_message.as_deref(),
-    )
-    .await?;
-
-    if args.amend {
-        println!("amended HEAD with finalize tree for `{stem}`");
-    } else {
-        println!("finalized `{stem}`");
-    }
+    finalize(&repo, &stem, &preview, commit_message.as_deref()).await?;
+    println!("finalized `{stem}`");
 
     if args.purge || args.squash.is_some() {
         run_post_finalize_rewrite(&repo, &plan_key, args).await?;
@@ -177,36 +165,33 @@ fn compose_finish_message(parts: &[String]) -> Option<String> {
 /// be validated — or `None` if this invocation authors no finish commit.
 ///
 /// - `--squash` collapses the range into one commit carrying the squash MSG,
-///   so THAT is validated (the transient finalize/amend commit is squashed
-///   away by `apply_squash`).
-/// - otherwise the finalize/amend message is validated on any authoring path:
-///   finalize create, `--amend`, or a bare `-m` rewrite on a finished plan.
-///   `--purge` is NOT exempt (codex 53a9edb): it still CREATES a finalize
-///   commit first, and if the strip rewrite is refused (protected branch,
-///   etc.) that commit SURVIVES — so it must not be the `[stem] finish`
-///   placeholder either.
-/// - a no-op finish on an already-finished plan (no `--amend`, no `-m`, and
-///   any purge/squash handled directly by the retroactive path) lands
-///   nothing.
+///   so THAT is validated (the transient finalize commit is squashed away by
+///   `apply_squash`).
+/// - otherwise the finalize message is validated on any authoring path:
+///   finalize create, or a bare `-m` rewrite on a finished plan. `--purge` is
+///   NOT exempt (codex 53a9edb): it still CREATES a finalize commit first, and
+///   if the strip rewrite is refused (protected branch, etc.) that commit
+///   SURVIVES — so it must not be the `[stem] finish` placeholder either.
+/// - a no-op finish on an already-finished plan (no `-m`, and any
+///   purge/squash handled directly by the retroactive path) lands nothing.
 ///
 /// The inner `Option<&str>` is the message itself — `Some(None)` means "a
 /// message is required here but none was supplied", which validation rejects.
 fn message_requiring_validation<'a>(
     already_finished: bool,
-    amend: bool,
     message: Option<&'a str>,
     squash: Option<&'a str>,
 ) -> Option<Option<&'a str>> {
     if squash.is_some() {
         Some(squash)
-    } else if !already_finished || amend || message.is_some() {
+    } else if !already_finished || message.is_some() {
         Some(message)
     } else {
         None
     }
 }
 
-/// The message to stamp on the transient finalize/amend commit: the squash
+/// The message to stamp on the transient finalize commit: the squash
 /// MSG when squashing (so a refused squash rewrite leaves the validated
 /// landing message, not the `[stem] finish` placeholder), else the `-m`.
 fn finalize_commit_message<'a>(
@@ -286,15 +271,15 @@ fn finish_message_help(stem: &str) -> String {
     )
 }
 
-/// Dry-run preview for `finish --purge`/`--squash`. Emits a
-/// description of the planned action without calling `finalize()`
-/// or running the rewrite engine. Covers all three finalize
-/// states: not-yet-finalized (the run would create the finalize),
-/// already-finished + `--amend` (would re-commit it), and
-/// already-finished without `--amend` (finalize left as-is; only
-/// the range is rewritten). Not pipeable to `git` — for the
-/// not-yet-finalized case the finalize commit doesn't exist yet,
-/// so the operator must run the live command first.
+/// Dry-run preview for a FRESH (not-yet-finalized) `finish --purge`/
+/// `--squash`. Emits a description without calling `finalize()` or the
+/// rewrite engine — the finalize commit doesn't exist yet, so the engine
+/// cannot compute the real post-finalize plan; the operator must run the
+/// live command. KNOWN GAP vs the one-computation rule (ruthless a2314e9):
+/// this is hand-rolled narration; converging it onto the engine needs a
+/// hypothetical-finalize preview — tracked as the
+/// `finish-fresh-dry-through-engine` follow-up. Already-finished `--dry`
+/// does NOT come here (it runs the engine's own dry mode).
 fn dry_run_finish_composite(
     stem: &str,
     preview: &FinishPreviewResponse,
@@ -302,31 +287,16 @@ fn dry_run_finish_composite(
 ) -> anyhow::Result<()> {
     println!("# clank finish --dry preview");
     println!("# plan: {}", preview.plan_id);
-    let already_finished = matches!(preview.readiness, FinalizeReadiness::AlreadyFinished);
     let msg = compose_finish_message(&args.message).unwrap_or_else(|| format!("[{stem}] finish"));
-    if already_finished && args.amend {
-        // --amend re-commits the existing finalize.
-        println!("# would amend HEAD finalize commit:");
-        println!("#   message: {msg}");
-    } else if already_finished {
-        // Non-amend rewrite on an already-finished plan: the
-        // finalize commit already exists and is NOT touched — only
-        // the range is rewritten below. (Was previously mislabeled
-        // "would create finalize commit"; codex c0c34ef.)
-        println!(
-            "# plan already finished; finalize commit left as-is (only the range is rewritten)."
-        );
-    } else {
-        // Ready, not yet finalized: this run creates the finalize.
-        println!("# would create finalize commit:");
-        println!("#   message: {msg}");
-        let approvers: Vec<&str> = preview
-            .sealed_approvals
-            .iter()
-            .map(|a| a.author.as_str())
-            .collect();
-        println!("#   sealed approvals: {}", approvers.join(", "));
-    }
+    // Ready, not yet finalized: this run creates the finalize.
+    println!("# would create finalize commit:");
+    println!("#   message: {msg}");
+    let approvers: Vec<&str> = preview
+        .sealed_approvals
+        .iter()
+        .map(|a| a.author.as_str())
+        .collect();
+    println!("#   sealed approvals: {}", approvers.join(", "));
     println!("#");
     if args.purge && args.squash.is_some() {
         println!(
@@ -473,7 +443,6 @@ async fn finalize(
     repo: &Path,
     stem: &str,
     _preview: &FinishPreviewResponse,
-    amend: bool,
     message: Option<&str>,
 ) -> anyhow::Result<()> {
     let finished_dir = repo.join(".clank/finished");
@@ -507,35 +476,69 @@ async fn finalize(
 
     let default_msg = format!("[{stem}] finish");
     let msg = message.unwrap_or(&default_msg);
-    crate::git_plumbing::commit(repo, msg, amend)?;
+    crate::git_plumbing::commit(repo, msg, false)?;
     Ok(())
 }
 
-fn amend_already_finished(repo: &Path, stem: &str, message: Option<&str>) -> anyhow::Result<()> {
-    let default_msg = format!("[{stem}] finish");
+/// Reword a finished plan's finalize commit WHEREVER it sits: `reword_in_place`
+/// rebuilds it with `message` (a no-descendant reword when it's HEAD;
+/// reword-and-replay when buried), then review feedback is migrated for every
+/// rewritten commit so `clank log` annotations follow the new shas. Implies
+/// `allow_rewrite_protected` — the finalize usually lives on `master`/`main`,
+/// and aggressively rewriting local plan history is the point (consistent with
+/// autosquash).
+///
+/// `dry` threads straight into the engine: the preview IS the live plan
+/// computed once and printed instead of applied (same descendants, same
+/// blockers), so `--dry` and execution cannot drift (ruthless a2314e9).
+///
+/// A history rewrite must disclose its extent at least as loudly as its
+/// preview (ruthless 883fb5e): report the replayed-descendant count and the
+/// branch's old → new move, plus the force-push consequence if the branch was
+/// already pushed.
+async fn reword_finalize(
+    repo: &Path,
+    stem: &str,
+    target: &clank_core::ids::CommitSha,
+    message: Option<&str>,
+    dry: bool,
+) -> anyhow::Result<()> {
+    let head =
+        crate::git_io::rev_parse_head(repo)?.ok_or_else(|| anyhow::anyhow!("repo has no HEAD"))?;
+    let default_msg = String::from("finish");
     let msg = message.unwrap_or(&default_msg);
-    crate::git_plumbing::commit(repo, msg, true)
-}
-
-fn require_head_is_finalize(repo: &Path, stem: &str) -> anyhow::Result<()> {
-    if !head_is_finalize_for(repo, stem)? {
-        anyhow::bail!(
-            "rewriting plan `{stem}`'s finish commit needs it to be HEAD, but HEAD \
-             is a different commit (work is stacked on top). Check out or rebase \
-             onto the finalize commit, or edit it via an interactive rebase.",
-        );
+    let pairs = crate::cli::rewrite::reword_in_place(crate::cli::rewrite::RewordOpts {
+        repo,
+        target_sha: target,
+        head_sha: &head,
+        new_message: msg,
+        allow_rewrite_protected: true,
+        dry,
+    })
+    .await?;
+    if dry {
+        // The engine printed the plan (target, descendant count, blockers).
+        return Ok(());
     }
+    crate::cli::rewire::migrate_feedback_pairs(repo, &pairs)?;
+    let short = |s: &str| s.chars().take(7).collect::<String>();
+    let branch = crate::git_io::current_branch_at(repo)?.unwrap_or_else(|| "HEAD".into());
+    let new_tip = pairs
+        .last()
+        .map(|(_, new)| short(new.as_str()))
+        .unwrap_or_default();
+    println!(
+        "rewrote finish message for `{stem}`: reworded {} and replayed {} stacked commit(s); \
+         `{branch}` {} → {new_tip}",
+        short(target.as_str()),
+        pairs.len().saturating_sub(1),
+        short(head.as_str()),
+    );
+    println!(
+        "note: this rewrote `{branch}` in place — if it was already pushed, push with \
+         `git push --force-with-lease`"
+    );
     Ok(())
-}
-
-fn head_is_finalize_for(repo: &Path, stem: &str) -> anyhow::Result<bool> {
-    let Some(head) = crate::git_io::rev_parse_head(repo)? else {
-        return Ok(false);
-    };
-    let finished_path = crate::init_facts::finished_md_rel(stem);
-    Ok(crate::git_io::diff_tree_changes_at(repo, &head)
-        .map(|c| c.clank_paths_touched.contains(&finished_path))
-        .unwrap_or(false))
 }
 
 #[cfg(test)]
@@ -686,11 +689,10 @@ mod tests {
     /// exactly as `run()` applies it.
     fn check(
         already_finished: bool,
-        amend: bool,
         message: Option<&str>,
         squash: Option<&str>,
     ) -> anyhow::Result<()> {
-        match message_requiring_validation(already_finished, amend, message, squash) {
+        match message_requiring_validation(already_finished, message, squash) {
             Some(m) => validate_finish_message(m, "foo"),
             None => Ok(()),
         }
@@ -701,19 +703,18 @@ mod tests {
         // codex c2122b3: `--squash` MSG is the message that LANDS, so a
         // placeholder squash message must be rejected (the finalize commit it
         // creates first is squashed away).
-        assert!(check(false, false, None, Some("finish")).is_err());
-        assert!(check(false, false, None, Some("just a subject no body")).is_err());
+        assert!(check(false, None, Some("finish")).is_err());
+        assert!(check(false, None, Some("just a subject no body")).is_err());
         assert!(
             check(
-                false,
                 false,
                 None,
                 Some("collapse fetch retries\n\nso transient DNS blips don't wedge the daemon"),
             )
             .is_ok()
         );
-        // The already-finished `--amend --squash` path has the same shape.
-        assert!(check(true, true, None, Some("done")).is_err());
+        // The retroactive already-finished `--squash` path has the same shape.
+        assert!(check(true, None, Some("done")).is_err());
     }
 
     #[test]
@@ -722,26 +723,21 @@ mod tests {
         // survives a refused strip rewrite, so it must carry a validated
         // message — no exemption. (Routing is purge-agnostic: it treats purge
         // like any finalize-authoring path.)
-        assert!(check(false, false, None, None).is_err()); // Ready + purge, no -m
-        assert!(check(false, false, Some("finish"), None).is_err()); // placeholder
-        assert!(
-            check(
-                false,
-                false,
-                Some("strip foo\n\nartifacts no longer needed"),
-                None
-            )
-            .is_ok()
-        );
+        assert!(check(false, None, None).is_err()); // Ready + purge, no -m
+        assert!(check(false, Some("finish"), None).is_err()); // placeholder
+        assert!(check(false, Some("strip foo\n\nartifacts no longer needed"), None).is_ok());
     }
 
     #[test]
     fn plain_finalize_still_requires_a_good_message() {
-        assert!(check(false, false, None, None).is_err()); // no -m
-        assert!(check(false, false, Some("finish"), None).is_err()); // placeholder
-        assert!(check(false, false, Some("add X\n\nbecause Y needed it"), None).is_ok());
+        assert!(check(false, None, None).is_err()); // no -m
+        assert!(check(false, Some("finish"), None).is_err()); // placeholder
+        assert!(check(false, Some("add X\n\nbecause Y needed it"), None).is_ok());
         // A no-op finish on an already-finished plan validates nothing.
-        assert!(check(true, false, None, None).is_ok());
+        assert!(check(true, None, None).is_ok());
+        // A bare `-m` reword on an already-finished plan IS validated.
+        assert!(check(true, Some("finish"), None).is_err());
+        assert!(check(true, Some("better summary\n\nwith a real why"), None).is_ok());
     }
 
     #[tokio::test]
@@ -753,9 +749,7 @@ mod tests {
         run_git(dir.path(), &["commit", "--quiet", "-m", "seed"]);
 
         let preview = mk_preview_ready();
-        finalize(dir.path(), "foo", &preview, false, None)
-            .await
-            .unwrap();
+        finalize(dir.path(), "foo", &preview, None).await.unwrap();
 
         let finished = dir.path().join(".clank/finished/foo.md");
         assert!(finished.exists(), "finished file should exist");
@@ -774,38 +768,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn amend_already_finished_rewrites_message_without_touching_finished_file() {
-        let dir = init_repo();
-        write_at(dir.path(), ".clank/plans/foo.md", "# foo body\n");
-        run_git(dir.path(), &["add", "-A"]);
-        run_git(dir.path(), &["commit", "--quiet", "-m", "seed"]);
-
-        let preview = mk_preview_ready();
-        finalize(dir.path(), "foo", &preview, false, None)
-            .await
-            .unwrap();
-
-        let finished = dir.path().join(".clank/finished/foo.md");
-        let original_body = std::fs::read_to_string(&finished).unwrap();
-        assert_eq!(original_body, "# foo body\n");
-
-        amend_already_finished(dir.path(), "foo", Some("custom amend message")).unwrap();
-
-        let out = std::process::Command::new("git")
-            .arg("-C")
-            .arg(dir.path())
-            .args(["log", "-1", "--format=%s"])
-            .output()
-            .unwrap();
-        assert_eq!(
-            String::from_utf8(out.stdout).unwrap().trim(),
-            "custom amend message"
-        );
-
-        assert_eq!(std::fs::read_to_string(&finished).unwrap(), original_body);
-    }
-
-    #[tokio::test]
     async fn finalize_replaces_old_directory_style_marker() {
         let dir = init_repo();
         write_at(dir.path(), ".clank/plans/foo.md", "# foo\n");
@@ -816,9 +778,7 @@ mod tests {
         write_at(dir.path(), ".clank/finished/foo/codex.md", "CONTINUE\n");
 
         let preview = mk_preview_ready();
-        finalize(dir.path(), "foo", &preview, false, None)
-            .await
-            .unwrap();
+        finalize(dir.path(), "foo", &preview, None).await.unwrap();
 
         let finished = dir.path().join(".clank/finished/foo.md");
         assert!(finished.is_file(), "should produce .md file");
