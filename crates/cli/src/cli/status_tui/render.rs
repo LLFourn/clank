@@ -170,22 +170,24 @@ pub(super) fn render_at(
         }
     }
 
-    // Queue: a tall pane gets the full block; otherwise one
-    // summary line — head of the queue + how many more.
+    // Queue gauge: PANEL-LESS renders only — a repo with an agents
+    // panel gets the interactive QUEUE section between AGENTS and LOG
+    // instead (rendering both would duplicate the list). A tall pane
+    // gets the full block; otherwise one summary line.
     let queue_block = rows >= 12 && snap.queue.len() > 1;
-    if !snap.queue.is_empty() {
+    if !snap.queue.is_empty() && snap.agents.is_empty() {
         if queue_block {
-            for (i, name) in snap.queue.iter().enumerate() {
+            for (i, item) in snap.queue.iter().enumerate() {
                 body.push(if i == 0 {
-                    vec![label("queue"), plain(name.clone())]
+                    vec![label("queue"), plain(item.name.clone())]
                 } else {
-                    vec![label(""), dim(name.clone())]
+                    vec![label(""), dim(item.name.clone())]
                 });
             }
         } else if !(snap.plans.is_empty() && snap.queue.len() == 1) {
             // (suppressed when the bar itself is the promote line
             // for the only queued item — it would be a repeat)
-            let mut line = vec![label("next"), plain(snap.queue[0].clone())];
+            let mut line = vec![label("next"), plain(snap.queue[0].name.clone())];
             if snap.queue.len() > 1 {
                 line.push(dim(format!(" +{}", snap.queue.len() - 1)));
             }
@@ -319,6 +321,39 @@ pub(super) fn render_at(
                     cols,
                 ));
             }
+        }
+    }
+
+    // QUEUE — the queued plans between AGENTS and LOG, priority order
+    // (lower NNN first). Selection continues from the panel: rows sit at
+    // indices `agents.len()+1 ..` after the "+ add" row. Enter reads the
+    // draft, `o` opens its HTML page, +/- nudge its priority. Hidden when
+    // the queue is empty (no empty header); panel-less renders keep the
+    // gauge summary above instead.
+    if !snap.agents.is_empty() && !snap.queue.is_empty() && out.len() < rows {
+        let agents_focused = mode.agents_focused();
+        out.push(region_rule(
+            "queue",
+            "⏎ read · o page · +/- priority",
+            agents_focused,
+            cols,
+        ));
+        for (i, item) in snap.queue.iter().enumerate() {
+            if out.len() >= rows {
+                break;
+            }
+            let spans = vec![
+                plain("  ".to_string()),
+                dim(format!("{:03} ", item.priority)),
+                plain(item.name.clone()),
+            ];
+            let sel_idx = snap.agents.len() + 1 + i;
+            out.push(row_line(
+                &spans,
+                mode.selected() == Some(sel_idx),
+                color,
+                cols,
+            ));
         }
     }
 
@@ -560,8 +595,14 @@ pub(super) fn bar_text(snap: &StatusSnapshot) -> (String, String) {
                     b.answer.is_none() && (b.plan.is_none() || b.plan.as_deref() == Some(name))
                 })
             };
-            let promotable = snap.queue.iter().find(|name| !pending(name)).cloned();
-            let head = promotable.clone().unwrap_or_else(|| snap.queue[0].clone());
+            let promotable = snap
+                .queue
+                .iter()
+                .find(|item| !pending(&item.name))
+                .map(|item| item.name.clone());
+            let head = promotable
+                .clone()
+                .unwrap_or_else(|| snap.queue[0].name.clone());
             let right = if snap.queue.len() > 1 {
                 format!("{head} +{}", snap.queue.len() - 1)
             } else {
@@ -2009,6 +2050,83 @@ mod tests {
         assert!(
             line_with(&mas, "unbound").contains("\x1b[31m"),
             "unbound renders red"
+        );
+    }
+
+    #[test]
+    fn queue_section_renders_between_agents_and_log_with_selection() {
+        // Two agents + two queued items: the QUEUE section sits between
+        // AGENTS and LOG, priority-ordered, and the panel selection
+        // continues past "+ add" into the queue rows.
+        let mut s = two_agent_snap();
+        s.queue = vec![
+            crate::cli::status::QueueItemView {
+                priority: 100,
+                name: "urgent-fix".into(),
+            },
+            crate::cli::status::QueueItemView {
+                priority: 800,
+                name: "later-idea".into(),
+            },
+        ];
+        // sel 3 = first queue row (0-1 agents, 2 "+ add").
+        let out = render_at(
+            &s,
+            40,
+            80,
+            0,
+            0,
+            &PanelView::just(Mode::AgentPanel { sel: 3 }),
+        )
+        .0;
+        let texts: Vec<String> = out.iter().map(|l| visible(l)).collect();
+        let pos = |needle: &str| texts.iter().position(|t| t.contains(needle));
+        let (agents_rule, queue_rule, log_rule) = (
+            pos("AGENTS").expect("agents rule"),
+            pos("QUEUE").expect("queue rule"),
+            pos("LOG").expect("log rule"),
+        );
+        assert!(
+            agents_rule < queue_rule && queue_rule < log_rule,
+            "QUEUE sits between AGENTS and LOG"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("100 urgent-fix"))
+                && texts.iter().any(|t| t.contains("800 later-idea")),
+            "queue rows show priority + name: {texts:?}"
+        );
+        let a = pos("urgent-fix").unwrap();
+        let b = pos("later-idea").unwrap();
+        assert!(a < b, "priority order (lower NNN first)");
+        // The selected queue row carries the unified selection band.
+        let row_idx = texts
+            .iter()
+            .position(|t| t.contains("100 urgent-fix"))
+            .expect("queue row");
+        assert!(
+            out[row_idx].contains(REVERSE),
+            "queue row selection band: {:?}",
+            out[row_idx]
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("+/- priority")),
+            "reprioritise hint shown"
+        );
+
+        // Empty queue: the section vanishes entirely.
+        let s = two_agent_snap();
+        let out = render_at(
+            &s,
+            40,
+            80,
+            0,
+            0,
+            &PanelView::just(Mode::AgentPanel { sel: 0 }),
+        )
+        .0;
+        assert!(
+            !out.iter().any(|l| visible(l).contains("QUEUE")),
+            "no empty QUEUE header"
         );
     }
 

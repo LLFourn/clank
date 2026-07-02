@@ -40,8 +40,12 @@ pub(super) enum Key {
     /// `n` — decline.
     No,
     /// `o` — open the current plan/commit detail overlay as its rendered
-    /// HTML page in the browser. A no-op outside an overlay.
+    /// HTML page in the browser (or a queue row's page from the panel).
     Html,
+    /// `+` — nudge the selected queue row's priority number up (later).
+    Plus,
+    /// `-` — nudge the selected queue row's priority number down (sooner).
+    Minus,
 }
 
 /// Which region (and sub-state) owns the keyboard. The backbone of key
@@ -201,6 +205,27 @@ pub(super) enum DetailNav {
     MoveCursor(usize),
     /// Activate the action under the cursor.
     Activate(DetailAction),
+}
+
+/// Re-bind the panel cursor across a data refresh. An agent/"+ add"
+/// cursor re-bounds by CLAMP to the new roster; a QUEUE-row cursor is
+/// re-bound by NAME (`queue_name`, captured from the OLD snapshot) — the
+/// refresh is often self-inflicted (a reprioritise renames the queue
+/// file and re-sorts the list), and the cursor must FOLLOW the item, not
+/// snap back to "+ add". A vanished item (promoted/removed under us)
+/// drops the cursor to the "+ add" row.
+pub(super) fn rebind_panel_sel(
+    old_sel: usize,
+    queue_name: Option<&str>,
+    agents_len: usize,
+    queue: &[crate::cli::status::QueueItemView],
+) -> usize {
+    if let Some(name) = queue_name
+        && let Some(pos) = queue.iter().position(|q| q.name == name)
+    {
+        return agents_len + 1 + pos;
+    }
+    old_sel.min(agents_len)
 }
 
 /// Re-locate an open detail page by LABEL after a roster rebuild:
@@ -368,32 +393,66 @@ pub(super) enum PanelAction {
     OpenDetail(usize),
     /// Open the add picker (Enter/Space on the "+ add" row).
     OpenPicker,
+    /// Open a queued plan's read overlay (Enter on a queue row).
+    OpenQueueItem(usize),
+    /// Open a queued plan's HTML page in the browser (`o` on a queue row).
+    OpenQueueHtml(usize),
+    /// Nudge a queue row's priority by `delta` (+/- on a queue row); the
+    /// loop clamps to 0-999 and writes through `queue::set_priority`.
+    NudgeQueue {
+        idx: usize,
+        delta: i16,
+    },
 }
 
 /// Pure key routing for the agent panel. `agents` is the roster; the
-/// "+ add" row sits at index `agents.len()`. Removal/role/tier are no
+/// "+ add" row sits at index `agents.len()`; `queue_len` QUEUE rows
+/// follow at `agents.len()+1..` (Enter reads the queued plan, `o` opens
+/// its HTML page, +/- nudge its priority). Removal/role/tier are no
 /// longer panel actions — Enter opens the detail page where they live.
 pub(super) fn agent_panel_action(
     sel: usize,
     agents: &[crate::cli::status::AgentAutoRow],
+    queue_len: usize,
     key: Key,
 ) -> PanelAction {
     let add_row = agents.len();
+    let total = add_row + 1 + queue_len;
     let on_add = sel == add_row;
+    // A queue row's index within the queue list, when the cursor is on one.
+    let queue_idx = (sel > add_row).then(|| sel - add_row - 1);
+    let on_last = sel + 1 == total;
     match key {
         Key::Quit => PanelAction::Quit,
         Key::Focus | Key::Escape => PanelAction::LeaveFocus,
-        Key::Up => PanelAction::MoveCursor(move_selection(sel, add_row + 1, false)),
-        // `Down` past the bottom row ("+ add") flows into the log —
-        // continuous navigation across the panel↔log boundary.
-        Key::Down if on_add => PanelAction::EnterLog,
-        Key::Down => PanelAction::MoveCursor(move_selection(sel, add_row + 1, true)),
-        // Enter activates the row: the picker on "+ add", the detail page
-        // on an agent. Space is the quick inline auto-toggle (or the
-        // picker on "+ add").
+        Key::Up => PanelAction::MoveCursor(move_selection(sel, total, false)),
+        // `Down` past the bottom row flows into the log — continuous
+        // navigation across the panel↔log boundary.
+        Key::Down if on_last => PanelAction::EnterLog,
+        Key::Down => PanelAction::MoveCursor(move_selection(sel, total, true)),
+        // Enter activates the row: the picker on "+ add", a read overlay
+        // on a queue row, the detail page on an agent. Space is the quick
+        // inline auto-toggle (or the picker on "+ add"); it does nothing
+        // on a queue row (no accidental overlay).
         Key::Enter if on_add => PanelAction::OpenPicker,
-        Key::Enter => PanelAction::OpenDetail(sel),
+        Key::Enter => match queue_idx {
+            Some(q) => PanelAction::OpenQueueItem(q),
+            None => PanelAction::OpenDetail(sel),
+        },
+        Key::Html => match queue_idx {
+            Some(q) => PanelAction::OpenQueueHtml(q),
+            None => PanelAction::None,
+        },
+        Key::Plus if queue_idx.is_some() => PanelAction::NudgeQueue {
+            idx: queue_idx.unwrap(),
+            delta: 50,
+        },
+        Key::Minus if queue_idx.is_some() => PanelAction::NudgeQueue {
+            idx: queue_idx.unwrap(),
+            delta: -50,
+        },
         Key::Space if on_add => PanelAction::OpenPicker,
+        Key::Space if queue_idx.is_some() => PanelAction::None,
         Key::Space => PanelAction::ToggleAuto(sel),
         _ => PanelAction::None,
     }
@@ -460,6 +519,8 @@ pub(super) fn parse_keys(bytes: &[u8]) -> Vec<Key> {
                 b'y' => keys.push(Key::Yes),
                 b'n' => keys.push(Key::No),
                 b'o' => keys.push(Key::Html),
+                b'+' => keys.push(Key::Plus),
+                b'-' => keys.push(Key::Minus),
                 0x1b => keys.push(Key::Escape),
                 b'q' => keys.push(Key::Quit),
                 _ => {}
@@ -738,49 +799,132 @@ mod tests {
         // "+ add" row is index 2 (== agents.len()): Enter AND Space open
         // the picker.
         assert_eq!(
-            agent_panel_action(2, &agents, Key::Enter),
+            agent_panel_action(2, &agents, 0, Key::Enter),
             PanelAction::OpenPicker
         );
         assert_eq!(
-            agent_panel_action(2, &agents, Key::Space),
+            agent_panel_action(2, &agents, 0, Key::Space),
             PanelAction::OpenPicker
         );
         // Agent rows: Enter opens the detail page; Space toggles auto.
         assert_eq!(
-            agent_panel_action(1, &agents, Key::Enter),
+            agent_panel_action(1, &agents, 0, Key::Enter),
             PanelAction::OpenDetail(1)
         );
         assert_eq!(
-            agent_panel_action(1, &agents, Key::Space),
+            agent_panel_action(1, &agents, 0, Key::Space),
             PanelAction::ToggleAuto(1)
         );
         // DEL is no longer a panel action (removal lives on the detail page).
         assert_eq!(
-            agent_panel_action(1, &agents, Key::Delete),
+            agent_panel_action(1, &agents, 0, Key::Delete),
             PanelAction::None
         );
         // Navigation: Down within the panel moves; Down at the +add row
         // (index 2 == agents.len()) crosses into the log; Tab/Esc leave;
         // q quits.
         assert_eq!(
-            agent_panel_action(0, &agents, Key::Down),
+            agent_panel_action(0, &agents, 0, Key::Down),
             PanelAction::MoveCursor(1)
         );
         assert_eq!(
-            agent_panel_action(2, &agents, Key::Down),
+            agent_panel_action(2, &agents, 0, Key::Down),
             PanelAction::EnterLog,
             "Down past +add flows into the log"
         );
         assert_eq!(
-            agent_panel_action(0, &agents, Key::Up),
+            agent_panel_action(0, &agents, 0, Key::Up),
             PanelAction::MoveCursor(0),
             "Up at the top stays put"
         );
         assert_eq!(
-            agent_panel_action(1, &agents, Key::Focus),
+            agent_panel_action(1, &agents, 0, Key::Focus),
             PanelAction::LeaveFocus
         );
-        assert_eq!(agent_panel_action(1, &agents, Key::Quit), PanelAction::Quit);
+        assert_eq!(
+            agent_panel_action(1, &agents, 0, Key::Quit),
+            PanelAction::Quit
+        );
+    }
+
+    #[test]
+    fn agent_panel_action_routes_queue_rows() {
+        use crate::cli::teams_config::RosterRole;
+        use clank_core::vocab::AutoMode;
+        let agents = vec![
+            agent_row("claude", RosterRole::Master, AutoMode::On),
+            agent_row("codex", RosterRole::Commit, AutoMode::Off),
+        ];
+        // Rows: 0-1 agents, 2 "+ add", 3-4 the two queue rows.
+        let ql = 2;
+        // Enter on a queue row reads it; `o` opens its HTML page.
+        assert_eq!(
+            agent_panel_action(3, &agents, ql, Key::Enter),
+            PanelAction::OpenQueueItem(0)
+        );
+        assert_eq!(
+            agent_panel_action(4, &agents, ql, Key::Html),
+            PanelAction::OpenQueueHtml(1)
+        );
+        // +/- nudge the priority number by 50 (loop clamps + persists via
+        // queue::set_priority).
+        assert_eq!(
+            agent_panel_action(3, &agents, ql, Key::Plus),
+            PanelAction::NudgeQueue { idx: 0, delta: 50 }
+        );
+        assert_eq!(
+            agent_panel_action(3, &agents, ql, Key::Minus),
+            PanelAction::NudgeQueue { idx: 0, delta: -50 }
+        );
+        // Space on a queue row is inert (no accidental overlay); `o` on an
+        // agent row is inert too.
+        assert_eq!(
+            agent_panel_action(3, &agents, ql, Key::Space),
+            PanelAction::None
+        );
+        assert_eq!(
+            agent_panel_action(1, &agents, ql, Key::Html),
+            PanelAction::None
+        );
+        // Down from "+ add" now enters the queue, not the log; Down from
+        // the LAST queue row crosses into the log.
+        assert_eq!(
+            agent_panel_action(2, &agents, ql, Key::Down),
+            PanelAction::MoveCursor(3)
+        );
+        assert_eq!(
+            agent_panel_action(4, &agents, ql, Key::Down),
+            PanelAction::EnterLog
+        );
+        // With an empty queue, Down from "+ add" still enters the log.
+        assert_eq!(
+            agent_panel_action(2, &agents, 0, Key::Down),
+            PanelAction::EnterLog
+        );
+    }
+
+    #[test]
+    fn rebind_panel_sel_follows_a_queue_row_by_name_across_refresh() {
+        use crate::cli::status::QueueItemView;
+        let q = |prio: u16, name: &str| QueueItemView {
+            priority: prio,
+            name: name.to_string(),
+        };
+        // Cursor was on "b" (sel 4 = agents 2 + add 1 + queue idx 1); a
+        // nudge re-sorted the queue so "b" is now FIRST — the cursor
+        // follows it to sel 3, never snapping back to "+ add".
+        let new_queue = [q(100, "b"), q(500, "a")];
+        assert_eq!(rebind_panel_sel(4, Some("b"), 2, &new_queue), 3);
+        // The item left the queue (promoted/removed) → "+ add" row.
+        let without_b = [q(500, "a")];
+        assert_eq!(rebind_panel_sel(4, Some("b"), 2, &without_b), 2);
+        // A non-queue cursor keeps the old clamp semantics.
+        assert_eq!(rebind_panel_sel(1, None, 2, &new_queue), 1);
+        assert_eq!(
+            rebind_panel_sel(9, None, 2, &new_queue),
+            2,
+            "clamped to +add"
+        );
     }
 
     #[test]

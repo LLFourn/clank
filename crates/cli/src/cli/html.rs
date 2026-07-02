@@ -162,6 +162,8 @@ fn open_target_label(args: &crate::cli::HtmlOpenArgs) -> String {
         format!("commit {}", &sha[..sha.len().min(9)])
     } else if let Some(plan) = &args.plan {
         format!("plan {plan}")
+    } else if let Some(name) = &args.queue {
+        format!("queued plan {name}")
     } else {
         "the report".to_string()
     }
@@ -226,6 +228,15 @@ async fn resolve_open_target_path(
             .ok_or_else(|| anyhow::anyhow!("not a known commit: `{raw}`"))?;
         return Ok(out_dir.join(format!("commit/{}.html", sha.as_str())));
     }
+    if let Some(name) = args.queue.as_deref() {
+        let known = crate::cli::queue::scan_queue(repo)
+            .into_iter()
+            .any(|e| e.name == name);
+        if !known {
+            anyhow::bail!("`{name}` is not in the queue (see `clank queue`)");
+        }
+        return Ok(out_dir.join(format!("queue/{name}.html")));
+    }
     match args.plan.as_deref() {
         Some(raw) => {
             let state =
@@ -241,10 +252,12 @@ async fn resolve_open_target_path(
     }
 }
 
-/// The command-line target for opening a plan/commit page in the browser.
+/// The command-line target for opening a plan/commit/queue page in the
+/// browser.
 pub enum HtmlOpenTarget<'a> {
     Plan(&'a str),
     Commit(&'a str),
+    Queue(&'a str),
 }
 
 /// Build the argv (after the program name) the TUI spawns to open a
@@ -272,6 +285,10 @@ pub fn html_open_argv(repo: &Path, target: HtmlOpenTarget, rebuild: bool) -> Vec
         HtmlOpenTarget::Commit(sha) => {
             argv.push("--commit".to_string());
             argv.push(sha.to_string());
+        }
+        HtmlOpenTarget::Queue(name) => {
+            argv.push("--queue".to_string());
+            argv.push(name.to_string());
         }
     }
     argv
@@ -375,11 +392,32 @@ async fn build_site(
     // skip the full fold.
     write_events_cache(out_dir, &events)?;
 
+    // Queue pages — always fully re-rendered: the queue changes without
+    // commits (add/remove/promote/reprioritise), the files are few and
+    // cheap, and wiping the dir first drops pages for items that left
+    // the queue.
+    let queue_entries = crate::cli::queue::scan_queue(repo);
+    let queue_dir = out_dir.join("queue");
+    let _ = std::fs::remove_dir_all(&queue_dir);
+    std::fs::create_dir_all(&queue_dir)?;
+    for entry in &queue_entries {
+        let body = std::fs::read_to_string(&entry.path).unwrap_or_default();
+        let page = render_queue_page(&entry.name, entry.priority, &body);
+        std::fs::write(queue_dir.join(format!("{}.html", entry.name)), page)?;
+    }
+
     // Index page — always full re-render so the status header,
     // verdict marks, and umbrella grouping reflect current
     // state regardless of slice contents.
     let head_str = head_sha.as_ref().map(|s| s.as_str());
-    let index_html = render_index(&status, &events, &reviews, &subjects, head_str);
+    let index_html = render_index(
+        &status,
+        &queue_entries,
+        &events,
+        &reviews,
+        &subjects,
+        head_str,
+    );
     std::fs::write(out_dir.join("index.html"), index_html)?;
 
     // Per-commit pages: write every commit whose page is
@@ -962,6 +1000,7 @@ fn collect_reviews(repo: &Path, shas: &[CommitSha]) -> BTreeMap<String, Vec<Revi
 
 fn render_index(
     status: &StatusSnapshot,
+    queue: &[crate::cli::queue::QueueEntry],
     events: &[LogEvent],
     reviews: &BTreeMap<String, Vec<Review>>,
     subjects: &BTreeMap<String, String>,
@@ -1015,12 +1054,18 @@ fn render_index(
     } else {
         out.push_str("  <div class=\"empty\">No active plans — repo is idle.</div>\n");
     }
-    if !status.queue.is_empty() {
-        out.push_str(&format!(
-            "  <div class=\"queue\">queue: {} item{}</div>\n",
-            status.queue.len(),
-            if status.queue.len() == 1 { "" } else { "s" }
-        ));
+    // QUEUE block — the queued plans by priority, each linking to its
+    // page. Omitted entirely when the queue is empty (no empty header).
+    if !queue.is_empty() {
+        out.push_str("  <div class=\"queue\">queue:\n    <ul>\n");
+        for e in queue {
+            out.push_str(&format!(
+                "      <li><a class=\"plan-pill\" href=\"queue/{name}.html\">{name}</a> <code>{prio:03}</code></li>\n",
+                name = esc(&e.name),
+                prio = e.priority,
+            ));
+        }
+        out.push_str("    </ul>\n  </div>\n");
     }
     if !status.blocks.is_empty() {
         out.push_str("  <div class=\"blocks\">blocks:\n    <ul>\n");
@@ -1382,6 +1427,33 @@ fn plan_body_at_head(repo: &Path, stem: &str, lifecycle: PlanLifecycle) -> Optio
         PlanLifecycle::Finished => crate::init_facts::finished_md_rel(stem),
     };
     crate::git_io::show_blob(repo, &head, std::path::Path::new(&path)).ok()
+}
+
+/// A queued plan's page: the draft body as markdown under a header naming
+/// the queue position. Mirrors the plan page's shape so queued and active
+/// plans read consistently; no timeline (a queued plan has no commits yet).
+fn render_queue_page(name: &str, priority: u16, body: &str) -> String {
+    let mut out = String::new();
+    write_doc_open(&mut out, &format!("queued {name} · clank"), "..");
+    out.push_str("<header class=\"plan-header\">\n");
+    out.push_str("  <p class=\"crumb\"><a href=\"../index.html\">← timeline</a></p>\n");
+    out.push_str(&format!(
+        "  <h1><span class=\"plan-pill\">{}</span></h1>\n",
+        esc(name)
+    ));
+    out.push_str(&format!(
+        "  <div class=\"plan-state\">queued · priority {priority:03}</div>\n"
+    ));
+    out.push_str("</header>\n");
+    out.push_str("<main>\n");
+    out.push_str("<section class=\"plan-body\">\n");
+    out.push_str("  <article class=\"md\">\n");
+    out.push_str(&render_markdown(body));
+    out.push_str("  </article>\n");
+    out.push_str("</section>\n");
+    out.push_str("</main>\n");
+    write_doc_close(&mut out);
+    out
 }
 
 fn render_plan_page(
@@ -2264,6 +2336,59 @@ mod tests {
         );
         assert!(html.contains("build failed: boom"));
         assert!(html.contains("#f26d6d"), "error accent");
+    }
+
+    #[test]
+    fn render_queue_page_shows_name_priority_and_body() {
+        let html = render_queue_page(
+            "my-idea",
+            250,
+            "# my-idea\n\nDo the thing because reasons.\n",
+        );
+        assert!(html.contains("my-idea"));
+        assert!(html.contains("queued · priority 250"));
+        assert!(html.contains("Do the thing because reasons."));
+        assert!(html.contains("../index.html"), "crumb back to the timeline");
+    }
+
+    #[test]
+    fn render_index_queue_block_lists_by_priority_and_hides_when_empty() {
+        use crate::cli::queue::QueueEntry;
+        let status = crate::cli::status_tui::fixtures::snap(vec![], vec![]);
+        let empty_events: Vec<LogEvent> = Vec::new();
+        let reviews = BTreeMap::new();
+        let subjects = BTreeMap::new();
+
+        // Non-empty queue: a QUEUE block with per-item links, priority order.
+        let queue = vec![
+            QueueEntry {
+                priority: 100,
+                name: "urgent-fix".into(),
+                path: "/x/.clank/queue/100-urgent-fix.md".into(),
+            },
+            QueueEntry {
+                priority: 800,
+                name: "later-idea".into(),
+                path: "/x/.clank/queue/800-later-idea.md".into(),
+            },
+        ];
+        let html = render_index(&status, &queue, &empty_events, &reviews, &subjects, None);
+        assert!(
+            html.contains("queue/urgent-fix.html"),
+            "item links to its page"
+        );
+        assert!(html.contains("queue/later-idea.html"));
+        assert!(
+            html.contains("100") && html.contains("800"),
+            "priorities shown"
+        );
+        let a = html.find("urgent-fix").unwrap();
+        let b = html.find("later-idea").unwrap();
+        assert!(a < b, "priority order (lower NNN first)");
+
+        // Empty queue: the block is omitted entirely (no empty header).
+        let html = render_index(&status, &[], &empty_events, &reviews, &subjects, None);
+        assert!(!html.contains("class=\"queue\""), "no empty queue block");
     }
 
     #[test]

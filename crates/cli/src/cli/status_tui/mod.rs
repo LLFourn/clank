@@ -269,6 +269,12 @@ enum OverlayData {
         stem: String,
         markdown: Option<String>,
     },
+    /// A QUEUED plan's markdown by name (source: `.clank/queue/`, not
+    /// `plans/`); `markdown` is `None` when it left the queue.
+    QueuedPlan {
+        name: String,
+        markdown: Option<String>,
+    },
 }
 
 /// An open document overlay: the fetched [`OverlayData`] and the scroll
@@ -296,6 +302,13 @@ impl Overlay {
     fn plan(stem: String, markdown: Option<String>) -> Self {
         Self {
             data: OverlayData::Plan { stem, markdown },
+            offset: 0,
+        }
+    }
+    /// A queued-plan overlay, opened at the top.
+    fn queued(name: String, markdown: Option<String>) -> Self {
+        Self {
+            data: OverlayData::QueuedPlan { name, markdown },
             offset: 0,
         }
     }
@@ -387,11 +400,22 @@ fn read_plan_markdown(repo: &std::path::Path, stem: &str) -> Option<String> {
     None
 }
 
+/// Read a queued plan's markdown by NAME via a fresh queue scan — the
+/// priority prefix can change under us (a reprioritise renames the file),
+/// so the path is resolved at read time, never cached.
+fn read_queue_markdown(repo: &std::path::Path, name: &str) -> Option<String> {
+    let entry = crate::cli::queue::scan_queue(repo)
+        .into_iter()
+        .find(|e| e.name == name)?;
+    std::fs::read_to_string(&entry.path).ok()
+}
+
 /// What an open overlay can render as HTML — a plan stem or a full commit
 /// sha, owned so the overlay's borrow is released before dispatch.
 enum HtmlTarget {
     Plan(String),
     Commit(String),
+    Queue(String),
 }
 
 /// Open the overlay's plan/commit as its rendered HTML page in the host
@@ -408,6 +432,9 @@ fn open_overlay_in_browser(repo: &std::path::Path, target: &HtmlTarget) {
             let page = repo.join(format!(".clank/html/commit/{sha}.html"));
             (HtmlOpenTarget::Commit(sha.as_str()), !page.exists())
         }
+        // Queue pages are re-rendered on every build, so no --rebuild
+        // heuristic is needed — a plain open regenerates the site.
+        HtmlTarget::Queue(name) => (HtmlOpenTarget::Queue(name.as_str()), false),
     };
     let argv = crate::cli::html::html_open_argv(repo, open_target, rebuild);
     if let Ok(exe) = std::env::current_exe() {
@@ -603,6 +630,13 @@ pub(crate) async fn run_tui(
                     rows as usize,
                     cols as usize,
                 ),
+                OverlayData::QueuedPlan { name, markdown } => render_plan_doc(
+                    name,
+                    markdown.as_deref(),
+                    overlay.offset,
+                    rows as usize,
+                    cols as usize,
+                ),
             };
             // Extract the html-open target by value up front so the
             // `OpenHtml` arm doesn't hold a borrow of `detail` (the `Back`
@@ -610,6 +644,7 @@ pub(crate) async fn run_tui(
             let html_target: HtmlTarget = match &overlay.data {
                 OverlayData::Commit(d) => HtmlTarget::Commit(d.sha.as_str().to_string()),
                 OverlayData::Plan { stem, .. } => HtmlTarget::Plan(stem.clone()),
+                OverlayData::QueuedPlan { name, .. } => HtmlTarget::Queue(name.clone()),
             };
             paint(&lines);
             match ev_rx.recv_timeout(Duration::from_secs(60)) {
@@ -636,6 +671,13 @@ pub(crate) async fn run_tui(
                             Some(OverlayData::Plan {
                                 markdown: read_plan_markdown(&repo, &stem),
                                 stem,
+                            })
+                        }
+                        OverlayData::QueuedPlan { name, .. } => {
+                            let name = name.clone();
+                            Some(OverlayData::QueuedPlan {
+                                markdown: read_queue_markdown(&repo, &name),
+                                name,
                             })
                         }
                     };
@@ -730,7 +772,8 @@ pub(crate) async fn run_tui(
                     // (where IO happens).
                     match mode {
                         Mode::AgentPanel { sel } => {
-                            match agent_panel_action(sel, &snapshot.agents, k) {
+                            match agent_panel_action(sel, &snapshot.agents, snapshot.queue.len(), k)
+                            {
                                 PanelAction::Quit => break 'evloop,
                                 PanelAction::LeaveFocus => {
                                     mode = mode.toggle_focus(snapshot.agents.len())
@@ -774,6 +817,52 @@ pub(crate) async fn run_tui(
                                 }
                                 PanelAction::OpenDetail(i) => {
                                     mode = Mode::AgentDetail { idx: i, sel: 0 };
+                                }
+                                PanelAction::OpenQueueItem(q) => {
+                                    if let Some(item) = snapshot.queue.get(q) {
+                                        let name = item.name.clone();
+                                        let md = read_queue_markdown(&repo, &name);
+                                        detail = Some(Overlay::queued(name, md));
+                                    }
+                                }
+                                PanelAction::OpenQueueHtml(q) => {
+                                    if let Some(item) = snapshot.queue.get(q) {
+                                        open_overlay_in_browser(
+                                            &repo,
+                                            &HtmlTarget::Queue(item.name.clone()),
+                                        );
+                                    }
+                                }
+                                PanelAction::NudgeQueue { idx, delta } => {
+                                    if let Some(item) = snapshot.queue.get(idx) {
+                                        let name = item.name.clone();
+                                        let next = (item.priority as i32 + delta as i32)
+                                            .clamp(0, 999)
+                                            as u16;
+                                        // ONE validated mutation — the same
+                                        // primitive `queue reprioritise` uses,
+                                        // never an inline rename.
+                                        if crate::cli::queue::set_priority(&repo, &name, next)
+                                            .is_ok()
+                                        {
+                                            snapshot.queue[idx].priority = next;
+                                            snapshot.queue.sort_by(|a, b| {
+                                                a.priority
+                                                    .cmp(&b.priority)
+                                                    .then(a.name.cmp(&b.name))
+                                            });
+                                            // Keep the cursor ON the nudged
+                                            // item as it moves through the
+                                            // re-sorted list.
+                                            if let Some(pos) =
+                                                snapshot.queue.iter().position(|i| i.name == name)
+                                            {
+                                                mode = Mode::AgentPanel {
+                                                    sel: snapshot.agents.len() + 1 + pos,
+                                                };
+                                            }
+                                        }
+                                    }
                                 }
                                 PanelAction::None => {}
                             }
@@ -832,7 +921,9 @@ pub(crate) async fn run_tui(
                             | Key::Right
                             | Key::Yes
                             | Key::No
-                            | Key::Html => {}
+                            | Key::Html
+                            | Key::Plus
+                            | Key::Minus => {}
                         },
                         // Confirm: one decision, resolved in one place.
                         Mode::Confirm { action } => {
@@ -911,7 +1002,9 @@ pub(crate) async fn run_tui(
                             | Key::Delete
                             | Key::Yes
                             | Key::No
-                            | Key::Html => {}
+                            | Key::Html
+                            | Key::Plus
+                            | Key::Minus => {}
                         },
                     }
                     log.request_fill();
@@ -962,6 +1055,17 @@ pub(crate) async fn run_tui(
                     }
                     _ => None,
                 };
+                // Same identity rule for a panel cursor on a QUEUE row: a
+                // reprioritise renames the queue file, so THIS refresh is
+                // often self-inflicted and re-sorts the list — capture the
+                // selected item's NAME so the cursor follows it.
+                let panel_queue_name = match mode {
+                    Mode::AgentPanel { sel } if sel > snapshot.agents.len() => snapshot
+                        .queue
+                        .get(sel - snapshot.agents.len() - 1)
+                        .map(|q| q.name.clone()),
+                    _ => None,
+                };
                 snapshot = StatusSnapshot::build_async(
                     &repo,
                     &basename,
@@ -987,7 +1091,12 @@ pub(crate) async fn run_tui(
                     Mode::LogScroll => Mode::LogScroll,
                     _ if snapshot.agents.is_empty() => Mode::LogScroll,
                     Mode::AgentPanel { sel } => Mode::AgentPanel {
-                        sel: sel.min(snapshot.agents.len()),
+                        sel: rebind_panel_sel(
+                            sel,
+                            panel_queue_name.as_deref(),
+                            snapshot.agents.len(),
+                            &snapshot.queue,
+                        ),
                     },
                     // The detail page tracks ONE agent by identity:
                     // re-locate the captured label in the (possibly
@@ -1160,7 +1269,7 @@ pub(crate) mod tests {
         };
         let subject_of = |o: &Overlay| match &o.data {
             OverlayData::Commit(d) => d.subject.clone(),
-            OverlayData::Plan { .. } => unreachable!(),
+            OverlayData::Plan { .. } | OverlayData::QueuedPlan { .. } => unreachable!(),
         };
         // A review row opens at a non-zero offset (commit row would be 0).
         let mut o = Overlay::commit(data("first"), 5);

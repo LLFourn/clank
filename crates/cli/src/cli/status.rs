@@ -32,10 +32,10 @@ pub struct StatusSnapshot {
     pub(crate) plans: Vec<PlanWorkState>,
     pub(crate) last_finished: Option<FinishedPlan>,
     pub(crate) blocks: Vec<crate::cli::block::BlockEntry>,
-    /// Queued plan names in priority order (the TUI's tier-4 list;
-    /// counts everywhere else derive from it). Plan:
-    /// clank-status-tui.
-    pub(crate) queue: Vec<String>,
+    /// Queued plans (name + priority) in priority order — the TUI's
+    /// QUEUE section renders and reprioritises these; counts everywhere
+    /// else derive from it.
+    pub(crate) queue: Vec<QueueItemView>,
     /// The team's master label, when a team resolves (render path:
     /// degrades to None on a teamless repo). The TUI's idle+queue
     /// headline names master as the agent whose turn it is.
@@ -132,6 +132,14 @@ pub(crate) struct AvailableAgent {
     pub(crate) tool: String,
     pub(crate) invocation: String,
     pub(crate) description: Option<String>,
+}
+
+/// One queued plan as the snapshot carries it: display name + the
+/// `NNN` priority from its filename prefix (lower = promoted sooner).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct QueueItemView {
+    pub(crate) priority: u16,
+    pub(crate) name: String,
 }
 
 /// Build the roster's auto-mode rows: master first, then reviewers in
@@ -241,7 +249,7 @@ struct StatusJson<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     queue_count: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    queue: Option<&'a [String]>,
+    queue: Option<Vec<&'a str>>,
     /// Only when non-empty (plan-lifecycle-verbs).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     shelved: Vec<ShelvedJson<'a>>,
@@ -414,9 +422,12 @@ impl StatusSnapshot {
         // scan_queue returns entries sorted by (priority, name);
         // capture the names so the snapshot stays the single source
         // of truth for the queue (count derives from it).
-        let queue: Vec<String> = crate::cli::queue::scan_queue(repo)
+        let queue: Vec<QueueItemView> = crate::cli::queue::scan_queue(repo)
             .into_iter()
-            .map(|e| e.name)
+            .map(|e| QueueItemView {
+                priority: e.priority,
+                name: e.name,
+            })
             .collect();
 
         let shelved: Vec<ShelvedView> = crate::cli::shelve::scan_shelved(repo)
@@ -531,7 +542,10 @@ impl StatusSnapshot {
             // queue_count + queue travel together, present only when
             // the queue is non-empty (clank-status-tui).
             queue_count: (!self.queue.is_empty()).then_some(self.queue.len()),
-            queue: (!self.queue.is_empty()).then_some(self.queue.as_slice()),
+            // The JSON wire shape stays a names array (priority is a
+            // TUI/HTML display concern; consumers read names).
+            queue: (!self.queue.is_empty())
+                .then(|| self.queue.iter().map(|q| q.name.as_str()).collect()),
             shelved,
             head_correction: self.head_correction.as_ref().map(|c| HeadCorrectionJson {
                 sha: c.sha.as_str(),
@@ -1878,7 +1892,16 @@ mod dirty_and_wake_tests {
             deletions: 1,
             untracked: 2,
         });
-        snap.queue = vec!["bar".to_string(), "baz".to_string()];
+        snap.queue = vec![
+            QueueItemView {
+                priority: 500,
+                name: "bar".to_string(),
+            },
+            QueueItemView {
+                priority: 500,
+                name: "baz".to_string(),
+            },
+        ];
         snap.shelved = vec![ShelvedView {
             stem: "old".to_string(),
             waiting_for: Some("bar".to_string()),

@@ -231,6 +231,29 @@ mod tests {
             }
             _ => panic!("expected html command"),
         }
+
+        // Queue target -> `open --queue <name>`.
+        match parse(html_open_argv(
+            Path::new("/r"),
+            HtmlOpenTarget::Queue("bar"),
+            false,
+        )) {
+            Command::Html(h) => {
+                let Some(HtmlCmd::Open(HtmlOpenArgs {
+                    plan,
+                    commit,
+                    queue,
+                    ..
+                })) = h.command
+                else {
+                    panic!("expected html open");
+                };
+                assert_eq!(plan, None);
+                assert_eq!(commit, None);
+                assert_eq!(queue.as_deref(), Some("bar"));
+            }
+            _ => panic!("expected html command"),
+        }
     }
 }
 

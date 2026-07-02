@@ -89,7 +89,13 @@ pub(crate) fn snap(plans: Vec<PlanWorkState>, queue: Vec<&str>) -> StatusSnapsho
         plans,
         last_finished: None,
         blocks: Vec::new(),
-        queue: queue.into_iter().map(str::to_string).collect(),
+        queue: queue
+            .into_iter()
+            .map(|name| crate::cli::status::QueueItemView {
+                priority: 500,
+                name: name.to_string(),
+            })
+            .collect(),
         master: Some("claude".into()),
         agents: Vec::new(),
         shelved: Vec::new(),

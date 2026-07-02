@@ -9,6 +9,7 @@ pub async fn run(args: QueueArgs) -> anyhow::Result<()> {
         Some(QueueCmd::Add(a)) => add_cmd(&repo, a),
         Some(QueueCmd::Remove(r)) => remove(&repo, &r.name),
         Some(QueueCmd::Promote(p)) => promote(&repo, &p.name),
+        Some(QueueCmd::Reprioritise(r)) => reprioritise(&repo, &r.name, r.priority),
     }
 }
 
@@ -296,6 +297,34 @@ fn remove(repo: &Path, name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Change a queued item's priority by renaming its `NNN-` prefix — the
+/// ONE validated mutation both the CLI (`queue reprioritise`) and the TUI
+/// nudge go through (no ad-hoc renames). Same priority is a no-op.
+/// Returns the entry's (possibly new) path.
+pub fn set_priority(repo: &Path, name: &str, priority: u16) -> anyhow::Result<PathBuf> {
+    if priority > 999 {
+        anyhow::bail!("priority must be 0-999");
+    }
+    let entries = scan_queue(repo);
+    let entry = find_unique(&entries, name)?;
+    if entry.priority == priority {
+        return Ok(entry.path.clone());
+    }
+    let dest = queue_dir(repo).join(format!("{priority:03}-{name}.md"));
+    std::fs::rename(&entry.path, &dest)
+        .map_err(|e| anyhow::anyhow!("renaming `{}`: {e}", entry.path.display()))?;
+    Ok(dest)
+}
+
+fn reprioritise(repo: &Path, name: &str, priority: u16) -> anyhow::Result<()> {
+    let dest = set_priority(repo, name, priority)?;
+    println!(
+        "`{name}` now at priority {priority:03} ({})",
+        dest.display()
+    );
+    Ok(())
+}
+
 fn promote(repo: &Path, name: &str) -> anyhow::Result<()> {
     validate_name(name)?;
     let entries = scan_queue(repo);
@@ -336,6 +365,41 @@ mod tests {
         assert_eq!(entries[0].priority, 100);
         assert_eq!(entries[1].name, "gamma");
         assert_eq!(entries[2].name, "beta");
+    }
+
+    #[test]
+    fn set_priority_renames_the_prefix_and_validates() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = dir.path().join(".clank/queue");
+        write(&q.join("500-foo.md"), "# foo\n\nbody\n");
+
+        // Rename to a new priority; body travels with the file.
+        let dest = set_priority(dir.path(), "foo", 100).unwrap();
+        assert_eq!(dest, q.join("100-foo.md"));
+        assert!(dest.is_file());
+        assert!(!q.join("500-foo.md").exists());
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "# foo\n\nbody\n");
+
+        // Same priority: a safe no-op returning the existing path.
+        let dest = set_priority(dir.path(), "foo", 100).unwrap();
+        assert_eq!(dest, q.join("100-foo.md"));
+        assert!(dest.is_file());
+
+        // Out-of-range and unknown names error clearly.
+        let err = set_priority(dir.path(), "foo", 1000).unwrap_err();
+        assert!(err.to_string().contains("0-999"), "{err}");
+        let err = set_priority(dir.path(), "nope", 100).unwrap_err();
+        assert!(err.to_string().contains("not in queue"), "{err}");
+    }
+
+    #[test]
+    fn set_priority_refuses_ambiguous_duplicate_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = dir.path().join(".clank/queue");
+        write(&q.join("100-foo.md"), "# foo\n");
+        write(&q.join("200-foo.md"), "# foo\n");
+        let err = set_priority(dir.path(), "foo", 300).unwrap_err();
+        assert!(err.to_string().contains("ambiguous"), "{err}");
     }
 
     #[test]

@@ -245,6 +245,16 @@ pub struct HtmlOpenArgs {
     /// plan name.
     #[arg(long, conflicts_with = "plan", value_name = "SHA")]
     pub commit: Option<String>,
+    /// Queued plan name. When supplied, the browser opens
+    /// `queue/<name>.html`. Mutually exclusive with a plan name
+    /// or commit.
+    #[arg(
+        long,
+        conflicts_with = "plan",
+        conflicts_with = "commit",
+        value_name = "NAME"
+    )]
+    pub queue: Option<String>,
     /// Print the resolved target path on stdout and exit
     /// without launching a browser. Mirrors `--print` on
     /// `clank agent start`, `clank diff`, `clank open zellij`.
@@ -1124,6 +1134,9 @@ pub enum QueueCmd {
     Remove(QueueRemoveArgs),
     /// Promote a queued item to an active plan.
     Promote(QueuePromoteArgs),
+    /// Change a queued item's priority (renames its `NNN-` prefix).
+    #[command(alias = "reprioritize")]
+    Reprioritise(QueueReprioritiseArgs),
 }
 
 #[derive(Args, Debug)]
@@ -1145,6 +1158,13 @@ pub struct QueueRemoveArgs {
 #[derive(Args, Debug)]
 pub struct QueuePromoteArgs {
     pub name: String,
+}
+
+#[derive(Args, Debug)]
+pub struct QueueReprioritiseArgs {
+    pub name: String,
+    /// New priority, 0-999 (lower = promoted sooner).
+    pub priority: u16,
 }
 
 #[derive(Args, Debug)]
