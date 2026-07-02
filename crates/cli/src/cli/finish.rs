@@ -387,7 +387,7 @@ async fn rewrite_with_state(
     // plan file — tag the squash MSG so it doesn't trip `fix_commit_tag`
     // (ruthless 28e3be4).
     let squash_msg = args.squash.as_deref().map(|m| ensure_plan_tag(m, stem));
-    crate::cli::rewrite::run(crate::cli::rewrite::RewriteOpts {
+    let outcome = crate::cli::rewrite::run(crate::cli::rewrite::RewriteOpts {
         repo,
         intro_sha: preview.intro_sha.as_ref(),
         head_sha: &preview.head_sha,
@@ -397,12 +397,17 @@ async fn rewrite_with_state(
         dry: args.dry,
         allow_rewrite_protected: args.allow_rewrite_protected,
         squash: squash_msg.as_deref(),
+        squash_tip: preview.squash_tip.as_ref(),
         head_strip_paths: &preview.head_strip_paths,
     })
     .await?;
     if args.dry {
         return Ok(());
     }
+    // Keep sha-keyed review feedback attached through the rewrite — a
+    // plumbing `update-ref` fires no `post-rewrite` hook, so restacked
+    // commits (later plans' gate feedback!) would otherwise strand.
+    crate::cli::rewire::migrate_feedback_pairs(repo, &outcome.pairs)?;
     if let Some(branch) = args.into_branch.as_deref() {
         println!("rewritten history on branch `{branch}`");
     } else if args.squash.is_some() {

@@ -142,8 +142,16 @@ pub struct RewritePreviewResponse {
     /// True iff `[intro_sha, head_sha]` is first-parent linear.
     pub linear: bool,
     pub commits: Vec<RewriteCommit>,
-    /// Strippable paths at HEAD's resulting tree. Used by squash
-    /// mode to compute the correct collapsed tree.
+    /// Where a squash's COLLAPSE ends: `Some(finalized_at)` for a finished
+    /// plan (only the plan's own `[intro..finalized_at]` run collapses;
+    /// commits after it are RESTACKED individually on top), `None` for an
+    /// active plan (collapse to `head_sha`). Without this bound, squashing
+    /// a BURIED plan would sweep every later commit into the collapse.
+    #[serde(default)]
+    pub squash_tip: Option<crate::ids::CommitSha>,
+    /// Strippable paths at the squash tip's tree (`squash_tip` when set,
+    /// else `head_sha`). Used by squash mode to compute the correct
+    /// collapsed tree.
     #[serde(default)]
     pub head_strip_paths: Vec<String>,
 }

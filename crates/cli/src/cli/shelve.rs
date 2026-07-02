@@ -217,6 +217,7 @@ pub async fn run_shelve(args: ShelveArgs) -> anyhow::Result<()> {
         dry: false,
         allow_rewrite_protected: args.allow_rewrite_protected,
         squash: None,
+        squash_tip: None,
         head_strip_paths: &preview.head_strip_paths,
     })
     .await;

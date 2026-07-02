@@ -544,3 +544,167 @@ fn fresh_purge_dry_is_a_strict_noop() {
     assert_eq!(git_out(repo, &["for-each-ref"]), refs_before);
     assert!(repo.join(".clank/plans/foo.md").exists());
 }
+
+#[test]
+fn buried_squash_collapses_only_the_plans_own_range_and_restacks() {
+    // The buried-plan squash bug: --squash must collapse [intro..finalized_at]
+    // only — commits AFTER the plan are restacked individually (never
+    // foreign-refused), and HEAD's tree is unchanged.
+    let env = TestEnv::init();
+    env.register_team("claude", &["codex"], &[]);
+    let repo = env.repo();
+    set_autosquash(repo, false);
+    ready_plan_on_base(&env);
+
+    // Finish foo WITHOUT squash → base, intro, finalize = 3 commits.
+    let mut args = finish_args(repo, "foo", None);
+    args.message = vec!["wrap up foo".into(), "original two-commit shape".into()];
+    block_on(clank::cli::finish::run(args)).expect("plain finish");
+    assert_eq!(git_out(repo, &["rev-list", "--count", "HEAD"]), "3");
+
+    // Bury it under a later ad-hoc commit.
+    write(repo, "src/later.rs", "// later\n");
+    commit(repo, "later work");
+    let tree_before = git_out(repo, &["rev-parse", "HEAD^{tree}"]);
+    // Feedback on the later commit — must follow it through the restack.
+    let later_sha = git_out(repo, &["rev-parse", "HEAD"]);
+    write(
+        repo,
+        &format!(".clank/agents/codex/feedback/{}.md", &later_sha[..7]),
+        "APPROVE looks good\n",
+    );
+
+    // Retroactive squash of the BURIED plan.
+    let msg = "collapse foo\n\nfoo reads as one commit now";
+    let mut args = finish_args(repo, "foo", Some(msg));
+    args.allow_rewrite_protected = true;
+    block_on(clank::cli::finish::run(args)).expect("buried squash must work");
+
+    // base + squashed foo + restacked later = 3; HEAD tree unchanged.
+    assert_eq!(git_out(repo, &["rev-list", "--count", "HEAD"]), "3");
+    assert_eq!(
+        git_out(repo, &["rev-parse", "HEAD^{tree}"]),
+        tree_before,
+        "plain squash must not change HEAD's tree"
+    );
+    assert_eq!(git_out(repo, &["log", "-1", "--format=%s"]), "later work");
+    assert_eq!(
+        git_out(repo, &["log", "-1", "--format=%s", "HEAD~1"]),
+        "[foo] collapse foo",
+        "the plan's own two commits collapsed into one"
+    );
+    // The restacked commit's feedback migrated to its new sha.
+    let new_later = git_out(repo, &["rev-parse", "HEAD"]);
+    assert_ne!(new_later, later_sha, "restack rewrote the sha");
+    let feedback_dir = repo.join(".clank/agents/codex/feedback");
+    let migrated = std::fs::read_dir(&feedback_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .any(|e| {
+            let n = e.file_name().to_string_lossy().into_owned();
+            n.starts_with(&new_later[..7])
+        });
+    assert!(migrated, "feedback must follow the restacked commit");
+}
+
+#[test]
+fn buried_squash_dry_is_a_noop_then_live_agrees() {
+    let env = TestEnv::init();
+    env.register_team("claude", &["codex"], &[]);
+    let repo = env.repo();
+    set_autosquash(repo, false);
+    ready_plan_on_base(&env);
+    let mut args = finish_args(repo, "foo", None);
+    args.message = vec!["wrap up foo".into(), "original shape".into()];
+    block_on(clank::cli::finish::run(args)).expect("plain finish");
+    write(repo, "src/later.rs", "// later\n");
+    commit(repo, "later work");
+
+    let head_before = git_out(repo, &["rev-parse", "HEAD"]);
+    let msg = "collapse foo\n\nfoo reads as one commit now";
+    let mut args = finish_args(repo, "foo", Some(msg));
+    args.allow_rewrite_protected = true;
+    args.dry = true;
+    block_on(clank::cli::finish::run(args)).expect("dry buried squash");
+    assert_eq!(
+        git_out(repo, &["rev-parse", "HEAD"]),
+        head_before,
+        "--dry must not move HEAD"
+    );
+
+    let mut args = finish_args(repo, "foo", Some(msg));
+    args.allow_rewrite_protected = true;
+    block_on(clank::cli::finish::run(args)).expect("live executes what dry previewed");
+    assert_eq!(git_out(repo, &["rev-list", "--count", "HEAD"]), "3");
+}
+
+#[test]
+fn buried_squash_refuses_interleaved_foreign_and_names_it() {
+    // A foreign commit INSIDE [intro..finalized_at] still refuses (tree
+    // replay can't preserve it) — and the error NAMES the offender.
+    let env = TestEnv::init();
+    env.register_team("claude", &["codex"], &[]);
+    let repo = env.repo();
+    write(repo, "README", "base\n");
+    commit(repo, "base");
+    write(repo, ".clank/plans/foo.md", "# foo\n\nbody\n");
+    commit(repo, "[foo] intro");
+    // Interleaved mid-plan ad-hoc commit (untagged → foreign to foo).
+    write(repo, "src/stray.rs", "// stray\n");
+    commit(repo, "stray mid-plan commit");
+    let stray_sha = git_out(repo, &["rev-parse", "HEAD"]);
+    // Simulate the finalize.
+    std::fs::create_dir_all(repo.join(".clank/finished")).unwrap();
+    std::fs::rename(
+        repo.join(".clank/plans/foo.md"),
+        repo.join(".clank/finished/foo.md"),
+    )
+    .unwrap();
+    commit(repo, "[foo] finish");
+    write(repo, "src/later.rs", "// later\n");
+    commit(repo, "later work");
+
+    let head_before = git_out(repo, &["rev-parse", "HEAD"]);
+    let msg = "collapse foo\n\nshould refuse: stray is interleaved";
+    let mut args = finish_args(repo, "foo", Some(msg));
+    args.allow_rewrite_protected = true;
+    let err = block_on(clank::cli::finish::run(args)).expect_err("interleaved foreign refuses");
+    let text = err.to_string();
+    assert!(text.contains("interleaved"), "got: {text}");
+    assert!(
+        text.contains(&stray_sha[..7]) && text.contains("stray mid-plan commit"),
+        "error must NAME the offender; got: {text}"
+    );
+    assert_eq!(git_out(repo, &["rev-parse", "HEAD"]), head_before);
+}
+
+#[test]
+fn buried_purge_squash_strips_artifacts_from_restacked_commits() {
+    // --purge --squash on a buried plan: restacked descendants' trees still
+    // CONTAIN the inherited finished/<stem>.md — the restack must strip it.
+    let env = TestEnv::init();
+    env.register_team("claude", &["codex"], &[]);
+    let repo = env.repo();
+    set_autosquash(repo, false);
+    ready_plan_on_base(&env);
+    let mut args = finish_args(repo, "foo", None);
+    args.message = vec!["wrap up foo".into(), "original shape".into()];
+    block_on(clank::cli::finish::run(args)).expect("plain finish");
+    write(repo, "src/later.rs", "// later\n");
+    commit(repo, "later work");
+
+    let msg = "collapse and strip foo\n\nthe bookkeeping is noise now";
+    let mut args = finish_args(repo, "foo", Some(msg));
+    args.purge = true;
+    args.allow_rewrite_protected = true;
+    block_on(clank::cli::finish::run(args)).expect("buried purge+squash");
+
+    // HEAD (the restacked later commit) must NOT contain foo's artifacts.
+    let tree = git_out(repo, &["ls-tree", "-r", "--name-only", "HEAD"]);
+    assert!(
+        tree.lines().all(|l| l != ".clank/finished/foo.md"),
+        "restacked tree must be stripped of the finalize snapshot; got:\n{tree}"
+    );
+    assert!(tree.lines().any(|l| l == "src/later.rs"));
+    assert_eq!(git_out(repo, &["log", "-1", "--format=%s"]), "later work");
+}

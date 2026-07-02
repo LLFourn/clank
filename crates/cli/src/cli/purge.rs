@@ -121,6 +121,7 @@ async fn run_single(
         dry: args.dry,
         allow_rewrite_protected: args.allow_rewrite_protected,
         squash: args.squash.as_deref(),
+        squash_tip: preview.squash_tip.as_ref(),
         head_strip_paths: &preview.head_strip_paths,
     })
     .await?;
@@ -128,6 +129,9 @@ async fn run_single(
     if args.dry {
         return Ok(());
     }
+    // Keep sha-keyed review feedback attached through the rewrite (no
+    // post-rewrite hook fires for a plumbing update-ref).
+    crate::cli::rewire::migrate_feedback_pairs(repo, &outcome.pairs)?;
     if let (Some(tip), Some(branch)) = (outcome.new_tip, outcome.updated_branch) {
         println!(
             "rewrote `{stem}`: branch `{branch}` now at {} ({})",
@@ -166,6 +170,9 @@ async fn run_all(repo: &std::path::Path, basename: &str, args: &PurgeArgs) -> an
         dry: args.dry,
         allow_rewrite_protected: args.allow_rewrite_protected,
         squash: args.squash.as_deref(),
+        // All-plans mode has no single squash tip (`--squash --all` is
+        // rejected at parse time anyway).
+        squash_tip: None,
         head_strip_paths: &preview.head_strip_paths,
     })
     .await?;
@@ -173,6 +180,7 @@ async fn run_all(repo: &std::path::Path, basename: &str, args: &PurgeArgs) -> an
     if args.dry {
         return Ok(());
     }
+    crate::cli::rewire::migrate_feedback_pairs(repo, &outcome.pairs)?;
     if let (Some(tip), Some(branch)) = (outcome.new_tip, outcome.updated_branch) {
         println!(
             "purged all .clank/ history: branch `{branch}` now at {} ({})",

@@ -163,6 +163,7 @@ pub async fn build_rewrite_preview(
                 head_sha,
                 linear: true,
                 commits: Vec::new(),
+                squash_tip: None,
                 head_strip_paths: Vec::new(),
             });
         }
@@ -215,7 +216,14 @@ pub async fn build_rewrite_preview(
         });
     }
 
-    let head_strip_paths = git.tree_plan_paths(&head_sha, plan_key.as_str(), include_finalize)?;
+    // A finished plan's squash collapses only its own [intro..finalized_at]
+    // run (later commits are restacked), so the collapsed tree — and its
+    // strip set — come from the FINALIZE commit's tree, not HEAD's. An
+    // active plan collapses to HEAD (squash_tip: None), present behavior.
+    let squash_tip = finalized_at;
+    let strip_source = squash_tip.as_ref().unwrap_or(&head_sha);
+    let head_strip_paths =
+        git.tree_plan_paths(strip_source, plan_key.as_str(), include_finalize)?;
 
     Ok(RewritePreviewResponse {
         plan_id: plan_id_str,
@@ -224,6 +232,7 @@ pub async fn build_rewrite_preview(
         head_sha,
         linear,
         commits,
+        squash_tip,
         head_strip_paths,
     })
 }

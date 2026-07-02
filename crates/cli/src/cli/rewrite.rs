@@ -43,19 +43,24 @@ pub struct RewriteOpts<'a> {
     /// Permit rewriting a protected branch (`main`/`master`/etc.)
     /// in place. Ignored when `into_branch` is set.
     pub allow_rewrite_protected: bool,
-    /// `Some(msg)` collapses every commit in the range into one
-    /// commit on top of `intro_parent`, with the supplied message.
-    /// Refuses if any commit in the range is marked `foreign`
-    /// (squash can't selectively preserve interleaved foreign
-    /// work). The resulting tree is HEAD's tree minus
-    /// `head_strip_paths` — Drop commits don't carry per-commit
-    /// `strip_paths`, so unioning the manifest's strip_paths
-    /// would leak content the per-commit replay would have
-    /// removed by skipping.
+    /// `Some(msg)` collapses the squash range into one commit on top of
+    /// `intro_parent`, with the supplied message. Refuses if any commit in
+    /// the COLLAPSED range is marked `foreign` (a squash can't selectively
+    /// preserve interleaved foreign work). The resulting tree is the squash
+    /// tip's tree minus `head_strip_paths` — Drop commits don't carry
+    /// per-commit `strip_paths`, so unioning the manifest's strip_paths
+    /// would leak content the per-commit replay would have removed by
+    /// skipping.
     pub squash: Option<&'a str>,
-    /// Strippable paths at HEAD's tree (from the daemon's
-    /// preview). The squash mode's source of truth for what to
-    /// strip from the collapsed tree. Empty when not squashing.
+    /// Where the squash COLLAPSE ends. `Some(sha)` (a finished plan's
+    /// finalize commit) collapses `[intro..sha]` and RESTACKS every later
+    /// step individually on top, per its manifest disposition — so purge
+    /// stripping applies to restacked trees too. `None` collapses the whole
+    /// range to `head_sha` (an active plan). Ignored when not squashing.
+    pub squash_tip: Option<&'a CommitSha>,
+    /// Strippable paths at the squash tip's tree (`squash_tip` when set,
+    /// else `head_sha`; from the preview). The squash mode's source of truth
+    /// for what to strip from the collapsed tree. Empty when not squashing.
     pub head_strip_paths: &'a [String],
 }
 
@@ -65,6 +70,12 @@ pub struct RewriteOutcome {
     pub new_tip: Option<String>,
     /// Branch the engine updated. `None` in dry mode.
     pub updated_branch: Option<String>,
+    /// `(old, new)` sha pairs for every commit the rewrite replayed or
+    /// collapsed (a squash maps each collapsed old to the one squash
+    /// commit). Callers migrate sha-keyed state (review feedback) with
+    /// these — a plumbing `update-ref` fires no `post-rewrite` hook.
+    /// Empty in dry mode.
+    pub pairs: Vec<(CommitSha, CommitSha)>,
 }
 
 /// Drive the rewrite. Engine refuses pre-flight on:
@@ -89,25 +100,60 @@ pub async fn run(opts: RewriteOpts<'_>) -> anyhow::Result<RewriteOutcome> {
 
     let blockers = collect_blockers(&opts)?;
 
-    // Squash adds one more blocker: foreign commits in the range.
-    // Squash can't selectively preserve interleaved foreign work;
-    // the operator must `--purge` first if they want to handle
-    // them.
+    // The squash COLLAPSE covers steps[..=boundary]; steps after it are
+    // restacked individually. `squash_tip: None` → the whole range (an
+    // active plan collapsing to HEAD). An EMPTY range keeps boundary None
+    // so the "rewrite range is empty" blocker reports (dry prints it, live
+    // bails) instead of the slice math panicking (codex eeec2de).
+    let boundary = match (
+        opts.squash.is_some() && !plan.steps.is_empty(),
+        opts.squash_tip,
+    ) {
+        (true, Some(tip)) => Some(
+            plan.steps
+                .iter()
+                .position(|s| s.sha == tip.as_str())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "squash tip {} is not in the rewrite range — preview and \
+                         engine disagree; re-run to refresh the preview",
+                        short(tip.as_str()),
+                    )
+                })?,
+        ),
+        (true, None) => Some(plan.steps.len() - 1),
+        (false, _) => None,
+    };
+
+    // Squash adds one more blocker: foreign commits INSIDE the collapsed
+    // range (a squash can't selectively preserve interleaved foreign work —
+    // replay uses full trees, so replaying an interleaved commit after the
+    // squash would reset the plan's later changes). Commits AFTER the
+    // squash tip are restack steps and never trip this. Name the offenders
+    // so the operator knows what to re-tag or move.
     let mut blockers = blockers;
-    if opts.squash.is_some() {
-        let foreign = plan.steps.iter().filter(|s| s.foreign).count();
-        if foreign > 0 {
+    if let Some(boundary) = boundary {
+        // boundary < steps.len() by construction (a position() hit, or
+        // len-1 of a non-empty list), so the inclusive slice is in range.
+        let offenders: Vec<String> = plan.steps[..=boundary]
+            .iter()
+            .filter(|s| s.foreign)
+            .map(|s| format!("{} {}", short(&s.sha), s.subject))
+            .collect();
+        if !offenders.is_empty() {
             blockers.push(format!(
-                "--squash refuses {foreign} foreign commit(s) in the rewrite \
-                 range. Use `clank purge` without `--squash` first, then \
-                 retry."
+                "--squash refuses {} foreign commit(s) interleaved within the \
+                 plan's own range:\n    {}\n  Re-tag or move them, or use \
+                 `clank purge` without `--squash` first, then retry.",
+                offenders.len(),
+                offenders.join("\n    "),
             ));
         }
     }
 
     if opts.dry {
         if let Some(msg) = opts.squash {
-            print_squash_dry_run(&opts, &plan, &blockers, msg);
+            print_squash_dry_run(&opts, &plan, boundary, &blockers, msg);
         } else {
             print_rebase_todo(&opts, &plan, &blockers);
         }
@@ -127,17 +173,59 @@ pub async fn run(opts: RewriteOpts<'_>) -> anyhow::Result<RewriteOutcome> {
         .expect("blockers would have caught a missing intro");
     let _ = intro;
 
+    let mut pairs: Vec<(CommitSha, CommitSha)> = Vec::new();
     let new_tip = if let Some(message) = opts.squash {
-        apply_squash(
+        // None only for an empty range, which the empty-range blocker
+        // already bailed on above.
+        let boundary = boundary.expect("empty squash range is caught by blockers");
+        let squash_source = opts.squash_tip.unwrap_or(opts.head_sha);
+        let squashed = apply_squash(
             opts.repo,
-            opts.head_sha,
+            squash_source,
             opts.head_strip_paths,
             intro_parent.as_deref(),
             message,
         )
-        .await?
+        .await?;
+        let squashed_sha = parse_rewritten(&squashed)?;
+        // Every collapsed old maps to the one squash commit (the feedback
+        // migrator keeps the LATEST old per new — the finalize commit's).
+        for step in &plan.steps[..=boundary] {
+            pairs.push((parse_rewritten(&step.sha)?, squashed_sha.clone()));
+        }
+        // RESTACK the steps after the squash tip individually, per their
+        // manifest disposition — purge stripping applies to their trees too.
+        let mut parent = squashed;
+        for step in &plan.steps[boundary + 1..] {
+            let replayed = match step.disposition {
+                RewriteDisposition::Drop => None,
+                RewriteDisposition::KeepVerbatim => {
+                    let tree = git_plumbing::commit_tree_oid(opts.repo, &step.sha)?;
+                    Some(git_plumbing::replay_commit(
+                        opts.repo,
+                        &step.sha,
+                        &tree,
+                        Some(&parent),
+                    )?)
+                }
+                RewriteDisposition::Rewrite => {
+                    let tree = git_plumbing::strip_tree(opts.repo, &step.sha, &step.strip_paths)?;
+                    Some(git_plumbing::replay_commit(
+                        opts.repo,
+                        &step.sha,
+                        &tree,
+                        Some(&parent),
+                    )?)
+                }
+            };
+            if let Some(new) = replayed {
+                pairs.push((parse_rewritten(&step.sha)?, parse_rewritten(&new)?));
+                parent = new;
+            }
+        }
+        parent
     } else {
-        apply_plan(opts.repo, &plan, intro_parent.as_deref()).await?
+        apply_plan(opts.repo, &plan, intro_parent.as_deref(), &mut pairs).await?
     };
     let updated_branch = match opts.into_branch {
         Some(name) => {
@@ -182,7 +270,12 @@ pub async fn run(opts: RewriteOpts<'_>) -> anyhow::Result<RewriteOutcome> {
     Ok(RewriteOutcome {
         new_tip: Some(new_tip),
         updated_branch: Some(updated_branch),
+        pairs,
     })
+}
+
+fn parse_rewritten(sha: &str) -> anyhow::Result<CommitSha> {
+    CommitSha::parse(sha).map_err(|e| anyhow::anyhow!("parse rewritten sha `{sha}`: {e}"))
 }
 
 /// Inputs for [`reword_in_place`].
@@ -527,17 +620,24 @@ fn print_rebase_todo(opts: &RewriteOpts<'_>, plan: &ExecutionPlan, blockers: &[S
 fn print_squash_dry_run(
     opts: &RewriteOpts<'_>,
     plan: &ExecutionPlan,
+    boundary: Option<usize>,
     blockers: &[String],
     msg: &str,
 ) {
+    let collapse_end = boundary.unwrap_or(plan.steps.len().saturating_sub(1));
+    let restacked = plan.steps.len().saturating_sub(collapse_end + 1);
     println!("# clank rewrite --squash preview");
     if let Some(intro) = opts.intro_sha {
+        let tip = opts.squash_tip.unwrap_or(opts.head_sha);
         println!(
             "# range: {}..{} ({} commit(s) would collapse into one)",
             short(intro.as_str()),
-            short(opts.head_sha.as_str()),
-            plan.steps.len(),
+            short(tip.as_str()),
+            collapse_end + 1,
         );
+        if restacked > 0 {
+            println!("# restacked on top: {restacked} later commit(s), preserved individually");
+        }
     } else {
         println!("# range: (empty — no .clank/ history)");
     }
@@ -553,10 +653,15 @@ fn print_squash_dry_run(
     println!("#");
     println!("# would create ONE commit on top of starting parent:");
     println!("#   message: {msg}");
-    if opts.head_strip_paths.is_empty() {
-        println!("#   tree: HEAD's tree, unchanged");
+    let tree_src = if opts.squash_tip.is_some() {
+        "the finalize commit's tree"
     } else {
-        println!("#   tree: HEAD's tree MINUS:");
+        "HEAD's tree"
+    };
+    if opts.head_strip_paths.is_empty() {
+        println!("#   tree: {tree_src}, unchanged");
+    } else {
+        println!("#   tree: {tree_src} MINUS:");
         for p in opts.head_strip_paths {
             println!("#     - {p}");
         }
@@ -600,6 +705,7 @@ async fn apply_plan(
     repo: &Path,
     plan: &ExecutionPlan,
     intro_parent: Option<&str>,
+    pairs: &mut Vec<(CommitSha, CommitSha)>,
 ) -> anyhow::Result<String> {
     let mut parent: Option<String> = plan.intro_parent.clone();
     let mut produced_any = false;
@@ -612,6 +718,7 @@ async fn apply_plan(
                 let tree = git_plumbing::commit_tree_oid(repo, &step.sha)?;
                 let new_sha =
                     git_plumbing::replay_commit(repo, &step.sha, &tree, parent.as_deref())?;
+                pairs.push((parse_rewritten(&step.sha)?, parse_rewritten(&new_sha)?));
                 parent = Some(new_sha);
                 produced_any = true;
             }
@@ -619,6 +726,7 @@ async fn apply_plan(
                 let new_tree = git_plumbing::strip_tree(repo, &step.sha, &step.strip_paths)?;
                 let new_sha =
                     git_plumbing::replay_commit(repo, &step.sha, &new_tree, parent.as_deref())?;
+                pairs.push((parse_rewritten(&step.sha)?, parse_rewritten(&new_sha)?));
                 parent = Some(new_sha);
                 produced_any = true;
             }
@@ -638,36 +746,36 @@ async fn apply_plan(
     }
 }
 
-/// Collapse the rewrite range into ONE commit on top of
-/// `intro_parent`. Tree = HEAD's tree minus the union of all
-/// strip_paths across the manifest. Foreign-commit refusal lives
-/// in `run()`'s blocker check; this function assumes the range
-/// is clean.
+/// Collapse the squash range into ONE commit on top of `intro_parent`.
+/// `source_sha` is the squash tip (a buried plan's finalize commit, or HEAD
+/// for an active plan): its tree — minus the strip set — is the collapsed
+/// tree (the plan's cumulative end state), and its author/date seed the
+/// commit. Foreign-commit refusal lives in `run()`'s blocker check; this
+/// function assumes the range is clean.
 async fn apply_squash(
     repo: &Path,
-    head_sha: &CommitSha,
-    head_strip_paths: &[String],
+    source_sha: &CommitSha,
+    strip_paths: &[String],
     intro_parent: Option<&str>,
     message: &str,
 ) -> anyhow::Result<String> {
-    // The strip set is `head_strip_paths` from the daemon's preview
-    // — NOT the union of per-commit strip_paths. Per-commit strips
-    // only fire for `Rewrite`, but `Drop` commits add content that
-    // would be removed by skipping them. For squash, we collapse
-    // to a single commit, so the strip set must reflect every
-    // path the per-commit replay would have removed at HEAD time.
-    let strip: Vec<String> = head_strip_paths.to_vec();
-    // Build the squashed tree from HEAD's tree (the union of
-    // everything the range produced) with the strip paths removed.
-    // Paths in the strip set but absent from HEAD's tree are no-ops
-    // for `update-index --force-remove` — added-then-deleted in the
-    // range, already gone.
-    let head_str = head_sha.as_str();
-    let new_tree = git_plumbing::strip_tree(repo, head_str, &strip)?;
-    // `squash_commit` carries the idempotence above: HEAD's author is
+    // The strip set comes from the preview, computed at the squash tip's
+    // tree — NOT the union of per-commit strip_paths. Per-commit strips
+    // only fire for `Rewrite`, but `Drop` commits add content that would
+    // be removed by skipping them. For squash, we collapse to a single
+    // commit, so the strip set must reflect every path the per-commit
+    // replay would have removed as of the squash tip.
+    let strip: Vec<String> = strip_paths.to_vec();
+    // Build the squashed tree from the tip's tree (the union of everything
+    // the collapsed range produced) with the strip paths removed. Paths in
+    // the strip set but absent from the tree are no-ops — added-then-deleted
+    // in the range, already gone.
+    let src = source_sha.as_str();
+    let new_tree = git_plumbing::strip_tree(repo, src, &strip)?;
+    // `squash_commit` carries the idempotence above: the tip's author is
     // preserved and the committer date is pinned to it, so re-squashing
     // reproduces the same sha (finish-squash-idempotent-on-finished).
-    git_plumbing::squash_commit(repo, head_str, &new_tree, intro_parent, message)
+    git_plumbing::squash_commit(repo, src, &new_tree, intro_parent, message)
 }
 
 fn working_tree_dirty(repo: &Path) -> anyhow::Result<bool> {
@@ -796,6 +904,7 @@ mod tests {
             intro_sha: Some(CommitSha::parse(intro).unwrap()),
             head_sha: CommitSha::parse(head).unwrap(),
             linear: true,
+            squash_tip: None,
             head_strip_paths: Vec::new(),
             commits: commits
                 .into_iter()
@@ -852,6 +961,7 @@ mod tests {
             dry: false,
             allow_rewrite_protected: false,
             squash: None,
+            squash_tip: None,
             head_strip_paths: &[],
         })
         .await
@@ -903,6 +1013,7 @@ mod tests {
             dry: true,
             allow_rewrite_protected: false,
             squash: None,
+            squash_tip: None,
             head_strip_paths: &[],
         })
         .await
@@ -948,6 +1059,7 @@ mod tests {
             dry: false,
             allow_rewrite_protected: false,
             squash: None,
+            squash_tip: None,
             head_strip_paths: &[],
         })
         .await
@@ -997,6 +1109,7 @@ mod tests {
             dry: false,
             allow_rewrite_protected: false,
             squash: None,
+            squash_tip: None,
             head_strip_paths: &[],
         })
         .await
@@ -1045,6 +1158,7 @@ mod tests {
             // policy.
             allow_rewrite_protected: true,
             squash: None,
+            squash_tip: None,
             head_strip_paths: &[],
         })
         .await
@@ -1107,6 +1221,7 @@ mod tests {
             dry: false,
             allow_rewrite_protected: false,
             squash: None,
+            squash_tip: None,
             head_strip_paths: &[],
         })
         .await
@@ -1167,6 +1282,7 @@ mod tests {
             dry: false,
             allow_rewrite_protected: false,
             squash: None,
+            squash_tip: None,
             head_strip_paths: &[],
         })
         .await
@@ -1280,6 +1396,7 @@ mod tests {
             dry: false,
             allow_rewrite_protected: false,
             squash: Some("Implement foo"),
+            squash_tip: None,
             head_strip_paths: &[".clank/plans/foo.md".to_string()],
         })
         .await
@@ -1334,6 +1451,7 @@ mod tests {
             squash: Some("squashed plan"),
             // Daemon provides head_strip_paths — the squash uses
             // these, NOT the union of per-step strip_paths.
+            squash_tip: None,
             head_strip_paths: &[".clank/plans/foo.md".to_string()],
         })
         .await
@@ -1372,6 +1490,7 @@ mod tests {
             dry: false,
             allow_rewrite_protected: false,
             squash: Some("collapse"),
+            squash_tip: None,
             head_strip_paths: &[],
         })
         .await
@@ -1410,6 +1529,7 @@ mod tests {
             dry: false,
             allow_rewrite_protected: false,
             squash: None,
+            squash_tip: None,
             head_strip_paths: &[],
         })
         .await
@@ -1451,6 +1571,7 @@ mod tests {
             dry: false,
             allow_rewrite_protected: false,
             squash: None,
+            squash_tip: None,
             head_strip_paths: &[],
         })
         .await
@@ -1469,6 +1590,7 @@ mod tests {
             head_sha: CommitSha::parse(&seed).unwrap(),
             linear: false,
             commits: Vec::new(),
+            squash_tip: None,
             head_strip_paths: Vec::new(),
         };
         let err = super::run(RewriteOpts {
@@ -1481,6 +1603,7 @@ mod tests {
             dry: false,
             allow_rewrite_protected: false,
             squash: None,
+            squash_tip: None,
             head_strip_paths: &[],
         })
         .await
@@ -1658,6 +1781,39 @@ mod tests {
         .await
         .unwrap_err();
         assert!(format!("{err}").contains("first-parent history"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn squash_with_empty_range_reports_blocker_instead_of_panicking() {
+        // codex eeec2de: squash + an empty rewrite range (intro None, no
+        // commits) used to underflow in the foreign-offender slice math.
+        // Both dry and live must surface the empty-range blocker instead.
+        let dir = init_repo();
+        write(dir.path(), "README.md", "seed\n");
+        let seed = commit(dir.path(), "seed");
+        let head = CommitSha::parse(&seed).unwrap();
+        let opts = |dry| RewriteOpts {
+            repo: dir.path(),
+            intro_sha: None,
+            head_sha: &head,
+            linear: true,
+            commits: &[],
+            into_branch: None,
+            dry,
+            allow_rewrite_protected: true,
+            squash: Some("collapse nothing"),
+            squash_tip: None,
+            head_strip_paths: &[],
+        };
+        // Dry: prints the blocker, returns cleanly.
+        let outcome = super::run(opts(true)).await.unwrap();
+        assert!(outcome.new_tip.is_none());
+        // Live: bails with the empty-range blocker.
+        let err = super::run(opts(false)).await.unwrap_err();
+        assert!(
+            format!("{err}").contains("rewrite range is empty"),
+            "got: {err}"
+        );
     }
 
     #[test]
