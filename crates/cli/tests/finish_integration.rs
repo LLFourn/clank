@@ -55,6 +55,7 @@ fn finish_args(
         message: vec![],
         purge: false,
         squash: squash.map(str::to_string),
+        no_squash: false,
         into_branch: None,
         allow_rewrite_protected: false,
         dry: false,
@@ -206,5 +207,116 @@ fn squash_message_gets_the_plan_tag_even_when_untagged() {
     assert_eq!(
         subject, "[foo] collapse foo",
         "squash subject must carry the plan tag"
+    );
+}
+
+// Merge `finish.autosquash` into the repo config WITHOUT clobbering the roster
+// (register_team wrote the roster into the same .clank/config.json).
+fn set_autosquash(repo: &Path, on: bool) {
+    let p = repo.join(".clank/config.json");
+    let mut v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&p).unwrap_or_else(|_| "{}".into())).unwrap();
+    v["finish"] = serde_json::json!({ "autosquash": on });
+    std::fs::write(&p, serde_json::to_string_pretty(&v).unwrap()).unwrap();
+}
+
+// A base commit (so the plan intro isn't the root), then a Ready plan: intro
+// + a FINISHED review on it. Call AFTER any config mutation so `base` commits
+// a clean tree.
+fn ready_plan_on_base(env: &TestEnv) {
+    let repo = env.repo();
+    write(repo, "README", "base\n");
+    commit(repo, "base");
+    write(repo, ".clank/plans/foo.md", "# foo\n\nbody\n");
+    commit(repo, "[foo] intro");
+    let intro = git_out(repo, &["rev-parse", "HEAD"]);
+    write(
+        repo,
+        &format!(".clank/agents/codex/feedback/{}.md", &intro[..7]),
+        "FINISHED ship it\n",
+    );
+}
+
+#[test]
+fn autosquash_config_collapses_plan_to_one_tagged_commit() {
+    // finish.autosquash on → a plain `finish -m …` squashes the plan into ONE
+    // commit carrying the (auto-tagged) finish message.
+    let env = TestEnv::init();
+    env.register_team("claude", &["codex"], &[]);
+    let repo = env.repo();
+    set_autosquash(repo, true);
+    ready_plan_on_base(&env);
+
+    let mut args = finish_args(repo, "foo", None, false);
+    args.message = vec!["wrap up foo".into(), "one commit reads cleaner".into()];
+    args.allow_rewrite_protected = true; // main is protected; let the squash run
+    block_on(clank::cli::finish::run(args)).expect("autosquash finish should succeed");
+
+    assert_eq!(
+        git_out(repo, &["log", "-1", "--format=%s"]),
+        "[foo] wrap up foo",
+        "squashed into one tagged commit"
+    );
+    // base + the single squashed plan commit (NOT base + intro + finish = 3).
+    assert_eq!(git_out(repo, &["rev-list", "--count", "HEAD"]), "2");
+    assert!(
+        repo.join(".clank/finished/foo.md").exists(),
+        "finalize snapshot preserved"
+    );
+}
+
+#[test]
+fn without_autosquash_the_plan_keeps_its_commits() {
+    let env = TestEnv::init();
+    env.register_team("claude", &["codex"], &[]);
+    let repo = env.repo();
+    set_autosquash(repo, false);
+    ready_plan_on_base(&env);
+
+    let mut args = finish_args(repo, "foo", None, false);
+    args.message = vec!["wrap up foo".into(), "keep the commits".into()];
+    block_on(clank::cli::finish::run(args)).expect("finish should succeed");
+
+    assert_eq!(
+        git_out(repo, &["log", "-1", "--format=%s"]),
+        "[foo] wrap up foo"
+    );
+    // base + intro + finish — not squashed.
+    assert_eq!(git_out(repo, &["rev-list", "--count", "HEAD"]), "3");
+}
+
+#[test]
+fn no_squash_flag_opts_out_of_autosquash() {
+    let env = TestEnv::init();
+    env.register_team("claude", &["codex"], &[]);
+    let repo = env.repo();
+    set_autosquash(repo, true);
+    ready_plan_on_base(&env);
+
+    let mut args = finish_args(repo, "foo", None, false);
+    args.message = vec!["wrap up foo".into(), "keep the commits this time".into()];
+    args.no_squash = true;
+    block_on(clank::cli::finish::run(args)).expect("finish should succeed");
+
+    // --no-squash keeps the individual commits despite autosquash being on.
+    assert_eq!(git_out(repo, &["rev-list", "--count", "HEAD"]), "3");
+}
+
+#[test]
+fn autosquash_with_no_message_still_rejects() {
+    // -m stays mandatory under autosquash: no -m → args.squash stays None →
+    // normal path → validation rejects.
+    let env = TestEnv::init();
+    env.register_team("claude", &["codex"], &[]);
+    let repo = env.repo();
+    set_autosquash(repo, true);
+    ready_plan_on_base(&env);
+
+    let args = finish_args(repo, "foo", None, false); // no message
+    let err = block_on(clank::cli::finish::run(args))
+        .expect_err("no -m must reject even with autosquash on");
+    assert!(
+        err.to_string().contains("finish needs"),
+        "educational message-required error, got: {err}"
     );
 }

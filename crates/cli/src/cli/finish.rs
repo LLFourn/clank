@@ -11,7 +11,7 @@ use std::path::Path;
 use super::{FinishArgs, repo_basename, resolve_repo};
 use clank_core::api::{FinalizeBlockReason, FinalizeReadiness, FinishPreviewResponse};
 
-pub async fn run(args: FinishArgs) -> anyhow::Result<()> {
+pub async fn run(mut args: FinishArgs) -> anyhow::Result<()> {
     let repo = resolve_repo(args.repo.as_deref())?;
     let basename = repo_basename(&repo)?;
     let policy = if args.no_cache {
@@ -31,6 +31,17 @@ pub async fn run(args: FinishArgs) -> anyhow::Result<()> {
 
     // Repeated `-m` values compose git-style: subject, blank line, body…
     let message = compose_finish_message(&args.message);
+
+    // `finish.autosquash`: treat a plain finish as `--squash <the -m message>`
+    // — collapse the plan into one commit carrying the whole-plan message.
+    // Only fills when `--squash` is unset (explicit wins), `--purge` is absent
+    // (respect its explicit rewrite), and `--no-squash` isn't given (per-finish
+    // opt-out). `-m` stays MANDATORY: an empty `-m` composes to None, so
+    // `args.squash` stays None → the normal path → validation rejects.
+    let cfg = crate::cli::config::load(&repo);
+    if cfg.finish.autosquash && args.squash.is_none() && !args.purge && !args.no_squash {
+        args.squash = message.clone();
+    }
 
     // Validate the message that will BECOME the final finish commit's message.
     // With `--squash` that's the squash MSG (the finalize/amend commit made

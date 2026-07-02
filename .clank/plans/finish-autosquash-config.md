@@ -53,32 +53,35 @@ set it globally) vs. document hand-editing `~/.clank/config.json` for v1.
 Load the config and, when autosquash is on, route through the existing squash
 path — minimal wiring so validation/tagging/rewrite all just work:
 
+Reuse `run()`'s existing `message` binding (line 33) — do NOT re-compose
+(ruthless e6e3a67):
+
 ```rust
 let cfg = crate::cli::config::load(&repo);
-let message = compose_finish_message(&args.message);
-// autosquash: treat a plain finish as `--squash <the -m message>`. Explicit
-// --squash wins; --purge is respected (not auto-squashed).
-let mut args = args;
-if cfg.finish.autosquash && args.squash.is_none() && !args.purge {
+if cfg.finish.autosquash && args.squash.is_none() && !args.purge && !args.no_squash {
     args.squash = message.clone();
 }
 ```
+(`run(mut args)`.) Because `args.squash` now carries the `-m` message,
+everything downstream is unchanged: `message_requiring_validation` validates
+it, `finalize_commit_message` + `ensure_plan_tag` stamp the transient commit,
+and `run_post_finalize_rewrite` collapses the plan into one `[<stem>]
+<subject>` commit. `-m` stays mandatory (autosquash with no `-m` → composes to
+None → `args.squash` stays None → validation rejects).
 
-Because `args.squash` now carries the `-m` message, everything downstream is
-unchanged: `message_requiring_validation` validates it, `finalize_commit_message`
-+ `ensure_plan_tag` stamp the transient commit, and `run_post_finalize_rewrite`
-collapses the plan into one `[<stem>] <subject>` commit. `-m` stays mandatory
-(autosquash with no `-m` → `args.squash` stays None → validation rejects).
+## Decisions — RESOLVED (ruthless e6e3a67)
 
-## Decisions to flag for review
-
-1. **autosquash + `--purge`**: lean SKIP autosquash when `--purge` is explicit
-   (purge already rewrites; respect the explicit intent). Reviewer's call.
-2. **explicit `--squash "X"`**: always wins over autosquash (only fill when
-   `args.squash.is_none()`). Not a real question — just confirming.
-3. **per-invocation opt-out**: a `--no-squash` to disable autosquash for one
-   finish. Lean: NOT in v1 (set the config per-repo). Add only if needed.
-4. **`--global` in this plan**: see above.
+1. **autosquash + `--purge`**: SKIP autosquash when `--purge` is explicit
+   (`&& !args.purge`) — purge already rewrites; respect the explicit intent.
+2. **explicit `--squash "X"`**: wins (only fill when `args.squash.is_none()`).
+3. **per-invocation opt-out**: INCLUDE `--no-squash` (not deferred). Real gap
+   — autosquash on globally, but for ONE plan you want to KEEP the individual
+   commits (a bisectable refactor whose history is worth reading). A bool flag
+   that forces `args.squash` None; `conflicts_with = "squash"`.
+4. **`--global`**: INCLUDED. Generalize `set_repo_key` → `set_key(config_path)`
+   and route by `ConfigArgs.global` (user vs repo scope). Note: this broadens
+   `clank config --global` to ALL keys — intended scope; the `--json`/resolve
+   read paths already layer both scopes.
 
 ## Tests
 

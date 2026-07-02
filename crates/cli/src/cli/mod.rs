@@ -52,6 +52,11 @@ pub struct ConfigArgs {
     pub repo: Option<PathBuf>,
     #[arg(short = 'j', long)]
     pub json: bool,
+    /// Write to the USER-scope config (`~/.clank/config.json`) instead of the
+    /// repo's `.clank/config.json`. Only affects `set`; reads always show the
+    /// effective merged value (repo shadows user).
+    #[arg(long)]
+    pub global: bool,
 }
 
 #[derive(Args, Debug)]
@@ -97,6 +102,10 @@ pub enum ConfigKey {
     /// Default `--wait` behavior for `clank diff`. bool, default: false.
     #[command(name = "diff.wait", alias = "diff_wait")]
     DiffWait(ConfigKeyArgs),
+    /// Auto-squash a plan into ONE commit at `clank finish` (using the finish
+    /// message). bool, default: false. `--no-squash` overrides per-finish.
+    #[command(name = "finish.autosquash", alias = "finish_autosquash")]
+    FinishAutosquash(ConfigKeyArgs),
 }
 
 #[derive(Args, Debug)]
@@ -1166,6 +1175,11 @@ pub struct FinishArgs {
     /// the plan's `.clank/` artifacts.
     #[arg(long, value_name = "MSG")]
     pub squash: Option<String>,
+    /// Opt OUT of `finish.autosquash` for this one finish — keep the plan's
+    /// individual commits (e.g. a bisectable refactor). No effect when
+    /// autosquash is off or `--squash` is given explicitly.
+    #[arg(long, conflicts_with = "squash")]
+    pub no_squash: bool,
     /// Write the rewritten history to a fresh branch instead of
     /// in-place. Only meaningful with `--purge`/`--squash`.
     #[arg(long, value_name = "NAME")]

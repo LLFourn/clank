@@ -15,6 +15,8 @@ pub struct Config {
     /// wait behavior. Layered field-by-field via `apply_layer`
     /// (matches `review`/`hooks`; NOT REPLACE like `agents`).
     pub diff: DiffConfig,
+    /// `clank finish` settings.
+    pub finish: FinishConfig,
 }
 
 impl Default for Config {
@@ -23,8 +25,19 @@ impl Default for Config {
             review: ReviewConfig::default(),
             hooks: BTreeMap::new(),
             diff: DiffConfig::default(),
+            finish: FinishConfig::default(),
         }
     }
+}
+
+/// `clank finish` config. Loaded from `.clank/config.json#/finish` (user +
+/// repo scopes, repo shadows user).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FinishConfig {
+    /// When true, `clank finish` collapses the plan into ONE commit using the
+    /// finish message (as if `--squash <message>` were passed). `--no-squash`
+    /// overrides per-finish; `--purge` / an explicit `--squash` are respected.
+    pub autosquash: bool,
 }
 
 /// `clank diff` config: editor launch profile + default wait
@@ -73,6 +86,14 @@ struct ConfigFile {
     hooks: Option<HooksFile>,
     #[serde(default)]
     diff: Option<DiffFile>,
+    #[serde(default)]
+    finish: Option<FinishFile>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct FinishFile {
+    #[serde(default)]
+    autosquash: Option<bool>,
 }
 
 /// Lossy-deserialize wrapper for `.clank/config.json#/diff`. Used
@@ -179,10 +200,20 @@ pub struct RepoConfigFile {
     /// operations preserve it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diff: Option<DiffConfig>,
+    /// `clank finish` settings. Round-tripped so `clank config` set
+    /// operations preserve it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finish: Option<FinishSection>,
     /// Forward-compat catchall: any top-level key this version
     /// of clank doesn't know about. Preserved on round-trip.
     #[serde(flatten)]
     pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct FinishSection {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub autosquash: Option<bool>,
 }
 
 /// Typed `hooks` section for round-trip producers per
@@ -351,6 +382,12 @@ fn apply_layer(cfg: &mut Config, path: Option<&Path>) -> BTreeSet<String> {
             present.insert("diff.wait".to_string());
         }
     }
+    if let Some(finish) = parsed.finish
+        && let Some(v) = finish.autosquash
+    {
+        cfg.finish.autosquash = v;
+        present.insert("finish.autosquash".to_string());
+    }
     present
 }
 
@@ -434,6 +471,13 @@ pub static KEY_CATALOG: &[KeyDef] = &[
         type_desc: "bool",
         default: "false",
         help: "Default `--wait` behavior for `clank diff`; --no-wait/--wait override",
+    },
+    KeyDef {
+        section: "finish",
+        name: "autosquash",
+        type_desc: "bool",
+        default: "false",
+        help: "Collapse a plan into one commit at `clank finish` (using the finish message); --no-squash overrides per-finish",
     },
 ];
 
@@ -537,6 +581,7 @@ pub fn get_value(cfg: &Config, key: &str) -> String {
             // d861e85 caught the catalog/get-value mismatch).
             .unwrap_or(false)
             .to_string(),
+        "finish.autosquash" => cfg.finish.autosquash.to_string(),
         _ => "unknown key".to_string(),
     }
 }
@@ -567,6 +612,7 @@ fn key_to_json_path(key: &str) -> Option<&'static [&'static str]> {
         "hooks.blocked" => Some(&["hooks", "blocked"]),
         "diff.wait" => Some(&["diff", "wait"]),
         "diff.editor.command" => Some(&["diff", "editor", "command"]),
+        "finish.autosquash" => Some(&["finish", "autosquash"]),
         _ => None,
     }
 }
@@ -585,6 +631,12 @@ struct ConfigJson<'a> {
     review: ReviewJson,
     hooks: HooksJson<'a>,
     diff: DiffJson<'a>,
+    finish: FinishJson,
+}
+
+#[derive(serde::Serialize)]
+struct FinishJson {
+    autosquash: bool,
 }
 
 #[derive(serde::Serialize)]
@@ -633,6 +685,9 @@ impl<'a> From<&'a Config> for ConfigJson<'a> {
                 editor: cfg.diff.editor.as_ref(),
                 wait: cfg.diff.wait,
             },
+            finish: FinishJson {
+                autosquash: cfg.finish.autosquash,
+            },
         }
     }
 }
@@ -649,6 +704,7 @@ fn key_name(cmd: &ConfigKey) -> &'static str {
         ConfigKey::HooksBlocked(_) => "hooks.blocked",
         ConfigKey::DiffEditorCommand(_) => "diff.editor.command",
         ConfigKey::DiffWait(_) => "diff.wait",
+        ConfigKey::FinishAutosquash(_) => "finish.autosquash",
     }
 }
 
@@ -663,7 +719,8 @@ fn key_args(cmd: &ConfigKey) -> &ConfigKeyArgs {
         | ConfigKey::HooksIdle(a)
         | ConfigKey::HooksBlocked(a)
         | ConfigKey::DiffEditorCommand(a)
-        | ConfigKey::DiffWait(a) => a,
+        | ConfigKey::DiffWait(a)
+        | ConfigKey::FinishAutosquash(a) => a,
     }
 }
 
@@ -736,7 +793,18 @@ pub async fn run(args: ConfigArgs) -> anyhow::Result<()> {
                 anyhow::bail!("{key} is a bool; value must be true or false");
             }
             let path = key_to_json_path(key).expect("key_name always returns a catalog key");
-            set_repo_key(&repo, path, value, def.type_desc)?;
+            // `--global` writes the user-scope config; otherwise the repo's.
+            // Reads below still show the effective merged value (repo shadows
+            // user), so the reported `source` reflects where it landed.
+            let config_path = if args.global {
+                let home = std::env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .ok_or_else(|| anyhow::anyhow!("--global needs $HOME set"))?;
+                home.join(".clank/config.json")
+            } else {
+                repo.join(".clank/config.json")
+            };
+            set_key(&config_path, path, value, def.type_desc)?;
             let kvs = resolve_key_values(&repo);
             if let Some(kv) = kvs.iter().find(|kv| kv.key == key) {
                 println!("{} = {} ({})", kv.key, kv.value, kv.source);
@@ -750,13 +818,20 @@ pub async fn run(args: ConfigArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Thin repo-scope wrapper over [`set_key`] (used by tests).
+#[cfg(test)]
 fn set_repo_key(repo: &Path, path: &[&str], value: &str, type_desc: &str) -> anyhow::Result<()> {
+    set_key(&repo.join(".clank/config.json"), path, value, type_desc)
+}
+
+/// Read-modify-write a single key into `config_path` (repo or user scope),
+/// creating the file + parent dir if absent. Preserves unknown keys.
+fn set_key(config_path: &Path, path: &[&str], value: &str, type_desc: &str) -> anyhow::Result<()> {
     if path.is_empty() {
         anyhow::bail!("empty JSON path");
     }
-    let config_path = repo.join(".clank/config.json");
     let mut root: serde_json::Value = if config_path.exists() {
-        let body = std::fs::read_to_string(&config_path)?;
+        let body = std::fs::read_to_string(config_path)?;
         serde_json::from_str(&body)?
     } else {
         serde_json::Value::Object(serde_json::Map::new())
@@ -795,7 +870,7 @@ fn set_repo_key(repo: &Path, path: &[&str], value: &str, type_desc: &str) -> any
         std::fs::create_dir_all(parent)?;
     }
     let body = serde_json::to_string_pretty(&root)?;
-    std::fs::write(&config_path, body)?;
+    std::fs::write(config_path, body)?;
     Ok(())
 }
 
@@ -934,6 +1009,7 @@ mod tests {
             )),
             repo: Some(tmp.path().to_path_buf()),
             json: false,
+            global: false,
         };
         let result = tokio::runtime::Runtime::new().unwrap().block_on(run(args));
         assert!(result.is_err());
@@ -1005,6 +1081,7 @@ mod tests {
             )),
             repo: Some(tmp.path().to_path_buf()),
             json: false,
+            global: false,
         };
         let result = tokio::runtime::Runtime::new().unwrap().block_on(run(args));
         assert!(result.is_err());
@@ -1385,9 +1462,86 @@ mod tests {
                 "diff": {
                     "editor": cfg.diff.editor,
                     "wait": cfg.diff.wait,
+                },
+                "finish": {
+                    "autosquash": cfg.finish.autosquash,
                 }
             })
         );
+    }
+
+    #[test]
+    fn finish_autosquash_defaults_false() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(!load_isolated(tmp.path()).finish.autosquash);
+    }
+
+    #[test]
+    fn finish_autosquash_repo_shadows_global() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        write(
+            &home.path().join(".clank/config.json"),
+            r#"{"finish":{"autosquash":false}}"#,
+        );
+        write(
+            &tmp.path().join(".clank/config.json"),
+            r#"{"finish":{"autosquash":true}}"#,
+        );
+        assert!(
+            load_with_home(tmp.path(), Some(home.path()))
+                .finish
+                .autosquash,
+            "repo true shadows global false"
+        );
+    }
+
+    #[test]
+    fn finish_autosquash_from_global_when_repo_unset() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        write(
+            &home.path().join(".clank/config.json"),
+            r#"{"finish":{"autosquash":true}}"#,
+        );
+        assert!(
+            load_with_home(tmp.path(), Some(home.path()))
+                .finish
+                .autosquash,
+            "global autosquash applies when repo doesn't set it"
+        );
+    }
+
+    #[test]
+    fn finish_autosquash_set_round_trips_repo_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".clank")).unwrap();
+        set_repo_key(tmp.path(), &["finish", "autosquash"], "true", "bool").unwrap();
+        assert!(load_isolated(tmp.path()).finish.autosquash);
+        let kvs = resolve_key_values_with_home(tmp.path(), None);
+        let kv = kvs.iter().find(|kv| kv.key == "finish.autosquash").unwrap();
+        assert_eq!(kv.value, "true");
+        assert_eq!(kv.source, ValueSource::Repo);
+    }
+
+    #[test]
+    fn global_set_writes_user_scope_reported_as_user_source() {
+        // `--global` writes the user-scope config (via set_key to the home
+        // path); the effective value reads back with source User (a repo
+        // value would shadow it).
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        set_key(
+            &home.path().join(".clank/config.json"),
+            &["finish", "autosquash"],
+            "true",
+            "bool",
+        )
+        .unwrap();
+        let kvs = resolve_key_values_with_home(tmp.path(), Some(home.path()));
+        let kv = kvs.iter().find(|kv| kv.key == "finish.autosquash").unwrap();
+        assert_eq!(kv.value, "true");
+        assert_eq!(kv.source, ValueSource::User, "global write is user-scope");
     }
 
     #[test]
