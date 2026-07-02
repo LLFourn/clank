@@ -80,8 +80,15 @@ pub(super) enum Mode {
 pub(super) enum DetailAction {
     /// Arm/disarm the agent's auto-mode.
     ToggleAuto,
-    /// Flip a reviewer between the commit and gate tiers.
-    SwitchTier,
+    /// The `commit` review checkbox — EXCLUSIVE: a commit-tier reviewer
+    /// reviews every commit, subsuming the gate points, so ticking it
+    /// grays out `plan`/`final`.
+    TierCommit,
+    /// The `plan` review checkbox (independent of `final`).
+    TierPlan,
+    /// The `final` review checkbox. `plan`+`final` together is what the
+    /// roster calls `Gate` internally.
+    TierFinal,
     /// Promote a reviewer to master (the core also demotes the old one).
     PromoteToMaster,
     /// Remove the agent from the team (behind the confirm).
@@ -91,7 +98,7 @@ pub(super) enum DetailAction {
 }
 
 /// The detail-page actions for `role`, in display order. Master gets a
-/// reduced set (no tier-switch / promote / remove): the UI hide is
+/// reduced set (no review checkboxes / promote / remove): the UI hide is
 /// primary, and the cores refuse anyway (defense in depth).
 pub(super) fn detail_actions(role: crate::cli::teams_config::RosterRole) -> Vec<DetailAction> {
     use crate::cli::teams_config::RosterRole;
@@ -99,8 +106,86 @@ pub(super) fn detail_actions(role: crate::cli::teams_config::RosterRole) -> Vec<
     match role {
         RosterRole::Master => vec![ToggleAuto, Back],
         RosterRole::Commit | RosterRole::Plan | RosterRole::Final | RosterRole::Gate => {
-            vec![ToggleAuto, SwitchTier, PromoteToMaster, Remove, Back]
+            vec![
+                ToggleAuto,
+                TierCommit,
+                TierPlan,
+                TierFinal,
+                PromoteToMaster,
+                Remove,
+                Back,
+            ]
         }
+    }
+}
+
+/// A reviewer tier's checkbox state, `(commit, plan, final)`. The four
+/// `ReviewKind`s map 1:1 onto the reachable states — `Gate` IS
+/// `plan`+`final`; the checkboxes expose the model the roster already has.
+pub(super) fn tier_boxes(kind: crate::cli::teams_config::ReviewKind) -> (bool, bool, bool) {
+    use crate::cli::teams_config::ReviewKind::*;
+    match kind {
+        Commit => (true, false, false),
+        Plan => (false, true, false),
+        Final => (false, false, true),
+        Gate => (false, true, true),
+    }
+}
+
+/// The reviewer tier after toggling one checkbox — `None` = no-op.
+/// Rules: `commit` is exclusive (ticking it clears `plan`/`final`;
+/// ticking `plan`/`final` while in commit mode LEAVES commit mode); and
+/// unticking the last remaining coverage is a no-op (a reviewer must
+/// review something).
+pub(super) fn tier_after_toggle(
+    current: crate::cli::teams_config::ReviewKind,
+    action: DetailAction,
+) -> Option<crate::cli::teams_config::ReviewKind> {
+    use crate::cli::teams_config::ReviewKind::*;
+    let (commit, plan, final_) = tier_boxes(current);
+    match action {
+        DetailAction::TierCommit => (!commit).then_some(Commit),
+        DetailAction::TierPlan => match (commit, plan, final_) {
+            (true, _, _) => Some(Plan),
+            (false, true, true) => Some(Final),
+            (false, true, false) => None, // last coverage — keep it
+            (false, false, _) => Some(if final_ { Gate } else { Plan }),
+        },
+        DetailAction::TierFinal => match (commit, final_, plan) {
+            (true, _, _) => Some(Final),
+            (false, true, true) => Some(Plan),
+            (false, true, false) => None, // last coverage — keep it
+            (false, false, _) => Some(if plan { Gate } else { Final }),
+        },
+        _ => None,
+    }
+}
+
+/// A roster role's `ReviewKind` — `None` for master (no review tier).
+pub(super) fn role_review_kind(
+    role: crate::cli::teams_config::RosterRole,
+) -> Option<crate::cli::teams_config::ReviewKind> {
+    use crate::cli::teams_config::{ReviewKind, RosterRole};
+    match role {
+        RosterRole::Master => None,
+        RosterRole::Commit => Some(ReviewKind::Commit),
+        RosterRole::Plan => Some(ReviewKind::Plan),
+        RosterRole::Final => Some(ReviewKind::Final),
+        RosterRole::Gate => Some(ReviewKind::Gate),
+    }
+}
+
+/// The roster role a `ReviewKind` persists as (for in-place snapshot
+/// updates after a tier edit).
+pub(super) fn review_kind_role(
+    kind: crate::cli::teams_config::ReviewKind,
+) -> crate::cli::teams_config::RosterRole {
+    use crate::cli::teams_config::{ReviewKind, RosterRole};
+    match kind {
+        ReviewKind::Commit => RosterRole::Commit,
+        ReviewKind::Plan => RosterRole::Plan,
+        ReviewKind::Final => RosterRole::Final,
+        ReviewKind::Gate => RosterRole::Gate,
     }
 }
 
@@ -131,10 +216,16 @@ pub(super) fn relocate_detail(
 }
 
 /// A value-bearing row that ←/→ may flip in place (vs an action row that
-/// only Enter/Space activates). Both toggles are 2-state, so the flip is
-/// direction-agnostic.
+/// only Enter/Space activates). All toggles are flips (auto on/off, a
+/// checkbox tick/untick), so the flip is direction-agnostic.
 pub(super) fn is_toggle(action: DetailAction) -> bool {
-    matches!(action, DetailAction::ToggleAuto | DetailAction::SwitchTier)
+    matches!(
+        action,
+        DetailAction::ToggleAuto
+            | DetailAction::TierCommit
+            | DetailAction::TierPlan
+            | DetailAction::TierFinal
+    )
 }
 
 /// Pure key routing for the detail page. ↑↓ move the cursor; ←/→/␣ "change"
@@ -505,20 +596,45 @@ mod tests {
         use crate::cli::teams_config::RosterRole;
         use DetailAction::*;
         assert_eq!(detail_actions(RosterRole::Master), vec![ToggleAuto, Back]);
-        assert_eq!(
-            detail_actions(RosterRole::Commit),
-            vec![ToggleAuto, SwitchTier, PromoteToMaster, Remove, Back]
-        );
-        assert_eq!(
-            detail_actions(RosterRole::Gate),
-            vec![ToggleAuto, SwitchTier, PromoteToMaster, Remove, Back]
-        );
+        let reviewer = vec![
+            ToggleAuto,
+            TierCommit,
+            TierPlan,
+            TierFinal,
+            PromoteToMaster,
+            Remove,
+            Back,
+        ];
+        assert_eq!(detail_actions(RosterRole::Commit), reviewer);
+        assert_eq!(detail_actions(RosterRole::Gate), reviewer);
+    }
+
+    #[test]
+    fn tier_toggle_state_machine_covers_all_transitions() {
+        use crate::cli::teams_config::ReviewKind::*;
+        use DetailAction::*;
+        // commit is exclusive; ticking plan/final leaves commit mode.
+        assert_eq!(tier_after_toggle(Commit, TierCommit), None, "last coverage");
+        assert_eq!(tier_after_toggle(Commit, TierPlan), Some(Plan));
+        assert_eq!(tier_after_toggle(Commit, TierFinal), Some(Final));
+        // plan-only.
+        assert_eq!(tier_after_toggle(Plan, TierCommit), Some(Commit));
+        assert_eq!(tier_after_toggle(Plan, TierPlan), None, "last coverage");
+        assert_eq!(tier_after_toggle(Plan, TierFinal), Some(Gate));
+        // final-only.
+        assert_eq!(tier_after_toggle(Final, TierCommit), Some(Commit));
+        assert_eq!(tier_after_toggle(Final, TierPlan), Some(Gate));
+        assert_eq!(tier_after_toggle(Final, TierFinal), None, "last coverage");
+        // gate == plan+final; unticking one leaves the other.
+        assert_eq!(tier_after_toggle(Gate, TierCommit), Some(Commit));
+        assert_eq!(tier_after_toggle(Gate, TierPlan), Some(Final));
+        assert_eq!(tier_after_toggle(Gate, TierFinal), Some(Plan));
     }
 
     #[test]
     fn agent_detail_nav_routes_menu_keys() {
         use DetailAction::*;
-        let actions = [ToggleAuto, SwitchTier, Remove, Back];
+        let actions = [ToggleAuto, TierCommit, Remove, Back];
         assert_eq!(
             agent_detail_nav(0, &actions, Key::Down),
             DetailNav::MoveCursor(1)
@@ -530,7 +646,7 @@ mod tests {
         );
         assert_eq!(
             agent_detail_nav(1, &actions, Key::Enter),
-            DetailNav::Activate(SwitchTier)
+            DetailNav::Activate(TierCommit)
         );
         assert_eq!(agent_detail_nav(0, &actions, Key::Escape), DetailNav::Back);
         assert_eq!(agent_detail_nav(0, &actions, Key::Quit), DetailNav::Quit);

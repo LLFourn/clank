@@ -81,17 +81,20 @@ pub struct StatusSnapshot {
 /// decision), NOT a live run indicator.
 pub(crate) struct AgentAutoRow {
     pub(crate) label: String,
-    /// The roster TIER — Master / Commit / Gate — so the panel can
-    /// distinguish the kinds of reviewers (not just master vs reviewer).
+    /// The roster TIER — Master / Commit / Plan / Final / Gate — so the
+    /// panel can distinguish the kinds of reviewers (not just master vs
+    /// reviewer).
     pub(crate) role: crate::cli::teams_config::RosterRole,
     pub(crate) auto_mode: clank_core::vocab::AutoMode,
     /// Roster `AgentDescription` facts the detail page surfaces: the
-    /// tool, the invocation that runs it (launch command + args, or the
-    /// bare tool), and its `initial_prompt` as the only "what is this
-    /// for" clank has (no semantic purpose field yet).
+    /// tool and the invocation that runs it (launch command + args, or
+    /// the bare tool).
     pub(crate) tool: String,
     pub(crate) invocation: String,
-    pub(crate) description: Option<String>,
+    /// The session id this label is bound to (`clank as`), from the
+    /// agent's local config. `None` = unbound — surfaced as a problem on
+    /// the detail page, since an unbound agent can't receive work.
+    pub(crate) session: Option<String>,
 }
 
 /// The invocation that runs an agent: launch command (or the bare tool
@@ -159,13 +162,17 @@ fn roster_auto_rows(
             .ok()
             .flatten();
         let auto_mode = crate::cli::team::resolve_effective_auto_mode(cfg.as_ref(), home);
+        let session = cfg
+            .as_ref()
+            .and_then(|c| c.session.as_ref())
+            .map(|s| s.id.as_str().to_string());
         rows.push(AgentAutoRow {
             label: label.as_str().to_string(),
             role,
             auto_mode,
             tool: desc.tool.as_str().to_string(),
             invocation: agent_invocation(desc),
-            description: desc.initial_prompt.clone(),
+            session,
         });
     }
     rows
@@ -1663,7 +1670,7 @@ mod dirty_and_wake_tests {
             auto_mode: AutoMode::Off,
             tool: "codex".to_string(),
             invocation: "codex".to_string(),
-            description: None,
+            session: None,
         }];
         let avail = available_agents(Some(home.path()), &roster);
         let labels: Vec<&str> = avail.iter().map(|a| a.label.as_str()).collect();

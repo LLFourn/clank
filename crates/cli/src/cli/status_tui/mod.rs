@@ -113,11 +113,13 @@ fn apply_confirm(
 }
 
 /// Execute a detail-page action via the existing `clank agent` cores
-/// and return the next mode. ToggleAuto stays on the page (auto doesn't
-/// reorder the roster); SwitchTier/Promote return to the panel (the
-/// roster reorders, so leave by index and let the Refresh rebuild
-/// re-bound the cursor); Remove defers to the Confirm modal. The TUI is
-/// a front-end to the cores, never a reimplemented write.
+/// and return the next mode. ToggleAuto and the review checkboxes STAY
+/// on the page (the row is updated in place so several boxes can be
+/// ticked in one visit; a concurrent external Refresh re-locates the
+/// open page by LABEL, so the roster reordering is safe); Promote
+/// returns to the panel (the agent's own action set changes shape);
+/// Remove defers to the Confirm modal. The TUI is a front-end to the
+/// cores, never a reimplemented write.
 fn apply_detail_action(
     action: DetailAction,
     idx: usize,
@@ -125,7 +127,6 @@ fn apply_detail_action(
     snapshot: &mut StatusSnapshot,
     repo: &std::path::Path,
 ) -> Mode {
-    use crate::cli::teams_config::{ReviewKind, RosterRole};
     // Copy out what we need so the &mut write below doesn't conflict.
     let (auto_mode, role, label_str) = match snapshot.agents.get(idx) {
         Some(a) => (a.auto_mode, a.role, a.label.clone()),
@@ -142,13 +143,14 @@ fn apply_detail_action(
             }
             Mode::AgentDetail { idx, sel }
         }
-        DetailAction::SwitchTier => {
-            let to = match role {
-                RosterRole::Commit => ReviewKind::Gate,
-                _ => ReviewKind::Commit,
-            };
-            let _ = crate::cli::agent::set_repo_review(repo, &label, to);
-            Mode::AgentPanel { sel: idx }
+        DetailAction::TierCommit | DetailAction::TierPlan | DetailAction::TierFinal => {
+            if let Some(current) = input::role_review_kind(role)
+                && let Some(next) = input::tier_after_toggle(current, action)
+                && crate::cli::agent::set_repo_review(repo, &label, next).is_ok()
+            {
+                snapshot.agents[idx].role = input::review_kind_role(next);
+            }
+            Mode::AgentDetail { idx, sel }
         }
         DetailAction::PromoteToMaster => {
             let _ = crate::cli::agent::set_repo_master(repo, &label);
@@ -1277,22 +1279,49 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn apply_detail_action_switch_tier_uses_the_core() {
+    fn apply_detail_action_tier_checkbox_uses_the_core_and_stays_on_page() {
+        use crate::cli::teams_config::RosterRole;
         let repo = detail_repo();
         let mut s = two_agent_snap(); // idx 1 == codex (commit)
-        let next = apply_detail_action(DetailAction::SwitchTier, 1, 1, &mut s, repo.path());
+        // Tick `plan` on a commit-tier reviewer → leaves commit mode.
+        let next = apply_detail_action(DetailAction::TierPlan, 1, 2, &mut s, repo.path());
+        let parsed: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(repo.path().join(".clank/config.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            parsed["agents"]["codex"]["role"], "plan",
+            "commit → plan via set_repo_review"
+        );
+        assert!(
+            matches!(next, Mode::AgentDetail { idx: 1, sel: 2 }),
+            "a tier edit STAYS on the detail page: {next:?}"
+        );
+        assert_eq!(
+            s.agents[1].role,
+            RosterRole::Plan,
+            "snapshot row updated in place so the checkboxes repaint live"
+        );
+
+        // Tick `final` too → plan+final == gate.
+        let next = apply_detail_action(DetailAction::TierFinal, 1, 3, &mut s, repo.path());
         let parsed: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(repo.path().join(".clank/config.json")).unwrap(),
         )
         .unwrap();
         assert_eq!(
             parsed["agents"]["codex"]["role"], "gate",
-            "commit → gate via set_repo_review"
+            "plan+final persists as gate"
         );
-        assert!(
-            matches!(next, Mode::AgentPanel { .. }),
-            "returns to the panel (the roster reorders)"
-        );
+        assert!(matches!(next, Mode::AgentDetail { idx: 1, sel: 3 }));
+
+        // Unticking down to the last coverage is a no-op (still gate→final
+        // →final stays; final is the only box left, untick refused).
+        apply_detail_action(DetailAction::TierPlan, 1, 2, &mut s, repo.path());
+        let before = std::fs::read_to_string(repo.path().join(".clank/config.json")).unwrap();
+        apply_detail_action(DetailAction::TierFinal, 1, 3, &mut s, repo.path());
+        let after = std::fs::read_to_string(repo.path().join(".clank/config.json")).unwrap();
+        assert_eq!(before, after, "unticking the last coverage is a no-op");
     }
 
     #[test]

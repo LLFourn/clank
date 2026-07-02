@@ -728,17 +728,17 @@ fn toggle_segment(left: (&str, bool), right: (&str, bool), selected: bool) -> Ve
 }
 
 /// One detail-page row's spans: a fixed-width caret gutter (so rows don't
-/// jitter as the cursor moves) then either a segmented toggle (auto/tier),
-/// a glyph-prefixed action, or the destructive red `✗ remove`. Selection
-/// is a `▸` caret — NOT the reverse band — so the inline toggle value and
-/// the red destructive cue stay visible. The caret turns red on the
-/// selected Remove row as an extra danger cue.
+/// jitter as the cursor moves) then a segmented toggle (auto), a review
+/// checkbox (`[x] commit` / `[ ] plan` / `[ ] final`), a glyph-prefixed
+/// action, or the destructive red `✗ remove`. Selection is a `▸` caret —
+/// NOT the reverse band — so the inline toggle value and the red
+/// destructive cue stay visible. The caret turns red on the selected
+/// Remove row as an extra danger cue.
 pub(super) fn detail_row_spans(
     action: DetailAction,
     agent: &crate::cli::status::AgentAutoRow,
     selected: bool,
 ) -> Vec<Span> {
-    use crate::cli::teams_config::RosterRole;
     use clank_core::vocab::AutoMode;
     let danger = matches!(action, DetailAction::Remove);
     // Gutter: caret+space when selected, two spaces otherwise — always 2
@@ -754,14 +754,32 @@ pub(super) fn detail_row_spans(
             spans.push(dim(format!("{:<10}", "auto")));
             spans.extend(toggle_segment(("on", on), ("off", !on), selected));
         }
-        DetailAction::SwitchTier => {
-            let commit = agent.role == RosterRole::Commit;
-            spans.push(dim(format!("{:<10}", "tier")));
-            spans.extend(toggle_segment(
-                ("commit", commit),
-                ("gate", !commit),
-                selected,
-            ));
+        DetailAction::TierCommit | DetailAction::TierPlan | DetailAction::TierFinal => {
+            let kind = super::input::role_review_kind(agent.role)
+                .unwrap_or(crate::cli::teams_config::ReviewKind::Commit);
+            let (commit, plan, final_) = super::input::tier_boxes(kind);
+            let (name, checked, label_col) = match action {
+                DetailAction::TierCommit => ("commit", commit, "reviews"),
+                DetailAction::TierPlan => ("plan", plan, ""),
+                _ => ("final", final_, ""),
+            };
+            spans.push(dim(format!("{label_col:<10}")));
+            // Checked → bold; unchecked → plain; plan/final render fully
+            // DIM while commit is ticked (commit subsumes the gate points)
+            // — still toggleable: ticking one LEAVES commit mode.
+            let grayed = commit && !matches!(action, DetailAction::TierCommit);
+            let box_txt = format!("[{}] {name}", if checked { "x" } else { " " });
+            if selected {
+                spans.push(dim("‹ "));
+            }
+            spans.push(match (checked, grayed) {
+                (true, _) => bold(box_txt),
+                (false, true) => dim(box_txt),
+                (false, false) => plain(box_txt),
+            });
+            if selected {
+                spans.push(dim(" ›"));
+            }
         }
         DetailAction::PromoteToMaster => spans.push(plain("⇧ promote to master")),
         DetailAction::Remove => spans.push(colored("31", "✗ remove from team")),
@@ -771,10 +789,10 @@ pub(super) fn detail_row_spans(
 }
 
 /// The full-screen per-agent detail/config page: a read-only info block
-/// (tool, invocation, purpose) then the directly-manipulable rows —
-/// auto/tier are inline toggles (←/→/␣ flip), promote/remove/back are
-/// actions, the cursor marked by a `▸` caret. Hard-clamped to `rows` with
-/// single-line fields so a multiline `initial_prompt` can't overflow.
+/// (tool, the FULL wrapped invocation, session binding) then the
+/// directly-manipulable rows — auto is an inline toggle and the review
+/// tier is three checkboxes (←/→/␣ flip), promote/remove/back are
+/// actions, the cursor marked by a `▸` caret. Hard-clamped to `rows`.
 /// Returns `(lines, 0)` — no log.
 pub(super) fn render_agent_detail(
     agent: &crate::cli::status::AgentAutoRow,
@@ -791,23 +809,42 @@ pub(super) fn render_agent_detail(
         cols,
     ));
     out.push(String::new());
-    // Read-only info — auto/tier are NOT here; they're live toggle rows
+    // Read-only info — auto/review are NOT here; they're live toggle rows
     // below (one place to see AND change each, no duplication).
-    let purpose = agent
-        .description
-        .as_deref()
-        .filter(|d| !d.trim().is_empty())
-        .unwrap_or("—");
-    let info = [
-        ("tool", agent.tool.clone()),
-        ("invocation", one_line(&agent.invocation, cols)),
-        ("purpose", one_line(purpose, cols)),
-    ];
-    for (k, v) in info {
+    if out.len() < rows {
+        out.push(emit(
+            &[dim(format!("   {:<11}", "tool")), plain(agent.tool.clone())],
+            "",
+            cols,
+        ));
+    }
+    // The invocation in FULL, wrapped — a copy-pastable command line, never
+    // `…`-truncated (a long launch command must be recoverable by eye).
+    const INFO_INDENT: usize = 14; // "   " + 11-col label
+    let inv_lines = wrap(&agent.invocation, cols.saturating_sub(INFO_INDENT).max(1));
+    for (i, line) in inv_lines.iter().enumerate() {
         if out.len() >= rows {
             break;
         }
-        out.push(emit(&[dim(format!("   {k:<11}")), plain(v)], "", cols));
+        let label = if i == 0 { "invocation" } else { "" };
+        out.push(emit(
+            &[dim(format!("   {label:<11}")), plain(line.clone())],
+            "",
+            cols,
+        ));
+    }
+    // Session binding: an unbound agent can't receive work — surface that
+    // as a PROBLEM, not a dash.
+    if out.len() < rows {
+        let mut spans = vec![dim(format!("   {:<11}", "session"))];
+        match agent.session.as_deref() {
+            Some(id) => spans.push(dim(one_line(id, cols.saturating_sub(INFO_INDENT)))),
+            None => spans.push(colored(
+                "31",
+                format!("✗ unbound — run `clank as {}` in its session", agent.label),
+            )),
+        }
+        out.push(emit(&spans, "", cols));
     }
     if out.len() < rows {
         out.push(String::new());
@@ -1910,11 +1947,11 @@ mod tests {
         let mut s = two_agent_snap();
         let mut codex = agent_row("codex", RosterRole::Commit, AutoMode::Off);
         codex.invocation = "codex --profile deep".to_string();
-        codex.description = Some("line one\nline two".to_string());
+        codex.session = Some("0d9af2c1-session-id".to_string());
         s.agents = vec![agent_row("claude", RosterRole::Master, AutoMode::On), codex];
 
-        // Reviewer detail (idx 1): info + full action set; the multiline
-        // purpose collapses to one line; the selected action is banded.
+        // Reviewer detail (idx 1): info + full action set; the review tier
+        // renders as checkboxes; the selected row carries the caret.
         let rev = render_at(
             &s,
             40,
@@ -1927,28 +1964,26 @@ mod tests {
         let rev_j = rev.join("\n");
         assert!(rev_j.contains("AGENT · CODEX"), "detail title");
         assert!(rev_j.contains("codex --profile deep"), "invocation shown");
-        assert!(
-            rev_j.contains("line one") && !rev_j.contains("line two"),
-            "purpose one-lined"
-        );
-        // tier is a segmented toggle (commit │ gate), not a verb naming
-        // the target; auto likewise (on │ off).
-        assert!(
-            rev_j.contains("commit") && rev_j.contains("gate"),
-            "tier toggle shown"
-        );
+        assert!(rev_j.contains("0d9af2c1-session-id"), "bound session shown");
+        assert!(!rev_j.contains("purpose"), "the dead purpose row is gone");
+        // The review tier is three checkboxes exposing the REAL domain —
+        // a Commit reviewer: [x] commit, with plan/final unticked.
+        assert!(rev_j.contains("[x] commit"), "commit checked: {rev_j}");
+        assert!(rev_j.contains("[ ] plan"), "plan unticked");
+        assert!(rev_j.contains("[ ] final"), "final unticked");
+        assert!(!rev_j.contains("gate"), "no internal 'gate' word: {rev_j}");
         assert!(rev_j.contains("promote to master") && rev_j.contains("remove from team"));
-        // Selected row (tier, sel=1) is marked by the ▸ caret — not the
-        // reverse-video band (the detail page uses caret selection so the
-        // inline toggle value + red destructive cue stay visible).
+        // Selected row (the commit checkbox, sel=1) is marked by the ▸
+        // caret — not the reverse-video band.
         assert!(
-            line_with(&rev, "tier").contains('▸'),
+            line_with(&rev, "[x] commit").contains('▸'),
             "selected row carries the caret"
         );
         // Full screen: not the normal layout.
         assert!(!rev_j.contains("git"), "detail replaces the normal layout");
 
-        // Master detail (idx 0): reduced — auto toggle + back only.
+        // Master detail (idx 0): reduced — auto toggle + back only, and its
+        // session (unset in the fixture) reads as a red problem.
         let mas = render_at(
             &s,
             40,
@@ -1957,15 +1992,89 @@ mod tests {
             0,
             &PanelView::just(Mode::AgentDetail { idx: 0, sel: 0 }),
         )
-        .0
-        .join("\n");
+        .0;
+        let mas_j = mas.join("\n");
         assert!(
-            mas.contains("auto") && mas.contains("on") && mas.contains("off"),
-            "master keeps the auto toggle: {mas}"
+            mas_j.contains("auto") && mas_j.contains("on") && mas_j.contains("off"),
+            "master keeps the auto toggle: {mas_j}"
         );
         assert!(
-            !mas.contains("tier") && !mas.contains("promote") && !mas.contains("remove"),
-            "master's action set is reduced: {mas}"
+            !mas_j.contains("[ ] plan") && !mas_j.contains("promote") && !mas_j.contains("remove"),
+            "master's action set is reduced: {mas_j}"
+        );
+        assert!(
+            mas_j.contains("unbound") && mas_j.contains("clank as claude"),
+            "unbound session surfaced as a problem with the fix: {mas_j}"
+        );
+        assert!(
+            line_with(&mas, "unbound").contains("\x1b[31m"),
+            "unbound renders red"
+        );
+    }
+
+    #[test]
+    fn detail_page_gate_reviewer_shows_plan_and_final_ticked() {
+        use crate::cli::teams_config::RosterRole;
+        use clank_core::vocab::AutoMode;
+        let mut s = two_agent_snap();
+        s.agents = vec![
+            agent_row("claude", RosterRole::Master, AutoMode::On),
+            agent_row("ruthless", RosterRole::Gate, AutoMode::On),
+        ];
+        let out = render_at(
+            &s,
+            40,
+            80,
+            0,
+            0,
+            &PanelView::just(Mode::AgentDetail { idx: 1, sel: 0 }),
+        )
+        .0
+        .join("\n");
+        // Gate == plan+final: both ticked, commit unticked.
+        assert!(out.contains("[ ] commit"), "commit unticked: {out}");
+        assert!(out.contains("[x] plan"), "plan ticked");
+        assert!(out.contains("[x] final"), "final ticked");
+    }
+
+    #[test]
+    fn detail_page_invocation_wraps_in_full_without_ellipsis() {
+        use crate::cli::teams_config::RosterRole;
+        use clank_core::vocab::AutoMode;
+        let mut s = two_agent_snap();
+        let mut codex = agent_row("codex", RosterRole::Commit, AutoMode::Off);
+        codex.invocation =
+            "codex --profile deep --sandbox danger-full-access --config model_reasoning_effort=high"
+                .to_string();
+        // A short bound session so no OTHER info row needs truncation at
+        // this narrow width — the no-ellipsis assert below is global.
+        codex.session = Some("s1".to_string());
+        s.agents = vec![agent_row("claude", RosterRole::Master, AutoMode::On), codex];
+        let out = render_at(
+            &s,
+            40,
+            48, // narrow: the invocation cannot fit one line
+            0,
+            0,
+            &PanelView::just(Mode::AgentDetail { idx: 1, sel: 0 }),
+        )
+        .0;
+        // The FULL command is present (copy-pastable) — wrapped, never
+        // `…`-truncated. Reassemble the visible text and check every token.
+        let all: String = out.iter().map(|l| visible(l)).collect::<Vec<_>>().join(" ");
+        for token in [
+            "codex",
+            "--profile",
+            "deep",
+            "--sandbox",
+            "danger-full-access",
+            "model_reasoning_effort=high",
+        ] {
+            assert!(all.contains(token), "token `{token}` lost: {all}");
+        }
+        assert!(
+            !out.iter().any(|l| visible(l).contains('…')),
+            "invocation must never be ellipsized"
         );
     }
 
@@ -2332,17 +2441,20 @@ mod tests {
         let texts: Vec<String> = lines.iter().map(|l| visible(l)).collect();
         let raw = lines.join("\n");
 
-        // auto + tier are segmented toggles, shown ONCE each (not also a
-        // read-only info line — the duplication this redesign removes).
+        // auto is a segmented toggle; the review tier is checkbox rows —
+        // each shown ONCE (not also a read-only info line).
         let auto = texts.iter().find(|t| t.contains("auto")).expect("auto row");
-        let tier = texts.iter().find(|t| t.contains("tier")).expect("tier row");
+        let commit_row = texts
+            .iter()
+            .find(|t| t.contains("commit"))
+            .expect("commit checkbox row");
         assert!(
             auto.contains("on") && auto.contains("off"),
             "auto segmented: {auto:?}"
         );
         assert!(
-            tier.contains("commit") && tier.contains("gate"),
-            "tier segmented: {tier:?}"
+            commit_row.contains("[x] commit"),
+            "commit-tier reviewer has commit ticked: {commit_row:?}"
         );
         assert_eq!(
             texts.iter().filter(|t| t.contains("auto")).count(),
@@ -2350,15 +2462,20 @@ mod tests {
             "auto once"
         );
         assert_eq!(
-            texts.iter().filter(|t| t.contains("tier")).count(),
+            texts.iter().filter(|t| t.contains("commit")).count(),
             1,
-            "tier once"
+            "commit checkbox once"
         );
 
-        // auto is ON → the active "on" renders bold.
+        // auto is ON → the active "on" renders bold; the ticked checkbox
+        // renders bold too.
         assert!(
             raw.contains("\x1b[1mon\x1b[0m"),
             "active option bold: {raw:?}"
+        );
+        assert!(
+            raw.contains("\x1b[1m[x] commit\x1b[0m"),
+            "ticked checkbox bold: {raw:?}"
         );
         // Selected row gets the ▸ caret; the gutter is a fixed 2 DISPLAY
         // columns (▸ is one column but 3 bytes), so the label column is
@@ -2367,7 +2484,7 @@ mod tests {
         let gutter = |row: &str, label: &str| display_width(&row[..row.find(label).unwrap()]);
         assert_eq!(gutter(auto, "auto"), 2, "selected caret gutter is 2 cols");
         assert_eq!(
-            gutter(tier, "tier"),
+            gutter(commit_row, "reviews"),
             2,
             "unselected gutter is the same 2 cols"
         );

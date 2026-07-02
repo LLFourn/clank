@@ -21,7 +21,7 @@ pub(crate) fn agent_row(
         auto_mode: auto,
         tool: "claude".to_string(),
         invocation: "claude".to_string(),
-        description: None,
+        session: None,
     }
 }
 
