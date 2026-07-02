@@ -360,7 +360,7 @@ mod tests {
             OnelineRow::Commit {
                 sha,
                 subject: "do a thing".into(),
-                ad_hoc: false,
+                marker: crate::cli::log::RowMarker::Plain,
             },
         ];
         s
@@ -427,7 +427,7 @@ mod tests {
             OnelineRow::Commit {
                 sha,
                 subject: "x".into(),
-                ad_hoc: false,
+                marker: crate::cli::log::RowMarker::Plain,
             },
         ];
         let ask = block_ask_spans(&s, 80);
@@ -471,7 +471,7 @@ mod tests {
         let commit = |s: &str| OnelineRow::Commit {
             sha: sha(s),
             subject: "x".into(),
-            ad_hoc: false,
+            marker: crate::cli::log::RowMarker::Plain,
         };
         let review = |a: &str| OnelineRow::Review {
             verdict: Verdict::Continue,

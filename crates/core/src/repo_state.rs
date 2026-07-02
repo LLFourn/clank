@@ -210,6 +210,14 @@ pub enum LogEvent {
         plan: PlanKey,
         sha: CommitSha,
         ts: i64,
+        /// The finish commit's real subject — a whole-plan summary now that
+        /// finish messages are mandatory (not `"finish"`). `#[serde(default)]`
+        /// for back-compat with pre-subject cache checkpoints; the
+        /// `CACHE_FORMAT_VERSION` bump forces a one-time re-fold so existing
+        /// finishes populate it (renderers fall back to a synthesized label
+        /// when it's still empty).
+        #[serde(default)]
+        subject: String,
     },
     PlanDeleted {
         plan: PlanKey,
@@ -290,6 +298,14 @@ pub fn umbrella_sections<'a>(
             if key == UmbrellaKey::AdHoc {
                 pending.push(e);
                 continue;
+            }
+            // A finish commit CLOSES its plan. In newest-first order it is the
+            // plan's chronologically-newest event, so any pending ad-hoc
+            // (which appears BEFORE it in the stream) is NEWER than the finish
+            // — it landed AFTER the plan finished and must NOT fold into it.
+            // Flush the pending ad-hocs as their own header-less section first.
+            if matches!(e, LogEvent::PlanFinalized { .. }) && !pending.is_empty() {
+                out.push((UmbrellaKey::AdHoc, std::mem::take(&mut pending)));
             }
             let same = matches!(out.last(), Some((k, _)) if *k == key);
             if !same {
@@ -607,6 +623,7 @@ impl RepoState {
                 plan: plan.clone(),
                 sha: event.sha.clone(),
                 ts: event.author_ts,
+                subject: event.subject.clone(),
             });
         }
 
@@ -1366,6 +1383,52 @@ mod tests {
                 subject: format!("adhoc c{n}"),
             },
         }
+    }
+
+    fn log_finish(plan: &str, n: u8) -> LogEvent {
+        LogEvent::PlanFinalized {
+            plan: PlanKey::parse(plan).unwrap(),
+            sha: CommitSha::parse(&format!("{n:0<40x}")).unwrap(),
+            ts: n as i64,
+            subject: format!("[{plan}] wrap up"),
+        }
+    }
+
+    #[test]
+    fn umbrella_sections_adhoc_after_finish_is_its_own_section() {
+        // Chronological: intro(a), finish(a), then ad-hoc X. X landed AFTER
+        // a finished, so it must NOT fold under a's umbrella — it opens its
+        // own header-less section. Newest-first stream (log/status feed):
+        // X, finish(a), intro(a).
+        let intro = log_ev(Some("a"), 1);
+        let finish = log_finish("a", 2);
+        let x = log_ev(None, 3);
+        let s = umbrella_sections(&[&x, &finish, &intro], true);
+        assert_eq!(s.len(), 2, "post-finish adhoc is its own section: {s:?}");
+        assert_eq!(s[0].0, UmbrellaKey::AdHoc);
+        assert!(matches!(&s[0].1[..], [e] if matches!(e, LogEvent::AdHoc { .. })));
+        assert_eq!(s[1].0, UmbrellaKey::Plan(PlanKey::parse("a").unwrap()));
+        assert!(
+            !s[1].1.iter().any(|e| matches!(e, LogEvent::AdHoc { .. })),
+            "no adhoc folded under the finished plan"
+        );
+    }
+
+    #[test]
+    fn umbrella_sections_adhoc_before_finish_still_folds_in() {
+        // An ad-hoc BEFORE the finish (while the plan was active) still folds
+        // into the plan: chronological intro(a), X, finish(a); newest-first
+        // stream finish(a), X, intro(a). Only the absorbing FINISH is special.
+        let intro = log_ev(Some("a"), 1);
+        let x = log_ev(None, 2);
+        let finish = log_finish("a", 3);
+        let s = umbrella_sections(&[&finish, &x, &intro], true);
+        assert_eq!(s.len(), 1, "adhoc during an active plan folds in: {s:?}");
+        assert_eq!(s[0].0, UmbrellaKey::Plan(PlanKey::parse("a").unwrap()));
+        assert!(
+            s[0].1.iter().any(|e| matches!(e, LogEvent::AdHoc { .. })),
+            "adhoc folded into the active plan"
+        );
     }
 
     #[test]

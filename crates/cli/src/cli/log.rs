@@ -279,6 +279,69 @@ fn print_human(events: &[&LogEvent], repo: &Path, shas: &[CommitSha]) -> anyhow:
     Ok(())
 }
 
+/// The leading 1-col gutter marker on a commit row — mutually exclusive by
+/// construction (a commit is exactly one of these), replacing the old
+/// `ad_hoc: bool`. The icon LEADS the row (before the sha).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RowMarker {
+    /// No icon (space) — a plan-delete row.
+    Plain,
+    /// Ad-hoc commit (no `[plan]` tag).
+    AdHoc,
+    /// Plan commit that only touched the plan doc (intro, or a plan-only
+    /// revise) — planning, not code.
+    Planning,
+    /// Plan commit that touched code — implementation.
+    Impl,
+    /// The plan's finalize commit (its message is now a real whole-plan
+    /// summary, so the flag is what identifies it at a glance).
+    Finish,
+}
+
+impl RowMarker {
+    /// Classify a timeline event. Implementation (touched code) vs planning
+    /// (plan-doc-only) is read from `PlanCommit::touched_code`; an intro is
+    /// always planning.
+    fn of(event: &LogEvent) -> RowMarker {
+        match event {
+            LogEvent::AdHoc { .. } => RowMarker::AdHoc,
+            LogEvent::PlanFinalized { .. } => RowMarker::Finish,
+            LogEvent::PlanIntro { .. } => RowMarker::Planning,
+            LogEvent::PlanCommit { touched_code, .. } => {
+                if *touched_code {
+                    RowMarker::Impl
+                } else {
+                    RowMarker::Planning
+                }
+            }
+            LogEvent::PlanDeleted { .. } => RowMarker::Plain,
+        }
+    }
+
+    /// The 1-col gutter glyph. Every glyph is East-Asian-Width Neutral/Narrow
+    /// → 1 column, preserving the fixed 1-col gutter that keeps rows aligned
+    /// in the narrow TUI pane (a test pins each width at 1). Emoji (🔨/📜/🏁)
+    /// are 2-col and would break alignment — deliberately avoided.
+    pub(crate) fn glyph(self) -> char {
+        match self {
+            RowMarker::Plain => ' ',
+            RowMarker::AdHoc => '~',
+            RowMarker::Planning => '✎',
+            RowMarker::Impl => '⚒',
+            RowMarker::Finish => '⚑',
+        }
+    }
+
+    /// ANSI color for the glyph in the colored CLI renderer (`""` = none).
+    fn ansi(self) -> &'static str {
+        match self {
+            RowMarker::Finish => C, // cyan, matching the Finished verdict
+            RowMarker::AdHoc => Y,  // yellow (unchanged from the old `~`)
+            _ => "",
+        }
+    }
+}
+
 /// One `--oneline` display row: data only, no formatting — shared
 /// by the CLI renderer (which colors it) and the status TUI's log
 /// pane (which dims it). Plan: status-tui-live-log.
@@ -294,11 +357,10 @@ pub(crate) enum OnelineRow {
         /// matches the enclosing umbrella's plan (redundant under
         /// the header); verbatim otherwise.
         subject: String,
-        /// True for an ad-hoc commit (no `[plan]` tag) folded into the
-        /// surrounding plan's umbrella — the renderer shows the `~`
-        /// ad-hoc marker (adhoc-commit-marker). The single carrier of
-        /// ad-hoc-ness now that ad-hoc commits have no own header.
-        ad_hoc: bool,
+        /// Gutter marker: `AdHoc` (no `[plan]` tag, folded into the
+        /// surrounding umbrella — `~`), `Finish` (the plan's finalize
+        /// commit — `⚑`), or `Plain`.
+        marker: RowMarker,
     },
     Review {
         verdict: Verdict,
@@ -340,8 +402,19 @@ pub(crate) fn oneline_rows(
                 LogEvent::PlanIntro { sha, subject, .. }
                 | LogEvent::PlanCommit { sha, subject, .. }
                 | LogEvent::AdHoc { sha, subject, .. } => (sha, subject.clone()),
-                LogEvent::PlanFinalized { plan, sha, .. } => {
-                    (sha, format!("[{}] finish", plan.as_str()))
+                LogEvent::PlanFinalized {
+                    plan, sha, subject, ..
+                } => {
+                    // The real whole-plan finish message. Fall back to the
+                    // synthesized label for pre-subject cached checkpoints
+                    // (the CACHE_FORMAT_VERSION bump re-folds them, but
+                    // degrade gracefully if one slips through).
+                    let s = if subject.trim().is_empty() {
+                        format!("[{}] finish", plan.as_str())
+                    } else {
+                        subject.clone()
+                    };
+                    (sha, s)
                 }
                 LogEvent::PlanDeleted { plan, sha, .. } => {
                     (sha, format!("Delete {}", plan.as_str()))
@@ -383,7 +456,7 @@ pub(crate) fn oneline_rows(
             out.push(OnelineRow::Commit {
                 sha: sha.clone(),
                 subject,
-                ad_hoc: matches!(event, LogEvent::AdHoc { .. }),
+                marker: RowMarker::of(event),
             });
         }
     }
@@ -396,15 +469,15 @@ pub(crate) fn oneline_plain_lines(rows: &[OnelineRow]) -> Vec<String> {
     rows.iter()
         .map(|row| match row {
             OnelineRow::Header { plan } => plan.clone().unwrap_or_else(|| "adhoc".to_string()),
-            // Fixed 1-col marker gutter on EVERY row (alignment): `~`
-            // for ad-hoc, a space otherwise.
+            // The 1-col marker icon LEADS every commit row (finish/impl/
+            // planning/adhoc), then the sha, then the subject. Fixed width
+            // keeps subjects column-aligned.
             OnelineRow::Commit {
                 sha,
                 subject,
-                ad_hoc,
+                marker,
             } => {
-                let m = if *ad_hoc { '~' } else { ' ' };
-                format!("  {} {m} {subject}", short(sha))
+                format!("{} {} {subject}", marker.glyph(), short(sha))
             }
             OnelineRow::Review {
                 verdict,
@@ -439,22 +512,20 @@ fn print_oneline(events: &[&LogEvent], repo: &Path, shas: &[CommitSha]) -> anyho
             OnelineRow::Commit {
                 sha,
                 subject,
-                ad_hoc,
+                marker,
             } => {
-                // Fixed 1-col ad-hoc marker gutter on EVERY row so
-                // subjects stay column-aligned; `~` (yellow) for ad-hoc,
-                // a space otherwise. Color is TTY-gated via `c` like the
-                // rest of this output (no ANSI when piped).
+                // The marker icon LEADS the row (before the sha), then the
+                // sha, then the subject. Fixed 1-col icon keeps subjects
+                // aligned. Color is TTY-gated via `c` (no ANSI when piped).
+                let g = marker.glyph();
                 if c {
-                    let marker = if ad_hoc {
-                        format!("{Y}~{Z}")
-                    } else {
-                        " ".to_string()
+                    let icon = match marker.ansi() {
+                        "" => g.to_string(),
+                        col => format!("{col}{g}{Z}"),
                     };
-                    println!("  {Y}{}{Z} {marker} {subject}", short(&sha));
+                    println!("{icon} {Y}{}{Z} {subject}", short(&sha));
                 } else {
-                    let marker = if ad_hoc { '~' } else { ' ' };
-                    println!("  {} {marker} {subject}", short(&sha));
+                    println!("{g} {} {subject}", short(&sha));
                 }
             }
             OnelineRow::Review {
@@ -507,6 +578,7 @@ enum LogJsonRow<'a> {
         plan: &'a str,
         sha: &'a str,
         ts: i64,
+        subject: &'a str,
     },
     #[serde(rename = "deleted")]
     Deleted {
@@ -559,10 +631,16 @@ fn print_json(events: &[&LogEvent], repo: &Path, shas: &[CommitSha]) -> anyhow::
                 touched_code: *touched_code,
                 subject,
             },
-            LogEvent::PlanFinalized { plan, sha, ts } => LogJsonRow::Finalized {
+            LogEvent::PlanFinalized {
+                plan,
+                sha,
+                ts,
+                subject,
+            } => LogJsonRow::Finalized {
                 plan: plan.as_str(),
                 sha: sha.as_str(),
                 ts: *ts,
+                subject,
             },
             LogEvent::PlanDeleted { plan, sha, ts } => LogJsonRow::Deleted {
                 plan: plan.as_str(),
@@ -635,9 +713,10 @@ mod json_output_tests {
                     plan: "p",
                     sha: "abc",
                     ts: 5,
+                    subject: "[p] wrap it up",
                 })
                 .unwrap(),
-                serde_json::json!({"kind":"finalized","plan":"p","sha":"abc","ts":5}),
+                serde_json::json!({"kind":"finalized","plan":"p","sha":"abc","ts":5,"subject":"[p] wrap it up"}),
             ),
             (
                 serde_json::to_value(LogJsonRow::Deleted {
@@ -699,6 +778,7 @@ mod tests {
                 plan: PlanKey::parse("foo").unwrap(),
                 sha: sha("bb"),
                 ts: 2,
+                subject: "[foo] wrap up".into(),
             },
             LogEvent::AdHoc {
                 sha: sha("cc"),
@@ -730,10 +810,10 @@ mod tests {
         );
         let lines = oneline_plain_lines(&oneline_rows(&refs, &reviews));
         // Umbrella shape (log-plan-umbrellas + adhoc-commit-marker): one
-        // plan header at col 0; commits indented with a fixed 1-col
-        // marker gutter (`~` for ad-hoc, space otherwise) so subjects
-        // stay column-aligned; the ad-hoc commit folds UNDER the plan
-        // umbrella (no separate "adhoc" header) and carries the `~`.
+        // plan header at col 0; each commit LEADS with its 1-col marker icon
+        // (planning `✎`, finish `⚑`, ad-hoc `~`), then the sha, then the
+        // subject (finish now shows its real whole-plan message). The ad-hoc
+        // commit folds UNDER the plan umbrella (no separate "adhoc" header).
         assert_eq!(
             lines,
             vec![
@@ -741,9 +821,9 @@ mod tests {
                 // review renders ABOVE its commit (newest-first time
                 // order — status-timeline-progress)
                 "    ✓ codex: lgtm".to_string(),
-                "  aa00000   intro".to_string(),
-                "  bb00000   finish".to_string(),
-                "  cc00000 ~ drive-by".to_string(),
+                "✎ aa00000 intro".to_string(),
+                "⚑ bb00000 wrap up".to_string(),
+                "~ cc00000 drive-by".to_string(),
             ]
         );
     }
@@ -777,43 +857,71 @@ mod tests {
             .collect();
         assert_eq!(headers.len(), 1, "no separate adhoc header: {rows:?}");
         assert!(matches!(headers[0], OnelineRow::Header { plan: Some(p) } if p == "foo"));
-        // The plan commit is not ad-hoc; the drive-by is.
-        let flag = |prefix: &str| {
+        // The plan commit (touched code) is Impl; the drive-by is AdHoc.
+        let marker = |prefix: &str| {
             rows.iter().find_map(|r| match r {
-                OnelineRow::Commit { sha, ad_hoc, .. } if sha.as_str().starts_with(prefix) => {
-                    Some(*ad_hoc)
+                OnelineRow::Commit { sha, marker, .. } if sha.as_str().starts_with(prefix) => {
+                    Some(*marker)
                 }
                 _ => None,
             })
         };
-        assert_eq!(flag("aa"), Some(false), "plan commit not marked");
-        assert_eq!(flag("bb"), Some(true), "ad-hoc commit marked");
+        assert_eq!(marker("aa"), Some(RowMarker::Impl), "code commit is Impl");
+        assert_eq!(marker("bb"), Some(RowMarker::AdHoc), "drive-by is AdHoc");
     }
 
     #[test]
     fn oneline_marker_gutter_keeps_subjects_aligned() {
-        // The marker gutter is reserved on EVERY commit row so a marked
-        // (ad-hoc) and an unmarked (plan) subject begin at the SAME
-        // column. Prefix is ASCII, so byte index == display column.
-        let plan_row = OnelineRow::Commit {
+        // The leading 1-col marker icon is on EVERY commit row so subjects
+        // begin at the SAME column regardless of marker. Each glyph is 1
+        // char (and 1 display col), so CHAR position of the subject matches
+        // across rows (byte offsets differ — the glyphs are multi-byte).
+        let impl_row = OnelineRow::Commit {
             sha: sha("aa"),
             subject: "x".into(),
-            ad_hoc: false,
+            marker: RowMarker::Impl,
         };
         let adhoc_row = OnelineRow::Commit {
             sha: sha("bb"),
             subject: "x".into(),
-            ad_hoc: true,
+            marker: RowMarker::AdHoc,
         };
-        let lines = oneline_plain_lines(&[plan_row, adhoc_row]);
-        let col = |line: &str| line.find('x').unwrap();
+        let lines = oneline_plain_lines(&[impl_row, adhoc_row]);
+        let col = |line: &str| line.chars().position(|c| c == 'x').unwrap();
         assert_eq!(
             col(&lines[0]),
             col(&lines[1]),
-            "subject column aligned across marked/unmarked: {lines:?}"
+            "subject column aligned across markers: {lines:?}"
         );
-        assert!(lines[1].contains('~'), "ad-hoc row has the marker");
-        assert!(!lines[0].contains('~'), "plan row has no marker");
+        assert!(
+            lines[0].starts_with(RowMarker::Impl.glyph()),
+            "impl row leads with ⚒: {lines:?}"
+        );
+        assert!(
+            lines[1].starts_with(RowMarker::AdHoc.glyph()),
+            "adhoc row leads with ~: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn row_marker_glyphs_are_all_single_char() {
+        // Alignment invariant: every marker glyph is exactly ONE char. The
+        // display-width==1 invariant (the trap ruthless flagged) is pinned in
+        // the status_tui width test against `char_width`. A future emoji swap
+        // (multi-scalar / width-2) fails one of the two.
+        for m in [
+            RowMarker::Plain,
+            RowMarker::AdHoc,
+            RowMarker::Planning,
+            RowMarker::Impl,
+            RowMarker::Finish,
+        ] {
+            assert_eq!(
+                m.glyph().to_string().chars().count(),
+                1,
+                "{m:?} is one char"
+            );
+        }
     }
 
     #[test]

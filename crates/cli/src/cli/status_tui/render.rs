@@ -415,7 +415,7 @@ pub(super) const MARK_FIELD: usize = 2;
 /// author is padded to `author_width` so every summary begins at one
 /// aligned column (tui-log-plan-highlight-align).
 pub(super) fn log_row_spans(row: &crate::cli::log::OnelineRow, author_width: usize) -> Vec<Span> {
-    use crate::cli::log::OnelineRow;
+    use crate::cli::log::{OnelineRow, RowMarker};
     match row {
         OnelineRow::Header { plan } => {
             vec![Span(
@@ -426,20 +426,21 @@ pub(super) fn log_row_spans(row: &crate::cli::log::OnelineRow, author_width: usi
         OnelineRow::Commit {
             sha,
             subject,
-            ad_hoc,
+            marker,
         } => {
-            // Fixed 1-col ad-hoc marker gutter on EVERY commit row so
-            // subjects stay column-aligned: `~` (yellow) for ad-hoc, a
-            // space otherwise (adhoc-commit-marker).
-            let marker = if *ad_hoc {
-                colored("33", "~".to_string())
-            } else {
-                plain(" ".to_string())
+            // The 1-col marker icon LEADS every commit row (finish `⚑`, impl
+            // `⚒`, planning `✎`, adhoc `~`), then the sha, then the subject.
+            // Fixed width keeps subjects column-aligned.
+            let g = marker.glyph().to_string();
+            let icon = match marker {
+                RowMarker::Finish => colored("36", g), // cyan, like Finished
+                RowMarker::AdHoc => colored("33", g),  // yellow (unchanged)
+                _ => plain(g),
             };
             vec![
-                dim(format!("  {} ", &sha.as_str()[..7])),
-                marker,
-                plain(format!(" {subject}")),
+                icon,
+                dim(format!(" {} ", &sha.as_str()[..7])),
+                plain(subject.clone()),
             ]
         }
         OnelineRow::Review {
@@ -1017,7 +1018,7 @@ mod tests {
         crate::cli::log::OnelineRow::Commit {
             sha: crate::lifecycle::CommitSha::parse(&format!("{:0<40}", "abc1234")).unwrap(),
             subject: subject.to_string(),
-            ad_hoc: false,
+            marker: crate::cli::log::RowMarker::Plain,
         }
     }
 
@@ -1030,6 +1031,28 @@ mod tests {
         );
         s.log_rows = subjects.iter().map(|l| commit_row(l)).collect();
         s
+    }
+
+    #[test]
+    fn row_marker_glyphs_are_one_display_column() {
+        // Alignment invariant (ruthless ab4e174): every commit-row marker
+        // glyph must be ONE display column per the pane's OWN width model
+        // (`char_width`), or the fixed 1-col gutter breaks. A future emoji
+        // swap (🔨/📜/🏁 → width 2) fails here.
+        use crate::cli::log::RowMarker;
+        for m in [
+            RowMarker::Plain,
+            RowMarker::AdHoc,
+            RowMarker::Planning,
+            RowMarker::Impl,
+            RowMarker::Finish,
+        ] {
+            assert_eq!(
+                super::char_width(m.glyph()),
+                1,
+                "{m:?} glyph must be 1 display column"
+            );
+        }
     }
 
     #[test]

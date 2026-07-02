@@ -55,7 +55,11 @@ const CACHE_MAGIC: &[u8] = b"CLANK-STATE\n";
 ///   classifier collapse — adhoc-commits-and-plan-tag-validation), so
 ///   the wincode payload shape changed; bump forces v10 caches to be
 ///   reclaimed rather than mis-deserialized.
-const CACHE_FORMAT_VERSION: u32 = 11;
+/// - v12: `LogEvent::PlanFinalized` gained `subject` (the real whole-plan
+///   finish message). Bump forces a one-time re-fold so existing finish
+///   commits populate it — pre-v12 checkpoints have no subject and aren't
+///   re-folded on incremental appends (ruthless ab4e174).
+const CACHE_FORMAT_VERSION: u32 = 12;
 const CLANK_CACHE_GENERATION: u32 = 1;
 
 const HEADER_LEN: usize = CACHE_MAGIC.len() + 4 + 4 + 40;
