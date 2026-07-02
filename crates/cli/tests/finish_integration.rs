@@ -99,10 +99,10 @@ fn refused_squash_leaves_the_validated_message_not_the_placeholder() {
         "expected protected-branch refusal, got: {err}"
     );
 
-    // HEAD carries the validated squash subject, NOT the placeholder.
+    // HEAD carries the validated squash subject (plan-tagged), NOT the placeholder.
     let subject = git_out(repo, &["log", "-1", "--format=%s"]);
     assert_eq!(
-        subject, "collapse foo into one",
+        subject, "[foo] collapse foo into one",
         "refused squash must leave the landing message"
     );
     assert_ne!(
@@ -144,11 +144,67 @@ fn refused_purge_leaves_the_validated_message_not_the_placeholder() {
 
     let subject = git_out(repo, &["log", "-1", "--format=%s"]);
     assert_eq!(
-        subject, "strip foo artifacts",
+        subject, "[foo] strip foo artifacts",
         "refused purge must leave the validated message"
     );
     assert_ne!(
         subject, "[foo] finish",
         "placeholder must not remain on HEAD"
+    );
+}
+
+// Setup: a plan with a reviewable commit + a FINISHED review → gate Ready.
+fn ready_plan(env: &TestEnv) {
+    let repo = env.repo();
+    write(repo, ".clank/plans/foo.md", "# foo\n\nbody\n");
+    commit(repo, "[foo] intro");
+    let intro = git_out(repo, &["rev-parse", "HEAD"]);
+    write(
+        repo,
+        &format!(".clank/agents/codex/feedback/{}.md", &intro[..7]),
+        "FINISHED ship it\n",
+    );
+}
+
+#[test]
+fn finish_message_gets_the_plan_tag_even_when_untagged() {
+    // ruthless 28e3be4: the finalize commit renames the plan file, so a custom
+    // `-m` without `[<stem>]` must still land tagged — else fix_commit_tag.
+    let env = TestEnv::init();
+    env.register_team("claude", &["codex"], &[]);
+    let repo = env.repo();
+    ready_plan(&env);
+
+    let mut args = finish_args(repo, "foo", None, false);
+    args.message = vec!["make foo work".into(), "because it was broken".into()];
+    block_on(clank::cli::finish::run(args)).expect("finish should succeed");
+
+    // A `[foo]`-tagged subject on the plan-file-touching finish commit is
+    // exactly G==T — no fix_commit_tag.
+    let subject = git_out(repo, &["log", "-1", "--format=%s"]);
+    assert_eq!(
+        subject, "[foo] make foo work",
+        "finish subject must carry the plan tag"
+    );
+}
+
+#[test]
+fn squash_message_gets_the_plan_tag_even_when_untagged() {
+    // The squash commit collapses the plan-file rename in, so an untagged
+    // `--squash` MSG must land tagged too.
+    let env = TestEnv::init();
+    env.register_team("claude", &["codex"], &[]);
+    let repo = env.repo();
+    ready_plan(&env);
+
+    let mut args = finish_args(repo, "foo", None, false);
+    args.squash = Some("collapse foo\n\na single commit reads cleaner".into());
+    args.allow_rewrite_protected = true; // let the squash run on `main`
+    block_on(clank::cli::finish::run(args)).expect("squash finish should succeed");
+
+    let subject = git_out(repo, &["log", "-1", "--format=%s"]);
+    assert_eq!(
+        subject, "[foo] collapse foo",
+        "squash subject must carry the plan tag"
     );
 }

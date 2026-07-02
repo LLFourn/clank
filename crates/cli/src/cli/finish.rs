@@ -51,8 +51,12 @@ pub async fn run(args: FinishArgs) -> anyhow::Result<()> {
     // The transient finalize/amend commit carries the message that ultimately
     // LANDS — the squash MSG when squashing — so a post-finalize rewrite that
     // is refused (e.g. protected-branch) leaves the validated message on HEAD,
-    // never the `[stem] finish` placeholder (codex 053f9d1).
-    let commit_message = finalize_commit_message(args.squash.as_deref(), message.as_deref());
+    // never the `[stem] finish` placeholder (codex 053f9d1). It also renames
+    // the plan file, so its subject must carry the `[<stem>]` tag or it trips
+    // `fix_commit_tag` — `ensure_plan_tag` adds it (idempotently) after
+    // validation.
+    let commit_message = finalize_commit_message(args.squash.as_deref(), message.as_deref())
+        .map(|m| ensure_plan_tag(m, &stem));
 
     // Amend on an already-finished plan: rewrite HEAD's commit
     // (e.g. to refresh a stale message). The finalize tree is
@@ -62,7 +66,7 @@ pub async fn run(args: FinishArgs) -> anyhow::Result<()> {
         if args.dry && (args.purge || args.squash.is_some()) {
             return dry_run_finish_composite(&stem, &preview, &args);
         }
-        amend_already_finished(&repo, &stem, commit_message)?;
+        amend_already_finished(&repo, &stem, commit_message.as_deref())?;
         println!("amended HEAD with finalize tree for `{stem}`");
         if args.purge || args.squash.is_some() {
             run_post_finalize_rewrite(&repo, &plan_key, args).await?;
@@ -81,7 +85,7 @@ pub async fn run(args: FinishArgs) -> anyhow::Result<()> {
             println!("# clank finish --dry: would rewrite the finish message for `{stem}`");
             return Ok(());
         }
-        amend_already_finished(&repo, &stem, commit_message)?;
+        amend_already_finished(&repo, &stem, commit_message.as_deref())?;
         println!("rewrote finish message for `{stem}`");
         return Ok(());
     }
@@ -116,7 +120,14 @@ pub async fn run(args: FinishArgs) -> anyhow::Result<()> {
         return dry_run_finish_composite(&stem, &preview, &args);
     }
 
-    finalize(&repo, &stem, &preview, args.amend, commit_message).await?;
+    finalize(
+        &repo,
+        &stem,
+        &preview,
+        args.amend,
+        commit_message.as_deref(),
+    )
+    .await?;
 
     if args.amend {
         println!("amended HEAD with finalize tree for `{stem}`");
@@ -181,6 +192,24 @@ fn finalize_commit_message<'a>(
     message: Option<&'a str>,
 ) -> Option<&'a str> {
     squash.or(message)
+}
+
+/// Ensure a finish/squash commit's SUBJECT carries the plan's `[<stem>]` tag.
+/// The finalize commit renames `plans/<stem>.md` → `finished/<stem>.md` (and
+/// the squash commit collapses that rename in), so it touches the plan file
+/// and commit-tag validation requires the `[<stem>]` tag — otherwise every
+/// custom finish message trips `fix_commit_tag`. Idempotent: prepends
+/// `[<stem>] ` only when the subject doesn't already start with `[<stem>]`;
+/// the body is untouched. A subject that starts with a DIFFERENT `[other]`
+/// tag still gets `[<stem>]` prepended (the rule keys on the plan's own stem).
+fn ensure_plan_tag(message: &str, stem: &str) -> String {
+    let tag = format!("[{stem}]");
+    let subject = message.lines().next().unwrap_or("");
+    if subject.starts_with(&tag) {
+        message.to_string()
+    } else {
+        format!("{tag} {message}")
+    }
 }
 
 /// Secondary guard only: catch a trivially-empty WHY body (e.g. `.` or a
@@ -325,6 +354,10 @@ async fn run_post_finalize_rewrite(
         .await
         .map_err(|e| anyhow::anyhow!("rewrite preview failed: {e}"))?;
     let stem = plan_key.as_str();
+    // The squashed commit collapses the finalize rename in, so it touches the
+    // plan file — tag the squash MSG so it doesn't trip `fix_commit_tag`
+    // (ruthless 28e3be4).
+    let squash_msg = args.squash.as_deref().map(|m| ensure_plan_tag(m, stem));
     crate::cli::rewrite::run(crate::cli::rewrite::RewriteOpts {
         repo,
         intro_sha: preview.intro_sha.as_ref(),
@@ -334,7 +367,7 @@ async fn run_post_finalize_rewrite(
         into_branch: args.into_branch.as_deref(),
         dry: args.dry,
         allow_rewrite_protected: args.allow_rewrite_protected,
-        squash: args.squash.as_deref(),
+        squash: squash_msg.as_deref(),
         head_strip_paths: &preview.head_strip_paths,
     })
     .await?;
@@ -576,6 +609,31 @@ mod tests {
         assert!(validate_finish_message(Some(long_subject_no_body), "foo").is_err());
         // A trivially-empty body is also rejected (secondary floor).
         assert!(validate_finish_message(Some("real subject here\n\n."), "foo").is_err());
+    }
+
+    #[test]
+    fn ensure_plan_tag_prepends_idempotently_and_preserves_body() {
+        // Prepends the tag when the subject lacks it; body untouched.
+        assert_eq!(
+            ensure_plan_tag("do a thing\n\nbecause it was broken", "foo"),
+            "[foo] do a thing\n\nbecause it was broken"
+        );
+        // Idempotent when already tagged.
+        assert_eq!(
+            ensure_plan_tag("[foo] do a thing\n\nwhy", "foo"),
+            "[foo] do a thing\n\nwhy"
+        );
+        // A DIFFERENT `[other]` tag still gets `[foo]` prepended (the rule keys
+        // on the plan's OWN stem — `[other]` doesn't satisfy it).
+        assert_eq!(
+            ensure_plan_tag("[other] x\n\nwhy", "foo"),
+            "[foo] [other] x\n\nwhy"
+        );
+        // A similar-but-different stem is not mistaken for the tag.
+        assert_eq!(
+            ensure_plan_tag("[foobar] x\n\nwhy", "foo"),
+            "[foo] [foobar] x\n\nwhy"
+        );
     }
 
     #[test]

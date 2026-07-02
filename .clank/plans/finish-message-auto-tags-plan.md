@@ -31,11 +31,13 @@ lands on a plan-file-touching commit, idempotently:
   in `finalize` / `amend_already_finished`, or once in `run()` before those
   calls. The result is that `clank finish <plan> -m "<subject>" -m "<why>"`
   lands `[<stem>] <subject>` + body.
-- The `--squash` MSG lands on a commit that also touches the plan's files
-  (the collapsed commit), so tag it the same way — investigate whether the
-  finished-plan squash commit is subject to the same validation and, if so,
-  route the squash MSG through `ensure_plan_tag` too. Confirm against the
-  real `fix_commit_tag` rule for finished vs active plans.
+- The `--squash` MSG lands on the collapsed commit, which still carries the
+  finalize rename (`plans/<stem>.md → finished/<stem>.md`) → touches the plan
+  file → the commit-tag rule requires `[<stem>]` (ruthless 28e3be4 verified
+  the chain). So route the squash MSG through `ensure_plan_tag` too — a
+  DEFINITE step, done in `run_post_finalize_rewrite`. The `--amend` path
+  authors a plan-file-touching commit as well, so its `commit_message` is
+  tagged the same way.
 
 Ordering vs validation: `validate_finish_message` already strips a leading
 `[<stem>]` for its placeholder check, so it accepts a message whether or not
