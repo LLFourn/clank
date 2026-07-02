@@ -320,3 +320,31 @@ fn autosquash_with_no_message_still_rejects() {
         "educational message-required error, got: {err}"
     );
 }
+
+#[test]
+fn autosquash_squashes_on_protected_main_without_the_flag() {
+    // Part 2 (option A): autosquash implies allow_rewrite_protected, so it
+    // collapses the plan on protected `main` WITHOUT `--allow-rewrite-protected`
+    // — the natural clank workflow runs on the protected branch.
+    let env = TestEnv::init();
+    env.register_team("claude", &["codex"], &[]);
+    let repo = env.repo();
+    set_autosquash(repo, true);
+    ready_plan_on_base(&env);
+
+    let mut args = finish_args(repo, "foo", None, false);
+    args.message = vec!["wrap up foo".into(), "one commit on main".into()];
+    // allow_rewrite_protected stays FALSE — autosquash must supply it.
+    assert!(!args.allow_rewrite_protected);
+    block_on(clank::cli::finish::run(args)).expect("autosquash squashes on protected main");
+
+    assert_eq!(
+        git_out(repo, &["log", "-1", "--format=%s"]),
+        "[foo] wrap up foo"
+    );
+    assert_eq!(
+        git_out(repo, &["rev-list", "--count", "HEAD"]),
+        "2",
+        "collapsed to base + one commit on protected main"
+    );
+}

@@ -102,8 +102,9 @@ pub enum ConfigKey {
     /// Default `--wait` behavior for `clank diff`. bool, default: false.
     #[command(name = "diff.wait", alias = "diff_wait")]
     DiffWait(ConfigKeyArgs),
-    /// Auto-squash a plan into ONE commit at `clank finish` (using the finish
-    /// message). bool, default: false. `--no-squash` overrides per-finish.
+    /// Auto-squash a plan into ONE commit at `clank finish`, REWRITING the
+    /// current branch in place (rewrites published history if already pushed).
+    /// bool, default: false. `--no-squash` skips it for one finish.
     #[command(name = "finish.autosquash", alias = "finish_autosquash")]
     FinishAutosquash(ConfigKeyArgs),
 }

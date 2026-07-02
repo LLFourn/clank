@@ -477,7 +477,7 @@ pub static KEY_CATALOG: &[KeyDef] = &[
         name: "autosquash",
         type_desc: "bool",
         default: "false",
-        help: "Collapse a plan into one commit at `clank finish` (using the finish message); --no-squash overrides per-finish",
+        help: "Collapse a plan into one commit at `clank finish` by REWRITING the current branch in place (rewrites published history if the branch was already pushed); `--no-squash` skips it for one finish",
     },
 ];
 
@@ -872,6 +872,41 @@ fn set_key(config_path: &Path, path: &[&str], value: &str, type_desc: &str) -> a
     let body = serde_json::to_string_pretty(&root)?;
     std::fs::write(config_path, body)?;
     Ok(())
+}
+
+/// True if `path` is PRESENT in `config_path` (any value, including `false`).
+/// A missing/unreadable/malformed file counts as absent.
+pub(crate) fn json_path_present(config_path: &Path, path: &[&str]) -> bool {
+    let Ok(body) = std::fs::read_to_string(config_path) else {
+        return false;
+    };
+    let Ok(root) = serde_json::from_str::<serde_json::Value>(&body) else {
+        return false;
+    };
+    let mut cur = &root;
+    for seg in path {
+        match cur.get(seg) {
+            Some(v) => cur = v,
+            None => return false,
+        }
+    }
+    true
+}
+
+/// Set `path` to `value` ONLY IF absent (an explicit value — even `false` —
+/// is preserved). Returns whether it wrote. Used by `clank setup` to seed a
+/// first-run default without clobbering a user's choice.
+pub(crate) fn set_key_if_absent(
+    config_path: &Path,
+    path: &[&str],
+    value: &str,
+    type_desc: &str,
+) -> anyhow::Result<bool> {
+    if json_path_present(config_path, path) {
+        return Ok(false);
+    }
+    set_key(config_path, path, value, type_desc)?;
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -1467,6 +1502,40 @@ mod tests {
                     "autosquash": cfg.finish.autosquash,
                 }
             })
+        );
+    }
+
+    #[test]
+    fn set_key_if_absent_seeds_only_when_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join(".clank/config.json");
+        // Absent → writes, returns true.
+        assert!(set_key_if_absent(&p, &["finish", "autosquash"], "true", "bool").unwrap());
+        assert!(json_path_present(&p, &["finish", "autosquash"]));
+        assert!(load_isolated(tmp.path()).finish.autosquash);
+        // Present (true) → no-op, returns false.
+        assert!(!set_key_if_absent(&p, &["finish", "autosquash"], "true", "bool").unwrap());
+        // An explicit `false` is PRESERVED (first-run seed never clobbers it).
+        set_key(&p, &["finish", "autosquash"], "false", "bool").unwrap();
+        assert!(
+            !set_key_if_absent(&p, &["finish", "autosquash"], "true", "bool").unwrap(),
+            "explicit false counts as present → not re-seeded"
+        );
+        assert!(!load_isolated(tmp.path()).finish.autosquash);
+    }
+
+    #[test]
+    fn json_path_present_false_for_missing_file_and_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join(".clank/config.json");
+        assert!(
+            !json_path_present(&p, &["finish", "autosquash"]),
+            "missing file"
+        );
+        write(&p, r#"{"review":{"adhoc_feedback":true}}"#);
+        assert!(
+            !json_path_present(&p, &["finish", "autosquash"]),
+            "missing key"
         );
     }
 

@@ -38,9 +38,20 @@ pub async fn run(mut args: FinishArgs) -> anyhow::Result<()> {
     // (respect its explicit rewrite), and `--no-squash` isn't given (per-finish
     // opt-out). `-m` stays MANDATORY: an empty `-m` composes to None, so
     // `args.squash` stays None → the normal path → validation rejects.
+    //
+    // Autosquash also implies `allow_rewrite_protected` (option A): the natural
+    // clank workflow finalizes on the working branch, which is often
+    // `master`/`main`, and collapsing the plan there is the whole point.
+    // Autosquash is an explicit standing opt-in and clank is local-first (the
+    // plan's commits are fresh), so we permit the in-place protected rewrite.
+    // CAVEAT: if the branch is already pushed/shared, this rewrites published
+    // history — `--no-squash` opts out for that one finish. Explicit
+    // `clank finish --squash` is UNCHANGED (still needs
+    // `--allow-rewrite-protected`).
     let cfg = crate::cli::config::load(&repo);
     if cfg.finish.autosquash && args.squash.is_none() && !args.purge && !args.no_squash {
         args.squash = message.clone();
+        args.allow_rewrite_protected = true;
     }
 
     // Validate the message that will BECOME the final finish commit's message.
