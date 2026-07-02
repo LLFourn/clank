@@ -383,7 +383,17 @@ pub(super) fn render_at(
     if out.len() < rows && (total > 0 || has_panel) {
         let mut avail = rows - out.len();
         if has_panel && avail >= 1 {
-            out.push(region_rule("log", "↑↓ scroll", log_focused, cols));
+            // Lift on scroll (Material app-bar elevation): the flat rule
+            // while the log is at its top; the same bar on a raised
+            // surface while entries are scrolled UNDER it. The bar
+            // settling flat is also the cue that the next Up crosses
+            // into the panel (panel-focus-tops-log invariant).
+            let clipped = offset.min(total.saturating_sub(1));
+            out.push(if clipped > 0 {
+                region_rule_elevated("log", "↑↓ scroll", log_focused, cols)
+            } else {
+                region_rule("log", "↑↓ scroll", log_focused, cols)
+            });
             avail -= 1;
         } else if avail >= 2 {
             // Panel-less: keep the old blank separator, unchanged.
@@ -1131,6 +1141,36 @@ mod tests {
                 "{m:?} glyph must be 1 display column"
             );
         }
+    }
+
+    #[test]
+    fn log_rule_lifts_while_entries_are_scrolled_under_it() {
+        // Material lift-on-scroll: the LOG rule is flat (dim, no bg) at
+        // the top; scrolled down, the same bar renders on the raised
+        // surface. The bar settling flat is also the visual cue that the
+        // next Up crosses into the panel (panel-focus-tops-log).
+        let mut s = two_agent_snap();
+        s.log_rows = (0..12).map(|i| commit_row(&format!("c{i}"))).collect();
+        let view = PanelView {
+            mode: Mode::LogScroll,
+            picker: &[],
+            log_cursor: 6,
+        };
+        let rule_of = |offset: usize| {
+            let out = render_at(&s, 12, 60, offset, 0, &view).0;
+            out.iter()
+                .find(|l| visible(l).contains("LOG"))
+                .expect("log rule")
+                .clone()
+        };
+        assert!(
+            !rule_of(0).contains("48;5;238"),
+            "topped → flat rule, no raised surface"
+        );
+        assert!(
+            rule_of(6).contains("48;5;238"),
+            "scrolled → the bar lifts onto the raised surface"
+        );
     }
 
     #[test]

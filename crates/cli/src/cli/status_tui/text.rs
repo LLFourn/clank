@@ -208,6 +208,23 @@ pub(super) fn region_rule(title: &str, hint: &str, focused: bool, cols: usize) -
     format!("\x1b[2m{head}{}\x1b[0m", "─".repeat(fill))
 }
 
+/// The "lift on scroll" variant of [`region_rule`] (Material app-bar
+/// elevation): the same rule rendered on a RAISED surface — dark-grey
+/// background across the full width, title at full brightness instead
+/// of dim. The caller renders the flat rule while its content is at
+/// the top and this one the moment entries scroll UNDER the bar — the
+/// bar itself is the scroll-state signal (no text to read, no color
+/// that already carries a meaning: dim = secondary, accent = state).
+pub(super) fn region_rule_elevated(title: &str, hint: &str, focused: bool, cols: usize) -> String {
+    let mut head = format!("── {} ", title.to_uppercase());
+    if focused && !hint.is_empty() {
+        head.push_str(&format!("· {hint} "));
+    }
+    let head = truncate_to(&head, cols);
+    let fill = cols.saturating_sub(display_width(&head));
+    format!("[48;5;238m{head}{}[0m", "─".repeat(fill))
+}
+
 /// Display columns a char occupies in the terminal. Not a full
 /// unicode-width implementation: rendered content is validated
 /// ASCII (plan stems, agent labels, gate names) plus the fixed
@@ -292,5 +309,35 @@ mod tests {
         assert_eq!(wrap("🔨🔨", 2), vec!["🔨", "🔨"]);
         // width 0 degrades to one line per newline-segment, no panic.
         assert_eq!(wrap("a b\nc", 0), vec!["a b", "c"]);
+    }
+
+    #[test]
+    fn region_rule_elevated_is_the_same_bar_on_a_raised_surface() {
+        let flat = region_rule("log", "hint", true, 40);
+        let lifted = region_rule_elevated("log", "hint", true, 40);
+        // Same visible content (title + hint + fill to the same width)…
+        let strip = |s: &str| {
+            let mut out = String::new();
+            let mut ch = s.chars();
+            while let Some(c) = ch.next() {
+                if c == '\x1b' {
+                    for e in ch.by_ref() {
+                        if e == 'm' {
+                            break;
+                        }
+                    }
+                } else {
+                    out.push(c);
+                }
+            }
+            out
+        };
+        assert_eq!(strip(&flat), strip(&lifted), "same bar, different surface");
+        // …but the lifted bar carries the raised-surface background and
+        // drops the dim (title at full brightness), while the flat rule
+        // is dim with no background.
+        assert!(lifted.contains("\x1b[48;5;238m"), "raised surface bg");
+        assert!(!lifted.contains("\x1b[2m"), "lifted title not dim");
+        assert!(flat.contains("\x1b[2m") && !flat.contains("48;5;238"));
     }
 }
