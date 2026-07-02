@@ -57,11 +57,12 @@ message at squash time (`finish --squash` reading it; a batch `clank squash
     `apply_squash` collapses the range — including the finalize commit — into
     ONE commit carrying the `--squash` MSG, so with `--squash` it's that MSG
     that must be validated (validating `-m` there would let a placeholder
-    squash message land). Conversely `--purge` without `--squash` drops the
-    finalize commit, so NO finish message lands and `-m` must NOT be demanded.
-    Model this in a pure `message_requiring_validation(...)` (squash MSG →
-    validate it; `--purge` no-squash → none; else the finalize/amend message)
-    so the routing is unit-testable alongside `validate_finish_message`.
+    squash message land). Model this in a pure `message_requiring_validation`
+    (squash MSG → validate it; else the finalize/amend message) so the routing
+    is unit-testable alongside `validate_finish_message`. `--purge` is NOT
+    exempt (codex 53a9edb): it still authors a finalize commit first, which
+    SURVIVES if the strip rewrite is refused, so its message must be validated
+    too — the transient commit must never be the `[stem] finish` placeholder.
   - **Repeatable `-m`** (codex c2122b3): make `FinishArgs.message` a
     `Vec<String>` composed git-style (paragraphs joined by a blank line) via
     `compose_finish_message`, so the educational error's `-m "<subject>" -m

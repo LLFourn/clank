@@ -110,3 +110,45 @@ fn refused_squash_leaves_the_validated_message_not_the_placeholder() {
         "placeholder must not remain on HEAD"
     );
 }
+
+#[test]
+fn refused_purge_leaves_the_validated_message_not_the_placeholder() {
+    // codex 53a9edb: `--purge` on a READY plan CREATES the finalize commit,
+    // then runs the strip rewrite — which can be refused (protected `main`),
+    // leaving the finalize commit on HEAD. It must carry the validated `-m`,
+    // never `[stem] finish`.
+    let env = TestEnv::init();
+    env.register_team("claude", &["codex"], &[]);
+    let repo = env.repo();
+
+    // A plan with a reviewable commit + a FINISHED review → gate Ready.
+    write(repo, ".clank/plans/foo.md", "# foo\n\nbody\n");
+    commit(repo, "[foo] intro");
+    let intro = git_out(repo, &["rev-parse", "HEAD"]);
+    write(
+        repo,
+        &format!(".clank/agents/codex/feedback/{}.md", &intro[..7]),
+        "FINISHED ship it\n",
+    );
+
+    let msg = "strip foo artifacts\n\nthe plan is done and the .clank bookkeeping is noise";
+    let mut args = finish_args(repo, "foo", None, false);
+    args.purge = true;
+    args.message = vec![msg.to_string()];
+    let err = block_on(clank::cli::finish::run(args))
+        .expect_err("purge rewrite must be refused on protected main");
+    assert!(
+        err.to_string().contains("protected"),
+        "expected protected-branch refusal, got: {err}"
+    );
+
+    let subject = git_out(repo, &["log", "-1", "--format=%s"]);
+    assert_eq!(
+        subject, "strip foo artifacts",
+        "refused purge must leave the validated message"
+    );
+    assert_ne!(
+        subject, "[foo] finish",
+        "placeholder must not remain on HEAD"
+    );
+}

@@ -35,13 +35,13 @@ pub async fn run(args: FinishArgs) -> anyhow::Result<()> {
     // Validate the message that will BECOME the final finish commit's message.
     // With `--squash` that's the squash MSG (the finalize/amend commit made
     // first is collapsed away by `apply_squash`), so validating `-m` there
-    // would miss the real message. A `--purge` without `--squash` drops the
-    // finalize commit, so no finish message lands — nothing to validate.
+    // would miss the real message. `--purge` is NOT exempt: it authors a
+    // finalize commit that survives a refused strip rewrite (see
+    // `message_requiring_validation`).
     let already_finished = matches!(preview.readiness, FinalizeReadiness::AlreadyFinished);
     if let Some(final_msg) = message_requiring_validation(
         already_finished,
         args.amend,
-        args.purge,
         message.as_deref(),
         args.squash.as_deref(),
     ) {
@@ -141,30 +141,31 @@ fn compose_finish_message(parts: &[String]) -> Option<String> {
 }
 
 /// The message that will BECOME the final finish commit's message and so must
-/// be validated — or `None` if this invocation lands no finish message.
+/// be validated — or `None` if this invocation authors no finish commit.
 ///
 /// - `--squash` collapses the range into one commit carrying the squash MSG,
 ///   so THAT is validated (the transient finalize/amend commit is squashed
 ///   away by `apply_squash`).
-/// - `--purge` without `--squash` strips/drops the finalize commit, so no
-///   finish message lands.
-/// - otherwise the finalize/amend message is final on any authoring path
-///   (finalize create, `--amend`, or a bare `-m` rewrite on a finished plan);
-///   a no-op finish on an already-finished plan lands nothing.
+/// - otherwise the finalize/amend message is validated on any authoring path:
+///   finalize create, `--amend`, or a bare `-m` rewrite on a finished plan.
+///   `--purge` is NOT exempt (codex 53a9edb): it still CREATES a finalize
+///   commit first, and if the strip rewrite is refused (protected branch,
+///   etc.) that commit SURVIVES — so it must not be the `[stem] finish`
+///   placeholder either.
+/// - a no-op finish on an already-finished plan (no `--amend`, no `-m`, and
+///   any purge/squash handled directly by the retroactive path) lands
+///   nothing.
 ///
 /// The inner `Option<&str>` is the message itself — `Some(None)` means "a
 /// message is required here but none was supplied", which validation rejects.
 fn message_requiring_validation<'a>(
     already_finished: bool,
     amend: bool,
-    purge: bool,
     message: Option<&'a str>,
     squash: Option<&'a str>,
 ) -> Option<Option<&'a str>> {
     if squash.is_some() {
         Some(squash)
-    } else if purge {
-        None
     } else if !already_finished || amend || message.is_some() {
         Some(message)
     } else {
@@ -606,11 +607,10 @@ mod tests {
     fn check(
         already_finished: bool,
         amend: bool,
-        purge: bool,
         message: Option<&str>,
         squash: Option<&str>,
     ) -> anyhow::Result<()> {
-        match message_requiring_validation(already_finished, amend, purge, message, squash) {
+        match message_requiring_validation(already_finished, amend, message, squash) {
             Some(m) => validate_finish_message(m, "foo"),
             None => Ok(()),
         }
@@ -621,11 +621,10 @@ mod tests {
         // codex c2122b3: `--squash` MSG is the message that LANDS, so a
         // placeholder squash message must be rejected (the finalize commit it
         // creates first is squashed away).
-        assert!(check(false, false, false, None, Some("finish")).is_err());
-        assert!(check(false, false, false, None, Some("just a subject no body")).is_err());
+        assert!(check(false, false, None, Some("finish")).is_err());
+        assert!(check(false, false, None, Some("just a subject no body")).is_err());
         assert!(
             check(
-                false,
                 false,
                 false,
                 None,
@@ -634,33 +633,35 @@ mod tests {
             .is_ok()
         );
         // The already-finished `--amend --squash` path has the same shape.
-        assert!(check(true, true, false, None, Some("done")).is_err());
+        assert!(check(true, true, None, Some("done")).is_err());
     }
 
     #[test]
-    fn purge_without_squash_lands_no_finish_message_so_needs_no_m() {
-        // `--purge` (no `--squash`) drops the finalize commit — no finish
-        // message lands, so `-m` is not required (and not over-demanded).
-        assert!(check(false, false, true, None, None).is_ok());
-        assert!(check(true, false, true, None, None).is_ok());
-    }
-
-    #[test]
-    fn plain_finalize_still_requires_a_good_message() {
-        assert!(check(false, false, false, None, None).is_err()); // no -m
-        assert!(check(false, false, false, Some("finish"), None).is_err()); // placeholder
+    fn purge_finalize_still_requires_a_good_message() {
+        // codex 53a9edb: `--purge` still CREATES a finalize commit that
+        // survives a refused strip rewrite, so it must carry a validated
+        // message — no exemption. (Routing is purge-agnostic: it treats purge
+        // like any finalize-authoring path.)
+        assert!(check(false, false, None, None).is_err()); // Ready + purge, no -m
+        assert!(check(false, false, Some("finish"), None).is_err()); // placeholder
         assert!(
             check(
                 false,
                 false,
-                false,
-                Some("add X\n\nbecause Y needed it"),
+                Some("strip foo\n\nartifacts no longer needed"),
                 None
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn plain_finalize_still_requires_a_good_message() {
+        assert!(check(false, false, None, None).is_err()); // no -m
+        assert!(check(false, false, Some("finish"), None).is_err()); // placeholder
+        assert!(check(false, false, Some("add X\n\nbecause Y needed it"), None).is_ok());
         // A no-op finish on an already-finished plan validates nothing.
-        assert!(check(true, false, false, None, None).is_ok());
+        assert!(check(true, false, None, None).is_ok());
     }
 
     #[tokio::test]
