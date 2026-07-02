@@ -451,3 +451,96 @@ fn autosquash_squashes_on_protected_main_without_the_flag() {
         "collapsed to base + one commit on protected main"
     );
 }
+
+#[test]
+fn fresh_squash_dry_is_a_strict_noop_then_live_agrees() {
+    // The one-computation rule for the FRESH composite: --dry runs the same
+    // preview + engine path as live (over a synthetic finalize commit) and
+    // mutates NOTHING; the live run then executes the plan the dry printed.
+    let env = TestEnv::init();
+    env.register_team("claude", &["codex"], &[]);
+    let repo = env.repo();
+    set_autosquash(repo, true);
+    ready_plan_on_base(&env);
+
+    let head_before = git_out(repo, &["rev-parse", "HEAD"]);
+    let refs_before = git_out(repo, &["for-each-ref"]);
+
+    // Fresh --dry (autosquash fills squash + allow flag; plan not finalized).
+    let mut args = finish_args(repo, "foo", None);
+    args.message = vec!["wrap up foo".into(), "one commit reads cleaner".into()];
+    args.dry = true;
+    block_on(clank::cli::finish::run(args)).expect("fresh dry should succeed");
+
+    assert_eq!(
+        git_out(repo, &["rev-parse", "HEAD"]),
+        head_before,
+        "--dry must not move HEAD"
+    );
+    assert_eq!(
+        git_out(repo, &["for-each-ref"]),
+        refs_before,
+        "--dry must not create or move any ref"
+    );
+    assert!(
+        repo.join(".clank/plans/foo.md").exists(),
+        "--dry must not finalize the plan file"
+    );
+
+    // The live run executes what the dry previewed: base + ONE squashed commit.
+    let mut args = finish_args(repo, "foo", None);
+    args.message = vec!["wrap up foo".into(), "one commit reads cleaner".into()];
+    block_on(clank::cli::finish::run(args)).expect("live finish");
+    assert_eq!(git_out(repo, &["rev-list", "--count", "HEAD"]), "2");
+    assert_eq!(
+        git_out(repo, &["log", "-1", "--format=%s"]),
+        "[foo] wrap up foo"
+    );
+}
+
+#[test]
+fn fresh_squash_dry_reports_the_same_blocker_live_refuses() {
+    // Blocker parity: an explicit --squash on protected `main` without
+    // --allow-rewrite-protected. The live run refuses; the --dry — the same
+    // computation — reports the blocker and changes nothing.
+    let env = TestEnv::init();
+    env.register_team("claude", &["codex"], &[]);
+    let repo = env.repo();
+    ready_plan_on_base(&env);
+
+    let head_before = git_out(repo, &["rev-parse", "HEAD"]);
+    let msg = "collapse foo\n\nso the branch reads as one commit";
+    let mut args = finish_args(repo, "foo", Some(msg));
+    args.dry = true;
+    block_on(clank::cli::finish::run(args)).expect("dry prints blockers, exits clean");
+    assert_eq!(
+        git_out(repo, &["rev-parse", "HEAD"]),
+        head_before,
+        "blocked dry changes nothing"
+    );
+    assert!(repo.join(".clank/plans/foo.md").exists());
+
+    let args = finish_args(repo, "foo", Some(msg));
+    let err = block_on(clank::cli::finish::run(args)).expect_err("live refuses on protected main");
+    assert!(err.to_string().contains("protected"), "got: {err}");
+}
+
+#[test]
+fn fresh_purge_dry_is_a_strict_noop() {
+    let env = TestEnv::init();
+    env.register_team("claude", &["codex"], &[]);
+    let repo = env.repo();
+    ready_plan_on_base(&env);
+
+    let head_before = git_out(repo, &["rev-parse", "HEAD"]);
+    let refs_before = git_out(repo, &["for-each-ref"]);
+    let mut args = finish_args(repo, "foo", None);
+    args.purge = true;
+    args.dry = true;
+    args.message = vec!["strip foo".into(), "bookkeeping is noise now".into()];
+    block_on(clank::cli::finish::run(args)).expect("purge dry");
+
+    assert_eq!(git_out(repo, &["rev-parse", "HEAD"]), head_before);
+    assert_eq!(git_out(repo, &["for-each-ref"]), refs_before);
+    assert!(repo.join(".clank/plans/foo.md").exists());
+}

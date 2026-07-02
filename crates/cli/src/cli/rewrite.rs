@@ -1660,6 +1660,52 @@ mod tests {
         assert!(format!("{err}").contains("first-parent history"), "{err}");
     }
 
+    #[test]
+    fn write_finalize_commit_moves_plan_file_and_stays_dangling() {
+        let dir = init_repo();
+        let repo = dir.path();
+        write(repo, "src.rs", "fn main() {}\n");
+        write(repo, ".clank/plans/foo.md", "# foo plan body\n");
+        let head = commit(repo, "[foo] intro");
+        let refs_before = ref_count(repo);
+
+        let synth = git_plumbing::write_finalize_commit(repo, &head, "foo", "[foo] finish preview")
+            .unwrap();
+
+        // Tree: plan file MOVED to finished/, same blob; code untouched.
+        assert!(!tree_has(repo, &synth, ".clank/plans/foo.md"));
+        assert!(tree_has(repo, &synth, ".clank/finished/foo.md"));
+        assert!(tree_has(repo, &synth, "src.rs"));
+        let blob = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["show", &format!("{synth}:.clank/finished/foo.md")])
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8(blob.stdout).unwrap(), "# foo plan body\n");
+        // Parent is head; the commit is DANGLING (no refs created, HEAD still).
+        let parent = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["rev-parse", &format!("{synth}^")])
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8(parent.stdout).unwrap().trim(), head);
+        assert_eq!(ref_count(repo), refs_before, "no refs may be created");
+        let chain = rev_list(repo, "main");
+        assert_eq!(chain.last().unwrap(), &head, "branch untouched");
+    }
+
+    fn ref_count(repo: &Path) -> usize {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["for-each-ref"])
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout).unwrap().lines().count()
+    }
+
     #[tokio::test]
     async fn reword_in_place_refuses_merge_in_range_live_and_reports_in_dry() {
         // A merge among the descendants means first-parent replay would drop a

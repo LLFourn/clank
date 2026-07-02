@@ -139,7 +139,15 @@ pub async fn run(mut args: FinishArgs) -> anyhow::Result<()> {
     }
 
     if args.dry && (args.purge || args.squash.is_some()) {
-        return dry_run_finish_composite(&stem, &preview, &args);
+        return dry_run_fresh_composite(
+            &repo,
+            &state,
+            &plan_key,
+            &preview,
+            commit_message.as_deref(),
+            args,
+        )
+        .await;
     }
 
     finalize(&repo, &stem, &preview, commit_message.as_deref()).await?;
@@ -149,6 +157,69 @@ pub async fn run(mut args: FinishArgs) -> anyhow::Result<()> {
         run_post_finalize_rewrite(&repo, &plan_key, args).await?;
     }
     Ok(())
+}
+
+/// Fresh `--squash`/`--purge` `--dry`: print the finalize framing (the one
+/// finish-level fact the engine can't know), then run the SAME preview +
+/// engine path the live run takes — over a SYNTHETIC, dangling finalize
+/// commit (`git_plumbing::write_finalize_commit`, bit-for-bit the tree the
+/// live `finalize()` would land) — with the engine in dry mode. One
+/// computation, printed instead of applied; the engine reports the real
+/// commits collapsed and the real blockers. Naively previewing the
+/// PRE-finalize range instead would show a different plan than the live run
+/// executes (missing the finalize commit) — the same drift in new clothes.
+async fn dry_run_fresh_composite(
+    repo: &Path,
+    state: &crate::repo_state::RepoState,
+    plan_key: &crate::lifecycle::PlanKey,
+    preview: &FinishPreviewResponse,
+    commit_message: Option<&str>,
+    args: FinishArgs,
+) -> anyhow::Result<()> {
+    let stem = plan_key.as_str();
+    let default_msg = format!("[{stem}] finish");
+    let msg = commit_message.unwrap_or(&default_msg);
+    println!("# clank finish --dry preview");
+    println!("# plan: {}", preview.plan_id);
+    println!("# would create finalize commit:");
+    println!("#   message: {msg}");
+    let approvers: Vec<&str> = preview
+        .sealed_approvals
+        .iter()
+        .map(|a| a.author.as_str())
+        .collect();
+    println!("#   sealed approvals: {}", approvers.join(", "));
+    println!("#");
+
+    let head = state
+        .head
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("repo has no HEAD"))?;
+    let synth_sha = crate::git_plumbing::write_finalize_commit(repo, head.as_str(), stem, msg)?;
+    let synth = clank_core::ids::CommitSha::parse(&synth_sha)
+        .map_err(|e| anyhow::anyhow!("parse synthetic finalize sha `{synth_sha}`: {e}"))?;
+
+    // Post-finalize fold state: the same classifier the live run's re-fold
+    // uses, applied to the one extra (synthetic) commit. The fold sees the
+    // plans/→finished/ move and records the finalize, so the preview below
+    // takes the identical finished-plan path the live rewrite does.
+    let mut post_state = state.clone();
+    let metas = crate::git_io::first_parent_commits_between(repo, &head, &synth)?;
+    for meta in &metas {
+        let changes = crate::git_io::diff_tree_changes_at(repo, &meta.sha)?;
+        crate::disk_snapshot::apply_commit(
+            &mut post_state,
+            &crate::disk_snapshot::CommitEvent {
+                commit: meta.sha.clone(),
+                author_ts: meta.author_ts,
+                subject: meta.subject.clone(),
+                changes,
+            },
+        );
+    }
+    post_state.head = Some(synth);
+
+    rewrite_with_state(repo, &post_state, plan_key, args).await
 }
 
 /// Join repeated `-m` values into one message, git-style: each becomes a
@@ -271,58 +342,32 @@ fn finish_message_help(stem: &str) -> String {
     )
 }
 
-/// Dry-run preview for a FRESH (not-yet-finalized) `finish --purge`/
-/// `--squash`. Emits a description without calling `finalize()` or the
-/// rewrite engine — the finalize commit doesn't exist yet, so the engine
-/// cannot compute the real post-finalize plan; the operator must run the
-/// live command. KNOWN GAP vs the one-computation rule (ruthless a2314e9):
-/// this is hand-rolled narration; converging it onto the engine needs a
-/// hypothetical-finalize preview — tracked as the
-/// `finish-fresh-dry-through-engine` follow-up. Already-finished `--dry`
-/// does NOT come here (it runs the engine's own dry mode).
-fn dry_run_finish_composite(
-    stem: &str,
-    preview: &FinishPreviewResponse,
-    args: &FinishArgs,
-) -> anyhow::Result<()> {
-    println!("# clank finish --dry preview");
-    println!("# plan: {}", preview.plan_id);
-    let msg = compose_finish_message(&args.message).unwrap_or_else(|| format!("[{stem}] finish"));
-    // Ready, not yet finalized: this run creates the finalize.
-    println!("# would create finalize commit:");
-    println!("#   message: {msg}");
-    let approvers: Vec<&str> = preview
-        .sealed_approvals
-        .iter()
-        .map(|a| a.author.as_str())
-        .collect();
-    println!("#   sealed approvals: {}", approvers.join(", "));
-    println!("#");
-    if args.purge && args.squash.is_some() {
-        println!(
-            "# would then squash plan history into one commit and strip the finalize snapshot."
-        );
-        println!(
-            "#   squash message: {}",
-            args.squash.as_deref().unwrap_or("")
-        );
-    } else if args.squash.is_some() {
-        println!(
-            "# would then squash plan-attributed commits into one (finalize snapshot preserved)."
-        );
-        println!(
-            "#   squash message: {}",
-            args.squash.as_deref().unwrap_or("")
-        );
-    } else if args.purge {
-        println!("# would then strip the plan's `.clank/` artifacts from history.");
-    }
-    println!("# (--dry: no commits, no refs updated)");
-    Ok(())
-}
-
+/// Re-fold the repo (the finalize commit has just landed) and run the range
+/// rewrite via [`rewrite_with_state`].
 async fn run_post_finalize_rewrite(
     repo: &std::path::Path,
+    plan_key: &crate::lifecycle::PlanKey,
+    args: FinishArgs,
+) -> anyhow::Result<()> {
+    let policy = if args.no_cache {
+        crate::rebuild::CachePolicy::Bypass
+    } else {
+        crate::rebuild::CachePolicy::Use
+    };
+    let state = crate::rebuild::rebuild_repo_with_policy(repo, policy)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to fold repo `{}`: {e}", repo.display()))?;
+    rewrite_with_state(repo, &state, plan_key, args).await
+}
+
+/// Preview + run the `--squash`/`--purge` range rewrite over `state`. The ONE
+/// path for both `--dry` and live (`args.dry` threads into the engine): live
+/// callers pass the re-folded post-finalize state; the fresh `--dry` passes a
+/// synthetic post-finalize state. finish.rs owns no preview text for the
+/// history edit — the engine prints or applies the same computed plan.
+async fn rewrite_with_state(
+    repo: &std::path::Path,
+    state: &crate::repo_state::RepoState,
     plan_key: &crate::lifecycle::PlanKey,
     args: FinishArgs,
 ) -> anyhow::Result<()> {
@@ -334,15 +379,7 @@ async fn run_post_finalize_rewrite(
     // into one but PRESERVE the finalize snapshot. Use
     // include_finalize=false so the snapshot survives the squash.
     let include_finalize = args.purge;
-    let policy = if args.no_cache {
-        crate::rebuild::CachePolicy::Bypass
-    } else {
-        crate::rebuild::CachePolicy::Use
-    };
-    let state = crate::rebuild::rebuild_repo_with_policy(repo, policy)
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to fold repo `{}`: {e}", repo.display()))?;
-    let preview = crate::preview::build_rewrite_preview(repo, &state, plan_key, include_finalize)
+    let preview = crate::preview::build_rewrite_preview(repo, state, plan_key, include_finalize)
         .await
         .map_err(|e| anyhow::anyhow!("rewrite preview failed: {e}"))?;
     let stem = plan_key.as_str();
@@ -445,9 +482,29 @@ async fn finalize(
     _preview: &FinishPreviewResponse,
     message: Option<&str>,
 ) -> anyhow::Result<()> {
+    // ONE builder for the finalize commit — the same `write_finalize_commit`
+    // the `--dry` preview walks (ruthless 3bd7882): live IS the preview
+    // commit, ref'd. Built from HEAD's tree, so `--dry` and execution cannot
+    // drift by construction, and unrelated STAGED changes are never swept
+    // into the finalize commit (the old commit-the-index flow did that).
+    let head =
+        crate::git_io::rev_parse_head(repo)?.ok_or_else(|| anyhow::anyhow!("repo has no HEAD"))?;
+    let branch = crate::git_io::current_branch_at(repo)?
+        .ok_or_else(|| anyhow::anyhow!("HEAD is detached; cannot finalize"))?;
+    let default_msg = format!("[{stem}] finish");
+    let msg = message.unwrap_or(&default_msg);
+    let sha = crate::git_plumbing::write_finalize_commit(repo, head.as_str(), stem, msg)?;
+    crate::git_plumbing::update_ref(
+        repo,
+        &format!("refs/heads/{branch}"),
+        &sha,
+        crate::git_plumbing::ExpectedRef::Match(head.as_str().to_string()),
+    )?;
+
+    // Sync the worktree + index for the two moved paths ONLY — a
+    // `reset --hard` would clobber unrelated uncommitted work.
     let finished_dir = repo.join(".clank/finished");
     std::fs::create_dir_all(&finished_dir)?;
-
     // Remove legacy directory-style finished marker if present.
     let legacy_dir = finished_dir.join(stem);
     if legacy_dir.is_dir() {
@@ -458,8 +515,6 @@ async fn finalize(
     if legacy_marker.is_file() {
         std::fs::remove_file(&legacy_marker)?;
     }
-
-    // Move the plan file into finished/ to commit as a rename/move.
     let plan_path = repo.join(crate::init_facts::plan_md_rel(stem));
     let finished_path = finished_dir.join(format!("{stem}.md"));
     if plan_path.exists() {
@@ -468,15 +523,10 @@ async fn finalize(
         // Plan file missing (e.g. hidden); write an empty finished marker.
         std::fs::write(&finished_path, "")?;
     }
-
     let rel_plan = crate::init_facts::plan_md_rel(stem);
     let rel_finished = crate::init_facts::finished_md_rel(stem);
     crate::git_plumbing::remove_path(repo, &rel_plan)?;
     crate::git_plumbing::stage(repo, &rel_finished)?;
-
-    let default_msg = format!("[{stem}] finish");
-    let msg = message.unwrap_or(&default_msg);
-    crate::git_plumbing::commit(repo, msg, false)?;
     Ok(())
 }
 
@@ -765,6 +815,44 @@ mod tests {
             String::from_utf8(out.stdout).unwrap().trim(),
             "[foo] finish"
         );
+    }
+
+    #[tokio::test]
+    async fn finalize_ignores_unrelated_staged_changes() {
+        // ONE builder (`write_finalize_commit`, shared with --dry) reads
+        // HEAD's tree — so an unrelated STAGED change must NOT be swept into
+        // the finalize commit (the old commit-the-index flow did exactly
+        // that), and it must still be staged afterwards (ruthless 3bd7882).
+        let dir = init_repo();
+        write_at(dir.path(), "src.rs", "fn main() {}\n");
+        write_at(dir.path(), ".clank/plans/foo.md", "# foo\n");
+        run_git(dir.path(), &["add", "-A"]);
+        run_git(dir.path(), &["commit", "--quiet", "-m", "seed"]);
+        // Stage an unrelated edit before finalize.
+        write_at(dir.path(), "src.rs", "fn main() { /* staged */ }\n");
+        run_git(dir.path(), &["add", "src.rs"]);
+
+        let preview = mk_preview_ready();
+        finalize(dir.path(), "foo", &preview, None).await.unwrap();
+
+        let git_out = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir.path())
+                .args(args)
+                .output()
+                .unwrap();
+            String::from_utf8(out.stdout).unwrap()
+        };
+        // The finalize commit's tree carries HEAD's src.rs, not the staged edit.
+        assert_eq!(git_out(&["show", "HEAD:src.rs"]), "fn main() {}\n");
+        // The plan moved in the committed tree.
+        let tree = git_out(&["ls-tree", "-r", "--name-only", "HEAD"]);
+        assert!(tree.lines().any(|l| l == ".clank/finished/foo.md"));
+        assert!(tree.lines().all(|l| l != ".clank/plans/foo.md"));
+        // The unrelated edit is STILL staged (not lost, not committed).
+        let staged = git_out(&["diff", "--cached", "--name-only"]);
+        assert_eq!(staged.trim(), "src.rs");
     }
 
     #[tokio::test]

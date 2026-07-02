@@ -112,6 +112,67 @@ pub fn squash_commit(
     write_commit(&r, tree_sha, parent, author, committer, message.into())
 }
 
+/// Write THE finalize commit for `stem` as a DANGLING object: `head_sha`'s
+/// tree with `.clank/plans/<stem>.md` MOVED to `.clank/finished/<stem>.md`
+/// (same blob; an empty blob when the plan file is absent — the empty-marker
+/// fallback), parent = `head_sha`, ambient identity, `message`.
+///
+/// This is the ONE builder for finalize commits (ruthless 3bd7882): the live
+/// `finish` refs the returned commit; `--dry` leaves it dangling and previews
+/// over it. One implementation, so preview and execution cannot drift.
+/// Building from HEAD's tree (not the index) also means unrelated STAGED
+/// changes are never swept into the finalize commit.
+pub fn write_finalize_commit(
+    repo: &Path,
+    head_sha: &str,
+    stem: &str,
+    message: &str,
+) -> anyhow::Result<String> {
+    let r = open(repo)?;
+    let tree_id = r
+        .find_commit(parse_oid(head_sha)?)
+        .with_context(|| format!("find commit `{head_sha}`"))?
+        .tree_id()
+        .with_context(|| format!("tree of `{head_sha}`"))?;
+    let plan_rel = crate::init_facts::plan_md_rel(stem);
+    let finished_rel = crate::init_facts::finished_md_rel(stem);
+    let blob = match r
+        .find_tree(tree_id)
+        .context("find head tree")?
+        .lookup_entry_by_path(&plan_rel)
+        .with_context(|| format!("lookup `{plan_rel}`"))?
+    {
+        Some(entry) => entry.oid().to_owned(),
+        None => r
+            .write_blob([])
+            .context("write empty marker blob")?
+            .detach(),
+    };
+    let mut editor = r
+        .edit_tree(tree_id)
+        .with_context(|| format!("edit tree of `{head_sha}`"))?;
+    editor
+        .remove(plan_rel.as_str())
+        .with_context(|| format!("remove `{plan_rel}`"))?;
+    editor
+        .upsert(
+            finished_rel.as_str(),
+            gix::object::tree::EntryKind::Blob,
+            blob,
+        )
+        .with_context(|| format!("add `{finished_rel}`"))?;
+    let new_tree = editor.write().context("write finalize-preview tree")?;
+    let sig = ambient_committer(&r)?;
+    write_commit(
+        &r,
+        &new_tree.detach().to_string(),
+        Some(head_sha),
+        sig.clone(),
+        sig,
+        message.into(),
+    )
+}
+
 /// The configured committer identity (config name/email + now), as an
 /// owned signature. Errors when no identity is configured.
 fn ambient_committer(r: &gix::Repository) -> anyhow::Result<gix::actor::Signature> {
