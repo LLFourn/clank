@@ -246,6 +246,20 @@ impl LogView {
     }
 }
 
+/// THE INVARIANT: panel focus ⟹ the log viewport is at its top. The
+/// panel sits ABOVE the log in one continuous column (Up from the log's
+/// first entry crosses into it; Down past the panel's last row crosses
+/// back), so a focused panel over a mid-scroll log reads as two cursors
+/// at once. Enforced HERE on every loop pass — not by per-transition
+/// discipline — so no panel entry path (the Up-crossing, Tab's teleport
+/// from any depth, a refresh rebind, or any future one) can violate it.
+/// Idempotent; a no-op while the log owns focus.
+fn enforce_panel_tops_log(mode: Mode, log: &mut LogView) {
+    if !matches!(mode, Mode::LogScroll) {
+        log.enter_first();
+    }
+}
+
 /// The fetched DATA for a commit-detail overlay: the commit and every
 /// reviewer's verdict + full feedback body. Anchored by `sha` (not a log
 /// index) so a `Refresh` re-fetches the SAME commit.
@@ -605,6 +619,8 @@ pub(crate) async fn run_tui(
     // event loop, not just the inner `for`.
     'evloop: loop {
         let (rows, cols) = term_size();
+        // Every pass, before any render: see the fn's invariant doc.
+        enforce_panel_tops_log(mode, &mut log);
 
         // The commit-detail overlay owns the whole pane until dismissed:
         // render it, route its own (scroll / back) keys, and skip the
@@ -954,10 +970,12 @@ pub(crate) async fn run_tui(
                         Mode::LogScroll => match k {
                             Key::Quit => break 'evloop,
                             Key::Focus => mode = mode.toggle_focus(snapshot.agents.len()),
-                            Key::Up => match log_up_target(log.cursor, snapshot.agents.len()) {
-                                Some(sel) => mode = Mode::AgentPanel { sel },
-                                None => log.up(),
-                            },
+                            Key::Up => {
+                                match log_up_target(log.cursor, log.offset, snapshot.agents.len()) {
+                                    Some(sel) => mode = Mode::AgentPanel { sel },
+                                    None => log.up(),
+                                }
+                            }
                             Key::Down => log.down(),
                             Key::PageUp => log.page_up(page),
                             Key::Space | Key::PageDown => log.page_down(page),
@@ -1287,6 +1305,44 @@ pub(crate) mod tests {
         // A plan overlay opens at the top.
         let p = Overlay::plan("foo".into(), Some("# foo".into()));
         assert_eq!(p.offset, 0);
+    }
+
+    #[test]
+    fn panel_focus_forces_the_log_to_its_top() {
+        // THE INVARIANT: any panel-family mode ⟹ log topped. A wheel
+        // burst used to cross into the panel mid-batch, freezing a
+        // mid-scroll viewport under the focused panel; Tab could do the
+        // same from any depth. The loop-pass enforcement makes the state
+        // unrepresentable regardless of which path entered the panel.
+        let mut log = LogView::new();
+        log.cursor = 7;
+        log.offset = 5;
+        enforce_panel_tops_log(Mode::AgentPanel { sel: 0 }, &mut log);
+        assert_eq!((log.cursor, log.offset), (0, 0), "panel focus tops the log");
+
+        // Every panel-family mode enforces; the log mode never touches it.
+        for mode in [
+            Mode::AddPicker { sel: 0 },
+            Mode::AgentDetail { idx: 0, sel: 0 },
+            Mode::Confirm {
+                action: ConfirmAction::RemoveAgent { idx: 0 },
+            },
+        ] {
+            let mut log = LogView::new();
+            log.cursor = 3;
+            log.offset = 3;
+            enforce_panel_tops_log(mode, &mut log);
+            assert_eq!((log.cursor, log.offset), (0, 0), "{mode:?}");
+        }
+        let mut log = LogView::new();
+        log.cursor = 7;
+        log.offset = 5;
+        enforce_panel_tops_log(Mode::LogScroll, &mut log);
+        assert_eq!(
+            (log.cursor, log.offset),
+            (7, 5),
+            "log focus keeps its scroll state"
+        );
     }
 
     #[test]
