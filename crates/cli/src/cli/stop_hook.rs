@@ -362,19 +362,21 @@ async fn peek_has_work(repo: &Path, label: &AgentLabel, role: Role) -> Result<bo
 /// The continuation that nudges the agent to start its own backgrounded
 /// `clank wait` alongside a live process. Wording matches the spike that
 /// validated compliance — explicit and copy-pasteable (a vague hint is the
-/// failure mode). Names the live process(es) so the agent knows what it's
-/// parked on.
+/// failure mode). Deliberately does NOT echo the task command lines: the
+/// agent knows what it backgrounded, and real commands (multi-clause
+/// `until …; do sleep …` one-liners) turned the nudge into a wall of shell
+/// that buried the instruction (lloyd, dark-skippy). Only the COUNT is
+/// stated.
 fn nudge_reason(input: &HookInput) -> String {
-    let procs: Vec<&str> = input
+    let count = input
         .background_tasks
         .iter()
         .filter(|t| !t.is_clank_wait())
-        .filter_map(|t| t.command.as_deref())
-        .collect();
-    let what = if procs.is_empty() {
-        "a background task".to_string()
+        .count();
+    let what = if count > 1 {
+        format!("{count} background tasks")
     } else {
-        format!("a background task ({})", procs.join(", "))
+        "a background task".to_string()
     };
     format!(
         "You ended your turn with {what} still running, but nothing is \
@@ -825,6 +827,53 @@ mod tests {
         t.finalize(&HookOutcome::Silent {
             why: SilentReason::NoWork,
         });
+    }
+
+    #[test]
+    fn nudge_states_the_count_and_never_echoes_commands() {
+        // lloyd (dark-skippy): real background commands are multi-clause
+        // shell one-liners; echoing them buried the instruction. The nudge
+        // states only THAT something is running (and how many) — no
+        // command text ever reaches the agent.
+        let monster = "until [ -s /tmp/x.output ]; do sleep 3; done; grep -iE \"FILL|error\" /tmp/x.output | head -20";
+        let input: HookInput = serde_json::from_value(serde_json::json!({
+            "session_id": "sess-nudge-test",
+            "cwd": "/tmp",
+            "stop_hook_active": false,
+            "background_tasks": [
+                {"id": "t1", "status": "running", "command": monster},
+                {"id": "t2", "status": "running", "command": monster},
+                {"id": "t3", "status": "running", "command": "clank wait --author codex"},
+            ],
+        }))
+        .unwrap();
+        let reason = nudge_reason(&input);
+        assert!(
+            reason.contains("2 background tasks"),
+            "counts non-clank-wait tasks: {reason}"
+        );
+        assert!(
+            !reason.contains("until") && !reason.contains("/tmp/x.output"),
+            "no command text leaks: {reason}"
+        );
+        // The spike-validated instruction is intact.
+        assert!(reason.contains("Start `clank wait` as its OWN"));
+        assert!(reason.contains("run_in_background set to true"));
+
+        // Singular wording for one task.
+        let one: HookInput = serde_json::from_value(serde_json::json!({
+            "session_id": "sess-nudge-test",
+            "cwd": "/tmp",
+            "stop_hook_active": false,
+            "background_tasks": [{"id": "t1", "status": "running", "command": "cargo build"}],
+        }))
+        .unwrap();
+        let reason = nudge_reason(&one);
+        assert!(
+            reason.contains("a background task still running"),
+            "{reason}"
+        );
+        assert!(!reason.contains("cargo"), "no command text: {reason}");
     }
 
     #[test]
