@@ -264,16 +264,31 @@ pub(super) fn render_at(
         out.push(region_rule("agents", hint, agents_focused, cols));
         // Each agent row; the cursor row gets the unified selection band.
         // The tier (master/commit/gate) distinguishes the kinds.
+        // Active agents carry the spinner + italic wait-verb on their own
+        // rows — activity lives where the actors are; the log below is
+        // pure history (tui-spinner-on-agent-rows).
+        let activity = in_progress_rows(snap);
+        let verb_for = |label: &str| {
+            activity.iter().find_map(|p| match p {
+                InProgress::PendingReview { label: l, verb } if l == label => Some(*verb),
+                InProgress::MasterWorking { name, verb } if name == label => Some(*verb),
+                _ => None,
+            })
+        };
         for (i, a) in snap.agents.iter().enumerate() {
             if out.len() >= rows {
                 break;
             }
-            let spans = vec![
+            let mut spans = vec![
                 plain("  ".to_string()),
                 auto_mark(a.auto_mode),
                 plain(format!(" {}", a.label)),
                 dim(format!("  {}", tier_label(a.role))),
             ];
+            if let Some(verb) = verb_for(&a.label) {
+                spans.push(dim(format!("  {}", spinner_glyph(frame))));
+                spans.push(italic(format!(" {verb}…")));
+            }
             out.push(row_line(&spans, mode.selected() == Some(i), color, cols));
         }
         // "+ add" button — the last selectable row (cursor index
@@ -367,8 +382,7 @@ pub(super) fn render_at(
     // ask, then the log with in-progress placeholders spliced into their
     // final slots (see `build_scroll`).
     let ask_lines = block_ask_spans(snap, cols);
-    let in_prog = in_progress_rows(snap);
-    let seq = build_scroll(snap, &ask_lines, &in_prog);
+    let seq = build_scroll(snap, &ask_lines);
     let total = seq.len();
     let mut log_capacity = 0usize;
     // The log is a focusable region ONLY when there's an agents panel to
@@ -406,17 +420,13 @@ pub(super) fn render_at(
             // still fills.
             let off = offset.min(total.saturating_sub(1));
             let end = (off + avail).min(total);
-            // Align summaries at one column: widest name among the windowed
-            // rows — done reviews AND pending spinners (ask lines / the
-            // master row have no author column).
+            // Align summaries at one column: widest reviewer name among
+            // the windowed rows (ask lines have no author column).
             let author_width = seq[off..end]
                 .iter()
                 .filter_map(|s| match s {
                     Seg::Log(crate::cli::log::OnelineRow::Review { author, .. }) => {
                         Some(display_width(author))
-                    }
-                    Seg::InProg(InProgress::PendingReview { label, .. }) => {
-                        Some(display_width(label))
                     }
                     _ => None,
                 })
@@ -426,7 +436,6 @@ pub(super) fn render_at(
                 let spans = match s {
                     Seg::Ask(line) => (*line).clone(),
                     Seg::Log(row) => log_row_spans(row, author_width),
-                    Seg::InProg(item) => in_progress_spans(item, frame, author_width),
                 };
                 // The selected timeline entry gets the unified selection
                 // band — the same "selected" style as the panel/picker —
@@ -515,34 +524,6 @@ pub(super) fn log_row_spans(row: &crate::cli::log::OnelineRow, author_width: usi
                 plain(snip),
             ]
         }
-    }
-}
-
-/// Spans for one in-progress row. The pending spinner sits in the SAME
-/// verdict-mark column as finished reviews (so done and in-flight align);
-/// the master row mirrors a commit row (`-------` under the shas) with an
-/// italic "working…" and a leading spinner for liveness.
-pub(super) fn in_progress_spans(item: &InProgress, frame: usize, author_width: usize) -> Vec<Span> {
-    match item {
-        InProgress::PendingReview { label, verb } => {
-            let mark = spinner_glyph(frame);
-            let after_mark = MARK_FIELD.saturating_sub(display_width(mark)) + 1;
-            let author_pad = author_width.saturating_sub(display_width(label));
-            vec![
-                plain("  ".to_string()),
-                dim(mark.to_string()),
-                plain(" ".repeat(after_mark)),
-                dim(format!("{label}{}", " ".repeat(author_pad))),
-                // The wait-verb is what's italic — "what we await".
-                italic(format!(" {verb}…")),
-            ]
-        }
-        InProgress::MasterWorking { name, verb } => vec![
-            dim(format!("{} ", spinner_glyph(frame))),
-            dim("------- ".to_string()),
-            dim(format!("{name} ")),
-            italic(format!("{verb}…")),
-        ],
     }
 }
 
@@ -2277,26 +2258,53 @@ mod tests {
     }
 
     #[test]
-    fn pending_review_row_shows_spinner_name_and_reviewing() {
-        let s = snap(vec![plan_state("foo", reviewer_missing("codex"))], vec![]);
-        let out = render(&s, 40, 80).join("\n");
-        assert!(out.contains(SPINNER[0]), "frame-0 spinner glyph shown");
-        assert!(out.contains("codex"), "reviewer named");
-        assert!(out.contains("reviewing"), "italic wait-verb");
+    fn active_reviewer_agent_row_carries_spinner_and_verb() {
+        // Activity lives on the AGENTS rows (tui-spinner-on-agent-rows):
+        // the pending reviewer's row spins with the italic wait-verb, the
+        // idle agent's row does not, and the LOG carries no placeholder
+        // rows — "waiting is never invisible" now holds via the panel.
+        let mut s = two_agent_snap(); // claude (master) + codex (commit)
+        s.plans = vec![plan_state("foo", reviewer_missing("codex"))];
+        let out = render(&s, 40, 80);
+        let codex_row = visible(line_with(&out, "codex"));
+        assert!(
+            codex_row.contains(SPINNER[0]),
+            "spinner on the actor's row: {codex_row}"
+        );
+        assert!(codex_row.contains("reviewing"), "wait-verb: {codex_row}");
+        let claude_row = visible(line_with(&out, "claude"));
+        assert!(
+            !claude_row.contains(SPINNER[0]) && !claude_row.contains("reviewing"),
+            "idle agent row unchanged: {claude_row}"
+        );
+
+        // The documented teamless trade: no panel → no spinner anywhere
+        // (activity presupposes a roster).
+        let teamless = snap(vec![plan_state("foo", reviewer_missing("codex"))], vec![]);
+        assert!(
+            !render(&teamless, 40, 80).join("\n").contains(SPINNER[0]),
+            "panel-less render carries no spinner"
+        );
     }
 
     #[test]
-    fn master_row_shows_dashes_name_and_per_state_verb() {
-        let s = snap(vec![plan_state("foo", WaitingOn::MasterToContinue)], vec![]);
-        let out = render(&s, 40, 80).join("\n");
-        assert!(out.contains("-------"), "dashes where the sha would be");
-        assert!(out.contains("working"), "per-state italic verb");
-        // The finalizing case (the gap M2 missed): master named + verb.
-        let mut s = snap(vec![plan_state("foo", WaitingOn::MasterToFinalize)], vec![]);
-        s.master = Some("claude".into());
-        let out = render(&s, 40, 80).join("\n");
-        assert!(out.contains("claude"), "master named");
-        assert!(out.contains("finalizing"), "finalizing verb shown");
+    fn master_agent_row_spins_with_the_producing_verb() {
+        // Any master-producing state spins MASTER's row with the per-state
+        // verb — incl. finalizing (the gap M2 once missed).
+        let mut s = two_agent_snap();
+        s.plans = vec![plan_state("foo", WaitingOn::MasterToContinue)];
+        let row = visible(line_with(&render(&s, 40, 80), "claude"));
+        assert!(
+            row.contains(SPINNER[0]) && row.contains("working"),
+            "producing master spins: {row}"
+        );
+        let mut s = two_agent_snap();
+        s.plans = vec![plan_state("foo", WaitingOn::MasterToFinalize)];
+        let row = visible(line_with(&render(&s, 40, 80), "claude"));
+        assert!(
+            row.contains(SPINNER[0]) && row.contains("finalizing"),
+            "finalizing verb shown: {row}"
+        );
     }
 
     #[test]

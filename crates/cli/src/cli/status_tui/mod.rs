@@ -718,13 +718,18 @@ pub(crate) async fn run_tui(
         };
         let capacity = render_at(&snapshot, rows, cols, log.offset, frame, &view).1;
 
-        // The ask + in-progress rows depend on blocks/waiting_on (not the
-        // log fetch), so compute them before filling. `head` is the count
-        // of scrollable rows that aren't log rows (ask lines + in-progress
-        // placeholders); the total scrollable length is head + log.
+        // The ask lines depend on blocks (not the log fetch), so compute
+        // them before filling. `head` is the count of scrollable rows that
+        // aren't log rows — ONLY the ask lines: in-progress activity lives
+        // on the AGENTS panel rows, not in the scroll sequence, so it must
+        // not count here (codex 5482f26: phantom rows put the cursor past
+        // the rendered sequence). INVARIANT: head + log_rows.len() ==
+        // build_scroll(...).len(), the same sequence render and
+        // Enter-targeting walk — pinned by
+        // scroll_sequence_is_pure_history_no_placeholders.
         let ask_lines = block_ask_spans(&snapshot, cols as usize);
         let in_prog = in_progress_rows(&snapshot);
-        let head = ask_lines.len() + in_prog.len();
+        let head = ask_lines.len();
 
         // Load enough log to fill the viewport AND reach the cursor (the
         // cursor can move past the loaded tail). Gated on `log.fill` so
@@ -754,15 +759,10 @@ pub(crate) async fn run_tui(
         };
         paint(&render_at(&snapshot, rows, cols, log.offset, frame, &view).0);
 
-        // The in-progress rows now sit at SCATTERED indices (master after
-        // the plan header; reviews in the latest commit's review block), so
-        // ask `build_scroll` (the same arrangement render uses) for their
-        // positions and tick iff ANY of them is within the window.
-        let win = log.offset..log.offset + capacity;
-        let spinner_visible = build_scroll(&snapshot, &ask_lines, &in_prog)
-            .iter()
-            .enumerate()
-            .any(|(i, s)| matches!(s, Seg::InProg(_)) && win.contains(&i));
+        // The spinner lives on the AGENTS panel rows, which are always on
+        // screen when a roster exists — tick whenever any agent is active
+        // (no window math; the log carries no placeholders).
+        let spinner_visible = !in_prog.is_empty() && !snapshot.agents.is_empty();
         let base = if spinner_visible {
             Duration::from_millis(120)
         } else {
@@ -989,7 +989,7 @@ pub(crate) async fn run_tui(
                             // header opens the plan's rendered markdown. Ask /
                             // in-progress / ad-hoc rows resolve to None.
                             Key::Enter => {
-                                let seq = build_scroll(&snapshot, &ask_lines, &in_prog);
+                                let seq = build_scroll(&snapshot, &ask_lines);
                                 match entry_overlay_target(&seq, log.cursor) {
                                     Some(OverlayTarget::Commit { sha, focus }) => {
                                         if let Some(data) = fetch_commit_detail(&repo, &sha) {
