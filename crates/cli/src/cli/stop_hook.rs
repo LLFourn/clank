@@ -23,21 +23,189 @@ use crate::agent_store::load_agent_config;
 use crate::lifecycle::AgentLabel;
 use clank_core::{
     AutoMode, BgDisposition, CLAUDE_CONTINUATION_EXIT, CodexBlockDecision, HOOK_OK_EXIT, HookInput,
-    HookOutcome, Role, Tool, background_disposition,
+    HookOutcome, Role, SilentReason, Tool, background_disposition,
 };
 
 pub async fn run(args: StopHookArgs) -> anyhow::Result<()> {
     let tool: Tool = args.tool.into();
-    let outcome = compute_outcome(tool, args.repo.as_deref()).await;
+    let mut trace = Trace::new(tool);
+    let outcome = match read_hook_stdin() {
+        Ok(input) => {
+            trace.record_input(&input);
+            compute_outcome(tool, args.repo.as_deref(), input, &mut trace).await
+        }
+        Err(e) => HookOutcome::Diagnostic { message: e },
+    };
+    // Best-effort, never outcome-changing: the trace is diagnostics.
+    trace.finalize(&outcome);
     emit_and_exit(outcome, tool);
 }
 
-async fn compute_outcome(tool: Tool, repo_override: Option<&Path>) -> HookOutcome {
-    let input = match read_hook_stdin() {
-        Ok(i) => i,
-        Err(e) => return HookOutcome::Diagnostic { message: e },
-    };
+/// The stop-hook decision trace (stop-hook-decision-trace): one JSON
+/// record OVERWRITTEN on every invocation, so "the hook fired and chose
+/// not to wait" is distinguishable from "the hook never fired" — and
+/// WHICH silent branch fired is recorded, not re-derived.
+///
+/// Written to `.clank/agents/<label>/stop-hook.json` once the session
+/// resolves to an agent, else `.clank/stop-hook.json` at the repo level
+/// (fired-but-unidentified; final records only — see
+/// [`Trace::mark_in_flight`]). Two-phase at the AGENT path: an
+/// `in_flight` record lands after identity resolves, right before the
+/// slow peek/wait work, and the final decision overwrites it — a record
+/// left `in_flight` means the hook died mid-decision.
+///
+/// Every write is BEST-EFFORT: a failed trace write must never change
+/// the hook's outcome or exit code.
+struct Trace {
+    tool: Tool,
+    session_id: Option<String>,
+    cwd: Option<String>,
+    repo: Option<PathBuf>,
+    label: Option<String>,
+    last_assistant_message: Option<String>,
+    stop_hook_active: Option<bool>,
+    background_tasks: usize,
+    background_clank_wait: bool,
+    effective_auto: Option<AutoMode>,
+    role: Option<Role>,
+    disposition: Option<&'static str>,
+}
 
+/// Cap on captured text (the last assistant message, continue reasons):
+/// enough to recognize the turn, small enough to never matter on disk.
+const TRACE_TEXT_CAP: usize = 2000;
+
+fn truncate_chars(s: &str, cap: usize) -> String {
+    if s.chars().count() <= cap {
+        s.to_string()
+    } else {
+        let mut out: String = s.chars().take(cap).collect();
+        out.push('…');
+        out
+    }
+}
+
+impl Trace {
+    fn new(tool: Tool) -> Self {
+        Self {
+            tool,
+            session_id: None,
+            cwd: None,
+            repo: None,
+            label: None,
+            last_assistant_message: None,
+            stop_hook_active: None,
+            background_tasks: 0,
+            background_clank_wait: false,
+            effective_auto: None,
+            role: None,
+            disposition: None,
+        }
+    }
+
+    fn record_input(&mut self, input: &HookInput) {
+        self.session_id = Some(input.session_id.as_str().to_string());
+        self.cwd = Some(input.cwd.clone());
+        self.last_assistant_message = input
+            .last_assistant_message
+            .as_deref()
+            .map(|m| truncate_chars(m, TRACE_TEXT_CAP));
+        self.stop_hook_active = Some(input.stop_hook_active);
+        self.background_tasks = input.background_tasks.len();
+        self.background_clank_wait = input.has_background_clank_wait();
+    }
+
+    fn set_repo(&mut self, repo: &Path) {
+        self.repo = Some(repo.to_path_buf());
+    }
+
+    /// Land the phase-1 `in_flight` record. Called ONLY once identity is
+    /// resolved (the record's path is settled), right before the hook's
+    /// slow, crash-prone work — the spawned peek/wait. So a leftover
+    /// `in_flight` always means "died mid-decision" at the agent path,
+    /// and the repo-level fallback only ever holds FINAL records (an
+    /// unidentified fire's diagnostic), never a stranded in-flight from
+    /// an identified run (codex 4e22861).
+    fn mark_in_flight(&mut self) {
+        self.write("in_flight", "");
+    }
+
+    fn set_label(&mut self, label: &AgentLabel) {
+        self.label = Some(label.as_str().to_string());
+    }
+
+    fn set_disposition(&mut self, d: BgDisposition) {
+        self.disposition = Some(match d {
+            BgDisposition::YieldArmed => "yield_armed",
+            BgDisposition::NeedsWorkCheck => "needs_work_check",
+            BgDisposition::NoBackgroundWork => "no_background_work",
+        });
+    }
+
+    fn finalize(&mut self, outcome: &HookOutcome) {
+        let (decision, reason) = match outcome {
+            HookOutcome::Continue { reason } => {
+                ("continue", truncate_chars(reason, TRACE_TEXT_CAP))
+            }
+            HookOutcome::Silent { why } => (
+                "silent",
+                serde_json::to_value(why)
+                    .ok()
+                    .and_then(|v| v.as_str().map(str::to_string))
+                    .unwrap_or_default(),
+            ),
+            HookOutcome::Diagnostic { message } => {
+                ("diagnostic", truncate_chars(message, TRACE_TEXT_CAP))
+            }
+        };
+        self.write(decision, &reason);
+    }
+
+    fn write(&mut self, decision: &str, reason: &str) {
+        // Nowhere sensible to write without a repo (cwd wasn't one).
+        let Some(repo) = self.repo.as_ref() else {
+            return;
+        };
+        let path = match self.label.as_deref() {
+            Some(label) => repo.join(format!(".clank/agents/{label}/stop-hook.json")),
+            None => repo.join(".clank/stop-hook.json"),
+        };
+        let ts = time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_default();
+        let record = serde_json::json!({
+            "ts": ts,
+            "tool": self.tool.as_str(),
+            "session_id": self.session_id,
+            "cwd": self.cwd,
+            "repo": self.repo.as_ref().map(|r| r.display().to_string()),
+            "label": self.label,
+            "last_assistant_message": self.last_assistant_message,
+            "stop_hook_active": self.stop_hook_active,
+            "background_tasks": self.background_tasks,
+            "background_clank_wait": self.background_clank_wait,
+            "effective_auto": self.effective_auto.map(|m| format!("{m:?}").to_lowercase()),
+            "role": self.role.map(|r| format!("{r:?}").to_lowercase()),
+            "disposition": self.disposition,
+            "decision": decision,
+            "reason": reason,
+        });
+        let Ok(body) = serde_json::to_string_pretty(&record) else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(&path, body);
+    }
+}
+
+async fn compute_outcome(
+    tool: Tool,
+    repo_override: Option<&Path>,
+    input: HookInput,
+    trace: &mut Trace,
+) -> HookOutcome {
     // Decide how the agent's in-flight background work affects this
     // turn-end, BEFORE any clank resolution (`background_disposition` is a
     // pure function of the turn). `YieldArmed` never runs a wait — Claude
@@ -46,8 +214,20 @@ async fn compute_outcome(tool: Tool, repo_override: Option<&Path>) -> HookOutcom
     // through to resolution, so a config Diagnostic can only surface when we
     // were going to engage clank anyway.
     let disposition = background_disposition(tool, &input);
+    trace.set_disposition(disposition);
     if matches!(disposition, BgDisposition::YieldArmed) {
-        return HookOutcome::Silent;
+        // Best-effort repo+label resolution PURELY for the trace — this
+        // early-return deliberately precedes clank resolution, and a
+        // failure here must stay a silent yield, never a Diagnostic.
+        if let Ok(repo) = resolve_hook_repo(repo_override, &input) {
+            if let Ok(label) = resolve_identity_for_hook(&repo, tool, &input.session_id) {
+                trace.set_label(&label);
+            }
+            trace.set_repo(&repo);
+        }
+        return HookOutcome::Silent {
+            why: SilentReason::YieldArmed,
+        };
     }
 
     // Resolve repo: explicit --repo (testing) > hook stdin cwd.
@@ -55,6 +235,7 @@ async fn compute_outcome(tool: Tool, repo_override: Option<&Path>) -> HookOutcom
         Ok(r) => r,
         Err(e) => return HookOutcome::Diagnostic { message: e },
     };
+    trace.set_repo(&repo);
 
     let label = match resolve_identity_for_hook(&repo, tool, &input.session_id) {
         Ok(l) => l,
@@ -64,6 +245,7 @@ async fn compute_outcome(tool: Tool, repo_override: Option<&Path>) -> HookOutcom
             };
         }
     };
+    trace.set_label(&label);
 
     // Config may be ABSENT (bound via `clank as` but auto never
     // touched) — that's not "off", it's "unset, inherit the
@@ -81,6 +263,7 @@ async fn compute_outcome(tool: Tool, repo_override: Option<&Path>) -> HookOutcom
     };
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
     let effective = crate::cli::team::resolve_effective_auto_mode(cfg.as_ref(), home.as_deref());
+    trace.effective_auto = Some(effective);
 
     // Role is roster-derived. The hook path is fail-soft: if the
     // repo has no master configured (or resolution errors),
@@ -90,9 +273,14 @@ async fn compute_outcome(tool: Tool, repo_override: Option<&Path>) -> HookOutcom
     // drive master-only actions).
     let role = crate::agent_store::resolve_role(&repo, &label)
         .unwrap_or_else(|_| clank_core::vocab::Role::default());
+    trace.role = Some(role);
+    // Identity settled — land the phase-1 record before the slow work.
+    trace.mark_in_flight();
 
     match effective {
-        AutoMode::Off => HookOutcome::Silent,
+        AutoMode::Off => HookOutcome::Silent {
+            why: SilentReason::AutoOff,
+        },
         AutoMode::On => match disposition {
             // A process is live with no `clank wait` watching. Peek (without
             // blocking) whether the agent has work RIGHT NOW:
@@ -106,13 +294,17 @@ async fn compute_outcome(tool: Tool, repo_override: Option<&Path>) -> HookOutcom
             //    from looping: with no work the wait blocks and persists, and
             //    the next Stop sees it (`YieldArmed`).
             BgDisposition::NeedsWorkCheck => match peek_has_work(&repo, &label, role).await {
-                Ok(true) => HookOutcome::Silent,
+                Ok(true) => HookOutcome::Silent {
+                    why: SilentReason::BusyOwnWork,
+                },
                 Ok(false) => HookOutcome::Continue {
                     reason: nudge_reason(&input),
                 },
                 // Fail-soft: if the peek can't run, yield rather than nudge
                 // (the process still wakes the agent; no forced turn on doubt).
-                Err(_) => HookOutcome::Silent,
+                Err(_) => HookOutcome::Silent {
+                    why: SilentReason::PeekFailed,
+                },
             },
             // NoBackgroundWork (YieldArmed already returned above): genuinely idle.
             _ => {
@@ -252,7 +444,9 @@ async fn compute_wait_outcome(
 
     match output.status.code() {
         Some(0) => match parse_wait_json(&output.stdout) {
-            Ok(items) if items.is_empty() => HookOutcome::Silent,
+            Ok(items) if items.is_empty() => HookOutcome::Silent {
+                why: SilentReason::NoWork,
+            },
             Ok(items) => HookOutcome::Continue {
                 reason: render_wait_items(&items, label, role),
             },
@@ -260,7 +454,9 @@ async fn compute_wait_outcome(
                 message: format!("hook: wait stdout malformed: {e}"),
             },
         },
-        Some(2) => HookOutcome::Silent, // wait timeout
+        Some(2) => HookOutcome::Silent {
+            why: SilentReason::WaitTimeout,
+        },
         other => HookOutcome::Diagnostic {
             message: format!(
                 "hook: wait exited {} stderr={}",
@@ -449,7 +645,7 @@ fn emit_and_exit(outcome: HookOutcome, tool: Tool) -> ! {
             }
             std::process::exit(HOOK_OK_EXIT);
         }
-        (HookOutcome::Silent, _) => {
+        (HookOutcome::Silent { .. }, _) => {
             std::process::exit(HOOK_OK_EXIT);
         }
         (HookOutcome::Diagnostic { message }, _) => {
@@ -462,6 +658,183 @@ fn emit_and_exit(outcome: HookOutcome, tool: Tool) -> ! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn init_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let ok = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir.path())
+            .args(["init", "--quiet"])
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok);
+        dir
+    }
+
+    fn hook_input(session: &str, last_msg: Option<&str>) -> HookInput {
+        serde_json::from_value(serde_json::json!({
+            "session_id": session,
+            "cwd": "/tmp",
+            "stop_hook_active": false,
+            "last_assistant_message": last_msg,
+        }))
+        .unwrap()
+    }
+
+    fn bind(repo: &Path, label: &str, session: &str) -> AgentLabel {
+        let label = AgentLabel::parse(label).unwrap();
+        let sid = clank_core::ids::SessionId::parse(session).unwrap();
+        crate::agent_store::bind_session_to_agent(repo, &label, Tool::Claude, &sid).unwrap();
+        label
+    }
+
+    fn read_trace(path: &Path) -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn auto_off_writes_a_silent_trace_with_the_branch_reason() {
+        let dir = init_repo();
+        let repo = dir.path();
+        let label = bind(repo, "codex", "sess-auto-off");
+        crate::agent_store::set_auto_mode(repo, &label, AutoMode::Off).unwrap();
+
+        let mut trace = Trace::new(Tool::Claude);
+        let input = hook_input("sess-auto-off", Some("I finished the thing."));
+        trace.record_input(&input);
+        let outcome = compute_outcome(Tool::Claude, Some(repo), input, &mut trace).await;
+        assert_eq!(
+            outcome,
+            HookOutcome::Silent {
+                why: SilentReason::AutoOff
+            }
+        );
+        trace.finalize(&outcome);
+
+        let rec = read_trace(&repo.join(".clank/agents/codex/stop-hook.json"));
+        assert_eq!(rec["decision"], "silent");
+        assert_eq!(rec["reason"], "auto_off");
+        assert_eq!(rec["label"], "codex");
+        assert_eq!(rec["last_assistant_message"], "I finished the thing.");
+        assert_eq!(rec["effective_auto"], "off");
+    }
+
+    #[tokio::test]
+    async fn yield_armed_traces_without_engaging_clank_resolution() {
+        // An armed background `clank wait` yields silently — but the trace
+        // still records the fire, the branch, and (best-effort) the agent.
+        let dir = init_repo();
+        let repo = dir.path();
+        bind(repo, "codex", "sess-armed");
+
+        let input: HookInput = serde_json::from_value(serde_json::json!({
+            "session_id": "sess-armed",
+            "cwd": "/tmp",
+            "stop_hook_active": false,
+            "background_tasks": [
+                {"id": "t1", "status": "running", "command": "clank wait --author codex"}
+            ],
+        }))
+        .unwrap();
+        let mut trace = Trace::new(Tool::Claude);
+        trace.record_input(&input);
+        let outcome = compute_outcome(Tool::Claude, Some(repo), input, &mut trace).await;
+        assert_eq!(
+            outcome,
+            HookOutcome::Silent {
+                why: SilentReason::YieldArmed
+            }
+        );
+        trace.finalize(&outcome);
+
+        let rec = read_trace(&repo.join(".clank/agents/codex/stop-hook.json"));
+        assert_eq!(rec["reason"], "yield_armed");
+        assert_eq!(rec["disposition"], "yield_armed");
+        assert_eq!(rec["background_clank_wait"], true);
+        assert_eq!(rec["background_tasks"], 1);
+    }
+
+    #[tokio::test]
+    async fn unresolved_identity_falls_back_to_the_repo_level_trace() {
+        // A session with NO binding: the hook fired but can't tell who it
+        // is — the record lands at the repo level so this case is still
+        // distinguishable from "the hook never fired".
+        let dir = init_repo();
+        let repo = dir.path();
+
+        let mut trace = Trace::new(Tool::Claude);
+        let input = hook_input("sess-unbound", None);
+        trace.record_input(&input);
+        let outcome = compute_outcome(Tool::Claude, Some(repo), input, &mut trace).await;
+        assert!(matches!(outcome, HookOutcome::Diagnostic { .. }));
+        trace.finalize(&outcome);
+
+        let rec = read_trace(&repo.join(".clank/stop-hook.json"));
+        assert_eq!(rec["decision"], "diagnostic");
+        assert_eq!(rec["label"], serde_json::Value::Null);
+        assert_eq!(rec["last_assistant_message"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn identified_run_leaves_no_repo_level_record() {
+        // codex 4e22861: an identified run must never strand anything at
+        // the repo-level fallback — in_flight lands only at the AGENT path
+        // (once identity settles), so a leftover in_flight always means
+        // died-mid-decision. A previous unidentified fire's FINAL record
+        // at the fallback survives an identified run untouched.
+        let dir = init_repo();
+        let repo = dir.path();
+        std::fs::create_dir_all(repo.join(".clank")).unwrap();
+        std::fs::write(
+            repo.join(".clank/stop-hook.json"),
+            r#"{"decision":"diagnostic","reason":"earlier unbound fire"}"#,
+        )
+        .unwrap();
+        let label = bind(repo, "codex", "sess-identified");
+        crate::agent_store::set_auto_mode(repo, &label, AutoMode::Off).unwrap();
+
+        let mut trace = Trace::new(Tool::Claude);
+        let input = hook_input("sess-identified", None);
+        trace.record_input(&input);
+        let outcome = compute_outcome(Tool::Claude, Some(repo), input, &mut trace).await;
+        trace.finalize(&outcome);
+
+        let rec = read_trace(&repo.join(".clank/agents/codex/stop-hook.json"));
+        assert_eq!(rec["decision"], "silent", "final, not in_flight");
+        let fallback = read_trace(&repo.join(".clank/stop-hook.json"));
+        assert_eq!(
+            fallback["reason"], "earlier unbound fire",
+            "the previous unidentified record survives an identified run"
+        );
+    }
+
+    #[test]
+    fn trace_write_failure_is_swallowed_and_no_repo_writes_nothing() {
+        // No repo resolved → nowhere to write; must not panic.
+        let mut t = Trace::new(Tool::Claude);
+        t.finalize(&HookOutcome::Diagnostic {
+            message: "no repo".into(),
+        });
+        // Repo whose .clank is a FILE → create_dir_all/write fail; still
+        // silent (best-effort IO can never change the hook's behavior).
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".clank"), "not a dir").unwrap();
+        let mut t = Trace::new(Tool::Claude);
+        t.repo = Some(dir.path().to_path_buf());
+        t.finalize(&HookOutcome::Silent {
+            why: SilentReason::NoWork,
+        });
+    }
+
+    #[test]
+    fn trace_text_is_truncated_at_the_cap() {
+        let long = "x".repeat(TRACE_TEXT_CAP + 500);
+        let t = truncate_chars(&long, TRACE_TEXT_CAP);
+        assert_eq!(t.chars().count(), TRACE_TEXT_CAP + 1, "cap + ellipsis");
+        assert!(t.ends_with('…'));
+        assert_eq!(truncate_chars("short", TRACE_TEXT_CAP), "short");
+    }
 
     /// Deserialize `json!` values through the real `WaitItem` path —
     /// the same typed parse the production stop hook uses — then

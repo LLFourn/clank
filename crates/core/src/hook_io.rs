@@ -164,15 +164,38 @@ pub enum HookOutcome {
     /// Resume the agent with `reason` as a continuation prompt.
     /// The agent runs another turn against this text.
     Continue { reason: String },
-    /// Let the agent stop normally. No output to either tool.
-    /// Used for: `auto_mode=off`, wait timed out with no work.
-    Silent,
+    /// Let the agent stop normally. No output to either tool. `why`
+    /// carries WHICH silent branch fired — never on the wire, but the
+    /// stop-hook decision trace records it so "the hook chose not to
+    /// wait" is diagnosable per-branch instead of one indistinct
+    /// silence (stop-hook-decision-trace).
+    Silent { why: SilentReason },
     /// Internal problem (config parse, identity unresolvable,
     /// projection failure). The hook NEVER fails the agent —
     /// the diagnostic goes to stderr and exit is still 0 so the
     /// turn ends cleanly. Clank bugs show up here; production
     /// failures don't compound by also breaking the agent.
     Diagnostic { message: String },
+}
+
+/// Why the hook let the agent stop silently — first-class data so the
+/// decision trace records the branch instead of re-deriving it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SilentReason {
+    /// Background work is armed to re-fire Stop; yield to that wake.
+    YieldArmed,
+    /// Effective auto-mode is off.
+    AutoOff,
+    /// The peek says the agent has work RIGHT NOW — it's still its own
+    /// turn; don't nudge.
+    BusyOwnWork,
+    /// The peek couldn't run; fail-soft yield.
+    PeekFailed,
+    /// The wait returned no items.
+    NoWork,
+    /// The wait timed out with no work.
+    WaitTimeout,
 }
 
 /// Codex's stop-hook continuation wire shape, written to stdout
@@ -461,7 +484,9 @@ mod tests {
         // Sanity that we can match exhaustively on the public enum.
         let outcomes = [
             HookOutcome::Continue { reason: "x".into() },
-            HookOutcome::Silent,
+            HookOutcome::Silent {
+                why: SilentReason::AutoOff,
+            },
             HookOutcome::Diagnostic {
                 message: "y".into(),
             },
@@ -469,7 +494,7 @@ mod tests {
         for o in &outcomes {
             match o {
                 HookOutcome::Continue { .. } => {}
-                HookOutcome::Silent => {}
+                HookOutcome::Silent { .. } => {}
                 HookOutcome::Diagnostic { .. } => {}
             }
         }
