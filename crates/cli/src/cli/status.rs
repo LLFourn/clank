@@ -52,7 +52,7 @@ pub struct StatusSnapshot {
     /// Shelved plans (stem, what they're waiting for if `--for`
     /// was used, and whether that wait is over). Plan:
     /// plan-lifecycle-verbs.
-    pub(crate) shelved: Vec<ShelvedView>,
+    pub(crate) stash: Vec<StashItemView>,
     /// Recent activity as STRUCTURED oneline rows (umbrella
     /// headers + commits + reviews), NEWEST FIRST (the git-log
     /// convention every log display follows; lloyd) — the TUI's
@@ -216,13 +216,15 @@ pub(crate) fn available_agents(
         .collect()
 }
 
-/// One shelved plan as the renderers see it.
-pub(crate) struct ShelvedView {
+/// One stashed plan as the renderers see it.
+pub(crate) struct StashItemView {
     pub(crate) stem: String,
     pub(crate) waiting_for: Option<String>,
     /// True when `waiting_for` names a plan that has finished —
-    /// the unshelve nudge.
+    /// the pop nudge.
     pub(crate) ready: bool,
+    /// How many commits the stash holds (the pop size).
+    pub(crate) commits: usize,
 }
 
 /// Typed `status --json` shape (typed-json-not-json-macro,
@@ -250,9 +252,11 @@ struct StatusJson<'a> {
     queue_count: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     queue: Option<Vec<&'a str>>,
-    /// Only when non-empty (plan-lifecycle-verbs).
+    /// Only when non-empty. RENAMED from `shelved`
+    /// (rename-shelve-to-stash) — a breaking wire change for dogfood
+    /// consumers.
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    shelved: Vec<ShelvedJson<'a>>,
+    stash: Vec<StashJson<'a>>,
     /// Only when a HEAD commit-tag violation is present
     /// (commit-tag-fixup-is-first-class-state).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -295,7 +299,7 @@ struct DirtyStatsJson {
 }
 
 #[derive(serde::Serialize)]
-struct ShelvedJson<'a> {
+struct StashJson<'a> {
     plan: &'a str,
     waiting_for: Option<&'a str>,
     ready: bool,
@@ -430,7 +434,7 @@ impl StatusSnapshot {
             })
             .collect();
 
-        let shelved: Vec<ShelvedView> = crate::cli::shelve::scan_shelved(repo)
+        let stash: Vec<StashItemView> = crate::cli::stash::scan_stash(repo)
             .into_iter()
             .map(|(stem, st)| {
                 let ready = st.waiting_for.as_deref().is_some_and(|w| {
@@ -440,10 +444,11 @@ impl StatusSnapshot {
                         .iter()
                         .any(|fp| fp.plan.as_str() == w)
                 });
-                ShelvedView {
+                StashItemView {
                     stem,
                     waiting_for: st.waiting_for,
                     ready,
+                    commits: st.shas.len(),
                 }
             })
             .collect();
@@ -461,7 +466,7 @@ impl StatusSnapshot {
             queue,
             master,
             agents,
-            shelved,
+            stash,
             log_rows,
             pr_reviews: work_status.pr_reviews,
             head_correction: work_status.head_correction,
@@ -515,10 +520,10 @@ impl StatusSnapshot {
             })
             .collect();
 
-        let shelved = self
-            .shelved
+        let stash = self
+            .stash
             .iter()
-            .map(|sv| ShelvedJson {
+            .map(|sv| StashJson {
                 plan: &sv.stem,
                 waiting_for: sv.waiting_for.as_deref(),
                 ready: sv.ready,
@@ -546,7 +551,7 @@ impl StatusSnapshot {
             // TUI/HTML display concern; consumers read names).
             queue: (!self.queue.is_empty())
                 .then(|| self.queue.iter().map(|q| q.name.as_str()).collect()),
-            shelved,
+            stash,
             head_correction: self.head_correction.as_ref().map(|c| HeadCorrectionJson {
                 sha: c.sha.as_str(),
                 unknown: &c.violation.unknown,
@@ -605,13 +610,13 @@ impl StatusSnapshot {
                 if self.queue.len() == 1 { "" } else { "s" }
             );
         }
-        for sv in &self.shelved {
+        for sv in &self.stash {
             let note = match (&sv.waiting_for, sv.ready) {
-                (Some(w), true) => format!(" (was waiting on {w} — FINISHED; unshelve?)"),
+                (Some(w), true) => format!(" (was waiting on {w} — FINISHED; pop?)"),
                 (Some(w), false) => format!(" (waiting on {w})"),
                 (None, _) => String::new(),
             };
-            let _ = writeln!(out, "shelved: {}{note}", sv.stem);
+            let _ = writeln!(out, "stashed: {} · {} commit(s){note}", sv.stem, sv.commits);
         }
         for pr in &self.pr_reviews {
             let url = pr_url(&pr.repo, pr.pr);
@@ -1826,7 +1831,7 @@ mod dirty_and_wake_tests {
             queue: Vec::new(),
             master: None,
             agents: Vec::new(),
-            shelved: Vec::new(),
+            stash: Vec::new(),
             log_rows: Vec::new(),
             pr_reviews: Vec::new(),
             head_correction: None,
@@ -1902,10 +1907,11 @@ mod dirty_and_wake_tests {
                 name: "baz".to_string(),
             },
         ];
-        snap.shelved = vec![ShelvedView {
+        snap.stash = vec![StashItemView {
             stem: "old".to_string(),
             waiting_for: Some("bar".to_string()),
             ready: true,
+            commits: 2,
         }];
         snap.head_correction = Some(clank_core::wait::HeadCorrection {
             sha: sha("deadbeef"),
@@ -1924,10 +1930,13 @@ mod dirty_and_wake_tests {
         );
         assert_eq!(got["queue_count"], 2);
         assert_eq!(got["queue"], serde_json::json!(["bar", "baz"]));
+        // RENAMED key (rename-shelve-to-stash): `shelved` → `stash`, a
+        // deliberate breaking wire change for dogfood consumers.
         assert_eq!(
-            got["shelved"],
+            got["stash"],
             serde_json::json!([{"plan": "old", "waiting_for": "bar", "ready": true}])
         );
+        assert_eq!(got["shelved"], serde_json::Value::Null, "old key gone");
         assert_eq!(
             got["head_correction"],
             serde_json::json!({

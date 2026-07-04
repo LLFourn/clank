@@ -98,7 +98,7 @@ pub(crate) fn snap(plans: Vec<PlanWorkState>, queue: Vec<&str>) -> StatusSnapsho
             .collect(),
         master: Some("claude".into()),
         agents: Vec::new(),
-        shelved: Vec::new(),
+        stash: Vec::new(),
         log_rows: Vec::new(),
         pr_reviews: Vec::new(),
         head_correction: None,

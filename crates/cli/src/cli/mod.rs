@@ -35,7 +35,7 @@ pub mod queue;
 pub mod rewire;
 pub mod rewrite;
 pub mod setup;
-pub mod shelve;
+pub mod stash;
 pub mod status;
 pub(crate) mod status_tui;
 pub mod stop_hook;
@@ -256,6 +256,16 @@ pub struct HtmlOpenArgs {
         value_name = "NAME"
     )]
     pub queue: Option<String>,
+    /// Stashed plan name. When supplied, the browser opens
+    /// `stash/<name>.html`. Mutually exclusive with the other targets.
+    #[arg(
+        long,
+        conflicts_with = "plan",
+        conflicts_with = "commit",
+        conflicts_with = "queue",
+        value_name = "NAME"
+    )]
+    pub stash: Option<String>,
     /// Print the resolved target path on stdout and exit
     /// without launching a browser. Mirrors `--print` on
     /// `clank agent start`, `clank diff`, `clank open zellij`.
@@ -1238,6 +1248,95 @@ pub struct FinishArgs {
 }
 
 #[derive(Args, Debug)]
+pub struct StashArgs {
+    #[command(subcommand)]
+    pub command: Option<StashCmd>,
+    /// Repo root. Defaults to the cwd's git toplevel.
+    #[arg(long, value_name = "PATH")]
+    pub repo: Option<PathBuf>,
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum StashCmd {
+    /// Set a plan's commits aside (kept restorable on a protective ref)
+    /// and clean them off the branch.
+    Push(StashPushArgs),
+    /// Restore a stashed plan: replay its commits onto HEAD and consume
+    /// the stash. Reviews reset (the replayed commits are re-reviewed).
+    Pop(StashPopArgs),
+    /// Print a stashed plan's body (from its protective ref) + commits.
+    Show(StashShowArgs),
+    /// Permanently discard a plan's stashed commits + record.
+    Drop(StashDropArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct StashPopArgs {
+    /// Stashed plan stem to restore.
+    pub plan: String,
+    /// Repo root. Defaults to the cwd's git toplevel.
+    #[arg(long, value_name = "PATH")]
+    pub repo: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub struct StashShowArgs {
+    /// Stashed plan stem.
+    pub plan: String,
+    /// Repo root. Defaults to the cwd's git toplevel.
+    #[arg(long, value_name = "PATH")]
+    pub repo: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub struct StashDropArgs {
+    /// Stashed plan stem.
+    pub plan: String,
+    #[arg(long, value_name = "PATH")]
+    pub repo: Option<PathBuf>,
+    /// Skip the interactive confirmation prompt.
+    #[arg(long)]
+    pub yes: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct StashPushArgs {
+    /// Plan stem to stash (same parsing as `clank purge`). Optional when
+    /// the repo has exactly one in-flight active plan.
+    pub plan: Option<String>,
+    /// Repo root. Defaults to the cwd's git toplevel.
+    #[arg(long, value_name = "PATH")]
+    pub repo: Option<PathBuf>,
+    /// Record that this plan is waiting on another; `clank status`
+    /// nudges to pop once that plan finishes.
+    #[arg(long = "for", value_name = "PLAN")]
+    pub waiting_for: Option<String>,
+    /// Also save the plan body back to the queue for re-attempt
+    /// from scratch.
+    #[arg(long)]
+    pub to_queue: bool,
+    /// Queue priority for `--to-queue` (default 500).
+    #[arg(long, value_name = "N")]
+    pub priority: Option<u16>,
+    /// Allow stashing when the plan range contains `Rewrite`
+    /// dispositions (your own code-touching commits). Does NOT
+    /// bypass foreign commits — those refuse unconditionally.
+    #[arg(long)]
+    pub force: bool,
+    /// Print the plan without changing anything.
+    #[arg(long)]
+    pub dry: bool,
+    /// Skip the interactive confirmation prompt.
+    #[arg(long)]
+    pub yes: bool,
+    /// Permit rewriting a protected branch in place.
+    #[arg(long)]
+    pub allow_rewrite_protected: bool,
+}
+
+/// HIDDEN ALIAS (one release): `clank shelve` → `clank stash push`,
+/// `clank shelve clean` → `clank stash drop`.
+#[derive(Args, Debug)]
 pub struct ShelveArgs {
     #[command(subcommand)]
     pub command: Option<ShelveCmd>,
@@ -1247,7 +1346,7 @@ pub struct ShelveArgs {
     #[arg(long, value_name = "PATH")]
     pub repo: Option<PathBuf>,
     /// Record that this plan is waiting on another; `clank status`
-    /// nudges to unshelve once that plan finishes.
+    /// nudges to pop once that plan finishes.
     #[arg(long = "for", value_name = "PLAN")]
     pub waiting_for: Option<String>,
     /// Also save the plan body back to the queue for re-attempt
@@ -1422,8 +1521,8 @@ pub struct PurgeArgs {
     /// implementation code — not just `.clank/` artifacts. The
     /// plan AND its work both vanish from history. Refuses
     /// foreign commits unconditionally (same policy as
-    /// `clank shelve --to-queue`). Does NOT save the plan body —
-    /// use `clank shelve --to-queue` if you want to re-queue it for
+    /// `clank stash push --to-queue`). Does NOT save the plan body —
+    /// use `clank stash push --to-queue` if you want to re-queue it for
     /// another attempt. Mutually exclusive with `--all`,
     /// `--squash`, and `--amend`.
     #[arg(long)]

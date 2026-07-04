@@ -64,7 +64,7 @@ must amend BEFORE anything else proceeds. Three ways to break it:
   FINISHED plan (message mandatory: WHAT subject + WHY body). On an
   already-finished plan, a bare `-m` just rewrites the finish commit's
   message (to fix/improve the summary).
-- `clank shelve <plan>` / `clank unshelve <plan>` — set a plan's commits
+- `clank stash push <plan>` / `clank stash pop <plan>` — set a plan's commits
   aside / restore them (reviews reset on restore); `clank purge --drop
   <plan>` fully deletes a plan (commits + body)
 - roster: `clank agent add <name> [--tool claude|codex] [--review

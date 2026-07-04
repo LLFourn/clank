@@ -289,6 +289,13 @@ enum OverlayData {
         name: String,
         markdown: Option<String>,
     },
+    /// A STASHED plan's markdown by name — read from the stash record's
+    /// protective ref (the plan file no longer exists on the branch);
+    /// `None` when the item left the stash.
+    StashedPlan {
+        name: String,
+        markdown: Option<String>,
+    },
 }
 
 /// An open document overlay: the fetched [`OverlayData`] and the scroll
@@ -323,6 +330,13 @@ impl Overlay {
     fn queued(name: String, markdown: Option<String>) -> Self {
         Self {
             data: OverlayData::QueuedPlan { name, markdown },
+            offset: 0,
+        }
+    }
+    /// A stashed-plan overlay, opened at the top.
+    fn stashed(name: String, markdown: Option<String>) -> Self {
+        Self {
+            data: OverlayData::StashedPlan { name, markdown },
             offset: 0,
         }
     }
@@ -424,12 +438,27 @@ fn read_queue_markdown(repo: &std::path::Path, name: &str) -> Option<String> {
     std::fs::read_to_string(&entry.path).ok()
 }
 
+/// Read a stashed plan's markdown by NAME: resolve the item through the
+/// merged stash scan and read `plans/<name>.md` from THE RECORD'S OWN
+/// protective ref (the ref-path contract) — the file no longer exists on
+/// the branch. Re-resolved on refresh; `None` when the item left the
+/// stash or the blob is missing.
+fn read_stash_markdown(repo: &std::path::Path, name: &str) -> Option<String> {
+    let (_, record) = crate::cli::stash::scan_stash(repo)
+        .into_iter()
+        .find(|(stem, _)| stem == name)?;
+    let tip = crate::git_io::resolve_commit(repo, &record.git_ref)?;
+    let rel = crate::init_facts::plan_md_rel(name);
+    crate::git_io::show_blob(repo, &tip, std::path::Path::new(&rel)).ok()
+}
+
 /// What an open overlay can render as HTML — a plan stem or a full commit
 /// sha, owned so the overlay's borrow is released before dispatch.
 enum HtmlTarget {
     Plan(String),
     Commit(String),
     Queue(String),
+    Stash(String),
 }
 
 /// Open the overlay's plan/commit as its rendered HTML page in the host
@@ -446,9 +475,10 @@ fn open_overlay_in_browser(repo: &std::path::Path, target: &HtmlTarget) {
             let page = repo.join(format!(".clank/html/commit/{sha}.html"));
             (HtmlOpenTarget::Commit(sha.as_str()), !page.exists())
         }
-        // Queue pages are re-rendered on every build, so no --rebuild
-        // heuristic is needed — a plain open regenerates the site.
+        // Queue/stash pages are re-rendered on every build, so no
+        // --rebuild heuristic is needed — a plain open regenerates the site.
         HtmlTarget::Queue(name) => (HtmlOpenTarget::Queue(name.as_str()), false),
+        HtmlTarget::Stash(name) => (HtmlOpenTarget::Stash(name.as_str()), false),
     };
     let argv = crate::cli::html::html_open_argv(repo, open_target, rebuild);
     if let Ok(exe) = std::env::current_exe() {
@@ -646,7 +676,8 @@ pub(crate) async fn run_tui(
                     rows as usize,
                     cols as usize,
                 ),
-                OverlayData::QueuedPlan { name, markdown } => render_plan_doc(
+                OverlayData::QueuedPlan { name, markdown }
+                | OverlayData::StashedPlan { name, markdown } => render_plan_doc(
                     name,
                     markdown.as_deref(),
                     overlay.offset,
@@ -661,6 +692,7 @@ pub(crate) async fn run_tui(
                 OverlayData::Commit(d) => HtmlTarget::Commit(d.sha.as_str().to_string()),
                 OverlayData::Plan { stem, .. } => HtmlTarget::Plan(stem.clone()),
                 OverlayData::QueuedPlan { name, .. } => HtmlTarget::Queue(name.clone()),
+                OverlayData::StashedPlan { name, .. } => HtmlTarget::Stash(name.clone()),
             };
             paint(&lines);
             match ev_rx.recv_timeout(Duration::from_secs(60)) {
@@ -693,6 +725,13 @@ pub(crate) async fn run_tui(
                             let name = name.clone();
                             Some(OverlayData::QueuedPlan {
                                 markdown: read_queue_markdown(&repo, &name),
+                                name,
+                            })
+                        }
+                        OverlayData::StashedPlan { name, .. } => {
+                            let name = name.clone();
+                            Some(OverlayData::StashedPlan {
+                                markdown: read_stash_markdown(&repo, &name),
                                 name,
                             })
                         }
@@ -788,8 +827,13 @@ pub(crate) async fn run_tui(
                     // (where IO happens).
                     match mode {
                         Mode::AgentPanel { sel } => {
-                            match agent_panel_action(sel, &snapshot.agents, snapshot.queue.len(), k)
-                            {
+                            match agent_panel_action(
+                                sel,
+                                &snapshot.agents,
+                                snapshot.stash.len(),
+                                snapshot.queue.len(),
+                                k,
+                            ) {
                                 PanelAction::Quit => break 'evloop,
                                 PanelAction::LeaveFocus => {
                                     mode = mode.toggle_focus(snapshot.agents.len())
@@ -846,6 +890,21 @@ pub(crate) async fn run_tui(
                                         open_overlay_in_browser(
                                             &repo,
                                             &HtmlTarget::Queue(item.name.clone()),
+                                        );
+                                    }
+                                }
+                                PanelAction::OpenStashItem(i) => {
+                                    if let Some(item) = snapshot.stash.get(i) {
+                                        let name = item.stem.clone();
+                                        let md = read_stash_markdown(&repo, &name);
+                                        detail = Some(Overlay::stashed(name, md));
+                                    }
+                                }
+                                PanelAction::OpenStashHtml(i) => {
+                                    if let Some(item) = snapshot.stash.get(i) {
+                                        open_overlay_in_browser(
+                                            &repo,
+                                            &HtmlTarget::Stash(item.stem.clone()),
                                         );
                                     }
                                 }
@@ -1077,12 +1136,22 @@ pub(crate) async fn run_tui(
                 // reprioritise renames the queue file, so THIS refresh is
                 // often self-inflicted and re-sorts the list — capture the
                 // selected item's NAME so the cursor follows it.
-                let panel_queue_name = match mode {
-                    Mode::AgentPanel { sel } if sel > snapshot.agents.len() => snapshot
-                        .queue
-                        .get(sel - snapshot.agents.len() - 1)
-                        .map(|q| q.name.clone()),
-                    _ => None,
+                let (panel_stash_name, panel_queue_name) = match mode {
+                    Mode::AgentPanel { sel } if sel > snapshot.agents.len() => {
+                        let i = sel - snapshot.agents.len() - 1;
+                        if i < snapshot.stash.len() {
+                            (snapshot.stash.get(i).map(|s| s.stem.clone()), None)
+                        } else {
+                            (
+                                None,
+                                snapshot
+                                    .queue
+                                    .get(i - snapshot.stash.len())
+                                    .map(|q| q.name.clone()),
+                            )
+                        }
+                    }
+                    _ => (None, None),
                 };
                 snapshot = StatusSnapshot::build_async(
                     &repo,
@@ -1111,8 +1180,10 @@ pub(crate) async fn run_tui(
                     Mode::AgentPanel { sel } => Mode::AgentPanel {
                         sel: rebind_panel_sel(
                             sel,
+                            panel_stash_name.as_deref(),
                             panel_queue_name.as_deref(),
                             snapshot.agents.len(),
+                            &snapshot.stash,
                             &snapshot.queue,
                         ),
                     },
@@ -1287,7 +1358,9 @@ pub(crate) mod tests {
         };
         let subject_of = |o: &Overlay| match &o.data {
             OverlayData::Commit(d) => d.subject.clone(),
-            OverlayData::Plan { .. } | OverlayData::QueuedPlan { .. } => unreachable!(),
+            OverlayData::Plan { .. }
+            | OverlayData::QueuedPlan { .. }
+            | OverlayData::StashedPlan { .. } => unreachable!(),
         };
         // A review row opens at a non-zero offset (commit row would be 0).
         let mut o = Overlay::commit(data("first"), 5);

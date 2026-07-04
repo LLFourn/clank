@@ -195,15 +195,16 @@ pub(super) fn render_at(
         }
     }
 
-    // `shelf` — shelved plans; the unshelve nudge once a `--for`
-    // dependency finishes (plan-lifecycle-verbs).
-    for sv in &snap.shelved {
+    // `stash` gauge — PANEL-LESS renders only; a repo with an agents
+    // panel gets the interactive STASH section between AGENTS and QUEUE
+    // instead (rendering both would duplicate the list).
+    for sv in snap.stash.iter().filter(|_| snap.agents.is_empty()) {
         let note = match (&sv.waiting_for, sv.ready) {
-            (Some(w), true) => format!(" — {w} finished; unshelve?"),
+            (Some(w), true) => format!(" — {w} finished; pop?"),
             (Some(w), false) => format!(" — waiting on {w}"),
             (None, _) => String::new(),
         };
-        body.push(vec![label("shelf"), plain(sv.stem.clone()), dim(note)]);
+        body.push(vec![label("stash"), plain(sv.stem.clone()), dim(note)]);
     }
 
     // `pr` — active PR review(s): the full GitHub URL on its own
@@ -336,6 +337,47 @@ pub(super) fn render_at(
                     cols,
                 ));
             }
+        }
+    }
+
+    // STASH — stashed plans ABOVE the queue (they have commits, nearer
+    // to live work than queued ideas). Selection continues from the
+    // panel: STASH rows at `agents.len()+1..`, QUEUE rows after them.
+    // Enter reads the plan (body from the record's protective ref), `o`
+    // opens its HTML page. Hidden when empty; panel-less renders keep
+    // the gauge summary instead.
+    if !snap.agents.is_empty() && !snap.stash.is_empty() && out.len() < rows {
+        let agents_focused = mode.agents_focused();
+        out.push(region_rule(
+            "stash",
+            "⏎ read · o page",
+            agents_focused,
+            cols,
+        ));
+        for (i, item) in snap.stash.iter().enumerate() {
+            if out.len() >= rows {
+                break;
+            }
+            let note = match (&item.waiting_for, item.ready) {
+                (Some(w), true) => format!("  {w} finished — pop?"),
+                (Some(w), false) => format!("  waiting on {w}"),
+                (None, _) => String::new(),
+            };
+            let mut spans = vec![
+                plain("  ".to_string()),
+                plain(item.stem.clone()),
+                dim(format!("  {} commit(s)", item.commits)),
+            ];
+            if !note.is_empty() {
+                spans.push(if item.ready { accent(note) } else { dim(note) });
+            }
+            let sel_idx = snap.agents.len() + 1 + i;
+            out.push(row_line(
+                &spans,
+                mode.selected() == Some(sel_idx),
+                color,
+                cols,
+            ));
         }
     }
 
@@ -2148,6 +2190,71 @@ mod tests {
         assert!(
             !out.iter().any(|l| visible(l).contains("QUEUE")),
             "no empty QUEUE header"
+        );
+    }
+
+    #[test]
+    fn stash_section_renders_above_the_queue_with_ready_nudge() {
+        let mut s = two_agent_snap();
+        s.stash = vec![crate::cli::status::StashItemView {
+            stem: "parked".into(),
+            waiting_for: Some("dep".into()),
+            ready: true,
+            commits: 3,
+        }];
+        s.queue = vec![crate::cli::status::QueueItemView {
+            priority: 500,
+            name: "queued-idea".into(),
+        }];
+        let out = render_at(
+            &s,
+            40,
+            80,
+            0,
+            0,
+            &PanelView::just(Mode::AgentPanel { sel: 3 }),
+        )
+        .0;
+        let texts: Vec<String> = out.iter().map(|l| visible(l)).collect();
+        let pos = |needle: &str| texts.iter().position(|t| t.contains(needle));
+        let (agents_rule, stash_rule, queue_rule, log_rule) = (
+            pos("AGENTS").expect("agents rule"),
+            pos("STASH").expect("stash rule"),
+            pos("QUEUE").expect("queue rule"),
+            pos("LOG").expect("log rule"),
+        );
+        assert!(
+            agents_rule < stash_rule && stash_rule < queue_rule && queue_rule < log_rule,
+            "order: AGENTS → STASH → QUEUE → LOG"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.contains("parked") && t.contains("3 commit(s)")),
+            "stash row shows name + commit count: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("dep finished — pop?")),
+            "ready nudge shown"
+        );
+        // sel 3 = the stash row (first row after "+ add") carries the band.
+        let row = texts.iter().position(|t| t.contains("parked")).unwrap();
+        assert!(out[row].contains(REVERSE), "stash row selection band");
+
+        // Empty stash: the section vanishes entirely.
+        let s = two_agent_snap();
+        let out = render_at(
+            &s,
+            40,
+            80,
+            0,
+            0,
+            &PanelView::just(Mode::AgentPanel { sel: 0 }),
+        )
+        .0;
+        assert!(
+            !out.iter().any(|l| visible(l).contains("STASH")),
+            "no empty STASH header"
         );
     }
 

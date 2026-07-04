@@ -1,7 +1,7 @@
 //! gix-backed git PLUMBING — object/tree/ref writes, the mutation
 //! counterpart to [`crate::git_io`]'s reads (which stay read-only for
 //! the filesystem-truth model). The history-rewrite engine (`purge` /
-//! `finish --purge`) and `shelve` build trees, write commit objects,
+//! `finish --purge`) and `stash` build trees, write commit objects,
 //! and move refs through this typed API instead of scattering `gix::`
 //! calls. A read appears here only when it's an inseparable input to a
 //! write (e.g. an original commit's author for a replay).

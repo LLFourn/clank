@@ -1,15 +1,21 @@
-//! `clank shelve <plan>` / `clank unshelve <plan>` — set an
-//! in-flight plan's commits aside and restore them later.
-//! Plan: plan-lifecycle-verbs (absorbs the removed `clank demote`;
-//! `clank purge --drop` is the full-delete).
+//! `clank stash` — set an in-flight plan's commits aside (`push`) and
+//! restore them later (`pop`), with `show` / `drop` / bare-list. The
+//! verbs mirror `git stash` (rename-shelve-to-stash; formerly
+//! `clank shelve`/`unshelve`, kept as hidden aliases for a release).
 //!
-//! Shelve order is the data-safety invariant: the protective ref
-//! (`refs/clank/shelved/<plan>`) is written BEFORE the rewrite
-//! drops anything, so the plan's commits stay reachable and
-//! GC-protected even if every later step fails. Unshelve
-//! cherry-picks the recorded shas back; reviews RESET by design
-//! (new shas, new context — the fold derives Unreviewed and
-//! reviewers re-review; nothing migrates).
+//! Push order is the data-safety invariant: the protective ref
+//! (`refs/clank/stash/<plan>`) is written BEFORE the rewrite drops
+//! anything, so the plan's commits stay reachable and GC-protected
+//! even if every later step fails. Pop cherry-picks the recorded shas
+//! back; reviews RESET by design (new shas, new context — the fold
+//! derives Unreviewed and reviewers re-review; nothing migrates).
+//!
+//! STORAGE — read both, write new: records land at
+//! `.clank/stash/<stem>.json` + `refs/clank/stash/<stem>`; legacy
+//! `.clank/shelved/` records (+ their `refs/clank/shelved/` refs)
+//! stay readable for a release. THE REF-PATH CONTRACT (codex d633f87):
+//! every reader resolves an item through the merged scan and uses the
+//! RECORD'S OWN `git_ref` — never a stem-constructed path.
 
 use std::path::{Path, PathBuf};
 
@@ -21,47 +27,77 @@ use crate::rebuild::CachePolicy;
 use clank_core::api::{RewriteCommit, RewriteDisposition};
 use clank_core::ids::CommitSha;
 
-use super::{ShelveArgs, ShelveCleanArgs, UnshelveArgs};
+use super::{
+    ShelveArgs, ShelveCmd, StashArgs, StashCmd, StashPushArgs, StashShowArgs, UnshelveArgs,
+};
 
-/// On-disk shelve record at `.clank/shelved/<plan>.json`.
+/// On-disk stash record — `.clank/stash/<plan>.json` for new pushes,
+/// `.clank/shelved/<plan>.json` for legacy ones (read-both). The wire
+/// shape is unchanged from the shelve era, so legacy records parse.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub struct ShelveState {
+pub struct StashRecord {
     /// The plan's attributed commit shas, oldest first — the
-    /// cherry-pick order for unshelve.
+    /// cherry-pick order for pop.
     pub shas: Vec<String>,
     /// The protective ref keeping those commits reachable.
     pub git_ref: String,
-    /// Optional "shelved waiting on this plan" dependency; powers
+    /// Optional "stashed waiting on this plan" dependency; powers
     /// the `clank status` nudge once that plan finishes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub waiting_for: Option<String>,
 }
 
-pub fn shelved_dir(repo: &Path) -> PathBuf {
+fn stash_dir(repo: &Path) -> PathBuf {
+    repo.join(".clank/stash")
+}
+
+/// Legacy location from the shelve era — read-only for one release.
+fn legacy_dir(repo: &Path) -> PathBuf {
     repo.join(".clank/shelved")
 }
 
+/// Where NEW records are written.
 fn state_path(repo: &Path, stem: &str) -> PathBuf {
-    shelved_dir(repo).join(format!("{stem}.json"))
+    stash_dir(repo).join(format!("{stem}.json"))
 }
 
+/// New pushes protect on the stash ref namespace; readers NEVER
+/// construct this — they use the record's own `git_ref`.
 fn ref_name(stem: &str) -> String {
-    format!("refs/clank/shelved/{stem}")
+    format!("refs/clank/stash/{stem}")
 }
 
-/// Read every shelve record (for `clank status` surfacing).
-pub fn scan_shelved(repo: &Path) -> Vec<(String, ShelveState)> {
-    let Ok(entries) = std::fs::read_dir(shelved_dir(repo)) else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(stem) = name.to_str().and_then(|s| s.strip_suffix(".json")) else {
+/// The record file for `stem`, wherever it lives (new first, then
+/// legacy), or `None`.
+fn find_record_path(repo: &Path, stem: &str) -> Option<PathBuf> {
+    let new = state_path(repo, stem);
+    if new.is_file() {
+        return Some(new);
+    }
+    let legacy = legacy_dir(repo).join(format!("{stem}.json"));
+    legacy.is_file().then_some(legacy)
+}
+
+/// Read every stash record — the MERGED new+legacy scan (a new record
+/// shadows a same-stem legacy one). For `clank stash` list, `status`,
+/// the TUI, and the HTML report.
+pub fn scan_stash(repo: &Path) -> Vec<(String, StashRecord)> {
+    let mut out: Vec<(String, StashRecord)> = Vec::new();
+    for dir in [stash_dir(repo), legacy_dir(repo)] {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
-        if let Ok(body) = std::fs::read_to_string(entry.path()) {
-            if let Ok(state) = serde_json::from_str::<ShelveState>(&body) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(stem) = name.to_str().and_then(|s| s.strip_suffix(".json")) else {
+                continue;
+            };
+            if out.iter().any(|(s, _)| s == stem) {
+                continue; // new location shadows legacy
+            }
+            if let Ok(body) = std::fs::read_to_string(entry.path())
+                && let Ok(state) = serde_json::from_str::<StashRecord>(&body)
+            {
                 out.push((stem.to_string(), state));
             }
         }
@@ -70,7 +106,44 @@ pub fn scan_shelved(repo: &Path) -> Vec<(String, ShelveState)> {
     out
 }
 
-pub async fn run_shelve(args: ShelveArgs) -> anyhow::Result<()> {
+/// `clank stash` dispatcher: bare = list; push/pop/show/drop.
+pub async fn run(args: StashArgs) -> anyhow::Result<()> {
+    match args.command {
+        None => run_list(args.repo.as_deref()).await,
+        Some(StashCmd::Push(a)) => run_push(a).await,
+        Some(StashCmd::Pop(a)) => run_pop_inner(a.repo.as_deref(), &a.plan).await,
+        Some(StashCmd::Show(a)) => run_show(a).await,
+        Some(StashCmd::Drop(a)) => run_drop_inner(a.repo.as_deref(), &a.plan, a.yes).await,
+    }
+}
+
+/// Hidden-alias adapter: `clank shelve [clean]` → push / drop.
+pub async fn run_shelve_alias(args: ShelveArgs) -> anyhow::Result<()> {
+    match args.command {
+        Some(ShelveCmd::Clean(a)) => run_drop_inner(a.repo.as_deref(), &a.plan, a.yes).await,
+        None => {
+            run_push(StashPushArgs {
+                plan: args.plan,
+                repo: args.repo,
+                waiting_for: args.waiting_for,
+                to_queue: args.to_queue,
+                priority: args.priority,
+                force: args.force,
+                dry: args.dry,
+                yes: args.yes,
+                allow_rewrite_protected: args.allow_rewrite_protected,
+            })
+            .await
+        }
+    }
+}
+
+/// Hidden-alias adapter: `clank unshelve` → pop.
+pub async fn run_unshelve_alias(args: UnshelveArgs) -> anyhow::Result<()> {
+    run_pop_inner(args.repo.as_deref(), &args.plan).await
+}
+
+pub async fn run_push(args: StashPushArgs) -> anyhow::Result<()> {
     if !args.to_queue {
         if args.priority.is_some() {
             anyhow::bail!("--priority only applies with --to-queue");
@@ -93,11 +166,11 @@ pub async fn run_shelve(args: ShelveArgs) -> anyhow::Result<()> {
         crate::cli::plan_resolve::resolve_plan(&state, basename.as_str(), args.plan.as_deref())?;
     let stem = plan_key.as_str().to_string();
 
-    if state_path(&repo, &stem).exists() {
+    if find_record_path(&repo, &stem).is_some() {
         anyhow::bail!(
-            "plan `{stem}` already has shelved state. \
-             `clank unshelve {stem}` to restore it, or \
-             `clank shelve clean {stem}` to discard it first."
+            "plan `{stem}` is already stashed. \
+             `clank stash pop {stem}` to restore it, or \
+             `clank stash drop {stem}` to discard it first."
         );
     }
     if let Some(for_plan) = args.waiting_for.as_deref() {
@@ -111,7 +184,7 @@ pub async fn run_shelve(args: ShelveArgs) -> anyhow::Result<()> {
 
     // Same tiered safety as demote had: foreign commits in the
     // range are an unconditional refusal (interleaved plans can't
-    // be shelved; `plan-reorder` is the future enabler), non-plan
+    // be stashed; `plan-reorder` is the future enabler), non-plan
     // content dropped only under --force.
     safety_check(&preview.commits, args.force)?;
 
@@ -119,7 +192,7 @@ pub async fn run_shelve(args: ShelveArgs) -> anyhow::Result<()> {
     if plan_file_dirty(&repo, &plan_rel, preview.head_sha.as_str())? {
         anyhow::bail!(
             "`{plan_rel}` in the working tree differs from HEAD. \
-             Commit your plan-body changes or `git stash` before shelving."
+             Commit your plan-body changes or `git stash` before pushing."
         );
     }
 
@@ -148,11 +221,11 @@ pub async fn run_shelve(args: ShelveArgs) -> anyhow::Result<()> {
         .map(|c| c.sha.as_str().to_string())
         .collect();
     if shas.is_empty() {
-        anyhow::bail!("plan `{stem}` has no commits to shelve");
+        anyhow::bail!("plan `{stem}` has no commits to stash");
     }
 
     if args.dry {
-        println!("dry-run: would shelve `{stem}`");
+        println!("dry-run: would stash `{stem}`");
         println!(
             "  protective ref: {} @ {}",
             ref_name(&stem),
@@ -170,7 +243,7 @@ pub async fn run_shelve(args: ShelveArgs) -> anyhow::Result<()> {
 
     if !args.yes
         && !confirm(&format!(
-            "Shelve `{stem}` ({} commits set aside)?",
+            "Stash `{stem}` ({} commits set aside)?",
             shas.len()
         ))?
     {
@@ -179,14 +252,14 @@ pub async fn run_shelve(args: ShelveArgs) -> anyhow::Result<()> {
 
     // ── PROTECT FIRST: the ref lands before anything rewrites. ──
     git_update_ref(&repo, &ref_name(&stem), preview.head_sha.as_str())?;
-    let shelve_state = ShelveState {
+    let record = StashRecord {
         shas: shas.clone(),
         git_ref: ref_name(&stem),
         waiting_for: args.waiting_for.clone(),
     };
     let sp = state_path(&repo, &stem);
     std::fs::create_dir_all(sp.parent().expect("state path has parent"))?;
-    std::fs::write(&sp, serde_json::to_string_pretty(&shelve_state)?)
+    std::fs::write(&sp, serde_json::to_string_pretty(&record)?)
         .with_context(|| format!("writing `{}`", sp.display()))?;
 
     // ── Drop the plan's commits via the guarded rewrite path. ──
@@ -240,7 +313,7 @@ pub async fn run_shelve(args: ShelveArgs) -> anyhow::Result<()> {
                 let _ = std::fs::remove_file(&sp);
             } else {
                 eprintln!(
-                    "shelve: rewrite failed AFTER the branch moved; keeping \
+                    "stash: rewrite failed AFTER the branch moved; keeping \
                      {} and {} so the commits stay recoverable",
                     ref_name(&stem),
                     sp.display()
@@ -260,14 +333,14 @@ pub async fn run_shelve(args: ShelveArgs) -> anyhow::Result<()> {
 
     if let (Some(tip), Some(branch)) = (outcome.new_tip, outcome.updated_branch) {
         println!(
-            "shelved `{stem}`: branch `{branch}` now at {} ({} commits set aside on {})",
+            "stashed `{stem}`: branch `{branch}` now at {} ({} commits set aside on {})",
             &tip[..tip.len().min(12)],
             shas.len(),
             ref_name(&stem),
         );
     } else {
         println!(
-            "shelved `{stem}` ({} commits set aside on {})",
+            "stashed `{stem}` ({} commits set aside on {})",
             shas.len(),
             ref_name(&stem)
         );
@@ -281,79 +354,158 @@ pub async fn run_shelve(args: ShelveArgs) -> anyhow::Result<()> {
     if let Some(for_plan) = &args.waiting_for {
         println!("  waiting on `{for_plan}` — `clank status` will nudge when it finishes");
     }
-    println!("  restore with `clank unshelve {stem}`");
+    println!("  restore with `clank stash pop {stem}`");
     Ok(())
 }
 
-pub async fn run_unshelve(args: UnshelveArgs) -> anyhow::Result<()> {
-    let repo = super::resolve_repo(args.repo.as_deref())?;
-    let stem = args.plan.clone();
+async fn run_pop_inner(repo_override: Option<&Path>, plan: &str) -> anyhow::Result<()> {
+    let repo = super::resolve_repo(repo_override)?;
+    let stem = plan.to_string();
     PlanKey::parse(&stem).map_err(|e| anyhow::anyhow!("invalid plan `{stem}`: {e}"))?;
 
-    let sp = state_path(&repo, &stem);
-    let body = std::fs::read_to_string(&sp)
-        .map_err(|e| anyhow::anyhow!("no shelved state for `{stem}` ({}): {e}", sp.display()))?;
-    let shelve_state: ShelveState =
+    // Merged lookup: the record may live at the new or the legacy path;
+    // its `git_ref` names the protective ref either way.
+    let sp = find_record_path(&repo, &stem)
+        .ok_or_else(|| anyhow::anyhow!("`{stem}` is not stashed (see `clank stash`)"))?;
+    let body =
+        std::fs::read_to_string(&sp).with_context(|| format!("reading `{}`", sp.display()))?;
+    let record: StashRecord =
         serde_json::from_str(&body).with_context(|| format!("parsing `{}`", sp.display()))?;
 
     // A re-promoted plan with the same stem would collide with the
     // restored plan file; fail closed.
     if repo.join(crate::init_facts::plan_md_rel(&stem)).exists() {
         anyhow::bail!(
-            "plan `{stem}` is already active — its shelved commits predate the \
-             current plan. `clank shelve clean {stem}` to discard them."
+            "plan `{stem}` is already active — its stashed commits predate the \
+             current plan. `clank stash drop {stem}` to discard them."
         );
     }
     if worktree_dirty(&repo)? {
-        anyhow::bail!("working tree dirty; commit or stash before unshelving");
+        anyhow::bail!("working tree dirty; commit or stash before popping");
     }
 
     // Cherry-pick oldest-first. On the first conflict git leaves
     // the cherry-pick in progress for the user; the protective ref
-    // and shelve state are NOT touched (fail-closed) — finishing
-    // by hand + `clank shelve clean` completes the restore.
-    for sha in &shelve_state.shas {
+    // and record are NOT touched (fail-closed) — finishing by hand
+    // + `clank stash drop` completes the restore.
+    for sha in &record.shas {
         if !crate::git_plumbing::cherry_pick(&repo, sha)? {
             anyhow::bail!(
                 "cherry-pick of {sha} stopped (conflict?). Resolve with git \
-                 (`git cherry-pick --continue` / `--abort`); the shelved ref \
-                 `{}` and state are untouched. After completing by hand, run \
-                 `clank shelve clean {stem}`.",
-                shelve_state.git_ref
+                 (`git cherry-pick --continue` / `--abort`); the stash ref \
+                 `{}` and record are untouched. After completing by hand, run \
+                 `clank stash drop {stem}`.",
+                record.git_ref
             );
         }
     }
 
-    // Restore fully landed: drop the protective ref + state.
-    git_delete_ref(&repo, &shelve_state.git_ref)?;
+    // Restore fully landed: drop the protective ref + record (pop =
+    // restore AND consume, matching git stash pop).
+    git_delete_ref(&repo, &record.git_ref)?;
     std::fs::remove_file(&sp).with_context(|| format!("removing `{}`", sp.display()))?;
 
     println!(
-        "unshelved `{stem}`: {} commits replayed onto HEAD",
-        shelve_state.shas.len()
+        "popped `{stem}`: {} commits replayed onto HEAD",
+        record.shas.len()
     );
     println!("  reviews reset — the new commits are unreviewed; reviewers will wake");
     Ok(())
 }
 
-pub async fn run_clean(args: ShelveCleanArgs) -> anyhow::Result<()> {
-    let repo = super::resolve_repo(args.repo.as_deref())?;
-    let stem = args.plan.clone();
-    let sp = state_path(&repo, &stem);
-    if !sp.exists() {
-        anyhow::bail!("no shelved state for `{stem}`");
-    }
-    if !args.yes
+async fn run_drop_inner(repo_override: Option<&Path>, plan: &str, yes: bool) -> anyhow::Result<()> {
+    let repo = super::resolve_repo(repo_override)?;
+    let stem = plan.to_string();
+    let sp =
+        find_record_path(&repo, &stem).ok_or_else(|| anyhow::anyhow!("`{stem}` is not stashed"))?;
+    // The record's OWN git_ref, never a stem-constructed path — a legacy
+    // record's ref lives under refs/clank/shelved/ (codex d633f87).
+    let record: StashRecord = serde_json::from_str(
+        &std::fs::read_to_string(&sp).with_context(|| format!("reading `{}`", sp.display()))?,
+    )
+    .with_context(|| format!("parsing `{}`", sp.display()))?;
+    if !yes
         && !confirm(&format!(
-            "Permanently discard shelved commits for `{stem}`? This is the only \
+            "Permanently discard stashed commits for `{stem}`? This is the only \
              copy of that work."
         ))?
     {
         anyhow::bail!("aborted");
     }
-    git_delete_ref(&repo, &ref_name(&stem))?;
+    git_delete_ref(&repo, &record.git_ref)?;
     std::fs::remove_file(&sp).with_context(|| format!("removing `{}`", sp.display()))?;
-    println!("discarded shelved state for `{stem}`");
+    println!("dropped stashed state for `{stem}`");
+    Ok(())
+}
+
+/// `clank stash show <plan>` — the stashed plan body (read from the
+/// record's protective ref: the plan file no longer exists on the
+/// branch) + its commit list, oldest first (the pop order).
+async fn run_show(args: StashShowArgs) -> anyhow::Result<()> {
+    let repo = super::resolve_repo(args.repo.as_deref())?;
+    let stem = args.plan;
+    let sp = find_record_path(&repo, &stem)
+        .ok_or_else(|| anyhow::anyhow!("`{stem}` is not stashed (see `clank stash`)"))?;
+    let record: StashRecord = serde_json::from_str(
+        &std::fs::read_to_string(&sp).with_context(|| format!("reading `{}`", sp.display()))?,
+    )
+    .with_context(|| format!("parsing `{}`", sp.display()))?;
+
+    let tip = crate::git_io::resolve_commit(&repo, &record.git_ref)
+        .ok_or_else(|| anyhow::anyhow!("protective ref `{}` is gone", record.git_ref))?;
+    println!(
+        "stashed `{stem}` ({} commit(s) on {})",
+        record.shas.len(),
+        record.git_ref
+    );
+    if let Some(w) = &record.waiting_for {
+        println!("waiting on `{w}`");
+    }
+    println!();
+    for sha in &record.shas {
+        let key = crate::lifecycle::CommitSha::parse(sha)
+            .map_err(|e| anyhow::anyhow!("record sha `{sha}`: {e}"))?;
+        let subject = crate::git_io::commit_subject_at(&repo, &key).unwrap_or_default();
+        println!("  {} {subject}", &sha[..7.min(sha.len())]);
+    }
+    println!();
+    let plan_rel = crate::init_facts::plan_md_rel(&stem);
+    match crate::git_io::show_blob(&repo, &tip, Path::new(&plan_rel)) {
+        Ok(body) => print!("{body}"),
+        Err(_) => println!("(plan body not present at the protective ref)"),
+    }
+    Ok(())
+}
+
+/// Bare `clank stash` — the list, one line per item.
+async fn run_list(repo_override: Option<&Path>) -> anyhow::Result<()> {
+    let repo = super::resolve_repo(repo_override)?;
+    let items = scan_stash(&repo);
+    if items.is_empty() {
+        println!("stash is empty");
+        return Ok(());
+    }
+    // Readiness (a `--for` dependency that has finished) comes from the
+    // fold — the same signal `status` renders.
+    let state = crate::rebuild::rebuild_repo_with_policy(&repo, CachePolicy::Use)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to fold repo `{}`: {e}", repo.display()))?;
+    for (stem, record) in &items {
+        let note = match &record.waiting_for {
+            Some(w)
+                if state
+                    .fold
+                    .finished_plans
+                    .iter()
+                    .any(|f| f.plan.as_str() == w) =>
+            {
+                format!(" · was waiting on {w} — READY, pop?")
+            }
+            Some(w) => format!(" · waiting on {w}"),
+            None => String::new(),
+        };
+        println!("{stem} · {} commit(s){note}", record.shas.len());
+    }
     Ok(())
 }
 
@@ -393,7 +545,7 @@ fn confirm(prompt: &str) -> anyhow::Result<bool> {
 /// - All non-foreign `Drop`: ok.
 /// - Any `Rewrite` non-foreign: refuse unless `--force`.
 /// - Any foreign commit (regardless of disposition): unconditional
-///   refusal — interleaved plans cannot be shelved (codex 625b8af:
+///   refusal — interleaved plans cannot be stashed (codex 625b8af:
 ///   a foreign commit can classify as `Rewrite`, so ANY foreign is
 ///   refused, not just `KeepVerbatim`).
 fn safety_check(commits: &[RewriteCommit], force: bool) -> anyhow::Result<()> {
@@ -414,7 +566,7 @@ fn safety_check(commits: &[RewriteCommit], force: bool) -> anyhow::Result<()> {
             .map(|s| s.as_str().to_string())
             .collect();
         anyhow::bail!(
-            "shelve refuses: foreign commit(s) interleaved in plan range: {}. \
+            "stash push refuses: foreign commit(s) interleaved in plan range: {}. \
              `--force` does NOT bypass this. Disentangle first (see the \
              `plan-reorder` queue item) or coordinate with the author(s).",
             list.join(", ")
@@ -426,8 +578,8 @@ fn safety_check(commits: &[RewriteCommit], force: bool) -> anyhow::Result<()> {
             .map(|s| s.as_str().to_string())
             .collect();
         anyhow::bail!(
-            "shelve refuses: commit(s) {} touch non-plan content that would be \
-             set aside with the plan. Pass `--force` to shelve them anyway.",
+            "stash push refuses: commit(s) {} touch non-plan content that would be \
+             set aside with the plan. Pass `--force` to stash them anyway.",
             list.join(", ")
         );
     }
@@ -447,9 +599,6 @@ fn plan_file_dirty(repo: &Path, rel_path: &str, head_sha: &str) -> anyhow::Resul
     };
     let head_sha_parsed = CommitSha::parse(head_sha)
         .map_err(|e| anyhow::anyhow!("invalid head SHA `{head_sha}`: {e}"))?;
-    let head_content = match crate::git_io::show_blob(repo, &head_sha_parsed, Path::new(rel_path)) {
-        Ok(s) => Some(s),
-        Err(_) => None,
-    };
+    let head_content = crate::git_io::show_blob(repo, &head_sha_parsed, Path::new(rel_path)).ok();
     Ok(wt_content != head_content)
 }

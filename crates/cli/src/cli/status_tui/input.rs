@@ -216,14 +216,21 @@ pub(super) enum DetailNav {
 /// drops the cursor to the "+ add" row.
 pub(super) fn rebind_panel_sel(
     old_sel: usize,
+    stash_name: Option<&str>,
     queue_name: Option<&str>,
     agents_len: usize,
+    stash: &[crate::cli::status::StashItemView],
     queue: &[crate::cli::status::QueueItemView],
 ) -> usize {
+    if let Some(name) = stash_name
+        && let Some(pos) = stash.iter().position(|i| i.stem == name)
+    {
+        return agents_len + 1 + pos;
+    }
     if let Some(name) = queue_name
         && let Some(pos) = queue.iter().position(|q| q.name == name)
     {
-        return agents_len + 1 + pos;
+        return agents_len + 1 + stash.len() + pos;
     }
     old_sel.min(agents_len)
 }
@@ -397,6 +404,11 @@ pub(super) enum PanelAction {
     OpenQueueItem(usize),
     /// Open a queued plan's HTML page in the browser (`o` on a queue row).
     OpenQueueHtml(usize),
+    /// Open a stashed plan's read overlay (Enter on a STASH row) — the
+    /// body comes from the record's protective ref.
+    OpenStashItem(usize),
+    /// Open a stashed plan's HTML page in the browser (`o` on a STASH row).
+    OpenStashHtml(usize),
     /// Nudge a queue row's priority by `delta` (+/- on a queue row); the
     /// loop clamps to 0-999 and writes through `queue::set_priority`.
     NudgeQueue {
@@ -413,14 +425,17 @@ pub(super) enum PanelAction {
 pub(super) fn agent_panel_action(
     sel: usize,
     agents: &[crate::cli::status::AgentAutoRow],
+    stash_len: usize,
     queue_len: usize,
     key: Key,
 ) -> PanelAction {
     let add_row = agents.len();
-    let total = add_row + 1 + queue_len;
+    let total = add_row + 1 + stash_len + queue_len;
     let on_add = sel == add_row;
-    // A queue row's index within the queue list, when the cursor is on one.
-    let queue_idx = (sel > add_row).then(|| sel - add_row - 1);
+    // Which segment the cursor sits in: STASH rows come first (they
+    // render above the queue), then QUEUE rows.
+    let stash_idx = (sel > add_row && sel <= add_row + stash_len).then(|| sel - add_row - 1);
+    let queue_idx = (sel > add_row + stash_len).then(|| sel - add_row - 1 - stash_len);
     let on_last = sel + 1 == total;
     match key {
         Key::Quit => PanelAction::Quit,
@@ -435,13 +450,15 @@ pub(super) fn agent_panel_action(
         // inline auto-toggle (or the picker on "+ add"); it does nothing
         // on a queue row (no accidental overlay).
         Key::Enter if on_add => PanelAction::OpenPicker,
-        Key::Enter => match queue_idx {
-            Some(q) => PanelAction::OpenQueueItem(q),
-            None => PanelAction::OpenDetail(sel),
+        Key::Enter => match (stash_idx, queue_idx) {
+            (Some(i), _) => PanelAction::OpenStashItem(i),
+            (_, Some(q)) => PanelAction::OpenQueueItem(q),
+            _ => PanelAction::OpenDetail(sel),
         },
-        Key::Html => match queue_idx {
-            Some(q) => PanelAction::OpenQueueHtml(q),
-            None => PanelAction::None,
+        Key::Html => match (stash_idx, queue_idx) {
+            (Some(i), _) => PanelAction::OpenStashHtml(i),
+            (_, Some(q)) => PanelAction::OpenQueueHtml(q),
+            _ => PanelAction::None,
         },
         Key::Plus if queue_idx.is_some() => PanelAction::NudgeQueue {
             idx: queue_idx.unwrap(),
@@ -452,7 +469,7 @@ pub(super) fn agent_panel_action(
             delta: -50,
         },
         Key::Space if on_add => PanelAction::OpenPicker,
-        Key::Space if queue_idx.is_some() => PanelAction::None,
+        Key::Space if stash_idx.is_some() || queue_idx.is_some() => PanelAction::None,
         Key::Space => PanelAction::ToggleAuto(sel),
         _ => PanelAction::None,
     }
@@ -799,50 +816,50 @@ mod tests {
         // "+ add" row is index 2 (== agents.len()): Enter AND Space open
         // the picker.
         assert_eq!(
-            agent_panel_action(2, &agents, 0, Key::Enter),
+            agent_panel_action(2, &agents, 0, 0, Key::Enter),
             PanelAction::OpenPicker
         );
         assert_eq!(
-            agent_panel_action(2, &agents, 0, Key::Space),
+            agent_panel_action(2, &agents, 0, 0, Key::Space),
             PanelAction::OpenPicker
         );
         // Agent rows: Enter opens the detail page; Space toggles auto.
         assert_eq!(
-            agent_panel_action(1, &agents, 0, Key::Enter),
+            agent_panel_action(1, &agents, 0, 0, Key::Enter),
             PanelAction::OpenDetail(1)
         );
         assert_eq!(
-            agent_panel_action(1, &agents, 0, Key::Space),
+            agent_panel_action(1, &agents, 0, 0, Key::Space),
             PanelAction::ToggleAuto(1)
         );
         // DEL is no longer a panel action (removal lives on the detail page).
         assert_eq!(
-            agent_panel_action(1, &agents, 0, Key::Delete),
+            agent_panel_action(1, &agents, 0, 0, Key::Delete),
             PanelAction::None
         );
         // Navigation: Down within the panel moves; Down at the +add row
         // (index 2 == agents.len()) crosses into the log; Tab/Esc leave;
         // q quits.
         assert_eq!(
-            agent_panel_action(0, &agents, 0, Key::Down),
+            agent_panel_action(0, &agents, 0, 0, Key::Down),
             PanelAction::MoveCursor(1)
         );
         assert_eq!(
-            agent_panel_action(2, &agents, 0, Key::Down),
+            agent_panel_action(2, &agents, 0, 0, Key::Down),
             PanelAction::EnterLog,
             "Down past +add flows into the log"
         );
         assert_eq!(
-            agent_panel_action(0, &agents, 0, Key::Up),
+            agent_panel_action(0, &agents, 0, 0, Key::Up),
             PanelAction::MoveCursor(0),
             "Up at the top stays put"
         );
         assert_eq!(
-            agent_panel_action(1, &agents, 0, Key::Focus),
+            agent_panel_action(1, &agents, 0, 0, Key::Focus),
             PanelAction::LeaveFocus
         );
         assert_eq!(
-            agent_panel_action(1, &agents, 0, Key::Quit),
+            agent_panel_action(1, &agents, 0, 0, Key::Quit),
             PanelAction::Quit
         );
     }
@@ -859,47 +876,108 @@ mod tests {
         let ql = 2;
         // Enter on a queue row reads it; `o` opens its HTML page.
         assert_eq!(
-            agent_panel_action(3, &agents, ql, Key::Enter),
+            agent_panel_action(3, &agents, 0, ql, Key::Enter),
             PanelAction::OpenQueueItem(0)
         );
         assert_eq!(
-            agent_panel_action(4, &agents, ql, Key::Html),
+            agent_panel_action(4, &agents, 0, ql, Key::Html),
             PanelAction::OpenQueueHtml(1)
         );
         // +/- nudge the priority number by 50 (loop clamps + persists via
         // queue::set_priority).
         assert_eq!(
-            agent_panel_action(3, &agents, ql, Key::Plus),
+            agent_panel_action(3, &agents, 0, ql, Key::Plus),
             PanelAction::NudgeQueue { idx: 0, delta: 50 }
         );
         assert_eq!(
-            agent_panel_action(3, &agents, ql, Key::Minus),
+            agent_panel_action(3, &agents, 0, ql, Key::Minus),
             PanelAction::NudgeQueue { idx: 0, delta: -50 }
         );
         // Space on a queue row is inert (no accidental overlay); `o` on an
         // agent row is inert too.
         assert_eq!(
-            agent_panel_action(3, &agents, ql, Key::Space),
+            agent_panel_action(3, &agents, 0, ql, Key::Space),
             PanelAction::None
         );
         assert_eq!(
-            agent_panel_action(1, &agents, ql, Key::Html),
+            agent_panel_action(1, &agents, 0, ql, Key::Html),
             PanelAction::None
         );
         // Down from "+ add" now enters the queue, not the log; Down from
         // the LAST queue row crosses into the log.
         assert_eq!(
-            agent_panel_action(2, &agents, ql, Key::Down),
+            agent_panel_action(2, &agents, 0, ql, Key::Down),
             PanelAction::MoveCursor(3)
         );
         assert_eq!(
-            agent_panel_action(4, &agents, ql, Key::Down),
+            agent_panel_action(4, &agents, 0, ql, Key::Down),
             PanelAction::EnterLog
         );
         // With an empty queue, Down from "+ add" still enters the log.
         assert_eq!(
-            agent_panel_action(2, &agents, 0, Key::Down),
+            agent_panel_action(2, &agents, 0, 0, Key::Down),
             PanelAction::EnterLog
+        );
+    }
+
+    #[test]
+    fn agent_panel_action_routes_stash_rows_before_queue_rows() {
+        use crate::cli::teams_config::RosterRole;
+        use clank_core::vocab::AutoMode;
+        let agents = vec![
+            agent_row("claude", RosterRole::Master, AutoMode::On),
+            agent_row("codex", RosterRole::Commit, AutoMode::Off),
+        ];
+        // Rows: 0-1 agents, 2 "+ add", 3 the stash row, 4 the queue row.
+        let (sl, ql) = (1, 1);
+        assert_eq!(
+            agent_panel_action(3, &agents, sl, ql, Key::Enter),
+            PanelAction::OpenStashItem(0)
+        );
+        assert_eq!(
+            agent_panel_action(3, &agents, sl, ql, Key::Html),
+            PanelAction::OpenStashHtml(0)
+        );
+        // The queue row sits AFTER the stash segment.
+        assert_eq!(
+            agent_panel_action(4, &agents, sl, ql, Key::Enter),
+            PanelAction::OpenQueueItem(0)
+        );
+        // +/- are queue-only; inert on a stash row.
+        assert_eq!(
+            agent_panel_action(3, &agents, sl, ql, Key::Plus),
+            PanelAction::None
+        );
+        // Down from the LAST row (the queue row) crosses into the log.
+        assert_eq!(
+            agent_panel_action(4, &agents, sl, ql, Key::Down),
+            PanelAction::EnterLog
+        );
+    }
+
+    #[test]
+    fn rebind_panel_sel_follows_a_stash_row_by_name() {
+        use crate::cli::status::{QueueItemView, StashItemView};
+        let st = |stem: &str| StashItemView {
+            stem: stem.to_string(),
+            waiting_for: None,
+            ready: false,
+            commits: 1,
+        };
+        let q = |name: &str| QueueItemView {
+            priority: 500,
+            name: name.to_string(),
+        };
+        let stash = [st("a"), st("b")];
+        let queue = [q("x")];
+        // Cursor on stash "b" (sel 4 = 2 agents + add + idx 1) follows it.
+        assert_eq!(rebind_panel_sel(4, Some("b"), None, 2, &stash, &queue), 4);
+        // A queue selection offsets past the stash segment.
+        assert_eq!(rebind_panel_sel(5, None, Some("x"), 2, &stash, &queue), 5);
+        // Vanished stash item → "+ add".
+        assert_eq!(
+            rebind_panel_sel(4, Some("gone"), None, 2, &stash, &queue),
+            2
         );
     }
 
@@ -914,14 +992,14 @@ mod tests {
         // nudge re-sorted the queue so "b" is now FIRST — the cursor
         // follows it to sel 3, never snapping back to "+ add".
         let new_queue = [q(100, "b"), q(500, "a")];
-        assert_eq!(rebind_panel_sel(4, Some("b"), 2, &new_queue), 3);
+        assert_eq!(rebind_panel_sel(4, None, Some("b"), 2, &[], &new_queue), 3);
         // The item left the queue (promoted/removed) → "+ add" row.
         let without_b = [q(500, "a")];
-        assert_eq!(rebind_panel_sel(4, Some("b"), 2, &without_b), 2);
+        assert_eq!(rebind_panel_sel(4, None, Some("b"), 2, &[], &without_b), 2);
         // A non-queue cursor keeps the old clamp semantics.
-        assert_eq!(rebind_panel_sel(1, None, 2, &new_queue), 1);
+        assert_eq!(rebind_panel_sel(1, None, None, 2, &[], &new_queue), 1);
         assert_eq!(
-            rebind_panel_sel(9, None, 2, &new_queue),
+            rebind_panel_sel(9, None, None, 2, &[], &new_queue),
             2,
             "clamped to +add"
         );

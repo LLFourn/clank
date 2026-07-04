@@ -57,7 +57,7 @@ fn repo_with_inflight_foo() -> TestEnv {
     env
 }
 
-fn shelve_args(env: &TestEnv, to_queue: bool, waiting_for: Option<&str>) -> clank::cli::ShelveArgs {
+fn push_args(env: &TestEnv, to_queue: bool, waiting_for: Option<&str>) -> clank::cli::ShelveArgs {
     clank::cli::ShelveArgs {
         command: None,
         plan: Some("foo".into()),
@@ -81,7 +81,7 @@ fn shelve_protects_then_drops() {
     let env = repo_with_inflight_foo();
     let repo = env.repo();
 
-    block_on(clank::cli::shelve::run_shelve(shelve_args(
+    block_on(clank::cli::stash::run_shelve_alias(push_args(
         &env, false, None,
     )))
     .unwrap();
@@ -89,7 +89,7 @@ fn shelve_protects_then_drops() {
     // Protective ref exists.
     let refs = git_out(repo, &["show-ref"]);
     assert!(
-        refs.contains("refs/clank/shelved/foo"),
+        refs.contains("refs/clank/stash/foo"),
         "protective ref missing: {refs}"
     );
     // Branch history is clean of foo.
@@ -97,7 +97,7 @@ fn shelve_protects_then_drops() {
     assert!(!log.contains("[foo]"), "foo commits still on branch: {log}");
     assert!(log.contains("[misc] base"), "foreign work preserved");
     // State recorded; plan file gone from the worktree.
-    assert!(repo.join(".clank/shelved/foo.json").is_file());
+    assert!(repo.join(".clank/stash/foo.json").is_file());
     assert!(!repo.join(".clank/plans/foo.md").exists());
 }
 
@@ -107,15 +107,14 @@ fn git_gc_does_not_lose_shelved_work() {
     // shelved commits alive through a full gc.
     let env = repo_with_inflight_foo();
     let repo = env.repo();
-    block_on(clank::cli::shelve::run_shelve(shelve_args(
+    block_on(clank::cli::stash::run_shelve_alias(push_args(
         &env, false, None,
     )))
     .unwrap();
 
-    let state: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(repo.join(".clank/shelved/foo.json")).unwrap(),
-    )
-    .unwrap();
+    let state: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(repo.join(".clank/stash/foo.json")).unwrap())
+            .unwrap();
     let shas: Vec<String> = state["shas"]
         .as_array()
         .unwrap()
@@ -141,7 +140,7 @@ fn git_gc_does_not_lose_shelved_work() {
 fn unshelve_restores_and_resets_reviews() {
     let env = repo_with_inflight_foo();
     let repo = env.repo();
-    block_on(clank::cli::shelve::run_shelve(shelve_args(
+    block_on(clank::cli::stash::run_shelve_alias(push_args(
         &env, false, None,
     )))
     .unwrap();
@@ -150,10 +149,12 @@ fn unshelve_restores_and_resets_reviews() {
     write(repo, "src/other.rs", "// other\n");
     commit(repo, "[misc] other work");
 
-    block_on(clank::cli::shelve::run_unshelve(clank::cli::UnshelveArgs {
-        plan: "foo".into(),
-        repo: Some(repo.to_path_buf()),
-    }))
+    block_on(clank::cli::stash::run_unshelve_alias(
+        clank::cli::UnshelveArgs {
+            plan: "foo".into(),
+            repo: Some(repo.to_path_buf()),
+        },
+    ))
     .unwrap();
 
     // Plan file is back; commits replayed on top.
@@ -161,8 +162,8 @@ fn unshelve_restores_and_resets_reviews() {
     let log = git_out(repo, &["log", "--format=%s", "-4"]);
     assert!(log.contains("[foo] impl b"), "replayed commits: {log}");
     // Ref + state cleaned up.
-    assert!(!repo.join(".clank/shelved/foo.json").exists());
-    assert!(!git_out(repo, &["show-ref"]).contains("refs/clank/shelved/foo"));
+    assert!(!repo.join(".clank/stash/foo.json").exists());
+    assert!(!git_out(repo, &["show-ref"]).contains("refs/clank/stash/foo"));
 
     // Reviews reset by design: the snapshot sees foo active again.
     // (Master-only team → gate computes zero-reviewer Continued; the
@@ -195,7 +196,7 @@ fn interleaved_plan_refuses() {
     write(repo, "src/a.rs", "// a\n");
     commit(repo, "[foo] impl a");
 
-    let err = block_on(clank::cli::shelve::run_shelve(shelve_args(
+    let err = block_on(clank::cli::stash::run_shelve_alias(push_args(
         &env, false, None,
     )))
     .unwrap_err()
@@ -205,15 +206,15 @@ fn interleaved_plan_refuses() {
         "interleaved plan must refuse with the foreign-commit error; got: {err}"
     );
     // Nothing mutated: no ref, no state, branch intact.
-    assert!(!git_out(repo, &["show-ref"]).contains("refs/clank/shelved/foo"));
-    assert!(!repo.join(".clank/shelved/foo.json").exists());
+    assert!(!git_out(repo, &["show-ref"]).contains("refs/clank/stash/foo"));
+    assert!(!repo.join(".clank/stash/foo.json").exists());
 }
 
 #[test]
 fn to_queue_saves_body_and_sets_aside() {
     let env = repo_with_inflight_foo();
     let repo = env.repo();
-    block_on(clank::cli::shelve::run_shelve(shelve_args(
+    block_on(clank::cli::stash::run_shelve_alias(push_args(
         &env, true, None,
     )))
     .unwrap();
@@ -223,15 +224,15 @@ fn to_queue_saves_body_and_sets_aside() {
     assert_eq!(std::fs::read_to_string(&queued).unwrap(), "# foo\n");
     // Commits are STILL set aside restorably (strictly better than
     // the removed demote).
-    assert!(repo.join(".clank/shelved/foo.json").is_file());
-    assert!(git_out(repo, &["show-ref"]).contains("refs/clank/shelved/foo"));
+    assert!(repo.join(".clank/stash/foo.json").is_file());
+    assert!(git_out(repo, &["show-ref"]).contains("refs/clank/stash/foo"));
 }
 
 #[test]
 fn unshelve_refuses_when_plan_active_again() {
     let env = repo_with_inflight_foo();
     let repo = env.repo();
-    block_on(clank::cli::shelve::run_shelve(shelve_args(
+    block_on(clank::cli::stash::run_shelve_alias(push_args(
         &env, false, None,
     )))
     .unwrap();
@@ -240,22 +241,24 @@ fn unshelve_refuses_when_plan_active_again() {
     write(repo, ".clank/plans/foo.md", "# foo v2\n");
     commit(repo, "[foo] intro v2");
 
-    let err = block_on(clank::cli::shelve::run_unshelve(clank::cli::UnshelveArgs {
-        plan: "foo".into(),
-        repo: Some(repo.to_path_buf()),
-    }))
+    let err = block_on(clank::cli::stash::run_unshelve_alias(
+        clank::cli::UnshelveArgs {
+            plan: "foo".into(),
+            repo: Some(repo.to_path_buf()),
+        },
+    ))
     .unwrap_err()
     .to_string();
     assert!(err.contains("already active"), "got: {err}");
     // Fail-closed: shelved state untouched.
-    assert!(repo.join(".clank/shelved/foo.json").is_file());
+    assert!(repo.join(".clank/stash/foo.json").is_file());
 }
 
 #[test]
 fn conflicted_unshelve_leaves_ref_and_state_intact() {
     let env = repo_with_inflight_foo();
     let repo = env.repo();
-    block_on(clank::cli::shelve::run_shelve(shelve_args(
+    block_on(clank::cli::stash::run_shelve_alias(push_args(
         &env, false, None,
     )))
     .unwrap();
@@ -264,43 +267,59 @@ fn conflicted_unshelve_leaves_ref_and_state_intact() {
     write(repo, "src/a.rs", "// conflicting\n");
     commit(repo, "[misc] conflicting change");
 
-    let err = block_on(clank::cli::shelve::run_unshelve(clank::cli::UnshelveArgs {
-        plan: "foo".into(),
-        repo: Some(repo.to_path_buf()),
-    }))
+    let err = block_on(clank::cli::stash::run_unshelve_alias(
+        clank::cli::UnshelveArgs {
+            plan: "foo".into(),
+            repo: Some(repo.to_path_buf()),
+        },
+    ))
     .unwrap_err()
     .to_string();
     assert!(err.contains("cherry-pick"), "got: {err}");
     // Fail-closed: protective ref + state survive the conflict.
-    assert!(git_out(repo, &["show-ref"]).contains("refs/clank/shelved/foo"));
-    assert!(repo.join(".clank/shelved/foo.json").is_file());
+    assert!(git_out(repo, &["show-ref"]).contains("refs/clank/stash/foo"));
+    assert!(repo.join(".clank/stash/foo.json").is_file());
 }
 
 #[test]
 fn shelve_clean_discards_ref_and_state() {
     let env = repo_with_inflight_foo();
     let repo = env.repo();
-    block_on(clank::cli::shelve::run_shelve(shelve_args(
+    block_on(clank::cli::stash::run_shelve_alias(push_args(
         &env, false, None,
     )))
     .unwrap();
 
-    block_on(clank::cli::shelve::run_clean(clank::cli::ShelveCleanArgs {
-        plan: "foo".into(),
-        repo: Some(repo.to_path_buf()),
-        yes: true,
-    }))
+    // `shelve clean` alias routes to `stash drop`.
+    block_on(clank::cli::stash::run_shelve_alias(
+        clank::cli::ShelveArgs {
+            command: Some(clank::cli::ShelveCmd::Clean(clank::cli::ShelveCleanArgs {
+                plan: "foo".into(),
+                repo: Some(repo.to_path_buf()),
+                yes: true,
+            })),
+            plan: None,
+            repo: None,
+            waiting_for: None,
+            to_queue: false,
+            priority: None,
+            force: false,
+            dry: false,
+            yes: false,
+            allow_rewrite_protected: false,
+        },
+    ))
     .unwrap();
 
-    assert!(!repo.join(".clank/shelved/foo.json").exists());
-    assert!(!git_out(repo, &["show-ref"]).contains("refs/clank/shelved/foo"));
+    assert!(!repo.join(".clank/stash/foo.json").exists());
+    assert!(!git_out(repo, &["show-ref"]).contains("refs/clank/stash/foo"));
 }
 
 #[test]
-fn status_surfaces_shelved_with_for_nudge() {
+fn status_surfaces_stash_with_for_nudge() {
     let env = repo_with_inflight_foo();
     let repo = env.repo();
-    block_on(clank::cli::shelve::run_shelve(shelve_args(
+    block_on(clank::cli::stash::run_shelve_alias(push_args(
         &env,
         false,
         Some("bar"),
@@ -310,9 +329,12 @@ fn status_surfaces_shelved_with_for_nudge() {
     // Before bar exists: waiting, not ready.
     let snap = block_on(clank::cli::status::snapshot(repo, Some(env.home()))).unwrap();
     let json = snap.to_json();
-    assert_eq!(json["shelved"][0]["plan"], "foo");
-    assert_eq!(json["shelved"][0]["ready"], false);
-    assert!(snap.to_human().contains("shelved: foo (waiting on bar)"));
+    assert_eq!(json["stash"][0]["plan"], "foo");
+    assert_eq!(json["stash"][0]["ready"], false);
+    assert!(
+        snap.to_human()
+            .contains("stashed: foo · 3 commit(s) (waiting on bar)")
+    );
 
     // bar runs to finish (synthetic finalize).
     write(repo, ".clank/plans/bar.md", "# bar\n");
@@ -324,9 +346,9 @@ fn status_surfaces_shelved_with_for_nudge() {
 
     let snap = block_on(clank::cli::status::snapshot(repo, Some(env.home()))).unwrap();
     let json = snap.to_json();
-    assert_eq!(json["shelved"][0]["ready"], true, "nudge fires: {json}");
+    assert_eq!(json["stash"][0]["ready"], true, "nudge fires: {json}");
     assert!(
-        snap.to_human().contains("FINISHED; unshelve?"),
+        snap.to_human().contains("FINISHED; pop?"),
         "human nudge: {}",
         snap.to_human()
     );
@@ -342,22 +364,98 @@ fn rewrite_refusal_rolls_back_ref_and_state() {
     let env = repo_with_inflight_foo();
     let repo = env.repo();
 
-    let mut args = shelve_args(&env, false, None);
+    let mut args = push_args(&env, false, None);
     args.allow_rewrite_protected = false; // tests run on `main` → refusal
-    let err = block_on(clank::cli::shelve::run_shelve(args))
+    let err = block_on(clank::cli::stash::run_shelve_alias(args))
         .unwrap_err()
         .to_string();
     assert!(err.contains("protected branch"), "got: {err}");
 
     // Rolled back: no ref, no state, commits untouched.
-    assert!(!git_out(repo, &["show-ref"]).contains("refs/clank/shelved/foo"));
-    assert!(!repo.join(".clank/shelved/foo.json").exists());
+    assert!(!git_out(repo, &["show-ref"]).contains("refs/clank/stash/foo"));
+    assert!(!repo.join(".clank/stash/foo.json").exists());
     assert!(git_out(repo, &["log", "--format=%s"]).contains("[foo] impl b"));
 
     // And the retry path is clear: a corrected attempt succeeds.
-    block_on(clank::cli::shelve::run_shelve(shelve_args(
+    block_on(clank::cli::stash::run_shelve_alias(push_args(
         &env, false, None,
     )))
     .unwrap();
-    assert!(repo.join(".clank/shelved/foo.json").is_file());
+    assert!(repo.join(".clank/stash/foo.json").is_file());
+}
+
+#[test]
+fn legacy_shelved_record_pops_via_its_own_ref() {
+    // Read-both storage + THE REF-PATH CONTRACT (codex d633f87): a record
+    // from the shelve era lives at .clank/shelved/ with a
+    // refs/clank/shelved/ protective ref — pop must resolve it through
+    // the merged scan and use the RECORD'S OWN git_ref.
+    let env = repo_with_inflight_foo();
+    let repo = env.repo();
+    // Stash it with today's code (lands at the new paths)…
+    block_on(clank::cli::stash::run_shelve_alias(push_args(
+        &env, false, None,
+    )))
+    .unwrap();
+    // …then relocate record + ref to the LEGACY locations, simulating a
+    // pre-rename repo.
+    let record = std::fs::read_to_string(repo.join(".clank/stash/foo.json")).unwrap();
+    let legacy = record.replace("refs/clank/stash/foo", "refs/clank/shelved/foo");
+    let sha = git_out(repo, &["rev-parse", "refs/clank/stash/foo"])
+        .trim()
+        .to_string();
+    git(repo, &["update-ref", "refs/clank/shelved/foo", &sha]);
+    git(repo, &["update-ref", "-d", "refs/clank/stash/foo"]);
+    std::fs::remove_file(repo.join(".clank/stash/foo.json")).unwrap();
+    std::fs::create_dir_all(repo.join(".clank/shelved")).unwrap();
+    std::fs::write(repo.join(".clank/shelved/foo.json"), legacy).unwrap();
+
+    // The merged scan sees it…
+    let items = clank::cli::stash::scan_stash(repo);
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].0, "foo");
+    assert_eq!(items[0].1.git_ref, "refs/clank/shelved/foo");
+
+    // …and pop restores through the legacy ref, consuming both.
+    block_on(clank::cli::stash::run_unshelve_alias(
+        clank::cli::UnshelveArgs {
+            plan: "foo".into(),
+            repo: Some(repo.to_path_buf()),
+        },
+    ))
+    .unwrap();
+    assert!(repo.join(".clank/plans/foo.md").exists(), "plan restored");
+    assert!(!repo.join(".clank/shelved/foo.json").exists());
+    assert!(!git_out(repo, &["show-ref"]).contains("refs/clank/shelved/foo"));
+}
+
+#[test]
+fn stash_show_reads_the_body_from_the_protective_ref() {
+    // The stashed plan's file no longer exists on the branch — show must
+    // read it from the record's ref. In-process we assert the resolution
+    // path: the ref resolves and the body is present at plans/<stem>.md
+    // in its tree (run_show prints; the read path is what we pin).
+    let env = repo_with_inflight_foo();
+    let repo = env.repo();
+    block_on(clank::cli::stash::run_shelve_alias(push_args(
+        &env, false, None,
+    )))
+    .unwrap();
+    assert!(
+        !repo.join(".clank/plans/foo.md").exists(),
+        "plan file left the branch"
+    );
+    let items = clank::cli::stash::scan_stash(repo);
+    let (stem, record) = &items[0];
+    let body = git_out(
+        repo,
+        &[
+            "show",
+            &format!("{}:.clank/plans/{stem}.md", record.git_ref),
+        ],
+    );
+    assert!(
+        body.contains("# foo"),
+        "body lives in the ref's tree: {body}"
+    );
 }

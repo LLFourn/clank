@@ -46,17 +46,22 @@ enum Command {
     /// Launch the configured editor on a plan or commit-range
     /// diff. See `clank diff --help` for argument shapes.
     Diff(cli::DiffArgs),
-    /// Set an in-flight plan's commits aside (kept restorable on a
-    /// protective ref) and clean them off the branch. `--to-queue`
-    /// also saves the plan body back to the queue for re-attempt
+    /// Set an in-flight plan's commits aside and restore them later,
+    /// with git-stash verbs: `stash push` / `stash pop` / `stash show`
+    /// / `stash drop`; bare `clank stash` lists. `push --to-queue`
+    /// also saves the plan body back to the queue for re-attempt.
+    Stash(cli::StashArgs),
+    /// Hidden alias for `clank stash push` (+ `shelve clean` →
+    /// `stash drop`). One release of back-compat.
+    #[command(hide = true)]
     Shelve(cli::ShelveArgs),
     /// Create a linked worktree with the whole team's sessions
     /// forked into it (opens a tab when inside zellij)
     Fork(cli::ForkArgs),
     /// Run the multi-agent review loop against a GitHub PR.
     PrReview(cli::PrReviewArgs),
-    /// Restore a shelved plan: replay its commits onto HEAD.
-    /// Reviews reset (the replayed commits are re-reviewed)
+    /// Hidden alias for `clank stash pop`. One release of back-compat.
+    #[command(hide = true)]
     Unshelve(cli::UnshelveArgs),
     /// Print a chronological timeline of commits and reviews for
     /// a plan.
@@ -130,11 +135,9 @@ async fn main() -> anyhow::Result<()> {
         Command::Export(args) => cli::export::run(args).await,
         Command::Purge(args) => cli::purge::run(args).await,
         Command::Diff(args) => cli::diff::run(args).await,
-        Command::Shelve(args) => match args.command {
-            Some(cli::ShelveCmd::Clean(clean)) => cli::shelve::run_clean(clean).await,
-            None => cli::shelve::run_shelve(args).await,
-        },
-        Command::Unshelve(args) => cli::shelve::run_unshelve(args).await,
+        Command::Stash(args) => cli::stash::run(args).await,
+        Command::Shelve(args) => cli::stash::run_shelve_alias(args).await,
+        Command::Unshelve(args) => cli::stash::run_unshelve_alias(args).await,
         Command::Fork(args) => cli::fork::run(args).await,
         Command::PrReview(args) => cli::pr_review::run(args).await,
         Command::Log(args) => cli::log::run(args).await,
@@ -233,6 +236,21 @@ mod tests {
                 };
                 assert_eq!(plan, None);
                 assert_eq!(commit.as_deref(), Some("abc123"));
+            }
+            _ => panic!("expected html command"),
+        }
+
+        // Stash target -> `open --stash <name>`.
+        match parse(html_open_argv(
+            Path::new("/r"),
+            HtmlOpenTarget::Stash("parked"),
+            false,
+        )) {
+            Command::Html(h) => {
+                let Some(HtmlCmd::Open(HtmlOpenArgs { stash, .. })) = h.command else {
+                    panic!("expected html open");
+                };
+                assert_eq!(stash.as_deref(), Some("parked"));
             }
             _ => panic!("expected html command"),
         }

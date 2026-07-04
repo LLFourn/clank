@@ -164,6 +164,8 @@ fn open_target_label(args: &crate::cli::HtmlOpenArgs) -> String {
         format!("plan {plan}")
     } else if let Some(name) = &args.queue {
         format!("queued plan {name}")
+    } else if let Some(name) = &args.stash {
+        format!("stashed plan {name}")
     } else {
         "the report".to_string()
     }
@@ -237,6 +239,15 @@ async fn resolve_open_target_path(
         }
         return Ok(out_dir.join(format!("queue/{name}.html")));
     }
+    if let Some(name) = args.stash.as_deref() {
+        let known = crate::cli::stash::scan_stash(repo)
+            .into_iter()
+            .any(|(stem, _)| stem == name);
+        if !known {
+            anyhow::bail!("`{name}` is not stashed (see `clank stash`)");
+        }
+        return Ok(out_dir.join(format!("stash/{name}.html")));
+    }
     match args.plan.as_deref() {
         Some(raw) => {
             let state =
@@ -258,6 +269,7 @@ pub enum HtmlOpenTarget<'a> {
     Plan(&'a str),
     Commit(&'a str),
     Queue(&'a str),
+    Stash(&'a str),
 }
 
 /// Build the argv (after the program name) the TUI spawns to open a
@@ -288,6 +300,10 @@ pub fn html_open_argv(repo: &Path, target: HtmlOpenTarget, rebuild: bool) -> Vec
         }
         HtmlOpenTarget::Queue(name) => {
             argv.push("--queue".to_string());
+            argv.push(name.to_string());
+        }
+        HtmlOpenTarget::Stash(name) => {
+            argv.push("--stash".to_string());
             argv.push(name.to_string());
         }
     }
@@ -392,6 +408,35 @@ async fn build_site(
     // skip the full fold.
     write_events_cache(out_dir, &events)?;
 
+    // Stash pages — same always-rebuild policy as queue pages (the stash
+    // changes without branch commits; wiping drops pages for popped/
+    // dropped items). The body comes from THE RECORD'S OWN protective ref
+    // (the ref-path contract) and the commits are listed inline — they
+    // are off the branch, so no commit pages exist to link.
+    let stash_items = crate::cli::stash::scan_stash(repo);
+    let stash_out = out_dir.join("stash");
+    let _ = std::fs::remove_dir_all(&stash_out);
+    std::fs::create_dir_all(&stash_out)?;
+    for (stem, record) in &stash_items {
+        let body = crate::git_io::resolve_commit(repo, &record.git_ref)
+            .and_then(|tip| {
+                let rel = crate::init_facts::plan_md_rel(stem);
+                crate::git_io::show_blob(repo, &tip, Path::new(&rel)).ok()
+            })
+            .unwrap_or_default();
+        let commits: Vec<(String, String)> = record
+            .shas
+            .iter()
+            .filter_map(|sha| {
+                let key = crate::lifecycle::CommitSha::parse(sha).ok()?;
+                let subject = crate::git_io::commit_subject_at(repo, &key).unwrap_or_default();
+                Some((sha[..7.min(sha.len())].to_string(), subject))
+            })
+            .collect();
+        let page = render_stash_page(stem, record.waiting_for.as_deref(), &commits, &body);
+        std::fs::write(stash_out.join(format!("{stem}.html")), page)?;
+    }
+
     // Queue pages — always fully re-rendered: the queue changes without
     // commits (add/remove/promote/reprioritise), the files are few and
     // cheap, and wiping the dir first drops pages for items that left
@@ -412,6 +457,7 @@ async fn build_site(
     let head_str = head_sha.as_ref().map(|s| s.as_str());
     let index_html = render_index(
         &status,
+        &stash_items,
         &queue_entries,
         &events,
         &reviews,
@@ -1000,6 +1046,7 @@ fn collect_reviews(repo: &Path, shas: &[CommitSha]) -> BTreeMap<String, Vec<Revi
 
 fn render_index(
     status: &StatusSnapshot,
+    stash: &[(String, crate::cli::stash::StashRecord)],
     queue: &[crate::cli::queue::QueueEntry],
     events: &[LogEvent],
     reviews: &BTreeMap<String, Vec<Review>>,
@@ -1053,6 +1100,24 @@ fn render_index(
         ));
     } else {
         out.push_str("  <div class=\"empty\">No active plans — repo is idle.</div>\n");
+    }
+    // STASH block — above the queue: stashed plans have COMMITS, making
+    // them nearer to live work than queued ideas. Each links to its page;
+    // omitted entirely when empty.
+    if !stash.is_empty() {
+        out.push_str("  <div class=\"stash\">stash:\n    <ul>\n");
+        for (stem, record) in stash {
+            let note = match &record.waiting_for {
+                Some(w) => format!(" · waiting on {}", esc(w)),
+                None => String::new(),
+            };
+            out.push_str(&format!(
+                "      <li><a class=\"plan-pill\" href=\"stash/{stem}.html\">{stem}</a> <code>{n} commit(s)</code>{note}</li>\n",
+                stem = esc(stem),
+                n = record.shas.len(),
+            ));
+        }
+        out.push_str("    </ul>\n  </div>\n");
     }
     // QUEUE block — the queued plans by priority, each linking to its
     // page. Omitted entirely when the queue is empty (no empty header).
@@ -1451,6 +1516,53 @@ fn render_queue_page(name: &str, priority: u16, body: &str) -> String {
     out.push_str(&render_markdown(body));
     out.push_str("  </article>\n");
     out.push_str("</section>\n");
+    out.push_str("</main>\n");
+    write_doc_close(&mut out);
+    out
+}
+
+/// A stashed plan's page: name + commit list (inline — the commits are
+/// off the branch, so no commit pages exist to link) + the plan body
+/// read from the record's protective ref.
+fn render_stash_page(
+    name: &str,
+    waiting_for: Option<&str>,
+    commits: &[(String, String)],
+    body: &str,
+) -> String {
+    let mut out = String::new();
+    write_doc_open(&mut out, &format!("stashed {name} · clank"), "..");
+    out.push_str("<header class=\"plan-header\">\n");
+    out.push_str("  <p class=\"crumb\"><a href=\"../index.html\">← timeline</a></p>\n");
+    out.push_str(&format!(
+        "  <h1><span class=\"plan-pill\">{}</span></h1>\n",
+        esc(name)
+    ));
+    let state_line = match waiting_for {
+        Some(w) => format!(
+            "stashed · {} commit(s) · waiting on {}",
+            commits.len(),
+            esc(w)
+        ),
+        None => format!("stashed · {} commit(s)", commits.len()),
+    };
+    out.push_str(&format!("  <div class=\"plan-state\">{state_line}</div>\n"));
+    out.push_str("</header>\n");
+    out.push_str("<main>\n");
+    out.push_str("<h2>Stashed commits</h2>\n<ul>\n");
+    for (short, subject) in commits {
+        out.push_str(&format!(
+            "  <li><code>{}</code> {}</li>\n",
+            esc(short),
+            esc(subject)
+        ));
+    }
+    out.push_str("</ul>\n");
+    if !body.is_empty() {
+        out.push_str("<section class=\"plan-body\">\n  <article class=\"md\">\n");
+        out.push_str(&render_markdown(body));
+        out.push_str("  </article>\n</section>\n");
+    }
     out.push_str("</main>\n");
     write_doc_close(&mut out);
     out
@@ -2352,6 +2464,68 @@ mod tests {
     }
 
     #[test]
+    fn render_stash_page_shows_commits_and_body() {
+        let html = render_stash_page(
+            "parked",
+            Some("dep"),
+            &[("abc1234".into(), "[parked] intro".into())],
+            "# parked\n\nwhy it exists\n",
+        );
+        assert!(html.contains("stashed · 1 commit(s) · waiting on dep"));
+        assert!(html.contains("abc1234") && html.contains("[parked] intro"));
+        assert!(html.contains("why it exists"));
+        assert!(html.contains("../index.html"), "crumb back");
+    }
+
+    #[test]
+    fn render_index_stash_block_sits_above_the_queue_block() {
+        use crate::cli::queue::QueueEntry;
+        use crate::cli::stash::StashRecord;
+        let status = crate::cli::status_tui::fixtures::snap(vec![], vec![]);
+        let empty_events: Vec<LogEvent> = Vec::new();
+        let reviews = BTreeMap::new();
+        let subjects = BTreeMap::new();
+        let stash = vec![(
+            "parked".to_string(),
+            StashRecord {
+                shas: vec!["a".repeat(40)],
+                git_ref: "refs/clank/stash/parked".into(),
+                waiting_for: None,
+            },
+        )];
+        let queue = vec![QueueEntry {
+            priority: 500,
+            name: "queued-idea".into(),
+            path: "/x/.clank/queue/500-queued-idea.md".into(),
+        }];
+        let html = render_index(
+            &status,
+            &stash,
+            &queue,
+            &empty_events,
+            &reviews,
+            &subjects,
+            None,
+        );
+        assert!(html.contains("stash/parked.html"), "stash item links");
+        let s_pos = html.find("stash/parked.html").unwrap();
+        let q_pos = html.find("queue/queued-idea.html").unwrap();
+        assert!(s_pos < q_pos, "STASH block above QUEUE block");
+
+        // Empty stash: no block.
+        let html = render_index(
+            &status,
+            &[],
+            &queue,
+            &empty_events,
+            &reviews,
+            &subjects,
+            None,
+        );
+        assert!(!html.contains("class=\"stash\""), "no empty stash block");
+    }
+
+    #[test]
     fn render_index_queue_block_lists_by_priority_and_hides_when_empty() {
         use crate::cli::queue::QueueEntry;
         let status = crate::cli::status_tui::fixtures::snap(vec![], vec![]);
@@ -2372,7 +2546,15 @@ mod tests {
                 path: "/x/.clank/queue/800-later-idea.md".into(),
             },
         ];
-        let html = render_index(&status, &queue, &empty_events, &reviews, &subjects, None);
+        let html = render_index(
+            &status,
+            &[],
+            &queue,
+            &empty_events,
+            &reviews,
+            &subjects,
+            None,
+        );
         assert!(
             html.contains("queue/urgent-fix.html"),
             "item links to its page"
@@ -2387,7 +2569,7 @@ mod tests {
         assert!(a < b, "priority order (lower NNN first)");
 
         // Empty queue: the block is omitted entirely (no empty header).
-        let html = render_index(&status, &[], &empty_events, &reviews, &subjects, None);
+        let html = render_index(&status, &[], &[], &empty_events, &reviews, &subjects, None);
         assert!(!html.contains("class=\"queue\""), "no empty queue block");
     }
 

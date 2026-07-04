@@ -588,7 +588,7 @@ pub fn working_tree_dirty_at(repo: &Path) -> Result<Option<DirtyStats>, GitIoErr
 
 /// `true` iff the working tree + index are clean — no tracked changes
 /// and no untracked files (the `git status --porcelain` empty test the
-/// `clank unfinish` / `shelve` / `open` / `purge` guards used).
+/// `clank unfinish` / `stash` / `open` / `purge` guards used).
 pub fn working_tree_clean(repo: &Path) -> Result<bool, GitIoError> {
     Ok(working_tree_status(repo)?.is_clean())
 }
