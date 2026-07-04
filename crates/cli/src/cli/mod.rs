@@ -27,6 +27,7 @@ pub mod init;
 pub mod log;
 pub mod open;
 pub mod open_zellij;
+pub mod pick;
 pub mod plan_resolve;
 pub mod pr_review;
 pub mod purge;
@@ -1137,6 +1138,25 @@ pub enum QueueCmd {
     /// Change a queued item's priority (renames its `NNN-` prefix).
     #[command(alias = "reprioritize")]
     Reprioritise(QueueReprioritiseArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct PickArgs {
+    /// Plan stem(s) to copy from `--from`. Replayed in SOURCE order
+    /// (their stacking order over there), regardless of argument order.
+    #[arg(required = true)]
+    pub plans: Vec<String>,
+    /// Branch (or any committish) to copy the plans FROM. Never
+    /// modified — `pick` is a copy, not a move.
+    #[arg(long, value_name = "COMMITTISH")]
+    pub from: String,
+    /// Repo root. Defaults to the cwd's git toplevel.
+    #[arg(long, value_name = "PATH")]
+    pub repo: Option<PathBuf>,
+    /// Print the resolved plan order and each plan's commits without
+    /// picking anything (the same computation the live run applies).
+    #[arg(long)]
+    pub dry: bool,
 }
 
 #[derive(Args, Debug)]

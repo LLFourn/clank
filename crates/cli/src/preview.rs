@@ -341,7 +341,7 @@ pub async fn build_rewrite_preview_all(
 /// Phase-2 cache loading is opportunistic: try the closest cached
 /// ancestor of `finalized_at` and fold-forward from there; fall
 /// back to a cold walk from root on miss.
-async fn re_fold_finished_plan_natives(
+pub(crate) async fn re_fold_finished_plan_natives(
     repo_root: &Path,
     plan_key: &PlanKey,
     finalized_at: &CommitSha,
@@ -378,6 +378,34 @@ async fn re_fold_finished_plan_natives(
         .unwrap_or_default();
     native.insert(finalized_at.clone());
     Ok(native)
+}
+
+/// Fold an arbitrary TIP's first-parent history into a `RepoState` —
+/// the fold-anywhere primitive `clank pick` uses to read another
+/// branch's plans without checking it out. Same cache-anchor + forward
+/// fold the finished-plan natives re-derivation uses; `head` is set to
+/// the tip so downstream consumers see a coherent state.
+pub(crate) async fn fold_at_tip(
+    repo_root: &Path,
+    tip: &CommitSha,
+) -> Result<RepoState, PreviewError> {
+    use crate::disk_snapshot::{CommitEvent, apply_commit};
+    let git = crate::git_io::open(repo_root)?;
+    let metas = git.first_parent_commits_to(tip)?;
+    let end = metas.len();
+    let (mut state, start_idx) = pick_cache_anchor(repo_root, &metas, end).await?;
+    for meta in &metas[start_idx..end] {
+        let changes = git.diff_tree_changes(&meta.sha)?;
+        let event = CommitEvent {
+            commit: meta.sha.clone(),
+            author_ts: meta.author_ts,
+            subject: meta.subject.clone(),
+            changes,
+        };
+        apply_commit(&mut state, &event);
+    }
+    state.head = Some(tip.clone());
+    Ok(state)
 }
 
 /// Most-recent cached `RepoState` whose head is an ancestor of

@@ -39,6 +39,10 @@ enum Command {
     Export(cli::ExportArgs),
     /// Strip a plan's `.clank/` artifacts from history.
     Purge(cli::PurgeArgs),
+    /// Copy plans (their commits + plan files) from another branch onto
+    /// the current one. The source is never modified; run it where you
+    /// want the plans to land.
+    Pick(cli::PickArgs),
     /// Launch the configured editor on a plan or commit-range
     /// diff. See `clank diff --help` for argument shapes.
     Diff(cli::DiffArgs),
@@ -120,6 +124,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Finish(args) => cli::finish::run(args).await,
         Command::Unfinish(args) => cli::unfinish::run(args).await,
         Command::Queue(args) => cli::queue::run(args).await,
+        Command::Pick(args) => cli::pick::run(args).await,
         Command::Agent(args) => cli::agent::run(args).await,
         Command::Team(args) => cli::team::run(args).await,
         Command::Export(args) => cli::export::run(args).await,

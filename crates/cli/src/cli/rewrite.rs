@@ -778,7 +778,7 @@ async fn apply_squash(
     git_plumbing::squash_commit(repo, src, &new_tree, intro_parent, message)
 }
 
-fn working_tree_dirty(repo: &Path) -> anyhow::Result<bool> {
+pub(crate) fn working_tree_dirty(repo: &Path) -> anyhow::Result<bool> {
     let status = crate::git_io::working_tree_status(repo)?;
     // Clank's OWN untracked scratch under `.clank/` (cache, agent
     // configs, queue, a freshly-written `.gitignore`, …) is local

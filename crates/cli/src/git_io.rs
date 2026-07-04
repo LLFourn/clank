@@ -1149,6 +1149,35 @@ pub fn first_parent_commits_between(
     first_parent_walk(&repo, Some(base_oid), tip_oid, CONTEXT)
 }
 
+/// Merge base of `a` and `b` — `None` when the histories are unrelated.
+pub fn merge_base_at(
+    repo: &Path,
+    a: &CommitSha,
+    b: &CommitSha,
+) -> Result<Option<CommitSha>, GitIoError> {
+    const CONTEXT: &str = "merge_base_at";
+    let r = gix::open(repo).map_err(|e| GitIoError::NonZero {
+        context: CONTEXT.into(),
+        code: None,
+        stderr: format!("gix open: {e}"),
+    })?;
+    let parse = |sha: &CommitSha| {
+        gix::ObjectId::from_hex(sha.as_str().as_bytes()).map_err(|e| GitIoError::Parse {
+            context: CONTEXT.into(),
+            detail: format!("oid hex: {e}"),
+        })
+    };
+    match r.merge_base(parse(a)?, parse(b)?) {
+        Ok(id) => Ok(Some(parse_sha(CONTEXT, &id.detach().to_string())?)),
+        Err(gix::repository::merge_base::Error::NotFound { .. }) => Ok(None),
+        Err(e) => Err(GitIoError::NonZero {
+            context: CONTEXT.into(),
+            code: None,
+            stderr: format!("merge_base: {e}"),
+        }),
+    }
+}
+
 /// [`Repo::parent_of`] opening its own handle.
 pub fn parent_of_at(repo: &Path, sha: &CommitSha) -> Result<Option<CommitSha>, GitIoError> {
     open(repo)?.parent_of(sha)
