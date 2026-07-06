@@ -998,23 +998,48 @@ fn verdict_color(verdict: clank_core::vocab::Verdict) -> &'static str {
 /// feedback body. Records the first line of each reviewer's block by
 /// author so the review-focus scroll lands on the SAME lines the view
 /// windows (no second function re-deriving positions that could drift).
+/// Truncate a path to `max` display chars keeping the FILENAME (the
+/// discriminating end) — `crates/…/render.rs`, never `crates/cli/s…`.
+fn middle_truncate_path(path: &str, max: usize) -> String {
+    if path.chars().count() <= max {
+        return path.to_string();
+    }
+    let file = path.rsplit('/').next().unwrap_or(path);
+    let keep_head = max.saturating_sub(file.chars().count() + 2);
+    let head: String = path.chars().take(keep_head).collect();
+    format!("{head}…/{file}")
+}
+
 pub(super) struct CommitLayout {
     pub(super) lines: Vec<String>,
     /// First content line (the verdict-mark row) of each reviewer's block.
     pub(super) review_line: std::collections::BTreeMap<String, usize>,
 }
 
-pub(super) fn build_commit_lines(
-    short_sha: &str,
-    subject: &str,
-    body: &str,
-    reviews: &[(String, clank_core::vocab::Verdict, String)],
-    cols: usize,
-) -> CommitLayout {
+/// Everything the commit overlay renders, borrowed from
+/// [`super::CommitDetail`] — ONE bundle so the layout builder, the
+/// windowing renderer, and the review-offset derivation can't drift
+/// apart in their inputs.
+pub(super) struct CommitDoc<'a> {
+    pub(super) short_sha: &'a str,
+    pub(super) subject: &'a str,
+    pub(super) body: &'a str,
+    pub(super) stats: &'a [crate::git_io::FileStat],
+    pub(super) reviews: &'a [(String, clank_core::vocab::Verdict, String)],
+}
+
+pub(super) fn build_commit_lines(doc: &CommitDoc<'_>, cols: usize) -> CommitLayout {
+    let CommitDoc {
+        short_sha,
+        subject,
+        body,
+        stats,
+        reviews,
+    } = *doc;
     let mut lines: Vec<String> = Vec::new();
     let mut review_line = std::collections::BTreeMap::new();
     // The rule title is upper-cased, so keep the (lowercase) sha out of it
-    // and on the subject line with the message.
+    // and on its own line below.
     lines.push(region_rule(
         "commit",
         "↑↓ scroll · o browser · Esc back",
@@ -1022,10 +1047,10 @@ pub(super) fn build_commit_lines(
         cols,
     ));
     lines.push(String::new());
-    // WRAP the subject (don't truncate) so a long summary is fully readable:
-    // the sha leads the first line; continuations align under the subject.
-    let sha_prefix = format!("{short_sha}  ");
-    let gutter = display_width(&sha_prefix);
+    // The hash is IDENTITY, not content: its own dim line, so the title
+    // wraps flush-left at full width instead of hanging in a sha-wide
+    // gutter (tui-commit-overlay-stats, lloyd).
+    lines.push(emit(&[dim(short_sha.to_string())], "", cols));
     let subject_line: String = subject
         .lines()
         .next()
@@ -1033,21 +1058,42 @@ pub(super) fn build_commit_lines(
         .chars()
         .filter(|c| !c.is_control())
         .collect();
-    let wrapped = wrap(&subject_line, cols.saturating_sub(gutter).max(1));
-    if wrapped.is_empty() {
-        lines.push(emit(&[dim(sha_prefix.clone())], "", cols));
-    } else {
-        for (i, seg) in wrapped.into_iter().enumerate() {
-            if i == 0 {
-                lines.push(emit(&[dim(sha_prefix.clone()), plain(seg)], "", cols));
-            } else {
-                lines.push(emit(
-                    &[plain(format!("{}{}", " ".repeat(gutter), seg))],
-                    "",
-                    cols,
-                ));
-            }
+    for seg in wrap(&subject_line, cols.max(1)) {
+        lines.push(emit(&[plain(seg)], "", cols));
+    }
+    // The SHAPE of the change before the prose about it: per-file
+    // +/− (binary → `bin`), then a dim summary line.
+    if !stats.is_empty() {
+        lines.push(String::new());
+        let (mut ta, mut tr) = (0u64, 0u64);
+        for st in stats {
+            let counts = match (st.added, st.removed) {
+                (Some(a), Some(r)) => {
+                    ta += a;
+                    tr += r;
+                    vec![
+                        colored("32", format!("+{a}")),
+                        plain(" ".to_string()),
+                        colored("31", format!("−{r}")),
+                    ]
+                }
+                _ => vec![dim("bin".to_string())],
+            };
+            let count_width: usize = 12;
+            let path = middle_truncate_path(&st.path, cols.saturating_sub(count_width + 3).max(8));
+            let mut spans = vec![plain(format!("  {path}  "))];
+            spans.extend(counts);
+            lines.push(emit(&spans, "", cols));
         }
+        lines.push(emit(
+            &[dim(format!(
+                "  {} file{} · +{ta} −{tr}",
+                stats.len(),
+                if stats.len() == 1 { "" } else { "s" },
+            ))],
+            "",
+            cols,
+        ));
     }
     lines.push(String::new());
     for line in wrap(body, cols) {
@@ -1080,15 +1126,12 @@ pub(super) fn build_commit_lines(
 /// AND the TOTAL content height, so the loop clamps the scroll offset to
 /// the last page.
 pub(super) fn render_commit_detail(
-    short_sha: &str,
-    subject: &str,
-    body: &str,
-    reviews: &[(String, clank_core::vocab::Verdict, String)],
+    doc: &CommitDoc<'_>,
     offset: usize,
     rows: usize,
     cols: usize,
 ) -> (Vec<String>, usize) {
-    let layout = build_commit_lines(short_sha, subject, body, reviews, cols);
+    let layout = build_commit_lines(doc, cols);
     let total = layout.lines.len();
     let off = offset.min(total.saturating_sub(1));
     let windowed = layout.lines.into_iter().skip(off).take(rows).collect();
@@ -1099,15 +1142,8 @@ pub(super) fn render_commit_detail(
 /// of the commit-detail view (its block's first line), falling back to
 /// the topmost reviewer block, then 0. Derived from the SAME layout the
 /// view windows, so the focus can't drift from what's drawn.
-pub(super) fn commit_review_offset(
-    short_sha: &str,
-    subject: &str,
-    body: &str,
-    reviews: &[(String, clank_core::vocab::Verdict, String)],
-    author: &str,
-    cols: usize,
-) -> usize {
-    let layout = build_commit_lines(short_sha, subject, body, reviews, cols);
+pub(super) fn commit_review_offset(doc: &CommitDoc<'_>, author: &str, cols: usize) -> usize {
+    let layout = build_commit_lines(doc, cols);
     layout
         .review_line
         .get(author)
@@ -3044,6 +3080,22 @@ mod tests {
         assert_eq!(bar_emoji(&snap(vec![], vec![])), "💤");
     }
 
+    fn doc<'a>(
+        short_sha: &'a str,
+        subject: &'a str,
+        body: &'a str,
+        stats: &'a [crate::git_io::FileStat],
+        reviews: &'a [(String, clank_core::vocab::Verdict, String)],
+    ) -> CommitDoc<'a> {
+        CommitDoc {
+            short_sha,
+            subject,
+            body,
+            stats,
+            reviews,
+        }
+    }
+
     #[test]
     fn commit_detail_shows_message_and_each_reviewers_feedback() {
         use clank_core::vocab::Verdict;
@@ -3060,10 +3112,13 @@ mod tests {
             ),
         ];
         let (lines, total) = render_commit_detail(
-            "abc1234",
-            "do the thing",
-            "a longer body paragraph",
-            &reviews,
+            &doc(
+                "abc1234",
+                "do the thing",
+                "a longer body paragraph",
+                &[],
+                &reviews,
+            ),
             0,
             40,
             60,
@@ -3092,10 +3147,13 @@ mod tests {
 
         // Scrolling shifts the window — the heading is no longer line 0.
         let (scrolled, _) = render_commit_detail(
-            "abc1234",
-            "do the thing",
-            "a longer body paragraph",
-            &reviews,
+            &doc(
+                "abc1234",
+                "do the thing",
+                "a longer body paragraph",
+                &[],
+                &reviews,
+            ),
             3,
             40,
             60,
@@ -3108,13 +3166,90 @@ mod tests {
     }
 
     #[test]
+    fn commit_detail_orders_hash_title_stats_body_reviews() {
+        use clank_core::vocab::Verdict;
+        let stats = vec![
+            crate::git_io::FileStat {
+                path: "src/lib.rs".into(),
+                added: Some(10),
+                removed: Some(2),
+            },
+            crate::git_io::FileStat {
+                path: "assets/logo.png".into(),
+                added: None,
+                removed: None,
+            },
+        ];
+        let reviews = vec![("codex".to_string(), Verdict::Continue, "lgtm".to_string())];
+        let layout = build_commit_lines(
+            &doc(
+                "abc123456789",
+                "do the thing",
+                "the body prose",
+                &stats,
+                &reviews,
+            ),
+            80,
+        );
+        let vis: Vec<String> = layout.lines.iter().map(|l| visible(l)).collect();
+        let pos = |needle: &str| {
+            vis.iter()
+                .position(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("`{needle}` missing: {vis:#?}"))
+        };
+        // The shape of the change BEFORE the prose about it.
+        let hash = pos("abc123456789");
+        let title = pos("do the thing");
+        let stat = pos("src/lib.rs");
+        let summary = pos("2 files · +10 −2");
+        let body = pos("the body prose");
+        let review = pos("codex");
+        assert!(hash < title, "hash above the title");
+        assert!(title < stat && stat < summary, "stats after the title");
+        assert!(summary < body, "stats BEFORE the message body");
+        assert!(body < review, "reviews last");
+        // Per-file counts + binary marker.
+        assert!(vis[stat].contains("+10") && vis[stat].contains("−2"));
+        assert!(vis[pos("assets/logo.png")].contains("bin"), "binary → bin");
+        // Reviewer-jump offsets derive from the SAME layout, so they
+        // land on the header row even with the stat block present.
+        let off = commit_review_offset(
+            &doc(
+                "abc123456789",
+                "do the thing",
+                "the body prose",
+                &stats,
+                &reviews,
+            ),
+            "codex",
+            80,
+        );
+        assert_eq!(off, layout.review_line["codex"]);
+        assert!(visible(&layout.lines[off]).contains("codex"));
+    }
+
+    #[test]
+    fn long_stat_paths_keep_the_filename() {
+        let long = "crates/cli/src/cli/status_tui/some/very/deep/nested/module/render_helpers.rs";
+        let t = middle_truncate_path(long, 30);
+        assert!(t.chars().count() <= 30, "{t}");
+        assert!(t.ends_with("render_helpers.rs"), "filename kept: {t}");
+        assert!(t.contains('…'), "visibly truncated: {t}");
+        assert_eq!(
+            middle_truncate_path("short.rs", 30),
+            "short.rs",
+            "short paths untouched"
+        );
+    }
+
+    #[test]
     fn commit_detail_wraps_a_long_subject_instead_of_truncating() {
         // A subject wider than the pane must WRAP across multiple lines with
         // every word readable — never truncated with an ellipsis.
         let subject =
             "[a-really-long-plan-name] make the thing work end to end without going off the screen";
         let cols = 40;
-        let (lines, _) = render_commit_detail("abc1234", subject, "", &[], 0, 40, cols);
+        let (lines, _) = render_commit_detail(&doc("abc1234", subject, "", &[], &[]), 0, 40, cols);
         let visibles: Vec<String> = lines.iter().map(|l| visible(l)).collect();
         let joined = visibles.join("\n");
         // Every word of the subject survives (nothing dropped to an
@@ -3122,13 +3257,27 @@ mod tests {
         for word in subject.split_whitespace() {
             assert!(joined.contains(word), "word `{word}` missing: {joined}");
         }
-        // The sha still leads the first subject line, and the subject spilled
-        // onto more than one line (i.e. it actually wrapped).
+        // The hash sits on its OWN line ABOVE the title — the title is
+        // never indented by a sha gutter (tui-commit-overlay-stats).
         let sha_line = visibles
             .iter()
             .position(|l| l.contains("abc1234"))
             .expect("sha line present");
-        assert!(visibles[sha_line].contains("[a-really-long-plan-name]"));
+        assert_eq!(
+            visibles[sha_line].trim(),
+            "abc1234",
+            "hash line carries only the hash"
+        );
+        let title_line = visibles
+            .iter()
+            .position(|l| l.contains("[a-really-long-plan-name]"))
+            .expect("title present");
+        assert!(title_line > sha_line, "title below the hash");
+        assert!(
+            visibles[title_line].starts_with("[a-really-long-plan-name]"),
+            "title flush-left, no gutter: {:?}",
+            visibles[title_line]
+        );
         let last_word_line = visibles
             .iter()
             .position(|l| l.contains("screen"))
@@ -3162,7 +3311,10 @@ mod tests {
             ),
         ];
         let cols = 60;
-        let layout = build_commit_lines("abc1234", "subject", "the message body", &reviews, cols);
+        let layout = build_commit_lines(
+            &doc("abc1234", "subject", "the message body", &[], &reviews),
+            cols,
+        );
         // Each recorded line is that reviewer's header (verdict-mark) row —
         // the SAME lines the view windows, so the focus can't drift.
         for (author, _, _) in &reviews {
@@ -3175,24 +3327,21 @@ mod tests {
         // A known author → its block; an unknown author → the topmost
         // block; no reviews → 0.
         let z = commit_review_offset(
-            "abc1234",
-            "subject",
-            "the message body",
-            &reviews,
+            &doc("abc1234", "subject", "the message body", &[], &reviews),
             "zzz",
             cols,
         );
         assert_eq!(z, layout.review_line["zzz"]);
         let ghost = commit_review_offset(
-            "abc1234",
-            "subject",
-            "the message body",
-            &reviews,
+            &doc("abc1234", "subject", "the message body", &[], &reviews),
             "ghost",
             cols,
         );
         assert_eq!(ghost, *layout.review_line.values().min().unwrap());
-        assert_eq!(commit_review_offset("abc1234", "s", "b", &[], "x", cols), 0);
+        assert_eq!(
+            commit_review_offset(&doc("abc1234", "s", "b", &[], &[]), "x", cols),
+            0
+        );
     }
 
     #[test]

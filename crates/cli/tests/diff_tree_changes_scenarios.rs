@@ -301,3 +301,54 @@ async fn finished_without_md_extension_ignored() {
     assert!(changes.plan_touches.is_empty());
     assert!(!changes.has_non_plan_code_changes);
 }
+
+// ── tui-commit-overlay-stats: commit_numstat ────────────────────
+
+#[tokio::test]
+async fn numstat_counts_lines_per_file_vs_first_parent() {
+    let dir = init_repo();
+    let repo = dir.path();
+    write(repo, "src/a.rs", "one\ntwo\nthree\n");
+    write(repo, "keep.txt", "kept\n");
+    commit(repo, "base");
+    write(repo, "src/a.rs", "one\nTWO\nthree\nfour\n"); // ~ +2 −1
+    write(repo, "src/new.rs", "fresh\nfile\n"); // +2 −0
+    std::fs::remove_file(repo.join("keep.txt")).unwrap(); // +0 −1
+    commit(repo, "change");
+
+    let stats = clank::git_io::commit_numstat_at(repo, &head_sha(repo)).unwrap();
+    let by_path: std::collections::BTreeMap<_, _> = stats
+        .iter()
+        .map(|s| (s.path.as_str(), (s.added, s.removed)))
+        .collect();
+    assert_eq!(by_path["src/a.rs"], (Some(2), Some(1)), "{stats:?}");
+    assert_eq!(by_path["src/new.rs"], (Some(2), Some(0)));
+    assert_eq!(by_path["keep.txt"], (Some(0), Some(1)));
+    // Untouched files never appear.
+    assert_eq!(stats.len(), 3, "{stats:?}");
+}
+
+#[tokio::test]
+async fn numstat_reports_binary_files_as_none_counts() {
+    let dir = init_repo();
+    let repo = dir.path();
+    write(repo, "readme.md", "text\n");
+    commit(repo, "base");
+    std::fs::write(repo.join("blob.bin"), [0u8, 1, 2, 3, 0, 255]).unwrap();
+    commit(repo, "add binary");
+
+    let stats = clank::git_io::commit_numstat_at(repo, &head_sha(repo)).unwrap();
+    let bin = stats.iter().find(|s| s.path == "blob.bin").unwrap();
+    assert_eq!((bin.added, bin.removed), (None, None), "git shows `-`");
+}
+
+#[tokio::test]
+async fn numstat_root_commit_diffs_against_the_empty_tree() {
+    let dir = init_repo();
+    let repo = dir.path();
+    write(repo, "a.txt", "l1\nl2\n");
+    commit(repo, "root");
+    let stats = clank::git_io::commit_numstat_at(repo, &head_sha(repo)).unwrap();
+    assert_eq!(stats.len(), 1);
+    assert_eq!((stats[0].added, stats[0].removed), (Some(2), Some(0)));
+}

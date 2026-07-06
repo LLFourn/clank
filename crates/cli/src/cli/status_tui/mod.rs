@@ -612,6 +612,9 @@ struct CommitDetail {
     body: String,
     /// `(author, verdict, full feedback body)` per reviewer.
     reviews: Vec<(String, clank_core::vocab::Verdict, String)>,
+    /// Per-file +/− counts vs first parent (display; empty when the
+    /// numstat read fails — the overlay still opens).
+    stats: Vec<crate::git_io::FileStat>,
 }
 
 /// What a full-window document overlay is showing. Each kind carries the
@@ -731,6 +734,17 @@ fn feedback_display_body(raw: &str) -> String {
 /// that file (the same per-agent file the log's review summaries come
 /// from). `None` if the commit can't be read; a missing feedback file
 /// degrades to an empty body.
+/// Borrow a [`CommitDetail`] as the render layer's [`render::CommitDoc`].
+fn commit_doc(d: &CommitDetail) -> render::CommitDoc<'_> {
+    render::CommitDoc {
+        short_sha: &d.short,
+        subject: &d.subject,
+        body: &d.body,
+        stats: &d.stats,
+        reviews: &d.reviews,
+    }
+}
+
 fn fetch_commit_detail(
     repo: &std::path::Path,
     sha: &crate::lifecycle::CommitSha,
@@ -759,9 +773,13 @@ fn fetch_commit_detail(
                 })
         })
         .unwrap_or_default();
+    // Stats degrade to empty on failure — the overlay still opens
+    // (subject/body/reviews are the load-bearing content).
+    let stats = crate::git_io::commit_numstat_at(repo, sha).unwrap_or_default();
     Some(CommitDetail {
         short: crate::cli::status::short_sha(sha.as_str()).to_string(),
         sha: sha.clone(),
+        stats,
         subject,
         body,
         reviews,
@@ -1025,10 +1043,7 @@ pub(crate) async fn run_tui(
             let overlay = detail.as_ref().unwrap();
             let (lines, total) = match &overlay.data {
                 OverlayData::Commit(d) => render_commit_detail(
-                    &d.short,
-                    &d.subject,
-                    &d.body,
-                    &d.reviews,
+                    &commit_doc(d),
                     overlay.offset,
                     rows as usize,
                     cols as usize,
@@ -1648,10 +1663,7 @@ pub(crate) async fn run_tui(
                                         if let Some(data) = fetch_commit_detail(&repo, &sha) {
                                             let offset = match &focus {
                                                 Some(author) => commit_review_offset(
-                                                    &data.short,
-                                                    &data.subject,
-                                                    &data.body,
-                                                    &data.reviews,
+                                                    &commit_doc(&data),
                                                     author,
                                                     cols as usize,
                                                 ),
@@ -2009,6 +2021,7 @@ pub(crate) mod tests {
     #[test]
     fn overlay_refresh_keeps_scroll_offset() {
         let data = |subject: &str| CommitDetail {
+            stats: Vec::new(),
             sha: crate::lifecycle::CommitSha::parse(&format!("{:0<40}", "abc")).unwrap(),
             short: "abc".into(),
             subject: subject.into(),

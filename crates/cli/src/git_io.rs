@@ -567,6 +567,121 @@ impl Repo {
         };
         diff_trees_changes(repo, parent_tree_owned.as_ref(), &this_tree, &context)
     }
+
+    /// Per-file `+/−` line counts for `sha` vs its FIRST parent (root
+    /// → empty tree), display-parity with `git show --numstat`:
+    /// renames follow content (git default 50% similarity), binary
+    /// files report `None` counts (git prints `-`), and the gix diff
+    /// may drift by a line from git's on pathological inputs — an
+    /// accepted display figure, same stance as [`working_tree_dirty`].
+    pub fn commit_numstat(&self, sha: &CommitSha) -> Result<Vec<FileStat>, GitIoError> {
+        let context = format!("commit_numstat {}", sha.as_str());
+        let repo = &self.0;
+        let oid =
+            gix::ObjectId::from_hex(sha.as_str().as_bytes()).map_err(|e| GitIoError::Parse {
+                context: context.clone(),
+                detail: format!("oid hex: {e}"),
+            })?;
+        let commit = repo
+            .find_commit(oid)
+            .map_err(|e| nonzero(context.clone(), format!("find_commit: {e}")))?;
+        let this_tree = commit
+            .tree()
+            .map_err(|e| nonzero(context.clone(), format!("commit.tree: {e}")))?;
+        let parent_tree = match commit.parent_ids().next() {
+            Some(p) => Some(
+                repo.find_commit(p.detach())
+                    .map_err(|e| nonzero(context.clone(), format!("parent find_commit: {e}")))?
+                    .tree()
+                    .map_err(|e| nonzero(context.clone(), format!("parent tree: {e}")))?,
+            ),
+            None => None,
+        };
+        let opts =
+            gix::diff::Options::default().with_rewrites(Some(gix::diff::Rewrites::default()));
+        let raw = repo
+            .diff_tree_to_tree(parent_tree.as_ref(), Some(&this_tree), opts)
+            .map_err(|e| nonzero(context.clone(), format!("diff_tree_to_tree: {e}")))?;
+
+        use gix::object::tree::diff::ChangeDetached as Ch;
+        let mut out = Vec::new();
+        for ch in raw {
+            // (path, old blob, new blob); trees/submodules skipped.
+            let (path, old_id, new_id) = match &ch {
+                Ch::Addition {
+                    location,
+                    entry_mode,
+                    id,
+                    ..
+                } if entry_mode.is_no_tree() => (location.to_string(), None, Some(*id)),
+                Ch::Deletion {
+                    location,
+                    entry_mode,
+                    id,
+                    ..
+                } if entry_mode.is_no_tree() => (location.to_string(), Some(*id), None),
+                Ch::Modification {
+                    location,
+                    entry_mode,
+                    previous_id,
+                    id,
+                    ..
+                } if entry_mode.is_no_tree() => {
+                    (location.to_string(), Some(*previous_id), Some(*id))
+                }
+                Ch::Rewrite {
+                    location,
+                    entry_mode,
+                    source_id,
+                    id,
+                    ..
+                } if entry_mode.is_no_tree() => (location.to_string(), Some(*source_id), Some(*id)),
+                _ => continue,
+            };
+            let old = old_id
+                .and_then(|id| repo.find_blob(id).ok().map(|b| b.data.clone()))
+                .unwrap_or_default();
+            let new = new_id
+                .and_then(|id| repo.find_blob(id).ok().map(|b| b.data.clone()))
+                .unwrap_or_default();
+            // Git's binary heuristic: a NUL in the first 8000 bytes.
+            let is_binary = |b: &[u8]| b.iter().take(8000).any(|x| *x == 0);
+            if is_binary(&old) || is_binary(&new) {
+                out.push(FileStat {
+                    path,
+                    added: None,
+                    removed: None,
+                });
+                continue;
+            }
+            use gix::diff::blob::{Algorithm, InternedInput, diff_with_slider_heuristics};
+            let input = InternedInput::new(old.as_slice(), new.as_slice());
+            let diff = diff_with_slider_heuristics(Algorithm::Histogram, &input);
+            out.push(FileStat {
+                path,
+                added: Some(u64::from(diff.count_additions())),
+                removed: Some(u64::from(diff.count_removals())),
+            });
+        }
+        // diff_tree_to_tree emits in tree-walk order already; sort by
+        // path for a stable display regardless of rename pairing.
+        out.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(out)
+    }
+}
+
+/// One file's `+/−` counts in a commit ([`Repo::commit_numstat`]).
+/// `None` counts = binary (git's `-`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileStat {
+    pub path: String,
+    pub added: Option<u64>,
+    pub removed: Option<u64>,
+}
+
+/// Standalone [`Repo::commit_numstat`] for one-shot callers.
+pub fn commit_numstat_at(repo: &Path, sha: &CommitSha) -> Result<Vec<FileStat>, GitIoError> {
+    open(repo)?.commit_numstat(sha)
 }
 
 /// Worktree dirt summary: +/− line counts vs HEAD (staged and
