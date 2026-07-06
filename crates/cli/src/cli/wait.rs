@@ -98,6 +98,18 @@ fn firings_from_items(items: &[WaitItem]) -> Vec<HookFiring> {
                     gate: None,
                     next: Some("fix-commit-tag".to_string()),
                 }),
+            // Multiple open plans proactively pull master back, like
+            // the tag correction: keyed to the plan in progress (the
+            // one whose flow the overlap interrupts).
+            WaitItem::MultiplePlansOpen {
+                in_progress, sha, ..
+            } => Some(HookFiring {
+                event: HookEvent::MasterWork,
+                plan: in_progress.clone(),
+                sha: sha.clone(),
+                gate: None,
+                next: Some("multiple-plans-open".to_string()),
+            }),
             WaitItem::Idle { .. }
             | WaitItem::AdHocReview { .. }
             | WaitItem::AdHocRevise { .. }
@@ -591,6 +603,12 @@ enum WaitJsonItem<'a> {
         untagged_touched: Vec<&'a str>,
         extra_named: Vec<&'a str>,
     },
+    #[serde(rename = "multiple_plans_open")]
+    MultiplePlansOpen {
+        in_progress: &'a str,
+        new_plans: Vec<&'a str>,
+        sha: &'a str,
+    },
     #[serde(rename = "promote_from_queue")]
     PromoteFromQueue { name: &'a str, priority: u16 },
     #[serde(rename = "blocked")]
@@ -666,6 +684,15 @@ fn render_json(item: &WaitItem) -> WaitJsonItem<'_> {
                 .map(|p| p.as_str())
                 .collect(),
             extra_named: violation.extra_named.iter().map(|p| p.as_str()).collect(),
+        },
+        WaitItem::MultiplePlansOpen {
+            in_progress,
+            new_plans,
+            sha,
+        } => WaitJsonItem::MultiplePlansOpen {
+            in_progress: in_progress.as_str(),
+            new_plans: new_plans.iter().map(|p| p.as_str()).collect(),
+            sha: sha.as_str(),
         },
         WaitItem::PromoteFromQueue { name, priority } => WaitJsonItem::PromoteFromQueue {
             name,
@@ -768,6 +795,25 @@ fn render_human(item: &WaitItem) -> String {
                 parts.join("; ")
             )
         }
+        WaitItem::MultiplePlansOpen {
+            in_progress,
+            new_plans,
+            sha,
+        } => {
+            let news: Vec<&str> = new_plans.iter().map(|p| p.as_str()).collect();
+            let remedies = multi_plan_open_remedies(in_progress.as_str(), &news)
+                .into_iter()
+                .map(|r| format!("    {r}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!(
+                "multiple-plans-open  {}  {} opened while `{}` is unfinished — resolve by ONE of:\n{}",
+                short(sha),
+                backtick_list(&news),
+                in_progress.as_str(),
+                remedies,
+            )
+        }
         WaitItem::PromoteFromQueue { name, priority } => {
             format!("promote  {name}  (priority {priority:03})")
         }
@@ -794,6 +840,57 @@ fn render_human(item: &WaitItem) -> String {
             format!("pr-review  #{pr}  round {round}  master: {next:?}")
         }
     }
+}
+
+fn backtick_list(names: &[&str]) -> String {
+    names
+        .iter()
+        .map(|n| format!("`{n}`"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The three numbered remedies for the multiple-open-plans warning
+/// (soft-disallow-multiple-plans). ONE source for both `clank wait`'s
+/// human render and the stop-hook nudge — the command ORDER is
+/// load-bearing: stash only takes the plan whose commits sit at the
+/// tip (`build_rewrite_preview` ranges intro..HEAD and foreign
+/// commits refuse unconditionally), so new plans push newest-first
+/// and the in-progress plan can only be pushed once they're gone.
+pub(crate) fn multi_plan_open_remedies(in_progress: &str, new_plans: &[&str]) -> Vec<String> {
+    // `new_plans` arrives intro-ordered (oldest first); the tip plan
+    // is the newest, so the push sequence reverses it.
+    let push_new = new_plans
+        .iter()
+        .rev()
+        .map(|n| format!("`clank stash push {n}`"))
+        .collect::<Vec<_>>()
+        .join(", then ");
+    // The plan to resume after the swap: the newest (the one whose
+    // commit tripped the warning).
+    let resume = new_plans.last().copied().unwrap_or("?");
+    let drop_new = new_plans
+        .iter()
+        .map(|n| format!("`clank purge --drop {n}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    vec![
+        format!(
+            "1. park `{in_progress}`, continue `{resume}`: {push_new}, then \
+             `clank stash push {in_progress} --for {resume}`, then \
+             `clank stash pop {resume}` (stash only takes the plan at the tip, \
+             so the new one goes first)"
+        ),
+        format!(
+            "2. finish `{in_progress}` first: {push_new}, reduce \
+             `{in_progress}`'s scope if needed, finish it, then \
+             `clank stash pop {resume}`"
+        ),
+        format!(
+            "3. fold the new work into `{in_progress}`: {drop_new} and roll the \
+             work into `{in_progress}`, widening its scope"
+        ),
+    ]
 }
 
 fn parse_timeout(raw: &str) -> anyhow::Result<Option<Duration>> {
@@ -1013,6 +1110,36 @@ mod tests {
         let line = render_human(&item).to_lowercase();
         assert!(line.contains("remove"), "offers removing the tag: {line}");
         assert!(line.contains("ad-hoc"), "names the ad-hoc case: {line}");
+    }
+
+    #[test]
+    fn multiple_plans_open_line_orders_the_stash_swap_correctly() {
+        // The command ORDER is the load-bearing part: stash only
+        // takes the tip plan, so the NEW plan's push must come before
+        // the in-progress plan's (soft-disallow-multiple-plans).
+        let item = WaitItem::MultiplePlansOpen {
+            in_progress: PlanKey::parse("old-plan").unwrap(),
+            new_plans: vec![PlanKey::parse("new-plan").unwrap()],
+            sha: sha("aaaa"),
+        };
+        let line = render_human(&item);
+        assert!(line.contains("multiple-plans-open"));
+        assert!(line.contains("`old-plan` is unfinished"), "{line}");
+        let push_new = line
+            .find("stash push new-plan")
+            .expect("remedy pushes the new plan");
+        let push_old = line
+            .find("stash push old-plan --for new-plan")
+            .expect("remedy pushes the in-progress plan with --for");
+        assert!(push_new < push_old, "new plan is stashed FIRST: {line}");
+        assert!(line.contains("stash pop new-plan"), "{line}");
+        for n in ["1.", "2.", "3."] {
+            assert!(line.contains(n), "all three remedies present: {line}");
+        }
+        assert!(
+            line.contains("purge --drop new-plan"),
+            "fold-in remedy drops the new plan: {line}"
+        );
     }
 
     // ── minimal-hint rendering (wfw-output-is-a-minimal-hint) ──
@@ -1236,6 +1363,20 @@ mod tests {
                     "pr": 7,
                     "round": 2,
                     "next": PrMasterNext::Submit,
+                }),
+            ),
+            (
+                serde_json::to_value(render_json(&WaitItem::MultiplePlansOpen {
+                    in_progress: PlanKey::parse("old").unwrap(),
+                    new_plans: vec![PlanKey::parse("new").unwrap()],
+                    sha: sha("abc"),
+                }))
+                .unwrap(),
+                serde_json::json!({
+                    "kind": "multiple_plans_open",
+                    "in_progress": "old",
+                    "new_plans": ["new"],
+                    "sha": sha("abc").as_str(),
                 }),
             ),
         ];

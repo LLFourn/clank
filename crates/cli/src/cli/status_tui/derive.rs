@@ -150,6 +150,10 @@ pub(super) fn awaited_reviewers(snap: &StatusSnapshot) -> Vec<&clank_core::ids::
         ad_hoc: Vec::new(),
         pr_reviews: snap.pr_reviews.clone(),
         head_correction: snap.head_correction.clone(),
+        // Irrelevant to the reviewer question: the multi-plan warning
+        // preempts MASTER items only — reviewer routing is untouched
+        // by design (soft-disallow-multiple-plans).
+        multi_plan_open: None,
     };
     let actionable = |l: &clank_core::ids::AgentLabel| work.is_actionable(l, Role::Reviewer);
     let mut out = Vec::new();

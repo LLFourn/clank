@@ -105,6 +105,20 @@ pub enum WaitItem {
         sha: CommitSha,
         violation: HeadTagViolation,
     },
+    /// ≥2 open plans at HEAD (soft-disallow-multiple-plans). Master's
+    /// next action is resolving the overlap — park one via stash,
+    /// finish the older, or fold the newer in. Current-state only:
+    /// history with overlapping plans is never warned about
+    /// retroactively. Blocked plans don't count (see
+    /// [`WorkStatus::multi_plan_open`]).
+    MultiplePlansOpen {
+        /// Oldest open plan by intro time — "the plan in progress".
+        in_progress: PlanKey,
+        /// Every other open plan, intro order — "the new plan(s)".
+        new_plans: Vec<PlanKey>,
+        /// HEAD, for display parity with `FixCommitTag`.
+        sha: CommitSha,
+    },
     PromoteFromQueue {
         name: String,
         priority: u16,
@@ -377,6 +391,16 @@ pub struct WorkStatus {
     /// (same computation) so status/TUI render the correction. Empty
     /// when no HEAD facts were supplied or the tag is valid.
     pub head_correction: Option<HeadCorrection>,
+    /// `Some` iff ≥2 open plans are NOT block-suppressed on an adopted
+    /// repo (soft-disallow-multiple-plans). Routes the master to a
+    /// `WaitItem::MultiplePlansOpen`, preempting its other items —
+    /// resolving the overlap IS the next action. Reviewers are NOT
+    /// silenced (the "soft" in soft-disallow): review flow continues.
+    /// Blocked plans are excluded from the count for gate agreement:
+    /// wait's promotion gate deliberately offers the queue while a
+    /// plan is blocked, so counting blocked plans would have wait
+    /// warn against its own advice.
+    pub multi_plan_open: Option<MultiPlanOpen>,
 }
 
 /// A HEAD commit-tag violation paired with the SHA to amend, ready to
@@ -385,6 +409,16 @@ pub struct WorkStatus {
 pub struct HeadCorrection {
     pub sha: CommitSha,
     pub violation: HeadTagViolation,
+}
+
+/// ≥2 open (non-blocked) plans on an adopted repo, ready to route to
+/// the master as `WaitItem::MultiplePlansOpen`
+/// (soft-disallow-multiple-plans).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MultiPlanOpen {
+    pub in_progress: PlanKey,
+    pub new_plans: Vec<PlanKey>,
+    pub sha: CommitSha,
 }
 
 #[derive(Debug, Clone)]
@@ -663,6 +697,32 @@ impl RepoState {
             _ => BTreeSet::new(),
         };
 
+        // Soft-disallow multiple open plans: ≥2 open plans that are
+        // not block-suppressed is a live problem at HEAD, whatever
+        // commit HEAD is. Gated on the same HEAD facts as the tag
+        // invariant (`None`/un-adopted → never police), and NEVER
+        // derived from history — overlap that already resolved is
+        // tolerated silently (soft-disallow-multiple-plans).
+        let multi_plan_open = head.filter(|h| h.adopted).and_then(|h| {
+            let mut open: Vec<(&PlanKey, i64)> = self
+                .plans
+                .iter()
+                .filter(|(k, _)| reviews.blocks_for(k).is_empty())
+                .map(|(k, ps)| (k, ps.commits.first().map_or(i64::MAX, |e| e.ts)))
+                .collect();
+            if open.len() < 2 {
+                return None;
+            }
+            // Oldest intro = "the plan in progress"; ts ties break
+            // by key so the split is deterministic.
+            open.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(b.0)));
+            Some(MultiPlanOpen {
+                in_progress: open[0].0.clone(),
+                new_plans: open[1..].iter().map(|&(k, _)| k.clone()).collect(),
+                sha: h.sha.clone(),
+            })
+        });
+
         let mut plans = Vec::new();
         {
             for (key, ps) in &self.plans {
@@ -916,6 +976,7 @@ impl RepoState {
             ad_hoc,
             pr_reviews,
             head_correction,
+            multi_plan_open,
         }
     }
 }
@@ -982,6 +1043,23 @@ impl WorkStatus {
                 }],
                 Role::Reviewer => Vec::new(),
             };
+        }
+
+        // Multiple open plans preempt the master's other items —
+        // resolving the overlap IS the next action; every remedy
+        // (stash-and-swap, finish the older, fold the newer in) goes
+        // through this one item. Reviewers are NOT silenced, unlike
+        // the tag correction: that's the "soft" in soft-disallow —
+        // the gate keeps flowing (stash/pop resets reviews anyway,
+        // and the fold-in remedy continues the existing gate).
+        if role == Role::Master
+            && let Some(mp) = &self.multi_plan_open
+        {
+            return vec![WaitItem::MultiplePlansOpen {
+                in_progress: mp.in_progress.clone(),
+                new_plans: mp.new_plans.clone(),
+                sha: mp.sha.clone(),
+            }];
         }
 
         let mut out = Vec::new();
@@ -1795,6 +1873,7 @@ mod tests {
             ad_hoc: Vec::new(),
             pr_reviews: Vec::new(),
             head_correction: None,
+            multi_plan_open: None,
         }
     }
 
@@ -2186,6 +2265,7 @@ mod tests {
             ad_hoc: Vec::new(),
             pr_reviews: vec![s],
             head_correction: None,
+            multi_plan_open: None,
         };
         assert_eq!(
             ws.work_for(&label("claude"), Role::Master),
@@ -2221,6 +2301,7 @@ mod tests {
                 missing_reviewers: missing.iter().map(|l| label(l)).collect(),
             }],
             head_correction: None,
+            multi_plan_open: None,
         }
     }
 
@@ -2378,6 +2459,150 @@ mod tests {
                 .work_for(&label("ruthless"), Role::Reviewer)
                 .is_empty()
         );
+    }
+
+    // ── soft-disallow-multiple-plans ────────────────────────────
+    //
+    // ≥2 open, non-blocked plans on an adopted repo route the master
+    // to a MultiplePlansOpen item (preempting its other items);
+    // reviewers keep flowing. Current-state only, never history.
+
+    /// One open plan with a single reviewable commit whose intro
+    /// timestamp is controllable (intro order decides which plan the
+    /// warning calls "in progress").
+    fn open_plan(ts: i64, commit_sha: CommitSha) -> PlanState {
+        use crate::repo_state::PlanTimelineEvent;
+        let mut ps = PlanState::default();
+        ps.commits.push(PlanTimelineEvent {
+            sha: commit_sha,
+            ts,
+            touched_plan: true,
+            touched_code: false,
+        });
+        ps
+    }
+
+    #[test]
+    fn two_open_plans_route_master_to_the_overlap_warning() {
+        let mut state = RepoState::default();
+        state.plans.insert(plan("old"), open_plan(1, sha("aaaa")));
+        state.plans.insert(plan("new"), open_plan(2, sha("bbbb")));
+        // Untagged pure-code HEAD: no tag violation, so the overlap
+        // warning is what routes.
+        let status = state.derive_status(
+            &MockReviews(vec![]),
+            &plan_policy(),
+            Some(&head("work", &[])),
+        );
+        let master = status.work_for(&label("lloyd"), Role::Master);
+        assert_eq!(master.len(), 1, "the warning preempts other master items");
+        let WaitItem::MultiplePlansOpen {
+            in_progress,
+            new_plans,
+            ..
+        } = &master[0]
+        else {
+            panic!("expected MultiplePlansOpen, got {:?}", master[0]);
+        };
+        assert_eq!(in_progress.as_str(), "old", "oldest intro is in progress");
+        assert_eq!(new_plans.len(), 1);
+        assert_eq!(new_plans[0].as_str(), "new");
+        // Reviewers are NOT silenced — the soft in soft-disallow.
+        let reviewer = status.work_for(&label("codex"), Role::Reviewer);
+        assert_eq!(reviewer.len(), 2, "review flow continues on both plans");
+    }
+
+    #[test]
+    fn single_open_plan_never_warns() {
+        let state = state_one_plan("real");
+        let status = state.derive_status(
+            &MockReviews(vec![]),
+            &plan_policy(),
+            Some(&head("[real] work", &[])),
+        );
+        assert!(status.multi_plan_open.is_none());
+        assert!(
+            !status
+                .work_for(&label("lloyd"), Role::Master)
+                .iter()
+                .any(|i| matches!(i, WaitItem::MultiplePlansOpen { .. }))
+        );
+    }
+
+    #[test]
+    fn broken_head_tag_preempts_the_overlap_warning() {
+        let mut state = RepoState::default();
+        state.plans.insert(plan("old"), open_plan(1, sha("aaaa")));
+        state.plans.insert(plan("new"), open_plan(2, sha("bbbb")));
+        // `[nope]` names no plan → tag correction. Both derived states
+        // exist; the correction routes first.
+        let status = state.derive_status(
+            &MockReviews(vec![]),
+            &plan_policy(),
+            Some(&head("[nope] work", &[])),
+        );
+        assert!(status.multi_plan_open.is_some(), "both states derived");
+        let master = status.work_for(&label("lloyd"), Role::Master);
+        assert_eq!(master.len(), 1);
+        assert!(
+            matches!(master[0], WaitItem::FixCommitTag { .. }),
+            "tag correction first — one amend may even remove the overlap"
+        );
+    }
+
+    #[test]
+    fn blocked_plans_dont_count_toward_the_overlap() {
+        // The promotion gate deliberately offers the queue while a
+        // plan is blocked; the warning must agree with it or wait
+        // contradicts its own advice.
+        let mut state = RepoState::default();
+        state.plans.insert(plan("old"), open_plan(1, sha("aaaa")));
+        state.plans.insert(plan("new"), open_plan(2, sha("bbbb")));
+        let mut blocks = std::collections::BTreeMap::new();
+        blocks.insert(
+            plan("old"),
+            vec![mkblock("claude", "q", "waiting on lloyd")],
+        );
+        let status = state.derive_status(
+            &MockBlocks(blocks),
+            &plan_policy(),
+            Some(&head("work", &[])),
+        );
+        assert!(
+            status.multi_plan_open.is_none(),
+            "a blocked plan is not an overlap"
+        );
+    }
+
+    #[test]
+    fn three_open_plans_name_all_new_ones_in_intro_order() {
+        let mut state = RepoState::default();
+        // Keys deliberately out of intro order: c introduced first.
+        state.plans.insert(plan("c"), open_plan(1, sha("aaaa")));
+        state.plans.insert(plan("a"), open_plan(2, sha("bbbb")));
+        state.plans.insert(plan("b"), open_plan(3, sha("cccc")));
+        let status = state.derive_status(
+            &MockReviews(vec![]),
+            &plan_policy(),
+            Some(&head("work", &[])),
+        );
+        let mp = status.multi_plan_open.expect("three open plans warn");
+        assert_eq!(mp.in_progress.as_str(), "c", "intro time, not key order");
+        let names: Vec<&str> = mp.new_plans.iter().map(|p| p.as_str()).collect();
+        assert_eq!(names, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn unadopted_or_headless_repos_never_warn() {
+        let mut state = RepoState::default();
+        state.plans.insert(plan("old"), open_plan(1, sha("aaaa")));
+        state.plans.insert(plan("new"), open_plan(2, sha("bbbb")));
+        let mut unadopted = head("work", &[]);
+        unadopted.adopted = false;
+        let status = state.derive_status(&MockReviews(vec![]), &plan_policy(), Some(&unadopted));
+        assert!(status.multi_plan_open.is_none(), "guest repos not policed");
+        let status = state.derive_status(&MockReviews(vec![]), &plan_policy(), None);
+        assert!(status.multi_plan_open.is_none(), "no HEAD facts, no check");
     }
 
     #[test]

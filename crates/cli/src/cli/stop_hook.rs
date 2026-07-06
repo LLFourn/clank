@@ -527,6 +527,8 @@ struct WaitItem {
     answer: Option<String>,
     pr: Option<u64>,
     round: Option<u64>,
+    in_progress: Option<String>,
+    new_plans: Option<Vec<String>>,
 }
 
 fn parse_wait_json(raw: &[u8]) -> Result<Vec<WaitItem>, String> {
@@ -611,6 +613,34 @@ fn render_wait_items(items: &[WaitItem], label: &AgentLabel, role: Role) -> Stri
                 out.push_str(&format!(
                     "  - pr-review: master {next} #{pr} round {round}\n"
                 ));
+            }
+            // The one deliberately non-minimal item: the remedies are
+            // parameterized by the plan names (WHICH stash push goes
+            // first depends on them), so unlike the static HOW in the
+            // skill doc they must ride in the nudge itself
+            // (soft-disallow-multiple-plans).
+            "multiple_plans_open" => {
+                let in_progress = item.in_progress.as_deref().unwrap_or("?");
+                let news: Vec<&str> = item
+                    .new_plans
+                    .as_deref()
+                    .unwrap_or(&[])
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect();
+                out.push_str(&format!(
+                    "  - multiple-plans-open: commits exist for {} while `{}` is \
+                     still unfinished. Do NOT keep working on either until you \
+                     resolve this by ONE of:\n",
+                    news.iter()
+                        .map(|n| format!("`{n}`"))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    in_progress,
+                ));
+                for r in crate::cli::wait::multi_plan_open_remedies(in_progress, &news) {
+                    out.push_str(&format!("      {r}\n"));
+                }
             }
             other => out.push_str(&format!("  - {other}: {plan} @ {short}\n")),
         }
@@ -953,6 +983,32 @@ mod tests {
         ]);
         assert!(out.contains("  - blocked: claude/q on foo (awaiting human)\n"));
         assert!(out.contains("  - promote: next-up (priority 042)\n"));
+    }
+
+    #[test]
+    fn multiple_plans_open_nudge_carries_the_ordered_remedies() {
+        // The one deliberately non-minimal nudge: the remedies are
+        // parameterized by the plan names, so they ride in the wake
+        // itself rather than the static skill doc
+        // (soft-disallow-multiple-plans). The stash ORDER is the
+        // load-bearing content: new plan first.
+        let out = items_text(&[serde_json::json!({
+            "kind": "multiple_plans_open",
+            "in_progress": "old-plan",
+            "new_plans": ["new-plan"],
+            "sha": FULL_SHA,
+        })]);
+        assert!(out.contains("multiple-plans-open"), "{out}");
+        assert!(out.contains("`old-plan`"), "{out}");
+        assert!(out.contains("`new-plan`"), "{out}");
+        let push_new = out.find("stash push new-plan").expect("pushes new");
+        let push_old = out
+            .find("stash push old-plan --for new-plan")
+            .expect("pushes in-progress with --for");
+        assert!(push_new < push_old, "new plan stashed FIRST:\n{out}");
+        for n in ["1.", "2.", "3."] {
+            assert!(out.contains(n), "all three remedies:\n{out}");
+        }
     }
 
     #[test]
