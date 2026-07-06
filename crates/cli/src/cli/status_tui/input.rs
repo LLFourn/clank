@@ -324,6 +324,24 @@ pub(super) enum InputNav {
     None,
 }
 
+/// Compose the TUI squash message: typed subject + the plan's OWN WHY
+/// (the finalize commit's body). finish's validator demands a
+/// subject AND a `\n\n`-separated body (tui-squash-message-body: the
+/// raw one-line input was rejected unconditionally — the flow was
+/// dead on arrival). Legacy plans finished before mandatory messages
+/// have no body — a provenance line passes validation and is honest
+/// about why no richer WHY exists.
+pub(super) fn compose_squash_message(subject: &str, finalize_body: &str) -> String {
+    let body = finalize_body.trim();
+    let why = if body.is_empty() {
+        "collapsed to one commit from clank status --tui; the original \
+         finish predates mandatory finish messages."
+    } else {
+        body
+    };
+    format!("{subject}\n\n{why}")
+}
+
 /// THE drop-arming predicate: the RAW buffer must equal the stem
 /// exactly — no trim, no case-fold. One definition shared by the
 /// armed/not-armed indicator AND the submit gate, so they cannot
@@ -1151,6 +1169,27 @@ mod tests {
         assert_eq!(ti.buf, "helo");
         assert_eq!(text_input_nav(&mut ti, TextKey::Enter), InputNav::Submit);
         assert_eq!(text_input_nav(&mut ti, TextKey::Esc), InputNav::Cancel);
+    }
+
+    #[test]
+    fn composed_squash_message_passes_finish_validation() {
+        use crate::cli::finish::validate_finish_message as validate;
+        // The raw one-line input — the shipped bug — is REJECTED.
+        assert!(
+            validate(Some("collapse it all"), "my-plan").is_err(),
+            "subject-only must fail (tui-squash-message-body repro)"
+        );
+        // Typed subject + the plan's real finalize body passes.
+        let real = compose_squash_message(
+            "collapse it all",
+            "the plan landed in five steps; one commit reads better",
+        );
+        validate(Some(&real), "my-plan").expect("subject + finalize body");
+        assert!(real.contains("\n\nthe plan landed"));
+        // Legacy plan (no finalize body) → provenance fallback passes.
+        let legacy = compose_squash_message("collapse it all", "  ");
+        validate(Some(&legacy), "my-plan").expect("provenance fallback");
+        assert!(legacy.contains("predates mandatory finish messages"));
     }
 
     #[test]

@@ -1381,7 +1381,8 @@ pub(super) fn render_plan_input(
         ),
         PlanInputKind::SquashMessage => (
             format!("squash · {stem}"),
-            "the squash commit's message (prefilled with the finalize subject)",
+            "the squash commit's SUBJECT (prefilled from the finish; the WHY body \
+             is kept from the finish message)",
             "⏎ squash",
         ),
         PlanInputKind::BlockReason => (

@@ -307,7 +307,7 @@ const FINISH_MESSAGE_PLACEHOLDERS: &[&str] =
 /// the body rather than a subject-length floor is deliberate: a concise
 /// subject with a real WHY passes, and a long subject with NO why is
 /// rejected instead of landing silently.
-fn validate_finish_message(message: Option<&str>, stem: &str) -> anyhow::Result<()> {
+pub(crate) fn validate_finish_message(message: Option<&str>, stem: &str) -> anyhow::Result<()> {
     let Some(msg) = message.map(str::trim).filter(|m| !m.is_empty()) else {
         anyhow::bail!("{}", finish_message_help(stem));
     };

@@ -247,6 +247,15 @@ async fn submit_plan_input(
             if text.is_empty() {
                 return InputSubmit::Stay;
             }
+            // finish validates the squash message as a WHAT+WHY (the
+            // raw one-liner is rejected unconditionally —
+            // tui-squash-message-body). The plan already HAS a WHY:
+            // its finalize commit's body; compose it in.
+            let finalize_body = match finalize_commit_of(repo, stem).await {
+                Some(sha) => crate::git_io::commit_body_at(repo, &sha).unwrap_or_default(),
+                None => String::new(),
+            };
+            let msg = input::compose_squash_message(text, &finalize_body);
             // `finish --squash` on an already-finished plan is the
             // purpose-built path: only the range is rewritten.
             let res = crate::cli::finish::run(crate::cli::FinishArgs {
@@ -254,7 +263,7 @@ async fn submit_plan_input(
                 repo: Some(repo.to_path_buf()),
                 message: vec![],
                 purge: false,
-                squash: Some(text.to_string()),
+                squash: Some(msg),
                 no_squash: false,
                 into_branch: None,
                 allow_rewrite_protected: true,
@@ -348,18 +357,10 @@ async fn unblock_plan(
 /// message the plan finished with is usually the right squash summary).
 /// Any failure degrades to empty — the user types their own.
 async fn squash_prefill(repo: &std::path::Path, stem: &str) -> String {
-    let Ok(state) =
-        crate::rebuild::rebuild_repo_with_policy(repo, crate::rebuild::CachePolicy::Use).await
-    else {
+    let Some(finalized_at) = finalize_commit_of(repo, stem).await else {
         return String::new();
     };
-    let Ok(key) = crate::lifecycle::PlanKey::parse(stem) else {
-        return String::new();
-    };
-    let Some(fp) = state.fold.finished_plans.iter().find(|f| f.plan == key) else {
-        return String::new();
-    };
-    crate::git_io::commit_subject_at(repo, &fp.finalized_at)
+    crate::git_io::commit_subject_at(repo, &finalized_at)
         .ok()
         .map(|s| {
             // Strip the `[stem] ` tag — the squash core re-tags.
@@ -368,6 +369,23 @@ async fn squash_prefill(repo: &std::path::Path, stem: &str) -> String {
                 .to_string()
         })
         .unwrap_or_default()
+}
+
+/// The finished plan's finalize commit, from the cached fold.
+async fn finalize_commit_of(
+    repo: &std::path::Path,
+    stem: &str,
+) -> Option<crate::lifecycle::CommitSha> {
+    let state = crate::rebuild::rebuild_repo_with_policy(repo, crate::rebuild::CachePolicy::Use)
+        .await
+        .ok()?;
+    let key = crate::lifecycle::PlanKey::parse(stem).ok()?;
+    state
+        .fold
+        .finished_plans
+        .iter()
+        .find(|f| f.plan == key)
+        .map(|f| f.finalized_at.clone())
 }
 
 /// The plan page's derived facts, or `None` when the stem no longer

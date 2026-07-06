@@ -209,6 +209,78 @@ fn finish_refuses_an_open_block_even_when_the_gate_is_finished() {
 }
 
 #[test]
+fn tui_composed_squash_message_squashes_a_no_squash_finished_plan() {
+    // The TUI squash path end-to-end minus the widget
+    // (tui-squash-message-body): a plan finished with --no-squash keeps
+    // its commits; squashing later with a composed subject+finalize-body
+    // message must pass validation and land the composed message.
+    let env = TestEnv::init();
+    env.register_team("claude", &["codex"], &[]);
+    let repo = env.repo();
+    write(
+        repo, "README", "base
+",
+    );
+    commit(repo, "base");
+    write(
+        repo,
+        ".clank/plans/foo.md",
+        "# foo
+
+body
+",
+    );
+    commit(repo, "[foo] intro");
+    write(
+        repo,
+        "src/foo.rs",
+        "// foo
+",
+    );
+    commit(repo, "[foo] implement");
+    let intro_plus = git_out(repo, &["rev-parse", "HEAD"]);
+    write(
+        repo,
+        &format!(".clank/agents/codex/feedback/{}.md", &intro_plus[..7]),
+        "FINISHED ship it
+",
+    );
+    let mut args = finish_args(repo, "foo", None);
+    args.message = vec![
+        "make foo work".into(),
+        "foo exists because the thing needed doing".into(),
+    ];
+    args.no_squash = true;
+    block_on(clank::cli::finish::run(args)).expect("no-squash finish");
+    assert!(
+        git_out(repo, &["rev-list", "--count", "HEAD"]) == "4",
+        "commits kept"
+    );
+
+    // What the TUI submit arm does: typed subject + finalize body.
+    let finalize_body = git_out(repo, &["log", "-1", "--format=%b"]);
+    assert!(finalize_body.contains("needed doing"), "{finalize_body}");
+    let composed = format!(
+        "collapse foo
+
+{finalize_body}"
+    );
+    let mut squash = finish_args(repo, "foo", Some(&composed));
+    // The TUI path passes allow_rewrite_protected (its confirm gates it).
+    squash.allow_rewrite_protected = true;
+    block_on(clank::cli::finish::run(squash)).expect("composed squash passes validation");
+
+    assert_eq!(
+        git_out(repo, &["log", "-1", "--format=%s"]),
+        "[foo] collapse foo"
+    );
+    assert!(
+        git_out(repo, &["log", "-1", "--format=%b"]).contains("needed doing"),
+        "original WHY rides into the squash commit"
+    );
+}
+
+#[test]
 fn refused_squash_leaves_the_validated_message_not_the_placeholder() {
     // codex 053f9d1: `finish --squash` stamps the transient finalize commit
     // with the (validated) squash message BEFORE the squash runs, so a squash
