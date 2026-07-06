@@ -11,6 +11,7 @@
 //! Untested by design — every byte here touches a real terminal.
 
 use std::io::Write as _;
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::sync::atomic::{AtomicPtr, Ordering};
 
 /// (rows, cols) of the stdout tty via `TIOCGWINSZ`. libc carries
@@ -28,6 +29,30 @@ pub(crate) fn term_size() -> (u16, u16) {
         (ws.ws_row, ws.ws_col)
     } else {
         (24, 80)
+    }
+}
+
+/// (rows, cols) of an arbitrary tty device via `TIOCGWINSZ`, e.g.
+/// `/dev/ttys004` — used to measure the REAL window from inside a
+/// zellij pane by asking the attached client's controlling tty
+/// (zellij-in-session-orientation). `None` on open/ioctl failure or
+/// degenerate sizes; `O_NONBLOCK` so a wedged tty can't hang us,
+/// `O_NOCTTY` so we never adopt it as our controlling terminal.
+pub(crate) fn winsize_of_tty(dev: &str) -> Option<(u16, u16)> {
+    use std::os::unix::io::AsRawFd;
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOCTTY | libc::O_NONBLOCK)
+        .open(dev)
+        .ok()?;
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    // SAFETY: ws is a valid zeroed winsize; ioctl fills it or
+    // returns -1.
+    let rc = unsafe { libc::ioctl(f.as_raw_fd(), libc::TIOCGWINSZ, &mut ws) };
+    if rc == 0 && ws.ws_row > 0 && ws.ws_col > 0 {
+        Some((ws.ws_row, ws.ws_col))
+    } else {
+        None
     }
 }
 

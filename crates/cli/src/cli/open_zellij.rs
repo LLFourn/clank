@@ -201,7 +201,7 @@ fn open_all(source: &Path, targets: &[PathBuf], print: bool) -> anyhow::Result<(
         anyhow::bail!("no openable worktrees (none have clank agents configured)");
     }
 
-    let (rows, cols) = crate::cli::term::term_size();
+    let (rows, cols) = layout_term_size();
     let kdl = compose_multitab(&tabs, (cols, rows))?;
     let layout_path = layout_file_path(source);
     let (pre, spawn) = match plan {
@@ -340,10 +340,12 @@ fn open_one(repo: &Path, print: bool) -> anyhow::Result<()> {
         .map(crate::cli::team::read_user_config)
         .transpose()?
         .and_then(|cfg| cfg.zellij.and_then(|z| z.layout));
-    // Orientation from the SPAWNING terminal's dimensions
-    // (zellij-default-layout); ioctl stays at the shell, compose
-    // stays pure over (cols, rows).
-    let (rows, cols) = crate::cli::term::term_size();
+    // Orientation from the real WINDOW's dimensions — the client
+    // tty when inside a session, the spawning terminal otherwise
+    // (zellij-default-layout, zellij-in-session-orientation);
+    // measurement stays at the shell, compose stays pure over
+    // (cols, rows).
+    let (rows, cols) = layout_term_size();
     let kdl = compose_kdl(
         &basename,
         &repo_path_str,
@@ -540,6 +542,82 @@ fn compose_kdl(
             // alt+] flips the arrangement at runtime.
             add_swap_variants(&base, repo_path, master, reviewers)
         }
+    }
+}
+
+/// (rows, cols) for layout-orientation decisions. Outside zellij:
+/// the stdout ioctl (the real terminal). INSIDE zellij, stdout is the
+/// invoking PANE's PTY — a wide shell split reads as landscape no
+/// matter how portrait the window is — so measure the attached zellij
+/// CLIENT's controlling tty instead, falling back to the pane ioctl
+/// when no client is identifiable. Never worse than the pane
+/// measurement (zellij-in-session-orientation).
+fn layout_term_size() -> (u16, u16) {
+    if std::env::var_os("ZELLIJ").is_some()
+        && let Some(size) = zellij_client_window_size()
+    {
+        return size;
+    }
+    crate::cli::term::term_size()
+}
+
+/// Measure the real window from inside a session: find the zellij
+/// client process for `$ZELLIJ_SESSION_NAME` in `ps` output and read
+/// its controlling tty's winsize. Subprocess justified: zellij's CLI
+/// exposes no window geometry (`list-panes`/`list-tabs` carry none),
+/// and escape-sequence size queries are answered with PANE dimensions
+/// — the very trap this exists to avoid.
+fn zellij_client_window_size() -> Option<(u16, u16)> {
+    let out = std::process::Command::new("ps")
+        .args(["-axo", "tty=,command="])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let session = std::env::var("ZELLIJ_SESSION_NAME").ok();
+    let tty = pick_zellij_client_tty(&text, session.as_deref())?;
+    crate::cli::term::winsize_of_tty(&format!("/dev/{tty}"))
+}
+
+/// Pure picker over `ps -axo tty=,command=` lines: the tty of the
+/// zellij CLIENT attached to `session`. A client line is one whose
+/// program is zellij itself (basename match, so absolute paths count)
+/// on a real tty, excluding transient `zellij action`/`setup`/`ls`
+/// invocations. The session name must appear as a standalone argv
+/// token (`attach <name>`, `--session <name>`, `-s <name>` all
+/// satisfy this; a layout PATH merely containing the name does not —
+/// paths are single slash-joined tokens). With no named match a SOLE
+/// client is unambiguous — use it; several → `None` (two windows can
+/// disagree, so fall back to the deterministic pane ioctl). First
+/// named match wins ties: arbitrary but deterministic.
+fn pick_zellij_client_tty(ps_output: &str, session: Option<&str>) -> Option<String> {
+    let mut clients: Vec<(&str, Vec<&str>)> = Vec::new();
+    for line in ps_output.lines() {
+        let mut parts = line.split_whitespace();
+        let Some(tty) = parts.next() else { continue };
+        if tty == "??" || tty == "?" {
+            continue; // daemonized zellij (e.g. the server) — no terminal
+        }
+        let argv: Vec<&str> = parts.collect();
+        let Some(prog) = argv.first() else { continue };
+        if prog.rsplit('/').next().unwrap_or(prog) != "zellij" {
+            continue;
+        }
+        if argv
+            .iter()
+            .any(|a| matches!(*a, "action" | "setup" | "ls" | "list-sessions"))
+        {
+            continue;
+        }
+        clients.push((tty, argv));
+    }
+    if let Some(name) = session
+        && let Some((tty, _)) = clients.iter().find(|(_, argv)| argv.contains(&name))
+    {
+        return Some((*tty).to_string());
+    }
+    match clients.as_slice() {
+        [(tty, _)] => Some((*tty).to_string()),
+        _ => None,
     }
 }
 
@@ -1467,6 +1545,87 @@ mod tests {
     /// 80x60 cells — portrait (cols < 2*rows).
     const PORTRAIT: (u16, u16) = (80, 60);
     const TEST_TAB: &str = "test-repo";
+
+    // ── zellij-in-session-orientation: the client-tty picker ──
+    //
+    // ps shapes below are verbatim from a live machine (macOS ttysNNN;
+    // one Linux pts/N case).
+
+    const PS_LIVE: &str = "\
+??        /usr/local/bin/zellij --server /tmp/zellij-501/0.44.3/clank-clank
+ttys004   clank open zellij
+ttys004   zellij attach clank-dark_skippy
+ttys013   zellij --session clank-fsctl --new-session-with-layout /Users/llfourn/src/fsctl/.clank/zellij/layout.kdl options --session-serialization false
+ttys030   -zsh
+";
+
+    #[test]
+    fn picker_finds_the_attach_shape_client_by_session_name() {
+        assert_eq!(
+            pick_zellij_client_tty(PS_LIVE, Some("clank-dark_skippy")).as_deref(),
+            Some("ttys004")
+        );
+    }
+
+    #[test]
+    fn picker_finds_the_session_flag_shape_client() {
+        assert_eq!(
+            pick_zellij_client_tty(PS_LIVE, Some("clank-fsctl")).as_deref(),
+            Some("ttys013")
+        );
+    }
+
+    #[test]
+    fn picker_never_matches_a_layout_path_containing_the_name() {
+        // `fsctl` appears inside ttys013's layout PATH but only
+        // `clank-fsctl` is a standalone token — an unrelated session
+        // name that's a substring of a path must not match; with two
+        // clients present the ambiguous fallback is None.
+        assert_eq!(pick_zellij_client_tty(PS_LIVE, Some("fsctl")), None);
+    }
+
+    #[test]
+    fn picker_ignores_the_server_and_non_zellij_commands() {
+        // The `??`-tty server line and `clank open zellij` (prog !=
+        // zellij) are not clients; with the two real clients left and
+        // no name match → ambiguous → None.
+        assert_eq!(pick_zellij_client_tty(PS_LIVE, Some("nope")), None);
+        assert_eq!(pick_zellij_client_tty(PS_LIVE, None), None);
+    }
+
+    #[test]
+    fn picker_uses_a_sole_client_when_the_name_does_not_match() {
+        let ps = "ttys002   zellij\n??   /usr/local/bin/zellij --server /x\n";
+        assert_eq!(
+            pick_zellij_client_tty(ps, Some("anything")).as_deref(),
+            Some("ttys002"),
+            "a bare unnamed client is unambiguous"
+        );
+    }
+
+    #[test]
+    fn picker_excludes_transient_action_invocations() {
+        // clank's own `zellij -s <name> action ...` queries run
+        // concurrently on a tty; they are not the attached client.
+        let ps = "\
+ttys009   zellij -s clank-foo action query-tab-names
+ttys004   zellij attach clank-foo
+";
+        assert_eq!(
+            pick_zellij_client_tty(ps, Some("clank-foo")).as_deref(),
+            Some("ttys004")
+        );
+    }
+
+    #[test]
+    fn picker_handles_linux_pts_ttys() {
+        let ps = "pts/4   zellij attach clank-foo\n";
+        assert_eq!(
+            pick_zellij_client_tty(ps, Some("clank-foo")).as_deref(),
+            Some("pts/4"),
+            "caller prepends /dev/ → /dev/pts/4"
+        );
+    }
 
     #[test]
     fn compose_kdl_includes_tab_bar_and_status_bar_plugins() {
