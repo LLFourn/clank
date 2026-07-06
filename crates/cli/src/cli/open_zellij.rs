@@ -1293,13 +1293,56 @@ fn kdl_escape(s: &str) -> String {
 /// `ps -ao ppid,args` on an interval — accumulated detached
 /// sessions congest the whole machine (observed ~320 servers
 /// pinning every core with concurrent `ps` scans).
+/// Max generated session-name length. Zellij embeds the name in its
+/// UNIX socket path (`$TMPDIR/zellij-<uid>/<version>/<name>`) and
+/// refuses names past the budget at arg-parse time; macOS's long
+/// `$TMPDIR` leaves exactly 24 chars (probed on zellij 0.44: 24 OK,
+/// 25 refused — the error's "less than 0 characters" number is
+/// zellij's display bug). Linux runtime dirs are shorter, so the
+/// macOS bound is the binding one (zellij-session-name-budget).
+const SESSION_NAME_MAX: usize = 24;
+
 /// Deterministic per-repo session name (`zellij-session-dedup`):
 /// zellij enforces NAME UNIQUENESS, so a stable name makes
 /// duplicate clank sessions unrepresentable — re-running
 /// `clank open zellij` attaches instead of minting another
 /// randomly-named session full of fresh agent instances.
+///
+/// Long basenames are CAPPED to [`SESSION_NAME_MAX`]: truncated, with a
+/// short hash of the FULL basename appended so distinct long repos
+/// sharing a prefix never collide — and still deterministic, which
+/// reconciliation (find-session-by-name, add missing tabs) depends on.
+/// Short names are byte-identical to before, so existing sessions keep
+/// matching.
 fn session_name(basename: &str) -> String {
-    format!("clank-{basename}")
+    let full = format!("clank-{basename}");
+    if full.len() <= SESSION_NAME_MAX {
+        return full;
+    }
+    let hash = fnv1a_short(basename.as_bytes());
+    // "clank-" + truncated stem + "-" + 4 hex chars == SESSION_NAME_MAX.
+    let keep = SESSION_NAME_MAX - "clank-".len() - 1 - 4;
+    let mut stem = String::new();
+    for c in basename.chars() {
+        if stem.len() + c.len_utf8() > keep {
+            break;
+        }
+        stem.push(c);
+    }
+    format!("clank-{stem}-{hash}")
+}
+
+/// 4-hex-char FNV-1a. Inlined (not `DefaultHasher`) because the value
+/// must be stable across clank RELEASES — a session named by one build
+/// must be findable by the next — and std's hasher makes no such
+/// guarantee.
+fn fnv1a_short(bytes: &[u8]) -> String {
+    let mut h: u32 = 0x811c9dc5;
+    for b in bytes {
+        h ^= u32::from(*b);
+        h = h.wrapping_mul(0x01000193);
+    }
+    format!("{:04x}", (h >> 16) ^ (h & 0xffff))
 }
 
 /// What to do about the named session, decided PURELY over
@@ -2173,6 +2216,29 @@ dead-one [Created 10h ago] (EXITED - attach to resurrect)
     fn session_name_is_deterministic_per_repo() {
         assert_eq!(session_name("clank"), "clank-clank");
         assert_eq!(session_name("bindex-fun"), "clank-bindex-fun");
+    }
+
+    #[test]
+    fn session_name_caps_long_basenames_within_the_socket_budget() {
+        // The live failure (zellij-session-name-budget): macOS's TMPDIR
+        // leaves a 24-char budget; `clank-frostsnap_nostr-taipei` is 28.
+        let name = session_name("frostsnap_nostr-taipei");
+        assert!(
+            name.len() <= SESSION_NAME_MAX,
+            "capped within the probed budget: {name}"
+        );
+        assert!(name.starts_with("clank-"), "{name}");
+        // Deterministic (reconciliation finds the session by name across
+        // invocations AND releases — the hash is inlined FNV, not std's).
+        assert_eq!(name, session_name("frostsnap_nostr-taipei"));
+        // Distinct long repos sharing the truncated prefix don't collide.
+        let other = session_name("frostsnap_nostr-tokyo!");
+        assert_ne!(name, other, "hash disambiguates shared prefixes");
+        assert!(other.len() <= SESSION_NAME_MAX);
+        // Short names stay byte-identical (existing sessions keep
+        // matching), right up to the cap.
+        let at_cap = "x".repeat(SESSION_NAME_MAX - "clank-".len());
+        assert_eq!(session_name(&at_cap), format!("clank-{at_cap}"));
     }
 
     // ── agent-promote-zellij-relocation: compose_promote_layout ──
