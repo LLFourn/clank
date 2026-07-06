@@ -69,46 +69,381 @@ enum Ev {
     /// (possibly taller) viewport and repaint, but never rebuild — so a
     /// resize is never swallowed by the nothing-changed gate.
     Resize,
-    /// A keystroke from the stdin reader thread.
-    Key(Key),
+    /// A raw stdin chunk. Parsed AT THE LOOP, not in the reader
+    /// thread: bytes → keys is interpretation and the interpretation
+    /// is mode-scoped — an open text input reads the letters
+    /// j/k/y/n/o/q as TEXT, which a context-free parse would eat as
+    /// commands (tui-plan-actions-page).
+    Stdin(Vec<u8>),
 }
 
 /// Execute a confirmed roster mutation via the existing `clank agent`
 /// cores — the TUI is a FRONT-END to add/remove, never a second write
 /// path. The target label is resolved from the snapshot/picker by the
 /// action's index at apply time. Adds go in as a commit reviewer
-/// (parity with `clank agent add`). Best-effort: a failed core leaves
-/// the roster unchanged (the panel just won't move); surfacing modal
-/// errors is out of scope. The mutated `.clank/config.json` is tracked,
-/// so this dirties the tree — the deliberate, committed-config change
-/// the confirm modal warned about.
+/// (parity with `clank agent add`). A failed core leaves the roster
+/// unchanged and the error is RETURNED for the error overlay — silent
+/// `let _ =` swallowing was a bug this plan fixes in passing (codex
+/// e4bccc5). The mutated `.clank/config.json` is tracked, so this
+/// dirties the tree — the deliberate, committed-config change the
+/// confirm modal warned about.
 fn apply_confirm(
     action: ConfirmAction,
     repo: &std::path::Path,
     home: Option<&std::path::Path>,
     snap: &StatusSnapshot,
     picker: &[crate::cli::status::AvailableAgent],
-) {
+) -> anyhow::Result<()> {
     match action {
         ConfirmAction::AddCandidate { idx } => {
             if let Some(c) = picker.get(idx)
                 && let Ok(label) = clank_core::ids::AgentLabel::parse(&c.label)
             {
-                let _ = crate::cli::agent::add_repo_roster_agent_by_name(
+                crate::cli::agent::add_repo_roster_agent_by_name(
                     repo,
                     home,
                     &label,
                     crate::cli::teams_config::RosterRole::Commit,
-                );
+                )?;
             }
+            Ok(())
         }
         ConfirmAction::RemoveAgent { idx } => {
             if let Some(a) = snap.agents.get(idx)
                 && let Ok(label) = clank_core::ids::AgentLabel::parse(&a.label)
             {
-                let _ = crate::cli::agent::remove_repo_agent(repo, &label);
+                crate::cli::agent::remove_repo_agent(repo, &label)?;
+            }
+            Ok(())
+        }
+        // Plan-page confirms are executed by `run_plan_confirm` in the
+        // loop's Confirm arm (they're async and error-reporting); they
+        // never reach this sync roster path.
+        ConfirmAction::StashPlan | ConfirmAction::PurgeArtifacts | ConfirmAction::PurgeDrop => {
+            Ok(())
+        }
+    }
+}
+
+/// Execute a plan-page confirm via the SAME cores the CLI verbs run —
+/// the TUI is a front-end, never a reimplemented write. `yes: true`
+/// because the TUI's confirm screen IS the confirmation. Purges pass
+/// `allow_rewrite_protected: true`: the TUI's chooser + scary confirm
+/// is stronger consent than the CLI flag, and dogfooding happens on
+/// `master` (reviewers: challenge if you disagree).
+async fn run_plan_confirm(
+    action: ConfirmAction,
+    repo: &std::path::Path,
+    stem: &str,
+) -> anyhow::Result<()> {
+    match action {
+        ConfirmAction::StashPlan => {
+            crate::cli::stash::run_push(crate::cli::StashPushArgs {
+                plan: Some(stem.to_string()),
+                waiting_for: None,
+                to_queue: false,
+                priority: None,
+                force: false,
+                dry: false,
+                yes: true,
+                allow_rewrite_protected: true,
+                repo: Some(repo.to_path_buf()),
+            })
+            .await
+        }
+        ConfirmAction::PurgeArtifacts | ConfirmAction::PurgeDrop => {
+            crate::cli::purge::run(crate::cli::PurgeArgs {
+                plan: Some(stem.to_string()),
+                all: false,
+                repo: Some(repo.to_path_buf()),
+                into_branch: None,
+                dry: false,
+                yes: true,
+                squash: None,
+                amend: false,
+                drop: matches!(action, ConfirmAction::PurgeDrop),
+                allow_rewrite_protected: true,
+                no_cache: false,
+            })
+            .await
+        }
+        _ => Ok(()),
+    }
+}
+
+/// The error overlay's title for a failed plan-page action.
+fn plan_confirm_title(action: ConfirmAction) -> String {
+    match action {
+        ConfirmAction::StashPlan => "stash push failed".to_string(),
+        ConfirmAction::PurgeArtifacts => "purge failed".to_string(),
+        ConfirmAction::PurgeDrop => "purge --drop failed".to_string(),
+        _ => "action failed".to_string(),
+    }
+}
+
+/// What a plan-input submit did.
+enum InputSubmit {
+    /// Invalid input (empty subject; drop stem mismatch) — stay open.
+    Stay,
+    /// Action ran clean — back to the page (refresh reconciles).
+    Done,
+    /// Action failed — error overlay with (title, message).
+    Failed(String, String),
+}
+
+/// Execute a submitted plan-page input. Validation lives here so the
+/// screens can't diverge from what actually runs: an empty buffer
+/// never acts, and DropStem only arms on the EXACT stem.
+async fn submit_plan_input(
+    kind: PlanInputKind,
+    buf: &str,
+    plan_page: &Option<PlanPage>,
+    snapshot: &StatusSnapshot,
+    repo: &std::path::Path,
+) -> InputSubmit {
+    let Some(pp) = plan_page.as_ref() else {
+        return InputSubmit::Done; // page gone — nothing sane to do
+    };
+    let stem = pp.stem.as_str();
+    let text = buf.trim();
+    match kind {
+        PlanInputKind::ForceFinishSubject => {
+            if text.is_empty() {
+                return InputSubmit::Stay;
+            }
+            // The WHY paragraph is auto-provenance: the honest fact is
+            // WHO decided (the human, at the TUI) and what the gate
+            // said at bypass.
+            let gate = snapshot
+                .plans
+                .iter()
+                .find(|p| p.plan.as_str() == stem)
+                .map(|p| p.gate.as_str().to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            let why = format!(
+                "force-finished from clank status --tui; the review gate was \
+                 `{gate}` at bypass."
+            );
+            let res = crate::cli::finish::run(crate::cli::FinishArgs {
+                plan: Some(stem.to_string()),
+                repo: Some(repo.to_path_buf()),
+                message: vec![text.to_string(), why],
+                purge: false,
+                squash: None,
+                no_squash: false,
+                into_branch: None,
+                allow_rewrite_protected: true,
+                dry: false,
+                force: true,
+                no_cache: false,
+            })
+            .await;
+            match res {
+                Ok(()) => InputSubmit::Done,
+                Err(e) => InputSubmit::Failed("force finish failed".into(), format!("{e:?}")),
             }
         }
+        PlanInputKind::SquashMessage => {
+            if text.is_empty() {
+                return InputSubmit::Stay;
+            }
+            // `finish --squash` on an already-finished plan is the
+            // purpose-built path: only the range is rewritten.
+            let res = crate::cli::finish::run(crate::cli::FinishArgs {
+                plan: Some(stem.to_string()),
+                repo: Some(repo.to_path_buf()),
+                message: vec![],
+                purge: false,
+                squash: Some(text.to_string()),
+                no_squash: false,
+                into_branch: None,
+                allow_rewrite_protected: true,
+                dry: false,
+                force: false,
+                no_cache: false,
+            })
+            .await;
+            match res {
+                Ok(()) => InputSubmit::Done,
+                Err(e) => InputSubmit::Failed("squash failed".into(), format!("{e:?}")),
+            }
+        }
+        PlanInputKind::BlockReason => {
+            if text.is_empty() {
+                return InputSubmit::Stay;
+            }
+            let Some(master) = snapshot
+                .agents
+                .iter()
+                .find(|a| matches!(a.role, crate::cli::teams_config::RosterRole::Master))
+            else {
+                return InputSubmit::Failed(
+                    "block failed".into(),
+                    "no master agent on the roster to author the block".into(),
+                );
+            };
+            // Same core as `clank block create` (the Blocked hook
+            // fires identically); the block is authored as the MASTER
+            // (blocks live under an agent dir; the master owns the
+            // plan). Fixed name `pause`: one TUI pause per plan,
+            // idempotent re-block.
+            let res = crate::cli::block::run(crate::cli::BlockArgs {
+                command: crate::cli::BlockCmd::Create(crate::cli::BlockCreateArgs {
+                    name: "pause".to_string(),
+                    message: text.to_string(),
+                    plan: Some(stem.to_string()),
+                    all: false,
+                    author: Some(master.label.clone()),
+                    repo: Some(repo.to_path_buf()),
+                }),
+            })
+            .await;
+            match res {
+                Ok(()) => InputSubmit::Done,
+                Err(e) => InputSubmit::Failed("block failed".into(), format!("{e:?}")),
+            }
+        }
+        PlanInputKind::DropStem => {
+            // RAW buffer, not the trimmed `text`: the gate must be the
+            // SAME predicate the armed indicator renders (codex
+            // 0daf087 — a trimmed compare here executed drops the
+            // screen showed as not armed).
+            if !input::drop_armed(buf, stem) {
+                return InputSubmit::Stay; // not armed — keep typing or esc
+            }
+            match run_plan_confirm(ConfirmAction::PurgeDrop, repo, stem).await {
+                Ok(()) => InputSubmit::Done,
+                Err(e) => InputSubmit::Failed("purge --drop failed".into(), format!("{e:?}")),
+            }
+        }
+    }
+}
+
+/// Answer every pending block on the plan: the human clicked unblock,
+/// so each creator's block gets the canned answer via the SAME core as
+/// `clank unblock` — their `block clean` flow then sweeps the pair.
+async fn unblock_plan(
+    repo: &std::path::Path,
+    stem: &str,
+    snapshot: &StatusSnapshot,
+) -> anyhow::Result<()> {
+    for b in snapshot
+        .blocks
+        .iter()
+        .filter(|b| b.answer.is_none() && b.plan.as_deref() == Some(stem))
+    {
+        crate::cli::block::run_unblock(crate::cli::UnblockArgs {
+            agent: b.agent.clone(),
+            name: b.name.clone(),
+            plan: Some(stem.to_string()),
+            message: "unblocked from clank status --tui".to_string(),
+            repo: Some(repo.to_path_buf()),
+        })
+        .await?;
+    }
+    Ok(())
+}
+
+/// The squash input's prefill: the finalize commit's subject (the
+/// message the plan finished with is usually the right squash summary).
+/// Any failure degrades to empty — the user types their own.
+async fn squash_prefill(repo: &std::path::Path, stem: &str) -> String {
+    let Ok(state) =
+        crate::rebuild::rebuild_repo_with_policy(repo, crate::rebuild::CachePolicy::Use).await
+    else {
+        return String::new();
+    };
+    let Ok(key) = crate::lifecycle::PlanKey::parse(stem) else {
+        return String::new();
+    };
+    let Some(fp) = state.fold.finished_plans.iter().find(|f| f.plan == key) else {
+        return String::new();
+    };
+    crate::git_io::commit_subject_at(repo, &fp.finalized_at)
+        .ok()
+        .map(|s| {
+            // Strip the `[stem] ` tag — the squash core re-tags.
+            s.strip_prefix(&format!("[{stem}] "))
+                .unwrap_or(&s)
+                .to_string()
+        })
+        .unwrap_or_default()
+}
+
+/// The plan page's derived facts, or `None` when the stem no longer
+/// resolves to an active OR finished plan (page closes). `multi_commit`
+/// (squash-worthiness) for finished plans re-derives the plan's native
+/// range via the cached fold — one-shot at page open / refresh, never
+/// per repaint.
+async fn plan_page_facts(
+    repo: &std::path::Path,
+    stem: &str,
+    snapshot: &StatusSnapshot,
+) -> Option<input::PlanPageState> {
+    let active = snapshot.plans.iter().any(|p| p.plan.as_str() == stem);
+    let finished_file = repo.join(crate::init_facts::finished_md_rel(stem)).exists();
+    if !active && !finished_file {
+        return None;
+    }
+    let blocked = active
+        && snapshot
+            .blocks
+            .iter()
+            .any(|b| b.answer.is_none() && b.plan.as_deref() == Some(stem));
+    let multi_commit = if active {
+        true // squash isn't offered on active pages; value unused
+    } else {
+        finished_multi_commit(repo, stem).await
+    };
+    Some(input::PlanPageState {
+        finished: !active,
+        multi_commit,
+        blocked,
+    })
+}
+
+/// Refresh the open plan page's facts in place; `false` = the plan is
+/// gone and the page must close (clears `plan_page`, restoring the
+/// mode⟺Some invariant at both callers).
+async fn refetch_plan_page(
+    repo: &std::path::Path,
+    plan_page: &mut Option<PlanPage>,
+    snapshot: &StatusSnapshot,
+) -> bool {
+    let Some(pp) = plan_page.as_mut() else {
+        return false;
+    };
+    match plan_page_facts(repo, &pp.stem, snapshot).await {
+        Some(st) => {
+            pp.st = st;
+            true
+        }
+        None => {
+            *plan_page = None;
+            false
+        }
+    }
+}
+
+/// Does the finished plan's own range still span >1 commit? (An
+/// autosquashed plan is one commit — squash would be a no-op row.)
+/// Errors degrade to `true`: offering a squash that no-ops is better
+/// than hiding one that would work.
+async fn finished_multi_commit(repo: &std::path::Path, stem: &str) -> bool {
+    let Ok(state) =
+        crate::rebuild::rebuild_repo_with_policy(repo, crate::rebuild::CachePolicy::Use).await
+    else {
+        return true;
+    };
+    let Ok(key) = crate::lifecycle::PlanKey::parse(stem) else {
+        return true;
+    };
+    let Some(fp) = state.fold.finished_plans.iter().find(|f| f.plan == key) else {
+        return true;
+    };
+    match crate::preview::re_fold_finished_plan_natives(repo, &key, &fp.finalized_at).await {
+        Ok(natives) => natives.len() > 1,
+        Err(_) => true,
     }
 }
 
@@ -126,6 +461,7 @@ fn apply_detail_action(
     sel: usize,
     snapshot: &mut StatusSnapshot,
     repo: &std::path::Path,
+    error: &mut Option<(String, String)>,
 ) -> Mode {
     // Copy out what we need so the &mut write below doesn't conflict.
     let (auto_mode, role, label_str) = match snapshot.agents.get(idx) {
@@ -152,10 +488,16 @@ fn apply_detail_action(
             }
             Mode::AgentDetail { idx, sel }
         }
-        DetailAction::PromoteToMaster => {
-            let _ = crate::cli::agent::set_repo_master(repo, &label);
-            Mode::AgentPanel { sel: 0 }
-        }
+        DetailAction::PromoteToMaster => match crate::cli::agent::set_repo_master(repo, &label) {
+            Ok(()) => Mode::AgentPanel { sel: 0 },
+            // Stay on the page and surface the failure — a silently
+            // unchanged roster reads as "clank ignored me" (codex
+            // e4bccc5).
+            Err(e) => {
+                *error = Some(("promote failed".to_string(), format!("{e:?}")));
+                Mode::AgentDetail { idx, sel }
+            }
+        },
         DetailAction::Remove => Mode::Confirm {
             action: ConfirmAction::RemoveAgent { idx },
         },
@@ -276,6 +618,12 @@ struct CommitDetail {
 /// identity needed to re-fetch on a background `Refresh` (a commit sha; a
 /// plan stem), so the watcher firing never loses the reader's place.
 enum OverlayData {
+    /// A failed action's error text (no re-fetch identity — the error
+    /// is a moment, not a live document; Refresh leaves it as-is).
+    Error {
+        title: String,
+        message: String,
+    },
     Commit(CommitDetail),
     /// A plan's markdown by stem; `markdown` is `None` when the file
     /// isn't found.
@@ -330,6 +678,14 @@ impl Overlay {
     fn queued(name: String, markdown: Option<String>) -> Self {
         Self {
             data: OverlayData::QueuedPlan { name, markdown },
+            offset: 0,
+        }
+    }
+    /// A failed plan-page action's error, opened at the top
+    /// (errors-in-the-TUI, tui-plan-actions-page).
+    fn error(title: String, message: String) -> Self {
+        Self {
+            data: OverlayData::Error { title, message },
             offset: 0,
         }
     }
@@ -521,22 +877,24 @@ fn deferred_wait(
 /// flag each. So a storm of watcher wakes costs one repaint + at most one
 /// (throttled) rebuild, not one per event.
 struct Batch {
-    keys: Vec<Key>,
+    input: Vec<u8>,
     refresh: bool,
     resize: bool,
 }
 
-/// Fold a drained event burst into a [`Batch`]. Pure → unit-tested (the
+/// Fold a drained event burst into a [`Batch`]. Stdin chunks are
+/// CONCATENATED — a CSI sequence split across two 16-byte reads
+/// reassembles here before parsing. Pure → unit-tested (the
 /// "N wakes → one refresh" coalescing guarantee).
 fn coalesce(events: impl IntoIterator<Item = Ev>) -> Batch {
     let mut b = Batch {
-        keys: Vec::new(),
+        input: Vec::new(),
         refresh: false,
         resize: false,
     };
     for ev in events {
         match ev {
-            Ev::Key(k) => b.keys.push(k),
+            Ev::Stdin(bytes) => b.input.extend(bytes),
             Ev::Refresh => b.refresh = true,
             Ev::Resize => b.resize = true,
         }
@@ -600,10 +958,8 @@ pub(crate) async fn run_tui(
             if n <= 0 {
                 break;
             }
-            for key in parse_keys(&buf[..n as usize]) {
-                if ev_tx.send(Ev::Key(key)).is_err() {
-                    return;
-                }
+            if ev_tx.send(Ev::Stdin(buf[..n as usize].to_vec())).is_err() {
+                return;
             }
         }
     });
@@ -635,6 +991,14 @@ pub(crate) async fn run_tui(
     // --global` elsewhere shows up at once), referenced by index while
     // AddPicker/Confirm(Add) is active, cleared when the picker closes.
     let mut picker: Vec<crate::cli::status::AvailableAgent> = Vec::new();
+    // The open plan-actions page (tui-plan-actions-page): identity +
+    // derived facts. INVARIANT: `Some` ⟺ mode is PlanDetail/PurgeChoice/
+    // a plan-page Confirm — set and cleared ONLY together with those
+    // mode transitions.
+    let mut plan_page: Option<PlanPage> = None;
+    // The open plan-page text input's buffer (Mode::PlanInput carries
+    // only the KIND — same Copy-preserving split as `plan_page`).
+    let mut plan_input: Option<TextInput> = None;
     // Spinner animation frame. The ONLY state an animation tick mutates.
     let mut frame: usize = 0;
     // Debounce: a watcher wake only FLAGS a refresh; the trailing-edge
@@ -684,27 +1048,44 @@ pub(crate) async fn run_tui(
                     rows as usize,
                     cols as usize,
                 ),
+                OverlayData::Error { title, message } => {
+                    render_error_doc(title, message, overlay.offset, rows as usize, cols as usize)
+                }
             };
             // Extract the html-open target by value up front so the
             // `OpenHtml` arm doesn't hold a borrow of `detail` (the `Back`
             // arm mutates it).
-            let html_target: HtmlTarget = match &overlay.data {
-                OverlayData::Commit(d) => HtmlTarget::Commit(d.sha.as_str().to_string()),
-                OverlayData::Plan { stem, .. } => HtmlTarget::Plan(stem.clone()),
-                OverlayData::QueuedPlan { name, .. } => HtmlTarget::Queue(name.clone()),
-                OverlayData::StashedPlan { name, .. } => HtmlTarget::Stash(name.clone()),
+            let html_target: Option<HtmlTarget> = match &overlay.data {
+                OverlayData::Commit(d) => Some(HtmlTarget::Commit(d.sha.as_str().to_string())),
+                OverlayData::Plan { stem, .. } => Some(HtmlTarget::Plan(stem.clone())),
+                OverlayData::QueuedPlan { name, .. } => Some(HtmlTarget::Queue(name.clone())),
+                OverlayData::StashedPlan { name, .. } => Some(HtmlTarget::Stash(name.clone())),
+                OverlayData::Error { .. } => None,
             };
             paint(&lines);
             match ev_rx.recv_timeout(Duration::from_secs(60)) {
-                Ok(Ev::Key(k)) => match doc_nav(k, page) {
-                    DocNav::Back => detail = None,
-                    DocNav::Scroll(delta) => {
-                        let max_off = total.saturating_sub((rows as usize).max(1));
-                        detail.as_mut().unwrap().scroll(delta, max_off);
+                Ok(Ev::Stdin(bytes)) => {
+                    for k in parse_keys(&bytes) {
+                        match doc_nav(k, page) {
+                            DocNav::Back => detail = None,
+                            DocNav::Scroll(delta) => {
+                                let max_off = total.saturating_sub((rows as usize).max(1));
+                                if let Some(d) = detail.as_mut() {
+                                    d.scroll(delta, max_off);
+                                }
+                            }
+                            DocNav::OpenHtml => {
+                                if let Some(t) = &html_target {
+                                    open_overlay_in_browser(&repo, t);
+                                }
+                            }
+                            DocNav::None => {}
+                        }
+                        if detail.is_none() {
+                            break; // dismissed — remaining keys route next pass
+                        }
                     }
-                    DocNav::OpenHtml => open_overlay_in_browser(&repo, &html_target),
-                    DocNav::None => {}
-                },
+                }
                 // Data changed under us — re-fetch by IDENTITY (commit sha /
                 // plan stem), but KEEP the scroll offset (refresh swaps
                 // data, not view-state).
@@ -735,6 +1116,10 @@ pub(crate) async fn run_tui(
                                 name,
                             })
                         }
+                        // An error is a moment, not a live document —
+                        // a background refresh must not clear or morph
+                        // it while the user reads.
+                        OverlayData::Error { .. } => None,
                     };
                     if let (Some(data), Some(o)) = (new, detail.as_mut()) {
                         o.refresh(data);
@@ -752,6 +1137,8 @@ pub(crate) async fn run_tui(
         let log_focused = matches!(mode, Mode::LogScroll);
         let view = PanelView {
             mode,
+            plan_page: plan_page.as_ref(),
+            plan_input: plan_input.as_ref(),
             picker: &picker,
             log_cursor: log.cursor,
         };
@@ -793,6 +1180,8 @@ pub(crate) async fn run_tui(
         // Rebuild the view with the clamped cursor/offset for the paint.
         let view = PanelView {
             mode,
+            plan_page: plan_page.as_ref(),
+            plan_input: plan_input.as_ref(),
             picker: &picker,
             log_cursor: log.cursor,
         };
@@ -818,7 +1207,66 @@ pub(crate) async fn run_tui(
                 let batch = coalesce(
                     std::iter::once(first).chain(std::iter::from_fn(|| ev_rx.try_recv().ok())),
                 );
-                for k in batch.keys {
+                // Incremental parse: ONE key at a time, interpretation
+                // picked from the CURRENT mode — a pasted `f<subject>⏎`
+                // crosses into input mode mid-buffer and its text must
+                // not be pre-parsed as commands.
+                let mut inbuf = batch.input.as_slice();
+                loop {
+                    let text_mode = matches!(mode, Mode::PlanInput { .. });
+                    let Some((anykey, used)) = parse_one(inbuf, text_mode) else {
+                        if inbuf.is_empty() {
+                            break;
+                        }
+                        inbuf = &inbuf[1..];
+                        continue;
+                    };
+                    inbuf = &inbuf[used..];
+                    // Text keys route to the ONE input arm; command keys
+                    // to the per-mode match below.
+                    let k = match anykey {
+                        AnyKey::Text(tk) => {
+                            if let Mode::PlanInput { kind } = mode {
+                                let outcome = plan_input
+                                    .as_mut()
+                                    .map(|ti| text_input_nav(ti, tk))
+                                    .unwrap_or(InputNav::Cancel);
+                                match outcome {
+                                    InputNav::Cancel => {
+                                        plan_input = None;
+                                        mode = Mode::PlanDetail { sel: 0 };
+                                    }
+                                    InputNav::Submit => {
+                                        let buf = plan_input
+                                            .as_ref()
+                                            .map(|ti| ti.buf.clone())
+                                            .unwrap_or_default();
+                                        match submit_plan_input(
+                                            kind, &buf, &plan_page, &snapshot, &repo,
+                                        )
+                                        .await
+                                        {
+                                            InputSubmit::Stay => {}
+                                            InputSubmit::Done => {
+                                                plan_input = None;
+                                                mode = Mode::PlanDetail { sel: 0 };
+                                                refresh_pending = true;
+                                            }
+                                            InputSubmit::Failed(title, msg) => {
+                                                plan_input = None;
+                                                detail = Some(Overlay::error(title, msg));
+                                                mode = Mode::PlanDetail { sel: 0 };
+                                                refresh_pending = true;
+                                            }
+                                        }
+                                    }
+                                    InputNav::None => {}
+                                }
+                            }
+                            continue;
+                        }
+                        AnyKey::Cmd(k) => k,
+                    };
                     let page = (rows as usize).saturating_sub(3).max(1);
                     // `mode` is Copy: matching it copies, so reassigning `mode`
                     // inside an arm is free of borrow conflicts. The per-mode
@@ -953,8 +1401,18 @@ pub(crate) async fn run_tui(
                                     mode = Mode::AgentDetail { idx, sel: s }
                                 }
                                 DetailNav::Activate(action) => {
-                                    mode =
-                                        apply_detail_action(action, idx, sel, &mut snapshot, &repo);
+                                    let mut err: Option<(String, String)> = None;
+                                    mode = apply_detail_action(
+                                        action,
+                                        idx,
+                                        sel,
+                                        &mut snapshot,
+                                        &repo,
+                                        &mut err,
+                                    );
+                                    if let Some((title, msg)) = err {
+                                        detail = Some(Overlay::error(title, msg));
+                                    }
                                 }
                                 DetailNav::None => {}
                             }
@@ -998,19 +1456,49 @@ pub(crate) async fn run_tui(
                             | Key::No
                             | Key::Html
                             | Key::Plus
-                            | Key::Minus => {}
+                            | Key::Minus
+                            | Key::Char(_) => {}
                         },
                         // Confirm: one decision, resolved in one place.
                         Mode::Confirm { action } => {
                             if let Some(go) = confirm_decision(action, k) {
-                                if go {
-                                    apply_confirm(
+                                if action.is_plan_page() {
+                                    // Plan-page confirms execute the async
+                                    // core here (the TUI confirm IS the
+                                    // confirmation — the core's own prompt
+                                    // is bypassed with yes:true); an Err
+                                    // opens the error overlay instead of
+                                    // vanishing (errors-in-the-TUI).
+                                    if go && let Some(pp) = plan_page.as_ref() {
+                                        if let Err(e) =
+                                            run_plan_confirm(action, &repo, &pp.stem).await
+                                        {
+                                            detail = Some(Overlay::error(
+                                                plan_confirm_title(action),
+                                                format!("{e:?}"),
+                                            ));
+                                        }
+                                        // Success or failure, the repo may
+                                        // have changed — rebuild; the rebind
+                                        // exits the page if the plan is gone.
+                                        refresh_pending = true;
+                                    }
+                                    mode = Mode::PlanDetail { sel: 0 };
+                                    continue;
+                                }
+                                if go
+                                    && let Err(e) = apply_confirm(
                                         action,
                                         &repo,
                                         home.as_deref(),
                                         &snapshot,
                                         &picker,
-                                    );
+                                    )
+                                {
+                                    detail = Some(Overlay::error(
+                                        "roster change failed".to_string(),
+                                        format!("{e:?}"),
+                                    ));
                                 }
                                 picker.clear();
                                 // Back to the panel (on the +add row); the
@@ -1020,6 +1508,112 @@ pub(crate) async fn run_tui(
                                 mode = Mode::AgentPanel {
                                     sel: snapshot.agents.len(),
                                 };
+                            }
+                        }
+                        // Unreachable by construction: PlanInput parses
+                        // with text_mode=true, so every key routed here
+                        // is a TextKey handled above — but the match
+                        // must stay exhaustive.
+                        Mode::PlanInput { .. } => {}
+                        // The plan-actions page (tui-plan-actions-page).
+                        Mode::PlanDetail { sel } => {
+                            if k == Key::Quit {
+                                break 'evloop;
+                            }
+                            let Some(pp) = plan_page.clone() else {
+                                mode = Mode::LogScroll; // invariant breach — bail out
+                                continue;
+                            };
+                            let actions = plan_actions(pp.st);
+                            match plan_detail_nav(sel, &actions, k) {
+                                PlanNav::Sel(x) => mode = Mode::PlanDetail { sel: x },
+                                PlanNav::Back => {
+                                    plan_page = None;
+                                    mode = Mode::LogScroll;
+                                }
+                                PlanNav::Act(a) => match a {
+                                    PlanAction::ReadDoc => {
+                                        let md = read_plan_markdown(&repo, &pp.stem);
+                                        detail = Some(Overlay::plan(pp.stem.clone(), md));
+                                    }
+                                    PlanAction::OpenHtml => open_overlay_in_browser(
+                                        &repo,
+                                        &HtmlTarget::Plan(pp.stem.clone()),
+                                    ),
+                                    PlanAction::Stash => {
+                                        mode = Mode::Confirm {
+                                            action: ConfirmAction::StashPlan,
+                                        };
+                                    }
+                                    PlanAction::Purge => mode = Mode::PurgeChoice { sel: 0 },
+                                    PlanAction::Back => {
+                                        plan_page = None;
+                                        mode = Mode::LogScroll;
+                                    }
+                                    PlanAction::ForceFinish => {
+                                        plan_input = Some(TextInput::default());
+                                        mode = Mode::PlanInput {
+                                            kind: PlanInputKind::ForceFinishSubject,
+                                        };
+                                    }
+                                    PlanAction::Squash => {
+                                        let prefill = squash_prefill(&repo, &pp.stem).await;
+                                        plan_input = Some(TextInput::prefilled(&prefill));
+                                        mode = Mode::PlanInput {
+                                            kind: PlanInputKind::SquashMessage,
+                                        };
+                                    }
+                                    PlanAction::Block => {
+                                        plan_input = Some(TextInput::default());
+                                        mode = Mode::PlanInput {
+                                            kind: PlanInputKind::BlockReason,
+                                        };
+                                    }
+                                    // Unblock needs no input: the HUMAN is
+                                    // the one clicking, so the pending
+                                    // block(s) get a canned answer and the
+                                    // creator's block-clean flow stays
+                                    // intact.
+                                    PlanAction::Unblock => {
+                                        if let Err(e) =
+                                            unblock_plan(&repo, &pp.stem, &snapshot).await
+                                        {
+                                            detail = Some(Overlay::error(
+                                                "unblock failed".to_string(),
+                                                format!("{e:?}"),
+                                            ));
+                                        }
+                                        refresh_pending = true;
+                                    }
+                                },
+                                PlanNav::None => {}
+                            }
+                        }
+                        // The purge chooser: artifacts-only vs drop.
+                        Mode::PurgeChoice { sel } => {
+                            if k == Key::Quit {
+                                break 'evloop;
+                            }
+                            match purge_choice_nav(sel, k) {
+                                PlanNavPurge::Sel(x) => mode = Mode::PurgeChoice { sel: x },
+                                PlanNavPurge::Choose(PurgeChoice::Artifacts) => {
+                                    mode = Mode::Confirm {
+                                        action: ConfirmAction::PurgeArtifacts,
+                                    };
+                                }
+                                PlanNavPurge::Choose(PurgeChoice::Drop) => {
+                                    // The scariest gate: type the stem to
+                                    // arm (a y/N would be one habitual
+                                    // keystroke from losing real work).
+                                    plan_input = Some(TextInput::default());
+                                    mode = Mode::PlanInput {
+                                        kind: PlanInputKind::DropStem,
+                                    };
+                                }
+                                PlanNavPurge::Choose(PurgeChoice::Back) => {
+                                    mode = Mode::PlanDetail { sel: 0 };
+                                }
+                                PlanNavPurge::None => {}
                             }
                         }
                         // Default: the log is a selectable timeline — keys move
@@ -1066,9 +1660,16 @@ pub(crate) async fn run_tui(
                                             detail = Some(Overlay::commit(data, offset));
                                         }
                                     }
+                                    // A plan header opens the ACTIONS
+                                    // page (menu-first; the doc is its
+                                    // first row) — tui-plan-actions-page.
                                     Some(OverlayTarget::Plan { stem }) => {
-                                        let md = read_plan_markdown(&repo, &stem);
-                                        detail = Some(Overlay::plan(stem, md));
+                                        if let Some(st) =
+                                            plan_page_facts(&repo, &stem, &snapshot).await
+                                        {
+                                            plan_page = Some(PlanPage { stem, st });
+                                            mode = Mode::PlanDetail { sel: 0 };
+                                        }
                                     }
                                     None => {}
                                 }
@@ -1081,7 +1682,8 @@ pub(crate) async fn run_tui(
                             | Key::No
                             | Key::Html
                             | Key::Plus
-                            | Key::Minus => {}
+                            | Key::Minus
+                            | Key::Char(_) => {}
                         },
                     }
                     log.request_fill();
@@ -1176,7 +1778,19 @@ pub(crate) async fn run_tui(
                 picker.clear();
                 mode = match mode {
                     Mode::LogScroll => Mode::LogScroll,
-                    _ if snapshot.agents.is_empty() => Mode::LogScroll,
+                    // The plan page doesn't depend on the roster — it
+                    // must survive an empty-roster refresh (its arms are
+                    // below); everything agent-shaped drops to the log.
+                    Mode::AgentPanel { .. } | Mode::AgentDetail { .. } | Mode::AddPicker { .. }
+                        if snapshot.agents.is_empty() =>
+                    {
+                        Mode::LogScroll
+                    }
+                    Mode::Confirm { action }
+                        if snapshot.agents.is_empty() && !action.is_plan_page() =>
+                    {
+                        Mode::LogScroll
+                    }
                     Mode::AgentPanel { sel } => Mode::AgentPanel {
                         sel: rebind_panel_sel(
                             sel,
@@ -1201,6 +1815,43 @@ pub(crate) async fn run_tui(
                             None => Mode::AgentPanel {
                                 sel: snapshot.agents.len(),
                             },
+                        }
+                    }
+                    // The plan page tracks its plan by STEM: recompute
+                    // the facts against the fresh snapshot (block state /
+                    // finished-ness can flip under us); a vanished plan
+                    // (stashed, purged, dropped) closes the page to the
+                    // log. The chooser and plan-page confirms collapse
+                    // back to the page (their target may have changed).
+                    Mode::PlanDetail { sel } => {
+                        match refetch_plan_page(&repo, &mut plan_page, &snapshot).await {
+                            true => Mode::PlanDetail { sel },
+                            false => Mode::LogScroll,
+                        }
+                    }
+                    Mode::PurgeChoice { .. } => {
+                        match refetch_plan_page(&repo, &mut plan_page, &snapshot).await {
+                            true => Mode::PlanDetail { sel: 0 },
+                            false => Mode::LogScroll,
+                        }
+                    }
+                    // A half-typed input SURVIVES a background refresh
+                    // (the watcher fires constantly in a live session —
+                    // clearing it would eat the user's text); it closes
+                    // only when its plan vanished.
+                    Mode::PlanInput { kind } => {
+                        match refetch_plan_page(&repo, &mut plan_page, &snapshot).await {
+                            true => Mode::PlanInput { kind },
+                            false => {
+                                plan_input = None;
+                                Mode::LogScroll
+                            }
+                        }
+                    }
+                    Mode::Confirm { action } if action.is_plan_page() => {
+                        match refetch_plan_page(&repo, &mut plan_page, &snapshot).await {
+                            true => Mode::PlanDetail { sel: 0 },
+                            false => Mode::LogScroll,
                         }
                     }
                     // Cancel a picker/confirm onto the +add row.
@@ -1316,18 +1967,26 @@ pub(crate) mod tests {
         // order, resize folded — ONE pass, not N loop turns.
         let b = coalesce(vec![
             Ev::Refresh,
-            Ev::Key(Key::Down),
+            Ev::Stdin(b"j".to_vec()),
             Ev::Refresh,
             Ev::Resize,
             Ev::Refresh,
         ]);
         assert!(b.refresh, "many Refresh fold to one flag");
         assert!(b.resize, "Resize folded");
-        assert_eq!(b.keys, vec![Key::Down], "keys preserved in order");
-        // 100 wakes still yield a single refresh flag and no spurious keys.
+        assert_eq!(b.input, b"j".to_vec(), "stdin bytes preserved in order");
+        // Chunks CONCATENATE — a CSI split across two 16-byte reads
+        // reassembles before parsing.
+        let split = coalesce(vec![Ev::Stdin(b"\x1b[".to_vec()), Ev::Stdin(b"A".to_vec())]);
+        assert_eq!(
+            parse_keys(&split.input),
+            vec![Key::Up],
+            "split escape sequence reassembled"
+        );
+        // 100 wakes still yield a single refresh flag and no spurious input.
         let many = coalesce((0..100).map(|_| Ev::Refresh));
         assert!(many.refresh);
-        assert!(many.keys.is_empty());
+        assert!(many.input.is_empty());
         assert!(!many.resize);
     }
 
@@ -1360,7 +2019,8 @@ pub(crate) mod tests {
             OverlayData::Commit(d) => d.subject.clone(),
             OverlayData::Plan { .. }
             | OverlayData::QueuedPlan { .. }
-            | OverlayData::StashedPlan { .. } => unreachable!(),
+            | OverlayData::StashedPlan { .. }
+            | OverlayData::Error { .. } => unreachable!(),
         };
         // A review row opens at a non-zero offset (commit row would be 0).
         let mut o = Overlay::commit(data("first"), 5);
@@ -1522,7 +2182,8 @@ pub(crate) mod tests {
         let repo = detail_repo();
         let mut s = two_agent_snap(); // idx 1 == codex (commit)
         // Tick `plan` on a commit-tier reviewer → leaves commit mode.
-        let next = apply_detail_action(DetailAction::TierPlan, 1, 2, &mut s, repo.path());
+        let next =
+            apply_detail_action(DetailAction::TierPlan, 1, 2, &mut s, repo.path(), &mut None);
         let parsed: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(repo.path().join(".clank/config.json")).unwrap(),
         )
@@ -1542,7 +2203,14 @@ pub(crate) mod tests {
         );
 
         // Tick `final` too → plan+final == gate.
-        let next = apply_detail_action(DetailAction::TierFinal, 1, 3, &mut s, repo.path());
+        let next = apply_detail_action(
+            DetailAction::TierFinal,
+            1,
+            3,
+            &mut s,
+            repo.path(),
+            &mut None,
+        );
         let parsed: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(repo.path().join(".clank/config.json")).unwrap(),
         )
@@ -1555,18 +2223,58 @@ pub(crate) mod tests {
 
         // Unticking down to the last coverage is a no-op (still gate→final
         // →final stays; final is the only box left, untick refused).
-        apply_detail_action(DetailAction::TierPlan, 1, 2, &mut s, repo.path());
+        apply_detail_action(DetailAction::TierPlan, 1, 2, &mut s, repo.path(), &mut None);
         let before = std::fs::read_to_string(repo.path().join(".clank/config.json")).unwrap();
-        apply_detail_action(DetailAction::TierFinal, 1, 3, &mut s, repo.path());
+        apply_detail_action(
+            DetailAction::TierFinal,
+            1,
+            3,
+            &mut s,
+            repo.path(),
+            &mut None,
+        );
         let after = std::fs::read_to_string(repo.path().join(".clank/config.json")).unwrap();
         assert_eq!(before, after, "unticking the last coverage is a no-op");
+    }
+
+    #[test]
+    fn apply_detail_action_failed_promote_surfaces_the_error_and_stays() {
+        // codex e4bccc5: set_repo_master failures were `let _ =`
+        // swallowed — a silently unchanged roster reads as "clank
+        // ignored me". A failing core (no repo at the path) must
+        // surface through the error out-param and keep the page open.
+        let mut s = two_agent_snap();
+        let mut err: Option<(String, String)> = None;
+        let next = apply_detail_action(
+            DetailAction::PromoteToMaster,
+            1,
+            4,
+            &mut s,
+            std::path::Path::new("/nonexistent/clank-test-repo"),
+            &mut err,
+        );
+        let (title, msg) = err.expect("failure must be reported, not swallowed");
+        assert_eq!(title, "promote failed");
+        assert!(!msg.is_empty());
+        assert_eq!(
+            next,
+            Mode::AgentDetail { idx: 1, sel: 4 },
+            "stay on the page so the user sees where they were"
+        );
     }
 
     #[test]
     fn apply_detail_action_promote_uses_the_core_and_demotes_old_master() {
         let repo = detail_repo();
         let mut s = two_agent_snap();
-        apply_detail_action(DetailAction::PromoteToMaster, 1, 0, &mut s, repo.path());
+        apply_detail_action(
+            DetailAction::PromoteToMaster,
+            1,
+            0,
+            &mut s,
+            repo.path(),
+            &mut None,
+        );
         let parsed: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(repo.path().join(".clank/config.json")).unwrap(),
         )
@@ -1586,7 +2294,14 @@ pub(crate) mod tests {
         use clank_core::vocab::AutoMode;
         let repo = detail_repo();
         let mut s = two_agent_snap(); // codex auto Off
-        let next = apply_detail_action(DetailAction::ToggleAuto, 1, 2, &mut s, repo.path());
+        let next = apply_detail_action(
+            DetailAction::ToggleAuto,
+            1,
+            2,
+            &mut s,
+            repo.path(),
+            &mut None,
+        );
         assert_eq!(
             s.agents[1].auto_mode,
             AutoMode::On,
@@ -1603,7 +2318,7 @@ pub(crate) mod tests {
     fn apply_detail_action_remove_defers_to_confirm() {
         let repo = detail_repo();
         let mut s = two_agent_snap();
-        let next = apply_detail_action(DetailAction::Remove, 1, 3, &mut s, repo.path());
+        let next = apply_detail_action(DetailAction::Remove, 1, 3, &mut s, repo.path(), &mut None);
         assert_eq!(
             next,
             Mode::Confirm {

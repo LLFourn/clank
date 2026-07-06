@@ -117,6 +117,33 @@ pub(super) fn render_at(
         let actions = detail_actions(agent.role);
         return render_agent_detail(agent, &actions, sel, rows, cols);
     }
+    // The plan-actions page family (tui-plan-actions-page): page,
+    // purge chooser, and its confirms are dedicated full screens too.
+    // A missing `plan_page` (invariant breach) falls through to the
+    // normal layout; the loop bails the mode out next key.
+    if let Some(pp) = view.plan_page {
+        match mode {
+            Mode::PlanDetail { sel } => {
+                return render_plan_detail(pp, &plan_actions(pp.st), sel, rows, cols);
+            }
+            Mode::PurgeChoice { sel } => {
+                return render_purge_choice(&pp.stem, sel, rows, cols);
+            }
+            Mode::Confirm { action } if action.is_plan_page() => {
+                return render_plan_confirm(&pp.stem, action, rows, cols);
+            }
+            Mode::PlanInput { kind } => {
+                return render_plan_input(
+                    &pp.stem,
+                    kind,
+                    view.plan_input.unwrap_or(&TextInput::default()),
+                    rows,
+                    cols,
+                );
+            }
+            _ => {}
+        }
+    }
 
     let mut out: Vec<String> = Vec::with_capacity(rows);
     out.push(bar(snap, color, cols));
@@ -314,6 +341,11 @@ pub(super) fn render_at(
                         .map(|a| a.label.as_str())
                         .unwrap_or("?"),
                 ),
+                // Plan-page confirms render as their own full screen
+                // (render_at dispatches them before the panel path).
+                ConfirmAction::StashPlan
+                | ConfirmAction::PurgeArtifacts
+                | ConfirmAction::PurgeDrop => ("", ""),
             };
             let keys = if action.default_yes() {
                 "[Y]es  [n]o  (⏎ = yes)"
@@ -1084,6 +1116,345 @@ pub(super) fn commit_review_offset(
         .unwrap_or(0)
 }
 
+/// One row of the plan-actions page: `key  label  hint`, reverse-video
+/// band when selected; danger rows red (dim red until selected). The
+/// hotkey letter renders accent so the direct keys are discoverable
+/// from the rows themselves.
+fn plan_row(key: &str, label: &str, hint: &str, danger: bool) -> Vec<Span> {
+    let mut spans = if danger {
+        vec![colored("31", format!("   {key}  {label:<16} "))]
+    } else {
+        vec![
+            accent(format!("   {key}  ")),
+            plain(format!("{label:<16} ")),
+        ]
+    };
+    spans.push(dim(hint.to_string()));
+    spans
+}
+
+/// The plan-actions page (tui-plan-actions-page): a state-aware action
+/// menu over one plan. Danger rows sit below a rule; routine rows stay
+/// quiet — the danger GRADIENT deepens on the chooser + confirm
+/// screens.
+pub(super) fn render_plan_detail(
+    pp: &super::input::PlanPage,
+    actions: &[PlanAction],
+    sel: usize,
+    rows: usize,
+    cols: usize,
+) -> (Vec<String>, usize) {
+    let st = pp.st;
+    let mut out: Vec<String> = Vec::new();
+    let state_hint = if st.finished {
+        "finished".to_string()
+    } else if st.blocked {
+        "active · blocked".to_string()
+    } else {
+        "active".to_string()
+    };
+    out.push(region_rule(
+        &format!("plan · {}", pp.stem),
+        &state_hint,
+        true,
+        cols,
+    ));
+    out.push(String::new());
+    let mut danger_rule_done = false;
+    for (i, a) in actions.iter().enumerate() {
+        if out.len() >= rows.saturating_sub(1) {
+            break;
+        }
+        let danger = matches!(a, PlanAction::Purge);
+        if danger && !danger_rule_done {
+            out.push(emit(
+                &[colored("31", "  ── danger ──".to_string())],
+                "",
+                cols,
+            ));
+            danger_rule_done = true;
+        }
+        let (key, label, hint) = plan_action_row(*a);
+        out.push(row_line(
+            &plan_row(key, label, hint, danger),
+            i == sel,
+            "",
+            cols,
+        ));
+    }
+    if out.len() < rows {
+        out.push(String::new());
+    }
+    if out.len() < rows {
+        out.push(emit(
+            &[dim("  ↑↓ move · ⏎ select · esc back".to_string())],
+            "",
+            cols,
+        ));
+    }
+    out.truncate(rows);
+    (out, 0)
+}
+
+/// The row text for one plan action. The hotkey letters are the rows'
+/// own documentation.
+fn plan_action_row(a: PlanAction) -> (&'static str, &'static str, &'static str) {
+    match a {
+        PlanAction::ReadDoc => ("⏎", "read the plan", "the full document"),
+        PlanAction::OpenHtml => ("o", "open in browser", "html page with feedback"),
+        PlanAction::Stash => ("s", "stash…", "set the commits aside; pop to resume"),
+        PlanAction::ForceFinish => (
+            "f",
+            "force finish…",
+            "finalize NOW, bypassing the review gate",
+        ),
+        PlanAction::Squash => ("c", "squash…", "collapse the plan's commits into one"),
+        PlanAction::Block => ("b", "block…", "pause: ask the human, suppress work"),
+        PlanAction::Unblock => ("b", "unblock", "resume: answer the pending block"),
+        PlanAction::Purge => ("p", "purge…", "rewrite history; next screen chooses how"),
+        PlanAction::Back => ("esc", "back", ""),
+    }
+}
+
+/// The purge chooser (the danger door's second screen): artifacts-only
+/// vs drop-everything, both consequences spelled out.
+pub(super) fn render_purge_choice(
+    stem: &str,
+    sel: usize,
+    rows: usize,
+    cols: usize,
+) -> (Vec<String>, usize) {
+    let mut out: Vec<String> = Vec::new();
+    out.push(region_rule(&format!("purge · {stem}"), "", true, cols));
+    out.push(String::new());
+    let rows_spec: [(&str, &str, &str); 2] = [
+        (
+            "a",
+            "artifacts only",
+            "strip .clank/ files from history; the code stays",
+        ),
+        (
+            "d",
+            "drop EVERYTHING",
+            "the plan AND its implementation commits vanish",
+        ),
+    ];
+    for (i, (key, label, hint)) in rows_spec.iter().enumerate() {
+        if out.len() >= rows.saturating_sub(1) {
+            break;
+        }
+        out.push(row_line(
+            &plan_row(key, label, hint, true),
+            i == sel,
+            "",
+            cols,
+        ));
+    }
+    if out.len() < rows {
+        out.push(String::new());
+    }
+    if out.len() < rows {
+        out.push(emit(
+            &[dim("  ↑↓ move · ⏎ select · esc back".to_string())],
+            "",
+            cols,
+        ));
+    }
+    out.truncate(rows);
+    (out, 0)
+}
+
+/// A plan-page confirm: the scariest chrome in the TUI, scaled to the
+/// action — a full-width red reverse banner for drop, a red banner for
+/// artifacts purge, a plain highlight for stash. Default is ALWAYS No.
+pub(super) fn render_plan_confirm(
+    stem: &str,
+    action: ConfirmAction,
+    rows: usize,
+    cols: usize,
+) -> (Vec<String>, usize) {
+    let (title, consequence) = match action {
+        ConfirmAction::StashPlan => (
+            format!("stash `{stem}`?"),
+            "its commits are set aside on a protective ref; `clank stash pop` restores them"
+                .to_string(),
+        ),
+        ConfirmAction::PurgeArtifacts => (
+            format!("PURGE `{stem}` — rewrite history?"),
+            "strips the plan's .clank/ files from history; implementation commits stay;              rewrites this branch in place"
+                .to_string(),
+        ),
+        ConfirmAction::PurgeDrop => (
+            format!("DROP `{stem}` — plan AND code vanish?"),
+            "every commit attributed to the plan is dropped from history, including the              implementation. The plan body is NOT saved. This rewrites the branch."
+                .to_string(),
+        ),
+        _ => (String::new(), String::new()),
+    };
+    let mut out: Vec<String> = Vec::new();
+    out.push(region_rule(&format!("confirm · {stem}"), "", true, cols));
+    out.push(String::new());
+    let banner_color = match action {
+        ConfirmAction::StashPlan => "7", // reverse, uncolored
+        _ => "1;41;97",                  // bold white on red — the scary one
+    };
+    out.push(emit(
+        &[colored(banner_color, format!(" {title} "))],
+        "",
+        cols,
+    ));
+    out.push(String::new());
+    for line in wrap(&consequence, cols.saturating_sub(4).max(1)) {
+        if out.len() >= rows.saturating_sub(2) {
+            break;
+        }
+        out.push(emit(&[plain(format!("  {line}"))], "", cols));
+    }
+    if out.len() < rows {
+        out.push(String::new());
+    }
+    if out.len() < rows {
+        out.push(emit(
+            &[accent("  [y]es  [N]o  (⏎ = no)".to_string())],
+            "",
+            cols,
+        ));
+    }
+    out.truncate(rows);
+    (out, 0)
+}
+
+/// The one-line plan-page text input, chrome picked by KIND. The
+/// input line renders the cursor as a reverse-video cell; DropStem
+/// gets the scary banner plus a LIVE armed/not-armed indicator (the
+/// consequence of a match is irreversible, so the screen must show
+/// the state before Enter does anything).
+pub(super) fn render_plan_input(
+    stem: &str,
+    kind: PlanInputKind,
+    input: &TextInput,
+    rows: usize,
+    cols: usize,
+) -> (Vec<String>, usize) {
+    let (title, prompt, submit_hint): (String, &str, &str) = match kind {
+        PlanInputKind::ForceFinishSubject => (
+            format!("force finish · {stem}"),
+            "one line: WHAT this plan changed (the WHY is recorded as a gate-bypass \
+             provenance note)",
+            "⏎ force finish",
+        ),
+        PlanInputKind::SquashMessage => (
+            format!("squash · {stem}"),
+            "the squash commit's message (prefilled with the finalize subject)",
+            "⏎ squash",
+        ),
+        PlanInputKind::BlockReason => (
+            format!("block · {stem}"),
+            "why is this plan paused? (becomes the block's question)",
+            "⏎ block",
+        ),
+        PlanInputKind::DropStem => (
+            format!("DROP · {stem}"),
+            "",
+            "⏎ drop (armed only when the name matches)",
+        ),
+    };
+    let mut out: Vec<String> = Vec::new();
+    out.push(region_rule(&title, "", true, cols));
+    out.push(String::new());
+    if matches!(kind, PlanInputKind::DropStem) {
+        out.push(emit(
+            &[colored(
+                "1;41;97",
+                format!(" DROP `{stem}` — the plan AND its code vanish from history "),
+            )],
+            "",
+            cols,
+        ));
+        out.push(String::new());
+        out.push(emit(
+            &[plain(format!(
+                "  Type the plan's name (`{stem}`) to arm the drop:"
+            ))],
+            "",
+            cols,
+        ));
+    } else {
+        for line in wrap(prompt, cols.saturating_sub(4).max(1)) {
+            out.push(emit(&[dim(format!("  {line}"))], "", cols));
+        }
+    }
+    out.push(String::new());
+    // The input line: text with a reverse-video cursor cell.
+    let (before, at) = input.buf.split_at(input.cursor.min(input.buf.len()));
+    let (cursor_cell, after) = match at.split_at(at.len().min(1)) {
+        ("", _) => (" ".to_string(), ""),
+        (c, rest) => (c.to_string(), rest),
+    };
+    out.push(emit(
+        &[
+            accent("  > ".to_string()),
+            plain(before.to_string()),
+            highlight(cursor_cell),
+            plain(after.to_string()),
+        ],
+        "",
+        cols,
+    ));
+    if matches!(kind, PlanInputKind::DropStem) {
+        out.push(String::new());
+        let armed = super::input::drop_armed(&input.buf, stem);
+        out.push(emit(
+            &[if armed {
+                colored("1;31", "  ARMED — ⏎ drops the plan".to_string())
+            } else {
+                dim("  not armed (name doesn't match yet)".to_string())
+            }],
+            "",
+            cols,
+        ));
+    }
+    if out.len() < rows {
+        out.push(String::new());
+    }
+    if out.len() < rows {
+        out.push(emit(
+            &[dim(format!("  {submit_hint} · esc cancel"))],
+            "",
+            cols,
+        ));
+    }
+    out.truncate(rows);
+    (out, 0)
+}
+
+/// A failed action's error, full-window and scrollable (errors surface
+/// IN the TUI, not on a corrupted alt-screen stderr).
+pub(super) fn render_error_doc(
+    title: &str,
+    message: &str,
+    offset: usize,
+    rows: usize,
+    cols: usize,
+) -> (Vec<String>, usize) {
+    let mut content: Vec<String> = Vec::new();
+    content.push(region_rule(&format!("✗ {title}"), "esc back", true, cols));
+    content.push(String::new());
+    for raw in message.lines() {
+        if raw.is_empty() {
+            content.push(String::new());
+            continue;
+        }
+        for line in wrap(raw, cols.saturating_sub(2).max(1)) {
+            content.push(emit(&[colored("31", format!("  {line}"))], "", cols));
+        }
+    }
+    let total = content.len();
+    let off = offset.min(total.saturating_sub(1));
+    let windowed = content.into_iter().skip(off).take(rows).collect();
+    (windowed, total)
+}
+
 /// The full-window plan-document view (the `Enter`-on-a-plan-header drill
 /// in): the plan stem as the rule title, then the plan's markdown rendered
 /// to styled lines (or a dim "plan file not found" when the file is
@@ -1124,6 +1495,138 @@ mod tests {
     };
     use crate::lifecycle::{AgentLabel, CommitSha, PlanKey};
     use clank_core::plan_view::WaitingOn;
+
+    // ── tui-plan-actions-page: page renderers ──
+
+    fn page(st: crate::cli::status_tui::input::PlanPageState) -> super::super::input::PlanPage {
+        super::super::input::PlanPage {
+            stem: "my-plan".into(),
+            st,
+        }
+    }
+
+    #[test]
+    fn plan_detail_renders_state_rows_with_a_danger_rule() {
+        let st = crate::cli::status_tui::input::PlanPageState {
+            finished: false,
+            multi_commit: true,
+            blocked: false,
+        };
+        let pp = page(st);
+        let actions = plan_actions(st);
+        let (lines, _) = render_plan_detail(&pp, &actions, 2, 30, 90);
+        let text = lines.join("\n");
+        assert!(
+            text.contains("PLAN · MY-PLAN"),
+            "rule title uppercased: {text}"
+        );
+        assert!(text.contains("read the plan"));
+        assert!(text.contains("stash…"));
+        assert!(text.contains("force finish…"));
+        assert!(text.contains("block…"));
+        assert!(text.contains("── danger ──"), "danger rule present");
+        assert!(text.contains("purge…"));
+        // The danger rule sits ABOVE purge and BELOW the routine rows.
+        let rule = lines.iter().position(|l| l.contains("danger")).unwrap();
+        let purge = lines.iter().position(|l| l.contains("purge…")).unwrap();
+        let stash = lines.iter().position(|l| l.contains("stash…")).unwrap();
+        assert!(stash < rule && rule < purge, "gradient order");
+        // Selected row (idx 2 = stash) carries the reverse band.
+        assert!(
+            lines[lines.iter().position(|l| l.contains("stash…")).unwrap()].contains("\x1b[7m"),
+            "selection is the reverse-video band"
+        );
+    }
+
+    #[test]
+    fn purge_choice_names_both_consequences() {
+        let (lines, _) = render_purge_choice("my-plan", 1, 20, 90);
+        let text = lines.join("\n");
+        assert!(text.contains("PURGE · MY-PLAN"));
+        assert!(text.contains("artifacts only"));
+        assert!(text.contains("drop EVERYTHING"));
+        assert!(text.contains("the code stays"));
+        assert!(text.contains("implementation commits vanish"));
+    }
+
+    #[test]
+    fn drop_confirm_is_the_scariest_screen_and_defaults_no() {
+        let (lines, _) = render_plan_confirm(
+            "my-plan",
+            crate::cli::status_tui::input::ConfirmAction::PurgeDrop,
+            24,
+            90,
+        );
+        let text = lines.join("\n");
+        assert!(
+            text.contains("\x1b[1;41;97m"),
+            "bold white-on-red banner: {text:?}"
+        );
+        assert!(text.contains("DROP `my-plan`"));
+        assert!(text.contains("NOT saved"));
+        assert!(text.contains("[y]es  [N]o  (⏎ = no)"), "default is No");
+        // Stash's confirm is deliberately NOT the red banner.
+        let (calm, _) = render_plan_confirm(
+            "my-plan",
+            crate::cli::status_tui::input::ConfirmAction::StashPlan,
+            24,
+            90,
+        );
+        assert!(
+            !calm.join("").contains("\x1b[1;41;97m"),
+            "gradient: stash stays calm"
+        );
+    }
+
+    #[test]
+    fn drop_input_arms_only_on_the_exact_stem() {
+        use crate::cli::status_tui::input::{PlanInputKind, TextInput};
+        let near_miss = TextInput::prefilled("my-pla");
+        let (lines, _) = render_plan_input("my-plan", PlanInputKind::DropStem, &near_miss, 24, 90);
+        let text = lines.join("\n");
+        assert!(text.contains("\x1b[1;41;97m"), "scary banner always on");
+        assert!(text.contains("not armed"), "{text}");
+        let exact = TextInput::prefilled("my-plan");
+        let (lines, _) = render_plan_input("my-plan", PlanInputKind::DropStem, &exact, 24, 90);
+        assert!(lines.join("\n").contains("ARMED"), "exact match arms");
+        // Whitespace padding must show not-armed — and the submit gate
+        // uses the SAME predicate, so what renders is what executes.
+        let padded = TextInput::prefilled(" my-plan ");
+        let (lines, _) = render_plan_input("my-plan", PlanInputKind::DropStem, &padded, 24, 90);
+        assert!(
+            lines.join("\n").contains("not armed"),
+            "padding stays disarmed"
+        );
+    }
+
+    #[test]
+    fn plan_input_screens_name_their_purpose_and_cancel_path() {
+        use crate::cli::status_tui::input::{PlanInputKind, TextInput};
+        for (kind, want) in [
+            (PlanInputKind::ForceFinishSubject, "FORCE FINISH · MY-PLAN"),
+            (PlanInputKind::SquashMessage, "SQUASH · MY-PLAN"),
+            (PlanInputKind::BlockReason, "BLOCK · MY-PLAN"),
+        ] {
+            let (lines, _) = render_plan_input("my-plan", kind, &TextInput::default(), 24, 90);
+            let text = lines.join("\n");
+            assert!(text.contains(want), "{want}: {text}");
+            assert!(text.contains("esc cancel"), "{text}");
+        }
+    }
+
+    #[test]
+    fn error_doc_renders_red_and_scrolls() {
+        let msg = "stash push refuses: foreign commit(s)\nline two";
+        let (lines, total) = render_error_doc("stash push failed", msg, 0, 10, 80);
+        let text = lines.join("\n");
+        assert!(text.contains("✗ STASH PUSH FAILED"));
+        assert!(text.contains("\x1b[31m"), "error body is red");
+        assert!(text.contains("foreign commit"));
+        assert!(total >= 4);
+        // Windowing honors the offset like the other doc overlays.
+        let (scrolled, _) = render_error_doc("t", msg, 2, 10, 80);
+        assert!(scrolled.len() < lines.len() || !scrolled[0].contains('✗'));
+    }
 
     fn commit_row(subject: &str) -> crate::cli::log::OnelineRow {
         crate::cli::log::OnelineRow::Commit {
@@ -1175,6 +1678,8 @@ mod tests {
         let mut s = two_agent_snap();
         s.log_rows = (0..12).map(|i| commit_row(&format!("c{i}"))).collect();
         let view = PanelView {
+            plan_page: None,
+            plan_input: None,
             mode: Mode::LogScroll,
             picker: &[],
             log_cursor: 6,
@@ -1878,6 +2383,8 @@ mod tests {
             0,
             0,
             &PanelView {
+                plan_page: None,
+                plan_input: None,
                 mode: Mode::AddPicker { sel: 0 },
                 picker: &picker,
                 log_cursor: 0,
@@ -1917,6 +2424,8 @@ mod tests {
             cand("gizmo", "claude", "claude"),
         ];
         let view = PanelView {
+            plan_page: None,
+            plan_input: None,
             mode: Mode::AddPicker { sel: 0 },
             picker: &picker,
             log_cursor: 0,
@@ -2000,6 +2509,8 @@ mod tests {
             0,
             0,
             &PanelView {
+                plan_page: None,
+                plan_input: None,
                 mode: Mode::Confirm {
                     action: ConfirmAction::AddCandidate { idx: 0 },
                 },
@@ -2335,6 +2846,8 @@ mod tests {
         // Log focused, cursor on the SECOND entry (seq index 1, since
         // two_agent_snap has no ask/in-progress rows).
         let view = PanelView {
+            plan_page: None,
+            plan_input: None,
             mode: Mode::LogScroll,
             picker: &[],
             log_cursor: 1,

@@ -46,6 +46,11 @@ pub(super) enum Key {
     Plus,
     /// `-` — nudge the selected queue row's priority number down (sooner).
     Minus,
+    /// Any other printable ASCII byte — mode-scoped hotkeys (the plan
+    /// page's `s`/`f`/`c`/`p`/`b`) and, later, text input. Bound keys
+    /// above parse FIRST; `Char` is strictly the fallback, so adding a
+    /// binding never changes meaning under a mode that reads `Char`.
+    Char(u8),
 }
 
 /// Which region (and sub-state) owns the keyboard. The backbone of key
@@ -75,6 +80,36 @@ pub(super) enum Mode {
     /// A mutating decision is pending; the action carries the target by
     /// index.
     Confirm { action: ConfirmAction },
+    /// The per-plan actions page (tui-plan-actions-page); `sel` is the
+    /// cursor over its action menu. The plan's IDENTITY (stem) lives in
+    /// the loop's `plan_page` — `Mode` stays `Copy`; the two are set and
+    /// cleared together (invariant: `PlanDetail`/`PurgeChoice` ⟺
+    /// `plan_page.is_some()`).
+    PlanDetail { sel: usize },
+    /// The purge second screen: artifacts-only vs drop-everything.
+    PurgeChoice { sel: usize },
+    /// A one-line text input on the plan page (force-finish subject,
+    /// squash message, block reason, drop type-to-confirm). The BUFFER
+    /// lives in the loop's `plan_input` (Mode stays `Copy`); same
+    /// set/clear-together invariant as `plan_page`.
+    PlanInput { kind: PlanInputKind },
+}
+
+/// What the open plan-page input is FOR — picks the screen chrome, the
+/// submit action, and the validation (drop requires the exact stem).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PlanInputKind {
+    /// The WHAT subject for `finish --force`; the WHY paragraph is
+    /// auto-provenance (gate state at bypass).
+    ForceFinishSubject,
+    /// The squash message for a finished plan (prefilled with the
+    /// finalize commit's subject).
+    SquashMessage,
+    /// The reason for a pause block (the block's question text).
+    BlockReason,
+    /// Type-the-stem arming for `purge --drop` — the scariest screen;
+    /// submit is a no-op until the buffer equals the stem exactly.
+    DropStem,
 }
 
 /// One row of an agent's detail-page action menu (the actions are data
@@ -120,6 +155,211 @@ pub(super) fn detail_actions(role: crate::cli::teams_config::RosterRole) -> Vec<
                 Back,
             ]
         }
+    }
+}
+
+/// One row of the plan-actions page (tui-plan-actions-page). Rows are
+/// data the cursor moves over; availability depends on the plan's
+/// state — see [`plan_actions`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PlanAction {
+    /// Open the plan document overlay (Enter-first row: the old direct
+    /// drill-in, one keypress deeper for the menu's sake).
+    ReadDoc,
+    /// Open the plan's rendered HTML page in the browser.
+    OpenHtml,
+    /// `stash push` the plan (active only) — behind a confirm.
+    Stash,
+    /// `finish --force` (active only): finalize past the review gate.
+    ForceFinish,
+    /// `purge --squash` a finished plan's range into one commit. Only
+    /// offered when the range still has >1 commit.
+    Squash,
+    /// Pause: create a plan-scoped block (active, unblocked only).
+    Block,
+    /// Resume: answer the pending block (active, blocked only).
+    Unblock,
+    /// The danger door: opens the purge chooser (artifacts vs drop).
+    Purge,
+    /// Leave the page.
+    Back,
+}
+
+/// Facts of the plan the page needs, derived by the loop from the
+/// snapshot + log sequence (pure inputs, so row derivation is
+/// unit-testable).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct PlanPageState {
+    pub finished: bool,
+    /// The plan's range still spans >1 commit (squash is pointless on
+    /// an already-collapsed plan).
+    pub multi_commit: bool,
+    /// An unanswered block is pending on the plan.
+    pub blocked: bool,
+}
+
+/// The page's rows for a plan state, in display order. Inapplicable
+/// actions are ABSENT, not grayed: the states are different pages, not
+/// one form (finished plans can't stash/force-finish/block; active
+/// plans can't squash; block↔unblock flip on `blocked`).
+pub(super) fn plan_actions(st: PlanPageState) -> Vec<PlanAction> {
+    use PlanAction::*;
+    let mut v = vec![ReadDoc, OpenHtml];
+    if st.finished {
+        if st.multi_commit {
+            v.push(Squash);
+        }
+    } else {
+        v.push(Stash);
+        v.push(ForceFinish);
+        v.push(if st.blocked { Unblock } else { Block });
+    }
+    v.push(Purge);
+    v.push(Back);
+    v
+}
+
+/// The plan page's direct hotkey for a key, if that action is present
+/// on this page. `s` stash · `f` force-finish · `c` squash (collapse) ·
+/// `b` block/unblock · `p` purge · `o` html — `q` stays global quit.
+pub(super) fn plan_hotkey(key: Key, actions: &[PlanAction]) -> Option<PlanAction> {
+    use PlanAction::*;
+    let want = match key {
+        Key::Html => OpenHtml,
+        Key::Char(b's') => Stash,
+        Key::Char(b'f') => ForceFinish,
+        Key::Char(b'c') => Squash,
+        Key::Char(b'b') => {
+            return actions
+                .iter()
+                .copied()
+                .find(|a| matches!(a, Block | Unblock));
+        }
+        Key::Char(b'p') => Purge,
+        _ => return None,
+    };
+    actions.contains(&want).then_some(want)
+}
+
+/// One keypress on the plan page → what the loop should do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PlanNav {
+    Sel(usize),
+    Act(PlanAction),
+    Back,
+    None,
+}
+
+pub(super) fn plan_detail_nav(sel: usize, actions: &[PlanAction], key: Key) -> PlanNav {
+    if let Some(a) = plan_hotkey(key, actions) {
+        return PlanNav::Act(a);
+    }
+    match key {
+        Key::Up => PlanNav::Sel(sel.saturating_sub(1)),
+        Key::Down => PlanNav::Sel((sel + 1).min(actions.len().saturating_sub(1))),
+        Key::Enter => actions.get(sel).map_or(PlanNav::None, |a| PlanNav::Act(*a)),
+        Key::Escape => PlanNav::Back,
+        _ => PlanNav::None,
+    }
+}
+
+/// The purge chooser's rows: artifacts-only, drop-everything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PurgeChoice {
+    Artifacts,
+    Drop,
+    Back,
+}
+
+pub(super) fn purge_choice_nav(sel: usize, key: Key) -> PlanNavPurge {
+    match key {
+        Key::Char(b'a') => PlanNavPurge::Choose(PurgeChoice::Artifacts),
+        Key::Char(b'd') => PlanNavPurge::Choose(PurgeChoice::Drop),
+        Key::Up => PlanNavPurge::Sel(sel.saturating_sub(1)),
+        Key::Down => PlanNavPurge::Sel((sel + 1).min(1)),
+        Key::Enter => PlanNavPurge::Choose(if sel == 0 {
+            PurgeChoice::Artifacts
+        } else {
+            PurgeChoice::Drop
+        }),
+        Key::Escape => PlanNavPurge::Choose(PurgeChoice::Back),
+        _ => PlanNavPurge::None,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PlanNavPurge {
+    Sel(usize),
+    Choose(PurgeChoice),
+    None,
+}
+
+/// A one-line ASCII text input: buffer + byte cursor. ASCII-only by
+/// construction (the parser only emits printable ASCII `Char`s; the
+/// 16-byte stdin reads can split multibyte sequences, so non-ASCII is
+/// deliberately out of scope for now) — every byte index is a char
+/// boundary.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct TextInput {
+    pub(super) buf: String,
+    pub(super) cursor: usize,
+}
+
+impl TextInput {
+    pub(super) fn prefilled(text: &str) -> Self {
+        Self {
+            buf: text.to_string(),
+            cursor: text.len(),
+        }
+    }
+}
+
+/// What one text keystroke did to the input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum InputNav {
+    /// Enter — the caller validates + acts on `input.buf`.
+    Submit,
+    /// Esc — abandon the input.
+    Cancel,
+    None,
+}
+
+/// THE drop-arming predicate: the RAW buffer must equal the stem
+/// exactly — no trim, no case-fold. One definition shared by the
+/// armed/not-armed indicator AND the submit gate, so they cannot
+/// disagree (codex 0daf087: submit trimmed while the indicator
+/// didn't, so ` <stem> ` dropped a plan the screen called not armed).
+pub(super) fn drop_armed(buf: &str, stem: &str) -> bool {
+    buf == stem
+}
+
+/// Apply one [`TextKey`] to the input. Pure; the caller owns what
+/// Submit/Cancel mean for its screen.
+pub(super) fn text_input_nav(input: &mut TextInput, k: TextKey) -> InputNav {
+    match k {
+        TextKey::Enter => InputNav::Submit,
+        TextKey::Esc => InputNav::Cancel,
+        TextKey::Char(c) if (0x20..0x7f).contains(&c) => {
+            input.buf.insert(input.cursor, c as char);
+            input.cursor += 1;
+            InputNav::None
+        }
+        TextKey::Backspace => {
+            if input.cursor > 0 {
+                input.cursor -= 1;
+                input.buf.remove(input.cursor);
+            }
+            InputNav::None
+        }
+        TextKey::Left => {
+            input.cursor = input.cursor.saturating_sub(1);
+            InputNav::None
+        }
+        TextKey::Right => {
+            input.cursor = (input.cursor + 1).min(input.buf.len());
+            InputNav::None
+        }
+        TextKey::Char(_) | TextKey::Ignore => InputNav::None,
     }
 }
 
@@ -310,19 +550,36 @@ pub(super) fn doc_nav(key: Key, page: usize) -> DocNav {
 }
 
 /// A pending roster mutation, by index (keeps [`Mode`] `Copy`).
+/// Plan-page actions carry NO payload — the target stem is the loop's
+/// `plan_page` (same Copy-preserving indirection as the indices).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ConfirmAction {
     /// Add the candidate at this index in the loop's picker list.
     AddCandidate { idx: usize },
     /// Remove the agent at this index in `snapshot.agents`.
     RemoveAgent { idx: usize },
+    /// `stash push` the open plan page's plan.
+    StashPlan,
+    /// `purge` (artifacts only) the open plan page's plan.
+    PurgeArtifacts,
+    /// `purge --drop` the open plan page's plan — the scariest one.
+    PurgeDrop,
 }
 
 impl ConfirmAction {
-    /// Add defaults to Yes (non-destructive); remove defaults to No —
-    /// so Enter (which follows the default) never confirms a removal.
+    /// Add defaults to Yes (non-destructive); everything else defaults
+    /// to No — so Enter (which follows the default) never confirms a
+    /// removal, stash, or purge.
     pub(super) fn default_yes(self) -> bool {
         matches!(self, ConfirmAction::AddCandidate { .. })
+    }
+    /// Confirms that came FROM the plan page return TO it on decline /
+    /// completion-with-error; roster confirms return to the panel.
+    pub(super) fn is_plan_page(self) -> bool {
+        matches!(
+            self,
+            ConfirmAction::StashPlan | ConfirmAction::PurgeArtifacts | ConfirmAction::PurgeDrop
+        )
     }
 }
 
@@ -351,9 +608,21 @@ impl Mode {
     pub(super) fn toggle_focus(self, agents_len: usize) -> Mode {
         match self {
             Mode::LogScroll if agents_len > 0 => Mode::AgentPanel { sel: 0 },
+            // The plan page isn't part of the log↔agents focus cycle;
+            // Tab is a no-op there (esc leaves the page).
+            m @ (Mode::PlanDetail { .. } | Mode::PurgeChoice { .. }) => m,
             _ => Mode::LogScroll,
         }
     }
+}
+
+/// The open plan page's identity + derived facts (tui-plan-actions-page).
+/// Lives in the loop beside `mode` (which stays `Copy`); set and cleared
+/// together with `Mode::PlanDetail`/`PurgeChoice`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct PlanPage {
+    pub(super) stem: String,
+    pub(super) st: PlanPageState,
 }
 
 /// The interactive state `render_at` needs beyond the snapshot: which
@@ -362,6 +631,8 @@ impl Mode {
 /// bits land here, not as more args).
 pub(super) struct PanelView<'a> {
     pub(super) mode: Mode,
+    pub(super) plan_page: Option<&'a PlanPage>,
+    pub(super) plan_input: Option<&'a TextInput>,
     pub(super) picker: &'a [crate::cli::status::AvailableAgent],
     /// The selected log ENTRY (index into the scroll sequence) — drawn
     /// with the unified selection band when the log is focused.
@@ -375,6 +646,8 @@ impl<'a> PanelView<'a> {
     pub(super) fn just(mode: Mode) -> Self {
         Self {
             mode,
+            plan_page: None,
+            plan_input: None,
             picker: &[],
             log_cursor: 0,
         }
@@ -490,59 +763,121 @@ pub(super) fn confirm_decision(action: ConfirmAction, key: Key) -> Option<bool> 
 
 /// Parse a burst of stdin bytes into scroll keys — arrow keys,
 /// PgUp/PgDn, plus vi-ish `j`/`k`/`g`/`G`, space (page down), `q` (quit).
+/// One keystroke for a TEXT INPUT: printable bytes are literal text
+/// (vi keys, y/n/o/q — everything — because "block reason" needs to
+/// contain the letter j). Only the structural keys keep meaning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TextKey {
+    Char(u8),
+    Backspace,
+    Left,
+    Right,
+    Enter,
+    Esc,
+    /// A consumed-but-meaningless sequence (Up/Down, paging, unknown
+    /// CSI, control bytes) — explicit so no arm smuggles a NUL into
+    /// the buffer.
+    Ignore,
+}
+
+/// One parsed input item: a command key (normal modes) or a text key
+/// (a text input is open). The MODE picks the interpretation at the
+/// loop — bytes → keys is interpretation, so it can't live in the
+/// stdin thread (which doesn't know the mode): a context-free parse
+/// would eat the letters j/k/g/b/y/n/o/q out of typed text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AnyKey {
+    Cmd(Key),
+    Text(TextKey),
+}
+
+/// Parse ONE key from the head of `bytes` under the given
+/// interpretation; returns the key and the bytes consumed, or `None`
+/// for an unmapped head byte (caller skips 1). Incremental so the loop
+/// can re-pick the interpretation between keys — a pasted burst like
+/// `f<subject>\r` crosses INTO input mode mid-buffer and must not have
+/// its text pre-parsed as commands.
+pub(super) fn parse_one(bytes: &[u8], text_mode: bool) -> Option<(AnyKey, usize)> {
+    use AnyKey::{Cmd, Text};
+    if bytes.is_empty() {
+        return None;
+    }
+    // CSI sequences: arrows keep structural meaning in both modes
+    // (Left/Right move the input cursor); Up/Down and paging are
+    // SWALLOWED in a one-line input rather than reinterpreted.
+    let csi: &[(&[u8], Key, Option<TextKey>)] = &[
+        (b"\x1b[A", Key::Up, None),
+        (b"\x1b[B", Key::Down, None),
+        (b"\x1b[D", Key::Left, Some(TextKey::Left)),
+        (b"\x1b[C", Key::Right, Some(TextKey::Right)),
+        (b"\x1b[5~", Key::PageUp, None),
+        (b"\x1b[6~", Key::PageDown, None),
+    ];
+    for (seq, cmd, text) in csi {
+        if bytes.starts_with(seq) {
+            return Some(match (text_mode, text) {
+                (false, _) => (Cmd(*cmd), seq.len()),
+                (true, Some(t)) => (Text(*t), seq.len()),
+                (true, None) => (Text(TextKey::Ignore), seq.len()),
+            });
+        }
+    }
+    if bytes.starts_with(b"\x1b[") {
+        // Unknown CSI (F-keys, etc.): consume through its final byte
+        // so a lone Esc isn't misread out of the sequence's leading
+        // bytes.
+        let mut j = 2;
+        while j < bytes.len() && !(0x40..=0x7e).contains(&bytes[j]) {
+            j += 1;
+        }
+        let used = (j + 1).min(bytes.len());
+        return Some((Text(TextKey::Ignore), used)); // swallowed in both modes
+    }
+    let b = bytes[0];
+    if text_mode {
+        let t = match b {
+            b'\r' | b'\n' => TextKey::Enter,
+            0x7f | 0x08 => TextKey::Backspace,
+            0x1b => TextKey::Esc,
+            c if (0x20..0x7f).contains(&c) => TextKey::Char(c),
+            _ => TextKey::Ignore,
+        };
+        return Some((Text(t), 1));
+    }
+    let k = match b {
+        b'k' => Key::Up,
+        b'j' => Key::Down,
+        b'g' => Key::Top,
+        b'G' => Key::Bottom,
+        b' ' => Key::Space,
+        b'b' => Key::PageUp,
+        b'\t' | b'a' => Key::Focus,
+        b'\r' | b'\n' => Key::Enter,
+        0x7f | 0x08 => Key::Delete,
+        b'y' => Key::Yes,
+        b'n' => Key::No,
+        b'o' => Key::Html,
+        b'+' => Key::Plus,
+        b'-' => Key::Minus,
+        0x1b => Key::Escape,
+        b'q' => Key::Quit,
+        c if (0x20..0x7f).contains(&c) => Key::Char(c),
+        _ => return Some((Text(TextKey::Ignore), 1)), // swallowed
+    };
+    Some((Cmd(k), 1))
+}
+
 pub(super) fn parse_keys(bytes: &[u8]) -> Vec<Key> {
     let mut keys = Vec::new();
     let mut i = 0;
     while i < bytes.len() {
-        let rest = &bytes[i..];
-        if rest.starts_with(b"\x1b[A") {
-            keys.push(Key::Up);
-            i += 3;
-        } else if rest.starts_with(b"\x1b[B") {
-            keys.push(Key::Down);
-            i += 3;
-        } else if rest.starts_with(b"\x1b[5~") {
-            keys.push(Key::PageUp);
-            i += 4;
-        } else if rest.starts_with(b"\x1b[6~") {
-            keys.push(Key::PageDown);
-            i += 4;
-        } else if rest.starts_with(b"\x1b[D") {
-            keys.push(Key::Left);
-            i += 3;
-        } else if rest.starts_with(b"\x1b[C") {
-            keys.push(Key::Right);
-            i += 3;
-        } else if rest.starts_with(b"\x1b[") {
-            // Unknown CSI (F-keys, etc.): consume through its final byte
-            // so a lone Esc isn't misread out of the sequence's leading
-            // bytes.
-            let mut j = 2;
-            while j < rest.len() && !(0x40..=0x7e).contains(&rest[j]) {
-                j += 1;
+        match parse_one(&bytes[i..], false) {
+            Some((AnyKey::Cmd(k), used)) => {
+                keys.push(k);
+                i += used;
             }
-            i += (j + 1).min(rest.len());
-        } else {
-            match bytes[i] {
-                b'k' => keys.push(Key::Up),
-                b'j' => keys.push(Key::Down),
-                b'g' => keys.push(Key::Top),
-                b'G' => keys.push(Key::Bottom),
-                b' ' => keys.push(Key::Space),
-                b'b' => keys.push(Key::PageUp),
-                b'\t' | b'a' => keys.push(Key::Focus),
-                b'\r' | b'\n' => keys.push(Key::Enter),
-                0x7f | 0x08 => keys.push(Key::Delete),
-                b'y' => keys.push(Key::Yes),
-                b'n' => keys.push(Key::No),
-                b'o' => keys.push(Key::Html),
-                b'+' => keys.push(Key::Plus),
-                b'-' => keys.push(Key::Minus),
-                0x1b => keys.push(Key::Escape),
-                b'q' => keys.push(Key::Quit),
-                _ => {}
-            }
-            i += 1;
+            Some((_, used)) => i += used,
+            None => i += 1,
         }
     }
     keys
@@ -596,7 +931,249 @@ mod tests {
             .map(std::mem::discriminant)
             .collect();
         assert_eq!(csi, want_csi, "arrows + page keys");
-        assert!(parse_keys(b"xz.").is_empty(), "unmapped bytes are ignored");
+        // Printable bytes without a binding now parse as Char (the plan
+        // page's mode-scoped hotkeys / future text input); NON-printable
+        // unmapped bytes are still dropped.
+        assert_eq!(
+            parse_keys(b"xz."),
+            vec![Char(b'x'), Char(b'z'), Char(b'.')],
+            "printables fall through as Char"
+        );
+        assert!(parse_keys(b"\x01\x02").is_empty(), "control bytes ignored");
+    }
+
+    // ── tui-plan-actions-page: row derivation + routing ──
+
+    fn active_st() -> PlanPageState {
+        PlanPageState {
+            finished: false,
+            multi_commit: true,
+            blocked: false,
+        }
+    }
+
+    #[test]
+    fn plan_actions_active_page_has_stash_force_finish_block_and_purge() {
+        use PlanAction::*;
+        assert_eq!(
+            plan_actions(active_st()),
+            vec![ReadDoc, OpenHtml, Stash, ForceFinish, Block, Purge, Back]
+        );
+    }
+
+    #[test]
+    fn plan_actions_blocked_page_flips_block_to_unblock() {
+        use PlanAction::*;
+        let st = PlanPageState {
+            blocked: true,
+            ..active_st()
+        };
+        let rows = plan_actions(st);
+        assert!(rows.contains(&Unblock) && !rows.contains(&Block));
+    }
+
+    #[test]
+    fn plan_actions_finished_page_swaps_the_middle_block_for_squash() {
+        use PlanAction::*;
+        let st = PlanPageState {
+            finished: true,
+            multi_commit: true,
+            blocked: false,
+        };
+        assert_eq!(
+            plan_actions(st),
+            vec![ReadDoc, OpenHtml, Squash, Purge, Back]
+        );
+        // Already-collapsed plan: nothing to squash — the row is absent.
+        let one = PlanPageState {
+            multi_commit: false,
+            ..st
+        };
+        assert!(!plan_actions(one).contains(&Squash));
+    }
+
+    #[test]
+    fn plan_hotkeys_only_fire_for_rows_present_on_the_page() {
+        use PlanAction::*;
+        let active = plan_actions(active_st());
+        assert_eq!(plan_hotkey(Key::Char(b's'), &active), Some(Stash));
+        assert_eq!(plan_hotkey(Key::Char(b'f'), &active), Some(ForceFinish));
+        assert_eq!(plan_hotkey(Key::Char(b'b'), &active), Some(Block));
+        assert_eq!(plan_hotkey(Key::Char(b'p'), &active), Some(Purge));
+        assert_eq!(plan_hotkey(Key::Html, &active), Some(OpenHtml));
+        assert_eq!(
+            plan_hotkey(Key::Char(b'c'), &active),
+            None,
+            "no squash on active"
+        );
+        let blocked = plan_actions(PlanPageState {
+            blocked: true,
+            ..active_st()
+        });
+        assert_eq!(plan_hotkey(Key::Char(b'b'), &blocked), Some(Unblock));
+        let finished = plan_actions(PlanPageState {
+            finished: true,
+            multi_commit: true,
+            blocked: false,
+        });
+        assert_eq!(plan_hotkey(Key::Char(b'c'), &finished), Some(Squash));
+        assert_eq!(
+            plan_hotkey(Key::Char(b's'), &finished),
+            None,
+            "no stash on finished"
+        );
+    }
+
+    #[test]
+    fn plan_detail_nav_moves_activates_and_backs_out() {
+        let actions = plan_actions(active_st());
+        assert_eq!(plan_detail_nav(0, &actions, Key::Down), PlanNav::Sel(1));
+        assert_eq!(
+            plan_detail_nav(actions.len() - 1, &actions, Key::Down),
+            PlanNav::Sel(actions.len() - 1),
+            "clamped at the last row"
+        );
+        assert_eq!(plan_detail_nav(0, &actions, Key::Up), PlanNav::Sel(0));
+        assert_eq!(
+            plan_detail_nav(0, &actions, Key::Enter),
+            PlanNav::Act(PlanAction::ReadDoc)
+        );
+        assert_eq!(plan_detail_nav(0, &actions, Key::Escape), PlanNav::Back);
+        // A hotkey acts regardless of the cursor.
+        assert_eq!(
+            plan_detail_nav(0, &actions, Key::Char(b'p')),
+            PlanNav::Act(PlanAction::Purge)
+        );
+    }
+
+    #[test]
+    fn purge_choice_nav_routes_both_choices_and_escape() {
+        assert_eq!(
+            purge_choice_nav(0, Key::Char(b'a')),
+            PlanNavPurge::Choose(PurgeChoice::Artifacts)
+        );
+        assert_eq!(
+            purge_choice_nav(0, Key::Char(b'd')),
+            PlanNavPurge::Choose(PurgeChoice::Drop)
+        );
+        assert_eq!(
+            purge_choice_nav(1, Key::Enter),
+            PlanNavPurge::Choose(PurgeChoice::Drop),
+            "enter follows the cursor"
+        );
+        assert_eq!(
+            purge_choice_nav(0, Key::Escape),
+            PlanNavPurge::Choose(PurgeChoice::Back)
+        );
+    }
+
+    #[test]
+    fn plan_page_confirms_default_no_and_return_to_the_page() {
+        for a in [
+            ConfirmAction::StashPlan,
+            ConfirmAction::PurgeArtifacts,
+            ConfirmAction::PurgeDrop,
+        ] {
+            assert!(!a.default_yes(), "{a:?} must never Enter-confirm");
+            assert!(a.is_plan_page());
+        }
+    }
+
+    // ── tui-plan-actions-page M3: text input ──
+
+    #[test]
+    fn text_mode_reads_bound_letters_as_text() {
+        // The whole reason parsing is mode-scoped: j/k/y/n/o/q are
+        // commands in normal modes but LETTERS in an input.
+        let bytes = b"jkyq nob";
+        let mut i = 0;
+        let mut typed = String::new();
+        while i < bytes.len() {
+            let (k, used) = parse_one(&bytes[i..], true).unwrap();
+            if let AnyKey::Text(TextKey::Char(c)) = k {
+                typed.push(c as char);
+            }
+            i += used;
+        }
+        assert_eq!(typed, "jkyq nob");
+        // And the same bytes in command mode are commands, not text.
+        assert!(matches!(
+            parse_one(b"j", false),
+            Some((AnyKey::Cmd(Key::Down), 1))
+        ));
+    }
+
+    #[test]
+    fn text_mode_arrows_move_and_updown_is_swallowed() {
+        assert!(matches!(
+            parse_one(b"\x1b[D", true),
+            Some((AnyKey::Text(TextKey::Left), 3))
+        ));
+        assert!(matches!(
+            parse_one(b"\x1b[C", true),
+            Some((AnyKey::Text(TextKey::Right), 3))
+        ));
+        assert!(matches!(
+            parse_one(b"\x1b[A", true),
+            Some((AnyKey::Text(TextKey::Ignore), 3)),
+        ));
+        assert!(matches!(
+            parse_one(b"\x1b", true),
+            Some((AnyKey::Text(TextKey::Esc), 1))
+        ));
+    }
+
+    #[test]
+    fn text_input_edits_at_the_cursor() {
+        let mut ti = TextInput::default();
+        for c in b"helo" {
+            text_input_nav(&mut ti, TextKey::Char(*c));
+        }
+        // Fix the typo: ← ← insert l
+        text_input_nav(&mut ti, TextKey::Left);
+        text_input_nav(&mut ti, TextKey::Left);
+        text_input_nav(&mut ti, TextKey::Char(b'l'));
+        assert_eq!(ti.buf, "helllo".replace("lll", "ll"), "insert at cursor");
+        assert_eq!(ti.buf, "hello");
+        // Backspace removes BEFORE the cursor.
+        text_input_nav(&mut ti, TextKey::Backspace);
+        assert_eq!(ti.buf, "helo");
+        // Right clamps at the end; Left at 0.
+        for _ in 0..20 {
+            text_input_nav(&mut ti, TextKey::Right);
+        }
+        assert_eq!(ti.cursor, ti.buf.len());
+        for _ in 0..20 {
+            text_input_nav(&mut ti, TextKey::Left);
+        }
+        assert_eq!(ti.cursor, 0);
+        text_input_nav(&mut ti, TextKey::Backspace); // no-op at 0
+        assert_eq!(ti.buf, "helo");
+        assert_eq!(text_input_nav(&mut ti, TextKey::Enter), InputNav::Submit);
+        assert_eq!(text_input_nav(&mut ti, TextKey::Esc), InputNav::Cancel);
+    }
+
+    #[test]
+    fn drop_arming_rejects_whitespace_padding() {
+        // codex 0daf087 regression: submit used a TRIMMED compare while
+        // the indicator used the raw buffer, so ` <stem> ` executed a
+        // drop the screen called not armed. The predicate is raw-exact
+        // and shared by both.
+        assert!(drop_armed("my-plan", "my-plan"));
+        assert!(!drop_armed(" my-plan", "my-plan"));
+        assert!(!drop_armed("my-plan ", "my-plan"));
+        assert!(!drop_armed(" my-plan ", "my-plan"));
+        assert!(!drop_armed("My-plan", "my-plan"), "no case folding");
+        assert!(!drop_armed("my-pla", "my-plan"));
+        // The trap the trimmed compare fell into:
+        assert_eq!(" my-plan ".trim(), "my-plan", "trim WOULD have matched");
+    }
+
+    #[test]
+    fn prefilled_input_starts_with_cursor_at_the_end() {
+        let ti = TextInput::prefilled("subject line");
+        assert_eq!(ti.buf, "subject line");
+        assert_eq!(ti.cursor, ti.buf.len());
     }
 
     #[test]

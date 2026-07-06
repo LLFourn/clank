@@ -87,6 +87,16 @@ pub async fn build_finish_preview(
         latest_reviewable_sha.as_ref(),
         latest_touched_plan,
     )?;
+    // A pending plan-scoped (or repo-wide) block refuses finalize as
+    // its OWN reason, never a gate state: a block is a question to the
+    // HUMAN, not a review verdict, so it must hold even on a
+    // master-only repo — where gate states are waived entirely (codex
+    // 137bd3e: the first cut mapped blocks to gate `Blocked`, which
+    // `any_registered_reviewers` skipped). Finish previously never
+    // consulted blocks at all; `--force` cannot waive this.
+    let has_pending_block = crate::cli::block::scan_blocks(repo_root)
+        .iter()
+        .any(|b| b.answer.is_none() && b.plan.as_deref().is_none_or(|p| p == plan_key.as_str()));
     let tiers =
         crate::agent_store::load_reviewer_tiers(repo_root).map_err(PreviewError::AgentLoad)?;
     let any_registered =
@@ -98,6 +108,7 @@ pub async fn build_finish_preview(
         gate_state,
         worktree_status,
         any_registered,
+        has_pending_block,
     );
 
     Ok(FinishPreviewResponse {
@@ -461,6 +472,7 @@ pub fn compute_finalize_readiness(
     gate_state: CommitGateState,
     worktree_status: PlanWorktreeStatus,
     any_registered_reviewers: bool,
+    has_pending_block: bool,
 ) -> FinalizeReadiness {
     if is_finished {
         return FinalizeReadiness::AlreadyFinished;
@@ -468,6 +480,11 @@ pub fn compute_finalize_readiness(
     let mut reasons = Vec::new();
     if latest_reviewable_sha.is_none() {
         reasons.push(FinalizeBlockReason::NoReviewableCommit);
+    }
+    // UNCONDITIONAL — unlike gate states, a pending block refuses even
+    // on a master-only repo, and `--force` cannot waive it.
+    if has_pending_block {
+        reasons.push(FinalizeBlockReason::OpenBlock);
     }
     // Master-only repo: Continued is sufficient for finalize because
     // the all-Finished rule is unreachable without registered reviewers.
@@ -613,6 +630,7 @@ mod tests {
             CommitGateState::Continued,
             PlanWorktreeStatus::Clean,
             true,
+            false,
         );
         match readiness {
             FinalizeReadiness::Blocked { reasons } => {
@@ -636,8 +654,32 @@ mod tests {
             CommitGateState::Finished,
             PlanWorktreeStatus::Clean,
             true,
+            false,
         );
         assert!(matches!(readiness, FinalizeReadiness::Ready));
+    }
+
+    #[test]
+    fn finalize_refuses_an_open_block_even_on_a_master_only_repo() {
+        // codex 137bd3e: blocks-as-gate-state was skipped by the
+        // `any_registered_reviewers` waiver, so a master-only repo
+        // finalized over an open human block. OpenBlock is its own
+        // UNCONDITIONAL reason.
+        let sha = CommitSha::parse(&"a".repeat(40)).unwrap();
+        let readiness = compute_finalize_readiness(
+            false,
+            Some(&sha),
+            CommitGateState::Continued,
+            PlanWorktreeStatus::Clean,
+            false, // master-only: every gate state is waived...
+            true,  // ...but the pending block is not
+        );
+        match readiness {
+            FinalizeReadiness::Blocked { reasons } => {
+                assert_eq!(reasons, vec![FinalizeBlockReason::OpenBlock]);
+            }
+            other => panic!("expected Blocked, got {other:?}"),
+        }
     }
 
     #[test]
@@ -650,6 +692,7 @@ mod tests {
             Some(&sha),
             CommitGateState::Continued,
             PlanWorktreeStatus::Clean,
+            false,
             false,
         );
         assert!(matches!(readiness, FinalizeReadiness::Ready));

@@ -114,6 +114,13 @@ pub enum FinalizeBlockReason {
     NotFinished {
         state: crate::vocab::CommitGateState,
     },
+    /// An unanswered plan-scoped (or repo-wide) block is pending. Its
+    /// own reason — NOT a `NotFinished` gate state — because a block
+    /// is a question to the HUMAN, not a review verdict: it must
+    /// refuse finalize even on a master-only repo (where gate states
+    /// are waived entirely) and `finish --force` must not waive it
+    /// (tui-plan-actions-page, codex 137bd3e).
+    OpenBlock,
     PlanFileMissing,
     PlanFileDirty,
 }

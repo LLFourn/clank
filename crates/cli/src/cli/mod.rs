@@ -1242,6 +1242,13 @@ pub struct FinishArgs {
     /// (no history rewrite happens there).
     #[arg(long)]
     pub dry: bool,
+    /// Finalize even when the review gate hasn't said FINISHED
+    /// (unreviewed / continued / changes-requested / pending gate tier).
+    /// Bypasses ONLY the review-gate readiness: messages stay mandatory,
+    /// autosquash still applies, and safety refusals (dirty plan file,
+    /// missing plan file, open human block, no reviewable commit) stand.
+    #[arg(long)]
+    pub force: bool,
     /// Skip the on-disk state cache: don't read it, don't write it.
     #[arg(long)]
     pub no_cache: bool,

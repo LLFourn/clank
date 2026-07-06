@@ -53,8 +53,159 @@ fn finish_args(repo: &Path, plan: &str, squash: Option<&str>) -> clank::cli::Fin
         into_branch: None,
         allow_rewrite_protected: false,
         dry: false,
+        force: false,
         no_cache: true,
     }
+}
+
+#[test]
+fn finish_refuses_an_unreviewed_plan_and_hints_force() {
+    let env = TestEnv::init();
+    env.register_team("claude", &["codex"], &[]);
+    let repo = env.repo();
+    write(repo, ".clank/plans/foo.md", "# foo\n\nbody\n");
+    commit(repo, "[foo] intro");
+
+    let mut args = finish_args(repo, "foo", None);
+    args.message = vec!["finish foo now".into(), "it is wanted regardless".into()];
+    let err = block_on(clank::cli::finish::run(args)).expect_err("unreviewed must refuse");
+    let text = err.to_string();
+    assert!(text.contains("hasn't been reviewed"), "{text}");
+    assert!(
+        text.contains("--force"),
+        "waivable refusal must hint --force: {text}"
+    );
+}
+
+#[test]
+fn finish_force_bypasses_the_review_gate() {
+    let env = TestEnv::init();
+    env.register_team("claude", &["codex"], &[]);
+    let repo = env.repo();
+    write(repo, ".clank/plans/foo.md", "# foo\n\nbody\n");
+    commit(repo, "[foo] intro");
+
+    let mut args = finish_args(repo, "foo", None);
+    args.message = vec!["ship foo anyway".into(), "lloyd's call".into()];
+    args.force = true;
+    block_on(clank::cli::finish::run(args)).expect("force finish on unreviewed gate");
+
+    assert!(repo.join(".clank/finished/foo.md").exists());
+    assert!(!repo.join(".clank/plans/foo.md").exists());
+    assert_eq!(
+        git_out(repo, &["log", "-1", "--format=%s"]),
+        "[foo] ship foo anyway",
+        "the finalize commit carries the forced message"
+    );
+}
+
+#[test]
+fn finish_force_still_refuses_a_dirty_plan_file() {
+    // Force waives the review gate ONLY — file-safety refusals stand,
+    // and a mixed blocker set refuses whole (force never partially
+    // applies).
+    let env = TestEnv::init();
+    env.register_team("claude", &["codex"], &[]);
+    let repo = env.repo();
+    write(repo, ".clank/plans/foo.md", "# foo\n\nbody\n");
+    commit(repo, "[foo] intro");
+    write(
+        repo,
+        ".clank/plans/foo.md",
+        "# foo\n\nEDITED, uncommitted\n",
+    );
+
+    let mut args = finish_args(repo, "foo", None);
+    args.message = vec!["finish foo now".into(), "it is wanted regardless".into()];
+    args.force = true;
+    let err = block_on(clank::cli::finish::run(args)).expect_err("dirty plan file must refuse");
+    let text = err.to_string();
+    assert!(text.contains("uncommitted"), "{text}");
+    assert!(
+        !text.contains("--force finalizes anyway"),
+        "no force hint when force can't apply: {text}"
+    );
+}
+
+#[test]
+fn finish_force_still_refuses_an_open_block() {
+    // An open block is a pending HUMAN question, not a review verdict —
+    // force must not bury it.
+    let env = TestEnv::init();
+    env.register_team("claude", &["codex"], &[]);
+    let repo = env.repo();
+    write(repo, ".clank/plans/foo.md", "# foo\n\nbody\n");
+    commit(repo, "[foo] intro");
+    write(
+        repo,
+        ".clank/agents/codex/blocks/foo/which-api.md",
+        "Which API shape?\n",
+    );
+
+    let mut args = finish_args(repo, "foo", None);
+    args.message = vec!["finish foo now".into(), "it is wanted regardless".into()];
+    args.force = true;
+    let err = block_on(clank::cli::finish::run(args)).expect_err("open block must refuse");
+    assert!(err.to_string().contains("block"), "{err}");
+}
+
+#[test]
+fn finish_refuses_an_open_block_on_a_master_only_repo() {
+    // codex 137bd3e: the first block fix rode the gate state, which a
+    // master-only repo waives entirely (`any_registered_reviewers`),
+    // so the finalize still buried the question. OpenBlock is its own
+    // unconditional reason — and --force must not waive it either.
+    let env = TestEnv::init();
+    env.register_team("claude", &[], &[]);
+    let repo = env.repo();
+    write(repo, ".clank/plans/foo.md", "# foo\n\nbody\n");
+    commit(repo, "[foo] intro");
+    write(
+        repo,
+        ".clank/agents/claude/blocks/foo/which-api.md",
+        "Which API shape?\n",
+    );
+
+    let mut args = finish_args(repo, "foo", None);
+    args.message = vec!["finish foo now".into(), "it is wanted regardless".into()];
+    let err = block_on(clank::cli::finish::run(args)).expect_err("master-only block must refuse");
+    assert!(err.to_string().contains("block"), "{err}");
+
+    let mut forced = finish_args(repo, "foo", None);
+    forced.message = vec!["finish foo now".into(), "it is wanted regardless".into()];
+    forced.force = true;
+    let err =
+        block_on(clank::cli::finish::run(forced)).expect_err("force must not waive the block");
+    assert!(err.to_string().contains("block"), "{err}");
+    assert!(repo.join(".clank/plans/foo.md").exists(), "not finalized");
+}
+
+#[test]
+fn finish_refuses_an_open_block_even_when_the_gate_is_finished() {
+    // Pre-force, finish never consulted blocks — a finalize could bury
+    // an unanswered human question. Block precedence now mirrors
+    // derive_status: pending block dominates ANY gate verdict.
+    let env = TestEnv::init();
+    env.register_team("claude", &["codex"], &[]);
+    let repo = env.repo();
+    write(repo, ".clank/plans/foo.md", "# foo\n\nbody\n");
+    commit(repo, "[foo] intro");
+    let intro = git_out(repo, &["rev-parse", "HEAD"]);
+    write(
+        repo,
+        &format!(".clank/agents/codex/feedback/{}.md", &intro[..7]),
+        "FINISHED ship it\n",
+    );
+    write(
+        repo,
+        ".clank/agents/codex/blocks/foo/which-api.md",
+        "Which API shape?\n",
+    );
+
+    let mut args = finish_args(repo, "foo", None);
+    args.message = vec!["finish foo now".into(), "it is wanted regardless".into()];
+    let err = block_on(clank::cli::finish::run(args)).expect_err("open block dominates FINISHED");
+    assert!(err.to_string().contains("block"), "{err}");
 }
 
 #[test]

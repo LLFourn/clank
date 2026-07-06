@@ -134,7 +134,7 @@ pub async fn run(mut args: FinishArgs) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    if !dispatch_readiness(&preview)? {
+    if !dispatch_readiness(&preview, args.force)? {
         return Ok(());
     }
 
@@ -422,7 +422,14 @@ async fn rewrite_with_state(
 /// when the caller should continue with finalize, `false` for the
 /// no-op "already finished" case (so the caller can return cleanly
 /// without `std::process::exit` cutting tokio's shutdown short).
-fn dispatch_readiness(preview: &FinishPreviewResponse) -> anyhow::Result<bool> {
+///
+/// `force` waives ONLY review-gate blockers — `NotFinished` in any
+/// state except `Blocked` (an open human block is a pending question,
+/// not a review verdict; answer or clean it first). Safety blockers
+/// (dirty/missing plan file, no reviewable commit) always stand, and
+/// EVERY reason must be waivable or the whole finish refuses — force
+/// never partially applies (tui-plan-actions-page).
+fn dispatch_readiness(preview: &FinishPreviewResponse, force: bool) -> anyhow::Result<bool> {
     match &preview.readiness {
         FinalizeReadiness::Ready => Ok(true),
         FinalizeReadiness::AlreadyFinished => {
@@ -430,14 +437,39 @@ fn dispatch_readiness(preview: &FinishPreviewResponse) -> anyhow::Result<bool> {
             Ok(false)
         }
         FinalizeReadiness::Blocked { reasons } => {
+            if force && reasons.iter().all(gate_waivable) {
+                for r in reasons {
+                    if let FinalizeBlockReason::NotFinished { state } = r {
+                        println!("force: review gate bypassed (gate was {})", state.as_str());
+                    }
+                }
+                return Ok(true);
+            }
             let lines: Vec<String> = reasons.iter().map(reason_to_msg).collect();
+            let hint = if !force && reasons.iter().all(gate_waivable) {
+                "\n  (--force finalizes anyway, bypassing the review gate)"
+            } else {
+                ""
+            };
             anyhow::bail!(
-                "cannot finalize `{}`:\n  - {}",
+                "cannot finalize `{}`:\n  - {}{}",
                 preview.plan_id,
                 lines.join("\n  - "),
+                hint,
             )
         }
     }
+}
+
+/// A blocker `--force` may waive: a review-gate verdict state. Open
+/// blocks and file-safety refusals are NOT waivable.
+fn gate_waivable(reason: &FinalizeBlockReason) -> bool {
+    matches!(
+        reason,
+        FinalizeBlockReason::NotFinished {
+            state
+        } if !matches!(state, clank_core::vocab::CommitGateState::Blocked)
+    )
 }
 
 fn reason_to_msg(reason: &FinalizeBlockReason) -> String {
@@ -474,6 +506,11 @@ fn reason_to_msg(reason: &FinalizeBlockReason) -> String {
                     .into()
             }
         },
+        FinalizeBlockReason::OpenBlock => {
+            "plan has an open block — answer it (or `clank block clean`) before finalize; \
+             `--force` does not bypass blocks"
+                .into()
+        }
         FinalizeBlockReason::PlanFileMissing => "plan file is missing from the worktree".into(),
         FinalizeBlockReason::PlanFileDirty => {
             "plan file has uncommitted changes; commit or stash first".into()
