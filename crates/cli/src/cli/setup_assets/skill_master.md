@@ -7,12 +7,12 @@ review gate.
 ### Invariants — MUST follow
 
 - **Commit → STOP → get woken.** After you COMMIT ANYTHING, stop and
-  yield to the Stop hook for review. This includes an implementation
+  yield for review. This includes an implementation
   milestone, a plan revision, AND PROMOTING a plan from the queue
   (promotion is a plan commit that must clear intro review). Do NOT keep
   working past a commit — you will be woken when the gate has acted.
 - **NEVER finalize on your own judgment.** Run `clank finish <plan> -m "…"`
-  ONLY when the Stop hook hands you a finalize item (the gate reached
+  ONLY when clank hands you a finalize item (the gate reached
   FINISHED).
 - **Gate on REVIEWERS, not humans.** The queue is an instruction, not a
   question — never block the queue to ask permission to do queued work.
@@ -38,7 +38,7 @@ must amend BEFORE anything else proceeds. Three ways to break it:
 
 ### The loop
 
-`clank wait` (or the Stop hook) hands you work. Common kinds:
+`clank wait` hands you work. Common kinds:
 - **implement / continue** — do the next plan milestone, commit, STOP.
 - **address feedback** (REQUEST_CHANGES) — make the change, commit, STOP.
 - **promote** — EVALUATE the queued plan FIRST: read it, confirm it is
@@ -84,4 +84,4 @@ must amend BEFORE anything else proceeds. Three ways to break it:
 Reviewers write CONTINUE / FINISHED / REQUEST_CHANGES on your commits;
 read them with `clank feedback read --commit <sha>`. CONTINUE → keep
 going. REQUEST_CHANGES → address it, re-commit, STOP. Gate FINISHED →
-the Stop hook will hand you a finalize item.
+you will be handed a finalize item.

@@ -45,12 +45,41 @@ const OBSOLETE_SKILL: &str = "clank";
 const MASTER_DESC: &str = "Clank multi-agent workflow, MASTER role. Use ONLY when you are the master in a clank repo (implement plan milestones, promote/finish plans, manage the roster). Do NOT use as a reviewer — use clank-reviewer instead.";
 const REVIEWER_DESC: &str = "Clank multi-agent workflow, REVIEWER role. Use ONLY when you are a reviewer in a clank repo (review commits and write verdicts). Do NOT use as the master — use clank-master instead.";
 
+/// How each tool's agents receive work (claude-stop-hook-minimal-hint):
+/// claude parks an armed background `clank wait` whose completion wake
+/// carries the items — the skill must teach the arm/act/re-arm loop.
+/// Codex is driven by the Stop hook blocking with the items directly.
+/// Both variants keep the shared hint sentence the tests pin.
+const WORK_LOOP_CLAUDE: &str = "\
+- **Keep a `clank wait` armed.** End every turn with `clank wait`
+  running as its OWN background task (Bash, `run_in_background: true`).
+  Its completion is your wake: act on the items it printed IMMEDIATELY,
+  then re-arm `clank wait` and end your turn. If you stop with nothing
+  armed, the Stop hook reminds you to arm one. Run `clank status` if you
+  need more than the hint carries (short SHAs resolve wherever a `<sha>`
+  is wanted).
+  Each item is a one-line hint: kind, plan, short sha.
+- **NEVER poll.** Do not run `clank wait` in the FOREGROUND and do not
+  re-run `clank status` waiting for state to change. The armed
+  background wait wakes you; do not spin.";
+
+const WORK_LOOP_CODEX: &str = "\
+- **Act on Stop-hook work IMMEDIATELY, then YIELD.** When the Stop hook
+  hands you work, do it now. codex surfaces this as a
+  `Stop hook (blocked) feedback:` message. Run `clank status` if you
+  need more than the hint carries (short SHAs resolve wherever a `<sha>`
+  is wanted).
+  Each item is a one-line hint: kind, plan, short sha.
+- **NEVER poll.** Do not loop on `clank wait` or re-run `clank status`
+  waiting for state to change. STOP — the Stop hook re-invokes you when
+  there is work. You WILL be woken; do not spin.";
+
 /// Compose a role's `SKILL.md` for a tool from the shared single-source
 /// fragments: frontmatter (role-guarded description) + a role-guard
 /// line + shared core + the role body, plus the claude-only `/clank`
-/// slash command. Tool differences (`{{SHELL}}`, the codex stop-hook
-/// note) are substituted, never duplicated. Pure — unit-tested without
-/// touching the filesystem.
+/// slash command. Tool differences (`{{SHELL}}`, the per-tool
+/// `{{WORK_LOOP}}` work-delivery teaching) are substituted, never
+/// duplicated. Pure — unit-tested without touching the filesystem.
 pub fn compose_skill(role: Role, tool: Tool) -> String {
     let (name, description, body, other) = match role {
         Role::Master => (MASTER_SKILL, MASTER_DESC, SKILL_MASTER_BODY, REVIEWER_SKILL),
@@ -69,7 +98,7 @@ pub fn compose_skill(role: Role, tool: Tool) -> String {
     out.push_str(&format!(
         "> ROLE GUARD: this skill is for the **{role}** role. If your role \
          in this repo is not {role}, stop and use `{other}` instead — your \
-         role is what `clank status` and the Stop-hook hint report.\n\n",
+         role is what `clank status` and your work items report.\n\n",
         role = role.as_str(),
     ));
     out.push_str(SKILL_SHARED_CORE);
@@ -82,12 +111,12 @@ pub fn compose_skill(role: Role, tool: Tool) -> String {
         Tool::Claude => "Bash",
         Tool::Codex => "shell",
     };
-    let stop_hook_note = match tool {
-        Tool::Claude => "",
-        Tool::Codex => " codex surfaces this as a `Stop hook (blocked) feedback:` message.",
+    let work_loop = match tool {
+        Tool::Claude => WORK_LOOP_CLAUDE,
+        Tool::Codex => WORK_LOOP_CODEX,
     };
     out.replace("{{SHELL}}", shell)
-        .replace("{{STOP_HOOK_NOTE}}", stop_hook_note)
+        .replace("{{WORK_LOOP}}", work_loop)
 }
 
 /// Stable identifier we write onto every clank-owned hook entry
@@ -746,6 +775,22 @@ mod tests {
         // Codex carries the stop-hook phrasing note; claude does not.
         assert!(mx.contains("Stop hook (blocked) feedback:"));
         assert!(!mc.contains("Stop hook (blocked) feedback:"));
+    }
+
+    #[test]
+    fn work_loop_teaches_the_per_tool_delivery_model() {
+        // claude-stop-hook-minimal-hint: claude agents park an armed
+        // background `clank wait` whose completion wake carries the
+        // items; codex agents are driven by the Stop hook blocking
+        // with the items directly.
+        let mc = compose_skill(Role::Master, Tool::Claude);
+        let mx = compose_skill(Role::Master, Tool::Codex);
+        assert!(mc.contains("Keep a `clank wait` armed"));
+        assert!(mc.contains("run_in_background"));
+        assert!(mc.contains("re-arm"));
+        assert!(!mc.contains("Act on Stop-hook work"));
+        assert!(mx.contains("Act on Stop-hook work IMMEDIATELY"));
+        assert!(!mx.contains("run_in_background"));
     }
 
     #[test]

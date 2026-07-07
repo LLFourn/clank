@@ -8,6 +8,15 @@
 //! per-tool wire shape (claude: exit 2 + stderr; codex: exit
 //! 0 + stdout JSON; everything else exit 0).
 //!
+//! The two tools get different work-delivery models
+//! (claude-stop-hook-minimal-hint): **claude** never waits in-hook and
+//! never renders work items — its only continuation is the
+//! self-extinguishing "arm `clank wait` as a background task" hint, and
+//! the armed wait's completion wake delivers the work (claude wakes the
+//! session when a background task finishes). **codex** has no such wake
+//! channel, so its hook long-polls `clank wait` in-hook and blocks with
+//! the rendered items.
+//!
 //! **The hook NEVER fails the agent.** Every error path
 //! produces [`HookOutcome::Diagnostic`] which exits 0 with a
 //! human-readable stderr line. A non-zero exit from this binary
@@ -69,6 +78,10 @@ struct Trace {
     effective_auto: Option<AutoMode>,
     role: Option<Role>,
     disposition: Option<&'static str>,
+    /// WHICH continue branch fired — recorded, not re-derived (matching
+    /// the silent branches): `arm_wait_nudge` (the minimal hint) vs
+    /// `wait_items` (codex's rendered work items).
+    continue_kind: Option<&'static str>,
 }
 
 /// Cap on captured text (the last assistant message, continue reasons):
@@ -100,6 +113,7 @@ impl Trace {
             effective_auto: None,
             role: None,
             disposition: None,
+            continue_kind: None,
         }
     }
 
@@ -187,6 +201,7 @@ impl Trace {
             "effective_auto": self.effective_auto.map(|m| format!("{m:?}").to_lowercase()),
             "role": self.role.map(|r| format!("{r:?}").to_lowercase()),
             "disposition": self.disposition,
+            "continue_kind": self.continue_kind,
             "decision": decision,
             "reason": reason,
         });
@@ -297,9 +312,12 @@ async fn compute_outcome(
                 Ok(true) => HookOutcome::Silent {
                     why: SilentReason::BusyOwnWork,
                 },
-                Ok(false) => HookOutcome::Continue {
-                    reason: nudge_reason(&input),
-                },
+                Ok(false) => {
+                    trace.continue_kind = Some("arm_wait_nudge");
+                    HookOutcome::Continue {
+                        reason: nudge_reason(&input),
+                    }
+                }
                 // Fail-soft: if the peek can't run, yield rather than nudge
                 // (the process still wakes the agent; no forced turn on doubt).
                 Err(_) => HookOutcome::Silent {
@@ -307,10 +325,31 @@ async fn compute_outcome(
                 },
             },
             // NoBackgroundWork (YieldArmed already returned above): genuinely idle.
-            _ => {
-                let wait_timeout = cfg.as_ref().and_then(|c| c.wait_timeout.clone());
-                compute_wait_outcome(&repo, &label, role, wait_timeout.as_deref()).await
-            }
+            _ => match tool {
+                // Claude never waits in-hook and never renders work items —
+                // the hook's only continuation is the arm-the-wait hint, and
+                // the armed wait's completion wake delivers the work. Work
+                // presence is deliberately NOT consulted: if work exists the
+                // armed wait exits immediately and the wake carries it
+                // (claude-stop-hook-minimal-hint).
+                Tool::Claude => {
+                    trace.continue_kind = Some("arm_wait_nudge");
+                    HookOutcome::Continue {
+                        reason: nudge_reason(&input),
+                    }
+                }
+                // Codex has no background-task wake channel, so the in-hook
+                // long-poll + block-with-items model stays.
+                Tool::Codex => {
+                    let wait_timeout = cfg.as_ref().and_then(|c| c.wait_timeout.clone());
+                    let outcome =
+                        compute_wait_outcome(&repo, &label, role, wait_timeout.as_deref()).await;
+                    if matches!(outcome, HookOutcome::Continue { .. }) {
+                        trace.continue_kind = Some("wait_items");
+                    }
+                    outcome
+                }
+            },
         },
     }
 }
@@ -359,20 +398,32 @@ async fn peek_has_work(repo: &Path, label: &AgentLabel, role: Role) -> Result<bo
     }
 }
 
-/// The continuation that nudges the agent to start its own backgrounded
-/// `clank wait` alongside a live process. Wording matches the spike that
-/// validated compliance — explicit and copy-pasteable (a vague hint is the
-/// failure mode). Deliberately does NOT echo the task command lines: the
-/// agent knows what it backgrounded, and real commands (multi-clause
+/// The continuation that nudges the agent to arm its own backgrounded
+/// `clank wait` — the ONLY continuation the claude hook ever emits, and
+/// self-extinguishing: once armed, the next Stop is `YieldArmed`-silent.
+/// The core instruction's wording matches the spike that validated
+/// compliance — explicit and copy-pasteable (a vague hint is the failure
+/// mode). Deliberately does NOT echo the task command lines: the agent
+/// knows what it backgrounded, and real commands (multi-clause
 /// `until …; do sleep …` one-liners) turned the nudge into a wall of shell
 /// that buried the instruction (lloyd, dark-skippy). Only the COUNT is
-/// stated.
+/// stated. With no background work the preamble/tail change; the
+/// instruction does not.
 fn nudge_reason(input: &HookInput) -> String {
+    const CORE: &str = "Start `clank wait` as its OWN background task now — \
+         call the Bash tool with command `clank wait` and run_in_background \
+         set to true — then end your turn.";
     let count = input
         .background_tasks
         .iter()
         .filter(|t| !t.is_clank_wait())
         .count();
+    if count == 0 {
+        return format!(
+            "Nothing is watching for clank work. {CORE} It will wake you \
+             the moment there is clank work for you."
+        );
+    }
     let what = if count > 1 {
         format!("{count} background tasks")
     } else {
@@ -380,15 +431,13 @@ fn nudge_reason(input: &HookInput) -> String {
     };
     format!(
         "You ended your turn with {what} still running, but nothing is \
-         watching for clank review work. Start `clank wait` as its OWN \
-         background task now — call the Bash tool with command `clank wait` \
-         and run_in_background set to true — then end your turn. That way \
-         EITHER the background task finishing OR new clank review work will \
-         wake you."
+         watching for clank review work. {CORE} That way EITHER the \
+         background task finishing OR new clank review work will wake you."
     )
 }
 
-/// Long-poll via a self-spawned `clank wait --json`.
+/// Long-poll via a self-spawned `clank wait --json`. CODEX-ONLY:
+/// claude's hook never waits in-hook (see the module doc).
 /// Reuses the watcher loop without refactoring it. On items →
 /// Continue. On timeout (exit 2) → Silent. Anything else →
 /// Diagnostic.
@@ -538,7 +587,8 @@ fn parse_wait_json(raw: &[u8]) -> Result<Vec<WaitItem>, String> {
 }
 
 /// Render wait's JSON `items` array into the continuation prompt
-/// body. Loose stringly-typed projection because we're consuming
+/// body — codex-only; claude's hook never delivers items (see the
+/// module doc). Loose stringly-typed projection because we're consuming
 /// our own JSON output via subprocess. One MINIMAL line per item
 /// — who/verb + plan + 12-char sha (`wait-output-is-a-minimal-hint`):
 /// the HOW (feedback-write form, verdicts, promote evaluation,
@@ -904,6 +954,79 @@ mod tests {
             "{reason}"
         );
         assert!(!reason.contains("cargo"), "no command text: {reason}");
+    }
+
+    #[tokio::test]
+    async fn claude_idle_nudges_to_arm_wait_and_never_renders_items() {
+        // claude-stop-hook-minimal-hint: on claude the idle branch blocks
+        // with the arm-the-wait hint and NEVER runs the in-hook wait —
+        // even when work exists RIGHT NOW (here: a dirty plan file the
+        // master must commit, which a wait would return immediately).
+        // The armed wait's completion wake is what delivers the items.
+        use crate::cli::teams_config::{AgentDescription, RosterRole};
+        let dir = init_repo();
+        let repo = dir.path();
+        let label = bind(repo, "claude", "sess-claude-idle");
+        crate::agent_store::set_auto_mode(repo, &label, AutoMode::On).unwrap();
+        crate::cli::agent::add_repo_roster_agent(
+            repo,
+            &label,
+            AgentDescription {
+                tool: Tool::Claude,
+                launch: None,
+                initial_prompt: None,
+            },
+            RosterRole::Commit,
+        )
+        .unwrap();
+        crate::cli::agent::set_repo_master(repo, &label).unwrap();
+        std::fs::create_dir_all(repo.join(".clank/plans")).unwrap();
+        std::fs::write(repo.join(".clank/plans/some-plan.md"), "# some-plan\n").unwrap();
+
+        let mut trace = Trace::new(Tool::Claude);
+        let input = hook_input("sess-claude-idle", None);
+        trace.record_input(&input);
+        let outcome = compute_outcome(Tool::Claude, Some(repo), input, &mut trace).await;
+        let HookOutcome::Continue { reason } = &outcome else {
+            panic!("expected the arm-the-wait Continue, got {outcome:?}");
+        };
+        assert!(
+            reason.contains("Nothing is watching for clank work"),
+            "{reason}"
+        );
+        assert!(reason.contains("Start `clank wait` as its OWN"), "{reason}");
+        assert!(
+            !reason.contains("some-plan") && !reason.contains("  - "),
+            "the hint must carry no work items: {reason}"
+        );
+        trace.finalize(&outcome);
+
+        let rec = read_trace(&repo.join(".clank/agents/claude/stop-hook.json"));
+        assert_eq!(rec["decision"], "continue");
+        assert_eq!(rec["continue_kind"], "arm_wait_nudge");
+        assert_eq!(rec["disposition"], "no_background_work");
+    }
+
+    #[test]
+    fn idle_nudge_keeps_the_instruction_without_a_background_preamble() {
+        let input: HookInput = serde_json::from_value(serde_json::json!({
+            "session_id": "sess-idle-nudge",
+            "cwd": "/tmp",
+            "stop_hook_active": false,
+            "background_tasks": [],
+        }))
+        .unwrap();
+        let reason = nudge_reason(&input);
+        assert!(
+            reason.contains("Nothing is watching for clank work"),
+            "{reason}"
+        );
+        assert!(reason.contains("Start `clank wait` as its OWN"), "{reason}");
+        assert!(reason.contains("run_in_background set to true"), "{reason}");
+        assert!(
+            !reason.contains("still running"),
+            "no background-task preamble when idle: {reason}"
+        );
     }
 
     #[test]

@@ -25,7 +25,7 @@ You review the master's commits and write verdicts. That is all.
 
 ### The loop
 
-When the Stop hook hands you review work: read THAT commit's diff, then
+When you are handed review work: read THAT commit's diff, then
 write exactly ONE verdict, then STOP (you'll be woken for the next).
 Compose the command yourself:
 

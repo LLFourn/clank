@@ -192,9 +192,10 @@ pub enum SilentReason {
     BusyOwnWork,
     /// The peek couldn't run; fail-soft yield.
     PeekFailed,
-    /// The wait returned no items.
+    /// The in-hook wait returned no items (codex-only branch — the
+    /// claude hook never waits in-hook).
     NoWork,
-    /// The wait timed out with no work.
+    /// The in-hook wait timed out with no work (codex-only branch).
     WaitTimeout,
 }
 

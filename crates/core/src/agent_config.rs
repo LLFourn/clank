@@ -47,6 +47,11 @@ pub struct AgentConfig {
     /// `clank wait --timeout` accepts; validated by the CLI's
     /// existing `parse_timeout` at use site, not load site (one
     /// source of truth for the format).
+    ///
+    /// Consumed only by the CODEX stop hook's in-hook wait. The claude
+    /// hook never waits (claude-stop-hook-minimal-hint): it nudges the
+    /// agent to arm its own backgrounded `clank wait`, which runs
+    /// indefinitely.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wait_timeout: Option<String>,
     /// Session this agent label is currently bound to. Written by
