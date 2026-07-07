@@ -128,6 +128,7 @@ fn queue_dir(repo: &Path) -> PathBuf {
     repo.join(".clank/queue")
 }
 
+#[derive(Debug)]
 pub struct QueueEntry {
     pub priority: u16,
     pub name: String,
@@ -153,7 +154,12 @@ pub fn scan_queue_no_dups(repo: &Path) -> anyhow::Result<Vec<QueueEntry>> {
         .map(|(name, v)| {
             let files: Vec<String> = v
                 .iter()
-                .map(|e| format!("{:03}-{}.md", e.priority, e.name))
+                .map(|e| {
+                    e.path
+                        .file_name()
+                        .map(|f| f.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| format!("{:03}-{}.md", e.priority, e.name))
+                })
                 .collect();
             (name.to_string(), files)
         })
@@ -172,6 +178,31 @@ pub fn scan_queue_no_dups(repo: &Path) -> anyhow::Result<Vec<QueueEntry>> {
     );
 }
 
+/// Default priority for queue files WITHOUT a `NNN-` prefix: the end
+/// of the queue — explicit priorities always sort sooner
+/// (lenient-queue-filenames).
+pub const DEFAULT_QUEUE_PRIORITY: u16 = 999;
+
+/// Parse a queue file stem into `(priority, name)`. Lenient by design
+/// (lenient-queue-filenames): the strict `NNN-name` shape is a WRITER
+/// convention, not a reader contract — a hand-dropped `foo.md` must
+/// not be silently invisible. Split at the FIRST `-`: 1–3 ASCII
+/// digits on the left = an explicit priority (zero-padding optional,
+/// so `12-foo` works); anything else — no dash, non-digits (`2fa-x`),
+/// out-of-range digits (`1234-x`) — is a NAME at
+/// [`DEFAULT_QUEUE_PRIORITY`]. Total: every stem parses.
+pub fn parse_queue_stem(stem: &str) -> (u16, String) {
+    if let Some((left, rest)) = stem.split_once('-')
+        && (1..=3).contains(&left.len())
+        && left.bytes().all(|b| b.is_ascii_digit())
+        && !rest.is_empty()
+        && let Ok(priority) = left.parse::<u16>()
+    {
+        return (priority, rest.to_string());
+    }
+    (DEFAULT_QUEUE_PRIORITY, stem.to_string())
+}
+
 pub fn scan_queue(repo: &Path) -> Vec<QueueEntry> {
     let dir = queue_dir(repo);
     let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -184,13 +215,7 @@ pub fn scan_queue(repo: &Path) -> Vec<QueueEntry> {
         let Some(stem) = s.strip_suffix(".md") else {
             continue;
         };
-        if stem.len() < 5 || stem.as_bytes()[3] != b'-' {
-            continue;
-        }
-        let Ok(priority) = stem[..3].parse::<u16>() else {
-            continue;
-        };
-        let name = stem[4..].to_string();
+        let (priority, name) = parse_queue_stem(stem);
         out.push(QueueEntry {
             priority,
             name,
@@ -403,16 +428,73 @@ mod tests {
     }
 
     #[test]
-    fn scan_queue_ignores_malformed_filenames() {
+    fn scan_queue_accepts_every_md_with_lenient_priorities() {
+        // lenient-queue-filenames: the strict NNN- shape is a writer
+        // convention; the READER accepts every .md. Un-prefixed and
+        // out-of-range stems are NAMES at the default 999 (end of the
+        // queue); short digit prefixes parse (zero-padding optional).
         let dir = tempfile::tempdir().unwrap();
         let q = dir.path().join(".clank/queue");
         write(&q.join("100-good.md"), "ok\n");
         write(&q.join("bad.md"), "no prefix\n");
         write(&q.join("1000-overflow.md"), "4 digits\n");
+        write(&q.join("12-short.md"), "2-digit prefix\n");
         write(&q.join("notes.txt"), "not md\n");
         let entries = scan_queue(dir.path());
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].name, "good");
+        let got: Vec<(u16, &str)> = entries
+            .iter()
+            .map(|e| (e.priority, e.name.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (12, "short"),
+                (100, "good"),
+                (999, "1000-overflow"),
+                (999, "bad"),
+            ],
+            "explicit priorities sort sooner; bare files at 999 tie-break by name"
+        );
+    }
+
+    #[test]
+    fn parse_queue_stem_edges() {
+        assert_eq!(parse_queue_stem("500-foo"), (500, "foo".into()));
+        assert_eq!(parse_queue_stem("012-foo"), (12, "foo".into()));
+        assert_eq!(parse_queue_stem("0-foo"), (0, "foo".into()));
+        assert_eq!(parse_queue_stem("foo"), (999, "foo".into()));
+        // Not all digits before the first dash → a name.
+        assert_eq!(parse_queue_stem("2fa-support"), (999, "2fa-support".into()));
+        // Four digits exceed 0-999 → a name, not a bad priority.
+        assert_eq!(parse_queue_stem("1234-foo"), (999, "1234-foo".into()));
+        // A dash with nothing after it is a name, not an empty stem.
+        assert_eq!(parse_queue_stem("123-"), (999, "123-".into()));
+    }
+
+    #[test]
+    fn bare_and_prefixed_same_stem_is_a_duplicate_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = dir.path().join(".clank/queue");
+        write(&q.join("foo.md"), "bare\n");
+        write(&q.join("500-foo.md"), "prefixed\n");
+        let err = scan_queue_no_dups(dir.path()).expect_err("duplicate stems");
+        let text = err.to_string();
+        assert!(text.contains("foo"), "{text}");
+        assert!(
+            text.contains("foo.md") && text.contains("500-foo.md"),
+            "names the ACTUAL files on disk: {text}"
+        );
+    }
+
+    #[test]
+    fn reprioritise_canonicalizes_a_bare_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = dir.path().join(".clank/queue");
+        write(&q.join("foo.md"), "bare\n");
+        let dest = set_priority(dir.path(), "foo", 42).unwrap();
+        assert!(dest.ends_with("042-foo.md"), "{dest:?}");
+        assert!(!q.join("foo.md").exists(), "bare file renamed away");
+        assert!(q.join("042-foo.md").exists());
     }
 
     fn inline(body: &str) -> BodySource {

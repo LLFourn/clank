@@ -149,8 +149,9 @@ pub async fn run_push(args: StashPushArgs) -> anyhow::Result<()> {
             anyhow::bail!("--priority only applies with --to-queue");
         }
     } else if let Some(p) = args.priority {
-        // Mirrors `clank queue add`: scan_queue only recognizes
-        // three-digit priorities.
+        // Mirrors `clank queue add`'s writer range (0-999); the
+        // reader is lenient (lenient-queue-filenames) but writers
+        // stay canonical.
         if p > 999 {
             anyhow::bail!("--priority must be 0-999 (matches `clank queue add`)");
         }
