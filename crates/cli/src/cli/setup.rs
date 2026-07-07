@@ -750,7 +750,7 @@ mod tests {
 
     #[test]
     fn skills_teach_compose_from_hint_not_verbatim() {
-        // wfw-output-is-a-minimal-hint: the wake carries no verbatim
+        // wait-output-is-a-minimal-hint: the wake carries no verbatim
         // command; the shared core teaches composing from the hint.
         const HINT_SENTENCE: &str = "Each item is a one-line hint: kind, plan, short sha.";
         for role in [Role::Master, Role::Reviewer] {

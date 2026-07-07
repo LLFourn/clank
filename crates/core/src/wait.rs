@@ -819,9 +819,8 @@ impl RepoState {
                 //
                 // Block precedence still wins (handled by the
                 // `continue` above), so this only runs for unblocked
-                // plans.
-                //
-                // Plan: wfw-master-returns-on-dirty-plan-any-gate.
+                // plans. A dirty plan body is master's to commit
+                // regardless of gate state.
                 let waiting_on = if worktree == PlanWorktreeStatus::BodyDirty {
                     WaitingOn::MasterToCommit
                 } else {
@@ -3029,9 +3028,9 @@ mod tests {
         );
     }
 
-    // ====== wfw-master-returns-on-dirty-plan-any-gate ======
-    // Plan: dirty plan file pre-empts all gate-driven decisions
-    // for the master, regardless of gate state.
+    // ====== dirty plan file pre-empts the gate for master ======
+    // A dirty plan file pre-empts all gate-driven decisions for
+    // the master, regardless of gate state.
 
     /// `PlanStateLookup` mock that combines reviews + a fixed
     /// `BodyDirty` worktree status for ALL plans. The reviews mock

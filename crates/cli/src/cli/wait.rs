@@ -550,7 +550,7 @@ fn emit(items: &[WaitItem], json: bool) {
 /// COMPOSE `feedback write --commit <sha>` from this hint, and
 /// `CommitRef::resolve_against` errors on an ambiguous prefix — at
 /// 12 chars a collision is effectively impossible, so the hint
-/// always resolves (`wfw-output-is-a-minimal-hint`, ruthless
+/// always resolves (`wait-output-is-a-minimal-hint`, ruthless
 /// 201e498 concern 2). The full sha stays in the json field.
 fn short(sha: &CommitSha) -> &str {
     &sha.as_str()[..sha.as_str().len().min(12)]
@@ -1142,7 +1142,7 @@ mod tests {
         );
     }
 
-    // ── minimal-hint rendering (wfw-output-is-a-minimal-hint) ──
+    // ── minimal-hint rendering (wait-output-is-a-minimal-hint) ──
 
     fn sha(s: &str) -> CommitSha {
         CommitSha::parse(&format!("{s:0<40}")).unwrap()

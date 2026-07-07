@@ -510,7 +510,7 @@ struct WaitEnvelope {
 /// One `wait --json` item as the stop hook reads it. `kind` is the
 /// `#[serde(tag = "kind")]` discriminant `wait` emits; the remaining
 /// fields are the ones [`render_wait_items`] projects into the
-/// minimal wake hint (`wfw-output-is-a-minimal-hint`). Anything
+/// minimal wake hint (`wait-output-is-a-minimal-hint`). Anything
 /// `wait` adds is ignored; anything absent stays `None`.
 #[derive(serde::Deserialize)]
 struct WaitItem {
@@ -540,7 +540,7 @@ fn parse_wait_json(raw: &[u8]) -> Result<Vec<WaitItem>, String> {
 /// Render wait's JSON `items` array into the continuation prompt
 /// body. Loose stringly-typed projection because we're consuming
 /// our own JSON output via subprocess. One MINIMAL line per item
-/// — who/verb + plan + 12-char sha (`wfw-output-is-a-minimal-hint`):
+/// — who/verb + plan + 12-char sha (`wait-output-is-a-minimal-hint`):
 /// the HOW (feedback-write form, verdicts, promote evaluation,
 /// unblock) lives in the agent's skill doc, not re-taught per
 /// wake.
@@ -560,7 +560,7 @@ fn render_wait_items(items: &[WaitItem], label: &AgentLabel, role: Role) -> Stri
             .or(item.finalized_at.as_deref())
             .unwrap_or("");
         let short = short_sha(full);
-        // Minimal hints (`wfw-output-is-a-minimal-hint`): one line
+        // Minimal hints (`wait-output-is-a-minimal-hint`): one line
         // per item — WHO/verb + plan + short sha. The HOW (the
         // `feedback write` form, verdict meanings, promote
         // evaluation, unblock command) lives in the agent's skill
@@ -948,7 +948,7 @@ mod tests {
     #[test]
     fn wake_carries_no_tutorial_strings() {
         // The HOW lives in the skill doc, not the wake
-        // (wfw-output-is-a-minimal-hint). One wake with every
+        // (wait-output-is-a-minimal-hint). One wake with every
         // tutorial-bearing kind must contain none of the old
         // reference material.
         let out = items_text(&[

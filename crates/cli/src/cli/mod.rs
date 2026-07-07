@@ -794,9 +794,8 @@ pub struct AutoOnArgs {
     pub role: Option<RoleArg>,
     /// Override the wait-for-work timeout (e.g. `30m`, `5m`,
     /// `45s`). Omit to leave unchanged; `null` in the underlying
-    /// config means "indefinite". `--wfw-timeout` stays as an alias
-    /// for pre-rename muscle memory.
-    #[arg(long, value_name = "DUR", visible_alias = "wfw-timeout")]
+    /// config means "indefinite".
+    #[arg(long, value_name = "DUR")]
     pub wait_timeout: Option<String>,
 }
 

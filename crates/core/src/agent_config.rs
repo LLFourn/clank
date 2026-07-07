@@ -47,15 +47,7 @@ pub struct AgentConfig {
     /// `clank wait --timeout` accepts; validated by the CLI's
     /// existing `parse_timeout` at use site, not load site (one
     /// source of truth for the format).
-    ///
-    /// `alias = "wfw_timeout"` so configs written before the
-    /// `wfw`→`wait` rename keep loading; new writes use the
-    /// `wait_timeout` key.
-    #[serde(
-        default,
-        alias = "wfw_timeout",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wait_timeout: Option<String>,
     /// Session this agent label is currently bound to. Written by
     /// `clank as <label>` (or `clank init` phase 2) using the
@@ -168,16 +160,6 @@ mod tests {
         let json = serde_json::to_string(&cfg).unwrap();
         let back: AgentConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(cfg, back);
-    }
-
-    #[test]
-    fn wait_timeout_reads_legacy_wfw_timeout_key() {
-        // Back-compat: configs written before the wfw→wait rename
-        // stored the value under `wfw_timeout`. The serde alias keeps
-        // them loading with the value intact.
-        let json = r#"{ "wfw_timeout": "30m" }"#;
-        let cfg: AgentConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(cfg.wait_timeout.as_deref(), Some("30m"));
     }
 
     #[test]
