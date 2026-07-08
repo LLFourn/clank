@@ -163,6 +163,12 @@ pub struct ForkArgs {
     /// `<source>/.clank/worktrees/<name>`.
     #[arg(long, value_name = "DIR")]
     pub path: Option<PathBuf>,
+    /// Seed the fork's roster from this user-scope team template
+    /// (`~/.clank/config.json#/teams`) instead of copying the source
+    /// repo's roster. Members with a bound session in the source get
+    /// their sessions forked; the rest start fresh.
+    #[arg(long, value_name = "NAME")]
+    pub team: Option<String>,
     /// Move a draft from the source repo's `.clank/drafts/` into the
     /// fork's queue. Repeatable — the first named draft gets the lowest
     /// priority (000, then 001, …), so the forked master is handed them

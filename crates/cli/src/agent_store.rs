@@ -291,7 +291,7 @@ pub fn repo_config_if_valid(
 /// `agents` map of role-less descriptions) no longer parses as a
 /// roster, so rather than surface a cryptic serde message we map
 /// it to an actionable re-init hint.
-fn load_repo_config(
+pub(crate) fn load_repo_config(
     repo_cfg_path: &Path,
 ) -> anyhow::Result<Option<crate::cli::teams_config::RepoConfigFile>> {
     use crate::cli::teams_config::RepoConfigFile;

@@ -4,6 +4,7 @@
 
 mod common;
 
+use clank::cli::teams_config::RosterRole;
 use common::TestEnv;
 use std::path::Path;
 use std::process::Command;
@@ -88,6 +89,7 @@ fn fork_args(env: &TestEnv, name: &str) -> clank::cli::ForkArgs {
         pr: None,
         branch: None,
         path: None,
+        team: None,
         drafts: Vec::new(),
         prompt: None,
         no_open: true,
@@ -305,7 +307,11 @@ fn fork_from_worktree_lands_sibling_under_main_not_nested() {
 }
 
 #[test]
-fn fork_refuses_when_sessions_missing() {
+fn fork_with_unbound_member_creates_a_fresh_spec() {
+    // fork-robustness: session forking is BEST-EFFORT — an unbound
+    // member no longer fails the fork; it gets a spec with no
+    // from_session (a fresh session on launch), still carrying the
+    // orientation prompt.
     let env = TestEnv::init();
     env.register_team("claude", &["codex"], &[]);
     let repo = env.repo();
@@ -319,15 +325,201 @@ fn fork_refuses_when_sessions_missing() {
         "11111111-1111-1111-1111-111111111111",
     );
 
-    let err = block_on(clank::cli::fork::run_fork(
+    let dest = block_on(clank::cli::fork::run_fork(
         &fork_args(&env, "x"),
         Some(env.home()),
     ))
-    .unwrap_err()
-    .to_string();
-    assert!(err.contains("codex"), "names the unbound agent: {err}");
+    .unwrap();
+    let spec_of = |label: &str| -> serde_json::Value {
+        serde_json::from_str(
+            &std::fs::read_to_string(dest.join(format!(".clank/agents/{label}/fork.json")))
+                .unwrap(),
+        )
+        .unwrap()
+    };
+    let claude = spec_of("claude");
     assert!(
-        !repo.join(".clank/worktrees/x").exists(),
+        claude["from_session"].as_str().unwrap().starts_with("1111"),
+        "bound member forks its session"
+    );
+    let codex = spec_of("codex");
+    assert!(
+        codex["from_session"].is_null(),
+        "unbound member starts fresh: {codex}"
+    );
+    assert!(
+        codex["prompt"].as_str().unwrap().contains("worktree `x`"),
+        "fresh member still gets the orientation"
+    );
+}
+
+/// User-scope library (claude/codex/gemini) + the given teams, written
+/// through the typed [`UserConfigFile`] (typed-config-dogfood).
+fn write_user_teams(env: &TestEnv, teams: &[(&str, &[(&str, RosterRole)])]) {
+    use clank::cli::teams_config::{AgentDescription, TeamMember, TeamRef, UserConfigFile};
+    use clank_core::ids::AgentLabel;
+    use clank_core::vocab::Tool;
+
+    let mut cfg = UserConfigFile::default();
+    for (label, tool) in [
+        ("claude", Tool::Claude),
+        ("codex", Tool::Codex),
+        ("gemini", Tool::Claude),
+    ] {
+        cfg.agents.insert(
+            AgentLabel::parse(label).unwrap(),
+            AgentDescription {
+                tool,
+                launch: None,
+                initial_prompt: None,
+            },
+        );
+    }
+    for (name, members) in teams {
+        let mut roster = std::collections::BTreeMap::new();
+        for (label, role) in *members {
+            roster.insert(
+                AgentLabel::parse(label).unwrap(),
+                TeamMember::Ref(TeamRef {
+                    agent: None,
+                    role: *role,
+                }),
+            );
+        }
+        cfg.teams.insert(name.to_string(), roster);
+    }
+    write(
+        env.home(),
+        ".clank/config.json",
+        &serde_json::to_string_pretty(&cfg).unwrap(),
+    );
+}
+
+#[test]
+fn fork_without_roster_falls_back_to_the_default_team() {
+    // fork-robustness case 1: source never `clank init`ed — warn and
+    // seed the fork's roster from the user-scope `default` team; every
+    // member starts fresh (no source sessions exist).
+    let env = TestEnv::init();
+    let repo = env.repo();
+    write(repo, "src/lib.rs", "// base\n");
+    commit(repo, "[misc] base");
+    write_user_teams(
+        &env,
+        &[(
+            "default",
+            &[
+                ("claude", RosterRole::Master),
+                ("codex", RosterRole::Commit),
+            ],
+        )],
+    );
+
+    let dest = block_on(clank::cli::fork::run_fork(
+        &fork_args(&env, "bare"),
+        Some(env.home()),
+    ))
+    .unwrap();
+    let cfg: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dest.join(".clank/config.json")).unwrap())
+            .unwrap();
+    assert_eq!(cfg["agents"]["claude"]["role"], "master");
+    assert_eq!(cfg["agents"]["codex"]["role"], "commit");
+    for label in ["claude", "codex"] {
+        let spec: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dest.join(format!(".clank/agents/{label}/fork.json")))
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(spec["from_session"].is_null(), "{label} starts fresh");
+    }
+}
+
+#[test]
+fn fork_without_roster_and_no_default_team_errors() {
+    let env = TestEnv::init();
+    let repo = env.repo();
+    write(repo, "src/lib.rs", "// base\n");
+    commit(repo, "[misc] base");
+    // User library exists but has no `default` team.
+    write_user_teams(&env, &[("other", &[("claude", RosterRole::Master)])]);
+
+    let err = block_on(clank::cli::fork::run_fork(
+        &fork_args(&env, "bare"),
+        Some(env.home()),
+    ))
+    .unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("--team"), "names the --team remedy: {msg}");
+    assert!(
+        msg.contains("default"),
+        "names the default-team remedy: {msg}"
+    );
+    assert!(
+        !repo.join(".clank/worktrees/bare").exists(),
+        "fail-closed: nothing created"
+    );
+}
+
+#[test]
+fn fork_with_team_template_mixes_forked_and_fresh() {
+    // fork-robustness case 2: --team seeds the roster from the
+    // template; members that match source agents with bound sessions
+    // fork them, new members start fresh.
+    let env = source_with_bound_team();
+    write_user_teams(
+        &env,
+        &[(
+            "custom",
+            &[
+                ("claude", RosterRole::Master),
+                ("gemini", RosterRole::Commit),
+            ],
+        )],
+    );
+    let mut args = fork_args(&env, "teamed");
+    args.team = Some("custom".into());
+    let dest = block_on(clank::cli::fork::run_fork(&args, Some(env.home()))).unwrap();
+
+    let cfg: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dest.join(".clank/config.json")).unwrap())
+            .unwrap();
+    assert_eq!(cfg["agents"]["gemini"]["role"], "commit", "template roster");
+    assert!(
+        cfg["agents"]["codex"].is_null(),
+        "source-only agent absent from the template roster"
+    );
+
+    let spec_of = |label: &str| -> serde_json::Value {
+        serde_json::from_str(
+            &std::fs::read_to_string(dest.join(format!(".clank/agents/{label}/fork.json")))
+                .unwrap(),
+        )
+        .unwrap()
+    };
+    assert!(
+        spec_of("claude")["from_session"]
+            .as_str()
+            .unwrap()
+            .starts_with("1111"),
+        "matching member forks the source session"
+    );
+    assert!(
+        spec_of("gemini")["from_session"].is_null(),
+        "template-only member starts fresh"
+    );
+}
+
+#[test]
+fn fork_with_unknown_team_fails_before_any_mutation() {
+    let env = source_with_bound_team();
+    write_user_teams(&env, &[]);
+    let mut args = fork_args(&env, "typo-team");
+    args.team = Some("no-such-team".into());
+    let err = block_on(clank::cli::fork::run_fork(&args, Some(env.home()))).unwrap_err();
+    assert!(format!("{err:#}").contains("no-such-team"), "{err:#}");
+    assert!(
+        !env.repo().join(".clank/worktrees/typo-team").exists(),
         "fail-closed: nothing created"
     );
 }
@@ -562,15 +754,24 @@ fn fork_pr_precondition_failure_never_touches_network() {
         clank_core::vocab::Tool::Claude,
         "11111111-1111-1111-1111-111111111111",
     );
-    // codex unbound.
+    bind_session(
+        &env,
+        "codex",
+        clank_core::vocab::Tool::Codex,
+        "22222222-2222-2222-2222-222222222222",
+    );
+    // The tripwire precondition: a draft that doesn't exist. (The old
+    // tripwire — an unbound session — is deliberately no longer an
+    // error: fork-robustness made session forking best-effort.)
     let mut args = fork_args(&env, "ignored");
     args.name = None;
     args.pr = Some(123);
+    args.drafts = vec!["no-such-draft".into()];
     let err = block_on(clank::cli::fork::run_fork(&args, Some(env.home())))
         .unwrap_err()
         .to_string();
     assert!(
-        err.contains("codex") && err.contains("bound session"),
+        err.contains("no-such-draft"),
         "precondition error, not a fetch error: {err}"
     );
 }

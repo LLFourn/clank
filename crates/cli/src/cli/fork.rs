@@ -30,10 +30,15 @@ use super::ForkArgs;
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct ForkSpec {
     pub tool: clank_core::vocab::Tool,
-    /// The SOURCE repo's session id this agent forks from.
-    pub from_session: String,
-    /// Orientation prompt delivered to the forked session on its
-    /// first launch.
+    /// The SOURCE repo's session id this agent forks from. `None` when
+    /// the source had no bound session for this member — session
+    /// forking is BEST-EFFORT (fork-robustness): the launch then
+    /// creates a FRESH session that still carries `prompt`, so a new
+    /// session in a fork doesn't start blind.
+    #[serde(default)]
+    pub from_session: Option<String>,
+    /// Orientation prompt delivered to the forked (or fresh) session
+    /// on its first launch.
     pub prompt: String,
 }
 
@@ -215,39 +220,93 @@ pub async fn run_fork_pinned(
         };
     }
 
-    // Team + precondition: EVERY registered agent must have a
-    // bound session in the source repo — a fork with nothing to
-    // fork is meaningless.
-    let Some(set) = crate::agent_store::try_resolve_via_team_with(&source, home)? else {
-        anyhow::bail!(
-            "this repo has no agents configured. Run `clank agent add <name>` + \
-             `clank agent promote <name>` to build a roster, or `clank init --team <name>` \
-             to seed one from a template."
-        );
-    };
-    let mut members: Vec<AgentLabel> = vec![set.master.clone()];
-    members.extend(set.reviewers.iter().map(|r| r.label.clone()));
-
-    // Keep each member's FULL source config: the session drives the
-    // fork spec, and auto_mode/wait_timeout get carbon-copied into the
-    // fork (fork-carbon-copy-agent-config).
-    let mut sessions: Vec<(AgentLabel, clank_core::agent_config::AgentConfig)> = Vec::new();
-    let mut missing: Vec<String> = Vec::new();
-    for label in &members {
-        match crate::agent_store::load_agent_config(&source, label)? {
-            Some(cfg) if cfg.session.is_some() => {
-                sessions.push((label.clone(), cfg));
+    // The fork's roster (fork-robustness): `--team NAME` → the named
+    // user-scope template (fail fast on a typo — that's an error, not
+    // a degraded environment); else the source repo's roster; else
+    // (source never `clank init`ed) → warn and fall back to the
+    // user-scope `default` team.
+    let source_roster = crate::agent_store::load_repo_config(&source.join(".clank/config.json"))?
+        .map(|c| c.agents)
+        .filter(|r| !r.is_empty());
+    let team_seed: Option<(String, crate::cli::teams_config::Roster)> =
+        match (&args.team, &source_roster) {
+            (Some(team_name), _) => {
+                let home_dir = home.ok_or_else(|| {
+                    anyhow::anyhow!("--team needs $HOME to read the user-scope team library")
+                })?;
+                Some((
+                    team_name.clone(),
+                    crate::cli::init::load_user_team_roster(home_dir, team_name)?,
+                ))
             }
-            _ => missing.push(label.as_str().to_string()),
-        }
+            (None, Some(_)) => None,
+            (None, None) => {
+                let home_dir = home.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "{} has no clank roster and resolving the `default` team needs $HOME",
+                        source.display()
+                    )
+                })?;
+                let roster =
+                    crate::cli::init::load_user_team_roster(home_dir, "default").map_err(|e| {
+                        e.context(format!(
+                            "{} has no clank roster (`clank init` never ran) and no \
+                             user-scope `default` team exists to fall back on — define one \
+                             (`clank team save default`) or pass `--team <name>`",
+                            source.display()
+                        ))
+                    })?;
+                eprintln!(
+                    "warning: {} has no clank roster — seeding the fork from the \
+                     user-scope `default` team",
+                    source.display()
+                );
+                Some(("default".to_string(), roster))
+            }
+        };
+    let fork_roster: crate::cli::teams_config::Roster = match &team_seed {
+        Some((_, roster)) => roster.clone(),
+        None => source_roster
+            .clone()
+            .expect("copy path implies a source roster"),
+    };
+
+    // Session forking is BEST-EFFORT (fork-robustness): a member with a
+    // bound session in the source forks it; anyone else gets a FRESH
+    // session on launch (spec with no from_session) — warned, never
+    // failed. Each member's full source config rides along so
+    // auto_mode/wait_timeout carbon-copy into the fork
+    // (fork-carbon-copy-agent-config).
+    struct MemberSeed {
+        label: AgentLabel,
+        tool: clank_core::vocab::Tool,
+        from_session: Option<String>,
+        cfg: Option<clank_core::agent_config::AgentConfig>,
     }
-    if !missing.is_empty() {
-        anyhow::bail!(
-            "cannot fork: agent(s) without a bound session in {}: {}. \
-             Every team member needs a live session to fork (bind with `clank as <label>` \
-             in each agent's pane).",
+    let mut seeds: Vec<MemberSeed> = Vec::new();
+    let mut fresh: Vec<String> = Vec::new();
+    for (label, agent) in &fork_roster {
+        let cfg = crate::agent_store::load_agent_config(&source, label)?;
+        let (tool, from_session) = match cfg.as_ref().and_then(|c| c.session.as_ref()) {
+            Some(session) => (session.tool, Some(session.id.as_str().to_string())),
+            None => {
+                fresh.push(label.as_str().to_string());
+                (agent.tool, None)
+            }
+        };
+        seeds.push(MemberSeed {
+            label: label.clone(),
+            tool,
+            from_session,
+            cfg,
+        });
+    }
+    if !fresh.is_empty() {
+        eprintln!(
+            "warning: no bound session in {} for: {} — fresh session(s) will be \
+             created on launch",
             source.display(),
-            missing.join(", ")
+            fresh.join(", ")
         );
     }
 
@@ -308,6 +367,14 @@ pub async fn run_fork_pinned(
         std::fs::copy(&src_cfg, &dst_cfg)
             .with_context(|| format!("seeding `{}`", dst_cfg.display()))?;
     }
+    // A template-seeded fork (`--team` / the default fallback) swaps the
+    // ROSTER in over the copied config, so non-roster sections
+    // (review/hooks/diff) from the source survive — same write path as
+    // `init --team` (fork-robustness).
+    if let Some((team_name, _)) = &team_seed {
+        let home_dir = home.expect("checked when resolving the team");
+        crate::cli::init::register_repo_team(home_dir, &dest, team_name)?;
+    }
 
     // Seed the fork's queue from the source drafts (fork-draft-seeding)
     // BEFORE the session specs are written, so the orientation prompt
@@ -323,14 +390,11 @@ pub async fn run_fork_pinned(
     };
 
     let purpose = purpose_owned.as_deref().unwrap_or("parallel work");
-    for (label, src_cfg) in &sessions {
-        let session = src_cfg
-            .session
-            .as_ref()
-            .expect("session present (filtered above)");
+    for seed in &seeds {
+        let label = &seed.label;
         let spec = ForkSpec {
-            tool: session.tool,
-            from_session: session.id.as_str().to_string(),
+            tool: seed.tool,
+            from_session: seed.from_session.clone(),
             prompt: format!(
                 "You are `{label}` in worktree `{name}` of {source_path} \
                  (branch `{name}` off {base}), session forked for: {purpose}. \
@@ -351,7 +415,9 @@ pub async fn run_fork_pinned(
         // carries the source's explicit override
         // (fork-carbon-copy-agent-config). `clank as` later MERGES the
         // new session into this config, preserving these fields.
-        if src_cfg.auto_mode.is_some() || src_cfg.wait_timeout.is_some() {
+        if let Some(src_cfg) = &seed.cfg
+            && (src_cfg.auto_mode.is_some() || src_cfg.wait_timeout.is_some())
+        {
             let carried = clank_core::agent_config::AgentConfig {
                 auto_mode: src_cfg.auto_mode,
                 wait_timeout: src_cfg.wait_timeout.clone(),
@@ -364,9 +430,10 @@ pub async fn run_fork_pinned(
     }
 
     eprintln!(
-        "forked `{name}`: worktree at {} (branch `{name}` off {base}, {} agent sessions to fork on launch)",
+        "forked `{name}`: worktree at {} (branch `{name}` off {base}, {} sessions to fork, {} fresh)",
         dest.display(),
-        sessions.len(),
+        seeds.len() - fresh.len(),
+        fresh.len(),
     );
     eprintln!("  teardown: git worktree remove {}", dest.display());
     Ok((dest, pinned_pr_base))
@@ -754,6 +821,7 @@ detached
             pr: None,
             branch: None,
             path: None,
+            team: None,
             drafts: Vec::new(),
             prompt: None,
             no_open: true,
@@ -862,7 +930,7 @@ detached
 
         let spec = ForkSpec {
             tool: clank_core::vocab::Tool::Codex,
-            from_session: "ancestor-id".into(),
+            from_session: Some("ancestor-id".into()),
             prompt: "orient".into(),
         };
         let path = fork_spec_path(repo, &label);
@@ -871,8 +939,12 @@ detached
 
         // First take returns it AND deletes the file.
         assert_eq!(
-            take_fork_spec(repo, &label).unwrap().unwrap().from_session,
-            "ancestor-id"
+            take_fork_spec(repo, &label)
+                .unwrap()
+                .unwrap()
+                .from_session
+                .as_deref(),
+            Some("ancestor-id")
         );
         assert!(!path.exists(), "spec deleted after consume (one-shot)");
 

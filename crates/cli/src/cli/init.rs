@@ -435,7 +435,7 @@ pub fn register_repo_team(home: &Path, repo: &Path, team_name: &str) -> anyhow::
 /// errors with a compose-it hint; a malformed member errors naming
 /// the member and valid shapes; a dangling reference errors naming
 /// the missing library agent.
-fn load_user_team_roster(
+pub(crate) fn load_user_team_roster(
     home: &Path,
     team_name: &str,
 ) -> anyhow::Result<crate::cli::teams_config::Roster> {

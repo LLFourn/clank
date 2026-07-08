@@ -323,18 +323,22 @@ fn compose_fork_launch(
         .as_ref()
         .map(|l| l.args.clone())
         .unwrap_or_default();
-    match spec.tool {
-        Tool::Claude => {
+    match (&spec.from_session, spec.tool) {
+        (Some(sid), Tool::Claude) => {
             args.push("--resume".into());
-            args.push(spec.from_session.clone());
+            args.push(sid.clone());
             args.push("--fork-session".into());
         }
-        Tool::Codex => {
+        (Some(sid), Tool::Codex) => {
             args.push("fork".into());
             args.push("-C".into());
             args.push(worktree.display().to_string());
-            args.push(spec.from_session.clone());
+            args.push(sid.clone());
         }
+        // No source session to fork (fork-robustness): launch a FRESH
+        // session — same shape as the bootstrap launch, but carrying
+        // the fork's orientation prompt instead of the bare bind hint.
+        (None, _) => {}
     }
     args.push(spec.prompt.clone());
     let env_overrides = desc
@@ -1633,6 +1637,45 @@ mod tests {
     }
 
     #[test]
+    fn fork_launch_without_source_session_bootstraps_with_orientation() {
+        // fork-robustness: a spec with no from_session launches a FRESH
+        // session that still carries the orientation prompt — no
+        // --resume/fork argv, same shape as the bootstrap launch.
+        let desc = AgentDescription {
+            tool: Tool::Claude,
+            launch: None,
+            initial_prompt: None,
+        };
+        let spec = crate::cli::fork::ForkSpec {
+            tool: Tool::Claude,
+            from_session: None,
+            prompt: "You are `claude` in worktree `x`…".into(),
+        };
+        let wt = std::path::Path::new("/repo/.clank/worktrees/x");
+        let c = compose_fork_launch(&spec, &desc, wt);
+        assert_eq!(c.program, "claude");
+        assert_eq!(c.args, vec!["You are `claude` in worktree `x`…"]);
+
+        let spec = crate::cli::fork::ForkSpec {
+            tool: Tool::Codex,
+            from_session: None,
+            prompt: "orient".into(),
+        };
+        let desc = AgentDescription {
+            tool: Tool::Codex,
+            launch: None,
+            initial_prompt: None,
+        };
+        let c = compose_fork_launch(&spec, &desc, wt);
+        assert_eq!(c.program, "codex");
+        assert_eq!(
+            c.args,
+            vec!["orient"],
+            "no fork/-C argv without a source session"
+        );
+    }
+
+    #[test]
     fn fork_launch_composes_per_tool_with_orientation_prompt() {
         // clank-fork-worktree-sessions: the seeded fork spec turns
         // into the per-tool fork argv with the orientation prompt
@@ -1646,7 +1689,7 @@ mod tests {
         };
         let spec = crate::cli::fork::ForkSpec {
             tool: Tool::Claude,
-            from_session: "abc-123".into(),
+            from_session: Some("abc-123".into()),
             prompt: "You are `claude` in worktree `x`…".into(),
         };
         let wt = std::path::Path::new("/repo/.clank/worktrees/x");
@@ -1670,7 +1713,7 @@ mod tests {
         };
         let spec = crate::cli::fork::ForkSpec {
             tool: Tool::Codex,
-            from_session: "def-456".into(),
+            from_session: Some("def-456".into()),
             prompt: "orient".into(),
         };
         let c = compose_fork_launch(&spec, &desc, wt);
