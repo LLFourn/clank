@@ -350,16 +350,20 @@ pub(super) enum InputNav {
 /// dead on arrival). Legacy plans finished before mandatory messages
 /// have no body — a provenance line passes validation and is honest
 /// about why no richer WHY exists.
-pub(super) fn compose_squash_message(subject: &str, finalize_body: &str) -> String {
+pub(crate) fn compose_squash_message(
+    subject: &str,
+    finalize_body: &str,
+    provenance: &str,
+) -> String {
     let body = finalize_body.trim();
-    let why = if body.is_empty() {
-        "collapsed to one commit from clank status --tui; the original \
-         finish predates mandatory finish messages."
-    } else {
-        body
-    };
+    let why = if body.is_empty() { provenance } else { body };
     format!("{subject}\n\n{why}")
 }
+
+/// The TUI's provenance line for a squash whose finalize predates
+/// mandatory finish messages (no WHY body to carry).
+pub(super) const TUI_SQUASH_PROVENANCE: &str = "collapsed to one commit from clank status --tui; \
+     the original finish predates mandatory finish messages.";
 
 /// THE drop-arming predicate: the RAW buffer must equal the stem
 /// exactly — no trim, no case-fold. One definition shared by the
@@ -1250,11 +1254,12 @@ mod tests {
         let real = compose_squash_message(
             "collapse it all",
             "the plan landed in five steps; one commit reads better",
+            TUI_SQUASH_PROVENANCE,
         );
         validate(Some(&real), "my-plan").expect("subject + finalize body");
         assert!(real.contains("\n\nthe plan landed"));
         // Legacy plan (no finalize body) → provenance fallback passes.
-        let legacy = compose_squash_message("collapse it all", "  ");
+        let legacy = compose_squash_message("collapse it all", "  ", TUI_SQUASH_PROVENANCE);
         validate(Some(&legacy), "my-plan").expect("provenance fallback");
         assert!(legacy.contains("predates mandatory finish messages"));
     }

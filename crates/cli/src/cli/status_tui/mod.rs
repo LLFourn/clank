@@ -42,7 +42,7 @@ mod derive;
 
 mod markdown;
 
-mod input;
+pub(crate) mod input;
 use input::*;
 
 mod render;
@@ -255,7 +255,8 @@ async fn submit_plan_input(
                 Some(sha) => crate::git_io::commit_body_at(repo, &sha).unwrap_or_default(),
                 None => String::new(),
             };
-            let msg = input::compose_squash_message(text, &finalize_body);
+            let msg =
+                input::compose_squash_message(text, &finalize_body, input::TUI_SQUASH_PROVENANCE);
             // `finish --squash` on an already-finished plan is the
             // purpose-built path: only the range is rewritten.
             let res = crate::cli::finish::run(crate::cli::FinishArgs {

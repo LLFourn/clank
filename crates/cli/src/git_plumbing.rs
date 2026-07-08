@@ -307,6 +307,47 @@ fn run(repo: &Path, args: &[&str]) -> anyhow::Result<()> {
 /// `git reset --hard --quiet <rev>` — re-sync the worktree to `rev`. A
 /// worktree-state checkout whose exact gitignore/fileMode/autocrlf
 /// semantics must match git's, so it stays a subprocess.
+/// Cherry-pick `shas` (in order) into the index/worktree WITHOUT
+/// committing (`-n`) — the accumulation primitive behind pick's
+/// squash/purge modes. Verified against live git
+/// (pick-purge-and-squash study): git natively accepts a multi-commit
+/// `-n` sequence AND stacks further `-n` picks onto an already-staged
+/// index, and a mid-sequence conflict leaves git's cherry-pick state
+/// where `--abort` restores the PRE-SEQUENCE state. Returns false on
+/// conflict (state left for the user, same contract as
+/// [`cherry_pick`]). Why not gix: gix has no cherry-pick; the 3-way
+/// merge orchestration is exactly what the subprocess provides.
+pub fn cherry_pick_no_commit(repo: &Path, shas: &[&str]) -> anyhow::Result<bool> {
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["cherry-pick", "-n"])
+        .args(shas)
+        .status()
+        .context("spawning git cherry-pick -n")?;
+    Ok(status.success())
+}
+
+/// The tree of the CURRENT index (`git write-tree`). Why not gix:
+/// writing a tree from the live on-disk index (with whatever
+/// extensions a cherry-pick left in it) is the subprocess's job; gix's
+/// index-to-tree write path isn't proven on linked worktrees.
+pub fn write_index_tree(repo: &Path) -> anyhow::Result<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .arg("write-tree")
+        .output()
+        .context("spawning git write-tree")?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "git write-tree failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
 pub fn reset_hard(repo: &Path, rev: &str) -> anyhow::Result<()> {
     run(repo, &["reset", "--hard", "--quiet", rev])
 }

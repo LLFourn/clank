@@ -178,41 +178,332 @@ pub async fn run(args: PickArgs) -> anyhow::Result<()> {
         anyhow::bail!("working tree dirty; commit or stash first");
     }
 
+    let collapse = args.squash || args.purge;
+
+    // Collapse modes process ONE PLAN AT A TIME, so mutually-interleaved
+    // plans (which the plain pick handles by replaying the union in
+    // source order) would be silently REORDERED — each plan's later
+    // commits would 3-way merge against the other plan's full state
+    // instead of their source context. Refuse instead of reordering.
+    if collapse && keys.len() > 1 {
+        let spans: Vec<(usize, usize, &PlanKey)> = natives_by_plan
+            .iter()
+            .map(|(k, n)| {
+                let ps: Vec<usize> = n.iter().filter_map(&pos_of).collect();
+                (
+                    ps.iter().copied().min().unwrap_or(0),
+                    ps.iter().copied().max().unwrap_or(0),
+                    k,
+                )
+            })
+            .collect();
+        for (i, a) in spans.iter().enumerate() {
+            for b in &spans[i + 1..] {
+                if a.0 <= b.1 && b.0 <= a.1 {
+                    anyhow::bail!(
+                        "plans `{}` and `{}` interleave on `{}` — --squash/--purge \
+                         collapse one plan at a time and would reorder them. Pick \
+                         them plain, or untangle them on the source first.",
+                        a.2.as_str(),
+                        b.2.as_str(),
+                        args.from,
+                    );
+                }
+            }
+        }
+    }
+
+    // The landing shape, computed ONCE for --dry and execute alike
+    // (one-computation rule): each plan in SOURCE order with its
+    // ordered commits and, for --squash, the composed message.
+    let mut landings: Vec<(PlanKey, Vec<&crate::git_io::CommitMeta>, Option<String>)> = Vec::new();
+    let mut plans_sorted: Vec<&(PlanKey, BTreeSet<CommitSha>)> = natives_by_plan.iter().collect();
+    plans_sorted.sort_by_key(|(_, n)| n.iter().filter_map(&pos_of).min().unwrap_or(0));
+    for (key, natives) in plans_sorted {
+        let commits: Vec<&crate::git_io::CommitMeta> =
+            metas.iter().filter(|m| natives.contains(&m.sha)).collect();
+        let message = args.squash.then(|| {
+            squash_message(
+                &repo,
+                &source.fold,
+                key,
+                args.purge,
+                &args.from,
+                commits.len(),
+            )
+        });
+        landings.push((key.clone(), commits, message));
+    }
+
     if args.dry {
         println!(
             "# clank pick --dry ({} plan(s) from `{}`)",
             keys.len(),
             args.from
         );
-        for (key, natives) in &natives_by_plan {
-            println!("# plan: {} ({} commit(s))", key.as_str(), natives.len());
-        }
-        println!("# would cherry-pick, in source order:");
-        for m in &ordered {
-            println!("pick  {} {}", &m.sha.as_str()[..7], m.subject);
+        for (key, commits, message) in &landings {
+            println!("# plan: {} ({} commit(s))", key.as_str(), commits.len());
+            if let Some(msg) = message {
+                let subject = msg.lines().next().unwrap_or_default();
+                println!(
+                    "squash {} commit(s) → 1: {subject}{}",
+                    commits.len(),
+                    if args.purge {
+                        "  (.clank stripped)"
+                    } else {
+                        ""
+                    },
+                );
+                for m in commits {
+                    println!("  ← {} {}", &m.sha.as_str()[..7], m.subject);
+                }
+            } else {
+                for m in commits {
+                    println!(
+                        "pick  {} {}{}",
+                        &m.sha.as_str()[..7],
+                        m.subject,
+                        if args.purge {
+                            "  (.clank stripped; dropped if empty)"
+                        } else {
+                            ""
+                        },
+                    );
+                }
+            }
         }
         println!("# (--dry: no commits, no refs updated)");
         return Ok(());
     }
 
-    let total = ordered.len();
-    for (i, m) in ordered.iter().enumerate() {
-        if !crate::git_plumbing::cherry_pick(&repo, m.sha.as_str())? {
-            anyhow::bail!(
-                "cherry-pick of {} ({}) conflicted after {i} of {total} commit(s) landed. \
-                 Resolve and `git cherry-pick --continue`, or `git cherry-pick --abort` \
-                 to back out this pick. The source `{}` is untouched either way.",
-                &m.sha.as_str()[..7],
-                m.subject,
-                args.from,
-            );
+    if !collapse {
+        let total = ordered.len();
+        for (i, m) in ordered.iter().enumerate() {
+            if !crate::git_plumbing::cherry_pick(&repo, m.sha.as_str())? {
+                anyhow::bail!(
+                    "cherry-pick of {} ({}) conflicted after {i} of {total} commit(s) landed. \
+                     Resolve and `git cherry-pick --continue`, or `git cherry-pick --abort` \
+                     to back out this pick. The source `{}` is untouched either way.",
+                    &m.sha.as_str()[..7],
+                    m.subject,
+                    args.from,
+                );
+            }
+        }
+        println!(
+            "picked {} plan(s) from `{}`: {} commit(s) replayed onto HEAD (reviews reset)",
+            keys.len(),
+            args.from,
+            total,
+        );
+        return Ok(());
+    }
+
+    // ── Collapse modes (pick-purge-and-squash) ──
+    //
+    // STUDY FINDINGS (verified against live git; see the plan):
+    // - `cherry-pick -n` accepts a multi-commit sequence AND stacks onto
+    //   an already-staged index, accumulating in the index/worktree.
+    // - A mid-sequence conflict leaves git's cherry-pick state;
+    //   `--abort` restores the pre-sequence state.
+    // - The clean-case accumulated tree EQUALS target-base + the plan's
+    //   cumulative source diff — no drift class beyond what plain
+    //   per-commit cherry-pick already accepts (each step is the same
+    //   3-way merge either way).
+    // - A `.clank`-only commit CONFLICTS (modify/delete) if the earlier
+    //   `.clank` state wasn't landed — so --purge must keep the
+    //   index/worktree UNSTRIPPED during accumulation (full 3-way
+    //   context) and strip only the COMMITTED trees.
+    //
+    // Mechanism: accumulate with `-n`, snapshot the index via
+    // write-tree, strip via a dangling probe commit + the rewrite
+    // engine's strip_tree/tree_clank_paths, chain landed commits with
+    // replay_commit/squash_commit, and move HEAD ONCE with a final
+    // reset --hard. Nothing lands until that reset: to back out at any
+    // point — `git cherry-pick --abort` (if mid-conflict), then
+    // `git reset --hard`.
+    let mut cur_head = crate::git_io::resolve_commit(&repo, "HEAD")
+        .ok_or_else(|| anyhow::anyhow!("cannot resolve HEAD"))?
+        .as_str()
+        .to_string();
+    let start_head = cur_head.clone();
+    let mut landed = 0usize;
+    let mut dropped = 0usize;
+    for (key, commits, message) in &landings {
+        if let Some(message) = message {
+            // --squash: accumulate the whole plan, one commit.
+            let shas: Vec<&str> = commits.iter().map(|m| m.sha.as_str()).collect();
+            if !crate::git_plumbing::cherry_pick_no_commit(&repo, &shas)? {
+                bail_collapse(key.as_str(), &args.from)?;
+            }
+            let tree = crate::git_plumbing::write_index_tree(&repo)?;
+            let tip = shas.last().expect("non-empty plan");
+            let candidate =
+                crate::git_plumbing::squash_commit(&repo, tip, &tree, Some(&cur_head), message)?;
+            let final_commit = if args.purge {
+                strip_or_drop(&repo, &candidate, &cur_head)?.map(|stripped| {
+                    crate::git_plumbing::squash_commit(
+                        &repo,
+                        tip,
+                        &stripped,
+                        Some(&cur_head),
+                        message,
+                    )
+                })
+            } else {
+                Some(Ok(candidate))
+            };
+            match final_commit {
+                Some(c) => {
+                    cur_head = c?;
+                    landed += 1;
+                }
+                None => {
+                    dropped += 1;
+                    eprintln!(
+                        "note: `{}` collapsed to nothing after the .clank strip — dropped",
+                        key.as_str()
+                    );
+                }
+            }
+        } else {
+            // --purge without --squash: per-commit, stripped, empties drop.
+            for m in commits {
+                if !crate::git_plumbing::cherry_pick_no_commit(&repo, &[m.sha.as_str()])? {
+                    bail_collapse(key.as_str(), &args.from)?;
+                }
+                let tree = crate::git_plumbing::write_index_tree(&repo)?;
+                let candidate = crate::git_plumbing::replay_commit(
+                    &repo,
+                    m.sha.as_str(),
+                    &tree,
+                    Some(&cur_head),
+                )?;
+                match strip_or_drop(&repo, &candidate, &cur_head)? {
+                    Some(stripped) => {
+                        cur_head = crate::git_plumbing::replay_commit(
+                            &repo,
+                            m.sha.as_str(),
+                            &stripped,
+                            Some(&cur_head),
+                        )?;
+                        landed += 1;
+                    }
+                    None => dropped += 1,
+                }
+            }
         }
     }
+    if cur_head == start_head {
+        // Everything dropped: restore the clean worktree, land nothing.
+        crate::git_plumbing::reset_hard(&repo, "HEAD")?;
+        println!(
+            "picked {} plan(s) from `{}`: nothing to land (all commits empty after the .clank strip)",
+            keys.len(),
+            args.from,
+        );
+        return Ok(());
+    }
+    crate::git_plumbing::reset_hard(&repo, &cur_head)?;
     println!(
-        "picked {} plan(s) from `{}`: {} commit(s) replayed onto HEAD (reviews reset)",
+        "picked {} plan(s) from `{}`: {} commit(s) landed{} (reviews reset)",
         keys.len(),
         args.from,
-        total,
+        landed,
+        if dropped > 0 {
+            format!(", {dropped} dropped empty after the .clank strip")
+        } else {
+            String::new()
+        },
     );
     Ok(())
+}
+
+/// Bail out of a collapse-mode conflict. Nothing has landed (HEAD only
+/// moves at the final reset), so the back-out is total.
+fn bail_collapse(stem: &str, from: &str) -> anyhow::Result<()> {
+    anyhow::bail!(
+        "cherry-pick conflicted while accumulating `{stem}`. NOTHING has landed \
+         (HEAD moves once, at the end): run `git cherry-pick --abort`, then \
+         `git reset --hard` to discard any accumulated changes. The source \
+         `{from}` is untouched.",
+    )
+}
+
+/// Strip the `.clank/` paths the pick ITSELF introduces (the rewrite
+/// engine's `tree_clank_paths` + `strip_tree`): candidate paths that
+/// are NOT in the parent's tree. The target's own tracked `.clank`
+/// content (its .gitignore, finished/ history, other plans) is present
+/// in the parent too and therefore preserved — stripping ALL `.clank`
+/// paths would make the landed commit DELETE the target's files.
+/// (Edge accepted: a pick that MODIFIES a `.clank` path the target
+/// already tracks keeps that modification — only reachable when the
+/// same artifact path exists on both sides.) `None` when the stripped
+/// tree equals the parent's — empty after the strip, DROPPED (the same
+/// disposition finish's engine uses).
+fn strip_or_drop(
+    repo: &std::path::Path,
+    candidate: &str,
+    parent: &str,
+) -> anyhow::Result<Option<String>> {
+    let cand = CommitSha::parse(candidate)
+        .map_err(|e| anyhow::anyhow!("parse candidate sha `{candidate}`: {e}"))?;
+    let par = CommitSha::parse(parent)
+        .map_err(|e| anyhow::anyhow!("parse parent sha `{parent}`: {e}"))?;
+    let cand_paths = crate::git_io::tree_clank_paths_at(repo, &cand)
+        .map_err(|e| anyhow::anyhow!("listing .clank paths of `{candidate}`: {e}"))?;
+    let parent_paths: std::collections::BTreeSet<String> =
+        crate::git_io::tree_clank_paths_at(repo, &par)
+            .map_err(|e| anyhow::anyhow!("listing .clank paths of `{parent}`: {e}"))?
+            .into_iter()
+            .collect();
+    let strip: Vec<String> = cand_paths
+        .into_iter()
+        .filter(|p| !parent_paths.contains(p))
+        .collect();
+    let stripped = crate::git_plumbing::strip_tree(repo, candidate, &strip)?;
+    let parent_tree = crate::git_plumbing::commit_tree_oid(repo, parent)?;
+    Ok((stripped != parent_tree).then_some(stripped))
+}
+
+/// The composed one-commit message for a squashed plan: the plan's own
+/// finalize subject + WHY when the source plan is FINISHED (de-tagged;
+/// re-tagged `[stem]` unless --purge removes the plan file the tag
+/// would refer to), a pick provenance line otherwise — through the same
+/// `compose_squash_message` the TUI/finish squash uses.
+fn squash_message(
+    repo: &std::path::Path,
+    source: &clank_core::repo_state::RepoState,
+    key: &PlanKey,
+    purge: bool,
+    from: &str,
+    n_commits: usize,
+) -> String {
+    let stem = key.as_str();
+    let (subject_core, body) = match source.finished_plans.iter().find(|f| &f.plan == key) {
+        Some(fp) => {
+            let subject = crate::git_io::commit_subject_at(repo, &fp.finalized_at)
+                .ok()
+                .map(|s| {
+                    s.strip_prefix(&format!("[{stem}] "))
+                        .unwrap_or(&s)
+                        .to_string()
+                })
+                .unwrap_or_else(|| stem.to_string());
+            let body = crate::git_io::commit_body_at(repo, &fp.finalized_at).unwrap_or_default();
+            (subject, body)
+        }
+        None => (stem.to_string(), String::new()),
+    };
+    // Tag equality: the squashed commit carries `plans/<stem>.md` unless
+    // purged, so it must carry the `[stem]` tag exactly then.
+    let subject = if purge {
+        subject_core
+    } else {
+        format!("[{stem}] {subject_core}")
+    };
+    let provenance = format!(
+        "collapsed from {n_commits} commit(s) picked from `{from}` by clank pick --squash."
+    );
+    crate::cli::status_tui::input::compose_squash_message(&subject, &body, &provenance)
 }

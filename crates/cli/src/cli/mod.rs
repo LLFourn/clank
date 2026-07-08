@@ -1176,6 +1176,17 @@ pub struct PickArgs {
     /// Repo root. Defaults to the cwd's git toplevel.
     #[arg(long, value_name = "PATH")]
     pub repo: Option<PathBuf>,
+    /// Collapse each picked plan's commit stack into ONE commit on
+    /// this branch (N plans → N commits, in source order). The commit
+    /// message reuses the plan's finalize WHY when it has one.
+    #[arg(long)]
+    pub squash: bool,
+    /// Strip the plan's `.clank/` artifacts from what lands — the code
+    /// is copied, the plan file / review scaffolding is not. Commits
+    /// that become empty after the strip are dropped. Composes with
+    /// --squash (one clean commit).
+    #[arg(long)]
+    pub purge: bool,
     /// Print the resolved plan order and each plan's commits without
     /// picking anything (the same computation the live run applies).
     #[arg(long)]

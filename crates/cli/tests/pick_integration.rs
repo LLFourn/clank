@@ -47,6 +47,8 @@ fn pick_args(repo: &Path, plans: &[&str], from: &str) -> clank::cli::PickArgs {
         plans: plans.iter().map(|s| s.to_string()).collect(),
         from: from.to_string(),
         repo: Some(repo.to_path_buf()),
+        squash: false,
+        purge: false,
         dry: false,
     }
 }
@@ -268,4 +270,179 @@ fn pick_conflict_stops_with_abort_guidance_and_source_untouched() {
     );
     // Leave the fixture's cherry-pick state cleanly for the tempdir drop.
     git(repo, &["cherry-pick", "--abort"]);
+}
+
+// ── pick-purge-and-squash ──
+
+/// side branch with plan `bar`: intro (.clank only), code commit, and a
+/// clank-only body revision — the shape that exercises strip + drop.
+fn side_branch_with_bar(env: &TestEnv) -> String {
+    let repo = env.repo();
+    write(repo, "README", "base\n");
+    commit(repo, "base");
+    git(repo, &["checkout", "-q", "-b", "side"]);
+    write(repo, ".clank/plans/bar.md", "# bar\n\nthe bar plan\n");
+    commit(repo, "[bar] intro");
+    write(repo, "src/bar.rs", "// bar impl\n");
+    commit(repo, "[bar] implement");
+    write(repo, ".clank/plans/bar.md", "# bar\n\nrevised body\n");
+    commit(repo, "[bar] revise plan");
+    let tip = git_out(repo, &["rev-parse", "HEAD"]);
+    git(repo, &["checkout", "-q", "main"]);
+    write(repo, "main.txt", "main moved on\n");
+    commit(repo, "main work");
+    tip
+}
+
+#[test]
+fn pick_squash_collapses_a_plan_into_one_tagged_commit() {
+    let env = TestEnv::init();
+    env.register_team("claude", &["codex"], &[]);
+    let repo = env.repo();
+    let side_tip = side_branch_with_bar(&env);
+
+    let mut args = pick_args(repo, &["bar"], "side");
+    args.squash = true;
+    block_on(clank::cli::pick::run(args)).expect("squash pick succeeds");
+
+    // ONE commit for the whole plan, tagged (it carries the plan file).
+    assert_eq!(git_out(repo, &["rev-list", "--count", "HEAD"]), "3");
+    let subject = git_out(repo, &["log", "-1", "--format=%s"]);
+    assert!(subject.starts_with("[bar] "), "tagged: {subject}");
+    let body = git_out(repo, &["log", "-1", "--format=%b"]);
+    assert!(
+        body.contains("clank pick --squash"),
+        "provenance WHY for an unfinished plan: {body}"
+    );
+    // The collapsed tree carries the plan's END state.
+    assert!(repo.join("src/bar.rs").exists());
+    assert_eq!(
+        std::fs::read_to_string(repo.join(".clank/plans/bar.md")).unwrap(),
+        "# bar\n\nrevised body\n"
+    );
+    assert_eq!(
+        git_out(repo, &["rev-parse", "side"]),
+        side_tip,
+        "source untouched"
+    );
+}
+
+#[test]
+fn pick_purge_strips_clank_and_drops_empty_commits() {
+    let env = TestEnv::init();
+    env.register_team("claude", &["codex"], &[]);
+    let repo = env.repo();
+    side_branch_with_bar(&env);
+
+    let mut args = pick_args(repo, &["bar"], "side");
+    args.purge = true;
+    block_on(clank::cli::pick::run(args)).expect("purge pick succeeds");
+
+    // Only the code commit lands: intro and the body revision are
+    // .clank-only, so they are EMPTY after the strip and drop.
+    assert_eq!(git_out(repo, &["rev-list", "--count", "HEAD"]), "3");
+    assert_eq!(
+        git_out(repo, &["log", "-1", "--format=%s"]),
+        "[bar] implement"
+    );
+    assert!(repo.join("src/bar.rs").exists());
+    let tree = git_out(repo, &["ls-tree", "-r", "--name-only", "HEAD"]);
+    assert!(
+        !tree.contains(".clank/plans/bar.md"),
+        "the pick's plan artifacts never land: {tree}"
+    );
+    // The TARGET's own tracked .clank content is preserved — the strip
+    // set is what the pick INTRODUCES, never the target's files (the
+    // fixture's `git add -A` tracks .clank/config.json on main).
+    assert!(
+        tree.contains(".clank/config.json"),
+        "target-owned .clank content preserved: {tree}"
+    );
+}
+
+#[test]
+fn pick_purge_squash_yields_one_clean_commit() {
+    let env = TestEnv::init();
+    env.register_team("claude", &["codex"], &[]);
+    let repo = env.repo();
+    side_branch_with_bar(&env);
+
+    let mut args = pick_args(repo, &["bar"], "side");
+    args.purge = true;
+    args.squash = true;
+    block_on(clank::cli::pick::run(args)).expect("purge+squash pick succeeds");
+
+    assert_eq!(git_out(repo, &["rev-list", "--count", "HEAD"]), "3");
+    let subject = git_out(repo, &["log", "-1", "--format=%s"]);
+    assert!(
+        !subject.starts_with("[bar]"),
+        "untagged: the commit carries no plan file: {subject}"
+    );
+    assert!(repo.join("src/bar.rs").exists());
+    let tree = git_out(repo, &["ls-tree", "-r", "--name-only", "HEAD"]);
+    assert!(
+        !tree.contains(".clank/plans/bar.md"),
+        "clean commit — no plan artifacts: {tree}"
+    );
+}
+
+#[test]
+fn pick_dry_squash_purge_previews_the_shape_and_is_a_noop() {
+    let env = TestEnv::init();
+    env.register_team("claude", &["codex"], &[]);
+    let repo = env.repo();
+    side_branch_with_bar(&env);
+    let before = git_out(repo, &["rev-parse", "HEAD"]);
+
+    for (squash, purge) in [(true, false), (false, true), (true, true)] {
+        let mut args = pick_args(repo, &["bar"], "side");
+        args.squash = squash;
+        args.purge = purge;
+        args.dry = true;
+        block_on(clank::cli::pick::run(args)).expect("dry succeeds");
+        assert_eq!(
+            git_out(repo, &["rev-parse", "HEAD"]),
+            before,
+            "--dry is a strict no-op"
+        );
+        // Tracked state untouched (the fold's untracked .clank/cache
+        // is clank's own working data, not a pick side effect).
+        assert_eq!(git_out(repo, &["status", "--porcelain", "-uno"]).trim(), "");
+    }
+
+    // Dry-vs-live agreement (one-computation): the squash dry names one
+    // collapsed commit; the live run then produces exactly one commit.
+    let mut args = pick_args(repo, &["bar"], "side");
+    args.squash = true;
+    block_on(clank::cli::pick::run(args)).expect("live squash");
+    assert_eq!(git_out(repo, &["rev-list", "--count", "HEAD"]), "3");
+}
+
+#[test]
+fn pick_collapse_refuses_interleaved_plans() {
+    let env = TestEnv::init();
+    env.register_team("claude", &["codex"], &[]);
+    let repo = env.repo();
+    write(repo, "README", "base\n");
+    commit(repo, "base");
+    git(repo, &["checkout", "-q", "-b", "side"]);
+    write(repo, ".clank/plans/a.md", "# a\n\nplan a\n");
+    commit(repo, "[a] intro");
+    write(repo, ".clank/plans/b.md", "# b\n\nplan b\n");
+    commit(repo, "[b] intro");
+    write(repo, "a.rs", "// a\n");
+    commit(repo, "[a] impl");
+    write(repo, "b.rs", "// b\n");
+    commit(repo, "[b] impl");
+    git(repo, &["checkout", "-q", "main"]);
+
+    let mut args = pick_args(repo, &["a", "b"], "side");
+    args.squash = true;
+    let err = block_on(clank::cli::pick::run(args))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("interleave"), "{err}");
+    // Plain pick of the same pair still works.
+    block_on(clank::cli::pick::run(pick_args(repo, &["a", "b"], "side")))
+        .expect("plain pick of interleaved plans");
 }
