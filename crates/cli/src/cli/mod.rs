@@ -163,6 +163,12 @@ pub struct ForkArgs {
     /// `<source>/.clank/worktrees/<name>`.
     #[arg(long, value_name = "DIR")]
     pub path: Option<PathBuf>,
+    /// Move a draft from the source repo's `.clank/drafts/` into the
+    /// fork's queue. Repeatable — the first named draft gets the lowest
+    /// priority (000, then 001, …), so the forked master is handed them
+    /// in the order given. `.md` suffix optional.
+    #[arg(short = 'd', long = "draft", value_name = "NAME")]
+    pub drafts: Vec<String>,
     /// Extra orienting context for the forked sessions (appended
     /// to the standard orientation prompt).
     #[arg(long, value_name = "TEXT")]
@@ -1567,7 +1573,7 @@ pub(crate) fn repo_basename(repo: &Path) -> anyhow::Result<String> {
 
 #[cfg(test)]
 mod agent_team_cli_parse_tests {
-    use super::{AgentArgs, TeamArgs};
+    use super::{AgentArgs, ForkArgs, TeamArgs};
     use clap::Parser;
 
     // `AgentArgs` / `TeamArgs` derive `Args` (they wrap a
@@ -1583,6 +1589,18 @@ mod agent_team_cli_parse_tests {
     struct TeamT {
         #[command(flatten)]
         args: TeamArgs,
+    }
+
+    #[derive(Parser)]
+    struct ForkT {
+        #[command(flatten)]
+        args: ForkArgs,
+    }
+
+    #[test]
+    fn fork_draft_repeats_with_short_and_long_flags_in_order() {
+        let t = ForkT::try_parse_from(["t", "wt", "-d", "a", "-d", "b", "--draft", "c"]).unwrap();
+        assert_eq!(t.args.drafts, vec!["a", "b", "c"], "list order preserved");
     }
 
     #[test]

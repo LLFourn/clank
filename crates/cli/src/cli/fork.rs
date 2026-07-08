@@ -157,6 +157,7 @@ pub async fn run_fork_pinned(
         anyhow::bail!("fork name must be a simple directory/branch name (got `{name}`)");
     }
     let source = super::resolve_repo(args.source.as_deref())?;
+    let draft_names = normalize_draft_names(&args.drafts)?;
 
     // Worktrees live FLAT under the MAIN repo, never nested under the
     // current worktree — forking from a worktree must produce a
@@ -181,10 +182,23 @@ pub async fn run_fork_pinned(
     if dest.exists() {
         return match registered_worktree_branch(&source, &dest)? {
             Some(branch) if branch == name => {
-                eprintln!(
-                    "fork `{name}` already exists at {} — reopening (no changes)",
-                    dest.display()
-                );
+                // Idempotent draft seeding on re-fork: drafts still in
+                // the source move over; ones already consumed into this
+                // fork's queue are done (a failed multi-draft run can be
+                // retried with the same command).
+                let seeded = seed_drafts(&source, &dest, &draft_names)?;
+                if seeded.is_empty() {
+                    eprintln!(
+                        "fork `{name}` already exists at {} — reopening (no changes)",
+                        dest.display()
+                    );
+                } else {
+                    eprintln!(
+                        "fork `{name}` already exists at {} — reopening (queued: {})",
+                        dest.display(),
+                        seeded.join(", ")
+                    );
+                }
                 Ok((dest, None))
             }
             Some(branch) => anyhow::bail!(
@@ -237,6 +251,24 @@ pub async fn run_fork_pinned(
         );
     }
 
+    // Draft precondition (fork-draft-seeding): every named draft must
+    // exist in the SOURCE drafts dir BEFORE any mutation — a typo must
+    // fail fast, not leave a half-seeded fork. (The reopen path above
+    // is lenient instead: an already-consumed draft that sits in the
+    // fork's queue counts as seeded.)
+    let missing: Vec<&str> = draft_names
+        .iter()
+        .filter(|n| !source_draft_path(&source, n).is_file())
+        .map(String::as_str)
+        .collect();
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "draft(s) not found in {}/.clank/drafts: {}",
+            source.display(),
+            missing.join(", ")
+        );
+    }
+
     // ── Network + mutation side of the fail-closed line ──
     // The PR fetch (and the best-effort gh title lookup) are side
     // effects, so they sit AFTER every precondition (ruthless
@@ -277,6 +309,19 @@ pub async fn run_fork_pinned(
             .with_context(|| format!("seeding `{}`", dst_cfg.display()))?;
     }
 
+    // Seed the fork's queue from the source drafts (fork-draft-seeding)
+    // BEFORE the session specs are written, so the orientation prompt
+    // can name the queued work.
+    let seeded = seed_drafts(&source, &dest, &draft_names)?;
+    let queue_note = if seeded.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " Queued plans seeded for this fork, in order: {}.",
+            seeded.join(", ")
+        )
+    };
+
     let purpose = purpose_owned.as_deref().unwrap_or("parallel work");
     for (label, src_cfg) in &sessions {
         let session = src_cfg
@@ -289,7 +334,7 @@ pub async fn run_fork_pinned(
             prompt: format!(
                 "You are `{label}` in worktree `{name}` of {source_path} \
                  (branch `{name}` off {base}), session forked for: {purpose}. \
-                 Run `clank as {label}` to bind this forked session.",
+                 Run `clank as {label}` to bind this forked session.{queue_note}",
                 label = label.as_str(),
                 source_path = source.display(),
             ),
@@ -325,6 +370,82 @@ pub async fn run_fork_pinned(
     );
     eprintln!("  teardown: git worktree remove {}", dest.display());
     Ok((dest, pinned_pr_base))
+}
+
+/// Normalize `--draft` names: strip an optional `.md` suffix, validate
+/// each as a plan name, and refuse duplicates (the second copy would
+/// collide with the first's queue entry mid-seed). Runs BEFORE any
+/// mutation — an invalid name that happens to exist as a nested drafts
+/// file (`--draft foo/bar`) must fail here, not inside `queue::add`
+/// after the worktree exists (codex 82f3e9c). Order is preserved — it
+/// becomes priority order.
+fn normalize_draft_names(drafts: &[String]) -> anyhow::Result<Vec<String>> {
+    let names: Vec<String> = drafts
+        .iter()
+        .map(|d| d.strip_suffix(".md").unwrap_or(d).to_string())
+        .collect();
+    for (i, n) in names.iter().enumerate() {
+        crate::cli::queue::validate_name(n)?;
+        if names[..i].contains(n) {
+            anyhow::bail!("draft `{n}` named more than once");
+        }
+    }
+    Ok(names)
+}
+
+fn source_draft_path(source: &Path, name: &str) -> PathBuf {
+    source.join(format!(".clank/drafts/{name}.md"))
+}
+
+/// Move the named drafts from the SOURCE repo's `.clank/drafts/` into
+/// the fork's queue, priorities by list position (first → 000)
+/// (fork-draft-seeding). Idempotent for retries: a name whose draft is
+/// gone but which already sits in the fork's queue counts as seeded;
+/// gone AND unqueued is an error. Stem collisions (a draft that still
+/// exists AND is already queued in the fork) are checked for the WHOLE
+/// list before any draft is consumed. Returns the seeded names in
+/// order.
+fn seed_drafts(source: &Path, dest: &Path, names: &[String]) -> anyhow::Result<Vec<String>> {
+    if names.is_empty() {
+        return Ok(Vec::new());
+    }
+    let queued: std::collections::HashSet<String> = crate::cli::queue::scan_queue(dest)
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    let mut to_move: Vec<(usize, &String, PathBuf)> = Vec::new();
+    let mut collisions: Vec<&str> = Vec::new();
+    for (i, n) in names.iter().enumerate() {
+        let path = source_draft_path(source, n);
+        match (path.is_file(), queued.contains(n)) {
+            (true, true) => collisions.push(n),
+            (true, false) => to_move.push((i, n, path)),
+            // Already consumed into this fork's queue — a retry.
+            (false, true) => {}
+            (false, false) => anyhow::bail!(
+                "draft `{n}` not found in {}/.clank/drafts and not in the fork's queue",
+                source.display()
+            ),
+        }
+    }
+    if !collisions.is_empty() {
+        anyhow::bail!(
+            "queue of the fork already has entr{} named: {} — nothing was moved",
+            if collisions.len() == 1 { "y" } else { "ies" },
+            collisions.join(", ")
+        );
+    }
+    for (i, n, path) in &to_move {
+        let raw = std::fs::read_to_string(path)
+            .with_context(|| format!("reading draft `{}`", path.display()))?;
+        let source = crate::cli::queue::BodySource {
+            raw,
+            kind: crate::cli::queue::BodySourceKind::DraftsDir(path.clone()),
+        };
+        crate::cli::queue::add(dest, n, *i as u16, source)
+            .with_context(|| format!("queueing draft `{n}` in the fork"))?;
+    }
+    Ok(names.to_vec())
 }
 
 /// Pure name derivation: explicit name wins; `--pr N` defaults
@@ -633,6 +754,7 @@ detached
             pr: None,
             branch: None,
             path: None,
+            drafts: Vec::new(),
             prompt: None,
             no_open: true,
             review: false,

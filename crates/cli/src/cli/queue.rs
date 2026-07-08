@@ -37,7 +37,14 @@ fn add_cmd(repo: &Path, args: super::QueueAddArgs) -> anyhow::Result<()> {
         );
     }
     let source = pick_body_source(repo, &args.name, &args)?;
-    add(repo, &args.name, args.priority, source)
+    let dest = add(repo, &args.name, args.priority, source)?;
+    println!(
+        "queued `{}` at priority {:03} ({})",
+        args.name,
+        args.priority,
+        dest.display()
+    );
+    Ok(())
 }
 
 /// Where a queued draft's body came from. Used for error
@@ -238,13 +245,27 @@ fn list(repo: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn validate_name(name: &str) -> anyhow::Result<()> {
+/// THE definition of a valid queue/plan name (PlanKey). Also called by
+/// fork's `--draft` preflight so an invalid name fails before any
+/// mutation, not inside `add` after the worktree exists (codex 82f3e9c).
+pub(crate) fn validate_name(name: &str) -> anyhow::Result<()> {
     clank_core::ids::PlanKey::parse(name)
         .map_err(|e| anyhow::anyhow!("invalid plan name `{name}`: {e}"))?;
     Ok(())
 }
 
-fn add(repo: &Path, name: &str, priority: u16, source: BodySource) -> anyhow::Result<()> {
+/// The queue-add core: validate, refuse stem collisions, write the
+/// canonical `{priority:03}-{name}.md` entry, and consume a drafts-dir
+/// source AFTER the write (queue-add-consumes-draft). Quiet — callers
+/// own the user-facing print (`clank fork --draft` seeds a fork's queue
+/// through here and must keep its own stdout contract). Returns the
+/// written entry's path.
+pub(crate) fn add(
+    repo: &Path,
+    name: &str,
+    priority: u16,
+    source: BodySource,
+) -> anyhow::Result<PathBuf> {
     validate_name(name)?;
     if priority > 999 {
         anyhow::bail!("priority must be 0-999");
@@ -288,11 +309,7 @@ fn add(repo: &Path, name: &str, priority: u16, source: BodySource) -> anyhow::Re
             );
         }
     }
-    println!(
-        "queued `{name}` at priority {priority:03} ({})",
-        dest.display()
-    );
-    Ok(())
+    Ok(dest)
 }
 
 fn find_unique<'a>(entries: &'a [QueueEntry], name: &str) -> anyhow::Result<&'a QueueEntry> {

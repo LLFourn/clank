@@ -88,6 +88,7 @@ fn fork_args(env: &TestEnv, name: &str) -> clank::cli::ForkArgs {
         pr: None,
         branch: None,
         path: None,
+        drafts: Vec::new(),
         prompt: None,
         no_open: true,
         review: false,
@@ -522,7 +523,6 @@ fn fork_review_validates_slug_before_creating_the_worktree() {
 #[test]
 fn fork_pr_fetches_pins_and_orients() {
     let env = source_with_bound_team();
-    let repo = env.repo();
     let pr_sha = add_local_pr_remote(&env, "[misc] the pr change");
 
     let mut args = fork_args(&env, "ignored");
@@ -572,5 +572,128 @@ fn fork_pr_precondition_failure_never_touches_network() {
     assert!(
         err.contains("codex") && err.contains("bound session"),
         "precondition error, not a fetch error: {err}"
+    );
+}
+
+// ── fork-draft-seeding ──
+
+#[test]
+fn fork_moves_drafts_into_the_queue_in_list_order() {
+    let env = source_with_bound_team();
+    let repo = env.repo();
+    write(repo, ".clank/drafts/first.md", "# first\n\nbody one\n");
+    write(repo, ".clank/drafts/second.md", "# second\n\nbody two\n");
+
+    let mut args = fork_args(&env, "seeded");
+    // `.md` suffix optional per name.
+    args.drafts = vec!["first".into(), "second.md".into()];
+    let dest = block_on(clank::cli::fork::run_fork(&args, Some(env.home()))).unwrap();
+
+    // First named draft gets the lowest priority; canonical names.
+    let q = dest.join(".clank/queue");
+    let one = std::fs::read_to_string(q.join("000-first.md")).unwrap();
+    let two = std::fs::read_to_string(q.join("001-second.md")).unwrap();
+    assert!(one.contains("body one"));
+    assert!(two.contains("body two"));
+
+    // Moved, not copied: the source drafts are consumed.
+    assert!(!repo.join(".clank/drafts/first.md").exists());
+    assert!(!repo.join(".clank/drafts/second.md").exists());
+
+    // Orientation names the seeded queue in order.
+    let spec: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(dest.join(".clank/agents/claude/fork.json")).unwrap(),
+    )
+    .unwrap();
+    let prompt = spec["prompt"].as_str().unwrap();
+    assert!(
+        prompt.contains("in order: first, second"),
+        "orientation mentions the seeded queue: {prompt}"
+    );
+}
+
+#[test]
+fn fork_with_a_missing_draft_fails_before_any_mutation() {
+    let env = source_with_bound_team();
+    let repo = env.repo();
+    write(repo, ".clank/drafts/real.md", "# real\n\nbody\n");
+
+    let mut args = fork_args(&env, "typo");
+    args.drafts = vec!["real".into(), "no-such-draft".into()];
+    let err = block_on(clank::cli::fork::run_fork(&args, Some(env.home()))).unwrap_err();
+    assert!(err.to_string().contains("no-such-draft"), "{err}");
+
+    // Fail-fast: no worktree, and the real draft was not consumed.
+    assert!(!repo.join(".clank/worktrees/typo").exists());
+    assert!(repo.join(".clank/drafts/real.md").is_file());
+}
+
+#[test]
+fn refork_refuses_a_draft_colliding_with_an_already_seeded_entry() {
+    // The queue is gitignored per-worktree state, so a FRESH fork's
+    // queue starts empty — a collision can only arise on re-fork: a
+    // stem seeded by a previous run whose draft was since re-created.
+    let env = source_with_bound_team();
+    let repo = env.repo();
+    write(repo, ".clank/drafts/taken.md", "# taken\n\nqueued body\n");
+    let mut args = fork_args(&env, "collide");
+    args.drafts = vec!["taken".into()];
+    block_on(clank::cli::fork::run_fork(&args, Some(env.home()))).unwrap();
+
+    // Re-create the consumed draft, add a second, re-fork with both.
+    write(repo, ".clank/drafts/taken.md", "# taken\n\nnew body\n");
+    write(repo, ".clank/drafts/other.md", "# other\n\nother body\n");
+    args.drafts = vec!["other".into(), "taken".into()];
+    let err = block_on(clank::cli::fork::run_fork(&args, Some(env.home()))).unwrap_err();
+    assert!(err.to_string().contains("taken"), "{err}");
+
+    // Checked for the WHOLE list before any move: neither draft moved.
+    assert!(repo.join(".clank/drafts/taken.md").is_file());
+    assert!(repo.join(".clank/drafts/other.md").is_file());
+}
+
+#[test]
+fn refork_seeds_remaining_drafts_and_skips_already_queued() {
+    let env = source_with_bound_team();
+    let repo = env.repo();
+    write(repo, ".clank/drafts/alpha.md", "# alpha\n\na body\n");
+
+    let mut args = fork_args(&env, "retry");
+    args.drafts = vec!["alpha".into()];
+    let dest = block_on(clank::cli::fork::run_fork(&args, Some(env.home()))).unwrap();
+    assert!(dest.join(".clank/queue/000-alpha.md").is_file());
+
+    // Re-fork with alpha (consumed, already queued) + a new beta:
+    // alpha counts as seeded, beta lands at its list position.
+    write(repo, ".clank/drafts/beta.md", "# beta\n\nb body\n");
+    args.drafts = vec!["alpha".into(), "beta".into()];
+    let dest2 = block_on(clank::cli::fork::run_fork(&args, Some(env.home()))).unwrap();
+    assert_eq!(dest2, dest);
+    assert!(dest.join(".clank/queue/000-alpha.md").is_file());
+    assert!(dest.join(".clank/queue/001-beta.md").is_file());
+    assert!(!repo.join(".clank/drafts/beta.md").exists());
+}
+
+#[test]
+fn fork_rejects_an_invalid_draft_name_before_any_mutation() {
+    // codex 82f3e9c: `--draft foo/bar` whose NESTED drafts file exists
+    // passes a bare existence check but is not a valid plan name — it
+    // must fail in preflight, never after the worktree is created.
+    let env = source_with_bound_team();
+    let repo = env.repo();
+    write(repo, ".clank/drafts/foo/bar.md", "# bar\n\nnested body\n");
+
+    let mut args = fork_args(&env, "badname");
+    args.drafts = vec!["foo/bar".into()];
+    let err = block_on(clank::cli::fork::run_fork(&args, Some(env.home()))).unwrap_err();
+    assert!(err.to_string().contains("foo/bar"), "{err}");
+
+    assert!(
+        !repo.join(".clank/worktrees/badname").exists(),
+        "no worktree on an invalid draft name"
+    );
+    assert!(
+        repo.join(".clank/drafts/foo/bar.md").is_file(),
+        "nothing consumed"
     );
 }
