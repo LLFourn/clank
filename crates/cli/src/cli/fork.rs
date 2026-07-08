@@ -577,7 +577,7 @@ pub(crate) fn fetch_pr_head(source: &Path, pr: u32) -> anyhow::Result<String> {
 /// main checkout or a linked worktree — letting new worktrees anchor
 /// flat under `<main>/.clank/worktrees/` instead of nesting under the
 /// current one (fork-worktree-nesting).
-fn main_repo_root(repo: &Path) -> anyhow::Result<PathBuf> {
+pub(crate) fn main_repo_root(repo: &Path) -> anyhow::Result<PathBuf> {
     let stdout = crate::git_plumbing::worktree_list_porcelain(repo)
         .context("resolving the main worktree")?;
     let path = stdout

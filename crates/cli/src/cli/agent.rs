@@ -201,7 +201,11 @@ fn start(args: AgentStartArgs) -> anyhow::Result<()> {
     let cfg = load_agent_config(&repo, &label)?;
     let bound_session = cfg.as_ref().and_then(|c| c.session.as_ref());
 
-    let composed = match bound_session {
+    // Each arm captures the tool ITS composer runs — the fork spec's or
+    // the bound session's tool wins over the roster description, which
+    // can be stale (a codex session under a since-changed claude roster
+    // entry must still get codex launch side effects; codex ff3ca44).
+    let (composed, launch_tool) = match bound_session {
         // A seeded fork spec (clank fork) takes precedence over the
         // plain bootstrap on first launch: fork the source session
         // with the orientation prompt; the forked id then binds via
@@ -216,8 +220,11 @@ fn start(args: AgentStartArgs) -> anyhow::Result<()> {
                 crate::cli::fork::take_fork_spec(&repo, &label)?
             };
             match spec {
-                Some(spec) => compose_fork_launch(&spec, &desc, &repo),
-                None => compose_bootstrap_launch(&label, &desc)?,
+                Some(spec) => {
+                    let tool = spec.tool;
+                    (compose_fork_launch(&spec, &desc, &repo), tool)
+                }
+                None => (compose_bootstrap_launch(&label, &desc)?, desc.tool),
             }
         }
         Some(session) => {
@@ -225,11 +232,14 @@ fn start(args: AgentStartArgs) -> anyhow::Result<()> {
             let auto_mode =
                 crate::cli::team::resolve_effective_auto_mode(cfg.as_ref(), home.as_deref());
             let resolved_prompt = resolve_initial_prompt(desc.initial_prompt.as_deref(), auto_mode);
-            compose_launch(
-                &repo,
-                session,
-                desc.launch.as_ref(),
-                resolved_prompt.as_deref(),
+            (
+                compose_launch(
+                    &repo,
+                    session,
+                    desc.launch.as_ref(),
+                    resolved_prompt.as_deref(),
+                ),
+                session.tool,
             )
         }
     };
@@ -239,7 +249,77 @@ fn start(args: AgentStartArgs) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Codex shows an interactive "do you trust this directory?" prompt
+    // for any repo root not recorded in `~/.codex/config.toml` — and
+    // every codex launch in the codebase flows through THIS exec
+    // (zellij panes and console screens both run `clank agent start`),
+    // so ensuring trust here ensures it everywhere
+    // (codex-trust-at-launch). Best-effort: a failure degrades to the
+    // prompt, never a failed launch. Sits AFTER the `--print` return —
+    // previews must not write.
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    pre_launch_codex_trust(launch_tool, &repo, home.as_deref());
+
     exec_composed(composed)
+}
+
+/// The pre-exec trust step: codex launches record the MAIN repo root
+/// (codex's prompt applies trust to the repository root, so it covers
+/// every worktree under it) as trusted; claude has no such prompt and
+/// writes nothing.
+fn pre_launch_codex_trust(tool: Tool, repo: &Path, home: Option<&Path>) {
+    if tool != Tool::Codex {
+        return;
+    }
+    let Some(home) = home else {
+        return;
+    };
+    let root = match crate::cli::fork::main_repo_root(repo) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("warning: could not resolve the main repo root for codex trust: {e}");
+            return;
+        }
+    };
+    if let Err(e) = ensure_codex_project_trust(home, &root) {
+        eprintln!(
+            "warning: could not record codex trust for {}: {e}",
+            root.display()
+        );
+    }
+}
+
+/// Record `root` as a trusted codex project in `~/.codex/config.toml`
+/// — exactly the two-line table codex writes when the user answers Yes
+/// to its trust prompt. NO-OP when the root already has ANY
+/// `[projects."<root>"]` entry: an existing entry is a prior user
+/// decision (possibly an explicit distrust) and is never overridden.
+/// Appends at the end of the file (TOML table headers are
+/// position-independent), preserving the existing content verbatim;
+/// creates the file when absent (codex-trust-at-launch).
+fn ensure_codex_project_trust(home: &Path, root: &Path) -> anyhow::Result<()> {
+    let path = home.join(".codex/config.toml");
+    let existing = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            return Err(anyhow::Error::from(e).context(format!("reading `{}`", path.display())));
+        }
+    };
+    let header = format!("[projects.\"{}\"]", root.display());
+    if existing.contains(&header) {
+        return Ok(());
+    }
+    let mut out = existing;
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(&format!("\n{header}\ntrust_level = \"trusted\"\n"));
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, out).with_context(|| format!("writing `{}`", path.display()))?;
+    Ok(())
 }
 
 /// Find an agent's resolved `AgentDescription` in the registered
@@ -1634,6 +1714,84 @@ mod tests {
         let row = AgentRow::from_join(&label("boss"), "master", "—", Tool::Claude, None);
         assert_eq!(row.role, "master");
         assert_eq!(row.review, "—");
+    }
+
+    #[test]
+    fn codex_launch_under_stale_claude_roster_still_records_trust() {
+        // codex ff3ca44: the trust step keys on the tool the composed
+        // launch ACTUALLY runs (fork spec / bound session), never the
+        // roster description — a codex fork spec under a stale claude
+        // roster entry must still record trust, and a claude launch
+        // must write nothing.
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo.path())
+                .args(["init", "--quiet"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        // The spec's tool is what flows to the trust step (captured in
+        // the same match arm that picks the composer).
+        let spec = crate::cli::fork::ForkSpec {
+            tool: Tool::Codex,
+            from_session: None,
+            prompt: "orient".into(),
+        };
+        pre_launch_codex_trust(spec.tool, repo.path(), Some(home.path()));
+        let cfg = home.path().join(".codex/config.toml");
+        let body = std::fs::read_to_string(&cfg).unwrap();
+        assert!(body.contains("trust_level = \"trusted\""), "{body}");
+
+        // A claude launch writes nothing.
+        let home2 = tempfile::tempdir().unwrap();
+        pre_launch_codex_trust(Tool::Claude, repo.path(), Some(home2.path()));
+        assert!(!home2.path().join(".codex/config.toml").exists());
+    }
+
+    #[test]
+    fn codex_trust_appends_preserves_and_never_overrides() {
+        // codex-trust-at-launch: the ensure step mirrors codex's own
+        // Yes-answer write, appends without touching existing content,
+        // and NEVER rewrites an existing projects entry (a prior user
+        // decision — possibly an explicit distrust).
+        let home = tempfile::tempdir().unwrap();
+        let cfg = home.path().join(".codex/config.toml");
+        let root_a = std::path::Path::new("/repos/alpha");
+        let root_b = std::path::Path::new("/repos/beta");
+
+        // Creates the file when absent.
+        ensure_codex_project_trust(home.path(), root_a).unwrap();
+        let body = std::fs::read_to_string(&cfg).unwrap();
+        assert!(body.contains("[projects.\"/repos/alpha\"]"));
+        assert!(body.contains("trust_level = \"trusted\""));
+
+        // Idempotent: a second ensure adds nothing.
+        ensure_codex_project_trust(home.path(), root_a).unwrap();
+        assert_eq!(std::fs::read_to_string(&cfg).unwrap(), body);
+
+        // Existing content (including an explicit DISTRUST for beta)
+        // survives verbatim; beta's entry is never overridden.
+        let seeded = format!(
+            "model = \"gpt-5.5\"\n\n[projects.\"/repos/beta\"]\ntrust_level = \"untrusted\"\n"
+        );
+        std::fs::write(&cfg, &seeded).unwrap();
+        ensure_codex_project_trust(home.path(), root_b).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&cfg).unwrap(),
+            seeded,
+            "an existing entry is a prior user decision — untouched"
+        );
+        ensure_codex_project_trust(home.path(), root_a).unwrap();
+        let body = std::fs::read_to_string(&cfg).unwrap();
+        assert!(
+            body.starts_with(&seeded),
+            "existing file preserved verbatim"
+        );
+        assert!(body.contains("[projects.\"/repos/alpha\"]\ntrust_level = \"trusted\""));
     }
 
     #[test]
