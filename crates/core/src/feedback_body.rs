@@ -64,6 +64,50 @@ pub fn parse_summary(body: &str) -> &str {
     }
 }
 
+/// Strip a leading restatement of `verdict` from a review message
+/// (`"CONTINUE: looks good"` → `"looks good"`). Reviewers habitually
+/// restate the verdict at the head of their message even though the
+/// file header already carries it; the declared verdict is the single
+/// source of truth, so `feedback write` normalizes the duplicate away
+/// at compose time.
+///
+/// Deliberately conservative: the token must match the DECLARED
+/// verdict (case-insensitive; `REQUEST_CHANGES` also with space or
+/// hyphen between the words) and must be followed by a punctuation
+/// separator (`:`, `—`, `–`, `-`) — a bare verdict word followed by
+/// prose ("Continue polishing the API") is a summary, not a
+/// restatement. Strips once, at the very start only; everything after
+/// the separator (including newlines — a body must not be promoted
+/// into the summary line) is returned as-is.
+pub fn strip_verdict_restatement(verdict: Verdict, message: &str) -> &str {
+    let Some(after_token) = strip_token(verdict, message) else {
+        return message;
+    };
+    let at_sep = after_token.trim_start_matches([' ', '\t']);
+    let Some(after_sep) = at_sep.strip_prefix([':', '—', '–', '-']) else {
+        return message;
+    };
+    after_sep.trim_start_matches([' ', '\t'])
+}
+
+/// Case-insensitive match of `verdict`'s token at the start of `s`,
+/// returning the remainder. `None` for no match (including
+/// [`Verdict::Unmarked`], which has no token).
+fn strip_token(verdict: Verdict, s: &str) -> Option<&str> {
+    fn strip_ci<'a>(s: &'a str, token: &str) -> Option<&'a str> {
+        let (head, tail) = s.split_at_checked(token.len())?;
+        head.eq_ignore_ascii_case(token).then_some(tail)
+    }
+    match verdict {
+        Verdict::Continue => strip_ci(s, "CONTINUE"),
+        Verdict::Finished => strip_ci(s, "FINISHED"),
+        Verdict::RequestChanges => ["REQUEST_CHANGES", "REQUEST CHANGES", "REQUEST-CHANGES"]
+            .iter()
+            .find_map(|t| strip_ci(s, t)),
+        Verdict::Unmarked => None,
+    }
+}
+
 /// A parsed feedback body — the detected verdict header.
 ///
 /// Use [`FeedbackBody::parse`] to construct, then
@@ -210,6 +254,67 @@ mod tests {
     #[test]
     fn parse_verdict_empty_body() {
         assert_eq!(parse_verdict(""), Verdict::Unmarked);
+    }
+
+    #[test]
+    fn strip_verdict_restatement_strips_matching_prefixes() {
+        use Verdict::*;
+        for (v, msg, want) in [
+            (Continue, "CONTINUE: looks good", "looks good"),
+            (Continue, "Continue: looks good", "looks good"),
+            (Continue, "continue — looks good", "looks good"),
+            (Continue, "CONTINUE : spaced separator", "spaced separator"),
+            (Finished, "FINISHED — ship it", "ship it"),
+            (Finished, "Finished: ship it", "ship it"),
+            (RequestChanges, "REQUEST_CHANGES: fix foo", "fix foo"),
+            (RequestChanges, "Request changes: fix foo", "fix foo"),
+            (RequestChanges, "request-changes: fix foo", "fix foo"),
+            (RequestChanges, "REQUEST_CHANGES – fix foo", "fix foo"),
+        ] {
+            assert_eq!(strip_verdict_restatement(v, msg), want, "input: {msg}");
+        }
+    }
+
+    #[test]
+    fn strip_verdict_restatement_leaves_non_restatements() {
+        use Verdict::*;
+        for (v, msg) in [
+            // No separator: legitimate prose starting with the word.
+            (Continue, "Continue polishing the API"),
+            // Restated verdict doesn't match the declared one.
+            (Continue, "FINISHED: wrong verdict"),
+            (Finished, "CONTINUE: wrong verdict"),
+            // Word boundary: the token inside a longer word.
+            (Continue, "Continued: past tense"),
+            // Not at the start.
+            (Continue, "looks good; CONTINUE: later"),
+            // On a later line.
+            (Continue, "summary\nCONTINUE: details"),
+            // Unmarked has no token.
+            (Unmarked, "CONTINUE: anything"),
+        ] {
+            assert_eq!(strip_verdict_restatement(v, msg), msg, "input: {msg}");
+        }
+    }
+
+    #[test]
+    fn strip_verdict_restatement_preserves_the_body() {
+        // The body after the summary line rides along verbatim.
+        assert_eq!(
+            strip_verdict_restatement(Verdict::Continue, "Continue: ok\n\nDetails."),
+            "ok\n\nDetails."
+        );
+        // First line empties: the remainder keeps its leading newlines
+        // so the body is NOT promoted into the summary line.
+        assert_eq!(
+            strip_verdict_restatement(Verdict::Continue, "CONTINUE:\n\nDetails."),
+            "\n\nDetails."
+        );
+        // Empty remainder is allowed (header-only first line).
+        assert_eq!(
+            strip_verdict_restatement(Verdict::Continue, "CONTINUE:"),
+            ""
+        );
     }
 
     #[test]

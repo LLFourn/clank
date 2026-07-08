@@ -637,7 +637,9 @@ pub struct FeedbackWriteArgs {
     #[arg(long, value_name = "LABEL")]
     pub author: String,
     /// Review message (like `git commit -m`). First line is the
-    /// summary; subsequent lines are details. Required.
+    /// summary; subsequent lines are details. Required. Don't restate
+    /// the verdict — a leading `CONTINUE:` / `REQUEST_CHANGES:` etc.
+    /// matching --verdict is stripped.
     #[arg(short = 'm', value_name = "MSG")]
     pub message: String,
 }

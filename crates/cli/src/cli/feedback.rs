@@ -34,7 +34,21 @@ async fn run_write(args: FeedbackWriteArgs) -> anyhow::Result<()> {
         }
     };
 
-    let body = format!("{verdict_header} {}\n", args.message.trim());
+    // The declared --verdict is the single source of truth: a leading
+    // restatement in the message ("CONTINUE: …") would render the
+    // verdict twice on every summary surface, so it's normalized away
+    // here at the boundary (strip-verdict-restatement).
+    let message =
+        clank_core::feedback_body::strip_verdict_restatement(expected_verdict, args.message.trim());
+    // No space after the header when the summary is empty or the
+    // stripped first line was empty (the remainder starts with the
+    // body's newlines).
+    let sep = if message.is_empty() || message.starts_with('\n') {
+        ""
+    } else {
+        " "
+    };
+    let body = format!("{verdict_header}{sep}{message}\n");
 
     let state =
         crate::rebuild::rebuild_repo_with_policy(&repo, crate::rebuild::CachePolicy::Bypass)
