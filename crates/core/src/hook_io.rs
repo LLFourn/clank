@@ -165,10 +165,10 @@ pub enum HookOutcome {
     /// The agent runs another turn against this text.
     Continue { reason: String },
     /// Let the agent stop normally. No output to either tool. `why`
-    /// carries WHICH silent branch fired — never on the wire, but the
-    /// stop-hook decision trace records it so "the hook chose not to
-    /// wait" is diagnosable per-branch instead of one indistinct
-    /// silence (stop-hook-decision-trace).
+    /// carries WHICH silent branch fired — never on the wire, but
+    /// first-class so "the hook chose not to wait" stays
+    /// distinguishable per-branch (and testable) instead of one
+    /// indistinct silence.
     Silent { why: SilentReason },
     /// Internal problem (config parse, identity unresolvable,
     /// projection failure). The hook NEVER fails the agent —
@@ -178,10 +178,9 @@ pub enum HookOutcome {
     Diagnostic { message: String },
 }
 
-/// Why the hook let the agent stop silently — first-class data so the
-/// decision trace records the branch instead of re-deriving it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
+/// Why the hook let the agent stop silently — first-class data so each
+/// branch is named rather than re-derived at the call sites.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SilentReason {
     /// Background work is armed to re-fire Stop; yield to that wake.
     YieldArmed,
