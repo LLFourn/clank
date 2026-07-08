@@ -11,7 +11,7 @@
 //! The two tools get different work-delivery models
 //! (claude-stop-hook-minimal-hint): **claude** never waits in-hook and
 //! never renders work items — its only continuation is the
-//! self-extinguishing "arm `clank wait` as a background task" hint, and
+//! self-extinguishing arm-the-wait hint, and
 //! the armed wait's completion wake delivers the work (claude wakes the
 //! session when a background task finishes). **codex** has no such wake
 //! channel, so its hook long-polls `clank wait` in-hook and blocks with
@@ -410,8 +410,7 @@ async fn peek_has_work(repo: &Path, label: &AgentLabel, role: Role) -> Result<bo
 /// instruction (lloyd, dark-skippy). Only the COUNT is stated. The two
 /// variants share the instruction core so they can't drift.
 fn nudge_reason(input: &HookInput) -> String {
-    const CORE: &str =
-        "run `clank wait` as a background task (run_in_background: true), then end your turn.";
+    const CORE: &str = "run `clank wait` (run_in_background: true), then end your turn.";
     let count = input
         .background_tasks
         .iter()
@@ -932,7 +931,7 @@ mod tests {
             "no command text leaks: {reason}"
         );
         // The instruction core: command + the run_in_background detail.
-        assert!(reason.contains("run `clank wait` as a background task"));
+        assert!(reason.contains("run `clank wait` (run_in_background: true)"));
         assert!(reason.contains("run_in_background: true"));
         assert!(!reason.contains("Bash tool"), "terse: no tool tutorial");
 
@@ -991,7 +990,7 @@ mod tests {
             "{reason}"
         );
         assert!(
-            reason.contains("run `clank wait` as a background task"),
+            reason.contains("run `clank wait` (run_in_background: true)"),
             "{reason}"
         );
         assert!(
@@ -1021,7 +1020,7 @@ mod tests {
             "{reason}"
         );
         assert!(
-            reason.contains("run `clank wait` as a background task"),
+            reason.contains("run `clank wait` (run_in_background: true)"),
             "{reason}"
         );
         assert!(reason.contains("run_in_background: true"), "{reason}");
