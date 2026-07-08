@@ -401,28 +401,24 @@ async fn peek_has_work(repo: &Path, label: &AgentLabel, role: Role) -> Result<bo
 /// The continuation that nudges the agent to arm its own backgrounded
 /// `clank wait` — the ONLY continuation the claude hook ever emits, and
 /// self-extinguishing: once armed, the next Stop is `YieldArmed`-silent.
-/// The core instruction's wording matches the spike that validated
-/// compliance — explicit and copy-pasteable (a vague hint is the failure
-/// mode). Deliberately does NOT echo the task command lines: the agent
-/// knows what it backgrounded, and real commands (multi-clause
-/// `until …; do sleep …` one-liners) turned the nudge into a wall of shell
-/// that buried the instruction (lloyd, dark-skippy). Only the COUNT is
-/// stated. With no background work the preamble/tail change; the
-/// instruction does not.
+/// TERSE by the minimal-hint rule (terse-arm-wait-nudge): the skill docs
+/// teach the arm/act/re-arm loop, so the nudge states only the trigger
+/// plus the one detail models get wrong (run_in_background). Deliberately
+/// does NOT echo the task command lines: the agent knows what it
+/// backgrounded, and real commands (multi-clause `until …; do sleep …`
+/// one-liners) turned the nudge into a wall of shell that buried the
+/// instruction (lloyd, dark-skippy). Only the COUNT is stated. The two
+/// variants share the instruction core so they can't drift.
 fn nudge_reason(input: &HookInput) -> String {
-    const CORE: &str = "Start `clank wait` as its OWN background task now — \
-         call the Bash tool with command `clank wait` and run_in_background \
-         set to true — then end your turn.";
+    const CORE: &str =
+        "run `clank wait` as a background task (run_in_background: true), then end your turn.";
     let count = input
         .background_tasks
         .iter()
         .filter(|t| !t.is_clank_wait())
         .count();
     if count == 0 {
-        return format!(
-            "Nothing is watching for clank work. {CORE} It will wake you \
-             the moment there is clank work for you."
-        );
+        return format!("Nothing is watching for clank work — {CORE}");
     }
     let what = if count > 1 {
         format!("{count} background tasks")
@@ -430,9 +426,8 @@ fn nudge_reason(input: &HookInput) -> String {
         "a background task".to_string()
     };
     format!(
-        "You ended your turn with {what} still running, but nothing is \
-         watching for clank review work. {CORE} That way EITHER the \
-         background task finishing OR new clank review work will wake you."
+        "You ended your turn with {what} still running but nothing watching \
+         for clank work — also {CORE}"
     )
 }
 
@@ -936,9 +931,10 @@ mod tests {
             !reason.contains("until") && !reason.contains("/tmp/x.output"),
             "no command text leaks: {reason}"
         );
-        // The spike-validated instruction is intact.
-        assert!(reason.contains("Start `clank wait` as its OWN"));
-        assert!(reason.contains("run_in_background set to true"));
+        // The instruction core: command + the run_in_background detail.
+        assert!(reason.contains("run `clank wait` as a background task"));
+        assert!(reason.contains("run_in_background: true"));
+        assert!(!reason.contains("Bash tool"), "terse: no tool tutorial");
 
         // Singular wording for one task.
         let one: HookInput = serde_json::from_value(serde_json::json!({
@@ -994,7 +990,10 @@ mod tests {
             reason.contains("Nothing is watching for clank work"),
             "{reason}"
         );
-        assert!(reason.contains("Start `clank wait` as its OWN"), "{reason}");
+        assert!(
+            reason.contains("run `clank wait` as a background task"),
+            "{reason}"
+        );
         assert!(
             !reason.contains("some-plan") && !reason.contains("  - "),
             "the hint must carry no work items: {reason}"
@@ -1021,8 +1020,12 @@ mod tests {
             reason.contains("Nothing is watching for clank work"),
             "{reason}"
         );
-        assert!(reason.contains("Start `clank wait` as its OWN"), "{reason}");
-        assert!(reason.contains("run_in_background set to true"), "{reason}");
+        assert!(
+            reason.contains("run `clank wait` as a background task"),
+            "{reason}"
+        );
+        assert!(reason.contains("run_in_background: true"), "{reason}");
+        assert!(!reason.contains("Bash tool"), "terse: {reason}");
         assert!(
             !reason.contains("still running"),
             "no background-task preamble when idle: {reason}"
