@@ -1540,7 +1540,7 @@ pub(crate) async fn run_tui(
                                 continue;
                             };
                             let actions = plan_actions(pp.st);
-                            match plan_detail_nav(sel, &actions, k, page) {
+                            match plan_detail_nav(sel, &actions, k, page, pp.scroll) {
                                 PlanNav::Sel(x) => mode = Mode::PlanDetail { sel: x },
                                 PlanNav::Scroll(delta) => {
                                     if let Some(live) = plan_page.as_mut() {

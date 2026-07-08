@@ -1219,8 +1219,9 @@ pub(super) fn render_plan_detail(
         out.extend(button_block(key, label, desc, danger, i == sel, cols));
         out.push(String::new());
     }
-    out.push(region_rule("document", "PgUp/PgDn scroll", false, cols));
-    let chrome = out.len();
+    // The document rule is pushed AFTER the clamp below so its
+    // flat-vs-lifted choice keys on the same offset the window uses.
+    let chrome = out.len() + 1;
 
     let body_lines = match pp.body.as_deref() {
         Some(md) => super::markdown::render_markdown(md, cols),
@@ -1234,9 +1235,20 @@ pub(super) fn render_plan_detail(
     // The document fills whatever the buttons left; hint stays pinned
     // on the last row.
     let viewport = rows.saturating_sub(chrome + 1);
+    // Clamped ONCE; the window slice and the lift indicator both read
+    // this value, so the bar can never disagree with the actual scroll
+    // (plan-page-document-scroll-like-log).
     let off = pp
         .scroll
         .min(body_lines.len().saturating_sub(viewport.max(1)));
+    // Lift on scroll (the log's app-bar elevation, reused): flat rule
+    // at the document's top; the raised bar the moment lines scroll
+    // under it.
+    out.push(if off > 0 {
+        region_rule_elevated("document", "↓/PgDn scroll", false, cols)
+    } else {
+        region_rule("document", "↓/PgDn scroll", false, cols)
+    });
     out.extend(body_lines.into_iter().skip(off).take(viewport));
 
     while out.len() < rows.saturating_sub(1) {
@@ -1648,6 +1660,74 @@ mod tests {
             !moved.join("\n").contains("line one"),
             "scrolled past the first body line"
         );
+    }
+
+    #[test]
+    fn plan_detail_document_rule_lifts_on_scroll_keyed_on_the_clamp() {
+        // The log's app-bar elevation, reused: flat rule at the
+        // document's top, raised bar once lines scroll under it — and
+        // the choice keys on the SAME clamped offset as the window, so
+        // an over-scroll that clamps back to 0 stays FLAT
+        // (plan-page-document-scroll-like-log).
+        let st = crate::cli::status_tui::input::PlanPageState {
+            finished: false,
+            multi_commit: true,
+            blocked: false,
+        };
+        let cols = 90;
+        let mut pp = page(st);
+        pp.body = Some("p1\n\np2\n\np3\n\np4\n\np5\n\np6\n\np7\n".into());
+        let actions = plan_actions(st);
+        let flat = super::region_rule("document", "↓/PgDn scroll", false, cols);
+        let lifted = super::region_rule_elevated("document", "↓/PgDn scroll", false, cols);
+
+        let (top, _) = render_plan_detail(&pp, &actions, 0, 30, cols);
+        assert!(top.contains(&flat), "flat rule at the top");
+        assert!(!top.contains(&lifted));
+
+        pp.scroll = 2;
+        let (moved, _) = render_plan_detail(&pp, &actions, 0, 30, cols);
+        assert!(moved.contains(&lifted), "raised bar while scrolled");
+        assert!(!moved.contains(&flat));
+
+        // A tiny document that fits the viewport clamps any scroll back
+        // to 0 — the bar must stay flat (keyed on the clamp, not the
+        // raw request).
+        pp.body = Some("just one line\n".into());
+        pp.scroll = 99;
+        let (clamped, _) = render_plan_detail(&pp, &actions, 0, 40, cols);
+        assert!(clamped.contains(&flat), "clamped-to-top stays flat");
+        assert!(!clamped.contains(&lifted));
+    }
+
+    #[test]
+    fn plan_detail_document_lines_are_never_highlighted() {
+        // The read-only-prose guarantee: the document has no cursor and
+        // no Enter target, so no body line ever carries the selection's
+        // reverse-video style — even while scrolled
+        // (plan-page-document-scroll-like-log).
+        let st = crate::cli::status_tui::input::PlanPageState {
+            finished: false,
+            multi_commit: true,
+            blocked: false,
+        };
+        let mut pp = page(st);
+        pp.body = Some("p1\n\np2\n\np3\n\np4\n\np5\n\np6\n\np7\n".into());
+        pp.scroll = 2;
+        let actions = plan_actions(st);
+        // Select the LAST button (the position from which the document
+        // is scrolled).
+        let (lines, _) = render_plan_detail(&pp, &actions, actions.len() - 1, 30, 90);
+        let doc_rule = lines
+            .iter()
+            .position(|l| l.contains("DOCUMENT"))
+            .expect("document rule present");
+        for l in &lines[doc_rule + 1..] {
+            assert!(
+                !l.contains("\x1b[7m"),
+                "document region must never carry the selection band: {l:?}"
+            );
+        }
     }
 
     #[test]

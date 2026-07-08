@@ -255,14 +255,25 @@ pub(super) fn plan_detail_nav(
     actions: &[PlanAction],
     key: Key,
     page: usize,
+    scroll: usize,
 ) -> PlanNav {
     if let Some(a) = plan_hotkey(key, actions) {
         return PlanNav::Act(a);
     }
     let page = page as i32;
+    let last = actions.len().saturating_sub(1);
     match key {
+        // Continuous options→document crossing
+        // (plan-page-document-scroll-like-log, mirroring the panel↔log
+        // model): ↓ walks the buttons and then keeps scrolling the
+        // document; ↑ climbs back out through the document's top. The
+        // document region is entered and left only via the LAST button
+        // — the cursor itself never enters the document (read-only
+        // prose, no Enter target).
+        Key::Up if sel == last && scroll > 0 => PlanNav::Scroll(-1),
         Key::Up => PlanNav::Sel(sel.saturating_sub(1)),
-        Key::Down => PlanNav::Sel((sel + 1).min(actions.len().saturating_sub(1))),
+        Key::Down if sel < last => PlanNav::Sel(sel + 1),
+        Key::Down => PlanNav::Scroll(1),
         Key::PageUp => PlanNav::Scroll(-page),
         Key::Space | Key::PageDown => PlanNav::Scroll(page),
         Key::Enter => actions.get(sel).map_or(PlanNav::None, |a| PlanNav::Act(*a)),
@@ -1056,35 +1067,67 @@ mod tests {
     #[test]
     fn plan_detail_nav_moves_activates_scrolls_and_backs_out() {
         let actions = plan_actions(active_st());
-        assert_eq!(plan_detail_nav(0, &actions, Key::Down, 10), PlanNav::Sel(1));
+        let last = actions.len() - 1;
         assert_eq!(
-            plan_detail_nav(actions.len() - 1, &actions, Key::Down, 10),
-            PlanNav::Sel(actions.len() - 1),
-            "clamped at the last row"
+            plan_detail_nav(0, &actions, Key::Down, 10, 0),
+            PlanNav::Sel(1)
         );
-        assert_eq!(plan_detail_nav(0, &actions, Key::Up, 10), PlanNav::Sel(0));
         assert_eq!(
-            plan_detail_nav(0, &actions, Key::Enter, 10),
+            plan_detail_nav(0, &actions, Key::Up, 10, 0),
+            PlanNav::Sel(0)
+        );
+        assert_eq!(
+            plan_detail_nav(0, &actions, Key::Enter, 10, 0),
             PlanNav::Act(PlanAction::OpenHtml)
         );
-        assert_eq!(plan_detail_nav(0, &actions, Key::Escape, 10), PlanNav::Back);
+        assert_eq!(
+            plan_detail_nav(0, &actions, Key::Escape, 10, 0),
+            PlanNav::Back
+        );
         // A hotkey acts regardless of the cursor.
         assert_eq!(
-            plan_detail_nav(0, &actions, Key::Char(b'p'), 10),
+            plan_detail_nav(0, &actions, Key::Char(b'p'), 10, 0),
             PlanNav::Act(PlanAction::Purge)
         );
-        // Paging keys scroll the document body; ↑↓ stay on selection.
+        // Paging keys scroll the document body from any row.
         assert_eq!(
-            plan_detail_nav(0, &actions, Key::PageDown, 10),
+            plan_detail_nav(0, &actions, Key::PageDown, 10, 0),
             PlanNav::Scroll(10)
         );
         assert_eq!(
-            plan_detail_nav(0, &actions, Key::Space, 10),
+            plan_detail_nav(0, &actions, Key::Space, 10, 0),
             PlanNav::Scroll(10)
         );
         assert_eq!(
-            plan_detail_nav(0, &actions, Key::PageUp, 10),
+            plan_detail_nav(0, &actions, Key::PageUp, 10, 0),
             PlanNav::Scroll(-10)
+        );
+        // ── the options→document crossing (plan-page-document-scroll-like-log) ──
+        // ↓ on the LAST button keeps going: it scrolls the document.
+        assert_eq!(
+            plan_detail_nav(last, &actions, Key::Down, 10, 0),
+            PlanNav::Scroll(1)
+        );
+        assert_eq!(
+            plan_detail_nav(last, &actions, Key::Down, 10, 5),
+            PlanNav::Scroll(1),
+            "keeps scrolling while in the document"
+        );
+        // ↑ climbs back out THROUGH the document's top: unscroll first,
+        // then return to the buttons.
+        assert_eq!(
+            plan_detail_nav(last, &actions, Key::Up, 10, 3),
+            PlanNav::Scroll(-1)
+        );
+        assert_eq!(
+            plan_detail_nav(last, &actions, Key::Up, 10, 0),
+            PlanNav::Sel(last - 1),
+            "at the document top, ↑ returns to the buttons"
+        );
+        // A scrolled document never hijacks ↑ from a non-last button.
+        assert_eq!(
+            plan_detail_nav(1, &actions, Key::Up, 10, 5),
+            PlanNav::Sel(0)
         );
     }
 
