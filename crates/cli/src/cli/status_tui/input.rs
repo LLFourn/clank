@@ -163,9 +163,6 @@ pub(super) fn detail_actions(role: crate::cli::teams_config::RosterRole) -> Vec<
 /// state — see [`plan_actions`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PlanAction {
-    /// Open the plan document overlay (Enter-first row: the old direct
-    /// drill-in, one keypress deeper for the menu's sake).
-    ReadDoc,
     /// Open the plan's rendered HTML page in the browser.
     OpenHtml,
     /// `stash push` the plan (active only) — behind a confirm.
@@ -204,7 +201,7 @@ pub(super) struct PlanPageState {
 /// plans can't squash; block↔unblock flip on `blocked`).
 pub(super) fn plan_actions(st: PlanPageState) -> Vec<PlanAction> {
     use PlanAction::*;
-    let mut v = vec![ReadDoc, OpenHtml];
+    let mut v = vec![OpenHtml];
     if st.finished {
         if st.multi_commit {
             v.push(Squash);
@@ -246,17 +243,28 @@ pub(super) fn plan_hotkey(key: Key, actions: &[PlanAction]) -> Option<PlanAction
 pub(super) enum PlanNav {
     Sel(usize),
     Act(PlanAction),
+    /// Scroll the plan-document body below the buttons (↑↓ stay on
+    /// button selection; paging keys own the document).
+    Scroll(i32),
     Back,
     None,
 }
 
-pub(super) fn plan_detail_nav(sel: usize, actions: &[PlanAction], key: Key) -> PlanNav {
+pub(super) fn plan_detail_nav(
+    sel: usize,
+    actions: &[PlanAction],
+    key: Key,
+    page: usize,
+) -> PlanNav {
     if let Some(a) = plan_hotkey(key, actions) {
         return PlanNav::Act(a);
     }
+    let page = page as i32;
     match key {
         Key::Up => PlanNav::Sel(sel.saturating_sub(1)),
         Key::Down => PlanNav::Sel((sel + 1).min(actions.len().saturating_sub(1))),
+        Key::PageUp => PlanNav::Scroll(-page),
+        Key::Space | Key::PageDown => PlanNav::Scroll(page),
         Key::Enter => actions.get(sel).map_or(PlanNav::None, |a| PlanNav::Act(*a)),
         Key::Escape => PlanNav::Back,
         _ => PlanNav::None,
@@ -641,6 +649,12 @@ impl Mode {
 pub(super) struct PlanPage {
     pub(super) stem: String,
     pub(super) st: PlanPageState,
+    /// The plan document's markdown, read once when the page opens
+    /// (and on refresh) — rendered beneath the buttons. `None` when the
+    /// file is unreadable.
+    pub(super) body: Option<String>,
+    /// Scroll offset into the rendered document body.
+    pub(super) scroll: usize,
 }
 
 /// The interactive state `render_at` needs beyond the snapshot: which
@@ -975,7 +989,7 @@ mod tests {
         use PlanAction::*;
         assert_eq!(
             plan_actions(active_st()),
-            vec![ReadDoc, OpenHtml, Stash, ForceFinish, Block, Purge, Back]
+            vec![OpenHtml, Stash, ForceFinish, Block, Purge, Back]
         );
     }
 
@@ -998,10 +1012,7 @@ mod tests {
             multi_commit: true,
             blocked: false,
         };
-        assert_eq!(
-            plan_actions(st),
-            vec![ReadDoc, OpenHtml, Squash, Purge, Back]
-        );
+        assert_eq!(plan_actions(st), vec![OpenHtml, Squash, Purge, Back]);
         // Already-collapsed plan: nothing to squash — the row is absent.
         let one = PlanPageState {
             multi_commit: false,
@@ -1043,24 +1054,37 @@ mod tests {
     }
 
     #[test]
-    fn plan_detail_nav_moves_activates_and_backs_out() {
+    fn plan_detail_nav_moves_activates_scrolls_and_backs_out() {
         let actions = plan_actions(active_st());
-        assert_eq!(plan_detail_nav(0, &actions, Key::Down), PlanNav::Sel(1));
+        assert_eq!(plan_detail_nav(0, &actions, Key::Down, 10), PlanNav::Sel(1));
         assert_eq!(
-            plan_detail_nav(actions.len() - 1, &actions, Key::Down),
+            plan_detail_nav(actions.len() - 1, &actions, Key::Down, 10),
             PlanNav::Sel(actions.len() - 1),
             "clamped at the last row"
         );
-        assert_eq!(plan_detail_nav(0, &actions, Key::Up), PlanNav::Sel(0));
+        assert_eq!(plan_detail_nav(0, &actions, Key::Up, 10), PlanNav::Sel(0));
         assert_eq!(
-            plan_detail_nav(0, &actions, Key::Enter),
-            PlanNav::Act(PlanAction::ReadDoc)
+            plan_detail_nav(0, &actions, Key::Enter, 10),
+            PlanNav::Act(PlanAction::OpenHtml)
         );
-        assert_eq!(plan_detail_nav(0, &actions, Key::Escape), PlanNav::Back);
+        assert_eq!(plan_detail_nav(0, &actions, Key::Escape, 10), PlanNav::Back);
         // A hotkey acts regardless of the cursor.
         assert_eq!(
-            plan_detail_nav(0, &actions, Key::Char(b'p')),
+            plan_detail_nav(0, &actions, Key::Char(b'p'), 10),
             PlanNav::Act(PlanAction::Purge)
+        );
+        // Paging keys scroll the document body; ↑↓ stay on selection.
+        assert_eq!(
+            plan_detail_nav(0, &actions, Key::PageDown, 10),
+            PlanNav::Scroll(10)
+        );
+        assert_eq!(
+            plan_detail_nav(0, &actions, Key::Space, 10),
+            PlanNav::Scroll(10)
+        );
+        assert_eq!(
+            plan_detail_nav(0, &actions, Key::PageUp, 10),
+            PlanNav::Scroll(-10)
         );
     }
 

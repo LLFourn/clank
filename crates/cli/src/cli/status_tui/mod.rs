@@ -434,6 +434,9 @@ async fn refetch_plan_page(
     match plan_page_facts(repo, &pp.stem, snapshot).await {
         Some(st) => {
             pp.st = st;
+            // The document shown beneath the buttons may have changed
+            // (plan revised, finished) — re-read alongside the facts.
+            pp.body = read_plan_markdown(repo, &pp.stem);
             true
         }
         None => {
@@ -646,12 +649,9 @@ enum OverlayData {
         message: String,
     },
     Commit(CommitDetail),
-    /// A plan's markdown by stem; `markdown` is `None` when the file
-    /// isn't found.
-    Plan {
-        stem: String,
-        markdown: Option<String>,
-    },
+    /// (An ACTIVE plan's document has no overlay: the plan page renders
+    /// it beneath the action buttons — tui-plan-page-redesign.)
+    ///
     /// A QUEUED plan's markdown by name (source: `.clank/queue/`, not
     /// `plans/`); `markdown` is `None` when it left the queue.
     QueuedPlan {
@@ -686,13 +686,6 @@ impl Overlay {
         Self {
             data: OverlayData::Commit(data),
             offset,
-        }
-    }
-    /// A plan-document overlay, opened at the top.
-    fn plan(stem: String, markdown: Option<String>) -> Self {
-        Self {
-            data: OverlayData::Plan { stem, markdown },
-            offset: 0,
         }
     }
     /// A queued-plan overlay, opened at the top.
@@ -1066,13 +1059,6 @@ pub(crate) async fn run_tui(
                     rows as usize,
                     cols as usize,
                 ),
-                OverlayData::Plan { stem, markdown } => render_plan_doc(
-                    stem,
-                    markdown.as_deref(),
-                    overlay.offset,
-                    rows as usize,
-                    cols as usize,
-                ),
                 OverlayData::QueuedPlan { name, markdown }
                 | OverlayData::StashedPlan { name, markdown } => render_plan_doc(
                     name,
@@ -1090,7 +1076,6 @@ pub(crate) async fn run_tui(
             // arm mutates it).
             let html_target: Option<HtmlTarget> = match &overlay.data {
                 OverlayData::Commit(d) => Some(HtmlTarget::Commit(d.sha.as_str().to_string())),
-                OverlayData::Plan { stem, .. } => Some(HtmlTarget::Plan(stem.clone())),
                 OverlayData::QueuedPlan { name, .. } => Some(HtmlTarget::Queue(name.clone())),
                 OverlayData::StashedPlan { name, .. } => Some(HtmlTarget::Stash(name.clone())),
                 OverlayData::Error { .. } => None,
@@ -1127,13 +1112,6 @@ pub(crate) async fn run_tui(
                         OverlayData::Commit(d) => {
                             let sha = d.sha.clone();
                             fetch_commit_detail(&repo, &sha).map(OverlayData::Commit)
-                        }
-                        OverlayData::Plan { stem, .. } => {
-                            let stem = stem.clone();
-                            Some(OverlayData::Plan {
-                                markdown: read_plan_markdown(&repo, &stem),
-                                stem,
-                            })
                         }
                         OverlayData::QueuedPlan { name, .. } => {
                             let name = name.clone();
@@ -1218,7 +1196,11 @@ pub(crate) async fn run_tui(
             picker: &picker,
             log_cursor: log.cursor,
         };
-        paint(&render_at(&snapshot, rows, cols, log.offset, frame, &view).0);
+        // `screen_total` is the current screen's virtual content height
+        // (log rows; plan page chrome + full document) — the plan page's
+        // body-scroll clamp reads it, mirroring the overlay pattern.
+        let (screen, screen_total) = render_at(&snapshot, rows, cols, log.offset, frame, &view);
+        paint(&screen);
 
         // The spinner lives on the AGENTS panel rows, which are always on
         // screen when a roster exists — tick whenever any agent is active
@@ -1558,17 +1540,22 @@ pub(crate) async fn run_tui(
                                 continue;
                             };
                             let actions = plan_actions(pp.st);
-                            match plan_detail_nav(sel, &actions, k) {
+                            match plan_detail_nav(sel, &actions, k, page) {
                                 PlanNav::Sel(x) => mode = Mode::PlanDetail { sel: x },
+                                PlanNav::Scroll(delta) => {
+                                    if let Some(live) = plan_page.as_mut() {
+                                        let max_off =
+                                            screen_total.saturating_sub((rows as usize).max(1));
+                                        live.scroll = (live.scroll as i64 + delta as i64)
+                                            .clamp(0, max_off as i64)
+                                            as usize;
+                                    }
+                                }
                                 PlanNav::Back => {
                                     plan_page = None;
                                     mode = Mode::LogScroll;
                                 }
                                 PlanNav::Act(a) => match a {
-                                    PlanAction::ReadDoc => {
-                                        let md = read_plan_markdown(&repo, &pp.stem);
-                                        detail = Some(Overlay::plan(pp.stem.clone(), md));
-                                    }
                                     PlanAction::OpenHtml => open_overlay_in_browser(
                                         &repo,
                                         &HtmlTarget::Plan(pp.stem.clone()),
@@ -1691,13 +1678,19 @@ pub(crate) async fn run_tui(
                                         }
                                     }
                                     // A plan header opens the ACTIONS
-                                    // page (menu-first; the doc is its
-                                    // first row) — tui-plan-actions-page.
+                                    // page (buttons over the document —
+                                    // tui-plan-page-redesign).
                                     Some(OverlayTarget::Plan { stem }) => {
                                         if let Some(st) =
                                             plan_page_facts(&repo, &stem, &snapshot).await
                                         {
-                                            plan_page = Some(PlanPage { stem, st });
+                                            let body = read_plan_markdown(&repo, &stem);
+                                            plan_page = Some(PlanPage {
+                                                stem,
+                                                st,
+                                                body,
+                                                scroll: 0,
+                                            });
                                             mode = Mode::PlanDetail { sel: 0 };
                                         }
                                     }
@@ -2048,8 +2041,7 @@ pub(crate) mod tests {
         };
         let subject_of = |o: &Overlay| match &o.data {
             OverlayData::Commit(d) => d.subject.clone(),
-            OverlayData::Plan { .. }
-            | OverlayData::QueuedPlan { .. }
+            OverlayData::QueuedPlan { .. }
             | OverlayData::StashedPlan { .. }
             | OverlayData::Error { .. } => unreachable!(),
         };
@@ -2066,8 +2058,8 @@ pub(crate) mod tests {
         assert_eq!(o.offset, 8, "clamped to the last page");
         o.scroll(-100, 8);
         assert_eq!(o.offset, 0, "clamped at the top");
-        // A plan overlay opens at the top.
-        let p = Overlay::plan("foo".into(), Some("# foo".into()));
+        // A queued-plan overlay opens at the top.
+        let p = Overlay::queued("foo".into(), Some("# foo".into()));
         assert_eq!(p.offset, 0);
     }
 

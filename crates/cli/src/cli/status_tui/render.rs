@@ -1152,27 +1152,44 @@ pub(super) fn commit_review_offset(doc: &CommitDoc<'_>, author: &str, cols: usiz
         .unwrap_or(0)
 }
 
-/// One row of the plan-actions page: `key  label  hint`, reverse-video
-/// band when selected; danger rows red (dim red until selected). The
-/// hotkey letter renders accent so the direct keys are discoverable
-/// from the rows themselves.
-fn plan_row(key: &str, label: &str, hint: &str, danger: bool) -> Vec<Span> {
-    let mut spans = if danger {
-        vec![colored("31", format!("   {key}  {label:<16} "))]
+/// One button block of the plan-actions page: a label line plus the
+/// explanation word-wrapped BENEATH it (never clipped), indented under
+/// the label. Selection reverses the whole block; danger blocks render
+/// red (dim red until selected). The hotkey letter renders accent so
+/// the direct keys are discoverable from the buttons themselves.
+fn button_block(
+    key: &str,
+    label: &str,
+    desc: &str,
+    danger: bool,
+    selected: bool,
+    cols: usize,
+) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    let label_spans = if danger {
+        vec![colored("31", format!("  {key}  {label}"))]
     } else {
-        vec![
-            accent(format!("   {key}  ")),
-            plain(format!("{label:<16} ")),
-        ]
+        vec![accent(format!("  {key}  ")), plain(label.to_string())]
     };
-    spans.push(dim(hint.to_string()));
-    spans
+    lines.push(row_line(&label_spans, selected, "", cols));
+    let indent = "     ";
+    for l in wrap(desc, cols.saturating_sub(indent.len()).max(8)) {
+        let spans = if danger {
+            vec![colored("2;31", format!("{indent}{l}"))]
+        } else {
+            vec![dim(format!("{indent}{l}"))]
+        };
+        lines.push(row_line(&spans, selected, "", cols));
+    }
+    lines
 }
 
-/// The plan-actions page (tui-plan-actions-page): a state-aware action
-/// menu over one plan. Danger rows sit below a rule; routine rows stay
-/// quiet — the danger GRADIENT deepens on the chooser + confirm
-/// screens.
+/// The plan-actions page (tui-plan-actions-page, redesigned by
+/// tui-plan-page-redesign): button blocks over one plan, then the plan
+/// DOCUMENT itself beneath them — read it here, no drill-in. No danger
+/// rule: purge's red is the cue, and the danger GRADIENT deepens on
+/// the chooser + confirm screens. Returns the virtual content height
+/// (chrome + full document) so the loop can clamp body scroll.
 pub(super) fn render_plan_detail(
     pp: &super::input::PlanPage,
     actions: &[PlanAction],
@@ -1196,64 +1213,79 @@ pub(super) fn render_plan_detail(
         cols,
     ));
     out.push(String::new());
-    let mut danger_rule_done = false;
     for (i, a) in actions.iter().enumerate() {
-        if out.len() >= rows.saturating_sub(1) {
-            break;
-        }
         let danger = matches!(a, PlanAction::Purge);
-        if danger && !danger_rule_done {
-            out.push(emit(
-                &[colored("31", "  ── danger ──".to_string())],
-                "",
-                cols,
-            ));
-            danger_rule_done = true;
-        }
-        let (key, label, hint) = plan_action_row(*a);
-        out.push(row_line(
-            &plan_row(key, label, hint, danger),
-            i == sel,
-            "",
-            cols,
-        ));
-    }
-    if out.len() < rows {
+        let (key, label, desc) = plan_action_row(*a);
+        out.extend(button_block(key, label, desc, danger, i == sel, cols));
         out.push(String::new());
     }
-    if out.len() < rows {
-        out.push(emit(
-            &[dim("  ↑↓ move · ⏎ select · esc back".to_string())],
-            "",
-            cols,
-        ));
+    out.push(region_rule("document", "PgUp/PgDn scroll", false, cols));
+    let chrome = out.len();
+
+    let body_lines = match pp.body.as_deref() {
+        Some(md) => super::markdown::render_markdown(md, cols),
+        None => vec![emit(&[dim("  (no plan document)".to_string())], "", cols)],
+    };
+    // +1 for the pinned hint row: the loop clamps scroll to
+    // `total - rows` and the body viewport is `rows - chrome - 1`, so
+    // without it the final document line would be unreachable
+    // (codex 9452520).
+    let total = chrome + body_lines.len() + 1;
+    // The document fills whatever the buttons left; hint stays pinned
+    // on the last row.
+    let viewport = rows.saturating_sub(chrome + 1);
+    let off = pp
+        .scroll
+        .min(body_lines.len().saturating_sub(viewport.max(1)));
+    out.extend(body_lines.into_iter().skip(off).take(viewport));
+
+    while out.len() < rows.saturating_sub(1) {
+        out.push(String::new());
     }
-    out.truncate(rows);
-    (out, 0)
+    out.truncate(rows.saturating_sub(1));
+    out.push(emit(
+        &[dim("  ↑↓ move · ⏎ select · esc back".to_string())],
+        "",
+        cols,
+    ));
+    (out, total)
 }
 
-/// The row text for one plan action. The hotkey letters are the rows'
-/// own documentation.
+/// The text for one plan-action button: hotkey, label, explanation.
+/// Explanations say what the action DOES — never what a later screen
+/// will show.
 fn plan_action_row(a: PlanAction) -> (&'static str, &'static str, &'static str) {
     match a {
-        PlanAction::ReadDoc => ("⏎", "read the plan", "the full document"),
-        PlanAction::OpenHtml => ("o", "open in browser", "html page with feedback"),
-        PlanAction::Stash => ("s", "stash…", "set the commits aside; pop to resume"),
+        PlanAction::OpenHtml => ("o", "open in browser", "the plan's html page with feedback"),
+        PlanAction::Stash => (
+            "s",
+            "stash…",
+            "set the plan's commits aside; pop later to resume where it left off",
+        ),
         PlanAction::ForceFinish => (
             "f",
             "force finish…",
             "finalize NOW, bypassing the review gate",
         ),
         PlanAction::Squash => ("c", "squash…", "collapse the plan's commits into one"),
-        PlanAction::Block => ("b", "block…", "pause: ask the human, suppress work"),
+        PlanAction::Block => (
+            "b",
+            "block…",
+            "pause: ask the human a question and suppress work until answered",
+        ),
         PlanAction::Unblock => ("b", "unblock", "resume: answer the pending block"),
-        PlanAction::Purge => ("p", "purge…", "rewrite history; next screen chooses how"),
+        PlanAction::Purge => (
+            "p",
+            "purge…",
+            "remove this plan's reviews and feedback from history, or delete the plan entirely",
+        ),
         PlanAction::Back => ("esc", "back", ""),
     }
 }
 
 /// The purge chooser (the danger door's second screen): artifacts-only
-/// vs drop-everything, both consequences spelled out.
+/// vs drop-everything as full button blocks, both consequences spelled
+/// out in wrapped text — nothing clipped.
 pub(super) fn render_purge_choice(
     stem: &str,
     sel: usize,
@@ -1263,30 +1295,21 @@ pub(super) fn render_purge_choice(
     let mut out: Vec<String> = Vec::new();
     out.push(region_rule(&format!("purge · {stem}"), "", true, cols));
     out.push(String::new());
-    let rows_spec: [(&str, &str, &str); 2] = [
+    let choices: [(&str, &str, &str); 2] = [
         (
             "a",
             "artifacts only",
-            "strip .clank/ files from history; the code stays",
+            "strip this plan's .clank files — reviews, feedback, the plan \
+             document — out of history. The implementation commits stay.",
         ),
         (
             "d",
             "drop EVERYTHING",
-            "the plan AND its implementation commits vanish",
+            "delete the plan AND its implementation commits from the branch.",
         ),
     ];
-    for (i, (key, label, hint)) in rows_spec.iter().enumerate() {
-        if out.len() >= rows.saturating_sub(1) {
-            break;
-        }
-        out.push(row_line(
-            &plan_row(key, label, hint, true),
-            i == sel,
-            "",
-            cols,
-        ));
-    }
-    if out.len() < rows {
+    for (i, (key, label, desc)) in choices.iter().enumerate() {
+        out.extend(button_block(key, label, desc, true, i == sel, cols));
         out.push(String::new());
     }
     if out.len() < rows {
@@ -1539,11 +1562,13 @@ mod tests {
         super::super::input::PlanPage {
             stem: "my-plan".into(),
             st,
+            body: Some("# my-plan\n\nThe document body rendered inline.\n".into()),
+            scroll: 0,
         }
     }
 
     #[test]
-    fn plan_detail_renders_state_rows_with_a_danger_rule() {
+    fn plan_detail_renders_buttons_then_the_document() {
         let st = crate::cli::status_tui::input::PlanPageState {
             finished: false,
             multi_commit: true,
@@ -1551,39 +1576,124 @@ mod tests {
         };
         let pp = page(st);
         let actions = plan_actions(st);
-        let (lines, _) = render_plan_detail(&pp, &actions, 2, 30, 90);
+        let (lines, total) = render_plan_detail(&pp, &actions, 1, 40, 90);
         let text = lines.join("\n");
         assert!(
             text.contains("PLAN · MY-PLAN"),
             "rule title uppercased: {text}"
         );
-        assert!(text.contains("read the plan"));
         assert!(text.contains("stash…"));
         assert!(text.contains("force finish…"));
         assert!(text.contains("block…"));
-        assert!(text.contains("── danger ──"), "danger rule present");
         assert!(text.contains("purge…"));
-        // The danger rule sits ABOVE purge and BELOW the routine rows.
-        let rule = lines.iter().position(|l| l.contains("danger")).unwrap();
-        let purge = lines.iter().position(|l| l.contains("purge…")).unwrap();
-        let stash = lines.iter().position(|l| l.contains("stash…")).unwrap();
-        assert!(stash < rule && rule < purge, "gradient order");
-        // Selected row (idx 2 = stash) carries the reverse band.
+        // No drill-in row and no danger rule (purge's red is the cue).
+        assert!(!text.contains("read the plan"));
+        assert!(!text.contains("danger"));
+        // The document renders beneath the buttons.
+        assert!(text.contains("DOCUMENT"), "document rule: {text}");
         assert!(
-            lines[lines.iter().position(|l| l.contains("stash…")).unwrap()].contains("\x1b[7m"),
-            "selection is the reverse-video band"
+            text.contains("The document body rendered inline."),
+            "plan body shown on the page: {text}"
+        );
+        let doc_rule = lines.iter().position(|l| l.contains("DOCUMENT")).unwrap();
+        let body = lines
+            .iter()
+            .position(|l| l.contains("document body"))
+            .unwrap();
+        let purge = lines.iter().position(|l| l.contains("purge…")).unwrap();
+        assert!(purge < doc_rule && doc_rule < body, "buttons, then the doc");
+        assert!(total > doc_rule, "total covers chrome + document");
+        // Selected block (idx 1 = stash) carries the reverse band on its
+        // label AND its wrapped explanation line.
+        let stash = lines.iter().position(|l| l.contains("stash…")).unwrap();
+        assert!(lines[stash].contains("\x1b[7m"), "label reversed");
+        assert!(
+            lines[stash + 1].contains("\x1b[7m") && lines[stash + 1].contains("pop later"),
+            "explanation line is inside the selection band: {:?}",
+            lines[stash + 1]
         );
     }
 
     #[test]
-    fn purge_choice_names_both_consequences() {
-        let (lines, _) = render_purge_choice("my-plan", 1, 20, 90);
+    fn plan_detail_wraps_explanations_and_scrolls_the_body() {
+        let st = crate::cli::status_tui::input::PlanPageState {
+            finished: false,
+            multi_commit: true,
+            blocked: false,
+        };
+        // Narrow pane: the purge explanation must WRAP, never clip.
+        let pp = page(st);
+        let actions = plan_actions(st);
+        let (lines, _) = render_plan_detail(&pp, &actions, 0, 40, 46);
+        let text = lines.join("\n");
+        assert!(text.contains("reviews and feedback"), "{text}");
+        assert!(
+            text.contains("delete the plan entirely"),
+            "wrapped tail survives at narrow width: {text}"
+        );
+        assert!(!text.contains("next screen"), "no next-screen meta");
+        // Scrolling advances the body while the buttons stay put.
+        // (Blank-line separated: markdown flows adjacent lines into one
+        // paragraph.)
+        let mut scrolled = page(st);
+        scrolled.body = Some("line one\n\nline two\n\nline three\n\nline four\n".into());
+        let (top, _) = render_plan_detail(&scrolled, &actions, 0, 24, 90);
+        scrolled.scroll = 2;
+        let (moved, _) = render_plan_detail(&scrolled, &actions, 0, 24, 90);
+        let purge_top = top.iter().position(|l| l.contains("purge…")).unwrap();
+        let purge_moved = moved.iter().position(|l| l.contains("purge…")).unwrap();
+        assert_eq!(purge_top, purge_moved, "buttons pinned while scrolling");
+        assert!(top.join("\n").contains("line one"));
+        assert!(
+            !moved.join("\n").contains("line one"),
+            "scrolled past the first body line"
+        );
+    }
+
+    #[test]
+    fn plan_detail_final_document_line_is_reachable_at_the_loop_clamp() {
+        // The loop clamps body scroll to `total - rows` (mirroring the
+        // overlay pattern); the returned virtual height must account for
+        // the pinned hint row or the last line stays one step out of
+        // reach (codex 9452520).
+        let st = crate::cli::status_tui::input::PlanPageState {
+            finished: false,
+            multi_commit: true,
+            blocked: false,
+        };
+        let mut pp = page(st);
+        pp.body = Some("p1\n\np2\n\np3\n\np4\n\np5\n\nfinal-line\n".into());
+        let actions = plan_actions(st);
+        let rows = 24;
+        let (top, total) = render_plan_detail(&pp, &actions, 0, rows, 90);
+        assert!(
+            !top.join("\n").contains("final-line"),
+            "fixture long enough to need scrolling"
+        );
+        pp.scroll = total.saturating_sub(rows);
+        let (bottom, _) = render_plan_detail(&pp, &actions, 0, rows, 90);
+        assert!(
+            bottom.join("\n").contains("final-line"),
+            "the loop's max scroll reaches the document's last line: {bottom:?}"
+        );
+    }
+
+    #[test]
+    fn purge_choice_names_both_consequences_unclipped() {
+        // Narrow width: both explanations wrap and stay fully readable.
+        let (lines, _) = render_purge_choice("my-plan", 1, 24, 46);
         let text = lines.join("\n");
         assert!(text.contains("PURGE · MY-PLAN"));
         assert!(text.contains("artifacts only"));
         assert!(text.contains("drop EVERYTHING"));
-        assert!(text.contains("the code stays"));
-        assert!(text.contains("implementation commits vanish"));
+        assert!(text.contains("The implementation commits stay."), "{text}");
+        // The drop consequence wraps at this width — assert both halves
+        // so nothing was clipped.
+        assert!(
+            text.contains("delete the plan AND its") && text.contains("from the branch."),
+            "drop consequence fully present across wrapped lines: {text}"
+        );
+        assert!(!text.contains("next screen"));
     }
 
     #[test]
