@@ -1,9 +1,9 @@
 //! The view: pure rendering of a [`StatusSnapshot`] (+ interactive
 //! [`PanelView`] state) into ANSI lines. The who's-active bar, the
 //! greedy-fit gauge stack, the agents panel, and the scrollable log —
-//! plus the two full-screen modes (the add-picker and the per-agent
-//! detail page). Builds on the text primitives, the derived state, the
-//! scroll model, and the input mode; performs no IO.
+//! plus the full-screen modes (the add-picker, per-agent detail page,
+//! and confirmation pages). Builds on the text primitives, the derived
+//! state, the scroll model, and the input mode; performs no IO.
 
 use super::derive::*;
 use super::input::*;
@@ -104,8 +104,8 @@ pub(super) fn render_at(
     let cols = cols.max(1) as usize;
     let color = state_color(snap);
 
-    // The add picker and the per-agent detail page are DEDICATED full
-    // screens — they replace the normal bar/gauges/log layout while open.
+    // Picker/detail/confirm modes are DEDICATED full screens — they
+    // replace the normal bar/gauges/log layout while open.
     if let Mode::AddPicker { sel } = mode {
         return render_add_screen(picker, rows, cols, sel);
     }
@@ -117,8 +117,20 @@ pub(super) fn render_at(
         let actions = detail_actions(agent.role);
         return render_agent_detail(agent, &actions, sel, rows, cols);
     }
-    // The plan-actions page family (tui-plan-actions-page): page,
-    // purge chooser, and its confirms are dedicated full screens too.
+    if let Mode::Confirm { action } = mode {
+        match action {
+            ConfirmAction::AddCandidate { .. } | ConfirmAction::RemoveAgent { .. } => {
+                return render_roster_confirm(snap, picker, action, rows, cols);
+            }
+            ConfirmAction::StashPlan | ConfirmAction::PurgeArtifacts | ConfirmAction::PurgeDrop => {
+                if let Some(pp) = view.plan_page {
+                    return render_plan_confirm(&pp.stem, action, rows, cols);
+                }
+            }
+        }
+    }
+    // The plan-actions page family (tui-plan-actions-page): page and
+    // purge chooser are dedicated full screens too.
     // A missing `plan_page` (invariant breach) falls through to the
     // normal layout; the loop bails the mode out next key.
     if let Some(pp) = view.plan_page {
@@ -128,9 +140,6 @@ pub(super) fn render_at(
             }
             Mode::PurgeChoice { sel } => {
                 return render_purge_choice(&pp.stem, sel, rows, cols);
-            }
-            Mode::Confirm { action } if action.is_plan_page() => {
-                return render_plan_confirm(&pp.stem, action, rows, cols);
             }
             Mode::PlanInput { kind } => {
                 return render_plan_input(
@@ -325,50 +334,6 @@ pub(super) fn render_at(
             let add_selected = mode.selected() == Some(snap.agents.len());
             let spans = vec![plain("  + add agent".to_string())];
             out.push(row_line(&spans, add_selected, color, cols));
-        }
-        // Confirm modal — names the action, the local-config
-        // consequence, and which key is the (safe) default.
-        if let Mode::Confirm { action } = mode {
-            let (verb, who) = match action {
-                ConfirmAction::AddCandidate { idx } => (
-                    "add reviewer",
-                    picker.get(idx).map(|c| c.label.as_str()).unwrap_or("?"),
-                ),
-                ConfirmAction::RemoveAgent { idx } => (
-                    "remove reviewer",
-                    snap.agents
-                        .get(idx)
-                        .map(|a| a.label.as_str())
-                        .unwrap_or("?"),
-                ),
-                // Plan-page confirms render as their own full screen
-                // (render_at dispatches them before the panel path).
-                ConfirmAction::StashPlan
-                | ConfirmAction::PurgeArtifacts
-                | ConfirmAction::PurgeDrop => ("", ""),
-            };
-            let keys = if action.default_yes() {
-                "[Y]es  [n]o  (⏎ = yes)"
-            } else {
-                "[y]es  [N]o  (⏎ = no)"
-            };
-            if out.len() < rows {
-                out.push(emit(
-                    &[highlight(format!("confirm: {verb} “{who}”"))],
-                    color,
-                    cols,
-                ));
-            }
-            if out.len() < rows {
-                out.push(emit(
-                    &[
-                        dim("edits local .clank/config.json · ".to_string()),
-                        accent(keys.to_string()),
-                    ],
-                    color,
-                    cols,
-                ));
-            }
         }
     }
 
@@ -1351,6 +1316,71 @@ pub(super) fn render_purge_choice(
             "",
             cols,
         ));
+    }
+    out.truncate(rows);
+    (out, 0)
+}
+
+/// A roster confirm page: add/remove confirmations are clear full-screen
+/// pages, not inline prompts under the main agents panel. The TUI is
+/// confirming a local roster edit, so the config-file consequence is
+/// named directly.
+pub(super) fn render_roster_confirm(
+    snap: &StatusSnapshot,
+    picker: &[crate::cli::status::AvailableAgent],
+    action: ConfirmAction,
+    rows: usize,
+    cols: usize,
+) -> (Vec<String>, usize) {
+    let target = match action {
+        ConfirmAction::AddCandidate { idx } => picker
+            .get(idx)
+            .map(|c| format!("{} [{}]", c.label, c.tool))
+            .unwrap_or_else(|| "?".to_string()),
+        ConfirmAction::RemoveAgent { idx } => snap
+            .agents
+            .get(idx)
+            .map(|a| format!("{} [{}]", a.label, a.tool))
+            .unwrap_or_else(|| "?".to_string()),
+        ConfirmAction::StashPlan | ConfirmAction::PurgeArtifacts | ConfirmAction::PurgeDrop => {
+            unreachable!("plan confirmations render through render_plan_confirm")
+        }
+    };
+    let (title, consequence) = match action {
+        ConfirmAction::AddCandidate { .. } => (
+            format!("add reviewer `{target}`?"),
+            "adds this global-library agent to the local roster in .clank/config.json",
+        ),
+        ConfirmAction::RemoveAgent { .. } => (
+            format!("remove reviewer `{target}`?"),
+            "removes this agent from the local roster in .clank/config.json",
+        ),
+        ConfirmAction::StashPlan | ConfirmAction::PurgeArtifacts | ConfirmAction::PurgeDrop => {
+            unreachable!("plan confirmations render through render_plan_confirm")
+        }
+    };
+    let keys = if action.default_yes() {
+        "[Y]es  [n]o  (⏎ = yes)"
+    } else {
+        "[y]es  [N]o  (⏎ = no)"
+    };
+
+    let mut out: Vec<String> = Vec::new();
+    out.push(region_rule("confirm · agents", "", true, cols));
+    out.push(String::new());
+    out.push(emit(&[highlight(format!(" {title} "))], "", cols));
+    out.push(String::new());
+    for line in wrap(consequence, cols.saturating_sub(4).max(1)) {
+        if out.len() >= rows.saturating_sub(2) {
+            break;
+        }
+        out.push(emit(&[plain(format!("  {line}"))], "", cols));
+    }
+    if out.len() < rows {
+        out.push(String::new());
+    }
+    if out.len() < rows {
+        out.push(emit(&[accent(format!("  {keys}"))], "", cols));
     }
     out.truncate(rows);
     (out, 0)
@@ -2753,7 +2783,7 @@ mod tests {
     }
 
     #[test]
-    fn confirm_modal_names_action_consequence_and_default() {
+    fn roster_confirm_pages_name_action_consequence_and_default() {
         let s = two_agent_snap();
         // Remove: default No, Enter cancels.
         let rm = render_at(
@@ -2768,15 +2798,21 @@ mod tests {
         )
         .0
         .join("\n");
-        assert!(rm.contains("remove reviewer"), "names the action");
-        assert!(rm.contains("codex"), "names the target");
+        assert!(rm.contains("CONFIRM · AGENTS"), "full-screen title: {rm}");
+        assert!(rm.contains("remove reviewer"), "names the action: {rm}");
+        assert!(rm.contains("codex [claude]"), "names the target: {rm}");
         assert!(
-            rm.contains("local .clank/config.json"),
-            "names the consequence"
+            rm.contains(".clank/config.json"),
+            "names the consequence: {rm}"
         );
         assert!(
             rm.contains("[N]o") && rm.contains("⏎ = no"),
-            "remove default is No"
+            "remove default is No: {rm}"
+        );
+        assert!(!rm.contains("confirm:"), "old inline prompt removed: {rm}");
+        assert!(
+            !rm.contains("+ add agent"),
+            "confirm page replaces the normal agents panel: {rm}"
         );
 
         // Add: default Yes.
@@ -2799,10 +2835,22 @@ mod tests {
         )
         .0
         .join("\n");
-        assert!(add.contains("add reviewer") && add.contains("ruthless"));
+        assert!(add.contains("CONFIRM · AGENTS"), "full-screen title: {add}");
+        assert!(
+            add.contains("add reviewer") && add.contains("ruthless [claude]"),
+            "names the add target: {add}"
+        );
         assert!(
             add.contains("[Y]es") && add.contains("⏎ = yes"),
-            "add default is Yes"
+            "add default is Yes: {add}"
+        );
+        assert!(
+            !add.contains("confirm:"),
+            "old inline prompt removed: {add}"
+        );
+        assert!(
+            !add.contains("+ add agent"),
+            "confirm page replaces the normal agents panel: {add}"
         );
     }
 

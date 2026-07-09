@@ -526,6 +526,85 @@ fn apply_detail_action(
     }
 }
 
+fn roster_confirm_after_decision(
+    action: ConfirmAction,
+    roster_write_succeeded: bool,
+    picker_len: usize,
+    agents_len: usize,
+) -> (Mode, bool) {
+    if roster_write_succeeded {
+        return (Mode::AgentPanel { sel: agents_len }, true);
+    }
+    match action {
+        ConfirmAction::AddCandidate { idx } if idx < picker_len => {
+            (Mode::AddPicker { sel: idx }, false)
+        }
+        ConfirmAction::RemoveAgent { idx } if idx < agents_len => {
+            (Mode::AgentDetail { idx, sel: 0 }, false)
+        }
+        _ => (Mode::AgentPanel { sel: agents_len }, true),
+    }
+}
+
+fn rebind_picker_sel_by_label(
+    old_sel: usize,
+    label: Option<&str>,
+    picker: &[crate::cli::status::AvailableAgent],
+) -> Option<usize> {
+    if let Some(label) = label {
+        return picker.iter().position(|c| c.label.as_str() == label);
+    }
+    if picker.is_empty() {
+        None
+    } else {
+        Some(old_sel.min(picker.len() - 1))
+    }
+}
+
+fn rebind_add_picker_after_refresh(
+    old_sel: usize,
+    label: Option<&str>,
+    picker: &[crate::cli::status::AvailableAgent],
+    agents_len: usize,
+) -> Mode {
+    match rebind_picker_sel_by_label(old_sel, label, picker) {
+        Some(sel) => Mode::AddPicker { sel },
+        None => Mode::AgentPanel { sel: agents_len },
+    }
+}
+
+fn rebind_add_confirm_after_refresh(
+    old_idx: usize,
+    label: Option<&str>,
+    picker: &[crate::cli::status::AvailableAgent],
+    agents_len: usize,
+) -> Mode {
+    let rebound = if let Some(label) = label {
+        picker.iter().position(|c| c.label.as_str() == label)
+    } else {
+        (old_idx < picker.len()).then_some(old_idx)
+    };
+    match rebound {
+        Some(idx) => Mode::Confirm {
+            action: ConfirmAction::AddCandidate { idx },
+        },
+        None => Mode::AgentPanel { sel: agents_len },
+    }
+}
+
+fn rebind_remove_confirm_after_refresh(
+    label: Option<&str>,
+    agents: &[crate::cli::status::AgentAutoRow],
+    agents_len: usize,
+) -> Mode {
+    match label.and_then(|l| relocate_detail(l, agents)) {
+        Some(idx) => Mode::Confirm {
+            action: ConfirmAction::RemoveAgent { idx },
+        },
+        None => Mode::AgentPanel { sel: agents_len },
+    }
+}
+
 // `strip_leading_emoji` lives in `text` (it's a name/width helper); the
 // `--tui` loop's doc moved down onto `run_tui` where it belongs.
 
@@ -1501,28 +1580,37 @@ pub(crate) async fn run_tui(
                                     mode = Mode::PlanDetail { sel: 0 };
                                     continue;
                                 }
-                                if go
-                                    && let Err(e) = apply_confirm(
+                                let mut roster_write_succeeded = false;
+                                if go {
+                                    match apply_confirm(
                                         action,
                                         &repo,
                                         home.as_deref(),
                                         &snapshot,
                                         &picker,
-                                    )
-                                {
-                                    detail = Some(Overlay::error(
-                                        "roster change failed".to_string(),
-                                        format!("{e:?}"),
-                                    ));
+                                    ) {
+                                        Ok(()) => roster_write_succeeded = true,
+                                        Err(e) => {
+                                            detail = Some(Overlay::error(
+                                                "roster change failed".to_string(),
+                                                format!("{e:?}"),
+                                            ));
+                                        }
+                                    }
                                 }
-                                picker.clear();
-                                // Back to the panel (on the +add row); the
-                                // config write (if any) triggers a Refresh that
-                                // rebuilds the roster, and its clamp re-bounds
-                                // this cursor if the roster shrank.
-                                mode = Mode::AgentPanel {
-                                    sel: snapshot.agents.len(),
-                                };
+                                let (next_mode, clear_picker) = roster_confirm_after_decision(
+                                    action,
+                                    roster_write_succeeded,
+                                    picker.len(),
+                                    snapshot.agents.len(),
+                                );
+                                if roster_write_succeeded {
+                                    refresh_pending = true;
+                                }
+                                if clear_picker {
+                                    picker.clear();
+                                }
+                                mode = next_mode;
                             }
                         }
                         // Unreachable by construction: PlanInput parses
@@ -1746,17 +1834,32 @@ pub(crate) async fn run_tui(
             // repaint. The probe is far cheaper than the work it guards.
             let sig = crate::cli::status::input_signature(&repo).ok();
             if sig != last_sig {
-                // Capture the detail page's target by LABEL from the OLD
-                // roster before rebuilding — an external promote / tier
-                // change can REORDER rows (master, then commit, then gate),
-                // so a kept index could silently retarget a different agent.
-                // We re-locate the same label below.
+                // Capture index-addressed targets by LABEL from the OLD
+                // state before rebuilding — external roster/library edits
+                // can reorder rows, so kept indices could silently retarget
+                // different agents/candidates. We re-locate the same labels
+                // below.
                 let detail_label = match mode {
-                    Mode::AgentDetail { idx, .. } => {
-                        snapshot.agents.get(idx).map(|a| a.label.clone())
-                    }
+                    Mode::AgentDetail { idx, .. }
+                    | Mode::Confirm {
+                        action: ConfirmAction::RemoveAgent { idx },
+                    } => snapshot.agents.get(idx).map(|a| a.label.clone()),
                     _ => None,
                 };
+                let picker_label = match mode {
+                    Mode::AddPicker { sel }
+                    | Mode::Confirm {
+                        action: ConfirmAction::AddCandidate { idx: sel },
+                    } => picker.get(sel).map(|c| c.label.clone()),
+                    _ => None,
+                };
+                let keep_picker = matches!(
+                    mode,
+                    Mode::AddPicker { .. }
+                        | Mode::Confirm {
+                            action: ConfirmAction::AddCandidate { .. }
+                        }
+                );
                 // Same identity rule for a panel cursor on a QUEUE row: a
                 // reprioritise renames the queue file, so THIS refresh is
                 // often self-inflicted and re-sorts the list — capture the
@@ -1793,27 +1896,25 @@ pub(crate) async fn run_tui(
                 last_sig = sig;
                 log.complete = false;
                 log.request_fill();
-                // The data changed under us, so any in-flight picker/
-                // confirm (which reference now-possibly-stale indices)
-                // is cancelled back to the panel, and the panel cursor
-                // is re-bounded to the new row count (agents + the +add
-                // row). An empty roster drops focus to the log.
-                picker.clear();
+                if keep_picker {
+                    picker =
+                        crate::cli::status::available_agents(home.as_deref(), &snapshot.agents);
+                } else {
+                    picker.clear();
+                }
                 mode = match mode {
                     Mode::LogScroll => Mode::LogScroll,
                     // The plan page doesn't depend on the roster — it
                     // must survive an empty-roster refresh (its arms are
                     // below); everything agent-shaped drops to the log.
-                    Mode::AgentPanel { .. } | Mode::AgentDetail { .. } | Mode::AddPicker { .. }
+                    Mode::AgentPanel { .. } | Mode::AgentDetail { .. }
                         if snapshot.agents.is_empty() =>
                     {
                         Mode::LogScroll
                     }
-                    Mode::Confirm { action }
-                        if snapshot.agents.is_empty() && !action.is_plan_page() =>
-                    {
-                        Mode::LogScroll
-                    }
+                    Mode::Confirm {
+                        action: ConfirmAction::RemoveAgent { .. },
+                    } if snapshot.agents.is_empty() => Mode::LogScroll,
                     Mode::AgentPanel { sel } => Mode::AgentPanel {
                         sel: rebind_panel_sel(
                             sel,
@@ -1840,6 +1941,34 @@ pub(crate) async fn run_tui(
                             },
                         }
                     }
+                    // The add picker and add confirm track ONE global-library
+                    // candidate by identity: if the selected candidate is
+                    // still available after a config refresh, keep the page;
+                    // otherwise close to the panel.
+                    Mode::AddPicker { sel } => rebind_add_picker_after_refresh(
+                        sel,
+                        picker_label.as_deref(),
+                        &picker,
+                        snapshot.agents.len(),
+                    ),
+                    Mode::Confirm {
+                        action: ConfirmAction::AddCandidate { idx },
+                    } => rebind_add_confirm_after_refresh(
+                        idx,
+                        picker_label.as_deref(),
+                        &picker,
+                        snapshot.agents.len(),
+                    ),
+                    // Remove confirms also track the agent by identity, so a
+                    // tier change/reorder cannot make "yes" remove the wrong
+                    // row. If the target vanished, close to the panel.
+                    Mode::Confirm {
+                        action: ConfirmAction::RemoveAgent { .. },
+                    } => rebind_remove_confirm_after_refresh(
+                        detail_label.as_deref(),
+                        &snapshot.agents,
+                        snapshot.agents.len(),
+                    ),
                     // The plan page tracks its plan by STEM: recompute
                     // the facts against the fresh snapshot (block state /
                     // finished-ness can flip under us); a vanished plan
@@ -1877,8 +2006,7 @@ pub(crate) async fn run_tui(
                             false => Mode::LogScroll,
                         }
                     }
-                    // Cancel a picker/confirm onto the +add row.
-                    Mode::AddPicker { .. } | Mode::Confirm { .. } => Mode::AgentPanel {
+                    Mode::Confirm { .. } => Mode::AgentPanel {
                         sel: snapshot.agents.len(),
                     },
                 };
@@ -2011,6 +2139,70 @@ pub(crate) mod tests {
         assert!(many.refresh);
         assert!(many.input.is_empty());
         assert!(!many.resize);
+    }
+
+    #[test]
+    fn roster_confirm_decision_returns_to_origin_pages() {
+        assert_eq!(
+            roster_confirm_after_decision(ConfirmAction::AddCandidate { idx: 1 }, false, 3, 2),
+            (Mode::AddPicker { sel: 1 }, false),
+            "cancel/failed add returns to the selected picker candidate"
+        );
+        assert_eq!(
+            roster_confirm_after_decision(ConfirmAction::RemoveAgent { idx: 1 }, false, 0, 2),
+            (Mode::AgentDetail { idx: 1, sel: 0 }, false),
+            "cancel/failed remove returns to the target detail page"
+        );
+        assert_eq!(
+            roster_confirm_after_decision(ConfirmAction::AddCandidate { idx: 4 }, false, 2, 2),
+            (Mode::AgentPanel { sel: 2 }, true),
+            "an invalid add target falls back to the panel and drops picker state"
+        );
+        assert_eq!(
+            roster_confirm_after_decision(ConfirmAction::RemoveAgent { idx: 1 }, true, 0, 2),
+            (Mode::AgentPanel { sel: 2 }, true),
+            "successful roster writes refresh from the panel"
+        );
+    }
+
+    #[test]
+    fn roster_confirm_refresh_rebinds_by_identity() {
+        use crate::cli::teams_config::RosterRole;
+        use clank_core::vocab::AutoMode;
+
+        let picker = vec![
+            cand("scout", "codex", "codex"),
+            cand("grok", "grok", "grok"),
+        ];
+        assert_eq!(
+            rebind_add_confirm_after_refresh(0, Some("grok"), &picker, 2),
+            Mode::Confirm {
+                action: ConfirmAction::AddCandidate { idx: 1 }
+            },
+            "add confirm follows the same candidate after the picker reorders"
+        );
+        assert_eq!(
+            rebind_add_confirm_after_refresh(0, Some("missing"), &picker, 2),
+            Mode::AgentPanel { sel: 2 },
+            "add confirm closes instead of retargeting when the candidate vanished"
+        );
+
+        let agents = vec![
+            agent_row("codex", RosterRole::Commit, AutoMode::Off),
+            agent_row("claude", RosterRole::Master, AutoMode::On),
+        ];
+        assert_eq!(
+            rebind_remove_confirm_after_refresh(Some("codex"), &agents, agents.len()),
+            Mode::Confirm {
+                action: ConfirmAction::RemoveAgent { idx: 0 }
+            },
+            "remove confirm follows the same agent after roster reorder"
+        );
+        assert_eq!(
+            rebind_remove_confirm_after_refresh(Some("missing"), &agents, agents.len()),
+            Mode::AgentPanel { sel: agents.len() },
+            "remove confirm closes when the target vanished"
+        );
     }
 
     #[test]

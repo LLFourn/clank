@@ -614,8 +614,9 @@ impl ConfirmAction {
     pub(super) fn default_yes(self) -> bool {
         matches!(self, ConfirmAction::AddCandidate { .. })
     }
-    /// Confirms that came FROM the plan page return TO it on decline /
-    /// completion-with-error; roster confirms return to the panel.
+    /// True for confirms that came FROM the plan page. Rendering is
+    /// page-shaped for every confirm; this is only for navigation and
+    /// execution routing.
     pub(super) fn is_plan_page(self) -> bool {
         matches!(
             self,
