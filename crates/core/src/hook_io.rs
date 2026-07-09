@@ -82,19 +82,171 @@ pub struct BackgroundTask {
 
 impl BackgroundTask {
     /// True if this task is the agent's own `clank wait` long-poll.
-    /// Best-effort: the program word's basename is `clank` and the first
-    /// arg is `wait`. Claude reports the raw command the agent launched, so
-    /// wrappers (`bash -lc '…'`, env prefixes) aren't unpicked — they're not
-    /// how agents start it.
+    /// Best-effort: one shell command segment's program basename is `clank`
+    /// and its first arg is `wait`. Common shell wrappers and prefixes are
+    /// unpicked without executing the command or attempting a full shell
+    /// parse.
     pub fn is_clank_wait(&self) -> bool {
         let Some(cmd) = self.command.as_deref() else {
             return false;
         };
-        let mut words = cmd.split_whitespace();
-        let prog = words
-            .next()
-            .map(|w| w.rsplit(['/', '\\']).next().unwrap_or(w));
-        prog == Some("clank") && words.next() == Some("wait")
+        command_contains_clank_wait(cmd, 0)
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ShellToken {
+    Word(String),
+    Boundary,
+}
+
+fn command_contains_clank_wait(command: &str, depth: usize) -> bool {
+    const MAX_WRAPPER_DEPTH: usize = 8;
+    if depth > MAX_WRAPPER_DEPTH {
+        return false;
+    }
+
+    let tokens = shell_tokens(command);
+    tokens
+        .split(|token| matches!(token, ShellToken::Boundary))
+        .any(|segment| {
+            let words: Vec<&str> = segment
+                .iter()
+                .filter_map(|token| match token {
+                    ShellToken::Word(word) => Some(word.as_str()),
+                    ShellToken::Boundary => None,
+                })
+                .collect();
+            segment_contains_clank_wait(&words, depth)
+        })
+}
+
+fn segment_contains_clank_wait(words: &[&str], depth: usize) -> bool {
+    let mut command = 0;
+    loop {
+        while words.get(command).is_some_and(|word| is_assignment(word)) {
+            command += 1;
+        }
+
+        match words.get(command).map(|word| program_basename(word)) {
+            Some("env") => {
+                command += 1;
+                if words.get(command) == Some(&"--") {
+                    command += 1;
+                }
+            }
+            Some("exec" | "command") => {
+                command += 1;
+                if words.get(command) == Some(&"--") {
+                    command += 1;
+                }
+            }
+            _ => break,
+        }
+    }
+
+    let Some(program) = words.get(command).map(|word| program_basename(word)) else {
+        return false;
+    };
+    if program == "clank" && words.get(command + 1) == Some(&"wait") {
+        return true;
+    }
+
+    program.ends_with("sh")
+        && words.get(command + 1) == Some(&"-lc")
+        && words
+            .get(command + 2)
+            .is_some_and(|script| command_contains_clank_wait(script, depth + 1))
+}
+
+fn program_basename(word: &str) -> &str {
+    word.rsplit(['/', '\\']).next().unwrap_or(word)
+}
+
+fn is_assignment(word: &str) -> bool {
+    let Some((name, _)) = word.split_once('=') else {
+        return false;
+    };
+    let mut chars = name.chars();
+    matches!(chars.next(), Some('_' | 'a'..='z' | 'A'..='Z'))
+        && chars.all(|ch| matches!(ch, '_' | 'a'..='z' | 'A'..='Z' | '0'..='9'))
+}
+
+fn shell_tokens(command: &str) -> Vec<ShellToken> {
+    let mut tokens = Vec::new();
+    let mut word = String::new();
+    let mut word_started = false;
+    let mut chars = command.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\'' => {
+                word_started = true;
+                for quoted in chars.by_ref() {
+                    if quoted == '\'' {
+                        break;
+                    }
+                    word.push(quoted);
+                }
+            }
+            '"' => {
+                word_started = true;
+                while let Some(quoted) = chars.next() {
+                    match quoted {
+                        '"' => break,
+                        '\\' => {
+                            if let Some(escaped) = chars.next() {
+                                word.push(escaped);
+                            }
+                        }
+                        _ => word.push(quoted),
+                    }
+                }
+            }
+            '\\' => {
+                word_started = true;
+                if let Some(escaped) = chars.next() {
+                    word.push(escaped);
+                }
+            }
+            '#' if !word_started => {
+                for comment in chars.by_ref() {
+                    if comment == '\n' {
+                        push_boundary(&mut tokens, &mut word, &mut word_started);
+                        break;
+                    }
+                }
+            }
+            '\n' => push_boundary(&mut tokens, &mut word, &mut word_started),
+            ch if ch.is_whitespace() => push_word(&mut tokens, &mut word, &mut word_started),
+            ';' | '(' | ')' => push_boundary(&mut tokens, &mut word, &mut word_started),
+            '&' | '|' => {
+                push_boundary(&mut tokens, &mut word, &mut word_started);
+                if chars.peek() == Some(&ch) {
+                    chars.next();
+                }
+            }
+            _ => {
+                word_started = true;
+                word.push(ch);
+            }
+        }
+    }
+    push_word(&mut tokens, &mut word, &mut word_started);
+    tokens
+}
+
+fn push_word(tokens: &mut Vec<ShellToken>, word: &mut String, word_started: &mut bool) {
+    if *word_started {
+        tokens.push(ShellToken::Word(std::mem::take(word)));
+        *word_started = false;
+    }
+}
+
+fn push_boundary(tokens: &mut Vec<ShellToken>, word: &mut String, word_started: &mut bool) {
+    push_word(tokens, word, word_started);
+    if !matches!(tokens.last(), Some(ShellToken::Boundary)) {
+        tokens.push(ShellToken::Boundary);
     }
 }
 
@@ -359,6 +511,18 @@ mod tests {
             "clank wait --repo /x --author claude",
             "/Users/x/.cargo/bin/clank wait",
             "./clank wait",
+            "cd /repo; clank wait",
+            "cd '/repo with spaces' && clank wait --author claude",
+            "false || /Users/x/.cargo/bin/clank wait",
+            "cd /repo\nclank wait",
+            "bash -lc 'cd /repo; clank wait'",
+            "sh -lc 'cd /repo && clank wait'",
+            "zsh -lc 'cd /repo; clank wait --author claude'",
+            "CLANK_DIR=/repo clank wait",
+            "env CLANK_DIR=/repo clank wait",
+            "exec clank wait",
+            "command clank wait",
+            "(clank wait)",
         ] {
             assert!(task(cmd).is_clank_wait(), "should match: {cmd}");
         }
@@ -369,6 +533,16 @@ mod tests {
             "sleep 12",
             "git wait",
             "clank",
+            "echo clank wait",
+            "echo 'clank wait'",
+            "grep \"clank wait\" file",
+            "printf 'cd /repo; clank wait'",
+            "# clank wait",
+            "echo done # clank wait",
+            "command -v clank wait",
+            "env CLANK_DIR=/repo echo clank wait",
+            "bash -lc 'echo clank wait'",
+            "zsh -lc 'grep \"clank wait\" file'",
         ] {
             assert!(!task(cmd).is_clank_wait(), "should NOT match: {cmd}");
         }
@@ -389,6 +563,13 @@ mod tests {
         // A backgrounded `clank wait` (with or without other work) → yield.
         assert_eq!(
             background_disposition(Claude, &input_with(vec![task("clank wait")], false)),
+            BgDisposition::YieldArmed
+        );
+        assert_eq!(
+            background_disposition(
+                Claude,
+                &input_with(vec![task("cd /repo; clank wait")], false)
+            ),
             BgDisposition::YieldArmed
         );
         assert_eq!(

@@ -609,7 +609,7 @@ mod tests {
             "cwd": "/tmp",
             "stop_hook_active": false,
             "background_tasks": [
-                {"id": "t1", "status": "running", "command": "clank wait --author codex"}
+                {"id": "t1", "status": "running", "command": "cd /tmp; clank wait --author codex"}
             ],
         }))
         .unwrap();
@@ -648,7 +648,7 @@ mod tests {
             "background_tasks": [
                 {"id": "t1", "status": "running", "command": monster},
                 {"id": "t2", "status": "running", "command": monster},
-                {"id": "t3", "status": "running", "command": "clank wait --author codex"},
+                {"id": "t3", "status": "running", "command": "cd /tmp && clank wait --author codex"},
             ],
         }))
         .unwrap();
