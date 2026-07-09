@@ -5,8 +5,8 @@
 //! - write `.claude/settings.local.json` with claude
 //!   edit-permission rules for `.clank/agents/**`,
 //! - install the `post-rewrite` git hook,
-//! - warn if the root gitignore swallows any `.clank/` path the
-//!   plan needs tracked,
+//! - warn if an ancestor ignore rule swallows any tracked `.clank/`
+//!   plan artifact path,
 //! - write a self-contained repo config: bare init writes an
 //!   empty new-shape config; `--team <name>` copies a user-scope
 //!   team's composition + referenced agents into it.
@@ -202,13 +202,9 @@ fn write_scaffold(repo: &Path) -> anyhow::Result<()> {
     std::fs::create_dir_all(&plans_dir)?;
 
     let gitignore = clank_dir.join(".gitignore");
-    // SET-membership model (ruthless 02da305): three commands
-    // mutate this file (init, fork's /worktrees/ ensure, open
-    // zellij's /zellij/ ensure), so validation is "every managed
-    // entry present, nothing foreign" — order-irrelevant — and
-    // repair APPENDS the missing entries rather than rewriting,
-    // so an incrementally-appended file can never wedge a later
-    // init.
+    // Exact allow-list model: `/*` catches every local-only `.clank/`
+    // path, and only the explicit `!` entries below are tracked.
+    // Order matters, so a canonical file must match byte-for-byte.
     match std::fs::read_to_string(&gitignore) {
         Ok(existing) => match classify_gitignore_body(&existing) {
             crate::init_facts::GitignoreState::Canonical => {
@@ -239,23 +235,22 @@ fn write_scaffold(repo: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Tracked `.clank/` paths probed for ancestor-ignore warnings.
+const TRACKED_PROBES: &[&str] = &[".clank/plans", ".clank/finished"];
+
 /// Warn (but don't fail) if some ancestor `.gitignore` or
 /// `core.excludesFile` excludes paths that need to be tracked.
 ///
-/// Probes every `.clank/` subpath the plan requires committed
-/// (`plans/`, `finished/`, `config.json`, `agents/`) and parses
+/// Probes only tracked plan-artifact paths. Local-only state such as
+/// `.clank/config.json` and `.clank/agents/**` is intentionally omitted:
+/// an ancestor ignore rule for those paths is fine and must not warn as
+/// if a tracked file were hidden. Parses
 /// `git check-ignore -v`'s structured output:
 ///   `<source_file>:<line>:<pattern>\t<probed_path>`
 /// We suppress only when `<source_file>` is the `.clank/.gitignore`
 /// we just wrote. Substring matching on the whole record would be
 /// fooled by paths or patterns that happen to contain that literal.
 fn warn_if_globally_excluded(repo: &Path) {
-    const TRACKED_PROBES: &[&str] = &[
-        ".clank/plans",
-        ".clank/finished",
-        ".clank/config.json",
-        ".clank/agents",
-    ];
     for rel in TRACKED_PROBES {
         check_one(repo, rel);
     }
@@ -536,10 +531,16 @@ mod tests {
         let body = std::fs::read_to_string(dir.path().join(".clank/.gitignore")).unwrap();
         assert_eq!(body, clank_gitignore_body());
         // The allow-list: ignore everything except plans/finished + self.
-        assert!(body.contains("/*"));
-        assert!(body.contains("!/plans/"));
-        assert!(body.contains("!/finished/"));
-        assert!(body.contains("!/.gitignore"));
+        let entries: Vec<&str> = body.lines().collect();
+        assert_eq!(
+            entries,
+            crate::init_facts::CLANK_GITIGNORE_ENTRIES,
+            "managed allow-list entries are the complete tracked surface"
+        );
+        assert!(
+            !entries.iter().any(|e| e.contains("config.json")),
+            ".clank/config.json is local-only, not an allow-list carve-out"
+        );
     }
 
     #[test]
@@ -676,26 +677,22 @@ mod tests {
         assert_eq!(writes, 1, "duplicate entry on re-run");
     }
 
-    /// `check-ignore` matrix per D10: with the recommended root
-    /// gitignore + the managed `.clank/.gitignore`, which paths
-    /// are tracked vs ignored.
-    ///
-    /// Check-ignore matrix for the simplified tracking model:
-    /// only `plans/` and `finished/` need to be tracked;
-    /// everything else under `.clank/` is per-user / local
-    /// (agents/, feedback/, cache/, config.json — none of these
-    /// exist anymore as repo-shared state).
+    #[test]
+    fn tracked_probes_are_only_tracked_plan_artifacts() {
+        assert_eq!(
+            TRACKED_PROBES,
+            &[".clank/plans", ".clank/finished"],
+            "ancestor-ignore warnings must not probe local-only .clank state"
+        );
+    }
+
+    /// Check-ignore matrix for the managed `.clank/.gitignore` allow-list:
+    /// only `plans/`, `finished/`, and the managed ignore file itself are
+    /// tracked. Everything else under `.clank/` is per-user / local.
     #[test]
     fn check_ignore_matrix_simplified() {
         let dir = init_repo();
-        std::fs::write(
-            dir.path().join(".gitignore"),
-            "/target/\n\
-             .clank/*\n\
-             !.clank/plans/\n\
-             !.clank/finished/\n",
-        )
-        .unwrap();
+        std::fs::write(dir.path().join(".gitignore"), "/target/\n").unwrap();
         write_scaffold(dir.path()).unwrap();
 
         let probe = |rel: &str| -> bool {
@@ -712,10 +709,16 @@ mod tests {
         // Tracked.
         assert!(!probe(".clank/plans/foo.md"));
         assert!(!probe(".clank/finished/foo/seal.md"));
+        assert!(!probe(".clank/.gitignore"));
         // Per-user / local.
+        assert!(probe(".clank/config.json"));
         assert!(probe(".clank/agents/alice/config.json"));
         assert!(probe(".clank/agents/alice/feedback/foo/abc.md"));
         assert!(probe(".clank/cache/anything"));
+        assert!(probe(".clank/drafts/foo.md"));
+        assert!(probe(".clank/queue/500-foo.md"));
+        assert!(probe(".clank/html/foo.html"));
+        assert!(probe(".clank/worktrees/foo/.clank/config.json"));
     }
 
     #[test]

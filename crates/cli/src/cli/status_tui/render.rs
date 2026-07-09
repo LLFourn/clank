@@ -326,7 +326,7 @@ pub(super) fn render_at(
             let spans = vec![plain("  + add agent".to_string())];
             out.push(row_line(&spans, add_selected, color, cols));
         }
-        // Confirm modal — names the action, the committed-config
+        // Confirm modal — names the action, the local-config
         // consequence, and which key is the (safe) default.
         if let Mode::Confirm { action } = mode {
             let (verb, who) = match action {
@@ -362,7 +362,7 @@ pub(super) fn render_at(
             if out.len() < rows {
                 out.push(emit(
                     &[
-                        dim("edits the committed team config · ".to_string()),
+                        dim("edits local .clank/config.json · ".to_string()),
                         accent(keys.to_string()),
                     ],
                     color,
@@ -2771,7 +2771,7 @@ mod tests {
         assert!(rm.contains("remove reviewer"), "names the action");
         assert!(rm.contains("codex"), "names the target");
         assert!(
-            rm.contains("committed team config"),
+            rm.contains("local .clank/config.json"),
             "names the consequence"
         );
         assert!(

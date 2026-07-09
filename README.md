@@ -40,8 +40,8 @@ Two roles:
   or requests changes) on each commit master makes.
 
 Both roles are just regular agent sessions running `clank`. The role of
-the calling agent is inferred from `.clank/config.json` (which names the
-master) plus the agent's label.
+the calling agent is inferred from the local `.clank/config.json` roster
+plus the agent's label.
 
 ### Per repo: initialize
 
@@ -51,10 +51,11 @@ In a fresh repo:
 clank init
 ```
 
-That writes `.clank/.gitignore`, sets up claude's per-repo edit
-permissions for `.clank/agents/**` (so the agent doesn't prompt every
-time it writes feedback), and — if you're running inside an agent —
-prompts you to bind this agent's label and optionally claim master.
+That writes `.clank/.gitignore`, creates a local `.clank/config.json`
+roster when needed, and sets up claude's per-repo edit permissions for
+`.clank/agents/**` so the agent doesn't prompt every time it writes
+local state. It does not bind a session or choose a master; do that with
+`clank as`, `clank agent add`, and `clank agent promote`.
 
 ### Per session: bind your agent
 
@@ -175,17 +176,18 @@ which is independent per-agent state. (It still accepts a legacy
 <repo>/.clank/
 ├── plans/                          # active plans (one .md per plan) — TRACKED
 ├── finished/                       # finalized plans — TRACKED
+├── config.json                     # local roster + repo config
 ├── agents/<label>/
-│   ├── config.json                 # auto-mode + role + session binding
+│   ├── config.json                 # auto-mode + session binding
 │   └── feedback/<plan>/<sha>.md    # this agent's review notes
 ├── cache/                          # local fold cache
-└── .gitignore                      # blanket-ignores everything except plans/ and finished/
+└── .gitignore                      # allow-lists plans/, finished/, and itself
 ```
 
-Only `plans/` and `finished/` are committed. Everything else under
-`.clank/` is per-user state — agents on the same machine share it via
-the filesystem; multi-machine collaboration just shares the plans + the
-finalized seal.
+Only `plans/`, `finished/`, and the managed `.clank/.gitignore` are
+committed. Everything else under `.clank/` is per-user state — agents on
+the same machine share it via the filesystem; multi-machine
+collaboration just shares the plans and finalized plan records.
 
 ```
 ~/.claude/

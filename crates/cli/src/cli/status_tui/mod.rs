@@ -84,9 +84,8 @@ enum Ev {
 /// (parity with `clank agent add`). A failed core leaves the roster
 /// unchanged and the error is RETURNED for the error overlay — silent
 /// `let _ =` swallowing was a bug this plan fixes in passing (codex
-/// e4bccc5). The mutated `.clank/config.json` is tracked, so this
-/// dirties the tree — the deliberate, committed-config change the
-/// confirm modal warned about.
+/// e4bccc5). The mutated `.clank/config.json` is local-only repo
+/// state; the confirm modal names that local write explicitly.
 fn apply_confirm(
     action: ConfirmAction,
     repo: &std::path::Path,
@@ -2145,11 +2144,12 @@ pub(crate) mod tests {
             None,
             &s,
             &[],
-        );
+        )
+        .unwrap();
         let cfg = std::fs::read_to_string(repo.path().join(".clank/config.json")).unwrap();
         assert!(
             !cfg.contains("codex"),
-            "reviewer removed from the committed roster via the core: {cfg}"
+            "reviewer removed from the local roster via the core: {cfg}"
         );
         assert!(cfg.contains("claude"), "master untouched");
     }
@@ -2179,11 +2179,12 @@ pub(crate) mod tests {
             Some(home.path()),
             &s,
             &picker,
-        );
+        )
+        .unwrap();
         let cfg = std::fs::read_to_string(repo.path().join(".clank/config.json")).unwrap();
         assert!(
             cfg.contains("ruthless"),
-            "candidate added to the committed roster via the core: {cfg}"
+            "candidate added to the local roster via the core: {cfg}"
         );
     }
 

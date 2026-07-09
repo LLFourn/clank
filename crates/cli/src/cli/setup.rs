@@ -882,6 +882,29 @@ mod tests {
     }
 
     #[test]
+    fn role_skills_mark_repo_config_local_and_gitignored() {
+        // clank-config-local-only: generated skills must not teach agents
+        // that `.clank/config.json` is a shared/tracked project artifact.
+        for role in [Role::Master, Role::Reviewer] {
+            for tool in [Tool::Claude, Tool::Codex, Tool::Grok] {
+                let body = compose_skill(role, tool);
+                assert!(
+                    body.contains("`config.json` — local, gitignored repo config"),
+                    "{role:?}/{tool:?} skill must mark config.json local-only"
+                );
+                assert!(
+                    body.contains("repo ROSTER"),
+                    "{role:?}/{tool:?} skill must still name the roster semantics"
+                );
+                assert!(
+                    !body.contains("`config.json` — the repo ROSTER"),
+                    "{role:?}/{tool:?} skill must not carry the legacy tracked-artifact wording"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn role_guard_descriptions_are_unambiguous_both_ways() {
         let m = compose_skill(Role::Master, Tool::Claude);
         assert!(m.contains("name: clank-master"));
