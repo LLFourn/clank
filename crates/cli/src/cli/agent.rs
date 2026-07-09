@@ -263,6 +263,17 @@ fn start(args: AgentStartArgs) -> anyhow::Result<()> {
     exec_composed(composed)
 }
 
+/// Grok's folder-trust prompt is bypassed per-launch: `--trust` ("trust
+/// this folder and persist the decision", hidden from --help but real
+/// in 0.2.93) persists the cwd into grok's own trust store — no config
+/// surgery, and the composed argv shows it honestly in `--print`
+/// (grok-first-class). No-op for other tools.
+fn push_grok_trust(tool: Tool, args: &mut Vec<String>) {
+    if tool == Tool::Grok {
+        args.push("--trust".into());
+    }
+}
+
 /// The pre-exec trust step: codex launches record the MAIN repo root
 /// (codex's prompt applies trust to the repository root, so it covers
 /// every worktree under it) as trusted; claude has no such prompt and
@@ -363,6 +374,7 @@ fn compose_bootstrap_launch(
         .as_ref()
         .map(|l| l.args.clone())
         .unwrap_or_default();
+    push_grok_trust(desc.tool, &mut args);
     args.push(bootstrap_bind_prompt(label));
 
     let env_overrides = desc
@@ -415,11 +427,20 @@ fn compose_fork_launch(
             args.push(worktree.display().to_string());
             args.push(sid.clone());
         }
+        // Grok forks like claude: resume the source session and branch
+        // it under a fresh id grok generates (grok-first-class). The
+        // new id binds later via `clank as` (newest-session-for-cwd).
+        (Some(sid), Tool::Grok) => {
+            args.push("--resume".into());
+            args.push(sid.clone());
+            args.push("--fork-session".into());
+        }
         // No source session to fork (fork-robustness): launch a FRESH
         // session — same shape as the bootstrap launch, but carrying
         // the fork's orientation prompt instead of the bare bind hint.
         (None, _) => {}
     }
+    push_grok_trust(spec.tool, &mut args);
     args.push(spec.prompt.clone());
     let env_overrides = desc
         .launch
@@ -508,6 +529,7 @@ fn compose_launch(
 
     let mut args = launch_args;
     args.extend(session_restore);
+    push_grok_trust(tool, &mut args);
     if let Some(prompt) = initial_prompt {
         args.push(prompt.to_string());
     }
@@ -535,6 +557,14 @@ fn session_restore_args(tool: Tool, session_id: &str, repo: &Path) -> Vec<String
             "resume".into(),
             session_id.into(),
             "--cd".into(),
+            repo.to_string_lossy().into_owned(),
+        ],
+        // Grok resumes by id; --cwd pins the working directory (its
+        // session store groups by cwd, but --resume finds ids anywhere).
+        Tool::Grok => vec![
+            "--resume".into(),
+            session_id.into(),
+            "--cwd".into(),
             repo.to_string_lossy().into_owned(),
         ],
     }
@@ -770,9 +800,9 @@ pub fn add_repo_roster_agent_by_name(
     let desc = user_desc.ok_or_else(|| {
         anyhow::anyhow!(
             "unknown agent `{label}`: not in the user-scope `agents` library. \
-             Define it inline with `clank agent add {label} --tool <claude|codex>`, \
+             Define it inline with `clank agent add {label} --tool <claude|codex|grok>`, \
              or add it to the library first with \
-             `clank agent add {label} --global --tool <claude|codex>`.",
+             `clank agent add {label} --global --tool <claude|codex|grok>`.",
             label = label.as_str()
         )
     })?;
@@ -843,7 +873,7 @@ pub fn set_repo_master(repo: &Path, label: &AgentLabel) -> anyhow::Result<()> {
     if !repo_cfg.agents.contains_key(label) {
         anyhow::bail!(
             "agent `{label}` is not on this repo's roster. \
-             Add it first with `clank agent add {label} --tool <claude|codex>` \
+             Add it first with `clank agent add {label} --tool <claude|codex|grok>` \
              (or by name: `clank agent add {label}`).",
             label = label.as_str()
         );
@@ -1152,6 +1182,49 @@ mod tests {
             id: clank_core::ids::SessionId::parse("bbbbbbbb-1111-2222-3333-444444444444").unwrap(),
             tool: Tool::Codex,
             updated_at: "2026-06-04T12:00:00Z".to_string(),
+        }
+    }
+
+    fn grok_session() -> Session {
+        Session {
+            id: clank_core::ids::SessionId::parse("cccccccc-1111-2222-3333-444444444444").unwrap(),
+            tool: Tool::Grok,
+            updated_at: "2026-06-04T12:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn grok_launch_resumes_by_id_with_cwd_and_trust() {
+        // grok-first-class: restore = --resume <id> --cwd <repo>, and
+        // every grok launch carries --trust (folder-trust bypass) IN
+        // the composed argv so --print previews it honestly.
+        let s = grok_session();
+        let c = compose_launch(Path::new("/repo"), &s, None, Some("hello"));
+        assert_eq!(c.program, "grok");
+        let a: Vec<&str> = c.args.iter().map(|s| s.as_str()).collect();
+        assert_eq!(
+            a,
+            [
+                "--resume",
+                "cccccccc-1111-2222-3333-444444444444",
+                "--cwd",
+                "/repo",
+                "--trust",
+                "hello",
+            ]
+        );
+    }
+
+    #[test]
+    fn claude_and_codex_launches_never_carry_trust_flag() {
+        for s in [claude_session(), codex_session()] {
+            let c = compose_launch(Path::new("/repo"), &s, None, None);
+            assert!(
+                !c.args.iter().any(|a| a == "--trust"),
+                "--trust is grok-only, got {:?} for {:?}",
+                c.args,
+                s.tool
+            );
         }
     }
 
@@ -1792,6 +1865,62 @@ mod tests {
             "existing file preserved verbatim"
         );
         assert!(body.contains("[projects.\"/repos/alpha\"]\ntrust_level = \"trusted\""));
+    }
+
+    #[test]
+    fn grok_bootstrap_launch_carries_trust_before_the_bind_prompt() {
+        // codex 703312b: a registered grok agent with NO bound session
+        // and no fork spec reaches compose_bootstrap_launch — the trust
+        // flag must ride that path too or the first `clank agent start`
+        // hits grok's folder-trust prompt.
+        let desc = AgentDescription {
+            tool: Tool::Grok,
+            launch: None,
+            initial_prompt: None,
+        };
+        let c = compose_bootstrap_launch(&label("fresh-grok"), &desc).expect("compose");
+        assert_eq!(c.program, "grok");
+        assert_eq!(c.args.first().map(|s| s.as_str()), Some("--trust"));
+        assert_eq!(c.args.len(), 2, "trust + bind prompt only");
+    }
+
+    #[test]
+    fn grok_fork_resumes_and_branches_with_trust() {
+        // grok-first-class: fork = --resume <sid> --fork-session (grok
+        // names the child; binding lands later via `clank as`), plus
+        // the grok-only --trust, then the orientation prompt. Without
+        // a source session: fresh launch, still trusted + oriented.
+        let desc = AgentDescription {
+            tool: Tool::Grok,
+            launch: None,
+            initial_prompt: None,
+        };
+        let wt = std::path::Path::new("/repo/.clank/worktrees/x");
+        let spec = crate::cli::fork::ForkSpec {
+            tool: Tool::Grok,
+            from_session: Some("cccccccc-1111-2222-3333-444444444444".into()),
+            prompt: "orient".into(),
+        };
+        let c = compose_fork_launch(&spec, &desc, wt);
+        assert_eq!(c.program, "grok");
+        assert_eq!(
+            c.args,
+            vec![
+                "--resume",
+                "cccccccc-1111-2222-3333-444444444444",
+                "--fork-session",
+                "--trust",
+                "orient",
+            ]
+        );
+
+        let spec = crate::cli::fork::ForkSpec {
+            tool: Tool::Grok,
+            from_session: None,
+            prompt: "orient".into(),
+        };
+        let c = compose_fork_launch(&spec, &desc, wt);
+        assert_eq!(c.args, vec!["--trust", "orient"]);
     }
 
     #[test]

@@ -203,6 +203,11 @@ impl WaitingReason {
 pub enum Tool {
     Claude,
     Codex,
+    /// xAI's Grok CLI ("Grok Build") — grok-first-class. Claude-style
+    /// background-task wake, passive hooks (no stop-hook adapter), no
+    /// session env var in tool subprocesses (identity resolves via the
+    /// newest session dir for the cwd).
+    Grok,
 }
 
 impl Tool {
@@ -210,6 +215,7 @@ impl Tool {
         match self {
             Tool::Claude => "claude",
             Tool::Codex => "codex",
+            Tool::Grok => "grok",
         }
     }
 }

@@ -27,7 +27,7 @@ pub async fn run(args: AsArgs) -> anyhow::Result<()> {
         anyhow::anyhow!(
             "no session detected in env (CLAUDE_CODE_SESSION_ID / \
              CODEX_THREAD_ID not set). `clank as` must be run from \
-             inside a claude or codex session."
+             inside a claude, codex, or grok session."
         )
     })?;
 

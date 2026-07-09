@@ -79,7 +79,7 @@ pub(crate) fn resolve_effective_auto_mode(
     clank_core::agent_config::effective_auto_mode(per_agent.and_then(|c| c.auto_mode), user_default)
 }
 
-fn write_user_config(home: &Path, file: &UserConfigFile) -> anyhow::Result<()> {
+pub(crate) fn write_user_config(home: &Path, file: &UserConfigFile) -> anyhow::Result<()> {
     write_typed_config(&user_config_path(home), file)
 }
 

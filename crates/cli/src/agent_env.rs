@@ -14,6 +14,10 @@ use crate::agent_store::load_all_agent_configs_lossy;
 
 const ENV_CLAUDE_SESSION: &str = "CLAUDE_CODE_SESSION_ID";
 const ENV_CODEX_SESSION: &str = "CODEX_THREAD_ID";
+/// Grok sets NO session id in tool subprocess envs — only this marker
+/// (grok-first-class P2). Detection resolves the session as the
+/// newest session dir for the cwd (see [`grok_session_for_cwd`]).
+const ENV_GROK_MARKER: &str = "GROK_AGENT";
 const ENV_CLANK_AGENT: &str = "CLANK_AGENT";
 
 /// Try to detect (tool, session_id) from the env vars set by the
@@ -34,8 +38,59 @@ pub fn detect_session_from_env() -> Result<Option<(Tool, SessionId)>, EnvError> 
         }),
         (Some(raw), None) => Ok(Some((Tool::Claude, parse_session_id(&raw, Tool::Claude)?))),
         (None, Some(raw)) => Ok(Some((Tool::Codex, parse_session_id(&raw, Tool::Codex)?))),
-        (None, None) => Ok(None),
+        // Grok last: its marker carries no session id, and an explicit
+        // claude/codex session var (even one leaked from a parent
+        // shell) is stronger evidence than the bare marker.
+        (None, None) => {
+            if env::var(ENV_GROK_MARKER).is_err() {
+                return Ok(None);
+            }
+            let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+            let cwd = std::env::current_dir().ok();
+            match (home, cwd) {
+                (Some(home), Some(cwd)) => {
+                    Ok(grok_session_for_cwd(&home, &cwd).map(|sid| (Tool::Grok, sid)))
+                }
+                _ => Ok(None),
+            }
+        }
     }
+}
+
+/// The running grok session for `cwd`: the newest-mtime session dir
+/// under `~/.grok/sessions/<percent-encoded cwd>/` (grok groups
+/// sessions by URL-encoded working directory; the live session's dir
+/// is the most recently written — grok-first-class P2). `None` when
+/// the group doesn't exist. Two concurrent grok sessions in one
+/// directory can misresolve — `clank as` echoes the binding so the
+/// user can catch and rebind.
+fn grok_session_for_cwd(home: &std::path::Path, cwd: &std::path::Path) -> Option<SessionId> {
+    let mut encoded = String::new();
+    for b in cwd.to_string_lossy().bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(b as char)
+            }
+            _ => encoded.push_str(&format!("%{b:02X}")),
+        }
+    }
+    let group = home.join(".grok/sessions").join(encoded);
+    let mut newest: Option<(std::time::SystemTime, SessionId)> = None;
+    for entry in std::fs::read_dir(group).ok()?.flatten() {
+        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let Ok(sid) = SessionId::parse(&entry.file_name().to_string_lossy()) else {
+            continue;
+        };
+        let Ok(mtime) = entry.metadata().and_then(|m| m.modified()) else {
+            continue;
+        };
+        if newest.as_ref().is_none_or(|(t, _)| mtime > *t) {
+            newest = Some((mtime, sid));
+        }
+    }
+    newest.map(|(_, sid)| sid)
 }
 
 /// Read the explicit-override label from `CLANK_AGENT`. Empty
@@ -62,6 +117,7 @@ fn parse_session_id(raw: &str, tool: Tool) -> Result<SessionId, EnvError> {
         var: match tool {
             Tool::Claude => ENV_CLAUDE_SESSION,
             Tool::Codex => ENV_CODEX_SESSION,
+            Tool::Grok => ENV_GROK_MARKER,
         },
         value: raw.to_string(),
         reason: e.to_string(),
@@ -161,7 +217,7 @@ pub fn resolve_identity_from_env(repo: &Path) -> anyhow::Result<AgentLabel> {
     resolve_agent_identity(&inputs).map_err(|e| match e {
         ResolveError::NoSession => anyhow::anyhow!(
             "no session detected — pass --author <label>, set CLANK_AGENT, \
-             or run inside claude/codex"
+             or run inside claude/codex/grok"
         ),
         ResolveError::NoAgentForSession { session_id, tool } => anyhow::anyhow!(
             "no agent is bound to {tool} session {sid} in this repo — run \

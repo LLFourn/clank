@@ -599,11 +599,7 @@ fn agent_session_info(
     let Some(session) = cfg.session.as_ref() else {
         return (None, None, false);
     };
-    let tool_str = match session.tool {
-        Tool::Claude => "claude",
-        Tool::Codex => "codex",
-    }
-    .to_string();
+    let tool_str = session.tool.as_str().to_string();
     let session_id = session.id.as_str().to_string();
     let resumable = session_jsonl_exists(&session.tool, &session_id, home);
     (Some(tool_str), Some(session_id), resumable)
@@ -616,7 +612,19 @@ fn session_jsonl_exists(tool: &Tool, session_id: &str, home: Option<&Path>) -> b
     match tool {
         Tool::Claude => claude_session_jsonl_exists(home, session_id),
         Tool::Codex => codex_session_jsonl_exists(home, session_id),
+        Tool::Grok => grok_session_dir_exists(home, session_id),
     }
+}
+
+/// Grok stores sessions as `~/.grok/sessions/<encoded-cwd>/<id>/`
+/// directories (no per-session jsonl at a fixed depth); the session
+/// is resumable iff its dir exists under any cwd group.
+fn grok_session_dir_exists(home: &Path, session_id: &str) -> bool {
+    let root = home.join(".grok").join("sessions");
+    let Ok(groups) = std::fs::read_dir(&root) else {
+        return false;
+    };
+    groups.flatten().any(|g| g.path().join(session_id).is_dir())
 }
 
 fn claude_session_jsonl_exists(home: &Path, session_id: &str) -> bool {

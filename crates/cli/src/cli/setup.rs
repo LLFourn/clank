@@ -74,6 +74,22 @@ const WORK_LOOP_CODEX: &str = "\
   waiting for state to change. STOP — the Stop hook re-invokes you when
   there is work. You WILL be woken; do not spin.";
 
+/// Grok wakes on background-task completion like claude
+/// (grok-first-class P1), but its hooks are passive — no reminder
+/// nudge exists, so the arming discipline is carried entirely here.
+const WORK_LOOP_GROK: &str = "\
+- **Keep a `clank wait` armed.** End every turn with `clank wait`
+  running as a background terminal command (`background: true`).
+  Its completion wakes you: act on the items it printed IMMEDIATELY,
+  then re-arm `clank wait` and end your turn. Nothing reminds you if
+  you forget — arming the wait is YOUR responsibility, every turn. Run
+  `clank status` if you need more than the hint carries (short SHAs
+  resolve wherever a `<sha>` is wanted).
+  Each item is a one-line hint: kind, plan, short sha.
+- **NEVER poll.** Do not run `clank wait` in the foreground and do not
+  re-run `clank status` waiting for state to change. The armed
+  background wait wakes you; do not spin.";
+
 /// Compose a role's `SKILL.md` for a tool from the shared single-source
 /// fragments: frontmatter (role-guarded description) + a role-guard
 /// line + shared core + the role body, plus the claude-only `/clank`
@@ -110,10 +126,12 @@ pub fn compose_skill(role: Role, tool: Tool) -> String {
     let shell = match tool {
         Tool::Claude => "Bash",
         Tool::Codex => "shell",
+        Tool::Grok => "run_terminal_command",
     };
     let work_loop = match tool {
         Tool::Claude => WORK_LOOP_CLAUDE,
         Tool::Codex => WORK_LOOP_CODEX,
+        Tool::Grok => WORK_LOOP_GROK,
     };
     out.replace("{{SHELL}}", shell)
         .replace("{{WORK_LOOP}}", work_loop)
@@ -147,7 +165,16 @@ pub async fn run(args: SetupArgs) -> anyhow::Result<()> {
 
     // Role skills: clank-master + clank-reviewer, both to both tools
     // (tool != role). Composed per (role, tool) from one source each.
-    for (tool, tool_dir) in [(Tool::Claude, ".claude"), (Tool::Codex, ".codex")] {
+    // Grok reads native skills from ~/.grok/skills and dedupes by name
+    // against its claude-compat scan, native winning (grok-first-class
+    // P3) — so installing here cleanly overrides the claude copies it
+    // would otherwise pick up. No grok hook is installed: grok hooks
+    // are passive and the wake channel is the armed wait's completion.
+    for (tool, tool_dir) in [
+        (Tool::Claude, ".claude"),
+        (Tool::Codex, ".codex"),
+        (Tool::Grok, ".grok"),
+    ] {
         for (role, skill) in [
             (Role::Master, MASTER_SKILL),
             (Role::Reviewer, REVIEWER_SKILL),
@@ -182,6 +209,13 @@ pub async fn run(args: SetupArgs) -> anyhow::Result<()> {
         args.dry_run,
         &mut summary,
     )?;
+    install_skill(
+        &home.join(".grok/skills/clank-pr-review/SKILL.md"),
+        PR_REVIEW_SKILL_BODY,
+        args.force,
+        args.dry_run,
+        &mut summary,
+    )?;
     merge_hook_into_settings(
         &home.join(".claude/settings.json"),
         ClaudeHook,
@@ -207,6 +241,9 @@ pub async fn run(args: SetupArgs) -> anyhow::Result<()> {
     if let Some(line) = seed_autosquash_default(&home.join(".clank/config.json"), args.dry_run)? {
         summary.push(line);
     }
+    if let Some(line) = seed_research_team(&home, args.dry_run)? {
+        summary.push(line);
+    }
 
     if summary.is_empty() {
         println!("clank setup: nothing to do (all assets already in place)");
@@ -225,6 +262,44 @@ pub async fn run(args: SetupArgs) -> anyhow::Result<()> {
 /// the summary line when it seeds (or would, under `dry_run`); `None` when the
 /// key is already set (explicit true/false is preserved) or on a dry-run of an
 /// already-set key. Split out for testing without `$HOME` mutation.
+/// Seed the `research` team — grok master, codex commit reviewer,
+/// claude final reviewer (grok-first-class M4) — into the user config
+/// when no team of that name exists. An existing `research` team is
+/// never touched: the seed is a starting point, not a managed entry.
+fn seed_research_team(home: &Path, dry_run: bool) -> anyhow::Result<Option<String>> {
+    use crate::cli::teams_config::{RosterAgent, RosterRole, TeamMember};
+    use crate::lifecycle::AgentLabel;
+    use clank_core::vocab::Tool;
+
+    let mut cfg = crate::cli::team::read_user_config(home)?;
+    if cfg.teams.contains_key("research") {
+        return Ok(None);
+    }
+    let notice = "seeded team `research`: grok (master), codex (commit), claude (final)";
+    if dry_run {
+        return Ok(Some(format!("would have {notice}")));
+    }
+    let member = |tool: Tool, role: RosterRole| {
+        TeamMember::Inline(RosterAgent {
+            tool,
+            launch: None,
+            initial_prompt: None,
+            role,
+        })
+    };
+    let roster = [
+        ("grok", member(Tool::Grok, RosterRole::Master)),
+        ("codex", member(Tool::Codex, RosterRole::Commit)),
+        ("claude", member(Tool::Claude, RosterRole::Final)),
+    ]
+    .into_iter()
+    .map(|(l, m)| (AgentLabel::parse(l).expect("static label"), m))
+    .collect();
+    cfg.teams.insert("research".to_string(), roster);
+    crate::cli::team::write_user_config(home, &cfg)?;
+    Ok(Some(notice.to_string()))
+}
+
 fn seed_autosquash_default(user_config: &Path, dry_run: bool) -> anyhow::Result<Option<String>> {
     let key = &["finish", "autosquash"][..];
     // A destructive default must disclose itself at the surface, not just in a
@@ -675,6 +750,75 @@ mod tests {
         assert!(
             !compose_skill(Role::Master, Tool::Claude).contains("- **FINISHED**:"),
             "the master skill must not define verdicts (reviewer-only)"
+        );
+    }
+
+    #[test]
+    fn grok_skill_teaches_the_armed_wait_loop_without_a_nudge_crutch() {
+        // grok-first-class: grok wakes on background-task completion
+        // (P1) but has NO nudge channel (passive hooks) — the skill
+        // alone carries the arming discipline, in grok's vocabulary.
+        let mg = compose_skill(Role::Master, Tool::Grok);
+        assert!(mg.contains("background: true"), "grok bg phrasing");
+        assert!(
+            mg.contains("Nothing reminds you"),
+            "the no-nudge discipline is stated"
+        );
+        assert!(
+            mg.contains("run_terminal_command"),
+            "grok shell name substituted"
+        );
+        assert!(!mg.contains("{{WORK_LOOP}}") && !mg.contains("{{SHELL}}"));
+        assert!(
+            !mg.contains("Stop hook (blocked) feedback:"),
+            "codex-only phrase must not leak into grok"
+        );
+        assert!(
+            !mg.contains("run_in_background: true"),
+            "claude-only phrasing must not leak into grok"
+        );
+    }
+
+    #[test]
+    fn research_team_seeds_once_and_never_touches_an_existing_definition() {
+        use crate::cli::teams_config::RosterRole;
+        use crate::lifecycle::AgentLabel;
+        let home = tempfile::tempdir().unwrap();
+
+        // Dry run reports without writing.
+        assert!(
+            seed_research_team(home.path(), true).unwrap().is_some(),
+            "dry-run announces the seed"
+        );
+        assert!(
+            crate::cli::team::read_user_config(home.path())
+                .unwrap()
+                .teams
+                .is_empty()
+        );
+
+        // Fresh home: seeds grok master / codex commit / claude final.
+        seed_research_team(home.path(), false).unwrap().unwrap();
+        let cfg = crate::cli::team::read_user_config(home.path()).unwrap();
+        let team = cfg.teams.get("research").unwrap();
+        let role_of = |l: &str| team.get(&AgentLabel::parse(l).unwrap()).unwrap().role();
+        assert_eq!(role_of("grok"), RosterRole::Master);
+        assert_eq!(role_of("codex"), RosterRole::Commit);
+        assert_eq!(role_of("claude"), RosterRole::Final);
+
+        // Idempotent, and an existing definition is a user decision —
+        // never modified even if it drifts from the seed.
+        assert!(seed_research_team(home.path(), false).unwrap().is_none());
+        let mut cfg = crate::cli::team::read_user_config(home.path()).unwrap();
+        let team = cfg.teams.get_mut("research").unwrap();
+        team.remove(&AgentLabel::parse("claude").unwrap());
+        crate::cli::team::write_user_config(home.path(), &cfg).unwrap();
+        assert!(seed_research_team(home.path(), false).unwrap().is_none());
+        let cfg = crate::cli::team::read_user_config(home.path()).unwrap();
+        assert_eq!(
+            cfg.teams.get("research").unwrap().len(),
+            2,
+            "user-modified team survives re-setup untouched"
         );
     }
 

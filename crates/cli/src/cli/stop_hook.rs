@@ -150,6 +150,12 @@ async fn compute_outcome(
                     let wait_timeout = cfg.as_ref().and_then(|c| c.wait_timeout.clone());
                     compute_wait_outcome(&repo, &label, role, wait_timeout.as_deref()).await
                 }
+                // Grok's hooks are PASSIVE (grok-first-class): clank
+                // installs no grok adapter and no continuation could
+                // drive it. If something wires this up anyway, say so.
+                Tool::Grok => HookOutcome::Diagnostic {
+                    message: "hook: grok has no stop-hook adapter (grok hooks are passive)".into(),
+                },
             },
         },
     }
@@ -520,6 +526,13 @@ fn emit_and_exit(outcome: HookOutcome, tool: Tool) -> ! {
                 Ok(json) => println!("{json}"),
                 Err(_) => {}
             }
+            std::process::exit(HOOK_OK_EXIT);
+        }
+        // Grok hooks are passive — nothing we print can continue the
+        // agent, so a Continue degrades to a stderr note + exit 0
+        // (unreachable while no grok adapter is installed).
+        (HookOutcome::Continue { reason }, Tool::Grok) => {
+            eprintln!("{reason}");
             std::process::exit(HOOK_OK_EXIT);
         }
         (HookOutcome::Silent { .. }, _) => {

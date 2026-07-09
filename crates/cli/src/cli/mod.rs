@@ -912,6 +912,7 @@ pub struct StopHookArgs {
 pub enum ToolArg {
     Claude,
     Codex,
+    Grok,
 }
 
 impl From<ToolArg> for clank_core::Tool {
@@ -919,6 +920,7 @@ impl From<ToolArg> for clank_core::Tool {
         match t {
             ToolArg::Claude => clank_core::Tool::Claude,
             ToolArg::Codex => clank_core::Tool::Codex,
+            ToolArg::Grok => clank_core::Tool::Grok,
         }
     }
 }

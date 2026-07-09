@@ -154,7 +154,7 @@ fn run_console(repo: &Path, specs: Vec<Spec>) -> anyhow::Result<()> {
     let Some(status_idx) = status_idx else {
         anyhow::bail!(
             "clank open (console): no agents in this repo's roster — \
-             add one with `clank agent add <label> --tool <claude|codex>` \
+             add one with `clank agent add <label> --tool <claude|codex|grok>` \
              and `clank agent promote <label>`"
         );
     };
