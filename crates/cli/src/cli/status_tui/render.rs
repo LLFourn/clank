@@ -509,7 +509,7 @@ pub(super) fn render_at(
             for (local, s) in seq[off..end].iter().enumerate() {
                 let spans = match s {
                     Seg::Ask(line) => (*line).clone(),
-                    Seg::Log(row) => log_row_spans(row, author_width),
+                    Seg::Log(row) => log_row_spans(row, author_width, &snap.log_decorations),
                 };
                 // The selected timeline entry gets the unified selection
                 // band — the same "selected" style as the panel/picker —
@@ -542,7 +542,11 @@ pub(super) const MARK_FIELD: usize = 2;
 /// (green ✓ / cyan ✓✓ / red ✗) start at that SAME column 2, and the
 /// author is padded to `author_width` so every summary begins at one
 /// aligned column (tui-log-plan-highlight-align).
-pub(super) fn log_row_spans(row: &crate::cli::log::OnelineRow, author_width: usize) -> Vec<Span> {
+pub(super) fn log_row_spans(
+    row: &crate::cli::log::OnelineRow,
+    author_width: usize,
+    decorations: &std::collections::BTreeMap<String, Vec<String>>,
+) -> Vec<Span> {
     use crate::cli::log::{OnelineRow, RowMarker};
     match row {
         OnelineRow::Header { plan } => {
@@ -565,11 +569,28 @@ pub(super) fn log_row_spans(row: &crate::cli::log::OnelineRow, author_width: usi
                 RowMarker::AdHoc => colored("33", g),  // yellow (unchanged)
                 _ => plain(g),
             };
-            vec![
+            let mut spans = vec![
                 icon,
                 dim(format!(" {} ", &sha.as_str()[..7])),
                 plain(subject.clone()),
-            ]
+            ];
+            // Branch tips on this commit (tui-log-branch-decorations):
+            // git-decorate colors — local branches green, remote-tracking
+            // red — inside dim parens so the names read as annotation,
+            // not subject text. Row-level width truncation handles
+            // narrow panes.
+            if let Some(names) = decorations.get(sha.as_str()) {
+                spans.push(dim(" ("));
+                for (i, name) in names.iter().enumerate() {
+                    if i > 0 {
+                        spans.push(dim(", "));
+                    }
+                    let code = if name.contains('/') { "31" } else { "32" };
+                    spans.push(colored(code, name.clone()));
+                }
+                spans.push(dim(")"));
+            }
+            spans
         }
         OnelineRow::Review {
             verdict,
@@ -1872,6 +1893,37 @@ mod tests {
         );
         s.log_rows = subjects.iter().map(|l| commit_row(l)).collect();
         s
+    }
+
+    #[test]
+    fn log_commit_rows_carry_branch_decorations() {
+        // tui-log-branch-decorations: a commit whose sha is a relevant
+        // branch tip renders `(name, other)` after its subject, in map
+        // order; rows whose sha owns no decoration are unchanged.
+        let mut s = snap_with_log(&[]);
+        let tip_sha = format!("{:0<40}", "aaaa111");
+        let old_sha = format!("{:0<40}", "bbbb222");
+        let row = |sha: &str, subject: &str| crate::cli::log::OnelineRow::Commit {
+            sha: crate::lifecycle::CommitSha::parse(sha).unwrap(),
+            subject: subject.to_string(),
+            marker: crate::cli::log::RowMarker::Plain,
+        };
+        s.log_rows = vec![row(&tip_sha, "tip subject"), row(&old_sha, "older subject")];
+        s.log_decorations = [(
+            tip_sha,
+            vec!["master".to_string(), "origin/master".to_string()],
+        )]
+        .into_iter()
+        .collect();
+
+        let lines: Vec<String> = render(&s, 16, 80).iter().map(|l| visible(l)).collect();
+        let tip = lines.iter().find(|l| l.contains("tip subject")).unwrap();
+        assert!(
+            tip.contains("tip subject (master, origin/master)"),
+            "decorated tip row: {tip}"
+        );
+        let older = lines.iter().find(|l| l.contains("older subject")).unwrap();
+        assert!(!older.contains('('), "undecorated row stays bare: {older}");
     }
 
     #[test]

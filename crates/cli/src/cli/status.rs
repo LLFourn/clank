@@ -63,6 +63,13 @@ pub struct StatusSnapshot {
     /// 3ea8580 concern 1). Plans: status-tui-live-log,
     /// log-plan-umbrellas.
     pub(crate) log_rows: Vec<crate::cli::log::OnelineRow>,
+    /// sha → branch names whose tips sit on that commit
+    /// (tui-log-branch-decorations): HEAD's branch, its upstream, the
+    /// main worktree's branch and its `origin/…` counterpart. TUI-only
+    /// decoration; valid across `tui_log_rows` window growth (tips
+    /// don't move with scrolling) and rebuilt with the snapshot. NOT
+    /// in `to_json`.
+    pub(crate) log_decorations: std::collections::BTreeMap<String, Vec<String>>,
     /// Active GitHub PR reviews (clank-pr-review-mode), for the
     /// `pr` gauge. Empty in the common (no-PR-review) case.
     pub(crate) pr_reviews: Vec<clank_core::wait::PrReviewWorkState>,
@@ -453,6 +460,8 @@ impl StatusSnapshot {
             })
             .collect();
 
+        let log_decorations = log_decorations(&git, branch.as_deref());
+
         Ok(Self {
             repo_path: repo.to_path_buf(),
             basename: basename.to_string(),
@@ -468,6 +477,7 @@ impl StatusSnapshot {
             agents,
             stash,
             log_rows,
+            log_decorations,
             pr_reviews: work_status.pr_reviews,
             head_correction: work_status.head_correction,
         })
@@ -843,6 +853,42 @@ async fn recent_log_rows(repo: &Path, state: &RepoState) -> Vec<crate::cli::log:
         Some(head) => log_rows_windowed(repo, &head, LOG_WINDOW).await,
         None => Vec::new(),
     }
+}
+
+/// sha → branch names whose tips sit on that commit, for the TUI log
+/// (tui-log-branch-decorations). The relevant set — HEAD's branch, its
+/// configured upstream, the main worktree's branch (the base a linked
+/// worktree split from) and that base's `origin/…` counterpart — is a
+/// handful of local gix reads on the snapshot's existing handle: no
+/// subprocess, no network, nothing per-commit. Names dedupe in display
+/// order (on the main repo the base IS HEAD's branch).
+fn log_decorations(
+    git: &crate::git_io::Repo,
+    head_branch: Option<&str>,
+) -> std::collections::BTreeMap<String, Vec<String>> {
+    fn push(names: &mut Vec<String>, n: String) {
+        if !n.is_empty() && !names.contains(&n) {
+            names.push(n);
+        }
+    }
+    let mut names: Vec<String> = Vec::new();
+    if let Some(b) = head_branch {
+        push(&mut names, b.to_string());
+        if let Some(up) = git.upstream_short_name(b) {
+            push(&mut names, up);
+        }
+    }
+    if let Some(base) = git.main_worktree_branch() {
+        push(&mut names, base.clone());
+        push(&mut names, format!("origin/{base}"));
+    }
+    let mut map = std::collections::BTreeMap::new();
+    for (name, sha) in git.ref_tips(&names) {
+        map.entry(sha.as_str().to_string())
+            .or_insert_with(Vec::new)
+            .push(name);
+    }
+    map
 }
 
 /// Log rows for the last `window` commits, with HEAD
@@ -1833,6 +1879,7 @@ mod dirty_and_wake_tests {
             agents: Vec::new(),
             stash: Vec::new(),
             log_rows: Vec::new(),
+            log_decorations: Default::default(),
             pr_reviews: Vec::new(),
             head_correction: None,
         }

@@ -1028,6 +1028,66 @@ pub fn current_branch_at(repo: &Path) -> Result<Option<String>, GitIoError> {
     open(repo)?.current_branch()
 }
 
+impl Repo {
+    /// The branch checked out in the MAIN worktree — from a linked
+    /// worktree, the base it split from; on the main worktree, HEAD's
+    /// own branch. Resolved via gix common-dir topology (a linked
+    /// worktree's `git_dir` differs from the shared `common_dir`,
+    /// whose parent is the main checkout) rather than `git worktree
+    /// list` — the TUI log decoration path stays subprocess-free
+    /// (tui-log-branch-decorations). Only the linked case opens a
+    /// second handle (the main checkout is a different repo). `None`
+    /// when detached, bare, or unresolvable.
+    pub fn main_worktree_branch(&self) -> Option<String> {
+        if self.0.git_dir() == self.0.common_dir() {
+            return self.current_branch().ok().flatten();
+        }
+        // The common dir arrives UNRESOLVED (`…/.git/worktrees/<wt>/../..`);
+        // `Path::parent` is textual, so canonicalize before stepping up
+        // to the main checkout.
+        let common = std::fs::canonicalize(self.0.common_dir()).ok()?;
+        let main_root = common.parent()?;
+        current_branch_at(main_root).ok().flatten()
+    }
+
+    /// `branch`'s configured upstream as a short remote-tracking name
+    /// (`origin/foo`), read from LOCAL config only (the
+    /// `branch.<b>.remote` and `branch.<b>.merge` keys) — the offline
+    /// half of `git rev-parse --abbrev-ref <b>@{upstream}`. A `.`
+    /// remote (same-repo tracking) yields the bare branch name.
+    /// `None` when tracking is unset or the merge target isn't a
+    /// branch.
+    pub fn upstream_short_name(&self, branch: &str) -> Option<String> {
+        let cfg = self.0.config_snapshot();
+        let remote = cfg
+            .string(format!("branch.{branch}.remote").as_str())?
+            .to_string();
+        let merge = cfg
+            .string(format!("branch.{branch}.merge").as_str())?
+            .to_string();
+        let name = merge.strip_prefix("refs/heads/")?;
+        if remote == "." {
+            return Some(name.to_string());
+        }
+        Some(format!("{remote}/{name}"))
+    }
+
+    /// Resolve short ref names (`master`, `origin/master`) to the
+    /// commits their tips point at, on this handle, skipping names
+    /// that don't resolve. Local rev-parse only — no subprocess, no
+    /// network (tui-log-branch-decorations).
+    pub fn ref_tips(&self, names: &[String]) -> Vec<(String, CommitSha)> {
+        names
+            .iter()
+            .filter_map(|n| {
+                let id = self.0.rev_parse_single(n.as_str()).ok()?;
+                let sha = CommitSha::parse(&id.detach().to_string()).ok()?;
+                Some((n.clone(), sha))
+            })
+            .collect()
+    }
+}
+
 /// [`Repo::commit_subject`] opening its own handle.
 pub fn commit_subject_at(repo: &Path, sha: &CommitSha) -> Result<String, GitIoError> {
     open(repo)?.commit_subject(sha)
@@ -2286,6 +2346,75 @@ mod tests {
         let head = rev_parse_head(r).unwrap().unwrap();
         git(r, &["checkout", "--quiet", head.as_str()]);
         assert_eq!(current_branch_at(r).unwrap(), None);
+    }
+
+    #[test]
+    fn log_decoration_reads_are_local_and_skip_absent_refs() {
+        use std::process::Command;
+        fn git(dir: &Path, args: &[&str]) {
+            assert!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(dir)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?}"
+            );
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let r = dir.path();
+        git(r, &["init", "--quiet", "--initial-branch=master"]);
+        git(r, &["config", "user.email", "t@t"]);
+        git(r, &["config", "user.name", "t"]);
+        std::fs::write(r.join("f"), "x").unwrap();
+        git(r, &["add", "-A"]);
+        git(r, &["commit", "--quiet", "-m", "c1"]);
+        // A remote-tracking ref with NO network: write the ref directly.
+        git(r, &["update-ref", "refs/remotes/origin/master", "HEAD"]);
+        git(r, &["config", "branch.master.remote", "origin"]);
+        git(r, &["config", "branch.master.merge", "refs/heads/master"]);
+
+        let g = open(r).unwrap();
+
+        // Upstream comes from local config alone; unset tracking → None.
+        assert_eq!(
+            g.upstream_short_name("master").as_deref(),
+            Some("origin/master")
+        );
+        assert_eq!(g.upstream_short_name("untracked"), None);
+
+        // Both names resolve to the same tip; unknown names are skipped
+        // silently and order is preserved.
+        let head = rev_parse_head(r).unwrap().unwrap();
+        let tips = g.ref_tips(&["master".into(), "origin/master".into(), "ghost".into()]);
+        assert_eq!(
+            tips.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+            ["master", "origin/master"]
+        );
+        assert!(tips.iter().all(|(_, sha)| sha == &head));
+
+        // The main checkout answers its own branch; a linked worktree
+        // answers the MAIN worktree's branch, not its own.
+        assert_eq!(g.main_worktree_branch().as_deref(), Some("master"));
+        let wt = r.join("wt");
+        git(
+            r,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                wt.to_str().unwrap(),
+                "-b",
+                "feature",
+            ],
+        );
+        assert_eq!(current_branch_at(&wt).unwrap().as_deref(), Some("feature"));
+        assert_eq!(
+            open(&wt).unwrap().main_worktree_branch().as_deref(),
+            Some("master")
+        );
     }
 
     #[test]
