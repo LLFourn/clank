@@ -234,14 +234,12 @@ pub async fn run(args: SetupArgs) -> anyhow::Result<()> {
         &mut summary,
     )?;
 
-    // Seed the `finish.autosquash` default into the user-scope config on first
-    // setup — absent → true; an explicit true/false is preserved. Pairs with
-    // autosquash implying `allow_rewrite_protected` so it works on the natural
-    // (often `master`) workflow branch.
+    // Setup may seed product behavior defaults, but never personal/team
+    // composition templates. `finish.autosquash` is a behavior default:
+    // absent → true; an explicit true/false is preserved. Pairs with
+    // autosquash implying `allow_rewrite_protected` so it works on the
+    // natural (often `master`) workflow branch.
     if let Some(line) = seed_autosquash_default(&home.join(".clank/config.json"), args.dry_run)? {
-        summary.push(line);
-    }
-    if let Some(line) = seed_research_team(&home, args.dry_run)? {
         summary.push(line);
     }
 
@@ -262,44 +260,6 @@ pub async fn run(args: SetupArgs) -> anyhow::Result<()> {
 /// the summary line when it seeds (or would, under `dry_run`); `None` when the
 /// key is already set (explicit true/false is preserved) or on a dry-run of an
 /// already-set key. Split out for testing without `$HOME` mutation.
-/// Seed the `research` team — grok master, codex commit reviewer,
-/// claude final reviewer (grok-first-class M4) — into the user config
-/// when no team of that name exists. An existing `research` team is
-/// never touched: the seed is a starting point, not a managed entry.
-fn seed_research_team(home: &Path, dry_run: bool) -> anyhow::Result<Option<String>> {
-    use crate::cli::teams_config::{RosterAgent, RosterRole, TeamMember};
-    use crate::lifecycle::AgentLabel;
-    use clank_core::vocab::Tool;
-
-    let mut cfg = crate::cli::team::read_user_config(home)?;
-    if cfg.teams.contains_key("research") {
-        return Ok(None);
-    }
-    let notice = "seeded team `research`: grok (master), codex (commit), claude (final)";
-    if dry_run {
-        return Ok(Some(format!("would have {notice}")));
-    }
-    let member = |tool: Tool, role: RosterRole| {
-        TeamMember::Inline(RosterAgent {
-            tool,
-            launch: None,
-            initial_prompt: None,
-            role,
-        })
-    };
-    let roster = [
-        ("grok", member(Tool::Grok, RosterRole::Master)),
-        ("codex", member(Tool::Codex, RosterRole::Commit)),
-        ("claude", member(Tool::Claude, RosterRole::Final)),
-    ]
-    .into_iter()
-    .map(|(l, m)| (AgentLabel::parse(l).expect("static label"), m))
-    .collect();
-    cfg.teams.insert("research".to_string(), roster);
-    crate::cli::team::write_user_config(home, &cfg)?;
-    Ok(Some(notice.to_string()))
-}
-
 fn seed_autosquash_default(user_config: &Path, dry_run: bool) -> anyhow::Result<Option<String>> {
     let key = &["finish", "autosquash"][..];
     // A destructive default must disclose itself at the surface, not just in a
@@ -776,49 +736,6 @@ mod tests {
         assert!(
             !mg.contains("run_in_background: true"),
             "claude-only phrasing must not leak into grok"
-        );
-    }
-
-    #[test]
-    fn research_team_seeds_once_and_never_touches_an_existing_definition() {
-        use crate::cli::teams_config::RosterRole;
-        use crate::lifecycle::AgentLabel;
-        let home = tempfile::tempdir().unwrap();
-
-        // Dry run reports without writing.
-        assert!(
-            seed_research_team(home.path(), true).unwrap().is_some(),
-            "dry-run announces the seed"
-        );
-        assert!(
-            crate::cli::team::read_user_config(home.path())
-                .unwrap()
-                .teams
-                .is_empty()
-        );
-
-        // Fresh home: seeds grok master / codex commit / claude final.
-        seed_research_team(home.path(), false).unwrap().unwrap();
-        let cfg = crate::cli::team::read_user_config(home.path()).unwrap();
-        let team = cfg.teams.get("research").unwrap();
-        let role_of = |l: &str| team.get(&AgentLabel::parse(l).unwrap()).unwrap().role();
-        assert_eq!(role_of("grok"), RosterRole::Master);
-        assert_eq!(role_of("codex"), RosterRole::Commit);
-        assert_eq!(role_of("claude"), RosterRole::Final);
-
-        // Idempotent, and an existing definition is a user decision —
-        // never modified even if it drifts from the seed.
-        assert!(seed_research_team(home.path(), false).unwrap().is_none());
-        let mut cfg = crate::cli::team::read_user_config(home.path()).unwrap();
-        let team = cfg.teams.get_mut("research").unwrap();
-        team.remove(&AgentLabel::parse("claude").unwrap());
-        crate::cli::team::write_user_config(home.path(), &cfg).unwrap();
-        assert!(seed_research_team(home.path(), false).unwrap().is_none());
-        let cfg = crate::cli::team::read_user_config(home.path()).unwrap();
-        assert_eq!(
-            cfg.teams.get("research").unwrap().len(),
-            2,
-            "user-modified team survives re-setup untouched"
         );
     }
 
