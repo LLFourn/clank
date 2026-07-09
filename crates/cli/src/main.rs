@@ -188,6 +188,28 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn wait_for_parses_conflicts_with_peek_and_tolerates_author() {
+        // wait-for-observer-mode: each event parses; --peek conflicts
+        // (a delta probe has no baseline); --author/--role are ACCEPTED
+        // alongside --for (documented as ignored, not an error).
+        for (raw, want) in [
+            ("commit", cli::WaitFor::Commit),
+            ("finished", cli::WaitFor::Finished),
+            ("stopped", cli::WaitFor::Stopped),
+        ] {
+            let parsed = Cli::try_parse_from(["clank", "wait", "--for", raw]).unwrap();
+            let Command::Wait(w) = parsed.command else {
+                panic!("expected the wait command for --for {raw}");
+            };
+            assert_eq!(w.r#for, Some(want));
+        }
+        assert!(Cli::try_parse_from(["clank", "wait", "--for", "commit", "--peek"]).is_err());
+        assert!(
+            Cli::try_parse_from(["clank", "wait", "--for", "commit", "--author", "bob"]).is_ok()
+        );
+    }
+
     /// Pin the EXACT argv the TUI spawns to open a page (parent `html` flags
     /// before the `open` subcommand). Exercises the real builder — a
     /// flags-after-subcommand regression fails here at build time instead of

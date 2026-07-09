@@ -49,6 +49,7 @@ fn wait_args(repo: &Path, author: &str, role: WaitRole, peek: bool, timeout: &st
         role: Some(role),
         timeout: timeout.into(),
         json: true,
+        r#for: None,
         peek,
         no_cache: false,
         poll: false,

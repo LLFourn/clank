@@ -458,6 +458,18 @@ pub struct WaitArgs {
     /// Emit JSON instead of the human rendering.
     #[arg(short = 'j', long)]
     pub json: bool,
+    /// OBSERVE the repo instead of waiting for own work: block until
+    /// the given event lands, counting only events AFTER the wait
+    /// starts. For watching a foreign repo (pair with --repo) — no
+    /// session binding is needed there, so --author/--role are
+    /// ignored. Fires no lifecycle hooks.
+    #[arg(
+        long = "for",
+        value_enum,
+        value_name = "EVENT",
+        conflicts_with = "peek"
+    )]
+    pub r#for: Option<WaitFor>,
     /// One-shot, non-blocking probe: report whether the caller has
     /// actionable work RIGHT NOW and return immediately — never enter the
     /// watcher loop. Unlike a real wait it is SIDE-EFFECT-FREE: it fires no
@@ -596,6 +608,20 @@ pub enum WaitRole {
     /// users typing `--role reviewers` on `clank wait`.
     #[clap(alias = "reviewers")]
     Reviewer,
+}
+
+/// Observer events for `clank wait --for`
+/// (wait-for-observer-mode). Delta-from-startup: each fires only
+/// for occurrences after the wait began.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum WaitFor {
+    /// HEAD moved (any new commit).
+    Commit,
+    /// A plan was finalized.
+    Finished,
+    /// The repo came to a stop-point: a plan finalized OR a new
+    /// unanswered block appeared (someone needs the human).
+    Stopped,
 }
 
 impl From<WaitRole> for clank_core::Role {

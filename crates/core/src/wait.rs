@@ -123,6 +123,22 @@ pub enum WaitItem {
         name: String,
         priority: u16,
     },
+    /// Observer-mode events (`wait --for`, wait-for-observer-mode):
+    /// produced only by the CLI observer path, never by `work_for`.
+    /// Distinct kinds so a consumer can't mistake an observation of a
+    /// foreign repo for its own work items.
+    ForCommit {
+        sha: CommitSha,
+        subject: String,
+    },
+    ForFinished {
+        plan: PlanKey,
+        sha: CommitSha,
+    },
+    ForBlocked {
+        agent: String,
+        name: String,
+    },
     Blocked {
         agent: String,
         name: String,

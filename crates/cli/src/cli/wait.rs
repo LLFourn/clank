@@ -116,6 +116,12 @@ fn firings_from_items(items: &[WaitItem]) -> Vec<HookFiring> {
             | WaitItem::PromoteFromQueue { .. }
             | WaitItem::Blocked { .. }
             | WaitItem::Unblocked { .. }
+            // Observer items never fire hooks: the observer path is
+            // side-effect-free by contract (wait-for-observer-mode)
+            // and never calls firings anyway.
+            | WaitItem::ForCommit { .. }
+            | WaitItem::ForFinished { .. }
+            | WaitItem::ForBlocked { .. }
             // PR-review items surface via the stop-hook's `clank wait`
             // pull (like ad-hoc/queue items) rather than a dedicated
             // proactive OS hook — HookFiring is plan+sha keyed and PR
@@ -133,6 +139,15 @@ pub async fn run(args: WaitArgs) -> anyhow::Result<()> {
     let poll_mode = args.effective_poll();
 
     let repo = resolve_repo(args.repo.as_deref())?;
+
+    // Observer mode (`--for`, wait-for-observer-mode): a pure
+    // cross-repo observer — no identity, no role, no work
+    // projection, no lifecycle hooks. Branches BEFORE identity
+    // resolution: the observed repo has no session binding for the
+    // caller, and --author/--role are deliberately ignored.
+    if let Some(event) = args.r#for {
+        return run_observer(&repo, event, timeout, poll_mode, args.no_cache, args.json).await;
+    }
 
     // Resolve --author via the shared identity resolver when
     // omitted. Same precedence rule as `clank auto`: explicit
@@ -314,34 +329,7 @@ pub async fn run(args: WaitArgs) -> anyhow::Result<()> {
     };
     let deadline = timeout.map(|t| std::time::Instant::now() + t);
     loop {
-        let wait = match deadline {
-            None => tick,
-            Some(end) => match end.checked_duration_since(std::time::Instant::now()) {
-                None => return Err(WaitTimeout.into()),
-                Some(remaining) => remaining.min(tick),
-            },
-        };
-        let event_received = match rx.recv_timeout(wait) {
-            Ok(()) => true,
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                // Could be deadline-expiry or heartbeat-tick. Distinguish.
-                if let Some(end) = deadline {
-                    if std::time::Instant::now() >= end {
-                        return Err(WaitTimeout.into());
-                    }
-                }
-                false
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                anyhow::bail!("filesystem watcher disconnected")
-            }
-        };
-        if event_received {
-            // Debounce: drain bursts so one logical change → one
-            // refold. Only meaningful on the FS-event branch; the
-            // heartbeat tick has nothing to drain.
-            while rx.recv_timeout(Duration::from_millis(200)).is_ok() {}
-        }
+        next_beat(&rx, deadline, tick)?;
         {
             let br = check_blocks(&repo, &author);
             let has_answer = br
@@ -426,6 +414,175 @@ pub async fn run(args: WaitArgs) -> anyhow::Result<()> {
             }
         }
     }
+}
+
+/// One watcher-loop beat, shared by the work loop and the observer
+/// loop: block on the next FS event or heartbeat tick, enforce the
+/// deadline, and debounce event bursts (one logical change → one
+/// refold). `Ok(())` per beat; `Err(WaitTimeout)` on deadline expiry.
+fn next_beat(
+    rx: &mpsc::Receiver<()>,
+    deadline: Option<std::time::Instant>,
+    tick: Duration,
+) -> anyhow::Result<()> {
+    let wait = match deadline {
+        None => tick,
+        Some(end) => match end.checked_duration_since(std::time::Instant::now()) {
+            None => return Err(WaitTimeout.into()),
+            Some(remaining) => remaining.min(tick),
+        },
+    };
+    match rx.recv_timeout(wait) {
+        Ok(()) => {
+            // Debounce: drain bursts. Only meaningful on the FS-event
+            // branch; the heartbeat tick has nothing to drain.
+            while rx.recv_timeout(Duration::from_millis(200)).is_ok() {}
+            Ok(())
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            // Could be deadline-expiry or heartbeat-tick. Distinguish.
+            if let Some(end) = deadline
+                && std::time::Instant::now() >= end
+            {
+                return Err(WaitTimeout.into());
+            }
+            Ok(())
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            anyhow::bail!("filesystem watcher disconnected")
+        }
+    }
+}
+
+/// The `--for` observer loop (wait-for-observer-mode): block until a
+/// repo event lands, as a pure observer — no identity, no role, no
+/// work projection, and (like `--peek`) NO lifecycle side effects.
+/// The baseline is captured synchronously before the watcher loop, so
+/// only events strictly after startup fire; anything landing between
+/// capture and the watcher attaching is caught by the first heartbeat
+/// refold.
+async fn run_observer(
+    repo: &Path,
+    event: crate::cli::WaitFor,
+    timeout: Option<Duration>,
+    poll_mode: bool,
+    no_cache: bool,
+    json: bool,
+) -> anyhow::Result<()> {
+    let policy = if no_cache {
+        crate::rebuild::CachePolicy::Bypass
+    } else {
+        crate::rebuild::CachePolicy::Use
+    };
+    let state = crate::rebuild::rebuild_repo_with_policy(repo, policy)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to fold repo `{}`: {e}", repo.display()))?;
+    let baseline = ObserverBaseline::capture(repo, &state);
+
+    let (tx, rx) = mpsc::channel::<()>();
+    let _watcher = crate::repo_watch::RepoStateWatcher::attach(repo, poll_mode, tx)?;
+    let tick: Duration = if poll_mode {
+        Duration::from_millis(500)
+    } else {
+        Duration::from_millis(1500)
+    };
+    let deadline = timeout.map(|t| std::time::Instant::now() + t);
+    loop {
+        next_beat(&rx, deadline, tick)?;
+        let state = crate::rebuild::rebuild_repo_with_policy(repo, policy)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to fold repo `{}`: {e}", repo.display()))?;
+        let items = observe_events(&baseline, repo, &state, event);
+        if !items.is_empty() {
+            emit(&items, json);
+            return Ok(());
+        }
+    }
+}
+
+/// The observer's delta anchor: repo facts at startup that `--for`
+/// events are measured against. Deliberately NOT
+/// [`StartupSnapshot`]: that one only watches plans active at capture
+/// time, but an observer must fire for a plan that is introduced AND
+/// finalized after it starts.
+struct ObserverBaseline {
+    head: Option<CommitSha>,
+    /// Every (plan, finalize sha) pair already in history.
+    finalized: std::collections::BTreeSet<(PlanKey, CommitSha)>,
+    /// Unanswered (agent, name) blocks already pending.
+    unanswered_blocks: std::collections::BTreeSet<(String, String)>,
+}
+
+impl ObserverBaseline {
+    fn capture(repo: &Path, state: &crate::repo_state::RepoState) -> Self {
+        let finalized = state
+            .fold
+            .finished_plans
+            .iter()
+            .map(|fp| (fp.plan.clone(), fp.finalized_at.clone()))
+            .collect();
+        let unanswered_blocks = scan_blocks(repo)
+            .into_iter()
+            .filter(|b| b.answer.is_none())
+            .map(|b| (b.agent, b.name))
+            .collect();
+        Self {
+            head: state.head.clone(),
+            finalized,
+            unanswered_blocks,
+        }
+    }
+}
+
+/// Project one refold round against the baseline: the observer items
+/// that have occurred since. Empty = keep blocking.
+fn observe_events(
+    baseline: &ObserverBaseline,
+    repo: &Path,
+    state: &crate::repo_state::RepoState,
+    event: crate::cli::WaitFor,
+) -> Vec<WaitItem> {
+    use crate::cli::WaitFor;
+    let mut items = Vec::new();
+    match event {
+        WaitFor::Commit => {
+            if let Some(h) = state.head.as_ref()
+                && baseline.head.as_ref() != Some(h)
+            {
+                let subject = crate::git_io::commit_subject_at(repo, h).unwrap_or_default();
+                items.push(WaitItem::ForCommit {
+                    sha: h.clone(),
+                    subject,
+                });
+            }
+        }
+        WaitFor::Finished | WaitFor::Stopped => {
+            for fp in &state.fold.finished_plans {
+                let key = (fp.plan.clone(), fp.finalized_at.clone());
+                if !baseline.finalized.contains(&key) {
+                    items.push(WaitItem::ForFinished {
+                        plan: fp.plan.clone(),
+                        sha: fp.finalized_at.clone(),
+                    });
+                }
+            }
+            if event == WaitFor::Stopped {
+                for b in scan_blocks(repo) {
+                    if b.answer.is_none()
+                        && !baseline
+                            .unanswered_blocks
+                            .contains(&(b.agent.clone(), b.name.clone()))
+                    {
+                        items.push(WaitItem::ForBlocked {
+                            agent: b.agent,
+                            name: b.name,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    items
 }
 
 /// Check blocks and return (block_items, suppressed_plans). If a
@@ -611,6 +768,16 @@ enum WaitJsonItem<'a> {
     },
     #[serde(rename = "promote_from_queue")]
     PromoteFromQueue { name: &'a str, priority: u16 },
+    #[serde(rename = "for_commit")]
+    ForCommit { sha: &'a str, subject: &'a str },
+    #[serde(rename = "for_finished")]
+    ForFinished {
+        plan: &'a str,
+        plan_path: String,
+        sha: &'a str,
+    },
+    #[serde(rename = "for_blocked")]
+    ForBlocked { agent: &'a str, name: &'a str },
     #[serde(rename = "blocked")]
     Blocked {
         agent: &'a str,
@@ -698,6 +865,16 @@ fn render_json(item: &WaitItem) -> WaitJsonItem<'_> {
             name,
             priority: *priority,
         },
+        WaitItem::ForCommit { sha, subject } => WaitJsonItem::ForCommit {
+            sha: sha.as_str(),
+            subject,
+        },
+        WaitItem::ForFinished { plan, sha } => WaitJsonItem::ForFinished {
+            plan: plan.as_str(),
+            plan_path: plan_path(plan),
+            sha: sha.as_str(),
+        },
+        WaitItem::ForBlocked { agent, name } => WaitJsonItem::ForBlocked { agent, name },
         WaitItem::Blocked {
             agent,
             name,
@@ -816,6 +993,19 @@ fn render_human(item: &WaitItem) -> String {
         }
         WaitItem::PromoteFromQueue { name, priority } => {
             format!("promote  {name}  (priority {priority:03})")
+        }
+        WaitItem::ForCommit { sha, subject } => {
+            format!("for-commit    {}  {subject}", short(sha))
+        }
+        WaitItem::ForFinished { plan, sha } => {
+            format!(
+                "for-finished  {plan}  {sha}",
+                plan = plan.as_str(),
+                sha = short(sha),
+            )
+        }
+        WaitItem::ForBlocked { agent, name } => {
+            format!("for-blocked   {agent}/{name}  (awaiting human)")
         }
         WaitItem::Blocked {
             agent,
@@ -1383,6 +1573,83 @@ mod tests {
         for (got, want) in cases {
             assert_eq!(got, want);
         }
+    }
+
+    // ── wait --for observer items (wait-for-observer-mode) ─────
+
+    #[test]
+    fn observer_items_render_distinct_kinds_and_one_line_humans() {
+        // Distinct for_* kinds so a consumer can't mistake a foreign
+        // observation for its own work items.
+        let commit = WaitItem::ForCommit {
+            sha: sha("abc"),
+            subject: "did things".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(render_json(&commit)).unwrap(),
+            serde_json::json!({
+                "kind": "for_commit",
+                "sha": sha("abc").as_str(),
+                "subject": "did things",
+            })
+        );
+        assert_eq!(
+            render_human(&commit),
+            format!("for-commit    {}  did things", short(&sha("abc")))
+        );
+
+        let fin = WaitItem::ForFinished {
+            plan: PlanKey::parse("foo").unwrap(),
+            sha: sha("abc"),
+        };
+        assert_eq!(
+            serde_json::to_value(render_json(&fin)).unwrap(),
+            serde_json::json!({
+                "kind": "for_finished",
+                "plan": "foo",
+                "plan_path": ".clank/plans/foo.md",
+                "sha": sha("abc").as_str(),
+            })
+        );
+        assert_eq!(
+            render_human(&fin),
+            format!("for-finished  foo  {}", short(&sha("abc")))
+        );
+
+        let blocked = WaitItem::ForBlocked {
+            agent: "codex".into(),
+            name: "q".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(render_json(&blocked)).unwrap(),
+            serde_json::json!({ "kind": "for_blocked", "agent": "codex", "name": "q" })
+        );
+        assert_eq!(
+            render_human(&blocked),
+            "for-blocked   codex/q  (awaiting human)"
+        );
+    }
+
+    #[test]
+    fn observer_items_never_fire_hooks() {
+        // The observer path is side-effect-free by contract; even if
+        // its items ever flowed through the firing projection, they
+        // must map to none.
+        let items = [
+            WaitItem::ForCommit {
+                sha: sha("abc"),
+                subject: "s".into(),
+            },
+            WaitItem::ForFinished {
+                plan: PlanKey::parse("foo").unwrap(),
+                sha: sha("abc"),
+            },
+            WaitItem::ForBlocked {
+                agent: "a".into(),
+                name: "n".into(),
+            },
+        ];
+        assert!(firings_from_items(&items).is_empty());
     }
 
     #[test]
