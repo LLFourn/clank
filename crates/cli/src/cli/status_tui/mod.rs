@@ -1076,11 +1076,15 @@ pub(crate) async fn run_tui(
     // and each agent's status glyph onto its own pane name.
     let mut tab = TabIndicator::new();
     let mut panes = PaneStatus::new();
+    // The ONE owner of roster→pane convergence
+    // (tui-zellij-pane-reconcile): fed after every snapshot build.
+    let mut pane_reconciler = zellij::PaneReconciler::new();
     // Probe the input signature BEFORE the first build so any change
     // racing the build re-builds next wake (under-gate, never over-gate).
     let mut last_sig = crate::cli::status::input_signature(&repo).ok();
     let mut snapshot =
         StatusSnapshot::build_async(&repo, &basename, home.as_deref(), policy, None, true).await?;
+    pane_reconciler.observe(&repo, &snapshot);
     // The log viewport — cursor, derived offset, and the on-demand fetch
     // window. The log grows via fresh, larger windowed rebuilds (the fold
     // replays from a base, so this is re-fetch-bigger, not incremental):
@@ -1890,6 +1894,7 @@ pub(crate) async fn run_tui(
                     true,
                 )
                 .await?;
+                pane_reconciler.observe(&repo, &snapshot);
                 // Restore the user's scroll depth and re-open paging in
                 // case history grew; the loop top tops up the viewport.
                 snapshot.log_rows = crate::cli::status::tui_log_rows(&repo, log.window).await;

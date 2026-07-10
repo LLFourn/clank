@@ -881,6 +881,12 @@ struct ZellijPane {
     is_focused: bool,
     #[serde(default)]
     terminal_command: Option<String>,
+    /// Pane title from `list-panes --json` (verified live: present,
+    /// with any status-emoji prefix). Carries the ROLE the pane was
+    /// titled with (`… (master)` / `… (reviewer)`), which the command
+    /// string does not.
+    #[serde(default)]
+    title: String,
     /// Which tab the pane lives in — `list-panes --json` spans ALL tabs,
     /// so this scopes a relocation to the caller's active tab.
     #[serde(default)]
@@ -912,6 +918,57 @@ fn find_pane_by_command<'a>(panes: &'a [ZellijPane], cmd: &str) -> Option<&'a Ze
     panes
         .iter()
         .find(|p| !p.is_plugin && p.terminal_command.as_deref() == Some(cmd))
+}
+
+/// The agent label a pane runs for `repo_path`, parsed from the exact
+/// `clank agent start <label> --repo <path>` invocation
+/// [`agent_start_command`] composes. `None` for any other command
+/// shape or another repo's agents — the reconciler must only ever see
+/// THIS repo's panes (tui-zellij-pane-reconcile).
+fn agent_pane_label<'a>(pane: &'a ZellijPane, repo_path: &str) -> Option<&'a str> {
+    if pane.is_plugin {
+        return None;
+    }
+    let rest = pane
+        .terminal_command
+        .as_deref()?
+        .strip_prefix("clank agent start ")?;
+    let (label, tail) = rest.split_once(' ')?;
+    (tail == format!("--repo {repo_path}")).then_some(label)
+}
+
+/// Live agent panes for `repo` as `(label, master_titled)` — the
+/// label from the exact launch command, the role from the pane TITLE
+/// (`… (master)` suffix; titles are stamped by the layout and the
+/// promote relocation). The title is what lets a freshly-opened TUI
+/// infer who the STAGE currently belongs to. `None` outside zellij or
+/// when the listing fails (the caller treats that as "don't touch
+/// anything").
+pub(crate) fn live_agent_panes(repo: &Path) -> Option<Vec<(String, bool)>> {
+    std::env::var_os("ZELLIJ")?;
+    let repo_str = repo.to_string_lossy();
+    let panes = list_agent_panes()?;
+    Some(
+        panes
+            .iter()
+            .filter_map(|p| {
+                agent_pane_label(p, &repo_str)
+                    .map(|l| (l.to_owned(), p.title.ends_with(" (master)")))
+            })
+            .collect(),
+    )
+}
+
+/// The pane the USER actually has focused, via `zellij action
+/// list-clients` — unambiguous where per-tab `is_focused` flags are
+/// not (every tab reports one). Used to put focus back after a
+/// focus-stealing reconcile op; `None` on any query/parse failure.
+fn client_focused_pane() -> Option<String> {
+    let out = zellij_action(&["list-clients"])?;
+    let text = String::from_utf8_lossy(&out);
+    // Header line, then one line per client: `CLIENT_ID ZELLIJ_PANE_ID …`.
+    let pane = text.lines().nth(1)?.split_whitespace().nth(1)?;
+    (pane.starts_with("terminal_") || pane.starts_with("plugin_")).then(|| pane.to_string())
 }
 
 /// The first terminal pane running any of `cmds` — used to anchor a new
@@ -1004,12 +1061,21 @@ pub(crate) fn add_reviewer_pane(repo: &Path, label: &str, other_reviewers: &[Str
     if find_pane_by_command(&panes, &agent_start_command(label, &repo_str)).is_some() {
         return;
     }
-    let restore = restore_target(&panes, caller_pane_id().as_deref());
+    // Restore the USER'S focus, not the caller's pane: the reconcile can
+    // run from the status TUI while the user types in some other pane
+    // (tui-zellij-pane-reconcile) — client focus first, caller fallback.
+    let restore =
+        client_focused_pane().or_else(|| restore_target(&panes, caller_pane_id().as_deref()));
     let anchor_cmds: Vec<String> = other_reviewers
         .iter()
         .map(|l| agent_start_command(l, &repo_str))
         .collect();
     let anchor = find_anchor_pane(&panes, &anchor_cmds).map(ZellijPane::pane_id);
+    // Where to focus BEFORE new-pane: the reviewer anchor when a stack
+    // exists; else the caller's own pane, so the new pane still opens in
+    // the REPO's tab even when the user is focused on a different tab
+    // (new-pane targets the focused tab). NOT an anchor for stacking.
+    let focus_first = anchor.clone().or_else(caller_pane_id);
 
     let title = agent_pane_title(label, "reviewer");
     let mut new_pane: Vec<String> = vec![
@@ -1028,8 +1094,8 @@ pub(crate) fn add_reviewer_pane(repo: &Path, label: &str, other_reviewers: &[Str
     new_pane.push("clank".to_string());
     new_pane.extend(agent_start_argv(label, &repo_str));
 
-    if let Some(anchor_id) = &anchor {
-        zellij_action(&["focus-pane-id", anchor_id]);
+    if let Some(id) = &focus_first {
+        zellij_action(&["focus-pane-id", id]);
     }
     let refs: Vec<&str> = new_pane.iter().map(String::as_str).collect();
     zellij_action(&refs);
@@ -1051,13 +1117,14 @@ pub(crate) fn remove_reviewer_pane(repo: &Path, label: &str) {
         return;
     };
     if let Some(pane) = find_pane_by_command(&panes, &agent_start_command(label, &repo_str)) {
+        // Capture the USER'S focus before closing: the reconcile can run
+        // from the status TUI while the user works in another pane
+        // (tui-zellij-pane-reconcile) — client focus first, caller pane
+        // fallback. No-op if the focused pane is the one being closed
+        // (the ref stops resolving).
+        let restore = client_focused_pane().or_else(caller_pane_id);
         zellij_action(&["close-pane", "--pane-id", &pane.pane_id()]);
-        // close-pane can shift focus (notably when the target is in a
-        // different tab than the caller); return focus to the caller's own
-        // pane so `agent remove` from any tab leaves you where you ran it.
-        // No-op if the caller closed its own pane (the ref no longer
-        // resolves).
-        if let Some(id) = caller_pane_id() {
+        if let Some(id) = restore {
             zellij_action(&["focus-pane-id", &id]);
         }
     }
@@ -1262,7 +1329,7 @@ fn pane_command(node: &kdl::KdlNode) -> Option<String> {
 pub(crate) fn relocate_for_promote(
     repo: &Path,
     new_master: &str,
-    old_master: &str,
+    old_master: Option<&str>,
     roster_labels: &[String],
 ) {
     if std::env::var_os("ZELLIJ").is_none() {
@@ -1277,6 +1344,7 @@ pub(crate) fn relocate_for_promote(
     // mis-reads a portrait tab as landscape). Fall back to `term_size` when
     // the caller pane, its tab, or the geometry is unavailable / degenerate.
     let caller_ref = caller_pane_id();
+    let restore = client_focused_pane().or_else(|| caller_ref.clone());
     let term = caller_ref
         .as_deref()
         .and_then(|r| panes.iter().find(|p| p.pane_id() == r).map(|p| p.tab_id))
@@ -1324,7 +1392,18 @@ pub(crate) fn relocate_for_promote(
     // by id (no focus change); the TUI re-adds the status emoji on its next
     // refresh. Best-effort.
     rename_agent_pane(&panes, new_master, &repo_str, "master");
-    rename_agent_pane(&panes, old_master, &repo_str, "reviewer");
+    // No old master (nothing was master-titled — e.g. a whole-team
+    // replacement converging at startup): stage the new one, demote
+    // nobody.
+    if let Some(old) = old_master {
+        rename_agent_pane(&panes, old, &repo_str, "reviewer");
+    }
+    // override-layout can move focus; put it back on the pane the USER
+    // had focused (codex a730882: reconciliation may run from the TUI
+    // while the user types elsewhere — same rule as add/remove).
+    if let Some(id) = restore {
+        zellij_action(&["focus-pane-id", &id]);
+    }
 }
 
 /// Best-effort `rename-pane --pane-id` of the pane running
@@ -1686,6 +1765,44 @@ ttys004   zellij attach clank-foo
             agent_start_command("bob", "/repo"),
             "clank agent start bob --repo /repo"
         );
+    }
+
+    #[test]
+    fn agent_pane_label_parses_only_this_repos_agent_panes() {
+        // tui-zellij-pane-reconcile: the reconciler classifies live
+        // panes by the EXACT command agent_start_command composes —
+        // other repos' agents, plugins, and arbitrary commands with
+        // similar prefixes must all be invisible to it.
+        let pane = |cmd: Option<&str>, is_plugin: bool| ZellijPane {
+            id: 1,
+            is_plugin,
+            is_focused: false,
+            terminal_command: cmd.map(str::to_string),
+            title: String::new(),
+            tab_id: 0,
+            pane_x: 0,
+            pane_y: 0,
+            pane_columns: 0,
+            pane_rows: 0,
+        };
+        let ours = pane(Some("clank agent start bob --repo /repo"), false);
+        assert_eq!(agent_pane_label(&ours, "/repo"), Some("bob"));
+        // Same command shape, different repo → not ours.
+        assert_eq!(agent_pane_label(&ours, "/other"), None);
+        // Extra trailing args break the exact match (deliberate: only
+        // panes we composed count).
+        let extra = pane(Some("clank agent start bob --repo /repo --x"), false);
+        assert_eq!(agent_pane_label(&extra, "/repo"), None);
+        // Plugins and unrelated commands are invisible.
+        assert_eq!(
+            agent_pane_label(
+                &pane(Some("clank agent start bob --repo /repo"), true),
+                "/repo"
+            ),
+            None
+        );
+        assert_eq!(agent_pane_label(&pane(Some("zsh"), false), "/repo"), None);
+        assert_eq!(agent_pane_label(&pane(None, false), "/repo"), None);
     }
 
     // A realistic `list-panes --json --command` (subset of fields per
@@ -2398,6 +2515,80 @@ dead-one [Created 10h ago] (EXITED - attach to resurrect)
         // matching), right up to the cap.
         let at_cap = "x".repeat(SESSION_NAME_MAX - "clank-".len());
         assert_eq!(session_name(&at_cap), format!("clank-{at_cap}"));
+    }
+
+    #[test]
+    fn compose_relocation_requires_the_departing_old_master_in_the_set() {
+        // codex ae6338a: when the old master LEAVES the roster its pane
+        // is still live during the relocation (removes run after the
+        // layout). compose classifies panes against the supplied label
+        // set and skips on any unclassified agent pane — so the caller
+        // must include the departing source, or the relocation
+        // silently no-ops exactly when a team replacement needs it.
+        let panes = panes_from(&[
+            agent_pane(0, "old", false),
+            agent_pane(1, "codex", false),
+            status_pane(2),
+        ]);
+        let without_departing = compose_promote_layout(
+            &panes,
+            Some("terminal_2"),
+            &labels(&["codex"]),
+            "codex",
+            "/a",
+            (200, 50),
+        );
+        assert_eq!(
+            without_departing,
+            PromoteRelayout::Skip,
+            "unclassified live pane → skip (safety rule)"
+        );
+        let with_departing = compose_promote_layout(
+            &panes,
+            Some("terminal_2"),
+            &labels(&["codex", "old"]),
+            "codex",
+            "/a",
+            (200, 50),
+        );
+        assert!(
+            matches!(with_departing, PromoteRelayout::Apply(_)),
+            "departing source classified → relocation applies"
+        );
+    }
+
+    #[test]
+    fn compose_relocation_classifies_departing_reviewers_too() {
+        // codex 8c4906d: a team replacement can have a departing
+        // REVIEWER live during the relocation (removes run after the
+        // layout) alongside a master swap — the classification set
+        // must be roster ∪ every live agent label or compose skips.
+        let panes = panes_from(&[
+            agent_pane(0, "old-master", false),
+            agent_pane(1, "leaving-rev", false),
+            agent_pane(2, "codex", false),
+            status_pane(3),
+        ]);
+        // Roster after the change: codex master, old-master demoted...
+        // without the departing reviewer in the set → Skip.
+        let missing = compose_promote_layout(
+            &panes,
+            Some("terminal_3"),
+            &labels(&["codex", "old-master"]),
+            "codex",
+            "/a",
+            (200, 50),
+        );
+        assert_eq!(missing, PromoteRelayout::Skip);
+        let full = compose_promote_layout(
+            &panes,
+            Some("terminal_3"),
+            &labels(&["codex", "old-master", "leaving-rev"]),
+            "codex",
+            "/a",
+            (200, 50),
+        );
+        assert!(matches!(full, PromoteRelayout::Apply(_)));
     }
 
     // ── agent-promote-zellij-relocation: compose_promote_layout ──

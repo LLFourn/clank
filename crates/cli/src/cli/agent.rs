@@ -693,28 +693,10 @@ fn add(args: AgentAddArgs) -> anyhow::Result<()> {
             add_repo_roster_agent_by_name(&repo, home.as_deref(), &label, role)?;
         }
     }
-    // `agent add` only ever adds a reviewer (master is set via
-    // promote). Best-effort: project it onto the live zellij stack.
-    let other_reviewers = repo_reviewer_labels(&repo, Some(&label));
-    crate::cli::open_zellij::add_reviewer_pane(&repo, label.as_str(), &other_reviewers);
+    // No zellij projection here: the status TUI owns roster→pane
+    // convergence (tui-zellij-pane-reconcile), so this command — like
+    // every other roster write path — is a pure config mutation.
     Ok(())
-}
-
-/// Labels of this repo's reviewers (roster role `commit`/`gate`),
-/// optionally excluding `exclude`. Best-effort (empty on read error) —
-/// used only to anchor a live zellij pane onto the existing stack.
-fn repo_reviewer_labels(repo: &Path, exclude: Option<&AgentLabel>) -> Vec<String> {
-    read_repo_config(repo)
-        .map(|cfg| {
-            cfg.agents
-                .iter()
-                .filter(|(l, a)| {
-                    Some(*l) != exclude && matches!(a.role, RosterRole::Commit | RosterRole::Gate)
-                })
-                .map(|(l, _)| l.as_str().to_string())
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 // ── agent mutation cores ─────────────────────────────────────
@@ -823,45 +805,10 @@ fn promote(args: AgentPromoteArgs) -> anyhow::Result<()> {
     let label = AgentLabel::parse(&args.name)
         .map_err(|e| anyhow::anyhow!("invalid agent label `{}`: {e}", args.name))?;
     let repo = resolve_repo(args.repo.as_deref())?;
-    // Capture the outgoing master BEFORE the flip so the relocation can
-    // title the demoted pane. Best-effort: empty when there was no prior
-    // master or the read fails.
-    let old_master = read_repo_config(&repo)
-        .ok()
-        .and_then(|cfg| current_master_label(&cfg));
     set_repo_master(&repo, &label)?;
-    // Best-effort: project the role flip onto the live zellij layout (new
-    // master → 65% stage, old master → reviewer stack). Never fails promote.
-    if let Some(old_master) = old_master
-        && old_master != args.name
-    {
-        let roster_labels = repo_roster_labels(&repo);
-        crate::cli::open_zellij::relocate_for_promote(
-            &repo,
-            label.as_str(),
-            &old_master,
-            &roster_labels,
-        );
-    }
+    // No zellij relocation here: the status TUI observes the master
+    // swap in the config and re-layouts (tui-zellij-pane-reconcile).
     Ok(())
-}
-
-/// This repo's current master label (the one roster entry with role
-/// `Master`), if any.
-fn current_master_label(cfg: &RepoConfigFile) -> Option<String> {
-    cfg.agents
-        .iter()
-        .find(|(_, a)| a.role == RosterRole::Master)
-        .map(|(l, _)| l.as_str().to_string())
-}
-
-/// Every label on this repo's roster (master + reviewers). Best-effort
-/// (empty on read error) — used to classify live zellij panes for the
-/// promote relocation.
-fn repo_roster_labels(repo: &Path) -> Vec<String> {
-    read_repo_config(repo)
-        .map(|cfg| cfg.agents.keys().map(|l| l.as_str().to_string()).collect())
-        .unwrap_or_default()
 }
 
 /// Set THIS repo's master to `<label>`:
@@ -970,14 +917,9 @@ fn remove(args: AgentRemoveArgs) -> anyhow::Result<()> {
         let repo = resolve_repo(args.repo.as_deref())?;
         // Capture the role BEFORE removal: only a reviewer's pane is in
         // scope (master panes are deliberately left alone).
-        let was_reviewer = read_repo_config(&repo)
-            .ok()
-            .and_then(|cfg| cfg.agents.get(&label).map(|a| a.role))
-            .is_some_and(|r| matches!(r, RosterRole::Commit | RosterRole::Gate));
         remove_repo_agent(&repo, &label)?;
-        if was_reviewer {
-            crate::cli::open_zellij::remove_reviewer_pane(&repo, label.as_str());
-        }
+        // Pane closure moved to the TUI's roster→pane reconciler
+        // (tui-zellij-pane-reconcile).
     }
     Ok(())
 }
