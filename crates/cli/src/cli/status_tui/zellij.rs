@@ -143,6 +143,47 @@ fn parse_agent_panes(list_panes_stdout: &str) -> Vec<(String, String, clank_core
     out
 }
 
+/// Per-refresh retitle data, derived ON THE LOOP (pure — no zellij)
+/// and sent to the worker: each label's status emoji for BOTH possible
+/// pane roles (the pane's actual role comes from the worker's cached
+/// titles), plus the wanted set that justifies a pane-map re-query.
+/// Pane titles have ONE owner — the worker — so these renames can
+/// never race the reconciler's role stamps (codex ff9579f).
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct StatusGlyphs {
+    /// label → (emoji as master, emoji as reviewer).
+    emoji: std::collections::BTreeMap<String, (&'static str, &'static str)>,
+    /// Labels the snapshot wants marked (master + awaited reviewers).
+    wanted: Vec<String>,
+}
+
+impl StatusGlyphs {
+    pub(super) fn of(snap: &StatusSnapshot) -> Self {
+        use clank_core::vocab::Role;
+        let emoji = snap
+            .agents
+            .iter()
+            .map(|a| {
+                (
+                    a.label.clone(),
+                    (
+                        agent_status_emoji(snap, &a.label, Role::Master),
+                        agent_status_emoji(snap, &a.label, Role::Reviewer),
+                    ),
+                )
+            })
+            .collect();
+        let mut wanted: Vec<String> = awaited_reviewers(snap)
+            .iter()
+            .map(|l| l.as_str().to_string())
+            .collect();
+        if let Some(m) = snap.master.as_deref() {
+            wanted.push(m.to_string());
+        }
+        Self { emoji, wanted }
+    }
+}
+
 /// Mirrors each AGENT's status glyph onto its OWN pane name
 /// (tui-agent-pane-status-emoji). The `status --tui` pane already
 /// holds the whole snapshot and can rename any pane by id, so it owns
@@ -166,17 +207,29 @@ pub(super) struct PaneStatus {
 }
 
 impl PaneStatus {
-    pub(super) fn new() -> Option<Self> {
-        std::env::var_os("ZELLIJ").map(|_| Self {
+    /// Lives on the [`ReconcileWorker`] thread (only spawned inside
+    /// zellij), so no env gate here.
+    fn new() -> Self {
+        Self {
             last: std::collections::HashMap::new(),
             panes: Vec::new(),
             primed: false,
             requeried_absent: std::collections::HashSet::new(),
-        })
+        }
     }
 
-    pub(super) fn update(&mut self, snap: &StatusSnapshot) {
-        self.update_with(snap, list_panes, rename_pane);
+    /// The reconciler acted: cached (pane, label, ROLE) rows may name
+    /// pre-relocation roles — drop them so the next retitle pass
+    /// re-lists fresh titles instead of stamping stale roles back
+    /// (codex ff9579f).
+    fn invalidate(&mut self) {
+        self.primed = false;
+        self.requeried_absent.clear();
+        self.last.clear();
+        // Rows must go too: if the required re-list FAILS, update_with
+        // falls through to iterating whatever is here — stale rows
+        // would restamp pre-relocation roles (codex afb6d43).
+        self.panes.clear();
     }
 
     /// Core of [`update`] with the zellij I/O injected, so the caching
@@ -185,7 +238,7 @@ impl PaneStatus {
     /// `rename` only for panes whose title changed.
     fn update_with(
         &mut self,
-        snap: &StatusSnapshot,
+        glyphs: &StatusGlyphs,
         mut list_panes: impl FnMut() -> Option<String>,
         mut rename: impl FnMut(&str, &str),
     ) {
@@ -193,7 +246,7 @@ impl PaneStatus {
         // when the snapshot wants to mark an agent we have no cached
         // pane for (a pane was likely added). Steady state reuses the
         // cache, so no `list-panes` subprocess fires per render.
-        if (!self.primed || self.wants_uncached(snap))
+        if (!self.primed || self.wants_uncached(&glyphs.wanted))
             && let Some(panes) = list_panes()
         {
             self.panes = parse_agent_panes(&panes);
@@ -202,9 +255,9 @@ impl PaneStatus {
             // wanted label that's STILL absent so we don't re-query for
             // it every render.
             self.requeried_absent.clear();
-            for label in self.wanted(snap) {
-                if !self.has_pane(&label) {
-                    self.requeried_absent.insert(label);
+            for label in &glyphs.wanted {
+                if !self.has_pane(label) {
+                    self.requeried_absent.insert(label.clone());
                 }
             }
         }
@@ -213,7 +266,15 @@ impl PaneStatus {
         // borrows disjoint.
         let mut renames: Vec<(String, String)> = Vec::new();
         for (id, label, role) in &self.panes {
-            let emoji = agent_status_emoji(snap, label, *role);
+            // A cached pane whose label the roster no longer knows gets
+            // no glyph — leave it; the reconciler owns its fate.
+            let Some((master, reviewer)) = glyphs.emoji.get(label) else {
+                continue;
+            };
+            let emoji = match role {
+                clank_core::vocab::Role::Master => master,
+                clank_core::vocab::Role::Reviewer => reviewer,
+            };
             let title = format!("{emoji} {}", agent_pane_title(label, role.as_str()));
             if self.last.get(id).map(String::as_str) != Some(title.as_str()) {
                 renames.push((id.clone(), title));
@@ -225,30 +286,16 @@ impl PaneStatus {
         }
     }
 
-    /// Labels the snapshot wants to mark as active: the master and any
-    /// awaited reviewers. (Idle agents that already have a cached pane
-    /// are handled by the cache; this set only drives the re-query.)
-    fn wanted(&self, snap: &StatusSnapshot) -> Vec<String> {
-        let mut v: Vec<String> = awaited_reviewers(snap)
-            .iter()
-            .map(|l| l.as_str().to_string())
-            .collect();
-        if let Some(m) = snap.master.as_deref() {
-            v.push(m.to_string());
-        }
-        v
-    }
-
     fn has_pane(&self, label: &str) -> bool {
         self.panes.iter().any(|(_, l, _)| l == label)
     }
 
     /// A wanted agent has no cached pane and we haven't already given
     /// up re-querying for it — a pane likely appeared since we fetched.
-    fn wants_uncached(&self, snap: &StatusSnapshot) -> bool {
-        self.wanted(snap)
-            .into_iter()
-            .any(|label| !self.has_pane(&label) && !self.requeried_absent.contains(&label))
+    fn wants_uncached(&self, wanted: &[String]) -> bool {
+        wanted
+            .iter()
+            .any(|label| !self.has_pane(label) && !self.requeried_absent.contains(label))
     }
 }
 
@@ -402,27 +449,19 @@ impl PaneReconciler {
         Self { converged: None }
     }
 
-    /// Observe a fresh snapshot; reconcile unless this exact roster
-    /// view was already VERIFIED converged. Cheap in the steady state:
-    /// one set comparison, no zellij calls.
-    pub(super) fn observe(&mut self, repo: &std::path::Path, snap: &StatusSnapshot) {
-        if std::env::var_os("ZELLIJ").is_none() {
-            return;
-        }
-        let mut io = ZellijPaneIo { repo };
-        self.observe_with(snap, &mut io);
-    }
-
-    fn observe_with(&mut self, snap: &StatusSnapshot, io: &mut impl PaneIo) {
-        let cur = RosterView::of(snap);
+    /// One reconciliation pass for `cur`, skipped when that exact view
+    /// was already VERIFIED converged. Cheap in the steady state: one
+    /// set comparison, no zellij calls. Runs on the [`ReconcileWorker`]
+    /// thread, never the TUI loop (tui-reconcile-off-loop).
+    fn reconcile(&mut self, cur: RosterView, io: &mut impl PaneIo) -> bool {
         if self.converged.as_ref() == Some(&cur) {
-            return;
+            return false;
         }
         // Listing failure → touch nothing AND stay unconverged, so the
         // next refresh retries (acting on a partial listing would
         // re-open every pane; forgetting the event would drop it).
         let Some(live) = io.live() else {
-            return;
+            return false;
         };
         let plan = plan_panes(&cur, &live);
         let reviewers: Vec<String> = cur
@@ -453,6 +492,7 @@ impl PaneReconciler {
         // Converged only when a VERIFYING re-list confirms the target
         // state — every action above is best-effort, so observation is
         // not achievement. An already-empty plan needs no second list.
+        let acted = !plan.is_converged();
         let verified = if plan.is_converged() {
             true
         } else {
@@ -462,6 +502,155 @@ impl PaneReconciler {
         if verified {
             self.converged = Some(cur);
         }
+        acted
+    }
+}
+
+/// A message to the reconciliation worker. Both kinds coalesce
+/// independently (latest of each per batch): a roster view triggers a
+/// reconcile pass, glyph data a retitle pass.
+pub(super) enum WorkerMsg {
+    Roster(RosterView),
+    Glyphs(StatusGlyphs),
+}
+
+/// The worker's per-batch state: the reconciler AND the retitler,
+/// co-owned so pane titles have exactly ONE writer and a retitle can
+/// never race a relocation's role stamps (codex ff9579f). A reconcile
+/// pass that issued actions invalidates the retitler's cached
+/// (pane, label, role) rows, so the following retitle re-lists fresh
+/// titles instead of stamping stale roles back.
+struct WorkerState {
+    reconciler: PaneReconciler,
+    panes: PaneStatus,
+    /// The last roster view handled — cached (pane, label, role) rows
+    /// are only trustworthy while the roster TARGET is unchanged.
+    last_roster: Option<RosterView>,
+}
+
+impl WorkerState {
+    fn new() -> Self {
+        Self {
+            reconciler: PaneReconciler::new(),
+            panes: PaneStatus::new(),
+            last_roster: None,
+        }
+    }
+
+    fn handle(
+        &mut self,
+        roster: Option<RosterView>,
+        glyphs: Option<StatusGlyphs>,
+        io: &mut impl PaneIo,
+        list_panes: impl FnMut() -> Option<String>,
+        rename: impl FnMut(&str, &str),
+    ) {
+        if let Some(view) = roster {
+            // Invalidate on any TARGET change, not just on our own
+            // actions: another TUI may already have converged the live
+            // layout (reconcile no-ops), yet our cached rows still
+            // carry the previous roster's roles (codex afb6d43).
+            let changed = self.last_roster.as_ref() != Some(&view);
+            self.last_roster = Some(view.clone());
+            let acted = self.reconciler.reconcile(view, io);
+            if acted || changed {
+                self.panes.invalidate();
+            }
+        }
+        if let Some(g) = glyphs {
+            self.panes.update_with(&g, list_panes, rename);
+        }
+    }
+}
+
+/// The off-loop zellij worker (tui-reconcile-off-loop): owns EVERY
+/// zellij subprocess — reconciliation and retitles; the TUI loop only
+/// sends. One worker serializes passes by construction. Shutdown is
+/// deterministic: dropping the worker closes the channel and JOINS —
+/// declare it BEFORE the alt-screen guard so reverse drop order joins
+/// AFTER the terminal is restored on every exit path, and an
+/// in-flight pass (including its focus restore) always completes. On
+/// disconnect the worker drains what's queued into at most one final
+/// batch, then exits.
+pub(super) struct ReconcileWorker {
+    tx: Option<std::sync::mpsc::Sender<WorkerMsg>>,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ReconcileWorker {
+    /// Spawns the worker — a no-op handle outside zellij (no thread,
+    /// sends go nowhere).
+    pub(super) fn spawn(repo: std::path::PathBuf) -> Self {
+        if std::env::var_os("ZELLIJ").is_none() {
+            return Self {
+                tx: None,
+                join: None,
+            };
+        }
+        let (tx, rx) = std::sync::mpsc::channel::<WorkerMsg>();
+        let join = std::thread::spawn(move || {
+            let mut state = WorkerState::new();
+            let mut io = ZellijPaneIo { repo: &repo };
+            worker_loop(&rx, |roster, glyphs| {
+                state.handle(roster, glyphs, &mut io, list_panes, rename_pane);
+            });
+        });
+        Self {
+            tx: Some(tx),
+            join: Some(join),
+        }
+    }
+
+    /// Hand the worker a fresh snapshot's roster view. Non-blocking:
+    /// microseconds, no subprocesses — safe on the TUI loop.
+    pub(super) fn observe(&self, snap: &StatusSnapshot) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(WorkerMsg::Roster(RosterView::of(snap)));
+        }
+    }
+
+    /// Hand the worker this refresh's retitle data (derived on the
+    /// loop, pure). Non-blocking.
+    pub(super) fn update_glyphs(&self, snap: &StatusSnapshot) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(WorkerMsg::Glyphs(StatusGlyphs::of(snap)));
+        }
+    }
+}
+
+impl Drop for ReconcileWorker {
+    fn drop(&mut self) {
+        self.tx.take();
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+/// The worker's receive loop, generic over the batch handler so the
+/// coalescing contract is testable without zellij
+/// (tui-reconcile-off-loop): messages QUEUED before a batch starts
+/// collapse to the newest OF EACH KIND; arrivals DURING a batch
+/// collapse into exactly one follow-up batch. Exits when the channel
+/// disconnects (after at most one final drained batch).
+fn worker_loop(
+    rx: &std::sync::mpsc::Receiver<WorkerMsg>,
+    mut batch: impl FnMut(Option<RosterView>, Option<StatusGlyphs>),
+) {
+    while let Ok(first) = rx.recv() {
+        let mut roster = None;
+        let mut glyphs = None;
+        match first {
+            WorkerMsg::Roster(v) => roster = Some(v),
+            WorkerMsg::Glyphs(g) => glyphs = Some(g),
+        }
+        while let Ok(m) = rx.try_recv() {
+            match m {
+                WorkerMsg::Roster(v) => roster = Some(v),
+                WorkerMsg::Glyphs(g) => glyphs = Some(g),
+            }
+        }
+        batch(roster, glyphs);
     }
 }
 
@@ -657,7 +846,7 @@ mod tests {
 
         // First observe: listing fails → nothing done, not converged.
         let mut io = FakeIo::new(vec![None]);
-        r.observe_with(&snap, &mut io);
+        r.reconcile(RosterView::of(&snap), &mut io);
         assert!(io.log.is_empty());
         assert_eq!(r.converged, None, "failure must not converge");
 
@@ -667,13 +856,13 @@ mod tests {
             Some(live(&[("claude", true)])),
             Some(live(&[("claude", true), ("codex", false)])),
         ]);
-        r.observe_with(&snap, &mut io);
+        r.reconcile(RosterView::of(&snap), &mut io);
         assert_eq!(io.log, vec!["add codex"]);
         assert!(r.converged.is_some(), "verified pass converges");
 
         // Third observe, same roster: steady state, zero io.
         let mut io = FakeIo::new(vec![]);
-        r.observe_with(&snap, &mut io);
+        r.reconcile(RosterView::of(&snap), &mut io);
         assert!(io.log.is_empty());
     }
 
@@ -686,7 +875,7 @@ mod tests {
         let mut r = PaneReconciler::new();
         let stale = live(&[("claude", true)]);
         let mut io = FakeIo::new(vec![Some(stale.clone()), Some(stale)]);
-        r.observe_with(&snap, &mut io);
+        r.reconcile(RosterView::of(&snap), &mut io);
         assert_eq!(io.log, vec!["add codex"]);
         assert_eq!(r.converged, None);
     }
@@ -703,7 +892,7 @@ mod tests {
         let before = live(&[("old", true), ("codex", false)]);
         let after = live(&[("new-master", true), ("codex", false)]);
         let mut io = FakeIo::new(vec![Some(before), Some(after)]);
-        r.observe_with(&snap, &mut io);
+        r.reconcile(RosterView::of(&snap), &mut io);
         assert_eq!(
             io.log,
             vec![
@@ -725,8 +914,260 @@ mod tests {
         let before = live(&[("old", true), ("codex", false)]);
         let after = live(&[("new-master", false), ("codex", false)]);
         let mut io = FakeIo::new(vec![Some(before), Some(after)]);
-        r.observe_with(&snap, &mut io);
+        r.reconcile(RosterView::of(&snap), &mut io);
         assert_eq!(r.converged, None, "master in the stack is not converged");
+    }
+
+    // ── tui-reconcile-off-loop: worker coalescing + shutdown ────
+
+    #[test]
+    fn worker_coalesces_in_flight_arrivals_into_exactly_one_follow_up() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Barrier, Mutex};
+        let (tx, rx) = std::sync::mpsc::channel();
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let log: Arc<Mutex<Vec<RosterView>>> = Arc::new(Mutex::new(Vec::new()));
+        let (entered2, release2, log2) = (entered.clone(), release.clone(), log.clone());
+        let join = std::thread::spawn(move || {
+            let first = AtomicBool::new(true);
+            worker_loop(&rx, move |roster, _glyphs| {
+                if let Some(v) = roster {
+                    log2.lock().unwrap().push(v);
+                }
+                if first.swap(false, Ordering::SeqCst) {
+                    entered2.wait();
+                    release2.wait();
+                }
+            })
+        });
+        tx.send(WorkerMsg::Roster(view(&["v1"], None))).unwrap();
+        entered.wait(); // the first batch is now provably in-flight
+        // Arrivals DURING the batch: cannot cancel it, must collapse
+        // into exactly ONE follow-up against the newest view.
+        tx.send(WorkerMsg::Roster(view(&["v2"], None))).unwrap();
+        tx.send(WorkerMsg::Roster(view(&["v3"], None))).unwrap();
+        tx.send(WorkerMsg::Roster(view(&["v4"], None))).unwrap();
+        // Disconnect while the batch is STILL blocked: shutdown must
+        // wait for it (and the drained follow-up), not detach.
+        drop(tx);
+        release.wait();
+        join.join().expect("worker joins after the in-flight batch");
+        let log = log.lock().unwrap();
+        assert_eq!(
+            log.as_slice(),
+            &[view(&["v1"], None), view(&["v4"], None)],
+            "the running batch plus exactly one follow-up on the newest"
+        );
+    }
+
+    #[test]
+    fn worker_drains_queued_messages_to_one_final_batch_per_kind() {
+        use std::sync::{Arc, Mutex};
+        // Queue two rosters AND two glyph updates, disconnect before
+        // the worker starts: deterministic — one final batch with the
+        // newest of EACH kind, then exit.
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(WorkerMsg::Roster(view(&["a"], None))).unwrap();
+        tx.send(WorkerMsg::Glyphs(StatusGlyphs {
+            emoji: std::collections::BTreeMap::new(),
+            wanted: vec!["old".into()],
+        }))
+        .unwrap();
+        tx.send(WorkerMsg::Roster(view(&["b"], None))).unwrap();
+        tx.send(WorkerMsg::Glyphs(StatusGlyphs {
+            emoji: std::collections::BTreeMap::new(),
+            wanted: vec!["new".into()],
+        }))
+        .unwrap();
+        drop(tx);
+        let log: Arc<Mutex<Vec<(Option<RosterView>, Option<Vec<String>>)>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let log2 = log.clone();
+        let join = std::thread::spawn(move || {
+            worker_loop(&rx, move |roster, glyphs| {
+                log2.lock()
+                    .unwrap()
+                    .push((roster, glyphs.map(|g| g.wanted)));
+            });
+        });
+        join.join().expect("worker exits when the channel closes");
+        assert_eq!(
+            log.lock().unwrap().as_slice(),
+            &[(Some(view(&["b"], None)), Some(vec!["new".to_string()]))],
+            "one batch, newest of each kind"
+        );
+    }
+
+    #[test]
+    fn retitles_after_a_reconcile_use_fresh_titles_not_cached_roles() {
+        // codex ff9579f: the race this architecture removes — a retitle
+        // with cached PRE-relocation roles landing after the reconciler
+        // stamped new ones. Single owner + invalidation: after an
+        // acting reconcile, the retitle pass re-lists and stamps the
+        // POST-relocation roles.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let mut state = WorkerState::new();
+        // Prime the retitler's cache with PRE-swap titles: claude is
+        // master, codex reviewer.
+        let pre = "terminal_1  terminal  claude (master)\nterminal_2  terminal  codex (reviewer)";
+        let post = "terminal_1  terminal  claude (reviewer)\nterminal_2  terminal  codex (master)";
+        let glyphs = || StatusGlyphs {
+            emoji: [
+                ("claude".to_string(), ("M", "R")),
+                ("codex".to_string(), ("M", "R")),
+            ]
+            .into_iter()
+            .collect(),
+            wanted: vec!["claude".into(), "codex".into()],
+        };
+        let lists = AtomicUsize::new(0);
+        let mut renames: Vec<(String, String)> = Vec::new();
+        state.handle(
+            None,
+            Some(glyphs()),
+            &mut FakeIo::new(vec![]),
+            || {
+                lists.fetch_add(1, Ordering::SeqCst);
+                Some(pre.to_string())
+            },
+            |id, title| renames.push((id.to_string(), title.to_string())),
+        );
+        assert_eq!(lists.load(Ordering::SeqCst), 1, "primed once");
+        renames.clear();
+
+        // A roster batch swaps the master (reconciler acts: relocate),
+        // then the SAME worker retitles: it must re-list (cache
+        // invalidated) and stamp post-swap roles — never the cached
+        // pre-swap ones.
+        let live_post = live(&[("claude", false), ("codex", true)]);
+        state.handle(
+            Some(view(&["claude", "codex"], Some("codex"))),
+            Some(glyphs()),
+            &mut FakeIo::new(vec![
+                Some(live(&[("claude", true), ("codex", false)])),
+                Some(live_post),
+            ]),
+            || {
+                lists.fetch_add(1, Ordering::SeqCst);
+                Some(post.to_string())
+            },
+            |id, title| renames.push((id.to_string(), title.to_string())),
+        );
+        assert_eq!(
+            lists.load(Ordering::SeqCst),
+            2,
+            "acting reconcile invalidates the cache → retitle re-lists"
+        );
+        assert!(
+            renames
+                .iter()
+                .any(|(id, t)| id == "terminal_2" && t.contains("codex (master)")),
+            "post-swap role stamped from fresh titles: {renames:?}"
+        );
+        assert!(
+            !renames.iter().any(|(_, t)| t.contains("codex (reviewer)")),
+            "stale cached role never re-stamped: {renames:?}"
+        );
+    }
+
+    #[test]
+    fn failed_re_list_after_an_acting_reconcile_renames_nothing() {
+        // codex afb6d43: invalidation must clear the cached rows too —
+        // if the required fresh list FAILS, the retitle pass must emit
+        // ZERO renames rather than fall through to stale roles.
+        let mut state = WorkerState::new();
+        let pre = "terminal_1  terminal  claude (master)\nterminal_2  terminal  codex (reviewer)";
+        let glyphs = || StatusGlyphs {
+            emoji: [
+                ("claude".to_string(), ("M", "R")),
+                ("codex".to_string(), ("M", "R")),
+            ]
+            .into_iter()
+            .collect(),
+            wanted: vec!["claude".into(), "codex".into()],
+        };
+        let mut renames: Vec<(String, String)> = Vec::new();
+        state.handle(
+            None,
+            Some(glyphs()),
+            &mut FakeIo::new(vec![]),
+            || Some(pre.to_string()),
+            |id, t| renames.push((id.to_string(), t.to_string())),
+        );
+        renames.clear();
+
+        // Acting reconcile (master swap), then the fresh list FAILS.
+        state.handle(
+            Some(view(&["claude", "codex"], Some("codex"))),
+            Some(glyphs()),
+            &mut FakeIo::new(vec![
+                Some(live(&[("claude", true), ("codex", false)])),
+                Some(live(&[("claude", false), ("codex", true)])),
+            ]),
+            || None,
+            |id, t| renames.push((id.to_string(), t.to_string())),
+        );
+        assert!(
+            renames.is_empty(),
+            "no fresh list → no renames, never stale roles: {renames:?}"
+        );
+    }
+
+    #[test]
+    fn roster_change_invalidates_even_when_another_tui_already_converged() {
+        // codex afb6d43: reconcile can no-op (a second TUI already
+        // converged the live layout) while OUR cache still holds the
+        // previous roster's roles — the glyph pass must re-list, not
+        // rename the correct panes back to old roles.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let mut state = WorkerState::new();
+        let pre = "terminal_1  terminal  claude (master)\nterminal_2  terminal  codex (reviewer)";
+        let post = "terminal_1  terminal  claude (reviewer)\nterminal_2  terminal  codex (master)";
+        let glyphs = || StatusGlyphs {
+            emoji: [
+                ("claude".to_string(), ("M", "R")),
+                ("codex".to_string(), ("M", "R")),
+            ]
+            .into_iter()
+            .collect(),
+            wanted: vec!["claude".into(), "codex".into()],
+        };
+        let lists = AtomicUsize::new(0);
+        let mut renames: Vec<(String, String)> = Vec::new();
+        state.handle(
+            Some(view(&["claude", "codex"], Some("claude"))),
+            Some(glyphs()),
+            &mut FakeIo::new(vec![Some(live(&[("claude", true), ("codex", false)]))]),
+            || {
+                lists.fetch_add(1, Ordering::SeqCst);
+                Some(pre.to_string())
+            },
+            |id, t| renames.push((id.to_string(), t.to_string())),
+        );
+        renames.clear();
+
+        // New roster arrives; the OTHER TUI already converged live
+        // state (plan is empty → reconcile no-ops, acted = false).
+        state.handle(
+            Some(view(&["claude", "codex"], Some("codex"))),
+            Some(glyphs()),
+            &mut FakeIo::new(vec![Some(live(&[("claude", false), ("codex", true)]))]),
+            || {
+                lists.fetch_add(1, Ordering::SeqCst);
+                Some(post.to_string())
+            },
+            |id, t| renames.push((id.to_string(), t.to_string())),
+        );
+        assert_eq!(
+            lists.load(Ordering::SeqCst),
+            2,
+            "roster change re-lists even though reconcile no-oped"
+        );
+        assert!(
+            !renames.iter().any(|(_, t)| t.contains("codex (reviewer)")),
+            "already-correct panes never renamed back to old roles: {renames:?}"
+        );
     }
 
     #[test]
@@ -797,7 +1238,7 @@ terminal_3  terminal  ruthless (reviewer)
         };
         let go = |ps: &mut PaneStatus, s: &StatusSnapshot| {
             ps.update_with(
-                s,
+                &StatusGlyphs::of(s),
                 || {
                     list_calls.set(list_calls.get() + 1);
                     Some(panes_out.to_string())
@@ -810,8 +1251,36 @@ terminal_3  terminal  ruthless (reviewer)
             );
         };
 
+        // Glyph derivation now reads the ROSTER (StatusGlyphs::of), so
+        // the fixture must carry the team: claude master, codex commit.
+        let with_team = |mut s: StatusSnapshot| -> StatusSnapshot {
+            s.agents = vec![
+                crate::cli::status::AgentAutoRow {
+                    label: "claude".into(),
+                    role: crate::cli::teams_config::RosterRole::Master,
+                    auto_mode: clank_core::vocab::AutoMode::On,
+                    tool: "claude".into(),
+                    invocation: "claude".into(),
+                    session: None,
+                },
+                crate::cli::status::AgentAutoRow {
+                    label: "codex".into(),
+                    role: crate::cli::teams_config::RosterRole::Commit,
+                    auto_mode: clank_core::vocab::AutoMode::On,
+                    tool: "codex".into(),
+                    invocation: "codex".into(),
+                    session: None,
+                },
+            ];
+            s.master = Some("claude".into());
+            s
+        };
+
         // First render: one `list-panes`; both agent panes get a title.
-        let awaited = snap(vec![plan_state("p", reviewer_missing("codex"))], vec![]);
+        let awaited = with_team(snap(
+            vec![plan_state("p", reviewer_missing("codex"))],
+            vec![],
+        ));
         go(&mut ps, &awaited);
         assert_eq!(list_calls.get(), 1, "primed with one list-panes");
         let after_first = renames.borrow().len();
@@ -831,7 +1300,10 @@ terminal_3  terminal  ruthless (reviewer)
         // Master's turn instead: the plan's wait state toggles BOTH
         // emojis at once — master 💤→🔨 and codex 👀→💤 — so two panes
         // rename. Still no re-query: both panes are cached.
-        let idle = snap(vec![plan_state("p", WaitingOn::MasterToContinue)], vec![]);
+        let idle = with_team(snap(
+            vec![plan_state("p", WaitingOn::MasterToContinue)],
+            vec![],
+        ));
         go(&mut ps, &idle);
         assert_eq!(list_calls.get(), 1, "no re-query: panes already cached");
         assert_eq!(

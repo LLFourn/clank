@@ -52,7 +52,7 @@ mod scroll;
 use scroll::*;
 
 mod zellij;
-use zellij::{PaneStatus, TabIndicator};
+use zellij::TabIndicator;
 
 #[cfg(test)]
 pub(crate) mod fixtures;
@@ -1032,6 +1032,11 @@ pub(crate) async fn run_tui(
     let (winch_tx, winch_rx) = mpsc::channel::<()>();
     spawn_sigwinch_forwarder(winch_tx)?;
 
+    // Declared BEFORE the alt-screen guard: reverse drop order joins
+    // the worker AFTER the terminal is restored, on every exit path
+    // (tui-reconcile-off-loop).
+    let reconcile_worker = zellij::ReconcileWorker::spawn(repo.clone());
+
     let _guard = AltScreen::enter();
 
     // Merge the watcher (data), SIGWINCH (resize), and stdin (keys) into
@@ -1075,16 +1080,14 @@ pub(crate) async fn run_tui(
     // When inside zellij: mirror the bar's lamp emoji into the tab name,
     // and each agent's status glyph onto its own pane name.
     let mut tab = TabIndicator::new();
-    let mut panes = PaneStatus::new();
-    // The ONE owner of roster→pane convergence
-    // (tui-zellij-pane-reconcile): fed after every snapshot build.
-    let mut pane_reconciler = zellij::PaneReconciler::new();
     // Probe the input signature BEFORE the first build so any change
     // racing the build re-builds next wake (under-gate, never over-gate).
     let mut last_sig = crate::cli::status::input_signature(&repo).ok();
     let mut snapshot =
         StatusSnapshot::build_async(&repo, &basename, home.as_deref(), policy, None, true).await?;
-    pane_reconciler.observe(&repo, &snapshot);
+    // Roster→pane convergence is the worker's job; this is a channel
+    // send, not zellij work (tui-reconcile-off-loop).
+    reconcile_worker.observe(&snapshot);
     // The log viewport — cursor, derived offset, and the on-demand fetch
     // window. The log grows via fresh, larger windowed rebuilds (the fold
     // replays from a base, so this is re-fetch-bigger, not incremental):
@@ -1894,7 +1897,7 @@ pub(crate) async fn run_tui(
                     true,
                 )
                 .await?;
-                pane_reconciler.observe(&repo, &snapshot);
+                reconcile_worker.observe(&snapshot);
                 // Restore the user's scroll depth and re-open paging in
                 // case history grew; the loop top tops up the viewport.
                 snapshot.log_rows = crate::cli::status::tui_log_rows(&repo, log.window).await;
@@ -2018,9 +2021,10 @@ pub(crate) async fn run_tui(
                 if let Some(tab) = tab.as_mut() {
                     tab.update(&bar_emoji(&snapshot));
                 }
-                if let Some(panes) = panes.as_mut() {
-                    panes.update(&snapshot);
-                }
+                // Retitles are the worker's: derive pure glyph data
+                // here, send, never touch zellij on the loop
+                // (tui-reconcile-off-loop).
+                reconcile_worker.update_glyphs(&snapshot);
             }
         }
     }
