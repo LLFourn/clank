@@ -415,13 +415,36 @@ pub(super) fn plan_panes(cur: &RosterView, live: &[(String, bool)]) -> PanePlan 
 
 /// The zellij side effects [`PaneReconciler`] drives, injected so the
 /// convergence logic is testable without spawning zellij
-/// (no-binary-spawning-tests) — same pattern as
-/// [`PaneStatus::update_with`].
+/// (no-binary-spawning-tests). One pass takes ONE snapshot (the
+/// measured-slow `--json` listing) and threads it through every op;
+/// verification reads the cheap `dump-layout` source, falling back to
+/// a fresh snapshot (zellij-one-listing-per-pass). `Snap` is opaque to
+/// the reconciler: the real impl holds raw panes, tests hold pairs.
 pub(super) trait PaneIo {
-    fn live(&mut self) -> Option<Vec<(String, bool)>>;
-    fn add(&mut self, label: &str, other_reviewers: &[String]);
-    fn relocate(&mut self, new_master: &str, old_master: Option<&str>, roster: &[String]);
-    fn remove(&mut self, label: &str);
+    type Snap;
+    fn snapshot(&mut self) -> Option<Self::Snap>;
+    fn pairs(&mut self, snap: &Self::Snap) -> Vec<(String, bool)>;
+    /// Post-action ground truth for convergence recording.
+    fn verify_pairs(&mut self) -> Option<Vec<(String, bool)>>;
+    fn capture_focus(&mut self) -> Option<String>;
+    fn restore_focus(&mut self, id: &str);
+    /// Returns whether a pane was actually created — later adds chain
+    /// their stack-onto-focus off this (codex 4df5f0c).
+    fn add(
+        &mut self,
+        label: &str,
+        other_reviewers: &[String],
+        snap: &Self::Snap,
+        stack_onto_focus: bool,
+    ) -> bool;
+    fn relocate(
+        &mut self,
+        new_master: &str,
+        old_master: Option<&str>,
+        roster: &[String],
+        snap: &Self::Snap,
+    );
+    fn remove_all(&mut self, labels: &[String], snap: &Self::Snap);
 }
 
 /// The real zellij-backed [`PaneIo`].
@@ -430,17 +453,53 @@ struct ZellijPaneIo<'a> {
 }
 
 impl PaneIo for ZellijPaneIo<'_> {
-    fn live(&mut self) -> Option<Vec<(String, bool)>> {
-        crate::cli::open_zellij::live_agent_panes(self.repo)
+    type Snap = Vec<crate::cli::open_zellij::ZellijPane>;
+    fn snapshot(&mut self) -> Option<Self::Snap> {
+        crate::cli::open_zellij::snapshot_panes()
     }
-    fn add(&mut self, label: &str, other_reviewers: &[String]) {
-        crate::cli::open_zellij::add_reviewer_pane(self.repo, label, other_reviewers);
+    fn pairs(&mut self, snap: &Self::Snap) -> Vec<(String, bool)> {
+        crate::cli::open_zellij::agent_pane_pairs(snap, self.repo)
     }
-    fn relocate(&mut self, new_master: &str, old_master: Option<&str>, roster: &[String]) {
-        crate::cli::open_zellij::relocate_for_promote(self.repo, new_master, old_master, roster);
+    fn verify_pairs(&mut self) -> Option<Vec<(String, bool)>> {
+        crate::cli::open_zellij::dump_layout_pairs(self.repo).or_else(|| {
+            let snap = crate::cli::open_zellij::snapshot_panes()?;
+            Some(crate::cli::open_zellij::agent_pane_pairs(&snap, self.repo))
+        })
     }
-    fn remove(&mut self, label: &str) {
-        crate::cli::open_zellij::remove_reviewer_pane(self.repo, label);
+    fn capture_focus(&mut self) -> Option<String> {
+        crate::cli::open_zellij::pass_focus_target()
+    }
+    fn restore_focus(&mut self, id: &str) {
+        crate::cli::open_zellij::focus_pane(id);
+    }
+    fn add(
+        &mut self,
+        label: &str,
+        other_reviewers: &[String],
+        snap: &Self::Snap,
+        stack_onto_focus: bool,
+    ) -> bool {
+        crate::cli::open_zellij::add_reviewer_pane(
+            self.repo,
+            label,
+            other_reviewers,
+            snap,
+            stack_onto_focus,
+        )
+    }
+    fn relocate(
+        &mut self,
+        new_master: &str,
+        old_master: Option<&str>,
+        roster: &[String],
+        snap: &Self::Snap,
+    ) {
+        crate::cli::open_zellij::relocate_for_promote(
+            self.repo, new_master, old_master, roster, snap,
+        );
+    }
+    fn remove_all(&mut self, labels: &[String], snap: &Self::Snap) {
+        crate::cli::open_zellij::remove_reviewer_panes(self.repo, labels, snap);
     }
 }
 
@@ -452,7 +511,8 @@ impl PaneReconciler {
     /// One reconciliation pass for `cur`, skipped when that exact view
     /// was already VERIFIED converged. Cheap in the steady state: one
     /// set comparison, no zellij calls. Runs on the [`ReconcileWorker`]
-    /// thread, never the TUI loop (tui-reconcile-off-loop).
+    /// thread, never the TUI loop (tui-reconcile-off-loop). Returns
+    /// whether the pass issued actions.
     fn reconcile(&mut self, cur: RosterView, io: &mut impl PaneIo) -> bool {
         if self.converged.as_ref() == Some(&cur) {
             return false;
@@ -460,10 +520,19 @@ impl PaneReconciler {
         // Listing failure → touch nothing AND stay unconverged, so the
         // next refresh retries (acting on a partial listing would
         // re-open every pane; forgetting the event would drop it).
-        let Some(live) = io.live() else {
+        let Some(mut snap) = io.snapshot() else {
             return false;
         };
-        let plan = plan_panes(&cur, &live);
+        let plan = plan_panes(&cur, &io.pairs(&snap));
+        if plan.is_converged() {
+            // The listing we just took IS the ground truth: converged.
+            self.converged = Some(cur);
+            return false;
+        }
+        // Pass-level focus transaction: capture the user's focus once
+        // before the first action, restore once after the last
+        // (zellij-one-listing-per-pass).
+        let focus = io.capture_focus();
         let reviewers: Vec<String> = cur
             .labels
             .iter()
@@ -472,37 +541,54 @@ impl PaneReconciler {
             .collect();
         // Adds before the relocate (a swapped-in master may be brand
         // new), removes last.
+        // Later adds stack onto the pane the previous new-pane just
+        // focused — the stale snapshot can't name it (codex 5d498d0) —
+        // but ONLY when that previous add actually created a pane: a
+        // failed new-pane must not let the next add stack onto whatever
+        // is focused (codex 4df5f0c).
+        let mut prev_created = false;
         for label in &plan.add {
-            io.add(label, &reviewers);
+            prev_created = io.add(label, &reviewers, &snap, prev_created);
         }
         if let Some((new_master, old_master)) = &plan.relocate {
+            // Adds the relocation depends on aren't in the pass-start
+            // snapshot (new-pane reports no id; compose skips on an
+            // unclassified/absent master) — refresh ONCE after adds
+            // (codex 631636e). Refresh failure: proceed with the stale
+            // snapshot; compose may skip, verify catches it, the next
+            // refresh retries.
+            if !plan.add.is_empty()
+                && let Some(fresh) = io.snapshot()
+            {
+                snap = fresh;
+            }
             // The relocation's classification set is the union of the
             // desired roster and EVERY live agent label: all departing
             // panes (master or reviewer) are still live here — removes
             // run after the layout — and compose skips on any
             // unclassified live agent pane (codex ae6338a, 8c4906d).
             let mut all: std::collections::BTreeSet<String> = cur.labels.clone();
-            all.extend(live.iter().map(|(l, _)| l.clone()));
+            all.extend(io.pairs(&snap).into_iter().map(|(l, _)| l));
             let all: Vec<String> = all.into_iter().collect();
-            io.relocate(new_master, old_master.as_deref(), &all);
+            io.relocate(new_master, old_master.as_deref(), &all, &snap);
         }
-        for label in &plan.remove {
-            io.remove(label);
+        if !plan.remove.is_empty() {
+            io.remove_all(&plan.remove, &snap);
         }
-        // Converged only when a VERIFYING re-list confirms the target
+        if let Some(id) = &focus {
+            io.restore_focus(id);
+        }
+        // Converged only when a VERIFYING read confirms the target
         // state — every action above is best-effort, so observation is
-        // not achievement. An already-empty plan needs no second list.
-        let acted = !plan.is_converged();
-        let verified = if plan.is_converged() {
-            true
-        } else {
-            io.live()
-                .is_some_and(|after| plan_panes(&cur, &after).is_converged())
-        };
-        if verified {
+        // not achievement. The verify source is the cheap dump-layout
+        // (with a --json fallback inside the io impl).
+        if io
+            .verify_pairs()
+            .is_some_and(|after| plan_panes(&cur, &after).is_converged())
+        {
             self.converged = Some(cur);
         }
-        acted
+        true
     }
 }
 
@@ -778,34 +864,84 @@ mod tests {
         assert!(!plan.is_converged());
     }
 
-    /// Scripted [`PaneIo`]: a queue of `live()` answers + an action log.
+    /// Scripted [`PaneIo`]: queues of `snapshot()`/`verify_pairs()`
+    /// answers, an action log, and call counters for the
+    /// listings-per-pass acceptance (zellij-one-listing-per-pass).
     struct FakeIo {
-        lives: std::collections::VecDeque<Option<Vec<(String, bool)>>>,
+        snaps: std::collections::VecDeque<Option<Vec<(String, bool)>>>,
+        verifies: std::collections::VecDeque<Option<Vec<(String, bool)>>>,
         log: Vec<String>,
+        snapshots_taken: usize,
+        verifies_taken: usize,
+        focus_captures: usize,
+        /// Scripted per-add creation results (default: created).
+        add_results: std::collections::VecDeque<bool>,
     }
 
     impl FakeIo {
-        fn new(lives: Vec<Option<Vec<(String, bool)>>>) -> Self {
+        fn new(snaps: Vec<Option<Vec<(String, bool)>>>) -> Self {
+            Self::with_verify(snaps, vec![])
+        }
+
+        fn with_verify(
+            snaps: Vec<Option<Vec<(String, bool)>>>,
+            verifies: Vec<Option<Vec<(String, bool)>>>,
+        ) -> Self {
             Self {
-                lives: lives.into(),
+                snaps: snaps.into(),
+                verifies: verifies.into(),
                 log: Vec::new(),
+                snapshots_taken: 0,
+                verifies_taken: 0,
+                focus_captures: 0,
+                add_results: std::collections::VecDeque::new(),
             }
         }
     }
 
     impl PaneIo for FakeIo {
-        fn live(&mut self) -> Option<Vec<(String, bool)>> {
-            self.lives.pop_front().unwrap_or(None)
+        type Snap = Vec<(String, bool)>;
+        fn snapshot(&mut self) -> Option<Self::Snap> {
+            self.snapshots_taken += 1;
+            self.snaps.pop_front().unwrap_or(None)
         }
-        fn add(&mut self, label: &str, _other: &[String]) {
-            self.log.push(format!("add {label}"));
+        fn pairs(&mut self, snap: &Self::Snap) -> Vec<(String, bool)> {
+            snap.clone()
         }
-        fn relocate(&mut self, new_master: &str, old_master: Option<&str>, _roster: &[String]) {
+        fn verify_pairs(&mut self) -> Option<Vec<(String, bool)>> {
+            self.verifies_taken += 1;
+            self.verifies.pop_front().unwrap_or(None)
+        }
+        fn capture_focus(&mut self) -> Option<String> {
+            self.focus_captures += 1;
+            Some("user_pane".to_string())
+        }
+        fn restore_focus(&mut self, id: &str) {
+            self.log.push(format!("focus {id}"));
+        }
+        fn add(
+            &mut self,
+            label: &str,
+            _other: &[String],
+            _snap: &Self::Snap,
+            stack_onto_focus: bool,
+        ) -> bool {
+            let suffix = if stack_onto_focus { " (stacked)" } else { "" };
+            self.log.push(format!("add {label}{suffix}"));
+            self.add_results.pop_front().unwrap_or(true)
+        }
+        fn relocate(
+            &mut self,
+            new_master: &str,
+            old_master: Option<&str>,
+            _roster: &[String],
+            _snap: &Self::Snap,
+        ) {
             self.log
                 .push(format!("relocate {new_master}<-{old_master:?}"));
         }
-        fn remove(&mut self, label: &str) {
-            self.log.push(format!("remove {label}"));
+        fn remove_all(&mut self, labels: &[String], _snap: &Self::Snap) {
+            self.log.push(format!("remove {}", labels.join("+")));
         }
     }
 
@@ -851,13 +987,14 @@ mod tests {
         assert_eq!(r.converged, None, "failure must not converge");
 
         // Second observe, same roster: retries; the pass runs (codex
-        // pane missing → add) and the verify re-list confirms.
-        let mut io = FakeIo::new(vec![
-            Some(live(&[("claude", true)])),
-            Some(live(&[("claude", true), ("codex", false)])),
-        ]);
+        // pane missing → add) and the dump-layout verify confirms.
+        let mut io = FakeIo::with_verify(
+            vec![Some(live(&[("claude", true)]))],
+            vec![Some(live(&[("claude", true), ("codex", false)]))],
+        );
         r.reconcile(RosterView::of(&snap), &mut io);
-        assert_eq!(io.log, vec!["add codex"]);
+        assert_eq!(io.log, vec!["add codex", "focus user_pane"]);
+        assert_eq!((io.snapshots_taken, io.verifies_taken), (1, 1));
         assert!(r.converged.is_some(), "verified pass converges");
 
         // Third observe, same roster: steady state, zero io.
@@ -874,9 +1011,9 @@ mod tests {
         let snap = roster_snap(&[("claude", true), ("codex", false)]);
         let mut r = PaneReconciler::new();
         let stale = live(&[("claude", true)]);
-        let mut io = FakeIo::new(vec![Some(stale.clone()), Some(stale)]);
+        let mut io = FakeIo::with_verify(vec![Some(stale.clone())], vec![Some(stale)]);
         r.reconcile(RosterView::of(&snap), &mut io);
-        assert_eq!(io.log, vec!["add codex"]);
+        assert_eq!(io.log, vec!["add codex", "focus user_pane"]);
         assert_eq!(r.converged, None);
     }
 
@@ -890,15 +1027,21 @@ mod tests {
         let snap = roster_snap(&[("new-master", true), ("codex", false)]);
         let mut r = PaneReconciler::new();
         let before = live(&[("old", true), ("codex", false)]);
+        let after_add = live(&[("old", true), ("codex", false), ("new-master", false)]);
         let after = live(&[("new-master", true), ("codex", false)]);
-        let mut io = FakeIo::new(vec![Some(before), Some(after)]);
+        // Adds feed the relocation → the pass refreshes the snapshot
+        // once after the adds (codex 631636e): TWO snapshots, one
+        // dump-layout verify.
+        let mut io = FakeIo::with_verify(vec![Some(before), Some(after_add)], vec![Some(after)]);
         r.reconcile(RosterView::of(&snap), &mut io);
+        assert_eq!((io.snapshots_taken, io.verifies_taken), (2, 1));
         assert_eq!(
             io.log,
             vec![
                 "add new-master",
                 "relocate new-master<-Some(\"old\")",
-                "remove old"
+                "remove old",
+                "focus user_pane"
             ]
         );
         assert!(r.converged.is_some());
@@ -913,9 +1056,71 @@ mod tests {
         let mut r = PaneReconciler::new();
         let before = live(&[("old", true), ("codex", false)]);
         let after = live(&[("new-master", false), ("codex", false)]);
-        let mut io = FakeIo::new(vec![Some(before), Some(after)]);
+        let mut io =
+            FakeIo::with_verify(vec![Some(before.clone()), Some(before)], vec![Some(after)]);
         r.reconcile(RosterView::of(&snap), &mut io);
         assert_eq!(r.converged, None, "master in the stack is not converged");
+    }
+
+    #[test]
+    fn promote_shaped_pass_takes_one_snapshot_one_verify_one_focus() {
+        // zellij-one-listing-per-pass: all panes pre-exist — the pass
+        // must cost exactly ONE --json snapshot, ONE dump-layout
+        // verify, and ONE focus capture/restore transaction.
+        let snap = roster_snap(&[("codex", true), ("claude", false)]);
+        let mut r = PaneReconciler::new();
+        let before = live(&[("claude", true), ("codex", false)]);
+        let after = live(&[("claude", false), ("codex", true)]);
+        let mut io = FakeIo::with_verify(vec![Some(before)], vec![Some(after)]);
+        r.reconcile(RosterView::of(&snap), &mut io);
+        assert_eq!(
+            (io.snapshots_taken, io.verifies_taken, io.focus_captures),
+            (1, 1, 1)
+        );
+        assert_eq!(
+            io.log,
+            vec!["relocate codex<-Some(\"claude\")", "focus user_pane"]
+        );
+        assert!(r.converged.is_some());
+    }
+
+    #[test]
+    fn converged_at_start_pass_takes_one_snapshot_and_nothing_else() {
+        // The pass-start listing IS ground truth when the plan is
+        // empty: record convergence with no verify, no focus, no ops.
+        let snap = roster_snap(&[("claude", true), ("codex", false)]);
+        let mut r = PaneReconciler::new();
+        let mut io = FakeIo::new(vec![Some(live(&[("claude", true), ("codex", false)]))]);
+        r.reconcile(RosterView::of(&snap), &mut io);
+        assert_eq!(
+            (io.snapshots_taken, io.verifies_taken, io.focus_captures),
+            (1, 0, 0)
+        );
+        assert!(io.log.is_empty());
+        assert!(r.converged.is_some());
+    }
+
+    #[test]
+    fn later_adds_stack_only_after_a_successful_creation() {
+        // codex 4df5f0c: multi-add chaining. Success path: add #2
+        // stacks onto the pane add #1 just created and focused.
+        let snap = roster_snap(&[("claude", true), ("r1", false), ("r2", false)]);
+        let mut r = PaneReconciler::new();
+        let before = live(&[("claude", true)]);
+        let mut io = FakeIo::with_verify(vec![Some(before.clone())], vec![None]);
+        r.reconcile(RosterView::of(&snap), &mut io);
+        assert_eq!(
+            io.log,
+            vec!["add r1", "add r2 (stacked)", "focus user_pane"]
+        );
+
+        // Failure path: add #1's new-pane fails → add #2 must NOT
+        // stack onto whatever happens to be focused.
+        let mut r = PaneReconciler::new();
+        let mut io = FakeIo::with_verify(vec![Some(before)], vec![None]);
+        io.add_results = vec![false].into();
+        r.reconcile(RosterView::of(&snap), &mut io);
+        assert_eq!(io.log, vec!["add r1", "add r2", "focus user_pane"]);
     }
 
     // ── tui-reconcile-off-loop: worker coalescing + shutdown ────

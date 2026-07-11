@@ -873,12 +873,10 @@ fn agent_start_command(label: &str, repo_path: &str) -> String {
 /// Subset of a `zellij action list-panes --json --command` element.
 /// Extra fields are ignored (serde skips unknown keys by default).
 #[derive(Debug, serde::Deserialize)]
-struct ZellijPane {
+pub(crate) struct ZellijPane {
     id: u32,
     #[serde(default)]
     is_plugin: bool,
-    #[serde(default)]
-    is_focused: bool,
     #[serde(default)]
     terminal_command: Option<String>,
     /// Pane title from `list-panes --json` (verified live: present,
@@ -937,33 +935,104 @@ fn agent_pane_label<'a>(pane: &'a ZellijPane, repo_path: &str) -> Option<&'a str
     (tail == format!("--repo {repo_path}")).then_some(label)
 }
 
-/// Live agent panes for `repo` as `(label, master_titled)` — the
-/// label from the exact launch command, the role from the pane TITLE
-/// (`… (master)` suffix; titles are stamped by the layout and the
-/// promote relocation). The title is what lets a freshly-opened TUI
-/// infer who the STAGE currently belongs to. `None` outside zellij or
-/// when the listing fails (the caller treats that as "don't touch
-/// anything").
-pub(crate) fn live_agent_panes(repo: &Path) -> Option<Vec<(String, bool)>> {
+/// One `--json` pane listing for a whole reconcile pass
+/// (zellij-one-listing-per-pass: this call is the measured ~1.1s unit,
+/// so the worker takes it ONCE and threads it through the primitives).
+/// `None` outside zellij or on failure.
+pub(crate) fn snapshot_panes() -> Option<Vec<ZellijPane>> {
     std::env::var_os("ZELLIJ")?;
+    list_agent_panes()
+}
+
+/// Project a pane listing to this repo's agents as
+/// `(label, master_titled)` — the label from the exact launch command,
+/// the role from the pane TITLE (`… (master)` suffix; titles are
+/// stamped by the layout and the promote relocation). Pure.
+pub(crate) fn agent_pane_pairs(panes: &[ZellijPane], repo: &Path) -> Vec<(String, bool)> {
     let repo_str = repo.to_string_lossy();
-    let panes = list_agent_panes()?;
-    Some(
-        panes
-            .iter()
-            .filter_map(|p| {
-                agent_pane_label(p, &repo_str)
-                    .map(|l| (l.to_owned(), p.title.ends_with(" (master)")))
-            })
-            .collect(),
-    )
+    panes
+        .iter()
+        .filter_map(|p| {
+            agent_pane_label(p, &repo_str).map(|l| (l.to_owned(), p.title.ends_with(" (master)")))
+        })
+        .collect()
+}
+
+/// `(label, master_titled)` pairs from `zellij action dump-layout` —
+/// the CHEAP verification source (measured 0.12s vs the 1.1s `--json`
+/// listing): the KDL carries each pane's command/args (the exact
+/// repo-scoped agent-start invocation) and its name (the role title).
+/// `None` outside zellij or on query failure — the caller falls back
+/// to the `--json` listing (correctness over speed).
+pub(crate) fn dump_layout_pairs(repo: &Path) -> Option<Vec<(String, bool)>> {
+    std::env::var_os("ZELLIJ")?;
+    let out = zellij_action(&["dump-layout"])?;
+    parse_dump_layout_pairs(&String::from_utf8_lossy(&out), &repo.to_string_lossy())
+}
+
+/// Structural parse for [`dump_layout_pairs`] (codex 4df5f0c: a real
+/// KDL parse, not a line scan): an agent pane is any `pane` node with
+/// `command="clank"`, a `name`, and an `args` child whose positional
+/// values are exactly `agent start <label> --repo <repo>`. Parse
+/// failure → `None` (the caller falls back to the `--json` listing);
+/// a well-formed layout with no agent panes is `Some(vec![])` — a
+/// real answer. Escaping comes free from the KDL parser.
+fn parse_dump_layout_pairs(kdl_text: &str, repo_path: &str) -> Option<Vec<(String, bool)>> {
+    let doc: kdl::KdlDocument = kdl_text.parse().ok()?;
+    let mut out = Vec::new();
+    collect_agent_panes(&doc, repo_path, &mut out);
+    Some(out)
+}
+
+fn collect_agent_panes(doc: &kdl::KdlDocument, repo_path: &str, out: &mut Vec<(String, bool)>) {
+    for node in doc.nodes() {
+        if node.name().value() == "pane"
+            && node.get("command").and_then(|e| e.value().as_string()) == Some("clank")
+            && let Some(name) = node.get("name").and_then(|e| e.value().as_string())
+            && let Some(args) = node.children().and_then(|c| c.get("args"))
+        {
+            let vals: Vec<&str> = args
+                .entries()
+                .iter()
+                .filter(|e| e.name().is_none())
+                .filter_map(|e| e.value().as_string())
+                .collect();
+            if let ["agent", "start", label, "--repo", repo] = vals.as_slice()
+                && *repo == repo_path
+            {
+                out.push((label.to_string(), name.ends_with(" (master)")));
+            }
+        }
+        if let Some(children) = node.children() {
+            collect_agent_panes(children, repo_path, out);
+        }
+    }
 }
 
 /// The pane the USER actually has focused, via `zellij action
 /// list-clients` — unambiguous where per-tab `is_focused` flags are
 /// not (every tab reports one). Used to put focus back after a
 /// focus-stealing reconcile op; `None` on any query/parse failure.
-fn client_focused_pane() -> Option<String> {
+/// Pass-level focus restore (zellij-one-listing-per-pass): the worker
+/// captures once before its first action and restores once after the
+/// last, replacing the old per-op capture/restore.
+pub(crate) fn focus_pane(id: &str) {
+    zellij_action(&["focus-pane-id", id]);
+}
+
+/// The pass's focus-restore target: the pane the USER has focused,
+/// falling back to the caller's own pane when `list-clients` fails —
+/// the fallback the old per-op restores had (codex 5d498d0). Pure
+/// composition split out for testing.
+pub(crate) fn pass_focus_target() -> Option<String> {
+    focus_target_from(client_focused_pane(), caller_pane_id())
+}
+
+fn focus_target_from(client: Option<String>, caller: Option<String>) -> Option<String> {
+    client.or(caller)
+}
+
+pub(crate) fn client_focused_pane() -> Option<String> {
     let out = zellij_action(&["list-clients"])?;
     let text = String::from_utf8_lossy(&out);
     // Header line, then one line per client: `CLIENT_ID ZELLIJ_PANE_ID …`.
@@ -983,10 +1052,6 @@ fn find_anchor_pane<'a>(panes: &'a [ZellijPane], cmds: &[String]) -> Option<&'a 
     })
 }
 
-fn focused_pane_id(panes: &[ZellijPane]) -> Option<String> {
-    panes.iter().find(|p| p.is_focused).map(ZellijPane::pane_id)
-}
-
 /// The pane the current clank process runs in, identified authoritatively
 /// from the `ZELLIJ_PANE_ID` env var zellij sets per-pane. A clank command
 /// always runs in a terminal pane (never the plugin pane that can share
@@ -994,18 +1059,6 @@ fn focused_pane_id(panes: &[ZellijPane]) -> Option<String> {
 fn caller_pane_id() -> Option<String> {
     let id = std::env::var("ZELLIJ_PANE_ID").ok()?;
     (!id.is_empty()).then(|| format!("terminal_{id}"))
-}
-
-/// Where to return focus after a focus-stealing zellij op. Prefer the
-/// caller's own pane (`caller_id`, authoritative across tabs); fall back to
-/// the first focused pane in the listing only when the caller is unknown —
-/// that scan is ambiguous in a multi-tab session (each tab reports its own
-/// `is_focused` pane, so the first in listing order is whichever tab comes
-/// first, not necessarily the caller's) and is correct only single-tab.
-fn restore_target(panes: &[ZellijPane], caller_id: Option<&str>) -> Option<String> {
-    caller_id
-        .map(str::to_owned)
-        .or_else(|| focused_pane_id(panes))
 }
 
 /// Run `zellij action <args>`, swallowing output and errors. Best-effort
@@ -1044,33 +1097,46 @@ fn tab_dims(panes: &[ZellijPane], tab_id: u32) -> (u16, u16) {
     (cols, rows)
 }
 
-/// Best-effort: inside a zellij session, open a pane for a newly-added
-/// reviewer in the current reviewer stack. `repo` is the absolute repo
-/// path (it must match the pane's `--repo`); `other_reviewers` are the
-/// repo's OTHER reviewer labels, used to anchor onto the existing stack.
-/// No-op outside zellij, on any zellij failure, or if the pane already
-/// exists (idempotent).
-pub(crate) fn add_reviewer_pane(repo: &Path, label: &str, other_reviewers: &[String]) {
-    if std::env::var_os("ZELLIJ").is_none() {
-        return;
-    }
+/// Best-effort: open a pane for a newly-added reviewer in the current
+/// reviewer stack, working from the pass's shared `panes` listing
+/// (zellij-one-listing-per-pass — no internal re-list, no per-op focus
+/// restore; the worker owns the pass-level focus transaction).
+/// Idempotent: no-op if the pane already exists in the listing.
+pub(crate) fn add_reviewer_pane(
+    repo: &Path,
+    label: &str,
+    other_reviewers: &[String],
+    panes: &[ZellijPane],
+    stack_onto_focus: bool,
+) -> bool {
     let repo_str = repo.to_string_lossy();
-    let Some(panes) = list_agent_panes() else {
-        return;
-    };
-    if find_pane_by_command(&panes, &agent_start_command(label, &repo_str)).is_some() {
-        return;
+    if find_pane_by_command(panes, &agent_start_command(label, &repo_str)).is_some() {
+        return false;
     }
-    // Restore the USER'S focus, not the caller's pane: the reconcile can
-    // run from the status TUI while the user types in some other pane
-    // (tui-zellij-pane-reconcile) — client focus first, caller fallback.
-    let restore =
-        client_focused_pane().or_else(|| restore_target(&panes, caller_pane_id().as_deref()));
+    // A later add in the same pass (codex 5d498d0): the previous
+    // new-pane left focus ON the pane it created — a stack member the
+    // stale snapshot can't name — so stack onto the current focus and
+    // skip the snapshot-based anchoring entirely.
+    if stack_onto_focus {
+        let mut new_pane: Vec<String> = vec![
+            "new-pane".to_string(),
+            "--name".to_string(),
+            agent_pane_title(label, "reviewer"),
+            "--cwd".to_string(),
+            repo_str.to_string(),
+            "--stacked".to_string(),
+            "--".to_string(),
+            "clank".to_string(),
+        ];
+        new_pane.extend(agent_start_argv(label, &repo_str));
+        let refs: Vec<&str> = new_pane.iter().map(String::as_str).collect();
+        return zellij_action(&refs).is_some();
+    }
     let anchor_cmds: Vec<String> = other_reviewers
         .iter()
         .map(|l| agent_start_command(l, &repo_str))
         .collect();
-    let anchor = find_anchor_pane(&panes, &anchor_cmds).map(ZellijPane::pane_id);
+    let anchor = find_anchor_pane(panes, &anchor_cmds).map(ZellijPane::pane_id);
     // Where to focus BEFORE new-pane: the reviewer anchor when a stack
     // exists; else the caller's own pane, so the new pane still opens in
     // the REPO's tab even when the user is focused on a different tab
@@ -1098,36 +1164,48 @@ pub(crate) fn add_reviewer_pane(repo: &Path, label: &str, other_reviewers: &[Str
         zellij_action(&["focus-pane-id", id]);
     }
     let refs: Vec<&str> = new_pane.iter().map(String::as_str).collect();
-    zellij_action(&refs);
-    // new-pane steals focus; return it to where the caller was.
-    if let Some(id) = restore {
-        zellij_action(&["focus-pane-id", &id]);
+    // Report whether the pane was actually created: the caller chains
+    // later stacked adds off THIS success — a failed new-pane must not
+    // let the next add stack onto whatever happens to be focused
+    // (codex 4df5f0c).
+    zellij_action(&refs).is_some()
+}
+
+/// Best-effort: close the panes of removed reviewers, matched by exact
+/// launch command in the pass's shared listing. `labels` is a MULTISET
+/// — duplicate entries close DISTINCT panes (the duplicate-pane plan
+/// entries; codex 5d498d0). Closing kills each pane's process tree —
+/// that is the agent-exit guarantee. Focus restoration is the worker's
+/// pass-level transaction.
+pub(crate) fn remove_reviewer_panes(repo: &Path, labels: &[String], panes: &[ZellijPane]) {
+    for id in remove_target_ids(labels, panes, &repo.to_string_lossy()) {
+        zellij_action(&["close-pane", "--pane-id", &id]);
     }
 }
 
-/// Best-effort: inside a zellij session, close the pane of a just-removed
-/// reviewer, matched by its exact launch command. No-op outside zellij,
-/// on any failure, or if no pane matches.
-pub(crate) fn remove_reviewer_pane(repo: &Path, label: &str) {
-    if std::env::var_os("ZELLIJ").is_none() {
-        return;
+/// The DISTINCT pane ids the remove multiset resolves to: each label
+/// occurrence consumes one matching pane, so duplicate labels map to
+/// different panes (codex 4df5f0c). Pure.
+fn remove_target_ids(labels: &[String], panes: &[ZellijPane], repo_path: &str) -> Vec<String> {
+    let mut budget: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    for l in labels {
+        *budget.entry(l.as_str()).or_default() += 1;
     }
-    let repo_str = repo.to_string_lossy();
-    let Some(panes) = list_agent_panes() else {
-        return;
-    };
-    if let Some(pane) = find_pane_by_command(&panes, &agent_start_command(label, &repo_str)) {
-        // Capture the USER'S focus before closing: the reconcile can run
-        // from the status TUI while the user works in another pane
-        // (tui-zellij-pane-reconcile) — client focus first, caller pane
-        // fallback. No-op if the focused pane is the one being closed
-        // (the ref stops resolving).
-        let restore = client_focused_pane().or_else(caller_pane_id);
-        zellij_action(&["close-pane", "--pane-id", &pane.pane_id()]);
-        if let Some(id) = restore {
-            zellij_action(&["focus-pane-id", &id]);
+    let mut ids = Vec::new();
+    for pane in panes {
+        let Some(label) = agent_pane_label(pane, repo_path) else {
+            continue;
+        };
+        let Some(n) = budget.get_mut(label) else {
+            continue;
+        };
+        if *n == 0 {
+            continue;
         }
+        *n -= 1;
+        ids.push(pane.pane_id());
     }
+    ids
 }
 
 /// Outcome of [`compose_promote_layout`]: a ready-to-apply layout KDL, or
@@ -1331,31 +1409,25 @@ pub(crate) fn relocate_for_promote(
     new_master: &str,
     old_master: Option<&str>,
     roster_labels: &[String],
+    panes: &[ZellijPane],
 ) {
-    if std::env::var_os("ZELLIJ").is_none() {
-        return;
-    }
     let repo_str = repo.to_string_lossy().into_owned();
-    let Some(panes) = list_agent_panes() else {
-        return;
-    };
     // Orientation comes from the caller tab's full extent (what `clank open`
     // sees), not `term_size()` (the caller's own pane = the 65% stage, which
     // mis-reads a portrait tab as landscape). Fall back to `term_size` when
     // the caller pane, its tab, or the geometry is unavailable / degenerate.
     let caller_ref = caller_pane_id();
-    let restore = client_focused_pane().or_else(|| caller_ref.clone());
     let term = caller_ref
         .as_deref()
         .and_then(|r| panes.iter().find(|p| p.pane_id() == r).map(|p| p.tab_id))
-        .map(|tab_id| tab_dims(&panes, tab_id))
+        .map(|tab_id| tab_dims(panes, tab_id))
         .filter(|(cols, rows)| *cols != 0 && *rows != 0)
         .unwrap_or_else(|| {
             let (rows, cols) = crate::cli::term::term_size();
             (cols, rows)
         });
     let kdl = match compose_promote_layout(
-        &panes,
+        panes,
         caller_ref.as_deref(),
         roster_labels,
         new_master,
@@ -1391,19 +1463,15 @@ pub(crate) fn relocate_for_promote(
     // the TUI re-affirm the OLD role forever. `rename-pane --pane-id` targets
     // by id (no focus change); the TUI re-adds the status emoji on its next
     // refresh. Best-effort.
-    rename_agent_pane(&panes, new_master, &repo_str, "master");
+    rename_agent_pane(panes, new_master, &repo_str, "master");
     // No old master (nothing was master-titled — e.g. a whole-team
     // replacement converging at startup): stage the new one, demote
     // nobody.
     if let Some(old) = old_master {
-        rename_agent_pane(&panes, old, &repo_str, "reviewer");
+        rename_agent_pane(panes, old, &repo_str, "reviewer");
     }
-    // override-layout can move focus; put it back on the pane the USER
-    // had focused (codex a730882: reconciliation may run from the TUI
-    // while the user types elsewhere — same rule as add/remove).
-    if let Some(id) = restore {
-        zellij_action(&["focus-pane-id", &id]);
-    }
+    // Focus restoration is the worker's pass-level transaction
+    // (zellij-one-listing-per-pass).
 }
 
 /// Best-effort `rename-pane --pane-id` of the pane running
@@ -1768,6 +1836,129 @@ ttys004   zellij attach clank-foo
     }
 
     #[test]
+    fn dump_layout_pairs_parse_the_real_kdl_shape() {
+        // Trimmed from a LIVE `zellij action dump-layout` (2026-07-11):
+        // emoji-prefixed names, clank agent-start panes, a status pane,
+        // and a codex pane running the RESOLVED tool binary directly —
+        // the latter is (deliberately, for now) invisible to the
+        // matcher, exactly as it is to the --json listing's
+        // exact-command match, so listing and verify stay consistent.
+        let kdl = r#"layout {
+    cwd "/Users/llfourn/src"
+    tab name="🔨 clank" hide_floating_panes=true {
+        pane size=1 borderless=true {
+            plugin location="zellij:tab-bar"
+        }
+        pane command="clank" name="🔨 claude (master)" cwd="/Users/llfourn/src/clank" size="65%" {
+            args "agent" "start" "claude" "--repo" "/Users/llfourn/src/clank"
+            start_suspended true
+        }
+        pane command="/opt/homebrew/bin/codex" name="💤 codex (reviewer)" cwd="clank" {
+            args "resume" "019e54b7" "--cd" "/Users/llfourn/src/clank"
+            start_suspended true
+        }
+        pane command="clank" name="💤 ruthless (reviewer)" cwd="/Users/llfourn/src/clank" {
+            args "agent" "start" "ruthless" "--repo" "/Users/llfourn/src/clank"
+            start_suspended true
+        }
+        pane command="clank" name="status" cwd="clank" {
+            args "status" "--repo" "/Users/llfourn/src/clank" "--tui"
+            start_suspended true
+        }
+        pane command="clank" name="other (master)" cwd="/other" {
+            args "agent" "start" "other" "--repo" "/other/repo"
+            start_suspended true
+        }
+    }
+}"#;
+        assert_eq!(
+            parse_dump_layout_pairs(kdl, "/Users/llfourn/src/clank"),
+            Some(vec![
+                ("claude".to_string(), true),
+                ("ruthless".to_string(), false),
+            ]),
+            "agent-start panes for THIS repo only; status pane, other \
+             repos, and resolved-binary panes are invisible"
+        );
+        // Malformed / unsupported output is a PARSE FAILURE (None →
+        // the caller falls back to --json), not an empty answer.
+        assert_eq!(
+            parse_dump_layout_pairs("error: session not found", "/x"),
+            None
+        );
+        assert_eq!(
+            parse_dump_layout_pairs("layout {\n}", "/x"),
+            Some(vec![]),
+            "a well-formed layout with no agent panes is a real answer"
+        );
+    }
+
+    #[test]
+    fn dump_layout_parse_handles_escapes_and_rejects_invalid_kdl() {
+        // codex 4df5f0c: a REAL parser — escaped values decode, and
+        // syntactically invalid input is a parse failure (None → the
+        // --json fallback), never a silent empty success.
+        let kdl = r#"layout {
+    pane command="clank" name="🔨 we\"ird (master)" {
+        args "agent" "start" "we\"ird" "--repo" "/pa th/re\"po"
+    }
+}"#;
+        assert_eq!(
+            parse_dump_layout_pairs(kdl, "/pa th/re\"po"),
+            Some(vec![("we\"ird".to_string(), true)]),
+            "escaping comes from the KDL parser, not string scanning"
+        );
+        assert_eq!(
+            parse_dump_layout_pairs("layout { pane command=", "/x"),
+            None,
+            "truncated KDL is a parse failure"
+        );
+        assert_eq!(
+            parse_dump_layout_pairs("layout definitely-not={kdl", "/x"),
+            None,
+            "malformed node syntax is a parse failure"
+        );
+    }
+
+    #[test]
+    fn remove_target_ids_resolve_duplicates_to_distinct_panes() {
+        // codex 4df5f0c: the remove MULTISET maps each occurrence to a
+        // DIFFERENT pane id; unrelated panes and over-budget matches
+        // are untouched.
+        let panes: Vec<ZellijPane> = serde_json::from_str(
+            r#"[
+              {"id":1,"is_plugin":false,"title":"codex (reviewer)","terminal_command":"clank agent start codex --repo /a","tab_id":0},
+              {"id":2,"is_plugin":false,"title":"codex (reviewer)","terminal_command":"clank agent start codex --repo /a","tab_id":0},
+              {"id":3,"is_plugin":false,"title":"codex (reviewer)","terminal_command":"clank agent start codex --repo /a","tab_id":0},
+              {"id":4,"is_plugin":false,"title":"claude (master)","terminal_command":"clank agent start claude --repo /a","tab_id":0}
+            ]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            remove_target_ids(&["codex".into(), "codex".into()], &panes, "/a"),
+            vec!["terminal_1".to_string(), "terminal_2".to_string()],
+            "two entries, two DISTINCT panes; the third codex pane and claude survive"
+        );
+    }
+
+    #[test]
+    fn pass_focus_falls_back_to_the_caller_pane() {
+        // codex 5d498d0: when list-clients fails the pass restore must
+        // fall back to the caller's own (authoritative) pane, as the
+        // old per-op restores did.
+        assert_eq!(
+            focus_target_from(Some("terminal_3".into()), Some("terminal_9".into())).as_deref(),
+            Some("terminal_3"),
+            "client focus wins when available"
+        );
+        assert_eq!(
+            focus_target_from(None, Some("terminal_9".into())).as_deref(),
+            Some("terminal_9")
+        );
+        assert_eq!(focus_target_from(None, None), None);
+    }
+
+    #[test]
     fn agent_pane_label_parses_only_this_repos_agent_panes() {
         // tui-zellij-pane-reconcile: the reconciler classifies live
         // panes by the EXACT command agent_start_command composes —
@@ -1776,7 +1967,6 @@ ttys004   zellij attach clank-foo
         let pane = |cmd: Option<&str>, is_plugin: bool| ZellijPane {
             id: 1,
             is_plugin,
-            is_focused: false,
             terminal_command: cmd.map(str::to_string),
             title: String::new(),
             tab_id: 0,
@@ -1853,38 +2043,6 @@ ttys004   zellij attach clank-foo
         assert_eq!(anchor.unwrap().pane_id(), "terminal_1");
         // No reviewer of this repo present → no anchor (first reviewer case).
         assert!(find_anchor_pane(&panes, &[agent_start_command("codex", "/c")]).is_none());
-    }
-
-    #[test]
-    fn focused_pane_id_finds_the_focused_pane() {
-        let panes = parse_panes();
-        assert_eq!(focused_pane_id(&panes).as_deref(), Some("terminal_0"));
-    }
-
-    #[test]
-    fn restore_target_prefers_caller_over_first_focused_across_tabs() {
-        // Realistic multi-tab `list-panes`: EACH tab marks its own active
-        // pane focused. The agents' tab (tab 0) lists first, so the bare
-        // focus scan picks terminal_0 — the wrong tab when the command ran
-        // from tab 1. (The single-focus `parse_panes` fixture never
-        // exercised this — it's exactly why the bug slipped through.)
-        let panes: Vec<ZellijPane> = serde_json::from_str(
-            r#"[
-              {"id":0,"is_plugin":false,"is_focused":true,"title":"claude (master)","terminal_command":"clank agent start claude --repo /a","tab_id":0},
-              {"id":1,"is_plugin":false,"is_focused":false,"title":"codex (reviewer)","terminal_command":"clank agent start codex --repo /a","tab_id":0},
-              {"id":7,"is_plugin":false,"is_focused":true,"title":"shell","terminal_command":null,"tab_id":1}
-            ]"#,
-        )
-        .unwrap();
-        // Caller ran the command from its own pane in tab 1.
-        assert_eq!(
-            restore_target(&panes, Some("terminal_7")).as_deref(),
-            Some("terminal_7"),
-            "must restore to the caller's pane, not the first is_focused (terminal_0)"
-        );
-        // Defensive fallback when the caller is unknown: the ambiguous
-        // first-focused scan (the pre-fix behavior).
-        assert_eq!(restore_target(&panes, None).as_deref(), Some("terminal_0"));
     }
 
     #[test]
