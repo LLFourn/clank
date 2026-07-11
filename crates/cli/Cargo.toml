@@ -86,3 +86,6 @@ kdl = "4"
 
 [dev-dependencies]
 filetime = "0.2"
+# test-only: paused-time (`start_paused`) so the github poll loop's
+# inter-tick sleeps resolve instantly in tests (extra-wait-events).
+tokio = { version = "1", features = ["test-util"] }

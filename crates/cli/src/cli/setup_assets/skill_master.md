@@ -79,6 +79,32 @@ must amend BEFORE anything else proceeds. Three ways to break it:
   `--all` suppresses every item (rare). `clank block clean` acknowledges
   answered blocks.
 
+### Extra wake sources (controller repos)
+
+Beyond this repo's own state, `clank wait` can wake you on EXTERNAL
+events — for a "controller" repo that manages OTHER repos. Add them to
+this agent's `.clank/agents/<label>/config.json` under `wait_events`
+(or pass `--event '<json>'` ad hoc, same shape):
+
+- `{"kind":"github","repo":"owner/name","events":["pr_opened",
+  "pr_merged","pr_comment","issue_opened","issue_closed",
+  "issue_comment"]}` — wakes you with a `github_event` item when that
+  repo sees the listed activity (polled via `gh`; auth is `gh`'s). List
+  as many `github` entries as you want to watch several repos. By
+  default your OWN actions (the authenticated `gh` login) don't wake
+  you — set `"include_own_actions":true` to override. `"poll_interval"`
+  (`"60s"`) tunes cadence.
+- `{"kind":"command","name":"label","command":["prog","arg",…]}` — a
+  command whose COMPLETION is the wake (an HTTP long-poll, a custom
+  poller, a Signal receiver — anything). Its argv runs with no shell
+  (write `["sh","-c","…"]` for one); a `command_event` item carries the
+  exit code and the last 1 KiB of output. Have it BLOCK until the event
+  — a command that exits instantly re-fires every re-arm.
+
+React to a `github_event` / `command_event` like any other work item:
+do the triage (`gh` for PRs/issues, your own tools for command events),
+then re-arm and STOP.
+
 ### Reading feedback
 
 Reviewers write CONTINUE / FINISHED / REQUEST_CHANGES on your commits;

@@ -40,6 +40,7 @@ fn wait_args_role(repo: &Path, author: &str, timeout: &str, role: Option<WaitRol
         role,
         timeout: timeout.into(),
         json: true,
+        events: Vec::new(),
         r#for: None,
         peek: false,
         no_cache: false,

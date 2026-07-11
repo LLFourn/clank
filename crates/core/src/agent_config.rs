@@ -59,6 +59,70 @@ pub struct AgentConfig {
     /// `CLAUDE_CODE_SESSION_ID` / `CODEX_THREAD_ID` env var.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<Session>,
+    /// Extra wake sources for this agent's `clank wait`
+    /// (extra-wait-events): things beyond this repo's state — GitHub
+    /// activity on OTHER repos, arbitrary command completions. Fixed
+    /// at arm time; a config edit takes effect on the next re-arm.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub wait_events: Vec<WaitEventSource>,
+}
+
+/// One extra wake source (extra-wait-events). Tagged sum type so the
+/// set is additive: new kinds parse-fail LOUD on old binaries (an
+/// unknown `kind` is an error, not a silent drop) and new filters can
+/// join a kind without breaking existing configs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WaitEventSource {
+    Github(GithubSource),
+    Command(CommandSource),
+}
+
+/// Watch one GitHub repo's event feed. An agent lists as many of
+/// these as it likes — nothing is fixed to a single repo.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GithubSource {
+    /// `owner/name`.
+    pub repo: String,
+    /// Which event sub-kinds wake the agent.
+    pub events: Vec<GithubEventKind>,
+    /// Poll cadence as a duration string (`"60s"`, `"5m"`), same form
+    /// as `wait_timeout`; validated at use site. The EFFECTIVE
+    /// interval is max(this, the server's `X-Poll-Interval`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poll_interval: Option<String>,
+    /// Whether events actored by the authenticated `gh` login wake
+    /// this agent. Default FALSE: a controller agent's own PR comment
+    /// must not wake itself in a loop.
+    #[serde(default)]
+    pub include_own_actions: bool,
+}
+
+/// The GitHub event sub-kinds `clank wait` can wake on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GithubEventKind {
+    PrOpened,
+    PrMerged,
+    /// All three comment classes: an issue comment on a PR, a
+    /// submitted review (including empty-body approvals), and an
+    /// inline diff comment.
+    PrComment,
+    IssueOpened,
+    IssueClosed,
+    /// An issue comment on a NON-PR issue.
+    IssueComment,
+}
+
+/// Spawn a command when the wait arms; its COMPLETION is the wake.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandSource {
+    /// Labels the wake item.
+    pub name: String,
+    /// Argv — program + args, NO implicit shell (write
+    /// `["sh", "-c", "…"]` to get one). Runs in its own process
+    /// group; the group is killed when the wait exits without it.
+    pub command: Vec<String>,
 }
 
 /// Resolve a session's effective auto-mode from the per-agent
@@ -161,6 +225,7 @@ mod tests {
                 tool: Tool::Claude,
                 updated_at: "2026-05-23T16:24:47+10:00".into(),
             }),
+            wait_events: Vec::new(),
         };
         let json = serde_json::to_string(&cfg).unwrap();
         let back: AgentConfig = serde_json::from_str(&json).unwrap();

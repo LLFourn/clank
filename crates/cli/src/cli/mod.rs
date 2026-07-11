@@ -21,6 +21,7 @@ pub mod export;
 pub mod feedback;
 pub mod finish;
 pub mod fork;
+pub mod github_events;
 pub mod html;
 pub mod html_highlight;
 pub mod init;
@@ -458,6 +459,12 @@ pub struct WaitArgs {
     /// Emit JSON instead of the human rendering.
     #[arg(short = 'j', long)]
     pub json: bool,
+    /// Extra wake source for THIS wait, as the agent-config item JSON
+    /// (`{"kind":"github",…}` / `{"kind":"command",…}`) — exactly the
+    /// `wait_events` config shape, merged after the config's entries.
+    /// Repeatable.
+    #[arg(long = "event", value_name = "JSON")]
+    pub events: Vec<String>,
     /// OBSERVE the repo instead of waiting for own work: block until
     /// the given event lands, counting only events AFTER the wait
     /// starts. For watching a foreign repo (pair with --repo) — no

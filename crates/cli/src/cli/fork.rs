@@ -422,6 +422,9 @@ pub async fn run_fork_pinned(
                 auto_mode: src_cfg.auto_mode,
                 wait_timeout: src_cfg.wait_timeout.clone(),
                 session: None,
+                // Extra wake sources are per-repo watch lists; the
+                // fork's controller context differs — start clean.
+                wait_events: Vec::new(),
             };
             crate::agent_store::save_agent_config(&dest, label, &carried).with_context(|| {
                 format!("carbon-copying `{}` config to the fork", label.as_str())

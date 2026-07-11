@@ -25,6 +25,7 @@ fn skeleton(
         auto_mode: Some(auto_mode),
         wait_timeout: None,
         session,
+        wait_events: Vec::new(),
     }
 }
 

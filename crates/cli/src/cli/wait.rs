@@ -22,6 +22,7 @@
 //! event.
 
 use std::path::Path;
+use std::process::Stdio;
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -122,6 +123,10 @@ fn firings_from_items(items: &[WaitItem]) -> Vec<HookFiring> {
             | WaitItem::ForCommit { .. }
             | WaitItem::ForFinished { .. }
             | WaitItem::ForBlocked { .. }
+            // External wake sources fire no lifecycle hooks (MVP —
+            // extra-wait-events).
+            | WaitItem::GithubEvent { .. }
+            | WaitItem::CommandEvent { .. }
             // PR-review items surface via the stop-hook's `clank wait`
             // pull (like ad-hoc/queue items) rather than a dedicated
             // proactive OS hook — HookFiring is plan+sha keyed and PR
@@ -161,6 +166,10 @@ pub async fn run(args: WaitArgs) -> anyhow::Result<()> {
     };
 
     let explicit_role: Option<Role> = args.role.map(Into::into);
+    // Extra wake sources: the agent config's `wait_events` plus any
+    // `--event` items (config first, CLI appended). Parse errors are
+    // arm-time hard errors naming the offending input.
+    let event_sources = resolve_wait_event_sources(&repo, &author, &args.events)?;
     // Arm-time derivation errors stay HARD (a wait that can never
     // project is a bug to surface); the loop re-derives per wake and
     // is fail-soft there (wait-reloads-config-per-refold).
@@ -312,101 +321,176 @@ pub async fn run(args: WaitArgs) -> anyhow::Result<()> {
         Duration::from_millis(1500)
     };
     let deadline = timeout.map(|t| std::time::Instant::now() + t);
-    loop {
-        next_beat(&rx, deadline, tick)?;
-        // Re-derive the projection inputs EVERY wake: config.json is a
-        // wake dir, and a parked wait projecting with the team captured
-        // at arm time computes stale work after any roster change
-        // (wait-reloads-config-per-refold). Fail-soft mid-loop: a
-        // transient read failure keeps the last-known-good inputs and
-        // retries next wake — it must not kill a parked wait.
-        if let Ok(fresh) = derive_wait_inputs(&repo, &author, explicit_role) {
-            inputs = fresh;
+
+    // ONE supervised async loop (extra-wait-events, codex cdcf111):
+    // the watcher's sync channel is bridged into a tokio::select over
+    // repo wakes, external source items, the heartbeat tick, and the
+    // deadline. Sources spawn only when the wait actually PARKS (the
+    // initial pass above returns without them) and are cancelled AND
+    // joined on every return path below.
+    let (wake_tx, mut wake_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    std::thread::spawn(move || {
+        while rx.recv().is_ok() {
+            if wake_tx.send(()).is_err() {
+                break;
+            }
         }
-        {
+    });
+    let mut sources = EventSources::spawn(&event_sources);
+    // Once the source channel closes (every source task finished, or
+    // there were none), its `recv()` is permanently ready with `None`
+    // — a guard disables that select branch so it can't hot-loop the
+    // wait (codex 1bbb61d).
+    let mut sources_open = true;
+
+    let outcome: anyhow::Result<Vec<WaitItem>> = async {
+        loop {
+            // External items drained this beat (merged into whatever
+            // the repo projection yields — one emitted result).
+            let mut external: Vec<WaitItem> = Vec::new();
+            tokio::select! {
+                _ = tokio::time::sleep(tick) => {}
+                w = wake_rx.recv() => {
+                    if w.is_none() {
+                        anyhow::bail!("filesystem watcher disconnected");
+                    }
+                    // Debounce: let a burst settle, then drain it —
+                    // one logical change, one refold.
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    while wake_rx.try_recv().is_ok() {}
+                }
+                item = sources.rx.recv(), if sources_open => {
+                    match item {
+                        Some(item) => external.push(item),
+                        None => sources_open = false,
+                    }
+                }
+                _ = async {
+                    match deadline {
+                        Some(end) => tokio::time::sleep_until(end.into()).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    return Err(WaitTimeout.into());
+                }
+            }
+            // Drain items queued before/at this beat (whichever branch
+            // woke us) so a repo-branch win doesn't strand a ready
+            // external item (codex 1bbb61d).
+            drain_external(&mut sources.rx, &mut sources_open, &mut external);
+
+            // Re-derive the projection inputs EVERY wake: config.json is a
+            // wake dir, and a parked wait projecting with the team captured
+            // at arm time computes stale work after any roster change
+            // (wait-reloads-config-per-refold). Fail-soft mid-loop: a
+            // transient read failure keeps the last-known-good inputs and
+            // retries next wake — it must not kill a parked wait.
+            if let Ok(fresh) = derive_wait_inputs(&repo, &author, explicit_role) {
+                inputs = fresh;
+            }
+
+            // Compute this beat's REPO-side result (None = park). Any
+            // return then funnels through the single boundary below so a
+            // final drain catches items that arrived DURING the refold
+            // (`await`) — none is ever dropped (codex 907acd5).
             let br = check_blocks(&repo, &author);
             let has_answer = br
                 .items
                 .iter()
                 .any(|i| matches!(i, WaitItem::Unblocked { .. }));
-            if has_answer {
-                emit(&br.items, args.json);
-                return Ok(());
-            }
-            if br.suppress_all {
-                continue;
-            }
+            let repo_items: Option<Vec<WaitItem>> = if has_answer {
+                Some(br.items.clone())
+            } else if br.suppress_all {
+                None
+            } else {
+                let state = crate::rebuild::rebuild_repo_with_policy(&repo, policy)
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!("failed to fold repo `{}`: {e}", repo.display())
+                    })?;
+                let reviews =
+                    crate::fs_plan_state_lookup::FsPlanStateLookup::new(&repo, state.head.as_ref());
+                // Commit-tag correction is derived (see initial-pass note).
+                let head = crate::git_io::head_commit_at(&repo, &state);
+                let status = state
+                    .fold
+                    .derive_status(&reviews, &inputs.work_policy, head.as_ref());
+                let mut items = status.work_for(&author, inputs.role);
+                if !br.suppressed_plans.is_empty() {
+                    items.retain(|item| match item {
+                        WaitItem::Master { plan, .. } | WaitItem::Reviewer { plan, .. } => {
+                            !br.suppressed_plans.contains(plan)
+                        }
+                        _ => true,
+                    });
+                }
+                // Master-only Finished notice (watch loop); see the
+                // initial-pass rationale above
+                // (`finish-does-not-wake-reviewers`).
+                if inputs.role == Role::Master {
+                    items.extend(detect_finished(&snapshot, &state.fold));
+                }
+                if !items.is_empty() {
+                    // Co-surface pending Blocked entries (codex caught
+                    // on 0a3c039).
+                    let blocked_items: Vec<_> = br
+                        .items
+                        .iter()
+                        .filter(|i| matches!(i, WaitItem::Blocked { .. }))
+                        .cloned()
+                        .collect();
+                    items.extend(blocked_items);
+                    for firing in &firings_from_items(&items) {
+                        hook_config::run_hook(&repo, &inputs.hook_config, firing);
+                    }
+                    Some(items)
+                } else {
+                    // Same actionable-count gate as the initial pass — see
+                    // the comment above the initial gate. Watch-loop variant.
+                    let actionable_in_loop = state
+                        .fold
+                        .plans
+                        .iter()
+                        .filter(|(k, _)| !br.suppressed_plans.contains(k))
+                        .count();
+                    if inputs.role == Role::Master && actionable_in_loop == 0 {
+                        let queue = match crate::cli::queue::scan_queue_no_dups(&repo) {
+                            Ok(q) => q,
+                            Err(e) => {
+                                eprintln!("wait: {e}");
+                                Vec::new()
+                            }
+                        };
+                        // Same single-sourced rule as the initial pass:
+                        // promote the first unsuppressed queued item (+
+                        // Blocked context), but PARK on Blocked-only
+                        // (wait-ignores-queue-only-blocks).
+                        let items = queue_promote_outcome(&br.items, &br.suppressed_plans, &queue);
+                        wake_worthy(&items).then_some(items)
+                    } else {
+                        None
+                    }
+                }
+            };
 
-            let state = crate::rebuild::rebuild_repo_with_policy(&repo, policy)
-                .await
-                .map_err(|e| anyhow::anyhow!("failed to fold repo `{}`: {e}", repo.display()))?;
-            let reviews =
-                crate::fs_plan_state_lookup::FsPlanStateLookup::new(&repo, state.head.as_ref());
-            // Commit-tag correction is derived (see initial-pass note).
-            let head = crate::git_io::head_commit_at(&repo, &state);
-            let status = state
-                .fold
-                .derive_status(&reviews, &inputs.work_policy, head.as_ref());
-            let mut items = status.work_for(&author, inputs.role);
-            if !br.suppressed_plans.is_empty() {
-                items.retain(|item| match item {
-                    WaitItem::Master { plan, .. } | WaitItem::Reviewer { plan, .. } => {
-                        !br.suppressed_plans.contains(plan)
-                    }
-                    _ => true,
-                });
-            }
-            // Master-only Finished notice (watch loop); see the
-            // initial-pass rationale above
-            // (`finish-does-not-wake-reviewers`).
-            if inputs.role == Role::Master {
-                items.extend(detect_finished(&snapshot, &state.fold));
-            }
-            if !items.is_empty() {
-                // Co-surface pending Blocked entries (codex caught
-                // on 0a3c039).
-                let blocked_items: Vec<_> = br
-                    .items
-                    .iter()
-                    .filter(|i| matches!(i, WaitItem::Blocked { .. }))
-                    .cloned()
-                    .collect();
-                items.extend(blocked_items);
-                for firing in &firings_from_items(&items) {
-                    hook_config::run_hook(&repo, &inputs.hook_config, firing);
-                }
-                emit(&items, args.json);
-                return Ok(());
-            }
-            // Same actionable-count gate as the initial pass — see
-            // the comment above the initial gate. Watch-loop variant.
-            let actionable_in_loop = state
-                .fold
-                .plans
-                .iter()
-                .filter(|(k, _)| !br.suppressed_plans.contains(k))
-                .count();
-            if inputs.role == Role::Master && actionable_in_loop == 0 {
-                let queue = match crate::cli::queue::scan_queue_no_dups(&repo) {
-                    Ok(q) => q,
-                    Err(e) => {
-                        eprintln!("wait: {e}");
-                        Vec::new()
-                    }
-                };
-                // Same single-sourced rule as the initial pass: promote
-                // the first unsuppressed queued item (+ Blocked context),
-                // but PARK on Blocked-only (all queued items suppressed)
-                // rather than waking on a non-actionable human block
-                // (wait-ignores-queue-only-blocks).
-                let items = queue_promote_outcome(&br.items, &br.suppressed_plans, &queue);
-                if wake_worthy(&items) {
-                    emit(&items, args.json);
-                    return Ok(());
-                }
+            // THE single return boundary: one last drain catches items
+            // produced during the refold, then repo + external merge into
+            // ONE result. Park only when BOTH are empty (codex 907acd5).
+            drain_external(&mut sources.rx, &mut sources_open, &mut external);
+            if let Some(items) = combine_beat_result(repo_items, external) {
+                return Ok(items);
             }
         }
     }
+    .await;
+
+    // Every return path — items, timeout, error — cancels AND joins
+    // the source tasks; command children die by process-group kill
+    // (extra-wait-events).
+    sources.shutdown().await;
+    let items = outcome?;
+    emit(&items, args.json);
+    Ok(())
 }
 
 /// One watcher-loop beat, shared by the work loop and the observer
@@ -619,6 +703,256 @@ fn derive_wait_inputs(
     })
 }
 
+/// The merged extra-wake-source list (extra-wait-events): the agent
+/// config's `wait_events` first, then every CLI `--event` item — the
+/// SAME JSON shape, one grammar. Missing config → config sources are
+/// simply none (an unbound label can still `--event`).
+pub fn resolve_wait_event_sources(
+    repo: &Path,
+    author: &AgentLabel,
+    cli_items: &[String],
+) -> anyhow::Result<Vec<clank_core::agent_config::WaitEventSource>> {
+    let mut sources = crate::agent_store::load_agent_config(repo, author)?
+        .map(|c| c.wait_events)
+        .unwrap_or_default();
+    for raw in cli_items {
+        let item: clank_core::agent_config::WaitEventSource = serde_json::from_str(raw)
+            .map_err(|e| anyhow::anyhow!("invalid --event `{raw}`: {e}"))?;
+        sources.push(item);
+    }
+    // Validate durations at ARM time so a bad `poll_interval` fails
+    // loud here, not silently substituting the default deep in the
+    // poll loop (codex ef1861a).
+    for source in &sources {
+        if let clank_core::agent_config::WaitEventSource::Github(g) = source
+            && let Some(pi) = g.poll_interval.as_deref()
+        {
+            parse_duration_str(pi)
+                .map_err(|e| anyhow::anyhow!("invalid poll_interval `{pi}` for {}: {e}", g.repo))?;
+        }
+    }
+    Ok(sources)
+}
+
+/// Merge a beat's repo-side result with its drained external items
+/// into the single emitted result (extra-wait-events, codex fc7a4ff):
+/// repo work carries external items along; external-only still
+/// returns; both empty parks (`None`). Pure — the deterministic proof
+/// that a beat with BOTH ready emits ONE combined result.
+fn combine_beat_result(
+    repo_items: Option<Vec<WaitItem>>,
+    external: Vec<WaitItem>,
+) -> Option<Vec<WaitItem>> {
+    match repo_items {
+        Some(mut items) => {
+            items.extend(external);
+            Some(items)
+        }
+        None if !external.is_empty() => Some(external),
+        None => None,
+    }
+}
+
+/// Drain every ready external item into `out`, flipping `open` to
+/// false when the source channel has disconnected (all sources
+/// finished) so the select branch that reads it stays disabled — the
+/// fuse that prevents a closed channel from hot-looping the wait
+/// (codex 1bbb61d). No-op once closed.
+fn drain_external(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<WaitItem>,
+    open: &mut bool,
+    out: &mut Vec<WaitItem>,
+) {
+    if !*open {
+        return;
+    }
+    loop {
+        match rx.try_recv() {
+            Ok(item) => out.push(item),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                *open = false;
+                break;
+            }
+        }
+    }
+}
+
+/// External wake sources, spawned when the wait PARKS (the initial
+/// pass never spawns them) and torn down on every return path:
+/// [`EventSources::shutdown`] aborts AND joins each task, and command
+/// children die by process-group kill via a drop guard — abort-safe,
+/// so a shell wrapper's grandchildren can't outlive the wait
+/// (extra-wait-events).
+struct EventSources {
+    rx: tokio::sync::mpsc::UnboundedReceiver<WaitItem>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl EventSources {
+    fn spawn(sources: &[clank_core::agent_config::WaitEventSource]) -> Self {
+        use clank_core::agent_config::WaitEventSource;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut tasks = Vec::new();
+        for source in sources {
+            match source {
+                WaitEventSource::Command(c) => {
+                    tasks.push(tokio::spawn(run_command_source(c.clone(), tx.clone())));
+                }
+                WaitEventSource::Github(g) => {
+                    tasks.push(tokio::spawn(crate::cli::github_events::run_github_source(
+                        g.clone(),
+                        tx.clone(),
+                    )));
+                }
+            }
+        }
+        Self { rx, tasks }
+    }
+
+    async fn shutdown(self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+        for task in self.tasks {
+            let _ = task.await;
+        }
+    }
+}
+
+/// Kill the child's PROCESS GROUP on drop — grandchildren included.
+/// Sync `kill` subprocess, not libc: Drop must be sync and this runs
+/// on task abort too (the drop is the cancellation-safety story).
+struct GroupKill(Option<u32>);
+impl Drop for GroupKill {
+    fn drop(&mut self) {
+        if let Some(pgid) = self.0.take() {
+            let _ = std::process::Command::new("kill")
+                .arg("-9")
+                .arg(format!("-{pgid}"))
+                .output();
+        }
+    }
+}
+
+/// Last-`cap`-bytes ring for a command source's interleaved output —
+/// bounded by construction, so a chatty child can't balloon memory.
+struct RingTail {
+    buf: std::collections::VecDeque<u8>,
+    cap: usize,
+}
+
+impl RingTail {
+    fn new(cap: usize) -> Self {
+        Self {
+            buf: std::collections::VecDeque::with_capacity(cap),
+            cap,
+        }
+    }
+    fn push(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            if self.buf.len() == self.cap {
+                self.buf.pop_front();
+            }
+            self.buf.push_back(b);
+        }
+    }
+    fn into_string(self) -> String {
+        String::from_utf8_lossy(&Vec::from(self.buf)).into_owned()
+    }
+}
+
+/// One command source: spawn the argv in its own process group, stream
+/// stdout+stderr into a 1 KiB ring, and deliver a `CommandEvent` when
+/// it completes — the completion IS the wake. Spawn/exec failures
+/// degrade to a stderr warning, never the wait.
+async fn run_command_source(
+    src: clank_core::agent_config::CommandSource,
+    tx: tokio::sync::mpsc::UnboundedSender<WaitItem>,
+) {
+    use tokio::io::AsyncReadExt;
+    let Some((program, rest)) = src.command.split_first() else {
+        eprintln!("wait: command source `{}` has an empty argv", src.name);
+        return;
+    };
+    let mut cmd = tokio::process::Command::new(program);
+    cmd.args(rest)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .kill_on_drop(true);
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("wait: command source `{}` failed to spawn: {e}", src.name);
+            return;
+        }
+    };
+    let _group = GroupKill(child.id());
+    // Read stdout AND stderr concurrently INLINE — no detached tasks,
+    // so aborting this source task cancels the reads too (codex
+    // 907acd5). The ROOT child's exit is completion (codex fc7a4ff): a
+    // descendant that inherited a pipe keeps it open past root exit, so
+    // we must NOT block for EOF — Phase 1 races reads against
+    // `child.wait()` and breaks on exit; Phase 2 best-effort drains
+    // whatever bytes are already buffered (bounded), then the group
+    // guard kills any lingering descendants.
+    let mut ring = RingTail::new(1024);
+    let mut out = child.stdout.take();
+    let mut err = child.stderr.take();
+    let mut obuf = [0u8; 1024];
+    let mut ebuf = [0u8; 1024];
+    // Phase 1: until the root child exits.
+    let status = loop {
+        tokio::select! {
+            s = child.wait() => break s,
+            r = async { out.as_mut().unwrap().read(&mut obuf).await }, if out.is_some() => {
+                match r {
+                    Ok(0) | Err(_) => out = None,
+                    Ok(n) => ring.push(&obuf[..n]),
+                }
+            }
+            r = async { err.as_mut().unwrap().read(&mut ebuf).await }, if err.is_some() => {
+                match r {
+                    Ok(0) | Err(_) => err = None,
+                    Ok(n) => ring.push(&ebuf[..n]),
+                }
+            }
+        }
+    };
+    // Phase 2: root exited — grab already-buffered bytes, then STOP.
+    // Two bounds together, so no descendant behavior can stall the
+    // wake (codex a69ddd8): each read has a short quiet-timeout (a
+    // pipe held open but silent returns fast) AND the whole drain runs
+    // under one ABSOLUTE deadline (a descendant writing CONTINUOUSLY —
+    // e.g. a background `yes` — can't keep the reads succeeding
+    // forever). Whichever fires first, we emit and the group guard
+    // kills what's left. The ring is bounded, so cancelling mid-read
+    // loses nothing that matters.
+    async fn drain_until_quiet<R: AsyncReadExt + Unpin>(pipe: &mut Option<R>, ring: &mut RingTail) {
+        while let Some(p) = pipe.as_mut() {
+            let mut buf = [0u8; 1024];
+            match tokio::time::timeout(Duration::from_millis(20), p.read(&mut buf)).await {
+                Ok(Ok(n)) if n > 0 => ring.push(&buf[..n]),
+                _ => break, // EOF, error, or quiet within the budget
+            }
+        }
+    }
+    let _ = tokio::time::timeout(Duration::from_millis(100), async {
+        drain_until_quiet(&mut out, &mut ring).await;
+        drain_until_quiet(&mut err, &mut ring).await;
+    })
+    .await;
+    let exit_code = status.ok().and_then(|s| s.code());
+    let output_tail = ring.into_string();
+    let _ = tx.send(WaitItem::CommandEvent {
+        name: src.name,
+        exit_code,
+        output_tail,
+    });
+}
+
 /// Check blocks and return (block_items, suppressed_plans). If a
 /// `Unblocked` is found for the calling agent, it is returned as
 /// the sole item with `suppress_all = true` so the caller exits
@@ -802,6 +1136,22 @@ enum WaitJsonItem<'a> {
     },
     #[serde(rename = "promote_from_queue")]
     PromoteFromQueue { name: &'a str, priority: u16 },
+    #[serde(rename = "github_event")]
+    GithubEvent {
+        repo: &'a str,
+        event: &'a str,
+        detail: Option<&'a str>,
+        number: Option<u64>,
+        title: Option<&'a str>,
+        actor: Option<&'a str>,
+        url: Option<&'a str>,
+    },
+    #[serde(rename = "command_event")]
+    CommandEvent {
+        name: &'a str,
+        exit_code: Option<i32>,
+        output_tail: &'a str,
+    },
     #[serde(rename = "for_commit")]
     ForCommit { sha: &'a str, subject: &'a str },
     #[serde(rename = "for_finished")]
@@ -898,6 +1248,32 @@ fn render_json(item: &WaitItem) -> WaitJsonItem<'_> {
         WaitItem::PromoteFromQueue { name, priority } => WaitJsonItem::PromoteFromQueue {
             name,
             priority: *priority,
+        },
+        WaitItem::GithubEvent {
+            repo,
+            event,
+            detail,
+            number,
+            title,
+            actor,
+            url,
+        } => WaitJsonItem::GithubEvent {
+            repo,
+            event,
+            detail: detail.as_deref(),
+            number: *number,
+            title: title.as_deref(),
+            actor: actor.as_deref(),
+            url: url.as_deref(),
+        },
+        WaitItem::CommandEvent {
+            name,
+            exit_code,
+            output_tail,
+        } => WaitJsonItem::CommandEvent {
+            name,
+            exit_code: *exit_code,
+            output_tail,
         },
         WaitItem::ForCommit { sha, subject } => WaitJsonItem::ForCommit {
             sha: sha.as_str(),
@@ -1028,6 +1404,36 @@ fn render_human(item: &WaitItem) -> String {
         WaitItem::PromoteFromQueue { name, priority } => {
             format!("promote  {name}  (priority {priority:03})")
         }
+        WaitItem::GithubEvent {
+            repo,
+            event,
+            number,
+            title,
+            actor,
+            ..
+        } => {
+            let num = number.map(|n| format!("#{n}  ")).unwrap_or_default();
+            let title = title.as_deref().unwrap_or("");
+            let actor = actor
+                .as_deref()
+                .map(|a| format!("  by {a}"))
+                .unwrap_or_default();
+            format!("github   {event}  {repo}  {num}{title}{actor}")
+        }
+        WaitItem::CommandEvent {
+            name,
+            exit_code,
+            output_tail,
+        } => {
+            let exit = match exit_code {
+                Some(c) => format!("exit {c}"),
+                None => "signaled".to_string(),
+            };
+            // One line: the tail rides in json; the human line shows a
+            // single-line snippet.
+            let snippet = output_tail.lines().last().unwrap_or("");
+            format!("command  {name}  {exit}  {snippet}")
+        }
         WaitItem::ForCommit { sha, subject } => {
             format!("for-commit    {}  {subject}", short(sha))
         }
@@ -1117,6 +1523,13 @@ pub(crate) fn multi_plan_open_remedies(in_progress: &str, new_plans: &[&str]) ->
     ]
 }
 
+/// Parse a duration string (`30s`, `5m`, `1h`; `0`/empty = None).
+/// Shared by `--timeout` and github `poll_interval` so there's ONE
+/// grammar (extra-wait-events).
+pub(crate) fn parse_duration_str(raw: &str) -> anyhow::Result<Option<Duration>> {
+    parse_timeout(raw)
+}
+
 fn parse_timeout(raw: &str) -> anyhow::Result<Option<Duration>> {
     let trimmed = raw.trim();
     if trimmed == "0" || trimmed.is_empty() {
@@ -1146,6 +1559,151 @@ fn parse_timeout(raw: &str) -> anyhow::Result<Option<Duration>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── extra-wait-events: command source field contracts ──────
+
+    fn command_source(name: &str, argv: &[&str]) -> clank_core::agent_config::CommandSource {
+        clank_core::agent_config::CommandSource {
+            name: name.into(),
+            command: argv.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    async fn run_one_command(src: clank_core::agent_config::CommandSource) -> WaitItem {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        run_command_source(src, tx).await;
+        rx.recv()
+            .await
+            .expect("a command source emits exactly one item")
+    }
+
+    #[tokio::test]
+    async fn command_event_carries_exit_code_and_bounded_tail() {
+        let item =
+            run_one_command(command_source("ok", &["sh", "-c", "printf hello; exit 7"])).await;
+        match item {
+            WaitItem::CommandEvent {
+                name,
+                exit_code,
+                output_tail,
+            } => {
+                assert_eq!(name, "ok");
+                assert_eq!(exit_code, Some(7));
+                assert_eq!(output_tail, "hello");
+            }
+            other => panic!("expected CommandEvent, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn command_event_tail_is_bounded_to_the_last_kib() {
+        // 100 KiB of output → exactly the last 1024 bytes survive.
+        let item = run_one_command(command_source(
+            "chatty",
+            &["sh", "-c", "yes x | head -c 100000"],
+        ))
+        .await;
+        match item {
+            WaitItem::CommandEvent { output_tail, .. } => {
+                assert_eq!(output_tail.len(), 1024, "ring keeps exactly the cap");
+                assert!(output_tail.bytes().all(|b| b == b'x' || b == b'\n'));
+            }
+            other => panic!("expected CommandEvent, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn signal_killed_command_reports_null_exit_code() {
+        let item = run_one_command(command_source("selfkill", &["sh", "-c", "kill -9 $$"])).await;
+        match item {
+            WaitItem::CommandEvent { exit_code, .. } => {
+                assert_eq!(exit_code, None, "a signaled child has no exit code");
+            }
+            other => panic!("expected CommandEvent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ring_tail_bounds_raw_bytes_even_for_non_utf8() {
+        // codex 907acd5: the ring's invariant is RAW-byte bounded (the
+        // memory bound); the string is lossy-decoded from those last
+        // ≤cap bytes. 2000 bytes of 0xFF (invalid UTF-8) → the last
+        // 1024 raw bytes → 1024 U+FFFD replacement chars, no more.
+        let mut r = RingTail::new(1024);
+        r.push(&[0xFFu8; 2000]);
+        let out = r.into_string();
+        assert_eq!(
+            out.chars().count(),
+            1024,
+            "decoded from exactly cap raw bytes"
+        );
+        assert!(out.chars().all(|c| c == '\u{FFFD}'));
+    }
+
+    #[test]
+    fn combine_beat_result_merges_repo_and_external_into_one() {
+        // codex fc7a4ff: the deterministic proof that a beat with BOTH
+        // a repo item and an external item ready emits ONE result
+        // containing both — no wall-clock racing.
+        let repo = || {
+            Some(vec![WaitItem::Idle {
+                prompt: "repo".into(),
+            }])
+        };
+        let ext = || {
+            vec![WaitItem::CommandEvent {
+                name: "cmd".into(),
+                exit_code: Some(0),
+                output_tail: String::new(),
+            }]
+        };
+        // Both ready → one result with BOTH.
+        let combined = combine_beat_result(repo(), ext()).expect("wake");
+        assert_eq!(combined.len(), 2);
+        assert!(matches!(combined[0], WaitItem::Idle { .. }));
+        assert!(matches!(combined[1], WaitItem::CommandEvent { .. }));
+        // External-only still wakes.
+        assert_eq!(combine_beat_result(None, ext()).unwrap().len(), 1);
+        // Repo-only wakes.
+        assert_eq!(combine_beat_result(repo(), Vec::new()).unwrap().len(), 1);
+        // Both empty → park.
+        assert!(combine_beat_result(None, Vec::new()).is_none());
+    }
+
+    #[test]
+    fn drain_external_fuses_a_closed_channel() {
+        // codex 907acd5: the DETERMINISTIC proof the source branch gets
+        // disabled — a disconnected channel flips `open` to false (so
+        // the select branch stays off and can't hot-loop), while a live
+        // channel drains its queued items and stays open.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        tx.send(WaitItem::CommandEvent {
+            name: "a".into(),
+            exit_code: Some(0),
+            output_tail: String::new(),
+        })
+        .unwrap();
+        let mut open = true;
+        let mut out = Vec::new();
+        drain_external(&mut rx, &mut open, &mut out);
+        assert_eq!(out.len(), 1, "queued item drained");
+        assert!(open, "a live channel stays open");
+
+        drop(tx); // all senders gone → disconnected
+        drain_external(&mut rx, &mut open, &mut out);
+        assert!(!open, "a closed channel fuses the branch");
+        // Once fused, further drains are a no-op (branch disabled).
+        out.clear();
+        drain_external(&mut rx, &mut open, &mut out);
+        assert!(out.is_empty() && !open);
+    }
+
+    #[test]
+    fn ring_tail_keeps_only_the_last_cap_bytes() {
+        let mut r = RingTail::new(4);
+        r.push(b"abcdefg");
+        assert_eq!(r.into_string(), "defg");
+    }
 
     #[test]
     fn parse_timeout_zero_is_indefinite() {

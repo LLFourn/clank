@@ -41,6 +41,7 @@ fn observer_args(repo: &Path, event: WaitFor, timeout: &str) -> WaitArgs {
         role: None,
         timeout: timeout.into(),
         json: true,
+        events: Vec::new(),
         r#for: Some(event),
         peek: false,
         no_cache: false,

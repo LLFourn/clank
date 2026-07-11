@@ -123,6 +123,30 @@ pub enum WaitItem {
         name: String,
         priority: u16,
     },
+    /// Extra-wake-source events (extra-wait-events): produced by the
+    /// CLI's external source tasks, never by `work_for`. A GitHub
+    /// event on a watched repo…
+    GithubEvent {
+        /// `owner/name` of the watched repo.
+        repo: String,
+        /// The configured sub-kind that fired (`pr_opened`, …).
+        event: String,
+        /// Which payload class produced it (e.g. the three
+        /// `pr_comment` classes), when it matters.
+        detail: Option<String>,
+        number: Option<u64>,
+        title: Option<String>,
+        actor: Option<String>,
+        url: Option<String>,
+    },
+    /// …and a command source completing (its exit IS the wake).
+    /// `exit_code` is `None` for a signal-killed child.
+    CommandEvent {
+        name: String,
+        exit_code: Option<i32>,
+        /// Last ≤1 KiB of interleaved stdout+stderr.
+        output_tail: String,
+    },
     /// Observer-mode events (`wait --for`, wait-for-observer-mode):
     /// produced only by the CLI observer path, never by `work_for`.
     /// Distinct kinds so a consumer can't mistake an observation of a
