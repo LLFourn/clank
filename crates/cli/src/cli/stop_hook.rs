@@ -237,6 +237,21 @@ fn nudge_reason(input: &HookInput) -> String {
     )
 }
 
+/// The `--timeout` the codex in-hook poll runs with. An explicit
+/// per-agent `wait_timeout` wins; the DEFAULT expires five minutes
+/// BEFORE codex's hook-runner ceiling (setup's [`HOOK_TIMEOUT_SECS`],
+/// one shared constant so they can't drift) — a poll that outlives
+/// the ceiling gets KILLED and codex banners `Stop hook (failed):
+/// hook timed out` for a perfectly normal idle
+/// (codex-poll-expires-cleanly). The clean expiry exits 2, which maps
+/// to Silent below.
+fn codex_wait_timeout(explicit: Option<&str>) -> String {
+    match explicit {
+        Some(t) => t.to_string(),
+        None => format!("{}s", crate::cli::setup::HOOK_TIMEOUT_SECS - 300),
+    }
+}
+
 /// Long-poll via a self-spawned `clank wait --json`. CODEX-ONLY:
 /// claude's hook never waits in-hook (see the module doc).
 /// Reuses the watcher loop without refactoring it. On items →
@@ -267,7 +282,7 @@ async fn compute_wait_outcome(
         Role::Master => "master",
         Role::Reviewer => "reviewer",
     };
-    let timeout_arg = wait_timeout.unwrap_or("0");
+    let timeout_arg = codex_wait_timeout(wait_timeout);
 
     let mut cmd = Command::new(&exe);
     cmd.arg("wait")
@@ -632,6 +647,29 @@ mod tests {
         let input = hook_input("sess-unbound", None);
         let outcome = compute_outcome(Tool::Claude, Some(repo), input).await;
         assert!(matches!(outcome, HookOutcome::Diagnostic { .. }));
+    }
+
+    #[test]
+    fn codex_wait_default_expires_before_the_hook_ceiling() {
+        // codex-poll-expires-cleanly: with wait_timeout unset the poll
+        // must exit (2 → Silent) BEFORE codex's hook runner kills it at
+        // setup's ceiling — the failed banner for a normal idle. One
+        // shared constant so the two can't drift.
+        let default = codex_wait_timeout(None);
+        let secs: u64 = default
+            .strip_suffix('s')
+            .expect("seconds-suffixed duration")
+            .parse()
+            .expect("numeric");
+        assert!(
+            secs < crate::cli::setup::HOOK_TIMEOUT_SECS,
+            "default {secs}s must undercut the {} ceiling",
+            crate::cli::setup::HOOK_TIMEOUT_SECS
+        );
+        assert_eq!(secs, crate::cli::setup::HOOK_TIMEOUT_SECS - 300);
+        // An explicit per-agent value passes through untouched.
+        assert_eq!(codex_wait_timeout(Some("4h")), "4h");
+        assert_eq!(codex_wait_timeout(Some("0")), "0");
     }
 
     #[test]
