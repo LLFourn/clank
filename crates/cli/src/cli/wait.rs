@@ -160,13 +160,11 @@ pub async fn run(args: WaitArgs) -> anyhow::Result<()> {
         None => crate::agent_env::resolve_identity_from_env(&repo)?,
     };
 
-    // Resolve --role from the roster when omitted: `resolve_role`
-    // returns Master for the roster's master and Reviewer for any
-    // tier member. Errors if the repo has no master configured.
-    let role: Role = match args.role {
-        Some(explicit) => explicit.into(),
-        None => crate::agent_store::resolve_role(&repo, &author)?,
-    };
+    let explicit_role: Option<Role> = args.role.map(Into::into);
+    // Arm-time derivation errors stay HARD (a wait that can never
+    // project is a bug to surface); the loop re-derives per wake and
+    // is fail-soft there (wait-reloads-config-per-refold).
+    let mut inputs = derive_wait_inputs(&repo, &author, explicit_role)?;
 
     let policy = if args.no_cache {
         crate::rebuild::CachePolicy::Bypass
@@ -176,21 +174,6 @@ pub async fn run(args: WaitArgs) -> anyhow::Result<()> {
     let initial_state = crate::rebuild::rebuild_repo_with_policy(&repo, policy)
         .await
         .map_err(|e| anyhow::anyhow!("failed to fold repo `{}`: {e}", repo.display()))?;
-
-    let config = crate::cli::config::load(&repo);
-    let hook_config = config.hooks.clone();
-    // Reviewer tiers from the team resolver. wait is a workflow
-    // command, so it hard-errors when no team is configured
-    // (`teams-based-agent-registration` render-vs-workflow
-    // boundary).
-    let tiers = crate::agent_store::load_reviewer_tiers(&repo)?;
-    let work_policy = clank_core::wait::WorkPolicy {
-        plan_feedback: config.review.plan_feedback,
-        adhoc_feedback: config.review.adhoc_feedback,
-        commit_reviewers: tiers.commit,
-        plan_reviewers: tiers.plan,
-        final_reviewers: tiers.final_,
-    };
 
     let snapshot = StartupSnapshot::capture(&initial_state.fold);
 
@@ -220,10 +203,11 @@ pub async fn run(args: WaitArgs) -> anyhow::Result<()> {
             // FixCommitTag item / withholds reviewer wakes — no bespoke
             // side-check.
             let head = crate::git_io::head_commit_at(&repo, &initial_state);
-            let status = initial_state
-                .fold
-                .derive_status(&reviews, &work_policy, head.as_ref());
-            let mut items = status.work_for(&author, role);
+            let status =
+                initial_state
+                    .fold
+                    .derive_status(&reviews, &inputs.work_policy, head.as_ref());
+            let mut items = status.work_for(&author, inputs.role);
             if !br.suppressed_plans.is_empty() {
                 items.retain(|item| match item {
                     WaitItem::Master { plan, .. } | WaitItem::Reviewer { plan, .. } => {
@@ -238,7 +222,7 @@ pub async fn run(args: WaitArgs) -> anyhow::Result<()> {
             // finish, so injecting it into the work stream would wake
             // an idle reviewer via the `!items.is_empty()` gate below
             // for nothing (`finish-does-not-wake-reviewers`).
-            if role == Role::Master {
+            if inputs.role == Role::Master {
                 items.extend(detect_finished(&snapshot, &initial_state.fold));
             }
             if !items.is_empty() {
@@ -257,7 +241,7 @@ pub async fn run(args: WaitArgs) -> anyhow::Result<()> {
                 // lifecycle hooks (the Stop hook may peek on every stop).
                 if !args.peek {
                     for firing in &firings_from_items(&items) {
-                        hook_config::run_hook(&repo, &hook_config, firing);
+                        hook_config::run_hook(&repo, &inputs.hook_config, firing);
                     }
                 }
                 emit(&items, args.json);
@@ -279,7 +263,7 @@ pub async fn run(args: WaitArgs) -> anyhow::Result<()> {
         .iter()
         .filter(|(k, _)| !initial_suppressed_plans.contains(k))
         .count();
-    if !initial_suppress_all && role == Role::Master && actionable == 0 {
+    if !initial_suppress_all && inputs.role == Role::Master && actionable == 0 {
         let queue = match crate::cli::queue::scan_queue_no_dups(&repo) {
             Ok(q) => q,
             Err(e) => {
@@ -300,7 +284,7 @@ pub async fn run(args: WaitArgs) -> anyhow::Result<()> {
         }
         // The idle hook is a side effect; `--peek` must not fire it.
         if !args.peek {
-            hook_config::run_idle_hook(&repo, &hook_config);
+            hook_config::run_idle_hook(&repo, &inputs.hook_config);
         }
     }
 
@@ -330,6 +314,15 @@ pub async fn run(args: WaitArgs) -> anyhow::Result<()> {
     let deadline = timeout.map(|t| std::time::Instant::now() + t);
     loop {
         next_beat(&rx, deadline, tick)?;
+        // Re-derive the projection inputs EVERY wake: config.json is a
+        // wake dir, and a parked wait projecting with the team captured
+        // at arm time computes stale work after any roster change
+        // (wait-reloads-config-per-refold). Fail-soft mid-loop: a
+        // transient read failure keeps the last-known-good inputs and
+        // retries next wake — it must not kill a parked wait.
+        if let Ok(fresh) = derive_wait_inputs(&repo, &author, explicit_role) {
+            inputs = fresh;
+        }
         {
             let br = check_blocks(&repo, &author);
             let has_answer = br
@@ -353,8 +346,8 @@ pub async fn run(args: WaitArgs) -> anyhow::Result<()> {
             let head = crate::git_io::head_commit_at(&repo, &state);
             let status = state
                 .fold
-                .derive_status(&reviews, &work_policy, head.as_ref());
-            let mut items = status.work_for(&author, role);
+                .derive_status(&reviews, &inputs.work_policy, head.as_ref());
+            let mut items = status.work_for(&author, inputs.role);
             if !br.suppressed_plans.is_empty() {
                 items.retain(|item| match item {
                     WaitItem::Master { plan, .. } | WaitItem::Reviewer { plan, .. } => {
@@ -366,7 +359,7 @@ pub async fn run(args: WaitArgs) -> anyhow::Result<()> {
             // Master-only Finished notice (watch loop); see the
             // initial-pass rationale above
             // (`finish-does-not-wake-reviewers`).
-            if role == Role::Master {
+            if inputs.role == Role::Master {
                 items.extend(detect_finished(&snapshot, &state.fold));
             }
             if !items.is_empty() {
@@ -380,7 +373,7 @@ pub async fn run(args: WaitArgs) -> anyhow::Result<()> {
                     .collect();
                 items.extend(blocked_items);
                 for firing in &firings_from_items(&items) {
-                    hook_config::run_hook(&repo, &hook_config, firing);
+                    hook_config::run_hook(&repo, &inputs.hook_config, firing);
                 }
                 emit(&items, args.json);
                 return Ok(());
@@ -393,7 +386,7 @@ pub async fn run(args: WaitArgs) -> anyhow::Result<()> {
                 .iter()
                 .filter(|(k, _)| !br.suppressed_plans.contains(k))
                 .count();
-            if role == Role::Master && actionable_in_loop == 0 {
+            if inputs.role == Role::Master && actionable_in_loop == 0 {
                 let queue = match crate::cli::queue::scan_queue_no_dups(&repo) {
                     Ok(q) => q,
                     Err(e) => {
@@ -583,6 +576,47 @@ fn observe_events(
         }
     }
     items
+}
+
+/// The projection inputs derived from repo config — ONE derivation
+/// shared by the arm-time pass and every watch-loop wake, so the two
+/// can't drift (wait-reloads-config-per-refold). Author identity is
+/// deliberately not here (fixed at arm time by design); an explicit
+/// `--role` is an INPUT and is never re-resolved away.
+struct WaitInputs {
+    role: Role,
+    work_policy: clank_core::wait::WorkPolicy,
+    hook_config: std::collections::BTreeMap<HookEvent, Option<String>>,
+}
+
+fn derive_wait_inputs(
+    repo: &Path,
+    author: &AgentLabel,
+    explicit_role: Option<Role>,
+) -> anyhow::Result<WaitInputs> {
+    // Resolve --role from the roster when omitted: `resolve_role`
+    // returns Master for the roster's master and Reviewer for any
+    // tier member. Errors if the repo has no master configured.
+    let role = match explicit_role {
+        Some(r) => r,
+        None => crate::agent_store::resolve_role(repo, author)?,
+    };
+    let config = crate::cli::config::load(repo);
+    // Reviewer tiers from the team resolver. wait is a workflow
+    // command, so it hard-errors when no team is configured
+    // (`teams-based-agent-registration` render-vs-workflow boundary).
+    let tiers = crate::agent_store::load_reviewer_tiers(repo)?;
+    Ok(WaitInputs {
+        role,
+        work_policy: clank_core::wait::WorkPolicy {
+            plan_feedback: config.review.plan_feedback,
+            adhoc_feedback: config.review.adhoc_feedback,
+            commit_reviewers: tiers.commit,
+            plan_reviewers: tiers.plan,
+            final_reviewers: tiers.final_,
+        },
+        hook_config: config.hooks,
+    })
 }
 
 /// Check blocks and return (block_items, suppressed_plans). If a
