@@ -698,10 +698,14 @@ fn agent_group_kdl(
     }
     // The instrument pane: repo pinned via cwd AND --repo (codex
     // 7d3b5d1 — the 361b104/8075d43 lineage applies to every
-    // generated command, not just agent panes). Small on purpose:
-    // the TUI degrades gracefully (1-row bar invariant).
+    // generated command, not just agent panes). PERCENTAGE in both
+    // orientations: zellij treats an absolute layout size as a FIXED
+    // pane and refuses interactive resizes
+    // (zellij-status-pane-resizable) — and 10 rows was too short
+    // anyway. The TUI still degrades gracefully (1-row bar
+    // invariant) if the user squeezes it.
     let tui_size = match orientation {
-        Orientation::Landscape => "size=10",
+        Orientation::Landscape => "size=\"30%\"",
         Orientation::Portrait => "size=\"30%\"",
     };
     let repo_esc = kdl_escape(repo_path);
@@ -1680,6 +1684,34 @@ fn in_session_tab_argv(layout_path: &Path) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn status_pane_size_is_a_percentage_in_both_orientations() {
+        // zellij-status-pane-resizable: an ABSOLUTE layout size makes
+        // zellij treat the pane as FIXED (interactive resize refused),
+        // so the instrument pane must be percentage-sized in BOTH
+        // orientations. Every layout path (base, swap variants, fork,
+        // promote relayout) composes through agent_group_kdl, so this
+        // one assertion covers them all.
+        for o in [Orientation::Landscape, Orientation::Portrait] {
+            let kdl = agent_group_kdl("/repo", "alice", &["bob".to_string()], o);
+            let status_line = kdl
+                .lines()
+                .find(|l| l.contains("name=\"status\""))
+                .expect("an instrument pane line");
+            assert!(
+                status_line.contains("size=\"30%\""),
+                "{o:?}: percentage-sized, got: {status_line}"
+            );
+            // No absolute size anywhere in the group (chrome bars are
+            // composed elsewhere and stay fixed on purpose).
+            assert!(
+                !kdl.lines()
+                    .any(|l| l.contains("size=") && !l.contains("size=\"")),
+                "{o:?}: no absolute pane sizes in the agent group:\n{kdl}"
+            );
+        }
+    }
+
     use super::*;
 
     fn reviewers(labels: &[&str]) -> Vec<String> {
