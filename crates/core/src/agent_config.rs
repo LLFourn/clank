@@ -136,7 +136,31 @@ pub fn effective_auto_mode(
     per_agent: Option<AutoMode>,
     user_default: Option<AutoMode>,
 ) -> AutoMode {
-    per_agent.or(user_default).unwrap_or(AutoMode::Off)
+    effective_auto_mode_with_source(per_agent, user_default).0
+}
+
+/// Where an effective auto-mode came from — so surfaces that show the
+/// value (doctor) can say WHY without recreating the precedence
+/// (grok-first-turn-orchestration: doctor printed the raw per-agent
+/// field, an agent read `unset` as off, and misdiagnosed a wake gap).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoModeSource {
+    PerAgent,
+    UserDefault,
+    /// Neither set: the built-in `Off`.
+    Builtin,
+}
+
+/// The single mode+source resolver every consumer projects from.
+pub fn effective_auto_mode_with_source(
+    per_agent: Option<AutoMode>,
+    user_default: Option<AutoMode>,
+) -> (AutoMode, AutoModeSource) {
+    match (per_agent, user_default) {
+        (Some(m), _) => (m, AutoModeSource::PerAgent),
+        (None, Some(m)) => (m, AutoModeSource::UserDefault),
+        (None, None) => (AutoMode::Off, AutoModeSource::Builtin),
+    }
 }
 
 /// General-purpose launch profile: executable + args + env.

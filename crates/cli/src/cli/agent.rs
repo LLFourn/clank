@@ -231,7 +231,8 @@ fn start(args: AgentStartArgs) -> anyhow::Result<()> {
             let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
             let auto_mode =
                 crate::cli::team::resolve_effective_auto_mode(cfg.as_ref(), home.as_deref());
-            let resolved_prompt = resolve_initial_prompt(desc.initial_prompt.as_deref(), auto_mode);
+            let resolved_prompt =
+                resolve_initial_prompt(desc.initial_prompt.as_deref(), auto_mode, session.tool);
             (
                 compose_launch(
                     &repo,
@@ -470,13 +471,14 @@ struct ComposedLaunch {
     env_overrides: std::collections::BTreeMap<String, String>,
 }
 
-/// Default `initial_prompt` when `auto_mode == On` and the
-/// declaration's `initial_prompt` field is unset. Verbatim per
+/// Default `initial_prompt` for CLAUDE/CODEX when `auto_mode == On`
+/// and the declaration's `initial_prompt` field is unset. Verbatim per
 /// `agent-start-initial-prompt` Phase 3:
 /// - Triggers turn-end with minimum surface (both tools produce
 ///   a one-line ack).
-/// - Does NOT instruct the agent to run `clank wait` itself (the
-///   stop hook is the orchestrator; double-trigger to avoid).
+/// - Does NOT instruct the agent to run `clank wait` itself (THEIR
+///   stop hook is the orchestrator; double-trigger to avoid). Grok
+///   has no hook and gets [`DEFAULT_AUTO_PROMPT_GROK`] instead.
 /// - Does NOT expose orchestration internals (no "stop hook",
 ///   no "work loop") — agent only learns contextual location.
 ///
@@ -484,6 +486,16 @@ struct ComposedLaunch {
 /// asserts on this string with `assert_eq!`, so a tweak fails
 /// the test deliberately.
 pub(super) const DEFAULT_AUTO_PROMPT: &str = "Session resumed.";
+
+/// Grok's default when `auto_mode == On`: unlike claude/codex, grok
+/// has NO clank stop hook (its hooks are passive — grok-first-class),
+/// so nothing orchestrates it after the ack turn. Without this
+/// instruction a freshly started grok ends its first turn with no
+/// wait armed and never wakes (grok-first-turn-orchestration). The
+/// arming instruction IS the orchestrator for grok.
+pub(super) const DEFAULT_AUTO_PROMPT_GROK: &str = "Session resumed. Arm your clank work loop \
+     now: run `clank wait` as a background terminal command (background: true), then end your \
+     turn. Its completion wakes you with work items.";
 
 /// Resolve the initial prompt for an agent-start invocation.
 ///
@@ -499,6 +511,7 @@ pub(super) const DEFAULT_AUTO_PROMPT: &str = "Session resumed.";
 pub(super) fn resolve_initial_prompt(
     declaration: Option<&str>,
     auto_mode: AutoMode,
+    tool: Tool,
 ) -> Option<String> {
     if let Some(s) = declaration {
         if s.is_empty() {
@@ -507,7 +520,14 @@ pub(super) fn resolve_initial_prompt(
         return Some(s.to_string());
     }
     if auto_mode == AutoMode::On {
-        return Some(DEFAULT_AUTO_PROMPT.to_string());
+        // Tool-aware: for claude/codex the STOP HOOK orchestrates
+        // after the ack (a `clank wait` instruction here would
+        // double-trigger); grok has no hook, so its prompt must carry
+        // the arming itself (grok-first-turn-orchestration).
+        return Some(match tool {
+            Tool::Grok => DEFAULT_AUTO_PROMPT_GROK.to_string(),
+            Tool::Claude | Tool::Codex => DEFAULT_AUTO_PROMPT.to_string(),
+        });
     }
     None
 }
@@ -1584,11 +1604,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn compose_launch_grok_auto_start_carries_the_arming_prompt() {
+        // End-to-end shape of the grok-first-turn-orchestration fix:
+        // a grok session started under effective auto-on composes a
+        // launch whose prompt IS the arming instruction (grok has no
+        // hook to orchestrate it after a bare ack).
+        let session = grok_session();
+        let prompt = resolve_initial_prompt(None, AutoMode::On, session.tool)
+            .expect("auto-on default prompt");
+        let c = compose_launch(Path::new("/repo"), &session, None, Some(&prompt));
+        let last = c.args.last().map(|s| s.as_str()).unwrap_or("");
+        assert!(
+            last.contains("clank wait") && last.contains("background"),
+            "the composed grok launch must instruct arming: {:?}",
+            c.args
+        );
+    }
+
     // ── resolve_initial_prompt policy tests ────────────────────
 
     #[test]
     fn resolve_initial_prompt_uses_declaration_field_when_set() {
-        let out = resolve_initial_prompt(Some("foo"), AutoMode::Off);
+        let out = resolve_initial_prompt(Some("foo"), AutoMode::Off, Tool::Claude);
         assert_eq!(out, Some("foo".to_string()));
     }
 
@@ -1596,20 +1634,48 @@ mod tests {
     fn resolve_initial_prompt_uses_default_when_auto_on_and_declaration_unset() {
         // Pinned: exact equality against the constant so a future
         // tweak to DEFAULT_AUTO_PROMPT fails the test deliberately.
-        let out = resolve_initial_prompt(None, AutoMode::On);
-        assert_eq!(out, Some("Session resumed.".to_string()));
+        // Claude AND codex get the bare ack — their stop hook
+        // orchestrates after it.
+        for tool in [Tool::Claude, Tool::Codex] {
+            let out = resolve_initial_prompt(None, AutoMode::On, tool);
+            assert_eq!(out, Some("Session resumed.".to_string()));
+        }
+    }
+
+    #[test]
+    fn resolve_initial_prompt_grok_default_carries_the_arming_instruction() {
+        // grok-first-turn-orchestration: grok has NO clank hook, so
+        // the bare ack ends its first turn with nothing armed and it
+        // never wakes. Its default must instruct the arming. Pinned
+        // exactly, like the claude/codex constant.
+        let out = resolve_initial_prompt(None, AutoMode::On, Tool::Grok);
+        assert_eq!(
+            out,
+            Some(
+                "Session resumed. Arm your clank work loop now: run `clank wait` as a \
+                 background terminal command (background: true), then end your turn. Its \
+                 completion wakes you with work items."
+                    .to_string()
+            )
+        );
     }
 
     #[test]
     fn resolve_initial_prompt_returns_none_when_auto_off_and_declaration_unset() {
-        let out = resolve_initial_prompt(None, AutoMode::Off);
-        assert_eq!(out, None);
+        for tool in [Tool::Claude, Tool::Codex, Tool::Grok] {
+            let out = resolve_initial_prompt(None, AutoMode::Off, tool);
+            assert_eq!(out, None);
+        }
     }
 
     #[test]
     fn resolve_initial_prompt_declaration_wins_over_auto_default() {
-        let out = resolve_initial_prompt(Some("custom"), AutoMode::On);
-        assert_eq!(out, Some("custom".to_string()));
+        // Including for grok: an explicit prompt overrides the arming
+        // default too.
+        for tool in [Tool::Claude, Tool::Codex, Tool::Grok] {
+            let out = resolve_initial_prompt(Some("custom"), AutoMode::On, tool);
+            assert_eq!(out, Some("custom".to_string()));
+        }
     }
 
     #[test]
@@ -1617,9 +1683,11 @@ mod tests {
         // Ruthless 0fe1567 pin: Some("") is the explicit-disable
         // escape hatch. Without this, the only way to opt out of
         // the auto_mode default would be to disable auto_mode
-        // itself — coupling two unrelated concerns.
-        let out = resolve_initial_prompt(Some(""), AutoMode::On);
-        assert_eq!(out, None);
+        // itself — coupling two unrelated concerns. Grok included.
+        for tool in [Tool::Claude, Tool::Codex, Tool::Grok] {
+            let out = resolve_initial_prompt(Some(""), AutoMode::On, tool);
+            assert_eq!(out, None);
+        }
     }
 
     // ── compose_bootstrap_launch policy tests ─────────────────
@@ -1693,7 +1761,7 @@ mod tests {
     #[test]
     fn resolve_initial_prompt_empty_declaration_string_disables_prompt_under_auto_off() {
         // Declaration is authoritative regardless of auto_mode.
-        let out = resolve_initial_prompt(Some(""), AutoMode::Off);
+        let out = resolve_initial_prompt(Some(""), AutoMode::Off, Tool::Claude);
         assert_eq!(out, None);
     }
 

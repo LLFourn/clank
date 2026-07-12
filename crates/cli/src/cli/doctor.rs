@@ -261,10 +261,26 @@ pub fn repo_checks(repo: &Path, home: Option<&Path>) -> Vec<CheckResult> {
                 )
             })
             .unwrap_or_else(|| "unbound".to_string());
+        // Report the EFFECTIVE auto mode with provenance, via the same
+        // resolver `auto status` uses — the raw per-agent field alone
+        // reads as "off" when a user-global default is actually driving
+        // (grok-first-turn-orchestration).
+        let (auto_mode, auto_source) =
+            crate::cli::team::resolve_effective_auto_mode_with_source(Some(&cfg), home);
+        let auto_desc = match auto_source {
+            clank_core::agent_config::AutoModeSource::PerAgent => {
+                format!("{} (per-agent)", auto_mode.as_str())
+            }
+            clank_core::agent_config::AutoModeSource::UserDefault => {
+                format!("{} (user default; per-agent unset)", auto_mode.as_str())
+            }
+            clank_core::agent_config::AutoModeSource::Builtin => {
+                format!("{} (builtin default; nothing set)", auto_mode.as_str())
+            }
+        };
         let base_msg = format!(
-            "{}: auto_mode={}, session={}",
+            "{}: auto_mode={auto_desc}, session={}",
             agent_config_path(repo, label).display(),
-            cfg.auto_mode.map(|m| m.as_str()).unwrap_or("unset"),
             session_desc,
         );
         let agent_check = if cfg.session.is_none() {

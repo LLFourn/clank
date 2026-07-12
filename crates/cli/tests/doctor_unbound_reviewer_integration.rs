@@ -429,3 +429,74 @@ fn doctor_skips_zellij_check_when_unconfigured() {
         "no zellij config → no check emitted"
     );
 }
+
+/// grok-first-turn-orchestration: doctor reports the EFFECTIVE auto
+/// mode with provenance, not the raw per-agent field — an unset
+/// per-agent value under a user-global default-on previously printed
+/// `auto_mode=unset`, which a grok agent read as "off" and
+/// misdiagnosed its wake gap.
+#[tokio::test]
+async fn doctor_reports_effective_auto_mode_with_provenance() {
+    let env = init_repo();
+    register_agents(
+        &env,
+        &[
+            ("boss", clank_core::vocab::Role::Master),
+            ("grok", clank_core::vocab::Role::Reviewer),
+        ],
+    );
+    // Per-agent auto UNSET, session bound.
+    write_skeleton(
+        env.repo(),
+        "grok",
+        &clank_core::agent_config::AgentConfig {
+            auto_mode: None,
+            wait_timeout: None,
+            session: Some(session(
+                clank_core::vocab::Tool::Grok,
+                "11111111-2222-3333-4444-555555555555",
+            )),
+            wait_events: Vec::new(),
+        },
+    );
+    // Seed the user-global default-on in the test HOME.
+    std::fs::create_dir_all(env.home().join(".clank")).unwrap();
+    std::fs::write(env.home().join(".clank/config.json"), r#"{"auto":"on"}"#).unwrap();
+
+    let results = clank::cli::doctor::repo_checks(env.repo(), Some(env.home()));
+    let line = results
+        .iter()
+        .find(|r| r.name.contains("agent: grok"))
+        .expect("a grok agent line");
+    assert!(
+        line.message
+            .contains("auto_mode=on (user default; per-agent unset)"),
+        "effective value + provenance, not the raw field: {}",
+        line.message
+    );
+
+    // And an explicit per-agent OFF says so, despite the global ON.
+    write_skeleton(
+        env.repo(),
+        "grok",
+        &clank_core::agent_config::AgentConfig {
+            auto_mode: Some(clank_core::vocab::AutoMode::Off),
+            wait_timeout: None,
+            session: Some(session(
+                clank_core::vocab::Tool::Grok,
+                "11111111-2222-3333-4444-555555555555",
+            )),
+            wait_events: Vec::new(),
+        },
+    );
+    let results = clank::cli::doctor::repo_checks(env.repo(), Some(env.home()));
+    let line = results
+        .iter()
+        .find(|r| r.name.contains("agent: grok"))
+        .expect("a grok agent line");
+    assert!(
+        line.message.contains("auto_mode=off (per-agent)"),
+        "per-agent choice wins and is attributed: {}",
+        line.message
+    );
+}

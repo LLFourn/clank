@@ -73,10 +73,26 @@ pub(crate) fn resolve_effective_auto_mode(
     per_agent: Option<&clank_core::agent_config::AgentConfig>,
     home: Option<&Path>,
 ) -> clank_core::vocab::AutoMode {
+    resolve_effective_auto_mode_with_source(per_agent, home).0
+}
+
+/// Mode + provenance, for surfaces that display the value (doctor).
+/// Same inputs, same precedence — a projection of THE resolver, so
+/// doctor and `auto status` cannot disagree.
+pub(crate) fn resolve_effective_auto_mode_with_source(
+    per_agent: Option<&clank_core::agent_config::AgentConfig>,
+    home: Option<&Path>,
+) -> (
+    clank_core::vocab::AutoMode,
+    clank_core::agent_config::AutoModeSource,
+) {
     let user_default = home
         .and_then(|h| read_user_config(h).ok())
         .and_then(|c| c.auto);
-    clank_core::agent_config::effective_auto_mode(per_agent.and_then(|c| c.auto_mode), user_default)
+    clank_core::agent_config::effective_auto_mode_with_source(
+        per_agent.and_then(|c| c.auto_mode),
+        user_default,
+    )
 }
 
 pub(crate) fn write_user_config(home: &Path, file: &UserConfigFile) -> anyhow::Result<()> {
@@ -471,13 +487,17 @@ mod tests {
 
     #[test]
     fn resolve_effective_auto_mode_layers_global_default() {
-        use clank_core::agent_config::AgentConfig;
+        use clank_core::agent_config::{AgentConfig, AutoModeSource};
         use clank_core::vocab::AutoMode;
         let home_dir = setup_home();
         let home = home_dir.path();
 
-        // No user-global default, no per-agent config → Off.
+        // No user-global default, no per-agent config → Off (builtin).
         assert_eq!(resolve_effective_auto_mode(None, Some(home)), AutoMode::Off);
+        assert_eq!(
+            resolve_effective_auto_mode_with_source(None, Some(home)),
+            (AutoMode::Off, AutoModeSource::Builtin)
+        );
 
         // Seed a user-global default-on.
         let cfg = UserConfigFile {
@@ -487,8 +507,13 @@ mod tests {
         write_user_config(home, &cfg).unwrap();
 
         // A MISSING per-agent config under a global default-on
-        // resolves On.
+        // resolves On, sourced from the user default — the provenance
+        // doctor shows (grok-first-turn-orchestration).
         assert_eq!(resolve_effective_auto_mode(None, Some(home)), AutoMode::On);
+        assert_eq!(
+            resolve_effective_auto_mode_with_source(None, Some(home)),
+            (AutoMode::On, AutoModeSource::UserDefault)
+        );
 
         // An unset per-agent config also inherits the global default.
         let unset = AgentConfig::default();
@@ -505,6 +530,12 @@ mod tests {
         assert_eq!(
             resolve_effective_auto_mode(Some(&off), Some(home)),
             AutoMode::Off
+        );
+        // An explicit per-agent OFF under a global ON: per-agent wins
+        // and the source says so.
+        assert_eq!(
+            resolve_effective_auto_mode_with_source(Some(&off), Some(home)),
+            (AutoMode::Off, AutoModeSource::PerAgent)
         );
     }
 
