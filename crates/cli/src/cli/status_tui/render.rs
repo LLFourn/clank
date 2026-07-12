@@ -157,6 +157,124 @@ pub(super) fn render_at(
     let mut out: Vec<String> = Vec::with_capacity(rows);
     out.push(bar(snap, color, cols));
 
+    // The SCROLLABLE header (everything between the pinned bar and the
+    // log region), built in FULL by [`scrollable_header`] so the loop
+    // can measure it for the pressure-lift policy, then composed with
+    // the first `view.lift` rows skipped (tui-short-pane-whole-scroll).
+    // At lift == 0 the compose-time row cap reproduces the old
+    // per-section greedy cuts exactly.
+    let head_out = scrollable_header(snap, rows as u16, cols as u16, frame, view);
+    let head_len = head_out.len();
+
+    // Compose: pinned bar + the scrollable header with the first
+    // `lift` rows scrolled off, capped to the pane
+    // (tui-short-pane-whole-scroll).
+    let lift = view.lift.min(head_len);
+    for line in head_out.into_iter().skip(lift) {
+        if out.len() >= rows {
+            break;
+        }
+        out.push(line);
+    }
+
+    // `log` — the LOWEST tier (status-tui-live-log): recent
+    // activity fills whatever rows remain, MOST RECENT AT THE TOP
+    // (rows arrive newest-first, git-log convention — lloyd), each
+    // line styled per row kind + display-width truncated via the
+    // same emit path as the gauges. A blank separator when there's
+    // room for it plus at least one line.
+    // Scrollable content, windowed by `offset` so it ALL pages: the block
+    // ask, then the log with in-progress placeholders spliced into their
+    // final slots (see `build_scroll`).
+    let ask_lines = block_ask_spans(snap, cols);
+    let seq = build_scroll(snap, &ask_lines);
+    let total = seq.len();
+    // The log is a focusable region ONLY when there's an agents panel to
+    // switch focus with — so a panel-less render keeps the bare log
+    // (no rule), unchanged.
+    let has_panel = !snap.agents.is_empty();
+    let log_focused = mode.log_focused();
+    // Render the log region when it has content OR when there's a panel
+    // to switch focus with (so both focusable regions, and which one is
+    // live, stay visible even with an empty log). When a panel is
+    // present the LOG rule is also the breaker between panel and log.
+    // The region's row budget comes from THE shared arithmetic
+    // ([`log_budget`]) — render draws its decision; the loop settles
+    // the log window against the same numbers.
+    let budget = log_budget(rows, head_len, lift, has_panel, log_focused, total);
+    let log_capacity = budget.capacity;
+    {
+        match budget.divider {
+            Divider::Rule => {
+                // Lift on scroll (Material app-bar elevation): the flat rule
+                // while the log is at its top; the same bar on a raised
+                // surface while entries are scrolled UNDER it. The bar
+                // settling flat is also the cue that the next Up crosses
+                // into the panel (panel-focus-tops-log invariant).
+                let clipped = offset.min(total.saturating_sub(1));
+                out.push(if clipped > 0 {
+                    region_rule_elevated("log", "↑↓ scroll", log_focused, cols)
+                } else {
+                    region_rule("log", "↑↓ scroll", log_focused, cols)
+                });
+            }
+            Divider::Separator => out.push(String::new()),
+            Divider::None => {}
+        }
+        let avail = budget.capacity;
+        if total > 0 {
+            // Window starting `offset` rows down, clamped so the last page
+            // still fills.
+            let off = offset.min(total.saturating_sub(1));
+            let end = (off + avail).min(total);
+            // Align summaries at one column: widest reviewer name among
+            // the windowed rows (ask lines have no author column).
+            let author_width = seq[off..end]
+                .iter()
+                .filter_map(|s| match s {
+                    Seg::Log(crate::cli::log::OnelineRow::Review { author, .. }) => {
+                        Some(display_width(author))
+                    }
+                    _ => None,
+                })
+                .max()
+                .unwrap_or(0);
+            for (local, s) in seq[off..end].iter().enumerate() {
+                let spans = match s {
+                    Seg::Ask(line) => (*line).clone(),
+                    Seg::Log(row) => log_row_spans(row, author_width, &snap.log_decorations),
+                };
+                // The selected timeline entry gets the unified selection
+                // band — the same "selected" style as the panel/picker —
+                // while the log is the focused region. Gated on `has_panel`
+                // (the log is only a focusable region when there's a panel
+                // to switch with), so a panel-less log renders bare.
+                let selected = log_focused && has_panel && off + local == log_cursor;
+                out.push(row_line(&spans, selected, color, cols));
+            }
+        }
+    }
+    (out, log_capacity)
+}
+
+/// The FULL scrollable header (everything between the pinned bar and
+/// the log region): gauge body, AGENTS, STASH and QUEUE sections —
+/// unclipped, so the caller can both compose it (render_at) and
+/// MEASURE it (the pressure-lift policy needs the true length; the
+/// clipped render under-reports overflow — codex be2b054).
+pub(super) fn scrollable_header(
+    snap: &StatusSnapshot,
+    rows: u16,
+    cols: u16,
+    frame: usize,
+    view: &PanelView,
+) -> Vec<String> {
+    let mode = view.mode;
+    let rows = rows.max(1) as usize;
+    let cols = cols.max(1) as usize;
+    let color = state_color(snap);
+    let mut head_out: Vec<String> = Vec::new();
+
     let mut body: Vec<Vec<Span>> = Vec::new();
 
     // Breathing room under the bar — the bar needs negative space
@@ -277,16 +395,13 @@ pub(super) fn render_at(
         ]);
     }
 
-    // Greedy fit: bar (+breath) then the gauge body until rows run out.
+    // Bar (+breath) then the gauge body; the compose step below caps.
     // (The AGENTS + LOG sections render below, after the gauges.)
-    if breath && out.len() < rows && !body.is_empty() {
-        out.push(String::new());
+    if breath && !body.is_empty() {
+        head_out.push(String::new());
     }
     for line in body {
-        if out.len() >= rows {
-            break;
-        }
-        out.push(emit(&line, color, cols));
+        head_out.push(emit(&line, color, cols));
     }
 
     // AGENTS — the focusable roster section, rendered directly so it can
@@ -296,9 +411,9 @@ pub(super) fn render_at(
     // run/stop indicator). Gated on a non-empty roster so a teamless
     // repo (and every panel-less render) is byte-for-byte unchanged.
     let agents_focused = mode.agents_focused();
-    if !snap.agents.is_empty() && out.len() < rows {
+    if !snap.agents.is_empty() {
         let hint = "↑↓ move · SPC play/pause · ⏎ details";
-        out.push(region_rule("agents", hint, agents_focused, cols));
+        head_out.push(region_rule("agents", hint, agents_focused, cols));
         // Each agent row; the cursor row gets the unified selection band.
         // The tier (master/commit/gate) distinguishes the kinds.
         // Active agents carry the spinner + italic wait-verb on their own
@@ -313,9 +428,6 @@ pub(super) fn render_at(
             })
         };
         for (i, a) in snap.agents.iter().enumerate() {
-            if out.len() >= rows {
-                break;
-            }
             let mut spans = vec![
                 plain("  ".to_string()),
                 auto_mark(a.auto_mode),
@@ -326,14 +438,14 @@ pub(super) fn render_at(
                 spans.push(dim(format!("  {}", spinner_glyph(frame))));
                 spans.push(italic(format!(" {verb}…")));
             }
-            out.push(row_line(&spans, mode.selected() == Some(i), color, cols));
+            head_out.push(row_line(&spans, mode.selected() == Some(i), color, cols));
         }
         // "+ add" button — the last selectable row (cursor index
         // `agents.len()`).
-        if out.len() < rows {
+        {
             let add_selected = mode.selected() == Some(snap.agents.len());
             let spans = vec![plain("  + add agent".to_string())];
-            out.push(row_line(&spans, add_selected, color, cols));
+            head_out.push(row_line(&spans, add_selected, color, cols));
         }
     }
 
@@ -343,18 +455,15 @@ pub(super) fn render_at(
     // Enter reads the plan (body from the record's protective ref), `o`
     // opens its HTML page. Hidden when empty; panel-less renders keep
     // the gauge summary instead.
-    if !snap.agents.is_empty() && !snap.stash.is_empty() && out.len() < rows {
+    if !snap.agents.is_empty() && !snap.stash.is_empty() {
         let agents_focused = mode.agents_focused();
-        out.push(region_rule(
+        head_out.push(region_rule(
             "stash",
             "⏎ read · o page",
             agents_focused,
             cols,
         ));
         for (i, item) in snap.stash.iter().enumerate() {
-            if out.len() >= rows {
-                break;
-            }
             let note = match (&item.waiting_for, item.ready) {
                 (Some(w), true) => format!("  {w} finished — pop?"),
                 (Some(w), false) => format!("  waiting on {w}"),
@@ -369,7 +478,7 @@ pub(super) fn render_at(
                 spans.push(if item.ready { accent(note) } else { dim(note) });
             }
             let sel_idx = snap.agents.len() + 1 + i;
-            out.push(row_line(
+            head_out.push(row_line(
                 &spans,
                 mode.selected() == Some(sel_idx),
                 color,
@@ -384,25 +493,22 @@ pub(super) fn render_at(
     // draft, `o` opens its HTML page, +/- nudge its priority. Hidden when
     // the queue is empty (no empty header); panel-less renders keep the
     // gauge summary above instead.
-    if !snap.agents.is_empty() && !snap.queue.is_empty() && out.len() < rows {
+    if !snap.agents.is_empty() && !snap.queue.is_empty() {
         let agents_focused = mode.agents_focused();
-        out.push(region_rule(
+        head_out.push(region_rule(
             "queue",
             "⏎ read · o page · +/- priority",
             agents_focused,
             cols,
         ));
         for (i, item) in snap.queue.iter().enumerate() {
-            if out.len() >= rows {
-                break;
-            }
             let spans = vec![
                 plain("  ".to_string()),
                 dim(format!("{:03} ", item.priority)),
                 plain(item.name.clone()),
             ];
             let sel_idx = snap.agents.len() + 1 + i;
-            out.push(row_line(
+            head_out.push(row_line(
                 &spans,
                 mode.selected() == Some(sel_idx),
                 color,
@@ -411,82 +517,7 @@ pub(super) fn render_at(
         }
     }
 
-    // `log` — the LOWEST tier (status-tui-live-log): recent
-    // activity fills whatever rows remain, MOST RECENT AT THE TOP
-    // (rows arrive newest-first, git-log convention — lloyd), each
-    // line styled per row kind + display-width truncated via the
-    // same emit path as the gauges. A blank separator when there's
-    // room for it plus at least one line.
-    // Scrollable content, windowed by `offset` so it ALL pages: the block
-    // ask, then the log with in-progress placeholders spliced into their
-    // final slots (see `build_scroll`).
-    let ask_lines = block_ask_spans(snap, cols);
-    let seq = build_scroll(snap, &ask_lines);
-    let total = seq.len();
-    let mut log_capacity = 0usize;
-    // The log is a focusable region ONLY when there's an agents panel to
-    // switch focus with — so a panel-less render keeps the bare log
-    // (no rule), unchanged.
-    let has_panel = !snap.agents.is_empty();
-    let log_focused = mode.log_focused();
-    // Render the log region when it has content OR when there's a panel
-    // to switch focus with (so both focusable regions, and which one is
-    // live, stay visible even with an empty log). When a panel is
-    // present the LOG rule is also the breaker between panel and log.
-    if out.len() < rows && (total > 0 || has_panel) {
-        let mut avail = rows - out.len();
-        if has_panel && avail >= 1 {
-            // Lift on scroll (Material app-bar elevation): the flat rule
-            // while the log is at its top; the same bar on a raised
-            // surface while entries are scrolled UNDER it. The bar
-            // settling flat is also the cue that the next Up crosses
-            // into the panel (panel-focus-tops-log invariant).
-            let clipped = offset.min(total.saturating_sub(1));
-            out.push(if clipped > 0 {
-                region_rule_elevated("log", "↑↓ scroll", log_focused, cols)
-            } else {
-                region_rule("log", "↑↓ scroll", log_focused, cols)
-            });
-            avail -= 1;
-        } else if avail >= 2 {
-            // Panel-less: keep the old blank separator, unchanged.
-            out.push(String::new());
-            avail -= 1;
-        }
-        log_capacity = avail;
-        if total > 0 {
-            // Window starting `offset` rows down, clamped so the last page
-            // still fills.
-            let off = offset.min(total.saturating_sub(1));
-            let end = (off + avail).min(total);
-            // Align summaries at one column: widest reviewer name among
-            // the windowed rows (ask lines have no author column).
-            let author_width = seq[off..end]
-                .iter()
-                .filter_map(|s| match s {
-                    Seg::Log(crate::cli::log::OnelineRow::Review { author, .. }) => {
-                        Some(display_width(author))
-                    }
-                    _ => None,
-                })
-                .max()
-                .unwrap_or(0);
-            for (local, s) in seq[off..end].iter().enumerate() {
-                let spans = match s {
-                    Seg::Ask(line) => (*line).clone(),
-                    Seg::Log(row) => log_row_spans(row, author_width, &snap.log_decorations),
-                };
-                // The selected timeline entry gets the unified selection
-                // band — the same "selected" style as the panel/picker —
-                // while the log is the focused region. Gated on `has_panel`
-                // (the log is only a focusable region when there's a panel
-                // to switch with), so a panel-less log renders bare.
-                let selected = log_focused && has_panel && off + local == log_cursor;
-                out.push(row_line(&spans, selected, color, cols));
-            }
-        }
-    }
-    (out, log_capacity)
+    head_out
 }
 
 /// Newest-at-top render with no scroll — the common case the layout
@@ -1978,6 +2009,268 @@ mod tests {
         }
     }
 
+    // ── tui-short-pane-whole-scroll: pressure lift ────────────
+
+    #[test]
+    fn render_capacity_always_equals_the_budget() {
+        // THE consistency property the refactor exists for: render_at
+        // draws log_budget's decision, and the loop settles against the
+        // same numbers — so the render's returned capacity must equal
+        // the budget's across the shape space (heights, lifts, focus,
+        // panel presence, log lengths).
+        use super::super::scroll::log_budget;
+        let mut with_panel = two_agent_snap();
+        with_panel.log_rows = (0..12).map(|i| commit_row(&format!("c{i}"))).collect();
+        let mut empty_log = two_agent_snap();
+        empty_log.log_rows = Vec::new();
+        let mut panel_less = snap(vec![], vec![]);
+        panel_less.log_rows = (0..12).map(|i| commit_row(&format!("c{i}"))).collect();
+        for s in [&with_panel, &empty_log, &panel_less] {
+            let has_panel = !s.agents.is_empty();
+            for rows in [1u16, 2, 3, 4, 7, 10, 30] {
+                for lift in [0usize, 1, 3, 20] {
+                    for focused in [true, false] {
+                        let mode = if focused {
+                            Mode::LogScroll
+                        } else {
+                            Mode::AgentPanel { sel: 0 }
+                        };
+                        let view = PanelView {
+                            mode,
+                            plan_page: None,
+                            plan_input: None,
+                            picker: &[],
+                            log_cursor: 0,
+                            lift,
+                        };
+                        let header_len = scrollable_header(s, rows, 60, 0, &view).len();
+                        // The log is only a focusable region with a panel.
+                        let log_focused = focused && has_panel;
+                        let total = {
+                            let ask = block_ask_spans(s, 60);
+                            build_scroll(s, &ask).len()
+                        };
+                        let budget = log_budget(
+                            rows as usize,
+                            header_len,
+                            lift.min(header_len),
+                            has_panel,
+                            log_focused,
+                            total,
+                        );
+                        let cap = render_at(s, rows, 60, 0, 0, &view).1;
+                        assert_eq!(
+                            cap, budget.capacity,
+                            "rows {rows} lift {lift} focused {focused} panel {has_panel}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    fn lift_view(cursor: usize, lift: usize) -> PanelView<'static> {
+        PanelView {
+            plan_page: None,
+            plan_input: None,
+            mode: Mode::LogScroll,
+            picker: &[],
+            log_cursor: cursor,
+            lift,
+        }
+    }
+
+    #[test]
+    fn pressure_lift_policy_boundaries() {
+        use super::super::scroll::pressure_lift;
+        // Unfocused: never lifts, any height, any header.
+        assert_eq!(pressure_lift(false, 10, 30, 9, 12), 0);
+        // Tall pane, short header: fits alongside min_log → no lift.
+        assert_eq!(pressure_lift(true, 40, 7, 9, 12), 0);
+        // rows==10, header 7 (the two-agent fixture shape): full header
+        // + one entry coexist at the top; the lift grows with descent
+        // to the min_log target and no further.
+        assert_eq!(
+            pressure_lift(true, 10, 7, 0, 12),
+            0,
+            "cursor at top → full header"
+        );
+        assert_eq!(
+            pressure_lift(true, 10, 7, 2, 12),
+            2,
+            "progressive with descent"
+        );
+        assert_eq!(
+            pressure_lift(true, 10, 7, 9, 12),
+            4,
+            "capped at the min_log target"
+        );
+        // OVER-TALL header (codex be2b054): rows==10, header 20. Even at
+        // cursor-at-top one entry row is guaranteed — the header is
+        // partially hidden from the start (the defined tradeoff)…
+        assert_eq!(
+            pressure_lift(true, 10, 20, 0, 12),
+            13,
+            "one entry over a full header"
+        );
+        // …and descent still reaches the full min_log viewport.
+        assert_eq!(
+            pressure_lift(true, 10, 20, 9, 12),
+            17,
+            "min_log despite the overflow"
+        );
+        // Height-conditional chrome: rows==4 → min_log 2; rows==2 → the
+        // rule yields (chrome 1, min_log 1, ALL header hidden for the
+        // entry); rows==1 → bar only, lift can't help.
+        // rows==4: bar + rule + two entries consume the pane — the
+        // whole header hides at full descent.
+        assert_eq!(pressure_lift(true, 4, 7, 9, 12), 7);
+        assert_eq!(pressure_lift(true, 2, 7, 9, 12), 7);
+        assert_eq!(pressure_lift(true, 1, 7, 9, 12), 0);
+        // EMPTY sequence (codex ce616ce): nothing to reserve a viewport
+        // for — no lift, however tall the header.
+        assert_eq!(
+            pressure_lift(true, 10, 20, 0, 0),
+            0,
+            "empty timeline never lifts"
+        );
+        // Cursor past the exhausted tail: clamped to the real sequence,
+        // so the lift equals the last-entry lift, not an overshoot.
+        assert_eq!(
+            pressure_lift(true, 10, 20, 50, 12),
+            pressure_lift(true, 10, 20, 11, 12),
+            "past-end cursor clamps to the tail"
+        );
+        // A sequence SHORTER than min_log bounds the target too.
+        assert_eq!(
+            pressure_lift(true, 10, 20, 9, 2),
+            pressure_lift(true, 10, 20, 1, 2),
+            "target never exceeds the entries that exist"
+        );
+    }
+
+    #[test]
+    fn short_pane_walk_lifts_header_progressively_and_keeps_selection_visible() {
+        use super::super::scroll::pressure_lift;
+        // Roster + long log in a 10-row pane: the header (breath,
+        // gauges, AGENTS rule + 2 rows + add) eats most of it.
+        let mut s = two_agent_snap();
+        s.log_rows = (0..12).map(|i| commit_row(&format!("c{i}"))).collect();
+        walk_asserting_visibility(&s, 10, 12);
+        // Walking back to the top restores the full header: lift(0) is 0
+        // for this fixture (header + one entry fit), so the render is
+        // the untouched one.
+        let header_len = scrollable_header(&s, 10, 60, 0, &lift_view(0, 0)).len();
+        assert_eq!(pressure_lift(true, 10, header_len, 0, 12), 0);
+
+        // OVER-TALL header (codex be2b054): six more agents push the
+        // header past the pane. Capacity alone reads 0 at every depth;
+        // the header-length policy still surfaces the log.
+        let mut big = two_agent_snap();
+        for i in 0..6 {
+            big.agents.push(crate::cli::status_tui::fixtures::agent_row(
+                &format!("extra{i}"),
+                crate::cli::teams_config::RosterRole::Commit,
+                clank_core::vocab::AutoMode::On,
+            ));
+        }
+        big.log_rows = (0..12).map(|i| commit_row(&format!("c{i}"))).collect();
+        let header_len = scrollable_header(&big, 10, 60, 0, &lift_view(0, 0)).len();
+        assert!(header_len >= 10, "fixture premise: header exceeds the pane");
+        // Even at cursor-at-top the selection is visible (one entry row
+        // over a partially hidden header — the defined tradeoff).
+        let lift0 = pressure_lift(true, 10, header_len, 0, 12);
+        let cap0 = render_at(&big, 10, 60, 0, 0, &lift_view(0, lift0)).1;
+        assert!(cap0 >= 1, "one entry row guaranteed at the top");
+        walk_asserting_visibility(&big, 10, 12);
+    }
+
+    /// Emulate the loop for a cursor walk: derive the lift from the
+    /// true header length, probe capacity under it, settle the window,
+    /// and assert the selection is always visible with the min_log
+    /// target honored once descent allows it.
+    fn walk_asserting_visibility(s: &StatusSnapshot, rows: u16, total: usize) {
+        use super::super::scroll::{pressure_lift, scroll_to_show};
+        let header_len = scrollable_header(s, rows, 60, 0, &lift_view(0, 0)).len();
+        let min_log = 5.min(rows as usize - 2);
+        let mut offset = 0usize;
+        let mut last_header_visible = usize::MAX;
+        for cursor in 0..8 {
+            let lift = pressure_lift(true, rows as usize, header_len, cursor, total);
+            let (_, cap) = render_at(s, rows, 60, offset, 0, &lift_view(cursor, lift));
+            offset = scroll_to_show(cursor, offset, cap, total);
+            let (out, cap) = render_at(s, rows, 60, offset, 0, &lift_view(cursor, lift));
+            assert!(!out.is_empty(), "bar row present");
+            let target = (1 + cursor).min(min_log);
+            assert!(
+                cap >= target,
+                "cursor {cursor}: capacity {cap} ≥ target {target}"
+            );
+            assert!(
+                offset <= cursor && cursor < offset + cap,
+                "cursor {cursor} visible in [{offset}, {})",
+                offset + cap
+            );
+            // Header rows only recede as the cursor descends.
+            let header_visible = header_len - lift.min(header_len);
+            assert!(header_visible <= last_header_visible, "header only recedes");
+            last_header_visible = header_visible;
+        }
+    }
+
+    #[test]
+    fn lift_drops_header_rows_after_the_bar_only() {
+        let mut s = two_agent_snap();
+        s.log_rows = (0..12).map(|i| commit_row(&format!("c{i}"))).collect();
+        let base = render_at(&s, 10, 60, 0, 0, &lift_view(0, 0)).0;
+        let lifted = render_at(&s, 10, 60, 0, 0, &lift_view(0, 2)).0;
+        // The bar (row 0) is identical; the next rows are the base's
+        // header shifted up by two.
+        assert_eq!(base[0], lifted[0], "the bar is pinned");
+        assert_eq!(base[3], lifted[1], "header rows lifted off the top");
+        // Freed rows went to the log: capacity grew by the lift.
+        let cap0 = render_at(&s, 10, 60, 0, 0, &lift_view(0, 0)).1;
+        let cap2 = render_at(&s, 10, 60, 0, 0, &lift_view(0, 2)).1;
+        assert_eq!(cap2, cap0 + 2);
+    }
+
+    #[test]
+    fn tiny_height_degradation_is_intentional() {
+        let mut s = two_agent_snap();
+        s.log_rows = (0..12).map(|i| commit_row(&format!("c{i}"))).collect();
+        // rows == 4 and 3, focused: bar + lifted header remainder +
+        // rule + log — the rule is pinned (a row exists for it).
+        for rows in [4u16, 3] {
+            let (out, cap) = render_at(&s, rows, 60, 0, 0, &lift_view(0, 20));
+            assert!(out.len() <= rows as usize);
+            assert!(
+                out.iter().any(|l| visible(l).contains("LOG")),
+                "rows {rows}: the focused rule is pinned"
+            );
+            assert!(cap >= 1, "rows {rows}: at least one entry row");
+        }
+        // rows == 2, focused with content: the rule YIELDS to the entry.
+        let (out, cap) = render_at(&s, 2, 60, 0, 0, &lift_view(0, 20));
+        assert_eq!(cap, 1, "bar + the selected entry row");
+        assert!(
+            !out.iter().any(|l| visible(l).contains("LOG")),
+            "the rule yields its row to the selection"
+        );
+        // rows == 2, UNFOCUSED: today's greedy fit unchanged — bar +
+        // first header row, no pressure lift ever engages.
+        let unfocused = PanelView {
+            mode: Mode::AgentPanel { sel: 0 },
+            ..lift_view(0, 0)
+        };
+        let (out, _) = render_at(&s, 2, 60, 0, 0, &unfocused);
+        assert_eq!(out.len(), 2);
+        // rows == 1: bar only — the one height where selection
+        // visibility is unsatisfiable (no panic, no overdraw).
+        let (out, cap) = render_at(&s, 1, 60, 0, 0, &lift_view(0, 20));
+        assert_eq!(out.len(), 1, "bar only");
+        assert_eq!(cap, 0);
+    }
+
     #[test]
     fn log_rule_lifts_while_entries_are_scrolled_under_it() {
         // Material lift-on-scroll: the LOG rule is flat (dim, no bg) at
@@ -1992,6 +2285,7 @@ mod tests {
             mode: Mode::LogScroll,
             picker: &[],
             log_cursor: 6,
+            lift: 0,
         };
         let rule_of = |offset: usize| {
             let out = render_at(&s, 12, 60, offset, 0, &view).0;
@@ -2697,6 +2991,7 @@ mod tests {
                 mode: Mode::AddPicker { sel: 0 },
                 picker: &picker,
                 log_cursor: 0,
+                lift: 0,
             },
         )
         .0;
@@ -2738,6 +3033,7 @@ mod tests {
             mode: Mode::AddPicker { sel: 0 },
             picker: &picker,
             log_cursor: 0,
+            lift: 0,
         };
 
         // Tiny pane: never more lines than rows, and no element spans
@@ -2831,6 +3127,7 @@ mod tests {
                 },
                 picker: &picker,
                 log_cursor: 0,
+                lift: 0,
             },
         )
         .0
@@ -3178,6 +3475,7 @@ mod tests {
             mode: Mode::LogScroll,
             picker: &[],
             log_cursor: 1,
+            lift: 0,
         };
         let lines = render_at(&s, 40, 80, 0, 0, &view).0;
         assert!(

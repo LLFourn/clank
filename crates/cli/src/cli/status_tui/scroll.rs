@@ -409,3 +409,112 @@ mod tests {
         );
     }
 }
+
+/// The focused log's guaranteed viewport in a short pane, once the
+/// selection has descended far enough (tui-short-pane-whole-scroll).
+pub(super) const MIN_LOG_ROWS: usize = 5;
+
+/// What divides the (lifted) header from the log entries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Divider {
+    /// The focusable LOG region rule (panel present).
+    Rule,
+    /// The panel-less blank separator.
+    Separator,
+    None,
+}
+
+/// The log region's row budget — THE single owner of the pane's row
+/// arithmetic. `render_at` DRAWS this decision and the event loop
+/// settles the log window against the same numbers, so the two can't
+/// drift (they did, three review rounds running — codex be2b054,
+/// ce616ce lineage).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct LogBudget {
+    pub(super) divider: Divider,
+    /// Log ENTRY rows (after the divider's row, if any).
+    pub(super) capacity: usize,
+}
+
+/// Budget the pane: a pinned bar row, then the header's visible
+/// remainder (its length minus `lift`, capped to the pane), then the
+/// log region. The rule YIELDS its row when it would leave no entry
+/// row for a focused selection (rows == 2 shape): selection
+/// visibility outranks the rule, the bar outranks both.
+pub(super) fn log_budget(
+    rows: usize,
+    header_len: usize,
+    lift: usize,
+    has_panel: bool,
+    log_focused: bool,
+    total: usize,
+) -> LogBudget {
+    let rows = rows.max(1);
+    let visible_header = (header_len.saturating_sub(lift)).min(rows - 1);
+    let mut avail = rows - 1 - visible_header;
+    // The region renders when it has content OR a panel to switch
+    // focus with; otherwise it is absent entirely.
+    if avail == 0 || (total == 0 && !has_panel) {
+        return LogBudget {
+            divider: Divider::None,
+            capacity: 0,
+        };
+    }
+    let rule_yields = log_focused && avail == 1 && total > 0;
+    let divider = if has_panel && !rule_yields {
+        avail -= 1;
+        Divider::Rule
+    } else if !has_panel && avail >= 2 {
+        avail -= 1;
+        Divider::Separator
+    } else {
+        Divider::None
+    };
+    LogBudget {
+        divider,
+        capacity: avail,
+    }
+}
+
+/// Whole-pane pressure offset (tui-short-pane-whole-scroll): the
+/// SMALLEST lift whose [`log_budget`] meets the entry target — the
+/// policy optimizes over the render's own budget function, so the two
+/// cannot disagree by construction. Pure.
+///
+/// - Unfocused, or an empty sequence: 0 — the header never moves under
+///   you, and an empty timeline reserves nothing (codex ce616ce).
+/// - The target is `1 + cursor` (one entry visible even at
+///   cursor-at-top — with an over-tall header that means the header is
+///   partially hidden from the start; selection visibility outranks
+///   the full header), capped at [`MIN_LOG_ROWS`], the entries that
+///   exist, and what ANY lift can achieve at this height (rows == 1:
+///   nothing can — the bar owns the pane, the stated degradation).
+pub(super) fn pressure_lift(
+    log_focused: bool,
+    rows: usize,
+    header_len: usize,
+    cursor: usize,
+    total: usize,
+) -> usize {
+    if !log_focused || total == 0 {
+        return 0;
+    }
+    let cursor = cursor.min(total - 1);
+    let budget_at = |lift: usize| log_budget(rows, header_len, lift, true, true, total);
+    let max_capacity = budget_at(header_len).capacity;
+    let target = (1 + cursor).min(MIN_LOG_ROWS).min(total).min(max_capacity);
+    if target == 0 {
+        return 0;
+    }
+    // Prefer a lift that keeps the RULE alongside the target (it
+    // carries the focus affordance — pinned whenever affordable);
+    // fall back to the yield shape only when no lift can afford both
+    // (the rows == 2 family).
+    (0..=header_len)
+        .find(|&lift| {
+            let b = budget_at(lift);
+            b.divider == Divider::Rule && b.capacity >= target
+        })
+        .or_else(|| (0..=header_len).find(|&lift| budget_at(lift).capacity >= target))
+        .unwrap_or(0)
+}

@@ -685,6 +685,12 @@ pub(super) struct PanelView<'a> {
     /// The selected log ENTRY (index into the scroll sequence) — drawn
     /// with the unified selection band when the log is focused.
     pub(super) log_cursor: usize,
+    /// Whole-pane pressure offset (tui-short-pane-whole-scroll): how
+    /// many SCROLLABLE header rows (gauges, agents/stash/queue
+    /// sections — never the bar) are scrolled off the top to give a
+    /// focused log its minimum viewport in a short pane. 0 = today's
+    /// rendering, byte for byte.
+    pub(super) lift: usize,
 }
 
 impl<'a> PanelView<'a> {
@@ -698,6 +704,7 @@ impl<'a> PanelView<'a> {
             plan_input: None,
             picker: &[],
             log_cursor: 0,
+            lift: 0,
         }
     }
 }

@@ -1238,9 +1238,8 @@ pub(crate) async fn run_tui(
             plan_input: plan_input.as_ref(),
             picker: &picker,
             log_cursor: log.cursor,
+            lift: 0,
         };
-        let capacity = render_at(&snapshot, rows, cols, log.offset, frame, &view).1;
-
         // The ask lines depend on blocks (not the log fetch), so compute
         // them before filling. `head` is the count of scrollable rows that
         // aren't log rows — ONLY the ask lines: in-progress activity lives
@@ -1255,12 +1254,16 @@ pub(crate) async fn run_tui(
         let head = ask_lines.len();
 
         // Load enough log to fill the viewport AND reach the cursor (the
-        // cursor can move past the loaded tail). Gated on `log.fill` so
-        // an animation tick never reaches it.
+        // cursor can move past the loaded tail). Runs BEFORE the lift is
+        // derived, so the policy sees the real post-fill total (an
+        // unclamped cursor or an empty sequence must not over-lift —
+        // codex ce616ce). The viewport can never exceed the pane, so
+        // `rows` bounds the fill regardless of the eventual lift. Gated
+        // on `log.fill` so an animation tick never reaches it.
         if log.fill {
-            let want = (log.offset + capacity).max(log.cursor + 1);
+            let want = (log.offset + rows as usize).max(log.cursor + 1);
             while !log.complete && head + snapshot.log_rows.len() < want {
-                log.window += capacity.max(1);
+                log.window += (rows as usize).max(1);
                 let before = snapshot.log_rows.len();
                 snapshot.log_rows = crate::cli::status::tui_log_rows(&repo, log.window).await;
                 if snapshot.log_rows.len() == before {
@@ -1271,17 +1274,31 @@ pub(crate) async fn run_tui(
         }
 
         let total = head + snapshot.log_rows.len();
+        // Pressure lift (tui-short-pane-whole-scroll): in a short pane a
+        // focused log keeps a working viewport by lifting scrollable
+        // header rows off the top, growing with the cursor's descent so
+        // the header restores as the selection walks back up. Derived
+        // from the TRUE header length (a clipped render reports
+        // capacity 0 however deep the header overflows — codex be2b054)
+        // and the POST-FILL total (the policy clamps the cursor exactly
+        // as settle will). Capacity comes from the SAME budget function
+        // the render draws, so no probe render is needed.
+        let header_len = render::scrollable_header(&snapshot, rows, cols, frame, &view).len();
+        let lift = pressure_lift(log_focused, rows as usize, header_len, log.cursor, total);
+        let capacity = log_budget(
+            rows as usize,
+            header_len,
+            lift,
+            !snapshot.agents.is_empty(),
+            log_focused,
+            total,
+        )
+        .capacity;
         // Derive the viewport from the cursor (focused) or keep the last
         // page full (unfocused) — see [`LogView::settle`].
         log.settle(capacity, total, log_focused);
         // Rebuild the view with the clamped cursor/offset for the paint.
-        let view = PanelView {
-            mode,
-            plan_page: plan_page.as_ref(),
-            plan_input: plan_input.as_ref(),
-            picker: &picker,
-            log_cursor: log.cursor,
-        };
+        let view = PanelView { lift, ..view };
         // `screen_total` is the current screen's virtual content height
         // (log rows; plan page chrome + full document) — the plan page's
         // body-scroll clamp reads it, mirroring the overlay pattern.
