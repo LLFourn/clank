@@ -235,6 +235,9 @@ fn print_human(events: &[&LogEvent], repo: &Path, shas: &[CommitSha]) -> anyhow:
                 for line in body.lines() {
                     println!("    {line}");
                 }
+                // Ad-hoc commits carry reviews too
+                // (review.adhoc_feedback — adhoc-reviews-in-log).
+                print_reviews(&reviews, sha.as_str(), c);
                 continue;
             }
         };
@@ -254,29 +257,43 @@ fn print_human(events: &[&LogEvent], repo: &Path, shas: &[CommitSha]) -> anyhow:
         for line in body.lines() {
             println!("    {line}");
         }
-        if let Some(rs) = reviews.get(sha.as_str()) {
-            for r in rs {
-                let m = verdict_mark(r.verdict, c);
-                let snip = if r.summary.is_empty() {
-                    String::new()
-                } else {
-                    format!(": {}", r.summary)
-                };
-                if c {
-                    println!("    {m} {C}{}{Z} {}{snip}", r.author, r.verdict);
-                } else {
-                    println!("    {m} {} {}{snip}", r.author, r.verdict);
-                }
-                if !r.body.is_empty() {
-                    println!();
-                    for line in r.body.lines() {
-                        println!("        {line}");
-                    }
-                }
+        print_reviews(&reviews, sha.as_str(), c);
+    }
+    Ok(())
+}
+
+fn print_reviews(reviews: &std::collections::BTreeMap<String, Vec<Review>>, sha: &str, c: bool) {
+    if let Some(rs) = reviews.get(sha) {
+        for line in human_review_lines(rs, c) {
+            println!("{line}");
+        }
+    }
+}
+
+/// The `clank log` review block under a commit, as lines — pure so the
+/// shape is testable without capturing stdout (adhoc-reviews-in-log).
+fn human_review_lines(rs: &[Review], c: bool) -> Vec<String> {
+    let mut out = Vec::new();
+    for r in rs {
+        let m = verdict_mark(r.verdict, c);
+        let snip = if r.summary.is_empty() {
+            String::new()
+        } else {
+            format!(": {}", r.summary)
+        };
+        if c {
+            out.push(format!("    {m} {C}{}{Z} {}{snip}", r.author, r.verdict));
+        } else {
+            out.push(format!("    {m} {} {}{snip}", r.author, r.verdict));
+        }
+        if !r.body.is_empty() {
+            out.push(String::new());
+            for line in r.body.lines() {
+                out.push(format!("        {line}"));
             }
         }
     }
-    Ok(())
+    out
 }
 
 /// The leading 1-col gutter marker on a commit row — mutually exclusive by
@@ -438,13 +455,12 @@ pub(crate) fn oneline_rows(
             };
             // Reviews render ABOVE their commit: a review happens AFTER
             // its commit, so in a newest-first list it belongs above it
-            // (time order — status-timeline-progress). AdHoc rows carry
-            // no reviews. Multiple reviews of one commit keep
+            // (time order — status-timeline-progress). Ad-hoc commits
+            // carry reviews too (review.adhoc_feedback —
+            // adhoc-reviews-in-log). Multiple reviews of one commit keep
             // `collect_reviews`' deterministic by-author order — `Review`
             // carries no timestamp to sort chronologically.
-            if !matches!(event, LogEvent::AdHoc { .. })
-                && let Some(rs) = reviews.get(sha.as_str())
-            {
+            if let Some(rs) = reviews.get(sha.as_str()) {
                 for r in rs {
                     out.push(OnelineRow::Review {
                         verdict: r.verdict,
@@ -602,6 +618,18 @@ enum LogJsonRow<'a> {
 
 fn print_json(events: &[&LogEvent], repo: &Path, shas: &[CommitSha]) -> anyhow::Result<()> {
     let reviews = collect_reviews(repo, shas);
+    let out = json_rows(events, &reviews);
+    println!("{}", serde_json::to_string_pretty(&out)?);
+    Ok(())
+}
+
+/// The `clank log --json` row sequence — pure, so the review
+/// attachment (EVERY commit kind carries its reviews, ad-hoc included
+/// — adhoc-reviews-in-log) is pinned without capturing stdout.
+fn json_rows<'a>(
+    events: &[&'a LogEvent],
+    reviews: &'a std::collections::BTreeMap<String, Vec<Review>>,
+) -> Vec<LogJsonRow<'a>> {
     let mut out: Vec<LogJsonRow> = Vec::new();
     for event in events {
         out.push(match event {
@@ -670,13 +698,46 @@ fn print_json(events: &[&LogEvent], repo: &Path, shas: &[CommitSha]) -> anyhow::
             }
         }
     }
-    println!("{}", serde_json::to_string_pretty(&out)?);
-    Ok(())
+    out
 }
 
 #[cfg(test)]
 mod json_output_tests {
     use super::*;
+
+    #[test]
+    fn json_rows_attach_reviews_to_adhoc_commits_too() {
+        // adhoc-reviews-in-log: the JSON surface already attached
+        // reviews to every commit kind — pinned so the three renderers
+        // can't diverge again.
+        use crate::lifecycle::CommitSha;
+        let sha = CommitSha::parse(&format!("{:0<40}", "cc")).unwrap();
+        let event = LogEvent::AdHoc {
+            sha: sha.clone(),
+            ts: 5,
+            subject: "drive-by".into(),
+        };
+        let mut reviews = std::collections::BTreeMap::new();
+        reviews.insert(
+            sha.as_str().to_string(),
+            vec![Review {
+                author: "codex".into(),
+                verdict: Verdict::RequestChanges,
+                summary: "s".into(),
+                body: String::new(),
+            }],
+        );
+        let rows = json_rows(&[&event], &reviews);
+        assert_eq!(rows.len(), 2, "the ad-hoc row plus its review row");
+        assert!(matches!(rows[0], LogJsonRow::AdHoc { .. }));
+        assert!(matches!(
+            rows[1],
+            LogJsonRow::Review {
+                author: "codex",
+                ..
+            }
+        ));
+    }
 
     #[test]
     fn log_json_rows_serialize_to_the_stable_shape() {
@@ -797,8 +858,9 @@ mod tests {
                 body: String::new(),
             }],
         );
-        // AdHoc carries reviews in the map but must NOT emit
-        // sub-lines (pre-factoring shape).
+        // AdHoc commits render their reviews too — ad-hoc feedback is
+        // a first-class review surface (review.adhoc_feedback,
+        // adhoc-reviews-in-log).
         reviews.insert(
             sha("cc").as_str().to_string(),
             vec![Review {
@@ -823,9 +885,34 @@ mod tests {
                 "    ✓ codex: lgtm".to_string(),
                 "✎ aa00000 intro".to_string(),
                 "⚑ bb00000 wrap up".to_string(),
+                "    ✓ codex: x".to_string(),
                 "~ cc00000 drive-by".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn human_review_lines_shape_for_adhoc_reviews() {
+        // adhoc-reviews-in-log: the pure line builder `clank log`'s
+        // AdHoc arm now shares with the plan path — verdict mark,
+        // author, summary snip, indented body.
+        let rs = vec![Review {
+            author: "codex".into(),
+            verdict: Verdict::RequestChanges,
+            summary: "make it consistent".into(),
+            body: "line one\nline two".into(),
+        }];
+        let lines = human_review_lines(&rs, false);
+        assert_eq!(
+            lines,
+            vec![
+                "    ✗ codex request_changes: make it consistent".to_string(),
+                String::new(),
+                "        line one".to_string(),
+                "        line two".to_string(),
+            ]
+        );
+        assert!(human_review_lines(&[], false).is_empty());
     }
 
     #[test]
