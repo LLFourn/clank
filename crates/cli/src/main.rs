@@ -99,8 +99,9 @@ enum Command {
     /// agent's Stop hook config by `clank setup`; not typically
     /// invoked directly.
     StopHook(cli::StopHookArgs),
-    /// Install user-scope clank assets into ~/.claude and
-    /// ~/.codex: skill files and Stop hook entries.
+    /// Install user-scope clank assets into ~/.claude, ~/.codex,
+    /// and ~/.grok: skill files, plus Stop hook entries for the
+    /// tools with active hooks (claude, codex).
     Setup(cli::SetupArgs),
     /// Check that the clank integration is correctly set up
     /// across repo, user, and current-session scopes. Exits 0

@@ -67,13 +67,13 @@ must amend BEFORE anything else proceeds. Three ways to break it:
 - `clank stash push <plan>` / `clank stash pop <plan>` — set a plan's commits
   aside / restore them (reviews reset on restore); `clank purge --drop
   <plan>` fully deletes a plan (commits + body)
-- roster: `clank agent add <name> [--tool claude|codex] [--review
-  commit|gate]` (by name from the global library, or `--tool` to define
-  inline), `clank agent promote <name>` (elevate an agent to master,
-  demoting the current one — NOT `clank queue promote`, which activates a
-  queued plan), `clank agent set-review <name> commit|gate` (change a
-  reviewer's tier in place), `clank agent remove <name>`, `clank agent
-  list`
+- roster: `clank agent add <name> [--tool claude|codex|grok] [--review
+  commit|plan|final|gate]` (by name from the global library, or `--tool`
+  to define inline), `clank agent promote <name>` (elevate an agent to
+  master, demoting the current one — NOT `clank queue promote`, which
+  activates a queued plan), `clank agent set-review <name>
+  commit|plan|final|gate` (change a reviewer's tier in place),
+  `clank agent remove <name>`, `clank agent list`
 - `clank block create <name> --plan <stem> -m "question"` — ask the
   human. Scope is mandatory: `--plan <stem>` targets one plan (usual);
   `--all` suppresses every item (rare). `clank block clean` acknowledges

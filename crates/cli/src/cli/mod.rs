@@ -961,8 +961,8 @@ pub enum AgentCmd {
     /// DESCRIPTION to the user-scope library (no repo change);
     /// repo-scope `--tool` defines a fresh agent inline; repo-scope
     /// by-name (no `--tool`) copies a description from the
-    /// user-scope library. `--review commit|gate` sets the role
-    /// (default `commit`).
+    /// user-scope library. `--review commit|plan|final|gate` sets
+    /// the tier (default `commit`).
     Add(AgentAddArgs),
     /// Promote an agent to the repo's master:
     /// `repo.agents[<name>].role = master`, demoting the previous
@@ -975,9 +975,10 @@ pub enum AgentCmd {
     /// (and scrubs any team template referencing it). Per-agent
     /// skeleton dir + feedback history are preserved.
     Remove(AgentRemoveArgs),
-    /// Change a reviewer's tier (`commit` ↔ `gate`) in place — no
-    /// remove/re-add, so the agent's session and zellij pane are
-    /// undisturbed. Refuses on the master (not a reviewer tier).
+    /// Change a reviewer's tier (commit / plan / final / gate) in
+    /// place — no remove/re-add, so the agent's session and zellij
+    /// pane are undisturbed. Refuses on the master (not a reviewer
+    /// tier).
     SetReview(AgentSetReviewArgs),
 }
 
@@ -1018,8 +1019,9 @@ pub struct AgentAddArgs {
     /// from the user-scope `agents` library.
     #[arg(long, value_enum)]
     pub tool: Option<ToolArg>,
-    /// Role for the new roster entry: `commit` (default) or `gate`
-    /// reviewer. Ignored with `--global` (the library has no role).
+    /// Tier for the new roster entry: `commit` (default), `plan`,
+    /// `final`, or `gate`. Ignored with `--global` (the library has
+    /// no role).
     #[arg(long, value_enum, default_value = "commit")]
     pub review: ReviewKindArg,
     /// Write the agent DESCRIPTION to the user-scope library
@@ -1083,7 +1085,7 @@ pub struct AgentRemoveArgs {
 pub struct AgentSetReviewArgs {
     /// Reviewer label whose tier to change.
     pub name: String,
-    /// New tier: `commit` or `gate`.
+    /// New tier: `commit`, `plan`, `final`, or `gate`.
     #[arg(value_enum)]
     pub review: ReviewKindArg,
     /// Repo root. Defaults to the cwd's git toplevel.

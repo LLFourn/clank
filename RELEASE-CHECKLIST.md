@@ -21,9 +21,10 @@ investigated while authoring this checklist and need no plan.
   today).
 - [ ] **`first-run-experience-test`** — walk the true
   first-contact path on a clean machine/user: install → `clank
-  setup` → `clank team create` + agent declarations → `clank
-  init` → `clank open zellij` → first plan through the full
-  review loop. Every rough edge found becomes a checklist
+  setup` → agent declarations (`clank agent add --global`) +
+  a saved team (`clank team save`) → `clank init --team` →
+  `clank open zellij` → first plan through the full review
+  loop. Every rough edge found becomes a checklist
   addendum. (Several first-run fixes already landed this cycle:
   bare `clank init` adopts the user's `default` team; init warns
   with exact commands when no team exists. The walk verifies the
@@ -59,13 +60,14 @@ investigated while authoring this checklist and need no plan.
 
 ## 3. Docs & pitch
 
-- [ ] **`readme-rewrite`** — README.md exists (234 lines,
-  accurate, structured) but reads as an operator manual, not a
-  pitch. A public README needs: the motivating story (why
-  multi-agent peer review; what goes wrong without the gate), a
-  60-second demo path, the mental model (plans, the two-tier
-  gate, milestones), THEN the reference material. Rewrite once
-  the install story (item 1) exists so the quickstart is real.
+- [ ] **`readme-rewrite`** — README.md is accurate as of the
+  docs-pass plan (surface-verified against the binary) but reads
+  as an operator manual, not a pitch. A public README needs: the
+  motivating story (why multi-agent peer review; what goes wrong
+  without the gate), a 60-second demo path, the mental model
+  (plans, the review tiers, milestones), THEN the reference
+  material. Rewrite once the install story (item 1) exists so
+  the quickstart is real.
 - [ ] **`tutorial-screencast-content`** — script/content for an
   intro screencast: a repo going from `clank init` through a
   full plan lifecycle (intro → sizing reviews → implement →
@@ -79,7 +81,7 @@ investigated while authoring this checklist and need no plan.
 
 - [ ] **`help-output-beauty`** — `clank --help` wraps badly
   because several subcommands carry paragraph-length `about`
-  strings (team, shelve, open, rewire, stop-hook…). Fix shape:
+  strings (team, stash, open, rewire, stop-hook…). Fix shape:
   one-line `about` for the command list + move the detail to
   `long_about` (shown on `clank <cmd> --help`). Audit all
   subcommands; eyeball at 80 cols. Small, mechanical.

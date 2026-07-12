@@ -5,8 +5,9 @@ Clank is a peer-review workflow for multi-agent development. Each repo's
 - `plans/` — one `.md` per active plan; `finished/` — finalized plans
 - `queue/` — queued plan drafts awaiting promotion
 - `config.json` — local, gitignored repo config: the repo ROSTER as a
-  flat list of agents, each with a role (`master` / `commit` / `gate`).
-  NOT a single "master" setting.
+  flat list of agents, each with a role (`master`, or a reviewer tier:
+  `commit` / `plan` / `final` / `gate` — gate folds into both the plan-
+  and final-stage reviews). NOT a single "master" setting.
 - `agents/<label>/config.json` — per-agent local state, gitignored
   (session binding, auto-mode)
 - `agents/<label>/feedback/<sha>.md` — a reviewer's notes on a commit
