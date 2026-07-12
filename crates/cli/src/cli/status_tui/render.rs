@@ -210,12 +210,15 @@ pub(super) fn render_at(
                 // while the log is at its top; the same bar on a raised
                 // surface while entries are scrolled UNDER it. The bar
                 // settling flat is also the cue that the next Up crosses
-                // into the panel (panel-focus-tops-log invariant).
+                // into the panel (panel-focus-tops-log invariant). The
+                // rule carries the BRANCH as its note — the branch lives
+                // where the commits are (tui-gauges-declutter).
+                let branch = snap.branch.as_deref().unwrap_or("");
                 let clipped = offset.min(total.saturating_sub(1));
                 out.push(if clipped > 0 {
-                    region_rule_elevated("log", "↑↓ scroll", log_focused, cols)
+                    region_rule_elevated_with_note("log", branch, "↑↓ scroll", log_focused, cols)
                 } else {
-                    region_rule("log", "↑↓ scroll", log_focused, cols)
+                    region_rule_with_note("log", branch, "↑↓ scroll", log_focused, cols)
                 });
             }
             Divider::Separator => out.push(String::new()),
@@ -369,10 +372,13 @@ pub(super) fn scrollable_header(
         body.push(vec![label("pr"), link(url.clone(), url)]);
     }
 
-    // `git` — branch + head, dim. When the worktree is dirty the
-    // stats get their OWN line below, with GitHub-colored counts
+    // `git` — branch + head, dim: PANEL-LESS renders only. A panel
+    // render carries the branch on the LOG rule and the head as the
+    // log's newest row — this line would echo both
+    // (tui-gauges-declutter). When the worktree is dirty the stats get
+    // their OWN line below, with GitHub-colored counts
     // (tui-dirty-line-color).
-    {
+    if snap.agents.is_empty() {
         let branch = snap.branch.as_deref().unwrap_or("?");
         let head = snap.head_sha.as_deref().map(short_sha).unwrap_or("?");
         body.push(vec![label("git"), dim(format!("{branch} {head}"))]);
@@ -381,8 +387,11 @@ pub(super) fn scrollable_header(
         body.push(dirty_spans(d));
     }
 
-    // `done` — last finished, only when the repo is idle.
+    // `done` — last finished, only when the repo is idle: PANEL-LESS
+    // renders only (the finalize row in the log carries it —
+    // tui-gauges-declutter).
     if snap.plans.is_empty()
+        && snap.agents.is_empty()
         && let Some(fp) = &snap.last_finished
     {
         body.push(vec![
@@ -395,25 +404,22 @@ pub(super) fn scrollable_header(
         ]);
     }
 
-    // Bar (+breath) then the gauge body; the compose step below caps.
-    // (The AGENTS + LOG sections render below, after the gauges.)
-    if breath && !body.is_empty() {
+    // Breathing room under the bar: PANEL-LESS only — panel renders
+    // put the agent rows DIRECTLY under the bar (tui-gauges-declutter,
+    // codex bef2d5c), keeping panel-less bytes unchanged.
+    if breath && snap.agents.is_empty() && !body.is_empty() {
         head_out.push(String::new());
     }
-    for line in body {
-        head_out.push(emit(&line, color, cols));
-    }
 
-    // AGENTS — the focusable roster section, rendered directly so it can
-    // carry the full-width focus rule and the full-row selection band.
-    // The armed auto-mode reads as ▶ play / ⏸ pause (the EFFECTIVE mode
-    // governing each agent's NEXT Stop-hook decision — NOT a live
-    // run/stop indicator). Gated on a non-empty roster so a teamless
-    // repo (and every panel-less render) is byte-for-byte unchanged.
-    let agents_focused = mode.agents_focused();
+    // AGENTS — the roster leads the header, directly under the bar and
+    // WITHOUT a title rule: everyone knows what the rows are, the
+    // selection band shows focus, and the detail page teaches the keys
+    // (tui-gauges-declutter). The armed auto-mode reads as ▶ play /
+    // ⏸ pause (the EFFECTIVE mode governing each agent's NEXT
+    // Stop-hook decision — NOT a live run/stop indicator). Gated on a
+    // non-empty roster so a teamless repo (and every panel-less
+    // render) is byte-for-byte unchanged.
     if !snap.agents.is_empty() {
-        let hint = "↑↓ move · SPC play/pause · ⏎ details";
-        head_out.push(region_rule("agents", hint, agents_focused, cols));
         // Each agent row; the cursor row gets the unified selection band.
         // The tier (master/commit/gate) distinguishes the kinds.
         // Active agents carry the spinner + italic wait-verb on their own
@@ -447,6 +453,12 @@ pub(super) fn scrollable_header(
             let spans = vec![plain("  + add agent".to_string())];
             head_out.push(row_line(&spans, add_selected, color, cols));
         }
+    }
+
+    // The gauge body — the load-bearing state the log does NOT carry
+    // (gate / fix / pr / dirty; git + done are panel-less-only above).
+    for line in body {
+        head_out.push(emit(&line, color, cols));
     }
 
     // STASH — stashed plans ABOVE the queue (they have commits, nearer
@@ -2009,6 +2021,106 @@ mod tests {
         }
     }
 
+    #[test]
+    fn panel_render_leads_with_agents_and_drops_echo_gauges() {
+        // tui-gauges-declutter: an idle PANEL render shows no `git` and
+        // no `done` gauge lines (the log's newest row is head; its
+        // finalize row is the last finish), the branch rides the LOG
+        // rule case-preserved, and the agent rows lead the header with
+        // no AGENTS title rule.
+        use clank_core::repo_state::FinishedPlan;
+        let mut s = two_agent_snap();
+        s.branch = Some("Feature/Mixed".into());
+        s.last_finished = Some(FinishedPlan {
+            plan: PlanKey::parse("old-plan").unwrap(),
+            intro: CommitSha::parse(&format!("{:0<40}", "aa")).unwrap(),
+            finalized_at: CommitSha::parse(&format!("{:0<40}", "bb")).unwrap(),
+        });
+        s.log_rows = (0..4).map(|i| commit_row(&format!("c{i}"))).collect();
+        let texts: Vec<String> = render(&s, 20, 60).iter().map(|l| visible(l)).collect();
+        assert!(
+            !texts.iter().any(|t| t.trim_start().starts_with("git ")),
+            "no git gauge line in a panel render: {texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|t| t.trim_start().starts_with("done ")),
+            "no done gauge line in a panel render"
+        );
+        assert!(
+            texts.iter().all(|t| !t.contains("AGENTS")),
+            "no AGENTS title rule"
+        );
+        // Agent rows sit DIRECTLY under the bar — exact adjacency, no
+        // breath row in panel renders (codex bef2d5c).
+        assert!(
+            texts[1].contains("claude"),
+            "row 1 is the first agent, adjacent to the bar: {:?}",
+            &texts[..3]
+        );
+        // The branch rides the log rule, case preserved beside the
+        // uppercased title.
+        let log_rule = texts.iter().find(|t| t.contains("LOG")).expect("log rule");
+        assert!(
+            log_rule.contains("LOG · Feature/Mixed"),
+            "branch on the rule, original case: {log_rule}"
+        );
+    }
+
+    #[test]
+    fn long_branch_never_truncates_the_focused_hint_off_the_rule() {
+        // codex bef2d5c: the note is fitted around a RESERVED hint, so
+        // the focused and unfocused rules stay visually distinct at any
+        // width. A 60-char branch in a 40-col pane:
+        use super::super::text::{region_rule, region_rule_with_note};
+        let branch = "feature/very-long-branch-name-that-keeps-going-and-going-x";
+        let focused = region_rule_with_note("log", branch, "↑↓ scroll", true, 40);
+        assert!(
+            visible(&focused).contains("↑↓ scroll"),
+            "the focused hint survives the long note: {}",
+            visible(&focused)
+        );
+        // And the truncated note still starts with real branch text.
+        assert!(
+            visible(&focused).contains("· feature/"),
+            "the note shows its head: {}",
+            visible(&focused)
+        );
+        let unfocused = region_rule_with_note("log", branch, "↑↓ scroll", false, 40);
+        assert_ne!(
+            visible(&focused),
+            visible(&unfocused),
+            "focused and unfocused rules stay distinct"
+        );
+        // Degenerate width: the rule never panics and stays one line.
+        for cols in [1usize, 5, 12] {
+            let r = region_rule_with_note("log", branch, "↑↓ scroll", true, cols);
+            assert!(!visible(&r).contains('\n'));
+        }
+        let _ = region_rule("log", "↑↓ scroll", true, 40); // flat variant untouched
+    }
+
+    #[test]
+    fn panel_less_render_keeps_the_git_and_done_gauges() {
+        // No roster → no log rule to host the branch and no agents to
+        // lead with: the git/done gauge lines stay.
+        use clank_core::repo_state::FinishedPlan;
+        let mut s = snap(vec![], vec![]);
+        s.last_finished = Some(FinishedPlan {
+            plan: PlanKey::parse("old-plan").unwrap(),
+            intro: CommitSha::parse(&format!("{:0<40}", "aa")).unwrap(),
+            finalized_at: CommitSha::parse(&format!("{:0<40}", "bb")).unwrap(),
+        });
+        let texts: Vec<String> = render(&s, 10, 60).iter().map(|l| visible(l)).collect();
+        assert!(
+            texts.iter().any(|t| t.trim_start().starts_with("git ")),
+            "panel-less keeps the git line: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t.trim_start().starts_with("done ")),
+            "panel-less keeps the done line"
+        );
+    }
+
     // ── tui-short-pane-whole-scroll: pressure lift ────────────
 
     #[test]
@@ -2167,7 +2279,7 @@ mod tests {
         // header past the pane. Capacity alone reads 0 at every depth;
         // the header-length policy still surfaces the log.
         let mut big = two_agent_snap();
-        for i in 0..6 {
+        for i in 0..9 {
             big.agents.push(crate::cli::status_tui::fixtures::agent_row(
                 &format!("extra{i}"),
                 crate::cli::teams_config::RosterRole::Commit,
@@ -3279,15 +3391,18 @@ mod tests {
         .0;
         let texts: Vec<String> = out.iter().map(|l| visible(l)).collect();
         let pos = |needle: &str| texts.iter().position(|t| t.contains(needle));
-        let (agents_rule, queue_rule, log_rule) = (
-            pos("AGENTS").expect("agents rule"),
+        // The agents section leads the header with NO title rule
+        // (tui-gauges-declutter): locate it by its final ROW.
+        let (agents_rows, queue_rule, log_rule) = (
+            pos("+ add agent").expect("agents rows"),
             pos("QUEUE").expect("queue rule"),
             pos("LOG").expect("log rule"),
         );
         assert!(
-            agents_rule < queue_rule && queue_rule < log_rule,
-            "QUEUE sits between AGENTS and LOG"
+            agents_rows < queue_rule && queue_rule < log_rule,
+            "QUEUE sits between the agent rows and LOG"
         );
+        assert!(pos("AGENTS").is_none(), "no AGENTS title rule");
         assert!(
             texts.iter().any(|t| t.contains("100 urgent-fix"))
                 && texts.iter().any(|t| t.contains("800 later-idea")),
@@ -3352,14 +3467,14 @@ mod tests {
         .0;
         let texts: Vec<String> = out.iter().map(|l| visible(l)).collect();
         let pos = |needle: &str| texts.iter().position(|t| t.contains(needle));
-        let (agents_rule, stash_rule, queue_rule, log_rule) = (
-            pos("AGENTS").expect("agents rule"),
+        let (agents_rows, stash_rule, queue_rule, log_rule) = (
+            pos("+ add agent").expect("agents rows"),
             pos("STASH").expect("stash rule"),
             pos("QUEUE").expect("queue rule"),
             pos("LOG").expect("log rule"),
         );
         assert!(
-            agents_rule < stash_rule && stash_rule < queue_rule && queue_rule < log_rule,
+            agents_rows < stash_rule && stash_rule < queue_rule && queue_rule < log_rule,
             "order: AGENTS → STASH → QUEUE → LOG"
         );
         assert!(

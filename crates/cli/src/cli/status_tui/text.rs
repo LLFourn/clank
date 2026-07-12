@@ -199,13 +199,51 @@ pub(super) fn one_line(s: &str, cols: usize) -> String {
 /// the rule also carries the active-key hint (a quiet aid, not a
 /// highlight).
 pub(super) fn region_rule(title: &str, hint: &str, focused: bool, cols: usize) -> String {
-    let mut head = format!("── {} ", title.to_uppercase());
-    if focused && !hint.is_empty() {
-        head.push_str(&format!("· {hint} "));
-    }
+    region_rule_with_note(title, "", hint, focused, cols)
+}
+
+/// [`region_rule`] with an always-shown, case-preserved note after the
+/// title (`── LOG · master ────`) — the title is uppercased branding,
+/// the note is DATA (a branch name) and must keep its case
+/// (tui-gauges-declutter).
+pub(super) fn region_rule_with_note(
+    title: &str,
+    note: &str,
+    hint: &str,
+    focused: bool,
+    cols: usize,
+) -> String {
+    let head = rule_head(title, note, hint, focused, cols);
     let head = truncate_to(&head, cols);
     let fill = cols.saturating_sub(display_width(&head));
     format!("\x1b[2m{head}{}\x1b[0m", "─".repeat(fill))
+}
+
+/// Compose `── TITLE · note · hint ` with the FOCUSED HINT reserved
+/// first: the note is DATA of arbitrary length (a branch name) and is
+/// fitted into whatever width remains, so it can never truncate the
+/// hint away — the focused and unfocused rules must stay visually
+/// distinct at any width (codex bef2d5c).
+fn rule_head(title: &str, note: &str, hint: &str, focused: bool, cols: usize) -> String {
+    let title_part = format!("── {} ", title.to_uppercase());
+    let hint_part = if focused && !hint.is_empty() {
+        format!("· {hint} ")
+    } else {
+        String::new()
+    };
+    let mut head = title_part;
+    if !note.is_empty() {
+        let reserved = display_width(&head) + display_width(&hint_part);
+        let room = cols.saturating_sub(reserved);
+        // "· x " needs 5 columns to say anything; below that the note
+        // is dropped whole rather than shown as pure ellipsis.
+        if room >= 5 {
+            let fitted = truncate_to(note, room - 4);
+            head.push_str(&format!("· {fitted} "));
+        }
+    }
+    head.push_str(&hint_part);
+    head
 }
 
 /// The "lift on scroll" variant of [`region_rule`] (Material app-bar
@@ -216,10 +254,18 @@ pub(super) fn region_rule(title: &str, hint: &str, focused: bool, cols: usize) -
 /// bar itself is the scroll-state signal (no text to read, no color
 /// that already carries a meaning: dim = secondary, accent = state).
 pub(super) fn region_rule_elevated(title: &str, hint: &str, focused: bool, cols: usize) -> String {
-    let mut head = format!("── {} ", title.to_uppercase());
-    if focused && !hint.is_empty() {
-        head.push_str(&format!("· {hint} "));
-    }
+    region_rule_elevated_with_note(title, "", hint, focused, cols)
+}
+
+/// The elevated variant of [`region_rule_with_note`].
+pub(super) fn region_rule_elevated_with_note(
+    title: &str,
+    note: &str,
+    hint: &str,
+    focused: bool,
+    cols: usize,
+) -> String {
+    let head = rule_head(title, note, hint, focused, cols);
     let head = truncate_to(&head, cols);
     let fill = cols.saturating_sub(display_width(&head));
     format!("[48;5;238m{head}{}[0m", "─".repeat(fill))
