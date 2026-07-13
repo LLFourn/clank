@@ -252,6 +252,7 @@ impl SeenSet {
 }
 
 /// One `/events` response the fetcher yields.
+#[derive(Debug)]
 pub(crate) enum GhResponse {
     /// `304 Not Modified` (only meaningful for the ETag-conditioned
     /// page 1). Carries the response's `X-Poll-Interval`: the server
@@ -436,7 +437,7 @@ pub(crate) fn parse_gh_include(stdout: &str) -> anyhow::Result<GhResponse> {
     // Headers are parsed BEFORE classifying the status: a 304 can
     // still raise `X-Poll-Interval` and the client must observe it
     // (codex e9b8b66).
-    let not_modified = status.contains(" 304");
+    let not_modified = http_status_of(status) == Some(304);
     let mut etag = None;
     let mut poll_interval = None;
     for line in lines.by_ref() {
@@ -472,6 +473,51 @@ pub(crate) fn parse_gh_include(stdout: &str) -> anyhow::Result<GhResponse> {
     })
 }
 
+/// The HTTP status code of an `--include` status line
+/// (`HTTP/2.0 304 Not Modified` → 304). `None` for anything that
+/// isn't a status line.
+fn http_status_of(status_line: &str) -> Option<u16> {
+    let mut it = status_line.split_whitespace();
+    if !it.next()?.starts_with("HTTP/") {
+        return None;
+    }
+    it.next()?.parse().ok()
+}
+
+/// Classify one `gh api --include` run. `gh` exits NON-ZERO for every
+/// non-2xx status — including the 304 the conditional `If-None-Match`
+/// poll is DESIGNED to produce — so a failed exit is not necessarily a
+/// failed poll (github-poll-304-is-success: every healthy idle cycle
+/// logged "poll failed"). Reclassification is EXACT-304-only: a
+/// failed 401/403/500 whose stdout still carries an include block
+/// must never read as a healthy poll (codex a950e7b).
+pub(crate) fn interpret_gh_events_output(
+    success: bool,
+    stdout: &str,
+    stderr: &str,
+) -> anyhow::Result<GhResponse> {
+    if success {
+        return parse_gh_include(stdout);
+    }
+    // A failed exit whose include block's STATUS LINE parses to
+    // exactly 304: the parse also captures the X-Poll-Interval floor
+    // (the server can raise it on a 304).
+    if let Some(status_line) = stdout.lines().next()
+        && http_status_of(status_line) == Some(304)
+    {
+        return parse_gh_include(stdout);
+    }
+    // gh's own bare failure line for a 304 with no include block on
+    // stdout — matched STRICTLY (a proxy error merely mentioning 304
+    // stays an error).
+    if stderr.lines().any(|l| l.trim() == "gh: HTTP 304") {
+        return Ok(GhResponse::NotModified {
+            poll_interval: None,
+        });
+    }
+    anyhow::bail!("gh /events failed: {}", stderr.trim());
+}
+
 /// Production fetcher: an async, cancellation-safe `gh api --include`
 /// child (`kill_on_drop`, so aborting the source task kills the poll).
 struct GhFetcher {
@@ -490,13 +536,11 @@ impl EventFetcher for GhFetcher {
         }
         cmd.kill_on_drop(true);
         let out = cmd.output().await?;
-        if !out.status.success() {
-            anyhow::bail!(
-                "gh /events failed: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
-        }
-        parse_gh_include(&String::from_utf8_lossy(&out.stdout))
+        interpret_gh_events_output(
+            out.status.success(),
+            &String::from_utf8_lossy(&out.stdout),
+            &String::from_utf8_lossy(&out.stderr),
+        )
     }
 }
 
@@ -985,6 +1029,55 @@ mod tests {
             effective_interval(Some(Duration::from_secs(120)), Some(60)),
             Duration::from_secs(120)
         );
+    }
+
+    #[test]
+    fn interpret_gh_output_reclassifies_only_an_exact_304() {
+        // github-poll-304-is-success: gh exits non-zero on the 304 the
+        // conditional poll is DESIGNED to produce.
+        // Success path: unchanged.
+        let ok200 = "HTTP/2.0 200 OK\nETag: \"e\"\n\n[]";
+        assert!(matches!(
+            interpret_gh_events_output(true, ok200, "").unwrap(),
+            GhResponse::Ok { .. }
+        ));
+        // Failed exit + 304 include block → healthy, WITH the floor.
+        let nm = "HTTP/2.0 304 Not Modified\r\nX-Poll-Interval: 90\r\n\r\n";
+        match interpret_gh_events_output(false, nm, "gh: HTTP 304").unwrap() {
+            GhResponse::NotModified { poll_interval } => assert_eq!(poll_interval, Some(90)),
+            _ => panic!("expected NotModified"),
+        }
+        // Failed exit + bare gh stderr, no stdout → healthy, no floor.
+        match interpret_gh_events_output(false, "", "gh: HTTP 304\n").unwrap() {
+            GhResponse::NotModified { poll_interval } => assert_eq!(poll_interval, None),
+            _ => panic!("expected NotModified"),
+        }
+        // Failed exit + NON-304 include blocks must stay errors —
+        // empty body AND list-shaped body (codex a950e7b:
+        // parse_gh_include would read either as a healthy poll).
+        for block in [
+            "HTTP/2.0 401 Unauthorized\nContent-Type: application/json\n\n",
+            "HTTP/2.0 500 Internal Server Error\nContent-Type: application/json\n\n[]",
+            "HTTP/2.0 403 Forbidden\nX-Poll-Interval: 60\n\n{\"message\":\"rate limited\"}",
+        ] {
+            assert!(
+                interpret_gh_events_output(false, block, "gh: HTTP 4xx").is_err(),
+                "non-304 failure must stay an error: {block}"
+            );
+        }
+        // A stderr merely MENTIONING 304 inside another message is an
+        // error, and the message is preserved.
+        let err = interpret_gh_events_output(
+            false,
+            "",
+            "error connecting to proxy; last cached status HTTP 304",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("proxy"), "{err}");
+        // A genuine failure carries its stderr verbatim.
+        let err =
+            interpret_gh_events_output(false, "", "gh: HTTP 401 Bad credentials").unwrap_err();
+        assert!(err.to_string().contains("Bad credentials"));
     }
 
     #[test]
