@@ -127,12 +127,27 @@ user-global default (`~/.clank/config.json`'s `"auto"`) when unset —
 - `clank wait --for commit|finished|stopped` — OBSERVE a repo (often a
   foreign one via `--repo`) instead of waiting for your own work.
 - **Extra wake sources** (`wait_events` in the agent's config, or
-  repeatable `--event '<json>'`): `github` entries poll any repo's
-  events feed via `gh` (PRs opened/merged, comments, issues — your own
-  actions filtered by default), and `command` entries spawn an argv
-  whose completion is the wake. This is the building block for a
-  "controller" repo whose agents manage other repos — the
+  repeatable `--event '<json>'`): `github` entries watch any repo
+  (PRs opened/updated/merged, comments, issues, branch pushes — your
+  own actions filtered by default), and `command` entries spawn an
+  argv whose completion is the wake. `"delivery":"realtime"` upgrades
+  a github source from polling to push-speed webhook delivery, with
+  polling kept as the completeness backstop. This is the building
+  block for a "controller" repo whose agents manage other repos — the
   `clank-master` skill documents the pattern.
+
+  What the github sources need (`gh` is optional for polling):
+  - **Polling** talks to the REST API directly. The token comes from
+    `GH_TOKEN` / `GITHUB_TOKEN` if set — no `gh` needed at all — else
+    from one `gh auth token` call. With neither, the source waits
+    (loudly, fail-closed) rather than polling unauthenticated.
+  - **Realtime** requires the `gh` binary, the `cli/gh-webhook`
+    extension, and ADMIN on the watched repo (it creates a webhook).
+    When any of that is missing the source falls back to polling with
+    one diagnostic naming the reason — nothing is lost, wakes are
+    just poll-speed.
+  - The rest of clank's GitHub surface (`pr-review`, `fork --pr`)
+    still shells `gh` directly.
 
 ## Command reference
 
