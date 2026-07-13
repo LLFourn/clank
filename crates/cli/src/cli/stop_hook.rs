@@ -394,6 +394,17 @@ struct WaitItem {
     round: Option<u64>,
     in_progress: Option<String>,
     new_plans: Option<Vec<String>>,
+    // External wake payloads (external-wake-hints-carry-payload):
+    // github_event / command_event fields, all optional like the rest.
+    repo: Option<String>,
+    event: Option<String>,
+    detail: Option<String>,
+    number: Option<u64>,
+    title: Option<String>,
+    actor: Option<String>,
+    url: Option<String>,
+    exit_code: Option<i64>,
+    output_tail: Option<String>,
 }
 
 fn parse_wait_json(raw: &[u8]) -> Result<Vec<WaitItem>, String> {
@@ -507,6 +518,53 @@ fn render_wait_items(items: &[WaitItem], label: &AgentLabel, role: Role) -> Stri
                 for r in crate::cli::wait::multi_plan_open_remedies(in_progress, &news) {
                     out.push_str(&format!("      {r}\n"));
                 }
+            }
+            // External wakes carry their payload — a bare `? @ ?`
+            // fallback hint is unactionable
+            // (external-wake-hints-carry-payload).
+            "github_event" => {
+                let repo = item.repo.as_deref().unwrap_or("?");
+                let event = item.event.as_deref().unwrap_or("?");
+                let detail = item
+                    .detail
+                    .as_deref()
+                    .map(|d| format!(" ({d})"))
+                    .unwrap_or_default();
+                let num = item.number.map(|n| format!(" #{n}")).unwrap_or_default();
+                let title = item
+                    .title
+                    .as_deref()
+                    .filter(|t| !t.is_empty())
+                    .map(|t| format!(" \"{t}\""))
+                    .unwrap_or_default();
+                let actor = item
+                    .actor
+                    .as_deref()
+                    .map(|a| format!(" by {a}"))
+                    .unwrap_or_default();
+                let url = item
+                    .url
+                    .as_deref()
+                    .map(|u| format!(" {u}"))
+                    .unwrap_or_default();
+                out.push_str(&format!(
+                    "  - github: {event}{detail} {repo}{num}{title}{actor}{url}\n"
+                ));
+            }
+            "command_event" => {
+                let name = item.name.as_deref().unwrap_or("?");
+                let exit = match item.exit_code {
+                    Some(c) => format!("exit {c}"),
+                    None => "signaled".to_string(),
+                };
+                let snip = item
+                    .output_tail
+                    .as_deref()
+                    .and_then(|t| t.lines().last())
+                    .filter(|l| !l.is_empty())
+                    .map(|l| format!(": {l}"))
+                    .unwrap_or_default();
+                out.push_str(&format!("  - command: {name} {exit}{snip}\n"));
             }
             other => out.push_str(&format!("  - {other}: {plan} @ {short}\n")),
         }
@@ -670,6 +728,54 @@ mod tests {
         // An explicit per-agent value passes through untouched.
         assert_eq!(codex_wait_timeout(Some("4h")), "4h");
         assert_eq!(codex_wait_timeout(Some("0")), "0");
+    }
+
+    #[test]
+    fn external_wake_hints_render_their_payload() {
+        // external-wake-hints-carry-payload: the codex in-hook hints
+        // for the external kinds carry the payload instead of the
+        // useless `? @ ?` fallback. Built from wait's ACTUAL --json
+        // field names (the same wire the hook consumes).
+        let raw = serde_json::json!({
+            "items": [
+                {
+                    "kind": "github_event",
+                    "repo": "o/r",
+                    "event": "pr_comment",
+                    "detail": "review",
+                    "number": 12,
+                    "title": "Add the widget",
+                    "actor": "hubot",
+                    "url": "https://github.com/o/r/pull/12"
+                },
+                {
+                    "kind": "command_event",
+                    "name": "signal",
+                    "exit_code": null,
+                    "output_tail": "line one\nlast line"
+                },
+                { "kind": "some_future_kind", "plan": "p", "sha": "abcdef123456789" }
+            ]
+        });
+        let items = parse_wait_json(raw.to_string().as_bytes()).unwrap();
+        let label = AgentLabel::parse("codex").unwrap();
+        let out = render_wait_items(&items, &label, Role::Reviewer);
+        assert!(
+            out.contains(
+                "  - github: pr_comment (review) o/r #12 \"Add the widget\" by hubot \
+                 https://github.com/o/r/pull/12"
+            ),
+            "github hint carries the payload: {out}"
+        );
+        assert!(
+            out.contains("  - command: signal signaled: last line"),
+            "command hint carries name/exit/tail snippet: {out}"
+        );
+        // Unknown future kinds still fall through loose (fail-soft).
+        assert!(
+            out.contains("  - some_future_kind: p @ abcdef123456"),
+            "unknown kind falls through: {out}"
+        );
     }
 
     #[test]

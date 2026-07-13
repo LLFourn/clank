@@ -1407,18 +1407,33 @@ fn render_human(item: &WaitItem) -> String {
         WaitItem::GithubEvent {
             repo,
             event,
+            detail,
             number,
             title,
             actor,
-            ..
+            url,
         } => {
-            let num = number.map(|n| format!("#{n}  ")).unwrap_or_default();
-            let title = title.as_deref().unwrap_or("");
-            let actor = actor
+            // Segments joined uniformly so absent optionals leave no
+            // dangling separators; the URL rides along — it's the
+            // actionable pointer (external-wake-hints-carry-payload).
+            let detail = detail
                 .as_deref()
-                .map(|a| format!("  by {a}"))
+                .map(|d| format!(" ({d})"))
                 .unwrap_or_default();
-            format!("github   {event}  {repo}  {num}{title}{actor}")
+            let mut parts = vec![format!("github   {event}{detail}"), repo.clone()];
+            if let Some(n) = number {
+                parts.push(format!("#{n}"));
+            }
+            if let Some(t) = title.as_deref().filter(|t| !t.is_empty()) {
+                parts.push(t.to_string());
+            }
+            if let Some(a) = actor.as_deref() {
+                parts.push(format!("by {a}"));
+            }
+            if let Some(u) = url.as_deref() {
+                parts.push(u.to_string());
+            }
+            parts.join("  ")
         }
         WaitItem::CommandEvent {
             name,
@@ -1936,6 +1951,37 @@ mod tests {
         // hint; 12 hex chars can't realistically be ambiguous
         // (ruthless 201e498 concern 2). Full sha stays in json.
         assert_eq!(short(&sha("abc")).len(), 12);
+    }
+
+    #[test]
+    fn github_hint_carries_the_full_payload_and_degrades_cleanly() {
+        // external-wake-hints-carry-payload: the one-liner carries the
+        // detail and the URL (the actionable pointer)…
+        let full = WaitItem::GithubEvent {
+            repo: "o/r".into(),
+            event: "pr_comment".into(),
+            detail: Some("review".into()),
+            number: Some(12),
+            title: Some("Add the widget".into()),
+            actor: Some("hubot".into()),
+            url: Some("https://github.com/o/r/pull/12".into()),
+        };
+        assert_eq!(
+            render_human(&full),
+            "github   pr_comment (review)  o/r  #12  Add the widget  by hubot  \
+             https://github.com/o/r/pull/12"
+        );
+        // …and absent optionals leave no dangling separators.
+        let sparse = WaitItem::GithubEvent {
+            repo: "o/r".into(),
+            event: "issue_opened".into(),
+            detail: None,
+            number: None,
+            title: None,
+            actor: None,
+            url: None,
+        };
+        assert_eq!(render_human(&sparse), "github   issue_opened  o/r");
     }
 
     #[test]
