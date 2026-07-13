@@ -93,9 +93,16 @@ pub struct GithubSource {
     pub poll_interval: Option<String>,
     /// Whether events actored by the authenticated `gh` login wake
     /// this agent. Default FALSE: a controller agent's own PR comment
-    /// must not wake itself in a loop.
+    /// must not wake itself in a loop (and its own pushes don't
+    /// either — load-bearing for `branch_push`).
     #[serde(default)]
     pub include_own_actions: bool,
+    /// `branch_push` scope: only pushes to these branches wake the
+    /// agent (short names, e.g. `"main"`). Empty = every branch.
+    /// Applies to `branch_push` only — the PR kinds are
+    /// number-scoped already.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub branches: Vec<String>,
 }
 
 /// The GitHub event sub-kinds `clank wait` can wake on.
@@ -103,6 +110,9 @@ pub struct GithubSource {
 #[serde(rename_all = "snake_case")]
 pub enum GithubEventKind {
     PrOpened,
+    /// New commits landed on a PR (the events feed's `synchronize`
+    /// action). Fires on the BASE repo, so fork PRs are covered.
+    PrUpdated,
     PrMerged,
     /// All three comment classes: an issue comment on a PR, a
     /// submitted review (including empty-body approvals), and an
@@ -112,6 +122,10 @@ pub enum GithubEventKind {
     IssueClosed,
     /// An issue comment on a NON-PR issue.
     IssueComment,
+    /// A push to a BRANCH (`refs/heads/*` only — tag pushes are not
+    /// branch pushes and never match). Scope with
+    /// [`GithubSource::branches`].
+    BranchPush,
 }
 
 /// Spawn a command when the wait arms; its COMPLETION is the wake.
@@ -309,6 +323,35 @@ mod tests {
         assert!(
             !json.contains("wait_timeout"),
             "expected no wait_timeout key: {json}"
+        );
+    }
+
+    #[test]
+    fn github_source_round_trips_new_kinds_and_branches() {
+        // github-wake-pr-updates-and-pushes: the additive sub-kinds +
+        // the branches filter round-trip…
+        let src = WaitEventSource::Github(GithubSource {
+            repo: "o/r".into(),
+            events: vec![GithubEventKind::PrUpdated, GithubEventKind::BranchPush],
+            poll_interval: None,
+            include_own_actions: false,
+            branches: vec!["main".into()],
+        });
+        let json = serde_json::to_string(&src).unwrap();
+        assert!(json.contains("pr_updated") && json.contains("branch_push"));
+        let back: WaitEventSource = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, src);
+        // …and an OLD config (absent branches, original kinds) parses
+        // unchanged with the empty-filter default.
+        let old = r#"{"kind":"github","repo":"o/r","events":["pr_opened","issue_comment"]}"#;
+        let parsed: WaitEventSource = serde_json::from_str(old).unwrap();
+        let WaitEventSource::Github(g) = parsed else {
+            panic!("github kind");
+        };
+        assert!(g.branches.is_empty(), "absent branches = every branch");
+        assert_eq!(
+            g.events,
+            vec![GithubEventKind::PrOpened, GithubEventKind::IssueComment]
         );
     }
 

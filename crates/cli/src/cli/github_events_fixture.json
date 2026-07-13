@@ -2,8 +2,13 @@
   {
     "id": "40001",
     "type": "PullRequestEvent",
-    "actor": { "login": "octocat", "id": 1 },
-    "repo": { "name": "o/r" },
+    "actor": {
+      "login": "octocat",
+      "id": 1
+    },
+    "repo": {
+      "name": "o/r"
+    },
     "payload": {
       "action": "opened",
       "number": 12,
@@ -20,8 +25,13 @@
   {
     "id": "40002",
     "type": "PullRequestEvent",
-    "actor": { "login": "octocat", "id": 1 },
-    "repo": { "name": "o/r" },
+    "actor": {
+      "login": "octocat",
+      "id": 1
+    },
+    "repo": {
+      "name": "o/r"
+    },
     "payload": {
       "action": "closed",
       "number": 11,
@@ -39,8 +49,13 @@
   {
     "id": "40003",
     "type": "IssueCommentEvent",
-    "actor": { "login": "hubot", "id": 2 },
-    "repo": { "name": "o/r" },
+    "actor": {
+      "login": "hubot",
+      "id": 2
+    },
+    "repo": {
+      "name": "o/r"
+    },
     "payload": {
       "action": "created",
       "issue": {
@@ -62,8 +77,13 @@
   {
     "id": "40004",
     "type": "PullRequestReviewEvent",
-    "actor": { "login": "hubot", "id": 2 },
-    "repo": { "name": "o/r" },
+    "actor": {
+      "login": "hubot",
+      "id": 2
+    },
+    "repo": {
+      "name": "o/r"
+    },
     "payload": {
       "action": "created",
       "review": {
@@ -82,8 +102,13 @@
   {
     "id": "40005",
     "type": "PullRequestReviewCommentEvent",
-    "actor": { "login": "hubot", "id": 2 },
-    "repo": { "name": "o/r" },
+    "actor": {
+      "login": "hubot",
+      "id": 2
+    },
+    "repo": {
+      "name": "o/r"
+    },
     "payload": {
       "action": "created",
       "comment": {
@@ -102,8 +127,13 @@
   {
     "id": "40006",
     "type": "IssuesEvent",
-    "actor": { "login": "octocat", "id": 1 },
-    "repo": { "name": "o/r" },
+    "actor": {
+      "login": "octocat",
+      "id": 1
+    },
+    "repo": {
+      "name": "o/r"
+    },
     "payload": {
       "action": "opened",
       "issue": {
@@ -118,8 +148,13 @@
   {
     "id": "40007",
     "type": "IssuesEvent",
-    "actor": { "login": "octocat", "id": 1 },
-    "repo": { "name": "o/r" },
+    "actor": {
+      "login": "octocat",
+      "id": 1
+    },
+    "repo": {
+      "name": "o/r"
+    },
     "payload": {
       "action": "closed",
       "issue": {
@@ -134,8 +169,13 @@
   {
     "id": "40008",
     "type": "IssueCommentEvent",
-    "actor": { "login": "hubot", "id": 2 },
-    "repo": { "name": "o/r" },
+    "actor": {
+      "login": "hubot",
+      "id": 2
+    },
+    "repo": {
+      "name": "o/r"
+    },
     "payload": {
       "action": "created",
       "issue": {
@@ -153,9 +193,90 @@
   {
     "id": "40009",
     "type": "WatchEvent",
-    "actor": { "login": "randomstar", "id": 9 },
-    "repo": { "name": "o/r" },
-    "payload": { "action": "started" },
+    "actor": {
+      "login": "randomstar",
+      "id": 9
+    },
+    "repo": {
+      "name": "o/r"
+    },
+    "payload": {
+      "action": "started"
+    },
     "created_at": "2026-07-11T11:10:00Z"
+  },
+  {
+    "id": "40010",
+    "type": "PullRequestEvent",
+    "actor": {
+      "login": "octocat",
+      "id": 1
+    },
+    "repo": {
+      "name": "o/r"
+    },
+    "payload": {
+      "action": "synchronize",
+      "number": 12,
+      "before": "1111111111111111111111111111111111111111",
+      "after": "2222222222222222222222222222222222222222",
+      "pull_request": {
+        "number": 12,
+        "title": "Add the widget",
+        "html_url": "https://github.com/o/r/pull/12",
+        "state": "open",
+        "merged": false
+      }
+    },
+    "created_at": "2026-07-13T09:00:00Z"
+  },
+  {
+    "id": "40011",
+    "type": "PushEvent",
+    "actor": {
+      "login": "octocat",
+      "id": 1
+    },
+    "repo": {
+      "name": "o/r"
+    },
+    "payload": {
+      "repository_id": 1296269,
+      "push_id": 10115855396,
+      "size": 3,
+      "distinct_size": 3,
+      "ref": "refs/heads/main",
+      "head": "7a8f3ac80e2ad2f6842cb86f576d4bfe2c03e300",
+      "before": "883efe034920928c47fe18598c01249d1a9fdabd",
+      "commits": [
+        {
+          "sha": "7a8f3ac80e2ad2f6842cb86f576d4bfe2c03e300",
+          "message": "fix the flange",
+          "distinct": true
+        }
+      ]
+    },
+    "created_at": "2026-07-13T09:05:00Z"
+  },
+  {
+    "id": "40012",
+    "type": "PushEvent",
+    "actor": {
+      "login": "octocat",
+      "id": 1
+    },
+    "repo": {
+      "name": "o/r"
+    },
+    "payload": {
+      "push_id": 10115855400,
+      "size": 1,
+      "distinct_size": 1,
+      "ref": "refs/tags/v1.0",
+      "head": "9b1fc2033010e34dbeb21e277a22e34c62a481f3",
+      "before": "0000000000000000000000000000000000000000",
+      "commits": []
+    },
+    "created_at": "2026-07-13T09:10:00Z"
   }
 ]

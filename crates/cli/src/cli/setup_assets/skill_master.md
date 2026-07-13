@@ -87,12 +87,15 @@ this agent's `.clank/agents/<label>/config.json` under `wait_events`
 (or pass `--event '<json>'` ad hoc, same shape):
 
 - `{"kind":"github","repo":"owner/name","events":["pr_opened",
-  "pr_merged","pr_comment","issue_opened","issue_closed",
-  "issue_comment"]}` — wakes you with a `github_event` item when that
-  repo sees the listed activity (polled via `gh`; auth is `gh`'s). List
-  as many `github` entries as you want to watch several repos. By
-  default your OWN actions (the authenticated `gh` login) don't wake
-  you — set `"include_own_actions":true` to override. `"poll_interval"`
+  "pr_updated","pr_merged","pr_comment","issue_opened","issue_closed",
+  "issue_comment","branch_push"]}` — wakes you with a `github_event`
+  item when that repo sees the listed activity (polled via `gh`; auth
+  is `gh`'s). `pr_updated` = new commits on a PR; `branch_push` = a
+  push to a branch (never a tag), scopable with
+  `"branches":["main"]`. List as many `github` entries as you want to
+  watch several repos. By default your OWN actions (the authenticated
+  `gh` login) don't wake you — including your own pushes — set
+  `"include_own_actions":true` to override. `"poll_interval"`
   (`"60s"`) tunes cadence.
 - `{"kind":"command","name":"label","command":["prog","arg",…]}` — a
   command whose COMPLETION is the wake (an HTTP long-poll, a custom

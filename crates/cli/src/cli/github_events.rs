@@ -42,6 +42,7 @@ pub(crate) fn classify_event(
     wanted: &[GithubEventKind],
     own_login: Option<&str>,
     include_own: bool,
+    branches: &[String],
 ) -> Option<WaitItem> {
     let actor = event
         .get("actor")
@@ -68,11 +69,46 @@ pub(crate) fn classify_event(
     // merge is `action == "closed"` with `pull_request.merged == true`
     // (the API's shape); `"merged"` is accepted too for
     // forward/legacy tolerance.
+    // `branch_push` builds its item from the push payload (no
+    // issue/PR object), so it short-circuits before the tuple match.
+    // BRANCH refs only: PushEvent also fires for tag pushes, and
+    // `refs/tags/*` is not a branch push — the strip_prefix gate is
+    // the event-domain boundary, and the branches filter sees only
+    // real short branch names (codex 3f04e3d).
+    if ty == "PushEvent" {
+        if !wanted.contains(&GithubEventKind::BranchPush) {
+            return None;
+        }
+        let full_ref = payload.get("ref").and_then(|r| r.as_str())?;
+        let branch = full_ref.strip_prefix("refs/heads/")?;
+        if !branches.is_empty() && !branches.iter().any(|b| b == branch) {
+            return None;
+        }
+        let size = payload.get("size").and_then(|s| s.as_u64()).unwrap_or(0);
+        let url = payload
+            .get("before")
+            .and_then(|b| b.as_str())
+            .zip(payload.get("head").and_then(|h| h.as_str()))
+            .map(|(before, head)| format!("https://github.com/{repo}/compare/{before}...{head}"));
+        return Some(WaitItem::GithubEvent {
+            repo: repo.to_string(),
+            event: kind_str(GithubEventKind::BranchPush).to_string(),
+            detail: None,
+            number: None,
+            title: Some(format!("{branch} +{size}")),
+            actor: actor.map(str::to_string),
+            url,
+        });
+    }
+
     let (kind, detail, obj): (GithubEventKind, Option<&str>, &serde_json::Value) = match ty {
         "PullRequestEvent" => {
             let merged = pr().get("merged").and_then(|m| m.as_bool()) == Some(true);
             match action {
                 Some("opened") => (GithubEventKind::PrOpened, None, pr()),
+                // New commits on the PR (the events feed's action for
+                // a head update).
+                Some("synchronize") => (GithubEventKind::PrUpdated, None, pr()),
                 Some("merged") => (GithubEventKind::PrMerged, None, pr()),
                 Some("closed") if merged => (GithubEventKind::PrMerged, None, pr()),
                 _ => return None,
@@ -136,6 +172,8 @@ pub(crate) fn classify_event(
 fn kind_str(kind: GithubEventKind) -> &'static str {
     match kind {
         GithubEventKind::PrOpened => "pr_opened",
+        GithubEventKind::PrUpdated => "pr_updated",
+        GithubEventKind::BranchPush => "branch_push",
         GithubEventKind::PrMerged => "pr_merged",
         GithubEventKind::PrComment => "pr_comment",
         GithubEventKind::IssueOpened => "issue_opened",
@@ -168,6 +206,7 @@ fn map_page(
             &src.events,
             own_login,
             src.include_own_actions,
+            &src.branches,
         ) {
             items.push(item);
         }
@@ -621,6 +660,7 @@ mod tests {
             events: events.to_vec(),
             poll_interval: None,
             include_own_actions: include_own,
+            branches: Vec::new(),
         }
     }
 
@@ -723,7 +763,7 @@ mod tests {
             ),
         ];
         for (raw, want, detail) in cases {
-            let item = classify_event("o/r", &raw, all, None, false)
+            let item = classify_event("o/r", &raw, all, None, false, &[])
                 .unwrap_or_else(|| panic!("must classify {want}"));
             let WaitItem::GithubEvent {
                 event, detail: d, ..
@@ -737,6 +777,111 @@ mod tests {
     }
 
     #[test]
+    fn branch_push_is_refs_heads_only_and_branch_filtered() {
+        use GithubEventKind::BranchPush;
+        let push = |r: &str| {
+            ev(
+                "1",
+                "PushEvent",
+                serde_json::json!({"ref": r, "size": 2,
+                    "before": "aaaa", "head": "bbbb", "commits": []}),
+                "x",
+            )
+        };
+        // A TAG push is ignored even when branch_push is subscribed
+        // with an empty branches filter (codex 3f04e3d).
+        assert!(
+            classify_event(
+                "o/r",
+                &push("refs/tags/v1.0"),
+                &[BranchPush],
+                None,
+                false,
+                &[]
+            )
+            .is_none(),
+            "refs/tags/* is not a branch push"
+        );
+        // Unsubscribed configs drop branch pushes.
+        assert!(
+            classify_event(
+                "o/r",
+                &push("refs/heads/main"),
+                &[GithubEventKind::PrOpened],
+                None,
+                false,
+                &[]
+            )
+            .is_none()
+        );
+        // The branches filter admits by SHORT ref and drops others.
+        let main_only = vec!["main".to_string()];
+        assert!(
+            classify_event(
+                "o/r",
+                &push("refs/heads/main"),
+                &[BranchPush],
+                None,
+                false,
+                &main_only
+            )
+            .is_some()
+        );
+        assert!(
+            classify_event(
+                "o/r",
+                &push("refs/heads/dev"),
+                &[BranchPush],
+                None,
+                false,
+                &main_only
+            )
+            .is_none()
+        );
+        // Own-actor filtering applies like every other kind.
+        assert!(
+            classify_event(
+                "o/r",
+                &push("refs/heads/main"),
+                &[BranchPush],
+                Some("x"),
+                false,
+                &[]
+            )
+            .is_none(),
+            "own push must not self-wake"
+        );
+    }
+
+    #[test]
+    fn pr_updated_maps_only_the_synchronize_action() {
+        use GithubEventKind::PrUpdated;
+        let pr_ev = |action: &str| {
+            ev(
+                "1",
+                "PullRequestEvent",
+                serde_json::json!({"action": action,
+                    "pull_request": {"number": 7, "title": "t", "html_url": "u"}}),
+                "x",
+            )
+        };
+        let item = classify_event("o/r", &pr_ev("synchronize"), &[PrUpdated], None, false, &[])
+            .expect("synchronize → pr_updated");
+        let WaitItem::GithubEvent { event, number, .. } = item else {
+            unreachable!()
+        };
+        assert_eq!(event, "pr_updated");
+        assert_eq!(number, Some(7));
+        // Other head-adjacent actions stay unmapped.
+        for action in ["edited", "labeled", "reopened"] {
+            assert!(
+                classify_event("o/r", &pr_ev(action), &[PrUpdated], None, false, &[]).is_none(),
+                "{action} is not a pr_updated"
+            );
+        }
+    }
+
+    #[test]
     fn pr_merged_accepts_both_the_api_and_legacy_shapes() {
         // Events API: action=closed + merged=true. Legacy/forward:
         // action=merged. Both map to pr_merged.
@@ -745,7 +890,7 @@ mod tests {
             serde_json::json!({"action":"merged","pull_request":{"number":1}}),
         ] {
             let raw = ev("1", "PullRequestEvent", payload, "x");
-            let item = classify_event("o/r", &raw, &[GithubEventKind::PrMerged], None, false);
+            let item = classify_event("o/r", &raw, &[GithubEventKind::PrMerged], None, false, &[]);
             assert!(
                 matches!(item, Some(WaitItem::GithubEvent { .. })),
                 "must be pr_merged"
@@ -772,7 +917,7 @@ mod tests {
                 "x",
             );
             assert!(
-                classify_event("o/r", &raw, wanted, None, false).is_none(),
+                classify_event("o/r", &raw, wanted, None, false, &[]).is_none(),
                 "{ty}/{action} must be filtered"
             );
         }
@@ -786,7 +931,9 @@ mod tests {
             serde_json::json!({"action":"closed","pull_request":{"number":9,"merged":false}}),
             "x",
         );
-        assert!(classify_event("o/r", &raw, &[GithubEventKind::PrMerged], None, false).is_none());
+        assert!(
+            classify_event("o/r", &raw, &[GithubEventKind::PrMerged], None, false, &[]).is_none()
+        );
         let raw = ev(
             "1",
             "PullRequestEvent",
@@ -794,10 +941,26 @@ mod tests {
             "me",
         );
         assert!(
-            classify_event("o/r", &raw, &[GithubEventKind::PrOpened], Some("me"), false).is_none()
+            classify_event(
+                "o/r",
+                &raw,
+                &[GithubEventKind::PrOpened],
+                Some("me"),
+                false,
+                &[]
+            )
+            .is_none()
         );
         assert!(
-            classify_event("o/r", &raw, &[GithubEventKind::PrOpened], Some("me"), true).is_some()
+            classify_event(
+                "o/r",
+                &raw,
+                &[GithubEventKind::PrOpened],
+                Some("me"),
+                true,
+                &[]
+            )
+            .is_some()
         );
     }
 
@@ -1138,14 +1301,17 @@ mod tests {
             repo: "o/r".into(),
             events: vec![
                 PrOpened,
+                PrUpdated,
                 PrMerged,
                 PrComment,
                 IssueOpened,
                 IssueClosed,
                 IssueComment,
+                BranchPush,
             ],
             poll_interval: None,
             include_own_actions: true, // don't filter — assert full mapping
+            branches: Vec::new(),
         };
         let (items, _ids) = map_page(&s, &raw, &BTreeSet::new(), None);
         let got: Vec<(&str, Option<&str>, Option<u64>)> = items
@@ -1171,8 +1337,24 @@ mod tests {
                 ("issue_opened", None, Some(30)),
                 ("issue_closed", None, Some(29)),
                 ("issue_comment", None, Some(30)),
+                ("pr_updated", None, Some(12)),
+                ("branch_push", None, None),
             ],
-            "the WatchEvent is dropped; every other kind maps with its detail"
+            "the WatchEvent AND the tag push are dropped; every other \
+             kind maps with its detail"
+        );
+        // The branch push carries the short ref + size title and the
+        // actionable compare URL from before/head.
+        let WaitItem::GithubEvent { title, url, .. } = items.last().unwrap() else {
+            unreachable!()
+        };
+        assert_eq!(title.as_deref(), Some("main +3"));
+        assert_eq!(
+            url.as_deref(),
+            Some(
+                "https://github.com/o/r/compare/883efe034920928c47fe18598c01249d1a9fdabd...\
+                 7a8f3ac80e2ad2f6842cb86f576d4bfe2c03e300"
+            )
         );
         // The pr_opened item carries the recorded title + url.
         let WaitItem::GithubEvent { title, url, .. } = &items[0] else {
