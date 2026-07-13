@@ -36,6 +36,23 @@ const SEEN_CAP: usize = 1000;
 /// One classified event, or `None` if it doesn't match a wanted
 /// sub-kind, is filtered by actor, or is a non-creating action (an
 /// edit/delete/dismiss is not a new comment/review). Pure.
+/// A classified wake: the item plus its ACTION KEY — the normalized,
+/// content-derived identity the dual-path coordinator dedups on. The
+/// key is computed HERE, at classification time, because the raw
+/// identities it needs (comment/review ids, the PR head sha, the push
+/// ref+sha) live in the payload and are discarded by `WaitItem`
+/// (codex e89be23). Both payload forms (events feed / webhook) yield
+/// the SAME key for the same underlying action.
+#[derive(Debug)]
+pub(crate) struct Classified {
+    pub(crate) item: WaitItem,
+    /// `None` when a REQUIRED identity was missing from the payload:
+    /// the coordinator then never dedups this wake (emit-always is the
+    /// safe degradation) instead of collapsing unrelated actions into
+    /// a manufactured shared key (codex bf1e1ea).
+    pub(crate) key: Option<String>,
+}
+
 pub(crate) fn classify_event(
     repo: &str,
     event: &serde_json::Value,
@@ -43,7 +60,7 @@ pub(crate) fn classify_event(
     own_login: Option<&str>,
     include_own: bool,
     branches: &[String],
-) -> Option<WaitItem> {
+) -> Option<Classified> {
     let actor = event
         .get("actor")
         .and_then(|a| a.get("login"))
@@ -90,14 +107,18 @@ pub(crate) fn classify_event(
             .and_then(|b| b.as_str())
             .zip(payload.get("head").and_then(|h| h.as_str()))
             .map(|(before, head)| format!("https://github.com/{repo}/compare/{before}...{head}"));
-        return Some(WaitItem::GithubEvent {
-            repo: repo.to_string(),
-            event: kind_str(GithubEventKind::BranchPush).to_string(),
-            detail: None,
-            number: None,
-            title: Some(format!("{branch} +{size}")),
-            actor: actor.map(str::to_string),
-            url,
+        let head = payload.get("head").and_then(|h| h.as_str());
+        return Some(Classified {
+            item: WaitItem::GithubEvent {
+                repo: repo.to_string(),
+                event: kind_str(GithubEventKind::BranchPush).to_string(),
+                detail: None,
+                number: None,
+                title: Some(format!("{branch} +{size}")),
+                actor: actor.map(str::to_string),
+                url,
+            },
+            key: head.map(|h| format!("push@{full_ref}+{h}")),
         });
     }
 
@@ -152,21 +173,75 @@ pub(crate) fn classify_event(
     if !wanted.contains(&kind) {
         return None;
     }
-    Some(WaitItem::GithubEvent {
-        repo: repo.to_string(),
-        event: kind_str(kind).to_string(),
-        detail: detail.map(str::to_string),
-        number: obj.get("number").and_then(|n| n.as_u64()),
-        title: obj
-            .get("title")
-            .and_then(|t| t.as_str())
-            .map(str::to_string),
-        actor: actor.map(str::to_string),
-        url: obj
-            .get("html_url")
-            .and_then(|u| u.as_str())
-            .map(str::to_string),
+    let key = action_key(kind, detail, payload, obj);
+    Some(Classified {
+        item: WaitItem::GithubEvent {
+            repo: repo.to_string(),
+            event: kind_str(kind).to_string(),
+            detail: detail.map(str::to_string),
+            number: obj.get("number").and_then(|n| n.as_u64()),
+            title: obj
+                .get("title")
+                .and_then(|t| t.as_str())
+                .map(str::to_string),
+            actor: actor.map(str::to_string),
+            url: obj
+                .get("html_url")
+                .and_then(|u| u.as_str())
+                .map(str::to_string),
+        },
+        key,
     })
+}
+
+/// The normalized action identity for the non-push kinds — SHARED by
+/// both classifiers so the two payload forms cannot derive different
+/// keys for one action. Feed event ids and webhook delivery GUIDs are
+/// different id spaces and deliberately not used; the key is built
+/// from the objects both forms carry.
+fn action_key(
+    kind: GithubEventKind,
+    detail: Option<&str>,
+    payload: &serde_json::Value,
+    obj: &serde_json::Value,
+) -> Option<String> {
+    // Every identity is REQUIRED: a missing number/id/sha yields None
+    // (the coordinator never dedups such a wake) — a manufactured `0`
+    // or `?` would collapse unrelated actions into one key
+    // (codex bf1e1ea).
+    let number = obj.get("number").and_then(|n| n.as_u64());
+    match kind {
+        GithubEventKind::PrOpened => Some(format!("pr_opened#{}", number?)),
+        GithubEventKind::PrMerged => Some(format!("pr_merged#{}", number?)),
+        GithubEventKind::PrUpdated => {
+            let head = payload
+                .get("pull_request")
+                .and_then(|p| p.get("head"))
+                .and_then(|h| h.get("sha"))
+                .and_then(|s| s.as_str())?;
+            Some(format!("pr_updated#{}@{head}", number?))
+        }
+        GithubEventKind::IssueOpened => Some(format!("issue_opened#{}", number?)),
+        GithubEventKind::IssueClosed => Some(format!("issue_closed#{}", number?)),
+        // Comment-family ids live in DIFFERENT resource domains
+        // (issue comments, review comments, reviews) — the key is
+        // namespaced by the classified subtype so equal numeric ids
+        // across families never collide (codex bf1e1ea).
+        GithubEventKind::PrComment | GithubEventKind::IssueComment => {
+            let (ns, container) = match detail {
+                Some("review") => ("review", "review"),
+                Some("review_comment") => ("review_comment", "comment"),
+                Some("issue_comment_on_pr") => ("pr_issue_comment", "comment"),
+                _ => ("issue_comment", "comment"),
+            };
+            let id = payload
+                .get(container)
+                .and_then(|c| c.get("id"))
+                .and_then(|i| i.as_u64())?;
+            Some(format!("{ns}#{id}"))
+        }
+        GithubEventKind::BranchPush => unreachable!("push keys are built in the push arms"),
+    }
 }
 
 fn kind_str(kind: GithubEventKind) -> &'static str {
@@ -182,6 +257,138 @@ fn kind_str(kind: GithubEventKind) -> &'static str {
     }
 }
 
+/// Classify one WEBHOOK delivery (github-http-client-and-realtime
+/// M2). The relay hands us standard webhook payloads, which differ
+/// from the events feed: the event NAME arrives out-of-band (the
+/// `X-GitHub-Event` header), the action vocabulary is the webhook one
+/// (`submitted` reviews, `synchronize`), the actor is `sender.login`,
+/// and a push carries `after`/`ref` with a commits array. Same wanted/
+/// own-actor/branches semantics as [`classify_event`]; tag pushes are
+/// ignored by the same `refs/heads/` gate.
+pub(crate) fn classify_webhook(
+    repo: &str,
+    event_name: &str,
+    payload: &serde_json::Value,
+    wanted: &[GithubEventKind],
+    own_login: Option<&str>,
+    include_own: bool,
+    branches: &[String],
+) -> Option<Classified> {
+    let actor = payload
+        .get("sender")
+        .and_then(|a| a.get("login"))
+        .and_then(|l| l.as_str());
+    if !include_own
+        && let (Some(own), Some(actor)) = (own_login, actor)
+        && own == actor
+    {
+        return None;
+    }
+    let action = payload.get("action").and_then(|a| a.as_str());
+    let pr = || {
+        payload
+            .get("pull_request")
+            .unwrap_or(&serde_json::Value::Null)
+    };
+
+    if event_name == "push" {
+        if !wanted.contains(&GithubEventKind::BranchPush) {
+            return None;
+        }
+        let full_ref = payload.get("ref").and_then(|r| r.as_str())?;
+        let branch = full_ref.strip_prefix("refs/heads/")?;
+        if !branches.is_empty() && !branches.iter().any(|b| b == branch) {
+            return None;
+        }
+        let size = payload
+            .get("commits")
+            .and_then(|c| c.as_array())
+            .map(|c| c.len())
+            .unwrap_or(0);
+        let url = payload
+            .get("before")
+            .and_then(|b| b.as_str())
+            .zip(payload.get("after").and_then(|h| h.as_str()))
+            .map(|(before, after)| format!("https://github.com/{repo}/compare/{before}...{after}"));
+        let after = payload.get("after").and_then(|h| h.as_str());
+        return Some(Classified {
+            item: WaitItem::GithubEvent {
+                repo: repo.to_string(),
+                event: kind_str(GithubEventKind::BranchPush).to_string(),
+                detail: None,
+                number: None,
+                title: Some(format!("{branch} +{size}")),
+                actor: actor.map(str::to_string),
+                url,
+            },
+            key: after.map(|a| format!("push@{full_ref}+{a}")),
+        });
+    }
+
+    let (kind, detail, obj): (GithubEventKind, Option<&str>, &serde_json::Value) = match event_name
+    {
+        "pull_request" => {
+            let merged = pr().get("merged").and_then(|m| m.as_bool()) == Some(true);
+            match action {
+                Some("opened") => (GithubEventKind::PrOpened, None, pr()),
+                Some("synchronize") => (GithubEventKind::PrUpdated, None, pr()),
+                Some("closed") if merged => (GithubEventKind::PrMerged, None, pr()),
+                _ => return None,
+            }
+        }
+        "issues" => {
+            let issue = payload.get("issue").unwrap_or(&serde_json::Value::Null);
+            match action {
+                Some("opened") => (GithubEventKind::IssueOpened, None, issue),
+                Some("closed") => (GithubEventKind::IssueClosed, None, issue),
+                _ => return None,
+            }
+        }
+        "issue_comment" if action == Some("created") => {
+            let issue = payload.get("issue").unwrap_or(&serde_json::Value::Null);
+            if issue.get("pull_request").is_some() {
+                (
+                    GithubEventKind::PrComment,
+                    Some("issue_comment_on_pr"),
+                    issue,
+                )
+            } else {
+                (GithubEventKind::IssueComment, None, issue)
+            }
+        }
+        // Webhook vocabulary: a new review is SUBMITTED.
+        "pull_request_review" if action == Some("submitted") => {
+            (GithubEventKind::PrComment, Some("review"), pr())
+        }
+        "pull_request_review_comment" if action == Some("created") => {
+            (GithubEventKind::PrComment, Some("review_comment"), pr())
+        }
+        _ => return None,
+    };
+    if !wanted.contains(&kind) {
+        return None;
+    }
+    let key = action_key(kind, detail, payload, obj);
+    Some(Classified {
+        item: WaitItem::GithubEvent {
+            repo: repo.to_string(),
+            event: kind_str(kind).to_string(),
+            detail: detail.map(str::to_string),
+            number: obj.get("number").and_then(|n| n.as_u64()),
+            title: obj
+                .get("title")
+                .and_then(|t| t.as_str())
+                .map(str::to_string),
+            actor: actor.map(str::to_string),
+            url: obj
+                .get("html_url")
+                .and_then(|u| u.as_str())
+                .map(str::to_string),
+        },
+        key,
+    })
+}
+
 /// New items from one page (ids not in `seen`, matching + filtered),
 /// plus the ids observed on the page. Pure.
 fn map_page(
@@ -189,7 +396,7 @@ fn map_page(
     events: &[serde_json::Value],
     seen: &BTreeSet<String>,
     own_login: Option<&str>,
-) -> (Vec<WaitItem>, Vec<String>) {
+) -> (Vec<Classified>, Vec<String>) {
     let mut items = Vec::new();
     let mut ids = Vec::new();
     for event in events {
@@ -200,7 +407,7 @@ fn map_page(
         if seen.contains(id) {
             continue;
         }
-        if let Some(item) = classify_event(
+        if let Some(classified) = classify_event(
             &src.repo,
             event,
             &src.events,
@@ -208,7 +415,7 @@ fn map_page(
             src.include_own_actions,
             &src.branches,
         ) {
-            items.push(item);
+            items.push(classified);
         }
     }
     (items, ids)
@@ -294,7 +501,7 @@ pub(crate) struct PollOutcome {
 pub(crate) enum PollDelta {
     NotModified,
     Fetched {
-        items: Vec<WaitItem>,
+        items: Vec<Classified>,
         new_ids: Vec<String>,
         overrun: bool,
     },
@@ -429,141 +636,255 @@ pub(crate) fn effective_interval(
     configured.max(server)
 }
 
-/// Parse `gh api --include` output (status line, headers, blank line,
-/// JSON body) into a [`GhResponse`]. Pure.
-pub(crate) fn parse_gh_include(stdout: &str) -> anyhow::Result<GhResponse> {
-    let mut lines = stdout.lines();
-    let status = lines.next().unwrap_or("");
-    // Headers are parsed BEFORE classifying the status: a 304 can
-    // still raise `X-Poll-Interval` and the client must observe it
-    // (codex e9b8b66).
-    let not_modified = http_status_of(status) == Some(304);
-    let mut etag = None;
-    let mut poll_interval = None;
-    for line in lines.by_ref() {
-        // `lines()` strips `\n` but keeps `\r`, so a CRLF blank
-        // separator arrives as "\r" — trim it or the JSON body would be
-        // parsed as headers and dropped (codex ef1861a).
-        if line.trim_end_matches('\r').is_empty() {
-            break;
-        }
-        let Some((name, value)) = line.split_once(':') else {
-            continue;
-        };
-        let (name, value) = (name.trim().to_ascii_lowercase(), value.trim());
-        match name.as_str() {
-            "etag" => etag = Some(value.to_string()),
-            "x-poll-interval" => poll_interval = value.parse().ok(),
-            _ => {}
-        }
+/// The GitHub token, reusing gh's credential without shelling gh per
+/// poll: `GH_TOKEN` / `GITHUB_TOKEN` env first (the standard
+/// overrides gh itself honors), else ONE `gh auth token` subprocess —
+/// the last place gh is invoked on the polling path
+/// (github-http-client-and-realtime M1).
+async fn acquire_github_token() -> anyhow::Result<String> {
+    if let Some(t) = env_token(|k| std::env::var(k).ok()) {
+        return Ok(t);
     }
-    if not_modified {
-        return Ok(GhResponse::NotModified { poll_interval });
-    }
-    let body: String = lines.collect::<Vec<_>>().join("\n");
-    let events: Vec<serde_json::Value> = if body.trim().is_empty() {
-        Vec::new()
-    } else {
-        serde_json::from_str(&body).map_err(|e| anyhow::anyhow!("gh /events body not JSON: {e}"))?
-    };
-    Ok(GhResponse::Ok {
-        events,
-        etag,
-        poll_interval,
-    })
-}
-
-/// The HTTP status code of an `--include` status line
-/// (`HTTP/2.0 304 Not Modified` → 304). `None` for anything that
-/// isn't a status line.
-fn http_status_of(status_line: &str) -> Option<u16> {
-    let mut it = status_line.split_whitespace();
-    if !it.next()?.starts_with("HTTP/") {
-        return None;
-    }
-    it.next()?.parse().ok()
-}
-
-/// Classify one `gh api --include` run. `gh` exits NON-ZERO for every
-/// non-2xx status — including the 304 the conditional `If-None-Match`
-/// poll is DESIGNED to produce — so a failed exit is not necessarily a
-/// failed poll (github-poll-304-is-success: every healthy idle cycle
-/// logged "poll failed"). Reclassification is EXACT-304-only: a
-/// failed 401/403/500 whose stdout still carries an include block
-/// must never read as a healthy poll (codex a950e7b).
-pub(crate) fn interpret_gh_events_output(
-    success: bool,
-    stdout: &str,
-    stderr: &str,
-) -> anyhow::Result<GhResponse> {
-    if success {
-        return parse_gh_include(stdout);
-    }
-    // A failed exit whose include block's STATUS LINE parses to
-    // exactly 304: the parse also captures the X-Poll-Interval floor
-    // (the server can raise it on a 304).
-    if let Some(status_line) = stdout.lines().next()
-        && http_status_of(status_line) == Some(304)
-    {
-        return parse_gh_include(stdout);
-    }
-    // gh's own bare failure line for a 304 with no include block on
-    // stdout — matched STRICTLY (a proxy error merely mentioning 304
-    // stays an error).
-    if stderr.lines().any(|l| l.trim() == "gh: HTTP 304") {
-        return Ok(GhResponse::NotModified {
-            poll_interval: None,
-        });
-    }
-    anyhow::bail!("gh /events failed: {}", stderr.trim());
-}
-
-/// Production fetcher: an async, cancellation-safe `gh api --include`
-/// child (`kill_on_drop`, so aborting the source task kills the poll).
-struct GhFetcher {
-    repo: String,
-}
-
-impl EventFetcher for GhFetcher {
-    async fn fetch(&self, page: u32, etag: Option<String>) -> anyhow::Result<GhResponse> {
-        let mut cmd = tokio::process::Command::new("gh");
-        cmd.arg("api").arg("--include").arg(format!(
-            "repos/{}/events?per_page=100&page={page}",
-            self.repo
-        ));
-        if let Some(tag) = etag {
-            cmd.arg("-H").arg(format!("If-None-Match: {tag}"));
-        }
-        cmd.kill_on_drop(true);
-        let out = cmd.output().await?;
-        interpret_gh_events_output(
-            out.status.success(),
-            &String::from_utf8_lossy(&out.stdout),
-            &String::from_utf8_lossy(&out.stderr),
-        )
-    }
-}
-
-/// The authenticated `gh` login, for the own-actor filter — an async,
-/// cancellation-safe child. `Err` when `gh` can't answer (the caller
-/// warns and degrades).
-async fn gh_login() -> anyhow::Result<String> {
     let out = tokio::process::Command::new("gh")
-        .args(["api", "user", "--jq", ".login"])
+        .args(["auth", "token"])
         .kill_on_drop(true)
         .output()
         .await?;
     if !out.status.success() {
         anyhow::bail!(
-            "gh api user failed: {}",
+            "no GH_TOKEN/GITHUB_TOKEN and `gh auth token` failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
-    let login = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if login.is_empty() {
-        anyhow::bail!("gh returned an empty login");
+    let token = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if token.is_empty() {
+        anyhow::bail!("`gh auth token` returned nothing");
     }
-    Ok(login)
+    Ok(token)
+}
+
+/// Env-token precedence, injected for tests: GH_TOKEN beats
+/// GITHUB_TOKEN, blanks don't count.
+fn env_token(get: impl Fn(&str) -> Option<String>) -> Option<String> {
+    ["GH_TOKEN", "GITHUB_TOKEN"]
+        .iter()
+        .filter_map(|k| get(k))
+        .map(|t| t.trim().to_string())
+        .find(|t| !t.is_empty())
+}
+
+/// A cached token that can be invalidated (a 401 means it rotated) and
+/// re-acquired on the next use — acquisition injected for tests.
+struct TokenCell(tokio::sync::Mutex<Option<String>>);
+
+impl TokenCell {
+    fn new() -> Self {
+        Self(tokio::sync::Mutex::new(None))
+    }
+    async fn invalidate(&self) {
+        *self.0.lock().await = None;
+    }
+    async fn get_or_acquire<F, Fut>(&self, acquire: F) -> anyhow::Result<String>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = anyhow::Result<String>>,
+    {
+        let mut slot = self.0.lock().await;
+        if let Some(t) = slot.as_ref() {
+            return Ok(t.clone());
+        }
+        let fresh = acquire().await?;
+        *slot = Some(fresh.clone());
+        Ok(fresh)
+    }
+}
+
+/// A minimal response the session yields — our own shape so the
+/// transport is injectable in tests without fabricating reqwest types.
+pub(crate) struct MiniResponse {
+    pub(crate) status: u16,
+    pub(crate) headers: std::collections::BTreeMap<String, String>,
+    pub(crate) body: String,
+}
+
+impl MiniResponse {
+    fn header_u64(&self, name: &str) -> Option<u64> {
+        self.headers.get(name)?.parse().ok()
+    }
+}
+
+/// The raw HTTP GET, injected so the session's auth behavior is
+/// testable without a network.
+pub(crate) trait HttpSend: Send + Sync {
+    fn send(
+        &self,
+        url: &str,
+        bearer: &str,
+        etag: Option<&str>,
+    ) -> impl std::future::Future<Output = anyhow::Result<MiniResponse>> + Send;
+}
+
+/// Production sender: reqwest (rustls), typed statuses and headers —
+/// the gh-CLI text parsing this transport replaced produced the
+/// 304-noise/CRLF/substring-status bug class.
+pub(crate) struct ReqwestSend(reqwest::Client);
+
+impl HttpSend for ReqwestSend {
+    async fn send(
+        &self,
+        url: &str,
+        bearer: &str,
+        etag: Option<&str>,
+    ) -> anyhow::Result<MiniResponse> {
+        let mut req = self
+            .0
+            .get(url)
+            .bearer_auth(bearer)
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28");
+        if let Some(tag) = etag {
+            req = req.header("If-None-Match", tag);
+        }
+        let resp = req.send().await?;
+        let status = resp.status().as_u16();
+        let headers = resp
+            .headers()
+            .iter()
+            .filter_map(|(k, v)| {
+                Some((
+                    k.as_str().to_ascii_lowercase(),
+                    v.to_str().ok()?.to_string(),
+                ))
+            })
+            .collect();
+        let body = resp.text().await.unwrap_or_default();
+        Ok(MiniResponse {
+            status,
+            headers,
+            body,
+        })
+    }
+}
+
+/// A token acquirer: the boxed-future fn shape both production
+/// (`acquire_github_token`) and the tests' scripted acquirers share.
+type AcquireFn =
+    fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<String>> + Send>>;
+
+/// ONE host-scoped authenticated session shared by every github
+/// source in the process (codex f9807c3: per-source cells shelled gh
+/// once per source and let a rotated token gate /user forever). Every
+/// endpoint goes through [`GithubSession::get`], which has the ONE
+/// uniform 401 story: invalidate, re-acquire, retry ONCE; a second
+/// 401 is the error.
+pub(crate) struct GithubSession<S> {
+    http: S,
+    token: TokenCell,
+    acquire: AcquireFn,
+}
+
+/// The github.com session, created on first use (host-scoped: one per
+/// process today; a hosts map when enterprise arrives).
+pub(crate) fn shared_session() -> std::sync::Arc<GithubSession<ReqwestSend>> {
+    static SESSION: std::sync::OnceLock<std::sync::Arc<GithubSession<ReqwestSend>>> =
+        std::sync::OnceLock::new();
+    SESSION
+        .get_or_init(|| {
+            std::sync::Arc::new(GithubSession {
+                http: ReqwestSend(
+                    reqwest::Client::builder()
+                        .user_agent("clank")
+                        .build()
+                        .expect("static client config"),
+                ),
+                token: TokenCell::new(),
+                acquire: || Box::pin(acquire_github_token()),
+            })
+        })
+        .clone()
+}
+
+impl<S: HttpSend> GithubSession<S> {
+    #[cfg(test)]
+    fn for_tests(
+        http: S,
+        acquire: fn() -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = anyhow::Result<String>> + Send>,
+        >,
+    ) -> Self {
+        Self {
+            http,
+            token: TokenCell::new(),
+            acquire,
+        }
+    }
+
+    /// Authorized GET with the uniform 401 handling.
+    async fn get(&self, url: &str, etag: Option<&str>) -> anyhow::Result<MiniResponse> {
+        let token = self.token.get_or_acquire(self.acquire).await?;
+        let resp = self.http.send(url, &token, etag).await?;
+        if resp.status != 401 {
+            return Ok(resp);
+        }
+        // The token rotated: re-acquire and retry exactly once.
+        self.token.invalidate().await;
+        let token = self.token.get_or_acquire(self.acquire).await?;
+        let resp = self.http.send(url, &token, etag).await?;
+        if resp.status == 401 {
+            anyhow::bail!("github {url}: 401 after token re-acquisition");
+        }
+        Ok(resp)
+    }
+}
+
+/// Production fetcher: the events endpoint over the SHARED session.
+struct GhFetcher<S: HttpSend> {
+    repo: String,
+    session: std::sync::Arc<GithubSession<S>>,
+}
+
+impl<S: HttpSend> EventFetcher for GhFetcher<S> {
+    async fn fetch(&self, page: u32, etag: Option<String>) -> anyhow::Result<GhResponse> {
+        let url = format!(
+            "https://api.github.com/repos/{}/events?per_page=100&page={page}",
+            self.repo
+        );
+        let resp = self.session.get(&url, etag.as_deref()).await?;
+        match resp.status {
+            304 => Ok(GhResponse::NotModified {
+                poll_interval: resp.header_u64("x-poll-interval"),
+            }),
+            s if (200..300).contains(&s) => {
+                let events: Vec<serde_json::Value> = serde_json::from_str(&resp.body)?;
+                Ok(GhResponse::Ok {
+                    etag: resp.headers.get("etag").cloned(),
+                    poll_interval: resp.header_u64("x-poll-interval"),
+                    events,
+                })
+            }
+            s => anyhow::bail!(
+                "github /events: {s}: {}",
+                resp.body.chars().take(200).collect::<String>()
+            ),
+        }
+    }
+}
+
+/// The authenticated login for the own-action filter — `GET /user`
+/// over the SAME session and 401 story as the events endpoint.
+async fn fetch_authenticated_login<S: HttpSend>(
+    session: &GithubSession<S>,
+) -> anyhow::Result<String> {
+    let resp = session.get("https://api.github.com/user", None).await?;
+    if !(200..300).contains(&resp.status) {
+        anyhow::bail!("github /user: {}", resp.status);
+    }
+    let v: serde_json::Value = serde_json::from_str(&resp.body)?;
+    v.get("login")
+        .and_then(|l| l.as_str())
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| anyhow::anyhow!("github /user returned no login"))
 }
 
 /// Resolves the authenticated login for the own-action filter —
@@ -572,24 +893,423 @@ pub(crate) trait LoginResolver {
     fn resolve(&self) -> impl Future<Output = anyhow::Result<String>> + Send;
 }
 
-/// Production resolver: `gh api user`.
-struct GhLogin;
-impl LoginResolver for GhLogin {
+/// Production resolver: `GET /user` over the shared session.
+struct GhLogin<S: HttpSend>(std::sync::Arc<GithubSession<S>>);
+impl<S: HttpSend> LoginResolver for GhLogin<S> {
     async fn resolve(&self) -> anyhow::Result<String> {
-        gh_login().await
+        fetch_authenticated_login(&self.0).await
     }
 }
 
-/// One github wake source: the production entry point. Drives
-/// [`poll_loop`] with the real `gh` fetcher + login resolver.
+/// Extract one relay delivery from a webhook request: the event name
+/// from `X-GitHub-Event`, the payload from the JSON body. Generic
+/// over the body so tests drive it with fabricated requests.
+/// One loopback request may not buffer unboundedly: the count-bounded
+/// inbox doesn't bound MEMORY if a single body is huge (codex
+/// 4d77b83). Real webhook payloads are kilobytes; a MiB is generous.
+const MAX_WEBHOOK_BODY: usize = 1 << 20;
+
+async fn webhook_from_request<B>(req: hyper::Request<B>) -> Option<RawDelivery>
+where
+    B: hyper::body::Body,
+    B::Data: Send,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    use http_body_util::BodyExt;
+    let name = req
+        .headers()
+        .get("x-github-event")?
+        .to_str()
+        .ok()?
+        .to_string();
+    let limited = http_body_util::Limited::new(req.into_body(), MAX_WEBHOOK_BODY);
+    let bytes = limited.collect().await.ok()?.to_bytes();
+    let payload = serde_json::from_slice(&bytes).ok()?;
+    Some((name, payload))
+}
+
+/// Serve the loopback listener: each delivery lands in the inbox
+/// (ingress-bounded), 200 back to the forwarder. Connections are
+/// served INLINE — no detached per-connection tasks, so aborting the
+/// supervisor cancels everything it owns.
+async fn run_relay_listener(listener: tokio::net::TcpListener, inbox: std::sync::Arc<RelayInbox>) {
+    loop {
+        let Ok((stream, _)) = listener.accept().await else {
+            break;
+        };
+        let io = hyper_util::rt::TokioIo::new(stream);
+        let inbox = inbox.clone();
+        let svc = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+            let inbox = inbox.clone();
+            async move {
+                if let Some(raw) = webhook_from_request(req).await {
+                    inbox.push(raw);
+                }
+                Ok::<_, std::convert::Infallible>(hyper::Response::new(http_body_util::Empty::<
+                    hyper::body::Bytes,
+                >::new()))
+            }
+        });
+        let _ = hyper::server::conn::http1::Builder::new()
+            .serve_connection(io, svc)
+            .await;
+    }
+}
+
+/// The webhook event names a source's sub-kinds subscribe to — what
+/// `gh webhook forward --events` receives.
+fn webhook_event_names(events: &[GithubEventKind]) -> Vec<&'static str> {
+    let mut names = Vec::new();
+    for k in events {
+        let name = match k {
+            GithubEventKind::PrOpened | GithubEventKind::PrUpdated | GithubEventKind::PrMerged => {
+                "pull_request"
+            }
+            GithubEventKind::PrComment => "pull_request_review", // + comment kinds below
+            GithubEventKind::IssueOpened | GithubEventKind::IssueClosed => "issues",
+            GithubEventKind::IssueComment => "issue_comment",
+            GithubEventKind::BranchPush => "push",
+        };
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    // pr_comment spans three webhook events.
+    if events.contains(&GithubEventKind::PrComment) {
+        for extra in ["pull_request_review_comment", "issue_comment"] {
+            if !names.contains(&extra) {
+                names.push(extra);
+            }
+        }
+    }
+    names
+}
+
+/// The forwarder's argv — pure, pinned by test (codex 4d77b83).
+fn forwarder_argv(repo: &str, events: &str, port: u16) -> Vec<String> {
+    vec![
+        "webhook".into(),
+        "forward".into(),
+        format!("--repo={repo}"),
+        format!("--events={events}"),
+        format!("--url=http://127.0.0.1:{port}"),
+    ]
+}
+
+/// The forwarder process seam: run until TERMINAL, returning the one
+/// bounded human reason (spawn failure, or exit status + last stderr
+/// line). Injected so the supervisor's outcomes are scriptable
+/// without gh (codex 4d77b83).
+pub(crate) trait Forwarder: Send + Sync + 'static {
+    fn run(
+        &self,
+        repo: String,
+        events: String,
+        port: u16,
+    ) -> impl std::future::Future<Output = String> + Send;
+}
+
+/// Production forwarder: `gh webhook forward` in its own process
+/// group, killed with the supervisor (kill_on_drop + group kill);
+/// stderr captured so the terminal reason is USEFUL (a missing
+/// extension or admin refusal names itself).
+struct GhForwarder;
+
+impl Forwarder for GhForwarder {
+    async fn run(&self, repo: String, events: String, port: u16) -> String {
+        let mut cmd = tokio::process::Command::new("gh");
+        cmd.args(forwarder_argv(&repo, &events, port))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .process_group(0)
+            .kill_on_drop(true);
+        run_forwarder_process(cmd).await
+    }
+}
+
+/// Supervise a spawned forwarder-shaped command to its terminal
+/// reason. stderr is drained CONCURRENTLY with the wait into a
+/// bounded tail — a chatty extension that fills the OS pipe would
+/// otherwise block before exit and the wait would never complete
+/// (codex 24c3355); the post-exit drain uses the same absolute
+/// deadline discipline as command sources.
+async fn run_forwarder_process(mut cmd: tokio::process::Command) -> String {
+    use tokio::io::AsyncReadExt;
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => return format!("failed to start: {e}"),
+    };
+    let _group = crate::cli::wait::GroupKill(child.id());
+    let mut stderr = child.stderr.take();
+    let mut tail = crate::cli::wait::RingTail::new(4096);
+    let mut buf = [0u8; 1024];
+    let status = loop {
+        tokio::select! {
+            st = child.wait() => break st,
+            r = async { stderr.as_mut().unwrap().read(&mut buf).await }, if stderr.is_some() => {
+                match r {
+                    Ok(0) | Err(_) => stderr = None,
+                    Ok(n) => tail.push(&buf[..n]),
+                }
+            }
+        }
+    };
+    // Catch a final line written just before exit — bounded both ways.
+    let _ = tokio::time::timeout(std::time::Duration::from_millis(100), async {
+        while let Some(pipe) = stderr.as_mut() {
+            match tokio::time::timeout(std::time::Duration::from_millis(20), pipe.read(&mut buf))
+                .await
+            {
+                Ok(Ok(n)) if n > 0 => tail.push(&buf[..n]),
+                _ => break,
+            }
+        }
+    })
+    .await;
+    let text = tail.into_string();
+    let last_line = text.lines().last().unwrap_or("").to_string();
+    match status {
+        Ok(st) => format!("forwarder exited {st}: {last_line}"),
+        Err(e) => format!("forwarder wait failed: {e}"),
+    }
+}
+
+/// Aborts the relay's listener/supervisor tasks when the source dies —
+/// the forwarder child itself dies by kill_on_drop + group kill inside
+/// the supervisor task.
+struct RelayGuard(Vec<tokio::task::JoinHandle<()>>);
+impl Drop for RelayGuard {
+    fn drop(&mut self) {
+        for h in &self.0 {
+            h.abort();
+        }
+    }
+}
+
+/// Start the realtime relay: a loopback-only listener (by
+/// construction — bound to 127.0.0.1) plus a supervised
+/// `gh webhook forward` child in its own process group. Any failure
+/// to start, and the forwarder EXITING, close the inbox — the poll
+/// loop logs the fallback once and continues on polling alone
+/// (polling never stopped; nothing is lost). Requires ADMIN on the
+/// watched repo and the cli/gh-webhook extension; GitHub bills the
+/// relay as dev tooling — all stated in the skill docs.
+async fn start_relay<Fw: Forwarder>(
+    src: &GithubSource,
+    forwarder: Fw,
+) -> Option<(std::sync::Arc<RelayInbox>, RelayGuard)> {
+    let listener = match tokio::net::TcpListener::bind(("127.0.0.1", 0)).await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!(
+                "wait: github {} — realtime listener failed to bind ({e}); polling alone",
+                src.repo
+            );
+            return None;
+        }
+    };
+    let port = listener.local_addr().ok()?.port();
+    let inbox = std::sync::Arc::new(RelayInbox::new());
+    let listen_task = tokio::spawn(run_relay_listener(listener, inbox.clone()));
+    let events = webhook_event_names(&src.events).join(",");
+    let repo = src.repo.clone();
+    let inbox_for_child = inbox.clone();
+    let child_task = tokio::spawn(async move {
+        // The supervisor prints NOTHING: the terminal reason lands in
+        // the inbox and poll_loop's fallback line is the single
+        // diagnostic owner (codex 4d77b83).
+        let reason = forwarder.run(repo, events, port).await;
+        inbox_for_child.close_with(&reason);
+    });
+    Some((inbox, RelayGuard(vec![listen_task, child_task])))
+}
+
+/// One github wake source: the production entry point. Every source
+/// in the process shares ONE host-scoped session (one token
+/// acquisition, one 401 story — codex f9807c3). `delivery: realtime`
+/// adds the webhook relay as the latency path; polling remains the
+/// completeness backstop either way.
 pub(crate) async fn run_github_source(
     src: GithubSource,
     tx: tokio::sync::mpsc::UnboundedSender<WaitItem>,
 ) {
+    let session = shared_session();
     let fetcher = GhFetcher {
         repo: src.repo.clone(),
+        session: session.clone(),
     };
-    poll_loop(&src, &GhLogin, &fetcher, &tx).await;
+    let relay = if src.delivery == clank_core::agent_config::Delivery::Realtime {
+        start_relay(&src, GhForwarder).await
+    } else {
+        None
+    };
+    let inbox = relay.as_ref().map(|(i, _)| i.clone());
+    poll_loop(&src, &GhLogin(session), &fetcher, &tx, inbox).await;
+    // RelayGuard drops here (and on task abort): listener + supervisor
+    // die with the source; the forwarder child by group kill.
+}
+
+/// The per-source EMISSION gate — one owner for what reaches the wait
+/// loop across both delivery paths (the coordinator model, codex
+/// 1ddc0f6/afb7a35). First arrival with a given action key emits; the
+/// other path's copy drops at the gate. A KEYLESS wake (missing
+/// payload identity) is never deduped — emit-always is the safe
+/// degradation. The poll BASELINE owns the horizon: it seeds the key
+/// set and emits nothing, and relay deliveries BUFFER (bounded,
+/// drop-oldest) until a baseline has succeeded, then drain through
+/// the gate — realtime without a poll-established horizon could
+/// replay history.
+pub(crate) struct Coordinator {
+    keys: SeenSet,
+    baseline_done: bool,
+    buffered: std::collections::VecDeque<Classified>,
+    tx: tokio::sync::mpsc::UnboundedSender<WaitItem>,
+}
+
+/// Pre-baseline relay backlog bound — startup-window sized.
+const RELAY_BUFFER_CAP: usize = 256;
+
+impl Coordinator {
+    pub(crate) fn new(tx: tokio::sync::mpsc::UnboundedSender<WaitItem>) -> Self {
+        Self {
+            keys: SeenSet::new(SEEN_CAP),
+            baseline_done: false,
+            buffered: std::collections::VecDeque::new(),
+            tx,
+        }
+    }
+
+    /// A classified wake from EITHER path. Returns false when the wait
+    /// side is gone (the caller should stop).
+    pub(crate) fn offer(&mut self, c: Classified) -> bool {
+        // Keyless wakes skip the gate entirely: never dedup.
+        if let Some(k) = &c.key {
+            if self.keys.as_btree().contains(k) {
+                return true; // the other path already emitted it
+            }
+            self.keys.extend([k.clone()]);
+        }
+        self.tx.send(c.item).is_ok()
+    }
+
+    /// The BASELINE poll's actions: seed the gate, emit nothing, then
+    /// drain any pre-baseline relay backlog through it (pre-seeded
+    /// keys drop; genuinely-new actions emit once).
+    pub(crate) fn baseline(&mut self, baseline: Vec<Classified>) -> bool {
+        self.keys.extend(baseline.into_iter().filter_map(|c| c.key));
+        self.baseline_done = true;
+        while let Some(c) = self.buffered.pop_front() {
+            if !self.offer(c) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// A relay delivery: buffered until the baseline succeeds, gated
+    /// afterward.
+    pub(crate) fn deliver(&mut self, c: Classified) -> bool {
+        if !self.baseline_done {
+            if self.buffered.len() == RELAY_BUFFER_CAP {
+                self.buffered.pop_front();
+                eprintln!("wait: github relay backlog overflow pre-baseline; oldest dropped");
+            }
+            self.buffered.push_back(c);
+            return true;
+        }
+        self.offer(c)
+    }
+}
+
+/// One relay delivery as the loopback listener hands it over: the
+/// webhook event NAME (the `X-GitHub-Event` header) plus the payload.
+/// RAW on purpose — classification happens at DRAIN time in the poll
+/// loop, where `own_login` is resolved, so a delivery arriving before
+/// identity resolution can never bypass the fail-closed own-actor
+/// filter (codex c29a07c): it simply waits in the inbox.
+pub(crate) type RawDelivery = (String, serde_json::Value);
+
+/// The relay inbox: a BOUNDED drop-oldest queue whose capacity lives
+/// at PRODUCER ingress (codex 840725c) — `push` itself evicts, so no
+/// pending await anywhere in the consumer (a hung /user call, a slow
+/// poll) can let deliveries accumulate beyond the cap. std Mutex (no
+/// await while held) + Notify for the consumer wake.
+pub(crate) struct RelayInbox {
+    queue: std::sync::Mutex<std::collections::VecDeque<RawDelivery>>,
+    notify: tokio::sync::Notify,
+    closed: std::sync::atomic::AtomicBool,
+    /// Why the relay ended — rendered by the ONE diagnostic owner
+    /// (poll_loop's fallback line); bounded at write (codex 4d77b83).
+    reason: std::sync::Mutex<Option<String>>,
+}
+
+impl RelayInbox {
+    pub(crate) fn new() -> Self {
+        Self {
+            queue: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            notify: tokio::sync::Notify::new(),
+            closed: std::sync::atomic::AtomicBool::new(false),
+            reason: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Enqueue, applying the overflow policy AT INGRESS: at capacity
+    /// the oldest delivery is dropped (with a stderr note).
+    pub(crate) fn push(&self, raw: RawDelivery) {
+        {
+            let mut q = self.queue.lock().unwrap();
+            if q.len() == RELAY_BUFFER_CAP {
+                q.pop_front();
+                eprintln!("wait: github relay inbox overflow; oldest delivery dropped");
+            }
+            q.push_back(raw);
+        }
+        self.notify.notify_one();
+    }
+
+    /// The producer is gone: record WHY (bounded) and wake the
+    /// consumer so it can fall back. The reason is rendered exactly
+    /// once, by poll_loop's fallback line — no other diagnostic owner.
+    pub(crate) fn close_with(&self, reason: &str) {
+        let bounded: String = reason.chars().take(200).collect();
+        *self.reason.lock().unwrap() = Some(bounded);
+        self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.notify.notify_one();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn close(&self) {
+        self.close_with("closed");
+    }
+
+    pub(crate) fn reason(&self) -> String {
+        self.reason
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| "relay ended".to_string())
+    }
+
+    /// Next delivery, or `None` once closed AND drained. Cancellation-
+    /// safe: the check-then-wait loop re-checks after every wake, and
+    /// `notify_one` stores a permit when nobody is waiting.
+    pub(crate) async fn recv(&self) -> Option<RawDelivery> {
+        loop {
+            if let Some(raw) = self.queue.lock().unwrap().pop_front() {
+                return Some(raw);
+            }
+            if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
+                return None;
+            }
+            self.notify.notified().await;
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.queue.lock().unwrap().len()
+    }
 }
 
 /// The transport-agnostic poll loop: the arm-time fetch establishes
@@ -610,6 +1330,7 @@ pub(crate) async fn poll_loop<F: EventFetcher, R: LoginResolver>(
     login: &R,
     fetcher: &F,
     tx: &tokio::sync::mpsc::UnboundedSender<WaitItem>,
+    mut relay: Option<std::sync::Arc<RelayInbox>>,
 ) {
     let configured = src
         .poll_interval
@@ -620,6 +1341,7 @@ pub(crate) async fn poll_loop<F: EventFetcher, R: LoginResolver>(
     let mut floor: Option<u64> = None;
     let mut established = false; // has a baseline fetch succeeded?
     let mut own_login: Option<String> = None;
+    let mut coordinator = Coordinator::new(tx.clone());
 
     loop {
         // Establish the own-action filter before ANY poll when it's
@@ -633,6 +1355,9 @@ pub(crate) async fn poll_loop<F: EventFetcher, R: LoginResolver>(
                          not polling this source until it resolves",
                         src.repo
                     );
+                    // The relay inbox is bounded at INGRESS, so
+                    // deliveries simply wait in it while we retry —
+                    // no drain needed here (codex 840725c).
                     tokio::time::sleep(effective_interval(configured, floor)).await;
                     continue;
                 }
@@ -671,13 +1396,19 @@ pub(crate) async fn poll_loop<F: EventFetcher, R: LoginResolver>(
                 }
                 // The FIRST successful fetch is baseline-only
                 // (delta-from-now); a failed arm-time fetch does NOT
-                // count, so real history is never replayed as new.
+                // count, so real history is never replayed as new. The
+                // coordinator owns emission for BOTH paths: the
+                // baseline seeds its key gate, delta polls offer
+                // through it (a webhook that already emitted an action
+                // suppresses the poll's copy, and vice versa).
                 if established {
-                    for item in items {
-                        if tx.send(item).is_err() {
+                    for c in items {
+                        if !coordinator.offer(c) {
                             return; // wait gone
                         }
                     }
+                } else if !coordinator.baseline(items) {
+                    return; // wait gone
                 }
                 established = true;
             }
@@ -689,7 +1420,49 @@ pub(crate) async fn poll_loop<F: EventFetcher, R: LoginResolver>(
                 eprintln!("wait: github {} poll failed: {e}", src.repo);
             }
         }
-        tokio::time::sleep(effective_interval(configured, floor)).await;
+        // Between ticks: the relay is the LATENCY path — deliveries
+        // classify and emit IMMEDIATELY (through the same coordinator
+        // gate) instead of waiting for the next poll. A closed relay
+        // falls back to polling alone, loudly, once; polling never
+        // stopped, so nothing is lost.
+        let deadline = tokio::time::Instant::now() + effective_interval(configured, floor);
+        loop {
+            let Some(inbox) = relay.as_ref() else {
+                tokio::time::sleep_until(deadline).await;
+                break;
+            };
+            tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => break,
+                delivery = inbox.recv() => match delivery {
+                    Some((name, payload)) => {
+                        if let Some(c) = classify_webhook(
+                            &src.repo,
+                            &name,
+                            &payload,
+                            &src.events,
+                            own_login.as_deref(),
+                            src.include_own_actions,
+                            &src.branches,
+                        ) && !coordinator.deliver(c)
+                        {
+                            return; // wait gone
+                        }
+                    }
+                    None => {
+                        // THE one fallback diagnostic (codex 4d77b83):
+                        // the supervisor records why, this line renders
+                        // it, nobody else prints.
+                        eprintln!(
+                            "wait: github {} — realtime relay ended ({}); \
+                             continuing on polling alone",
+                            src.repo,
+                            relay.as_ref().map(|i| i.reason()).unwrap_or_default()
+                        );
+                        relay = None;
+                    }
+                },
+            }
+        }
     }
 }
 
@@ -705,6 +1478,7 @@ mod tests {
             poll_interval: None,
             include_own_actions: include_own,
             branches: Vec::new(),
+            delivery: clank_core::agent_config::Delivery::Poll,
         }
     }
 
@@ -808,7 +1582,8 @@ mod tests {
         ];
         for (raw, want, detail) in cases {
             let item = classify_event("o/r", &raw, all, None, false, &[])
-                .unwrap_or_else(|| panic!("must classify {want}"));
+                .unwrap_or_else(|| panic!("must classify {want}"))
+                .item;
             let WaitItem::GithubEvent {
                 event, detail: d, ..
             } = item
@@ -910,7 +1685,8 @@ mod tests {
             )
         };
         let item = classify_event("o/r", &pr_ev("synchronize"), &[PrUpdated], None, false, &[])
-            .expect("synchronize → pr_updated");
+            .expect("synchronize → pr_updated")
+            .item;
         let WaitItem::GithubEvent { event, number, .. } = item else {
             unreachable!()
         };
@@ -934,7 +1710,8 @@ mod tests {
             serde_json::json!({"action":"merged","pull_request":{"number":1}}),
         ] {
             let raw = ev("1", "PullRequestEvent", payload, "x");
-            let item = classify_event("o/r", &raw, &[GithubEventKind::PrMerged], None, false, &[]);
+            let item = classify_event("o/r", &raw, &[GithubEventKind::PrMerged], None, false, &[])
+                .map(|c| c.item);
             assert!(
                 matches!(item, Some(WaitItem::GithubEvent { .. })),
                 "must be pr_merged"
@@ -1032,78 +1809,818 @@ mod tests {
     }
 
     #[test]
-    fn interpret_gh_output_reclassifies_only_an_exact_304() {
-        // github-poll-304-is-success: gh exits non-zero on the 304 the
-        // conditional poll is DESIGNED to produce.
-        // Success path: unchanged.
-        let ok200 = "HTTP/2.0 200 OK\nETag: \"e\"\n\n[]";
-        assert!(matches!(
-            interpret_gh_events_output(true, ok200, "").unwrap(),
-            GhResponse::Ok { .. }
-        ));
-        // Failed exit + 304 include block → healthy, WITH the floor.
-        let nm = "HTTP/2.0 304 Not Modified\r\nX-Poll-Interval: 90\r\n\r\n";
-        match interpret_gh_events_output(false, nm, "gh: HTTP 304").unwrap() {
-            GhResponse::NotModified { poll_interval } => assert_eq!(poll_interval, Some(90)),
-            _ => panic!("expected NotModified"),
-        }
-        // Failed exit + bare gh stderr, no stdout → healthy, no floor.
-        match interpret_gh_events_output(false, "", "gh: HTTP 304\n").unwrap() {
-            GhResponse::NotModified { poll_interval } => assert_eq!(poll_interval, None),
-            _ => panic!("expected NotModified"),
-        }
-        // Failed exit + NON-304 include blocks must stay errors —
-        // empty body AND list-shaped body (codex a950e7b:
-        // parse_gh_include would read either as a healthy poll).
-        for block in [
-            "HTTP/2.0 401 Unauthorized\nContent-Type: application/json\n\n",
-            "HTTP/2.0 500 Internal Server Error\nContent-Type: application/json\n\n[]",
-            "HTTP/2.0 403 Forbidden\nX-Poll-Interval: 60\n\n{\"message\":\"rate limited\"}",
-        ] {
-            assert!(
-                interpret_gh_events_output(false, block, "gh: HTTP 4xx").is_err(),
-                "non-304 failure must stay an error: {block}"
-            );
-        }
-        // A stderr merely MENTIONING 304 inside another message is an
-        // error, and the message is preserved.
-        let err = interpret_gh_events_output(
-            false,
-            "",
-            "error connecting to proxy; last cached status HTTP 304",
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("proxy"), "{err}");
-        // A genuine failure carries its stderr verbatim.
-        let err =
-            interpret_gh_events_output(false, "", "gh: HTTP 401 Bad credentials").unwrap_err();
-        assert!(err.to_string().contains("Bad credentials"));
+    fn maps_recorded_events_api_fixtures_for_all_kinds() {
+        // A representative RECORDED Events API payload (all six
+        // sub-kinds + the three pr_comment classes + an unrelated
+        // WatchEvent) — codex a989653: map real shapes, not synthetic
+        // minimal JSON.
+        use GithubEventKind::*;
+        let raw: Vec<serde_json::Value> =
+            serde_json::from_str(include_str!("github_events_fixture.json")).unwrap();
+        let s = GithubSource {
+            repo: "o/r".into(),
+            events: vec![
+                PrOpened,
+                PrUpdated,
+                PrMerged,
+                PrComment,
+                IssueOpened,
+                IssueClosed,
+                IssueComment,
+                BranchPush,
+            ],
+            poll_interval: None,
+            include_own_actions: true, // don't filter — assert full mapping
+            branches: Vec::new(),
+            delivery: clank_core::agent_config::Delivery::Poll,
+        };
+        let (items, _ids) = map_page(&s, &raw, &BTreeSet::new(), None);
+        let got: Vec<(&str, Option<&str>, Option<u64>)> = items
+            .iter()
+            .map(|c| match &c.item {
+                WaitItem::GithubEvent {
+                    event,
+                    detail,
+                    number,
+                    ..
+                } => (event.as_str(), detail.as_deref(), *number),
+                _ => panic!("github items only"),
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("pr_opened", None, Some(12)),
+                ("pr_merged", None, Some(11)),
+                ("pr_comment", Some("issue_comment_on_pr"), Some(12)),
+                ("pr_comment", Some("review"), Some(12)),
+                ("pr_comment", Some("review_comment"), Some(12)),
+                ("issue_opened", None, Some(30)),
+                ("issue_closed", None, Some(29)),
+                ("issue_comment", None, Some(30)),
+                ("pr_updated", None, Some(12)),
+                ("branch_push", None, None),
+            ],
+            "the WatchEvent AND the tag push are dropped; every other \
+             kind maps with its detail"
+        );
+        // The branch push carries the short ref + size title and the
+        // actionable compare URL from before/head.
+        let WaitItem::GithubEvent { title, url, .. } = &items.last().unwrap().item else {
+            unreachable!()
+        };
+        assert_eq!(title.as_deref(), Some("main +3"));
+        assert_eq!(
+            url.as_deref(),
+            Some(
+                "https://github.com/o/r/compare/883efe034920928c47fe18598c01249d1a9fdabd...\
+                 7a8f3ac80e2ad2f6842cb86f576d4bfe2c03e300"
+            )
+        );
+        // The pr_opened item carries the recorded title + url.
+        let WaitItem::GithubEvent { title, url, .. } = &items[0].item else {
+            unreachable!()
+        };
+        assert_eq!(title.as_deref(), Some("Add the widget"));
+        assert_eq!(url.as_deref(), Some("https://github.com/o/r/pull/12"));
     }
 
     #[test]
-    fn parse_gh_include_reads_304_etag_and_poll_interval() {
-        // A 304 can still RAISE the server floor — headers are parsed
-        // before the status is classified (codex e9b8b66).
-        let nm = "HTTP/2.0 304 Not Modified\r\nETag: \"abc\"\r\nX-Poll-Interval: 120\r\n\r\n";
-        match parse_gh_include(nm).unwrap() {
-            GhResponse::NotModified { poll_interval } => {
-                assert_eq!(poll_interval, Some(120), "the 304's floor is observed");
-            }
-            _ => panic!("expected NotModified"),
+    fn env_token_precedence_gh_token_beats_github_token_blanks_skipped() {
+        // github-http-client-and-realtime M1: env beats shelling gh,
+        // GH_TOKEN beats GITHUB_TOKEN, and blanks don't count.
+        let get = |m: &[(&str, &str)]| {
+            let m: Vec<(String, String)> = m
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            move |k: &str| m.iter().find(|(mk, _)| mk == k).map(|(_, v)| v.clone())
+        };
+        assert_eq!(
+            env_token(get(&[("GH_TOKEN", "a"), ("GITHUB_TOKEN", "b")])),
+            Some("a".into())
+        );
+        assert_eq!(env_token(get(&[("GITHUB_TOKEN", "b")])), Some("b".into()));
+        assert_eq!(env_token(get(&[("GH_TOKEN", "  ")])), None, "blank skipped");
+        assert_eq!(env_token(get(&[])), None);
+    }
+
+    #[tokio::test]
+    async fn token_cell_reacquires_only_after_invalidation() {
+        // A 401 invalidates; the next use re-acquires — pinned with a
+        // scripted acquirer, no network.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = AtomicUsize::new(0);
+        let acquire = || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async { Ok(format!("t{}", calls.load(Ordering::SeqCst))) }
+        };
+        let cell = TokenCell::new();
+        assert_eq!(cell.get_or_acquire(acquire).await.unwrap(), "t1");
+        assert_eq!(cell.get_or_acquire(acquire).await.unwrap(), "t1", "cached");
+        cell.invalidate().await;
+        assert_eq!(
+            cell.get_or_acquire(acquire).await.unwrap(),
+            "t2",
+            "re-acquired"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn webhook_classifier_maps_the_webhook_vocabulary() {
+        use GithubEventKind::*;
+        let all = &[
+            PrOpened,
+            PrUpdated,
+            PrMerged,
+            PrComment,
+            IssueOpened,
+            IssueClosed,
+            IssueComment,
+            BranchPush,
+        ][..];
+        let wh = |event: &str, payload: serde_json::Value| {
+            classify_webhook("o/r", event, &payload, all, Some("me"), false, &[])
+        };
+        // Webhook shapes: top-level action, sender.login actor, review
+        // action SUBMITTED (not the feed's created), push uses after.
+        let cases = vec![
+            (
+                "pull_request",
+                serde_json::json!({"action":"opened","sender":{"login":"x"},
+                "pull_request":{"number":1,"title":"t","html_url":"u"}}),
+                "pr_opened",
+            ),
+            (
+                "pull_request",
+                serde_json::json!({"action":"synchronize","sender":{"login":"x"},
+                "pull_request":{"number":1}}),
+                "pr_updated",
+            ),
+            (
+                "pull_request",
+                serde_json::json!({"action":"closed","sender":{"login":"x"},
+                "pull_request":{"number":1,"merged":true}}),
+                "pr_merged",
+            ),
+            (
+                "pull_request_review",
+                serde_json::json!({"action":"submitted","sender":{"login":"x"},
+                "pull_request":{"number":1}}),
+                "pr_comment",
+            ),
+            (
+                "issue_comment",
+                serde_json::json!({"action":"created","sender":{"login":"x"},
+                "issue":{"number":2}}),
+                "issue_comment",
+            ),
+        ];
+        for (event, payload, want) in cases {
+            let item = wh(event, payload)
+                .unwrap_or_else(|| panic!("{event} → {want}"))
+                .item;
+            let WaitItem::GithubEvent { event: got, .. } = item else {
+                unreachable!()
+            };
+            assert_eq!(got, want);
         }
-        let ok = "HTTP/2.0 200 OK\nETag: \"xyz\"\nX-Poll-Interval: 45\n\n[{\"id\":\"1\",\"type\":\"IssuesEvent\",\"payload\":{}}]";
-        match parse_gh_include(ok).unwrap() {
-            GhResponse::Ok {
-                events,
-                etag,
-                poll_interval,
-            } => {
-                assert_eq!(events.len(), 1);
-                assert_eq!(etag.as_deref(), Some("\"xyz\""));
-                assert_eq!(poll_interval, Some(45));
-            }
-            _ => panic!("expected Ok"),
+        // push: branch gate + compare url from before/after; tag ignored;
+        // own sender filtered.
+        let push = serde_json::json!({"ref":"refs/heads/main","before":"aa","after":"bb",
+            "commits":[{},{}],"sender":{"login":"x"}});
+        let item = wh("push", push).expect("branch push").item;
+        let WaitItem::GithubEvent { title, url, .. } = item else {
+            unreachable!()
+        };
+        assert_eq!(title.as_deref(), Some("main +2"));
+        assert_eq!(
+            url.as_deref(),
+            Some("https://github.com/o/r/compare/aa...bb")
+        );
+        assert!(
+            wh(
+                "push",
+                serde_json::json!({"ref":"refs/tags/v1","before":"a","after":"b",
+            "commits":[],"sender":{"login":"x"}})
+            )
+            .is_none(),
+            "tag push ignored"
+        );
+        assert!(
+            wh(
+                "push",
+                serde_json::json!({"ref":"refs/heads/main","before":"a","after":"b",
+            "commits":[],"sender":{"login":"me"}})
+            )
+            .is_none(),
+            "own push filtered"
+        );
+        // Non-creating webhook actions stay unmapped.
+        assert!(
+            wh(
+                "pull_request_review",
+                serde_json::json!({"action":"dismissed",
+            "sender":{"login":"x"},"pull_request":{}})
+            )
+            .is_none()
+        );
+        assert!(
+            wh(
+                "pull_request",
+                serde_json::json!({"action":"closed",
+            "sender":{"login":"x"},"pull_request":{"merged":false}})
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn action_keys_are_namespaced_and_never_manufactured() {
+        // codex bf1e1ea: comment-family ids live in different resource
+        // domains — the SAME numeric id across families must yield
+        // DISTINCT keys…
+        use GithubEventKind::*;
+        let all = &[PrComment, IssueComment][..];
+        let feed_key =
+            |ty: &str, payload: serde_json::Value| {
+                classify_event(
+                "o/r",
+                &serde_json::json!({"id":"1","type":ty,"actor":{"login":"x"},"payload":payload}),
+                all, None, false, &[],
+            )
+            .expect("classifies")
+            .key
+            };
+        let issue_c = feed_key(
+            "IssueCommentEvent",
+            serde_json::json!({"action":"created","comment":{"id":42},"issue":{"number":1}}),
+        );
+        let pr_issue_c = feed_key(
+            "IssueCommentEvent",
+            serde_json::json!({"action":"created","comment":{"id":42},
+                "issue":{"number":1,"pull_request":{}}}),
+        );
+        let review_c = feed_key(
+            "PullRequestReviewCommentEvent",
+            serde_json::json!({"action":"created","comment":{"id":42},"pull_request":{"number":1}}),
+        );
+        let review = feed_key(
+            "PullRequestReviewEvent",
+            serde_json::json!({"action":"created","review":{"id":42},"pull_request":{"number":1}}),
+        );
+        let keys = [&issue_c, &pr_issue_c, &review_c, &review];
+        for k in &keys {
+            assert!(k.is_some(), "identity present → key present");
         }
+        for (i, a) in keys.iter().enumerate() {
+            for b in keys.iter().skip(i + 1) {
+                assert_ne!(a, b, "same numeric id, different family → distinct keys");
+            }
+        }
+        // …and a MISSING required identity yields None on both
+        // transports (never a manufactured shared key).
+        let missing_feed = feed_key(
+            "PullRequestReviewEvent",
+            serde_json::json!({"action":"created","pull_request":{"number":1}}),
+        );
+        assert_eq!(missing_feed, None, "no review.id → no key");
+        let missing_hook = classify_webhook(
+            "o/r",
+            "pull_request",
+            &serde_json::json!({"action":"synchronize","sender":{"login":"x"},
+                "pull_request":{"number":12}}), // no head.sha
+            &[PrUpdated],
+            None,
+            false,
+            &[],
+        )
+        .expect("classifies")
+        .key;
+        assert_eq!(missing_hook, None, "no head sha → no key");
+        // Push without its sha: item still wakes, key is None.
+        let pushless = classify_webhook(
+            "o/r",
+            "push",
+            &serde_json::json!({"ref":"refs/heads/main","before":"aa",
+                "commits":[],"sender":{"login":"x"}}),
+            &[BranchPush],
+            None,
+            false,
+            &[],
+        )
+        .expect("classifies")
+        .key;
+        assert_eq!(pushless, None);
+    }
+
+    #[test]
+    fn action_keys_are_identical_across_the_two_payload_forms() {
+        // THE coordinator invariant's foundation (codex e89be23): one
+        // underlying action, arriving as a feed event AND a webhook
+        // delivery, derives ONE key — from the objects both forms
+        // carry, never from feed ids or delivery GUIDs.
+        use GithubEventKind::*;
+        let all = &[
+            PrOpened,
+            PrUpdated,
+            PrMerged,
+            PrComment,
+            IssueOpened,
+            IssueClosed,
+            IssueComment,
+            BranchPush,
+        ][..];
+        let feed = |ty: &str, payload: serde_json::Value| {
+            classify_event(
+                "o/r",
+                &serde_json::json!({"id":"40001","type":ty,"actor":{"login":"x"},"payload":payload}),
+                all, None, false, &[],
+            )
+            .expect("feed classifies")
+            .key
+        };
+        let hook = |name: &str, payload: serde_json::Value| {
+            classify_webhook("o/r", name, &payload, all, None, false, &[])
+                .expect("webhook classifies")
+                .key
+        };
+        // pr_updated: head sha from pull_request.head.sha in both.
+        let pr = serde_json::json!({"number":12,"head":{"sha":"beef"}});
+        assert_eq!(
+            feed(
+                "PullRequestEvent",
+                serde_json::json!({"action":"synchronize","pull_request":pr})
+            ),
+            hook(
+                "pull_request",
+                serde_json::json!({"action":"synchronize","sender":{"login":"x"},
+                "pull_request":{"number":12,"head":{"sha":"beef"}}})
+            ),
+        );
+        // review comment: comment.id in both.
+        assert_eq!(
+            feed(
+                "PullRequestReviewCommentEvent",
+                serde_json::json!({"action":"created",
+                "comment":{"id":77},"pull_request":{"number":12}})
+            ),
+            hook(
+                "pull_request_review_comment",
+                serde_json::json!({"action":"created",
+                "sender":{"login":"x"},"comment":{"id":77},"pull_request":{"number":12}})
+            ),
+        );
+        // submitted review: review.id in both (feed action created,
+        // webhook action submitted — same review).
+        assert_eq!(
+            feed(
+                "PullRequestReviewEvent",
+                serde_json::json!({"action":"created",
+                "review":{"id":88},"pull_request":{"number":12}})
+            ),
+            hook(
+                "pull_request_review",
+                serde_json::json!({"action":"submitted",
+                "sender":{"login":"x"},"review":{"id":88},"pull_request":{"number":12}})
+            ),
+        );
+        // push: feed head == webhook after for one push.
+        assert_eq!(
+            feed(
+                "PushEvent",
+                serde_json::json!({"ref":"refs/heads/main","size":2,
+                "before":"aa","head":"bb"})
+            ),
+            hook(
+                "push",
+                serde_json::json!({"ref":"refs/heads/main","before":"aa","after":"bb",
+                "commits":[{},{}],"sender":{"login":"x"}})
+            ),
+        );
+        // pr_opened / issues: number-keyed.
+        assert_eq!(
+            feed(
+                "PullRequestEvent",
+                serde_json::json!({"action":"opened","pull_request":{"number":5}})
+            ),
+            hook(
+                "pull_request",
+                serde_json::json!({"action":"opened","sender":{"login":"x"},
+                "pull_request":{"number":5}})
+            ),
+        );
+        assert_eq!(
+            feed(
+                "IssuesEvent",
+                serde_json::json!({"action":"closed","issue":{"number":9}})
+            ),
+            hook(
+                "issues",
+                serde_json::json!({"action":"closed","sender":{"login":"x"},
+                "issue":{"number":9}})
+            ),
+        );
+    }
+
+    #[tokio::test]
+    async fn webhook_requests_map_to_raw_deliveries() {
+        // The listener's extraction: X-GitHub-Event + JSON body →
+        // RawDelivery; junk degrades to None (dropped, never a panic).
+        use http_body_util::Full;
+        use hyper::body::Bytes;
+        let req = hyper::Request::builder()
+            .header("X-GitHub-Event", "push")
+            .body(Full::new(Bytes::from(r#"{"ref":"refs/heads/main"}"#)))
+            .unwrap();
+        let (name, payload) = webhook_from_request(req).await.expect("maps");
+        assert_eq!(name, "push");
+        assert_eq!(payload["ref"], "refs/heads/main");
+        // Missing event header → None.
+        let req = hyper::Request::builder()
+            .body(Full::new(Bytes::from("{}")))
+            .unwrap();
+        assert!(webhook_from_request(req).await.is_none());
+        // Non-JSON body → None.
+        let req = hyper::Request::builder()
+            .header("X-GitHub-Event", "push")
+            .body(Full::new(Bytes::from("not json")))
+            .unwrap();
+        assert!(webhook_from_request(req).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn relay_listener_binds_loopback_only() {
+        // "Rejects non-loopback binds by construction": the bind is
+        // literally 127.0.0.1.
+        let l = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        assert!(l.local_addr().unwrap().ip().is_loopback());
+    }
+
+    #[test]
+    fn webhook_event_names_cover_the_subscribed_kinds() {
+        use GithubEventKind::*;
+        let names = webhook_event_names(&[PrOpened, PrComment, BranchPush]);
+        for expect in [
+            "pull_request",
+            "pull_request_review",
+            "pull_request_review_comment",
+            "issue_comment",
+            "push",
+        ] {
+            assert!(names.contains(&expect), "{expect} missing: {names:?}");
+        }
+        assert_eq!(
+            webhook_event_names(&[IssueOpened, IssueClosed]),
+            vec!["issues"],
+            "no over-subscription"
+        );
+    }
+
+    #[test]
+    fn forwarder_argv_is_pinned() {
+        assert_eq!(
+            forwarder_argv("o/r", "push,issues", 4242),
+            vec![
+                "webhook",
+                "forward",
+                "--repo=o/r",
+                "--events=push,issues",
+                "--url=http://127.0.0.1:4242",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_webhook_bodies_are_rejected() {
+        // codex 4d77b83: a count-bounded inbox doesn't bound memory if
+        // one request is huge — the body collect is byte-limited.
+        use http_body_util::Full;
+        use hyper::body::Bytes;
+        let big = vec![b'x'; MAX_WEBHOOK_BODY + 1];
+        let req = hyper::Request::builder()
+            .header("X-GitHub-Event", "push")
+            .body(Full::new(Bytes::from(big)))
+            .unwrap();
+        assert!(webhook_from_request(req).await.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn relay_start_failure_and_exit_route_one_reason_through_the_inbox() {
+        // The injected supervisor seam (codex 4d77b83): a scripted
+        // forwarder terminates with its reason; the inbox closes
+        // carrying it (the SINGLE diagnostic's payload), the poll
+        // catches the action the relay missed, and the guard's drop
+        // aborts the relay tasks.
+        struct ScriptForwarder(&'static str);
+        impl Forwarder for ScriptForwarder {
+            async fn run(&self, _repo: String, _events: String, _port: u16) -> String {
+                self.0.to_string()
+            }
+        }
+        let s = src(&[GithubEventKind::IssueOpened], false);
+        let (inbox, guard) = start_relay(&s, ScriptForwarder("extension missing"))
+            .await
+            .expect("listener binds");
+        // The forwarder terminated immediately: the inbox closes with
+        // the bounded reason.
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), inbox.recv())
+                .await
+                .expect("closes"),
+            None
+        );
+        assert_eq!(inbox.reason(), "extension missing");
+        // The poll still catches the action the dead relay never
+        // delivered (baseline, then the delta poll emits it).
+        let f = ScriptFetcher::new(vec![
+            Box::new(|_p, _e| Ok(ok(vec![], None, None))),
+            Box::new(|_p, _e| Ok(ok(vec![issue("7", 7)], None, None))),
+        ]);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let loop_inbox = inbox.clone();
+        let handle = tokio::spawn(async move {
+            poll_loop(
+                &src(&[GithubEventKind::IssueOpened], false),
+                &FixedLogin("me"),
+                &f,
+                &tx,
+                Some(loop_inbox),
+            )
+            .await;
+        });
+        let item = tokio::time::timeout(std::time::Duration::from_secs(300), rx.recv())
+            .await
+            .expect("poll-only recovery")
+            .expect("open");
+        let WaitItem::GithubEvent { number, .. } = item else {
+            unreachable!()
+        };
+        assert_eq!(number, Some(7));
+        handle.abort();
+        let _ = handle.await;
+        drop(guard);
+    }
+
+    #[tokio::test]
+    async fn relay_guard_drop_aborts_both_owned_tasks() {
+        // codex 24c3355: an observable cancellation probe — each task
+        // holds a set-on-drop guard; RelayGuard's drop must abort them
+        // so the flags flip.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct SetOnDrop(std::sync::Arc<AtomicBool>);
+        impl Drop for SetOnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let flags = [
+            std::sync::Arc::new(AtomicBool::new(false)),
+            std::sync::Arc::new(AtomicBool::new(false)),
+        ];
+        let tasks: Vec<_> = flags
+            .iter()
+            .map(|f| {
+                let probe = SetOnDrop(f.clone());
+                tokio::spawn(async move {
+                    let _probe = probe;
+                    std::future::pending::<()>().await;
+                })
+            })
+            .collect();
+        tokio::task::yield_now().await;
+        drop(RelayGuard(tasks));
+        // Aborted tasks unwind asynchronously; give the runtime a few
+        // turns.
+        for _ in 0..50 {
+            if flags.iter().all(|f| f.load(Ordering::SeqCst)) {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("RelayGuard drop did not cancel its tasks");
+    }
+
+    #[tokio::test]
+    async fn forwarder_reason_survives_a_pipe_filling_child() {
+        // codex 24c3355: a child that writes beyond the OS pipe
+        // capacity before exiting must still reach its terminal
+        // reason — the concurrent tail read keeps the pipe drained.
+        // 256 KiB of stderr ≫ any default pipe buffer.
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.args([
+            "-c",
+            "i=0; while [ $i -lt 4096 ]; do printf \
+             'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\\n' >&2; \
+             i=$((i+1)); done; echo the-final-line >&2; exit 3",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .process_group(0)
+        .kill_on_drop(true);
+        let reason = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            run_forwarder_process(cmd),
+        )
+        .await
+        .expect("no deadlock on a full pipe");
+        assert!(
+            reason.contains("the-final-line"),
+            "the ACTUAL last stderr line survives the bounded tail: {reason}"
+        );
+        assert!(reason.contains("exited"), "{reason}");
+    }
+
+    // ── the coordinator: one emission owner, baseline horizon ──
+
+    fn classified(n: u64, key: Option<&str>) -> Classified {
+        Classified {
+            item: WaitItem::GithubEvent {
+                repo: "o/r".into(),
+                event: "issue_opened".into(),
+                detail: None,
+                number: Some(n),
+                title: None,
+                actor: None,
+                url: None,
+            },
+            key: key.map(str::to_string),
+        }
+    }
+
+    #[tokio::test]
+    async fn coordinator_gates_emission_by_action_key() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut c = Coordinator::new(tx);
+        assert!(c.baseline(vec![classified(1, Some("issue_opened#1"))]));
+        // Baseline emitted nothing.
+        assert!(rx.try_recv().is_err());
+        // webhook-then-poll of the SAME action → exactly one emission.
+        assert!(c.deliver(classified(2, Some("issue_opened#2"))));
+        assert!(c.offer(classified(2, Some("issue_opened#2"))));
+        assert!(rx.try_recv().is_ok(), "the first arrival emitted");
+        assert!(rx.try_recv().is_err(), "the second path's copy dropped");
+        // A poll-only action (the relay missed it) still emits.
+        assert!(c.offer(classified(3, Some("issue_opened#3"))));
+        assert!(rx.try_recv().is_ok());
+        // A pre-baseline action delivered later by webhook → no wake.
+        assert!(c.deliver(classified(1, Some("issue_opened#1"))));
+        assert!(rx.try_recv().is_err(), "baseline-seeded key drops");
+        // KEYLESS wakes are never deduped.
+        assert!(c.offer(classified(9, None)));
+        assert!(c.offer(classified(9, None)));
+        assert!(rx.try_recv().is_ok());
+        assert!(rx.try_recv().is_ok(), "keyless = emit-always");
+    }
+
+    #[tokio::test]
+    async fn coordinator_buffers_relay_deliveries_until_the_baseline() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut c = Coordinator::new(tx);
+        // Deliveries BEFORE the baseline buffer silently…
+        assert!(c.deliver(classified(1, Some("issue_opened#1"))));
+        assert!(c.deliver(classified(5, Some("issue_opened#5"))));
+        assert!(rx.try_recv().is_err(), "nothing emits pre-baseline");
+        // …then the baseline seeds (action 1 was visible at arm time)
+        // and the backlog drains through the gate: 1 drops, 5 emits.
+        assert!(c.baseline(vec![classified(1, Some("issue_opened#1"))]));
+        let emitted = rx.try_recv().expect("the genuinely-new action");
+        let WaitItem::GithubEvent { number, .. } = emitted else {
+            unreachable!()
+        };
+        assert_eq!(number, Some(5));
+        assert!(
+            rx.try_recv().is_err(),
+            "the pre-baseline action never wakes"
+        );
+    }
+
+    #[tokio::test]
+    async fn coordinator_buffer_is_bounded_drop_oldest() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut c = Coordinator::new(tx);
+        for i in 0..(RELAY_BUFFER_CAP as u64 + 3) {
+            assert!(c.deliver(classified(i, Some(&format!("issue_opened#{i}")))));
+        }
+        assert!(c.baseline(vec![]));
+        let mut got = Vec::new();
+        while let Ok(item) = rx.try_recv() {
+            let WaitItem::GithubEvent { number, .. } = item else {
+                unreachable!()
+            };
+            got.push(number.unwrap());
+        }
+        assert_eq!(got.len(), RELAY_BUFFER_CAP, "bounded backlog");
+        assert_eq!(*got.first().unwrap(), 3, "oldest dropped first");
+    }
+
+    // ── session auth: sharing + uniform 401 recovery ──────────
+
+    struct ScriptHttp {
+        /// Scripted statuses per request, in order; exhausted → 200.
+        statuses: std::sync::Mutex<std::collections::VecDeque<u16>>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    impl ScriptHttp {
+        fn new(statuses: &[u16]) -> Self {
+            Self {
+                statuses: std::sync::Mutex::new(statuses.iter().copied().collect()),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+    impl HttpSend for ScriptHttp {
+        async fn send(
+            &self,
+            url: &str,
+            _bearer: &str,
+            _etag: Option<&str>,
+        ) -> anyhow::Result<MiniResponse> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let status = self.statuses.lock().unwrap().pop_front().unwrap_or(200);
+            let body = if url.ends_with("/user") {
+                r#"{"login":"me"}"#.to_string()
+            } else {
+                "[]".to_string()
+            };
+            Ok(MiniResponse {
+                status,
+                headers: Default::default(),
+                body,
+            })
+        }
+    }
+
+    static ACQUIRES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    fn counting_acquire()
+    -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<String>> + Send>> {
+        ACQUIRES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async { Ok("tok".to_string()) })
+    }
+
+    #[tokio::test]
+    async fn one_session_serves_many_sources_with_one_acquisition_and_uniform_401() {
+        // codex f9807c3, all four demands in one scripted session:
+        ACQUIRES.store(0, std::sync::atomic::Ordering::SeqCst);
+        // (1) two fetchers share the session → ONE acquisition.
+        let session = std::sync::Arc::new(GithubSession::for_tests(
+            ScriptHttp::new(&[200, 200]),
+            counting_acquire,
+        ));
+        let a = GhFetcher {
+            repo: "o/a".into(),
+            session: session.clone(),
+        };
+        let b = GhFetcher {
+            repo: "o/b".into(),
+            session: session.clone(),
+        };
+        a.fetch(1, None).await.unwrap();
+        b.fetch(1, None).await.unwrap();
+        assert_eq!(
+            ACQUIRES.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "one acquisition for both sources"
+        );
+
+        // (2) /user recovers after one 401 (invalidate → re-acquire →
+        // retry once).
+        ACQUIRES.store(0, std::sync::atomic::Ordering::SeqCst);
+        let session = std::sync::Arc::new(GithubSession::for_tests(
+            ScriptHttp::new(&[401, 200]),
+            counting_acquire,
+        ));
+        assert_eq!(fetch_authenticated_login(&session).await.unwrap(), "me");
+        assert_eq!(
+            ACQUIRES.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "initial + one re-acquire"
+        );
+
+        // (3) /events recovers the same way — one shared 401 story.
+        let session = std::sync::Arc::new(GithubSession::for_tests(
+            ScriptHttp::new(&[401, 200]),
+            counting_acquire,
+        ));
+        let f = GhFetcher {
+            repo: "o/r".into(),
+            session,
+        };
+        assert!(f.fetch(1, None).await.is_ok());
+
+        // (4) a second 401 fails WITHOUT retrying forever.
+        let http = ScriptHttp::new(&[401, 401]);
+        let session = std::sync::Arc::new(GithubSession::for_tests(http, counting_acquire));
+        let f = GhFetcher {
+            repo: "o/r".into(),
+            session: session.clone(),
+        };
+        let err = f.fetch(1, None).await.unwrap_err();
+        assert!(err.to_string().contains("401"), "{err}");
     }
 
     // ── injected-runner poll state machine ─────────────────────
@@ -1283,7 +2800,7 @@ mod tests {
         };
         let numbers: Vec<u64> = items
             .iter()
-            .filter_map(|i| match i {
+            .filter_map(|c| match &c.item {
                 WaitItem::GithubEvent { number, .. } => *number,
                 _ => None,
             })
@@ -1363,6 +2880,7 @@ mod tests {
                 &FixedLogin("me"),
                 &f,
                 &tx,
+                None,
             )
             .await;
         });
@@ -1379,82 +2897,6 @@ mod tests {
         // (codex a989653 — don't leave the JoinHandle to time out).
         handle.abort();
         let _ = handle.await;
-    }
-
-    #[test]
-    fn maps_recorded_events_api_fixtures_for_all_kinds() {
-        // A representative RECORDED Events API payload (all six
-        // sub-kinds + the three pr_comment classes + an unrelated
-        // WatchEvent) — codex a989653: map real shapes, not synthetic
-        // minimal JSON.
-        use GithubEventKind::*;
-        let raw: Vec<serde_json::Value> =
-            serde_json::from_str(include_str!("github_events_fixture.json")).unwrap();
-        let s = GithubSource {
-            repo: "o/r".into(),
-            events: vec![
-                PrOpened,
-                PrUpdated,
-                PrMerged,
-                PrComment,
-                IssueOpened,
-                IssueClosed,
-                IssueComment,
-                BranchPush,
-            ],
-            poll_interval: None,
-            include_own_actions: true, // don't filter — assert full mapping
-            branches: Vec::new(),
-        };
-        let (items, _ids) = map_page(&s, &raw, &BTreeSet::new(), None);
-        let got: Vec<(&str, Option<&str>, Option<u64>)> = items
-            .iter()
-            .map(|i| match i {
-                WaitItem::GithubEvent {
-                    event,
-                    detail,
-                    number,
-                    ..
-                } => (event.as_str(), detail.as_deref(), *number),
-                _ => panic!("github items only"),
-            })
-            .collect();
-        assert_eq!(
-            got,
-            vec![
-                ("pr_opened", None, Some(12)),
-                ("pr_merged", None, Some(11)),
-                ("pr_comment", Some("issue_comment_on_pr"), Some(12)),
-                ("pr_comment", Some("review"), Some(12)),
-                ("pr_comment", Some("review_comment"), Some(12)),
-                ("issue_opened", None, Some(30)),
-                ("issue_closed", None, Some(29)),
-                ("issue_comment", None, Some(30)),
-                ("pr_updated", None, Some(12)),
-                ("branch_push", None, None),
-            ],
-            "the WatchEvent AND the tag push are dropped; every other \
-             kind maps with its detail"
-        );
-        // The branch push carries the short ref + size title and the
-        // actionable compare URL from before/head.
-        let WaitItem::GithubEvent { title, url, .. } = items.last().unwrap() else {
-            unreachable!()
-        };
-        assert_eq!(title.as_deref(), Some("main +3"));
-        assert_eq!(
-            url.as_deref(),
-            Some(
-                "https://github.com/o/r/compare/883efe034920928c47fe18598c01249d1a9fdabd...\
-                 7a8f3ac80e2ad2f6842cb86f576d4bfe2c03e300"
-            )
-        );
-        // The pr_opened item carries the recorded title + url.
-        let WaitItem::GithubEvent { title, url, .. } = &items[0] else {
-            unreachable!()
-        };
-        assert_eq!(title.as_deref(), Some("Add the widget"));
-        assert_eq!(url.as_deref(), Some("https://github.com/o/r/pull/12"));
     }
 
     #[tokio::test]
@@ -1543,6 +2985,7 @@ mod tests {
                 &login,
                 &f,
                 &tx,
+                None,
             )
             .await;
         });
@@ -1586,6 +3029,7 @@ mod tests {
                 &FixedLogin("me"),
                 &*f2,
                 &tx,
+                None,
             )
             .await;
         });
@@ -1631,6 +3075,7 @@ mod tests {
                 &FixedLogin("me"),
                 &*f2,
                 &tx,
+                None,
             )
             .await;
         });
@@ -1646,6 +3091,238 @@ mod tests {
             gap >= Duration::from_secs(120),
             "the 304's raised floor binds: next tick after {gap:?}, want ≥120s"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn relay_deliveries_emit_immediately_and_dedup_against_the_poll() {
+        // The full M2 lifecycle through the REAL poll_loop, no gh and
+        // no sockets: baseline poll seeds the horizon; a relay
+        // delivery emits IMMEDIATELY between ticks; the next poll's
+        // copy of the SAME action (same key) is suppressed by the
+        // coordinator; a poll-only action still emits; and the relay
+        // closing falls back to polling alone.
+        let s = src(&[GithubEventKind::IssueOpened], false);
+        let f = ScriptFetcher::new(vec![
+            // Tick 1: the baseline — issue #1 exists at arm time.
+            Box::new(|_p, _e| Ok(ok(vec![issue("1", 1)], Some("\"e1\""), None))),
+            Box::new(|_p, _e| Ok(ok(vec![], None, None))),
+            // Tick 2: the feed catches up — issue #2 (already emitted
+            // via the relay: SAME action key) and issue #3 (poll-only).
+            Box::new(|_p, _e| {
+                Ok(ok(
+                    vec![
+                        serde_json::json!({"id":"102","type":"IssuesEvent","actor":{"login":"them"},
+                            "payload":{"action":"opened","issue":{"number":2}}}),
+                        serde_json::json!({"id":"103","type":"IssuesEvent","actor":{"login":"them"},
+                            "payload":{"action":"opened","issue":{"number":3}}}),
+                        issue("1", 1),
+                    ],
+                    None,
+                    None,
+                ))
+            }),
+        ]);
+        let inbox = std::sync::Arc::new(RelayInbox::new());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let loop_inbox = inbox.clone();
+        let handle = tokio::spawn(async move {
+            poll_loop(
+                &src(&[GithubEventKind::IssueOpened], false),
+                &FixedLogin("me"),
+                &f,
+                &tx,
+                Some(loop_inbox),
+            )
+            .await;
+        });
+        // A webhook delivery for issue #2 lands between ticks — it must
+        // emit without waiting for the next poll.
+        inbox.push((
+            "issues".to_string(),
+            serde_json::json!({"action":"opened","sender":{"login":"them"},
+                "issue":{"number":2}}),
+        ));
+        let first = tokio::time::timeout(std::time::Duration::from_secs(300), rx.recv())
+            .await
+            .expect("the relay delivery emits")
+            .expect("open");
+        let WaitItem::GithubEvent { number, .. } = first else {
+            unreachable!()
+        };
+        assert_eq!(number, Some(2), "relay latency path");
+        // The next poll carries #2 (suppressed — same key) and #3
+        // (poll-only → emits). Exactly ONE more emission, #3.
+        let second = tokio::time::timeout(std::time::Duration::from_secs(300), rx.recv())
+            .await
+            .expect("the poll-only action emits")
+            .expect("open");
+        let WaitItem::GithubEvent { number, .. } = second else {
+            unreachable!()
+        };
+        assert_eq!(number, Some(3), "the poll's copy of #2 was suppressed");
+        // Relay closes → the loop continues on polling alone (script
+        // exhausted → 304s forever; the loop stays alive).
+        inbox.close();
+        tokio::task::yield_now().await;
+        assert!(rx.try_recv().is_err(), "no duplicate of #2 ever surfaced");
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pre_login_relay_intake_is_bounded_and_filtered_after_resolution() {
+        // codex d7f4a8f: while /user is down the relay channel must not
+        // grow unboundedly — intake drains into the bounded drop-oldest
+        // backlog, and classification waits for the login so a
+        // SELF-AUTHORED delivery buffered pre-login is filtered after
+        // resolution (fail-closed own-actor, preserved end to end).
+        let login = ScriptLogin(std::sync::Mutex::new(
+            vec![
+                Err(anyhow::anyhow!("gh down")),
+                Err(anyhow::anyhow!("still down")),
+                Ok("me".to_string()),
+            ]
+            .into(),
+        ));
+        // Fetcher: the (post-login) baseline is empty; then 304s.
+        let f = ScriptFetcher::new(vec![Box::new(|_p, _e| Ok(ok(vec![], None, None)))]);
+        let inbox = std::sync::Arc::new(RelayInbox::new());
+        // MORE than the cap of foreign deliveries + one self-authored,
+        // all pushed while the login is still failing — the bound
+        // applies at INGRESS (codex 840725c).
+        for i in 0..(RELAY_BUFFER_CAP as u64 + 3) {
+            inbox.push((
+                "issues".to_string(),
+                serde_json::json!({"action":"opened","sender":{"login":"them"},
+                    "issue":{"number":i}}),
+            ));
+        }
+        inbox.push((
+            "issues".to_string(),
+            serde_json::json!({"action":"opened","sender":{"login":"me"},
+                "issue":{"number":9999}}),
+        ));
+        assert_eq!(inbox.len(), RELAY_BUFFER_CAP, "bounded at the inbox itself");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let loop_inbox = inbox.clone();
+        let handle = tokio::spawn(async move {
+            poll_loop(
+                &src(&[GithubEventKind::IssueOpened], false),
+                &login,
+                &f,
+                &tx,
+                Some(loop_inbox),
+            )
+            .await;
+        });
+        // Expected: 259 foreign + 1 own sent; the bound keeps the LAST
+        // 256 (foreign 4..=258 plus the own one); the own delivery is
+        // filtered at classification ⇒ 255 emissions, starting at 4.
+        let expect = RELAY_BUFFER_CAP - 1;
+        let got: Vec<u64> = tokio::time::timeout(std::time::Duration::from_secs(600), async {
+            let mut got = Vec::new();
+            while got.len() < expect {
+                let Some(item) = rx.recv().await else { break };
+                let WaitItem::GithubEvent { number, .. } = item else {
+                    unreachable!()
+                };
+                got.push(number.unwrap());
+            }
+            got
+        })
+        .await
+        .expect("the bounded backlog drains after login+baseline");
+        assert_eq!(got.len(), expect, "drop-oldest bound applied");
+        assert!(!got.contains(&9999), "own delivery filtered post-login");
+        assert_eq!(*got.first().unwrap(), 4, "oldest dropped first");
+        // Nothing further: the own delivery never emits.
+        tokio::task::yield_now().await;
+        assert!(rx.try_recv().is_err());
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn inbox_bounds_ingress_while_login_resolution_hangs() {
+        // codex 840725c: the bound must hold even while the consumer is
+        // stuck INSIDE an await — a login resolution that never
+        // returns. Producers exceed the cap; the inbox itself evicts.
+        struct PendingLogin;
+        impl LoginResolver for PendingLogin {
+            async fn resolve(&self) -> anyhow::Result<String> {
+                std::future::pending::<()>().await;
+                unreachable!()
+            }
+        }
+        let f = ScriptFetcher::new(vec![]);
+        let inbox = std::sync::Arc::new(RelayInbox::new());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let loop_inbox = inbox.clone();
+        let handle = tokio::spawn(async move {
+            poll_loop(
+                &src(&[GithubEventKind::IssueOpened], false),
+                &PendingLogin,
+                &f,
+                &tx,
+                Some(loop_inbox),
+            )
+            .await;
+        });
+        tokio::task::yield_now().await; // the loop is now inside resolve()
+        for i in 0..(RELAY_BUFFER_CAP as u64 * 2) {
+            inbox.push((
+                "issues".to_string(),
+                serde_json::json!({"action":"opened","sender":{"login":"them"},
+                    "issue":{"number":i}}),
+            ));
+        }
+        assert_eq!(
+            inbox.len(),
+            RELAY_BUFFER_CAP,
+            "eviction at the inbox boundary, consumer hung or not"
+        );
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn relay_closing_while_login_gated_falls_back_without_ending_the_loop() {
+        // The relay dies while the source is still login-gated: one
+        // fallback line, and the poll loop keeps retrying login and
+        // then polls normally.
+        let login = ScriptLogin(std::sync::Mutex::new(
+            vec![Err(anyhow::anyhow!("gh down")), Ok("me".to_string())].into(),
+        ));
+        let f = ScriptFetcher::new(vec![
+            // Baseline (post-login), then a delta with a new action —
+            // proof the loop survived the relay's death.
+            Box::new(|_p, _e| Ok(ok(vec![], None, None))),
+            Box::new(|_p, _e| Ok(ok(vec![issue("7", 7)], None, None))),
+        ]);
+        let inbox = std::sync::Arc::new(RelayInbox::new());
+        inbox.close(); // dead before login ever resolves
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let loop_inbox = inbox.clone();
+        let handle = tokio::spawn(async move {
+            poll_loop(
+                &src(&[GithubEventKind::IssueOpened], false),
+                &login,
+                &f,
+                &tx,
+                Some(loop_inbox),
+            )
+            .await;
+        });
+        let item = tokio::time::timeout(std::time::Duration::from_secs(300), rx.recv())
+            .await
+            .expect("the loop out-lives the relay and still polls")
+            .expect("open");
+        let WaitItem::GithubEvent { number, .. } = item else {
+            unreachable!()
+        };
+        assert_eq!(number, Some(7));
+        handle.abort();
+        let _ = handle.await;
     }
 
     #[tokio::test]
@@ -1667,6 +3344,7 @@ mod tests {
                 &FixedLogin("me"),
                 &PendingFetcher,
                 &tx,
+                None,
             )
             .await;
         });

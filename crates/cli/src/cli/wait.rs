@@ -823,7 +823,7 @@ impl EventSources {
 /// Kill the child's PROCESS GROUP on drop — grandchildren included.
 /// Sync `kill` subprocess, not libc: Drop must be sync and this runs
 /// on task abort too (the drop is the cancellation-safety story).
-struct GroupKill(Option<u32>);
+pub(crate) struct GroupKill(pub(crate) Option<u32>);
 impl Drop for GroupKill {
     fn drop(&mut self) {
         if let Some(pgid) = self.0.take() {
@@ -837,19 +837,19 @@ impl Drop for GroupKill {
 
 /// Last-`cap`-bytes ring for a command source's interleaved output —
 /// bounded by construction, so a chatty child can't balloon memory.
-struct RingTail {
+pub(crate) struct RingTail {
     buf: std::collections::VecDeque<u8>,
     cap: usize,
 }
 
 impl RingTail {
-    fn new(cap: usize) -> Self {
+    pub(crate) fn new(cap: usize) -> Self {
         Self {
             buf: std::collections::VecDeque::with_capacity(cap),
             cap,
         }
     }
-    fn push(&mut self, bytes: &[u8]) {
+    pub(crate) fn push(&mut self, bytes: &[u8]) {
         for &b in bytes {
             if self.buf.len() == self.cap {
                 self.buf.pop_front();
@@ -857,7 +857,7 @@ impl RingTail {
             self.buf.push_back(b);
         }
     }
-    fn into_string(self) -> String {
+    pub(crate) fn into_string(self) -> String {
         String::from_utf8_lossy(&Vec::from(self.buf)).into_owned()
     }
 }

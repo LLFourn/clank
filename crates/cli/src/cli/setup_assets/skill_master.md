@@ -96,7 +96,13 @@ this agent's `.clank/agents/<label>/config.json` under `wait_events`
   watch several repos. By default your OWN actions (the authenticated
   `gh` login) don't wake you — including your own pushes — set
   `"include_own_actions":true` to override. `"poll_interval"`
-  (`"60s"`) tunes cadence.
+  (`"60s"`) tunes cadence. Add `"delivery":"realtime"` for push-speed
+  wakes via GitHub's webhook-forwarding relay: clank supervises
+  `gh webhook forward` to a loopback listener, deduping against the
+  poll (which keeps running as the completeness backstop — a dead
+  relay just means poll-speed, loudly noted once). Realtime needs
+  ADMIN on the watched repo (it creates a webhook) and the
+  `cli/gh-webhook` extension; GitHub bills the relay as dev tooling.
 - `{"kind":"command","name":"label","command":["prog","arg",…]}` — a
   command whose COMPLETION is the wake (an HTTP long-poll, a custom
   poller, a Signal receiver — anything). Its argv runs with no shell

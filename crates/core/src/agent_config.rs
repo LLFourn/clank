@@ -103,6 +103,21 @@ pub struct GithubSource {
     /// number-scoped already.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub branches: Vec<String>,
+    /// How events arrive (github-http-client-and-realtime M2):
+    /// `poll` (default) or `realtime` — the webhook-forward relay
+    /// front-running the poll for latency, with the poll remaining
+    /// the completeness backstop. Unknown values fail loud.
+    #[serde(default)]
+    pub delivery: Delivery,
+}
+
+/// Delivery mode for a github source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Delivery {
+    #[default]
+    Poll,
+    Realtime,
 }
 
 /// The GitHub event sub-kinds `clank wait` can wake on.
@@ -336,6 +351,7 @@ mod tests {
             poll_interval: None,
             include_own_actions: false,
             branches: vec!["main".into()],
+            delivery: Delivery::Realtime,
         });
         let json = serde_json::to_string(&src).unwrap();
         assert!(json.contains("pr_updated") && json.contains("branch_push"));
@@ -343,12 +359,20 @@ mod tests {
         assert_eq!(back, src);
         // …and an OLD config (absent branches, original kinds) parses
         // unchanged with the empty-filter default.
+        // delivery absent = poll; unknown value fails loud.
+        assert!(
+            serde_json::from_str::<WaitEventSource>(
+                r#"{"kind":"github","repo":"o/r","events":[],"delivery":"carrier-pigeon"}"#
+            )
+            .is_err()
+        );
         let old = r#"{"kind":"github","repo":"o/r","events":["pr_opened","issue_comment"]}"#;
         let parsed: WaitEventSource = serde_json::from_str(old).unwrap();
         let WaitEventSource::Github(g) = parsed else {
             panic!("github kind");
         };
         assert!(g.branches.is_empty(), "absent branches = every branch");
+        assert_eq!(g.delivery, Delivery::Poll, "absent delivery = poll");
         assert_eq!(
             g.events,
             vec![GithubEventKind::PrOpened, GithubEventKind::IssueComment]

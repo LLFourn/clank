@@ -5,6 +5,15 @@ edition = "2024"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
+# github polling transport (github-http-client-and-realtime M1):
+# typed statuses/headers instead of parsing gh CLI output. rustls, no
+# default features — no openssl linkage.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+# the realtime relay's loopback listener (M2): hyper serves the
+# gh-webhook forwarder's deliveries on 127.0.0.1 only.
+hyper = { version = "1", default-features = false, features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
 clap = { version = "4", features = ["derive", "env"] }
 
 # File watcher
