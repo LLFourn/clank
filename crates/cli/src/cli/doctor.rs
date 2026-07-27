@@ -521,6 +521,16 @@ fn user_checks() -> Vec<CheckResult> {
         crate::cli::setup::PR_REVIEW_SKILL_BODY,
         "~/.codex/skills/clank-pr-review/SKILL.md",
     ));
+    out.push(check_skill_file(
+        &home.join(".claude/skills/clank-github/SKILL.md"),
+        crate::cli::setup::GITHUB_SKILL_BODY,
+        "~/.claude/skills/clank-github/SKILL.md",
+    ));
+    out.push(check_skill_file(
+        &home.join(".codex/skills/clank-github/SKILL.md"),
+        crate::cli::setup::GITHUB_SKILL_BODY,
+        "~/.codex/skills/clank-github/SKILL.md",
+    ));
     // Hook entries.
     out.push(check_hook_entry(
         &home.join(".claude/settings.json"),

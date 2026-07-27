@@ -112,7 +112,12 @@ this agent's `.clank/agents/<label>/config.json` under `wait_events`
 
 React to a `github_event` / `command_event` like any other work item:
 do the triage (`gh` for PRs/issues, your own tools for command events),
-then re-arm and STOP.
+then re-arm and STOP. Github events land in a per-agent INBOX first
+(`.clank/agents/<label>/events/`) and re-wake you until you mark them
+handled: `clank events list` shows the unhandled backlog, `clank
+events ack <id>` closes an item out — react, then ack, every time.
+Events that fired while no wait was armed are caught up on the next
+arm. The `clank-github` skill carries the full inbox flow.
 
 ### Reading feedback
 

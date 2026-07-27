@@ -17,10 +17,12 @@ pub mod config;
 pub mod console;
 pub mod diff;
 pub mod doctor;
+pub mod events;
 pub mod export;
 pub mod feedback;
 pub mod finish;
 pub mod fork;
+pub(crate) mod github_event_log;
 pub mod github_events;
 pub mod html;
 pub mod html_highlight;
@@ -638,6 +640,66 @@ impl From<WaitRole> for clank_core::Role {
             WaitRole::Reviewer => clank_core::Role::Reviewer,
         }
     }
+}
+
+#[derive(Args, Debug)]
+pub struct EventsArgs {
+    #[command(subcommand)]
+    pub command: EventsCmd,
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum EventsCmd {
+    /// List logged github events (unhandled by default).
+    List(EventsListArgs),
+    /// Mark events handled so they stop waking you.
+    Ack(EventsAckArgs),
+    /// Show one event's full record.
+    Show(EventsShowArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct EventsListArgs {
+    /// Repo root. Defaults to the cwd's git toplevel.
+    #[arg(long, value_name = "PATH")]
+    pub repo: Option<PathBuf>,
+    /// Agent whose inbox to read (default: the session's binding).
+    #[arg(long, value_name = "LABEL")]
+    pub author: Option<String>,
+    /// Include handled (acked) events too.
+    #[arg(long)]
+    pub all: bool,
+    #[arg(short = 'j', long)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct EventsAckArgs {
+    /// Repo root. Defaults to the cwd's git toplevel.
+    #[arg(long, value_name = "PATH")]
+    pub repo: Option<PathBuf>,
+    /// Agent whose inbox to ack in (default: the session's binding).
+    #[arg(long, value_name = "LABEL")]
+    pub author: Option<String>,
+    /// Event ids from `clank events list` — a bare seq, or
+    /// `<source>@<seq>` when several sources share a seq.
+    #[arg(required = true, value_name = "ID")]
+    pub ids: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct EventsShowArgs {
+    /// Repo root. Defaults to the cwd's git toplevel.
+    #[arg(long, value_name = "PATH")]
+    pub repo: Option<PathBuf>,
+    /// Agent whose inbox to read (default: the session's binding).
+    #[arg(long, value_name = "LABEL")]
+    pub author: Option<String>,
+    /// An id from `clank events list`.
+    #[arg(value_name = "ID")]
+    pub id: String,
+    #[arg(short = 'j', long)]
+    pub json: bool,
 }
 
 #[derive(Args, Debug)]

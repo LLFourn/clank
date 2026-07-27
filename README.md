@@ -149,6 +149,16 @@ user-global default (`~/.clank/config.json`'s `"auto"`) when unset —
   - The rest of clank's GitHub surface (`pr-review`, `fork --pr`)
     still shells `gh` directly.
 
+  Every ingested github event lands in a per-agent **inbox**
+  (`.clank/agents/<label>/events/`, a write-ahead log) before it wakes
+  anyone, and stays *unhandled* — re-waking the agent on every arm —
+  until acked with `clank events ack`. That makes delivery
+  at-least-once: events that fire while no wait is armed (agent
+  offline, wait killed, the gap before a re-arm) are caught up on the
+  next arm by reconciling GitHub's event feed against the inbox.
+  `clank events list` / `show` inspect it; the `clank-github` skill
+  teaches agents the react-then-ack loop.
+
 ## Command reference
 
 Run `clank <cmd> --help` for details; the skills carry the depth.
@@ -162,6 +172,7 @@ Run `clank <cmd> --help` for details; the skills carry the depth.
 | `auto` | Per-agent auto-mode on / off / status |
 | `status` | Repo state; `--watch` live, `--tui` full-screen pane, `-j` JSON |
 | `wait` | Block for work; `--peek`, `--for`, `--event` (see above) |
+| `events` | Github event inbox: `list` / `ack` / `show` (see below) |
 | `feedback` | `write` / `read` review feedback via a typed surface |
 | `queue` | `add` / `promote` / `remove` / `reprioritise` queued plans |
 | `finish` | Finalize a FINISHED plan (`-m` required; autosquash-aware) |

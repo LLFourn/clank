@@ -32,6 +32,11 @@ const SKILL_SLASH_COMMAND: &str = include_str!("setup_assets/skill_slash_command
 /// installs to both skill dirs.
 pub const PR_REVIEW_SKILL_BODY: &str = include_str!("setup_assets/pr_review_skill.md");
 
+/// The github event-inbox skill (github-offline-catchup). Tool-neutral
+/// like pr-review: the events CLI and the react-then-ack loop are
+/// identical everywhere, so one body installs to all three skill dirs.
+pub const GITHUB_SKILL_BODY: &str = include_str!("setup_assets/github_events_skill.md");
+
 /// The two role skills, by their `~/.<tool>/skills/<name>/` dir name.
 const MASTER_SKILL: &str = "clank-master";
 const REVIEWER_SKILL: &str = "clank-reviewer";
@@ -212,6 +217,28 @@ pub async fn run(args: SetupArgs) -> anyhow::Result<()> {
     install_skill(
         &home.join(".grok/skills/clank-pr-review/SKILL.md"),
         PR_REVIEW_SKILL_BODY,
+        args.force,
+        args.dry_run,
+        &mut summary,
+    )?;
+
+    install_skill(
+        &home.join(".claude/skills/clank-github/SKILL.md"),
+        GITHUB_SKILL_BODY,
+        args.force,
+        args.dry_run,
+        &mut summary,
+    )?;
+    install_skill(
+        &home.join(".codex/skills/clank-github/SKILL.md"),
+        GITHUB_SKILL_BODY,
+        args.force,
+        args.dry_run,
+        &mut summary,
+    )?;
+    install_skill(
+        &home.join(".grok/skills/clank-github/SKILL.md"),
+        GITHUB_SKILL_BODY,
         args.force,
         args.dry_run,
         &mut summary,

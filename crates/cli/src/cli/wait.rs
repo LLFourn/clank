@@ -336,7 +336,10 @@ pub async fn run(args: WaitArgs) -> anyhow::Result<()> {
             }
         }
     });
-    let mut sources = EventSources::spawn(&event_sources);
+    let events_dir = crate::agent_store::agents_root(&repo)
+        .join(author.as_str())
+        .join("events");
+    let mut sources = EventSources::spawn(&event_sources, Some(&events_dir));
     // Once the source channel closes (every source task finished, or
     // there were none), its `recv()` is permanently ready with `None`
     // — a guard disables that select branch so it can't hot-loop the
@@ -790,7 +793,14 @@ struct EventSources {
 }
 
 impl EventSources {
-    fn spawn(sources: &[clank_core::agent_config::WaitEventSource]) -> Self {
+    /// `events_dir` is the agent's github event-WAL home
+    /// (`.clank/agents/<label>/events`) — `None` (ad-hoc/unbound
+    /// waits) runs github sources memory-only, exactly the pre-WAL
+    /// behavior (github-offline-catchup).
+    fn spawn(
+        sources: &[clank_core::agent_config::WaitEventSource],
+        events_dir: Option<&std::path::Path>,
+    ) -> Self {
         use clank_core::agent_config::WaitEventSource;
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let mut tasks = Vec::new();
@@ -803,6 +813,7 @@ impl EventSources {
                     tasks.push(tokio::spawn(crate::cli::github_events::run_github_source(
                         g.clone(),
                         tx.clone(),
+                        events_dir.map(std::path::Path::to_path_buf),
                     )));
                 }
             }

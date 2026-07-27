@@ -88,6 +88,9 @@ enum Command {
     /// Read / write feedback files via a typed CLI surface (vs.
     /// editing the on-disk paths directly).
     Feedback(cli::FeedbackArgs),
+    /// The github event inbox: list logged events, ack handled ones,
+    /// inspect records (github-offline-catchup).
+    Events(cli::EventsArgs),
     /// Bind the calling agent's session (CLAUDE_CODE_SESSION_ID
     /// / CODEX_THREAD_ID env var) to a clank label.
     As(cli::AsArgs),
@@ -148,6 +151,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Status(args) => cli::status::run(args).await,
         Command::Wait(args) => cli::wait::run(args).await,
         Command::Feedback(args) => cli::feedback::run(args).await,
+        Command::Events(args) => cli::events::run(args).await,
         Command::As(args) => cli::as_cmd::run(args).await,
         Command::Auto(args) => cli::auto::run(args).await,
         Command::StopHook(args) => cli::stop_hook::run(args).await,
