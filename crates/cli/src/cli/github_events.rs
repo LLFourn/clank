@@ -1464,6 +1464,13 @@ pub(crate) async fn poll_loop<F: EventFetcher, R: LoginResolver>(
                 src.repo
             );
         }
+        if loaded.foreign > 0 {
+            eprintln!(
+                "wait: github {} — {} event-log record(s) from another clank version \
+                 preserved but skipped",
+                src.repo, loaded.foreign
+            );
+        }
         for entry in &loaded.unhandled {
             if tx.send(entry.item.clone()).is_err() {
                 return; // wait gone

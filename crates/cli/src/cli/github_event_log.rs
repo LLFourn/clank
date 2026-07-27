@@ -56,14 +56,32 @@ pub(crate) enum Transport {
     Relay,
 }
 
+/// The version this binary writes and fully understands. Bumps ONLY
+/// for semantic changes to an existing `t` — additive optional fields
+/// never bump it (event-log-format-compat).
+const CURRENT_V: u64 = 1;
+
+/// One parsed log line: a record this version owns, or a FOREIGN one
+/// (unknown `t`, future `v`, or a known `t` whose fields drifted) —
+/// preserved byte-verbatim, skipped for semantics, but its envelope
+/// `seq` still reserves allocator namespace (codex 7e6e585).
+#[derive(Debug, Clone)]
+enum Line {
+    Known(Record),
+    Foreign { raw: String, seq: Option<u64> },
+}
+
 /// One JSONL line. `t`-tagged so a reader can never confuse the three
-/// forms, whatever optional fields they share.
+/// forms, whatever optional fields they share. `t`, `v`, and `seq`
+/// are the VERSION-STABLE ENVELOPE: framing keys owned by every
+/// version forever; all other keys are private to their `t`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 enum Record {
     /// Primary record of a PRESENTABLE event: the complete wake
     /// payload, re-presented byte-faithfully as backlog.
     Inbox {
+        v: u64,
         seq: u64,
         at: u64,
         transport: Transport,
@@ -75,6 +93,7 @@ enum Record {
     },
     /// Primary record of a NON-presentable observation: identity only.
     Obs {
+        v: u64,
         at: u64,
         #[serde(skip_serializing_if = "Option::is_none")]
         feed_id: Option<String>,
@@ -84,7 +103,15 @@ enum Record {
         baseline: bool,
     },
     /// Secondary: marks an inbox seq handled.
-    Ack { seq: u64, at: u64 },
+    Ack { v: u64, seq: u64, at: u64 },
+}
+
+impl Record {
+    fn version(&self) -> u64 {
+        match self {
+            Record::Inbox { v, .. } | Record::Obs { v, .. } | Record::Ack { v, .. } => *v,
+        }
+    }
 }
 
 /// Cache metadata sidecar — NEVER load-bearing for at-least-once.
@@ -121,6 +148,16 @@ pub(crate) struct EventRow {
     pub(crate) item: WaitItem,
 }
 
+/// [`EventLog::fold`]'s output.
+struct FoldOut {
+    unhandled: Vec<InboxEntry>,
+    feed_ids: Vec<String>,
+    action_keys: Vec<String>,
+    max_seq: u64,
+    lines: usize,
+    foreign: usize,
+}
+
 /// Everything a warm arm needs, rebuilt from the artifacts.
 #[derive(Debug, Default)]
 pub(crate) struct LoadedLog {
@@ -141,6 +178,9 @@ pub(crate) struct LoadedLog {
     /// `state.json` was corrupt — caller warns once; ONLY the cache
     /// resets, the WAL contents above are still authoritative.
     pub(crate) state_corrupt: bool,
+    /// Well-formed records from another clank version, preserved but
+    /// skipped — caller warns once with the count.
+    pub(crate) foreign: usize,
 }
 
 /// flock RAII over the sidecar. Shared = append, exclusive = compact.
@@ -237,7 +277,26 @@ impl SharedWal {
     }
 
     pub(crate) fn compact(&self) {
-        self.with(|log| log.maybe_compact());
+        let mut inner = self.0.lock().unwrap();
+        let warned = inner.warned;
+        if let Some(log) = inner.log.as_mut() {
+            match log.maybe_compact() {
+                Ok(0) => {}
+                Ok(n) => eprintln!(
+                    "wait: github event log compaction dropped {n} record(s) from another \
+                     clank version (retention cap)"
+                ),
+                Err(e) => {
+                    if !warned {
+                        eprintln!(
+                            "wait: github event log write failed ({e}); continuing without \
+                             durability"
+                        );
+                        inner.warned = true;
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -248,7 +307,9 @@ pub(crate) struct EventLog {
     log_path: PathBuf,
     state_path: PathBuf,
     lock_path: PathBuf,
-    next_seq: u64,
+    /// `None` = the seq namespace is exhausted (a record reserved
+    /// `u64::MAX`); inbox appends fail cleanly rather than wrapping.
+    next_seq: Option<u64>,
     /// Lines believed in the file (loaded + appended since), for the
     /// compaction trigger. Approximate is fine: compaction re-reads
     /// under the exclusive lock.
@@ -272,15 +333,19 @@ impl EventLog {
             log_path: events_dir.join(format!("{source_key}.jsonl")),
             state_path: events_dir.join(format!("{source_key}.state.json")),
             lock_path: events_dir.join(format!("{source_key}.lock")),
-            next_seq: 1,
+            next_seq: Some(1),
             lines: 0,
         })
     }
 
-    /// Parse the raw log text. `Err(())` = interior corruption. A
-    /// torn final line (unparseable AND unterminated) is dropped as a
-    /// normal crash artifact.
-    fn parse(text: &str) -> Result<Vec<Record>, ()> {
+    /// Parse the raw log text into the THREE-way classification
+    /// (event-log-format-compat). `Err(())` = interior GARBAGE (not
+    /// JSON objects); a torn final line (unparseable AND unterminated)
+    /// is dropped as a normal crash artifact. Well-formed objects this
+    /// version can't interpret are [`Line::Foreign`] — skipped for
+    /// semantics, preserved for custody, and their envelope `seq`
+    /// still reserves the allocator namespace.
+    fn parse(text: &str) -> Result<Vec<Line>, ()> {
         let mut out = Vec::new();
         let lines: Vec<&str> = text.split('\n').collect();
         let ends_with_newline = text.ends_with('\n') || text.is_empty();
@@ -289,21 +354,38 @@ impl EventLog {
             if line.is_empty() {
                 continue;
             }
-            match serde_json::from_str::<Record>(line) {
-                Ok(r) => out.push(r),
+            let value = match serde_json::from_str::<serde_json::Value>(line) {
+                Ok(v) if v.is_object() => v,
                 // Only the physically-last, unterminated line may be
-                // torn; anything else is real corruption.
-                Err(_) if i == n - 1 && !ends_with_newline => {}
-                Err(_) => return Err(()),
+                // torn; any other non-object is real corruption.
+                _ if i == n - 1 && !ends_with_newline => continue,
+                _ => return Err(()),
+            };
+            // Known iff the kind parses fully AND its version is one
+            // this binary understands. A recognized `t` whose fields
+            // no longer parse is FOREIGN, not corruption — additive
+            // evolution must never destroy a log.
+            let known = serde_json::from_value::<Record>(value.clone())
+                .ok()
+                .filter(|r| r.version() <= CURRENT_V);
+            match known {
+                Some(r) => out.push(Line::Known(r)),
+                None => out.push(Line::Foreign {
+                    raw: (*line).to_string(),
+                    seq: value.get("seq").and_then(serde_json::Value::as_u64),
+                }),
             }
         }
         Ok(out)
     }
 
-    fn fold(records: Vec<Record>) -> (Vec<InboxEntry>, Vec<String>, Vec<String>, u64, usize) {
+    /// Fold parsed lines into load state. Foreign lines contribute
+    /// exactly their envelope: the `seq` reservation and a count for
+    /// the caller's one warning — never horizons or backlog.
+    fn fold(lines_in: Vec<Line>) -> FoldOut {
         let mut acked = std::collections::HashSet::new();
-        for r in &records {
-            if let Record::Ack { seq, .. } = r {
+        for l in &lines_in {
+            if let Line::Known(Record::Ack { seq, .. }) = l {
                 acked.insert(*seq);
             }
         }
@@ -311,8 +393,19 @@ impl EventLog {
         let mut feed_ids = Vec::new();
         let mut action_keys = Vec::new();
         let mut max_seq = 0u64;
-        let lines = records.len();
-        for r in records {
+        let mut foreign = 0usize;
+        let lines = lines_in.len();
+        for l in lines_in {
+            let r = match l {
+                Line::Known(r) => r,
+                Line::Foreign { seq, .. } => {
+                    foreign += 1;
+                    if let Some(seq) = seq {
+                        max_seq = max_seq.max(seq);
+                    }
+                    continue;
+                }
+            };
             match r {
                 Record::Inbox {
                     seq,
@@ -355,7 +448,14 @@ impl EventLog {
         };
         cap_tail(&mut feed_ids);
         cap_tail(&mut action_keys);
-        (unhandled, feed_ids, action_keys, max_seq, lines)
+        FoldOut {
+            unhandled,
+            feed_ids,
+            action_keys,
+            max_seq,
+            lines,
+            foreign,
+        }
     }
 
     /// Inspector read for the `clank events` CLI: every inbox entry
@@ -374,26 +474,27 @@ impl EventLog {
                 Err(e) => return Err(e),
             }
         };
-        let Ok(records) = Self::parse(&text) else {
+        let Ok(lines_in) = Self::parse(&text) else {
             return Ok(None);
         };
-        let acked: std::collections::HashSet<u64> = records
+        let acked: std::collections::HashSet<u64> = lines_in
             .iter()
-            .filter_map(|r| match r {
-                Record::Ack { seq, .. } => Some(*seq),
+            .filter_map(|l| match l {
+                Line::Known(Record::Ack { seq, .. }) => Some(*seq),
                 _ => None,
             })
             .collect();
         let mut rows = Vec::new();
-        for r in records {
-            if let Record::Inbox {
+        for l in lines_in {
+            if let Line::Known(Record::Inbox {
                 seq,
                 at,
                 transport,
                 feed_id,
                 action_key,
                 item,
-            } = r
+                ..
+            }) = l
             {
                 rows.push(EventRow {
                     seq,
@@ -436,14 +537,22 @@ impl EventLog {
             }
         };
         match Self::parse(&text) {
-            Ok(records) => {
-                let (unhandled, feed_ids, action_keys, max_seq, lines) = Self::fold(records);
-                out.warm = true;
-                out.unhandled = unhandled;
-                out.feed_ids = feed_ids;
-                out.action_keys = action_keys;
-                self.next_seq = max_seq + 1;
-                self.lines = lines;
+            Ok(lines_in) => {
+                let folded = Self::fold(lines_in);
+                // Warm needs at least one KNOWN record: an all-foreign
+                // log (a future format under this binary's custody)
+                // must baseline, not reconcile against an empty cursor
+                // and replay the feed's history as wakes.
+                out.warm = folded.lines > folded.foreign;
+                out.unhandled = folded.unhandled;
+                out.feed_ids = folded.feed_ids;
+                out.action_keys = folded.action_keys;
+                out.foreign = folded.foreign;
+                // The framing domain includes u64::MAX (a foreign
+                // record may carry it) — exhaustion must be a clean
+                // append error, never a wrap or panic (codex 777eee9).
+                self.next_seq = folded.max_seq.checked_add(1);
+                self.lines = folded.lines;
             }
             Err(()) => {
                 // Quarantine preserves the evidence and stops the
@@ -494,8 +603,13 @@ impl EventLog {
         action_key: Option<&str>,
         item: &WaitItem,
     ) -> std::io::Result<u64> {
-        let seq = self.next_seq;
+        let Some(seq) = self.next_seq else {
+            return Err(std::io::Error::other(
+                "event-log seq namespace exhausted (a record reserves u64::MAX)",
+            ));
+        };
         self.append(&Record::Inbox {
+            v: CURRENT_V,
             seq,
             at: now_epoch(),
             transport,
@@ -503,7 +617,7 @@ impl EventLog {
             action_key: action_key.map(str::to_owned),
             item: item.clone(),
         })?;
-        self.next_seq += 1;
+        self.next_seq = seq.checked_add(1);
         Ok(seq)
     }
 
@@ -517,6 +631,7 @@ impl EventLog {
         baseline: bool,
     ) -> std::io::Result<()> {
         self.append(&Record::Obs {
+            v: CURRENT_V,
             at: now_epoch(),
             feed_id: feed_id.map(str::to_owned),
             action_key: action_key.map(str::to_owned),
@@ -526,6 +641,7 @@ impl EventLog {
 
     pub(crate) fn append_ack(&mut self, seq: u64) -> std::io::Result<()> {
         self.append(&Record::Ack {
+            v: CURRENT_V,
             seq,
             at: now_epoch(),
         })
@@ -554,28 +670,31 @@ impl EventLog {
     /// Compact when the file has grown past [`COMPACT_AT`]: under the
     /// EXCLUSIVE sidecar lock, fold acked inbox records down to
     /// identity-only `obs` records, keep the newest
-    /// [`LOG_IDENTITY_CAP`] identities and ALL unhandled inbox records
-    /// (any age), and replace the file by rename. Appenders hold the
-    /// lock shared and open after acquiring it, so nothing races the
-    /// replacement.
-    pub(crate) fn maybe_compact(&mut self) -> std::io::Result<()> {
+    /// [`LOG_IDENTITY_CAP`] identities, ALL unhandled inbox records
+    /// (any age), and FOREIGN lines byte-verbatim (EXACTLY the newest
+    /// [`LOG_IDENTITY_CAP`]; a dropped line's seq reservation dies
+    /// with the identity it protected), then replace the file by
+    /// rename. Appenders hold the lock shared and open after
+    /// acquiring it, so nothing races the replacement. Returns the
+    /// number of foreign lines dropped (caller reports).
+    pub(crate) fn maybe_compact(&mut self) -> std::io::Result<usize> {
         if self.lines < COMPACT_AT {
-            return Ok(());
+            return Ok(0);
         }
         let _lock = SidecarLock::acquire(&self.lock_path, true)?;
         let text = match std::fs::read_to_string(&self.log_path) {
             Ok(t) => t,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
             Err(e) => return Err(e),
         };
-        let Ok(records) = Self::parse(&text) else {
+        let Ok(lines_in) = Self::parse(&text) else {
             // Corruption is load's problem; don't compound it here.
-            return Ok(());
+            return Ok(0);
         };
-        let acked: std::collections::HashSet<u64> = records
+        let acked: std::collections::HashSet<u64> = lines_in
             .iter()
-            .filter_map(|r| match r {
-                Record::Ack { seq, .. } => Some(*seq),
+            .filter_map(|l| match l {
+                Line::Known(Record::Ack { seq, .. }) => Some(*seq),
                 _ => None,
             })
             .collect();
@@ -583,7 +702,15 @@ impl EventLog {
         // action_key, at, baseline) — keep only the newest cap.
         let mut identities: Vec<(Option<String>, Option<String>, u64, bool)> = Vec::new();
         let mut unhandled: Vec<Record> = Vec::new();
-        for r in records {
+        let mut foreign: Vec<(String, Option<u64>)> = Vec::new();
+        for l in lines_in {
+            let r = match l {
+                Line::Known(r) => r,
+                Line::Foreign { raw, seq } => {
+                    foreign.push((raw, seq));
+                    continue;
+                }
+            };
             match r {
                 Record::Inbox {
                     seq,
@@ -602,6 +729,7 @@ impl EventLog {
                     action_key,
                     at,
                     baseline,
+                    ..
                 } => {
                     if feed_id.is_some() || action_key.is_some() {
                         identities.push((feed_id, action_key, at, baseline));
@@ -610,6 +738,15 @@ impl EventLog {
                 Record::Ack { .. } => {}
             }
         }
+        // Foreign retention: EXACTLY the newest LOG_IDENTITY_CAP
+        // lines (codex 777eee9 — no immortal exemptions). Dropping a
+        // line drops the identity its seq reservation protected, so
+        // the reservation legitimately dies with it: the allocator
+        // high-water is whatever the RETAINED lines say on the next
+        // load.
+        let start = foreign.len().saturating_sub(LOG_IDENTITY_CAP);
+        let dropped_foreign = start;
+        let kept_foreign: Vec<&(String, Option<u64>)> = foreign[start..].iter().collect();
         // The horizons are INDEPENDENT (codex 66c8579): a run of
         // relay-only action keys must not evict still-relevant feed
         // ids, nor vice versa. Keep the union of the newest
@@ -641,6 +778,7 @@ impl EventLog {
                 continue;
             }
             let rec = Record::Obs {
+                v: CURRENT_V,
                 at,
                 feed_id,
                 action_key,
@@ -655,11 +793,16 @@ impl EventLog {
             out.push('\n');
             kept_lines += 1;
         }
+        for (raw, _) in kept_foreign {
+            out.push_str(raw);
+            out.push('\n');
+            kept_lines += 1;
+        }
         let tmp = self.log_path.with_extension("jsonl.tmp");
         std::fs::write(&tmp, out.as_bytes())?;
         std::fs::rename(&tmp, &self.log_path)?;
         self.lines = kept_lines;
-        Ok(())
+        Ok(dropped_foreign)
     }
 }
 
@@ -968,6 +1111,185 @@ mod tests {
                 full.len()
             );
         }
+    }
+
+    #[test]
+    fn foreign_records_skip_but_preserve_and_reserve_seq() {
+        // event-log-format-compat: unknown t, future v, and a known t
+        // with drifted fields are FOREIGN — no horizons, no backlog,
+        // preserved verbatim, seq reserved (codex 7e6e585).
+        let dir = tempdir();
+        let mut log = log_in(&dir);
+        log.append_inbox(Transport::Poll, Some("1"), None, &item(1))
+            .unwrap();
+        let path = dir.join("github-o-r-abcd.jsonl");
+        let unknown_kind = r#"{"t":"tombstone","v":1,"seq":90,"reason":"future"}"#;
+        let future_v = r#"{"t":"inbox","v":99,"seq":42,"payload":{"shape":"unknowable"}}"#;
+        let drifted = r#"{"t":"ack","v":1,"seq":"not-a-number"}"#;
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        text.push_str(&format!("{unknown_kind}\n{future_v}\n{drifted}\n"));
+        std::fs::write(&path, &text).unwrap();
+
+        let mut fresh = log_in(&dir);
+        let loaded = fresh.load();
+        assert!(loaded.warm, "foreign lines don't cost the warm start");
+        assert!(!loaded.log_quarantined, "foreign is NOT corruption");
+        assert_eq!(loaded.foreign, 3);
+        assert_eq!(loaded.unhandled.len(), 1, "backlog untouched");
+        assert_eq!(loaded.feed_ids, vec!["1".to_string()], "horizons untouched");
+        // The allocator reserves ABOVE the highest foreign seq…
+        let seq = fresh
+            .append_inbox(Transport::Poll, Some("2"), None, &item(2))
+            .unwrap();
+        assert_eq!(seq, 91, "foreign seq 90 reserved the namespace");
+        // …and the foreign lines survive the append round-trip
+        // byte-verbatim.
+        let text = std::fs::read_to_string(&path).unwrap();
+        for line in [unknown_kind, future_v, drifted] {
+            assert!(text.contains(line), "foreign line lost: {line}");
+        }
+    }
+
+    #[test]
+    fn foreign_lines_survive_compaction_and_keep_the_reservation() {
+        let dir = tempdir();
+        let mut log = log_in(&dir);
+        for i in 0..COMPACT_AT {
+            let id = format!("{i}");
+            let seq = log
+                .append_inbox(Transport::Poll, Some(&id), None, &item(1))
+                .unwrap();
+            log.append_ack(seq).unwrap();
+        }
+        let path = dir.join("github-o-r-abcd.jsonl");
+        let high = r#"{"t":"inbox","v":99,"seq":900000,"payload":true}"#;
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        text.push_str(&format!("{high}\n"));
+        std::fs::write(&path, &text).unwrap();
+
+        let mut fresh = log_in(&dir);
+        fresh.load();
+        fresh.lines = COMPACT_AT; // force the trigger
+        fresh.maybe_compact().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains(high),
+            "reservation-holding line compacted away"
+        );
+        let mut reloaded = log_in(&dir);
+        reloaded.load();
+        let seq = reloaded
+            .append_inbox(Transport::Poll, Some("x"), None, &item(9))
+            .unwrap();
+        assert_eq!(seq, 900_001, "no seq reuse after compaction + reload");
+    }
+
+    #[test]
+    fn foreign_custody_cap_is_exact_and_reservations_die_with_dropped_lines() {
+        // codex 777eee9: EXACTLY the newest cap foreign lines survive
+        // — an older high-seq line is NOT immortal; its reservation
+        // dies with it, and reload allocates above the highest
+        // RETAINED seq.
+        let dir = tempdir();
+        let mut log = log_in(&dir);
+        for i in 0..COMPACT_AT {
+            let id = format!("{i}");
+            let seq = log
+                .append_inbox(Transport::Poll, Some(&id), None, &item(1))
+                .unwrap();
+            log.append_ack(seq).unwrap();
+        }
+        let path = dir.join("github-o-r-abcd.jsonl");
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        // OLDEST foreign line holds a huge seq; then >cap newer ones.
+        text.push_str("{\"t\":\"future\",\"v\":9,\"seq\":800000}\n");
+        let extra = 5;
+        for i in 0..(LOG_IDENTITY_CAP + extra) {
+            text.push_str(&format!(
+                "{{\"t\":\"future\",\"v\":9,\"seq\":{}}}\n",
+                10_000 + i
+            ));
+        }
+        std::fs::write(&path, &text).unwrap();
+
+        let mut fresh = log_in(&dir);
+        fresh.load();
+        fresh.lines = COMPACT_AT; // force the trigger
+        let dropped = fresh.maybe_compact().unwrap();
+        assert_eq!(dropped, extra + 1, "exact cap: oldest lines drop, counted");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !text.contains("800000"),
+            "an old high-seq foreign line must not be immortal"
+        );
+        let foreign_lines = text.lines().filter(|l| l.contains("future")).count();
+        assert_eq!(foreign_lines, LOG_IDENTITY_CAP);
+
+        let mut reloaded = log_in(&dir);
+        reloaded.load();
+        let seq = reloaded
+            .append_inbox(Transport::Poll, Some("x"), None, &item(9))
+            .unwrap();
+        let max_retained = 10_000 + (LOG_IDENTITY_CAP + extra - 1) as u64;
+        assert_eq!(
+            seq,
+            max_retained + 1,
+            "allocates above the highest RETAINED reservation"
+        );
+    }
+
+    #[test]
+    fn seq_exhaustion_fails_cleanly_never_wraps() {
+        // codex 777eee9: u64::MAX is in the accepted framing domain.
+        let dir = tempdir();
+        let path = dir.join("github-o-r-abcd.jsonl");
+        std::fs::write(
+            &path,
+            format!("{{\"t\":\"future\",\"v\":9,\"seq\":{}}}\n", u64::MAX),
+        )
+        .unwrap();
+        let mut log = log_in(&dir);
+        let loaded = log.load();
+        assert_eq!(loaded.foreign, 1);
+        let err = log
+            .append_inbox(Transport::Poll, Some("1"), None, &item(1))
+            .expect_err("exhausted namespace must error, not wrap");
+        assert!(err.to_string().contains("exhausted"), "{err}");
+        // Observations and acks (no allocation) still work.
+        log.append_observation(Some("2"), None, false).unwrap();
+    }
+
+    #[test]
+    fn all_foreign_log_is_not_warm() {
+        // A future format under this binary's custody must baseline —
+        // a warm empty cursor would replay the feed's history.
+        let dir = tempdir();
+        let path = dir.join("github-o-r-abcd.jsonl");
+        std::fs::write(&path, "{\"t\":\"inbox\",\"v\":99,\"seq\":7}\n").unwrap();
+        let loaded = log_in(&dir).load();
+        assert!(!loaded.warm);
+        assert!(!loaded.log_quarantined);
+        assert_eq!(loaded.foreign, 1);
+    }
+
+    #[test]
+    fn new_records_stamp_v1_and_garbage_rules_hold() {
+        let dir = tempdir();
+        let mut log = log_in(&dir);
+        log.append_inbox(Transport::Poll, Some("1"), None, &item(1))
+            .unwrap();
+        log.append_observation(Some("2"), None, false).unwrap();
+        log.append_ack(1).unwrap();
+        let text = std::fs::read_to_string(dir.join("github-o-r-abcd.jsonl")).unwrap();
+        for line in text.lines() {
+            let v: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert_eq!(v["v"], 1, "every written record carries v: {line}");
+        }
+        // Interior non-JSON is still corruption, not foreign.
+        let path = dir.join("github-o-r-abcd.jsonl");
+        std::fs::write(&path, format!("plain garbage\n{text}")).unwrap();
+        let loaded = log_in(&dir).load();
+        assert!(loaded.log_quarantined);
     }
 
     fn tempdir() -> PathBuf {
