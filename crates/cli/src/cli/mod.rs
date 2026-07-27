@@ -24,6 +24,7 @@ pub mod finish;
 pub mod fork;
 pub(crate) mod github_event_log;
 pub mod github_events;
+pub(crate) mod github_timeline;
 pub mod html;
 pub mod html_highlight;
 pub mod init;
@@ -221,6 +222,10 @@ pub struct LogArgs {
     /// Compact one-line-per-commit output.
     #[arg(long)]
     pub oneline: bool,
+    /// Leave github events out of the timeline
+    /// (log-timeline-github-events).
+    #[arg(long)]
+    pub no_github: bool,
 }
 
 #[derive(Args, Debug)]

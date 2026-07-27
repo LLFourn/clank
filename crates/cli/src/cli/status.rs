@@ -927,7 +927,18 @@ async fn log_rows_windowed(
     let reviews = crate::cli::log::collect_reviews(repo, &reviewable);
     // Newest first, like `clank log` — the pane reads top-down.
     let newest_first: Vec<&LogEvent> = events.iter().rev().collect();
-    crate::cli::log::oneline_rows(&newest_first, &reviews)
+    // Github events interleave by time, same layer as `clank log`
+    // (log-timeline-github-events); read notices lead the pane as dim
+    // rows — the TUI's rendering of the snapshot's diagnostics.
+    let snap = crate::cli::github_timeline::timeline_snapshot(repo);
+    let items = crate::cli::log::interleave(&newest_first, &snap.events);
+    let mut rows: Vec<crate::cli::log::OnelineRow> = snap
+        .notices
+        .iter()
+        .map(|n| crate::cli::log::OnelineRow::Notice(n.clone()))
+        .collect();
+    rows.extend(crate::cli::log::oneline_items_rows(&items, &reviews));
+    rows
 }
 
 /// Decides which filesystem events wake the status loops. This is an

@@ -563,6 +563,17 @@ pub(super) fn log_row_spans(
                 plan.clone().unwrap_or_else(|| "adhoc".to_string()),
             )]
         }
+        // A merged github event in the timeline: cyan `gh` badge, the
+        // shared describe line, and the open-work mark while any
+        // agent's copy is unhandled (log-timeline-github-events).
+        OnelineRow::Github { line, unhandled } => {
+            let mut spans = vec![colored("36", "gh".to_string()), plain(format!(" {line}"))];
+            if *unhandled {
+                spans.push(colored("33", " ⚠".to_string()));
+            }
+            spans
+        }
+        OnelineRow::Notice(n) => vec![dim(format!("({n})"))],
         OnelineRow::Commit {
             sha,
             subject,

@@ -73,7 +73,7 @@ fn read_all(dir: &Path) -> anyhow::Result<Vec<Sourced>> {
         };
         let log = EventLog::open(dir, stem)?;
         match log.read_rows()? {
-            Some(rows) => out.extend(rows.into_iter().map(|row| Sourced {
+            Some(read) => out.extend(read.rows.into_iter().map(|row| Sourced {
                 source: stem.to_string(),
                 row,
             })),
@@ -310,11 +310,11 @@ mod tests {
         let dir = tempdir();
         let mut a = EventLog::open(&dir, "github-o-r-aaaa").unwrap();
         let sa = a
-            .append_inbox(Transport::Poll, Some("1"), None, &item(1))
+            .append_inbox(Transport::Poll, Some("1"), None, None, &item(1))
             .unwrap();
         let mut b = EventLog::open(&dir, "github-o-x-bbbb").unwrap();
         let sb = b
-            .append_inbox(Transport::Relay, None, Some("k#2"), &item(2))
+            .append_inbox(Transport::Relay, None, Some("k#2"), None, &item(2))
             .unwrap();
         assert_eq!((sa, sb), (1, 1), "per-source seqs collide by design");
 
@@ -345,8 +345,14 @@ mod tests {
         // id + source AND the record's durable identities.
         let dir = tempdir();
         let mut a = EventLog::open(&dir, "github-o-r-aaaa").unwrap();
-        a.append_inbox(Transport::Poll, Some("f-77"), Some("issue#7"), &item(7))
-            .unwrap();
+        a.append_inbox(
+            Transport::Poll,
+            Some("f-77"),
+            Some("issue#7"),
+            None,
+            &item(7),
+        )
+        .unwrap();
         let rows = read_all(&dir).unwrap();
         let s = resolve(&rows, "1").unwrap();
         let v = serde_json::to_value(json_row(&rows, s)).unwrap();
@@ -360,7 +366,7 @@ mod tests {
         assert_eq!(v["item"]["number"], 7);
         // A relay row has no feed_id — the field is absent, not null.
         let mut b = EventLog::open(&dir, "github-o-x-bbbb").unwrap();
-        b.append_inbox(Transport::Relay, None, Some("k#1"), &item(1))
+        b.append_inbox(Transport::Relay, None, Some("k#1"), None, &item(1))
             .unwrap();
         let rows = read_all(&dir).unwrap();
         let s = resolve(&rows, "github-o-x-bbbb@1").unwrap();
@@ -375,7 +381,7 @@ mod tests {
     fn resolve_errors_are_actionable() {
         let dir = tempdir();
         let mut a = EventLog::open(&dir, "github-o-r-aaaa").unwrap();
-        a.append_inbox(Transport::Poll, Some("1"), None, &item(1))
+        a.append_inbox(Transport::Poll, Some("1"), None, None, &item(1))
             .unwrap();
         let rows = read_all(&dir).unwrap();
         // Unique bare seq resolves without qualification.

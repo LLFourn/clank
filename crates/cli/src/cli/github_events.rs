@@ -56,6 +56,45 @@ pub(crate) struct Classified {
     /// feed id, and the classifiers must stay payload-symmetric). The
     /// WAL's durable cursor rides on it (github-offline-catchup).
     pub(crate) feed_id: Option<String>,
+    /// The event's github-side time (epoch), best effort from the
+    /// payload — the feed's `created_at`, or a per-kind webhook
+    /// timestamp. `None` when the payload carried nothing usable;
+    /// timeline surfaces fall back to ingest time
+    /// (log-timeline-github-events).
+    pub(crate) event_at: Option<u64>,
+}
+
+/// Epoch seconds from an RFC3339 timestamp (the shapes github emits:
+/// `Z`-suffixed, numeric offsets, optional fractional seconds).
+/// Externally supplied feed/webhook data: anything malformed —
+/// impossible dates, out-of-range offsets — is `None` (fall back to
+/// ingest time), never a plausible-but-wrong epoch that silently
+/// reorders the timeline (codex 6219148). The `time` crate is already
+/// a dependency; its RFC3339 parser owns the validation.
+fn parse_iso8601_epoch(s: &str) -> Option<u64> {
+    let t = time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339).ok()?;
+    u64::try_from(t.unix_timestamp()).ok()
+}
+
+/// Best-effort event time from a WEBHOOK payload: the per-kind
+/// timestamps the common shapes carry. Absent → `None`, and the
+/// timeline falls back to ingest time.
+fn webhook_event_at(payload: &serde_json::Value) -> Option<u64> {
+    let paths: [&[&str]; 3] = [
+        &["comment", "created_at"],
+        &["review", "submitted_at"],
+        &["head_commit", "timestamp"],
+    ];
+    for path in paths {
+        let mut v = Some(payload);
+        for k in path {
+            v = v.and_then(|x| x.get(k));
+        }
+        if let Some(t) = v.and_then(|x| x.as_str()).and_then(parse_iso8601_epoch) {
+            return Some(t);
+        }
+    }
+    None
 }
 
 pub(crate) fn classify_event(
@@ -78,6 +117,10 @@ pub(crate) fn classify_event(
     }
 
     let ty = event.get("type").and_then(|t| t.as_str())?;
+    let event_at = event
+        .get("created_at")
+        .and_then(|t| t.as_str())
+        .and_then(parse_iso8601_epoch);
     let payload = event.get("payload").unwrap_or(&serde_json::Value::Null);
     let action = payload.get("action").and_then(|a| a.as_str());
     let pr = || {
@@ -125,6 +168,7 @@ pub(crate) fn classify_event(
             },
             key: head.map(|h| format!("push@{full_ref}+{h}")),
             feed_id: None,
+            event_at,
         });
     }
 
@@ -198,6 +242,7 @@ pub(crate) fn classify_event(
         },
         key,
         feed_id: None,
+        event_at,
     })
 }
 
@@ -281,6 +326,7 @@ pub(crate) fn classify_webhook(
     include_own: bool,
     branches: &[String],
 ) -> Option<Classified> {
+    let event_at = webhook_event_at(payload);
     let actor = payload
         .get("sender")
         .and_then(|a| a.get("login"))
@@ -330,6 +376,7 @@ pub(crate) fn classify_webhook(
             },
             key: after.map(|a| format!("push@{full_ref}+{a}")),
             feed_id: None,
+            event_at,
         });
     }
 
@@ -395,6 +442,7 @@ pub(crate) fn classify_webhook(
         },
         key,
         feed_id: None,
+        event_at,
     })
 }
 
@@ -1275,8 +1323,13 @@ impl Coordinator {
             }
             self.keys.extend([k.clone()]);
         }
-        self.wal
-            .inbox(transport, c.feed_id.as_deref(), c.key.as_deref(), &c.item);
+        self.wal.inbox(
+            transport,
+            c.feed_id.as_deref(),
+            c.key.as_deref(),
+            c.event_at,
+            &c.item,
+        );
         self.tx.send(c.item).is_ok()
     }
 
@@ -2651,6 +2704,7 @@ mod tests {
             },
             key: key.map(str::to_string),
             feed_id: None,
+            event_at: None,
         }
     }
 
@@ -3560,6 +3614,109 @@ mod tests {
         );
     }
 
+    // ── event_at capture (log-timeline-github-events) ──
+
+    #[test]
+    fn iso8601_epoch_parses_github_shapes() {
+        assert_eq!(parse_iso8601_epoch("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(
+            parse_iso8601_epoch("2026-07-29T01:02:03Z"),
+            Some(1_785_286_923)
+        );
+        // Fractional seconds are valid RFC3339 (codex 6219148).
+        assert_eq!(
+            parse_iso8601_epoch("2026-07-29T01:02:03.517Z"),
+            Some(1_785_286_923)
+        );
+        // Offset form (push head_commit.timestamp): +10:00 is 10h
+        // BEHIND the same wall-clock in UTC.
+        assert_eq!(
+            parse_iso8601_epoch("2026-07-29T11:02:03+10:00"),
+            Some(1_785_286_923)
+        );
+        assert_eq!(
+            parse_iso8601_epoch("2026-07-28T15:02:03-10:00"),
+            Some(1_785_286_923)
+        );
+        // Malformed external data must be None — never a
+        // plausible-but-wrong epoch that reorders the timeline
+        // (codex 6219148).
+        for bad in [
+            "",
+            "not a time",
+            "2026-07-29",
+            "2026-07-29T01:02:03",
+            "2026-13-01T00:00:00Z",
+            "2026-02-31T00:00:00Z",
+            "2026-07-29T01:02:03+99:99",
+            "1969-12-31T23:59:59Z",
+        ] {
+            assert_eq!(parse_iso8601_epoch(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn classifiers_capture_event_time_best_effort() {
+        // Feed: top-level created_at covers every kind uniformly.
+        let ev = serde_json::json!({"id":"1","type":"IssuesEvent",
+            "created_at":"2026-07-29T01:02:03Z",
+            "actor":{"login":"them"},
+            "payload":{"action":"opened","issue":{"number":1}}});
+        let c =
+            classify_event("o/r", &ev, &[GithubEventKind::IssueOpened], None, true, &[]).unwrap();
+        assert_eq!(c.event_at, Some(1_785_286_923));
+        // Feed without created_at → None (fallback is the caller's).
+        let ev = serde_json::json!({"id":"1","type":"IssuesEvent",
+            "actor":{"login":"them"},
+            "payload":{"action":"opened","issue":{"number":1}}});
+        let c =
+            classify_event("o/r", &ev, &[GithubEventKind::IssueOpened], None, true, &[]).unwrap();
+        assert_eq!(c.event_at, None);
+        // Webhook comment.created_at.
+        let c = classify_webhook(
+            "o/r",
+            "issue_comment",
+            &serde_json::json!({"action":"created","sender":{"login":"them"},
+                "issue":{"number":2},
+                "comment":{"id":9,"created_at":"2026-07-29T01:02:03Z"}}),
+            &[GithubEventKind::IssueComment],
+            None,
+            true,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(c.event_at, Some(1_785_286_923));
+        // Webhook review.submitted_at.
+        let c = classify_webhook(
+            "o/r",
+            "pull_request_review",
+            &serde_json::json!({"action":"submitted","sender":{"login":"them"},
+                "pull_request":{"number":3},
+                "review":{"id":8,"submitted_at":"2026-07-29T01:02:03Z"}}),
+            &[GithubEventKind::PrComment],
+            None,
+            true,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(c.event_at, Some(1_785_286_923));
+        // Webhook push head_commit.timestamp (offset form).
+        let c = classify_webhook(
+            "o/r",
+            "push",
+            &serde_json::json!({"sender":{"login":"them"},
+                "ref":"refs/heads/main","before":"a","after":"b",
+                "commits":[{}],
+                "head_commit":{"timestamp":"2026-07-29T11:02:03+10:00"}}),
+            &[GithubEventKind::BranchPush],
+            None,
+            true,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(c.event_at, Some(1_785_286_923));
+    }
+
     // ── the WAL wiring: offline catch-up end to end ──
 
     fn wal_tempdir() -> std::path::PathBuf {
@@ -3643,6 +3800,7 @@ mod tests {
                 crate::cli::github_event_log::Transport::Poll,
                 Some("51"),
                 Some("issue#9"),
+                None,
                 &classified(9, Some("issue#9")).item,
             )
             .unwrap();

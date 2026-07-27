@@ -49,6 +49,14 @@ pub(crate) const LOG_IDENTITY_CAP: usize = 1000;
 /// Total-line threshold that triggers compaction on ingest appends.
 const COMPACT_AT: usize = 4 * LOG_IDENTITY_CAP;
 
+/// Presentation retention (log-timeline-github-events): compaction
+/// keeps this many of the NEWEST handled inbox records verbatim —
+/// payload, identities, event time, and their ack records — so the
+/// timeline surfaces don't lose the recent "event, then fix"
+/// narrative to a threshold compaction. Older handled records fold to
+/// identity observations as before.
+pub(crate) const DISPLAY_CAP: usize = 200;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Transport {
@@ -67,7 +75,7 @@ const CURRENT_V: u64 = 1;
 /// `seq` still reserves allocator namespace (codex 7e6e585).
 #[derive(Debug, Clone)]
 enum Line {
-    Known(Record),
+    Known(Box<Record>),
     Foreign { raw: String, seq: Option<u64> },
 }
 
@@ -84,6 +92,12 @@ enum Record {
         v: u64,
         seq: u64,
         at: u64,
+        /// The event's github-side time (epoch), when the payload
+        /// carried one — additive optional field, v stays 1
+        /// (log-timeline-github-events). Timeline surfaces fall back
+        /// to `at` when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        event_at: Option<u64>,
         transport: Transport,
         #[serde(skip_serializing_if = "Option::is_none")]
         feed_id: Option<String>,
@@ -131,6 +145,14 @@ pub(crate) struct InboxEntry {
     pub(crate) item: WaitItem,
 }
 
+/// [`EventLog::read_rows`]'s result: the inbox rows plus how many
+/// foreign records the read skipped.
+#[derive(Debug)]
+pub(crate) struct ReadRows {
+    pub(crate) rows: Vec<EventRow>,
+    pub(crate) foreign: usize,
+}
+
 /// One inbox entry with its lifecycle state — the `clank events`
 /// inspector's row. Carries the record's durable identities
 /// (feed id / action key): they're exactly the state one needs when
@@ -139,6 +161,10 @@ pub(crate) struct InboxEntry {
 pub(crate) struct EventRow {
     pub(crate) seq: u64,
     pub(crate) at: u64,
+    /// Github-side event time when known; display time is
+    /// `event_at.unwrap_or(at)`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) event_at: Option<u64>,
     pub(crate) transport: Transport,
     pub(crate) acked: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -259,10 +285,11 @@ impl SharedWal {
         transport: Transport,
         feed_id: Option<&str>,
         action_key: Option<&str>,
+        event_at: Option<u64>,
         item: &WaitItem,
     ) {
         self.with(|log| {
-            log.append_inbox(transport, feed_id, action_key, item)
+            log.append_inbox(transport, feed_id, action_key, event_at, item)
                 .map(|_| ())
         });
     }
@@ -369,7 +396,7 @@ impl EventLog {
                 .ok()
                 .filter(|r| r.version() <= CURRENT_V);
             match known {
-                Some(r) => out.push(Line::Known(r)),
+                Some(r) => out.push(Line::Known(Box::new(r))),
                 None => out.push(Line::Foreign {
                     raw: (*line).to_string(),
                     seq: value.get("seq").and_then(serde_json::Value::as_u64),
@@ -385,7 +412,9 @@ impl EventLog {
     fn fold(lines_in: Vec<Line>) -> FoldOut {
         let mut acked = std::collections::HashSet::new();
         for l in &lines_in {
-            if let Line::Known(Record::Ack { seq, .. }) = l {
+            if let Line::Known(r) = l
+                && let Record::Ack { seq, .. } = r.as_ref()
+            {
                 acked.insert(*seq);
             }
         }
@@ -397,7 +426,7 @@ impl EventLog {
         let lines = lines_in.len();
         for l in lines_in {
             let r = match l {
-                Line::Known(r) => r,
+                Line::Known(r) => *r,
                 Line::Foreign { seq, .. } => {
                     foreign += 1;
                     if let Some(seq) = seq {
@@ -458,18 +487,23 @@ impl EventLog {
         }
     }
 
-    /// Inspector read for the `clank events` CLI: every inbox entry
-    /// with its ack status, append order. READ-ONLY — unlike [`load`]
-    /// it never quarantines (an inspector must not mutate the ingest
-    /// side's artifacts); interior corruption is `Ok(None)` for the
-    /// caller to report.
-    pub(crate) fn read_rows(&self) -> std::io::Result<Option<Vec<EventRow>>> {
+    /// Inspector read for the `clank events` CLI and the timeline
+    /// layer: every inbox entry with its ack status, append order,
+    /// plus the count of FOREIGN records skipped (the viewer's
+    /// foreign-notice needs it — codex 92e9deb). READ-ONLY — unlike
+    /// [`load`] it never quarantines (an inspector must not mutate the
+    /// ingest side's artifacts); interior corruption is `Ok(None)` for
+    /// the caller to report.
+    pub(crate) fn read_rows(&self) -> std::io::Result<Option<ReadRows>> {
         let text = {
             let _lock = SidecarLock::acquire(&self.lock_path, false).ok();
             match std::fs::read_to_string(&self.log_path) {
                 Ok(t) => t,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    return Ok(Some(Vec::new()));
+                    return Ok(Some(ReadRows {
+                        rows: Vec::new(),
+                        foreign: 0,
+                    }));
                 }
                 Err(e) => return Err(e),
             }
@@ -480,25 +514,35 @@ impl EventLog {
         let acked: std::collections::HashSet<u64> = lines_in
             .iter()
             .filter_map(|l| match l {
-                Line::Known(Record::Ack { seq, .. }) => Some(*seq),
+                Line::Known(r) => match r.as_ref() {
+                    Record::Ack { seq, .. } => Some(*seq),
+                    _ => None,
+                },
                 _ => None,
             })
             .collect();
+        let foreign = lines_in
+            .iter()
+            .filter(|l| matches!(l, Line::Foreign { .. }))
+            .count();
         let mut rows = Vec::new();
         for l in lines_in {
-            if let Line::Known(Record::Inbox {
-                seq,
-                at,
-                transport,
-                feed_id,
-                action_key,
-                item,
-                ..
-            }) = l
+            if let Line::Known(r) = l
+                && let Record::Inbox {
+                    seq,
+                    at,
+                    event_at,
+                    transport,
+                    feed_id,
+                    action_key,
+                    item,
+                    ..
+                } = *r
             {
                 rows.push(EventRow {
                     seq,
                     at,
+                    event_at,
                     transport,
                     acked: acked.contains(&seq),
                     feed_id,
@@ -508,7 +552,7 @@ impl EventLog {
             }
         }
         rows.sort_by_key(|r| r.seq);
-        Ok(Some(rows))
+        Ok(Some(ReadRows { rows, foreign }))
     }
 
     /// Read both artifacts. Never fails: every failure mode maps to
@@ -601,6 +645,7 @@ impl EventLog {
         transport: Transport,
         feed_id: Option<&str>,
         action_key: Option<&str>,
+        event_at: Option<u64>,
         item: &WaitItem,
     ) -> std::io::Result<u64> {
         let Some(seq) = self.next_seq else {
@@ -612,6 +657,7 @@ impl EventLog {
             v: CURRENT_V,
             seq,
             at: now_epoch(),
+            event_at,
             transport,
             feed_id: feed_id.map(str::to_owned),
             action_key: action_key.map(str::to_owned),
@@ -694,18 +740,39 @@ impl EventLog {
         let acked: std::collections::HashSet<u64> = lines_in
             .iter()
             .filter_map(|l| match l {
-                Line::Known(Record::Ack { seq, .. }) => Some(*seq),
+                Line::Known(r) => match r.as_ref() {
+                    Record::Ack { seq, .. } => Some(*seq),
+                    _ => None,
+                },
                 _ => None,
             })
             .collect();
         // Identity-bearing records, oldest→newest, folded to (feed_id,
         // action_key, at, baseline) — keep only the newest cap.
+        // Handled inbox records split at the presentation bound
+        // (log-timeline-github-events): the newest DISPLAY_CAP stay
+        // VERBATIM — with their ack records, or a reload would
+        // re-present them as unhandled — while older ones fold to
+        // identity observations. Two passes: count acked inbox first
+        // so the split point is known when walking in order.
+        let acked_inbox_total = lines_in
+            .iter()
+            .filter(|l| {
+                matches!(l, Line::Known(r)
+                    if matches!(r.as_ref(), Record::Inbox { seq, .. } if acked.contains(seq)))
+            })
+            .count();
+        let fold_older = acked_inbox_total.saturating_sub(DISPLAY_CAP);
+        let mut acked_seen = 0usize;
         let mut identities: Vec<(Option<String>, Option<String>, u64, bool)> = Vec::new();
         let mut unhandled: Vec<Record> = Vec::new();
+        let mut retained_handled: Vec<Record> = Vec::new();
+        let mut ack_records: std::collections::HashMap<u64, Record> =
+            std::collections::HashMap::new();
         let mut foreign: Vec<(String, Option<u64>)> = Vec::new();
         for l in lines_in {
             let r = match l {
-                Line::Known(r) => r,
+                Line::Known(r) => *r,
                 Line::Foreign { raw, seq } => {
                     foreign.push((raw, seq));
                     continue;
@@ -715,12 +782,17 @@ impl EventLog {
                 Record::Inbox {
                     seq,
                     at,
-                    feed_id,
-                    action_key,
+                    ref feed_id,
+                    ref action_key,
                     ..
                 } if acked.contains(&seq) => {
-                    if feed_id.is_some() || action_key.is_some() {
-                        identities.push((feed_id, action_key, at, false));
+                    acked_seen += 1;
+                    if acked_seen <= fold_older {
+                        if feed_id.is_some() || action_key.is_some() {
+                            identities.push((feed_id.clone(), action_key.clone(), at, false));
+                        }
+                    } else {
+                        retained_handled.push(r);
                     }
                 }
                 Record::Inbox { .. } => unhandled.push(r),
@@ -735,7 +807,10 @@ impl EventLog {
                         identities.push((feed_id, action_key, at, baseline));
                     }
                 }
-                Record::Ack { .. } => {}
+                Record::Ack { seq, .. } => {
+                    // Keep the FIRST ack per seq for retained pairs.
+                    ack_records.entry(seq).or_insert(r);
+                }
             }
         }
         // Foreign retention: EXACTLY the newest LOG_IDENTITY_CAP
@@ -793,6 +868,19 @@ impl EventLog {
             out.push('\n');
             kept_lines += 1;
         }
+        for rec in &retained_handled {
+            out.push_str(&serde_json::to_string(rec).map_err(std::io::Error::other)?);
+            out.push('\n');
+            kept_lines += 1;
+            let Record::Inbox { seq, .. } = rec else {
+                unreachable!("retained_handled holds only inbox records");
+            };
+            if let Some(ack) = ack_records.get(seq) {
+                out.push_str(&serde_json::to_string(ack).map_err(std::io::Error::other)?);
+                out.push('\n');
+                kept_lines += 1;
+            }
+        }
         for (raw, _) in kept_foreign {
             out.push_str(raw);
             out.push('\n');
@@ -833,10 +921,16 @@ mod tests {
         assert!(!log.load().warm, "no file yet = cold start");
         log.append_observation(Some("100"), None, false).unwrap();
         let s1 = log
-            .append_inbox(Transport::Poll, Some("101"), Some("review#1"), &item(1))
+            .append_inbox(
+                Transport::Poll,
+                Some("101"),
+                Some("review#1"),
+                None,
+                &item(1),
+            )
             .unwrap();
         let s2 = log
-            .append_inbox(Transport::Relay, None, Some("review#2"), &item(2))
+            .append_inbox(Transport::Relay, None, Some("review#2"), None, &item(2))
             .unwrap();
         assert_ne!(s1, s2);
         let mut fresh = log_in(&dir);
@@ -859,9 +953,9 @@ mod tests {
         let dir = tempdir();
         let mut log = log_in(&dir);
         let s1 = log
-            .append_inbox(Transport::Poll, Some("1"), None, &item(1))
+            .append_inbox(Transport::Poll, Some("1"), None, None, &item(1))
             .unwrap();
-        log.append_inbox(Transport::Poll, Some("2"), None, &item(2))
+        log.append_inbox(Transport::Poll, Some("2"), None, None, &item(2))
             .unwrap();
         log.append_ack(s1).unwrap();
         log.append_ack(999).unwrap();
@@ -877,12 +971,12 @@ mod tests {
         let dir = tempdir();
         let mut log = log_in(&dir);
         let s1 = log
-            .append_inbox(Transport::Poll, Some("1"), None, &item(1))
+            .append_inbox(Transport::Poll, Some("1"), None, None, &item(1))
             .unwrap();
         let mut fresh = log_in(&dir);
         fresh.load();
         let s2 = fresh
-            .append_inbox(Transport::Poll, Some("2"), None, &item(2))
+            .append_inbox(Transport::Poll, Some("2"), None, None, &item(2))
             .unwrap();
         assert!(s2 > s1, "seq must not collide across restarts");
     }
@@ -904,7 +998,7 @@ mod tests {
     fn torn_final_line_is_dropped_not_corrupt() {
         let dir = tempdir();
         let mut log = log_in(&dir);
-        log.append_inbox(Transport::Poll, Some("1"), None, &item(1))
+        log.append_inbox(Transport::Poll, Some("1"), None, None, &item(1))
             .unwrap();
         let path = dir.join("github-o-r-abcd.jsonl");
         let mut text = std::fs::read_to_string(&path).unwrap();
@@ -920,7 +1014,7 @@ mod tests {
     fn interior_corruption_quarantines_the_log() {
         let dir = tempdir();
         let mut log = log_in(&dir);
-        log.append_inbox(Transport::Poll, Some("1"), None, &item(1))
+        log.append_inbox(Transport::Poll, Some("1"), None, None, &item(1))
             .unwrap();
         let path = dir.join("github-o-r-abcd.jsonl");
         let mut text = std::fs::read_to_string(&path).unwrap();
@@ -938,7 +1032,7 @@ mod tests {
     fn corrupt_state_json_keeps_wal_authoritative() {
         let dir = tempdir();
         let mut log = log_in(&dir);
-        log.append_inbox(Transport::Poll, Some("1"), None, &item(1))
+        log.append_inbox(Transport::Poll, Some("1"), None, None, &item(1))
             .unwrap();
         log.save_state(Some("etag-x"), Some(60)).unwrap();
         std::fs::write(dir.join("github-o-r-abcd.state.json"), b"{broken").unwrap();
@@ -966,12 +1060,18 @@ mod tests {
         let dir = tempdir();
         let mut log = log_in(&dir);
         let keep = log
-            .append_inbox(Transport::Poll, Some("keep-me"), Some("k#1"), &item(7))
+            .append_inbox(
+                Transport::Poll,
+                Some("keep-me"),
+                Some("k#1"),
+                None,
+                &item(7),
+            )
             .unwrap();
         for i in 0..COMPACT_AT {
             let id = format!("{i}");
             let seq = log
-                .append_inbox(Transport::Poll, Some(&id), None, &item(1))
+                .append_inbox(Transport::Poll, Some(&id), None, None, &item(1))
                 .unwrap();
             log.append_ack(seq).unwrap();
         }
@@ -992,8 +1092,10 @@ mod tests {
             .unwrap()
             .lines()
             .count();
+        // Bound = identity horizon + DISPLAY_CAP retained handled
+        // pairs (inbox + ack) + the unhandled row.
         assert!(
-            lines <= LOG_IDENTITY_CAP + 1,
+            lines <= LOG_IDENTITY_CAP + 2 * DISPLAY_CAP + 1,
             "compacted to bound, got {lines}"
         );
     }
@@ -1008,14 +1110,14 @@ mod tests {
         for i in 0..5 {
             let id = format!("poll{i}");
             let seq = log
-                .append_inbox(Transport::Poll, Some(&id), None, &item(1))
+                .append_inbox(Transport::Poll, Some(&id), None, None, &item(1))
                 .unwrap();
             log.append_ack(seq).unwrap();
         }
         for i in 0..COMPACT_AT {
             let key = format!("relay#{i}");
             let seq = log
-                .append_inbox(Transport::Relay, None, Some(&key), &item(1))
+                .append_inbox(Transport::Relay, None, Some(&key), None, &item(1))
                 .unwrap();
             log.append_ack(seq).unwrap();
         }
@@ -1044,7 +1146,7 @@ mod tests {
         for i in 0..COMPACT_AT {
             let id = format!("pre{i}");
             let seq = log
-                .append_inbox(Transport::Poll, Some(&id), None, &item(1))
+                .append_inbox(Transport::Poll, Some(&id), None, None, &item(1))
                 .unwrap();
             log.append_ack(seq).unwrap();
         }
@@ -1056,7 +1158,7 @@ mod tests {
             for i in 0..200u64 {
                 let key = format!("race#{i}");
                 seqs.push(
-                    log.append_inbox(Transport::Relay, None, Some(&key), &item(i))
+                    log.append_inbox(Transport::Relay, None, Some(&key), None, &item(i))
                         .unwrap(),
                 );
             }
@@ -1088,7 +1190,7 @@ mod tests {
         let dir = tempdir();
         let mut log = log_in(&dir);
         log.append_observation(Some("before"), None, false).unwrap();
-        log.append_inbox(Transport::Poll, Some("target"), Some("k#t"), &item(1))
+        log.append_inbox(Transport::Poll, Some("target"), Some("k#t"), None, &item(1))
             .unwrap();
         let path = dir.join("github-o-r-abcd.jsonl");
         let full = std::fs::read(&path).unwrap();
@@ -1114,13 +1216,73 @@ mod tests {
     }
 
     #[test]
+    fn compaction_retains_recent_handled_for_display_with_ack_state() {
+        // log-timeline-github-events: the newest DISPLAY_CAP handled
+        // records survive compaction VERBATIM with their acks (no
+        // re-presentation after reload); older handled fold to
+        // identity obs; unhandled stays lossless; horizons intact.
+        let dir = tempdir();
+        let mut log = log_in(&dir);
+        let total = COMPACT_AT;
+        let unhandled_seq = log
+            .append_inbox(
+                Transport::Poll,
+                Some("keep-unhandled"),
+                None,
+                None,
+                &item(1),
+            )
+            .unwrap();
+        for i in 0..total {
+            let id = format!("{i}");
+            let seq = log
+                .append_inbox(
+                    Transport::Poll,
+                    Some(&id),
+                    Some(&format!("k#{i}")),
+                    Some(1_000_000 + i as u64),
+                    &item(i as u64),
+                )
+                .unwrap();
+            log.append_ack(seq).unwrap();
+        }
+        log.maybe_compact().unwrap();
+
+        let rows = log_in(&dir).read_rows().unwrap().unwrap().rows;
+        let handled: Vec<_> = rows.iter().filter(|r| r.acked).collect();
+        assert_eq!(
+            handled.len(),
+            DISPLAY_CAP,
+            "exactly the display bound of handled rows survives"
+        );
+        // The newest ones, payload + event time intact.
+        let newest = handled.last().unwrap();
+        assert_eq!(newest.item, item((total - 1) as u64));
+        assert_eq!(newest.event_at, Some(1_000_000 + (total as u64) - 1));
+        let oldest_retained = handled.first().unwrap();
+        assert_eq!(
+            oldest_retained.item,
+            item((total - DISPLAY_CAP) as u64),
+            "age-out is exactly at the bound"
+        );
+        // Ack state survives: reload re-presents ONLY the unhandled row.
+        let loaded = log_in(&dir).load();
+        assert_eq!(loaded.unhandled.len(), 1);
+        assert_eq!(loaded.unhandled[0].seq, unhandled_seq);
+        // Horizons unaffected by retention: newest CAP identities.
+        assert_eq!(loaded.feed_ids.len(), LOG_IDENTITY_CAP);
+        assert!(loaded.feed_ids.contains(&format!("{}", total - 1)));
+        assert_eq!(loaded.action_keys.len(), LOG_IDENTITY_CAP);
+    }
+
+    #[test]
     fn foreign_records_skip_but_preserve_and_reserve_seq() {
         // event-log-format-compat: unknown t, future v, and a known t
         // with drifted fields are FOREIGN — no horizons, no backlog,
         // preserved verbatim, seq reserved (codex 7e6e585).
         let dir = tempdir();
         let mut log = log_in(&dir);
-        log.append_inbox(Transport::Poll, Some("1"), None, &item(1))
+        log.append_inbox(Transport::Poll, Some("1"), None, None, &item(1))
             .unwrap();
         let path = dir.join("github-o-r-abcd.jsonl");
         let unknown_kind = r#"{"t":"tombstone","v":1,"seq":90,"reason":"future"}"#;
@@ -1139,7 +1301,7 @@ mod tests {
         assert_eq!(loaded.feed_ids, vec!["1".to_string()], "horizons untouched");
         // The allocator reserves ABOVE the highest foreign seq…
         let seq = fresh
-            .append_inbox(Transport::Poll, Some("2"), None, &item(2))
+            .append_inbox(Transport::Poll, Some("2"), None, None, &item(2))
             .unwrap();
         assert_eq!(seq, 91, "foreign seq 90 reserved the namespace");
         // …and the foreign lines survive the append round-trip
@@ -1157,7 +1319,7 @@ mod tests {
         for i in 0..COMPACT_AT {
             let id = format!("{i}");
             let seq = log
-                .append_inbox(Transport::Poll, Some(&id), None, &item(1))
+                .append_inbox(Transport::Poll, Some(&id), None, None, &item(1))
                 .unwrap();
             log.append_ack(seq).unwrap();
         }
@@ -1179,7 +1341,7 @@ mod tests {
         let mut reloaded = log_in(&dir);
         reloaded.load();
         let seq = reloaded
-            .append_inbox(Transport::Poll, Some("x"), None, &item(9))
+            .append_inbox(Transport::Poll, Some("x"), None, None, &item(9))
             .unwrap();
         assert_eq!(seq, 900_001, "no seq reuse after compaction + reload");
     }
@@ -1195,7 +1357,7 @@ mod tests {
         for i in 0..COMPACT_AT {
             let id = format!("{i}");
             let seq = log
-                .append_inbox(Transport::Poll, Some(&id), None, &item(1))
+                .append_inbox(Transport::Poll, Some(&id), None, None, &item(1))
                 .unwrap();
             log.append_ack(seq).unwrap();
         }
@@ -1228,7 +1390,7 @@ mod tests {
         let mut reloaded = log_in(&dir);
         reloaded.load();
         let seq = reloaded
-            .append_inbox(Transport::Poll, Some("x"), None, &item(9))
+            .append_inbox(Transport::Poll, Some("x"), None, None, &item(9))
             .unwrap();
         let max_retained = 10_000 + (LOG_IDENTITY_CAP + extra - 1) as u64;
         assert_eq!(
@@ -1252,7 +1414,7 @@ mod tests {
         let loaded = log.load();
         assert_eq!(loaded.foreign, 1);
         let err = log
-            .append_inbox(Transport::Poll, Some("1"), None, &item(1))
+            .append_inbox(Transport::Poll, Some("1"), None, None, &item(1))
             .expect_err("exhausted namespace must error, not wrap");
         assert!(err.to_string().contains("exhausted"), "{err}");
         // Observations and acks (no allocation) still work.
@@ -1276,7 +1438,7 @@ mod tests {
     fn new_records_stamp_v1_and_garbage_rules_hold() {
         let dir = tempdir();
         let mut log = log_in(&dir);
-        log.append_inbox(Transport::Poll, Some("1"), None, &item(1))
+        log.append_inbox(Transport::Poll, Some("1"), None, None, &item(1))
             .unwrap();
         log.append_observation(Some("2"), None, false).unwrap();
         log.append_ack(1).unwrap();

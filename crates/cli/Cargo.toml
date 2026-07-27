@@ -71,7 +71,7 @@ syntect = { version = "5", default-features = false, features = ["default-fancy"
 
 # RFC3339 timestamp formatting for AgentConfig.session.updated_at.
 # UTC only — local-offset has soundness issues in multi-threaded programs.
-time = { version = "0.3", features = ["formatting"] }
+time = { version = "0.3", features = ["formatting", "parsing"] }
 
 # `which` for the doctor's `cfg.launch.command on $PATH?` check.
 # Small + pure-Rust + cross-platform.

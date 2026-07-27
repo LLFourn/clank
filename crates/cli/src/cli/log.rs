@@ -56,13 +56,28 @@ pub async fn run(args: LogArgs) -> anyhow::Result<()> {
         })
         .collect();
 
-    if filtered.is_empty() {
+    // Github events interleave by time (log-timeline-github-events)
+    // unless excluded; a plan-scoped view is plan work only, so the
+    // repo-wide github stream stays out of it too.
+    let gh_events: Vec<crate::cli::github_timeline::MergedEvent> =
+        if args.no_github || plan_filter.is_some() {
+            Vec::new()
+        } else {
+            let snap = crate::cli::github_timeline::timeline_snapshot(&repo);
+            for n in &snap.notices {
+                eprintln!("log: {n}");
+            }
+            snap.events
+        };
+
+    if filtered.is_empty() && gh_events.is_empty() {
         println!("no log events");
         return Ok(());
     }
 
     // Most recent first (git log convention).
     let filtered: Vec<&LogEvent> = filtered.into_iter().rev().collect();
+    let items = interleave(&filtered, &gh_events);
 
     let reviewable_shas: Vec<CommitSha> = filtered
         .iter()
@@ -75,13 +90,89 @@ pub async fn run(args: LogArgs) -> anyhow::Result<()> {
         .collect();
 
     if args.json {
-        print_json(&filtered, &repo, &reviewable_shas)?;
+        print_json(&items, &repo, &reviewable_shas)?;
     } else if args.oneline {
-        print_oneline(&filtered, &repo, &reviewable_shas)?;
+        print_oneline(&items, &repo, &reviewable_shas)?;
     } else {
-        print_human(&filtered, &repo, &reviewable_shas)?;
+        print_human(&items, &repo, &reviewable_shas)?;
     }
     Ok(())
+}
+
+/// One interleaved timeline entry: a fold event or a merged github
+/// event (log-timeline-github-events).
+pub(crate) enum TimelineItem<'a> {
+    Repo(&'a LogEvent),
+    Github(&'a crate::cli::github_timeline::MergedEvent),
+}
+
+fn event_ts(e: &LogEvent) -> i64 {
+    match e {
+        LogEvent::PlanIntro { ts, .. }
+        | LogEvent::PlanCommit { ts, .. }
+        | LogEvent::PlanFinalized { ts, .. }
+        | LogEvent::PlanDeleted { ts, .. }
+        | LogEvent::AdHoc { ts, .. } => *ts,
+    }
+}
+
+/// Two-pointer newest-first merge preserving each list's own order.
+/// Github events OLDER than the oldest displayed commit fall outside
+/// the folded range and are excluded (when any commits are shown at
+/// all); newer-than-newest ones lead the view — a just-arrived event
+/// is exactly what the reader wants on top. `gh` arrives
+/// oldest-first (the snapshot's order).
+pub(crate) fn interleave<'a>(
+    events: &[&'a LogEvent],
+    gh: &'a [crate::cli::github_timeline::MergedEvent],
+) -> Vec<TimelineItem<'a>> {
+    let floor: Option<i64> = events.last().map(|e| event_ts(e));
+    let mut gh_desc: Vec<&crate::cli::github_timeline::MergedEvent> = gh
+        .iter()
+        .filter(|g| {
+            let t = i64::try_from(g.at).unwrap_or(i64::MAX);
+            floor.is_none_or(|f| t >= f)
+        })
+        .collect();
+    gh_desc.reverse();
+    let mut out = Vec::with_capacity(events.len() + gh_desc.len());
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < events.len() || j < gh_desc.len() {
+        let take_gh = match (events.get(i), gh_desc.get(j)) {
+            (Some(e), Some(g)) => i64::try_from(g.at).unwrap_or(i64::MAX) >= event_ts(e),
+            (None, Some(_)) => true,
+            _ => false,
+        };
+        if take_gh {
+            out.push(TimelineItem::Github(gh_desc[j]));
+            j += 1;
+        } else {
+            out.push(TimelineItem::Repo(events[i]));
+            i += 1;
+        }
+    }
+    out
+}
+
+/// One-line description shared by the oneline and human renderers —
+/// mirrors the `clank events` CLI's shape so the two surfaces read
+/// the same.
+fn gh_describe(g: &crate::cli::github_timeline::MergedEvent) -> String {
+    let mut out = g.event.clone();
+    if let Some(d) = &g.detail {
+        out.push_str(&format!("/{d}"));
+    }
+    out.push_str(&format!("  {}", g.repo));
+    if let Some(n) = g.number {
+        out.push_str(&format!("#{n}"));
+    }
+    if let Some(t) = &g.title {
+        out.push_str(&format!("  “{t}”"));
+    }
+    if let Some(a) = &g.actor {
+        out.push_str(&format!("  by {a}"));
+    }
+    out
 }
 
 // ── git helpers ──────────────────────────────────────────────
@@ -190,13 +281,52 @@ pub(crate) fn verdict_mark(v: Verdict, c: bool) -> String {
 
 // ── renderers ───────────────────────────────────────────────
 
-fn print_human(events: &[&LogEvent], repo: &Path, shas: &[CommitSha]) -> anyhow::Result<()> {
+fn print_human(items: &[TimelineItem], repo: &Path, shas: &[CommitSha]) -> anyhow::Result<()> {
     let reviews = collect_reviews(repo, shas);
     let c = color();
-    for (i, event) in events.iter().enumerate() {
-        if i > 0 {
+    let mut started = false;
+    let mut chunk: Vec<&LogEvent> = Vec::new();
+    for item in items {
+        match item {
+            TimelineItem::Repo(e) => chunk.push(e),
+            TimelineItem::Github(g) => {
+                print_human_events(&chunk, repo, &reviews, c, &mut started)?;
+                chunk.clear();
+                if started {
+                    println!();
+                }
+                started = true;
+                let line = gh_describe(g);
+                let mark = if g.unhandled { "  [UNHANDLED]" } else { "" };
+                if c {
+                    println!("{C}gh{Z} {line}{mark}");
+                } else {
+                    println!("gh {line}{mark}");
+                }
+                if !g.seen_by.is_empty() {
+                    println!("Seen-by: {}", g.seen_by.join(", "));
+                }
+                if let Some(url) = &g.url {
+                    println!("{url}");
+                }
+            }
+        }
+    }
+    print_human_events(&chunk, repo, &reviews, c, &mut started)
+}
+
+fn print_human_events(
+    events: &[&LogEvent],
+    repo: &Path,
+    reviews: &std::collections::BTreeMap<String, Vec<Review>>,
+    c: bool,
+    started: &mut bool,
+) -> anyhow::Result<()> {
+    for event in events.iter() {
+        if *started {
             println!();
         }
+        *started = true;
         let (plan, sha, kind) = match event {
             LogEvent::PlanIntro { plan, sha, .. } => (plan, sha, "plan"),
             LogEvent::PlanCommit {
@@ -237,7 +367,7 @@ fn print_human(events: &[&LogEvent], repo: &Path, shas: &[CommitSha]) -> anyhow:
                 }
                 // Ad-hoc commits carry reviews too
                 // (review.adhoc_feedback — adhoc-reviews-in-log).
-                print_reviews(&reviews, sha.as_str(), c);
+                print_reviews(reviews, sha.as_str(), c);
                 continue;
             }
         };
@@ -257,7 +387,7 @@ fn print_human(events: &[&LogEvent], repo: &Path, shas: &[CommitSha]) -> anyhow:
         for line in body.lines() {
             println!("    {line}");
         }
-        print_reviews(&reviews, sha.as_str(), c);
+        print_reviews(reviews, sha.as_str(), c);
     }
     Ok(())
 }
@@ -384,6 +514,40 @@ pub(crate) enum OnelineRow {
         author: String,
         summary: String,
     },
+    /// A merged github event interleaved into the timeline
+    /// (log-timeline-github-events); `line` is [`gh_describe`]'s
+    /// shape, shared with the CLI renderers.
+    Github { line: String, unhandled: bool },
+    /// A timeline-read notice (corrupt/foreign logs) surfaced as a
+    /// dim row — the TUI's rendering of the snapshot's notices.
+    Notice(String),
+}
+
+/// The interleaved oneline row sequence — pure, shared by the status
+/// TUI's log pane (and testable without a repo): repo chunks through
+/// [`oneline_rows`], github entries as [`OnelineRow::Github`] rows in
+/// timeline position.
+pub(crate) fn oneline_items_rows(
+    items: &[TimelineItem],
+    reviews: &std::collections::BTreeMap<String, Vec<Review>>,
+) -> Vec<OnelineRow> {
+    let mut out = Vec::new();
+    let mut chunk: Vec<&LogEvent> = Vec::new();
+    for item in items {
+        match item {
+            TimelineItem::Repo(e) => chunk.push(e),
+            TimelineItem::Github(g) => {
+                out.extend(oneline_rows(&chunk, reviews));
+                chunk.clear();
+                out.push(OnelineRow::Github {
+                    line: gh_describe(g),
+                    unhandled: g.unhandled,
+                });
+            }
+        }
+    }
+    out.extend(oneline_rows(&chunk, reviews));
+    out
 }
 
 /// Pure row producer for the oneline view. Subjects come from the
@@ -485,6 +649,10 @@ pub(crate) fn oneline_plain_lines(rows: &[OnelineRow]) -> Vec<String> {
     rows.iter()
         .map(|row| match row {
             OnelineRow::Header { plan } => plan.clone().unwrap_or_else(|| "adhoc".to_string()),
+            OnelineRow::Github { line, unhandled } => {
+                format!("gh {line}{}", if *unhandled { " ⚠" } else { "" })
+            }
+            OnelineRow::Notice(n) => format!("({n})"),
             // The 1-col marker icon LEADS every commit row (finish/impl/
             // planning/adhoc), then the sha, then the subject. Fixed width
             // keeps subjects column-aligned.
@@ -512,11 +680,42 @@ pub(crate) fn oneline_plain_lines(rows: &[OnelineRow]) -> Vec<String> {
         .collect()
 }
 
-fn print_oneline(events: &[&LogEvent], repo: &Path, shas: &[CommitSha]) -> anyhow::Result<()> {
+fn print_oneline(items: &[TimelineItem], repo: &Path, shas: &[CommitSha]) -> anyhow::Result<()> {
     let reviews = collect_reviews(repo, shas);
     let c = color();
-    for row in oneline_rows(events, &reviews) {
+    let mut chunk: Vec<&LogEvent> = Vec::new();
+    for item in items {
+        match item {
+            TimelineItem::Repo(e) => chunk.push(e),
+            TimelineItem::Github(g) => {
+                print_oneline_events(&chunk, &reviews, c);
+                chunk.clear();
+                // One row, marker-led like commits; unhandled events
+                // carry the open-work mark.
+                let line = gh_describe(g);
+                let mark = if g.unhandled { " ⚠" } else { "" };
+                if c {
+                    println!("{C}gh{Z} {line}{mark}");
+                } else {
+                    println!("gh {line}{mark}");
+                }
+            }
+        }
+    }
+    print_oneline_events(&chunk, &reviews, c);
+    Ok(())
+}
+
+fn print_oneline_events(
+    events: &[&LogEvent],
+    reviews: &std::collections::BTreeMap<String, Vec<Review>>,
+    c: bool,
+) {
+    for row in oneline_rows(events, reviews) {
         match row {
+            // oneline_rows never produces these; the interleaving
+            // caller prints github rows itself.
+            OnelineRow::Github { .. } | OnelineRow::Notice(_) => {}
             OnelineRow::Header { plan } => {
                 let name = plan.unwrap_or_else(|| "adhoc".to_string());
                 if c {
@@ -563,7 +762,6 @@ fn print_oneline(events: &[&LogEvent], repo: &Path, shas: &[CommitSha]) -> anyho
             }
         }
     }
-    Ok(())
 }
 
 /// Typed rows for `clank log --json` (typed-json-not-json-macro,
@@ -614,13 +812,65 @@ enum LogJsonRow<'a> {
         author: &'a str,
         verdict: Verdict,
     },
+    #[serde(rename = "github_event")]
+    Github {
+        ts: i64,
+        repo: &'a str,
+        event: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        detail: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        number: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        title: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        actor: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        url: Option<&'a str>,
+        seen_by: &'a [String],
+        unhandled: bool,
+    },
 }
 
-fn print_json(events: &[&LogEvent], repo: &Path, shas: &[CommitSha]) -> anyhow::Result<()> {
+fn print_json(items: &[TimelineItem], repo: &Path, shas: &[CommitSha]) -> anyhow::Result<()> {
     let reviews = collect_reviews(repo, shas);
-    let out = json_rows(events, &reviews);
+    let out = json_items(items, &reviews);
     println!("{}", serde_json::to_string_pretty(&out)?);
     Ok(())
+}
+
+/// The interleaved `--json` sequence: repo chunks through
+/// [`json_rows`], github entries as typed `github_event` rows in
+/// their timeline position. Pure, like `json_rows`.
+fn json_items<'a>(
+    items: &[TimelineItem<'a>],
+    reviews: &'a std::collections::BTreeMap<String, Vec<Review>>,
+) -> Vec<LogJsonRow<'a>> {
+    let mut out = Vec::new();
+    let mut chunk: Vec<&LogEvent> = Vec::new();
+    for item in items {
+        match item {
+            TimelineItem::Repo(e) => chunk.push(e),
+            TimelineItem::Github(g) => {
+                out.extend(json_rows(&chunk, reviews));
+                chunk.clear();
+                out.push(LogJsonRow::Github {
+                    ts: i64::try_from(g.at).unwrap_or(i64::MAX),
+                    repo: &g.repo,
+                    event: &g.event,
+                    detail: g.detail.as_deref(),
+                    number: g.number,
+                    title: g.title.as_deref(),
+                    actor: g.actor.as_deref(),
+                    url: g.url.as_deref(),
+                    seen_by: &g.seen_by,
+                    unhandled: g.unhandled,
+                });
+            }
+        }
+    }
+    out.extend(json_rows(&chunk, reviews));
+    out
 }
 
 /// The `clank log --json` row sequence — pure, so the review
@@ -704,6 +954,98 @@ fn json_rows<'a>(
 #[cfg(test)]
 mod json_output_tests {
     use super::*;
+
+    fn gh(at: u64, key_hint: &str, unhandled: bool) -> crate::cli::github_timeline::MergedEvent {
+        crate::cli::github_timeline::MergedEvent {
+            at,
+            repo: "o/r".into(),
+            event: "pr_comment".into(),
+            detail: Some("review".into()),
+            number: Some(12),
+            title: Some(key_hint.into()),
+            actor: Some("alice".into()),
+            url: None,
+            seen_by: vec!["claude".into()],
+            unhandled,
+        }
+    }
+
+    fn adhoc(ts: i64, subject: &str) -> LogEvent {
+        use crate::lifecycle::CommitSha;
+        LogEvent::AdHoc {
+            sha: CommitSha::parse(&format!("{:0<40x}", ts.max(1))).unwrap(),
+            ts,
+            subject: subject.into(),
+        }
+    }
+
+    #[test]
+    fn interleave_orders_by_time_and_respects_the_range_floor() {
+        // Commits at ts 100 and 200 (newest first); gh events at 250
+        // (newer than newest — leads), 150 (between), and 50 (older
+        // than the folded range — excluded).
+        let e_new = adhoc(200, "new");
+        let e_old = adhoc(100, "old");
+        let events: Vec<&LogEvent> = vec![&e_new, &e_old];
+        let gh_events = vec![
+            gh(50, "too-old", false),
+            gh(150, "between", false),
+            gh(250, "lead", true),
+        ];
+        let items = interleave(&events, &gh_events);
+        let shape: Vec<&str> = items
+            .iter()
+            .map(|i| match i {
+                TimelineItem::Github(g) => g.title.as_deref().unwrap(),
+                TimelineItem::Repo(LogEvent::AdHoc { subject, .. }) => subject.as_str(),
+                _ => "?",
+            })
+            .collect();
+        assert_eq!(shape, vec!["lead", "new", "between", "old"]);
+        // No commits at all → every gh event shows.
+        let items = interleave(&[], &gh_events);
+        assert_eq!(items.len(), 3);
+    }
+
+    #[test]
+    fn oneline_items_rows_splice_github_rows_for_the_tui() {
+        let e = adhoc(100, "c");
+        let events: Vec<&LogEvent> = vec![&e];
+        let gh_events = vec![gh(150, "arrived", true)];
+        let items = interleave(&events, &gh_events);
+        let reviews = std::collections::BTreeMap::new();
+        let rows = oneline_items_rows(&items, &reviews);
+        assert!(
+            matches!(&rows[0], OnelineRow::Github { unhandled: true, line } if line.contains("o/r#12")),
+            "{rows:?}"
+        );
+        // The repo chunk follows (umbrella header + commit).
+        assert!(rows.iter().any(|r| matches!(r, OnelineRow::Commit { .. })));
+        // Plain lines render the badge + open-work mark.
+        let lines = oneline_plain_lines(&rows);
+        assert!(
+            lines[0].starts_with("gh ") && lines[0].ends_with(" ⚠"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn json_items_splice_typed_github_rows_in_position() {
+        let e = adhoc(100, "c");
+        let events: Vec<&LogEvent> = vec![&e];
+        let gh_events = vec![gh(150, "arrived", true)];
+        let items = interleave(&events, &gh_events);
+        let reviews = std::collections::BTreeMap::new();
+        let rows = json_items(&items, &reviews);
+        let v = serde_json::to_value(&rows).unwrap();
+        assert_eq!(v[0]["kind"], "github_event");
+        assert_eq!(v[0]["ts"], 150);
+        assert_eq!(v[0]["repo"], "o/r");
+        assert_eq!(v[0]["number"], 12);
+        assert_eq!(v[0]["unhandled"], true);
+        assert_eq!(v[0]["seen_by"][0], "claude");
+        assert_eq!(v[1]["kind"], "ad-hoc");
+    }
 
     #[test]
     fn json_rows_attach_reviews_to_adhoc_commits_too() {
