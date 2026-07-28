@@ -5,7 +5,7 @@ use clap::{Parser, Subcommand};
 #[command(
     name = "clank",
     version,
-    about = "Multi-agent peer review around watched artifacts"
+    about = "Multi-agent peer review around plans"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -14,108 +14,166 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Scaffold `.clank/` in a repo (creates `plans/` and `.gitignore`).
+    // ── getting set up ──
+    /// Scaffold `.clank/` in a repo
+    ///
+    /// Creates `plans/` and the managed `.gitignore`, and installs the
+    /// `post-rewrite` hook. `--team <name>` seeds the roster from a
+    /// saved template.
     Init(cli::InitArgs),
-    /// Finish a plan: move its file from `plans/` to `finished/`.
-    Finish(cli::FinishArgs),
-    /// Unfinish a plan: move it back from `finished/` to `plans/`.
-    Unfinish(cli::UnfinishArgs),
-    /// Manage the plan queue.
+    /// Install skills and hooks into ~/.claude, ~/.codex, ~/.grok
+    ///
+    /// User-scope assets: the role-split skill files plus Stop-hook
+    /// entries for the tools with active hooks (claude, codex).
+    /// Re-run after upgrading; `--force` refreshes edited skills.
+    Setup(cli::SetupArgs),
+    /// Check the clank setup across repo, user, and session
+    ///
+    /// Per-section OK / WARN / FAIL with actionable messages. Exits 0
+    /// if everything is OK or WARN; 1 on any FAIL.
+    Doctor(cli::DoctorArgs),
+
+    // ── the daily flow ──
+    /// Show the repo's clank state
+    ///
+    /// HEAD, plans, phases, and the roster. `--watch` renders live,
+    /// `--tui` is the full-screen pane, `-j` emits JSON.
+    Status(cli::StatusArgs),
+    /// Block until this agent has actionable work
+    ///
+    /// Author and role come from the session binding (`clank as`).
+    /// `--peek` probes without blocking; `--for` observes a repo
+    /// instead; `--event` adds ad-hoc wake sources (github repos,
+    /// commands) alongside the agent config's `wait_events`.
+    Wait(cli::WaitArgs),
+    /// Manage the plan queue
+    ///
+    /// `queue add` consumes a draft from `.clank/drafts/`; `promote`
+    /// activates the next plan; `remove` / `reprioritise` curate.
     Queue(cli::QueueArgs),
-    /// Manage THIS repo's agent ROSTER (the operating list):
-    /// `agent add` / `agent promote` / `agent remove` /
-    /// `agent list` / `agent start`. Each agent carries its tool +
-    /// launch profile AND role; `agent add <name>` adds by name from
-    /// the global library, or `--tool` defines one inline.
+    /// Read or write review feedback
+    ///
+    /// A typed surface over the on-disk feedback files: `feedback
+    /// write --commit <sha> --verdict … -m "…"` and `feedback read`.
+    Feedback(cli::FeedbackArgs),
+    /// The github event inbox: list, ack, show
+    ///
+    /// Every github event a wait ingests lands here and re-wakes the
+    /// agent until acked. `list` shows the unhandled backlog, `ack`
+    /// closes items out, `show` prints one full record.
+    Events(cli::EventsArgs),
+    /// Print the repo timeline: commits, reviews, github events
+    ///
+    /// Chronological and newest-first, with github events interleaved
+    /// by their github-side time (`--no-github` to leave them out,
+    /// `--plan` to scope to one plan, `--oneline` / `-j` for compact
+    /// and machine forms).
+    Log(cli::LogArgs),
+    /// Finalize a plan into `finished/`
+    ///
+    /// Runs when the gate says FINISHED; `-m` is required (what
+    /// changed, then why). With `finish.autosquash` the plan's
+    /// commits collapse into one.
+    Finish(cli::FinishArgs),
+    /// Move a finalized plan back to active
+    Unfinish(cli::UnfinishArgs),
+
+    // ── the roster & workspaces ──
+    /// Manage this repo's agent roster
+    ///
+    /// `agent add` / `promote` / `remove` / `list` / `set-review` /
+    /// `start`. Each agent carries its tool + launch profile and
+    /// role; `agent add <name>` pulls from the global library, or
+    /// `--tool` defines one inline.
     Agent(cli::AgentArgs),
-    /// Manage the GLOBAL team-template library (a team is a saved
-    /// roster): `team save` (capture this repo's roster as a
-    /// template) / `team list` / `team show <name>` / `team delete`.
-    /// Seed a repo from a template with `clank init --team <name>`.
+    /// Save and reuse roster templates across repos
+    ///
+    /// `team save` captures this repo's roster; `team list` / `show`
+    /// / `delete` manage the library. Seed a repo with
+    /// `clank init --team <name>`.
     Team(cli::TeamArgs),
-    /// Serialize this repo's self-contained config (the `agents`
-    /// roster) as pretty JSON to stdout. Fail-closed on the old shape
-    /// (re-init hint).
-    Export(cli::ExportArgs),
-    /// Strip a plan's `.clank/` artifacts from history.
-    Purge(cli::PurgeArgs),
-    /// Copy plans (their commits + plan files) from another branch onto
-    /// the current one. The source is never modified; run it where you
-    /// want the plans to land.
-    Pick(cli::PickArgs),
-    /// Launch the configured editor on a plan or commit-range
-    /// diff. See `clank diff --help` for argument shapes.
-    Diff(cli::DiffArgs),
-    /// Set an in-flight plan's commits aside and restore them later,
-    /// with git-stash verbs: `stash push` / `stash pop` / `stash show`
-    /// / `stash drop`; bare `clank stash` lists. `push --to-queue`
-    /// also saves the plan body back to the queue for re-attempt.
+    /// Bind this session to a roster label
+    ///
+    /// Reads the tool's session id from the environment
+    /// (CLAUDE_CODE_SESSION_ID / CODEX_THREAD_ID) and records the
+    /// binding in the agent's local config.
+    As(cli::AsArgs),
+    /// Manage this agent's auto-mode
+    ///
+    /// `auto on|off|status`, with an optional role designation; the
+    /// Stop hook reads it to drive the work loop.
+    Auto(cli::AutoArgs),
+    /// Open the team workspace
+    ///
+    /// Context-aware: the self-managed console in a fresh terminal,
+    /// or a tab when already inside zellij. `open zellij` forces the
+    /// zellij layout; `open dry <path>` classifies without opening.
+    Open(cli::OpenArgs),
+    /// Fork the team into a linked worktree
+    ///
+    /// Creates the worktree with the whole team's sessions forked
+    /// into it (opens a tab when inside zellij).
+    Fork(cli::ForkArgs),
+
+    // ── plan surgery ──
+    /// Set a plan's commits aside and restore them later
+    ///
+    /// git-stash verbs: `stash push` / `pop` / `show` / `drop`; bare
+    /// `clank stash` lists. `push --to-queue` re-queues the plan body
+    /// for a later attempt.
     Stash(cli::StashArgs),
     /// Hidden alias for `clank stash push` (+ `shelve clean` →
     /// `stash drop`). One release of back-compat.
     #[command(hide = true)]
     Shelve(cli::ShelveArgs),
-    /// Create a linked worktree with the whole team's sessions
-    /// forked into it (opens a tab when inside zellij)
-    Fork(cli::ForkArgs),
-    /// Run the multi-agent review loop against a GitHub PR.
-    PrReview(cli::PrReviewArgs),
     /// Hidden alias for `clank stash pop`. One release of back-compat.
     #[command(hide = true)]
     Unshelve(cli::UnshelveArgs),
-    /// Print a chronological timeline of commits and reviews for
-    /// a plan.
-    Log(cli::LogArgs),
-    /// Render the event log + status to a static HTML site at
-    /// `.clank/html/`. Use `clank html open` to build and
-    /// launch the result in your browser.
+    /// Copy plans from another branch
+    ///
+    /// Brings their commits + plan files onto the current branch; the
+    /// source is never modified. Run it where the plans should land.
+    Pick(cli::PickArgs),
+    /// Strip a plan's `.clank/` artifacts from history
+    ///
+    /// `--drop` removes the plan entirely (commits included).
+    Purge(cli::PurgeArgs),
+    /// Run the review loop against a GitHub PR
+    ///
+    /// The team iterates on a shared pending review until it agrees,
+    /// then submits it as one published review.
+    PrReview(cli::PrReviewArgs),
+
+    // ── odds & ends ──
+    /// Open a plan or commit-range diff in your editor
+    Diff(cli::DiffArgs),
+    /// Render the timeline + status to a static site
+    ///
+    /// Writes `.clank/html/`; `clank html open` builds and launches
+    /// it in your browser.
     Html(cli::HtmlArgs),
-    /// Open your agent workspace, context-aware: the self-managed
-    /// console in a fresh terminal, or a zellij tab when you're
-    /// already in a session. `clank open zellij` forces the zellij
-    /// layout; `clank open dry <path>` is the read-only path
-    /// classifier.
-    Open(cli::OpenArgs),
-    /// Rewire feedback files after a rebase / amend. Installed
-    /// as a `post-rewrite` git hook by `clank init`; reads
-    /// old->new SHA pairs from stdin (with --from-stdin).
+    /// Ask the human a blocking question
+    Block(cli::BlockArgs),
+    /// Answer a pending block
+    Unblock(cli::UnblockArgs),
+    /// Read or write clank config values
+    Config(cli::ConfigArgs),
+    /// Dump the repo's roster config as JSON
+    ///
+    /// Pretty-printed to stdout; fails closed on a pre-roster config
+    /// shape with a re-init hint.
+    Export(cli::ExportArgs),
+    /// Remap feedback after a rebase or amend
+    ///
+    /// Installed as the `post-rewrite` git hook by `clank init`;
+    /// reads old→new SHA pairs from stdin with `--from-stdin`.
     Rewire(cli::RewireArgs),
-    /// Print the repo's Clank state (HEAD, plans, phases).
-    Status(cli::StatusArgs),
-    /// Wait-for-work: block until the calling agent has actionable
-    /// work on one of the repo's active plans.
-    Wait(cli::WaitArgs),
-    /// Read / write feedback files via a typed CLI surface (vs.
-    /// editing the on-disk paths directly).
-    Feedback(cli::FeedbackArgs),
-    /// The github event inbox: list logged events, ack handled ones,
-    /// inspect records (github-offline-catchup).
-    Events(cli::EventsArgs),
-    /// Bind the calling agent's session (CLAUDE_CODE_SESSION_ID
-    /// / CODEX_THREAD_ID env var) to a clank label.
-    As(cli::AsArgs),
-    /// Manage this agent's auto-mode (Stop-hook behavior) and
-    /// optional role designation.
-    Auto(cli::AutoArgs),
-    /// Stop-hook adapter: reads HookInput JSON from stdin and
-    /// emits per-tool continuation output. Installed into the
-    /// agent's Stop hook config by `clank setup`; not typically
+    /// The per-tool Stop-hook adapter
+    ///
+    /// Reads HookInput JSON on stdin and emits the tool's
+    /// continuation output. Installed by `clank setup`; not typically
     /// invoked directly.
     StopHook(cli::StopHookArgs),
-    /// Install user-scope clank assets into ~/.claude, ~/.codex,
-    /// and ~/.grok: skill files, plus Stop hook entries for the
-    /// tools with active hooks (claude, codex).
-    Setup(cli::SetupArgs),
-    /// Check that the clank integration is correctly set up
-    /// across repo, user, and current-session scopes. Exits 0
-    /// if everything is OK/Warn; 1 if anything is Fail.
-    Doctor(cli::DoctorArgs),
-    /// Read or write Clank config values.
-    Config(cli::ConfigArgs),
-    /// Create or clean blocks.
-    Block(cli::BlockArgs),
-    /// Answer a pending block.
-    Unblock(cli::UnblockArgs),
 }
 
 #[tokio::main]
