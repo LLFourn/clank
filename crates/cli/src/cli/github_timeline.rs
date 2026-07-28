@@ -47,6 +47,10 @@ pub(crate) struct MergedEvent {
     /// copy is acked (codex 8354e51) — the TUI's open-work marker is
     /// deterministic under mixed ack state.
     pub(crate) unhandled: bool,
+    /// Pre-watch history: true only when EVERY copy is a baseline
+    /// record (codex b1b1d91) — one agent's live copy keeps the entry
+    /// normal, and a live unhandled copy keeps it open.
+    pub(crate) baseline: bool,
 }
 
 /// The typed result of one timeline read: entries plus deduplicated
@@ -73,6 +77,7 @@ struct Copy {
     aliases: Vec<(String, String)>,
     item: WaitItem,
     acked: bool,
+    baseline: bool,
 }
 
 impl Copy {
@@ -143,6 +148,7 @@ pub(crate) fn timeline_snapshot(repo: &Path) -> TimelineSnapshot {
                             aliases,
                             item: r.item,
                             acked: r.acked,
+                            baseline: r.baseline,
                         })
                     }));
                 }
@@ -244,6 +250,7 @@ fn merge(copies: Vec<Copy>) -> Vec<MergedEvent> {
                 url: first(&|i| gh(i).and_then(|g| g.6)),
                 seen_by,
                 unhandled: members.iter().any(|&i| !copies[i].acked),
+                baseline: members.iter().all(|&i| copies[i].baseline),
             };
             (members, merged)
         })
@@ -465,6 +472,41 @@ mod tests {
             "{:?}",
             snap.notices
         );
+    }
+
+    #[test]
+    fn baseline_aggregation_requires_every_copy() {
+        // codex b1b1d91: one agent's cold arm baselines an event
+        // another agent received LIVE — the entry must render normal
+        // (and stay OPEN while the live copy is unhandled), never
+        // dimmed as pre-watch history. All-baseline components dim.
+        let repo = tempdir();
+        let mut a = agent_log(&repo, "alice");
+        a.append_baseline_inbox(Some("feed-1"), None, Some(1_000), &item("o/r", 5, None))
+            .unwrap();
+        let mut b = agent_log(&repo, "bob");
+        let live = b
+            .append_inbox(
+                Transport::Poll,
+                Some("feed-1"),
+                None,
+                Some(1_000),
+                &item("o/r", 5, None),
+            )
+            .unwrap();
+        let e = &timeline_snapshot(&repo).events[0];
+        assert!(!e.baseline, "a live copy keeps the entry normal");
+        assert!(e.unhandled, "…and unhandled live keeps it open");
+        b.append_ack(live).unwrap();
+        let e = &timeline_snapshot(&repo).events[0];
+        assert!(!e.baseline && !e.unhandled, "acked live: normal, closed");
+
+        // A second, all-baseline event dims.
+        a.append_baseline_inbox(Some("feed-2"), None, Some(2_000), &item("o/r", 6, None))
+            .unwrap();
+        let events = timeline_snapshot(&repo).events;
+        let dimmed = events.iter().find(|e| e.number == Some(6)).unwrap();
+        assert!(dimmed.baseline && !dimmed.unhandled);
     }
 
     #[test]

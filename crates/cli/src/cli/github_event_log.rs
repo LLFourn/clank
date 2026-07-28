@@ -98,6 +98,12 @@ enum Record {
         /// to `at` when absent.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         event_at: Option<u64>,
+        /// BORN HANDLED (github-watch-resilience): a pre-watch event
+        /// logged at baseline with its payload for the timeline —
+        /// never backlog, never re-presented, no ack record needed.
+        /// One atomic append per event, like every primary record.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        baseline: bool,
         transport: Transport,
         #[serde(skip_serializing_if = "Option::is_none")]
         feed_id: Option<String>,
@@ -167,6 +173,9 @@ pub(crate) struct EventRow {
     pub(crate) event_at: Option<u64>,
     pub(crate) transport: Transport,
     pub(crate) acked: bool,
+    /// Pre-watch history logged at baseline (born handled).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) baseline: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) feed_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -290,6 +299,21 @@ impl SharedWal {
     ) {
         self.with(|log| {
             log.append_inbox(transport, feed_id, action_key, event_at, item)
+                .map(|_| ())
+        });
+    }
+
+    /// A pre-watch presentable event at baseline: payload kept for
+    /// the timeline, born handled.
+    pub(crate) fn baseline_inbox(
+        &self,
+        feed_id: Option<&str>,
+        action_key: Option<&str>,
+        event_at: Option<u64>,
+        item: &WaitItem,
+    ) {
+        self.with(|log| {
+            log.append_baseline_inbox(feed_id, action_key, event_at, item)
                 .map(|_| ())
         });
     }
@@ -440,6 +464,7 @@ impl EventLog {
                     seq,
                     feed_id,
                     action_key,
+                    baseline,
                     item,
                     ..
                 } => {
@@ -450,7 +475,8 @@ impl EventLog {
                     if let Some(k) = action_key {
                         action_keys.push(k);
                     }
-                    if !acked.contains(&seq) {
+                    // Born-handled baseline records are never backlog.
+                    if !baseline && !acked.contains(&seq) {
                         unhandled.push(InboxEntry { seq, item });
                     }
                 }
@@ -532,6 +558,7 @@ impl EventLog {
                     seq,
                     at,
                     event_at,
+                    baseline,
                     transport,
                     feed_id,
                     action_key,
@@ -544,7 +571,8 @@ impl EventLog {
                     at,
                     event_at,
                     transport,
-                    acked: acked.contains(&seq),
+                    acked: baseline || acked.contains(&seq),
+                    baseline,
                     feed_id,
                     action_key,
                     item,
@@ -648,6 +676,30 @@ impl EventLog {
         event_at: Option<u64>,
         item: &WaitItem,
     ) -> std::io::Result<u64> {
+        self.append_inbox_record(transport, feed_id, action_key, event_at, item, false)
+    }
+
+    /// A pre-watch event at baseline: full payload, BORN HANDLED —
+    /// one atomic append, never backlog (github-watch-resilience).
+    pub(crate) fn append_baseline_inbox(
+        &mut self,
+        feed_id: Option<&str>,
+        action_key: Option<&str>,
+        event_at: Option<u64>,
+        item: &WaitItem,
+    ) -> std::io::Result<u64> {
+        self.append_inbox_record(Transport::Poll, feed_id, action_key, event_at, item, true)
+    }
+
+    fn append_inbox_record(
+        &mut self,
+        transport: Transport,
+        feed_id: Option<&str>,
+        action_key: Option<&str>,
+        event_at: Option<u64>,
+        item: &WaitItem,
+        baseline: bool,
+    ) -> std::io::Result<u64> {
         let Some(seq) = self.next_seq else {
             return Err(std::io::Error::other(
                 "event-log seq namespace exhausted (a record reserves u64::MAX)",
@@ -658,6 +710,7 @@ impl EventLog {
             seq,
             at: now_epoch(),
             event_at,
+            baseline,
             transport,
             feed_id: feed_id.map(str::to_owned),
             action_key: action_key.map(str::to_owned),
@@ -759,7 +812,8 @@ impl EventLog {
             .iter()
             .filter(|l| {
                 matches!(l, Line::Known(r)
-                    if matches!(r.as_ref(), Record::Inbox { seq, .. } if acked.contains(seq)))
+                    if matches!(r.as_ref(), Record::Inbox { seq, baseline, .. }
+                        if *baseline || acked.contains(seq)))
             })
             .count();
         let fold_older = acked_inbox_total.saturating_sub(DISPLAY_CAP);
@@ -784,8 +838,9 @@ impl EventLog {
                     at,
                     ref feed_id,
                     ref action_key,
+                    baseline,
                     ..
-                } if acked.contains(&seq) => {
+                } if baseline || acked.contains(&seq) => {
                     acked_seen += 1;
                     if acked_seen <= fold_older {
                         if feed_id.is_some() || action_key.is_some() {
@@ -1213,6 +1268,63 @@ mod tests {
                 full.len()
             );
         }
+    }
+
+    #[test]
+    fn baseline_inbox_is_born_handled_with_payload() {
+        // github-watch-resilience: pre-watch history keeps its payload
+        // for the timeline but never becomes backlog — one atomic
+        // append, no ack record, warm cursor.
+        let dir = tempdir();
+        let mut log = log_in(&dir);
+        log.append_baseline_inbox(Some("10"), Some("k#1"), Some(500), &item(1))
+            .unwrap();
+        let loaded = log_in(&dir).load();
+        assert!(loaded.warm);
+        assert!(loaded.unhandled.is_empty(), "born handled: never backlog");
+        assert_eq!(loaded.feed_ids, vec!["10".to_string()], "cursor seeded");
+        assert_eq!(loaded.action_keys, vec!["k#1".to_string()]);
+        let rows = log_in(&dir).read_rows().unwrap().unwrap().rows;
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].acked && rows[0].baseline);
+        assert_eq!(rows[0].event_at, Some(500));
+        assert_eq!(rows[0].item, item(1), "payload preserved for display");
+        // Crash-prefix: truncate at every byte — a baseline record can
+        // never surface as presentable-unhandled.
+        let path = dir.join("github-o-r-abcd.jsonl");
+        let full = std::fs::read(&path).unwrap();
+        for cut in 0..=full.len() {
+            std::fs::write(&path, &full[..cut]).unwrap();
+            let l = log_in(&dir).load();
+            assert!(
+                l.unhandled.is_empty(),
+                "prefix {cut} made baseline history presentable"
+            );
+        }
+    }
+
+    #[test]
+    fn baseline_inbox_ages_through_display_retention_without_acks() {
+        let dir = tempdir();
+        let mut log = log_in(&dir);
+        for i in 0..COMPACT_AT {
+            let id = format!("{i}");
+            log.append_baseline_inbox(Some(&id), None, Some(i as u64), &item(i as u64))
+                .unwrap();
+        }
+        log.maybe_compact().unwrap();
+        let rows = log_in(&dir).read_rows().unwrap().unwrap().rows;
+        assert_eq!(rows.len(), DISPLAY_CAP, "handled retention applies");
+        assert!(rows.iter().all(|r| r.baseline && r.acked));
+        let text = std::fs::read_to_string(dir.join("github-o-r-abcd.jsonl")).unwrap();
+        assert!(
+            !text.contains("\"t\":\"ack\""),
+            "born-handled needs no ack records"
+        );
+        // Reload: still no backlog, horizons intact.
+        let loaded = log_in(&dir).load();
+        assert!(loaded.unhandled.is_empty());
+        assert_eq!(loaded.feed_ids.len(), LOG_IDENTITY_CAP);
     }
 
     #[test]

@@ -154,6 +154,19 @@ pub(crate) fn interleave<'a>(
     out
 }
 
+/// The colored `gh` row for one merged event: the WHOLE row dims for
+/// pre-watch (baseline) history — it's context, not team activity —
+/// while live rows get the cyan badge; no-color output keeps the
+/// textual markers (codex c917ba7).
+fn gh_colored_row(g: &crate::cli::github_timeline::MergedEvent, mark: &str) -> String {
+    let line = gh_describe(g);
+    if g.baseline {
+        format!("{DIM}gh {line}{mark}{Z}")
+    } else {
+        format!("{C}gh{Z} {line}{mark}")
+    }
+}
+
 /// One-line description shared by the oneline and human renderers —
 /// mirrors the `clank events` CLI's shape so the two surfaces read
 /// the same.
@@ -248,6 +261,8 @@ pub(crate) fn collect_reviews(
 // ── ANSI ────────────────────────────────────────────────────
 
 const Y: &str = "\x1b[33m";
+/// Dim — pre-watch (baseline) github rows render entirely faint.
+const DIM: &str = "\x1b[2m";
 const C: &str = "\x1b[36m";
 const G: &str = "\x1b[32m";
 const R: &str = "\x1b[31m";
@@ -296,12 +311,17 @@ fn print_human(items: &[TimelineItem], repo: &Path, shas: &[CommitSha]) -> anyho
                     println!();
                 }
                 started = true;
-                let line = gh_describe(g);
-                let mark = if g.unhandled { "  [UNHANDLED]" } else { "" };
-                if c {
-                    println!("{C}gh{Z} {line}{mark}");
+                let mark = if g.unhandled {
+                    "  [UNHANDLED]"
+                } else if g.baseline {
+                    "  (pre-watch)"
                 } else {
-                    println!("gh {line}{mark}");
+                    ""
+                };
+                if c {
+                    println!("{}", gh_colored_row(g, mark));
+                } else {
+                    println!("gh {}{mark}", gh_describe(g));
                 }
                 if !g.seen_by.is_empty() {
                     println!("Seen-by: {}", g.seen_by.join(", "));
@@ -516,8 +536,13 @@ pub(crate) enum OnelineRow {
     },
     /// A merged github event interleaved into the timeline
     /// (log-timeline-github-events); `line` is [`gh_describe`]'s
-    /// shape, shared with the CLI renderers.
-    Github { line: String, unhandled: bool },
+    /// shape, shared with the CLI renderers. `baseline` = pre-watch
+    /// history (rendered dimmed / marked, never open).
+    Github {
+        line: String,
+        unhandled: bool,
+        baseline: bool,
+    },
     /// A timeline-read notice (corrupt/foreign logs) surfaced as a
     /// dim row — the TUI's rendering of the snapshot's notices.
     Notice(String),
@@ -542,6 +567,7 @@ pub(crate) fn oneline_items_rows(
                 out.push(OnelineRow::Github {
                     line: gh_describe(g),
                     unhandled: g.unhandled,
+                    baseline: g.baseline,
                 });
             }
         }
@@ -649,8 +675,19 @@ pub(crate) fn oneline_plain_lines(rows: &[OnelineRow]) -> Vec<String> {
     rows.iter()
         .map(|row| match row {
             OnelineRow::Header { plan } => plan.clone().unwrap_or_else(|| "adhoc".to_string()),
-            OnelineRow::Github { line, unhandled } => {
-                format!("gh {line}{}", if *unhandled { " ⚠" } else { "" })
+            OnelineRow::Github {
+                line,
+                unhandled,
+                baseline,
+            } => {
+                let mark = if *unhandled {
+                    " ⚠"
+                } else if *baseline {
+                    " (pre-watch)"
+                } else {
+                    ""
+                };
+                format!("gh {line}{mark}")
             }
             OnelineRow::Notice(n) => format!("({n})"),
             // The 1-col marker icon LEADS every commit row (finish/impl/
@@ -691,13 +728,18 @@ fn print_oneline(items: &[TimelineItem], repo: &Path, shas: &[CommitSha]) -> any
                 print_oneline_events(&chunk, &reviews, c);
                 chunk.clear();
                 // One row, marker-led like commits; unhandled events
-                // carry the open-work mark.
-                let line = gh_describe(g);
-                let mark = if g.unhandled { " ⚠" } else { "" };
-                if c {
-                    println!("{C}gh{Z} {line}{mark}");
+                // carry the open-work mark, pre-watch history its own.
+                let mark = if g.unhandled {
+                    " ⚠"
+                } else if g.baseline {
+                    " (pre-watch)"
                 } else {
-                    println!("gh {line}{mark}");
+                    ""
+                };
+                if c {
+                    println!("{}", gh_colored_row(g, mark));
+                } else {
+                    println!("gh {}{mark}", gh_describe(g));
                 }
             }
         }
@@ -829,6 +871,7 @@ enum LogJsonRow<'a> {
         url: Option<&'a str>,
         seen_by: &'a [String],
         unhandled: bool,
+        baseline: bool,
     },
 }
 
@@ -865,6 +908,7 @@ fn json_items<'a>(
                     url: g.url.as_deref(),
                     seen_by: &g.seen_by,
                     unhandled: g.unhandled,
+                    baseline: g.baseline,
                 });
             }
         }
@@ -967,6 +1011,7 @@ mod json_output_tests {
             url: None,
             seen_by: vec!["claude".into()],
             unhandled,
+            baseline: false,
         }
     }
 
@@ -1008,6 +1053,31 @@ mod json_output_tests {
     }
 
     #[test]
+    fn baseline_rows_dim_fully_in_color_and_mark_in_plain() {
+        // codex c917ba7: pre-watch history dims the WHOLE row in the
+        // color paths — not just a cyan badge — and keeps the textual
+        // marker without ANSI in plain output.
+        let base = gh(100, "old news", false);
+        let base = crate::cli::github_timeline::MergedEvent {
+            baseline: true,
+            ..base
+        };
+        let colored = gh_colored_row(&base, "  (pre-watch)");
+        assert!(colored.starts_with(DIM), "{colored:?}");
+        assert!(colored.ends_with(Z), "{colored:?}");
+        assert!(
+            !colored.contains(C),
+            "no normal-intensity badge: {colored:?}"
+        );
+        assert!(colored.contains("(pre-watch)"));
+        // A live row keeps the cyan badge and normal text.
+        let live = gh(100, "fresh", true);
+        let colored = gh_colored_row(&live, "  [UNHANDLED]");
+        assert!(colored.starts_with(C), "{colored:?}");
+        assert!(!colored.contains(DIM), "{colored:?}");
+    }
+
+    #[test]
     fn oneline_items_rows_splice_github_rows_for_the_tui() {
         let e = adhoc(100, "c");
         let events: Vec<&LogEvent> = vec![&e];
@@ -1016,7 +1086,7 @@ mod json_output_tests {
         let reviews = std::collections::BTreeMap::new();
         let rows = oneline_items_rows(&items, &reviews);
         assert!(
-            matches!(&rows[0], OnelineRow::Github { unhandled: true, line } if line.contains("o/r#12")),
+            matches!(&rows[0], OnelineRow::Github { unhandled: true, line, .. } if line.contains("o/r#12")),
             "{rows:?}"
         );
         // The repo chunk follows (umbrella header + commit).

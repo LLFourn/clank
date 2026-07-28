@@ -759,6 +759,7 @@ impl TokenCell {
 
 /// A minimal response the session yields — our own shape so the
 /// transport is injectable in tests without fabricating reqwest types.
+#[derive(Debug)]
 pub(crate) struct MiniResponse {
     pub(crate) status: u16,
     pub(crate) headers: std::collections::BTreeMap<String, String>,
@@ -839,6 +840,31 @@ pub(crate) struct GithubSession<S> {
     http: S,
     token: TokenCell,
     acquire: AcquireFn,
+    /// Application-level deadlines at the OWNERSHIP boundary
+    /// (github-watch-resilience): they bound ANY `HttpSend` and ANY
+    /// acquire — not just the production reqwest/gh ones — so a
+    /// wedged connection or hung subprocess becomes a tick error the
+    /// poll loop retries, never a forever-await that silently kills
+    /// one source while its siblings tick on.
+    send_timeout: std::time::Duration,
+    acquire_timeout: std::time::Duration,
+}
+
+/// Default deadline for one HTTP send. Ticks are 60s+; this can never
+/// overlap the next tick.
+const SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Default deadline for one token acquisition (`gh auth token`).
+const ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// The production client: transport-level belt UNDER the session's
+/// application deadline (connect + total request bounds).
+fn github_client_with(connect: std::time::Duration, total: std::time::Duration) -> reqwest::Client {
+    reqwest::Client::builder()
+        .user_agent("clank")
+        .connect_timeout(connect)
+        .timeout(total)
+        .build()
+        .expect("static client config")
 }
 
 /// The github.com session, created on first use (host-scoped: one per
@@ -849,14 +875,14 @@ pub(crate) fn shared_session() -> std::sync::Arc<GithubSession<ReqwestSend>> {
     SESSION
         .get_or_init(|| {
             std::sync::Arc::new(GithubSession {
-                http: ReqwestSend(
-                    reqwest::Client::builder()
-                        .user_agent("clank")
-                        .build()
-                        .expect("static client config"),
-                ),
+                http: ReqwestSend(github_client_with(
+                    std::time::Duration::from_secs(10),
+                    SEND_TIMEOUT,
+                )),
                 token: TokenCell::new(),
                 acquire: || Box::pin(acquire_github_token()),
+                send_timeout: SEND_TIMEOUT,
+                acquire_timeout: ACQUIRE_TIMEOUT,
             })
         })
         .clone()
@@ -874,20 +900,65 @@ impl<S: HttpSend> GithubSession<S> {
             http,
             token: TokenCell::new(),
             acquire,
+            send_timeout: SEND_TIMEOUT,
+            acquire_timeout: ACQUIRE_TIMEOUT,
         }
     }
 
-    /// Authorized GET with the uniform 401 handling.
+    /// Test knob for paused-clock deadline proofs.
+    #[cfg(test)]
+    fn with_timeouts(mut self, send: std::time::Duration, acquire: std::time::Duration) -> Self {
+        self.send_timeout = send;
+        self.acquire_timeout = acquire;
+        self
+    }
+
+    /// One acquisition under the deadline. Timing out DROPS the
+    /// acquire future — the `gh auth token` child dies by its
+    /// `kill_on_drop` config, never outliving the deadline.
+    async fn token_within_deadline(&self) -> anyhow::Result<String> {
+        match tokio::time::timeout(
+            self.acquire_timeout,
+            self.token.get_or_acquire(self.acquire),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => anyhow::bail!(
+                "github token acquisition timed out after {}s",
+                self.acquire_timeout.as_secs()
+            ),
+        }
+    }
+
+    /// One send under the deadline.
+    async fn send_within_deadline(
+        &self,
+        url: &str,
+        token: &str,
+        etag: Option<&str>,
+    ) -> anyhow::Result<MiniResponse> {
+        match tokio::time::timeout(self.send_timeout, self.http.send(url, token, etag)).await {
+            Ok(r) => r,
+            Err(_) => anyhow::bail!(
+                "github {url}: request timed out after {}s",
+                self.send_timeout.as_secs()
+            ),
+        }
+    }
+
+    /// Authorized GET with the uniform 401 handling, every await
+    /// bounded (github-watch-resilience).
     async fn get(&self, url: &str, etag: Option<&str>) -> anyhow::Result<MiniResponse> {
-        let token = self.token.get_or_acquire(self.acquire).await?;
-        let resp = self.http.send(url, &token, etag).await?;
+        let token = self.token_within_deadline().await?;
+        let resp = self.send_within_deadline(url, &token, etag).await?;
         if resp.status != 401 {
             return Ok(resp);
         }
         // The token rotated: re-acquire and retry exactly once.
         self.token.invalidate().await;
-        let token = self.token.get_or_acquire(self.acquire).await?;
-        let resp = self.http.send(url, &token, etag).await?;
+        let token = self.token_within_deadline().await?;
+        let resp = self.send_within_deadline(url, &token, etag).await?;
         if resp.status == 401 {
             anyhow::bail!("github {url}: 401 after token re-acquisition");
         }
@@ -1338,13 +1409,16 @@ impl Coordinator {
         self.gate(c, crate::cli::github_event_log::Transport::Poll)
     }
 
-    /// The BASELINE poll's actions: seed the gate, emit nothing (each
-    /// action's durable record is a baseline observation), then drain
-    /// any pre-baseline relay backlog through the gate (pre-seeded
-    /// keys drop; genuinely-new actions emit once).
+    /// The BASELINE poll's actions: seed the gate, emit nothing —
+    /// each action's durable record keeps its PAYLOAD as a
+    /// born-handled baseline inbox record so the timeline can show
+    /// pre-watch history (github-watch-resilience) — then drain any
+    /// pre-baseline relay backlog through the gate (pre-seeded keys
+    /// drop; genuinely-new actions emit once).
     pub(crate) fn baseline(&mut self, baseline: Vec<Classified>) -> bool {
         for c in baseline {
-            self.wal.obs(c.feed_id.as_deref(), c.key.as_deref(), true);
+            self.wal
+                .baseline_inbox(c.feed_id.as_deref(), c.key.as_deref(), c.event_at, &c.item);
             self.keys.extend(c.key);
         }
         self.baseline_done = true;
@@ -2772,6 +2846,170 @@ mod tests {
         }
         assert_eq!(got.len(), RELAY_BUFFER_CAP, "bounded backlog");
         assert_eq!(*got.first().unwrap(), 3, "oldest dropped first");
+    }
+
+    // ── bounded transport: deadlines at the ownership boundary ──
+
+    /// Hangs on the FIRST send forever; later sends return 200 with
+    /// one page of nothing. The call counter is shared with the test.
+    struct HangFirstHttp {
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl HttpSend for HangFirstHttp {
+        async fn send(
+            &self,
+            _url: &str,
+            _bearer: &str,
+            _etag: Option<&str>,
+        ) -> anyhow::Result<MiniResponse> {
+            if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                std::future::pending::<()>().await;
+            }
+            Ok(MiniResponse {
+                status: 200,
+                headers: Default::default(),
+                body: "[]".to_string(),
+            })
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hung_send_fails_the_tick_and_the_next_tick_proceeds() {
+        // github-watch-resilience: the deadline is the SESSION's, so a
+        // hung HttpSend (which bypasses any reqwest limit) still
+        // becomes a bounded tick error, and the loop's next tick
+        // recovers — no source-task ever awaits forever.
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let session = std::sync::Arc::new(
+            GithubSession::for_tests(
+                HangFirstHttp {
+                    calls: calls.clone(),
+                },
+                || Box::pin(async { Ok("tok".to_string()) }),
+            )
+            .with_timeouts(
+                std::time::Duration::from_secs(30),
+                std::time::Duration::from_secs(15),
+            ),
+        );
+        let fetcher = GhFetcher {
+            repo: "o/r".to_string(),
+            session: session.clone(),
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let s = src(&[GithubEventKind::IssueOpened], true);
+        let run = tokio::spawn(async move {
+            poll_loop(&s, &FixedLogin("me"), &fetcher, &tx, None, None).await;
+        });
+        // Tick 1 hangs → times out at 30s; the loop sleeps the
+        // interval and tick 2's send succeeds (empty baseline). Give
+        // the paused clock several minutes of virtual time.
+        tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+        assert!(
+            calls.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "the loop must reach a SECOND send after the hung first one"
+        );
+        assert!(rx.try_recv().is_err(), "empty feed emits nothing");
+        run.abort();
+        let _ = run.await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hung_acquire_fails_within_its_bound() {
+        let session = GithubSession::for_tests(ScriptHttp::new(&[]), || {
+            Box::pin(async {
+                std::future::pending::<()>().await;
+                unreachable!()
+            })
+        })
+        .with_timeouts(
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(15),
+        );
+        let start = tokio::time::Instant::now();
+        let err = session
+            .get("https://api.github.com/x", None)
+            .await
+            .expect_err("hung acquire must not hang the get");
+        assert!(
+            err.to_string().contains("token acquisition timed out"),
+            "{err}"
+        );
+        assert_eq!(
+            start.elapsed(),
+            std::time::Duration::from_secs(15),
+            "bounded at exactly the acquire deadline (paused clock)"
+        );
+    }
+
+    /// Set-on-drop probe: the deadline must CANCEL (drop) the owned
+    /// acquire future — production's `kill_on_drop` on the gh child
+    /// rides exactly that drop, so the drop IS the invariant to pin
+    /// (codex 78d6592: no external binaries, no unix-only kill).
+    static ACQUIRE_DROPPED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    fn hanging_probed_acquire()
+    -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<String>> + Send>> {
+        struct Probe;
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                ACQUIRE_DROPPED.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        Box::pin(async {
+            let _probe = Probe;
+            std::future::pending::<()>().await;
+            unreachable!()
+        })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timed_out_acquire_drops_the_owned_future() {
+        let session = GithubSession::for_tests(ScriptHttp::new(&[]), hanging_probed_acquire)
+            .with_timeouts(
+                std::time::Duration::from_secs(30),
+                std::time::Duration::from_secs(15),
+            );
+        let err = session
+            .get("https://api.github.com/x", None)
+            .await
+            .expect_err("hung acquire must time out");
+        assert!(err.to_string().contains("timed out"), "{err}");
+        assert!(
+            ACQUIRE_DROPPED.load(std::sync::atomic::Ordering::SeqCst),
+            "the deadline must drop the acquire future (kill_on_drop rides this)"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn real_client_config_bounds_a_tarpit() {
+        // The transport belt: the SAME builder wiring production uses
+        // (github_client_with) must error against a listener that
+        // accepts and never responds — proven with short bounds so the
+        // test runs in real time. The tarpit is an OWNED task, aborted
+        // and awaited afterward so no thread, socket, or descriptor
+        // outlives the test (codex 78d6592).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hold = tokio::spawn(async move {
+            // Accept one connection and hold it open, never respond.
+            let _conn = listener.accept().await;
+            std::future::pending::<()>().await
+        });
+        let client = github_client_with(
+            std::time::Duration::from_millis(200),
+            std::time::Duration::from_millis(400),
+        );
+        let start = std::time::Instant::now();
+        let err = client
+            .get(format!("http://{addr}/events"))
+            .send()
+            .await
+            .expect_err("tarpit must not hang the configured client");
+        assert!(start.elapsed() < std::time::Duration::from_secs(5), "{err}");
+        hold.abort();
+        let _ = hold.await;
     }
 
     // ── session auth: sharing + uniform 401 recovery ──────────

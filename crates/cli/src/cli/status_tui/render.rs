@@ -566,8 +566,18 @@ pub(super) fn log_row_spans(
         // A merged github event in the timeline: cyan `gh` badge, the
         // shared describe line, and the open-work mark while any
         // agent's copy is unhandled (log-timeline-github-events).
-        OnelineRow::Github { line, unhandled } => {
-            let mut spans = vec![colored("36", "gh".to_string()), plain(format!(" {line}"))];
+        OnelineRow::Github {
+            line,
+            unhandled,
+            baseline,
+        } => {
+            // Pre-watch history renders fully DIM — it's context, not
+            // team activity (github-watch-resilience).
+            let mut spans = if *baseline {
+                vec![dim(format!("gh {line} (pre-watch)"))]
+            } else {
+                vec![colored("36", "gh".to_string()), plain(format!(" {line}"))]
+            };
             if *unhandled {
                 spans.push(colored("33", " ⚠".to_string()));
             }
