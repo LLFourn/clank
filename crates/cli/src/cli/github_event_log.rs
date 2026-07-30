@@ -122,8 +122,18 @@ enum Record {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         baseline: bool,
     },
-    /// Secondary: marks an inbox seq handled.
-    Ack { v: u64, seq: u64, at: u64 },
+    /// Secondary: marks an inbox seq handled. A PLAIN ack (no
+    /// `ident`) covers every row of its seq; a DISCRIMINATED ack
+    /// covers exactly the rows whose logical identity equals `ident`
+    /// (wal-single-ingest-writer: damaged logs can hold two DIFFERENT
+    /// events at one seq). Additive field — v stays 1.
+    Ack {
+        v: u64,
+        seq: u64,
+        at: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ident: Option<String>,
+    },
 }
 
 impl Record {
@@ -132,6 +142,41 @@ impl Record {
             Record::Inbox { v, .. } | Record::Obs { v, .. } | Record::Ack { v, .. } => *v,
         }
     }
+}
+
+/// The CANONICAL logical identity of an inbox row — one definition
+/// shared by fold, read_rows, the events resolver, and compaction
+/// (wal-single-ingest-writer; no consumer may reimplement this
+/// seq-keyed). Action-key first: that is the coordinator's
+/// cross-transport contract (a poll copy carries both identities, its
+/// relay twin only the key). Identity-less rows hash their COMPLETE
+/// logical content — rows identical across all of it form one
+/// indistinguishable occurrence group by construction.
+pub(crate) fn logical_ident(
+    feed_id: Option<&str>,
+    action_key: Option<&str>,
+    event_at: Option<u64>,
+    transport: Transport,
+    item: &WaitItem,
+) -> String {
+    if let Some(k) = action_key {
+        return format!("k:{k}");
+    }
+    if let Some(f) = feed_id {
+        return format!("f:{f}");
+    }
+    // blake3 over the serialized complete content: the discriminator
+    // is a CORRECTNESS selector over user-controlled content, so it
+    // must be collision-resistant — a collision would silently merge
+    // and jointly acknowledge distinct events (codex 20cdd09).
+    let content = serde_json::to_string(&(item, event_at, transport)).unwrap_or_default();
+    let hex = blake3::hash(content.as_bytes()).to_hex();
+    format!("h:{}", &hex.as_str()[..32])
+}
+
+/// The one ack-selector matcher: does this ack cover a row?
+fn ack_covers(ack_seq: u64, ack_ident: Option<&str>, row_seq: u64, row_ident: &str) -> bool {
+    ack_seq == row_seq && ack_ident.is_none_or(|i| i == row_ident)
 }
 
 /// Cache metadata sidecar — NEVER load-bearing for at-least-once.
@@ -148,6 +193,9 @@ struct StateFile {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct InboxEntry {
     pub(crate) seq: u64,
+    /// The row's canonical logical identity — takeover suppression is
+    /// keyed on (seq, ident), never seq alone (codex 20cdd09).
+    pub(crate) ident: String,
     pub(crate) item: WaitItem,
 }
 
@@ -176,6 +224,9 @@ pub(crate) struct EventRow {
     /// Pre-watch history logged at baseline (born handled).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) baseline: bool,
+    /// The row's canonical logical identity ([`logical_ident`]) — the
+    /// discriminator targeted acks use.
+    pub(crate) ident: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) feed_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -245,6 +296,48 @@ impl SidecarLock {
     }
 }
 // flock releases with the fd on drop; no explicit LOCK_UN needed.
+
+/// The per-source INGEST LEASE (wal-single-ingest-writer): exactly one
+/// process may run a source's transports (polling AND the realtime
+/// relay) and append its primary records. Exclusive, NON-blocking —
+/// a second wait finding it held tails the WAL instead of ingesting.
+/// flock dies with the process, so a killed holder frees the lease
+/// with no cleanup protocol. Distinct from the append/compaction data
+/// lock: this is about ingest exclusivity, not I/O atomicity.
+pub(crate) struct IngestLease {
+    _file: std::fs::File,
+}
+
+impl IngestLease {
+    /// `Ok(None)` = CONTENDED (another live process holds the lease —
+    /// strictly EWOULDBLOCK); any other failure is a real error the
+    /// caller must handle distinctly (codex 8bf682e: an unopenable
+    /// dir must not read as "someone else is ingesting" and strand a
+    /// tailer forever).
+    pub(crate) fn try_acquire(
+        events_dir: &Path,
+        source_key: &str,
+    ) -> std::io::Result<Option<IngestLease>> {
+        std::fs::create_dir_all(events_dir)?;
+        let path = events_dir.join(format!("{source_key}.ingest.lock"));
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)?;
+        // SAFETY: valid owned fd; flock has no memory effects.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 {
+            return Ok(Some(IngestLease { _file: file }));
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::WouldBlock {
+            return Ok(None);
+        }
+        Err(err)
+    }
+}
 
 /// The ingest-side WAL handle shared between the poll loop and the
 /// coordinator's emission gate (both live on one task; the Mutex is
@@ -434,15 +527,35 @@ impl EventLog {
     /// exactly their envelope: the `seq` reservation and a count for
     /// the caller's one warning — never horizons or backlog.
     fn fold(lines_in: Vec<Line>) -> FoldOut {
-        let mut acked = std::collections::HashSet::new();
+        // All ack selectors up front — coverage is answered ONLY by
+        // the shared matcher (wal-single-ingest-writer).
+        let mut acks: Vec<(u64, Option<String>)> = Vec::new();
         for l in &lines_in {
             if let Line::Known(r) = l
-                && let Record::Ack { seq, .. } = r.as_ref()
+                && let Record::Ack { seq, ident, .. } = r.as_ref()
             {
-                acked.insert(*seq);
+                acks.push((*seq, ident.clone()));
             }
         }
-        let mut unhandled = Vec::new();
+        // (seq, ident) is the first-class event key: physical rows
+        // GROUP under it — identities union into the horizons
+        // (whichever copy carried them), baseline aggregates over ALL
+        // copies, and one live uncovered copy keeps the group open.
+        // First-occurrence skipping would be append-order dependent
+        // (codex 20cdd09: a baseline copy first must not hide a live
+        // copy; a relay copy first must not lose its poll twin's
+        // feed id).
+        struct Group {
+            seq: u64,
+            ident: String,
+            item: WaitItem,
+            all_baseline: bool,
+        }
+        let mut groups: Vec<Group> = Vec::new();
+        let mut by_key: std::collections::HashMap<(u64, String), usize> =
+            std::collections::HashMap::new();
+        let mut pushed_ids: std::collections::HashSet<(usize, String)> =
+            std::collections::HashSet::new();
         let mut feed_ids = Vec::new();
         let mut action_keys = Vec::new();
         let mut max_seq = 0u64;
@@ -465,19 +578,40 @@ impl EventLog {
                     feed_id,
                     action_key,
                     baseline,
+                    event_at,
+                    transport,
                     item,
                     ..
                 } => {
                     max_seq = max_seq.max(seq);
-                    if let Some(id) = feed_id {
+                    let ident = logical_ident(
+                        feed_id.as_deref(),
+                        action_key.as_deref(),
+                        event_at,
+                        transport,
+                        &item,
+                    );
+                    let gi = *by_key.entry((seq, ident.clone())).or_insert_with(|| {
+                        groups.push(Group {
+                            seq,
+                            ident,
+                            item,
+                            all_baseline: true,
+                        });
+                        groups.len() - 1
+                    });
+                    groups[gi].all_baseline &= baseline;
+                    // Union of durable identities, deduped per group,
+                    // in encounter order.
+                    if let Some(id) = feed_id
+                        && pushed_ids.insert((gi, format!("f{id}")))
+                    {
                         feed_ids.push(id);
                     }
-                    if let Some(k) = action_key {
+                    if let Some(k) = action_key
+                        && pushed_ids.insert((gi, format!("k{k}")))
+                    {
                         action_keys.push(k);
-                    }
-                    // Born-handled baseline records are never backlog.
-                    if !baseline && !acked.contains(&seq) {
-                        unhandled.push(InboxEntry { seq, item });
                     }
                 }
                 Record::Obs {
@@ -495,6 +629,20 @@ impl EventLog {
                 Record::Ack { .. } => {}
             }
         }
+        let mut unhandled: Vec<InboxEntry> = groups
+            .into_iter()
+            .filter(|g| {
+                let covered = acks
+                    .iter()
+                    .any(|(a, i)| ack_covers(*a, i.as_deref(), g.seq, &g.ident));
+                !g.all_baseline && !covered
+            })
+            .map(|g| InboxEntry {
+                seq: g.seq,
+                ident: g.ident,
+                item: g.item,
+            })
+            .collect();
         unhandled.sort_by_key(|e| e.seq);
         let cap_tail = |v: &mut Vec<String>| {
             if v.len() > LOG_IDENTITY_CAP {
@@ -537,11 +685,11 @@ impl EventLog {
         let Ok(lines_in) = Self::parse(&text) else {
             return Ok(None);
         };
-        let acked: std::collections::HashSet<u64> = lines_in
+        let acks: Vec<(u64, Option<String>)> = lines_in
             .iter()
             .filter_map(|l| match l {
                 Line::Known(r) => match r.as_ref() {
-                    Record::Ack { seq, .. } => Some(*seq),
+                    Record::Ack { seq, ident, .. } => Some((*seq, ident.clone())),
                     _ => None,
                 },
                 _ => None,
@@ -551,7 +699,13 @@ impl EventLog {
             .iter()
             .filter(|l| matches!(l, Line::Foreign { .. }))
             .count();
-        let mut rows = Vec::new();
+        // Grouped by the (seq, ident) event key like fold: one display
+        // row per logical event, identities unioned (first Some wins),
+        // baseline aggregated over all copies, acked only when
+        // baseline-aggregate or matcher-covered (codex 20cdd09).
+        let mut by_key: std::collections::HashMap<(u64, String), usize> =
+            std::collections::HashMap::new();
+        let mut rows: Vec<EventRow> = Vec::new();
         for l in lines_in {
             if let Line::Known(r) = l
                 && let Record::Inbox {
@@ -566,18 +720,50 @@ impl EventLog {
                     ..
                 } = *r
             {
-                rows.push(EventRow {
-                    seq,
-                    at,
+                let ident = logical_ident(
+                    feed_id.as_deref(),
+                    action_key.as_deref(),
                     event_at,
                     transport,
-                    acked: baseline || acked.contains(&seq),
-                    baseline,
-                    feed_id,
-                    action_key,
-                    item,
-                });
+                    &item,
+                );
+                match by_key.entry((seq, ident.clone())) {
+                    std::collections::hash_map::Entry::Vacant(v) => {
+                        v.insert(rows.len());
+                        rows.push(EventRow {
+                            seq,
+                            at,
+                            event_at,
+                            transport,
+                            acked: false, // resolved below
+                            baseline,
+                            ident,
+                            feed_id,
+                            action_key,
+                            item,
+                        });
+                    }
+                    std::collections::hash_map::Entry::Occupied(o) => {
+                        let row = &mut rows[*o.get()];
+                        row.baseline &= baseline;
+                        if row.feed_id.is_none() {
+                            row.feed_id = feed_id;
+                        }
+                        if row.action_key.is_none() {
+                            row.action_key = action_key;
+                        }
+                        if row.event_at.is_none() {
+                            row.event_at = event_at;
+                        }
+                    }
+                }
             }
+        }
+        for row in &mut rows {
+            let covered = acks
+                .iter()
+                .any(|(a, i)| ack_covers(*a, i.as_deref(), row.seq, &row.ident));
+            row.acked = row.baseline || covered;
         }
         rows.sort_by_key(|r| r.seq);
         Ok(Some(ReadRows { rows, foreign }))
@@ -739,10 +925,21 @@ impl EventLog {
     }
 
     pub(crate) fn append_ack(&mut self, seq: u64) -> std::io::Result<()> {
+        self.append_ack_selector(seq, None)
+    }
+
+    /// A DISCRIMINATED ack: covers only rows whose logical identity
+    /// equals `ident` (damaged same-seq-distinct-events logs).
+    pub(crate) fn append_ack_ident(&mut self, seq: u64, ident: &str) -> std::io::Result<()> {
+        self.append_ack_selector(seq, Some(ident))
+    }
+
+    fn append_ack_selector(&mut self, seq: u64, ident: Option<&str>) -> std::io::Result<()> {
         self.append(&Record::Ack {
             v: CURRENT_V,
             seq,
             at: now_epoch(),
+            ident: ident.map(str::to_owned),
         })
     }
 
@@ -790,39 +987,36 @@ impl EventLog {
             // Corruption is load's problem; don't compound it here.
             return Ok(0);
         };
-        let acked: std::collections::HashSet<u64> = lines_in
+        // Coverage is answered ONLY by the shared matcher over the
+        // canonical identity — never seq-keyed (codex 77b5d97: a
+        // discriminated ack against two colliding rows must handle
+        // exactly its row, through rewrite and reload).
+        let acks: Vec<(u64, Option<String>, Record)> = lines_in
             .iter()
             .filter_map(|l| match l {
                 Line::Known(r) => match r.as_ref() {
-                    Record::Ack { seq, .. } => Some(*seq),
+                    Record::Ack { seq, ident, .. } => Some((*seq, ident.clone(), (**r).clone())),
                     _ => None,
                 },
                 _ => None,
             })
             .collect();
-        // Identity-bearing records, oldest→newest, folded to (feed_id,
-        // action_key, at, baseline) — keep only the newest cap.
-        // Handled inbox records split at the presentation bound
-        // (log-timeline-github-events): the newest DISPLAY_CAP stay
-        // VERBATIM — with their ack records, or a reload would
-        // re-present them as unhandled — while older ones fold to
-        // identity observations. Two passes: count acked inbox first
-        // so the split point is known when walking in order.
-        let acked_inbox_total = lines_in
-            .iter()
-            .filter(|l| {
-                matches!(l, Line::Known(r)
-                    if matches!(r.as_ref(), Record::Inbox { seq, baseline, .. }
-                        if *baseline || acked.contains(seq)))
-            })
-            .count();
-        let fold_older = acked_inbox_total.saturating_sub(DISPLAY_CAP);
-        let mut acked_seen = 0usize;
-        let mut identities: Vec<(Option<String>, Option<String>, u64, bool)> = Vec::new();
-        let mut unhandled: Vec<Record> = Vec::new();
-        let mut retained_handled: Vec<Record> = Vec::new();
-        let mut ack_records: std::collections::HashMap<u64, Record> =
+        // Pass 1: GROUP physical rows by the (seq, ident) event key —
+        // the same grouped state fold builds (codex 20cdd09). Every
+        // physical row of a kept group is rewritten VERBATIM (the
+        // read side re-groups), so no copy's identities are lost;
+        // folded groups contribute the UNION of their copies'
+        // identities.
+        struct CGroup {
+            seq: u64,
+            ident: String,
+            rows: Vec<Record>,
+            all_baseline: bool,
+        }
+        let mut cgroups: Vec<CGroup> = Vec::new();
+        let mut by_key: std::collections::HashMap<(u64, String), usize> =
             std::collections::HashMap::new();
+        let mut identities: Vec<(Option<String>, Option<String>, u64, bool)> = Vec::new();
         let mut foreign: Vec<(String, Option<u64>)> = Vec::new();
         for l in lines_in {
             let r = match l {
@@ -835,22 +1029,33 @@ impl EventLog {
             match r {
                 Record::Inbox {
                     seq,
-                    at,
                     ref feed_id,
                     ref action_key,
+                    event_at,
+                    transport,
                     baseline,
+                    ref item,
                     ..
-                } if baseline || acked.contains(&seq) => {
-                    acked_seen += 1;
-                    if acked_seen <= fold_older {
-                        if feed_id.is_some() || action_key.is_some() {
-                            identities.push((feed_id.clone(), action_key.clone(), at, false));
-                        }
-                    } else {
-                        retained_handled.push(r);
-                    }
+                } => {
+                    let ident = logical_ident(
+                        feed_id.as_deref(),
+                        action_key.as_deref(),
+                        event_at,
+                        transport,
+                        item,
+                    );
+                    let gi = *by_key.entry((seq, ident.clone())).or_insert_with(|| {
+                        cgroups.push(CGroup {
+                            seq,
+                            ident,
+                            rows: Vec::new(),
+                            all_baseline: true,
+                        });
+                        cgroups.len() - 1
+                    });
+                    cgroups[gi].all_baseline &= baseline;
+                    cgroups[gi].rows.push(r);
                 }
-                Record::Inbox { .. } => unhandled.push(r),
                 Record::Obs {
                     feed_id,
                     action_key,
@@ -862,10 +1067,71 @@ impl EventLog {
                         identities.push((feed_id, action_key, at, baseline));
                     }
                 }
-                Record::Ack { seq, .. } => {
-                    // Keep the FIRST ack per seq for retained pairs.
-                    ack_records.entry(seq).or_insert(r);
+                Record::Ack { .. } => {}
+            }
+        }
+        let covered = |g: &CGroup| {
+            acks.iter()
+                .any(|(a, i, _)| ack_covers(*a, i.as_deref(), g.seq, &g.ident))
+        };
+        let handled: Vec<usize> = (0..cgroups.len())
+            .filter(|&i| cgroups[i].all_baseline || covered(&cgroups[i]))
+            .collect();
+        // Presentation split (log-timeline-github-events): the newest
+        // DISPLAY_CAP handled GROUPS stay verbatim; older ones fold to
+        // the union of their copies' identity observations.
+        let fold_older = handled.len().saturating_sub(DISPLAY_CAP);
+        let mut retained: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        for (rank, &gi) in handled.iter().enumerate() {
+            if rank < fold_older {
+                for r in &cgroups[gi].rows {
+                    if let Record::Inbox {
+                        at,
+                        feed_id,
+                        action_key,
+                        ..
+                    } = r
+                        && (feed_id.is_some() || action_key.is_some())
+                    {
+                        identities.push((feed_id.clone(), action_key.clone(), *at, false));
+                    }
                 }
+            } else {
+                retained.insert(gi);
+            }
+        }
+        let handled_set: std::collections::HashSet<usize> = handled.iter().copied().collect();
+        // Kept records: every physical row of unhandled groups and of
+        // retained handled groups, in original group order.
+        let mut unhandled: Vec<Record> = Vec::new();
+        let mut retained_handled: Vec<(Record, String, bool)> = Vec::new();
+        for (gi, g) in cgroups.iter().enumerate() {
+            if !handled_set.contains(&gi) {
+                unhandled.extend(g.rows.iter().cloned());
+            } else if retained.contains(&gi) {
+                for r in &g.rows {
+                    retained_handled.push((r.clone(), g.ident.clone(), g.all_baseline));
+                }
+            }
+        }
+        // Ack retention through the SAME matcher: every ack that
+        // covers a retained non-baseline handled group survives the
+        // rewrite (deduped by selector); acks whose groups folded or
+        // never existed are dropped.
+        let mut kept_acks: Vec<Record> = Vec::new();
+        let mut seen_selectors: std::collections::HashSet<(u64, Option<String>)> =
+            std::collections::HashSet::new();
+        for (a_seq, a_ident, rec) in &acks {
+            if !seen_selectors.insert((*a_seq, a_ident.clone())) {
+                continue;
+            }
+            let needed = cgroups.iter().enumerate().any(|(gi, g)| {
+                retained.contains(&gi)
+                    && !g.all_baseline
+                    && ack_covers(*a_seq, a_ident.as_deref(), g.seq, &g.ident)
+            });
+            if needed {
+                kept_acks.push(rec.clone());
             }
         }
         // Foreign retention: EXACTLY the newest LOG_IDENTITY_CAP
@@ -923,18 +1189,15 @@ impl EventLog {
             out.push('\n');
             kept_lines += 1;
         }
-        for rec in &retained_handled {
+        for (rec, _, _) in &retained_handled {
             out.push_str(&serde_json::to_string(rec).map_err(std::io::Error::other)?);
             out.push('\n');
             kept_lines += 1;
-            let Record::Inbox { seq, .. } = rec else {
-                unreachable!("retained_handled holds only inbox records");
-            };
-            if let Some(ack) = ack_records.get(seq) {
-                out.push_str(&serde_json::to_string(ack).map_err(std::io::Error::other)?);
-                out.push('\n');
-                kept_lines += 1;
-            }
+        }
+        for ack in &kept_acks {
+            out.push_str(&serde_json::to_string(ack).map_err(std::io::Error::other)?);
+            out.push('\n');
+            kept_lines += 1;
         }
         for (raw, _) in kept_foreign {
             out.push_str(raw);
@@ -1268,6 +1531,227 @@ mod tests {
                 full.len()
             );
         }
+    }
+
+    // ── damaged logs: the shared identity model (wal-single-ingest-writer) ──
+
+    /// Append a raw duplicate of an existing line (the duplicate-
+    /// writer field shape: same seq re-allocated by a second process).
+    fn duplicate_line_with(dir: &Path, replace: &[(&str, &str)]) {
+        let path = dir.join("github-o-r-abcd.jsonl");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let mut line = text.lines().last().unwrap().to_string();
+        for (from, to) in replace {
+            line = line.replace(from, to);
+        }
+        std::fs::write(&path, format!("{text}{line}\n")).unwrap();
+    }
+
+    #[test]
+    fn field_shape_same_seq_same_event_collapses_and_plain_acks() {
+        // The fsctl report: two inbox rows, same seq, same feed_id.
+        let dir = tempdir();
+        let mut log = log_in(&dir);
+        log.append_inbox(Transport::Poll, Some("f-522"), None, None, &item(522))
+            .unwrap();
+        duplicate_line_with(&dir, &[]);
+        let loaded = log_in(&dir).load();
+        assert_eq!(loaded.unhandled.len(), 1, "one logical event");
+        let rows = log_in(&dir).read_rows().unwrap().unwrap().rows;
+        assert_eq!(rows.len(), 1, "one display row");
+        // The manual-workaround shape: one PLAIN ack clears it.
+        let mut log = log_in(&dir);
+        log.load();
+        log.append_ack(1).unwrap();
+        assert!(log_in(&dir).load().unhandled.is_empty());
+    }
+
+    #[test]
+    fn distinct_events_at_one_seq_stay_addressable_across_compaction() {
+        // codex 0fb262b/77b5d97: same seq, DIFFERENT feed events —
+        // nothing may be silently erased, a discriminated ack clears
+        // exactly one, and the un-acked row survives a compaction.
+        let dir = tempdir();
+        let mut log = log_in(&dir);
+        log.append_inbox(Transport::Poll, Some("A"), None, None, &item(1))
+            .unwrap();
+        duplicate_line_with(
+            &dir,
+            &[("\"A\"", "\"B\""), ("\"number\":1", "\"number\":2")],
+        );
+        let loaded = log_in(&dir).load();
+        assert_eq!(loaded.unhandled.len(), 2, "both real events present");
+        let rows = log_in(&dir).read_rows().unwrap().unwrap().rows;
+        assert_eq!(rows.len(), 2);
+        assert_ne!(rows[0].ident, rows[1].ident);
+        // Discriminated ack for the "A" row only.
+        let ident_a = rows
+            .iter()
+            .find(|r| r.feed_id.as_deref() == Some("A"))
+            .unwrap();
+        let mut log = log_in(&dir);
+        log.load();
+        log.append_ack_ident(1, &ident_a.ident.clone()).unwrap();
+        let loaded = log_in(&dir).load();
+        assert_eq!(loaded.unhandled.len(), 1, "only B remains open");
+        assert!(matches!(
+            &loaded.unhandled[0].item,
+            WaitItem::GithubEvent {
+                number: Some(2),
+                ..
+            }
+        ));
+        // Across a forced compaction + reload: the acked row is
+        // handled (retained or folded), B is STILL unhandled.
+        let mut log = log_in(&dir);
+        log.load();
+        log.lines = COMPACT_AT;
+        log.maybe_compact().unwrap();
+        let loaded = log_in(&dir).load();
+        assert_eq!(loaded.unhandled.len(), 1, "compaction must not erase B");
+        assert!(matches!(
+            &loaded.unhandled[0].item,
+            WaitItem::GithubEvent {
+                number: Some(2),
+                ..
+            }
+        ));
+        let rows = log_in(&dir).read_rows().unwrap().unwrap().rows;
+        let a = rows.iter().find(|r| r.feed_id.as_deref() == Some("A"));
+        if let Some(a) = a {
+            assert!(a.acked, "A's discriminated ack survived the rewrite");
+        }
+    }
+
+    #[test]
+    fn identity_less_identical_rows_group_and_poll_relay_pair_collapses() {
+        let dir = tempdir();
+        let mut log = log_in(&dir);
+        // Keyless, no feed id — identical complete content twice.
+        log.append_inbox(Transport::Poll, None, None, Some(9), &item(3))
+            .unwrap();
+        duplicate_line_with(&dir, &[]);
+        // The damaged poll/relay pair at one seq: poll row carries
+        // feed_id + action key; the relay copy only the same key.
+        log_in(&dir).load(); // no-op read
+        let mut log = log_in(&dir);
+        log.load();
+        log.append_inbox(Transport::Poll, Some("F"), Some("k#9"), None, &item(4))
+            .unwrap();
+        duplicate_line_with(
+            &dir,
+            &[
+                ("\"transport\":\"poll\"", "\"transport\":\"relay\""),
+                ("\"feed_id\":\"F\",", ""),
+            ],
+        );
+        let loaded = log_in(&dir).load();
+        // Keyless identical pair grouped; poll/relay pair collapsed
+        // under action-key-first identity → exactly two logical
+        // events.
+        assert_eq!(loaded.unhandled.len(), 2, "{:?}", loaded.unhandled);
+        let rows = log_in(&dir).read_rows().unwrap().unwrap().rows;
+        assert_eq!(rows.len(), 2);
+        // The keyless group's hash discriminator clears the group.
+        let keyless = rows.iter().find(|r| r.ident.starts_with("h:")).unwrap();
+        let (kseq, kident) = (keyless.seq, keyless.ident.clone());
+        let mut log = log_in(&dir);
+        log.load();
+        log.append_ack_ident(kseq, &kident).unwrap();
+        assert_eq!(log_in(&dir).load().unhandled.len(), 1);
+    }
+
+    #[test]
+    fn ack_appends_while_the_ingest_lease_is_held() {
+        // The ingest lease gates TRANSPORTS, not the data path: the
+        // ack CLI must append normally while a wait holds the lease
+        // (codex b649c72).
+        let dir = tempdir();
+        let lease = IngestLease::try_acquire(&dir, "github-o-r-abcd")
+            .unwrap()
+            .unwrap();
+        let mut log = log_in(&dir);
+        let seq = log
+            .append_inbox(Transport::Poll, Some("1"), None, None, &item(1))
+            .unwrap();
+        let mut acker = log_in(&dir);
+        acker.load();
+        acker.append_ack(seq).unwrap();
+        assert!(log_in(&dir).load().unhandled.is_empty());
+        drop(lease);
+    }
+
+    #[test]
+    fn baseline_copy_first_never_hides_a_live_copy() {
+        // Append-order independence (codex 20cdd09/b649c72): the
+        // BASELINE copy lands first, the live copy second — the group
+        // must aggregate to LIVE-unhandled, not inherit the first
+        // row's born-handled state.
+        let dir = tempdir();
+        let mut log = log_in(&dir);
+        log.append_baseline_inbox(Some("X"), None, Some(5), &item(9))
+            .unwrap();
+        // A live duplicate of the same logical event at the same seq
+        // (duplicate-writer damage): flip baseline off on the raw
+        // line.
+        duplicate_line_with(&dir, &[("\"baseline\":true,", "")]);
+        let loaded = log_in(&dir).load();
+        assert_eq!(
+            loaded.unhandled.len(),
+            1,
+            "a live copy keeps the group open regardless of order: {loaded:?}"
+        );
+        let rows = log_in(&dir).read_rows().unwrap().unwrap().rows;
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].baseline, "baseline aggregates over ALL copies");
+        assert!(!rows[0].acked);
+    }
+
+    #[test]
+    fn relay_copy_first_keeps_the_poll_twins_feed_id_across_compaction() {
+        // The relay copy (action key only) lands BEFORE its poll twin
+        // (feed id + key): the feed id must reach the cursor horizon
+        // and survive compaction via the group's identity union
+        // (codex 20cdd09/b649c72).
+        let dir = tempdir();
+        let mut log = log_in(&dir);
+        log.append_inbox(Transport::Relay, None, Some("k#7"), None, &item(7))
+            .unwrap();
+        // The poll twin at the SAME seq (duplicate-writer damage).
+        let path = dir.join("github-o-r-abcd.jsonl");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let line = text
+            .lines()
+            .last()
+            .unwrap()
+            .replace("\"transport\":\"relay\"", "\"transport\":\"poll\"")
+            .replace(
+                "\"action_key\":\"k#7\"",
+                "\"feed_id\":\"F7\",\"action_key\":\"k#7\"",
+            );
+        std::fs::write(&path, format!("{text}{line}\n")).unwrap();
+        let loaded = log_in(&dir).load();
+        assert_eq!(loaded.unhandled.len(), 1, "one logical event");
+        assert!(
+            loaded.feed_ids.contains(&"F7".to_string()),
+            "the poll twin's feed id reaches the horizon: {:?}",
+            loaded.feed_ids
+        );
+        // Ack it, force a compaction, reload: the identity union
+        // (feed id AND key) survives the rewrite.
+        let mut log = log_in(&dir);
+        log.load();
+        log.append_ack(1).unwrap();
+        log.lines = COMPACT_AT;
+        log.maybe_compact().unwrap();
+        let loaded = log_in(&dir).load();
+        assert!(loaded.unhandled.is_empty());
+        assert!(
+            loaded.feed_ids.contains(&"F7".to_string()),
+            "feed id survives compaction: {:?}",
+            loaded.feed_ids
+        );
+        assert!(loaded.action_keys.contains(&"k#7".to_string()));
     }
 
     #[test]

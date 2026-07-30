@@ -87,46 +87,101 @@ fn read_all(dir: &Path) -> anyhow::Result<Vec<Sourced>> {
     Ok(out)
 }
 
-/// Resolve one user-supplied id (`seq` or `<source>@<seq>`) against
-/// the rows. A bare seq matching several sources is an error naming
-/// the qualified forms.
+/// Resolve one user-supplied id (`[source@]seq[#N]`) against the
+/// rows. A bare seq matching several SOURCES demands the
+/// source-qualified form; a seq matching several DISTINCT events in
+/// ONE source (duplicate-writer damage) demands the ordinal form
+/// `seq#N` — ordinals order by the rows' logical identities, which is
+/// total and stable (wal-single-ingest-writer).
 fn resolve<'a>(rows: &'a [Sourced], id: &str) -> anyhow::Result<&'a Sourced> {
-    let (source, seq) = match id.rsplit_once('@') {
+    let (rest, ordinal) = match id.rsplit_once('#') {
+        Some((r, n)) => (
+            r,
+            Some(
+                n.parse::<usize>()
+                    .map_err(|_| anyhow::anyhow!("invalid ordinal in `{id}` (expected seq#N)"))?,
+            ),
+        ),
+        None => (id, None),
+    };
+    let (source, seq) = match rest.rsplit_once('@') {
         Some((s, n)) => (Some(s), n),
-        None => (None, id),
+        None => (None, rest),
     };
     let seq: u64 = seq
         .parse()
-        .map_err(|_| anyhow::anyhow!("invalid event id `{id}` (expected a seq or source@seq)"))?;
-    let matches: Vec<&Sourced> = rows
+        .map_err(|_| anyhow::anyhow!("invalid event id `{id}` (expected [source@]seq[#N])"))?;
+    let mut matches: Vec<&Sourced> = rows
         .iter()
         .filter(|s| s.row.seq == seq && source.is_none_or(|src| s.source == src))
         .collect();
-    match matches.as_slice() {
-        [one] => Ok(one),
-        [] => anyhow::bail!("no event `{id}` — see `clank events list --all`"),
-        many => anyhow::bail!(
+    if matches.is_empty() {
+        anyhow::bail!("no event `{id}` — see `clank events list --all`");
+    }
+    let sources: std::collections::BTreeSet<&str> =
+        matches.iter().map(|s| s.source.as_str()).collect();
+    if sources.len() > 1 {
+        anyhow::bail!(
             "`{id}` is ambiguous; qualify it: {}",
-            many.iter()
+            matches
+                .iter()
                 .map(|s| format!("{}@{}", s.source, s.row.seq))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    // One source: order same-seq distinct events by identity (total,
+    // stable) for ordinal addressing.
+    matches.sort_by(|a, b| a.row.ident.cmp(&b.row.ident));
+    match (matches.len(), ordinal) {
+        (1, None | Some(1)) => Ok(matches[0]),
+        (_, Some(n)) if n >= 1 && n <= matches.len() => Ok(matches[n - 1]),
+        (_, Some(n)) => anyhow::bail!("`{id}`: ordinal {n} out of range (1..={})", matches.len()),
+        (_, None) => anyhow::bail!(
+            "`{id}` matches {} distinct events at that seq (damaged log); address one: {}",
+            matches.len(),
+            (1..=matches.len())
+                .map(|n| format!("{rest}#{n}"))
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
     }
 }
 
-/// Bare seq when unique across sources, qualified otherwise.
-fn display_id(rows: &[Sourced], s: &Sourced) -> String {
-    let dup = rows
-        .iter()
-        .filter(|o| o.row.seq == s.row.seq)
-        .take(2)
+/// Whether this row shares its (source, seq) with OTHER distinct
+/// events — the case where an ack must be discriminated.
+fn seq_collides(rows: &[Sourced], s: &Sourced) -> bool {
+    rows.iter()
+        .filter(|o| o.source == s.source && o.row.seq == s.row.seq)
         .count()
-        > 1;
-    if dup {
+        > 1
+}
+
+/// Bare seq when unique; `source@seq` across sources; `…#N` when one
+/// source holds distinct events at the seq (damaged log).
+fn display_id(rows: &[Sourced], s: &Sourced) -> String {
+    let cross_source = rows
+        .iter()
+        .any(|o| o.row.seq == s.row.seq && o.source != s.source);
+    let base = if cross_source {
         format!("{}@{}", s.source, s.row.seq)
     } else {
         s.row.seq.to_string()
+    };
+    if seq_collides(rows, s) {
+        let mut siblings: Vec<&Sourced> = rows
+            .iter()
+            .filter(|o| o.source == s.source && o.row.seq == s.row.seq)
+            .collect();
+        siblings.sort_by(|a, b| a.row.ident.cmp(&b.row.ident));
+        let n = siblings
+            .iter()
+            .position(|o| o.row.ident == s.row.ident)
+            .map(|i| i + 1)
+            .unwrap_or(1);
+        format!("{base}#{n}")
+    } else {
+        base
     }
 }
 
@@ -236,11 +291,21 @@ fn ack(dir: &Path, rows: Vec<Sourced>, ids: &[String]) -> anyhow::Result<()> {
             println!("{id}: already handled");
             continue;
         }
-        targets.push((s.source.clone(), s.row.seq, id));
+        targets.push((
+            s.source.clone(),
+            s.row.seq,
+            s.row.ident.clone(),
+            seq_collides(&rows, s),
+            id,
+        ));
     }
-    for (source, seq, id) in targets {
+    for (source, seq, ident, discriminate, id) in targets {
         let mut log = EventLog::open(dir, &source)?;
-        log.append_ack(seq)?;
+        if discriminate {
+            log.append_ack_ident(seq, &ident)?;
+        } else {
+            log.append_ack(seq)?;
+        }
         println!("{id}: handled");
     }
     Ok(())
@@ -375,6 +440,67 @@ mod tests {
         assert!(v.get("feed_id").is_none());
         assert_eq!(v["action_key"], "k#1");
         assert_eq!(v["transport"], "relay");
+    }
+
+    #[test]
+    fn damaged_same_seq_events_use_ordinals_and_discriminated_acks() {
+        // wal-single-ingest-writer: two DISTINCT events at one seq in
+        // one source — display and resolution go ordinal, and acking
+        // one writes the discriminated selector clearing only it.
+        let dir = tempdir();
+        let mut a = EventLog::open(&dir, "github-o-r-aaaa").unwrap();
+        a.append_inbox(Transport::Poll, Some("F1"), None, None, &item(1))
+            .unwrap();
+        let path = dir.join("github-o-r-aaaa.jsonl");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let line = text
+            .lines()
+            .last()
+            .unwrap()
+            .replace("\"F1\"", "\"F2\"")
+            .replace("\"number\":1", "\"number\":2");
+        std::fs::write(&path, format!("{text}{line}\n")).unwrap();
+
+        let rows = read_all(&dir).unwrap();
+        assert_eq!(rows.len(), 2, "both real events surface");
+        // Display ids are ordinal-qualified.
+        let ids: std::collections::BTreeSet<String> =
+            rows.iter().map(|s| display_id(&rows, s)).collect();
+        assert_eq!(
+            ids,
+            ["1#1".to_string(), "1#2".into()].into_iter().collect(),
+            "{ids:?}"
+        );
+        // A bare seq errors naming the ordinal forms.
+        let err = resolve(&rows, "1").unwrap_err().to_string();
+        assert!(err.contains("1#1") && err.contains("1#2"), "{err}");
+        // Ordinals resolve deterministically (identity order).
+        let one = resolve(&rows, "1#1").unwrap();
+        let two = resolve(&rows, "1#2").unwrap();
+        assert_ne!(one.row.ident, two.row.ident);
+        assert!(resolve(&rows, "1#3").is_err());
+        // Acking one ordinal clears exactly that event.
+        let target = display_id(&rows, two);
+        ack(&dir, read_all(&dir).unwrap(), &[target]).unwrap();
+        let rows = read_all(&dir).unwrap();
+        let acked: Vec<bool> = {
+            let mut v: Vec<(&String, bool)> =
+                rows.iter().map(|s| (&s.row.ident, s.row.acked)).collect();
+            v.sort();
+            v.into_iter().map(|(_, a)| a).collect()
+        };
+        assert_eq!(
+            acked.iter().filter(|a| **a).count(),
+            1,
+            "exactly one event handled: {rows:?}"
+        );
+        // The written ack carries the discriminator.
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.lines()
+                .any(|l| l.contains("\"t\":\"ack\"") && l.contains("\"ident\"")),
+            "discriminated selector on disk"
+        );
     }
 
     #[test]

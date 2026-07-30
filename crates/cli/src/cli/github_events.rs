@@ -1269,28 +1269,137 @@ pub(crate) async fn run_github_source(
         repo: src.repo.clone(),
         session: session.clone(),
     };
-    let log = events_dir.and_then(|dir| {
-        match crate::cli::github_event_log::EventLog::open(&dir, &source_key(&src)) {
-            Ok(l) => Some(l),
-            Err(e) => {
-                eprintln!(
-                    "wait: github {} — can't open the event log dir ({e}); \
-                     continuing without offline catch-up",
-                    src.repo
-                );
+    let login = GhLogin(session);
+    let realtime = src.delivery == clank_core::agent_config::Delivery::Realtime;
+    let src2 = src.clone();
+    source_supervisor(
+        &src,
+        &login,
+        &fetcher,
+        &tx,
+        events_dir,
+        move || async move {
+            if realtime {
+                start_relay(&src2, GhForwarder).await
+            } else {
                 None
             }
-        }
-    });
-    let relay = if src.delivery == clank_core::agent_config::Delivery::Realtime {
-        start_relay(&src, GhForwarder).await
-    } else {
-        None
+        },
+    )
+    .await;
+}
+
+/// The lease-gated source runtime (wal-single-ingest-writer): the
+/// INGEST LEASE is acquired before ANY transport exists — only the
+/// holder starts the relay or polls github; a non-holder TAILS the
+/// WAL, presenting logged unhandled entries on the poll cadence, and
+/// takes over (starting transports only then) when the holder dies.
+/// Presentation never acknowledges: `clank wait` — leased or tailing
+/// — writes no ack records, ever.
+async fn source_supervisor<F, R, RF, RFut>(
+    src: &GithubSource,
+    login: &R,
+    fetcher: &F,
+    tx: &tokio::sync::mpsc::UnboundedSender<WaitItem>,
+    events_dir: Option<std::path::PathBuf>,
+    relay_start: RF,
+) where
+    F: EventFetcher,
+    R: LoginResolver,
+    RF: FnOnce() -> RFut,
+    RFut: std::future::Future<Output = Option<(std::sync::Arc<RelayInbox>, RelayGuard)>>,
+{
+    // Ad-hoc unbound waits have no persistence dir: memory-only
+    // ingest, lease-free — nothing durable to contend over.
+    let Some(dir) = events_dir else {
+        let relay = relay_start().await;
+        let inbox = relay.as_ref().map(|(i, _)| i.clone());
+        poll_loop(src, login, fetcher, tx, inbox, None, Default::default()).await;
+        return;
     };
-    let inbox = relay.as_ref().map(|(i, _)| i.clone());
-    poll_loop(&src, &GhLogin(session), &fetcher, &tx, inbox, log).await;
-    // RelayGuard drops here (and on task abort): listener + supervisor
-    // die with the source; the forwarder child by group kill.
+    let key = source_key(src);
+    // FnOnce discipline across the loop: the transports start at most
+    // once, exactly at lease acquisition.
+    let mut relay_start = Some(relay_start);
+    let mut warned_tail = false;
+    // Presented LOGICAL EVENT keys — (seq, ident), never seq alone:
+    // damaged logs can hold distinct events at one seq and each must
+    // present (codex 20cdd09). Re-arms re-present (at-least-once).
+    let mut presented: std::collections::HashSet<(u64, String)> = std::collections::HashSet::new();
+    let configured = src
+        .poll_interval
+        .as_deref()
+        .and_then(|s| crate::cli::wait::parse_duration_str(s).ok().flatten());
+    loop {
+        let lease = match crate::cli::github_event_log::IngestLease::try_acquire(&dir, &key) {
+            Ok(l) => l,
+            Err(e) => {
+                // A REAL lease failure (unopenable dir, exotic fs) is
+                // not contention: ingest memory-only rather than tail
+                // a holder that doesn't exist (codex 8bf682e).
+                eprintln!(
+                    "wait: github {} — ingest lease unavailable ({e}); \
+                     polling without persistence",
+                    src.repo
+                );
+                let relay = match relay_start.take() {
+                    Some(start) => start().await,
+                    None => None,
+                };
+                let inbox = relay.as_ref().map(|(i, _)| i.clone());
+                poll_loop(src, login, fetcher, tx, inbox, None, Default::default()).await;
+                return;
+            }
+        };
+        if let Some(lease) = lease {
+            let log = match crate::cli::github_event_log::EventLog::open(&dir, &key) {
+                Ok(l) => Some(l),
+                Err(e) => {
+                    eprintln!(
+                        "wait: github {} — can't open the event log dir ({e}); \
+                         continuing without offline catch-up",
+                        src.repo
+                    );
+                    None
+                }
+            };
+            let relay = match relay_start.take() {
+                Some(start) => start().await,
+                None => None,
+            };
+            let inbox = relay.as_ref().map(|(i, _)| i.clone());
+            poll_loop(src, login, fetcher, tx, inbox, log, presented).await;
+            drop(lease);
+            // RelayGuard drops here (and on task abort): listener +
+            // supervisor die with the source; the forwarder child by
+            // group kill.
+            return;
+        }
+        if !warned_tail {
+            eprintln!(
+                "wait: github {} — another wait is already watching this source for this \
+                 agent; tailing its event log instead of polling",
+                src.repo
+            );
+            warned_tail = true;
+        }
+        // Tail one cycle: present the leased writer's unhandled
+        // entries this process hasn't presented yet. read_rows is the
+        // read-only inspector — a tailer never quarantines.
+        if let Ok(log) = crate::cli::github_event_log::EventLog::open(&dir, &key)
+            && let Ok(Some(read)) = log.read_rows()
+        {
+            for row in read.rows {
+                if !row.acked
+                    && presented.insert((row.seq, row.ident.clone()))
+                    && tx.send(row.item).is_err()
+                {
+                    return; // wait gone
+                }
+            }
+        }
+        tokio::time::sleep(effective_interval(configured, None)).await;
+    }
 }
 
 /// Stable per-source WAL key: the sanitized repo plus a short hash of
@@ -1555,6 +1664,7 @@ pub(crate) async fn poll_loop<F: EventFetcher, R: LoginResolver>(
     tx: &tokio::sync::mpsc::UnboundedSender<WaitItem>,
     mut relay: Option<std::sync::Arc<RelayInbox>>,
     mut log: Option<crate::cli::github_event_log::EventLog>,
+    suppress_backlog: std::collections::HashSet<(u64, String)>,
 ) {
     let configured = src
         .poll_interval
@@ -1599,6 +1709,15 @@ pub(crate) async fn poll_loop<F: EventFetcher, R: LoginResolver>(
             );
         }
         for entry in &loaded.unhandled {
+            // A takeover's tail phase already presented these LOGICAL
+            // events IN THIS PROCESS — re-presenting them in the same
+            // wait would double-wake (codex 8bf682e/20cdd09). Keyed by
+            // (seq, ident): distinct damaged events at one seq
+            // suppress independently. Horizons and coordinator state
+            // still load fully.
+            if suppress_backlog.contains(&(entry.seq, entry.ident.clone())) {
+                continue;
+            }
             if tx.send(entry.item.clone()).is_err() {
                 return; // wait gone
             }
@@ -2677,6 +2796,7 @@ mod tests {
                 &tx,
                 Some(loop_inbox),
                 None,
+                Default::default(),
             )
             .await;
         });
@@ -2848,6 +2968,159 @@ mod tests {
         assert_eq!(*got.first().unwrap(), 3, "oldest dropped first");
     }
 
+    // ── the ingest lease: one writer, tailers present (wal-single-ingest-writer) ──
+
+    #[test]
+    fn ingest_lease_is_exclusive_and_freed_on_drop() {
+        let dir = wal_tempdir();
+        let a = crate::cli::github_event_log::IngestLease::try_acquire(&dir, "k").unwrap();
+        assert!(a.is_some());
+        assert!(
+            crate::cli::github_event_log::IngestLease::try_acquire(&dir, "k")
+                .unwrap()
+                .is_none(),
+            "held lease reads as CONTENDED, not an error"
+        );
+        assert!(
+            crate::cli::github_event_log::IngestLease::try_acquire(&dir, "other")
+                .unwrap()
+                .is_some(),
+            "leases are per source"
+        );
+        drop(a);
+        assert!(
+            crate::cli::github_event_log::IngestLease::try_acquire(&dir, "k")
+                .unwrap()
+                .is_some(),
+            "dropping the holder frees the lease"
+        );
+        // A REAL failure (the "dir" is a file) is an error, never
+        // contention (codex 8bf682e).
+        let file_path = dir.join("not-a-dir");
+        std::fs::write(&file_path, b"x").unwrap();
+        assert!(
+            crate::cli::github_event_log::IngestLease::try_acquire(&file_path, "k").is_err(),
+            "an unusable dir must surface as an error"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn non_holder_tails_without_transports_and_takes_over() {
+        let dir = wal_tempdir();
+        let key = source_key(&src(&[GithubEventKind::IssueOpened], true));
+        // The "holder": a leased writer that logged one unhandled
+        // event, standing in for a live wait's ingest.
+        let lease = crate::cli::github_event_log::IngestLease::try_acquire(&dir, &key).unwrap();
+        {
+            let mut log = crate::cli::github_event_log::EventLog::open(&dir, &key).unwrap();
+            log.append_inbox(
+                crate::cli::github_event_log::Transport::Poll,
+                Some("1"),
+                None,
+                None,
+                &classified(7, None).item,
+            )
+            .unwrap();
+            // Duplicate-writer damage: a SECOND distinct event at the
+            // SAME seq (codex 20cdd09) — both must tail-present and
+            // both must suppress at takeover.
+            let path = dir.join(format!("{key}.jsonl"));
+            let text = std::fs::read_to_string(&path).unwrap();
+            let line = text
+                .lines()
+                .last()
+                .unwrap()
+                .replace("\"1\"", "\"2\"")
+                .replace("\"number\":7", "\"number\":8");
+            std::fs::write(&path, format!("{text}{line}\n")).unwrap();
+        }
+        // The second wait's supervisor: its relay starter and fetcher
+        // must go UNUSED while tailing.
+        let relay_started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fetched = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        struct CountFetcher(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+        impl EventFetcher for CountFetcher {
+            async fn fetch(&self, _p: u32, _e: Option<String>) -> anyhow::Result<GhResponse> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(ok(vec![], None, None))
+            }
+        }
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let s = src(&[GithubEventKind::IssueOpened], true);
+        let d = dir.clone();
+        let rs = relay_started.clone();
+        let f = CountFetcher(fetched.clone());
+        let run = tokio::spawn(async move {
+            source_supervisor(
+                &s,
+                &FixedLogin("me"),
+                &f,
+                &tx,
+                Some(d),
+                move || async move {
+                    rs.store(true, std::sync::atomic::Ordering::SeqCst);
+                    None
+                },
+            )
+            .await;
+        });
+        // The tailer presents BOTH logical events at the damaged seq…
+        let mut got = Vec::new();
+        for _ in 0..2 {
+            let woke = tokio::time::timeout(std::time::Duration::from_secs(300), rx.recv())
+                .await
+                .expect("the tailer must present the leased writer's entries")
+                .expect("open");
+            if let WaitItem::GithubEvent { number, .. } = &woke {
+                got.push(number.unwrap());
+            }
+        }
+        got.sort();
+        assert_eq!(got, vec![7, 8], "both distinct same-seq events present");
+        // …without starting transports or touching github.
+        assert!(!relay_started.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(fetched.load(std::sync::atomic::Ordering::SeqCst), 0);
+        // Holder dies → the tailer's next cycle takes the lease and
+        // becomes the ingester: transports start, github is polled.
+        drop(lease);
+        tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+        assert!(
+            relay_started.load(std::sync::atomic::Ordering::SeqCst),
+            "takeover must start transports after acquiring the lease"
+        );
+        assert!(
+            fetched.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "takeover must begin polling"
+        );
+        // No ack records were ever written by presentation.
+        let text = std::fs::read_to_string(dir.join(format!("{key}.jsonl"))).unwrap_or_default();
+        assert!(
+            !text.contains("\"t\":\"ack\""),
+            "wait must never acknowledge"
+        );
+        // Exactly-once WITHIN this wait (codex 8bf682e): the takeover's
+        // warm start suppresses what the tail phase already presented —
+        // the channel holds no second copy of the event.
+        let mut extra = 0;
+        while let Ok(item) = rx.try_recv() {
+            if matches!(
+                &item,
+                WaitItem::GithubEvent {
+                    number: Some(7 | 8),
+                    ..
+                }
+            ) {
+                extra += 1;
+            }
+        }
+        assert_eq!(
+            extra, 0,
+            "takeover re-presented entries the tail already delivered"
+        );
+        run.abort();
+        let _ = run.await;
+    }
+
     // ── bounded transport: deadlines at the ownership boundary ──
 
     /// Hangs on the FIRST send forever; later sends return 200 with
@@ -2899,7 +3172,16 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let s = src(&[GithubEventKind::IssueOpened], true);
         let run = tokio::spawn(async move {
-            poll_loop(&s, &FixedLogin("me"), &fetcher, &tx, None, None).await;
+            poll_loop(
+                &s,
+                &FixedLogin("me"),
+                &fetcher,
+                &tx,
+                None,
+                None,
+                Default::default(),
+            )
+            .await;
         });
         // Tick 1 hangs → times out at 30s; the loop sleeps the
         // interval and tick 2's send succeeds (empty baseline). Give
@@ -3376,6 +3658,7 @@ mod tests {
                 &tx,
                 None,
                 None,
+                Default::default(),
             )
             .await;
         });
@@ -3482,6 +3765,7 @@ mod tests {
                 &tx,
                 None,
                 None,
+                Default::default(),
             )
             .await;
         });
@@ -3527,6 +3811,7 @@ mod tests {
                 &tx,
                 None,
                 None,
+                Default::default(),
             )
             .await;
         });
@@ -3574,6 +3859,7 @@ mod tests {
                 &tx,
                 None,
                 None,
+                Default::default(),
             )
             .await;
         });
@@ -3624,7 +3910,16 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let loop_inbox = inbox.clone();
         let handle = tokio::spawn(async move {
-            poll_loop(&s, &FixedLogin("me"), &f, &tx, Some(loop_inbox), None).await;
+            poll_loop(
+                &s,
+                &FixedLogin("me"),
+                &f,
+                &tx,
+                Some(loop_inbox),
+                None,
+                Default::default(),
+            )
+            .await;
         });
         // A webhook delivery for issue #2 lands between ticks — it must
         // emit without waiting for the next poll.
@@ -3704,6 +3999,7 @@ mod tests {
                 &tx,
                 Some(loop_inbox),
                 None,
+                Default::default(),
             )
             .await;
         });
@@ -3758,6 +4054,7 @@ mod tests {
                 &tx,
                 Some(loop_inbox),
                 None,
+                Default::default(),
             )
             .await;
         });
@@ -3804,6 +4101,7 @@ mod tests {
                 &tx,
                 Some(loop_inbox),
                 None,
+                Default::default(),
             )
             .await;
         });
@@ -3840,6 +4138,7 @@ mod tests {
                 &tx,
                 None,
                 None,
+                Default::default(),
             )
             .await;
         });
@@ -3989,7 +4288,16 @@ mod tests {
         let s1 = src(&[GithubEventKind::IssueOpened], true);
         let d = dir.clone();
         let run1 = tokio::spawn(async move {
-            poll_loop(&s1, &FixedLogin("me"), &f, &tx, None, Some(open_log(&d))).await;
+            poll_loop(
+                &s1,
+                &FixedLogin("me"),
+                &f,
+                &tx,
+                None,
+                Some(open_log(&d)),
+                Default::default(),
+            )
+            .await;
         });
         tokio::task::yield_now().await;
         assert!(
@@ -4007,7 +4315,16 @@ mod tests {
         let s2 = src(&[GithubEventKind::IssueOpened], true);
         let d = dir.clone();
         let run2 = tokio::spawn(async move {
-            poll_loop(&s2, &FixedLogin("me"), &f, &tx, None, Some(open_log(&d))).await;
+            poll_loop(
+                &s2,
+                &FixedLogin("me"),
+                &f,
+                &tx,
+                None,
+                Some(open_log(&d)),
+                Default::default(),
+            )
+            .await;
         });
         let woke = tokio::time::timeout(std::time::Duration::from_secs(300), rx.recv())
             .await
@@ -4050,7 +4367,16 @@ mod tests {
         let s = src(&[GithubEventKind::IssueOpened], true);
         let d = dir.clone();
         let run = tokio::spawn(async move {
-            poll_loop(&s, &FixedLogin("me"), &f, &tx, None, Some(open_log(&d))).await;
+            poll_loop(
+                &s,
+                &FixedLogin("me"),
+                &f,
+                &tx,
+                None,
+                Some(open_log(&d)),
+                Default::default(),
+            )
+            .await;
         });
         let woke = tokio::time::timeout(std::time::Duration::from_secs(300), rx.recv())
             .await
@@ -4123,6 +4449,7 @@ mod tests {
                 &tx,
                 Some(loop_inbox),
                 Some(open_log(&d)),
+                Default::default(),
             )
             .await;
         });
@@ -4166,7 +4493,16 @@ mod tests {
         let s = src(&[GithubEventKind::IssueOpened], true);
         let d = dir.clone();
         let run = tokio::spawn(async move {
-            poll_loop(&s, &FixedLogin("me"), &f, &tx, None, Some(open_log(&d))).await;
+            poll_loop(
+                &s,
+                &FixedLogin("me"),
+                &f,
+                &tx,
+                None,
+                Some(open_log(&d)),
+                Default::default(),
+            )
+            .await;
         });
         let woke = tokio::time::timeout(std::time::Duration::from_secs(300), rx.recv())
             .await
@@ -4213,6 +4549,7 @@ mod tests {
                 &tx,
                 Some(loop_inbox),
                 Some(open_log(&d)),
+                Default::default(),
             )
             .await;
         });
@@ -4248,7 +4585,16 @@ mod tests {
         let s2 = src(&[GithubEventKind::IssueOpened], true);
         let d = dir.clone();
         let run2 = tokio::spawn(async move {
-            poll_loop(&s2, &FixedLogin("me"), &f, &tx, None, Some(open_log(&d))).await;
+            poll_loop(
+                &s2,
+                &FixedLogin("me"),
+                &f,
+                &tx,
+                None,
+                Some(open_log(&d)),
+                Default::default(),
+            )
+            .await;
         });
         // Give the loop several ticks' worth of virtual time.
         tokio::time::sleep(std::time::Duration::from_secs(120)).await;
