@@ -1788,7 +1788,7 @@ mod tests {
             Tool::OpenCode,
             Some(LaunchConfig {
                 command: None,
-                args: vec!["--model".into(), "moonshot/kimi-k3".into()],
+                args: vec!["--model".into(), "moonshotai/kimi-k3".into()],
                 env: Default::default(),
             }),
         );
@@ -1798,7 +1798,7 @@ mod tests {
             c.args,
             vec![
                 "--model".to_string(),
-                "moonshot/kimi-k3".to_string(),
+                "moonshotai/kimi-k3".to_string(),
                 "--prompt".to_string(),
                 "Run `clank as kimi` to bind this session.".to_string(),
             ]

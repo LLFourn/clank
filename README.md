@@ -126,7 +126,7 @@ auto-mode drives it:
   ```json
   "kimi": {
     "tool": "opencode",
-    "launch": { "args": ["--model", "moonshot/kimi-k3"] }
+    "launch": { "args": ["--model", "moonshotai/kimi-k3"] }
   }
   ```
 
