@@ -1,5 +1,5 @@
 //! `clank setup` — install user-scope clank assets into
-//! `~/.claude/` and `~/.codex/`.
+//! `~/.claude/`, `~/.codex/`, `~/.grok/`, and `~/.config/opencode/`.
 //!
 //! Writes skill files (refuse-if-drifted; D8) and
 //! tag-merges a `Stop` hook entry into each agent's user-wide
@@ -36,6 +36,11 @@ pub const PR_REVIEW_SKILL_BODY: &str = include_str!("setup_assets/pr_review_skil
 /// like pr-review: the events CLI and the react-then-ack loop are
 /// identical everywhere, so one body installs to all three skill dirs.
 pub const GITHUB_SKILL_BODY: &str = include_str!("setup_assets/github_events_skill.md");
+
+/// The opencode plugin: session BINDING via `shell.env` + the
+/// `session.idle` work loop (opencode-agent-tool M2). Content
+/// invariants pinned by tests below; installed by `clank setup`.
+pub const OPENCODE_PLUGIN: &str = include_str!("setup_assets/opencode_plugin.js");
 
 /// The two role skills, by their `~/.<tool>/skills/<name>/` dir name.
 const MASTER_SKILL: &str = "clank-master";
@@ -95,6 +100,24 @@ const WORK_LOOP_GROK: &str = "\
   re-run `clank status` waiting for state to change. The armed
   background wait wakes you; do not spin.";
 
+/// opencode is plugin-driven (opencode-agent-tool M1/M2): the clank
+/// plugin long-polls `clank stop-hook` on session.idle and INJECTS
+/// work as a new prompt — from the agent's seat, work simply
+/// arrives. No arming, no reminder; the skill must forbid
+/// self-arming (a parked wait duplicates the plugin's deliveries
+/// and litters processes).
+const WORK_LOOP_OPENCODE: &str = "\
+- **Work arrives on its own.** When you end a turn, clank's opencode
+  plugin watches for work and injects it as a new prompt (\"Clank wait
+  returned work…\"). Act on the items IMMEDIATELY. Run `clank status`
+  if you need more than the hint carries (short SHAs resolve wherever
+  a `<sha>` is wanted).
+  Each item is a one-line hint: kind, plan, short sha.
+- **NEVER run `clank wait` yourself**, foreground or background — the
+  plugin already holds this session's one wait; a second duplicates
+  deliveries. Do not re-run `clank status` waiting for state to
+  change. End your turn; work finds you.";
+
 /// Compose a role's `SKILL.md` for a tool from the shared single-source
 /// fragments: frontmatter (role-guarded description) + a role-guard
 /// line + shared core + the role body, plus the claude-only `/clank`
@@ -132,11 +155,13 @@ pub fn compose_skill(role: Role, tool: Tool) -> String {
         Tool::Claude => "Bash",
         Tool::Codex => "shell",
         Tool::Grok => "run_terminal_command",
+        Tool::OpenCode => "bash",
     };
     let work_loop = match tool {
         Tool::Claude => WORK_LOOP_CLAUDE,
         Tool::Codex => WORK_LOOP_CODEX,
         Tool::Grok => WORK_LOOP_GROK,
+        Tool::OpenCode => WORK_LOOP_OPENCODE,
     };
     out.replace("{{SHELL}}", shell)
         .replace("{{WORK_LOOP}}", work_loop)
@@ -164,85 +189,78 @@ const LEGACY_COMMAND_PREFIX: &str = "clank stop-hook";
 /// stops the agent's hook runner from killing the process early.
 pub(crate) const HOOK_TIMEOUT_SECS: u64 = 86400;
 
-pub async fn run(args: SetupArgs) -> anyhow::Result<()> {
-    let home = home_dir()?;
-    let mut summary = Vec::<String>::new();
+/// The per-tool user-scope skill dirs. Grok dedupes its claude-compat
+/// scan native-first (grok-first-class P3), so native copies win
+/// there; opencode's compat scan wins its dedupe instead, so `clank
+/// agent start` launches opencode with that scan disabled
+/// (OPENCODE_DISABLE_CLAUDE_CODE_SKILLS=1) and the native copies are
+/// what its agents see — every tool ends up on the same per-tool
+/// skill model.
+pub const TOOL_SKILL_DIRS: [(Tool, &str); 4] = [
+    (Tool::Claude, ".claude"),
+    (Tool::Codex, ".codex"),
+    (Tool::Grok, ".grok"),
+    (Tool::OpenCode, ".config/opencode"),
+];
 
-    // Role skills: clank-master + clank-reviewer, both to both tools
-    // (tool != role). Composed per (role, tool) from one source each.
-    // Grok reads native skills from ~/.grok/skills and dedupes by name
-    // against its claude-compat scan, native winning (grok-first-class
-    // P3) — so installing here cleanly overrides the claude copies it
-    // would otherwise pick up. No grok hook is installed: grok hooks
-    // are passive and the wake channel is the armed wait's completion.
-    for (tool, tool_dir) in [
-        (Tool::Claude, ".claude"),
-        (Tool::Codex, ".codex"),
-        (Tool::Grok, ".grok"),
-    ] {
+/// Every user-scope file clank owns under `$HOME`, as
+/// (home-relative path, expected content): the role skills composed
+/// per (role, tool), the tool-neutral pr-review + github skills for
+/// every tool dir, and the opencode plugin (binding + work loop;
+/// plugins only load from the GLOBAL dir — project-local
+/// .opencode/plugin is not scanned, M2 findings). ONE inventory,
+/// consumed by both `clank setup` (install) and `clank doctor`
+/// (verify), so the two can never diverge (codex 0c90514).
+pub fn user_asset_inventory() -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for (tool, tool_dir) in TOOL_SKILL_DIRS {
         for (role, skill) in [
             (Role::Master, MASTER_SKILL),
             (Role::Reviewer, REVIEWER_SKILL),
         ] {
-            install_skill(
-                &home.join(format!("{tool_dir}/skills/{skill}/SKILL.md")),
-                &compose_skill(role, tool),
-                args.force,
-                args.dry_run,
-                &mut summary,
-            )?;
+            out.push((
+                format!("{tool_dir}/skills/{skill}/SKILL.md"),
+                compose_skill(role, tool),
+            ));
         }
-        // Drop the pre-split single `clank` skill so it can't shadow the
-        // role skills with stale, role-jamming guidance.
+        out.push((
+            format!("{tool_dir}/skills/clank-pr-review/SKILL.md"),
+            PR_REVIEW_SKILL_BODY.to_string(),
+        ));
+        out.push((
+            format!("{tool_dir}/skills/clank-github/SKILL.md"),
+            GITHUB_SKILL_BODY.to_string(),
+        ));
+    }
+    out.push((
+        ".config/opencode/plugin/clank.js".to_string(),
+        OPENCODE_PLUGIN.to_string(),
+    ));
+    out
+}
+
+pub async fn run(args: SetupArgs) -> anyhow::Result<()> {
+    let home = home_dir()?;
+    let mut summary = Vec::<String>::new();
+
+    for (rel, expected) in user_asset_inventory() {
+        install_skill(
+            &home.join(&rel),
+            &expected,
+            args.force,
+            args.dry_run,
+            &mut summary,
+        )?;
+    }
+    // Drop the pre-split single `clank` skill so it can't shadow the
+    // role skills with stale, role-jamming guidance.
+    for (_, tool_dir) in TOOL_SKILL_DIRS {
         remove_obsolete_skill(
             &home.join(format!("{tool_dir}/skills/{OBSOLETE_SKILL}")),
             args.dry_run,
             &mut summary,
         )?;
     }
-    install_skill(
-        &home.join(".claude/skills/clank-pr-review/SKILL.md"),
-        PR_REVIEW_SKILL_BODY,
-        args.force,
-        args.dry_run,
-        &mut summary,
-    )?;
-    install_skill(
-        &home.join(".codex/skills/clank-pr-review/SKILL.md"),
-        PR_REVIEW_SKILL_BODY,
-        args.force,
-        args.dry_run,
-        &mut summary,
-    )?;
-    install_skill(
-        &home.join(".grok/skills/clank-pr-review/SKILL.md"),
-        PR_REVIEW_SKILL_BODY,
-        args.force,
-        args.dry_run,
-        &mut summary,
-    )?;
-
-    install_skill(
-        &home.join(".claude/skills/clank-github/SKILL.md"),
-        GITHUB_SKILL_BODY,
-        args.force,
-        args.dry_run,
-        &mut summary,
-    )?;
-    install_skill(
-        &home.join(".codex/skills/clank-github/SKILL.md"),
-        GITHUB_SKILL_BODY,
-        args.force,
-        args.dry_run,
-        &mut summary,
-    )?;
-    install_skill(
-        &home.join(".grok/skills/clank-github/SKILL.md"),
-        GITHUB_SKILL_BODY,
-        args.force,
-        args.dry_run,
-        &mut summary,
-    )?;
     merge_hook_into_settings(
         &home.join(".claude/settings.json"),
         ClaudeHook,
@@ -902,6 +920,14 @@ mod tests {
         assert!(!mc.contains("Act on Stop-hook work"));
         assert!(mx.contains("Act on Stop-hook work IMMEDIATELY"));
         assert!(!mx.contains("run_in_background"));
+        // opencode is plugin-driven: work is INJECTED as a prompt;
+        // self-arming is forbidden (a second wait duplicates the
+        // plugin's deliveries).
+        let mo = compose_skill(Role::Master, Tool::OpenCode);
+        assert!(mo.contains("Work arrives on its own"));
+        assert!(mo.contains("NEVER run `clank wait` yourself"));
+        assert!(!mo.contains("Keep a `clank wait` armed"));
+        assert!(!mo.contains("run_in_background"));
     }
 
     #[test]
@@ -1221,5 +1247,182 @@ mod tests {
             }]
         });
         assert!(!wrapper_is_clank(&w));
+    }
+
+    #[test]
+    fn user_asset_inventory_covers_every_tool_dir_and_the_plugin() {
+        // Doctor verifies exactly this inventory; a skill added to
+        // setup but missing here (or vice versa) is structurally
+        // impossible — this test just pins the expected shape.
+        let inv = user_asset_inventory();
+        for (_, dir) in TOOL_SKILL_DIRS {
+            for skill in [
+                "clank-master",
+                "clank-reviewer",
+                "clank-pr-review",
+                "clank-github",
+            ] {
+                let rel = format!("{dir}/skills/{skill}/SKILL.md");
+                assert!(inv.iter().any(|(r, _)| r == &rel), "missing {rel}");
+            }
+        }
+        assert!(
+            inv.iter()
+                .any(|(r, c)| r == ".config/opencode/plugin/clank.js" && c == OPENCODE_PLUGIN)
+        );
+        assert_eq!(inv.len(), TOOL_SKILL_DIRS.len() * 4 + 1);
+    }
+
+    #[test]
+    fn opencode_plugin_scrubs_every_foreign_identity_var() {
+        // The plugin's blank-scrub list must track SESSION_IDENTITY_VARS
+        // (minus its own var, which it SETS): a var added to clank's
+        // identity set but not blanked by the plugin would leak a
+        // parent agent's identity into opencode tool shells.
+        for var in crate::agent_env::SESSION_IDENTITY_VARS {
+            if *var == "OPENCODE_SESSION_ID" {
+                assert!(OPENCODE_PLUGIN.contains("output.env.OPENCODE_SESSION_ID"));
+                continue;
+            }
+            assert!(
+                OPENCODE_PLUGIN.contains(&format!("\"{var}\"")),
+                "plugin must blank-scrub {var}"
+            );
+        }
+    }
+
+    /// In-process model of the plugin's event-loop discipline —
+    /// the state machine opencode_plugin.js's event handler must
+    /// implement. The source-invariant tests below pin the JS to
+    /// this model's critical ordering; the full JS is executable
+    /// manually via `node crates/cli/tests/opencode_plugin_lifecycle.mjs`.
+    struct LoopModel {
+        inflight: bool,
+        activity: u32,
+        seen_msgs: std::collections::HashSet<&'static str>,
+        pending_wait: Option<u32>,
+        arms: u32,
+        injections: u32,
+    }
+
+    impl LoopModel {
+        fn new() -> Self {
+            LoopModel {
+                inflight: false,
+                activity: 0,
+                seen_msgs: Default::default(),
+                pending_wait: None,
+                arms: 0,
+                injections: 0,
+            }
+        }
+
+        /// message.updated with role=user: activity is FIRST
+        /// SIGHTINGS of message ids only — opencode re-emits the
+        /// turn's own user message after idle (housekeeping).
+        fn user_message(&mut self, id: &'static str) {
+            if self.seen_msgs.insert(id) {
+                self.activity += 1;
+            }
+        }
+
+        fn idle(&mut self) {
+            if self.inflight {
+                return;
+            }
+            self.inflight = true;
+            self.arms += 1;
+            self.pending_wait = Some(self.activity);
+        }
+
+        /// The wait completes: the guard is released BEFORE the
+        /// injection decision — the injected turn's terminal idle
+        /// must arm the next wait (codex d7c8908).
+        fn wait_returns(&mut self, work: bool) {
+            let seen = self.pending_wait.take().expect("wait armed");
+            self.inflight = false;
+            if work && self.activity == seen {
+                self.injections += 1;
+            }
+        }
+    }
+
+    #[test]
+    fn opencode_loop_model_rearms_and_discards_stale() {
+        let mut m = LoopModel::new();
+        // Turn 1: the turn's own user message, then idle; opencode
+        // RE-updates that same message during the wait — a
+        // re-sighting must not discard the continuation.
+        m.user_message("msg_user_1");
+        m.idle();
+        m.user_message("msg_user_1");
+        m.wait_returns(true);
+        assert_eq!((m.arms, m.injections), (1, 1));
+        // The injected turn runs (its own user message appears),
+        // ends in a terminal idle: the next wait MUST arm even
+        // though the injected turn's prompt call may still be
+        // pending — the guard covers only the wait.
+        m.user_message("msg_inject_1");
+        m.idle();
+        m.wait_returns(true);
+        assert_eq!((m.arms, m.injections), (2, 2));
+        // A genuinely NEW user message during a wait discards.
+        m.idle();
+        m.user_message("msg_user_2");
+        m.wait_returns(true);
+        assert_eq!((m.arms, m.injections), (3, 2));
+        // An idle during an in-flight wait is ignored.
+        m.idle();
+        m.idle();
+        assert_eq!(m.arms, 4);
+    }
+
+    #[test]
+    fn opencode_plugin_releases_the_wait_guard_before_injecting() {
+        // The lifecycle regression (codex d7c8908): a guard held
+        // across the injection await swallows the injected turn's
+        // terminal session.idle and the loop goes dormant after one
+        // delivery. Pinned at the source level: the finally that
+        // releases the guard closes before the injection, which
+        // must sit OUTSIDE the guarded try and use promptAsync
+        // (return-on-accept), never the synchronous prompt().
+        let src = OPENCODE_PLUGIN;
+        let guarded_try = src.find("try {").expect("wait try block");
+        let release = src.find("} finally {").expect("guard release");
+        let inject = src
+            .find("client.session.promptAsync(")
+            .expect("promptAsync injection");
+        assert!(guarded_try < release && release < inject);
+        assert!(
+            !src[guarded_try..inject].contains("promptAsync("),
+            "injection must not be inside the wait guard"
+        );
+        assert!(
+            !src.contains("session.prompt("),
+            "the synchronous prompt() pins the whole model turn"
+        );
+    }
+
+    #[test]
+    fn opencode_plugin_staleness_counts_first_sightings_only() {
+        // Observed live: opencode re-emits message.updated for the
+        // turn's OWN user message right after session.idle; counting
+        // user-role events (rather than new ids) marks every wait
+        // stale and every continuation is silently discarded.
+        assert!(OPENCODE_PLUGIN.contains("!seenUserMessages.has(info.id)"));
+        assert!(OPENCODE_PLUGIN.contains("seenUserMessages.add(info.id)"));
+    }
+
+    #[test]
+    fn opencode_plugin_pins_the_loop_discipline() {
+        // Exact-session-only binding: no sessionID in the hook call
+        // (user PTYs) → no injection, never a cwd guess.
+        assert!(OPENCODE_PLUGIN.contains("if (!input.sessionID) return"));
+        // At most one in-flight wait per session.
+        assert!(OPENCODE_PLUGIN.contains("if (inflight.has(id)) return"));
+        // Stale continuations are discarded, not injected.
+        assert!(OPENCODE_PLUGIN.contains("!== seen) return"));
+        // The real command path, empty-stdout-quiescent wire.
+        assert!(OPENCODE_PLUGIN.contains("clank stop-hook --tool opencode"));
     }
 }

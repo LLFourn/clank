@@ -208,6 +208,13 @@ pub enum Tool {
     /// session env var in tool subprocesses (identity resolves via the
     /// newest session dir for the cwd).
     Grok,
+    /// opencode (anomalyco) — opencode-agent-tool M0. Session identity
+    /// comes from the clank opencode PLUGIN injecting
+    /// `OPENCODE_SESSION_ID` into shell executions (opencode exports
+    /// nothing natively); the work-loop shape is decided by the M1
+    /// spike. Serialized as `opencode` (one word, like the binary).
+    #[serde(rename = "opencode")]
+    OpenCode,
 }
 
 impl Tool {
@@ -216,6 +223,7 @@ impl Tool {
             Tool::Claude => "claude",
             Tool::Codex => "codex",
             Tool::Grok => "grok",
+            Tool::OpenCode => "opencode",
         }
     }
 }
@@ -319,6 +327,19 @@ mod role_rename_tests {
     fn role_reviewer_singular_string_deserializes() {
         let parsed: Role = serde_json::from_str(r#""reviewer""#).unwrap();
         assert_eq!(parsed, Role::Reviewer);
+    }
+
+    #[test]
+    fn tool_opencode_serializes_one_word() {
+        // opencode-agent-tool M0: the variant must serialize as
+        // "opencode" (one word, like the binary), not snake_cased.
+        assert_eq!(
+            serde_json::to_string(&super::Tool::OpenCode).unwrap(),
+            "\"opencode\""
+        );
+        let back: super::Tool = serde_json::from_str("\"opencode\"").unwrap();
+        assert_eq!(back, super::Tool::OpenCode);
+        assert_eq!(super::Tool::OpenCode.as_str(), "opencode");
     }
 
     #[test]

@@ -987,6 +987,9 @@ pub enum ToolArg {
     Claude,
     Codex,
     Grok,
+    /// One word, like the binary (clap would kebab-case the variant).
+    #[value(name = "opencode")]
+    OpenCode,
 }
 
 impl From<ToolArg> for clank_core::Tool {
@@ -995,6 +998,7 @@ impl From<ToolArg> for clank_core::Tool {
             ToolArg::Claude => clank_core::Tool::Claude,
             ToolArg::Codex => clank_core::Tool::Codex,
             ToolArg::Grok => clank_core::Tool::Grok,
+            ToolArg::OpenCode => clank_core::Tool::OpenCode,
         }
     }
 }

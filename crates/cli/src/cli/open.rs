@@ -142,7 +142,11 @@ pub struct AgentInfo {
     pub tool: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_session_id: Option<String>,
-    pub session_resumable: bool,
+    /// `None` = UNKNOWN: the tool's session store can't be probed yet
+    /// (opencode until opencode-agent-tool M2). Distinct from `false`
+    /// so clients are never told to discard/rebind a valid session
+    /// (codex e5d0880).
+    pub session_resumable: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -556,7 +560,7 @@ async fn clank_info_for_repo(
             last_session_id: session_id_str.clone(),
             session_resumable: resumable,
         });
-        if resumable {
+        if resumable == Some(true) {
             let tool = tool_str.clone().unwrap_or_default();
             let session_id = session_id_str.clone().unwrap_or_default();
             let command_hint = match tool.as_str() {
@@ -570,12 +574,16 @@ async fn clank_info_for_repo(
                 session_id,
                 command_hint,
             });
-        } else {
+        } else if resumable == Some(false) {
             recommendations.push(Recommendation::BindAgent {
                 label: Some(label.as_str().to_string()),
                 tool: tool_str,
             });
         }
+        // resumable == None (unknown, e.g. opencode pending M2):
+        // recommend NOTHING — the binding may be perfectly valid and
+        // a BindAgent hint would tell clients to discard it (codex
+        // e5d0880).
     }
 
     let (active_plans, waiting_on, fold_warning) = fold_summary(repo_root, home).await;
@@ -595,9 +603,9 @@ async fn clank_info_for_repo(
 fn agent_session_info(
     cfg: &AgentConfig,
     home: Option<&Path>,
-) -> (Option<String>, Option<String>, bool) {
+) -> (Option<String>, Option<String>, Option<bool>) {
     let Some(session) = cfg.session.as_ref() else {
-        return (None, None, false);
+        return (None, None, Some(false));
     };
     let tool_str = session.tool.as_str().to_string();
     let session_id = session.id.as_str().to_string();
@@ -605,14 +613,25 @@ fn agent_session_info(
     (Some(tool_str), Some(session_id), resumable)
 }
 
-fn session_jsonl_exists(tool: &Tool, session_id: &str, home: Option<&Path>) -> bool {
+/// `None` = the tool's store can't be probed yet — never conflated
+/// with "session gone" (codex e5d0880).
+fn session_jsonl_exists(tool: &Tool, session_id: &str, home: Option<&Path>) -> Option<bool> {
+    // opencode's store can't be probed until opencode-agent-tool M2:
+    // UNKNOWN unconditionally — with or without a HOME, a valid
+    // binding must never read as "definitely gone" (codex 5764fcf).
+    if matches!(tool, Tool::OpenCode) {
+        return None;
+    }
+    // No HOME keeps the pre-existing "not resumable" answer for the
+    // probeable tools.
     let Some(home) = home else {
-        return false;
+        return Some(false);
     };
     match tool {
-        Tool::Claude => claude_session_jsonl_exists(home, session_id),
-        Tool::Codex => codex_session_jsonl_exists(home, session_id),
-        Tool::Grok => grok_session_dir_exists(home, session_id),
+        Tool::Claude => Some(claude_session_jsonl_exists(home, session_id)),
+        Tool::Codex => Some(codex_session_jsonl_exists(home, session_id)),
+        Tool::Grok => Some(grok_session_dir_exists(home, session_id)),
+        Tool::OpenCode => None, // unreachable; kept exhaustive
     }
 }
 
@@ -903,5 +922,58 @@ mod open_args_tests {
         }
         let o = parse(&["t", "open", "dry", "/some/path"]);
         assert!(matches!(o.command, Some(OpenCmd::Dry(_))));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clank_core::agent_config::{AgentConfig, Session};
+
+    fn cfg_with(tool: Tool, id: &str) -> AgentConfig {
+        AgentConfig {
+            session: Some(Session {
+                id: clank_core::ids::SessionId::parse(id).unwrap(),
+                tool,
+                updated_at: "2026-08-03T00:00:00Z".to_string(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn opencode_resumability_is_unknown_not_false() {
+        // codex e5d0880: an un-probeable store must report UNKNOWN —
+        // never `false`, which downstream turns into a BindAgent
+        // "discard/rebind this session" recommendation for a binding
+        // that may be perfectly valid.
+        let home = std::env::temp_dir();
+        let (tool, sid, resumable) = agent_session_info(
+            &cfg_with(Tool::OpenCode, "ses_0af1b2c3d4e5f607"),
+            Some(&home),
+        );
+        assert_eq!(tool.as_deref(), Some("opencode"));
+        assert_eq!(sid.as_deref(), Some("ses_0af1b2c3d4e5f607"));
+        assert_eq!(resumable, None, "unknown, explicitly");
+        // …including with NO home at all (codex 5764fcf): the guard
+        // must not downgrade unknown to definitely-gone.
+        let (_, _, resumable) =
+            agent_session_info(&cfg_with(Tool::OpenCode, "ses_0af1b2c3d4e5f607"), None);
+        assert_eq!(resumable, None, "unknown independent of HOME");
+        // The JSON shape carries null (serialized field present).
+        let info = AgentInfo {
+            label: "kimi".into(),
+            tool,
+            last_session_id: sid,
+            session_resumable: resumable,
+        };
+        let v = serde_json::to_value(&info).unwrap();
+        assert!(v["session_resumable"].is_null());
+        // A probeable tool with no session file stays a definite false.
+        let (_, _, resumable) = agent_session_info(
+            &cfg_with(Tool::Claude, "11111111-2222-3333-4444-555555555555"),
+            Some(&home),
+        );
+        assert_eq!(resumable, Some(false));
     }
 }

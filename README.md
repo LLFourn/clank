@@ -22,12 +22,14 @@ clank setup
 ```
 
 This installs the role-split skills (`clank-master`, `clank-reviewer`,
-plus `clank-pr-review`) into `~/.claude/`, `~/.codex/`, and
-`~/.grok/`, a `/clank` slash command for claude, and tag-merges a Stop
-hook entry into claude's `settings.json` and codex's `hooks.json`
-(grok has no active hooks — its skill carries the work loop). Re-run
-`clank setup` after upgrading the binary; `--force` refreshes skill
-files you've locally edited.
+plus `clank-pr-review`) into `~/.claude/`, `~/.codex/`, `~/.grok/`,
+and `~/.config/opencode/`, a `/clank` slash command for claude, the
+clank opencode plugin (`~/.config/opencode/plugin/clank.js` — session
+binding + work loop), and tag-merges a Stop hook entry into claude's
+`settings.json` and codex's `hooks.json` (grok has no active hooks —
+its skill carries the work loop). Re-run `clank setup` after
+upgrading the binary; `--force` refreshes skill files you've locally
+edited.
 
 Verify with:
 
@@ -115,6 +117,18 @@ auto-mode drives it:
 - **grok** — has no active hooks; its skill (and the auto-on launch
   prompt from `clank agent start`) teach it to arm the background
   wait itself.
+- **opencode** — the clank plugin long-polls in-hook on
+  `session.idle` and injects the items as a new prompt; the agent
+  never arms anything. The launch profile carries the model: after
+  `clank agent add kimi --tool opencode`, edit the agent's entry in
+  `.clank/config.json` (or `~/.clank/config.json` for `--global`):
+
+  ```json
+  "kimi": {
+    "tool": "opencode",
+    "launch": { "args": ["--model", "moonshot/kimi-k3"] }
+  }
+  ```
 
 Auto-mode is per-agent (`clank auto on|off|status`), inheriting a
 user-global default (`~/.clank/config.json`'s `"auto"`) when unset —
@@ -166,7 +180,7 @@ Run `clank <cmd> --help` for details; the skills carry the depth.
 | Command | What it does |
 |---|---|
 | `init` | Scaffold `.clank/` (+ `--team <name>` to seed a roster) |
-| `setup` | Install skills + hook entries into `~/.claude`, `~/.codex`, `~/.grok` |
+| `setup` | Install skills, hooks + the opencode plugin into `~/.claude`, `~/.codex`, `~/.grok`, `~/.config/opencode` |
 | `doctor` | Diagnose repo / user / session setup; exits 1 on FAIL |
 | `as` | Bind this agent session to a roster label |
 | `auto` | Per-agent auto-mode on / off / status |
@@ -217,6 +231,8 @@ committed. Everything else is per-user state.
 ~/.claude/skills/{clank-master,clank-reviewer,clank-pr-review}/
 ~/.codex/skills/{clank-master,clank-reviewer,clank-pr-review}/
 ~/.grok/skills/{clank-master,clank-reviewer,clank-pr-review}/
+~/.config/opencode/skills/{clank-master,clank-reviewer,clank-pr-review}/
+~/.config/opencode/plugin/clank.js  # opencode binding + work-loop plugin
 ~/.claude/settings.json             # claude Stop hook tag-merged in
 ~/.codex/hooks.json                 # codex Stop hook tag-merged in
 ~/.clank/config.json                # agent library, teams, hooks, defaults

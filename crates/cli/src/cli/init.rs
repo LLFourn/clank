@@ -71,7 +71,7 @@ pub async fn run(args: InitArgs) -> anyhow::Result<()> {
 /// Write a valid empty new-shape [`RepoConfigFile`] (an empty
 /// roster). Standalone — needs no user-scope template. The repo
 /// then has a parseable config; the user adds agents via
-/// `clank agent add <label> --tool <claude|codex|grok>` and designates
+/// `clank agent add <label> --tool <claude|codex|grok|opencode>` and designates
 /// a master via `clank agent promote <agent>` before any
 /// workflow command works.
 ///
@@ -85,7 +85,7 @@ fn bootstrap_empty_repo_config(repo: &Path) -> anyhow::Result<()> {
     write_repo_config(&repo_cfg_path, &RepoConfigFile::default())?;
     eprintln!(
         "wrote empty roster to {} — add agents with \
-         `clank agent add <label> --tool <claude|codex|grok>` and pick a master with \
+         `clank agent add <label> --tool <claude|codex|grok|opencode>` and pick a master with \
          `clank agent promote <agent>`",
         repo_cfg_path.display()
     );
@@ -498,7 +498,7 @@ fn team_parse_error(
                     "team `{team_name}` member `{member}` in user-scope `teams` is malformed \
                      ({member_err}); a member must be a reference \
                      (`{{\"role\": \"<master|commit|gate>\", \"agent\"?: \"<library agent>\"}}`) \
-                     or a full inline definition (`{{\"tool\": \"<claude|codex|grok>\", \"role\": ...}}`)"
+                     or a full inline definition (`{{\"tool\": \"<claude|codex|grok|opencode>\", \"role\": ...}}`)"
                 );
             }
         }

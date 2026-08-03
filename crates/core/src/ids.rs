@@ -378,10 +378,11 @@ impl SessionId {
     /// Parse the opaque session id produced by the running agent.
     /// Claude sets `CLAUDE_CODE_SESSION_ID` to a UUID v4 (36 chars);
     /// codex sets `CODEX_THREAD_ID` to a ULID rendered in the same
-    /// 36-char dashed shape. Both use only `[0-9a-zA-Z-]`. We
-    /// validate that charset over 8–128 chars: tight enough to
-    /// catch typos, loose enough to survive if either agent
-    /// changes its render (e.g. removes dashes).
+    /// 36-char dashed shape; opencode generates `ses_<payload>` —
+    /// which is why `_` is admitted (opencode-agent-tool M0). We
+    /// validate `[0-9a-zA-Z-_]` over 8–128 chars: tight enough to
+    /// catch typos, loose enough to survive if an agent changes its
+    /// render.
     pub fn parse(s: &str) -> Result<Self, IdError> {
         const KIND: &str = "SessionId";
         const MIN: usize = 8;
@@ -395,7 +396,7 @@ impl SessionId {
             });
         }
         for ch in s.chars() {
-            if !(ch.is_ascii_alphanumeric() || ch == '-') {
+            if !(ch.is_ascii_alphanumeric() || ch == '-' || ch == '_') {
                 return Err(IdError::ForbiddenChar {
                     kind: KIND,
                     ch,
@@ -520,6 +521,17 @@ mod tests {
 
     fn p(s: &str) -> PathBuf {
         PathBuf::from(s)
+    }
+
+    #[test]
+    fn session_id_accepts_opencodes_ses_shape() {
+        // opencode-agent-tool M0: opencode generates ses_<payload>;
+        // underscores are part of the accepted charset now.
+        let id = SessionId::parse("ses_8f2a1b3c4d5e6f70").unwrap();
+        assert_eq!(id.as_str(), "ses_8f2a1b3c4d5e6f70");
+        assert!(SessionId::parse("ses_with-mixed-01_AB").is_ok());
+        assert!(SessionId::parse("bad space").is_err());
+        assert!(SessionId::parse("bad/slash").is_err());
     }
 
     #[test]

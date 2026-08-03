@@ -376,13 +376,15 @@ fn compose_bootstrap_launch(
         .map(|l| l.args.clone())
         .unwrap_or_default();
     push_grok_trust(desc.tool, &mut args);
-    args.push(bootstrap_bind_prompt(label));
+    push_prompt(desc.tool, &mut args, bootstrap_bind_prompt(label));
 
-    let env_overrides = desc
-        .launch
-        .as_ref()
-        .map(|l| l.env.clone())
-        .unwrap_or_default();
+    let mut env_overrides = tool_env_defaults(desc.tool);
+    env_overrides.extend(
+        desc.launch
+            .as_ref()
+            .map(|l| l.env.clone())
+            .unwrap_or_default(),
+    );
 
     Ok(ComposedLaunch {
         program,
@@ -391,16 +393,19 @@ fn compose_bootstrap_launch(
     })
 }
 
-/// Launch a FORKED copy of a source session (clank fork): both
-/// tools fork cleanly — `claude --resume <src> --fork-session`
+/// Launch a FORKED copy of a source session (clank fork): every
+/// tool forks cleanly — `claude --resume <src> --fork-session`
 /// mints a diverged session; `codex fork -C <worktree> <src>
-/// [prompt]` likewise. `worktree` is this agent's resolved repo (the
-/// fork dest). codex's `-C/--cd` is REQUIRED: forking a session
-/// whose recorded cwd differs from the launch cwd otherwise makes
-/// codex interactively prompt "Choose working directory…" every time
+/// [prompt]` likewise; `opencode --session <src> --fork` branches
+/// under a fresh `ses_` id (verified live, opencode-agent-tool M2).
+/// `worktree` is this agent's resolved repo (the fork dest).
+/// codex's `-C/--cd` is REQUIRED: forking a session whose recorded
+/// cwd differs from the launch cwd otherwise makes codex
+/// interactively prompt "Choose working directory…" every time
 /// (fork-codex-cd-flag); naming the worktree explicitly skips that
 /// picker. claude takes the cwd from the pane and doesn't prompt.
-/// The orientation prompt rides as the trailing positional on both.
+/// The orientation prompt rides in each tool's prompt slot
+/// ([`push_prompt`]).
 fn compose_fork_launch(
     spec: &crate::cli::fork::ForkSpec,
     desc: &AgentDescription,
@@ -436,23 +441,45 @@ fn compose_fork_launch(
             args.push(sid.clone());
             args.push("--fork-session".into());
         }
+        // opencode: `--session <src> --fork` — the TUI resumes a COPY
+        // and mints a fresh `ses_` id; the source is untouched. The
+        // new id binds later via the plugin + `clank as` (same as a
+        // fresh start). cwd comes from the pane, like claude.
+        (Some(sid), Tool::OpenCode) => {
+            args.push("--session".into());
+            args.push(sid.clone());
+            args.push("--fork".into());
+        }
         // No source session to fork (fork-robustness): launch a FRESH
         // session — same shape as the bootstrap launch, but carrying
         // the fork's orientation prompt instead of the bare bind hint.
         (None, _) => {}
     }
     push_grok_trust(spec.tool, &mut args);
-    args.push(spec.prompt.clone());
-    let env_overrides = desc
-        .launch
-        .as_ref()
-        .map(|l| l.env.clone())
-        .unwrap_or_default();
+    push_prompt(spec.tool, &mut args, spec.prompt.clone());
+    let mut env_overrides = tool_env_defaults(spec.tool);
+    env_overrides.extend(
+        desc.launch
+            .as_ref()
+            .map(|l| l.env.clone())
+            .unwrap_or_default(),
+    );
     ComposedLaunch {
         program,
         args,
         env_overrides,
     }
+}
+
+/// Append the launch prompt in the tool's own dialect: opencode's
+/// TUI positional is a PROJECT PATH (a prompt there would be read as
+/// a directory), so its prompt rides behind `--prompt`; every other
+/// tool takes the trailing positional.
+fn push_prompt(tool: Tool, args: &mut Vec<String>, prompt: String) {
+    if tool == Tool::OpenCode {
+        args.push("--prompt".into());
+    }
+    args.push(prompt);
 }
 
 /// Seed prompt for the bootstrap launch. Verbatim per the plan's
@@ -463,6 +490,22 @@ pub(super) fn bootstrap_bind_prompt(label: &AgentLabel) -> String {
     format!("Run `clank as {}` to bind this session.", label.as_str())
 }
 
+/// Env defaults a tool's launch always carries; `launch.env` merges
+/// OVER these, so a user can override. opencode: its claude-compat
+/// scan surfaces ~/.claude/skills AND wins the name dedupe, so the
+/// claude-flavored role skills (which teach background-wait arming —
+/// the wrong loop for a plugin-driven tool) would shadow the
+/// opencode-composed copies setup installs to
+/// ~/.config/opencode/skills. Disabling the scan gives opencode the
+/// same per-tool skill model codex and grok already have.
+fn tool_env_defaults(tool: Tool) -> std::collections::BTreeMap<String, String> {
+    let mut env = std::collections::BTreeMap::new();
+    if tool == Tool::OpenCode {
+        env.insert("OPENCODE_DISABLE_CLAUDE_CODE_SKILLS".into(), "1".into());
+    }
+    env
+}
+
 /// Composed launch line: executable + argv + env additions.
 #[derive(Debug, Clone)]
 struct ComposedLaunch {
@@ -471,14 +514,16 @@ struct ComposedLaunch {
     env_overrides: std::collections::BTreeMap<String, String>,
 }
 
-/// Default `initial_prompt` for CLAUDE/CODEX when `auto_mode == On`
-/// and the declaration's `initial_prompt` field is unset. Verbatim per
-/// `agent-start-initial-prompt` Phase 3:
-/// - Triggers turn-end with minimum surface (both tools produce
-///   a one-line ack).
-/// - Does NOT instruct the agent to run `clank wait` itself (THEIR
-///   stop hook is the orchestrator; double-trigger to avoid). Grok
-///   has no hook and gets [`DEFAULT_AUTO_PROMPT_GROK`] instead.
+/// Default `initial_prompt` for CLAUDE/CODEX/OPENCODE when
+/// `auto_mode == On` and the declaration's `initial_prompt` field is
+/// unset. Verbatim per `agent-start-initial-prompt` Phase 3:
+/// - Triggers turn-end with minimum surface (a one-line ack).
+/// - Does NOT instruct the agent to run `clank wait` itself (an
+///   orchestrator reacts to the turn ending: claude/codex via their
+///   stop hook, opencode via the clank plugin's `session.idle`
+///   handler — opencode-agent-tool M1; a wait instruction here
+///   would double-trigger). Grok has no orchestrator and gets
+///   [`DEFAULT_AUTO_PROMPT_GROK`] instead.
 /// - Does NOT expose orchestration internals (no "stop hook",
 ///   no "work loop") — agent only learns contextual location.
 ///
@@ -526,7 +571,10 @@ pub(super) fn resolve_initial_prompt(
         // the arming itself (grok-first-turn-orchestration).
         return Some(match tool {
             Tool::Grok => DEFAULT_AUTO_PROMPT_GROK.to_string(),
-            Tool::Claude | Tool::Codex => DEFAULT_AUTO_PROMPT.to_string(),
+            // opencode joined the hook-driven side once the M1 spike
+            // proved the plugin loop (session.idle → stop-hook →
+            // inject) — the grok-style arming interim is gone.
+            Tool::Claude | Tool::Codex | Tool::OpenCode => DEFAULT_AUTO_PROMPT.to_string(),
         });
     }
     None
@@ -551,10 +599,11 @@ fn compose_launch(
     args.extend(session_restore);
     push_grok_trust(tool, &mut args);
     if let Some(prompt) = initial_prompt {
-        args.push(prompt.to_string());
+        push_prompt(tool, &mut args, prompt.to_string());
     }
 
-    let env_overrides = launch.map(|l| l.env.clone()).unwrap_or_default();
+    let mut env_overrides = tool_env_defaults(tool);
+    env_overrides.extend(launch.map(|l| l.env.clone()).unwrap_or_default());
 
     ComposedLaunch {
         program,
@@ -587,6 +636,10 @@ fn session_restore_args(tool: Tool, session_id: &str, repo: &Path) -> Vec<String
             "--cwd".into(),
             repo.to_string_lossy().into_owned(),
         ],
+        // Per `opencode run --help`: `-s/--session <id>` continues a
+        // session; the M1 spike verifies the TUI accepts the same
+        // (opencode-agent-tool M0 — full start/resume is M2).
+        Tool::OpenCode => vec!["--session".into(), session_id.into()],
     }
 }
 
@@ -623,11 +676,27 @@ fn shell_quote(s: &str) -> String {
     out
 }
 
+/// A fresh agent launch must not INHERIT another agent's identity:
+/// agent sessions export their session vars to every shell, so a
+/// tool started from inside one (or from a pane server that kept
+/// them) sees the parent's identity and either dies in
+/// ConflictingSessions or silently binds as the parent — observed
+/// live with opencode under a claude shell (opencode-agent-tool M1).
+/// Each tool re-exports its own identity to its children, so
+/// scrubbing is always safe; deliberate `launch.env` overrides are
+/// applied after and win.
+fn scrub_inherited_identity(cmd: &mut std::process::Command) {
+    for var in crate::agent_env::SESSION_IDENTITY_VARS {
+        cmd.env_remove(var);
+    }
+}
+
 #[cfg(unix)]
 fn exec_composed(c: ComposedLaunch) -> anyhow::Result<()> {
     use std::os::unix::process::CommandExt;
     let mut cmd = std::process::Command::new(&c.program);
     cmd.args(&c.args);
+    scrub_inherited_identity(&mut cmd);
     for (k, v) in &c.env_overrides {
         cmd.env(k, v);
     }
@@ -643,8 +712,10 @@ fn exec_composed(c: ComposedLaunch) -> anyhow::Result<()> {
     // Non-unix fallback: spawn + wait. Process replacement isn't
     // available on Windows; the calling shell sees clank exit
     // with the child's status.
-    let status = std::process::Command::new(&c.program)
-        .args(&c.args)
+    let mut cmd = std::process::Command::new(&c.program);
+    cmd.args(&c.args);
+    scrub_inherited_identity(&mut cmd);
+    let status = cmd
         .envs(c.env_overrides.iter())
         .status()
         .map_err(|e| anyhow::anyhow!("failed to spawn `{}`: {e}", c.program))?;
@@ -802,9 +873,9 @@ pub fn add_repo_roster_agent_by_name(
     let desc = user_desc.ok_or_else(|| {
         anyhow::anyhow!(
             "unknown agent `{label}`: not in the user-scope `agents` library. \
-             Define it inline with `clank agent add {label} --tool <claude|codex|grok>`, \
+             Define it inline with `clank agent add {label} --tool <claude|codex|grok|opencode>`, \
              or add it to the library first with \
-             `clank agent add {label} --global --tool <claude|codex|grok>`.",
+             `clank agent add {label} --global --tool <claude|codex|grok|opencode>`.",
             label = label.as_str()
         )
     })?;
@@ -840,7 +911,7 @@ pub fn set_repo_master(repo: &Path, label: &AgentLabel) -> anyhow::Result<()> {
     if !repo_cfg.agents.contains_key(label) {
         anyhow::bail!(
             "agent `{label}` is not on this repo's roster. \
-             Add it first with `clank agent add {label} --tool <claude|codex|grok>` \
+             Add it first with `clank agent add {label} --tool <claude|codex|grok|opencode>` \
              (or by name: `clank agent add {label}`).",
             label = label.as_str()
         );
@@ -1103,6 +1174,19 @@ mod tests {
 
     fn label(s: &str) -> AgentLabel {
         AgentLabel::parse(s).unwrap()
+    }
+
+    #[test]
+    fn opencode_restore_args_use_session_flag() {
+        // opencode-agent-tool M0: per `opencode run --help`,
+        // -s/--session continues a session (the M1 spike verifies the
+        // TUI form; full composition is M2).
+        let args = session_restore_args(
+            clank_core::Tool::OpenCode,
+            "ses_8f2a1b3c4d5e6f70",
+            std::path::Path::new("/repo"),
+        );
+        assert_eq!(args, vec!["--session", "ses_8f2a1b3c4d5e6f70"]);
     }
 
     #[test]
@@ -1634,9 +1718,10 @@ mod tests {
     fn resolve_initial_prompt_uses_default_when_auto_on_and_declaration_unset() {
         // Pinned: exact equality against the constant so a future
         // tweak to DEFAULT_AUTO_PROMPT fails the test deliberately.
-        // Claude AND codex get the bare ack — their stop hook
-        // orchestrates after it.
-        for tool in [Tool::Claude, Tool::Codex] {
+        // Claude, codex AND opencode get the bare ack — an
+        // orchestrator (stop hook / clank plugin) reacts to the
+        // turn ending.
+        for tool in [Tool::Claude, Tool::Codex, Tool::OpenCode] {
             let out = resolve_initial_prompt(None, AutoMode::On, tool);
             assert_eq!(out, Some("Session resumed.".to_string()));
         }
@@ -1692,6 +1777,130 @@ mod tests {
 
     // ── compose_bootstrap_launch policy tests ─────────────────
     // Plan: agent-start-bootstraps-missing-skeleton.
+
+    #[test]
+    fn opencode_prompts_ride_behind_the_prompt_flag() {
+        // opencode's TUI positional is a PROJECT PATH — a prompt
+        // pushed as the trailing positional would be read as a
+        // directory (opencode-agent-tool M2). Every launch mode's
+        // prompt must use `--prompt`.
+        let desc = desc_with(
+            Tool::OpenCode,
+            Some(LaunchConfig {
+                command: None,
+                args: vec!["--model".into(), "moonshot/kimi-k3".into()],
+                env: Default::default(),
+            }),
+        );
+        let c = compose_bootstrap_launch(&label("kimi"), &desc).expect("compose");
+        assert_eq!(c.program, "opencode");
+        assert_eq!(
+            c.args,
+            vec![
+                "--model".to_string(),
+                "moonshot/kimi-k3".to_string(),
+                "--prompt".to_string(),
+                "Run `clank as kimi` to bind this session.".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn opencode_fork_resumes_a_copy_under_the_fork_flag() {
+        // `opencode --session <src> --fork` branches the source under
+        // a fresh ses_ id (verified live, opencode-agent-tool M2); the
+        // orientation prompt rides behind --prompt like every other
+        // opencode launch.
+        let desc = desc_with(Tool::OpenCode, None);
+        let spec = crate::cli::fork::ForkSpec {
+            tool: Tool::OpenCode,
+            from_session: Some("ses_039d60658ffe0RPgue3noZ0Qqf".into()),
+            prompt: "orient".into(),
+        };
+        let c = compose_fork_launch(&spec, &desc, Path::new("/repo/.clank/worktrees/x"));
+        assert_eq!(c.program, "opencode");
+        assert_eq!(
+            c.args,
+            vec![
+                "--session",
+                "ses_039d60658ffe0RPgue3noZ0Qqf",
+                "--fork",
+                "--prompt",
+                "orient",
+            ]
+        );
+    }
+
+    #[test]
+    fn opencode_launches_disable_the_claude_compat_skill_scan() {
+        // The claude-flavored role skills teach background-wait
+        // arming — wrong for a plugin-driven tool — and WIN
+        // opencode's name dedupe over the native copies setup
+        // installs (observed live). Every opencode launch mode
+        // disables the compat scan; a deliberate launch.env override
+        // wins.
+        let desc = desc_with(Tool::OpenCode, None);
+        let c = compose_bootstrap_launch(&label("kimi"), &desc).expect("compose");
+        assert_eq!(
+            c.env_overrides.get("OPENCODE_DISABLE_CLAUDE_CODE_SKILLS"),
+            Some(&"1".to_string())
+        );
+        let mut env = std::collections::BTreeMap::new();
+        env.insert(
+            "OPENCODE_DISABLE_CLAUDE_CODE_SKILLS".to_string(),
+            "0".to_string(),
+        );
+        let desc = desc_with(
+            Tool::OpenCode,
+            Some(LaunchConfig {
+                command: None,
+                args: vec![],
+                env,
+            }),
+        );
+        let c = compose_bootstrap_launch(&label("kimi"), &desc).expect("compose");
+        assert_eq!(
+            c.env_overrides.get("OPENCODE_DISABLE_CLAUDE_CODE_SKILLS"),
+            Some(&"0".to_string())
+        );
+        // Other tools carry no opencode default.
+        let desc = desc_with(Tool::Claude, None);
+        let c = compose_bootstrap_launch(&label("phantom"), &desc).expect("compose");
+        assert!(c.env_overrides.is_empty());
+    }
+
+    #[test]
+    fn launches_scrub_every_inherited_identity_var() {
+        // The child env must not carry ANOTHER agent's identity
+        // (observed live: opencode under a claude shell bound the
+        // claude session — opencode-agent-tool M1). Asserted at the
+        // Command level via get_envs: scrubbed vars map to None
+        // (explicit removal), and a deliberate launch.env override
+        // applied after still wins.
+        let mut cmd = std::process::Command::new("true");
+        scrub_inherited_identity(&mut cmd);
+        cmd.env("CLAUDE_CODE_SESSION_ID", "deliberate");
+        let envs: std::collections::BTreeMap<_, _> = cmd
+            .get_envs()
+            .map(|(k, v)| (k.to_os_string(), v.map(|v| v.to_os_string())))
+            .collect();
+        for var in [
+            "CODEX_THREAD_ID",
+            "OPENCODE_SESSION_ID",
+            "GROK_AGENT",
+            "CLANK_AGENT",
+        ] {
+            assert_eq!(
+                envs.get(std::ffi::OsStr::new(var)),
+                Some(&None),
+                "{var} must be removed"
+            );
+        }
+        assert_eq!(
+            envs.get(std::ffi::OsStr::new("CLAUDE_CODE_SESSION_ID")),
+            Some(&Some("deliberate".into()))
+        );
+    }
 
     fn desc_with(tool: Tool, launch: Option<LaunchConfig>) -> AgentDescription {
         AgentDescription {

@@ -1,7 +1,8 @@
 //! `clank as <label>` — bind the calling agent's session to a
 //! clank label.
 //!
-//! Reads `CLAUDE_CODE_SESSION_ID` / `CODEX_THREAD_ID` from env,
+//! Reads `CLAUDE_CODE_SESSION_ID` / `CODEX_THREAD_ID` /
+//! `OPENCODE_SESSION_ID` from env,
 //! writes `.clank/agents/<label>/config.json` with the session
 //! field set, and clears the same session id from any OTHER
 //! agent's config (one session can't be bound to two labels at
@@ -26,8 +27,9 @@ pub async fn run(args: AsArgs) -> anyhow::Result<()> {
     let (tool, session_id) = detect_session_from_env()?.ok_or_else(|| {
         anyhow::anyhow!(
             "no session detected in env (CLAUDE_CODE_SESSION_ID / \
-             CODEX_THREAD_ID not set). `clank as` must be run from \
-             inside a claude, codex, or grok session."
+             CODEX_THREAD_ID / OPENCODE_SESSION_ID not set). `clank as` \
+             must be run from inside a claude, codex, grok, or opencode \
+             session."
         )
     })?;
 

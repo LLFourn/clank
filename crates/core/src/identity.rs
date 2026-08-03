@@ -58,7 +58,7 @@ pub struct IdentityInputs<'a> {
 pub enum ResolveError {
     /// Caller wasn't running inside an agent (no session id env
     /// var, no hook stdin) AND no `CLANK_AGENT` override. Fix:
-    /// pass `--author` explicitly or run inside claude/codex/grok.
+    /// pass `--author` explicitly or run inside claude/codex/grok/opencode.
     NoSession,
     /// Running inside an agent, session id resolved, but no agent
     /// config in this repo has bound that session id. Fix: run
@@ -76,7 +76,7 @@ impl std::fmt::Display for ResolveError {
         match self {
             ResolveError::NoSession => f.write_str(
                 "no session detected — pass --author <label> or run \
-                 inside claude/codex/grok",
+                 inside claude/codex/grok/opencode",
             ),
             ResolveError::NoAgentForSession { session_id, tool } => write!(
                 f,

@@ -67,7 +67,7 @@ must amend BEFORE anything else proceeds. Three ways to break it:
 - `clank stash push <plan>` / `clank stash pop <plan>` — set a plan's commits
   aside / restore them (reviews reset on restore); `clank purge --drop
   <plan>` fully deletes a plan (commits + body)
-- roster: `clank agent add <name> [--tool claude|codex|grok] [--review
+- roster: `clank agent add <name> [--tool claude|codex|grok|opencode] [--review
   commit|plan|final|gate]` (by name from the global library, or `--tool`
   to define inline), `clank agent promote <name>` (elevate an agent to
   master, demoting the current one — NOT `clank queue promote`, which

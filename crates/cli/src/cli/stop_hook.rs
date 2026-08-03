@@ -134,30 +134,56 @@ async fn compute_outcome(
                 },
             },
             // NoBackgroundWork (YieldArmed already returned above): genuinely idle.
-            _ => match tool {
+            _ => match loop_policy(tool) {
                 // Claude never waits in-hook and never renders work items —
                 // the hook's only continuation is the arm-the-wait hint, and
                 // the armed wait's completion wake delivers the work. Work
                 // presence is deliberately NOT consulted: if work exists the
                 // armed wait exits immediately and the wake carries it
                 // (claude-stop-hook-minimal-hint).
-                Tool::Claude => HookOutcome::Continue {
+                LoopPolicy::BackgroundArm => HookOutcome::Continue {
                     reason: nudge_reason(&input),
                 },
-                // Codex has no background-task wake channel, so the in-hook
-                // long-poll + block-with-items model stays.
-                Tool::Codex => {
+                // The in-hook long-poll + emit-with-items model: codex
+                // blocks with the items; opencode's plugin injects
+                // non-empty output on session.idle (M1 spike). No
+                // work / timeout is SILENT either way (codex 8000d6e:
+                // a nudge relay would loop an opencode session
+                // forever).
+                LoopPolicy::InHookWait => {
                     let wait_timeout = cfg.as_ref().and_then(|c| c.wait_timeout.clone());
                     compute_wait_outcome(&repo, &label, role, wait_timeout.as_deref()).await
                 }
                 // Grok's hooks are PASSIVE (grok-first-class): clank
                 // installs no grok adapter and no continuation could
                 // drive it. If something wires this up anyway, say so.
-                Tool::Grok => HookOutcome::Diagnostic {
+                LoopPolicy::Passive => HookOutcome::Diagnostic {
                     message: "hook: grok has no stop-hook adapter (grok hooks are passive)".into(),
                 },
             },
         },
+    }
+}
+
+/// Which continuation model a tool's stop-hook uses — the PURE
+/// tool→loop-policy decision (codex fbc5da1), so routing is testable
+/// without the spawning wait path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoopPolicy {
+    /// Background-armed wait; the hook only nudges (claude).
+    BackgroundArm,
+    /// In-hook long-poll; non-empty output is the continuation
+    /// (codex blocks with it, opencode's plugin injects it).
+    InHookWait,
+    /// Passive hooks; nothing can drive a continuation (grok).
+    Passive,
+}
+
+fn loop_policy(tool: Tool) -> LoopPolicy {
+    match tool {
+        Tool::Claude => LoopPolicy::BackgroundArm,
+        Tool::Codex | Tool::OpenCode => LoopPolicy::InHookWait,
+        Tool::Grok => LoopPolicy::Passive,
     }
 }
 
@@ -608,6 +634,13 @@ fn emit_and_exit(outcome: HookOutcome, tool: Tool) -> ! {
             eprintln!("{reason}");
             std::process::exit(HOOK_OK_EXIT);
         }
+        // opencode wire (settled by the M1 spike): plain text on
+        // stdout = a continuation for the plugin to inject; EMPTY
+        // stdout (the Silent arm) = stay quiescent. Exit 0 either way.
+        (HookOutcome::Continue { reason }, Tool::OpenCode) => {
+            println!("{reason}");
+            std::process::exit(HOOK_OK_EXIT);
+        }
         (HookOutcome::Silent { .. }, _) => {
             std::process::exit(HOOK_OK_EXIT);
         }
@@ -646,10 +679,58 @@ mod tests {
     }
 
     fn bind(repo: &Path, label: &str, session: &str) -> AgentLabel {
+        bind_tool(repo, label, session, Tool::Claude)
+    }
+
+    fn bind_tool(repo: &Path, label: &str, session: &str, tool: Tool) -> AgentLabel {
         let label = AgentLabel::parse(label).unwrap();
         let sid = clank_core::ids::SessionId::parse(session).unwrap();
-        crate::agent_store::bind_session_to_agent(repo, &label, Tool::Claude, &sid).unwrap();
+        crate::agent_store::bind_session_to_agent(repo, &label, tool, &sid).unwrap();
         label
+    }
+
+    #[tokio::test]
+    async fn opencode_binding_resolves_and_idle_routes_a_nudge() {
+        // opencode-agent-tool M0: a ses_-shaped binding persists,
+        // resolves the label from the session id, and the idle
+        // outcome routes the claude-style nudge the plugin relays
+        // (final wire shape is the M1 spike's).
+        let dir = init_repo();
+        let repo = dir.path();
+        let label = bind_tool(repo, "kimi", "ses_0af1b2c3d4e5f607", Tool::OpenCode);
+        crate::agent_store::set_auto_mode(repo, &label, AutoMode::On).unwrap();
+        crate::cli::agent::add_repo_roster_agent(
+            repo,
+            &label,
+            crate::cli::teams_config::AgentDescription {
+                tool: Tool::OpenCode,
+                launch: None,
+                initial_prompt: None,
+            },
+            crate::cli::teams_config::RosterRole::Commit,
+        )
+        .unwrap();
+        crate::cli::agent::set_repo_master(repo, &label).unwrap();
+        std::fs::create_dir_all(repo.join(".clank/plans")).unwrap();
+
+        // The persisted binding round-trips: tool + ses_ id.
+        let cfg = crate::agent_store::load_agent_config(repo, &label)
+            .unwrap()
+            .unwrap();
+        let sess = cfg.session.expect("binding persisted");
+        assert_eq!(sess.tool, Tool::OpenCode);
+        assert_eq!(sess.id.as_str(), "ses_0af1b2c3d4e5f607");
+
+        // Routing is pinned at the PURE boundary — no spawning wait
+        // path in unit tests (codex fbc5da1): opencode shares codex's
+        // in-hook long-poll policy, whose no-work outcome is silence,
+        // never the claude arming nudge (codex 8000d6e: a non-empty
+        // relay would loop an opencode session forever). The live
+        // spike proved the empty/work/quiescent wire with the real
+        // binary.
+        assert_eq!(loop_policy(Tool::OpenCode), loop_policy(Tool::Codex));
+        assert_eq!(loop_policy(Tool::OpenCode), LoopPolicy::InHookWait);
+        assert_ne!(loop_policy(Tool::OpenCode), loop_policy(Tool::Claude));
     }
 
     #[tokio::test]

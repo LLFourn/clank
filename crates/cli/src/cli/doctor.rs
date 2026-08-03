@@ -222,6 +222,31 @@ pub fn repo_checks(repo: &Path, home: Option<&Path>) -> Vec<CheckResult> {
     }
 
     for (label, role_str, desc) in &members {
+        // The EFFECTIVE launch executable on $PATH? — explicit
+        // `launch.command` or the tool's bare default. Launch
+        // feasibility comes from the ROSTER description alone, so
+        // this runs before any skeleton/session early-outs: a
+        // freshly added agent with no skeleton yet is exactly the
+        // state where a missing binary should be diagnosed (codex
+        // 0c90514/00fc9b4).
+        let program = effective_launch_program(desc);
+        if which::which(&program).is_err() {
+            let source = if desc.launch.as_ref().is_some_and(|l| l.command.is_some()) {
+                "launch.command"
+            } else {
+                "tool default"
+            };
+            out.push(CheckResult::warn(
+                SECTION,
+                format!("agent: {} launch", label.as_str()),
+                format!(
+                    "`{program}` ({source}) not found on $PATH; \
+                     `clank agent start {}` will fail at exec time",
+                    label.as_str()
+                ),
+            ));
+        }
+
         let skeleton = match load_agent_config(repo, label) {
             Ok(s) => s,
             Err(e) => {
@@ -297,25 +322,6 @@ pub fn repo_checks(repo: &Path, home: Option<&Path>) -> Vec<CheckResult> {
             CheckResult::ok(SECTION, format!("agent: {}", label.as_str()), base_msg)
         };
         out.push(agent_check);
-
-        // `description.launch.command on $PATH?` — Warn if the
-        // configured launch command isn't found (catches typos
-        // before `clank agent start <label>` exec time).
-        if let Some(launch) = &desc.launch {
-            if let Some(cmd) = launch.command.as_deref() {
-                if which::which(cmd).is_err() {
-                    out.push(CheckResult::warn(
-                        SECTION,
-                        format!("agent: {} launch", label.as_str()),
-                        format!(
-                            "`launch.command = {cmd:?}` not found on $PATH; \
-                             `clank agent start {}` will fail at exec time",
-                            label.as_str()
-                        ),
-                    ));
-                }
-            }
-        }
     }
 
     // Orphan-skeleton check: walk .clank/agents/ and flag any
@@ -357,6 +363,16 @@ pub fn repo_checks(repo: &Path, home: Option<&Path>) -> Vec<CheckResult> {
 /// "ignored" is a Warn (means the root gitignore lacks a needed
 /// carve-out). The probed path doesn't need to exist on disk —
 /// git matches patterns, not files.
+/// The executable `clank agent start` will exec for a declaration:
+/// explicit `launch.command`, else the tool's bare name. Pure —
+/// the $PATH probe stays at the call site.
+fn effective_launch_program(desc: &crate::cli::teams_config::AgentDescription) -> String {
+    desc.launch
+        .as_ref()
+        .and_then(|l| l.command.clone())
+        .unwrap_or_else(|| desc.tool.as_str().to_string())
+}
+
 fn check_gitignore_probe(repo: &Path, rel: &str, expect_tracked: bool) -> CheckResult {
     const SECTION: &str = "repo";
     let ignored_by = crate::git_io::check_ignore(repo, rel);
@@ -482,23 +498,21 @@ fn user_checks() -> Vec<CheckResult> {
         }
     };
 
-    // Skill files. The `clank` skill is split by role (clank-master /
-    // clank-reviewer), both composed per tool from a single source.
-    use clank_core::vocab::{Role, Tool};
-    for (tool, tool_dir) in [(Tool::Claude, ".claude"), (Tool::Codex, ".codex")] {
-        for (role, skill) in [
-            (Role::Master, "clank-master"),
-            (Role::Reviewer, "clank-reviewer"),
-        ] {
-            let rel = format!("~/{tool_dir}/skills/{skill}/SKILL.md");
-            out.push(check_skill_file(
-                &home.join(format!("{tool_dir}/skills/{skill}/SKILL.md")),
-                &crate::cli::setup::compose_skill(role, tool),
-                &rel,
-            ));
-        }
-        // The pre-split `clank` skill must be gone — left in place it
-        // shadows the role skills with stale, role-jamming guidance.
+    // Every user-scope asset, from THE inventory setup installs from
+    // (setup/doctor parity by construction — codex 0c90514). This
+    // includes the opencode plugin: a missing or drifted plugin means
+    // opencode agents never bind and never receive work, silently
+    // (the wire is exit-0/empty by design).
+    for (rel, expected) in crate::cli::setup::user_asset_inventory() {
+        out.push(check_skill_file(
+            &home.join(&rel),
+            &expected,
+            &format!("~/{rel}"),
+        ));
+    }
+    // The pre-split `clank` skill must be gone — left in place it
+    // shadows the role skills with stale, role-jamming guidance.
+    for (_, tool_dir) in crate::cli::setup::TOOL_SKILL_DIRS {
         let obsolete = home.join(format!("{tool_dir}/skills/clank"));
         if obsolete.join("SKILL.md").exists() {
             out.push(CheckResult::warn(
@@ -511,26 +525,6 @@ fn user_checks() -> Vec<CheckResult> {
             ));
         }
     }
-    out.push(check_skill_file(
-        &home.join(".claude/skills/clank-pr-review/SKILL.md"),
-        crate::cli::setup::PR_REVIEW_SKILL_BODY,
-        "~/.claude/skills/clank-pr-review/SKILL.md",
-    ));
-    out.push(check_skill_file(
-        &home.join(".codex/skills/clank-pr-review/SKILL.md"),
-        crate::cli::setup::PR_REVIEW_SKILL_BODY,
-        "~/.codex/skills/clank-pr-review/SKILL.md",
-    ));
-    out.push(check_skill_file(
-        &home.join(".claude/skills/clank-github/SKILL.md"),
-        crate::cli::setup::GITHUB_SKILL_BODY,
-        "~/.claude/skills/clank-github/SKILL.md",
-    ));
-    out.push(check_skill_file(
-        &home.join(".codex/skills/clank-github/SKILL.md"),
-        crate::cli::setup::GITHUB_SKILL_BODY,
-        "~/.codex/skills/clank-github/SKILL.md",
-    ));
     // Hook entries.
     out.push(check_hook_entry(
         &home.join(".claude/settings.json"),
@@ -857,6 +851,33 @@ fn render(results: &[CheckResult], json: bool) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn effective_launch_program_prefers_command_then_tool_default() {
+        // The $PATH probe checks THIS resolution — an opencode agent
+        // with no launch block must resolve to the bare `opencode`
+        // (previously the default case was never checked at all).
+        use crate::cli::teams_config::AgentDescription;
+        use clank_core::vocab::Tool;
+        let desc = AgentDescription {
+            tool: Tool::OpenCode,
+            launch: None,
+            initial_prompt: None,
+        };
+        assert_eq!(super::effective_launch_program(&desc), "opencode");
+        let desc = AgentDescription {
+            tool: Tool::OpenCode,
+            launch: Some(clank_core::agent_config::LaunchConfig {
+                command: Some("my-opencode-wrapper".into()),
+                ..Default::default()
+            }),
+            initial_prompt: None,
+        };
+        assert_eq!(
+            super::effective_launch_program(&desc),
+            "my-opencode-wrapper"
+        );
+    }
+
     use super::*;
 
     fn init_git_repo() -> tempfile::TempDir {
@@ -903,6 +924,50 @@ mod tests {
             .expect("gitignore check ran");
         assert_eq!(gi.status, CheckStatus::Warn);
         assert!(gi.message.contains("clank init"));
+    }
+
+    #[test]
+    fn repo_checks_flag_missing_binary_for_a_skeletonless_agent() {
+        // The exact fresh state the check exists for (codex 00fc9b4):
+        // rostered via `clank agent add`, never bound, no
+        // .clank/agents/<label>/ skeleton — launch feasibility comes
+        // from the roster description alone and must be diagnosed
+        // before the missing-skeleton early-out.
+        use crate::cli::teams_config::{AgentDescription, RosterRole};
+        use clank_core::vocab::Tool;
+        let dir = init_git_repo();
+        crate::cli::agent::add_repo_roster_agent(
+            dir.path(),
+            &clank_core::ids::AgentLabel::parse("kimi").unwrap(),
+            AgentDescription {
+                tool: Tool::OpenCode,
+                launch: Some(clank_core::agent_config::LaunchConfig {
+                    command: Some("definitely-missing-opencode-binary".into()),
+                    ..Default::default()
+                }),
+                initial_prompt: None,
+            },
+            RosterRole::Master,
+        )
+        .unwrap();
+        let results = repo_checks(dir.path(), None);
+        let launch = results
+            .iter()
+            .find(|r| r.name == "agent: kimi launch")
+            .expect("launch check ran despite the missing skeleton");
+        assert_eq!(launch.status, CheckStatus::Warn);
+        assert!(
+            launch
+                .message
+                .contains("definitely-missing-opencode-binary")
+        );
+        // And the skeleton-less state still gets its own warning —
+        // the launch check runs IN ADDITION, not instead.
+        let agent = results
+            .iter()
+            .find(|r| r.name == "agent: kimi")
+            .expect("agent check ran");
+        assert_eq!(agent.status, CheckStatus::Warn);
     }
 
     #[test]
