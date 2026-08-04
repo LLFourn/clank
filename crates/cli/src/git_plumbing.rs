@@ -391,6 +391,47 @@ pub fn amend_no_edit(repo: &Path) -> anyhow::Result<()> {
     run(repo, &["commit", "--amend", "--no-edit", "--allow-empty"])
 }
 
+/// `git clone --quiet <source> <dest>` then `git -C <dest> checkout
+/// --quiet -b <name> <base_sha>` — a full LOCAL clone (independent
+/// config/remotes; `origin` = the source path) pinned to a branch at
+/// an explicit sha. gix has a clone API, but the local-transport
+/// clone + fresh-checkout path isn't proven here yet; subprocess
+/// like [`worktree_add`].
+pub fn clone_local(source: &Path, dest: &Path, name: &str, base_sha: &str) -> anyhow::Result<()> {
+    let out = Command::new("git")
+        .arg("clone")
+        .arg("--quiet")
+        .arg(source)
+        .arg(dest)
+        .output()
+        .context("spawning git clone")?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "git clone failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dest)
+        .args(["checkout", "--quiet", "-b", name, base_sha])
+        .output()
+        .context("spawning git checkout in the clone")?;
+    if !out.status.success() {
+        // This call created `dest` (the caller cloned into a path it
+        // verified absent) — remove it, or the next invocation finds
+        // a descriptor-less foreign dir and can never retry.
+        let _ = std::fs::remove_dir_all(dest);
+        anyhow::bail!(
+            "git checkout -b {name} {base_sha} failed in the clone (is the base \
+             reachable from the main repo's refs? a detached or unpushed-ref base \
+             can't ride a clone; the partial clone was removed): {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
 /// `git worktree add -b <name> <dest> <base>` — gix has no worktree
 /// creation.
 pub fn worktree_add(source: &Path, name: &str, dest: &Path, base: &str) -> anyhow::Result<()> {

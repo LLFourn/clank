@@ -153,6 +153,7 @@ pub async fn run(args: PrReviewArgs) -> anyhow::Result<()> {
                 pr: Some(a.pr),
                 branch: None,
                 path: None,
+                clone: false,
                 team: None,
                 drafts: Vec::new(),
                 prompt: None,

@@ -49,26 +49,29 @@ pub async fn run(args: OpenZellijArgs) -> anyhow::Result<()> {
     open_one(&target, args.print)
 }
 
-/// Resolve an EXISTING fork worktree `<source>/.clank/worktrees/<name>`,
-/// erroring if it's absent — `open` opens, `clank fork` creates
-/// (open-and-fork-idempotent).
+/// Resolve an EXISTING fork by name through THE shared model
+/// ([`crate::cli::fork::resolve_fork`]): a registered worktree on
+/// branch `<name>` or a descriptor-validated clone — one name
+/// namespace, so at most one exists. Errors if absent: `open` opens,
+/// `clank fork` creates (open-and-fork-idempotent).
 fn fork_path(source: &Path, name: &str) -> anyhow::Result<PathBuf> {
-    let p = source.join(".clank/worktrees").join(name);
-    if !p.is_dir() {
-        anyhow::bail!(
-            "no fork `{name}` at `{}` — create it with `clank fork {name}`",
-            p.display()
-        );
+    match crate::cli::fork::resolve_fork(source, name)? {
+        Some((_, p)) => Ok(p),
+        None => anyhow::bail!("no fork `{name}` — create it with `clank fork {name}`"),
     }
-    Ok(p)
 }
 
 /// Every worktree of `repo`'s repository — the main checkout PLUS every
-/// linked worktree — via `git worktree list --porcelain`. This is the
-/// `--all` target set: the repo itself and all its forks.
+/// linked worktree — via `git worktree list --porcelain`, PLUS every
+/// descriptor-VALIDATED clone fork from the shared model
+/// ([`crate::cli::fork::clone_fork_paths`]; git's worktree registry
+/// structurally cannot see clones). This is the `--all` target set:
+/// the repo itself and all its forks.
 fn worktree_paths(repo: &Path) -> anyhow::Result<Vec<PathBuf>> {
     let stdout = crate::git_plumbing::worktree_list_porcelain(repo)?;
-    Ok(parse_worktree_list(&stdout))
+    let mut targets = parse_worktree_list(&stdout);
+    targets.extend(crate::cli::fork::clone_fork_paths(repo));
+    Ok(targets)
 }
 
 /// Parse `git worktree list --porcelain` stdout → worktree paths
@@ -2571,17 +2574,55 @@ dead-one [Created 10h ago] (EXITED - attach to resurrect)
     }
 
     #[test]
-    fn fork_path_errors_when_absent_resolves_when_present() {
+    fn fork_path_errors_when_absent_resolves_registered_worktrees() {
+        // fork_path answers through the shared resolve_fork model:
+        // a REGISTERED worktree on the branch resolves (wherever it
+        // lives); a bare same-name directory is not a fork.
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(src)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{:?}: {out:?}", args);
+        };
+        git(&["init", "--quiet", "--initial-branch=main"]);
+        git(&[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "--allow-empty",
+            "-q",
+            "-m",
+            "seed",
+        ]);
         // Absent → error pointing at `clank fork`.
         let err = fork_path(src, "ghost").unwrap_err().to_string();
         assert!(err.contains("ghost") && err.contains("clank fork"), "{err}");
-        // Present → the worktree path.
+        // A bare unregistered dir in the default namespace is NOT a
+        // fork (identity is the registry, not the path).
         std::fs::create_dir_all(src.join(".clank/worktrees/foo")).unwrap();
+        assert!(fork_path(src, "foo").is_err());
+        // A registered worktree resolves — including one `--path`
+        // put OUTSIDE the default namespace.
+        let elsewhere = dir.path().join("elsewhere-wt");
+        git(&[
+            "worktree",
+            "add",
+            "--quiet",
+            "-b",
+            "bar",
+            elsewhere.to_str().unwrap(),
+        ]);
+        let resolved = fork_path(src, "bar").unwrap();
         assert_eq!(
-            fork_path(src, "foo").unwrap(),
-            src.join(".clank/worktrees/foo")
+            dunce::canonicalize(&resolved).unwrap(),
+            dunce::canonicalize(&elsewhere).unwrap()
         );
     }
 

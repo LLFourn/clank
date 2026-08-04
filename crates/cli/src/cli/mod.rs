@@ -167,6 +167,15 @@ pub struct ForkArgs {
     /// `<source>/.clank/worktrees/<name>`.
     #[arg(long, value_name = "DIR")]
     pub path: Option<PathBuf>,
+    /// Full local CLONE at `.clank/clones/<name>` instead of a
+    /// linked worktree: an independent repo whose only remote is
+    /// the local main root (removable — that's the point).
+    /// Conflicts with `--path` (clones are never relocated; the
+    /// descriptor, not the path, is the identity) and `--pr` (a
+    /// fetched PR head is reachable from no main-root ref, and git
+    /// does not guarantee unreachable objects survive a clone).
+    #[arg(long, conflicts_with_all = ["path", "pr"])]
+    pub clone: bool,
     /// Seed the fork's roster from this user-scope team template
     /// (`~/.clank/config.json#/teams`) instead of copying the source
     /// repo's roster. Members with a bound session in the source get

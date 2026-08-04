@@ -42,6 +42,114 @@ pub struct ForkSpec {
     pub prompt: String,
 }
 
+/// The durable identity record of a `--clone` fork, at
+/// `<dest>/.clank/fork.json` (gitignored via the inherited
+/// `.clank/.gitignore` allow-list). Every lifecycle decision —
+/// idempotent re-run, discovery, teardown — reads THIS and never
+/// the remote set: `git remote remove origin` is the feature's
+/// motivating act and must break nothing (fork-clone-option).
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct ForkDescriptor {
+    pub kind: String,
+    /// Canonical main repo root the clone was cut from.
+    pub source: PathBuf,
+    pub branch: String,
+    /// The pinned base sha the branch was created at.
+    pub base: String,
+}
+
+pub fn fork_descriptor_path(dest: &Path) -> PathBuf {
+    dest.join(".clank/fork.json")
+}
+
+pub fn load_fork_descriptor(dest: &Path) -> anyhow::Result<Option<ForkDescriptor>> {
+    let p = fork_descriptor_path(dest);
+    match std::fs::read_to_string(&p) {
+        Ok(raw) => Ok(Some(serde_json::from_str(&raw).with_context(|| {
+            format!("parsing fork descriptor `{}`", p.display())
+        })?)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("reading `{}`", p.display())),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForkKind {
+    Worktree,
+    Clone,
+}
+
+/// THE fork discovery/resolution model (fork-clone-option, codex
+/// 0013e7b): one place answers "is `<name>` a fork of this repo, and
+/// where" — creation's collision checks, `open --fork`, and `open
+/// --all` all consult it, so no doorway invents its own fork test.
+/// A worktree fork is a REGISTERED linked worktree on branch
+/// `<name>` (wherever `--path` put it — the registry, not the
+/// default namespace, is the authority); a clone fork is a
+/// descriptor-VALIDATED repo at `<main>/.clank/clones/<name>`.
+pub fn resolve_fork(repo: &Path, name: &str) -> anyhow::Result<Option<(ForkKind, PathBuf)>> {
+    let main = main_repo_root(repo)?;
+    if let Some(p) = validated_clone_fork(&main, name) {
+        return Ok(Some((ForkKind::Clone, p)));
+    }
+    if let Some(p) = linked_worktree_on_branch(repo, name)? {
+        return Ok(Some((ForkKind::Worktree, p)));
+    }
+    Ok(None)
+}
+
+/// Every descriptor-validated clone fork of `repo`'s main root — the
+/// `open --all` extension leg.
+pub fn clone_fork_paths(repo: &Path) -> Vec<PathBuf> {
+    let Ok(main) = main_repo_root(repo) else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(main.join(".clank/clones")) else {
+        return Vec::new();
+    };
+    let mut out: Vec<PathBuf> = entries
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            validated_clone_fork(&main, &name)
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// The clone fork `<name>` iff the fixed-namespace dir passes FULL
+/// validation: descriptor kind `clone`, source = this main root,
+/// branch = `<name>`, and a live repo actually ON that branch.
+/// Remote state is deliberately never consulted (removing `origin`
+/// is the feature's motivating act). Anything else — squatter dir,
+/// foreign descriptor, broken repo — is NOT a fork (creation
+/// separately refuses to adopt such a dir).
+fn validated_clone_fork(main_root: &Path, name: &str) -> Option<PathBuf> {
+    let p = main_root.join(".clank/clones").join(name);
+    let d = load_fork_descriptor(&p).ok().flatten()?;
+    if d.kind != "clone" || d.branch != name || canonical(&d.source) != canonical(main_root) {
+        return None;
+    }
+    match crate::git_io::current_branch_at(&p) {
+        Ok(Some(b)) if b == name => Some(p),
+        _ => None,
+    }
+}
+
+/// The registered LINKED worktree of `repo` on branch `name`, if
+/// any. The main checkout is excluded — being on branch `<name>` is
+/// not being a fork.
+fn linked_worktree_on_branch(repo: &Path, name: &str) -> anyhow::Result<Option<PathBuf>> {
+    let main = canonical(&main_repo_root(repo)?);
+    let stdout =
+        crate::git_plumbing::worktree_list_porcelain(repo).context("resolving worktrees")?;
+    Ok(parse_worktrees(&stdout)
+        .into_iter()
+        .find(|(path, branch)| *branch == name && canonical(Path::new(path)) != main)
+        .map(|(path, _)| PathBuf::from(path)))
+}
+
 pub fn fork_spec_path(repo: &Path, label: &AgentLabel) -> PathBuf {
     repo.join(format!(".clank/agents/{}/fork.json", label.as_str()))
 }
@@ -171,11 +279,57 @@ pub async fn run_fork_pinned(
     // only the dest LOCATION is main-rooted. `--path` still wins.
     let main_root = main_repo_root(&source)?;
     let cwd = std::env::current_dir().context("resolving the current directory")?;
-    let dest = resolve_dest(
-        args.path.as_deref(),
-        main_root.join(format!(".clank/worktrees/{name}")),
-        &cwd,
-    );
+    let dest = if args.clone {
+        // Never `--path`-relocated (clap conflict): the clones
+        // namespace is fixed so discovery and teardown always know
+        // where to look; identity lives in the descriptor.
+        main_root.join(format!(".clank/clones/{name}"))
+    } else {
+        resolve_dest(
+            args.path.as_deref(),
+            main_root.join(format!(".clank/worktrees/{name}")),
+            &cwd,
+        )
+    };
+
+    // A clone is NOT a fork source (fork-clone-option): its main
+    // root is itself, so forking from inside one would nest a new
+    // fork tree in the sandbox instead of the real repo.
+    if load_fork_descriptor(&main_root)?.is_some() {
+        anyhow::bail!(
+            "{} is a clank clone fork — a clone is not a fork source; \
+             fork from the main repo instead",
+            main_root.display()
+        );
+    }
+
+    // `<name>` is ONE namespace across both fork kinds — a same-name
+    // worktree/clone pair would make every doorway (`open --fork`)
+    // ambiguous, so it's prevented at creation. The check consults
+    // the SAME model the doorways resolve through: the worktree
+    // REGISTRY (a `--path`-relocated worktree still collides) and
+    // the fixed clones namespace in ANY state (a squatter dir still
+    // takes the name — never adopted, never shadowed).
+    if args.clone {
+        if let Some(wt) = linked_worktree_on_branch(&source, name)? {
+            anyhow::bail!(
+                "fork name `{name}` is taken by the worktree at `{}` — fork \
+                 names are one namespace across worktrees and clones; pick \
+                 another name",
+                wt.display(),
+            );
+        }
+    } else {
+        let clone_dir = main_root.join(format!(".clank/clones/{name}"));
+        if clone_dir.exists() {
+            anyhow::bail!(
+                "fork name `{name}` is taken by the clone at `{}` — fork \
+                 names are one namespace across worktrees and clones; pick \
+                 another name",
+                clone_dir.display(),
+            );
+        }
+    }
 
     // Idempotent re-fork (open-and-fork-idempotent Part 4): if `dest`
     // already IS this fork — a registered worktree of `source` on
@@ -184,6 +338,51 @@ pub async fn run_fork_pinned(
     // caller (re)opens its tab. Bail only on a genuine collision: a
     // path that isn't our worktree, or one on a different branch (never
     // silently adopt foreign state).
+    if args.clone && dest.exists() {
+        let desc = load_fork_descriptor(&dest)?;
+        return match desc {
+            Some(d)
+                if d.kind == "clone"
+                    && canonical(&d.source) == canonical(&main_root)
+                    && d.branch == name =>
+            {
+                // The descriptor is the identity; the branch check is
+                // the one piece of live state we corroborate. Remotes
+                // are deliberately NOT consulted — the user may have
+                // removed origin, and re-run must still no-op.
+                let on = crate::git_io::current_branch_at(&dest)
+                    .map_err(|e| anyhow::anyhow!("reading the clone's branch: {e}"))?;
+                if on.as_deref() != Some(name) {
+                    anyhow::bail!(
+                        "`{}` is the clank clone `{name}` but is on branch {} — \
+                         check out `{name}` (or remove the directory) and re-run",
+                        dest.display(),
+                        on.as_deref().unwrap_or("<detached>"),
+                    );
+                }
+                let seeded = seed_drafts(&source, &dest, &draft_names)?;
+                if seeded.is_empty() {
+                    eprintln!(
+                        "clone fork `{name}` already exists at {} — reopening (no changes)",
+                        dest.display()
+                    );
+                } else {
+                    eprintln!(
+                        "clone fork `{name}` already exists at {} — reopening (queued: {})",
+                        dest.display(),
+                        seeded.join(", ")
+                    );
+                }
+                Ok((dest, None))
+            }
+            _ => anyhow::bail!(
+                "`{}` already exists but is not the clank clone fork `{name}` \
+                 (missing or mismatched .clank/fork.json) — never adopting a \
+                 foreign directory; remove it or pick another name",
+                dest.display(),
+            ),
+        };
+    }
     if dest.exists() {
         return match registered_worktree_branch(&source, &dest)? {
             Some(branch) if branch == name => {
@@ -347,14 +546,37 @@ pub async fn run_fork_pinned(
         (None, None) => None,
     };
 
-    // ── Mutation starts: the worktree. ──
-    // `.clank/worktrees/` is gitignored by the `.clank/.gitignore` allow-list
-    // (`/*`) — no per-dir entry to ensure.
+    // ── Mutation starts: the worktree (or clone). ──
+    // `.clank/worktrees/` and `.clank/clones/` are gitignored by the
+    // `.clank/.gitignore` allow-list (`/*`) — no per-dir entry to
+    // ensure.
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating `{}`", parent.display()))?;
     }
-    crate::git_plumbing::worktree_add(&source, name, &dest, base)?;
+    if args.clone {
+        // Logical/transport split (fork-clone-option): the BASE is
+        // pinned in the CURRENT worktree (`source`) exactly like the
+        // worktree arm, but the clone's transport — origin URL and
+        // descriptor source — is the canonical main root. The pinned
+        // sha is reachable there via the shared ref store.
+        let base_sha = crate::git_io::resolve_commit(&source, base).ok_or_else(|| {
+            anyhow::anyhow!("cannot resolve fork base `{base}` in {}", source.display())
+        })?;
+        crate::git_plumbing::clone_local(&main_root, &dest, name, base_sha.as_str())?;
+        let desc = ForkDescriptor {
+            kind: "clone".to_string(),
+            source: canonical(&main_root),
+            branch: name.to_string(),
+            base: base_sha.as_str().to_string(),
+        };
+        let dp = fork_descriptor_path(&dest);
+        std::fs::create_dir_all(dp.parent().expect("has parent"))?;
+        std::fs::write(&dp, serde_json::to_string_pretty(&desc)?)
+            .with_context(|| format!("writing `{}`", dp.display()))?;
+    } else {
+        crate::git_plumbing::worktree_add(&source, name, &dest, base)?;
+    }
 
     // ── Seed the worktree's gitignored .clank/ ──
     // Repo config (team selection) is per-worktree + gitignored,
@@ -396,10 +618,11 @@ pub async fn run_fork_pinned(
             tool: seed.tool,
             from_session: seed.from_session.clone(),
             prompt: format!(
-                "You are `{label}` in worktree `{name}` of {source_path} \
+                "You are `{label}` in {kind_word} `{name}` of {source_path} \
                  (branch `{name}` off {base}), session forked for: {purpose}. \
                  Run `clank as {label}` to bind this forked session.{queue_note}",
                 label = label.as_str(),
+                kind_word = if args.clone { "clone" } else { "worktree" },
                 source_path = source.display(),
             ),
         };
@@ -433,12 +656,19 @@ pub async fn run_fork_pinned(
     }
 
     eprintln!(
-        "forked `{name}`: worktree at {} (branch `{name}` off {base}, {} sessions to fork, {} fresh)",
+        "forked `{name}`: {} at {} (branch `{name}` off {base}, {} sessions to fork, {} fresh)",
+        if args.clone { "clone" } else { "worktree" },
         dest.display(),
         seeds.len() - fresh.len(),
         fresh.len(),
     );
-    eprintln!("  teardown: git worktree remove {}", dest.display());
+    if args.clone {
+        // A clone is an independent repo: plain deletion, NEVER
+        // `git worktree remove` (it isn't registered as one).
+        eprintln!("  teardown: rm -rf {}", dest.display());
+    } else {
+        eprintln!("  teardown: git worktree remove {}", dest.display());
+    }
     Ok((dest, pinned_pr_base))
 }
 
@@ -732,6 +962,15 @@ mod tests {
         // --review needs --pr (a branch fork has no PR to review).
         assert!(T::try_parse_from(["t", "myname", "--review"]).is_err());
         assert!(T::try_parse_from(["t", "--pr", "1", "--review"]).is_ok());
+        // --clone: plain shape ok; --path and --pr are loud
+        // conflicts (fork-clone-option — clones are never relocated
+        // and a fetched PR head can't ride a local clone).
+        assert!(T::try_parse_from(["t", "myname", "--clone"]).is_ok());
+        assert!(T::try_parse_from(["t", "myname", "--clone", "--path", "/x"]).is_err());
+        assert!(T::try_parse_from(["t", "--pr", "1", "--clone"]).is_err());
+        // --clone --branch is allowed: the ref resolves in the
+        // source and pins a sha.
+        assert!(T::try_parse_from(["t", "myname", "--clone", "--branch", "dev"]).is_ok());
     }
 
     #[test]
@@ -824,6 +1063,7 @@ detached
             pr: None,
             branch: None,
             path: None,
+            clone: false,
             team: None,
             drafts: Vec::new(),
             prompt: None,

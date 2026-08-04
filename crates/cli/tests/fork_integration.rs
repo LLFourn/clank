@@ -90,6 +90,7 @@ fn fork_args(env: &TestEnv, name: &str) -> clank::cli::ForkArgs {
         pr: None,
         branch: None,
         path: None,
+        clone: false,
         team: None,
         drafts: Vec::new(),
         prompt: None,
@@ -899,4 +900,238 @@ fn fork_rejects_an_invalid_draft_name_before_any_mutation() {
         repo.join(".clank/drafts/foo/bar.md").is_file(),
         "nothing consumed"
     );
+}
+
+// ── fork --clone (fork-clone-option) ─────────────────────────
+
+#[test]
+fn fork_clone_creates_independent_repo_and_survives_origin_removal() {
+    let env = source_with_bound_team();
+    let repo = env.repo();
+    let head = git_out(repo, &["rev-parse", "HEAD"]).trim().to_string();
+
+    let mut args = fork_args(&env, "sandbox");
+    args.clone = true;
+    let dest = block_on(clank::cli::fork::run_fork(&args, Some(env.home()))).unwrap();
+    assert_eq!(
+        std::fs::canonicalize(&dest).unwrap(),
+        std::fs::canonicalize(repo)
+            .unwrap()
+            .join(".clank/clones/sandbox")
+    );
+
+    // Independent repo on the pinned branch, origin = the main root.
+    assert_eq!(git_out(&dest, &["rev-parse", "HEAD"]).trim(), head);
+    assert_eq!(
+        git_out(&dest, &["branch", "--show-current"]).trim(),
+        "sandbox"
+    );
+    let origin = git_out(&dest, &["remote", "get-url", "origin"]);
+    assert_eq!(
+        std::fs::canonicalize(origin.trim()).unwrap(),
+        std::fs::canonicalize(repo).unwrap()
+    );
+
+    // The descriptor is the durable identity.
+    let desc = clank::cli::fork::load_fork_descriptor(&dest)
+        .unwrap()
+        .expect("descriptor written");
+    assert_eq!(desc.kind, "clone");
+    assert_eq!(desc.branch, "sandbox");
+    assert_eq!(desc.base, head);
+
+    // Session specs seeded like the worktree arm, naming the kind.
+    let spec = std::fs::read_to_string(dest.join(".clank/agents/claude/fork-session.json"))
+        .or_else(|_| {
+            std::fs::read_to_string(clank::cli::fork::fork_spec_path(
+                &dest,
+                &clank_core::ids::AgentLabel::parse("claude").unwrap(),
+            ))
+        })
+        .expect("claude fork spec");
+    assert!(spec.contains("clone `sandbox`"), "spec says clone: {spec}");
+
+    // THE MOTIVATING ACT: remove origin. The parent keeps its
+    // remotes, and the idempotent re-run still no-ops.
+    git(&dest, &["remote", "remove", "origin"]);
+    let again = block_on(clank::cli::fork::run_fork(&args, Some(env.home()))).unwrap();
+    assert_eq!(again, dest);
+    assert_eq!(git_out(&dest, &["remote"]).trim(), "", "still remote-less");
+}
+
+#[test]
+fn fork_clone_name_collides_with_worktree_and_vice_versa() {
+    let env = source_with_bound_team();
+
+    // worktree `x` first → clone `x` refused.
+    let args = fork_args(&env, "x");
+    block_on(clank::cli::fork::run_fork(&args, Some(env.home()))).unwrap();
+    let mut clone_args = fork_args(&env, "x");
+    clone_args.clone = true;
+    let err = block_on(clank::cli::fork::run_fork(&clone_args, Some(env.home())))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("one") && err.contains("namespace"), "{err}");
+
+    // clone `y` first → worktree `y` refused.
+    let mut clone_args = fork_args(&env, "y");
+    clone_args.clone = true;
+    block_on(clank::cli::fork::run_fork(&clone_args, Some(env.home()))).unwrap();
+    let args = fork_args(&env, "y");
+    let err = block_on(clank::cli::fork::run_fork(&args, Some(env.home())))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("one") && err.contains("namespace"), "{err}");
+}
+
+#[test]
+fn fork_clone_refuses_a_foreign_destination() {
+    let env = source_with_bound_team();
+    let squat = env.repo().join(".clank/clones/taken");
+    std::fs::create_dir_all(&squat).unwrap();
+    std::fs::write(squat.join("junk"), "not a clone").unwrap();
+    let mut args = fork_args(&env, "taken");
+    args.clone = true;
+    let err = block_on(clank::cli::fork::run_fork(&args, Some(env.home())))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("not the clank clone fork"), "{err}");
+}
+
+#[test]
+fn fork_clone_from_linked_worktree_pins_that_worktrees_head() {
+    let env = source_with_bound_team();
+    let repo = env.repo();
+
+    // A linked worktree that advances past main's HEAD.
+    let args = fork_args(&env, "feature");
+    let wt = block_on(clank::cli::fork::run_fork(&args, Some(env.home()))).unwrap();
+    write(&wt, "extra.txt", "worktree-only work");
+    git(&wt, &["add", "."]);
+    git(&wt, &["commit", "-q", "-m", "worktree-only"]);
+    let wt_head = git_out(&wt, &["rev-parse", "HEAD"]).trim().to_string();
+    let main_head = git_out(repo, &["rev-parse", "HEAD"]).trim().to_string();
+    assert_ne!(wt_head, main_head);
+
+    // Fork --clone FROM the worktree: base pins the WORKTREE's head,
+    // dest + origin are main-rooted (logical/transport split).
+    let mut args = fork_args(&env, "wtclone");
+    args.clone = true;
+    args.source = Some(wt.clone());
+    let dest = block_on(clank::cli::fork::run_fork(&args, Some(env.home()))).unwrap();
+    assert_eq!(
+        std::fs::canonicalize(&dest).unwrap(),
+        std::fs::canonicalize(repo)
+            .unwrap()
+            .join(".clank/clones/wtclone")
+    );
+    assert_eq!(git_out(&dest, &["rev-parse", "HEAD"]).trim(), wt_head);
+    let desc = clank::cli::fork::load_fork_descriptor(&dest)
+        .unwrap()
+        .unwrap();
+    assert_eq!(desc.base, wt_head);
+}
+
+#[test]
+fn fork_clone_collides_with_a_custom_path_worktree() {
+    // The collision check consults the worktree REGISTRY, not the
+    // default namespace: a `--path`-relocated worktree still owns
+    // its name (codex 0013e7b).
+    let env = source_with_bound_team();
+    let outside = tempfile::tempdir().unwrap();
+    let elsewhere = outside.path().join("relocated-wt");
+    let mut args = fork_args(&env, "moved");
+    args.path = Some(elsewhere.clone());
+    block_on(clank::cli::fork::run_fork(&args, Some(env.home()))).unwrap();
+
+    let mut clone_args = fork_args(&env, "moved");
+    clone_args.clone = true;
+    let err = block_on(clank::cli::fork::run_fork(&clone_args, Some(env.home())))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("namespace") && err.contains("relocated-wt"),
+        "{err}"
+    );
+}
+
+#[test]
+fn fork_refuses_a_clone_as_source() {
+    let env = source_with_bound_team();
+    let mut args = fork_args(&env, "sandboxed");
+    args.clone = true;
+    let dest = block_on(clank::cli::fork::run_fork(&args, Some(env.home()))).unwrap();
+
+    // Fork FROM the clone (either kind): refused — a clone is not a
+    // fork source.
+    for clone_flag in [false, true] {
+        let mut args = fork_args(&env, "nested");
+        args.source = Some(dest.clone());
+        args.clone = clone_flag;
+        let err = block_on(clank::cli::fork::run_fork(&args, Some(env.home())))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not a fork source"), "{err}");
+    }
+}
+
+#[test]
+fn resolve_fork_rejects_invalid_clone_candidates() {
+    let env = source_with_bound_team();
+    let repo = env.repo();
+
+    // Descriptor-less squatter: never a fork.
+    let squat = repo.join(".clank/clones/squat");
+    std::fs::create_dir_all(&squat).unwrap();
+    assert!(
+        clank::cli::fork::resolve_fork(repo, "squat")
+            .unwrap()
+            .is_none()
+    );
+
+    // A real clone fork resolves…
+    let mut args = fork_args(&env, "real");
+    args.clone = true;
+    let dest = block_on(clank::cli::fork::run_fork(&args, Some(env.home()))).unwrap();
+    let (kind, p) = clank::cli::fork::resolve_fork(repo, "real")
+        .unwrap()
+        .unwrap();
+    assert!(matches!(kind, clank::cli::fork::ForkKind::Clone));
+    assert_eq!(p, dest);
+
+    // …until its descriptor stops matching (foreign source).
+    let dp = clank::cli::fork::fork_descriptor_path(&dest);
+    let doctored = std::fs::read_to_string(&dp)
+        .unwrap()
+        .replace(&*repo.to_string_lossy(), "/somewhere/else");
+    std::fs::write(&dp, doctored).unwrap();
+    assert!(
+        clank::cli::fork::resolve_fork(repo, "real")
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn fork_clone_failed_checkout_cleans_up_and_can_retry() {
+    // Pinned at the plumbing layer with a sha NO repo contains: a
+    // failed post-clone checkout must remove the directory this call
+    // created, or the next invocation finds a descriptor-less
+    // foreign dest and can never retry (codex 0013e7b). (A merely
+    // DANGLING sha is not a reliable trigger — local clones copy the
+    // whole object store, unreachable objects included.)
+    let env = source_with_bound_team();
+    let repo = env.repo();
+    let dest = repo.join(".clank/clones/retry");
+    let missing_sha = "1111111111111111111111111111111111111111";
+    let err = clank::git_plumbing::clone_local(repo, &dest, "retry", missing_sha)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("checkout"), "{err}");
+    assert!(!dest.exists(), "partial clone cleaned up");
+
+    // The name is free again: a real `fork --clone retry` works.
+    let mut args = fork_args(&env, "retry");
+    args.clone = true;
+    block_on(clank::cli::fork::run_fork(&args, Some(env.home()))).unwrap();
 }
