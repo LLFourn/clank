@@ -429,6 +429,8 @@ struct WaitItem {
     title: Option<String>,
     actor: Option<String>,
     url: Option<String>,
+    /// The watch's operator prompt (github-watch-prompts).
+    instructions: Option<String>,
     exit_code: Option<i64>,
     output_tail: Option<String>,
 }
@@ -576,6 +578,16 @@ fn render_wait_items(items: &[WaitItem], label: &AgentLabel, role: Role) -> Stri
                 out.push_str(&format!(
                     "  - github: {event}{detail} {repo}{num}{title}{actor}{url}\n"
                 ));
+                // The watch's standing instructions, one sanitized
+                // indented follow-on line (github-watch-prompts) —
+                // same collapse as the wait's own hint surface.
+                if let Some(i) = item
+                    .instructions
+                    .as_deref()
+                    .filter(|i| !i.trim().is_empty())
+                {
+                    out.push_str(&format!("    ↳ {}\n", crate::cli::wait::one_line(i, 300)));
+                }
             }
             "command_event" => {
                 let name = item.name.as_deref().unwrap_or("?");
@@ -856,6 +868,25 @@ mod tests {
         assert!(
             out.contains("  - some_future_kind: p @ abcdef123456"),
             "unknown kind falls through: {out}"
+        );
+        // Promptless: no follow-on line anywhere.
+        assert!(!out.contains('↳'), "no instructions line: {out}");
+        // A prompted watch's instructions render as the sanitized
+        // indented follow-on (github-watch-prompts) on THIS surface
+        // too — the codex/opencode hook is the real wake wire.
+        let raw = serde_json::json!({
+            "items": [{
+                "kind": "github_event",
+                "repo": "o/r",
+                "event": "issue_opened",
+                "instructions": "Label it,\nthen reply.\tThen ack."
+            }]
+        });
+        let items = parse_wait_json(raw.to_string().as_bytes()).unwrap();
+        let out = render_wait_items(&items, &label, Role::Reviewer);
+        assert!(
+            out.contains("  - github: issue_opened o/r\n    ↳ Label it, then reply. Then ack.\n"),
+            "instructions follow-on: {out}"
         );
     }
 

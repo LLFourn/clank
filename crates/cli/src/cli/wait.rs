@@ -710,23 +710,34 @@ fn derive_wait_inputs(
 /// config's `wait_events` first, then every CLI `--event` item — the
 /// SAME JSON shape, one grammar. Missing config → config sources are
 /// simply none (an unbound label can still `--event`).
-pub fn resolve_wait_event_sources(
+pub(crate) fn resolve_wait_event_sources(
     repo: &Path,
     author: &AgentLabel,
     cli_items: &[String],
-) -> anyhow::Result<Vec<clank_core::agent_config::WaitEventSource>> {
-    let mut sources = crate::agent_store::load_agent_config(repo, author)?
+) -> anyhow::Result<
+    Vec<(
+        clank_core::agent_config::WaitEventSource,
+        crate::cli::github_events::SourceOrigin,
+    )>,
+> {
+    use crate::cli::github_events::SourceOrigin;
+    // Provenance rides the merge (github-watch-prompts, codex
+    // 16ea191): who declared a source decides who stores its prompt.
+    let mut sources: Vec<_> = crate::agent_store::load_agent_config(repo, author)?
         .map(|c| c.wait_events)
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .into_iter()
+        .map(|s| (s, SourceOrigin::Config))
+        .collect();
     for raw in cli_items {
         let item: clank_core::agent_config::WaitEventSource = serde_json::from_str(raw)
             .map_err(|e| anyhow::anyhow!("invalid --event `{raw}`: {e}"))?;
-        sources.push(item);
+        sources.push((item, SourceOrigin::Cli));
     }
     // Validate durations at ARM time so a bad `poll_interval` fails
     // loud here, not silently substituting the default deep in the
     // poll loop (codex ef1861a).
-    for source in &sources {
+    for (source, _) in &sources {
         if let clank_core::agent_config::WaitEventSource::Github(g) = source
             && let Some(pi) = g.poll_interval.as_deref()
         {
@@ -798,13 +809,16 @@ impl EventSources {
     /// waits) runs github sources memory-only, exactly the pre-WAL
     /// behavior (github-offline-catchup).
     fn spawn(
-        sources: &[clank_core::agent_config::WaitEventSource],
+        sources: &[(
+            clank_core::agent_config::WaitEventSource,
+            crate::cli::github_events::SourceOrigin,
+        )],
         events_dir: Option<&std::path::Path>,
     ) -> Self {
         use clank_core::agent_config::WaitEventSource;
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let mut tasks = Vec::new();
-        for source in sources {
+        for (source, origin) in sources {
             match source {
                 WaitEventSource::Command(c) => {
                     tasks.push(tokio::spawn(run_command_source(c.clone(), tx.clone())));
@@ -814,6 +828,7 @@ impl EventSources {
                         g.clone(),
                         tx.clone(),
                         events_dir.map(std::path::Path::to_path_buf),
+                        *origin,
                     )));
                 }
             }
@@ -1156,6 +1171,8 @@ enum WaitJsonItem<'a> {
         title: Option<&'a str>,
         actor: Option<&'a str>,
         url: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        instructions: Option<&'a str>,
     },
     #[serde(rename = "command_event")]
     CommandEvent {
@@ -1268,6 +1285,7 @@ fn render_json(item: &WaitItem) -> WaitJsonItem<'_> {
             title,
             actor,
             url,
+            instructions,
         } => WaitJsonItem::GithubEvent {
             repo,
             event,
@@ -1276,6 +1294,7 @@ fn render_json(item: &WaitItem) -> WaitJsonItem<'_> {
             title: title.as_deref(),
             actor: actor.as_deref(),
             url: url.as_deref(),
+            instructions: instructions.as_deref(),
         },
         WaitItem::CommandEvent {
             name,
@@ -1423,6 +1442,7 @@ fn render_human(item: &WaitItem) -> String {
             title,
             actor,
             url,
+            instructions,
         } => {
             // Segments joined uniformly so absent optionals leave no
             // dangling separators; the URL rides along — it's the
@@ -1444,7 +1464,16 @@ fn render_human(item: &WaitItem) -> String {
             if let Some(u) = url.as_deref() {
                 parts.push(u.to_string());
             }
-            parts.join("  ")
+            let mut line = parts.join("  ");
+            // The operator's per-watch prompt rides as ONE indented
+            // follow-on line: control chars collapse (same treatment
+            // as PR titles — operator text must not restructure the
+            // item list), full text lives in `clank events show`.
+            if let Some(i) = instructions.as_deref().filter(|i| !i.trim().is_empty()) {
+                line.push_str("\n         ↳ ");
+                line.push_str(&one_line(i, 300));
+            }
+            line
         }
         WaitItem::CommandEvent {
             name,
@@ -1550,6 +1579,30 @@ pub(crate) fn multi_plan_open_remedies(in_progress: &str, new_plans: &[&str]) ->
 }
 
 /// Parse a duration string (`30s`, `5m`, `1h`; `0`/empty = None).
+/// Collapse to a single line for hint contexts: control characters
+/// become spaces (runs collapse), overlong text truncates with an
+/// ellipsis.
+pub(crate) fn one_line(s: &str, cap: usize) -> String {
+    let mut out = String::with_capacity(s.len().min(cap + 4));
+    let mut last_space = false;
+    for ch in s.chars() {
+        let ch = if ch.is_control() { ' ' } else { ch };
+        if ch == ' ' && last_space {
+            continue;
+        }
+        last_space = ch == ' ';
+        out.push(ch);
+    }
+    let out = out.trim().to_string();
+    if out.chars().count() > cap {
+        let mut t: String = out.chars().take(cap).collect();
+        t.push('…');
+        t
+    } else {
+        out
+    }
+}
+
 /// Shared by `--timeout` and github `poll_interval` so there's ONE
 /// grammar (extra-wait-events).
 pub(crate) fn parse_duration_str(raw: &str) -> anyhow::Result<Option<Duration>> {
@@ -1976,6 +2029,7 @@ mod tests {
             title: Some("Add the widget".into()),
             actor: Some("hubot".into()),
             url: Some("https://github.com/o/r/pull/12".into()),
+            instructions: None,
         };
         assert_eq!(
             render_human(&full),
@@ -1991,8 +2045,39 @@ mod tests {
             title: None,
             actor: None,
             url: None,
+            instructions: None,
         };
         assert_eq!(render_human(&sparse), "github   issue_opened  o/r");
+        // The watch's operator prompt rides as one indented
+        // follow-on line, control chars collapsed so operator text
+        // can't restructure the item list (github-watch-prompts).
+        // Promptless hints above stay byte-stable.
+        let prompted = WaitItem::GithubEvent {
+            repo: "o/r".into(),
+            event: "issue_opened".into(),
+            detail: None,
+            number: None,
+            title: None,
+            actor: None,
+            url: None,
+            instructions: Some("Triage it:\nlabel,\treply,  then ack.".into()),
+        };
+        assert_eq!(
+            render_human(&prompted),
+            "github   issue_opened  o/r\n         ↳ Triage it: label, reply, then ack."
+        );
+        // Blank instructions render nothing extra.
+        let blank = WaitItem::GithubEvent {
+            repo: "o/r".into(),
+            event: "issue_opened".into(),
+            detail: None,
+            number: None,
+            title: None,
+            actor: None,
+            url: None,
+            instructions: Some("  \n ".into()),
+        };
+        assert_eq!(render_human(&blank), "github   issue_opened  o/r");
     }
 
     #[test]

@@ -165,6 +165,9 @@ pub(crate) fn classify_event(
                 title: Some(format!("{branch} +{size}")),
                 actor: actor.map(str::to_string),
                 url,
+                // Never at classification (github-watch-prompts):
+                // the WAL stores no prompt; presentation stamps it.
+                instructions: None,
             },
             key: head.map(|h| format!("push@{full_ref}+{h}")),
             feed_id: None,
@@ -239,6 +242,7 @@ pub(crate) fn classify_event(
                 .get("html_url")
                 .and_then(|u| u.as_str())
                 .map(str::to_string),
+            instructions: None,
         },
         key,
         feed_id: None,
@@ -373,6 +377,9 @@ pub(crate) fn classify_webhook(
                 title: Some(format!("{branch} +{size}")),
                 actor: actor.map(str::to_string),
                 url,
+                // Never at classification (github-watch-prompts):
+                // the WAL stores no prompt; presentation stamps it.
+                instructions: None,
             },
             key: after.map(|a| format!("push@{full_ref}+{a}")),
             feed_id: None,
@@ -439,6 +446,7 @@ pub(crate) fn classify_webhook(
                 .get("html_url")
                 .and_then(|u| u.as_str())
                 .map(str::to_string),
+            instructions: None,
         },
         key,
         feed_id: None,
@@ -1259,34 +1267,109 @@ async fn start_relay<Fw: Forwarder>(
 /// acquisition, one 401 story — codex f9807c3). `delivery: realtime`
 /// adds the webhook relay as the latency path; polling remains the
 /// completeness backstop either way.
+/// Where an armed source came from — the provenance that decides
+/// who stores its prompt (github-watch-prompts, codex 16ea191).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SourceOrigin {
+    Config,
+    Cli,
+}
+
+/// Sidecar policy: CONFIG-origin watches never carry sidecars — the
+/// agent config IS their prompt store, and every arm REMOVES any
+/// leftover so a watch deleted from config cannot resurrect its
+/// intent from stale metadata (this also self-heals sidecars
+/// written before provenance existed). CLI-origin (`--event`)
+/// watches write theirs — the only store such an arm has — and
+/// remove it when re-armed promptless.
+pub(crate) fn write_watch_sidecar(dir: &std::path::Path, src: &GithubSource, origin: SourceOrigin) {
+    let meta = dir.join(format!("{}.meta.json", source_key(src)));
+    let res = match (origin, &src.prompt) {
+        (SourceOrigin::Cli, Some(p)) => std::fs::create_dir_all(dir)
+            .and_then(|()| std::fs::write(&meta, serde_json::json!({ "prompt": p }).to_string())),
+        _ => match std::fs::remove_file(&meta) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            r => r,
+        },
+    };
+    if let Err(e) = res {
+        eprintln!("warning: watch metadata `{}`: {e}", meta.display());
+    }
+}
+
 pub(crate) async fn run_github_source(
     src: GithubSource,
     tx: tokio::sync::mpsc::UnboundedSender<WaitItem>,
     events_dir: Option<std::path::PathBuf>,
+    origin: SourceOrigin,
 ) {
-    let session = shared_session();
-    let fetcher = GhFetcher {
-        repo: src.repo.clone(),
-        session: session.clone(),
-    };
-    let login = GhLogin(session);
-    let realtime = src.delivery == clank_core::agent_config::Delivery::Realtime;
-    let src2 = src.clone();
-    source_supervisor(
-        &src,
-        &login,
-        &fetcher,
-        &tx,
-        events_dir,
-        move || async move {
-            if realtime {
-                start_relay(&src2, GhForwarder).await
-            } else {
-                None
-            }
+    // The per-watch operator prompt is stamped HERE — the single
+    // choke point between this source's machinery (live ingest,
+    // backlog, takeover tail) and the wait — never at
+    // classification, so the WAL stores no prompt and editing the
+    // watch retitles already-logged events (github-watch-prompts).
+    let (itx, irx) = tokio::sync::mpsc::unbounded_channel();
+    let stamper = stamp_instructions_forwarder(irx, tx, src.prompt.clone());
+
+    // Presentation-metadata sidecar, provenance-gated — see
+    // [`write_watch_sidecar`].
+    if let Some(dir) = &events_dir {
+        write_watch_sidecar(dir, &src, origin);
+    }
+
+    // The supervisor arm OWNS `itx`: when it returns, the drop
+    // closes the channel and the stamper drains out — the join can
+    // never hang on a live-but-idle intermediate channel.
+    let ((), ()) = tokio::join!(
+        async {
+            let session = shared_session();
+            let fetcher = GhFetcher {
+                repo: src.repo.clone(),
+                session: session.clone(),
+            };
+            let login = GhLogin(session);
+            let realtime = src.delivery == clank_core::agent_config::Delivery::Realtime;
+            let src2 = src.clone();
+            source_supervisor(
+                &src,
+                &login,
+                &fetcher,
+                &itx,
+                events_dir,
+                move || async move {
+                    if realtime {
+                        start_relay(&src2, GhForwarder).await
+                    } else {
+                        None
+                    }
+                },
+            )
+            .await;
+            drop(itx);
         },
-    )
-    .await;
+        stamper
+    );
+}
+
+/// Forward items, stamping the watch's `prompt` onto every github
+/// event that passes. Pure plumbing, unit-tested without transports.
+async fn stamp_instructions_forwarder(
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<WaitItem>,
+    tx: tokio::sync::mpsc::UnboundedSender<WaitItem>,
+    prompt: Option<String>,
+) {
+    while let Some(mut item) = rx.recv().await {
+        if let WaitItem::GithubEvent {
+            ref mut instructions,
+            ..
+        } = item
+        {
+            instructions.clone_from(&prompt);
+        }
+        if tx.send(item).is_err() {
+            return;
+        }
+    }
 }
 
 /// The lease-gated source runtime (wal-single-ingest-writer): the
@@ -1408,7 +1491,7 @@ async fn source_supervisor<F, R, RF, RFut>(
 /// DIFFERENT log (a config edit re-baselines rather than misreading
 /// an old cursor). FNV-1a inlined for cross-release stability, like
 /// the zellij session hash.
-fn source_key(src: &GithubSource) -> String {
+pub(crate) fn source_key(src: &GithubSource) -> String {
     let slug: String = src
         .repo
         .chars()
@@ -1924,6 +2007,7 @@ mod tests {
             poll_interval: None,
             include_own_actions: include_own,
             branches: Vec::new(),
+            prompt: None,
             delivery: clank_core::agent_config::Delivery::Poll,
         }
     }
@@ -2279,6 +2363,7 @@ mod tests {
             include_own_actions: true, // don't filter — assert full mapping
             branches: Vec::new(),
             delivery: clank_core::agent_config::Delivery::Poll,
+            prompt: None,
         };
         let (items, _ids) = map_page(&s, &raw, &BTreeSet::new(), None);
         let got: Vec<(&str, Option<&str>, Option<u64>)> = items
@@ -2895,6 +2980,7 @@ mod tests {
                 title: None,
                 actor: None,
                 url: None,
+                instructions: None,
             },
             key: key.map(str::to_string),
             feed_id: None,
@@ -4608,5 +4694,56 @@ mod tests {
         assert!(loaded.feed_ids.iter().any(|id| id == "77"));
         run2.abort();
         let _ = run2.await;
+    }
+
+    #[tokio::test]
+    async fn stamper_stamps_github_items_at_presentation_only() {
+        // The WAL side: a classified item serializes WITHOUT the
+        // instructions field (presentation-only; the log format is
+        // untouched by github-watch-prompts)…
+        let c = classify_event(
+            "o/r",
+            &ev(
+                "1",
+                "IssuesEvent",
+                serde_json::json!({"action": "opened", "issue": {"number": 7}}),
+                "hubot",
+            ),
+            &[GithubEventKind::IssueOpened],
+            None,
+            false,
+            &[],
+        )
+        .expect("classified");
+        let stored = serde_json::to_string(&c.item).unwrap();
+        assert!(!stored.contains("instructions"), "WAL bytes: {stored}");
+
+        // …and the forwarder is the single stamping choke point.
+        let (itx, irx) = tokio::sync::mpsc::unbounded_channel();
+        let (otx, mut orx) = tokio::sync::mpsc::unbounded_channel();
+        let fwd = tokio::spawn(stamp_instructions_forwarder(
+            irx,
+            otx,
+            Some("triage and reply".into()),
+        ));
+        itx.send(c.item).unwrap();
+        drop(itx);
+        let out = orx.recv().await.expect("forwarded");
+        let WaitItem::GithubEvent { instructions, .. } = out else {
+            panic!("github item");
+        };
+        assert_eq!(instructions.as_deref(), Some("triage and reply"));
+        fwd.await.unwrap();
+    }
+
+    #[test]
+    fn source_key_ignores_the_prompt() {
+        // Editing a watch's prompt must NOT re-key its WAL (the
+        // prompt is presentation config; identity is repo/kinds/
+        // branches/own-actions).
+        let mut a = src(&[GithubEventKind::IssueOpened], false);
+        let key = source_key(&a);
+        a.prompt = Some("do the thing".into());
+        assert_eq!(source_key(&a), key);
     }
 }

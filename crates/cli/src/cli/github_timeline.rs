@@ -222,6 +222,8 @@ fn merge(copies: Vec<Copy>) -> Vec<MergedEvent> {
                     title,
                     actor,
                     url,
+                    // Presentation-time stamp; WAL rows never carry it.
+                    instructions: _,
                 } => Some((
                     repo.clone(),
                     event.clone(),
@@ -276,6 +278,7 @@ mod tests {
             title: title.map(str::to_string),
             actor: Some("alice".into()),
             url: None,
+            instructions: None,
         }
     }
 

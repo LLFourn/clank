@@ -14,25 +14,33 @@ use clank_core::wait::WaitItem;
 pub async fn run(args: super::EventsArgs) -> anyhow::Result<()> {
     match args.command {
         super::EventsCmd::List(a) => {
-            let dir = events_dir(a.repo.as_deref(), a.author.as_deref())?;
+            let (dir, prompts) = events_context(a.repo.as_deref(), a.author.as_deref())?;
             let rows = read_all(&dir)?;
-            list(rows, a.all, a.json)
+            list(rows, &prompts, a.all, a.json)
         }
         super::EventsCmd::Ack(a) => {
-            let dir = events_dir(a.repo.as_deref(), a.author.as_deref())?;
+            let (dir, _) = events_context(a.repo.as_deref(), a.author.as_deref())?;
             let rows = read_all(&dir)?;
             ack(&dir, rows, &a.ids)
         }
         super::EventsCmd::Show(a) => {
-            let dir = events_dir(a.repo.as_deref(), a.author.as_deref())?;
+            let (dir, prompts) = events_context(a.repo.as_deref(), a.author.as_deref())?;
             let rows = read_all(&dir)?;
-            show(rows, &a.id, a.json)
+            show(rows, &prompts, &a.id, a.json)
         }
     }
 }
 
-/// `.clank/agents/<label>/events` for the resolved agent.
-fn events_dir(repo: Option<&Path>, author: Option<&str>) -> anyhow::Result<PathBuf> {
+/// The events dir PLUS the source-key → watch-prompt map from the
+/// agent's CURRENT config (github-watch-prompts): the prompt is
+/// presentation config joined at render time — never stored in the
+/// WAL — so events logged before a prompt existed still show it,
+/// and edits retitle the standing intent. `source_key` excludes the
+/// prompt from source identity, so editing one never re-keys a WAL.
+fn events_context(
+    repo: Option<&Path>,
+    author: Option<&str>,
+) -> anyhow::Result<(PathBuf, std::collections::HashMap<String, String>)> {
     let repo = super::resolve_repo(repo)?;
     let author = match author {
         Some(raw) => {
@@ -40,9 +48,62 @@ fn events_dir(repo: Option<&Path>, author: Option<&str>) -> anyhow::Result<PathB
         }
         None => crate::agent_env::resolve_identity_from_env(&repo)?,
     };
-    Ok(crate::agent_store::agents_root(&repo)
+    let dir = crate::agent_store::agents_root(&repo)
         .join(author.as_str())
-        .join("events"))
+        .join("events");
+    let githubs: Vec<clank_core::agent_config::GithubSource> =
+        match crate::agent_store::load_agent_config(&repo, &author) {
+            Ok(Some(cfg)) => cfg
+                .wait_events
+                .iter()
+                .filter_map(|s| match s {
+                    clank_core::agent_config::WaitEventSource::Github(g) => Some(g.clone()),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+    let prompts = join_prompts(&githubs, &dir);
+    Ok((dir, prompts))
+}
+
+/// The source-key → prompt map, two tiers: the agent config is
+/// authoritative for sources it DECLARES (a declared-but-promptless
+/// source shows nothing, even over a stale sidecar); `.meta.json`
+/// sidecars written at arm time cover everything else — notably
+/// sources armed only via CLI `--event`, which the config never
+/// sees (github-watch-prompts, codex 6a907c6).
+fn join_prompts(
+    config: &[clank_core::agent_config::GithubSource],
+    dir: &Path,
+) -> std::collections::HashMap<String, String> {
+    let mut prompts = std::collections::HashMap::new();
+    let mut declared = std::collections::HashSet::new();
+    for g in config {
+        let key = crate::cli::github_events::source_key(g);
+        if let Some(p) = &g.prompt {
+            prompts.insert(key.clone(), p.clone());
+        }
+        declared.insert(key);
+    }
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(key) = name.to_str().and_then(|n| n.strip_suffix(".meta.json")) else {
+                continue;
+            };
+            if declared.contains(key) {
+                continue;
+            }
+            if let Ok(raw) = std::fs::read_to_string(entry.path())
+                && let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw)
+                && let Some(p) = v.get("prompt").and_then(|p| p.as_str())
+            {
+                prompts.insert(key.to_string(), p.to_string());
+            }
+        }
+    }
+    prompts
 }
 
 /// One listed row, addressable across sources: `source` is the WAL
@@ -237,22 +298,36 @@ fn age(at: u64) -> String {
 struct JsonRow<'a> {
     id: String,
     source: &'a str,
+    /// The source watch's CURRENT prompt (presentation-time join;
+    /// github-watch-prompts).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    instructions: Option<&'a str>,
     #[serde(flatten)]
     row: &'a EventRow,
 }
 
-fn json_row<'a>(rows: &[Sourced], s: &'a Sourced) -> JsonRow<'a> {
+fn json_row<'a>(
+    rows: &[Sourced],
+    s: &'a Sourced,
+    prompts: &'a std::collections::HashMap<String, String>,
+) -> JsonRow<'a> {
     JsonRow {
         id: display_id(rows, s),
         source: &s.source,
+        instructions: prompts.get(&s.source).map(String::as_str),
         row: &s.row,
     }
 }
 
-fn list(rows: Vec<Sourced>, all: bool, json: bool) -> anyhow::Result<()> {
+fn list(
+    rows: Vec<Sourced>,
+    prompts: &std::collections::HashMap<String, String>,
+    all: bool,
+    json: bool,
+) -> anyhow::Result<()> {
     let shown: Vec<&Sourced> = rows.iter().filter(|s| all || !s.row.acked).collect();
     if json {
-        let out: Vec<JsonRow> = shown.iter().map(|s| json_row(&rows, s)).collect();
+        let out: Vec<JsonRow> = shown.iter().map(|s| json_row(&rows, s, prompts)).collect();
         println!("{}", serde_json::to_string_pretty(&out)?);
         return Ok(());
     }
@@ -276,6 +351,11 @@ fn list(rows: Vec<Sourced>, all: bool, json: bool) -> anyhow::Result<()> {
             status,
             describe(&s.row.item)
         );
+        // The watch's standing instructions ride under every event
+        // it produced (github-watch-prompts).
+        if let Some(p) = prompts.get(&s.source) {
+            println!("{:>10}  ↳ {}", "", crate::cli::wait::one_line(p, 300));
+        }
     }
     println!("\nack with: clank events ack <id> …   (unacked events keep waking the wait)");
     Ok(())
@@ -311,10 +391,18 @@ fn ack(dir: &Path, rows: Vec<Sourced>, ids: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn show(rows: Vec<Sourced>, id: &str, json: bool) -> anyhow::Result<()> {
+fn show(
+    rows: Vec<Sourced>,
+    prompts: &std::collections::HashMap<String, String>,
+    id: &str,
+    json: bool,
+) -> anyhow::Result<()> {
     let s = resolve(&rows, id)?;
     if json {
-        println!("{}", serde_json::to_string_pretty(&json_row(&rows, s))?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json_row(&rows, s, prompts))?
+        );
         return Ok(());
     }
     println!("id:        {}", display_id(&rows, s));
@@ -338,6 +426,16 @@ fn show(rows: Vec<Sourced>, id: &str, json: bool) -> anyhow::Result<()> {
     if let WaitItem::GithubEvent { url: Some(url), .. } = &s.row.item {
         println!("url:       {url}");
     }
+    if let Some(p) = prompts.get(&s.source) {
+        // Full text (multi-line preserved), but non-newline control
+        // characters must not reach the terminal raw; continuation
+        // lines align under the value column.
+        let clean: String = p
+            .chars()
+            .map(|c| if c.is_control() && c != '\n' { ' ' } else { c })
+            .collect();
+        println!("prompt:    {}", clean.replace('\n', "\n           "));
+    }
     Ok(())
 }
 
@@ -355,6 +453,7 @@ mod tests {
             title: Some("t".into()),
             actor: Some("a".into()),
             url: Some("https://x".into()),
+            instructions: None,
         }
     }
 
@@ -420,8 +519,15 @@ mod tests {
         .unwrap();
         let rows = read_all(&dir).unwrap();
         let s = resolve(&rows, "1").unwrap();
-        let v = serde_json::to_value(json_row(&rows, s)).unwrap();
+        let prompts = std::collections::HashMap::from([(
+            "github-o-r-aaaa".to_string(),
+            "triage and reply".to_string(),
+        )]);
+        let v = serde_json::to_value(json_row(&rows, s, &prompts)).unwrap();
         assert_eq!(v["id"], "1");
+        // Presentation-time join: the CURRENT config's prompt rides
+        // rows logged before it existed (github-watch-prompts).
+        assert_eq!(v["instructions"], "triage and reply");
         assert_eq!(v["source"], "github-o-r-aaaa");
         assert_eq!(v["feed_id"], "f-77");
         assert_eq!(v["action_key"], "issue#7");
@@ -435,9 +541,11 @@ mod tests {
             .unwrap();
         let rows = read_all(&dir).unwrap();
         let s = resolve(&rows, "github-o-x-bbbb@1").unwrap();
-        let v = serde_json::to_value(json_row(&rows, s)).unwrap();
+        let v = serde_json::to_value(json_row(&rows, s, &prompts)).unwrap();
         assert_eq!(v["id"], "github-o-x-bbbb@1", "collision qualifies the id");
         assert!(v.get("feed_id").is_none());
+        // No prompt for THIS source: the field is absent, not null.
+        assert!(v.get("instructions").is_none());
         assert_eq!(v["action_key"], "k#1");
         assert_eq!(v["transport"], "relay");
     }
@@ -516,5 +624,105 @@ mod tests {
         assert!(resolve(&rows, "not-a-seq").is_err());
         // An empty/missing dir is an empty listing, not an error.
         assert!(read_all(&dir.join("missing")).unwrap().is_empty());
+    }
+
+    #[test]
+    fn watch_prompt_three_state_provenance() {
+        // The full arm+join composition (codex 16ea191): configured
+        // prompt wins; a configured watch REMOVED from config leaves
+        // no prompt (its arm never wrote a sidecar — and removes any
+        // leftover); genuine CLI-only metadata stays visible.
+        use crate::cli::github_events::{SourceOrigin, write_watch_sidecar};
+        use clank_core::agent_config::{Delivery, GithubEventKind, GithubSource};
+        let dir = tempdir();
+        let gh = |repo: &str, prompt: Option<&str>| GithubSource {
+            repo: repo.into(),
+            events: vec![GithubEventKind::IssueOpened],
+            poll_interval: None,
+            include_own_actions: false,
+            branches: Vec::new(),
+            prompt: prompt.map(str::to_string),
+            delivery: Delivery::Poll,
+        };
+        let key = |g: &GithubSource| crate::cli::github_events::source_key(g);
+        let configured = gh("o/a", Some("configured intent"));
+        let cli_only = gh("o/c", Some("cli intent"));
+
+        // Arm both: config-origin writes NO sidecar, CLI-origin does.
+        write_watch_sidecar(&dir, &configured, SourceOrigin::Config);
+        write_watch_sidecar(&dir, &cli_only, SourceOrigin::Cli);
+
+        // State 1: configured prompt wins (from config, not disk).
+        let map = join_prompts(&[configured.clone()], &dir);
+        assert_eq!(map.get(&key(&configured)).unwrap(), "configured intent");
+        // State 3: CLI-only metadata visible alongside.
+        assert_eq!(map.get(&key(&cli_only)).unwrap(), "cli intent");
+
+        // State 2: the configured watch is DELETED from config — its
+        // intent must NOT resurrect.
+        let map = join_prompts(&[], &dir);
+        assert!(map.get(&key(&configured)).is_none(), "no resurrection");
+        assert_eq!(map.get(&key(&cli_only)).unwrap(), "cli intent");
+
+        // Self-heal: a pre-provenance sidecar for a config watch is
+        // removed by the next config-origin arm.
+        std::fs::write(
+            dir.join(format!("{}.meta.json", key(&configured))),
+            r#"{"prompt":"stale pre-provenance"}"#,
+        )
+        .unwrap();
+        write_watch_sidecar(&dir, &configured, SourceOrigin::Config);
+        assert!(join_prompts(&[], &dir).get(&key(&configured)).is_none());
+
+        // CLI promptless re-arm removes the CLI sidecar.
+        write_watch_sidecar(&dir, &gh("o/c", None), SourceOrigin::Cli);
+        assert!(join_prompts(&[], &dir).get(&key(&cli_only)).is_none());
+    }
+
+    #[test]
+    fn join_prompts_two_tiers_config_wins_sidecar_covers_cli_sources() {
+        use clank_core::agent_config::{Delivery, GithubEventKind, GithubSource};
+        let dir = tempdir();
+        let gh = |repo: &str, prompt: Option<&str>| GithubSource {
+            repo: repo.into(),
+            events: vec![GithubEventKind::IssueOpened],
+            poll_interval: None,
+            include_own_actions: false,
+            branches: Vec::new(),
+            prompt: prompt.map(str::to_string),
+            delivery: Delivery::Poll,
+        };
+        let declared_prompted = gh("o/a", Some("from config"));
+        let declared_promptless = gh("o/b", None);
+        let cli_only = gh("o/c", Some("from --event"));
+        let key = |g: &GithubSource| crate::cli::github_events::source_key(g);
+        // Sidecars: a STALE one for the declared-promptless source
+        // (must be suppressed — config is authoritative for declared
+        // sources) and a live one for the CLI-only source.
+        std::fs::write(
+            dir.join(format!("{}.meta.json", key(&declared_promptless))),
+            r#"{"prompt":"stale intent"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join(format!("{}.meta.json", key(&cli_only))),
+            r#"{"prompt":"from --event"}"#,
+        )
+        .unwrap();
+
+        let map = join_prompts(
+            &[declared_prompted.clone(), declared_promptless.clone()],
+            &dir,
+        );
+        assert_eq!(map.get(&key(&declared_prompted)).unwrap(), "from config");
+        assert!(
+            map.get(&key(&declared_promptless)).is_none(),
+            "declared-promptless suppresses the stale sidecar"
+        );
+        assert_eq!(
+            map.get(&key(&cli_only)).unwrap(),
+            "from --event",
+            "CLI-only sources join through the sidecar"
+        );
     }
 }

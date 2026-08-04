@@ -1225,6 +1225,7 @@ mod tests {
             title: Some(format!("t{n}")),
             actor: Some("alice".into()),
             url: Some(format!("https://x/{n}")),
+            instructions: None,
         }
     }
 

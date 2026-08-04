@@ -15,8 +15,11 @@ YOUR per-agent event inbox (a write-ahead log under
 ## The loop: react, then ack
 
 1. A wake hands you `github_event` items (repo, event kind, number,
-   title, actor). Triage each one — `gh pr view`, `gh issue view`,
-   your own tooling — and do whatever the event demands.
+   title, actor). When an item carries an indented `↳ …` line (or an
+   `instructions` field in JSON), that is the OPERATOR'S STANDING
+   INTENT for this watch — follow it as the definition of "react".
+   Otherwise triage on your judgment — `gh pr view`, `gh issue
+   view`, your own tooling — and do whatever the event demands.
 2. When an event needs nothing more from you, mark it handled:
 
    ```sh
@@ -38,6 +41,11 @@ clank events list            # unhandled events
 clank events list --all -j   # everything, machine-readable
 clank events show <id>       # one full record (url, transport, age)
 ```
+
+`list`/`show` display the watch's `prompt` (its standing
+instructions) with each event — including events logged before the
+prompt was written: it is joined from the CURRENT config at render
+time, never stored in the log.
 
 Ids are the listed seq (qualified as `<source>@<seq>` when several
 watched repos collide — the error message shows the qualified forms).

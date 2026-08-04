@@ -138,6 +138,14 @@ pub enum WaitItem {
         title: Option<String>,
         actor: Option<String>,
         url: Option<String>,
+        /// The watch's operator prompt (github-watch-prompts),
+        /// stamped at PRESENTATION time only — classification never
+        /// sets it, so the event WAL stores no copy and editing the
+        /// watch retitles already-logged events. Absent = the field
+        /// never serializes (WAL bytes and hints byte-stable for
+        /// promptless watches).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        instructions: Option<String>,
     },
     /// …and a command source completing (its exit IS the wake).
     /// `exit_code` is `None` for a signal-killed child.

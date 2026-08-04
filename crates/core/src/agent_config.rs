@@ -103,6 +103,12 @@ pub struct GithubSource {
     /// number-scoped already.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub branches: Vec<String>,
+    /// Operator instructions stamped onto every wake item this
+    /// watch presents (github-watch-prompts): free text telling the
+    /// agent exactly how to react. Presentation config — never
+    /// stored in the event WAL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
     /// How events arrive (github-http-client-and-realtime M2):
     /// `poll` (default) or `realtime` — the webhook-forward relay
     /// front-running the poll for latency, with the poll remaining
@@ -352,6 +358,7 @@ mod tests {
             include_own_actions: false,
             branches: vec!["main".into()],
             delivery: Delivery::Realtime,
+            prompt: None,
         });
         let json = serde_json::to_string(&src).unwrap();
         assert!(json.contains("pr_updated") && json.contains("branch_push"));

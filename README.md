@@ -144,7 +144,18 @@ user-global default (`~/.clank/config.json`'s `"auto"`) when unset —
   repeatable `--event '<json>'`): `github` entries watch any repo
   (PRs opened/updated/merged, comments, issues, branch pushes — your
   own actions filtered by default), and `command` entries spawn an
-  argv whose completion is the wake. `"delivery":"realtime"` upgrades
+  argv whose completion is the wake. A watch can carry a `"prompt"`
+  — operator instructions stamped onto every wake item it produces,
+  telling the agent exactly how to react:
+
+  ```json
+  { "kind": "github", "repo": "o/r", "events": ["pr_comment"],
+    "prompt": "Triage the comment; reply on the PR, then ack." }
+  ```
+
+  The prompt is presentation config, never stored in the event log:
+  editing it retitles the standing intent for already-logged
+  unhandled events (per-kind granularity = split the watch). `"delivery":"realtime"` upgrades
   a github source from polling to push-speed webhook delivery, with
   polling kept as the completeness backstop. This is the building
   block for a "controller" repo whose agents manage other repos — the
