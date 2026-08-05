@@ -54,8 +54,13 @@ pub(super) fn attention_state(snap: &StatusSnapshot) -> AttentionState {
     {
         return AttentionState::NeedsCorrection;
     }
-    let nothing_in_flight =
-        snap.plans.is_empty() && snap.pr_reviews.is_empty() && snap.queue.is_empty();
+    // Ad-hoc counts as in-flight only while its gate still ROUTES
+    // work (codex 923a679) — a positively reviewed ad-hoc commit
+    // (Continued/Finished) is terminal, not active.
+    let nothing_in_flight = snap.plans.is_empty()
+        && snap.pr_reviews.is_empty()
+        && snap.queue.is_empty()
+        && !snap.ad_hoc.iter().any(|a| a.is_open());
     if nothing_in_flight {
         AttentionState::Idle
     } else {
@@ -86,7 +91,21 @@ pub(super) fn master_is_active(snap: &StatusSnapshot) -> bool {
                 .iter()
                 .any(|p| !p.missing_reviewers.is_empty())
         }
+        // Plan-less precedence mirrors wait's routing exactly (codex
+        // 0c31c92): an ad-hoc ChangesRequested is an actionable
+        // MASTER item (AdHocRevise) wait returns BEFORE scanning the
+        // queue; an Unreviewed ad-hoc gives master nothing, so wait
+        // DOES reach queue promotion — promote beats the
+        // reviewers'-turn fallthrough.
+        [] if snap
+            .ad_hoc
+            .iter()
+            .any(|a| a.gate == clank_core::vocab::CommitGateState::ChangesRequested) =>
+        {
+            true
+        }
         [] if !snap.queue.is_empty() => true, // promote
+        [] if snap.ad_hoc.iter().any(|a| a.is_open()) => false, // reviewers' turn
         [] => false,                          // unreachable (Idle covers it)
         // Plans present: queue/PR ignored — master's turn iff some
         // plan is on a master action.
@@ -116,8 +135,15 @@ pub(super) fn state_color(snap: &StatusSnapshot) -> &'static str {
         AttentionState::Active => {
             if master_is_active(snap) {
                 // cyan for the queue-promote branch (no plans, no
-                // PRs), green for master working on a plan or PR.
-                if snap.plans.is_empty() && snap.pr_reviews.is_empty() {
+                // PRs, no ad-hoc revision), green for master working
+                // on a plan, PR, or ad-hoc revision (codex 4a4be39).
+                if snap.plans.is_empty()
+                    && snap.pr_reviews.is_empty()
+                    && !snap
+                        .ad_hoc
+                        .iter()
+                        .any(|a| a.gate == clank_core::vocab::CommitGateState::ChangesRequested)
+                {
                     "36" // cyan: promote
                 } else {
                     "32" // green: master
@@ -129,45 +155,41 @@ pub(super) fn state_color(snap: &StatusSnapshot) -> &'static str {
     }
 }
 
-/// Reviewers the team is currently waiting on. The candidate labels
-/// are the `missing` sets (commit + gate tiers across plans) plus each
-/// PR review's `missing_reviewers`, but the ACTIONABILITY decision is
-/// delegated to [`clank_core::wait::WorkStatus::is_actionable`] — the
-/// SAME predicate the stop-hook (`clank wait`) uses. Routing the
-/// decision through one source keeps the panel and the hook from
-/// drifting; in particular it inherits `work_for`'s GLOBAL
-/// `head_correction` preempt, so a broken HEAD tag idles every reviewer
-/// here too — even one missing on a non-implicated plan — instead of
-/// showing 👀 while their `clank wait` returns nothing. May contain
-/// duplicates; callers test membership.
-pub(super) fn awaited_reviewers(snap: &StatusSnapshot) -> Vec<&clank_core::ids::AgentLabel> {
-    use clank_core::vocab::Role;
-    // The same projection `clank wait` reduces (ad-hoc isn't carried in
-    // the snapshot and isn't a candidate here, so an empty list is
-    // faithful for the reviewer question).
-    let work = clank_core::wait::WorkStatus {
+/// The `WorkStatus` projection the panel questions reduce — the SAME
+/// shape `clank wait` reduces, with the fold's REAL ad-hoc state
+/// (tui-adhoc-review-activity).
+pub(super) fn work_projection(snap: &StatusSnapshot) -> clank_core::wait::WorkStatus {
+    clank_core::wait::WorkStatus {
         plans: snap.plans.clone(),
-        ad_hoc: Vec::new(),
+        ad_hoc: snap.ad_hoc.clone(),
         pr_reviews: snap.pr_reviews.clone(),
         head_correction: snap.head_correction.clone(),
         // Irrelevant to the reviewer question: the multi-plan warning
         // preempts MASTER items only — reviewer routing is untouched
         // by design (soft-disallow-multiple-plans).
         multi_plan_open: None,
-    };
-    let actionable = |l: &clank_core::ids::AgentLabel| work.is_actionable(l, Role::Reviewer);
-    let mut out = Vec::new();
-    for p in &snap.plans {
-        if let WaitingOn::ReviewerApprovalsMissing { missing }
-        | WaitingOn::GateReviewersMissing { missing } = &p.waiting_on
-        {
-            out.extend(missing.iter().filter(|l| actionable(l)));
-        }
     }
-    for pr in &snap.pr_reviews {
-        out.extend(pr.missing_reviewers.iter().filter(|l| actionable(l)));
-    }
-    out
+}
+
+/// ROSTER-driven (tui-adhoc-review-activity, intro 956bed7):
+/// candidates are the roster's non-master rows and the shared
+/// `is_actionable` alone decides who is awaited — one routing path
+/// covers plan, PR, ad-hoc, their unions, and global preemption.
+/// Work-kind-specific candidate discovery is gone: an ad-hoc review
+/// carries no labels, so no missing-set enumeration could ever
+/// surface its reviewers.
+pub(super) fn awaited_reviewers(snap: &StatusSnapshot) -> Vec<String> {
+    use clank_core::vocab::Role;
+    let work = work_projection(snap);
+    snap.agents
+        .iter()
+        .filter(|a| a.role != crate::cli::teams_config::RosterRole::Master)
+        .filter(|a| {
+            clank_core::ids::AgentLabel::parse(&a.label)
+                .is_ok_and(|l| work.is_actionable(&l, Role::Reviewer))
+        })
+        .map(|a| a.label.clone())
+        .collect()
 }
 
 /// The status glyph for ONE agent's pane: `🔨` master working / `👀`
@@ -234,7 +256,9 @@ pub(super) fn verb_of(w: &WaitingOn) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::status_tui::fixtures::{plan_state, pr_awaiting, reviewer_missing, snap};
+    use crate::cli::status_tui::fixtures::{
+        plan_state, pr_awaiting, reviewer_missing, snap, with_agents,
+    };
     use crate::lifecycle::AgentLabel;
 
     #[test]
@@ -294,12 +318,76 @@ mod tests {
     }
 
     #[test]
-    fn awaited_reviewers_unions_plans_and_prs() {
-        let mut s = snap(vec![plan_state("p", reviewer_missing("codex"))], vec![]);
-        s.pr_reviews.push(pr_awaiting(&["ruthless"]));
-        let got: Vec<&str> = awaited_reviewers(&s).iter().map(|l| l.as_str()).collect();
+    fn adhoc_review_activates_roster_reviewers() {
+        // THE report (tui-adhoc-review-activity): a pending AD-HOC
+        // commit review — no plans, no PRs — must show its reviewers
+        // active. Candidates come from the ROSTER (AdHocWorkState
+        // carries no labels); the shared is_actionable decides.
+        use crate::cli::teams_config::RosterRole;
+        use clank_core::vocab::Role;
+        let roster: &[(&str, RosterRole)] = &[
+            ("claude", RosterRole::Master),
+            ("codex", RosterRole::Commit),
+            ("ruthless", RosterRole::Gate),
+        ];
+        let mut s = with_agents(snap(vec![], vec![]), roster);
+        s.ad_hoc = vec![clank_core::wait::AdHocWorkState {
+            sha: crate::lifecycle::CommitSha::parse(&"b".repeat(40)).unwrap(),
+            gate: clank_core::vocab::CommitGateState::Unreviewed,
+        }];
+        let awaited = awaited_reviewers(&s);
         assert!(
-            got.contains(&"codex") && got.contains(&"ruthless"),
+            awaited.iter().any(|l| l == "codex"),
+            "ad-hoc-only snapshot activates roster reviewers: {awaited:?}"
+        );
+        assert_eq!(agent_status_emoji(&s, "codex", Role::Reviewer), "👀");
+        assert_eq!(
+            agent_status_emoji(&s, "claude", Role::Master),
+            "💤",
+            "unreviewed ad-hoc work is the reviewers' turn"
+        );
+
+        // Global preemption still routes through is_actionable: a
+        // broken HEAD idles everyone, ad-hoc work included.
+        let mut broken = s;
+        broken.head_correction = Some(clank_core::wait::HeadCorrection {
+            sha: crate::lifecycle::CommitSha::parse(&"a".repeat(40)).unwrap(),
+            violation: clank_core::wait::HeadTagViolation {
+                unknown: vec!["ghost".to_string()],
+                untagged_touched: vec![],
+                extra_named: vec![],
+            },
+        });
+        assert!(
+            awaited_reviewers(&broken).is_empty(),
+            "a broken HEAD idles ad-hoc reviewers too"
+        );
+
+        // ChangesRequested: the reviewers' part is done — they idle
+        // (master's ad-hoc revise is out of this plan's scope).
+        let mut done = with_agents(snap(vec![], vec![]), roster);
+        done.ad_hoc = vec![clank_core::wait::AdHocWorkState {
+            sha: crate::lifecycle::CommitSha::parse(&"b".repeat(40)).unwrap(),
+            gate: clank_core::vocab::CommitGateState::ChangesRequested,
+        }];
+        assert!(awaited_reviewers(&done).is_empty());
+    }
+
+    #[test]
+    fn awaited_reviewers_unions_plans_and_prs() {
+        use crate::cli::teams_config::RosterRole;
+        let mut s = with_agents(
+            snap(vec![plan_state("p", reviewer_missing("codex"))], vec![]),
+            &[
+                ("claude", RosterRole::Master),
+                ("codex", RosterRole::Commit),
+                ("ruthless", RosterRole::Gate),
+            ],
+        );
+        s.pr_reviews.push(pr_awaiting(&["ruthless"]));
+        let got = awaited_reviewers(&s);
+        assert!(
+            got.iter().any(|l| l == "codex") && got.iter().any(|l| l == "ruthless"),
             "got: {got:?}"
         );
         // Master's turn → nobody awaited.
@@ -319,7 +407,16 @@ mod tests {
         assert_eq!(agent_status_emoji(&working, "claude", Role::Master), "🔨");
         assert_eq!(agent_status_emoji(&working, "codex", Role::Reviewer), "💤");
 
-        let reviewing = snap(vec![plan_state("p", reviewer_missing("codex"))], vec![]);
+        // Roster-driven candidates (tui-adhoc-review-activity): the
+        // fixture must declare who is on the team.
+        let reviewing = with_agents(
+            snap(vec![plan_state("p", reviewer_missing("codex"))], vec![]),
+            &[
+                ("claude", crate::cli::teams_config::RosterRole::Master),
+                ("codex", crate::cli::teams_config::RosterRole::Commit),
+                ("ruthless", crate::cli::teams_config::RosterRole::Gate),
+            ],
+        );
         assert_eq!(
             agent_status_emoji(&reviewing, "codex", Role::Reviewer),
             "👀"

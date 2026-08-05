@@ -489,6 +489,22 @@ pub struct AdHocWorkState {
     pub gate: crate::vocab::CommitGateState,
 }
 
+impl AdHocWorkState {
+    /// Whether this gate state still routes work to ANYONE — the
+    /// exact mirror of [`WorkStatus::work_for`]'s ad-hoc arms
+    /// (`Unreviewed` → reviewers, `ChangesRequested` → master).
+    /// Every other state is terminal or unrouted for an ad-hoc
+    /// commit, so consumers (the TUI's attention/bar) must not
+    /// read a nonempty list as in-flight work.
+    pub fn is_open(&self) -> bool {
+        matches!(
+            self.gate,
+            crate::vocab::CommitGateState::Unreviewed
+                | crate::vocab::CommitGateState::ChangesRequested
+        )
+    }
+}
+
 /// Compute the gate state for one commit given its review
 /// entries and the two-tier reviewer split from the team
 /// composition.

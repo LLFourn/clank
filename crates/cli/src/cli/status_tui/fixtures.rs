@@ -102,8 +102,30 @@ pub(crate) fn snap(plans: Vec<PlanWorkState>, queue: Vec<&str>) -> StatusSnapsho
         log_rows: Vec::new(),
         log_decorations: Default::default(),
         pr_reviews: Vec::new(),
+        ad_hoc: Vec::new(),
         head_correction: None,
     }
+}
+
+/// Roster rows for activity-projection tests: candidates come from
+/// the roster (tui-adhoc-review-activity), so fixtures asserting
+/// awaited/spinner state must declare who is on the team.
+pub(crate) fn with_agents(
+    mut s: StatusSnapshot,
+    agents: &[(&str, crate::cli::teams_config::RosterRole)],
+) -> StatusSnapshot {
+    s.agents = agents
+        .iter()
+        .map(|(label, role)| crate::cli::status::AgentAutoRow {
+            label: label.to_string(),
+            role: *role,
+            auto_mode: clank_core::vocab::AutoMode::On,
+            tool: "claude".to_string(),
+            invocation: "claude".to_string(),
+            session: None,
+        })
+        .collect();
+    s
 }
 
 /// Visible text: ANSI escapes removed, trailing pad trimmed.

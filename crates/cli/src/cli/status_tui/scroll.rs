@@ -5,7 +5,6 @@
 //! the renderer turns each [`Seg`] into spans, and the loop drives the
 //! cursor.
 
-use super::derive::verb_of;
 use super::text::Span;
 use crate::cli::status::StatusSnapshot;
 use clank_core::plan_view::WaitingOn;
@@ -35,37 +34,72 @@ pub(super) fn spinner_glyph(frame: usize) -> &'static str {
     SPINNER[frame % SPINNER.len()]
 }
 
-/// In-progress activity for the active plan. THE INVARIANT: whenever the
-/// gate is waiting on an agent to produce something, emit an item for it
-/// (its AGENTS row spins). Pending reviewers each get one; any
-/// master-producing state — incl. `MasterToFinalize` (the finish commit)
-/// — gets one for master. Excluded: `Blocked` (a human's turn, shown by
-/// the block ask) and `MasterToFixCommitTag` (surfaced by the `fix`
-/// gauge). The match is exhaustive (no catch-all) so a new producing
-/// state can't silently slip through invisibly. Pure — unit-tested.
+/// In-progress activity. THE INVARIANT: whenever the gate is waiting
+/// on an agent to produce something, emit an item for it (its AGENTS
+/// row spins).
+///
+/// REVIEWER rows are ROSTER-driven through the shared
+/// `is_actionable` (tui-adhoc-review-activity): one routing path
+/// covers plan, PR, and AD-HOC reviews, their unions, and global
+/// preemption — an ad-hoc review carries no labels, so no
+/// missing-set enumeration could surface its reviewers. The verb
+/// refines from the single active plan's `waiting_on` when it names
+/// the reviewer ("gate-reviewing"); anything else is "reviewing".
+///
+/// MASTER's row keeps the single-active-plan derivation — its verbs
+/// (working/revising/committing/finalizing via [`verb_of`]) are
+/// defined by plan states alone. Excluded: `Blocked` (a human's
+/// turn, shown by the block ask) and `MasterToFixCommitTag`
+/// (surfaced by the `fix` gauge). The match is exhaustive (no
+/// catch-all) so a new producing state can't silently slip through
+/// invisibly. Pure — unit-tested.
 pub(super) fn in_progress_rows(snap: &StatusSnapshot) -> Vec<InProgress> {
-    let [v] = snap.plans.as_slice() else {
-        return Vec::new();
+    let plan_verb = |label: &str| -> &'static str {
+        if let [v] = snap.plans.as_slice()
+            && let WaitingOn::ReviewerApprovalsMissing { missing }
+            | WaitingOn::GateReviewersMissing { missing } = &v.waiting_on
+            && missing.iter().any(|l| l.as_str() == label)
+        {
+            super::derive::verb_of(&v.waiting_on)
+        } else {
+            "reviewing"
+        }
     };
-    let verb = verb_of(&v.waiting_on);
-    match &v.waiting_on {
-        WaitingOn::ReviewerApprovalsMissing { missing }
-        | WaitingOn::GateReviewersMissing { missing } => missing
-            .iter()
-            .map(|l| InProgress::PendingReview {
-                label: l.as_str().to_string(),
-                verb,
-            })
-            .collect(),
-        WaitingOn::MasterToContinue
-        | WaitingOn::MasterToRevise { .. }
-        | WaitingOn::MasterToCommit
-        | WaitingOn::MasterToFinalize => vec![InProgress::MasterWorking {
+    let mut out: Vec<InProgress> = super::derive::awaited_reviewers(snap)
+        .into_iter()
+        .map(|label| {
+            let verb = plan_verb(&label);
+            InProgress::PendingReview { label, verb }
+        })
+        .collect();
+    if let [v] = snap.plans.as_slice() {
+        match &v.waiting_on {
+            WaitingOn::MasterToContinue
+            | WaitingOn::MasterToRevise { .. }
+            | WaitingOn::MasterToCommit
+            | WaitingOn::MasterToFinalize => out.push(InProgress::MasterWorking {
+                name: snap.master.as_deref().unwrap_or("master").to_string(),
+                verb: super::derive::verb_of(&v.waiting_on),
+            }),
+            WaitingOn::ReviewerApprovalsMissing { .. }
+            | WaitingOn::GateReviewersMissing { .. }
+            | WaitingOn::Blocked { .. }
+            | WaitingOn::MasterToFixCommitTag => {}
+        }
+    } else if snap
+        .ad_hoc
+        .iter()
+        .any(|a| a.gate == clank_core::vocab::CommitGateState::ChangesRequested)
+    {
+        // Plan-less ad-hoc revision: master's row spins with the
+        // routed verb, mirroring bar_text and master_is_active
+        // (codex 4a4be39).
+        out.push(InProgress::MasterWorking {
             name: snap.master.as_deref().unwrap_or("master").to_string(),
-            verb,
-        }],
-        WaitingOn::Blocked { .. } | WaitingOn::MasterToFixCommitTag => Vec::new(),
+            verb: "revising",
+        });
     }
+    out
 }
 
 /// One row of scrollable content: a wrapped block-ask line or a
@@ -252,8 +286,17 @@ mod tests {
 
     #[test]
     fn in_progress_rows_derive_from_waiting_on() {
+        use crate::cli::status_tui::fixtures::with_agents;
+        use crate::cli::teams_config::RosterRole;
+        let roster: &[(&str, RosterRole)] = &[
+            ("claude", RosterRole::Master),
+            ("codex", RosterRole::Commit),
+        ];
         // Pending reviewers → one spinner row each, verb "reviewing".
-        let s = snap(vec![plan_state("foo", reviewer_missing("codex"))], vec![]);
+        let s = with_agents(
+            snap(vec![plan_state("foo", reviewer_missing("codex"))], vec![]),
+            roster,
+        );
         assert!(matches!(
             in_progress_rows(&s).as_slice(),
             [InProgress::PendingReview { label, verb }] if label == "codex" && *verb == "reviewing"
@@ -317,7 +360,13 @@ mod tests {
         // reviewer or on master. The "waiting is never invisible"
         // invariant now lives in the agent-row render test.
         for waiting in [reviewer_missing("codex"), WaitingOn::MasterToContinue] {
-            let s = snap_with_header_and_commit(waiting);
+            let s = crate::cli::status_tui::fixtures::with_agents(
+                snap_with_header_and_commit(waiting),
+                &[
+                    ("claude", crate::cli::teams_config::RosterRole::Master),
+                    ("codex", crate::cli::teams_config::RosterRole::Commit),
+                ],
+            );
             let ask = block_ask_spans(&s, 80);
             assert!(
                 !in_progress_rows(&s).is_empty(),

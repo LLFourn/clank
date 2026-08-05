@@ -73,6 +73,10 @@ pub struct StatusSnapshot {
     /// Active GitHub PR reviews (clank-pr-review-mode), for the
     /// `pr` gauge. Empty in the common (no-PR-review) case.
     pub(crate) pr_reviews: Vec<clank_core::wait::PrReviewWorkState>,
+    /// The fold's pending AD-HOC commit review, if any — carried so
+    /// the TUI's activity projection sees the same work `clank wait`
+    /// delivers (tui-adhoc-review-activity).
+    pub(crate) ad_hoc: Vec<clank_core::wait::AdHocWorkState>,
     /// A broken HEAD commit tag, when present
     /// (commit-tag-fixup-is-first-class-state). The SINGLE source the
     /// renderers read so the correction is visible even when NO active
@@ -479,6 +483,7 @@ impl StatusSnapshot {
             log_rows,
             log_decorations,
             pr_reviews: work_status.pr_reviews,
+            ad_hoc: work_status.ad_hoc,
             head_correction: work_status.head_correction,
         })
     }
@@ -1892,6 +1897,7 @@ mod dirty_and_wake_tests {
             log_rows: Vec::new(),
             log_decorations: Default::default(),
             pr_reviews: Vec::new(),
+            ad_hoc: Vec::new(),
             head_correction: None,
         }
     }

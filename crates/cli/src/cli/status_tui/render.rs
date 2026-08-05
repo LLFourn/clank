@@ -697,6 +697,29 @@ pub(super) fn bar_text(snap: &StatusSnapshot) -> (String, String) {
             [pr] => pr_bar_text(pr, snap.master.as_deref().unwrap_or("master")),
             many => (format!("🔀 {} PR REVIEWS", many.len()), String::new()),
         },
+        // Ad-hoc ChangesRequested is an actionable MASTER item
+        // (AdHocRevise) that wait returns BEFORE scanning the queue —
+        // revising beats promote (codex 0c31c92). Head correction
+        // owns the bar over it.
+        [] if snap.head_correction.is_none()
+            && snap
+                .ad_hoc
+                .iter()
+                .any(|a| a.gate == clank_core::vocab::CommitGateState::ChangesRequested) =>
+        {
+            let ah = snap
+                .ad_hoc
+                .iter()
+                .find(|a| a.gate == clank_core::vocab::CommitGateState::ChangesRequested)
+                .expect("guard checked");
+            (
+                format!(
+                    "🔨 {} revising",
+                    snap.master.as_deref().unwrap_or("master").to_uppercase()
+                ),
+                crate::cli::status::short_sha(ah.sha.as_str()).to_string(),
+            )
+        }
         [] if !snap.queue.is_empty() => {
             let master = snap.master.as_deref().unwrap_or("master").to_uppercase();
             // Mirror the wait promote scan (wait-ignores-queue-only-blocks):
@@ -727,6 +750,25 @@ pub(super) fn bar_text(snap: &StatusSnapshot) -> (String, String) {
                 (format!("📋 {master} promote"), right)
             } else {
                 (format!("🙋 {master} blocked"), right)
+            }
+        }
+        // Unreviewed ad-hoc: the reviewers' turn — BELOW the queue
+        // arm, because an Unreviewed ad-hoc gives master nothing and
+        // wait does reach queue promotion (codex 0c31c92). Terminal /
+        // unrouted gates fall through; head correction owns the bar.
+        [] if snap.head_correction.is_none() && snap.ad_hoc.iter().any(|a| a.is_open()) => {
+            let ah = snap
+                .ad_hoc
+                .iter()
+                .find(|a| a.is_open())
+                .expect("guard checked");
+            match super::derive::awaited_reviewers(snap).first() {
+                Some(reviewer) => (
+                    format!("👀 {} reviewing", reviewer.to_uppercase()),
+                    crate::cli::status::short_sha(ah.sha.as_str()).to_string(),
+                ),
+                // Roster gap: nobody CAN act — say so honestly.
+                None => ("💤 idle".to_string(), String::new()),
             }
         }
         [] => ("💤 idle".to_string(), String::new()),
@@ -3635,6 +3677,170 @@ mod tests {
         assert!(
             !line_with(&panel, "second").contains(REVERSE),
             "no log cursor band when the panel is focused"
+        );
+    }
+
+    #[test]
+    fn adhoc_review_is_never_an_idle_bar() {
+        // codex bad9de1: the panel row spun under a dim idle bar —
+        // ad-hoc work must drive the SHARED attention/bar
+        // derivation like every other in-flight kind. The bar names
+        // WHO and the COMMIT (short sha), and attention classifies
+        // Active (the zellij indicator follows it).
+        let mut s = two_agent_snap(); // claude (master) + codex (commit)
+        s.ad_hoc = vec![clank_core::wait::AdHocWorkState {
+            sha: crate::lifecycle::CommitSha::parse(&format!("{:b<40}", "abc123")).unwrap(),
+            gate: clank_core::vocab::CommitGateState::Unreviewed,
+        }];
+        assert_eq!(
+            super::super::derive::attention_state(&s),
+            super::super::derive::AttentionState::Active,
+            "ad-hoc work is in-flight"
+        );
+        let (left, right) = bar_text(&s);
+        assert!(left.contains("👀") && left.contains("CODEX"), "{left}");
+        assert!(!left.contains("idle"), "{left}");
+        assert_eq!(
+            right,
+            crate::cli::status::short_sha(s.ad_hoc[0].sha.as_str())
+        );
+
+        // ChangesRequested: the reviewers are done — master owes the
+        // revision, and EVERY master surface agrees (codex 4a4be39):
+        // the bar, the green frame (not promote-cyan, not
+        // reviewer-yellow), the master 🔨, and the revising spinner
+        // on master's row.
+        s.ad_hoc[0].gate = clank_core::vocab::CommitGateState::ChangesRequested;
+        let (left, _) = bar_text(&s);
+        assert!(left.contains("🔨") && left.contains("CLAUDE"), "{left}");
+        assert!(super::super::derive::master_is_active(&s));
+        assert_eq!(super::super::derive::state_color(&s), "32", "green: master");
+        assert_eq!(
+            super::super::derive::agent_status_emoji(&s, "claude", clank_core::vocab::Role::Master),
+            "🔨"
+        );
+        let out = render(&s, 40, 80);
+        let claude_row = visible(line_with(&out, "claude"));
+        assert!(
+            claude_row.contains(SPINNER[0]) && claude_row.contains("revising"),
+            "master row spins with the routed verb: {claude_row}"
+        );
+
+        // TERMINAL gates route no work (codex 923a679): a positively
+        // reviewed ad-hoc commit is Idle — not a permanently active
+        // bar falsely revising.
+        for gate in [
+            clank_core::vocab::CommitGateState::Continued,
+            clank_core::vocab::CommitGateState::Finished,
+        ] {
+            s.ad_hoc[0].gate = gate;
+            assert_eq!(
+                super::super::derive::attention_state(&s),
+                super::super::derive::AttentionState::Idle,
+                "{gate:?} is terminal"
+            );
+            let (left, _) = bar_text(&s);
+            assert!(left.contains("idle"), "{gate:?}: {left}");
+        }
+
+        // Head correction preempts an Unreviewed ad-hoc: correction
+        // owns the state and the bar must NOT claim master is
+        // revising.
+        s.ad_hoc[0].gate = clank_core::vocab::CommitGateState::Unreviewed;
+        s.head_correction = Some(clank_core::wait::HeadCorrection {
+            sha: crate::lifecycle::CommitSha::parse(&"a".repeat(40)).unwrap(),
+            violation: clank_core::wait::HeadTagViolation {
+                unknown: vec!["ghost".to_string()],
+                untagged_touched: vec![],
+                extra_named: vec![],
+            },
+        });
+        assert_eq!(
+            super::super::derive::attention_state(&s),
+            super::super::derive::AttentionState::NeedsCorrection
+        );
+        let (left, _) = bar_text(&s);
+        assert!(!left.contains("revising"), "correction precedence: {left}");
+    }
+
+    #[test]
+    fn adhoc_and_queue_mix_follows_waits_precedence() {
+        // codex 0c31c92: precedence mirrors wait's routing. A
+        // ChangesRequested ad-hoc is an actionable master item wait
+        // returns BEFORE the queue scan — revising beats promote on
+        // every surface. An Unreviewed ad-hoc gives master nothing,
+        // so promotion wins the bar/frame while the reviewers still
+        // spin their rows.
+        let mut s = two_agent_snap(); // claude (master) + codex (commit)
+        s.queue = vec![crate::cli::status::QueueItemView {
+            priority: 500,
+            name: "queued-plan".to_string(),
+        }];
+        s.ad_hoc = vec![clank_core::wait::AdHocWorkState {
+            sha: crate::lifecycle::CommitSha::parse(&format!("{:b<40}", "abc123")).unwrap(),
+            gate: clank_core::vocab::CommitGateState::ChangesRequested,
+        }];
+        let (left, right) = bar_text(&s);
+        assert!(
+            left.contains("🔨") && left.contains("revising"),
+            "revising beats promote: {left}"
+        );
+        assert_eq!(
+            right,
+            crate::cli::status::short_sha(s.ad_hoc[0].sha.as_str())
+        );
+        assert_eq!(
+            super::super::derive::state_color(&s),
+            "32",
+            "green, not cyan"
+        );
+        assert!(super::super::derive::master_is_active(&s));
+
+        // Unreviewed + queue: promote wins the bar and the frame is
+        // promote-cyan; master panes show active (promoting), the
+        // reviewer still spins.
+        s.ad_hoc[0].gate = clank_core::vocab::CommitGateState::Unreviewed;
+        let (left, _) = bar_text(&s);
+        assert!(left.contains("promote"), "promote wins the bar: {left}");
+        assert_eq!(super::super::derive::state_color(&s), "36", "promote cyan");
+        assert!(super::super::derive::master_is_active(&s), "promoting");
+        assert_eq!(
+            super::super::derive::agent_status_emoji(
+                &s,
+                "codex",
+                clank_core::vocab::Role::Reviewer
+            ),
+            "👀",
+            "the reviewer is still awaited"
+        );
+        let out = render(&s, 40, 80);
+        let codex_row = visible(line_with(&out, "codex"));
+        assert!(
+            codex_row.contains(SPINNER[0]) && codex_row.contains("reviewing"),
+            "reviewer spins under a promote bar: {codex_row}"
+        );
+    }
+
+    #[test]
+    fn adhoc_review_spins_the_reviewer_row() {
+        // tui-adhoc-review-activity: an ad-hoc commit review — no
+        // plans at all — spins the reviewer's AGENTS row with the
+        // "reviewing" verb; master's row stays still.
+        let mut s = two_agent_snap(); // claude (master) + codex (commit)
+        s.ad_hoc = vec![clank_core::wait::AdHocWorkState {
+            sha: crate::lifecycle::CommitSha::parse(&"b".repeat(40)).unwrap(),
+            gate: clank_core::vocab::CommitGateState::Unreviewed,
+        }];
+        let out = render(&s, 40, 80);
+        let codex_row = visible(line_with(&out, "codex"));
+        assert!(
+            codex_row.contains(SPINNER[0]) && codex_row.contains("reviewing"),
+            "ad-hoc review spins the reviewer row: {codex_row}"
+        );
+        let claude_row = visible(line_with(&out, "claude"));
+        assert!(
+            !claude_row.contains(SPINNER[0]),
+            "master row still: {claude_row}"
         );
     }
 
