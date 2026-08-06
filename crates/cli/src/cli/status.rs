@@ -779,6 +779,22 @@ pub async fn run(args: StatusArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The watch loop's failure policy (tui-transient-refresh-resilience,
+/// codex 697cdb1): BEFORE the first successful snapshot there is no
+/// prior output to retain — a probe/build failure is FATAL, exactly
+/// like the one-shot path. AFTER one success, failures degrade to a
+/// stderr warning with the last output kept; the caller leaves the
+/// signature untouched, so the SAME state retries on the next event
+/// or the 60s backstop (recovery is the ordinary success path).
+fn watch_failure(bootstrapped: bool, stage: &str, e: impl std::fmt::Display) -> anyhow::Result<()> {
+    if bootstrapped {
+        eprintln!("status watch: {stage} failed ({e}); kept last output, retrying");
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!("status watch: {stage} failed: {e}"))
+    }
+}
+
 async fn run_watch(
     repo: std::path::PathBuf,
     basename: String,
@@ -797,35 +813,47 @@ async fn run_watch(
         // Nothing-changed gate (lloyd's invariant): only rebuild when an
         // input the snapshot depends on actually changed. The signature
         // probe is far cheaper than the fold + render it guards.
-        let sig = input_signature(&repo)?;
-        if last_sig.as_ref() != Some(&sig) {
-            let snapshot = StatusSnapshot::build_async(
-                &repo,
-                &basename,
-                home.as_deref(),
-                policy,
-                plan_arg,
-                true,
-            )
-            .await?;
+        // Transient probe/rebuild failures must not kill a
+        // BOOTSTRAPPED watch (see [`watch_failure`] — the first
+        // snapshot stays fatal): keep the last output, do NOT
+        // advance the signature, and let the next event or the 60s
+        // backstop retry the SAME state.
+        match input_signature(&repo) {
+            Ok(sig) if last_sig.as_ref() != Some(&sig) => {
+                match StatusSnapshot::build_async(
+                    &repo,
+                    &basename,
+                    home.as_deref(),
+                    policy,
+                    plan_arg,
+                    true,
+                )
+                .await
+                {
+                    Ok(snapshot) => {
+                        let output = if json {
+                            snapshot.to_json_compact()
+                        } else {
+                            snapshot.to_human()
+                        };
 
-            let output = if json {
-                snapshot.to_json_compact()
-            } else {
-                snapshot.to_human()
-            };
-
-            if last_emitted.as_deref() != Some(&output) {
-                let stdout = std::io::stdout();
-                let mut out = stdout.lock();
-                if last_emitted.is_some() {
-                    writeln!(out)?;
+                        if last_emitted.as_deref() != Some(&output) {
+                            let stdout = std::io::stdout();
+                            let mut out = stdout.lock();
+                            if last_emitted.is_some() {
+                                writeln!(out)?;
+                            }
+                            writeln!(out, "{output}")?;
+                            out.flush()?;
+                            last_emitted = Some(output);
+                        }
+                        last_sig = Some(sig);
+                    }
+                    Err(e) => watch_failure(last_sig.is_some(), "refresh", format!("{e:#}"))?,
                 }
-                writeln!(out, "{output}")?;
-                out.flush()?;
-                last_emitted = Some(output);
             }
-            last_sig = Some(sig);
+            Ok(_) => {}
+            Err(e) => watch_failure(last_sig.is_some(), "input probe", format!("{e:#}"))?,
         }
 
         // Event-driven: worktree edits, .clank writes, and git-dir
@@ -1400,6 +1428,27 @@ pub(crate) fn dirty_summary(d: &DirtyStats) -> String {
         return "changes".to_string();
     }
     parts.join(" · ")
+}
+
+#[cfg(test)]
+mod watch_failure_tests {
+    use super::watch_failure;
+
+    #[test]
+    fn initial_failure_is_fatal_post_success_degrades() {
+        // codex 697cdb1: before the first successful snapshot there
+        // is nothing to retain — fail loud, like the one-shot path.
+        let err = watch_failure(false, "input probe", "boom").unwrap_err();
+        assert!(err.to_string().contains("input probe"), "{err}");
+        let err = watch_failure(false, "refresh", "boom").unwrap_err();
+        assert!(err.to_string().contains("refresh"), "{err}");
+        // After one success the watch degrades and keeps running;
+        // the caller leaves last_sig untouched, so the next
+        // event/backstop retries the same state and an ordinary
+        // success is the recovery.
+        assert!(watch_failure(true, "input probe", "boom").is_ok());
+        assert!(watch_failure(true, "refresh", "boom").is_ok());
+    }
 }
 
 #[cfg(test)]

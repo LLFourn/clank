@@ -10,12 +10,25 @@ use crate::lifecycle::{CommitSha, PlanKey};
 
 #[derive(Debug, thiserror::Error)]
 pub enum GitIoError {
+    /// A git SUBPROCESS failed (spawn error or nonzero exit) —
+    /// constructed ONLY at the subprocess boundary
+    /// (`read_git_stdout`). Provenance is carried at construction,
+    /// never inferred: spawn failures also have `code: None`, so
+    /// code absence cannot distinguish gix from subprocess
+    /// (tui-transient-refresh-resilience).
     #[error("git {context}: exit {code:?}: {stderr}")]
     NonZero {
         context: String,
         code: Option<i32>,
         stderr: String,
     },
+    /// A gix-backed operation failed. Distinct so no gix failure
+    /// ever renders as a subprocess death — "git git status item:
+    /// exit None: …" sent a real investigation down the wrong path.
+    /// (`detail`, not `source` — thiserror gives `source` chaining
+    /// semantics.)
+    #[error("gix {context}: {detail}")]
+    Gix { context: String, detail: String },
     #[error("git output parse failure ({context}): {detail}")]
     Parse { context: String, detail: String },
 }
@@ -27,11 +40,14 @@ fn parse_sha(context: &str, s: &str) -> Result<CommitSha, GitIoError> {
     })
 }
 
-fn nonzero(context: impl Into<String>, e: impl std::fmt::Display) -> GitIoError {
-    GitIoError::NonZero {
+/// Wrap a gix-side failure. EVERY error constructed above the
+/// subprocess divider goes through this (or `GitIoError::Gix`
+/// directly) — the subprocess shape is reserved for
+/// `read_git_stdout` below it.
+fn gix_err(context: impl Into<String>, e: impl std::fmt::Display) -> GitIoError {
+    GitIoError::Gix {
         context: context.into(),
-        code: None,
-        stderr: e.to_string(),
+        detail: e.to_string(),
     }
 }
 
@@ -57,8 +73,7 @@ thread_local! {
 pub fn open(repo: &Path) -> Result<Repo, GitIoError> {
     #[cfg(test)]
     OPEN_COUNT.with(|c| c.set(c.get() + 1));
-    let mut r =
-        gix::open(repo).map_err(|e| nonzero(format!("gix open `{}`", repo.display()), e))?;
+    let mut r = gix::open(repo).map_err(|e| gix_err(format!("open `{}`", repo.display()), e))?;
     r.object_cache_size_if_unset(16 * 1024 * 1024);
     Ok(Repo(r))
 }
@@ -93,7 +108,7 @@ impl Repo {
 
         let workdir = git
             .workdir()
-            .ok_or_else(|| nonzero("working_tree_dirty", "bare repo has no working tree"))?
+            .ok_or_else(|| gix_err("working_tree_dirty", "bare repo has no working tree"))?
             .to_path_buf();
 
         let walk = status_walk(git)?;
@@ -153,7 +168,7 @@ impl Repo {
     pub fn current_branch(&self) -> Result<Option<String>, GitIoError> {
         match self.0.head_name() {
             Ok(opt) => Ok(opt.map(|name| name.shorten().to_string())),
-            Err(e) => Err(nonzero("current_branch", format!("head_name: {e}"))),
+            Err(e) => Err(gix_err("current_branch", format!("head_name: {e}"))),
         }
     }
 
@@ -168,10 +183,10 @@ impl Repo {
         let commit = self
             .0
             .find_commit(oid)
-            .map_err(|e| nonzero("commit_subject", format!("find_commit: {e}")))?;
+            .map_err(|e| gix_err("commit_subject", format!("find_commit: {e}")))?;
         let msg = commit
             .message()
-            .map_err(|e| nonzero("commit_subject", format!("message: {e}")))?;
+            .map_err(|e| gix_err("commit_subject", format!("message: {e}")))?;
         Ok(msg.summary().to_string())
     }
 
@@ -221,10 +236,10 @@ impl Repo {
         let commit = self
             .0
             .find_commit(oid)
-            .map_err(|e| nonzero("commit_body", format!("find_commit: {e}")))?;
+            .map_err(|e| gix_err("commit_body", format!("find_commit: {e}")))?;
         let msg = commit
             .message()
-            .map_err(|e| nonzero("commit_body", format!("message: {e}")))?;
+            .map_err(|e| gix_err("commit_body", format!("message: {e}")))?;
         Ok(msg.body().map(|b| b.to_string()).unwrap_or_default())
     }
 
@@ -266,10 +281,9 @@ impl Repo {
             if candidates.contains(&sha) {
                 return Ok(Some(sha));
             }
-            let commit = repo.find_commit(cursor).map_err(|e| GitIoError::NonZero {
+            let commit = repo.find_commit(cursor).map_err(|e| GitIoError::Gix {
                 context: CONTEXT.into(),
-                code: None,
-                stderr: format!("find_commit: {e}"),
+                detail: format!("find_commit: {e}"),
             })?;
             match commit.parent_ids().next() {
                 Some(p) => cursor = p.detach(),
@@ -286,10 +300,9 @@ impl Repo {
         tip: &CommitSha,
     ) -> Result<Vec<CommitEvent>, GitIoError> {
         const CONTEXT: &str = "commit_events_between";
-        let walk_err = |e: &dyn std::fmt::Display, stage: &str| GitIoError::NonZero {
+        let walk_err = |e: &dyn std::fmt::Display, stage: &str| GitIoError::Gix {
             context: CONTEXT.to_string(),
-            code: None,
-            stderr: format!("{stage}: {e}"),
+            detail: format!("{stage}: {e}"),
         };
         let repo = &self.0;
 
@@ -395,17 +408,15 @@ impl Repo {
                 DiffGate::FullDiff => {
                     let parent = parent_tree
                         .map(|t| {
-                            repo.find_tree(t).map_err(|e| GitIoError::NonZero {
+                            repo.find_tree(t).map_err(|e| GitIoError::Gix {
                                 context: CONTEXT.to_string(),
-                                code: None,
-                                stderr: format!("parent find_tree: {e}"),
+                                detail: format!("parent find_tree: {e}"),
                             })
                         })
                         .transpose()?;
-                    let child = repo.find_tree(raw.tree).map_err(|e| GitIoError::NonZero {
+                    let child = repo.find_tree(raw.tree).map_err(|e| GitIoError::Gix {
                         context: CONTEXT.to_string(),
-                        code: None,
-                        stderr: format!("find_tree: {e}"),
+                        detail: format!("find_tree: {e}"),
                     })?;
                     diff_trees_changes(repo, parent.as_ref(), &child, CONTEXT)?
                 }
@@ -507,7 +518,7 @@ impl Repo {
         let commit = self
             .0
             .find_commit(oid)
-            .map_err(|e| nonzero(context, format!("find_commit: {e}")))?;
+            .map_err(|e| gix_err(context, format!("find_commit: {e}")))?;
         Ok(commit.parent_ids().count())
     }
 
@@ -549,19 +560,19 @@ impl Repo {
             })?;
         let commit = repo
             .find_commit(oid)
-            .map_err(|e| nonzero(context.clone(), format!("find_commit: {e}")))?;
+            .map_err(|e| gix_err(context.clone(), format!("find_commit: {e}")))?;
         let this_tree = commit
             .tree()
-            .map_err(|e| nonzero(context.clone(), format!("commit.tree: {e}")))?;
+            .map_err(|e| gix_err(context.clone(), format!("commit.tree: {e}")))?;
         // First-parent semantics fall out: `parent_ids().next()` IS
         // the first parent for merges. Root commit → no parent →
         // diff against the empty tree (matches legacy `--root`).
         let parent_tree_owned = match commit.parent_ids().next() {
             Some(p) => Some(
                 repo.find_commit(p.detach())
-                    .map_err(|e| nonzero(context.clone(), format!("parent find_commit: {e}")))?
+                    .map_err(|e| gix_err(context.clone(), format!("parent find_commit: {e}")))?
                     .tree()
-                    .map_err(|e| nonzero(context.clone(), format!("parent tree: {e}")))?,
+                    .map_err(|e| gix_err(context.clone(), format!("parent tree: {e}")))?,
             ),
             None => None,
         };
@@ -584,16 +595,16 @@ impl Repo {
             })?;
         let commit = repo
             .find_commit(oid)
-            .map_err(|e| nonzero(context.clone(), format!("find_commit: {e}")))?;
+            .map_err(|e| gix_err(context.clone(), format!("find_commit: {e}")))?;
         let this_tree = commit
             .tree()
-            .map_err(|e| nonzero(context.clone(), format!("commit.tree: {e}")))?;
+            .map_err(|e| gix_err(context.clone(), format!("commit.tree: {e}")))?;
         let parent_tree = match commit.parent_ids().next() {
             Some(p) => Some(
                 repo.find_commit(p.detach())
-                    .map_err(|e| nonzero(context.clone(), format!("parent find_commit: {e}")))?
+                    .map_err(|e| gix_err(context.clone(), format!("parent find_commit: {e}")))?
                     .tree()
-                    .map_err(|e| nonzero(context.clone(), format!("parent tree: {e}")))?,
+                    .map_err(|e| gix_err(context.clone(), format!("parent tree: {e}")))?,
             ),
             None => None,
         };
@@ -601,7 +612,7 @@ impl Repo {
             gix::diff::Options::default().with_rewrites(Some(gix::diff::Rewrites::default()));
         let raw = repo
             .diff_tree_to_tree(parent_tree.as_ref(), Some(&this_tree), opts)
-            .map_err(|e| nonzero(context.clone(), format!("diff_tree_to_tree: {e}")))?;
+            .map_err(|e| gix_err(context.clone(), format!("diff_tree_to_tree: {e}")))?;
 
         use gix::object::tree::diff::ChangeDetached as Ch;
         let mut out = Vec::new();
@@ -764,17 +775,17 @@ pub struct PathIgnore {
 /// skip-worktree fallback (a stale index doesn't affect a live wake
 /// filter, which errs toward waking).
 pub fn open_ignore(repo: &Path) -> Result<PathIgnore, GitIoError> {
-    let r = gix::open(repo).map_err(|e| nonzero(format!("gix open `{}`", repo.display()), e))?;
+    let r = gix::open(repo).map_err(|e| gix_err(format!("open `{}`", repo.display()), e))?;
     let index = r
         .index_or_empty()
-        .map_err(|e| nonzero("open index for excludes", e))?;
+        .map_err(|e| gix_err("open index for excludes", e))?;
     let stack = r
         .excludes(
             &index,
             None,
             gix::worktree::stack::state::ignore::Source::WorktreeThenIdMappingIfNotSkipped,
         )
-        .map_err(|e| nonzero("build exclude stack", e))?
+        .map_err(|e| gix_err("build exclude stack", e))?
         .detach();
     Ok(PathIgnore { repo: r, stack })
 }
@@ -813,11 +824,11 @@ fn status_walk(git: &gix::Repository) -> Result<WtStatus, GitIoError> {
     let patterns: Vec<gix::bstr::BString> = Vec::new();
     let iter = git
         .status(gix::progress::Discard)
-        .map_err(|e| nonzero("git status", e))?
+        .map_err(|e| gix_err("status", e))?
         .into_iter(patterns)
-        .map_err(|e| nonzero("git status iter", e))?;
+        .map_err(|e| gix_err("status iter", e))?;
     for item in iter {
-        match item.map_err(|e| nonzero("git status item", e))? {
+        match item.map_err(|e| gix_err("status item", e))? {
             gix::status::Item::TreeIndex(change) => {
                 changed.insert(change.location().to_str_lossy().into_owned());
             }
@@ -966,10 +977,9 @@ fn absolutize(repo: &Path, p: &Path) -> PathBuf {
 /// common dir; use [`common_dir`]. Replaces hardcoded `<repo>/.git`
 /// and `git rev-parse --git-path …` for per-worktree paths.
 pub fn git_dir(repo: &Path) -> Result<PathBuf, GitIoError> {
-    let r = gix::open(repo).map_err(|e| GitIoError::NonZero {
+    let r = gix::open(repo).map_err(|e| GitIoError::Gix {
         context: "open".into(),
-        code: None,
-        stderr: format!("open: {e}"),
+        detail: format!("open: {e}"),
     })?;
     Ok(absolutize(repo, r.git_dir()))
 }
@@ -978,10 +988,9 @@ pub fn git_dir(repo: &Path) -> Result<PathBuf, GitIoError> {
 /// across all linked worktrees. Use for shared paths: `hooks/`,
 /// `config`, `info/`. Replaces `git rev-parse --git-path hooks/…`.
 pub fn common_dir(repo: &Path) -> Result<PathBuf, GitIoError> {
-    let r = gix::open(repo).map_err(|e| GitIoError::NonZero {
+    let r = gix::open(repo).map_err(|e| GitIoError::Gix {
         context: "open".into(),
-        code: None,
-        stderr: format!("open: {e}"),
+        detail: format!("open: {e}"),
     })?;
     Ok(absolutize(repo, r.common_dir()))
 }
@@ -1004,10 +1013,9 @@ pub fn discover_work_dir(start: &Path) -> Result<Option<PathBuf>, GitIoError> {
 /// `None` when the key is absent (or unparseable). Replaces
 /// `git config --get <key>` + a hand-rolled truthiness check.
 pub fn config_bool(repo: &Path, key: &str) -> Result<Option<bool>, GitIoError> {
-    let r = gix::open(repo).map_err(|e| GitIoError::NonZero {
+    let r = gix::open(repo).map_err(|e| GitIoError::Gix {
         context: "open".into(),
-        code: None,
-        stderr: format!("open: {e}"),
+        detail: format!("open: {e}"),
     })?;
     Ok(r.config_snapshot().boolean(key))
 }
@@ -1115,7 +1123,7 @@ impl Repo {
         head: &CommitSha,
     ) -> Result<std::collections::BTreeMap<String, String>, GitIoError> {
         let err = |stage: &str, e: &dyn std::fmt::Display| {
-            nonzero("ancestor_subjects", format!("{stage}: {e}"))
+            gix_err("ancestor_subjects", format!("{stage}: {e}"))
         };
         let tip =
             gix::ObjectId::from_hex(head.as_str().as_bytes()).map_err(|e| GitIoError::Parse {
@@ -1159,44 +1167,36 @@ pub fn show_blob(repo: &Path, rev: &CommitSha, rel_path: &Path) -> Result<String
     let rev_str = rev.as_str();
     let path_str = rel_path.to_string_lossy();
     let context = format!("show_blob {rev_str}:{path_str}");
-    let repo = gix::open(repo).map_err(|e| GitIoError::NonZero {
+    let repo = gix::open(repo).map_err(|e| GitIoError::Gix {
         context: context.clone(),
-        code: None,
-        stderr: format!("gix open: {e}"),
+        detail: format!("open failed: {e}"),
     })?;
     let oid = gix::ObjectId::from_hex(rev_str.as_bytes()).map_err(|e| GitIoError::Parse {
         context: context.clone(),
         detail: format!("rev oid hex: {e}"),
     })?;
-    let commit = repo.find_commit(oid).map_err(|e| GitIoError::NonZero {
+    let commit = repo.find_commit(oid).map_err(|e| GitIoError::Gix {
         context: context.clone(),
-        code: None,
-        stderr: format!("find_commit: {e}"),
+        detail: format!("find_commit: {e}"),
     })?;
-    let tree = commit.tree().map_err(|e| GitIoError::NonZero {
+    let tree = commit.tree().map_err(|e| GitIoError::Gix {
         context: context.clone(),
-        code: None,
-        stderr: format!("commit.tree: {e}"),
+        detail: format!("commit.tree: {e}"),
     })?;
     let entry = tree
         .lookup_entry_by_path(path_str.as_ref())
-        .map_err(|e| GitIoError::NonZero {
+        .map_err(|e| GitIoError::Gix {
             context: context.clone(),
-            code: None,
-            stderr: format!("lookup_entry_by_path: {e}"),
+            detail: format!("lookup_entry_by_path: {e}"),
         })?
-        .ok_or_else(|| GitIoError::NonZero {
+        .ok_or_else(|| GitIoError::Gix {
             context: context.clone(),
-            code: Some(128),
-            stderr: format!("path `{path_str}` not in tree at {rev_str}"),
+            detail: format!("path `{path_str}` not in tree at {rev_str}"),
         })?;
-    let blob = repo
-        .find_blob(entry.oid())
-        .map_err(|e| GitIoError::NonZero {
-            context,
-            code: None,
-            stderr: format!("find_blob: {e}"),
-        })?;
+    let blob = repo.find_blob(entry.oid()).map_err(|e| GitIoError::Gix {
+        context,
+        detail: format!("find_blob: {e}"),
+    })?;
     Ok(String::from_utf8_lossy(&blob.data).into_owned())
 }
 
@@ -1214,10 +1214,9 @@ pub fn is_ancestor(
     head: &CommitSha,
 ) -> Result<bool, GitIoError> {
     let context = format!("is_ancestor {} {}", ancestor.as_str(), head.as_str());
-    let repo = gix::open(repo).map_err(|e| GitIoError::NonZero {
+    let repo = gix::open(repo).map_err(|e| GitIoError::Gix {
         context: context.clone(),
-        code: None,
-        stderr: format!("gix open: {e}"),
+        detail: format!("open failed: {e}"),
     })?;
     let ancestor_oid =
         gix::ObjectId::from_hex(ancestor.as_str().as_bytes()).map_err(|e| GitIoError::Parse {
@@ -1232,10 +1231,9 @@ pub fn is_ancestor(
     match repo.merge_base(ancestor_oid, head_oid) {
         Ok(id) => Ok(id.detach() == ancestor_oid),
         Err(gix::repository::merge_base::Error::NotFound { .. }) => Ok(false),
-        Err(e) => Err(GitIoError::NonZero {
+        Err(e) => Err(GitIoError::Gix {
             context,
-            code: None,
-            stderr: format!("merge_base: {e}"),
+            detail: format!("merge_base: {e}"),
         }),
     }
 }
@@ -1258,10 +1256,9 @@ fn first_parent_walk(
     tip: gix::ObjectId,
     context: &'static str,
 ) -> Result<Vec<CommitMeta>, GitIoError> {
-    let walk_err = |e: &dyn std::fmt::Display, stage: &str| GitIoError::NonZero {
+    let walk_err = |e: &dyn std::fmt::Display, stage: &str| GitIoError::Gix {
         context: context.to_string(),
-        code: None,
-        stderr: format!("{stage}: {e}"),
+        detail: format!("{stage}: {e}"),
     };
     let mut builder = repo.rev_walk([tip]).first_parent_only();
     if let Some(from_oid) = from {
@@ -1306,10 +1303,9 @@ pub fn first_parent_commits_between(
     tip: &CommitSha,
 ) -> Result<Vec<CommitMeta>, GitIoError> {
     const CONTEXT: &str = "first_parent_commits_between";
-    let repo = gix::open(repo).map_err(|e| GitIoError::NonZero {
+    let repo = gix::open(repo).map_err(|e| GitIoError::Gix {
         context: CONTEXT.into(),
-        code: None,
-        stderr: format!("gix open: {e}"),
+        detail: format!("open failed: {e}"),
     })?;
     let base_oid =
         gix::ObjectId::from_hex(base.as_str().as_bytes()).map_err(|e| GitIoError::Parse {
@@ -1331,10 +1327,9 @@ pub fn merge_base_at(
     b: &CommitSha,
 ) -> Result<Option<CommitSha>, GitIoError> {
     const CONTEXT: &str = "merge_base_at";
-    let r = gix::open(repo).map_err(|e| GitIoError::NonZero {
+    let r = gix::open(repo).map_err(|e| GitIoError::Gix {
         context: CONTEXT.into(),
-        code: None,
-        stderr: format!("gix open: {e}"),
+        detail: format!("open failed: {e}"),
     })?;
     let parse = |sha: &CommitSha| {
         gix::ObjectId::from_hex(sha.as_str().as_bytes()).map_err(|e| GitIoError::Parse {
@@ -1345,10 +1340,9 @@ pub fn merge_base_at(
     match r.merge_base(parse(a)?, parse(b)?) {
         Ok(id) => Ok(Some(parse_sha(CONTEXT, &id.detach().to_string())?)),
         Err(gix::repository::merge_base::Error::NotFound { .. }) => Ok(None),
-        Err(e) => Err(GitIoError::NonZero {
+        Err(e) => Err(GitIoError::Gix {
             context: CONTEXT.into(),
-            code: None,
-            stderr: format!("merge_base: {e}"),
+            detail: format!("merge_base: {e}"),
         }),
     }
 }
@@ -1370,10 +1364,9 @@ pub fn tree_clank_paths_at(repo: &Path, sha: &CommitSha) -> Result<Vec<String>, 
 
 pub fn first_parent_commits(repo: &Path) -> Result<Vec<CommitMeta>, GitIoError> {
     const CONTEXT: &str = "first_parent_commits";
-    let repo = gix::open(repo).map_err(|e| GitIoError::NonZero {
+    let repo = gix::open(repo).map_err(|e| GitIoError::Gix {
         context: CONTEXT.into(),
-        code: None,
-        stderr: format!("gix open: {e}"),
+        detail: format!("open failed: {e}"),
     })?;
     let head_oid = match repo.head().ok().and_then(|h| h.id()) {
         Some(id) => id.detach(),
@@ -1426,10 +1419,9 @@ fn clank_entry_oid(
     tree_id: gix::ObjectId,
     context: &str,
 ) -> Result<Option<gix::ObjectId>, GitIoError> {
-    let tree = repo.find_tree(tree_id).map_err(|e| GitIoError::NonZero {
+    let tree = repo.find_tree(tree_id).map_err(|e| GitIoError::Gix {
         context: context.to_string(),
-        code: None,
-        stderr: format!("find_tree: {e}"),
+        detail: format!("find_tree: {e}"),
     })?;
     for entry in tree.iter() {
         let entry = entry.map_err(|e| GitIoError::Parse {
@@ -1510,10 +1502,9 @@ fn diff_trees_changes(
     let opts = gix::diff::Options::default().with_rewrites(Some(gix::diff::Rewrites::default()));
     let raw_changes = repo
         .diff_tree_to_tree(parent_tree, Some(this_tree), opts)
-        .map_err(|e| GitIoError::NonZero {
+        .map_err(|e| GitIoError::Gix {
             context: context.to_string(),
-            code: None,
-            stderr: format!("diff_tree_to_tree: {e}"),
+            detail: format!("diff_tree_to_tree: {e}"),
         })?;
     let records: Vec<DiffRecord> = raw_changes
         .into_iter()
@@ -1938,7 +1929,7 @@ pub fn origin_url(repo: &Path) -> Option<String> {
 /// if the rev or path can't be resolved.
 pub fn blob_at_rev(repo: &Path, rev: &str, rel: &str) -> Result<String, GitIoError> {
     let sha = resolve_commit(repo, rev)
-        .ok_or_else(|| nonzero(format!("resolve `{rev}`"), "no such revision"))?;
+        .ok_or_else(|| gix_err(format!("resolve `{rev}`"), "no such revision"))?;
     show_blob(repo, &sha, Path::new(rel))
 }
 
@@ -1949,16 +1940,29 @@ pub fn blob_at_rev(repo: &Path, rev: &str, rel: &str) -> Result<String, GitIoErr
 // the `%ai` date format) that gix doesn't reproduce cheaply. Converting
 // them to gix is future work, invisible to callers behind these fns.
 
+fn subprocess_err(
+    context: impl Into<String>,
+    code: Option<i32>,
+    e: impl std::fmt::Display,
+) -> GitIoError {
+    GitIoError::NonZero {
+        context: context.into(),
+        code,
+        stderr: e.to_string(),
+    }
+}
+
 fn read_git_stdout(repo: &Path, args: &[&str]) -> Result<Vec<u8>, GitIoError> {
     let out = std::process::Command::new("git")
         .arg("-C")
         .arg(repo)
         .args(args)
         .output()
-        .map_err(|e| nonzero(format!("git {}", args.join(" ")), e))?;
+        .map_err(|e| subprocess_err(format!("git {}", args.join(" ")), None, e))?;
     if !out.status.success() {
-        return Err(nonzero(
+        return Err(subprocess_err(
             format!("git {}", args.join(" ")),
+            out.status.code(),
             String::from_utf8_lossy(&out.stderr).trim(),
         ));
     }
@@ -2045,6 +2049,40 @@ pub fn commit_meta(repo: &Path, sha: &CommitSha) -> (String, String, String) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn error_display_carries_provenance() {
+        // The bug this pins (tui-transient-refresh-resilience): a
+        // gix status-walk failure rendered as "git git status item:
+        // exit None: …" — a subprocess death that never happened.
+        // Provenance is set at construction; display never infers.
+        let g = gix_err("status item", "IO error while reading");
+        assert_eq!(g.to_string(), "gix status item: IO error while reading");
+        // The REAL open path (codex 889c637): context strings must
+        // not smuggle a backend name back in — "gix gix open" and
+        // "gix git status" are the regression.
+        let real = match super::open(Path::new("/nonexistent-clank-test-repo")) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("open must fail"),
+        };
+        assert!(real.starts_with("gix open `"), "{real}");
+        // No doubled backend prefix and no subprocess costume — the
+        // upstream prose may legitimately say "git repository".
+        assert!(
+            !real.contains("gix gix") && !real.contains("exit"),
+            "{real}"
+        );
+        let spawn = subprocess_err("log --oneline", None, "spawn failed");
+        assert_eq!(
+            spawn.to_string(),
+            "git log --oneline: exit None: spawn failed"
+        );
+        let exit = subprocess_err("log", Some(128), "fatal: bad revision");
+        assert_eq!(
+            exit.to_string(),
+            "git log: exit Some(128): fatal: bad revision"
+        );
+    }
+
     use super::*;
 
     fn oid(byte: u8) -> gix::ObjectId {

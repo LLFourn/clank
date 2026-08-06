@@ -446,6 +446,50 @@ async fn refetch_plan_page(
     }
 }
 
+/// Apply a refresh rebuild to the loop state — THE resilience seam
+/// (tui-transient-refresh-resilience). Success replaces the snapshot
+/// (fresh log rows included) and returns true: the caller advances
+/// the accepted signature. Failure KEEPS the previous frame (fresh
+/// history rows still apply — they're derived independently), mounts
+/// ONE transient notice row at the top (replacing a prior refresh
+/// notice, never stacking), and returns false: the signature is NOT
+/// advanced, so the same input state stays retryable on the next
+/// wake. The INITIAL build has no frame to keep and stays fatal at
+/// its own call site.
+fn apply_refresh(
+    snapshot: &mut crate::cli::status::StatusSnapshot,
+    fresh_log_rows: Vec<crate::cli::log::OnelineRow>,
+    result: Result<crate::cli::status::StatusSnapshot, String>,
+    consecutive_failures: &mut u32,
+) -> bool {
+    use crate::cli::log::OnelineRow;
+    const PREFIX: &str = "status refresh failed";
+    match result {
+        Ok(next) => {
+            *consecutive_failures = 0;
+            *snapshot = next;
+            snapshot.log_rows = fresh_log_rows;
+            true
+        }
+        Err(e) => {
+            *consecutive_failures += 1;
+            snapshot.log_rows = fresh_log_rows;
+            let streak = if *consecutive_failures > 1 {
+                format!(" — {} in a row", consecutive_failures)
+            } else {
+                String::new()
+            };
+            snapshot.log_rows.insert(
+                0,
+                OnelineRow::Notice(format!(
+                    "{PREFIX}: {e}{streak}; kept the last view, retrying on the next change"
+                )),
+            );
+            false
+        }
+    }
+}
+
 /// Does the finished plan's own range still span >1 commit? (An
 /// autosquashed plan is one commit — squash would be a no-op row.)
 /// Errors degrade to `true`: offering a squash that no-ops is better
@@ -980,6 +1024,17 @@ fn deferred_wait(
     }
 }
 
+/// Backoff before RETRYING a failed rebuild
+/// (tui-transient-refresh-resilience, codex 889c637): 1s, 2s, 4s …
+/// capped at 30s — a lone transient failure recovers in about a
+/// second without needing a filesystem event, while a persistent
+/// one polls gently instead of spinning the rebuild loop hot.
+/// Event-driven recovery is unaffected (a real refresh event still
+/// rebuilds immediately). Pure → unit-tested.
+fn retry_delay(failures: u32) -> Duration {
+    Duration::from_secs(1u64 << failures.saturating_sub(1).min(5)).min(Duration::from_secs(30))
+}
+
 /// A drained burst of loop events collapsed for ONE pass: keystrokes in
 /// arrival order, and ANY number of `Refresh`/`Resize` folded to a single
 /// flag each. So a storm of watcher wakes costs one repaint + at most one
@@ -1083,6 +1138,11 @@ pub(crate) async fn run_tui(
     // Probe the input signature BEFORE the first build so any change
     // racing the build re-builds next wake (under-gate, never over-gate).
     let mut last_sig = crate::cli::status::input_signature(&repo).ok();
+    // Consecutive failed refreshes (tui-transient-refresh-resilience);
+    // reset by every successful rebuild. `refresh_retry_at` schedules
+    // the bounded self-retry after a failure.
+    let mut refresh_failures: u32 = 0;
+    let mut refresh_retry_at: Option<std::time::Instant> = None;
     let mut snapshot =
         StatusSnapshot::build_async(&repo, &basename, home.as_deref(), policy, None, true).await?;
     // Roster→pane convergence is the worker's job; this is a channel
@@ -1314,7 +1374,21 @@ pub(crate) async fn run_tui(
         } else {
             Duration::from_secs(60)
         };
+        // A scheduled retry that has come due is promoted to a normal
+        // deferred refresh; a pending one caps the sleep so the
+        // deadline actually fires (a plain Timeout wake loops back
+        // here and promotes).
+        if let Some(at) = refresh_retry_at
+            && at <= std::time::Instant::now()
+        {
+            refresh_pending = true;
+            refresh_retry_at = None;
+        }
         let wait = deferred_wait(base, refresh_pending, last_rebuild.elapsed(), REBUILD_MIN);
+        let wait = match refresh_retry_at {
+            Some(at) => wait.min(at.saturating_duration_since(std::time::Instant::now())),
+            None => wait,
+        };
 
         match ev_rx.recv_timeout(wait) {
             // Drain the whole queued burst in ONE pass: keystrokes apply
@@ -1905,7 +1979,11 @@ pub(crate) async fn run_tui(
                     }
                     _ => (None, None),
                 };
-                snapshot = StatusSnapshot::build_async(
+                // A FAILED rebuild must not kill the TUI (a gix
+                // status walk racing a worktree mutation is routine)
+                // and must not advance the accepted signature — see
+                // [`apply_refresh`].
+                let rebuilt = StatusSnapshot::build_async(
                     &repo,
                     &basename,
                     home.as_deref(),
@@ -1913,12 +1991,19 @@ pub(crate) async fn run_tui(
                     None,
                     true,
                 )
-                .await?;
-                reconcile_worker.observe(&snapshot);
+                .await
+                .map_err(|e| format!("{e:#}"));
                 // Restore the user's scroll depth and re-open paging in
                 // case history grew; the loop top tops up the viewport.
-                snapshot.log_rows = crate::cli::status::tui_log_rows(&repo, log.window).await;
-                last_sig = sig;
+                let fresh_rows = crate::cli::status::tui_log_rows(&repo, log.window).await;
+                if apply_refresh(&mut snapshot, fresh_rows, rebuilt, &mut refresh_failures) {
+                    last_sig = sig;
+                    refresh_retry_at = None;
+                } else {
+                    refresh_retry_at =
+                        Some(std::time::Instant::now() + retry_delay(refresh_failures));
+                }
+                reconcile_worker.observe(&snapshot);
                 log.complete = false;
                 log.request_fill();
                 if keep_picker {
@@ -2050,6 +2135,77 @@ pub(crate) async fn run_tui(
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[test]
+    fn retry_delay_backs_off_and_caps() {
+        // The scheduling decision (codex 889c637): bounded backoff —
+        // fast first retry, gentle persistent polling, hard cap.
+        assert_eq!(retry_delay(1), Duration::from_secs(1));
+        assert_eq!(retry_delay(2), Duration::from_secs(2));
+        assert_eq!(retry_delay(3), Duration::from_secs(4));
+        assert_eq!(retry_delay(6), Duration::from_secs(30));
+        assert_eq!(retry_delay(100), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn apply_refresh_keeps_frame_and_signature_on_failure() {
+        // THE contract (intro 1913796): the accepted signature
+        // advances ONLY on successful snapshot replacement — a
+        // failed rebuild returns false (caller leaves last_sig
+        // untouched, so the SAME signature stays retryable), keeps
+        // the old frame, and mounts exactly one transient notice.
+        use crate::cli::log::OnelineRow;
+        use crate::cli::status_tui::fixtures::snap;
+        let mut current = snap(vec![], vec![]);
+        current.basename = "old-frame".into();
+        let mut failures = 0u32;
+
+        let advance = apply_refresh(
+            &mut current,
+            Vec::new(),
+            Err("gix status item: io race".into()),
+            &mut failures,
+        );
+        assert!(!advance, "failure must not advance the signature");
+        assert_eq!(current.basename, "old-frame", "frame kept");
+        assert_eq!(failures, 1);
+        assert!(matches!(
+            current.log_rows.first(),
+            Some(OnelineRow::Notice(n)) if n.contains("status refresh failed") && n.contains("io race")
+        ));
+
+        // Repeated failure REPLACES the notice (streak text), never
+        // stacks a second row.
+        let fresh = current.log_rows.split_off(1);
+        let advance = apply_refresh(
+            &mut current,
+            fresh,
+            Err("gix status item: io race".into()),
+            &mut failures,
+        );
+        assert!(!advance);
+        assert_eq!(failures, 2);
+        let notices = current
+            .log_rows
+            .iter()
+            .filter(|r| matches!(r, OnelineRow::Notice(n) if n.contains("status refresh failed")))
+            .count();
+        assert_eq!(notices, 1, "one notice, not a stack");
+        assert!(matches!(
+            current.log_rows.first(),
+            Some(OnelineRow::Notice(n)) if n.contains("2 in a row")
+        ));
+
+        // Success replaces the snapshot, clears the notice (fresh
+        // rows), resets the streak, and advances.
+        let mut next = snap(vec![], vec![]);
+        next.basename = "new-frame".into();
+        let advance = apply_refresh(&mut current, Vec::new(), Ok(next), &mut failures);
+        assert!(advance, "success advances the signature");
+        assert_eq!(current.basename, "new-frame");
+        assert_eq!(failures, 0);
+        assert!(current.log_rows.is_empty(), "notice gone with fresh rows");
+    }
+
     use super::fixtures::*;
     use super::*;
 
