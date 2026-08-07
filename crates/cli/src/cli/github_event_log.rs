@@ -64,6 +64,15 @@ pub(crate) enum Transport {
     Relay,
 }
 
+impl Transport {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Transport::Poll => "poll",
+            Transport::Relay => "relay",
+        }
+    }
+}
+
 /// The version this binary writes and fully understands. Bumps ONLY
 /// for semantic changes to an existing `t` — additive optional fields
 /// never bump it (event-log-format-compat).

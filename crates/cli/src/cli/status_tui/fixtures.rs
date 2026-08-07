@@ -100,6 +100,7 @@ pub(crate) fn snap(plans: Vec<PlanWorkState>, queue: Vec<&str>) -> StatusSnapsho
         agents: Vec::new(),
         stash: Vec::new(),
         log_rows: Vec::new(),
+        github_events: Vec::new(),
         log_decorations: Default::default(),
         pr_reviews: Vec::new(),
         ad_hoc: Vec::new(),

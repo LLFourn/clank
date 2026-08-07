@@ -129,6 +129,21 @@ pub(super) fn render_at(
             }
         }
     }
+    // The github event page (tui-github-event-page): a dedicated
+    // full screen like the other detail pages. A missing
+    // `event_page` (invariant breach) falls through; the loop bails
+    // the mode out next key.
+    if let Some(ep) = view.event_page
+        && let Mode::EventDetail { sel } = mode
+    {
+        return render_event_detail(
+            ep,
+            &event_actions(ep.event.url.is_some(), ep.event.unhandled),
+            sel,
+            rows,
+            cols,
+        );
+    }
     // The plan-actions page family (tui-plan-actions-page): page and
     // purge chooser are dedicated full screens too.
     // A missing `plan_page` (invariant breach) falls through to the
@@ -567,6 +582,7 @@ pub(super) fn log_row_spans(
         // shared describe line, and the open-work mark while any
         // agent's copy is unhandled (log-timeline-github-events).
         OnelineRow::Github {
+            event_idx: _,
             line,
             unhandled,
             baseline,
@@ -1282,6 +1298,157 @@ fn button_block(
 /// rule: purge's red is the cue, and the danger GRADIENT deepens on
 /// the chooser + confirm screens. Returns the virtual content height
 /// (chrome + full document) so the loop can clamp body scroll.
+/// The event page's action-row copy.
+fn event_action_row(a: EventAction) -> (&'static str, &'static str, &'static str) {
+    match a {
+        EventAction::OpenBrowser => ("o", "open in browser", "launch the event URL"),
+        EventAction::Ack => ("a", "ack", "mark every agent's copy handled"),
+        EventAction::Back => ("esc", "back", "return to the log"),
+    }
+}
+
+/// The github event page (tui-github-event-page): actions on top
+/// (plan-page UX), then a WINDOWED details body — identity with
+/// relative age, every member with per-copy transport + state, and
+/// the standing prompts (attributed when they differ) — wrapped and
+/// control-char-sanitized (the events-show cleanup), scrolled with
+/// the plan page's document model so long multiline prompts are
+/// always reachable, with the pinned key-summary row last.
+pub(super) fn render_event_detail(
+    ep: &super::input::EventPage,
+    actions: &[EventAction],
+    sel: usize,
+    rows: usize,
+    cols: usize,
+) -> (Vec<String>, usize) {
+    let ev = &ep.event;
+    let clean = |s: &str| crate::cli::events::sanitize_multiline(s).replace('\n', " ");
+    let mut out: Vec<String> = Vec::new();
+    let state_hint = if ev.baseline {
+        "pre-watch history"
+    } else if ev.unhandled {
+        "UNHANDLED"
+    } else {
+        "handled"
+    };
+    out.push(region_rule(
+        &format!("github · {}", ev.repo),
+        state_hint,
+        true,
+        cols,
+    ));
+    out.push(String::new());
+    for (i, a) in actions.iter().enumerate() {
+        let (key, label, desc) = event_action_row(*a);
+        out.extend(button_block(key, label, desc, false, i == sel, cols));
+        out.push(String::new());
+    }
+    let chrome = out.len() + 1;
+
+    // The details body: built in full, windowed below.
+    let mut body: Vec<String> = Vec::new();
+    let fact = |body: &mut Vec<String>, k: &str, v: String| {
+        body.push(emit(
+            &[dim(format!("  {k:<9}")), plain(format!(" {v}"))],
+            "",
+            cols,
+        ));
+    };
+    let detail = ev
+        .detail
+        .as_deref()
+        .map(|d| format!(" ({d})"))
+        .unwrap_or_default();
+    fact(&mut body, "event", format!("{}{detail}", clean(&ev.event)));
+    fact(&mut body, "age", crate::cli::events::age(ev.at));
+    if let Some(n) = ev.number {
+        fact(&mut body, "number", format!("#{n}"));
+    }
+    if let Some(t) = ev.title.as_deref() {
+        fact(&mut body, "title", clean(t));
+    }
+    if let Some(a) = ev.actor.as_deref() {
+        fact(&mut body, "actor", clean(a));
+    }
+    if let Some(u) = ev.url.as_deref() {
+        fact(&mut body, "url", clean(u));
+    }
+    body.push(String::new());
+    body.push(emit(&[dim("  copies".to_string())], "", cols));
+    for m in &ev.members {
+        let state = if m.acked { "handled" } else { "UNHANDLED" };
+        body.push(emit(
+            &[plain(format!(
+                "    {}  {}@{}  {}  {}",
+                m.key.agent,
+                m.key.source,
+                m.key.seq,
+                m.transport.as_str(),
+                state
+            ))],
+            "",
+            cols,
+        ));
+    }
+    if !ep.prompts.is_empty() {
+        body.push(String::new());
+        body.push(emit(&[dim("  standing prompt".to_string())], "", cols));
+        for (who, text) in &ep.prompts {
+            let attributed = match who {
+                Some(agent) => {
+                    format!("[{agent}] {}", crate::cli::events::sanitize_multiline(text))
+                }
+                None => crate::cli::events::sanitize_multiline(text),
+            };
+            // Display-width-aware wrapping at the ACTUAL post-indent
+            // width (codex bd110f0: a scalar-count chunker let emit
+            // drop the tail of wide-glyph chunks — CJK text became
+            // unreachable through any scroll).
+            let width = cols.saturating_sub(4).max(1);
+            for wrapped in super::text::wrap(&attributed, width) {
+                body.push(emit(&[italic(format!("    {wrapped}"))], "", cols));
+            }
+        }
+    }
+
+    // Windowed exactly like the plan page's document region: clamp
+    // once, elevated rule when scrolled, pinned key summary last.
+    // The scroll window covers the WHOLE page — buttons included —
+    // so the never-clipped contract holds structurally in any pane:
+    // a short pane scrolls the chrome off the top first and every
+    // body line stays reachable (codex bd110f0: the old
+    // extend-then-truncate ate the body whenever the chrome filled
+    // the pane). The pinned key summary keeps the last row.
+    let _ = chrome;
+    let mut page_lines = out;
+    page_lines.push(region_rule("details", "↓/PgDn scroll", false, cols));
+    page_lines.extend(body);
+    let total = page_lines.len() + 1;
+    // The footer owns the last row; the content window is whatever
+    // remains — ZERO in a one-row pane (the footer alone shows),
+    // keeping render's at-most-`rows` invariant (codex dd670c5).
+    let window = rows.saturating_sub(1);
+    let off = ep
+        .scroll
+        .min(page_lines.len().saturating_sub(window.max(1)));
+    let mut out: Vec<String> = page_lines.into_iter().skip(off).take(window).collect();
+    if off > 0 && !out.is_empty() {
+        // The elevation cue replaces the top row while scrolled.
+        out[0] = region_rule_elevated("· · ·", "scrolled", false, cols);
+    }
+    while out.len() < rows.saturating_sub(1) {
+        out.push(String::new());
+    }
+    out.push(emit(
+        &[dim(
+            "  ↑↓ move · ⏎ select · esc/q back · space scroll".to_string()
+        )],
+        "",
+        cols,
+    ));
+    (out, total)
+}
+
 pub(super) fn render_plan_detail(
     pp: &super::input::PlanPage,
     actions: &[PlanAction],
@@ -2213,6 +2380,7 @@ mod tests {
                         let view = PanelView {
                             mode,
                             plan_page: None,
+                            event_page: None,
                             plan_input: None,
                             picker: &[],
                             log_cursor: 0,
@@ -2247,6 +2415,7 @@ mod tests {
     fn lift_view(cursor: usize, lift: usize) -> PanelView<'static> {
         PanelView {
             plan_page: None,
+            event_page: None,
             plan_input: None,
             mode: Mode::LogScroll,
             picker: &[],
@@ -2456,6 +2625,7 @@ mod tests {
         s.log_rows = (0..12).map(|i| commit_row(&format!("c{i}"))).collect();
         let view = PanelView {
             plan_page: None,
+            event_page: None,
             plan_input: None,
             mode: Mode::LogScroll,
             picker: &[],
@@ -3162,6 +3332,7 @@ mod tests {
             0,
             &PanelView {
                 plan_page: None,
+                event_page: None,
                 plan_input: None,
                 mode: Mode::AddPicker { sel: 0 },
                 picker: &picker,
@@ -3204,6 +3375,7 @@ mod tests {
         ];
         let view = PanelView {
             plan_page: None,
+            event_page: None,
             plan_input: None,
             mode: Mode::AddPicker { sel: 0 },
             picker: &picker,
@@ -3296,6 +3468,7 @@ mod tests {
             0,
             &PanelView {
                 plan_page: None,
+                event_page: None,
                 plan_input: None,
                 mode: Mode::Confirm {
                     action: ConfirmAction::AddCandidate { idx: 0 },
@@ -3649,6 +3822,7 @@ mod tests {
         // two_agent_snap has no ask/in-progress rows).
         let view = PanelView {
             plan_page: None,
+            event_page: None,
             plan_input: None,
             mode: Mode::LogScroll,
             picker: &[],
@@ -3678,6 +3852,144 @@ mod tests {
             !line_with(&panel, "second").contains(REVERSE),
             "no log cursor band when the panel is focused"
         );
+    }
+
+    #[test]
+    fn event_page_renders_actions_members_and_attributed_prompts() {
+        // tui-github-event-page: the page shows its actions (browser
+        // omitted without a URL, ack omitted when handled), every
+        // member with per-copy transport + state, and prompts with
+        // attribution only when they differ.
+        use crate::cli::github_event_log::Transport;
+        use crate::cli::github_timeline::{MemberKey, MemberRef, MergedEvent};
+        let member = |agent: &str, acked: bool, transport| MemberRef {
+            key: MemberKey {
+                agent: agent.into(),
+                source: "github-o-r-aaaa".into(),
+                seq: 3,
+                ident: "f:1".into(),
+            },
+            acked,
+            transport,
+        };
+        let ev = MergedEvent {
+            at: 1,
+            repo: "o/r".into(),
+            event: "pr_comment".into(),
+            detail: Some("review".into()),
+            number: Some(12),
+            title: Some("Add the widget".into()),
+            actor: Some("hubot".into()),
+            url: Some("https://github.com/o/r/pull/12".into()),
+            seen_by: vec!["alpha".into(), "beta".into()],
+            unhandled: true,
+            baseline: false,
+            members: vec![
+                member("alpha", false, Transport::Poll),
+                member("beta", true, Transport::Relay),
+            ],
+        };
+        let ep = super::super::input::EventPage {
+            target: ev.members[0].key.clone(),
+            retained: ev.members.iter().map(|m| m.key.clone()).collect(),
+            event: ev,
+            prompts: vec![
+                (Some("alpha".into()), "triage and reply".into()),
+                (Some("beta".into()), "just ack it".into()),
+            ],
+            scroll: 0,
+        };
+        let actions = event_actions(true, true);
+        let (out, _) = render_event_detail(&ep, &actions, 0, 40, 90);
+        let text: String = out
+            .iter()
+            .map(|l| visible(l))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("GITHUB · O/R"), "{text}");
+        assert!(
+            text.contains("open in browser") && text.contains("ack"),
+            "{text}"
+        );
+        assert!(
+            text.contains("alpha  github-o-r-aaaa@3  poll  UNHANDLED"),
+            "{text}"
+        );
+        assert!(
+            text.contains("beta  github-o-r-aaaa@3  relay  handled"),
+            "{text}"
+        );
+        assert!(text.contains("[alpha] triage and reply"), "{text}");
+        assert!(text.contains("[beta] just ack it"), "{text}");
+
+        // Age renders; the key summary is pinned on the last row.
+        assert!(text.contains("age"), "{text}");
+        assert!(
+            visible(out.last().unwrap()).contains("esc/q back"),
+            "key summary pinned: {:?}",
+            out.last()
+        );
+
+        // Prompt text is control-char sanitized at the shared
+        // events-show seam (a raw ESC inside operator text becomes a
+        // space; newlines survive for the wrap).
+        assert_eq!(
+            crate::cli::events::sanitize_multiline("a\u{1b}[31mb\nc"),
+            "a [31mb\nc"
+        );
+        // A LONG prompt exceeds a short pane and is REACHABLE via
+        // the scroll window rather than clipped forever.
+        let mut long = ep.clone();
+        long.prompts = vec![(None, format!("marker-head {}", "x".repeat(600)))];
+        let (out0, total) = render_event_detail(&long, &actions_full(), 0, 14, 40);
+        assert!(total > 14, "long content exceeds the pane: {total}");
+        let mut scrolled = long.clone();
+        scrolled.scroll = total - 14;
+        let (out1, _) = render_event_detail(&scrolled, &actions_full(), 0, 14, 40);
+        assert_ne!(
+            out0.iter().map(|l| visible(l)).collect::<Vec<_>>(),
+            out1.iter().map(|l| visible(l)).collect::<Vec<_>>(),
+            "scroll reaches later body lines"
+        );
+        let tail: String = out1.iter().map(|l| visible(l)).collect::<Vec<_>>().join("");
+        assert!(tail.contains("xxx"), "the deep prompt lines are reachable");
+
+        // Wide Unicode in a NARROW pane (codex bd110f0): every CJK
+        // glyph survives the wrap — the display-width wrapper never
+        // hands emit an over-wide chunk to truncate, so the full
+        // sequence is recoverable through the scroll window.
+        let cjk: String = "漢字寬度測試".repeat(40);
+        let mut wide = ep.clone();
+        wide.prompts = vec![(None, cjk.clone())];
+        let (_, wide_total) = render_event_detail(&wide, &actions_full(), 0, 12, 24);
+        let mut seen = String::new();
+        for off in 0..wide_total {
+            let mut page = wide.clone();
+            page.scroll = off;
+            let (out, _) = render_event_detail(&page, &actions_full(), 0, 12, 24);
+            for l in &out {
+                seen.push_str(visible(l).trim());
+            }
+        }
+        for glyph in ["漢", "字", "寬", "度", "測", "試"] {
+            assert!(
+                seen.matches(glyph).count() >= 40,
+                "every {glyph} reachable through scroll"
+            );
+        }
+
+        // A one-row terminal renders EXACTLY one line (the footer) —
+        // render's at-most-rows invariant (codex dd670c5).
+        let (one, _) = render_event_detail(&ep, &actions_full(), 0, 1, 40);
+        assert_eq!(one.len(), 1, "{one:?}");
+
+        // No URL + fully handled: those actions are OMITTED.
+        let actions = event_actions(false, false);
+        assert_eq!(actions, vec![super::super::input::EventAction::Back]);
+    }
+
+    fn actions_full() -> Vec<super::super::input::EventAction> {
+        event_actions(true, true)
     }
 
     #[test]

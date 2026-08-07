@@ -446,6 +446,86 @@ async fn refetch_plan_page(
     }
 }
 
+/// Retained-set retargeting (tui-github-event-page): follow the
+/// FIRST retained key still present in the fresh events (first-key
+/// wins across component splits), refresh the retained set from the
+/// newly targeted component, close only when none survive. Pure over
+/// the fresh event list — the retarget contract's test seam.
+fn refetch_event_page(
+    page: &mut Option<EventPage>,
+    events: &[crate::cli::github_timeline::MergedEvent],
+) -> bool {
+    let Some(p) = page.as_mut() else {
+        return false;
+    };
+    for key in &p.retained {
+        if let Some(ev) = events
+            .iter()
+            .find(|e| e.members.iter().any(|m| &m.key == key))
+        {
+            p.target = key.clone();
+            p.retained = ev.members.iter().map(|m| m.key.clone()).collect();
+            p.event = ev.clone();
+            return true;
+        }
+    }
+    *page = None;
+    false
+}
+
+/// The page's standing prompts: each member's watch prompt (the
+/// per-agent presentation-time join), deduplicated — one
+/// unattributed line when every member agrees, per-agent attribution
+/// when they differ (tui-github-event-page).
+fn event_prompts(
+    repo: &std::path::Path,
+    event: &crate::cli::github_timeline::MergedEvent,
+) -> Vec<(Option<String>, String)> {
+    use std::collections::BTreeSet;
+    let mut per_agent: std::collections::HashMap<
+        String,
+        std::collections::HashMap<String, String>,
+    > = Default::default();
+    let mut pairs: BTreeSet<(String, String)> = Default::default();
+    for m in &event.members {
+        let map = per_agent.entry(m.key.agent.clone()).or_insert_with(|| {
+            let dir = crate::agent_store::agents_root(repo)
+                .join(&m.key.agent)
+                .join("events");
+            let githubs: Vec<clank_core::agent_config::GithubSource> =
+                clank_core::ids::AgentLabel::parse(&m.key.agent)
+                    .ok()
+                    .and_then(|l| {
+                        crate::agent_store::load_agent_config(repo, &l)
+                            .ok()
+                            .flatten()
+                    })
+                    .map(|c| {
+                        c.wait_events
+                            .iter()
+                            .filter_map(|s| match s {
+                                clank_core::agent_config::WaitEventSource::Github(g) => {
+                                    Some(g.clone())
+                                }
+                                _ => None,
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+            crate::cli::events::join_prompts(&githubs, &dir)
+        });
+        if let Some(p) = map.get(&m.key.source) {
+            pairs.insert((m.key.agent.clone(), p.clone()));
+        }
+    }
+    let texts: BTreeSet<&String> = pairs.iter().map(|(_, t)| t).collect();
+    if texts.len() <= 1 {
+        texts.into_iter().map(|t| (None, t.clone())).collect()
+    } else {
+        pairs.into_iter().map(|(a, t)| (Some(a), t)).collect()
+    }
+}
+
 /// Apply a refresh rebuild to the loop state — THE resilience seam
 /// (tui-transient-refresh-resilience). Success replaces the snapshot
 /// (fresh log rows included) and returns true: the caller advances
@@ -1171,6 +1251,9 @@ pub(crate) async fn run_tui(
     // a plan-page Confirm — set and cleared ONLY together with those
     // mode transitions.
     let mut plan_page: Option<PlanPage> = None;
+    // The open EVENT page (tui-github-event-page); invariant: `Some`
+    // ⟺ mode is `EventDetail` (set/cleared together, like plan_page).
+    let mut event_page: Option<EventPage> = None;
     // The open plan-page text input's buffer (Mode::PlanInput carries
     // only the KIND — same Copy-preserving split as `plan_page`).
     let mut plan_input: Option<TextInput> = None;
@@ -1295,6 +1378,7 @@ pub(crate) async fn run_tui(
         let view = PanelView {
             mode,
             plan_page: plan_page.as_ref(),
+            event_page: event_page.as_ref(),
             plan_input: plan_input.as_ref(),
             picker: &picker,
             log_cursor: log.cursor,
@@ -1717,6 +1801,55 @@ pub(crate) async fn run_tui(
                         // must stay exhaustive.
                         Mode::PlanInput { .. } => {}
                         // The plan-actions page (tui-plan-actions-page).
+                        Mode::EventDetail { sel } => {
+                            let Some(ep) = event_page.clone() else {
+                                mode = Mode::LogScroll; // invariant breach — bail out
+                                continue;
+                            };
+                            let actions = event_actions(ep.event.url.is_some(), ep.event.unhandled);
+                            match event_detail_nav(sel, &actions, k, page, ep.scroll) {
+                                EventNav::Sel(x) => mode = Mode::EventDetail { sel: x },
+                                EventNav::Scroll(delta) => {
+                                    if let Some(live) = event_page.as_mut() {
+                                        let max_off =
+                                            screen_total.saturating_sub((rows as usize).max(1));
+                                        live.scroll = (live.scroll as i64 + delta as i64)
+                                            .clamp(0, max_off as i64)
+                                            as usize;
+                                    }
+                                }
+                                EventNav::Back => {
+                                    event_page = None;
+                                    mode = Mode::LogScroll;
+                                }
+                                // The EFFECT is resolved at the
+                                // tested seam (event_action_effect,
+                                // codex 525cef1); the loop only
+                                // performs the IO.
+                                EventNav::Act(a) => match event_action_effect(&ep, a) {
+                                    EventEffect::Open(url) => {
+                                        let _ = crate::cli::html::launch_opener(
+                                            std::path::Path::new(&url),
+                                        );
+                                    }
+                                    EventEffect::AckFanout(keys) => {
+                                        // Shared core; the refold
+                                        // re-renders handled state
+                                        // (best-effort: a failed
+                                        // fanout leaves rows
+                                        // unhandled and visible).
+                                        let _ = crate::cli::events::ack_members(&repo, &keys);
+                                        refresh_pending = true;
+                                    }
+                                    EventEffect::Close => {
+                                        event_page = None;
+                                        mode = Mode::LogScroll;
+                                    }
+                                    EventEffect::None => {}
+                                },
+                                EventNav::None => {}
+                            }
+                        }
                         Mode::PlanDetail { sel } => {
                             if k == Key::Quit {
                                 break 'evloop;
@@ -1849,6 +1982,34 @@ pub(crate) async fn run_tui(
                             // in-progress / ad-hoc rows resolve to None.
                             Key::Enter => {
                                 let seq = build_scroll(&snapshot, &ask_lines);
+                                // A github row opens the EVENT PAGE
+                                // (tui-github-event-page): target =
+                                // the component's first member (full
+                                // copy key), retained set = every
+                                // member key.
+                                if let Some(Seg::Log(crate::cli::log::OnelineRow::Github {
+                                    event_idx,
+                                    ..
+                                })) = seq.get(log.cursor)
+                                {
+                                    if let Some(ev) = snapshot.github_events.get(*event_idx)
+                                        && let Some(first) = ev.members.first()
+                                    {
+                                        event_page = Some(EventPage {
+                                            target: first.key.clone(),
+                                            retained: ev
+                                                .members
+                                                .iter()
+                                                .map(|m| m.key.clone())
+                                                .collect(),
+                                            event: ev.clone(),
+                                            prompts: event_prompts(&repo, ev),
+                                            scroll: 0,
+                                        });
+                                        mode = Mode::EventDetail { sel: 0 };
+                                    }
+                                    continue;
+                                }
                                 match entry_overlay_target(&seq, log.cursor) {
                                     Some(OverlayTarget::Commit { sha, focus }) => {
                                         if let Some(data) = fetch_commit_detail(&repo, &sha) {
@@ -1995,8 +2156,16 @@ pub(crate) async fn run_tui(
                 .map_err(|e| format!("{e:#}"));
                 // Restore the user's scroll depth and re-open paging in
                 // case history grew; the loop top tops up the viewport.
-                let fresh_rows = crate::cli::status::tui_log_rows(&repo, log.window).await;
-                if apply_refresh(&mut snapshot, fresh_rows, rebuilt, &mut refresh_failures) {
+                let (fresh_rows, fresh_events) =
+                    crate::cli::status::tui_log_with_events(&repo, log.window).await;
+                let refresh_ok =
+                    apply_refresh(&mut snapshot, fresh_rows, rebuilt, &mut refresh_failures);
+                // Rows and events must come from the SAME read —
+                // event_idx targets this list (set after apply so a
+                // replaced snapshot's own build-time read never
+                // misaligns them; the kept-frame arm needs them too).
+                snapshot.github_events = fresh_events;
+                if refresh_ok {
                     last_sig = sig;
                     refresh_retry_at = None;
                 } else {
@@ -2085,6 +2254,19 @@ pub(crate) async fn run_tui(
                     // (stashed, purged, dropped) closes the page to the
                     // log. The chooser and plan-page confirms collapse
                     // back to the page (their target may have changed).
+                    // The event page retargets through its retained
+                    // member-key set; a vanished component closes to
+                    // the log (tui-github-event-page).
+                    Mode::EventDetail { sel } => {
+                        if refetch_event_page(&mut event_page, &snapshot.github_events) {
+                            if let Some(ep) = event_page.as_mut() {
+                                ep.prompts = event_prompts(&repo, &ep.event.clone());
+                            }
+                            Mode::EventDetail { sel }
+                        } else {
+                            Mode::LogScroll
+                        }
+                    }
                     Mode::PlanDetail { sel } => {
                         match refetch_plan_page(&repo, &mut plan_page, &snapshot).await {
                             true => Mode::PlanDetail { sel },
@@ -2135,6 +2317,174 @@ pub(crate) async fn run_tui(
 
 #[cfg(test)]
 pub(crate) mod tests {
+    fn mk_member(
+        agent: &str,
+        seq: u64,
+        ident: &str,
+        acked: bool,
+    ) -> crate::cli::github_timeline::MemberRef {
+        crate::cli::github_timeline::MemberRef {
+            key: crate::cli::github_timeline::MemberKey {
+                agent: agent.into(),
+                source: "github-o-r-aaaa".into(),
+                seq,
+                ident: ident.into(),
+            },
+            acked,
+            transport: crate::cli::github_event_log::Transport::Poll,
+        }
+    }
+
+    fn mk_event(
+        members: Vec<crate::cli::github_timeline::MemberRef>,
+    ) -> crate::cli::github_timeline::MergedEvent {
+        crate::cli::github_timeline::MergedEvent {
+            at: 1,
+            repo: "o/r".into(),
+            event: "issue_opened".into(),
+            detail: None,
+            number: None,
+            title: None,
+            actor: None,
+            url: None,
+            seen_by: members.iter().map(|m| m.key.agent.clone()).collect(),
+            unhandled: members.iter().any(|m| !m.acked),
+            baseline: false,
+            members,
+        }
+    }
+
+    #[test]
+    fn event_action_effects_record_the_exact_url_and_fanout() {
+        // codex 525cef1: the EXECUTED step is the seam — the effect
+        // carries the exact URL production hands the shared opener,
+        // and the exact unhandled keys the fanout receives; a no-URL
+        // browser action resolves to None (belt: the menu omits it).
+        let handled = crate::cli::github_timeline::MemberRef {
+            acked: true,
+            ..mk_member("beta", 2, "f:2", true)
+        };
+        let mut ev = mk_event(vec![mk_member("alpha", 1, "f:1", false), handled]);
+        ev.url = Some("https://github.com/o/r/pull/12".into());
+        let ep = EventPage {
+            target: ev.members[0].key.clone(),
+            retained: ev.members.iter().map(|m| m.key.clone()).collect(),
+            event: ev,
+            prompts: Vec::new(),
+            scroll: 0,
+        };
+        assert_eq!(
+            event_action_effect(&ep, EventAction::OpenBrowser),
+            EventEffect::Open("https://github.com/o/r/pull/12".into()),
+            "the exact event URL reaches the opener"
+        );
+        assert_eq!(
+            event_action_effect(&ep, EventAction::Ack),
+            EventEffect::AckFanout(vec![ep.event.members[0].key.clone()]),
+            "only the unhandled copy fans out"
+        );
+        assert_eq!(
+            event_action_effect(&ep, EventAction::Back),
+            EventEffect::Close
+        );
+
+        let mut no_url = ep.clone();
+        no_url.event.url = None;
+        assert_eq!(
+            event_action_effect(&no_url, EventAction::OpenBrowser),
+            EventEffect::None
+        );
+    }
+
+    #[test]
+    fn event_prompts_dedup_and_attribute() {
+        // tui-github-event-page: identical member prompts collapse
+        // to ONE unattributed line; differing prompts each carry
+        // their agent. Joined through the same per-agent
+        // presentation path as `clank events list` (sidecars here —
+        // the CLI-source tier).
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        for (agent, prompt) in [("alpha", "same intent"), ("beta", "same intent")] {
+            let d = crate::agent_store::agents_root(repo)
+                .join(agent)
+                .join("events");
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(
+                d.join("github-o-r-aaaa.meta.json"),
+                format!(r#"{{"prompt":"{prompt}"}}"#),
+            )
+            .unwrap();
+        }
+        let ev = mk_event(vec![
+            mk_member("alpha", 1, "f:1", false),
+            mk_member("beta", 1, "f:1", false),
+        ]);
+        let prompts = event_prompts(repo, &ev);
+        assert_eq!(prompts, vec![(None, "same intent".to_string())]);
+
+        // Differing: attribution appears.
+        let d = crate::agent_store::agents_root(repo)
+            .join("beta")
+            .join("events");
+        std::fs::write(
+            d.join("github-o-r-aaaa.meta.json"),
+            r#"{"prompt":"different intent"}"#,
+        )
+        .unwrap();
+        let prompts = event_prompts(repo, &ev);
+        assert_eq!(
+            prompts,
+            vec![
+                (Some("alpha".to_string()), "same intent".to_string()),
+                (Some("beta".to_string()), "different intent".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn event_page_retargets_through_the_retained_set() {
+        // The retarget contract (tui-github-event-page): first
+        // surviving retained key wins — including across a component
+        // SPLIT — the retained set refreshes from the new component,
+        // and the page closes only when nothing survives.
+        let a = mk_member("alpha", 1, "f:1", false);
+        let b = mk_member("beta", 1, "f:1", false);
+        let mut page = Some(EventPage {
+            target: a.key.clone(),
+            retained: vec![a.key.clone(), b.key.clone()],
+            event: mk_event(vec![a.clone(), b.clone()]),
+            prompts: Vec::new(),
+            scroll: 0,
+        });
+
+        // Target's copy vanished; beta's survives in a fresh component.
+        let fresh = vec![mk_event(vec![b.clone()])];
+        assert!(refetch_event_page(&mut page, &fresh));
+        let p = page.as_ref().unwrap();
+        assert_eq!(p.target, b.key, "retargeted to the first surviving key");
+        assert_eq!(p.retained, vec![b.key.clone()], "retained set refreshed");
+
+        // SPLIT: alpha and beta now live in SEPARATE components; a
+        // page retaining both follows the FIRST retained key's side.
+        let mut split_page = Some(EventPage {
+            target: a.key.clone(),
+            retained: vec![a.key.clone(), b.key.clone()],
+            event: mk_event(vec![a.clone(), b.clone()]),
+            prompts: Vec::new(),
+            scroll: 0,
+        });
+        let split = vec![mk_event(vec![b.clone()]), mk_event(vec![a.clone()])];
+        assert!(refetch_event_page(&mut split_page, &split));
+        let p = split_page.as_ref().unwrap();
+        assert_eq!(p.target, a.key, "first-key wins picks alpha's side");
+        assert_eq!(p.retained, vec![a.key.clone()]);
+
+        // Everything gone → closed.
+        assert!(!refetch_event_page(&mut page, &[]));
+        assert!(page.is_none());
+    }
+
     #[test]
     fn retry_delay_backs_off_and_caps() {
         // The scheduling decision (codex 889c637): bounded backoff —

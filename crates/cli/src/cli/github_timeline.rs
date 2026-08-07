@@ -23,6 +23,33 @@ use std::path::Path;
 use crate::cli::github_event_log::EventLog;
 use clank_core::wait::WaitItem;
 
+/// A copy's IMMUTABLE identity — the COMPLETE copy key
+/// (tui-github-event-page): damaged WALs legally hold distinct
+/// idents at one seq, and ident is the discriminator
+/// reads/compaction/ack already use. Eq/Ord live HERE and only
+/// here, so retained page targets survive mutable-state flips (an
+/// ack must never read as the copy disappearing — codex fc7bf6c).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+pub(crate) struct MemberKey {
+    pub(crate) agent: String,
+    pub(crate) source: String,
+    pub(crate) seq: u64,
+    pub(crate) ident: String,
+}
+
+/// One copy: its key plus MUTABLE state. Deliberately NOT Eq/Ord as
+/// an IDENTITY (compare and sort by [`MemberKey`]); the PartialEq
+/// here only serves MergedEvent's whole-value comparison (the
+/// nothing-changed repaint gate SHOULD see an ack flip as a
+/// change). Transport stays typed; rendering goes through `as_str`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub(crate) struct MemberRef {
+    #[serde(flatten)]
+    pub(crate) key: MemberKey,
+    pub(crate) acked: bool,
+    pub(crate) transport: crate::cli::github_event_log::Transport,
+}
+
 /// One merged timeline entry.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub(crate) struct MergedEvent {
@@ -43,6 +70,11 @@ pub(crate) struct MergedEvent {
     pub(crate) url: Option<String>,
     /// Agent labels holding a copy, sorted, deduped.
     pub(crate) seen_by: Vec<String>,
+    /// Every copy's full address + state, sorted by
+    /// (agent, source, seq, ident) — the page's target space and the
+    /// ack fanout list.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) members: Vec<MemberRef>,
     /// UNHANDLED while ANY copy is unhandled; handled only when every
     /// copy is acked (codex 8354e51) — the TUI's open-work marker is
     /// deterministic under mixed ack state.
@@ -73,6 +105,8 @@ struct Copy {
     agent: String,
     source: String,
     seq: u64,
+    ident: String,
+    transport: crate::cli::github_event_log::Transport,
     display_at: u64,
     aliases: Vec<(String, String)>,
     item: WaitItem,
@@ -144,6 +178,8 @@ pub(crate) fn timeline_snapshot(repo: &Path) -> TimelineSnapshot {
                             agent: label.clone(),
                             source: stem.to_string(),
                             seq: r.seq,
+                            ident: r.ident,
+                            transport: r.transport,
                             display_at: r.event_at.unwrap_or(r.at),
                             aliases,
                             item: r.item,
@@ -241,6 +277,20 @@ fn merge(copies: Vec<Copy>) -> Vec<MergedEvent> {
                 members.iter().map(|&i| copies[i].agent.clone()).collect();
             seen_by.sort();
             seen_by.dedup();
+            let mut member_refs: Vec<MemberRef> = members
+                .iter()
+                .map(|&i| MemberRef {
+                    key: MemberKey {
+                        agent: copies[i].agent.clone(),
+                        source: copies[i].source.clone(),
+                        seq: copies[i].seq,
+                        ident: copies[i].ident.clone(),
+                    },
+                    acked: copies[i].acked,
+                    transport: copies[i].transport,
+                })
+                .collect();
+            member_refs.sort_by(|a, b| a.key.cmp(&b.key));
             let merged = MergedEvent {
                 at: copies[members[0]].display_at,
                 repo,
@@ -251,6 +301,7 @@ fn merge(copies: Vec<Copy>) -> Vec<MergedEvent> {
                 actor: first(&|i| gh(i).and_then(|g| g.5)),
                 url: first(&|i| gh(i).and_then(|g| g.6)),
                 seen_by,
+                members: member_refs,
                 unhandled: members.iter().any(|&i| !copies[i].acked),
                 baseline: members.iter().all(|&i| copies[i].baseline),
             };
@@ -298,6 +349,95 @@ mod tests {
         let dir = repo.join(".clank/agents").join(agent).join("events");
         std::fs::create_dir_all(&dir).unwrap();
         EventLog::open(&dir, "github-o-r-aaaa").unwrap()
+    }
+
+    #[test]
+    fn members_carry_full_copy_keys_across_agents_and_damaged_seqs() {
+        // tui-github-event-page identity pins: two agents may reuse
+        // a source name and seq — members stay distinct by agent —
+        // and one damaged WAL may hold two DISTINCT idents at one
+        // seq — members stay distinct by ident. Sorted, full keys.
+        let repo = tempdir();
+        // Agent A: feed id f-1 at seq 1.
+        let mut a = agent_log(&repo, "alpha");
+        a.append_inbox(
+            Transport::Poll,
+            Some("f-1"),
+            None,
+            Some(100),
+            &item("o/r", 1, None),
+        )
+        .unwrap();
+        // Agent B: SAME source stem, SAME seq, same feed id (merges
+        // into one component) — distinct agent in the member set.
+        let mut b = agent_log(&repo, "beta");
+        b.append_inbox(
+            Transport::Relay,
+            Some("f-1"),
+            None,
+            Some(100),
+            &item("o/r", 1, None),
+        )
+        .unwrap();
+
+        let snap = timeline_snapshot(&repo);
+        let ev = snap
+            .events
+            .iter()
+            .find(|e| e.members.len() == 2)
+            .expect("merged component");
+        let keys: Vec<(&str, u64)> = ev
+            .members
+            .iter()
+            .map(|m| (m.key.agent.as_str(), m.key.seq))
+            .collect();
+        assert_eq!(
+            keys,
+            vec![("alpha", 1), ("beta", 1)],
+            "sorted, agent-scoped"
+        );
+        assert!(ev.members.iter().all(|m| !m.key.ident.is_empty()));
+        assert_eq!(ev.members[0].transport.as_str(), "poll");
+        assert_eq!(ev.members[1].transport.as_str(), "relay");
+
+        // The DAMAGED-WAL case for real (codex fc7bf6c): duplicate
+        // gamma's row bytes at the SAME seq with a different feed id
+        // — one agent, one source, one seq, two DISTINCT idents; the
+        // full four-field keys stay separately targetable.
+        let mut c = agent_log(&repo, "gamma");
+        c.append_inbox(
+            Transport::Poll,
+            Some("g-1"),
+            None,
+            Some(200),
+            &item("o/r", 9, None),
+        )
+        .unwrap();
+        let gpath = repo.join(".clank/agents/gamma/events/github-o-r-aaaa.jsonl");
+        let text = std::fs::read_to_string(&gpath).unwrap();
+        let dup = text
+            .lines()
+            .last()
+            .unwrap()
+            .replace("\"g-1\"", "\"g-2\"")
+            .replace("\"number\":9", "\"number\":10");
+        std::fs::write(&gpath, format!("{text}{dup}\n")).unwrap();
+
+        let snap = timeline_snapshot(&repo);
+        let gamma_keys: Vec<&MemberKey> = snap
+            .events
+            .iter()
+            .flat_map(|e| &e.members)
+            .filter(|m| m.key.agent == "gamma")
+            .map(|m| &m.key)
+            .collect();
+        assert_eq!(gamma_keys.len(), 2, "both damaged-seq copies surface");
+        assert_eq!(gamma_keys[0].seq, gamma_keys[1].seq, "same seq");
+        assert_eq!(gamma_keys[0].source, gamma_keys[1].source);
+        assert_ne!(
+            gamma_keys[0].ident, gamma_keys[1].ident,
+            "distinct idents keep distinct full keys"
+        );
     }
 
     #[test]

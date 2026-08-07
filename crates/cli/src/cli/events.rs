@@ -73,7 +73,7 @@ fn events_context(
 /// sidecars written at arm time cover everything else — notably
 /// sources armed only via CLI `--event`, which the config never
 /// sees (github-watch-prompts, codex 6a907c6).
-fn join_prompts(
+pub(crate) fn join_prompts(
     config: &[clank_core::agent_config::GithubSource],
     dir: &Path,
 ) -> std::collections::HashMap<String, String> {
@@ -277,7 +277,7 @@ fn describe(item: &WaitItem) -> String {
     }
 }
 
-fn age(at: u64) -> String {
+pub(crate) fn age(at: u64) -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -367,28 +367,123 @@ fn ack(dir: &Path, rows: Vec<Sourced>, ids: &[String]) -> anyhow::Result<()> {
     let mut targets = Vec::new();
     for id in ids {
         let s = resolve(&rows, id)?;
-        if s.row.acked {
-            println!("{id}: already handled");
-            continue;
+        // The SHARED resolution seam judges collision + handled
+        // state; `None` here can only mean already handled (the row
+        // was just resolved, so it cannot have vanished).
+        match resolve_ack_target(dir, &rows, &s.source, s.row.seq, &s.row.ident) {
+            Some(t) => targets.push((t, id)),
+            None => println!("{id}: already handled"),
         }
-        targets.push((
-            s.source.clone(),
-            s.row.seq,
-            s.row.ident.clone(),
-            seq_collides(&rows, s),
-            id,
-        ));
     }
-    for (source, seq, ident, discriminate, id) in targets {
-        let mut log = EventLog::open(dir, &source)?;
-        if discriminate {
-            log.append_ack_ident(seq, &ident)?;
-        } else {
-            log.append_ack(seq)?;
-        }
+    for (t, id) in targets {
+        append_ack_target(&t)?;
         println!("{id}: handled");
     }
     Ok(())
+}
+
+/// A FULLY RESOLVED ack write: the WAL dir plus the selector,
+/// collision state already judged against that WAL's own rows. Both
+/// ack surfaces (`clank events ack`, the page fanout) resolve
+/// through [`resolve_ack_target`] and append from this one shape, so
+/// collision rules cannot drift (tui-github-event-page, codex
+/// 7e34106).
+pub(crate) struct AckTarget {
+    dir: std::path::PathBuf,
+    source: String,
+    seq: u64,
+    ident: String,
+    discriminate: bool,
+}
+
+/// Resolve one copy against ITS WAL's rows: `None` is an explicit
+/// no-op (vanished or already handled), `Some` carries the selector.
+fn resolve_ack_target(
+    dir: &Path,
+    rows: &[Sourced],
+    source: &str,
+    seq: u64,
+    ident: &str,
+) -> Option<AckTarget> {
+    let s = rows
+        .iter()
+        .find(|s| s.source == source && s.row.seq == seq && s.row.ident == ident)?;
+    if s.row.acked {
+        return None;
+    }
+    Some(AckTarget {
+        dir: dir.to_path_buf(),
+        source: source.to_string(),
+        seq,
+        ident: ident.to_string(),
+        discriminate: seq_collides(rows, s),
+    })
+}
+
+fn append_ack_target(t: &AckTarget) -> anyhow::Result<()> {
+    let mut log = EventLog::open(&t.dir, &t.source)?;
+    if t.discriminate {
+        log.append_ack_ident(t.seq, &t.ident)?;
+    } else {
+        log.append_ack(t.seq)?;
+    }
+    Ok(())
+}
+
+/// Ack a merged component's members ACROSS agent WALs — the event
+/// page's fanout (tui-github-event-page). TWO PHASES (codex
+/// 7e34106): every involved agent's WALs are read and every member
+/// resolved to a typed [`AckTarget`] FIRST — a read failure aborts
+/// with nothing written — and only then does the append phase run.
+/// Vanished and already-handled members resolve to explicit no-ops.
+pub(crate) fn ack_members(
+    repo: &Path,
+    members: &[crate::cli::github_timeline::MemberKey],
+) -> anyhow::Result<usize> {
+    let mut by_agent: std::collections::BTreeMap<
+        &str,
+        Vec<&crate::cli::github_timeline::MemberKey>,
+    > = Default::default();
+    for m in members {
+        by_agent.entry(m.agent.as_str()).or_default().push(m);
+    }
+    use anyhow::Context as _;
+    // Phase 1: read + resolve everything.
+    let mut targets: Vec<AckTarget> = Vec::new();
+    for (agent, keys) in by_agent {
+        let dir = crate::agent_store::agents_root(repo)
+            .join(agent)
+            .join("events");
+        let rows = read_all(&dir)
+            .with_context(|| format!("reading `{agent}`'s event WALs for the ack fanout"))?;
+        for k in keys {
+            if let Some(t) = resolve_ack_target(&dir, &rows, &k.source, k.seq, &k.ident) {
+                targets.push(t);
+            }
+        }
+    }
+    // Dedup identical selectors (a caller may pass duplicate keys).
+    targets.sort_by(|a, b| {
+        (&a.dir, &a.source, a.seq, &a.ident).cmp(&(&b.dir, &b.source, b.seq, &b.ident))
+    });
+    targets.dedup_by(|a, b| {
+        (&a.dir, &a.source, a.seq, &a.ident) == (&b.dir, &b.source, b.seq, &b.ident)
+    });
+    // Phase 2: append.
+    let n = targets.len();
+    for t in &targets {
+        append_ack_target(t)?;
+    }
+    Ok(n)
+}
+
+/// Terminal-safe text: non-newline control characters collapse to
+/// spaces, newlines survive (the events-show cleanup, shared with
+/// the TUI event page).
+pub(crate) fn sanitize_multiline(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() && c != '\n' { ' ' } else { c })
+        .collect()
 }
 
 fn show(
@@ -430,10 +525,7 @@ fn show(
         // Full text (multi-line preserved), but non-newline control
         // characters must not reach the terminal raw; continuation
         // lines align under the value column.
-        let clean: String = p
-            .chars()
-            .map(|c| if c.is_control() && c != '\n' { ' ' } else { c })
-            .collect();
+        let clean = sanitize_multiline(p);
         println!("prompt:    {}", clean.replace('\n', "\n           "));
     }
     Ok(())
@@ -624,6 +716,129 @@ mod tests {
         assert!(resolve(&rows, "not-a-seq").is_err());
         // An empty/missing dir is an empty listing, not an error.
         assert!(read_all(&dir.join("missing")).unwrap().is_empty());
+    }
+
+    #[test]
+    fn ack_members_fans_out_across_agent_wals() {
+        // tui-github-event-page: a merged component's members ack
+        // across BOTH agents' WALs through the shared core, with the
+        // discriminated selector where a WAL's seq is ambiguous, and
+        // vanished/already-acked copies skipped.
+        use crate::cli::github_timeline::MemberKey;
+        let root = tempdir();
+        let repo = root.as_path();
+        let mk_agent = |agent: &str| {
+            let dir = crate::agent_store::agents_root(repo)
+                .join(agent)
+                .join("events");
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        };
+        let a = mk_agent("alpha");
+        let b = mk_agent("beta");
+        let mut la = EventLog::open(&a, "github-o-r-aaaa").unwrap();
+        la.append_inbox(Transport::Poll, Some("f-1"), None, None, &item(1))
+            .unwrap();
+        let mut lb = EventLog::open(&b, "github-o-r-aaaa").unwrap();
+        lb.append_inbox(Transport::Relay, Some("f-1"), None, None, &item(1))
+            .unwrap();
+
+        let rows_a = read_all(&a).unwrap();
+        let rows_b = read_all(&b).unwrap();
+        let key = |agent: &str, s: &Sourced| MemberKey {
+            agent: agent.into(),
+            source: s.source.clone(),
+            seq: s.row.seq,
+            ident: s.row.ident.clone(),
+        };
+        let members = vec![key("alpha", &rows_a[0]), key("beta", &rows_b[0])];
+        assert_eq!(ack_members(repo, &members).unwrap(), 2, "both copies acked");
+        assert!(read_all(&a).unwrap()[0].row.acked);
+        assert!(read_all(&b).unwrap()[0].row.acked);
+        // Idempotent: a second fanout acks nothing further.
+        assert_eq!(ack_members(repo, &members).unwrap(), 0);
+        // A vanished copy is skipped, not an error.
+        let mut ghost = members.clone();
+        ghost.push(MemberKey {
+            agent: "alpha".into(),
+            source: "github-o-r-aaaa".into(),
+            seq: 99,
+            ident: "f:nope".into(),
+        });
+        assert_eq!(ack_members(repo, &ghost).unwrap(), 0);
+    }
+
+    #[test]
+    fn ack_members_discriminates_damaged_seqs_and_two_phases_on_failure() {
+        use crate::cli::github_timeline::MemberKey;
+        let root = tempdir();
+        let repo = root.as_path();
+        let a = crate::agent_store::agents_root(repo)
+            .join("alpha")
+            .join("events");
+        std::fs::create_dir_all(&a).unwrap();
+        let mut la = EventLog::open(&a, "github-o-r-aaaa").unwrap();
+        la.append_inbox(Transport::Poll, Some("D1"), None, None, &item(1))
+            .unwrap();
+        // The damaged twin: same agent/source/seq, distinct ident.
+        let path = a.join("github-o-r-aaaa.jsonl");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let dup = text
+            .lines()
+            .last()
+            .unwrap()
+            .replace("\"D1\"", "\"D2\"")
+            .replace("\"number\":1", "\"number\":2");
+        std::fs::write(&path, format!("{text}{dup}\n")).unwrap();
+
+        let rows = read_all(&a).unwrap();
+        assert_eq!(rows.len(), 2);
+        // Fan out on ONE member: only the selected ident acks — the
+        // discriminated selector at work; a broad seq ack would have
+        // covered both.
+        let selected = MemberKey {
+            agent: "alpha".into(),
+            source: rows[0].source.clone(),
+            seq: rows[0].row.seq,
+            ident: rows[0].row.ident.clone(),
+        };
+        assert_eq!(ack_members(repo, &[selected.clone()]).unwrap(), 1);
+        let rows = read_all(&a).unwrap();
+        let acked: Vec<bool> = rows.iter().map(|s| s.row.acked).collect();
+        assert_eq!(
+            acked.iter().filter(|&&b| b).count(),
+            1,
+            "exactly the selected member: {acked:?}"
+        );
+
+        // TWO-PHASE (codex 7e34106): a later agent's read failure
+        // aborts BEFORE any write — alpha's remaining unhandled row
+        // stays untouched.
+        let beta_events = crate::agent_store::agents_root(repo)
+            .join("beta")
+            .join("events");
+        std::fs::create_dir_all(beta_events.parent().unwrap()).unwrap();
+        std::fs::write(&beta_events, "not a directory").unwrap();
+        let remaining = rows
+            .iter()
+            .find(|s| !s.row.acked)
+            .map(|s| MemberKey {
+                agent: "alpha".into(),
+                source: s.source.clone(),
+                seq: s.row.seq,
+                ident: s.row.ident.clone(),
+            })
+            .unwrap();
+        let beta_key = MemberKey {
+            agent: "beta".into(),
+            source: "github-o-r-aaaa".into(),
+            seq: 1,
+            ident: "f:x".into(),
+        };
+        let err = ack_members(repo, &[remaining, beta_key]).unwrap_err();
+        assert!(err.to_string().contains("beta"), "{err}");
+        let acked_after: Vec<bool> = read_all(&a).unwrap().iter().map(|s| s.row.acked).collect();
+        assert_eq!(acked, acked_after, "phase 1 failure wrote nothing");
     }
 
     #[test]

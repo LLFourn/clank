@@ -88,6 +88,11 @@ pub(super) enum Mode {
     PlanDetail { sel: usize },
     /// The purge second screen: artifacts-only vs drop-everything.
     PurgeChoice { sel: usize },
+    /// The github event page (tui-github-event-page); `sel` is the
+    /// cursor over its action menu. The event's IDENTITY (retained
+    /// member keys) lives in the loop's `event_page` — same
+    /// set/clear-together invariant as `plan_page`.
+    EventDetail { sel: usize },
     /// A one-line text input on the plan page (force-finish subject,
     /// squash message, block reason, drop type-to-confirm). The BUFFER
     /// lives in the loop's `plan_input` (Mode stays `Copy`); same
@@ -658,6 +663,133 @@ impl Mode {
     }
 }
 
+/// The open EVENT page (tui-github-event-page): the target copy key,
+/// the retained component member-key set (the retarget lookup — the
+/// fresh snapshot cannot reconstruct membership from one key), and
+/// the freshly-derived merged event. Set/cleared with
+/// [`Mode::EventDetail`].
+#[derive(Debug, Clone)]
+pub(super) struct EventPage {
+    /// The targeted copy — the FULL key.
+    pub(super) target: crate::cli::github_timeline::MemberKey,
+    /// The component's sorted member keys as of the last successful
+    /// refresh; retargeting follows the first surviving key.
+    pub(super) retained: Vec<crate::cli::github_timeline::MemberKey>,
+    /// The component's current merged view.
+    pub(super) event: crate::cli::github_timeline::MergedEvent,
+    /// Standing watch prompts, deduplicated: `None` attribution when
+    /// every member's prompt agrees, per-agent attribution when they
+    /// differ (tui-github-event-page).
+    pub(super) prompts: Vec<(Option<String>, String)>,
+    /// Scroll offset into the details body (facts/members/prompts) —
+    /// the plan page's document-scroll model, so long multiline
+    /// prompts are always reachable.
+    pub(super) scroll: usize,
+}
+
+/// One row of the event page's action menu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum EventAction {
+    /// Open the event URL via the platform opener.
+    OpenBrowser,
+    /// Ack every unhandled copy (the fanout through the shared core).
+    Ack,
+    /// Close the page.
+    Back,
+}
+
+/// The event page's actions in display order: unavailable actions are
+/// OMITTED (no URL → no browser row; fully handled → no ack row),
+/// matching how the other pages degrade.
+pub(super) fn event_actions(has_url: bool, unhandled: bool) -> Vec<EventAction> {
+    let mut out = Vec::new();
+    if has_url {
+        out.push(EventAction::OpenBrowser);
+    }
+    if unhandled {
+        out.push(EventAction::Ack);
+    }
+    out.push(EventAction::Back);
+    out
+}
+
+/// The EXECUTED effect of an event-page action — the tested seam
+/// codex 525cef1 asked for: the URL extraction and the fanout list
+/// are resolved HERE (pure, recorded in tests with the exact URL);
+/// the loop only routes `Open` to the shared platform opener and
+/// `AckFanout` to the shared ack core.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum EventEffect {
+    /// Launch this exact URL via the shared opener.
+    Open(String),
+    /// Fan these member keys through the shared events-ack core.
+    AckFanout(Vec<crate::cli::github_timeline::MemberKey>),
+    /// Close the page.
+    Close,
+    /// Nothing to do (e.g. OpenBrowser with no URL — the menu omits
+    /// it, this is the belt).
+    None,
+}
+
+pub(super) fn event_action_effect(ep: &EventPage, a: EventAction) -> EventEffect {
+    match a {
+        EventAction::OpenBrowser => ep
+            .event
+            .url
+            .clone()
+            .map(EventEffect::Open)
+            .unwrap_or(EventEffect::None),
+        EventAction::Ack => EventEffect::AckFanout(
+            ep.event
+                .members
+                .iter()
+                .filter(|m| !m.acked)
+                .map(|m| m.key.clone())
+                .collect(),
+        ),
+        EventAction::Back => EventEffect::Close,
+    }
+}
+
+/// Event-page navigation outcome — pure key routing, IO stays in
+/// the loop (same shape as [`PlanNav`]).
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum EventNav {
+    Sel(usize),
+    /// Scroll the details body (the plan page's continuous
+    /// buttons→document model).
+    Scroll(i32),
+    Back,
+    Act(EventAction),
+    None,
+}
+
+pub(super) fn event_detail_nav(
+    sel: usize,
+    actions: &[EventAction],
+    k: Key,
+    page: usize,
+    scroll: usize,
+) -> EventNav {
+    let page = page as i32;
+    let last = actions.len().saturating_sub(1);
+    match k {
+        // Esc AND q return to the log (the page never quits the TUI —
+        // tui-github-event-page).
+        Key::Escape | Key::Quit => EventNav::Back,
+        Key::Up if sel == last && scroll > 0 => EventNav::Scroll(-1),
+        Key::Up => EventNav::Sel(sel.saturating_sub(1)),
+        Key::Down if sel == last => EventNav::Scroll(1),
+        Key::Down => EventNav::Sel((sel + 1).min(last)),
+        Key::PageUp => EventNav::Scroll(-page),
+        Key::Space | Key::PageDown => EventNav::Scroll(page),
+        Key::Enter => actions
+            .get(sel)
+            .map_or(EventNav::None, |a| EventNav::Act(*a)),
+        _ => EventNav::None,
+    }
+}
+
 /// The open plan page's identity + derived facts (tui-plan-actions-page).
 /// Lives in the loop beside `mode` (which stays `Copy`); set and cleared
 /// together with `Mode::PlanDetail`/`PurgeChoice`.
@@ -680,6 +812,7 @@ pub(super) struct PlanPage {
 pub(super) struct PanelView<'a> {
     pub(super) mode: Mode,
     pub(super) plan_page: Option<&'a PlanPage>,
+    pub(super) event_page: Option<&'a EventPage>,
     pub(super) plan_input: Option<&'a TextInput>,
     pub(super) picker: &'a [crate::cli::status::AvailableAgent],
     /// The selected log ENTRY (index into the scroll sequence) — drawn
@@ -701,6 +834,7 @@ impl<'a> PanelView<'a> {
         Self {
             mode,
             plan_page: None,
+            event_page: None,
             plan_input: None,
             picker: &[],
             log_cursor: 0,
@@ -961,6 +1095,71 @@ pub(super) fn move_selection(sel: usize, len: usize, down: bool) -> usize {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn event_detail_nav_routes_keys_to_actions() {
+        // The action seam (tui-github-event-page): Enter on a row
+        // RETURNS the action — the loop performs the IO — so
+        // open-in-browser and ack are pinned here without spawning
+        // anything, exactly like the plan page's nav.
+        use super::{EventAction, EventNav, event_actions, event_detail_nav};
+        let actions = event_actions(true, true);
+        assert_eq!(
+            actions,
+            vec![
+                EventAction::OpenBrowser,
+                EventAction::Ack,
+                EventAction::Back
+            ]
+        );
+        assert_eq!(
+            event_detail_nav(0, &actions, Key::Enter, 5, 0),
+            EventNav::Act(EventAction::OpenBrowser)
+        );
+        assert_eq!(
+            event_detail_nav(1, &actions, Key::Enter, 5, 0),
+            EventNav::Act(EventAction::Ack)
+        );
+        assert_eq!(
+            event_detail_nav(0, &actions, Key::Down, 5, 0),
+            EventNav::Sel(1)
+        );
+        // Down at the LAST button crosses into the details body —
+        // the plan page's continuous buttons→document model.
+        assert_eq!(
+            event_detail_nav(2, &actions, Key::Down, 5, 0),
+            EventNav::Scroll(1)
+        );
+        assert_eq!(
+            event_detail_nav(2, &actions, Key::Up, 5, 3),
+            EventNav::Scroll(-1),
+            "Up climbs back out through the body top"
+        );
+        assert_eq!(
+            event_detail_nav(0, &actions, Key::PageDown, 5, 0),
+            EventNav::Scroll(5)
+        );
+        // q returns to the log — the page never quits the TUI.
+        assert_eq!(
+            event_detail_nav(0, &actions, Key::Quit, 5, 0),
+            EventNav::Back
+        );
+        assert_eq!(
+            event_detail_nav(0, &actions, Key::Up, 5, 0),
+            EventNav::Sel(0)
+        );
+        assert_eq!(
+            event_detail_nav(1, &actions, Key::Escape, 5, 0),
+            EventNav::Back
+        );
+        // Degraded menu: no URL, handled → only Back, and Enter on it
+        // closes.
+        let only_back = event_actions(false, false);
+        assert_eq!(
+            event_detail_nav(0, &only_back, Key::Enter, 5, 0),
+            EventNav::Act(EventAction::Back)
+        );
+    }
+
     use super::*;
     use crate::cli::status_tui::fixtures::agent_row;
 

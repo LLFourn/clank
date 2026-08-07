@@ -2022,7 +2022,7 @@ fn fmt_ts(ts: i64) -> String {
         .unwrap_or_default()
 }
 
-fn launch_opener(path: &Path) -> anyhow::Result<()> {
+pub(crate) fn launch_opener(path: &Path) -> anyhow::Result<()> {
     let path_str = path.to_string_lossy().to_string();
     #[cfg(target_os = "macos")]
     let prog = "open";

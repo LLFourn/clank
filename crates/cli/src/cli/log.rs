@@ -103,7 +103,7 @@ pub async fn run(args: LogArgs) -> anyhow::Result<()> {
 /// event (log-timeline-github-events).
 pub(crate) enum TimelineItem<'a> {
     Repo(&'a LogEvent),
-    Github(&'a crate::cli::github_timeline::MergedEvent),
+    Github(usize, &'a crate::cli::github_timeline::MergedEvent),
 }
 
 fn event_ts(e: &LogEvent) -> i64 {
@@ -127,9 +127,14 @@ pub(crate) fn interleave<'a>(
     gh: &'a [crate::cli::github_timeline::MergedEvent],
 ) -> Vec<TimelineItem<'a>> {
     let floor: Option<i64> = events.last().map(|e| event_ts(e));
-    let mut gh_desc: Vec<&crate::cli::github_timeline::MergedEvent> = gh
+    // The carried index is the ORIGINAL snapshot position — captured
+    // by enumerate BEFORE the floor filter and the reversal, so the
+    // displayed row and the event it opens share identity (codex
+    // d7f4d40: a derived-list position inverted the mapping).
+    let mut gh_desc: Vec<(usize, &crate::cli::github_timeline::MergedEvent)> = gh
         .iter()
-        .filter(|g| {
+        .enumerate()
+        .filter(|(_, g)| {
             let t = i64::try_from(g.at).unwrap_or(i64::MAX);
             floor.is_none_or(|f| t >= f)
         })
@@ -139,12 +144,13 @@ pub(crate) fn interleave<'a>(
     let (mut i, mut j) = (0usize, 0usize);
     while i < events.len() || j < gh_desc.len() {
         let take_gh = match (events.get(i), gh_desc.get(j)) {
-            (Some(e), Some(g)) => i64::try_from(g.at).unwrap_or(i64::MAX) >= event_ts(e),
+            (Some(e), Some((_, g))) => i64::try_from(g.at).unwrap_or(i64::MAX) >= event_ts(e),
             (None, Some(_)) => true,
             _ => false,
         };
         if take_gh {
-            out.push(TimelineItem::Github(gh_desc[j]));
+            let (orig_idx, g) = gh_desc[j];
+            out.push(TimelineItem::Github(orig_idx, g));
             j += 1;
         } else {
             out.push(TimelineItem::Repo(events[i]));
@@ -304,7 +310,7 @@ fn print_human(items: &[TimelineItem], repo: &Path, shas: &[CommitSha]) -> anyho
     for item in items {
         match item {
             TimelineItem::Repo(e) => chunk.push(e),
-            TimelineItem::Github(g) => {
+            TimelineItem::Github(_, g) => {
                 print_human_events(&chunk, repo, &reviews, c, &mut started)?;
                 chunk.clear();
                 if started {
@@ -539,6 +545,10 @@ pub(crate) enum OnelineRow {
     /// shape, shared with the CLI renderers. `baseline` = pre-watch
     /// history (rendered dimmed / marked, never open).
     Github {
+        /// Index into the SAME timeline read's merged-event list
+        /// (`StatusSnapshot.github_events` in the TUI) — Enter's
+        /// page target. Row and list are always set together.
+        event_idx: usize,
         line: String,
         unhandled: bool,
         baseline: bool,
@@ -561,10 +571,11 @@ pub(crate) fn oneline_items_rows(
     for item in items {
         match item {
             TimelineItem::Repo(e) => chunk.push(e),
-            TimelineItem::Github(g) => {
+            TimelineItem::Github(idx, g) => {
                 out.extend(oneline_rows(&chunk, reviews));
                 chunk.clear();
                 out.push(OnelineRow::Github {
+                    event_idx: *idx,
                     line: gh_describe(g),
                     unhandled: g.unhandled,
                     baseline: g.baseline,
@@ -676,6 +687,7 @@ pub(crate) fn oneline_plain_lines(rows: &[OnelineRow]) -> Vec<String> {
         .map(|row| match row {
             OnelineRow::Header { plan } => plan.clone().unwrap_or_else(|| "adhoc".to_string()),
             OnelineRow::Github {
+                event_idx: _,
                 line,
                 unhandled,
                 baseline,
@@ -724,7 +736,7 @@ fn print_oneline(items: &[TimelineItem], repo: &Path, shas: &[CommitSha]) -> any
     for item in items {
         match item {
             TimelineItem::Repo(e) => chunk.push(e),
-            TimelineItem::Github(g) => {
+            TimelineItem::Github(_, g) => {
                 print_oneline_events(&chunk, &reviews, c);
                 chunk.clear();
                 // One row, marker-led like commits; unhandled events
@@ -894,7 +906,7 @@ fn json_items<'a>(
     for item in items {
         match item {
             TimelineItem::Repo(e) => chunk.push(e),
-            TimelineItem::Github(g) => {
+            TimelineItem::Github(_, g) => {
                 out.extend(json_rows(&chunk, reviews));
                 chunk.clear();
                 out.push(LogJsonRow::Github {
@@ -1010,6 +1022,7 @@ mod json_output_tests {
             actor: Some("alice".into()),
             url: None,
             seen_by: vec!["claude".into()],
+            members: Vec::new(),
             unhandled,
             baseline: false,
         }
@@ -1041,12 +1054,33 @@ mod json_output_tests {
         let shape: Vec<&str> = items
             .iter()
             .map(|i| match i {
-                TimelineItem::Github(g) => g.title.as_deref().unwrap(),
+                TimelineItem::Github(_, g) => g.title.as_deref().unwrap(),
                 TimelineItem::Repo(LogEvent::AdHoc { subject, .. }) => subject.as_str(),
                 _ => "?",
             })
             .collect();
         assert_eq!(shape, vec!["lead", "new", "between", "old"]);
+        // The carried index is the ORIGINAL snapshot position (codex
+        // d7f4d40): with the floor filtering "too-old" out and the
+        // display reversed, each rendered row must still open ITS
+        // OWN event — "lead" is snapshot[2], "between" snapshot[1] —
+        // never a derived-list position.
+        let idx_of = |title: &str| {
+            items
+                .iter()
+                .find_map(|i| match i {
+                    TimelineItem::Github(idx, g) if g.title.as_deref() == Some(title) => Some(*idx),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        assert_eq!(gh_events[idx_of("lead")].title.as_deref(), Some("lead"));
+        assert_eq!(
+            gh_events[idx_of("between")].title.as_deref(),
+            Some("between")
+        );
+        assert_eq!(idx_of("lead"), 2, "original position, not display order");
+        assert_eq!(idx_of("between"), 1, "floor filtering shifts nothing");
         // No commits at all → every gh event shows.
         let items = interleave(&[], &gh_events);
         assert_eq!(items.len(), 3);

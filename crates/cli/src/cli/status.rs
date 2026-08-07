@@ -73,6 +73,10 @@ pub struct StatusSnapshot {
     /// Active GitHub PR reviews (clank-pr-review-mode), for the
     /// `pr` gauge. Empty in the common (no-PR-review) case.
     pub(crate) pr_reviews: Vec<clank_core::wait::PrReviewWorkState>,
+    /// The timeline's merged github events, index-aligned with the
+    /// `OnelineRow::Github` rows in `log_rows` (set together —
+    /// tui-github-event-page).
+    pub(crate) github_events: Vec<crate::cli::github_timeline::MergedEvent>,
     /// The fold's pending AD-HOC commit review, if any — carried so
     /// the TUI's activity projection sees the same work `clank wait`
     /// delivers (tui-adhoc-review-activity).
@@ -357,8 +361,17 @@ impl StatusSnapshot {
         let state = crate::rebuild::rebuild_repo_with_policy(repo, policy)
             .await
             .map_err(|e| anyhow::anyhow!("failed to fold repo `{}`: {e}", repo.display()))?;
-        let log_rows = recent_log_rows(repo, &state).await;
-        Self::from_state(repo, basename, home, &state, plan_arg, watch_mode, log_rows)
+        let (log_rows, github_events) = recent_log_rows(repo, &state).await;
+        Self::from_state(
+            repo,
+            basename,
+            home,
+            &state,
+            plan_arg,
+            watch_mode,
+            log_rows,
+            github_events,
+        )
     }
 
     fn from_state(
@@ -369,6 +382,7 @@ impl StatusSnapshot {
         plan_arg: Option<&str>,
         watch_mode: bool,
         log_rows: Vec<crate::cli::log::OnelineRow>,
+        github_events: Vec<crate::cli::github_timeline::MergedEvent>,
     ) -> anyhow::Result<Self> {
         // One ODB handle for the whole snapshot: HEAD facts, the dirty
         // walk, the commit-tag HEAD read, and every per-plan worktree
@@ -481,6 +495,7 @@ impl StatusSnapshot {
             agents,
             stash,
             log_rows,
+            github_events,
             log_decorations,
             pr_reviews: work_status.pr_reviews,
             ad_hoc: work_status.ad_hoc,
@@ -880,11 +895,17 @@ async fn run_watch(
 /// a just-finished plan's commits vanish the moment one plan was
 /// active). Best-effort: any failure yields an empty pane, never a
 /// status error.
-async fn recent_log_rows(repo: &Path, state: &RepoState) -> Vec<crate::cli::log::OnelineRow> {
+async fn recent_log_rows(
+    repo: &Path,
+    state: &RepoState,
+) -> (
+    Vec<crate::cli::log::OnelineRow>,
+    Vec<crate::cli::github_timeline::MergedEvent>,
+) {
     const LOG_WINDOW: usize = 30;
     match state.head.clone() {
         Some(head) => log_rows_windowed(repo, &head, LOG_WINDOW).await,
-        None => Vec::new(),
+        None => (Vec::new(), Vec::new()),
     }
 }
 
@@ -929,9 +950,21 @@ fn log_decorations(
 /// window to pull older history on demand (a fresh windowed rebuild each
 /// time, NOT an incremental fold continuation).
 pub(crate) async fn tui_log_rows(repo: &Path, window: usize) -> Vec<crate::cli::log::OnelineRow> {
+    tui_log_with_events(repo, window).await.0
+}
+
+/// Rows AND the index-aligned merged events — the TUI sets both on
+/// the snapshot together (tui-github-event-page).
+pub(crate) async fn tui_log_with_events(
+    repo: &Path,
+    window: usize,
+) -> (
+    Vec<crate::cli::log::OnelineRow>,
+    Vec<crate::cli::github_timeline::MergedEvent>,
+) {
     match crate::cli::log::git_rev_parse(repo, "HEAD") {
         Some(head) => log_rows_windowed(repo, &head, window).await,
-        None => Vec::new(),
+        None => (Vec::new(), Vec::new()),
     }
 }
 
@@ -940,12 +973,15 @@ async fn log_rows_windowed(
     repo: &Path,
     head: &crate::lifecycle::CommitSha,
     window: usize,
-) -> Vec<crate::cli::log::OnelineRow> {
+) -> (
+    Vec<crate::cli::log::OnelineRow>,
+    Vec<crate::cli::github_timeline::MergedEvent>,
+) {
     use clank_core::repo_state::LogEvent;
 
     let from = crate::cli::log::git_rev_parse(repo, &format!("HEAD~{window}"));
     let Ok((_state, events)) = crate::rebuild::rebuild_from(repo, from.as_ref(), head).await else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
 
     let reviewable: Vec<crate::lifecycle::CommitSha> = events
@@ -971,7 +1007,7 @@ async fn log_rows_windowed(
         .map(|n| crate::cli::log::OnelineRow::Notice(n.clone()))
         .collect();
     rows.extend(crate::cli::log::oneline_items_rows(&items, &reviews));
-    rows
+    (rows, snap.events)
 }
 
 /// Decides which filesystem events wake the status loops. This is an
@@ -1944,6 +1980,7 @@ mod dirty_and_wake_tests {
             agents: Vec::new(),
             stash: Vec::new(),
             log_rows: Vec::new(),
+            github_events: Vec::new(),
             log_decorations: Default::default(),
             pr_reviews: Vec::new(),
             ad_hoc: Vec::new(),

@@ -202,7 +202,7 @@ Run `clank <cmd> --help` for details; the skills carry the depth.
 | `doctor` | Diagnose repo / user / session setup; exits 1 on FAIL |
 | `as` | Bind this agent session to a roster label |
 | `auto` | Per-agent auto-mode on / off / status |
-| `status` | Repo state; `--watch` live, `--tui` full-screen pane, `-j` JSON |
+| `status` | Repo state; `--watch` live, `--tui` full-screen pane (Enter on a github row opens the event page: preview, ack, open-in-browser), `-j` JSON |
 | `wait` | Block for work; `--peek`, `--for`, `--event` (see above) |
 | `events` | Github event inbox: `list` / `ack` / `show` (see below) |
 | `feedback` | `write` / `read` review feedback via a typed surface |
