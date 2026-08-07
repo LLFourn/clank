@@ -73,6 +73,23 @@ const WORK_LOOP_CLAUDE: &str = "\
   re-run `clank status` waiting for state to change. The armed
   background wait wakes you; do not spin.";
 
+/// Claude under the ASYNCREWAKE loop (claude-asyncrewake-work-loop):
+/// the Stop hook parks the watcher itself and work arrives as a
+/// system-reminder wake — the agent must never arm anything. The
+/// legacy text below stays for machines whose Claude Code predates
+/// asyncRewake (setup decides per machine).
+const WORK_LOOP_CLAUDE_ASYNC: &str = "\
+- **Work arrives on its own.** When you end a turn, clank parks a
+  watcher inside the Stop hook; when work exists you are WOKEN with
+  the items as a system reminder (\"Clank wait returned work…\").
+  Act on them IMMEDIATELY. Run `clank status` if you need more than
+  the hint carries (short SHAs resolve wherever a `<sha>` is wanted).
+  Each item is a one-line hint: kind, plan, short sha.
+- **NEVER run `clank wait` yourself**, foreground or background —
+  the parked hook already holds this session's one wait; a second
+  duplicates deliveries. Do not re-run `clank status` waiting for
+  state to change. End your turn; work finds you.";
+
 const WORK_LOOP_CODEX: &str = "\
 - **Act on Stop-hook work IMMEDIATELY, then YIELD.** When the Stop hook
   hands you work, do it now. codex surfaces this as a
@@ -125,6 +142,14 @@ const WORK_LOOP_OPENCODE: &str = "\
 /// `{{WORK_LOOP}}` work-delivery teaching) are substituted, never
 /// duplicated. Pure — unit-tested without touching the filesystem.
 pub fn compose_skill(role: Role, tool: Tool) -> String {
+    compose_skill_with(role, tool, false)
+}
+
+/// `claude_async` selects claude's work-loop teaching
+/// (claude-asyncrewake-work-loop): setup passes the SAME probed mode
+/// it encodes in the hook entry, and doctor verifies with the same
+/// value — the skill on disk always matches the installed loop.
+pub fn compose_skill_with(role: Role, tool: Tool, claude_async: bool) -> String {
     let (name, description, body, other) = match role {
         Role::Master => (MASTER_SKILL, MASTER_DESC, SKILL_MASTER_BODY, REVIEWER_SKILL),
         Role::Reviewer => (
@@ -158,6 +183,7 @@ pub fn compose_skill(role: Role, tool: Tool) -> String {
         Tool::OpenCode => "bash",
     };
     let work_loop = match tool {
+        Tool::Claude if claude_async => WORK_LOOP_CLAUDE_ASYNC,
         Tool::Claude => WORK_LOOP_CLAUDE,
         Tool::Codex => WORK_LOOP_CODEX,
         Tool::Grok => WORK_LOOP_GROK,
@@ -211,28 +237,51 @@ pub const TOOL_SKILL_DIRS: [(Tool, &str); 4] = [
 /// .opencode/plugin is not scanned, M2 findings). ONE inventory,
 /// consumed by both `clank setup` (install) and `clank doctor`
 /// (verify), so the two can never diverge (codex 0c90514).
-pub fn user_asset_inventory() -> Vec<(String, String)> {
+/// One owned user-scope asset: the expected content plus any OTHER
+/// canonical content clank itself generated for a different mode —
+/// a file exactly matching an alternate is a MODE MIGRATION, not
+/// user drift, and installs without --force (codex 1483318: doctor
+/// tells the user to run plain `clank setup` on mode drift, so it
+/// must actually work).
+pub struct OwnedAsset {
+    pub rel: String,
+    pub expected: String,
+    pub canonical_alternates: Vec<String>,
+}
+
+pub fn user_asset_inventory(claude_async: bool) -> Vec<OwnedAsset> {
+    let plain = |rel: String, expected: String| OwnedAsset {
+        rel,
+        expected,
+        canonical_alternates: Vec::new(),
+    };
     let mut out = Vec::new();
     for (tool, tool_dir) in TOOL_SKILL_DIRS {
         for (role, skill) in [
             (Role::Master, MASTER_SKILL),
             (Role::Reviewer, REVIEWER_SKILL),
         ] {
-            out.push((
-                format!("{tool_dir}/skills/{skill}/SKILL.md"),
-                compose_skill(role, tool),
-            ));
+            let canonical_alternates = if tool == Tool::Claude {
+                vec![compose_skill_with(role, tool, !claude_async)]
+            } else {
+                Vec::new()
+            };
+            out.push(OwnedAsset {
+                rel: format!("{tool_dir}/skills/{skill}/SKILL.md"),
+                expected: compose_skill_with(role, tool, claude_async),
+                canonical_alternates,
+            });
         }
-        out.push((
+        out.push(plain(
             format!("{tool_dir}/skills/clank-pr-review/SKILL.md"),
             PR_REVIEW_SKILL_BODY.to_string(),
         ));
-        out.push((
+        out.push(plain(
             format!("{tool_dir}/skills/clank-github/SKILL.md"),
             GITHUB_SKILL_BODY.to_string(),
         ));
     }
-    out.push((
+    out.push(plain(
         ".config/opencode/plugin/clank.js".to_string(),
         OPENCODE_PLUGIN.to_string(),
     ));
@@ -243,10 +292,14 @@ pub async fn run(args: SetupArgs) -> anyhow::Result<()> {
     let home = home_dir()?;
     let mut summary = Vec::<String>::new();
 
-    for (rel, expected) in user_asset_inventory() {
+    // ONE probe drives the skills AND the hook entries — the
+    // installed teaching and the installed loop cannot disagree.
+    let claude_async = probe_claude_asyncrewake() == Some(true);
+    for asset in user_asset_inventory(claude_async) {
         install_skill(
-            &home.join(&rel),
-            &expected,
+            &home.join(&asset.rel),
+            &asset.expected,
+            &asset.canonical_alternates,
             args.force,
             args.dry_run,
             &mut summary,
@@ -261,12 +314,35 @@ pub async fn run(args: SetupArgs) -> anyhow::Result<()> {
             &mut summary,
         )?;
     }
+    // The delivery mode is decided HERE, once, and encoded in the
+    // installed entry's argv (claude-asyncrewake-work-loop): probe
+    // the installed Claude Code; no binary / too old → legacy loop.
     merge_hook_into_settings(
         &home.join(".claude/settings.json"),
-        ClaudeHook,
+        ClaudeHook {
+            async_mode: claude_async,
+        },
         args.dry_run,
         &mut summary,
     )?;
+    if claude_async {
+        merge_hook_into_settings(
+            &home.join(".claude/settings.json"),
+            SessionStartHook,
+            args.dry_run,
+            &mut summary,
+        )?;
+    } else {
+        // A downgraded machine sheds the companion so no stale
+        // SessionStart entry outlives the mode that installed it.
+        remove_hook_entry(
+            &home.join(".claude/settings.json"),
+            "SessionStart",
+            SESSION_START_HOOK_ID,
+            args.dry_run,
+            &mut summary,
+        )?;
+    }
     merge_hook_into_settings(
         &home.join(".codex/hooks.json"),
         CodexHook,
@@ -343,6 +419,7 @@ fn home_dir() -> anyhow::Result<PathBuf> {
 fn install_skill(
     path: &Path,
     expected: &str,
+    canonical_alternates: &[String],
     force: bool,
     dry_run: bool,
     summary: &mut Vec<String>,
@@ -350,6 +427,16 @@ fn install_skill(
     match std::fs::read_to_string(path) {
         Ok(existing) if existing == expected => {
             summary.push(format!("  ok    {}", path.display()));
+        }
+        // A file exactly matching another clank-generated canonical
+        // variant is OURS in a different mode — migrate freely.
+        // Genuinely modified content still refuses below.
+        Ok(existing) if canonical_alternates.contains(&existing) => {
+            if !dry_run {
+                std::fs::write(path, expected)
+                    .with_context(|| format!("writing `{}`", path.display()))?;
+            }
+            summary.push(format!("  mode  {}", path.display()));
         }
         Ok(_) if force => {
             if !dry_run {
@@ -548,6 +635,11 @@ struct StopHookEntry<'a> {
     timeout: u64,
     #[serde(rename = "statusMessage", skip_serializing_if = "Option::is_none")]
     status_message: Option<&'a str>,
+    /// claude-asyncrewake-work-loop: the async park entry. Absent
+    /// (not `false`) for every legacy/other-tool entry so their JSON
+    /// is byte-stable.
+    #[serde(rename = "asyncRewake", skip_serializing_if = "std::ops::Not::not")]
+    async_rewake: bool,
 }
 
 #[derive(serde::Serialize)]
@@ -566,17 +658,104 @@ trait HookKind {
     fn status_message(&self) -> Option<&'static str> {
         None
     }
+    /// Which hook event array the entry merges into.
+    fn event(&self) -> &'static str {
+        "Stop"
+    }
+    /// The stable ownership marker for THIS entry kind.
+    fn id(&self) -> &'static str {
+        HOOK_ID
+    }
+    /// claude-asyncrewake-work-loop: park-mode entry.
+    fn async_rewake(&self) -> bool {
+        false
+    }
+    fn timeout(&self) -> u64 {
+        HOOK_TIMEOUT_SECS
+    }
 }
 
-struct ClaudeHook;
+/// The claude Stop entry. The delivery mode is ONE durable
+/// setup-time decision (claude-asyncrewake-work-loop): the command
+/// carries `--loop asyncrewake` iff the installed Claude Code can
+/// honor `asyncRewake`, and the hook obeys its own argv — the
+/// static entry and the runtime behavior cannot drift.
+struct ClaudeHook {
+    async_mode: bool,
+}
 impl HookKind for ClaudeHook {
     fn command(&self) -> &'static str {
-        "clank stop-hook --tool claude"
+        if self.async_mode {
+            "clank stop-hook --tool claude --loop asyncrewake"
+        } else {
+            "clank stop-hook --tool claude"
+        }
     }
     fn tool_name(&self) -> &'static str {
         "claude"
     }
-    // Claude doesn't show statusMessage; skip.
+    fn status_message(&self) -> Option<&'static str> {
+        // Visible while the park holds (asyncRewake mode only —
+        // legacy claude doesn't show statusMessage).
+        self.async_mode.then_some("Clank: watching for work")
+    }
+    fn async_rewake(&self) -> bool {
+        self.async_mode
+    }
+}
+
+/// SessionStart companion (async mode only): mints the wait
+/// generation and delivers catch-up context. Fast — it must never
+/// hold a session start hostage.
+struct SessionStartHook;
+impl HookKind for SessionStartHook {
+    fn command(&self) -> &'static str {
+        "clank stop-hook --tool claude --session-start"
+    }
+    fn tool_name(&self) -> &'static str {
+        "claude"
+    }
+    fn event(&self) -> &'static str {
+        "SessionStart"
+    }
+    fn id(&self) -> &'static str {
+        SESSION_START_HOOK_ID
+    }
+    fn timeout(&self) -> u64 {
+        15
+    }
+}
+
+/// Stable marker for the SessionStart companion entry.
+pub(crate) const SESSION_START_HOOK_ID: &str = "clank-session-start";
+
+/// Pure capability gate: 2.1.223 is the M0-verified floor for
+/// `asyncRewake`. Parses the leading x.y.z of `claude --version`.
+pub(crate) fn claude_asyncrewake_capable(version_output: &str) -> bool {
+    let mut nums = version_output
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .split('.')
+        .map(|p| p.parse::<u64>().unwrap_or(0));
+    let v = (
+        nums.next().unwrap_or(0),
+        nums.next().unwrap_or(0),
+        nums.next().unwrap_or(0),
+    );
+    v >= (2, 1, 223)
+}
+
+/// Probe the installed Claude Code. `None` = no binary / unreadable
+/// version — setup stays on the legacy loop (conservative).
+pub(crate) fn probe_claude_asyncrewake() -> Option<bool> {
+    let out = std::process::Command::new("claude")
+        .arg("--version")
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| claude_asyncrewake_capable(&String::from_utf8_lossy(&out.stdout)))
 }
 
 struct CodexHook;
@@ -621,30 +800,33 @@ fn merge_hook_into_settings(
     let hooks = hooks
         .as_object_mut()
         .ok_or_else(|| anyhow::anyhow!("`hooks` is not a JSON object"))?;
+    let event = kind.event();
     let stop = hooks
-        .entry("Stop".to_string())
+        .entry(event.to_string())
         .or_insert_with(|| serde_json::Value::Array(Vec::new()));
     let stop = stop
         .as_array_mut()
-        .ok_or_else(|| anyhow::anyhow!("`hooks.Stop` is not a JSON array"))?;
+        .ok_or_else(|| anyhow::anyhow!("`hooks.{event}` is not a JSON array"))?;
 
     // Remove any prior clank entries — keyed on the stable
     // `id` marker first, falling back to the legacy
     // command-prefix match for entries written before HOOK_ID
     // shipped (dogfood-era).
     let before = stop.len();
-    stop.retain(|wrapper| !wrapper_is_clank(wrapper));
+    let own_id = kind.id();
+    stop.retain(|wrapper| !wrapper_is_clank_id(wrapper, own_id));
     let removed = before - stop.len();
 
     // Add our fresh entry, tagged with HOOK_ID so future re-runs
     // (with whatever command shape we evolve to) can still find
     // and replace it.
     let entry = StopHookEntry {
-        id: HOOK_ID,
+        id: own_id,
         kind: "command",
         command: kind.command(),
-        timeout: HOOK_TIMEOUT_SECS,
+        timeout: kind.timeout(),
         status_message: kind.status_message(),
+        async_rewake: kind.async_rewake(),
     };
     stop.push(serde_json::to_value(StopHookWrapper { hooks: [entry] })?);
 
@@ -660,28 +842,78 @@ fn merge_hook_into_settings(
 
     let action = if removed > 0 { "merge" } else { "add  " };
     summary.push(format!(
-        "  {action} {path} ({tool} Stop hook)",
+        "  {action} {path} ({tool} {event} hook)",
         path = path.display(),
         tool = kind.tool_name(),
     ));
     Ok(())
 }
 
+/// Remove a clank-owned hook entry (mode downgrades: the
+/// SessionStart companion leaves with the async mode). No-op when
+/// absent.
+fn remove_hook_entry(
+    path: &Path,
+    event: &str,
+    id: &str,
+    dry_run: bool,
+    summary: &mut Vec<String>,
+) -> anyhow::Result<()> {
+    let mut value: serde_json::Value = match std::fs::read_to_string(path) {
+        Ok(s) => serde_json::from_str(&s)
+            .with_context(|| format!("parsing `{}` as JSON", path.display()))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    let Some(arr) = value
+        .get_mut("hooks")
+        .and_then(|h| h.get_mut(event))
+        .and_then(|v| v.as_array_mut())
+    else {
+        return Ok(());
+    };
+    let before = arr.len();
+    arr.retain(|wrapper| !wrapper_is_clank_id(wrapper, id));
+    if arr.len() == before {
+        return Ok(());
+    }
+    if !dry_run {
+        std::fs::write(
+            path,
+            format!(
+                "{}
+",
+                serde_json::to_string_pretty(&value)?
+            ),
+        )
+        .with_context(|| format!("writing `{}`", path.display()))?;
+    }
+    summary.push(format!("  drop  {} (stale {event} hook)", path.display()));
+    Ok(())
+}
+
+/// Test-facing shorthand for the original Stop-entry ownership test.
+#[cfg(test)]
 fn wrapper_is_clank(wrapper: &serde_json::Value) -> bool {
+    wrapper_is_clank_id(wrapper, HOOK_ID)
+}
+
+/// Ownership test for one entry KIND: the stable `id` marker; the
+/// legacy command-prefix fallback applies only to the original Stop
+/// entry (pre-id dogfood installs never wrote other kinds).
+fn wrapper_is_clank_id(wrapper: &serde_json::Value, own_id: &str) -> bool {
     let Some(inner) = wrapper.get("hooks").and_then(|h| h.as_array()) else {
         return false;
     };
     inner.iter().any(|h| {
-        // Primary: the stable id marker.
         let id_match = h
             .get("id")
             .and_then(|v| v.as_str())
-            .is_some_and(|id| id == HOOK_ID);
-        // Legacy: pre-id-marker dogfood entries.
-        let cmd_match = h
-            .get("command")
-            .and_then(|c| c.as_str())
-            .is_some_and(|cmd| cmd.starts_with(LEGACY_COMMAND_PREFIX));
+            .is_some_and(|id| id == own_id);
+        let cmd_match = own_id == HOOK_ID
+            && h.get("command")
+                .and_then(|c| c.as_str())
+                .is_some_and(|cmd| cmd.starts_with(LEGACY_COMMAND_PREFIX));
         id_match || cmd_match
     })
 }
@@ -928,6 +1160,18 @@ mod tests {
         assert!(mo.contains("NEVER run `clank wait` yourself"));
         assert!(!mo.contains("Keep a `clank wait` armed"));
         assert!(!mo.contains("run_in_background"));
+        // claude under asyncrewake flips to the same work-finds-you
+        // model (claude-asyncrewake-work-loop); legacy compose is
+        // byte-stable arm-the-wait.
+        let ma = compose_skill_with(Role::Master, Tool::Claude, true);
+        assert!(ma.contains("Work arrives on its own"));
+        assert!(ma.contains("NEVER run `clank wait` yourself"));
+        assert!(!ma.contains("Keep a `clank wait` armed"));
+        assert_eq!(
+            compose_skill_with(Role::Master, Tool::Claude, false),
+            compose_skill(Role::Master, Tool::Claude),
+            "legacy unchanged"
+        );
     }
 
     #[test]
@@ -989,7 +1233,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("a/b/SKILL.md");
         let mut summary = Vec::new();
-        install_skill(&path, "hello", false, false, &mut summary).unwrap();
+        install_skill(&path, "hello", &[], false, false, &mut summary).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello");
         assert!(summary[0].contains("write"));
     }
@@ -1000,7 +1244,7 @@ mod tests {
         let path = dir.path().join("SKILL.md");
         write_file(&path, "hello");
         let mut summary = Vec::new();
-        install_skill(&path, "hello", false, false, &mut summary).unwrap();
+        install_skill(&path, "hello", &[], false, false, &mut summary).unwrap();
         assert!(summary[0].contains("ok"));
     }
 
@@ -1010,7 +1254,7 @@ mod tests {
         let path = dir.path().join("SKILL.md");
         write_file(&path, "edited by user\n");
         let mut summary = Vec::new();
-        let err = install_skill(&path, "hello", false, false, &mut summary).unwrap_err();
+        let err = install_skill(&path, "hello", &[], false, false, &mut summary).unwrap_err();
         assert!(err.to_string().contains("--force"), "unexpected: {err}");
         // File preserved.
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "edited by user\n");
@@ -1022,7 +1266,7 @@ mod tests {
         let path = dir.path().join("SKILL.md");
         write_file(&path, "edited by user\n");
         let mut summary = Vec::new();
-        install_skill(&path, "hello", true, false, &mut summary).unwrap();
+        install_skill(&path, "hello", &[], true, false, &mut summary).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello");
         assert!(summary[0].contains("force"));
     }
@@ -1032,7 +1276,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("SKILL.md");
         let mut summary = Vec::new();
-        install_skill(&path, "hello", false, true, &mut summary).unwrap();
+        install_skill(&path, "hello", &[], false, true, &mut summary).unwrap();
         assert!(!path.exists());
         assert!(summary[0].contains("write")); // reports the intent
     }
@@ -1068,7 +1312,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(".claude/settings.json");
         let mut summary = Vec::new();
-        merge_hook_into_settings(&path, ClaudeHook, false, &mut summary).unwrap();
+        merge_hook_into_settings(&path, ClaudeHook { async_mode: false }, false, &mut summary)
+            .unwrap();
         let body = std::fs::read_to_string(&path).unwrap();
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         let stop = &v["hooks"]["Stop"];
@@ -1111,7 +1356,8 @@ mod tests {
             ),
         );
         let mut summary = Vec::new();
-        merge_hook_into_settings(&path, ClaudeHook, false, &mut summary).unwrap();
+        merge_hook_into_settings(&path, ClaudeHook { async_mode: false }, false, &mut summary)
+            .unwrap();
         let v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         let stop = v["hooks"]["Stop"].as_array().unwrap();
@@ -1163,7 +1409,8 @@ mod tests {
             }"#,
         );
         let mut summary = Vec::new();
-        merge_hook_into_settings(&path, ClaudeHook, false, &mut summary).unwrap();
+        merge_hook_into_settings(&path, ClaudeHook { async_mode: false }, false, &mut summary)
+            .unwrap();
         let v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         let stop = v["hooks"]["Stop"].as_array().unwrap();
@@ -1181,8 +1428,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(".claude/settings.json");
         let mut summary = Vec::new();
-        merge_hook_into_settings(&path, ClaudeHook, false, &mut summary).unwrap();
-        merge_hook_into_settings(&path, ClaudeHook, false, &mut summary).unwrap();
+        merge_hook_into_settings(&path, ClaudeHook { async_mode: false }, false, &mut summary)
+            .unwrap();
+        merge_hook_into_settings(&path, ClaudeHook { async_mode: false }, false, &mut summary)
+            .unwrap();
         let v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         let stop = v["hooks"]["Stop"].as_array().unwrap();
@@ -1194,8 +1443,144 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(".claude/settings.json");
         let mut summary = Vec::new();
-        merge_hook_into_settings(&path, ClaudeHook, true, &mut summary).unwrap();
+        merge_hook_into_settings(&path, ClaudeHook { async_mode: false }, true, &mut summary)
+            .unwrap();
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn mode_flip_migrates_canonical_claude_skills_without_force() {
+        // codex 1483318: doctor tells the user plain `clank setup`
+        // fixes mode drift, so it must actually run — a file exactly
+        // equal to the OTHER mode's canonical variant is ours to
+        // migrate; genuinely edited content still refuses.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("SKILL.md");
+        let legacy = compose_skill_with(Role::Master, Tool::Claude, false);
+        let asyncv = compose_skill_with(Role::Master, Tool::Claude, true);
+        let mut summary = Vec::new();
+
+        // legacy → async.
+        std::fs::write(&path, &legacy).unwrap();
+        install_skill(
+            &path,
+            &asyncv,
+            &[legacy.clone()],
+            false,
+            false,
+            &mut summary,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), asyncv);
+        assert!(summary.last().unwrap().contains("mode"), "{summary:?}");
+
+        // async → legacy (the downgrade).
+        install_skill(
+            &path,
+            &legacy,
+            &[asyncv.clone()],
+            false,
+            false,
+            &mut summary,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), legacy);
+
+        // A user edit is NOT a canonical alternate — still refused
+        // without --force.
+        std::fs::write(&path, format!("{legacy}\n# my local note\n")).unwrap();
+        let err = install_skill(
+            &path,
+            &asyncv,
+            &[legacy.clone()],
+            false,
+            false,
+            &mut summary,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("--force"), "{err}");
+
+        // Dry-run migration reports but writes nothing.
+        std::fs::write(&path, &legacy).unwrap();
+        install_skill(&path, &asyncv, &[legacy.clone()], false, true, &mut summary).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), legacy);
+    }
+
+    #[test]
+    fn bind_fails_when_generation_cannot_persist() {
+        // codex 1483318: an ownership claim that cannot persist its
+        // revocation must FAIL — wait.gen as a DIRECTORY makes the
+        // write deterministically impossible.
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_dir = tmp.path();
+        std::fs::create_dir_all(agent_dir.join("wait.gen")).unwrap();
+        let err = crate::agent_store::mint_wait_generation(agent_dir).unwrap_err();
+        assert!(err.to_string().contains("wait.gen"), "{err}");
+    }
+
+    #[test]
+    fn asyncrewake_capability_floor_is_2_1_223() {
+        assert!(claude_asyncrewake_capable("2.1.223 (Claude Code)"));
+        assert!(claude_asyncrewake_capable("2.1.230 (Claude Code)"));
+        assert!(claude_asyncrewake_capable("3.0.0 (Claude Code)"));
+        assert!(!claude_asyncrewake_capable("2.1.222 (Claude Code)"));
+        assert!(!claude_asyncrewake_capable("1.9.999"));
+        assert!(!claude_asyncrewake_capable("garbage"));
+        assert!(!claude_asyncrewake_capable(""));
+    }
+
+    #[test]
+    fn claude_mode_writes_matching_entries_and_downgrade_sheds_companion() {
+        // The durable-mode contract (claude-asyncrewake-work-loop):
+        // async installs the --loop argv + asyncRewake field + the
+        // SessionStart companion; legacy installs neither, and a
+        // downgrade REMOVES a previously installed companion.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.json");
+        let mut summary = Vec::new();
+
+        merge_hook_into_settings(&path, ClaudeHook { async_mode: true }, false, &mut summary)
+            .unwrap();
+        merge_hook_into_settings(&path, SessionStartHook, false, &mut summary).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let stop = &v["hooks"]["Stop"][0]["hooks"][0];
+        assert_eq!(
+            stop["command"],
+            "clank stop-hook --tool claude --loop asyncrewake"
+        );
+        assert_eq!(stop["asyncRewake"], true);
+        assert_eq!(stop["statusMessage"], "Clank: watching for work");
+        let ss = &v["hooks"]["SessionStart"][0]["hooks"][0];
+        assert_eq!(
+            ss["command"],
+            "clank stop-hook --tool claude --session-start"
+        );
+        assert_eq!(ss["id"], SESSION_START_HOOK_ID);
+
+        // Downgrade: legacy entry replaces in place; the companion
+        // is dropped; asyncRewake is ABSENT (not false).
+        merge_hook_into_settings(&path, ClaudeHook { async_mode: false }, false, &mut summary)
+            .unwrap();
+        remove_hook_entry(
+            &path,
+            "SessionStart",
+            SESSION_START_HOOK_ID,
+            false,
+            &mut summary,
+        )
+        .unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let stop = &v["hooks"]["Stop"][0]["hooks"][0];
+        assert_eq!(stop["command"], "clank stop-hook --tool claude");
+        assert!(stop.get("asyncRewake").is_none(), "absent, not false");
+        assert!(
+            v["hooks"]["SessionStart"]
+                .as_array()
+                .is_none_or(|a| a.is_empty()),
+            "companion shed on downgrade"
+        );
     }
 
     #[test]
@@ -1254,7 +1639,7 @@ mod tests {
         // Doctor verifies exactly this inventory; a skill added to
         // setup but missing here (or vice versa) is structurally
         // impossible — this test just pins the expected shape.
-        let inv = user_asset_inventory();
+        let inv = user_asset_inventory(false);
         for (_, dir) in TOOL_SKILL_DIRS {
             for skill in [
                 "clank-master",
@@ -1263,12 +1648,13 @@ mod tests {
                 "clank-github",
             ] {
                 let rel = format!("{dir}/skills/{skill}/SKILL.md");
-                assert!(inv.iter().any(|(r, _)| r == &rel), "missing {rel}");
+                assert!(inv.iter().any(|a| a.rel == rel), "missing {rel}");
             }
         }
         assert!(
             inv.iter()
-                .any(|(r, c)| r == ".config/opencode/plugin/clank.js" && c == OPENCODE_PLUGIN)
+                .any(|a| a.rel == ".config/opencode/plugin/clank.js"
+                    && a.expected == OPENCODE_PLUGIN)
         );
         assert_eq!(inv.len(), TOOL_SKILL_DIRS.len() * 4 + 1);
     }

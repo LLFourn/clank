@@ -436,6 +436,34 @@ pub struct BindOutcome {
 /// on stale-clear leaves a ghost binding rather than no
 /// binding), then clear stale. Preserves auto_mode and
 /// wait_timeout on the target's existing config.
+/// The agent's current wait GENERATION
+/// (claude-asyncrewake-work-loop): `wait.gen` beside the skeleton;
+/// absent or unparseable reads 0. Minted (bumped) by every claim of
+/// the label — a session BINDING and a SessionStart — so a waiter
+/// surviving a dead incarnation is revoked the moment a successor
+/// exists.
+pub(crate) fn read_wait_generation(agent_dir: &Path) -> u64 {
+    std::fs::read_to_string(agent_dir.join("wait.gen"))
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// Bump the generation. FALLIBLE — the caller owns the policy: a
+/// session BINDING must propagate (an ownership claim that cannot
+/// persist its revocation would leave a dead predecessor's waiter
+/// holding the lease forever — codex 1483318), while SessionStart
+/// explicitly discards to stay fail-open.
+pub(crate) fn mint_wait_generation(agent_dir: &Path) -> anyhow::Result<u64> {
+    let next = read_wait_generation(agent_dir).wrapping_add(1);
+    std::fs::create_dir_all(agent_dir)
+        .with_context(|| format!("creating `{}`", agent_dir.display()))?;
+    let gen_path = agent_dir.join("wait.gen");
+    std::fs::write(&gen_path, format!("{next}\n"))
+        .with_context(|| format!("writing `{}`", gen_path.display()))?;
+    Ok(next)
+}
+
 pub fn bind_session_to_agent(
     repo: &Path,
     label: &AgentLabel,
@@ -464,6 +492,15 @@ pub fn bind_session_to_agent(
         tool,
         updated_at: now,
     });
+    // A binding is an ownership CLAIM on the label: mint the wait
+    // generation FIRST, so a completed claim can never exist without
+    // its revocation persisted (codex 1483318) — any waiter
+    // surviving a dead predecessor self-revokes (its wake pipe is
+    // dead, M0). SessionStart minting alone cannot cover the
+    // FRESH-session case: it fires before the session is bound
+    // (observed live, M2 e2e).
+    mint_wait_generation(&agents_root(repo).join(label.as_str()))
+        .context("persisting the wait-generation ownership claim")?;
     save_agent_config(repo, label, &cfg)?;
 
     let mut cleared_from: Vec<AgentLabel> = Vec::new();

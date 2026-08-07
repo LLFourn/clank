@@ -36,18 +36,35 @@ use clank_core::{
 };
 
 pub async fn run(args: StopHookArgs) -> anyhow::Result<()> {
+    if args.session_start {
+        return run_session_start(args).await;
+    }
     let tool: Tool = args.tool.into();
+    let async_loop =
+        tool == Tool::Claude && args.loop_mode == Some(crate::cli::LoopModeArg::Asyncrewake);
     let outcome = match read_hook_stdin() {
-        Ok(input) => compute_outcome(tool, args.repo.as_deref(), input).await,
+        Ok(input) => compute_outcome_with(tool, args.repo.as_deref(), input, async_loop).await,
         Err(e) => HookOutcome::Diagnostic { message: e },
     };
     emit_and_exit(outcome, tool);
 }
 
+/// Test-facing wrapper: production routes through
+/// [`compute_outcome_with`] carrying the argv-selected loop mode.
+#[cfg(test)]
 async fn compute_outcome(
     tool: Tool,
     repo_override: Option<&Path>,
     input: HookInput,
+) -> HookOutcome {
+    compute_outcome_with(tool, repo_override, input, false).await
+}
+
+async fn compute_outcome_with(
+    tool: Tool,
+    repo_override: Option<&Path>,
+    input: HookInput,
+    async_loop: bool,
 ) -> HookOutcome {
     // Decide how the agent's in-flight background work affects this
     // turn-end, BEFORE any clank resolution (`background_disposition` is a
@@ -120,6 +137,15 @@ async fn compute_outcome(
             //    EITHER the process finishing OR review work wakes it. Safe
             //    from looping: with no work the wait blocks and persists, and
             //    the next Stop sees it (`YieldArmed`).
+            // In the asyncrewake loop the PARK is the watcher: a live
+            // background process coexists with the parked wait (its
+            // completion wakes via the task notification; work wakes
+            // via exit 2) — nudging the agent to arm a background
+            // wait would reintroduce the tracked-task loop this mode
+            // exists to delete (claude-asyncrewake-work-loop).
+            BgDisposition::NeedsWorkCheck if async_loop => {
+                return asyncrewake_park(&repo, &label, role, cfg.as_ref()).await;
+            }
             BgDisposition::NeedsWorkCheck => match peek_has_work(&repo, &label, role).await {
                 Ok(true) => HookOutcome::Silent {
                     why: SilentReason::BusyOwnWork,
@@ -134,6 +160,9 @@ async fn compute_outcome(
                 },
             },
             // NoBackgroundWork (YieldArmed already returned above): genuinely idle.
+            _ if async_loop => {
+                return asyncrewake_park(&repo, &label, role, cfg.as_ref()).await;
+            }
             _ => match loop_policy(tool) {
                 // Claude never waits in-hook and never renders work items —
                 // the hook's only continuation is the arm-the-wait hint, and
@@ -187,11 +216,244 @@ fn loop_policy(tool: Tool) -> LoopPolicy {
     }
 }
 
+/// SessionStart (claude-asyncrewake-work-loop): every incarnation
+/// MINTS a new wait generation — revoking any waiter surviving from
+/// a previous incarnation (whose wake pipe is dead, M0) — then
+/// surfaces pending work via `additionalContext` so a resumed
+/// session catches up immediately instead of waiting for its first
+/// turn-end park. Fail-open EVERYWHERE: a session start must never
+/// be broken by clank state, so every error path exits 0 quietly.
+async fn run_session_start(args: StopHookArgs) -> anyhow::Result<()> {
+    #[derive(serde::Deserialize)]
+    struct SessionStartInput {
+        session_id: String,
+        cwd: String,
+    }
+    let mut raw = String::new();
+    use std::io::Read as _;
+    if std::io::stdin().read_to_string(&mut raw).is_err() {
+        return Ok(());
+    }
+    let Ok(input) = serde_json::from_str::<SessionStartInput>(&raw) else {
+        return Ok(());
+    };
+    let Ok(repo) = crate::cli::resolve_repo(Some(Path::new(&input.cwd))) else {
+        return Ok(());
+    };
+    let tool: Tool = args.tool.into();
+    let Ok(sid) = clank_core::ids::SessionId::parse(&input.session_id) else {
+        return Ok(());
+    };
+    let Ok(label) = resolve_identity_for_hook(&repo, tool, &sid) else {
+        return Ok(());
+    };
+
+    // Mint FIRST — stale-waiter revocation must not depend on the
+    // peek working (or on auto being on).
+    let agent_dir = crate::agent_store::agents_root(&repo).join(label.as_str());
+    // Fail-open by POLICY: a session start is never broken by clank
+    // state, so the mint error is explicitly discarded here (the
+    // bind-time mint is the one that must not fail silently).
+    let _ = crate::agent_store::mint_wait_generation(&agent_dir);
+
+    let cfg = load_agent_config(&repo, &label).ok().flatten();
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    if crate::cli::team::resolve_effective_auto_mode(cfg.as_ref(), home.as_deref()) == AutoMode::Off
+    {
+        return Ok(());
+    }
+    let role = crate::agent_store::resolve_role(&repo, &label)
+        .unwrap_or_else(|_| clank_core::vocab::Role::default());
+    let Ok(items) = peek_items(&repo, &label, role).await else {
+        return Ok(());
+    };
+    if items.is_empty() {
+        return Ok(());
+    }
+    println!(
+        "{}",
+        session_start_payload(&render_wait_items(&items, &label, role))
+    );
+    Ok(())
+}
+
+/// The SessionStart hook-output wire (claude-asyncrewake-work-loop):
+/// pending work rides `additionalContext`. Pure — the catch-up seam
+/// the acceptance pins.
+fn session_start_payload(items_text: &str) -> serde_json::Value {
+    serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "SessionStart",
+            "additionalContext": format!(
+                "Pending clank work found at session start.\n{items_text}"
+            ),
+        }
+    })
+}
+
+// ── asyncrewake ownership + park (claude-asyncrewake-work-loop) ──
+// One waiter per session, owned GENERATIONALLY: the wake transport
+// is the hook's stderr pipe to its own claude process (M0), so a
+// waiter surviving its session can never wake the resumed
+// incarnation — a newer generation takes the park over and the
+// stale waiter suppresses itself.
+
+/// What a new asyncrewake hook does given the park-lease state.
+#[derive(Debug, PartialEq, Eq)]
+enum ParkDecision {
+    /// Lease free — park.
+    Park,
+    /// A live waiter of THIS generation holds the park — exit quiet.
+    DeferToLiveWaiter,
+    /// The holder's generation is stale — it self-releases on its
+    /// next generation check; retry the lease briefly.
+    AwaitStaleHandoff,
+}
+
+fn park_decision(lease_free: bool, holder_gen: Option<u64>, current_gen: u64) -> ParkDecision {
+    if lease_free {
+        ParkDecision::Park
+    } else if holder_gen == Some(current_gen) {
+        ParkDecision::DeferToLiveWaiter
+    } else {
+        ParkDecision::AwaitStaleHandoff
+    }
+}
+
+/// See [`crate::agent_store::read_wait_generation`] — minted by
+/// session BINDING and SessionStart alike.
+fn read_generation(agent_dir: &Path) -> u64 {
+    crate::agent_store::read_wait_generation(agent_dir)
+}
+
+fn read_holder_gen(agent_dir: &Path) -> Option<u64> {
+    std::fs::read_to_string(agent_dir.join("wait.holder"))
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+}
+
+/// flock RAII over `wait.lock` — exclusive, non-blocking. Same
+/// mechanism as the event-WAL leases.
+struct WaitLease {
+    _file: std::fs::File,
+}
+
+fn try_wait_lease(agent_dir: &Path) -> std::io::Result<Option<WaitLease>> {
+    use std::os::fd::AsRawFd;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(agent_dir.join("wait.lock"))?;
+    // SAFETY: valid owned fd; flock has no memory effects.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc == 0 {
+        Ok(Some(WaitLease { _file: file }))
+    } else {
+        let e = std::io::Error::last_os_error();
+        if e.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            Ok(None)
+        } else {
+            Err(e)
+        }
+    }
+}
+
+/// Resolves when the generation file no longer reads `own_gen`.
+async fn generation_changed(agent_dir: &Path, own_gen: u64) {
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        if read_generation(agent_dir) != own_gen {
+            return;
+        }
+    }
+}
+
+/// Park the SHARED long-poll under this session's generational
+/// lease. Work → Continue (claude's exit-2 + stderr wire IS the
+/// asyncRewake wake); no work → Silent (empty-is-quiescent is
+/// load-bearing — M0's unconditional-exit-2 probe looped forever).
+async fn asyncrewake_park(
+    repo: &Path,
+    label: &AgentLabel,
+    role: Role,
+    cfg: Option<&clank_core::agent_config::AgentConfig>,
+) -> HookOutcome {
+    let agent_dir = crate::agent_store::agents_root(repo).join(label.as_str());
+    if let Err(e) = std::fs::create_dir_all(&agent_dir) {
+        return HookOutcome::Diagnostic {
+            message: format!("hook: creating `{}`: {e}", agent_dir.display()),
+        };
+    }
+    let my_gen = read_generation(&agent_dir);
+
+    // Take the park, deferring to a live waiter and briefly awaiting
+    // a stale one's self-release (it checks its generation every 2s).
+    let mut tries = 0u32;
+    let lease = loop {
+        match try_wait_lease(&agent_dir) {
+            Ok(Some(lease)) => break lease,
+            Ok(None) => match park_decision(false, read_holder_gen(&agent_dir), my_gen) {
+                ParkDecision::DeferToLiveWaiter => {
+                    return HookOutcome::Silent {
+                        why: SilentReason::WaiterAlreadyParked,
+                    };
+                }
+                ParkDecision::AwaitStaleHandoff => {
+                    tries += 1;
+                    if tries > 60 {
+                        return HookOutcome::Diagnostic {
+                            message: "hook: stale waiter did not hand off the park".to_string(),
+                        };
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
+                ParkDecision::Park => unreachable!("lease reported held"),
+            },
+            Err(e) => {
+                return HookOutcome::Diagnostic {
+                    message: format!("hook: wait lease: {e}"),
+                };
+            }
+        }
+    };
+    if let Err(e) = std::fs::write(agent_dir.join("wait.holder"), format!("{my_gen}\n")) {
+        return HookOutcome::Diagnostic {
+            message: format!("hook: recording park holder: {e}"),
+        };
+    }
+
+    let wait_timeout = cfg.and_then(|c| c.wait_timeout.clone());
+    let outcome = tokio::select! {
+        o = compute_wait_outcome(repo, label, role, wait_timeout.as_deref()) => o,
+        // A newer incarnation took over: release (the select drops
+        // the wait child via kill_on_drop) and suppress.
+        () = generation_changed(&agent_dir, my_gen) => {
+            return HookOutcome::Silent {
+                why: SilentReason::StaleGeneration,
+            };
+        }
+    };
+    // Wake guard: never emit for a dead incarnation.
+    if read_generation(&agent_dir) != my_gen {
+        return HookOutcome::Silent {
+            why: SilentReason::StaleGeneration,
+        };
+    }
+    drop(lease);
+    outcome
+}
+
 /// Non-blocking peek: does `label` have actionable clank work right now?
 /// Self-spawns `clank wait --peek --json` (side-effect-free: fires no
 /// hooks) and CAPTURES its stdout — never inherits it — so the peek's JSON
 /// envelope can't corrupt the hook's own protocol stdout (ruthless c042912).
 async fn peek_has_work(repo: &Path, label: &AgentLabel, role: Role) -> Result<bool, String> {
+    peek_items(repo, label, role).await.map(|i| !i.is_empty())
+}
+
+/// The peek's ITEMS — shared by the work-check and SessionStart's
+/// catch-up context (claude-asyncrewake-work-loop).
+async fn peek_items(repo: &Path, label: &AgentLabel, role: Role) -> Result<Vec<WaitItem>, String> {
     use tokio::process::Command;
 
     let exe = std::env::current_exe().map_err(|e| format!("current_exe failed: {e}"))?;
@@ -218,9 +480,9 @@ async fn peek_has_work(repo: &Path, label: &AgentLabel, role: Role) -> Result<bo
         .map_err(|e| format!("spawning peek failed: {e}"))?;
 
     match output.status.code() {
-        Some(0) => parse_wait_json(&output.stdout)
-            .map(|items| !items.is_empty())
-            .map_err(|e| format!("peek stdout malformed: {e}")),
+        Some(0) => {
+            parse_wait_json(&output.stdout).map_err(|e| format!("peek stdout malformed: {e}"))
+        }
         other => Err(format!(
             "peek exited {} stderr={}",
             other
@@ -699,6 +961,83 @@ mod tests {
         let sid = clank_core::ids::SessionId::parse(session).unwrap();
         crate::agent_store::bind_session_to_agent(repo, &label, tool, &sid).unwrap();
         label
+    }
+
+    #[test]
+    fn park_decision_matrix_and_generation_reads() {
+        // claude-asyncrewake-work-loop: takeover is deterministic —
+        // free parks, a live same-generation waiter defers, a stale
+        // holder is awaited (it self-releases on its 2s check), and
+        // the wake guard suppresses a stale emission.
+        assert_eq!(park_decision(true, None, 3), ParkDecision::Park);
+        assert_eq!(
+            park_decision(false, Some(3), 3),
+            ParkDecision::DeferToLiveWaiter
+        );
+        assert_eq!(
+            park_decision(false, Some(2), 3),
+            ParkDecision::AwaitStaleHandoff,
+            "older holder is stale"
+        );
+        assert_eq!(
+            park_decision(false, None, 3),
+            ParkDecision::AwaitStaleHandoff,
+            "unreadable holder is treated stale, not adopted"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        // Absent / garbage read as generation 0 (pre-generation
+        // installs keep working; SessionStart mints real ones).
+        assert_eq!(read_generation(dir.path()), 0);
+        std::fs::write(dir.path().join("wait.gen"), "not-a-number").unwrap();
+        assert_eq!(read_generation(dir.path()), 0);
+        std::fs::write(dir.path().join("wait.gen"), "7\n").unwrap();
+        assert_eq!(read_generation(dir.path()), 7);
+
+        // Binding mints (the fresh-session claim — SessionStart
+        // fires before the bind and cannot cover it, M2 e2e): a
+        // stale waiter of gen 7 is revoked by the successor's bind.
+        assert_eq!(
+            crate::agent_store::mint_wait_generation(dir.path()).unwrap(),
+            8
+        );
+        assert_eq!(read_generation(dir.path()), 8);
+
+        // The lease is exclusive within a process and frees on drop
+        // (same flock mechanism as the event WAL).
+        let a = try_wait_lease(dir.path()).unwrap();
+        assert!(a.is_some());
+        assert!(try_wait_lease(dir.path()).unwrap().is_none());
+        drop(a);
+        assert!(try_wait_lease(dir.path()).unwrap().is_some());
+    }
+
+    #[test]
+    fn session_start_payload_carries_items_as_additional_context() {
+        // The catch-up wire: a resumed session receives pending work
+        // through SessionStart's additionalContext, exactly shaped
+        // for claude's hookSpecificOutput schema.
+        let v = session_start_payload("Clank wait returned work for `x`.");
+        assert_eq!(v["hookSpecificOutput"]["hookEventName"], "SessionStart");
+        let ctx = v["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap();
+        assert!(ctx.starts_with("Pending clank work found at session start."));
+        assert!(ctx.contains("Clank wait returned work"), "{ctx}");
+    }
+
+    #[test]
+    fn asyncrewake_flag_gates_only_claude() {
+        // The mode is argv-keyed (one durable setup-time decision):
+        // --loop asyncrewake on claude selects the park; other tools
+        // ignore it (setup never writes it for them).
+        use crate::cli::LoopModeArg;
+        let on = |tool: Tool, lm: Option<LoopModeArg>| {
+            tool == Tool::Claude && lm == Some(LoopModeArg::Asyncrewake)
+        };
+        assert!(on(Tool::Claude, Some(LoopModeArg::Asyncrewake)));
+        assert!(!on(Tool::Claude, None));
+        assert!(!on(Tool::Codex, Some(LoopModeArg::Asyncrewake)));
     }
 
     #[tokio::test]

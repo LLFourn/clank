@@ -109,9 +109,16 @@ clank finish my-feature -m "<what changed>" -m "<why>"
 its loop differently — `clank setup`'s skills teach this, and
 auto-mode drives it:
 
-- **claude** — never waits inside its Stop hook. The hook nudges the
-  agent to keep a background `clank wait` armed; the wait's completion
-  wakes the session with the work items.
+- **claude** — with a Claude Code that supports `asyncRewake`
+  (2.1.223+), `clank setup` installs the ASYNC loop: the Stop hook
+  itself parks the long-poll (no armed background task at all — the
+  task manager can't reap what doesn't exist) and work WAKES the
+  session as a system reminder; a SessionStart companion mints the
+  waiter generation and delivers catch-up work after restarts. On
+  older installs the legacy loop remains: the hook nudges the agent
+  to keep a background `clank wait` armed and the wait's completion
+  wake carries the items. Setup decides ONCE per machine and
+  `clank doctor` flags drift.
 - **codex** — its Stop hook long-polls `clank wait` in-hook and blocks
   with the items (per-agent `wait_timeout` bounds the poll).
 - **grok** — has no active hooks; its skill (and the auto-on launch

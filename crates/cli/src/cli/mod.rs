@@ -988,6 +988,26 @@ pub struct StopHookArgs {
     /// hook stdin JSON (which IS the agent's cwd at stop time).
     #[arg(long, value_name = "PATH")]
     pub repo: Option<PathBuf>,
+    /// SessionStart handler (claude-asyncrewake-work-loop): mint a
+    /// new wait generation (revoking stale waiters) and surface any
+    /// pending work as additionalContext. Installed alongside the
+    /// asyncrewake Stop entry; never fails a session start.
+    #[arg(long)]
+    pub session_start: bool,
+    /// Delivery-loop mode, written into the installed entry by
+    /// `clank setup` (claude-asyncrewake-work-loop). The hook obeys
+    /// ITS OWN argv — never a runtime capability probe — so the
+    /// static hook entry and the behavior cannot drift.
+    #[arg(long = "loop", value_enum)]
+    pub loop_mode: Option<LoopModeArg>,
+}
+
+/// `--loop` value for the claude stop hook.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum LoopModeArg {
+    /// Park the shared long-poll inside an asyncRewake hook; work
+    /// wakes the session via exit 2 + stderr.
+    Asyncrewake,
 }
 
 /// `--tool` value. Mirrors [`clank_core::Tool`].

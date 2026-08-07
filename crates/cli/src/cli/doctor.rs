@@ -363,6 +363,76 @@ pub fn repo_checks(repo: &Path, home: Option<&Path>) -> Vec<CheckResult> {
 /// "ignored" is a Warn (means the root gitignore lacks a needed
 /// carve-out). The probed path doesn't need to exist on disk —
 /// git matches patterns, not files.
+/// Classify installed-vs-capable loop-mode drift
+/// (claude-asyncrewake-work-loop). Pure; `None` = healthy.
+pub(crate) fn claude_mode_drift(
+    installed_async: bool,
+    session_start_installed: bool,
+    capable: bool,
+) -> Option<String> {
+    match (installed_async, capable) {
+        (true, false) => Some(
+            "the installed claude Stop hook is asyncrewake but this Claude Code \
+             cannot honor asyncRewake — the park would run as a SYNCHRONOUS hook; \
+             run `clank setup`"
+                .to_string(),
+        ),
+        (false, true) => Some(
+            "this Claude Code supports asyncRewake but the installed Stop hook is \
+             the legacy background-arm loop; run `clank setup` to upgrade"
+                .to_string(),
+        ),
+        (true, true) if !session_start_installed => Some(
+            "asyncrewake Stop hook installed without its SessionStart companion \
+             (generation minting + catch-up); run `clank setup`"
+                .to_string(),
+        ),
+        _ => None,
+    }
+}
+
+/// The mode check against the LIVE settings + binary. `None` when
+/// the settings or the claude binary are absent (other checks cover
+/// those).
+fn check_claude_loop_mode(settings: &Path) -> Option<CheckResult> {
+    const SECTION: &str = "user";
+    let raw = std::fs::read_to_string(settings).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let entry_cmd = |event: &str, id: &str| -> Option<String> {
+        v.get("hooks")?
+            .get(event)?
+            .as_array()?
+            .iter()
+            .flat_map(|w| {
+                w.get("hooks")
+                    .and_then(|h| h.as_array())
+                    .into_iter()
+                    .flatten()
+            })
+            .find(|h| h.get("id").and_then(|i| i.as_str()) == Some(id))
+            .and_then(|h| h.get("command").and_then(|c| c.as_str()).map(String::from))
+    };
+    let stop_cmd = entry_cmd("Stop", "clank-stop-hook")?;
+    let installed_async = stop_cmd.contains("--loop asyncrewake");
+    let session_start_installed =
+        entry_cmd("SessionStart", crate::cli::setup::SESSION_START_HOOK_ID).is_some();
+    let capable = crate::cli::setup::probe_claude_asyncrewake()?;
+    Some(
+        match claude_mode_drift(installed_async, session_start_installed, capable) {
+            Some(msg) => CheckResult::warn(SECTION, "claude loop mode", msg),
+            None => CheckResult::ok(
+                SECTION,
+                "claude loop mode",
+                if installed_async {
+                    "asyncrewake (matches installed Claude Code)"
+                } else {
+                    "legacy background-arm (matches installed Claude Code)"
+                },
+            ),
+        },
+    )
+}
+
 /// The executable `clank agent start` will exec for a declaration:
 /// explicit `launch.command`, else the tool's bare name. Pure —
 /// the $PATH probe stays at the call site.
@@ -503,12 +573,27 @@ fn user_checks() -> Vec<CheckResult> {
     // includes the opencode plugin: a missing or drifted plugin means
     // opencode agents never bind and never receive work, silently
     // (the wire is exit-0/empty by design).
-    for (rel, expected) in crate::cli::setup::user_asset_inventory() {
-        out.push(check_skill_file(
-            &home.join(&rel),
-            &expected,
-            &format!("~/{rel}"),
-        ));
+    let claude_async = crate::cli::setup::probe_claude_asyncrewake() == Some(true);
+    for asset in crate::cli::setup::user_asset_inventory(claude_async) {
+        // Stale canonical mode reads differently from arbitrary
+        // drift: plain `clank setup` migrates it, no --force needed.
+        let path = home.join(&asset.rel);
+        let display = format!("~/{}", asset.rel);
+        if let Ok(existing) = std::fs::read_to_string(&path)
+            && existing != asset.expected
+            && asset.canonical_alternates.contains(&existing)
+        {
+            out.push(CheckResult::warn(
+                SECTION,
+                display.clone(),
+                format!(
+                    "{display} is the canonical skill from the OTHER claude loop \
+                     mode; run `clank setup` (no --force needed) to migrate"
+                ),
+            ));
+            continue;
+        }
+        out.push(check_skill_file(&path, &asset.expected, &display));
     }
     // The pre-split `clank` skill must be gone — left in place it
     // shadows the role skills with stale, role-jamming guidance.
@@ -524,6 +609,14 @@ fn user_checks() -> Vec<CheckResult> {
                 ),
             ));
         }
+    }
+    // claude-asyncrewake-work-loop: the installed entry's delivery
+    // mode is a durable setup-time decision — flag drift in BOTH
+    // directions (a stale async entry on a downgraded claude is a
+    // SYNCHRONOUS day-long hook; a legacy entry on a capable claude
+    // wastes the whole point).
+    if let Some(check) = check_claude_loop_mode(&home.join(".claude/settings.json")) {
+        out.push(check);
     }
     // Hook entries.
     out.push(check_hook_entry(
@@ -851,6 +944,20 @@ fn render(results: &[CheckResult], json: bool) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn claude_mode_drift_matrix() {
+        // Both drift directions warn; matched modes are healthy; a
+        // missing SessionStart companion under async is drift too.
+        assert!(super::claude_mode_drift(true, true, true).is_none());
+        assert!(super::claude_mode_drift(false, false, false).is_none());
+        let stale_async = super::claude_mode_drift(true, true, false).unwrap();
+        assert!(stale_async.contains("SYNCHRONOUS"), "{stale_async}");
+        let stale_legacy = super::claude_mode_drift(false, false, true).unwrap();
+        assert!(stale_legacy.contains("upgrade"), "{stale_legacy}");
+        let no_companion = super::claude_mode_drift(true, false, true).unwrap();
+        assert!(no_companion.contains("SessionStart"), "{no_companion}");
+    }
+
     #[test]
     fn effective_launch_program_prefers_command_then_tool_default() {
         // The $PATH probe checks THIS resolution — an opencode agent

@@ -346,6 +346,12 @@ pub enum SilentReason {
     /// The in-hook wait returned no items (codex-only branch — the
     /// claude hook never waits in-hook).
     NoWork,
+    /// A live same-generation waiter already holds this session's
+    /// park (claude-asyncrewake-work-loop); one waiter per session.
+    WaiterAlreadyParked,
+    /// This waiter's generation went stale (a newer session
+    /// incarnation took over); its wake is suppressed.
+    StaleGeneration,
     /// The in-hook wait timed out with no work (codex-only branch).
     WaitTimeout,
 }
