@@ -114,6 +114,10 @@ fn firings_from_items(items: &[WaitItem]) -> Vec<HookFiring> {
             WaitItem::Idle { .. }
             | WaitItem::AdHocReview { .. }
             | WaitItem::AdHocRevise { .. }
+            // Settle notices surface via the wait/stop-hook pull like
+            // the other ad-hoc items — HookFiring is plan-keyed and
+            // ad-hoc commits have no plan.
+            | WaitItem::AdHocSettled { .. }
             | WaitItem::PromoteFromQueue { .. }
             | WaitItem::Blocked { .. }
             | WaitItem::Unblocked { .. }
@@ -184,7 +188,21 @@ pub async fn run(args: WaitArgs) -> anyhow::Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("failed to fold repo `{}`: {e}", repo.display()))?;
 
-    let snapshot = StartupSnapshot::capture(&initial_state.fold);
+    // Derived BEFORE the snapshot so it can capture arm-time ad-hoc
+    // gate states (detect_adhoc_settled needs "pending at arm").
+    // A broken HEAD tag is a derived, dominating state
+    // (commit-tag-fixup-is-first-class-state): derive_status yields
+    // the correction and work_for routes master to the FixCommitTag
+    // item / withholds reviewer wakes — no bespoke side-check.
+    let initial_status = {
+        let reviews =
+            crate::fs_plan_state_lookup::FsPlanStateLookup::new(&repo, initial_state.head.as_ref());
+        let head = crate::git_io::head_commit_at(&repo, &initial_state);
+        initial_state
+            .fold
+            .derive_status(&reviews, &inputs.work_policy, head.as_ref())
+    };
+    let snapshot = StartupSnapshot::capture(&initial_state.fold, &initial_status.ad_hoc);
 
     let initial_suppress_all;
     let initial_block_items: Vec<WaitItem>;
@@ -202,21 +220,7 @@ pub async fn run(args: WaitArgs) -> anyhow::Result<()> {
         }
 
         if !br.suppress_all {
-            let reviews = crate::fs_plan_state_lookup::FsPlanStateLookup::new(
-                &repo,
-                initial_state.head.as_ref(),
-            );
-            // A broken HEAD tag is now a derived, dominating state
-            // (commit-tag-fixup-is-first-class-state): derive_status
-            // yields the correction and work_for routes master to the
-            // FixCommitTag item / withholds reviewer wakes — no bespoke
-            // side-check.
-            let head = crate::git_io::head_commit_at(&repo, &initial_state);
-            let status =
-                initial_state
-                    .fold
-                    .derive_status(&reviews, &inputs.work_policy, head.as_ref());
-            let mut items = status.work_for(&author, inputs.role);
+            let mut items = initial_status.work_for(&author, inputs.role);
             if !br.suppressed_plans.is_empty() {
                 items.retain(|item| match item {
                     WaitItem::Master { plan, .. } | WaitItem::Reviewer { plan, .. } => {
@@ -233,6 +237,15 @@ pub async fn run(args: WaitArgs) -> anyhow::Result<()> {
             // for nothing (`finish-does-not-wake-reviewers`).
             if inputs.role == Role::Master {
                 items.extend(detect_finished(&snapshot, &initial_state.fold));
+                // Ad-hoc settles are the same shape: a verdict
+                // notification only master acts on. Initial-pass
+                // emission is vacuous by construction (the snapshot
+                // was captured from THIS derive, so nothing has
+                // settled yet) but keeps the two sites symmetric.
+                items.extend(clank_core::wait::detect_adhoc_settled(
+                    &snapshot,
+                    &initial_status.ad_hoc,
+                ));
             }
             if !items.is_empty() {
                 // Co-surface pending Blocked entries alongside
@@ -429,9 +442,17 @@ pub async fn run(args: WaitArgs) -> anyhow::Result<()> {
                 }
                 // Master-only Finished notice (watch loop); see the
                 // initial-pass rationale above
-                // (`finish-does-not-wake-reviewers`).
+                // (`finish-does-not-wake-reviewers`). Ad-hoc settles
+                // ride the same master-only gate: a CONTINUE/FINISHED
+                // verdict on an ad-hoc commit routes work to no one,
+                // so without this the parked master never wakes
+                // (adhoc-continue-wake-investigation).
                 if inputs.role == Role::Master {
                     items.extend(detect_finished(&snapshot, &state.fold));
+                    items.extend(clank_core::wait::detect_adhoc_settled(
+                        &snapshot,
+                        &status.ad_hoc,
+                    ));
                 }
                 if !items.is_empty() {
                     // Co-surface pending Blocked entries (codex caught
@@ -1147,6 +1168,8 @@ enum WaitJsonItem<'a> {
     },
     #[serde(rename = "adhoc_revise")]
     AdHocRevise { sha: &'a str },
+    #[serde(rename = "adhoc_settled")]
+    AdHocSettled { sha: &'a str, gate: &'a str },
     #[serde(rename = "fix_commit_tag")]
     FixCommitTag {
         sha: &'a str,
@@ -1254,6 +1277,10 @@ fn render_json(item: &WaitItem) -> WaitJsonItem<'_> {
             feedback_path,
         },
         WaitItem::AdHocRevise { sha } => WaitJsonItem::AdHocRevise { sha: sha.as_str() },
+        WaitItem::AdHocSettled { sha, gate } => WaitJsonItem::AdHocSettled {
+            sha: sha.as_str(),
+            gate: gate.as_str(),
+        },
         WaitItem::FixCommitTag { sha, violation } => WaitJsonItem::FixCommitTag {
             sha: sha.as_str(),
             unknown: &violation.unknown,
@@ -1378,6 +1405,9 @@ fn render_human(item: &WaitItem) -> String {
             format!("adhoc-review  {}  write feedback", short(sha),)
         }
         WaitItem::AdHocRevise { sha } => format!("adhoc-revise  {}  address changes", short(sha)),
+        WaitItem::AdHocSettled { sha, gate } => {
+            format!("adhoc-settled  {}  gate {}", short(sha), gate.as_str())
+        }
         WaitItem::FixCommitTag { sha, violation } => {
             let mut parts: Vec<String> = Vec::new();
             if !violation.untagged_touched.is_empty() {
@@ -2207,6 +2237,18 @@ mod tests {
                 serde_json::to_value(render_json(&WaitItem::AdHocRevise { sha: sha("abc") }))
                     .unwrap(),
                 serde_json::json!({ "kind": "adhoc_revise", "sha": sha("abc").as_str() }),
+            ),
+            (
+                serde_json::to_value(render_json(&WaitItem::AdHocSettled {
+                    sha: sha("abc"),
+                    gate: clank_core::vocab::CommitGateState::Continued,
+                }))
+                .unwrap(),
+                serde_json::json!({
+                    "kind": "adhoc_settled",
+                    "sha": sha("abc").as_str(),
+                    "gate": "continued",
+                }),
             ),
             (
                 serde_json::to_value(render_json(&WaitItem::FixCommitTag {

@@ -94,6 +94,16 @@ pub enum WaitItem {
     AdHocRevise {
         sha: CommitSha,
     },
+    /// An ad-hoc commit's gate settled (Continued/Finished) during
+    /// this wait. Notification, not work — the reviewers made the
+    /// verdict and no follow-on item exists, but master's loop must
+    /// wake to move on (adhoc-continue-wake-investigation). Master
+    /// only, like [`WaitItem::Finished`]; produced by
+    /// [`detect_adhoc_settled`], never by `work_for`.
+    AdHocSettled {
+        sha: CommitSha,
+        gate: crate::vocab::CommitGateState,
+    },
     /// Master's HEAD commit's `[..]` tag doesn't match the plan files
     /// its diff touched (`commit-tag-fixup-is-first-class-state`).
     /// Master must amend the message before any review motion
@@ -310,9 +320,10 @@ pub fn head_tag_violation(
     }
 }
 
-/// Snapshot taken once at `wait` startup. `detect_finished` compares
-/// the current state against this to decide which watched plans
-/// newly transitioned to finished.
+/// Snapshot taken once at `wait` startup. `detect_finished` and
+/// `detect_adhoc_settled` compare the current state against this to
+/// decide which watched plans / ad-hoc gates newly transitioned
+/// during the wait.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StartupSnapshot {
     /// Plan keys this wait is responsible for: the active plan keys
@@ -325,12 +336,20 @@ pub struct StartupSnapshot {
     /// The set-per-plan stays correct across re-intro /
     /// re-finalize cycles.
     pub finished_at_startup: BTreeMap<PlanKey, BTreeSet<CommitSha>>,
+    /// Ad-hoc commit shas whose gate had NOT settled
+    /// (Continued/Finished) when the wait armed. Broader than
+    /// [`AdHocWorkState::is_open`] on purpose: a wait armed during
+    /// `ContinuedPendingGate` (the gate-reviewers' window, master
+    /// asleep) or `Blocked` must still wake when the verdict lands.
+    /// `detect_adhoc_settled` emits for exactly these shas once
+    /// their gate settles.
+    pub adhoc_pending_at_startup: BTreeSet<CommitSha>,
 }
 
 impl StartupSnapshot {
     /// Build from the initial fold. The watched set is every active
     /// plan at startup (all team members watch every plan).
-    pub fn capture(state: &RepoState) -> Self {
+    pub fn capture(state: &RepoState, ad_hoc: &[AdHocWorkState]) -> Self {
         let watched: BTreeSet<PlanKey> = state.plans.keys().cloned().collect();
         let mut finished_at_startup: BTreeMap<PlanKey, BTreeSet<CommitSha>> = BTreeMap::new();
         for fp in &state.finished_plans {
@@ -339,9 +358,15 @@ impl StartupSnapshot {
                 .or_default()
                 .insert(fp.finalized_at.clone());
         }
+        let adhoc_pending_at_startup = ad_hoc
+            .iter()
+            .filter(|a| !a.is_settled())
+            .map(|a| a.sha.clone())
+            .collect();
         Self {
             watched,
             finished_at_startup,
+            adhoc_pending_at_startup,
         }
     }
 }
@@ -501,6 +526,18 @@ impl AdHocWorkState {
             self.gate,
             crate::vocab::CommitGateState::Unreviewed
                 | crate::vocab::CommitGateState::ChangesRequested
+        )
+    }
+
+    /// Whether the gate reached a terminal verdict. NOT the negation
+    /// of [`is_open`](Self::is_open): `ContinuedPendingGate` and
+    /// `Blocked` are neither open (no one is routed work) nor
+    /// settled (the verdict is still pending) — master sleeps
+    /// through them and must still be woken when they resolve.
+    pub fn is_settled(&self) -> bool {
+        matches!(
+            self.gate,
+            crate::vocab::CommitGateState::Continued | crate::vocab::CommitGateState::Finished
         )
     }
 }
@@ -1319,6 +1356,28 @@ pub fn detect_finished(snapshot: &StartupSnapshot, current: &RepoState) -> Vec<W
         .collect()
 }
 
+/// The ad-hoc analogue of [`detect_finished`]: emit
+/// [`WaitItem::AdHocSettled`] for every sha the snapshot captured as
+/// pending whose gate has since settled (Continued/Finished). Both
+/// verdicts ride the same item. A settled-at-arm sha was never
+/// captured, so re-arming after the wake emits nothing — once per
+/// parked wait by construction. Shas that vanished from the current
+/// ad-hoc set (a plan started, new commits landed) emit nothing:
+/// only a positively observed settle wakes.
+pub fn detect_adhoc_settled(
+    snapshot: &StartupSnapshot,
+    current: &[AdHocWorkState],
+) -> Vec<WaitItem> {
+    current
+        .iter()
+        .filter(|a| a.is_settled() && snapshot.adhoc_pending_at_startup.contains(&a.sha))
+        .map(|a| WaitItem::AdHocSettled {
+            sha: a.sha.clone(),
+            gate: a.gate,
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2075,6 +2134,7 @@ mod tests {
         let mut s = StartupSnapshot {
             watched: watched.iter().map(|k| plan(k)).collect(),
             finished_at_startup: BTreeMap::new(),
+            adhoc_pending_at_startup: BTreeSet::new(),
         };
         for (k, sh) in finished_at_startup {
             s.finished_at_startup
@@ -2155,10 +2215,94 @@ mod tests {
         let mut state = RepoState::default();
         state.plans.insert(plan("a"), PlanState::default());
         state.plans.insert(plan("b"), PlanState::default());
-        let snap = StartupSnapshot::capture(&state);
+        let snap = StartupSnapshot::capture(&state, &[]);
         assert_eq!(snap.watched.len(), 2);
         assert!(snap.watched.contains(&plan("a")));
         assert!(snap.watched.contains(&plan("b")));
+    }
+
+    #[test]
+    fn adhoc_settled_fires_for_pending_at_arm_shas_only() {
+        let adhoc = |s: &str, gate| AdHocWorkState { sha: sha(s), gate };
+        // Armed while: aaa unreviewed, bbb changes-requested, ccc
+        // pending-gate, ddd blocked, eee already continued.
+        let at_arm = vec![
+            adhoc("aaa", CommitGateState::Unreviewed),
+            adhoc("bbb", CommitGateState::ChangesRequested),
+            adhoc("ccc", CommitGateState::ContinuedPendingGate),
+            adhoc("ddd", CommitGateState::Blocked),
+            adhoc("eee", CommitGateState::Continued),
+        ];
+        let snap = StartupSnapshot::capture(&RepoState::default(), &at_arm);
+        assert!(
+            !snap.adhoc_pending_at_startup.contains(&sha("eee")),
+            "settled-at-arm shas are never captured"
+        );
+
+        // Later beat: everything settled; fff appeared post-arm
+        // already settled.
+        let now = vec![
+            adhoc("aaa", CommitGateState::Continued),
+            adhoc("bbb", CommitGateState::Continued),
+            adhoc("ccc", CommitGateState::Continued),
+            adhoc("ddd", CommitGateState::Finished),
+            adhoc("eee", CommitGateState::Continued),
+            adhoc("fff", CommitGateState::Continued),
+        ];
+        let items = detect_adhoc_settled(&snap, &now);
+        let settled: Vec<(CommitSha, CommitGateState)> = items
+            .iter()
+            .map(|i| match i {
+                WaitItem::AdHocSettled { sha, gate } => (sha.clone(), *gate),
+                other => panic!("unexpected item {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            settled,
+            vec![
+                (sha("aaa"), CommitGateState::Continued),
+                (sha("bbb"), CommitGateState::Continued),
+                (sha("ccc"), CommitGateState::Continued),
+                (sha("ddd"), CommitGateState::Finished),
+            ],
+            "every pending-at-arm settle emits (incl. pending-gate and \
+             blocked windows); eee was settled at arm and fff appeared \
+             settled — neither wakes"
+        );
+
+        // Re-arm after the wake: all settled at capture → nothing
+        // pending → the same verdicts never emit twice.
+        let resnap = StartupSnapshot::capture(&RepoState::default(), &now);
+        assert!(detect_adhoc_settled(&resnap, &now).is_empty());
+    }
+
+    #[test]
+    fn adhoc_settled_is_silent_while_still_pending_or_vanished() {
+        let at_arm = vec![AdHocWorkState {
+            sha: sha("aaa"),
+            gate: CommitGateState::Unreviewed,
+        }];
+        let snap = StartupSnapshot::capture(&RepoState::default(), &at_arm);
+        // Still open → no wake.
+        assert!(detect_adhoc_settled(&snap, &at_arm).is_empty());
+        // Verdict window states are not settles either.
+        for gate in [
+            CommitGateState::ContinuedPendingGate,
+            CommitGateState::Blocked,
+            CommitGateState::ChangesRequested,
+        ] {
+            let now = vec![AdHocWorkState {
+                sha: sha("aaa"),
+                gate,
+            }];
+            assert!(
+                detect_adhoc_settled(&snap, &now).is_empty(),
+                "{gate:?} must not emit"
+            );
+        }
+        // Sha gone from the ad-hoc set (plan started / new commits):
+        // no positively observed settle → no wake.
+        assert!(detect_adhoc_settled(&snap, &[]).is_empty());
     }
 
     // ============ derive_status ad-hoc + blocks ============
@@ -2339,6 +2483,57 @@ mod tests {
             }]
         );
         assert!(ws.work_for(&label("codex"), Role::Reviewer).is_empty());
+    }
+
+    #[test]
+    fn adhoc_gate_routing_matrix_continued_gives_master_nothing() {
+        // adhoc-continue-wake-investigation: TODAY'S behavior, pinned
+        // as the reproduction. A CONTINUED (or FINISHED) ad-hoc gate
+        // routes work to NO ONE — the reviewer's job is done and no
+        // AdHocRevise exists — so a parked master wait derives no
+        // item and never wakes. Unreviewed routes to reviewers,
+        // ChangesRequested to master (the only two routed states).
+        use crate::vocab::CommitGateState as G;
+        let ws = |gate: G| WorkStatus {
+            plans: Vec::new(),
+            ad_hoc: vec![AdHocWorkState {
+                sha: CommitSha::parse(&"a".repeat(40)).unwrap(),
+                gate,
+            }],
+            pr_reviews: Vec::new(),
+            head_correction: None,
+            multi_plan_open: None,
+        };
+        // The reproduction: continued/finished → master empty.
+        assert!(
+            ws(G::Continued)
+                .work_for(&label("claude"), Role::Master)
+                .is_empty()
+        );
+        assert!(
+            ws(G::Finished)
+                .work_for(&label("claude"), Role::Master)
+                .is_empty()
+        );
+        // The routed states, as controls.
+        assert!(matches!(
+            ws(G::Unreviewed)
+                .work_for(&label("codex"), Role::Reviewer)
+                .as_slice(),
+            [WaitItem::AdHocReview { .. }]
+        ));
+        assert!(matches!(
+            ws(G::ChangesRequested)
+                .work_for(&label("claude"), Role::Master)
+                .as_slice(),
+            [WaitItem::AdHocRevise { .. }]
+        ));
+        // Reviewers idle in every settled state.
+        assert!(
+            ws(G::Continued)
+                .work_for(&label("codex"), Role::Reviewer)
+                .is_empty()
+        );
     }
 
     #[test]

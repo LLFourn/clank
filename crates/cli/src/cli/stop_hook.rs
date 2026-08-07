@@ -678,6 +678,8 @@ struct WaitItem {
     priority: Option<u64>,
     agent: Option<String>,
     answer: Option<String>,
+    /// Ad-hoc settle verdict (adhoc-continue-wake-investigation).
+    gate: Option<String>,
     pr: Option<u64>,
     round: Option<u64>,
     in_progress: Option<String>,
@@ -748,6 +750,10 @@ fn render_wait_items(items: &[WaitItem], label: &AgentLabel, role: Role) -> Stri
             }
             "adhoc_review" => out.push_str(&format!("  - adhoc-review: {short}\n")),
             "adhoc_revise" => out.push_str(&format!("  - adhoc-revise: {short}\n")),
+            "adhoc_settled" => {
+                let gate = item.gate.as_deref().unwrap_or("?");
+                out.push_str(&format!("  - adhoc-settled: {short} (gate {gate})\n"));
+            }
             "promote_from_queue" => {
                 let name = item.name.as_deref().unwrap_or("?");
                 let priority = item.priority.unwrap_or(0);
@@ -1417,6 +1423,20 @@ mod tests {
         ]);
         assert!(out.contains("  - blocked: claude/q on foo (awaiting human)\n"));
         assert!(out.contains("  - promote: next-up (priority 042)\n"));
+    }
+
+    #[test]
+    fn adhoc_settled_renders_the_verdict_one_liner() {
+        // The settle wake (adhoc-continue-wake-investigation): short
+        // sha + verdict, nothing else — there is no follow-on work
+        // command to teach.
+        let out = items_text(&[
+            serde_json::json!({"kind": "adhoc_settled", "sha": FULL_SHA, "gate": "continued"}),
+            serde_json::json!({"kind": "adhoc_settled", "sha": FULL_SHA, "gate": "finished"}),
+        ]);
+        let short = short_sha(FULL_SHA);
+        assert!(out.contains(&format!("  - adhoc-settled: {short} (gate continued)\n")));
+        assert!(out.contains(&format!("  - adhoc-settled: {short} (gate finished)\n")));
     }
 
     #[test]
