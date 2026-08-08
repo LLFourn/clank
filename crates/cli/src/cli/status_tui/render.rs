@@ -1300,10 +1300,14 @@ fn button_block(
 /// (chrome + full document) so the loop can clamp body scroll.
 /// The event page's action-row copy.
 fn event_action_row(a: EventAction) -> (&'static str, &'static str, &'static str) {
+    // The hotkey comes from the input layer, never a literal here:
+    // this row is what tells the operator the key exists, so the two
+    // must be one fact (tui-event-page-hotkeys).
+    let key = super::input::event_action_key(a).1;
     match a {
-        EventAction::OpenBrowser => ("o", "open in browser", "launch the event URL"),
-        EventAction::Ack => ("a", "ack", "mark every agent's copy handled"),
-        EventAction::Back => ("esc", "back", "return to the log"),
+        EventAction::OpenBrowser => (key, "open in browser", "launch the event URL"),
+        EventAction::Ack => (key, "ack", "mark every agent's copy handled"),
+        EventAction::Back => (key, "back", "return to the log"),
     }
 }
 

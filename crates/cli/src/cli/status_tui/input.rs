@@ -17,8 +17,16 @@ pub(super) enum Key {
     /// selected agent while the agent panel is focused. Context-free
     /// parse; the loop resolves the meaning from focus.
     Space,
-    /// Tab / `a` — move keyboard focus between the log and the agent
-    /// panel.
+    /// Tab — move keyboard focus between the log and the agent panel.
+    ///
+    /// `a` is an ALIAS for this at the sites that want it, but it is
+    /// no longer folded in here: the parser used to map both bytes to
+    /// this one variant, which left every page unable to tell a
+    /// navigation keypress from a letter. Pages that bind `a` to an
+    /// action (the event page's ack, the purge chooser's
+    /// artifacts-only) could not see it at all, and routing this
+    /// variant to such an action would have made TAB perform it
+    /// (tui-event-page-hotkeys).
     Focus,
     /// Esc — back out one level (leave the panel / cancel a picker or
     /// confirm).
@@ -555,7 +563,7 @@ pub(super) fn agent_detail_nav(sel: usize, actions: &[DetailAction], key: Key) -
     let current = || actions.get(sel).copied().unwrap_or(DetailAction::Back);
     match key {
         Key::Quit => DetailNav::Quit,
-        Key::Escape | Key::Focus => DetailNav::Back,
+        Key::Escape | Key::Focus | Key::Char(b'a') => DetailNav::Back,
         Key::Up => DetailNav::MoveCursor(move_selection(sel, actions.len(), false)),
         Key::Down => DetailNav::MoveCursor(move_selection(sel, actions.len(), true)),
         Key::Enter => DetailNav::Activate(current()),
@@ -585,7 +593,9 @@ pub(super) enum DocNav {
 pub(super) fn doc_nav(key: Key, page: usize) -> DocNav {
     let page = page as i32;
     match key {
-        Key::Escape | Key::Enter | Key::Quit | Key::Focus | Key::Left => DocNav::Back,
+        Key::Escape | Key::Enter | Key::Quit | Key::Focus | Key::Char(b'a') | Key::Left => {
+            DocNav::Back
+        }
         Key::Up => DocNav::Scroll(-1),
         Key::Down => DocNav::Scroll(1),
         Key::PageUp => DocNav::Scroll(-page),
@@ -696,6 +706,33 @@ pub(super) enum EventAction {
     Ack,
     /// Close the page.
     Back,
+}
+
+/// An event action's key and the label the page shows for it —
+/// defined together, in one arm per action, so the two cannot drift.
+/// The render draws `.1`; [`event_hotkey`] matches `.0`. Adding an
+/// action with a key that looks live and does nothing now requires
+/// going out of your way (tui-event-page-hotkeys).
+pub(super) fn event_action_key(a: EventAction) -> (Key, &'static str) {
+    match a {
+        EventAction::OpenBrowser => (Key::Html, "o"),
+        // The physical letter, NOT `Key::Focus`: that variant is Tab
+        // too, and acking every copy is destructive.
+        EventAction::Ack => (Key::Char(b'a'), "a"),
+        EventAction::Back => (Key::Escape, "esc"),
+    }
+}
+
+/// Resolve a keypress to an event-page action, gated on the action
+/// being OFFERED right now — mirroring `plan_hotkey`. A no-URL event
+/// has no browser row, so `o` is inert there rather than launching
+/// nothing; a fully-handled event has no ack row, so `a` cannot
+/// re-ack it.
+pub(super) fn event_hotkey(key: Key, actions: &[EventAction]) -> Option<EventAction> {
+    actions
+        .iter()
+        .copied()
+        .find(|a| event_action_key(*a).0 == key)
 }
 
 /// The event page's actions in display order: unavailable actions are
@@ -901,7 +938,7 @@ pub(super) fn agent_panel_action(
     let on_last = sel + 1 == total;
     match key {
         Key::Quit => PanelAction::Quit,
-        Key::Focus | Key::Escape => PanelAction::LeaveFocus,
+        Key::Focus | Key::Char(b'a') | Key::Escape => PanelAction::LeaveFocus,
         Key::Up => PanelAction::MoveCursor(move_selection(sel, total, false)),
         // `Down` past the bottom row flows into the log — continuous
         // navigation across the panel↔log boundary.
@@ -1040,7 +1077,7 @@ pub(super) fn parse_one(bytes: &[u8], text_mode: bool) -> Option<(AnyKey, usize)
         b'G' => Key::Bottom,
         b' ' => Key::Space,
         b'b' => Key::PageUp,
-        b'\t' | b'a' => Key::Focus,
+        b'\t' => Key::Focus,
         b'\r' | b'\n' => Key::Enter,
         0x7f | 0x08 => Key::Delete,
         b'y' => Key::Yes,
@@ -1095,6 +1132,114 @@ pub(super) fn move_selection(sel: usize, len: usize, down: bool) -> usize {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn every_displayed_event_key_activates_the_action_it_names() {
+        // Driven from the action list itself, not a hand-written key
+        // table: a future action gets this coverage for free, which
+        // is the drift that made `o` and `a` inert to begin with.
+        for a in [
+            EventAction::OpenBrowser,
+            EventAction::Ack,
+            EventAction::Back,
+        ] {
+            let (key, label) = event_action_key(a);
+            let offered = [a];
+            assert_eq!(
+                event_hotkey(key, &offered),
+                Some(a),
+                "the key displayed as `{label}` must activate {a:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn event_hotkeys_are_gated_on_the_action_being_offered() {
+        // A no-URL event has no browser row and a handled event has no
+        // ack row; their keys must be inert rather than firing at
+        // something that is not there.
+        let none: Vec<EventAction> = event_actions(false, false);
+        assert_eq!(event_hotkey(Key::Html, &none), None, "no URL → `o` inert");
+        assert_eq!(
+            event_hotkey(Key::Char(b'a'), &none),
+            None,
+            "handled → ack inert"
+        );
+
+        let both = event_actions(true, true);
+        assert_eq!(
+            event_hotkey(Key::Html, &both),
+            Some(EventAction::OpenBrowser)
+        );
+        assert_eq!(event_hotkey(Key::Char(b'a'), &both), Some(EventAction::Ack));
+    }
+
+    #[test]
+    fn tab_never_acks_and_the_letter_a_does() {
+        // MUST start from raw bytes. The whole hazard was that `\t`
+        // and `a` became the same `Key`, so a test starting from a
+        // `Key` value starts after the bug (codex on 6028cb0).
+        let key_of = |b: &[u8]| {
+            let keys = parse_keys(b);
+            assert_eq!(keys.len(), 1, "one key per byte here: {keys:?}");
+            keys[0]
+        };
+        let actions = event_actions(true, true);
+
+        let tab = key_of(b"\t");
+        assert_eq!(tab, Key::Focus, "Tab stays the focus key");
+        assert_eq!(
+            event_hotkey(tab, &actions),
+            None,
+            "Tab must NEVER ack — it is navigation, and ack is destructive"
+        );
+
+        let letter = key_of(b"a");
+        assert_ne!(letter, Key::Focus, "`a` must survive the parse as itself");
+        assert_eq!(
+            event_hotkey(letter, &actions),
+            Some(EventAction::Ack),
+            "the advertised `a` must actually ack"
+        );
+
+        // And `o` likewise, through the parser.
+        assert_eq!(
+            event_hotkey(key_of(b"o"), &actions),
+            Some(EventAction::OpenBrowser)
+        );
+    }
+
+    #[test]
+    fn the_letter_a_still_means_focus_where_it_always_did() {
+        // Splitting the parse must not retire the alias: every site
+        // that documented `a` as focus keeps it.
+        use crate::cli::teams_config::RosterRole;
+        use clank_core::vocab::AutoMode;
+        let agents = vec![agent_row("claude", RosterRole::Master, AutoMode::On)];
+        assert_eq!(
+            agent_panel_action(0, &agents, 0, 0, Key::Char(b'a')),
+            agent_panel_action(0, &agents, 0, 0, Key::Focus),
+            "panel: `a` and Tab both leave focus"
+        );
+        let acts = [DetailAction::Back];
+        assert!(matches!(
+            agent_detail_nav(0, &acts, Key::Char(b'a')),
+            DetailNav::Back
+        ));
+        assert!(matches!(doc_nav(Key::Char(b'a'), 10), DocNav::Back));
+    }
+
+    #[test]
+    fn the_purge_choosers_advertised_a_now_reaches_it() {
+        // Collateral proof the parse was the defect: this arm existed
+        // all along and was unreachable, because `a` never survived
+        // the parser.
+        let keys = parse_keys(b"a");
+        assert!(matches!(
+            purge_choice_nav(1, keys[0]),
+            PlanNavPurge::Choose(PurgeChoice::Artifacts)
+        ));
+    }
+
     #[test]
     fn event_detail_nav_routes_keys_to_actions() {
         // The action seam (tui-github-event-page): Enter on a row
@@ -1497,16 +1642,18 @@ mod tests {
     #[test]
     fn parse_keys_recognizes_panel_focus_keys() {
         use Key::*;
-        // Tab and `a` both focus the agent panel; lone Esc leaves it.
+        // Tab and `a` are now DISTINCT at the parse — both still act
+        // as focus, but each site opts in, so a page can bind `a`
+        // without Tab performing it (tui-event-page-hotkeys).
         let got: Vec<_> = parse_keys(b"\ta\x1b")
             .iter()
             .map(std::mem::discriminant)
             .collect();
-        let want: Vec<_> = [Focus, Focus, Escape]
+        let want: Vec<_> = [Focus, Char(b'a'), Escape]
             .iter()
             .map(std::mem::discriminant)
             .collect();
-        assert_eq!(got, want, "tab/a focus, esc leaves");
+        assert_eq!(got, want, "tab focuses, `a` stays a letter, esc leaves");
         // Left arrow (← / CSI D) is its own key (the commit-detail back
         // key) — consumed whole, NOT misread as a lone Esc from the CSI's
         // leading bytes.

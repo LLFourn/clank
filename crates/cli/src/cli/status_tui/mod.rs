@@ -1697,7 +1697,7 @@ pub(crate) async fn run_tui(
                         Mode::AddPicker { sel } => match k {
                             Key::Quit => break 'evloop,
                             // Esc/Tab close the picker back onto the +add row.
-                            Key::Escape | Key::Focus => {
+                            Key::Escape | Key::Focus | Key::Char(b'a') => {
                                 picker.clear();
                                 mode = Mode::AgentPanel {
                                     sel: snapshot.agents.len(),
@@ -1807,7 +1807,15 @@ pub(crate) async fn run_tui(
                                 continue;
                             };
                             let actions = event_actions(ep.event.url.is_some(), ep.event.unhandled);
-                            match event_detail_nav(sel, &actions, k, page, ep.scroll) {
+                            // A displayed hotkey acts DIRECTLY, leaving the
+                            // selection where it was — pressing `o` must not
+                            // silently re-aim what Enter would do next
+                            // (tui-event-page-hotkeys).
+                            let nav = match event_hotkey(k, &actions) {
+                                Some(a) => EventNav::Act(a),
+                                None => event_detail_nav(sel, &actions, k, page, ep.scroll),
+                            };
+                            match nav {
                                 EventNav::Sel(x) => mode = Mode::EventDetail { sel: x },
                                 EventNav::Scroll(delta) => {
                                     if let Some(live) = event_page.as_mut() {
@@ -1961,7 +1969,9 @@ pub(crate) async fn run_tui(
                         // entry crosses back into the panel (continuous nav).
                         Mode::LogScroll => match k {
                             Key::Quit => break 'evloop,
-                            Key::Focus => mode = mode.toggle_focus(snapshot.agents.len()),
+                            Key::Focus | Key::Char(b'a') => {
+                                mode = mode.toggle_focus(snapshot.agents.len())
+                            }
                             Key::Up => {
                                 match log_up_target(log.cursor, log.offset, snapshot.agents.len()) {
                                     Some(sel) => mode = Mode::AgentPanel { sel },
