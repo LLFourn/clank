@@ -1276,6 +1276,7 @@ fn render_json(item: &WaitItem) -> WaitJsonItem<'_> {
             actor,
             url,
             instructions,
+            content: _,
         } => WaitJsonItem::GithubEvent {
             repo,
             event,
@@ -1436,6 +1437,7 @@ fn render_human(item: &WaitItem) -> String {
             actor,
             url,
             instructions,
+            content: _,
         } => {
             // Segments joined uniformly so absent optionals leave no
             // dangling separators; the URL rides along — it's the
@@ -2031,6 +2033,7 @@ mod tests {
             actor: Some("hubot".into()),
             url: Some("https://github.com/o/r/pull/12".into()),
             instructions: None,
+            content: None,
         };
         assert_eq!(
             render_human(&full),
@@ -2047,6 +2050,7 @@ mod tests {
             actor: None,
             url: None,
             instructions: None,
+            content: None,
         };
         assert_eq!(render_human(&sparse), "github   issue_opened  o/r");
         // The watch's operator prompt rides as one indented
@@ -2062,6 +2066,7 @@ mod tests {
             actor: None,
             url: None,
             instructions: Some("Triage it:\nlabel,\treply,  then ack.".into()),
+            content: None,
         };
         assert_eq!(
             render_human(&prompted),
@@ -2077,6 +2082,7 @@ mod tests {
             actor: None,
             url: None,
             instructions: Some("  \n ".into()),
+            content: None,
         };
         assert_eq!(render_human(&blank), "github   issue_opened  o/r");
     }

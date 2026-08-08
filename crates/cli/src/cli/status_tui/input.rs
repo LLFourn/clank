@@ -695,6 +695,10 @@ pub(super) struct EventPage {
     /// the plan page's document-scroll model, so long multiline
     /// prompts are always reachable.
     pub(super) scroll: usize,
+    /// The GitHub body request, when this event names an object to
+    /// read (tui-github-event-content). `None` for legacy rows and
+    /// pushes, which name none.
+    pub(super) content: Option<super::event_content::ContentSlot>,
 }
 
 /// One row of the event page's action menu.
@@ -704,6 +708,10 @@ pub(super) enum EventAction {
     OpenBrowser,
     /// Ack every unhandled copy (the fanout through the shared core).
     Ack,
+    /// Re-request the GitHub body. Offered ONLY while the content is
+    /// in a retryable failure, so it never becomes a key that sits
+    /// there doing nothing (tui-github-event-content, Contract 4).
+    Retry,
     /// Close the page.
     Back,
 }
@@ -719,6 +727,7 @@ pub(super) fn event_action_key(a: EventAction) -> (Key, &'static str) {
         // The physical letter, NOT `Key::Focus`: that variant is Tab
         // too, and acking every copy is destructive.
         EventAction::Ack => (Key::Char(b'a'), "a"),
+        EventAction::Retry => (Key::Char(b'r'), "r"),
         EventAction::Back => (Key::Escape, "esc"),
     }
 }
@@ -738,7 +747,7 @@ pub(super) fn event_hotkey(key: Key, actions: &[EventAction]) -> Option<EventAct
 /// The event page's actions in display order: unavailable actions are
 /// OMITTED (no URL → no browser row; fully handled → no ack row),
 /// matching how the other pages degrade.
-pub(super) fn event_actions(has_url: bool, unhandled: bool) -> Vec<EventAction> {
+pub(super) fn event_actions(has_url: bool, unhandled: bool, retryable: bool) -> Vec<EventAction> {
     let mut out = Vec::new();
     if has_url {
         out.push(EventAction::OpenBrowser);
@@ -746,8 +755,53 @@ pub(super) fn event_actions(has_url: bool, unhandled: bool) -> Vec<EventAction> 
     if unhandled {
         out.push(EventAction::Ack);
     }
+    if retryable {
+        out.push(EventAction::Retry);
+    }
     out.push(EventAction::Back);
     out
+}
+
+/// The actions a page currently offers, read off the page itself so
+/// availability and the page's real state cannot disagree.
+pub(super) fn actions_for(ep: &EventPage) -> Vec<EventAction> {
+    event_actions(
+        event_open_url(ep).is_some(),
+        ep.event.unhandled,
+        ep.content.as_ref().is_some_and(|c| c.state.is_retryable()),
+    )
+}
+
+/// Keep the cursor on the SAME action across an availability change.
+///
+/// Selection is an INDEX, but the action list changes asynchronously:
+/// a failed fetch inserts Retry ABOVE Back, so the index that meant
+/// "close the page" silently comes to mean "retry". Rebinding by
+/// identity is what stops a completion landing under the operator's
+/// cursor from repurposing the key they were about to press.
+///
+/// If the selected action is gone entirely, fall back to the LAST
+/// entry — always Back, and the only action that cannot do anything
+/// the operator did not ask for.
+pub(super) fn rebind_event_sel(before: &[EventAction], sel: usize, after: &[EventAction]) -> usize {
+    let last = after.len().saturating_sub(1);
+    match before.get(sel) {
+        Some(want) => after.iter().position(|a| a == want).unwrap_or(last),
+        None => last,
+    }
+}
+
+/// The URL the browser action opens: the FETCHED object's own link
+/// when we have it — for a comment that is the anchored permalink the
+/// event record never carried — else the record's issue/PR URL.
+pub(super) fn event_open_url(ep: &EventPage) -> Option<String> {
+    if let Some(slot) = &ep.content
+        && let super::event_content::ContentState::Ready(b) = &slot.state
+        && let Some(u) = &b.url
+    {
+        return Some(u.clone());
+    }
+    ep.event.url.clone()
 }
 
 /// The EXECUTED effect of an event-page action — the tested seam
@@ -763,6 +817,8 @@ pub(super) enum EventEffect {
     AckFanout(Vec<crate::cli::github_timeline::MemberKey>),
     /// Close the page.
     Close,
+    /// Re-request the body under a fresh generation.
+    RetryContent,
     /// Nothing to do (e.g. OpenBrowser with no URL — the menu omits
     /// it, this is the belt).
     None,
@@ -770,10 +826,7 @@ pub(super) enum EventEffect {
 
 pub(super) fn event_action_effect(ep: &EventPage, a: EventAction) -> EventEffect {
     match a {
-        EventAction::OpenBrowser => ep
-            .event
-            .url
-            .clone()
+        EventAction::OpenBrowser => event_open_url(ep)
             .map(EventEffect::Open)
             .unwrap_or(EventEffect::None),
         EventAction::Ack => EventEffect::AckFanout(
@@ -784,6 +837,7 @@ pub(super) fn event_action_effect(ep: &EventPage, a: EventAction) -> EventEffect
                 .map(|m| m.key.clone())
                 .collect(),
         ),
+        EventAction::Retry => EventEffect::RetryContent,
         EventAction::Back => EventEffect::Close,
     }
 }
@@ -1157,7 +1211,7 @@ mod tests {
         // A no-URL event has no browser row and a handled event has no
         // ack row; their keys must be inert rather than firing at
         // something that is not there.
-        let none: Vec<EventAction> = event_actions(false, false);
+        let none: Vec<EventAction> = event_actions(false, false, false);
         assert_eq!(event_hotkey(Key::Html, &none), None, "no URL → `o` inert");
         assert_eq!(
             event_hotkey(Key::Char(b'a'), &none),
@@ -1165,7 +1219,7 @@ mod tests {
             "handled → ack inert"
         );
 
-        let both = event_actions(true, true);
+        let both = event_actions(true, true, false);
         assert_eq!(
             event_hotkey(Key::Html, &both),
             Some(EventAction::OpenBrowser)
@@ -1183,7 +1237,7 @@ mod tests {
             assert_eq!(keys.len(), 1, "one key per byte here: {keys:?}");
             keys[0]
         };
-        let actions = event_actions(true, true);
+        let actions = event_actions(true, true, false);
 
         let tab = key_of(b"\t");
         assert_eq!(tab, Key::Focus, "Tab stays the focus key");
@@ -1247,7 +1301,7 @@ mod tests {
         // open-in-browser and ack are pinned here without spawning
         // anything, exactly like the plan page's nav.
         use super::{EventAction, EventNav, event_actions, event_detail_nav};
-        let actions = event_actions(true, true);
+        let actions = event_actions(true, true, false);
         assert_eq!(
             actions,
             vec![
@@ -1298,7 +1352,7 @@ mod tests {
         );
         // Degraded menu: no URL, handled → only Back, and Enter on it
         // closes.
-        let only_back = event_actions(false, false);
+        let only_back = event_actions(false, false, false);
         assert_eq!(
             event_detail_nav(0, &only_back, Key::Enter, 5, 0),
             EventNav::Act(EventAction::Back)

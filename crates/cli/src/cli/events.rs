@@ -546,6 +546,7 @@ mod tests {
             actor: Some("a".into()),
             url: Some("https://x".into()),
             instructions: None,
+            content: None,
         }
     }
 

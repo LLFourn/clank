@@ -48,6 +48,41 @@ pub(crate) struct MemberRef {
     pub(crate) key: MemberKey,
     pub(crate) acked: bool,
     pub(crate) transport: crate::cli::github_event_log::Transport,
+    /// This copy's content reference (tui-github-event-content).
+    /// Absent on rows logged before it existed, which is why the
+    /// component-level resolution below cannot simply take member
+    /// zero's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) content: Option<clank_core::wait::ContentRef>,
+}
+
+/// Which object the PAGE should read a body from for a merged
+/// component (tui-github-event-content, Contract 2).
+///
+/// Copies of one event should agree, and legacy rows carry nothing at
+/// all, so the component takes the first reference in the members'
+/// existing provenance order — the same first-some rule every other
+/// merged field uses, which is already total and therefore stable
+/// across refreshes. (The plan first said "newest"; that was an
+/// arbitrary second ordering for no gain, and consistency here is
+/// worth more.) A legacy row never clears a reference a sibling has.
+///
+/// If members genuinely DISAGREE the component does not speak for
+/// both — it would be showing one event's body under another's
+/// heading — so the caller's target row decides.
+pub(crate) fn resolve_content_ref<'a>(
+    members: &'a [MemberRef],
+    target: &MemberKey,
+) -> Option<&'a clank_core::wait::ContentRef> {
+    let mut present = members.iter().filter_map(|m| m.content.as_ref());
+    let first = present.next()?;
+    if present.any(|c| c != first) {
+        return members
+            .iter()
+            .find(|m| &m.key == target)
+            .and_then(|m| m.content.as_ref());
+    }
+    Some(first)
 }
 
 /// One merged timeline entry.
@@ -260,6 +295,7 @@ fn merge(copies: Vec<Copy>) -> Vec<MergedEvent> {
                     url,
                     // Presentation-time stamp; WAL rows never carry it.
                     instructions: _,
+                    content: _,
                 } => Some((
                     repo.clone(),
                     event.clone(),
@@ -288,6 +324,10 @@ fn merge(copies: Vec<Copy>) -> Vec<MergedEvent> {
                     },
                     acked: copies[i].acked,
                     transport: copies[i].transport,
+                    content: match &copies[i].item {
+                        WaitItem::GithubEvent { content, .. } => content.clone(),
+                        _ => None,
+                    },
                 })
                 .collect();
             member_refs.sort_by(|a, b| a.key.cmp(&b.key));
@@ -316,6 +356,75 @@ fn merge(copies: Vec<Copy>) -> Vec<MergedEvent> {
 
 #[cfg(test)]
 mod tests {
+
+    use clank_core::wait::ContentRef;
+
+    fn member_with(agent: &str, content: Option<ContentRef>) -> MemberRef {
+        MemberRef {
+            key: MemberKey {
+                agent: agent.into(),
+                source: "github-o-r-aaaa".into(),
+                seq: 1,
+                ident: String::new(),
+            },
+            acked: false,
+            transport: crate::cli::github_event_log::Transport::Poll,
+            content,
+        }
+    }
+
+    #[test]
+    fn a_legacy_row_never_clears_a_sibling_reference() {
+        // The mix EVERY existing repo hits on the first run after the
+        // reference ships: copies logged before it sit beside copies
+        // logged after.
+        let want = ContentRef::ReviewComment { id: 900 };
+        let members = vec![
+            member_with("codex", None),
+            member_with("claude", Some(want.clone())),
+        ];
+        let target = members[0].key.clone();
+        assert_eq!(
+            resolve_content_ref(&members, &target),
+            Some(&want),
+            "a row with no reference must not out-vote one that has it"
+        );
+        // Order must not matter: the reference is a property of the
+        // event, not of which agent happened to log first.
+        let flipped = vec![members[1].clone(), members[0].clone()];
+        assert_eq!(resolve_content_ref(&flipped, &target), Some(&want));
+    }
+
+    #[test]
+    fn no_reference_anywhere_resolves_to_none() {
+        let members = vec![member_with("codex", None), member_with("claude", None)];
+        let target = members[0].key.clone();
+        assert_eq!(resolve_content_ref(&members, &target), None);
+    }
+
+    #[test]
+    fn conflicting_references_defer_to_the_targeted_row() {
+        // A component whose copies disagree does not speak for both:
+        // guessing would render one event's body under another's
+        // heading, which is precisely the confusion this page exists
+        // to remove.
+        let mine = ContentRef::ReviewComment { id: 900 };
+        let theirs = ContentRef::ReviewComment { id: 901 };
+        let members = vec![
+            member_with("claude", Some(mine.clone())),
+            member_with("codex", Some(theirs.clone())),
+        ];
+        assert_eq!(
+            resolve_content_ref(&members, &members[1].key),
+            Some(&theirs),
+            "the targeted row decides, not the first one"
+        );
+        assert_eq!(resolve_content_ref(&members, &members[0].key), Some(&mine));
+        // A target that is no longer present (retargeting mid-flight)
+        // yields nothing rather than an arbitrary pick.
+        let gone = member_with("ruthless", None).key;
+        assert_eq!(resolve_content_ref(&members, &gone), None);
+    }
     use super::*;
     use crate::cli::github_event_log::Transport;
     use std::path::PathBuf;
@@ -330,6 +439,7 @@ mod tests {
             actor: Some("alice".into()),
             url: None,
             instructions: None,
+            content: None,
         }
     }
 

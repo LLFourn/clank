@@ -136,13 +136,7 @@ pub(super) fn render_at(
     if let Some(ep) = view.event_page
         && let Mode::EventDetail { sel } = mode
     {
-        return render_event_detail(
-            ep,
-            &event_actions(ep.event.url.is_some(), ep.event.unhandled),
-            sel,
-            rows,
-            cols,
-        );
+        return render_event_detail(ep, &super::input::actions_for(ep), sel, rows, cols);
     }
     // The plan-actions page family (tui-plan-actions-page): page and
     // purge chooser are dedicated full screens too.
@@ -1307,6 +1301,7 @@ fn event_action_row(a: EventAction) -> (&'static str, &'static str, &'static str
     match a {
         EventAction::OpenBrowser => (key, "open in browser", "launch the event URL"),
         EventAction::Ack => (key, "ack", "mark every agent's copy handled"),
+        EventAction::Retry => (key, "retry", "request the body from GitHub again"),
         EventAction::Back => (key, "back", "return to the log"),
     }
 }
@@ -1351,6 +1346,47 @@ pub(super) fn render_event_detail(
 
     // The details body: built in full, windowed below.
     let mut body: Vec<String> = Vec::new();
+    // The GitHub body FIRST (codex on dcc04f9). It is the reason to
+    // open this page, so in a short pane it must be the thing already
+    // on screen — putting it after the facts and every copy row left
+    // the operator scrolling past metadata to reach the content they
+    // came for.
+    if let Some(slot) = &ep.content {
+        use super::event_content::ContentState;
+        let width = cols.saturating_sub(4).max(1);
+        match &slot.state {
+            ContentState::Loading => {
+                body.push(emit(&[dim("  reading from github…".to_string())], "", cols));
+            }
+            ContentState::Unavailable(why) => {
+                body.push(emit(&[dim(format!("  {why}"))], "", cols));
+            }
+            ContentState::Failed(why) => {
+                body.push(emit(&[dim(format!("  {why}"))], "", cols));
+            }
+            ContentState::Ready(b) => {
+                if let Some(author) = &b.author {
+                    body.push(emit(&[dim(format!("  @{}", clean(author)))], "", cols));
+                }
+                if b.body.is_empty() {
+                    body.push(emit(&[dim("  (no body)".to_string())], "", cols));
+                } else {
+                    // Same display-width wrap the prompts use, so wide
+                    // glyphs stay reachable through the scroll.
+                    for line in crate::cli::events::sanitize_multiline(&b.body).lines() {
+                        if line.is_empty() {
+                            body.push(String::new());
+                            continue;
+                        }
+                        for wrapped in super::text::wrap(line, width) {
+                            body.push(emit(&[plain(format!("  {wrapped}"))], "", cols));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let fact = |body: &mut Vec<String>, k: &str, v: String| {
         body.push(emit(
             &[dim(format!("  {k:<9}")), plain(format!(" {v}"))],
@@ -3859,6 +3895,70 @@ mod tests {
     }
 
     #[test]
+    fn the_fetched_body_precedes_the_metadata() {
+        // In a short pane the first rows are all the operator sees, so
+        // the content must be there rather than below the facts and
+        // every copy row (codex on dcc04f9).
+        use super::super::event_content::{ContentSlot, ContentState, EventBody};
+        use clank_core::wait::ContentRef;
+
+        let ev = crate::cli::github_timeline::MergedEvent {
+            at: 0,
+            repo: "o/r".into(),
+            event: "pr_comment".into(),
+            detail: None,
+            number: Some(12),
+            title: Some("Add the widget".into()),
+            actor: Some("hubot".into()),
+            url: Some("https://github.com/o/r/pull/12".into()),
+            seen_by: vec!["alpha".into()],
+            unhandled: true,
+            baseline: false,
+            members: vec![crate::cli::github_timeline::MemberRef {
+                key: crate::cli::github_timeline::MemberKey {
+                    agent: "alpha".into(),
+                    source: "github-o-r-aaaa".into(),
+                    seq: 1,
+                    ident: String::new(),
+                },
+                acked: false,
+                transport: crate::cli::github_event_log::Transport::Poll,
+                content: None,
+            }],
+        };
+        let mut ep = super::super::input::EventPage {
+            target: ev.members[0].key.clone(),
+            retained: ev.members.iter().map(|m| m.key.clone()).collect(),
+            event: ev,
+            prompts: Vec::new(),
+            scroll: 0,
+            content: None,
+        };
+        let mut slot = ContentSlot::requesting(ContentRef::Pr { number: 1 }, 1);
+        slot.state = ContentState::Ready(EventBody {
+            body: "THE-BODY-TEXT".into(),
+            author: None,
+            url: None,
+        });
+        ep.content = Some(slot);
+
+        let (lines, _) =
+            render_event_detail(&ep, &super::super::input::actions_for(&ep), 0, 80, 60);
+        let joined = lines.join("\n");
+        // Compare against a FACT VALUE, not the word "event": the
+        // action row's own copy says "launch the event URL", which a
+        // looser search matches before the facts even start.
+        let body_at = joined.find("THE-BODY-TEXT").expect("body rendered");
+        let facts_at = joined.find("pr_comment").expect("facts rendered");
+        let members_at = joined.find("alpha").expect("copy rows rendered");
+        assert!(
+            body_at < facts_at && body_at < members_at,
+            "the fetched body must precede the facts ({facts_at}) and the \
+             copy rows ({members_at}), got body at {body_at}:\n{joined}"
+        );
+    }
+
+    #[test]
     fn event_page_renders_actions_members_and_attributed_prompts() {
         // tui-github-event-page: the page shows its actions (browser
         // omitted without a URL, ack omitted when handled), every
@@ -3875,6 +3975,7 @@ mod tests {
             },
             acked,
             transport,
+            content: None,
         };
         let ev = MergedEvent {
             at: 1,
@@ -3902,8 +4003,9 @@ mod tests {
                 (Some("beta".into()), "just ack it".into()),
             ],
             scroll: 0,
+            content: None,
         };
-        let actions = event_actions(true, true);
+        let actions = event_actions(true, true, false);
         let (out, _) = render_event_detail(&ep, &actions, 0, 40, 90);
         let text: String = out
             .iter()
@@ -3988,12 +4090,12 @@ mod tests {
         assert_eq!(one.len(), 1, "{one:?}");
 
         // No URL + fully handled: those actions are OMITTED.
-        let actions = event_actions(false, false);
+        let actions = event_actions(false, false, false);
         assert_eq!(actions, vec![super::super::input::EventAction::Back]);
     }
 
     fn actions_full() -> Vec<super::super::input::EventAction> {
-        event_actions(true, true)
+        event_actions(true, true, false)
     }
 
     #[test]

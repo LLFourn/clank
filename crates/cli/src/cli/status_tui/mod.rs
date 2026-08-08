@@ -32,6 +32,7 @@ use super::term::{AltScreen, paint, term_size};
 
 use super::status::{StatusSnapshot, spawn_sigwinch_forwarder, watch_status_paths};
 
+mod event_content;
 mod text;
 // Re-export for `open_zellij`'s tab/pane renamer, which strips the same
 // stale lamp prefix. (The IO shell itself uses no text primitives — the
@@ -69,6 +70,14 @@ enum Ev {
     /// (possibly taller) viewport and repaint, but never rebuild — so a
     /// resize is never swallowed by the nothing-changed gate.
     Resize,
+    /// A github body fetch finished (tui-github-event-content). Its
+    /// generation and target are carried back so the page can refuse
+    /// a completion it no longer wants.
+    Content {
+        generation: u64,
+        target: clank_core::wait::ContentRef,
+        state: event_content::ContentState,
+    },
     /// A raw stdin chunk. Parsed AT THE LOOP, not in the reader
     /// thread: bytes → keys is interpretation and the interpretation
     /// is mode-scoped — an open text input reads the letters
@@ -451,6 +460,102 @@ async fn refetch_plan_page(
 /// wins across component splits), refresh the retained set from the
 /// newly targeted component, close only when none survive. Pure over
 /// the fresh event list — the retarget contract's test seam.
+/// What a retarget decided: where the cursor ends up, and whether a
+/// new body request must be spawned.
+struct Retarget {
+    sel: usize,
+    /// (repo slug, object, generation) when the page now points at a
+    /// DIFFERENT object than it was fetching.
+    fetch: Option<(String, clank_core::wait::ContentRef, u64)>,
+}
+
+/// Follow the page through a refresh: retarget it, decide whether the
+/// body must be re-requested, and rebind the cursor.
+///
+/// Extracted from the loop because the ORDER is the whole contract and
+/// loop code cannot be tested (codex on 4390f27): the action list must
+/// be captured BEFORE the retarget replaces `event`, or an
+/// availability change made by the refresh itself — a legacy row
+/// gaining a URL, say — has already shifted the list by the time the
+/// "before" snapshot is taken, and the rebind silently moves the
+/// operator's cursor to a different action.
+///
+/// `None` means the component is gone and the page should close.
+fn retarget_event_page(
+    page: &mut Option<EventPage>,
+    events: &[crate::cli::github_timeline::MergedEvent],
+    repo: &std::path::Path,
+    sel: usize,
+    next_generation: &mut u64,
+) -> Option<Retarget> {
+    // FIRST — before anything mutates the page.
+    let before = page.as_ref().map(actions_for).unwrap_or_default();
+    if !refetch_event_page(page, events) {
+        return None;
+    }
+    let ep = page.as_mut()?;
+    ep.prompts = event_prompts(repo, &ep.event.clone());
+
+    // A refresh re-requests ONLY when the page now points at a
+    // DIFFERENT object: re-fetching on every refresh would re-issue
+    // continuously while a failure persists (Contract 4) and would
+    // discard a body already on screen.
+    let now =
+        crate::cli::github_timeline::resolve_content_ref(&ep.event.members, &ep.target).cloned();
+    let mut fetch = None;
+    if content_needs_refetch(ep.content.as_ref().map(|c| &c.target), now.as_ref()) {
+        ep.content = now.map(|target| {
+            *next_generation += 1;
+            fetch = Some((ep.event.repo.clone(), target.clone(), *next_generation));
+            event_content::ContentSlot::requesting(target, *next_generation)
+        });
+    }
+    let after = actions_for(ep);
+    Some(Retarget {
+        sel: rebind_event_sel(&before, sel, &after),
+        fetch,
+    })
+}
+
+/// Whether a refresh must issue a NEW request.
+///
+/// Only a change of object does. This is the whole of Contract 4's
+/// "refreshes never re-issue a failed fetch": the TUI refreshes on
+/// every watcher event, so returning true for an unchanged target
+/// would re-request continuously for as long as a failure persists,
+/// spending the rate limit of the token the wake sources poll with.
+/// It would also throw away a body already on screen.
+fn content_needs_refetch(
+    current: Option<&clank_core::wait::ContentRef>,
+    now: Option<&clank_core::wait::ContentRef>,
+) -> bool {
+    current != now
+}
+
+/// Start a body fetch for `target`, answering on `ev_tx`.
+///
+/// Spawned rather than awaited: attach and refold already make the
+/// loop's turn long, and a GitHub round trip must not be added to it.
+/// The generation rides along so a slow answer can be refused if the
+/// page has moved on.
+fn spawn_content_fetch(
+    ev_tx: &mpsc::Sender<Ev>,
+    repo: String,
+    target: clank_core::wait::ContentRef,
+    generation: u64,
+) {
+    let tx = ev_tx.clone();
+    tokio::spawn(async move {
+        let fetcher = event_content::SessionFetch(crate::cli::github_events::shared_session());
+        let state = event_content::fetch_content(&fetcher, &repo, &target).await;
+        let _ = tx.send(Ev::Content {
+            generation,
+            target,
+            state,
+        });
+    });
+}
+
 fn refetch_event_page(
     page: &mut Option<EventPage>,
     events: &[crate::cli::github_timeline::MergedEvent],
@@ -1123,6 +1228,12 @@ struct Batch {
     input: Vec<u8>,
     refresh: bool,
     resize: bool,
+    /// Body fetches that landed this beat, in arrival order.
+    content: Vec<(
+        u64,
+        clank_core::wait::ContentRef,
+        event_content::ContentState,
+    )>,
 }
 
 /// Fold a drained event burst into a [`Batch`]. Stdin chunks are
@@ -1134,12 +1245,20 @@ fn coalesce(events: impl IntoIterator<Item = Ev>) -> Batch {
         input: Vec::new(),
         refresh: false,
         resize: false,
+        content: Vec::new(),
     };
     for ev in events {
         match ev {
             Ev::Stdin(bytes) => b.input.extend(bytes),
             Ev::Refresh => b.refresh = true,
             Ev::Resize => b.resize = true,
+            // Each completion is DATA, not a flag — folding two into
+            // one would drop an answer the page is waiting for.
+            Ev::Content {
+                generation,
+                target,
+                state,
+            } => b.content.push((generation, target, state)),
         }
     }
     b
@@ -1198,6 +1317,9 @@ pub(crate) async fn run_tui(
             }
         });
     }
+    // Kept for the content fetches spawned later; the stdin reader
+    // takes its own clone rather than the original.
+    let ev_tx_content = ev_tx.clone();
     std::thread::spawn(move || {
         let mut buf = [0u8; 16];
         loop {
@@ -1254,6 +1376,10 @@ pub(crate) async fn run_tui(
     // The open EVENT page (tui-github-event-page); invariant: `Some`
     // ⟺ mode is `EventDetail` (set/cleared together, like plan_page).
     let mut event_page: Option<EventPage> = None;
+    // Monotonic across the whole session: every request the page makes
+    // gets a number, and only the newest one's answer is wanted
+    // (tui-github-event-content, Contract 3).
+    let mut content_generation: u64 = 0;
     // The open plan-page text input's buffer (Mode::PlanInput carries
     // only the KIND — same Copy-preserving split as `plan_page`).
     let mut plan_input: Option<TextInput> = None;
@@ -1311,6 +1437,27 @@ pub(crate) async fn run_tui(
             };
             paint(&lines);
             match ev_rx.recv_timeout(Duration::from_secs(60)) {
+                // The page is behind this overlay, not gone: applying
+                // here keeps a completion that arrives mid-overlay
+                // instead of stranding the slot on Loading.
+                Ok(Ev::Content {
+                    generation,
+                    target,
+                    state,
+                }) => {
+                    let before = event_page.as_ref().map(actions_for).unwrap_or_default();
+                    if let Some(slot) = event_page.as_mut().and_then(|p| p.content.as_mut()) {
+                        slot.apply(generation, &target, state);
+                    }
+                    // The page is behind this overlay and its stored
+                    // selection outlives it, so rebind here too.
+                    if let (Some(ep), Mode::EventDetail { sel }) = (event_page.as_ref(), &mode) {
+                        let after = actions_for(ep);
+                        mode = Mode::EventDetail {
+                            sel: rebind_event_sel(&before, *sel, &after),
+                        };
+                    }
+                }
                 Ok(Ev::Stdin(bytes)) => {
                     for k in parse_keys(&bytes) {
                         match doc_nav(k, page) {
@@ -1483,6 +1630,26 @@ pub(crate) async fn run_tui(
                 let batch = coalesce(
                     std::iter::once(first).chain(std::iter::from_fn(|| ev_rx.try_recv().ok())),
                 );
+                // Body fetches that landed: each is applied only if
+                // the page still wants it (Contract 3). A refused one
+                // is silently dropped — it answers a question nobody
+                // is asking any more.
+                if !batch.content.is_empty() {
+                    let before = event_page.as_ref().map(actions_for).unwrap_or_default();
+                    for (generation, target, state) in batch.content {
+                        if let Some(slot) = event_page.as_mut().and_then(|p| p.content.as_mut()) {
+                            slot.apply(generation, &target, state);
+                        }
+                    }
+                    // Availability may have moved under the cursor;
+                    // keep it on the action it was on.
+                    if let (Some(ep), Mode::EventDetail { sel }) = (event_page.as_ref(), &mode) {
+                        let after = actions_for(ep);
+                        mode = Mode::EventDetail {
+                            sel: rebind_event_sel(&before, *sel, &after),
+                        };
+                    }
+                }
                 // Incremental parse: ONE key at a time, interpretation
                 // picked from the CURRENT mode — a pasted `f<subject>⏎`
                 // crosses into input mode mid-buffer and its text must
@@ -1806,7 +1973,7 @@ pub(crate) async fn run_tui(
                                 mode = Mode::LogScroll; // invariant breach — bail out
                                 continue;
                             };
-                            let actions = event_actions(ep.event.url.is_some(), ep.event.unhandled);
+                            let actions = actions_for(&ep);
                             // A displayed hotkey acts DIRECTLY, leaving the
                             // selection where it was — pressing `o` must not
                             // silently re-aim what Enter would do next
@@ -1848,6 +2015,35 @@ pub(crate) async fn run_tui(
                                         // unhandled and visible).
                                         let _ = crate::cli::events::ack_members(&repo, &keys);
                                         refresh_pending = true;
+                                    }
+                                    EventEffect::RetryContent => {
+                                        // A NEW generation, so the
+                                        // failed attempt cannot land
+                                        // on top of this one if it
+                                        // finishes late.
+                                        let before = actions_for(&ep);
+                                        if let Some(live) = event_page.as_mut()
+                                            && let Some(slot) = live.content.as_mut()
+                                        {
+                                            content_generation += 1;
+                                            slot.retry(content_generation);
+                                            spawn_content_fetch(
+                                                &ev_tx_content,
+                                                live.event.repo.clone(),
+                                                slot.target.clone(),
+                                                content_generation,
+                                            );
+                                        }
+                                        // Retry vanishes the moment it
+                                        // is pressed (Loading is not
+                                        // retryable), so the cursor
+                                        // must move with it.
+                                        if let Some(live) = event_page.as_ref() {
+                                            let after = actions_for(live);
+                                            mode = Mode::EventDetail {
+                                                sel: rebind_event_sel(&before, sel, &after),
+                                            };
+                                        }
                                     }
                                     EventEffect::Close => {
                                         event_page = None;
@@ -2005,6 +2201,25 @@ pub(crate) async fn run_tui(
                                     if let Some(ev) = snapshot.github_events.get(*event_idx)
                                         && let Some(first) = ev.members.first()
                                     {
+                                        let want =
+                                            crate::cli::github_timeline::resolve_content_ref(
+                                                &ev.members,
+                                                &first.key,
+                                            )
+                                            .cloned();
+                                        let slot = want.map(|target| {
+                                            content_generation += 1;
+                                            spawn_content_fetch(
+                                                &ev_tx_content,
+                                                ev.repo.clone(),
+                                                target.clone(),
+                                                content_generation,
+                                            );
+                                            event_content::ContentSlot::requesting(
+                                                target,
+                                                content_generation,
+                                            )
+                                        });
                                         event_page = Some(EventPage {
                                             target: first.key.clone(),
                                             retained: ev
@@ -2015,6 +2230,7 @@ pub(crate) async fn run_tui(
                                             event: ev.clone(),
                                             prompts: event_prompts(&repo, ev),
                                             scroll: 0,
+                                            content: slot,
                                         });
                                         mode = Mode::EventDetail { sel: 0 };
                                     }
@@ -2268,13 +2484,25 @@ pub(crate) async fn run_tui(
                     // member-key set; a vanished component closes to
                     // the log (tui-github-event-page).
                     Mode::EventDetail { sel } => {
-                        if refetch_event_page(&mut event_page, &snapshot.github_events) {
-                            if let Some(ep) = event_page.as_mut() {
-                                ep.prompts = event_prompts(&repo, &ep.event.clone());
+                        match retarget_event_page(
+                            &mut event_page,
+                            &snapshot.github_events,
+                            &repo,
+                            sel,
+                            &mut content_generation,
+                        ) {
+                            Some(r) => {
+                                if let Some((repo_slug, target, generation)) = r.fetch {
+                                    spawn_content_fetch(
+                                        &ev_tx_content,
+                                        repo_slug,
+                                        target,
+                                        generation,
+                                    );
+                                }
+                                Mode::EventDetail { sel: r.sel }
                             }
-                            Mode::EventDetail { sel }
-                        } else {
-                            Mode::LogScroll
+                            None => Mode::LogScroll,
                         }
                     }
                     Mode::PlanDetail { sel } => {
@@ -2342,6 +2570,7 @@ pub(crate) mod tests {
             },
             acked,
             transport: crate::cli::github_event_log::Transport::Poll,
+            content: None,
         }
     }
 
@@ -2364,6 +2593,91 @@ pub(crate) mod tests {
         }
     }
 
+    /// A one-member page whose content slot the caller sets.
+    fn mk_page() -> EventPage {
+        let ev = mk_event(vec![mk_member("alpha", 1, "f:1", false)]);
+        EventPage {
+            target: ev.members[0].key.clone(),
+            retained: ev.members.iter().map(|m| m.key.clone()).collect(),
+            event: ev,
+            prompts: Vec::new(),
+            scroll: 0,
+            content: None,
+        }
+    }
+
+    #[test]
+    fn retry_is_offered_only_where_it_can_help() {
+        use clank_core::wait::ContentRef;
+        use event_content::{ContentSlot, ContentState, EventBody};
+
+        let page_with = |state: Option<ContentState>| {
+            let mut ep = mk_page();
+            ep.content = state.map(|st| {
+                let mut slot = ContentSlot::requesting(ContentRef::Pr { number: 1 }, 1);
+                slot.state = st;
+                slot
+            });
+            ep
+        };
+        let offers_retry = |ep: &EventPage| actions_for(ep).contains(&EventAction::Retry);
+
+        assert!(
+            offers_retry(&page_with(Some(ContentState::Failed("500".into())))),
+            "a retryable failure must offer the retry"
+        );
+        assert!(
+            !offers_retry(&page_with(Some(ContentState::Loading))),
+            "nothing to retry while the first request is in flight"
+        );
+        assert!(
+            !offers_retry(&page_with(Some(ContentState::Unavailable("gone".into())))),
+            "a deleted object must not offer a retry that can never work"
+        );
+        assert!(
+            !offers_retry(&page_with(Some(ContentState::Ready(EventBody {
+                body: "b".into(),
+                author: None,
+                url: None,
+            })))),
+            "no retry once the body is on screen"
+        );
+        assert!(
+            !offers_retry(&page_with(None)),
+            "an event that names no object has nothing to retry"
+        );
+    }
+
+    #[test]
+    fn the_browser_action_prefers_the_fetched_permalink() {
+        use clank_core::wait::ContentRef;
+        use event_content::{ContentSlot, ContentState, EventBody};
+
+        // The record's url is the issue/PR page; the FETCHED object
+        // carries the anchored comment link the record never had, and
+        // that anchor is the point of opening from a comment event.
+        let mut ep = mk_page();
+        ep.event.url = Some("https://github.com/o/r/pull/9".into());
+        assert_eq!(
+            event_open_url(&ep).as_deref(),
+            Some("https://github.com/o/r/pull/9"),
+            "with no body yet, the record's url still opens"
+        );
+
+        let mut slot = ContentSlot::requesting(ContentRef::ReviewComment { id: 5 }, 1);
+        slot.state = ContentState::Ready(EventBody {
+            body: "b".into(),
+            author: None,
+            url: Some("https://github.com/o/r/pull/9#discussion_r5".into()),
+        });
+        ep.content = Some(slot);
+        assert_eq!(
+            event_open_url(&ep).as_deref(),
+            Some("https://github.com/o/r/pull/9#discussion_r5"),
+            "once fetched, the anchored permalink wins"
+        );
+    }
+
     #[test]
     fn event_action_effects_record_the_exact_url_and_fanout() {
         // codex 525cef1: the EXECUTED step is the seam — the effect
@@ -2382,6 +2696,7 @@ pub(crate) mod tests {
             event: ev,
             prompts: Vec::new(),
             scroll: 0,
+            content: None,
         };
         assert_eq!(
             event_action_effect(&ep, EventAction::OpenBrowser),
@@ -2453,6 +2768,167 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_retarget_that_changes_availability_keeps_the_cursor_on_its_action() {
+        // codex on 4390f27: the refresh ITSELF can change
+        // availability. A legacy page with [Ack, Back] and Back
+        // selected gains a URL on refresh; capturing the action list
+        // after the retarget would record index 1 as Ack, silently
+        // moving the operator's cursor onto Ack.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut page = Some(mk_page());
+        // Starts with no URL: [Ack, Back], Back at index 1.
+        if let Some(p) = page.as_mut() {
+            p.event.url = None;
+        }
+        let before = actions_for(page.as_ref().unwrap());
+        assert_eq!(before, vec![EventAction::Ack, EventAction::Back]);
+        let sel = 1;
+
+        // The refreshed component carries a URL, so OpenBrowser
+        // appears ahead of everything.
+        let mut refreshed = page.as_ref().unwrap().event.clone();
+        refreshed.url = Some("https://github.com/o/r/pull/12".into());
+        let mut generation = 0;
+        let r = retarget_event_page(&mut page, &[refreshed], tmp.path(), sel, &mut generation)
+            .expect("the component survives");
+
+        let after = actions_for(page.as_ref().unwrap());
+        assert_eq!(
+            after,
+            vec![
+                EventAction::OpenBrowser,
+                EventAction::Ack,
+                EventAction::Back
+            ]
+        );
+        assert_eq!(
+            after[r.sel],
+            EventAction::Back,
+            "the cursor must follow Back, not stay on an index that now \
+             means Ack"
+        );
+    }
+
+    #[test]
+    fn a_retarget_that_keeps_the_same_object_issues_no_request() {
+        // The bounded-request property at the seam that actually
+        // decides it: an unchanged target must not spawn a fetch,
+        // however many refreshes arrive.
+        use clank_core::wait::ContentRef;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut page = Some(mk_page());
+        if let Some(p) = page.as_mut() {
+            p.content = Some(event_content::ContentSlot::requesting(
+                ContentRef::Pr { number: 1 },
+                1,
+            ));
+        }
+        // The refreshed component resolves to no reference at all
+        // (legacy rows), so the slot is dropped and nothing refetches
+        // in a loop; then a second pass with the same state must also
+        // stay quiet.
+        let same = page.as_ref().unwrap().event.clone();
+        let mut generation = 1;
+        let first = retarget_event_page(&mut page, &[same.clone()], tmp.path(), 0, &mut generation)
+            .expect("survives");
+        let second = retarget_event_page(&mut page, &[same], tmp.path(), 0, &mut generation)
+            .expect("survives");
+        assert!(
+            second.fetch.is_none(),
+            "a settled target must not re-request on every refresh"
+        );
+        let _ = first;
+    }
+
+    #[test]
+    fn an_async_availability_change_does_not_repurpose_the_cursor() {
+        // codex on dcc04f9, concrete: while Loading the list is
+        // [Open, Ack, Back] and the operator selects Back at index 2.
+        // A Failed completion inserts Retry ABOVE Back, so without
+        // rebinding, index 2 now means Retry and Enter retries instead
+        // of closing the page.
+        use clank_core::wait::ContentRef;
+        use event_content::{ContentSlot, ContentState};
+
+        let mut ep = mk_page();
+        ep.event.url = Some("u".into());
+        ep.content = Some(ContentSlot::requesting(ContentRef::Pr { number: 1 }, 1));
+
+        let before = actions_for(&ep);
+        assert_eq!(
+            before,
+            vec![
+                EventAction::OpenBrowser,
+                EventAction::Ack,
+                EventAction::Back
+            ]
+        );
+        let sel = 2;
+        assert_eq!(before[sel], EventAction::Back);
+
+        // Loading → Failed.
+        if let Some(slot) = ep.content.as_mut() {
+            slot.state = ContentState::Failed("500".into());
+        }
+        let after = actions_for(&ep);
+        assert_eq!(
+            after,
+            vec![
+                EventAction::OpenBrowser,
+                EventAction::Ack,
+                EventAction::Retry,
+                EventAction::Back
+            ]
+        );
+        let moved = rebind_event_sel(&before, sel, &after);
+        assert_eq!(
+            after[moved],
+            EventAction::Back,
+            "the cursor must still be on Back, not on the Retry that \
+             appeared under it"
+        );
+
+        // Retry → Loading: Retry disappears from under the cursor.
+        let before = after;
+        let sel = 2;
+        assert_eq!(before[sel], EventAction::Retry);
+        if let Some(slot) = ep.content.as_mut() {
+            slot.retry(2);
+        }
+        let after = actions_for(&ep);
+        assert!(!after.contains(&EventAction::Retry));
+        let moved = rebind_event_sel(&before, sel, &after);
+        assert_eq!(
+            after[moved],
+            EventAction::Back,
+            "a vanished action falls back to Back, never to something \
+             that acts"
+        );
+    }
+
+    #[test]
+    fn a_refresh_re_requests_only_when_the_object_changed() {
+        use clank_core::wait::ContentRef;
+        let a = ContentRef::ReviewComment { id: 1 };
+        let b = ContentRef::ReviewComment { id: 2 };
+
+        // The property that bounds the request stream: an unchanged
+        // target must issue NOTHING, however many refreshes arrive.
+        assert!(
+            !content_needs_refetch(Some(&a), Some(&a)),
+            "an unchanged target must never re-request — the TUI \
+             refreshes on every watcher event, so this is what keeps a \
+             persistent failure from becoming a request storm"
+        );
+        // Retargeting to a different object must.
+        assert!(content_needs_refetch(Some(&a), Some(&b)));
+        // Gaining or losing a reference is also a change.
+        assert!(content_needs_refetch(None, Some(&a)));
+        assert!(content_needs_refetch(Some(&a), None));
+        assert!(!content_needs_refetch(None, None));
+    }
+
+    #[test]
     fn event_page_retargets_through_the_retained_set() {
         // The retarget contract (tui-github-event-page): first
         // surviving retained key wins — including across a component
@@ -2466,6 +2942,7 @@ pub(crate) mod tests {
             event: mk_event(vec![a.clone(), b.clone()]),
             prompts: Vec::new(),
             scroll: 0,
+            content: None,
         });
 
         // Target's copy vanished; beta's survives in a fresh component.
@@ -2483,6 +2960,7 @@ pub(crate) mod tests {
             event: mk_event(vec![a.clone(), b.clone()]),
             prompts: Vec::new(),
             scroll: 0,
+            content: None,
         });
         let split = vec![mk_event(vec![b.clone()]), mk_event(vec![a.clone()])];
         assert!(refetch_event_page(&mut split_page, &split));

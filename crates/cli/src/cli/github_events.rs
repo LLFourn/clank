@@ -168,6 +168,7 @@ pub(crate) fn classify_event(
                 // Never at classification (github-watch-prompts):
                 // the WAL stores no prompt; presentation stamps it.
                 instructions: None,
+                content: None,
             },
             key: head.map(|h| format!("push@{full_ref}+{h}")),
             feed_id: None,
@@ -243,11 +244,68 @@ pub(crate) fn classify_event(
                 .and_then(|u| u.as_str())
                 .map(str::to_string),
             instructions: None,
+            content: content_ref(kind, detail, payload, obj),
         },
         key,
         feed_id: None,
         event_at,
     })
+}
+
+/// The dedup namespace and payload container for a comment-family
+/// event. Factored out of `action_key` so [`content_ref`] reads the
+/// SAME fact instead of a second copy that can drift — the key's
+/// output is unchanged by construction.
+fn comment_ns_container(detail: Option<&str>) -> (&'static str, &'static str) {
+    match detail {
+        Some("review") => ("review", "review"),
+        Some("review_comment") => ("review_comment", "comment"),
+        Some("issue_comment_on_pr") => ("pr_issue_comment", "comment"),
+        _ => ("issue_comment", "comment"),
+    }
+}
+
+/// Which object carries this event's body
+/// (tui-github-event-content). Derived from the payload, never from
+/// `action_key`: the dedup string's shape must not become
+/// load-bearing anywhere else.
+fn content_ref(
+    kind: GithubEventKind,
+    detail: Option<&str>,
+    payload: &serde_json::Value,
+    obj: &serde_json::Value,
+) -> Option<clank_core::wait::ContentRef> {
+    use clank_core::wait::ContentRef;
+    let number = obj.get("number").and_then(|n| n.as_u64());
+    match kind {
+        GithubEventKind::PrOpened | GithubEventKind::PrUpdated | GithubEventKind::PrMerged => {
+            Some(ContentRef::Pr { number: number? })
+        }
+        GithubEventKind::IssueOpened | GithubEventKind::IssueClosed => {
+            Some(ContentRef::Issue { number: number? })
+        }
+        GithubEventKind::PrComment | GithubEventKind::IssueComment => {
+            let (ns, container) = comment_ns_container(detail);
+            let id = payload
+                .get(container)
+                .and_then(|c| c.get("id"))
+                .and_then(|i| i.as_u64())?;
+            Some(match ns {
+                // A review is addressed THROUGH its PR, so a missing
+                // number makes it unaddressable — no reference rather
+                // than a wrong one.
+                "review" => ContentRef::Review {
+                    number: number?,
+                    id,
+                },
+                "review_comment" => ContentRef::ReviewComment { id },
+                "pr_issue_comment" => ContentRef::PrIssueComment { id },
+                _ => ContentRef::IssueComment { id },
+            })
+        }
+        // A push has no single object to read a body from.
+        GithubEventKind::BranchPush => None,
+    }
 }
 
 /// The normalized action identity for the non-push kinds — SHARED by
@@ -284,12 +342,7 @@ fn action_key(
         // namespaced by the classified subtype so equal numeric ids
         // across families never collide (codex bf1e1ea).
         GithubEventKind::PrComment | GithubEventKind::IssueComment => {
-            let (ns, container) = match detail {
-                Some("review") => ("review", "review"),
-                Some("review_comment") => ("review_comment", "comment"),
-                Some("issue_comment_on_pr") => ("pr_issue_comment", "comment"),
-                _ => ("issue_comment", "comment"),
-            };
+            let (ns, container) = comment_ns_container(detail);
             let id = payload
                 .get(container)
                 .and_then(|c| c.get("id"))
@@ -380,6 +433,7 @@ pub(crate) fn classify_webhook(
                 // Never at classification (github-watch-prompts):
                 // the WAL stores no prompt; presentation stamps it.
                 instructions: None,
+                content: None,
             },
             key: after.map(|a| format!("push@{full_ref}+{a}")),
             feed_id: None,
@@ -447,6 +501,7 @@ pub(crate) fn classify_webhook(
                 .and_then(|u| u.as_str())
                 .map(str::to_string),
             instructions: None,
+            content: content_ref(kind, detail, payload, obj),
         },
         key,
         feed_id: None,
@@ -956,8 +1011,10 @@ impl<S: HttpSend> GithubSession<S> {
     }
 
     /// Authorized GET with the uniform 401 handling, every await
-    /// bounded (github-watch-resilience).
-    async fn get(&self, url: &str, etag: Option<&str>) -> anyhow::Result<MiniResponse> {
+    /// bounded (github-watch-resilience). `pub(crate)` so the event
+    /// page's content fetch shares this ONE authorized path rather
+    /// than opening a second one (tui-github-event-content).
+    pub(crate) async fn get(&self, url: &str, etag: Option<&str>) -> anyhow::Result<MiniResponse> {
         let token = self.token_within_deadline().await?;
         let resp = self.send_within_deadline(url, &token, etag).await?;
         if resp.status != 401 {
@@ -2568,6 +2625,197 @@ mod tests {
     }
 
     #[test]
+    fn classification_actually_persists_the_reference() {
+        // The helper being right proves nothing if the classifier does
+        // not call it. Drive the REAL entry point and read the field
+        // back off the produced item.
+        use clank_core::wait::ContentRef;
+        let all = &[GithubEventKind::PrComment, GithubEventKind::PrOpened][..];
+        let got = |event: &str, payload: serde_json::Value| {
+            classify_webhook("o/r", event, &payload, all, Some("me"), false, &[]).map(|c| {
+                match c.item {
+                    WaitItem::GithubEvent { content, .. } => content,
+                    other => panic!("unexpected {other:?}"),
+                }
+            })
+        };
+
+        assert_eq!(
+            got(
+                "pull_request_review_comment",
+                serde_json::json!({
+                    "action": "created",
+                    "pull_request": {"number": 42, "title": "t", "html_url": "u"},
+                    "comment": {"id": 900}
+                })
+            ),
+            Some(Some(ContentRef::ReviewComment { id: 900 }))
+        );
+        assert_eq!(
+            got(
+                "pull_request_review",
+                serde_json::json!({
+                    "action": "submitted",
+                    "pull_request": {"number": 42, "title": "t", "html_url": "u"},
+                    "review": {"id": 901}
+                })
+            ),
+            Some(Some(ContentRef::Review {
+                number: 42,
+                id: 901
+            }))
+        );
+        assert_eq!(
+            got(
+                "pull_request",
+                serde_json::json!({
+                    "action": "opened",
+                    "pull_request": {"number": 42, "title": "t", "html_url": "u"}
+                })
+            ),
+            Some(Some(ContentRef::Pr { number: 42 }))
+        );
+    }
+
+    #[test]
+    fn content_refs_address_each_comment_family_and_carry_what_the_endpoint_takes() {
+        use clank_core::wait::ContentRef;
+        let comment = |id: u64| serde_json::json!({"comment": {"id": id}});
+        let review = |id: u64| serde_json::json!({"review": {"id": id}});
+        let obj = serde_json::json!({"number": 42});
+
+        let cases: Vec<(GithubEventKind, Option<&str>, serde_json::Value, ContentRef)> = vec![
+            (
+                GithubEventKind::IssueComment,
+                None,
+                comment(7),
+                ContentRef::IssueComment { id: 7 },
+            ),
+            (
+                GithubEventKind::PrComment,
+                Some("issue_comment_on_pr"),
+                comment(7),
+                ContentRef::PrIssueComment { id: 7 },
+            ),
+            (
+                GithubEventKind::PrComment,
+                Some("review_comment"),
+                comment(7),
+                ContentRef::ReviewComment { id: 7 },
+            ),
+            (
+                // The one addressed THROUGH its PR: same id, and the
+                // number is part of the address rather than decoration.
+                GithubEventKind::PrComment,
+                Some("review"),
+                review(7),
+                ContentRef::Review { number: 42, id: 7 },
+            ),
+            (
+                GithubEventKind::PrOpened,
+                None,
+                serde_json::json!({}),
+                ContentRef::Pr { number: 42 },
+            ),
+            (
+                GithubEventKind::IssueOpened,
+                None,
+                serde_json::json!({}),
+                ContentRef::Issue { number: 42 },
+            ),
+        ];
+        for (kind, detail, payload, want) in cases {
+            assert_eq!(
+                content_ref(kind, detail, &payload, &obj),
+                Some(want.clone()),
+                "{kind:?}/{detail:?} must address {want:?}"
+            );
+        }
+
+        // Endpoints differ per family — the whole reason the variants
+        // are distinct.
+        assert_eq!(
+            ContentRef::IssueComment { id: 7 }.path("o/r"),
+            "/repos/o/r/issues/comments/7"
+        );
+        assert_eq!(
+            ContentRef::ReviewComment { id: 7 }.path("o/r"),
+            "/repos/o/r/pulls/comments/7"
+        );
+        assert_eq!(
+            ContentRef::Review { number: 42, id: 7 }.path("o/r"),
+            "/repos/o/r/pulls/42/reviews/7"
+        );
+        assert_eq!(
+            ContentRef::Pr { number: 42 }.path("o/r"),
+            "/repos/o/r/pulls/42"
+        );
+        assert_eq!(
+            ContentRef::Issue { number: 42 }.path("o/r"),
+            "/repos/o/r/issues/42"
+        );
+    }
+
+    #[test]
+    fn an_unaddressable_object_yields_no_reference_rather_than_a_wrong_one() {
+        // Same rule action_key already follows: never manufacture an
+        // identity. A review with no PR number cannot be addressed, and
+        // a comment with no id cannot either.
+        let no_number = serde_json::json!({});
+        assert_eq!(
+            content_ref(
+                GithubEventKind::PrComment,
+                Some("review"),
+                &serde_json::json!({"review": {"id": 7}}),
+                &no_number,
+            ),
+            None,
+            "a review needs its PR number to be addressable"
+        );
+        assert_eq!(
+            content_ref(
+                GithubEventKind::IssueComment,
+                None,
+                &serde_json::json!({"comment": {}}),
+                &serde_json::json!({"number": 42}),
+            ),
+            None,
+            "no comment id → no reference"
+        );
+        assert_eq!(
+            content_ref(
+                GithubEventKind::BranchPush,
+                None,
+                &serde_json::json!({}),
+                &no_number,
+            ),
+            None,
+            "a push has no single body to read"
+        );
+    }
+
+    #[test]
+    fn a_legacy_event_row_still_decodes_and_stays_byte_identical() {
+        // Every row logged before the reference existed lacks the key.
+        // It must decode (serde default) AND re-serialize unchanged,
+        // or the WAL rewrites itself on first read.
+        let legacy = r#"{"kind":"github_event","repo":"o/r","event":"pr_comment","detail":"review","number":42,"title":"t","actor":"a","url":"u"}"#;
+        let item: clank_core::wait::WaitItem =
+            serde_json::from_str(legacy).expect("legacy rows must still decode");
+        match &item {
+            clank_core::wait::WaitItem::GithubEvent { content, .. } => {
+                assert!(content.is_none(), "absent, not defaulted to something");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_eq!(
+            serde_json::to_string(&item).unwrap(),
+            legacy,
+            "a legacy row must round-trip byte-for-byte"
+        );
+    }
+
+    #[test]
     fn action_keys_are_namespaced_and_never_manufactured() {
         // codex bf1e1ea: comment-family ids live in different resource
         // domains — the SAME numeric id across families must yield
@@ -2981,6 +3229,7 @@ mod tests {
                 actor: None,
                 url: None,
                 instructions: None,
+                content: None,
             },
             key: key.map(str::to_string),
             feed_id: None,

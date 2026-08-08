@@ -61,6 +61,54 @@ pub enum PrMasterNext {
     Continue,
 }
 
+/// Which GitHub object an event's BODY should be read from
+/// (tui-github-event-content).
+///
+/// Extracted at classification ALONGSIDE the dedup key, never parsed
+/// back out of it: `action_key`'s string shape is a dedup detail, and
+/// making it load-bearing in a second place is how dedup gets changed
+/// by accident.
+///
+/// The variants are not addressed uniformly — a review needs its PR
+/// number as well as its id — so each one carries exactly what its
+/// endpoint takes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "ref", rename_all = "snake_case")]
+pub enum ContentRef {
+    /// A comment on an issue.
+    IssueComment { id: u64 },
+    /// A comment on a PR's conversation tab. Same REST resource as
+    /// [`IssueComment`](Self::IssueComment); distinct because the
+    /// event families are distinct and the page says different
+    /// things about them.
+    PrIssueComment { id: u64 },
+    /// An inline review comment on a diff.
+    ReviewComment { id: u64 },
+    /// A submitted review. The number is part of the ADDRESS.
+    Review { number: u64, id: u64 },
+    /// The pull request itself (opened/updated/merged).
+    Pr { number: u64 },
+    /// The issue itself (opened/closed).
+    Issue { number: u64 },
+}
+
+impl ContentRef {
+    /// The REST path for this object under `owner/name`.
+    pub fn path(&self, repo: &str) -> String {
+        match self {
+            ContentRef::IssueComment { id } | ContentRef::PrIssueComment { id } => {
+                format!("/repos/{repo}/issues/comments/{id}")
+            }
+            ContentRef::ReviewComment { id } => format!("/repos/{repo}/pulls/comments/{id}"),
+            ContentRef::Review { number, id } => {
+                format!("/repos/{repo}/pulls/{number}/reviews/{id}")
+            }
+            ContentRef::Pr { number } => format!("/repos/{repo}/pulls/{number}"),
+            ContentRef::Issue { number } => format!("/repos/{repo}/issues/{number}"),
+        }
+    }
+}
+
 /// Flat tagged list `wait` returns from one refold round.
 /// Actionable items (`Master`, `Reviewer`) and terminal events
 /// (`Finished`) sit at the same level. Empty list at the call
@@ -156,6 +204,12 @@ pub enum WaitItem {
         /// promptless watches).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         instructions: Option<String>,
+        /// Which object carries this event's body
+        /// (tui-github-event-content). Absent on every row logged
+        /// before it existed, and skipped when absent, so legacy WAL
+        /// bytes are unchanged and legacy rows still decode.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        content: Option<ContentRef>,
     },
     /// …and a command source completing (its exit IS the wake).
     /// `exit_code` is `None` for a signal-killed child.
