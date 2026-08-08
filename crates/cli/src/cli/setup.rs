@@ -210,9 +210,10 @@ const HOOK_ID: &str = "clank-stop-hook";
 const LEGACY_COMMAND_PREFIX: &str = "clank stop-hook";
 
 /// Per-tool hook timeout we write into the agent's hook config.
-/// 24 hours — effectively infinite. The clank-side `wait_timeout`
-/// in the agent's local AgentConfig is the real timer; this just
-/// stops the agent's hook runner from killing the process early.
+/// 24 hours — effectively infinite. Nothing on the clank side races
+/// it any more: the in-hook poll parks until work, this ceiling, or
+/// the hook's own death (remove-wait-timeout). It exists only to
+/// stop the agent's hook runner from killing the process early.
 pub(crate) const HOOK_TIMEOUT_SECS: u64 = 86400;
 
 /// The per-tool user-scope skill dirs. Grok dedupes its claude-compat

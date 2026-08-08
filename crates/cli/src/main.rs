@@ -227,12 +227,10 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Map error variants to exit codes. Defaults to 1; `wait` timeout
-/// returns 2; status's "ambiguous active plans" returns 3.
+/// Map error variants to exit codes. Defaults to 1. `wait` no longer
+/// has an expected non-zero exit: it parks until a wake, a real
+/// error, or owner death (remove-wait-timeout), so exit 2 is free.
 fn exit_code_for(err: &anyhow::Error) -> i32 {
-    if err.downcast_ref::<cli::wait::WaitTimeout>().is_some() {
-        return 2;
-    }
     if err.downcast_ref::<cli::doctor::DoctorFailed>().is_some() {
         return 1;
     }

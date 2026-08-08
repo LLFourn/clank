@@ -474,7 +474,7 @@ pub async fn run_fork_pinned(
     // bound session in the source forks it; anyone else gets a FRESH
     // session on launch (spec with no from_session) — warned, never
     // failed. Each member's full source config rides along so
-    // auto_mode/wait_timeout carbon-copy into the fork
+    // auto_mode carbon-copies into the fork
     // (fork-carbon-copy-agent-config).
     struct MemberSeed {
         label: AgentLabel,
@@ -639,11 +639,10 @@ pub async fn run_fork_pinned(
         // (fork-carbon-copy-agent-config). `clank as` later MERGES the
         // new session into this config, preserving these fields.
         if let Some(src_cfg) = &seed.cfg
-            && (src_cfg.auto_mode.is_some() || src_cfg.wait_timeout.is_some())
+            && src_cfg.auto_mode.is_some()
         {
             let carried = clank_core::agent_config::AgentConfig {
                 auto_mode: src_cfg.auto_mode,
-                wait_timeout: src_cfg.wait_timeout.clone(),
                 session: None,
                 // Extra wake sources are per-repo watch lists; the
                 // fork's controller context differs — start clean.

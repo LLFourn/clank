@@ -468,10 +468,15 @@ pub struct WaitArgs {
     /// `.clank/config.json`'s `master` field, else `reviewer`.
     #[arg(long, value_enum)]
     pub role: Option<WaitRole>,
-    /// Maximum wait. Accepts `30s`, `5m`, `1h`. `0` (default) means
-    /// wait indefinitely.
-    #[arg(long, default_value = "0", value_name = "DURATION")]
-    pub timeout: String,
+    /// Exit when the process that spawned this wait goes away.
+    ///
+    /// The spawner must hand this process a pipe as stdin and hold
+    /// the write end; EOF then means the owner is gone, which the
+    /// kernel reports on an orderly exit and a SIGKILL alike. Opt-in
+    /// on purpose: without it stdin is ignored, so an interactive
+    /// `clank wait < /dev/null` does not exit the moment it starts.
+    #[arg(long)]
+    pub die_with_owner: bool,
     /// Emit JSON instead of the human rendering.
     #[arg(short = 'j', long)]
     pub json: bool,
@@ -915,11 +920,6 @@ pub struct AutoOnArgs {
     /// currently holds it.
     #[arg(long, value_enum)]
     pub role: Option<RoleArg>,
-    /// Override the wait-for-work timeout (e.g. `30m`, `5m`,
-    /// `45s`). Omit to leave unchanged; `null` in the underlying
-    /// config means "indefinite".
-    #[arg(long, value_name = "DUR")]
-    pub wait_timeout: Option<String>,
 }
 
 #[derive(Args, Debug)]

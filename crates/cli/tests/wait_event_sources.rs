@@ -30,12 +30,12 @@ fn write(repo: &Path, rel: &str, body: &str) {
     std::fs::write(abs, body).unwrap();
 }
 
-fn wait_args(repo: &Path, events: Vec<String>, timeout: &str) -> WaitArgs {
+fn wait_args(repo: &Path, events: Vec<String>) -> WaitArgs {
     WaitArgs {
         repo: Some(repo.to_path_buf()),
         author: Some("rev".into()),
         role: Some(WaitRole::Reviewer),
-        timeout: timeout.into(),
+        die_with_owner: false,
         json: true,
         events,
         r#for: None,
@@ -63,33 +63,35 @@ fn cmd_event(name: &str, argv: &[&str]) -> String {
     serde_json::json!({ "kind": "command", "name": name, "command": argv }).to_string()
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn command_completion_wakes_a_parked_wait() {
+    let _serial = common::serial();
     let env = idle_env();
     let repo = env.repo();
     let ev = cmd_event("probe", &["sh", "-c", "sleep 0.4; echo the-payload"]);
-    clank::cli::wait::run(wait_args(repo, vec![ev], "20s"))
+    clank::cli::wait::run(wait_args(repo, vec![ev]))
         .await
         .expect("the command's completion is the wake");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn timeout_kills_the_whole_process_group() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn returning_kills_the_whole_process_group() {
+    let _serial = common::serial();
     let env = idle_env();
     let repo = env.repo();
     let pidfile = repo.join("grandchild.pid");
     // The shell backgrounds a long sleep (a GRANDCHILD) and then waits
     // on it: only a group kill reaps the sleep.
     let script = format!("sleep 300 & echo $! > '{}'; wait", pidfile.display());
-    let ev = cmd_event("stuck", &["sh", "-c", &script]);
-    let err = clank::cli::wait::run(wait_args(repo, vec![ev], "3s"))
+    let stuck = cmd_event("stuck", &["sh", "-c", &script]);
+    // A second source that DOES complete supplies the wake. The wait
+    // used to be ended by its own timeout; with the flag gone, the
+    // teardown path under test is reached the way production reaches
+    // it — by a wake (remove-wait-timeout).
+    let waker = cmd_event("waker", &["sh", "-c", "sleep 1.5"]);
+    clank::cli::wait::run(wait_args(repo, vec![stuck, waker]))
         .await
-        .expect_err("no wake → timeout");
-    assert!(
-        err.downcast_ref::<clank::cli::wait::WaitTimeout>()
-            .is_some(),
-        "expected WaitTimeout, got {err:#}"
-    );
+        .expect("the waker's completion returns the wait");
     let pid: i32 = std::fs::read_to_string(&pidfile)
         .expect("grandchild pidfile written")
         .trim()
@@ -108,7 +110,7 @@ async fn timeout_kills_the_whole_process_group() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn chatty_output_is_bounded_and_signals_report_null_exit() {
     // Both contracts via the JSON the wait would emit — exercised at
     // the source-runner level through a real parked wait: a child that
@@ -120,36 +122,29 @@ async fn chatty_output_is_bounded_and_signals_report_null_exit() {
     let env = idle_env();
     let repo = env.repo();
     let chatty = cmd_event("chatty", &["sh", "-c", "yes xxxxxxxx | head -c 100000"]);
-    clank::cli::wait::run(wait_args(repo, vec![chatty], "20s"))
+    clank::cli::wait::run(wait_args(repo, vec![chatty]))
         .await
         .expect("bounded ring: a chatty child still wakes the wait");
 
     let signaled = cmd_event("selfkill", &["sh", "-c", "kill -9 $$"]);
-    clank::cli::wait::run(wait_args(repo, vec![signaled], "20s"))
+    clank::cli::wait::run(wait_args(repo, vec![signaled]))
         .await
         .expect("a signal-killed child still wakes the wait");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn zero_source_wait_parks_to_its_timeout() {
     // A wait with NO event sources parks to its deadline and returns
-    // WaitTimeout. (The no-hot-loop fuse itself is pinned
+    // parked. (The no-hot-loop fuse itself is pinned
     // deterministically by the `drain_external_fuses_a_closed_channel`
     // unit test — codex 907acd5 — since wall time can't distinguish a
     // spin from a park.)
     let env = idle_env();
     let repo = env.repo();
-    let err = clank::cli::wait::run(wait_args(repo, vec![], "2s"))
-        .await
-        .expect_err("idle, no sources → timeout");
-    assert!(
-        err.downcast_ref::<clank::cli::wait::WaitTimeout>()
-            .is_some(),
-        "expected WaitTimeout, got {err:#}"
-    );
+    common::assert_stays_parked(repo, wait_args(repo, vec![]), "idle with no sources").await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn root_exit_wakes_even_with_a_pipe_holding_descendant() {
     // codex fc7a4ff: "command COMPLETING is the wake" means ROOT exit,
     // not pipe EOF. The root backgrounds a sleeper that INHERITS
@@ -167,7 +162,7 @@ async fn root_exit_wakes_even_with_a_pipe_holding_descendant() {
     // wall-clock threshold under parallel load — codex fc7a4ff).
     let script = format!("sleep 300 & echo $! > '{}'; echo done", pidfile.display());
     let ev = cmd_event("root", &["sh", "-c", &script]);
-    clank::cli::wait::run(wait_args(repo, vec![ev], "20s"))
+    clank::cli::wait::run(wait_args(repo, vec![ev]))
         .await
         .expect("root exit wakes within the timeout, despite the pipe-holding descendant");
     let pid: i32 = std::fs::read_to_string(&pidfile)
@@ -187,7 +182,7 @@ async fn root_exit_wakes_even_with_a_pipe_holding_descendant() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn root_exit_wakes_even_with_a_continuously_writing_descendant() {
     // codex a69ddd8: a descendant that CONTINUOUSLY writes to the
     // inherited pipe keeps every post-exit read succeeding — the
@@ -199,7 +194,7 @@ async fn root_exit_wakes_even_with_a_continuously_writing_descendant() {
     let pidfile = repo.join("yes.pid");
     let script = format!("yes & echo $! > '{}'; echo done", pidfile.display());
     let ev = cmd_event("root", &["sh", "-c", &script]);
-    clank::cli::wait::run(wait_args(repo, vec![ev], "20s"))
+    clank::cli::wait::run(wait_args(repo, vec![ev]))
         .await
         .expect("root exit wakes despite a continuously-writing descendant");
     let pid: i32 = std::fs::read_to_string(&pidfile)
@@ -219,7 +214,7 @@ async fn root_exit_wakes_even_with_a_continuously_writing_descendant() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_command_event_during_the_refold_is_not_lost() {
     // codex 907acd5: the single return boundary drains once more after
     // the refold, so an external item that races a repo wake is never
@@ -229,24 +224,24 @@ async fn a_command_event_during_the_refold_is_not_lost() {
     let env = idle_env();
     let repo = env.repo();
     let ev = cmd_event("racer", &["sh", "-c", "sleep 0.6; echo hi"]);
-    let waiter = tokio::spawn(clank::cli::wait::run(wait_args(repo, vec![ev], "20s")));
+    let waiter = tokio::spawn(clank::cli::wait::run(wait_args(repo, vec![ev])));
     tokio::time::sleep(Duration::from_millis(400)).await;
     write(repo, ".clank/queue/500-p.md", "# p\n");
-    tokio::time::timeout(Duration::from_secs(15), waiter)
+    tokio::time::timeout(common::race_deadline(repo), waiter)
         .await
         .expect("a beat with repo + external readiness must return, not hang")
         .expect("join")
         .expect("returns a combined result");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn peek_starts_no_command_source() {
     // --peek returns from the initial pass, before sources spawn.
     let env = idle_env();
     let repo = env.repo();
     let marker = repo.join("source_ran.marker");
     let ev = cmd_event("touch", &["touch", marker.to_str().unwrap()]);
-    let mut args = wait_args(repo, vec![ev], "0");
+    let mut args = wait_args(repo, vec![ev]);
     args.peek = true;
     clank::cli::wait::run(args).await.expect("peek returns");
     // Give any (erroneously) spawned source a moment to run.
@@ -254,7 +249,7 @@ async fn peek_starts_no_command_source() {
     assert!(!marker.exists(), "--peek must spawn no source");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_fast_source_wins_and_the_slow_source_is_group_killed() {
     // Two sources: one completes fast (the wake), one is a stuck shell
     // with a backgrounded grandchild. On return the supervisor aborts
@@ -266,7 +261,7 @@ async fn a_fast_source_wins_and_the_slow_source_is_group_killed() {
     let slow_script = format!("sleep 300 & echo $! > '{}'; wait", pidfile.display());
     let slow = cmd_event("slow", &["sh", "-c", &slow_script]);
     let fast = cmd_event("fast", &["sh", "-c", "sleep 0.5; echo done"]);
-    clank::cli::wait::run(wait_args(repo, vec![slow, fast], "20s"))
+    clank::cli::wait::run(wait_args(repo, vec![slow, fast]))
         .await
         .expect("the fast source wakes the wait");
 
@@ -287,7 +282,7 @@ async fn a_fast_source_wins_and_the_slow_source_is_group_killed() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_bad_github_poll_interval_fails_loud_at_arm_time() {
     // codex ef1861a: a malformed poll_interval must error at arm time,
     // not silently fall back to the default deep in the poll loop.
@@ -300,7 +295,7 @@ async fn a_bad_github_poll_interval_fails_loud_at_arm_time() {
         "poll_interval": "banana"
     })
     .to_string();
-    let err = clank::cli::wait::run(wait_args(repo, vec![ev], "5s"))
+    let err = clank::cli::wait::run(wait_args(repo, vec![ev]))
         .await
         .expect_err("a bad poll_interval must fail loud");
     assert!(
@@ -309,7 +304,7 @@ async fn a_bad_github_poll_interval_fails_loud_at_arm_time() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_malformed_config_wait_events_is_a_hard_error() {
     // codex 1bbb61d: an unknown tagged kind in the FILE config must
     // propagate, not be silently treated as no sources.
@@ -322,7 +317,7 @@ async fn a_malformed_config_wait_events_is_a_hard_error() {
         r#"{"wait_events":[{"kind":"telepathy","repo":"x"}]}"#,
     )
     .unwrap();
-    let err = clank::cli::wait::run(wait_args(repo, vec![], "5s"))
+    let err = clank::cli::wait::run(wait_args(repo, vec![]))
         .await
         .expect_err("unknown config kind must fail loud");
     let msg = format!("{err:#}");
@@ -332,11 +327,12 @@ async fn a_malformed_config_wait_events_is_a_hard_error() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn malformed_event_json_is_an_arm_time_error() {
+    let _serial = common::serial();
     let env = idle_env();
     let repo = env.repo();
-    let err = clank::cli::wait::run(wait_args(repo, vec!["{\"kind\":\"nope\"}".into()], "5s"))
+    let err = clank::cli::wait::run(wait_args(repo, vec!["{\"kind\":\"nope\"}".into()]))
         .await
         .expect_err("unknown kind fails loud at arm time");
     assert!(

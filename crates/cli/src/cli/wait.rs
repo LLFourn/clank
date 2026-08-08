@@ -34,20 +34,6 @@ use clank_core::Role;
 use clank_core::vocab::HookEvent;
 use clank_core::wait::{StartupSnapshot, WaitItem, detect_finished};
 
-/// Exit code returned when `--timeout` elapses without producing
-/// any work. The rest of the CLI uses anyhow for normal errors;
-/// timeout is the one expected non-zero exit, so we surface it via
-/// a sentinel error type instead of `process::exit` so `main` can
-/// translate it cleanly.
-#[derive(Debug)]
-pub struct WaitTimeout;
-impl std::fmt::Display for WaitTimeout {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("wait timed out")
-    }
-}
-impl std::error::Error for WaitTimeout {}
-
 fn firings_from_items(items: &[WaitItem]) -> Vec<HookFiring> {
     items
         .iter()
@@ -142,7 +128,12 @@ fn firings_from_items(items: &[WaitItem]) -> Vec<HookFiring> {
 }
 
 pub async fn run(args: WaitArgs) -> anyhow::Result<()> {
-    let timeout = parse_timeout(&args.timeout)?;
+    // Before ANY setup: the fold and the watcher attach can block for
+    // seconds, and an owner that dies in that window must still reap
+    // this process (remove-wait-timeout).
+    if args.die_with_owner {
+        crate::owner_sentinel::spawn_stdin_sentinel();
+    }
     // One env read for the entire process, here at the CLI
     // boundary. Downstream takes a plain `bool`.
     let poll_mode = args.effective_poll();
@@ -155,7 +146,7 @@ pub async fn run(args: WaitArgs) -> anyhow::Result<()> {
     // resolution: the observed repo has no session binding for the
     // caller, and --author/--role are deliberately ignored.
     if let Some(event) = args.r#for {
-        return run_observer(&repo, event, timeout, poll_mode, args.no_cache, args.json).await;
+        return run_observer(&repo, event, poll_mode, args.no_cache, args.json).await;
     }
 
     // Resolve --author via the shared identity resolver when
@@ -333,12 +324,11 @@ pub async fn run(args: WaitArgs) -> anyhow::Result<()> {
     } else {
         Duration::from_millis(1500)
     };
-    let deadline = timeout.map(|t| std::time::Instant::now() + t);
 
     // ONE supervised async loop (extra-wait-events, codex cdcf111):
     // the watcher's sync channel is bridged into a tokio::select over
-    // repo wakes, external source items, the heartbeat tick, and the
-    // deadline. Sources spawn only when the wait actually PARKS (the
+    // repo wakes, external source items, and the heartbeat tick.
+    // Sources spawn only when the wait actually PARKS (the
     // initial pass above returns without them) and are cancelled AND
     // joined on every return path below.
     let (wake_tx, mut wake_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
@@ -380,14 +370,6 @@ pub async fn run(args: WaitArgs) -> anyhow::Result<()> {
                         Some(item) => external.push(item),
                         None => sources_open = false,
                     }
-                }
-                _ = async {
-                    match deadline {
-                        Some(end) => tokio::time::sleep_until(end.into()).await,
-                        None => std::future::pending::<()>().await,
-                    }
-                } => {
-                    return Err(WaitTimeout.into());
                 }
             }
             // Drain items queued before/at this beat (whichever branch
@@ -518,37 +500,20 @@ pub async fn run(args: WaitArgs) -> anyhow::Result<()> {
 }
 
 /// One watcher-loop beat, shared by the work loop and the observer
-/// loop: block on the next FS event or heartbeat tick, enforce the
-/// deadline, and debounce event bursts (one logical change → one
-/// refold). `Ok(())` per beat; `Err(WaitTimeout)` on deadline expiry.
-fn next_beat(
-    rx: &mpsc::Receiver<()>,
-    deadline: Option<std::time::Instant>,
-    tick: Duration,
-) -> anyhow::Result<()> {
-    let wait = match deadline {
-        None => tick,
-        Some(end) => match end.checked_duration_since(std::time::Instant::now()) {
-            None => return Err(WaitTimeout.into()),
-            Some(remaining) => remaining.min(tick),
-        },
-    };
-    match rx.recv_timeout(wait) {
+/// loop: block on the next FS event or heartbeat tick, and debounce
+/// event bursts (one logical change → one refold). `Ok(())` per beat.
+/// The loop ends on a wake, a real error, or owner death — never a
+/// clock (remove-wait-timeout).
+fn next_beat(rx: &mpsc::Receiver<()>, tick: Duration) -> anyhow::Result<()> {
+    match rx.recv_timeout(tick) {
         Ok(()) => {
             // Debounce: drain bursts. Only meaningful on the FS-event
             // branch; the heartbeat tick has nothing to drain.
             while rx.recv_timeout(Duration::from_millis(200)).is_ok() {}
             Ok(())
         }
-        Err(mpsc::RecvTimeoutError::Timeout) => {
-            // Could be deadline-expiry or heartbeat-tick. Distinguish.
-            if let Some(end) = deadline
-                && std::time::Instant::now() >= end
-            {
-                return Err(WaitTimeout.into());
-            }
-            Ok(())
-        }
+        // Heartbeat tick: nothing to drain, just beat.
+        Err(mpsc::RecvTimeoutError::Timeout) => Ok(()),
         Err(mpsc::RecvTimeoutError::Disconnected) => {
             anyhow::bail!("filesystem watcher disconnected")
         }
@@ -565,7 +530,6 @@ fn next_beat(
 async fn run_observer(
     repo: &Path,
     event: crate::cli::WaitFor,
-    timeout: Option<Duration>,
     poll_mode: bool,
     no_cache: bool,
     json: bool,
@@ -587,9 +551,8 @@ async fn run_observer(
     } else {
         Duration::from_millis(1500)
     };
-    let deadline = timeout.map(|t| std::time::Instant::now() + t);
     loop {
-        next_beat(&rx, deadline, tick)?;
+        next_beat(&rx, tick)?;
         let state = crate::rebuild::rebuild_repo_with_policy(repo, policy)
             .await
             .map_err(|e| anyhow::anyhow!("failed to fold repo `{}`: {e}", repo.display()))?;
@@ -1633,13 +1596,12 @@ pub(crate) fn one_line(s: &str, cap: usize) -> String {
     }
 }
 
-/// Shared by `--timeout` and github `poll_interval` so there's ONE
-/// grammar (extra-wait-events).
+/// Parse a duration in clank's one grammar (`30s`, `5m`, `1h`; `0`
+/// or empty means none). Shared grammar from extra-wait-events; the
+/// wait's own bound is gone (remove-wait-timeout) and github
+/// `poll_interval` is now the only caller, so the errors name the
+/// VALUE rather than any flag.
 pub(crate) fn parse_duration_str(raw: &str) -> anyhow::Result<Option<Duration>> {
-    parse_timeout(raw)
-}
-
-fn parse_timeout(raw: &str) -> anyhow::Result<Option<Duration>> {
     let trimmed = raw.trim();
     if trimmed == "0" || trimmed.is_empty() {
         return Ok(None);
@@ -1651,7 +1613,7 @@ fn parse_timeout(raw: &str) -> anyhow::Result<Option<Duration>> {
     );
     let n: u64 = num
         .parse()
-        .map_err(|_| anyhow::anyhow!("invalid --timeout `{raw}` (expected e.g. 30s, 5m, 1h)"))?;
+        .map_err(|_| anyhow::anyhow!("invalid duration `{raw}` (expected e.g. 30s, 5m, 1h)"))?;
     let secs = match unit {
         "" | "s" => n,
         "m" => n
@@ -1660,7 +1622,7 @@ fn parse_timeout(raw: &str) -> anyhow::Result<Option<Duration>> {
         "h" => n
             .checked_mul(3600)
             .ok_or_else(|| anyhow::anyhow!("timeout overflow"))?,
-        other => anyhow::bail!("invalid --timeout unit `{other}` (use s, m, or h)"),
+        other => anyhow::bail!("invalid duration unit `{other}` (use s, m, or h)"),
     };
     Ok(Some(Duration::from_secs(secs)))
 }
@@ -1815,26 +1777,35 @@ mod tests {
     }
 
     #[test]
-    fn parse_timeout_zero_is_indefinite() {
-        assert!(parse_timeout("0").unwrap().is_none());
-        assert!(parse_timeout("").unwrap().is_none());
+    fn parse_duration_zero_is_indefinite() {
+        assert!(parse_duration_str("0").unwrap().is_none());
+        assert!(parse_duration_str("").unwrap().is_none());
     }
 
     #[test]
-    fn parse_timeout_units() {
-        assert_eq!(parse_timeout("30s").unwrap(), Some(Duration::from_secs(30)));
-        assert_eq!(parse_timeout("30").unwrap(), Some(Duration::from_secs(30)));
-        assert_eq!(parse_timeout("5m").unwrap(), Some(Duration::from_secs(300)));
+    fn parse_duration_units() {
         assert_eq!(
-            parse_timeout("1h").unwrap(),
+            parse_duration_str("30s").unwrap(),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(
+            parse_duration_str("30").unwrap(),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(
+            parse_duration_str("5m").unwrap(),
+            Some(Duration::from_secs(300))
+        );
+        assert_eq!(
+            parse_duration_str("1h").unwrap(),
             Some(Duration::from_secs(3600))
         );
     }
 
     #[test]
-    fn parse_timeout_rejects_garbage() {
-        assert!(parse_timeout("abc").is_err());
-        assert!(parse_timeout("5x").is_err());
+    fn parse_duration_rejects_garbage() {
+        assert!(parse_duration_str("abc").is_err());
+        assert!(parse_duration_str("5x").is_err());
     }
 
     // ── wait-ignores-queue-only-blocks ─────────────────────────

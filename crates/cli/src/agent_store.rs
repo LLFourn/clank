@@ -43,7 +43,7 @@ pub fn save_agent_config(repo: &Path, label: &AgentLabel, cfg: &AgentConfig) -> 
 
 /// Read-modify-write one agent's config, defaulting a missing file.
 /// The single mutation primitive: every field-level edit goes through
-/// here so unrelated fields (notably `wait_timeout`) are preserved
+/// here so unrelated fields (notably `wait_events`) are preserved
 /// across a partial update instead of being clobbered.
 pub fn update_agent_config(
     repo: &Path,
@@ -58,7 +58,7 @@ pub fn update_agent_config(
 /// Set this agent's auto-mode, preserving the rest of its config.
 /// The single write path for arming/disarming auto — `clank auto`
 /// and the `status --tui` toggle both call it, so neither can drop
-/// `wait_timeout` on a flip.
+/// `wait_events` on a flip.
 pub fn set_auto_mode(repo: &Path, label: &AgentLabel, mode: AutoMode) -> anyhow::Result<()> {
     update_agent_config(repo, label, |cfg| cfg.auto_mode = Some(mode))
 }
@@ -435,7 +435,7 @@ pub struct BindOutcome {
 /// identify stale, write the target FIRST (so a partial failure
 /// on stale-clear leaves a ghost binding rather than no
 /// binding), then clear stale. Preserves auto_mode and
-/// wait_timeout on the target's existing config.
+/// wait_events on the target's existing config.
 /// The agent's current wait GENERATION
 /// (claude-asyncrewake-work-loop): `wait.gen` beside the skeleton;
 /// absent or unparseable reads 0. Minted (bumped) by every claim of
@@ -782,13 +782,25 @@ mod tests {
     }
 
     #[test]
-    fn set_auto_mode_round_trips_and_preserves_wait_timeout() {
+    fn set_auto_mode_round_trips_and_preserves_unrelated_fields() {
         let repo = TempDir::new().unwrap();
         let lbl = label("codex");
-        // Seed a config that already carries a wait_timeout — the field
-        // the toggle must never clobber.
+        // Seed a config carrying a field the toggle has no business
+        // touching. (This once guarded the per-agent poll bound;
+        // that field is gone, but the merge-not-overwrite contract it
+        // was really testing is not — so it guards a surviving one.)
         let seed = AgentConfig {
-            wait_timeout: Some("45s".to_string()),
+            wait_events: vec![clank_core::agent_config::WaitEventSource::Github(
+                clank_core::agent_config::GithubSource {
+                    repo: "o/r".into(),
+                    events: vec![clank_core::agent_config::GithubEventKind::PrOpened],
+                    poll_interval: None,
+                    include_own_actions: false,
+                    branches: Vec::new(),
+                    prompt: None,
+                    delivery: Default::default(),
+                },
+            )],
             ..AgentConfig::default()
         };
         save_agent_config(repo.path(), &lbl, &seed).unwrap();
@@ -796,19 +808,14 @@ mod tests {
         set_auto_mode(repo.path(), &lbl, AutoMode::On).unwrap();
         let armed = load_agent_config(repo.path(), &lbl).unwrap().unwrap();
         assert_eq!(armed.auto_mode, Some(AutoMode::On));
-        assert_eq!(
-            armed.wait_timeout.as_deref(),
-            Some("45s"),
-            "wait_timeout preserved on arm"
-        );
+        assert_eq!(armed.wait_events, seed.wait_events, "preserved on arm");
 
         set_auto_mode(repo.path(), &lbl, AutoMode::Off).unwrap();
         let disarmed = load_agent_config(repo.path(), &lbl).unwrap().unwrap();
         assert_eq!(disarmed.auto_mode, Some(AutoMode::Off));
         assert_eq!(
-            disarmed.wait_timeout.as_deref(),
-            Some("45s"),
-            "wait_timeout preserved on disarm"
+            disarmed.wait_events, seed.wait_events,
+            "preserved on disarm"
         );
     }
 

@@ -120,7 +120,8 @@ auto-mode drives it:
   wake carries the items. Setup decides ONCE per machine and
   `clank doctor` flags drift.
 - **codex** — its Stop hook long-polls `clank wait` in-hook and blocks
-  with the items (per-agent `wait_timeout` bounds the poll).
+  with the items (the poll parks until work, the hook-runner
+  ceiling, or the hook's own death).
 - **grok** — has no active hooks; its skill (and the auto-on launch
   prompt from `clank agent start`) teach it to arm the background
   wait itself.

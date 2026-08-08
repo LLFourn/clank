@@ -232,7 +232,7 @@ impl Tool {
 ///
 /// - `Off`: hook exits immediately.
 /// - `On`: hook long-polls `clank wait` until work arrives or
-///   `wait_timeout` elapses.
+///   the in-hook poll parks with no work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AutoMode {

@@ -15,7 +15,12 @@
 //! the armed wait's completion wake delivers the work (claude wakes the
 //! session when a background task finishes). **codex** has no such wake
 //! channel, so its hook long-polls `clank wait` in-hook and blocks with
-//! the rendered items.
+//! the rendered items. That poll has no clock of its own: it parks
+//! until a wake, the hook-runner ceiling, or the hook's OWN death,
+//! which it learns by holding the write end of the wait's stdin pipe
+//! (remove-wait-timeout). If this process is killed — SIGKILL
+//! included, where no destructor runs — the pipe closes and the wait
+//! reaps itself.
 //!
 //! **The hook NEVER fails the agent.** Every error path
 //! produces [`HookOutcome::Diagnostic`] which exits 0 with a
@@ -144,7 +149,7 @@ async fn compute_outcome_with(
             // wait would reintroduce the tracked-task loop this mode
             // exists to delete (claude-asyncrewake-work-loop).
             BgDisposition::NeedsWorkCheck if async_loop => {
-                return asyncrewake_park(&repo, &label, role, cfg.as_ref()).await;
+                return asyncrewake_park(&repo, &label, role).await;
             }
             BgDisposition::NeedsWorkCheck => match peek_has_work(&repo, &label, role).await {
                 Ok(true) => HookOutcome::Silent {
@@ -161,7 +166,7 @@ async fn compute_outcome_with(
             },
             // NoBackgroundWork (YieldArmed already returned above): genuinely idle.
             _ if async_loop => {
-                return asyncrewake_park(&repo, &label, role, cfg.as_ref()).await;
+                return asyncrewake_park(&repo, &label, role).await;
             }
             _ => match loop_policy(tool) {
                 // Claude never waits in-hook and never renders work items —
@@ -179,10 +184,7 @@ async fn compute_outcome_with(
                 // work / timeout is SILENT either way (codex 8000d6e:
                 // a nudge relay would loop an opencode session
                 // forever).
-                LoopPolicy::InHookWait => {
-                    let wait_timeout = cfg.as_ref().and_then(|c| c.wait_timeout.clone());
-                    compute_wait_outcome(&repo, &label, role, wait_timeout.as_deref()).await
-                }
+                LoopPolicy::InHookWait => compute_wait_outcome(&repo, &label, role).await,
                 // Grok's hooks are PASSIVE (grok-first-class): clank
                 // installs no grok adapter and no continuation could
                 // drive it. If something wires this up anyway, say so.
@@ -372,12 +374,7 @@ async fn generation_changed(agent_dir: &Path, own_gen: u64) {
 /// lease. Work → Continue (claude's exit-2 + stderr wire IS the
 /// asyncRewake wake); no work → Silent (empty-is-quiescent is
 /// load-bearing — M0's unconditional-exit-2 probe looped forever).
-async fn asyncrewake_park(
-    repo: &Path,
-    label: &AgentLabel,
-    role: Role,
-    cfg: Option<&clank_core::agent_config::AgentConfig>,
-) -> HookOutcome {
+async fn asyncrewake_park(repo: &Path, label: &AgentLabel, role: Role) -> HookOutcome {
     let agent_dir = crate::agent_store::agents_root(repo).join(label.as_str());
     if let Err(e) = std::fs::create_dir_all(&agent_dir) {
         return HookOutcome::Diagnostic {
@@ -422,9 +419,8 @@ async fn asyncrewake_park(
         };
     }
 
-    let wait_timeout = cfg.and_then(|c| c.wait_timeout.clone());
     let outcome = tokio::select! {
-        o = compute_wait_outcome(repo, label, role, wait_timeout.as_deref()) => o,
+        o = compute_wait_outcome(repo, label, role) => o,
         // A newer incarnation took over: release (the select drops
         // the wait child via kill_on_drop) and suppress.
         () = generation_changed(&agent_dir, my_gen) => {
@@ -525,38 +521,98 @@ fn nudge_reason(input: &HookInput) -> String {
     )
 }
 
-/// The `--timeout` the codex in-hook poll runs with. An explicit
-/// per-agent `wait_timeout` wins; the DEFAULT expires five minutes
-/// BEFORE codex's hook-runner ceiling (setup's [`HOOK_TIMEOUT_SECS`],
-/// one shared constant so they can't drift) — a poll that outlives
-/// the ceiling gets KILLED and codex banners `Stop hook (failed):
-/// hook timed out` for a perfectly normal idle
-/// (codex-poll-expires-cleanly). The clean expiry exits 2, which maps
-/// to Silent below.
-fn codex_wait_timeout(explicit: Option<&str>) -> String {
-    match explicit {
-        Some(t) => t.to_string(),
-        None => format!("{}s", crate::cli::setup::HOOK_TIMEOUT_SECS - 300),
+use tokio::process::Command;
+
+/// Argv for the in-hook wait. Separate from the spawn so the shape
+/// can be asserted without launching anything.
+fn wait_argv(repo: &Path, label: &AgentLabel, role: Role) -> Vec<String> {
+    let role_arg = match role {
+        Role::Master => "master",
+        Role::Reviewer => "reviewer",
+    };
+    vec![
+        "wait".into(),
+        "--repo".into(),
+        repo.display().to_string(),
+        "--author".into(),
+        label.as_str().to_string(),
+        "--role".into(),
+        role_arg.into(),
+        // Ownership, not decoration: without this the wait has no
+        // bound at all and outlives a killed hook forever.
+        "--die-with-owner".into(),
+        "--json".into(),
+    ]
+}
+
+fn wait_command(exe: &Path, repo: &Path, label: &AgentLabel, role: Role) -> Command {
+    let mut cmd = Command::new(exe);
+    cmd.args(wait_argv(repo, label, role))
+        // Piped stdin IS the ownership channel. `OwnedWait::spawn`
+        // refuses to proceed without it.
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    cmd
+}
+
+/// A spawned wait bundled with the owner handle whose LIFETIME is the
+/// ownership contract.
+///
+/// The handle is not an incidental local that must be remembered: it
+/// is a required field, so a wait with no owner cannot be
+/// constructed, and it is released only inside [`run`](Self::run),
+/// after the child is collected. Closing it early would give every
+/// in-hook wait instant EOF and exit it on the spot, so the drop
+/// point is not something to leave to statement order.
+struct OwnedWait {
+    child: tokio::process::Child,
+    owner_end: tokio::process::ChildStdin,
+}
+
+impl OwnedWait {
+    /// Spawn `cmd`, requiring the ownership pipe. A missing
+    /// `ChildStdin` is a hard error rather than a silently unowned
+    /// wait — that degradation is invisible until a hook is killed
+    /// and its wait is still running days later.
+    fn spawn(cmd: &mut Command) -> Result<Self, String> {
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| format!("hook: spawning wait failed: {e}"))?;
+        let owner_end = child.stdin.take().ok_or_else(|| {
+            "hook: wait spawned without a stdin pipe — the ownership \
+             sentinel would be absent, so refusing to run it"
+                .to_string()
+        })?;
+        Ok(Self { child, owner_end })
+    }
+
+    /// Collect the wait, holding the owner handle across the whole
+    /// await and dropping it only afterwards.
+    async fn run(self) -> std::io::Result<std::process::Output> {
+        let Self { child, owner_end } = self;
+        let output = child.wait_with_output().await;
+        drop(owner_end);
+        output
     }
 }
 
 /// Long-poll via a self-spawned `clank wait --json`. CODEX-ONLY:
 /// claude's hook never waits in-hook (see the module doc).
 /// Reuses the watcher loop without refactoring it. On items →
-/// Continue. On timeout (exit 2) → Silent. Anything else →
-/// Diagnostic.
+/// Continue. Anything non-zero → Diagnostic. There is no timeout
+/// branch any more: the poll parks until a wake, the hook-runner
+/// ceiling, or OUR death (remove-wait-timeout).
 ///
-/// Self-spawning has one advantage over factoring out the loop:
-/// the wait process is a clean child that gets killed if the
-/// agent kills the hook (Stdio::piped + drop kills the child).
-async fn compute_wait_outcome(
-    repo: &Path,
-    label: &AgentLabel,
-    role: Role,
-    wait_timeout: Option<&str>,
-) -> HookOutcome {
-    use tokio::process::Command;
-
+/// The child's stdin is the ownership sentinel, not a spare fd. We
+/// hold the write end for the whole wait, so if this hook is killed
+/// — SIGKILL included, where no destructor runs and `kill_on_drop`
+/// cannot fire — the pipe closes and the wait reaps itself. That is
+/// why this spawns and holds the handle instead of calling
+/// `Command::output()`, which closes the child's stdin immediately
+/// and would read as instant owner death.
+async fn compute_wait_outcome(repo: &Path, label: &AgentLabel, role: Role) -> HookOutcome {
     let exe = match std::env::current_exe() {
         Ok(p) => p,
         Err(e) => {
@@ -566,37 +622,38 @@ async fn compute_wait_outcome(
         }
     };
 
-    let role_arg = match role {
-        Role::Master => "master",
-        Role::Reviewer => "reviewer",
+    let mut cmd = wait_command(&exe, repo, label, role);
+
+    let owned = match OwnedWait::spawn(&mut cmd) {
+        Ok(w) => w,
+        Err(e) => return HookOutcome::Diagnostic { message: e },
     };
-    let timeout_arg = codex_wait_timeout(wait_timeout);
 
-    let mut cmd = Command::new(&exe);
-    cmd.arg("wait")
-        .arg("--repo")
-        .arg(repo)
-        .arg("--author")
-        .arg(label.as_str())
-        .arg("--role")
-        .arg(role_arg)
-        .arg("--timeout")
-        .arg(timeout_arg)
-        .arg("--json")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-
-    let output = match cmd.output().await {
+    let output = match owned.run().await {
         Ok(o) => o,
         Err(e) => {
             return HookOutcome::Diagnostic {
-                message: format!("hook: spawning wait failed: {e}"),
+                message: format!("hook: waiting on wait failed: {e}"),
             };
         }
     };
 
+    outcome_from_wait_output(&output, label, role)
+}
+
+/// Map the finished wait's output to an outcome. Pure, so the
+/// contract can be asserted without spawning anything.
+///
+/// Every non-zero exit is a Diagnostic. There is no longer a code
+/// that means "expired quietly": an idle poll parks instead of
+/// self-expiring (remove-wait-timeout), so a wait that exits
+/// non-zero has genuinely failed and must be surfaced rather than
+/// swallowed as a routine idle.
+fn outcome_from_wait_output(
+    output: &std::process::Output,
+    label: &AgentLabel,
+    role: Role,
+) -> HookOutcome {
     match output.status.code() {
         Some(0) => match parse_wait_json(&output.stdout) {
             Ok(items) if items.is_empty() => HookOutcome::Silent {
@@ -608,9 +665,6 @@ async fn compute_wait_outcome(
             Err(e) => HookOutcome::Diagnostic {
                 message: format!("hook: wait stdout malformed: {e}"),
             },
-        },
-        Some(2) => HookOutcome::Silent {
-            why: SilentReason::WaitTimeout,
         },
         other => HookOutcome::Diagnostic {
             message: format!(
@@ -1146,29 +1200,6 @@ mod tests {
     }
 
     #[test]
-    fn codex_wait_default_expires_before_the_hook_ceiling() {
-        // codex-poll-expires-cleanly: with wait_timeout unset the poll
-        // must exit (2 → Silent) BEFORE codex's hook runner kills it at
-        // setup's ceiling — the failed banner for a normal idle. One
-        // shared constant so the two can't drift.
-        let default = codex_wait_timeout(None);
-        let secs: u64 = default
-            .strip_suffix('s')
-            .expect("seconds-suffixed duration")
-            .parse()
-            .expect("numeric");
-        assert!(
-            secs < crate::cli::setup::HOOK_TIMEOUT_SECS,
-            "default {secs}s must undercut the {} ceiling",
-            crate::cli::setup::HOOK_TIMEOUT_SECS
-        );
-        assert_eq!(secs, crate::cli::setup::HOOK_TIMEOUT_SECS - 300);
-        // An explicit per-agent value passes through untouched.
-        assert_eq!(codex_wait_timeout(Some("4h")), "4h");
-        assert_eq!(codex_wait_timeout(Some("0")), "0");
-    }
-
-    #[test]
     fn external_wake_hints_render_their_payload() {
         // external-wake-hints-carry-payload: the codex in-hook hints
         // for the external kinds carry the payload instead of the
@@ -1494,6 +1525,106 @@ mod tests {
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].kind.as_deref(), Some("reviewer"));
         assert_eq!(items[1].next.as_deref(), Some("revise"));
+    }
+
+    #[test]
+    fn an_idle_poll_no_longer_self_expires() {
+        use std::os::unix::process::ExitStatusExt;
+        let out = |code: i32, stdout: &str| std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: Vec::new(),
+        };
+        let label = AgentLabel::parse("codex").unwrap();
+
+        // Exit 2 used to mean "timed out, go quiet". It has no
+        // special meaning now, so it must surface rather than be
+        // swallowed as a routine idle.
+        let two = outcome_from_wait_output(&out(2, ""), &label, Role::Master);
+        assert!(
+            matches!(two, HookOutcome::Diagnostic { .. }),
+            "a non-zero wait exit must surface, got {two:?}"
+        );
+
+        // Idle is now expressed the only way left: exit 0, no items.
+        let idle = outcome_from_wait_output(&out(0, r#"{"items":[]}"#), &label, Role::Master);
+        assert!(
+            matches!(
+                idle,
+                HookOutcome::Silent {
+                    why: SilentReason::NoWork
+                }
+            ),
+            "idle is exit 0 with no items, got {idle:?}"
+        );
+    }
+
+    #[test]
+    fn the_in_hook_wait_argv_carries_the_ownership_flag() {
+        let argv = wait_argv(
+            Path::new("/repo"),
+            &AgentLabel::parse("codex").unwrap(),
+            Role::Master,
+        );
+        assert!(
+            argv.iter().any(|a| a == "--die-with-owner"),
+            "without this the in-hook wait has no bound at all: {argv:?}"
+        );
+        assert!(
+            !argv.iter().any(|a| a == "--timeout"),
+            "the flag is gone: {argv:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn owned_wait_refuses_a_child_with_no_ownership_pipe() {
+        // The degradation codex flagged: `stdin.take()` yielding None
+        // must be a hard error, not a silently unowned wait that
+        // outlives a killed hook.
+        let mut bare = Command::new("true");
+        bare.stdin(Stdio::null());
+        let err = match OwnedWait::spawn(&mut bare) {
+            Err(e) => e,
+            Ok(_) => panic!("a child with no ownership pipe must be refused"),
+        };
+        assert!(err.contains("ownership"), "explains the refusal: {err}");
+
+        // And the real builder DOES pipe stdin, so construction works.
+        let owned = OwnedWait::spawn(&mut wait_command(
+            Path::new("true"),
+            Path::new("/repo"),
+            &AgentLabel::parse("codex").unwrap(),
+            Role::Master,
+        ))
+        .expect("the hook's own command must carry the pipe");
+        let _ = owned.run().await;
+    }
+
+    #[tokio::test]
+    async fn the_owner_handle_is_held_for_the_whole_wait() {
+        // The regression this guards: anything that closes the
+        // child's stdin early — reverting to `Command::output()`, or
+        // dropping the handle before the await — gives every in-hook
+        // wait instant EOF and exits it immediately.
+        //
+        // `cat` stands in for the wait (this repo bans spawning the
+        // clank binary in tests): it runs until its stdin closes, so
+        // if the handle were released early it would exit at once.
+        let mut cmd = Command::new("cat");
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let owned = OwnedWait::spawn(&mut cmd).expect("cat spawns with a pipe");
+        let running = tokio::spawn(async move { owned.run().await });
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        let exited = running.is_finished();
+        running.abort();
+        assert!(
+            !exited,
+            "the child saw EOF while the wait was still running — the \
+             owner handle was released early"
+        );
     }
 
     #[test]

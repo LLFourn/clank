@@ -32,14 +32,14 @@ fn write(repo: &Path, rel: &str, body: &str) {
     std::fs::write(abs, body).unwrap();
 }
 
-fn observer_args(repo: &Path, event: WaitFor, timeout: &str) -> WaitArgs {
+fn observer_args(repo: &Path, event: WaitFor) -> WaitArgs {
     WaitArgs {
         repo: Some(repo.to_path_buf()),
         // The observer never resolves identity: author/role stay None
         // and no session env or binding exists in the fixture.
         author: None,
         role: None,
-        timeout: timeout.into(),
+        die_with_owner: false,
         json: true,
         events: Vec::new(),
         r#for: Some(event),
@@ -50,31 +50,31 @@ fn observer_args(repo: &Path, event: WaitFor, timeout: &str) -> WaitArgs {
     }
 }
 
-fn assert_timed_out(err: anyhow::Error) {
-    assert!(
-        err.downcast_ref::<clank::cli::wait::WaitTimeout>()
-            .is_some(),
-        "expected WaitTimeout, got: {err:#}"
-    );
+/// A pre-existing state is BASELINE, not an event: the observer must
+/// stay parked. Sampled rather than timed out (remove-wait-timeout),
+/// over a window that outlasts setup.
+async fn assert_ignores_preexisting(repo: &Path, event: WaitFor, what: &str) {
+    common::assert_stays_parked(repo, observer_args(repo, event), what).await;
 }
 
 /// Race the observer against a mutation applied shortly after it
 /// starts; the observer must fire (exit Ok) well before its own
 /// generous timeout.
 async fn fires_after(repo: &Path, event: WaitFor, mutate: impl FnOnce(&Path)) {
-    let observer = tokio::spawn(clank::cli::wait::run(observer_args(repo, event, "30s")));
+    let observer = tokio::spawn(clank::cli::wait::run(observer_args(repo, event)));
     // Give the observer time to capture its baseline and attach.
     tokio::time::sleep(Duration::from_millis(800)).await;
     mutate(repo);
-    tokio::time::timeout(Duration::from_secs(20), observer)
+    tokio::time::timeout(common::race_deadline(repo), observer)
         .await
         .expect("observer must fire before the outer deadline")
         .expect("join")
         .expect("observer exits Ok when the event lands");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn for_commit_fires_on_a_new_commit_only() {
+    let _serial = common::serial();
     let env = TestEnv::init();
     let repo = env.repo();
     write(repo, "f.txt", "one");
@@ -82,10 +82,12 @@ async fn for_commit_fires_on_a_new_commit_only() {
     git(repo, &["commit", "--quiet", "-m", "seed"]);
 
     // Delta semantics: the existing HEAD is the baseline, not an event.
-    let err = clank::cli::wait::run(observer_args(repo, WaitFor::Commit, "2s"))
-        .await
-        .expect_err("no new commit → observer parks until timeout");
-    assert_timed_out(err);
+    assert_ignores_preexisting(
+        repo,
+        WaitFor::Commit,
+        "no new commit → observer parks until timeout",
+    )
+    .await;
 
     fires_after(repo, WaitFor::Commit, |repo| {
         write(repo, "f.txt", "two");
@@ -95,8 +97,9 @@ async fn for_commit_fires_on_a_new_commit_only() {
     .await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn for_finished_ignores_preexisting_and_fires_on_a_new_finalize() {
+    let _serial = common::serial();
     let env = TestEnv::init();
     let repo = env.repo();
     // A plan finished BEFORE the observer starts…
@@ -116,10 +119,12 @@ async fn for_finished_ignores_preexisting_and_fires_on_a_new_finalize() {
     git(repo, &["add", "-A"]);
     git(repo, &["commit", "--quiet", "-m", "[foo] intro"]);
 
-    let err = clank::cli::wait::run(observer_args(repo, WaitFor::Finished, "2s"))
-        .await
-        .expect_err("pre-existing finishes are baseline, not events");
-    assert_timed_out(err);
+    assert_ignores_preexisting(
+        repo,
+        WaitFor::Finished,
+        "pre-existing finishes are baseline, not events",
+    )
+    .await;
 
     fires_after(repo, WaitFor::Finished, |repo| {
         std::fs::rename(
@@ -133,8 +138,9 @@ async fn for_finished_ignores_preexisting_and_fires_on_a_new_finalize() {
     .await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn for_stopped_fires_on_a_new_block_and_ignores_preexisting() {
+    let _serial = common::serial();
     let env = TestEnv::init();
     let repo = env.repo();
     write(repo, "f.txt", "seed");
@@ -143,10 +149,7 @@ async fn for_stopped_fires_on_a_new_block_and_ignores_preexisting() {
     // An already-pending block is baseline, not an event.
     write(repo, ".clank/agents/claude/blocks/pre.md", "old question\n");
 
-    let err = clank::cli::wait::run(observer_args(repo, WaitFor::Stopped, "2s"))
-        .await
-        .expect_err("pre-existing block is baseline");
-    assert_timed_out(err);
+    assert_ignores_preexisting(repo, WaitFor::Stopped, "pre-existing block is baseline").await;
 
     fires_after(repo, WaitFor::Stopped, |repo| {
         write(repo, ".clank/agents/claude/blocks/new-q.md", "which way?\n");
@@ -154,8 +157,9 @@ async fn for_stopped_fires_on_a_new_block_and_ignores_preexisting() {
     .await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn for_stopped_also_fires_on_a_finalize() {
+    let _serial = common::serial();
     let env = TestEnv::init();
     let repo = env.repo();
     write(repo, ".clank/plans/foo.md", "# foo\n");

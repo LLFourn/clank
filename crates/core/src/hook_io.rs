@@ -352,8 +352,6 @@ pub enum SilentReason {
     /// This waiter's generation went stale (a newer session
     /// incarnation took over); its wake is suppressed.
     StaleGeneration,
-    /// The in-hook wait timed out with no work (codex-only branch).
-    WaitTimeout,
 }
 
 /// Codex's stop-hook continuation wire shape, written to stdout

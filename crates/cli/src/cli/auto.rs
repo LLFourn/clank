@@ -26,7 +26,6 @@ struct AutoStatusJson<'a> {
     label: &'a str,
     auto_mode: &'a str,
     auto_mode_explicit: Option<&'a str>,
-    wait_timeout: Option<&'a str>,
     role: &'a str,
 }
 
@@ -44,9 +43,6 @@ async fn run_on(args: AutoOnArgs) -> anyhow::Result<()> {
 
     update_agent_config(&repo, &label, |cfg| {
         cfg.auto_mode = Some(AutoMode::On);
-        if let Some(t) = args.wait_timeout.as_deref() {
-            cfg.wait_timeout = Some(t.to_string());
-        }
     })?;
 
     println!("auto-mode for `{}` set to on", label.as_str());
@@ -98,17 +94,12 @@ async fn run_status(args: AutoStatusArgs) -> anyhow::Result<()> {
             label: label.as_str(),
             auto_mode: effective.as_str(),
             auto_mode_explicit: cfg.auto_mode.map(|m| m.as_str()),
-            wait_timeout: cfg.wait_timeout.as_deref(),
             role: &role,
         };
         println!("{}", serde_json::to_string(&payload)?);
     } else {
         println!("agent: {}", label.as_str());
         println!("  auto_mode:   {}", effective.as_str());
-        println!(
-            "  wait_timeout: {}",
-            cfg.wait_timeout.as_deref().unwrap_or("(indefinite)")
-        );
         println!("  role:        {role}");
     }
     Ok(())
@@ -128,7 +119,6 @@ mod tests {
             label: "codex",
             auto_mode: "on",
             auto_mode_explicit: Some("on"),
-            wait_timeout: Some("30s"),
             role: "reviewer",
         };
         assert_eq!(
@@ -137,7 +127,6 @@ mod tests {
                 "label": "codex",
                 "auto_mode": "on",
                 "auto_mode_explicit": "on",
-                "wait_timeout": "30s",
                 "role": "reviewer",
             })
         );
@@ -148,7 +137,6 @@ mod tests {
             label: "claude",
             auto_mode: "off",
             auto_mode_explicit: None,
-            wait_timeout: None,
             role: "master",
         };
         assert_eq!(
@@ -157,7 +145,6 @@ mod tests {
                 "label": "claude",
                 "auto_mode": "off",
                 "auto_mode_explicit": null,
-                "wait_timeout": null,
                 "role": "master",
             })
         );

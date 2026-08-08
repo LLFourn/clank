@@ -1575,7 +1575,7 @@ pub(crate) async fn run_tui(
                                             clank_core::ids::AgentLabel::parse(&row.label)
                                         {
                                             // Single source for the write
-                                            // (preserves wait_timeout). On
+                                            // (preserves other fields). On
                                             // success, flip the in-memory lamp
                                             // for an immediate repaint; the
                                             // config write also bumps the input

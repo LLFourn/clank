@@ -41,19 +41,6 @@ pub struct AgentConfig {
     /// silent `off`. Resolve via [`effective_auto_mode`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_mode: Option<AutoMode>,
-    /// Wait-for-work timeout as a duration string (`"30m"`,
-    /// `"5m"`, `"45s"`). `None` means indefinite. Stringly typed
-    /// so users editing JSON see the same form
-    /// `clank wait --timeout` accepts; validated by the CLI's
-    /// existing `parse_timeout` at use site, not load site (one
-    /// source of truth for the format).
-    ///
-    /// Consumed only by the CODEX stop hook's in-hook wait. The claude
-    /// hook never waits (claude-stop-hook-minimal-hint): it nudges the
-    /// agent to arm its own backgrounded `clank wait`, which runs
-    /// indefinitely.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub wait_timeout: Option<String>,
     /// Session this agent label is currently bound to. Written by
     /// `clank as <label>` (or `clank init` phase 2) using the
     /// `CLAUDE_CODE_SESSION_ID` / `CODEX_THREAD_ID` env var.
@@ -87,7 +74,7 @@ pub struct GithubSource {
     /// Which event sub-kinds wake the agent.
     pub events: Vec<GithubEventKind>,
     /// Poll cadence as a duration string (`"60s"`, `"5m"`), same form
-    /// as `wait_timeout`; validated at use site. The EFFECTIVE
+    /// as a duration string; validated at use site. The EFFECTIVE
     /// interval is max(this, the server's `X-Poll-Interval`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub poll_interval: Option<String>,
@@ -270,7 +257,6 @@ mod tests {
         let back: AgentConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(cfg, back);
         assert_eq!(back.auto_mode, None, "fresh skeleton is unset, not Off");
-        assert!(back.wait_timeout.is_none());
         assert!(back.session.is_none());
     }
 
@@ -278,7 +264,6 @@ mod tests {
     fn agent_config_round_trips_populated() {
         let cfg = AgentConfig {
             auto_mode: Some(AutoMode::On),
-            wait_timeout: Some("30m".into()),
             session: Some(Session {
                 id: session_id("742f6a04-f174-409a-ab01-419a16c5f372"),
                 tool: Tool::Claude,
@@ -329,7 +314,6 @@ mod tests {
         let json = r#"{ "auto_mode": "wait" }"#;
         let cfg: AgentConfig = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.auto_mode, Some(AutoMode::On));
-        assert!(cfg.wait_timeout.is_none());
         assert!(cfg.session.is_none());
     }
 
@@ -341,10 +325,6 @@ mod tests {
         };
         let json = serde_json::to_string(&cfg).unwrap();
         assert!(!json.contains("session"), "expected no session key: {json}");
-        assert!(
-            !json.contains("wait_timeout"),
-            "expected no wait_timeout key: {json}"
-        );
     }
 
     #[test]

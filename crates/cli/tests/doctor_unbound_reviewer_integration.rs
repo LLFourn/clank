@@ -23,7 +23,6 @@ fn skeleton(
 ) -> clank_core::agent_config::AgentConfig {
     clank_core::agent_config::AgentConfig {
         auto_mode: Some(auto_mode),
-        wait_timeout: None,
         session,
         wait_events: Vec::new(),
     }
@@ -451,7 +450,6 @@ async fn doctor_reports_effective_auto_mode_with_provenance() {
         "grok",
         &clank_core::agent_config::AgentConfig {
             auto_mode: None,
-            wait_timeout: None,
             session: Some(session(
                 clank_core::vocab::Tool::Grok,
                 "11111111-2222-3333-4444-555555555555",
@@ -481,7 +479,6 @@ async fn doctor_reports_effective_auto_mode_with_provenance() {
         "grok",
         &clank_core::agent_config::AgentConfig {
             auto_mode: Some(clank_core::vocab::AutoMode::Off),
-            wait_timeout: None,
             session: Some(session(
                 clank_core::vocab::Tool::Grok,
                 "11111111-2222-3333-4444-555555555555",

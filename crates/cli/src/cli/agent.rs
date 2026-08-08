@@ -9,7 +9,7 @@
 //! picks the master; the ROLE RESOLVER
 //! (`agent_store::try_resolve_via_team`) reads the roster directly.
 //! The per-agent skeleton at `.clank/agents/<label>/config.json`
-//! holds ONLY per-machine state (`auto_mode`, `wait_timeout`,
+//! holds ONLY per-machine state (`auto_mode`,
 //! `session`). `list` joins the resolved set with each agent's
 //! skeleton session.
 
@@ -736,7 +736,7 @@ fn exec_composed(c: ComposedLaunch) -> anyhow::Result<()> {
 //   - repo by-name (no `--tool`): copy a description from the
 //     user-scope library → insert a RosterAgent with the role.
 // Per-agent skeletons hold only state (session / auto_mode /
-// wait_timeout) — never declaration.
+// wake sources) — never declaration.
 
 /// `clank agent add <label> [--global] [--tool ...] [--review ...]`
 /// — thin shell: parse the label + role, build the launch profile,

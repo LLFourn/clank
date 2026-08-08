@@ -15,6 +15,7 @@ pub mod git_io;
 pub mod git_plumbing;
 pub mod hook_config;
 pub mod init_facts;
+pub mod owner_sentinel;
 pub mod preview;
 pub mod repo_watch;
 pub mod runtime;

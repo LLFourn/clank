@@ -42,12 +42,12 @@ fn set_hook(repo: &Path, event: &str, cmd: &str) {
     std::fs::write(&cfg_path, serde_json::to_string_pretty(&cfg).unwrap()).unwrap();
 }
 
-fn wait_args(repo: &Path, author: &str, role: WaitRole, peek: bool, timeout: &str) -> WaitArgs {
+fn wait_args(repo: &Path, author: &str, role: WaitRole, peek: bool) -> WaitArgs {
     WaitArgs {
         repo: Some(repo.to_path_buf()),
         author: Some(author.into()),
         role: Some(role),
-        timeout: timeout.into(),
+        die_with_owner: false,
         json: true,
         events: Vec::new(),
         r#for: None,
@@ -80,7 +80,7 @@ async fn peek_does_not_fire_the_work_hook() {
     git(repo, &["commit", "--quiet", "-m", "[foo] intro"]);
 
     // Work IS present, so both calls return immediately (no loop entered).
-    clank::cli::wait::run(wait_args(repo, "rev", WaitRole::Reviewer, false, "0"))
+    clank::cli::wait::run(wait_args(repo, "rev", WaitRole::Reviewer, false))
         .await
         .expect("non-peek returns immediately when work is present");
     assert!(
@@ -89,7 +89,7 @@ async fn peek_does_not_fire_the_work_hook() {
     );
     std::fs::remove_file(&marker).unwrap();
 
-    clank::cli::wait::run(wait_args(repo, "rev", WaitRole::Reviewer, true, "0"))
+    clank::cli::wait::run(wait_args(repo, "rev", WaitRole::Reviewer, true))
         .await
         .expect("peek returns immediately");
     assert!(
@@ -100,7 +100,9 @@ async fn peek_does_not_fire_the_work_hook() {
 
 /// An idle master reaches `run_idle_hook`: a real (non-peek) wait fires it;
 /// `--peek` must not (and must return instead of parking).
-#[tokio::test]
+// Multi-thread: the wait blocks its thread through setup, so the
+// marker poll below needs a thread of its own to make progress.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn peek_does_not_fire_the_idle_hook() {
     let env = TestEnv::init();
     env.register_team("master", &["rev"], &[]);
@@ -114,9 +116,20 @@ async fn peek_does_not_fire_the_idle_hook() {
     git(repo, &["add", "-A"]);
     git(repo, &["commit", "--quiet", "-m", "scaffold"]);
 
-    // Baseline: a non-peek idle wait fires the idle hook (before it parks);
-    // a short timeout keeps the test from blocking.
-    let _ = clank::cli::wait::run(wait_args(repo, "master", WaitRole::Master, false, "1s")).await;
+    // Baseline: a non-peek idle wait fires the idle hook BEFORE it
+    // parks, and now parks forever — so watch for the marker and
+    // abort, rather than waiting on a wait that will never return.
+    let waiter = tokio::spawn(clank::cli::wait::run(wait_args(
+        repo,
+        "master",
+        WaitRole::Master,
+        false,
+    )));
+    let deadline = std::time::Instant::now() + common::race_deadline(repo);
+    while !marker.exists() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    waiter.abort();
     assert!(
         marker.exists(),
         "sanity: a non-peek idle wait fires the idle hook"
@@ -124,7 +137,7 @@ async fn peek_does_not_fire_the_idle_hook() {
     std::fs::remove_file(&marker).unwrap();
 
     // Peek: same idle master, must NOT fire the idle hook, and must return.
-    clank::cli::wait::run(wait_args(repo, "master", WaitRole::Master, true, "0"))
+    clank::cli::wait::run(wait_args(repo, "master", WaitRole::Master, true))
         .await
         .expect("peek returns immediately");
     assert!(
