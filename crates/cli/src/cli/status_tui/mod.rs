@@ -151,7 +151,6 @@ async fn run_plan_confirm(
                 waiting_for: None,
                 to_queue: false,
                 priority: None,
-                force: false,
                 dry: false,
                 yes: true,
                 allow_rewrite_protected: true,

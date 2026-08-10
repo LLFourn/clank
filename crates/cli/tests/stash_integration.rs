@@ -57,6 +57,10 @@ fn repo_with_inflight_foo() -> TestEnv {
     env
 }
 
+/// NOTE: no `force`. The fixture's plan carries `[foo] impl a` /
+/// `impl b`, which touch `src/`, so every test that stashes through
+/// this helper is now also proving the case that used to need
+/// `--force` (stash-stops-refusing-impl-commits).
 fn push_args(env: &TestEnv, to_queue: bool, waiting_for: Option<&str>) -> clank::cli::ShelveArgs {
     clank::cli::ShelveArgs {
         command: None,
@@ -65,7 +69,6 @@ fn push_args(env: &TestEnv, to_queue: bool, waiting_for: Option<&str>) -> clank:
         waiting_for: waiting_for.map(str::to_string),
         to_queue,
         priority: None,
-        force: true, // impl commits touch non-plan content
         dry: false,
         yes: true,
         allow_rewrite_protected: true, // tests run on `main`
@@ -211,6 +214,73 @@ fn interleaved_plan_refuses() {
 }
 
 #[test]
+fn untagged_adhoc_commit_in_range_refuses() {
+    // A DISTINCT source of foreign status from `interleaved_plan_refuses`:
+    // that one proves a commit tagged for ANOTHER plan is refused, this
+    // one proves an UNTAGGED ad-hoc commit is. Both are `!attributed`
+    // today, but only a test keeps them that way — the case for deleting
+    // the old `Rewrite` tier was that this arm still catches everything
+    // the plan's own timeline does not claim, so an attribution refactor
+    // that quietly made untagged work attributed would hollow it out
+    // (stash-stops-refusing-impl-commits).
+    let env = TestEnv::init();
+    env.register_team("claude", &[], &[]);
+    let repo = env.repo();
+    write(repo, ".clank/.gitignore", "/cache/\n/agents/\n/shelved/\n");
+    write(repo, ".clank/plans/foo.md", "# foo\n");
+    commit(repo, "[foo] intro");
+    // Ad-hoc work with NO plan tag lands mid-range.
+    write(repo, "src/unrelated.rs", "// unrelated\n");
+    commit(repo, "drive-by fix");
+    write(repo, "src/a.rs", "// a\n");
+    commit(repo, "[foo] impl a");
+
+    let err = block_on(clank::cli::stash::run_shelve_alias(push_args(
+        &env, false, None,
+    )))
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.contains("foreign commit"),
+        "an untagged ad-hoc commit in the range must refuse; got: {err}"
+    );
+    // And nothing was set aside.
+    assert!(!git_out(repo, &["show-ref"]).contains("refs/clank/stash/foo"));
+    assert!(!repo.join(".clank/stash/foo.json").exists());
+}
+
+#[test]
+fn impl_commits_stash_without_any_flag() {
+    // The bug this plan exists for: the fixture's plan touches `src/`,
+    // which used to classify as `Rewrite` and refuse with an
+    // instruction to pass `--force`. Stashing a plan's own
+    // implementation work is the NORMAL path and must need no flag.
+    let env = repo_with_inflight_foo();
+    let repo = env.repo();
+    block_on(clank::cli::stash::run_shelve_alias(push_args(
+        &env, false, None,
+    )))
+    .expect("a plan's own implementation commits stash with no flag");
+    assert!(git_out(repo, &["show-ref"]).contains("refs/clank/stash/foo"));
+    // And they come back. Replayed onto later work, like a real
+    // resume — an immediate pop onto the unchanged tip conflicts on
+    // files the rewrite left in the worktree, which is a property of
+    // replay, not of this change.
+    write(repo, "src/later.rs", "// later\n");
+    commit(repo, "[misc] later work");
+    block_on(clank::cli::stash::run_unshelve_alias(
+        clank::cli::UnshelveArgs {
+            plan: "foo".into(),
+            repo: Some(repo.to_path_buf()),
+        },
+    ))
+    .expect("pop restores them");
+    let log = git_out(repo, &["log", "--oneline"]);
+    assert!(log.contains("[foo] impl a"), "impl a restored: {log}");
+    assert!(log.contains("[foo] impl b"), "impl b restored: {log}");
+}
+
+#[test]
 fn to_queue_saves_body_and_sets_aside() {
     let env = repo_with_inflight_foo();
     let repo = env.repo();
@@ -303,7 +373,6 @@ fn shelve_clean_discards_ref_and_state() {
             waiting_for: None,
             to_queue: false,
             priority: None,
-            force: false,
             dry: false,
             yes: false,
             allow_rewrite_protected: false,

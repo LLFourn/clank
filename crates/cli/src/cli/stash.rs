@@ -128,7 +128,6 @@ pub async fn run_shelve_alias(args: ShelveArgs) -> anyhow::Result<()> {
                 waiting_for: args.waiting_for,
                 to_queue: args.to_queue,
                 priority: args.priority,
-                force: args.force,
                 dry: args.dry,
                 yes: args.yes,
                 allow_rewrite_protected: args.allow_rewrite_protected,
@@ -186,8 +185,8 @@ pub async fn run_push(args: StashPushArgs) -> anyhow::Result<()> {
     // Same tiered safety as demote had: foreign commits in the
     // range are an unconditional refusal (interleaved plans can't
     // be stashed; `plan-reorder` is the future enabler), non-plan
-    // content dropped only under --force.
-    safety_check(&preview.commits, args.force)?;
+    // content dropped with the plan.
+    safety_check(&preview.commits)?;
 
     let plan_rel = crate::init_facts::plan_md_rel(&stem);
     if plan_file_dirty(&repo, &plan_rel, preview.head_sha.as_str())? {
@@ -542,25 +541,32 @@ fn confirm(prompt: &str) -> anyhow::Result<bool> {
     Ok(matches!(line.trim(), "y" | "Y" | "yes"))
 }
 
-/// Tiered safety check (inherited verbatim from demote):
-/// - All non-foreign `Drop`: ok.
-/// - Any `Rewrite` non-foreign: refuse unless `--force`.
-/// - Any foreign commit (regardless of disposition): unconditional
-///   refusal — interleaved plans cannot be stashed (codex 625b8af:
-///   a foreign commit can classify as `Rewrite`, so ANY foreign is
-///   refused, not just `KeepVerbatim`).
-fn safety_check(commits: &[RewriteCommit], force: bool) -> anyhow::Result<()> {
-    let mut rewrite_shas: Vec<&CommitSha> = Vec::new();
-    let mut foreign_shas: Vec<&CommitSha> = Vec::new();
-    for c in commits {
-        if c.foreign {
-            foreign_shas.push(&c.sha);
-            continue;
-        }
-        if c.disposition == RewriteDisposition::Rewrite {
-            rewrite_shas.push(&c.sha);
-        }
-    }
+/// Foreign-commit refusal. The ONLY tier: a commit the plan's own
+/// timeline does not claim cannot be set aside as a side effect of
+/// stashing that plan, and `--force` does not bypass it (codex
+/// 625b8af: a foreign commit can classify as `Rewrite`, so ANY
+/// foreign is refused, not just `KeepVerbatim`). Note this covers
+/// two sources of foreignness — another plan's commits AND untagged
+/// ad-hoc work interleaved in the range — because `foreign` is
+/// `!attributed`, attribution being membership in the plan's own
+/// timeline.
+///
+/// There used to be a second tier: any non-foreign commit whose
+/// disposition is `Rewrite` — that is, one touching content beyond
+/// the plan document — refused unless `--force`. That is what an
+/// implementation commit IS, so it fired for every plan past its
+/// intro and made `clank stash` unusable on real work, while
+/// offering nothing but an instruction to pass `--force`. It was
+/// inherited from `demote`, which no longer exists.
+///
+/// It is not replaced by a smarter predicate, because none exists: a
+/// `[plan]` tag asserts ownership of the whole commit, not that no
+/// unrelated change rides along in it. What remains is a deliberate
+/// trade, and `purge` already makes it on the IRREVERSIBLE path (see
+/// `purge::drop_safety_check`) — stash pops back, so it costs
+/// strictly less here (stash-stops-refusing-impl-commits).
+fn safety_check(commits: &[RewriteCommit]) -> anyhow::Result<()> {
+    let foreign_shas = crate::preview::foreign_shas(commits);
     if !foreign_shas.is_empty() {
         let list: Vec<String> = foreign_shas
             .iter()
@@ -568,19 +574,8 @@ fn safety_check(commits: &[RewriteCommit], force: bool) -> anyhow::Result<()> {
             .collect();
         anyhow::bail!(
             "stash push refuses: foreign commit(s) interleaved in plan range: {}. \
-             `--force` does NOT bypass this. Disentangle first (see the \
-             `plan-reorder` queue item) or coordinate with the author(s).",
-            list.join(", ")
-        );
-    }
-    if !rewrite_shas.is_empty() && !force {
-        let list: Vec<String> = rewrite_shas
-            .iter()
-            .map(|s| s.as_str().to_string())
-            .collect();
-        anyhow::bail!(
-            "stash push refuses: commit(s) {} touch non-plan content that would be \
-             set aside with the plan. Pass `--force` to stash them anyway.",
+             Disentangle first (see the `plan-reorder` queue item) or coordinate \
+             with the author(s).",
             list.join(", ")
         );
     }

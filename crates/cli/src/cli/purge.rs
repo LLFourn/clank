@@ -391,11 +391,7 @@ fn is_finish_diff(lines: &[String], plan_key: Option<&PlanKey>) -> bool {
 /// the opt-in to losing code (Phase 2, OQ1 tentative pick:
 /// skip the Rewrite-requires-force tier).
 fn drop_safety_check(commits: &[RewriteCommit]) -> anyhow::Result<()> {
-    let foreign: Vec<&clank_core::ids::CommitSha> = commits
-        .iter()
-        .filter(|c| c.foreign)
-        .map(|c| &c.sha)
-        .collect();
+    let foreign = crate::preview::foreign_shas(commits);
     if !foreign.is_empty() {
         let list: Vec<String> = foreign.iter().map(|s| s.as_str().to_string()).collect();
         anyhow::bail!(

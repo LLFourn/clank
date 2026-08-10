@@ -123,6 +123,27 @@ pub async fn build_finish_preview(
     })
 }
 
+/// The commits in a rewrite range the target plan's own timeline does
+/// NOT claim.
+///
+/// Shared by `stash push` and `purge --drop` because it is the one
+/// rule they genuinely agree on: a foreign commit cannot be swept up
+/// as a side effect of operating on someone else's plan, and no flag
+/// bypasses it. They keep separate MESSAGES — the advice differs —
+/// but sharing the predicate is what stops the two drifting apart
+/// (stash-stops-refusing-impl-commits).
+///
+/// Note this covers two sources at once: commits tagged for another
+/// plan, and untagged ad-hoc work interleaved in the range. Both are
+/// `!attributed`.
+pub fn foreign_shas(commits: &[RewriteCommit]) -> Vec<&clank_core::ids::CommitSha> {
+    commits
+        .iter()
+        .filter(|c| c.foreign)
+        .map(|c| &c.sha)
+        .collect()
+}
+
 /// Single-plan rewrite preview. `include_finalize=true` strips the
 /// `.clank/finished/<stem>/` snapshot too (purge mode).
 pub async fn build_rewrite_preview(

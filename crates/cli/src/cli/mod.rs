@@ -1486,11 +1486,6 @@ pub struct StashPushArgs {
     /// Queue priority for `--to-queue` (default 500).
     #[arg(long, value_name = "N")]
     pub priority: Option<u16>,
-    /// Allow stashing when the plan range contains `Rewrite`
-    /// dispositions (your own code-touching commits). Does NOT
-    /// bypass foreign commits — those refuse unconditionally.
-    #[arg(long)]
-    pub force: bool,
     /// Print the plan without changing anything.
     #[arg(long)]
     pub dry: bool,
@@ -1524,11 +1519,6 @@ pub struct ShelveArgs {
     /// Queue priority for `--to-queue` (default 500).
     #[arg(long, value_name = "N")]
     pub priority: Option<u16>,
-    /// Allow shelving when the plan range contains `Rewrite`
-    /// dispositions (your own code-touching commits). Does NOT
-    /// bypass foreign commits — those refuse unconditionally.
-    #[arg(long)]
-    pub force: bool,
     /// Print the plan without changing anything.
     #[arg(long)]
     pub dry: bool,
