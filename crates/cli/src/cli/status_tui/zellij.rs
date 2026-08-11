@@ -417,26 +417,36 @@ pub(super) fn plan_panes(cur: &RosterView, live: &[(String, bool)]) -> PanePlan 
 /// convergence logic is testable without spawning zellij
 /// (no-binary-spawning-tests). One pass takes ONE snapshot (the
 /// measured-slow `--json` listing) and threads it through every op;
-/// verification reads the cheap `dump-layout` source, falling back to
-/// a fresh snapshot (zellij-one-listing-per-pass). `Snap` is opaque to
+/// verification re-reads that same listing — the only source that
+/// identifies a STARTED agent (zellij-one-listing-per-pass, revised
+/// by zellij-pane-placement-and-cost). `Snap` is opaque to
 /// the reconciler: the real impl holds raw panes, tests hold pairs.
 pub(super) trait PaneIo {
     type Snap;
     fn snapshot(&mut self) -> Option<Self::Snap>;
     fn pairs(&mut self, snap: &Self::Snap) -> Vec<(String, bool)>;
-    /// Post-action ground truth for convergence recording.
-    fn verify_pairs(&mut self) -> Option<Vec<(String, bool)>>;
+    /// Post-action ground truth for convergence: the label/role pairs
+    /// AND whether the reviewers are correctly placed, from ONE read.
+    /// Both, because a pass that only removed or relocated still has
+    /// to answer for placement — checking labels alone lets an
+    /// unstacked tab be cached (codex on d5121e1) — and splitting
+    /// them would cost a second session-wide listing.
+    fn verify(&mut self, reviewers: &[String]) -> Option<(Vec<(String, bool)>, bool)>;
     fn capture_focus(&mut self) -> Option<String>;
     fn restore_focus(&mut self, id: &str);
-    /// Returns whether a pane was actually created — later adds chain
-    /// their stack-onto-focus off this (codex 4df5f0c).
-    fn add(
-        &mut self,
-        label: &str,
-        other_reviewers: &[String],
-        snap: &Self::Snap,
-        stack_onto_focus: bool,
-    ) -> bool;
+    /// Create the pane; returns its id when one was made (`None` when
+    /// it already existed or creation failed). The caller accumulates
+    /// these and stacks the whole set once via [`Self::stack`].
+    fn add(&mut self, label: &str, other_reviewers: &[String], snap: &Self::Snap)
+    -> Option<String>;
+    /// Put this repo's reviewer panes, plus `extra_ids` created this
+    /// pass, into one stack. Returns whether they ARE stacked
+    /// afterwards — read back, not assumed.
+    fn stack(&mut self, reviewers: &[String], snap: &Self::Snap, extra_ids: &[String]) -> bool;
+    /// Whether the reviewers are ALREADY stacked in `snap`. Presence
+    /// of every label does not imply correct placement, so the
+    /// converged path consults this before caching.
+    fn is_placed(&mut self, reviewers: &[String], snap: &Self::Snap) -> bool;
     fn relocate(
         &mut self,
         new_master: &str,
@@ -460,11 +470,31 @@ impl PaneIo for ZellijPaneIo<'_> {
     fn pairs(&mut self, snap: &Self::Snap) -> Vec<(String, bool)> {
         crate::cli::open_zellij::agent_pane_pairs(snap, self.repo)
     }
-    fn verify_pairs(&mut self) -> Option<Vec<(String, bool)>> {
-        crate::cli::open_zellij::dump_layout_pairs(self.repo).or_else(|| {
-            let snap = crate::cli::open_zellij::snapshot_panes()?;
-            Some(crate::cli::open_zellij::agent_pane_pairs(&snap, self.repo))
-        })
+    fn verify(&mut self, reviewers: &[String]) -> Option<(Vec<(String, bool)>, bool)> {
+        // A FRESH listing, not `dump-layout`. The dump was the cheap
+        // source (1.0s vs 5.6s on a 28-pane session) but it cannot
+        // identify an agent that has STARTED: it reports the running
+        // program, which the exec turns into `opencode`, `uv`,
+        // `caffeinate`, a vendored codex path, even a child like
+        // `rust-analyzer`. The listing keeps the CONFIGURED command,
+        // so `clank agent start <label> --repo <repo>` is still there
+        // — provenance and label in one string that the exec cannot
+        // touch. Identifying by pane TITLE instead was tried and
+        // rejected: the title carries no ownership marker, so any
+        // pane in the repo named `x (reviewer)` would pass, and it
+        // cannot round-trip the legal label domain (`AgentLabel`
+        // permits emoji and spaces), which fails OPEN — a wrong label
+        // that never converges — where this fails closed
+        // (zellij-pane-placement-and-cost).
+        //
+        // Cost is bounded by WHEN this runs: a converged pass returns
+        // on its first listing and never reaches here, so the second
+        // read is paid only by passes that actually changed something.
+        let snap = crate::cli::open_zellij::snapshot_panes()?;
+        Some((
+            crate::cli::open_zellij::agent_pane_pairs(&snap, self.repo),
+            crate::cli::open_zellij::reviewers_are_stacked(&snap, self.repo, reviewers),
+        ))
     }
     fn capture_focus(&mut self) -> Option<String> {
         crate::cli::open_zellij::pass_focus_target()
@@ -477,15 +507,14 @@ impl PaneIo for ZellijPaneIo<'_> {
         label: &str,
         other_reviewers: &[String],
         snap: &Self::Snap,
-        stack_onto_focus: bool,
-    ) -> bool {
-        crate::cli::open_zellij::add_reviewer_pane(
-            self.repo,
-            label,
-            other_reviewers,
-            snap,
-            stack_onto_focus,
-        )
+    ) -> Option<String> {
+        crate::cli::open_zellij::add_reviewer_pane(self.repo, label, other_reviewers, snap)
+    }
+    fn stack(&mut self, reviewers: &[String], snap: &Self::Snap, extra_ids: &[String]) -> bool {
+        crate::cli::open_zellij::stack_reviewer_panes(self.repo, reviewers, snap, extra_ids)
+    }
+    fn is_placed(&mut self, reviewers: &[String], snap: &Self::Snap) -> bool {
+        crate::cli::open_zellij::reviewers_are_stacked(snap, self.repo, reviewers)
     }
     fn relocate(
         &mut self,
@@ -524,31 +553,79 @@ impl PaneReconciler {
             return false;
         };
         let plan = plan_panes(&cur, &io.pairs(&snap));
-        if plan.is_converged() {
-            // The listing we just took IS the ground truth: converged.
-            self.converged = Some(cur);
-            return false;
-        }
-        // Pass-level focus transaction: capture the user's focus once
-        // before the first action, restore once after the last
-        // (zellij-one-listing-per-pass).
-        let focus = io.capture_focus();
         let reviewers: Vec<String> = cur
             .labels
             .iter()
             .filter(|l| Some(*l) != cur.master.as_ref())
             .cloned()
             .collect();
+        if plan.is_converged() {
+            // Every label is present — but presence is not PLACEMENT.
+            // A tab whose reviewers are not stacked (a failed or
+            // silently no-op `stack-panes` last pass, or a tab broken
+            // before this code existed) looks converged by label and
+            // would never be repaired (codex on 3d3ffce). Repair here,
+            // and only cache convergence once placement is confirmed.
+            if io.is_placed(&reviewers, &snap) {
+                self.converged = Some(cur);
+                return false;
+            }
+            let focus = io.capture_focus();
+            let placed = io.stack(&reviewers, &snap, &[]);
+            if let Some(id) = &focus {
+                io.restore_focus(id);
+            }
+            // `stack-panes` can only BUILD a stack, never take a pane
+            // out of one — measured: move-pane does nothing to a stack
+            // member, break-pane does not exist, and stacking with a
+            // fresh pane merges INTO the existing stack. So a lone
+            // reviewer sharing the instrument pane's stack cannot be
+            // repaired, and re-attempting it every refresh would
+            // reinstate exactly the unbounded work this plan removes.
+            //
+            // Cache only what we KNOW is beyond us: with fewer than
+            // two reviewers there is no action left to try, and the
+            // roster changing (a second reviewer arriving) both
+            // invalidates this and makes repair possible again.
+            // Anything else stays unconverged and retries.
+            if placed || reviewers.len() < 2 {
+                self.converged = Some(cur);
+            }
+            return true;
+        }
+        // Pass-level focus transaction: capture the user's focus once
+        // before the first action, restore once after the last
+        // (zellij-one-listing-per-pass).
+        let focus = io.capture_focus();
         // Adds before the relocate (a swapped-in master may be brand
         // new), removes last.
-        // Later adds stack onto the pane the previous new-pane just
-        // focused — the stale snapshot can't name it (codex 5d498d0) —
-        // but ONLY when that previous add actually created a pane: a
-        // failed new-pane must not let the next add stack onto whatever
-        // is focused (codex 4df5f0c).
-        let mut prev_created = false;
+        // Adds do not stack; the whole desired set is stacked ONCE
+        // below. Stacking per-add off the pass-start snapshot skipped
+        // it entirely whenever two reviewers arrived together — each
+        // call saw no existing reviewer and a one-element set (codex
+        // on 2d273c6). Ids created this pass are accumulated because
+        // that snapshot cannot name them.
+        // Tracked BY LABEL: `plan.add` can include a brand-new MASTER
+        // (a swap-in), and feeding that id to the reviewer stack would
+        // sweep the master into it — the same class of bug as the
+        // instrument pane being captured (codex on 3d3ffce).
+        let mut created: Vec<(String, String)> = Vec::new();
         for label in &plan.add {
-            prev_created = io.add(label, &reviewers, &snap, prev_created);
+            if let Some(id) = io.add(label, &reviewers, &snap) {
+                created.push((label.clone(), id));
+            }
+        }
+        let created_reviewers: Vec<String> = created
+            .iter()
+            .filter(|(label, _)| reviewers.iter().any(|r| r == label))
+            .map(|(_, id)| id.clone())
+            .collect();
+        // Placement is part of the outcome, not a side effect. The
+        // verifying read below decides it for EVERY pass — including
+        // remove-only and relocate-only ones, which can leave a stack
+        // wrong without adding anything.
+        if !plan.add.is_empty() {
+            io.stack(&reviewers, &snap, &created_reviewers);
         }
         if let Some((new_master, old_master)) = &plan.relocate {
             // Adds the relocation depends on aren't in the pass-start
@@ -580,11 +657,12 @@ impl PaneReconciler {
         }
         // Converged only when a VERIFYING read confirms the target
         // state — every action above is best-effort, so observation is
-        // not achievement. The verify source is the cheap dump-layout
-        // (with a --json fallback inside the io impl).
+        // not achievement. The verify source is a FRESH listing —
+        // see `verify_pairs` for why the cheaper dump cannot do this
+        // job.
         if io
-            .verify_pairs()
-            .is_some_and(|after| plan_panes(&cur, &after).is_converged())
+            .verify(&reviewers)
+            .is_some_and(|(after, placed)| placed && plan_panes(&cur, &after).is_converged())
         {
             self.converged = Some(cur);
         }
@@ -876,6 +954,9 @@ mod tests {
         focus_captures: usize,
         /// Scripted per-add creation results (default: created).
         add_results: std::collections::VecDeque<bool>,
+        stack_results: std::collections::VecDeque<bool>,
+        placed_results: std::collections::VecDeque<bool>,
+        verify_placed: std::collections::VecDeque<bool>,
     }
 
     impl FakeIo {
@@ -895,6 +976,9 @@ mod tests {
                 verifies_taken: 0,
                 focus_captures: 0,
                 add_results: std::collections::VecDeque::new(),
+                stack_results: std::collections::VecDeque::new(),
+                placed_results: std::collections::VecDeque::new(),
+                verify_placed: std::collections::VecDeque::new(),
             }
         }
     }
@@ -908,9 +992,13 @@ mod tests {
         fn pairs(&mut self, snap: &Self::Snap) -> Vec<(String, bool)> {
             snap.clone()
         }
-        fn verify_pairs(&mut self) -> Option<Vec<(String, bool)>> {
+        fn verify(&mut self, _reviewers: &[String]) -> Option<(Vec<(String, bool)>, bool)> {
             self.verifies_taken += 1;
-            self.verifies.pop_front().unwrap_or(None)
+            let placed = self.verify_placed.pop_front().unwrap_or(true);
+            self.verifies
+                .pop_front()
+                .unwrap_or(None)
+                .map(|p| (p, placed))
         }
         fn capture_focus(&mut self) -> Option<String> {
             self.focus_captures += 1;
@@ -919,16 +1007,19 @@ mod tests {
         fn restore_focus(&mut self, id: &str) {
             self.log.push(format!("focus {id}"));
         }
-        fn add(
-            &mut self,
-            label: &str,
-            _other: &[String],
-            _snap: &Self::Snap,
-            stack_onto_focus: bool,
-        ) -> bool {
-            let suffix = if stack_onto_focus { " (stacked)" } else { "" };
-            self.log.push(format!("add {label}{suffix}"));
-            self.add_results.pop_front().unwrap_or(true)
+        fn add(&mut self, label: &str, _other: &[String], _snap: &Self::Snap) -> Option<String> {
+            self.log.push(format!("add {label}"));
+            self.add_results
+                .pop_front()
+                .unwrap_or(true)
+                .then(|| format!("terminal_{label}"))
+        }
+        fn stack(&mut self, _revs: &[String], _snap: &Self::Snap, extra: &[String]) -> bool {
+            self.log.push(format!("stack [{}]", extra.join(",")));
+            self.stack_results.pop_front().unwrap_or(true)
+        }
+        fn is_placed(&mut self, _revs: &[String], _snap: &Self::Snap) -> bool {
+            self.placed_results.pop_front().unwrap_or(true)
         }
         fn relocate(
             &mut self,
@@ -987,13 +1078,16 @@ mod tests {
         assert_eq!(r.converged, None, "failure must not converge");
 
         // Second observe, same roster: retries; the pass runs (codex
-        // pane missing → add) and the dump-layout verify confirms.
+        // pane missing → add) and the verifying read confirms.
         let mut io = FakeIo::with_verify(
             vec![Some(live(&[("claude", true)]))],
             vec![Some(live(&[("claude", true), ("codex", false)]))],
         );
         r.reconcile(RosterView::of(&snap), &mut io);
-        assert_eq!(io.log, vec!["add codex", "focus user_pane"]);
+        assert_eq!(
+            io.log,
+            vec!["add codex", "stack [terminal_codex]", "focus user_pane"]
+        );
         assert_eq!((io.snapshots_taken, io.verifies_taken), (1, 1));
         assert!(r.converged.is_some(), "verified pass converges");
 
@@ -1013,7 +1107,10 @@ mod tests {
         let stale = live(&[("claude", true)]);
         let mut io = FakeIo::with_verify(vec![Some(stale.clone())], vec![Some(stale)]);
         r.reconcile(RosterView::of(&snap), &mut io);
-        assert_eq!(io.log, vec!["add codex", "focus user_pane"]);
+        assert_eq!(
+            io.log,
+            vec!["add codex", "stack [terminal_codex]", "focus user_pane"]
+        );
         assert_eq!(r.converged, None);
     }
 
@@ -1031,7 +1128,7 @@ mod tests {
         let after = live(&[("new-master", true), ("codex", false)]);
         // Adds feed the relocation → the pass refreshes the snapshot
         // once after the adds (codex 631636e): TWO snapshots, one
-        // dump-layout verify.
+        // verifying read.
         let mut io = FakeIo::with_verify(vec![Some(before), Some(after_add)], vec![Some(after)]);
         r.reconcile(RosterView::of(&snap), &mut io);
         assert_eq!((io.snapshots_taken, io.verifies_taken), (2, 1));
@@ -1039,6 +1136,11 @@ mod tests {
             io.log,
             vec![
                 "add new-master",
+                // The new MASTER's id is NOT offered to the reviewer
+                // stack — feeding it in would sweep the master into
+                // the reviewers, the same class of bug as capturing
+                // the instrument pane.
+                "stack []",
                 "relocate new-master<-Some(\"old\")",
                 "remove old",
                 "focus user_pane"
@@ -1101,29 +1203,193 @@ mod tests {
     }
 
     #[test]
-    fn later_adds_stack_only_after_a_successful_creation() {
-        // codex 4df5f0c: multi-add chaining. Success path: add #2
-        // stacks onto the pane add #1 just created and focused.
+    fn two_adds_from_a_reviewerless_snapshot_still_get_stacked() {
+        // The regression codex caught on 2d273c6: stacking per-add off
+        // the PASS-START snapshot meant each call saw no existing
+        // reviewer and a one-element set, so neither stacked and two
+        // reviewers sat unstacked. The ids created this pass must
+        // reach the stack even though the snapshot cannot name them.
         let snap = roster_snap(&[("claude", true), ("r1", false), ("r2", false)]);
         let mut r = PaneReconciler::new();
+        // Live state has the MASTER only — no reviewer to anchor on.
         let before = live(&[("claude", true)]);
+        let mut io = FakeIo::with_verify(vec![Some(before)], vec![None]);
+        r.reconcile(RosterView::of(&snap), &mut io);
+        assert!(
+            io.log
+                .contains(&"stack [terminal_r1,terminal_r2]".to_string()),
+            "both new panes must be stacked together; got {:?}",
+            io.log
+        );
+    }
+
+    #[test]
+    fn a_remove_only_pass_still_answers_for_placement() {
+        // codex on d5121e1: a pass that only REMOVES (or only
+        // relocates) adds nothing, so it used to skip the placement
+        // question entirely and cache on label/title alone — leaving
+        // an unstacked tab remembered as converged.
+        let snap = roster_snap(&[("claude", true), ("r1", false)]);
+        // Live has a stale extra reviewer → the plan is remove-only.
+        let before = live(&[("claude", true), ("r1", false), ("gone", false)]);
+        let after = live(&[("claude", true), ("r1", false)]);
+        let mut r = PaneReconciler::new();
+        let mut io = FakeIo::with_verify(vec![Some(before)], vec![Some(after)]);
+        io.verify_placed = vec![false].into();
+        r.reconcile(RosterView::of(&snap), &mut io);
+        assert!(
+            io.log.iter().any(|l| l.starts_with("remove")),
+            "sanity: this pass removes; got {:?}",
+            io.log
+        );
+        assert!(
+            r.converged.is_none(),
+            "an unstacked result must not converge just because nothing was added"
+        );
+    }
+
+    #[test]
+    fn a_second_pass_repairs_placement_instead_of_caching_it() {
+        // codex on 3d3ffce: after a failed stack the panes EXIST, so
+        // the next pass sees every label and would take the
+        // label-only converged return — the broken placement would
+        // never be retried, and a tab broken before this code existed
+        // would be accepted as fine. Presence is not placement.
+        let snap = roster_snap(&[("claude", true), ("r1", false), ("r2", false)]);
+        let all_live = live(&[("claude", true), ("r1", false), ("r2", false)]);
+        let mut r = PaneReconciler::new();
+        let mut io = FakeIo::with_verify(vec![Some(all_live)], vec![None]);
+        // Labels all present, but NOT stacked; the repair fails too.
+        io.placed_results = vec![false].into();
+        io.stack_results = vec![false].into();
+        let acted = r.reconcile(RosterView::of(&snap), &mut io);
+
+        assert!(acted, "an unplaced tab is work, not a no-op");
+        assert!(
+            io.log.iter().any(|l| l.starts_with("stack ")),
+            "the second pass must attempt repair; got {:?}",
+            io.log
+        );
+        assert!(
+            r.converged.is_none(),
+            "a failed repair must not be cached as converged"
+        );
+    }
+
+    #[test]
+    fn an_unrepairable_lone_reviewer_does_not_spin() {
+        // One reviewer stacked with the instrument pane cannot be
+        // separated by any action zellij offers, so retrying it on
+        // every refresh would reinstate the unbounded work this plan
+        // exists to remove. It is cached — but only because there is
+        // nothing left to try, and only until the roster changes.
+        let snap = roster_snap(&[("claude", true), ("r1", false)]);
+        let all_live = live(&[("claude", true), ("r1", false)]);
+        let mut r = PaneReconciler::new();
+        let mut io = FakeIo::with_verify(vec![Some(all_live)], vec![None]);
+        io.placed_results = vec![false].into();
+        io.stack_results = vec![false].into();
+        r.reconcile(RosterView::of(&snap), &mut io);
+        assert!(
+            r.converged.is_some(),
+            "with one reviewer there is no repair to retry; spinning helps nobody"
+        );
+
+        // TWO reviewers is repairable, so a failure must NOT be cached.
+        let snap2 = roster_snap(&[("claude", true), ("r1", false), ("r2", false)]);
+        let live2 = live(&[("claude", true), ("r1", false), ("r2", false)]);
+        let mut r2 = PaneReconciler::new();
+        let mut io2 = FakeIo::with_verify(vec![Some(live2)], vec![None]);
+        io2.placed_results = vec![false].into();
+        io2.stack_results = vec![false].into();
+        r2.reconcile(RosterView::of(&snap2), &mut io2);
+        assert!(
+            r2.converged.is_none(),
+            "a repairable failure must stay unconverged and retry"
+        );
+    }
+
+    #[test]
+    fn a_placed_tab_converges_without_acting() {
+        // The other half: when the labels are all present AND the
+        // reviewers are stacked, the pass must stay a no-op — the
+        // repair path must not fire on every refresh.
+        let snap = roster_snap(&[("claude", true), ("r1", false)]);
+        let all_live = live(&[("claude", true), ("r1", false)]);
+        let mut r = PaneReconciler::new();
+        let mut io = FakeIo::with_verify(vec![Some(all_live)], vec![None]);
+        io.placed_results = vec![true].into();
+        let acted = r.reconcile(RosterView::of(&snap), &mut io);
+        assert!(!acted);
+        assert!(
+            io.log.is_empty(),
+            "no actions on a placed tab: {:?}",
+            io.log
+        );
+        assert!(r.converged.is_some());
+    }
+
+    #[test]
+    fn unconfirmed_placement_keeps_the_pass_unconverged() {
+        // `stack-panes` exits 0 on a stale id without doing anything,
+        // so its status proves nothing and placement is READ BACK. If
+        // the reviewers are not stacked afterwards, the pass must not
+        // cache convergence — otherwise a silent no-op is remembered
+        // as success and never retried (codex on 2d273c6).
+        let snap = roster_snap(&[("claude", true), ("r1", false)]);
+        let mut r = PaneReconciler::new();
+        let before = live(&[("claude", true)]);
+        // Verify would say converged; placement says otherwise.
+        let after = live(&[("claude", true), ("r1", false)]);
+        let mut io = FakeIo::with_verify(vec![Some(before)], vec![Some(after)]);
+        // The VERIFYING read is what decides: `stack-panes` exits 0 on
+        // a stale id without doing anything, so its status proves
+        // nothing and is not consulted.
+        io.verify_placed = vec![false].into();
+        r.reconcile(RosterView::of(&snap), &mut io);
+        assert!(
+            r.converged.is_none(),
+            "placement not confirmed → the pass must stay unconverged so it retries"
+        );
+    }
+
+    #[test]
+    fn adds_are_independent_of_each_other() {
+        // Replaces `later_adds_stack_only_after_a_successful_creation`
+        // (codex 4df5f0c), whose subject is gone: adds no longer chain
+        // through focus, because each one stacks by pane ID afterwards
+        // rather than steering `new-pane --stacked`. What must hold now
+        // is that one add tells the next nothing — including when the
+        // first FAILS, which used to be load-bearing
+        // (zellij-pane-placement-and-cost).
+        let snap = roster_snap(&[("claude", true), ("r1", false), ("r2", false)]);
+        let before = live(&[("claude", true)]);
+
+        let mut r = PaneReconciler::new();
         let mut io = FakeIo::with_verify(vec![Some(before.clone())], vec![None]);
         r.reconcile(RosterView::of(&snap), &mut io);
         assert_eq!(
             io.log,
-            vec!["add r1", "add r2 (stacked)", "focus user_pane"]
+            vec![
+                "add r1",
+                "add r2",
+                "stack [terminal_r1,terminal_r2]",
+                "focus user_pane"
+            ]
         );
 
-        // Failure path: add #1's new-pane fails → add #2 must NOT
-        // stack onto whatever happens to be focused.
+        // A failed first add changes nothing about the second, and the
+        // stack still runs over what DID get made — it contributes no
+        // id, rather than aborting placement for the rest.
         let mut r = PaneReconciler::new();
         let mut io = FakeIo::with_verify(vec![Some(before)], vec![None]);
         io.add_results = vec![false].into();
         r.reconcile(RosterView::of(&snap), &mut io);
-        assert_eq!(io.log, vec!["add r1", "add r2", "focus user_pane"]);
+        assert_eq!(
+            io.log,
+            vec!["add r1", "add r2", "stack [terminal_r2]", "focus user_pane"]
+        );
     }
-
-    // ── tui-reconcile-off-loop: worker coalescing + shutdown ────
 
     #[test]
     fn worker_coalesces_in_flight_arrivals_into_exactly_one_follow_up() {

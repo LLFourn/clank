@@ -934,12 +934,24 @@ fn agent_pane_label<'a>(pane: &'a ZellijPane, repo_path: &str) -> Option<&'a str
     if pane.is_plugin {
         return None;
     }
+    // Strip the KNOWN repo suffix rather than splitting at the first
+    // space: `AgentLabel` permits spaces (it forbids only empty,
+    // dot-segments and `/`), so a label like `two words` produced the
+    // exact command `clank agent start two words --repo /repo` and a
+    // first-space split read it as `two` with a tail that never
+    // matched. That agent was then permanently absent — and since
+    // verification now reads this same parser, permanently absent
+    // means reconciliation never converges (codex on 1fe53e0).
+    //
+    // Anchoring on both ends keeps what the split gave for free: a
+    // different repo does not match, and a trailing extra argument
+    // leaves the suffix un-terminal so it does not either.
     let rest = pane
         .terminal_command
         .as_deref()?
         .strip_prefix("clank agent start ")?;
-    let (label, tail) = rest.split_once(' ')?;
-    (tail == format!("--repo {repo_path}")).then_some(label)
+    let label = rest.strip_suffix(&format!(" --repo {repo_path}"))?;
+    (!label.is_empty()).then_some(label)
 }
 
 /// One `--json` pane listing for a whole reconcile pass
@@ -963,57 +975,6 @@ pub(crate) fn agent_pane_pairs(panes: &[ZellijPane], repo: &Path) -> Vec<(String
             agent_pane_label(p, &repo_str).map(|l| (l.to_owned(), p.title.ends_with(" (master)")))
         })
         .collect()
-}
-
-/// `(label, master_titled)` pairs from `zellij action dump-layout` —
-/// the CHEAP verification source (measured 0.12s vs the 1.1s `--json`
-/// listing): the KDL carries each pane's command/args (the exact
-/// repo-scoped agent-start invocation) and its name (the role title).
-/// `None` outside zellij or on query failure — the caller falls back
-/// to the `--json` listing (correctness over speed).
-pub(crate) fn dump_layout_pairs(repo: &Path) -> Option<Vec<(String, bool)>> {
-    std::env::var_os("ZELLIJ")?;
-    let out = zellij_action(&["dump-layout"])?;
-    parse_dump_layout_pairs(&String::from_utf8_lossy(&out), &repo.to_string_lossy())
-}
-
-/// Structural parse for [`dump_layout_pairs`] (codex 4df5f0c: a real
-/// KDL parse, not a line scan): an agent pane is any `pane` node with
-/// `command="clank"`, a `name`, and an `args` child whose positional
-/// values are exactly `agent start <label> --repo <repo>`. Parse
-/// failure → `None` (the caller falls back to the `--json` listing);
-/// a well-formed layout with no agent panes is `Some(vec![])` — a
-/// real answer. Escaping comes free from the KDL parser.
-fn parse_dump_layout_pairs(kdl_text: &str, repo_path: &str) -> Option<Vec<(String, bool)>> {
-    let doc: kdl::KdlDocument = kdl_text.parse().ok()?;
-    let mut out = Vec::new();
-    collect_agent_panes(&doc, repo_path, &mut out);
-    Some(out)
-}
-
-fn collect_agent_panes(doc: &kdl::KdlDocument, repo_path: &str, out: &mut Vec<(String, bool)>) {
-    for node in doc.nodes() {
-        if node.name().value() == "pane"
-            && node.get("command").and_then(|e| e.value().as_string()) == Some("clank")
-            && let Some(name) = node.get("name").and_then(|e| e.value().as_string())
-            && let Some(args) = node.children().and_then(|c| c.get("args"))
-        {
-            let vals: Vec<&str> = args
-                .entries()
-                .iter()
-                .filter(|e| e.name().is_none())
-                .filter_map(|e| e.value().as_string())
-                .collect();
-            if let ["agent", "start", label, "--repo", repo] = vals.as_slice()
-                && *repo == repo_path
-            {
-                out.push((label.to_string(), name.ends_with(" (master)")));
-            }
-        }
-        if let Some(children) = node.children() {
-            collect_agent_panes(children, repo_path, out);
-        }
-    }
 }
 
 /// The pane the USER actually has focused, via `zellij action
@@ -1068,6 +1029,40 @@ fn caller_pane_id() -> Option<String> {
     (!id.is_empty()).then(|| format!("terminal_{id}"))
 }
 
+/// What the INSTALLED zellij client can do about pane placement.
+///
+/// Three outcomes, kept apart because the operator's next step
+/// differs: no zellij at all is not a problem to fix, an old client
+/// is an upgrade, and a capable client is nothing to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlacementCapability {
+    /// No zellij on PATH — nothing to say.
+    NoZellij,
+    /// A client without `stack-panes`: reviewer panes will not be
+    /// stacked, and the only symptom is a wrong arrangement.
+    ClientTooOld,
+    /// The client parser accepts it. NOT a statement about a running
+    /// SERVER: replacing the binary under a live session leaves an
+    /// older server that may reject what this client can spell
+    /// (zellij-pane-placement-and-cost).
+    ClientSupports,
+}
+
+pub fn placement_capability() -> PlacementCapability {
+    // Probed by CAPABILITY, not by parsing `zellij --version`: a HEAD
+    // build can report a version AHEAD of the latest release, so
+    // version arithmetic answers a different question than "does this
+    // binary have the action".
+    match std::process::Command::new("zellij")
+        .args(["action", "stack-panes", "--help"])
+        .output()
+    {
+        Err(_) => PlacementCapability::NoZellij,
+        Ok(o) if o.status.success() => PlacementCapability::ClientSupports,
+        Ok(_) => PlacementCapability::ClientTooOld,
+    }
+}
+
 /// Run `zellij action <args>`, swallowing output and errors. Best-effort
 /// by construction: a zellij hiccup must never fail the caller (the
 /// roster mutation already persisted) nor bleed onto a pane. Returns
@@ -1104,78 +1099,162 @@ fn tab_dims(panes: &[ZellijPane], tab_id: u32) -> (u16, u16) {
     (cols, rows)
 }
 
-/// Best-effort: open a pane for a newly-added reviewer in the current
-/// reviewer stack, working from the pass's shared `panes` listing
-/// (zellij-one-listing-per-pass — no internal re-list, no per-op focus
-/// restore; the worker owns the pass-level focus transaction).
+/// Best-effort: open a pane for a newly-added reviewer and put it in
+/// this repo's reviewer stack, working from the pass's shared `panes`
+/// listing (zellij-one-listing-per-pass).
 /// Idempotent: no-op if the pane already exists in the listing.
+///
+/// Stacking is NOT done here — see [`stack_reviewer_panes`], which
+/// the caller runs ONCE over the whole desired set. Doing it per-add
+/// off the pass-start snapshot silently skipped stacking whenever two
+/// reviewers were added at once: each call saw no existing reviewer
+/// and a one-element set (codex on 2d273c6). Returning the created id
+/// lets the caller accumulate what this pass actually made.
+///
+/// Placement is by pane id via `zellij action stack-panes` — never by
+/// `new-pane --stacked` onto whatever is focused. That focus-dependence is how the instrument pane ended up
+/// inside the reviewer stack: with no reviewer anchor the old code
+/// focused the caller, and a roster add is issued FROM the status
+/// TUI, so the caller IS the status pane. Naming the reviewer ids
+/// explicitly makes the instrument pane unstackable by construction —
+/// it is simply never in the list (zellij-pane-placement-and-cost).
+///
+/// Measured properties of `stack-panes` this relies on: running
+/// processes survive it, panes outside the id list are untouched, and
+/// a stale id is tolerated (exit 0, nothing damaged) — which matters
+/// because the listing threaded in here can be a pass old.
 pub(crate) fn add_reviewer_pane(
     repo: &Path,
     label: &str,
     other_reviewers: &[String],
     panes: &[ZellijPane],
-    stack_onto_focus: bool,
-) -> bool {
+) -> Option<String> {
     let repo_str = repo.to_string_lossy();
     if find_pane_by_command(panes, &agent_start_command(label, &repo_str)).is_some() {
-        return false;
+        return None;
     }
-    // A later add in the same pass (codex 5d498d0): the previous
-    // new-pane left focus ON the pane it created — a stack member the
-    // stale snapshot can't name — so stack onto the current focus and
-    // skip the snapshot-based anchoring entirely.
-    if stack_onto_focus {
-        let mut new_pane: Vec<String> = vec![
-            "new-pane".to_string(),
-            "--name".to_string(),
-            agent_pane_title(label, "reviewer"),
-            "--cwd".to_string(),
-            repo_str.to_string(),
-            "--stacked".to_string(),
-            "--".to_string(),
-            "clank".to_string(),
-        ];
-        new_pane.extend(agent_start_argv(label, &repo_str));
-        let refs: Vec<&str> = new_pane.iter().map(String::as_str).collect();
-        return zellij_action(&refs).is_some();
-    }
+    // Focus decides which TAB `new-pane` opens in — nothing more. An
+    // existing reviewer keeps the pane in the repo's tab; else the
+    // caller's own pane does. A wrong guess here used to also decide
+    // what got stacked, which is exactly what it no longer does.
     let anchor_cmds: Vec<String> = other_reviewers
         .iter()
         .map(|l| agent_start_command(l, &repo_str))
         .collect();
-    let anchor = find_anchor_pane(panes, &anchor_cmds).map(ZellijPane::pane_id);
-    // Where to focus BEFORE new-pane: the reviewer anchor when a stack
-    // exists; else the caller's own pane, so the new pane still opens in
-    // the REPO's tab even when the user is focused on a different tab
-    // (new-pane targets the focused tab). NOT an anchor for stacking.
-    let focus_first = anchor.clone().or_else(caller_pane_id);
-
-    let title = agent_pane_title(label, "reviewer");
-    let mut new_pane: Vec<String> = vec![
-        "new-pane".to_string(),
-        "--name".to_string(),
-        title,
-        "--cwd".to_string(),
-        repo_str.to_string(),
-    ];
-    // `--stacked` only with a reviewer anchor focused: stacking onto the
-    // master (the fallback focus) would fold the stage into a stack.
-    if anchor.is_some() {
-        new_pane.push("--stacked".to_string());
-    }
-    new_pane.push("--".to_string());
-    new_pane.push("clank".to_string());
-    new_pane.extend(agent_start_argv(label, &repo_str));
-
+    let focus_first = find_anchor_pane(panes, &anchor_cmds)
+        .map(ZellijPane::pane_id)
+        .or_else(caller_pane_id);
     if let Some(id) = &focus_first {
         zellij_action(&["focus-pane-id", id]);
     }
+
+    let mut new_pane: Vec<String> = vec![
+        "new-pane".to_string(),
+        "--name".to_string(),
+        agent_pane_title(label, "reviewer"),
+        "--cwd".to_string(),
+        repo_str.to_string(),
+        "--".to_string(),
+        "clank".to_string(),
+    ];
+    new_pane.extend(agent_start_argv(label, &repo_str));
     let refs: Vec<&str> = new_pane.iter().map(String::as_str).collect();
-    // Report whether the pane was actually created: the caller chains
-    // later stacked adds off THIS success — a failed new-pane must not
-    // let the next add stack onto whatever happens to be focused
-    // (codex 4df5f0c).
-    zellij_action(&refs).is_some()
+    let out = zellij_action(&refs)?;
+    // `new-pane` prints the id it created, so the caller can stack the
+    // fresh pane without paying for another listing.
+    let created = String::from_utf8_lossy(&out).trim().to_string();
+    (!created.is_empty()).then_some(created)
+}
+
+/// Put this repo's reviewer panes — the ones already live plus any
+/// `extra_ids` created this pass — into one stack.
+///
+/// Called ONCE per pass over the complete set, never per add. The
+/// instrument pane is not in the set, so it cannot be swept in.
+/// Returns whether the panes are stacked AFTERWARDS, read back rather
+/// than assumed: `stack-panes` exits 0 on a stale id without doing
+/// anything, so its status proves nothing (codex on 2d273c6).
+pub(crate) fn stack_reviewer_panes(
+    repo: &Path,
+    reviewers: &[String],
+    panes: &[ZellijPane],
+    extra_ids: &[String],
+) -> bool {
+    let repo_str = repo.to_string_lossy();
+    let mut ids: Vec<String> = panes
+        .iter()
+        .filter(|p| {
+            agent_pane_label(p, &repo_str).is_some_and(|l| reviewers.iter().any(|r| r == l))
+        })
+        .map(ZellijPane::pane_id)
+        .collect();
+    for id in extra_ids {
+        if !ids.contains(id) {
+            ids.push(id.clone());
+        }
+    }
+    // `stack-panes` needs two ids to express anything. It used to
+    // return `true` here, which reported SUCCESS for the single
+    // reviewer stacked with the instrument pane — the first-reviewer
+    // form of the reported bug — and the caller then cached that
+    // broken tab as repaired (codex on cc4ae5e). Whether one pane is
+    // correctly placed is a question only the read-back answers.
+    if ids.len() >= 2 {
+        let mut args: Vec<&str> = vec!["stack-panes", "--"];
+        args.extend(ids.iter().map(String::as_str));
+        zellij_action(&args);
+    }
+    match snapshot_panes() {
+        Some(fresh) => reviewers_are_stacked(&fresh, repo, reviewers),
+        // Cannot tell: report NOT placed so the pass stays
+        // unconverged and retries, rather than caching a guess.
+        None => false,
+    }
+}
+
+/// Whether this repo's reviewer panes share ONE stack that the
+/// instrument pane is not in.
+///
+/// `list-panes` has no stacked flag and does not need one: stack
+/// members are reported at IDENTICAL geometry (the whole stack area),
+/// and panes that are NOT stacked never overlap. So equal
+/// (x, y, columns, rows) across the reviewer panes is stack
+/// membership.
+///
+/// The status pane must be checked too, not assumed away. If the
+/// reviewers AND status all sit in one stack — the exact bug this
+/// repairs — every reviewer geometry still agrees, so a
+/// reviewers-only predicate reports "placed" and caches the broken
+/// arrangement forever (codex on d5121e1). Its geometry differing
+/// from the stack's IS its exclusion.
+pub(crate) fn reviewers_are_stacked(
+    panes: &[ZellijPane],
+    repo: &Path,
+    reviewers: &[String],
+) -> bool {
+    let repo_str = repo.to_string_lossy();
+    let geom = |p: &ZellijPane| (p.pane_x, p.pane_y, p.pane_columns, p.pane_rows);
+    let geoms: Vec<(u16, u16, u16, u16)> = panes
+        .iter()
+        .filter(|p| {
+            agent_pane_label(p, &repo_str).is_some_and(|l| reviewers.iter().any(|r| r == l))
+        })
+        .map(geom)
+        .collect();
+    let Some(stack) = geoms.first() else {
+        return true;
+    };
+    if geoms.iter().any(|g| g != stack) {
+        return false;
+    }
+    // The instrument pane, when this repo has one, must sit OUTSIDE
+    // that geometry.
+    let status_command = format!("clank status --repo {repo_str} --tui");
+    !panes.iter().any(|p| {
+        !p.is_plugin
+            && p.terminal_command.as_deref() == Some(status_command.as_str())
+            && geom(p) == *stack
+    })
 }
 
 /// Best-effort: close the panes of removed reviewers, matched by exact
@@ -1871,91 +1950,6 @@ ttys004   zellij attach clank-foo
     }
 
     #[test]
-    fn dump_layout_pairs_parse_the_real_kdl_shape() {
-        // Trimmed from a LIVE `zellij action dump-layout` (2026-07-11):
-        // emoji-prefixed names, clank agent-start panes, a status pane,
-        // and a codex pane running the RESOLVED tool binary directly —
-        // the latter is (deliberately, for now) invisible to the
-        // matcher, exactly as it is to the --json listing's
-        // exact-command match, so listing and verify stay consistent.
-        let kdl = r#"layout {
-    cwd "/Users/llfourn/src"
-    tab name="🔨 clank" hide_floating_panes=true {
-        pane size=1 borderless=true {
-            plugin location="zellij:tab-bar"
-        }
-        pane command="clank" name="🔨 claude (master)" cwd="/Users/llfourn/src/clank" size="65%" {
-            args "agent" "start" "claude" "--repo" "/Users/llfourn/src/clank"
-            start_suspended true
-        }
-        pane command="/opt/homebrew/bin/codex" name="💤 codex (reviewer)" cwd="clank" {
-            args "resume" "019e54b7" "--cd" "/Users/llfourn/src/clank"
-            start_suspended true
-        }
-        pane command="clank" name="💤 ruthless (reviewer)" cwd="/Users/llfourn/src/clank" {
-            args "agent" "start" "ruthless" "--repo" "/Users/llfourn/src/clank"
-            start_suspended true
-        }
-        pane command="clank" name="status" cwd="clank" {
-            args "status" "--repo" "/Users/llfourn/src/clank" "--tui"
-            start_suspended true
-        }
-        pane command="clank" name="other (master)" cwd="/other" {
-            args "agent" "start" "other" "--repo" "/other/repo"
-            start_suspended true
-        }
-    }
-}"#;
-        assert_eq!(
-            parse_dump_layout_pairs(kdl, "/Users/llfourn/src/clank"),
-            Some(vec![
-                ("claude".to_string(), true),
-                ("ruthless".to_string(), false),
-            ]),
-            "agent-start panes for THIS repo only; status pane, other \
-             repos, and resolved-binary panes are invisible"
-        );
-        // Malformed / unsupported output is a PARSE FAILURE (None →
-        // the caller falls back to --json), not an empty answer.
-        assert_eq!(
-            parse_dump_layout_pairs("error: session not found", "/x"),
-            None
-        );
-        assert_eq!(
-            parse_dump_layout_pairs("layout {\n}", "/x"),
-            Some(vec![]),
-            "a well-formed layout with no agent panes is a real answer"
-        );
-    }
-
-    #[test]
-    fn dump_layout_parse_handles_escapes_and_rejects_invalid_kdl() {
-        // codex 4df5f0c: a REAL parser — escaped values decode, and
-        // syntactically invalid input is a parse failure (None → the
-        // --json fallback), never a silent empty success.
-        let kdl = r#"layout {
-    pane command="clank" name="🔨 we\"ird (master)" {
-        args "agent" "start" "we\"ird" "--repo" "/pa th/re\"po"
-    }
-}"#;
-        assert_eq!(
-            parse_dump_layout_pairs(kdl, "/pa th/re\"po"),
-            Some(vec![("we\"ird".to_string(), true)]),
-            "escaping comes from the KDL parser, not string scanning"
-        );
-        assert_eq!(
-            parse_dump_layout_pairs("layout { pane command=", "/x"),
-            None,
-            "truncated KDL is a parse failure"
-        );
-        assert_eq!(
-            parse_dump_layout_pairs("layout definitely-not={kdl", "/x"),
-            None,
-            "malformed node syntax is a parse failure"
-        );
-    }
-
-    #[test]
     fn remove_target_ids_resolve_duplicates_to_distinct_panes() {
         // codex 4df5f0c: the remove MULTISET maps each occurrence to a
         // DIFFERENT pane id; unrelated panes and over-budget matches
@@ -1994,6 +1988,99 @@ ttys004   zellij attach clank-foo
     }
 
     #[test]
+    fn a_lone_reviewer_stacked_with_status_is_not_placed() {
+        // The FIRST-reviewer form of the reported bug, and the shape
+        // of the tab that prompted this work: one reviewer sharing a
+        // stack with the instrument pane. A two-reviewer fixture
+        // misses it because the reviewers-agree check passes
+        // vacuously on a single pane (codex on cc4ae5e).
+        let pane = |cmd: &str, x: u16, y: u16, w: u16, h: u16| ZellijPane {
+            id: 1,
+            is_plugin: false,
+            terminal_command: Some(cmd.to_string()),
+            title: String::new(),
+            tab_id: 0,
+            pane_x: x,
+            pane_y: y,
+            pane_columns: w,
+            pane_rows: h,
+        };
+        let repo = std::path::Path::new("/repo");
+        let one = vec!["kimi".to_string()];
+        let rev = agent_start_command("kimi", "/repo");
+        let status = "clank status --repo /repo --tui";
+
+        assert!(
+            !reviewers_are_stacked(
+                &[pane(&rev, 125, 1, 53, 133), pane(status, 125, 1, 53, 133)],
+                repo,
+                &one
+            ),
+            "one reviewer sharing the instrument pane's geometry is NOT placed"
+        );
+        assert!(
+            reviewers_are_stacked(
+                &[pane(&rev, 125, 1, 53, 100), pane(status, 125, 101, 53, 33)],
+                repo,
+                &one
+            ),
+            "beside the instrument pane IS placed"
+        );
+    }
+
+    #[test]
+    fn status_sharing_the_reviewer_stack_is_not_placed() {
+        // THE reported bug, as a fixture: adding an agent put it in a
+        // stack WITH the status pane. Every reviewer geometry agrees
+        // there, so a reviewers-only check calls it placed and caches
+        // the broken tab forever (codex on d5121e1). The instrument
+        // pane sharing the stack's geometry is what makes it wrong.
+        let pane = |cmd: &str, x: u16, y: u16, w: u16, h: u16| ZellijPane {
+            id: 1,
+            is_plugin: false,
+            terminal_command: Some(cmd.to_string()),
+            title: String::new(),
+            tab_id: 0,
+            pane_x: x,
+            pane_y: y,
+            pane_columns: w,
+            pane_rows: h,
+        };
+        let repo = std::path::Path::new("/repo");
+        let reviewers = vec!["r1".to_string(), "r2".to_string()];
+        let r1 = agent_start_command("r1", "/repo");
+        let r2 = agent_start_command("r2", "/repo");
+        let status = "clank status --repo /repo --tui";
+
+        // BROKEN: both reviewers AND status at the stack geometry.
+        let broken = vec![
+            pane(&r1, 40, 0, 40, 16),
+            pane(&r2, 40, 0, 40, 16),
+            pane(status, 40, 0, 40, 16),
+        ];
+        assert!(
+            !reviewers_are_stacked(&broken, repo, &reviewers),
+            "status inside the reviewer stack is NOT placed"
+        );
+
+        // GOOD: reviewers stacked, status beside them.
+        let good = vec![
+            pane(&r1, 40, 0, 40, 16),
+            pane(&r2, 40, 0, 40, 16),
+            pane(status, 40, 16, 40, 8),
+        ];
+        assert!(reviewers_are_stacked(&good, repo, &reviewers));
+
+        // Reviewers not stacked at all is also not placed.
+        let split = vec![pane(&r1, 40, 0, 40, 8), pane(&r2, 40, 8, 40, 8)];
+        assert!(!reviewers_are_stacked(&split, repo, &reviewers));
+
+        // A repo with no status pane still resolves on the reviewers.
+        let no_status = vec![pane(&r1, 40, 0, 40, 16), pane(&r2, 40, 0, 40, 16)];
+        assert!(reviewers_are_stacked(&no_status, repo, &reviewers));
+    }
+
+    #[test]
     fn agent_pane_label_parses_only_this_repos_agent_panes() {
         // tui-zellij-pane-reconcile: the reconciler classifies live
         // panes by the EXACT command agent_start_command composes —
@@ -2028,6 +2115,37 @@ ttys004   zellij attach clank-foo
         );
         assert_eq!(agent_pane_label(&pane(Some("zsh"), false), "/repo"), None);
         assert_eq!(agent_pane_label(&pane(None, false), "/repo"), None);
+
+        // The FULL legal label domain round-trips. `AgentLabel`
+        // forbids only empty, dot-segments and `/`, so spaces and
+        // emoji are legal names a user can really create — and an
+        // agent this parser cannot read is an agent reconciliation
+        // can never converge on, because it drives both the initial
+        // classification and the verify.
+        for label in ["two words", "🔥bot", "a b c", "with-dash", "under_score"] {
+            let cmd = agent_start_command(label, "/repo");
+            assert_eq!(
+                agent_pane_label(&pane(Some(&cmd), false), "/repo"),
+                Some(label),
+                "the command composed for {label:?} must parse back to it"
+            );
+        }
+        // A label that itself looks like the suffix still round-trips:
+        // the LAST occurrence is the real one.
+        let tricky = "x --repo /repo";
+        let cmd = agent_start_command(tricky, "/repo");
+        assert_eq!(
+            agent_pane_label(&pane(Some(&cmd), false), "/repo"),
+            Some(tricky)
+        );
+        // An empty label is not a pane we composed.
+        assert_eq!(
+            agent_pane_label(
+                &pane(Some("clank agent start  --repo /repo"), false),
+                "/repo"
+            ),
+            None
+        );
     }
 
     // A realistic `list-panes --json --command` (subset of fields per

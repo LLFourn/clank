@@ -100,7 +100,7 @@ fn register_agent_with_launch(
 /// JSON array `clank doctor --json` emits — no binary spawn. The
 /// agent checks these tests navigate live in the repo section.
 fn run_doctor(env: &TestEnv) -> serde_json::Value {
-    let results = clank::cli::doctor::repo_checks(env.repo(), Some(env.home()));
+    let results = clank::cli::doctor::repo_checks(env.repo(), Some(env.home()), None);
     clank::cli::doctor::checks_to_json(&results)
 }
 
@@ -390,7 +390,7 @@ fn zellij_check(results: &[clank::cli::doctor::CheckResult]) -> Option<String> {
 fn doctor_validates_broken_zellij_template_at_doctor_time() {
     let env = init_repo();
     write_user_zellij_template(&env, "layout { pane "); // invalid KDL
-    let results = clank::cli::doctor::repo_checks(env.repo(), Some(env.home()));
+    let results = clank::cli::doctor::repo_checks(env.repo(), Some(env.home()), None);
     let line = zellij_check(&results).expect("zellij template check present");
     assert!(
         line.contains("fail") && line.contains("not valid KDL"),
@@ -402,7 +402,7 @@ fn doctor_validates_broken_zellij_template_at_doctor_time() {
 fn doctor_flags_template_missing_the_marker() {
     let env = init_repo();
     write_user_zellij_template(&env, "layout {\n    pane\n}\n");
-    let results = clank::cli::doctor::repo_checks(env.repo(), Some(env.home()));
+    let results = clank::cli::doctor::repo_checks(env.repo(), Some(env.home()), None);
     let line = zellij_check(&results).expect("zellij template check present");
     assert!(
         line.contains("fail") && line.contains("clank_agents"),
@@ -414,7 +414,7 @@ fn doctor_flags_template_missing_the_marker() {
 fn doctor_passes_valid_zellij_template() {
     let env = init_repo();
     write_user_zellij_template(&env, "layout {\n    clank_agents\n}\n");
-    let results = clank::cli::doctor::repo_checks(env.repo(), Some(env.home()));
+    let results = clank::cli::doctor::repo_checks(env.repo(), Some(env.home()), None);
     let line = zellij_check(&results).expect("zellij template check present");
     assert!(line.contains("ok"), "valid template passes; got: {line}");
 }
@@ -422,7 +422,7 @@ fn doctor_passes_valid_zellij_template() {
 #[test]
 fn doctor_skips_zellij_check_when_unconfigured() {
     let env = init_repo();
-    let results = clank::cli::doctor::repo_checks(env.repo(), Some(env.home()));
+    let results = clank::cli::doctor::repo_checks(env.repo(), Some(env.home()), None);
     assert!(
         zellij_check(&results).is_none(),
         "no zellij config → no check emitted"
@@ -461,7 +461,7 @@ async fn doctor_reports_effective_auto_mode_with_provenance() {
     std::fs::create_dir_all(env.home().join(".clank")).unwrap();
     std::fs::write(env.home().join(".clank/config.json"), r#"{"auto":"on"}"#).unwrap();
 
-    let results = clank::cli::doctor::repo_checks(env.repo(), Some(env.home()));
+    let results = clank::cli::doctor::repo_checks(env.repo(), Some(env.home()), None);
     let line = results
         .iter()
         .find(|r| r.name.contains("agent: grok"))
@@ -486,7 +486,7 @@ async fn doctor_reports_effective_auto_mode_with_provenance() {
             wait_events: Vec::new(),
         },
     );
-    let results = clank::cli::doctor::repo_checks(env.repo(), Some(env.home()));
+    let results = clank::cli::doctor::repo_checks(env.repo(), Some(env.home()), None);
     let line = results
         .iter()
         .find(|r| r.name.contains("agent: grok"))

@@ -84,7 +84,15 @@ pub async fn run(args: DoctorArgs) -> anyhow::Result<()> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let repo = super::resolve_repo(args.repo.as_deref()).ok();
     if let Some(repo) = repo.as_deref() {
-        results.extend(repo_checks(repo, home.as_deref()));
+        // Probed ONCE at the command boundary, so `repo_checks` stays
+        // deterministic and spawns nothing. Reported even outside a
+        // zellij session: before opening one is exactly when learning
+        // your client cannot place panes is useful.
+        results.extend(repo_checks(
+            repo,
+            home.as_deref(),
+            Some(crate::cli::open_zellij::placement_capability()),
+        ));
     } else {
         results.push(CheckResult::warn(
             "repo",
@@ -114,7 +122,11 @@ pub async fn run(args: DoctorArgs) -> anyhow::Result<()> {
 /// so in-process callers (tests) control team resolution. `pub`
 /// for in-process assertion. Plan: dogfood-init-setup-in-tests
 /// (Phase B).
-pub fn repo_checks(repo: &Path, home: Option<&Path>) -> Vec<CheckResult> {
+pub fn repo_checks(
+    repo: &Path,
+    home: Option<&Path>,
+    placement: Option<crate::cli::open_zellij::PlacementCapability>,
+) -> Vec<CheckResult> {
     let mut out: Vec<CheckResult> = Vec::new();
     const SECTION: &str = "repo";
 
@@ -173,6 +185,38 @@ pub fn repo_checks(repo: &Path, home: Option<&Path>) -> Vec<CheckResult> {
                 SECTION,
                 "zellij layout template",
                 format!("{e:#}"),
+            )),
+        }
+    }
+
+    // Pane placement needs `zellij action stack-panes`; without it
+    // reviewers are never stacked and the only symptom is a wrong
+    // arrangement — which is how this reached us as "zellij is slow
+    // and unreliable" (zellij-pane-placement-and-cost). The result is
+    // INJECTED rather than probed here: probing inside `repo_checks`
+    // made every doctor test spawn the real binary whenever tests ran
+    // inside zellij, a hidden process dependency this repo's test
+    // boundary forbids (codex on 0e1522b).
+    if let Some(cap) = placement {
+        use crate::cli::open_zellij::PlacementCapability as P;
+        let name = "zellij pane placement";
+        match cap {
+            P::NoZellij => {}
+            P::ClientSupports => out.push(CheckResult::ok(
+                SECTION,
+                name,
+                "`stack-panes` available in the zellij client — reviewer panes \
+                 can be placed (a session started by an OLDER binary may still \
+                 reject it until restarted)"
+                    .to_string(),
+            )),
+            P::ClientTooOld => out.push(CheckResult::warn(
+                SECTION,
+                name,
+                "this zellij has no `stack-panes`: reviewer panes will not be \
+                 stacked, and the symptom is panes beside the status pane \
+                 instead of in the reviewer stack. Upgrade zellij."
+                    .to_string(),
             )),
         }
     }
@@ -1022,9 +1066,39 @@ mod tests {
     }
 
     #[test]
+    fn placement_capability_is_reported_without_probing() {
+        // The row is driven by an INJECTED value, so the check is
+        // deterministic and `repo_checks` spawns nothing — and it is
+        // reported outside a zellij session too, which is when
+        // learning your client cannot place panes is most useful.
+        use crate::cli::open_zellij::PlacementCapability as P;
+        let dir = tempfile::tempdir().unwrap();
+        let row = |cap: Option<P>| {
+            repo_checks(dir.path(), None, cap)
+                .into_iter()
+                .find(|r| r.name == "zellij pane placement")
+        };
+        assert!(row(None).is_none(), "unknown capability says nothing");
+        assert!(
+            row(Some(P::NoZellij)).is_none(),
+            "no zellij at all is not a problem to report"
+        );
+        assert_eq!(
+            row(Some(P::ClientTooOld)).map(|r| r.status),
+            Some(CheckStatus::Warn),
+            "a client without stack-panes must warn: the only other symptom \
+             is panes in the wrong place"
+        );
+        assert_eq!(
+            row(Some(P::ClientSupports)).map(|r| r.status),
+            Some(CheckStatus::Ok)
+        );
+    }
+
+    #[test]
     fn repo_checks_warn_on_missing_gitignore() {
         let dir = init_git_repo();
-        let results = repo_checks(dir.path(), None);
+        let results = repo_checks(dir.path(), None, None);
         let gi = results
             .iter()
             .find(|r| r.name == ".clank/.gitignore")
@@ -1057,7 +1131,7 @@ mod tests {
             RosterRole::Master,
         )
         .unwrap();
-        let results = repo_checks(dir.path(), None);
+        let results = repo_checks(dir.path(), None, None);
         let launch = results
             .iter()
             .find(|r| r.name == "agent: kimi launch")
@@ -1080,7 +1154,7 @@ mod tests {
     #[test]
     fn repo_checks_warn_on_missing_claude_perms() {
         let dir = init_git_repo();
-        let results = repo_checks(dir.path(), None);
+        let results = repo_checks(dir.path(), None, None);
         let perm = results
             .iter()
             .find(|r| r.name == ".claude/settings.local.json")
