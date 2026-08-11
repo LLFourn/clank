@@ -285,41 +285,6 @@ async fn submit_plan_input(
                 Err(e) => InputSubmit::Failed("squash failed".into(), format!("{e:?}")),
             }
         }
-        PlanInputKind::BlockReason => {
-            if text.is_empty() {
-                return InputSubmit::Stay;
-            }
-            let Some(master) = snapshot
-                .agents
-                .iter()
-                .find(|a| matches!(a.role, crate::cli::teams_config::RosterRole::Master))
-            else {
-                return InputSubmit::Failed(
-                    "block failed".into(),
-                    "no master agent on the roster to author the block".into(),
-                );
-            };
-            // Same core as `clank block create` (the Blocked hook
-            // fires identically); the block is authored as the MASTER
-            // (blocks live under an agent dir; the master owns the
-            // plan). Fixed name `pause`: one TUI pause per plan,
-            // idempotent re-block.
-            let res = crate::cli::block::run(crate::cli::BlockArgs {
-                command: crate::cli::BlockCmd::Create(crate::cli::BlockCreateArgs {
-                    name: "pause".to_string(),
-                    message: text.to_string(),
-                    plan: Some(stem.to_string()),
-                    all: false,
-                    author: Some(master.label.clone()),
-                    repo: Some(repo.to_path_buf()),
-                }),
-            })
-            .await;
-            match res {
-                Ok(()) => InputSubmit::Done,
-                Err(e) => InputSubmit::Failed("block failed".into(), format!("{e:?}")),
-            }
-        }
         PlanInputKind::DropStem => {
             // RAW buffer, not the trimmed `text`: the gate must be the
             // SAME predicate the armed indicator renders (codex
@@ -336,24 +301,103 @@ async fn submit_plan_input(
     }
 }
 
-/// Answer every pending block on the plan: the human clicked unblock,
-/// so each creator's block gets the canned answer via the SAME core as
-/// `clank unblock` — their `block clean` flow then sweeps the pair.
-async fn unblock_plan(
+/// Create the repo's pause block from the typed question.
+///
+/// Repo-scoped, so it takes no plan: a pause parks the whole repo and
+/// must be raisable when no plan is open or none exists.
+async fn submit_pause_question(
+    buf: &str,
+    snapshot: &StatusSnapshot,
     repo: &std::path::Path,
-    stem: &str,
+) -> InputSubmit {
+    let text = buf.trim();
+    if text.is_empty() {
+        return InputSubmit::Stay;
+    }
+    let Some(master) = snapshot
+        .agents
+        .iter()
+        .find(|a| matches!(a.role, crate::cli::teams_config::RosterRole::Master))
+    else {
+        return InputSubmit::Failed(
+            "block failed".into(),
+            "no master agent on the roster to author the block".into(),
+        );
+    };
+    // Same core as `clank block create` (the Blocked hook
+    // fires identically); authored as the MASTER because
+    // blocks live under an agent dir. Fixed name `pause`
+    // keeps re-block idempotent, and blocks are repo-wide,
+    // so there is exactly one.
+    let res = crate::cli::block::run(crate::cli::BlockArgs {
+        command: crate::cli::BlockCmd::Create(crate::cli::BlockCreateArgs {
+            name: "pause".to_string(),
+            message: text.to_string(),
+            author: Some(master.label.clone()),
+            repo: Some(repo.to_path_buf()),
+        }),
+    })
+    .await;
+    match res {
+        Ok(()) => InputSubmit::Done,
+        Err(e) => InputSubmit::Failed("block failed".into(), format!("{e:?}")),
+    }
+}
+
+/// Answer ONE pending block with the human's typed message.
+///
+/// Takes the block by index rather than sweeping a name: each block is
+/// a distinct agent's distinct question, and the answer written here is
+/// the human's own words, never a canned string.
+async fn submit_block_answer(
+    block: usize,
+    buf: &str,
+    snapshot: &StatusSnapshot,
+    repo: &std::path::Path,
+) -> InputSubmit {
+    let text = buf.trim();
+    if text.is_empty() {
+        return InputSubmit::Stay;
+    }
+    let Some(b) = snapshot.blocks.get(block) else {
+        return InputSubmit::Failed(
+            "unblock failed".into(),
+            "the block is no longer pending".into(),
+        );
+    };
+    match crate::cli::block::run_unblock(crate::cli::UnblockArgs {
+        agent: b.agent.clone(),
+        name: b.name.clone(),
+        message: text.to_string(),
+        repo: Some(repo.to_path_buf()),
+    })
+    .await
+    {
+        Ok(()) => InputSubmit::Done,
+        Err(e) => InputSubmit::Failed("unblock failed".into(), format!("{e:?}")),
+    }
+}
+
+/// Answer the TUI's own `pause` block — the one this screen created.
+///
+/// Agent-authored blocks are deliberately NOT swept here. Each is a
+/// distinct question from a distinct agent, and answering them in bulk
+/// would write one canned string underneath all of them; that is a
+/// fabricated answer, multiplied. They are answered individually from
+/// the blocks section.
+async fn resume_from_pause(
+    repo: &std::path::Path,
     snapshot: &StatusSnapshot,
 ) -> anyhow::Result<()> {
     for b in snapshot
         .blocks
         .iter()
-        .filter(|b| b.answer.is_none() && b.plan.as_deref() == Some(stem))
+        .filter(|b| b.answer.is_none() && b.name == "pause")
     {
         crate::cli::block::run_unblock(crate::cli::UnblockArgs {
             agent: b.agent.clone(),
             name: b.name.clone(),
-            plan: Some(stem.to_string()),
-            message: "unblocked from clank status --tui".to_string(),
+            message: "resumed from clank status --tui".to_string(),
             repo: Some(repo.to_path_buf()),
         })
         .await?;
@@ -411,11 +455,11 @@ async fn plan_page_facts(
     if !active && !finished_file {
         return None;
     }
-    let blocked = active
+    let repo_paused = active
         && snapshot
             .blocks
             .iter()
-            .any(|b| b.answer.is_none() && b.plan.as_deref() == Some(stem));
+            .any(|b| b.answer.is_none() && b.name == "pause");
     let multi_commit = if active {
         true // squash isn't offered on active pages; value unused
     } else {
@@ -424,7 +468,7 @@ async fn plan_page_facts(
     Some(input::PlanPageState {
         finished: !active,
         multi_commit,
-        blocked,
+        repo_paused,
     })
 }
 
@@ -1655,7 +1699,10 @@ pub(crate) async fn run_tui(
                 // not be pre-parsed as commands.
                 let mut inbuf = batch.input.as_slice();
                 loop {
-                    let text_mode = matches!(mode, Mode::PlanInput { .. });
+                    let text_mode = matches!(
+                        mode,
+                        Mode::PlanInput { .. } | Mode::PauseInput | Mode::BlockAnswer { .. }
+                    );
                     let Some((anykey, used)) = parse_one(inbuf, text_mode) else {
                         if inbuf.is_empty() {
                             break;
@@ -1698,6 +1745,75 @@ pub(crate) async fn run_tui(
                                                 plan_input = None;
                                                 detail = Some(Overlay::error(title, msg));
                                                 mode = Mode::PlanDetail { sel: 0 };
+                                                refresh_pending = true;
+                                            }
+                                        }
+                                    }
+                                    InputNav::None => {}
+                                }
+                            } else if let Mode::BlockAnswer { block } = mode {
+                                let outcome = plan_input
+                                    .as_mut()
+                                    .map(|ti| text_input_nav(ti, tk))
+                                    .unwrap_or(InputNav::Cancel);
+                                match outcome {
+                                    InputNav::Cancel => {
+                                        plan_input = None;
+                                        mode = Mode::LogScroll;
+                                    }
+                                    InputNav::Submit => {
+                                        let buf = plan_input
+                                            .as_ref()
+                                            .map(|ti| ti.buf.clone())
+                                            .unwrap_or_default();
+                                        match submit_block_answer(block, &buf, &snapshot, &repo)
+                                            .await
+                                        {
+                                            InputSubmit::Stay => {}
+                                            InputSubmit::Done => {
+                                                plan_input = None;
+                                                mode = Mode::LogScroll;
+                                                refresh_pending = true;
+                                            }
+                                            InputSubmit::Failed(title, msg) => {
+                                                plan_input = None;
+                                                detail = Some(Overlay::error(title, msg));
+                                                mode = Mode::LogScroll;
+                                                refresh_pending = true;
+                                            }
+                                        }
+                                    }
+                                    InputNav::None => {}
+                                }
+                            } else if matches!(mode, Mode::PauseInput) {
+                                let outcome = plan_input
+                                    .as_mut()
+                                    .map(|ti| text_input_nav(ti, tk))
+                                    .unwrap_or(InputNav::Cancel);
+                                // Pause is repo state, so every exit
+                                // from this input returns to the log —
+                                // there may be no plan page to go back to.
+                                match outcome {
+                                    InputNav::Cancel => {
+                                        plan_input = None;
+                                        mode = Mode::LogScroll;
+                                    }
+                                    InputNav::Submit => {
+                                        let buf = plan_input
+                                            .as_ref()
+                                            .map(|ti| ti.buf.clone())
+                                            .unwrap_or_default();
+                                        match submit_pause_question(&buf, &snapshot, &repo).await {
+                                            InputSubmit::Stay => {}
+                                            InputSubmit::Done => {
+                                                plan_input = None;
+                                                mode = Mode::LogScroll;
+                                                refresh_pending = true;
+                                            }
+                                            InputSubmit::Failed(title, msg) => {
+                                                plan_input = None;
+                                                detail = Some(Overlay::error(title, msg));
+                                                mode = Mode::LogScroll;
                                                 refresh_pending = true;
                                             }
                                         }
@@ -1965,7 +2081,7 @@ pub(crate) async fn run_tui(
                         // with text_mode=true, so every key routed here
                         // is a TextKey handled above — but the match
                         // must stay exhaustive.
-                        Mode::PlanInput { .. } => {}
+                        Mode::PlanInput { .. } | Mode::PauseInput | Mode::BlockAnswer { .. } => {}
                         // The plan-actions page (tui-plan-actions-page).
                         Mode::EventDetail { sel } => {
                             let Some(ep) = event_page.clone() else {
@@ -2105,28 +2221,6 @@ pub(crate) async fn run_tui(
                                             kind: PlanInputKind::SquashMessage,
                                         };
                                     }
-                                    PlanAction::Block => {
-                                        plan_input = Some(TextInput::default());
-                                        mode = Mode::PlanInput {
-                                            kind: PlanInputKind::BlockReason,
-                                        };
-                                    }
-                                    // Unblock needs no input: the HUMAN is
-                                    // the one clicking, so the pending
-                                    // block(s) get a canned answer and the
-                                    // creator's block-clean flow stays
-                                    // intact.
-                                    PlanAction::Unblock => {
-                                        if let Err(e) =
-                                            unblock_plan(&repo, &pp.stem, &snapshot).await
-                                        {
-                                            detail = Some(Overlay::error(
-                                                "unblock failed".to_string(),
-                                                format!("{e:?}"),
-                                            ));
-                                        }
-                                        refresh_pending = true;
-                                    }
                                 },
                                 PlanNav::None => {}
                             }
@@ -2164,6 +2258,40 @@ pub(crate) async fn run_tui(
                         // entry crosses back into the panel (continuous nav).
                         Mode::LogScroll => match k {
                             Key::Quit => break 'evloop,
+                            // Pause is REPO state: `b` is global, live
+                            // even with no plans and an empty queue —
+                            // an idle repo the human wants kept idle is
+                            // exactly when pausing matters.
+                            // One question, one typed answer: the
+                            // cursor picks WHICH block, so no keystroke
+                            // can answer several at once.
+                            Key::Char(b'u') => {
+                                let seq = build_scroll(&snapshot, &ask_lines);
+                                if let Some(Seg::Ask(a)) = seq.get(log.cursor)
+                                    && let Some(block) = a.block
+                                {
+                                    plan_input = Some(TextInput::default());
+                                    mode = Mode::BlockAnswer { block };
+                                }
+                            }
+                            Key::Char(b'b') => {
+                                let paused = snapshot
+                                    .blocks
+                                    .iter()
+                                    .any(|b| b.answer.is_none() && b.name == "pause");
+                                if paused {
+                                    if let Err(e) = resume_from_pause(&repo, &snapshot).await {
+                                        detail = Some(Overlay::error(
+                                            "resume failed".to_string(),
+                                            format!("{e:?}"),
+                                        ));
+                                    }
+                                    refresh_pending = true;
+                                } else {
+                                    plan_input = Some(TextInput::default());
+                                    mode = Mode::PauseInput;
+                                }
+                            }
                             Key::Focus | Key::Char(b'a') => {
                                 mode = mode.toggle_focus(snapshot.agents.len())
                             }
@@ -2408,6 +2536,17 @@ pub(crate) async fn run_tui(
                 }
                 mode = match mode {
                     Mode::LogScroll => Mode::LogScroll,
+                    Mode::PauseInput => Mode::PauseInput,
+                    // The answered block may be gone after a refresh;
+                    // an out-of-range index must not answer a
+                    // DIFFERENT agent's question, so drop to the log.
+                    Mode::BlockAnswer { block } if block < snapshot.blocks.len() => {
+                        Mode::BlockAnswer { block }
+                    }
+                    Mode::BlockAnswer { .. } => {
+                        plan_input = None;
+                        Mode::LogScroll
+                    }
                     // The plan page doesn't depend on the roster — it
                     // must survive an empty-roster refresh (its arms are
                     // below); everything agent-shaped drops to the log.

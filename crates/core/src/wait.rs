@@ -238,12 +238,10 @@ pub enum WaitItem {
     Blocked {
         agent: String,
         name: String,
-        plan: Option<String>,
         question: String,
     },
     Unblocked {
         name: String,
-        plan: Option<String>,
         answer: String,
     },
     /// A reviewer should review PR #`pr` at `round`

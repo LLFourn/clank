@@ -1283,23 +1283,21 @@ mod tests {
     }
 
     #[test]
-    fn master_skill_uses_scoped_block_create_recipe() {
-        // block-create-explicit-scope: the recipe must carry `--plan`
-        // (the bare no-scope form errors at runtime). `block create` is
-        // a MASTER command — reviewers must not carry it.
+    fn master_skill_uses_repo_wide_block_create_recipe() {
+        // Every block is repo-wide, so the recipe must NOT carry a
+        // scope flag — `--plan` is rejected at the parser now, and a
+        // skill that still teaches it hands agents a failing command.
+        // `block create` is a MASTER command — reviewers must not
+        // carry it.
         for tool in [Tool::Claude, Tool::Codex] {
             let body = compose_skill(Role::Master, tool);
             assert!(
-                body.contains("clank block create"),
-                "master must document block create"
+                body.contains(r#"clank block create <name> -m "question""#),
+                "master must document the flat block create recipe"
             );
             assert!(
-                body.contains("--plan"),
-                "block create recipe must carry --plan (the primary scope flag)"
-            );
-            assert!(
-                !body.contains(r#"clank block create <name> -m "question""#),
-                "must not embed the legacy no-scope recipe"
+                !body.contains("--plan"),
+                "block create recipe must not carry the deleted --plan flag"
             );
             assert!(
                 !compose_skill(Role::Reviewer, tool).contains("clank block create"),

@@ -466,7 +466,6 @@ mod tests {
         s.blocks = vec![crate::cli::block::BlockEntry {
             agent: "claude".into(),
             name: "q".into(),
-            plan: None,
             question: "halt?".into(),
             answer: None,
         }];
@@ -498,7 +497,6 @@ mod tests {
         blocked.blocks = vec![crate::cli::block::BlockEntry {
             agent: "claude".into(),
             name: "q".into(),
-            plan: None,
             question: "halt?".into(),
             answer: None,
         }];

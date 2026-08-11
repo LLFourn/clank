@@ -96,13 +96,12 @@ impl PlanStateLookup for FsPlanStateLookup<'_> {
         entries
     }
 
-    fn blocks_for(&self, plan: &PlanKey) -> Vec<PlanBlock> {
-        // Reuse the existing scan_blocks pass and project pending
-        // (unanswered) plan-scoped blocks for this plan key.
-        let plan_str = plan.as_str();
+    fn blocks_for(&self, _plan: &PlanKey) -> Vec<PlanBlock> {
+        // Blocks are repo-wide, so every pending one bears on every
+        // plan; the plan key no longer selects among them.
         crate::cli::block::scan_blocks(self.repo)
             .into_iter()
-            .filter(|b| b.answer.is_none() && b.plan.as_deref() == Some(plan_str))
+            .filter(|b| b.answer.is_none())
             .filter_map(|b| {
                 clank_core::ids::AgentLabel::parse(&b.agent)
                     .ok()

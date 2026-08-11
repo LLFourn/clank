@@ -96,6 +96,14 @@ pub(super) enum Mode {
     PlanDetail { sel: usize },
     /// The purge second screen: artifacts-only vs drop-everything.
     PurgeChoice { sel: usize },
+    /// Typing the repo pause question. Deliberately NOT a
+    /// `PlanInput`: a pause is repo state, so this mode must work
+    /// with no plan page open (and with no plans at all).
+    PauseInput,
+    /// Typing the answer to ONE agent-authored block, indexed into
+    /// `snapshot.blocks`. Per-block by construction: a shared answer
+    /// box would put one string under several distinct questions.
+    BlockAnswer { block: usize },
     /// The github event page (tui-github-event-page); `sel` is the
     /// cursor over its action menu. The event's IDENTITY (retained
     /// member keys) lives in the loop's `event_page` — same
@@ -118,8 +126,6 @@ pub(super) enum PlanInputKind {
     /// The squash message for a finished plan (prefilled with the
     /// finalize commit's subject).
     SquashMessage,
-    /// The reason for a pause block (the block's question text).
-    BlockReason,
     /// Type-the-stem arming for `purge --drop` — the scariest screen;
     /// submit is a no-op until the buffer equals the stem exactly.
     DropStem,
@@ -185,10 +191,6 @@ pub(super) enum PlanAction {
     /// `purge --squash` a finished plan's range into one commit. Only
     /// offered when the range still has >1 commit.
     Squash,
-    /// Pause: create a plan-scoped block (active, unblocked only).
-    Block,
-    /// Resume: answer the pending block (active, blocked only).
-    Unblock,
     /// The danger door: opens the purge chooser (artifacts vs drop).
     Purge,
     /// Leave the page.
@@ -204,14 +206,16 @@ pub(super) struct PlanPageState {
     /// The plan's range still spans >1 commit (squash is pointless on
     /// an already-collapsed plan).
     pub multi_commit: bool,
-    /// An unanswered block is pending on the plan.
-    pub blocked: bool,
+    /// The repo is paused by an unanswered block. Repo state, not the
+    /// plan's — shown on this page only to explain why an active plan
+    /// is not progressing. Pausing is driven by the global `b` key.
+    pub repo_paused: bool,
 }
 
 /// The page's rows for a plan state, in display order. Inapplicable
 /// actions are ABSENT, not grayed: the states are different pages, not
-/// one form (finished plans can't stash/force-finish/block; active
-/// plans can't squash; block↔unblock flip on `blocked`).
+/// one form (finished plans can't stash/force-finish; active plans
+/// can't squash).
 pub(super) fn plan_actions(st: PlanPageState) -> Vec<PlanAction> {
     use PlanAction::*;
     let mut v = vec![OpenHtml];
@@ -222,7 +226,6 @@ pub(super) fn plan_actions(st: PlanPageState) -> Vec<PlanAction> {
     } else {
         v.push(Stash);
         v.push(ForceFinish);
-        v.push(if st.blocked { Unblock } else { Block });
     }
     v.push(Purge);
     v.push(Back);
@@ -239,12 +242,6 @@ pub(super) fn plan_hotkey(key: Key, actions: &[PlanAction]) -> Option<PlanAction
         Key::Char(b's') => Stash,
         Key::Char(b'f') => ForceFinish,
         Key::Char(b'c') => Squash,
-        Key::Char(b'b') => {
-            return actions
-                .iter()
-                .copied()
-                .find(|a| matches!(a, Block | Unblock));
-        }
         Key::Char(b'p') => Purge,
         _ => return None,
     };
@@ -1401,28 +1398,28 @@ mod tests {
         PlanPageState {
             finished: false,
             multi_commit: true,
-            blocked: false,
+            repo_paused: false,
         }
     }
 
     #[test]
-    fn plan_actions_active_page_has_stash_force_finish_block_and_purge() {
+    fn plan_actions_active_page_has_stash_force_finish_and_purge() {
         use PlanAction::*;
         assert_eq!(
             plan_actions(active_st()),
-            vec![OpenHtml, Stash, ForceFinish, Block, Purge, Back]
+            vec![OpenHtml, Stash, ForceFinish, Purge, Back]
         );
     }
 
     #[test]
-    fn plan_actions_blocked_page_flips_block_to_unblock() {
-        use PlanAction::*;
+    fn a_paused_repo_adds_no_row_to_the_plan_page() {
+        // Pause is repo state driven by the global `b`; the plan page
+        // must not grow a per-plan block toggle again.
         let st = PlanPageState {
-            blocked: true,
+            repo_paused: true,
             ..active_st()
         };
-        let rows = plan_actions(st);
-        assert!(rows.contains(&Unblock) && !rows.contains(&Block));
+        assert_eq!(plan_actions(st), plan_actions(active_st()));
     }
 
     #[test]
@@ -1431,7 +1428,7 @@ mod tests {
         let st = PlanPageState {
             finished: true,
             multi_commit: true,
-            blocked: false,
+            repo_paused: false,
         };
         assert_eq!(plan_actions(st), vec![OpenHtml, Squash, Purge, Back]);
         // Already-collapsed plan: nothing to squash — the row is absent.
@@ -1448,7 +1445,6 @@ mod tests {
         let active = plan_actions(active_st());
         assert_eq!(plan_hotkey(Key::Char(b's'), &active), Some(Stash));
         assert_eq!(plan_hotkey(Key::Char(b'f'), &active), Some(ForceFinish));
-        assert_eq!(plan_hotkey(Key::Char(b'b'), &active), Some(Block));
         assert_eq!(plan_hotkey(Key::Char(b'p'), &active), Some(Purge));
         assert_eq!(plan_hotkey(Key::Html, &active), Some(OpenHtml));
         assert_eq!(
@@ -1456,15 +1452,15 @@ mod tests {
             None,
             "no squash on active"
         );
-        let blocked = plan_actions(PlanPageState {
-            blocked: true,
-            ..active_st()
-        });
-        assert_eq!(plan_hotkey(Key::Char(b'b'), &blocked), Some(Unblock));
+        assert_eq!(
+            plan_hotkey(Key::Char(b'b'), &active),
+            None,
+            "`b` is global pause, never a plan-page row"
+        );
         let finished = plan_actions(PlanPageState {
             finished: true,
             multi_commit: true,
-            blocked: false,
+            repo_paused: false,
         });
         assert_eq!(plan_hotkey(Key::Char(b'c'), &finished), Some(Squash));
         assert_eq!(

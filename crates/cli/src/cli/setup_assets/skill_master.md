@@ -74,10 +74,10 @@ must amend BEFORE anything else proceeds. Three ways to break it:
   activates a queued plan), `clank agent set-review <name>
   commit|plan|final|gate` (change a reviewer's tier in place),
   `clank agent remove <name>`, `clank agent list`
-- `clank block create <name> --plan <stem> -m "question"` — ask the
-  human. Scope is mandatory: `--plan <stem>` targets one plan (usual);
-  `--all` suppresses every item (rare). `clank block clean` acknowledges
-  answered blocks.
+- `clank block create <name> -m "question"` — ask the human. A block is
+  always repo-wide: one pending block parks you entirely until it is
+  answered, so raise one only when you genuinely cannot proceed.
+  `clank block clean` acknowledges answered blocks.
 
 ### Extra wake sources (controller repos)
 

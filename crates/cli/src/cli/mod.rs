@@ -1576,6 +1576,17 @@ pub enum BlockCmd {
     Create(BlockCreateArgs),
     /// Remove answered block+unblock pairs for this agent.
     Clean(BlockCleanArgs),
+    /// Flatten legacy plan-scoped blocks to the repo-wide layout.
+    Migrate(BlockMigrateArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct BlockMigrateArgs {
+    /// Print what would change without touching anything.
+    #[arg(long)]
+    pub dry: bool,
+    #[arg(long, value_name = "PATH")]
+    pub repo: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -1585,16 +1596,6 @@ pub struct BlockCreateArgs {
     /// Question or reason for the block.
     #[arg(short = 'm', value_name = "MSG")]
     pub message: String,
-    /// Scope the block to a specific plan. Mutually exclusive with
-    /// `--all`. Exactly one is required.
-    #[arg(long, value_name = "PLAN")]
-    pub plan: Option<String>,
-    /// Scope the block to the entire repo (suppresses every wait item
-    /// for the calling agent across all plans + queue items). Mutually
-    /// exclusive with `--plan`. Exactly one is required. Use sparingly
-    /// — most blocks should be plan-scoped.
-    #[arg(long, conflicts_with = "plan")]
-    pub all: bool,
     /// Agent label. Resolved from env when omitted.
     #[arg(long, value_name = "LABEL")]
     pub author: Option<String>,
@@ -1617,9 +1618,6 @@ pub struct UnblockArgs {
     /// Answer message.
     #[arg(short = 'm', value_name = "MSG")]
     pub message: String,
-    /// Plan scope (must match the block's scope).
-    #[arg(long, value_name = "PLAN")]
-    pub plan: Option<String>,
     #[arg(long, value_name = "PATH")]
     pub repo: Option<PathBuf>,
 }

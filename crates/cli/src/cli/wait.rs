@@ -196,8 +196,6 @@ pub async fn run(args: WaitArgs) -> anyhow::Result<()> {
     let snapshot = StartupSnapshot::capture(&initial_state.fold, &initial_status.ad_hoc);
 
     let initial_suppress_all;
-    let initial_block_items: Vec<WaitItem>;
-    let initial_suppressed_plans;
     {
         let br = check_blocks(&repo, &author);
         initial_suppress_all = br.suppress_all;
@@ -212,14 +210,6 @@ pub async fn run(args: WaitArgs) -> anyhow::Result<()> {
 
         if !br.suppress_all {
             let mut items = initial_status.work_for(&author, inputs.role);
-            if !br.suppressed_plans.is_empty() {
-                items.retain(|item| match item {
-                    WaitItem::Master { plan, .. } | WaitItem::Reviewer { plan, .. } => {
-                        !br.suppressed_plans.contains(plan)
-                    }
-                    _ => true,
-                });
-            }
             // Finished is a NOTIFICATION, not work, and only MASTER
             // acts on it (the finalization-lifecycle role + home of
             // the plan_finalized hook). A reviewer has no action on a
@@ -239,17 +229,6 @@ pub async fn run(args: WaitArgs) -> anyhow::Result<()> {
                 ));
             }
             if !items.is_empty() {
-                // Co-surface pending Blocked entries alongside
-                // actionable items so a partial-block situation
-                // (plan A blocked, plan B actionable) shows BOTH.
-                // Codex caught the omission on 0a3c039.
-                let blocked_items: Vec<_> = br
-                    .items
-                    .iter()
-                    .filter(|i| matches!(i, WaitItem::Blocked { .. }))
-                    .cloned()
-                    .collect();
-                items.extend(blocked_items);
                 // `--peek` is a pure probe: report work-presence, fire NO
                 // lifecycle hooks (the Stop hook may peek on every stop).
                 if !args.peek {
@@ -261,22 +240,12 @@ pub async fn run(args: WaitArgs) -> anyhow::Result<()> {
                 return Ok(());
             }
         } // !suppress_all
-        initial_block_items = br.items;
-        initial_suppressed_plans = br.suppressed_plans;
     }
 
-    // Master with no actionable plans (either no plans at all, or
-    // every active plan suppressed by per-plan blocks) should be
-    // pointed at the queue. The pre-fix gate checked
-    // `fold.plans.is_empty()` only, so a master whose only active
-    // plan was agent-blocked got no signal at all.
-    let actionable = initial_state
-        .fold
-        .plans
-        .iter()
-        .filter(|(k, _)| !initial_suppressed_plans.contains(k))
-        .count();
-    if !initial_suppress_all && inputs.role == Role::Master && actionable == 0 {
+    // Master with nothing active is pointed at the queue. A pending
+    // block parks this agent entirely (`initial_suppress_all`), so
+    // reaching here means there is no block to work around.
+    if !initial_suppress_all && inputs.role == Role::Master && initial_state.fold.plans.is_empty() {
         let queue = match crate::cli::queue::scan_queue_no_dups(&repo) {
             Ok(q) => q,
             Err(e) => {
@@ -284,14 +253,8 @@ pub async fn run(args: WaitArgs) -> anyhow::Result<()> {
                 Vec::new()
             }
         };
-        // Promote the first unsuppressed queued item (+ any Blocked
-        // context). If every queued item is suppressed by a pending
-        // plan-scoped block, the outcome is Blocked-only — NOT
-        // wake-worthy — so we PARK rather than return on a
-        // non-actionable human block (wait-ignores-queue-only-blocks).
-        // Repo-wide blocks short-circuit upstream (`initial_suppress_all`).
-        let items = queue_promote_outcome(&initial_block_items, &initial_suppressed_plans, &queue);
-        if wake_worthy(&items) {
+        let items = queue_promote_outcome(&queue);
+        if !items.is_empty() {
             emit(&items, args.json);
             return Ok(());
         }
@@ -414,14 +377,6 @@ pub async fn run(args: WaitArgs) -> anyhow::Result<()> {
                     .fold
                     .derive_status(&reviews, &inputs.work_policy, head.as_ref());
                 let mut items = status.work_for(&author, inputs.role);
-                if !br.suppressed_plans.is_empty() {
-                    items.retain(|item| match item {
-                        WaitItem::Master { plan, .. } | WaitItem::Reviewer { plan, .. } => {
-                            !br.suppressed_plans.contains(plan)
-                        }
-                        _ => true,
-                    });
-                }
                 // Master-only Finished notice (watch loop); see the
                 // initial-pass rationale above
                 // (`finish-does-not-wake-reviewers`). Ad-hoc settles
@@ -437,29 +392,14 @@ pub async fn run(args: WaitArgs) -> anyhow::Result<()> {
                     ));
                 }
                 if !items.is_empty() {
-                    // Co-surface pending Blocked entries (codex caught
-                    // on 0a3c039).
-                    let blocked_items: Vec<_> = br
-                        .items
-                        .iter()
-                        .filter(|i| matches!(i, WaitItem::Blocked { .. }))
-                        .cloned()
-                        .collect();
-                    items.extend(blocked_items);
                     for firing in &firings_from_items(&items) {
                         hook_config::run_hook(&repo, &inputs.hook_config, firing);
                     }
                     Some(items)
                 } else {
-                    // Same actionable-count gate as the initial pass — see
-                    // the comment above the initial gate. Watch-loop variant.
-                    let actionable_in_loop = state
-                        .fold
-                        .plans
-                        .iter()
-                        .filter(|(k, _)| !br.suppressed_plans.contains(k))
-                        .count();
-                    if inputs.role == Role::Master && actionable_in_loop == 0 {
+                    // Same gate as the initial pass. Unreachable while a
+                    // block pends: `br.suppress_all` short-circuits above.
+                    if inputs.role == Role::Master && state.fold.plans.is_empty() {
                         let queue = match crate::cli::queue::scan_queue_no_dups(&repo) {
                             Ok(q) => q,
                             Err(e) => {
@@ -467,12 +407,8 @@ pub async fn run(args: WaitArgs) -> anyhow::Result<()> {
                                 Vec::new()
                             }
                         };
-                        // Same single-sourced rule as the initial pass:
-                        // promote the first unsuppressed queued item (+
-                        // Blocked context), but PARK on Blocked-only
-                        // (wait-ignores-queue-only-blocks).
-                        let items = queue_promote_outcome(&br.items, &br.suppressed_plans, &queue);
-                        wake_worthy(&items).then_some(items)
+                        let items = queue_promote_outcome(&queue);
+                        (!items.is_empty()).then_some(items)
                     } else {
                         None
                     }
@@ -963,15 +899,14 @@ async fn run_command_source(
     });
 }
 
-/// Check blocks and return (block_items, suppressed_plans). If a
-/// `Unblocked` is found for the calling agent, it is returned as
-/// the sole item with `suppress_all = true` so the caller exits
-/// immediately. Pending blocks emit `Blocked` items and
-/// suppress either all work (repo-scope) or specific plans.
+/// Check blocks for the calling agent. An `Unblocked` answer is
+/// returned as the sole item so the caller exits immediately; any
+/// pending block sets `suppress_all`, which parks this agent until
+/// it is answered. Blocks are repo-wide, so there is no partial
+/// suppression and nothing downstream routes work around one.
 struct BlockResult {
     items: Vec<WaitItem>,
     suppress_all: bool,
-    suppressed_plans: std::collections::BTreeSet<PlanKey>,
 }
 
 fn check_blocks(repo: &Path, author: &AgentLabel) -> BlockResult {
@@ -979,7 +914,6 @@ fn check_blocks(repo: &Path, author: &AgentLabel) -> BlockResult {
     let mut result = BlockResult {
         items: Vec::new(),
         suppress_all: false,
-        suppressed_plans: std::collections::BTreeSet::new(),
     };
 
     for b in &blocks {
@@ -987,7 +921,6 @@ fn check_blocks(repo: &Path, author: &AgentLabel) -> BlockResult {
             if let Some(ref answer) = b.answer {
                 result.items = vec![WaitItem::Unblocked {
                     name: b.name.clone(),
-                    plan: b.plan.clone(),
                     answer: answer.clone(),
                 }];
                 result.suppress_all = true;
@@ -1003,58 +936,34 @@ fn check_blocks(repo: &Path, author: &AgentLabel) -> BlockResult {
         result.items.push(WaitItem::Blocked {
             agent: b.agent.clone(),
             name: b.name.clone(),
-            plan: b.plan.clone(),
             question: b.question.clone(),
         });
-        match &b.plan {
-            None => result.suppress_all = true,
-            Some(plan_str) => {
-                if let Ok(pk) = PlanKey::parse(plan_str) {
-                    result.suppressed_plans.insert(pk);
-                }
-            }
-        }
+        // Every block is repo-wide: one pending block parks this
+        // agent entirely, so there is no per-plan bookkeeping and
+        // nothing downstream can route work "around" it.
+        result.suppress_all = true;
     }
 
     result
 }
 
-/// A pending human `Block` is attachable CONTEXT — co-surfaced beside
-/// real work — but NEVER wake-worthy on its own. A wait result is
-/// wake-worthy iff it carries at least one non-`Blocked` item
-/// (actionable Master/Reviewer work, `PromoteFromQueue`, `Unblocked`,
-/// `Finished`, a commit-tag fix, …). Returning on `Blocked`-alone wakes
-/// an agent that has nothing to do and churns the stop-hook / wait loop
-/// on a non-actionable condition (wait-ignores-queue-only-blocks) — the
-/// caller PARKS instead. Single source so neither the initial pass nor
-/// the watch-loop pass can re-introduce the emit-on-Blocked bug.
-fn wake_worthy(items: &[WaitItem]) -> bool {
-    items.iter().any(|i| !matches!(i, WaitItem::Blocked { .. }))
-}
-
-/// The master-with-no-actionable-active-work outcome: any pending-Blocked
-/// context, plus a `PromoteFromQueue` for the first queue item NOT
-/// suppressed by a plan-scoped block (a block on the top queued item
-/// must not hide a lower-priority unblocked one). If EVERY queued item
-/// is suppressed — or the queue is empty — the result is Blocked-only
-/// (or empty), which [`wake_worthy`] rejects, so the caller parks.
-/// Shared by both the initial pass and the watch-loop pass.
-fn queue_promote_outcome(
-    block_items: &[WaitItem],
-    suppressed_plans: &std::collections::BTreeSet<PlanKey>,
-    queue: &[crate::cli::queue::QueueEntry],
-) -> Vec<WaitItem> {
-    let mut items = block_items.to_vec();
-    if let Some(first) = queue
-        .iter()
-        .find(|q| !suppressed_plans.iter().any(|k| k.as_str() == q.name))
-    {
-        items.push(WaitItem::PromoteFromQueue {
-            name: first.name.clone(),
-            priority: first.priority,
-        });
-    }
-    items
+/// The master-with-nothing-active outcome: a `PromoteFromQueue` for
+/// the first queued item, or empty when the queue is empty (the
+/// caller then parks). Both call sites are reached only when no
+/// block pends — a block sets `suppress_all` upstream — so there is
+/// no Blocked context to co-surface here and no suppression to apply.
+/// Shared by the initial pass and the watch-loop pass so the two
+/// cannot drift.
+fn queue_promote_outcome(queue: &[crate::cli::queue::QueueEntry]) -> Vec<WaitItem> {
+    queue
+        .first()
+        .map(|first| {
+            vec![WaitItem::PromoteFromQueue {
+                name: first.name.clone(),
+                priority: first.priority,
+            }]
+        })
+        .unwrap_or_default()
 }
 
 /// `clank wait --json` envelope. The stop-hook parses this; the
@@ -1180,15 +1089,10 @@ enum WaitJsonItem<'a> {
     Blocked {
         agent: &'a str,
         name: &'a str,
-        plan: Option<&'a str>,
         question: &'a str,
     },
     #[serde(rename = "unblocked")]
-    Unblocked {
-        name: &'a str,
-        plan: Option<&'a str>,
-        answer: &'a str,
-    },
+    Unblocked { name: &'a str, answer: &'a str },
     #[serde(rename = "pr_reviewer")]
     PrReviewer { pr: u32, round: u64 },
     #[serde(rename = "pr_master")]
@@ -1309,19 +1213,13 @@ fn render_json(item: &WaitItem) -> WaitJsonItem<'_> {
         WaitItem::Blocked {
             agent,
             name,
-            plan,
             question,
         } => WaitJsonItem::Blocked {
             agent,
             name,
-            plan: plan.as_deref(),
             question,
         },
-        WaitItem::Unblocked { name, plan, answer } => WaitJsonItem::Unblocked {
-            name,
-            plan: plan.as_deref(),
-            answer,
-        },
+        WaitItem::Unblocked { name, answer } => WaitJsonItem::Unblocked { name, answer },
         WaitItem::PrReviewer { pr, round } => WaitJsonItem::PrReviewer {
             pr: *pr,
             round: *round,
@@ -1500,19 +1398,12 @@ fn render_human(item: &WaitItem) -> String {
         WaitItem::Blocked {
             agent,
             name,
-            plan,
             // The question is for the HUMAN (who reads the block
             // elsewhere); the woken agent only needs "not your
             // move". It stays a json field.
             question: _,
-        } => {
-            let scope = plan.as_deref().unwrap_or("repo");
-            format!("blocked  {agent}/{name}  scope={scope}  (awaiting human)")
-        }
-        WaitItem::Unblocked { name, plan, answer } => {
-            let scope = plan.as_deref().unwrap_or("repo");
-            format!("answer   {name}  scope={scope}  {answer}")
-        }
+        } => format!("blocked  {agent}/{name}  (awaiting human)"),
+        WaitItem::Unblocked { name, answer } => format!("answer   {name}  {answer}"),
         WaitItem::PrReviewer { pr, round } => {
             format!("pr-review  #{pr}  round {round}  review the pending comments")
         }
@@ -1815,15 +1706,6 @@ mod tests {
     // alone: Blocked-only parks (times out), but a block must not hide
     // a lower-priority unblocked queue item.
 
-    fn blocked(name: &str, plan: Option<&str>) -> WaitItem {
-        WaitItem::Blocked {
-            agent: "claude".into(),
-            name: name.into(),
-            plan: plan.map(Into::into),
-            question: "?".into(),
-        }
-    }
-
     fn qentry(name: &str, priority: u16) -> crate::cli::queue::QueueEntry {
         crate::cli::queue::QueueEntry {
             priority,
@@ -1832,71 +1714,73 @@ mod tests {
         }
     }
 
-    fn suppressed(names: &[&str]) -> std::collections::BTreeSet<PlanKey> {
-        names.iter().map(|n| PlanKey::parse(n).unwrap()).collect()
-    }
-
     #[test]
-    fn wake_worthy_rejects_blocked_alone_and_empty() {
-        assert!(!wake_worthy(&[]), "empty is not wake-worthy");
+    fn idle_queue_promotes_first_item() {
+        // The ordinary idle-repo path: no plans, no blocks, non-empty
+        // queue. Both call sites reach this, so a regression here
+        // removes queue promotion from clank entirely.
+        let items = queue_promote_outcome(&[qentry("first", 400), qentry("second", 500)]);
         assert!(
-            !wake_worthy(&[blocked("d", Some("p"))]),
-            "a pending Block alone must not wake"
+            matches!(
+                items.as_slice(),
+                [WaitItem::PromoteFromQueue { name, .. }] if name == "first"
+            ),
+            "expected the first queued item, got {items:?}"
         );
-        // Anything non-Blocked alongside makes it wake-worthy.
-        assert!(wake_worthy(&[
-            blocked("d", Some("p")),
-            WaitItem::PromoteFromQueue {
-                name: "x".into(),
-                priority: 1
-            },
-        ]));
-        assert!(wake_worthy(&[WaitItem::Unblocked {
-            name: "d".into(),
-            plan: Some("p".into()),
-            answer: "go".into(),
-        }]));
     }
 
     #[test]
-    fn queue_only_block_parks_does_not_wake() {
-        // The Frostsnap repro: one queued plan (`simctl-up`), one
-        // pending block scoped to it → every queued item suppressed →
-        // Blocked-only → caller parks (wait times out).
-        let items = queue_promote_outcome(
-            &[blocked("simctl-up-design-decisions", Some("simctl-up"))],
-            &suppressed(&["simctl-up"]),
-            &[qentry("simctl-up", 500)],
+    fn empty_queue_parks() {
+        assert!(queue_promote_outcome(&[]).is_empty());
+    }
+
+    #[test]
+    fn pending_block_parks_the_agent_entirely() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let blocks = repo.join(".clank/agents/claude/blocks");
+        std::fs::create_dir_all(&blocks).unwrap();
+        std::fs::write(blocks.join("q.md"), "why?").unwrap();
+
+        let br = check_blocks(repo, &AgentLabel::parse("claude").unwrap());
+
+        assert!(
+            br.suppress_all,
+            "any pending block must park the agent; nothing routes around it"
         );
         assert!(
-            !wake_worthy(&items),
-            "queue-only pending block must park, got {items:?}"
+            matches!(
+                br.items.as_slice(),
+                [WaitItem::Blocked { agent, name, .. }] if agent == "claude" && name == "q"
+            ),
+            "expected the pending block surfaced as context, got {:?}",
+            br.items
         );
     }
 
     #[test]
-    fn block_on_top_queue_item_still_promotes_lower_unblocked() {
-        // First queued plan blocked, second unblocked → promote the
-        // second (a block must not hide lower-priority work).
-        let items = queue_promote_outcome(
-            &[blocked("d", Some("blocked-plan"))],
-            &suppressed(&["blocked-plan"]),
-            &[qentry("blocked-plan", 400), qentry("free-plan", 500)],
-        );
-        assert!(wake_worthy(&items));
+    fn answered_block_returns_unblocked_and_stops_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let agent = repo.join(".clank/agents/claude");
+        std::fs::create_dir_all(agent.join("blocks")).unwrap();
+        std::fs::create_dir_all(agent.join("unblocks")).unwrap();
+        std::fs::write(agent.join("blocks/q.md"), "why?").unwrap();
+        // The flat answer path: written where the flat reader looks.
+        // A split landing (reader flat, writer scoped) would leave the
+        // pair unmatched and park the repo forever.
+        std::fs::write(agent.join("unblocks/q.md"), "because").unwrap();
+
+        let br = check_blocks(repo, &AgentLabel::parse("claude").unwrap());
+
         assert!(
-            items.iter().any(|i| matches!(
-                i,
-                WaitItem::PromoteFromQueue { name, .. } if name == "free-plan"
-            )),
-            "lower-priority unblocked item must promote, got {items:?}"
+            matches!(
+                br.items.as_slice(),
+                [WaitItem::Unblocked { name, answer }] if name == "q" && answer == "because"
+            ),
+            "expected the answer delivered, got {:?}",
+            br.items
         );
-    }
-
-    #[test]
-    fn empty_queue_with_no_blocks_parks() {
-        let items = queue_promote_outcome(&[], &suppressed(&[]), &[]);
-        assert!(!wake_worthy(&items));
     }
 
     // ── commit-tag-fixup-is-first-class-state ──────────────────
@@ -2098,10 +1982,9 @@ mod tests {
         let blocked = render_human(&WaitItem::Blocked {
             agent: "claude".into(),
             name: "q".into(),
-            plan: Some("foo".into()),
             question: "should we?".into(),
         });
-        assert_eq!(blocked, "blocked  claude/q  scope=foo  (awaiting human)");
+        assert_eq!(blocked, "blocked  claude/q  (awaiting human)");
         assert!(
             !blocked.contains("should we?"),
             "block question is for the human, not the woken agent"
@@ -2124,7 +2007,6 @@ mod tests {
         let j = serde_json::to_value(render_json(&WaitItem::Blocked {
             agent: "claude".into(),
             name: "q".into(),
-            plan: Some("foo".into()),
             question: "should we?".into(),
         }))
         .unwrap();
@@ -2261,7 +2143,6 @@ mod tests {
                 serde_json::to_value(render_json(&WaitItem::Blocked {
                     agent: "claude".into(),
                     name: "q".into(),
-                    plan: Some("foo".into()),
                     question: "should we?".into(),
                 }))
                 .unwrap(),
@@ -2269,23 +2150,18 @@ mod tests {
                     "kind": "blocked",
                     "agent": "claude",
                     "name": "q",
-                    "plan": "foo",
                     "question": "should we?",
                 }),
             ),
             (
-                // `plan: None` must serialize to `null`, matching the
-                // old `&Option<String>` value.
                 serde_json::to_value(render_json(&WaitItem::Unblocked {
                     name: "q".into(),
-                    plan: None,
                     answer: "yes".into(),
                 }))
                 .unwrap(),
                 serde_json::json!({
                     "kind": "unblocked",
                     "name": "q",
-                    "plan": null,
                     "answer": "yes",
                 }),
             ),

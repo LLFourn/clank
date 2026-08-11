@@ -1136,13 +1136,9 @@ fn render_index(
         out.push_str("  <div class=\"blocks\">blocks:\n    <ul>\n");
         for b in &status.blocks {
             out.push_str(&format!(
-                "      <li><code>{}</code>/{}{} — {}</li>\n",
+                "      <li><code>{}</code>/{} — {}</li>\n",
                 esc(&b.agent),
                 esc(&b.name),
-                b.plan
-                    .as_deref()
-                    .map(|p| format!(" · plan {p}"))
-                    .unwrap_or_default(),
                 esc(&b.question)
             ));
         }

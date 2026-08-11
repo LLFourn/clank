@@ -300,7 +300,6 @@ struct FinishedPlanJson<'a> {
 struct BlockJson<'a> {
     agent: &'a str,
     name: &'a str,
-    plan: Option<&'a str>,
     question: &'a str,
     answer: Option<&'a str>,
     pending: bool,
@@ -543,7 +542,6 @@ impl StatusSnapshot {
             .map(|b| BlockJson {
                 agent: &b.agent,
                 name: &b.name,
-                plan: b.plan.as_deref(),
                 question: &b.question,
                 answer: b.answer.as_deref(),
                 pending: b.answer.is_none(),
@@ -722,20 +720,11 @@ impl StatusSnapshot {
             let _ = writeln!(out);
             let _ = writeln!(out, "blocks:");
             for b in &self.blocks {
-                let scope = b.plan.as_deref().unwrap_or("repo");
                 if let Some(ref answer) = b.answer {
-                    let _ = writeln!(
-                        out,
-                        "  UNBLOCKED ({}, scope: {}): {}",
-                        b.agent, scope, b.question
-                    );
+                    let _ = writeln!(out, "  UNBLOCKED ({}): {}", b.agent, b.question);
                     let _ = writeln!(out, "    answer: {answer}");
                 } else {
-                    let _ = writeln!(
-                        out,
-                        "  BLOCKED ({}, scope: {}): {}",
-                        b.agent, scope, b.question
-                    );
+                    let _ = writeln!(out, "  BLOCKED ({}): {}", b.agent, b.question);
                 }
             }
         }
@@ -1971,7 +1960,6 @@ mod dirty_and_wake_tests {
             blocks: vec![crate::cli::block::BlockEntry {
                 agent: "codex".to_string(),
                 name: "q".to_string(),
-                plan: Some("foo".to_string()),
                 question: "why?".to_string(),
                 answer: None,
             }],
@@ -2014,7 +2002,6 @@ mod dirty_and_wake_tests {
             "blocks": [{
                 "agent": "codex",
                 "name": "q",
-                "plan": "foo",
                 "question": "why?",
                 "answer": null,
                 "pending": true,

@@ -106,7 +106,7 @@ pub(super) fn in_progress_rows(snap: &StatusSnapshot) -> Vec<InProgress> {
 /// historical log row. Live activity is NOT in the sequence — it renders
 /// on the AGENTS panel rows.
 pub(super) enum Seg<'a> {
-    Ask(&'a Vec<Span>),
+    Ask(&'a crate::cli::status_tui::render::AskLine),
     Log(&'a crate::cli::log::OnelineRow),
 }
 
@@ -116,7 +116,7 @@ pub(super) enum Seg<'a> {
 /// Enter-targeting uses — they cannot disagree.
 pub(super) fn build_scroll<'a>(
     snap: &'a StatusSnapshot,
-    ask_lines: &'a [Vec<Span>],
+    ask_lines: &'a [crate::cli::status_tui::render::AskLine],
 ) -> Vec<Seg<'a>> {
     let mut seq: Vec<Seg> = ask_lines.iter().map(Seg::Ask).collect();
     seq.extend(snap.log_rows.iter().map(Seg::Log));

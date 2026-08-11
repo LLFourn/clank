@@ -96,7 +96,7 @@ pub async fn build_finish_preview(
     // consulted blocks at all; `--force` cannot waive this.
     let has_pending_block = crate::cli::block::scan_blocks(repo_root)
         .iter()
-        .any(|b| b.answer.is_none() && b.plan.as_deref().is_none_or(|p| p == plan_key.as_str()));
+        .any(|b| b.answer.is_none());
     let tiers =
         crate::agent_store::load_reviewer_tiers(repo_root).map_err(PreviewError::AgentLoad)?;
     let any_registered =

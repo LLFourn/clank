@@ -123,6 +123,25 @@ pub(super) fn render_at(
                 return render_roster_confirm(snap, picker, action, rows, cols);
             }
             ConfirmAction::StashPlan | ConfirmAction::PurgeArtifacts | ConfirmAction::PurgeDrop => {
+                if let Mode::BlockAnswer { block } = mode {
+                    if let Some(b) = snap.blocks.get(block) {
+                        return render_block_answer(
+                            &b.agent,
+                            &b.name,
+                            &b.question,
+                            view.plan_input.unwrap_or(&TextInput::default()),
+                            rows,
+                            cols,
+                        );
+                    }
+                }
+                if matches!(mode, Mode::PauseInput) {
+                    return render_pause_input(
+                        view.plan_input.unwrap_or(&TextInput::default()),
+                        rows,
+                        cols,
+                    );
+                }
                 if let Some(pp) = view.plan_page {
                     return render_plan_confirm(&pp.stem, action, rows, cols);
                 }
@@ -253,7 +272,7 @@ pub(super) fn render_at(
                 .unwrap_or(0);
             for (local, s) in seq[off..end].iter().enumerate() {
                 let spans = match s {
-                    Seg::Ask(line) => (*line).clone(),
+                    Seg::Ask(a) => a.spans.clone(),
                     Seg::Log(row) => log_row_spans(row, author_width, &snap.log_decorations),
                 };
                 // The selected timeline entry gets the unified selection
@@ -661,19 +680,45 @@ pub(super) fn log_row_spans(
     }
 }
 
+/// One rendered line of a pending block's question, tagged with the
+/// block it came from so the cursor can answer THAT block. A question
+/// wraps to several lines; every one carries the same index.
+#[derive(Clone)]
+pub(super) struct AskLine {
+    /// The block this line belongs to, or `None` for the trailing key
+    /// hint — which must not be answerable, or `u` on it would answer
+    /// whichever block happened to be last.
+    pub block: Option<usize>,
+    pub spans: Vec<Span>,
+}
+
 /// Full-width wrapped lines for every pending (unanswered) block ask, in
 /// accent style with NO label or gutter: the accent (red) already marks it
 /// as a block, and a human question often needs the whole pane. Rendered as
 /// SCROLLABLE content so a long question can be paged. Pure (word-wrap
 /// only): safe to call on an animation tick. Empty when no ask is pending
 /// (reserves no space).
-pub(super) fn block_ask_spans(snap: &StatusSnapshot, cols: usize) -> Vec<Vec<Span>> {
+pub(super) fn block_ask_spans(snap: &StatusSnapshot, cols: usize) -> Vec<AskLine> {
     let width = cols.max(1);
     let mut lines = Vec::new();
-    for b in snap.blocks.iter().filter(|b| b.answer.is_none()) {
+    for (block, b) in snap
+        .blocks
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| b.answer.is_none())
+    {
         for line in wrap(b.question.trim(), width) {
-            lines.push(vec![accent(line)]);
+            lines.push(AskLine {
+                block: Some(block),
+                spans: vec![accent(line)],
+            });
         }
+    }
+    if !lines.is_empty() {
+        lines.push(AskLine {
+            block: None,
+            spans: vec![dim("  ↑↓ select · u answer".to_string())],
+        });
     }
     lines
 }
@@ -738,11 +783,9 @@ pub(super) fn bar_text(snap: &StatusSnapshot) -> (String, String) {
             // ALL, a plan-scoped one suppresses its plan. Block > promote:
             // if nothing is promotable the queue is STOPPED on a human ask,
             // so show the block lamp (🙋), not the promote lamp.
-            let pending = |name: &str| {
-                snap.blocks.iter().any(|b| {
-                    b.answer.is_none() && (b.plan.is_none() || b.plan.as_deref() == Some(name))
-                })
-            };
+            // Blocks are repo-wide: one pending block stops the queue
+            // regardless of which item is next.
+            let pending = |_name: &str| snap.blocks.iter().any(|b| b.answer.is_none());
             let promotable = snap
                 .queue
                 .iter()
@@ -1500,8 +1543,8 @@ pub(super) fn render_plan_detail(
     let mut out: Vec<String> = Vec::new();
     let state_hint = if st.finished {
         "finished".to_string()
-    } else if st.blocked {
-        "active · blocked".to_string()
+    } else if st.repo_paused {
+        "active · repo paused".to_string()
     } else {
         "active".to_string()
     };
@@ -1579,12 +1622,6 @@ fn plan_action_row(a: PlanAction) -> (&'static str, &'static str, &'static str) 
             "finalize NOW, bypassing the review gate",
         ),
         PlanAction::Squash => ("c", "squash…", "collapse the plan's commits into one"),
-        PlanAction::Block => (
-            "b",
-            "block…",
-            "pause: ask the human a question and suppress work until answered",
-        ),
-        PlanAction::Unblock => ("b", "unblock", "resume: answer the pending block"),
         PlanAction::Purge => (
             "p",
             "purge…",
@@ -1784,11 +1821,6 @@ pub(super) fn render_plan_input(
              is kept from the finish message)",
             "⏎ squash",
         ),
-        PlanInputKind::BlockReason => (
-            format!("block · {stem}"),
-            "why is this plan paused? (becomes the block's question)",
-            "⏎ block",
-        ),
         PlanInputKind::DropStem => (
             format!("DROP · {stem}"),
             "",
@@ -1821,22 +1853,7 @@ pub(super) fn render_plan_input(
         }
     }
     out.push(String::new());
-    // The input line: text with a reverse-video cursor cell.
-    let (before, at) = input.buf.split_at(input.cursor.min(input.buf.len()));
-    let (cursor_cell, after) = match at.split_at(at.len().min(1)) {
-        ("", _) => (" ".to_string(), ""),
-        (c, rest) => (c.to_string(), rest),
-    };
-    out.push(emit(
-        &[
-            accent("  > ".to_string()),
-            plain(before.to_string()),
-            highlight(cursor_cell),
-            plain(after.to_string()),
-        ],
-        "",
-        cols,
-    ));
+    push_input_line(&mut out, input, cols);
     if matches!(kind, PlanInputKind::DropStem) {
         out.push(String::new());
         let armed = super::input::drop_armed(&input.buf, stem);
@@ -1859,6 +1876,93 @@ pub(super) fn render_plan_input(
             "",
             cols,
         ));
+    }
+    out.truncate(rows);
+    (out, 0)
+}
+
+/// The input line shared by every text-entry screen: the buffer with a
+/// reverse-video cursor cell.
+fn push_input_line(out: &mut Vec<String>, input: &TextInput, cols: usize) {
+    let (before, at) = input.buf.split_at(input.cursor.min(input.buf.len()));
+    let (cursor_cell, after) = match at.split_at(at.len().min(1)) {
+        ("", _) => (" ".to_string(), ""),
+        (c, rest) => (c.to_string(), rest),
+    };
+    out.push(emit(
+        &[
+            accent("  > ".to_string()),
+            plain(before.to_string()),
+            highlight(cursor_cell),
+            plain(after.to_string()),
+        ],
+        "",
+        cols,
+    ));
+}
+
+/// The answer screen for ONE pending block: the asking agent, its
+/// question in full, and the input. Showing the question while the
+/// human types is the point — an answer written blind is a guess.
+pub(super) fn render_block_answer(
+    agent: &str,
+    name: &str,
+    question: &str,
+    input: &TextInput,
+    rows: usize,
+    cols: usize,
+) -> (Vec<String>, usize) {
+    let mut out: Vec<String> = Vec::new();
+    out.push(region_rule(
+        &format!("answer · {agent}/{name}"),
+        "",
+        true,
+        cols,
+    ));
+    out.push(String::new());
+    for line in wrap(question.trim(), cols.saturating_sub(4).max(1)) {
+        out.push(emit(&[accent(format!("  {line}"))], "", cols));
+    }
+    out.push(String::new());
+    push_input_line(&mut out, input, cols);
+    if out.len() < rows {
+        out.push(String::new());
+    }
+    if out.len() < rows {
+        out.push(emit(
+            &[dim("  ⏎ answer · esc cancel".to_string())],
+            "",
+            cols,
+        ));
+    }
+    out.truncate(rows);
+    (out, 0)
+}
+
+/// The repo pause question screen. Carries no plan stem: a pause parks
+/// the whole repo, and this screen is reachable with no plan open.
+pub(super) fn render_pause_input(
+    input: &TextInput,
+    rows: usize,
+    cols: usize,
+) -> (Vec<String>, usize) {
+    let mut out: Vec<String> = Vec::new();
+    out.push(region_rule("pause repo", "", true, cols));
+    out.push(String::new());
+    for line in wrap(
+        "why is the repo paused? (becomes the question the human answers; \
+         every agent stays parked until it is answered)",
+        cols.saturating_sub(4).max(1),
+    ) {
+        out.push(emit(&[dim(format!("  {line}"))], "", cols));
+    }
+    out.push(String::new());
+    push_input_line(&mut out, input, cols);
+    if out.len() < rows {
+        out.push(String::new());
+    }
+    if out.len() < rows {
+        out.push(emit(&[dim("  ⏎ pause · esc cancel".to_string())], "", cols));
     }
     out.truncate(rows);
     (out, 0)
@@ -1948,7 +2052,7 @@ mod tests {
         let st = crate::cli::status_tui::input::PlanPageState {
             finished: false,
             multi_commit: true,
-            blocked: false,
+            repo_paused: false,
         };
         let pp = page(st);
         let actions = plan_actions(st);
@@ -1960,8 +2064,12 @@ mod tests {
         );
         assert!(text.contains("stash…"));
         assert!(text.contains("force finish…"));
-        assert!(text.contains("block…"));
         assert!(text.contains("purge…"));
+        // Pause is repo state on the global `b`, never a plan-page row.
+        assert!(
+            !text.contains("block…") && !text.contains("unblock"),
+            "{text}"
+        );
         // No drill-in row and no danger rule (purge's red is the cue).
         assert!(!text.contains("read the plan"));
         assert!(!text.contains("danger"));
@@ -1995,7 +2103,7 @@ mod tests {
         let st = crate::cli::status_tui::input::PlanPageState {
             finished: false,
             multi_commit: true,
-            blocked: false,
+            repo_paused: false,
         };
         // Narrow pane: the purge explanation must WRAP, never clip.
         let pp = page(st);
@@ -2036,7 +2144,7 @@ mod tests {
         let st = crate::cli::status_tui::input::PlanPageState {
             finished: false,
             multi_commit: true,
-            blocked: false,
+            repo_paused: false,
         };
         let cols = 90;
         let mut pp = page(st);
@@ -2073,7 +2181,7 @@ mod tests {
         let st = crate::cli::status_tui::input::PlanPageState {
             finished: false,
             multi_commit: true,
-            blocked: false,
+            repo_paused: false,
         };
         let mut pp = page(st);
         pp.body = Some("p1\n\np2\n\np3\n\np4\n\np5\n\np6\n\np7\n".into());
@@ -2103,7 +2211,7 @@ mod tests {
         let st = crate::cli::status_tui::input::PlanPageState {
             finished: false,
             multi_commit: true,
-            blocked: false,
+            repo_paused: false,
         };
         let mut pp = page(st);
         pp.body = Some("p1\n\np2\n\np3\n\np4\n\np5\n\nfinal-line\n".into());
@@ -2196,13 +2304,100 @@ mod tests {
         for (kind, want) in [
             (PlanInputKind::ForceFinishSubject, "FORCE FINISH · MY-PLAN"),
             (PlanInputKind::SquashMessage, "SQUASH · MY-PLAN"),
-            (PlanInputKind::BlockReason, "BLOCK · MY-PLAN"),
         ] {
             let (lines, _) = render_plan_input("my-plan", kind, &TextInput::default(), 24, 90);
             let text = lines.join("\n");
             assert!(text.contains(want), "{want}: {text}");
             assert!(text.contains("esc cancel"), "{text}");
         }
+    }
+
+    #[test]
+    fn each_pending_block_tags_its_own_lines_and_the_hint_is_not_answerable() {
+        let mut s = snap(vec![], vec![]);
+        s.blocks = vec![
+            crate::cli::block::BlockEntry {
+                agent: "claude".into(),
+                name: "a".into(),
+                question: "first question".into(),
+                answer: None,
+            },
+            crate::cli::block::BlockEntry {
+                agent: "codex".into(),
+                name: "b".into(),
+                question: "second question".into(),
+                answer: None,
+            },
+        ];
+        let lines = block_ask_spans(&s, 60);
+        let owners: Vec<Option<usize>> = lines.iter().map(|l| l.block).collect();
+        assert_eq!(
+            owners,
+            vec![Some(0), Some(1), None],
+            "each question tags its own block; the trailing hint tags none"
+        );
+    }
+
+    #[test]
+    fn an_answered_block_contributes_no_ask_line() {
+        let mut s = snap(vec![], vec![]);
+        s.blocks = vec![crate::cli::block::BlockEntry {
+            agent: "claude".into(),
+            name: "a".into(),
+            question: "already answered".into(),
+            answer: Some("yes".into()),
+        }];
+        assert!(block_ask_spans(&s, 60).is_empty());
+    }
+
+    #[test]
+    fn ask_line_indices_address_the_snapshot_not_the_pending_subset() {
+        // The index answers `snapshot.blocks[i]`, so it must count
+        // answered blocks too — indexing the filtered subset would
+        // write the answer under the WRONG agent's question.
+        let mut s = snap(vec![], vec![]);
+        s.blocks = vec![
+            crate::cli::block::BlockEntry {
+                agent: "claude".into(),
+                name: "done".into(),
+                question: "answered".into(),
+                answer: Some("yes".into()),
+            },
+            crate::cli::block::BlockEntry {
+                agent: "codex".into(),
+                name: "open".into(),
+                question: "still open".into(),
+                answer: None,
+            },
+        ];
+        let lines = block_ask_spans(&s, 60);
+        assert_eq!(lines[0].block, Some(1), "must point at the OPEN block");
+    }
+
+    #[test]
+    fn block_answer_screen_shows_the_question_being_answered() {
+        use crate::cli::status_tui::input::TextInput;
+        let (lines, _) = render_block_answer(
+            "codex",
+            "scope",
+            "should this ship?",
+            &TextInput::default(),
+            24,
+            80,
+        );
+        let text = lines.join("\n");
+        assert!(text.to_uppercase().contains("CODEX/SCOPE"), "{text}");
+        assert!(text.contains("should this ship?"), "{text}");
+        assert!(text.contains("esc cancel"), "{text}");
+    }
+
+    #[test]
+    fn pause_screen_names_the_repo_not_a_plan() {
+        use crate::cli::status_tui::input::TextInput;
+        let (lines, _) = render_pause_input(&TextInput::default(), 24, 80);
+        let text = lines.join("\n");
+        assert!(text.to_uppercase().contains("PAUSE REPO"), "{text}");
+        assert!(text.contains("esc cancel"), "{text}");
     }
 
     #[test]
@@ -3010,7 +3205,6 @@ mod tests {
         s.blocks = vec![crate::cli::block::BlockEntry {
             agent: "claude".into(),
             name: "simctl-up-design-decisions".into(),
-            plan: Some("simctl-up".into()),
             question: "which sims?".into(),
             answer: None,
         }];
@@ -3019,20 +3213,24 @@ mod tests {
     }
 
     #[test]
-    fn block_on_head_queue_item_still_shows_promote_for_lower() {
-        // A block on the head queued plan must not hide a lower unblocked
-        // one: block > promote applies ONLY when nothing is promotable.
+    fn any_pending_block_stops_the_queue() {
+        // Blocks are repo-wide, so a pending one halts promotion
+        // outright — there is no longer a "lower unblocked item" to
+        // fall through to. The lamp must say blocked, not promote,
+        // or the human is invited to take work the agent will refuse.
         let mut s = snap(vec![], vec!["blocked-plan", "free-plan"]);
         s.blocks = vec![crate::cli::block::BlockEntry {
             agent: "claude".into(),
             name: "q".into(),
-            plan: Some("blocked-plan".into()),
             question: "?".into(),
             answer: None,
         }];
         let v = visible(&render(&s, 1, 60)[0]);
-        assert!(v.starts_with("📋 CLAUDE promote"), "got `{v}`");
-        assert!(v.contains("free-plan"), "names the promotable item: `{v}`");
+        assert!(v.contains("blocked"), "expected the block lamp, got `{v}`");
+        assert!(
+            !v.contains("promote"),
+            "must not offer promotion while blocked: `{v}`"
+        );
     }
 
     #[test]
@@ -3150,7 +3348,6 @@ mod tests {
         s.blocks = vec![crate::cli::block::BlockEntry {
             agent: "claude".into(),
             name: "q".into(),
-            plan: None,
             question: "is this right?\nmore detail".into(),
             answer: None,
         }];
@@ -3191,7 +3388,6 @@ mod tests {
         s.blocks = vec![crate::cli::block::BlockEntry {
             agent: "claude".into(),
             name: "q".into(),
-            plan: None,
             question: q.into(),
             answer: None,
         }];
@@ -4385,7 +4581,6 @@ mod tests {
         s.blocks = vec![crate::cli::block::BlockEntry {
             agent: "claude".into(),
             name: "q".into(),
-            plan: None,
             question: "the first line is long enough to wrap\nsecond paragraph".into(),
             answer: None,
         }];

@@ -138,7 +138,7 @@ fn finish_force_still_refuses_an_open_block() {
     commit(repo, "[foo] intro");
     write(
         repo,
-        ".clank/agents/codex/blocks/foo/which-api.md",
+        ".clank/agents/codex/blocks/which-api.md",
         "Which API shape?\n",
     );
 
@@ -162,7 +162,7 @@ fn finish_refuses_an_open_block_on_a_master_only_repo() {
     commit(repo, "[foo] intro");
     write(
         repo,
-        ".clank/agents/claude/blocks/foo/which-api.md",
+        ".clank/agents/claude/blocks/which-api.md",
         "Which API shape?\n",
     );
 
@@ -198,7 +198,7 @@ fn finish_refuses_an_open_block_even_when_the_gate_is_finished() {
     );
     write(
         repo,
-        ".clank/agents/codex/blocks/foo/which-api.md",
+        ".clank/agents/codex/blocks/which-api.md",
         "Which API shape?\n",
     );
 
