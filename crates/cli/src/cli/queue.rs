@@ -257,7 +257,7 @@ pub(crate) fn validate_name(name: &str) -> anyhow::Result<()> {
 /// The queue-add core: validate, refuse stem collisions, write the
 /// canonical `{priority:03}-{name}.md` entry, and consume a drafts-dir
 /// source AFTER the write (queue-add-consumes-draft). Quiet — callers
-/// own the user-facing print (`clank fork --draft` seeds a fork's queue
+/// own the user-facing print (`clank fork create --draft` seeds a fork's queue
 /// through here and must keep its own stdout contract). Returns the
 /// written entry's path.
 pub(crate) fn add(

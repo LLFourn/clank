@@ -6,7 +6,7 @@
 //! preview is the contract every mutation runs against — it makes
 //! "what would happen" inspectable before "do it" runs.
 
-use clap::Args;
+use clap::{Args, Subcommand};
 use std::path::{Path, PathBuf};
 
 pub mod agent;
@@ -149,6 +149,46 @@ pub struct ExportArgs {
 
 #[derive(Args, Debug)]
 pub struct ForkArgs {
+    #[command(subcommand)]
+    pub command: ForkCmd,
+}
+
+/// `fork` is a NOUN with a lifecycle, not a verb. Every other durable
+/// multi-operation noun in this CLI uses subcommands, and the bare
+/// positional form made `clank fork list` create a worktree called
+/// `list` — a silently successful wrong action (fork-cli-is-a-noun).
+#[derive(Subcommand, Debug)]
+pub enum ForkCmd {
+    /// Fork the team into a linked worktree (or `--clone`).
+    Create(ForkCreateArgs),
+    /// List this repo's forks.
+    List(ForkListArgs),
+    /// Remove a fork's worktree or clone.
+    Remove(ForkRemoveArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct ForkListArgs {
+    #[arg(long, value_name = "PATH")]
+    pub repo: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub struct ForkRemoveArgs {
+    /// Fork name, resolved through the validated fork identity — never
+    /// a path.
+    pub name: String,
+    /// Override the dirty-state and unreachable-commit refusals. Never
+    /// overrides the identity check. For a CLONE this permanently
+    /// destroys commits the source cannot reach.
+    #[arg(long)]
+    pub force: bool,
+    #[arg(long, value_name = "PATH")]
+    pub repo: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub struct ForkCreateArgs {
     /// Worktree name — also the new branch name and the zellij
     /// tab name. Defaults to `pr-<N>` when `--pr` is given.
     #[arg(required_unless_present = "pr")]
@@ -361,7 +401,7 @@ pub struct OpenZellijArgs {
     /// Open an EXISTING fork (linked worktree under
     /// `.clank/worktrees/<name>`) as a tab, idempotently — no-op if
     /// its tab is already open. Errors if the fork doesn't exist
-    /// (`clank fork <name>` creates it).
+    /// (`clank fork create <name>` creates it).
     #[arg(long, value_name = "NAME", conflicts_with_all = ["pr", "all"])]
     pub fork: Option<String>,
     /// Open the existing `pr-<N>` fork's tab (same as `--fork pr-<N>`).
@@ -835,7 +875,7 @@ pub struct PrReviewStartArgs {
     /// PR number.
     pub pr: u32,
     /// Create a linked worktree on the PR head + seed the team, then
-    /// scaffold the review there (same as `clank fork --pr <N>
+    /// scaffold the review there (same as `clank fork create --pr <N>
     /// --review`). Mutually exclusive with `--checkout`.
     #[arg(long, conflicts_with = "checkout")]
     pub fork: bool,
@@ -1731,7 +1771,7 @@ pub(crate) fn repo_basename(repo: &Path) -> anyhow::Result<String> {
 
 #[cfg(test)]
 mod agent_team_cli_parse_tests {
-    use super::{AgentArgs, ForkArgs, TeamArgs};
+    use super::{AgentArgs, ForkCreateArgs, TeamArgs};
     use clap::Parser;
 
     // `AgentArgs` / `TeamArgs` derive `Args` (they wrap a
@@ -1752,7 +1792,55 @@ mod agent_team_cli_parse_tests {
     #[derive(Parser)]
     struct ForkT {
         #[command(flatten)]
-        args: ForkArgs,
+        args: ForkCreateArgs,
+    }
+
+    #[derive(Parser)]
+    struct ForkNoun {
+        #[command(subcommand)]
+        cmd: super::ForkCmd,
+    }
+
+    #[test]
+    fn a_bare_token_can_never_be_read_as_a_fork_name() {
+        // THE regression. `clank fork list` used to create a worktree,
+        // a branch and forked team sessions called `list` — a silently
+        // successful wrong action. No bare token parses at all now.
+        assert!(
+            ForkNoun::try_parse_from(["t", "list-forks-please"]).is_err(),
+            "a bare name must not parse as creation"
+        );
+        assert!(
+            matches!(
+                ForkNoun::try_parse_from(["t", "list"]).unwrap().cmd,
+                super::ForkCmd::List(_)
+            ),
+            "`list` is the subcommand"
+        );
+    }
+
+    #[test]
+    fn list_is_still_usable_as_a_name_when_stated_explicitly() {
+        // The invariant is about AMBIGUITY, not about banning the word.
+        let parsed = ForkNoun::try_parse_from(["t", "create", "list"]).unwrap();
+        match parsed.cmd {
+            super::ForkCmd::Create(a) => assert_eq!(a.name.as_deref(), Some("list")),
+            other => panic!("expected create, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_keeps_the_pr_derived_name_rule() {
+        // `--pr N` derives `pr-<N>`, so NAME is required-unless-pr —
+        // the contract the noun grammar must not silently drop.
+        assert!(
+            ForkNoun::try_parse_from(["t", "create", "--pr", "7"]).is_ok(),
+            "--pr derives the name"
+        );
+        assert!(
+            ForkNoun::try_parse_from(["t", "create"]).is_err(),
+            "without a name or --pr there is nothing to create"
+        );
     }
 
     #[test]

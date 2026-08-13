@@ -53,6 +53,10 @@ pub struct StatusSnapshot {
     /// was used, and whether that wait is over). Plan:
     /// plan-lifecycle-verbs.
     pub(crate) stash: Vec<StashItemView>,
+    /// This repo's forks (name, kind). Durable repo state of exactly
+    /// the kind status already reports — their absence here is why a
+    /// fork could sit stranded unnoticed (fork-cli-is-a-noun).
+    pub(crate) forks: Vec<(String, &'static str)>,
     /// Recent activity as STRUCTURED oneline rows (umbrella
     /// headers + commits + reviews), NEWEST FIRST (the git-log
     /// convention every log display follows; lloyd) — the TUI's
@@ -458,6 +462,20 @@ impl StatusSnapshot {
             })
             .collect();
 
+        let forks: Vec<(String, &'static str)> = crate::cli::fork::list_forks(repo)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(kind, name, _)| {
+                (
+                    name,
+                    match kind {
+                        crate::cli::fork::ForkKind::Clone => "clone",
+                        crate::cli::fork::ForkKind::Worktree => "worktree",
+                    },
+                )
+            })
+            .collect();
+
         let stash: Vec<StashItemView> = crate::cli::stash::scan_stash(repo)
             .into_iter()
             .map(|(stem, st)| {
@@ -480,6 +498,7 @@ impl StatusSnapshot {
         let log_decorations = log_decorations(&git, branch.as_deref());
 
         Ok(Self {
+            forks,
             repo_path: repo.to_path_buf(),
             basename: basename.to_string(),
             branch,
@@ -637,6 +656,9 @@ impl StatusSnapshot {
                 self.queue.len(),
                 if self.queue.len() == 1 { "" } else { "s" }
             );
+        }
+        for (name, kind) in &self.forks {
+            let _ = writeln!(out, "fork:   {name} · {kind}");
         }
         for sv in &self.stash {
             let note = match (&sv.waiting_for, sv.ready) {
@@ -1943,6 +1965,7 @@ mod dirty_and_wake_tests {
 
     fn minimal_snapshot() -> StatusSnapshot {
         StatusSnapshot {
+            forks: Vec::new(),
             repo_path: PathBuf::from("/repo"),
             basename: "repo".to_string(),
             branch: Some("main".to_string()),

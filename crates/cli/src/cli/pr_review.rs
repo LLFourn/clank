@@ -144,21 +144,23 @@ pub async fn run(args: PrReviewArgs) -> anyhow::Result<()> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     match args.command {
         PrReviewCmd::Start(a) if a.fork => {
-            // Same operation as `clank fork --pr <N> --review`: the
+            // Same operation as `clank fork create --pr <N> --review`: the
             // worktree creation + review scaffold + zellij open all
             // live in `fork::run`; this verb is just a second door.
             super::fork::run(crate::cli::ForkArgs {
-                name: None,
-                source: repo_arg,
-                pr: Some(a.pr),
-                branch: None,
-                path: None,
-                clone: false,
-                team: None,
-                drafts: Vec::new(),
-                prompt: None,
-                no_open: false,
-                review: true,
+                command: crate::cli::ForkCmd::Create(crate::cli::ForkCreateArgs {
+                    name: None,
+                    source: repo_arg,
+                    pr: Some(a.pr),
+                    branch: None,
+                    path: None,
+                    clone: false,
+                    team: None,
+                    drafts: Vec::new(),
+                    prompt: None,
+                    no_open: false,
+                    review: true,
+                }),
             })
             .await
         }

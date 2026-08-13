@@ -111,8 +111,8 @@ fn source_with_bound_team() -> TestEnv {
     env
 }
 
-fn fork_args(env: &TestEnv, name: &str) -> clank::cli::ForkArgs {
-    clank::cli::ForkArgs {
+fn fork_args(env: &TestEnv, name: &str) -> clank::cli::ForkCreateArgs {
+    clank::cli::ForkCreateArgs {
         name: Some(name.into()),
         source: Some(env.repo().to_path_buf()),
         pr: None,
@@ -691,7 +691,7 @@ fn fork_worktree_ignored_by_allow_list_without_touching_gitignore() {
     );
 }
 
-/// A bare "origin" carrying refs/pull/123/head, so `fork --pr`
+/// A bare "origin" carrying refs/pull/123/head, so `fork create --pr`
 /// exercises the real fetch path with no network and no gh (the
 /// title lookup fails -> the degraded prompt, deterministically).
 fn add_local_pr_remote(env: &TestEnv, pr_head_msg: &str) -> String {
@@ -741,7 +741,7 @@ fn add_local_pr_remote_gh(env: &TestEnv, pr_head_msg: &str) -> String {
 
 #[test]
 fn fork_pr_review_scaffolds_review_in_the_worktree() {
-    // The shared core behind `fork --pr --review` AND `pr-review
+    // The shared core behind `fork create --pr --review` AND `pr-review
     // start --fork`: worktree on the PR head + review scaffold in
     // the worktree's .clank/, with the slug from the source origin.
     let env = source_with_bound_team();
@@ -987,7 +987,136 @@ fn fork_rejects_an_invalid_draft_name_before_any_mutation() {
     );
 }
 
-// ── fork --clone (fork-clone-option) ─────────────────────────
+// ── fork create --clone (fork-clone-option) ─────────────────────────
+
+fn remove_args(env: &TestEnv, name: &str, force: bool) -> clank::cli::ForkRemoveArgs {
+    clank::cli::ForkRemoveArgs {
+        name: name.into(),
+        force,
+        repo: Some(env.repo().to_path_buf()),
+    }
+}
+
+fn remove(env: &TestEnv, name: &str, force: bool) -> anyhow::Result<()> {
+    block_on(clank::cli::fork::run(clank::cli::ForkArgs {
+        command: clank::cli::ForkCmd::Remove(remove_args(env, name, force)),
+    }))
+}
+
+#[test]
+fn removing_a_clone_whose_history_the_source_has_is_allowed_and_takes_the_branch() {
+    // The asymmetry made concrete: a clone's branch lives INSIDE the
+    // clone, so removal takes it with the directory. That is only safe
+    // because the source can reach every commit on it.
+    let env = source_with_bound_team();
+    let mut args = fork_args(&env, "sandbox");
+    args.clone = true;
+    let dest = block_on(clank::cli::fork::run_fork(&args, Some(env.home()))).unwrap();
+    assert!(dest.exists());
+
+    remove(&env, "sandbox", false).expect("clean clone with no unique history removes");
+    assert!(!dest.exists(), "the clone directory is gone");
+    // And with it the branch: the source never had `sandbox`.
+    let branches = git_out(env.repo(), &["branch", "--list", "sandbox"]);
+    assert!(
+        branches.trim().is_empty(),
+        "a clone's branch does not survive removal: {branches:?}"
+    );
+}
+
+#[test]
+fn a_clone_holding_unique_commits_refuses_removal() {
+    // The history-protection rule. Without it, `remove` would be a
+    // one-command way to destroy work that exists nowhere else.
+    let env = source_with_bound_team();
+    let mut args = fork_args(&env, "sandbox");
+    args.clone = true;
+    let dest = block_on(clank::cli::fork::run_fork(&args, Some(env.home()))).unwrap();
+
+    std::fs::write(dest.join("only-here.txt"), "irreplaceable").unwrap();
+    git(&dest, &["add", "."]);
+    git(
+        &dest,
+        &["commit", "--quiet", "-m", "work the source has never seen"],
+    );
+    let unique_sha = git_out(&dest, &["rev-parse", "HEAD"]).trim().to_string();
+
+    let err = remove(&env, "sandbox", false).expect_err("unique history must refuse");
+    let msg = err.to_string();
+    assert!(msg.contains("cannot reach"), "{msg}");
+    assert!(dest.exists(), "and nothing is deleted");
+    assert_eq!(
+        git_out(&dest, &["rev-parse", "HEAD"]).trim(),
+        unique_sha,
+        "the commit is still there"
+    );
+
+    // --force is the stated escape hatch, and it does destroy them.
+    remove(&env, "sandbox", true).expect("--force overrides the refusal");
+    assert!(!dest.exists());
+}
+
+#[test]
+fn a_stale_tracking_ref_cannot_authorize_deleting_live_history() {
+    // The unsoundness codex caught: asking the CLONE about its own
+    // `refs/remotes` uses refs cached at clone time. Rewind the source
+    // afterwards and those stale refs still claim the source has the
+    // history — authorizing deletion of the last live copy. The check
+    // must ask the SOURCE about its CURRENT refs.
+    let env = source_with_bound_team();
+    let repo = env.repo();
+    git(repo, &["checkout", "-q", "-b", "doomed"]);
+    std::fs::write(repo.join("shared.txt"), "shared work").unwrap();
+    git(repo, &["add", "."]);
+    git(repo, &["commit", "--quiet", "-m", "shared commit"]);
+    let shared = git_out(repo, &["rev-parse", "HEAD"]).trim().to_string();
+    git(repo, &["checkout", "-q", "-"]);
+
+    let mut args = fork_args(&env, "sandbox");
+    args.clone = true;
+    let dest = block_on(clank::cli::fork::run_fork(&args, Some(env.home()))).unwrap();
+    // The clone's branch carries the shared commit...
+    git(&dest, &["reset", "--hard", "--quiet", &shared]);
+    // ...and now the SOURCE loses it, while the clone's cached
+    // remote-tracking ref still points at it.
+    git(repo, &["branch", "-D", "doomed"]);
+
+    let err = remove(&env, "sandbox", false)
+        .expect_err("a stale tracking ref must not authorize deletion");
+    assert!(err.to_string().contains("cannot reach"), "{err}");
+    assert!(dest.exists(), "the last copy of that history survives");
+}
+
+#[test]
+fn a_dirty_clone_refuses_removal() {
+    let env = source_with_bound_team();
+    let mut args = fork_args(&env, "sandbox");
+    args.clone = true;
+    let dest = block_on(clank::cli::fork::run_fork(&args, Some(env.home()))).unwrap();
+    std::fs::write(dest.join("scratch.txt"), "uncommitted").unwrap();
+
+    let err = remove(&env, "sandbox", false).expect_err("dirty state must refuse");
+    assert!(err.to_string().contains("uncommitted"), "{err}");
+    assert!(dest.join("scratch.txt").exists(), "work survives");
+}
+
+#[test]
+fn list_reports_both_kinds() {
+    let env = source_with_bound_team();
+    let mut clone_args = fork_args(&env, "sandbox");
+    clone_args.clone = true;
+    block_on(clank::cli::fork::run_fork(&clone_args, Some(env.home()))).unwrap();
+    block_on(clank::cli::fork::run_fork(
+        &fork_args(&env, "wt"),
+        Some(env.home()),
+    ))
+    .unwrap();
+
+    let forks = clank::cli::fork::list_forks(env.repo()).unwrap();
+    let names: Vec<&str> = forks.iter().map(|(_, n, _)| n.as_str()).collect();
+    assert!(names.contains(&"sandbox"), "clone listed: {names:?}");
+    assert!(names.contains(&"wt"), "worktree listed: {names:?}");
+}
 
 #[test]
 fn fork_clone_creates_independent_repo_and_survives_origin_removal() {
@@ -1215,7 +1344,7 @@ fn fork_clone_failed_checkout_cleans_up_and_can_retry() {
     assert!(err.contains("checkout"), "{err}");
     assert!(!dest.exists(), "partial clone cleaned up");
 
-    // The name is free again: a real `fork --clone retry` works.
+    // The name is free again: a real `fork create --clone retry` works.
     let mut args = fork_args(&env, "retry");
     args.clone = true;
     block_on(clank::cli::fork::run_fork(&args, Some(env.home()))).unwrap();

@@ -1987,6 +1987,62 @@ pub fn diff_tree_name_status(repo: &Path, detect_renames: bool) -> Result<Vec<St
         .collect())
 }
 
+/// The tip sha of `branch` in `repo`, if it exists.
+pub fn branch_tip(repo: &Path, branch: &str) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "--verify", "--quiet", branch])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!sha.is_empty()).then_some(sha)
+}
+
+/// How many commits reachable from `tip` are reachable from NO ref in
+/// `repo` — i.e. would be lost if `tip`'s only other home were
+/// deleted.
+///
+/// Asked of the SOURCE repo against its CURRENT refs. Asking the clone
+/// about its own `refs/remotes` instead is unsound: those are cached
+/// at clone time, so a branch the source has since rewound or purged
+/// still reads as "the source has it" and would authorize deleting the
+/// last live copy of that history (codex on d1729f5).
+///
+/// `Err` when the source cannot answer — including when it does not
+/// have the object at all, which is itself proof the commits are
+/// unique. Callers MUST treat any error as "unique", never as "safe".
+///
+/// Stays `git`: gix has no revwalk-with-boundary equivalent of
+/// `rev-list --not --all` yet.
+pub fn commits_unreachable_from_refs(repo: &Path, tip: &str) -> Result<usize, GitIoError> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-list", "--count", tip, "--not", "--all"])
+        .output()
+        .map_err(|e| GitIoError::Parse {
+            context: "git rev-list".into(),
+            detail: e.to_string(),
+        })?;
+    if !out.status.success() {
+        return Err(GitIoError::Parse {
+            context: "git rev-list".into(),
+            detail: String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        });
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse::<usize>()
+        .map_err(|e| GitIoError::Parse {
+            context: "git rev-list count".into(),
+            detail: e.to_string(),
+        })
+}
+
 /// `git check-ignore -v <rel>`: `Some(rule)` (the first `-v` line — the
 /// matching gitignore source) if git ignores `rel`, else `None`. The
 /// path needn't exist; git matches patterns. `None` on spawn failure.

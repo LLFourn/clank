@@ -1,4 +1,4 @@
-//! `clank fork <name>` — create a linked git worktree and seed it
+//! `clank fork create <name>` — create a linked git worktree and seed it
 //! so the WHOLE TEAM continues there in forked sessions
 //! (plan: clank-fork-worktree-sessions).
 //!
@@ -14,7 +14,7 @@
 //! (clank-open-zellij-context): inside zellij the new tab opens by
 //! default (`--no-open` opts out); outside zellij fork never
 //! auto-spawns. The worktree path is the SOLE stdout line either
-//! way, so `clank open --repo "$(clank fork --no-open x)"`
+//! way, so `clank open --repo "$(clank fork create --no-open x)"`
 //! composes.
 
 use std::path::{Path, PathBuf};
@@ -23,7 +23,7 @@ use anyhow::Context;
 
 use crate::lifecycle::AgentLabel;
 
-use super::ForkArgs;
+use super::{ForkArgs, ForkCreateArgs, resolve_repo};
 
 /// One-shot fork spec consumed by `clank agent start`'s bootstrap
 /// path when the agent has no bound session yet.
@@ -287,6 +287,14 @@ fn should_open(inside_zellij: bool, no_open: bool) -> bool {
 }
 
 pub async fn run(args: ForkArgs) -> anyhow::Result<()> {
+    match args.command {
+        super::ForkCmd::Create(a) => run_create(a).await,
+        super::ForkCmd::List(a) => run_list(a).await,
+        super::ForkCmd::Remove(a) => run_remove(a).await,
+    }
+}
+
+async fn run_create(args: super::ForkCreateArgs) -> anyhow::Result<()> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let dest = run_fork_with_review(&args, home.as_deref()).await?;
     // SOLE stdout line: the worktree path (composition contract).
@@ -308,15 +316,127 @@ pub async fn run(args: ForkArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Every fork of this repo, both kinds, resolved through the same
+/// validated identity the rest of the feature uses.
+pub fn list_forks(repo: &Path) -> anyhow::Result<Vec<(ForkKind, String, PathBuf)>> {
+    let main = main_repo_root(repo)?;
+    let mut out: Vec<(ForkKind, String, PathBuf)> = Vec::new();
+    for path in clone_fork_paths(repo) {
+        if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
+            out.push((ForkKind::Clone, name.to_string(), path.clone()));
+        }
+    }
+    let stdout = crate::git_plumbing::worktree_list_porcelain(repo)?;
+    let main_c = canonical(&main);
+    for (path, branch) in parse_worktrees(&stdout) {
+        if canonical(Path::new(&path)) != main_c {
+            out.push((ForkKind::Worktree, branch.to_string(), PathBuf::from(path)));
+        }
+    }
+    out.sort_by(|a, b| a.1.cmp(&b.1));
+    Ok(out)
+}
+
+async fn run_list(args: super::ForkListArgs) -> anyhow::Result<()> {
+    let repo = resolve_repo(args.repo.as_deref())?;
+    let forks = list_forks(&repo)?;
+    if forks.is_empty() {
+        println!("no forks");
+        return Ok(());
+    }
+    for (kind, name, path) in forks {
+        let k = match kind {
+            ForkKind::Clone => "clone",
+            ForkKind::Worktree => "worktree",
+        };
+        println!("{name}\t{k}\t{}", path.display());
+    }
+    Ok(())
+}
+
+/// Remove a fork's worktree or clone.
+///
+/// The only destructive verb here, so it is deliberately narrower than
+/// the teardown advice it replaces. It resolves ONLY through
+/// [`resolve_fork`] — never a path — so a squatter directory, a
+/// foreign worktree or a stale descriptor resolves to nothing and is
+/// refused rather than deleted.
+///
+/// Branch retention is NOT symmetric, and the difference is why the
+/// unreachable-commit check exists. A worktree fork's branch lives in
+/// the SOURCE ref store, so removing the worktree keeps it. A clone
+/// fork's branch is created inside the clone
+/// (`git_plumbing::clone_local`), so deleting the directory destroys
+/// that ref — which is safe only when the source can already reach
+/// every commit on it.
+async fn run_remove(args: super::ForkRemoveArgs) -> anyhow::Result<()> {
+    let repo = resolve_repo(args.repo.as_deref())?;
+    let name = args.name.as_str();
+    let Some((kind, path)) = resolve_fork(&repo, name)? else {
+        anyhow::bail!(
+            "no fork `{name}` in this repo — `clank fork list` shows what there is. \
+             (A directory that is not a descriptor-validated fork is never removed.)"
+        );
+    };
+
+    if !args.force {
+        if !crate::git_io::working_tree_clean(&path)? {
+            anyhow::bail!(
+                "`{name}` has uncommitted changes or untracked files at {} — \
+                 commit, discard, or re-run with --force",
+                path.display()
+            );
+        }
+        if kind == ForkKind::Clone {
+            // A clone's branch dies with the directory, so unique
+            // commits would be destroyed. Ask the SOURCE about its
+            // CURRENT refs — the clone's own `refs/remotes` are cached
+            // at clone time, so a branch the source has since rewound
+            // would read as safe and authorize destroying the last
+            // copy. Any failure to ANSWER counts as unique: never
+            // delete on a question we could not resolve.
+            let main = main_repo_root(&repo)?;
+            let unique = crate::git_io::branch_tip(&path, name)
+                .map(|tip| crate::git_io::commits_unreachable_from_refs(&main, &tip).unwrap_or(1))
+                .unwrap_or(1);
+            if unique > 0 {
+                anyhow::bail!(
+                    "clone `{name}` holds {unique} commit(s) the source cannot reach, and its \
+                     branch exists ONLY inside the clone — removing it would destroy them. \
+                     Push or cherry-pick them first, or re-run with --force to lose them."
+                );
+            }
+        }
+    }
+
+    match kind {
+        ForkKind::Worktree => {
+            crate::git_plumbing::worktree_remove(&repo, &path, args.force)?;
+            println!("removed worktree fork `{name}` ({})", path.display());
+            println!("  branch `{name}` kept — `git branch -D {name}` to drop it too");
+        }
+        ForkKind::Clone => {
+            std::fs::remove_dir_all(&path)
+                .with_context(|| format!("removing clone at {}", path.display()))?;
+            println!("removed clone fork `{name}` ({})", path.display());
+            println!("  its branch `{name}` lived inside the clone and is gone with it");
+        }
+    }
+    Ok(())
+}
+
 /// `run_fork` plus, when `--review` is set, scaffolding the PR
 /// review in the new worktree. The SINGLE implementation behind both
-/// `clank fork --pr --review` and `clank pr-review start --fork`, so
+/// `clank fork create --pr --review` and `clank pr-review start --fork`, so
 /// the two doorways can't diverge. Returns the worktree path.
 ///
 /// The review scaffold lands in the worktree's gitignored `.clank/`
 /// (where the forked team's wait surface reads it); the slug comes
 /// from the SOURCE repo's origin, not the worktree cwd.
-pub async fn run_fork_with_review(args: &ForkArgs, home: Option<&Path>) -> anyhow::Result<PathBuf> {
+pub async fn run_fork_with_review(
+    args: &ForkCreateArgs,
+    home: Option<&Path>,
+) -> anyhow::Result<PathBuf> {
     // Resolve the review precondition (PR + a parseable origin slug)
     // BEFORE creating the worktree — fail-closed, so an unparseable
     // origin doesn't leave a half-made worktree behind (codex
@@ -347,7 +467,7 @@ pub async fn run_fork_with_review(args: &ForkArgs, home: Option<&Path>) -> anyho
 /// user-scope config. Everything before the `git worktree add` is
 /// read-only validation (fail-closed: no mutation until all
 /// checks pass).
-pub async fn run_fork(args: &ForkArgs, home: Option<&Path>) -> anyhow::Result<PathBuf> {
+pub async fn run_fork(args: &ForkCreateArgs, home: Option<&Path>) -> anyhow::Result<PathBuf> {
     Ok(run_fork_pinned(args, home).await?.0)
 }
 
@@ -356,7 +476,7 @@ pub async fn run_fork(args: &ForkArgs, home: Option<&Path>) -> anyhow::Result<Pa
 /// state to the SAME commit the worktree is based on without a
 /// second fetch (ruthless b88ae34).
 pub async fn run_fork_pinned(
-    args: &ForkArgs,
+    args: &ForkCreateArgs,
     home: Option<&Path>,
 ) -> anyhow::Result<(PathBuf, Option<String>)> {
     let name = derived_name(args.name.as_deref(), args.pr)?;
@@ -600,7 +720,7 @@ pub async fn run_fork_pinned(
         });
     }
     // STDERR, never stdout: the worktree path is the sole stdout line
-    // so `clank open --repo "$(clank fork --no-open x)"` composes.
+    // so `clank open --repo "$(clank fork create --no-open x)"` composes.
     let seed_report = summarize_seeds(&classified, &source);
     for line in &seed_report.warnings {
         eprintln!("{line}");
@@ -627,7 +747,7 @@ pub async fn run_fork_pinned(
     // ── Network + mutation side of the fail-closed line ──
     // The PR fetch (and the best-effort gh title lookup) are side
     // effects, so they sit AFTER every precondition (ruthless
-    // 91ecaf2 edge 1): `fork --pr` against a repo with an unbound
+    // 91ecaf2 edge 1): `fork create --pr` against a repo with an unbound
     // session bails before touching the network.
     let pinned_pr_base: Option<String> = match args.pr {
         Some(pr) => Some(fetch_pr_head(&source, pr)?),
@@ -1044,7 +1164,7 @@ mod tests {
         #[derive(Parser)]
         struct T {
             #[command(flatten)]
-            f: super::super::ForkArgs,
+            f: super::super::ForkCreateArgs,
         }
         // --pr alone: ok, name optional.
         assert!(T::try_parse_from(["t", "--pr", "123"]).is_ok());
@@ -1152,8 +1272,8 @@ detached
         dir
     }
 
-    fn fork_args(name: &str, source: &Path) -> ForkArgs {
-        ForkArgs {
+    fn fork_args(name: &str, source: &Path) -> ForkCreateArgs {
+        ForkCreateArgs {
             name: Some(name.to_string()),
             source: Some(source.to_path_buf()),
             pr: None,
@@ -1301,6 +1421,110 @@ detached
         let r = summarize_seeds(&members, Path::new("/src/repo"));
         assert_eq!((r.to_fork, r.fresh), (2, 0));
         assert!(r.warnings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn remove_refuses_a_name_that_is_not_a_fork() {
+        // Resolution is by validated fork identity, never a path, so a
+        // typo or a squatter directory can never delete anything.
+        let dir = init_repo_with_commit();
+        let repo = dir.path();
+        let squatter = repo.join(".clank/worktrees/ghost");
+        std::fs::create_dir_all(&squatter).unwrap();
+        std::fs::write(squatter.join("work.txt"), "precious").unwrap();
+
+        let err = run_remove(super::super::ForkRemoveArgs {
+            name: "ghost".into(),
+            force: false,
+            repo: Some(repo.to_path_buf()),
+        })
+        .await
+        .expect_err("a directory that is not a validated fork must not be removed");
+        assert!(err.to_string().contains("no fork"), "{err}");
+        assert!(
+            squatter.join("work.txt").exists(),
+            "and nothing of it is touched"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_refuses_a_dirty_worktree_fork() {
+        let dir = init_repo_with_commit();
+        let repo = dir.path();
+        let dest = repo.join(".clank/worktrees/wt");
+        git(
+            repo,
+            &["worktree", "add", "-b", "wt", dest.to_str().unwrap()],
+        );
+        std::fs::write(dest.join("scratch.txt"), "uncommitted").unwrap();
+
+        let err = run_remove(super::super::ForkRemoveArgs {
+            name: "wt".into(),
+            force: false,
+            repo: Some(repo.to_path_buf()),
+        })
+        .await
+        .expect_err("dirty state must refuse");
+        assert!(err.to_string().contains("uncommitted"), "{err}");
+        assert!(
+            dest.join("scratch.txt").exists(),
+            "work survives the refusal"
+        );
+    }
+
+    #[tokio::test]
+    async fn removing_a_clean_worktree_fork_keeps_its_branch() {
+        // The asymmetry, asserted: a worktree fork's branch lives in
+        // the SOURCE ref store, so it outlives the worktree.
+        let dir = init_repo_with_commit();
+        let repo = dir.path();
+        let dest = repo.join(".clank/worktrees/wt");
+        git(
+            repo,
+            &["worktree", "add", "-b", "wt", dest.to_str().unwrap()],
+        );
+
+        run_remove(super::super::ForkRemoveArgs {
+            name: "wt".into(),
+            force: false,
+            repo: Some(repo.to_path_buf()),
+        })
+        .await
+        .expect("a clean worktree fork removes");
+
+        assert!(!dest.exists(), "the worktree directory is gone");
+        let branches = crate::git_plumbing::worktree_list_porcelain(repo).unwrap();
+        assert!(!branches.contains("worktrees/wt"), "and is deregistered");
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["branch", "--list", "wt"])
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("wt"),
+            "the BRANCH survives — it lives in the source, not the worktree"
+        );
+    }
+
+    #[test]
+    fn list_reports_both_kinds_and_is_empty_without_forks() {
+        let dir = init_repo_with_commit();
+        let repo = dir.path();
+        assert!(
+            list_forks(repo).unwrap().is_empty(),
+            "a repo with no forks lists nothing — not an error"
+        );
+
+        let dest = repo.join(".clank/worktrees/wt");
+        git(
+            repo,
+            &["worktree", "add", "-b", "wt", dest.to_str().unwrap()],
+        );
+        let forks = list_forks(repo).unwrap();
+        assert_eq!(forks.len(), 1);
+        assert_eq!(forks[0].1, "wt");
+        assert_eq!(forks[0].0, ForkKind::Worktree);
     }
 
     #[tokio::test]

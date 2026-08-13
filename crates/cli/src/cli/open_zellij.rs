@@ -57,7 +57,7 @@ pub async fn run(args: OpenZellijArgs) -> anyhow::Result<()> {
 fn fork_path(source: &Path, name: &str) -> anyhow::Result<PathBuf> {
     match crate::cli::fork::resolve_fork(source, name)? {
         Some((_, p)) => Ok(p),
-        None => anyhow::bail!("no fork `{name}` — create it with `clank fork {name}`"),
+        None => anyhow::bail!("no fork `{name}` — create it with `clank fork create {name}`"),
     }
 }
 

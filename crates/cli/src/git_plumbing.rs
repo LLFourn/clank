@@ -455,6 +455,32 @@ pub fn worktree_add(source: &Path, name: &str, dest: &Path, base: &str) -> anyho
 /// Raw `git worktree list --porcelain` stdout — callers parse the
 /// `worktree <path>` lines. gix's linked-worktree enumeration is
 /// insufficient, so this stays git.
+/// `git worktree remove` — deletes the worktree directory and
+/// deregisters it, KEEPING the branch (which lives in the source ref
+/// store). gix cannot manage linked worktrees, so this stays git.
+///
+/// git refuses a dirty worktree on its own; `force` passes that
+/// through, so callers get git's guard for free even when their own
+/// checks are bypassed.
+pub fn worktree_remove(repo: &Path, path: &Path, force: bool) -> anyhow::Result<()> {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(repo).args(["worktree", "remove"]);
+    if force {
+        cmd.arg("--force");
+    }
+    let out = cmd
+        .arg(path)
+        .output()
+        .context("spawning git worktree remove")?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "git worktree remove failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
 pub fn worktree_list_porcelain(repo: &Path) -> anyhow::Result<String> {
     let out = Command::new("git")
         .arg("-C")

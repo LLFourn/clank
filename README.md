@@ -179,7 +179,7 @@ user-global default (`~/.clank/config.json`'s `"auto"`) when unset —
     When any of that is missing the source falls back to polling with
     one diagnostic naming the reason — nothing is lost, wakes are
     just poll-speed.
-  - The rest of clank's GitHub surface (`pr-review`, `fork --pr`)
+  - The rest of clank's GitHub surface (`pr-review`, `fork create --pr`)
     still shells `gh` directly.
 
   Every ingested github event lands in a per-agent **inbox**
