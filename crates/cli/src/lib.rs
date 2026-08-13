@@ -4,6 +4,7 @@ pub mod disk_snapshot;
 pub mod lifecycle;
 pub mod rebuild;
 pub mod repo_state;
+pub mod session_probe;
 
 // IO + runtime layers.
 pub mod agent_env;

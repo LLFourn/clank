@@ -52,6 +52,35 @@ fn bind_session(env: &TestEnv, label: &str, tool: clank_core::vocab::Tool, id: &
         wait_events: Vec::new(),
     };
     clank::agent_store::save_agent_config(env.repo(), &l, &cfg).unwrap();
+    write_transcript(env.home(), tool, id);
+}
+
+/// Create the session's transcript under the fixture HOME, in the
+/// tool's real store layout.
+///
+/// `fork` now refuses to `--resume` a transcript that is gone
+/// (fork-stale-binding-launches-fresh), so a test that binds a session
+/// and expects it to FORK must give that session a transcript.
+/// Without this, "bound" would mean "dangling" and every such test
+/// would be asserting the fresh-fallback path by accident.
+fn write_transcript(home: &std::path::Path, tool: clank_core::vocab::Tool, id: &str) {
+    use clank_core::vocab::Tool;
+    match tool {
+        Tool::Claude => {
+            let d = home.join(".claude/projects/fixture");
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join(format!("{id}.jsonl")), "{}\n").unwrap();
+        }
+        Tool::Codex => {
+            let d = home.join(".codex/sessions/2026/06/10");
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join(format!("rollout-{id}.jsonl")), "{}\n").unwrap();
+        }
+        Tool::Grok => {
+            std::fs::create_dir_all(home.join(".grok/sessions/fixture").join(id)).unwrap();
+        }
+        Tool::OpenCode => {}
+    }
 }
 
 /// Source repo: claude master + codex commit reviewer, both with
@@ -296,6 +325,72 @@ fn fork_from_worktree_lands_sibling_under_main_not_nested() {
         1,
         "exactly one worktrees segment (no nesting): {}",
         c.display()
+    );
+}
+
+#[test]
+fn a_dangling_binding_is_seeded_fresh_not_resumed() {
+    // End to end, on the artefact that actually reaches launch: a
+    // member bound to a session whose transcript is GONE must get a
+    // fresh spec. Carrying the dead id makes the agent exit at launch
+    // with no pane and no error, and the fork's gate then waits
+    // forever on a reviewer that never started — a stale binding is
+    // strictly worse than no binding.
+    //
+    // Lives here rather than in the lib tests on purpose: driving
+    // `run_fork` spawns `git`, and a forked child briefly inherits
+    // open descriptors, which can hold an `flock` alive and break the
+    // lease tests running concurrently inside the lib test binary.
+    let env = TestEnv::init();
+    env.register_team("claude", &["codex"], &[]);
+    let repo = env.repo();
+    write(repo, "src/lib.rs", "// base\n");
+    commit(repo, "[misc] base");
+
+    bind_session(
+        &env,
+        "claude",
+        clank_core::vocab::Tool::Claude,
+        "11111111-1111-1111-1111-111111111111",
+    );
+    bind_session(
+        &env,
+        "codex",
+        clank_core::vocab::Tool::Codex,
+        "22222222-2222-2222-2222-222222222222",
+    );
+    // codex's transcript disappears after the bind — the exact state
+    // that reached `--resume` before this fix.
+    std::fs::remove_dir_all(env.home().join(".codex")).unwrap();
+
+    let dest = block_on(clank::cli::fork::run_fork(
+        &fork_args(&env, "x"),
+        Some(env.home()),
+    ))
+    .unwrap();
+    let spec_of = |label: &str| -> serde_json::Value {
+        serde_json::from_str(
+            &std::fs::read_to_string(dest.join(format!(".clank/agents/{label}/fork.json")))
+                .unwrap(),
+        )
+        .unwrap()
+    };
+
+    let codex = spec_of("codex");
+    assert!(
+        codex["from_session"].is_null(),
+        "a dead session must not reach the spec: {codex}"
+    );
+    assert!(
+        codex["prompt"].as_str().unwrap().contains("worktree `x`"),
+        "the fresh session still carries the orientation: {codex}"
+    );
+    // The live member is untouched — the fix must not disable session
+    // forking wholesale.
+    let claude = spec_of("claude");
+    assert!(
+        claude["from_session"].as_str().unwrap().starts_with("1111"),
+        "a live binding still forks its session: {claude}"
     );
 }
 

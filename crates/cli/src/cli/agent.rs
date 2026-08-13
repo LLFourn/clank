@@ -222,7 +222,11 @@ fn start(args: AgentStartArgs) -> anyhow::Result<()> {
             match spec {
                 Some(spec) => {
                     let tool = spec.tool;
-                    (compose_fork_launch(&spec, &desc, &repo), tool)
+                    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+                    (
+                        compose_fork_launch(&spec, &desc, &repo, home.as_deref()),
+                        tool,
+                    )
                 }
                 None => (compose_bootstrap_launch(&label, &desc)?, desc.tool),
             }
@@ -410,6 +414,7 @@ fn compose_fork_launch(
     spec: &crate::cli::fork::ForkSpec,
     desc: &AgentDescription,
     worktree: &Path,
+    home: Option<&Path>,
 ) -> ComposedLaunch {
     let program = desc
         .launch
@@ -421,7 +426,29 @@ fn compose_fork_launch(
         .as_ref()
         .map(|l| l.args.clone())
         .unwrap_or_default();
-    match (&spec.from_session, spec.tool) {
+    // Boundary TWO. The seed was validated when the fork was built,
+    // but a transcript can be deleted in between, and `--resume` on a
+    // dead one exits immediately with no pane and no error. Re-probe
+    // here so the guarantee holds at the moment it matters. `None`
+    // (unprobeable) still resumes — it is not evidence of absence.
+    let live = match &spec.from_session {
+        Some(sid) => {
+            crate::session_probe::session_jsonl_exists(&spec.tool, sid, home) != Some(false)
+        }
+        None => true,
+    };
+    let from_session = if live {
+        spec.from_session.clone()
+    } else {
+        None
+    };
+    if !live {
+        eprintln!(
+            "warning: forked session is gone — starting a fresh session with the \
+             fork's orientation prompt"
+        );
+    }
+    match (&from_session, spec.tool) {
         (Some(sid), Tool::Claude) => {
             args.push("--resume".into());
             args.push(sid.clone());
@@ -1817,7 +1844,7 @@ mod tests {
             from_session: Some("ses_039d60658ffe0RPgue3noZ0Qqf".into()),
             prompt: "orient".into(),
         };
-        let c = compose_fork_launch(&spec, &desc, Path::new("/repo/.clank/worktrees/x"));
+        let c = compose_fork_launch(&spec, &desc, Path::new("/repo/.clank/worktrees/x"), None);
         assert_eq!(c.program, "opencode");
         assert_eq!(
             c.args,
@@ -2103,6 +2130,32 @@ mod tests {
         assert_eq!(c.args.len(), 2, "trust + bind prompt only");
     }
 
+    /// A fixture HOME in which `sid` IS resumable for `tool`, so a
+    /// test can assert the resume argv without depending on the real
+    /// `$HOME`. Mirrors each tool's real store layout — the probe
+    /// walks these paths for real.
+    fn home_with_session(tool: Tool, sid: &str) -> tempfile::TempDir {
+        let home = tempfile::tempdir().unwrap();
+        let h = home.path();
+        match tool {
+            Tool::Claude => {
+                let d = h.join(".claude/projects/some-project");
+                std::fs::create_dir_all(&d).unwrap();
+                std::fs::write(d.join(format!("{sid}.jsonl")), "{}\n").unwrap();
+            }
+            Tool::Codex => {
+                let d = h.join(".codex/sessions/2026/08/13");
+                std::fs::create_dir_all(&d).unwrap();
+                std::fs::write(d.join(format!("rollout-{sid}.jsonl")), "{}\n").unwrap();
+            }
+            Tool::Grok => {
+                std::fs::create_dir_all(h.join(".grok/sessions/cwd-group").join(sid)).unwrap();
+            }
+            Tool::OpenCode => {}
+        }
+        home
+    }
+
     #[test]
     fn grok_fork_resumes_and_branches_with_trust() {
         // grok-first-class: fork = --resume <sid> --fork-session (grok
@@ -2120,7 +2173,8 @@ mod tests {
             from_session: Some("cccccccc-1111-2222-3333-444444444444".into()),
             prompt: "orient".into(),
         };
-        let c = compose_fork_launch(&spec, &desc, wt);
+        let home = home_with_session(Tool::Grok, "cccccccc-1111-2222-3333-444444444444");
+        let c = compose_fork_launch(&spec, &desc, wt, Some(home.path()));
         assert_eq!(c.program, "grok");
         assert_eq!(
             c.args,
@@ -2138,7 +2192,7 @@ mod tests {
             from_session: None,
             prompt: "orient".into(),
         };
-        let c = compose_fork_launch(&spec, &desc, wt);
+        let c = compose_fork_launch(&spec, &desc, wt, None);
         assert_eq!(c.args, vec!["--trust", "orient"]);
     }
 
@@ -2158,7 +2212,7 @@ mod tests {
             prompt: "You are `claude` in worktree `x`…".into(),
         };
         let wt = std::path::Path::new("/repo/.clank/worktrees/x");
-        let c = compose_fork_launch(&spec, &desc, wt);
+        let c = compose_fork_launch(&spec, &desc, wt, None);
         assert_eq!(c.program, "claude");
         assert_eq!(c.args, vec!["You are `claude` in worktree `x`…"]);
 
@@ -2172,12 +2226,76 @@ mod tests {
             launch: None,
             initial_prompt: None,
         };
-        let c = compose_fork_launch(&spec, &desc, wt);
+        let c = compose_fork_launch(&spec, &desc, wt, None);
         assert_eq!(c.program, "codex");
         assert_eq!(
             c.args,
             vec!["orient"],
             "no fork/-C argv without a source session"
+        );
+    }
+
+    #[test]
+    fn fork_launch_falls_back_fresh_when_the_transcript_vanished() {
+        // Boundary TWO: the seed was validated when the fork was
+        // built, but the transcript can be deleted before the pane
+        // launches. `--resume` on a dead id exits immediately with no
+        // pane and no error, so the fork's gate would wait forever on
+        // a reviewer that never started.
+        let wt = std::path::Path::new("/repo/.clank/worktrees/x");
+        let empty = tempfile::tempdir().unwrap();
+        for tool in [Tool::Claude, Tool::Codex, Tool::Grok] {
+            let desc = AgentDescription {
+                tool,
+                launch: None,
+                initial_prompt: None,
+            };
+            let spec = crate::cli::fork::ForkSpec {
+                tool,
+                from_session: Some("gone-999".into()),
+                prompt: "orient".into(),
+            };
+            let c = compose_fork_launch(&spec, &desc, wt, Some(empty.path()));
+            assert!(
+                !c.args.iter().any(|a| a == "--resume" || a == "fork"),
+                "{tool:?} must not resume a transcript that is gone: {:?}",
+                c.args
+            );
+            assert!(
+                c.args.iter().any(|a| a == "orient"),
+                "{tool:?} fresh launch still carries the orientation prompt: {:?}",
+                c.args
+            );
+        }
+    }
+
+    #[test]
+    fn fork_launch_still_resumes_when_the_store_cannot_be_probed() {
+        // opencode's store is unprobeable, so the probe answers None
+        // — "cannot tell", never "gone". Treating it as gone would
+        // silently discard LIVE sessions, which is a worse bug than
+        // the one being fixed.
+        let desc = AgentDescription {
+            tool: Tool::OpenCode,
+            launch: None,
+            initial_prompt: None,
+        };
+        let spec = crate::cli::fork::ForkSpec {
+            tool: Tool::OpenCode,
+            from_session: Some("ses_0af1b2c3d4e5f607".into()),
+            prompt: "orient".into(),
+        };
+        let empty = tempfile::tempdir().unwrap();
+        let c = compose_fork_launch(
+            &spec,
+            &desc,
+            std::path::Path::new("/repo/.clank/worktrees/x"),
+            Some(empty.path()),
+        );
+        assert!(
+            c.args.iter().any(|a| a == "--session"),
+            "unprobeable must still resume: {:?}",
+            c.args
         );
     }
 
@@ -2199,7 +2317,8 @@ mod tests {
             prompt: "You are `claude` in worktree `x`…".into(),
         };
         let wt = std::path::Path::new("/repo/.clank/worktrees/x");
-        let c = compose_fork_launch(&spec, &desc, wt);
+        let home = home_with_session(Tool::Claude, "abc-123");
+        let c = compose_fork_launch(&spec, &desc, wt, Some(home.path()));
         assert_eq!(c.program, "claude");
         // claude takes cwd from the pane — no -C.
         assert_eq!(
@@ -2222,7 +2341,8 @@ mod tests {
             from_session: Some("def-456".into()),
             prompt: "orient".into(),
         };
-        let c = compose_fork_launch(&spec, &desc, wt);
+        let codex_home = home_with_session(Tool::Codex, "def-456");
+        let c = compose_fork_launch(&spec, &desc, wt, Some(codex_home.path()));
         assert_eq!(c.program, "codex");
         // codex gets -C <worktree> so it doesn't prompt for the cwd
         // (fork-codex-cd-flag).

@@ -42,6 +42,101 @@ pub struct ForkSpec {
     pub prompt: String,
 }
 
+/// Why a member's fork spec carries a source session or not.
+///
+/// The seed's normalized `from_session` is the single source of truth
+/// for what gets persisted; this records WHY it ended up that way, so
+/// the caller warnings and the summary counts are derived from the
+/// same decision instead of from side lists assembled before the
+/// staleness probe ran. Keeping those separate is what let a
+/// stale-only fork warn about a stale binding and then report "1
+/// session to fork, 0 fresh" while persisting a fresh spec.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SeedSource {
+    /// A live binding: the session forks.
+    Resume,
+    /// The source repo had no bound session for this member.
+    FreshNoBinding,
+    /// A binding existed, but its transcript is gone. Carries the dead
+    /// id so the caller can see which session was abandoned.
+    FreshStale { dead: String },
+}
+
+/// Decide what a member's fork spec carries, given the source binding.
+///
+/// Pure apart from the transcript probe, and deliberately free of git:
+/// classification is not about worktrees, so testing it must not spawn
+/// `git`. A child process briefly inherits open descriptors, and an
+/// inherited fd holding an `flock` keeps that lock alive until the
+/// child execs — which broke unrelated lease tests running
+/// concurrently in the same test binary.
+pub(crate) fn classify_binding(
+    tool: clank_core::vocab::Tool,
+    bound: Option<String>,
+    home: Option<&Path>,
+) -> (Option<String>, SeedSource) {
+    match bound {
+        None => (None, SeedSource::FreshNoBinding),
+        Some(sid) => {
+            if crate::session_probe::session_jsonl_exists(&tool, &sid, home) == Some(false) {
+                (None, SeedSource::FreshStale { dead: sid })
+            } else {
+                (Some(sid.clone()), SeedSource::Resume)
+            }
+        }
+    }
+}
+
+/// What the caller is told about a fork's session seeding: the counts
+/// AND the warning lines, both derived from the same classification so
+/// they cannot disagree. Pure — the seam that makes the caller-facing
+/// report testable without spawning anything.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct SeedReport {
+    pub to_fork: usize,
+    pub fresh: usize,
+    pub warnings: Vec<String>,
+}
+
+pub(crate) fn summarize_seeds(members: &[(String, SeedSource)], source: &Path) -> SeedReport {
+    let no_binding: Vec<&str> = members
+        .iter()
+        .filter(|(_, s)| *s == SeedSource::FreshNoBinding)
+        .map(|(l, _)| l.as_str())
+        .collect();
+    let stale: Vec<String> = members
+        .iter()
+        .filter_map(|(l, s)| match s {
+            SeedSource::FreshStale { dead } => Some(format!("{l} ({dead})")),
+            _ => None,
+        })
+        .collect();
+    let mut warnings = Vec::new();
+    if !no_binding.is_empty() {
+        warnings.push(format!(
+            "warning: no bound session in {} for: {} — fresh session(s) will be created on launch",
+            source.display(),
+            no_binding.join(", ")
+        ));
+    }
+    if !stale.is_empty() {
+        warnings.push(format!(
+            "warning: bound session no longer exists for: {} — fresh session(s) will be created \
+             on launch",
+            stale.join(", ")
+        ));
+    }
+    let to_fork = members
+        .iter()
+        .filter(|(_, s)| *s == SeedSource::Resume)
+        .count();
+    SeedReport {
+        to_fork,
+        fresh: members.len() - to_fork,
+        warnings,
+    }
+}
+
 /// The durable identity record of a `--clone` fork, at
 /// `<dest>/.clank/fork.json` (gitignored via the inherited
 /// `.clank/.gitignore` allow-list). Every lifecycle decision —
@@ -483,16 +578,20 @@ pub async fn run_fork_pinned(
         cfg: Option<clank_core::agent_config::AgentConfig>,
     }
     let mut seeds: Vec<MemberSeed> = Vec::new();
-    let mut fresh: Vec<String> = Vec::new();
+    let mut classified: Vec<(String, SeedSource)> = Vec::new();
     for (label, agent) in &fork_roster {
         let cfg = crate::agent_store::load_agent_config(&source, label)?;
-        let (tool, from_session) = match cfg.as_ref().and_then(|c| c.session.as_ref()) {
+        let (tool, bound) = match cfg.as_ref().and_then(|c| c.session.as_ref()) {
             Some(session) => (session.tool, Some(session.id.as_str().to_string())),
-            None => {
-                fresh.push(label.as_str().to_string());
-                (agent.tool, None)
-            }
+            None => (agent.tool, None),
         };
+        // A DANGLING binding is worse than none: `--resume` on a
+        // deleted transcript exits the agent at launch with no pane,
+        // no transcript and no error, and the fork's gate then waits
+        // forever on a reviewer that never started. One decision
+        // drives the spec, the warnings and the counts.
+        let (from_session, source_kind) = classify_binding(tool, bound, home);
+        classified.push((label.as_str().to_string(), source_kind));
         seeds.push(MemberSeed {
             label: label.clone(),
             tool,
@@ -500,13 +599,11 @@ pub async fn run_fork_pinned(
             cfg,
         });
     }
-    if !fresh.is_empty() {
-        eprintln!(
-            "warning: no bound session in {} for: {} — fresh session(s) will be \
-             created on launch",
-            source.display(),
-            fresh.join(", ")
-        );
+    // STDERR, never stdout: the worktree path is the sole stdout line
+    // so `clank open --repo "$(clank fork --no-open x)"` composes.
+    let seed_report = summarize_seeds(&classified, &source);
+    for line in &seed_report.warnings {
+        eprintln!("{line}");
     }
 
     // Draft precondition (fork-draft-seeding): every named draft must
@@ -658,8 +755,8 @@ pub async fn run_fork_pinned(
         "forked `{name}`: {} at {} (branch `{name}` off {base}, {} sessions to fork, {} fresh)",
         if args.clone { "clone" } else { "worktree" },
         dest.display(),
-        seeds.len() - fresh.len(),
-        fresh.len(),
+        seed_report.to_fork,
+        seed_report.fresh,
     );
     if args.clone {
         // A clone is an independent repo: plain deletion, NEVER
@@ -1069,6 +1166,141 @@ detached
             no_open: true,
             review: false,
         }
+    }
+
+    /// A HOME in which `sid` IS resumable for claude.
+    fn home_with_claude_session(sid: &str) -> tempfile::TempDir {
+        let home = tempfile::tempdir().unwrap();
+        let projects = home.path().join(".claude/projects/p");
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::write(projects.join(format!("{sid}.jsonl")), "{}\n").unwrap();
+        home
+    }
+
+    #[test]
+    fn a_dangling_binding_never_reaches_the_spec() {
+        // A stale binding is strictly WORSE than no binding: with none
+        // the fork launches a working fresh session, with a dangling
+        // one `--resume` exits at launch leaving no pane and no error,
+        // and the gate then waits forever on a reviewer that never
+        // started. The dead id must not survive classification.
+        let empty_home = tempfile::tempdir().unwrap();
+        let (from_session, kind) = classify_binding(
+            clank_core::vocab::Tool::Claude,
+            Some("dddddddd-1111-2222-3333-444444444444".into()),
+            Some(empty_home.path()),
+        );
+        assert_eq!(from_session, None, "the dead id is dropped, not carried");
+        assert_eq!(
+            kind,
+            SeedSource::FreshStale {
+                dead: "dddddddd-1111-2222-3333-444444444444".into()
+            },
+            "and the reason is recorded so the caller can be told which session died"
+        );
+    }
+
+    #[test]
+    fn a_live_binding_is_kept_for_the_spec() {
+        // The guard against "fixing" the bug by disabling session
+        // forking outright.
+        let sid = "11111111-2222-3333-4444-555555555555";
+        let home = home_with_claude_session(sid);
+        let (from_session, kind) = classify_binding(
+            clank_core::vocab::Tool::Claude,
+            Some(sid.into()),
+            Some(home.path()),
+        );
+        assert_eq!(from_session.as_deref(), Some(sid));
+        assert_eq!(kind, SeedSource::Resume);
+    }
+
+    #[test]
+    fn an_unprobeable_store_is_kept_not_discarded() {
+        // opencode cannot be probed, so the answer is "cannot tell",
+        // never "gone". Treating unknown as stale would silently throw
+        // away LIVE sessions — worse than the bug being fixed.
+        let empty_home = tempfile::tempdir().unwrap();
+        let (from_session, kind) = classify_binding(
+            clank_core::vocab::Tool::OpenCode,
+            Some("ses_0af1b2c3d4e5f607".into()),
+            Some(empty_home.path()),
+        );
+        assert_eq!(from_session.as_deref(), Some("ses_0af1b2c3d4e5f607"));
+        assert_eq!(kind, SeedSource::Resume);
+    }
+
+    #[test]
+    fn no_binding_classifies_as_fresh_without_probing() {
+        let empty_home = tempfile::tempdir().unwrap();
+        let (from_session, kind) = classify_binding(
+            clank_core::vocab::Tool::Claude,
+            None,
+            Some(empty_home.path()),
+        );
+        assert_eq!(from_session, None);
+        assert_eq!(kind, SeedSource::FreshNoBinding);
+    }
+
+    #[test]
+    fn a_stale_only_fork_reports_it_as_fresh_not_as_forked() {
+        // The regression codex caught: the counts were computed from a
+        // side list built BEFORE the staleness probe, so a stale-only
+        // fork warned about the stale binding and then claimed "1
+        // session to fork, 0 fresh" while persisting a fresh spec.
+        // Counts and warnings must both follow the normalized state.
+        let members = vec![(
+            "claude".to_string(),
+            SeedSource::FreshStale {
+                dead: "dddddddd-1111-2222-3333-444444444444".into(),
+            },
+        )];
+        let r = summarize_seeds(&members, Path::new("/src/repo"));
+        assert_eq!(r.to_fork, 0, "a stale binding forks NO session");
+        assert_eq!(r.fresh, 1);
+        assert_eq!(r.warnings.len(), 1);
+        assert!(
+            r.warnings[0].contains("claude")
+                && r.warnings[0].contains("dddddddd-1111-2222-3333-444444444444"),
+            "the caller is told which member and which dead id: {:?}",
+            r.warnings
+        );
+    }
+
+    #[test]
+    fn seed_report_separates_the_two_fresh_reasons() {
+        // "no binding" and "binding is gone" are different facts for
+        // the human: the second means a session was abandoned.
+        let members = vec![
+            ("a".to_string(), SeedSource::Resume),
+            ("b".to_string(), SeedSource::FreshNoBinding),
+            (
+                "c".to_string(),
+                SeedSource::FreshStale {
+                    dead: "sid-c".into(),
+                },
+            ),
+        ];
+        let r = summarize_seeds(&members, Path::new("/src/repo"));
+        assert_eq!((r.to_fork, r.fresh), (1, 2));
+        assert_eq!(r.warnings.len(), 2, "one line per reason: {:?}", r.warnings);
+        assert!(r.warnings[0].contains("no bound session") && r.warnings[0].contains("b"));
+        assert!(r.warnings[1].contains("no longer exists") && r.warnings[1].contains("c (sid-c)"));
+        assert!(
+            !r.warnings[0].contains("sid-c"),
+            "the no-binding line must not name a dead id"
+        );
+    }
+
+    #[test]
+    fn an_all_live_fork_warns_about_nothing() {
+        let members = vec![
+            ("a".to_string(), SeedSource::Resume),
+            ("b".to_string(), SeedSource::Resume),
+        ];
+        let r = summarize_seeds(&members, Path::new("/src/repo"));
+        assert_eq!((r.to_fork, r.fresh), (2, 0));
+        assert!(r.warnings.is_empty());
     }
 
     #[tokio::test]

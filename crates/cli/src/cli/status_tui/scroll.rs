@@ -5,7 +5,6 @@
 //! the renderer turns each [`Seg`] into spans, and the loop drives the
 //! cursor.
 
-use super::text::Span;
 use crate::cli::status::StatusSnapshot;
 use clank_core::plan_view::WaitingOn;
 
