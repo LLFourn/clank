@@ -352,6 +352,12 @@ pub enum SilentReason {
     /// This waiter's generation went stale (a newer session
     /// incarnation took over); its wake is suppressed.
     StaleGeneration,
+    /// The in-hook poll reached ITS OWN deadline and ended cleanly,
+    /// below the hook runner's ceiling. Distinct from [`NoWork`] —
+    /// same silent wire, but it means "we stopped waiting", not
+    /// "there was nothing to wait for". Being killed AT the ceiling
+    /// instead is what surfaces to the human as a failed hook.
+    PollDeadline,
 }
 
 /// Codex's stop-hook continuation wire shape, written to stdout

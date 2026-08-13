@@ -8,19 +8,26 @@
 //! per-tool wire shape (claude: exit 2 + stderr; codex: exit
 //! 0 + stdout JSON; everything else exit 0).
 //!
-//! The two tools get different work-delivery models
-//! (claude-stop-hook-minimal-hint): **claude** never waits in-hook and
-//! never renders work items — its only continuation is the
-//! self-extinguishing arm-the-wait hint, and
-//! the armed wait's completion wake delivers the work (claude wakes the
-//! session when a background task finishes). **codex** has no such wake
-//! channel, so its hook long-polls `clank wait` in-hook and blocks with
-//! the rendered items. That poll has no clock of its own: it parks
-//! until a wake, the hook-runner ceiling, or the hook's OWN death,
-//! which it learns by holding the write end of the wait's stdin pipe
-//! (remove-wait-timeout). If this process is killed — SIGKILL
-//! included, where no destructor runs — the pipe closes and the wait
-//! reaps itself.
+//! Both tools now long-poll IN-HOOK, by different routes. **claude**
+//! parks inside an `asyncRewake` Stop hook, which runs in the
+//! background and wakes the session on exit 2 with the hook's stderr
+//! as a system reminder (claude-asyncrewake-work-loop). That replaced
+//! arming a background `clank wait`, which Claude Code's task reaper
+//! kills; the arm model SURVIVES for claude versions without the
+//! asyncRewake capability (`LoopPolicy::BackgroundArm`), which nudge
+//! and never park. **codex** has no async hook
+//! support at all — the field is parsed but unimplemented, and setting
+//! it makes codex SKIP the hook — so its hook blocks in-hook and
+//! returns the rendered items.
+//!
+//! The poll has THREE terminators: a wake, its own deadline, or the
+//! hook's OWN death. The deadline is derived from the ceiling clank
+//! writes into the hook config and expires cleanly BELOW it, because
+//! being killed at the ceiling surfaces to the user as a failed hook
+//! (codex-idle-is-not-a-hook-failure). Death it learns by holding the
+//! write end of the wait's stdin pipe (remove-wait-timeout): if this
+//! process is killed — SIGKILL included, where no destructor runs —
+//! the pipe closes and the wait reaps itself.
 //!
 //! **The hook NEVER fails the agent.** Every error path
 //! produces [`HookOutcome::Diagnostic`] which exits 0 with a
@@ -44,11 +51,17 @@ pub async fn run(args: StopHookArgs) -> anyhow::Result<()> {
     if args.session_start {
         return run_session_start(args).await;
     }
+    // The runner's ceiling clock starts HERE, at process spawn — so
+    // the poll's own deadline must be measured from here too, not from
+    // where the waiting begins.
+    let started = std::time::Instant::now();
     let tool: Tool = args.tool.into();
     let async_loop =
         tool == Tool::Claude && args.loop_mode == Some(crate::cli::LoopModeArg::Asyncrewake);
     let outcome = match read_hook_stdin() {
-        Ok(input) => compute_outcome_with(tool, args.repo.as_deref(), input, async_loop).await,
+        Ok(input) => {
+            compute_outcome_with(tool, args.repo.as_deref(), input, async_loop, started).await
+        }
         Err(e) => HookOutcome::Diagnostic { message: e },
     };
     emit_and_exit(outcome, tool);
@@ -62,7 +75,7 @@ async fn compute_outcome(
     repo_override: Option<&Path>,
     input: HookInput,
 ) -> HookOutcome {
-    compute_outcome_with(tool, repo_override, input, false).await
+    compute_outcome_with(tool, repo_override, input, false, std::time::Instant::now()).await
 }
 
 async fn compute_outcome_with(
@@ -70,6 +83,7 @@ async fn compute_outcome_with(
     repo_override: Option<&Path>,
     input: HookInput,
     async_loop: bool,
+    started: std::time::Instant,
 ) -> HookOutcome {
     // Decide how the agent's in-flight background work affects this
     // turn-end, BEFORE any clank resolution (`background_disposition` is a
@@ -149,7 +163,7 @@ async fn compute_outcome_with(
             // wait would reintroduce the tracked-task loop this mode
             // exists to delete (claude-asyncrewake-work-loop).
             BgDisposition::NeedsWorkCheck if async_loop => {
-                return asyncrewake_park(&repo, &label, role).await;
+                return asyncrewake_park(&repo, &label, role, started).await;
             }
             BgDisposition::NeedsWorkCheck => match peek_has_work(&repo, &label, role).await {
                 Ok(true) => HookOutcome::Silent {
@@ -166,14 +180,16 @@ async fn compute_outcome_with(
             },
             // NoBackgroundWork (YieldArmed already returned above): genuinely idle.
             _ if async_loop => {
-                return asyncrewake_park(&repo, &label, role).await;
+                return asyncrewake_park(&repo, &label, role, started).await;
             }
             _ => match loop_policy(tool) {
-                // Claude never waits in-hook and never renders work items —
-                // the hook's only continuation is the arm-the-wait hint, and
-                // the armed wait's completion wake delivers the work. Work
-                // presence is deliberately NOT consulted: if work exists the
-                // armed wait exits immediately and the wake carries it
+                // LEGACY claude only (`--loop asyncrewake` returns
+                // above): this branch never waits in-hook and never
+                // renders work items — its only continuation is the
+                // arm-the-wait hint, and the armed wait's completion
+                // wake delivers the work. Work presence is deliberately
+                // NOT consulted: if work exists the armed wait exits
+                // immediately and the wake carries it
                 // (claude-stop-hook-minimal-hint).
                 LoopPolicy::BackgroundArm => HookOutcome::Continue {
                     reason: nudge_reason(&input),
@@ -184,7 +200,7 @@ async fn compute_outcome_with(
                 // work / timeout is SILENT either way (codex 8000d6e:
                 // a nudge relay would loop an opencode session
                 // forever).
-                LoopPolicy::InHookWait => compute_wait_outcome(&repo, &label, role).await,
+                LoopPolicy::InHookWait => compute_wait_outcome(&repo, &label, role, started).await,
                 // Grok's hooks are PASSIVE (grok-first-class): clank
                 // installs no grok adapter and no continuation could
                 // drive it. If something wires this up anyway, say so.
@@ -374,7 +390,12 @@ async fn generation_changed(agent_dir: &Path, own_gen: u64) {
 /// lease. Work → Continue (claude's exit-2 + stderr wire IS the
 /// asyncRewake wake); no work → Silent (empty-is-quiescent is
 /// load-bearing — M0's unconditional-exit-2 probe looped forever).
-async fn asyncrewake_park(repo: &Path, label: &AgentLabel, role: Role) -> HookOutcome {
+async fn asyncrewake_park(
+    repo: &Path,
+    label: &AgentLabel,
+    role: Role,
+    started: std::time::Instant,
+) -> HookOutcome {
     let agent_dir = crate::agent_store::agents_root(repo).join(label.as_str());
     if let Err(e) = std::fs::create_dir_all(&agent_dir) {
         return HookOutcome::Diagnostic {
@@ -420,7 +441,7 @@ async fn asyncrewake_park(repo: &Path, label: &AgentLabel, role: Role) -> HookOu
     }
 
     let outcome = tokio::select! {
-        o = compute_wait_outcome(repo, label, role) => o,
+        o = compute_wait_outcome(repo, label, role, started) => o,
         // A newer incarnation took over: release (the select drops
         // the wait child via kill_on_drop) and suppress.
         () = generation_changed(&agent_dir, my_gen) => {
@@ -598,12 +619,63 @@ impl OwnedWait {
     }
 }
 
-/// Long-poll via a self-spawned `clank wait --json`. CODEX-ONLY:
-/// claude's hook never waits in-hook (see the module doc).
+/// Margin between the in-hook poll's own deadline and the hook
+/// runner's ceiling.
+///
+/// The runner's clock starts at PROCESS SPAWN, not at the poll, so the
+/// margin has to cover everything else this process does: reading
+/// stdin, resolving identity, loading config, acquiring the park
+/// lease, spawning the child, and emitting. Generous on purpose — the
+/// cost of expiring early is one silent exit and a re-park on the next
+/// turn end; the cost of expiring late is the runner killing us, which
+/// is what the human sees as `hook timed out after 86400s`.
+const POLL_MARGIN_SECS: u64 = 300;
+
+/// The ABSOLUTE instant past which this hook must not still be
+/// waiting, derived from the ceiling clank itself writes into the
+/// tool's hook config so the two cannot drift apart.
+///
+/// Absolute, not a duration budget: a budget computed before the child
+/// spawn and armed after it silently excludes the spawn, which is the
+/// same "armed after unbounded setup" dishonesty that got `--timeout`
+/// deleted (a 2s timeout measured at 9.5s). An instant fixed at hook
+/// entry charges everything that happens afterwards, whenever the
+/// timeout is finally armed.
+///
+/// LIMIT, stated rather than papered over: this bounds the WAIT, not
+/// the setup. Nothing here can preempt a hang in identity resolution
+/// or lease acquisition — those are not cancellable at this boundary.
+/// The deadline is re-checked immediately before arming, so a slow
+/// setup shortens or cancels the wait, but a setup that never returns
+/// still reaches the runner's ceiling. Making setup itself cancellable
+/// is a larger change than this plan.
+fn poll_deadline(started: std::time::Instant) -> std::time::Instant {
+    let ceiling = std::time::Duration::from_secs(crate::cli::setup::HOOK_TIMEOUT_SECS);
+    let margin = std::time::Duration::from_secs(POLL_MARGIN_SECS);
+    started + ceiling.saturating_sub(margin)
+}
+
+/// Await `fut` until `deadline`. `None` = the deadline won.
+///
+/// The seam that makes expiry testable without spawning anything: the
+/// production path passes the real `OwnedWait::run()`, tests pass a
+/// future they control. Dropping `fut` on expiry is load-bearing —
+/// that is what closes the owner pipe so the child reaps itself.
+async fn under_deadline<F: std::future::Future>(
+    fut: F,
+    deadline: std::time::Instant,
+) -> Option<F::Output> {
+    tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), fut)
+        .await
+        .ok()
+}
+
+/// Long-poll via a self-spawned `clank wait --json`. Used by BOTH
+/// loops: codex's blocking hook and claude's asyncrewake park.
 /// Reuses the watcher loop without refactoring it. On items →
-/// Continue. Anything non-zero → Diagnostic. There is no timeout
-/// branch any more: the poll parks until a wake, the hook-runner
-/// ceiling, or OUR death (remove-wait-timeout).
+/// Continue. Anything non-zero → Diagnostic. The poll parks until a
+/// wake, its own deadline (which expires BELOW the hook-runner
+/// ceiling), or OUR death (remove-wait-timeout).
 ///
 /// The child's stdin is the ownership sentinel, not a spare fd. We
 /// hold the write end for the whole wait, so if this hook is killed
@@ -612,7 +684,20 @@ impl OwnedWait {
 /// why this spawns and holds the handle instead of calling
 /// `Command::output()`, which closes the child's stdin immediately
 /// and would read as instant owner death.
-async fn compute_wait_outcome(repo: &Path, label: &AgentLabel, role: Role) -> HookOutcome {
+async fn compute_wait_outcome(
+    repo: &Path,
+    label: &AgentLabel,
+    role: Role,
+    started: std::time::Instant,
+) -> HookOutcome {
+    // Fixed at hook entry, so everything below — current_exe, command
+    // construction, the child spawn — is charged against it.
+    let deadline = poll_deadline(started);
+    if std::time::Instant::now() >= deadline {
+        return HookOutcome::Silent {
+            why: SilentReason::PollDeadline,
+        };
+    }
     let exe = match std::env::current_exe() {
         Ok(p) => p,
         Err(e) => {
@@ -629,9 +714,21 @@ async fn compute_wait_outcome(repo: &Path, label: &AgentLabel, role: Role) -> Ho
         Err(e) => return HookOutcome::Diagnostic { message: e },
     };
 
-    let output = match owned.run().await {
-        Ok(o) => o,
-        Err(e) => {
+    // Expire BELOW the runner's ceiling, cleanly. Dropping `owned`
+    // closes the stdin pipe the wait treats as its owner sentinel, so
+    // the child reaps itself — the deadline does not leak a wait, and
+    // it does not mask owner death: whichever fires first ends the
+    // same way.
+    // Re-checked here by construction: the deadline is absolute, so
+    // the spawn above has already eaten into it.
+    let output = match under_deadline(owned.run(), deadline).await {
+        None => {
+            return HookOutcome::Silent {
+                why: SilentReason::PollDeadline,
+            };
+        }
+        Some(Ok(o)) => o,
+        Some(Err(e)) => {
             return HookOutcome::Diagnostic {
                 message: format!("hook: waiting on wait failed: {e}"),
             };
@@ -1024,6 +1121,97 @@ mod tests {
     }
 
     #[test]
+    fn the_poll_deadline_sits_under_the_runner_ceiling() {
+        // Asserted as a RELATIONSHIP, not a literal: the deadline is
+        // derived from the ceiling clank itself writes into the hook
+        // config, so raising one cannot silently outrun the other.
+        let started = std::time::Instant::now();
+        let ceiling = std::time::Duration::from_secs(crate::cli::setup::HOOK_TIMEOUT_SECS);
+        let deadline = poll_deadline(started);
+        assert!(
+            deadline < started + ceiling,
+            "the poll must end BEFORE the runner kills it"
+        );
+        assert_eq!(
+            (started + ceiling) - deadline,
+            std::time::Duration::from_secs(POLL_MARGIN_SECS),
+            "the gap is exactly the margin — no independent constant"
+        );
+    }
+
+    #[test]
+    fn the_deadline_is_absolute_so_later_arming_gets_less_time() {
+        // The bug this shape prevents: computing a relative budget and
+        // arming it after the child spawn silently excludes the spawn.
+        // Anchored to hook entry, the instant does not move, so time
+        // spent setting up genuinely shortens the wait.
+        let started = std::time::Instant::now();
+        let deadline = poll_deadline(started);
+        let after_setup = poll_deadline(started); // same anchor, later call
+        assert_eq!(deadline, after_setup, "the deadline must not slide");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expiry_returns_none_and_drops_the_waiter() {
+        // Drives the REAL timeout path. The drop is load-bearing: it is
+        // what closes the owner pipe so the `clank wait` child reaps
+        // itself instead of being orphaned by our expiry.
+        struct DropFlag(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = DropFlag(dropped.clone());
+        let never = async move {
+            let _held = flag;
+            std::future::pending::<u8>().await
+        };
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        assert_eq!(under_deadline(never, deadline).await, None, "deadline wins");
+        assert!(
+            dropped.load(std::sync::atomic::Ordering::SeqCst),
+            "expiry must DROP the waiter — that is what reaps the child"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn work_arriving_before_the_deadline_wins() {
+        // The guard against "fixing" the banner by never waiting.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+        let quick = async {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            "items"
+        };
+        assert_eq!(under_deadline(quick, deadline).await, Some("items"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_already_past_deadline_does_not_wait_at_all() {
+        let past = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        assert_eq!(
+            under_deadline(std::future::pending::<u8>(), past).await,
+            None
+        );
+    }
+
+    #[test]
+    fn expiry_is_silent_and_distinct_from_emptiness() {
+        // The user-visible bug was an idle looking like a FAILURE, so
+        // expiry must stay on the silent wire — and stay
+        // distinguishable from "there was nothing to wait for".
+        assert!(!matches!(
+            HookOutcome::Silent {
+                why: SilentReason::PollDeadline
+            },
+            HookOutcome::Diagnostic { .. }
+        ));
+        assert_ne!(SilentReason::PollDeadline, SilentReason::NoWork);
+    }
+
+    #[test]
     fn park_decision_matrix_and_generation_reads() {
         // claude-asyncrewake-work-loop: takeover is deterministic —
         // free parks, a live same-generation waiter defers, a stale
@@ -1069,7 +1257,18 @@ mod tests {
         assert!(a.is_some());
         assert!(try_wait_lease(dir.path()).unwrap().is_none());
         drop(a);
-        assert!(try_wait_lease(dir.path()).unwrap().is_some());
+        // NOT instantaneous under concurrent forks: an `flock` lives on
+        // the open file DESCRIPTION, `fork()` duplicates the fd into the
+        // child, and `O_CLOEXEC` closes it only at `exec()`. So while any
+        // other test in this binary spawns a process, a dropped holder's
+        // lock can still be held by that child for the fork→exec window.
+        // The property under test is that the drop RELEASES, not that it
+        // releases within one instruction.
+        let freed = (0..200).any(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            try_wait_lease(dir.path()).unwrap().is_some()
+        });
+        assert!(freed, "dropping the holder frees the lease");
     }
 
     #[test]

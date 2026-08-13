@@ -3323,12 +3323,20 @@ mod tests {
             "leases are per source"
         );
         drop(a);
-        assert!(
+        // NOT instantaneous under concurrent forks: an `flock` lives on
+        // the open file DESCRIPTION, `fork()` duplicates the fd into the
+        // child, and `O_CLOEXEC` closes it only at `exec()`. So while any
+        // other test in this binary spawns a process, a dropped holder's
+        // lock can still be held by that child for the fork→exec window.
+        // The property under test is that the drop RELEASES, not that it
+        // releases within one instruction.
+        let freed = (0..200).any(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(10));
             crate::cli::github_event_log::IngestLease::try_acquire(&dir, "k")
                 .unwrap()
-                .is_some(),
-            "dropping the holder frees the lease"
-        );
+                .is_some()
+        });
+        assert!(freed, "dropping the holder frees the lease");
         // A REAL failure (the "dir" is a file) is an error, never
         // contention (codex 8bf682e).
         let file_path = dir.join("not-a-dir");

@@ -210,10 +210,20 @@ const HOOK_ID: &str = "clank-stop-hook";
 const LEGACY_COMMAND_PREFIX: &str = "clank stop-hook";
 
 /// Per-tool hook timeout we write into the agent's hook config.
-/// 24 hours — effectively infinite. Nothing on the clank side races
-/// it any more: the in-hook poll parks until work, this ceiling, or
-/// the hook's own death (remove-wait-timeout). It exists only to
-/// stop the agent's hook runner from killing the process early.
+///
+/// A BACKSTOP, not the terminator. The in-hook poll now ends itself
+/// below this value (`stop_hook::poll_deadline` derives its deadline
+/// from this constant), so reaching the ceiling means something went
+/// wrong — it is not the normal way a park ends. Being killed AT the
+/// ceiling is what surfaced to the user as
+/// `Stop hook (failed) — hook timed out after 86400s`
+/// (codex-idle-is-not-a-hook-failure).
+///
+/// Raising it buys nothing now that the poll self-expires, and it must
+/// not be dropped either: absent the field, each runner applies its own
+/// default (claude documents 600s for a `command` hook), which would
+/// cut a legitimate park short. No documented MAXIMUM was found for
+/// either runner.
 pub(crate) const HOOK_TIMEOUT_SECS: u64 = 86400;
 
 /// The per-tool user-scope skill dirs. Grok dedupes its claude-compat
@@ -1390,6 +1400,37 @@ mod tests {
             .as_str()
             .unwrap();
         assert!(msg.contains("Clank"));
+    }
+
+    #[test]
+    fn codex_hook_carries_no_async_field_of_any_kind() {
+        // codex 0.147.0 PARSES `async` (and knows `asyncRewake`) but
+        // has not implemented them: the binary carries
+        // `skipping async hook in ` / `async hooks are not supported
+        // yet`. Setting either would not make the hook non-blocking —
+        // codex would decline to run it at all, silently disabling the
+        // whole codex work loop for one log line. The field being
+        // visible in codex's schema is an active invitation to that
+        // mistake, so its absence is pinned rather than assumed
+        // (codex-idle-is-not-a-hook-failure).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".codex/hooks.json");
+        let mut summary = Vec::new();
+        merge_hook_into_settings(&path, CodexHook, false, &mut summary).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let entry = &serde_json::from_str::<serde_json::Value>(&raw).unwrap()["hooks"]["Stop"][0]["hooks"]
+            [0];
+        assert!(
+            entry.get("async").is_none(),
+            "`async` must stay unset: {entry}"
+        );
+        assert!(
+            entry.get("asyncRewake").is_none(),
+            "`asyncRewake` must stay unset: {entry}"
+        );
+        // The ceiling still ships — absent, codex applies its own
+        // default and cuts a legitimate park short.
+        assert_eq!(entry["timeout"].as_u64(), Some(HOOK_TIMEOUT_SECS));
     }
 
     #[test]
