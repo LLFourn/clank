@@ -156,6 +156,9 @@ enum Command {
     Block(cli::BlockArgs),
     /// Answer a pending block
     Unblock(cli::UnblockArgs),
+    /// Record the background task you are waiting on, so the Stop hook
+    /// stops waking you with work you are already doing
+    Attending(cli::AttendingArgs),
     /// Read or write clank config values
     Config(cli::ConfigArgs),
     /// Dump the repo's roster config as JSON
@@ -218,6 +221,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Config(args) => cli::config::run(args).await,
         Command::Block(args) => cli::block::run(args).await,
         Command::Unblock(args) => cli::block::run_unblock(args).await,
+        Command::Attending(args) => cli::attending::run(args).await,
     };
     if let Err(e) = result {
         let code = exit_code_for(&e);

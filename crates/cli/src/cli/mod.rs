@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 
 pub mod agent;
 pub mod as_cmd;
+pub mod attending;
 pub mod auto;
 pub mod block;
 pub mod config;
@@ -1605,6 +1606,21 @@ pub struct BlockCreateArgs {
 
 #[derive(Args, Debug)]
 pub struct BlockCleanArgs {
+    #[arg(long, value_name = "PATH")]
+    pub repo: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub struct AttendingArgs {
+    /// The background task id you are waiting on, as the tool reports
+    /// it. Omit with `--clear` to stop attending.
+    pub task_id: Option<String>,
+    /// Forget the recorded task.
+    #[arg(long)]
+    pub clear: bool,
+    /// Agent label. Resolved from env when omitted.
+    #[arg(long, value_name = "LABEL")]
+    pub author: Option<String>,
     #[arg(long, value_name = "PATH")]
     pub repo: Option<PathBuf>,
 }

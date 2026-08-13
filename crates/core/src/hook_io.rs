@@ -294,6 +294,20 @@ pub enum BgDisposition {
 /// (once a `clank wait` is armed it shows up here as `YieldArmed`), and the
 /// nudge fires only when the agent has no immediate work — precisely when a
 /// backgrounded `clank wait` would block and persist.
+impl HookInput {
+    /// Ids of background tasks the tool reports as live this turn.
+    /// The authority for whether an `attending` marker still means
+    /// anything — a marker is a POINTER, validated here, never a
+    /// claim the agent has to remember to retract.
+    pub fn live_task_ids(&self) -> Vec<String> {
+        self.background_tasks
+            .iter()
+            .filter(|t| t.status.as_deref() != Some("completed"))
+            .filter_map(|t| t.id.clone())
+            .collect()
+    }
+}
+
 pub fn background_disposition(tool: Tool, input: &HookInput) -> BgDisposition {
     if input.has_background_clank_wait() {
         return BgDisposition::YieldArmed;
@@ -352,6 +366,12 @@ pub enum SilentReason {
     /// This waiter's generation went stale (a newer session
     /// incarnation took over); its wake is suppressed.
     StaleGeneration,
+    /// Every item was work the agent is already attending: it has a
+    /// LIVE background task recorded, and nothing arrived that it did
+    /// not already know. Waking here is what turned one long build
+    /// into a dozen identical wakes
+    /// (attending-suppresses-standing-wakes).
+    AttendingBackgroundTask,
     /// The in-hook poll reached ITS OWN deadline and ended cleanly,
     /// below the hook runner's ceiling. Distinct from [`NoWork`] —
     /// same silent wire, but it means "we stopped waiting", not

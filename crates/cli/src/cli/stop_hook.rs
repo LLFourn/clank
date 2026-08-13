@@ -92,6 +92,7 @@ async fn compute_outcome_with(
     // would block that wake. Only `NeedsWorkCheck` / `NoBackgroundWork` fall
     // through to resolution, so a config Diagnostic can only surface when we
     // were going to engage clank anyway.
+    let live_ids = input.live_task_ids();
     let disposition = background_disposition(tool, &input);
     if matches!(disposition, BgDisposition::YieldArmed) {
         return HookOutcome::Silent {
@@ -163,7 +164,7 @@ async fn compute_outcome_with(
             // wait would reintroduce the tracked-task loop this mode
             // exists to delete (claude-asyncrewake-work-loop).
             BgDisposition::NeedsWorkCheck if async_loop => {
-                return asyncrewake_park(&repo, &label, role, started).await;
+                return asyncrewake_park(&repo, &label, role, started, &live_ids).await;
             }
             BgDisposition::NeedsWorkCheck => match peek_has_work(&repo, &label, role).await {
                 Ok(true) => HookOutcome::Silent {
@@ -180,7 +181,7 @@ async fn compute_outcome_with(
             },
             // NoBackgroundWork (YieldArmed already returned above): genuinely idle.
             _ if async_loop => {
-                return asyncrewake_park(&repo, &label, role, started).await;
+                return asyncrewake_park(&repo, &label, role, started, &live_ids).await;
             }
             _ => match loop_policy(tool) {
                 // LEGACY claude only (`--loop asyncrewake` returns
@@ -200,7 +201,9 @@ async fn compute_outcome_with(
                 // work / timeout is SILENT either way (codex 8000d6e:
                 // a nudge relay would loop an opencode session
                 // forever).
-                LoopPolicy::InHookWait => compute_wait_outcome(&repo, &label, role, started).await,
+                LoopPolicy::InHookWait => {
+                    compute_wait_outcome(&repo, &label, role, started, &live_ids).await
+                }
                 // Grok's hooks are PASSIVE (grok-first-class): clank
                 // installs no grok adapter and no continuation could
                 // drive it. If something wires this up anyway, say so.
@@ -395,6 +398,7 @@ async fn asyncrewake_park(
     label: &AgentLabel,
     role: Role,
     started: std::time::Instant,
+    live_ids: &[String],
 ) -> HookOutcome {
     let agent_dir = crate::agent_store::agents_root(repo).join(label.as_str());
     if let Err(e) = std::fs::create_dir_all(&agent_dir) {
@@ -441,7 +445,7 @@ async fn asyncrewake_park(
     }
 
     let outcome = tokio::select! {
-        o = compute_wait_outcome(repo, label, role, started) => o,
+        o = compute_wait_outcome(repo, label, role, started, live_ids) => o,
         // A newer incarnation took over: release (the select drops
         // the wait child via kill_on_drop) and suppress.
         () = generation_changed(&agent_dir, my_gen) => {
@@ -470,7 +474,11 @@ async fn peek_has_work(repo: &Path, label: &AgentLabel, role: Role) -> Result<bo
 
 /// The peek's ITEMS — shared by the work-check and SessionStart's
 /// catch-up context (claude-asyncrewake-work-loop).
-async fn peek_items(repo: &Path, label: &AgentLabel, role: Role) -> Result<Vec<WaitItem>, String> {
+pub(crate) async fn peek_items(
+    repo: &Path,
+    label: &AgentLabel,
+    role: Role,
+) -> Result<Vec<WaitItem>, String> {
     use tokio::process::Command;
 
     let exe = std::env::current_exe().map_err(|e| format!("current_exe failed: {e}"))?;
@@ -689,6 +697,7 @@ async fn compute_wait_outcome(
     label: &AgentLabel,
     role: Role,
     started: std::time::Instant,
+    live_ids: &[String],
 ) -> HookOutcome {
     // Fixed at hook entry, so everything below — current_exe, command
     // construction, the child spawn — is charged against it.
@@ -735,7 +744,92 @@ async fn compute_wait_outcome(
         }
     };
 
-    outcome_from_wait_output(&output, label, role)
+    let agent_dir = crate::agent_store::agents_root(repo).join(label.as_str());
+    outcome_from_wait_output(&output, label, role, &agent_dir, live_ids)
+}
+
+// ── attending a background task (attending-suppresses-standing-wakes) ──
+
+/// Where the agent records the background task it is waiting on.
+fn attending_path(agent_dir: &Path) -> PathBuf {
+    agent_dir.join("attending")
+}
+
+/// What the agent acknowledged when it started attending: the live
+/// background task, AND the exact standing item it had already seen.
+///
+/// The item identity is load-bearing. A reviewer's CONTINUE on a NEW
+/// commit surfaces as the SAME `gate_continue` reason at a new sha
+/// (`wait.rs:1251-1258`), so suppressing by reason alone would discard
+/// genuine review progress. Only an exact (plan, sha) match is
+/// suppressed; anything else is news and wakes.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Attending {
+    pub(crate) task: String,
+    /// The acknowledged standing item, absent if none was pending when
+    /// attendance began — in which case nothing is suppressed.
+    #[serde(default)]
+    pub(crate) plan: Option<String>,
+    #[serde(default)]
+    pub(crate) sha: Option<String>,
+}
+
+/// The attendance record, iff its task is still LIVE.
+///
+/// Ownership by liveness, never by claim: the recorded id is validated
+/// against the tool's own live task list, and an id absent from it is
+/// void and deleted. The agent therefore cannot wedge the hook silent
+/// by forgetting to clear the marker — a stale "I am busy" flag would
+/// cause MISSED wakes, which is strictly worse than the noise this
+/// suppresses.
+fn attending_live_task(agent_dir: &Path, live_ids: &[String]) -> Option<Attending> {
+    let path = attending_path(agent_dir);
+    let raw = std::fs::read_to_string(&path).ok()?;
+    let Ok(rec) = serde_json::from_str::<Attending>(&raw) else {
+        // Unreadable marker suppresses nothing — fail toward NOISE,
+        // never toward silence.
+        let _ = std::fs::remove_file(&path);
+        return None;
+    };
+    if live_ids.iter().any(|id| id == &rec.task) {
+        return Some(rec);
+    }
+    let _ = std::fs::remove_file(&path);
+    None
+}
+
+impl Attending {
+    /// Is this item EXACTLY the standing work already acknowledged?
+    ///
+    /// Reason, plan and sha must all match. A new sha is review
+    /// progress and must wake, even though its reason is identical.
+    fn acknowledges(&self, item: &WaitItem) -> bool {
+        is_standing_work(item)
+            && self.plan.is_some()
+            && self.plan == item.plan
+            && self.sha.is_some()
+            && self.sha == item.sha
+    }
+}
+
+/// Is this item work the agent is ALREADY doing?
+///
+/// Exactly one reason qualifies: `GateContinue` on a master item —
+/// "latest reviewable commit is CONTINUE; master keeps working", which
+/// stays true for the whole implementation and is information the
+/// agent already has.
+///
+/// `Revise` is deliberately NOT here. It carries
+/// `AddressCommitChanges` — newly arrived REQUEST_CHANGES — which is
+/// news, and suppressing it would mean sitting through reviewer
+/// feedback for the length of a build.
+fn is_standing_work(item: &WaitItem) -> bool {
+    // Stringly-typed because this crosses the `wait --json` subprocess
+    // boundary, where the hook's projection is deliberately loose. A
+    // test pins these against what core actually serializes, so a
+    // rename in `WaitingReason` cannot silently stop suppressing.
+    item.kind.as_deref() == Some("master")
+        && item.reason.as_deref() == Some(clank_core::vocab::WaitingReason::GateContinue.as_str())
 }
 
 /// Map the finished wait's output to an outcome. Pure, so the
@@ -750,15 +844,41 @@ fn outcome_from_wait_output(
     output: &std::process::Output,
     label: &AgentLabel,
     role: Role,
+    agent_dir: &Path,
+    live_ids: &[String],
 ) -> HookOutcome {
     match output.status.code() {
         Some(0) => match parse_wait_json(&output.stdout) {
             Ok(items) if items.is_empty() => HookOutcome::Silent {
                 why: SilentReason::NoWork,
             },
-            Ok(items) => HookOutcome::Continue {
-                reason: render_wait_items(&items, label, role),
-            },
+            Ok(items) => {
+                let attending = attending_live_task(agent_dir, live_ids);
+                let kept: Vec<&WaitItem> = items
+                    .iter()
+                    .filter(|i| !attending.as_ref().is_some_and(|a| a.acknowledges(i)))
+                    .collect();
+                if kept.is_empty() {
+                    return HookOutcome::Silent {
+                        why: SilentReason::AttendingBackgroundTask,
+                    };
+                }
+                let mut reason = render_wait_items_ref(&kept, label, role);
+                // Teach the protocol exactly where it would otherwise
+                // loop: a standing item, a live task, and no marker is
+                // the shape that produced a dozen identical wakes.
+                if attending.is_none() && !live_ids.is_empty() && items.iter().any(is_standing_work)
+                {
+                    reason.push_str(&format!(
+                        "\n\nYou have a live background task ({}). If you are WAITING on it, \
+                         record it — `clank attending {}` — and this will stop waking you with \
+                         work you are already doing. Do not end your turn to poll it.",
+                        live_ids.join(", "),
+                        live_ids.first().map(String::as_str).unwrap_or("<task-id>"),
+                    ));
+                }
+                HookOutcome::Continue { reason }
+            }
             Err(e) => HookOutcome::Diagnostic {
                 message: format!("hook: wait stdout malformed: {e}"),
             },
@@ -817,13 +937,13 @@ struct WaitEnvelope {
 /// minimal wake hint (`wait-output-is-a-minimal-hint`). Anything
 /// `wait` adds is ignored; anything absent stays `None`.
 #[derive(serde::Deserialize)]
-struct WaitItem {
-    kind: Option<String>,
-    plan: Option<String>,
-    sha: Option<String>,
+pub(crate) struct WaitItem {
+    pub(crate) kind: Option<String>,
+    pub(crate) plan: Option<String>,
+    pub(crate) sha: Option<String>,
     finalized_at: Option<String>,
     next: Option<String>,
-    reason: Option<String>,
+    pub(crate) reason: Option<String>,
     prompt: Option<String>,
     name: Option<String>,
     priority: Option<u64>,
@@ -865,6 +985,11 @@ fn parse_wait_json(raw: &[u8]) -> Result<Vec<WaitItem>, String> {
 /// unblock) lives in the agent's skill doc, not re-taught per
 /// wake.
 fn render_wait_items(items: &[WaitItem], label: &AgentLabel, role: Role) -> String {
+    let refs: Vec<&WaitItem> = items.iter().collect();
+    render_wait_items_ref(&refs, label, role)
+}
+
+fn render_wait_items_ref(items: &[&WaitItem], label: &AgentLabel, role: Role) -> String {
     let mut out = String::new();
     out.push_str(&format!(
         "Clank wait returned work for `{label}` ({role}). Items:\n",
@@ -1118,6 +1243,249 @@ mod tests {
         let sid = clank_core::ids::SessionId::parse(session).unwrap();
         crate::agent_store::bind_session_to_agent(repo, &label, tool, &sid).unwrap();
         label
+    }
+
+    fn write_attending(dir: &Path, task: &str, sha: Option<&str>) {
+        let rec = Attending {
+            task: task.to_string(),
+            plan: sha.map(|_| "p".to_string()),
+            sha: sha.map(str::to_string),
+        };
+        std::fs::write(dir.join("attending"), serde_json::to_string(&rec).unwrap()).unwrap();
+    }
+
+    fn wait_output(items: serde_json::Value) -> std::process::Output {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: serde_json::to_vec(&serde_json::json!({ "items": items })).unwrap(),
+            stderr: Vec::new(),
+        }
+    }
+
+    fn standing_item() -> serde_json::Value {
+        serde_json::json!({"kind":"master","plan":"p","sha":FULL_SHA,
+                           "next":"continue","reason":"gate_continue","gate":"continued"})
+    }
+
+    #[test]
+    fn the_suppressed_reason_matches_what_core_serializes() {
+        // The predicate compares strings across the `wait --json`
+        // subprocess boundary. Pinning it against core means renaming
+        // the variant breaks a test rather than silently ending
+        // suppression.
+        assert_eq!(
+            clank_core::vocab::WaitingReason::GateContinue.as_str(),
+            "gate_continue"
+        );
+        let items: Vec<WaitItem> =
+            serde_json::from_value(serde_json::json!([standing_item()])).unwrap();
+        assert!(is_standing_work(&items[0]));
+    }
+
+    #[test]
+    fn review_feedback_is_news_and_is_never_standing() {
+        // `Revise` carries AddressCommitChanges — newly arrived
+        // REQUEST_CHANGES. Suppressing it would mean sitting through
+        // reviewer feedback for the length of a build.
+        let items: Vec<WaitItem> = serde_json::from_value(serde_json::json!([
+            {"kind":"master","plan":"p","sha":FULL_SHA,
+             "next":"revise","reason":"address_commit_changes","gate":"changes_requested"}
+        ]))
+        .unwrap();
+        assert!(!is_standing_work(&items[0]));
+    }
+
+    #[test]
+    fn attending_a_live_task_suppresses_standing_work() {
+        let dir = tempfile::tempdir().unwrap();
+        write_attending(dir.path(), "task-42", Some(FULL_SHA));
+        let out = outcome_from_wait_output(
+            &wait_output(serde_json::json!([standing_item()])),
+            &AgentLabel::parse("claude").unwrap(),
+            Role::Master,
+            dir.path(),
+            &["task-42".to_string()],
+        );
+        assert!(
+            matches!(
+                out,
+                HookOutcome::Silent {
+                    why: SilentReason::AttendingBackgroundTask
+                }
+            ),
+            "got {out:?}"
+        );
+    }
+
+    #[test]
+    fn a_new_sha_wakes_even_though_the_reason_is_identical() {
+        // The hole codex found: a reviewer's CONTINUE on a NEW commit
+        // reuses `gate_continue` at a new sha, so suppressing by reason
+        // alone silently discards real review progress. Attendance is
+        // bound to the acknowledged ITEM, not just the task.
+        let dir = tempfile::tempdir().unwrap();
+        write_attending(dir.path(), "task-42", Some(FULL_SHA));
+        let other_sha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+        let same = outcome_from_wait_output(
+            &wait_output(serde_json::json!([standing_item()])),
+            &AgentLabel::parse("claude").unwrap(),
+            Role::Master,
+            dir.path(),
+            &["task-42".to_string()],
+        );
+        assert!(
+            matches!(
+                same,
+                HookOutcome::Silent {
+                    why: SilentReason::AttendingBackgroundTask
+                }
+            ),
+            "the acknowledged sha stays suppressed: {same:?}"
+        );
+
+        let moved = outcome_from_wait_output(
+            &wait_output(serde_json::json!([
+                {"kind":"master","plan":"p","sha":other_sha,
+                 "next":"continue","reason":"gate_continue","gate":"continued"}
+            ])),
+            &AgentLabel::parse("claude").unwrap(),
+            Role::Master,
+            dir.path(),
+            &["task-42".to_string()],
+        );
+        assert!(
+            matches!(moved, HookOutcome::Continue { .. }),
+            "review progress at a NEW sha must wake: {moved:?}"
+        );
+    }
+
+    #[test]
+    fn a_marker_with_no_acknowledged_item_suppresses_nothing() {
+        // Attendance recorded while nothing was standing must not
+        // become a blanket mute for whatever arrives later.
+        let dir = tempfile::tempdir().unwrap();
+        write_attending(dir.path(), "task-42", None);
+        let out = outcome_from_wait_output(
+            &wait_output(serde_json::json!([standing_item()])),
+            &AgentLabel::parse("claude").unwrap(),
+            Role::Master,
+            dir.path(),
+            &["task-42".to_string()],
+        );
+        assert!(matches!(out, HookOutcome::Continue { .. }), "got {out:?}");
+    }
+
+    #[test]
+    fn an_unreadable_marker_fails_toward_noise() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("attending"), "not json").unwrap();
+        let out = outcome_from_wait_output(
+            &wait_output(serde_json::json!([standing_item()])),
+            &AgentLabel::parse("claude").unwrap(),
+            Role::Master,
+            dir.path(),
+            &["task-42".to_string()],
+        );
+        assert!(
+            matches!(out, HookOutcome::Continue { .. }),
+            "a corrupt marker must never silence: {out:?}"
+        );
+    }
+
+    #[test]
+    fn attending_does_not_suppress_news() {
+        // The guard against trading a noisy loop for silently sitting
+        // through a REQUEST_CHANGES.
+        let dir = tempfile::tempdir().unwrap();
+        write_attending(dir.path(), "task-42", Some(FULL_SHA));
+        let out = outcome_from_wait_output(
+            &wait_output(serde_json::json!([
+                standing_item(),
+                {"kind":"unblocked","name":"q","answer":"yes"}
+            ])),
+            &AgentLabel::parse("claude").unwrap(),
+            Role::Master,
+            dir.path(),
+            &["task-42".to_string()],
+        );
+        match out {
+            HookOutcome::Continue { reason } => {
+                assert!(reason.contains("unblocked"), "news must wake: {reason}");
+                assert!(
+                    !reason.contains("gate_continue"),
+                    "standing work stays suppressed: {reason}"
+                );
+            }
+            other => panic!("news must wake, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_stale_marker_is_void_and_removed() {
+        // The missed-wake failure mode, tested directly: a marker whose
+        // task is gone must NOT silence the hook, and must not linger.
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("attending");
+        write_attending(dir.path(), "task-gone", Some(FULL_SHA));
+        let out = outcome_from_wait_output(
+            &wait_output(serde_json::json!([standing_item()])),
+            &AgentLabel::parse("claude").unwrap(),
+            Role::Master,
+            dir.path(),
+            &["task-other".to_string()],
+        );
+        assert!(
+            matches!(out, HookOutcome::Continue { .. }),
+            "a stale marker must never suppress: {out:?}"
+        );
+        assert!(!marker.exists(), "and it is discarded, not left to rot");
+    }
+
+    #[test]
+    fn no_marker_plus_a_live_task_carries_the_hint() {
+        // Teaches the protocol exactly where it would otherwise loop.
+        let dir = tempfile::tempdir().unwrap();
+        let out = outcome_from_wait_output(
+            &wait_output(serde_json::json!([standing_item()])),
+            &AgentLabel::parse("claude").unwrap(),
+            Role::Master,
+            dir.path(),
+            &["task-42".to_string()],
+        );
+        match out {
+            HookOutcome::Continue { reason } => {
+                assert!(reason.contains("task-42"), "names the live task: {reason}");
+                assert!(
+                    reason.contains("clank attending"),
+                    "gives the recipe: {reason}"
+                );
+            }
+            other => panic!("no marker means it still wakes, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn no_background_task_means_no_hint_and_no_suppression() {
+        let dir = tempfile::tempdir().unwrap();
+        write_attending(dir.path(), "task-42", Some(FULL_SHA));
+        let out = outcome_from_wait_output(
+            &wait_output(serde_json::json!([standing_item()])),
+            &AgentLabel::parse("claude").unwrap(),
+            Role::Master,
+            dir.path(),
+            &[],
+        );
+        match out {
+            HookOutcome::Continue { reason } => {
+                assert!(
+                    !reason.contains("clank attending"),
+                    "no task, no hint: {reason}"
+                )
+            }
+            other => panic!("nothing to attend means it wakes, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1739,14 +2107,21 @@ mod tests {
         // Exit 2 used to mean "timed out, go quiet". It has no
         // special meaning now, so it must surface rather than be
         // swallowed as a routine idle.
-        let two = outcome_from_wait_output(&out(2, ""), &label, Role::Master);
+        let two =
+            outcome_from_wait_output(&out(2, ""), &label, Role::Master, Path::new("/nope"), &[]);
         assert!(
             matches!(two, HookOutcome::Diagnostic { .. }),
             "a non-zero wait exit must surface, got {two:?}"
         );
 
         // Idle is now expressed the only way left: exit 0, no items.
-        let idle = outcome_from_wait_output(&out(0, r#"{"items":[]}"#), &label, Role::Master);
+        let idle = outcome_from_wait_output(
+            &out(0, r#"{"items":[]}"#),
+            &label,
+            Role::Master,
+            Path::new("/nope"),
+            &[],
+        );
         assert!(
             matches!(
                 idle,
