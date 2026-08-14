@@ -984,6 +984,92 @@ fn parse_wait_json(raw: &[u8]) -> Result<Vec<WaitItem>, String> {
 /// the HOW (feedback-write form, verdicts, promote evaluation,
 /// unblock) lives in the agent's skill doc, not re-taught per
 /// wake.
+// ── discharge conditions (wakes-state-their-discharge-condition) ──
+//
+// A wake says what to do. Without saying what STOPS it, an agent that
+// believes it already acted has no way to tell it is looping — every
+// wake looks like a fresh instruction. The condition is a pure
+// function of the item, so no state is stored and level-triggering is
+// untouched.
+
+/// Why a wake will or will not fire again.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Discharge {
+    /// Fires while a condition holds; the text says what ends it.
+    Until(&'static str),
+    /// Fires on an edge and will not repeat. Carries WHY, so a
+    /// one-shot is a decision rather than an omission.
+    OneShot(&'static str),
+    /// Watcher delivery, not stop-hook wake delivery.
+    ObserverOnly,
+}
+
+/// Classify a rendered item. `reason` matters for `master`, whose
+/// several `WaitingReason`s discharge differently.
+pub(crate) fn discharge_of(kind: &str, reason: Option<&str>) -> Option<Discharge> {
+    use Discharge::*;
+    Some(match kind {
+        "master" => match reason? {
+            // Says only what ENDS it. The `clank attending` recipe is
+            // the hint's job (attending-suppresses-standing-wakes),
+            // which fires only when a background task is actually
+            // live — advertising it unconditionally here would tell an
+            // agent with nothing running to record nothing.
+            "gate_continue" => Until("fires until a commit moves the gate"),
+            "address_commit_changes" => {
+                Until("fires until you commit work addressing the feedback on that sha")
+            }
+            "ready_to_finalize" => Until("fires until `clank finish` runs"),
+            "commit_plan_revision" => Until("fires until the plan edit is committed"),
+            // A future reason must not silently claim a condition.
+            _ => return None,
+        },
+        "reviewer" => Until("fires until you write feedback for that sha"),
+        "fix_commit_tag" => Until("fires until the commit's plan tag is corrected"),
+        "multiple_plans_open" => Until(
+            "fires until one plan is active — `clank finish` one, or `clank stash push` the rest",
+        ),
+        "promote_from_queue" => Until("fires until the item is promoted or removed from the queue"),
+        "github_event" => Until("fires until the event is acked — `clank events ack`"),
+        "adhoc_review" => Until("fires until feedback exists for that sha"),
+        "adhoc_revise" => Until("fires until you commit the revision"),
+        "pr_reviewer" => Until("fires until your review for that round is written"),
+        "pr_master" => Until("fires until you act on that round"),
+        "unblocked" => Until("fires until you acknowledge it — `clank block clean`"),
+        "blocked" => Until(
+            "you CANNOT clear this — only the human can answer it. Do not act on it, and do \
+             not answer it yourself",
+        ),
+        "idle" => Until("fires while there is nothing else to do"),
+        "finished" => OneShot("a finalize notice — it will not fire again for that sha"),
+        "adhoc_settled" => OneShot("a settle notice — it will not fire again for that sha"),
+        // REPEATING, despite looking like a one-off. Command sources
+        // are spawned once per wait, and every stop-hook re-arm starts
+        // them again — so a source that exits immediately re-fires on
+        // every re-arm (extra-wait-events). Classifying it from the
+        // single wait process rather than the re-arm loop is how it
+        // read as one-shot.
+        "command_event" => Until(
+            "fires again on every re-arm unless the source BLOCKS until a real event — \
+             change or remove the command source to stop it",
+        ),
+        "for_commit" | "for_finished" | "for_blocked" => ObserverOnly,
+        // Unknown/future kinds render WITHOUT a condition rather than
+        // guessing: the subprocess boundary stays fail-soft.
+        _ => return None,
+    })
+}
+
+fn discharge_suffix(kind: &str, reason: Option<&str>) -> String {
+    match discharge_of(kind, reason) {
+        // NOT `↳` — that already marks a watch's standing
+        // instructions (`github-watch-prompts`), and two meanings on
+        // one glyph is how a reader stops trusting either.
+        Some(Discharge::Until(t)) | Some(Discharge::OneShot(t)) => format!("      · {t}\n"),
+        Some(Discharge::ObserverOnly) | None => String::new(),
+    }
+}
+
 fn render_wait_items(items: &[WaitItem], label: &AgentLabel, role: Role) -> String {
     let refs: Vec<&WaitItem> = items.iter().collect();
     render_wait_items_ref(&refs, label, role)
@@ -1148,8 +1234,14 @@ fn render_wait_items_ref(items: &[&WaitItem], label: &AgentLabel, role: Role) ->
                     .unwrap_or_default();
                 out.push_str(&format!("  - command: {name} {exit}{snip}\n"));
             }
+            // Its OWN variant, not a `master` reason — `work_for`
+            // emits it directly. It rendered through the catchall
+            // until now, which is exactly how a recurring wake ends up
+            // with no explanation.
+            "fix_commit_tag" => out.push_str(&format!("  - fix-commit-tag: {plan} @ {short}\n")),
             other => out.push_str(&format!("  - {other}: {plan} @ {short}\n")),
         }
+        out.push_str(&discharge_suffix(kind, item.reason.as_deref()));
     }
     out.push_str("\nAct on these items now.");
     out
@@ -1486,6 +1578,149 @@ mod tests {
             }
             other => panic!("nothing to attend means it wakes, got {other:?}"),
         }
+    }
+
+    /// The DRIFT GUARD. An exhaustive match over the core enum, so
+    /// adding a `WaitItem` variant without classifying it fails to
+    /// compile. String matching on the hook's loose projection cannot
+    /// give exhaustiveness, which is how `fix_commit_tag` reached the
+    /// catchall unnoticed in the first place.
+    fn wire_tag_of(item: &clank_core::wait::WaitItem) -> &'static str {
+        use clank_core::wait::WaitItem as W;
+        match item {
+            W::Master { .. } => "master",
+            W::Reviewer { .. } => "reviewer",
+            W::Finished { .. } => "finished",
+            W::Idle { .. } => "idle",
+            W::AdHocReview { .. } => "adhoc_review",
+            W::AdHocRevise { .. } => "adhoc_revise",
+            W::AdHocSettled { .. } => "adhoc_settled",
+            W::FixCommitTag { .. } => "fix_commit_tag",
+            W::MultiplePlansOpen { .. } => "multiple_plans_open",
+            W::PromoteFromQueue { .. } => "promote_from_queue",
+            W::GithubEvent { .. } => "github_event",
+            W::CommandEvent { .. } => "command_event",
+            W::ForCommit { .. } => "for_commit",
+            W::ForFinished { .. } => "for_finished",
+            W::ForBlocked { .. } => "for_blocked",
+            W::Blocked { .. } => "blocked",
+            W::Unblocked { .. } => "unblocked",
+            W::PrReviewer { .. } => "pr_reviewer",
+            W::PrMaster { .. } => "pr_master",
+        }
+    }
+
+    #[test]
+    fn every_wait_item_variant_is_classified() {
+        // Table-driven over the WHOLE algebra. A kind cannot be tested
+        // into existence without being classified, and `wire_tag_of`
+        // above stops a new variant slipping past the table.
+        use Discharge::*;
+        let master_reasons = [
+            "gate_continue",
+            "address_commit_changes",
+            "ready_to_finalize",
+            "commit_plan_revision",
+        ];
+        for r in master_reasons {
+            assert!(
+                matches!(discharge_of("master", Some(r)), Some(Until(_))),
+                "master/{r} must state what ends it"
+            );
+        }
+        let repeating = [
+            "reviewer",
+            "fix_commit_tag",
+            "multiple_plans_open",
+            "promote_from_queue",
+            "github_event",
+            "adhoc_review",
+            "adhoc_revise",
+            "pr_reviewer",
+            "pr_master",
+            "unblocked",
+            "blocked",
+            "idle",
+            // Re-armed command sources re-fire; see `discharge_of`.
+            "command_event",
+        ];
+        for k in repeating {
+            assert!(
+                matches!(discharge_of(k, None), Some(Until(_))),
+                "{k} repeats and must state what ends it"
+            );
+        }
+        for k in ["finished", "adhoc_settled"] {
+            assert!(
+                matches!(discharge_of(k, None), Some(OneShot(_))),
+                "{k} is one-shot and must say so rather than stay silent"
+            );
+        }
+        for k in ["for_commit", "for_finished", "for_blocked"] {
+            assert_eq!(
+                discharge_of(k, None),
+                Some(ObserverOnly),
+                "{k} is watcher delivery, classified rather than skipped"
+            );
+        }
+    }
+
+    #[test]
+    fn master_keys_on_the_reason_not_the_kind() {
+        // Four reasons, four different discharges. Keying on the kind
+        // alone would print a condition that does not apply — worse
+        // than silence, because it reads as authoritative.
+        let cont = discharge_of("master", Some("gate_continue"));
+        let revise = discharge_of("master", Some("address_commit_changes"));
+        assert_ne!(cont, revise);
+        assert!(
+            matches!(cont, Some(Discharge::Until(t)) if t.contains("gate")),
+            "continue is discharged by moving the GATE: {cont:?}"
+        );
+        assert!(
+            matches!(revise, Some(Discharge::Until(t)) if t.contains("feedback")),
+            "revise is discharged by addressing the FEEDBACK: {revise:?}"
+        );
+        // A future reason must not be given a borrowed condition.
+        assert_eq!(discharge_of("master", Some("some_new_reason")), None);
+    }
+
+    #[test]
+    fn blocked_tells_the_agent_not_to_act() {
+        // The one wake where acting is WRONG, and where an agent is
+        // most likely to invent an action to stop the nagging.
+        let Some(Discharge::Until(t)) = discharge_of("blocked", None) else {
+            panic!("blocked must carry guidance");
+        };
+        assert!(t.contains("CANNOT"), "{t}");
+        assert!(t.contains("human"), "{t}");
+        assert!(t.contains("not answer it yourself"), "{t}");
+    }
+
+    #[test]
+    fn unknown_kinds_render_without_a_condition_and_do_not_panic() {
+        assert_eq!(discharge_of("some_future_kind", None), None);
+        assert!(discharge_suffix("some_future_kind", None).is_empty());
+    }
+
+    #[test]
+    fn the_rendered_wake_carries_the_condition_and_still_carries_the_sha() {
+        let items: Vec<WaitItem> = serde_json::from_value(serde_json::json!([
+            {"kind":"master","plan":"p","sha":FULL_SHA,
+             "next":"continue","reason":"gate_continue","gate":"continued"}
+        ]))
+        .unwrap();
+        let refs: Vec<&WaitItem> = items.iter().collect();
+        let out = render_wait_items_ref(&refs, &AgentLabel::parse("claude").unwrap(), Role::Master);
+        assert!(out.contains("gate_continue"), "{out}");
+        assert!(
+            out.contains("fires until"),
+            "the wake says what stops it: {out}"
+        );
+        assert!(
+            out.contains(&FULL_SHA[..12]),
+            "the 12-char sha stays — it is what `feedback write --commit` is built from: {out}"
+        );
     }
 
     #[test]
