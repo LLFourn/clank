@@ -177,7 +177,14 @@ fn gh_colored_row(g: &crate::cli::github_timeline::MergedEvent, mark: &str) -> S
 /// mirrors the `clank events` CLI's shape so the two surfaces read
 /// the same.
 fn gh_describe(g: &crate::cli::github_timeline::MergedEvent) -> String {
-    let mut out = g.event.clone();
+    // WHO first: scanning the timeline, the actor is the fastest way to
+    // tell your own activity from someone else's, so it leads rather
+    // than trailing after a title that can be long enough to truncate.
+    let mut out = String::new();
+    if let Some(a) = &g.actor {
+        out.push_str(&format!("{a}  "));
+    }
+    out.push_str(&g.event);
     if let Some(d) = &g.detail {
         out.push_str(&format!("/{d}"));
     }
@@ -187,9 +194,6 @@ fn gh_describe(g: &crate::cli::github_timeline::MergedEvent) -> String {
     }
     if let Some(t) = &g.title {
         out.push_str(&format!("  “{t}”"));
-    }
-    if let Some(a) = &g.actor {
-        out.push_str(&format!("  by {a}"));
     }
     out
 }
