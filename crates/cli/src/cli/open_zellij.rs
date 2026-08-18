@@ -1212,49 +1212,113 @@ pub(crate) fn stack_reviewer_panes(
     }
 }
 
-/// Whether this repo's reviewer panes share ONE stack that the
+/// Whether this repo's reviewer panes form ONE zellij stack that the
 /// instrument pane is not in.
 ///
-/// `list-panes` has no stacked flag and does not need one: stack
-/// members are reported at IDENTICAL geometry (the whole stack area),
-/// and panes that are NOT stacked never overlap. So equal
-/// (x, y, columns, rows) across the reviewer panes is stack
-/// membership.
+/// zellij reports a stack in TWO shapes, and both are accepted because
+/// both have been measured:
 ///
-/// The status pane must be checked too, not assumed away. If the
-/// reviewers AND status all sit in one stack — the exact bug this
-/// repairs — every reviewer geometry still agrees, so a
-/// reviewers-only predicate reports "placed" and caches the broken
-/// arrangement forever (codex on d5121e1). Its geometry differing
-/// from the stack's IS its exclusion.
+/// - **Identical geometry** — every member reports the whole stack
+///   area (the original observation this predicate was built on).
+/// - **Expanded + collapsed** — one member holds the area and the rest
+///   are one-row title bars, sharing a column span and tiling a
+///   contiguous run. Captured live on 0.45.0; requiring only the first
+///   shape made every correctly stacked tab read as broken, so the
+///   reconcile pass repaired it on every refresh forever and stole
+///   focus each time (placement-reads-zellij-stacks-correctly).
+///
+/// Accepting one shape and not the other is what caused the bug, so
+/// neither is privileged.
+///
+/// `tab_id` equality is an explicit invariant: `list-panes` spans ALL
+/// tabs, so panes in different tabs can share a column span and read
+/// as contiguous by coordinate alone (codex on 5320c1d), and no
+/// `stack-panes` call can join two tabs.
+///
+/// `list-panes --json` on 0.45.0 exposes no stack flag —
+/// `is_floating` / `is_fullscreen` / `is_held` / `is_suppressed` and an
+/// empty `index_in_pane_group` — so geometry is the only signal.
 pub(crate) fn reviewers_are_stacked(
     panes: &[ZellijPane],
     repo: &Path,
     reviewers: &[String],
 ) -> bool {
     let repo_str = repo.to_string_lossy();
-    let geom = |p: &ZellijPane| (p.pane_x, p.pane_y, p.pane_columns, p.pane_rows);
-    let geoms: Vec<(u16, u16, u16, u16)> = panes
+    let mine: Vec<&ZellijPane> = panes
         .iter()
         .filter(|p| {
             agent_pane_label(p, &repo_str).is_some_and(|l| reviewers.iter().any(|r| r == l))
         })
-        .map(geom)
         .collect();
-    let Some(stack) = geoms.first() else {
+    let Some(first) = mine.first() else {
         return true;
     };
-    if geoms.iter().any(|g| g != stack) {
+    let status_command = format!("clank status --repo {repo_str} --tui");
+    let statuses: Vec<&ZellijPane> = panes
+        .iter()
+        .filter(|p| !p.is_plugin && p.terminal_command.as_deref() == Some(status_command.as_str()))
+        .collect();
+    let same_column = |a: &ZellijPane, b: &ZellijPane| {
+        a.tab_id == b.tab_id && a.pane_x == b.pane_x && a.pane_columns == b.pane_columns
+    };
+    // `tab_id` FIRST: identical coordinates in two different tabs are
+    // two panes, not one stack. `list-panes` spans all tabs, so
+    // leaving it out let a cross-tab pair read as placed.
+    let geom = |p: &ZellijPane| (p.tab_id, p.pane_x, p.pane_y, p.pane_columns, p.pane_rows);
+    // Two panes in one column span are stack SIBLINGS when they abut
+    // and either is collapsed to a title row. Abutting alone is the
+    // NORMAL layout — the instrument pane sits directly under the
+    // reviewer region — so the collapse is what distinguishes them.
+    let stacked_with = |a: &ZellijPane, b: &ZellijPane| {
+        same_column(a, b)
+            && (a.pane_rows == 1 || b.pane_rows == 1)
+            && (a.pane_y + a.pane_rows == b.pane_y || b.pane_y + b.pane_rows == a.pane_y)
+    };
+
+    // A lone reviewer forms no stack of its own; the only question is
+    // whether the instrument pane shares one WITH it — the reported
+    // bug's first-reviewer form, in either shape.
+    if mine.len() == 1 {
+        return !statuses
+            .iter()
+            .any(|st| geom(st) == geom(first) || stacked_with(st, first));
+    }
+
+    // Every geometry field is `#[serde(default)]`, so an absent one
+    // reads as 0 — and all-zero panes compare IDENTICAL, which would
+    // report a stack we never saw and cache it. A listing we cannot
+    // measure must fail CLOSED (codex on 7b3536c).
+    if mine.iter().any(|p| p.pane_columns == 0 || p.pane_rows == 0) {
         return false;
     }
-    // The instrument pane, when this repo has one, must sit OUTSIDE
-    // that geometry.
-    let status_command = format!("clank status --repo {repo_str} --tui");
-    !panes.iter().any(|p| {
-        !p.is_plugin
-            && p.terminal_command.as_deref() == Some(status_command.as_str())
-            && geom(p) == *stack
-    })
+    let all_identical = mine.iter().all(|p| geom(p) == geom(first));
+    let run_shaped = {
+        let one_column = mine.iter().all(|p| same_column(p, first));
+        // Exactly one expanded AND every other member exactly one row
+        // — the captured shape. "Not expanded" would admit a zero-row
+        // pane, which also satisfies the contiguity equation below.
+        let one_expanded = mine.iter().filter(|p| p.pane_rows > 1).count() == 1;
+        let rest_collapsed = mine.iter().filter(|p| p.pane_rows == 1).count() == mine.len() - 1;
+        let mut rows: Vec<(u16, u16)> = mine.iter().map(|p| (p.pane_y, p.pane_rows)).collect();
+        rows.sort();
+        let contiguous = rows.windows(2).all(|w| w[0].0 + w[0].1 == w[1].0);
+        one_column && one_expanded && rest_collapsed && contiguous
+    };
+    if !all_identical && !run_shaped {
+        return false;
+    }
+
+    // The instrument pane must not be a MEMBER of that stack.
+    if all_identical {
+        return !statuses.iter().any(|st| geom(st) == geom(first));
+    }
+    let mut rows: Vec<(u16, u16)> = mine.iter().map(|p| (p.pane_y, p.pane_rows)).collect();
+    rows.sort();
+    let top = rows[0].0;
+    let bottom = rows[rows.len() - 1].0 + rows[rows.len() - 1].1;
+    !statuses
+        .iter()
+        .any(|st| same_column(st, first) && st.pane_y >= top && st.pane_y < bottom)
 }
 
 /// Best-effort: close the panes of removed reviewers, matched by exact
@@ -1985,6 +2049,215 @@ ttys004   zellij attach clank-foo
             Some("terminal_9")
         );
         assert_eq!(focus_target_from(None, None), None);
+    }
+
+    #[test]
+    fn live_zellij_stacks_read_as_placed() {
+        // THE regression, on geometry captured live from zellij 0.45.0
+        // (session `clank-fsctl`, 2026-08-18). A stack renders as one
+        // EXPANDED member plus collapsed one-row title bars — members
+        // do NOT share identical geometry, which the old predicate
+        // required. Every one of these tabs was correctly stacked and
+        // read as broken, so the reconcile pass repaired them on every
+        // refresh forever and stole the user's focus each time.
+        let pane = |cmd: &str, tab: u32, x: u16, y: u16, w: u16, h: u16| ZellijPane {
+            id: 1,
+            is_plugin: false,
+            terminal_command: Some(cmd.to_string()),
+            title: String::new(),
+            tab_id: tab,
+            pane_x: x,
+            pane_y: y,
+            pane_columns: w,
+            pane_rows: h,
+        };
+        let repo = std::path::Path::new("/r");
+        let two = vec!["codex".to_string(), "ruthless".to_string()];
+        let cx = "clank agent start codex --repo /r";
+        let ru = "clank agent start ruthless --repo /r";
+
+        // (name, codex geom, ruthless geom) — verbatim captures.
+        let live: [(&str, (u16, u16, u16, u16), (u16, u16, u16, u16)); 5] = [
+            (
+                "nonce-aware-coin-selection",
+                (116, 1, 62, 1),
+                (116, 2, 62, 93),
+            ),
+            ("firmware-upgrade-nudge", (116, 1, 62, 93), (116, 94, 62, 1)),
+            ("sign-task-path-bounds", (116, 1, 62, 1), (116, 2, 62, 93)),
+            ("change-index-leak-demo", (0, 88, 125, 1), (0, 89, 125, 46)),
+            ("fix-anchor-above-tip", (116, 1, 62, 1), (116, 2, 62, 93)),
+        ];
+        for (name, c, r) in live {
+            let panes = vec![
+                pane(cx, 1, c.0, c.1, c.2, c.3),
+                pane(ru, 1, r.0, r.1, r.2, r.3),
+            ];
+            assert!(
+                reviewers_are_stacked(&panes, repo, &two),
+                "{name}: a real zellij stack must read as PLACED"
+            );
+        }
+    }
+
+    #[test]
+    fn a_genuine_split_is_not_a_stack() {
+        // Side by side in different column spans — the shape a stack
+        // repair should still act on.
+        let pane = |cmd: &str, x: u16, y: u16, w: u16, h: u16| ZellijPane {
+            id: 1,
+            is_plugin: false,
+            terminal_command: Some(cmd.to_string()),
+            title: String::new(),
+            tab_id: 1,
+            pane_x: x,
+            pane_y: y,
+            pane_columns: w,
+            pane_rows: h,
+        };
+        let repo = std::path::Path::new("/r");
+        let two = vec!["codex".to_string(), "ruthless".to_string()];
+        let panes = vec![
+            pane("clank agent start codex --repo /r", 0, 1, 60, 40),
+            pane("clank agent start ruthless --repo /r", 60, 1, 60, 40),
+        ];
+        assert!(!reviewers_are_stacked(&panes, repo, &two));
+    }
+
+    #[test]
+    fn unmeasurable_geometry_fails_closed_in_both_shapes() {
+        // Every geometry field is `#[serde(default)]`, so an absent one
+        // reads as 0. All-zero panes compare IDENTICAL, and a zero-row
+        // pane also satisfies the contiguity equation — both would
+        // report a stack nobody observed and CACHE it, leaving a real
+        // misplacement unrepaired (codex on 7b3536c). A listing we
+        // cannot measure must never read as placed.
+        let bare = |cmd: &str, y: u16, w: u16, h: u16| ZellijPane {
+            id: 1,
+            is_plugin: false,
+            terminal_command: Some(cmd.to_string()),
+            title: String::new(),
+            tab_id: 1,
+            pane_x: 116,
+            pane_y: y,
+            pane_columns: w,
+            pane_rows: h,
+        };
+        let repo = std::path::Path::new("/r");
+        let two = vec!["codex".to_string(), "ruthless".to_string()];
+        let cx = "clank agent start codex --repo /r";
+        let ru = "clank agent start ruthless --repo /r";
+
+        // Identical shape, geometry entirely absent.
+        let zeroed = vec![bare(cx, 0, 0, 0), bare(ru, 0, 0, 0)];
+        assert!(
+            !reviewers_are_stacked(&zeroed, repo, &two),
+            "all-zero geometry must not read as an identical-shape stack"
+        );
+
+        // Run shape, with a ZERO-row member that satisfies contiguity
+        // (y + 0 == y) but is not a collapsed title bar.
+        let zero_member = vec![bare(cx, 1, 62, 0), bare(ru, 1, 62, 93)];
+        assert!(
+            !reviewers_are_stacked(&zero_member, repo, &two),
+            "a zero-row pane is not a collapsed member"
+        );
+
+        // The real collapsed shape still passes, so the guard did not
+        // simply reject everything.
+        let real = vec![bare(cx, 1, 62, 1), bare(ru, 2, 62, 93)];
+        assert!(reviewers_are_stacked(&real, repo, &two));
+    }
+
+    #[test]
+    fn identical_geometry_in_different_tabs_is_not_one_stack() {
+        // The hole codex found: the identical-shape branch compared
+        // only x/y/columns/rows, so two panes at the SAME coordinates
+        // in DIFFERENT tabs read as one stack. `list-panes` spans all
+        // tabs, so that pair is ordinary — every tab has a pane at
+        // (116,1). The previous different-tab test used different
+        // y/rows and therefore only exercised the run-shaped branch.
+        let pane = |cmd: &str, tab: u32| ZellijPane {
+            id: 1,
+            is_plugin: false,
+            terminal_command: Some(cmd.to_string()),
+            title: String::new(),
+            tab_id: tab,
+            pane_x: 116,
+            pane_y: 1,
+            pane_columns: 62,
+            pane_rows: 40,
+        };
+        let repo = std::path::Path::new("/r");
+        let two = vec!["codex".to_string(), "ruthless".to_string()];
+        let panes = vec![
+            pane("clank agent start codex --repo /r", 1),
+            pane("clank agent start ruthless --repo /r", 9),
+        ];
+        assert!(
+            !reviewers_are_stacked(&panes, repo, &two),
+            "identical coordinates in different tabs are two panes, not a stack"
+        );
+    }
+
+    #[test]
+    fn reviewers_in_different_tabs_are_never_stacked() {
+        // `list-panes` spans ALL tabs, so identical column spans can
+        // collide across tabs and read as contiguous by coordinate
+        // alone. Same-tab is an invariant, not a coincidence (codex on
+        // 5320c1d) — and no `stack-panes` call can join two tabs.
+        let pane = |cmd: &str, tab: u32, y: u16, h: u16| ZellijPane {
+            id: 1,
+            is_plugin: false,
+            terminal_command: Some(cmd.to_string()),
+            title: String::new(),
+            tab_id: tab,
+            pane_x: 116,
+            pane_y: y,
+            pane_columns: 62,
+            pane_rows: h,
+        };
+        let repo = std::path::Path::new("/r");
+        let two = vec!["codex".to_string(), "ruthless".to_string()];
+        let panes = vec![
+            pane("clank agent start codex --repo /r", 1, 1, 1),
+            pane("clank agent start ruthless --repo /r", 7, 2, 93),
+        ];
+        assert!(
+            !reviewers_are_stacked(&panes, repo, &two),
+            "different tabs cannot be one stack"
+        );
+    }
+
+    #[test]
+    fn the_instrument_pane_inside_the_stack_still_fails() {
+        // The ORIGINAL bug must stay caught under the new model: a
+        // status pane that is a member of the reviewers' run.
+        let pane = |cmd: &str, y: u16, h: u16| ZellijPane {
+            id: 1,
+            is_plugin: false,
+            terminal_command: Some(cmd.to_string()),
+            title: String::new(),
+            tab_id: 1,
+            pane_x: 116,
+            pane_y: y,
+            pane_columns: 62,
+            pane_rows: h,
+        };
+        let repo = std::path::Path::new("/r");
+        let two = vec!["codex".to_string(), "ruthless".to_string()];
+        let panes = vec![
+            pane("clank agent start codex --repo /r", 1, 1),
+            pane("clank agent start ruthless --repo /r", 3, 92),
+            // Wedged BETWEEN the reviewers — a stack member, which is
+            // the reported bug. Contrast the healthy layout, where the
+            // instrument pane sits directly BELOW the run.
+            pane("clank status --repo /r --tui", 2, 1),
+        ];
+        assert!(
+            !reviewers_are_stacked(&panes, repo, &two),
+            "the instrument pane sharing the run is the reported bug"
+        );
     }
 
     #[test]

@@ -311,7 +311,26 @@ impl PaneStatus {
 /// or TUI start, not instantly.
 pub(super) struct PaneReconciler {
     converged: Option<RosterView>,
+    /// Consecutive failed placement repairs for `failing`. Three of the
+    /// four ways placement can fail cannot be fixed by trying again —
+    /// reviewers split across tabs, the instrument pane already inside
+    /// the stack (zellij has no `break-pane`), and a `stack-panes` the
+    /// server silently rejected. Retrying those forever is what turned
+    /// a wrong verdict into permanent focus churn, so repair is bounded
+    /// independently of whether the predicate is right
+    /// (placement-reads-zellij-stacks-correctly).
+    failed_repairs: u32,
+    failing: Option<RosterView>,
 }
+
+/// Consecutive FAILING passes allowed for one roster before the tab is
+/// left alone — covering restacking AND add / remove / relocate, since
+/// any of them can fail verification forever and each acts on the tab
+/// (codex on dfeff8c). Small on purpose: an action that works, works
+/// on the first pass. `clank open` remains the escape hatch, as it
+/// already is for a lone reviewer sharing the instrument pane's
+/// stack.
+const MAX_FAILED_PASSES: u32 = 2;
 
 /// The roster facts panes depend on: the member set and who is master.
 /// Role flips between reviewer tiers keep the same pane, so tiers are
@@ -534,7 +553,11 @@ impl PaneIo for ZellijPaneIo<'_> {
 
 impl PaneReconciler {
     pub(super) fn new() -> Self {
-        Self { converged: None }
+        Self {
+            converged: None,
+            failed_repairs: 0,
+            failing: None,
+        }
     }
 
     /// One reconciliation pass for `cur`, skipped when that exact view
@@ -542,6 +565,25 @@ impl PaneReconciler {
     /// set comparison, no zellij calls. Runs on the [`ReconcileWorker`]
     /// thread, never the TUI loop (tui-reconcile-off-loop). Returns
     /// whether the pass issued actions.
+    /// Record a failing pass for `cur`; `true` once the budget is
+    /// spent and the tab should be left alone. Counted PER ROSTER: a
+    /// roster change both invalidates the count and can make the
+    /// action possible again.
+    fn note_failure(&mut self, cur: &RosterView) -> bool {
+        if self.failing.as_ref() == Some(cur) {
+            self.failed_repairs += 1;
+        } else {
+            self.failing = Some(cur.clone());
+            self.failed_repairs = 1;
+        }
+        self.failed_repairs >= MAX_FAILED_PASSES
+    }
+
+    fn note_success(&mut self) {
+        self.failed_repairs = 0;
+        self.failing = None;
+    }
+
     fn reconcile(&mut self, cur: RosterView, io: &mut impl PaneIo) -> bool {
         if self.converged.as_ref() == Some(&cur) {
             return false;
@@ -588,7 +630,16 @@ impl PaneReconciler {
             // roster changing (a second reviewer arriving) both
             // invalidates this and makes repair possible again.
             // Anything else stays unconverged and retries.
-            if placed || reviewers.len() < 2 {
+            if placed {
+                self.note_success();
+                self.converged = Some(cur);
+                return true;
+            }
+            // Give up on what we cannot fix, rather than acting on
+            // every refresh forever. `< 2` keeps its original meaning:
+            // with one reviewer there is no action left to try at all.
+            let spent = self.note_failure(&cur);
+            if reviewers.len() < 2 || spent {
                 self.converged = Some(cur);
             }
             return true;
@@ -664,6 +715,14 @@ impl PaneReconciler {
             .verify(&reviewers)
             .is_some_and(|(after, placed)| placed && plan_panes(&cur, &after).is_converged())
         {
+            self.note_success();
+            self.converged = Some(cur);
+        } else if self.note_failure(&cur) {
+            // An add / remove / relocate that never verifies acts on
+            // the tab every refresh exactly like a failing restack did.
+            // The budget covers it, or the acceptance criterion ("no
+            // reachable state issues actions indefinitely") is false
+            // for three of the four action kinds (codex on dfeff8c).
             self.converged = Some(cur);
         }
         true
@@ -1245,6 +1304,110 @@ mod tests {
         assert!(
             r.converged.is_none(),
             "an unstacked result must not converge just because nothing was added"
+        );
+    }
+
+    #[test]
+    fn repair_is_bounded_when_placement_can_never_succeed() {
+        // THE churn. Three of the four ways placement can fail cannot
+        // be fixed by trying again — reviewers split across tabs, the
+        // instrument pane already inside the stack (no `break-pane`
+        // exists), and a `stack-panes` the server silently rejected.
+        // Retrying them every refresh is what moved the user's focus
+        // to a pane where nothing was happening, indefinitely.
+        //
+        // Asserted on the number of ACTIONS, not the verdict: the
+        // symptom was the repeated work, so a fix that keeps answering
+        // "not placed" is fine as long as it stops POKING the tab.
+        let snap = roster_snap(&[("claude", true), ("r1", false), ("r2", false)]);
+        let all_live = live(&[("claude", true), ("r1", false), ("r2", false)]);
+        let passes = 8;
+        let mut r = PaneReconciler::new();
+        let mut io = FakeIo::with_verify(vec![Some(all_live.clone()); passes], vec![None; passes]);
+        // Placement NEVER succeeds, however many times it is tried.
+        io.placed_results = vec![false; passes * 2].into();
+        io.stack_results = vec![false; passes * 2].into();
+
+        for _ in 0..passes {
+            r.reconcile(RosterView::of(&snap), &mut io);
+        }
+
+        let attempts = io.log.iter().filter(|l| l.starts_with("stack ")).count();
+        assert!(
+            attempts <= MAX_FAILED_PASSES as usize,
+            "repair must be bounded: {attempts} attempts over {passes} passes; log {:?}",
+            io.log
+        );
+        assert!(
+            r.converged.is_some(),
+            "after the bound the tab is left alone until `clank open` rebuilds it"
+        );
+    }
+
+    #[test]
+    fn a_failing_add_is_bounded_too_not_only_a_failing_restack() {
+        // The budget originally lived only in the placement branch, so
+        // an add / remove / relocate that never verifies kept acting
+        // on the tab every refresh — the same churn by another door,
+        // and it falsified the plan's own acceptance criterion (codex
+        // on dfeff8c).
+        let snap = roster_snap(&[("claude", true), ("r1", false), ("r2", false)]);
+        // The listing never shows r2, so the pass always plans an add
+        // and the verifying read never confirms.
+        let missing = live(&[("claude", true), ("r1", false)]);
+        let passes = 8;
+        let mut r = PaneReconciler::new();
+        let mut io = FakeIo::with_verify(vec![Some(missing.clone()); passes], vec![None; passes]);
+
+        for _ in 0..passes {
+            r.reconcile(RosterView::of(&snap), &mut io);
+        }
+
+        let adds = io.log.iter().filter(|l| l.starts_with("add ")).count();
+        assert!(
+            adds <= MAX_FAILED_PASSES as usize,
+            "a never-verifying add must be bounded: {adds} over {passes} passes; log {:?}",
+            io.log
+        );
+    }
+
+    #[test]
+    fn a_roster_change_reopens_repair_after_the_bound() {
+        // The bound must not wedge a tab permanently: a roster change
+        // both invalidates the count and can make repair possible
+        // again (a member arriving or leaving changes the layout).
+        let snap_a = roster_snap(&[("claude", true), ("r1", false), ("r2", false)]);
+        let live_a = live(&[("claude", true), ("r1", false), ("r2", false)]);
+        let mut r = PaneReconciler::new();
+        let mut io = FakeIo::with_verify(vec![Some(live_a); 6], vec![None; 6]);
+        io.placed_results = vec![false; 12].into();
+        io.stack_results = vec![false; 12].into();
+        for _ in 0..4 {
+            r.reconcile(RosterView::of(&snap_a), &mut io);
+        }
+        let before = io.log.iter().filter(|l| l.starts_with("stack ")).count();
+
+        // A third reviewer joins: new roster, fresh budget.
+        let snap_b = roster_snap(&[
+            ("claude", true),
+            ("r1", false),
+            ("r2", false),
+            ("r3", false),
+        ]);
+        let live_b = live(&[
+            ("claude", true),
+            ("r1", false),
+            ("r2", false),
+            ("r3", false),
+        ]);
+        let mut io2 = FakeIo::with_verify(vec![Some(live_b); 3], vec![None; 3]);
+        io2.placed_results = vec![false; 6].into();
+        io2.stack_results = vec![false; 6].into();
+        r.reconcile(RosterView::of(&snap_b), &mut io2);
+        assert!(
+            io2.log.iter().any(|l| l.starts_with("stack ")),
+            "a changed roster retries; before={before}, log {:?}",
+            io2.log
         );
     }
 
