@@ -451,7 +451,9 @@ pub(super) trait PaneIo {
     /// unstacked tab be cached (codex on d5121e1) — and splitting
     /// them would cost a second session-wide listing.
     fn verify(&mut self, reviewers: &[String]) -> Option<(Vec<(String, bool)>, bool)>;
-    fn capture_focus(&mut self) -> Option<String>;
+    /// The pane to restore focus to after the pass. Takes the pass's
+    /// listing so the target costs no session-wide query of its own.
+    fn capture_focus(&mut self, snap: &Self::Snap) -> Option<String>;
     fn restore_focus(&mut self, id: &str);
     /// Create the pane; reports the id when one was made, plus any
     /// reviewer pane found by TITLE that anchored it. The caller
@@ -481,11 +483,69 @@ pub(super) trait PaneIo {
         snap: &Self::Snap,
     );
     fn remove_all(&mut self, labels: &[String], snap: &Self::Snap);
+    /// Whether THIS process may drive pane reconciliation for the repo.
+    ///
+    /// Exactly one may, at a time — the same shape as the ingest lease
+    /// (wal-single-ingest-writer). Two TUIs on one repo is a supported
+    /// and OBSERVED state (the `full-app-sim-driver` worktree had two
+    /// live `clank status --tui` processes), and the existing comment
+    /// on cache invalidation already anticipates one converging the
+    /// other's layout.
+    ///
+    /// What it does not survive is both ACTING. A worker serializes
+    /// passes only within its own process, so two drivers doing
+    /// list-then-create is a lock-free TOCTOU: both see a label
+    /// missing, both create, and the tool refuses the second session
+    /// with `already has an active writer`, leaving a corpse that the
+    /// listing still counts as that label's pane.
+    ///
+    /// Scoped to RECONCILE: structural pane work (create, stack,
+    /// relocate, close) and convergence caching. The RETITLE pass is
+    /// deliberately outside the lease — pane titles are SESSION-local,
+    /// so a loser in a different zellij session never receives the
+    /// holder's stamps and must apply its own; within one session the
+    /// two stamp identical titles from identical inputs.
+    fn may_reconcile(&mut self) -> bool;
 }
 
 /// The real zellij-backed [`PaneIo`].
 struct ZellijPaneIo<'a> {
     repo: &'a std::path::Path,
+    /// Held for as long as this process drives the repo. Re-attempted
+    /// while absent, so closing the holding TUI hands reconciliation
+    /// to a surviving one rather than stranding it.
+    lease: Option<ReconcileLease>,
+}
+
+/// flock RAII over `<repo>/.clank/zellij-reconcile.lock`.
+///
+/// Exclusive and NON-blocking: a second driver must degrade, not
+/// queue — queuing would apply a pass computed against a roster the
+/// holder has already changed.
+///
+/// flock dies with the process, so a killed TUI frees the lease with
+/// no cleanup protocol. Rust opens files `O_CLOEXEC`, so the zellij
+/// subprocesses this drives cannot carry the lease past their exec.
+struct ReconcileLease {
+    _file: std::fs::File,
+}
+
+impl ReconcileLease {
+    fn acquire(repo: &std::path::Path) -> Option<Self> {
+        use std::os::fd::AsRawFd;
+        let dir = repo.join(".clank");
+        std::fs::create_dir_all(&dir).ok()?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(dir.join("zellij-reconcile.lock"))
+            .ok()?;
+        // SAFETY: valid owned fd; flock has no memory effects.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        (rc == 0).then_some(Self { _file: file })
+    }
 }
 
 impl PaneIo for ZellijPaneIo<'_> {
@@ -522,8 +582,14 @@ impl PaneIo for ZellijPaneIo<'_> {
             crate::cli::open_zellij::reviewers_are_stacked(&snap, self.repo, reviewers),
         ))
     }
-    fn capture_focus(&mut self) -> Option<String> {
-        crate::cli::open_zellij::pass_focus_target()
+    fn capture_focus(&mut self, snap: &Self::Snap) -> Option<String> {
+        crate::cli::open_zellij::pass_focus_target(snap)
+    }
+    fn may_reconcile(&mut self) -> bool {
+        if self.lease.is_none() {
+            self.lease = ReconcileLease::acquire(self.repo);
+        }
+        self.lease.is_some()
     }
     fn restore_focus(&mut self, id: &str) {
         crate::cli::open_zellij::focus_pane(id);
@@ -602,6 +668,13 @@ impl PaneReconciler {
         if self.converged.as_ref() == Some(&cur) {
             return false;
         }
+        // Not this process's to reconcile. Nothing is cached as
+        // converged: the holder's work is not ours to claim, and if
+        // the lease frees we must reconcile from whatever state it
+        // left. Retitles continue — see [`PaneIo::may_reconcile`].
+        if !io.may_reconcile() {
+            return false;
+        }
         // Listing failure → touch nothing AND stay unconverged, so the
         // next refresh retries (acting on a partial listing would
         // re-open every pane; forgetting the event would drop it).
@@ -626,7 +699,7 @@ impl PaneReconciler {
                 self.converged = Some(cur);
                 return false;
             }
-            let focus = io.capture_focus();
+            let focus = io.capture_focus(&snap);
             let placed = io.stack(&reviewers, &snap, &[]);
             if let Some(id) = &focus {
                 io.restore_focus(id);
@@ -661,7 +734,7 @@ impl PaneReconciler {
         // Pass-level focus transaction: capture the user's focus once
         // before the first action, restore once after the last
         // (zellij-one-listing-per-pass).
-        let focus = io.capture_focus();
+        let focus = io.capture_focus(&snap);
         // Adds before the relocate (a swapped-in master may be brand
         // new), removes last.
         // Adds do not stack; the whole desired set is stacked ONCE
@@ -860,7 +933,10 @@ impl ReconcileWorker {
         let (tx, rx) = std::sync::mpsc::channel::<WorkerMsg>();
         let join = std::thread::spawn(move || {
             let mut state = WorkerState::new();
-            let mut io = ZellijPaneIo { repo: &repo };
+            let mut io = ZellijPaneIo {
+                repo: &repo,
+                lease: None,
+            };
             worker_loop(&rx, |roster, glyphs| {
                 state.handle(roster, glyphs, &mut io, list_panes, rename_pane);
             });
@@ -1062,6 +1138,8 @@ mod tests {
         add_results: std::collections::VecDeque<bool>,
         add_anchors: std::collections::VecDeque<Option<String>>,
         add_departing: Vec<Vec<String>>,
+        /// Scripted lease answer; the real IO holds an flock.
+        may_reconcile: bool,
         stack_results: std::collections::VecDeque<bool>,
         placed_results: std::collections::VecDeque<bool>,
         verify_placed: std::collections::VecDeque<bool>,
@@ -1086,6 +1164,7 @@ mod tests {
                 add_results: std::collections::VecDeque::new(),
                 add_anchors: std::collections::VecDeque::new(),
                 add_departing: Vec::new(),
+                may_reconcile: true,
                 stack_results: std::collections::VecDeque::new(),
                 placed_results: std::collections::VecDeque::new(),
                 verify_placed: std::collections::VecDeque::new(),
@@ -1110,7 +1189,10 @@ mod tests {
                 .unwrap_or(None)
                 .map(|p| (p, placed))
         }
-        fn capture_focus(&mut self) -> Option<String> {
+        fn may_reconcile(&mut self) -> bool {
+            self.may_reconcile
+        }
+        fn capture_focus(&mut self, _snap: &Self::Snap) -> Option<String> {
             self.focus_captures += 1;
             Some("user_pane".to_string())
         }
@@ -1288,8 +1370,8 @@ mod tests {
     #[test]
     fn promote_shaped_pass_takes_one_snapshot_one_verify_one_focus() {
         // zellij-one-listing-per-pass: all panes pre-exist — the pass
-        // must cost exactly ONE --json snapshot, ONE dump-layout
-        // verify, and ONE focus capture/restore transaction.
+        // must cost exactly ONE --json snapshot, ONE verifying listing,
+        // and ONE focus capture/restore transaction.
         let snap = roster_snap(&[("codex", true), ("claude", false)]);
         let mut r = PaneReconciler::new();
         let before = live(&[("claude", true), ("codex", false)]);
@@ -1576,6 +1658,84 @@ mod tests {
             r.converged.is_none(),
             "placement not confirmed → the pass must stay unconverged so it retries"
         );
+    }
+
+    #[test]
+    fn a_driver_without_the_lease_still_retitles() {
+        // NOT an oversight in the lease: pane titles are SESSION-local.
+        // A loser driving a different zellij session never sees the
+        // holder's stamps, so gating this would leave its own session
+        // permanently unglyphed. Within one session both write the
+        // same title from the same inputs.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let mut state = WorkerState::new();
+        let mut io = FakeIo::new(vec![Some(live(&[("claude", true)]))]);
+        io.may_reconcile = false;
+        let lists = AtomicUsize::new(0);
+        let mut renames: Vec<(String, String)> = Vec::new();
+        state.handle(
+            Some(view(&["claude"], Some("claude"))),
+            Some(StatusGlyphs {
+                emoji: [("claude".to_string(), ("M", "R"))].into_iter().collect(),
+                wanted: vec!["claude".into()],
+            }),
+            &mut io,
+            || {
+                lists.fetch_add(1, Ordering::SeqCst);
+                Some("terminal_1  terminal  claude (master)".to_string())
+            },
+            |id, title| renames.push((id.to_string(), title.to_string())),
+        );
+        assert!(io.log.is_empty(), "no structural pane work: {:?}", io.log);
+        assert_eq!(
+            renames,
+            vec![("terminal_1".to_string(), "M claude (master)".to_string())],
+            "the retitle pass runs without the lease"
+        );
+        assert_eq!(lists.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn the_reconcile_lease_admits_exactly_one_holder_and_frees_on_drop() {
+        // flock binds to the OPEN FILE DESCRIPTION, so a second
+        // acquire conflicts even from this process -- which is what
+        // makes it exclusive across the two TUIs it exists to
+        // separate.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let first = ReconcileLease::acquire(repo).expect("first driver takes it");
+        assert!(
+            ReconcileLease::acquire(repo).is_none(),
+            "a second driver must be refused, not queued"
+        );
+        drop(first);
+        assert!(
+            ReconcileLease::acquire(repo).is_some(),
+            "closing the holder must hand reconciliation over, not strand it"
+        );
+    }
+
+    #[test]
+    fn a_driver_without_the_lease_does_not_reconcile_and_caches_nothing() {
+        // Two TUIs on one repo is supported and observed. Their
+        // workers serialize only within a process, so both doing
+        // STRUCTURAL pane work is a lock-free TOCTOU that double-opens
+        // a pane -- and the second tool refuses the session, leaving a
+        // corpse the listing still counts.
+        //
+        // Scoped to reconcile: retitles are session-local and stay
+        // dual on purpose, pinned by
+        // `a_driver_without_the_lease_still_retitles`.
+        let snap = roster_snap(&[("claude", true), ("r1", false)]);
+        let before = live(&[("claude", true)]);
+        let mut r = PaneReconciler::new();
+        let mut io = FakeIo::with_verify(vec![Some(before)], vec![None]);
+        io.may_reconcile = false;
+        assert!(!r.reconcile(RosterView::of(&snap), &mut io));
+        assert!(io.log.is_empty(), "no zellij work: {:?}", io.log);
+        // Nothing cached: the holder's convergence is not ours to
+        // claim, and we must act on whatever it leaves if it exits.
+        assert!(r.converged.is_none());
     }
 
     #[test]

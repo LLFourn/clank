@@ -896,6 +896,18 @@ pub(crate) struct ZellijPane {
     /// so this scopes a relocation to the caller's active tab.
     #[serde(default)]
     tab_id: u32,
+    /// Focused WITHIN its tab. Every tab reports one, so this alone
+    /// cannot name the user's focus — paired with [`active_tab_id`] it
+    /// can. Default false when absent, which costs a focus restore
+    /// rather than a wrong one.
+    #[serde(default)]
+    is_focused: bool,
+    /// The pane's process has ended (zellij holds the pane open with
+    /// its exit code). Deliberately NOT part of identifying a pane —
+    /// see [`agent_pane_label`] — and used only to choose WHICH copy
+    /// to close in [`remove_target_ids`].
+    #[serde(default)]
+    exited: bool,
     /// Pane geometry (terminal cells) from `list-panes --json`: top-left
     /// position + size. Feeds [`tab_dims`] so orientation is read from the
     /// tab's true extent, not the caller's own pane. Default 0 when absent.
@@ -930,6 +942,21 @@ fn find_pane_by_command<'a>(panes: &'a [ZellijPane], cmd: &str) -> Option<&'a Ze
 /// [`agent_start_command`] composes. `None` for any other command
 /// shape or another repo's agents — the reconciler must only ever see
 /// THIS repo's panes (tui-zellij-pane-reconcile).
+///
+/// EXIT STATE IS NOT CONSULTED, and that is the single rule every
+/// reader shares — the idempotence guard in [`add_reviewer_pane`],
+/// the multiplicity count in `plan_panes`, and the removals. A
+/// crashed agent's pane is still that agent's pane, so the reconciler
+/// leaves it standing rather than opening a replacement: respawn is
+/// MANUAL, by design. Auto-respawn would relaunch a tool that just
+/// failed, and for one that refuses a second session
+/// (`already has an active writer`) it would relaunch it straight
+/// back into that error on every pass.
+///
+/// The cost is accepted: a crashed agent blocks its own replacement
+/// until someone acts. What must not follow is a corpse outliving a
+/// live duplicate, which is why [`remove_target_ids`] closes exited
+/// copies first.
 fn agent_pane_label<'a>(pane: &'a ZellijPane, repo_path: &str) -> Option<&'a str> {
     if pane.is_plugin {
         return None;
@@ -977,35 +1004,58 @@ pub(crate) fn agent_pane_pairs(panes: &[ZellijPane], repo: &Path) -> Vec<(String
         .collect()
 }
 
-/// The pane the USER actually has focused, via `zellij action
-/// list-clients` — unambiguous where per-tab `is_focused` flags are
-/// not (every tab reports one). Used to put focus back after a
-/// focus-stealing reconcile op; `None` on any query/parse failure.
+/// Put focus back on `id` after a focus-stealing reconcile op.
+///
 /// Pass-level focus restore (zellij-one-listing-per-pass): the worker
 /// captures once before its first action and restores once after the
-/// last, replacing the old per-op capture/restore.
+/// last, replacing the old per-op capture/restore. See
+/// [`pass_focus_target`] for how the target is derived.
 pub(crate) fn focus_pane(id: &str) {
     zellij_action(&["focus-pane-id", id]);
 }
 
 /// The pass's focus-restore target: the pane the USER has focused,
-/// falling back to the caller's own pane when `list-clients` fails —
-/// the fallback the old per-op restores had (codex 5d498d0). Pure
-/// composition split out for testing.
-pub(crate) fn pass_focus_target() -> Option<String> {
-    focus_target_from(client_focused_pane(), caller_pane_id())
+/// falling back to the caller's own pane when it cannot be determined
+/// — the fallback the old per-op restores had (codex 5d498d0).
+///
+/// Derived from the listing the pass ALREADY holds plus one
+/// `current-tab-info`, never from `list-clients`. That action routes
+/// through zellij's `populate_session_layout_metadata`, which shells
+/// out to `ps -ao ppid,args` to label every pane's process: measured
+/// on this machine at 1035-1041 ms (±3 ms over six runs) against 1071
+/// ms for the bare `ps`, versus ~30 ms for `list-panes` and 34 ms for
+/// `current-tab-info`. The cost tracks processes on the MACHINE, not
+/// panes in the session, so it grows with every agent started
+/// anywhere — for one integer.
+pub(crate) fn pass_focus_target(panes: &[ZellijPane]) -> Option<String> {
+    focus_target_from(focused_pane_in(panes, active_tab_id()), caller_pane_id())
 }
 
-fn focus_target_from(client: Option<String>, caller: Option<String>) -> Option<String> {
-    client.or(caller)
+fn focus_target_from(focused: Option<String>, caller: Option<String>) -> Option<String> {
+    focused.or(caller)
 }
 
-pub(crate) fn client_focused_pane() -> Option<String> {
-    let out = zellij_action(&["list-clients"])?;
-    let text = String::from_utf8_lossy(&out);
-    // Header line, then one line per client: `CLIENT_ID ZELLIJ_PANE_ID …`.
-    let pane = text.lines().nth(1)?.split_whitespace().nth(1)?;
-    (pane.starts_with("terminal_") || pane.starts_with("plugin_")).then(|| pane.to_string())
+/// The focused pane of `tab` — `None` without a tab, since every tab
+/// reports a focused pane and picking one at random would move the
+/// user's focus rather than restore it.
+fn focused_pane_in(panes: &[ZellijPane], tab: Option<u32>) -> Option<String> {
+    let tab = tab?;
+    panes
+        .iter()
+        .find(|p| p.is_focused && p.tab_id == tab)
+        .map(ZellijPane::pane_id)
+}
+
+/// The active tab's id, from `current-tab-info`'s `id:` line.
+fn active_tab_id() -> Option<u32> {
+    let out = zellij_action(&["current-tab-info"])?;
+    parse_active_tab_id(&String::from_utf8_lossy(&out))
+}
+
+fn parse_active_tab_id(text: &str) -> Option<u32> {
+    text.lines()
+        .find_map(|l| l.strip_prefix("id:"))
+        .and_then(|v| v.trim().parse().ok())
 }
 
 /// The first terminal pane running any of `cmds` — used to anchor a new
@@ -1461,18 +1511,27 @@ fn remove_target_ids(labels: &[String], panes: &[ZellijPane], repo_path: &str) -
         *budget.entry(l.as_str()).or_default() += 1;
     }
     let mut ids = Vec::new();
-    for pane in panes {
-        let Some(label) = agent_pane_label(pane, repo_path) else {
-            continue;
-        };
-        let Some(n) = budget.get_mut(label) else {
-            continue;
-        };
-        if *n == 0 {
-            continue;
+    // EXITED copies first. When a label has both a corpse and a live
+    // pane, the excess to close is the corpse — listing order can put
+    // the live one first, closing the working agent and leaving the
+    // corpse to be counted as an excess again next pass, forever.
+    //
+    // Only the CHOICE changes: when every pane of a label is being
+    // closed the budget covers them all and this just reorders ids.
+    for exited_first in [true, false] {
+        for pane in panes.iter().filter(|p| p.exited == exited_first) {
+            let Some(label) = agent_pane_label(pane, repo_path) else {
+                continue;
+            };
+            let Some(n) = budget.get_mut(label) else {
+                continue;
+            };
+            if *n == 0 {
+                continue;
+            }
+            *n -= 1;
+            ids.push(pane.pane_id());
         }
-        *n -= 1;
-        ids.push(pane.pane_id());
     }
     ids
 }
@@ -2154,6 +2213,44 @@ ttys004   zellij attach clank-foo
     }
 
     #[test]
+    fn active_tab_id_is_read_from_current_tab_info() {
+        // Real shape: `name:` / `id:` / `position:` lines. `id` is the
+        // STABLE tab id `list-panes` reports as `tab_id`, not the
+        // position — they differ on every session with a closed tab.
+        let text = "name: \u{1f4a4} self-spend-prompt\nid: 20\nposition: 7\n";
+        assert_eq!(parse_active_tab_id(text), Some(20));
+        assert_eq!(parse_active_tab_id("position: 7\n"), None);
+        assert_eq!(parse_active_tab_id("id: not-a-number\n"), None);
+    }
+
+    #[test]
+    fn focused_pane_is_the_one_in_the_active_tab() {
+        // Every tab reports a focused pane — measured live: 13 tabs,
+        // 13 `is_focused` panes. Without the active tab there is no
+        // answer, and guessing MOVES the user's focus rather than
+        // restoring it.
+        let panes: Vec<ZellijPane> = serde_json::from_str(
+            r#"[
+              {"id":1,"is_plugin":false,"is_focused":true,"tab_id":0,"title":"a"},
+              {"id":2,"is_plugin":false,"is_focused":false,"tab_id":0,"title":"b"},
+              {"id":3,"is_plugin":false,"is_focused":true,"tab_id":7,"title":"c"}
+            ]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            focused_pane_in(&panes, Some(7)).as_deref(),
+            Some("terminal_3")
+        );
+        assert_eq!(
+            focused_pane_in(&panes, Some(0)).as_deref(),
+            Some("terminal_1")
+        );
+        // No active tab, and a tab with no focused pane: no answer.
+        assert_eq!(focused_pane_in(&panes, None), None);
+        assert_eq!(focused_pane_in(&panes, Some(99)), None);
+    }
+
+    #[test]
     fn pass_focus_falls_back_to_the_caller_pane() {
         // codex 5d498d0: when list-clients fails the pass restore must
         // fall back to the caller's own (authoritative) pane, as the
@@ -2185,6 +2282,8 @@ ttys004   zellij attach clank-foo
             terminal_command: Some(cmd.to_string()),
             title: String::new(),
             tab_id: tab,
+            is_focused: false,
+            exited: false,
             pane_x: x,
             pane_y: y,
             pane_columns: w,
@@ -2229,6 +2328,8 @@ ttys004   zellij attach clank-foo
             terminal_command: Some(cmd.to_string()),
             title: String::new(),
             tab_id: 1,
+            is_focused: false,
+            exited: false,
             pane_x: x,
             pane_y: y,
             pane_columns: w,
@@ -2257,6 +2358,8 @@ ttys004   zellij attach clank-foo
             terminal_command: Some(cmd.to_string()),
             title: String::new(),
             tab_id: 1,
+            is_focused: false,
+            exited: false,
             pane_x: 116,
             pane_y: y,
             pane_columns: w,
@@ -2302,6 +2405,8 @@ ttys004   zellij attach clank-foo
             terminal_command: Some(cmd.to_string()),
             title: String::new(),
             tab_id: tab,
+            is_focused: false,
+            exited: false,
             pane_x: 116,
             pane_y: 1,
             pane_columns: 62,
@@ -2331,6 +2436,8 @@ ttys004   zellij attach clank-foo
             terminal_command: Some(cmd.to_string()),
             title: String::new(),
             tab_id: tab,
+            is_focused: false,
+            exited: false,
             pane_x: 116,
             pane_y: y,
             pane_columns: 62,
@@ -2358,6 +2465,8 @@ ttys004   zellij attach clank-foo
             terminal_command: Some(cmd.to_string()),
             title: String::new(),
             tab_id: 1,
+            is_focused: false,
+            exited: false,
             pane_x: 116,
             pane_y: y,
             pane_columns: 62,
@@ -2392,6 +2501,8 @@ ttys004   zellij attach clank-foo
             terminal_command: Some(cmd.to_string()),
             title: String::new(),
             tab_id: 0,
+            is_focused: false,
+            exited: false,
             pane_x: x,
             pane_y: y,
             pane_columns: w,
@@ -2433,6 +2544,8 @@ ttys004   zellij attach clank-foo
             terminal_command: Some(cmd.to_string()),
             title: String::new(),
             tab_id: 0,
+            is_focused: false,
+            exited: false,
             pane_x: x,
             pane_y: y,
             pane_columns: w,
@@ -2484,6 +2597,8 @@ ttys004   zellij attach clank-foo
             terminal_command: cmd.map(str::to_string),
             title: String::new(),
             tab_id: 0,
+            is_focused: false,
+            exited: false,
             pane_x: 0,
             pane_y: 0,
             pane_columns: 0,
@@ -2609,6 +2724,61 @@ ttys004   zellij attach clank-foo
 
     fn title_shape_panes() -> Vec<ZellijPane> {
         serde_json::from_str(TITLE_SHAPES_JSON).expect("list-panes shape parses")
+    }
+
+    #[test]
+    fn remove_closes_the_exited_copy_not_the_live_one() {
+        // The reported shape: a duplicate pane whose tool refused the
+        // session (`already has an active writer`) and exited 1, while
+        // the first pane kept working. Multiplicity says close ONE.
+        //
+        // Listing order alone would close whichever came first — and
+        // if that is the live agent, the corpse survives, is counted
+        // as an excess again next pass, and the tab never converges
+        // while the working agent is repeatedly killed.
+        let panes: Vec<ZellijPane> = serde_json::from_str(
+            r#"[
+              {"id":1,"is_plugin":false,"terminal_command":"clank agent start codex --repo /a","tab_id":0,"title":"codex (reviewer)","exited":false},
+              {"id":2,"is_plugin":false,"terminal_command":"clank agent start codex --repo /a","tab_id":0,"title":"codex (reviewer)","exited":true},
+              {"id":3,"is_plugin":false,"terminal_command":"clank agent start claude --repo /a","tab_id":0,"title":"claude (master)","exited":false}
+            ]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            remove_target_ids(&["codex".to_string()], &panes, "/a"),
+            vec!["terminal_2".to_string()],
+            "the corpse is the excess copy, whatever order the listing reports"
+        );
+        // A label leaving the roster entirely still loses BOTH panes:
+        // the preference picks WHICH, never HOW MANY.
+        assert_eq!(
+            remove_target_ids(&["codex".to_string(), "codex".to_string()], &panes, "/a"),
+            vec!["terminal_2".to_string(), "terminal_1".to_string()]
+        );
+    }
+
+    #[test]
+    fn an_exited_pane_still_counts_as_its_label_s_pane() {
+        // One rule for every reader: exit state never changes WHO a
+        // pane belongs to. So a crashed agent is not silently replaced
+        // — respawn is manual by design, and auto-respawn would
+        // relaunch a tool straight back into the error that killed it.
+        let panes: Vec<ZellijPane> = serde_json::from_str(
+            r#"[
+              {"id":1,"is_plugin":false,"terminal_command":"clank agent start codex --repo /a","tab_id":0,"title":"codex (reviewer)","exited":true}
+            ]"#,
+        )
+        .unwrap();
+        assert_eq!(agent_pane_label(&panes[0], "/a"), Some("codex"));
+        assert_eq!(
+            agent_pane_pairs(&panes, Path::new("/a")),
+            vec![("codex".to_string(), false)]
+        );
+        // The idempotence guard sees it too, so no replacement is made.
+        assert!(
+            find_pane_by_command(&panes, &agent_start_command("codex", "/a")).is_some(),
+            "a corpse must still satisfy the guard, or the pass respawns it"
+        );
     }
 
     #[test]
