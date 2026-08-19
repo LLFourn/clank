@@ -1055,20 +1055,76 @@ fn find_reviewer_pane_by_title(panes: &[ZellijPane], tab: u32) -> Option<&Zellij
     })
 }
 
+/// Where to focus before `new-pane`, and whether the caller must be
+/// told which pane was used.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct AnchorChoice {
+    /// Focus decides which TAB `new-pane` opens in — nothing more.
+    focus: Option<String>,
+    /// Set only when [`stack_reviewer_panes`] cannot rediscover the
+    /// anchor from the CURRENT roster, so the caller has to carry the
+    /// id over itself.
+    report: Option<String>,
+}
+
+/// Pick the anchor for a pane about to be created, in descending order
+/// of how well it identifies the repo's tab:
+///
+/// 1. a CURRENT reviewer of this repo, by launch command — the stack
+///    call rediscovers it, so it is not reported;
+/// 2. a DEPARTING reviewer, by launch command — its pane is still live
+///    (removes run after the layout) and knows the tab the replacement
+///    belongs in, but `stack` is given the new roster and cannot name
+///    it, so it is reported;
+/// 3. any reviewer pane in the CALLER's tab, by title — reported for
+///    the same reason;
+/// 4. the caller's own pane — a tab, not a reviewer, so nothing to
+///    report.
+fn select_anchor(
+    panes: &[ZellijPane],
+    current_cmds: &[String],
+    departing_cmds: &[String],
+    caller: Option<String>,
+) -> AnchorChoice {
+    if let Some(p) = find_anchor_pane(panes, current_cmds) {
+        return AnchorChoice {
+            focus: Some(p.pane_id()),
+            report: None,
+        };
+    }
+    let reported = find_anchor_pane(panes, departing_cmds)
+        .map(ZellijPane::pane_id)
+        .or_else(|| {
+            caller
+                .as_deref()
+                .and_then(|r| panes.iter().find(|p| p.pane_id() == r))
+                .map(|p| p.tab_id)
+                .and_then(|tab| find_reviewer_pane_by_title(panes, tab))
+                .map(ZellijPane::pane_id)
+        });
+    AnchorChoice {
+        focus: reported.clone().or(caller),
+        report: reported,
+    }
+}
+
 /// What [`add_reviewer_pane`] made, and what it leaned on to place it.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct ReviewerPaneAdd {
     /// The pane created this pass — `None` when one already existed or
     /// creation failed.
     pub created: Option<String>,
-    /// The reviewer pane found by TITLE that anchored the new one.
+    /// The pane that anchored the new one, when [`stack_reviewer_panes`]
+    /// cannot rediscover it — a pane matched by TITLE (no launch
+    /// command to be named by) or a DEPARTING reviewer (named by
+    /// command, but no longer on the roster `stack` is given).
     ///
-    /// Reported because [`stack_reviewer_panes`] names stack members by
-    /// exact launch command: a pane it cannot name is absent from the
-    /// id list, the list falls short of the two entries `stack-panes`
-    /// needs, and the call is skipped — so the pane this anchored would
-    /// never join the stack it was placed against.
-    pub title_anchor: Option<String>,
+    /// Reported because `stack` names members by exact launch command
+    /// against the CURRENT roster: an anchor it cannot name is absent
+    /// from the id list, the list falls short of the two entries
+    /// `stack-panes` needs, and the call is skipped — so the pane this
+    /// anchored would never join the stack it was placed against.
+    pub anchor: Option<String>,
 }
 
 /// The pane the current clank process runs in, identified authoritatively
@@ -1178,6 +1234,7 @@ pub(crate) fn add_reviewer_pane(
     repo: &Path,
     label: &str,
     other_reviewers: &[String],
+    departing: &[String],
     panes: &[ZellijPane],
 ) -> ReviewerPaneAdd {
     let repo_str = repo.to_string_lossy();
@@ -1192,22 +1249,13 @@ pub(crate) fn add_reviewer_pane(
         .iter()
         .map(|l| agent_start_command(l, &repo_str))
         .collect();
-    let caller = caller_pane_id();
-    let exact = find_anchor_pane(panes, &anchor_cmds).map(ZellijPane::pane_id);
-    // Only when no reviewer of this repo can be named by command. The
-    // caller's tab is the tab `new-pane` will open in, so a reviewer
-    // anywhere else cannot anchor anything here.
-    let title_anchor = match exact {
-        Some(_) => None,
-        None => caller
-            .as_deref()
-            .and_then(|r| panes.iter().find(|p| p.pane_id() == r))
-            .map(|p| p.tab_id)
-            .and_then(|tab| find_reviewer_pane_by_title(panes, tab))
-            .map(ZellijPane::pane_id),
-    };
-    let focus_first = exact.or_else(|| title_anchor.clone()).or(caller);
-    if let Some(id) = &focus_first {
+    let departing_cmds: Vec<String> = departing
+        .iter()
+        .map(|l| agent_start_command(l, &repo_str))
+        .collect();
+    let choice = select_anchor(panes, &anchor_cmds, &departing_cmds, caller_pane_id());
+    let anchor = choice.report;
+    if let Some(id) = &choice.focus {
         zellij_action(&["focus-pane-id", id]);
     }
 
@@ -1233,7 +1281,7 @@ pub(crate) fn add_reviewer_pane(
     }
     ReviewerPaneAdd {
         created: Some(created),
-        title_anchor,
+        anchor,
     }
 }
 
@@ -2561,6 +2609,87 @@ ttys004   zellij attach clank-foo
 
     fn title_shape_panes() -> Vec<ZellijPane> {
         serde_json::from_str(TITLE_SHAPES_JSON).expect("list-panes shape parses")
+    }
+
+    #[test]
+    fn anchor_prefers_a_current_reviewer_and_does_not_report_it() {
+        let panes = parse_panes();
+        let c = select_anchor(
+            &panes,
+            &[agent_start_command("codex", "/a")],
+            &[agent_start_command("gone", "/a")],
+            Some("terminal_0".to_string()),
+        );
+        assert_eq!(c.focus.as_deref(), Some("terminal_1"));
+        // `stack` names members by command against the current roster,
+        // so it finds this one on its own.
+        assert_eq!(c.report, None);
+    }
+
+    #[test]
+    fn anchor_falls_back_to_a_departing_reviewer_and_reports_it() {
+        // The swap case: the arriving reviewer has no peer on the new
+        // roster, and the pane that knows the tab belongs to the agent
+        // leaving this pass. Its pane is still live because removes run
+        // after the layout.
+        let panes = parse_panes();
+        let c = select_anchor(
+            &panes,
+            &[agent_start_command("nobody", "/a")],
+            &[agent_start_command("codex", "/a")],
+            Some("terminal_0".to_string()),
+        );
+        assert_eq!(c.focus.as_deref(), Some("terminal_1"));
+        // Not on the roster `stack` is given, so it must be carried.
+        assert_eq!(c.report.as_deref(), Some("terminal_1"));
+    }
+
+    #[test]
+    fn a_departing_anchor_is_scoped_to_this_repo() {
+        // `codex` runs in BOTH /a and /b. Command identity carries the
+        // repo path, so a departing `codex` in /a lands on /a's pane —
+        // being pulled into another repo's tab is the failure zellij
+        // 0.45.0 cannot undo.
+        let panes = parse_panes();
+        let c = select_anchor(
+            &panes,
+            &[agent_start_command("nobody", "/a")],
+            &[agent_start_command("codex", "/a")],
+            None,
+        );
+        assert_eq!(c.report.as_deref(), Some("terminal_1"));
+        // A departing label with no pane in THIS repo anchors nothing.
+        let c = select_anchor(
+            &panes,
+            &[agent_start_command("nobody", "/a")],
+            &[agent_start_command("codex", "/c")],
+            None,
+        );
+        assert_eq!(c.report, None);
+    }
+
+    #[test]
+    fn anchor_falls_back_to_the_caller_pane_and_reports_nothing() {
+        // Caller sits in tab 20, which holds a master, the instrument
+        // pane and a plugin — no reviewer to anchor on.
+        let panes = title_shape_panes();
+        let c = select_anchor(
+            &panes,
+            &[agent_start_command("nobody", "/c")],
+            &[],
+            Some("terminal_151".to_string()),
+        );
+        // The caller pane picks a TAB and nothing more: it must never
+        // enter the stack set.
+        assert_eq!(c.focus.as_deref(), Some("terminal_151"));
+        assert_eq!(c.report, None);
+    }
+
+    #[test]
+    fn anchor_with_nothing_to_go_on_is_empty() {
+        let panes = parse_panes();
+        let c = select_anchor(&panes, &[agent_start_command("nobody", "/a")], &[], None);
+        assert_eq!(c, AnchorChoice::default());
     }
 
     #[test]

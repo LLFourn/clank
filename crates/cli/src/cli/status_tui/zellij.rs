@@ -462,6 +462,7 @@ pub(super) trait PaneIo {
         &mut self,
         label: &str,
         other_reviewers: &[String],
+        departing: &[String],
         snap: &Self::Snap,
     ) -> crate::cli::open_zellij::ReviewerPaneAdd;
     /// Put this repo's reviewer panes, plus `extra_ids` created this
@@ -531,9 +532,16 @@ impl PaneIo for ZellijPaneIo<'_> {
         &mut self,
         label: &str,
         other_reviewers: &[String],
+        departing: &[String],
         snap: &Self::Snap,
     ) -> crate::cli::open_zellij::ReviewerPaneAdd {
-        crate::cli::open_zellij::add_reviewer_pane(self.repo, label, other_reviewers, snap)
+        crate::cli::open_zellij::add_reviewer_pane(
+            self.repo,
+            label,
+            other_reviewers,
+            departing,
+            snap,
+        )
     }
     fn stack(&mut self, reviewers: &[String], snap: &Self::Snap, extra_ids: &[String]) -> bool {
         crate::cli::open_zellij::stack_reviewer_panes(self.repo, reviewers, snap, extra_ids)
@@ -667,15 +675,22 @@ impl PaneReconciler {
         // sweep the master into it — the same class of bug as the
         // instrument pane being captured (codex on 3d3ffce).
         let mut created: Vec<(String, String)> = Vec::new();
-        // Anchors are NOT label-keyed: they are existing panes, matched
-        // on a `(reviewer)` title, so a master pane can never be one.
+        // Anchors are NOT label-keyed: they are existing panes, either
+        // matched on a `(reviewer)` title (so a master pane can never
+        // be one) or belonging to a reviewer leaving this pass.
+        //
+        // `plan.remove` is passed so a replacement can anchor on the
+        // pane being vacated. Nothing here knows or needs to know that
+        // a swap happened: any pass that both adds and removes gets
+        // the same preservation, which is why `agent swap` needs no
+        // signal of its own.
         let mut anchors: Vec<String> = Vec::new();
         for label in &plan.add {
-            let added = io.add(label, &reviewers, &snap);
+            let added = io.add(label, &reviewers, &plan.remove, &snap);
             if let Some(id) = added.created {
                 created.push((label.clone(), id));
             }
-            if let Some(id) = added.title_anchor {
+            if let Some(id) = added.anchor {
                 anchors.push(id);
             }
         }
@@ -1046,6 +1061,7 @@ mod tests {
         /// Scripted per-add creation results (default: created).
         add_results: std::collections::VecDeque<bool>,
         add_anchors: std::collections::VecDeque<Option<String>>,
+        add_departing: Vec<Vec<String>>,
         stack_results: std::collections::VecDeque<bool>,
         placed_results: std::collections::VecDeque<bool>,
         verify_placed: std::collections::VecDeque<bool>,
@@ -1069,6 +1085,7 @@ mod tests {
                 focus_captures: 0,
                 add_results: std::collections::VecDeque::new(),
                 add_anchors: std::collections::VecDeque::new(),
+                add_departing: Vec::new(),
                 stack_results: std::collections::VecDeque::new(),
                 placed_results: std::collections::VecDeque::new(),
                 verify_placed: std::collections::VecDeque::new(),
@@ -1104,16 +1121,18 @@ mod tests {
             &mut self,
             label: &str,
             _other: &[String],
+            departing: &[String],
             _snap: &Self::Snap,
         ) -> crate::cli::open_zellij::ReviewerPaneAdd {
             self.log.push(format!("add {label}"));
+            self.add_departing.push(departing.to_vec());
             crate::cli::open_zellij::ReviewerPaneAdd {
                 created: self
                     .add_results
                     .pop_front()
                     .unwrap_or(true)
                     .then(|| format!("terminal_{label}")),
-                title_anchor: self.add_anchors.pop_front().flatten(),
+                anchor: self.add_anchors.pop_front().flatten(),
             }
         }
         fn stack(&mut self, _revs: &[String], _snap: &Self::Snap, extra: &[String]) -> bool {
@@ -1557,6 +1576,38 @@ mod tests {
             r.converged.is_none(),
             "placement not confirmed → the pass must stay unconverged so it retries"
         );
+    }
+
+    #[test]
+    fn a_replacement_is_offered_the_departing_pane_as_an_anchor() {
+        // The swap shape: r1 leaves and r2 arrives in ONE pass. r2 has
+        // no peer on the new roster, so the only pane that knows which
+        // tab it belongs in is r1's — still live, because removes run
+        // after the layout.
+        let snap = roster_snap(&[("claude", true), ("r2", false)]);
+        let before = live(&[("claude", true), ("r1", false)]);
+        let mut r = PaneReconciler::new();
+        let mut io = FakeIo::with_verify(vec![Some(before)], vec![None]);
+        r.reconcile(RosterView::of(&snap), &mut io);
+        assert_eq!(io.add_departing, vec![vec!["r1".to_string()]]);
+        // And the departure is still applied, after the layout.
+        let add = io.log.iter().position(|l| l == "add r2");
+        let rm = io.log.iter().position(|l| l.starts_with("remove"));
+        assert!(
+            add < rm,
+            "the arriving pane must be placed before the departing one closes: {:?}",
+            io.log
+        );
+    }
+
+    #[test]
+    fn an_add_with_no_departure_is_offered_nothing() {
+        let snap = roster_snap(&[("claude", true), ("r1", false)]);
+        let before = live(&[("claude", true)]);
+        let mut r = PaneReconciler::new();
+        let mut io = FakeIo::with_verify(vec![Some(before)], vec![None]);
+        r.reconcile(RosterView::of(&snap), &mut io);
+        assert_eq!(io.add_departing, vec![Vec::<String>::new()]);
     }
 
     #[test]

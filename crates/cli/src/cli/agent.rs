@@ -29,7 +29,7 @@ use std::collections::BTreeMap;
 
 use super::{
     AgentAddArgs, AgentArgs, AgentCmd, AgentListArgs, AgentPromoteArgs, AgentRemoveArgs,
-    AgentSetReviewArgs, AgentStartArgs, resolve_repo,
+    AgentSetReviewArgs, AgentStartArgs, AgentSwapArgs, resolve_repo,
 };
 
 pub async fn run(args: AgentArgs) -> anyhow::Result<()> {
@@ -40,6 +40,7 @@ pub async fn run(args: AgentArgs) -> anyhow::Result<()> {
         AgentCmd::Promote(a) => promote(a),
         AgentCmd::Remove(a) => remove(a),
         AgentCmd::SetReview(a) => set_review(a),
+        AgentCmd::Swap(a) => swap(a),
     }
 }
 
@@ -877,6 +878,28 @@ pub fn add_repo_roster_agent(
 /// with the given role. Errors if the label isn't in the library
 /// (suggesting `--tool` to define it inline, or `agent add
 /// --global --tool` to populate the library first).
+/// The description `<label>` carries in the user-scope `agents`
+/// library. Errors with the two ways to define one when absent.
+fn library_description(
+    home: Option<&Path>,
+    label: &AgentLabel,
+) -> anyhow::Result<AgentDescription> {
+    home.map(|h| -> anyhow::Result<Option<AgentDescription>> {
+        Ok(read_user_config(h)?.agents.get(label).cloned())
+    })
+    .transpose()?
+    .flatten()
+    .ok_or_else(|| {
+        anyhow::anyhow!(
+            "unknown agent `{label}`: not in the user-scope `agents` library. \
+             Define it inline with `clank agent add {label} --tool <claude|codex|grok|opencode>`, \
+             or add it to the library first with \
+             `clank agent add {label} --global --tool <claude|codex|grok|opencode>`.",
+            label = label.as_str()
+        )
+    })
+}
+
 pub fn add_repo_roster_agent_by_name(
     repo: &Path,
     home: Option<&Path>,
@@ -891,21 +914,7 @@ pub fn add_repo_roster_agent_by_name(
             label = label.as_str()
         );
     }
-    let user_desc = home
-        .map(|h| -> anyhow::Result<Option<AgentDescription>> {
-            Ok(read_user_config(h)?.agents.get(label).cloned())
-        })
-        .transpose()?
-        .flatten();
-    let desc = user_desc.ok_or_else(|| {
-        anyhow::anyhow!(
-            "unknown agent `{label}`: not in the user-scope `agents` library. \
-             Define it inline with `clank agent add {label} --tool <claude|codex|grok|opencode>`, \
-             or add it to the library first with \
-             `clank agent add {label} --global --tool <claude|codex|grok|opencode>`.",
-            label = label.as_str()
-        )
-    })?;
+    let desc = library_description(home, label)?;
     repo_cfg
         .agents
         .insert(label.clone(), RosterAgent::from_description(desc, role));
@@ -916,6 +925,81 @@ pub fn add_repo_roster_agent_by_name(
         role_word(role)
     );
     Ok(())
+}
+
+/// Replace `<out>` on THIS repo's roster with `<in>`, carrying the
+/// outgoing agent's role across unchanged.
+///
+/// ONE config write: the role is never observed vacant, so no pass can
+/// see a gate whose expected reviewer set has silently shrunk.
+///
+/// Pure config, like every sibling roster command — the status TUI
+/// owns roster→pane convergence (tui-zellij-pane-reconcile). Giving
+/// this command its own pane orchestration would make it a second
+/// owner, and a pane it created before the write would be
+/// roster-absent, which is exactly what the reconciler destroys.
+pub fn swap_repo_agent(
+    repo: &Path,
+    home: Option<&Path>,
+    out: &AgentLabel,
+    into: &AgentLabel,
+) -> anyhow::Result<()> {
+    let mut repo_cfg = read_repo_config(repo)?;
+    let role = match repo_cfg.agents.get(out) {
+        Some(a) => a.role,
+        None => anyhow::bail!(
+            "agent `{}` is not on this repo's roster, so there is nothing to swap out",
+            out.as_str()
+        ),
+    };
+    if role == RosterRole::Master {
+        anyhow::bail!(
+            "agent `{out}` is this repo's master. Swap a master by promoting its \
+             replacement — `clank agent promote {into}` demotes `{out}` and moves \
+             the panes.",
+            out = out.as_str(),
+            into = into.as_str()
+        );
+    }
+    // A map keyed by label: inserting onto an existing one COLLAPSES
+    // two entries into one. `out` would go, `into`'s tier would be
+    // overwritten with `out`'s, and the roster would shrink by one
+    // silently — the shrinking expected-reviewer set this command
+    // exists to avoid.
+    if repo_cfg.agents.contains_key(into) {
+        anyhow::bail!(
+            "agent `{into}` is already on this repo's roster, so swapping onto it \
+             would drop an entry rather than replace one. To change a tier use \
+             `clank agent set-review {into} <tier>`; to drop an agent use \
+             `clank agent remove {out}`.",
+            into = into.as_str(),
+            out = out.as_str()
+        );
+    }
+    let desc = library_description(home, into)?;
+    repo_cfg.agents.remove(out);
+    repo_cfg
+        .agents
+        .insert(into.clone(), RosterAgent::from_description(desc, role));
+    write_repo_config(repo, &repo_cfg)?;
+    eprintln!(
+        "swapped `{}` out for `{}` as a `{}` reviewer",
+        out.as_str(),
+        into.as_str(),
+        role_word(role)
+    );
+    Ok(())
+}
+
+/// `clank agent swap <out> <in>` — thin shell.
+fn swap(args: AgentSwapArgs) -> anyhow::Result<()> {
+    let out = AgentLabel::parse(&args.out)
+        .map_err(|e| anyhow::anyhow!("invalid agent label `{}`: {e}", args.out))?;
+    let into = AgentLabel::parse(&args.into)
+        .map_err(|e| anyhow::anyhow!("invalid agent label `{}`: {e}", args.into))?;
+    let repo = resolve_repo(args.repo.as_deref())?;
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    swap_repo_agent(&repo, home.as_deref(), &out, &into)
 }
 
 /// `clank agent promote <name>` — thin shell.
@@ -1197,6 +1281,26 @@ fn write_typed_config<T: serde::Serialize>(path: &Path, value: &T) -> anyhow::Re
 
 #[cfg(test)]
 mod tests {
+    /// Every roster command is a pure config write; the status TUI
+    /// owns roster→pane convergence (tui-zellij-pane-reconcile).
+    ///
+    /// `agent swap` rests on this entirely. A roster command that
+    /// created a pane would be a SECOND owner of pane lifecycle, and a
+    /// pane created before its config write is roster-absent — which
+    /// is exactly what the reconciler destroys, so the command would
+    /// race the owner into losing the position it meant to preserve.
+    #[test]
+    fn roster_commands_never_touch_zellij() {
+        // Split so this assertion is not itself a match.
+        let calls = [concat!("open_", "zellij"), concat!("zellij", "_action")];
+        for (n, line) in include_str!("agent.rs").lines().enumerate() {
+            let code = line.split("//").next().unwrap_or("");
+            for c in calls {
+                assert!(!code.contains(c), "agent.rs:{} calls {c}: {line}", n + 1);
+            }
+        }
+    }
+
     use super::*;
 
     fn label(s: &str) -> AgentLabel {

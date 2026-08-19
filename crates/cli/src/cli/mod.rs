@@ -1121,6 +1121,25 @@ pub enum AgentCmd {
     /// pane are undisturbed. Refuses on the master (not a reviewer
     /// tier).
     SetReview(AgentSetReviewArgs),
+    /// Replace a reviewer with another, keeping the role: one config
+    /// write, so the role is never observed vacant and the gate's
+    /// expected reviewer set never briefly shrinks. Refuses on the
+    /// master (use `agent promote`) and refuses when the incoming
+    /// label is already on the roster.
+    Swap(AgentSwapArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct AgentSwapArgs {
+    /// Reviewer to swap OUT. Must be on the roster.
+    pub out: String,
+    /// Reviewer to swap IN. Must NOT already be on the roster; its
+    /// description is copied from the user-scope library.
+    #[arg(value_name = "IN")]
+    pub into: String,
+    /// Repo root. Defaults to the cwd's git toplevel.
+    #[arg(long, value_name = "PATH")]
+    pub repo: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
