@@ -453,11 +453,17 @@ pub(super) trait PaneIo {
     fn verify(&mut self, reviewers: &[String]) -> Option<(Vec<(String, bool)>, bool)>;
     fn capture_focus(&mut self) -> Option<String>;
     fn restore_focus(&mut self, id: &str);
-    /// Create the pane; returns its id when one was made (`None` when
-    /// it already existed or creation failed). The caller accumulates
-    /// these and stacks the whole set once via [`Self::stack`].
-    fn add(&mut self, label: &str, other_reviewers: &[String], snap: &Self::Snap)
-    -> Option<String>;
+    /// Create the pane; reports the id when one was made, plus any
+    /// reviewer pane found by TITLE that anchored it. The caller
+    /// accumulates both and stacks the whole set once via
+    /// [`Self::stack`] — a title-found anchor has no launch command to
+    /// be named by, so `stack` cannot rediscover it.
+    fn add(
+        &mut self,
+        label: &str,
+        other_reviewers: &[String],
+        snap: &Self::Snap,
+    ) -> crate::cli::open_zellij::ReviewerPaneAdd;
     /// Put this repo's reviewer panes, plus `extra_ids` created this
     /// pass, into one stack. Returns whether they ARE stacked
     /// afterwards — read back, not assumed.
@@ -526,7 +532,7 @@ impl PaneIo for ZellijPaneIo<'_> {
         label: &str,
         other_reviewers: &[String],
         snap: &Self::Snap,
-    ) -> Option<String> {
+    ) -> crate::cli::open_zellij::ReviewerPaneAdd {
         crate::cli::open_zellij::add_reviewer_pane(self.repo, label, other_reviewers, snap)
     }
     fn stack(&mut self, reviewers: &[String], snap: &Self::Snap, extra_ids: &[String]) -> bool {
@@ -661,16 +667,42 @@ impl PaneReconciler {
         // sweep the master into it — the same class of bug as the
         // instrument pane being captured (codex on 3d3ffce).
         let mut created: Vec<(String, String)> = Vec::new();
+        // Anchors are NOT label-keyed: they are existing panes, matched
+        // on a `(reviewer)` title, so a master pane can never be one.
+        let mut anchors: Vec<String> = Vec::new();
         for label in &plan.add {
-            if let Some(id) = io.add(label, &reviewers, &snap) {
+            let added = io.add(label, &reviewers, &snap);
+            if let Some(id) = added.created {
                 created.push((label.clone(), id));
             }
+            if let Some(id) = added.title_anchor {
+                anchors.push(id);
+            }
         }
-        let created_reviewers: Vec<String> = created
+        let mut created_reviewers: Vec<String> = created
             .iter()
             .filter(|(label, _)| reviewers.iter().any(|r| r == label))
             .map(|(_, id)| id.clone())
             .collect();
+        // A title-found anchor has no launch command to be named by, so
+        // `stack` cannot rediscover it from the snapshot — without this
+        // the id list falls short of the two entries `stack-panes`
+        // needs and the call is skipped entirely.
+        //
+        // Known and deliberate: the verifying read
+        // (`reviewers_are_stacked`) still identifies members by exact
+        // command, so it sees the newly stacked pane as a LONE reviewer
+        // and reports converged as long as it is not stacked with the
+        // instrument pane. Do not "fix" that blind spot by teaching the
+        // read-back to match titles — that is classification, which
+        // fails open on a label the glyph-strip cannot round-trip, and
+        // an unconverged read here means repairing every refresh
+        // forever (placement-reads-zellij-stacks-correctly).
+        for id in anchors {
+            if !created_reviewers.contains(&id) {
+                created_reviewers.push(id);
+            }
+        }
         // Placement is part of the outcome, not a side effect. The
         // verifying read below decides it for EVERY pass — including
         // remove-only and relocate-only ones, which can leave a stack
@@ -1013,6 +1045,7 @@ mod tests {
         focus_captures: usize,
         /// Scripted per-add creation results (default: created).
         add_results: std::collections::VecDeque<bool>,
+        add_anchors: std::collections::VecDeque<Option<String>>,
         stack_results: std::collections::VecDeque<bool>,
         placed_results: std::collections::VecDeque<bool>,
         verify_placed: std::collections::VecDeque<bool>,
@@ -1035,6 +1068,7 @@ mod tests {
                 verifies_taken: 0,
                 focus_captures: 0,
                 add_results: std::collections::VecDeque::new(),
+                add_anchors: std::collections::VecDeque::new(),
                 stack_results: std::collections::VecDeque::new(),
                 placed_results: std::collections::VecDeque::new(),
                 verify_placed: std::collections::VecDeque::new(),
@@ -1066,12 +1100,21 @@ mod tests {
         fn restore_focus(&mut self, id: &str) {
             self.log.push(format!("focus {id}"));
         }
-        fn add(&mut self, label: &str, _other: &[String], _snap: &Self::Snap) -> Option<String> {
+        fn add(
+            &mut self,
+            label: &str,
+            _other: &[String],
+            _snap: &Self::Snap,
+        ) -> crate::cli::open_zellij::ReviewerPaneAdd {
             self.log.push(format!("add {label}"));
-            self.add_results
-                .pop_front()
-                .unwrap_or(true)
-                .then(|| format!("terminal_{label}"))
+            crate::cli::open_zellij::ReviewerPaneAdd {
+                created: self
+                    .add_results
+                    .pop_front()
+                    .unwrap_or(true)
+                    .then(|| format!("terminal_{label}")),
+                title_anchor: self.add_anchors.pop_front().flatten(),
+            }
         }
         fn stack(&mut self, _revs: &[String], _snap: &Self::Snap, extra: &[String]) -> bool {
             self.log.push(format!("stack [{}]", extra.join(",")));
@@ -1513,6 +1556,41 @@ mod tests {
         assert!(
             r.converged.is_none(),
             "placement not confirmed → the pass must stay unconverged so it retries"
+        );
+    }
+
+    #[test]
+    fn a_title_found_anchor_joins_the_stack_call() {
+        // `stack` names members by exact launch command, so a pane
+        // found by TITLE is invisible to it. Unless the add hands the
+        // anchor id over, the list holds one entry, `stack-panes` gets
+        // no pair to work with, and the pane it was placed against
+        // never joins the stack.
+        let snap = roster_snap(&[("claude", true), ("r1", false)]);
+        let before = live(&[("claude", true)]);
+        let mut r = PaneReconciler::new();
+        let mut io = FakeIo::with_verify(vec![Some(before)], vec![None]);
+        io.add_anchors = vec![Some("terminal_99".to_string())].into();
+        r.reconcile(RosterView::of(&snap), &mut io);
+        assert!(
+            io.log.contains(&"stack [terminal_r1,terminal_99]".to_string()),
+            "anchor must reach the stack set: {:?}",
+            io.log
+        );
+    }
+
+    #[test]
+    fn an_anchor_already_created_this_pass_is_not_stacked_twice() {
+        let snap = roster_snap(&[("claude", true), ("r1", false)]);
+        let before = live(&[("claude", true)]);
+        let mut r = PaneReconciler::new();
+        let mut io = FakeIo::with_verify(vec![Some(before)], vec![None]);
+        io.add_anchors = vec![Some("terminal_r1".to_string())].into();
+        r.reconcile(RosterView::of(&snap), &mut io);
+        assert!(
+            io.log.contains(&"stack [terminal_r1]".to_string()),
+            "duplicate id must not be repeated: {:?}",
+            io.log
         );
     }
 

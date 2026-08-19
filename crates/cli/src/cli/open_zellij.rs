@@ -1020,6 +1020,57 @@ fn find_anchor_pane<'a>(panes: &'a [ZellijPane], cmds: &[String]) -> Option<&'a 
     })
 }
 
+/// A reviewer pane in `tab`, identified by the title zellij reports
+/// rather than by the command it was launched with.
+///
+/// ANCHORS placement only — never classification.
+/// `zellij-pane-placement-and-cost` rejected titles for deciding WHO a
+/// pane is: a title carries no ownership marker and cannot round-trip
+/// the legal label domain, so a wrong read fails OPEN and never
+/// converges. A wrong anchor costs one misplaced pane and reaches no
+/// roster decision, which is why the same objection does not apply.
+///
+/// Needed because [`find_anchor_pane`] matches the launch command
+/// byte-for-byte, so any divergence — a repo path spelled differently,
+/// a pane started before a rename, an agent restarted by hand — leaves
+/// a visible reviewer that cannot anchor anything. A hand-titled pane
+/// can anchor too; that is the accepted cost of not requiring a
+/// command, and it buys one misplaced pane at worst.
+///
+/// `tab` scoping is an invariant, not hygiene: `list-panes` spans ALL
+/// tabs, `(reviewer)` appears in nearly every clank tab, and zellij
+/// 0.45.0 exposes no action that moves a pane between tabs
+/// (`BreakPane*` are keybindings only) — so anchoring onto a foreign
+/// tab strands the pane there until someone closes and respawns it.
+///
+/// The status TUI stamps a status glyph onto agent titles and both
+/// shapes are live at once, so the glyph is stripped before matching —
+/// the same rule `parse_agent_panes` classifies with.
+fn find_reviewer_pane_by_title(panes: &[ZellijPane], tab: u32) -> Option<&ZellijPane> {
+    let suffix = format!(" ({})", clank_core::vocab::Role::Reviewer.as_str());
+    panes.iter().find(|p| {
+        !p.is_plugin
+            && p.tab_id == tab
+            && crate::cli::status_tui::strip_leading_emoji(&p.title).ends_with(&suffix)
+    })
+}
+
+/// What [`add_reviewer_pane`] made, and what it leaned on to place it.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct ReviewerPaneAdd {
+    /// The pane created this pass — `None` when one already existed or
+    /// creation failed.
+    pub created: Option<String>,
+    /// The reviewer pane found by TITLE that anchored the new one.
+    ///
+    /// Reported because [`stack_reviewer_panes`] names stack members by
+    /// exact launch command: a pane it cannot name is absent from the
+    /// id list, the list falls short of the two entries `stack-panes`
+    /// needs, and the call is skipped — so the pane this anchored would
+    /// never join the stack it was placed against.
+    pub title_anchor: Option<String>,
+}
+
 /// The pane the current clank process runs in, identified authoritatively
 /// from the `ZELLIJ_PANE_ID` env var zellij sets per-pane. A clank command
 /// always runs in a terminal pane (never the plugin pane that can share
@@ -1128,10 +1179,10 @@ pub(crate) fn add_reviewer_pane(
     label: &str,
     other_reviewers: &[String],
     panes: &[ZellijPane],
-) -> Option<String> {
+) -> ReviewerPaneAdd {
     let repo_str = repo.to_string_lossy();
     if find_pane_by_command(panes, &agent_start_command(label, &repo_str)).is_some() {
-        return None;
+        return ReviewerPaneAdd::default();
     }
     // Focus decides which TAB `new-pane` opens in — nothing more. An
     // existing reviewer keeps the pane in the repo's tab; else the
@@ -1141,9 +1192,21 @@ pub(crate) fn add_reviewer_pane(
         .iter()
         .map(|l| agent_start_command(l, &repo_str))
         .collect();
-    let focus_first = find_anchor_pane(panes, &anchor_cmds)
-        .map(ZellijPane::pane_id)
-        .or_else(caller_pane_id);
+    let caller = caller_pane_id();
+    let exact = find_anchor_pane(panes, &anchor_cmds).map(ZellijPane::pane_id);
+    // Only when no reviewer of this repo can be named by command. The
+    // caller's tab is the tab `new-pane` will open in, so a reviewer
+    // anywhere else cannot anchor anything here.
+    let title_anchor = match exact {
+        Some(_) => None,
+        None => caller
+            .as_deref()
+            .and_then(|r| panes.iter().find(|p| p.pane_id() == r))
+            .map(|p| p.tab_id)
+            .and_then(|tab| find_reviewer_pane_by_title(panes, tab))
+            .map(ZellijPane::pane_id),
+    };
+    let focus_first = exact.or_else(|| title_anchor.clone()).or(caller);
     if let Some(id) = &focus_first {
         zellij_action(&["focus-pane-id", id]);
     }
@@ -1159,11 +1222,19 @@ pub(crate) fn add_reviewer_pane(
     ];
     new_pane.extend(agent_start_argv(label, &repo_str));
     let refs: Vec<&str> = new_pane.iter().map(String::as_str).collect();
-    let out = zellij_action(&refs)?;
+    let Some(out) = zellij_action(&refs) else {
+        return ReviewerPaneAdd::default();
+    };
     // `new-pane` prints the id it created, so the caller can stack the
     // fresh pane without paying for another listing.
     let created = String::from_utf8_lossy(&out).trim().to_string();
-    (!created.is_empty()).then_some(created)
+    if created.is_empty() {
+        return ReviewerPaneAdd::default();
+    }
+    ReviewerPaneAdd {
+        created: Some(created),
+        title_anchor,
+    }
 }
 
 /// Put this repo's reviewer panes — the ones already live plus any
@@ -2469,6 +2540,83 @@ ttys004   zellij attach clank-foo
         assert_eq!(anchor.unwrap().pane_id(), "terminal_1");
         // No reviewer of this repo present → no anchor (first reviewer case).
         assert!(find_anchor_pane(&panes, &[agent_start_command("codex", "/c")]).is_none());
+    }
+
+    // Both title shapes an anchor search must accept. The status TUI
+    // stamps a status glyph onto every agent pane it classifies
+    // (`status_tui/zellij.rs`), so matching `agent_pane_title`'s bare
+    // output alone would miss them all; a pane the TUI has not
+    // classified keeps the bare form. The command-less pane is what
+    // anything not launched by clank looks like.
+    const TITLE_SHAPES_JSON: &str = r#"[
+      {"id":138,"is_plugin":false,"title":"🔨 claude (master)","terminal_command":"clank agent start claude --repo /a","tab_id":18},
+      {"id":140,"is_plugin":false,"title":"status","terminal_command":"clank status --repo /a --tui","tab_id":18},
+      {"id":201,"is_plugin":false,"title":"kimi (reviewer)","terminal_command":null,"tab_id":18},
+      {"id":111,"is_plugin":false,"title":"👀 codex (reviewer)","terminal_command":null,"tab_id":19},
+      {"id":113,"is_plugin":false,"title":"💤 ruthless (reviewer)","terminal_command":null,"tab_id":19},
+      {"id":150,"is_plugin":false,"title":"🔨 claude (master)","terminal_command":"clank agent start claude --repo /c","tab_id":20},
+      {"id":151,"is_plugin":false,"title":"status","terminal_command":"clank status --repo /c --tui","tab_id":20},
+      {"id":152,"is_plugin":true,"title":"ghost (reviewer)","terminal_command":null,"tab_id":20}
+    ]"#;
+
+    fn title_shape_panes() -> Vec<ZellijPane> {
+        serde_json::from_str(TITLE_SHAPES_JSON).expect("list-panes shape parses")
+    }
+
+    #[test]
+    fn title_anchor_finds_the_reviewer_the_command_match_cannot_see() {
+        let panes = title_shape_panes();
+        // A reviewer pane the exact-command lookup cannot name, which
+        // is the whole reason the fallback exists.
+        assert!(find_anchor_pane(&panes, &[agent_start_command("kimi", "/a")]).is_none());
+        assert_eq!(
+            find_reviewer_pane_by_title(&panes, 18).map(ZellijPane::pane_id),
+            Some("terminal_201".to_string())
+        );
+    }
+
+    #[test]
+    fn title_anchor_accepts_the_glyph_stamped_shape() {
+        let panes = title_shape_panes();
+        assert_eq!(
+            find_reviewer_pane_by_title(&panes, 19).map(ZellijPane::pane_id),
+            Some("terminal_111".to_string())
+        );
+    }
+
+    #[test]
+    fn title_anchor_never_picks_master_status_or_a_plugin() {
+        let panes = title_shape_panes();
+        // Tab 20 holds a master, the instrument pane, and a PLUGIN
+        // whose title would otherwise match — the instrument pane
+        // getting stacked is the original bug this must not revive.
+        assert!(find_reviewer_pane_by_title(&panes, 20).is_none());
+    }
+
+    #[test]
+    fn title_anchor_is_scoped_to_one_tab() {
+        let panes = title_shape_panes();
+        // `list-panes` spans ALL tabs and `(reviewer)` is in nearly
+        // every one, so an unscoped match would anchor onto a foreign
+        // tab — which zellij 0.45.0 offers no way to undo.
+        for (tab, want) in [(18u32, "terminal_201"), (19, "terminal_111")] {
+            assert_eq!(
+                find_reviewer_pane_by_title(&panes, tab).map(ZellijPane::pane_id),
+                Some(want.to_string())
+            );
+        }
+        assert!(find_reviewer_pane_by_title(&panes, 99).is_none());
+    }
+
+    #[test]
+    fn a_title_matched_pane_is_still_not_a_roster_member() {
+        let panes = title_shape_panes();
+        // Anchoring accepts it; CLASSIFICATION must not. A title
+        // carries no ownership marker, so letting it name an agent
+        // fails open (zellij-pane-placement-and-cost).
+        let anchor = find_reviewer_pane_by_title(&panes, 18).expect("anchor found");
+        assert_eq!(agent_pane_label(anchor, "/a"), None);
+        assert!(agent_pane_pairs(&panes, Path::new("/a")).iter().all(|(l, _)| l != "kimi"));
     }
 
     #[test]
