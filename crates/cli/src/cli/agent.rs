@@ -225,11 +225,11 @@ fn start(args: AgentStartArgs) -> anyhow::Result<()> {
                     let tool = spec.tool;
                     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
                     (
-                        compose_fork_launch(&spec, &desc, &repo, home.as_deref()),
+                        compose_fork_launch(&label, &spec, &desc, &repo, home.as_deref()),
                         tool,
                     )
                 }
-                None => (compose_bootstrap_launch(&label, &desc)?, desc.tool),
+                None => (compose_bootstrap_launch(&repo, &label, &desc)?, desc.tool),
             }
         }
         Some(session) => {
@@ -241,6 +241,7 @@ fn start(args: AgentStartArgs) -> anyhow::Result<()> {
             (
                 compose_launch(
                     &repo,
+                    &label,
                     session,
                     desc.launch.as_ref(),
                     resolved_prompt.as_deref(),
@@ -366,6 +367,7 @@ fn registered_labels(set: &crate::cli::teams_config::RegisteredSet) -> Vec<Strin
 /// which creates the skeleton + session binding. Subsequent
 /// `clank agent start <label>` calls resume normally.
 fn compose_bootstrap_launch(
+    repo: &Path,
     label: &AgentLabel,
     desc: &AgentDescription,
 ) -> anyhow::Result<ComposedLaunch> {
@@ -381,7 +383,13 @@ fn compose_bootstrap_launch(
         .map(|l| l.args.clone())
         .unwrap_or_default();
     push_grok_trust(desc.tool, &mut args);
-    push_prompt(desc.tool, &mut args, bootstrap_bind_prompt(label));
+    let name = session_display_name(repo, label);
+    set_session_name(desc.tool, &mut args, &name);
+    push_prompt(
+        desc.tool,
+        &mut args,
+        name_led_prompt(desc.tool, &name, bootstrap_bind_prompt(label)),
+    );
 
     let mut env_overrides = tool_env_defaults(desc.tool);
     env_overrides.extend(
@@ -412,6 +420,7 @@ fn compose_bootstrap_launch(
 /// The orientation prompt rides in each tool's prompt slot
 /// ([`push_prompt`]).
 fn compose_fork_launch(
+    label: &AgentLabel,
     spec: &crate::cli::fork::ForkSpec,
     desc: &AgentDescription,
     worktree: &Path,
@@ -484,7 +493,19 @@ fn compose_fork_launch(
         (None, _) => {}
     }
     push_grok_trust(spec.tool, &mut args);
-    push_prompt(spec.tool, &mut args, spec.prompt.clone());
+    // Named for the FORK's worktree, not the source's. A forked
+    // session otherwise keeps whatever name it was copied from, which
+    // is the one name guaranteed to be wrong — and for the derived
+    // tools the orientation prompt opens with "You are `x` in clone
+    // …", putting the fork name mid-string, exactly where a truncated
+    // title cuts it off.
+    let name = session_display_name(worktree, label);
+    set_session_name(spec.tool, &mut args, &name);
+    push_prompt(
+        spec.tool,
+        &mut args,
+        name_led_prompt(spec.tool, &name, spec.prompt.clone()),
+    );
     let mut env_overrides = tool_env_defaults(spec.tool);
     env_overrides.extend(
         desc.launch
@@ -508,6 +529,56 @@ fn push_prompt(tool: Tool, args: &mut Vec<String>, prompt: String) {
         args.push("--prompt".into());
     }
     args.push(prompt);
+}
+
+/// The display name a session should carry: the worktree (or repo)
+/// directory it belongs to, then the agent label.
+///
+/// The directory alone was the literal ask, but several agents share
+/// one worktree, so it collides across the master and every reviewer
+/// there — and an undistinguishable session list is the complaint
+/// being fixed. Leading with the place keeps the ask; the label makes
+/// it answer the question.
+pub(super) fn session_display_name(repo: &Path, label: &AgentLabel) -> String {
+    let place = repo
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| repo.to_string_lossy().into_owned());
+    format!("{place} · {}", label.as_str())
+}
+
+/// Set the session name where the tool accepts one outright.
+///
+/// Only `claude` does (`-n, --name`, top level, so it applies to the
+/// interactive launch). Passed on EVERY launch including resume: with
+/// no way to read a session's current name back, "set it once" would
+/// leave every session created before this permanently mis-titled,
+/// which is the reported problem.
+fn set_session_name(tool: Tool, args: &mut Vec<String>, name: &str) {
+    if tool == Tool::Claude {
+        args.push("-n".into());
+        args.push(name.to_string());
+    }
+}
+
+/// Lead the prompt with the name for tools that DERIVE a title from
+/// the opening message.
+///
+/// `opencode` has `--title` only on its non-interactive `run`, and
+/// `codex` has no launch-time flag at all — both summarise the first
+/// message instead, which opencode's own flag doc states: "uses
+/// truncated prompt if no value provided". Since clank writes that
+/// message, the name is still clank-driven; nothing here asks the
+/// agent to name itself.
+///
+/// The tool decides the final string, so this SHAPES a derived title
+/// rather than setting one.
+fn name_led_prompt(tool: Tool, name: &str, prompt: String) -> String {
+    if tool == Tool::Claude {
+        prompt
+    } else {
+        format!("{name} — {prompt}")
+    }
 }
 
 /// Seed prompt for the bootstrap launch. Verbatim per the plan's
@@ -610,6 +681,7 @@ pub(super) fn resolve_initial_prompt(
 
 fn compose_launch(
     repo: &Path,
+    label: &AgentLabel,
     session: &Session,
     launch: Option<&LaunchConfig>,
     initial_prompt: Option<&str>,
@@ -626,8 +698,10 @@ fn compose_launch(
     let mut args = launch_args;
     args.extend(session_restore);
     push_grok_trust(tool, &mut args);
+    let name = session_display_name(repo, label);
+    set_session_name(tool, &mut args, &name);
     if let Some(prompt) = initial_prompt {
-        push_prompt(tool, &mut args, prompt.to_string());
+        push_prompt(tool, &mut args, name_led_prompt(tool, &name, prompt.to_string()));
     }
 
     let mut env_overrides = tool_env_defaults(tool);
@@ -1281,6 +1355,10 @@ fn write_typed_config<T: serde::Serialize>(path: &Path, value: &T) -> anyhow::Re
 
 #[cfg(test)]
 mod tests {
+    fn lbl(s: &str) -> AgentLabel {
+        AgentLabel::parse(s).unwrap()
+    }
+
     /// Every roster command is a pure config write; the status TUI
     /// owns roster→pane convergence (tui-zellij-pane-reconcile).
     ///
@@ -1376,7 +1454,7 @@ mod tests {
         // every grok launch carries --trust (folder-trust bypass) IN
         // the composed argv so --print previews it honestly.
         let s = grok_session();
-        let c = compose_launch(Path::new("/repo"), &s, None, Some("hello"));
+        let c = compose_launch(Path::new("/repo"), &lbl("tester"), &s, None, Some("hello"));
         assert_eq!(c.program, "grok");
         let a: Vec<&str> = c.args.iter().map(|s| s.as_str()).collect();
         assert_eq!(
@@ -1387,7 +1465,8 @@ mod tests {
                 "--cwd",
                 "/repo",
                 "--trust",
-                "hello",
+                // grok has no name flag either: derived from the prompt.
+                "repo · tester — hello",
             ]
         );
     }
@@ -1395,7 +1474,7 @@ mod tests {
     #[test]
     fn claude_and_codex_launches_never_carry_trust_flag() {
         for s in [claude_session(), codex_session()] {
-            let c = compose_launch(Path::new("/repo"), &s, None, None);
+            let c = compose_launch(Path::new("/repo"), &lbl("tester"), &s, None, None);
             assert!(
                 !c.args.iter().any(|a| a == "--trust"),
                 "--trust is grok-only, got {:?} for {:?}",
@@ -1779,7 +1858,7 @@ mod tests {
     #[test]
     fn compose_launch_appends_initial_prompt_when_set() {
         let s = claude_session();
-        let c = compose_launch(Path::new("/repo"), &s, None, Some("custom prompt"));
+        let c = compose_launch(Path::new("/repo"), &lbl("tester"), &s, None, Some("custom prompt"));
         assert_eq!(
             c.args.last().map(|s| s.as_str()),
             Some("custom prompt"),
@@ -1789,13 +1868,119 @@ mod tests {
     }
 
     #[test]
+    fn session_name_leads_with_the_worktree_then_the_label() {
+        // A worktree, a clone and a plain checkout all name themselves
+        // by their directory — the same string the zellij tab carries.
+        assert_eq!(
+            session_display_name(
+                Path::new("/Users/x/src/frostsnap-ci/.clank/worktrees/recovery-scan"),
+                &lbl("kimi")
+            ),
+            "recovery-scan · kimi"
+        );
+        assert_eq!(
+            session_display_name(Path::new("/Users/x/src/clank"), &lbl("claude")),
+            "clank · claude"
+        );
+        // The label is what keeps a shared worktree's sessions apart:
+        // master and every reviewer live in the same directory.
+        assert_ne!(
+            session_display_name(Path::new("/r/wt"), &lbl("claude")),
+            session_display_name(Path::new("/r/wt"), &lbl("codex"))
+        );
+    }
+
+    #[test]
+    fn only_claude_takes_the_name_as_a_flag() {
+        // Verified against the installed binaries: claude has
+        // top-level `-n, --name`; opencode's `--title` exists only on
+        // its non-interactive `run`; codex has none.
+        for tool in [Tool::Claude, Tool::Codex, Tool::OpenCode, Tool::Grok] {
+            let mut args = Vec::new();
+            set_session_name(tool, &mut args, "wt · a");
+            let prompt = name_led_prompt(tool, "wt · a", "do the thing".to_string());
+            if tool == Tool::Claude {
+                assert_eq!(args, vec!["-n".to_string(), "wt · a".to_string()]);
+                // Named outright, so its prompt is left alone.
+                assert_eq!(prompt, "do the thing");
+            } else {
+                assert!(args.is_empty(), "{tool:?} has no name flag to pass");
+                // Derived from the opening message, so the name leads.
+                assert!(
+                    prompt.starts_with("wt · a"),
+                    "{tool:?} prompt must lead with the name: {prompt}"
+                );
+                assert!(prompt.ends_with("do the thing"));
+            }
+        }
+    }
+
+    #[test]
+    fn a_fork_is_named_for_the_fork_not_the_session_it_came_from() {
+        // The headline case: `clank fork` is where a session most
+        // needs its own name, because a forked session otherwise
+        // inherits the SOURCE's — the one name guaranteed to be wrong.
+        let wt = Path::new("/repo/.clank/worktrees/recovery-scan");
+        let orient = "You are `kimi` in worktree `recovery-scan`…";
+
+        // claude takes it as a flag, so the prompt is untouched.
+        let spec = crate::cli::fork::ForkSpec {
+            tool: Tool::Claude,
+            from_session: Some("src-session".into()),
+            prompt: orient.into(),
+        };
+        let c = compose_fork_launch(&lbl("kimi"), &spec, &desc_with(Tool::Claude, None), wt, None);
+        let n = c.args.iter().position(|a| a == "-n").expect("fork is named");
+        assert_eq!(c.args[n + 1], "recovery-scan · kimi");
+        assert!(c.args.iter().any(|a| a == orient));
+
+        // codex and opencode derive it, so the name must LEAD — the
+        // orientation prompt opens "You are `kimi` in worktree …",
+        // which buries the fork name where truncation cuts it off.
+        for tool in [Tool::Codex, Tool::OpenCode] {
+            let spec = crate::cli::fork::ForkSpec {
+                tool,
+                from_session: Some("src-session".into()),
+                prompt: orient.into(),
+            };
+            let c = compose_fork_launch(&lbl("kimi"), &spec, &desc_with(tool, None), wt, None);
+            let prompt = c.args.last().expect("a prompt");
+            assert!(
+                prompt.starts_with("recovery-scan · kimi"),
+                "{tool:?} fork prompt must lead with the fork name: {prompt}"
+            );
+            assert!(prompt.ends_with(orient), "orientation is preserved: {prompt}");
+            assert!(!c.args.iter().any(|a| a == "-n"), "{tool:?} has no name flag");
+        }
+    }
+
+    #[test]
+    fn a_resumed_session_is_named_again() {
+        // Deliberate: nothing can read a session's current name back,
+        // so setting it only on first launch would leave every session
+        // created before this permanently mis-titled — which is the
+        // reported problem, not a hypothetical.
+        let s = claude_session();
+        let c = compose_launch(Path::new("/repo"), &lbl("tester"), &s, None, None);
+        let n = c.args.iter().position(|a| a == "-n").expect("named on resume");
+        assert_eq!(c.args[n + 1], "repo · tester");
+    }
+
+    #[test]
     fn compose_launch_omits_prompt_when_none() {
         let s = claude_session();
-        let c = compose_launch(Path::new("/repo"), &s, None, None);
-        // Current behavior preserved exactly: trailing arg is the session id, no prompt.
+        let c = compose_launch(Path::new("/repo"), &lbl("tester"), &s, None, None);
+        // No prompt is appended. The trailing pair is the session
+        // NAME clank always sets for claude, so "last arg" no longer
+        // distinguishes prompt from no-prompt — assert on the absence.
         assert_eq!(
-            c.args.last().map(|s| s.as_str()),
-            Some("aaaaaaaa-1111-2222-3333-444444444444"),
+            c.args,
+            vec![
+                "--resume",
+                "aaaaaaaa-1111-2222-3333-444444444444",
+                "-n",
+                "repo · tester"
+            ],
             "no trailing prompt should be appended; got: {:?}",
             c.args
         );
@@ -1806,12 +1991,14 @@ mod tests {
         // For codex, --cd <repo> comes from session_restore_args
         // BEFORE the prompt. The prompt is the final positional.
         let s = codex_session();
-        let c = compose_launch(Path::new("/repo"), &s, None, Some("ack"));
+        let c = compose_launch(Path::new("/repo"), &lbl("tester"), &s, None, Some("ack"));
         // Expected: ["resume", "<id>", "--cd", "/repo", "ack"]
-        assert_eq!(c.args.last().map(|s| s.as_str()), Some("ack"));
+        // codex has no name flag, so the prompt carries the name.
+        let prompt = "repo · tester — ack";
+        assert_eq!(c.args.last().map(|s| s.as_str()), Some(prompt));
         // --cd <repo> appears before the prompt.
         let cd_pos = c.args.iter().position(|s| s == "--cd").unwrap();
-        let prompt_pos = c.args.iter().position(|s| s == "ack").unwrap();
+        let prompt_pos = c.args.iter().position(|s| s == prompt).unwrap();
         assert!(
             cd_pos < prompt_pos,
             "--cd must come before prompt; argv: {:?}",
@@ -1828,7 +2015,7 @@ mod tests {
         let session = grok_session();
         let prompt = resolve_initial_prompt(None, AutoMode::On, session.tool)
             .expect("auto-on default prompt");
-        let c = compose_launch(Path::new("/repo"), &session, None, Some(&prompt));
+        let c = compose_launch(Path::new("/repo"), &lbl("tester"), &session, None, Some(&prompt));
         let last = c.args.last().map(|s| s.as_str()).unwrap_or("");
         assert!(
             last.contains("clank wait") && last.contains("background"),
@@ -1923,7 +2110,7 @@ mod tests {
                 env: Default::default(),
             }),
         );
-        let c = compose_bootstrap_launch(&label("kimi"), &desc).expect("compose");
+        let c = compose_bootstrap_launch(Path::new("/repo"), &label("kimi"), &desc).expect("compose");
         assert_eq!(c.program, "opencode");
         assert_eq!(
             c.args,
@@ -1931,7 +2118,9 @@ mod tests {
                 "--model".to_string(),
                 "moonshotai/kimi-k3".to_string(),
                 "--prompt".to_string(),
-                "Run `clank as kimi` to bind this session.".to_string(),
+                // opencode's --title is `run`-only, so the interactive
+                // launch derives its title from this prompt.
+                "repo · kimi — Run `clank as kimi` to bind this session.".to_string(),
             ]
         );
     }
@@ -1948,7 +2137,7 @@ mod tests {
             from_session: Some("ses_039d60658ffe0RPgue3noZ0Qqf".into()),
             prompt: "orient".into(),
         };
-        let c = compose_fork_launch(&spec, &desc, Path::new("/repo/.clank/worktrees/x"), None);
+        let c = compose_fork_launch(&lbl("tester"), &spec, &desc, Path::new("/repo/.clank/worktrees/x"), None);
         assert_eq!(c.program, "opencode");
         assert_eq!(
             c.args,
@@ -1957,7 +2146,8 @@ mod tests {
                 "ses_039d60658ffe0RPgue3noZ0Qqf",
                 "--fork",
                 "--prompt",
-                "orient",
+                // No name flag: the fork's name leads the prompt.
+                "x · tester — orient",
             ]
         );
     }
@@ -1971,7 +2161,7 @@ mod tests {
         // disables the compat scan; a deliberate launch.env override
         // wins.
         let desc = desc_with(Tool::OpenCode, None);
-        let c = compose_bootstrap_launch(&label("kimi"), &desc).expect("compose");
+        let c = compose_bootstrap_launch(Path::new("/repo"), &label("kimi"), &desc).expect("compose");
         assert_eq!(
             c.env_overrides.get("OPENCODE_DISABLE_CLAUDE_CODE_SKILLS"),
             Some(&"1".to_string())
@@ -1989,14 +2179,14 @@ mod tests {
                 env,
             }),
         );
-        let c = compose_bootstrap_launch(&label("kimi"), &desc).expect("compose");
+        let c = compose_bootstrap_launch(Path::new("/repo"), &label("kimi"), &desc).expect("compose");
         assert_eq!(
             c.env_overrides.get("OPENCODE_DISABLE_CLAUDE_CODE_SKILLS"),
             Some(&"0".to_string())
         );
         // Other tools carry no opencode default.
         let desc = desc_with(Tool::Claude, None);
-        let c = compose_bootstrap_launch(&label("phantom"), &desc).expect("compose");
+        let c = compose_bootstrap_launch(Path::new("/repo"), &label("phantom"), &desc).expect("compose");
         assert!(c.env_overrides.is_empty());
     }
 
@@ -2051,13 +2241,17 @@ mod tests {
                 env: Default::default(),
             }),
         );
-        let composed = compose_bootstrap_launch(&label("phantom"), &desc).expect("compose");
+        let composed = compose_bootstrap_launch(Path::new("/repo"), &label("phantom"), &desc).expect("compose");
         assert_eq!(composed.program, "claude");
         assert_eq!(
             composed.args,
             vec![
                 "--skill".to_string(),
                 "ruthless".to_string(),
+                // claude takes the name outright, so its prompt is
+                // left alone.
+                "-n".to_string(),
+                "repo · phantom".to_string(),
                 "Run `clank as phantom` to bind this session.".to_string(),
             ]
         );
@@ -2073,7 +2267,7 @@ mod tests {
                 env: Default::default(),
             }),
         );
-        let composed = compose_bootstrap_launch(&label("phantom"), &desc).expect("compose");
+        let composed = compose_bootstrap_launch(Path::new("/repo"), &label("phantom"), &desc).expect("compose");
         // launch.command wins; tool=claude is only the fallback.
         assert_eq!(composed.program, "my-claude-wrapper");
     }
@@ -2082,11 +2276,13 @@ mod tests {
     fn bootstrap_falls_back_to_tool_when_no_launch_command() {
         // No launch profile at all → program is the tool name.
         let desc = desc_with(Tool::Codex, None);
-        let composed = compose_bootstrap_launch(&label("phantom"), &desc).expect("compose");
+        let composed = compose_bootstrap_launch(Path::new("/repo"), &label("phantom"), &desc).expect("compose");
         assert_eq!(composed.program, "codex");
         assert_eq!(
             composed.args,
-            vec!["Run `clank as phantom` to bind this session.".to_string()]
+            // No name flag for this tool, so the title is DERIVED
+            // from the opening message and the name has to lead it.
+            vec!["repo · phantom — Run `clank as phantom` to bind this session.".to_string()]
         );
     }
 
@@ -2228,7 +2424,7 @@ mod tests {
             launch: None,
             initial_prompt: None,
         };
-        let c = compose_bootstrap_launch(&label("fresh-grok"), &desc).expect("compose");
+        let c = compose_bootstrap_launch(Path::new("/repo"), &label("fresh-grok"), &desc).expect("compose");
         assert_eq!(c.program, "grok");
         assert_eq!(c.args.first().map(|s| s.as_str()), Some("--trust"));
         assert_eq!(c.args.len(), 2, "trust + bind prompt only");
@@ -2278,7 +2474,7 @@ mod tests {
             prompt: "orient".into(),
         };
         let home = home_with_session(Tool::Grok, "cccccccc-1111-2222-3333-444444444444");
-        let c = compose_fork_launch(&spec, &desc, wt, Some(home.path()));
+        let c = compose_fork_launch(&lbl("tester"), &spec, &desc, wt, Some(home.path()));
         assert_eq!(c.program, "grok");
         assert_eq!(
             c.args,
@@ -2287,7 +2483,7 @@ mod tests {
                 "cccccccc-1111-2222-3333-444444444444",
                 "--fork-session",
                 "--trust",
-                "orient",
+                "x · tester — orient",
             ]
         );
 
@@ -2296,8 +2492,8 @@ mod tests {
             from_session: None,
             prompt: "orient".into(),
         };
-        let c = compose_fork_launch(&spec, &desc, wt, None);
-        assert_eq!(c.args, vec!["--trust", "orient"]);
+        let c = compose_fork_launch(&lbl("tester"), &spec, &desc, wt, None);
+        assert_eq!(c.args, vec!["--trust", "x · tester — orient"]);
     }
 
     #[test]
@@ -2316,9 +2512,12 @@ mod tests {
             prompt: "You are `claude` in worktree `x`…".into(),
         };
         let wt = std::path::Path::new("/repo/.clank/worktrees/x");
-        let c = compose_fork_launch(&spec, &desc, wt, None);
+        let c = compose_fork_launch(&lbl("tester"), &spec, &desc, wt, None);
         assert_eq!(c.program, "claude");
-        assert_eq!(c.args, vec!["You are `claude` in worktree `x`…"]);
+        assert_eq!(
+            c.args,
+            vec!["-n", "x · tester", "You are `claude` in worktree `x`…"]
+        );
 
         let spec = crate::cli::fork::ForkSpec {
             tool: Tool::Codex,
@@ -2330,11 +2529,11 @@ mod tests {
             launch: None,
             initial_prompt: None,
         };
-        let c = compose_fork_launch(&spec, &desc, wt, None);
+        let c = compose_fork_launch(&lbl("tester"), &spec, &desc, wt, None);
         assert_eq!(c.program, "codex");
         assert_eq!(
             c.args,
-            vec!["orient"],
+            vec!["x · tester — orient"],
             "no fork/-C argv without a source session"
         );
     }
@@ -2359,14 +2558,16 @@ mod tests {
                 from_session: Some("gone-999".into()),
                 prompt: "orient".into(),
             };
-            let c = compose_fork_launch(&spec, &desc, wt, Some(empty.path()));
+            let c = compose_fork_launch(&lbl("tester"), &spec, &desc, wt, Some(empty.path()));
             assert!(
                 !c.args.iter().any(|a| a == "--resume" || a == "fork"),
                 "{tool:?} must not resume a transcript that is gone: {:?}",
                 c.args
             );
+            // Still carries the orientation prompt — now behind the
+            // session name for the tools whose title is derived.
             assert!(
-                c.args.iter().any(|a| a == "orient"),
+                c.args.iter().any(|a| a.ends_with("orient")),
                 "{tool:?} fresh launch still carries the orientation prompt: {:?}",
                 c.args
             );
@@ -2391,6 +2592,7 @@ mod tests {
         };
         let empty = tempfile::tempdir().unwrap();
         let c = compose_fork_launch(
+            &lbl("tester"),
             &spec,
             &desc,
             std::path::Path::new("/repo/.clank/worktrees/x"),
@@ -2422,7 +2624,7 @@ mod tests {
         };
         let wt = std::path::Path::new("/repo/.clank/worktrees/x");
         let home = home_with_session(Tool::Claude, "abc-123");
-        let c = compose_fork_launch(&spec, &desc, wt, Some(home.path()));
+        let c = compose_fork_launch(&lbl("tester"), &spec, &desc, wt, Some(home.path()));
         assert_eq!(c.program, "claude");
         // claude takes cwd from the pane — no -C.
         assert_eq!(
@@ -2431,6 +2633,9 @@ mod tests {
                 "--resume",
                 "abc-123",
                 "--fork-session",
+                // Named for the FORK, not the session it was copied from.
+                "-n",
+                "x · tester",
                 "You are `claude` in worktree `x`…",
             ]
         );
@@ -2446,7 +2651,7 @@ mod tests {
             prompt: "orient".into(),
         };
         let codex_home = home_with_session(Tool::Codex, "def-456");
-        let c = compose_fork_launch(&spec, &desc, wt, Some(codex_home.path()));
+        let c = compose_fork_launch(&lbl("tester"), &spec, &desc, wt, Some(codex_home.path()));
         assert_eq!(c.program, "codex");
         // codex gets -C <worktree> so it doesn't prompt for the cwd
         // (fork-codex-cd-flag).
@@ -2457,7 +2662,8 @@ mod tests {
                 "-C",
                 "/repo/.clank/worktrees/x",
                 "def-456",
-                "orient",
+                // codex has no name flag: the name leads the prompt.
+                "x · tester — orient",
             ]
         );
     }
