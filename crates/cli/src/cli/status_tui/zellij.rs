@@ -321,6 +321,15 @@ pub(super) struct PaneReconciler {
     /// (placement-reads-zellij-stacks-correctly).
     failed_repairs: u32,
     failing: Option<RosterView>,
+    /// Labels whose pane this reconciler created and has not yet seen
+    /// in a listing, with the passes each is still believed for.
+    ///
+    /// A snapshot is a LAGGING observation: `new-pane` returns before
+    /// the listing reports the pane, and `plan.add` is re-derived from
+    /// a fresh snapshot every pass. Without this the pass that follows
+    /// a creation sees the label as still missing and opens a SECOND
+    /// pane for it — the duplicate reviewer this exists to prevent.
+    pending: std::collections::BTreeMap<String, u32>,
 }
 
 /// Consecutive FAILING passes allowed for one roster before the tab is
@@ -331,6 +340,13 @@ pub(super) struct PaneReconciler {
 /// already is for a lone reviewer sharing the instrument pane's
 /// stack.
 const MAX_FAILED_PASSES: u32 = 2;
+
+/// Passes a created-but-unlisted pane stays believed in. It MUST
+/// expire: a `new-pane` that reported an id which never reaches a
+/// listing would otherwise block its label from ever being opened
+/// again, leaving that agent permanently unstarted. One lagging
+/// listing is tolerated, then the label is retried.
+const PENDING_CREATE_PASSES: u32 = 2;
 
 /// The roster facts panes depend on: the member set and who is master.
 /// Role flips between reviewer tiers keep the same pane, so tiers are
@@ -637,7 +653,30 @@ impl PaneReconciler {
             converged: None,
             failed_repairs: 0,
             failing: None,
+            pending: std::collections::BTreeMap::new(),
         }
+    }
+
+    /// Fold creations this reconciler has not yet seen listed into the
+    /// live set, so a pass whose snapshot has not caught up does not
+    /// open a SECOND pane for a label the previous pass just opened.
+    ///
+    /// Keyed by LABEL, not by the created id: `pairs` reports labels,
+    /// so a label is what a listing can confirm. An entry is dropped
+    /// the moment a listing shows it, and ages out otherwise — see
+    /// [`PENDING_CREATE_PASSES`] for why it must.
+    ///
+    /// Believed panes are reported NOT master-titled: the relocation
+    /// that stamps the title runs after the adds, so `false` is what a
+    /// listing would say about a pane created this pass.
+    fn believe_pending(&mut self, live: &[(String, bool)]) -> Vec<(String, bool)> {
+        self.pending.retain(|label, left| {
+            *left = left.saturating_sub(1);
+            !live.iter().any(|(l, _)| l == label) && *left > 0
+        });
+        let mut out = live.to_vec();
+        out.extend(self.pending.keys().map(|l| (l.clone(), false)));
+        out
     }
 
     /// One reconciliation pass for `cur`, skipped when that exact view
@@ -681,7 +720,7 @@ impl PaneReconciler {
         let Some(mut snap) = io.snapshot() else {
             return false;
         };
-        let plan = plan_panes(&cur, &io.pairs(&snap));
+        let plan = plan_panes(&cur, &self.believe_pending(&io.pairs(&snap)));
         let reviewers: Vec<String> = cur
             .labels
             .iter()
@@ -761,6 +800,9 @@ impl PaneReconciler {
         for label in &plan.add {
             let added = io.add(label, &reviewers, &plan.remove, &snap);
             if let Some(id) = added.created {
+                // Believed live until a listing confirms it, so the
+                // next pass cannot open this label a second time.
+                self.pending.insert(label.clone(), PENDING_CREATE_PASSES);
                 created.push((label.clone(), id));
             }
             if let Some(id) = added.anchor {
@@ -1315,6 +1357,120 @@ mod tests {
             vec!["add codex", "stack [terminal_codex]", "focus user_pane"]
         );
         assert_eq!(r.converged, None);
+    }
+
+    #[test]
+    fn reconciler_does_not_reopen_a_pane_whose_listing_has_not_caught_up() {
+        // The observed bug: `new-pane` returns before the listing
+        // reports the pane, so the next pass re-derived `add` from a
+        // snapshot that still showed the label missing and opened a
+        // SECOND pane for it (two `ruthless` panes, one of them never
+        // retitled). What a pass created is believed until a listing
+        // confirms it.
+        let snap = roster_snap(&[("claude", true), ("codex", false)]);
+        let mut r = PaneReconciler::new();
+        let stale = live(&[("claude", true)]);
+
+        // Pass 1 opens codex. The verifying re-list lags too, so
+        // nothing in this pass confirms the pane exists.
+        let mut io = FakeIo::with_verify(vec![Some(stale.clone())], vec![Some(stale.clone())]);
+        r.reconcile(RosterView::of(&snap), &mut io);
+        assert_eq!(io.log.iter().filter(|l| *l == "add codex").count(), 1);
+        assert_eq!(r.converged, None, "unconfirmed pass must retry");
+
+        // Pass 2's snapshot STILL does not show it. No second pane.
+        let mut io = FakeIo::new(vec![Some(stale)]);
+        r.reconcile(RosterView::of(&snap), &mut io);
+        assert!(
+            !io.log.iter().any(|l| l == "add codex"),
+            "a believed pane must not be re-created: {:?}",
+            io.log
+        );
+    }
+
+    #[test]
+    fn a_confirmed_creation_stops_being_believed() {
+        // Discharge, direction one: the listing catches up, so the
+        // memory releases the label and stops shadowing reality.
+        let snap = roster_snap(&[("claude", true), ("codex", false)]);
+        let mut r = PaneReconciler::new();
+        let stale = live(&[("claude", true)]);
+        let mut io = FakeIo::with_verify(vec![Some(stale.clone())], vec![Some(stale)]);
+        r.reconcile(RosterView::of(&snap), &mut io);
+        assert!(r.pending.contains_key("codex"), "created pane is believed");
+
+        let mut io = FakeIo::new(vec![Some(live(&[("claude", true), ("codex", false)]))]);
+        r.reconcile(RosterView::of(&snap), &mut io);
+        assert!(
+            r.pending.is_empty(),
+            "a listed pane must stop being believed: {:?}",
+            r.pending
+        );
+    }
+
+    #[test]
+    fn a_creation_that_never_appears_stops_blocking_its_label() {
+        // Discharge, direction two: the memory MUST expire. A
+        // `new-pane` that reported an id which never reaches a listing
+        // would otherwise block its label forever, and the agent would
+        // never be opened again.
+        //
+        // Each pass grows the roster so none is skipped as converged;
+        // the snapshot never catches up.
+        let mut r = PaneReconciler::new();
+        let stale = live(&[("claude", true)]);
+        let mut adds = 0;
+        for extra in [Vec::new(), vec!["ruthless"], vec!["kimi", "ruthless"]] {
+            let mut labels = vec![("claude", true), ("codex", false)];
+            labels.extend(extra.iter().map(|l| (*l, false)));
+            let snap = roster_snap(&labels);
+            let mut io = FakeIo::with_verify(vec![Some(stale.clone())], vec![Some(stale.clone())]);
+            r.reconcile(RosterView::of(&snap), &mut io);
+            adds += io.log.iter().filter(|l| *l == "add codex").count();
+        }
+        assert_eq!(
+            adds, 2,
+            "codex is retried once the belief expires, not stranded"
+        );
+    }
+
+    #[test]
+    fn a_duplicate_and_unstacked_tab_converges() {
+        // The state the reported tab settled into: two panes for one
+        // roster label, and the reviewers not stacked. The excess pane
+        // is closed and the survivor joins the stack.
+        let snap = roster_snap(&[("claude", true), ("codex", false), ("ruthless", false)]);
+        let dup = live(&[
+            ("claude", true),
+            ("codex", false),
+            ("ruthless", false),
+            ("ruthless", false),
+        ]);
+        let clean = live(&[("claude", true), ("codex", false), ("ruthless", false)]);
+        let mut r = PaneReconciler::new();
+
+        // Pass 1 closes the excess pane; the tab is still unstacked, so
+        // the verify refuses convergence.
+        let mut io = FakeIo::with_verify(vec![Some(dup)], vec![Some(clean.clone())]);
+        io.verify_placed.push_back(false);
+        r.reconcile(RosterView::of(&snap), &mut io);
+        assert!(
+            io.log.iter().any(|l| l == "remove ruthless"),
+            "the excess pane is closed: {:?}",
+            io.log
+        );
+        assert_eq!(r.converged, None, "unstacked must not cache as converged");
+
+        // Pass 2 has nothing to add or remove and repairs placement.
+        let mut io = FakeIo::new(vec![Some(clean)]);
+        io.placed_results.push_back(false);
+        r.reconcile(RosterView::of(&snap), &mut io);
+        assert!(
+            io.log.iter().any(|l| l.starts_with("stack ")),
+            "placement is repaired: {:?}",
+            io.log
+        );
+        assert!(r.converged.is_some(), "repaired tab converges");
     }
 
     #[test]
