@@ -768,7 +768,95 @@ fn attending_path(agent_dir: &Path) -> PathBuf {
 /// exactly as long as the work does and cannot be claimed for longer.
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Attending {
+    /// Authoritative for SUPPRESSION. The hook validates this against
+    /// `background_tasks`, the only thing that knows whether the
+    /// agent's own harness still considers the work live.
     pub(crate) task: String,
+    /// For DISPLAY only, and absent on markers written before it
+    /// existed. A harness task handle carries no pid, so this arrives
+    /// only when the backgrounded command recorded its own `$$`; a
+    /// marker without one is still a correct instruction to the hook,
+    /// it merely cannot be display-verified.
+    ///
+    /// Never consulted by suppression. That is what makes pid REUSE
+    /// tolerable: a recycled pid can at worst leave a status line up
+    /// slightly too long, and can never cause a missed wake.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) pid: Option<i32>,
+    /// RFC3339, for rendering age. Absent on older markers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) since: Option<String>,
+}
+
+/// Does this process exist?
+///
+/// `kill(pid, 0)` runs the existence and permission checks without
+/// delivering a signal. `EPERM` means the process EXISTS but belongs
+/// to another user — the question here is existence, so that is ALIVE.
+///
+/// Non-positive pids are rejected rather than passed through: `kill`
+/// reads 0 as "every process in my group" and -1 as "every process I
+/// may signal", so a corrupt marker holding one must not reach it.
+pub(crate) fn pid_is_alive(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+impl Attending {
+    /// Whether the recorded process still exists, or `None` when the
+    /// marker carries no pid and the question cannot be answered.
+    ///
+    /// A reader outside the hook has no `background_tasks`, so this is
+    /// the ONLY liveness signal available to it. Saying nothing is the
+    /// correct answer when there is no pid — never a guess.
+    pub(crate) fn process_alive(&self) -> Option<bool> {
+        self.pid.map(pid_is_alive)
+    }
+
+    /// How this reads on a status surface: the pid a human can find in
+    /// `ps` when there is one, the harness handle that identifies it to
+    /// the hook, and either its age or the fact that it has ended.
+    pub(crate) fn summary(&self, now: time::OffsetDateTime) -> String {
+        let mut out = match self.pid {
+            Some(pid) => format!("{pid} ({})", self.task),
+            None => self.task.clone(),
+        };
+        match (self.process_alive(), self.age(now)) {
+            (Some(false), _) => out.push_str(" · stale, ended"),
+            (_, Some(age)) => {
+                out.push_str(" · ");
+                out.push_str(&age);
+            }
+            _ => {}
+        }
+        out
+    }
+
+    fn age(&self, now: time::OffsetDateTime) -> Option<String> {
+        let since = time::OffsetDateTime::parse(
+            self.since.as_deref()?,
+            &time::format_description::well_known::Rfc3339,
+        )
+        .ok()?;
+        Some(short_duration(now - since))
+    }
+}
+
+/// A duration at one significant unit — long enough to judge staleness
+/// by eye, short enough for a status line that must not wrap.
+fn short_duration(d: time::Duration) -> String {
+    let secs = d.whole_seconds().max(0);
+    match secs {
+        s if s < 60 => format!("{s}s"),
+        s if s < 3600 => format!("{}m", s / 60),
+        s if s < 86_400 => format!("{}h", s / 3600),
+        s => format!("{}d", s / 86_400),
+    }
 }
 
 /// The marker as it sits on disk, WITHOUT validating or reaping it.
@@ -841,7 +929,8 @@ fn outcome_from_wait_output(
                     reason.push_str(&format!(
                         "\n\nYou have a live background task ({}). If you are WAITING on it, \
                          record it — `clank attending {}` — and nothing will wake you until it \
-                         ends. Do not end your turn to poll it.",
+                         ends. Add `--pid <pid>` (see `clank attending --help`) so `clank status` \
+                         can show when it has ended. Do not end your turn to poll it.",
                         live_ids.join(", "),
                         live_ids.first().map(String::as_str).unwrap_or("<task-id>"),
                     ));
@@ -1307,8 +1396,14 @@ mod tests {
     }
 
     fn write_attending(dir: &Path, task: &str) {
+        write_attending_pid(dir, task, None)
+    }
+
+    fn write_attending_pid(dir: &Path, task: &str, pid: Option<i32>) {
         let rec = Attending {
             task: task.to_string(),
+            pid,
+            since: None,
         };
         std::fs::write(dir.join("attending"), serde_json::to_string(&rec).unwrap()).unwrap();
     }
@@ -1327,6 +1422,76 @@ mod tests {
                            "next":"continue","reason":"gate_continue","gate":"continued"})
     }
 
+    #[test]
+    fn liveness_is_existence_not_permission() {
+        assert!(pid_is_alive(std::process::id() as i32), "our own process");
+        // pid 1 always exists and is root-owned, so a non-root test
+        // run takes the EPERM branch — which must read as ALIVE, since
+        // the question is existence. Running as root takes the rc == 0
+        // branch and must agree.
+        assert!(pid_is_alive(1), "existing but foreign-owned");
+        assert!(!pid_is_alive(i32::MAX), "cannot be a live pid");
+    }
+
+    /// `kill` reads 0 as "my whole process group" and -1 as "every
+    /// process I may signal". A corrupt marker holding one must be
+    /// rejected before it reaches the syscall.
+    #[test]
+    fn non_positive_pids_never_reach_kill() {
+        assert!(!pid_is_alive(0));
+        assert!(!pid_is_alive(-1));
+    }
+
+    /// The pid is for DISPLAY. Suppression keys on the task id alone,
+    /// which is what makes pid reuse unable to cause a missed wake.
+    #[test]
+    fn suppression_ignores_the_pid_entirely() {
+        for pid in [None, Some(i32::MAX), Some(std::process::id() as i32)] {
+            let dir = tempfile::tempdir().unwrap();
+            write_attending_pid(dir.path(), "task-42", pid);
+            let out = outcome_from_wait_output(
+                &wait_output(serde_json::json!([standing_item()])),
+                &AgentLabel::parse("claude").unwrap(),
+                Role::Master,
+                dir.path(),
+                &["task-42".to_string()],
+            );
+            assert!(
+                matches!(
+                    out,
+                    HookOutcome::Silent {
+                        why: SilentReason::AttendingBackgroundTask
+                    }
+                ),
+                "pid {pid:?} must not change suppression, got {out:?}"
+            );
+        }
+    }
+
+    /// Status shows a dead pid as ended but must NOT delete the marker:
+    /// reaping stays the hook's authority, and a reader that raced it
+    /// could silence a wake the agent never acknowledged.
+    #[test]
+    fn reading_a_dead_pid_marker_leaves_it_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        write_attending_pid(dir.path(), "task-42", Some(i32::MAX));
+        let rec = read_attending(dir.path()).expect("readable");
+        assert_eq!(rec.process_alive(), Some(false));
+        assert!(attending_path(dir.path()).exists(), "status never reaps");
+    }
+
+    /// A marker written before `--pid` existed must still parse and
+    /// still suppress — it is a correct instruction to the hook, it
+    /// merely cannot be display-verified.
+    #[test]
+    fn a_pidless_marker_still_parses_and_says_nothing_about_liveness() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(attending_path(dir.path()), r#"{"task":"task-42"}"#).unwrap();
+        let rec = read_attending(dir.path()).expect("old form still readable");
+        assert_eq!(rec.pid, None);
+        assert_eq!(rec.process_alive(), None, "no pid means no claim");
+    }
+
     /// Status parses the very bytes the hook writes. Pinning the field
     /// name here means renaming it without a serde rename breaks the
     /// build rather than quietly making every marker unreadable — which
@@ -1339,6 +1504,10 @@ mod tests {
         let raw = std::fs::read_to_string(attending_path(dir.path())).unwrap();
         let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(json["task"], "task-42");
+        assert!(
+            json.get("pid").is_none() && json.get("since").is_none(),
+            "absent display fields stay off the wire: {json}"
+        );
 
         assert_eq!(
             read_attending(dir.path()).expect("round-trips").task,
@@ -1504,6 +1673,10 @@ mod tests {
                 assert!(
                     reason.contains("clank attending"),
                     "gives the recipe: {reason}"
+                );
+                assert!(
+                    reason.contains("--pid"),
+                    "and teaches the flag that makes status honest: {reason}"
                 );
             }
             other => panic!("no marker means it still wakes, got {other:?}"),

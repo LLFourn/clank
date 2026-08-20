@@ -468,12 +468,21 @@ pub(super) fn scrollable_header(
                 plain(format!(" {}", a.label)),
                 dim(format!("  {}", tier_label(a.role))),
             ];
-            if let Some(verb) = verb_for(&a.label) {
-                spans.push(dim(format!("  {}", spinner_glyph(frame))));
-                spans.push(italic(format!(" {verb}…")));
-            }
-            if let Some(att) = &a.attending {
-                spans.push(dim(format!("  ⌛ {}", att.task)));
+            // An attending agent is BLOCKED, not working, so the
+            // hourglass replaces the spinner and its verb rather than
+            // crowding in beside them — `⌛ working…` claims two things
+            // at once, and the wrong one is the animated one.
+            match &a.attending {
+                Some(att) => spans.push(dim(format!(
+                    "  ⌛ {}",
+                    att.summary(time::OffsetDateTime::now_utc())
+                ))),
+                None => {
+                    if let Some(verb) = verb_for(&a.label) {
+                        spans.push(dim(format!("  {}", spinner_glyph(frame))));
+                        spans.push(italic(format!(" {verb}…")));
+                    }
+                }
             }
             head_out.push(row_line(&spans, mode.selected() == Some(i), color, cols));
         }
@@ -4489,6 +4498,28 @@ mod tests {
             !render(&teamless, 40, 80).join("\n").contains(SPINNER[0]),
             "panel-less render carries no spinner"
         );
+    }
+
+    /// An attending agent is blocked, not working. The hourglass takes
+    /// the spinner's place rather than joining it: an animated
+    /// `working…` beside a wait marker asserts two states at once, and
+    /// the moving one is the wrong one.
+    #[test]
+    fn an_attending_agent_row_shows_the_hourglass_instead_of_a_verb() {
+        let mut s = two_agent_snap();
+        s.plans = vec![plan_state("foo", WaitingOn::MasterToContinue)];
+        s.agents[0].attending = Some(crate::cli::stop_hook::Attending {
+            task: "b72qah60w".to_string(),
+            pid: Some(std::process::id() as i32),
+            since: None,
+        });
+        let row = visible(line_with(&render(&s, 40, 80), "claude"));
+        assert!(row.contains("⌛"), "hourglass marks the wait: {row}");
+        assert!(
+            !row.contains("working"),
+            "verb is replaced, not joined: {row}"
+        );
+        assert!(!row.contains(SPINNER[0]), "and so is the spinner: {row}");
     }
 
     #[test]

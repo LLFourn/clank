@@ -41,11 +41,30 @@ pub async fn run(args: AttendingArgs) -> anyhow::Result<()> {
     if task_id.is_empty() {
         anyhow::bail!("task id is empty");
     }
+    if args.pid.is_some_and(|p| p <= 0) {
+        anyhow::bail!("--pid must be a real process id");
+    }
     let record = crate::cli::stop_hook::Attending {
         task: task_id.to_string(),
+        pid: args.pid,
+        since: Some(
+            time::OffsetDateTime::now_utc()
+                .format(&time::format_description::well_known::Rfc3339)?,
+        ),
     };
     std::fs::write(&path, serde_json::to_string(&record)?)?;
 
-    println!("attending `{task_id}` — nothing will wake you until it ends");
+    match args.pid {
+        Some(pid) => {
+            println!("attending `{task_id}` (pid {pid}) — nothing will wake you until it ends")
+        }
+        // Worth saying: without a pid `clank status` can show that the
+        // wait exists but never that it has ended, so a finished wait
+        // keeps reading as live until the next hook reaps it.
+        None => println!(
+            "attending `{task_id}` — nothing will wake you until it ends. Pass `--pid` to let \
+             `clank status` show when it has ended."
+        ),
+    }
     Ok(())
 }

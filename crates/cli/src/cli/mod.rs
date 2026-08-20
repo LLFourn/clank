@@ -1674,6 +1674,14 @@ pub struct AttendingArgs {
     /// The background task id you are waiting on, as the tool reports
     /// it. Omit with `--clear` to stop attending.
     pub task_id: Option<String>,
+    /// PID of the process you are waiting on, so `clank status` can
+    /// tell a live wait from one that already ended. A task handle
+    /// carries no pid: have the backgrounded command record its own
+    /// (`echo $$ > .clank/agents/<label>/attending.pid`) and pass it
+    /// here. Optional — without it the wait is recorded but cannot be
+    /// shown as live or ended.
+    #[arg(long, value_name = "PID")]
+    pub pid: Option<i32>,
     /// Forget the recorded task.
     #[arg(long)]
     pub clear: bool,

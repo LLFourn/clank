@@ -711,7 +711,12 @@ impl StatusSnapshot {
         }
         for row in &self.agents {
             if let Some(a) = &row.attending {
-                let _ = writeln!(out, "attending: {} → {}", row.label, a.task);
+                let _ = writeln!(
+                    out,
+                    "attending: {} → {}",
+                    row.label,
+                    a.summary(time::OffsetDateTime::now_utc())
+                );
             }
         }
 
@@ -1997,15 +2002,73 @@ mod dirty_and_wake_tests {
         }
     }
 
+    fn marker(
+        task: &str,
+        pid: Option<i32>,
+        since: Option<&str>,
+    ) -> crate::cli::stop_hook::Attending {
+        crate::cli::stop_hook::Attending {
+            task: task.to_string(),
+            pid,
+            since: since.map(str::to_string),
+        }
+    }
+
     #[test]
-    fn a_marker_names_the_task_silencing_the_agent() {
+    fn a_live_pid_renders_as_attending_with_its_age() {
         let mut snap = minimal_snapshot();
         snap.agents = vec![agent_row(
             "claude",
-            Some(crate::cli::stop_hook::Attending {
-                task: "bj0onbq1u".to_string(),
-            }),
+            Some(marker(
+                "b72qah60w",
+                Some(std::process::id() as i32),
+                Some("2026-08-20T14:51:09Z"),
+            )),
         )];
+        let out = snap.to_human();
+        assert!(
+            out.contains(&format!(
+                "attending: claude → {} (b72qah60w) · ",
+                std::process::id()
+            )),
+            "{out}"
+        );
+        assert!(!out.contains("stale"), "a live pid is not stale: {out}");
+    }
+
+    /// The defect this plan exists for: a wait that has ENDED must not
+    /// keep reading as attendance just because no hook has reaped it.
+    #[test]
+    fn a_dead_pid_renders_as_stale() {
+        let mut snap = minimal_snapshot();
+        snap.agents = vec![agent_row(
+            "claude",
+            Some(marker("b72qah60w", Some(i32::MAX), None)),
+        )];
+        assert!(
+            snap.to_human()
+                .contains("attending: claude → 2147483647 (b72qah60w) · stale, ended"),
+            "{}",
+            snap.to_human()
+        );
+    }
+
+    /// A marker written before `--pid` existed, or by a caller that
+    /// could not supply one. Still valid, still shown — but it must
+    /// claim nothing about liveness it cannot check.
+    #[test]
+    fn a_marker_without_a_pid_makes_no_liveness_claim() {
+        let mut snap = minimal_snapshot();
+        snap.agents = vec![agent_row("claude", Some(marker("b72qah60w", None, None)))];
+        let out = snap.to_human();
+        assert!(out.contains("attending: claude → b72qah60w"), "{out}");
+        assert!(!out.contains("stale"), "{out}");
+    }
+
+    #[test]
+    fn a_marker_names_the_task_silencing_the_agent() {
+        let mut snap = minimal_snapshot();
+        snap.agents = vec![agent_row("claude", Some(marker("bj0onbq1u", None, None)))];
         assert!(
             snap.to_human().contains("attending: claude → bj0onbq1u"),
             "{}",
