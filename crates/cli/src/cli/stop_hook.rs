@@ -772,15 +772,17 @@ pub(crate) struct Attending {
     /// `background_tasks`, the only thing that knows whether the
     /// agent's own harness still considers the work live.
     pub(crate) task: String,
-    /// For DISPLAY only, and absent on markers written before it
-    /// existed. A harness task handle carries no pid, so this arrives
-    /// only when the backgrounded command recorded its own `$$`; a
-    /// marker without one is still a correct instruction to the hook,
-    /// it merely cannot be display-verified.
+    /// Absent on markers written before it existed. A harness task
+    /// handle carries no pid, so this arrives only when the
+    /// backgrounded command recorded its own `$$`; a marker without
+    /// one is still a correct instruction to the hook.
     ///
-    /// Never consulted by suppression. That is what makes pid REUSE
-    /// tolerable: a recycled pid can at worst leave a status line up
-    /// slightly too long, and can never cause a missed wake.
+    /// A VETO on suppression, never a licence for it: a dead process
+    /// voids the marker, but a live one cannot suppress anything the
+    /// task id does not already suppress. That asymmetry is what
+    /// makes pid REUSE tolerable — a recycled pid only fails to veto,
+    /// so it can at worst leave silence as long as it already was,
+    /// and never longer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) pid: Option<i32>,
     /// RFC3339, for rendering age. Absent on older markers.
@@ -874,8 +876,9 @@ pub(crate) fn read_attending(agent_dir: &Path) -> Option<Attending> {
 /// The attendance record, iff its task is still LIVE.
 ///
 /// Ownership by liveness, never by claim: the recorded id is validated
-/// against the tool's own live task list, and an id absent from it is
-/// void and deleted. The agent therefore cannot wedge the hook silent
+/// against the tool's own live task list AND, when the marker carries
+/// one, against whether the recorded process still exists. Either
+/// answering "gone" makes the marker void and deletes it. The agent therefore cannot wedge the hook silent
 /// by forgetting to clear the marker — a stale "I am busy" flag would
 /// cause MISSED wakes, which is strictly worse than the noise this
 /// suppresses.
@@ -888,7 +891,19 @@ fn attending_live_task(agent_dir: &Path, live_ids: &[String]) -> Option<Attendin
         let _ = std::fs::remove_file(&path);
         return None;
     };
-    if live_ids.iter().any(|id| id == &rec.task) {
+    // BOTH signals must agree, never either alone. `background_tasks`
+    // has been caught reporting finished work as live (a `cargo
+    // install` that had exited, whose pid was already gone from the
+    // process table), and under blanket suppression a task id that
+    // stays falsely live is an agent that is silent forever.
+    //
+    // A conjunction can only SHORTEN silence — every input silent
+    // after this was silent before — so it cannot introduce a missed
+    // wake. It is also why a pid cannot wedge the hook: passing one
+    // that never dies (`1`, or the agent's own parent) buys nothing,
+    // because the task id still has to agree.
+    let live = live_ids.iter().any(|id| id == &rec.task) && rec.process_alive().unwrap_or(true);
+    if live {
         return Some(rec);
     }
     let _ = std::fs::remove_file(&path);
@@ -1422,6 +1437,106 @@ mod tests {
                            "next":"continue","reason":"gate_continue","gate":"continued"})
     }
 
+    /// Both signals must agree. Reproduces the observed failure:
+    /// `bctmopf2c` exited 0 and pid 98707 was gone from the process
+    /// table, yet the hook still listed the task as live. Under
+    /// blanket suppression that marker would never be reaped and the
+    /// agent would be silent forever.
+    #[test]
+    fn a_dead_pid_voids_a_task_the_harness_still_calls_live() {
+        let dir = tempfile::tempdir().unwrap();
+        write_attending_pid(dir.path(), "task-42", Some(i32::MAX));
+        let out = outcome_from_wait_output(
+            &wait_output(serde_json::json!([standing_item()])),
+            &AgentLabel::parse("claude").unwrap(),
+            Role::Master,
+            dir.path(),
+            &["task-42".to_string()],
+        );
+        assert!(
+            matches!(out, HookOutcome::Continue { .. }),
+            "a dead process must wake regardless of the task list: {out:?}"
+        );
+        assert!(
+            !attending_path(dir.path()).exists(),
+            "and the void marker is reaped, not left to rot"
+        );
+    }
+
+    /// The conjunction's SAFETY property, asserted as a property
+    /// rather than an example: it can only ever shorten silence. Every
+    /// combination that is silent after the change was silent before
+    /// it, so no input that used to wake can now be swallowed.
+    #[test]
+    fn the_conjunction_only_ever_shortens_silence() {
+        let live_pid = std::process::id() as i32;
+        for (pid, task_listed, expect_silent) in [
+            (Some(live_pid), true, true),
+            (Some(i32::MAX), true, false),
+            (None, true, true),
+            (Some(live_pid), false, false),
+            (Some(i32::MAX), false, false),
+            (None, false, false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            write_attending_pid(dir.path(), "task-42", pid);
+            let live_ids: Vec<String> = if task_listed {
+                vec!["task-42".to_string()]
+            } else {
+                vec!["task-other".to_string()]
+            };
+            let out = outcome_from_wait_output(
+                &wait_output(serde_json::json!([standing_item()])),
+                &AgentLabel::parse("claude").unwrap(),
+                Role::Master,
+                dir.path(),
+                &live_ids,
+            );
+            let silent = matches!(
+                out,
+                HookOutcome::Silent {
+                    why: SilentReason::AttendingBackgroundTask
+                }
+            );
+            assert_eq!(
+                silent, expect_silent,
+                "pid {pid:?} + task_listed {task_listed} → silent {silent}, want {expect_silent}"
+            );
+            // Silence is the ONLY state that keeps the marker; every
+            // wake here is a void marker and must reap it.
+            assert_eq!(
+                attending_path(dir.path()).exists(),
+                expect_silent,
+                "marker survives exactly when it suppressed: {pid:?}/{task_listed}"
+            );
+        }
+    }
+
+    /// Markers predating `--pid` carry no pid, so the process half of
+    /// the conjunction cannot speak and must not veto. They behave
+    /// exactly as before.
+    #[test]
+    fn a_pidless_marker_is_governed_by_the_task_list_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(attending_path(dir.path()), r#"{"task":"task-42"}"#).unwrap();
+        let out = outcome_from_wait_output(
+            &wait_output(serde_json::json!([standing_item()])),
+            &AgentLabel::parse("claude").unwrap(),
+            Role::Master,
+            dir.path(),
+            &["task-42".to_string()],
+        );
+        assert!(
+            matches!(
+                out,
+                HookOutcome::Silent {
+                    why: SilentReason::AttendingBackgroundTask
+                }
+            ),
+            "no pid means no veto: {out:?}"
+        );
+    }
+
     #[test]
     fn liveness_is_existence_not_permission() {
         assert!(pid_is_alive(std::process::id() as i32), "our own process");
@@ -1442,30 +1557,26 @@ mod tests {
         assert!(!pid_is_alive(-1));
     }
 
-    /// The pid is for DISPLAY. Suppression keys on the task id alone,
-    /// which is what makes pid reuse unable to cause a missed wake.
+    /// The wedge guard. A pid can VETO suppression but never grant it,
+    /// so an agent that records one which never dies — `1`, or its own
+    /// parent — gains no silence at all: the task id still has to
+    /// agree. Making the pid sufficient would buy codex support and
+    /// this hazard in the same stroke.
     #[test]
-    fn suppression_ignores_the_pid_entirely() {
-        for pid in [None, Some(i32::MAX), Some(std::process::id() as i32)] {
-            let dir = tempfile::tempdir().unwrap();
-            write_attending_pid(dir.path(), "task-42", pid);
-            let out = outcome_from_wait_output(
-                &wait_output(serde_json::json!([standing_item()])),
-                &AgentLabel::parse("claude").unwrap(),
-                Role::Master,
-                dir.path(),
-                &["task-42".to_string()],
-            );
-            assert!(
-                matches!(
-                    out,
-                    HookOutcome::Silent {
-                        why: SilentReason::AttendingBackgroundTask
-                    }
-                ),
-                "pid {pid:?} must not change suppression, got {out:?}"
-            );
-        }
+    fn a_live_pid_is_never_enough_on_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        write_attending_pid(dir.path(), "task-42", Some(1));
+        let out = outcome_from_wait_output(
+            &wait_output(serde_json::json!([standing_item()])),
+            &AgentLabel::parse("claude").unwrap(),
+            Role::Master,
+            dir.path(),
+            &["task-other".to_string()],
+        );
+        assert!(
+            matches!(out, HookOutcome::Continue { .. }),
+            "an unlisted task wakes however immortal the pid: {out:?}"
+        );
     }
 
     /// Status shows a dead pid as ended but must NOT delete the marker:
