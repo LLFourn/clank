@@ -115,6 +115,12 @@ async fn compute_outcome_with(
         }
     };
 
+    // Take the marker NOW, before any branch can return without it.
+    // `AutoMode::Off` and the empty-items path both used to exit
+    // above the old reap, which is how markers outlived their turn.
+    let agent_dir = crate::agent_store::agents_root(&repo).join(label.as_str());
+    let attending = consume_attending(&agent_dir);
+
     // Config may be ABSENT (bound via `clank as` but auto never
     // touched) — that's not "off", it's "unset, inherit the
     // ~/.clank default" (auto-mode-default-on). Resolve the
@@ -164,7 +170,7 @@ async fn compute_outcome_with(
             // wait would reintroduce the tracked-task loop this mode
             // exists to delete (claude-asyncrewake-work-loop).
             BgDisposition::NeedsWorkCheck if async_loop => {
-                return asyncrewake_park(&repo, &label, role, started, &live_ids).await;
+                return asyncrewake_park(&repo, &label, role, started, &live_ids, attending).await;
             }
             BgDisposition::NeedsWorkCheck => match peek_has_work(&repo, &label, role).await {
                 Ok(true) => HookOutcome::Silent {
@@ -181,7 +187,7 @@ async fn compute_outcome_with(
             },
             // NoBackgroundWork (YieldArmed already returned above): genuinely idle.
             _ if async_loop => {
-                return asyncrewake_park(&repo, &label, role, started, &live_ids).await;
+                return asyncrewake_park(&repo, &label, role, started, &live_ids, attending).await;
             }
             _ => match loop_policy(tool) {
                 // LEGACY claude only (`--loop asyncrewake` returns
@@ -202,7 +208,7 @@ async fn compute_outcome_with(
                 // a nudge relay would loop an opencode session
                 // forever).
                 LoopPolicy::InHookWait => {
-                    compute_wait_outcome(&repo, &label, role, started, &live_ids).await
+                    compute_wait_outcome(&repo, &label, role, started, &live_ids, attending).await
                 }
                 // Grok's hooks are PASSIVE (grok-first-class): clank
                 // installs no grok adapter and no continuation could
@@ -399,6 +405,7 @@ async fn asyncrewake_park(
     role: Role,
     started: std::time::Instant,
     live_ids: &[String],
+    attending: Option<Attending>,
 ) -> HookOutcome {
     let agent_dir = crate::agent_store::agents_root(repo).join(label.as_str());
     if let Err(e) = std::fs::create_dir_all(&agent_dir) {
@@ -445,7 +452,7 @@ async fn asyncrewake_park(
     }
 
     let outcome = tokio::select! {
-        o = compute_wait_outcome(repo, label, role, started, live_ids) => o,
+        o = compute_wait_outcome(repo, label, role, started, live_ids, attending) => o,
         // A newer incarnation took over: release (the select drops
         // the wait child via kill_on_drop) and suppress.
         () = generation_changed(&agent_dir, my_gen) => {
@@ -698,6 +705,7 @@ async fn compute_wait_outcome(
     role: Role,
     started: std::time::Instant,
     live_ids: &[String],
+    attending: Option<Attending>,
 ) -> HookOutcome {
     // Fixed at hook entry, so everything below — current_exe, command
     // construction, the child spawn — is charged against it.
@@ -745,7 +753,7 @@ async fn compute_wait_outcome(
     };
 
     let agent_dir = crate::agent_store::agents_root(repo).join(label.as_str());
-    outcome_from_wait_output(&output, label, role, &agent_dir, live_ids)
+    outcome_from_wait_output(&output, label, role, &agent_dir, live_ids, attending)
 }
 
 // ── attending a background task (attending-suppresses-standing-wakes) ──
@@ -755,39 +763,54 @@ fn attending_path(agent_dir: &Path) -> PathBuf {
     agent_dir.join("attending")
 }
 
-/// The background task the agent is waiting on.
+/// Where the hook records the attendance decision it last made.
+fn attended_path(agent_dir: &Path) -> PathBuf {
+    agent_dir.join("attended")
+}
+
+/// The agent's intent for ONE yield: "I am ending my turn because I
+/// am waiting on this, do not nudge me for this yield."
 ///
-/// A live marker silences the hook COMPLETELY — every item, whatever
-/// its reason. An agent blocked on a build cannot act on review
-/// feedback anyway, and the feedback is still there, undelivered and
-/// unchanged, the moment the task ends and the marker dies with it.
-/// Waking it meanwhile only produces the loop this exists to stop.
+/// Consumed by the Stop hook that reads it, so it silences at most
+/// one turn-end and can never outlive the turn that wrote it. That
+/// is the whole safety argument, and it needs no liveness check:
+/// staleness requires surviving, and this cannot.
 ///
-/// The safety is liveness, not selectivity: the id is validated
-/// against the tool's live task list every time, so the silence lasts
-/// exactly as long as the work does and cannot be claimed for longer.
+/// The earlier design stored the same words as a claim about a
+/// DURATION — "X is running, stay silent until it stops" — which had
+/// to remain true over time, so it needed reaping, and the only
+/// reaper was the Stop hook the marker silenced. A reviewer sat
+/// mute for three hours on that.
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Attending {
-    /// Authoritative for SUPPRESSION. The hook validates this against
-    /// `background_tasks`, the only thing that knows whether the
-    /// agent's own harness still considers the work live.
     pub(crate) task: String,
-    /// Absent on markers written before it existed. A harness task
-    /// handle carries no pid, so this arrives only when the
-    /// backgrounded command recorded its own `$$`; a marker without
-    /// one is still a correct instruction to the hook.
-    ///
-    /// A VETO on suppression, never a licence for it: a dead process
-    /// voids the marker, but a live one cannot suppress anything the
-    /// task id does not already suppress. That asymmetry is what
-    /// makes pid REUSE tolerable — a recycled pid only fails to veto,
-    /// so it can at worst leave silence as long as it already was,
-    /// and never longer.
+    /// Absent unless the caller passed `--pid`. A harness task handle
+    /// carries no pid, so this arrives only when the backgrounded
+    /// command recorded its own `$$`. Display only — nothing about
+    /// suppression consults it, since a one-shot marker has no
+    /// lifetime to bound.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) pid: Option<i32>,
-    /// RFC3339, for rendering age. Absent on older markers.
+}
+
+/// What the Stop hook DECIDED, kept for the human to read.
+///
+/// The marker is gone within a turn, which is too short to be seen.
+/// This is the observation left behind: at `at`, this agent was
+/// silenced because it said it was waiting on `task`. It is history
+/// plus — via `pid` — a live OS check, never a claim that survived.
+///
+/// Nothing reads it for suppression. That is precisely what makes it
+/// safe to outlive the marker it came from: an inaccurate record
+/// misinforms a status line, where an inaccurate marker muted an
+/// agent.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Attended {
+    pub(crate) task: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) since: Option<String>,
+    pub(crate) pid: Option<i32>,
+    /// RFC3339, for rendering how long ago the decision was made.
+    pub(crate) at: String,
 }
 
 /// Does this process exist?
@@ -809,20 +832,20 @@ pub(crate) fn pid_is_alive(pid: i32) -> bool {
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
-impl Attending {
+impl Attended {
     /// Whether the recorded process still exists, or `None` when the
-    /// marker carries no pid and the question cannot be answered.
+    /// record carries no pid and the question cannot be answered.
     ///
-    /// A reader outside the hook has no `background_tasks`, so this is
-    /// the ONLY liveness signal available to it. Saying nothing is the
-    /// correct answer when there is no pid — never a guess.
+    /// Saying nothing is the correct answer without a pid — never a
+    /// guess.
     pub(crate) fn process_alive(&self) -> Option<bool> {
         self.pid.map(pid_is_alive)
     }
 
-    /// How this reads on a status surface: the pid a human can find in
-    /// `ps` when there is one, the harness handle that identifies it to
-    /// the hook, and either its age or the fact that it has ended.
+    /// How the decision reads on a status surface: the pid a human can
+    /// find in `ps` when there is one, the harness handle that names it
+    /// to the hook, and either how long ago it was made or the fact
+    /// that the process has since ended.
     pub(crate) fn summary(&self, now: time::OffsetDateTime) -> String {
         let mut out = match self.pid {
             Some(pid) => format!("{pid} ({})", self.task),
@@ -840,12 +863,10 @@ impl Attending {
     }
 
     fn age(&self, now: time::OffsetDateTime) -> Option<String> {
-        let since = time::OffsetDateTime::parse(
-            self.since.as_deref()?,
-            &time::format_description::well_known::Rfc3339,
-        )
-        .ok()?;
-        Some(short_duration(now - since))
+        let at =
+            time::OffsetDateTime::parse(&self.at, &time::format_description::well_known::Rfc3339)
+                .ok()?;
+        Some(short_duration(now - at))
     }
 }
 
@@ -861,53 +882,53 @@ fn short_duration(d: time::Duration) -> String {
     }
 }
 
-/// The marker as it sits on disk, WITHOUT validating or reaping it.
-///
-/// Reaping belongs to the hook, which alone holds the liveness
-/// authority (`live_ids`). A read-only surface that deleted markers
-/// would race the hook and could silence a wake the agent never
-/// acknowledged, so an unreadable marker reads here as no attendance
-/// and is left exactly where it is.
-pub(crate) fn read_attending(agent_dir: &Path) -> Option<Attending> {
-    let raw = std::fs::read_to_string(attending_path(agent_dir)).ok()?;
-    serde_json::from_str::<Attending>(&raw).ok()
+/// The last decision, for surfaces that report it. Read-only: status
+/// never writes or clears this, because the hook rewrites it on every
+/// turn-end anyway.
+pub(crate) fn read_attended(agent_dir: &Path) -> Option<Attended> {
+    let raw = std::fs::read_to_string(attended_path(agent_dir)).ok()?;
+    serde_json::from_str::<Attended>(&raw).ok()
 }
 
-/// The attendance record, iff its task is still LIVE.
+/// Take the marker, and take it WHATEVER happens next.
 ///
-/// Ownership by liveness, never by claim: the recorded id is validated
-/// against the tool's own live task list AND, when the marker carries
-/// one, against whether the recorded process still exists. Either
-/// answering "gone" makes the marker void and deletes it. The agent therefore cannot wedge the hook silent
-/// by forgetting to clear the marker — a stale "I am busy" flag would
-/// cause MISSED wakes, which is strictly worse than the noise this
-/// suppresses.
-fn attending_live_task(agent_dir: &Path, live_ids: &[String]) -> Option<Attending> {
+/// Unconditional and early by design. Every way the old code failed to
+/// reap was "the hook ran but never reached the marker" — auto off,
+/// no work, or the task still reported live — so the only deletion
+/// that closes them is one no branch can skip. Read-then-delete, never
+/// delete-if-used: a marker that survives a Stop for any reason is the
+/// duration-scoped bug returning.
+///
+/// The stale decision record goes with it, so what remains describes
+/// THIS turn-end and no earlier one.
+fn consume_attending(agent_dir: &Path) -> Option<Attending> {
     let path = attending_path(agent_dir);
-    let raw = std::fs::read_to_string(&path).ok()?;
-    let Ok(rec) = serde_json::from_str::<Attending>(&raw) else {
-        // Unreadable marker suppresses nothing — fail toward NOISE,
-        // never toward silence.
+    let raw = std::fs::read_to_string(&path).ok();
+    if raw.is_some() {
         let _ = std::fs::remove_file(&path);
-        return None;
-    };
-    // BOTH signals must agree, never either alone. `background_tasks`
-    // has been caught reporting finished work as live (a `cargo
-    // install` that had exited, whose pid was already gone from the
-    // process table), and under blanket suppression a task id that
-    // stays falsely live is an agent that is silent forever.
-    //
-    // A conjunction can only SHORTEN silence — every input silent
-    // after this was silent before — so it cannot introduce a missed
-    // wake. It is also why a pid cannot wedge the hook: passing one
-    // that never dies (`1`, or the agent's own parent) buys nothing,
-    // because the task id still has to agree.
-    let live = live_ids.iter().any(|id| id == &rec.task) && rec.process_alive().unwrap_or(true);
-    if live {
-        return Some(rec);
     }
-    let _ = std::fs::remove_file(&path);
-    None
+    let _ = std::fs::remove_file(attended_path(agent_dir));
+    // An unreadable marker suppresses nothing — fail toward NOISE,
+    // never toward silence.
+    raw.and_then(|r| serde_json::from_str::<Attending>(&r).ok())
+}
+
+/// Leave the decision behind for `clank status`, since the marker
+/// itself is gone within the turn and never visible.
+fn record_attended(agent_dir: &Path, rec: &Attending) {
+    let Ok(at) =
+        time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339)
+    else {
+        return;
+    };
+    let entry = Attended {
+        task: rec.task.clone(),
+        pid: rec.pid,
+        at,
+    };
+    if let Ok(json) = serde_json::to_string(&entry) {
+        let _ = std::fs::write(attended_path(agent_dir), json);
+    }
 }
 
 /// Map the finished wait's output to an outcome. Pure, so the
@@ -924,6 +945,7 @@ fn outcome_from_wait_output(
     role: Role,
     agent_dir: &Path,
     live_ids: &[String],
+    attending: Option<Attending>,
 ) -> HookOutcome {
     match output.status.code() {
         Some(0) => match parse_wait_json(&output.stdout) {
@@ -931,7 +953,8 @@ fn outcome_from_wait_output(
                 why: SilentReason::NoWork,
             },
             Ok(items) => {
-                if attending_live_task(agent_dir, live_ids).is_some() {
+                if let Some(rec) = attending {
+                    record_attended(agent_dir, &rec);
                     return HookOutcome::Silent {
                         why: SilentReason::AttendingBackgroundTask,
                     };
@@ -1418,7 +1441,6 @@ mod tests {
         let rec = Attending {
             task: task.to_string(),
             pid,
-            since: None,
         };
         std::fs::write(dir.join("attending"), serde_json::to_string(&rec).unwrap()).unwrap();
     }
@@ -1437,104 +1459,25 @@ mod tests {
                            "next":"continue","reason":"gate_continue","gate":"continued"})
     }
 
-    /// Both signals must agree. Reproduces the observed failure:
-    /// `bctmopf2c` exited 0 and pid 98707 was gone from the process
-    /// table, yet the hook still listed the task as live. Under
-    /// blanket suppression that marker would never be reaped and the
-    /// agent would be silent forever.
-    #[test]
-    fn a_dead_pid_voids_a_task_the_harness_still_calls_live() {
-        let dir = tempfile::tempdir().unwrap();
-        write_attending_pid(dir.path(), "task-42", Some(i32::MAX));
-        let out = outcome_from_wait_output(
-            &wait_output(serde_json::json!([standing_item()])),
+    fn outcome(dir: &Path, items: serde_json::Value, live: &[String]) -> HookOutcome {
+        let attending = consume_attending(dir);
+        outcome_from_wait_output(
+            &wait_output(items),
             &AgentLabel::parse("claude").unwrap(),
             Role::Master,
-            dir.path(),
-            &["task-42".to_string()],
-        );
-        assert!(
-            matches!(out, HookOutcome::Continue { .. }),
-            "a dead process must wake regardless of the task list: {out:?}"
-        );
-        assert!(
-            !attending_path(dir.path()).exists(),
-            "and the void marker is reaped, not left to rot"
-        );
+            dir,
+            live,
+            attending,
+        )
     }
 
-    /// The conjunction's SAFETY property, asserted as a property
-    /// rather than an example: it can only ever shorten silence. Every
-    /// combination that is silent after the change was silent before
-    /// it, so no input that used to wake can now be swallowed.
-    #[test]
-    fn the_conjunction_only_ever_shortens_silence() {
-        let live_pid = std::process::id() as i32;
-        for (pid, task_listed, expect_silent) in [
-            (Some(live_pid), true, true),
-            (Some(i32::MAX), true, false),
-            (None, true, true),
-            (Some(live_pid), false, false),
-            (Some(i32::MAX), false, false),
-            (None, false, false),
-        ] {
-            let dir = tempfile::tempdir().unwrap();
-            write_attending_pid(dir.path(), "task-42", pid);
-            let live_ids: Vec<String> = if task_listed {
-                vec!["task-42".to_string()]
-            } else {
-                vec!["task-other".to_string()]
-            };
-            let out = outcome_from_wait_output(
-                &wait_output(serde_json::json!([standing_item()])),
-                &AgentLabel::parse("claude").unwrap(),
-                Role::Master,
-                dir.path(),
-                &live_ids,
-            );
-            let silent = matches!(
-                out,
-                HookOutcome::Silent {
-                    why: SilentReason::AttendingBackgroundTask
-                }
-            );
-            assert_eq!(
-                silent, expect_silent,
-                "pid {pid:?} + task_listed {task_listed} → silent {silent}, want {expect_silent}"
-            );
-            // Silence is the ONLY state that keeps the marker; every
-            // wake here is a void marker and must reap it.
-            assert_eq!(
-                attending_path(dir.path()).exists(),
-                expect_silent,
-                "marker survives exactly when it suppressed: {pid:?}/{task_listed}"
-            );
-        }
-    }
-
-    /// Markers predating `--pid` carry no pid, so the process half of
-    /// the conjunction cannot speak and must not veto. They behave
-    /// exactly as before.
-    #[test]
-    fn a_pidless_marker_is_governed_by_the_task_list_alone() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(attending_path(dir.path()), r#"{"task":"task-42"}"#).unwrap();
-        let out = outcome_from_wait_output(
-            &wait_output(serde_json::json!([standing_item()])),
-            &AgentLabel::parse("claude").unwrap(),
-            Role::Master,
-            dir.path(),
-            &["task-42".to_string()],
-        );
-        assert!(
-            matches!(
-                out,
-                HookOutcome::Silent {
-                    why: SilentReason::AttendingBackgroundTask
-                }
-            ),
-            "no pid means no veto: {out:?}"
-        );
+    fn is_attending_silence(out: &HookOutcome) -> bool {
+        matches!(
+            out,
+            HookOutcome::Silent {
+                why: SilentReason::AttendingBackgroundTask
+            }
+        )
     }
 
     #[test]
@@ -1549,7 +1492,7 @@ mod tests {
     }
 
     /// `kill` reads 0 as "my whole process group" and -1 as "every
-    /// process I may signal". A corrupt marker holding one must be
+    /// process I may signal". A corrupt record holding one must be
     /// rejected before it reaches the syscall.
     #[test]
     fn non_positive_pids_never_reach_kill() {
@@ -1557,214 +1500,184 @@ mod tests {
         assert!(!pid_is_alive(-1));
     }
 
-    /// The wedge guard. A pid can VETO suppression but never grant it,
-    /// so an agent that records one which never dies — `1`, or its own
-    /// parent — gains no silence at all: the task id still has to
-    /// agree. Making the pid sufficient would buy codex support and
-    /// this hazard in the same stroke.
+    /// THE property. A marker buys exactly one quiet turn-end; the
+    /// next Stop, with everything else identical, wakes. Staleness
+    /// needs survival, and nothing here survives.
     #[test]
-    fn a_live_pid_is_never_enough_on_its_own() {
+    fn a_marker_silences_one_stop_and_only_one() {
         let dir = tempfile::tempdir().unwrap();
-        write_attending_pid(dir.path(), "task-42", Some(1));
-        let out = outcome_from_wait_output(
-            &wait_output(serde_json::json!([standing_item()])),
-            &AgentLabel::parse("claude").unwrap(),
-            Role::Master,
-            dir.path(),
-            &["task-other".to_string()],
-        );
+        write_attending_pid(dir.path(), "task-42", Some(std::process::id() as i32));
+
+        let first = outcome(dir.path(), serde_json::json!([standing_item()]), &[]);
+        assert!(is_attending_silence(&first), "got {first:?}");
+
+        let second = outcome(dir.path(), serde_json::json!([standing_item()]), &[]);
         assert!(
-            matches!(out, HookOutcome::Continue { .. }),
-            "an unlisted task wakes however immortal the pid: {out:?}"
+            matches!(second, HookOutcome::Continue { .. }),
+            "the marker was consumed, so this must wake: {second:?}"
         );
     }
 
-    /// Status shows a dead pid as ended but must NOT delete the marker:
-    /// reaping stays the hook's authority, and a reader that raced it
-    /// could silence a wake the agent never acknowledged.
+    /// Suppression no longer consults the harness at all. The marker
+    /// is an intent about THIS yield, not a claim that some task is
+    /// still running, so a task the harness never mentions — or still
+    /// falsely calls live — changes nothing either way.
     #[test]
-    fn reading_a_dead_pid_marker_leaves_it_on_disk() {
-        let dir = tempfile::tempdir().unwrap();
-        write_attending_pid(dir.path(), "task-42", Some(i32::MAX));
-        let rec = read_attending(dir.path()).expect("readable");
-        assert_eq!(rec.process_alive(), Some(false));
-        assert!(attending_path(dir.path()).exists(), "status never reaps");
-    }
-
-    /// A marker written before `--pid` existed must still parse and
-    /// still suppress — it is a correct instruction to the hook, it
-    /// merely cannot be display-verified.
-    #[test]
-    fn a_pidless_marker_still_parses_and_says_nothing_about_liveness() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(attending_path(dir.path()), r#"{"task":"task-42"}"#).unwrap();
-        let rec = read_attending(dir.path()).expect("old form still readable");
-        assert_eq!(rec.pid, None);
-        assert_eq!(rec.process_alive(), None, "no pid means no claim");
-    }
-
-    /// Status parses the very bytes the hook writes. Pinning the field
-    /// name here means renaming it without a serde rename breaks the
-    /// build rather than quietly making every marker unreadable — which
-    /// would surface as "nobody is attending anything", the same as
-    /// working correctly.
-    #[test]
-    fn the_marker_on_disk_has_the_field_names_status_reads() {
-        let dir = tempfile::tempdir().unwrap();
-        write_attending(dir.path(), "task-42");
-        let raw = std::fs::read_to_string(attending_path(dir.path())).unwrap();
-        let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        assert_eq!(json["task"], "task-42");
-        assert!(
-            json.get("pid").is_none() && json.get("since").is_none(),
-            "absent display fields stay off the wire: {json}"
-        );
-
-        assert_eq!(
-            read_attending(dir.path()).expect("round-trips").task,
-            "task-42"
-        );
-    }
-
-    /// A marker too corrupt to parse must read as no attendance and
-    /// stay on disk: reaping is the hook's call, and a reader that
-    /// deleted it could silence a wake the agent never acknowledged.
-    #[test]
-    fn an_unreadable_marker_reads_as_no_attendance_and_survives() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(attending_path(dir.path()), "{not json").unwrap();
-        assert!(read_attending(dir.path()).is_none());
-        assert!(attending_path(dir.path()).exists());
+    fn the_task_list_no_longer_decides_anything() {
+        for live in [
+            Vec::new(),
+            vec!["task-42".to_string()],
+            vec!["something-else".to_string()],
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            write_attending(dir.path(), "task-42");
+            let out = outcome(dir.path(), serde_json::json!([standing_item()]), &live);
+            assert!(is_attending_silence(&out), "live={live:?} got {out:?}");
+            assert!(
+                !attending_path(dir.path()).exists(),
+                "and it is consumed regardless: live={live:?}"
+            );
+        }
     }
 
     #[test]
-    fn no_marker_reads_as_no_attendance() {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(read_attending(dir.path()).is_none());
-    }
-
-    #[test]
-    fn attending_a_live_task_suppresses_standing_work() {
-        let dir = tempfile::tempdir().unwrap();
-        write_attending(dir.path(), "task-42");
-        let out = outcome_from_wait_output(
-            &wait_output(serde_json::json!([standing_item()])),
-            &AgentLabel::parse("claude").unwrap(),
-            Role::Master,
-            dir.path(),
-            &["task-42".to_string()],
-        );
-        assert!(
-            matches!(
-                out,
-                HookOutcome::Silent {
-                    why: SilentReason::AttendingBackgroundTask
-                }
-            ),
-            "got {out:?}"
-        );
-    }
-
-    /// Every reason, not a chosen few. `ready_to_finalize` is the case
-    /// that motivated this: it woke a master a dozen times while a
-    /// build ran, and no marker could acknowledge it because the old
-    /// predicate admitted only `gate_continue`.
-    #[test]
-    fn a_live_marker_suppresses_every_reason_there_is() {
-        let dir = tempfile::tempdir().unwrap();
-        write_attending(dir.path(), "task-42");
+    fn a_marker_silences_every_reason_there_is() {
         for item in [
             serde_json::json!({"kind":"master","plan":"p","sha":FULL_SHA,
                  "next":"finalize","reason":"ready_to_finalize","gate":"finished"}),
             serde_json::json!({"kind":"master","plan":"p","sha":FULL_SHA,
                  "next":"revise","reason":"address_commit_changes","gate":"changes_requested"}),
             serde_json::json!({"kind":"unblocked","name":"q","answer":"yes"}),
-            serde_json::json!({"kind":"master","plan":"p","sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-                 "next":"continue","reason":"gate_continue","gate":"continued"}),
         ] {
-            let out = outcome_from_wait_output(
-                &wait_output(serde_json::json!([item.clone()])),
-                &AgentLabel::parse("claude").unwrap(),
-                Role::Master,
-                dir.path(),
-                &["task-42".to_string()],
-            );
-            assert!(
-                matches!(
-                    out,
-                    HookOutcome::Silent {
-                        why: SilentReason::AttendingBackgroundTask
-                    }
-                ),
-                "{item} must be suppressed, got {out:?}"
-            );
+            let dir = tempfile::tempdir().unwrap();
+            write_attending(dir.path(), "task-42");
+            let out = outcome(dir.path(), serde_json::json!([item.clone()]), &[]);
+            assert!(is_attending_silence(&out), "{item} → {out:?}");
         }
     }
 
+    /// The empty-items path returns before the marker is examined, so
+    /// consumption cannot live there. This pins that the caller takes
+    /// the marker first — the escape route that let markers outlive
+    /// their turn.
     #[test]
-    fn an_unreadable_marker_fails_toward_noise() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("attending"), "not json").unwrap();
-        let out = outcome_from_wait_output(
-            &wait_output(serde_json::json!([standing_item()])),
-            &AgentLabel::parse("claude").unwrap(),
-            Role::Master,
-            dir.path(),
-            &["task-42".to_string()],
-        );
-        assert!(
-            matches!(out, HookOutcome::Continue { .. }),
-            "a corrupt marker must never silence: {out:?}"
-        );
-    }
-
-    /// News does not get an exemption. An agent blocked on a build
-    /// cannot act on an answered block either, and the item is still
-    /// there, unchanged, the moment the task ends.
-    #[test]
-    fn attending_suppresses_news_too() {
+    fn no_work_still_consumes_the_marker() {
         let dir = tempfile::tempdir().unwrap();
         write_attending(dir.path(), "task-42");
-        let out = outcome_from_wait_output(
-            &wait_output(serde_json::json!([
-                standing_item(),
-                {"kind":"unblocked","name":"q","answer":"yes"}
-            ])),
-            &AgentLabel::parse("claude").unwrap(),
-            Role::Master,
-            dir.path(),
-            &["task-42".to_string()],
-        );
+        let out = outcome(dir.path(), serde_json::json!([]), &[]);
         assert!(
             matches!(
                 out,
                 HookOutcome::Silent {
-                    why: SilentReason::AttendingBackgroundTask
+                    why: SilentReason::NoWork
                 }
             ),
             "got {out:?}"
         );
+        assert!(
+            !attending_path(dir.path()).exists(),
+            "consumed even though the marker was never consulted"
+        );
     }
 
     #[test]
-    fn a_stale_marker_is_void_and_removed() {
-        // The missed-wake failure mode, tested directly: a marker whose
-        // task is gone must NOT silence the hook, and must not linger.
+    fn an_unreadable_marker_fails_toward_noise_and_is_taken() {
         let dir = tempfile::tempdir().unwrap();
-        let marker = dir.path().join("attending");
-        write_attending(dir.path(), "task-gone");
-        let out = outcome_from_wait_output(
-            &wait_output(serde_json::json!([standing_item()])),
-            &AgentLabel::parse("claude").unwrap(),
-            Role::Master,
-            dir.path(),
-            &["task-other".to_string()],
-        );
+        std::fs::write(attending_path(dir.path()), "not json").unwrap();
+        let out = outcome(dir.path(), serde_json::json!([standing_item()]), &[]);
         assert!(
             matches!(out, HookOutcome::Continue { .. }),
-            "a stale marker must never suppress: {out:?}"
+            "a corrupt marker must never silence: {out:?}"
         );
-        assert!(!marker.exists(), "and it is discarded, not left to rot");
+        assert!(
+            !attending_path(dir.path()).exists(),
+            "and must not be left to fail again next turn"
+        );
+    }
+
+    /// Markers written before the pid existed, and before `since` was
+    /// dropped, are consumed identically — serde ignores the extra
+    /// field and the model does not care.
+    #[test]
+    fn markers_of_any_older_shape_are_consumed_identically() {
+        for raw in [
+            r#"{"task":"task-42"}"#,
+            r#"{"task":"task-42","pid":4242}"#,
+            r#"{"task":"task-42","since":"2026-08-20T10:13:13Z"}"#,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(attending_path(dir.path()), raw).unwrap();
+            let out = outcome(dir.path(), serde_json::json!([standing_item()]), &[]);
+            assert!(is_attending_silence(&out), "{raw} → {out:?}");
+            assert!(!attending_path(dir.path()).exists(), "{raw} not consumed");
+        }
+    }
+
+    // ── the decision record ──
+
+    #[test]
+    fn silencing_records_the_decision_with_its_pid() {
+        let dir = tempfile::tempdir().unwrap();
+        write_attending_pid(dir.path(), "task-42", Some(4242));
+        assert!(is_attending_silence(&outcome(
+            dir.path(),
+            serde_json::json!([standing_item()]),
+            &[]
+        )));
+
+        let rec = read_attended(dir.path()).expect("decision recorded");
+        assert_eq!(rec.task, "task-42");
+        assert_eq!(rec.pid, Some(4242));
+        assert!(
+            !rec.at.is_empty(),
+            "and stamps when, so status can age it: {rec:?}"
+        );
+    }
+
+    /// A decision must not outlive the wake that supersedes it.
+    #[test]
+    fn any_other_outcome_clears_the_decision() {
+        let dir = tempfile::tempdir().unwrap();
+        write_attending_pid(dir.path(), "task-42", Some(4242));
+        outcome(dir.path(), serde_json::json!([standing_item()]), &[]);
+        assert!(read_attended(dir.path()).is_some(), "recorded");
+
+        let out = outcome(dir.path(), serde_json::json!([standing_item()]), &[]);
+        assert!(matches!(out, HookOutcome::Continue { .. }));
+        assert!(
+            read_attended(dir.path()).is_none(),
+            "the wake erased the decision it superseded"
+        );
+    }
+
+    #[test]
+    fn the_record_on_disk_has_the_field_names_status_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        write_attending_pid(dir.path(), "task-42", Some(4242));
+        outcome(dir.path(), serde_json::json!([standing_item()]), &[]);
+        let raw = std::fs::read_to_string(attended_path(dir.path())).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(json["task"], "task-42");
+        assert_eq!(json["pid"], 4242);
+        assert!(json["at"].is_string());
+    }
+
+    #[test]
+    fn a_record_without_a_pid_makes_no_liveness_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        write_attending(dir.path(), "task-42");
+        outcome(dir.path(), serde_json::json!([standing_item()]), &[]);
+        let rec = read_attended(dir.path()).expect("recorded");
+        assert_eq!(rec.pid, None);
+        assert_eq!(rec.process_alive(), None);
+    }
+
+    #[test]
+    fn no_record_reads_as_no_attendance() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(read_attended(dir.path()).is_none());
+        std::fs::write(attended_path(dir.path()), "{not json").unwrap();
+        assert!(read_attended(dir.path()).is_none(), "corrupt reads as none");
     }
 
     #[test]
@@ -1777,6 +1690,7 @@ mod tests {
             Role::Master,
             dir.path(),
             &["task-42".to_string()],
+            None,
         );
         match out {
             HookOutcome::Continue { reason } => {
@@ -1804,6 +1718,7 @@ mod tests {
             Role::Master,
             dir.path(),
             &[],
+            None,
         );
         match out {
             HookOutcome::Continue { reason } => {
@@ -2199,6 +2114,36 @@ mod tests {
         );
     }
 
+    /// The second early return. `AutoMode::Off` exits above everything
+    /// clank does, so it is the same shape as the empty-items route —
+    /// "the hook ran but never reached the marker" — which is the
+    /// entire bug class this model deletes. Consumption sits before
+    /// the auto-mode branch precisely so neither can skip it.
+    #[tokio::test]
+    async fn auto_off_still_consumes_the_marker() {
+        let dir = init_repo();
+        let repo = dir.path();
+        let label = bind(repo, "codex", "sess-auto-off-marker");
+        crate::agent_store::set_auto_mode(repo, &label, AutoMode::Off).unwrap();
+
+        let agent_dir = crate::agent_store::agents_root(repo).join(label.as_str());
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        write_attending(&agent_dir, "task-42");
+
+        let input = hook_input("sess-auto-off-marker", Some("done"));
+        let outcome = compute_outcome(Tool::Claude, Some(repo), input).await;
+        assert_eq!(
+            outcome,
+            HookOutcome::Silent {
+                why: SilentReason::AutoOff
+            }
+        );
+        assert!(
+            !attending_path(&agent_dir).exists(),
+            "an auto-off turn-end must still take the marker with it"
+        );
+    }
+
     #[tokio::test]
     async fn armed_background_wait_yields_silently_before_clank_resolution() {
         // An armed background `clank wait` yields silently — the branch
@@ -2578,8 +2523,14 @@ mod tests {
         // Exit 2 used to mean "timed out, go quiet". It has no
         // special meaning now, so it must surface rather than be
         // swallowed as a routine idle.
-        let two =
-            outcome_from_wait_output(&out(2, ""), &label, Role::Master, Path::new("/nope"), &[]);
+        let two = outcome_from_wait_output(
+            &out(2, ""),
+            &label,
+            Role::Master,
+            Path::new("/nope"),
+            &[],
+            None,
+        );
         assert!(
             matches!(two, HookOutcome::Diagnostic { .. }),
             "a non-zero wait exit must surface, got {two:?}"
@@ -2592,6 +2543,7 @@ mod tests {
             Role::Master,
             Path::new("/nope"),
             &[],
+            None,
         );
         assert!(
             matches!(

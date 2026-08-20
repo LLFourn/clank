@@ -47,10 +47,6 @@ pub async fn run(args: AttendingArgs) -> anyhow::Result<()> {
     let record = crate::cli::stop_hook::Attending {
         task: task_id.to_string(),
         pid: args.pid,
-        since: Some(
-            time::OffsetDateTime::now_utc()
-                .format(&time::format_description::well_known::Rfc3339)?,
-        ),
     };
     std::fs::write(&path, serde_json::to_string(&record)?)?;
 

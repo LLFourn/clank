@@ -4508,10 +4508,10 @@ mod tests {
     fn an_attending_agent_row_shows_the_hourglass_instead_of_a_verb() {
         let mut s = two_agent_snap();
         s.plans = vec![plan_state("foo", WaitingOn::MasterToContinue)];
-        s.agents[0].attending = Some(crate::cli::stop_hook::Attending {
+        s.agents[0].attending = Some(crate::cli::stop_hook::Attended {
             task: "b72qah60w".to_string(),
             pid: Some(std::process::id() as i32),
-            since: None,
+            at: "2026-08-20T14:51:09Z".to_string(),
         });
         let row = visible(line_with(&render(&s, 40, 80), "claude"));
         assert!(row.contains("⌛"), "hourglass marks the wait: {row}");

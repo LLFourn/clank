@@ -114,19 +114,17 @@ pub(crate) struct AgentAutoRow {
     /// agent's local config. `None` = unbound — surfaced as a problem on
     /// the detail page, since an unbound agent can't receive work.
     pub(crate) session: Option<String>,
-    /// The `clank attending` marker as it sits on disk, or `None` for
-    /// no marker. A marker means this agent is silenced entirely until
-    /// its task ends, which is why it is worth showing at all.
+    /// The last attendance DECISION the Stop hook made, or `None` if
+    /// its most recent turn-end was not an attending silence.
     ///
-    /// Reported, never acted on: status has no `background_tasks` and
-    /// so cannot tell a live task from a dead one, and it must not
-    /// reap — that authority is the hook's.
+    /// Not the marker: that is consumed within the turn that writes it
+    /// and is never visible here. This is the observation left behind,
+    /// which is why it can be shown at all.
     ///
-    /// Expect this to read as absent for a codex agent almost always.
-    /// Codex omits `background_tasks` entirely, so the hook sees no
-    /// live id and discards the marker at its next wake. That is the
-    /// subsystem working as built, not a status bug.
-    pub(crate) attending: Option<crate::cli::stop_hook::Attending>,
+    /// Reported, never acted on. Status must not write or clear it —
+    /// the hook rewrites it at every turn-end, so there is nothing
+    /// here to maintain.
+    pub(crate) attending: Option<crate::cli::stop_hook::Attended>,
 }
 
 /// The invocation that runs an agent: launch command (or the bare tool
@@ -213,7 +211,7 @@ fn roster_auto_rows(
             tool: desc.tool.as_str().to_string(),
             invocation: agent_invocation(desc),
             session,
-            attending: crate::cli::stop_hook::read_attending(
+            attending: crate::cli::stop_hook::read_attended(
                 &crate::agent_store::agents_root(repo).join(label.as_str()),
             ),
         });
@@ -1990,7 +1988,7 @@ mod dirty_and_wake_tests {
         PlanKey::parse(s).unwrap()
     }
 
-    fn agent_row(label: &str, attending: Option<crate::cli::stop_hook::Attending>) -> AgentAutoRow {
+    fn agent_row(label: &str, attending: Option<crate::cli::stop_hook::Attended>) -> AgentAutoRow {
         AgentAutoRow {
             label: label.to_string(),
             role: crate::cli::teams_config::RosterRole::Master,
@@ -2002,15 +2000,11 @@ mod dirty_and_wake_tests {
         }
     }
 
-    fn marker(
-        task: &str,
-        pid: Option<i32>,
-        since: Option<&str>,
-    ) -> crate::cli::stop_hook::Attending {
-        crate::cli::stop_hook::Attending {
+    fn marker(task: &str, pid: Option<i32>, at: Option<&str>) -> crate::cli::stop_hook::Attended {
+        crate::cli::stop_hook::Attended {
             task: task.to_string(),
             pid,
-            since: since.map(str::to_string),
+            at: at.unwrap_or("2026-08-20T14:51:09Z").to_string(),
         }
     }
 
