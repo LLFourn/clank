@@ -1298,6 +1298,7 @@ mod tests {
                 tool: "claude".into(),
                 invocation: "claude".into(),
                 session: None,
+                attending: None,
             })
             .collect();
         s.master = labels
@@ -2341,6 +2342,7 @@ terminal_3  terminal  ruthless (reviewer)
                     tool: "claude".into(),
                     invocation: "claude".into(),
                     session: None,
+                    attending: None,
                 },
                 crate::cli::status::AgentAutoRow {
                     label: "codex".into(),
@@ -2349,6 +2351,7 @@ terminal_3  terminal  ruthless (reviewer)
                     tool: "codex".into(),
                     invocation: "codex".into(),
                     session: None,
+                    attending: None,
                 },
             ];
             s.master = Some("claude".into());

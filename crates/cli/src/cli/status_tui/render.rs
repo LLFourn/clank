@@ -472,6 +472,9 @@ pub(super) fn scrollable_header(
                 spans.push(dim(format!("  {}", spinner_glyph(frame))));
                 spans.push(italic(format!(" {verb}…")));
             }
+            if let Some(att) = &a.attending {
+                spans.push(dim(format!("  ⌛ {}", att.task)));
+            }
             head_out.push(row_line(&spans, mode.selected() == Some(i), color, cols));
         }
         // "+ add" button — the last selectable row (cursor index

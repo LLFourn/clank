@@ -114,6 +114,19 @@ pub(crate) struct AgentAutoRow {
     /// agent's local config. `None` = unbound — surfaced as a problem on
     /// the detail page, since an unbound agent can't receive work.
     pub(crate) session: Option<String>,
+    /// The `clank attending` marker as it sits on disk, or `None` for
+    /// no marker. A marker means this agent is silenced entirely until
+    /// its task ends, which is why it is worth showing at all.
+    ///
+    /// Reported, never acted on: status has no `background_tasks` and
+    /// so cannot tell a live task from a dead one, and it must not
+    /// reap — that authority is the hook's.
+    ///
+    /// Expect this to read as absent for a codex agent almost always.
+    /// Codex omits `background_tasks` entirely, so the hook sees no
+    /// live id and discards the marker at its next wake. That is the
+    /// subsystem working as built, not a status bug.
+    pub(crate) attending: Option<crate::cli::stop_hook::Attending>,
 }
 
 /// The invocation that runs an agent: launch command (or the bare tool
@@ -200,6 +213,9 @@ fn roster_auto_rows(
             tool: desc.tool.as_str().to_string(),
             invocation: agent_invocation(desc),
             session,
+            attending: crate::cli::stop_hook::read_attending(
+                &crate::agent_store::agents_root(repo).join(label.as_str()),
+            ),
         });
     }
     rows
@@ -692,6 +708,11 @@ impl StatusSnapshot {
                 );
             }
             let _ = writeln!(out, "  {url}");
+        }
+        for row in &self.agents {
+            if let Some(a) = &row.attending {
+                let _ = writeln!(out, "attending: {} → {}", row.label, a.task);
+            }
         }
 
         if self.plans.is_empty() && self.last_finished.is_none() && self.pr_reviews.is_empty() {
@@ -1848,6 +1869,7 @@ mod dirty_and_wake_tests {
             tool: "codex".to_string(),
             invocation: "codex".to_string(),
             session: None,
+            attending: None,
         }];
         let avail = available_agents(Some(home.path()), &roster);
         let labels: Vec<&str> = avail.iter().map(|a| a.label.as_str()).collect();
@@ -1961,6 +1983,45 @@ mod dirty_and_wake_tests {
 
     fn plan_key(s: &str) -> PlanKey {
         PlanKey::parse(s).unwrap()
+    }
+
+    fn agent_row(label: &str, attending: Option<crate::cli::stop_hook::Attending>) -> AgentAutoRow {
+        AgentAutoRow {
+            label: label.to_string(),
+            role: crate::cli::teams_config::RosterRole::Master,
+            auto_mode: clank_core::vocab::AutoMode::On,
+            tool: "claude".to_string(),
+            invocation: "claude".to_string(),
+            session: None,
+            attending,
+        }
+    }
+
+    #[test]
+    fn a_marker_names_the_task_silencing_the_agent() {
+        let mut snap = minimal_snapshot();
+        snap.agents = vec![agent_row(
+            "claude",
+            Some(crate::cli::stop_hook::Attending {
+                task: "bj0onbq1u".to_string(),
+            }),
+        )];
+        assert!(
+            snap.to_human().contains("attending: claude → bj0onbq1u"),
+            "{}",
+            snap.to_human()
+        );
+    }
+
+    #[test]
+    fn an_agent_attending_nothing_adds_no_line() {
+        let mut snap = minimal_snapshot();
+        snap.agents = vec![agent_row("claude", None)];
+        assert!(
+            !snap.to_human().contains("attending"),
+            "{}",
+            snap.to_human()
+        );
     }
 
     fn minimal_snapshot() -> StatusSnapshot {

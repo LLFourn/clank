@@ -755,23 +755,32 @@ fn attending_path(agent_dir: &Path) -> PathBuf {
     agent_dir.join("attending")
 }
 
-/// What the agent acknowledged when it started attending: the live
-/// background task, AND the exact standing item it had already seen.
+/// The background task the agent is waiting on.
 ///
-/// The item identity is load-bearing. A reviewer's CONTINUE on a NEW
-/// commit surfaces as the SAME `gate_continue` reason at a new sha
-/// (`wait.rs:1251-1258`), so suppressing by reason alone would discard
-/// genuine review progress. Only an exact (plan, sha) match is
-/// suppressed; anything else is news and wakes.
+/// A live marker silences the hook COMPLETELY — every item, whatever
+/// its reason. An agent blocked on a build cannot act on review
+/// feedback anyway, and the feedback is still there, undelivered and
+/// unchanged, the moment the task ends and the marker dies with it.
+/// Waking it meanwhile only produces the loop this exists to stop.
+///
+/// The safety is liveness, not selectivity: the id is validated
+/// against the tool's live task list every time, so the silence lasts
+/// exactly as long as the work does and cannot be claimed for longer.
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Attending {
     pub(crate) task: String,
-    /// The acknowledged standing item, absent if none was pending when
-    /// attendance began — in which case nothing is suppressed.
-    #[serde(default)]
-    pub(crate) plan: Option<String>,
-    #[serde(default)]
-    pub(crate) sha: Option<String>,
+}
+
+/// The marker as it sits on disk, WITHOUT validating or reaping it.
+///
+/// Reaping belongs to the hook, which alone holds the liveness
+/// authority (`live_ids`). A read-only surface that deleted markers
+/// would race the hook and could silence a wake the agent never
+/// acknowledged, so an unreadable marker reads here as no attendance
+/// and is left exactly where it is.
+pub(crate) fn read_attending(agent_dir: &Path) -> Option<Attending> {
+    let raw = std::fs::read_to_string(attending_path(agent_dir)).ok()?;
+    serde_json::from_str::<Attending>(&raw).ok()
 }
 
 /// The attendance record, iff its task is still LIVE.
@@ -798,40 +807,6 @@ fn attending_live_task(agent_dir: &Path, live_ids: &[String]) -> Option<Attendin
     None
 }
 
-impl Attending {
-    /// Is this item EXACTLY the standing work already acknowledged?
-    ///
-    /// Reason, plan and sha must all match. A new sha is review
-    /// progress and must wake, even though its reason is identical.
-    fn acknowledges(&self, item: &WaitItem) -> bool {
-        is_standing_work(item)
-            && self.plan.is_some()
-            && self.plan == item.plan
-            && self.sha.is_some()
-            && self.sha == item.sha
-    }
-}
-
-/// Is this item work the agent is ALREADY doing?
-///
-/// Exactly one reason qualifies: `GateContinue` on a master item —
-/// "latest reviewable commit is CONTINUE; master keeps working", which
-/// stays true for the whole implementation and is information the
-/// agent already has.
-///
-/// `Revise` is deliberately NOT here. It carries
-/// `AddressCommitChanges` — newly arrived REQUEST_CHANGES — which is
-/// news, and suppressing it would mean sitting through reviewer
-/// feedback for the length of a build.
-fn is_standing_work(item: &WaitItem) -> bool {
-    // Stringly-typed because this crosses the `wait --json` subprocess
-    // boundary, where the hook's projection is deliberately loose. A
-    // test pins these against what core actually serializes, so a
-    // rename in `WaitingReason` cannot silently stop suppressing.
-    item.kind.as_deref() == Some("master")
-        && item.reason.as_deref() == Some(clank_core::vocab::WaitingReason::GateContinue.as_str())
-}
-
 /// Map the finished wait's output to an outcome. Pure, so the
 /// contract can be asserted without spawning anything.
 ///
@@ -853,26 +828,20 @@ fn outcome_from_wait_output(
                 why: SilentReason::NoWork,
             },
             Ok(items) => {
-                let attending = attending_live_task(agent_dir, live_ids);
-                let kept: Vec<&WaitItem> = items
-                    .iter()
-                    .filter(|i| !attending.as_ref().is_some_and(|a| a.acknowledges(i)))
-                    .collect();
-                if kept.is_empty() {
+                if attending_live_task(agent_dir, live_ids).is_some() {
                     return HookOutcome::Silent {
                         why: SilentReason::AttendingBackgroundTask,
                     };
                 }
+                let kept: Vec<&WaitItem> = items.iter().collect();
                 let mut reason = render_wait_items_ref(&kept, label, role);
-                // Teach the protocol exactly where it would otherwise
-                // loop: a standing item, a live task, and no marker is
-                // the shape that produced a dozen identical wakes.
-                if attending.is_none() && !live_ids.is_empty() && items.iter().any(is_standing_work)
-                {
+                // A live task and no marker is the shape that produced
+                // a dozen identical wakes.
+                if !live_ids.is_empty() {
                     reason.push_str(&format!(
                         "\n\nYou have a live background task ({}). If you are WAITING on it, \
-                         record it — `clank attending {}` — and this will stop waking you with \
-                         work you are already doing. Do not end your turn to poll it.",
+                         record it — `clank attending {}` — and nothing will wake you until it \
+                         ends. Do not end your turn to poll it.",
                         live_ids.join(", "),
                         live_ids.first().map(String::as_str).unwrap_or("<task-id>"),
                     ));
@@ -1337,11 +1306,9 @@ mod tests {
         label
     }
 
-    fn write_attending(dir: &Path, task: &str, sha: Option<&str>) {
+    fn write_attending(dir: &Path, task: &str) {
         let rec = Attending {
             task: task.to_string(),
-            plan: sha.map(|_| "p".to_string()),
-            sha: sha.map(str::to_string),
         };
         std::fs::write(dir.join("attending"), serde_json::to_string(&rec).unwrap()).unwrap();
     }
@@ -1360,38 +1327,46 @@ mod tests {
                            "next":"continue","reason":"gate_continue","gate":"continued"})
     }
 
+    /// Status parses the very bytes the hook writes. Pinning the field
+    /// name here means renaming it without a serde rename breaks the
+    /// build rather than quietly making every marker unreadable — which
+    /// would surface as "nobody is attending anything", the same as
+    /// working correctly.
     #[test]
-    fn the_suppressed_reason_matches_what_core_serializes() {
-        // The predicate compares strings across the `wait --json`
-        // subprocess boundary. Pinning it against core means renaming
-        // the variant breaks a test rather than silently ending
-        // suppression.
+    fn the_marker_on_disk_has_the_field_names_status_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        write_attending(dir.path(), "task-42");
+        let raw = std::fs::read_to_string(attending_path(dir.path())).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(json["task"], "task-42");
+
         assert_eq!(
-            clank_core::vocab::WaitingReason::GateContinue.as_str(),
-            "gate_continue"
+            read_attending(dir.path()).expect("round-trips").task,
+            "task-42"
         );
-        let items: Vec<WaitItem> =
-            serde_json::from_value(serde_json::json!([standing_item()])).unwrap();
-        assert!(is_standing_work(&items[0]));
+    }
+
+    /// A marker too corrupt to parse must read as no attendance and
+    /// stay on disk: reaping is the hook's call, and a reader that
+    /// deleted it could silence a wake the agent never acknowledged.
+    #[test]
+    fn an_unreadable_marker_reads_as_no_attendance_and_survives() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(attending_path(dir.path()), "{not json").unwrap();
+        assert!(read_attending(dir.path()).is_none());
+        assert!(attending_path(dir.path()).exists());
     }
 
     #[test]
-    fn review_feedback_is_news_and_is_never_standing() {
-        // `Revise` carries AddressCommitChanges — newly arrived
-        // REQUEST_CHANGES. Suppressing it would mean sitting through
-        // reviewer feedback for the length of a build.
-        let items: Vec<WaitItem> = serde_json::from_value(serde_json::json!([
-            {"kind":"master","plan":"p","sha":FULL_SHA,
-             "next":"revise","reason":"address_commit_changes","gate":"changes_requested"}
-        ]))
-        .unwrap();
-        assert!(!is_standing_work(&items[0]));
+    fn no_marker_reads_as_no_attendance() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(read_attending(dir.path()).is_none());
     }
 
     #[test]
     fn attending_a_live_task_suppresses_standing_work() {
         let dir = tempfile::tempdir().unwrap();
-        write_attending(dir.path(), "task-42", Some(FULL_SHA));
+        write_attending(dir.path(), "task-42");
         let out = outcome_from_wait_output(
             &wait_output(serde_json::json!([standing_item()])),
             &AgentLabel::parse("claude").unwrap(),
@@ -1410,63 +1385,40 @@ mod tests {
         );
     }
 
+    /// Every reason, not a chosen few. `ready_to_finalize` is the case
+    /// that motivated this: it woke a master a dozen times while a
+    /// build ran, and no marker could acknowledge it because the old
+    /// predicate admitted only `gate_continue`.
     #[test]
-    fn a_new_sha_wakes_even_though_the_reason_is_identical() {
-        // The hole codex found: a reviewer's CONTINUE on a NEW commit
-        // reuses `gate_continue` at a new sha, so suppressing by reason
-        // alone silently discards real review progress. Attendance is
-        // bound to the acknowledged ITEM, not just the task.
+    fn a_live_marker_suppresses_every_reason_there_is() {
         let dir = tempfile::tempdir().unwrap();
-        write_attending(dir.path(), "task-42", Some(FULL_SHA));
-        let other_sha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-
-        let same = outcome_from_wait_output(
-            &wait_output(serde_json::json!([standing_item()])),
-            &AgentLabel::parse("claude").unwrap(),
-            Role::Master,
-            dir.path(),
-            &["task-42".to_string()],
-        );
-        assert!(
-            matches!(
-                same,
-                HookOutcome::Silent {
-                    why: SilentReason::AttendingBackgroundTask
-                }
-            ),
-            "the acknowledged sha stays suppressed: {same:?}"
-        );
-
-        let moved = outcome_from_wait_output(
-            &wait_output(serde_json::json!([
-                {"kind":"master","plan":"p","sha":other_sha,
-                 "next":"continue","reason":"gate_continue","gate":"continued"}
-            ])),
-            &AgentLabel::parse("claude").unwrap(),
-            Role::Master,
-            dir.path(),
-            &["task-42".to_string()],
-        );
-        assert!(
-            matches!(moved, HookOutcome::Continue { .. }),
-            "review progress at a NEW sha must wake: {moved:?}"
-        );
-    }
-
-    #[test]
-    fn a_marker_with_no_acknowledged_item_suppresses_nothing() {
-        // Attendance recorded while nothing was standing must not
-        // become a blanket mute for whatever arrives later.
-        let dir = tempfile::tempdir().unwrap();
-        write_attending(dir.path(), "task-42", None);
-        let out = outcome_from_wait_output(
-            &wait_output(serde_json::json!([standing_item()])),
-            &AgentLabel::parse("claude").unwrap(),
-            Role::Master,
-            dir.path(),
-            &["task-42".to_string()],
-        );
-        assert!(matches!(out, HookOutcome::Continue { .. }), "got {out:?}");
+        write_attending(dir.path(), "task-42");
+        for item in [
+            serde_json::json!({"kind":"master","plan":"p","sha":FULL_SHA,
+                 "next":"finalize","reason":"ready_to_finalize","gate":"finished"}),
+            serde_json::json!({"kind":"master","plan":"p","sha":FULL_SHA,
+                 "next":"revise","reason":"address_commit_changes","gate":"changes_requested"}),
+            serde_json::json!({"kind":"unblocked","name":"q","answer":"yes"}),
+            serde_json::json!({"kind":"master","plan":"p","sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                 "next":"continue","reason":"gate_continue","gate":"continued"}),
+        ] {
+            let out = outcome_from_wait_output(
+                &wait_output(serde_json::json!([item.clone()])),
+                &AgentLabel::parse("claude").unwrap(),
+                Role::Master,
+                dir.path(),
+                &["task-42".to_string()],
+            );
+            assert!(
+                matches!(
+                    out,
+                    HookOutcome::Silent {
+                        why: SilentReason::AttendingBackgroundTask
+                    }
+                ),
+                "{item} must be suppressed, got {out:?}"
+            );
+        }
     }
 
     #[test]
@@ -1486,12 +1438,13 @@ mod tests {
         );
     }
 
+    /// News does not get an exemption. An agent blocked on a build
+    /// cannot act on an answered block either, and the item is still
+    /// there, unchanged, the moment the task ends.
     #[test]
-    fn attending_does_not_suppress_news() {
-        // The guard against trading a noisy loop for silently sitting
-        // through a REQUEST_CHANGES.
+    fn attending_suppresses_news_too() {
         let dir = tempfile::tempdir().unwrap();
-        write_attending(dir.path(), "task-42", Some(FULL_SHA));
+        write_attending(dir.path(), "task-42");
         let out = outcome_from_wait_output(
             &wait_output(serde_json::json!([
                 standing_item(),
@@ -1502,16 +1455,15 @@ mod tests {
             dir.path(),
             &["task-42".to_string()],
         );
-        match out {
-            HookOutcome::Continue { reason } => {
-                assert!(reason.contains("unblocked"), "news must wake: {reason}");
-                assert!(
-                    !reason.contains("gate_continue"),
-                    "standing work stays suppressed: {reason}"
-                );
-            }
-            other => panic!("news must wake, got {other:?}"),
-        }
+        assert!(
+            matches!(
+                out,
+                HookOutcome::Silent {
+                    why: SilentReason::AttendingBackgroundTask
+                }
+            ),
+            "got {out:?}"
+        );
     }
 
     #[test]
@@ -1520,7 +1472,7 @@ mod tests {
         // task is gone must NOT silence the hook, and must not linger.
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("attending");
-        write_attending(dir.path(), "task-gone", Some(FULL_SHA));
+        write_attending(dir.path(), "task-gone");
         let out = outcome_from_wait_output(
             &wait_output(serde_json::json!([standing_item()])),
             &AgentLabel::parse("claude").unwrap(),
@@ -1561,7 +1513,7 @@ mod tests {
     #[test]
     fn no_background_task_means_no_hint_and_no_suppression() {
         let dir = tempfile::tempdir().unwrap();
-        write_attending(dir.path(), "task-42", Some(FULL_SHA));
+        write_attending(dir.path(), "task-42");
         let out = outcome_from_wait_output(
             &wait_output(serde_json::json!([standing_item()])),
             &AgentLabel::parse("claude").unwrap(),

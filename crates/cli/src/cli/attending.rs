@@ -1,12 +1,13 @@
 //! `clank attending <task-id>` — record the background task this agent
 //! is waiting on.
 //!
-//! The marker is a POINTER, not a claim. The Stop hook validates the
-//! recorded id against the tool's live task list and discards it the
-//! moment that task is gone, so a forgotten marker cannot silence the
-//! hook (attending-suppresses-standing-wakes). That is why nothing
-//! here has to be cleaned up to stay correct — `--clear` is a
-//! convenience, not a requirement.
+//! While the task is live NOTHING wakes this agent. The marker is a
+//! POINTER, not a claim: the Stop hook validates the recorded id
+//! against the tool's live task list and discards it the moment that
+//! task is gone, so the silence lasts exactly as long as the work and
+//! a forgotten marker cannot extend it. That is why nothing here has
+//! to be cleaned up to stay correct — `--clear` is a convenience, not
+//! a requirement.
 
 use super::{AttendingArgs, resolve_repo};
 use crate::agent_store::agents_root;
@@ -40,37 +41,11 @@ pub async fn run(args: AttendingArgs) -> anyhow::Result<()> {
     if task_id.is_empty() {
         anyhow::bail!("task id is empty");
     }
-    // Capture WHAT is being acknowledged, not just the task. A
-    // reviewer's CONTINUE on a new commit reuses the same
-    // `gate_continue` reason at a new sha, so suppressing by reason
-    // alone would swallow real review progress; only this exact item
-    // is suppressed.
-    let role = crate::agent_store::resolve_role(&repo, &label)?;
-    let pending = crate::cli::stop_hook::peek_items(&repo, &label, role)
-        .await
-        .unwrap_or_default();
-    let standing = pending.iter().find(|i| {
-        i.kind.as_deref() == Some("master")
-            && i.reason.as_deref() == Some(clank_core::vocab::WaitingReason::GateContinue.as_str())
-    });
-
     let record = crate::cli::stop_hook::Attending {
         task: task_id.to_string(),
-        plan: standing.and_then(|i| i.plan.clone()),
-        sha: standing.and_then(|i| i.sha.clone()),
     };
     std::fs::write(&path, serde_json::to_string(&record)?)?;
 
-    match (&record.plan, &record.sha) {
-        (Some(plan), Some(sha)) => println!(
-            "attending `{task_id}` — `continue {plan} @ {short}` will not wake you again while \
-             it runs; anything new still will",
-            short = &sha[..sha.len().min(12)]
-        ),
-        _ => println!(
-            "attending `{task_id}` — nothing standing to acknowledge right now, so all work \
-             still wakes you"
-        ),
-    }
+    println!("attending `{task_id}` — nothing will wake you until it ends");
     Ok(())
 }
