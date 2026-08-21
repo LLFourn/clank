@@ -879,6 +879,36 @@ impl Attended {
         out
     }
 
+    /// The agent row's form, or `None` to draw no marker at all.
+    ///
+    /// Narrower than [`Self::summary`] in two ways, because a TUI row
+    /// is the scarcest surface there is.
+    ///
+    /// A wait whose process has ENDED is not rendered. The row answers
+    /// "who is waiting, and on what"; a dead process answers "nobody",
+    /// so spending columns to say `stale, ended` says nothing. This is
+    /// a RENDER decision only — the record is left alone, because
+    /// reaping belongs to the hook.
+    ///
+    /// The harness task id is dropped. It cannot be looked up,
+    /// correlated with anything else on screen, or found in `ps`. The
+    /// pid is the half a human can act on; the id keeps its place on
+    /// the plain `clank status` line, where width is not scarce.
+    ///
+    /// A record with no pid still renders: "cannot check" is not
+    /// "ended".
+    pub(crate) fn row_marker(&self, now: time::OffsetDateTime) -> Option<String> {
+        if self.process_alive() == Some(false) {
+            return None;
+        }
+        Some(match (self.pid, self.age(now)) {
+            (Some(pid), Some(age)) => format!("{pid} · {age}"),
+            (Some(pid), None) => pid.to_string(),
+            (None, Some(age)) => age,
+            (None, None) => String::new(),
+        })
+    }
+
     fn age(&self, now: time::OffsetDateTime) -> Option<String> {
         let at =
             time::OffsetDateTime::parse(&self.at, &time::format_description::well_known::Rfc3339)

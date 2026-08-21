@@ -701,7 +701,11 @@ fn compose_launch(
     let name = session_display_name(repo, label);
     set_session_name(tool, &mut args, &name);
     if let Some(prompt) = initial_prompt {
-        push_prompt(tool, &mut args, name_led_prompt(tool, &name, prompt.to_string()));
+        push_prompt(
+            tool,
+            &mut args,
+            name_led_prompt(tool, &name, prompt.to_string()),
+        );
     }
 
     let mut env_overrides = tool_env_defaults(tool);
@@ -1858,7 +1862,13 @@ mod tests {
     #[test]
     fn compose_launch_appends_initial_prompt_when_set() {
         let s = claude_session();
-        let c = compose_launch(Path::new("/repo"), &lbl("tester"), &s, None, Some("custom prompt"));
+        let c = compose_launch(
+            Path::new("/repo"),
+            &lbl("tester"),
+            &s,
+            None,
+            Some("custom prompt"),
+        );
         assert_eq!(
             c.args.last().map(|s| s.as_str()),
             Some("custom prompt"),
@@ -1929,8 +1939,18 @@ mod tests {
             from_session: Some("src-session".into()),
             prompt: orient.into(),
         };
-        let c = compose_fork_launch(&lbl("kimi"), &spec, &desc_with(Tool::Claude, None), wt, None);
-        let n = c.args.iter().position(|a| a == "-n").expect("fork is named");
+        let c = compose_fork_launch(
+            &lbl("kimi"),
+            &spec,
+            &desc_with(Tool::Claude, None),
+            wt,
+            None,
+        );
+        let n = c
+            .args
+            .iter()
+            .position(|a| a == "-n")
+            .expect("fork is named");
         assert_eq!(c.args[n + 1], "recovery-scan · kimi");
         assert!(c.args.iter().any(|a| a == orient));
 
@@ -1949,8 +1969,14 @@ mod tests {
                 prompt.starts_with("recovery-scan · kimi"),
                 "{tool:?} fork prompt must lead with the fork name: {prompt}"
             );
-            assert!(prompt.ends_with(orient), "orientation is preserved: {prompt}");
-            assert!(!c.args.iter().any(|a| a == "-n"), "{tool:?} has no name flag");
+            assert!(
+                prompt.ends_with(orient),
+                "orientation is preserved: {prompt}"
+            );
+            assert!(
+                !c.args.iter().any(|a| a == "-n"),
+                "{tool:?} has no name flag"
+            );
         }
     }
 
@@ -1962,7 +1988,11 @@ mod tests {
         // reported problem, not a hypothetical.
         let s = claude_session();
         let c = compose_launch(Path::new("/repo"), &lbl("tester"), &s, None, None);
-        let n = c.args.iter().position(|a| a == "-n").expect("named on resume");
+        let n = c
+            .args
+            .iter()
+            .position(|a| a == "-n")
+            .expect("named on resume");
         assert_eq!(c.args[n + 1], "repo · tester");
     }
 
@@ -2015,7 +2045,13 @@ mod tests {
         let session = grok_session();
         let prompt = resolve_initial_prompt(None, AutoMode::On, session.tool)
             .expect("auto-on default prompt");
-        let c = compose_launch(Path::new("/repo"), &lbl("tester"), &session, None, Some(&prompt));
+        let c = compose_launch(
+            Path::new("/repo"),
+            &lbl("tester"),
+            &session,
+            None,
+            Some(&prompt),
+        );
         let last = c.args.last().map(|s| s.as_str()).unwrap_or("");
         assert!(
             last.contains("clank wait") && last.contains("background"),
@@ -2110,7 +2146,8 @@ mod tests {
                 env: Default::default(),
             }),
         );
-        let c = compose_bootstrap_launch(Path::new("/repo"), &label("kimi"), &desc).expect("compose");
+        let c =
+            compose_bootstrap_launch(Path::new("/repo"), &label("kimi"), &desc).expect("compose");
         assert_eq!(c.program, "opencode");
         assert_eq!(
             c.args,
@@ -2137,7 +2174,13 @@ mod tests {
             from_session: Some("ses_039d60658ffe0RPgue3noZ0Qqf".into()),
             prompt: "orient".into(),
         };
-        let c = compose_fork_launch(&lbl("tester"), &spec, &desc, Path::new("/repo/.clank/worktrees/x"), None);
+        let c = compose_fork_launch(
+            &lbl("tester"),
+            &spec,
+            &desc,
+            Path::new("/repo/.clank/worktrees/x"),
+            None,
+        );
         assert_eq!(c.program, "opencode");
         assert_eq!(
             c.args,
@@ -2161,7 +2204,8 @@ mod tests {
         // disables the compat scan; a deliberate launch.env override
         // wins.
         let desc = desc_with(Tool::OpenCode, None);
-        let c = compose_bootstrap_launch(Path::new("/repo"), &label("kimi"), &desc).expect("compose");
+        let c =
+            compose_bootstrap_launch(Path::new("/repo"), &label("kimi"), &desc).expect("compose");
         assert_eq!(
             c.env_overrides.get("OPENCODE_DISABLE_CLAUDE_CODE_SKILLS"),
             Some(&"1".to_string())
@@ -2179,14 +2223,16 @@ mod tests {
                 env,
             }),
         );
-        let c = compose_bootstrap_launch(Path::new("/repo"), &label("kimi"), &desc).expect("compose");
+        let c =
+            compose_bootstrap_launch(Path::new("/repo"), &label("kimi"), &desc).expect("compose");
         assert_eq!(
             c.env_overrides.get("OPENCODE_DISABLE_CLAUDE_CODE_SKILLS"),
             Some(&"0".to_string())
         );
         // Other tools carry no opencode default.
         let desc = desc_with(Tool::Claude, None);
-        let c = compose_bootstrap_launch(Path::new("/repo"), &label("phantom"), &desc).expect("compose");
+        let c = compose_bootstrap_launch(Path::new("/repo"), &label("phantom"), &desc)
+            .expect("compose");
         assert!(c.env_overrides.is_empty());
     }
 
@@ -2241,7 +2287,8 @@ mod tests {
                 env: Default::default(),
             }),
         );
-        let composed = compose_bootstrap_launch(Path::new("/repo"), &label("phantom"), &desc).expect("compose");
+        let composed = compose_bootstrap_launch(Path::new("/repo"), &label("phantom"), &desc)
+            .expect("compose");
         assert_eq!(composed.program, "claude");
         assert_eq!(
             composed.args,
@@ -2267,7 +2314,8 @@ mod tests {
                 env: Default::default(),
             }),
         );
-        let composed = compose_bootstrap_launch(Path::new("/repo"), &label("phantom"), &desc).expect("compose");
+        let composed = compose_bootstrap_launch(Path::new("/repo"), &label("phantom"), &desc)
+            .expect("compose");
         // launch.command wins; tool=claude is only the fallback.
         assert_eq!(composed.program, "my-claude-wrapper");
     }
@@ -2276,7 +2324,8 @@ mod tests {
     fn bootstrap_falls_back_to_tool_when_no_launch_command() {
         // No launch profile at all → program is the tool name.
         let desc = desc_with(Tool::Codex, None);
-        let composed = compose_bootstrap_launch(Path::new("/repo"), &label("phantom"), &desc).expect("compose");
+        let composed = compose_bootstrap_launch(Path::new("/repo"), &label("phantom"), &desc)
+            .expect("compose");
         assert_eq!(composed.program, "codex");
         assert_eq!(
             composed.args,
@@ -2424,7 +2473,8 @@ mod tests {
             launch: None,
             initial_prompt: None,
         };
-        let c = compose_bootstrap_launch(Path::new("/repo"), &label("fresh-grok"), &desc).expect("compose");
+        let c = compose_bootstrap_launch(Path::new("/repo"), &label("fresh-grok"), &desc)
+            .expect("compose");
         assert_eq!(c.program, "grok");
         assert_eq!(c.args.first().map(|s| s.as_str()), Some("--trust"));
         assert_eq!(c.args.len(), 2, "trust + bind prompt only");

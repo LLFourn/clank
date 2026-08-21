@@ -2915,7 +2915,11 @@ ttys004   zellij attach clank-foo
         // fails open (zellij-pane-placement-and-cost).
         let anchor = find_reviewer_pane_by_title(&panes, 18).expect("anchor found");
         assert_eq!(agent_pane_label(anchor, "/a"), None);
-        assert!(agent_pane_pairs(&panes, Path::new("/a")).iter().all(|(l, _)| l != "kimi"));
+        assert!(
+            agent_pane_pairs(&panes, Path::new("/a"))
+                .iter()
+                .all(|(l, _)| l != "kimi")
+        );
     }
 
     #[test]

@@ -1360,11 +1360,13 @@ mod tests {
         snapshot.agents = cfg
             .agents
             .iter()
-            .map(|(l, a)| super::super::fixtures::agent_row(
-                l.as_str(),
-                a.role,
-                clank_core::vocab::AutoMode::On,
-            ))
+            .map(|(l, a)| {
+                super::super::fixtures::agent_row(
+                    l.as_str(),
+                    a.role,
+                    clank_core::vocab::AutoMode::On,
+                )
+            })
             .collect();
         snapshot.master = cfg
             .agents
@@ -2017,7 +2019,8 @@ mod tests {
         io.add_anchors = vec![Some("terminal_99".to_string())].into();
         r.reconcile(RosterView::of(&snap), &mut io);
         assert!(
-            io.log.contains(&"stack [terminal_r1,terminal_99]".to_string()),
+            io.log
+                .contains(&"stack [terminal_r1,terminal_99]".to_string()),
             "anchor must reach the stack set: {:?}",
             io.log
         );

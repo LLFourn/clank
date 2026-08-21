@@ -271,17 +271,158 @@ pub(super) fn region_rule_elevated_with_note(
     format!("[48;5;238m{head}{}[0m", "─".repeat(fill))
 }
 
-/// Display columns a char occupies in the terminal. Not a full
-/// unicode-width implementation: rendered content is validated
-/// ASCII (plan stems, agent labels, gate names) plus the fixed
-/// status emoji set — so "emoji plane → 2, else 1" is exact for
-/// everything we draw, with zero new deps.
+/// The East-Asian Wide and Fullwidth code points — the ones a terminal
+/// draws in two cells. Generated from the Unicode Character Database
+/// (UCD 16.0.0) rather than hand-listed, so it is complete: an earlier
+/// hand-built version covered the emoji plane only and measured `⌛`
+/// (U+231B) as one column, and a later one still stopped at U+1FAFF and
+/// so missed U+20000 (codex on 5f271a6).
+const WIDE: &[(u32, u32)] = &[
+    (0x1100, 0x115F),
+    (0x231A, 0x231B),
+    (0x2329, 0x232A),
+    (0x23E9, 0x23EC),
+    (0x23F0, 0x23F0),
+    (0x23F3, 0x23F3),
+    (0x25FD, 0x25FE),
+    (0x2614, 0x2615),
+    (0x2630, 0x2637),
+    (0x2648, 0x2653),
+    (0x267F, 0x267F),
+    (0x268A, 0x268F),
+    (0x2693, 0x2693),
+    (0x26A1, 0x26A1),
+    (0x26AA, 0x26AB),
+    (0x26BD, 0x26BE),
+    (0x26C4, 0x26C5),
+    (0x26CE, 0x26CE),
+    (0x26D4, 0x26D4),
+    (0x26EA, 0x26EA),
+    (0x26F2, 0x26F3),
+    (0x26F5, 0x26F5),
+    (0x26FA, 0x26FA),
+    (0x26FD, 0x26FD),
+    (0x2705, 0x2705),
+    (0x270A, 0x270B),
+    (0x2728, 0x2728),
+    (0x274C, 0x274C),
+    (0x274E, 0x274E),
+    (0x2753, 0x2755),
+    (0x2757, 0x2757),
+    (0x2795, 0x2797),
+    (0x27B0, 0x27B0),
+    (0x27BF, 0x27BF),
+    (0x2B1B, 0x2B1C),
+    (0x2B50, 0x2B50),
+    (0x2B55, 0x2B55),
+    (0x2E80, 0x2E99),
+    (0x2E9B, 0x2EF3),
+    (0x2F00, 0x2FD5),
+    (0x2FF0, 0x303E),
+    (0x3041, 0x3096),
+    (0x3099, 0x30FF),
+    (0x3105, 0x312F),
+    (0x3131, 0x318E),
+    (0x3190, 0x31E5),
+    (0x31EF, 0x321E),
+    (0x3220, 0x3247),
+    (0x3250, 0xA48C),
+    (0xA490, 0xA4C6),
+    (0xA960, 0xA97C),
+    (0xAC00, 0xD7A3),
+    (0xF900, 0xFAFF),
+    (0xFE10, 0xFE19),
+    (0xFE30, 0xFE52),
+    (0xFE54, 0xFE66),
+    (0xFE68, 0xFE6B),
+    (0xFF01, 0xFF60),
+    (0xFFE0, 0xFFE6),
+    (0x16FE0, 0x16FE4),
+    (0x16FF0, 0x16FF1),
+    (0x17000, 0x187F7),
+    (0x18800, 0x18CD5),
+    (0x18CFF, 0x18D08),
+    (0x1AFF0, 0x1AFF3),
+    (0x1AFF5, 0x1AFFB),
+    (0x1AFFD, 0x1AFFE),
+    (0x1B000, 0x1B122),
+    (0x1B132, 0x1B132),
+    (0x1B150, 0x1B152),
+    (0x1B155, 0x1B155),
+    (0x1B164, 0x1B167),
+    (0x1B170, 0x1B2FB),
+    (0x1D300, 0x1D356),
+    (0x1D360, 0x1D376),
+    (0x1F004, 0x1F004),
+    (0x1F0CF, 0x1F0CF),
+    (0x1F18E, 0x1F18E),
+    (0x1F191, 0x1F19A),
+    (0x1F200, 0x1F202),
+    (0x1F210, 0x1F23B),
+    (0x1F240, 0x1F248),
+    (0x1F250, 0x1F251),
+    (0x1F260, 0x1F265),
+    (0x1F300, 0x1F320),
+    (0x1F32D, 0x1F335),
+    (0x1F337, 0x1F37C),
+    (0x1F37E, 0x1F393),
+    (0x1F3A0, 0x1F3CA),
+    (0x1F3CF, 0x1F3D3),
+    (0x1F3E0, 0x1F3F0),
+    (0x1F3F4, 0x1F3F4),
+    (0x1F3F8, 0x1F43E),
+    (0x1F440, 0x1F440),
+    (0x1F442, 0x1F4FC),
+    (0x1F4FF, 0x1F53D),
+    (0x1F54B, 0x1F54E),
+    (0x1F550, 0x1F567),
+    (0x1F57A, 0x1F57A),
+    (0x1F595, 0x1F596),
+    (0x1F5A4, 0x1F5A4),
+    (0x1F5FB, 0x1F64F),
+    (0x1F680, 0x1F6C5),
+    (0x1F6CC, 0x1F6CC),
+    (0x1F6D0, 0x1F6D2),
+    (0x1F6D5, 0x1F6D7),
+    (0x1F6DC, 0x1F6DF),
+    (0x1F6EB, 0x1F6EC),
+    (0x1F6F4, 0x1F6FC),
+    (0x1F7E0, 0x1F7EB),
+    (0x1F7F0, 0x1F7F0),
+    (0x1F90C, 0x1F93A),
+    (0x1F93C, 0x1F945),
+    (0x1F947, 0x1F9FF),
+    (0x1FA70, 0x1FA7C),
+    (0x1FA80, 0x1FA89),
+    (0x1FA8F, 0x1FAC6),
+    (0x1FACE, 0x1FADC),
+    (0x1FADF, 0x1FAE9),
+    (0x1FAF0, 0x1FAF8),
+    (0x20000, 0x2FFFD),
+    (0x30000, 0x3FFFD),
+];
+
+/// Display columns a char occupies in the terminal.
+///
+/// Complete for East-Asian Wide/Fullwidth via [`WIDE`], with no
+/// dependency. It does NOT implement zero-width combining marks, which
+/// this TUI does not draw — with one deliberate exception: U+FE0F is
+/// counted as 1. The selector occupies no cell itself, but it upgrades
+/// the preceding character to emoji presentation, which the terminal
+/// then draws in two cells instead of one; counting it is how that
+/// second cell is accounted for without clustering graphemes.
 pub(super) fn char_width(c: char) -> usize {
-    if ('\u{1F000}'..='\u{1FAFF}').contains(&c) {
-        2
-    } else {
-        1
-    }
+    let cp = c as u32;
+    let hit = WIDE.binary_search_by(|&(lo, hi)| {
+        if cp < lo {
+            std::cmp::Ordering::Greater
+        } else if cp > hi {
+            std::cmp::Ordering::Less
+        } else {
+            std::cmp::Ordering::Equal
+        }
+    });
+    if hit.is_ok() { 2 } else { 1 }
 }
 
 pub(super) fn display_width(s: &str) -> usize {
@@ -385,5 +526,131 @@ mod tests {
         assert!(lifted.contains("\x1b[48;5;238m"), "raised surface bg");
         assert!(!lifted.contains("\x1b[2m"), "lifted title not dim");
         assert!(flat.contains("\x1b[2m") && !flat.contains("48;5;238"));
+    }
+
+    /// A representative sample of the non-ASCII characters the TUI
+    /// draws, each hand-verified against East-Asian width.
+    ///
+    /// NOT a complete list, and nothing keeps it complete: the scanner
+    /// that once did was deleted with the incomplete lookup it existed
+    /// to compensate for, so a newly drawn glyph will simply be absent
+    /// from here. That costs nothing, because completeness lives in
+    /// [`WIDE`] — which is generated from the UCD and covers every code
+    /// point — and this is a regression pin for the row that broke
+    /// (ruthless on 07c5e04).
+    const DRAWN: &[(char, usize)] = &[
+        ('\u{00B7}', 1),  // MIDDLE DOT
+        ('\u{2014}', 1),  // EM DASH
+        ('\u{2022}', 1),  // BULLET
+        ('\u{2026}', 1),  // HORIZONTAL ELLIPSIS
+        ('\u{2039}', 1),  // SINGLE LEFT-POINTING ANGLE QUOTATION MARK
+        ('\u{203A}', 1),  // SINGLE RIGHT-POINTING ANGLE QUOTATION MARK
+        ('\u{2190}', 1),  // LEFTWARDS ARROW
+        ('\u{2191}', 1),  // UPWARDS ARROW
+        ('\u{2192}', 1),  // RIGHTWARDS ARROW
+        ('\u{2193}', 1),  // DOWNWARDS ARROW
+        ('\u{21C4}', 1),  // RIGHTWARDS ARROW OVER LEFTWARDS ARROW
+        ('\u{21E7}', 1),  // UPWARDS WHITE ARROW
+        ('\u{2212}', 1),  // MINUS SIGN
+        ('\u{231B}', 2),  // HOURGLASS
+        ('\u{23CE}', 1),  // RETURN SYMBOL
+        ('\u{23F8}', 1),  // DOUBLE VERTICAL BAR
+        ('\u{2423}', 1),  // OPEN BOX
+        ('\u{2500}', 1),  // BOX DRAWINGS LIGHT HORIZONTAL
+        ('\u{2502}', 1),  // BOX DRAWINGS LIGHT VERTICAL
+        ('\u{25B6}', 1),  // BLACK RIGHT-POINTING TRIANGLE
+        ('\u{25B8}', 1),  // BLACK RIGHT-POINTING SMALL TRIANGLE
+        ('\u{26A0}', 1),  // WARNING SIGN
+        ('\u{2717}', 1),  // BALLOT X
+        ('\u{280B}', 1),  // BRAILLE PATTERN DOTS-124
+        ('\u{2819}', 1),  // BRAILLE PATTERN DOTS-145
+        ('\u{2826}', 1),  // BRAILLE PATTERN DOTS-236
+        ('\u{2827}', 1),  // BRAILLE PATTERN DOTS-1236
+        ('\u{2834}', 1),  // BRAILLE PATTERN DOTS-356
+        ('\u{2838}', 1),  // BRAILLE PATTERN DOTS-456
+        ('\u{2839}', 1),  // BRAILLE PATTERN DOTS-1456
+        ('\u{283C}', 1),  // BRAILLE PATTERN DOTS-3456
+        ('\u{FE0F}', 1),  // VARIATION SELECTOR-16 — see `char_width`
+        ('\u{1F3C1}', 2), // CHEQUERED FLAG
+        ('\u{1F440}', 2), // EYES
+        ('\u{1F4A4}', 2), // SLEEPING SYMBOL
+        ('\u{1F4CB}', 2), // CLIPBOARD
+        ('\u{1F500}', 2), // TWISTED RIGHTWARDS ARROWS
+        ('\u{1F50D}', 2), // LEFT-POINTING MAGNIFYING GLASS
+        ('\u{1F528}', 2), // HAMMER
+        ('\u{1F64B}', 2), // HAPPY PERSON RAISING ONE HAND
+    ];
+
+    #[test]
+    fn every_drawn_glyph_is_measured() {
+        let wrong: Vec<String> = DRAWN
+            .iter()
+            .filter(|(c, w)| char_width(*c) != *w)
+            .map(|(c, w)| {
+                format!(
+                    "U+{:04X} {c} is {w} column(s), measured {}",
+                    *c as u32,
+                    char_width(*c)
+                )
+            })
+            .collect();
+        assert!(
+            wrong.is_empty(),
+            "char_width mis-measures glyph(s) the TUI draws, so every row \
+             containing one is off by that many columns:\n  {}",
+            wrong.join("\n  ")
+        );
+    }
+
+    /// The class, not just the glyph that broke. Each of these is a
+    /// character the old lookups got wrong or nearly did: `⌛` sat
+    /// outside the emoji plane, and U+20000 sits outside the BMP
+    /// ranges that replaced it. Narrow lookalikes are pinned too — a
+    /// table that widens `✗` or `→` breaks every row that draws one.
+    #[test]
+    fn the_wide_class_is_complete_beyond_the_emoji_plane() {
+        for (c, want) in [
+            ('\u{231B}', 2),  // ⌛ HOURGLASS — the original regression
+            ('\u{20000}', 2), // CJK Ext B, plane 2
+            ('\u{30000}', 2), // CJK Ext G, plane 3
+            ('\u{4E00}', 2),  // 一 CJK unified
+            ('\u{AC00}', 2),  // 가 Hangul syllable
+            ('\u{FF21}', 2),  // Ａ fullwidth
+            ('\u{3000}', 2),  // ideographic space
+            ('\u{1F600}', 2), // emoji plane
+            ('\u{2717}', 1),  // ✗ — narrow despite the company it keeps
+            ('\u{2714}', 1),  // ✔
+            ('\u{2192}', 1),  // →
+            ('\u{FE0F}', 1),  // selector: see `char_width`
+            ('a', 1),
+            ('\u{0}', 1),
+            ('\u{10FFFF}', 1), // last code point, must not panic
+        ] {
+            assert_eq!(
+                char_width(c),
+                want,
+                "U+{:04X} should be {want} column(s)",
+                c as u32
+            );
+        }
+    }
+
+    /// The ranges must stay sorted and disjoint: `char_width` binary
+    /// searches them, and an out-of-order or overlapping entry would
+    /// make it silently miss code points.
+    #[test]
+    fn the_wide_ranges_are_sorted_and_disjoint() {
+        for w in WIDE.windows(2) {
+            let (a, b) = (w[0], w[1]);
+            assert!(a.0 <= a.1, "range U+{:04X}..U+{:04X} is inverted", a.0, a.1);
+            assert!(
+                a.1 < b.0,
+                "U+{:04X}..U+{:04X} overlaps or precedes U+{:04X}..U+{:04X}",
+                a.0,
+                a.1,
+                b.0,
+                b.1
+            );
+        }
     }
 }

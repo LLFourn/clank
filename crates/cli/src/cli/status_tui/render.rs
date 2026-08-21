@@ -479,11 +479,15 @@ pub(super) fn scrollable_header(
             // hourglass replaces the spinner and its verb rather than
             // crowding in beside them — `⌛ working…` claims two things
             // at once, and the wrong one is the animated one.
-            match &a.attending {
-                Some(att) => spans.push(dim(format!(
-                    "  ⌛ {}",
-                    att.summary(time::OffsetDateTime::now_utc())
-                ))),
+            match a
+                .attending
+                .as_ref()
+                .and_then(|att| att.row_marker(time::OffsetDateTime::now_utc()))
+            {
+                Some(marker) if marker.is_empty() => spans.push(dim("  ⌛".to_string())),
+                Some(marker) => spans.push(dim(format!("  ⌛ {marker}"))),
+                // No live wait — including a record whose process has
+                // ended, which leaves the agent free to be working.
                 None => {
                     if let Some(verb) = verb_for(&a.label) {
                         spans.push(dim(format!("  {}", spinner_glyph(frame))));
@@ -4551,6 +4555,118 @@ mod tests {
             "verb is replaced, not joined: {row}"
         );
         assert!(!row.contains(SPINNER[0]), "and so is the spinner: {row}");
+    }
+
+    /// A dead pid is the process saying nobody is waiting. Rendering
+    /// `stale, ended` spent the row's scarcest resource to say that,
+    /// so the marker goes entirely and the row reads as any other.
+    #[test]
+    fn an_ended_wait_renders_no_marker_and_keeps_the_record() {
+        let mut s = two_agent_snap();
+        s.agents[0].attending = Some(crate::cli::stop_hook::Attended {
+            task: "b72qah60w".to_string(),
+            // Above every platform's pid_max, so it cannot be running.
+            pid: Some(i32::MAX),
+            at: "2026-08-20T14:51:09Z".to_string(),
+        });
+        let row = visible(line_with(&render(&s, 40, 80), "claude"));
+        assert!(!row.contains("⌛"), "an ended wait is not drawn: {row}");
+        assert!(!row.contains("stale"), "and says nothing about it: {row}");
+        assert!(
+            s.agents[0].attending.is_some(),
+            "rendering must not consume the record — the hook owns reaping"
+        );
+    }
+
+    /// Unknown is not ended. Without a pid the question cannot be
+    /// answered, and a wait that may well be live must stay visible.
+    #[test]
+    fn a_wait_with_no_pid_still_renders() {
+        let mut s = two_agent_snap();
+        s.agents[0].attending = Some(crate::cli::stop_hook::Attended {
+            task: "b72qah60w".to_string(),
+            pid: None,
+            at: "2026-08-20T14:51:09Z".to_string(),
+        });
+        let row = visible(line_with(&render(&s, 40, 80), "claude"));
+        assert!(row.contains("⌛"), "cannot-check still shows a wait: {row}");
+    }
+
+    /// The task id is an opaque harness handle: not in `ps`, not
+    /// correlated with anything else on screen. The pid is the half a
+    /// human can act on, so only it survives into the row.
+    #[test]
+    fn the_row_keeps_the_pid_and_drops_the_harness_id() {
+        let mut s = two_agent_snap();
+        s.agents[0].attending = Some(crate::cli::stop_hook::Attended {
+            task: "b72qah60w".to_string(),
+            pid: Some(std::process::id() as i32),
+            at: "2026-08-20T14:51:09Z".to_string(),
+        });
+        let row = visible(line_with(&render(&s, 40, 80), "claude"));
+        assert!(
+            row.contains(&std::process::id().to_string()),
+            "the pid is actionable and stays: {row}"
+        );
+        assert!(
+            !row.contains("b72qah60w"),
+            "the harness id belongs on the plain status line: {row}"
+        );
+    }
+
+    /// The regression that took the layout down: `⌛` is U+231B, two
+    /// columns, measured as one. Every attending row came out a column
+    /// over, wrapped, and pushed the status bar off screen.
+    ///
+    /// Asserts the row is BUILT to fit: nothing over `cols`, the
+    /// selection band included. Two things it deliberately does NOT
+    /// assert:
+    ///
+    /// The band is not checked for being `cols` wide — agent-panel
+    /// bands hug their own content (a selected `codex` row is 18
+    /// columns in a 40-column pane), so demanding pane width here
+    /// would pin a model the renderer does not implement.
+    ///
+    /// And it cannot catch `char_width` being wrong, since it measures
+    /// with the same function the renderer used. That guard is
+    /// `every_drawn_glyph_is_measured`, which pins against East-Asian
+    /// width rather than against ourselves.
+    #[test]
+    fn an_attending_row_is_built_to_fit_its_pane() {
+        let mut s = two_agent_snap();
+        s.agents[0].attending = Some(crate::cli::stop_hook::Attended {
+            task: "b72qah60w".to_string(),
+            pid: Some(std::process::id() as i32),
+            at: "2026-08-20T14:51:09Z".to_string(),
+        });
+        for cols in [18u16, 24, 40, 80] {
+            for line in &render(&s, 40, cols) {
+                assert!(
+                    display_width(visible(line).trim_end()) <= cols as usize,
+                    "line exceeds {cols} display cols: `{line}`"
+                );
+            }
+
+            let lines = render_at(
+                &s,
+                40,
+                cols,
+                0,
+                0,
+                &PanelView::just(Mode::AgentPanel { sel: 0 }),
+            )
+            .0;
+            let row = line_with(&lines, "claude").to_string();
+            assert!(
+                row.contains(REVERSE),
+                "the attending row is selected: {row}"
+            );
+            assert!(
+                display_width(&visible(&row)) <= cols as usize,
+                "the selection band overruns a {cols}-column pane: `{}`",
+                visible(&row)
+            );
+        }
     }
 
     #[test]

@@ -145,7 +145,8 @@ fn head_sha(repo: &Path) -> clank_core::ids::CommitSha {
 /// The gate as the repo's CURRENT roster sees it at `sha`.
 fn gate_now(repo: &Path, sha: &clank_core::ids::CommitSha) -> clank_core::vocab::CommitGateState {
     use clank_core::wait::PlanStateLookup;
-    let entries = clank::fs_plan_state_lookup::FsPlanStateLookup::new(repo, Some(sha)).reviews_for(sha);
+    let entries =
+        clank::fs_plan_state_lookup::FsPlanStateLookup::new(repo, Some(sha)).reviews_for(sha);
     let tiers = clank::agent_store::load_reviewer_tiers(repo).unwrap();
     clank_core::wait::compute_gate(&entries, &tiers.commit, &tiers.plan, &tiers.final_, false)
 }
