@@ -295,14 +295,7 @@ pub async fn run(args: WaitArgs) -> anyhow::Result<()> {
     // Sources spawn only when the wait actually PARKS (the
     // initial pass above returns without them) and are cancelled AND
     // joined on every return path below.
-    let (wake_tx, mut wake_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-    std::thread::spawn(move || {
-        while rx.recv().is_ok() {
-            if wake_tx.send(()).is_err() {
-                break;
-            }
-        }
-    });
+    let mut beat = Beat::bridge(rx);
     let events_dir = crate::agent_store::agents_root(&repo)
         .join(author.as_str())
         .join("events");
@@ -320,14 +313,14 @@ pub async fn run(args: WaitArgs) -> anyhow::Result<()> {
             let mut external: Vec<WaitItem> = Vec::new();
             tokio::select! {
                 _ = tokio::time::sleep(tick) => {}
-                w = wake_rx.recv() => {
+                w = beat.rx.recv() => {
                     if w.is_none() {
                         anyhow::bail!("filesystem watcher disconnected");
                     }
                     // Debounce: let a burst settle, then drain it —
                     // one logical change, one refold.
                     tokio::time::sleep(Duration::from_millis(200)).await;
-                    while wake_rx.try_recv().is_ok() {}
+                    while beat.rx.try_recv().is_ok() {}
                 }
                 item = sources.rx.recv(), if sources_open => {
                     match item {
@@ -436,23 +429,52 @@ pub async fn run(args: WaitArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// One watcher-loop beat, shared by the work loop and the observer
-/// loop: block on the next FS event or heartbeat tick, and debounce
-/// event bursts (one logical change → one refold). `Ok(())` per beat.
-/// The loop ends on a wake, a real error, or owner death — never a
-/// clock (remove-wait-timeout).
-fn next_beat(rx: &mpsc::Receiver<()>, tick: Duration) -> anyhow::Result<()> {
-    match rx.recv_timeout(tick) {
-        Ok(()) => {
-            // Debounce: drain bursts. Only meaningful on the FS-event
-            // branch; the heartbeat tick has nothing to drain.
-            while rx.recv_timeout(Duration::from_millis(200)).is_ok() {}
-            Ok(())
-        }
-        // Heartbeat tick: nothing to drain, just beat.
-        Err(mpsc::RecvTimeoutError::Timeout) => Ok(()),
-        Err(mpsc::RecvTimeoutError::Disconnected) => {
-            anyhow::bail!("filesystem watcher disconnected")
+/// The watcher's sync channel, bridged into async.
+///
+/// The bridge is not a convenience. `mpsc::Receiver::recv_timeout` is
+/// SYNCHRONOUS, so awaiting a beat that way parks a runtime worker in
+/// blocking code — where `abort()` cannot reach it and a multi-thread
+/// runtime's drop waits for it. A test that aborted such a task hung
+/// in teardown AFTER its assertions had passed, which is the failure
+/// mode `attach_cost`'s doc predicted: the test's own timeout future
+/// is never polled, so it hangs instead of failing.
+///
+/// One reader thread does the blocking recv and forwards; every await
+/// here is cancel-safe.
+struct Beat {
+    rx: tokio::sync::mpsc::UnboundedReceiver<()>,
+}
+
+impl Beat {
+    fn bridge(rx: mpsc::Receiver<()>) -> Self {
+        let (tx, arx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        std::thread::spawn(move || {
+            while rx.recv().is_ok() {
+                if tx.send(()).is_err() {
+                    break;
+                }
+            }
+        });
+        Self { rx: arx }
+    }
+
+    /// One beat: the next FS event or the heartbeat tick, whichever
+    /// lands first, with event bursts debounced to one refold. Ends on
+    /// a wake, a real error, or owner death — never a clock
+    /// (remove-wait-timeout).
+    async fn next(&mut self, tick: Duration) -> anyhow::Result<()> {
+        tokio::select! {
+            _ = tokio::time::sleep(tick) => Ok(()),
+            w = self.rx.recv() => {
+                if w.is_none() {
+                    anyhow::bail!("filesystem watcher disconnected");
+                }
+                // Let a burst settle, then drain it — one logical
+                // change, one refold.
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                while self.rx.try_recv().is_ok() {}
+                Ok(())
+            }
         }
     }
 }
@@ -488,8 +510,9 @@ async fn run_observer(
     } else {
         Duration::from_millis(1500)
     };
+    let mut beat = Beat::bridge(rx);
     loop {
-        next_beat(&rx, tick)?;
+        beat.next(tick).await?;
         let state = crate::rebuild::rebuild_repo_with_policy(repo, policy)
             .await
             .map_err(|e| anyhow::anyhow!("failed to fold repo `{}`: {e}", repo.display()))?;

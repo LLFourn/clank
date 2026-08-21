@@ -578,19 +578,12 @@ use tokio::process::Command;
 
 /// Argv for the in-hook wait. Separate from the spawn so the shape
 /// can be asserted without launching anything.
-/// The argv for the hook's armed wait.
 ///
-/// `--role` is DELIBERATELY omitted. An explicit role is fixed input
-/// the wait never re-resolves (`explicit_role_survives_a_mid_wait_promotion`);
-/// omitting it makes the wait resolve per refold, so a roster that
-/// changes — or that was unreadable when this hook ran — corrects
-/// itself on the next wake instead of leaving the wait blocked on a
-/// question with no answer.
-///
-/// That difference is not cosmetic. A hook-pinned `reviewer` on an
-/// agent the roster calls master arms a poll that can never return,
-/// and where the tool allows one in-flight wait per session nothing
-/// can replace it.
+/// Carries no role: `clank wait` derives it from `--author`'s roster
+/// entry, per refold, so a roster that changes under a parked wait
+/// corrects it on the next wake. The hook could not usefully supply
+/// one anyway — a role it resolved once would be exactly the fixed
+/// input that left a master's wait blocked forever on reviewer work.
 fn wait_argv(repo: &Path, label: &AgentLabel) -> Vec<String> {
     vec![
         "wait".into(),
@@ -2631,16 +2624,19 @@ mod tests {
             argv.iter().any(|a| a == "--die-with-owner"),
             "without this the in-hook wait has no bound at all: {argv:?}"
         );
+        // Absence assertions over a flag the CLI no longer accepts.
+        // These are reachable, not ceremony: this inspects what the
+        // BUILDER produces, before clap sees it, so re-adding either
+        // flag here fails the test. And it must — a hook injecting a
+        // flag `clank wait` rejects would break the wait outright, at
+        // runtime, in production.
         assert!(
             !argv.iter().any(|a| a == "--timeout"),
             "the flag is gone: {argv:?}"
         );
-        // Role is DERIVED from identity, so the hook must not pin one:
-        // a pinned role is fixed input no refold re-resolves, which is
-        // how a master's wait blocked forever on reviewer work.
         assert!(
             !argv.iter().any(|a| a == "--role"),
-            "the hook must not pin a role: {argv:?}"
+            "role is derived from identity; the hook must not pin one: {argv:?}"
         );
     }
 
