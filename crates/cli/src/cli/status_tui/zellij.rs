@@ -1308,6 +1308,82 @@ mod tests {
         s
     }
 
+    /// The roster the REAL swap writes is what drives convergence.
+    ///
+    /// This is the positive half of sole pane ownership: the incoming
+    /// agent reaches a pane only on the reconcile that follows, and
+    /// only because `apply_swap` wrote it to `.clank/config.json`.
+    /// The negative half — that the swap performs no pane work of its
+    /// own — is NOT asserted here: `apply_swap` takes no `PaneIo`, so
+    /// watching an io it never receives would be tautology (codex on
+    /// 5b8988f). Its absence from the signature is the enforcement,
+    /// with `zellij_ownership_boundary` covering the API it could
+    /// otherwise reach around it for.
+    #[test]
+    fn a_swap_reaches_the_panes_only_through_the_reconciler() {
+        use crate::cli::status_tui::fixtures::{cand, detail_repo, library_home, two_agent_snap};
+        use crate::cli::teams_config::RosterRole;
+
+        let repo = detail_repo();
+        let home = library_home(&["scout"]);
+        let mut snapshot = two_agent_snap();
+        let mut r = PaneReconciler::new();
+        let mut io = FakeIo::with_verify(
+            vec![
+                Some(live(&[("claude", true), ("codex", false)])),
+                Some(live(&[("claude", true), ("codex", false)])),
+            ],
+            vec![
+                Some(live(&[("claude", true), ("codex", false)])),
+                Some(live(&[("claude", true), ("scout", false)])),
+            ],
+        );
+        r.reconcile(RosterView::of(&snapshot), &mut io);
+        let settled = io.log.len();
+
+        let picker = vec![cand("scout", "codex", "codex")];
+        let mut err = None;
+        super::super::apply_swap(
+            1,
+            0,
+            &mut snapshot,
+            &picker,
+            repo.path(),
+            Some(home.path()),
+            &mut err,
+        );
+        assert!(err.is_none(), "the swap itself succeeded: {err:?}");
+
+        // The roster the swap WROTE is what the reconciler reacts to;
+        // building it by hand here would test nothing about the swap.
+        let cfg = crate::agent_store::load_repo_config_required(repo.path()).unwrap();
+        snapshot.agents = cfg
+            .agents
+            .iter()
+            .map(|(l, a)| super::super::fixtures::agent_row(
+                l.as_str(),
+                a.role,
+                clank_core::vocab::AutoMode::On,
+            ))
+            .collect();
+        snapshot.master = cfg
+            .agents
+            .iter()
+            .find(|(_, a)| a.role == RosterRole::Master)
+            .map(|(l, _)| l.as_str().to_string());
+        assert!(
+            snapshot.agents.iter().any(|a| a.label == "scout"),
+            "precondition: the swap put scout on the roster"
+        );
+
+        r.reconcile(RosterView::of(&snapshot), &mut io);
+        let after = &io.log[settled..];
+        assert!(
+            after.iter().any(|l| l.contains("scout")),
+            "the reconciler alone opens the incoming pane: {after:?}"
+        );
+    }
+
     #[test]
     fn reconciler_retries_after_a_failed_listing_and_verifies_convergence() {
         // codex a730882 concern 1: a transient listing failure must NOT

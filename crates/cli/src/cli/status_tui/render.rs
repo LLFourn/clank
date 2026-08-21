@@ -109,6 +109,13 @@ pub(super) fn render_at(
     if let Mode::AddPicker { sel } = mode {
         return render_add_screen(picker, rows, cols, sel);
     }
+    if let Mode::SwapPicker { out, sel } = mode {
+        // A stale `out` falls through to the panel, as the detail page
+        // does; the loop's Refresh moves the mode off next tick.
+        if let Some(agent) = snap.agents.get(out) {
+            return render_candidate_screen(picker, rows, cols, sel, Some(&agent.label));
+        }
+    }
     // (A stale `idx` — roster shrank under us — falls through to the
     // panel; the loop's Refresh reset moves the mode off detail next tick.)
     if let Mode::AgentDetail { idx, sel } = mode
@@ -914,8 +921,27 @@ pub(super) fn render_add_screen(
     cols: usize,
     sel: usize,
 ) -> (Vec<String>, usize) {
+    render_candidate_screen(picker, rows, cols, sel, None)
+}
+
+/// The candidate list, framed by what choosing one will DO.
+///
+/// One screen for both callers because the candidate set is the same
+/// question — the library minus this roster — and a second list would
+/// drift from the first.
+pub(super) fn render_candidate_screen(
+    picker: &[crate::cli::status::AvailableAgent],
+    rows: usize,
+    cols: usize,
+    sel: usize,
+    swapping_out: Option<&str>,
+) -> (Vec<String>, usize) {
+    let (title, verb) = match swapping_out {
+        Some(out) => (format!("swap out {out}"), "swap in"),
+        None => ("add a reviewer".to_string(), "add"),
+    };
     let mut out: Vec<String> = Vec::new();
-    out.push(region_rule("add a reviewer", "", true, cols));
+    out.push(region_rule(&title, "", true, cols));
     out.push(String::new());
     if picker.is_empty() {
         out.push(emit(
@@ -953,7 +979,7 @@ pub(super) fn render_add_screen(
     }
     if out.len() < rows {
         out.push(emit(
-            &[dim("  ↑↓ move · ⏎ add · Esc cancel".to_string())],
+            &[dim(format!("  ↑↓ move · ⏎ {verb} · Esc cancel"))],
             "",
             cols,
         ));
@@ -1017,6 +1043,11 @@ pub(super) fn detail_row_spans(
             spans.push(dim(format!("{:<10}", "auto")));
             spans.extend(toggle_segment(("on", on), ("off", !on), selected));
         }
+        // No `…`: that is this UI's TRUNCATION marker, and
+        // `detail_page_invocation_wraps_in_full_without_ellipsis` reads
+        // its presence as a truncated invocation. `+ add agent` sets
+        // the convention for a picker-opening row — a bare label.
+        DetailAction::Swap => spans.push(plain("⇄ swap for another".to_string())),
         DetailAction::TierCommit | DetailAction::TierPlan | DetailAction::TierFinal => {
             let kind = super::input::role_review_kind(agent.role)
                 .unwrap_or(crate::cli::teams_config::ReviewKind::Commit);
@@ -4941,6 +4972,78 @@ mod tests {
             miss.iter()
                 .any(|l| visible(l).contains("plan file not found"))
         );
+    }
+
+    /// The picker frames itself by what choosing will DO, so a swap
+    /// cannot be mistaken for an add — the two differ only in framing
+    /// and share one candidate list.
+    #[test]
+    fn the_swap_picker_names_who_is_going_out() {
+        let picker = vec![
+            cand("scout", "codex", "codex"),
+            cand("ruthless", "claude", "claude"),
+        ];
+        let (lines, _) = render_candidate_screen(&picker, 24, 60, 0, Some("kimi"));
+        let text = lines
+            .iter()
+            .map(|l| visible(l))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let lower = text.to_lowercase();
+        assert!(
+            lower.contains("swap out kimi"),
+            "names the outgoing agent: {text}"
+        );
+        assert!(lower.contains("swap in"), "and what Enter does: {text}");
+        assert!(
+            text.contains("scout") && text.contains("ruthless"),
+            "{text}"
+        );
+
+        // The add framing is unchanged.
+        let (lines, _) = render_candidate_screen(&picker, 24, 60, 0, None);
+        let lower = lines
+            .iter()
+            .map(|l| visible(l))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .to_lowercase();
+        assert!(lower.contains("add a reviewer"), "{lower}");
+        assert!(!lower.contains("swap"), "{lower}");
+    }
+
+    /// Swap opens a picker rather than acting, so it must not read as
+    /// a toggle or a destructive action.
+    #[test]
+    fn the_swap_action_row_reads_as_a_navigation() {
+        use crate::cli::teams_config::RosterRole;
+        use clank_core::vocab::AutoMode;
+        let agent = agent_row("kimi", RosterRole::Commit, AutoMode::On);
+        let actions = detail_actions(RosterRole::Commit);
+        let sel = actions
+            .iter()
+            .position(|a| *a == DetailAction::Swap)
+            .expect("swap is on a reviewer page");
+        let (lines, _) = render_agent_detail(&agent, &actions, sel, 24, 60);
+        let row = lines
+            .iter()
+            .map(|l| visible(l))
+            .find(|t| t.contains("swap"))
+            .expect("swap row");
+        assert!(
+            row.contains("swap for another"),
+            "names what it opens: {row:?}"
+        );
+        assert!(
+            !row.contains('…'),
+            "`…` means TRUNCATED in this UI; a label must not borrow it: {row:?}"
+        );
+        // Not red: remove owns the destructive colour.
+        let raw = lines.join("\n");
+        let red_swap = raw
+            .lines()
+            .any(|l| l.contains("swap") && l.contains("\x1b[31m"));
+        assert!(!red_swap, "swap is not destructive styling");
     }
 
     #[test]

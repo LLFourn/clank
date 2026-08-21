@@ -202,3 +202,35 @@ pub(crate) fn pr_awaiting(missing: &[&str]) -> clank_core::wait::PrReviewWorkSta
             .collect(),
     }
 }
+
+/// A repo whose roster is claude(master) + codex(commit), matching
+/// `two_agent_snap`, for the detail-action reuse tests.
+pub(crate) fn detail_repo() -> tempfile::TempDir {
+    let repo = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir_all(repo.path().join(".clank")).unwrap();
+    std::fs::write(
+        repo.path().join(".clank/config.json"),
+        r#"{"agents":{"claude":{"tool":"claude","role":"master"},"codex":{"tool":"codex","role":"commit"}}}"#,
+    )
+    .unwrap();
+    repo
+}
+
+/// A user-scope library holding `labels` — `swap_repo_agent` copies
+/// the incoming agent's DESCRIPTION from there, so a candidate that
+/// is not in the library cannot be swapped in.
+pub(crate) fn library_home(labels: &[&str]) -> tempfile::TempDir {
+    let home = tempfile::tempdir().unwrap();
+    let agents: String = labels
+        .iter()
+        .map(|l| format!(r#""{l}":{{"tool":"codex"}}"#))
+        .collect::<Vec<_>>()
+        .join(",");
+    std::fs::create_dir_all(home.path().join(".clank")).unwrap();
+    std::fs::write(
+        home.path().join(".clank/config.json"),
+        format!(r#"{{"agents":{{{agents}}},"teams":{{}}}}"#),
+    )
+    .unwrap();
+    home
+}

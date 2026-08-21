@@ -82,6 +82,10 @@ pub(super) enum Mode {
     /// Choosing a library agent to add; `sel` indexes the freshly-read
     /// candidate list the loop holds.
     AddPicker { sel: usize },
+    /// Choosing the agent to swap IN for `out`. Same candidate list as
+    /// `AddPicker` — library minus roster is exactly who may replace a
+    /// member — with `out` indexing `snapshot.agents`.
+    SwapPicker { out: usize, sel: usize },
     /// The per-agent detail/config page; `idx` is the agent in
     /// `snapshot.agents`, `sel` the cursor over its action menu.
     AgentDetail { idx: usize, sel: usize },
@@ -149,6 +153,10 @@ pub(super) enum DetailAction {
     TierFinal,
     /// Promote a reviewer to master (the core also demotes the old one).
     PromoteToMaster,
+    /// Replace this reviewer with another, keeping its role. Opens a
+    /// picker: unlike every sibling action it needs a SECOND operand,
+    /// since it acts on this agent AND an incoming one.
+    Swap,
     /// Remove the agent from the team (behind the confirm).
     Remove,
     /// Leave the detail page.
@@ -170,6 +178,7 @@ pub(super) fn detail_actions(role: crate::cli::teams_config::RosterRole) -> Vec<
                 TierPlan,
                 TierFinal,
                 PromoteToMaster,
+                Swap,
                 Remove,
                 Back,
             ]
@@ -1772,11 +1781,33 @@ mod tests {
             TierPlan,
             TierFinal,
             PromoteToMaster,
+            Swap,
             Remove,
             Back,
         ];
         assert_eq!(detail_actions(RosterRole::Commit), reviewer);
         assert_eq!(detail_actions(RosterRole::Gate), reviewer);
+    }
+
+    /// Swap is a REVIEWER action. The core refuses it on the master
+    /// (`agent promote` is that operation), and the page follows its
+    /// existing convention of hiding what it cannot do rather than
+    /// offering an action that always errors.
+    #[test]
+    fn swap_is_offered_to_every_reviewer_tier_and_never_the_master() {
+        use crate::cli::teams_config::RosterRole;
+        for tier in [
+            RosterRole::Commit,
+            RosterRole::Plan,
+            RosterRole::Final,
+            RosterRole::Gate,
+        ] {
+            assert!(
+                detail_actions(tier).contains(&DetailAction::Swap),
+                "{tier:?} must be swappable"
+            );
+        }
+        assert!(!detail_actions(RosterRole::Master).contains(&DetailAction::Swap));
     }
 
     #[test]

@@ -781,6 +781,9 @@ fn apply_detail_action(
             }
             Mode::AgentDetail { idx, sel }
         }
+        // Swap needs a SECOND operand, so it opens a picker rather
+        // than acting. Nothing is written until a candidate is chosen.
+        DetailAction::Swap => Mode::SwapPicker { out: idx, sel: 0 },
         DetailAction::PromoteToMaster => match crate::cli::agent::set_repo_master(repo, &label) {
             Ok(()) => Mode::AgentPanel { sel: 0 },
             // Stay on the page and surface the failure — a silently
@@ -830,6 +833,46 @@ fn rebind_picker_sel_by_label(
         None
     } else {
         Some(old_sel.min(picker.len() - 1))
+    }
+}
+
+/// Swap `out` for the candidate at `sel`: ONE config write, then back
+/// to the panel.
+///
+/// No pane work, deliberately. The status TUI owns roster->pane
+/// convergence (tui-zellij-pane-reconcile), so a pane opened here
+/// would make this a second owner — and one opened before the write
+/// is roster-absent, which is exactly what the reconciler destroys.
+/// The write is the whole action; the watcher observes it and the
+/// panes follow.
+///
+/// A failure keeps the user on the page with the reason, matching
+/// `PromoteToMaster`: a silently unchanged roster reads as "clank
+/// ignored me".
+fn apply_swap(
+    out: usize,
+    sel: usize,
+    snapshot: &mut crate::cli::status::StatusSnapshot,
+    picker: &[crate::cli::status::AvailableAgent],
+    repo: &std::path::Path,
+    home: Option<&std::path::Path>,
+    error: &mut Option<(String, String)>,
+) -> Mode {
+    let (Some(agent), Some(cand)) = (snapshot.agents.get(out), picker.get(sel)) else {
+        return Mode::AgentPanel { sel: 0 };
+    };
+    let (Ok(out_label), Ok(in_label)) = (
+        clank_core::ids::AgentLabel::parse(&agent.label),
+        clank_core::ids::AgentLabel::parse(&cand.label),
+    ) else {
+        return Mode::AgentDetail { idx: out, sel: 0 };
+    };
+    match crate::cli::agent::swap_repo_agent(repo, home, &out_label, &in_label) {
+        Ok(()) => Mode::AgentPanel { sel: 0 },
+        Err(e) => {
+            *error = Some(("swap failed".to_string(), format!("{e:?}")));
+            Mode::AgentDetail { idx: out, sel: 0 }
+        }
     }
 }
 
@@ -1959,6 +2002,17 @@ pub(crate) async fn run_tui(
                                     mode = Mode::AgentDetail { idx, sel: s }
                                 }
                                 DetailNav::Activate(action) => {
+                                    // Swap opens a picker, so its
+                                    // candidates must be read FRESH here —
+                                    // the same rule `OpenPicker` follows.
+                                    // `apply_detail_action` cannot do it: it
+                                    // holds neither `home` nor `picker`.
+                                    if action == DetailAction::Swap {
+                                        picker = crate::cli::status::available_agents(
+                                            home.as_deref(),
+                                            &snapshot.agents,
+                                        );
+                                    }
                                     let mut err: Option<(String, String)> = None;
                                     mode = apply_detail_action(
                                         action,
@@ -2016,6 +2070,42 @@ pub(crate) async fn run_tui(
                             | Key::Plus
                             | Key::Minus
                             | Key::Char(_) => {}
+                        },
+                        Mode::SwapPicker { out, sel } => match k {
+                            Key::Quit => break 'evloop,
+                            // Backing out performs NOTHING — the roster is
+                            // untouched until a candidate is chosen.
+                            Key::Escape | Key::Focus => {
+                                mode = Mode::AgentDetail { idx: out, sel: 0 };
+                            }
+                            Key::Up => {
+                                mode = Mode::SwapPicker {
+                                    out,
+                                    sel: move_selection(sel, picker.len(), false),
+                                }
+                            }
+                            Key::Down => {
+                                mode = Mode::SwapPicker {
+                                    out,
+                                    sel: move_selection(sel, picker.len(), true),
+                                }
+                            }
+                            Key::Enter => {
+                                let mut err: Option<(String, String)> = None;
+                                mode = apply_swap(
+                                    out,
+                                    sel,
+                                    &mut snapshot,
+                                    &picker,
+                                    &repo,
+                                    home.as_deref(),
+                                    &mut err,
+                                );
+                                if let Some((title, msg)) = err {
+                                    detail = Some(Overlay::error(title, msg));
+                                }
+                            }
+                            _ => {}
                         },
                         // Confirm: one decision, resolved in one place.
                         Mode::Confirm { action } => {
@@ -2455,11 +2545,15 @@ pub(crate) async fn run_tui(
                     Mode::AgentDetail { idx, .. }
                     | Mode::Confirm {
                         action: ConfirmAction::RemoveAgent { idx },
-                    } => snapshot.agents.get(idx).map(|a| a.label.clone()),
+                    }
+                    | Mode::SwapPicker { out: idx, .. } => {
+                        snapshot.agents.get(idx).map(|a| a.label.clone())
+                    }
                     _ => None,
                 };
                 let picker_label = match mode {
                     Mode::AddPicker { sel }
+                    | Mode::SwapPicker { sel, .. }
                     | Mode::Confirm {
                         action: ConfirmAction::AddCandidate { idx: sel },
                     } => picker.get(sel).map(|c| c.label.clone()),
@@ -2468,6 +2562,7 @@ pub(crate) async fn run_tui(
                 let keep_picker = matches!(
                     mode,
                     Mode::AddPicker { .. }
+                        | Mode::SwapPicker { .. }
                         | Mode::Confirm {
                             action: ConfirmAction::AddCandidate { .. }
                         }
@@ -2542,6 +2637,22 @@ pub(crate) async fn run_tui(
                     // DIFFERENT agent's question, so drop to the log.
                     Mode::BlockAnswer { block } if block < snapshot.blocks.len() => {
                         Mode::BlockAnswer { block }
+                    }
+                    // Both identities are re-LOCATED by label, never
+                    // trusted as indices: a roster or library edit can
+                    // reorder either list, and a stale index would swap
+                    // a different pair than the one on screen. If either
+                    // label is gone, the swap it described is gone too.
+                    Mode::SwapPicker { sel, .. } => {
+                        match (
+                            detail_label
+                                .as_deref()
+                                .and_then(|l| relocate_detail(l, &snapshot.agents)),
+                            rebind_picker_sel_by_label(sel, picker_label.as_deref(), &picker),
+                        ) {
+                            (Some(out), Some(sel)) => Mode::SwapPicker { out, sel },
+                            _ => Mode::AgentPanel { sel: 0 },
+                        }
                     }
                     Mode::BlockAnswer { .. } => {
                         plan_input = None;
@@ -3538,19 +3649,6 @@ pub(crate) mod tests {
         );
     }
 
-    /// A repo whose roster is claude(master) + codex(commit), matching
-    /// `two_agent_snap`, for the detail-action reuse tests.
-    pub(crate) fn detail_repo() -> tempfile::TempDir {
-        let repo = tempfile::TempDir::new().unwrap();
-        std::fs::create_dir_all(repo.path().join(".clank")).unwrap();
-        std::fs::write(
-            repo.path().join(".clank/config.json"),
-            r#"{"agents":{"claude":{"tool":"claude","role":"master"},"codex":{"tool":"codex","role":"commit"}}}"#,
-        )
-        .unwrap();
-        repo
-    }
-
     #[test]
     fn apply_detail_action_tier_checkbox_uses_the_core_and_stays_on_page() {
         use crate::cli::teams_config::RosterRole;
@@ -3662,6 +3760,140 @@ pub(crate) mod tests {
             parsed["agents"]["claude"]["role"], "master",
             "old master demoted"
         );
+    }
+
+    /// Swap acts on a SECOND operand, so the action itself must not
+    /// write — it opens the picker and nothing else changes.
+    #[test]
+    fn apply_detail_action_swap_only_opens_the_picker() {
+        let repo = detail_repo();
+        let mut s = two_agent_snap();
+        let before = std::fs::read_to_string(repo.path().join(".clank/config.json")).unwrap();
+        let mode = apply_detail_action(DetailAction::Swap, 1, 0, &mut s, repo.path(), &mut None);
+        assert_eq!(
+            mode,
+            Mode::SwapPicker { out: 1, sel: 0 },
+            "opens on that agent"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join(".clank/config.json")).unwrap(),
+            before,
+            "no write until a candidate is chosen"
+        );
+    }
+
+    /// The whole action is ONE config write, and the roster change is
+    /// its only observable effect.
+    #[test]
+    fn apply_swap_writes_the_roster_and_carries_the_role() {
+        let repo = detail_repo();
+        let mut s = two_agent_snap();
+        let picker = vec![crate::cli::status::AvailableAgent {
+            label: "scout".to_string(),
+            tool: "codex".to_string(),
+            invocation: "codex".to_string(),
+            description: None,
+        }];
+        let home = library_home(&["scout"]);
+        let mut err = None;
+        let mode = apply_swap(
+            1,
+            0,
+            &mut s,
+            &picker,
+            repo.path(),
+            Some(home.path()),
+            &mut err,
+        );
+
+        assert_eq!(mode, Mode::AgentPanel { sel: 0 }, "back to the panel");
+        assert!(err.is_none(), "clean swap reports nothing: {err:?}");
+
+        let parsed: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(repo.path().join(".clank/config.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            parsed["agents"]["scout"].is_object(),
+            "incoming is on the roster"
+        );
+        assert!(parsed["agents"]["codex"].is_null(), "outgoing is off it");
+        assert_eq!(
+            parsed["agents"]["scout"]["role"], "commit",
+            "and it carried the role across"
+        );
+
+        // Sole pane ownership is asserted at the PaneIo seam instead —
+        // see `a_swap_reaches_the_panes_only_through_the_reconciler`.
+        // A filesystem check cannot show it: a direct zellij call is
+        // IPC and leaves no artifact behind.
+    }
+
+    /// The identity rule, at the seam that had the bug: both ends of a
+    /// swap are re-LOCATED by label after a refresh, never trusted as
+    /// indices. An external roster or library edit reorders these
+    /// lists, and a stale index would swap a pair the user never chose.
+    #[test]
+    fn a_swap_survives_a_reorder_by_relocating_both_ends() {
+        use crate::cli::status::AvailableAgent;
+        let cand = |l: &str| AvailableAgent {
+            label: l.to_string(),
+            tool: "codex".to_string(),
+            invocation: "codex".to_string(),
+            description: None,
+        };
+
+        let mut s = two_agent_snap();
+        let out_label = s.agents[1].label.clone();
+        let picker = vec![cand("ruthless"), cand("scout")];
+        let in_label = picker[1].label.clone();
+
+        s.agents.swap(0, 1);
+        let picker: Vec<AvailableAgent> = vec![cand("scout"), cand("ruthless")];
+
+        let out = relocate_detail(&out_label, &s.agents).expect("outgoing still on the roster");
+        let sel = rebind_picker_sel_by_label(1, Some(&in_label), &picker)
+            .expect("incoming still a candidate");
+        assert_eq!(s.agents[out].label, out_label, "still the chosen agent");
+        assert_eq!(picker[sel].label, in_label, "still the chosen candidate");
+        assert_ne!((out, sel), (1, 1), "and NOT the stale indices");
+
+        assert!(relocate_detail("vanished", &s.agents).is_none());
+        assert!(rebind_picker_sel_by_label(0, Some("vanished"), &picker).is_none());
+    }
+
+    /// A failed swap keeps the user on the page WITH the reason,
+    /// matching promote: a silently unchanged roster reads as "clank
+    /// ignored me".
+    #[test]
+    fn apply_swap_failure_surfaces_the_error_and_stays() {
+        let repo = detail_repo();
+        let mut s = two_agent_snap();
+        // Swapping IN a label already on the roster is refused by the
+        // core.
+        let picker = vec![crate::cli::status::AvailableAgent {
+            label: "claude".to_string(),
+            tool: "claude".to_string(),
+            invocation: "claude".to_string(),
+            description: None,
+        }];
+        let home = library_home(&["claude"]);
+        let mut err = None;
+        let mode = apply_swap(
+            1,
+            0,
+            &mut s,
+            &picker,
+            repo.path(),
+            Some(home.path()),
+            &mut err,
+        );
+        assert_eq!(
+            mode,
+            Mode::AgentDetail { idx: 1, sel: 0 },
+            "stays on the page"
+        );
+        assert!(err.is_some(), "and says why");
     }
 
     #[test]
