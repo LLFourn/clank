@@ -38,7 +38,6 @@ fn observer_args(repo: &Path, event: WaitFor) -> WaitArgs {
         // The observer never resolves identity: author/role stay None
         // and no session env or binding exists in the fixture.
         author: None,
-        role: None,
         die_with_owner: false,
         json: true,
         events: Vec::new(),

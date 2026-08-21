@@ -256,7 +256,7 @@ mod tests {
     #[test]
     fn wait_for_parses_conflicts_with_peek_and_tolerates_author() {
         // wait-for-observer-mode: each event parses; --peek conflicts
-        // (a delta probe has no baseline); --author/--role are ACCEPTED
+        // (a delta probe has no baseline); --author is ACCEPTED
         // alongside --for (documented as ignored, not an error).
         for (raw, want) in [
             ("commit", cli::WaitFor::Commit),

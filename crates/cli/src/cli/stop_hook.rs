@@ -138,83 +138,102 @@ async fn compute_outcome_with(
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
     let effective = crate::cli::team::resolve_effective_auto_mode(cfg.as_ref(), home.as_deref());
 
-    // Role is roster-derived. The hook path is fail-soft: if the
-    // repo has no master configured (or resolution errors),
-    // default to Reviewer —
-    // a misconfigured repo shouldn't block the agent's session,
-    // and Reviewer is the conservative default (won't spuriously
-    // drive master-only actions).
-    let role = crate::agent_store::resolve_role(&repo, &label)
-        .unwrap_or_else(|_| clank_core::vocab::Role::default());
-
     match effective {
         AutoMode::Off => HookOutcome::Silent {
             why: SilentReason::AutoOff,
         },
-        AutoMode::On => match disposition {
-            // A process is live with no `clank wait` watching. Peek (without
-            // blocking) whether the agent has work RIGHT NOW:
-            //  - it does → it's still its turn, blocked on its own task →
-            //    yield silently (don't nudge; that was the loop — a master
-            //    mid-plan always has "continue" work, so a nudged wait would
-            //    return instantly and never persist).
-            //  - it doesn't → idle (e.g. just committed, awaiting reviews) →
-            //    nudge it to start `clank wait` alongside the process, so
-            //    EITHER the process finishing OR review work wakes it. Safe
-            //    from looping: with no work the wait blocks and persists, and
-            //    the next Stop sees it (`YieldArmed`).
-            // In the asyncrewake loop the PARK is the watcher: a live
-            // background process coexists with the parked wait (its
-            // completion wakes via the task notification; work wakes
-            // via exit 2) — nudging the agent to arm a background
-            // wait would reintroduce the tracked-task loop this mode
-            // exists to delete (claude-asyncrewake-work-loop).
-            BgDisposition::NeedsWorkCheck if async_loop => {
-                return asyncrewake_park(&repo, &label, role, started, &live_ids, attending).await;
-            }
-            BgDisposition::NeedsWorkCheck => match peek_has_work(&repo, &label, role).await {
-                Ok(true) => HookOutcome::Silent {
-                    why: SilentReason::BusyOwnWork,
-                },
-                Ok(false) => HookOutcome::Continue {
-                    reason: nudge_reason(&input),
-                },
-                // Fail-soft: if the peek can't run, yield rather than nudge
-                // (the process still wakes the agent; no forced turn on doubt).
-                Err(_) => HookOutcome::Silent {
-                    why: SilentReason::PeekFailed,
-                },
+        // Role is resolved HERE, inside the arm that drives — never
+        // above the auto-mode check. An agent with auto off has asked
+        // not to be driven, and diagnosing its repo's roster would be
+        // noise about work it is not going to do.
+        //
+        // A FAILURE is not laundered into an answer. Defaulting to
+        // Reviewer was the opposite of the conservative choice it
+        // claimed to be: for an agent that is master it arms a poll
+        // that can never return, and where the tool allows one
+        // in-flight wait per session nothing can replace it — the
+        // session is dead until a human prompts it.
+        //
+        // So arm nothing, and SAY so. That failure cost hours of dead
+        // session undiagnosable from outside; a quiet exit would
+        // rebuild exactly that hole.
+        AutoMode::On => match crate::agent_store::resolve_role(&repo, &label) {
+            Err(e) => HookOutcome::Diagnostic {
+                message: format!(
+                    "hook: cannot resolve `{}`'s role ({e:#}); arming no wait. \
+                     Fix the roster and the next turn-end will arm one.",
+                    label.as_str()
+                ),
             },
-            // NoBackgroundWork (YieldArmed already returned above): genuinely idle.
-            _ if async_loop => {
-                return asyncrewake_park(&repo, &label, role, started, &live_ids, attending).await;
-            }
-            _ => match loop_policy(tool) {
-                // LEGACY claude only (`--loop asyncrewake` returns
-                // above): this branch never waits in-hook and never
-                // renders work items — its only continuation is the
-                // arm-the-wait hint, and the armed wait's completion
-                // wake delivers the work. Work presence is deliberately
-                // NOT consulted: if work exists the armed wait exits
-                // immediately and the wake carries it
-                // (claude-stop-hook-minimal-hint).
-                LoopPolicy::BackgroundArm => HookOutcome::Continue {
-                    reason: nudge_reason(&input),
-                },
-                // The in-hook long-poll + emit-with-items model: codex
-                // blocks with the items; opencode's plugin injects
-                // non-empty output on session.idle (M1 spike). No
-                // work / timeout is SILENT either way (codex 8000d6e:
-                // a nudge relay would loop an opencode session
-                // forever).
-                LoopPolicy::InHookWait => {
-                    compute_wait_outcome(&repo, &label, role, started, &live_ids, attending).await
+            Ok(role) => match disposition {
+                // A process is live with no `clank wait` watching. Peek (without
+                // blocking) whether the agent has work RIGHT NOW:
+                //  - it does → it's still its turn, blocked on its own task →
+                //    yield silently (don't nudge; that was the loop — a master
+                //    mid-plan always has "continue" work, so a nudged wait would
+                //    return instantly and never persist).
+                //  - it doesn't → idle (e.g. just committed, awaiting reviews) →
+                //    nudge it to start `clank wait` alongside the process, so
+                //    EITHER the process finishing OR review work wakes it. Safe
+                //    from looping: with no work the wait blocks and persists, and
+                //    the next Stop sees it (`YieldArmed`).
+                // In the asyncrewake loop the PARK is the watcher: a live
+                // background process coexists with the parked wait (its
+                // completion wakes via the task notification; work wakes
+                // via exit 2) — nudging the agent to arm a background
+                // wait would reintroduce the tracked-task loop this mode
+                // exists to delete (claude-asyncrewake-work-loop).
+                BgDisposition::NeedsWorkCheck if async_loop => {
+                    return asyncrewake_park(&repo, &label, role, started, &live_ids, attending)
+                        .await;
                 }
-                // Grok's hooks are PASSIVE (grok-first-class): clank
-                // installs no grok adapter and no continuation could
-                // drive it. If something wires this up anyway, say so.
-                LoopPolicy::Passive => HookOutcome::Diagnostic {
-                    message: "hook: grok has no stop-hook adapter (grok hooks are passive)".into(),
+                BgDisposition::NeedsWorkCheck => match peek_has_work(&repo, &label).await {
+                    Ok(true) => HookOutcome::Silent {
+                        why: SilentReason::BusyOwnWork,
+                    },
+                    Ok(false) => HookOutcome::Continue {
+                        reason: nudge_reason(&input),
+                    },
+                    // Fail-soft: if the peek can't run, yield rather than nudge
+                    // (the process still wakes the agent; no forced turn on doubt).
+                    Err(_) => HookOutcome::Silent {
+                        why: SilentReason::PeekFailed,
+                    },
+                },
+                // NoBackgroundWork (YieldArmed already returned above): genuinely idle.
+                _ if async_loop => {
+                    return asyncrewake_park(&repo, &label, role, started, &live_ids, attending)
+                        .await;
+                }
+                _ => match loop_policy(tool) {
+                    // LEGACY claude only (`--loop asyncrewake` returns
+                    // above): this branch never waits in-hook and never
+                    // renders work items — its only continuation is the
+                    // arm-the-wait hint, and the armed wait's completion
+                    // wake delivers the work. Work presence is deliberately
+                    // NOT consulted: if work exists the armed wait exits
+                    // immediately and the wake carries it
+                    // (claude-stop-hook-minimal-hint).
+                    LoopPolicy::BackgroundArm => HookOutcome::Continue {
+                        reason: nudge_reason(&input),
+                    },
+                    // The in-hook long-poll + emit-with-items model: codex
+                    // blocks with the items; opencode's plugin injects
+                    // non-empty output on session.idle (M1 spike). No
+                    // work / timeout is SILENT either way (codex 8000d6e:
+                    // a nudge relay would loop an opencode session
+                    // forever).
+                    LoopPolicy::InHookWait => {
+                        compute_wait_outcome(&repo, &label, role, started, &live_ids, attending)
+                            .await
+                    }
+                    // Grok's hooks are PASSIVE (grok-first-class): clank
+                    // installs no grok adapter and no continuation could
+                    // drive it. If something wires this up anyway, say so.
+                    LoopPolicy::Passive => HookOutcome::Diagnostic {
+                        message: "hook: grok has no stop-hook adapter (grok hooks are passive)"
+                            .into(),
+                    },
                 },
             },
         },
@@ -289,14 +308,22 @@ async fn run_session_start(args: StopHookArgs) -> anyhow::Result<()> {
     {
         return Ok(());
     }
-    let role = crate::agent_store::resolve_role(&repo, &label)
-        .unwrap_or_else(|_| clank_core::vocab::Role::default());
-    let Ok(items) = peek_items(&repo, &label, role).await else {
+    // No role to get wrong here: the peek resolves it from identity
+    // in the subprocess, so this cannot greet a session with another
+    // agent's work.
+    let Ok(items) = peek_items(&repo, &label).await else {
         return Ok(());
     };
     if items.is_empty() {
         return Ok(());
     }
+    // Needed only to PHRASE the items, and only now that there are
+    // some. Fail-open like every other path here: a session start is
+    // never broken by clank state, so an unresolvable role surfaces
+    // nothing rather than guessing whose work this is.
+    let Ok(role) = crate::agent_store::resolve_role(&repo, &label) else {
+        return Ok(());
+    };
     println!(
         "{}",
         session_start_payload(&render_wait_items(&items, &label, role))
@@ -475,24 +502,16 @@ async fn asyncrewake_park(
 /// Self-spawns `clank wait --peek --json` (side-effect-free: fires no
 /// hooks) and CAPTURES its stdout — never inherits it — so the peek's JSON
 /// envelope can't corrupt the hook's own protocol stdout (ruthless c042912).
-async fn peek_has_work(repo: &Path, label: &AgentLabel, role: Role) -> Result<bool, String> {
-    peek_items(repo, label, role).await.map(|i| !i.is_empty())
+async fn peek_has_work(repo: &Path, label: &AgentLabel) -> Result<bool, String> {
+    peek_items(repo, label).await.map(|i| !i.is_empty())
 }
 
 /// The peek's ITEMS — shared by the work-check and SessionStart's
 /// catch-up context (claude-asyncrewake-work-loop).
-pub(crate) async fn peek_items(
-    repo: &Path,
-    label: &AgentLabel,
-    role: Role,
-) -> Result<Vec<WaitItem>, String> {
+pub(crate) async fn peek_items(repo: &Path, label: &AgentLabel) -> Result<Vec<WaitItem>, String> {
     use tokio::process::Command;
 
     let exe = std::env::current_exe().map_err(|e| format!("current_exe failed: {e}"))?;
-    let role_arg = match role {
-        Role::Master => "master",
-        Role::Reviewer => "reviewer",
-    };
     let output = Command::new(&exe)
         .arg("wait")
         .arg("--peek")
@@ -500,8 +519,6 @@ pub(crate) async fn peek_items(
         .arg(repo)
         .arg("--author")
         .arg(label.as_str())
-        .arg("--role")
-        .arg(role_arg)
         .arg("--json")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -561,19 +578,26 @@ use tokio::process::Command;
 
 /// Argv for the in-hook wait. Separate from the spawn so the shape
 /// can be asserted without launching anything.
-fn wait_argv(repo: &Path, label: &AgentLabel, role: Role) -> Vec<String> {
-    let role_arg = match role {
-        Role::Master => "master",
-        Role::Reviewer => "reviewer",
-    };
+/// The argv for the hook's armed wait.
+///
+/// `--role` is DELIBERATELY omitted. An explicit role is fixed input
+/// the wait never re-resolves (`explicit_role_survives_a_mid_wait_promotion`);
+/// omitting it makes the wait resolve per refold, so a roster that
+/// changes — or that was unreadable when this hook ran — corrects
+/// itself on the next wake instead of leaving the wait blocked on a
+/// question with no answer.
+///
+/// That difference is not cosmetic. A hook-pinned `reviewer` on an
+/// agent the roster calls master arms a poll that can never return,
+/// and where the tool allows one in-flight wait per session nothing
+/// can replace it.
+fn wait_argv(repo: &Path, label: &AgentLabel) -> Vec<String> {
     vec![
         "wait".into(),
         "--repo".into(),
         repo.display().to_string(),
         "--author".into(),
         label.as_str().to_string(),
-        "--role".into(),
-        role_arg.into(),
         // Ownership, not decoration: without this the wait has no
         // bound at all and outlives a killed hook forever.
         "--die-with-owner".into(),
@@ -581,9 +605,9 @@ fn wait_argv(repo: &Path, label: &AgentLabel, role: Role) -> Vec<String> {
     ]
 }
 
-fn wait_command(exe: &Path, repo: &Path, label: &AgentLabel, role: Role) -> Command {
+fn wait_command(exe: &Path, repo: &Path, label: &AgentLabel) -> Command {
     let mut cmd = Command::new(exe);
-    cmd.args(wait_argv(repo, label, role))
+    cmd.args(wait_argv(repo, label))
         // Piped stdin IS the ownership channel. `OwnedWait::spawn`
         // refuses to proceed without it.
         .stdin(Stdio::piped())
@@ -724,7 +748,7 @@ async fn compute_wait_outcome(
         }
     };
 
-    let mut cmd = wait_command(&exe, repo, label, role);
+    let mut cmd = wait_command(&exe, repo, label);
 
     let owned = match OwnedWait::spawn(&mut cmd) {
         Ok(w) => w,
@@ -2119,6 +2143,50 @@ mod tests {
     /// "the hook ran but never reached the marker" — which is the
     /// entire bug class this model deletes. Consumption sits before
     /// the auto-mode branch precisely so neither can skip it.
+    /// The laundering that wedged a real session: a repo whose role
+    /// cannot be resolved used to arm a wait as Reviewer, and for an
+    /// agent that is master that poll can never return.
+    #[tokio::test]
+    async fn unresolvable_role_arms_nothing_and_says_why() {
+        let dir = init_repo();
+        let repo = dir.path();
+        // Bound, auto on, but NO master designated — `resolve_role`
+        // has no answer to give.
+        let label = bind(repo, "codex", "sess-no-master");
+        crate::agent_store::set_auto_mode(repo, &label, AutoMode::On).unwrap();
+
+        let input = hook_input("sess-no-master", Some("done"));
+        match compute_outcome(Tool::Claude, Some(repo), input).await {
+            HookOutcome::Diagnostic { message } => {
+                assert!(message.contains("role"), "names the failure: {message}");
+                assert!(
+                    message.contains("arming no wait"),
+                    "says what it did NOT do: {message}"
+                );
+            }
+            other => panic!("a role we cannot resolve must arm nothing, got {other:?}"),
+        }
+    }
+
+    /// Auto off is the agent asking not to be driven. Diagnosing its
+    /// repo's roster would be noise about work it will not do, so the
+    /// resolution must sit INSIDE the driving arm, never above it.
+    #[tokio::test]
+    async fn auto_off_outranks_an_unresolvable_role() {
+        let dir = init_repo();
+        let repo = dir.path();
+        let label = bind(repo, "codex", "sess-off-no-master");
+        crate::agent_store::set_auto_mode(repo, &label, AutoMode::Off).unwrap();
+
+        let input = hook_input("sess-off-no-master", Some("done"));
+        assert_eq!(
+            compute_outcome(Tool::Claude, Some(repo), input).await,
+            HookOutcome::Silent {
+                why: SilentReason::AutoOff
+            },
+        );
+    }
+
     #[tokio::test]
     async fn auto_off_still_consumes_the_marker() {
         let dir = init_repo();
@@ -2558,11 +2626,7 @@ mod tests {
 
     #[test]
     fn the_in_hook_wait_argv_carries_the_ownership_flag() {
-        let argv = wait_argv(
-            Path::new("/repo"),
-            &AgentLabel::parse("codex").unwrap(),
-            Role::Master,
-        );
+        let argv = wait_argv(Path::new("/repo"), &AgentLabel::parse("codex").unwrap());
         assert!(
             argv.iter().any(|a| a == "--die-with-owner"),
             "without this the in-hook wait has no bound at all: {argv:?}"
@@ -2570,6 +2634,13 @@ mod tests {
         assert!(
             !argv.iter().any(|a| a == "--timeout"),
             "the flag is gone: {argv:?}"
+        );
+        // Role is DERIVED from identity, so the hook must not pin one:
+        // a pinned role is fixed input no refold re-resolves, which is
+        // how a master's wait blocked forever on reviewer work.
+        assert!(
+            !argv.iter().any(|a| a == "--role"),
+            "the hook must not pin a role: {argv:?}"
         );
     }
 
@@ -2591,7 +2662,6 @@ mod tests {
             Path::new("true"),
             Path::new("/repo"),
             &AgentLabel::parse("codex").unwrap(),
-            Role::Master,
         ))
         .expect("the hook's own command must carry the pipe");
         let _ = owned.run().await;

@@ -9,7 +9,7 @@ use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
-use clank::cli::{WaitArgs, WaitRole};
+use clank::cli::WaitArgs;
 
 fn git(repo: &Path, args: &[&str]) {
     assert!(
@@ -34,7 +34,6 @@ fn wait_args(repo: &Path, events: Vec<String>) -> WaitArgs {
     WaitArgs {
         repo: Some(repo.to_path_buf()),
         author: Some("rev".into()),
-        role: Some(WaitRole::Reviewer),
         die_with_owner: false,
         json: true,
         events,

@@ -1,15 +1,17 @@
 //! `clank wait` — block until the calling agent has wait-surface
 //! items to print.
 //!
-//! Two roles. `--role master` watches for plans where the gate
-//! has moved on without master, and additionally receives
-//! `Finished` notices when a watched plan transitions into
-//! `finished_plans` (the notice is what fires the
-//! `plan_finalized` hook). `--role reviewers` watches for plans
-//! whose latest reviewable commit needs an opinion from
-//! `--author` — and ONLY that: a finish is a notification with no
-//! reviewer action, so it never wakes a reviewer
-//! (`finish-does-not-wake-reviewers`).
+//! Two roles, DERIVED from `--author`'s roster entry — never
+//! supplied, because which side of the workflow an agent plays is
+//! not orthogonal to who it is.
+//!
+//! The roster's master watches for plans where the gate has moved on
+//! without master, and additionally receives `Finished` notices when
+//! a watched plan transitions into `finished_plans` (the notice is
+//! what fires the `plan_finalized` hook). A reviewer watches for
+//! plans whose latest reviewable commit needs its opinion — and ONLY
+//! that: a finish is a notification with no reviewer action, so it
+//! never wakes a reviewer (`finish-does-not-wake-reviewers`).
 //!
 //! `wait` folds the repo, runs `RepoState::derive_status` (which
 //! threads `wait::compute_gate` over every plan), filters the
@@ -144,7 +146,7 @@ pub async fn run(args: WaitArgs) -> anyhow::Result<()> {
     // cross-repo observer — no identity, no role, no work
     // projection, no lifecycle hooks. Branches BEFORE identity
     // resolution: the observed repo has no session binding for the
-    // caller, and --author/--role are deliberately ignored.
+    // caller, and --author is deliberately ignored.
     if let Some(event) = args.r#for {
         return run_observer(&repo, event, poll_mode, args.no_cache, args.json).await;
     }
@@ -160,7 +162,6 @@ pub async fn run(args: WaitArgs) -> anyhow::Result<()> {
         None => crate::agent_env::resolve_identity_from_env(&repo)?,
     };
 
-    let explicit_role: Option<Role> = args.role.map(Into::into);
     // Extra wake sources: the agent config's `wait_events` plus any
     // `--event` items (config first, CLI appended). Parse errors are
     // arm-time hard errors naming the offending input.
@@ -168,7 +169,7 @@ pub async fn run(args: WaitArgs) -> anyhow::Result<()> {
     // Arm-time derivation errors stay HARD (a wait that can never
     // project is a bug to surface); the loop re-derives per wake and
     // is fail-soft there (wait-reloads-config-per-refold).
-    let mut inputs = derive_wait_inputs(&repo, &author, explicit_role)?;
+    let mut inputs = derive_wait_inputs(&repo, &author)?;
 
     let policy = if args.no_cache {
         crate::rebuild::CachePolicy::Bypass
@@ -346,7 +347,7 @@ pub async fn run(args: WaitArgs) -> anyhow::Result<()> {
             // (wait-reloads-config-per-refold). Fail-soft mid-loop: a
             // transient read failure keeps the last-known-good inputs and
             // retries next wake — it must not kill a parked wait.
-            if let Ok(fresh) = derive_wait_inputs(&repo, &author, explicit_role) {
+            if let Ok(fresh) = derive_wait_inputs(&repo, &author) {
                 inputs = fresh;
             }
 
@@ -588,26 +589,24 @@ fn observe_events(
 /// The projection inputs derived from repo config — ONE derivation
 /// shared by the arm-time pass and every watch-loop wake, so the two
 /// can't drift (wait-reloads-config-per-refold). Author identity is
-/// deliberately not here (fixed at arm time by design); an explicit
-/// `--role` is an INPUT and is never re-resolved away.
+/// deliberately not here (fixed at arm time by design); the ROLE is,
+/// because it derives from that identity and must follow a roster
+/// that changes under a parked wait.
 struct WaitInputs {
     role: Role,
     work_policy: clank_core::wait::WorkPolicy,
     hook_config: std::collections::BTreeMap<HookEvent, Option<String>>,
 }
 
-fn derive_wait_inputs(
-    repo: &Path,
-    author: &AgentLabel,
-    explicit_role: Option<Role>,
-) -> anyhow::Result<WaitInputs> {
-    // Resolve --role from the roster when omitted: `resolve_role`
-    // returns Master for the roster's master and Reviewer for any
-    // tier member. Errors if the repo has no master configured.
-    let role = match explicit_role {
-        Some(r) => r,
-        None => crate::agent_store::resolve_role(repo, author)?,
-    };
+fn derive_wait_inputs(repo: &Path, author: &AgentLabel) -> anyhow::Result<WaitInputs> {
+    // Role is DERIVED from identity, never supplied. Which side of the
+    // workflow you play is not orthogonal to who you are, so a
+    // caller cannot hold a role the roster contradicts — the state
+    // that left a master's wait blocked forever on reviewer work.
+    //
+    // Re-derived every refold, so a roster change corrects a parked
+    // wait on its next wake rather than stranding it.
+    let role = crate::agent_store::resolve_role(repo, author)?;
     let config = crate::cli::config::load(repo);
     // Reviewer tiers from the team resolver. wait is a workflow
     // command, so it hard-errors when no team is configured

@@ -504,11 +504,6 @@ pub struct WaitArgs {
     /// to override or to run from outside a session.
     #[arg(long, value_name = "LABEL")]
     pub author: Option<String>,
-    /// Which side of the workflow this caller plays. Optional:
-    /// defaults to `master` iff the resolved label matches
-    /// `.clank/config.json`'s `master` field, else `reviewer`.
-    #[arg(long, value_enum)]
-    pub role: Option<WaitRole>,
     /// Exit when the process that spawned this wait goes away.
     ///
     /// The spawner must hand this process a pipe as stdin and hold
@@ -530,8 +525,8 @@ pub struct WaitArgs {
     /// OBSERVE the repo instead of waiting for own work: block until
     /// the given event lands, counting only events AFTER the wait
     /// starts. For watching a foreign repo (pair with --repo) — no
-    /// session binding is needed there, so --author/--role are
-    /// ignored. Fires no lifecycle hooks.
+    /// session binding is needed there, so --author is ignored.
+    /// Fires no lifecycle hooks.
     #[arg(
         long = "for",
         value_enum,
@@ -596,7 +591,7 @@ pub fn resolve_poll(explicit: Option<bool>, codex_sandbox: Option<&str>) -> bool
 
 #[cfg(test)]
 mod role_arg_alias_tests {
-    use super::{RoleArg, WaitRole};
+    use super::RoleArg;
     use clap::ValueEnum;
 
     #[test]
@@ -611,18 +606,6 @@ mod role_arg_alias_tests {
         // the clap alias.
         let parsed = RoleArg::from_str("reviewers", false).unwrap();
         assert!(matches!(parsed, RoleArg::Reviewer));
-    }
-
-    #[test]
-    fn wait_role_accepts_both_forms() {
-        assert!(matches!(
-            WaitRole::from_str("reviewer", false).unwrap(),
-            WaitRole::Reviewer
-        ));
-        assert!(matches!(
-            WaitRole::from_str("reviewers", false).unwrap(),
-            WaitRole::Reviewer
-        ));
     }
 
     #[test]
@@ -669,16 +652,6 @@ mod resolve_poll_tests {
     }
 }
 
-#[derive(Copy, Clone, Debug, clap::ValueEnum)]
-pub enum WaitRole {
-    Master,
-    /// Singular per `role-reviewers-to-reviewer-rename`.
-    /// `alias = "reviewers"` preserves backwards compat for
-    /// users typing `--role reviewers` on `clank wait`.
-    #[clap(alias = "reviewers")]
-    Reviewer,
-}
-
 /// Observer events for `clank wait --for`
 /// (wait-for-observer-mode). Delta-from-startup: each fires only
 /// for occurrences after the wait began.
@@ -691,15 +664,6 @@ pub enum WaitFor {
     /// The repo came to a stop-point: a plan finalized OR a new
     /// unanswered block appeared (someone needs the human).
     Stopped,
-}
-
-impl From<WaitRole> for clank_core::Role {
-    fn from(r: WaitRole) -> Self {
-        match r {
-            WaitRole::Master => clank_core::Role::Master,
-            WaitRole::Reviewer => clank_core::Role::Reviewer,
-        }
-    }
 }
 
 #[derive(Args, Debug)]
