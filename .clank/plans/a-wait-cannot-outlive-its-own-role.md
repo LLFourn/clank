@@ -65,43 +65,68 @@ the ANSWER changing.
 
 ## Approach
 
-**Make the roster an input the wait watches, not a value it captured.**
-The wait already watches the repo for work (`repo_watch` wakes on gate
-signal dirs and the gitdir). Extend that to the roster inputs — the
-repo config, and whatever else `try_resolve_via_team` reads — and EXIT
-when they change.
+**The watcher already does its half.** `config.json` is in
+`CLANK_WAKE_DIRS` (`crates/cli/src/repo_watch.rs:34`), so a roster
+write ALREADY wakes the wait's loop today. Do not build watch plumbing
+— none is missing.
 
-Exit, do not re-resolve in place. Exiting is the smaller change and the
-honest one: the caller decides what to arm next, the in-flight slot is
-freed, and the next idle re-arms with a freshly resolved role. A wait
-that silently switched its own role would be a second place where role
-is decided.
+The gap is what the loop does on that wake: it REFOLDS state and keeps
+its fixed role, so it re-answers the same wrong question and blocks
+again. An explicit `--role` is fixed input that no refold re-resolves;
+omitting the flag re-resolves per fold, which is why only the
+hook-armed explicit form can wedge.
 
-**And do not arm a wait on a FAILED resolution.** The hook currently
-launders failure into a confident answer:
+So: **on a wake whose input is a roster input, exit instead of
+refolding.**
+
+**The exit contract.** Exit in the NO-WORK shape — exit 0, empty items
+— so the hook maps it to `Silent{NoWork}`, the in-flight slot frees,
+and the next idle re-arms with a freshly resolved role. Any other shape
+is worse: a non-zero exit reads as genuine failure, and a synthesised
+item reads as phantom work the agent cannot act on.
+
+Exit, do not re-resolve in place. A wait that changed its own role
+would be a second place where role is decided, and the caller is
+already the place that decides it.
+
+**Do not arm on a FAILED resolution — and say so.** The hook launders
+failure into a confident answer in TWO places, both of which this must
+cover:
+
+    stop_hook.rs:147  (the armed wait)
+    stop_hook.rs:292  (the peek path)
 
     let role = resolve_role(&repo, &label).unwrap_or_else(|_| Role::default());
 
-whose comment claims *"Reviewer is the conservative default"*. It is
-not. For an agent that is master, Reviewer arms a long-poll that can
-never return and — with one in-flight slot — permanently wedges the
-session. That is the opposite of the comment's stated goal that "a
-misconfigured repo shouldn't block the agent's session". The
-conservative response to a failed resolution is to arm NOTHING and let
-the next idle retry, which self-heals the moment the roster resolves.
+Emit a **Diagnostic**, not a quiet Silent. This failure cost hours of
+dead session that was undiagnosable from outside; arming nothing is
+only half the fix, and a Silent that hides the reason rebuilds the
+observability hole the bug lived in.
 
-Decide in review whether that becomes a Diagnostic (visible) or a quiet
-Silent (invisible but harmless). Prefer visible: this failure was
-undiagnosable from the outside for hours.
+The comment above it inverts, because it currently asserts the
+opposite of what happens:
+
+    default to Reviewer — a misconfigured repo shouldn't block the
+    agent's session, and Reviewer is the conservative default
+
+Reviewer is the one default that CAN wedge the session: for an agent
+that is master it arms a poll that can never return, and with one
+in-flight slot nothing can replace it.
 
 ## Required tests
 
-- A wait whose roster input changes under it exits, rather than
-  continuing to block on the old role.
+- A wait whose roster input changes under it EXITS, rather than
+  refolding and blocking on the old role again.
+- It exits in the no-work shape (exit 0, empty items), so the hook
+  maps it to `Silent{NoWork}` — asserted on the shape, since a
+  non-zero exit or a synthesised item would each fail differently.
 - A wait exits on a roster change even when it has NO work — the
   wedged case is precisely the one with nothing to return.
-- Role resolution failing produces NO armed wait, and is distinguishable
-  from "resolved, and there is no work".
+- Role resolution failing produces NO armed wait and a Diagnostic
+  naming the failure, distinguishable from "resolved, and there is no
+  work".
+- BOTH fallback sites are covered — the armed wait (`:147`) and the
+  peek path (`:292`). A fix to one leaves the other laundering.
 - A roster change that does NOT affect this agent's role still exits;
   correctness first, and re-arming is cheap.
 - The existing `--die-with-owner` bound is unaffected — the two bounds
