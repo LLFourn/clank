@@ -10,7 +10,7 @@ investigated while authoring this checklist and need no plan.
 ## 1. Install & distribution
 
 - [ ] **`install-script-and-release-builds`** — today the only
-  install is clone + `cargo install --path crates/cli`. A public
+  install is clone + `cargo install --path crates/cli --locked`. A public
   release needs: a GitHub Actions release workflow building
   binaries for the platforms we care about (macOS arm64/x86_64,
   Linux x86_64/arm64 to start), plus a `curl … | sh` installer

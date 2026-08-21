@@ -11,11 +11,15 @@ daemon and no server.
 ```sh
 git clone <this-repo>
 cd <repo-dir>
-cargo install --path crates/cli
+cargo install --path crates/cli --locked
 ```
 
-That puts `clank` on your `$PATH`. Then wire it into your agents
-(Claude Code, Codex CLI, Grok CLI — any or all):
+That puts `clank` on your `$PATH`. Keep `--locked`: without it
+`cargo install` ignores the committed `Cargo.lock` and re-resolves
+every dependency to the newest semver-compatible version.
+
+Then wire it into your agents (Claude Code, Codex CLI, Grok CLI —
+any or all):
 
 ```sh
 clank setup
