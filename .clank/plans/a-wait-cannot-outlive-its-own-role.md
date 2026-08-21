@@ -54,84 +54,71 @@ master."
 
 ## The invariant
 
-**A blocked wait must not be able to outlive the configuration it was
-built from.**
+**Role is not orthogonal to identity — it is DERIVED from it.**
 
-Today the wait is a long-lived process holding an unrevalidated
-snapshot, which is the same false model as a stale marker: a fact
-asserted once and trusted indefinitely. The `--die-with-owner` bound
-already exists for the OWNER dying; there is no equivalent bound for
-the ANSWER changing.
+Which side of the workflow an agent plays is decided by who it is: the
+roster names one master, and everyone else is a reviewer. A `--role`
+flag makes that a second, independent input, and two sources of truth
+for one fact can disagree. This wedge is what disagreement looks like.
 
-## Approach
+## Approach: delete the flag
 
-**The watcher already does its half.** `config.json` is in
-`CLANK_WAKE_DIRS` (`crates/cli/src/repo_watch.rs:34`), so a roster
-write ALREADY wakes the wait's loop today. Do not build watch plumbing
-— none is missing.
+Not "detect the divergence and recover from it" — make the divergence
+UNREPRESENTABLE. `clank wait` loses `--role` entirely (the flag, the
+`WaitRole` enum, its conversion), and `derive_wait_inputs` resolves the
+role from the author's roster entry, every refold.
 
-The gap is what the loop does on that wake: it REFOLDS state and keeps
-its fixed role, so it re-answers the same wrong question and blocks
-again. An explicit `--role` is fixed input that no refold re-resolves;
-omitting the flag re-resolves per fold, which is why only the
-hook-armed explicit form can wedge.
+The recovery machinery this plan first proposed is then unnecessary,
+and so is the flag's own defaulting: its doc conceded the derivation
+already — *"defaults to `master` iff the resolved label matches
+`.clank/config.json`'s `master` field, else `reviewer`"* — so the flag
+existed only to OVERRIDE identity, which is the bug and not a feature.
 
-So: **on a wake whose input is a roster input, exit instead of
-refolding.**
+**The self-correcting path already existed and was already tested.**
+`wait_config_reload` pins that an omitted role re-resolves on a wake
+and returns master work after a mid-wait promotion, without the wait
+restarting. The hook opted out of that by passing an explicit role.
+Removing the flag makes every caller take the tested path.
 
-**The exit contract.** Exit in the NO-WORK shape — exit 0, empty items
-— so the hook maps it to `Silent{NoWork}`, the in-flight slot frees,
-and the next idle re-arms with a freshly resolved role. Any other shape
-is worse: a non-zero exit reads as genuine failure, and a synthesised
-item reads as phantom work the agent cannot act on.
+**What must keep working, and does:**
 
-Exit, do not re-resolve in place. A wait that changed its own role
-would be a second place where role is decided, and the caller is
-already the place that decides it.
+- `clank wait --repo <path> --author <label>` from OUTSIDE the repo.
+  Role derives from the roster, which needs neither a session nor a
+  cwd inside the repo.
+- `clank wait --for <event>`, which needs no identity at all. It
+  already returns before author resolution, so it is untouched.
 
-**Do not arm on a FAILED resolution — and say so.** The hook launders
-failure into a confident answer in TWO places, both of which this must
-cover:
+**Arming still refuses on an unresolvable role.** A role that cannot be
+derived is not a role to guess, so the hook emits a Diagnostic and arms
+nothing rather than defaulting to Reviewer. Resolution moved INSIDE the
+auto-on arm: an agent with auto off asked not to be driven, and
+diagnosing its roster would be noise about work it will not do.
 
-    stop_hook.rs:147  (the armed wait)
-    stop_hook.rs:292  (the peek path)
+The SessionStart peek needs no such guard once the flag is gone — the
+peek subprocess derives its own role from identity, so it cannot be
+told a wrong one. It resolves a role only to PHRASE items, and only
+once there are some.
 
-    let role = resolve_role(&repo, &label).unwrap_or_else(|_| Role::default());
+## What this deletes
 
-Emit a **Diagnostic**, not a quiet Silent. This failure cost hours of
-dead session that was undiagnosable from outside; arming nothing is
-only half the fix, and a Silent that hides the reason rebuilds the
-observability hole the bug lived in.
-
-The comment above it inverts, because it currently asserts the
-opposite of what happens:
-
-    default to Reviewer — a misconfigured repo shouldn't block the
-    agent's session, and Reviewer is the conservative default
-
-Reviewer is the one default that CAN wedge the session: for an agent
-that is master it arms a poll that can never return, and with one
-in-flight slot nothing can replace it.
+- `explicit_role_survives_a_mid_wait_promotion`, which pinned the
+  semantics of the removed flag. Deleted, not adapted: the behaviour
+  that survives — an omitted role re-resolving mid-wait — is pinned by
+  the test directly above it.
+- The hook's `Role::default()` fallbacks, both of them.
 
 ## Required tests
 
-- A wait whose roster input changes under it EXITS, rather than
-  refolding and blocking on the old role again.
-- It exits in the no-work shape (exit 0, empty items), so the hook
-  maps it to `Silent{NoWork}` — asserted on the shape, since a
-  non-zero exit or a synthesised item would each fail differently.
-- A wait exits on a roster change even when it has NO work — the
-  wedged case is precisely the one with nothing to return.
+- A parked wait whose agent is promoted mid-wait returns MASTER work
+  on the wake, without restarting. This is the existing test, and it
+  now covers every caller rather than only the flagless ones.
 - Role resolution failing produces NO armed wait and a Diagnostic
-  naming the failure, distinguishable from "resolved, and there is no
-  work".
-- BOTH fallback sites are covered — the armed wait (`:147`) and the
-  peek path (`:292`). A fix to one leaves the other laundering.
-- A roster change that does NOT affect this agent's role still exits;
-  correctness first, and re-arming is cheap.
-- The existing `--die-with-owner` bound is unaffected — the two bounds
-  are independent and neither replaces the other.
-- No test spawns zellij, an agent binary, or a real editor session.
+  naming the failure.
+- Auto-off outranks an unresolvable role: an agent that asked not to
+  be driven is silent, not diagnosed.
+- `--for` still runs with no identity resolvable at all.
+- `--repo` + `--author` still works from outside the repo.
+- No test spawns zellij or an agent binary.
 
 ## Out of scope
 
