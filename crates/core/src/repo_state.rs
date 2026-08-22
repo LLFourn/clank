@@ -67,6 +67,13 @@ pub struct RepoState {
     /// ad-hoc events.
     #[serde(default)]
     pub adopted: bool,
+
+    /// First commit that made [`adopted`](Self::adopted) true. This is
+    /// durable even when every plan is later deleted, and gives history
+    /// readers an exact floor: commits before it are plain Git history and
+    /// never need to enter the clank fold.
+    #[serde(default)]
+    pub adopted_at: Option<CommitSha>,
 }
 
 /// One active plan. Just its per-commit timeline; every other
@@ -498,6 +505,7 @@ impl RepoState {
 
     /// Apply one `CommitEvent` to this state.
     pub fn apply_commit(&mut self, event: &CommitEvent) -> Vec<LogEvent> {
+        let was_adopted = self.adopted;
         let mut log_events = Vec::new();
         let touches: BTreeMap<PlanKey, TouchKind> = event
             .plan_touches
@@ -648,6 +656,10 @@ impl RepoState {
                 ts: event.author_ts,
                 subject: event.subject.clone(),
             });
+        }
+
+        if !was_adopted && self.adopted && self.adopted_at.is_none() {
+            self.adopted_at = Some(event.sha.clone());
         }
 
         log_events
@@ -1106,6 +1118,7 @@ mod tests {
         );
         assert!(matches!(events.last(), Some(LogEvent::PlanIntro { .. })));
         assert!(s.adopted);
+        assert_eq!(s.adopted_at, Some(sha("4444")));
     }
 
     #[test]
@@ -1219,9 +1232,11 @@ mod tests {
         assert!(s.plans.is_empty());
         assert!(s.finished_plans.is_empty());
         assert!(s.adopted, "adoption must persist across PlanDeleted");
+        let adopted_at = s.adopted_at.clone();
         let mut e = ev("3333", 3, "[misc] drive-by fix", Vec::new());
         e.has_code_changes = true;
         let events = s.apply_commit(&e);
+        assert_eq!(s.adopted_at, adopted_at, "adoption boundary is durable");
         assert!(
             events.iter().any(|e| matches!(e, LogEvent::AdHoc { .. })),
             "[misc] commit after PlanDeleted must still emit AdHoc; got {events:?}"

@@ -67,10 +67,17 @@ pub struct StatusSnapshot {
     /// 3ea8580 concern 1). Plans: status-tui-live-log,
     /// log-plan-umbrellas.
     pub(crate) log_rows: Vec<crate::cli::log::OnelineRow>,
+    /// Durable fold boundary used by on-demand log paging. Keeping it in
+    /// the snapshot means scrolling never rebuilds the whole repo merely to
+    /// rediscover where plain Git history begins.
+    pub(crate) log_adopted_at: Option<crate::lifecycle::CommitSha>,
+    /// Cursor for the next older TUI page. `None` means the currently loaded
+    /// rows reach the repository root.
+    pub(crate) log_next: Option<crate::cli::log::HistoryCursor>,
     /// sha → branch names whose tips sit on that commit
     /// (tui-log-branch-decorations): HEAD's branch, its upstream, the
     /// main worktree's branch and its `origin/…` counterpart. TUI-only
-    /// decoration; valid across `tui_log_rows` window growth (tips
+    /// decoration; valid across paged log growth (tips
     /// don't move with scrolling) and rebuilt with the snapshot. NOT
     /// in `to_json`.
     pub(crate) log_decorations: std::collections::BTreeMap<String, Vec<String>>,
@@ -378,7 +385,7 @@ impl StatusSnapshot {
         let state = crate::rebuild::rebuild_repo_with_policy(repo, policy)
             .await
             .map_err(|e| anyhow::anyhow!("failed to fold repo `{}`: {e}", repo.display()))?;
-        let (log_rows, github_events) = recent_log_rows(repo, &state).await;
+        let log = recent_log_rows(repo, &state).await;
         Self::from_state(
             repo,
             basename,
@@ -386,8 +393,9 @@ impl StatusSnapshot {
             &state,
             plan_arg,
             watch_mode,
-            log_rows,
-            github_events,
+            log.rows,
+            log.github_events,
+            log.next,
         )
     }
 
@@ -400,6 +408,7 @@ impl StatusSnapshot {
         watch_mode: bool,
         log_rows: Vec<crate::cli::log::OnelineRow>,
         github_events: Vec<crate::cli::github_timeline::MergedEvent>,
+        log_next: Option<crate::cli::log::HistoryCursor>,
     ) -> anyhow::Result<Self> {
         // One ODB handle for the whole snapshot: HEAD facts, the dirty
         // walk, the commit-tag HEAD read, and every per-plan worktree
@@ -527,6 +536,8 @@ impl StatusSnapshot {
             agents,
             stash,
             log_rows,
+            log_adopted_at: state.fold.adopted_at.clone(),
+            log_next,
             github_events,
             log_decorations,
             pr_reviews: work_status.pr_reviews,
@@ -930,17 +941,20 @@ async fn run_watch(
 /// a just-finished plan's commits vanish the moment one plan was
 /// active). Best-effort: any failure yields an empty pane, never a
 /// status error.
-async fn recent_log_rows(
-    repo: &Path,
-    state: &RepoState,
-) -> (
-    Vec<crate::cli::log::OnelineRow>,
-    Vec<crate::cli::github_timeline::MergedEvent>,
-) {
+async fn recent_log_rows(repo: &Path, state: &RepoState) -> TuiLogRead {
     const LOG_WINDOW: usize = 30;
     match state.head.clone() {
-        Some(head) => log_rows_windowed(repo, &head, LOG_WINDOW).await,
-        None => (Vec::new(), Vec::new()),
+        Some(head) => {
+            log_rows_windowed(
+                repo,
+                &head,
+                LOG_WINDOW,
+                state.fold.adopted_at.as_ref(),
+                true,
+            )
+            .await
+        }
+        None => TuiLogRead::default(),
     }
 }
 
@@ -980,12 +994,24 @@ fn log_decorations(
     map
 }
 
-/// Log rows for the last `window` commits, with HEAD
-/// taken from git directly — the `--tui` pager calls this with a growing
-/// window to pull older history on demand (a fresh windowed rebuild each
-/// time, NOT an incremental fold continuation).
-pub(crate) async fn tui_log_rows(repo: &Path, window: usize) -> Vec<crate::cli::log::OnelineRow> {
-    tui_log_with_events(repo, window).await.0
+/// One bounded log read plus the cursor for the next older fixed-size page.
+#[derive(Default)]
+pub(crate) struct TuiLogRead {
+    pub(crate) rows: Vec<crate::cli::log::OnelineRow>,
+    pub(crate) github_events: Vec<crate::cli::github_timeline::MergedEvent>,
+    pub(crate) next: Option<crate::cli::log::HistoryCursor>,
+}
+
+/// One additional fixed-size page, rooted at `cursor`. Github events are
+/// carried by the initial/current-window read and are deliberately absent
+/// here, so appending a Git page cannot duplicate event rows.
+pub(crate) async fn tui_log_page(
+    repo: &Path,
+    cursor: &crate::cli::log::HistoryCursor,
+    page_size: usize,
+    adopted_at: Option<&crate::lifecycle::CommitSha>,
+) -> TuiLogRead {
+    log_rows_page(repo, cursor, page_size, adopted_at, false).await
 }
 
 /// Rows AND the index-aligned merged events — the TUI sets both on
@@ -993,13 +1019,11 @@ pub(crate) async fn tui_log_rows(repo: &Path, window: usize) -> Vec<crate::cli::
 pub(crate) async fn tui_log_with_events(
     repo: &Path,
     window: usize,
-) -> (
-    Vec<crate::cli::log::OnelineRow>,
-    Vec<crate::cli::github_timeline::MergedEvent>,
-) {
+    adopted_at: Option<&crate::lifecycle::CommitSha>,
+) -> TuiLogRead {
     match crate::cli::log::git_rev_parse(repo, "HEAD") {
-        Some(head) => log_rows_windowed(repo, &head, window).await,
-        None => (Vec::new(), Vec::new()),
+        Some(head) => log_rows_windowed(repo, &head, window, adopted_at, true).await,
+        None => TuiLogRead::default(),
     }
 }
 
@@ -1008,16 +1032,29 @@ async fn log_rows_windowed(
     repo: &Path,
     head: &crate::lifecycle::CommitSha,
     window: usize,
-) -> (
-    Vec<crate::cli::log::OnelineRow>,
-    Vec<crate::cli::github_timeline::MergedEvent>,
-) {
+    adopted_at: Option<&crate::lifecycle::CommitSha>,
+    include_github: bool,
+) -> TuiLogRead {
+    let cursor = crate::cli::log::HistoryCursor {
+        tip: head.clone(),
+        post_adoption: adopted_at.is_some(),
+    };
+    log_rows_page(repo, &cursor, window, adopted_at, include_github).await
+}
+
+async fn log_rows_page(
+    repo: &Path,
+    cursor: &crate::cli::log::HistoryCursor,
+    window: usize,
+    adopted_at: Option<&crate::lifecycle::CommitSha>,
+    include_github: bool,
+) -> TuiLogRead {
     use clank_core::repo_state::LogEvent;
 
-    let from = crate::cli::log::git_rev_parse(repo, &format!("HEAD~{window}"));
-    let Ok((_state, events)) = crate::rebuild::rebuild_from(repo, from.as_ref(), head).await else {
-        return (Vec::new(), Vec::new());
+    let Ok(history) = crate::cli::log::history_page(repo, cursor, window, adopted_at).await else {
+        return TuiLogRead::default();
     };
+    let events = history.folded;
 
     let reviewable: Vec<crate::lifecycle::CommitSha> = events
         .iter()
@@ -1034,15 +1071,23 @@ async fn log_rows_windowed(
     // Github events interleave by time, same layer as `clank log`
     // (log-timeline-github-events); read notices lead the pane as dim
     // rows — the TUI's rendering of the snapshot's diagnostics.
-    let snap = crate::cli::github_timeline::timeline_snapshot(repo);
-    let items = crate::cli::log::interleave(&newest_first, &snap.events);
+    let snap = if include_github {
+        crate::cli::github_timeline::timeline_snapshot(repo)
+    } else {
+        crate::cli::github_timeline::TimelineSnapshot::default()
+    };
+    let items = crate::cli::log::interleave_with_plain(&newest_first, &history.plain, &snap.events);
     let mut rows: Vec<crate::cli::log::OnelineRow> = snap
         .notices
         .iter()
         .map(|n| crate::cli::log::OnelineRow::Notice(n.clone()))
         .collect();
     rows.extend(crate::cli::log::oneline_items_rows(&items, &reviews));
-    (rows, snap.events)
+    TuiLogRead {
+        rows,
+        github_events: snap.events,
+        next: history.next,
+    }
 }
 
 /// Decides which filesystem events wake the status loops. This is an
@@ -1660,6 +1705,178 @@ mod dirty_and_wake_tests {
         dir
     }
 
+    fn empty_commit(repo: &Path, subject: &str) {
+        git(repo, &["commit", "--quiet", "--allow-empty", "-m", subject]);
+    }
+
+    #[tokio::test]
+    async fn unadopted_repo_history_is_plain_and_head_is_decorated() {
+        let dir = fixture_repo();
+        let repo = dir.path();
+        empty_commit(repo, "second");
+        empty_commit(repo, "third");
+        let git = crate::git_io::open(repo).unwrap();
+        let head = git.head_sha().unwrap().unwrap();
+
+        crate::rebuild::reset_fold_commit_count();
+        let history = crate::cli::log::history_window(repo, &head, 30, None)
+            .await
+            .unwrap();
+        assert!(history.folded.is_empty());
+        assert_eq!(history.plain.len(), 3);
+        assert_eq!(
+            crate::rebuild::fold_commit_count(),
+            0,
+            "plain history must never enter the fold"
+        );
+        let head_row = &history.plain[0];
+        assert_eq!(head_row.meta.sha, head);
+        assert!(head_row.refs.iter().any(|name| name == "main"));
+
+        let items = crate::cli::log::interleave_with_plain(&[], &history.plain, &[]);
+        let rows = crate::cli::log::oneline_items_rows(&items, &Default::default());
+        assert_eq!(rows.len(), 3);
+        assert!(
+            rows.iter()
+                .all(|row| matches!(row, crate::cli::log::OnelineRow::PlainCommit { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn history_splices_continuously_at_adoption_without_folding_before_it() {
+        let dir = fixture_repo();
+        let repo = dir.path();
+        empty_commit(repo, "plain two");
+        empty_commit(repo, "plain three");
+
+        std::fs::create_dir_all(repo.join(".clank/plans")).unwrap();
+        std::fs::write(repo.join(".clank/plans/foo.md"), "# foo\n").unwrap();
+        git(repo, &["add", "-A"]);
+        git(repo, &["commit", "--quiet", "-m", "[foo] intro"]);
+        empty_commit(repo, "post one");
+        empty_commit(repo, "post two");
+
+        let state = crate::rebuild::rebuild_repo(repo).await.unwrap();
+        let adopted_at = state.fold.adopted_at.clone().expect("adoption sha");
+        let git = crate::git_io::open(repo).unwrap();
+        let head = git.head_sha().unwrap().unwrap();
+        let expected: Vec<_> = git
+            .first_parent_page_to(&head, 30)
+            .unwrap()
+            .into_iter()
+            .map(|commit| commit.sha)
+            .collect();
+
+        crate::rebuild::reset_fold_commit_count();
+        let history = crate::cli::log::history_window(repo, &head, 30, Some(&adopted_at))
+            .await
+            .unwrap();
+        assert_eq!(history.plain.len(), 3);
+        assert_eq!(history.folded.len(), 3);
+        assert_eq!(
+            crate::rebuild::fold_commit_count(),
+            3,
+            "only adoption and newer commits are folded"
+        );
+
+        let folded: Vec<&clank_core::repo_state::LogEvent> = history.folded.iter().rev().collect();
+        let items = crate::cli::log::interleave_with_plain(&folded, &history.plain, &[]);
+        let rows = crate::cli::log::oneline_items_rows(&items, &Default::default());
+        let actual: Vec<_> = rows
+            .iter()
+            .filter_map(|row| match row {
+                crate::cli::log::OnelineRow::Commit { sha, .. }
+                | crate::cli::log::OnelineRow::PlainCommit { sha, .. } => Some(sha.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(actual, expected, "no gap or duplicate at the seam");
+
+        crate::rebuild::reset_fold_commit_count();
+        let seam_page = crate::cli::log::history_window(repo, &head, 4, Some(&adopted_at))
+            .await
+            .unwrap();
+        let older_cursor = seam_page.next.as_ref().expect("plain page after seam");
+        assert!(!older_cursor.post_adoption);
+        let older = crate::cli::log::history_page(repo, older_cursor, 4, Some(&adopted_at))
+            .await
+            .unwrap();
+        assert!(older.folded.is_empty());
+        assert_eq!(older.plain.len(), 2);
+        assert_eq!(
+            crate::rebuild::fold_commit_count(),
+            3,
+            "paging beyond the seam must not perform another fold"
+        );
+    }
+
+    #[tokio::test]
+    async fn plain_page_cost_does_not_grow_with_repository_age() {
+        async fn read(depth: usize) -> (usize, usize) {
+            let dir = fixture_repo();
+            for i in 1..depth {
+                empty_commit(dir.path(), &format!("plain {i}"));
+            }
+            let git = crate::git_io::open(dir.path()).unwrap();
+            let head = git.head_sha().unwrap().unwrap();
+            crate::rebuild::reset_fold_commit_count();
+            let history = crate::cli::log::history_window(dir.path(), &head, 5, None)
+                .await
+                .unwrap();
+            (history.plain.len(), crate::rebuild::fold_commit_count())
+        }
+
+        assert_eq!(read(8).await, (5, 0));
+        assert_eq!(read(80).await, (5, 0));
+    }
+
+    #[tokio::test]
+    async fn plain_paging_reads_disjoint_fixed_size_batches() {
+        let dir = fixture_repo();
+        for i in 1..12 {
+            empty_commit(dir.path(), &format!("plain {i}"));
+        }
+        let git = crate::git_io::open(dir.path()).unwrap();
+        let head = git.head_sha().unwrap().unwrap();
+
+        crate::rebuild::reset_fold_commit_count();
+        let first = crate::cli::log::history_window(dir.path(), &head, 5, None)
+            .await
+            .unwrap();
+        let second = crate::cli::log::history_page(
+            dir.path(),
+            first.next.as_ref().expect("older page"),
+            5,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!((first.plain.len(), second.plain.len()), (5, 5));
+        let first_shas: std::collections::BTreeSet<_> = first
+            .plain
+            .iter()
+            .map(|commit| commit.meta.sha.clone())
+            .collect();
+        assert!(
+            second
+                .plain
+                .iter()
+                .all(|commit| !first_shas.contains(&commit.meta.sha)),
+            "the second page must not reread the first"
+        );
+        assert_eq!(crate::rebuild::fold_commit_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn unborn_repo_has_no_log_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        git(dir.path(), &["init", "--quiet", "-b", "main"]);
+        let read = tui_log_with_events(dir.path(), 30, None).await;
+        assert!(read.rows.is_empty());
+        assert!(read.github_events.is_empty());
+        assert!(read.next.is_none());
+    }
+
     #[tokio::test]
     async fn status_shows_adhoc_commits_with_one_active_plan() {
         // show-adhoc-commits-in-status (reproduce-first): with exactly
@@ -2109,6 +2326,8 @@ mod dirty_and_wake_tests {
             agents: Vec::new(),
             stash: Vec::new(),
             log_rows: Vec::new(),
+            log_adopted_at: None,
+            log_next: None,
             github_events: Vec::new(),
             log_decorations: Default::default(),
             pr_reviews: Vec::new(),

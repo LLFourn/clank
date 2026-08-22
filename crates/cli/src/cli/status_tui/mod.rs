@@ -942,6 +942,8 @@ struct LogView {
     offset: usize,
     /// Log fetch-window size; grows on demand until `complete`.
     window: usize,
+    /// Cursor for the next older fixed-size page.
+    next: Option<crate::cli::log::HistoryCursor>,
     /// The fetch reached the root — stop growing.
     complete: bool,
     /// This pass may do the top-up IO. Set by input/data/resize, cleared
@@ -955,6 +957,7 @@ impl LogView {
             cursor: 0,
             offset: 0,
             window: 30,
+            next: None,
             complete: false,
             fill: true,
         }
@@ -1014,6 +1017,14 @@ impl LogView {
 fn enforce_panel_tops_log(mode: Mode, log: &mut LogView) {
     if !matches!(mode, Mode::LogScroll) {
         log.enter_first();
+    }
+}
+
+fn initial_mode(snapshot: &StatusSnapshot) -> Mode {
+    if snapshot.log_rows.is_empty() && snapshot.blocks.is_empty() && !snapshot.agents.is_empty() {
+        Mode::AgentPanel { sel: 0 }
+    } else {
+        Mode::LogScroll
     }
 }
 
@@ -1437,18 +1448,20 @@ pub(crate) async fn run_tui(
     // send, not zellij work (tui-reconcile-off-loop).
     reconcile_worker.observe(&snapshot);
     // The log viewport — cursor, derived offset, and the on-demand fetch
-    // window. The log grows via fresh, larger windowed rebuilds (the fold
-    // replays from a base, so this is re-fetch-bigger, not incremental):
-    // keep at least `offset + viewport` rows loaded, which both fills a
-    // tall pane on first paint and pages in older rows as you scroll. See
+    // window. Older history is appended in fixed-size pages from `next`;
+    // already loaded commits are not reread merely because the cursor moved.
+    // Keep at least `offset + viewport` rows loaded, which both fills a tall
+    // pane on first paint and pages in older rows as you scroll. See
     // [`LogView`] for the invariants its methods enforce.
     let mut log = LogView::new();
+    log.next = snapshot.log_next.clone();
+    log.complete = log.next.is_none();
     // The document overlay, when open (Enter on a log entry): a commit's
     // detail or a plan's rendered markdown.
     let mut detail: Option<Overlay> = None;
     // Which region owns the keyboard. Starts on the log; Tab moves it to
     // the agent panel. The single source of key-routing truth.
-    let mut mode = Mode::LogScroll;
+    let mut mode = initial_mode(&snapshot);
     // The "+ add" candidate list — read FRESH from the global library
     // the moment the picker opens (never cached, so a `clank agent add
     // --global` elsewhere shows up at once), referenced by index while
@@ -1640,17 +1653,35 @@ pub(crate) async fn run_tui(
         if log.fill {
             let want = (log.offset + rows as usize).max(log.cursor + 1);
             while !log.complete && head + snapshot.log_rows.len() < want {
-                log.window += (rows as usize).max(1);
-                let before = snapshot.log_rows.len();
-                snapshot.log_rows = crate::cli::status::tui_log_rows(&repo, log.window).await;
-                if snapshot.log_rows.len() == before {
-                    log.complete = true; // hit the root — stop growing
-                }
+                let page_size = (rows as usize).max(1);
+                let Some(tip) = log.next.clone() else {
+                    log.complete = true;
+                    break;
+                };
+                let page = crate::cli::status::tui_log_page(
+                    &repo,
+                    &tip,
+                    page_size,
+                    snapshot.log_adopted_at.as_ref(),
+                )
+                .await;
+                log.window += page_size;
+                log.next = page.next.clone();
+                snapshot.log_next = page.next;
+                snapshot.log_rows.extend(page.rows);
+                log.complete = log.next.is_none();
             }
             log.fill = false;
         }
 
         let total = head + snapshot.log_rows.len();
+        if total == 0 && matches!(mode, Mode::LogScroll) && !snapshot.agents.is_empty() {
+            // An unborn repository has no timeline entry to select. Keep
+            // focus on the real panel instead of presenting a cursor in an
+            // empty region.
+            mode = Mode::AgentPanel { sel: 0 };
+            continue;
+        }
         // Pressure lift (tui-short-pane-whole-scroll): in a short pane a
         // focused log keeps a working viewport by lifting scrollable
         // header rows off the top, growing with the cursor's descent so
@@ -1885,13 +1916,17 @@ pub(crate) async fn run_tui(
                             ) {
                                 PanelAction::Quit => break 'evloop,
                                 PanelAction::LeaveFocus => {
-                                    mode = mode.toggle_focus(snapshot.agents.len())
+                                    if total > 0 {
+                                        mode = mode.toggle_focus(snapshot.agents.len())
+                                    }
                                 }
                                 PanelAction::MoveCursor(s) => mode = Mode::AgentPanel { sel: s },
                                 PanelAction::EnterLog => {
-                                    // Cross into the log at the FIRST entry.
-                                    log.enter_first();
-                                    mode = Mode::LogScroll;
+                                    if total > 0 {
+                                        // Cross into the log at the FIRST entry.
+                                        log.enter_first();
+                                        mode = Mode::LogScroll;
+                                    }
                                 }
                                 PanelAction::ToggleAuto(i) => {
                                     if let Some(row) = snapshot.agents.get(i) {
@@ -2604,15 +2639,22 @@ pub(crate) async fn run_tui(
                 .map_err(|e| format!("{e:#}"));
                 // Restore the user's scroll depth and re-open paging in
                 // case history grew; the loop top tops up the viewport.
-                let (fresh_rows, fresh_events) =
-                    crate::cli::status::tui_log_with_events(&repo, log.window).await;
+                let adopted_at = rebuilt
+                    .as_ref()
+                    .ok()
+                    .and_then(|fresh| fresh.log_adopted_at.as_ref())
+                    .or(snapshot.log_adopted_at.as_ref());
+                let fresh =
+                    crate::cli::status::tui_log_with_events(&repo, log.window, adopted_at).await;
                 let refresh_ok =
-                    apply_refresh(&mut snapshot, fresh_rows, rebuilt, &mut refresh_failures);
+                    apply_refresh(&mut snapshot, fresh.rows, rebuilt, &mut refresh_failures);
                 // Rows and events must come from the SAME read —
                 // event_idx targets this list (set after apply so a
                 // replaced snapshot's own build-time read never
                 // misaligns them; the kept-frame arm needs them too).
-                snapshot.github_events = fresh_events;
+                snapshot.github_events = fresh.github_events;
+                snapshot.log_next = fresh.next.clone();
+                log.next = fresh.next;
                 if refresh_ok {
                     last_sig = sig;
                     refresh_retry_at = None;
@@ -2621,7 +2663,7 @@ pub(crate) async fn run_tui(
                         Some(std::time::Instant::now() + retry_delay(refresh_failures));
                 }
                 reconcile_worker.observe(&snapshot);
-                log.complete = false;
+                log.complete = log.next.is_none();
                 log.request_fill();
                 if keep_picker {
                     picker =
@@ -2804,6 +2846,28 @@ pub(crate) async fn run_tui(
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[test]
+    fn empty_log_refuses_log_focus() {
+        let snapshot = crate::cli::status_tui::fixtures::two_agent_snap();
+        assert!(matches!(
+            super::initial_mode(&snapshot),
+            super::Mode::AgentPanel { sel: 0 }
+        ));
+
+        let mut with_history = snapshot;
+        with_history
+            .log_rows
+            .push(crate::cli::log::OnelineRow::PlainCommit {
+                sha: crate::lifecycle::CommitSha::parse(&format!("{:0<40}", "abc")).unwrap(),
+                subject: "first".into(),
+                refs: vec!["main".into()],
+            });
+        assert!(matches!(
+            super::initial_mode(&with_history),
+            super::Mode::LogScroll
+        ));
+    }
+
     fn mk_member(
         agent: &str,
         seq: u64,

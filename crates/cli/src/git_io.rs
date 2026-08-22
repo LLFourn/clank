@@ -536,6 +536,78 @@ impl Repo {
         first_parent_walk(&self.0, None, tip_oid, CONTEXT)
     }
 
+    /// First-parent commits in `(base, tip]`, oldest first, on this
+    /// already-open handle.
+    pub fn first_parent_commits_between(
+        &self,
+        base: &CommitSha,
+        tip: &CommitSha,
+    ) -> Result<Vec<CommitMeta>, GitIoError> {
+        const CONTEXT: &str = "first_parent_commits_between";
+        let base_oid =
+            gix::ObjectId::from_hex(base.as_str().as_bytes()).map_err(|e| GitIoError::Parse {
+                context: CONTEXT.into(),
+                detail: format!("base oid hex: {e}"),
+            })?;
+        let tip_oid =
+            gix::ObjectId::from_hex(tip.as_str().as_bytes()).map_err(|e| GitIoError::Parse {
+                context: CONTEXT.into(),
+                detail: format!("tip oid hex: {e}"),
+            })?;
+        first_parent_walk(&self.0, Some(base_oid), tip_oid, CONTEXT)
+    }
+
+    /// At most `limit` commits from `tip` down its first-parent chain,
+    /// newest first. Unlike [`first_parent_commits_to`](Self::first_parent_commits_to),
+    /// this stops the revision iterator as soon as the requested page is
+    /// full, so its work is independent of history behind that page.
+    pub fn first_parent_page_to(
+        &self,
+        tip: &CommitSha,
+        limit: usize,
+    ) -> Result<Vec<CommitMeta>, GitIoError> {
+        const CONTEXT: &str = "first_parent_page_to";
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let tip_oid =
+            gix::ObjectId::from_hex(tip.as_str().as_bytes()).map_err(|e| GitIoError::Parse {
+                context: CONTEXT.into(),
+                detail: format!("tip oid hex: {e}"),
+            })?;
+        let walk_err = |e: &dyn std::fmt::Display, stage: &str| GitIoError::Gix {
+            context: CONTEXT.to_string(),
+            detail: format!("{stage}: {e}"),
+        };
+        let walk = self
+            .0
+            .rev_walk([tip_oid])
+            .first_parent_only()
+            .all()
+            .map_err(|e| walk_err(&e, "rev_walk"))?;
+        let mut out = Vec::with_capacity(limit);
+        for info in walk.take(limit) {
+            let info = info.map_err(|e| walk_err(&e, "walk iter"))?;
+            let commit = info.object().map_err(|e| walk_err(&e, "info.object"))?;
+            let author = commit.author().map_err(|e| walk_err(&e, "commit.author"))?;
+            let author_ts = author
+                .time()
+                .map_err(|e| walk_err(&e, "author.time parse"))?
+                .seconds;
+            let subject = commit
+                .message()
+                .map_err(|e| walk_err(&e, "commit.message"))?
+                .summary()
+                .to_string();
+            out.push(CommitMeta {
+                sha: parse_sha(CONTEXT, &info.id.to_string())?,
+                author_ts,
+                subject,
+            });
+        }
+        Ok(out)
+    }
+
     /// Structured changes for `sha` against its first parent (or the
     /// empty tree for the root commit), translated into a
     /// `CommitChanges`.
@@ -1093,6 +1165,32 @@ impl Repo {
                 Some((n.clone(), sha))
             })
             .collect()
+    }
+
+    /// Every real ref tip in the repository, peeled and shortened for
+    /// display (`main`, `origin/main`, `v1.2.3`). Broken refs are skipped.
+    /// This is one bounded ref-table scan per history read, never one lookup
+    /// per commit.
+    pub fn all_ref_tips(&self) -> Vec<(String, CommitSha)> {
+        let Ok(platform) = self.0.references() else {
+            return Vec::new();
+        };
+        let Ok(iter) = platform.all() else {
+            return Vec::new();
+        };
+        let Ok(iter) = iter.peeled() else {
+            return Vec::new();
+        };
+        let mut out: Vec<(String, CommitSha)> = iter
+            .filter_map(|reference| {
+                let reference = reference.ok()?;
+                let sha = CommitSha::parse(&reference.try_id()?.detach().to_string()).ok()?;
+                Some((reference.name().shorten().to_string(), sha))
+            })
+            .collect();
+        out.sort();
+        out.dedup();
+        out
     }
 }
 

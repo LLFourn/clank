@@ -80,7 +80,16 @@ impl RepoState {
             hasher.update(ev.sha.as_str().as_bytes());
             hasher.update(b",");
         }
-        hasher.update(b"]\nfold.warnings[");
+        hasher.update(b"]\nfold.adopted_at=");
+        hasher.update(
+            self.fold
+                .adopted_at
+                .as_ref()
+                .map(|sha| sha.as_str())
+                .unwrap_or("")
+                .as_bytes(),
+        );
+        hasher.update(b"\nfold.warnings[");
         for w in &self.fold.warnings {
             hasher.update(w.sha.as_str().as_bytes());
             hasher.update(b":");

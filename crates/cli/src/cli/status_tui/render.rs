@@ -636,6 +636,17 @@ pub(super) fn log_row_spans(
             spans
         }
         OnelineRow::Notice(n) => vec![dim(format!("({n})"))],
+        OnelineRow::PlainCommit { sha, subject, refs } => {
+            let mut spans = vec![
+                plain(" ".to_string()),
+                dim(format!(" {} ", &sha.as_str()[..7])),
+                plain(subject.clone()),
+            ];
+            if !refs.is_empty() {
+                spans.push(dim(format!(" ({})", refs.join(", "))));
+            }
+            spans
+        }
         OnelineRow::Commit {
             sha,
             subject,

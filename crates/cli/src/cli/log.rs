@@ -8,6 +8,7 @@ use std::path::Path;
 use super::{LogArgs, repo_basename, resolve_repo};
 use crate::cli::plan_resolve::parse_arg;
 use crate::feedback_scan::scan_feedback;
+use crate::git_io::CommitMeta;
 use crate::lifecycle::{CommitSha, PlanKey};
 use clank_core::repo_state::LogEvent;
 use clank_core::vocab::Verdict;
@@ -41,9 +42,35 @@ pub async fn run(args: LogArgs) -> anyhow::Result<()> {
         }
     };
 
-    let (_state, log_events) = crate::rebuild::rebuild_from(&repo, from.as_ref(), &to)
+    let state = crate::rebuild::rebuild_repo(&repo)
         .await
-        .map_err(|e| anyhow::anyhow!("failed to fold range: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("failed to rebuild repo: {e}"))?;
+    let git = crate::git_io::open(&repo)?;
+    let mut page = match from.as_ref() {
+        Some(base) => git.first_parent_commits_between(base, &to)?,
+        None if args.range.is_none() && args.limit > 0 => {
+            git.first_parent_page_to(&to, args.limit)?
+        }
+        None => {
+            let mut all = git.first_parent_commits_to(&to)?;
+            all.reverse();
+            all
+        }
+    };
+    // Range reads return oldest-first; bounded pages are already newest-first.
+    if from.is_some() {
+        page.reverse();
+    }
+    let adopted_at = state.fold.adopted_at.as_ref();
+    let tip_post_adoption = match adopted_at {
+        None => false,
+        Some(_) if state.head.as_ref() == Some(&to) => true,
+        Some(adopted) => git
+            .first_parent_chain_find(&to, &std::iter::once(adopted.clone()).collect())?
+            .is_some(),
+    };
+    let history = history_from_page(&repo, &git, &to, page, adopted_at, tip_post_adoption).await?;
+    let log_events = history.folded;
 
     let filtered: Vec<&LogEvent> = log_events
         .iter()
@@ -70,14 +97,19 @@ pub async fn run(args: LogArgs) -> anyhow::Result<()> {
             snap.events
         };
 
-    if filtered.is_empty() && gh_events.is_empty() {
+    if filtered.is_empty() && history.plain.is_empty() && gh_events.is_empty() {
         println!("no log events");
         return Ok(());
     }
 
     // Most recent first (git log convention).
     let filtered: Vec<&LogEvent> = filtered.into_iter().rev().collect();
-    let items = interleave(&filtered, &gh_events);
+    let plain: &[PlainCommit] = if plan_filter.is_none() {
+        &history.plain
+    } else {
+        &[]
+    };
+    let items = interleave_with_plain(&filtered, plain, &gh_events);
 
     let reviewable_shas: Vec<CommitSha> = filtered
         .iter()
@@ -99,10 +131,143 @@ pub async fn run(args: LogArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PlainCommit {
+    pub(crate) meta: CommitMeta,
+    pub(crate) refs: Vec<String>,
+}
+
+pub(crate) struct HistoryWindow {
+    pub(crate) folded: Vec<LogEvent>,
+    pub(crate) plain: Vec<PlainCommit>,
+    /// First commit of the next older page, or `None` at the root.
+    pub(crate) next: Option<HistoryCursor>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HistoryCursor {
+    pub(crate) tip: CommitSha,
+    /// Whether `tip` is at or after the adoption commit. Once a page crosses
+    /// the seam this stays false, avoiding an ancestry walk on every older
+    /// page.
+    pub(crate) post_adoption: bool,
+}
+
+/// Read one requested first-parent page and split it at the durable adoption
+/// boundary. The Git page is already bounded by its caller. Only the newer
+/// side enters the fold; older commits become plain rows directly.
+#[cfg(test)]
+pub(crate) async fn history_window(
+    repo: &Path,
+    head: &CommitSha,
+    limit: usize,
+    adopted_at: Option<&CommitSha>,
+) -> anyhow::Result<HistoryWindow> {
+    let cursor = HistoryCursor {
+        tip: head.clone(),
+        post_adoption: adopted_at.is_some(),
+    };
+    history_page(repo, &cursor, limit, adopted_at).await
+}
+
+pub(crate) async fn history_page(
+    repo: &Path,
+    cursor: &HistoryCursor,
+    limit: usize,
+    adopted_at: Option<&CommitSha>,
+) -> anyhow::Result<HistoryWindow> {
+    let git = crate::git_io::open(repo)?;
+    let page = git.first_parent_page_to(&cursor.tip, limit)?;
+    history_from_page(
+        repo,
+        &git,
+        &cursor.tip,
+        page,
+        adopted_at,
+        cursor.post_adoption,
+    )
+    .await
+}
+
+async fn history_from_page(
+    repo: &Path,
+    git: &crate::git_io::Repo,
+    tip: &CommitSha,
+    page: Vec<CommitMeta>,
+    adopted_at: Option<&CommitSha>,
+    tip_post_adoption: bool,
+) -> anyhow::Result<HistoryWindow> {
+    if page.is_empty() {
+        return Ok(HistoryWindow {
+            folded: Vec::new(),
+            plain: Vec::new(),
+            next: None,
+        });
+    }
+
+    let next_tip = git.parent_of(&page.last().expect("non-empty page").sha)?;
+
+    let (folded_page, plain_page, next_post_adoption) = match adopted_at {
+        None => (Vec::new(), page, false),
+        Some(adopted) if tip_post_adoption => {
+            if let Some(seam) = page.iter().position(|commit| &commit.sha == adopted) {
+                let mut folded = page;
+                let plain = folded.split_off(seam + 1);
+                (folded, plain, false)
+            } else {
+                // `tip` is post-adoption and the boundary is older than this
+                // page, so every requested commit belongs to the fold side.
+                (page, Vec::new(), true)
+            }
+        }
+        Some(_) => (Vec::new(), page, false),
+    };
+
+    let folded = match (adopted_at, folded_page.last()) {
+        (Some(adopted), Some(oldest)) => {
+            let from = git.parent_of(&oldest.sha)?;
+            let (_, events) = crate::rebuild::rebuild_from_adoption_with_git(
+                repo,
+                git,
+                from.as_ref(),
+                tip,
+                adopted,
+            )?;
+            events
+        }
+        _ => Vec::new(),
+    };
+
+    let mut refs_by_sha: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for (name, sha) in git.all_ref_tips() {
+        refs_by_sha
+            .entry(sha.as_str().to_string())
+            .or_default()
+            .push(name);
+    }
+    let plain = plain_page
+        .into_iter()
+        .map(|meta| PlainCommit {
+            refs: refs_by_sha.remove(meta.sha.as_str()).unwrap_or_default(),
+            meta,
+        })
+        .collect();
+    Ok(HistoryWindow {
+        folded,
+        plain,
+        next: next_tip.map(|tip| HistoryCursor {
+            tip,
+            post_adoption: next_post_adoption,
+        }),
+    })
+}
+
 /// One interleaved timeline entry: a fold event or a merged github
 /// event (log-timeline-github-events).
 pub(crate) enum TimelineItem<'a> {
     Repo(&'a LogEvent),
+    Plain(&'a PlainCommit),
     Github(usize, &'a crate::cli::github_timeline::MergedEvent),
 }
 
@@ -122,11 +287,23 @@ fn event_ts(e: &LogEvent) -> i64 {
 /// all); newer-than-newest ones lead the view — a just-arrived event
 /// is exactly what the reader wants on top. `gh` arrives
 /// oldest-first (the snapshot's order).
+#[cfg(test)]
 pub(crate) fn interleave<'a>(
     events: &[&'a LogEvent],
     gh: &'a [crate::cli::github_timeline::MergedEvent],
 ) -> Vec<TimelineItem<'a>> {
-    let floor: Option<i64> = events.last().map(|e| event_ts(e));
+    interleave_with_plain(events, &[], gh)
+}
+
+pub(crate) fn interleave_with_plain<'a>(
+    events: &[&'a LogEvent],
+    plain: &'a [PlainCommit],
+    gh: &'a [crate::cli::github_timeline::MergedEvent],
+) -> Vec<TimelineItem<'a>> {
+    let floor = plain
+        .last()
+        .map(|p| p.meta.author_ts)
+        .or_else(|| events.last().map(|e| event_ts(e)));
     // The carried index is the ORIGINAL snapshot position — captured
     // by enumerate BEFORE the floor filter and the reversal, so the
     // displayed row and the event it opens share identity (codex
@@ -140,11 +317,23 @@ pub(crate) fn interleave<'a>(
         })
         .collect();
     gh_desc.reverse();
-    let mut out = Vec::with_capacity(events.len() + gh_desc.len());
+    let mut history: Vec<TimelineItem<'a>> = events
+        .iter()
+        .map(|event| TimelineItem::Repo(*event))
+        .collect();
+    history.extend(plain.iter().map(TimelineItem::Plain));
+    let mut out = Vec::with_capacity(history.len() + gh_desc.len());
     let (mut i, mut j) = (0usize, 0usize);
-    while i < events.len() || j < gh_desc.len() {
-        let take_gh = match (events.get(i), gh_desc.get(j)) {
-            (Some(e), Some((_, g))) => i64::try_from(g.at).unwrap_or(i64::MAX) >= event_ts(e),
+    while i < history.len() || j < gh_desc.len() {
+        let history_ts = |item: &TimelineItem<'_>| match item {
+            TimelineItem::Repo(event) => event_ts(event),
+            TimelineItem::Plain(commit) => commit.meta.author_ts,
+            TimelineItem::Github(_, event) => i64::try_from(event.at).unwrap_or(i64::MAX),
+        };
+        let take_gh = match (history.get(i), gh_desc.get(j)) {
+            (Some(item), Some((_, g))) => {
+                i64::try_from(g.at).unwrap_or(i64::MAX) >= history_ts(item)
+            }
             (None, Some(_)) => true,
             _ => false,
         };
@@ -153,7 +342,11 @@ pub(crate) fn interleave<'a>(
             out.push(TimelineItem::Github(orig_idx, g));
             j += 1;
         } else {
-            out.push(TimelineItem::Repo(events[i]));
+            out.push(match history[i] {
+                TimelineItem::Repo(event) => TimelineItem::Repo(event),
+                TimelineItem::Plain(commit) => TimelineItem::Plain(commit),
+                TimelineItem::Github(_, _) => unreachable!("history contains no github rows"),
+            });
             i += 1;
         }
     }
@@ -314,6 +507,29 @@ fn print_human(items: &[TimelineItem], repo: &Path, shas: &[CommitSha]) -> anyho
     for item in items {
         match item {
             TimelineItem::Repo(e) => chunk.push(e),
+            TimelineItem::Plain(commit) => {
+                print_human_events(&chunk, repo, &reviews, c, &mut started)?;
+                chunk.clear();
+                if started {
+                    println!();
+                }
+                started = true;
+                let (author, date, body) = commit_info(repo, &commit.meta.sha);
+                if c {
+                    println!("{Y}commit {}{Z}", commit.meta.sha.as_str());
+                } else {
+                    println!("commit {}", commit.meta.sha.as_str());
+                }
+                println!("Author: {author}");
+                println!("Date:   {date}");
+                if !commit.refs.is_empty() {
+                    println!("Refs:   {}", commit.refs.join(", "));
+                }
+                println!();
+                for line in body.lines() {
+                    println!("    {line}");
+                }
+            }
             TimelineItem::Github(_, g) => {
                 print_human_events(&chunk, repo, &reviews, c, &mut started)?;
                 chunk.clear();
@@ -539,6 +755,14 @@ pub(crate) enum OnelineRow {
         /// commit — `⚑`), or `Plain`.
         marker: RowMarker,
     },
+    /// A pre-adoption Git commit. It is intentionally a distinct row kind:
+    /// no plan umbrella, marker, reviews, or fold attribution can attach to
+    /// it accidentally.
+    PlainCommit {
+        sha: CommitSha,
+        subject: String,
+        refs: Vec<String>,
+    },
     Review {
         verdict: Verdict,
         author: String,
@@ -575,6 +799,15 @@ pub(crate) fn oneline_items_rows(
     for item in items {
         match item {
             TimelineItem::Repo(e) => chunk.push(e),
+            TimelineItem::Plain(commit) => {
+                out.extend(oneline_rows(&chunk, reviews));
+                chunk.clear();
+                out.push(OnelineRow::PlainCommit {
+                    sha: commit.meta.sha.clone(),
+                    subject: commit.meta.subject.clone(),
+                    refs: commit.refs.clone(),
+                });
+            }
             TimelineItem::Github(idx, g) => {
                 out.extend(oneline_rows(&chunk, reviews));
                 chunk.clear();
@@ -597,7 +830,7 @@ pub(crate) fn oneline_items_rows(
 /// pane re-rendering every refresh.
 ///
 /// `events` are NEWEST-FIRST (the git-log convention every caller —
-/// `print_oneline`, the status TUI's `tui_log_rows` — uses); that
+/// `print_oneline`, the status TUI's paged log reader — uses); that
 /// order is what `umbrella_sections` folds ad-hoc commits by.
 pub(crate) fn oneline_rows(
     events: &[&LogEvent],
@@ -706,6 +939,14 @@ pub(crate) fn oneline_plain_lines(rows: &[OnelineRow]) -> Vec<String> {
                 format!("gh {line}{mark}")
             }
             OnelineRow::Notice(n) => format!("({n})"),
+            OnelineRow::PlainCommit { sha, subject, refs } => {
+                let refs = if refs.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", refs.join(", "))
+                };
+                format!("  {} {subject}{refs}", short(sha))
+            }
             // The 1-col marker icon LEADS every commit row (finish/impl/
             // planning/adhoc), then the sha, then the subject. Fixed width
             // keeps subjects column-aligned.
@@ -740,6 +981,28 @@ fn print_oneline(items: &[TimelineItem], repo: &Path, shas: &[CommitSha]) -> any
     for item in items {
         match item {
             TimelineItem::Repo(e) => chunk.push(e),
+            TimelineItem::Plain(commit) => {
+                print_oneline_events(&chunk, &reviews, c);
+                chunk.clear();
+                let refs = if commit.refs.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", commit.refs.join(", "))
+                };
+                if c {
+                    println!(
+                        "  {Y}{}{Z} {}{refs}",
+                        short(&commit.meta.sha),
+                        commit.meta.subject
+                    );
+                } else {
+                    println!(
+                        "  {} {}{refs}",
+                        short(&commit.meta.sha),
+                        commit.meta.subject
+                    );
+                }
+            }
             TimelineItem::Github(_, g) => {
                 print_oneline_events(&chunk, &reviews, c);
                 chunk.clear();
@@ -773,7 +1036,7 @@ fn print_oneline_events(
         match row {
             // oneline_rows never produces these; the interleaving
             // caller prints github rows itself.
-            OnelineRow::Github { .. } | OnelineRow::Notice(_) => {}
+            OnelineRow::Github { .. } | OnelineRow::Notice(_) | OnelineRow::PlainCommit { .. } => {}
             OnelineRow::Header { plan } => {
                 let name = plan.unwrap_or_else(|| "adhoc".to_string());
                 if c {
@@ -864,6 +1127,13 @@ enum LogJsonRow<'a> {
         ts: i64,
         subject: &'a str,
     },
+    #[serde(rename = "git-commit")]
+    Plain {
+        sha: &'a str,
+        ts: i64,
+        subject: &'a str,
+        refs: &'a [String],
+    },
     #[serde(rename = "review")]
     Review {
         sha: &'a str,
@@ -910,6 +1180,16 @@ fn json_items<'a>(
     for item in items {
         match item {
             TimelineItem::Repo(e) => chunk.push(e),
+            TimelineItem::Plain(commit) => {
+                out.extend(json_rows(&chunk, reviews));
+                chunk.clear();
+                out.push(LogJsonRow::Plain {
+                    sha: commit.meta.sha.as_str(),
+                    ts: commit.meta.author_ts,
+                    subject: &commit.meta.subject,
+                    refs: &commit.refs,
+                });
+            }
             TimelineItem::Github(_, g) => {
                 out.extend(json_rows(&chunk, reviews));
                 chunk.clear();
@@ -1255,6 +1535,16 @@ mod json_output_tests {
                 })
                 .unwrap(),
                 serde_json::json!({"kind":"review","sha":"abc","author":"codex","verdict":Verdict::Continue}),
+            ),
+            (
+                serde_json::to_value(LogJsonRow::Plain {
+                    sha: "abc",
+                    ts: 5,
+                    subject: "before clank",
+                    refs: &["main".to_string()],
+                })
+                .unwrap(),
+                serde_json::json!({"kind":"git-commit","sha":"abc","ts":5,"subject":"before clank","refs":["main"]}),
             ),
         ];
         for (got, want) in cases {

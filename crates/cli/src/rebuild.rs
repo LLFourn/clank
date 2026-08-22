@@ -52,6 +52,19 @@ fn find_base_checkpoint(
     git: &git_io::Repo,
     target: &CommitSha,
 ) -> Option<(state_cache::CheckpointRef, RepoState)> {
+    find_base_checkpoint_matching(repo_root, git, target, false)
+}
+
+/// The normal checkpoint lookup, optionally refusing pre-adoption
+/// snapshots. History rendering uses the latter mode so its fallback can
+/// start exactly at the adoption floor instead of replaying old Git-only
+/// commits through the fold.
+fn find_base_checkpoint_matching(
+    repo_root: &Path,
+    git: &git_io::Repo,
+    target: &CommitSha,
+    require_adopted: bool,
+) -> Option<(state_cache::CheckpointRef, RepoState)> {
     let mut checkpoints = state_cache::list_checkpoints(repo_root);
     // A corrupt hit is deleted by try_load; retry against the
     // remaining candidates rather than giving up the whole lookup.
@@ -76,7 +89,12 @@ fn find_base_checkpoint(
         let pos = checkpoints.iter().position(|c| c.sha == hit)?;
         let cp = checkpoints.remove(pos);
         match state_cache::try_load(repo_root, &cp) {
-            Ok(Some(state)) => return Some((cp, state)),
+            Ok(Some(state)) if !require_adopted || state.fold.adopted => {
+                return Some((cp, state));
+            }
+            // Adoption is monotonic. Once the newest on-chain candidate is
+            // pre-adoption, every older candidate is too.
+            Ok(Some(_)) => return None,
             Ok(None) => {}
             Err(e) => {
                 tracing::warn!(
@@ -89,6 +107,21 @@ fn find_base_checkpoint(
         }
         checkpoints.retain(|c| c.sha != cp.sha);
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static FOLD_COMMIT_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_fold_commit_count() {
+    FOLD_COMMIT_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn fold_commit_count() -> usize {
+    FOLD_COMMIT_COUNT.with(std::cell::Cell::get)
 }
 
 /// A checkpoint a fold PROPOSES persisting: the folded [`RepoState`]
@@ -127,6 +160,8 @@ fn fold_events(
     let mut checkpoints = Vec::new();
     let mut depth = base_depth;
     for event in events {
+        #[cfg(test)]
+        FOLD_COMMIT_COUNT.with(|count| count.set(count.get() + 1));
         let sha = event.commit.clone();
         log_events.extend(apply_commit(state, &event));
         depth += 1;
@@ -206,12 +241,54 @@ pub async fn rebuild_from(
     from: Option<&CommitSha>,
     to: &CommitSha,
 ) -> Result<(RepoState, Vec<LogEvent>), RebuildError> {
+    rebuild_from_floor(repo_root, from, to, None, false)
+}
+
+/// Range fold whose empty-state fallback starts at the parent of
+/// `adopted_at`, not the repository root. Only adopted checkpoints may
+/// resume it. Consequently every commit entering this fold is at or after
+/// adoption, even when the requested Git page extends into arbitrarily old
+/// pre-adoption history.
+pub(crate) fn rebuild_from_adoption_with_git(
+    repo_root: &Path,
+    git: &git_io::Repo,
+    from: Option<&CommitSha>,
+    to: &CommitSha,
+    adopted_at: &CommitSha,
+) -> Result<(RepoState, Vec<LogEvent>), RebuildError> {
+    let floor = git.parent_of(adopted_at)?;
+    rebuild_from_floor_with_git(repo_root, git, from, to, floor.as_ref(), true)
+}
+
+fn rebuild_from_floor(
+    repo_root: &Path,
+    from: Option<&CommitSha>,
+    to: &CommitSha,
+    floor: Option<&CommitSha>,
+    require_adopted_checkpoint: bool,
+) -> Result<(RepoState, Vec<LogEvent>), RebuildError> {
     // One handle for both range walks (and the checkpoint probe).
     let git = git_io::open(repo_root)?;
-    let base = from.and_then(|f| find_base_checkpoint(repo_root, &git, f));
+    rebuild_from_floor_with_git(repo_root, &git, from, to, floor, require_adopted_checkpoint)
+}
+
+fn rebuild_from_floor_with_git(
+    repo_root: &Path,
+    git: &git_io::Repo,
+    from: Option<&CommitSha>,
+    to: &CommitSha,
+    floor: Option<&CommitSha>,
+    require_adopted_checkpoint: bool,
+) -> Result<(RepoState, Vec<LogEvent>), RebuildError> {
+    let base = from
+        .and_then(|f| find_base_checkpoint_matching(repo_root, git, f, require_adopted_checkpoint));
     let (mut state, base_depth) = match base {
         Some((cp, s)) => (s, cp.depth),
-        None => (RepoState::empty(repo_root.to_path_buf()), 0),
+        None => {
+            let mut state = RepoState::empty(repo_root.to_path_buf());
+            state.head = floor.cloned();
+            (state, 0)
+        }
     };
 
     // Two phases: a SILENT fold from the resume base up through `from`

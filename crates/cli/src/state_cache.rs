@@ -59,7 +59,10 @@ const CACHE_MAGIC: &[u8] = b"CLANK-STATE\n";
 ///   finish message). Bump forces a one-time re-fold so existing finish
 ///   commits populate it — pre-v12 checkpoints have no subject and aren't
 ///   re-folded on incremental appends (ruthless ab4e174).
-const CACHE_FORMAT_VERSION: u32 = 12;
+/// - v13: `RepoState` gained the durable `adopted_at` boundary used to
+///   splice pre-adoption Git history without folding it. Old checkpoints
+///   know only the boolean and cannot provide a safe floor.
+const CACHE_FORMAT_VERSION: u32 = 13;
 const CLANK_CACHE_GENERATION: u32 = 1;
 
 const HEADER_LEN: usize = CACHE_MAGIC.len() + 4 + 4 + 40;

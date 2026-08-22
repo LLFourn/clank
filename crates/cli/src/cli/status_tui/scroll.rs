@@ -181,7 +181,8 @@ pub(super) enum OverlayTarget {
 pub(super) fn entry_overlay_target(seq: &[Seg], cursor: usize) -> Option<OverlayTarget> {
     use crate::cli::log::OnelineRow;
     match seq.get(cursor)? {
-        Seg::Log(OnelineRow::Commit { sha, .. }) => Some(OverlayTarget::Commit {
+        Seg::Log(OnelineRow::Commit { sha, .. })
+        | Seg::Log(OnelineRow::PlainCommit { sha, .. }) => Some(OverlayTarget::Commit {
             sha: sha.clone(),
             focus: None,
         }),
