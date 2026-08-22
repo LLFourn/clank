@@ -13,7 +13,7 @@
 //! `session`). `list` joins the resolved set with each agent's
 //! skeleton session.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use serde::Serialize;
@@ -25,7 +25,7 @@ use crate::cli::teams_config::{
 use clank_core::agent_config::{LaunchConfig, Session};
 use clank_core::ids::AgentLabel;
 use clank_core::vocab::{AutoMode, Tool};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::{
     AgentAddArgs, AgentArgs, AgentCmd, AgentListArgs, AgentPromoteArgs, AgentRemoveArgs,
@@ -901,6 +901,307 @@ fn add(args: AgentAddArgs) -> anyhow::Result<()> {
 // `pub`, env-free (explicit `home`/`repo`), args-free. Both
 // `run()` and integration-test setup call these.
 
+/// How a roster transition treats labels newly entering reviewer tiers.
+/// Every repo-roster write must choose here; identity replacement is the
+/// deliberate exception to historical gate preservation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RosterTransitionPolicy {
+    PreserveGate,
+    RequireFreshReview,
+}
+
+#[derive(Debug, Clone)]
+struct GateTarget {
+    sha: clank_core::ids::CommitSha,
+    /// A shared commit can be latest for several plans with different
+    /// milestone facts. One stand-in must preserve every context.
+    touched_plan: Vec<bool>,
+    reviews: Vec<clank_core::wait::ReviewEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RosterStandIn {
+    author: AgentLabel,
+    sha: clank_core::ids::CommitSha,
+    verdict: clank_core::Verdict,
+}
+
+fn added_expected_labels(
+    before: &crate::agent_store::ReviewerTiers,
+    after: &crate::agent_store::ReviewerTiers,
+) -> BTreeSet<AgentLabel> {
+    let mut added = BTreeSet::new();
+    for (old, new) in [
+        (&before.commit, &after.commit),
+        (&before.plan, &after.plan),
+        (&before.final_, &after.final_),
+    ] {
+        added.extend(new.iter().filter(|label| !old.contains(label)).cloned());
+    }
+    added
+}
+
+fn remove_labels(tiers: &mut crate::agent_store::ReviewerTiers, labels: &BTreeSet<AgentLabel>) {
+    tiers.commit.retain(|label| !labels.contains(label));
+    tiers.plan.retain(|label| !labels.contains(label));
+    tiers.final_.retain(|label| !labels.contains(label));
+}
+
+fn add_label_from_after(
+    tiers: &mut crate::agent_store::ReviewerTiers,
+    after: &crate::agent_store::ReviewerTiers,
+    label: &AgentLabel,
+) {
+    for (current, final_tier) in [
+        (&mut tiers.commit, &after.commit),
+        (&mut tiers.plan, &after.plan),
+        (&mut tiers.final_, &after.final_),
+    ] {
+        if final_tier.contains(label) && !current.contains(label) {
+            current.push(label.clone());
+            current.sort();
+        }
+    }
+}
+
+fn gates_for_target(
+    target: &GateTarget,
+    tiers: &crate::agent_store::ReviewerTiers,
+) -> Vec<clank_core::vocab::CommitGateState> {
+    target
+        .touched_plan
+        .iter()
+        .map(|touched_plan| {
+            clank_core::wait::compute_gate(
+                &target.reviews,
+                &tiers.commit,
+                &tiers.plan,
+                &tiers.final_,
+                *touched_plan,
+            )
+        })
+        .collect()
+}
+
+/// Pure gate-preservation planner. Removals and tier exits are already present
+/// in `after`; new expected labels are added one at a time so each pending slot
+/// is neutralised only when it would otherwise alter the baseline gate.
+fn plan_roster_stand_ins(
+    before: crate::agent_store::ReviewerTiers,
+    after: crate::agent_store::ReviewerTiers,
+    policy: RosterTransitionPolicy,
+    targets: &mut [GateTarget],
+) -> anyhow::Result<Vec<RosterStandIn>> {
+    if policy == RosterTransitionPolicy::RequireFreshReview {
+        return Ok(Vec::new());
+    }
+
+    let entrants = added_expected_labels(&before, &after);
+    let mut current = after.clone();
+    remove_labels(&mut current, &entrants);
+    let mut stand_ins = Vec::new();
+
+    for entrant in entrants {
+        let baseline: Vec<_> = targets
+            .iter()
+            .map(|target| gates_for_target(target, &current))
+            .collect();
+        add_label_from_after(&mut current, &after, &entrant);
+
+        for (target, expected_gates) in targets.iter_mut().zip(baseline) {
+            // A real (or earlier synthetic) verdict is historical evidence and
+            // must never be replaced. Its own effect on the gate is legitimate.
+            if target.reviews.iter().any(|review| review.author == entrant) {
+                continue;
+            }
+            if gates_for_target(target, &current) == expected_gates {
+                continue;
+            }
+
+            let verdict = [clank_core::Verdict::Continue, clank_core::Verdict::Finished]
+                .into_iter()
+                .find(|verdict| {
+                    target.reviews.push(clank_core::wait::ReviewEntry {
+                        author: entrant.clone(),
+                        verdict: *verdict,
+                    });
+                    let preserves = gates_for_target(target, &current) == expected_gates;
+                    target.reviews.pop();
+                    preserves
+                })
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "cannot preserve the gate for reviewer `{}` entering at {}",
+                        entrant.as_str(),
+                        target.sha.as_str()
+                    )
+                })?;
+
+            target.reviews.push(clank_core::wait::ReviewEntry {
+                author: entrant.clone(),
+                verdict,
+            });
+            stand_ins.push(RosterStandIn {
+                author: entrant.clone(),
+                sha: target.sha.clone(),
+                verdict,
+            });
+        }
+    }
+    Ok(stand_ins)
+}
+
+fn latest_gate_targets(repo: &Path, state: &crate::repo_state::RepoState) -> Vec<GateTarget> {
+    use clank_core::wait::PlanStateLookup;
+
+    let lookup = crate::fs_plan_state_lookup::FsPlanStateLookup::new(repo, state.head.as_ref());
+    let mut contexts: BTreeMap<clank_core::ids::CommitSha, Vec<bool>> = BTreeMap::new();
+    for plan in state.fold.plans.values() {
+        let Some(event) = plan
+            .commits
+            .iter()
+            .rev()
+            .find(|event| event.touched_plan || event.touched_code)
+        else {
+            continue;
+        };
+        let touched = contexts.entry(event.sha.clone()).or_default();
+        if !touched.contains(&event.touched_plan) {
+            touched.push(event.touched_plan);
+        }
+    }
+    contexts
+        .into_iter()
+        .map(|(sha, touched_plan)| GateTarget {
+            reviews: lookup.reviews_for(&sha),
+            sha,
+            touched_plan,
+        })
+        .collect()
+}
+
+fn all_reviewable_shas(state: &crate::repo_state::RepoState) -> Vec<clank_core::ids::CommitSha> {
+    let mut shas = Vec::new();
+    for plan in state.fold.plans.values() {
+        shas.extend(plan.reviewable_shas());
+    }
+    shas.extend(state.fold.ad_hoc.iter().map(|event| event.sha.clone()));
+    shas.sort();
+    shas.dedup();
+    shas
+}
+
+fn existing_feedback_path(
+    repo: &Path,
+    author: &AgentLabel,
+    sha: &clank_core::ids::CommitSha,
+) -> Option<PathBuf> {
+    let dir = repo
+        .join(".clank/agents")
+        .join(author.as_str())
+        .join("feedback");
+    let full = dir.join(format!("{}.md", sha.as_str()));
+    let short = dir.join(format!("{}.md", &sha.as_str()[..7.min(sha.as_str().len())]));
+    [full, short].into_iter().find(|path| path.exists())
+}
+
+fn stand_in_body(verdict: clank_core::Verdict) -> String {
+    let header = match verdict {
+        clank_core::Verdict::Continue => "CONTINUE",
+        clank_core::Verdict::Finished => "FINISHED",
+        clank_core::Verdict::RequestChanges | clank_core::Verdict::Unmarked => {
+            unreachable!("stand-ins are positive verdicts")
+        }
+    };
+    format!(
+        "{header} Synthetic roster stand-in; no review performed\n\n{}\n\
+         This agent joined the review tier after the commit. Clank recorded\n\
+         non-participation only to keep the already-reached gate from rewinding.\n",
+        clank_core::feedback_body::ROSTER_STAND_IN_MARKER
+    )
+}
+
+fn write_stand_in_noclobber(
+    repo: &Path,
+    stand_in: &RosterStandIn,
+    all_shas: &[clank_core::ids::CommitSha],
+) -> anyhow::Result<Option<PathBuf>> {
+    if existing_feedback_path(repo, &stand_in.author, &stand_in.sha).is_some() {
+        return Ok(None);
+    }
+    let rel = crate::disk_format::feedback_path_wire(&stand_in.author, &stand_in.sha, all_shas);
+    let path = repo.join(rel);
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("no parent for `{}`", path.display()))?;
+    std::fs::create_dir_all(parent)?;
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".clank-roster-stand-in-")
+        .suffix(".md.tmp")
+        .tempfile_in(parent)?;
+    use std::io::Write;
+    tmp.write_all(stand_in_body(stand_in.verdict).as_bytes())?;
+    tmp.as_file_mut().sync_all()?;
+    match tmp.persist_noclobber(&path) {
+        Ok(_) => Ok(Some(path)),
+        Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
+        Err(e) => Err(e.error.into()),
+    }
+}
+
+fn write_repo_transition(
+    repo: &Path,
+    before: &RepoConfigFile,
+    after: &RepoConfigFile,
+    policy: RosterTransitionPolicy,
+) -> anyhow::Result<()> {
+    // No active plan means there is no plan gate to preserve and no reason to
+    // pay for a fold. This also keeps pre-adoption roster setup independent of
+    // git history.
+    let plans_dir = repo.join(".clank/plans");
+    let (stand_ins, all_shas) =
+        if plans_dir.is_dir() && policy == RosterTransitionPolicy::PreserveGate {
+            let state = crate::rebuild::rebuild_repo_sync_with_policy(
+                repo,
+                crate::rebuild::CachePolicy::Bypass,
+            )?;
+            let mut targets = latest_gate_targets(repo, &state);
+            let before_tiers = crate::agent_store::ReviewerTiers::from_roster(&before.agents);
+            let after_tiers = crate::agent_store::ReviewerTiers::from_roster(&after.agents);
+            (
+                plan_roster_stand_ins(before_tiers, after_tiers, policy, &mut targets)?,
+                all_reviewable_shas(&state),
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
+
+    // Stand-ins are written first while their authors are still unexpected and
+    // therefore gate-neutral. Noclobber protects a concurrent or historical
+    // human review. Roll back only files created by this call if config
+    // persistence fails.
+    let mut created = Vec::new();
+    for stand_in in &stand_ins {
+        match write_stand_in_noclobber(repo, stand_in, &all_shas) {
+            Ok(Some(path)) => created.push(path),
+            Ok(None) => {}
+            Err(error) => {
+                for path in created {
+                    let _ = std::fs::remove_file(path);
+                }
+                return Err(error);
+            }
+        }
+    }
+    if let Err(error) = write_repo_config_raw(repo, after) {
+        for path in created {
+            let _ = std::fs::remove_file(path);
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
 /// Declare an agent DESCRIPTION in the user-scope `agents`
 /// library (role-free). Errors if the label already exists there.
 pub fn declare_global_agent(
@@ -932,6 +1233,7 @@ pub fn add_repo_roster_agent(
     role: RosterRole,
 ) -> anyhow::Result<()> {
     let mut repo_cfg = read_repo_config(repo)?;
+    let before = repo_cfg.clone();
     if repo_cfg.agents.contains_key(label) {
         anyhow::bail!(
             "agent `{label}` is already on this repo's roster. \
@@ -942,7 +1244,12 @@ pub fn add_repo_roster_agent(
     repo_cfg
         .agents
         .insert(label.clone(), RosterAgent::from_description(desc, role));
-    write_repo_config(repo, &repo_cfg)?;
+    write_repo_transition(
+        repo,
+        &before,
+        &repo_cfg,
+        RosterTransitionPolicy::PreserveGate,
+    )?;
     eprintln!(
         "added `{}` to this repo's roster as a `{}` reviewer",
         label.as_str(),
@@ -985,6 +1292,7 @@ pub fn add_repo_roster_agent_by_name(
     role: RosterRole,
 ) -> anyhow::Result<()> {
     let mut repo_cfg = read_repo_config(repo)?;
+    let before = repo_cfg.clone();
     if repo_cfg.agents.contains_key(label) {
         anyhow::bail!(
             "agent `{label}` is already on this repo's roster. \
@@ -996,7 +1304,12 @@ pub fn add_repo_roster_agent_by_name(
     repo_cfg
         .agents
         .insert(label.clone(), RosterAgent::from_description(desc, role));
-    write_repo_config(repo, &repo_cfg)?;
+    write_repo_transition(
+        repo,
+        &before,
+        &repo_cfg,
+        RosterTransitionPolicy::PreserveGate,
+    )?;
     eprintln!(
         "added `{}` to this repo's roster as a `{}` reviewer (copied from the library)",
         label.as_str(),
@@ -1023,6 +1336,7 @@ pub fn swap_repo_agent(
     into: &AgentLabel,
 ) -> anyhow::Result<()> {
     let mut repo_cfg = read_repo_config(repo)?;
+    let before = repo_cfg.clone();
     let role = match repo_cfg.agents.get(out) {
         Some(a) => a.role,
         None => anyhow::bail!(
@@ -1059,7 +1373,12 @@ pub fn swap_repo_agent(
     repo_cfg
         .agents
         .insert(into.clone(), RosterAgent::from_description(desc, role));
-    write_repo_config(repo, &repo_cfg)?;
+    write_repo_transition(
+        repo,
+        &before,
+        &repo_cfg,
+        RosterTransitionPolicy::RequireFreshReview,
+    )?;
     eprintln!(
         "swapped `{}` out for `{}` as a `{}` reviewer",
         out.as_str(),
@@ -1097,6 +1416,7 @@ fn promote(args: AgentPromoteArgs) -> anyhow::Result<()> {
 /// already be on the roster.
 pub fn set_repo_master(repo: &Path, label: &AgentLabel) -> anyhow::Result<()> {
     let mut repo_cfg = read_repo_config(repo)?;
+    let before = repo_cfg.clone();
     if !repo_cfg.agents.contains_key(label) {
         anyhow::bail!(
             "agent `{label}` is not on this repo's roster. \
@@ -1121,7 +1441,12 @@ pub fn set_repo_master(repo: &Path, label: &AgentLabel) -> anyhow::Result<()> {
     if let Some(agent) = repo_cfg.agents.get_mut(label) {
         agent.role = RosterRole::Master;
     }
-    write_repo_config(repo, &repo_cfg)?;
+    write_repo_transition(
+        repo,
+        &before,
+        &repo_cfg,
+        RosterTransitionPolicy::PreserveGate,
+    )?;
     eprintln!("set `{}` as this repo's master", label.as_str());
     Ok(())
 }
@@ -1145,6 +1470,7 @@ fn set_review(args: AgentSetReviewArgs) -> anyhow::Result<()> {
 /// `tier`.
 pub fn set_repo_review(repo: &Path, label: &AgentLabel, tier: ReviewKind) -> anyhow::Result<()> {
     let mut repo_cfg = read_repo_config(repo)?;
+    let before = repo_cfg.clone();
     let agent = match repo_cfg.agents.get_mut(label) {
         Some(a) => a,
         None => anyhow::bail!(
@@ -1171,7 +1497,12 @@ pub fn set_repo_review(repo: &Path, label: &AgentLabel, tier: ReviewKind) -> any
         return Ok(());
     }
     agent.role = new_role;
-    write_repo_config(repo, &repo_cfg)?;
+    write_repo_transition(
+        repo,
+        &before,
+        &repo_cfg,
+        RosterTransitionPolicy::PreserveGate,
+    )?;
     eprintln!(
         "set `{}` as a `{}` reviewer",
         label.as_str(),
@@ -1243,10 +1574,16 @@ pub fn remove_global_agent(home: &Path, label: &AgentLabel) -> anyhow::Result<()
 /// isn't on the roster.
 pub fn remove_repo_agent(repo: &Path, label: &AgentLabel) -> anyhow::Result<()> {
     let mut repo_cfg = read_repo_config(repo)?;
+    let before = repo_cfg.clone();
     if repo_cfg.agents.remove(label).is_none() {
         anyhow::bail!("agent `{}` is not on this repo's roster", label.as_str());
     }
-    write_repo_config(repo, &repo_cfg)?;
+    write_repo_transition(
+        repo,
+        &before,
+        &repo_cfg,
+        RosterTransitionPolicy::PreserveGate,
+    )?;
     eprintln!("removed `{}` from this repo's roster", label.as_str());
     Ok(())
 }
@@ -1336,7 +1673,7 @@ fn read_repo_config(repo: &Path) -> anyhow::Result<RepoConfigFile> {
 
 /// Atomic write of `<repo>/.clank/config.json`. The `extra`
 /// flatten catchall preserves unknown sections on round-trip.
-fn write_repo_config(repo: &Path, file: &RepoConfigFile) -> anyhow::Result<()> {
+fn write_repo_config_raw(repo: &Path, file: &RepoConfigFile) -> anyhow::Result<()> {
     write_typed_config(&repo.join(".clank/config.json"), file)
 }
 
@@ -1504,6 +1841,290 @@ mod tests {
             launch: None,
             initial_prompt: None,
         }
+    }
+
+    fn tiers(commit: &[&str], plan: &[&str], final_: &[&str]) -> crate::agent_store::ReviewerTiers {
+        crate::agent_store::ReviewerTiers {
+            commit: commit.iter().map(|name| label(name)).collect(),
+            plan: plan.iter().map(|name| label(name)).collect(),
+            final_: final_.iter().map(|name| label(name)).collect(),
+        }
+    }
+
+    fn gate_target(touched_plan: bool, reviews: &[(&str, clank_core::Verdict)]) -> GateTarget {
+        GateTarget {
+            sha: clank_core::ids::CommitSha::parse(&"a".repeat(40)).unwrap(),
+            touched_plan: vec![touched_plan],
+            reviews: reviews
+                .iter()
+                .map(|(author, verdict)| clank_core::wait::ReviewEntry {
+                    author: label(author),
+                    verdict: *verdict,
+                })
+                .collect(),
+        }
+    }
+
+    fn target_gate(
+        target: &GateTarget,
+        tiers: &crate::agent_store::ReviewerTiers,
+    ) -> clank_core::vocab::CommitGateState {
+        gates_for_target(target, tiers)[0]
+    }
+
+    #[test]
+    fn reviewer_add_preserves_every_computed_gate_state() {
+        use clank_core::Verdict::{Continue, Finished, RequestChanges};
+        use clank_core::vocab::CommitGateState;
+
+        struct Case {
+            name: &'static str,
+            before: crate::agent_store::ReviewerTiers,
+            after: crate::agent_store::ReviewerTiers,
+            target: GateTarget,
+            expected: CommitGateState,
+            stand_in: Option<clank_core::Verdict>,
+        }
+        let cases = [
+            Case {
+                name: "unreviewed",
+                before: tiers(&["alice"], &[], &[]),
+                after: tiers(&["alice", "new"], &[], &[]),
+                target: gate_target(false, &[]),
+                expected: CommitGateState::Unreviewed,
+                stand_in: None,
+            },
+            Case {
+                name: "changes requested",
+                before: tiers(&["alice"], &[], &[]),
+                after: tiers(&["alice", "new"], &[], &[]),
+                target: gate_target(false, &[("alice", RequestChanges)]),
+                expected: CommitGateState::ChangesRequested,
+                stand_in: Some(Continue),
+            },
+            Case {
+                name: "continued",
+                before: tiers(&["alice"], &[], &[]),
+                after: tiers(&["alice", "new"], &[], &[]),
+                target: gate_target(false, &[("alice", Continue)]),
+                expected: CommitGateState::Continued,
+                stand_in: Some(Continue),
+            },
+            Case {
+                name: "continued pending gate",
+                before: tiers(&["alice"], &["gate"], &[]),
+                after: tiers(&["alice", "new"], &["gate"], &[]),
+                target: gate_target(true, &[("alice", Continue)]),
+                expected: CommitGateState::ContinuedPendingGate,
+                stand_in: Some(Continue),
+            },
+            Case {
+                name: "finished",
+                before: tiers(&["alice"], &[], &["gate"]),
+                after: tiers(&["alice"], &["new"], &["gate", "new"]),
+                target: gate_target(false, &[("alice", Finished), ("gate", Finished)]),
+                expected: CommitGateState::Finished,
+                stand_in: Some(Finished),
+            },
+        ];
+
+        for mut case in cases {
+            assert_eq!(
+                target_gate(&case.target, &case.before),
+                case.expected,
+                "{} baseline",
+                case.name
+            );
+            let stand_ins = plan_roster_stand_ins(
+                case.before,
+                case.after.clone(),
+                RosterTransitionPolicy::PreserveGate,
+                std::slice::from_mut(&mut case.target),
+            )
+            .unwrap();
+            assert_eq!(
+                target_gate(&case.target, &case.after),
+                case.expected,
+                "{} after",
+                case.name
+            );
+            assert_eq!(
+                stand_ins.first().map(|s| s.verdict),
+                case.stand_in,
+                "{} stand-in",
+                case.name
+            );
+            assert_eq!(
+                stand_ins.len(),
+                usize::from(case.stand_in.is_some()),
+                "{} count",
+                case.name
+            );
+        }
+    }
+
+    #[test]
+    fn promotion_neutralises_the_demoted_masters_new_pending_slot() {
+        use clank_core::Verdict::Continue;
+        use clank_core::vocab::CommitGateState;
+
+        let before = tiers(&["incoming-master"], &[], &[]);
+        let after = tiers(&["old-master"], &[], &[]);
+        let mut target = gate_target(false, &[("incoming-master", Continue)]);
+        let stand_ins = plan_roster_stand_ins(
+            before,
+            after.clone(),
+            RosterTransitionPolicy::PreserveGate,
+            std::slice::from_mut(&mut target),
+        )
+        .unwrap();
+
+        assert_eq!(target_gate(&target, &after), CommitGateState::Continued);
+        assert_eq!(stand_ins.len(), 1);
+        assert_eq!(stand_ins[0].author, label("old-master"));
+        assert_eq!(stand_ins[0].verdict, Continue);
+    }
+
+    #[test]
+    fn tier_move_uses_the_same_preservation_seam() {
+        use clank_core::Verdict::Continue;
+        use clank_core::vocab::CommitGateState;
+
+        let before = tiers(&["alice"], &[], &[]);
+        let after = tiers(&[], &["alice"], &[]);
+        let mut target = gate_target(true, &[]);
+        let stand_ins = plan_roster_stand_ins(
+            before,
+            after.clone(),
+            RosterTransitionPolicy::PreserveGate,
+            std::slice::from_mut(&mut target),
+        )
+        .unwrap();
+
+        assert_eq!(target_gate(&target, &after), CommitGateState::Continued);
+        assert_eq!(stand_ins.len(), 1);
+        assert_eq!(stand_ins[0].verdict, Continue);
+    }
+
+    #[test]
+    fn swap_deliberately_reopens_for_the_replacement() {
+        use clank_core::Verdict::Continue;
+        use clank_core::vocab::CommitGateState;
+
+        let before = tiers(&["out"], &[], &[]);
+        let after = tiers(&["into"], &[], &[]);
+        let mut target = gate_target(false, &[("out", Continue)]);
+        let stand_ins = plan_roster_stand_ins(
+            before,
+            after.clone(),
+            RosterTransitionPolicy::RequireFreshReview,
+            std::slice::from_mut(&mut target),
+        )
+        .unwrap();
+
+        assert!(stand_ins.is_empty());
+        assert_eq!(target_gate(&target, &after), CommitGateState::Unreviewed);
+    }
+
+    #[test]
+    fn existing_real_verdict_is_never_replaced() {
+        use clank_core::Verdict::{Continue, RequestChanges};
+        use clank_core::vocab::CommitGateState;
+
+        let before = tiers(&["alice"], &[], &[]);
+        let after = tiers(&["alice", "returning"], &[], &[]);
+        let mut target = gate_target(false, &[("alice", Continue), ("returning", RequestChanges)]);
+        let stand_ins = plan_roster_stand_ins(
+            before,
+            after.clone(),
+            RosterTransitionPolicy::PreserveGate,
+            std::slice::from_mut(&mut target),
+        )
+        .unwrap();
+
+        assert!(stand_ins.is_empty());
+        assert_eq!(
+            target_gate(&target, &after),
+            CommitGateState::ChangesRequested
+        );
+        assert_eq!(
+            target
+                .reviews
+                .iter()
+                .filter(|review| review.author == label("returning"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn stand_in_write_is_marked_and_never_clobbers_real_feedback() {
+        let repo = tempfile::tempdir().unwrap();
+        let sha = clank_core::ids::CommitSha::parse(&"b".repeat(40)).unwrap();
+        let stand_in = RosterStandIn {
+            author: label("new"),
+            sha: sha.clone(),
+            verdict: clank_core::Verdict::Continue,
+        };
+        let path = write_stand_in_noclobber(repo.path(), &stand_in, std::slice::from_ref(&sha))
+            .unwrap()
+            .unwrap();
+        let synthetic = std::fs::read_to_string(&path).unwrap();
+        assert!(clank_core::feedback_body::is_roster_stand_in(&synthetic));
+
+        std::fs::write(&path, "REQUEST_CHANGES real review\n").unwrap();
+        assert!(
+            write_stand_in_noclobber(repo.path(), &stand_in, std::slice::from_ref(&sha))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            "REQUEST_CHANGES real review\n"
+        );
+    }
+
+    #[test]
+    fn latest_gate_targets_never_backfills_older_commits() {
+        let repo = tempfile::tempdir().unwrap();
+        let old = clank_core::ids::CommitSha::parse(&"1".repeat(40)).unwrap();
+        let latest = clank_core::ids::CommitSha::parse(&"2".repeat(40)).unwrap();
+        let mut state = crate::repo_state::RepoState::empty(repo.path().to_path_buf());
+        state.fold.plans.insert(
+            clank_core::ids::PlanKey::parse("example").unwrap(),
+            clank_core::repo_state::PlanState {
+                commits: vec![
+                    clank_core::repo_state::PlanTimelineEvent {
+                        sha: old,
+                        ts: 1,
+                        touched_plan: true,
+                        touched_code: false,
+                    },
+                    clank_core::repo_state::PlanTimelineEvent {
+                        sha: latest.clone(),
+                        ts: 2,
+                        touched_plan: false,
+                        touched_code: true,
+                    },
+                ],
+            },
+        );
+
+        let targets = latest_gate_targets(repo.path(), &state);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].sha, latest);
+        assert_eq!(targets[0].touched_plan, vec![false]);
+    }
+
+    #[test]
+    fn roster_config_has_one_raw_write_choke_point() {
+        let source = include_str!("agent.rs");
+        let raw_writer = concat!("write_repo_config", "_raw(");
+        assert_eq!(
+            source.matches(raw_writer).count(),
+            2,
+            "the raw writer must appear only at its definition and inside write_repo_transition"
+        );
     }
 
     // ── agent add (inline) ───────────────────────────────────

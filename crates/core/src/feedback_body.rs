@@ -28,6 +28,18 @@
 
 use crate::vocab::Verdict;
 
+/// Exact on-disk marker for a gate-preservation record written when a
+/// reviewer joins the roster after a commit was made. These records carry a
+/// verdict so the existing gate fold can consume them, but they are not human
+/// reviews. Keep the marker on its own line so prose cannot match by accident.
+pub const ROSTER_STAND_IN_MARKER: &str = "<!-- clank:roster-stand-in:v1 -->";
+
+/// Whether `body` is a synthetic roster stand-in rather than a human review.
+pub fn is_roster_stand_in(body: &str) -> bool {
+    body.lines()
+        .any(|line| line.trim() == ROSTER_STAND_IN_MARKER)
+}
+
 /// Parse the first non-empty line of a feedback file body as a
 /// verdict marker. The line starts with `CONTINUE`, `FINISHED`, or
 /// `REQUEST_CHANGES`, optionally followed by a space and a
@@ -144,6 +156,13 @@ impl FeedbackBody {
             .to_string()
     }
 
+    /// True for a machine-written roster stand-in. Callers that display or
+    /// audit feedback can distinguish non-participation from an actual review
+    /// without interpreting prose.
+    pub fn is_roster_stand_in(&self) -> bool {
+        is_roster_stand_in(&self.body)
+    }
+
     /// Confirm that the parsed verdict matches what the caller
     /// claimed. `expected` of `Verdict::Unmarked` is rejected —
     /// you cannot intentionally write an unmarked feedback file.
@@ -214,6 +233,17 @@ mod tests {
     #[test]
     fn parse_verdict_continue() {
         assert_eq!(parse_verdict("CONTINUE\n\nbody\n"), Verdict::Continue);
+    }
+
+    #[test]
+    fn roster_stand_in_requires_exact_marker_line() {
+        let body = format!("CONTINUE synthetic\n\n{ROSTER_STAND_IN_MARKER}\nNo review.\n");
+        let parsed = FeedbackBody::parse(&body);
+        assert!(parsed.is_roster_stand_in());
+        assert!(is_roster_stand_in(&body));
+        assert!(!is_roster_stand_in(
+            "CONTINUE\n\nmentions <!-- clank:roster-stand-in:v1 --> in prose\n"
+        ));
     }
 
     #[test]

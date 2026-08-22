@@ -142,6 +142,20 @@ pub enum RosterRole {
     Gate,
 }
 
+impl RosterRole {
+    pub(crate) fn in_commit_tier(self) -> bool {
+        self == Self::Commit
+    }
+
+    pub(crate) fn in_plan_tier(self) -> bool {
+        matches!(self, Self::Plan | Self::Gate)
+    }
+
+    pub(crate) fn in_final_tier(self) -> bool {
+        matches!(self, Self::Final | Self::Gate)
+    }
+}
+
 /// One roster entry: an agent's DEFINITION plus its ROLE. This is
 /// the value type of a [`Roster`]. The `role` field is what
 /// distinguishes a roster entry from a bare [`AgentDescription`]
@@ -359,17 +373,17 @@ impl RegisteredSet {
 
     /// Commit-tier reviewers (every commit): role `Commit`.
     pub fn commit_tier(&self) -> Vec<AgentLabel> {
-        self.labels_with_role(|role| role == RosterRole::Commit)
+        self.labels_with_role(RosterRole::in_commit_tier)
     }
 
     /// PLAN-milestone tier (plan-doc commits): `plan` + `gate`.
     pub fn plan_tier(&self) -> Vec<AgentLabel> {
-        self.labels_with_role(|role| matches!(role, RosterRole::Plan | RosterRole::Gate))
+        self.labels_with_role(RosterRole::in_plan_tier)
     }
 
     /// FINISH-milestone tier (the end): `final` + `gate`.
     pub fn final_tier(&self) -> Vec<AgentLabel> {
-        self.labels_with_role(|role| matches!(role, RosterRole::Final | RosterRole::Gate))
+        self.labels_with_role(RosterRole::in_final_tier)
     }
 }
 

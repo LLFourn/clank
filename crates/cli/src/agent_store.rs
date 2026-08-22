@@ -129,6 +129,7 @@ pub fn load_reviewer_tiers_with(repo: &Path, home: Option<&Path>) -> anyhow::Res
 /// both `plan` and `final`), ready for `WorkPolicy` / `compute_gate`.
 /// The single conversion from a [`crate::cli::teams_config::RegisteredSet`]
 /// so every WorkPolicy builder gets the same gate-fold.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReviewerTiers {
     pub commit: Vec<AgentLabel>,
     pub plan: Vec<AgentLabel>,
@@ -141,6 +142,26 @@ impl ReviewerTiers {
             commit: set.commit_tier(),
             plan: set.plan_tier(),
             final_: set.final_tier(),
+        }
+    }
+
+    /// Build gate tiers directly from a prospective repo roster. Config
+    /// mutation needs to evaluate the before/after gate before the new config
+    /// is persisted, so it cannot go back through the filesystem resolver.
+    pub fn from_roster(roster: &crate::cli::teams_config::Roster) -> Self {
+        use crate::cli::teams_config::RosterRole;
+
+        let labels = |include: fn(RosterRole) -> bool| {
+            roster
+                .iter()
+                .filter(|(_, agent)| include(agent.role))
+                .map(|(label, _)| label.clone())
+                .collect()
+        };
+        Self {
+            commit: labels(RosterRole::in_commit_tier),
+            plan: labels(RosterRole::in_plan_tier),
+            final_: labels(RosterRole::in_final_tier),
         }
     }
 

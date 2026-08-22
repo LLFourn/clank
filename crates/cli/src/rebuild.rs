@@ -37,7 +37,7 @@ pub struct RebuildDiagnostics {
 }
 
 pub async fn rebuild_repo(repo_root: &Path) -> Result<RepoState, RebuildError> {
-    rebuild_repo_with_policy(repo_root, CachePolicy::Use).await
+    rebuild_repo_sync_with_policy(repo_root, CachePolicy::Use)
 }
 
 /// Deepest checkpoint ON `target`'s first-parent chain, at or
@@ -247,11 +247,28 @@ pub async fn rebuild_repo_with_policy(
     repo_root: &Path,
     policy: CachePolicy,
 ) -> Result<RepoState, RebuildError> {
-    let (state, _diag) = rebuild_with_diagnostics(repo_root, policy).await?;
+    rebuild_repo_sync_with_policy(repo_root, policy)
+}
+
+/// Synchronous rebuild for config-mutation cores which are also called from
+/// the synchronous status TUI. The fold is entirely synchronous; the async
+/// entry points remain as compatibility wrappers for existing command paths.
+pub fn rebuild_repo_sync_with_policy(
+    repo_root: &Path,
+    policy: CachePolicy,
+) -> Result<RepoState, RebuildError> {
+    let (state, _diag) = rebuild_with_diagnostics_sync(repo_root, policy)?;
     Ok(state)
 }
 
 pub async fn rebuild_with_diagnostics(
+    repo_root: &Path,
+    policy: CachePolicy,
+) -> Result<(RepoState, RebuildDiagnostics), RebuildError> {
+    rebuild_with_diagnostics_sync(repo_root, policy)
+}
+
+fn rebuild_with_diagnostics_sync(
     repo_root: &Path,
     policy: CachePolicy,
 ) -> Result<(RepoState, RebuildDiagnostics), RebuildError> {
