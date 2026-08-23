@@ -807,7 +807,7 @@ fn require_master(
              Build a roster with `clank agent add` / `clank agent promote`."
         )
     })?;
-    if crate::agent_store::role_from_registered_set(&set, caller) == Role::Master {
+    if crate::agent_store::role_from_registered_set(&set, caller) == Some(Role::Master) {
         Ok(())
     } else {
         anyhow::bail!(

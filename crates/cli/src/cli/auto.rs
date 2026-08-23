@@ -83,11 +83,9 @@ async fn run_status(args: AutoStatusArgs) -> anyhow::Result<()> {
     // acts on (auto-mode-default-on).
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
     let effective = crate::cli::team::resolve_effective_auto_mode(Some(&cfg), home.as_deref());
-    // Role is roster-derived; best-effort (a repo with no master
-    // has no resolvable role — show `unknown` rather than error).
-    let role = crate::agent_store::resolve_role(&repo, &label)
-        .map(|r| r.as_str().to_string())
-        .unwrap_or_else(|_| "unknown (no master configured)".to_string());
+    // Role is roster-derived and best-effort. The shared formatter keeps
+    // missing-master distinct from this identity having been removed.
+    let role = crate::agent_store::role_status_text(&repo, &label);
 
     if args.json {
         let payload = AutoStatusJson {

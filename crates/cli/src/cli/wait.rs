@@ -337,11 +337,21 @@ pub async fn run(args: WaitArgs) -> anyhow::Result<()> {
             // Re-derive the projection inputs EVERY wake: config.json is a
             // wake dir, and a parked wait projecting with the team captured
             // at arm time computes stale work after any roster change
-            // (wait-reloads-config-per-refold). Fail-soft mid-loop: a
-            // transient read failure keeps the last-known-good inputs and
-            // retries next wake — it must not kill a parked wait.
-            if let Ok(fresh) = derive_wait_inputs(&repo, &author) {
-                inputs = fresh;
+            // (wait-reloads-config-per-refold). Fail-soft mid-loop only for
+            // transient failures: an identity successfully resolved absent
+            // from the roster has been revoked and must stop this wait rather
+            // than retain its last-known role.
+            match derive_wait_inputs(&repo, &author) {
+                Ok(fresh) => inputs = fresh,
+                Err(err)
+                    if matches!(
+                        err.downcast_ref::<crate::agent_store::RoleResolutionError>(),
+                        Some(crate::agent_store::RoleResolutionError::NotRegistered { .. })
+                    ) =>
+                {
+                    return Err(err);
+                }
+                Err(_) => {}
             }
 
             // Compute this beat's REPO-side result (None = park). Any

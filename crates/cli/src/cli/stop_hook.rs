@@ -2191,6 +2191,49 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn swapped_out_auto_identity_is_diagnostic_and_arms_nothing() {
+        let dir = init_repo();
+        let repo = dir.path();
+        let label = bind(repo, "codex", "sess-swapped-out");
+        crate::agent_store::set_auto_mode(repo, &label, AutoMode::On).unwrap();
+        crate::cli::agent::add_repo_roster_agent(
+            repo,
+            &label,
+            crate::cli::teams_config::AgentDescription {
+                tool: Tool::Codex,
+                launch: None,
+                initial_prompt: None,
+            },
+            crate::cli::teams_config::RosterRole::Commit,
+        )
+        .unwrap();
+        crate::cli::agent::set_repo_master(repo, &label).unwrap();
+
+        let home = tempfile::tempdir().unwrap();
+        let incoming = AgentLabel::parse("scout").unwrap();
+        crate::cli::agent::declare_global_agent(
+            home.path(),
+            &incoming,
+            crate::cli::teams_config::AgentDescription {
+                tool: Tool::Claude,
+                launch: None,
+                initial_prompt: None,
+            },
+        )
+        .unwrap();
+        crate::cli::agent::swap_repo_agent(repo, Some(home.path()), &label, &incoming).unwrap();
+
+        let input = hook_input("sess-swapped-out", Some("done"));
+        match compute_outcome(Tool::Claude, Some(repo), input).await {
+            HookOutcome::Diagnostic { message } => {
+                assert!(message.contains("not on this repo's roster"), "{message}");
+                assert!(message.contains("arming no wait"), "{message}");
+            }
+            other => panic!("a swapped-out identity must arm nothing, got {other:?}"),
+        }
+    }
+
     /// Auto off is the agent asking not to be driven. Diagnosing its
     /// repo's roster would be noise about work it will not do, so the
     /// resolution must sit INSIDE the driving arm, never above it.

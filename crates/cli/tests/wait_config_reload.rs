@@ -122,12 +122,22 @@ async fn parked_wait_survives_a_transient_config_corruption() {
 async fn parked_wait_picks_up_a_tier_change_without_restarting() {
     let _serial = common::serial();
     let env = TestEnv::init();
-    // `rev` starts OFF the roster entirely: no tier contains it, so
-    // the intro commit projects no item for it and the wait parks.
-    // Role still resolves — an off-roster label derives Reviewer —
-    // so the wait arms and simply has nothing to return.
+    // `rev` starts in the final tier, which has no work on an intro
+    // commit. Moving it to commit must wake the existing wait and
+    // project that intro without relying on an off-roster identity.
     env.register_team("master", &["other"], &[]);
     let repo = env.repo();
+    clank::cli::agent::add_repo_roster_agent(
+        repo,
+        &clank_core::ids::AgentLabel::parse("rev").unwrap(),
+        AgentDescription {
+            tool: Tool::Claude,
+            launch: None,
+            initial_prompt: None,
+        },
+        RosterRole::Final,
+    )
+    .unwrap();
     write(repo, ".clank/.gitignore", "/cache/\n/agents/\n/shelved/\n");
     write(repo, ".clank/plans/foo.md", "# foo\n");
     git(repo, &["add", "-A"]);
@@ -137,11 +147,11 @@ async fn parked_wait_picks_up_a_tier_change_without_restarting() {
     common::assert_stays_parked(
         repo,
         wait_args(repo, "rev"),
-        "non-member under current tiers",
+        "final reviewer before the final gate",
     )
     .await;
 
-    // Park a wait, then ADD rev to the commit tier mid-wait. The
+    // Park a wait, then MOVE rev to the commit tier mid-wait. The
     // config write wakes the loop; the re-derived tiers must project
     // the review item — the wait returns WITHOUT restarting. (Before
     // wait-reloads-config-per-refold this hung to timeout on the
@@ -149,15 +159,10 @@ async fn parked_wait_picks_up_a_tier_change_without_restarting() {
     let repo_owned = repo.to_path_buf();
     let waiter = tokio::spawn(clank::cli::wait::run(wait_args(repo, "rev")));
     tokio::time::sleep(Duration::from_millis(1200)).await;
-    clank::cli::agent::add_repo_roster_agent(
+    clank::cli::agent::set_repo_review(
         &repo_owned,
         &clank_core::ids::AgentLabel::parse("rev").unwrap(),
-        AgentDescription {
-            tool: Tool::Claude,
-            launch: None,
-            initial_prompt: None,
-        },
-        RosterRole::Commit,
+        clank::cli::teams_config::ReviewKind::Commit,
     )
     .expect("flip rev to the commit tier");
 
@@ -166,4 +171,52 @@ async fn parked_wait_picks_up_a_tier_change_without_restarting() {
         .expect("the parked wait must wake and project the NEW tiers")
         .expect("join")
         .expect("wait returns the review item under the new config");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn parked_wait_exits_when_its_master_identity_is_swapped_out() {
+    let _serial = common::serial();
+    let env = parked_reviewer_env();
+    let repo = env.repo();
+    // Remove the queue item so the master has no immediate work and parks.
+    std::fs::remove_file(repo.join(".clank/queue/500-someplan.md")).unwrap();
+    clank::cli::agent::declare_global_agent(
+        env.home(),
+        &clank_core::ids::AgentLabel::parse("in").unwrap(),
+        AgentDescription {
+            tool: Tool::Claude,
+            launch: None,
+            initial_prompt: None,
+        },
+    )
+    .unwrap();
+
+    let waiter = tokio::spawn(clank::cli::wait::run(wait_args(repo, "master")));
+    tokio::time::sleep(common::parked_window(repo)).await;
+    assert!(
+        !waiter.is_finished(),
+        "master wait must be parked before the swap"
+    );
+
+    clank::cli::agent::swap_repo_agent(
+        repo,
+        Some(env.home()),
+        &clank_core::ids::AgentLabel::parse("master").unwrap(),
+        &clank_core::ids::AgentLabel::parse("in").unwrap(),
+    )
+    .unwrap();
+
+    let err = tokio::time::timeout(common::race_deadline(repo), waiter)
+        .await
+        .expect("roster change must wake the parked wait")
+        .expect("join")
+        .expect_err("a removed identity must terminate instead of becoming a reviewer");
+    assert!(
+        matches!(
+            err.downcast_ref::<clank::agent_store::RoleResolutionError>(),
+            Some(clank::agent_store::RoleResolutionError::NotRegistered { .. })
+        ),
+        "typed off-roster error: {err:#}"
+    );
+    assert!(format!("{err:#}").contains("not on this repo's roster"));
 }

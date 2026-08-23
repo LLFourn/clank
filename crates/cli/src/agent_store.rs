@@ -16,6 +16,17 @@ use clank_core::agent_config::{AgentConfig, Session};
 use clank_core::ids::{AgentLabel, SessionId};
 use clank_core::vocab::{AutoMode, Tool};
 
+/// A successfully resolved roster does not contain the requested identity.
+///
+/// This is structurally distinct from transient config I/O/parse failures so
+/// a parked wait can terminate a removed identity without giving up its
+/// fail-soft retry behavior for temporary read failures.
+#[derive(Debug, thiserror::Error)]
+pub enum RoleResolutionError {
+    #[error("agent `{label}` is not on this repo's roster")]
+    NotRegistered { label: AgentLabel },
+}
+
 /// Repo-relative path: `.clank/agents`.
 pub fn agents_root(repo: &Path) -> PathBuf {
     repo.join(".clank").join("agents")
@@ -90,14 +101,39 @@ fn no_team_configured() -> anyhow::Error {
 
 /// Resolve an agent's role for this repo via the roster-resolved
 /// registered set: `label == master` → `Master`; in either
-/// reviewer tier → `Reviewer`; otherwise the default role.
+/// reviewer tier → `Reviewer`; otherwise a typed not-registered error.
 ///
 /// Errors if the repo has no master designated — there is no
 /// legacy fallback.
 pub fn resolve_role(repo: &Path, label: &AgentLabel) -> anyhow::Result<clank_core::vocab::Role> {
     match try_resolve_via_team(repo)? {
-        Some(set) => Ok(role_from_registered_set(&set, label)),
+        Some(set) => role_from_registered_set(&set, label).ok_or_else(|| {
+            RoleResolutionError::NotRegistered {
+                label: label.clone(),
+            }
+            .into()
+        }),
         None => Err(no_team_configured()),
+    }
+}
+
+/// Best-effort role text for diagnostic/status surfaces.
+///
+/// Preserve the historical no-master fallback while exposing a successfully
+/// resolved roster's explicit identity absence. Callers must not flatten the
+/// latter back into a missing-master diagnosis.
+pub fn role_status_text(repo: &Path, label: &AgentLabel) -> String {
+    match resolve_role(repo, label) {
+        Ok(role) => role.as_str().to_string(),
+        Err(err)
+            if matches!(
+                err.downcast_ref::<RoleResolutionError>(),
+                Some(RoleResolutionError::NotRegistered { .. })
+            ) =>
+        {
+            format!("unknown ({err})")
+        }
+        Err(_) => "unknown (no master configured)".to_string(),
     }
 }
 
@@ -202,16 +238,16 @@ pub fn reviewer_tiers_for_render_with(repo: &Path, home: Option<&Path>) -> Revie
 pub fn role_from_registered_set(
     set: &crate::cli::teams_config::RegisteredSet,
     label: &AgentLabel,
-) -> clank_core::vocab::Role {
+) -> Option<clank_core::vocab::Role> {
     use clank_core::vocab::Role;
     if &set.master == label {
-        return Role::Master;
+        return Some(Role::Master);
     }
     let is_reviewer = set.reviewers.iter().any(|r| &r.label == label);
     if is_reviewer {
-        Role::Reviewer
+        Some(Role::Reviewer)
     } else {
-        Role::default()
+        None
     }
 }
 
@@ -618,7 +654,7 @@ mod tests {
         let set = registered_set("codex", &["claude"], &["ruthless"]);
         assert_eq!(
             role_from_registered_set(&set, &label("codex")),
-            Role::Master
+            Some(Role::Master)
         );
     }
 
@@ -627,7 +663,7 @@ mod tests {
         let set = registered_set("codex", &["claude"], &["ruthless"]);
         assert_eq!(
             role_from_registered_set(&set, &label("claude")),
-            Role::Reviewer
+            Some(Role::Reviewer)
         );
     }
 
@@ -636,16 +672,49 @@ mod tests {
         let set = registered_set("codex", &["claude"], &["ruthless"]);
         assert_eq!(
             role_from_registered_set(&set, &label("ruthless")),
-            Role::Reviewer
+            Some(Role::Reviewer)
         );
     }
 
     #[test]
-    fn role_from_registered_set_returns_default_for_unknown_label() {
+    fn role_from_registered_set_returns_none_for_unknown_label() {
         let set = registered_set("codex", &["claude"], &["ruthless"]);
+        assert_eq!(role_from_registered_set(&set, &label("phantom")), None);
+    }
+
+    #[test]
+    fn resolve_role_returns_typed_error_for_unknown_label() {
+        let repo = TempDir::new().unwrap();
+        write_repo_config(
+            repo.path(),
+            r#"{"agents":{"codex":{"tool":"codex","role":"master"}}}"#,
+        );
+
+        let err = resolve_role(repo.path(), &label("phantom")).unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<RoleResolutionError>(),
+            Some(RoleResolutionError::NotRegistered { label }) if label.as_str() == "phantom"
+        ));
+        assert!(format!("{err:#}").contains("not on this repo's roster"));
+    }
+
+    #[test]
+    fn role_status_text_distinguishes_absence_from_no_master() {
+        let repo = TempDir::new().unwrap();
+        write_repo_config(
+            repo.path(),
+            r#"{"agents":{"codex":{"tool":"codex","role":"master"}}}"#,
+        );
+        assert_eq!(role_status_text(repo.path(), &label("codex")), "master");
         assert_eq!(
-            role_from_registered_set(&set, &label("phantom")),
-            Role::default()
+            role_status_text(repo.path(), &label("phantom")),
+            "unknown (agent `phantom` is not on this repo's roster)"
+        );
+
+        let no_master = TempDir::new().unwrap();
+        assert_eq!(
+            role_status_text(no_master.path(), &label("phantom")),
+            "unknown (no master configured)"
         );
     }
 

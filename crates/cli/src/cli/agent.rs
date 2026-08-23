@@ -1344,15 +1344,6 @@ pub fn swap_repo_agent(
             out.as_str()
         ),
     };
-    if role == RosterRole::Master {
-        anyhow::bail!(
-            "agent `{out}` is this repo's master. Swap a master by promoting its \
-             replacement — `clank agent promote {into}` demotes `{out}` and moves \
-             the panes.",
-            out = out.as_str(),
-            into = into.as_str()
-        );
-    }
     // A map keyed by label: inserting onto an existing one COLLAPSES
     // two entries into one. `out` would go, `into`'s tier would be
     // overwritten with `out`'s, and the roster would shrink by one
@@ -1380,7 +1371,7 @@ pub fn swap_repo_agent(
         RosterTransitionPolicy::RequireFreshReview,
     )?;
     eprintln!(
-        "swapped `{}` out for `{}` as a `{}` reviewer",
+        "swapped `{}` out for `{}` as `{}`",
         out.as_str(),
         into.as_str(),
         role_word(role)

@@ -3893,6 +3893,42 @@ pub(crate) mod tests {
         // IPC and leaves no artifact behind.
     }
 
+    #[test]
+    fn apply_swap_replaces_the_master_from_the_same_picker_path() {
+        let repo = detail_repo();
+        let mut s = two_agent_snap();
+        let picker = vec![crate::cli::status::AvailableAgent {
+            label: "scout".to_string(),
+            tool: "codex".to_string(),
+            invocation: "codex".to_string(),
+            description: None,
+        }];
+        let home = library_home(&["scout"]);
+        let mut err = None;
+
+        let mode = apply_swap(
+            0,
+            0,
+            &mut s,
+            &picker,
+            repo.path(),
+            Some(home.path()),
+            &mut err,
+        );
+
+        assert_eq!(mode, Mode::AgentPanel { sel: 0 });
+        assert!(err.is_none(), "master swap reports nothing: {err:?}");
+        let cfg = crate::agent_store::load_repo_config_required(repo.path()).unwrap();
+        let scout = clank_core::ids::AgentLabel::parse("scout").unwrap();
+        let old = clank_core::ids::AgentLabel::parse("claude").unwrap();
+        assert_eq!(
+            cfg.agents[&scout].role,
+            crate::cli::teams_config::RosterRole::Master
+        );
+        assert_eq!(cfg.agents[&scout].tool, clank_core::vocab::Tool::Codex);
+        assert!(!cfg.agents.contains_key(&old));
+    }
+
     /// The identity rule, at the seam that had the bug: both ends of a
     /// swap are re-LOCATED by label after a refresh, never trusted as
     /// indices. An external roster or library edit reorders these

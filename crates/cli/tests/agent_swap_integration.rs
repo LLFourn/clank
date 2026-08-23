@@ -1,4 +1,4 @@
-//! `clank agent swap <out> <in>` — replace a reviewer, keep the role.
+//! `clank agent swap <out> <in>` — replace a roster member, keep the role.
 
 mod common;
 
@@ -97,17 +97,28 @@ fn swapping_out_an_agent_that_is_not_on_the_roster_is_refused() {
 }
 
 #[test]
-fn swapping_the_master_is_refused_and_names_agent_promote() {
-    // `agent promote` already demotes the previous master AND owns the
-    // pane relocation; a second path would duplicate it.
+fn swapping_the_master_atomically_replaces_it() {
     let env = TestEnv::init();
     common::register_team(env.home(), env.repo(), "claude", &["a"], &[]);
     declare(env.home(), "in");
-    let before = roster(env.repo());
 
-    let err = swap(&env, "claude", "in").unwrap_err();
-    assert!(err.to_string().contains("agent promote"), "{err}");
-    assert_eq!(roster(env.repo()), before, "nothing may be written");
+    swap(&env, "claude", "in").unwrap();
+
+    let after = roster(env.repo());
+    assert_eq!(after.len(), 2, "one agent out and one in: {after:?}");
+    assert!(!after.iter().any(|(label, _)| label == "claude"));
+    assert_eq!(
+        after
+            .iter()
+            .filter(|(_, role)| *role == RosterRole::Master)
+            .collect::<Vec<_>>(),
+        vec![&("in".to_string(), RosterRole::Master)],
+    );
+    assert!(
+        after
+            .iter()
+            .any(|(label, role)| { label == "a" && *role == RosterRole::Commit })
+    );
 }
 
 #[test]
@@ -200,4 +211,37 @@ async fn a_departed_reviewers_verdict_does_not_satisfy_the_gate_for_its_replacem
         clank_core::vocab::CommitGateState::Unreviewed,
         "the incoming reviewer owes a fresh review"
     );
+}
+
+#[tokio::test]
+async fn replacing_the_master_does_not_rewind_a_settled_reviewer_gate() {
+    use clank::cli::{FeedbackArgs, FeedbackCmd, FeedbackWriteArgs, VerdictArg};
+
+    let env = TestEnv::init();
+    common::register_team(env.home(), env.repo(), "master", &["rev"], &[]);
+    declare(env.home(), "incoming-master");
+    let repo = env.repo();
+
+    std::fs::create_dir_all(repo.join(".clank/plans")).unwrap();
+    std::fs::write(repo.join(".clank/plans/foo.md"), "# foo\n").unwrap();
+    git(repo, &["add", "-A"]);
+    git(repo, &["commit", "--quiet", "-m", "[foo] intro"]);
+    let sha = head_sha(repo);
+    clank::cli::feedback::run(FeedbackArgs {
+        command: FeedbackCmd::Write(FeedbackWriteArgs {
+            repo: Some(repo.to_path_buf()),
+            commit: sha.as_str().to_string(),
+            verdict: VerdictArg::Finished,
+            author: "rev".into(),
+            message: "ship it".into(),
+        }),
+    })
+    .await
+    .unwrap();
+    let before = gate_now(repo, &sha);
+
+    swap(&env, "master", "incoming-master").unwrap();
+
+    assert_eq!(gate_now(repo, &sha), before);
+    assert_eq!(before, clank_core::vocab::CommitGateState::Finished);
 }

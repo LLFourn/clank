@@ -879,11 +879,10 @@ fn session_checks(repo: Option<&Path>) -> Vec<CheckResult> {
     let source = describe_identity_source(repo, &resolved, &detected, &explicit);
     out.push(CheckResult::ok(SECTION, "identity", source));
 
-    // Inferred role from the roster resolver (best-effort: a repo
-    // with no master configured has no resolvable role).
-    let role = crate::agent_store::resolve_role(repo, &resolved)
-        .map(|r| r.as_str().to_string())
-        .unwrap_or_else(|_| "unknown (no master configured)".to_string());
+    // Inferred role from the roster resolver. The shared best-effort
+    // formatter distinguishes a missing master from this identity having
+    // been removed from an otherwise valid roster.
+    let role = crate::agent_store::role_status_text(repo, &resolved);
     out.push(CheckResult::ok(
         SECTION,
         "role",

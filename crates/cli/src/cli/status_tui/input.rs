@@ -170,7 +170,7 @@ pub(super) fn detail_actions(role: crate::cli::teams_config::RosterRole) -> Vec<
     use crate::cli::teams_config::RosterRole;
     use DetailAction::*;
     match role {
-        RosterRole::Master => vec![ToggleAuto, Back],
+        RosterRole::Master => vec![ToggleAuto, Swap, Back],
         RosterRole::Commit | RosterRole::Plan | RosterRole::Final | RosterRole::Gate => {
             vec![
                 ToggleAuto,
@@ -1774,7 +1774,10 @@ mod tests {
     fn detail_actions_are_reduced_for_master() {
         use crate::cli::teams_config::RosterRole;
         use DetailAction::*;
-        assert_eq!(detail_actions(RosterRole::Master), vec![ToggleAuto, Back]);
+        assert_eq!(
+            detail_actions(RosterRole::Master),
+            vec![ToggleAuto, Swap, Back]
+        );
         let reviewer = vec![
             ToggleAuto,
             TierCommit,
@@ -1789,12 +1792,11 @@ mod tests {
         assert_eq!(detail_actions(RosterRole::Gate), reviewer);
     }
 
-    /// Swap is a REVIEWER action. The core refuses it on the master
-    /// (`agent promote` is that operation), and the page follows its
-    /// existing convention of hiding what it cannot do rather than
-    /// offering an action that always errors.
+    /// Swap is a roster replacement action for every role. Promotion
+    /// remains the separate operation for making an existing reviewer
+    /// master while keeping the outgoing master on the roster.
     #[test]
-    fn swap_is_offered_to_every_reviewer_tier_and_never_the_master() {
+    fn swap_is_offered_to_every_roster_role() {
         use crate::cli::teams_config::RosterRole;
         for tier in [
             RosterRole::Commit,
@@ -1807,7 +1809,7 @@ mod tests {
                 "{tier:?} must be swappable"
             );
         }
-        assert!(!detail_actions(RosterRole::Master).contains(&DetailAction::Swap));
+        assert!(detail_actions(RosterRole::Master).contains(&DetailAction::Swap));
     }
 
     #[test]
