@@ -117,4 +117,57 @@ await settle()
 assert(armedAt === 3, `third idle must arm (arms=${armedAt})`)
 assert(injections.length === 2, "stale continuation must be discarded, not injected")
 
+// ── An interrupted turn is not a finished one ─────────────────
+// Esc produces no new USER message, so the staleness guard cannot
+// see it; opencode marks the aborted turn's ASSISTANT message.
+const abortMsg = () => ({
+  event: {
+    type: "message.updated",
+    properties: {
+      sessionID: SID,
+      info: {
+        id: "msg_asst_abort",
+        role: "assistant",
+        error: { name: "MessageAbortedError" },
+      },
+    },
+  },
+})
+
+// Abort observed BEFORE the idle: no wait may even arm. A wait here
+// would long-poll holding the guard, and the next genuine idle would
+// be ignored as in-flight.
+await hooks.event(abortMsg())
+const armsBeforeAbort = arms
+await fire("session.idle", SID)
+await settle()
+assert(arms === armsBeforeAbort, `an interrupted turn must not arm a wait (arms=${arms})`)
+assert(injections.length === 2, "an interrupted turn must inject nothing")
+
+// Prompting again ends the stop the interrupt began.
+await hooks.event(userMsg("msg_user_3"))
+waits.push({ exitCode: 0, stdout: "work-4\n", stderr: "" })
+const idle4 = fire("session.idle", SID)
+await settle()
+assert(arms === armsBeforeAbort + 1, `a new prompt must re-arm the loop (arms=${arms})`)
+assert(
+  injections.length === 3 && injections[2] === "work-4",
+  "the loop must deliver again after the user resumes",
+)
+injectionReleases.forEach((r) => r())
+await idle4
+
+// Abort observed AFTER the idle, while the wait is in flight — the
+// ordering opencode actually produces for post-idle housekeeping.
+// The wait armed, so the discard has to happen at injection time.
+await hooks.event(userMsg("msg_user_4"))
+waits.push({ exitCode: 0, stdout: "work-5\n", stderr: "" })
+const idle5 = fire("session.idle", SID)
+const armedAtAbort = arms
+await hooks.event(abortMsg())
+await idle5
+await settle()
+assert(armedAtAbort === armsBeforeAbort + 2, `the wait must have armed (arms=${armedAtAbort})`)
+assert(injections.length === 3, "an abort during the wait must discard its continuation")
+
 console.log("OK")

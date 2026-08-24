@@ -21,6 +21,9 @@
 // Loop discipline:
 // - At most ONE in-flight stop-hook wait per session; an idle firing
 //   while a wait is pending is ignored.
+// - An INTERRUPTED turn is not a finished one. `session.idle` means
+//   the session stopped being busy, which is equally true after the
+//   user hits Esc — prodding then restarts exactly what they stopped.
 // - A completed wait's continuation is DISCARDED unless the session
 //   is still idle at injection time: any session activity observed
 //   after the triggering idle invalidates it. Discarding is safe —
@@ -49,6 +52,12 @@ export const ClankPlugin = async ({ client, $, directory }) => {
   // wait stale (both observed live).
   const activity = new Map()
   const seenUserMessages = new Set()
+  // Sessions whose current turn a HUMAN stopped. opencode marks the
+  // interrupted turn's ASSISTANT message with MessageAbortedError —
+  // read from there rather than from `session.error`, whose schema
+  // makes sessionID OPTIONAL, so it cannot attribute an abort to a
+  // session at all.
+  const aborted = new Set()
 
   const sessionOf = (event) => {
     const p = event?.properties ?? {}
@@ -69,16 +78,30 @@ export const ClankPlugin = async ({ client, $, directory }) => {
         const info = event.properties?.info
         if (
           event.type?.startsWith("message.") &&
+          info?.role === "assistant" &&
+          info.error?.name === "MessageAbortedError"
+        ) {
+          aborted.add(id)
+        }
+        if (
+          event.type?.startsWith("message.") &&
           info?.role === "user" &&
           info.id &&
           !seenUserMessages.has(info.id)
         ) {
           seenUserMessages.add(info.id)
           activity.set(id, (activity.get(id) ?? 0) + 1)
+          // The human prompting again is what ends the stop Esc began.
+          aborted.delete(id)
         }
         return
       }
       if (inflight.has(id)) return
+      // Do not even ARM after an interrupt. A wait spawned here would
+      // long-poll holding the guard, and the next genuine idle — the
+      // one ending the turn the user starts next — would be ignored
+      // as in-flight, leaving the loop dormant (the d7c8908 class).
+      if (aborted.has(id)) return
       inflight.add(id)
       const seen = activity.get(id) ?? 0
       let continuation = ""
@@ -106,6 +129,10 @@ export const ClankPlugin = async ({ client, $, directory }) => {
       }
       if (!continuation) return
       if ((activity.get(id) ?? 0) !== seen) return // stale: session moved on
+      // The abort may be observed on EITHER side of the triggering
+      // idle — opencode emits housekeeping after it — so the decision
+      // is made here, where both orderings have been seen.
+      if (aborted.has(id)) return
       // promptAsync: return-on-accept. The handler must not pin the
       // whole model turn.
       await client.session.promptAsync({

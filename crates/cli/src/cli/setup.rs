@@ -1727,6 +1727,8 @@ mod tests {
         activity: u32,
         seen_msgs: std::collections::HashSet<&'static str>,
         pending_wait: Option<u32>,
+        /// The turn was stopped by a human, not finished.
+        aborted: bool,
         arms: u32,
         injections: u32,
     }
@@ -1738,6 +1740,7 @@ mod tests {
                 activity: 0,
                 seen_msgs: Default::default(),
                 pending_wait: None,
+                aborted: false,
                 arms: 0,
                 injections: 0,
             }
@@ -1749,11 +1752,24 @@ mod tests {
         fn user_message(&mut self, id: &'static str) {
             if self.seen_msgs.insert(id) {
                 self.activity += 1;
+                // Prompting again is what ends the stop Esc began.
+                self.aborted = false;
             }
+        }
+
+        /// message.updated, role=assistant, error MessageAbortedError:
+        /// opencode's mark for a turn a human stopped.
+        fn abort(&mut self) {
+            self.aborted = true;
         }
 
         fn idle(&mut self) {
             if self.inflight {
+                return;
+            }
+            // Arming after an interrupt would long-poll holding the
+            // guard, so the next genuine idle is ignored as in-flight.
+            if self.aborted {
                 return;
             }
             self.inflight = true;
@@ -1767,7 +1783,7 @@ mod tests {
         fn wait_returns(&mut self, work: bool) {
             let seen = self.pending_wait.take().expect("wait armed");
             self.inflight = false;
-            if work && self.activity == seen {
+            if work && self.activity == seen && !self.aborted {
                 self.injections += 1;
             }
         }
@@ -1801,6 +1817,98 @@ mod tests {
         m.idle();
         m.idle();
         assert_eq!(m.arms, 4);
+    }
+
+    /// Esc means stop. `session.idle` fires for an interrupted turn
+    /// exactly as it does for a finished one, so the idle alone cannot
+    /// tell them apart — and the staleness guard cannot either, since
+    /// an abort produces no new USER message and leaves the activity
+    /// count untouched. Both orderings are covered: opencode emits
+    /// housekeeping after the idle, so the abort can be observed on
+    /// either side of it.
+    #[test]
+    fn opencode_loop_model_does_not_prod_an_interrupted_turn() {
+        // Abort observed BEFORE the idle: nothing arms, nothing injects.
+        let mut m = LoopModel::new();
+        m.user_message("msg_user_1");
+        m.abort();
+        m.idle();
+        assert_eq!(
+            (m.arms, m.injections),
+            (0, 0),
+            "an interrupted turn must not even arm a wait"
+        );
+
+        // Prompting again ends the stop: the loop works normally after.
+        m.user_message("msg_user_2");
+        m.idle();
+        m.wait_returns(true);
+        assert_eq!(
+            (m.arms, m.injections),
+            (1, 1),
+            "a new prompt re-arms the loop"
+        );
+
+        // Abort observed AFTER the idle, while the wait is in flight:
+        // the wait armed, so the discard has to happen at injection.
+        m.user_message("msg_user_3");
+        m.idle();
+        m.abort();
+        m.wait_returns(true);
+        assert_eq!(
+            (m.arms, m.injections),
+            (2, 1),
+            "an abort during the wait discards its continuation"
+        );
+
+        // And the latch persists: a later idle still injects nothing.
+        m.idle();
+        assert_eq!((m.arms, m.injections), (2, 1));
+
+        // A turn that ends by COMPLETING is unaffected — the fix must
+        // not buy quiet by breaking the loop.
+        m.user_message("msg_user_4");
+        m.idle();
+        m.wait_returns(true);
+        assert_eq!((m.arms, m.injections), (3, 2));
+    }
+
+    #[test]
+    fn opencode_plugin_keys_the_abort_on_the_assistant_message() {
+        let src = OPENCODE_PLUGIN;
+        // The FACT, not a heuristic (elapsed time, empty output).
+        assert!(src.contains(r#"info.error?.name === "MessageAbortedError""#));
+        assert!(src.contains(r#"info?.role === "assistant""#));
+        // Read from the message, NOT session.error: that event's
+        // schema makes sessionID optional, so it cannot attribute an
+        // abort to a session.
+        // The QUOTED event name: a real subscription must name it as a
+        // string. Matching bare `session.error` would also hit the
+        // comment explaining why it is not used, and a check that
+        // deletes its own rationale teaches nothing.
+        assert!(
+            !src.contains("\"session.error\""),
+            "session.error cannot attribute an abort — its sessionID is optional"
+        );
+        // The latch clears when the human prompts again.
+        assert!(src.contains("aborted.delete(id)"));
+        // Checked at BOTH points: before arming, and again at
+        // injection, since the abort can be observed on either side of
+        // the triggering idle.
+        assert_eq!(src.matches("aborted.has(id)").count(), 2);
+        let arm = src.find("inflight.add(id)").expect("arm site");
+        let inject = src
+            .find("client.session.promptAsync(")
+            .expect("injection site");
+        let checks: Vec<_> = src
+            .match_indices("aborted.has(id)")
+            .map(|(i, _)| i)
+            .collect();
+        assert!(checks[0] < arm, "the arm-time check must precede arming");
+        assert!(
+            checks[1] > arm && checks[1] < inject,
+            "the injection-time check must sit between the wait and the injection"
+        );
     }
 
     #[test]
