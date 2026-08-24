@@ -18,6 +18,7 @@ pub mod hook_config;
 pub mod init_facts;
 pub mod owner_sentinel;
 pub mod preview;
+pub mod proc_identity;
 pub mod repo_watch;
 pub mod runtime;
 pub mod state_cache;

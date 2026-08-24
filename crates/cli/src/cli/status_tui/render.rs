@@ -124,10 +124,34 @@ pub(super) fn render_at(
         let actions = detail_actions(agent.role);
         return render_agent_detail(agent, &actions, sel, rows, cols);
     }
+    if let Mode::WaitDetail { agent, sel } = mode
+        && let Some((a, att)) = snap
+            .agents
+            .get(agent)
+            .and_then(|a| a.attending.as_ref().map(|t| (a, t)))
+    {
+        let actions = wait_actions(att.killable_pid().is_some());
+        return render_wait_page(&a.label, att, &actions, sel, rows, cols);
+    }
     if let Mode::Confirm { action } = mode {
         match action {
             ConfirmAction::AddCandidate { .. } | ConfirmAction::RemoveAgent { .. } => {
                 return render_roster_confirm(snap, picker, action, rows, cols);
+            }
+            ConfirmAction::KillAttended => {
+                if let Some((a, att)) = view
+                    .wait_page
+                    .and_then(|p| {
+                        snap.agents
+                            .iter()
+                            .find(|a| a.label == p.label)
+                            .map(|a| (a, a.attending.as_ref()))
+                    })
+                    .and_then(|(a, att)| att.map(|t| (a, t)))
+                {
+                    return render_kill_confirm(&a.label, att, rows, cols);
+                }
+                return (vec![region_rule("stop", "", true, cols)], 1);
             }
             ConfirmAction::StashPlan | ConfirmAction::PurgeArtifacts | ConfirmAction::PurgeDrop => {
                 if let Mode::BlockAnswer { block } = mode {
@@ -454,6 +478,21 @@ pub(super) fn scrollable_header(
     // Stop-hook decision — NOT a live run/stop indicator). Gated on a
     // non-empty roster so a teamless repo (and every panel-less
     // render) is byte-for-byte unchanged.
+    let wait_view = agent_wait_view(snap, cols);
+    // The SAME enumeration the cursor walks: deriving positions
+    // arithmetically here is what let the queue rows highlight at
+    // the stash rows' offsets.
+    let panel = panel_rows(
+        snap.agents.len(),
+        &wait_view
+            .iter()
+            .enumerate()
+            .filter_map(|(i, (_, m))| m.is_some().then_some(i))
+            .collect::<Vec<_>>(),
+        snap.stash.len(),
+        snap.queue.len(),
+    );
+    let at = |row: PanelRow| panel.iter().position(|r| *r == row);
     if !snap.agents.is_empty() {
         // Each agent row; the cursor row gets the unified selection band.
         // The tier (master/commit/gate) distinguishes the kinds.
@@ -484,22 +523,24 @@ pub(super) fn scrollable_header(
             // spinning `working…` on an agent that was blocked, merely
             // because the pane was too narrow to say on what (codex on
             // 46e5e53).
-            let waiting = a
-                .attending
-                .as_ref()
-                .and_then(|att| att.marker_fields(time::OffsetDateTime::now_utc()));
-            let marker = waiting.as_ref().and_then(|f| {
-                fit_marker(f, (cols as usize).saturating_sub(ATTENDING_INDENT.len()))
-            });
+            let (waiting, marker) = wait_view
+                .get(i)
+                .map(|(w, m)| (*w, m.clone()))
+                .unwrap_or((false, None));
             // No live wait — including a record whose process has
             // ended, which leaves the agent free to be working.
-            if waiting.is_none() {
+            if !waiting {
                 if let Some(verb) = verb_for(&a.label) {
                     spans.push(dim(format!("  {}", spinner_glyph(frame))));
                     spans.push(italic(format!(" {verb}…")));
                 }
             }
-            head_out.push(row_line(&spans, mode.selected() == Some(i), color, cols));
+            head_out.push(row_line(
+                &spans,
+                mode.selected() == at(PanelRow::Agent(i)),
+                color,
+                cols,
+            ));
             // The wait gets its OWN line beneath its agent, so naming
             // it costs the agent row nothing. Not selectable: rows stay
             // 1:1 with the cursor's agent indices, and reaching this
@@ -507,7 +548,7 @@ pub(super) fn scrollable_header(
             if let Some(marker) = marker {
                 head_out.push(row_line(
                     &[dim(format!("{ATTENDING_INDENT}{marker}"))],
-                    false,
+                    mode.selected() == at(PanelRow::Wait(i)),
                     color,
                     cols,
                 ));
@@ -516,7 +557,7 @@ pub(super) fn scrollable_header(
         // "+ add" button — the last selectable row (cursor index
         // `agents.len()`).
         {
-            let add_selected = mode.selected() == Some(snap.agents.len());
+            let add_selected = mode.selected() == at(PanelRow::Add);
             let spans = vec![plain("+ add agent".to_string())];
             head_out.push(row_line(&spans, add_selected, color, cols));
         }
@@ -556,10 +597,9 @@ pub(super) fn scrollable_header(
             if !note.is_empty() {
                 spans.push(if item.ready { accent(note) } else { dim(note) });
             }
-            let sel_idx = snap.agents.len() + 1 + i;
             head_out.push(row_line(
                 &spans,
-                mode.selected() == Some(sel_idx),
+                mode.selected() == at(PanelRow::Stash(i)),
                 color,
                 cols,
             ));
@@ -586,10 +626,9 @@ pub(super) fn scrollable_header(
                 dim(format!("{:03} ", item.priority)),
                 plain(item.name.clone()),
             ];
-            let sel_idx = snap.agents.len() + 1 + i;
             head_out.push(row_line(
                 &spans,
-                mode.selected() == Some(sel_idx),
+                mode.selected() == at(PanelRow::Queue(i)),
                 color,
                 cols,
             ));
@@ -604,6 +643,35 @@ pub(super) fn scrollable_header(
 #[cfg(test)]
 pub(super) fn render(snap: &StatusSnapshot, rows: u16, cols: u16) -> Vec<String> {
     render_at(snap, rows, cols, 0, 0, &PanelView::just(Mode::LogScroll)).0
+}
+
+/// Per agent: is it BLOCKED on a wait, and what marker (if any) fits
+/// beside it at `cols`.
+///
+/// One source for both facts, because the renderer and the cursor must
+/// not disagree: a row the cursor can reach has to be a row the user
+/// can see, and a blocked agent must not spin merely because its wait
+/// did not fit.
+pub(super) fn agent_wait_view(snap: &StatusSnapshot, cols: usize) -> Vec<(bool, Option<String>)> {
+    let now = time::OffsetDateTime::now_utc();
+    let budget = cols.saturating_sub(ATTENDING_INDENT.len());
+    snap.agents
+        .iter()
+        .map(|a| {
+            let fields = a.attending.as_ref().and_then(|att| att.marker_fields(now));
+            let marker = fields.as_ref().and_then(|f| fit_marker(f, budget));
+            (fields.is_some(), marker)
+        })
+        .collect()
+}
+
+/// The agent indices whose wait the cursor may land on.
+pub(super) fn drawable_waits(snap: &StatusSnapshot, cols: usize) -> Vec<usize> {
+    agent_wait_view(snap, cols)
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, (_, marker))| marker.is_some().then_some(i))
+        .collect()
 }
 
 /// The attendance line sits one step in from its agent. The agents
@@ -1177,6 +1245,110 @@ pub(super) fn detail_row_spans(
 /// tier is three checkboxes (←/→/␣ flip), promote/remove/back are
 /// actions, the cursor marked by a `▸` caret. Hard-clamped to `rows`.
 /// Returns `(lines, 0)` — no log.
+/// The WAIT page: what the wait is, and whether it can be stopped.
+///
+/// States what is NOT known rather than blanking a field — a record
+/// with no pid cannot report liveness, and saying so is the honest
+/// answer that "cannot check" is not "ended".
+pub(super) fn render_wait_page(
+    label: &str,
+    att: &crate::cli::stop_hook::Attended,
+    actions: &[WaitAction],
+    sel: usize,
+    rows: usize,
+    cols: usize,
+) -> (Vec<String>, usize) {
+    let mut out: Vec<String> = Vec::new();
+    out.push(region_rule(&format!("wait · {label}"), "", true, cols));
+    out.push(String::new());
+
+    let field = |name: &str, value: String| {
+        emit(
+            &[dim(format!("   {name:<11}")), plain(one_line(&value, cols))],
+            "",
+            cols,
+        )
+    };
+    out.push(field("doing", att.subject().to_string()));
+    out.push(field("task", att.task.clone()));
+    out.push(field(
+        "started",
+        att.age(time::OffsetDateTime::now_utc())
+            .map(|a| format!("{a} ago"))
+            .unwrap_or_else(|| "unknown".to_string()),
+    ));
+    out.push(field(
+        "process",
+        match (att.pid, att.process_alive()) {
+            (Some(pid), Some(true)) => format!("pid {pid}, running"),
+            (Some(pid), Some(false)) => format!("pid {pid}, ended"),
+            (Some(pid), None) => format!("pid {pid}"),
+            (None, _) => "not recorded".to_string(),
+        },
+    ));
+
+    // Why the kill row is absent, when it is. The page says it rather
+    // than showing a control that cannot work.
+    if let Some(why) = att.kill_blocker() {
+        out.push(String::new());
+        for line in wrap(
+            &format!("cannot stop it: {why}"),
+            cols.saturating_sub(3).max(1),
+        ) {
+            out.push(emit(&[dim(format!("   {line}"))], "", cols));
+        }
+    }
+
+    out.push(String::new());
+    for (i, a) in actions.iter().enumerate() {
+        let (glyph, text, danger) = match a {
+            WaitAction::Kill => ("✗", "stop this process", true),
+            WaitAction::Back => ("‹", "back", false),
+        };
+        let spans = vec![if danger {
+            colored("31", format!("   {glyph} {text}"))
+        } else {
+            plain(format!("   {glyph} {text}"))
+        }];
+        out.push(row_line(&spans, sel == i, "", cols));
+    }
+    let len = out.len();
+    out.truncate(rows);
+    (out, len)
+}
+
+/// The kill confirm. Names the target AND the blast radius: signalling
+/// one pid does not reach its children, and promising a clean tree
+/// kill would be a lie.
+pub(super) fn render_kill_confirm(
+    label: &str,
+    att: &crate::cli::stop_hook::Attended,
+    rows: usize,
+    cols: usize,
+) -> (Vec<String>, usize) {
+    let mut out: Vec<String> = Vec::new();
+    out.push(region_rule(&format!("stop · {label}"), "", true, cols));
+    out.push(String::new());
+    let pid = att.pid.map(|p| p.to_string()).unwrap_or_default();
+    let body = format!(
+        "Send SIGTERM to pid {pid} ({})? Its children are NOT signalled and may keep \
+         running. The attendance record is kept either way.",
+        att.subject()
+    );
+    for line in wrap(&body, cols.saturating_sub(3).max(1)) {
+        out.push(emit(&[plain(format!("   {line}"))], "", cols));
+    }
+    out.push(String::new());
+    out.push(emit(
+        &[dim("   y stop it   ·   n cancel".to_string())],
+        "",
+        cols,
+    ));
+    let len = out.len();
+    out.truncate(rows);
+    (out, len)
+}
+
 pub(super) fn render_agent_detail(
     agent: &crate::cli::status::AgentAutoRow,
     actions: &[DetailAction],
@@ -1815,6 +1987,9 @@ pub(super) fn render_roster_confirm(
     cols: usize,
 ) -> (Vec<String>, usize) {
     let target = match action {
+        // Rendered by `render_kill_confirm`, which needs the wait
+        // record rather than the roster.
+        ConfirmAction::KillAttended => return (Vec::new(), 0),
         ConfirmAction::AddCandidate { idx } => picker
             .get(idx)
             .map(|c| format!("{} [{}]", c.label, c.tool))
@@ -1829,6 +2004,7 @@ pub(super) fn render_roster_confirm(
         }
     };
     let (title, consequence) = match action {
+        ConfirmAction::KillAttended => unreachable!("returned above"),
         ConfirmAction::AddCandidate { .. } => (
             format!("add reviewer `{target}`?"),
             "adds this global-library agent to the local roster in .clank/config.json",
@@ -2748,6 +2924,7 @@ mod tests {
                             mode,
                             plan_page: None,
                             event_page: None,
+                            wait_page: None,
                             plan_input: None,
                             picker: &[],
                             log_cursor: 0,
@@ -2783,6 +2960,7 @@ mod tests {
         PanelView {
             plan_page: None,
             event_page: None,
+            wait_page: None,
             plan_input: None,
             mode: Mode::LogScroll,
             picker: &[],
@@ -2993,6 +3171,7 @@ mod tests {
         let view = PanelView {
             plan_page: None,
             event_page: None,
+            wait_page: None,
             plan_input: None,
             mode: Mode::LogScroll,
             picker: &[],
@@ -3701,6 +3880,7 @@ mod tests {
             &PanelView {
                 plan_page: None,
                 event_page: None,
+                wait_page: None,
                 plan_input: None,
                 mode: Mode::AddPicker { sel: 0 },
                 picker: &picker,
@@ -3744,6 +3924,7 @@ mod tests {
         let view = PanelView {
             plan_page: None,
             event_page: None,
+            wait_page: None,
             plan_input: None,
             mode: Mode::AddPicker { sel: 0 },
             picker: &picker,
@@ -3837,6 +4018,7 @@ mod tests {
             &PanelView {
                 plan_page: None,
                 event_page: None,
+                wait_page: None,
                 plan_input: None,
                 mode: Mode::Confirm {
                     action: ConfirmAction::AddCandidate { idx: 0 },
@@ -4191,6 +4373,7 @@ mod tests {
         let view = PanelView {
             plan_page: None,
             event_page: None,
+            wait_page: None,
             plan_input: None,
             mode: Mode::LogScroll,
             picker: &[],
@@ -4630,6 +4813,7 @@ mod tests {
         s.plans = vec![plan_state("foo", WaitingOn::MasterToContinue)];
         s.agents[0].attending = Some(crate::cli::stop_hook::Attended {
             desc: None,
+            token: None,
             task: "b72qah60w".to_string(),
             pid: Some(std::process::id() as i32),
             at: "2026-08-20T14:51:09Z".to_string(),
@@ -4655,6 +4839,7 @@ mod tests {
         let mut s = two_agent_snap();
         s.agents[0].attending = Some(crate::cli::stop_hook::Attended {
             desc: None,
+            token: None,
             task: "b72qah60w".to_string(),
             // Above every platform's pid_max, so it cannot be running.
             pid: Some(i32::MAX),
@@ -4679,6 +4864,7 @@ mod tests {
         let mut s = two_agent_snap();
         s.agents[0].attending = Some(crate::cli::stop_hook::Attended {
             desc: None,
+            token: None,
             task: "b72qah60w".to_string(),
             pid: None,
             at: "2026-08-20T14:51:09Z".to_string(),
@@ -4699,6 +4885,7 @@ mod tests {
     fn the_marker_names_its_subject_description_first_then_the_id() {
         let att = |desc: Option<&str>| crate::cli::stop_hook::Attended {
             desc: desc.map(str::to_string),
+            token: None,
             task: "b72qah60w".to_string(),
             pid: Some(std::process::id() as i32),
             at: "2026-08-20T14:51:09Z".to_string(),
@@ -4747,6 +4934,7 @@ mod tests {
         ] {
             let att = crate::cli::stop_hook::Attended {
                 desc: desc.map(str::to_string),
+                token: None,
                 task: "b72qah60w".to_string(),
                 pid,
                 at: at.to_string(),
@@ -4834,6 +5022,7 @@ mod tests {
         s.plans = vec![plan_state("foo", WaitingOn::MasterToContinue)];
         s.agents[0].attending = Some(crate::cli::stop_hook::Attended {
             desc: None,
+            token: None,
             // Nothing to name: the record is live but unnameable.
             task: String::new(),
             pid: Some(std::process::id() as i32),
@@ -4868,6 +5057,7 @@ mod tests {
         let mut s = two_agent_snap();
         s.agents[0].attending = Some(crate::cli::stop_hook::Attended {
             desc: Some("running the whole test suite".to_string()),
+            token: None,
             task: "b72qah60w".to_string(),
             pid: Some(std::process::id() as i32),
             at: "2026-08-20T14:51:09Z".to_string(),
@@ -4931,6 +5121,7 @@ mod tests {
         let mut s = two_agent_snap();
         s.agents[0].attending = Some(crate::cli::stop_hook::Attended {
             desc: Some("test run".to_string()),
+            token: None,
             task: "b72qah60w".to_string(),
             pid: Some(std::process::id() as i32),
             at: "2026-08-20T14:51:09Z".to_string(),
@@ -4958,6 +5149,90 @@ mod tests {
         );
     }
 
+    /// The page says WHY it cannot stop a process, instead of just
+    /// omitting the control. An absent button with no explanation
+    /// teaches nothing, and each of these has a different remedy.
+    #[test]
+    fn the_wait_page_explains_every_reason_it_cannot_stop_a_process() {
+        let att = |pid: Option<i32>, token: Option<crate::proc_identity::ProcToken>| {
+            crate::cli::stop_hook::Attended {
+                task: "b72qah60w".to_string(),
+                desc: Some("test run".to_string()),
+                pid,
+                token,
+                at: "2026-08-20T14:51:09Z".to_string(),
+            }
+        };
+        let me = std::process::id() as i32;
+        let body = |a: &crate::cli::stop_hook::Attended| {
+            let actions = wait_actions(a.killable_pid().is_some());
+            render_wait_page("claude", a, &actions, 0, 40, 80)
+                .0
+                .iter()
+                .map(|l| visible(l))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let no_pid = body(&att(None, None));
+        assert!(no_pid.contains("no pid"), "{no_pid}");
+        assert!(!no_pid.contains("stop this process"), "no control offered");
+
+        let no_token = body(&att(Some(me), None));
+        assert!(
+            no_token.contains("before clank identified processes"),
+            "{no_token}"
+        );
+
+        let dead = body(&att(
+            Some(i32::MAX),
+            Some(crate::proc_identity::ProcToken::MacStart { sec: 1, usec: 1 }),
+        ));
+        assert!(dead.contains("already ended"), "{dead}");
+
+        let reused = body(&att(
+            Some(me),
+            Some(crate::proc_identity::ProcToken::MacStart { sec: 1, usec: 1 }),
+        ));
+        assert!(reused.contains("reused"), "{reused}");
+        assert!(!reused.contains("stop this process"), "and offers nothing");
+
+        // The one case that CAN be stopped offers the control and
+        // explains nothing.
+        let live = body(&att(Some(me), crate::proc_identity::token_for(me)));
+        assert!(live.contains("stop this process"), "{live}");
+        assert!(!live.contains("cannot stop it"), "{live}");
+    }
+
+    /// The confirm names the blast radius rather than implying a clean
+    /// tree kill: one pid is signalled, its children are not.
+    #[test]
+    fn the_kill_confirm_says_what_it_does_not_reach() {
+        let me = std::process::id() as i32;
+        let att = crate::cli::stop_hook::Attended {
+            task: "b72qah60w".to_string(),
+            desc: Some("test run".to_string()),
+            pid: Some(me),
+            token: crate::proc_identity::token_for(me),
+            at: "2026-08-20T14:51:09Z".to_string(),
+        };
+        let body = render_kill_confirm("claude", &att, 40, 80)
+            .0
+            .iter()
+            .map(|l| visible(l))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(body.contains(&me.to_string()), "names the target: {body}");
+        assert!(
+            body.contains("children"),
+            "and what it will not reach: {body}"
+        );
+        assert!(
+            body.contains("record is kept"),
+            "and that nothing is reaped: {body}"
+        );
+    }
+
     /// The regression that took the layout down: `⌛` is U+231B, two
     /// columns, measured as one. Every attending row came out a column
     /// over, wrapped, and pushed the status bar off screen.
@@ -4980,6 +5255,7 @@ mod tests {
         let mut s = two_agent_snap();
         s.agents[0].attending = Some(crate::cli::stop_hook::Attended {
             desc: None,
+            token: None,
             task: "b72qah60w".to_string(),
             pid: Some(std::process::id() as i32),
             at: "2026-08-20T14:51:09Z".to_string(),

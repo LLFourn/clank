@@ -113,6 +113,8 @@ pub(super) enum Mode {
     /// member keys) lives in the loop's `event_page` — same
     /// set/clear-together invariant as `plan_page`.
     EventDetail { sel: usize },
+    /// The open WAIT page: which agent's wait, and the cursor row on it.
+    WaitDetail { agent: usize, sel: usize },
     /// A one-line text input on the plan page (force-finish subject,
     /// squash message, block reason, drop type-to-confirm). The BUFFER
     /// lives in the loop's `plan_input` (Mode stays `Copy`); same
@@ -505,34 +507,112 @@ pub(super) enum DetailNav {
     MoveCursor(usize),
     /// Activate the action under the cursor.
     Activate(DetailAction),
+    /// The wait page's kill row — routed to a confirm, never straight
+    /// to a signal.
+    ActivateKill,
 }
 
-/// Re-bind the panel cursor across a data refresh. An agent/"+ add"
-/// cursor re-bounds by CLAMP to the new roster; a QUEUE-row cursor is
-/// re-bound by NAME (`queue_name`, captured from the OLD snapshot) — the
-/// refresh is often self-inflicted (a reprioritise renames the queue
-/// file and re-sorts the list), and the cursor must FOLLOW the item, not
-/// snap back to "+ add". A vanished item (promoted/removed under us)
-/// drops the cursor to the "+ add" row.
-pub(super) fn rebind_panel_sel(
-    old_sel: usize,
-    stash_name: Option<&str>,
-    queue_name: Option<&str>,
-    agents_len: usize,
-    stash: &[crate::cli::status::StashItemView],
-    queue: &[crate::cli::status::QueueItemView],
+/// What the panel cursor was ON, by IDENTITY rather than position.
+///
+/// A refresh rebuilds the row list, and positions move: a wait
+/// appearing above the cursor shifts every row after it, and the old
+/// arithmetic (`agents_len + 1 + i` for stash, the same for queue)
+/// could not see waits at all. Captured before the rebuild, located
+/// after it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum PanelAnchor {
+    Agent(String),
+    /// The wait belonging to that agent.
+    /// A wait, by its full attendance INSTANCE. The owning agent's
+    /// label alone would rebind onto a REPLACEMENT attendance for the
+    /// same agent — a different wait wearing the same row.
+    Wait {
+        label: String,
+        task: String,
+        at: String,
+    },
+    Add,
+    Stash(String),
+    Queue(String),
+}
+
+/// What the cursor is on now, for re-locating after a refresh.
+pub(super) fn capture_anchor(
+    sel: usize,
+    rows: &[PanelRow],
+    agents: &[crate::cli::status::AgentAutoRow],
+    stash_stems: &[String],
+    queue_names: &[String],
+) -> PanelAnchor {
+    match rows.get(sel) {
+        Some(PanelRow::Agent(i)) => agents
+            .get(*i)
+            .map(|a| PanelAnchor::Agent(a.label.clone()))
+            .unwrap_or(PanelAnchor::Add),
+        // The full instance: a replacement attendance under the same
+        // agent is a different wait and must not inherit this cursor.
+        Some(PanelRow::Wait(i)) => agents
+            .get(*i)
+            .and_then(|a| {
+                a.attending.as_ref().map(|att| PanelAnchor::Wait {
+                    label: a.label.clone(),
+                    task: att.task.clone(),
+                    at: att.at.clone(),
+                })
+            })
+            .unwrap_or(PanelAnchor::Add),
+        Some(PanelRow::Stash(i)) => stash_stems
+            .get(*i)
+            .map(|n| PanelAnchor::Stash(n.clone()))
+            .unwrap_or(PanelAnchor::Add),
+        Some(PanelRow::Queue(i)) => queue_names
+            .get(*i)
+            .map(|n| PanelAnchor::Queue(n.clone()))
+            .unwrap_or(PanelAnchor::Add),
+        _ => PanelAnchor::Add,
+    }
+}
+
+/// Where that anchor sits in the rebuilt list.
+///
+/// A vanished wait falls back to its OWNING AGENT rather than to the
+/// add row: the agent is still there and is what the wait hung under,
+/// so that is where the user's attention already is. Everything else
+/// that vanishes drops to "+ add".
+pub(super) fn rebind_anchor(
+    anchor: &PanelAnchor,
+    rows: &[PanelRow],
+    agents: &[crate::cli::status::AgentAutoRow],
+    stash_stems: &[String],
+    queue_names: &[String],
 ) -> usize {
-    if let Some(name) = stash_name
-        && let Some(pos) = stash.iter().position(|i| i.stem == name)
-    {
-        return agents_len + 1 + pos;
-    }
-    if let Some(name) = queue_name
-        && let Some(pos) = queue.iter().position(|q| q.name == name)
-    {
-        return agents_len + 1 + stash.len() + pos;
-    }
-    old_sel.min(agents_len)
+    let find = |want: PanelRow| rows.iter().position(|r| *r == want);
+    let by_label = |label: &str| agents.iter().position(|a| a.label == label);
+    let at = match anchor {
+        PanelAnchor::Agent(label) => by_label(label).and_then(|i| find(PanelRow::Agent(i))),
+        // The SAME attendance, or else the agent it hung under. A
+        // replacement is a DIFFERENT wait and must not inherit this
+        // cursor.
+        PanelAnchor::Wait { label, task, at } => by_label(label).and_then(|i| {
+            let same = agents[i]
+                .attending
+                .as_ref()
+                .is_some_and(|c| &c.task == task && &c.at == at);
+            same.then(|| find(PanelRow::Wait(i)))
+                .flatten()
+                .or_else(|| find(PanelRow::Agent(i)))
+        }),
+        PanelAnchor::Stash(name) => stash_stems
+            .iter()
+            .position(|n| n == name)
+            .and_then(|i| find(PanelRow::Stash(i))),
+        PanelAnchor::Queue(name) => queue_names
+            .iter()
+            .position(|n| n == name)
+            .and_then(|i| find(PanelRow::Queue(i))),
+        PanelAnchor::Add => None,
+    };
+    at.unwrap_or_else(|| add_row_index(rows))
 }
 
 /// Re-locate an open detail page by LABEL after a roster rebuild:
@@ -565,6 +645,42 @@ pub(super) fn is_toggle(action: DetailAction) -> bool {
 /// directional or space key can never fire the destructive `Remove` or
 /// `PromoteToMaster`; only `Enter` "selects" (activates) an action. This
 /// matches the hint exactly (←→ ␣ change · ⏎ select).
+/// A row on the WAIT page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum WaitAction {
+    /// SIGTERM the recorded process — the one destructive action here,
+    /// offered only when the process can still be identified.
+    Kill,
+    Back,
+}
+
+/// The wait page's actions. `killable` is false whenever the process
+/// cannot be identified — no pid, a dead one, a record predating the
+/// identity token, or a token that no longer matches the pid. The row
+/// is then ABSENT rather than shown-and-inert: a control that cannot
+/// work teaches nothing, and the page says why in its body.
+pub(super) fn wait_actions(killable: bool) -> Vec<WaitAction> {
+    if killable {
+        vec![WaitAction::Kill, WaitAction::Back]
+    } else {
+        vec![WaitAction::Back]
+    }
+}
+
+pub(super) fn wait_page_nav(sel: usize, actions: &[WaitAction], key: Key) -> DetailNav {
+    match key {
+        Key::Quit => DetailNav::Quit,
+        Key::Escape | Key::Focus | Key::Char(b'a') => DetailNav::Back,
+        Key::Up => DetailNav::MoveCursor(move_selection(sel, actions.len(), false)),
+        Key::Down => DetailNav::MoveCursor(move_selection(sel, actions.len(), true)),
+        Key::Enter => match actions.get(sel) {
+            Some(WaitAction::Kill) => DetailNav::ActivateKill,
+            _ => DetailNav::Back,
+        },
+        _ => DetailNav::None,
+    }
+}
+
 pub(super) fn agent_detail_nav(sel: usize, actions: &[DetailAction], key: Key) -> DetailNav {
     let current = || actions.get(sel).copied().unwrap_or(DetailAction::Back);
     match key {
@@ -626,6 +742,11 @@ pub(super) enum ConfirmAction {
     PurgeArtifacts,
     /// `purge --drop` the open plan page's plan — the scariest one.
     PurgeDrop,
+    /// SIGTERM the open wait page's process. Carries no pid: the
+    /// target is re-resolved from the page's identity AFTER the
+    /// confirm, because everything checked before it is stale by the
+    /// time the answer arrives.
+    KillAttended,
 }
 
 impl ConfirmAction {
@@ -676,6 +797,29 @@ impl Mode {
             m @ (Mode::PlanDetail { .. } | Mode::PurgeChoice { .. }) => m,
             _ => Mode::LogScroll,
         }
+    }
+}
+
+/// The open WAIT page's identity, held beside the `Copy` [`Mode`].
+///
+/// The ATTENDANCE INSTANCE, not just the agent and task: the same
+/// agent can attend the same task again, and a replacement record
+/// carries a new pid, description and `at`. Keying on label+task alone
+/// would leave this page — or a confirm standing on top of it —
+/// pointed at a different wait than the user chose.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct WaitPage {
+    pub(super) label: String,
+    pub(super) task: String,
+    /// Per-record, so a replacement is a DIFFERENT instance.
+    pub(super) at: String,
+}
+
+impl WaitPage {
+    /// Is this still the same attendance? Compared in full — agent,
+    /// task and instance.
+    pub(super) fn matches(&self, label: &str, att: &crate::cli::stop_hook::Attended) -> bool {
+        self.label == label && self.task == att.task && self.at == att.at
     }
 }
 
@@ -910,6 +1054,7 @@ pub(super) struct PanelView<'a> {
     pub(super) mode: Mode,
     pub(super) plan_page: Option<&'a PlanPage>,
     pub(super) event_page: Option<&'a EventPage>,
+    pub(super) wait_page: Option<&'a WaitPage>,
     pub(super) plan_input: Option<&'a TextInput>,
     pub(super) picker: &'a [crate::cli::status::AvailableAgent],
     /// The selected log ENTRY (index into the scroll sequence) — drawn
@@ -932,6 +1077,7 @@ impl<'a> PanelView<'a> {
             mode,
             plan_page: None,
             event_page: None,
+            wait_page: None,
             plan_input: None,
             picker: &[],
             log_cursor: 0,
@@ -957,6 +1103,8 @@ pub(super) enum PanelAction {
     ToggleAuto(usize),
     /// Open the per-agent detail page (Enter on an agent row).
     OpenDetail(usize),
+    /// Open the wait attended by that agent.
+    OpenWait(usize),
     /// Open the add picker (Enter/Space on the "+ add" row).
     OpenPicker,
     /// Open a queued plan's read overlay (Enter on a queue row).
@@ -981,20 +1129,66 @@ pub(super) enum PanelAction {
 /// follow at `agents.len()+1..` (Enter reads the queued plan, `o` opens
 /// its HTML page, +/- nudge its priority). Removal/role/tier are no
 /// longer panel actions — Enter opens the detail page where they live.
-pub(super) fn agent_panel_action(
-    sel: usize,
-    agents: &[crate::cli::status::AgentAutoRow],
+/// One CURSOR POSITION in the agent panel, knowing what it is.
+///
+/// The panel used to derive this arithmetically — `agents.len()` was
+/// the add button, stash rows were `sel - add_row - 1`, and so on —
+/// which works only while drawn rows and cursor positions correspond
+/// one to one. They no longer do: an attending agent draws a wait line
+/// beneath it. Positions are enumerated now, so a new row kind cannot
+/// silently shift the arithmetic under every other segment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PanelRow {
+    Agent(usize),
+    /// The wait attended by that agent, drawn beneath its row.
+    Wait(usize),
+    Add,
+    Stash(usize),
+    Queue(usize),
+}
+
+/// Every cursor position in the panel, in screen order. `waits` holds
+/// the agent indices whose wait is BOTH live and drawable — a row the
+/// cursor can reach must be a row the user can see.
+pub(super) fn panel_rows(
+    agents_len: usize,
+    waits: &[usize],
     stash_len: usize,
     queue_len: usize,
-    key: Key,
-) -> PanelAction {
-    let add_row = agents.len();
-    let total = add_row + 1 + stash_len + queue_len;
-    let on_add = sel == add_row;
-    // Which segment the cursor sits in: STASH rows come first (they
-    // render above the queue), then QUEUE rows.
-    let stash_idx = (sel > add_row && sel <= add_row + stash_len).then(|| sel - add_row - 1);
-    let queue_idx = (sel > add_row + stash_len).then(|| sel - add_row - 1 - stash_len);
+) -> Vec<PanelRow> {
+    let mut out = Vec::with_capacity(agents_len + waits.len() + 1 + stash_len + queue_len);
+    for i in 0..agents_len {
+        out.push(PanelRow::Agent(i));
+        if waits.contains(&i) {
+            out.push(PanelRow::Wait(i));
+        }
+    }
+    out.push(PanelRow::Add);
+    out.extend((0..stash_len).map(PanelRow::Stash));
+    out.extend((0..queue_len).map(PanelRow::Queue));
+    out
+}
+
+/// The cursor position of the "+ add" row — the fallback every action
+/// that leaves a picker or removes an agent returns to.
+pub(super) fn add_row_index(rows: &[PanelRow]) -> usize {
+    rows.iter()
+        .position(|r| matches!(r, PanelRow::Add))
+        .unwrap_or(0)
+}
+
+pub(super) fn agent_panel_action(sel: usize, rows: &[PanelRow], key: Key) -> PanelAction {
+    let total = rows.len();
+    let here = rows.get(sel).copied();
+    let on_add = matches!(here, Some(PanelRow::Add));
+    let stash_idx = match here {
+        Some(PanelRow::Stash(i)) => Some(i),
+        _ => None,
+    };
+    let queue_idx = match here {
+        Some(PanelRow::Queue(q)) => Some(q),
+        _ => None,
+    };
     let on_last = sel + 1 == total;
     match key {
         Key::Quit => PanelAction::Quit,
@@ -1009,10 +1203,12 @@ pub(super) fn agent_panel_action(
         // inline auto-toggle (or the picker on "+ add"); it does nothing
         // on a queue row (no accidental overlay).
         Key::Enter if on_add => PanelAction::OpenPicker,
-        Key::Enter => match (stash_idx, queue_idx) {
-            (Some(i), _) => PanelAction::OpenStashItem(i),
-            (_, Some(q)) => PanelAction::OpenQueueItem(q),
-            _ => PanelAction::OpenDetail(sel),
+        Key::Enter => match here {
+            Some(PanelRow::Stash(i)) => PanelAction::OpenStashItem(i),
+            Some(PanelRow::Queue(q)) => PanelAction::OpenQueueItem(q),
+            Some(PanelRow::Agent(i)) => PanelAction::OpenDetail(i),
+            Some(PanelRow::Wait(i)) => PanelAction::OpenWait(i),
+            _ => PanelAction::None,
         },
         Key::Html => match (stash_idx, queue_idx) {
             (Some(i), _) => PanelAction::OpenStashHtml(i),
@@ -1028,8 +1224,12 @@ pub(super) fn agent_panel_action(
             delta: -50,
         },
         Key::Space if on_add => PanelAction::OpenPicker,
-        Key::Space if stash_idx.is_some() || queue_idx.is_some() => PanelAction::None,
-        Key::Space => PanelAction::ToggleAuto(sel),
+        // Space is the agent's inline auto-toggle and belongs to no
+        // other row kind — a wait has no auto mode to flip.
+        Key::Space => match here {
+            Some(PanelRow::Agent(i)) => PanelAction::ToggleAuto(i),
+            _ => PanelAction::None,
+        },
         _ => PanelAction::None,
     }
 }
@@ -1276,8 +1476,8 @@ mod tests {
         use clank_core::vocab::AutoMode;
         let agents = vec![agent_row("claude", RosterRole::Master, AutoMode::On)];
         assert_eq!(
-            agent_panel_action(0, &agents, 0, 0, Key::Char(b'a')),
-            agent_panel_action(0, &agents, 0, 0, Key::Focus),
+            agent_panel_action(0, &panel_rows(agents.len(), &[], 0, 0), Key::Char(b'a')),
+            agent_panel_action(0, &panel_rows(agents.len(), &[], 0, 0), Key::Focus),
             "panel: `a` and Tab both leave focus"
         );
         let acts = [DetailAction::Back];
@@ -1930,6 +2130,119 @@ mod tests {
         assert_eq!(relocate_detail(&label, &removed), None);
     }
 
+    /// A wait is a cursor position of its own, sitting between its
+    /// agent and whatever follows. Positions are ENUMERATED rather
+    /// than derived, which is what stops a new row kind shifting every
+    /// segment after it — the queue rows used to be drawn at the stash
+    /// rows' offsets for exactly that reason.
+    #[test]
+    fn a_drawable_wait_is_a_cursor_position_between_its_agent_and_the_next() {
+        let rows = panel_rows(2, &[0], 1, 2);
+        assert_eq!(
+            rows,
+            vec![
+                PanelRow::Agent(0),
+                PanelRow::Wait(0),
+                PanelRow::Agent(1),
+                PanelRow::Add,
+                PanelRow::Stash(0),
+                PanelRow::Queue(0),
+                PanelRow::Queue(1),
+            ]
+        );
+        assert_eq!(
+            add_row_index(&rows),
+            3,
+            "the add row moved down by the wait"
+        );
+
+        // Stash and queue keep DISTINCT positions — the arithmetic
+        // version gave them the same ones.
+        assert_ne!(
+            rows.iter().position(|r| *r == PanelRow::Stash(0)),
+            rows.iter().position(|r| *r == PanelRow::Queue(0))
+        );
+    }
+
+    /// A wait the pane cannot draw is not a place the cursor may go:
+    /// landing on an invisible row is worse than not reaching it.
+    #[test]
+    fn an_undrawable_wait_is_not_a_cursor_position() {
+        assert_eq!(
+            panel_rows(2, &[], 0, 0),
+            vec![PanelRow::Agent(0), PanelRow::Agent(1), PanelRow::Add]
+        );
+    }
+
+    /// Enter opens the WAIT, not the agent it hangs under — the two
+    /// rows are adjacent and an off-by-one here opens the wrong page.
+    #[test]
+    fn enter_on_a_wait_row_opens_the_wait_not_its_agent() {
+        let rows = panel_rows(2, &[1], 0, 0);
+        // [Agent(0), Agent(1), Wait(1), Add]
+        assert_eq!(
+            agent_panel_action(1, &rows, Key::Enter),
+            PanelAction::OpenDetail(1)
+        );
+        assert_eq!(
+            agent_panel_action(2, &rows, Key::Enter),
+            PanelAction::OpenWait(1)
+        );
+        // And Space, the agent's inline auto-toggle, belongs to no
+        // other row kind — a wait has no auto mode to flip.
+        assert_eq!(
+            agent_panel_action(1, &rows, Key::Space),
+            PanelAction::ToggleAuto(1)
+        );
+        assert_eq!(agent_panel_action(2, &rows, Key::Space), PanelAction::None);
+    }
+
+    /// The agent index an action carries is the AGENT's, not the
+    /// cursor's — they diverge as soon as a wait sits above.
+    #[test]
+    fn actions_carry_the_agent_index_not_the_cursor_position() {
+        let rows = panel_rows(3, &[0], 0, 0);
+        // [Agent(0), Wait(0), Agent(1), Agent(2), Add]
+        assert_eq!(
+            agent_panel_action(3, &rows, Key::Enter),
+            PanelAction::OpenDetail(2),
+            "cursor 3 is agent 2"
+        );
+    }
+
+    /// The kill row is offered only when the process can be
+    /// identified; otherwise it is ABSENT, and the page explains
+    /// rather than showing a control that cannot work.
+    #[test]
+    fn the_kill_row_is_absent_when_the_process_cannot_be_identified() {
+        assert_eq!(wait_actions(true), vec![WaitAction::Kill, WaitAction::Back]);
+        assert_eq!(wait_actions(false), vec![WaitAction::Back]);
+        // Enter on the only row of a non-killable page backs out; it
+        // can never reach the kill.
+        assert_eq!(
+            wait_page_nav(0, &wait_actions(false), Key::Enter),
+            DetailNav::Back
+        );
+        assert_eq!(
+            wait_page_nav(0, &wait_actions(true), Key::Enter),
+            DetailNav::ActivateKill
+        );
+    }
+
+    /// A destructive default is never confirmed by Enter.
+    #[test]
+    fn the_kill_confirm_does_not_default_to_yes() {
+        assert!(!ConfirmAction::KillAttended.default_yes());
+        assert_eq!(
+            confirm_decision(ConfirmAction::KillAttended, Key::Enter),
+            Some(false)
+        );
+        assert_eq!(
+            confirm_decision(ConfirmAction::KillAttended, Key::Escape),
+            Some(false)
+        );
+    }
+
     #[test]
     fn agent_panel_action_routes_keys_by_row_and_role() {
         use crate::cli::teams_config::RosterRole;
@@ -1941,50 +2254,50 @@ mod tests {
         // "+ add" row is index 2 (== agents.len()): Enter AND Space open
         // the picker.
         assert_eq!(
-            agent_panel_action(2, &agents, 0, 0, Key::Enter),
+            agent_panel_action(2, &panel_rows(agents.len(), &[], 0, 0), Key::Enter),
             PanelAction::OpenPicker
         );
         assert_eq!(
-            agent_panel_action(2, &agents, 0, 0, Key::Space),
+            agent_panel_action(2, &panel_rows(agents.len(), &[], 0, 0), Key::Space),
             PanelAction::OpenPicker
         );
         // Agent rows: Enter opens the detail page; Space toggles auto.
         assert_eq!(
-            agent_panel_action(1, &agents, 0, 0, Key::Enter),
+            agent_panel_action(1, &panel_rows(agents.len(), &[], 0, 0), Key::Enter),
             PanelAction::OpenDetail(1)
         );
         assert_eq!(
-            agent_panel_action(1, &agents, 0, 0, Key::Space),
+            agent_panel_action(1, &panel_rows(agents.len(), &[], 0, 0), Key::Space),
             PanelAction::ToggleAuto(1)
         );
         // DEL is no longer a panel action (removal lives on the detail page).
         assert_eq!(
-            agent_panel_action(1, &agents, 0, 0, Key::Delete),
+            agent_panel_action(1, &panel_rows(agents.len(), &[], 0, 0), Key::Delete),
             PanelAction::None
         );
         // Navigation: Down within the panel moves; Down at the +add row
         // (index 2 == agents.len()) crosses into the log; Tab/Esc leave;
         // q quits.
         assert_eq!(
-            agent_panel_action(0, &agents, 0, 0, Key::Down),
+            agent_panel_action(0, &panel_rows(agents.len(), &[], 0, 0), Key::Down),
             PanelAction::MoveCursor(1)
         );
         assert_eq!(
-            agent_panel_action(2, &agents, 0, 0, Key::Down),
+            agent_panel_action(2, &panel_rows(agents.len(), &[], 0, 0), Key::Down),
             PanelAction::EnterLog,
             "Down past +add flows into the log"
         );
         assert_eq!(
-            agent_panel_action(0, &agents, 0, 0, Key::Up),
+            agent_panel_action(0, &panel_rows(agents.len(), &[], 0, 0), Key::Up),
             PanelAction::MoveCursor(0),
             "Up at the top stays put"
         );
         assert_eq!(
-            agent_panel_action(1, &agents, 0, 0, Key::Focus),
+            agent_panel_action(1, &panel_rows(agents.len(), &[], 0, 0), Key::Focus),
             PanelAction::LeaveFocus
         );
         assert_eq!(
-            agent_panel_action(1, &agents, 0, 0, Key::Quit),
+            agent_panel_action(1, &panel_rows(agents.len(), &[], 0, 0), Key::Quit),
             PanelAction::Quit
         );
     }
@@ -2001,46 +2314,46 @@ mod tests {
         let ql = 2;
         // Enter on a queue row reads it; `o` opens its HTML page.
         assert_eq!(
-            agent_panel_action(3, &agents, 0, ql, Key::Enter),
+            agent_panel_action(3, &panel_rows(agents.len(), &[], 0, ql), Key::Enter),
             PanelAction::OpenQueueItem(0)
         );
         assert_eq!(
-            agent_panel_action(4, &agents, 0, ql, Key::Html),
+            agent_panel_action(4, &panel_rows(agents.len(), &[], 0, ql), Key::Html),
             PanelAction::OpenQueueHtml(1)
         );
         // +/- nudge the priority number by 50 (loop clamps + persists via
         // queue::set_priority).
         assert_eq!(
-            agent_panel_action(3, &agents, 0, ql, Key::Plus),
+            agent_panel_action(3, &panel_rows(agents.len(), &[], 0, ql), Key::Plus),
             PanelAction::NudgeQueue { idx: 0, delta: 50 }
         );
         assert_eq!(
-            agent_panel_action(3, &agents, 0, ql, Key::Minus),
+            agent_panel_action(3, &panel_rows(agents.len(), &[], 0, ql), Key::Minus),
             PanelAction::NudgeQueue { idx: 0, delta: -50 }
         );
         // Space on a queue row is inert (no accidental overlay); `o` on an
         // agent row is inert too.
         assert_eq!(
-            agent_panel_action(3, &agents, 0, ql, Key::Space),
+            agent_panel_action(3, &panel_rows(agents.len(), &[], 0, ql), Key::Space),
             PanelAction::None
         );
         assert_eq!(
-            agent_panel_action(1, &agents, 0, ql, Key::Html),
+            agent_panel_action(1, &panel_rows(agents.len(), &[], 0, ql), Key::Html),
             PanelAction::None
         );
         // Down from "+ add" now enters the queue, not the log; Down from
         // the LAST queue row crosses into the log.
         assert_eq!(
-            agent_panel_action(2, &agents, 0, ql, Key::Down),
+            agent_panel_action(2, &panel_rows(agents.len(), &[], 0, ql), Key::Down),
             PanelAction::MoveCursor(3)
         );
         assert_eq!(
-            agent_panel_action(4, &agents, 0, ql, Key::Down),
+            agent_panel_action(4, &panel_rows(agents.len(), &[], 0, ql), Key::Down),
             PanelAction::EnterLog
         );
         // With an empty queue, Down from "+ add" still enters the log.
         assert_eq!(
-            agent_panel_action(2, &agents, 0, 0, Key::Down),
+            agent_panel_action(2, &panel_rows(agents.len(), &[], 0, 0), Key::Down),
             PanelAction::EnterLog
         );
     }
@@ -2056,77 +2369,171 @@ mod tests {
         // Rows: 0-1 agents, 2 "+ add", 3 the stash row, 4 the queue row.
         let (sl, ql) = (1, 1);
         assert_eq!(
-            agent_panel_action(3, &agents, sl, ql, Key::Enter),
+            agent_panel_action(3, &panel_rows(agents.len(), &[], sl, ql), Key::Enter),
             PanelAction::OpenStashItem(0)
         );
         assert_eq!(
-            agent_panel_action(3, &agents, sl, ql, Key::Html),
+            agent_panel_action(3, &panel_rows(agents.len(), &[], sl, ql), Key::Html),
             PanelAction::OpenStashHtml(0)
         );
         // The queue row sits AFTER the stash segment.
         assert_eq!(
-            agent_panel_action(4, &agents, sl, ql, Key::Enter),
+            agent_panel_action(4, &panel_rows(agents.len(), &[], sl, ql), Key::Enter),
             PanelAction::OpenQueueItem(0)
         );
         // +/- are queue-only; inert on a stash row.
         assert_eq!(
-            agent_panel_action(3, &agents, sl, ql, Key::Plus),
+            agent_panel_action(3, &panel_rows(agents.len(), &[], sl, ql), Key::Plus),
             PanelAction::None
         );
         // Down from the LAST row (the queue row) crosses into the log.
         assert_eq!(
-            agent_panel_action(4, &agents, sl, ql, Key::Down),
+            agent_panel_action(4, &panel_rows(agents.len(), &[], sl, ql), Key::Down),
             PanelAction::EnterLog
         );
     }
 
+    /// Agent rows, with an attendance on each index in `attending`.
+    fn rows_for(labels: &[&str], attending: &[usize]) -> Vec<crate::cli::status::AgentAutoRow> {
+        labels
+            .iter()
+            .enumerate()
+            .map(|(i, l)| crate::cli::status::AgentAutoRow {
+                label: l.to_string(),
+                role: crate::cli::teams_config::RosterRole::Commit,
+                auto_mode: clank_core::vocab::AutoMode::On,
+                tool: "claude".to_string(),
+                invocation: "claude".to_string(),
+                session: None,
+                attending: attending
+                    .contains(&i)
+                    .then(|| crate::cli::stop_hook::Attended {
+                        task: format!("t{i}"),
+                        desc: None,
+                        pid: None,
+                        token: None,
+                        at: "2026-08-20T14:51:09Z".to_string(),
+                    }),
+            })
+            .collect()
+    }
+
+    /// A replacement attendance under the same agent is a DIFFERENT
+    /// wait. The cursor falls back to the agent rather than landing on
+    /// something the user never selected — the anchor carries the full
+    /// instance for exactly this.
     #[test]
-    fn rebind_panel_sel_follows_a_stash_row_by_name() {
-        use crate::cli::status::{QueueItemView, StashItemView};
-        let st = |stem: &str| StashItemView {
-            stem: stem.to_string(),
-            waiting_for: None,
-            ready: false,
-            commits: 1,
-        };
-        let q = |name: &str| QueueItemView {
-            priority: 500,
-            name: name.to_string(),
-        };
-        let stash = [st("a"), st("b")];
-        let queue = [q("x")];
-        // Cursor on stash "b" (sel 4 = 2 agents + add + idx 1) follows it.
-        assert_eq!(rebind_panel_sel(4, Some("b"), None, 2, &stash, &queue), 4);
-        // A queue selection offsets past the stash segment.
-        assert_eq!(rebind_panel_sel(5, None, Some("x"), 2, &stash, &queue), 5);
-        // Vanished stash item → "+ add".
+    fn a_replaced_attendance_does_not_inherit_the_wait_cursor() {
+        let before = rows_for(&["claude", "codex"], &[1]);
+        let rows = panel_rows(2, &[1], 0, 0); // [A0, A1, W1, Add]
+        let anchor = capture_anchor(2, &rows, &before, &[], &[]);
+
+        // Same agent, still attending — but a new instance.
+        let mut after = rows_for(&["claude", "codex"], &[1]);
+        after[1].attending.as_mut().unwrap().at = "2026-08-24T09:00:00Z".to_string();
         assert_eq!(
-            rebind_panel_sel(4, Some("gone"), None, 2, &stash, &queue),
-            2
+            rebind_anchor(&anchor, &rows, &after, &[], &[]),
+            1,
+            "falls back to its agent, not onto the replacement"
+        );
+
+        // Unchanged instance keeps the wait row.
+        assert_eq!(rebind_anchor(&anchor, &rows, &before, &[], &[]), 2);
+    }
+
+    /// A refresh moves rows. The cursor follows what it was ON, by
+    /// identity — the old arithmetic could not see a wait row at all,
+    /// so a wait appearing above a stash or queue selection silently
+    /// retargeted it.
+    #[test]
+    fn the_cursor_follows_its_row_across_a_refresh_that_moves_everything() {
+        let labels = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let agents = rows_for(&["claude", "codex"], &[]);
+        let stash = labels(&["s1"]);
+        let queue = labels(&["q1", "q2"]);
+
+        // No waits: [A0, A1, Add, S0, Q0, Q1]
+        let before = panel_rows(2, &[], 1, 2);
+        let anchor = capture_anchor(4, &before, &agents, &stash, &queue);
+        assert_eq!(anchor, PanelAnchor::Queue("q1".to_string()));
+
+        // A wait appears above everything: [A0, W0, A1, Add, S0, Q0, Q1]
+        let after = panel_rows(2, &[0], 1, 2);
+        assert_eq!(
+            rebind_anchor(&anchor, &after, &agents, &stash, &queue),
+            5,
+            "the queue row moved down by the wait; the cursor moved with it"
+        );
+
+        // The stash row too.
+        let anchor = capture_anchor(3, &before, &agents, &stash, &queue);
+        assert_eq!(anchor, PanelAnchor::Stash("s1".to_string()));
+        assert_eq!(rebind_anchor(&anchor, &after, &agents, &stash, &queue), 4);
+
+        // And an agent below the new wait.
+        let anchor = capture_anchor(1, &before, &agents, &stash, &queue);
+        assert_eq!(anchor, PanelAnchor::Agent("codex".to_string()));
+        assert_eq!(rebind_anchor(&anchor, &after, &agents, &stash, &queue), 2);
+    }
+
+    /// A queue item that is renamed or re-sorted under the cursor is
+    /// still followed — the refresh is often self-inflicted by a
+    /// reprioritise.
+    #[test]
+    fn a_reordered_queue_item_keeps_the_cursor() {
+        let agents = rows_for(&["claude", "codex"], &[]);
+        let queue = vec!["a".to_string(), "b".to_string()];
+        let rows = panel_rows(2, &[], 0, 2);
+        let anchor = capture_anchor(4, &rows, &agents, &[], &queue);
+        assert_eq!(anchor, PanelAnchor::Queue("b".to_string()));
+
+        let resorted = vec!["b".to_string(), "a".to_string()];
+        assert_eq!(
+            rebind_anchor(&anchor, &rows, &agents, &[], &resorted),
+            3,
+            "follows the item, not the slot"
+        );
+
+        // Gone entirely → the add row.
+        let without = vec!["a".to_string()];
+        let shorter = panel_rows(2, &[], 0, 1);
+        assert_eq!(
+            rebind_anchor(&anchor, &shorter, &agents, &[], &without),
+            add_row_index(&shorter)
         );
     }
 
+    /// A wait that stops being drawable drops to the AGENT it hung
+    /// under, not to "+ add": the agent is still there, and it is
+    /// where the user was already looking.
     #[test]
-    fn rebind_panel_sel_follows_a_queue_row_by_name_across_refresh() {
-        use crate::cli::status::QueueItemView;
-        let q = |prio: u16, name: &str| QueueItemView {
-            priority: prio,
-            name: name.to_string(),
-        };
-        // Cursor was on "b" (sel 4 = agents 2 + add 1 + queue idx 1); a
-        // nudge re-sorted the queue so "b" is now FIRST — the cursor
-        // follows it to sel 3, never snapping back to "+ add".
-        let new_queue = [q(100, "b"), q(500, "a")];
-        assert_eq!(rebind_panel_sel(4, None, Some("b"), 2, &[], &new_queue), 3);
-        // The item left the queue (promoted/removed) → "+ add" row.
-        let without_b = [q(500, "a")];
-        assert_eq!(rebind_panel_sel(4, None, Some("b"), 2, &[], &without_b), 2);
-        // A non-queue cursor keeps the old clamp semantics.
-        assert_eq!(rebind_panel_sel(1, None, None, 2, &[], &new_queue), 1);
+    fn a_vanished_wait_falls_back_to_its_own_agent() {
+        let agents = rows_for(&["claude", "codex"], &[1]);
+        let with = panel_rows(2, &[1], 0, 0); // [A0, A1, W1, Add]
+        let anchor = capture_anchor(2, &with, &agents, &[], &[]);
         assert_eq!(
-            rebind_panel_sel(9, None, None, 2, &[], &new_queue),
-            2,
-            "clamped to +add"
+            anchor,
+            PanelAnchor::Wait {
+                label: "codex".to_string(),
+                task: "t1".to_string(),
+                at: "2026-08-20T14:51:09Z".to_string(),
+            }
+        );
+
+        let without = panel_rows(2, &[], 0, 0); // [A0, A1, Add]
+        let no_wait = rows_for(&["claude", "codex"], &[]);
+        assert_eq!(
+            rebind_anchor(&anchor, &without, &no_wait, &[], &[]),
+            1,
+            "its agent, not the add row"
+        );
+
+        // The agent left too → the add row.
+        let solo = rows_for(&["claude"], &[]);
+        let rows = panel_rows(1, &[], 0, 0);
+        assert_eq!(
+            rebind_anchor(&anchor, &rows, &solo, &[], &[]),
+            add_row_index(&rows)
         );
     }
 

@@ -64,6 +64,10 @@ pub async fn run(args: AttendingArgs) -> anyhow::Result<()> {
             .map(|d| d.trim().to_string())
             .filter(|d| !d.is_empty()),
         pid: args.pid,
+        // Taken NOW, while the pid is known to be the process the
+        // caller meant. Read later it would identify whatever holds
+        // the number by then, which is the reuse this exists to catch.
+        token: args.pid.and_then(crate::proc_identity::token_for),
     };
     std::fs::write(&path, serde_json::to_string(&record)?)?;
 

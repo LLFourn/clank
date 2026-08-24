@@ -781,6 +781,18 @@ fn attending_path(agent_dir: &Path) -> PathBuf {
 }
 
 /// Where the hook records the attendance decision it last made.
+/// Read an agent's attendance record STRAIGHT FROM DISK.
+///
+/// For decisions that must not run against cached state. The TUI's
+/// snapshot is refreshed by an asynchronous filesystem wake, so it can
+/// lag the file by however long a confirm sits on screen — and a
+/// signal decided from a lagging snapshot is a signal decided from a
+/// record that may already have been replaced (codex on f2793af).
+pub(crate) fn read_attended_now(repo: &Path, label: &str) -> Option<Attended> {
+    let path = attended_path(&crate::agent_store::agents_root(repo).join(label));
+    serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
+}
+
 fn attended_path(agent_dir: &Path) -> PathBuf {
     agent_dir.join("attended")
 }
@@ -806,6 +818,12 @@ pub(crate) struct Attending {
     /// task id is the subject then.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) desc: Option<String>,
+    /// WHO the pid was when it was recorded. A pid alone is reused, so
+    /// anything that would signal this process compares the token
+    /// first. Absent without `--pid`, on platforms that cannot answer,
+    /// and on records written before it existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) token: Option<crate::proc_identity::ProcToken>,
     /// Absent unless the caller passed `--pid`. A harness task handle
     /// carries no pid, so this arrives only when the backgrounded
     /// command recorded its own `$$`. Display only — nothing about
@@ -833,6 +851,9 @@ pub(crate) struct Attended {
     pub(crate) desc: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) pid: Option<i32>,
+    /// See [`Attending::token`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) token: Option<crate::proc_identity::ProcToken>,
     /// RFC3339, for rendering how long ago the decision was made.
     pub(crate) at: String,
 }
@@ -915,6 +936,41 @@ impl Attended {
             .unwrap_or(&self.task)
     }
 
+    /// The pid this wait may be signalled at, or `None` when the
+    /// process cannot be IDENTIFIED.
+    ///
+    /// A pid alone is never enough: it is reused, so a recorded number
+    /// whose process has exited can come back held by a stranger that
+    /// is both alive and killable. The token is what distinguishes
+    /// them, and no token means no signal.
+    pub(crate) fn killable_pid(&self) -> Option<i32> {
+        let pid = self.pid?;
+        let token = self.token.as_ref()?;
+        token.still_holds(pid).then_some(pid)
+    }
+
+    /// Why this wait cannot be killed, phrased for the page. `None`
+    /// when it can be. Saying which of the reasons applies is the
+    /// point — a control that is simply absent teaches nothing.
+    pub(crate) fn kill_blocker(&self) -> Option<&'static str> {
+        let Some(pid) = self.pid else {
+            return Some("no pid was recorded for this wait, so there is nothing to signal");
+        };
+        let Some(token) = self.token.as_ref() else {
+            return Some(
+                "this wait was recorded before clank identified processes, \
+                 so the pid cannot be trusted to still be the same process",
+            );
+        };
+        if !pid_is_alive(pid) {
+            return Some("that process has already ended");
+        }
+        (!token.still_holds(pid)).then_some(
+            "the pid is in use by a DIFFERENT process now — the recorded one has ended \
+             and its number was reused",
+        )
+    }
+
     /// The marker's fields in priority order: subject, then age, then
     /// pid. Callers drop from the RIGHT to fit, so a narrowing line
     /// only ever gets shorter. `None` once the process is known dead —
@@ -930,7 +986,7 @@ impl Attended {
         })
     }
 
-    fn age(&self, now: time::OffsetDateTime) -> Option<String> {
+    pub(crate) fn age(&self, now: time::OffsetDateTime) -> Option<String> {
         let at =
             time::OffsetDateTime::parse(&self.at, &time::format_description::well_known::Rfc3339)
                 .ok()?;
@@ -1002,6 +1058,7 @@ fn record_attended(agent_dir: &Path, rec: &Attending) {
         task: rec.task.clone(),
         desc: rec.desc.clone(),
         pid: rec.pid,
+        token: rec.token.clone(),
         at,
     };
     if let Ok(json) = serde_json::to_string(&entry) {
@@ -1520,6 +1577,7 @@ mod tests {
     fn write_attending_pid(dir: &Path, task: &str, pid: Option<i32>) {
         let rec = Attending {
             desc: None,
+            token: None,
             task: task.to_string(),
             pid,
         };

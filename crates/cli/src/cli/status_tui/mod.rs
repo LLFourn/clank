@@ -95,6 +95,95 @@ enum Ev {
 /// `let _ =` swallowing was a bug this plan fixes in passing (codex
 /// e4bccc5). The mutated `.clank/config.json` is local-only repo
 /// state; the confirm modal names that local write explicitly.
+/// The panel's cursor positions for this snapshot at this width.
+///
+/// THE source of panel positions. Every transition that names a row
+/// goes through here: computing one arithmetically works only while
+/// drawn rows and cursor positions correspond one to one, and a wait
+/// row above the target breaks that silently (codex on bc033f0).
+fn panel_row_list(
+    snap: &StatusSnapshot,
+    cols: usize,
+) -> Vec<crate::cli::status_tui::input::PanelRow> {
+    crate::cli::status_tui::input::panel_rows(
+        snap.agents.len(),
+        &crate::cli::status_tui::render::drawable_waits(snap, cols),
+        snap.stash.len(),
+        snap.queue.len(),
+    )
+}
+
+/// Where `row` sits in the panel, or the "+ add" row when it is gone.
+fn row_position(
+    rows: &[crate::cli::status_tui::input::PanelRow],
+    row: crate::cli::status_tui::input::PanelRow,
+) -> usize {
+    rows.iter()
+        .position(|r| *r == row)
+        .unwrap_or_else(|| crate::cli::status_tui::input::add_row_index(rows))
+}
+
+/// Where the open wait page's attendance lives NOW in the roster, or
+/// `None` if that attendance is gone.
+///
+/// Located by INSTANCE — agent label, task and `at` — never by the
+/// index it had when the page opened. A roster edit reorders the list
+/// under the cursor, and this repo has already paid once for trusting
+/// an index across a refresh.
+fn relocate_wait(
+    page: &crate::cli::status_tui::input::WaitPage,
+    agents: &[crate::cli::status::AgentAutoRow],
+) -> Option<usize> {
+    agents.iter().position(|a| {
+        a.label == page.label
+            && a.attending
+                .as_ref()
+                .is_some_and(|att| page.matches(&a.label, att))
+    })
+}
+
+/// The pid a confirmed kill may signal, or why it may not.
+///
+/// Reads the attendance record FROM DISK rather than from the TUI's
+/// snapshot. The snapshot is refreshed by an asynchronous filesystem
+/// wake, so it can lag the file by however long the confirm was on
+/// screen; validating against it would let a record replaced after the
+/// confirm opened still pass (codex on f2793af). Taking no snapshot
+/// argument is what makes that mistake unavailable here.
+///
+/// Re-run AFTER the confirm, never when the page opened: the record
+/// can be replaced, the process can exit and its pid be reused, all
+/// while the answer is pending.
+fn resolve_kill_target(
+    page: &crate::cli::status_tui::input::WaitPage,
+    repo: &std::path::Path,
+) -> Result<i32, String> {
+    // Removing an agent leaves its local `attended` file behind, so
+    // the file alone is not authority to signal: an agent taken off
+    // the roster while the confirm was open would still be killable
+    // (codex on bc033f0). Roster membership is read here, freshly,
+    // for the same reason the record is.
+    match crate::agent_store::load_repo_config_required(repo) {
+        Ok(cfg) => {
+            if !cfg.agents.keys().any(|l| l.as_str() == page.label.as_str()) {
+                return Err(format!("`{}` is no longer on the roster", page.label));
+            }
+        }
+        Err(e) => return Err(format!("cannot read the roster: {e}")),
+    }
+    let Some(att) = crate::cli::stop_hook::read_attended_now(repo, &page.label) else {
+        return Err(format!("`{}` is no longer attending anything", page.label));
+    };
+    if !page.matches(&page.label, &att) {
+        return Err("that wait was replaced by a different one".to_string());
+    }
+    att.killable_pid().ok_or_else(|| {
+        att.kill_blocker()
+            .unwrap_or("it cannot be identified")
+            .to_string()
+    })
+}
+
 fn apply_confirm(
     action: ConfirmAction,
     repo: &std::path::Path,
@@ -103,6 +192,9 @@ fn apply_confirm(
     picker: &[crate::cli::status::AvailableAgent],
 ) -> anyhow::Result<()> {
     match action {
+        // Executed at the call site, which holds the page identity the
+        // post-confirm revalidation needs.
+        ConfirmAction::KillAttended => Ok(()),
         ConfirmAction::AddCandidate { idx } => {
             if let Some(c) = picker.get(idx)
                 && let Ok(label) = clank_core::ids::AgentLabel::parse(&c.label)
@@ -755,6 +847,10 @@ fn apply_detail_action(
     snapshot: &mut StatusSnapshot,
     repo: &std::path::Path,
     error: &mut Option<(String, String)>,
+    // Where this agent's ROW sits in the panel. Not `idx`: a wait
+    // above it makes those different numbers, and Back would land on
+    // whatever now occupies the index (codex on a561012).
+    agent_row: usize,
 ) -> Mode {
     // Copy out what we need so the &mut write below doesn't conflict.
     let (auto_mode, role, label_str) = match snapshot.agents.get(idx) {
@@ -797,7 +893,7 @@ fn apply_detail_action(
         DetailAction::Remove => Mode::Confirm {
             action: ConfirmAction::RemoveAgent { idx },
         },
-        DetailAction::Back => Mode::AgentPanel { sel: idx },
+        DetailAction::Back => Mode::AgentPanel { sel: agent_row },
     }
 }
 
@@ -805,10 +901,13 @@ fn roster_confirm_after_decision(
     action: ConfirmAction,
     roster_write_succeeded: bool,
     picker_len: usize,
+    // Two different numbers since waits became selectable: where the
+    // "+ add" row sits, and how many agents there are to index into.
+    add_row: usize,
     agents_len: usize,
 ) -> (Mode, bool) {
     if roster_write_succeeded {
-        return (Mode::AgentPanel { sel: agents_len }, true);
+        return (Mode::AgentPanel { sel: add_row }, true);
     }
     match action {
         ConfirmAction::AddCandidate { idx } if idx < picker_len => {
@@ -817,7 +916,7 @@ fn roster_confirm_after_decision(
         ConfirmAction::RemoveAgent { idx } if idx < agents_len => {
             (Mode::AgentDetail { idx, sel: 0 }, false)
         }
-        _ => (Mode::AgentPanel { sel: agents_len }, true),
+        _ => (Mode::AgentPanel { sel: add_row }, true),
     }
 }
 
@@ -880,11 +979,11 @@ fn rebind_add_picker_after_refresh(
     old_sel: usize,
     label: Option<&str>,
     picker: &[crate::cli::status::AvailableAgent],
-    agents_len: usize,
+    add_row: usize,
 ) -> Mode {
     match rebind_picker_sel_by_label(old_sel, label, picker) {
         Some(sel) => Mode::AddPicker { sel },
-        None => Mode::AgentPanel { sel: agents_len },
+        None => Mode::AgentPanel { sel: add_row },
     }
 }
 
@@ -892,7 +991,7 @@ fn rebind_add_confirm_after_refresh(
     old_idx: usize,
     label: Option<&str>,
     picker: &[crate::cli::status::AvailableAgent],
-    agents_len: usize,
+    add_row: usize,
 ) -> Mode {
     let rebound = if let Some(label) = label {
         picker.iter().position(|c| c.label.as_str() == label)
@@ -903,20 +1002,20 @@ fn rebind_add_confirm_after_refresh(
         Some(idx) => Mode::Confirm {
             action: ConfirmAction::AddCandidate { idx },
         },
-        None => Mode::AgentPanel { sel: agents_len },
+        None => Mode::AgentPanel { sel: add_row },
     }
 }
 
 fn rebind_remove_confirm_after_refresh(
     label: Option<&str>,
     agents: &[crate::cli::status::AgentAutoRow],
-    agents_len: usize,
+    add_row: usize,
 ) -> Mode {
     match label.and_then(|l| relocate_detail(l, agents)) {
         Some(idx) => Mode::Confirm {
             action: ConfirmAction::RemoveAgent { idx },
         },
-        None => Mode::AgentPanel { sel: agents_len },
+        None => Mode::AgentPanel { sel: add_row },
     }
 }
 
@@ -1475,6 +1574,7 @@ pub(crate) async fn run_tui(
     // The open EVENT page (tui-github-event-page); invariant: `Some`
     // ⟺ mode is `EventDetail` (set/cleared together, like plan_page).
     let mut event_page: Option<EventPage> = None;
+    let mut wait_page: Option<crate::cli::status_tui::input::WaitPage> = None;
     // Monotonic across the whole session: every request the page makes
     // gets a number, and only the newest one's answer is wanted
     // (tui-github-event-content, Contract 3).
@@ -1622,6 +1722,7 @@ pub(crate) async fn run_tui(
 
         let log_focused = matches!(mode, Mode::LogScroll);
         let view = PanelView {
+            wait_page: wait_page.as_ref(),
             mode,
             plan_page: plan_page.as_ref(),
             event_page: event_page.as_ref(),
@@ -1906,14 +2007,35 @@ pub(crate) async fn run_tui(
                     // confirm_decision); the loop only executes the result
                     // (where IO happens).
                     match mode {
+                        Mode::WaitDetail { agent, sel } => {
+                            let att = snapshot
+                                .agents
+                                .get(agent)
+                                .and_then(|a| a.attending.as_ref());
+                            let actions = crate::cli::status_tui::input::wait_actions(
+                                att.is_some_and(|a| a.killable_pid().is_some()),
+                            );
+                            match crate::cli::status_tui::input::wait_page_nav(sel, &actions, k) {
+                                DetailNav::Quit => break 'evloop,
+                                DetailNav::Back => {
+                                    wait_page = None;
+                                    mode = Mode::AgentPanel { sel: 0 };
+                                }
+                                DetailNav::MoveCursor(s) => {
+                                    mode = Mode::WaitDetail { agent, sel: s }
+                                }
+                                DetailNav::ActivateKill => {
+                                    mode = Mode::Confirm {
+                                        action: ConfirmAction::KillAttended,
+                                    }
+                                }
+                                DetailNav::Activate(_) | DetailNav::None => {}
+                            }
+                            continue;
+                        }
                         Mode::AgentPanel { sel } => {
-                            match agent_panel_action(
-                                sel,
-                                &snapshot.agents,
-                                snapshot.stash.len(),
-                                snapshot.queue.len(),
-                                k,
-                            ) {
+                            let panel = panel_row_list(&snapshot, cols as usize);
+                            match agent_panel_action(sel, &panel, k) {
                                 PanelAction::Quit => break 'evloop,
                                 PanelAction::LeaveFocus => {
                                     if total > 0 {
@@ -1921,6 +2043,20 @@ pub(crate) async fn run_tui(
                                     }
                                 }
                                 PanelAction::MoveCursor(s) => mode = Mode::AgentPanel { sel: s },
+                                PanelAction::OpenWait(agent) => {
+                                    if let Some((label, att)) =
+                                        snapshot.agents.get(agent).and_then(|a| {
+                                            a.attending.as_ref().map(|t| (a.label.clone(), t))
+                                        })
+                                    {
+                                        wait_page = Some(crate::cli::status_tui::input::WaitPage {
+                                            label,
+                                            task: att.task.clone(),
+                                            at: att.at.clone(),
+                                        });
+                                        mode = Mode::WaitDetail { agent, sel: 0 };
+                                    }
+                                }
                                 PanelAction::EnterLog => {
                                     if total > 0 {
                                         // Cross into the log at the FIRST entry.
@@ -2017,7 +2153,10 @@ pub(crate) async fn run_tui(
                                                 snapshot.queue.iter().position(|i| i.name == name)
                                             {
                                                 mode = Mode::AgentPanel {
-                                                    sel: snapshot.agents.len() + 1 + pos,
+                                                    sel: row_position(
+                                                        &panel_row_list(&snapshot, cols as usize),
+                                                        crate::cli::status_tui::input::PanelRow::Queue(pos),
+                                                    ),
                                                 };
                                             }
                                         }
@@ -2031,8 +2170,18 @@ pub(crate) async fn run_tui(
                             let role = snapshot.agents.get(idx).map(|a| a.role);
                             let actions = role.map(detail_actions).unwrap_or_default();
                             match agent_detail_nav(sel, &actions, k) {
+                                // The kill row belongs to the WAIT page; the
+                                // agent page never produces it.
+                                DetailNav::ActivateKill => {}
                                 DetailNav::Quit => break 'evloop,
-                                DetailNav::Back => mode = Mode::AgentPanel { sel: idx },
+                                DetailNav::Back => {
+                                    mode = Mode::AgentPanel {
+                                        sel: row_position(
+                                            &panel_row_list(&snapshot, cols as usize),
+                                            crate::cli::status_tui::input::PanelRow::Agent(idx),
+                                        ),
+                                    }
+                                }
                                 DetailNav::MoveCursor(s) => {
                                     mode = Mode::AgentDetail { idx, sel: s }
                                 }
@@ -2049,6 +2198,10 @@ pub(crate) async fn run_tui(
                                         );
                                     }
                                     let mut err: Option<(String, String)> = None;
+                                    let agent_row = row_position(
+                                        &panel_row_list(&snapshot, cols as usize),
+                                        crate::cli::status_tui::input::PanelRow::Agent(idx),
+                                    );
                                     mode = apply_detail_action(
                                         action,
                                         idx,
@@ -2056,6 +2209,7 @@ pub(crate) async fn run_tui(
                                         &mut snapshot,
                                         &repo,
                                         &mut err,
+                                        agent_row,
                                     );
                                     if let Some((title, msg)) = err {
                                         detail = Some(Overlay::error(title, msg));
@@ -2071,7 +2225,9 @@ pub(crate) async fn run_tui(
                             Key::Escape | Key::Focus | Key::Char(b'a') => {
                                 picker.clear();
                                 mode = Mode::AgentPanel {
-                                    sel: snapshot.agents.len(),
+                                    sel: crate::cli::status_tui::input::add_row_index(
+                                        &panel_row_list(&snapshot, cols as usize),
+                                    ),
                                 };
                             }
                             Key::Up => {
@@ -2169,6 +2325,41 @@ pub(crate) async fn run_tui(
                                     mode = Mode::PlanDetail { sel: 0 };
                                     continue;
                                 }
+                                // The kill is resolved and validated
+                                // HERE, after the answer: the record can
+                                // have been replaced and the pid reused
+                                // while the confirm was on screen.
+                                if action == ConfirmAction::KillAttended {
+                                    if go {
+                                        match wait_page
+                                            .as_ref()
+                                            .ok_or_else(|| "no wait is open".to_string())
+                                            .and_then(|p| resolve_kill_target(p, &repo))
+                                        {
+                                            Ok(pid) => {
+                                                // SIGTERM the recorded pid ALONE.
+                                                // Its group is unverified, and
+                                                // signalling one we did not
+                                                // identify is the same mistake as
+                                                // signalling a reused pid.
+                                                // SAFETY: `pid` was just validated
+                                                // as a live process this token
+                                                // still identifies.
+                                                unsafe { libc::kill(pid, libc::SIGTERM) };
+                                                refresh_pending = true;
+                                            }
+                                            Err(why) => {
+                                                detail = Some(Overlay::error(
+                                                    "nothing was signalled".to_string(),
+                                                    why,
+                                                ));
+                                            }
+                                        }
+                                    }
+                                    wait_page = None;
+                                    mode = Mode::AgentPanel { sel: 0 };
+                                    continue;
+                                }
                                 let mut roster_write_succeeded = false;
                                 if go {
                                     match apply_confirm(
@@ -2191,6 +2382,10 @@ pub(crate) async fn run_tui(
                                     action,
                                     roster_write_succeeded,
                                     picker.len(),
+                                    crate::cli::status_tui::input::add_row_index(&panel_row_list(
+                                        &snapshot,
+                                        cols as usize,
+                                    )),
                                     snapshot.agents.len(),
                                 );
                                 if roster_write_succeeded {
@@ -2606,22 +2801,25 @@ pub(crate) async fn run_tui(
                 // reprioritise renames the queue file, so THIS refresh is
                 // often self-inflicted and re-sorts the list — capture the
                 // selected item's NAME so the cursor follows it.
-                let (panel_stash_name, panel_queue_name) = match mode {
-                    Mode::AgentPanel { sel } if sel > snapshot.agents.len() => {
-                        let i = sel - snapshot.agents.len() - 1;
-                        if i < snapshot.stash.len() {
-                            (snapshot.stash.get(i).map(|s| s.stem.clone()), None)
-                        } else {
-                            (
-                                None,
-                                snapshot
-                                    .queue
-                                    .get(i - snapshot.stash.len())
-                                    .map(|q| q.name.clone()),
-                            )
-                        }
+                let panel_anchor = match mode {
+                    Mode::AgentPanel { sel } => {
+                        Some(crate::cli::status_tui::input::capture_anchor(
+                            sel,
+                            &panel_row_list(&snapshot, cols as usize),
+                            &snapshot.agents,
+                            &snapshot
+                                .stash
+                                .iter()
+                                .map(|i| i.stem.clone())
+                                .collect::<Vec<_>>(),
+                            &snapshot
+                                .queue
+                                .iter()
+                                .map(|q| q.name.clone())
+                                .collect::<Vec<_>>(),
+                        ))
                     }
-                    _ => (None, None),
+                    _ => None,
                 };
                 // A FAILED rebuild must not kill the TUI (a gix
                 // status walk racing a worktree mutation is routine)
@@ -2696,6 +2894,26 @@ pub(crate) async fn run_tui(
                             _ => Mode::AgentPanel { sel: 0 },
                         }
                     }
+                    // The wait page is bound to an attendance
+                    // INSTANCE. Re-locate the agent by label, then
+                    // demand the same task AND the same `at`: a
+                    // replacement record is a different wait, and
+                    // silently retargeting the page at it is how a
+                    // confirmed action lands on something the user
+                    // never chose.
+                    Mode::WaitDetail { sel, .. } => {
+                        match wait_page
+                            .as_ref()
+                            .and_then(|p| relocate_wait(p, &snapshot.agents))
+                            .map(|i| (i, sel))
+                        {
+                            Some((agent, sel)) => Mode::WaitDetail { agent, sel },
+                            None => {
+                                wait_page = None;
+                                Mode::AgentPanel { sel: 0 }
+                            }
+                        }
+                    }
                     Mode::BlockAnswer { .. } => {
                         plan_input = None;
                         Mode::LogScroll
@@ -2712,14 +2930,26 @@ pub(crate) async fn run_tui(
                         action: ConfirmAction::RemoveAgent { .. },
                     } if snapshot.agents.is_empty() => Mode::LogScroll,
                     Mode::AgentPanel { sel } => Mode::AgentPanel {
-                        sel: rebind_panel_sel(
-                            sel,
-                            panel_stash_name.as_deref(),
-                            panel_queue_name.as_deref(),
-                            snapshot.agents.len(),
-                            &snapshot.stash,
-                            &snapshot.queue,
-                        ),
+                        sel: panel_anchor
+                            .as_ref()
+                            .map(|a| {
+                                crate::cli::status_tui::input::rebind_anchor(
+                                    a,
+                                    &panel_row_list(&snapshot, cols as usize),
+                                    &snapshot.agents,
+                                    &snapshot
+                                        .stash
+                                        .iter()
+                                        .map(|i| i.stem.clone())
+                                        .collect::<Vec<_>>(),
+                                    &snapshot
+                                        .queue
+                                        .iter()
+                                        .map(|q| q.name.clone())
+                                        .collect::<Vec<_>>(),
+                                )
+                            })
+                            .unwrap_or(sel),
                     },
                     // The detail page tracks ONE agent by identity:
                     // re-locate the captured label in the (possibly
@@ -2733,7 +2963,10 @@ pub(crate) async fn run_tui(
                         {
                             Some(idx) => Mode::AgentDetail { idx, sel },
                             None => Mode::AgentPanel {
-                                sel: snapshot.agents.len(),
+                                sel: crate::cli::status_tui::input::add_row_index(&panel_row_list(
+                                    &snapshot,
+                                    cols as usize,
+                                )),
                             },
                         }
                     }
@@ -2745,7 +2978,10 @@ pub(crate) async fn run_tui(
                         sel,
                         picker_label.as_deref(),
                         &picker,
-                        snapshot.agents.len(),
+                        crate::cli::status_tui::input::add_row_index(&panel_row_list(
+                            &snapshot,
+                            cols as usize,
+                        )),
                     ),
                     Mode::Confirm {
                         action: ConfirmAction::AddCandidate { idx },
@@ -2753,7 +2989,10 @@ pub(crate) async fn run_tui(
                         idx,
                         picker_label.as_deref(),
                         &picker,
-                        snapshot.agents.len(),
+                        crate::cli::status_tui::input::add_row_index(&panel_row_list(
+                            &snapshot,
+                            cols as usize,
+                        )),
                     ),
                     // Remove confirms also track the agent by identity, so a
                     // tier change/reorder cannot make "yes" remove the wrong
@@ -2763,7 +3002,10 @@ pub(crate) async fn run_tui(
                     } => rebind_remove_confirm_after_refresh(
                         detail_label.as_deref(),
                         &snapshot.agents,
-                        snapshot.agents.len(),
+                        crate::cli::status_tui::input::add_row_index(&panel_row_list(
+                            &snapshot,
+                            cols as usize,
+                        )),
                     ),
                     // The plan page tracks its plan by STEM: recompute
                     // the facts against the fresh snapshot (block state /
@@ -2827,8 +3069,16 @@ pub(crate) async fn run_tui(
                             false => Mode::LogScroll,
                         }
                     }
+                    // A refresh cancels the confirm back to the panel.
+                    // `agents.len()` is not the add row once a wait is
+                    // drawn — and a KILL confirm necessarily has one,
+                    // so this landed on another agent or wait every
+                    // time (codex on a561012).
                     Mode::Confirm { .. } => Mode::AgentPanel {
-                        sel: snapshot.agents.len(),
+                        sel: crate::cli::status_tui::input::add_row_index(&panel_row_list(
+                            &snapshot,
+                            cols as usize,
+                        )),
                     },
                 };
                 if let Some(tab) = tab.as_mut() {
@@ -3477,22 +3727,22 @@ pub(crate) mod tests {
     #[test]
     fn roster_confirm_decision_returns_to_origin_pages() {
         assert_eq!(
-            roster_confirm_after_decision(ConfirmAction::AddCandidate { idx: 1 }, false, 3, 2),
+            roster_confirm_after_decision(ConfirmAction::AddCandidate { idx: 1 }, false, 3, 2, 2),
             (Mode::AddPicker { sel: 1 }, false),
             "cancel/failed add returns to the selected picker candidate"
         );
         assert_eq!(
-            roster_confirm_after_decision(ConfirmAction::RemoveAgent { idx: 1 }, false, 0, 2),
+            roster_confirm_after_decision(ConfirmAction::RemoveAgent { idx: 1 }, false, 0, 2, 2),
             (Mode::AgentDetail { idx: 1, sel: 0 }, false),
             "cancel/failed remove returns to the target detail page"
         );
         assert_eq!(
-            roster_confirm_after_decision(ConfirmAction::AddCandidate { idx: 4 }, false, 2, 2),
+            roster_confirm_after_decision(ConfirmAction::AddCandidate { idx: 4 }, false, 2, 2, 2),
             (Mode::AgentPanel { sel: 2 }, true),
             "an invalid add target falls back to the panel and drops picker state"
         );
         assert_eq!(
-            roster_confirm_after_decision(ConfirmAction::RemoveAgent { idx: 1 }, true, 0, 2),
+            roster_confirm_after_decision(ConfirmAction::RemoveAgent { idx: 1 }, true, 0, 2, 2),
             (Mode::AgentPanel { sel: 2 }, true),
             "successful roster writes refresh from the panel"
         );
@@ -3719,8 +3969,15 @@ pub(crate) mod tests {
         let repo = detail_repo();
         let mut s = two_agent_snap(); // idx 1 == codex (commit)
         // Tick `plan` on a commit-tier reviewer → leaves commit mode.
-        let next =
-            apply_detail_action(DetailAction::TierPlan, 1, 2, &mut s, repo.path(), &mut None);
+        let next = apply_detail_action(
+            DetailAction::TierPlan,
+            1,
+            2,
+            &mut s,
+            repo.path(),
+            &mut None,
+            1,
+        );
         let parsed: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(repo.path().join(".clank/config.json")).unwrap(),
         )
@@ -3747,6 +4004,7 @@ pub(crate) mod tests {
             &mut s,
             repo.path(),
             &mut None,
+            1,
         );
         let parsed: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(repo.path().join(".clank/config.json")).unwrap(),
@@ -3760,7 +4018,15 @@ pub(crate) mod tests {
 
         // Unticking down to the last coverage is a no-op (still gate→final
         // →final stays; final is the only box left, untick refused).
-        apply_detail_action(DetailAction::TierPlan, 1, 2, &mut s, repo.path(), &mut None);
+        apply_detail_action(
+            DetailAction::TierPlan,
+            1,
+            2,
+            &mut s,
+            repo.path(),
+            &mut None,
+            1,
+        );
         let before = std::fs::read_to_string(repo.path().join(".clank/config.json")).unwrap();
         apply_detail_action(
             DetailAction::TierFinal,
@@ -3769,6 +4035,7 @@ pub(crate) mod tests {
             &mut s,
             repo.path(),
             &mut None,
+            1,
         );
         let after = std::fs::read_to_string(repo.path().join(".clank/config.json")).unwrap();
         assert_eq!(before, after, "unticking the last coverage is a no-op");
@@ -3789,6 +4056,7 @@ pub(crate) mod tests {
             &mut s,
             std::path::Path::new("/nonexistent/clank-test-repo"),
             &mut err,
+            1,
         );
         let (title, msg) = err.expect("failure must be reported, not swallowed");
         assert_eq!(title, "promote failed");
@@ -3811,6 +4079,7 @@ pub(crate) mod tests {
             &mut s,
             repo.path(),
             &mut None,
+            1,
         );
         let parsed: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(repo.path().join(".clank/config.json")).unwrap(),
@@ -3833,7 +4102,7 @@ pub(crate) mod tests {
         let repo = detail_repo();
         let mut s = two_agent_snap();
         let before = std::fs::read_to_string(repo.path().join(".clank/config.json")).unwrap();
-        let mode = apply_detail_action(DetailAction::Swap, 1, 0, &mut s, repo.path(), &mut None);
+        let mode = apply_detail_action(DetailAction::Swap, 1, 0, &mut s, repo.path(), &mut None, 1);
         assert_eq!(
             mode,
             Mode::SwapPicker { out: 1, sel: 0 },
@@ -3929,6 +4198,378 @@ pub(crate) mod tests {
         assert!(!cfg.agents.contains_key(&old));
     }
 
+    // ── the wait page's two identities ────────────────────────
+    //
+    // Every case below must resolve to NO target, and each drives the
+    // REAL path: `resolve_kill_target` reads the record from disk, so
+    // these write and rewrite that file rather than handing the
+    // resolver a synthetic snapshot it could never have seen.
+
+    fn attended(
+        task: &str,
+        at: &str,
+        pid: Option<i32>,
+        token: bool,
+    ) -> crate::cli::stop_hook::Attended {
+        crate::cli::stop_hook::Attended {
+            task: task.to_string(),
+            desc: Some("test run".to_string()),
+            pid,
+            token: token
+                .then(|| pid.and_then(crate::proc_identity::token_for))
+                .flatten(),
+            at: at.to_string(),
+        }
+    }
+
+    fn page(label: &str, task: &str, at: &str) -> crate::cli::status_tui::input::WaitPage {
+        crate::cli::status_tui::input::WaitPage {
+            label: label.to_string(),
+            task: task.to_string(),
+            at: at.to_string(),
+        }
+    }
+
+    /// Put an attendance record where the resolver will look for it.
+    fn write_attended(repo: &std::path::Path, label: &str, att: &crate::cli::stop_hook::Attended) {
+        let dir = repo.join(".clank/agents").join(label);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("attended"), serde_json::to_string(att).unwrap()).unwrap();
+    }
+
+    fn snap_attending(
+        att: Option<crate::cli::stop_hook::Attended>,
+    ) -> crate::cli::status::StatusSnapshot {
+        let mut s = two_agent_snap();
+        s.agents[0].attending = att;
+        s
+    }
+
+    /// Activating the visible Back ROW — not Escape, which takes a
+    /// different path — must return to the agent's ROW, not to its
+    /// index. With a wait above, those differ, and Back highlighted
+    /// whatever now sits at the index.
+    #[test]
+    fn back_from_the_detail_page_lands_on_the_agent_row_not_its_index() {
+        let repo = detail_repo();
+        let me = std::process::id() as i32;
+        let mut s = snap_attending(Some(attended("t1", "2026-08-20T14:51:09Z", Some(me), true)));
+        s.stash = vec![];
+        s.queue = vec![];
+        // [Agent(0), Wait(0), Agent(1), Add] — agent 1 is at ROW 2.
+        let rows = panel_row_list(&s, 120);
+        let agent_row = row_position(&rows, crate::cli::status_tui::input::PanelRow::Agent(1));
+        assert_eq!(agent_row, 2, "precondition: the wait shifted it");
+
+        let next = apply_detail_action(
+            DetailAction::Back,
+            1,
+            0,
+            &mut s,
+            repo.path(),
+            &mut None,
+            agent_row,
+        );
+        assert_eq!(
+            next,
+            Mode::AgentPanel { sel: 2 },
+            "Back returns to the agent's row"
+        );
+        assert_ne!(next, Mode::AgentPanel { sel: 1 }, "not to its index");
+    }
+
+    /// A refresh cancels an open confirm back to the panel. A KILL
+    /// confirm necessarily has a wait row on screen, so the add-row
+    /// position is never `agents.len()` there — it landed on another
+    /// agent or wait every time.
+    #[test]
+    fn a_refresh_cancelling_a_kill_confirm_lands_on_the_add_row() {
+        use crate::cli::status_tui::input::add_row_index;
+        let me = std::process::id() as i32;
+        let mut s = snap_attending(Some(attended("t1", "2026-08-20T14:51:09Z", Some(me), true)));
+        s.stash = vec![];
+        s.queue = vec![];
+        let rows = panel_row_list(&s, 120);
+        assert_eq!(
+            add_row_index(&rows),
+            3,
+            "A0, W0, A1, Add — and `agents.len()` is 2"
+        );
+        assert_ne!(
+            add_row_index(&rows),
+            s.agents.len(),
+            "the old fallback would have selected the wait's agent"
+        );
+    }
+
+    /// Every transition that names a panel row goes through
+    /// `row_position`, and a wait above the target is what breaks the
+    /// arithmetic those sites used to do for themselves: agent-detail
+    /// Back returned the AGENT INDEX, queue reprioritise computed
+    /// `agents.len() + 1 + pos`, and the refresh fallbacks passed
+    /// `agents.len()` as the add row (codex on bc033f0).
+    #[test]
+    fn a_wait_above_the_target_moves_every_named_row() {
+        use crate::cli::status_tui::input::{PanelRow, add_row_index};
+        let me = std::process::id() as i32;
+        let mut s = snap_attending(Some(attended("t1", "2026-08-20T14:51:09Z", Some(me), true)));
+        s.stash = vec![];
+        s.queue = vec![];
+
+        // Wide: agent 0's wait is drawable, so it takes a position.
+        let with = panel_row_list(&s, 120);
+        assert_eq!(with.len(), 4, "A0, W0, A1, Add: {with:?}");
+        assert_eq!(
+            row_position(&with, PanelRow::Agent(1)),
+            2,
+            "the agent-detail Back target is NOT the agent index"
+        );
+        assert_eq!(add_row_index(&with), 3, "nor is the add row agents.len()");
+
+        // Same snapshot, a pane too narrow to draw the wait: the row
+        // is gone and every position closes back up.
+        let narrow = panel_row_list(&s, 6);
+        assert_eq!(narrow.len(), 3, "A0, A1, Add: {narrow:?}");
+        assert_eq!(row_position(&narrow, PanelRow::Agent(1)), 1);
+        assert_eq!(add_row_index(&narrow), 2);
+
+        // A row that no longer exists falls back to "+ add" rather
+        // than to some other agent's row.
+        assert_eq!(
+            row_position(&narrow, PanelRow::Wait(0)),
+            add_row_index(&narrow)
+        );
+    }
+
+    /// The queue-row target, with a wait above it: the old formula
+    /// (`agents.len() + 1 + pos`) lands one row short.
+    #[test]
+    fn a_queue_row_target_accounts_for_waits_above_it() {
+        use crate::cli::status_tui::input::PanelRow;
+        let me = std::process::id() as i32;
+        let mut s = snap_attending(Some(attended("t1", "2026-08-20T14:51:09Z", Some(me), true)));
+        s.stash = vec![];
+        let rows = panel_row_list(&s, 120);
+        let queue_len = s.queue.len();
+        if queue_len > 0 {
+            let want = 3 + 1 + 0; // A0, W0, A1, Add, Q0
+            assert_eq!(row_position(&rows, PanelRow::Queue(0)), want);
+            assert_ne!(
+                row_position(&rows, PanelRow::Queue(0)),
+                s.agents.len() + 1,
+                "the old arithmetic is off by the wait row"
+            );
+        }
+    }
+
+    /// The page follows its attendance across a roster REORDER — the
+    /// same instance stays selected, and explicitly not the stale
+    /// index it opened at.
+    #[test]
+    fn the_wait_page_follows_its_instance_across_a_reorder() {
+        let me = std::process::id() as i32;
+        let mut s = snap_attending(Some(attended("t1", "2026-08-20T14:51:09Z", Some(me), true)));
+        let p = page("claude", "t1", "2026-08-20T14:51:09Z");
+        assert_eq!(relocate_wait(&p, &s.agents), Some(0));
+
+        s.agents.swap(0, 1);
+        assert_eq!(
+            relocate_wait(&p, &s.agents),
+            Some(1),
+            "found by identity at its new position"
+        );
+
+        // Same agent, attending something else now.
+        s.agents[1].attending = Some(attended("t9", "2026-08-24T09:00:00Z", Some(me), true));
+        assert_eq!(
+            relocate_wait(&p, &s.agents),
+            None,
+            "a different wait is not this one"
+        );
+
+        s.agents.clear();
+        assert_eq!(relocate_wait(&p, &s.agents), None);
+    }
+
+    /// Removing an agent leaves its local `attended` file behind, so
+    /// the file alone is not authority to signal. An agent taken off
+    /// the roster while the confirm was open must not be killable.
+    #[test]
+    fn an_agent_removed_from_the_roster_cannot_be_signalled() {
+        let repo = detail_repo();
+        let me = std::process::id() as i32;
+        let p = page("claude", "t1", "2026-08-20T14:51:09Z");
+        write_attended(
+            repo.path(),
+            "claude",
+            &attended("t1", "2026-08-20T14:51:09Z", Some(me), true),
+        );
+        assert_eq!(
+            resolve_kill_target(&p, repo.path()),
+            Ok(me),
+            "valid while on the roster"
+        );
+
+        // Off the roster, record deliberately LEFT in place.
+        std::fs::write(
+            repo.path().join(".clank/config.json"),
+            r#"{"agents":{"codex":{"tool":"codex","role":"master"}}}"#,
+        )
+        .unwrap();
+        assert!(
+            repo.path().join(".clank/agents/claude/attended").exists(),
+            "the file is still there — that is the point"
+        );
+        let err = resolve_kill_target(&p, repo.path())
+            .expect_err("a departed agent's leftover record must not be signalled");
+        assert!(err.contains("roster"), "{err}");
+    }
+
+    /// The happy path, so every refusal below is meaningful.
+    #[test]
+    fn a_matching_instance_and_identity_resolve_to_the_recorded_pid() {
+        let repo = detail_repo();
+        let me = std::process::id() as i32;
+        write_attended(
+            repo.path(),
+            "claude",
+            &attended("t1", "2026-08-20T14:51:09Z", Some(me), true),
+        );
+        assert_eq!(
+            resolve_kill_target(&page("claude", "t1", "2026-08-20T14:51:09Z"), repo.path()),
+            Ok(me)
+        );
+    }
+
+    /// The bug this shape exists to prevent: the record changes AFTER
+    /// the confirm opens. The TUI's snapshot is refreshed by an
+    /// asynchronous wake and may still hold the old record, so a
+    /// resolver reading the snapshot would happily signal. Reading the
+    /// FILE is what makes the answer current.
+    #[test]
+    fn a_record_replaced_between_the_confirm_and_the_signal_signals_nothing() {
+        let repo = detail_repo();
+        let me = std::process::id() as i32;
+        let p = page("claude", "t1", "2026-08-20T14:51:09Z");
+        write_attended(
+            repo.path(),
+            "claude",
+            &attended("t1", "2026-08-20T14:51:09Z", Some(me), true),
+        );
+        assert_eq!(
+            resolve_kill_target(&p, repo.path()),
+            Ok(me),
+            "valid when opened"
+        );
+
+        // The agent re-attends: same task, a NEW instance.
+        write_attended(
+            repo.path(),
+            "claude",
+            &attended("t1", "2026-08-24T09:00:00Z", Some(me), true),
+        );
+        let err = resolve_kill_target(&p, repo.path())
+            .expect_err("a new instance must not inherit the standing confirm");
+        assert!(err.contains("replaced"), "{err}");
+
+        // Or stops attending altogether.
+        std::fs::remove_file(repo.path().join(".clank/agents/claude/attended")).unwrap();
+        assert!(
+            resolve_kill_target(&p, repo.path()).is_err(),
+            "nothing to signal"
+        );
+    }
+
+    /// The pid is live and the record looks fine — but the process
+    /// holding that number is not the one recorded. This is the case
+    /// that turns a kill into signalling a stranger.
+    #[test]
+    fn a_reused_pid_is_refused_even_though_it_is_alive() {
+        let repo = detail_repo();
+        let me = std::process::id() as i32;
+        let mut att = attended("t1", "2026-08-20T14:51:09Z", Some(me), true);
+        // Same live pid, a birth this process does not have.
+        att.token = Some(crate::proc_identity::ProcToken::MacStart { sec: 1, usec: 1 });
+        write_attended(repo.path(), "claude", &att);
+        let err = resolve_kill_target(&page("claude", "t1", "2026-08-20T14:51:09Z"), repo.path())
+            .expect_err("a mismatched identity must never be signalled");
+        assert!(err.contains("reused") || err.contains("DIFFERENT"), "{err}");
+    }
+
+    /// Records written before identity existed stay viewable, and are
+    /// never killable: their pid cannot be trusted to be the same
+    /// process any more.
+    #[test]
+    fn a_record_without_a_token_is_viewable_but_not_killable() {
+        let repo = detail_repo();
+        let me = std::process::id() as i32;
+        let att = attended("t1", "2026-08-20T14:51:09Z", Some(me), false);
+        assert!(
+            att.marker_fields(time::OffsetDateTime::now_utc()).is_some(),
+            "still shown"
+        );
+        assert_eq!(att.killable_pid(), None, "but not actionable");
+        write_attended(repo.path(), "claude", &att);
+        assert!(
+            resolve_kill_target(&page("claude", "t1", "2026-08-20T14:51:09Z"), repo.path())
+                .is_err()
+        );
+    }
+
+    /// The other ways the target can change while the confirm sits on
+    /// screen, each asserted separately: a check that only runs when
+    /// the page OPENS passes all of them and still signals.
+    #[test]
+    fn a_target_that_changed_after_the_confirm_signals_nothing() {
+        let repo = detail_repo();
+        let me = std::process::id() as i32;
+        let p = page("claude", "t1", "2026-08-20T14:51:09Z");
+
+        // A different task under the same agent.
+        write_attended(
+            repo.path(),
+            "claude",
+            &attended("t2", "2026-08-20T14:51:09Z", Some(me), true),
+        );
+        assert!(
+            resolve_kill_target(&p, repo.path()).is_err(),
+            "different task"
+        );
+
+        // The process exited.
+        write_attended(
+            repo.path(),
+            "claude",
+            &attended("t1", "2026-08-20T14:51:09Z", Some(i32::MAX), true),
+        );
+        assert!(resolve_kill_target(&p, repo.path()).is_err(), "dead pid");
+
+        // No record at all.
+        let empty = detail_repo();
+        assert!(
+            resolve_kill_target(&p, empty.path()).is_err(),
+            "no attendance"
+        );
+    }
+
+    /// Resolving is READ-ONLY: it decides, it does not reap. The hook
+    /// owns the record's lifetime.
+    #[test]
+    fn resolving_a_kill_leaves_the_record_alone() {
+        let repo = detail_repo();
+        let me = std::process::id() as i32;
+        write_attended(
+            repo.path(),
+            "claude",
+            &attended("t1", "2026-08-20T14:51:09Z", Some(me), true),
+        );
+        let _ = resolve_kill_target(&page("claude", "t1", "2026-08-20T14:51:09Z"), repo.path());
+        assert!(
+            repo.path().join(".clank/agents/claude/attended").exists(),
+            "the record survives"
+        );
+    }
+
     /// The identity rule, at the seam that had the bug: both ends of a
     /// swap are re-LOCATED by label after a refresh, never trusted as
     /// indices. An external roster or library edit reorders these
@@ -4008,6 +4649,7 @@ pub(crate) mod tests {
             &mut s,
             repo.path(),
             &mut None,
+            1,
         );
         assert_eq!(
             s.agents[1].auto_mode,
@@ -4025,7 +4667,15 @@ pub(crate) mod tests {
     fn apply_detail_action_remove_defers_to_confirm() {
         let repo = detail_repo();
         let mut s = two_agent_snap();
-        let next = apply_detail_action(DetailAction::Remove, 1, 3, &mut s, repo.path(), &mut None);
+        let next = apply_detail_action(
+            DetailAction::Remove,
+            1,
+            3,
+            &mut s,
+            repo.path(),
+            &mut None,
+            1,
+        );
         assert_eq!(
             next,
             Mode::Confirm {
