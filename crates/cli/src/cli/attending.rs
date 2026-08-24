@@ -46,6 +46,23 @@ pub async fn run(args: AttendingArgs) -> anyhow::Result<()> {
     }
     let record = crate::cli::stop_hook::Attending {
         task: task_id.to_string(),
+        // One line, no control bytes: the record is read straight
+        // into a terminal row. The renderer normalises too — records
+        // can be hand-edited — but a clean write keeps the stored
+        // value honest.
+        desc: args
+            .desc
+            .as_deref()
+            .map(|d| {
+                d.lines()
+                    .next()
+                    .unwrap_or("")
+                    .chars()
+                    .filter(|c| !c.is_control())
+                    .collect::<String>()
+            })
+            .map(|d| d.trim().to_string())
+            .filter(|d| !d.is_empty()),
         pid: args.pid,
     };
     std::fs::write(&path, serde_json::to_string(&record)?)?;

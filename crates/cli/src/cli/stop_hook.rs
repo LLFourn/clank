@@ -801,6 +801,11 @@ fn attended_path(agent_dir: &Path) -> PathBuf {
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Attending {
     pub(crate) task: String,
+    /// Two words for what is being waited on. Absent on records
+    /// written before it existed, and on callers that omit it — the
+    /// task id is the subject then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) desc: Option<String>,
     /// Absent unless the caller passed `--pid`. A harness task handle
     /// carries no pid, so this arrives only when the backgrounded
     /// command recorded its own `$$`. Display only — nothing about
@@ -824,6 +829,8 @@ pub(crate) struct Attending {
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Attended {
     pub(crate) task: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) desc: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) pid: Option<i32>,
     /// RFC3339, for rendering how long ago the decision was made.
@@ -897,15 +904,29 @@ impl Attended {
     ///
     /// A record with no pid still renders: "cannot check" is not
     /// "ended".
-    pub(crate) fn row_marker(&self, now: time::OffsetDateTime) -> Option<String> {
+    /// What the wait IS: the recorded description, else the opaque
+    /// task id. Never empty — this is the field the marker exists to
+    /// show, and a marker that cannot show it is not drawn at all.
+    pub(crate) fn subject(&self) -> &str {
+        self.desc
+            .as_deref()
+            .map(str::trim)
+            .filter(|d| !d.is_empty())
+            .unwrap_or(&self.task)
+    }
+
+    /// The marker's fields in priority order: subject, then age, then
+    /// pid. Callers drop from the RIGHT to fit, so a narrowing line
+    /// only ever gets shorter. `None` once the process is known dead —
+    /// a wait that has ended is not drawn.
+    pub(crate) fn marker_fields(&self, now: time::OffsetDateTime) -> Option<MarkerFields<'_>> {
         if self.process_alive() == Some(false) {
             return None;
         }
-        Some(match (self.pid, self.age(now)) {
-            (Some(pid), Some(age)) => format!("{pid} · {age}"),
-            (Some(pid), None) => pid.to_string(),
-            (None, Some(age)) => age,
-            (None, None) => String::new(),
+        Some(MarkerFields {
+            subject: self.subject(),
+            age: self.age(now),
+            pid: self.pid,
         })
     }
 
@@ -915,6 +936,15 @@ impl Attended {
                 .ok()?;
         Some(short_duration(now - at))
     }
+}
+
+/// The attendance marker's parts, most important first. Assembling
+/// and fitting them belongs to the renderer, which is where the
+/// column budget and the width tables live.
+pub(crate) struct MarkerFields<'a> {
+    pub(crate) subject: &'a str,
+    pub(crate) age: Option<String>,
+    pub(crate) pid: Option<i32>,
 }
 
 /// A duration at one significant unit — long enough to judge staleness
@@ -970,6 +1000,7 @@ fn record_attended(agent_dir: &Path, rec: &Attending) {
     };
     let entry = Attended {
         task: rec.task.clone(),
+        desc: rec.desc.clone(),
         pid: rec.pid,
         at,
     };
@@ -1013,9 +1044,11 @@ fn outcome_from_wait_output(
                 if !live_ids.is_empty() {
                     reason.push_str(&format!(
                         "\n\nYou have a live background task ({}). If you are WAITING on it, \
-                         record it — `clank attending {}` — and nothing will wake you until it \
-                         ends. Add `--pid <pid>` (see `clank attending --help`) so `clank status` \
-                         can show when it has ended. Do not end your turn to poll it.",
+                         record it — `clank attending {} --desc \"two words\"` — and nothing will \
+                         wake you until it ends. The description is what `clank status --tui` \
+                         shows; without it the row can only name the opaque task id. Add \
+                         `--pid <pid>` (see `clank attending --help`) so `clank status` can show \
+                         when it has ended. Do not end your turn to poll it.",
                         live_ids.join(", "),
                         live_ids.first().map(String::as_str).unwrap_or("<task-id>"),
                     ));
@@ -1486,6 +1519,7 @@ mod tests {
 
     fn write_attending_pid(dir: &Path, task: &str, pid: Option<i32>) {
         let rec = Attending {
+            desc: None,
             task: task.to_string(),
             pid,
         };
@@ -1525,6 +1559,28 @@ mod tests {
                 why: SilentReason::AttendingBackgroundTask
             }
         )
+    }
+
+    /// Records on disk predate `desc`. They must keep loading, with
+    /// the task id as the subject — an upgrade that silently stopped
+    /// showing existing waits would be the reported bug again, by a
+    /// different route.
+    #[test]
+    fn an_attended_record_without_a_description_still_loads_and_names_itself() {
+        let raw = r#"{"task":"br9711ewy","at":"2026-08-20T14:51:09Z"}"#;
+        let rec: Attended = serde_json::from_str(raw).expect("pre-desc record still parses");
+        assert_eq!(rec.desc, None);
+        assert_eq!(rec.subject(), "br9711ewy", "the id is the subject");
+
+        // And a blank description is not a description.
+        let blank = r#"{"task":"br9711ewy","desc":"   ","at":"2026-08-20T14:51:09Z"}"#;
+        let rec: Attended = serde_json::from_str(blank).unwrap();
+        assert_eq!(rec.subject(), "br9711ewy", "whitespace never names a wait");
+
+        // A recorded description wins.
+        let full = r#"{"task":"br9711ewy","desc":"test run","at":"2026-08-20T14:51:09Z"}"#;
+        let rec: Attended = serde_json::from_str(full).unwrap();
+        assert_eq!(rec.subject(), "test run");
     }
 
     #[test]

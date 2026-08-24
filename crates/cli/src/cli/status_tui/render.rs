@@ -470,7 +470,6 @@ pub(super) fn scrollable_header(
         };
         for (i, a) in snap.agents.iter().enumerate() {
             let mut spans = vec![
-                plain("  ".to_string()),
                 auto_mark(a.auto_mode),
                 plain(format!(" {}", a.label)),
                 dim(format!("  {}", tier_label(a.role))),
@@ -479,29 +478,46 @@ pub(super) fn scrollable_header(
             // hourglass replaces the spinner and its verb rather than
             // crowding in beside them — `⌛ working…` claims two things
             // at once, and the wrong one is the animated one.
-            match a
+            // Two INDEPENDENT questions. Whether the agent is blocked
+            // is about the record; whether its wait fits on screen is
+            // about the pane. Deriving the first from the second put a
+            // spinning `working…` on an agent that was blocked, merely
+            // because the pane was too narrow to say on what (codex on
+            // 46e5e53).
+            let waiting = a
                 .attending
                 .as_ref()
-                .and_then(|att| att.row_marker(time::OffsetDateTime::now_utc()))
-            {
-                Some(marker) if marker.is_empty() => spans.push(dim("  ⌛".to_string())),
-                Some(marker) => spans.push(dim(format!("  ⌛ {marker}"))),
-                // No live wait — including a record whose process has
-                // ended, which leaves the agent free to be working.
-                None => {
-                    if let Some(verb) = verb_for(&a.label) {
-                        spans.push(dim(format!("  {}", spinner_glyph(frame))));
-                        spans.push(italic(format!(" {verb}…")));
-                    }
+                .and_then(|att| att.marker_fields(time::OffsetDateTime::now_utc()));
+            let marker = waiting.as_ref().and_then(|f| {
+                fit_marker(f, (cols as usize).saturating_sub(ATTENDING_INDENT.len()))
+            });
+            // No live wait — including a record whose process has
+            // ended, which leaves the agent free to be working.
+            if waiting.is_none() {
+                if let Some(verb) = verb_for(&a.label) {
+                    spans.push(dim(format!("  {}", spinner_glyph(frame))));
+                    spans.push(italic(format!(" {verb}…")));
                 }
             }
             head_out.push(row_line(&spans, mode.selected() == Some(i), color, cols));
+            // The wait gets its OWN line beneath its agent, so naming
+            // it costs the agent row nothing. Not selectable: rows stay
+            // 1:1 with the cursor's agent indices, and reaching this
+            // line with the cursor is a separate plan.
+            if let Some(marker) = marker {
+                head_out.push(row_line(
+                    &[dim(format!("{ATTENDING_INDENT}{marker}"))],
+                    false,
+                    color,
+                    cols,
+                ));
+            }
         }
         // "+ add" button — the last selectable row (cursor index
         // `agents.len()`).
         {
             let add_selected = mode.selected() == Some(snap.agents.len());
-            let spans = vec![plain("  + add agent".to_string())];
+            let spans = vec![plain("+ add agent".to_string())];
             head_out.push(row_line(&spans, add_selected, color, cols));
         }
     }
@@ -588,6 +604,64 @@ pub(super) fn scrollable_header(
 #[cfg(test)]
 pub(super) fn render(snap: &StatusSnapshot, rows: u16, cols: u16) -> Vec<String> {
     render_at(snap, rows, cols, 0, 0, &PanelView::just(Mode::LogScroll)).0
+}
+
+/// The attendance line sits one step in from its agent. The agents
+/// list used to carry this indent for nothing; it is spent here, where
+/// an indent actually means something.
+const ATTENDING_INDENT: &str = "  ";
+
+/// Fit the attendance marker to `budget` display columns.
+///
+/// Fields drop from the RIGHT — pid, then age — so a narrowing line
+/// only gets shorter. The SUBJECT never drops: it is the whole point
+/// of the marker, and a marker that cannot name what it attends is
+/// not a smaller marker, it is the bug this exists to prevent
+/// (`⌛ 2m` said waiting, for two minutes, on nothing it would name).
+///
+/// Below `MIN_SUBJECT` columns of subject text it returns None rather
+/// than an ellipsis naming nothing: `⌛ t…` is the bare hourglass in
+/// disguise. A pane too narrow to say what a wait is says nothing,
+/// and the agent row above it is still there.
+fn fit_marker(fields: &crate::cli::stop_hook::MarkerFields<'_>, budget: usize) -> Option<String> {
+    /// Fewer columns than this names nothing worth reading.
+    const MIN_SUBJECT: usize = 6;
+    const GLYPH: &str = "⌛ ";
+
+    let head = display_width(GLYPH);
+    // A subject is drawn into a terminal row, so it must BE one row:
+    // `one_line` takes the first line and drops control bytes, which
+    // would otherwise inject extra rows or escape sequences from a
+    // `--desc` (or a hand-edited record). If nothing legible survives
+    // — including a persisted task that was empty all along — there is
+    // nothing to name and so no marker (codex on 46e5e53).
+    let subject = one_line(fields.subject, budget);
+    let subject = subject.trim();
+    if subject.is_empty() {
+        return None;
+    }
+    let mut parts: Vec<String> = vec![subject.to_string()];
+    if let Some(age) = &fields.age {
+        parts.push(age.clone());
+    }
+    if let Some(pid) = fields.pid {
+        parts.push(format!("pid {pid}"));
+    }
+    // Drop from the right while the whole thing overflows.
+    while parts.len() > 1 && head + display_width(&parts.join(" · ")) > budget {
+        parts.pop();
+    }
+    let joined = parts.join(" · ");
+    if head + display_width(&joined) <= budget {
+        return Some(format!("{GLYPH}{joined}"));
+    }
+
+    // Subject alone still overflows: truncate it, but never past the
+    // point where it identifies anything.
+    let room = budget.saturating_sub(head);
+    let cut = truncate_to(subject, room);
+    let kept = display_width(&cut).saturating_sub(if cut.ends_with('…') { 1 } else { 0 });
+    (kept >= MIN_SUBJECT).then(|| format!("{GLYPH}{cut}"))
 }
 
 /// Widest verdict mark in display columns: `✓✓` (Finished) is 2,
@@ -4555,17 +4629,22 @@ mod tests {
         let mut s = two_agent_snap();
         s.plans = vec![plan_state("foo", WaitingOn::MasterToContinue)];
         s.agents[0].attending = Some(crate::cli::stop_hook::Attended {
+            desc: None,
             task: "b72qah60w".to_string(),
             pid: Some(std::process::id() as i32),
             at: "2026-08-20T14:51:09Z".to_string(),
         });
-        let row = visible(line_with(&render(&s, 40, 80), "claude"));
-        assert!(row.contains("⌛"), "hourglass marks the wait: {row}");
+        let lines = render(&s, 40, 80);
+        let agent = visible(line_with(&lines, "claude"));
+        let wait = visible(line_with(&lines, "⌛"));
         assert!(
-            !row.contains("working"),
-            "verb is replaced, not joined: {row}"
+            !wait.is_empty(),
+            "the wait gets a line of its own: {lines:?}"
         );
-        assert!(!row.contains(SPINNER[0]), "and so is the spinner: {row}");
+        assert!(
+            !agent.contains("working") && !agent.contains(SPINNER[0]),
+            "verb and spinner are replaced, not joined: {agent}"
+        );
     }
 
     /// A dead pid is the process saying nobody is waiting. Rendering
@@ -4575,14 +4654,18 @@ mod tests {
     fn an_ended_wait_renders_no_marker_and_keeps_the_record() {
         let mut s = two_agent_snap();
         s.agents[0].attending = Some(crate::cli::stop_hook::Attended {
+            desc: None,
             task: "b72qah60w".to_string(),
             // Above every platform's pid_max, so it cannot be running.
             pid: Some(i32::MAX),
             at: "2026-08-20T14:51:09Z".to_string(),
         });
-        let row = visible(line_with(&render(&s, 40, 80), "claude"));
-        assert!(!row.contains("⌛"), "an ended wait is not drawn: {row}");
-        assert!(!row.contains("stale"), "and says nothing about it: {row}");
+        let joined = render(&s, 40, 80).join("\n");
+        assert!(
+            !joined.contains("⌛"),
+            "an ended wait is not drawn: {joined}"
+        );
+        assert!(!joined.contains("stale"), "and says nothing about it");
         assert!(
             s.agents[0].attending.is_some(),
             "rendering must not consume the record — the hook owns reaping"
@@ -4595,33 +4678,283 @@ mod tests {
     fn a_wait_with_no_pid_still_renders() {
         let mut s = two_agent_snap();
         s.agents[0].attending = Some(crate::cli::stop_hook::Attended {
+            desc: None,
             task: "b72qah60w".to_string(),
             pid: None,
             at: "2026-08-20T14:51:09Z".to_string(),
         });
-        let row = visible(line_with(&render(&s, 40, 80), "claude"));
-        assert!(row.contains("⌛"), "cannot-check still shows a wait: {row}");
+        let wait = visible(line_with(&render(&s, 40, 80), "⌛"));
+        assert!(!wait.is_empty(), "cannot-check still shows a wait");
+        assert!(
+            wait.contains("b72qah60w"),
+            "and names it — the id is the subject when no description was recorded: {wait}"
+        );
     }
 
-    /// The task id is an opaque harness handle: not in `ps`, not
-    /// correlated with anything else on screen. The pid is the half a
-    /// human can act on, so only it survives into the row.
+    /// The subject is what the marker exists to show: the recorded
+    /// description when there is one, the task id when there is not.
+    /// Naming nothing was the bug — a row reading `⌛ 2m` announced a
+    /// wait and withheld what it was for.
     #[test]
-    fn the_row_keeps_the_pid_and_drops_the_harness_id() {
+    fn the_marker_names_its_subject_description_first_then_the_id() {
+        let att = |desc: Option<&str>| crate::cli::stop_hook::Attended {
+            desc: desc.map(str::to_string),
+            task: "b72qah60w".to_string(),
+            pid: Some(std::process::id() as i32),
+            at: "2026-08-20T14:51:09Z".to_string(),
+        };
+
+        let mut s = two_agent_snap();
+        s.agents[0].attending = Some(att(Some("test run")));
+        let wait = visible(line_with(&render(&s, 40, 120), "⌛"));
+        assert!(
+            wait.contains("test run"),
+            "the description is the subject: {wait}"
+        );
+        assert!(
+            !wait.contains("b72qah60w"),
+            "the opaque id gives way to it: {wait}"
+        );
+        assert!(
+            wait.contains(&std::process::id().to_string()),
+            "the pid still rides along when there is room: {wait}"
+        );
+
+        s.agents[0].attending = Some(att(None));
+        let wait = visible(line_with(&render(&s, 40, 120), "⌛"));
+        assert!(
+            wait.contains("b72qah60w"),
+            "with no description the id is the subject: {wait}"
+        );
+    }
+
+    /// The invariant, over every shape a record can take: a drawn
+    /// marker always names what it attends. `⌛ 2m` — waiting, for two
+    /// minutes, on nothing it would name — is the bug this plan exists
+    /// to make unrepresentable.
+    #[test]
+    fn every_drawn_marker_names_its_subject() {
+        let now = time::OffsetDateTime::now_utc();
+        let live = std::process::id() as i32;
+        for (desc, pid, at) in [
+            (Some("test run"), Some(live), "2026-08-20T14:51:09Z"),
+            (Some("test run"), None, "2026-08-20T14:51:09Z"),
+            (None, Some(live), "2026-08-20T14:51:09Z"),
+            (None, None, "2026-08-20T14:51:09Z"),
+            // Unparseable timestamp: no age, so the marker is subject
+            // (and pid) alone — still never subjectless.
+            (None, None, "not-a-timestamp"),
+        ] {
+            let att = crate::cli::stop_hook::Attended {
+                desc: desc.map(str::to_string),
+                task: "b72qah60w".to_string(),
+                pid,
+                at: at.to_string(),
+            };
+            let fields = att.marker_fields(now).expect("a live wait is drawn");
+            let marker = fit_marker(&fields, 80).expect("80 columns is ample");
+            assert!(
+                marker.contains(desc.unwrap_or("b72qah60w")),
+                "marker names nothing for desc={desc:?} pid={pid:?} at={at}: {marker}"
+            );
+        }
+    }
+
+    /// Fields drop from the RIGHT as the pane narrows — pid, then age
+    /// — so a narrowing line only ever gets shorter and the subject is
+    /// the last thing standing.
+    #[test]
+    fn the_marker_drops_pid_then_age_and_keeps_the_subject() {
+        // Built directly: this exercises the FITTER, and routing it
+        // through a record would make the test depend on whether a
+        // fabricated pid happens to be alive.
+        let f = crate::cli::stop_hook::MarkerFields {
+            subject: "test run",
+            age: Some("2m".to_string()),
+            pid: Some(41293),
+        };
+
+        let wide = fit_marker(&f, 60).expect("fits");
+        assert!(wide.contains("test run") && wide.contains("41293"));
+
+        // Enough for subject + age, not the pid.
+        let mid = fit_marker(&f, 18).expect("subject and age fit");
+        assert!(mid.contains("test run"), "subject survives: {mid}");
+        assert!(!mid.contains("41293"), "pid dropped first: {mid}");
+
+        // Enough for the subject alone.
+        let narrow = fit_marker(&f, 11).expect("subject fits");
+        assert_eq!(narrow, "⌛ test run", "age dropped next");
+    }
+
+    /// Below the floor there is no marker at all — not a bare
+    /// hourglass, and not an ellipsis naming nothing. `⌛ t…` is the
+    /// reported bug wearing a different hat, so the width case is the
+    /// invariant applied, never an exception to it.
+    #[test]
+    fn a_pane_too_narrow_to_name_the_wait_draws_no_marker() {
+        let f = crate::cli::stop_hook::MarkerFields {
+            subject: "running the whole test suite",
+            age: Some("2m".to_string()),
+            pid: Some(41293),
+        };
+
+        // Room for some of the subject: truncated, still identifying.
+        let cut = fit_marker(&f, 14).expect("above the floor");
+        assert!(
+            cut.starts_with("⌛ running"),
+            "keeps a readable head: {cut}"
+        );
+        assert!(cut.contains('…'), "and marks the cut: {cut}");
+
+        // Under the floor: nothing at all, at every width down to zero.
+        for budget in 0..=8 {
+            assert_eq!(
+                fit_marker(&f, budget),
+                None,
+                "a {budget}-column pane must draw NO marker, never a bare hourglass"
+            );
+        }
+    }
+
+    /// Being blocked and being displayable are different facts. An
+    /// undrawable marker must not make the agent claim it is WORKING —
+    /// a false statement, strictly worse than the silence the width
+    /// rule asks for.
+    ///
+    /// The discriminating case is a live wait whose subject cannot be
+    /// named at ANY width, not a narrow pane: the verb needs about 29
+    /// columns and a marker only 12, so at every width narrow enough
+    /// to lose the marker the verb is already truncated away and the
+    /// assertion cannot tell the wirings apart. A persisted empty task
+    /// separates them at full width.
+    #[test]
+    fn an_undrawable_wait_still_stops_the_agent_claiming_it_is_working() {
+        let mut s = two_agent_snap();
+        s.plans = vec![plan_state("foo", WaitingOn::MasterToContinue)];
+        s.agents[0].attending = Some(crate::cli::stop_hook::Attended {
+            desc: None,
+            // Nothing to name: the record is live but unnameable.
+            task: String::new(),
+            pid: Some(std::process::id() as i32),
+            at: "2026-08-20T14:51:09Z".to_string(),
+        });
+        let lines = render(&s, 40, 80);
+        let agent = visible(line_with(&lines, "claude"));
+        assert!(
+            !lines.join("\n").contains("⌛"),
+            "an unnameable wait draws no marker: {lines:?}"
+        );
+        assert!(
+            !agent.contains("working") && !agent.contains(SPINNER[0]),
+            "but the agent is still BLOCKED and must not spin: `{agent}`"
+        );
+
+        // The control: remove the attendance and the verb returns, so
+        // the assertion above is about the wiring, not a snapshot that
+        // never had a verb.
+        s.agents[0].attending = None;
+        let agent = visible(line_with(&render(&s, 40, 80), "claude"));
+        assert!(
+            agent.contains("working") && agent.contains(SPINNER[0]),
+            "a genuinely unattended master does spin: `{agent}`"
+        );
+    }
+
+    /// The narrow pane, at the full render call site: no marker line,
+    /// and nothing left behind where it would have been.
+    #[test]
+    fn a_narrow_pane_draws_no_marker_line_at_all() {
         let mut s = two_agent_snap();
         s.agents[0].attending = Some(crate::cli::stop_hook::Attended {
+            desc: Some("running the whole test suite".to_string()),
             task: "b72qah60w".to_string(),
             pid: Some(std::process::id() as i32),
             at: "2026-08-20T14:51:09Z".to_string(),
         });
-        let row = visible(line_with(&render(&s, 40, 80), "claude"));
+        // 11 columns: two to the indent, three to the glyph, leaving
+        // six for the subject — one short of the floor once the
+        // ellipsis takes its column.
+        let lines = render(&s, 40, 11);
         assert!(
-            row.contains(&std::process::id().to_string()),
-            "the pid is actionable and stays: {row}"
+            !lines.join("\n").contains("⌛"),
+            "no marker fits at 11 columns: {lines:?}"
+        );
+        // And at 12 it does — so the assertion above is a real
+        // boundary, not a width where nothing renders anyway.
+        assert!(
+            render(&s, 40, 12).join("\n").contains("⌛"),
+            "12 columns is exactly enough"
+        );
+    }
+
+    /// The subject is drawn into a terminal ROW. A description with a
+    /// newline would inject a second one and break the height clamp;
+    /// control bytes would emit escape sequences. And a record whose
+    /// task was empty all along names nothing, so it draws nothing.
+    #[test]
+    fn a_subject_is_one_safe_line_or_there_is_no_marker() {
+        let f = |subject: &'static str| crate::cli::stop_hook::MarkerFields {
+            subject,
+            age: Some("2m".to_string()),
+            pid: None,
+        };
+
+        let m = fit_marker(&f("test\nrun"), 80).expect("first line survives");
+        assert_eq!(m, "⌛ test · 2m", "a newline cannot add a row: {m}");
+
+        let m = fit_marker(&f("test\u{1b}[31m run"), 80).expect("stripped");
+        assert!(
+            !m.contains('\u{1b}'),
+            "no escape sequences reach the pane: {m}"
+        );
+
+        // Nothing legible left: no marker, never a bare hourglass.
+        assert_eq!(
+            fit_marker(&f(""), 80),
+            None,
+            "an empty subject draws nothing"
+        );
+        assert_eq!(fit_marker(&f("   "), 80), None, "nor a blank one");
+        assert_eq!(
+            fit_marker(&f("\u{1b}\u{7}"), 80),
+            None,
+            "nor one that is only control bytes"
+        );
+    }
+
+    /// The wait sits on its own line, one step in from its agent — and
+    /// the agents themselves no longer carry the indent they used to
+    /// spend on nothing.
+    #[test]
+    fn the_wait_gets_an_indented_line_under_a_flush_agent_row() {
+        let mut s = two_agent_snap();
+        s.agents[0].attending = Some(crate::cli::stop_hook::Attended {
+            desc: Some("test run".to_string()),
+            task: "b72qah60w".to_string(),
+            pid: Some(std::process::id() as i32),
+            at: "2026-08-20T14:51:09Z".to_string(),
+        });
+        let lines = render(&s, 40, 80);
+        let agent_at = lines
+            .iter()
+            .position(|l| visible(l).contains("claude"))
+            .unwrap();
+        let wait_at = lines
+            .iter()
+            .position(|l| visible(l).contains("⌛"))
+            .unwrap();
+        assert_eq!(wait_at, agent_at + 1, "the wait follows its agent");
+
+        let agent = visible(&lines[agent_at]);
+        let wait = visible(&lines[wait_at]);
+        assert!(
+            !agent.starts_with(' '),
+            "the agent row is flush now: `{agent}`"
         );
         assert!(
-            !row.contains("b72qah60w"),
-            "the harness id belongs on the plain status line: {row}"
+            wait.starts_with(ATTENDING_INDENT) && !wait.trim_start().is_empty(),
+            "the wait is indented under it: `{wait}`"
         );
     }
 
@@ -4646,6 +4979,7 @@ mod tests {
     fn an_attending_row_is_built_to_fit_its_pane() {
         let mut s = two_agent_snap();
         s.agents[0].attending = Some(crate::cli::stop_hook::Attended {
+            desc: None,
             task: "b72qah60w".to_string(),
             pid: Some(std::process::id() as i32),
             at: "2026-08-20T14:51:09Z".to_string(),

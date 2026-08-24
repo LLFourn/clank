@@ -2219,6 +2219,7 @@ mod dirty_and_wake_tests {
 
     fn marker(task: &str, pid: Option<i32>, at: Option<&str>) -> crate::cli::stop_hook::Attended {
         crate::cli::stop_hook::Attended {
+            desc: None,
             task: task.to_string(),
             pid,
             at: at.unwrap_or("2026-08-20T14:51:09Z").to_string(),
