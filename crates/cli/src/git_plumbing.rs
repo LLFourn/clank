@@ -90,7 +90,7 @@ pub fn squash_commit(
     source_sha: &str,
     tree_sha: &str,
     parent: Option<&str>,
-    message: &str,
+    message: &[u8],
 ) -> anyhow::Result<String> {
     let r = open(repo)?;
     let source = r
@@ -108,6 +108,54 @@ pub fn squash_commit(
         name: cfg.name,
         email: cfg.email,
         time: author.time,
+    };
+    write_commit(&r, tree_sha, parent, author, committer, message.into())
+}
+
+/// Write a commit that must NOT reproduce `source_sha`, even when tree,
+/// parent, author and message are all unchanged.
+///
+/// [`squash_commit`] pins the committer date to the author date so
+/// re-squashing is idempotent — which means rewriting one of its own
+/// commits with the same message yields a byte-identical object and the
+/// SAME sha. That is correct for squashing and wrong for `rereview`,
+/// whose entire purpose is to mint a fresh review target.
+///
+/// The committer date is therefore derived from the SOURCE's, not from
+/// the wall clock: `max(now, source.committer.time + 1s)`. Ambient-now
+/// alone collides at one-second resolution, and a caller that then
+/// checked for equality would turn a rare silent no-op into a rare
+/// spurious failure. Deriving it makes the new object differ by
+/// construction, so two rewrites back to back both succeed.
+pub fn recommit_distinct(
+    repo: &Path,
+    source_sha: &str,
+    tree_sha: &str,
+    parent: Option<&str>,
+    message: &[u8],
+) -> anyhow::Result<String> {
+    let r = open(repo)?;
+    let source = r
+        .find_commit(parse_oid(source_sha)?)
+        .with_context(|| format!("find commit `{source_sha}`"))?;
+    let author = source
+        .author()
+        .with_context(|| format!("author of `{source_sha}`"))?
+        .to_owned()?;
+    let prev = source
+        .committer()
+        .with_context(|| format!("committer of `{source_sha}`"))?
+        .time()
+        .context("committer time")?;
+    let cfg = ambient_committer(&r)?;
+    let seconds = cfg.time.seconds.max(prev.seconds + 1);
+    let committer = gix::actor::Signature {
+        name: cfg.name,
+        email: cfg.email,
+        time: gix::date::Time {
+            seconds,
+            ..cfg.time
+        },
     };
     write_commit(&r, tree_sha, parent, author, committer, message.into())
 }

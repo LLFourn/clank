@@ -166,6 +166,12 @@ enum Command {
     /// Pretty-printed to stdout; fails closed on a pre-roster config
     /// shape with a re-init hint.
     Export(cli::ExportArgs),
+    /// Re-open review on a plan's latest reviewable commit
+    ///
+    /// Rewrites it with the same tree and message so it becomes a new
+    /// commit that every reviewer owes a fresh verdict on. Use after a
+    /// promotion auto-continued a demoted master's self-review.
+    Rereview(cli::RereviewArgs),
     /// Remap feedback after a rebase or amend
     ///
     /// Installed as the `post-rewrite` git hook by `clank init`;
@@ -208,6 +214,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Log(args) => cli::log::run(args).await,
         Command::Html(args) => cli::html::run(args).await,
         Command::Open(args) => cli::open::run(args).await,
+        Command::Rereview(args) => cli::rereview::run(args).await,
         Command::Rewire(args) => cli::rewire::run(args).await,
         Command::Status(args) => cli::status::run(args).await,
         Command::Wait(args) => cli::wait::run(args).await,

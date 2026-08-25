@@ -338,8 +338,13 @@ pub async fn run(args: PickArgs) -> anyhow::Result<()> {
             }
             let tree = crate::git_plumbing::write_index_tree(&repo)?;
             let tip = shas.last().expect("non-empty plan");
-            let candidate =
-                crate::git_plumbing::squash_commit(&repo, tip, &tree, Some(&cur_head), message)?;
+            let candidate = crate::git_plumbing::squash_commit(
+                &repo,
+                tip,
+                &tree,
+                Some(&cur_head),
+                message.as_bytes(),
+            )?;
             let final_commit = if args.purge {
                 strip_or_drop(&repo, &candidate, &cur_head)?.map(|stripped| {
                     crate::git_plumbing::squash_commit(
@@ -347,7 +352,7 @@ pub async fn run(args: PickArgs) -> anyhow::Result<()> {
                         tip,
                         &stripped,
                         Some(&cur_head),
-                        message,
+                        message.as_bytes(),
                     )
                 })
             } else {

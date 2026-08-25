@@ -289,9 +289,17 @@ pub struct RewordOpts<'a> {
     /// Branch tip the reword was computed against — the expected-old-value
     /// for the conditional in-place ref update.
     pub head_sha: &'a CommitSha,
-    pub new_message: &'a str,
+    /// BYTES, not `&str`: a message may be invalid UTF-8 and a reword
+    /// that preserves it must not launder it through a lossy decode.
+    pub new_message: &'a [u8],
     /// Permit rewriting a protected branch (`main`/`master`) in place.
     pub allow_rewrite_protected: bool,
+    /// Force the rewritten target to be a DIFFERENT commit even when
+    /// the message is unchanged. Off by default: a reword normally
+    /// changes the message, so the sha changes anyway, and pinning the
+    /// committer date keeps re-squashing idempotent. `rereview` sets
+    /// it, since minting a fresh review target is its whole purpose.
+    pub distinct_target: bool,
     pub dry: bool,
 }
 
@@ -378,13 +386,23 @@ pub async fn reword_in_place(opts: RewordOpts<'_>) -> anyhow::Result<Vec<(Commit
     // `squash_commit`), then replay each descendant on top.
     let target_tree = git_plumbing::commit_tree_oid(opts.repo, opts.target_sha.as_str())?;
     let target_parent = crate::git_io::parent_of_at(opts.repo, opts.target_sha)?;
-    let new_target = git_plumbing::squash_commit(
-        opts.repo,
-        opts.target_sha.as_str(),
-        &target_tree,
-        target_parent.as_ref().map(CommitSha::as_str),
-        opts.new_message,
-    )?;
+    let new_target = if opts.distinct_target {
+        git_plumbing::recommit_distinct(
+            opts.repo,
+            opts.target_sha.as_str(),
+            &target_tree,
+            target_parent.as_ref().map(CommitSha::as_str),
+            opts.new_message,
+        )?
+    } else {
+        git_plumbing::squash_commit(
+            opts.repo,
+            opts.target_sha.as_str(),
+            &target_tree,
+            target_parent.as_ref().map(CommitSha::as_str),
+            opts.new_message,
+        )?
+    };
     let parse_new = |s: &str| {
         CommitSha::parse(s).map_err(|e| anyhow::anyhow!("parse rewritten sha `{s}`: {e}"))
     };
@@ -775,7 +793,7 @@ async fn apply_squash(
     // `squash_commit` carries the idempotence above: the tip's author is
     // preserved and the committer date is pinned to it, so re-squashing
     // reproduces the same sha (finish-squash-idempotent-on-finished).
-    git_plumbing::squash_commit(repo, src, &new_tree, intro_parent, message)
+    git_plumbing::squash_commit(repo, src, &new_tree, intro_parent, message.as_bytes())
 }
 
 pub(crate) fn working_tree_dirty(repo: &Path) -> anyhow::Result<bool> {
@@ -1698,8 +1716,9 @@ mod tests {
             repo,
             target_sha: &CommitSha::parse(&target).unwrap(),
             head_sha: &CommitSha::parse(&head).unwrap(),
-            new_message: "reworded whole-plan summary\n\nwhy it exists",
-            allow_rewrite_protected: true, // default branch `main` is protected
+            new_message: "reworded whole-plan summary\n\nwhy it exists".as_bytes(),
+            allow_rewrite_protected: true,
+            distinct_target: false, // default branch `main` is protected
             dry: false,
         })
         .await
@@ -1731,6 +1750,97 @@ mod tests {
         assert_eq!(pairs.last().unwrap().1.as_str(), *new_c);
     }
 
+    /// The property `rereview` needs: rewriting with an UNCHANGED
+    /// message mints a new commit every time, including back to back.
+    ///
+    /// Without `distinct_target` the second rewrite reproduces the
+    /// first's sha exactly — `squash_commit` pins the committer date to
+    /// the author date, so once a commit has been through it there is
+    /// nothing left to differ. That makes `rereview` work once per plan
+    /// and then silently do nothing, which is worse than never working.
+    ///
+    /// Deliberately NO sleeping: needing one would mean the guarantee
+    /// still rests on the wall clock.
+    #[tokio::test]
+    async fn a_distinct_target_mints_a_new_sha_on_every_same_message_rewrite() {
+        let dir = init_repo();
+        let repo = dir.path();
+        write(repo, "a.txt", "a\n");
+        let c = commit(repo, "[foo] intro");
+        let mut sha = CommitSha::parse(&c).unwrap();
+
+        let mut seen = vec![sha.clone()];
+        for round in 0..3 {
+            let pairs = reword_in_place(RewordOpts {
+                repo,
+                target_sha: &sha,
+                head_sha: &sha,
+                new_message: "[foo] intro".as_bytes(),
+                allow_rewrite_protected: true,
+                distinct_target: true,
+                dry: false,
+            })
+            .await
+            .unwrap();
+            let new = pairs[0].1.clone();
+            assert_ne!(new, sha, "round {round} reproduced its own target");
+            assert!(!seen.contains(&new), "round {round} reused an earlier sha");
+            seen.push(new.clone());
+            sha = new;
+        }
+
+        // The tree and message are untouched throughout — only the
+        // review target moved.
+        let msg = crate::git_io::commit_subject_at(repo, &sha).unwrap();
+        assert!(msg.starts_with("[foo] intro"), "message preserved: {msg}");
+    }
+
+    /// The control: WITHOUT the opt-in, a second same-message rewrite
+    /// reproduces the first's sha. This is the behaviour `rereview`
+    /// cannot use, pinned so it is not mistaken for a bug later.
+    #[tokio::test]
+    async fn a_pinned_target_reproduces_its_own_sha_on_a_second_rewrite() {
+        let dir = init_repo();
+        let repo = dir.path();
+        write(repo, "a.txt", "a\n");
+        let c = commit(repo, "[foo] intro");
+        let sha = CommitSha::parse(&c).unwrap();
+
+        let once = reword_in_place(RewordOpts {
+            repo,
+            target_sha: &sha,
+            head_sha: &sha,
+            new_message: "[foo] intro".as_bytes(),
+            allow_rewrite_protected: true,
+            distinct_target: false,
+            dry: false,
+        })
+        .await
+        .unwrap()[0]
+            .1
+            .clone();
+
+        let twice = reword_in_place(RewordOpts {
+            repo,
+            target_sha: &once,
+            head_sha: &once,
+            new_message: "[foo] intro".as_bytes(),
+            allow_rewrite_protected: true,
+            distinct_target: false,
+            dry: false,
+        })
+        .await
+        .unwrap()[0]
+            .1
+            .clone();
+
+        assert_eq!(
+            once, twice,
+            "the pinned committer date makes this a no-op — which is why \
+             rereview must opt out of it"
+        );
+    }
+
     #[tokio::test]
     async fn reword_in_place_refuses_dirty_tree() {
         let dir = init_repo();
@@ -1747,8 +1857,9 @@ mod tests {
             repo,
             target_sha: &CommitSha::parse(&target).unwrap(),
             head_sha: &CommitSha::parse(&head).unwrap(),
-            new_message: "x\n\nwhy",
+            new_message: "x\n\nwhy".as_bytes(),
             allow_rewrite_protected: true,
+            distinct_target: false,
             dry: false,
         })
         .await
@@ -1774,8 +1885,9 @@ mod tests {
             repo,
             target_sha: &CommitSha::parse(&off).unwrap(),
             head_sha: &CommitSha::parse(&head).unwrap(),
-            new_message: "x\n\nwhy",
+            new_message: "x\n\nwhy".as_bytes(),
             allow_rewrite_protected: true,
+            distinct_target: false,
             dry: false,
         })
         .await
@@ -1890,8 +2002,9 @@ mod tests {
             repo,
             target_sha: &target_sha,
             head_sha: &head_sha,
-            new_message: "x\n\nwhy",
+            new_message: "x\n\nwhy".as_bytes(),
             allow_rewrite_protected: true,
+            distinct_target: false,
             dry,
         };
         let err = super::reword_in_place(opts(false)).await.unwrap_err();
@@ -1927,8 +2040,9 @@ mod tests {
             repo,
             target_sha: &CommitSha::parse(&target).unwrap(),
             head_sha: &CommitSha::parse(&head).unwrap(),
-            new_message: "x\n\nwhy",
-            allow_rewrite_protected: false, // `main` is protected
+            new_message: "x\n\nwhy".as_bytes(),
+            allow_rewrite_protected: false,
+            distinct_target: false, // `main` is protected
             dry: false,
         })
         .await

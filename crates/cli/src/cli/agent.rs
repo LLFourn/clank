@@ -1116,7 +1116,12 @@ fn stand_in_body(verdict: clank_core::Verdict) -> String {
     format!(
         "{header} Synthetic roster stand-in; no review performed\n\n{}\n\
          This agent joined the review tier after the commit. Clank recorded\n\
-         non-participation only to keep the already-reached gate from rewinding.\n",
+         non-participation only to keep the already-reached gate from rewinding.\n\
+         \n\
+         The roster change produced this verdict, not a human judgment. If this\n\
+         commit deserves a real review round, run `clank rereview` — it rewrites\n\
+         the commit unchanged so every reviewer, this agent included, owes it a\n\
+         fresh verdict.\n",
         clank_core::feedback_body::ROSTER_STAND_IN_MARKER
     )
 }
@@ -1183,7 +1188,18 @@ fn write_repo_transition(
     let mut created = Vec::new();
     for stand_in in &stand_ins {
         match write_stand_in_noclobber(repo, stand_in, &all_shas) {
-            Ok(Some(path)) => created.push(path),
+            Ok(Some(path)) => {
+                // Say it out loud. A synthetic verdict nobody is told
+                // about is one nobody knows to question, and the whole
+                // point of `rereview` is that it can be questioned.
+                eprintln!(
+                    "auto-continued {} for `{}` (roster change, not a review) — \
+                     `clank rereview` opens a real round",
+                    &stand_in.sha.as_str()[..7.min(stand_in.sha.as_str().len())],
+                    stand_in.author.as_str()
+                );
+                created.push(path)
+            }
             Ok(None) => {}
             Err(error) => {
                 for path in created {

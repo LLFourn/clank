@@ -37,6 +37,7 @@ pub mod plan_resolve;
 pub mod pr_review;
 pub mod purge;
 pub mod queue;
+pub mod rereview;
 pub mod rewire;
 pub mod rewrite;
 pub mod setup;
@@ -241,6 +242,15 @@ pub struct ForkCreateArgs {
     /// `--pr`). Same as `clank pr-review start <N> --fork`.
     #[arg(long, requires = "pr")]
     pub review: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct RereviewArgs {
+    /// Plan to re-open. Defaults to the active plan.
+    pub plan: Option<String>,
+    /// Repo root. Defaults to the cwd's git toplevel.
+    #[arg(long, value_name = "PATH")]
+    pub repo: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]

@@ -603,8 +603,9 @@ async fn reword_finalize(
         repo,
         target_sha: target,
         head_sha: &head,
-        new_message: msg,
+        new_message: msg.as_bytes(),
         allow_rewrite_protected: true,
+        distinct_target: false,
         dry,
     })
     .await?;

@@ -224,6 +224,29 @@ impl Repo {
         })
     }
 
+    /// The commit's message EXACTLY as stored, as BYTES.
+    ///
+    /// Git messages are bytes, not UTF-8, and a lossy conversion here
+    /// would rewrite invalid sequences to U+FFFD — silently altering
+    /// the message of a commit whose whole point is being unchanged
+    /// (codex on acff986). `Vec<u8>` also keeps the backend out of the
+    /// caller's type, which naming a gix `BString` would not.
+    pub fn commit_message_raw(&self, sha: &CommitSha) -> Result<Vec<u8>, GitIoError> {
+        let oid =
+            gix::ObjectId::from_hex(sha.as_str().as_bytes()).map_err(|e| GitIoError::Parse {
+                context: "commit_message_raw".into(),
+                detail: format!("oid hex: {e}"),
+            })?;
+        let commit = self
+            .0
+            .find_commit(oid)
+            .map_err(|e| gix_err("commit_message_raw", format!("find_commit: {e}")))?;
+        let raw = commit
+            .message_raw()
+            .map_err(|e| gix_err("commit_message_raw", format!("message_raw: {e}")))?;
+        Ok(raw.to_vec())
+    }
+
     /// The commit's body (`%b`) — everything after the subject and its
     /// blank line, or `""` if none. Replaces `git log -1 --format=%b
     /// <sha>`.
@@ -1210,6 +1233,11 @@ pub fn head_commit_at(
 /// [`Repo::commit_body`] opening its own handle.
 pub fn commit_body_at(repo: &Path, sha: &CommitSha) -> Result<String, GitIoError> {
     open(repo)?.commit_body(sha)
+}
+
+/// [`Repo::commit_message_raw`] opening its own handle.
+pub fn commit_message_raw_at(repo: &Path, sha: &CommitSha) -> Result<Vec<u8>, GitIoError> {
+    open(repo)?.commit_message_raw(sha)
 }
 
 /// All commits reachable from `head`, as a `full-sha -> subject` map
