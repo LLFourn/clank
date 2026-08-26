@@ -1657,10 +1657,10 @@ pub struct AttendingArgs {
     #[arg(long, value_name = "PID")]
     pub pid: Option<i32>,
     /// TWO WORDS for what you are waiting on — `--desc "test run"`.
-    /// This is what `clank status --tui` shows; without it the row can
-    /// only name the opaque task id. Longer text is truncated to fit,
-    /// never rejected.
-    #[arg(long, value_name = "TEXT")]
+    /// Required: this is what `clank status --tui` shows, and a wait
+    /// nobody can identify is worse than no wait at all. Longer text
+    /// is truncated to fit, never rejected.
+    #[arg(long, value_name = "TEXT", required_unless_present = "clear")]
     pub desc: Option<String>,
     /// Forget the recorded task.
     #[arg(long)]

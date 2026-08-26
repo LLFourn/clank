@@ -1102,8 +1102,8 @@ fn outcome_from_wait_output(
                     reason.push_str(&format!(
                         "\n\nYou have a live background task ({}). If you are WAITING on it, \
                          record it — `clank attending {} --desc \"two words\"` — and nothing will \
-                         wake you until it ends. The description is what `clank status --tui` \
-                         shows; without it the row can only name the opaque task id. Add \
+                         wake you until it ends. `--desc` is REQUIRED: two words naming the wait, \
+                         which is what `clank status --tui` shows. Add \
                          `--pid <pid>` (see `clank attending --help`) so `clank status` can show \
                          when it has ended. Do not end your turn to poll it.",
                         live_ids.join(", "),
