@@ -102,7 +102,8 @@ pub(super) fn render_at(
     let log_cursor = view.log_cursor;
     let rows = rows.max(1) as usize;
     let cols = cols.max(1) as usize;
-    let color = state_color(snap);
+    let color = state_color(snap).sgr();
+    let color = color.as_str();
 
     // Picker/detail/confirm modes are DEDICATED full screens — they
     // replace the normal bar/gauges/log layout while open.
@@ -334,7 +335,8 @@ pub(super) fn scrollable_header(
     let mode = view.mode;
     let rows = rows.max(1) as usize;
     let cols = cols.max(1) as usize;
-    let color = state_color(snap);
+    let color = state_color(snap).sgr();
+    let color = color.as_str();
     let mut head_out: Vec<String> = Vec::new();
 
     let mut body: Vec<Vec<Span>> = Vec::new();
@@ -4643,7 +4645,7 @@ mod tests {
         let (left, _) = bar_text(&s);
         assert!(left.contains("🔨") && left.contains("CLAUDE"), "{left}");
         assert!(super::super::derive::master_is_active(&s));
-        assert_eq!(super::super::derive::state_color(&s), "32", "green: master");
+        assert_eq!(super::super::derive::state_color(&s), Hue::Green, "master");
         assert_eq!(
             super::super::derive::agent_status_emoji(&s, "claude", clank_core::vocab::Role::Master),
             "🔨"
@@ -4720,7 +4722,7 @@ mod tests {
         );
         assert_eq!(
             super::super::derive::state_color(&s),
-            "32",
+            Hue::Green,
             "green, not cyan"
         );
         assert!(super::super::derive::master_is_active(&s));
@@ -4731,7 +4733,7 @@ mod tests {
         s.ad_hoc[0].gate = clank_core::vocab::CommitGateState::Unreviewed;
         let (left, _) = bar_text(&s);
         assert!(left.contains("promote"), "promote wins the bar: {left}");
-        assert_eq!(super::super::derive::state_color(&s), "36", "promote cyan");
+        assert_eq!(super::super::derive::state_color(&s), Hue::Cyan, "promote");
         assert!(super::super::derive::master_is_active(&s), "promoting");
         assert_eq!(
             super::super::derive::agent_status_emoji(

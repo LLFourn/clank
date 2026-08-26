@@ -122,16 +122,59 @@ pub(super) fn master_is_active(snap: &StatusSnapshot) -> bool {
     }
 }
 
+/// The frame's one hue — a COLOUR, never an attribute.
+///
+/// `bar` paints it as a reverse-video BACKGROUND. An attribute (dim,
+/// bold) sets no colour, so under reverse video it paints nothing and
+/// the bar collapses to the terminal's plain reverse — which is
+/// exactly the panel's selection band. Idle used to be `"2"` (dim)
+/// for that reason, making an idle header indistinguishable from a
+/// selected row.
+///
+/// A string return type made that mistake well-typed. This one cannot
+/// represent it: the named variants are a closed set of foreground
+/// colours, and `38;5;n` is a colour for every `n`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Hue {
+    Red,
+    Green,
+    Yellow,
+    Cyan,
+    /// A 256-palette index, for hues no 16-colour code is close
+    /// enough for: orange (208) and the idle blue (63).
+    Indexed(u8),
+}
+
+impl Hue {
+    /// The SGR parameters, for interpolation into an escape.
+    pub(super) fn sgr(self) -> String {
+        match self {
+            Hue::Red => "31".to_string(),
+            Hue::Green => "32".to_string(),
+            Hue::Yellow => "33".to_string(),
+            Hue::Cyan => "36".to_string(),
+            Hue::Indexed(i) => format!("38;5;{i}"),
+        }
+    }
+}
+
 /// The frame's one hue: red = a human must act (blocked), orange =
 /// HEAD tag needs correction, yellow = reviewers, green = master
-/// working, cyan = promote, dim idle. The orange is a 256-color SGR
-/// (`38;5;208`) — true orange has no 16-color code, and only this
-/// branch needs one.
-pub(super) fn state_color(snap: &StatusSnapshot) -> &'static str {
+/// working, cyan = promote, blue = idle.
+///
+/// Orange and the idle blue are 256-colour indices: no 16-colour code
+/// is close enough for orange, and the idle blue is #5f5fff, chosen
+/// because reverse video paints the terminal's default background AS
+/// TEXT over the hue — so the bar must read with black text on a dark
+/// theme AND white text on a light one. #5f5fff scores 4.57:1 and
+/// 4.60:1; plain ANSI blue (`34`, #0000ee) is 2.23:1 on black. A
+/// theme-mapped code would leave the real colour to the terminal, and
+/// with it those numbers.
+pub(super) fn state_color(snap: &StatusSnapshot) -> Hue {
     match attention_state(snap) {
-        AttentionState::Blocked => "31",               // red
-        AttentionState::NeedsCorrection => "38;5;208", // orange (256-color)
-        AttentionState::Idle => "2",                   // dim
+        AttentionState::Blocked => Hue::Red,
+        AttentionState::NeedsCorrection => Hue::Indexed(208), // orange
+        AttentionState::Idle => Hue::Indexed(63),             // blue
         AttentionState::Active => {
             if master_is_active(snap) {
                 // cyan for the queue-promote branch (no plans, no
@@ -144,12 +187,12 @@ pub(super) fn state_color(snap: &StatusSnapshot) -> &'static str {
                         .iter()
                         .any(|a| a.gate == clank_core::vocab::CommitGateState::ChangesRequested)
                 {
-                    "36" // cyan: promote
+                    Hue::Cyan // promote
                 } else {
-                    "32" // green: master
+                    Hue::Green // master
                 }
             } else {
-                "33" // yellow: reviewers
+                Hue::Yellow // reviewers
             }
         }
     }
@@ -476,6 +519,113 @@ mod tests {
         );
     }
 
+    /// Every branch `state_color` can return, built from a REAL
+    /// snapshot rather than by naming `AttentionState` directly — the
+    /// snapshot→hue mapping is what ships, and a branch reachable only
+    /// in theory would not be worth pinning.
+    fn rendered_branches() -> Vec<(&'static str, StatusSnapshot)> {
+        let mut blocked = snap(vec![], vec!["queued"]);
+        blocked.blocks = vec![crate::cli::block::BlockEntry {
+            agent: "claude".into(),
+            name: "q".into(),
+            question: "halt?".into(),
+            answer: None,
+        }];
+        vec![
+            ("blocked", blocked),
+            (
+                "correction",
+                snap(
+                    vec![plan_state("foo", WaitingOn::MasterToFixCommitTag)],
+                    vec![],
+                ),
+            ),
+            ("idle", snap(vec![], vec![])),
+            (
+                "master",
+                snap(vec![plan_state("foo", WaitingOn::MasterToContinue)], vec![]),
+            ),
+            ("promote", snap(vec![], vec!["queued"])),
+            (
+                "reviewer",
+                snap(vec![plan_state("foo", reviewer_missing("codex"))], vec![]),
+            ),
+        ]
+    }
+
+    /// A foreground COLOUR SGR: `30`-`37`, `90`-`97`, or a well-formed
+    /// `38;5;n`. Never an attribute — `1` bold, `2` dim, `3` italic,
+    /// `4` underline, `7` reverse — which sets no colour at all.
+    fn is_foreground_colour(sgr: &str) -> bool {
+        match sgr.strip_prefix("38;5;") {
+            Some(n) => n.parse::<u8>().is_ok(),
+            None => matches!(sgr.parse::<u16>(), Ok(30..=37 | 90..=97)),
+        }
+    }
+
+    /// `bar` paints the hue as a reverse-video BACKGROUND, so an
+    /// attribute paints nothing and the bar collapses to the
+    /// terminal's plain reverse — the panel's selection band. `Hue`
+    /// makes that unrepresentable; this pins the table it feeds, and
+    /// that the six branches stay tellable apart.
+    #[test]
+    fn every_branch_is_a_distinct_colour_never_an_attribute() {
+        let branches = rendered_branches();
+        for (name, s) in &branches {
+            let sgr = state_color(s).sgr();
+            assert!(
+                is_foreground_colour(&sgr),
+                "{name}: `{sgr}` paints no colour"
+            );
+        }
+        for (i, (a_name, a)) in branches.iter().enumerate() {
+            for (b_name, b) in branches.iter().skip(i + 1) {
+                assert_ne!(
+                    state_color(a),
+                    state_color(b),
+                    "{a_name} and {b_name} share a hue — the bar cannot tell them apart"
+                );
+            }
+        }
+    }
+
+    /// Comparing the bar's escape to the selection band's cannot catch
+    /// the defect this replaced: `\x1b[1;7;2m` is textually distinct
+    /// from `\x1b[7m` while rendering identically, so that assertion
+    /// passes on the exact collision (codex on dbaa3e0). Assert the
+    /// property that actually differs — a colour is present.
+    #[test]
+    fn every_bar_carries_a_colour_not_just_reverse_video() {
+        for (name, s) in rendered_branches() {
+            let line = crate::cli::status_tui::render::bar(&s, &state_color(&s).sgr(), 20);
+            let sgr = line
+                .strip_prefix("\x1b[")
+                .and_then(|rest| rest.split_once('m'))
+                .expect("the bar opens with an SGR")
+                .0;
+            let hue = sgr
+                .strip_prefix("1;7;")
+                .unwrap_or_else(|| panic!("{name}: expected bold+reverse then a hue, got `{sgr}`"));
+            assert!(
+                is_foreground_colour(hue),
+                "{name}: bar paints no colour, so it renders as the selection band: {line:?}"
+            );
+        }
+    }
+
+    /// Pinned to the exact value, not merely "a colour that isn't the
+    /// selection band". Reverse video paints the terminal's default
+    /// background AS TEXT over the hue, so the bar must read with
+    /// black text on a dark theme and white text on a light one.
+    /// #5f5fff clears 4.5:1 both ways (4.57 / 4.60); the window where
+    /// any single colour can is only L ∈ [0.175, 0.183]. A looser
+    /// assertion would stay green while an edit swapped in a colour
+    /// that fails on half the terminals in use.
+    #[test]
+    fn idle_is_the_blue_the_contrast_derivation_chose() {
+        assert_eq!(state_color(&snap(vec![], vec![])), Hue::Indexed(63));
+    }
+
     #[test]
     fn needs_correction_is_orange_above_active_below_blocked() {
         // commit-tag-fixup-is-first-class-state: a MasterToFixCommitTag
@@ -485,7 +635,7 @@ mod tests {
             vec![],
         );
         assert_eq!(attention_state(&s), AttentionState::NeedsCorrection);
-        assert_eq!(state_color(&s), "38;5;208", "orange 256-color SGR");
+        assert_eq!(state_color(&s), Hue::Indexed(208), "orange");
         // Master is the actor (per-pane 🔨), and the bar emoji is ⚠️ —
         // bar lamp + tab indicator both derived from attention_state,
         // so they can't disagree.
