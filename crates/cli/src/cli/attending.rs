@@ -1,13 +1,22 @@
 //! `clank attending <task-id> --desc "two words"` — record the
 //! background task this agent is waiting on, and what it IS.
 //!
-//! While the task is live NOTHING wakes this agent. The marker is a
-//! POINTER, not a claim: the Stop hook validates the recorded id
-//! against the tool's live task list and discards it the moment that
-//! task is gone, so the silence lasts exactly as long as the work and
-//! a forgotten marker cannot extend it. That is why nothing here has
-//! to be cleaned up to stay correct — `--clear` is a convenience, not
-//! a requirement.
+//! The marker buys ONE quiet turn-end. The Stop hook consumes it on
+//! the turn that reads it, so it cannot outlive that turn and cannot
+//! go stale — which is why nothing here has to be cleaned up to stay
+//! correct, and `--clear` is a convenience rather than a requirement.
+//!
+//! It only silences that turn if the attendance can PROVE a wake is
+//! still coming: the task listed live by the tool, a pid that is
+//! alive, and a `ProcToken` that still holds it. Silence hands the
+//! wake channel to the task's completion notification, and that
+//! notification only fires while the task is really running — so
+//! suppressing without proof leaves the agent with no channel at all,
+//! which is a permanent sleep rather than a missed nudge.
+//!
+//! A marker that cannot prove itself — no `--pid`, no token, or a
+//! task the tool no longer lists — is still consumed, and the turn
+//! parks as usual. Noise, never silence.
 
 use super::{AttendingArgs, resolve_repo};
 use crate::agent_store::agents_root;
@@ -67,26 +76,43 @@ pub async fn run(args: AttendingArgs) -> anyhow::Result<()> {
         token: args.pid.and_then(crate::proc_identity::token_for),
     };
     std::fs::write(&path, serde_json::to_string(&record)?)?;
-    println!("{}", confirmation(&desc, task_id, args.pid));
+    println!("{}", confirmation(&record));
     Ok(())
 }
 
-/// What the caller sees on a successful record. It leads with the
-/// DESCRIPTION because that is the recorded fact the caller can check
-/// — a task id echoed back proves only that argv arrived intact,
-/// while a description read back is the caller's chance to notice the
-/// row will say something they did not mean.
-fn confirmation(desc: &str, task_id: &str, pid: Option<i32>) -> String {
-    match pid {
-        Some(pid) => format!(
-            "attending \"{desc}\" (`{task_id}`, pid {pid}) — nothing will wake you until it ends"
+/// What the caller sees on a successful record.
+///
+/// Derived from the RECORD, never from the arguments, so it cannot
+/// promise something other than what was stored. It leads with the
+/// description because that is the fact the caller can check — a task
+/// id echoed back proves only that argv arrived intact.
+///
+/// Crucially it says whether the marker can SUPPRESS anything. The
+/// hook silences a turn only on proof the work is still running (a
+/// live task id, a live pid, and a token that still holds it), so a
+/// marker missing any of that is recorded and then ignored. A caller
+/// silently getting a no-op is how this whole class of bug stayed
+/// invisible (codex on 8be3184).
+fn confirmation(rec: &crate::cli::stop_hook::Attending) -> String {
+    let desc = rec.desc.as_deref().unwrap_or_default();
+    let task = &rec.task;
+    match (rec.pid, rec.token.is_some()) {
+        // Still conditional: the tool must ALSO be listing the task as
+        // live when the turn ends. Promising more than that is what
+        // the previous wording got wrong.
+        (Some(pid), true) => format!(
+            "attending \"{desc}\" (`{task}`, pid {pid}) — your next turn-end stays silent for \
+             as long as the tool still reports this task running"
         ),
-        // Worth saying: without a pid `clank status` can show that the
-        // wait exists but never that it has ended, so a finished wait
-        // keeps reading as live until the next hook reaps it.
-        None => format!(
-            "attending \"{desc}\" (`{task_id}`) — nothing will wake you until it ends. Pass \
-             `--pid` to let `clank status` show when it has ended."
+        (Some(pid), false) => format!(
+            "attending \"{desc}\" (`{task}`, pid {pid}) — RECORDED, BUT IT WILL NOT SILENCE \
+             ANYTHING: no process token could be taken for pid {pid}, so clank cannot prove that \
+             process is still the one you meant"
+        ),
+        (None, _) => format!(
+            "attending \"{desc}\" (`{task}`) — RECORDED, BUT IT WILL NOT SILENCE ANYTHING: \
+             without `--pid` clank cannot prove the work is still running, and silencing a turn \
+             with no provable wake is how an agent goes to sleep for good"
         ),
     }
 }
@@ -191,19 +217,72 @@ mod tests {
         );
     }
 
+    fn rec(pid: Option<i32>, token: bool) -> crate::cli::stop_hook::Attending {
+        crate::cli::stop_hook::Attending {
+            task: "br9711ewy".into(),
+            desc: Some("test run".into()),
+            pid,
+            token: token.then(|| {
+                crate::proc_identity::token_for(std::process::id() as i32)
+                    .expect("this platform answers for its own pid")
+            }),
+        }
+    }
+
     /// The confirmation is the caller's only sight of what was
-    /// actually stored — the same String that went into the record,
+    /// actually stored — the same values that went into the record,
     /// so a description mangled by normalisation shows up HERE rather
     /// than in the TUI row hours later.
     #[test]
     fn the_confirmation_names_the_wait_not_just_the_task_id() {
-        for pid in [None, Some(41293)] {
-            let line = confirmation("test run", "br9711ewy", pid);
+        for r in [
+            rec(None, false),
+            rec(Some(41293), false),
+            rec(Some(41293), true),
+        ] {
+            let line = confirmation(&r);
             assert!(line.contains("test run"), "names the wait: {line}");
             assert!(line.contains("br9711ewy"), "and the task id: {line}");
         }
-        let with_pid = confirmation("test run", "br9711ewy", Some(41293));
+        let with_pid = confirmation(&rec(Some(41293), true));
         assert!(with_pid.contains("pid 41293"), "and the pid: {with_pid}");
+    }
+
+    /// A marker that cannot suppress must SAY it cannot. The hook
+    /// silences only on proof the work is still running, so every
+    /// other shape is recorded and then ignored — and a caller who is
+    /// not told has no way to discover it except by being nudged
+    /// anyway and not knowing why (codex on 8be3184).
+    #[test]
+    fn only_a_marker_with_a_verified_identity_claims_it_can_silence() {
+        let silences = |r: &crate::cli::stop_hook::Attending| {
+            let line = confirmation(r);
+            let refuses = line.contains("WILL NOT SILENCE");
+            let claims = line.contains("stays silent");
+            assert_ne!(refuses, claims, "must say exactly one of the two: {line}");
+            claims
+        };
+
+        assert!(
+            !silences(&rec(None, false)),
+            "no pid: nothing can prove the work is running"
+        );
+        assert!(
+            !silences(&rec(Some(41293), false)),
+            "a pid with no token is not an identity — pids are reused"
+        );
+        assert!(
+            silences(&rec(Some(41293), true)),
+            "pid plus a token is the only shape entitled to claim it"
+        );
+
+        // And the claim it does make stays conditional: the tool has
+        // to be listing the task live at turn-end too.
+        let full = confirmation(&rec(Some(41293), true));
+        assert!(
+            full.contains("as long as") && full.contains("running"),
+            "the promise is conditional, not absolute: {full}"
+        );
     }
 
     #[tokio::test]

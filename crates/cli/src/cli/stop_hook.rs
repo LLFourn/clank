@@ -165,77 +165,91 @@ async fn compute_outcome_with(
                     label.as_str()
                 ),
             },
-            Ok(role) => match disposition {
-                // A process is live with no `clank wait` watching. Peek (without
-                // blocking) whether the agent has work RIGHT NOW:
-                //  - it does → it's still its turn, blocked on its own task →
-                //    yield silently (don't nudge; that was the loop — a master
-                //    mid-plan always has "continue" work, so a nudged wait would
-                //    return instantly and never persist).
-                //  - it doesn't → idle (e.g. just committed, awaiting reviews) →
-                //    nudge it to start `clank wait` alongside the process, so
-                //    EITHER the process finishing OR review work wakes it. Safe
-                //    from looping: with no work the wait blocks and persists, and
-                //    the next Stop sees it (`YieldArmed`).
-                // In the asyncrewake loop the PARK is the watcher: a live
-                // background process coexists with the parked wait (its
-                // completion wakes via the task notification; work wakes
-                // via exit 2) — nudging the agent to arm a background
-                // wait would reintroduce the tracked-task loop this mode
-                // exists to delete (claude-asyncrewake-work-loop).
-                BgDisposition::NeedsWorkCheck if async_loop => {
-                    return asyncrewake_park(&repo, &label, role, started, &live_ids, attending)
-                        .await;
+            Ok(role) => {
+                // Attendance is decided HERE, before any park, because
+                // this is where `live_ids` is FRESH. Deciding it at
+                // wait-return meant judging a snapshot taken at hook
+                // entry and then carried through an unbounded park —
+                // by then the attended task may have finished hours
+                // ago and spent its wake, and suppressing on that is
+                // the permanent sleep (codex on 81981f2).
+                //
+                // Every path out of here holds a channel: this branch
+                // has just proven a completion wake is outstanding,
+                // and every other one parks.
+                if let Some(silence) = attendance_silence(attending.as_ref(), &live_ids, &agent_dir)
+                {
+                    return silence;
                 }
-                BgDisposition::NeedsWorkCheck => match peek_has_work(&repo, &label).await {
-                    Ok(true) => HookOutcome::Silent {
-                        why: SilentReason::BusyOwnWork,
-                    },
-                    Ok(false) => HookOutcome::Continue {
-                        reason: nudge_reason(&input),
-                    },
-                    // Fail-soft: if the peek can't run, yield rather than nudge
-                    // (the process still wakes the agent; no forced turn on doubt).
-                    Err(_) => HookOutcome::Silent {
-                        why: SilentReason::PeekFailed,
-                    },
-                },
-                // NoBackgroundWork (YieldArmed already returned above): genuinely idle.
-                _ if async_loop => {
-                    return asyncrewake_park(&repo, &label, role, started, &live_ids, attending)
-                        .await;
-                }
-                _ => match loop_policy(tool) {
-                    // LEGACY claude only (`--loop asyncrewake` returns
-                    // above): this branch never waits in-hook and never
-                    // renders work items — its only continuation is the
-                    // arm-the-wait hint, and the armed wait's completion
-                    // wake delivers the work. Work presence is deliberately
-                    // NOT consulted: if work exists the armed wait exits
-                    // immediately and the wake carries it
-                    // (claude-stop-hook-minimal-hint).
-                    LoopPolicy::BackgroundArm => HookOutcome::Continue {
-                        reason: nudge_reason(&input),
-                    },
-                    // The in-hook long-poll + emit-with-items model: codex
-                    // blocks with the items; opencode's plugin injects
-                    // non-empty output on session.idle (M1 spike). No
-                    // work / timeout is SILENT either way (codex 8000d6e:
-                    // a nudge relay would loop an opencode session
-                    // forever).
-                    LoopPolicy::InHookWait => {
-                        compute_wait_outcome(&repo, &label, role, started, &live_ids, attending)
-                            .await
+                match disposition {
+                    // A process is live with no `clank wait` watching. Peek (without
+                    // blocking) whether the agent has work RIGHT NOW:
+                    //  - it does → it's still its turn, blocked on its own task →
+                    //    yield silently (don't nudge; that was the loop — a master
+                    //    mid-plan always has "continue" work, so a nudged wait would
+                    //    return instantly and never persist).
+                    //  - it doesn't → idle (e.g. just committed, awaiting reviews) →
+                    //    nudge it to start `clank wait` alongside the process, so
+                    //    EITHER the process finishing OR review work wakes it. Safe
+                    //    from looping: with no work the wait blocks and persists, and
+                    //    the next Stop sees it (`YieldArmed`).
+                    // In the asyncrewake loop the PARK is the watcher: a live
+                    // background process coexists with the parked wait (its
+                    // completion wakes via the task notification; work wakes
+                    // via exit 2) — nudging the agent to arm a background
+                    // wait would reintroduce the tracked-task loop this mode
+                    // exists to delete (claude-asyncrewake-work-loop).
+                    BgDisposition::NeedsWorkCheck if async_loop => {
+                        return asyncrewake_park(&repo, &label, role, started, &live_ids).await;
                     }
-                    // Grok's hooks are PASSIVE (grok-first-class): clank
-                    // installs no grok adapter and no continuation could
-                    // drive it. If something wires this up anyway, say so.
-                    LoopPolicy::Passive => HookOutcome::Diagnostic {
-                        message: "hook: grok has no stop-hook adapter (grok hooks are passive)"
-                            .into(),
+                    BgDisposition::NeedsWorkCheck => match peek_has_work(&repo, &label).await {
+                        Ok(true) => HookOutcome::Silent {
+                            why: SilentReason::BusyOwnWork,
+                        },
+                        Ok(false) => HookOutcome::Continue {
+                            reason: nudge_reason(&input),
+                        },
+                        // Fail-soft: if the peek can't run, yield rather than nudge
+                        // (the process still wakes the agent; no forced turn on doubt).
+                        Err(_) => HookOutcome::Silent {
+                            why: SilentReason::PeekFailed,
+                        },
                     },
-                },
-            },
+                    // NoBackgroundWork (YieldArmed already returned above): genuinely idle.
+                    _ if async_loop => {
+                        return asyncrewake_park(&repo, &label, role, started, &live_ids).await;
+                    }
+                    _ => match loop_policy(tool) {
+                        // LEGACY claude only (`--loop asyncrewake` returns
+                        // above): this branch never waits in-hook and never
+                        // renders work items — its only continuation is the
+                        // arm-the-wait hint, and the armed wait's completion
+                        // wake delivers the work. Work presence is deliberately
+                        // NOT consulted: if work exists the armed wait exits
+                        // immediately and the wake carries it
+                        // (claude-stop-hook-minimal-hint).
+                        LoopPolicy::BackgroundArm => HookOutcome::Continue {
+                            reason: nudge_reason(&input),
+                        },
+                        // The in-hook long-poll + emit-with-items model: codex
+                        // blocks with the items; opencode's plugin injects
+                        // non-empty output on session.idle (M1 spike). No
+                        // work / timeout is SILENT either way (codex 8000d6e:
+                        // a nudge relay would loop an opencode session
+                        // forever).
+                        LoopPolicy::InHookWait => {
+                            compute_wait_outcome(&repo, &label, role, started, &live_ids).await
+                        }
+                        // Grok's hooks are PASSIVE (grok-first-class): clank
+                        // installs no grok adapter and no continuation could
+                        // drive it. If something wires this up anyway, say so.
+                        LoopPolicy::Passive => HookOutcome::Diagnostic {
+                            message: "hook: grok has no stop-hook adapter (grok hooks are passive)"
+                                .into(),
+                        },
+                    },
+                }
+            }
         },
     }
 }
@@ -432,7 +446,6 @@ async fn asyncrewake_park(
     role: Role,
     started: std::time::Instant,
     live_ids: &[String],
-    attending: Option<Attending>,
 ) -> HookOutcome {
     let agent_dir = crate::agent_store::agents_root(repo).join(label.as_str());
     if let Err(e) = std::fs::create_dir_all(&agent_dir) {
@@ -479,7 +492,7 @@ async fn asyncrewake_park(
     }
 
     let outcome = tokio::select! {
-        o = compute_wait_outcome(repo, label, role, started, live_ids, attending) => o,
+        o = compute_wait_outcome(repo, label, role, started, live_ids) => o,
         // A newer incarnation took over: release (the select drops
         // the wait child via kill_on_drop) and suppress.
         () = generation_changed(&agent_dir, my_gen) => {
@@ -722,7 +735,6 @@ async fn compute_wait_outcome(
     role: Role,
     started: std::time::Instant,
     live_ids: &[String],
-    attending: Option<Attending>,
 ) -> HookOutcome {
     // Fixed at hook entry, so everything below — current_exe, command
     // construction, the child spawn — is charged against it.
@@ -769,8 +781,7 @@ async fn compute_wait_outcome(
         }
     };
 
-    let agent_dir = crate::agent_store::agents_root(repo).join(label.as_str());
-    outcome_from_wait_output(&output, label, role, &agent_dir, live_ids, attending)
+    outcome_from_wait_output(&output, label, role, live_ids)
 }
 
 // ── attending a background task (attending-suppresses-standing-wakes) ──
@@ -831,6 +842,33 @@ pub(crate) struct Attending {
     /// lifetime to bound.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) pid: Option<i32>,
+}
+
+impl Attending {
+    /// Is there PROVABLY still a wake coming for this attendance?
+    ///
+    /// Silencing a turn hands the wake channel to something else. For
+    /// an attended background task that something is the tool's
+    /// completion notification, which will only ever fire while the
+    /// task is actually running — so suppressing without proof of
+    /// that leaves the agent with no channel at all, which is a
+    /// permanent sleep, not a missed nudge.
+    ///
+    /// Hence proof, not the absence of doubt. `live_ids` alone is not
+    /// proof: `a-dead-pid-voids-a-falsely-live-marker` recorded claude
+    /// announcing an already-finished task as live (pid gone from the
+    /// process table, still listed by the next hook). A bare pid is
+    /// not proof either, because pids are reused. Only a pid the
+    /// token still holds identifies the process that was attended.
+    ///
+    /// Anything unverifiable — no pid, no token, legacy record —
+    /// answers `false` and keeps its park. Noise, never silence.
+    fn provably_live(&self, live_ids: &[String]) -> bool {
+        let (Some(pid), Some(token)) = (self.pid, self.token.as_ref()) else {
+            return false;
+        };
+        live_ids.iter().any(|id| id == &self.task) && pid_is_alive(pid) && token.still_holds(pid)
+    }
 }
 
 /// What the Stop hook DECIDED, kept for the human to read.
@@ -1046,6 +1084,29 @@ fn consume_attending(agent_dir: &Path) -> Option<Attending> {
     raw.and_then(|r| serde_json::from_str::<Attending>(&r).ok())
 }
 
+/// The attendance decision, taken at hook ENTRY where `live_ids` is
+/// still fresh. `Some` means this turn is silenced and the wake has
+/// been handed to the attended task's completion; `None` means carry
+/// on and park.
+///
+/// It lives here, and not at wait-return, because the list handed to
+/// a returning park was snapshotted before the park began and may be
+/// arbitrarily old by then (codex on 81981f2).
+fn attendance_silence(
+    attending: Option<&Attending>,
+    live_ids: &[String],
+    agent_dir: &Path,
+) -> Option<HookOutcome> {
+    let rec = attending?;
+    if !rec.provably_live(live_ids) {
+        return None;
+    }
+    record_attended(agent_dir, rec);
+    Some(HookOutcome::Silent {
+        why: SilentReason::AttendingBackgroundTask,
+    })
+}
+
 /// Leave the decision behind for `clank status`, since the marker
 /// itself is gone within the turn and never visible.
 fn record_attended(agent_dir: &Path, rec: &Attending) {
@@ -1078,9 +1139,7 @@ fn outcome_from_wait_output(
     output: &std::process::Output,
     label: &AgentLabel,
     role: Role,
-    agent_dir: &Path,
     live_ids: &[String],
-    attending: Option<Attending>,
 ) -> HookOutcome {
     match output.status.code() {
         Some(0) => match parse_wait_json(&output.stdout) {
@@ -1088,12 +1147,10 @@ fn outcome_from_wait_output(
                 why: SilentReason::NoWork,
             },
             Ok(items) => {
-                if let Some(rec) = attending {
-                    record_attended(agent_dir, &rec);
-                    return HookOutcome::Silent {
-                        why: SilentReason::AttendingBackgroundTask,
-                    };
-                }
+                // No attendance branch here any more: by the time a
+                // park RETURNS, the `live_ids` it was handed are as
+                // old as the park itself. Attendance is settled at
+                // hook entry, where the evidence is fresh.
                 let kept: Vec<&WaitItem> = items.iter().collect();
                 let mut reason = render_wait_items_ref(&kept, label, role);
                 // A live task and no marker is the shape that produced
@@ -1102,10 +1159,12 @@ fn outcome_from_wait_output(
                     reason.push_str(&format!(
                         "\n\nYou have a live background task ({}). If you are WAITING on it, \
                          record it — `clank attending {} --desc \"two words\"` — and nothing will \
-                         wake you until it ends. `--desc` is REQUIRED: two words naming the wait, \
-                         which is what `clank status --tui` shows. Add \
-                         `--pid <pid>` (see `clank attending --help`) so `clank status` can show \
-                         when it has ended. Do not end your turn to poll it.",
+                         wake you until it ends. BOTH flags are load-bearing: `--desc` is two \
+                         words naming the wait, which is what `clank status --tui` shows, and \
+                         `--pid <pid>` (see `clank attending --help`) is what lets clank PROVE \
+                         the task is still running — without it the marker is recorded but \
+                         suppresses nothing, because silence with no provable wake is how an \
+                         agent goes to sleep for good. Do not end your turn to poll it.",
                         live_ids.join(", "),
                         live_ids.first().map(String::as_str).unwrap_or("<task-id>"),
                     ));
@@ -1574,6 +1633,21 @@ mod tests {
         write_attending_pid(dir, task, None)
     }
 
+    /// A marker that can PROVE itself: this process, plus the token
+    /// that identifies it. The only shape entitled to suppress.
+    fn write_provable_attending(dir: &Path, task: &str) -> i32 {
+        let pid = std::process::id() as i32;
+        let rec = Attending {
+            desc: Some("test run".into()),
+            token: crate::proc_identity::token_for(pid),
+            task: task.to_string(),
+            pid: Some(pid),
+        };
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("attending"), serde_json::to_string(&rec).unwrap()).unwrap();
+        pid
+    }
+
     fn write_attending_pid(dir: &Path, task: &str, pid: Option<i32>) {
         let rec = Attending {
             desc: None,
@@ -1598,16 +1672,24 @@ mod tests {
                            "next":"continue","reason":"gate_continue","gate":"continued"})
     }
 
+    /// The wait-return path, which no longer knows anything about
+    /// attendance. Kept taking `dir` so callers still write markers
+    /// and can assert they were consumed at entry.
     fn outcome(dir: &Path, items: serde_json::Value, live: &[String]) -> HookOutcome {
-        let attending = consume_attending(dir);
+        let _ = consume_attending(dir);
         outcome_from_wait_output(
             &wait_output(items),
             &AgentLabel::parse("claude").unwrap(),
             Role::Master,
-            dir,
             live,
-            attending,
         )
+    }
+
+    /// The ENTRY decision, as the hook takes it: consume the marker,
+    /// then judge it against a fresh task list.
+    fn entry_outcome(dir: &Path, live: &[String]) -> Option<HookOutcome> {
+        let attending = consume_attending(dir);
+        attendance_silence(attending.as_ref(), live, dir)
     }
 
     fn is_attending_silence(out: &HookOutcome) -> bool {
@@ -1661,59 +1743,105 @@ mod tests {
         assert!(!pid_is_alive(-1));
     }
 
-    /// THE property. A marker buys exactly one quiet turn-end; the
-    /// next Stop, with everything else identical, wakes. Staleness
-    /// needs survival, and nothing here survives.
+    /// Suppression may only ever hand off to a wake that PROVABLY
+    /// still exists. `live_ids` alone cannot establish that — this
+    /// repo recorded claude announcing an already-finished task as
+    /// live — and a bare pid cannot either, because pids are reused.
+    /// So: task listed live, pid alive, and the token still holding
+    /// that pid. Anything short of all three keeps its park.
     #[test]
-    fn a_marker_silences_one_stop_and_only_one() {
-        let dir = tempfile::tempdir().unwrap();
-        write_attending_pid(dir.path(), "task-42", Some(std::process::id() as i32));
+    fn only_a_provably_live_attendance_may_suppress() {
+        let me = std::process::id() as i32;
+        let token = crate::proc_identity::token_for(me);
+        assert!(token.is_some(), "this platform must answer for its own pid");
+        let live = vec!["task-42".to_string()];
 
-        let first = outcome(dir.path(), serde_json::json!([standing_item()]), &[]);
-        assert!(is_attending_silence(&first), "got {first:?}");
+        let full = Attending {
+            task: "task-42".into(),
+            desc: None,
+            pid: Some(me),
+            token: token.clone(),
+        };
+        assert!(full.provably_live(&live), "all three signals agree");
 
-        let second = outcome(dir.path(), serde_json::json!([standing_item()]), &[]);
+        // Each signal removed in turn — every one is load-bearing.
         assert!(
-            matches!(second, HookOutcome::Continue { .. }),
-            "the marker was consumed, so this must wake: {second:?}"
+            !full.provably_live(&[]),
+            "not listed live: the completion wake has already been spent"
+        );
+        assert!(
+            !full.provably_live(&["other".to_string()]),
+            "a DIFFERENT task being live says nothing about this one"
+        );
+        assert!(
+            !Attending {
+                pid: None,
+                ..full.clone()
+            }
+            .provably_live(&live),
+            "no pid — the penlock marker's exact shape — cannot prove anything"
+        );
+        assert!(
+            !Attending {
+                token: None,
+                ..full.clone()
+            }
+            .provably_live(&live),
+            "a bare pid is not an identity; pids are reused"
+        );
+        // A pid that cannot be alive, and a token that no longer holds
+        // its pid, are each independently fatal.
+        assert!(
+            !Attending {
+                pid: Some(-1),
+                ..full.clone()
+            }
+            .provably_live(&live),
+            "an impossible pid is not alive"
+        );
+        assert!(
+            !Attending {
+                token: Some(crate::proc_identity::ProcToken::Unrecognised),
+                ..full.clone()
+            }
+            .provably_live(&live),
+            "an unparseable token never matches, so it never proves"
         );
     }
 
-    /// Suppression no longer consults the harness at all. The marker
-    /// is an intent about THIS yield, not a claim that some task is
-    /// still running, so a task the harness never mentions — or still
-    /// falsely calls live — changes nothing either way.
+    /// The wait-return path no longer decides attendance AT ALL.
+    ///
+    /// It cannot: the `live_ids` handed to it were snapshotted at hook
+    /// entry and then carried through an unbounded park, so by the
+    /// time work arrives they may be hours stale — the attended task
+    /// finished long ago, its wake already spent (codex on 81981f2).
+    /// Whatever the marker or the list says here, the work is
+    /// DELIVERED.
     #[test]
-    fn the_task_list_no_longer_decides_anything() {
+    fn the_wait_return_path_never_suppresses_however_stale_its_snapshot() {
         for live in [
             Vec::new(),
             vec!["task-42".to_string()],
             vec!["something-else".to_string()],
         ] {
-            let dir = tempfile::tempdir().unwrap();
-            write_attending(dir.path(), "task-42");
-            let out = outcome(dir.path(), serde_json::json!([standing_item()]), &live);
-            assert!(is_attending_silence(&out), "live={live:?} got {out:?}");
-            assert!(
-                !attending_path(dir.path()).exists(),
-                "and it is consumed regardless: live={live:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_marker_silences_every_reason_there_is() {
-        for item in [
-            serde_json::json!({"kind":"master","plan":"p","sha":FULL_SHA,
-                 "next":"finalize","reason":"ready_to_finalize","gate":"finished"}),
-            serde_json::json!({"kind":"master","plan":"p","sha":FULL_SHA,
-                 "next":"revise","reason":"address_commit_changes","gate":"changes_requested"}),
-            serde_json::json!({"kind":"unblocked","name":"q","answer":"yes"}),
-        ] {
-            let dir = tempfile::tempdir().unwrap();
-            write_attending(dir.path(), "task-42");
-            let out = outcome(dir.path(), serde_json::json!([item.clone()]), &[]);
-            assert!(is_attending_silence(&out), "{item} → {out:?}");
+            for item in [
+                standing_item(),
+                serde_json::json!({"kind":"master","plan":"p","sha":FULL_SHA,
+                     "next":"finalize","reason":"ready_to_finalize","gate":"finished"}),
+                serde_json::json!({"kind":"unblocked","name":"q","answer":"yes"}),
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                write_provable_attending(dir.path(), "task-42");
+                let out = outcome(dir.path(), serde_json::json!([item.clone()]), &live);
+                assert!(
+                    matches!(out, HookOutcome::Continue { .. }),
+                    "live={live:?} {item} must be delivered, got {out:?}"
+                );
+                assert!(
+                    !attending_path(dir.path()).exists(),
+                    "and the marker is still consumed"
+                );
+            }
         }
     }
 
@@ -1756,11 +1884,13 @@ mod tests {
         );
     }
 
-    /// Markers written before the pid existed, and before `since` was
-    /// dropped, are consumed identically — serde ignores the extra
-    /// field and the model does not care.
+    /// Older markers still PARSE — serde ignores the extra field —
+    /// and are still consumed. What they may no longer do is suppress:
+    /// none of them carries the pid-plus-token that proves a wake is
+    /// still coming, so each keeps its park. That is the penlock
+    /// record's shape, and the case this plan exists for.
     #[test]
-    fn markers_of_any_older_shape_are_consumed_identically() {
+    fn markers_of_any_older_shape_are_consumed_but_never_suppress() {
         for raw in [
             r#"{"task":"task-42"}"#,
             r#"{"task":"task-42","pid":4242}"#,
@@ -1768,8 +1898,8 @@ mod tests {
         ] {
             let dir = tempfile::tempdir().unwrap();
             std::fs::write(attending_path(dir.path()), raw).unwrap();
-            let out = outcome(dir.path(), serde_json::json!([standing_item()]), &[]);
-            assert!(is_attending_silence(&out), "{raw} → {out:?}");
+            let out = entry_outcome(dir.path(), &["task-42".to_string()]);
+            assert!(out.is_none(), "{raw} must keep its park, got {out:?}");
             assert!(!attending_path(dir.path()).exists(), "{raw} not consumed");
         }
     }
@@ -1779,32 +1909,34 @@ mod tests {
     #[test]
     fn silencing_records_the_decision_with_its_pid() {
         let dir = tempfile::tempdir().unwrap();
-        write_attending_pid(dir.path(), "task-42", Some(4242));
-        assert!(is_attending_silence(&outcome(
-            dir.path(),
-            serde_json::json!([standing_item()]),
-            &[]
-        )));
+        let pid = write_provable_attending(dir.path(), "task-42");
+        let out = entry_outcome(dir.path(), &["task-42".to_string()]).expect("silenced");
+        assert!(is_attending_silence(&out));
 
         let rec = read_attended(dir.path()).expect("decision recorded");
         assert_eq!(rec.task, "task-42");
-        assert_eq!(rec.pid, Some(4242));
+        assert_eq!(rec.pid, Some(pid));
         assert!(
             !rec.at.is_empty(),
             "and stamps when, so status can age it: {rec:?}"
         );
     }
 
-    /// A decision must not outlive the wake that supersedes it.
+    /// A decision must not outlive the wake that supersedes it — and
+    /// the marker buys exactly ONE quiet turn-end, so the next entry
+    /// with everything else identical does not suppress.
     #[test]
     fn any_other_outcome_clears_the_decision() {
         let dir = tempfile::tempdir().unwrap();
-        write_attending_pid(dir.path(), "task-42", Some(4242));
-        outcome(dir.path(), serde_json::json!([standing_item()]), &[]);
+        write_provable_attending(dir.path(), "task-42");
+        let live = ["task-42".to_string()];
+        assert!(entry_outcome(dir.path(), &live).is_some(), "silenced once");
         assert!(read_attended(dir.path()).is_some(), "recorded");
 
-        let out = outcome(dir.path(), serde_json::json!([standing_item()]), &[]);
-        assert!(matches!(out, HookOutcome::Continue { .. }));
+        assert!(
+            entry_outcome(dir.path(), &live).is_none(),
+            "the marker was consumed, so this turn parks"
+        );
         assert!(
             read_attended(dir.path()).is_none(),
             "the wake erased the decision it superseded"
@@ -1814,23 +1946,30 @@ mod tests {
     #[test]
     fn the_record_on_disk_has_the_field_names_status_reads() {
         let dir = tempfile::tempdir().unwrap();
-        write_attending_pid(dir.path(), "task-42", Some(4242));
-        outcome(dir.path(), serde_json::json!([standing_item()]), &[]);
+        let pid = write_provable_attending(dir.path(), "task-42");
+        entry_outcome(dir.path(), &["task-42".to_string()]).expect("silenced");
         let raw = std::fs::read_to_string(attended_path(dir.path())).unwrap();
         let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(json["task"], "task-42");
-        assert_eq!(json["pid"], 4242);
+        assert_eq!(json["pid"], pid);
         assert!(json["at"].is_string());
     }
 
+    /// A pid-less marker leaves NO decision record at all, because it
+    /// never suppressed. That closes the display hole by construction:
+    /// the record `clank status` renders as an ongoing wait can now
+    /// only come from an attendance that proved itself, so there is no
+    /// longer such a thing as a row that ages forever because nothing
+    /// can ever learn it ended.
     #[test]
-    fn a_record_without_a_pid_makes_no_liveness_claim() {
+    fn an_unprovable_marker_leaves_no_decision_to_display() {
         let dir = tempfile::tempdir().unwrap();
         write_attending(dir.path(), "task-42");
-        outcome(dir.path(), serde_json::json!([standing_item()]), &[]);
-        let rec = read_attended(dir.path()).expect("recorded");
-        assert_eq!(rec.pid, None);
-        assert_eq!(rec.process_alive(), None);
+        assert!(entry_outcome(dir.path(), &["task-42".to_string()]).is_none());
+        assert!(
+            read_attended(dir.path()).is_none(),
+            "nothing was silenced, so there is nothing to show as attending"
+        );
     }
 
     #[test]
@@ -1844,14 +1983,11 @@ mod tests {
     #[test]
     fn no_marker_plus_a_live_task_carries_the_hint() {
         // Teaches the protocol exactly where it would otherwise loop.
-        let dir = tempfile::tempdir().unwrap();
         let out = outcome_from_wait_output(
             &wait_output(serde_json::json!([standing_item()])),
             &AgentLabel::parse("claude").unwrap(),
             Role::Master,
-            dir.path(),
             &["task-42".to_string()],
-            None,
         );
         match out {
             HookOutcome::Continue { reason } => {
@@ -1862,7 +1998,7 @@ mod tests {
                 );
                 assert!(
                     reason.contains("--pid"),
-                    "and teaches the flag that makes status honest: {reason}"
+                    "and teaches the flag suppression now REQUIRES: {reason}"
                 );
             }
             other => panic!("no marker means it still wakes, got {other:?}"),
@@ -1877,9 +2013,7 @@ mod tests {
             &wait_output(serde_json::json!([standing_item()])),
             &AgentLabel::parse("claude").unwrap(),
             Role::Master,
-            dir.path(),
             &[],
-            None,
         );
         match out {
             HookOutcome::Continue { reason } => {
@@ -2032,6 +2166,29 @@ mod tests {
         assert!(
             out.contains(&FULL_SHA[..12]),
             "the 12-char sha stays — it is what `feedback write --commit` is built from: {out}"
+        );
+    }
+
+    /// The ceiling must be UNREACHABLE, not merely generous. A park
+    /// waits for an unbounded event, so any ceiling a running machine
+    /// can reach eventually fires on a repo that is only quiet, and
+    /// kills an agent that had nothing wrong with it. At 86400 this
+    /// repo's codex reviewer went silent for 22 hours.
+    ///
+    /// The arithmetic is asserted, not reasoned about: `Instant::add`
+    /// PANICS on overflow, so raising this to `u64::MAX` would take
+    /// the hook down instead of extending it.
+    #[test]
+    fn the_ceiling_cannot_be_reached_by_a_running_machine() {
+        const YEAR: f64 = 365.25 * 24.0 * 3600.0;
+        let years = crate::cli::setup::HOOK_TIMEOUT_SECS as f64 / YEAR;
+        assert!(years > 50.0, "a {years:.1}-year ceiling is reachable");
+
+        let started = std::time::Instant::now();
+        let deadline = poll_deadline(started);
+        assert!(
+            deadline.duration_since(started).as_secs_f64() / YEAR > 50.0,
+            "and the derived deadline must be just as far out"
         );
     }
 
@@ -2771,28 +2928,14 @@ mod tests {
         // Exit 2 used to mean "timed out, go quiet". It has no
         // special meaning now, so it must surface rather than be
         // swallowed as a routine idle.
-        let two = outcome_from_wait_output(
-            &out(2, ""),
-            &label,
-            Role::Master,
-            Path::new("/nope"),
-            &[],
-            None,
-        );
+        let two = outcome_from_wait_output(&out(2, ""), &label, Role::Master, &[]);
         assert!(
             matches!(two, HookOutcome::Diagnostic { .. }),
             "a non-zero wait exit must surface, got {two:?}"
         );
 
         // Idle is now expressed the only way left: exit 0, no items.
-        let idle = outcome_from_wait_output(
-            &out(0, r#"{"items":[]}"#),
-            &label,
-            Role::Master,
-            Path::new("/nope"),
-            &[],
-            None,
-        );
+        let idle = outcome_from_wait_output(&out(0, r#"{"items":[]}"#), &label, Role::Master, &[]);
         assert!(
             matches!(
                 idle,

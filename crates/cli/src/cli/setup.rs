@@ -211,20 +211,28 @@ const LEGACY_COMMAND_PREFIX: &str = "clank stop-hook";
 
 /// Per-tool hook timeout we write into the agent's hook config.
 ///
-/// A BACKSTOP, not the terminator. The in-hook poll now ends itself
-/// below this value (`stop_hook::poll_deadline` derives its deadline
-/// from this constant), so reaching the ceiling means something went
-/// wrong — it is not the normal way a park ends. Being killed AT the
-/// ceiling is what surfaced to the user as
-/// `Stop hook (failed) — hook timed out after 86400s`
-/// (codex-idle-is-not-a-hook-failure).
+/// Effectively NEVER, by design. A park waits for an UNBOUNDED event —
+/// work arriving — so any finite ceiling eventually fires on a repo
+/// that is merely quiet, and the agent it kills has no wake channel
+/// left and never runs again. At 86400 this repo's own codex reviewer
+/// went silent for 22 hours with a review waiting on it.
 ///
-/// Raising it buys nothing now that the poll self-expires, and it must
-/// not be dropped either: absent the field, each runner applies its own
-/// default (claude documents 600s for a `command` hook), which would
-/// cut a legitimate park short. No documented MAXIMUM was found for
-/// either runner.
-pub(crate) const HOOK_TIMEOUT_SECS: u64 = 86400;
+/// `codex-idle-is-not-a-hook-failure` argued the value had stopped
+/// mattering because the poll was made to expire cleanly just below
+/// it. That covered the BANNER, not the agent: a clean expiry and a
+/// kill both end the turn with nothing armed, so only the cosmetics
+/// differed and the ceiling stayed the terminator.
+///
+/// Not dropped, either — absent the field each runner applies its own
+/// default, and claude documents 600s for a `command` hook, which
+/// would cut a legitimate park far shorter. The field does real work;
+/// it needed a bigger number, not deletion.
+///
+/// `i32::MAX` rather than `u64::MAX`: neither runner documents a
+/// maximum, so this is a judgement about what a parser will accept —
+/// a signed 32-bit field is the plausible limit — not a discovered
+/// bound.
+pub(crate) const HOOK_TIMEOUT_SECS: u64 = i32::MAX as u64;
 
 /// The per-tool user-scope skill dirs. Grok dedupes its claude-compat
 /// scan native-first (grok-first-class P3), so native copies win

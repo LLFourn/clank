@@ -296,9 +296,13 @@ pub enum BgDisposition {
 /// backgrounded `clank wait` would block and persist.
 impl HookInput {
     /// Ids of background tasks the tool reports as live this turn.
-    /// The authority for whether an `attending` marker still means
-    /// anything — a marker is a POINTER, validated here, never a
-    /// claim the agent has to remember to retract.
+    ///
+    /// ONE of the three signals an `attending` marker needs, and not
+    /// sufficient alone: this list has been observed naming tasks that
+    /// had already finished (`a-dead-pid-voids-a-falsely-live-marker`
+    /// records a `cargo install` that exited 0, its pid gone from the
+    /// process table, still listed by the very next hook). Suppression
+    /// also requires a live pid and a token that still holds it.
     pub fn live_task_ids(&self) -> Vec<String> {
         self.background_tasks
             .iter()
