@@ -4859,10 +4859,20 @@ mod tests {
         );
     }
 
-    /// Unknown is not ended. Without a pid the question cannot be
-    /// answered, and a wait that may well be live must stay visible.
+    /// A wait that cannot be CHECKED is not drawn.
+    ///
+    /// This inverts what it used to assert. Drawing such a record is a
+    /// liveness claim — `⌛ b72qah60w · 2m` and climbing — made from a
+    /// record that can never support one, and because nothing can ever
+    /// learn the work ended, the row ages upward forever. Lloyd
+    /// reported exactly that against a real `attending: claude →
+    /// bk3qnvo12 · 2m` whose task had long finished.
+    ///
+    /// "Cannot check" is not "ended", which is why the old rule looked
+    /// reasonable. But it is not "running" either, and the row only
+    /// has the vocabulary to say running.
     #[test]
-    fn a_wait_with_no_pid_still_renders() {
+    fn a_wait_that_cannot_be_checked_is_not_drawn() {
         let mut s = two_agent_snap();
         s.agents[0].attending = Some(crate::cli::stop_hook::Attended {
             desc: None,
@@ -4871,11 +4881,25 @@ mod tests {
             pid: None,
             at: "2026-08-20T14:51:09Z".to_string(),
         });
+        assert!(
+            !render(&s, 40, 80).join("\n").contains("⌛"),
+            "an uncheckable record must not be shown as an ongoing wait"
+        );
+
+        // The control: give it a pid that IS alive and the wait draws,
+        // so the assertion above is about checkability and not about a
+        // snapshot that never drew a marker at all.
+        s.agents[0].attending = Some(crate::cli::stop_hook::Attended {
+            desc: None,
+            token: None,
+            task: "b72qah60w".to_string(),
+            pid: Some(std::process::id() as i32),
+            at: "2026-08-20T14:51:09Z".to_string(),
+        });
         let wait = visible(line_with(&render(&s, 40, 80), "⌛"));
-        assert!(!wait.is_empty(), "cannot-check still shows a wait");
         assert!(
             wait.contains("b72qah60w"),
-            "and names it — the id is the subject when no description was recorded: {wait}"
+            "a checkable one draws, named by its id when no description was recorded: {wait}"
         );
     }
 
@@ -4925,14 +4949,14 @@ mod tests {
     fn every_drawn_marker_names_its_subject() {
         let now = time::OffsetDateTime::now_utc();
         let live = std::process::id() as i32;
+        // Every shape that is DRAWN, which now means every shape with
+        // a live pid — an uncheckable record is not rendered at all.
         for (desc, pid, at) in [
             (Some("test run"), Some(live), "2026-08-20T14:51:09Z"),
-            (Some("test run"), None, "2026-08-20T14:51:09Z"),
             (None, Some(live), "2026-08-20T14:51:09Z"),
-            (None, None, "2026-08-20T14:51:09Z"),
             // Unparseable timestamp: no age, so the marker is subject
             // (and pid) alone — still never subjectless.
-            (None, None, "not-a-timestamp"),
+            (None, Some(live), "not-a-timestamp"),
         ] {
             let att = crate::cli::stop_hook::Attended {
                 desc: desc.map(str::to_string),

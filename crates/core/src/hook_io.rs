@@ -121,30 +121,31 @@ fn command_contains_clank_wait(command: &str, depth: usize) -> bool {
         })
 }
 
-fn segment_contains_clank_wait(words: &[&str], depth: usize) -> bool {
+/// Index of the actual program word, skipping leading `VAR=value`
+/// assignments and `env` / `exec` / `command` wrappers.
+///
+/// Shared by every command recogniser here so the wrapper rules cannot
+/// drift apart between them.
+fn command_word_index(words: &[&str]) -> usize {
     let mut command = 0;
     loop {
         while words.get(command).is_some_and(|word| is_assignment(word)) {
             command += 1;
         }
-
         match words.get(command).map(|word| program_basename(word)) {
-            Some("env") => {
+            Some("env" | "exec" | "command") => {
                 command += 1;
                 if words.get(command) == Some(&"--") {
                     command += 1;
                 }
             }
-            Some("exec" | "command") => {
-                command += 1;
-                if words.get(command) == Some(&"--") {
-                    command += 1;
-                }
-            }
-            _ => break,
+            _ => return command,
         }
     }
+}
 
+fn segment_contains_clank_wait(words: &[&str], depth: usize) -> bool {
+    let command = command_word_index(words);
     let Some(program) = words.get(command).map(|word| program_basename(word)) else {
         return false;
     };
@@ -157,6 +158,55 @@ fn segment_contains_clank_wait(words: &[&str], depth: usize) -> bool {
         && words
             .get(command + 2)
             .is_some_and(|script| command_contains_clank_wait(script, depth + 1))
+}
+
+/// The `--desc` VALUE of a `clank run` invocation, or `None` if this
+/// command line is not one.
+///
+/// Structured recognition, not substring matching: `echo "test run"`
+/// names the same words and is not a run, and a `clank run` whose
+/// description happens to appear later on its own line is not a match
+/// for that later text either. The description is the only handle the
+/// hook has on an owned run — the tool assigns a task id only after
+/// launching the command, so no id can exist in the marker — which is
+/// exactly why the handle has to be recognised precisely.
+///
+/// Stops at `--`: everything after it belongs to the command being
+/// run, so a `--desc` there is the CHILD's flag, not clank's.
+pub fn clank_run_desc(command: &str) -> Option<String> {
+    let tokens = shell_tokens(command);
+    tokens
+        .split(|token| matches!(token, ShellToken::Boundary))
+        .find_map(|segment| {
+            let words: Vec<&str> = segment
+                .iter()
+                .filter_map(|token| match token {
+                    ShellToken::Word(word) => Some(word.as_str()),
+                    ShellToken::Boundary => None,
+                })
+                .collect();
+            let at = command_word_index(&words);
+            if words.get(at).map(|w| program_basename(w)) != Some("clank")
+                || words.get(at + 1) != Some(&"run")
+            {
+                return None;
+            }
+            let mut i = at + 2;
+            while let Some(word) = words.get(i) {
+                if *word == "--" {
+                    return None;
+                }
+                if *word == "--desc" {
+                    return words.get(i + 1).map(|v| v.trim().to_string());
+                }
+                if let Some(v) = word.strip_prefix("--desc=") {
+                    return Some(v.trim().to_string());
+                }
+                i += 1;
+            }
+            None
+        })
+        .filter(|d| !d.is_empty())
 }
 
 fn program_basename(word: &str) -> &str {
@@ -264,6 +314,22 @@ impl HookInput {
     /// completes, so the hook must not block in a wait while it runs.
     pub fn has_non_wait_background_work(&self) -> bool {
         self.background_tasks.iter().any(|t| !t.is_clank_wait())
+    }
+
+    /// How many LIVE background tasks are a `clank run` carrying this
+    /// description.
+    ///
+    /// The caller wants exactly one. Zero proves nothing is running.
+    /// Two or more means the description cannot tell them apart, and
+    /// picking either would be a guess about whether an agent may be
+    /// silenced — so both cases must decline to suppress.
+    pub fn live_clank_run_matches(&self, desc: &str) -> usize {
+        self.background_tasks
+            .iter()
+            .filter(|t| t.status.as_deref() != Some("completed"))
+            .filter_map(|t| t.command.as_deref())
+            .filter(|cmd| clank_run_desc(cmd).as_deref() == Some(desc))
+            .count()
     }
 }
 
@@ -536,6 +602,81 @@ mod tests {
             last_assistant_message: None,
             background_tasks: tasks,
         }
+    }
+
+    #[test]
+    fn clank_run_desc_recognises_the_invocation_not_the_words() {
+        assert_eq!(
+            clank_run_desc("clank run --desc \"test run\" -- cargo test").as_deref(),
+            Some("test run")
+        );
+        assert_eq!(
+            clank_run_desc("/Users/x/.cargo/bin/clank run --desc 'test run' -- make").as_deref(),
+            Some("test run")
+        );
+        assert_eq!(
+            clank_run_desc("cd /repo && exec clank run --desc=build -- ./x").as_deref(),
+            Some("build")
+        );
+
+        // Substring matching is NOT identity: each of these names the
+        // same words and is not a run.
+        assert_eq!(clank_run_desc("echo \"test run\""), None);
+        assert_eq!(clank_run_desc("cargo test # test run"), None);
+        assert_eq!(clank_run_desc("clank wait --author claude"), None);
+        assert_eq!(
+            clank_run_desc("clank attending x --desc \"test run\""),
+            None
+        );
+
+        // Everything after `--` belongs to the CHILD. Its `--desc` is
+        // not clank's and must not be picked up.
+        assert_eq!(
+            clank_run_desc("clank run --desc \"ours\" -- cargo test --desc \"theirs\"").as_deref(),
+            Some("ours")
+        );
+        assert_eq!(
+            clank_run_desc("clank run -- cargo test --desc \"theirs\""),
+            None,
+            "a run with no --desc of its own matches nothing"
+        );
+    }
+
+    #[test]
+    fn live_run_matches_counts_only_live_runs_with_that_exact_description() {
+        let input = |tasks: serde_json::Value| -> HookInput {
+            serde_json::from_value(serde_json::json!({
+                "session_id": "sess-run-match",
+                "cwd": "/tmp",
+                "stop_hook_active": false,
+                "background_tasks": tasks,
+            }))
+            .unwrap()
+        };
+        let run = |cmd: &str| serde_json::json!({"id": "t", "command": cmd});
+
+        let one = input(serde_json::json!([run(
+            "clank run --desc \"test run\" -- cargo test"
+        )]));
+        assert_eq!(one.live_clank_run_matches("test run"), 1);
+        assert_eq!(one.live_clank_run_matches("other"), 0);
+
+        // A finished task is not evidence that anything is running.
+        let done = input(serde_json::json!([{
+            "id": "t",
+            "status": "completed",
+            "command": "clank run --desc \"test run\" -- cargo test"
+        }]));
+        assert_eq!(done.live_clank_run_matches("test run"), 0);
+
+        // Two live runs sharing a description cannot be told apart, so
+        // the caller's "exactly one" rule declines to suppress rather
+        // than picking either.
+        let two = input(serde_json::json!([
+            run("clank run --desc \"test run\" -- cargo test"),
+            run("clank run --desc \"test run\" -- cargo build"),
+        ]));
+        assert_eq!(two.live_clank_run_matches("test run"), 2);
     }
 
     #[test]

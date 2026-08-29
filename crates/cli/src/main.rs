@@ -159,6 +159,14 @@ enum Command {
     /// Record the background task you are waiting on, so the Stop hook
     /// stops waking you with work you are already doing
     Attending(cli::AttendingArgs),
+    /// Run a command under clank, so it knows exactly when the work ends
+    ///
+    /// Background this instead of the bare command:
+    /// `clank run --desc "test run" -- cargo test`. Clank records what
+    /// it is attending, then BECOMES the command — same pid, same
+    /// stdio, same exit status — so the harness task's lifetime is the
+    /// work's lifetime and nothing has to be told when it finished.
+    Run(cli::RunArgs),
     /// Read or write clank config values
     Config(cli::ConfigArgs),
     /// Dump the repo's roster config as JSON
@@ -229,6 +237,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Block(args) => cli::block::run(args).await,
         Command::Unblock(args) => cli::block::run_unblock(args).await,
         Command::Attending(args) => cli::attending::run(args).await,
+        Command::Run(args) => cli::run::run(args),
     };
     if let Err(e) = result {
         let code = exit_code_for(&e);

@@ -50,9 +50,35 @@ pub async fn run(args: AttendingArgs) -> anyhow::Result<()> {
     if task_id.is_empty() {
         anyhow::bail!("task id is empty");
     }
-    if args.pid.is_some_and(|p| p <= 0) {
+    // A marker may only exist if clank can later determine whether the
+    // work has FINISHED. Without that it is not a wait, it is a claim
+    // nobody can check — recorded, ignored by the hook, and shown by
+    // `clank status` as a row that ages forever because nothing can
+    // ever learn it ended.
+    //
+    // Refusing beats warning. A caller told "this will not suppress"
+    // has still been handed a useless record, and the useful thing to
+    // hand them instead is the command that works.
+    let Some(pid) = args.pid else {
+        anyhow::bail!(
+            "--pid is required: without it clank cannot tell when this work ends, so the marker \
+             would suppress nothing.\n\nEasier: let clank supply it — `clank run --desc \"two \
+             words\" -- <command>` records the marker and becomes the command, so the pid is \
+             right by construction."
+        );
+    };
+    if pid <= 0 {
         anyhow::bail!("--pid must be a real process id");
     }
+    // A pid is a number the OS reuses. The token is what says WHICH
+    // process held it, so a marker without one identifies nothing.
+    let Some(token) = crate::proc_identity::token_for(pid) else {
+        anyhow::bail!(
+            "cannot identify pid {pid}: it may have already exited, or this platform cannot \
+             answer. A pid alone is not an identity — the OS reuses them — so the marker would \
+             not be trustworthy."
+        );
+    };
     // clap requires `--desc` unless `--clear`; what it cannot require
     // is that anything legible SURVIVES normalisation. `--desc "  "`
     // parses fine and names nothing, and a wait nobody can identify
@@ -69,11 +95,14 @@ pub async fn run(args: AttendingArgs) -> anyhow::Result<()> {
     let record = crate::cli::stop_hook::Attending {
         task: task_id.to_string(),
         desc: Some(desc.clone()),
-        pid: args.pid,
+        pid: Some(pid),
         // Taken NOW, while the pid is known to be the process the
         // caller meant. Read later it would identify whatever holds
         // the number by then, which is the reuse this exists to catch.
-        token: args.pid.and_then(crate::proc_identity::token_for),
+        token: Some(token),
+        // A hand-supplied marker names a harness TASK ID, so only a
+        // live task with that id may satisfy it.
+        correlation: crate::cli::stop_hook::Correlation::TaskId,
     };
     std::fs::write(&path, serde_json::to_string(&record)?)?;
     println!("{}", confirmation(&record));
@@ -83,45 +112,28 @@ pub async fn run(args: AttendingArgs) -> anyhow::Result<()> {
 /// What the caller sees on a successful record.
 ///
 /// Derived from the RECORD, never from the arguments, so it cannot
-/// promise something other than what was stored. It leads with the
-/// description because that is the fact the caller can check — a task
-/// id echoed back proves only that argv arrived intact.
+/// promise something other than what was stored.
 ///
-/// Crucially it says whether the marker can SUPPRESS anything. The
-/// hook silences a turn only on proof the work is still running (a
-/// live task id, a live pid, and a token that still holds it), so a
-/// marker missing any of that is recorded and then ignored. A caller
-/// silently getting a no-op is how this whole class of bug stayed
-/// invisible (codex on 8be3184).
+/// There is one shape to describe: admission refuses anything clank
+/// cannot verify, so a marker that exists is one that can suppress.
+/// The promise stays CONDITIONAL even so — the hook also requires the
+/// tool to still be reporting the work as live at turn-end, and
+/// claiming more than that is what the previous wording got wrong.
 fn confirmation(rec: &crate::cli::stop_hook::Attending) -> String {
     let desc = rec.desc.as_deref().unwrap_or_default();
     let task = &rec.task;
-    match (rec.pid, rec.token.is_some()) {
-        // Still conditional: the tool must ALSO be listing the task as
-        // live when the turn ends. Promising more than that is what
-        // the previous wording got wrong.
-        (Some(pid), true) => format!(
-            "attending \"{desc}\" (`{task}`, pid {pid}) — your next turn-end stays silent for \
-             as long as the tool still reports this task running"
-        ),
-        (Some(pid), false) => format!(
-            "attending \"{desc}\" (`{task}`, pid {pid}) — RECORDED, BUT IT WILL NOT SILENCE \
-             ANYTHING: no process token could be taken for pid {pid}, so clank cannot prove that \
-             process is still the one you meant"
-        ),
-        (None, _) => format!(
-            "attending \"{desc}\" (`{task}`) — RECORDED, BUT IT WILL NOT SILENCE ANYTHING: \
-             without `--pid` clank cannot prove the work is still running, and silencing a turn \
-             with no provable wake is how an agent goes to sleep for good"
-        ),
-    }
+    let pid = rec.pid.map(|p| p.to_string()).unwrap_or_default();
+    format!(
+        "attending \"{desc}\" (`{task}`, pid {pid}) — your next turn-end stays silent for as \
+         long as the tool still reports this work running"
+    )
 }
 
 /// Collapse a description to the single terminal row it will be drawn
 /// as: first line only, control bytes dropped, trimmed. The renderer
 /// normalises too — records can be hand-edited — but a clean write
 /// keeps the stored value honest.
-fn normalise_desc(raw: &str) -> String {
+pub(crate) fn normalise_desc(raw: &str) -> String {
     raw.lines()
         .next()
         .unwrap_or("")
@@ -144,6 +156,16 @@ mod tests {
             clear: false,
             author: Some("claude".into()),
             repo: Some(repo.to_path_buf()),
+        }
+    }
+
+    /// Args that pass admission: a real, identifiable pid. Most tests
+    /// are about something else and should not have to restate why a
+    /// marker is admissible.
+    fn ok_args(task: Option<&str>, desc: Option<&str>, repo: &std::path::Path) -> AttendingArgs {
+        AttendingArgs {
+            pid: Some(std::process::id() as i32),
+            ..args(task, desc, repo)
         }
     }
 
@@ -175,12 +197,16 @@ mod tests {
         // Each of these parses fine and names nothing.
         for blank in ["   ", "\u{7}\u{1b}", "\n first line lost"] {
             let dir = tempfile::tempdir().unwrap();
-            let err = run(args(Some("br9711ewy"), Some(blank), dir.path()))
+            // An admissible pid, so this exercises the DESCRIPTION
+            // rule and not the identity one — without it the pid check
+            // fires first and the assertion below passes on the wrong
+            // error, since that message also mentions `--desc`.
+            let err = run(ok_args(Some("br9711ewy"), Some(blank), dir.path()))
                 .await
                 .expect_err("refused");
             assert!(
-                err.to_string().contains("--desc"),
-                "says which flag is at fault: {err}"
+                err.to_string().contains("--desc is empty"),
+                "says which flag is at fault, and why: {err}"
             );
             assert!(
                 record(dir.path()).is_none(),
@@ -192,7 +218,7 @@ mod tests {
     #[tokio::test]
     async fn every_recorded_wait_carries_a_subject() {
         let dir = tempfile::tempdir().unwrap();
-        run(args(Some("br9711ewy"), Some("  test run  "), dir.path()))
+        run(ok_args(Some("br9711ewy"), Some("  test run  "), dir.path()))
             .await
             .unwrap();
         let rec = record(dir.path()).expect("written");
@@ -208,7 +234,7 @@ mod tests {
     async fn an_over_long_description_is_stored_whole() {
         let dir = tempfile::tempdir().unwrap();
         let long = "cargo nextest run across every crate in the workspace ".repeat(8);
-        run(args(Some("br9711ewy"), Some(&long), dir.path()))
+        run(ok_args(Some("br9711ewy"), Some(&long), dir.path()))
             .await
             .unwrap();
         assert_eq!(
@@ -226,6 +252,7 @@ mod tests {
                 crate::proc_identity::token_for(std::process::id() as i32)
                     .expect("this platform answers for its own pid")
             }),
+            correlation: crate::cli::stop_hook::Correlation::TaskId,
         }
     }
 
@@ -248,47 +275,68 @@ mod tests {
         assert!(with_pid.contains("pid 41293"), "and the pid: {with_pid}");
     }
 
-    /// A marker that cannot suppress must SAY it cannot. The hook
-    /// silences only on proof the work is still running, so every
-    /// other shape is recorded and then ignored — and a caller who is
-    /// not told has no way to discover it except by being nudged
-    /// anyway and not knowing why (codex on 8be3184).
-    #[test]
-    fn only_a_marker_with_a_verified_identity_claims_it_can_silence() {
-        let silences = |r: &crate::cli::stop_hook::Attending| {
-            let line = confirmation(r);
-            let refuses = line.contains("WILL NOT SILENCE");
-            let claims = line.contains("stays silent");
-            assert_ne!(refuses, claims, "must say exactly one of the two: {line}");
-            claims
-        };
+    /// Admission REFUSES what it cannot verify, rather than recording
+    /// it and warning. A caller told "this will not suppress" still
+    /// holds a useless record; refusing hands them the working command
+    /// instead. This is the shape the penlock marker had.
+    #[tokio::test]
+    async fn a_wait_clank_cannot_verify_is_refused_not_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = run(args(Some("br9711ewy"), Some("test run"), dir.path()))
+            .await
+            .expect_err("no --pid: refused");
+        let msg = err.to_string();
+        assert!(msg.contains("--pid"), "names what is missing: {msg}");
+        assert!(
+            msg.contains("clank run"),
+            "and points at the command that supplies it: {msg}"
+        );
+        assert!(
+            record(dir.path()).is_none(),
+            "nothing unverifiable reaches disk"
+        );
+    }
 
+    #[tokio::test]
+    async fn a_pid_that_cannot_be_identified_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        // Nothing can hold this, so no token can be taken for it.
+        let err = run(AttendingArgs {
+            pid: Some(999_999_998),
+            ..args(Some("br9711ewy"), Some("test run"), dir.path())
+        })
+        .await
+        .expect_err("unidentifiable pid: refused");
         assert!(
-            !silences(&rec(None, false)),
-            "no pid: nothing can prove the work is running"
+            err.to_string().contains("identity") || err.to_string().contains("identify"),
+            "says why a bare pid is not enough: {err}"
         );
-        assert!(
-            !silences(&rec(Some(41293), false)),
-            "a pid with no token is not an identity — pids are reused"
-        );
-        assert!(
-            silences(&rec(Some(41293), true)),
-            "pid plus a token is the only shape entitled to claim it"
-        );
+        assert!(record(dir.path()).is_none());
+    }
 
-        // And the claim it does make stays conditional: the tool has
-        // to be listing the task live at turn-end too.
-        let full = confirmation(&rec(Some(41293), true));
+    #[tokio::test]
+    async fn a_verifiable_wait_is_recorded_with_its_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let me = std::process::id() as i32;
+        run(AttendingArgs {
+            pid: Some(me),
+            ..args(Some("br9711ewy"), Some("test run"), dir.path())
+        })
+        .await
+        .unwrap();
+        let rec = record(dir.path()).expect("written");
+        assert_eq!(rec.pid, Some(me));
+        assert!(rec.token.is_some(), "and the identity that makes it usable");
         assert!(
-            full.contains("as long as") && full.contains("running"),
-            "the promise is conditional, not absolute: {full}"
+            rec.provably_live(&["br9711ewy".to_string()], 0),
+            "so it satisfies the hook's proof"
         );
     }
 
     #[tokio::test]
     async fn clearing_needs_no_description() {
         let dir = tempfile::tempdir().unwrap();
-        run(args(Some("br9711ewy"), Some("test run"), dir.path()))
+        run(ok_args(Some("br9711ewy"), Some("test run"), dir.path()))
             .await
             .unwrap();
         run(AttendingArgs {

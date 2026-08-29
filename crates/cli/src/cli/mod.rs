@@ -40,6 +40,7 @@ pub mod queue;
 pub mod rereview;
 pub mod rewire;
 pub mod rewrite;
+pub mod run;
 pub mod setup;
 pub mod stash;
 pub mod status;
@@ -1641,6 +1642,28 @@ pub struct BlockCreateArgs {
 pub struct BlockCleanArgs {
     #[arg(long, value_name = "PATH")]
     pub repo: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub struct RunArgs {
+    /// TWO WORDS for what you are waiting on — `--desc "test run"`.
+    ///
+    /// Required, and load-bearing twice over: it is what
+    /// `clank status --tui` shows, AND it is how the Stop hook
+    /// recognises this run among the tool's live background tasks.
+    /// The hook reads the command line the harness recorded, so the
+    /// description has to be ON it — which is why clank cannot just
+    /// generate an id for you.
+    #[arg(long, value_name = "TEXT")]
+    pub desc: String,
+    /// Agent label. Resolved from env when omitted.
+    #[arg(long, value_name = "LABEL")]
+    pub author: Option<String>,
+    #[arg(long, value_name = "PATH")]
+    pub repo: Option<PathBuf>,
+    /// The command to run, after `--`.
+    #[arg(trailing_var_arg = true, required = true, value_name = "CMD")]
+    pub command: Vec<String>,
 }
 
 #[derive(Args, Debug)]

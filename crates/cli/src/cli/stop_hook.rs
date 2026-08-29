@@ -177,7 +177,12 @@ async fn compute_outcome_with(
                 // Every path out of here holds a channel: this branch
                 // has just proven a completion wake is outstanding,
                 // and every other one parks.
-                if let Some(silence) = attendance_silence(attending.as_ref(), &live_ids, &agent_dir)
+                let run_matches = attending
+                    .as_ref()
+                    .filter(|r| r.correlation == Correlation::RunDesc)
+                    .map_or(0, |r| input.live_clank_run_matches(&r.task));
+                if let Some(silence) =
+                    attendance_silence(attending.as_ref(), &live_ids, run_matches, &agent_dir)
                 {
                     return silence;
                 }
@@ -821,6 +826,25 @@ fn attended_path(agent_dir: &Path) -> PathBuf {
 /// to remain true over time, so it needed reaping, and the only
 /// reaper was the Stop hook the marker silenced. A reviewer sat
 /// mute for three hours on that.
+/// WHICH live-work signal may satisfy a marker.
+///
+/// Without this the two correlation paths leak into each other: a
+/// hand-written task-id marker could be satisfied by an unrelated
+/// `clank run` that happened to share its text, and a run marker by a
+/// coincidentally equal harness task id (codex on c566eea). A marker
+/// is evidence about one specific thing, so it accepts one specific
+/// kind of proof.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Correlation {
+    /// `task` is a harness task id. The default, so every record
+    /// written before this field existed keeps its old meaning.
+    #[default]
+    TaskId,
+    /// `task` is the `--desc` of a `clank run` clank owns.
+    RunDesc,
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Attending {
     pub(crate) task: String,
@@ -842,6 +866,9 @@ pub(crate) struct Attending {
     /// lifetime to bound.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) pid: Option<i32>,
+    /// What kind of live-work evidence may satisfy this marker.
+    #[serde(default)]
+    pub(crate) correlation: Correlation,
 }
 
 impl Attending {
@@ -863,11 +890,24 @@ impl Attending {
     ///
     /// Anything unverifiable — no pid, no token, legacy record —
     /// answers `false` and keeps its park. Noise, never silence.
-    fn provably_live(&self, live_ids: &[String]) -> bool {
+    /// `run_matches` is how many live background tasks are a
+    /// `clank run` carrying this marker's description. A run owned by
+    /// clank has no harness id to match on — the tool assigns one only
+    /// after launching the command — so the description is its handle,
+    /// and EXACTLY ONE match is required: zero proves nothing, and two
+    /// or more cannot say which is this marker's.
+    pub(crate) fn provably_live(&self, live_ids: &[String], run_matches: usize) -> bool {
         let (Some(pid), Some(token)) = (self.pid, self.token.as_ref()) else {
             return false;
         };
-        live_ids.iter().any(|id| id == &self.task) && pid_is_alive(pid) && token.still_holds(pid)
+        // Only the evidence this marker was written for. Accepting
+        // either would let each path be satisfied by the other's
+        // coincidence.
+        let correlated = match self.correlation {
+            Correlation::TaskId => live_ids.iter().any(|id| id == &self.task),
+            Correlation::RunDesc => run_matches == 1,
+        };
+        correlated && pid_is_alive(pid) && token.still_holds(pid)
     }
 }
 
@@ -961,8 +1001,16 @@ impl Attended {
     /// pid is the half a human can act on; the id keeps its place on
     /// the plain `clank status` line, where width is not scarce.
     ///
-    /// A record with no pid still renders: "cannot check" is not
-    /// "ended".
+    /// A record that cannot be CHECKED is not drawn either. Rendering
+    /// one is a liveness assertion — "waiting on this, 2m and
+    /// counting" — from a record that can never support it, and since
+    /// nothing can ever learn the work ended, the row would age
+    /// upward forever. That was the reported bug.
+    ///
+    /// Such records can no longer be written (admission requires a
+    /// verifiable identity, and the decision record is only kept for
+    /// an attendance that proved itself), so this covers ones already
+    /// on disk, until the next hook entry sweeps them.
     /// What the wait IS: the recorded description, else the opaque
     /// task id. Never empty — this is the field the marker exists to
     /// show, and a marker that cannot show it is not drawn at all.
@@ -1014,7 +1062,10 @@ impl Attended {
     /// only ever gets shorter. `None` once the process is known dead —
     /// a wait that has ended is not drawn.
     pub(crate) fn marker_fields(&self, now: time::OffsetDateTime) -> Option<MarkerFields<'_>> {
-        if self.process_alive() == Some(false) {
+        // Positive evidence, not the absence of bad news: `None` here
+        // means "no pid, cannot check", which is not a wait anyone
+        // should be shown as ongoing.
+        if self.process_alive() != Some(true) {
             return None;
         }
         Some(MarkerFields {
@@ -1095,10 +1146,11 @@ fn consume_attending(agent_dir: &Path) -> Option<Attending> {
 fn attendance_silence(
     attending: Option<&Attending>,
     live_ids: &[String],
+    run_matches: usize,
     agent_dir: &Path,
 ) -> Option<HookOutcome> {
     let rec = attending?;
-    if !rec.provably_live(live_ids) {
+    if !rec.provably_live(live_ids, run_matches) {
         return None;
     }
     record_attended(agent_dir, rec);
@@ -1157,16 +1209,16 @@ fn outcome_from_wait_output(
                 // a dozen identical wakes.
                 if !live_ids.is_empty() {
                     reason.push_str(&format!(
-                        "\n\nYou have a live background task ({}). If you are WAITING on it, \
-                         record it — `clank attending {} --desc \"two words\"` — and nothing will \
-                         wake you until it ends. BOTH flags are load-bearing: `--desc` is two \
-                         words naming the wait, which is what `clank status --tui` shows, and \
-                         `--pid <pid>` (see `clank attending --help`) is what lets clank PROVE \
-                         the task is still running — without it the marker is recorded but \
-                         suppresses nothing, because silence with no provable wake is how an \
-                         agent goes to sleep for good. Do not end your turn to poll it.",
+                        "\n\nYou have a live background task ({}). To wait on one WITHOUT being \
+                         woken, launch it through clank next time — `clank run --desc \"two \
+                         words\" -- <command>` — which records what it is attending and then \
+                         becomes the command, so clank knows the pid and knows exactly when the \
+                         work ends. `clank attending <task-id> --desc \"two words\" --pid <pid>` \
+                         does the same job when you already have a pid; without one clank cannot \
+                         prove the work is still running and will refuse, because silencing a \
+                         turn with no provable wake is how an agent goes to sleep for good. Do \
+                         not end your turn to poll it.",
                         live_ids.join(", "),
-                        live_ids.first().map(String::as_str).unwrap_or("<task-id>"),
                     ));
                 }
                 HookOutcome::Continue { reason }
@@ -1642,6 +1694,7 @@ mod tests {
             token: crate::proc_identity::token_for(pid),
             task: task.to_string(),
             pid: Some(pid),
+            correlation: Correlation::TaskId,
         };
         std::fs::create_dir_all(dir).unwrap();
         std::fs::write(dir.join("attending"), serde_json::to_string(&rec).unwrap()).unwrap();
@@ -1654,6 +1707,7 @@ mod tests {
             token: None,
             task: task.to_string(),
             pid,
+            correlation: Correlation::TaskId,
         };
         std::fs::write(dir.join("attending"), serde_json::to_string(&rec).unwrap()).unwrap();
     }
@@ -1689,7 +1743,7 @@ mod tests {
     /// then judge it against a fresh task list.
     fn entry_outcome(dir: &Path, live: &[String]) -> Option<HookOutcome> {
         let attending = consume_attending(dir);
-        attendance_silence(attending.as_ref(), live, dir)
+        attendance_silence(attending.as_ref(), live, 0, dir)
     }
 
     fn is_attending_silence(out: &HookOutcome) -> bool {
@@ -1761,16 +1815,17 @@ mod tests {
             desc: None,
             pid: Some(me),
             token: token.clone(),
+            correlation: Correlation::TaskId,
         };
-        assert!(full.provably_live(&live), "all three signals agree");
+        assert!(full.provably_live(&live, 0), "all three signals agree");
 
         // Each signal removed in turn — every one is load-bearing.
         assert!(
-            !full.provably_live(&[]),
+            !full.provably_live(&[], 0),
             "not listed live: the completion wake has already been spent"
         );
         assert!(
-            !full.provably_live(&["other".to_string()]),
+            !full.provably_live(&["other".to_string()], 0),
             "a DIFFERENT task being live says nothing about this one"
         );
         assert!(
@@ -1778,7 +1833,7 @@ mod tests {
                 pid: None,
                 ..full.clone()
             }
-            .provably_live(&live),
+            .provably_live(&live, 0),
             "no pid — the penlock marker's exact shape — cannot prove anything"
         );
         assert!(
@@ -1786,7 +1841,7 @@ mod tests {
                 token: None,
                 ..full.clone()
             }
-            .provably_live(&live),
+            .provably_live(&live, 0),
             "a bare pid is not an identity; pids are reused"
         );
         // A pid that cannot be alive, and a token that no longer holds
@@ -1796,7 +1851,7 @@ mod tests {
                 pid: Some(-1),
                 ..full.clone()
             }
-            .provably_live(&live),
+            .provably_live(&live, 0),
             "an impossible pid is not alive"
         );
         assert!(
@@ -1804,8 +1859,105 @@ mod tests {
                 token: Some(crate::proc_identity::ProcToken::Unrecognised),
                 ..full.clone()
             }
-            .provably_live(&live),
+            .provably_live(&live, 0),
             "an unparseable token never matches, so it never proves"
+        );
+    }
+
+    /// The two correlation paths must not satisfy each other. Each
+    /// marker is evidence about one specific thing and accepts one
+    /// specific kind of proof; without the discriminator a hand-written
+    /// task-id marker could be silenced by an unrelated `clank run`
+    /// that happened to share its text, and vice versa (codex on
+    /// c566eea).
+    #[test]
+    fn a_marker_is_only_satisfied_by_the_evidence_it_was_written_for() {
+        let me = std::process::id() as i32;
+        let base = Attending {
+            task: "shared-text".into(),
+            desc: Some("shared-text".into()),
+            pid: Some(me),
+            token: crate::proc_identity::token_for(me),
+            correlation: Correlation::TaskId,
+        };
+        let manual = base.clone();
+        let owned = Attending {
+            correlation: Correlation::RunDesc,
+            ..base
+        };
+        let as_id = ["shared-text".to_string()];
+
+        // Each is satisfied by its OWN evidence.
+        assert!(
+            manual.provably_live(&as_id, 0),
+            "task id satisfies a manual marker"
+        );
+        assert!(
+            owned.provably_live(&[], 1),
+            "a live run satisfies an owned marker"
+        );
+
+        // And by nothing else, however exactly the text coincides.
+        assert!(
+            !manual.provably_live(&[], 1),
+            "a manual marker must NOT be satisfied by a run that shares its text"
+        );
+        assert!(
+            !owned.provably_live(&as_id, 0),
+            "an owned marker must NOT be satisfied by a task id that shares its text"
+        );
+    }
+
+    /// A run clank OWNS has no harness id to match on, so the
+    /// description is its only handle — and exactly one live match is
+    /// required. Zero proves nothing is running; two or more cannot
+    /// say which is this marker's, and choosing either would be a
+    /// guess about whether an agent may be silenced.
+    #[test]
+    fn an_owned_run_correlates_by_exactly_one_description_match() {
+        let me = std::process::id() as i32;
+        let rec = Attending {
+            // What `clank run` writes: the description, because no
+            // harness id exists when the marker is written.
+            task: "test run".into(),
+            desc: Some("test run".into()),
+            pid: Some(me),
+            token: crate::proc_identity::token_for(me),
+            correlation: Correlation::RunDesc,
+        };
+
+        assert!(
+            rec.provably_live(&[], 1),
+            "one live run with this description is the proof"
+        );
+        assert!(
+            !rec.provably_live(&[], 0),
+            "no live run: nothing shows the work is still going"
+        );
+        assert!(
+            !rec.provably_live(&[], 2),
+            "two live runs sharing a description is an ambiguity, not a proof"
+        );
+
+        // The id path is unaffected — but it belongs to a marker
+        // written for it, not to this one.
+        assert!(
+            Attending {
+                correlation: Correlation::TaskId,
+                ..rec.clone()
+            }
+            .provably_live(&["test run".to_string()], 0)
+        );
+
+        // And correlation never substitutes for identity: an
+        // unprovable marker stays unprovable however it correlates.
+        assert!(
+            !Attending {
+                token: None,
+                ..rec.clone()
+            }
+            .provably_live(&[], 1),
+            "correlation is not identity"
         );
     }
 
