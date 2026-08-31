@@ -1073,29 +1073,115 @@ mod tests {
         }
     }
 
+    /// The normative inventory, asserted PER TOOL.
+    ///
+    /// `compose_skill` takes the tool and the compositions are allowed
+    /// to differ, so a leaner per-tool variant must not become a way to
+    /// lose a rule. Checking only claude — as this test did — left
+    /// exactly that hole: codex's composition could drop
+    /// architecture-first review and the suite stayed green.
+    ///
+    /// Asserted against the COMPOSITION, never the asset files: the
+    /// role guard is generated in `compose_skill_with` and the
+    /// anti-poll rule lives in the `WORK_LOOP_*` constants, so neither
+    /// appears in any `.md` and an asset-level test would miss both.
+    /// The composed CODEX reviewer skill has a byte ceiling.
+    ///
+    /// Codex re-reads this document IN FULL on every reviewing turn —
+    /// its skill contract says skills do not carry across turns and
+    /// must be read completely before acting — so size here is a
+    /// RECURRING cost, measured at 587 reads in one session. That
+    /// makes bytes the acceptance criterion, and creep a regression.
+    ///
+    /// Claude's is deliberately NOT capped: it is read once per
+    /// session and kept, so its bytes are amortised and guidance there
+    /// is worth more than the space.
+    #[test]
+    fn the_codex_reviewer_skill_stays_under_its_ceiling() {
+        // 5,667B before the compression that introduced this test.
+        const CEILING: usize = 5_300;
+        let len = compose_skill(Role::Reviewer, Tool::Codex).len();
+        assert!(
+            len <= CEILING,
+            "codex reviewer skill is {len}B, over the {CEILING}B ceiling (5,667B \
+             before compression) — re-read in full every reviewing turn, so \
+             growth here is paid again on every wake"
+        );
+    }
+
     #[test]
     fn role_invariants_lead_each_body() {
-        // Guard against silent drift of the behaviours this split exists
-        // to encode.
-        let master = compose_skill(Role::Master, Tool::Claude);
-        assert!(
-            master.contains("Commit → STOP → get woken") && master.contains("PROMOTING"),
-            "master must encode the commit->yield loop incl. promotion"
-        );
-        let reviewer = compose_skill(Role::Reviewer, Tool::Claude);
-        assert!(
-            reviewer.contains("NEVER withhold CONTINUE or FINISHED waiting on a manual/external"),
-            "reviewer must encode the committable-scope invariant"
-        );
-        assert!(
-            reviewer.contains("ARCHITECTURE-FIRST"),
-            "reviewer must encode architecture-first review"
-        );
-        for body in [&master, &reviewer] {
+        for tool in [Tool::Claude, Tool::Codex] {
+            let master = compose_skill(Role::Master, tool);
+            let reviewer = compose_skill(Role::Reviewer, tool);
             assert!(
-                body.contains("NEVER poll"),
-                "both roles must forbid polling"
+                master.contains("Commit → STOP → get woken") && master.contains("PROMOTING"),
+                "master must encode the commit->yield loop incl. promotion ({tool:?})"
             );
+            // Two DISTINCT rules that read as one. The first bounds
+            // what a verdict may consider; the second forbids blocking
+            // on something outside that bound. Asserting only the
+            // second would let a compression delete the scope boundary
+            // itself with every test still green.
+            assert!(
+                reviewer.contains("Review ONLY committable artifacts"),
+                "reviewer must bound its scope to committable artifacts ({tool:?})"
+            );
+            assert!(
+                reviewer
+                    .contains("NEVER withhold CONTINUE or FINISHED waiting on a manual/external"),
+                "reviewer must never gate a verdict on a manual/external step ({tool:?})"
+            );
+            assert!(
+                reviewer.contains("ARCHITECTURE-FIRST"),
+                "reviewer must encode architecture-first review ({tool:?})"
+            );
+            // Workflow semantics `clank --help` cannot supply, and the
+            // guard against the historical failure mode: writing
+            // feedback files directly, or running on into the next
+            // item. So it can never be compressed out as "reference".
+            assert!(
+                reviewer.contains("exactly ONE verdict") && reviewer.contains("then STOP"),
+                "reviewer must encode one-verdict-then-stop ({tool:?})"
+            );
+            assert!(
+                reviewer.contains("DO NOT** CONTINUE"),
+                "reviewer must forbid CONTINUE while gating on a change ({tool:?})"
+            );
+            // The COMPLETE minimal form. Asserting only the command
+            // name and `--verdict` would let `--commit`, `--author` or
+            // `-m` fall out of the template with the suite green,
+            // leaving a reviewer to guess the invocation it is told to
+            // compose itself.
+            for part in [
+                "clank feedback write --commit <sha>",
+                "--verdict continue|finished|request-changes",
+                "--author <label> -m \"<message>\"",
+            ] {
+                assert!(
+                    reviewer.contains(part),
+                    "reviewer is missing part of the feedback-write form: {part} ({tool:?})"
+                );
+            }
+            // The PROHIBITION itself, not merely the absence of the
+            // commands. A compression could delete this line while
+            // `clank finish` stays absent, and absence alone never
+            // tells a reviewer it must not reach for them.
+            assert!(
+                reviewer
+                    .contains("You never run finish / promote / roster / plan-authoring commands"),
+                "reviewer must STATE the reviewer-only command prohibition ({tool:?})"
+            );
+            for body in [&master, &reviewer] {
+                assert!(
+                    body.contains("ROLE GUARD"),
+                    "the guard is generated, not an asset — it must survive composition ({tool:?})"
+                );
+                assert!(
+                    body.contains("NEVER poll"),
+                    "both roles must forbid polling ({tool:?})"
+                );
+            }
         }
     }
 

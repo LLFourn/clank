@@ -40,28 +40,26 @@ details. The tool prepends the verdict to the file.
 
 ### Verdicts
 
-Three verdicts, no overlap: **CONTINUE** (good, more to do) / **FINISHED**
-(good, done) / **REQUEST_CHANGES** (not good). The positive mid-flight verdict
-is CONTINUE — it literally tells the master to keep going. (It was once called
-APPROVE; that read as "ship it" and pulled reviewers toward it when the work
-was actually done and the verdict should have been FINISHED. If you think the
-plan is finished, you would not say "continue" — say FINISHED.)
+Three verdicts, no overlap. The positive mid-flight verdict is CONTINUE — it
+tells the master to keep going. (It was once APPROVE, which read as "ship it"
+and pulled reviewers toward it when the work was actually done and the verdict
+should have been FINISHED.)
 
-**DO NOT** CONTINUE while gating on a change you raised in the message — CONTINUE
-means good AND not gating on anything. If something must change before the plan
-can finish, use REQUEST_CHANGES. (Naming what still REMAINS to implement, or a
+**DO NOT** CONTINUE while gating on a change you raised — CONTINUE means good
+AND not gating on anything. If something must change before the plan can
+finish, use REQUEST_CHANGES. (Naming what still REMAINS to implement, or a
 clearly optional non-gating suggestion, stays a valid CONTINUE.)
 
-- **CONTINUE**: this commit's work is good and there is more to do — the master
-  keeps going. Add a one-sentence reason it's not FINISHED yet (e.g. "tests
-  still missing") to keep the master oriented on what's left. Before choosing
-  CONTINUE over FINISHED, name the plan deliverable still missing or wrong; if
-  you can't name one against the plan's acceptance, the verdict is FINISHED.
+- **CONTINUE**: good, and there is more to do — the master keeps going. Add a
+  one-sentence reason it's not FINISHED yet (e.g. "tests still missing") to keep
+  the master oriented. Before choosing CONTINUE over FINISHED, name the plan
+  deliverable still missing or wrong; if you can't name one against the plan's
+  acceptance, the verdict is FINISHED.
 - **FINISHED**: the committable work the plan DESCRIBES is
-  implemented and merge-ready — code written, tests passing, review satisfied —
-  so the plan is ready to finalize (the master runs the finalize step). FINISHED
-  does NOT mean
-  "the plan text is written": a complete plan document is the START of
+  implemented and merge-ready — code written, tests passing, review
+  satisfied — so the plan is
+  ready to finalize (the master runs the finalize step). It does NOT mean "the
+  plan text is written": a complete plan document is the START of
   implementation, not the end. (Exception: a plan whose ONLY deliverable is a
   document — research or design with no code to write — IS finished when the
   document is done.)
