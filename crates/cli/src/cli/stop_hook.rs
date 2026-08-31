@@ -205,7 +205,15 @@ async fn compute_outcome_with(
                     // wait would reintroduce the tracked-task loop this mode
                     // exists to delete (claude-asyncrewake-work-loop).
                     BgDisposition::NeedsWorkCheck if async_loop => {
-                        return asyncrewake_park(&repo, &label, role, started, &live_ids).await;
+                        return asyncrewake_park(
+                            &repo,
+                            &label,
+                            role,
+                            started,
+                            &live_ids,
+                            deadline_action(tool),
+                        )
+                        .await;
                     }
                     BgDisposition::NeedsWorkCheck => match peek_has_work(&repo, &label).await {
                         Ok(true) => HookOutcome::Silent {
@@ -222,7 +230,15 @@ async fn compute_outcome_with(
                     },
                     // NoBackgroundWork (YieldArmed already returned above): genuinely idle.
                     _ if async_loop => {
-                        return asyncrewake_park(&repo, &label, role, started, &live_ids).await;
+                        return asyncrewake_park(
+                            &repo,
+                            &label,
+                            role,
+                            started,
+                            &live_ids,
+                            deadline_action(tool),
+                        )
+                        .await;
                     }
                     _ => match loop_policy(tool) {
                         // LEGACY claude only (`--loop asyncrewake` returns
@@ -243,7 +259,15 @@ async fn compute_outcome_with(
                         // a nudge relay would loop an opencode session
                         // forever).
                         LoopPolicy::InHookWait => {
-                            compute_wait_outcome(&repo, &label, role, started, &live_ids).await
+                            compute_wait_outcome(
+                                &repo,
+                                &label,
+                                role,
+                                started,
+                                &live_ids,
+                                deadline_action(tool),
+                            )
+                            .await
                         }
                         // Grok's hooks are PASSIVE (grok-first-class): clank
                         // installs no grok adapter and no continuation could
@@ -271,6 +295,56 @@ enum LoopPolicy {
     InHookWait,
     /// Passive hooks; nothing can drive a continuation (grok).
     Passive,
+}
+
+/// What an adapter does when the long-poll reaches its deadline.
+///
+/// The runner's ceiling cannot be escaped — `asyncRewake` is the only
+/// mode that wakes on exit 2 and its timeout is always enforced — so
+/// the deadline WILL arrive on a quiet repo. The only choice is what
+/// it means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeadlineAction {
+    /// Wake with a heartbeat, so the turn-end that follows parks a
+    /// fresh hook under a new ceiling. Costs one turn per ceiling
+    /// period; the alternative is an agent that never runs again.
+    ReArm,
+    /// End the turn with nothing armed.
+    Sleep,
+}
+
+/// EXHAUSTIVE by design: a new adapter must answer this question
+/// rather than inherit whichever arm happened to be the default.
+fn deadline_action(tool: Tool) -> DeadlineAction {
+    match tool {
+        Tool::Claude | Tool::Codex => DeadlineAction::ReArm,
+        // opencode's plugin runs its work loop on `session.idle`, so a
+        // continuation re-idles immediately and spins forever
+        // (codex 8000d6e). It needs a different answer, not this one.
+        Tool::OpenCode => DeadlineAction::Sleep,
+        // Passive hooks reach no deadline at all; the arm exists so
+        // the match stays total.
+        Tool::Grok => DeadlineAction::Sleep,
+    }
+}
+
+/// The heartbeat wake.
+///
+/// It must not read as work. An agent woken with no items and no
+/// explanation will look for a reason and invent one, so this says
+/// what happened and what the correct response is.
+const REARM_REASON: &str = "clank: no work pending — the wait reached its ceiling and is re-arming. \
+This is a heartbeat, not a task. End your turn; the next hook parks a fresh wait.";
+
+fn deadline_outcome(action: DeadlineAction) -> HookOutcome {
+    match action {
+        DeadlineAction::ReArm => HookOutcome::Continue {
+            reason: REARM_REASON.to_string(),
+        },
+        DeadlineAction::Sleep => HookOutcome::Silent {
+            why: SilentReason::PollDeadline,
+        },
+    }
 }
 
 fn loop_policy(tool: Tool) -> LoopPolicy {
@@ -451,6 +525,7 @@ async fn asyncrewake_park(
     role: Role,
     started: std::time::Instant,
     live_ids: &[String],
+    on_deadline: DeadlineAction,
 ) -> HookOutcome {
     let agent_dir = crate::agent_store::agents_root(repo).join(label.as_str());
     if let Err(e) = std::fs::create_dir_all(&agent_dir) {
@@ -497,7 +572,7 @@ async fn asyncrewake_park(
     }
 
     let outcome = tokio::select! {
-        o = compute_wait_outcome(repo, label, role, started, live_ids) => o,
+        o = compute_wait_outcome(repo, label, role, started, live_ids, on_deadline) => o,
         // A newer incarnation took over: release (the select drops
         // the wait child via kill_on_drop) and suppress.
         () = generation_changed(&agent_dir, my_gen) => {
@@ -740,53 +815,65 @@ async fn compute_wait_outcome(
     role: Role,
     started: std::time::Instant,
     live_ids: &[String],
+    on_deadline: DeadlineAction,
 ) -> HookOutcome {
     // Fixed at hook entry, so everything below — current_exe, command
     // construction, the child spawn — is charged against it.
     let deadline = poll_deadline(started);
-    if std::time::Instant::now() >= deadline {
-        return HookOutcome::Silent {
-            why: SilentReason::PollDeadline,
-        };
+    let arm = || {
+        let exe = std::env::current_exe().map_err(|e| format!("hook: current_exe failed: {e}"))?;
+        let mut cmd = wait_command(&exe, repo, label);
+        Ok(OwnedWait::spawn(&mut cmd)?.run())
+    };
+    match await_wait_under_deadline(deadline, on_deadline, arm).await {
+        Ok(output) => outcome_from_wait_output(&output, label, role, live_ids),
+        Err(outcome) => outcome,
     }
-    let exe = match std::env::current_exe() {
-        Ok(p) => p,
-        Err(e) => {
-            return HookOutcome::Diagnostic {
-                message: format!("hook: current_exe failed: {e}"),
-            };
-        }
+}
+
+/// Everything the deadline governs: the pre-check, the arming, and the
+/// expiry.
+///
+/// The wait is INJECTED because this composition is the thing worth
+/// testing and the thing that cannot be spawned in a test. Reassembling
+/// `under_deadline` and `deadline_outcome` in a test body instead would
+/// leave BOTH production exits free to regress to silence while the
+/// test stayed green — which is exactly what an earlier version of
+/// these tests did.
+async fn await_wait_under_deadline<F>(
+    deadline: std::time::Instant,
+    on_deadline: DeadlineAction,
+    arm: impl FnOnce() -> Result<F, String>,
+) -> Result<std::process::Output, HookOutcome>
+where
+    F: std::future::Future<Output = std::io::Result<std::process::Output>>,
+{
+    // The RARER exit and the strictly worse one: it dies having done no
+    // waiting at all, so a setup slow near the boundary must not be
+    // what puts the agent to sleep. Short-circuits BEFORE arming.
+    if std::time::Instant::now() >= deadline {
+        return Err(deadline_outcome(on_deadline));
+    }
+
+    let waiting = match arm() {
+        Ok(f) => f,
+        Err(message) => return Err(HookOutcome::Diagnostic { message }),
     };
 
-    let mut cmd = wait_command(&exe, repo, label);
-
-    let owned = match OwnedWait::spawn(&mut cmd) {
-        Ok(w) => w,
-        Err(e) => return HookOutcome::Diagnostic { message: e },
-    };
-
-    // Expire BELOW the runner's ceiling, cleanly. Dropping `owned`
+    // Expire BELOW the runner's ceiling, cleanly. Dropping the future
     // closes the stdin pipe the wait treats as its owner sentinel, so
     // the child reaps itself — the deadline does not leak a wait, and
     // it does not mask owner death: whichever fires first ends the
     // same way.
     // Re-checked here by construction: the deadline is absolute, so
-    // the spawn above has already eaten into it.
-    let output = match under_deadline(owned.run(), deadline).await {
-        None => {
-            return HookOutcome::Silent {
-                why: SilentReason::PollDeadline,
-            };
-        }
-        Some(Ok(o)) => o,
-        Some(Err(e)) => {
-            return HookOutcome::Diagnostic {
-                message: format!("hook: waiting on wait failed: {e}"),
-            };
-        }
-    };
-
-    outcome_from_wait_output(&output, label, role, live_ids)
+    // the arming above has already eaten into it.
+    match under_deadline(waiting, deadline).await {
+        None => Err(deadline_outcome(on_deadline)),
+        Some(Ok(o)) => Ok(o),
+        Some(Err(e)) => Err(HookOutcome::Diagnostic {
+            message: format!("hook: waiting on wait failed: {e}"),
+        }),
+    }
 }
 
 // ── attending a background task (attending-suppresses-standing-wakes) ──
@@ -2437,18 +2524,152 @@ mod tests {
         );
     }
 
+    /// A wait that never resolves, driven through the PRODUCTION
+    /// composition rather than reassembled from its parts.
+    ///
+    /// The earlier version of this test called `under_deadline` and
+    /// `deadline_outcome` itself, which meant either production exit
+    /// could regress to silence with the test still green (codex on
+    /// 12d2e29). Going through `await_wait_under_deadline` is the
+    /// whole point: that function is where both exits live.
+    #[tokio::test(start_paused = true)]
+    async fn the_deadline_re_arms_except_where_a_continuation_would_spin() {
+        let arm = || Ok(std::future::pending::<std::io::Result<std::process::Output>>());
+
+        for tool in [Tool::Claude, Tool::Codex] {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            let got = await_wait_under_deadline(deadline, deadline_action(tool), arm).await;
+            assert!(
+                matches!(got, Err(HookOutcome::Continue { .. })),
+                "{tool:?} must re-arm at the deadline, got {got:?}"
+            );
+        }
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let got = await_wait_under_deadline(deadline, deadline_action(Tool::OpenCode), arm).await;
+        assert!(
+            matches!(
+                got,
+                Err(HookOutcome::Silent {
+                    why: SilentReason::PollDeadline
+                })
+            ),
+            "opencode injects on session.idle, so a continuation spins (codex 8000d6e)"
+        );
+    }
+
+    /// The pre-check exit: the deadline was already gone before
+    /// anything was armed. Rarer than the expiry and strictly worse —
+    /// it dies having done no waiting at all.
+    #[tokio::test(start_paused = true)]
+    async fn the_pre_check_exit_re_arms_without_arming_a_wait() {
+        let past = std::time::Instant::now() - std::time::Duration::from_secs(1);
+
+        let armed = std::cell::Cell::new(false);
+        let got = await_wait_under_deadline(past, DeadlineAction::ReArm, || {
+            armed.set(true);
+            Ok(std::future::pending::<std::io::Result<std::process::Output>>())
+        })
+        .await;
+        assert!(
+            matches!(got, Err(HookOutcome::Continue { .. })),
+            "the pre-check must re-arm too, got {got:?}"
+        );
+        assert!(
+            !armed.get(),
+            "it must short-circuit BEFORE arming — spawning a wait it cannot await leaks one"
+        );
+
+        let got = await_wait_under_deadline(past, DeadlineAction::Sleep, || {
+            Ok(std::future::pending::<std::io::Result<std::process::Output>>())
+        })
+        .await;
+        assert!(
+            matches!(
+                got,
+                Err(HookOutcome::Silent {
+                    why: SilentReason::PollDeadline
+                })
+            ),
+            "the sleeping adapters keep their old pre-check behaviour"
+        );
+    }
+
+    /// The heartbeat must never preempt real work.
+    #[tokio::test(start_paused = true)]
+    async fn work_arriving_before_the_deadline_survives_the_seam() {
+        use std::os::unix::process::ExitStatusExt;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+        let got = await_wait_under_deadline(deadline, DeadlineAction::ReArm, || {
+            Ok(async {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                Ok(std::process::Output {
+                    status: std::process::ExitStatus::from_raw(0),
+                    stdout: b"items".to_vec(),
+                    stderr: Vec::new(),
+                })
+            })
+        })
+        .await;
+        match got {
+            Ok(o) => assert_eq!(o.stdout, b"items"),
+            Err(outcome) => panic!("work must win over the heartbeat, got {outcome:?}"),
+        }
+    }
+
+    /// An agent that re-arms once and then sleeps is still gone, just
+    /// later — so renewal has to hold across periods.
+    #[tokio::test(start_paused = true)]
+    async fn consecutive_expiries_each_re_arm() {
+        for period in 0..2 {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            let got = await_wait_under_deadline(deadline, DeadlineAction::ReArm, || {
+                Ok(std::future::pending::<std::io::Result<std::process::Output>>())
+            })
+            .await;
+            assert!(
+                matches!(got, Err(HookOutcome::Continue { .. })),
+                "period {period} must re-arm, got {got:?}"
+            );
+        }
+    }
+
+    /// The heartbeat's WORDING is load-bearing, so it gets its own
+    /// regression: an agent woken with no items and no explanation
+    /// will look for a reason and usually invent one.
+    ///
+    /// Asserted on the reason the SEAM produces rather than on the
+    /// constant — a correct constant is worth nothing if the deadline
+    /// path stops using it.
+    #[tokio::test(start_paused = true)]
+    async fn the_re_arm_reason_cannot_be_mistaken_for_work() {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let got = await_wait_under_deadline(deadline, DeadlineAction::ReArm, || {
+            Ok(std::future::pending::<std::io::Result<std::process::Output>>())
+        })
+        .await;
+        let Err(HookOutcome::Continue { reason }) = got else {
+            panic!("the deadline must re-arm, got {got:?}");
+        };
+        let r = reason.to_lowercase();
+        assert!(
+            r.contains("no work"),
+            "must say nothing is pending: {reason}"
+        );
+        assert!(r.contains("re-arm"), "must name itself a re-arm: {reason}");
+        assert!(
+            r.contains("end your turn"),
+            "must say that ending the turn is the correct response: {reason}"
+        );
+    }
+
+    /// Adding an adapter must force an answer rather than inherit one.
     #[test]
-    fn expiry_is_silent_and_distinct_from_emptiness() {
-        // The user-visible bug was an idle looking like a FAILURE, so
-        // expiry must stay on the silent wire — and stay
-        // distinguishable from "there was nothing to wait for".
-        assert!(!matches!(
-            HookOutcome::Silent {
-                why: SilentReason::PollDeadline
-            },
-            HookOutcome::Diagnostic { .. }
-        ));
-        assert_ne!(SilentReason::PollDeadline, SilentReason::NoWork);
+    fn every_adapter_answers_the_deadline_question() {
+        assert_eq!(deadline_action(Tool::Claude), DeadlineAction::ReArm);
+        assert_eq!(deadline_action(Tool::Codex), DeadlineAction::ReArm);
+        assert_eq!(deadline_action(Tool::OpenCode), DeadlineAction::Sleep);
+        assert_eq!(deadline_action(Tool::Grok), DeadlineAction::Sleep);
     }
 
     #[test]
