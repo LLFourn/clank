@@ -211,28 +211,33 @@ const LEGACY_COMMAND_PREFIX: &str = "clank stop-hook";
 
 /// Per-tool hook timeout we write into the agent's hook config.
 ///
-/// Effectively NEVER, by design. A park waits for an UNBOUNDED event —
-/// work arriving — so any finite ceiling eventually fires on a repo
-/// that is merely quiet, and the agent it kills has no wake channel
-/// left and never runs again. At 86400 this repo's own codex reviewer
-/// went silent for 22 hours with a review waiting on it.
+/// The LARGEST value that does not WRAP: 24.9 days.
 ///
-/// `codex-idle-is-not-a-hook-failure` argued the value had stopped
-/// mattering because the poll was made to expire cleanly just below
-/// it. That covered the BANNER, not the agent: a clean expiry and a
-/// kill both end the turn with nothing armed, so only the cosmetics
-/// differed and the ceiling stayed the terminator.
+/// This field is in SECONDS. The runner converts it to MILLISECONDS
+/// for a timer whose delay is a signed 32-bit int, capped at
+/// 2147483647 ms; past that it wraps and fires on the next tick. So
+/// `i32::MAX` LOOKED safely inside a 32-bit range while being a
+/// thousandfold past it — 2147483647 s is 2147483647000 ms — and
+/// every parked hook was cancelled within a second of starting.
+/// Asking for a ceiling that never fires produced one that always
+/// did.
 ///
-/// Not dropped, either — absent the field each runner applies its own
-/// default, and claude documents 600s for a `command` hook, which
-/// would cut a legitimate park far shorter. The field does real work;
-/// it needed a bigger number, not deletion.
+/// The timeout cannot be escaped: `asyncRewake` is the only hook mode
+/// that wakes on exit 2, and it is always subject to this field
+/// (`async: true` is exempt but has no wake). Nor can the field be
+/// dropped — absent it each runner applies its own default, and
+/// claude documents 600s for a `command` hook, which would cut a
+/// legitimate park far shorter. It is load-bearing, so it has to be
+/// right.
 ///
-/// `i32::MAX` rather than `u64::MAX`: neither runner documents a
-/// maximum, so this is a judgement about what a parser will accept —
-/// a signed 32-bit field is the plausible limit — not a discovered
-/// bound.
-pub(crate) const HOOK_TIMEOUT_SECS: u64 = i32::MAX as u64;
+/// Not the old 86400 either: that ceiling was genuinely reached,
+/// silencing this repo's codex reviewer for 22 hours with a review
+/// waiting. Raising it was correct; the VALUE was wrong.
+///
+/// 24.9 days is still a cliff, just a rare one — an agent idle past it
+/// is left with no park. Removing the cliff needs the poll to re-arm
+/// rather than expire, which is its own plan.
+pub(crate) const HOOK_TIMEOUT_SECS: u64 = 2_147_483;
 
 /// The per-tool user-scope skill dirs. Grok dedupes its claude-compat
 /// scan native-first (grok-first-class P3), so native copies win

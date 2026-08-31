@@ -2321,26 +2321,42 @@ mod tests {
         );
     }
 
-    /// The ceiling must be UNREACHABLE, not merely generous. A park
-    /// waits for an unbounded event, so any ceiling a running machine
-    /// can reach eventually fires on a repo that is only quiet, and
-    /// kills an agent that had nothing wrong with it. At 86400 this
-    /// repo's codex reviewer went silent for 22 hours.
+    /// The ceiling is the largest value that does not WRAP.
     ///
-    /// The arithmetic is asserted, not reasoned about: `Instant::add`
-    /// PANICS on overflow, so raising this to `u64::MAX` would take
-    /// the hook down instead of extending it.
+    /// This test used to assert the opposite — that the ceiling was
+    /// unreachable by a running machine, `> 50 years` — and that
+    /// aspiration IS what produced the bug. The field is in seconds
+    /// and the timer's cap is in milliseconds, so `i32::MAX` seconds
+    /// satisfied a 32-bit intuition while being a thousandfold past
+    /// the limit: it wrapped, fired on the next tick, and cancelled
+    /// every parked hook sub-second. The assertion stayed green
+    /// throughout, because it was checking the ambition rather than
+    /// the arithmetic.
+    ///
+    /// So assert in MILLISECONDS, where the limit actually lives and
+    /// where seconds-based reasoning went wrong.
     #[test]
-    fn the_ceiling_cannot_be_reached_by_a_running_machine() {
-        const YEAR: f64 = 365.25 * 24.0 * 3600.0;
-        let years = crate::cli::setup::HOOK_TIMEOUT_SECS as f64 / YEAR;
-        assert!(years > 50.0, "a {years:.1}-year ceiling is reachable");
-
-        let started = std::time::Instant::now();
-        let deadline = poll_deadline(started);
+    fn the_ceiling_is_the_largest_value_that_does_not_wrap() {
+        /// The signed-32-bit cap on the runner's timer delay.
+        const MAX_TIMER_MS: u64 = 2_147_483_647;
+        let secs = crate::cli::setup::HOOK_TIMEOUT_SECS;
         assert!(
-            deadline.duration_since(started).as_secs_f64() / YEAR > 50.0,
-            "and the derived deadline must be just as far out"
+            secs * 1_000 <= MAX_TIMER_MS,
+            "{secs}s is {}ms, past the {MAX_TIMER_MS}ms cap — it would wrap and fire at once",
+            secs * 1_000
+        );
+        // And genuinely the LARGEST: one more second overflows. Pinned
+        // from both sides so the value cannot quietly drift down.
+        assert!(
+            (secs + 1) * 1_000 > MAX_TIMER_MS,
+            "a higher value still fits, so this is not the maximum"
+        );
+
+        // The arithmetic the hook performs must stay sound at it.
+        let started = std::time::Instant::now();
+        assert!(
+            poll_deadline(started) > started,
+            "the derived deadline is still in the future"
         );
     }
 
