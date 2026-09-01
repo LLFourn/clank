@@ -1115,6 +1115,20 @@ struct AnchorChoice {
     /// anchor from the CURRENT roster, so the caller has to carry the
     /// id over itself.
     report: Option<String>,
+    /// Whether a new pane may be born directly into the anchor's
+    /// stack — true ONLY for an exact-command current reviewer whose
+    /// column is verified to hold nothing else.
+    ///
+    /// Deliberately much narrower than "the anchor looks like a
+    /// reviewer". Joining a stack is IRREVERSIBLE: `stack-panes` can
+    /// only build a stack, never take a pane out of one (measured,
+    /// `status_tui/zellij.rs`). So every anchor whose stack cannot be
+    /// PROVEN clean — the caller pane, a title match that admits
+    /// hand-titled false positives, a departing reviewer, or a column
+    /// already contaminated by the instrument pane — keeps the
+    /// recoverable create-then-`stack-panes` path, where the cost of
+    /// being wrong stays one misplaced pane (codex on 5f29616).
+    stackable: bool,
 }
 
 /// Pick the anchor for a pane about to be created, in descending order
@@ -1140,6 +1154,7 @@ fn select_anchor(
         return AnchorChoice {
             focus: Some(p.pane_id()),
             report: None,
+            stackable: stack_is_clean(panes, p, current_cmds),
         };
     }
     let reported = find_anchor_pane(panes, departing_cmds)
@@ -1153,9 +1168,139 @@ fn select_anchor(
                 .map(ZellijPane::pane_id)
         });
     AnchorChoice {
+        // Every anchor below the exact-command match is unproven: a
+        // title match accepts hand-titled false positives, a departing
+        // reviewer is on its way out, and the caller fallback is a tab
+        // hint rather than a stack. None may be joined irreversibly.
+        stackable: false,
         focus: reported.clone().or(caller),
         report: reported,
     }
+}
+
+/// Two panes in the same column span of the same tab.
+fn same_column(a: &ZellijPane, b: &ZellijPane) -> bool {
+    a.tab_id == b.tab_id && a.pane_x == b.pane_x && a.pane_columns == b.pane_columns
+}
+
+/// Full placement identity. `tab_id` FIRST: identical coordinates in
+/// two different tabs are two panes, not one stack.
+fn pane_geom(p: &ZellijPane) -> (u32, u16, u16, u16, u16) {
+    (p.tab_id, p.pane_x, p.pane_y, p.pane_columns, p.pane_rows)
+}
+
+/// Whether two panes are members of the SAME zellij stack.
+///
+/// Same-column ABUTMENT is the normal layout, not a stack: the
+/// instrument pane sits directly under the reviewer region by design
+/// (`agent_group_kdl`). What marks a true sibling is the collapse to a
+/// single title row, or identical geometry. Reading the whole column
+/// as the stack made the healthy landscape tab look contaminated and
+/// disabled the fast path exactly where the jump shows (codex on
+/// ed9fc0e).
+fn same_stack(a: &ZellijPane, b: &ZellijPane) -> bool {
+    pane_geom(a) == pane_geom(b)
+        || (same_column(a, b)
+            && (a.pane_rows == 1 || b.pane_rows == 1)
+            && (a.pane_y + a.pane_rows == b.pane_y || b.pane_y + b.pane_rows == a.pane_y))
+}
+
+/// The extent of a reviewer set that forms ONE stack.
+enum StackSpan {
+    /// Every member reports the whole stack area.
+    Identical,
+    /// One expanded member plus one-row title bars, tiling a
+    /// contiguous run in one column: rows `[top, bottom)`.
+    Run { top: u16, bottom: u16 },
+}
+
+/// Prove `mine` is a single stack and describe its extent.
+///
+/// `None` when they are not one stack — a drifted or unmeasurable
+/// arrangement claims no span, so callers fail CLOSED.
+fn reviewer_stack_span(mine: &[&ZellijPane]) -> Option<StackSpan> {
+    let first = mine.first()?;
+    // Every geometry field is `#[serde(default)]`, so an absent one
+    // reads as 0 — and all-zero panes compare IDENTICAL, which would
+    // report a stack we never saw (codex on 7b3536c).
+    if mine.iter().any(|p| p.pane_columns == 0 || p.pane_rows == 0) {
+        return None;
+    }
+    if mine.iter().all(|p| pane_geom(p) == pane_geom(first)) {
+        return Some(StackSpan::Identical);
+    }
+    let one_column = mine.iter().all(|p| same_column(p, first));
+    // Exactly one expanded AND every other member exactly one row —
+    // the captured shape. "Not expanded" would admit a zero-row pane,
+    // which also satisfies the contiguity equation below.
+    let one_expanded = mine.iter().filter(|p| p.pane_rows > 1).count() == 1;
+    let rest_collapsed = mine.iter().filter(|p| p.pane_rows == 1).count() == mine.len() - 1;
+    let mut rows: Vec<(u16, u16)> = mine.iter().map(|p| (p.pane_y, p.pane_rows)).collect();
+    rows.sort();
+    let contiguous = rows.windows(2).all(|w| w[0].0 + w[0].1 == w[1].0);
+    (one_column && one_expanded && rest_collapsed && contiguous).then(|| StackSpan::Run {
+        top: rows[0].0,
+        bottom: rows[rows.len() - 1].0 + rows[rows.len() - 1].1,
+    })
+}
+
+/// Whether `foreign` is a MEMBER of the stack `span` describes.
+///
+/// A tile beginning exactly at the run's bottom is OUTSIDE. That is
+/// the healthy instrument pane: it abuts the reviewer stack in every
+/// landscape tab without joining it, which is why adjacency alone can
+/// never decide membership (codex on 1e57467).
+fn inside_stack(foreign: &ZellijPane, first: &ZellijPane, span: &StackSpan) -> bool {
+    match span {
+        StackSpan::Identical => pane_geom(foreign) == pane_geom(first),
+        StackSpan::Run { top, bottom } => {
+            same_column(foreign, first) && foreign.pane_y >= *top && foreign.pane_y < *bottom
+        }
+    }
+}
+
+/// Whether the anchor's STACK holds only current reviewers of this
+/// repo.
+///
+/// The question is MEMBERSHIP, not neighbourhood, and membership is a
+/// property of the reviewer SET rather than of any pair. A healthy
+/// landscape tab has the full-height instrument pane starting exactly
+/// at the reviewer run's bottom: adjacent to the last collapsed
+/// reviewer, and not in the stack. Deciding by adjacency — even
+/// transitively — walks straight across that boundary and refuses the
+/// fast path in the normal multi-reviewer shape (codex on 1e57467).
+///
+/// So the reviewer set must first be PROVEN to be one stack, and only
+/// panes inside that proven extent count as members. An arrangement
+/// that proves nothing is not clean.
+fn stack_is_clean(panes: &[ZellijPane], anchor: &ZellijPane, current_cmds: &[String]) -> bool {
+    if anchor.pane_columns == 0 || anchor.pane_rows == 0 {
+        return false;
+    }
+    let is_current_reviewer = |p: &ZellijPane| {
+        !p.is_plugin
+            && p.terminal_command
+                .as_deref()
+                .is_some_and(|c| current_cmds.iter().any(|x| x == c))
+    };
+    let tab: Vec<&ZellijPane> = panes.iter().filter(|p| p.tab_id == anchor.tab_id).collect();
+    let mine: Vec<&ZellijPane> = tab
+        .iter()
+        .copied()
+        .filter(|p| is_current_reviewer(p))
+        .collect();
+    let foreign = || tab.iter().copied().filter(|p| !is_current_reviewer(p));
+
+    // The anchor alone: no stack of its own yet, so the only question
+    // is whether anything else already shares one with it.
+    if mine.len() <= 1 {
+        return !foreign().any(|p| same_stack(p, anchor));
+    }
+    let Some(span) = reviewer_stack_span(&mine) else {
+        return false;
+    };
+    let first = mine[0];
+    !foreign().any(|p| inside_stack(p, first, &span))
 }
 
 /// What [`add_reviewer_pane`] made, and what it leaned on to place it.
@@ -1184,6 +1329,46 @@ pub(crate) struct ReviewerPaneAdd {
 fn caller_pane_id() -> Option<String> {
     let id = std::env::var("ZELLIJ_PANE_ID").ok()?;
     (!id.is_empty()).then(|| format!("terminal_{id}"))
+}
+
+/// Whether `new-pane` can place a pane INTO a stack as it creates it.
+///
+/// Probed from the help TEXT, not the exit status: `new-pane` exists on
+/// every client, so its exit code distinguishes nothing — only the flag
+/// list does. Not from `--version` either, for the reason
+/// [`placement_capability`] gives.
+///
+/// This probe matters more than the arrangement it buys. zellij's
+/// parser REJECTS an unknown flag, so guessing wrong does not misplace
+/// the pane — it fails `new-pane` outright and the reviewer never
+/// spawns at all, which is far worse than the visible jump this
+/// removes.
+fn new_pane_can_stack() -> bool {
+    std::process::Command::new("zellij")
+        .args(["action", "new-pane", "--help"])
+        .output()
+        .is_ok_and(|o| {
+            o.status.success() && String::from_utf8_lossy(&o.stdout).contains("--stacked")
+        })
+}
+
+/// The `new-pane` argv, split out so the placement decision is
+/// assertable without spawning a zellij.
+fn new_pane_argv(label: &str, repo: &str, stacked: bool) -> Vec<String> {
+    let mut argv = vec!["new-pane".to_string()];
+    if stacked {
+        argv.push("--stacked".to_string());
+    }
+    argv.extend([
+        "--name".to_string(),
+        agent_pane_title(label, "reviewer"),
+        "--cwd".to_string(),
+        repo.to_string(),
+        "--".to_string(),
+        "clank".to_string(),
+    ]);
+    argv.extend(agent_start_argv(label, repo));
+    argv
 }
 
 /// What the INSTALLED zellij client can do about pane placement.
@@ -1268,13 +1453,24 @@ fn tab_dims(panes: &[ZellijPane], tab_id: u32) -> (u16, u16) {
 /// and a one-element set (codex on 2d273c6). Returning the created id
 /// lets the caller accumulate what this pass actually made.
 ///
-/// Placement is by pane id via `zellij action stack-panes` — never by
-/// `new-pane --stacked` onto whatever is focused. That focus-dependence is how the instrument pane ended up
-/// inside the reviewer stack: with no reviewer anchor the old code
-/// focused the caller, and a roster add is issued FROM the status
-/// TUI, so the caller IS the status pane. Naming the reviewer ids
-/// explicitly makes the instrument pane unstackable by construction —
-/// it is simply never in the list (zellij-pane-placement-and-cost).
+/// Placement is by pane id via `zellij action stack-panes`, NOT by
+/// `new-pane --stacked` onto whatever is focused. That
+/// focus-dependence is how the instrument pane ended up inside the
+/// reviewer stack: with no reviewer anchor the old code focused the
+/// caller, and a roster add is issued FROM the status TUI, so the
+/// caller IS the status pane. Naming the reviewer ids explicitly makes
+/// the instrument pane unstackable by construction — it is simply
+/// never in the list (zellij-pane-placement-and-cost).
+///
+/// ONE exception, and it does not reopen that hole. When the anchor is
+/// an exact-command CURRENT reviewer AND its column is verified to
+/// hold nothing else ([`stack_is_clean`]), the pane is born stacked so
+/// it never appears loose and jumps. The old bug was stacking onto an
+/// UNVERIFIED focus; here the focus is proven to be a clean reviewer
+/// column from the same pass-start listing, and every unproven anchor
+/// still takes the explicit-id path. This matters because joining a
+/// stack cannot be undone — so the fast path must be provably right,
+/// not merely likely.
 ///
 /// Measured properties of `stack-panes` this relies on: running
 /// processes survive it, panes outside the id list are untouched, and
@@ -1309,16 +1505,10 @@ pub(crate) fn add_reviewer_pane(
         zellij_action(&["focus-pane-id", id]);
     }
 
-    let mut new_pane: Vec<String> = vec![
-        "new-pane".to_string(),
-        "--name".to_string(),
-        agent_pane_title(label, "reviewer"),
-        "--cwd".to_string(),
-        repo_str.to_string(),
-        "--".to_string(),
-        "clank".to_string(),
-    ];
-    new_pane.extend(agent_start_argv(label, &repo_str));
+    // Born in the stack rather than created loose and moved: the move
+    // is a SECOND action, and zellij has already drawn the pane in its
+    // default spot before it lands.
+    let new_pane = new_pane_argv(label, &repo_str, choice.stackable && new_pane_can_stack());
     let refs: Vec<&str> = new_pane.iter().map(String::as_str).collect();
     let Some(out) = zellij_action(&refs) else {
         return ReviewerPaneAdd::default();
@@ -1427,67 +1617,17 @@ pub(crate) fn reviewers_are_stacked(
         .iter()
         .filter(|p| !p.is_plugin && p.terminal_command.as_deref() == Some(status_command.as_str()))
         .collect();
-    let same_column = |a: &ZellijPane, b: &ZellijPane| {
-        a.tab_id == b.tab_id && a.pane_x == b.pane_x && a.pane_columns == b.pane_columns
-    };
-    // `tab_id` FIRST: identical coordinates in two different tabs are
-    // two panes, not one stack. `list-panes` spans all tabs, so
-    // leaving it out let a cross-tab pair read as placed.
-    let geom = |p: &ZellijPane| (p.tab_id, p.pane_x, p.pane_y, p.pane_columns, p.pane_rows);
-    // Two panes in one column span are stack SIBLINGS when they abut
-    // and either is collapsed to a title row. Abutting alone is the
-    // NORMAL layout — the instrument pane sits directly under the
-    // reviewer region — so the collapse is what distinguishes them.
-    let stacked_with = |a: &ZellijPane, b: &ZellijPane| {
-        same_column(a, b)
-            && (a.pane_rows == 1 || b.pane_rows == 1)
-            && (a.pane_y + a.pane_rows == b.pane_y || b.pane_y + b.pane_rows == a.pane_y)
-    };
-
     // A lone reviewer forms no stack of its own; the only question is
     // whether the instrument pane shares one WITH it — the reported
     // bug's first-reviewer form, in either shape.
     if mine.len() == 1 {
-        return !statuses
-            .iter()
-            .any(|st| geom(st) == geom(first) || stacked_with(st, first));
+        return !statuses.iter().any(|st| same_stack(st, first));
     }
-
-    // Every geometry field is `#[serde(default)]`, so an absent one
-    // reads as 0 — and all-zero panes compare IDENTICAL, which would
-    // report a stack we never saw and cache it. A listing we cannot
-    // measure must fail CLOSED (codex on 7b3536c).
-    if mine.iter().any(|p| p.pane_columns == 0 || p.pane_rows == 0) {
+    let Some(span) = reviewer_stack_span(&mine) else {
         return false;
-    }
-    let all_identical = mine.iter().all(|p| geom(p) == geom(first));
-    let run_shaped = {
-        let one_column = mine.iter().all(|p| same_column(p, first));
-        // Exactly one expanded AND every other member exactly one row
-        // — the captured shape. "Not expanded" would admit a zero-row
-        // pane, which also satisfies the contiguity equation below.
-        let one_expanded = mine.iter().filter(|p| p.pane_rows > 1).count() == 1;
-        let rest_collapsed = mine.iter().filter(|p| p.pane_rows == 1).count() == mine.len() - 1;
-        let mut rows: Vec<(u16, u16)> = mine.iter().map(|p| (p.pane_y, p.pane_rows)).collect();
-        rows.sort();
-        let contiguous = rows.windows(2).all(|w| w[0].0 + w[0].1 == w[1].0);
-        one_column && one_expanded && rest_collapsed && contiguous
     };
-    if !all_identical && !run_shaped {
-        return false;
-    }
-
     // The instrument pane must not be a MEMBER of that stack.
-    if all_identical {
-        return !statuses.iter().any(|st| geom(st) == geom(first));
-    }
-    let mut rows: Vec<(u16, u16)> = mine.iter().map(|p| (p.pane_y, p.pane_rows)).collect();
-    rows.sort();
-    let top = rows[0].0;
-    let bottom = rows[rows.len() - 1].0 + rows[rows.len() - 1].1;
-    !statuses
-        .iter()
-        .any(|st| same_column(st, first) && st.pane_y >= top && st.pane_y < bottom)
+    !statuses.iter().any(|st| inside_stack(st, first, &span))
 }
 
 /// Best-effort: close the panes of removed reviewers, matched by exact
@@ -2794,6 +2934,13 @@ ttys004   zellij attach clank-foo
         // `stack` names members by command against the current roster,
         // so it finds this one on its own.
         assert_eq!(c.report, None);
+        // This fixture carries no geometry, so the column cannot be
+        // PROVEN clean and the fast path is refused. Unverifiable is
+        // not the same as safe.
+        assert!(
+            !c.stackable,
+            "an unverifiable column takes the recoverable path"
+        );
     }
 
     #[test]
@@ -2853,6 +3000,205 @@ ttys004   zellij attach clank-foo
         // enter the stack set.
         assert_eq!(c.focus.as_deref(), Some("terminal_151"));
         assert_eq!(c.report, None);
+        assert!(
+            !c.stackable,
+            "focusing the caller is a tab hint, not a stack — `--stacked` here \
+             would put a reviewer into the status pane's stack"
+        );
+    }
+
+    /// Negative eligibility: a reported anchor is a reviewer by SHAPE,
+    /// which is not the same as a stack that can be safely joined.
+    ///
+    /// A departing reviewer is on its way out and a title match admits
+    /// hand-titled false positives. Their old cost was one misplaced
+    /// pane, recoverable by `stack-panes`; joining them with
+    /// `--stacked` is not recoverable at all.
+    #[test]
+    fn a_reported_anchor_is_never_joined_at_creation() {
+        let panes = parse_panes();
+        let c = select_anchor(
+            &panes,
+            &[agent_start_command("nobody", "/a")],
+            &[agent_start_command("gone", "/a")],
+            Some("terminal_0".to_string()),
+        );
+        assert!(
+            c.report.is_some(),
+            "the fixture must yield a departing anchor"
+        );
+        assert!(
+            !c.stackable,
+            "a departing anchor is not a proven-clean stack"
+        );
+    }
+
+    /// The HEALTHY LANDSCAPE shape: the reviewer region and the
+    /// instrument pane share the 35% column, with status as a
+    /// full-height tile directly below. This is `agent_group_kdl`'s
+    /// normal output, and it must be joinable — reading the column as
+    /// the stack made exactly this case look contaminated.
+    const LANDSCAPE_HEALTHY_JSON: &str = r#"[
+      {"id":40,"is_plugin":false,"title":"claude (master)","terminal_command":"clank agent start claude --repo /a","tab_id":6,"pane_x":0,"pane_columns":100,"pane_y":0,"pane_rows":40},
+      {"id":41,"is_plugin":false,"title":"codex (reviewer)","terminal_command":"clank agent start codex --repo /a","tab_id":6,"pane_x":100,"pane_columns":60,"pane_y":0,"pane_rows":20},
+      {"id":42,"is_plugin":false,"title":"status","terminal_command":"clank status --repo /a --tui","tab_id":6,"pane_x":100,"pane_columns":60,"pane_y":20,"pane_rows":20}
+    ]"#;
+
+    /// The PORTRAIT shape: status sits beside the reviewers, in its
+    /// own column.
+    const PORTRAIT_HEALTHY_JSON: &str = r#"[
+      {"id":10,"is_plugin":false,"title":"status","terminal_command":"clank status --repo /a --tui","tab_id":3,"pane_x":0,"pane_columns":40,"pane_y":20,"pane_rows":20},
+      {"id":11,"is_plugin":false,"title":"codex (reviewer)","terminal_command":"clank agent start codex --repo /a","tab_id":3,"pane_x":40,"pane_columns":60,"pane_y":20,"pane_rows":20}
+    ]"#;
+
+    /// The known-broken geometry: status is an actual stack SIBLING,
+    /// collapsed to a title row and abutting the reviewer. Not merely
+    /// another tile in the column — that is the healthy shape above.
+    const CONTAMINATED_STACK_JSON: &str = r#"[
+      {"id":20,"is_plugin":false,"title":"codex (reviewer)","terminal_command":"clank agent start codex --repo /a","tab_id":4,"pane_x":40,"pane_columns":60,"pane_y":0,"pane_rows":19},
+      {"id":21,"is_plugin":false,"title":"status","terminal_command":"clank status --repo /a --tui","tab_id":4,"pane_x":40,"pane_columns":60,"pane_y":19,"pane_rows":1}
+    ]"#;
+
+    /// The MULTI-REVIEWER landscape, which is the normal shape once a
+    /// second reviewer exists: one expanded, the rest collapsed to
+    /// title rows, and the full-height instrument pane starting
+    /// exactly at the run's bottom.
+    ///
+    /// The last collapsed reviewer ABUTS status, so any adjacency-based
+    /// membership test walks into it and refuses the fast path here.
+    const LANDSCAPE_MULTI_HEALTHY_JSON: &str = r#"[
+      {"id":60,"is_plugin":false,"title":"codex (reviewer)","terminal_command":"clank agent start codex --repo /a","tab_id":8,"pane_x":100,"pane_columns":60,"pane_y":0,"pane_rows":18},
+      {"id":61,"is_plugin":false,"title":"ruthless (reviewer)","terminal_command":"clank agent start ruthless --repo /a","tab_id":8,"pane_x":100,"pane_columns":60,"pane_y":18,"pane_rows":1},
+      {"id":62,"is_plugin":false,"title":"status","terminal_command":"clank status --repo /a --tui","tab_id":8,"pane_x":100,"pane_columns":60,"pane_y":19,"pane_rows":21}
+    ]"#;
+
+    /// The IDENTICAL-geometry stack shape with the instrument pane as
+    /// a member — every pane reports the whole stack area.
+    const IDENTICAL_CONTAMINATED_JSON: &str = r#"[
+      {"id":70,"is_plugin":false,"title":"codex (reviewer)","terminal_command":"clank agent start codex --repo /a","tab_id":9,"pane_x":40,"pane_columns":60,"pane_y":0,"pane_rows":20},
+      {"id":71,"is_plugin":false,"title":"ruthless (reviewer)","terminal_command":"clank agent start ruthless --repo /a","tab_id":9,"pane_x":40,"pane_columns":60,"pane_y":0,"pane_rows":20},
+      {"id":72,"is_plugin":false,"title":"status","terminal_command":"clank status --repo /a --tui","tab_id":9,"pane_x":40,"pane_columns":60,"pane_y":0,"pane_rows":20}
+    ]"#;
+
+    /// Status INTERLEAVED between two reviewers, which shows up as the
+    /// reviewer rows no longer tiling contiguously.
+    const INTERLEAVED_CONTAMINATED_JSON: &str = r#"[
+      {"id":80,"is_plugin":false,"title":"codex (reviewer)","terminal_command":"clank agent start codex --repo /a","tab_id":10,"pane_x":40,"pane_columns":60,"pane_y":0,"pane_rows":1},
+      {"id":81,"is_plugin":false,"title":"status","terminal_command":"clank status --repo /a --tui","tab_id":10,"pane_x":40,"pane_columns":60,"pane_y":1,"pane_rows":1},
+      {"id":82,"is_plugin":false,"title":"ruthless (reviewer)","terminal_command":"clank agent start ruthless --repo /a","tab_id":10,"pane_x":40,"pane_columns":60,"pane_y":2,"pane_rows":18}
+    ]"#;
+
+    fn codex_and_ruthless() -> [String; 2] {
+        [
+            agent_start_command("codex", "/a"),
+            agent_start_command("ruthless", "/a"),
+        ]
+    }
+
+    #[test]
+    fn the_multi_reviewer_landscape_stack_may_be_joined_at_creation() {
+        let panes: Vec<ZellijPane> = serde_json::from_str(LANDSCAPE_MULTI_HEALTHY_JSON).unwrap();
+        let c = select_anchor(&panes, &codex_and_ruthless(), &[], None);
+        assert_eq!(c.focus.as_deref(), Some("terminal_60"));
+        // The premise: the last collapsed reviewer really does abut
+        // status, so this only passes because membership is decided by
+        // the proven run and not by adjacency.
+        assert!(
+            same_stack(&panes[2], &panes[1]),
+            "the fixture must abut status to the last collapsed reviewer"
+        );
+        assert!(
+            c.stackable,
+            "status begins AT the run's bottom, which is outside it — this is every landscape \
+             tab with two reviewers"
+        );
+    }
+
+    #[test]
+    fn an_instrument_pane_sharing_the_stack_area_forbids_the_fast_path() {
+        let panes: Vec<ZellijPane> = serde_json::from_str(IDENTICAL_CONTAMINATED_JSON).unwrap();
+        let c = select_anchor(&panes, &codex_and_ruthless(), &[], None);
+        assert_eq!(c.focus.as_deref(), Some("terminal_70"));
+        assert!(
+            !c.stackable,
+            "identical geometry IS the stack, and status reports it too"
+        );
+    }
+
+    #[test]
+    fn an_interleaved_instrument_pane_forbids_the_fast_path() {
+        let panes: Vec<ZellijPane> = serde_json::from_str(INTERLEAVED_CONTAMINATED_JSON).unwrap();
+        let c = select_anchor(&panes, &codex_and_ruthless(), &[], None);
+        assert_eq!(c.focus.as_deref(), Some("terminal_80"));
+        assert!(
+            !c.stackable,
+            "something sits between the reviewers, so their rows no longer tile and no span can \
+             be proven"
+        );
+    }
+
+    #[test]
+    fn the_healthy_landscape_stack_may_be_joined_at_creation() {
+        let panes: Vec<ZellijPane> = serde_json::from_str(LANDSCAPE_HEALTHY_JSON).unwrap();
+        let c = select_anchor(&panes, &[agent_start_command("codex", "/a")], &[], None);
+        assert_eq!(c.focus.as_deref(), Some("terminal_41"));
+        assert!(
+            c.stackable,
+            "status ABUTS the reviewer region in every landscape tab — abutting is the layout, \
+             not a stack, and refusing here disables the fix where the jump actually shows"
+        );
+    }
+
+    #[test]
+    fn the_healthy_portrait_stack_may_be_joined_at_creation() {
+        let panes: Vec<ZellijPane> = serde_json::from_str(PORTRAIT_HEALTHY_JSON).unwrap();
+        let c = select_anchor(&panes, &[agent_start_command("codex", "/a")], &[], None);
+        assert_eq!(c.focus.as_deref(), Some("terminal_11"));
+        assert!(c.stackable, "status in its own column is no sibling at all");
+    }
+
+    /// The exact-command anchor is NOT sufficient on its own.
+    #[test]
+    fn an_instrument_pane_inside_the_stack_forbids_the_fast_path() {
+        let panes: Vec<ZellijPane> = serde_json::from_str(CONTAMINATED_STACK_JSON).unwrap();
+        let c = select_anchor(&panes, &[agent_start_command("codex", "/a")], &[], None);
+        assert_eq!(
+            c.focus.as_deref(),
+            Some("terminal_20"),
+            "still the anchor for the tab"
+        );
+        assert!(
+            !c.stackable,
+            "status collapsed to a title row and abutting IS a stack member, and joining it \
+             cannot be undone"
+        );
+    }
+
+    /// The pane is born in the stack instead of being created loose and
+    /// moved — the move is a second action, and zellij draws the pane
+    /// in its default spot before it lands.
+    #[test]
+    fn new_pane_is_born_stacked_only_when_there_is_a_stack() {
+        let with = new_pane_argv("ruthless", "/repo", true);
+        assert!(
+            with.iter().any(|a| a == "--stacked"),
+            "an anchored pane joins the stack at creation: {with:?}"
+        );
+        // Order matters to clap: flags precede the `--` separator.
+        let sep = with.iter().position(|a| a == "--").unwrap();
+        let flag = with.iter().position(|a| a == "--stacked").unwrap();
+        assert!(flag < sep, "the flag must sit before `--`: {with:?}");
+
+        let without = new_pane_argv("ruthless", "/repo", false);
+        assert!(
+            !without.iter().any(|a| a == "--stacked"),
+            "with no stack to join, the flag is a guess about layout: {without:?}"
+        );
+        // The unstacked form is EXACTLY what shipped before, so an old
+        // client falls back to today's behaviour rather than to a
+        // `new-pane` its parser rejects.
+        assert_eq!(without[0], "new-pane");
+        assert_eq!(without[1], "--name");
     }
 
     #[test]
