@@ -107,14 +107,14 @@ pub(super) fn render_at(
 
     // Picker/detail/confirm modes are DEDICATED full screens — they
     // replace the normal bar/gauges/log layout while open.
-    if let Mode::AddPicker { sel } = mode {
-        return render_add_screen(picker, rows, cols, sel);
+    if let Mode::AddPicker { sel, tier } = mode {
+        return render_add_screen(picker, rows, cols, sel, tier);
     }
     if let Mode::SwapPicker { out, sel } = mode {
         // A stale `out` falls through to the panel, as the detail page
         // does; the loop's Refresh moves the mode off next tick.
         if let Some(agent) = snap.agents.get(out) {
-            return render_candidate_screen(picker, rows, cols, sel, Some(&agent.label));
+            return render_candidate_screen(picker, rows, cols, sel, Some(&agent.label), None);
         }
     }
     // (A stale `idx` — roster shrank under us — falls through to the
@@ -1079,8 +1079,9 @@ pub(super) fn render_add_screen(
     rows: usize,
     cols: usize,
     sel: usize,
+    tier: crate::cli::teams_config::ReviewKind,
 ) -> (Vec<String>, usize) {
-    render_candidate_screen(picker, rows, cols, sel, None)
+    render_candidate_screen(picker, rows, cols, sel, None, Some(tier))
 }
 
 /// The candidate list, framed by what choosing one will DO.
@@ -1094,6 +1095,9 @@ pub(super) fn render_candidate_screen(
     cols: usize,
     sel: usize,
     swapping_out: Option<&str>,
+    // `None` when swapping: the incoming agent takes the outgoing
+    // one's place, so there is no tier to choose here.
+    tier: Option<crate::cli::teams_config::ReviewKind>,
 ) -> (Vec<String>, usize) {
     let (title, verb) = match swapping_out {
         Some(out) => (format!("swap out {out}"), "swap in"),
@@ -1137,8 +1141,12 @@ pub(super) fn render_candidate_screen(
         out.push(String::new());
     }
     if out.len() < rows {
+        let tier_hint = match tier {
+            Some(t) => format!(" · ←→ tier: {}", tier_label(t.into())),
+            None => String::new(),
+        };
         out.push(emit(
-            &[dim(format!("  ↑↓ move · ⏎ {verb} · Esc cancel"))],
+            &[dim(format!("  ↑↓ move{tier_hint} · ⏎ {verb} · Esc cancel"))],
             "",
             cols,
         ));
@@ -1992,9 +2000,9 @@ pub(super) fn render_roster_confirm(
         // Rendered by `render_kill_confirm`, which needs the wait
         // record rather than the roster.
         ConfirmAction::KillAttended => return (Vec::new(), 0),
-        ConfirmAction::AddCandidate { idx } => picker
+        ConfirmAction::AddCandidate { idx, tier } => picker
             .get(idx)
-            .map(|c| format!("{} [{}]", c.label, c.tool))
+            .map(|c| format!("{} [{}] as {}", c.label, c.tool, tier_label(tier.into())))
             .unwrap_or_else(|| "?".to_string()),
         ConfirmAction::RemoveAgent { idx } => snap
             .agents
@@ -3884,7 +3892,10 @@ mod tests {
                 event_page: None,
                 wait_page: None,
                 plan_input: None,
-                mode: Mode::AddPicker { sel: 0 },
+                mode: Mode::AddPicker {
+                    sel: 0,
+                    tier: crate::cli::teams_config::ReviewKind::Commit,
+                },
                 picker: &picker,
                 log_cursor: 0,
                 lift: 0,
@@ -3928,7 +3939,10 @@ mod tests {
             event_page: None,
             wait_page: None,
             plan_input: None,
-            mode: Mode::AddPicker { sel: 0 },
+            mode: Mode::AddPicker {
+                sel: 0,
+                tier: crate::cli::teams_config::ReviewKind::Commit,
+            },
             picker: &picker,
             log_cursor: 0,
             lift: 0,
@@ -3966,7 +3980,10 @@ mod tests {
             80,
             0,
             0,
-            &PanelView::just(Mode::AddPicker { sel: 0 }),
+            &PanelView::just(Mode::AddPicker {
+                sel: 0,
+                tier: crate::cli::teams_config::ReviewKind::Commit,
+            }),
         )
         .0
         .join("\n");
@@ -4023,7 +4040,10 @@ mod tests {
                 wait_page: None,
                 plan_input: None,
                 mode: Mode::Confirm {
-                    action: ConfirmAction::AddCandidate { idx: 0 },
+                    action: ConfirmAction::AddCandidate {
+                        idx: 0,
+                        tier: crate::cli::teams_config::ReviewKind::Commit,
+                    },
                 },
                 picker: &picker,
                 log_cursor: 0,
@@ -5746,7 +5766,7 @@ mod tests {
             cand("scout", "codex", "codex"),
             cand("ruthless", "claude", "claude"),
         ];
-        let (lines, _) = render_candidate_screen(&picker, 24, 60, 0, Some("kimi"));
+        let (lines, _) = render_candidate_screen(&picker, 24, 60, 0, Some("kimi"), None);
         let text = lines
             .iter()
             .map(|l| visible(l))
@@ -5764,7 +5784,14 @@ mod tests {
         );
 
         // The add framing is unchanged.
-        let (lines, _) = render_candidate_screen(&picker, 24, 60, 0, None);
+        let (lines, _) = render_candidate_screen(
+            &picker,
+            24,
+            60,
+            0,
+            None,
+            Some(crate::cli::teams_config::ReviewKind::Commit),
+        );
         let lower = lines
             .iter()
             .map(|l| visible(l))

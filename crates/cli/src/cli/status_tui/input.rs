@@ -81,7 +81,15 @@ pub(super) enum Mode {
     AgentPanel { sel: usize },
     /// Choosing a library agent to add; `sel` indexes the freshly-read
     /// candidate list the loop holds.
-    AddPicker { sel: usize },
+    AddPicker {
+        sel: usize,
+        /// The tier the candidate will be added AT, cycled with
+        /// ←/→ before Enter. Held in the mode rather than beside it so
+        /// every construction site — the refresh rebind included —
+        /// has to decide, and a redraw cannot silently reset a choice
+        /// the user already made.
+        tier: crate::cli::teams_config::ReviewKind,
+    },
     /// Choosing the agent to swap IN for `out`. Same candidate list as
     /// `AddPicker` — library minus roster is exactly who may replace a
     /// member — with `out` indexing `snapshot.agents`.
@@ -438,6 +446,27 @@ pub(super) fn tier_boxes(kind: crate::cli::teams_config::ReviewKind) -> (bool, b
     }
 }
 
+/// Step the add-picker's tier. ←/→ already mean "cycle the selected
+/// toggle" on the detail page, so they carry the same meaning here.
+///
+/// The ORDER is the review pipeline — commit, plan, final, then gate
+/// (which is both plan and final) — so stepping reads as widening
+/// scope rather than as an arbitrary rotation.
+pub(super) fn tier_cycle(
+    tier: crate::cli::teams_config::ReviewKind,
+    forward: bool,
+) -> crate::cli::teams_config::ReviewKind {
+    use crate::cli::teams_config::ReviewKind::*;
+    const ORDER: [crate::cli::teams_config::ReviewKind; 4] = [Commit, Plan, Final, Gate];
+    let at = ORDER.iter().position(|k| *k == tier).unwrap_or(0);
+    let next = if forward {
+        (at + 1) % ORDER.len()
+    } else {
+        (at + ORDER.len() - 1) % ORDER.len()
+    };
+    ORDER[next]
+}
+
 /// The reviewer tier after toggling one checkbox — `None` = no-op.
 /// Rules: `commit` is exclusive (ticking it clears `plan`/`final`;
 /// ticking `plan`/`final` while in commit mode LEAVES commit mode); and
@@ -733,7 +762,14 @@ pub(super) fn doc_nav(key: Key, page: usize) -> DocNav {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ConfirmAction {
     /// Add the candidate at this index in the loop's picker list.
-    AddCandidate { idx: usize },
+    AddCandidate {
+        idx: usize,
+        /// `ReviewKind` has no `Master` variant, so "add as master"
+        /// is unrepresentable here rather than rejected downstream.
+        /// Adding a master means demoting the incumbent, which is
+        /// `clank agent promote`'s job.
+        tier: crate::cli::teams_config::ReviewKind,
+    },
     /// Remove the agent at this index in `snapshot.agents`.
     RemoveAgent { idx: usize },
     /// `stash push` the open plan page's plan.
@@ -1951,7 +1987,14 @@ mod tests {
         assert_eq!(Mode::LogScroll.toggle_focus(0), Mode::LogScroll);
         // From any agent-region mode (panel, picker, confirm): back to log.
         assert_eq!(Mode::AgentPanel { sel: 1 }.toggle_focus(2), Mode::LogScroll);
-        assert_eq!(Mode::AddPicker { sel: 0 }.toggle_focus(2), Mode::LogScroll);
+        assert_eq!(
+            Mode::AddPicker {
+                sel: 0,
+                tier: crate::cli::teams_config::ReviewKind::Commit
+            }
+            .toggle_focus(2),
+            Mode::LogScroll
+        );
         assert_eq!(
             Mode::Confirm {
                 action: ConfirmAction::RemoveAgent { idx: 0 }
@@ -2010,6 +2053,21 @@ mod tests {
             );
         }
         assert!(detail_actions(RosterRole::Master).contains(&DetailAction::Swap));
+    }
+
+    /// ←/→ walk the review pipeline and wrap, in both directions.
+    #[test]
+    fn tier_cycle_walks_the_pipeline_and_wraps() {
+        use crate::cli::teams_config::ReviewKind::*;
+        let mut t = Commit;
+        for want in [Plan, Final, Gate, Commit] {
+            t = tier_cycle(t, true);
+            assert_eq!(t, want, "forward");
+        }
+        for want in [Gate, Final, Plan, Commit] {
+            t = tier_cycle(t, false);
+            assert_eq!(t, want, "backward");
+        }
     }
 
     #[test]
@@ -2077,7 +2135,10 @@ mod tests {
     #[test]
     fn confirm_decision_q_cancels_and_enter_follows_default() {
         let rm = ConfirmAction::RemoveAgent { idx: 0 };
-        let add = ConfirmAction::AddCandidate { idx: 0 };
+        let add = ConfirmAction::AddCandidate {
+            idx: 0,
+            tier: crate::cli::teams_config::ReviewKind::Commit,
+        };
         // In a confirm, q CANCELS — it must not quit the TUI.
         assert_eq!(confirm_decision(rm, Key::Quit), Some(false));
         assert_eq!(confirm_decision(rm, Key::Escape), Some(false));
@@ -2096,7 +2157,11 @@ mod tests {
             "a destructive remove defaults to No"
         );
         assert!(
-            ConfirmAction::AddCandidate { idx: 0 }.default_yes(),
+            ConfirmAction::AddCandidate {
+                idx: 0,
+                tier: crate::cli::teams_config::ReviewKind::Commit
+            }
+            .default_yes(),
             "a non-destructive add defaults to Yes"
         );
     }

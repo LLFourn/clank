@@ -195,16 +195,11 @@ fn apply_confirm(
         // Executed at the call site, which holds the page identity the
         // post-confirm revalidation needs.
         ConfirmAction::KillAttended => Ok(()),
-        ConfirmAction::AddCandidate { idx } => {
+        ConfirmAction::AddCandidate { idx, tier } => {
             if let Some(c) = picker.get(idx)
                 && let Ok(label) = clank_core::ids::AgentLabel::parse(&c.label)
             {
-                crate::cli::agent::add_repo_roster_agent_by_name(
-                    repo,
-                    home,
-                    &label,
-                    crate::cli::teams_config::RosterRole::Commit,
-                )?;
+                crate::cli::agent::add_repo_roster_agent_by_name(repo, home, &label, tier.into())?;
             }
             Ok(())
         }
@@ -910,8 +905,8 @@ fn roster_confirm_after_decision(
         return (Mode::AgentPanel { sel: add_row }, true);
     }
     match action {
-        ConfirmAction::AddCandidate { idx } if idx < picker_len => {
-            (Mode::AddPicker { sel: idx }, false)
+        ConfirmAction::AddCandidate { idx, tier } if idx < picker_len => {
+            (Mode::AddPicker { sel: idx, tier }, false)
         }
         ConfirmAction::RemoveAgent { idx } if idx < agents_len => {
             (Mode::AgentDetail { idx, sel: 0 }, false)
@@ -980,9 +975,12 @@ fn rebind_add_picker_after_refresh(
     label: Option<&str>,
     picker: &[crate::cli::status::AvailableAgent],
     add_row: usize,
+    // Survives the refresh: the tier is the user's choice, not a
+    // property of the list being redrawn under them.
+    tier: crate::cli::teams_config::ReviewKind,
 ) -> Mode {
     match rebind_picker_sel_by_label(old_sel, label, picker) {
-        Some(sel) => Mode::AddPicker { sel },
+        Some(sel) => Mode::AddPicker { sel, tier },
         None => Mode::AgentPanel { sel: add_row },
     }
 }
@@ -992,6 +990,7 @@ fn rebind_add_confirm_after_refresh(
     label: Option<&str>,
     picker: &[crate::cli::status::AvailableAgent],
     add_row: usize,
+    tier: crate::cli::teams_config::ReviewKind,
 ) -> Mode {
     let rebound = if let Some(label) = label {
         picker.iter().position(|c| c.label.as_str() == label)
@@ -1000,7 +999,7 @@ fn rebind_add_confirm_after_refresh(
     };
     match rebound {
         Some(idx) => Mode::Confirm {
-            action: ConfirmAction::AddCandidate { idx },
+            action: ConfirmAction::AddCandidate { idx, tier },
         },
         None => Mode::AgentPanel { sel: add_row },
     }
@@ -2093,7 +2092,10 @@ pub(crate) async fn run_tui(
                                         home.as_deref(),
                                         &snapshot.agents,
                                     );
-                                    mode = Mode::AddPicker { sel: 0 };
+                                    mode = Mode::AddPicker {
+                                        sel: 0,
+                                        tier: crate::cli::teams_config::ReviewKind::Commit,
+                                    };
                                 }
                                 PanelAction::OpenDetail(i) => {
                                     mode = Mode::AgentDetail { idx: i, sel: 0 };
@@ -2219,7 +2221,7 @@ pub(crate) async fn run_tui(
                             }
                         }
                         // Picker: choose a candidate to add.
-                        Mode::AddPicker { sel } => match k {
+                        Mode::AddPicker { sel, tier } => match k {
                             Key::Quit => break 'evloop,
                             // Esc/Tab close the picker back onto the +add row.
                             Key::Escape | Key::Focus | Key::Char(b'a') => {
@@ -2233,17 +2235,30 @@ pub(crate) async fn run_tui(
                             Key::Up => {
                                 mode = Mode::AddPicker {
                                     sel: move_selection(sel, picker.len(), false),
+                                    tier,
                                 }
                             }
                             Key::Down => {
                                 mode = Mode::AddPicker {
                                     sel: move_selection(sel, picker.len(), true),
+                                    tier,
+                                }
+                            }
+                            // The tier belongs to the ADD, not to the
+                            // highlighted row, so moving the cursor keeps it.
+                            Key::Left | Key::Right => {
+                                mode = Mode::AddPicker {
+                                    sel,
+                                    tier: crate::cli::status_tui::input::tier_cycle(
+                                        tier,
+                                        k == Key::Right,
+                                    ),
                                 }
                             }
                             Key::Enter => {
                                 if sel < picker.len() {
                                     mode = Mode::Confirm {
-                                        action: ConfirmAction::AddCandidate { idx: sel },
+                                        action: ConfirmAction::AddCandidate { idx: sel, tier },
                                     };
                                 }
                             }
@@ -2253,8 +2268,6 @@ pub(crate) async fn run_tui(
                             | Key::Top
                             | Key::Bottom
                             | Key::Delete
-                            | Key::Left
-                            | Key::Right
                             | Key::Yes
                             | Key::No
                             | Key::Html
@@ -2782,10 +2795,10 @@ pub(crate) async fn run_tui(
                     _ => None,
                 };
                 let picker_label = match mode {
-                    Mode::AddPicker { sel }
+                    Mode::AddPicker { sel, .. }
                     | Mode::SwapPicker { sel, .. }
                     | Mode::Confirm {
-                        action: ConfirmAction::AddCandidate { idx: sel },
+                        action: ConfirmAction::AddCandidate { idx: sel, .. },
                     } => picker.get(sel).map(|c| c.label.clone()),
                     _ => None,
                 };
@@ -2974,7 +2987,7 @@ pub(crate) async fn run_tui(
                     // candidate by identity: if the selected candidate is
                     // still available after a config refresh, keep the page;
                     // otherwise close to the panel.
-                    Mode::AddPicker { sel } => rebind_add_picker_after_refresh(
+                    Mode::AddPicker { sel, tier } => rebind_add_picker_after_refresh(
                         sel,
                         picker_label.as_deref(),
                         &picker,
@@ -2982,9 +2995,10 @@ pub(crate) async fn run_tui(
                             &snapshot,
                             cols as usize,
                         )),
+                        tier,
                     ),
                     Mode::Confirm {
-                        action: ConfirmAction::AddCandidate { idx },
+                        action: ConfirmAction::AddCandidate { idx, tier },
                     } => rebind_add_confirm_after_refresh(
                         idx,
                         picker_label.as_deref(),
@@ -2993,6 +3007,7 @@ pub(crate) async fn run_tui(
                             &snapshot,
                             cols as usize,
                         )),
+                        tier,
                     ),
                     // Remove confirms also track the agent by identity, so a
                     // tier change/reorder cannot make "yes" remove the wrong
@@ -3727,8 +3742,23 @@ pub(crate) mod tests {
     #[test]
     fn roster_confirm_decision_returns_to_origin_pages() {
         assert_eq!(
-            roster_confirm_after_decision(ConfirmAction::AddCandidate { idx: 1 }, false, 3, 2, 2),
-            (Mode::AddPicker { sel: 1 }, false),
+            roster_confirm_after_decision(
+                ConfirmAction::AddCandidate {
+                    idx: 1,
+                    tier: crate::cli::teams_config::ReviewKind::Commit
+                },
+                false,
+                3,
+                2,
+                2
+            ),
+            (
+                Mode::AddPicker {
+                    sel: 1,
+                    tier: crate::cli::teams_config::ReviewKind::Commit
+                },
+                false
+            ),
             "cancel/failed add returns to the selected picker candidate"
         );
         assert_eq!(
@@ -3737,7 +3767,16 @@ pub(crate) mod tests {
             "cancel/failed remove returns to the target detail page"
         );
         assert_eq!(
-            roster_confirm_after_decision(ConfirmAction::AddCandidate { idx: 4 }, false, 2, 2, 2),
+            roster_confirm_after_decision(
+                ConfirmAction::AddCandidate {
+                    idx: 4,
+                    tier: crate::cli::teams_config::ReviewKind::Commit
+                },
+                false,
+                2,
+                2,
+                2
+            ),
             (Mode::AgentPanel { sel: 2 }, true),
             "an invalid add target falls back to the panel and drops picker state"
         );
@@ -3757,15 +3796,21 @@ pub(crate) mod tests {
             cand("scout", "codex", "codex"),
             cand("grok", "grok", "grok"),
         ];
+        // A NON-default tier, so this proves the chosen tier survives the
+        // refresh rather than merely that the call compiles.
+        let chosen = crate::cli::teams_config::ReviewKind::Gate;
         assert_eq!(
-            rebind_add_confirm_after_refresh(0, Some("grok"), &picker, 2),
+            rebind_add_confirm_after_refresh(0, Some("grok"), &picker, 2, chosen),
             Mode::Confirm {
-                action: ConfirmAction::AddCandidate { idx: 1 }
+                action: ConfirmAction::AddCandidate {
+                    idx: 1,
+                    tier: chosen
+                }
             },
-            "add confirm follows the same candidate after the picker reorders"
+            "add confirm follows the same candidate, and keeps the tier, after a reorder"
         );
         assert_eq!(
-            rebind_add_confirm_after_refresh(0, Some("missing"), &picker, 2),
+            rebind_add_confirm_after_refresh(0, Some("missing"), &picker, 2, chosen),
             Mode::AgentPanel { sel: 2 },
             "add confirm closes instead of retargeting when the candidate vanished"
         );
@@ -3853,7 +3898,10 @@ pub(crate) mod tests {
 
         // Every panel-family mode enforces; the log mode never touches it.
         for mode in [
-            Mode::AddPicker { sel: 0 },
+            Mode::AddPicker {
+                sel: 0,
+                tier: crate::cli::teams_config::ReviewKind::Commit,
+            },
             Mode::AgentDetail { idx: 0, sel: 0 },
             Mode::Confirm {
                 action: ConfirmAction::RemoveAgent { idx: 0 },
@@ -3949,7 +3997,10 @@ pub(crate) mod tests {
         let s = two_agent_snap();
         let picker = vec![cand("ruthless", "claude", "claude")];
         apply_confirm(
-            ConfirmAction::AddCandidate { idx: 0 },
+            ConfirmAction::AddCandidate {
+                idx: 0,
+                tier: crate::cli::teams_config::ReviewKind::Gate,
+            },
             repo.path(),
             Some(home.path()),
             &s,
@@ -3961,6 +4012,80 @@ pub(crate) mod tests {
             cfg.contains("ruthless"),
             "candidate added to the local roster via the core: {cfg}"
         );
+        // The CHOSEN tier, not the default: adding `ruthless` at `gate`
+        // and getting `commit` is the exact defect this carries a tier
+        // to prevent, and it is invisible unless the role is asserted.
+        let parsed: serde_json::Value = serde_json::from_str(&cfg).unwrap();
+        assert_eq!(
+            parsed["agents"]["ruthless"]["role"], "gate",
+            "the tier chosen at add is the tier written: {cfg}"
+        );
+    }
+
+    /// Every reviewer tier reaches the roster through the confirm path.
+    #[test]
+    fn apply_confirm_add_writes_each_reviewer_tier() {
+        use crate::cli::teams_config::ReviewKind;
+        for (tier, want) in [
+            (ReviewKind::Commit, "commit"),
+            (ReviewKind::Plan, "plan"),
+            (ReviewKind::Final, "final"),
+            (ReviewKind::Gate, "gate"),
+        ] {
+            let repo = tempfile::TempDir::new().unwrap();
+            let home = tempfile::TempDir::new().unwrap();
+            std::fs::create_dir_all(repo.path().join(".clank")).unwrap();
+            std::fs::write(
+                repo.path().join(".clank/config.json"),
+                r#"{"agents":{"claude":{"tool":"claude","role":"master"}}}"#,
+            )
+            .unwrap();
+            std::fs::create_dir_all(home.path().join(".clank")).unwrap();
+            std::fs::write(
+                home.path().join(".clank/config.json"),
+                r#"{"agents":{"ruthless":{"tool":"claude"}},"teams":{}}"#,
+            )
+            .unwrap();
+            let s = two_agent_snap();
+            let picker = vec![cand("ruthless", "claude", "claude")];
+            apply_confirm(
+                ConfirmAction::AddCandidate { idx: 0, tier },
+                repo.path(),
+                Some(home.path()),
+                &s,
+                &picker,
+            )
+            .unwrap();
+            let cfg = std::fs::read_to_string(repo.path().join(".clank/config.json")).unwrap();
+            let parsed: serde_json::Value = serde_json::from_str(&cfg).unwrap();
+            assert_eq!(
+                parsed["agents"]["ruthless"]["role"], want,
+                "{tier:?} must write `{want}`: {cfg}"
+            );
+        }
+    }
+
+    /// `master` is unrepresentable in the add flow, not merely rejected.
+    ///
+    /// `AddCandidate` carries a `ReviewKind`, which has no `Master`
+    /// variant, so the invalid state cannot be built. This pins the
+    /// property the type provides: adding a master would mean demoting
+    /// the incumbent, which is `clank agent promote`'s job.
+    #[test]
+    fn no_reviewer_tier_can_become_master() {
+        use crate::cli::teams_config::{ReviewKind, RosterRole};
+        for tier in [
+            ReviewKind::Commit,
+            ReviewKind::Plan,
+            ReviewKind::Final,
+            ReviewKind::Gate,
+        ] {
+            assert_ne!(
+                RosterRole::from(tier),
+                RosterRole::Master,
+                "{tier:?} must never map to master"
+            );
+        }
     }
 
     #[test]
