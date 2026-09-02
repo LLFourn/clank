@@ -1,45 +1,34 @@
 # clank
 
-Multi-agent peer review around plans. One agent (the **master**)
-writes a plan, reviewers weigh in, the master implements it commit by
-commit, reviewers sign off on each commit, and the plan finalizes into
-a sealed record. Everything lives in `.clank/` and `git`; there's no
-daemon and no server.
+Multi-agent peer review around plans. One agent (the **master**) writes
+a plan; reviewers weigh in; the master implements it commit by commit;
+reviewers sign off on each commit; the plan finalizes into a sealed
+record.
 
-## Install
+Everything lives in `.clank/` and `git`. No daemon, no server, no
+database — the review history IS the commit history.
 
-```sh
-git clone <this-repo>
-cd <repo-dir>
-cargo install --path crates/cli --locked
+```
+        master                                    reviewers
+          │                                           │
+  write   │  .clank/drafts/my-feature.md              │
+  queue   │  clank queue add my-feature               │
+ promote  │  clank queue promote my-feature ─────────▶│  woken with the intro
+          │                                           │
+          │◀──────────── CONTINUE / REQUEST_CHANGES ──┤  clank feedback write
+          │                                           │
+ implement│  git commit -m "[my-feature] …" ─────────▶│  woken with the commit
+          │                                           │
+          │◀──────────── CONTINUE / REQUEST_CHANGES ──┤  (repeat per commit)
+          │                                           │
+          │◀──────────────────────────── FINISHED ────┤  gate reviewer
+  finish  │  clank finish my-feature                  │
+          ▼                                           │
+   .clank/finished/my-feature.md
 ```
 
-That puts `clank` on your `$PATH`. Keep `--locked`: without it
-`cargo install` ignores the committed `Cargo.lock` and re-resolves
-every dependency to the newest semver-compatible version.
-
-Then wire it into your agents (Claude Code, Codex CLI, Grok CLI —
-any or all):
-
-```sh
-clank setup
-```
-
-This installs the role-split skills (`clank-master`, `clank-reviewer`,
-plus `clank-pr-review`) into `~/.claude/`, `~/.codex/`, `~/.grok/`,
-and `~/.config/opencode/`, a `/clank` slash command for claude, the
-clank opencode plugin (`~/.config/opencode/plugin/clank.js` — session
-binding + work loop), and tag-merges a Stop hook entry into claude's
-`settings.json` and codex's `hooks.json` (grok has no active hooks —
-its skill carries the work loop). Re-run `clank setup` after
-upgrading the binary; `--force` refreshes skill files you've locally
-edited.
-
-Verify with:
-
-```sh
-clank doctor
-```
+Agents are woken when it is their turn — they do not poll, and you do
+not chase them.
 
 ## The model
 
@@ -60,141 +49,126 @@ clank doctor
   local-only), not per-session flags. Agents bind their session to a
   roster label once with `clank as <label>`.
 
-## Quickstart
-
-In a repo:
+## Install
 
 ```sh
-clank init                  # scaffold .clank/ (+ post-rewrite hook)
+git clone https://github.com/LLFourn/clank
+cd clank
+cargo install --path crates/cli --locked
+```
+
+That puts `clank` on your `$PATH`. Keep `--locked`: without it
+`cargo install` ignores the committed `Cargo.lock` and re-resolves
+every dependency to the newest semver-compatible version.
+
+Then wire it into your agents (Claude Code, Codex CLI, Grok CLI,
+opencode — any or all):
+
+```sh
+clank setup
+clank doctor      # verify
+```
+
+`setup` installs the role-split skills (`clank-master`,
+`clank-reviewer`, plus `clank-pr-review`) into `~/.claude/`,
+`~/.codex/`, `~/.grok/`, and `~/.config/opencode/`, a `/clank` slash
+command for claude, the clank opencode plugin
+(`~/.config/opencode/plugin/clank.js` — session binding + work loop),
+and tag-merges a Stop hook entry into claude's `settings.json` and
+codex's `hooks.json` (grok has no active hooks — its skill carries the
+work loop).
+
+Re-run `clank setup` after upgrading the binary; `--force` refreshes
+skill files you have locally edited.
+
+## Quickstart
+
+Two agents reviewing each other, from nothing. Every block says whose
+shell it belongs to — that distinction is the whole mental model.
+
+**1. You — set up the repo and the roster.**
+
+```sh
+cd ~/src/my-project
+clank init                                   # scaffold .clank/
 clank agent add alice --tool claude
-clank agent promote alice   # alice is the master
+clank agent promote alice                    # alice is the master
 clank agent add bob --tool codex --review commit
 ```
 
-(Or seed the whole roster from a saved template: `clank init --team
+(Or seed a whole roster from a saved template: `clank init --team
 <name>`; save one with `clank team save <name>`.)
 
-Inside each agent's session, bind once:
+**2. You — launch the team.**
 
 ```sh
-clank as alice
+clank open
 ```
 
-The master then queues and promotes a plan:
+This is the step that makes the agents exist. In a plain terminal it
+opens clank's own console; inside zellij it builds a tab with the
+master on the stage and the reviewers stacked beside it. Each pane is
+a real agent CLI, started in this repo.
+
+(`clank agent start <label>` launches ONE agent — resuming its session
+if it has one, or bootstrapping it with a seed prompt to bind if it
+doesn't. `clank open` is what brings up the whole team.)
+
+**3. Each agent — bind once, in its own pane.**
 
 ```sh
-$EDITOR .clank/drafts/my-feature.md   # write the plan body
+clank as alice        # in alice's pane
+clank as bob          # in bob's pane
+```
+
+The binding is what tells clank which roster entry this session is, so
+work can be routed to it. The installed skills teach the agents to do
+this themselves on first turn.
+
+**4. The master — write and promote a plan.**
+
+```sh
+$EDITOR .clank/drafts/my-feature.md   # the plan body
 clank queue add my-feature            # consumes the draft into the queue
 clank queue promote my-feature        # activates it: commits the intro
 ```
 
-Reviewers' `clank wait` wakes with the intro to review; they write
-verdicts:
+**5. Reviewers — woken automatically, they write verdicts.**
 
 ```sh
 clank feedback write --commit <sha> --verdict continue \
     --author bob -m "plan is well-scoped; implementation pending"
 ```
 
-(`-m` is required, git-style: first line summary, then detail. The
-verdict is prepended as the header — don't restate it in the message.)
+`-m` is required and git-shaped: summary line, then detail. The
+verdict becomes the header — don't restate it in the message.
 
-The master implements in `[my-feature]`-prefixed commits, each
-reviewed the same way. When the gate says FINISHED:
+**6. The master — implement, then finalize.**
+
+Each commit is tagged `[my-feature]` and wakes the reviewers again.
+When the gate reviewer says FINISHED:
 
 ```sh
 clank finish my-feature -m "<what changed>" -m "<why>"
 ```
 
-## How agents stay awake
+The plan moves to `.clank/finished/`, and with `finish.autosquash` its
+commits collapse into one.
 
-`clank wait` blocks until the calling agent has actionable work
-(inferring author + role from the session binding). Each tool keeps
-its loop differently — `clank setup`'s skills teach this, and
-auto-mode drives it:
+## Watching it happen
 
-- **claude** — with a Claude Code that supports `asyncRewake`
-  (2.1.223+), `clank setup` installs the ASYNC loop: the Stop hook
-  itself parks the long-poll (no armed background task at all — the
-  task manager can't reap what doesn't exist) and work WAKES the
-  session as a system reminder; a SessionStart companion mints the
-  waiter generation and delivers catch-up work after restarts. On
-  older installs the legacy loop remains: the hook nudges the agent
-  to keep a background `clank wait` armed and the wait's completion
-  wake carries the items. Setup decides ONCE per machine and
-  `clank doctor` flags drift.
-- **codex** — its Stop hook long-polls `clank wait` in-hook and blocks
-  with the items (the poll parks until work, the hook-runner
-  ceiling, or the hook's own death).
-- **grok** — has no active hooks; its skill (and the auto-on launch
-  prompt from `clank agent start`) teach it to arm the background
-  wait itself.
-- **opencode** — the clank plugin long-polls in-hook on
-  `session.idle` and injects the items as a new prompt; the agent
-  never arms anything. The launch profile carries the model: after
-  `clank agent add kimi --tool opencode`, edit the agent's entry in
-  `.clank/config.json` (or `~/.clank/config.json` for `--global`):
+```sh
+clank status            # one-shot repo state
+clank status --tui      # full-screen: the way you actually drive it
+```
 
-  ```json
-  "kimi": {
-    "tool": "opencode",
-    "launch": { "args": ["--model", "moonshotai/kimi-k3"] }
-  }
-  ```
+The TUI is the primary interface once a team is running: agent rows
+with live state, per-agent pages (auto-mode, review tier, swap,
+remove), the plan and its verdicts, queued plans, and github event
+pages. `--watch` gives a live non-fullscreen view; `-j` emits JSON.
 
-Auto-mode is per-agent (`clank auto on|off|status`), inheriting a
-user-global default (`~/.clank/config.json`'s `"auto"`) when unset —
-`clank doctor` shows the effective value with its provenance.
-
-### The wider wait surface
-
-- `clank wait --peek` — non-blocking, side-effect-free "is there work
-  right now?" probe.
-- `clank wait --for commit|finished|stopped` — OBSERVE a repo (often a
-  foreign one via `--repo`) instead of waiting for your own work.
-- **Extra wake sources** (`wait_events` in the agent's config, or
-  repeatable `--event '<json>'`): `github` entries watch any repo
-  (PRs opened/updated/merged, comments, issues, branch pushes — your
-  own actions filtered by default), and `command` entries spawn an
-  argv whose completion is the wake. A watch can carry a `"prompt"`
-  — operator instructions stamped onto every wake item it produces,
-  telling the agent exactly how to react:
-
-  ```json
-  { "kind": "github", "repo": "o/r", "events": ["pr_comment"],
-    "prompt": "Triage the comment; reply on the PR, then ack." }
-  ```
-
-  The prompt is presentation config, never stored in the event log:
-  editing it retitles the standing intent for already-logged
-  unhandled events (per-kind granularity = split the watch). `"delivery":"realtime"` upgrades
-  a github source from polling to push-speed webhook delivery, with
-  polling kept as the completeness backstop. This is the building
-  block for a "controller" repo whose agents manage other repos — the
-  `clank-master` skill documents the pattern.
-
-  What the github sources need (`gh` is optional for polling):
-  - **Polling** talks to the REST API directly. The token comes from
-    `GH_TOKEN` / `GITHUB_TOKEN` if set — no `gh` needed at all — else
-    from one `gh auth token` call. With neither, the source waits
-    (loudly, fail-closed) rather than polling unauthenticated.
-  - **Realtime** requires the `gh` binary, the `cli/gh-webhook`
-    extension, and ADMIN on the watched repo (it creates a webhook).
-    When any of that is missing the source falls back to polling with
-    one diagnostic naming the reason — nothing is lost, wakes are
-    just poll-speed.
-  - The rest of clank's GitHub surface (`pr-review`, `fork create --pr`)
-    still shells `gh` directly.
-
-  Every ingested github event lands in a per-agent **inbox**
-  (`.clank/agents/<label>/events/`, a write-ahead log) before it wakes
-  anyone, and stays *unhandled* — re-waking the agent on every arm —
-  until acked with `clank events ack`. That makes delivery
-  at-least-once: events that fire while no wait is armed (agent
-  offline, wait killed, the gap before a re-arm) are caught up on the
-  next arm by reconciling GitHub's event feed against the inbox.
-  `clank events list` / `show` inspect it; the `clank-github` skill
-  teaches agents the react-then-ack loop.
+Enter selects whatever the cursor is on; every screen shows its own
+keys along the bottom.
 
 ## Command reference
 
@@ -260,6 +234,96 @@ committed. Everything else is per-user state.
 ~/.codex/hooks.json                 # codex Stop hook tag-merged in
 ~/.clank/config.json                # agent library, teams, hooks, defaults
 ```
+
+## How agents stay awake
+
+`clank wait` blocks until the calling agent has actionable work
+(inferring author + role from the session binding). Each tool keeps
+its loop differently — `clank setup`'s skills teach this, and
+auto-mode drives it:
+
+- **claude** — with a Claude Code that supports `asyncRewake`
+  (2.1.223+), `clank setup` installs the ASYNC loop: the Stop hook
+  itself parks the long-poll (no armed background task at all — the
+  task manager can't reap what doesn't exist) and work WAKES the
+  session as a system reminder; a SessionStart companion mints the
+  waiter generation and delivers catch-up work after restarts. On
+  older installs the legacy loop remains: the hook nudges the agent
+  to keep a background `clank wait` armed and the wait's completion
+  wake carries the items. Setup decides ONCE per machine and
+  `clank doctor` flags drift.
+- **codex** — its Stop hook long-polls `clank wait` in-hook and blocks
+  with the items (the poll parks until work, the hook-runner
+  ceiling, or the hook's own death).
+- **grok** — has no active hooks; its skill (and the auto-on launch
+  prompt from `clank agent start`) teach it to arm the background
+  wait itself.
+- **opencode** — the clank plugin long-polls in-hook on
+  `session.idle` and injects the items as a new prompt; the agent
+  never arms anything. The launch profile carries the model: after
+  `clank agent add kimi --tool opencode`, edit the agent's entry in
+  `.clank/config.json` (or `~/.clank/config.json` for `--global`):
+
+  ```json
+  "kimi": {
+    "tool": "opencode",
+    "launch": { "args": ["--model", "moonshotai/kimi-k3"] }
+  }
+  ```
+
+Auto-mode is per-agent (`clank auto on|off|status`), inheriting a
+user-global default (`~/.clank/config.json`'s `"auto"`) when unset —
+`clank doctor` shows the effective value with its provenance.
+
+## Extra wake sources
+
+- `clank wait --peek` — non-blocking, side-effect-free "is there work
+  right now?" probe.
+- `clank wait --for commit|finished|stopped` — OBSERVE a repo (often a
+  foreign one via `--repo`) instead of waiting for your own work.
+- **Extra wake sources** (`wait_events` in the agent's config, or
+  repeatable `--event '<json>'`): `github` entries watch any repo
+  (PRs opened/updated/merged, comments, issues, branch pushes — your
+  own actions filtered by default), and `command` entries spawn an
+  argv whose completion is the wake. A watch can carry a `"prompt"`
+  — operator instructions stamped onto every wake item it produces,
+  telling the agent exactly how to react:
+
+  ```json
+  { "kind": "github", "repo": "o/r", "events": ["pr_comment"],
+    "prompt": "Triage the comment; reply on the PR, then ack." }
+  ```
+
+  The prompt is presentation config, never stored in the event log:
+  editing it retitles the standing intent for already-logged
+  unhandled events (per-kind granularity = split the watch). `"delivery":"realtime"` upgrades
+  a github source from polling to push-speed webhook delivery, with
+  polling kept as the completeness backstop. This is the building
+  block for a "controller" repo whose agents manage other repos — the
+  `clank-master` skill documents the pattern.
+
+  What the github sources need (`gh` is optional for polling):
+  - **Polling** talks to the REST API directly. The token comes from
+    `GH_TOKEN` / `GITHUB_TOKEN` if set — no `gh` needed at all — else
+    from one `gh auth token` call. With neither, the source waits
+    (loudly, fail-closed) rather than polling unauthenticated.
+  - **Realtime** requires the `gh` binary, the `cli/gh-webhook`
+    extension, and ADMIN on the watched repo (it creates a webhook).
+    When any of that is missing the source falls back to polling with
+    one diagnostic naming the reason — nothing is lost, wakes are
+    just poll-speed.
+  - The rest of clank's GitHub surface (`pr-review`, `fork create --pr`)
+    still shells `gh` directly.
+
+  Every ingested github event lands in a per-agent **inbox**
+  (`.clank/agents/<label>/events/`, a write-ahead log) before it wakes
+  anyone, and stays *unhandled* — re-waking the agent on every arm —
+  until acked with `clank events ack`. That makes delivery
+  at-least-once: events that fire while no wait is armed (agent
+  offline, wait killed, the gap before a re-arm) are caught up on the
+  next arm by reconciling GitHub's event feed against the inbox.
+  `clank events list` / `show` inspect it; the `clank-github` skill
+  teaches agents the react-then-ack loop.
 
 ## Troubleshooting
 

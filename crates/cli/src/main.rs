@@ -261,6 +261,122 @@ fn exit_code_for(err: &anyhow::Error) -> i32 {
 mod tests {
     use super::*;
 
+    /// The README's checkable claims, asserted against clap itself.
+    ///
+    /// Lives HERE because `Cli` is private to this binary: an
+    /// integration test cannot reach the authority and would have to
+    /// restate the command list, which is a second source of truth
+    /// that goes stale silently — a command deleted from `Cli` would
+    /// leave both the README and the copy untouched and the test green
+    /// (codex on fa63541).
+    fn readme() -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("README.md");
+        std::fs::read_to_string(&path).expect("README.md at the workspace root")
+    }
+
+    /// Every clank subcommand the README names is real.
+    ///
+    /// Covers BOTH shapes a reader meets: the reference table's first
+    /// column, including the `a / b` cells, and every `clank <sub>`
+    /// someone would actually type. Scanning only the table missed the
+    /// Quickstart entirely, which is where the commands that matter
+    /// are.
+    #[test]
+    fn the_readme_names_only_real_subcommands() {
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+        let real: Vec<String> = cmd
+            .get_subcommands()
+            .map(|c| c.get_name().to_string())
+            .collect();
+        let known = |n: &str| real.iter().any(|r| r == n);
+
+        let text = readme();
+        let mut unknown: Vec<String> = Vec::new();
+
+        // Shape 1: reference-table rows, `| `name` | …` — and cells
+        // that name two commands, `block` / `unblock`.
+        for line in text.lines() {
+            if let Some(rest) = line.strip_prefix("| `")
+                && let Some(cell) = rest.split(" |").next()
+            {
+                for name in cell.split(" / ") {
+                    let name = name.trim().trim_matches('`');
+                    if !name.is_empty() && !known(name) {
+                        unknown.push(format!("table: {name}"));
+                    }
+                }
+            }
+        }
+
+        // Shape 2: every `clank <sub>` inside code — fenced blocks and
+        // inline spans. Prose is excluded deliberately: "the clank
+        // opencode plugin" is a sentence, not an invocation.
+        //
+        // Scanned per LINE. Scanning the joined text let `cd clank`
+        // at the end of one line pair with `cargo` at the start of the
+        // next and report a command nobody wrote.
+        let mut code: Vec<String> = Vec::new();
+        let mut fenced = false;
+        for line in text.lines() {
+            if line.starts_with("```") {
+                fenced = !fenced;
+                continue;
+            }
+            if fenced {
+                code.push(line.to_string());
+            } else {
+                for (i, span) in line.split('`').enumerate() {
+                    if i % 2 == 1 {
+                        code.push(span.to_string());
+                    }
+                }
+            }
+        }
+        for line in &code {
+            for pair in line.split_whitespace().collect::<Vec<_>>().windows(2) {
+                if pair[0] == "clank"
+                    && pair[1]
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c.is_ascii_lowercase())
+                    && !known(pair[1])
+                {
+                    unknown.push(format!("invocation: clank {}", pair[1]));
+                }
+            }
+        }
+
+        assert!(
+            unknown.is_empty(),
+            "README names commands that do not exist: {unknown:?}"
+        );
+    }
+
+    /// The README must tell a newcomer how to START the agents.
+    ///
+    /// The defect the rewrite existed to fix: the Quickstart built a
+    /// roster, bound sessions and wrote verdicts without ever
+    /// launching anything, so following it produced nothing running.
+    #[test]
+    fn the_readme_quickstart_launches_the_agents() {
+        let text = readme();
+        let quickstart = text
+            .split("## Quickstart")
+            .nth(1)
+            .expect("a Quickstart section")
+            .split("\n## ")
+            .next()
+            .unwrap()
+            .to_string();
+        assert!(
+            quickstart.contains("clank open"),
+            "the Quickstart must contain the step that starts the agents"
+        );
+    }
+
     #[test]
     fn wait_command_parses() {
         assert!(matches!(

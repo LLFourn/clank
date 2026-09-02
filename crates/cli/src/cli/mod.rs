@@ -1068,9 +1068,11 @@ pub enum AgentCmd {
     /// Enumerate the repo's roster (master + reviewers) with their
     /// role, review tier, and bind state.
     List(AgentListArgs),
-    /// Launch an agent's CLI tool with its session restored and
-    /// any configured `launch` profile applied. Requires the
-    /// agent to have a bound session (`clank as <name>`).
+    /// Launch an agent's CLI tool with any configured `launch`
+    /// profile applied. With a bound session it RESUMES that
+    /// session; without one it bootstraps, exec'ing the bare tool
+    /// with a seed prompt telling the agent to run `clank as
+    /// <name>` (agent-start-bootstraps-missing-skeleton).
     Start(AgentStartArgs),
     /// Add an agent to the repo's roster (ONE step — definition +
     /// role). Three modes: `--global --tool` writes a reusable
