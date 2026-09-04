@@ -900,6 +900,12 @@ fn apply_detail_action(
     }
 }
 
+/// The screens whose content is an agent's pane presence: the roster
+/// rows and an agent's page.
+fn mode_shows_agents(mode: &Mode) -> bool {
+    matches!(mode, Mode::AgentPanel { .. } | Mode::AgentDetail { .. })
+}
+
 /// Mount a one-line notice at the top of the log rows, replacing any
 /// earlier one with the same `prefix` — like the refresh notice, it
 /// never stacks, and the next successful refresh clears it.
@@ -1583,6 +1589,7 @@ pub(crate) async fn run_tui(
     // The document overlay, when open (Enter on a log entry): a commit's
     // detail or a plan's rendered markdown.
     let mut detail: Option<Overlay> = None;
+    let mut detail_shown: Option<Vec<DetailAction>> = None;
     // Which region owns the keyboard. Starts on the log; Tab moves it to
     // the agent panel. The single source of key-routing truth.
     let mut mode = initial_mode(&snapshot);
@@ -1748,6 +1755,11 @@ pub(crate) async fn run_tui(
         }
 
         let log_focused = matches!(mode, Mode::LogScroll);
+        // Presence may have moved an agent page's action list since
+        // the last frame; the cursor follows its action before this
+        // one paints.
+        let presence = reconcile_worker.presence();
+        mode = settle_detail_cursor(mode, &snapshot.agents, &presence, &mut detail_shown);
         let view = PanelView {
             wait_page: wait_page.as_ref(),
             mode,
@@ -1760,6 +1772,7 @@ pub(crate) async fn run_tui(
             // A non-blocking drain: the worker reports after each
             // batch, the loop never waits on zellij to paint.
             reach: reconcile_worker.reach(),
+            presence,
         };
         for (label, outcome) in reconcile_worker.outcomes() {
             mount_notice(
@@ -1905,6 +1918,7 @@ pub(crate) async fn run_tui(
                         };
                     }
                 }
+                let was_on_agents = mode_shows_agents(&mode);
                 // Incremental parse: ONE key at a time, interpretation
                 // picked from the CURRENT mode — a pasted `f<subject>⏎`
                 // crosses into input mode mid-buffer and its text must
@@ -2207,8 +2221,20 @@ pub(crate) async fn run_tui(
                         }
                         // Detail page: a selectable action menu over one agent.
                         Mode::AgentDetail { idx, sel } => {
-                            let role = snapshot.agents.get(idx).map(|a| a.role);
-                            let actions = role.map(detail_actions).unwrap_or_default();
+                            let actions = snapshot
+                                .agents
+                                .get(idx)
+                                .map(|a| {
+                                    detail_actions(a.role, reconcile_worker.presence_of(&a.label))
+                                })
+                                .unwrap_or_default();
+                            // The list the operator SAW is what their
+                            // cursor means; presence may have moved it
+                            // since that frame.
+                            let sel = match &detail_shown {
+                                Some(shown) => rebind_detail_sel(shown, sel, &actions),
+                                None => sel.min(actions.len().saturating_sub(1)),
+                            };
                             match agent_detail_nav(sel, &actions, k) {
                                 // The kill row belongs to the WAIT page; the
                                 // agent page never produces it.
@@ -2786,6 +2812,12 @@ pub(crate) async fn run_tui(
                         },
                     }
                     log.request_fill();
+                }
+                // Entering the agents' screens asks for a fresh listing,
+                // so the menu is right when it opens rather than at the
+                // next period.
+                if mode_shows_agents(&mode) && !was_on_agents {
+                    reconcile_worker.probe();
                 }
                 // A data-change wake is COALESCED + THROTTLED: flag it; the
                 // trailing-edge flush after the match rebuilds at most once

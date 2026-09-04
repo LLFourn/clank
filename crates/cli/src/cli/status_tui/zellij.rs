@@ -7,7 +7,8 @@
 //! spawning zellij; [`TabIndicator`] / [`PaneStatus`] own the dedup +
 //! restore lifecycle.
 
-use super::derive::{agent_status_emoji, awaited_reviewers};
+use super::derive::agent_status_emoji;
+use super::input::Presence;
 use super::strip_leading_emoji;
 use crate::cli::open_zellij::agent_pane_title;
 use crate::cli::status::StatusSnapshot;
@@ -98,50 +99,19 @@ impl<R: FnMut(&str, &str)> Drop for TabIndicator<R> {
     }
 }
 
-fn list_panes() -> Option<String> {
-    crate::cli::open_zellij::list_panes_text()
-}
-
 fn rename_pane(id: &str, name: &str) {
     crate::cli::open_zellij::rename_pane(id, name)
 }
 
-/// The agent panes in `zellij action list-panes` output
-/// (`PANE_ID  TYPE  TITLE`, one per line) → `(pane_id, label, role)`.
-/// A pane is an agent's iff its title (after stripping any leading
-/// status glyph) is `"<label> (master)"` / `"<label> (reviewer)"` —
-/// the exact format `agent_pane_title` emits. Non-agent panes
-/// (status, plugin, the header row) don't match and are skipped.
-fn parse_agent_panes(list_panes_stdout: &str) -> Vec<(String, String, clank_core::vocab::Role)> {
-    use clank_core::vocab::Role;
-    let mut out = Vec::new();
-    for line in list_panes_stdout.lines() {
-        let mut toks = line.split_whitespace();
-        let Some(id) = toks.next() else { continue };
-        toks.next(); // TYPE column
-        let base = strip_leading_emoji(&toks.collect::<Vec<_>>().join(" "));
-        for role in [Role::Master, Role::Reviewer] {
-            if let Some(label) = base.strip_suffix(&format!(" ({})", role.as_str())) {
-                out.push((id.to_string(), label.to_string(), role));
-                break;
-            }
-        }
-    }
-    out
-}
-
 /// Per-refresh retitle data, derived ON THE LOOP (pure — no zellij)
 /// and sent to the worker: each label's status emoji for BOTH possible
-/// pane roles (the pane's actual role comes from the worker's cached
-/// titles), plus the wanted set that justifies a pane-map re-query.
+/// pane roles (the pane's actual role comes from the batch's listing).
 /// Pane titles have ONE owner — the worker — so these renames can
 /// never race the reconciler's role stamps (codex ff9579f).
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct StatusGlyphs {
     /// label → (emoji as master, emoji as reviewer).
     emoji: std::collections::BTreeMap<String, (&'static str, &'static str)>,
-    /// Labels the snapshot wants marked (master + awaited reviewers).
-    wanted: Vec<String>,
 }
 
 impl StatusGlyphs {
@@ -160,14 +130,7 @@ impl StatusGlyphs {
                 )
             })
             .collect();
-        let mut wanted: Vec<String> = awaited_reviewers(snap)
-            .iter()
-            .map(|l| l.as_str().to_string())
-            .collect();
-        if let Some(m) = snap.master.as_deref() {
-            wanted.push(m.to_string());
-        }
-        Self { emoji, wanted }
+        Self { emoji }
     }
 }
 
@@ -181,16 +144,12 @@ pub(super) struct PaneStatus {
     /// Pane id → last title rendered. Dedup: rename a pane only when
     /// its desired title changes.
     last: std::collections::HashMap<String, String>,
-    /// Cached `(pane_id, label, role)` map. The pane→agent mapping is
-    /// session-stable, so it's fetched via `list-panes` lazily and
-    /// reused — NOT re-shelled once per render (status-tui-watch-cpu
-    /// Fix 3: the per-render subprocess was loading the zellij server).
+    /// `(pane_id, label, role)` from the batch's listing — the one the
+    /// batch takes per REFRESH, never per render (status-tui-watch-cpu
+    /// Fix 3: a per-render subprocess loaded the zellij server; a
+    /// refresh is throttled and event-driven, and presence rides on
+    /// the same listing).
     panes: Vec<(String, String, clank_core::vocab::Role)>,
-    primed: bool,
-    /// Wanted labels we re-queried for and still found no pane — so a
-    /// genuinely paneless agent triggers at most one re-query, not one
-    /// per render.
-    requeried_absent: std::collections::HashSet<String>,
 }
 
 impl PaneStatus {
@@ -200,53 +159,31 @@ impl PaneStatus {
         Self {
             last: std::collections::HashMap::new(),
             panes: Vec::new(),
-            primed: false,
-            requeried_absent: std::collections::HashSet::new(),
         }
     }
 
-    /// The reconciler acted: cached (pane, label, ROLE) rows may name
-    /// pre-relocation roles — drop them so the next retitle pass
-    /// re-lists fresh titles instead of stamping stale roles back
-    /// (codex ff9579f).
+    /// The reconciler acted: the last-stamped titles may name
+    /// pre-relocation roles — forget them so every pane is restamped
+    /// off the next fresh listing (codex ff9579f). Rows go too: if that
+    /// listing FAILS, the pass falls through to whatever is here, and
+    /// stale rows would restamp pre-relocation roles (codex afb6d43).
     fn invalidate(&mut self) {
-        self.primed = false;
-        self.requeried_absent.clear();
         self.last.clear();
-        // Rows must go too: if the required re-list FAILS, update_with
-        // falls through to iterating whatever is here — stale rows
-        // would restamp pre-relocation roles (codex afb6d43).
         self.panes.clear();
     }
 
-    /// Core of [`update`] with the zellij I/O injected, so the caching
-    /// logic is testable without spawning (no-binary-spawning-tests).
-    /// `list_panes` is called only when the cache needs (re)priming;
-    /// `rename` only for panes whose title changed.
+    /// Core of the retitle pass with the zellij I/O injected, so the
+    /// dedup is testable without spawning (no-binary-spawning-tests).
+    /// `fresh` is the batch's listing when it answered; `rename` runs
+    /// only for panes whose title changed.
     fn update_with(
         &mut self,
         glyphs: &StatusGlyphs,
-        mut list_panes: impl FnMut() -> Option<String>,
+        fresh: Option<Vec<(String, String, clank_core::vocab::Role)>>,
         mut rename: impl FnMut(&str, &str),
     ) {
-        // Refresh the cached pane map only when needed: first run, or
-        // when the snapshot wants to mark an agent we have no cached
-        // pane for (a pane was likely added). Steady state reuses the
-        // cache, so no `list-panes` subprocess fires per render.
-        if (!self.primed || self.wants_uncached(&glyphs.wanted))
-            && let Some(panes) = list_panes()
-        {
-            self.panes = parse_agent_panes(&panes);
-            self.primed = true;
-            // A fresh map supersedes the give-up memory; re-record any
-            // wanted label that's STILL absent so we don't re-query for
-            // it every render.
-            self.requeried_absent.clear();
-            for label in &glyphs.wanted {
-                if !self.has_pane(label) {
-                    self.requeried_absent.insert(label.clone());
-                }
-            }
+        if let Some(panes) = fresh {
+            self.panes = panes;
         }
         // Build the rename list from the cached map first (immutable
         // borrow), then apply — keeps `self.panes` and `self.last`
@@ -271,18 +208,6 @@ impl PaneStatus {
             rename(&id, &title);
             self.last.insert(id, title);
         }
-    }
-
-    fn has_pane(&self, label: &str) -> bool {
-        self.panes.iter().any(|(_, l, _)| l == label)
-    }
-
-    /// A wanted agent has no cached pane and we haven't already given
-    /// up re-querying for it — a pane likely appeared since we fetched.
-    fn wants_uncached(&self, wanted: &[String]) -> bool {
-        wanted
-            .iter()
-            .any(|label| !self.has_pane(label) && !self.requeried_absent.contains(label))
     }
 }
 
@@ -533,6 +458,13 @@ pub(super) trait PaneIo {
         snap: &Self::Snap,
     );
     fn remove_all(&mut self, labels: &[String], snap: &Self::Snap);
+    /// The labels whose pane's PROCESS is still running. `pairs` counts
+    /// an exited pane as its label's — identity, so a corpse can be
+    /// closed — and this is the other question: is the agent open.
+    fn live_labels(&mut self, snap: &Self::Snap) -> std::collections::BTreeSet<String>;
+    /// `(pane id, label, role)` for every pane TITLED as an agent's —
+    /// the retitler's map, read off the same listing presence uses.
+    fn title_rows(&mut self, snap: &Self::Snap) -> Vec<(String, String, clank_core::vocab::Role)>;
     /// Whether THIS process may drive pane reconciliation for the repo.
     ///
     /// Exactly one may, at a time — the same shape as the ingest lease
@@ -678,6 +610,12 @@ impl PaneIo for ZellijPaneIo<'_> {
     }
     fn remove_all(&mut self, labels: &[String], snap: &Self::Snap) {
         crate::cli::open_zellij::remove_reviewer_panes(self.repo, labels, snap);
+    }
+    fn live_labels(&mut self, snap: &Self::Snap) -> std::collections::BTreeSet<String> {
+        crate::cli::open_zellij::live_agent_labels(snap, self.repo)
+    }
+    fn title_rows(&mut self, snap: &Self::Snap) -> Vec<(String, String, clank_core::vocab::Role)> {
+        crate::cli::open_zellij::titled_agent_panes(snap)
     }
 }
 
@@ -964,9 +902,26 @@ impl PaneReconciler {
         let Some(mut snap) = io.snapshot() else {
             return ReopenOutcome::NoListing;
         };
-        let plan = plan_panes(cur, &self.believe_pending(&io.pairs(&snap)));
+        let mut plan = plan_panes(cur, &self.believe_pending(&io.pairs(&snap)));
         if !plan.add.iter().any(|l| l == label) {
-            return ReopenOutcome::AlreadyOpen;
+            if io.live_labels(&snap).contains(label) {
+                return ReopenOutcome::AlreadyOpen;
+            }
+            // Listed but not live: every pane this label has is a
+            // corpse zellij kept open after the process ended. To the
+            // reconciler that is still the label's pane (so `remove`
+            // can find it); to the user the agent is plainly not open.
+            // Close it and list again — `add` finds panes by that same
+            // identity and would otherwise decline to make one.
+            io.remove_all(&[label.to_string()], &snap);
+            let Some(fresh) = io.snapshot() else {
+                return ReopenOutcome::NoListing;
+            };
+            snap = fresh;
+            plan = plan_panes(cur, &self.believe_pending(&io.pairs(&snap)));
+            if !plan.add.iter().any(|l| l == label) {
+                return ReopenOutcome::NotCreated;
+            }
         }
         let reviewers = cur.reviewers();
         let focus = io.capture_focus(&snap);
@@ -1126,6 +1081,12 @@ impl<I: PaneIo> PaneIo for Observed<'_, I> {
     fn remove_all(&mut self, labels: &[String], snap: &Self::Snap) {
         self.inner.remove_all(labels, snap)
     }
+    fn live_labels(&mut self, snap: &Self::Snap) -> std::collections::BTreeSet<String> {
+        self.inner.live_labels(snap)
+    }
+    fn title_rows(&mut self, snap: &Self::Snap) -> Vec<(String, String, clank_core::vocab::Role)> {
+        self.inner.title_rows(snap)
+    }
     fn may_reconcile(&mut self) -> bool {
         self.inner.may_reconcile()
     }
@@ -1140,7 +1101,39 @@ pub(super) enum WorkerMsg {
     Roster(RosterView),
     Glyphs(StatusGlyphs),
     Reopen(String),
+    /// Probe pane presence now — the loop asks when the agent panel
+    /// or an agent's page is entered, so what it shows is current.
+    Probe,
 }
+
+/// One batch of work for the worker, coalesced from the queue.
+#[derive(Default)]
+pub(super) struct WorkerBatch {
+    pub(super) roster: Option<RosterView>,
+    pub(super) glyphs: Option<StatusGlyphs>,
+    pub(super) reopens: Vec<String>,
+    /// List panes for presence: the period elapsed, the loop asked, or
+    /// a refresh arrived (which lists anyway).
+    pub(super) probe: bool,
+}
+
+/// What the worker tells the loop. One channel, drained without
+/// blocking before every paint.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Report {
+    Reach(ZellijReach),
+    /// This repo's labels with a live pane; `None` when the listing
+    /// did not answer — unknown, which is not absent.
+    Presence(Option<std::collections::BTreeSet<String>>),
+    Reopened(String, ReopenOutcome),
+}
+
+/// How long the worker waits for a message before probing presence
+/// on its own. A pane closed by hand or a process that exits changes
+/// nothing under the repo, so nothing else would ever ask
+/// (the-tui-knows-whether-a-pane-is-open). One ~25 ms listing per
+/// period per TUI.
+pub(super) const PRESENCE_PERIOD: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The worker's per-batch state: the reconciler AND the retitler,
 /// co-owned so pane titles have exactly ONE writer and a retitle can
@@ -1165,16 +1158,27 @@ impl WorkerState {
         }
     }
 
-    /// Returns each reopen request's outcome, in request order.
+    /// Returns what the loop should hear: each reopen's outcome in
+    /// request order, then presence when the batch listed.
+    ///
+    /// Outside the reconcile pass a batch lists AT MOST ONCE: the
+    /// retitler's map and presence are two projections of the same
+    /// listing, taken when the batch is a probe or a refresh (a
+    /// refresh retitles, and presence rides on that listing — the
+    /// plan's "a refresh batch probes too"; codex on e310988 and
+    /// 44e937e).
     fn handle(
         &mut self,
-        roster: Option<RosterView>,
-        glyphs: Option<StatusGlyphs>,
-        reopens: Vec<String>,
+        batch: WorkerBatch,
         io: &mut impl PaneIo,
-        list_panes: impl FnMut() -> Option<String>,
         rename: impl FnMut(&str, &str),
-    ) -> Vec<(String, ReopenOutcome)> {
+    ) -> Vec<Report> {
+        let WorkerBatch {
+            roster,
+            glyphs,
+            reopens,
+            probe,
+        } = batch;
         if let Some(view) = roster {
             // Invalidate on any TARGET change, not just on our own
             // actions: another TUI may already have converged the live
@@ -1187,7 +1191,7 @@ impl WorkerState {
                 self.panes.invalidate();
             }
         }
-        let outcomes = reopens
+        let mut reports: Vec<Report> = reopens
             .into_iter()
             .map(|label| {
                 let outcome = match &self.last_roster {
@@ -1197,13 +1201,21 @@ impl WorkerState {
                 if outcome == ReopenOutcome::Reopened {
                     self.panes.invalidate();
                 }
-                (label, outcome)
+                Report::Reopened(label, outcome)
             })
             .collect();
+        let listed = probe || glyphs.is_some();
+        let listing = if listed { io.snapshot() } else { None };
         if let Some(g) = glyphs {
-            self.panes.update_with(&g, list_panes, rename);
+            let rows = listing.as_ref().map(|snap| io.title_rows(snap));
+            self.panes.update_with(&g, rows, rename);
         }
-        outcomes
+        if listed {
+            reports.push(Report::Presence(
+                listing.as_ref().map(|snap| io.live_labels(snap)),
+            ));
+        }
+        reports
     }
 }
 
@@ -1219,13 +1231,15 @@ impl WorkerState {
 pub(super) struct ReconcileWorker {
     tx: Option<std::sync::mpsc::Sender<WorkerMsg>>,
     join: Option<std::thread::JoinHandle<()>>,
-    reach_rx: Option<std::sync::mpsc::Receiver<ZellijReach>>,
+    report_rx: Option<std::sync::mpsc::Receiver<Report>>,
     /// Last observed; `NotInSession` is fixed for the process's life,
     /// since `$ZELLIJ` does not change under a running TUI.
     reach: ZellijReach,
-    outcome_rx: Option<std::sync::mpsc::Receiver<(String, ReopenOutcome)>>,
-    /// Answers that needed no worker (there is none outside zellij),
-    /// drained with the worker's own by [`Self::outcomes`].
+    /// The last presence report; `None` until one arrives or when the
+    /// last listing did not answer.
+    presence: Option<std::collections::BTreeSet<String>>,
+    /// Reopen answers not yet handed to the loop — the worker's, and
+    /// those that needed no worker (there is none outside zellij).
     answered: Vec<(String, ReopenOutcome)>,
 }
 
@@ -1239,17 +1253,15 @@ impl ReconcileWorker {
             return Self {
                 tx: None,
                 join: None,
-                reach_rx: None,
+                report_rx: None,
                 reach: ZellijReach::NotInSession,
-                outcome_rx: None,
+                presence: None,
                 answered: Vec::new(),
             };
         }
         let (tx, rx) = std::sync::mpsc::channel::<WorkerMsg>();
-        let (reach_tx, reach_rx) = std::sync::mpsc::channel::<ZellijReach>();
-        let (outcome_tx, outcome_rx) = std::sync::mpsc::channel::<(String, ReopenOutcome)>();
-        let mut worker = Self::in_session(reach_rx);
-        worker.outcome_rx = Some(outcome_rx);
+        let (report_tx, report_rx) = std::sync::mpsc::channel::<Report>();
+        let mut worker = Self::in_session(report_rx);
         let join = std::thread::spawn(move || {
             let mut state = WorkerState::new();
             let io = ZellijPaneIo {
@@ -1261,27 +1273,20 @@ impl ReconcileWorker {
                 inner: io,
                 seen: &seen,
             };
-            worker_loop(&rx, |roster, glyphs, reopens| {
+            worker_loop(&rx, PRESENCE_PERIOD, |batch| {
                 seen.set(None);
-                let list = || {
-                    let out = list_panes();
-                    seen.set(Some(if out.is_some() {
-                        ZellijReach::Connected
-                    } else {
-                        ZellijReach::Unreachable
-                    }));
-                    out
-                };
-                let outcomes = state.handle(roster, glyphs, reopens, &mut io, list, rename_pane);
+                let reports = state.handle(batch, &mut io, rename_pane);
                 // Only a batch that actually listed has anything to
-                // say; a cached batch keeps the loop's last value.
+                // say about reach; a cached batch keeps the loop's
+                // last value.
                 if let Some(reach) = seen.get() {
-                    let _ = reach_tx.send(reach);
+                    let _ = report_tx.send(Report::Reach(reach));
                 }
-                if !outcomes.is_empty() {
-                    for outcome in outcomes {
-                        let _ = outcome_tx.send(outcome);
-                    }
+                let wake_loop = !reports.is_empty();
+                for report in reports {
+                    let _ = report_tx.send(report);
+                }
+                if wake_loop {
                     wake();
                 }
             });
@@ -1299,14 +1304,50 @@ impl ReconcileWorker {
     /// mutation it claimed to catch stayed green (codex on c842901).
     /// `$ZELLIJ` being set proves a variable, not a client, so nothing
     /// has been observed yet.
-    fn in_session(reach_rx: std::sync::mpsc::Receiver<ZellijReach>) -> Self {
+    fn in_session(report_rx: std::sync::mpsc::Receiver<Report>) -> Self {
         Self {
             tx: None,
             join: None,
-            reach_rx: Some(reach_rx),
+            report_rx: Some(report_rx),
             reach: ZellijReach::Unknown,
-            outcome_rx: None,
+            presence: None,
             answered: Vec::new(),
+        }
+    }
+
+    /// Take everything the worker has reported, without blocking.
+    fn drain(&mut self) {
+        if let Some(rx) = &self.report_rx {
+            while let Ok(r) = rx.try_recv() {
+                match r {
+                    Report::Reach(reach) => self.reach = reach,
+                    Report::Presence(live) => self.presence = live,
+                    Report::Reopened(label, outcome) => self.answered.push((label, outcome)),
+                }
+            }
+        }
+    }
+
+    /// Whether `label` has a live pane, as of the last presence report.
+    pub(super) fn presence_of(&mut self, label: &str) -> Presence {
+        self.drain();
+        match &self.presence {
+            None => Presence::Unknown,
+            Some(live) if live.contains(label) => Presence::Live,
+            Some(_) => Presence::Missing,
+        }
+    }
+
+    /// The last presence report, for the frame.
+    pub(super) fn presence(&mut self) -> Option<std::collections::BTreeSet<String>> {
+        self.drain();
+        self.presence.clone()
+    }
+
+    /// Ask the worker to list panes now. Non-blocking.
+    pub(super) fn probe(&self) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(WorkerMsg::Probe);
         }
     }
 
@@ -1327,23 +1368,14 @@ impl ReconcileWorker {
     /// Every reopen answered since the last call, in order. Drains
     /// without blocking.
     pub(super) fn outcomes(&mut self) -> Vec<(String, ReopenOutcome)> {
-        let mut out = std::mem::take(&mut self.answered);
-        if let Some(rx) = &self.outcome_rx {
-            while let Ok(o) = rx.try_recv() {
-                out.push(o);
-            }
-        }
-        out
+        self.drain();
+        std::mem::take(&mut self.answered)
     }
 
     /// The last reachability the worker reported. Drains the channel
     /// without blocking, so the render loop never waits on zellij.
     pub(super) fn reach(&mut self) -> ZellijReach {
-        if let Some(rx) = &self.reach_rx {
-            while let Ok(r) = rx.try_recv() {
-                self.reach = r;
-            }
-        }
+        self.drain();
         self.reach
     }
 
@@ -1379,24 +1411,31 @@ impl Drop for ReconcileWorker {
 /// collapse to the newest OF EACH KIND; arrivals DURING a batch
 /// collapse into exactly one follow-up batch. Exits when the channel
 /// disconnects (after at most one final drained batch).
+/// A wait that ends with no message is a batch of its own — a probe
+/// — so presence is re-read every `period` even when nothing else in
+/// the world moves.
 fn worker_loop(
     rx: &std::sync::mpsc::Receiver<WorkerMsg>,
-    mut batch: impl FnMut(Option<RosterView>, Option<StatusGlyphs>, Vec<String>),
+    period: std::time::Duration,
+    mut batch: impl FnMut(WorkerBatch),
 ) {
-    while let Ok(first) = rx.recv() {
-        let mut roster = None;
-        let mut glyphs = None;
-        let mut reopens = Vec::new();
-        let mut take = |m: WorkerMsg| match m {
-            WorkerMsg::Roster(v) => roster = Some(v),
-            WorkerMsg::Glyphs(g) => glyphs = Some(g),
-            WorkerMsg::Reopen(label) => reopens.push(label),
+    loop {
+        let mut b = WorkerBatch::default();
+        let take = |m: WorkerMsg, b: &mut WorkerBatch| match m {
+            WorkerMsg::Roster(v) => b.roster = Some(v),
+            WorkerMsg::Glyphs(g) => b.glyphs = Some(g),
+            WorkerMsg::Reopen(label) => b.reopens.push(label),
+            WorkerMsg::Probe => b.probe = true,
         };
-        take(first);
-        while let Ok(m) = rx.try_recv() {
-            take(m);
+        match rx.recv_timeout(period) {
+            Ok(first) => take(first, &mut b),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => b.probe = true,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
         }
-        batch(roster, glyphs, reopens);
+        while let Ok(m) = rx.try_recv() {
+            take(m, &mut b);
+        }
+        batch(b);
     }
 }
 
@@ -1472,9 +1511,9 @@ mod tests {
         let mut w = ReconcileWorker {
             tx: None,
             join: None,
-            reach_rx: None,
+            report_rx: None,
             reach: ZellijReach::NotInSession,
-            outcome_rx: None,
+            presence: None,
             answered: Vec::new(),
         };
         assert_eq!(w.reach(), ZellijReach::NotInSession);
@@ -1489,17 +1528,17 @@ mod tests {
         let mut w = ReconcileWorker {
             tx: None,
             join: None,
-            reach_rx: Some(rx),
+            report_rx: Some(rx),
             reach: ZellijReach::Connected,
-            outcome_rx: None,
+            presence: None,
             answered: Vec::new(),
         };
         // Nothing reported yet: the last value stands, and this must
         // not wait for a report that is never coming.
         assert_eq!(w.reach(), ZellijReach::Connected);
-        tx.send(ZellijReach::Unreachable).unwrap();
-        tx.send(ZellijReach::Connected).unwrap();
-        tx.send(ZellijReach::Unreachable).unwrap();
+        tx.send(Report::Reach(ZellijReach::Unreachable)).unwrap();
+        tx.send(Report::Reach(ZellijReach::Connected)).unwrap();
+        tx.send(Report::Reach(ZellijReach::Unreachable)).unwrap();
         assert_eq!(w.reach(), ZellijReach::Unreachable, "the latest wins");
         // A disconnected sender is not an error; the last value stands.
         drop(tx);
@@ -1523,14 +1562,7 @@ mod tests {
         let view = view(&["claude"], Some("claude"));
 
         // First batch: not converged, so the reconciler lists once.
-        state.handle(
-            Some(view.clone()),
-            None,
-            Vec::new(),
-            &mut io,
-            || None,
-            |_, _| {},
-        );
+        state.handle(wb(Some(view.clone()), None, Vec::new()), &mut io, |_, _| {});
         assert_eq!(
             io.inner.snapshots_taken, 1,
             "the reconcile listing, and only it"
@@ -1544,7 +1576,7 @@ mod tests {
         // Second batch, same roster: converged, ZERO listings — and
         // therefore no observation, so the loop keeps its last value.
         seen.set(None);
-        state.handle(Some(view), None, Vec::new(), &mut io, || None, |_, _| {});
+        state.handle(wb(Some(view), None, Vec::new()), &mut io, |_, _| {});
         assert_eq!(
             io.inner.snapshots_taken, 1,
             "a converged batch lists nothing"
@@ -1560,7 +1592,7 @@ mod tests {
         // Through the PRODUCTION initializer, not a literal of our
         // own: only then does re-seeding `spawn` to `Connected`
         // fail here.
-        let (_tx, rx) = std::sync::mpsc::channel::<ZellijReach>();
+        let (_tx, rx) = std::sync::mpsc::channel::<Report>();
         let mut w = ReconcileWorker::in_session(rx);
         assert_eq!(w.reach(), ZellijReach::Unknown, "no evidence, no claim");
         assert_ne!(w.reach(), ZellijReach::Connected);
@@ -1574,11 +1606,8 @@ mod tests {
         let mut io = Observed { inner, seen: &seen };
         let mut state = WorkerState::new();
         state.handle(
-            Some(view(&["claude"], Some("claude"))),
-            None,
-            Vec::new(),
+            wb(Some(view(&["claude"], Some("claude"))), None, Vec::new()),
             &mut io,
-            || None,
             |_, _| {},
         );
         assert_eq!(io.inner.snapshots_taken, 1);
@@ -1719,6 +1748,12 @@ mod tests {
         add_departing: Vec<Vec<String>>,
         /// Scripted lease answer; the real IO holds an flock.
         may_reconcile: bool,
+        /// Labels whose panes are all EXITED: listed by `pairs`, absent
+        /// from `live_labels`.
+        dead: std::collections::BTreeSet<String>,
+        /// Scripted retitler rows per listing; default derives them from
+        /// the snapshot's pairs as `terminal_<label>`.
+        title_rows: std::collections::VecDeque<Vec<(String, String, clank_core::vocab::Role)>>,
         stack_results: std::collections::VecDeque<bool>,
         placed_results: std::collections::VecDeque<bool>,
         verify_placed: std::collections::VecDeque<bool>,
@@ -1744,6 +1779,8 @@ mod tests {
                 add_anchors: std::collections::VecDeque::new(),
                 add_departing: Vec::new(),
                 may_reconcile: true,
+                dead: std::collections::BTreeSet::new(),
+                title_rows: std::collections::VecDeque::new(),
                 stack_results: std::collections::VecDeque::new(),
                 placed_results: std::collections::VecDeque::new(),
                 verify_placed: std::collections::VecDeque::new(),
@@ -1815,6 +1852,48 @@ mod tests {
         }
         fn remove_all(&mut self, labels: &[String], _snap: &Self::Snap) {
             self.log.push(format!("remove {}", labels.join("+")));
+        }
+        fn live_labels(&mut self, snap: &Self::Snap) -> std::collections::BTreeSet<String> {
+            snap.iter()
+                .map(|(l, _)| l.clone())
+                .filter(|l| !self.dead.contains(l))
+                .collect()
+        }
+        fn title_rows(
+            &mut self,
+            snap: &Self::Snap,
+        ) -> Vec<(String, String, clank_core::vocab::Role)> {
+            use clank_core::vocab::Role;
+            if let Some(rows) = self.title_rows.pop_front() {
+                return rows;
+            }
+            snap.iter()
+                .map(|(l, master)| {
+                    (
+                        format!("terminal_{l}"),
+                        l.clone(),
+                        if *master {
+                            Role::Master
+                        } else {
+                            Role::Reviewer
+                        },
+                    )
+                })
+                .collect()
+        }
+    }
+
+    /// A batch as the loop hands it over, nothing probed.
+    fn wb(
+        roster: Option<RosterView>,
+        glyphs: Option<StatusGlyphs>,
+        reopens: Vec<String>,
+    ) -> WorkerBatch {
+        WorkerBatch {
+            roster,
+            glyphs,
+            reopens,
+            probe: false,
         }
     }
 
@@ -2445,11 +2524,8 @@ mod tests {
         let mut state = WorkerState::new();
         let mut io = FakeIo::new(vec![Some(live_now)]);
         state.handle(
-            Some(view(labels, Some(master))),
-            None,
-            Vec::new(),
+            wb(Some(view(labels, Some(master))), None, Vec::new()),
             &mut io,
-            || None,
             |_, _| {},
         );
         assert!(io.log.is_empty(), "converged from the start: {:?}", io.log);
@@ -2457,10 +2533,12 @@ mod tests {
     }
 
     fn reopen(state: &mut WorkerState, io: &mut FakeIo, label: &str) -> ReopenOutcome {
-        let out = state.handle(None, None, vec![label.to_string()], io, || None, |_, _| {});
-        assert_eq!(out.len(), 1, "one request, one answer");
-        assert_eq!(out[0].0, label);
-        out[0].1.clone()
+        let out = state.handle(wb(None, None, vec![label.to_string()]), io, |_, _| {});
+        assert_eq!(out.len(), 1, "one request, one answer, nothing probed");
+        match &out[0] {
+            Report::Reopened(l, outcome) if l == label => outcome.clone(),
+            other => panic!("expected {label}'s outcome, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2624,11 +2702,12 @@ mod tests {
         // The same roster view again: still cached as converged, so no
         // listing and no pass.
         state.handle(
-            Some(view(&["claude", "r1", "r2"], Some("claude"))),
-            None,
-            Vec::new(),
+            wb(
+                Some(view(&["claude", "r1", "r2"], Some("claude"))),
+                None,
+                Vec::new(),
+            ),
             &mut io,
-            || None,
             |_, _| {},
         );
         assert_eq!(io.snapshots_taken, before, "no pass ran");
@@ -2691,11 +2770,12 @@ mod tests {
             ]))],
         );
         state.handle(
-            Some(view(&["claude", "r1", "r2"], Some("claude"))),
-            None,
-            Vec::new(),
+            wb(
+                Some(view(&["claude", "r1", "r2"], Some("claude"))),
+                None,
+                Vec::new(),
+            ),
             &mut io,
-            || None,
             |_, _| {},
         );
         assert_eq!(io.log[0], "add r2", "the pass created r2");
@@ -2729,6 +2809,215 @@ mod tests {
         assert_eq!(io.log[0], "add r2");
     }
 
+    // ── the-tui-knows-whether-a-pane-is-open: presence ──────────
+
+    fn presence_of(reports: &[Report]) -> Option<Option<Vec<String>>> {
+        reports.iter().find_map(|r| match r {
+            Report::Presence(live) => Some(live.as_ref().map(|s| s.iter().cloned().collect())),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn the_worker_probes_when_its_wait_ends_with_no_message() {
+        // A hand-closed pane changes nothing under the repo; the
+        // worker's own clock is the only thing that would ever look
+        // (codex on 63548a9).
+        let (tx, rx) = std::sync::mpsc::channel::<WorkerMsg>();
+        let mut batches = Vec::new();
+        let period = std::time::Duration::from_millis(20);
+        std::thread::spawn(move || {
+            std::thread::sleep(period * 4);
+            drop(tx);
+        });
+        worker_loop(&rx, period, |b| batches.push(b.probe));
+        assert!(
+            !batches.is_empty(),
+            "the wait ended without a message and that was a batch"
+        );
+        assert!(batches.iter().all(|p| *p), "every timeout batch is a probe");
+    }
+
+    #[test]
+    fn a_probe_request_and_a_refresh_each_list_once_and_a_bare_reopen_does_not() {
+        let mut state = WorkerState::new();
+        let mut io = FakeIo::new(vec![Some(live(&[("claude", true), ("r1", false)]))]);
+        let reports = state.handle(
+            WorkerBatch {
+                probe: true,
+                ..Default::default()
+            },
+            &mut io,
+            |_, _| {},
+        );
+        assert_eq!(io.snapshots_taken, 1);
+        assert_eq!(
+            presence_of(&reports),
+            Some(Some(vec!["claude".into(), "r1".into()]))
+        );
+        // A refresh carries glyphs; it lists anyway, and the presence
+        // rides on that.
+        let mut io = FakeIo::new(vec![Some(live(&[("claude", true)]))]);
+        let refresh = StatusGlyphs {
+            emoji: [("claude".to_string(), ("M", "R"))].into_iter().collect(),
+        };
+        let reports = state.handle(wb(None, Some(refresh), Vec::new()), &mut io, |_, _| {});
+        assert_eq!(presence_of(&reports), Some(Some(vec!["claude".into()])));
+        // The NEXT refresh, with the retitler's map already in hand,
+        // lists and reports all the same: the listing is per refresh,
+        // and presence rides on every one (codex on 44e937e).
+        let mut io = FakeIo::new(vec![Some(live(&[("claude", true), ("r1", false)]))]);
+        let reports = state.handle(
+            wb(
+                None,
+                Some(StatusGlyphs {
+                    emoji: [("claude".to_string(), ("M", "R"))].into_iter().collect(),
+                }),
+                Vec::new(),
+            ),
+            &mut io,
+            |_, _| {},
+        );
+        assert_eq!(io.snapshots_taken, 1);
+        assert_eq!(
+            presence_of(&reports),
+            Some(Some(vec!["claude".into(), "r1".into()]))
+        );
+        // Nothing asked: nothing listed, nothing said.
+        let mut io = FakeIo::new(vec![Some(live(&[("claude", true)]))]);
+        let reports = state.handle(wb(None, None, Vec::new()), &mut io, |_, _| {});
+        assert_eq!(io.snapshots_taken, 0);
+        assert_eq!(presence_of(&reports), None);
+    }
+
+    #[test]
+    fn presence_is_live_panes_only() {
+        let mut state = WorkerState::new();
+        let mut io = FakeIo::new(vec![Some(live(&[
+            ("claude", true),
+            ("r1", false),
+            ("r2", false),
+        ]))]);
+        io.dead.insert("r2".into());
+        let reports = state.handle(
+            WorkerBatch {
+                probe: true,
+                ..Default::default()
+            },
+            &mut io,
+            |_, _| {},
+        );
+        assert_eq!(
+            presence_of(&reports),
+            Some(Some(vec!["claude".into(), "r1".into()])),
+            "an exited pane's label is not present"
+        );
+        // A listing that does not answer is unknown, not empty.
+        let mut io = FakeIo::new(vec![None]);
+        let reports = state.handle(
+            WorkerBatch {
+                probe: true,
+                ..Default::default()
+            },
+            &mut io,
+            |_, _| {},
+        );
+        assert_eq!(presence_of(&reports), Some(None));
+    }
+
+    #[test]
+    fn a_hand_close_shows_as_missing_and_offers_reopen_with_nothing_else_moving() {
+        // Two probes, no roster or refresh between them, the live set
+        // shrinks: the mark goes ▶ → ? and the page GAINS its reopen
+        // row. Then the pane is back: ? → ▶ and the row is gone. Both
+        // directions, so this cannot pass with the row hidden
+        // throughout (codex on 580150a).
+        use super::super::input::{DetailAction, detail_actions};
+        use super::super::render::auto_mark;
+        use crate::cli::teams_config::RosterRole;
+        use clank_core::vocab::AutoMode;
+        let (report_tx, report_rx) = std::sync::mpsc::channel::<Report>();
+        let mut w = ReconcileWorker::in_session(report_rx);
+        let mut state = WorkerState::new();
+        let probe = || WorkerBatch {
+            probe: true,
+            ..Default::default()
+        };
+        let mut io = FakeIo::new(vec![Some(live(&[("claude", true), ("r1", false)]))]);
+        for r in state.handle(probe(), &mut io, |_, _| {}) {
+            report_tx.send(r).unwrap();
+        }
+        assert_eq!(w.presence_of("r1"), Presence::Live);
+        assert_eq!(auto_mark(AutoMode::On, w.presence_of("r1")).1.trim(), "▶");
+        assert!(
+            !detail_actions(RosterRole::Commit, w.presence_of("r1"))
+                .contains(&DetailAction::Reopen)
+        );
+
+        // The user closes r1's pane. Nothing else changes.
+        let mut io = FakeIo::new(vec![Some(live(&[("claude", true)]))]);
+        for r in state.handle(probe(), &mut io, |_, _| {}) {
+            report_tx.send(r).unwrap();
+        }
+        assert_eq!(w.presence_of("r1"), Presence::Missing);
+        assert_eq!(auto_mark(AutoMode::On, w.presence_of("r1")).1.trim(), "?");
+        assert!(
+            detail_actions(RosterRole::Commit, w.presence_of("r1")).contains(&DetailAction::Reopen)
+        );
+
+        // Back again.
+        let mut io = FakeIo::new(vec![Some(live(&[("claude", true), ("r1", false)]))]);
+        for r in state.handle(probe(), &mut io, |_, _| {}) {
+            report_tx.send(r).unwrap();
+        }
+        assert_eq!(w.presence_of("r1"), Presence::Live);
+        assert_eq!(auto_mark(AutoMode::On, w.presence_of("r1")).1.trim(), "▶");
+        assert!(
+            !detail_actions(RosterRole::Commit, w.presence_of("r1"))
+                .contains(&DetailAction::Reopen)
+        );
+    }
+
+    #[test]
+    fn a_dead_pane_is_closed_and_reopened_a_live_one_is_already_open() {
+        // zellij keeps a pane open after its process ends; to the
+        // reconciler it is still the label's pane, to the user the
+        // agent is plainly not open.
+        let all = live(&[("claude", true), ("r1", false), ("r2", false)]);
+        let mut state = converged_worker(&["claude", "r1", "r2"], "claude", all.clone());
+        let mut io = FakeIo::with_verify(
+            vec![
+                Some(all.clone()),
+                Some(live(&[("claude", true), ("r1", false)])),
+            ],
+            vec![Some(all.clone())],
+        );
+        io.dead.insert("r2".into());
+        assert_eq!(reopen(&mut state, &mut io, "r2"), ReopenOutcome::Reopened);
+        assert_eq!(
+            io.log,
+            vec![
+                "remove r2",
+                "add r2",
+                "stack [terminal_r2]",
+                "focus user_pane"
+            ],
+            "the corpse is closed, then a fresh listing, then the add"
+        );
+        assert_eq!(
+            io.snapshots_taken, 2,
+            "listed again after the close so add does not find the corpse"
+        );
+        // Live: nothing closed.
+        let mut state = converged_worker(&["claude", "r1", "r2"], "claude", all.clone());
+        let mut io = FakeIo::new(vec![Some(all)]);
+        assert_eq!(
+            reopen(&mut state, &mut io, "r2"),
+            ReopenOutcome::AlreadyOpen
+        );
+        assert!(io.log.is_empty(), "{:?}", io.log);
+    }
+
     #[test]
     fn reopen_requests_are_delivered_in_order_never_folded() {
         // Two different labels queued before a batch are two answers;
@@ -2739,7 +3028,9 @@ mod tests {
         tx.send(WorkerMsg::Reopen("r1".into())).unwrap();
         drop(tx);
         let mut batches = Vec::new();
-        worker_loop(&rx, |_roster, _glyphs, reopens| batches.push(reopens));
+        worker_loop(&rx, PRESENCE_PERIOD, |WorkerBatch { reopens, .. }| {
+            batches.push(reopens)
+        });
         assert_eq!(batches, vec![vec!["r1", "r2", "r1"]]);
     }
 
@@ -2748,9 +3039,9 @@ mod tests {
         let mut w = ReconcileWorker {
             tx: None,
             join: None,
-            reach_rx: None,
+            report_rx: None,
             reach: ZellijReach::NotInSession,
-            outcome_rx: None,
+            presence: None,
             answered: Vec::new(),
         };
         w.reopen("r1");
@@ -2768,33 +3059,34 @@ mod tests {
         // holder's stamps, so gating this would leave its own session
         // permanently unglyphed. Within one session both write the
         // same title from the same inputs.
-        use std::sync::atomic::{AtomicUsize, Ordering};
         let mut state = WorkerState::new();
         let mut io = FakeIo::new(vec![Some(live(&[("claude", true)]))]);
         io.may_reconcile = false;
-        let lists = AtomicUsize::new(0);
         let mut renames: Vec<(String, String)> = Vec::new();
         state.handle(
-            Some(view(&["claude"], Some("claude"))),
-            Some(StatusGlyphs {
-                emoji: [("claude".to_string(), ("M", "R"))].into_iter().collect(),
-                wanted: vec!["claude".into()],
-            }),
-            Vec::new(),
+            wb(
+                Some(view(&["claude"], Some("claude"))),
+                Some(StatusGlyphs {
+                    emoji: [("claude".to_string(), ("M", "R"))].into_iter().collect(),
+                }),
+                Vec::new(),
+            ),
             &mut io,
-            || {
-                lists.fetch_add(1, Ordering::SeqCst);
-                Some("terminal_1  terminal  claude (master)".to_string())
-            },
             |id, title| renames.push((id.to_string(), title.to_string())),
         );
         assert!(io.log.is_empty(), "no structural pane work: {:?}", io.log);
         assert_eq!(
             renames,
-            vec![("terminal_1".to_string(), "M claude (master)".to_string())],
+            vec![(
+                "terminal_claude".to_string(),
+                "M claude (master)".to_string()
+            )],
             "the retitle pass runs without the lease"
         );
-        assert_eq!(lists.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            io.snapshots_taken, 1,
+            "the retitler's priming listing, and only it"
+        );
     }
 
     #[test]
@@ -2957,15 +3249,19 @@ mod tests {
         let (entered2, release2, log2) = (entered.clone(), release.clone(), log.clone());
         let join = std::thread::spawn(move || {
             let first = AtomicBool::new(true);
-            worker_loop(&rx, move |roster, _glyphs, _reopens| {
-                if let Some(v) = roster {
-                    log2.lock().unwrap().push(v);
-                }
-                if first.swap(false, Ordering::SeqCst) {
-                    entered2.wait();
-                    release2.wait();
-                }
-            })
+            worker_loop(
+                &rx,
+                PRESENCE_PERIOD,
+                move |WorkerBatch { roster, .. }| {
+                    if let Some(v) = roster {
+                        log2.lock().unwrap().push(v);
+                    }
+                    if first.swap(false, Ordering::SeqCst) {
+                        entered2.wait();
+                        release2.wait();
+                    }
+                },
+            )
         });
         tx.send(WorkerMsg::Roster(view(&["v1"], None))).unwrap();
         entered.wait(); // the first batch is now provably in-flight
@@ -2993,29 +3289,28 @@ mod tests {
         // Queue two rosters AND two glyph updates, disconnect before
         // the worker starts: deterministic — one final batch with the
         // newest of EACH kind, then exit.
+        let glyphs_for = |label: &str| StatusGlyphs {
+            emoji: [(label.to_string(), ("M", "R"))].into_iter().collect(),
+        };
         let (tx, rx) = std::sync::mpsc::channel();
         tx.send(WorkerMsg::Roster(view(&["a"], None))).unwrap();
-        tx.send(WorkerMsg::Glyphs(StatusGlyphs {
-            emoji: std::collections::BTreeMap::new(),
-            wanted: vec!["old".into()],
-        }))
-        .unwrap();
+        tx.send(WorkerMsg::Glyphs(glyphs_for("old"))).unwrap();
         tx.send(WorkerMsg::Roster(view(&["b"], None))).unwrap();
-        tx.send(WorkerMsg::Glyphs(StatusGlyphs {
-            emoji: std::collections::BTreeMap::new(),
-            wanted: vec!["new".into()],
-        }))
-        .unwrap();
+        tx.send(WorkerMsg::Glyphs(glyphs_for("new"))).unwrap();
         drop(tx);
         let log: Arc<Mutex<Vec<(Option<RosterView>, Option<Vec<String>>)>>> =
             Arc::new(Mutex::new(Vec::new()));
         let log2 = log.clone();
         let join = std::thread::spawn(move || {
-            worker_loop(&rx, move |roster, glyphs, _reopens| {
-                log2.lock()
-                    .unwrap()
-                    .push((roster, glyphs.map(|g| g.wanted)));
-            });
+            worker_loop(
+                &rx,
+                PRESENCE_PERIOD,
+                move |WorkerBatch { roster, glyphs, .. }| {
+                    log2.lock()
+                        .unwrap()
+                        .push((roster, glyphs.map(|g| g.emoji.keys().cloned().collect())));
+                },
+            );
         });
         join.join().expect("worker exits when the channel closes");
         assert_eq!(
@@ -3032,12 +3327,7 @@ mod tests {
         // stamped new ones. Single owner + invalidation: after an
         // acting reconcile, the retitle pass re-lists and stamps the
         // POST-relocation roles.
-        use std::sync::atomic::{AtomicUsize, Ordering};
         let mut state = WorkerState::new();
-        // Prime the retitler's cache with PRE-swap titles: claude is
-        // master, codex reviewer.
-        let pre = "terminal_1  terminal  claude (master)\nterminal_2  terminal  codex (reviewer)";
-        let post = "terminal_1  terminal  claude (reviewer)\nterminal_2  terminal  codex (master)";
         let glyphs = || StatusGlyphs {
             emoji: [
                 ("claude".to_string(), ("M", "R")),
@@ -3045,52 +3335,44 @@ mod tests {
             ]
             .into_iter()
             .collect(),
-            wanted: vec!["claude".into(), "codex".into()],
         };
-        let lists = AtomicUsize::new(0);
         let mut renames: Vec<(String, String)> = Vec::new();
+        // Prime the retitler's cache with PRE-swap titles: claude is
+        // master, codex reviewer.
+        let mut io = FakeIo::new(vec![Some(live(&[("claude", true), ("codex", false)]))]);
         state.handle(
-            None,
-            Some(glyphs()),
-            Vec::new(),
-            &mut FakeIo::new(vec![]),
-            || {
-                lists.fetch_add(1, Ordering::SeqCst);
-                Some(pre.to_string())
-            },
+            wb(None, Some(glyphs()), Vec::new()),
+            &mut io,
             |id, title| renames.push((id.to_string(), title.to_string())),
         );
-        assert_eq!(lists.load(Ordering::SeqCst), 1, "primed once");
+        assert_eq!(io.snapshots_taken, 1, "primed once");
         renames.clear();
 
         // A roster batch swaps the master (reconciler acts: relocate),
         // then the SAME worker retitles: it must re-list (cache
         // invalidated) and stamp post-swap roles — never the cached
         // pre-swap ones.
-        let live_post = live(&[("claude", false), ("codex", true)]);
+        let mut io = FakeIo::new(vec![
+            Some(live(&[("claude", true), ("codex", false)])),
+            Some(live(&[("claude", false), ("codex", true)])),
+        ]);
         state.handle(
-            Some(view(&["claude", "codex"], Some("codex"))),
-            Some(glyphs()),
-            Vec::new(),
-            &mut FakeIo::new(vec![
-                Some(live(&[("claude", true), ("codex", false)])),
-                Some(live_post),
-            ]),
-            || {
-                lists.fetch_add(1, Ordering::SeqCst);
-                Some(post.to_string())
-            },
+            wb(
+                Some(view(&["claude", "codex"], Some("codex"))),
+                Some(glyphs()),
+                Vec::new(),
+            ),
+            &mut io,
             |id, title| renames.push((id.to_string(), title.to_string())),
         );
         assert_eq!(
-            lists.load(Ordering::SeqCst),
-            2,
-            "acting reconcile invalidates the cache → retitle re-lists"
+            io.snapshots_taken, 2,
+            "the pass's listing, then the retitle's — acting reconcile invalidates the cache"
         );
         assert!(
             renames
                 .iter()
-                .any(|(id, t)| id == "terminal_2" && t.contains("codex (master)")),
+                .any(|(id, t)| id == "terminal_codex" && t.contains("codex (master)")),
             "post-swap role stamped from fresh titles: {renames:?}"
         );
         assert!(
@@ -3105,7 +3387,6 @@ mod tests {
         // if the required fresh list FAILS, the retitle pass must emit
         // ZERO renames rather than fall through to stale roles.
         let mut state = WorkerState::new();
-        let pre = "terminal_1  terminal  claude (master)\nterminal_2  terminal  codex (reviewer)";
         let glyphs = || StatusGlyphs {
             emoji: [
                 ("claude".to_string(), ("M", "R")),
@@ -3113,29 +3394,26 @@ mod tests {
             ]
             .into_iter()
             .collect(),
-            wanted: vec!["claude".into(), "codex".into()],
         };
         let mut renames: Vec<(String, String)> = Vec::new();
-        state.handle(
-            None,
-            Some(glyphs()),
-            Vec::new(),
-            &mut FakeIo::new(vec![]),
-            || Some(pre.to_string()),
-            |id, t| renames.push((id.to_string(), t.to_string())),
-        );
+        let mut io = FakeIo::new(vec![Some(live(&[("claude", true), ("codex", false)]))]);
+        state.handle(wb(None, Some(glyphs()), Vec::new()), &mut io, |id, t| {
+            renames.push((id.to_string(), t.to_string()))
+        });
         renames.clear();
 
         // Acting reconcile (master swap), then the fresh list FAILS.
+        let mut io = FakeIo::new(vec![
+            Some(live(&[("claude", true), ("codex", false)])),
+            None,
+        ]);
         state.handle(
-            Some(view(&["claude", "codex"], Some("codex"))),
-            Some(glyphs()),
-            Vec::new(),
-            &mut FakeIo::new(vec![
-                Some(live(&[("claude", true), ("codex", false)])),
-                Some(live(&[("claude", false), ("codex", true)])),
-            ]),
-            || None,
+            wb(
+                Some(view(&["claude", "codex"], Some("codex"))),
+                Some(glyphs()),
+                Vec::new(),
+            ),
+            &mut io,
             |id, t| renames.push((id.to_string(), t.to_string())),
         );
         assert!(
@@ -3150,10 +3428,7 @@ mod tests {
         // converged the live layout) while OUR cache still holds the
         // previous roster's roles — the glyph pass must re-list, not
         // rename the correct panes back to old roles.
-        use std::sync::atomic::{AtomicUsize, Ordering};
         let mut state = WorkerState::new();
-        let pre = "terminal_1  terminal  claude (master)\nterminal_2  terminal  codex (reviewer)";
-        let post = "terminal_1  terminal  claude (reviewer)\nterminal_2  terminal  codex (master)";
         let glyphs = || StatusGlyphs {
             emoji: [
                 ("claude".to_string(), ("M", "R")),
@@ -3161,45 +3436,93 @@ mod tests {
             ]
             .into_iter()
             .collect(),
-            wanted: vec!["claude".into(), "codex".into()],
         };
-        let lists = AtomicUsize::new(0);
         let mut renames: Vec<(String, String)> = Vec::new();
+        let pre = live(&[("claude", true), ("codex", false)]);
+        let mut io = FakeIo::new(vec![Some(pre.clone()), Some(pre)]);
         state.handle(
-            Some(view(&["claude", "codex"], Some("claude"))),
-            Some(glyphs()),
-            Vec::new(),
-            &mut FakeIo::new(vec![Some(live(&[("claude", true), ("codex", false)]))]),
-            || {
-                lists.fetch_add(1, Ordering::SeqCst);
-                Some(pre.to_string())
-            },
+            wb(
+                Some(view(&["claude", "codex"], Some("claude"))),
+                Some(glyphs()),
+                Vec::new(),
+            ),
+            &mut io,
             |id, t| renames.push((id.to_string(), t.to_string())),
         );
         renames.clear();
 
         // New roster arrives; the OTHER TUI already converged live
         // state (plan is empty → reconcile no-ops, acted = false).
+        let post = live(&[("claude", false), ("codex", true)]);
+        let mut io = FakeIo::new(vec![Some(post.clone()), Some(post)]);
         state.handle(
-            Some(view(&["claude", "codex"], Some("codex"))),
-            Some(glyphs()),
-            Vec::new(),
-            &mut FakeIo::new(vec![Some(live(&[("claude", false), ("codex", true)]))]),
-            || {
-                lists.fetch_add(1, Ordering::SeqCst);
-                Some(post.to_string())
-            },
+            wb(
+                Some(view(&["claude", "codex"], Some("codex"))),
+                Some(glyphs()),
+                Vec::new(),
+            ),
+            &mut io,
             |id, t| renames.push((id.to_string(), t.to_string())),
         );
         assert_eq!(
-            lists.load(Ordering::SeqCst),
-            2,
-            "roster change re-lists even though reconcile no-oped"
+            io.snapshots_taken, 2,
+            "the pass's listing, then the retitle's: a roster change re-lists even though reconcile no-oped"
         );
         assert!(
             !renames.iter().any(|(_, t)| t.contains("codex (reviewer)")),
             "already-correct panes never renamed back to old roles: {renames:?}"
         );
+    }
+
+    #[test]
+    fn a_retitle_that_must_list_and_a_probe_share_one_listing() {
+        // The retitler's map and presence are two projections of ONE
+        // listing: an unprimed retitler plus a probe in the same batch
+        // is a single snapshot, and both come out of it (codex on
+        // e310988).
+        let mut state = WorkerState::new();
+        let mut io = FakeIo::new(vec![Some(live(&[("claude", true), ("codex", false)]))]);
+        let mut renames: Vec<(String, String)> = Vec::new();
+        let reports = state.handle(
+            WorkerBatch {
+                glyphs: Some(StatusGlyphs {
+                    emoji: [
+                        ("claude".to_string(), ("M", "R")),
+                        ("codex".to_string(), ("M", "R")),
+                    ]
+                    .into_iter()
+                    .collect(),
+                }),
+                probe: true,
+                ..Default::default()
+            },
+            &mut io,
+            |id, t| renames.push((id.to_string(), t.to_string())),
+        );
+        assert_eq!(io.snapshots_taken, 1, "one listing for both");
+        assert_eq!(renames.len(), 2, "both panes stamped off it: {renames:?}");
+        assert_eq!(
+            presence_of(&reports),
+            Some(Some(vec!["claude".into(), "codex".into()])),
+            "presence off the same listing"
+        );
+        // And a retitle that had to list reports presence even when
+        // nobody probed — the listing was taken; the fact is free.
+        let mut state = WorkerState::new();
+        let mut io = FakeIo::new(vec![Some(live(&[("claude", true)]))]);
+        let reports = state.handle(
+            wb(
+                None,
+                Some(StatusGlyphs {
+                    emoji: [("claude".to_string(), ("M", "R"))].into_iter().collect(),
+                }),
+                Vec::new(),
+            ),
+            &mut io,
+            |_, _| {},
+        );
+        assert_eq!(io.snapshots_taken, 1);
+        assert_eq!(presence_of(&reports), Some(Some(vec!["claude".into()])));
     }
 
     #[test]
@@ -3222,20 +3545,22 @@ mod tests {
     }
 
     #[test]
-    fn parse_agent_panes_from_live_list_panes() {
+    fn titled_agent_panes_from_a_live_listing() {
         use clank_core::vocab::Role;
-        // Exact `zellij action list-panes` shape (0.44.3); terminal_1
+        // `list-panes --json` titles as zellij reports them; terminal_1
         // carries a stale glyph that must be stripped.
-        let out = "\
-PANE_ID  TYPE  TITLE
-plugin_0  plugin  (.) - zellij:link
-terminal_0  terminal  claude (master)
-terminal_1  terminal  👀 codex (reviewer)
-terminal_2  terminal  status
-terminal_3  terminal  ruthless (reviewer)
-";
+        let panes: Vec<crate::cli::open_zellij::ZellijPane> = serde_json::from_str(
+            r#"[
+              {"id":0,"is_plugin":true,"title":"(.) - zellij:link"},
+              {"id":0,"is_plugin":false,"title":"claude (master)"},
+              {"id":1,"is_plugin":false,"title":"👀 codex (reviewer)"},
+              {"id":2,"is_plugin":false,"title":"status"},
+              {"id":3,"is_plugin":false,"title":"ruthless (reviewer)"}
+            ]"#,
+        )
+        .unwrap();
         assert_eq!(
-            parse_agent_panes(out),
+            crate::cli::open_zellij::titled_agent_panes(&panes),
             vec![
                 ("terminal_0".to_string(), "claude".to_string(), Role::Master),
                 (
@@ -3253,38 +3578,29 @@ terminal_3  terminal  ruthless (reviewer)
     }
 
     #[test]
-    fn pane_status_caches_list_panes_and_renames_only_on_change() {
-        // Fix 3 (status-tui-watch-cpu): the pane→agent map is fetched
-        // ONCE and reused — no `list-panes` subprocess per render — and
-        // a pane is renamed only when its emoji actually changes.
-        use std::cell::{Cell, RefCell};
+    fn pane_status_renames_only_on_change() {
+        // A pane is renamed only when its emoji actually changes: the
+        // rows arrive fresh with every refresh's listing, and the dedup
+        // is what keeps that from being a rename per refresh.
+        use std::cell::RefCell;
 
-        let panes_out = "0 PANE claude (master)\n1 PANE codex (reviewer)\n";
-        let list_calls = Cell::new(0usize);
+        use clank_core::vocab::Role;
+        let rows = vec![
+            ("0".to_string(), "claude".to_string(), Role::Master),
+            ("1".to_string(), "codex".to_string(), Role::Reviewer),
+        ];
         let renames = RefCell::new(Vec::<(String, String)>::new());
-        let mut ps = PaneStatus {
-            last: std::collections::HashMap::new(),
-            panes: Vec::new(),
-            primed: false,
-            requeried_absent: std::collections::HashSet::new(),
-        };
+        let mut ps = PaneStatus::new();
         let go = |ps: &mut PaneStatus, s: &StatusSnapshot| {
-            ps.update_with(
-                &StatusGlyphs::of(s),
-                || {
-                    list_calls.set(list_calls.get() + 1);
-                    Some(panes_out.to_string())
-                },
-                |id, title| {
-                    renames
-                        .borrow_mut()
-                        .push((id.to_string(), title.to_string()))
-                },
-            );
+            ps.update_with(&StatusGlyphs::of(s), Some(rows.clone()), |id, title| {
+                renames
+                    .borrow_mut()
+                    .push((id.to_string(), title.to_string()))
+            });
         };
 
-        // Glyph derivation now reads the ROSTER (StatusGlyphs::of), so
-        // the fixture must carry the team: claude master, codex commit.
+        // Glyph derivation reads the ROSTER (StatusGlyphs::of), so the
+        // fixture must carry the team: claude master, codex commit.
         let with_team = |mut s: StatusSnapshot| -> StatusSnapshot {
             s.agents = vec![
                 crate::cli::status::AgentAutoRow {
@@ -3310,21 +3626,19 @@ terminal_3  terminal  ruthless (reviewer)
             s
         };
 
-        // First render: one `list-panes`; both agent panes get a title.
+        // First refresh: both agent panes get a title.
         let awaited = with_team(snap(
             vec![plan_state("p", reviewer_missing("codex"))],
             vec![],
         ));
         go(&mut ps, &awaited);
-        assert_eq!(list_calls.get(), 1, "primed with one list-panes");
         let after_first = renames.borrow().len();
-        assert_eq!(after_first, 2, "both panes renamed on first render");
+        assert_eq!(after_first, 2, "both panes renamed on first refresh");
 
-        // Same snapshot, many renders: NO further list-panes, NO renames.
+        // Same snapshot, many refreshes: NO renames.
         for _ in 0..5 {
             go(&mut ps, &awaited);
         }
-        assert_eq!(list_calls.get(), 1, "list-panes reused from cache");
         assert_eq!(
             renames.borrow().len(),
             after_first,
@@ -3333,17 +3647,28 @@ terminal_3  terminal  ruthless (reviewer)
 
         // Master's turn instead: the plan's wait state toggles BOTH
         // emojis at once — master 💤→🔨 and codex 👀→💤 — so two panes
-        // rename. Still no re-query: both panes are cached.
+        // rename.
         let idle = with_team(snap(
             vec![plan_state("p", WaitingOn::MasterToContinue)],
             vec![],
         ));
         go(&mut ps, &idle);
-        assert_eq!(list_calls.get(), 1, "no re-query: panes already cached");
         assert_eq!(
             renames.borrow().len(),
             after_first + 2,
             "both flipped panes renamed"
+        );
+
+        // A refresh whose listing failed stamps off the rows it has.
+        ps.update_with(&StatusGlyphs::of(&idle), None, |id, title| {
+            renames
+                .borrow_mut()
+                .push((id.to_string(), title.to_string()))
+        });
+        assert_eq!(
+            renames.borrow().len(),
+            after_first + 2,
+            "nothing changed, nothing renamed"
         );
     }
 
@@ -3353,12 +3678,14 @@ terminal_3  terminal  ruthless (reviewer)
         // The shared builder's output is recoverable by the parser —
         // pins layout + renamer to one format (no silent drift).
         for (role, label) in [(Role::Master, "alice"), (Role::Reviewer, "bob")] {
-            let line = format!(
-                "terminal_9  terminal  {}",
+            let json = format!(
+                r#"[{{"id":9,"is_plugin":false,"title":"{}"}}]"#,
                 agent_pane_title(label, role.as_str())
             );
+            let panes: Vec<crate::cli::open_zellij::ZellijPane> =
+                serde_json::from_str(&json).unwrap();
             assert_eq!(
-                parse_agent_panes(&line),
+                crate::cli::open_zellij::titled_agent_panes(&panes),
                 vec![("terminal_9".to_string(), label.to_string(), role)]
             );
         }

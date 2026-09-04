@@ -164,9 +164,10 @@ clank status --tui      # full-screen: the way you actually drive it
 ```
 
 The TUI is the primary interface once a team is running: agent rows
-with live state, per-agent pages (auto-mode, review tier, swap,
-reopen a closed pane, remove), the plan and its verdicts, queued
-plans, and github event pages. `--watch` gives a live non-fullscreen view; `-j` emits JSON.
+with live state (`?` marks an agent whose pane is not open),
+per-agent pages (auto-mode, review tier, swap, reopen a closed pane,
+remove), the plan and its verdicts, queued plans, and github event
+pages. `--watch` gives a live non-fullscreen view; `-j` emits JSON.
 
 Enter selects whatever the cursor is on; every screen shows its own
 keys along the bottom.

@@ -24,16 +24,20 @@ pub(super) fn tier_label(role: crate::cli::teams_config::RosterRole) -> &'static
     }
 }
 
-/// The armed auto-mode mark in a FIXED [`MARK_FIELD`]-wide field —
-/// `▶` (playing, green) when auto runs the agent's loop, `⏸` (paused,
-/// dim) when parked. Padding the glyph into a fixed field (not relying
-/// on the two glyphs happening to share a width) is what keeps the
-/// name column from jittering between on/off rows.
-pub(super) fn auto_mark(mode: clank_core::vocab::AutoMode) -> Span {
+/// The agent's mark in a FIXED [`MARK_FIELD`]-wide field — `▶`
+/// (playing, green) when auto runs the agent's loop, `⏸` (paused,
+/// dim) when parked, and `?` (dim) when the agent has no live pane:
+/// an agent that is not open is not playing, whatever its auto-mode
+/// says (the-tui-knows-whether-a-pane-is-open). Padding the glyph
+/// into a fixed field (not relying on the glyphs happening to share
+/// a width) is what keeps the name column from jittering between
+/// rows.
+pub(super) fn auto_mark(mode: clank_core::vocab::AutoMode, presence: Presence) -> Span {
     use clank_core::vocab::AutoMode;
-    let (style, glyph) = match mode {
-        AutoMode::On => (Style::Color("32"), "▶"),
-        AutoMode::Off => (Style::Dim, "⏸"),
+    let (style, glyph) = match (presence, mode) {
+        (Presence::Missing, _) => (Style::Dim, "?"),
+        (_, AutoMode::On) => (Style::Color("32"), "▶"),
+        (_, AutoMode::Off) => (Style::Dim, "⏸"),
     };
     let pad = MARK_FIELD.saturating_sub(display_width(glyph));
     Span(style, format!("{glyph}{}", " ".repeat(pad)))
@@ -122,7 +126,10 @@ pub(super) fn render_at(
     if let Mode::AgentDetail { idx, sel } = mode
         && let Some(agent) = snap.agents.get(idx)
     {
-        let actions = detail_actions(agent.role);
+        let actions = detail_actions(agent.role, view.presence_of(&agent.label));
+        // The loop settles the cursor by action before every frame;
+        // this is only the guard against an index past the end.
+        let sel = sel.min(actions.len().saturating_sub(1));
         return render_agent_detail(agent, &actions, sel, rows, cols);
     }
     if let Mode::WaitDetail { agent, sel } = mode
@@ -511,7 +518,7 @@ pub(super) fn scrollable_header(
         };
         for (i, a) in snap.agents.iter().enumerate() {
             let mut spans = vec![
-                auto_mark(a.auto_mode),
+                auto_mark(a.auto_mode, view.presence_of(&a.label)),
                 plain(format!(" {}", a.label)),
                 dim(format!("  {}", tier_label(a.role))),
             ];
@@ -2996,6 +3003,7 @@ mod tests {
                             picker: &[],
                             log_cursor: 0,
                             reach: crate::cli::status_tui::zellij::ZellijReach::NotInSession,
+                            presence: None,
                             lift,
                         };
                         let header_len = scrollable_header(s, rows, 60, 0, &view).len();
@@ -3034,6 +3042,7 @@ mod tests {
             picker: &[],
             log_cursor: cursor,
             reach: crate::cli::status_tui::zellij::ZellijReach::NotInSession,
+            presence: None,
             lift,
         }
     }
@@ -3247,6 +3256,7 @@ mod tests {
             log_cursor: 6,
             lift: 0,
             reach: crate::cli::status_tui::zellij::ZellijReach::NotInSession,
+            presence: None,
         };
         let rule_of = |offset: usize| {
             let out = render_at(&s, 12, 60, offset, 0, &view).0;
@@ -3945,8 +3955,8 @@ mod tests {
         use clank_core::vocab::AutoMode;
         // The on/off marks MUST occupy the same display width or the name
         // column jitters between rows. The fixed MARK_FIELD guarantees it.
-        let on = auto_mark(AutoMode::On);
-        let off = auto_mark(AutoMode::Off);
+        let on = auto_mark(AutoMode::On, Presence::Live);
+        let off = auto_mark(AutoMode::Off, Presence::Live);
         assert_eq!(
             display_width(&on.1),
             MARK_FIELD,
@@ -3958,6 +3968,76 @@ mod tests {
             "pause mark fills the field"
         );
         assert_eq!(display_width(&on.1), display_width(&off.1), "equal width");
+    }
+
+    /// An agent with no live pane is not playing, whatever its
+    /// auto-mode says: `?` in the same field, so the name column does
+    /// not move (the-tui-knows-whether-a-pane-is-open).
+    #[test]
+    fn a_missing_pane_marks_the_row_with_a_question_mark() {
+        use clank_core::vocab::AutoMode;
+        for mode in [AutoMode::On, AutoMode::Off] {
+            let missing = auto_mark(mode, Presence::Missing);
+            assert_eq!(missing.1.trim(), "?", "{mode:?}");
+            assert_eq!(
+                display_width(&missing.1),
+                MARK_FIELD,
+                "{mode:?}: same field"
+            );
+            assert!(matches!(missing.0, Style::Dim), "{mode:?}: dim, not green");
+        }
+        for presence in [Presence::Live, Presence::Unknown] {
+            assert_eq!(
+                auto_mark(AutoMode::On, presence).1.trim(),
+                "▶",
+                "{presence:?}"
+            );
+            assert_eq!(
+                auto_mark(AutoMode::Off, presence).1.trim(),
+                "⏸",
+                "{presence:?}"
+            );
+        }
+        // On the panel: the missing agent's row, and only that row.
+        let s = two_agent_snap();
+        let mut view = PanelView::just(Mode::AgentPanel { sel: 0 });
+        view.presence = Some([s.agents[0].label.clone()].into_iter().collect());
+        let rows = render_at(&s, 40, 80, 0, 0, &view).0;
+        let texts: Vec<String> = rows.iter().map(|l| visible(l)).collect();
+        let row_of = |label: &str| {
+            texts
+                .iter()
+                .find(|t| t.contains(&format!(" {label}")))
+                .unwrap_or_else(|| panic!("row for {label}: {texts:?}"))
+                .clone()
+        };
+        assert!(
+            row_of(&s.agents[0].label).starts_with('▶')
+                || row_of(&s.agents[0].label).starts_with('⏸')
+        );
+        assert!(
+            row_of(&s.agents[1].label).starts_with('?'),
+            "{}",
+            row_of(&s.agents[1].label)
+        );
+    }
+
+    /// The reopen row leaves when the pane comes back; a cursor that was
+    /// on it lands on a real row, not past the end.
+    #[test]
+    fn the_detail_cursor_clamps_when_the_reopen_row_leaves() {
+        let s = two_agent_snap();
+        let mut view = PanelView::just(Mode::AgentDetail { idx: 1, sel: 99 });
+        view.presence = Some(s.agents.iter().map(|a| a.label.clone()).collect());
+        let page = render_at(&s, 40, 80, 0, 0, &view).0.join("\n");
+        let band = page
+            .lines()
+            .find(|l| l.contains("▸ "))
+            .expect("a selected row");
+        assert!(
+            visible(band).contains("back"),
+            "the cursor lands on the last real row: {band}"
+        );
     }
 
     #[test]
@@ -4068,6 +4148,7 @@ mod tests {
                 log_cursor: 0,
                 lift: 0,
                 reach: crate::cli::status_tui::zellij::ZellijReach::NotInSession,
+                presence: None,
             },
         )
         .0;
@@ -4116,6 +4197,7 @@ mod tests {
             log_cursor: 0,
             lift: 0,
             reach: crate::cli::status_tui::zellij::ZellijReach::NotInSession,
+            presence: None,
         };
 
         // Tiny pane: never more lines than rows, and no element spans
@@ -4219,6 +4301,7 @@ mod tests {
                 log_cursor: 0,
                 lift: 0,
                 reach: crate::cli::status_tui::zellij::ZellijReach::NotInSession,
+                presence: None,
             },
         )
         .0
@@ -4573,6 +4656,7 @@ mod tests {
             log_cursor: 1,
             lift: 0,
             reach: crate::cli::status_tui::zellij::ZellijReach::NotInSession,
+            presence: None,
         };
         let lines = render_at(&s, 40, 80, 0, 0, &view).0;
         assert!(
@@ -5975,14 +6059,15 @@ mod tests {
     }
 
     /// Reopen is an action on the workspace, not on the roster: plain,
-    /// not red, and present on the master's page as well.
+    /// not red, and present on the master's page as well — when the
+    /// pane is missing.
     #[test]
     fn the_reopen_row_is_plain_and_on_every_page() {
         use crate::cli::teams_config::RosterRole;
         use clank_core::vocab::AutoMode;
         for role in [RosterRole::Master, RosterRole::Commit] {
             let agent = agent_row("kimi", role, AutoMode::On);
-            let actions = detail_actions(role);
+            let actions = detail_actions(role, Presence::Missing);
             let sel = actions
                 .iter()
                 .position(|a| *a == DetailAction::Reopen)
@@ -6007,7 +6092,7 @@ mod tests {
         use crate::cli::teams_config::RosterRole;
         use clank_core::vocab::AutoMode;
         let agent = agent_row("kimi", RosterRole::Commit, AutoMode::On);
-        let actions = detail_actions(RosterRole::Commit);
+        let actions = detail_actions(RosterRole::Commit, Presence::Live);
         let sel = actions
             .iter()
             .position(|a| *a == DetailAction::Swap)
@@ -6039,7 +6124,7 @@ mod tests {
         use crate::cli::teams_config::RosterRole;
         use clank_core::vocab::AutoMode;
         let agent = agent_row("codex", RosterRole::Commit, AutoMode::On);
-        let actions = detail_actions(RosterRole::Commit); // auto,tier,promote,remove,back
+        let actions = detail_actions(RosterRole::Commit, Presence::Live); // auto,tier,promote,remove,back
         // Select the auto toggle (row 0).
         let (lines, _) = render_agent_detail(&agent, &actions, 0, 24, 60);
         let texts: Vec<String> = lines.iter().map(|l| visible(l)).collect();

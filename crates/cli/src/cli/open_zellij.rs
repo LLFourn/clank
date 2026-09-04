@@ -1094,6 +1094,23 @@ pub(crate) fn agent_pane_pairs(panes: &[ZellijPane], repo: &Path) -> Vec<(String
         .collect()
 }
 
+/// This repo's agent labels with a LIVE pane: the process the launch
+/// command started is still running. [`agent_pane_pairs`] counts a
+/// pane zellij keeps open after its process ended — identity, so the
+/// corpse can be found and closed — but "is this agent open" is a
+/// question about the process (the-tui-knows-whether-a-pane-is-open).
+pub(crate) fn live_agent_labels(
+    panes: &[ZellijPane],
+    repo: &Path,
+) -> std::collections::BTreeSet<String> {
+    let repo_str = repo.to_string_lossy();
+    panes
+        .iter()
+        .filter(|p| !p.exited)
+        .filter_map(|p| agent_pane_label(p, &repo_str).map(str::to_owned))
+        .collect()
+}
+
 /// Put focus back on `id` after a focus-stealing reconcile op.
 ///
 /// Pass-level focus restore (zellij-one-listing-per-pass): the worker
@@ -1626,18 +1643,27 @@ pub(crate) fn rename_tab(id: &str, name: &str) {
         .output();
 }
 
-/// Raw `list-panes` text (`PANE_ID  TYPE  TITLE`, one per line) — the
-/// cheap listing the retitler parses. Distinct from
-/// [`list_agent_panes`], which is the `--json` form the reconciler
-/// needs geometry from.
-pub(crate) fn list_panes_text() -> Option<String> {
-    let out = std::process::Command::new("zellij")
-        .args(["action", "list-panes"])
-        .output()
-        .ok()?;
-    out.status
-        .success()
-        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+/// `(pane id, label, role)` for every pane whose TITLE (after any
+/// status glyph) is `"<label> (master)"` / `"<label> (reviewer)"` —
+/// the exact format [`agent_pane_title`] emits. The retitler's map:
+/// by title, not command, because the title carries the ROLE the
+/// pane was last stamped with. Non-agent panes (status, plugins)
+/// don't match and are skipped. Pure.
+pub(crate) fn titled_agent_panes(
+    panes: &[ZellijPane],
+) -> Vec<(String, String, clank_core::vocab::Role)> {
+    use clank_core::vocab::Role;
+    let mut out = Vec::new();
+    for pane in panes {
+        let base = crate::cli::status_tui::strip_leading_emoji(&pane.title);
+        for role in [Role::Master, Role::Reviewer] {
+            if let Some(label) = base.strip_suffix(&format!(" ({})", role.as_str())) {
+                out.push((pane.pane_id(), label.to_string(), role));
+                break;
+            }
+        }
+    }
+    out
 }
 
 pub(crate) fn rename_pane(id: &str, name: &str) {
@@ -3495,6 +3521,31 @@ ttys004   zellij attach clank-foo
     /// The pane is born in the stack instead of being created loose and
     /// moved — the move is a second action, and zellij draws the pane
     /// in its default spot before it lands.
+    /// Whatever creates the pane — the layout, an add, a reopen — the
+    /// pane runs `clank agent start`, and THAT is where the session's
+    /// holder is found before anything resumes (a-session-has-one-
+    /// holder). A pane that launched the tool directly would skip it.
+    #[test]
+    fn every_new_pane_launches_through_agent_start() {
+        for stacked in [true, false] {
+            let argv = new_pane_argv("ruthless", "/repo", stacked);
+            let sep = argv
+                .iter()
+                .position(|a| a == "--")
+                .expect("a `--` separator");
+            assert_eq!(
+                argv[sep + 1..],
+                ["clank", "agent", "start", "ruthless", "--repo", "/repo"],
+                "{argv:?}"
+            );
+            assert_eq!(
+                argv[sep + 1..].join(" "),
+                agent_start_command("ruthless", "/repo"),
+                "byte-identical to the identity the scans match on"
+            );
+        }
+    }
+
     #[test]
     fn new_pane_is_born_stacked_only_when_there_is_a_stack() {
         let with = new_pane_argv("ruthless", "/repo", true);
