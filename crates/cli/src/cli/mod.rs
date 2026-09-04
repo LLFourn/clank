@@ -40,6 +40,7 @@ pub mod rereview;
 pub mod rewire;
 pub mod rewrite;
 pub mod run;
+pub(crate) mod session_holder;
 pub mod setup;
 pub mod stash;
 pub mod status;

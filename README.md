@@ -351,3 +351,12 @@ a real run):
 `WARN … drifted from embedded content` after an upgrade means the
 binary's embedded skills are newer than the installed files — run
 `clank setup --force`.
+
+An agent pane that says **`<label>` is already running in zellij
+session `…`, tab `…`** found a live pane elsewhere with the same
+agent — usually a tab in another session you opened earlier. Close
+that pane or use it there; a session has one holder, and a second
+resume of it is what the tool itself refuses. A claude agent whose
+tab was closed keeps running as a background session; `clank agent
+start` notices and `claude attach`es to it instead of resuming, so the
+conversation carries on where it was.

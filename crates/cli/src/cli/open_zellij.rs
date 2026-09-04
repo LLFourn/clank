@@ -944,7 +944,7 @@ pub(crate) fn agent_start_argv(label: &str, repo_path: &str) -> Vec<String> {
 /// <repo>`. This is an agent pane's UNIQUE identity within a session —
 /// the bare label repeats across worktree tabs, but the absolute
 /// `--repo` path disambiguates them.
-fn agent_start_command(label: &str, repo_path: &str) -> String {
+pub(crate) fn agent_start_command(label: &str, repo_path: &str) -> String {
     format!("clank {}", agent_start_argv(label, repo_path).join(" "))
 }
 
@@ -979,6 +979,9 @@ pub(crate) struct ZellijPane {
     /// to close in [`remove_target_ids`].
     #[serde(default)]
     exited: bool,
+    /// Present only with `--tab`; empty otherwise.
+    #[serde(default)]
+    tab_name: String,
     /// Pane geometry (terminal cells) from `list-panes --json`: top-left
     /// position + size. Feeds [`tab_dims`] so orientation is read from the
     /// tab's true extent, not the caller's own pane. Default 0 when absent.
@@ -995,9 +998,23 @@ pub(crate) struct ZellijPane {
 impl ZellijPane {
     /// The pane-id string zellij's `focus-pane-id` / `close-pane
     /// --pane-id` accept (`terminal_<id>` / `plugin_<id>`).
-    fn pane_id(&self) -> String {
+    pub(crate) fn pane_id(&self) -> String {
         let kind = if self.is_plugin { "plugin" } else { "terminal" };
         format!("{kind}_{}", self.id)
+    }
+
+    /// Whether a RUNNING process in this pane was launched with exactly
+    /// `command`. `exited` matters here and nowhere else in identity: a
+    /// pane zellij keeps open after its process ended still reports the
+    /// command, and [`find_pane_by_command`] wants that (so a dead copy
+    /// can be found and closed), but a dead pane holds no session
+    /// (a-session-has-one-holder).
+    pub(crate) fn runs(&self, command: &str) -> bool {
+        !self.is_plugin && !self.exited && self.terminal_command.as_deref() == Some(command)
+    }
+
+    pub(crate) fn tab_name(&self) -> &str {
+        &self.tab_name
     }
 }
 
@@ -1402,6 +1419,138 @@ pub(crate) struct ReviewerPaneAdd {
 fn caller_pane_id() -> Option<String> {
     let id = std::env::var("ZELLIJ_PANE_ID").ok()?;
     (!id.is_empty()).then(|| format!("terminal_{id}"))
+}
+
+/// Where the calling clank process runs, for a scan that must not
+/// count the caller's own pane as a holder: `clank agent start` runs
+/// INSIDE the pane whose `terminal_command` it would otherwise find.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum CallerIdentity {
+    /// No pane is the caller.
+    NotInZellij,
+    /// Inside zellij without a pane id: some pane MAY be the caller,
+    /// and there is no way to tell which.
+    Unidentified,
+    /// Pane ids repeat across sessions, so the pair is the identity.
+    Pane { session: String, pane_id: String },
+}
+
+pub(crate) fn caller_identity() -> CallerIdentity {
+    if !in_session() {
+        return CallerIdentity::NotInZellij;
+    }
+    let session = std::env::var("ZELLIJ_SESSION_NAME")
+        .ok()
+        .filter(|s| !s.is_empty());
+    match (session, caller_pane_id()) {
+        (Some(session), Some(pane_id)) => CallerIdentity::Pane { session, pane_id },
+        _ => CallerIdentity::Unidentified,
+    }
+}
+
+/// A pane tagged with the session it lives in.
+#[derive(Debug)]
+pub(crate) struct SessionPane {
+    pub(crate) session: String,
+    pub(crate) pane: ZellijPane,
+}
+
+/// The names of sessions whose server is up, from `list-sessions -n`
+/// output: the first token of each line, skipping the EXITED ones
+/// (their server is gone and would not answer an action anyway).
+fn live_session_names(list_output: &str) -> Vec<String> {
+    list_output
+        .lines()
+        .filter(|l| !l.contains("EXITED"))
+        .filter_map(|l| l.split_whitespace().next())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Every pane of every live session, each tagged with its session:
+/// one `list-panes` per session, all started at once, collected until
+/// `deadline`. A session that has not answered by then is killed and
+/// dropped — measured here: two stale two-month-old servers took 8.7 s
+/// and 4.8 s to answer while every healthy one took under 0.2 s, and
+/// an agent launch cannot wait on that. Dropping a session means its
+/// panes are not seen, which fails OPEN (no holder found).
+pub(crate) fn panes_in_all_sessions(deadline: std::time::Duration) -> Vec<SessionPane> {
+    use std::io::Read;
+    use std::process::Stdio;
+
+    struct Pending {
+        session: String,
+        child: std::process::Child,
+        reader: std::thread::JoinHandle<Vec<u8>>,
+    }
+    let mut pending: Vec<Pending> = live_session_names(&zellij_list_sessions())
+        .into_iter()
+        .filter_map(|session| {
+            let mut child = std::process::Command::new("zellij")
+                .args([
+                    "-s",
+                    &session,
+                    "action",
+                    "list-panes",
+                    "--json",
+                    "--command",
+                    "--tab",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .ok()?;
+            let mut stdout = child.stdout.take()?;
+            // Drained on its own thread so a listing larger than the
+            // pipe buffer cannot wedge the child before it exits.
+            let reader = std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                let _ = stdout.read_to_end(&mut buf);
+                buf
+            });
+            Some(Pending {
+                session,
+                child,
+                reader,
+            })
+        })
+        .collect();
+
+    let started = std::time::Instant::now();
+    let mut panes = Vec::new();
+    loop {
+        let mut i = 0;
+        while i < pending.len() {
+            match pending[i].child.try_wait() {
+                Ok(Some(status)) => {
+                    let done = pending.swap_remove(i);
+                    if status.success()
+                        && let Ok(buf) = done.reader.join()
+                        && let Ok(listed) = serde_json::from_slice::<Vec<ZellijPane>>(&buf)
+                    {
+                        panes.extend(listed.into_iter().map(|pane| SessionPane {
+                            session: done.session.clone(),
+                            pane,
+                        }));
+                    }
+                }
+                Ok(None) => i += 1,
+                Err(_) => {
+                    pending.swap_remove(i);
+                }
+            }
+        }
+        if pending.is_empty() || started.elapsed() >= deadline {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    for mut late in pending {
+        let _ = late.child.kill();
+        let _ = late.child.wait();
+    }
+    panes
 }
 
 /// Whether `new-pane` can place a pane INTO a stack as it creates it.
@@ -2584,6 +2733,7 @@ ttys004   zellij attach clank-foo
             tab_id: tab,
             is_focused: false,
             exited: false,
+            tab_name: String::new(),
             pane_x: x,
             pane_y: y,
             pane_columns: w,
@@ -2630,6 +2780,7 @@ ttys004   zellij attach clank-foo
             tab_id: 1,
             is_focused: false,
             exited: false,
+            tab_name: String::new(),
             pane_x: x,
             pane_y: y,
             pane_columns: w,
@@ -2660,6 +2811,7 @@ ttys004   zellij attach clank-foo
             tab_id: 1,
             is_focused: false,
             exited: false,
+            tab_name: String::new(),
             pane_x: 116,
             pane_y: y,
             pane_columns: w,
@@ -2707,6 +2859,7 @@ ttys004   zellij attach clank-foo
             tab_id: tab,
             is_focused: false,
             exited: false,
+            tab_name: String::new(),
             pane_x: 116,
             pane_y: 1,
             pane_columns: 62,
@@ -2738,6 +2891,7 @@ ttys004   zellij attach clank-foo
             tab_id: tab,
             is_focused: false,
             exited: false,
+            tab_name: String::new(),
             pane_x: 116,
             pane_y: y,
             pane_columns: 62,
@@ -2767,6 +2921,7 @@ ttys004   zellij attach clank-foo
             tab_id: 1,
             is_focused: false,
             exited: false,
+            tab_name: String::new(),
             pane_x: 116,
             pane_y: y,
             pane_columns: 62,
@@ -2803,6 +2958,7 @@ ttys004   zellij attach clank-foo
             tab_id: 0,
             is_focused: false,
             exited: false,
+            tab_name: String::new(),
             pane_x: x,
             pane_y: y,
             pane_columns: w,
@@ -2846,6 +3002,7 @@ ttys004   zellij attach clank-foo
             tab_id: 0,
             is_focused: false,
             exited: false,
+            tab_name: String::new(),
             pane_x: x,
             pane_y: y,
             pane_columns: w,
@@ -2899,6 +3056,7 @@ ttys004   zellij attach clank-foo
             tab_id: 0,
             is_focused: false,
             exited: false,
+            tab_name: String::new(),
             pane_x: 0,
             pane_y: 0,
             pane_columns: 0,
@@ -3980,6 +4138,38 @@ ttys004   zellij attach clank-foo
     }
 
     // ── session dedup (zellij-session-dedup) ──
+
+    #[test]
+    fn live_session_names_skip_the_dead_and_keep_the_current() {
+        let listing = "\
+clank-clank [Created 31m 15s ago] (current)
+other-repo [Created 2h ago]
+dead-one [Created 10h ago] (EXITED - attach to resurrect)
+";
+        assert_eq!(live_session_names(listing), ["clank-clank", "other-repo"]);
+        assert!(live_session_names("").is_empty());
+    }
+
+    #[test]
+    fn a_pane_runs_a_command_only_while_its_process_lives() {
+        let json = |exited: bool, plugin: bool| {
+            format!(
+                r#"{{"id":4,"is_plugin":{plugin},"exited":{exited},"title":"t",
+                    "terminal_command":"clank agent start codex --repo /r","tab_name":"r"}}"#
+            )
+        };
+        let pane = |exited, plugin| -> ZellijPane {
+            serde_json::from_str(&json(exited, plugin)).expect("list-panes element")
+        };
+        let cmd = "clank agent start codex --repo /r";
+        assert!(pane(false, false).runs(cmd));
+        assert!(!pane(true, false).runs(cmd), "an exited pane holds nothing");
+        assert!(!pane(false, true).runs(cmd), "a plugin pane runs no agent");
+        assert!(!pane(false, false).runs("clank agent start codex --repo /other"));
+        assert_eq!(pane(false, false).tab_name(), "r");
+        // The identity match deliberately still sees the exited copy.
+        assert!(find_pane_by_command(&[pane(true, false)], cmd).is_some());
+    }
 
     #[test]
     fn decide_session_three_branches() {

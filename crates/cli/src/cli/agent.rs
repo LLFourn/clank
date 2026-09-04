@@ -19,6 +19,7 @@ use anyhow::Context;
 use serde::Serialize;
 
 use crate::agent_store::load_agent_config;
+use crate::cli::session_holder::{self, Holder};
 use crate::cli::teams_config::{
     AgentDescription, RepoConfigFile, ReviewKind, RosterAgent, RosterRole, UserConfigFile,
 };
@@ -232,23 +233,45 @@ fn start(args: AgentStartArgs) -> anyhow::Result<()> {
                 None => (compose_bootstrap_launch(&repo, &label, &desc)?, desc.tool),
             }
         }
-        Some(session) => {
-            let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-            let auto_mode =
-                crate::cli::team::resolve_effective_auto_mode(cfg.as_ref(), home.as_deref());
-            let resolved_prompt =
-                resolve_initial_prompt(desc.initial_prompt.as_deref(), auto_mode, session.tool);
-            (
-                compose_launch(
-                    &repo,
-                    &label,
-                    session,
-                    desc.launch.as_ref(),
-                    resolved_prompt.as_deref(),
-                ),
+        Some(session) => match session_holder::find(
+            session,
+            &label,
+            &repo_as_given(&args, &repo),
+            launch_program(Tool::Claude, desc.launch.as_ref()),
+        ) {
+            Holder::Pane {
+                session: held_in,
+                tab,
+            } => anyhow::bail!(
+                "`{label}` is already running in zellij session `{held_in}`, tab `{tab}`. \
+                 This pane would resume the same {} conversation a second time, which {} \
+                 refuses. Close that pane, or attach to that session instead \
+                 (`zellij attach {held_in}`).",
+                session.tool.as_str(),
+                session.tool.as_str(),
+            ),
+            Holder::ClaudeBackground { short_id } => (
+                compose_attach_launch(session.tool, desc.launch.as_ref(), &short_id),
                 session.tool,
-            )
-        }
+            ),
+            Holder::Nobody => {
+                let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+                let auto_mode =
+                    crate::cli::team::resolve_effective_auto_mode(cfg.as_ref(), home.as_deref());
+                let resolved_prompt =
+                    resolve_initial_prompt(desc.initial_prompt.as_deref(), auto_mode, session.tool);
+                (
+                    compose_launch(
+                        &repo,
+                        &label,
+                        session,
+                        desc.launch.as_ref(),
+                        resolved_prompt.as_deref(),
+                    ),
+                    session.tool,
+                )
+            }
+        },
     };
 
     if args.print {
@@ -268,6 +291,40 @@ fn start(args: AgentStartArgs) -> anyhow::Result<()> {
     pre_launch_codex_trust(launch_tool, &repo, home.as_deref());
 
     exec_composed(composed)
+}
+
+/// The `--repo` this process was GIVEN, not the resolved path: the
+/// pane's `terminal_command` carries the literal argument, and the
+/// holder scan is byte matching against it.
+fn repo_as_given(args: &AgentStartArgs, resolved: &Path) -> String {
+    args.repo
+        .as_deref()
+        .unwrap_or(resolved)
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn launch_program(tool: Tool, launch: Option<&LaunchConfig>) -> String {
+    launch
+        .and_then(|l| l.command.clone())
+        .unwrap_or_else(|| tool.as_str().to_string())
+}
+
+/// `claude attach <short id>` and nothing else: `attach` is a
+/// subcommand, and the profile's args belong to the process that is
+/// already running with them. The env goes along as for any launch.
+fn compose_attach_launch(
+    tool: Tool,
+    launch: Option<&LaunchConfig>,
+    short_id: &str,
+) -> ComposedLaunch {
+    let mut env_overrides = tool_env_defaults(tool);
+    env_overrides.extend(launch.map(|l| l.env.clone()).unwrap_or_default());
+    ComposedLaunch {
+        program: launch_program(tool, launch),
+        args: vec!["attach".into(), short_id.into()],
+        env_overrides,
+    }
 }
 
 /// Grok's folder-trust prompt is bypassed per-launch: `--trust` ("trust
@@ -687,9 +744,7 @@ fn compose_launch(
     initial_prompt: Option<&str>,
 ) -> ComposedLaunch {
     let tool = session.tool;
-    let program = launch
-        .and_then(|l| l.command.clone())
-        .unwrap_or_else(|| tool.as_str().to_string());
+    let program = launch_program(tool, launch);
 
     let launch_args = launch.map(|l| l.args.clone()).unwrap_or_default();
 
@@ -1794,6 +1849,28 @@ mod tests {
             tool: Tool::Grok,
             updated_at: "2026-06-04T12:00:00Z".to_string(),
         }
+    }
+
+    #[test]
+    fn an_attach_launch_is_the_subcommand_alone_under_the_profiles_program() {
+        // The profile's args (`--agent <profile>`, …) belong to the
+        // process already running with them; `attach` is a subcommand
+        // and takes only the short id (a-session-has-one-holder).
+        let launch = LaunchConfig {
+            command: Some("/opt/bin/claude-wrapper".into()),
+            args: vec!["--agent".into(), "reviewer".into()],
+            env: BTreeMap::from([("CLANK_X".to_string(), "1".to_string())]),
+        };
+        let c = compose_attach_launch(Tool::Claude, Some(&launch), "1f47fd71");
+        assert_eq!(c.program, "/opt/bin/claude-wrapper");
+        assert_eq!(c.args, ["attach", "1f47fd71"]);
+        assert_eq!(
+            c.env_overrides.get("CLANK_X").map(String::as_str),
+            Some("1")
+        );
+        let bare = compose_attach_launch(Tool::Claude, None, "1f47fd71");
+        assert_eq!(bare.program, "claude");
+        assert_eq!(bare.args, ["attach", "1f47fd71"]);
     }
 
     #[test]
