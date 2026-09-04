@@ -351,6 +351,53 @@ impl RosterView {
             master: snap.master.clone(),
         }
     }
+
+    fn reviewers(&self) -> Vec<String> {
+        self.labels
+            .iter()
+            .filter(|l| Some(*l) != self.master.as_ref())
+            .cloned()
+            .collect()
+    }
+}
+
+/// What a targeted reopen found — the status line's whole vocabulary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum ReopenOutcome {
+    Reopened,
+    AlreadyOpen,
+    /// Another status TUI holds this repo's reconciliation lease.
+    HeldElsewhere,
+    /// zellij did not answer the listing.
+    NoListing,
+    /// The listing said the pane was missing and `new-pane` made
+    /// nothing.
+    NotCreated,
+    /// The pane exists but the read-back did not find it where it
+    /// belongs — a reviewer outside the stack, a master not staged.
+    Unplaced,
+    NotOnRoster,
+    NotInSession,
+}
+
+impl ReopenOutcome {
+    pub(super) fn describe(&self, label: &str) -> String {
+        match self {
+            Self::Reopened => format!("reopened `{label}`'s pane"),
+            Self::AlreadyOpen => format!("`{label}` already has a pane in this tab"),
+            Self::HeldElsewhere => {
+                "another status TUI holds this repo's panes — reopen from there".to_string()
+            }
+            Self::NoListing => "zellij did not answer; nothing was opened".to_string(),
+            Self::NotCreated => format!("zellij did not create a pane for `{label}`"),
+            Self::Unplaced => format!(
+                "opened `{label}`'s pane, but it did not land where it belongs — alt+[ or \
+                 a roster change re-lays the tab"
+            ),
+            Self::NotOnRoster => format!("`{label}` is not on the roster"),
+            Self::NotInSession => "not inside a zellij session; nothing to reopen into".to_string(),
+        }
+    }
 }
 
 /// What one reconcile pass must do: open panes for roster members with
@@ -657,13 +704,26 @@ impl PaneReconciler {
     /// that stamps the title runs after the adds, so `false` is what a
     /// listing would say about a pane created this pass.
     fn believe_pending(&mut self, live: &[(String, bool)]) -> Vec<(String, bool)> {
-        self.pending.retain(|label, left| {
+        self.confirm_listed(live);
+        self.pending.retain(|_, left| {
             *left = left.saturating_sub(1);
-            !live.iter().any(|(l, _)| l == label) && *left > 0
+            *left > 0
         });
         let mut out = live.to_vec();
         out.extend(self.pending.keys().map(|l| (l.clone(), false)));
         out
+    }
+
+    /// A label a listing shows is no longer a belief. Called on EVERY
+    /// listing the reconciler reads, the verifying read-back included:
+    /// a pass that created a pane, saw it in the verify, and cached the
+    /// view converged never reached `believe_pending` again, so the
+    /// belief outlived the pane — and the first targeted reopen after
+    /// a hand-close answered "already open" off that belief, over a
+    /// fresh listing that said otherwise (codex on 1bf604d).
+    fn confirm_listed(&mut self, listed: &[(String, bool)]) {
+        self.pending
+            .retain(|label, _| !listed.iter().any(|(l, _)| l == label));
     }
 
     /// One reconciliation pass for `cur`, skipped when that exact view
@@ -708,12 +768,7 @@ impl PaneReconciler {
             return false;
         };
         let plan = plan_panes(&cur, &self.believe_pending(&io.pairs(&snap)));
-        let reviewers: Vec<String> = cur
-            .labels
-            .iter()
-            .filter(|l| Some(*l) != cur.master.as_ref())
-            .cloned()
-            .collect();
+        let reviewers = cur.reviewers();
         if plan.is_converged() {
             // Every label is present — but presence is not PLACEMENT.
             // A tab whose reviewers are not stacked (a failed or
@@ -860,9 +915,11 @@ impl PaneReconciler {
         // not achievement. The verify source is a FRESH listing —
         // see `verify_pairs` for why the cheaper dump cannot do this
         // job.
-        if io
-            .verify(&reviewers)
-            .is_some_and(|(after, placed)| placed && plan_panes(&cur, &after).is_converged())
+        let verified = io.verify(&reviewers);
+        if let Some((after, _)) = &verified {
+            self.confirm_listed(after);
+        }
+        if verified.is_some_and(|(after, placed)| placed && plan_panes(&cur, &after).is_converged())
         {
             self.note_success();
             self.converged = Some(cur);
@@ -875,6 +932,104 @@ impl PaneReconciler {
             self.converged = Some(cur);
         }
         true
+    }
+
+    /// Bring back ONE label's pane — the per-agent "reopen pane" item
+    /// (reopen-an-agents-pane-from-its-menu).
+    ///
+    /// A pane closed by hand changes nothing in the roster view, so a
+    /// converged reconciler never looks again; this is the look. It is
+    /// scoped to `label` because a full pass adds EVERY missing label
+    /// and two can be missing at once — reopening one must not launch
+    /// the other. So it never enters the retry loop and never touches
+    /// `converged`: a following snapshot with the same view stays a
+    /// no-op, which is also why nothing here is verified back into the
+    /// cache (letting the loop see an unconverged tab would have it add
+    /// the rest next round, the same leak one step removed).
+    ///
+    /// It IS list-then-create, the exact two-TUI race the lease exists
+    /// for, so the lease is asked first and a refusal touches nothing.
+    pub(super) fn reopen(
+        &mut self,
+        cur: &RosterView,
+        label: &str,
+        io: &mut impl PaneIo,
+    ) -> ReopenOutcome {
+        if !cur.labels.contains(label) {
+            return ReopenOutcome::NotOnRoster;
+        }
+        if !io.may_reconcile() {
+            return ReopenOutcome::HeldElsewhere;
+        }
+        let Some(mut snap) = io.snapshot() else {
+            return ReopenOutcome::NoListing;
+        };
+        let plan = plan_panes(cur, &self.believe_pending(&io.pairs(&snap)));
+        if !plan.add.iter().any(|l| l == label) {
+            return ReopenOutcome::AlreadyOpen;
+        }
+        let reviewers = cur.reviewers();
+        let focus = io.capture_focus(&snap);
+        // No departing panes: this closes nothing, so nothing is vacated
+        // to anchor on.
+        let added = io.add(label, &reviewers, &[], &snap);
+        // Placement is FOR the new pane; without one there is nothing to
+        // place, and stacking or relocating anyway would rearrange live
+        // panes on behalf of a pane that does not exist (codex on
+        // 54acac6).
+        let Some(created) = added.created else {
+            if let Some(id) = &focus {
+                io.restore_focus(id);
+            }
+            return ReopenOutcome::NotCreated;
+        };
+        self.pending
+            .insert(label.to_string(), PENDING_CREATE_PASSES);
+        // A missing master is staged once it exists, exactly as a pass
+        // would; a relocation the plan wants for some OTHER label is not
+        // this request's to make.
+        let as_master = match &plan.relocate {
+            Some((new_master, old_master)) if new_master == label => {
+                if let Some(fresh) = io.snapshot() {
+                    snap = fresh;
+                }
+                let mut all: std::collections::BTreeSet<String> = cur.labels.clone();
+                all.extend(io.pairs(&snap).into_iter().map(|(l, _)| l));
+                let all: Vec<String> = all.into_iter().collect();
+                io.relocate(new_master, old_master.as_deref(), &all, &snap);
+                true
+            }
+            _ => {
+                let mut ids = vec![created];
+                if let Some(anchor) = added.anchor
+                    && !ids.contains(&anchor)
+                {
+                    ids.push(anchor);
+                }
+                io.stack(&reviewers, &snap, &ids);
+                false
+            }
+        };
+        // Reopened means READ BACK where it belongs, not merely created:
+        // every action here is best-effort, and the notice must not
+        // claim a placement the tab does not show. A master belongs on
+        // the stage (the pane the tab titles master is this one); a
+        // reviewer belongs in the stack. The same read-back confirms
+        // the label, so the belief does not outlive the pane.
+        let placed = io.verify(&reviewers).is_some_and(|(after, stacked)| {
+            self.confirm_listed(&after);
+            after
+                .iter()
+                .any(|(l, titled)| l == label && (if as_master { *titled } else { stacked }))
+        });
+        if let Some(id) = &focus {
+            io.restore_focus(id);
+        }
+        if placed {
+            ReopenOutcome::Reopened
+        } else {
+            ReopenOutcome::Unplaced
+        }
     }
 }
 
@@ -976,12 +1131,15 @@ impl<I: PaneIo> PaneIo for Observed<'_, I> {
     }
 }
 
-/// A message to the reconciliation worker. Both kinds coalesce
-/// independently (latest of each per batch): a roster view triggers a
-/// reconcile pass, glyph data a retitle pass.
+/// A message to the reconciliation worker. Roster views and glyph data
+/// coalesce independently (latest of each per batch): a roster view
+/// triggers a reconcile pass, glyph data a retitle pass. Reopen
+/// requests are DATA — each names an agent the user chose — so they
+/// are kept, in order, never folded.
 pub(super) enum WorkerMsg {
     Roster(RosterView),
     Glyphs(StatusGlyphs),
+    Reopen(String),
 }
 
 /// The worker's per-batch state: the reconciler AND the retitler,
@@ -1007,14 +1165,16 @@ impl WorkerState {
         }
     }
 
+    /// Returns each reopen request's outcome, in request order.
     fn handle(
         &mut self,
         roster: Option<RosterView>,
         glyphs: Option<StatusGlyphs>,
+        reopens: Vec<String>,
         io: &mut impl PaneIo,
         list_panes: impl FnMut() -> Option<String>,
         rename: impl FnMut(&str, &str),
-    ) {
+    ) -> Vec<(String, ReopenOutcome)> {
         if let Some(view) = roster {
             // Invalidate on any TARGET change, not just on our own
             // actions: another TUI may already have converged the live
@@ -1027,9 +1187,23 @@ impl WorkerState {
                 self.panes.invalidate();
             }
         }
+        let outcomes = reopens
+            .into_iter()
+            .map(|label| {
+                let outcome = match &self.last_roster {
+                    Some(view) => self.reconciler.reopen(view, &label, io),
+                    None => ReopenOutcome::NotOnRoster,
+                };
+                if outcome == ReopenOutcome::Reopened {
+                    self.panes.invalidate();
+                }
+                (label, outcome)
+            })
+            .collect();
         if let Some(g) = glyphs {
             self.panes.update_with(&g, list_panes, rename);
         }
+        outcomes
     }
 }
 
@@ -1049,23 +1223,33 @@ pub(super) struct ReconcileWorker {
     /// Last observed; `NotInSession` is fixed for the process's life,
     /// since `$ZELLIJ` does not change under a running TUI.
     reach: ZellijReach,
+    outcome_rx: Option<std::sync::mpsc::Receiver<(String, ReopenOutcome)>>,
+    /// Answers that needed no worker (there is none outside zellij),
+    /// drained with the worker's own by [`Self::outcomes`].
+    answered: Vec<(String, ReopenOutcome)>,
 }
 
 impl ReconcileWorker {
     /// Spawns the worker — a no-op handle outside zellij (no thread,
-    /// sends go nowhere).
-    pub(super) fn spawn(repo: std::path::PathBuf) -> Self {
+    /// sends go nowhere). `wake` is called after a batch that produced
+    /// reopen outcomes, so the loop paints them without waiting for its
+    /// next event.
+    pub(super) fn spawn(repo: std::path::PathBuf, wake: impl Fn() + Send + 'static) -> Self {
         if !crate::cli::open_zellij::in_session() {
             return Self {
                 tx: None,
                 join: None,
                 reach_rx: None,
                 reach: ZellijReach::NotInSession,
+                outcome_rx: None,
+                answered: Vec::new(),
             };
         }
         let (tx, rx) = std::sync::mpsc::channel::<WorkerMsg>();
         let (reach_tx, reach_rx) = std::sync::mpsc::channel::<ZellijReach>();
+        let (outcome_tx, outcome_rx) = std::sync::mpsc::channel::<(String, ReopenOutcome)>();
         let mut worker = Self::in_session(reach_rx);
+        worker.outcome_rx = Some(outcome_rx);
         let join = std::thread::spawn(move || {
             let mut state = WorkerState::new();
             let io = ZellijPaneIo {
@@ -1077,7 +1261,7 @@ impl ReconcileWorker {
                 inner: io,
                 seen: &seen,
             };
-            worker_loop(&rx, |roster, glyphs| {
+            worker_loop(&rx, |roster, glyphs, reopens| {
                 seen.set(None);
                 let list = || {
                     let out = list_panes();
@@ -1088,11 +1272,17 @@ impl ReconcileWorker {
                     }));
                     out
                 };
-                state.handle(roster, glyphs, &mut io, list, rename_pane);
+                let outcomes = state.handle(roster, glyphs, reopens, &mut io, list, rename_pane);
                 // Only a batch that actually listed has anything to
                 // say; a cached batch keeps the loop's last value.
                 if let Some(reach) = seen.get() {
                     let _ = reach_tx.send(reach);
+                }
+                if !outcomes.is_empty() {
+                    for outcome in outcomes {
+                        let _ = outcome_tx.send(outcome);
+                    }
+                    wake();
                 }
             });
         });
@@ -1115,7 +1305,35 @@ impl ReconcileWorker {
             join: None,
             reach_rx: Some(reach_rx),
             reach: ZellijReach::Unknown,
+            outcome_rx: None,
+            answered: Vec::new(),
         }
+    }
+
+    /// Ask the worker to bring back `label`'s pane. Non-blocking; the
+    /// answer arrives through [`Self::outcomes`]. Outside zellij there
+    /// is no worker and the answer is immediate.
+    pub(super) fn reopen(&mut self, label: &str) {
+        match &self.tx {
+            Some(tx) => {
+                let _ = tx.send(WorkerMsg::Reopen(label.to_string()));
+            }
+            None => self
+                .answered
+                .push((label.to_string(), ReopenOutcome::NotInSession)),
+        }
+    }
+
+    /// Every reopen answered since the last call, in order. Drains
+    /// without blocking.
+    pub(super) fn outcomes(&mut self) -> Vec<(String, ReopenOutcome)> {
+        let mut out = std::mem::take(&mut self.answered);
+        if let Some(rx) = &self.outcome_rx {
+            while let Ok(o) = rx.try_recv() {
+                out.push(o);
+            }
+        }
+        out
     }
 
     /// The last reachability the worker reported. Drains the channel
@@ -1163,22 +1381,22 @@ impl Drop for ReconcileWorker {
 /// disconnects (after at most one final drained batch).
 fn worker_loop(
     rx: &std::sync::mpsc::Receiver<WorkerMsg>,
-    mut batch: impl FnMut(Option<RosterView>, Option<StatusGlyphs>),
+    mut batch: impl FnMut(Option<RosterView>, Option<StatusGlyphs>, Vec<String>),
 ) {
     while let Ok(first) = rx.recv() {
         let mut roster = None;
         let mut glyphs = None;
-        match first {
+        let mut reopens = Vec::new();
+        let mut take = |m: WorkerMsg| match m {
             WorkerMsg::Roster(v) => roster = Some(v),
             WorkerMsg::Glyphs(g) => glyphs = Some(g),
-        }
+            WorkerMsg::Reopen(label) => reopens.push(label),
+        };
+        take(first);
         while let Ok(m) = rx.try_recv() {
-            match m {
-                WorkerMsg::Roster(v) => roster = Some(v),
-                WorkerMsg::Glyphs(g) => glyphs = Some(g),
-            }
+            take(m);
         }
-        batch(roster, glyphs);
+        batch(roster, glyphs, reopens);
     }
 }
 
@@ -1256,6 +1474,8 @@ mod tests {
             join: None,
             reach_rx: None,
             reach: ZellijReach::NotInSession,
+            outcome_rx: None,
+            answered: Vec::new(),
         };
         assert_eq!(w.reach(), ZellijReach::NotInSession);
     }
@@ -1271,6 +1491,8 @@ mod tests {
             join: None,
             reach_rx: Some(rx),
             reach: ZellijReach::Connected,
+            outcome_rx: None,
+            answered: Vec::new(),
         };
         // Nothing reported yet: the last value stands, and this must
         // not wait for a report that is never coming.
@@ -1301,7 +1523,14 @@ mod tests {
         let view = view(&["claude"], Some("claude"));
 
         // First batch: not converged, so the reconciler lists once.
-        state.handle(Some(view.clone()), None, &mut io, || None, |_, _| {});
+        state.handle(
+            Some(view.clone()),
+            None,
+            Vec::new(),
+            &mut io,
+            || None,
+            |_, _| {},
+        );
         assert_eq!(
             io.inner.snapshots_taken, 1,
             "the reconcile listing, and only it"
@@ -1315,7 +1544,7 @@ mod tests {
         // Second batch, same roster: converged, ZERO listings — and
         // therefore no observation, so the loop keeps its last value.
         seen.set(None);
-        state.handle(Some(view), None, &mut io, || None, |_, _| {});
+        state.handle(Some(view), None, Vec::new(), &mut io, || None, |_, _| {});
         assert_eq!(
             io.inner.snapshots_taken, 1,
             "a converged batch lists nothing"
@@ -1347,6 +1576,7 @@ mod tests {
         state.handle(
             Some(view(&["claude"], Some("claude"))),
             None,
+            Vec::new(),
             &mut io,
             || None,
             |_, _| {},
@@ -2202,6 +2432,335 @@ mod tests {
         );
     }
 
+    // ── reopen-an-agents-pane-from-its-menu: the targeted reopen ──
+
+    /// A worker that has seen the roster and verified it converged —
+    /// the state a hand-closed pane leaves behind: nothing in the view
+    /// changed, so no pass will look again.
+    fn converged_worker(
+        labels: &[&str],
+        master: &str,
+        live_now: Vec<(String, bool)>,
+    ) -> WorkerState {
+        let mut state = WorkerState::new();
+        let mut io = FakeIo::new(vec![Some(live_now)]);
+        state.handle(
+            Some(view(labels, Some(master))),
+            None,
+            Vec::new(),
+            &mut io,
+            || None,
+            |_, _| {},
+        );
+        assert!(io.log.is_empty(), "converged from the start: {:?}", io.log);
+        state
+    }
+
+    fn reopen(state: &mut WorkerState, io: &mut FakeIo, label: &str) -> ReopenOutcome {
+        let out = state.handle(None, None, vec![label.to_string()], io, || None, |_, _| {});
+        assert_eq!(out.len(), 1, "one request, one answer");
+        assert_eq!(out[0].0, label);
+        out[0].1.clone()
+    }
+
+    #[test]
+    fn reopening_one_of_two_missing_panes_adds_only_that_one() {
+        // A full pass would add BOTH — the user asked for one (codex on
+        // 30ff9f3).
+        let all = live(&[("claude", true), ("r1", false), ("r2", false)]);
+        let mut state = converged_worker(&["claude", "r1", "r2"], "claude", all);
+        // The master's pane has lost its title too, so a full pass
+        // would ALSO relocate; that is not this request's to make.
+        let mut io = FakeIo::with_verify(
+            vec![Some(live(&[("claude", false)]))],
+            vec![Some(live(&[("claude", false), ("r2", false)]))],
+        );
+        assert_eq!(reopen(&mut state, &mut io, "r2"), ReopenOutcome::Reopened);
+        assert_eq!(
+            io.log,
+            vec!["add r2", "stack [terminal_r2]", "focus user_pane"],
+            "exactly r2, stacked with the reviewers, focus restored"
+        );
+        assert!(!io.log.iter().any(|l| l.contains("r1")), "r1 stays absent");
+        assert_eq!(
+            io.add_departing,
+            vec![Vec::<String>::new()],
+            "nothing is vacated"
+        );
+    }
+
+    #[test]
+    fn reopening_the_master_adds_and_stages_it() {
+        let all = live(&[("claude", true), ("r1", false)]);
+        let mut state = converged_worker(&["claude", "r1"], "claude", all);
+        // The snapshot after the add is what the relocation classifies;
+        // the verify is what says it worked.
+        let mut io = FakeIo::with_verify(
+            vec![
+                Some(live(&[("r1", false)])),
+                Some(live(&[("r1", false), ("claude", false)])),
+            ],
+            vec![Some(live(&[("r1", false), ("claude", true)]))],
+        );
+        assert_eq!(
+            reopen(&mut state, &mut io, "claude"),
+            ReopenOutcome::Reopened
+        );
+        assert_eq!(
+            io.log,
+            vec!["add claude", "relocate claude<-None", "focus user_pane"]
+        );
+        assert_eq!(
+            io.snapshots_taken, 2,
+            "one to plan, one fresh for the relocation"
+        );
+        assert_eq!(io.verifies_taken, 1, "staged is read back, not assumed");
+    }
+
+    #[test]
+    fn a_failed_add_places_nothing() {
+        // Stacking or relocating on behalf of a pane that was never
+        // made rearranges live panes for nothing (codex on 54acac6).
+        let all = live(&[("claude", true), ("r1", false), ("r2", false)]);
+        let mut state = converged_worker(&["claude", "r1", "r2"], "claude", all.clone());
+        let mut io = FakeIo::new(vec![Some(live(&[("claude", true), ("r1", false)]))]);
+        io.add_results.push_back(false);
+        assert_eq!(reopen(&mut state, &mut io, "r2"), ReopenOutcome::NotCreated);
+        assert_eq!(io.log, vec!["add r2", "focus user_pane"], "no stack");
+        let mut state = converged_worker(&["claude", "r1", "r2"], "claude", all);
+        let mut io = FakeIo::new(vec![Some(live(&[("r1", false), ("r2", false)]))]);
+        io.add_results.push_back(false);
+        assert_eq!(
+            reopen(&mut state, &mut io, "claude"),
+            ReopenOutcome::NotCreated
+        );
+        assert_eq!(io.log, vec!["add claude", "focus user_pane"], "no relocate");
+        assert_eq!(
+            io.snapshots_taken, 1,
+            "no fresh listing for a relocation that must not run"
+        );
+    }
+
+    #[test]
+    fn reopened_is_the_read_back_not_the_creation() {
+        // A reviewer the read-back lists but does not find stacked, and
+        // one the read-back does not list at all.
+        let all = live(&[("claude", true), ("r1", false), ("r2", false)]);
+        for (listed, stacked) in [
+            (
+                live(&[("claude", true), ("r1", false), ("r2", false)]),
+                false,
+            ),
+            (live(&[("claude", true), ("r1", false)]), true),
+        ] {
+            let mut state = converged_worker(&["claude", "r1", "r2"], "claude", all.clone());
+            let mut io = FakeIo::with_verify(
+                vec![Some(live(&[("claude", true), ("r1", false)]))],
+                vec![Some(listed)],
+            );
+            io.verify_placed.push_back(stacked);
+            assert_eq!(reopen(&mut state, &mut io, "r2"), ReopenOutcome::Unplaced);
+            assert_eq!(
+                io.log,
+                vec!["add r2", "stack [terminal_r2]", "focus user_pane"]
+            );
+        }
+        // A master the tab still does not title master after the
+        // relocation — and one whose read-back never answered.
+        for verify in [Some(live(&[("r1", false), ("claude", false)])), None] {
+            let mut state = converged_worker(&["claude", "r1", "r2"], "claude", all.clone());
+            let mut io = FakeIo::with_verify(
+                vec![
+                    Some(live(&[("r1", false), ("r2", false)])),
+                    Some(live(&[("r1", false), ("r2", false), ("claude", false)])),
+                ],
+                vec![verify],
+            );
+            assert_eq!(
+                reopen(&mut state, &mut io, "claude"),
+                ReopenOutcome::Unplaced
+            );
+            assert!(io.log.contains(&"relocate claude<-None".to_string()));
+        }
+    }
+
+    #[test]
+    fn reopening_a_pane_that_exists_adds_nothing() {
+        let all = live(&[("claude", true), ("r1", false), ("r2", false)]);
+        let mut state = converged_worker(&["claude", "r1", "r2"], "claude", all.clone());
+        let mut io = FakeIo::new(vec![Some(all)]);
+        assert_eq!(
+            reopen(&mut state, &mut io, "r1"),
+            ReopenOutcome::AlreadyOpen
+        );
+        assert!(io.log.is_empty(), "no pane call: {:?}", io.log);
+        assert_eq!(io.snapshots_taken, 1, "the one listing that answered");
+        // r1 present, r2 missing: asking for r1 is still "already
+        // open" — the plan having SOME add is not this label's add.
+        let mut io = FakeIo::new(vec![Some(live(&[("claude", true), ("r1", false)]))]);
+        assert_eq!(
+            reopen(&mut state, &mut io, "r1"),
+            ReopenOutcome::AlreadyOpen
+        );
+        assert!(
+            io.log.is_empty(),
+            "r2 is not opened on r1's behalf: {:?}",
+            io.log
+        );
+    }
+
+    #[test]
+    fn a_reopen_leaves_the_converged_cache_alone() {
+        // The retry loop seeing an unconverged tab would add the OTHER
+        // missing pane next round — the same leak one step removed.
+        let all = live(&[("claude", true), ("r1", false), ("r2", false)]);
+        let mut state = converged_worker(&["claude", "r1", "r2"], "claude", all);
+        let mut io = FakeIo::with_verify(
+            vec![Some(live(&[("claude", true)]))],
+            vec![Some(live(&[("claude", true), ("r2", false)]))],
+        );
+        assert_eq!(reopen(&mut state, &mut io, "r2"), ReopenOutcome::Reopened);
+        let before = io.snapshots_taken;
+        // The same roster view again: still cached as converged, so no
+        // listing and no pass.
+        state.handle(
+            Some(view(&["claude", "r1", "r2"], Some("claude"))),
+            None,
+            Vec::new(),
+            &mut io,
+            || None,
+            |_, _| {},
+        );
+        assert_eq!(io.snapshots_taken, before, "no pass ran");
+        assert!(
+            !io.log.iter().any(|l| l == "add r1"),
+            "r1 was never asked for"
+        );
+    }
+
+    #[test]
+    fn a_reopen_without_the_lease_touches_nothing() {
+        // A reopen IS list-then-create, the two-TUI race the lease
+        // exists for (codex on 70df3aa).
+        let all = live(&[("claude", true), ("r1", false)]);
+        let mut state = converged_worker(&["claude", "r1"], "claude", all);
+        let mut io = FakeIo::new(vec![Some(live(&[("claude", true)]))]);
+        io.may_reconcile = false;
+        assert_eq!(
+            reopen(&mut state, &mut io, "r1"),
+            ReopenOutcome::HeldElsewhere
+        );
+        assert_eq!(io.snapshots_taken, 0, "no listing");
+        assert!(io.log.is_empty(), "no pane call: {:?}", io.log);
+        assert_eq!(
+            ReopenOutcome::HeldElsewhere.describe("r1"),
+            "another status TUI holds this repo's panes — reopen from there"
+        );
+    }
+
+    #[test]
+    fn a_reopen_reports_an_unanswered_listing_and_an_unmade_pane() {
+        let all = live(&[("claude", true), ("r1", false)]);
+        let mut state = converged_worker(&["claude", "r1"], "claude", all);
+        let mut io = FakeIo::new(vec![None]);
+        assert_eq!(reopen(&mut state, &mut io, "r1"), ReopenOutcome::NoListing);
+        assert!(io.log.is_empty());
+        let mut io = FakeIo::new(vec![Some(live(&[("claude", true)]))]);
+        io.add_results.push_back(false);
+        assert_eq!(reopen(&mut state, &mut io, "r1"), ReopenOutcome::NotCreated);
+        assert_eq!(
+            reopen(&mut state, &mut FakeIo::new(vec![]), "nobody"),
+            ReopenOutcome::NotOnRoster
+        );
+    }
+
+    #[test]
+    fn a_pane_the_reconciler_made_and_the_user_closed_reopens_on_the_first_ask() {
+        // The creating pass believes its pane until a listing shows
+        // it. The verify DID show it, the view was cached converged,
+        // and no later pass aged the belief — so a hand-closed pane
+        // was "already open" on the first reopen and only the second
+        // worked (codex on 1bf604d).
+        let mut state = WorkerState::new();
+        let mut io = FakeIo::with_verify(
+            vec![Some(live(&[("claude", true), ("r1", false)]))],
+            vec![Some(live(&[
+                ("claude", true),
+                ("r1", false),
+                ("r2", false),
+            ]))],
+        );
+        state.handle(
+            Some(view(&["claude", "r1", "r2"], Some("claude"))),
+            None,
+            Vec::new(),
+            &mut io,
+            || None,
+            |_, _| {},
+        );
+        assert_eq!(io.log[0], "add r2", "the pass created r2");
+        assert!(
+            state.reconciler.pending.is_empty(),
+            "the verify listed it: {:?}",
+            state.reconciler.pending
+        );
+        // The user closes r2 by hand.
+        let mut io = FakeIo::with_verify(
+            vec![Some(live(&[("claude", true), ("r1", false)]))],
+            vec![Some(live(&[
+                ("claude", true),
+                ("r1", false),
+                ("r2", false),
+            ]))],
+        );
+        assert_eq!(reopen(&mut state, &mut io, "r2"), ReopenOutcome::Reopened);
+        assert_eq!(io.log[0], "add r2", "the FIRST ask reopens it");
+        // And the reopen's own creation is confirmed by its read-back,
+        // so closing it again and asking again works the same way.
+        let mut io = FakeIo::with_verify(
+            vec![Some(live(&[("claude", true), ("r1", false)]))],
+            vec![Some(live(&[
+                ("claude", true),
+                ("r1", false),
+                ("r2", false),
+            ]))],
+        );
+        assert_eq!(reopen(&mut state, &mut io, "r2"), ReopenOutcome::Reopened);
+        assert_eq!(io.log[0], "add r2");
+    }
+
+    #[test]
+    fn reopen_requests_are_delivered_in_order_never_folded() {
+        // Two different labels queued before a batch are two answers;
+        // folding to the latest would drop one the user asked for.
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(WorkerMsg::Reopen("r1".into())).unwrap();
+        tx.send(WorkerMsg::Reopen("r2".into())).unwrap();
+        tx.send(WorkerMsg::Reopen("r1".into())).unwrap();
+        drop(tx);
+        let mut batches = Vec::new();
+        worker_loop(&rx, |_roster, _glyphs, reopens| batches.push(reopens));
+        assert_eq!(batches, vec![vec!["r1", "r2", "r1"]]);
+    }
+
+    #[test]
+    fn outside_zellij_a_reopen_is_answered_at_once() {
+        let mut w = ReconcileWorker {
+            tx: None,
+            join: None,
+            reach_rx: None,
+            reach: ZellijReach::NotInSession,
+            outcome_rx: None,
+            answered: Vec::new(),
+        };
+        w.reopen("r1");
+        assert_eq!(
+            w.outcomes(),
+            vec![("r1".to_string(), ReopenOutcome::NotInSession)]
+        );
+        assert!(w.outcomes().is_empty(), "drained");
+    }
+
     #[test]
     fn a_driver_without_the_lease_still_retitles() {
         // NOT an oversight in the lease: pane titles are SESSION-local.
@@ -2221,6 +2780,7 @@ mod tests {
                 emoji: [("claude".to_string(), ("M", "R"))].into_iter().collect(),
                 wanted: vec!["claude".into()],
             }),
+            Vec::new(),
             &mut io,
             || {
                 lists.fetch_add(1, Ordering::SeqCst);
@@ -2397,7 +2957,7 @@ mod tests {
         let (entered2, release2, log2) = (entered.clone(), release.clone(), log.clone());
         let join = std::thread::spawn(move || {
             let first = AtomicBool::new(true);
-            worker_loop(&rx, move |roster, _glyphs| {
+            worker_loop(&rx, move |roster, _glyphs, _reopens| {
                 if let Some(v) = roster {
                     log2.lock().unwrap().push(v);
                 }
@@ -2451,7 +3011,7 @@ mod tests {
             Arc::new(Mutex::new(Vec::new()));
         let log2 = log.clone();
         let join = std::thread::spawn(move || {
-            worker_loop(&rx, move |roster, glyphs| {
+            worker_loop(&rx, move |roster, glyphs, _reopens| {
                 log2.lock()
                     .unwrap()
                     .push((roster, glyphs.map(|g| g.wanted)));
@@ -2492,6 +3052,7 @@ mod tests {
         state.handle(
             None,
             Some(glyphs()),
+            Vec::new(),
             &mut FakeIo::new(vec![]),
             || {
                 lists.fetch_add(1, Ordering::SeqCst);
@@ -2510,6 +3071,7 @@ mod tests {
         state.handle(
             Some(view(&["claude", "codex"], Some("codex"))),
             Some(glyphs()),
+            Vec::new(),
             &mut FakeIo::new(vec![
                 Some(live(&[("claude", true), ("codex", false)])),
                 Some(live_post),
@@ -2557,6 +3119,7 @@ mod tests {
         state.handle(
             None,
             Some(glyphs()),
+            Vec::new(),
             &mut FakeIo::new(vec![]),
             || Some(pre.to_string()),
             |id, t| renames.push((id.to_string(), t.to_string())),
@@ -2567,6 +3130,7 @@ mod tests {
         state.handle(
             Some(view(&["claude", "codex"], Some("codex"))),
             Some(glyphs()),
+            Vec::new(),
             &mut FakeIo::new(vec![
                 Some(live(&[("claude", true), ("codex", false)])),
                 Some(live(&[("claude", false), ("codex", true)])),
@@ -2604,6 +3168,7 @@ mod tests {
         state.handle(
             Some(view(&["claude", "codex"], Some("claude"))),
             Some(glyphs()),
+            Vec::new(),
             &mut FakeIo::new(vec![Some(live(&[("claude", true), ("codex", false)]))]),
             || {
                 lists.fetch_add(1, Ordering::SeqCst);
@@ -2618,6 +3183,7 @@ mod tests {
         state.handle(
             Some(view(&["claude", "codex"], Some("codex"))),
             Some(glyphs()),
+            Vec::new(),
             &mut FakeIo::new(vec![Some(live(&[("claude", false), ("codex", true)]))]),
             || {
                 lists.fetch_add(1, Ordering::SeqCst);

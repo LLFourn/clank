@@ -84,6 +84,10 @@ enum Ev {
     /// j/k/y/n/o/q as TEXT, which a context-free parse would eat as
     /// commands (tui-plan-actions-page).
     Stdin(Vec<u8>),
+    /// The zellij worker answered a reopen request. Carries nothing:
+    /// every loop turn drains the worker's outcomes before painting,
+    /// so the event only has to end the wait.
+    Worker,
 }
 
 /// Execute a confirmed roster mutation via the existing `clank agent`
@@ -888,8 +892,21 @@ fn apply_detail_action(
         DetailAction::Remove => Mode::Confirm {
             action: ConfirmAction::RemoveAgent { idx },
         },
+        // The request itself goes to the zellij worker at the call
+        // site (this function holds no worker); the page stays open
+        // and the answer lands in the notice row.
+        DetailAction::Reopen => Mode::AgentDetail { idx, sel },
         DetailAction::Back => Mode::AgentPanel { sel: agent_row },
     }
+}
+
+/// Mount a one-line notice at the top of the log rows, replacing any
+/// earlier one with the same `prefix` — like the refresh notice, it
+/// never stacks, and the next successful refresh clears it.
+fn mount_notice(rows: &mut Vec<crate::cli::log::OnelineRow>, prefix: &str, text: &str) {
+    use crate::cli::log::OnelineRow;
+    rows.retain(|r| !matches!(r, OnelineRow::Notice(n) if n.starts_with(prefix)));
+    rows.insert(0, OnelineRow::Notice(format!("{prefix}: {text}")));
 }
 
 fn roster_confirm_after_decision(
@@ -1385,6 +1402,8 @@ fn open_overlay_in_browser(repo: &std::path::Path, target: &HtmlTarget) {
 /// drive the rebuild loop hot.
 const REBUILD_MIN: Duration = Duration::from_secs(1);
 
+const REOPEN_NOTICE: &str = "reopen pane";
+
 /// The loop's recv timeout: the `base` cadence (spinner tick when one is
 /// visible, else the idle backstop), shortened to the time left before a
 /// DEFERRED refresh may run — so a coalesced burst still rebuilds within
@@ -1454,6 +1473,7 @@ fn coalesce(events: impl IntoIterator<Item = Ev>) -> Batch {
                 target,
                 state,
             } => b.content.push((generation, target, state)),
+            Ev::Worker => {}
         }
     }
     b
@@ -1481,17 +1501,23 @@ pub(crate) async fn run_tui(
     let (winch_tx, winch_rx) = mpsc::channel::<()>();
     spawn_sigwinch_forwarder(winch_tx)?;
 
+    // Merge the watcher (data), SIGWINCH (resize), stdin (keys), and
+    // the zellij worker's answers into one event stream the loop
+    // drains. A blocking `read` on stdin IS the notification (no
+    // polling).
+    let (ev_tx, ev_rx) = mpsc::channel::<Ev>();
+
     // Declared BEFORE the alt-screen guard: reverse drop order joins
     // the worker AFTER the terminal is restored, on every exit path
     // (tui-reconcile-off-loop).
-    let mut reconcile_worker = zellij::ReconcileWorker::spawn(repo.clone());
+    let mut reconcile_worker = {
+        let wake = ev_tx.clone();
+        zellij::ReconcileWorker::spawn(repo.clone(), move || {
+            let _ = wake.send(Ev::Worker);
+        })
+    };
 
     let _guard = AltScreen::enter();
-
-    // Merge the watcher (data), SIGWINCH (resize), and stdin (keys) into
-    // one event stream the loop drains. A blocking `read` on stdin IS
-    // the notification (no polling).
-    let (ev_tx, ev_rx) = mpsc::channel::<Ev>();
     {
         let ev_tx = ev_tx.clone();
         std::thread::spawn(move || {
@@ -1710,7 +1736,9 @@ pub(crate) async fn run_tui(
                         o.refresh(data);
                     }
                 }
-                Ok(Ev::Resize) => {}
+                // The overlay hides the notice row; the answer is
+                // drained and painted once the overlay closes.
+                Ok(Ev::Resize) | Ok(Ev::Worker) => {}
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     anyhow::bail!("event channel disconnected")
@@ -1733,6 +1761,13 @@ pub(crate) async fn run_tui(
             // batch, the loop never waits on zellij to paint.
             reach: reconcile_worker.reach(),
         };
+        for (label, outcome) in reconcile_worker.outcomes() {
+            mount_notice(
+                &mut snapshot.log_rows,
+                REOPEN_NOTICE,
+                &outcome.describe(&label),
+            );
+        }
         // The ask lines depend on blocks (not the log fetch), so compute
         // them before filling. `head` is the count of scrollable rows that
         // aren't log rows — ONLY the ask lines: in-progress activity lives
@@ -2218,6 +2253,11 @@ pub(crate) async fn run_tui(
                                     );
                                     if let Some((title, msg)) = err {
                                         detail = Some(Overlay::error(title, msg));
+                                    }
+                                    if action == DetailAction::Reopen
+                                        && let Some(agent) = snapshot.agents.get(idx)
+                                    {
+                                        reconcile_worker.reopen(&agent.label);
                                     }
                                 }
                                 DetailNav::None => {}
@@ -3563,6 +3603,56 @@ pub(crate) mod tests {
         assert_eq!(retry_delay(3), Duration::from_secs(4));
         assert_eq!(retry_delay(6), Duration::from_secs(30));
         assert_eq!(retry_delay(100), Duration::from_secs(30));
+    }
+
+    /// The reopen answer is one notice row, replacing the last reopen
+    /// notice and leaving other notices alone — the refresh notice's
+    /// own rule, applied per prefix.
+    #[test]
+    fn a_reopen_notice_replaces_its_predecessor_and_leaves_others() {
+        use crate::cli::log::OnelineRow;
+        let mut rows = vec![OnelineRow::Notice("status refresh failed: x".into())];
+        mount_notice(&mut rows, REOPEN_NOTICE, "reopened `r1`'s pane");
+        mount_notice(
+            &mut rows,
+            REOPEN_NOTICE,
+            "`r1` already has a pane in this tab",
+        );
+        let notices: Vec<&str> = rows
+            .iter()
+            .filter_map(|r| match r {
+                OnelineRow::Notice(n) => Some(n.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            notices,
+            [
+                "reopen pane: `r1` already has a pane in this tab",
+                "status refresh failed: x"
+            ]
+        );
+    }
+
+    /// Reopen stays on the page: the request goes to the worker and
+    /// the answer arrives as a notice, so there is nowhere else to go.
+    #[test]
+    fn reopen_keeps_the_detail_page_open() {
+        let repo = detail_repo();
+        let mut s = two_agent_snap();
+        let before = std::fs::read_to_string(repo.path().join(".clank/config.json")).unwrap();
+        let mode = apply_detail_action(
+            DetailAction::Reopen,
+            1,
+            0,
+            &mut s,
+            repo.path(),
+            &mut None,
+            1,
+        );
+        assert_eq!(mode, Mode::AgentDetail { idx: 1, sel: 0 });
+        let after = std::fs::read_to_string(repo.path().join(".clank/config.json")).unwrap();
+        assert_eq!(before, after, "a reopen is not a roster write");
     }
 
     #[test]

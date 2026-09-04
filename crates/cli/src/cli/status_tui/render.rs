@@ -1299,6 +1299,7 @@ pub(super) fn detail_row_spans(
             }
         }
         DetailAction::PromoteToMaster => spans.push(plain("⇧ promote to master")),
+        DetailAction::Reopen => spans.push(plain("↻ reopen pane")),
         DetailAction::Remove => spans.push(colored("31", "✗ remove from team")),
         DetailAction::Back => spans.push(dim("← back")),
     }
@@ -5971,6 +5972,32 @@ mod tests {
             .to_lowercase();
         assert!(lower.contains("add a reviewer"), "{lower}");
         assert!(!lower.contains("swap"), "{lower}");
+    }
+
+    /// Reopen is an action on the workspace, not on the roster: plain,
+    /// not red, and present on the master's page as well.
+    #[test]
+    fn the_reopen_row_is_plain_and_on_every_page() {
+        use crate::cli::teams_config::RosterRole;
+        use clank_core::vocab::AutoMode;
+        for role in [RosterRole::Master, RosterRole::Commit] {
+            let agent = agent_row("kimi", role, AutoMode::On);
+            let actions = detail_actions(role);
+            let sel = actions
+                .iter()
+                .position(|a| *a == DetailAction::Reopen)
+                .expect("reopen is on every page");
+            let (lines, _) = render_agent_detail(&agent, &actions, sel, 24, 60);
+            let row = lines
+                .iter()
+                .find(|l| visible(l).contains("reopen pane"))
+                .expect("reopen row");
+            assert!(
+                !row.contains("\x1b[31m"),
+                "not destructive styling: {row:?}"
+            );
+            assert!(!visible(row).contains('…'), "no truncation marker: {row:?}");
+        }
     }
 
     /// Swap opens a picker rather than acting, so it must not read as

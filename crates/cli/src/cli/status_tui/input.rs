@@ -167,6 +167,11 @@ pub(super) enum DetailAction {
     /// picker: unlike every sibling action it needs a SECOND operand,
     /// since it acts on this agent AND an incoming one.
     Swap,
+    /// Bring back this agent's pane when it has been closed by hand.
+    /// Present on EVERY agent: whether a pane exists is the one fact
+    /// the reconciler's converged cache can no longer be trusted
+    /// about, and one on-demand listing is the honest answer.
+    Reopen,
     /// Remove the agent from the team (behind the confirm).
     Remove,
     /// Leave the detail page.
@@ -180,7 +185,7 @@ pub(super) fn detail_actions(role: crate::cli::teams_config::RosterRole) -> Vec<
     use crate::cli::teams_config::RosterRole;
     use DetailAction::*;
     match role {
-        RosterRole::Master => vec![ToggleAuto, Swap, Back],
+        RosterRole::Master => vec![ToggleAuto, Swap, Reopen, Back],
         RosterRole::Commit | RosterRole::Plan | RosterRole::Final | RosterRole::Gate => {
             vec![
                 ToggleAuto,
@@ -189,6 +194,7 @@ pub(super) fn detail_actions(role: crate::cli::teams_config::RosterRole) -> Vec<
                 TierFinal,
                 PromoteToMaster,
                 Swap,
+                Reopen,
                 Remove,
                 Back,
             ]
@@ -2022,7 +2028,7 @@ mod tests {
         use DetailAction::*;
         assert_eq!(
             detail_actions(RosterRole::Master),
-            vec![ToggleAuto, Swap, Back]
+            vec![ToggleAuto, Swap, Reopen, Back]
         );
         let reviewer = vec![
             ToggleAuto,
@@ -2031,11 +2037,33 @@ mod tests {
             TierFinal,
             PromoteToMaster,
             Swap,
+            Reopen,
             Remove,
             Back,
         ];
         assert_eq!(detail_actions(RosterRole::Commit), reviewer);
         assert_eq!(detail_actions(RosterRole::Gate), reviewer);
+    }
+
+    /// Reopen is offered to EVERY role, master included: a closed
+    /// master pane is the one the reconciler stages, and whether any
+    /// pane exists is exactly what its cache cannot answer
+    /// (reopen-an-agents-pane-from-its-menu).
+    #[test]
+    fn reopen_is_offered_to_every_role() {
+        use crate::cli::teams_config::RosterRole;
+        for role in [
+            RosterRole::Master,
+            RosterRole::Commit,
+            RosterRole::Plan,
+            RosterRole::Final,
+            RosterRole::Gate,
+        ] {
+            assert!(
+                detail_actions(role).contains(&DetailAction::Reopen),
+                "{role:?}"
+            );
+        }
     }
 
     /// Swap is a roster replacement action for every role. Promotion
