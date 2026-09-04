@@ -330,8 +330,13 @@ fn compose_multitab(tabs: &[TabSpec], term: (u16, u16)) -> anyhow::Result<String
     );
     for tab in tabs {
         s.push_str(&format!("    tab name=\"{}\" {{\n", kdl_escape(&tab.name)));
-        for line in
-            agent_group_kdl(&tab.repo_path, &tab.master, &tab.reviewers, orientation).lines()
+        for line in agent_group_kdl(
+            &tab.repo_path,
+            &tab.master,
+            ReviewerStack::Roster(&tab.reviewers),
+            orientation,
+        )
+        .lines()
         {
             if line.is_empty() {
                 s.push('\n');
@@ -567,7 +572,12 @@ fn compose_kdl(
     term: (u16, u16),
 ) -> anyhow::Result<String> {
     let orientation = Orientation::detect(term);
-    let agents = agent_group_kdl(repo_path, master, reviewers, orientation);
+    let agents = agent_group_kdl(
+        repo_path,
+        master,
+        ReviewerStack::Roster(reviewers),
+        orientation,
+    );
     match user_template {
         // User templates: unchanged marker contract — the detected
         // orientation's group, NO swap blocks (swap_tiled_layout is
@@ -580,7 +590,7 @@ fn compose_kdl(
             let base = substitute_marker(&built_in, &agents)?;
             // BOTH orientations ship as swap variants so alt+[ /
             // alt+] flips the arrangement at runtime.
-            add_swap_variants(&base, repo_path, master, reviewers)
+            add_swap_variants(&base, repo_path, master)
         }
     }
 }
@@ -688,19 +698,34 @@ impl Orientation {
     }
 }
 
+/// What the reviewer region of a pane group holds.
+///
+/// A tab's own layout LAUNCHES panes, so it names each reviewer. A
+/// swap variant is applied to panes that already exist, however many:
+/// zellij puts every pane without a command-matched slot at the
+/// layout's `children` node. A variant that named the opening roster
+/// had no such node, and a reviewer added later fell through to a
+/// plain split of the stage on every alt+[ / alt+]
+/// (a-swap-layout-describes-a-shape-not-a-roster).
+#[derive(Clone, Copy)]
+enum ReviewerStack<'a> {
+    Roster(&'a [String]),
+    AnyPresent,
+}
+
 /// The agent pane group clank owns: master is the STAGE (~65%),
 /// reviewers STACK in the smaller region, and a `clank status
 /// --tui` instrument pane sits beside/below the stack
 /// (zellij-default-layout). Landscape: master left, right column
 /// = stack over tui. Portrait: master top, bottom row = stack
-/// beside tui. Zero reviewers: no stack region — stage + tui.
+/// beside tui. An empty roster: no stack region — stage + tui.
 ///
 /// zellij KDL: `split_direction="vertical"` lays children out as
 /// COLUMNS, `"horizontal"` as ROWS.
 fn agent_group_kdl(
     repo_path: &str,
     master: &str,
-    reviewers: &[String],
+    stack: ReviewerStack<'_>,
     orientation: Orientation,
 ) -> String {
     let mut out = String::new();
@@ -722,19 +747,27 @@ fn agent_group_kdl(
     out.push_str(&format!(
         "    pane size=\"35%\" split_direction=\"{inner}\" {{\n"
     ));
-    if !reviewers.is_empty() {
-        out.push_str("        pane stacked=true {\n");
-        for reviewer in reviewers {
-            push_agent_pane(
-                &mut out,
-                "            ",
-                "",
-                reviewer.as_str(),
-                "reviewer",
-                repo_path,
-            );
+    match stack {
+        ReviewerStack::Roster(reviewers) if reviewers.is_empty() => {}
+        ReviewerStack::Roster(reviewers) => {
+            out.push_str("        pane stacked=true {\n");
+            for reviewer in reviewers {
+                push_agent_pane(
+                    &mut out,
+                    "            ",
+                    "",
+                    reviewer.as_str(),
+                    "reviewer",
+                    repo_path,
+                );
+            }
+            out.push_str("        }\n");
         }
-        out.push_str("        }\n");
+        ReviewerStack::AnyPresent => {
+            out.push_str("        pane stacked=true {\n");
+            out.push_str("            children\n");
+            out.push_str("        }\n");
+        }
     }
     // The instrument pane: repo pinned via cwd AND --repo (codex
     // 7d3b5d1 — the 361b104/8075d43 lineage applies to every
@@ -766,18 +799,19 @@ fn agent_group_kdl(
 /// the composed built-in layout so alt+[ / alt+] flips the
 /// arrangement. Tree-inserted into the parsed doc (valid KDL by
 /// construction), never string-spliced.
-fn add_swap_variants(
-    base: &str,
-    repo_path: &str,
-    master: &str,
-    reviewers: &[String],
-) -> anyhow::Result<String> {
+///
+/// The variants take no roster: their stack is a `children` slot, so
+/// they fit the reviewers present at swap time, not the ones present
+/// at open. They carry that slot even when the roster opened empty —
+/// the tab layout has nothing to launch then, but the first reviewer
+/// added later needs somewhere to land.
+fn add_swap_variants(base: &str, repo_path: &str, master: &str) -> anyhow::Result<String> {
     let mut doc: kdl::KdlDocument = base.parse().expect("composed built-in layout is valid KDL");
     let mut swaps = String::new();
     for o in [Orientation::Landscape, Orientation::Portrait] {
         swaps.push_str(&format!("swap_tiled_layout name=\"{}\" {{\n", o.name()));
         swaps.push_str("    tab {\n");
-        for line in agent_group_kdl(repo_path, master, reviewers, o).lines() {
+        for line in agent_group_kdl(repo_path, master, ReviewerStack::AnyPresent, o).lines() {
             swaps.push_str("        ");
             swaps.push_str(line);
             swaps.push('\n');
@@ -2278,7 +2312,12 @@ mod tests {
         // promote relayout) composes through agent_group_kdl, so this
         // one assertion covers them all.
         for o in [Orientation::Landscape, Orientation::Portrait] {
-            let kdl = agent_group_kdl("/repo", "alice", &["bob".to_string()], o);
+            let kdl = agent_group_kdl(
+                "/repo",
+                "alice",
+                ReviewerStack::Roster(&["bob".to_string()]),
+                o,
+            );
             let status_line = kdl
                 .lines()
                 .find(|l| l.contains("name=\"status\""))
@@ -3833,14 +3872,111 @@ ttys004   zellij attach clank-foo
     #[test]
     fn zero_reviewers_skips_stack_keeps_tui() {
         let kdl = compose_kdl(TEST_TAB, TEST_REPO, "m", &[], None, LANDSCAPE).unwrap();
+        let doc: kdl::KdlDocument = kdl.parse().expect("valid KDL");
         assert!(
-            !kdl.contains("stacked=true"),
-            "no empty stack region:\n{kdl}"
+            stacked_panes(layout_child(&doc, "tab")).is_empty(),
+            "no empty stack region in the tab:\n{kdl}"
         );
         assert!(
             kdl.contains("\"--tui\""),
             "instrument pane still ships:\n{kdl}"
         );
+        // The variants still carry the slot: the first reviewer added
+        // after open needs somewhere to land on alt+[.
+        for swap in swap_variants(&doc) {
+            assert_children_stack(swap);
+        }
+    }
+
+    /// Every `pane stacked=true` node under `node`, depth-first.
+    fn stacked_panes(node: &kdl::KdlNode) -> Vec<&kdl::KdlNode> {
+        let mut out = Vec::new();
+        for child in node.children().map(|c| c.nodes()).unwrap_or_default() {
+            if child.name().value() == "pane"
+                && child.get("stacked").and_then(|e| e.value().as_bool()) == Some(true)
+            {
+                out.push(child);
+            }
+            out.extend(stacked_panes(child));
+        }
+        out
+    }
+
+    fn layout_child<'a>(doc: &'a kdl::KdlDocument, name: &str) -> &'a kdl::KdlNode {
+        doc.get("layout")
+            .and_then(|l| l.children())
+            .and_then(|c| c.nodes().iter().find(|n| n.name().value() == name))
+            .unwrap_or_else(|| panic!("layout has a `{name}` node"))
+    }
+
+    fn swap_variants(doc: &kdl::KdlDocument) -> Vec<&kdl::KdlNode> {
+        let swaps: Vec<_> = doc
+            .get("layout")
+            .and_then(|l| l.children())
+            .map(|c| {
+                c.nodes()
+                    .iter()
+                    .filter(|n| n.name().value() == "swap_tiled_layout")
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(swaps.len(), 2, "one variant per orientation");
+        swaps
+    }
+
+    /// The variant's one stack is zellij's "whatever panes are here"
+    /// slot: a stacked pane whose only child is a `children` node.
+    fn assert_children_stack(swap: &kdl::KdlNode) {
+        let stacks = stacked_panes(swap);
+        assert_eq!(stacks.len(), 1, "one stack per variant:\n{swap}");
+        let slots: Vec<&str> = stacks[0]
+            .children()
+            .map(|c| c.nodes().iter().map(|n| n.name().value()).collect())
+            .unwrap_or_default();
+        assert_eq!(slots, ["children"], "the stack is a children slot:\n{swap}");
+    }
+
+    #[test]
+    fn swap_variants_take_any_reviewer_pane_not_the_opening_roster() {
+        // A variant is applied to the panes that EXIST. One that named
+        // the opening roster had a slot per reviewer and nothing for a
+        // reviewer added later, so alt+[ split that pane off the stage
+        // (a-swap-layout-describes-a-shape-not-a-roster).
+        let kdl = compose_kdl(
+            TEST_TAB,
+            TEST_REPO,
+            "alice",
+            &reviewers(&["bob", "carol"]),
+            None,
+            LANDSCAPE,
+        )
+        .unwrap();
+        let doc: kdl::KdlDocument = kdl.parse().expect("valid KDL");
+        let tab = layout_child(&doc, "tab").to_string();
+        assert!(
+            tab.contains("args \"agent\" \"start\" \"bob\"")
+                && tab.contains("args \"agent\" \"start\" \"carol\""),
+            "the tab launches every reviewer:\n{tab}"
+        );
+        for swap in swap_variants(&doc) {
+            assert_children_stack(swap);
+            let text = swap.to_string();
+            assert!(
+                !text.contains("\"bob\"") && !text.contains("\"carol\""),
+                "a variant names no reviewer:\n{text}"
+            );
+            // Master and status keep command-bearing slots — matching
+            // on the command is what holds them in place while the
+            // reviewers fill the slot.
+            assert!(
+                text.contains("args \"agent\" \"start\" \"alice\""),
+                "master slot keeps its command:\n{text}"
+            );
+            assert!(
+                text.contains("\"--tui\""),
+                "status slot keeps its command:\n{text}"
+            );
+        }
     }
 
     // ── session dedup (zellij-session-dedup) ──
