@@ -40,9 +40,6 @@ pub struct RewriteOpts<'a> {
     /// branch already exists.
     pub into_branch: Option<&'a str>,
     pub dry: bool,
-    /// Permit rewriting a protected branch (`main`/`master`/etc.)
-    /// in place. Ignored when `into_branch` is set.
-    pub allow_rewrite_protected: bool,
     /// `Some(msg)` collapses the squash range into one commit on top of
     /// `intro_parent`, with the supplied message. Refuses if any commit in
     /// the COLLAPSED range is marked `foreign` (a squash can't selectively
@@ -292,8 +289,6 @@ pub struct RewordOpts<'a> {
     /// BYTES, not `&str`: a message may be invalid UTF-8 and a reword
     /// that preserves it must not launder it through a lossy decode.
     pub new_message: &'a [u8],
-    /// Permit rewriting a protected branch (`main`/`master`) in place.
-    pub allow_rewrite_protected: bool,
     /// Force the rewritten target to be a DIFFERENT commit even when
     /// the message is unchanged. Off by default: a reword normally
     /// changes the message, so the sha changes anyway, and pinning the
@@ -315,9 +310,8 @@ pub struct RewordOpts<'a> {
 /// NOT fire for a plumbing `update-ref`).
 ///
 /// Refuses on: a merge commit in `[target, head]` (first-parent replay would
-/// drop a parent), a dirty working tree, a protected branch without
-/// `allow_rewrite_protected`, or `target_sha` not being on `head_sha`'s
-/// first-parent chain.
+/// drop a parent), a dirty working tree, or `target_sha` not being on
+/// `head_sha`'s first-parent chain.
 pub async fn reword_in_place(opts: RewordOpts<'_>) -> anyhow::Result<Vec<(CommitSha, CommitSha)>> {
     // The target must sit on head's first-parent chain, else the descendant
     // walk (anchored by hiding `target`) would not be relative to it.
@@ -355,15 +349,6 @@ pub async fn reword_in_place(opts: RewordOpts<'_>) -> anyhow::Result<Vec<(Commit
     }
     if working_tree_dirty(opts.repo)? {
         blockers.push("working tree dirty; commit or stash first".to_string());
-    }
-    if !opts.allow_rewrite_protected {
-        let current = current_branch(opts.repo)?;
-        if is_protected_branch(opts.repo, &current)? {
-            blockers.push(format!(
-                "refusing to rewrite protected branch `{current}` in place. \
-                 Pass `--allow-rewrite-protected` to override."
-            ));
-        }
     }
 
     if opts.dry {
@@ -493,31 +478,7 @@ fn collect_blockers(opts: &RewriteOpts<'_>) -> anyhow::Result<Vec<String>> {
              Pick a different name or delete it first."
         ));
     }
-    // Protected-branch refusal — only relevant for in-place
-    // rewrites; --into-branch never touches the protected ref.
-    if opts.into_branch.is_none() && !opts.allow_rewrite_protected {
-        let current = current_branch(opts.repo)?;
-        if is_protected_branch(opts.repo, &current)? {
-            blockers.push(format!(
-                "refusing to rewrite protected branch `{current}` in place. \
-                 Pass `--allow-rewrite-protected` to override, or use \
-                 `--into-branch <name>` to write the rewritten history to a \
-                 fresh branch."
-            ));
-        }
-    }
     Ok(blockers)
-}
-
-/// True if `branch` is `main`, `master`, or matched by
-/// `branch.<name>.protect = true` in the repo's git config. The
-/// engine refuses to rewrite protected branches in place without
-/// `--allow-rewrite-protected`.
-fn is_protected_branch(repo: &Path, branch: &str) -> anyhow::Result<bool> {
-    if matches!(branch, "main" | "master") {
-        return Ok(true);
-    }
-    Ok(crate::git_io::config_bool(repo, &format!("branch.{branch}.protect"))?.unwrap_or(false))
 }
 
 /// Emit a `git rebase --interactive` todo list. The operator can
@@ -977,7 +938,7 @@ mod tests {
             commits: &preview.commits,
             into_branch: Some("purged"),
             dry: false,
-            allow_rewrite_protected: false,
+
             squash: None,
             squash_tip: None,
             head_strip_paths: &[],
@@ -1029,7 +990,7 @@ mod tests {
             commits: &preview.commits,
             into_branch: Some("dry-target"),
             dry: true,
-            allow_rewrite_protected: false,
+
             squash: None,
             squash_tip: None,
             head_strip_paths: &[],
@@ -1075,7 +1036,7 @@ mod tests {
             commits: &preview.commits,
             into_branch: Some("already-exists"),
             dry: false,
-            allow_rewrite_protected: false,
+
             squash: None,
             squash_tip: None,
             head_strip_paths: &[],
@@ -1125,7 +1086,7 @@ mod tests {
             commits: &preview.commits,
             into_branch: Some("purged"),
             dry: false,
-            allow_rewrite_protected: false,
+
             squash: None,
             squash_tip: None,
             head_strip_paths: &[],
@@ -1170,11 +1131,7 @@ mod tests {
             commits: &preview.commits,
             into_branch: None, // in-place — triggers the conditional update
             dry: false,
-            // The test's repo uses the default `main` branch, which the new
-            // protected-branch check refuses. Override here — the test's
-            // assertion is about the in-place race, not protected-branch
-            // policy.
-            allow_rewrite_protected: true,
+
             squash: None,
             squash_tip: None,
             head_strip_paths: &[],
@@ -1237,7 +1194,7 @@ mod tests {
             commits: &preview.commits,
             into_branch: Some("scrubbed"),
             dry: false,
-            allow_rewrite_protected: false,
+
             squash: None,
             squash_tip: None,
             head_strip_paths: &[],
@@ -1298,7 +1255,7 @@ mod tests {
             commits: &preview.commits,
             into_branch: Some("scrubbed"),
             dry: false,
-            allow_rewrite_protected: false,
+
             squash: None,
             squash_tip: None,
             head_strip_paths: &[],
@@ -1412,7 +1369,7 @@ mod tests {
             commits: &preview.commits,
             into_branch: Some("squashed"),
             dry: false,
-            allow_rewrite_protected: false,
+
             squash: Some("Implement foo"),
             squash_tip: None,
             head_strip_paths: &[".clank/plans/foo.md".to_string()],
@@ -1465,7 +1422,7 @@ mod tests {
             commits: &preview.commits,
             into_branch: Some("squashed"),
             dry: false,
-            allow_rewrite_protected: false,
+
             squash: Some("squashed plan"),
             // Daemon provides head_strip_paths — the squash uses
             // these, NOT the union of per-step strip_paths.
@@ -1506,7 +1463,7 @@ mod tests {
             commits: &preview.commits,
             into_branch: Some("squashed"),
             dry: false,
-            allow_rewrite_protected: false,
+
             squash: Some("collapse"),
             squash_tip: None,
             head_strip_paths: &[],
@@ -1518,9 +1475,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rewrite_refuses_protected_branch_in_place() {
-        // The default `main` branch is protected; in-place
-        // rewrites refuse without --allow-rewrite-protected.
+    async fn rewrite_runs_in_place_on_the_default_branch() {
+        // `main`/`master` is where every clank plan is worked on;
+        // rewriting it in place is the tool's job, not a hazard it
+        // asks permission for (stash-does-what-you-mean).
         let dir = init_repo();
         write(dir.path(), "README.md", "seed\n");
         let _seed = commit(dir.path(), "seed");
@@ -1537,7 +1495,7 @@ mod tests {
                 vec![],
             )],
         );
-        let err = super::run(RewriteOpts {
+        super::run(RewriteOpts {
             repo: dir.path(),
             intro_sha: preview.intro_sha.as_ref(),
             head_sha: &preview.head_sha,
@@ -1545,23 +1503,23 @@ mod tests {
             commits: &preview.commits,
             into_branch: None, // in-place
             dry: false,
-            allow_rewrite_protected: false,
+
             squash: None,
             squash_tip: None,
             head_strip_paths: &[],
         })
         .await
-        .unwrap_err();
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("protected branch"),
-            "expected protected-branch refusal, got: {msg}"
+        .expect("the default branch rewrites in place");
+        assert_ne!(git_head(dir.path()), intro, "the branch moved");
+        assert_eq!(
+            rev_list(dir.path(), "main").len(),
+            1,
+            "main itself was rewritten: the seed alone remains"
         );
-        assert!(msg.contains("main"), "msg should name the branch: {msg}");
     }
 
     #[tokio::test]
-    async fn rewrite_protected_branch_bypassed_by_into_branch() {
+    async fn rewrite_into_branch_writes_a_fresh_branch() {
         let dir = init_repo();
         write(dir.path(), "README.md", "seed\n");
         let _seed = commit(dir.path(), "seed");
@@ -1578,7 +1536,6 @@ mod tests {
                 vec![],
             )],
         );
-        // --into-branch bypasses protected check; this should succeed.
         super::run(RewriteOpts {
             repo: dir.path(),
             intro_sha: preview.intro_sha.as_ref(),
@@ -1587,7 +1544,7 @@ mod tests {
             commits: &preview.commits,
             into_branch: Some("scrubbed"),
             dry: false,
-            allow_rewrite_protected: false,
+
             squash: None,
             squash_tip: None,
             head_strip_paths: &[],
@@ -1619,7 +1576,7 @@ mod tests {
             commits: &preview.commits,
             into_branch: Some("x"),
             dry: false,
-            allow_rewrite_protected: false,
+
             squash: None,
             squash_tip: None,
             head_strip_paths: &[],
@@ -1717,8 +1674,8 @@ mod tests {
             target_sha: &CommitSha::parse(&target).unwrap(),
             head_sha: &CommitSha::parse(&head).unwrap(),
             new_message: "reworded whole-plan summary\n\nwhy it exists".as_bytes(),
-            allow_rewrite_protected: true,
-            distinct_target: false, // default branch `main` is protected
+
+            distinct_target: false,
             dry: false,
         })
         .await
@@ -1776,7 +1733,7 @@ mod tests {
                 target_sha: &sha,
                 head_sha: &sha,
                 new_message: "[foo] intro".as_bytes(),
-                allow_rewrite_protected: true,
+
                 distinct_target: true,
                 dry: false,
             })
@@ -1811,7 +1768,7 @@ mod tests {
             target_sha: &sha,
             head_sha: &sha,
             new_message: "[foo] intro".as_bytes(),
-            allow_rewrite_protected: true,
+
             distinct_target: false,
             dry: false,
         })
@@ -1825,7 +1782,7 @@ mod tests {
             target_sha: &once,
             head_sha: &once,
             new_message: "[foo] intro".as_bytes(),
-            allow_rewrite_protected: true,
+
             distinct_target: false,
             dry: false,
         })
@@ -1858,7 +1815,7 @@ mod tests {
             target_sha: &CommitSha::parse(&target).unwrap(),
             head_sha: &CommitSha::parse(&head).unwrap(),
             new_message: "x\n\nwhy".as_bytes(),
-            allow_rewrite_protected: true,
+
             distinct_target: false,
             dry: false,
         })
@@ -1886,7 +1843,7 @@ mod tests {
             target_sha: &CommitSha::parse(&off).unwrap(),
             head_sha: &CommitSha::parse(&head).unwrap(),
             new_message: "x\n\nwhy".as_bytes(),
-            allow_rewrite_protected: true,
+
             distinct_target: false,
             dry: false,
         })
@@ -1912,7 +1869,7 @@ mod tests {
             commits: &[],
             into_branch: None,
             dry,
-            allow_rewrite_protected: true,
+
             squash: Some("collapse nothing"),
             squash_tip: None,
             head_strip_paths: &[],
@@ -2003,7 +1960,7 @@ mod tests {
             target_sha: &target_sha,
             head_sha: &head_sha,
             new_message: "x\n\nwhy".as_bytes(),
-            allow_rewrite_protected: true,
+
             distinct_target: false,
             dry,
         };
@@ -2023,30 +1980,5 @@ mod tests {
             .output()
             .unwrap();
         String::from_utf8(out.stdout).unwrap().trim().to_string()
-    }
-
-    #[tokio::test]
-    async fn reword_in_place_refuses_protected_branch_without_override() {
-        let dir = init_repo();
-        let repo = dir.path();
-        write(repo, "README.md", "seed\n");
-        let _seed = commit(repo, "seed");
-        write(repo, "a.txt", "a\n");
-        let target = commit(repo, "target");
-        write(repo, "b.txt", "b\n");
-        let head = commit(repo, "head");
-
-        let err = super::reword_in_place(RewordOpts {
-            repo,
-            target_sha: &CommitSha::parse(&target).unwrap(),
-            head_sha: &CommitSha::parse(&head).unwrap(),
-            new_message: "x\n\nwhy".as_bytes(),
-            allow_rewrite_protected: false,
-            distinct_target: false, // `main` is protected
-            dry: false,
-        })
-        .await
-        .unwrap_err();
-        assert!(format!("{err}").contains("protected branch"), "{err}");
     }
 }

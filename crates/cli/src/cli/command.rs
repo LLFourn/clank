@@ -122,9 +122,10 @@ pub enum Command {
     // ── plan surgery ──
     /// Set a plan's commits aside and restore them later
     ///
-    /// git-stash verbs: `stash push` / `pop` / `show` / `drop`; bare
-    /// `clank stash` lists. `push --to-queue` re-queues the plan body
-    /// for a later attempt.
+    /// Bare `clank stash [PLAN]` pushes, as `git stash` does: the one
+    /// in-flight plan, or the named one. `pop` / `show` / `drop` take
+    /// the one stashed plan when there is one; `list` lists.
+    /// `--to-queue` re-queues the plan body for a later attempt.
     Stash(crate::cli::StashArgs),
     /// Hidden alias for `clank stash push` (+ `shelve clean` →
     /// `stash drop`). One release of back-compat.

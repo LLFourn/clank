@@ -51,7 +51,6 @@ fn finish_args(repo: &Path, plan: &str, squash: Option<&str>) -> clank::cli::Fin
         squash: squash.map(str::to_string),
         no_squash: false,
         into_branch: None,
-        allow_rewrite_protected: false,
         dry: false,
         force: false,
         no_cache: true,
@@ -265,9 +264,7 @@ body
 
 {finalize_body}"
     );
-    let mut squash = finish_args(repo, "foo", Some(&composed));
-    // The TUI path passes allow_rewrite_protected (its confirm gates it).
-    squash.allow_rewrite_protected = true;
+    let squash = finish_args(repo, "foo", Some(&composed));
     block_on(clank::cli::finish::run(squash)).expect("composed squash passes validation");
 
     assert_eq!(
@@ -284,8 +281,9 @@ body
 fn refused_squash_leaves_the_validated_message_not_the_placeholder() {
     // codex 053f9d1: `finish --squash` stamps the transient finalize commit
     // with the (validated) squash message BEFORE the squash runs, so a squash
-    // that is REFUSED (here: protected `main`) leaves that message on HEAD —
-    // never the `[stem] finish` placeholder.
+    // that is REFUSED (here: `--into-branch` naming a branch that already
+    // exists) leaves that message on HEAD — never the `[stem] finish`
+    // placeholder.
     let env = TestEnv::init();
     env.register_team("claude", &["codex"], &[]);
     let repo = env.repo();
@@ -302,12 +300,15 @@ fn refused_squash_leaves_the_validated_message_not_the_placeholder() {
 
     let msg = "collapse foo into one\n\nso the branch reads as a single commit";
     // `--squash` finalizes (stamping the squash message), then the squash is
-    // refused on protected `main` (no --allow-rewrite-protected).
-    let err = block_on(clank::cli::finish::run(finish_args(repo, "foo", Some(msg))))
-        .expect_err("squash must be refused on protected main");
+    // refused: the target branch exists.
+    git_out(repo, &["branch", "taken"]);
+    let mut args = finish_args(repo, "foo", Some(msg));
+    args.into_branch = Some("taken".into());
+    let err = block_on(clank::cli::finish::run(args))
+        .expect_err("squash must be refused when the target branch exists");
     assert!(
-        err.to_string().contains("protected"),
-        "expected protected-branch refusal, got: {err}"
+        err.to_string().contains("already exists"),
+        "expected the existing-branch refusal, got: {err}"
     );
 
     // HEAD carries the validated squash subject (plan-tagged), NOT the placeholder.
@@ -325,9 +326,9 @@ fn refused_squash_leaves_the_validated_message_not_the_placeholder() {
 #[test]
 fn refused_purge_leaves_the_validated_message_not_the_placeholder() {
     // codex 53a9edb: `--purge` on a READY plan CREATES the finalize commit,
-    // then runs the strip rewrite — which can be refused (protected `main`),
-    // leaving the finalize commit on HEAD. It must carry the validated `-m`,
-    // never `[stem] finish`.
+    // then runs the strip rewrite — which can be refused (here: the
+    // `--into-branch` target already exists), leaving the finalize commit
+    // on HEAD. It must carry the validated `-m`, never `[stem] finish`.
     let env = TestEnv::init();
     env.register_team("claude", &["codex"], &[]);
     let repo = env.repo();
@@ -343,14 +344,16 @@ fn refused_purge_leaves_the_validated_message_not_the_placeholder() {
     );
 
     let msg = "strip foo artifacts\n\nthe plan is done and the .clank bookkeeping is noise";
+    git_out(repo, &["branch", "taken"]);
     let mut args = finish_args(repo, "foo", None);
     args.purge = true;
+    args.into_branch = Some("taken".into());
     args.message = vec![msg.to_string()];
     let err = block_on(clank::cli::finish::run(args))
-        .expect_err("purge rewrite must be refused on protected main");
+        .expect_err("purge rewrite must be refused when the target branch exists");
     assert!(
-        err.to_string().contains("protected"),
-        "expected protected-branch refusal, got: {err}"
+        err.to_string().contains("already exists"),
+        "expected the existing-branch refusal, got: {err}"
     );
 
     let subject = git_out(repo, &["log", "-1", "--format=%s"]);
@@ -410,7 +413,6 @@ fn squash_message_gets_the_plan_tag_even_when_untagged() {
 
     let mut args = finish_args(repo, "foo", None);
     args.squash = Some("collapse foo\n\na single commit reads cleaner".into());
-    args.allow_rewrite_protected = true; // let the squash run on `main`
     block_on(clank::cli::finish::run(args)).expect("squash finish should succeed");
 
     let subject = git_out(repo, &["log", "-1", "--format=%s"]);
@@ -459,7 +461,6 @@ fn autosquash_config_collapses_plan_to_one_tagged_commit() {
 
     let mut args = finish_args(repo, "foo", None);
     args.message = vec!["wrap up foo".into(), "one commit reads cleaner".into()];
-    args.allow_rewrite_protected = true; // main is protected; let the squash run
     block_on(clank::cli::finish::run(args)).expect("autosquash finish should succeed");
 
     assert_eq!(
@@ -648,10 +649,9 @@ fn finish_dash_m_dry_previews_the_reword_without_changing_anything() {
 }
 
 #[test]
-fn autosquash_squashes_on_protected_main_without_the_flag() {
-    // Part 2 (option A): autosquash implies allow_rewrite_protected, so it
-    // collapses the plan on protected `main` WITHOUT `--allow-rewrite-protected`
-    // — the natural clank workflow runs on the protected branch.
+fn autosquash_squashes_on_main() {
+    // The natural clank workflow finalizes on the working branch, which
+    // is `main`/`master`; collapsing the plan there is the point.
     let env = TestEnv::init();
     env.register_team("claude", &["codex"], &[]);
     let repo = env.repo();
@@ -660,9 +660,7 @@ fn autosquash_squashes_on_protected_main_without_the_flag() {
 
     let mut args = finish_args(repo, "foo", None);
     args.message = vec!["wrap up foo".into(), "one commit on main".into()];
-    // allow_rewrite_protected stays FALSE — autosquash must supply it.
-    assert!(!args.allow_rewrite_protected);
-    block_on(clank::cli::finish::run(args)).expect("autosquash squashes on protected main");
+    block_on(clank::cli::finish::run(args)).expect("autosquash squashes on main");
 
     assert_eq!(
         git_out(repo, &["log", "-1", "--format=%s"]),
@@ -671,7 +669,7 @@ fn autosquash_squashes_on_protected_main_without_the_flag() {
     assert_eq!(
         git_out(repo, &["rev-list", "--count", "HEAD"]),
         "2",
-        "collapsed to base + one commit on protected main"
+        "collapsed to base + one commit on main"
     );
 }
 
@@ -723,17 +721,19 @@ fn fresh_squash_dry_is_a_strict_noop_then_live_agrees() {
 
 #[test]
 fn fresh_squash_dry_reports_the_same_blocker_live_refuses() {
-    // Blocker parity: an explicit --squash on protected `main` without
-    // --allow-rewrite-protected. The live run refuses; the --dry — the same
+    // Blocker parity: an explicit --squash --into-branch naming a branch
+    // that exists. The live run refuses; the --dry — the same
     // computation — reports the blocker and changes nothing.
     let env = TestEnv::init();
     env.register_team("claude", &["codex"], &[]);
     let repo = env.repo();
     ready_plan_on_base(&env);
+    git_out(repo, &["branch", "taken"]);
 
     let head_before = git_out(repo, &["rev-parse", "HEAD"]);
     let msg = "collapse foo\n\nso the branch reads as one commit";
     let mut args = finish_args(repo, "foo", Some(msg));
+    args.into_branch = Some("taken".into());
     args.dry = true;
     block_on(clank::cli::finish::run(args)).expect("dry prints blockers, exits clean");
     assert_eq!(
@@ -743,9 +743,11 @@ fn fresh_squash_dry_reports_the_same_blocker_live_refuses() {
     );
     assert!(repo.join(".clank/plans/foo.md").exists());
 
-    let args = finish_args(repo, "foo", Some(msg));
-    let err = block_on(clank::cli::finish::run(args)).expect_err("live refuses on protected main");
-    assert!(err.to_string().contains("protected"), "got: {err}");
+    let mut args = finish_args(repo, "foo", Some(msg));
+    args.into_branch = Some("taken".into());
+    let err = block_on(clank::cli::finish::run(args))
+        .expect_err("live refuses when the target branch exists");
+    assert!(err.to_string().contains("already exists"), "got: {err}");
 }
 
 #[test]
@@ -799,8 +801,7 @@ fn buried_squash_collapses_only_the_plans_own_range_and_restacks() {
 
     // Retroactive squash of the BURIED plan.
     let msg = "collapse foo\n\nfoo reads as one commit now";
-    let mut args = finish_args(repo, "foo", Some(msg));
-    args.allow_rewrite_protected = true;
+    let args = finish_args(repo, "foo", Some(msg));
     block_on(clank::cli::finish::run(args)).expect("buried squash must work");
 
     // base + squashed foo + restacked later = 3; HEAD tree unchanged.
@@ -846,7 +847,6 @@ fn buried_squash_dry_is_a_noop_then_live_agrees() {
     let head_before = git_out(repo, &["rev-parse", "HEAD"]);
     let msg = "collapse foo\n\nfoo reads as one commit now";
     let mut args = finish_args(repo, "foo", Some(msg));
-    args.allow_rewrite_protected = true;
     args.dry = true;
     block_on(clank::cli::finish::run(args)).expect("dry buried squash");
     assert_eq!(
@@ -855,8 +855,7 @@ fn buried_squash_dry_is_a_noop_then_live_agrees() {
         "--dry must not move HEAD"
     );
 
-    let mut args = finish_args(repo, "foo", Some(msg));
-    args.allow_rewrite_protected = true;
+    let args = finish_args(repo, "foo", Some(msg));
     block_on(clank::cli::finish::run(args)).expect("live executes what dry previewed");
     assert_eq!(git_out(repo, &["rev-list", "--count", "HEAD"]), "3");
 }
@@ -889,8 +888,7 @@ fn buried_squash_refuses_interleaved_foreign_and_names_it() {
 
     let head_before = git_out(repo, &["rev-parse", "HEAD"]);
     let msg = "collapse foo\n\nshould refuse: stray is interleaved";
-    let mut args = finish_args(repo, "foo", Some(msg));
-    args.allow_rewrite_protected = true;
+    let args = finish_args(repo, "foo", Some(msg));
     let err = block_on(clank::cli::finish::run(args)).expect_err("interleaved foreign refuses");
     let text = err.to_string();
     assert!(text.contains("interleaved"), "got: {text}");
@@ -919,7 +917,6 @@ fn buried_purge_squash_strips_artifacts_from_restacked_commits() {
     let msg = "collapse and strip foo\n\nthe bookkeeping is noise now";
     let mut args = finish_args(repo, "foo", Some(msg));
     args.purge = true;
-    args.allow_rewrite_protected = true;
     block_on(clank::cli::finish::run(args)).expect("buried purge+squash");
 
     // HEAD (the restacked later commit) must NOT contain foo's artifacts.

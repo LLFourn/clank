@@ -381,9 +381,7 @@ pub async fn run(args: SetupArgs) -> anyhow::Result<()> {
 
     // Setup may seed product behavior defaults, but never personal/team
     // composition templates. `finish.autosquash` is a behavior default:
-    // absent → true; an explicit true/false is preserved. Pairs with
-    // autosquash implying `allow_rewrite_protected` so it works on the
-    // natural (often `master`) workflow branch.
+    // absent → true; an explicit true/false is preserved.
     if let Some(line) = seed_autosquash_default(&home.join(".clank/config.json"), args.dry_run)? {
         summary.push(line);
     }

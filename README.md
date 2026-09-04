@@ -198,7 +198,7 @@ Run `clank <cmd> --help` for details; the skills carry the depth.
 | `log` | Chronological commit + review timeline (`--oneline`, `-j`) |
 | `html` | Render the event log + status to a static site; `html open` |
 | `diff` | Launch the configured editor on a plan / range diff |
-| `stash` | Set a plan's commits aside / restore (`push --to-queue` re-queues) |
+| `stash` | Set a plan's commits aside (bare pushes, like `git stash`) / `pop` restores / `list` |
 | `pick` | Copy plans (commits + files) from another branch (`--from`) |
 | `purge` | Strip a plan's `.clank/` artifacts from history (`--drop` = all of it) |
 | `block` / `unblock` | Ask the human a blocking question / answer it |

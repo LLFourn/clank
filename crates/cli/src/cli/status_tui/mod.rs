@@ -225,11 +225,8 @@ fn apply_confirm(
 }
 
 /// Execute a plan-page confirm via the SAME cores the CLI verbs run —
-/// the TUI is a front-end, never a reimplemented write. `yes: true`
-/// because the TUI's confirm screen IS the confirmation. Purges pass
-/// `allow_rewrite_protected: true`: the TUI's chooser + scary confirm
-/// is stronger consent than the CLI flag, and dogfooding happens on
-/// `master` (reviewers: challenge if you disagree).
+/// the TUI is a front-end, never a reimplemented write. The TUI's
+/// confirm screen is its own affordance; the cores ask nothing.
 async fn run_plan_confirm(
     action: ConfirmAction,
     repo: &std::path::Path,
@@ -243,8 +240,6 @@ async fn run_plan_confirm(
                 to_queue: false,
                 priority: None,
                 dry: false,
-                yes: true,
-                allow_rewrite_protected: true,
                 repo: Some(repo.to_path_buf()),
             })
             .await
@@ -256,11 +251,9 @@ async fn run_plan_confirm(
                 repo: Some(repo.to_path_buf()),
                 into_branch: None,
                 dry: false,
-                yes: true,
                 squash: None,
                 amend: false,
                 drop: matches!(action, ConfirmAction::PurgeDrop),
-                allow_rewrite_protected: true,
                 no_cache: false,
             })
             .await
@@ -330,7 +323,6 @@ async fn submit_plan_input(
                 squash: None,
                 no_squash: false,
                 into_branch: None,
-                allow_rewrite_protected: true,
                 dry: false,
                 force: true,
                 no_cache: false,
@@ -365,7 +357,6 @@ async fn submit_plan_input(
                 squash: Some(msg),
                 no_squash: false,
                 into_branch: None,
-                allow_rewrite_protected: true,
                 dry: false,
                 force: false,
                 no_cache: false,

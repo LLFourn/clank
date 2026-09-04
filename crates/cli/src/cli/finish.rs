@@ -45,15 +45,10 @@ pub async fn run(mut args: FinishArgs) -> anyhow::Result<()> {
     // would route to the retroactive-squash path instead. Retroactive collapse
     // stays available via an EXPLICIT `--squash`.
     //
-    // Autosquash also implies `allow_rewrite_protected` (option A): the natural
-    // clank workflow finalizes on the working branch, which is often
-    // `master`/`main`, and collapsing the plan there is the whole point.
-    // Autosquash is an explicit standing opt-in and clank is local-first (the
-    // plan's commits are fresh), so we permit the in-place protected rewrite.
-    // CAVEAT: if the branch is already pushed/shared, this rewrites published
-    // history — `--no-squash` opts out for that one finish. Explicit
-    // `clank finish --squash` is UNCHANGED (still needs
-    // `--allow-rewrite-protected`).
+    // This rewrites the working branch in place — often `master`/`main`,
+    // and collapsing the plan there is the whole point. If the branch is
+    // already pushed, that rewrites published history; `--no-squash` opts
+    // out for that one finish.
     let cfg = crate::cli::config::load(&repo);
     if cfg.finish.autosquash
         && !already_finished
@@ -62,7 +57,6 @@ pub async fn run(mut args: FinishArgs) -> anyhow::Result<()> {
         && !args.no_squash
     {
         args.squash = message.clone();
-        args.allow_rewrite_protected = true;
     }
 
     // Validate the message that will BECOME the final finish commit's message.
@@ -395,7 +389,6 @@ async fn rewrite_with_state(
         commits: &preview.commits,
         into_branch: args.into_branch.as_deref(),
         dry: args.dry,
-        allow_rewrite_protected: args.allow_rewrite_protected,
         squash: squash_msg.as_deref(),
         squash_tip: preview.squash_tip.as_ref(),
         head_strip_paths: &preview.head_strip_paths,
@@ -575,10 +568,9 @@ async fn finalize(
 /// Reword a finished plan's finalize commit WHEREVER it sits: `reword_in_place`
 /// rebuilds it with `message` (a no-descendant reword when it's HEAD;
 /// reword-and-replay when buried), then review feedback is migrated for every
-/// rewritten commit so `clank log` annotations follow the new shas. Implies
-/// `allow_rewrite_protected` — the finalize usually lives on `master`/`main`,
-/// and aggressively rewriting local plan history is the point (consistent with
-/// autosquash).
+/// rewritten commit so `clank log` annotations follow the new shas. The
+/// finalize usually lives on `master`/`main`, and aggressively rewriting local
+/// plan history is the point.
 ///
 /// `dry` threads straight into the engine: the preview IS the live plan
 /// computed once and printed instead of applied (same descendants, same
@@ -604,7 +596,6 @@ async fn reword_finalize(
         target_sha: target,
         head_sha: &head,
         new_message: msg.as_bytes(),
-        allow_rewrite_protected: true,
         distinct_target: false,
         dry,
     })

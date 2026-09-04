@@ -62,7 +62,6 @@ pub async fn rereview_plan(
         // handoff this exists to unstick. Inheriting the engine's
         // protected-branch refusal would make the command unusable
         // exactly where it is needed.
-        allow_rewrite_protected: true,
         // The point of the command: mint a NEW review target even
         // though nothing but the commit's identity changes.
         distinct_target: true,

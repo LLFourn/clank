@@ -1,6 +1,7 @@
-//! `clank stash` — set an in-flight plan's commits aside (`push`) and
-//! restore them later (`pop`), with `show` / `drop` / bare-list. The
-//! verbs mirror `git stash` (rename-shelve-to-stash; formerly
+//! `clank stash` — set an in-flight plan's commits aside (bare, or
+//! `push`) and restore them later (`pop`), with `show` / `drop` /
+//! `list`. The verbs mirror `git stash`, bare-is-push included
+//! (rename-shelve-to-stash, stash-does-what-you-mean; formerly
 //! `clank shelve`/`unshelve`, kept as hidden aliases for a release).
 //!
 //! Push order is the data-safety invariant: the protective ref
@@ -106,40 +107,134 @@ pub fn scan_stash(repo: &Path) -> Vec<(String, StashRecord)> {
     out
 }
 
-/// `clank stash` dispatcher: bare = list; push/pop/show/drop.
-pub async fn run(args: StashArgs) -> anyhow::Result<()> {
-    match args.command {
-        None => run_list(args.repo.as_deref()).await,
-        Some(StashCmd::Push(a)) => run_push(a).await,
-        Some(StashCmd::Pop(a)) => run_pop_inner(a.repo.as_deref(), &a.plan).await,
-        Some(StashCmd::Show(a)) => run_show(a).await,
-        Some(StashCmd::Drop(a)) => run_drop_inner(a.repo.as_deref(), &a.plan, a.yes).await,
+/// The bare form's options belong to the bare form. Parsed before a
+/// verb they would be silently dropped — `clank stash --dry drop foo`
+/// running the drop — so a verb with any of them set is refused here,
+/// before anything is touched (codex on 70a17f8).
+pub fn refuse_parent_options(args: &StashArgs) -> anyhow::Result<()> {
+    let Some(cmd) = &args.command else {
+        return Ok(());
+    };
+    let p = &args.push;
+    let stray: Vec<&str> = [
+        (p.plan.is_some(), "a plan name"),
+        (p.repo.is_some(), "--repo"),
+        (p.waiting_for.is_some(), "--for"),
+        (p.to_queue, "--to-queue"),
+        (p.priority.is_some(), "--priority"),
+        (p.dry, "--dry"),
+    ]
+    .into_iter()
+    .filter_map(|(set, name)| set.then_some(name))
+    .collect();
+    if stray.is_empty() {
+        return Ok(());
     }
+    let verb = match cmd {
+        StashCmd::Push(_) => "push",
+        StashCmd::Pop(_) => "pop",
+        StashCmd::Show(_) => "show",
+        StashCmd::Drop(_) => "drop",
+        StashCmd::List(_) => "list",
+    };
+    anyhow::bail!(
+        "`clank stash {verb}` takes its options after the verb — {} came before it and would \
+         not apply. Write `clank stash {verb} …` with them after, or drop the verb for a bare \
+         push.",
+        stray.join(", ")
+    )
 }
 
-/// Hidden-alias adapter: `clank shelve [clean]` → push / drop.
-pub async fn run_shelve_alias(args: ShelveArgs) -> anyhow::Result<()> {
+/// `clank stash` dispatcher: bare = push, as `git stash` is;
+/// push/pop/show/drop/list.
+pub async fn run(args: StashArgs) -> anyhow::Result<()> {
+    refuse_parent_options(&args)?;
     match args.command {
-        Some(ShelveCmd::Clean(a)) => run_drop_inner(a.repo.as_deref(), &a.plan, a.yes).await,
-        None => {
-            run_push(StashPushArgs {
-                plan: args.plan,
-                repo: args.repo,
-                waiting_for: args.waiting_for,
-                to_queue: args.to_queue,
-                priority: args.priority,
-                dry: args.dry,
-                yes: args.yes,
-                allow_rewrite_protected: args.allow_rewrite_protected,
+        None => run_push(args.push).await,
+        Some(StashCmd::Push(a)) => run_push(a).await,
+        Some(StashCmd::Pop(a)) => run_pop_inner(a.repo.as_deref(), a.plan.as_deref()).await,
+        Some(StashCmd::Show(a)) => run_show(a).await,
+        Some(StashCmd::Drop(a)) => {
+            run_drop_inner(a.repo.as_deref(), a.plan.as_deref(), &mut |w| {
+                eprintln!("{w}")
             })
             .await
         }
+        Some(StashCmd::List(a)) => run_list(a.repo.as_deref()).await,
     }
 }
 
-/// Hidden-alias adapter: `clank unshelve` → pop.
+/// Hidden-alias adapter: `clank shelve [clean]` is `clank stash
+/// [drop]`, spelled the old way — the SAME `StashArgs`, so the
+/// parent-option refusal and the single-stash inference hold for the
+/// alias exactly as for the command (codex on c7cf432).
+pub fn shelve_as_stash(args: ShelveArgs) -> StashArgs {
+    StashArgs {
+        command: args.command.map(|c| match c {
+            ShelveCmd::Clean(a) => StashCmd::Drop(super::StashDropArgs {
+                plan: a.plan,
+                repo: a.repo,
+            }),
+        }),
+        push: StashPushArgs {
+            plan: args.plan,
+            repo: args.repo,
+            waiting_for: args.waiting_for,
+            to_queue: args.to_queue,
+            priority: args.priority,
+            dry: args.dry,
+        },
+    }
+}
+
+pub async fn run_shelve_alias(args: ShelveArgs) -> anyhow::Result<()> {
+    run(shelve_as_stash(args)).await
+}
+
+/// Hidden-alias adapter: `clank unshelve` is `clank stash pop`.
+pub fn unshelve_as_stash(args: UnshelveArgs) -> StashArgs {
+    StashArgs {
+        command: Some(StashCmd::Pop(super::StashPopArgs {
+            plan: args.plan,
+            repo: args.repo,
+        })),
+        push: StashPushArgs {
+            plan: None,
+            repo: None,
+            waiting_for: None,
+            to_queue: false,
+            priority: None,
+            dry: false,
+        },
+    }
+}
+
 pub async fn run_unshelve_alias(args: UnshelveArgs) -> anyhow::Result<()> {
-    run_pop_inner(args.repo.as_deref(), &args.plan).await
+    run(unshelve_as_stash(args)).await
+}
+
+/// The stem a pop/show/drop means: the named one, or the only one
+/// when exactly one plan is stashed — the rule `push` already uses
+/// for the single active plan. Pure over the scan.
+fn resolve_stashed(
+    stashed: &[(String, StashRecord)],
+    plan: Option<&str>,
+) -> anyhow::Result<String> {
+    if let Some(plan) = plan.map(str::trim).filter(|p| !p.is_empty()) {
+        PlanKey::parse(plan).map_err(|e| anyhow::anyhow!("invalid plan `{plan}`: {e}"))?;
+        return Ok(plan.to_string());
+    }
+    match stashed {
+        [] => anyhow::bail!("nothing is stashed"),
+        [(only, _)] => Ok(only.clone()),
+        many => anyhow::bail!(
+            "several plans are stashed — name one: {}",
+            many.iter()
+                .map(|(s, _)| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
 }
 
 pub async fn run_push(args: StashPushArgs) -> anyhow::Result<()> {
@@ -241,14 +336,9 @@ pub async fn run_push(args: StashPushArgs) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    if !args.yes
-        && !confirm(&format!(
-            "Stash `{stem}` ({} commits set aside)?",
-            shas.len()
-        ))?
-    {
-        anyhow::bail!("aborted");
-    }
+    // No confirmation: the ordering below — record and ref before
+    // the branch moves — is the safety, not a prompt in front of it,
+    // and clank asks no y/N anywhere (stash-does-what-you-mean).
 
     // ── PROTECT FIRST: the ref lands before anything rewrites. ──
     git_update_ref(&repo, &ref_name(&stem), preview.head_sha.as_str())?;
@@ -288,7 +378,6 @@ pub async fn run_push(args: StashPushArgs) -> anyhow::Result<()> {
         commits: &drop_commits,
         into_branch: None,
         dry: false,
-        allow_rewrite_protected: args.allow_rewrite_protected,
         squash: None,
         squash_tip: None,
         head_strip_paths: &preview.head_strip_paths,
@@ -298,8 +387,8 @@ pub async fn run_push(args: StashPushArgs) -> anyhow::Result<()> {
         Ok(o) => o,
         Err(e) => {
             // Roll back the protective ref + state ONLY when the
-            // branch never moved (pre-rewrite refusal, e.g.
-            // protected branch without the override): the branch
+            // branch never moved (a pre-rewrite refusal, e.g. a dirty
+            // working tree): the branch
             // still reaches every commit, and stranded state would
             // block the next attempt (codex 1f4800a). But
             // run_rewrite can also fail AFTER moving the branch
@@ -358,15 +447,14 @@ pub async fn run_push(args: StashPushArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_pop_inner(repo_override: Option<&Path>, plan: &str) -> anyhow::Result<()> {
+async fn run_pop_inner(repo_override: Option<&Path>, plan: Option<&str>) -> anyhow::Result<()> {
     let repo = super::resolve_repo(repo_override)?;
-    let stem = plan.to_string();
-    PlanKey::parse(&stem).map_err(|e| anyhow::anyhow!("invalid plan `{stem}`: {e}"))?;
+    let stem = resolve_stashed(&scan_stash(&repo), plan)?;
 
     // Merged lookup: the record may live at the new or the legacy path;
     // its `git_ref` names the protective ref either way.
     let sp = find_record_path(&repo, &stem)
-        .ok_or_else(|| anyhow::anyhow!("`{stem}` is not stashed (see `clank stash`)"))?;
+        .ok_or_else(|| anyhow::anyhow!("`{stem}` is not stashed (see `clank stash list`)"))?;
     let body =
         std::fs::read_to_string(&sp).with_context(|| format!("reading `{}`", sp.display()))?;
     let record: StashRecord =
@@ -380,7 +468,11 @@ async fn run_pop_inner(repo_override: Option<&Path>, plan: &str) -> anyhow::Resu
              current plan. `clank stash drop {stem}` to discard them."
         );
     }
-    if worktree_dirty(&repo)? {
+    // The rewrite engine's policy, not a raw status: clank's own
+    // untracked scratch under `.clank/` — this very stash's record,
+    // in a repo whose `.clank/.gitignore` does not cover it — is not
+    // the operator's work and must not refuse the pop.
+    if crate::cli::rewrite::working_tree_dirty(&repo)? {
         anyhow::bail!("working tree dirty; commit or stash before popping");
     }
 
@@ -413,9 +505,24 @@ async fn run_pop_inner(repo_override: Option<&Path>, plan: &str) -> anyhow::Resu
     Ok(())
 }
 
-async fn run_drop_inner(repo_override: Option<&Path>, plan: &str, yes: bool) -> anyhow::Result<()> {
+/// What `drop` says before it discards — on stderr, not as a question:
+/// the record of what ran, since this is the one verb with no undo.
+fn drop_warning(stem: &str) -> String {
+    format!(
+        "dropping the stashed commits of `{stem}` — the only copy of that work; \
+         `git reflog` will not have them"
+    )
+}
+
+/// `warn` receives the warning BEFORE the ref or record is touched;
+/// injected so a test can hold the order to account.
+pub async fn run_drop_inner(
+    repo_override: Option<&Path>,
+    plan: Option<&str>,
+    warn: &mut dyn FnMut(String),
+) -> anyhow::Result<()> {
     let repo = super::resolve_repo(repo_override)?;
-    let stem = plan.to_string();
+    let stem = resolve_stashed(&scan_stash(&repo), plan)?;
     let sp =
         find_record_path(&repo, &stem).ok_or_else(|| anyhow::anyhow!("`{stem}` is not stashed"))?;
     // The record's OWN git_ref, never a stem-constructed path — a legacy
@@ -424,14 +531,7 @@ async fn run_drop_inner(repo_override: Option<&Path>, plan: &str, yes: bool) -> 
         &std::fs::read_to_string(&sp).with_context(|| format!("reading `{}`", sp.display()))?,
     )
     .with_context(|| format!("parsing `{}`", sp.display()))?;
-    if !yes
-        && !confirm(&format!(
-            "Permanently discard stashed commits for `{stem}`? This is the only \
-             copy of that work."
-        ))?
-    {
-        anyhow::bail!("aborted");
-    }
+    warn(drop_warning(&stem));
     git_delete_ref(&repo, &record.git_ref)?;
     std::fs::remove_file(&sp).with_context(|| format!("removing `{}`", sp.display()))?;
     println!("dropped stashed state for `{stem}`");
@@ -443,9 +543,9 @@ async fn run_drop_inner(repo_override: Option<&Path>, plan: &str, yes: bool) -> 
 /// branch) + its commit list, oldest first (the pop order).
 async fn run_show(args: StashShowArgs) -> anyhow::Result<()> {
     let repo = super::resolve_repo(args.repo.as_deref())?;
-    let stem = args.plan;
+    let stem = resolve_stashed(&scan_stash(&repo), args.plan.as_deref())?;
     let sp = find_record_path(&repo, &stem)
-        .ok_or_else(|| anyhow::anyhow!("`{stem}` is not stashed (see `clank stash`)"))?;
+        .ok_or_else(|| anyhow::anyhow!("`{stem}` is not stashed (see `clank stash list`)"))?;
     let record: StashRecord = serde_json::from_str(
         &std::fs::read_to_string(&sp).with_context(|| format!("reading `{}`", sp.display()))?,
     )
@@ -477,7 +577,7 @@ async fn run_show(args: StashShowArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Bare `clank stash` — the list, one line per item.
+/// `clank stash list` — one line per item.
 async fn run_list(repo_override: Option<&Path>) -> anyhow::Result<()> {
     let repo = super::resolve_repo(repo_override)?;
     let items = scan_stash(&repo);
@@ -526,19 +626,6 @@ fn git_update_ref(repo: &Path, name: &str, sha: &str) -> anyhow::Result<()> {
 
 fn git_delete_ref(repo: &Path, name: &str) -> anyhow::Result<()> {
     crate::git_plumbing::delete_ref(repo, name)
-}
-
-fn worktree_dirty(repo: &Path) -> anyhow::Result<bool> {
-    Ok(!crate::git_io::working_tree_clean(repo)?)
-}
-
-fn confirm(prompt: &str) -> anyhow::Result<bool> {
-    use std::io::Write as _;
-    print!("{prompt} [y/N] ");
-    std::io::stdout().flush()?;
-    let mut line = String::new();
-    std::io::stdin().read_line(&mut line)?;
-    Ok(matches!(line.trim(), "y" | "Y" | "yes"))
 }
 
 /// Foreign-commit refusal. The ONLY tier: a commit the plan's own

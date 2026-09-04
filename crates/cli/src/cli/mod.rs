@@ -1428,10 +1428,6 @@ pub struct FinishArgs {
     /// in-place. Only meaningful with `--purge`/`--squash`.
     #[arg(long, value_name = "NAME")]
     pub into_branch: Option<String>,
-    /// Permit rewriting a protected branch (`main`/`master`) when
-    /// combined with `--purge`/`--squash`.
-    #[arg(long)]
-    pub allow_rewrite_protected: bool,
     /// Preview any history edit this finish would perform, without creating
     /// commits or moving refs: the `--purge`/`--squash` rewrite plan, or the
     /// reword plan for a bare `-m` on an already-finished plan (the same
@@ -1452,18 +1448,31 @@ pub struct FinishArgs {
 }
 
 #[derive(Args, Debug)]
+/// Bare `clank stash [PLAN]` IS a push, as `git stash` is — the
+/// verbs are for the rest (stash-does-what-you-mean).
+///
+/// The push options live on the parent for the bare form only: with
+/// a verb present they are refused by [`crate::cli::stash::run`]
+/// rather than parsed and dropped — `clank stash --dry drop foo` must
+/// not run a drop the operator asked to preview (codex on 70a17f8).
+/// Each verb carries its own `--repo`. A verb's name always means the
+/// verb, even after an option (`subcommand_precedence_over_arg`); a
+/// plan called `list` is stashed with `push list`. clap's own
+/// `args_conflicts_with_subcommands` is NOT the tool: with a parent
+/// positional it stops recognising the verb once an option was seen,
+/// so `--repo /x list` would stash a plan named `list`.
+#[command(subcommand_precedence_over_arg = true)]
 pub struct StashArgs {
     #[command(subcommand)]
     pub command: Option<StashCmd>,
-    /// Repo root. Defaults to the cwd's git toplevel.
-    #[arg(long, value_name = "PATH")]
-    pub repo: Option<PathBuf>,
+    #[command(flatten)]
+    pub push: StashPushArgs,
 }
 
 #[derive(clap::Subcommand, Debug)]
 pub enum StashCmd {
     /// Set a plan's commits aside (kept restorable on a protective ref)
-    /// and clean them off the branch.
+    /// and clean them off the branch — the same as bare `clank stash`.
     Push(StashPushArgs),
     /// Restore a stashed plan: replay its commits onto HEAD and consume
     /// the stash. Reviews reset (the replayed commits are re-reviewed).
@@ -1472,12 +1481,15 @@ pub enum StashCmd {
     Show(StashShowArgs),
     /// Permanently discard a plan's stashed commits + record.
     Drop(StashDropArgs),
+    /// List the stashed plans.
+    List(StashListArgs),
 }
 
 #[derive(Args, Debug)]
 pub struct StashPopArgs {
-    /// Stashed plan stem to restore.
-    pub plan: String,
+    /// Stashed plan stem to restore. Optional when exactly one plan is
+    /// stashed.
+    pub plan: Option<String>,
     /// Repo root. Defaults to the cwd's git toplevel.
     #[arg(long, value_name = "PATH")]
     pub repo: Option<PathBuf>,
@@ -1485,8 +1497,8 @@ pub struct StashPopArgs {
 
 #[derive(Args, Debug)]
 pub struct StashShowArgs {
-    /// Stashed plan stem.
-    pub plan: String,
+    /// Stashed plan stem. Optional when exactly one plan is stashed.
+    pub plan: Option<String>,
     /// Repo root. Defaults to the cwd's git toplevel.
     #[arg(long, value_name = "PATH")]
     pub repo: Option<PathBuf>,
@@ -1494,13 +1506,17 @@ pub struct StashShowArgs {
 
 #[derive(Args, Debug)]
 pub struct StashDropArgs {
-    /// Stashed plan stem.
-    pub plan: String,
+    /// Stashed plan stem. Optional when exactly one plan is stashed.
+    pub plan: Option<String>,
     #[arg(long, value_name = "PATH")]
     pub repo: Option<PathBuf>,
-    /// Skip the interactive confirmation prompt.
-    #[arg(long)]
-    pub yes: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct StashListArgs {
+    /// Repo root. Defaults to the cwd's git toplevel.
+    #[arg(long, value_name = "PATH")]
+    pub repo: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -1525,17 +1541,12 @@ pub struct StashPushArgs {
     /// Print the plan without changing anything.
     #[arg(long)]
     pub dry: bool,
-    /// Skip the interactive confirmation prompt.
-    #[arg(long)]
-    pub yes: bool,
-    /// Permit rewriting a protected branch in place.
-    #[arg(long)]
-    pub allow_rewrite_protected: bool,
 }
 
 /// HIDDEN ALIAS (one release): `clank shelve` → `clank stash push`,
 /// `clank shelve clean` → `clank stash drop`.
 #[derive(Args, Debug)]
+#[command(subcommand_precedence_over_arg = true)]
 pub struct ShelveArgs {
     #[command(subcommand)]
     pub command: Option<ShelveCmd>,
@@ -1558,12 +1569,6 @@ pub struct ShelveArgs {
     /// Print the plan without changing anything.
     #[arg(long)]
     pub dry: bool,
-    /// Skip the interactive confirmation prompt.
-    #[arg(long)]
-    pub yes: bool,
-    /// Permit rewriting a protected branch in place.
-    #[arg(long)]
-    pub allow_rewrite_protected: bool,
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -1574,19 +1579,17 @@ pub enum ShelveCmd {
 
 #[derive(Args, Debug)]
 pub struct ShelveCleanArgs {
-    /// Shelved plan stem.
-    pub plan: String,
+    /// Shelved plan stem. Optional when exactly one plan is stashed.
+    pub plan: Option<String>,
     #[arg(long, value_name = "PATH")]
     pub repo: Option<PathBuf>,
-    /// Skip the interactive confirmation prompt.
-    #[arg(long)]
-    pub yes: bool,
 }
 
 #[derive(Args, Debug)]
 pub struct UnshelveArgs {
-    /// Shelved plan stem to restore.
-    pub plan: String,
+    /// Shelved plan stem to restore. Optional when exactly one plan is
+    /// stashed.
+    pub plan: Option<String>,
     /// Repo root. Defaults to the cwd's git toplevel.
     #[arg(long, value_name = "PATH")]
     pub repo: Option<PathBuf>,
@@ -1735,9 +1738,6 @@ pub struct PurgeArgs {
     /// commits or moving any refs.
     #[arg(long)]
     pub dry: bool,
-    /// Skip the interactive confirmation prompt.
-    #[arg(long)]
-    pub yes: bool,
     /// Collapse the plan-attributed range into a single commit
     /// with the supplied message. Not pipeable to `git rebase` —
     /// see `--dry` output for the planned target tree.
@@ -1749,14 +1749,6 @@ pub struct PurgeArgs {
     /// `.clank/finished/` for `--all`).
     #[arg(long)]
     pub amend: bool,
-    /// Permit rewriting a protected branch (`main`/`master` or any
-    /// branch matched by `branch.<name>.protect` in git config).
-    /// Without this flag, the engine refuses to rewrite a
-    /// protected branch in place. `--into-branch` bypasses the
-    /// protection check because it doesn't touch the protected
-    /// branch.
-    #[arg(long)]
-    pub allow_rewrite_protected: bool,
     /// Skip the on-disk state cache: don't read it, don't write it.
     #[arg(long)]
     pub no_cache: bool,
@@ -1801,6 +1793,147 @@ pub(crate) fn repo_basename(repo: &Path) -> anyhow::Result<String> {
 }
 
 #[cfg(test)]
+mod stash_cli_parse_tests {
+    use super::{StashArgs, StashCmd};
+    use crate::cli::command::{Cli, Command};
+    use clap::Parser;
+
+    /// Through the PRODUCTION tree, `clank stash …`: the settings that
+    /// decide verb-vs-positional live on the `stash` command clap
+    /// builds from `StashArgs`, and a flattened test root is not it.
+    fn parse(argv: &[&str]) -> Result<StashArgs, clap::Error> {
+        Cli::try_parse_from(["clank", "stash"].into_iter().chain(argv.iter().copied())).map(|cli| {
+            match cli.command {
+                Command::Stash(a) => a,
+                _ => unreachable!("parsed under `stash`"),
+            }
+        })
+    }
+
+    /// A parent option before a verb is refused, never parsed and
+    /// dropped: `--dry` before `drop` would otherwise run the drop
+    /// (codex on 70a17f8). clap recognises the verb (it is not swallowed
+    /// as the plan) and `stash::run` refuses the combination before it
+    /// touches anything.
+    #[test]
+    fn parent_options_are_refused_when_a_verb_is_present() {
+        use crate::cli::stash::refuse_parent_options;
+        for argv in [
+            &["--dry", "drop", "foo"][..],
+            &["--repo", "/x", "list"],
+            &["--repo", "/x", "drop", "foo"],
+            &["foo", "list"],
+            &["--to-queue", "pop"],
+        ] {
+            let parsed = parse(argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+            assert!(parsed.command.is_some(), "{argv:?}: the verb is the verb");
+            let err = refuse_parent_options(&parsed)
+                .expect_err(&format!("{argv:?} must be refused"))
+                .to_string();
+            assert!(err.contains("after the verb"), "{argv:?}: {err}");
+        }
+        // Nothing before the verb: fine.
+        refuse_parent_options(&parse(&["list"]).unwrap()).unwrap();
+        refuse_parent_options(&parse(&["drop", "foo", "--repo", "/x"]).unwrap()).unwrap();
+        // And the bare form is never refused for carrying its own options.
+        refuse_parent_options(&parse(&["foo", "--dry", "--repo", "/x"]).unwrap()).unwrap();
+    }
+
+    /// The hidden aliases are the same command in old clothes: parsed
+    /// through the production tree, converted, and refused or inferred
+    /// exactly as `stash` is (codex on c7cf432).
+    #[test]
+    fn the_shelve_and_unshelve_aliases_are_stash_args() {
+        use crate::cli::stash::{refuse_parent_options, shelve_as_stash, unshelve_as_stash};
+        let shelve = |argv: &[&str]| {
+            Cli::try_parse_from(["clank", "shelve"].into_iter().chain(argv.iter().copied())).map(
+                |cli| match cli.command {
+                    Command::Shelve(a) => shelve_as_stash(a),
+                    _ => unreachable!(),
+                },
+            )
+        };
+        // `shelve --dry clean foo`: the verb is the verb, and the stray
+        // option is refused.
+        let a = shelve(&["--dry", "clean", "foo", "--repo", "/x"]).unwrap();
+        assert!(matches!(a.command, Some(StashCmd::Drop(_))));
+        assert!(
+            refuse_parent_options(&a)
+                .unwrap_err()
+                .to_string()
+                .contains("--dry")
+        );
+        // `shelve clean` with no plan infers, like `stash drop`.
+        match shelve(&["clean"]).unwrap().command {
+            Some(StashCmd::Drop(d)) => assert!(d.plan.is_none()),
+            other => panic!("{other:?}"),
+        }
+        // Bare `shelve foo --to-queue` is the bare push.
+        let a = shelve(&["foo", "--to-queue"]).unwrap();
+        assert!(a.command.is_none() && a.push.to_queue && a.push.plan.as_deref() == Some("foo"));
+        refuse_parent_options(&a).unwrap();
+
+        // `unshelve [plan]` is `stash pop [plan]`.
+        let unshelve = |argv: &[&str]| {
+            Cli::try_parse_from(
+                ["clank", "unshelve"]
+                    .into_iter()
+                    .chain(argv.iter().copied()),
+            )
+            .map(|cli| match cli.command {
+                Command::Unshelve(a) => unshelve_as_stash(a),
+                _ => unreachable!(),
+            })
+        };
+        match unshelve(&[]).unwrap().command {
+            Some(StashCmd::Pop(p)) => assert!(p.plan.is_none()),
+            other => panic!("{other:?}"),
+        }
+        match unshelve(&["foo", "--repo", "/x"]).unwrap().command {
+            Some(StashCmd::Pop(p)) => {
+                assert_eq!(p.plan.as_deref(), Some("foo"));
+                assert_eq!(p.repo.as_deref(), Some(std::path::Path::new("/x")));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_bare_form_carries_the_push_options_and_each_verb_its_own_repo() {
+        let bare = parse(&["foo", "--dry", "--repo", "/x"]).unwrap();
+        assert!(bare.command.is_none());
+        assert_eq!(bare.push.plan.as_deref(), Some("foo"));
+        assert!(bare.push.dry);
+        assert_eq!(bare.push.repo.as_deref(), Some(std::path::Path::new("/x")));
+
+        let bare = parse(&[]).unwrap();
+        assert!(bare.command.is_none() && bare.push.plan.is_none());
+        // A verb's name is the verb, wherever it sits.
+        assert!(matches!(
+            parse(&["list"]).unwrap().command,
+            Some(StashCmd::List(_))
+        ));
+
+        match parse(&["list", "--repo", "/x"]).unwrap().command {
+            Some(StashCmd::List(a)) => {
+                assert_eq!(a.repo.as_deref(), Some(std::path::Path::new("/x")))
+            }
+            other => panic!("expected list, got {other:?}"),
+        }
+        match parse(&["drop", "--repo", "/x"]).unwrap().command {
+            Some(StashCmd::Drop(a)) => {
+                assert!(a.plan.is_none(), "drop infers the one stash");
+                assert_eq!(a.repo.as_deref(), Some(std::path::Path::new("/x")));
+            }
+            other => panic!("expected drop, got {other:?}"),
+        }
+        match parse(&["push", "foo", "--dry"]).unwrap().command {
+            Some(StashCmd::Push(a)) => assert!(a.dry && a.plan.as_deref() == Some("foo")),
+            other => panic!("expected push, got {other:?}"),
+        }
+    }
+}
+
 mod agent_team_cli_parse_tests {
     use super::{AgentArgs, ForkCreateArgs, TeamArgs};
     use clap::Parser;

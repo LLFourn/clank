@@ -6,8 +6,6 @@
 //! manifest to the shared rewrite engine (`cli::rewrite`). No
 //! daemon required.
 
-use std::io::Write;
-
 use super::{PurgeArgs, repo_basename, resolve_repo};
 use crate::cli::rewrite::{RewriteOpts, run as run_rewrite};
 use crate::lifecycle::PlanKey;
@@ -98,17 +96,19 @@ async fn run_single(
         preview.commits.clone()
     };
 
-    // Confirmation prompt distinguishes the two modes per Phase 3.
-    if !args.dry && !args.yes {
+    // Said, not asked: the banner is the audit trail of what this
+    // run does, on stderr, and the run does it (stash-does-what-you-
+    // mean: no y/N anywhere in clank).
+    if !args.dry {
         let dropped_count = preview.commits.iter().filter(|c| !c.foreign).count();
-        let ok = if args.drop {
-            confirm_drop(&stem, dropped_count, args.into_branch.as_deref())?
-        } else {
-            confirm_single(&stem, args.into_branch.as_deref())?
-        };
-        if !ok {
-            anyhow::bail!("aborted");
-        }
+        eprintln!(
+            "{}",
+            if args.drop {
+                drop_banner(&stem, dropped_count, args.into_branch.as_deref())
+            } else {
+                single_banner(&stem, args.into_branch.as_deref())
+            }
+        );
     }
 
     let outcome = run_rewrite(RewriteOpts {
@@ -119,7 +119,6 @@ async fn run_single(
         commits: &commits_for_engine,
         into_branch: args.into_branch.as_deref(),
         dry: args.dry,
-        allow_rewrite_protected: args.allow_rewrite_protected,
         squash: args.squash.as_deref(),
         squash_tip: preview.squash_tip.as_ref(),
         head_strip_paths: &preview.head_strip_paths,
@@ -151,14 +150,12 @@ async fn run_all(repo: &std::path::Path, basename: &str, args: &PurgeArgs) -> an
         return Ok(());
     }
 
-    // The all-plans warning is loud — log to stderr even when
-    // `--yes` skips the prompt so script-driven invocations still
-    // produce an audit trail.
-    let warning = format_all_warning(preview.plans_touched.len(), args.into_branch.as_deref());
-    eprintln!("{warning}");
-    if !args.dry && !args.yes && !confirm_with(&warning)? {
-        anyhow::bail!("aborted");
-    }
+    // The all-plans warning is loud — stderr, so script-driven
+    // invocations keep an audit trail of a destructive operation.
+    eprintln!(
+        "{}",
+        format_all_warning(preview.plans_touched.len(), args.into_branch.as_deref())
+    );
 
     let outcome = run_rewrite(RewriteOpts {
         repo,
@@ -168,7 +165,6 @@ async fn run_all(repo: &std::path::Path, basename: &str, args: &PurgeArgs) -> an
         commits: &preview.commits,
         into_branch: args.into_branch.as_deref(),
         dry: args.dry,
-        allow_rewrite_protected: args.allow_rewrite_protected,
         squash: args.squash.as_deref(),
         // All-plans mode has no single squash tip (`--squash --all` is
         // rejected at parse time anyway).
@@ -308,40 +304,16 @@ async fn run_amend(repo: &std::path::Path, basename: &str, args: &PurgeArgs) -> 
     if !crate::git_io::working_tree_clean(repo)? {
         anyhow::bail!("working tree dirty; commit or stash first");
     }
-    if !args.allow_rewrite_protected {
-        // Detached HEAD → no branch name → not protected-by-name
-        // (matches the old empty `symbolic-ref` output).
-        let branch = crate::git_io::current_branch_at(repo)
-            .ok()
-            .flatten()
-            .unwrap_or_default();
-        let protected_by_name = matches!(branch.as_str(), "main" | "master");
-        let protected_by_config =
-            crate::git_io::config_bool(repo, &format!("branch.{branch}.protect"))
-                .ok()
-                .flatten()
-                .unwrap_or(false);
-        if protected_by_name || protected_by_config {
-            anyhow::bail!(
-                "refusing to amend protected branch `{branch}`. \
-                 Pass `--allow-rewrite-protected` to override."
-            );
-        }
-    }
 
     if args.dry {
         print!("{}", render_amend_dry(&program));
         return Ok(());
     }
 
-    if !args.yes
-        && !confirm_with(&format!(
-            "About to amend HEAD: strip {} path(s) from HEAD's tree.",
-            program.strip_paths.len()
-        ))?
-    {
-        anyhow::bail!("aborted");
-    }
+    eprintln!(
+        "About to amend HEAD: strip {} path(s) from HEAD's tree.",
+        program.strip_paths.len()
+    );
 
     execute_amend(repo, &program)?;
     Ok(())
@@ -428,41 +400,30 @@ fn transform_all_to_drop(commits: &[RewriteCommit]) -> Vec<RewriteCommit> {
         .collect()
 }
 
-fn confirm_drop(
-    stem: &str,
-    dropped_count: usize,
-    into_branch: Option<&str>,
-) -> anyhow::Result<bool> {
+fn drop_banner(stem: &str, dropped_count: usize, into_branch: Option<&str>) -> String {
     let target = match into_branch {
         Some(b) => format!("a NEW branch `{b}` (current branch left untouched)"),
         None => "the CURRENT branch (history will be rewritten in place)".into(),
     };
-    let prompt = format!(
-        "About to DROP all {dropped_count} commit(s) attributed to `{stem}` and write \
+    format!(
+        "Dropping all {dropped_count} commit(s) attributed to `{stem}` and writing \
          rewritten history to {target}. \
          This deletes the implementation code, not just `.clank/` artifacts. \
-         There is NO archived copy of the plan body anywhere — for that, use `clank stash push --to-queue`. \
-         Continue? [y/N] "
-    );
-    confirm_with(&prompt)
+         There is NO archived copy of the plan body anywhere — for that, use `clank stash --to-queue`."
+    )
 }
 
-fn confirm_single(stem: &str, into_branch: Option<&str>) -> anyhow::Result<bool> {
+fn single_banner(stem: &str, into_branch: Option<&str>) -> String {
     let target = match into_branch {
         Some(b) => format!("a NEW branch `{b}` (current branch left untouched)"),
         None => "the CURRENT branch (history will be rewritten in place)".into(),
     };
-    let prompt = format!(
-        "About to purge `{stem}` and write rewritten history to {target}. \
-         Continue? [y/N] "
-    );
-    confirm_with(&prompt)
+    format!("Purging `{stem}` and writing rewritten history to {target}.")
 }
 
-/// Render the all-plans confirmation banner. Logged on stderr
-/// before the engine runs even when `--yes` skips the interactive
-/// prompt — script-driven invocations should still see an audit
-/// trail showing this was a destructive operation.
+/// The all-plans banner, on stderr before the engine runs, so a
+/// script-driven invocation keeps an audit trail of a destructive
+/// operation.
 fn format_all_warning(plan_count: usize, into_branch: Option<&str>) -> String {
     let target = match into_branch {
         Some(b) => format!("a NEW branch `{b}` (current branch left untouched)"),
@@ -474,17 +435,6 @@ fn format_all_warning(plan_count: usize, into_branch: Option<&str>) -> String {
          ({plan_count} {noun} touched in the range) and write \
          rewritten history to {target}."
     )
-}
-
-fn confirm_with(banner: &str) -> anyhow::Result<bool> {
-    print!(
-        "{banner}\n\
-         Continue? [y/N] "
-    );
-    std::io::stdout().flush()?;
-    let mut buf = String::new();
-    std::io::stdin().read_line(&mut buf)?;
-    Ok(matches!(buf.trim().to_lowercase().as_str(), "y" | "yes"))
 }
 
 #[cfg(test)]
@@ -499,10 +449,8 @@ mod tests {
             repo: Some(std::env::current_dir().unwrap()),
             into_branch: None,
             dry: false,
-            yes: true,
             squash: None,
             amend: false,
-            allow_rewrite_protected: false,
             no_cache: false,
             drop: false,
         };
@@ -521,10 +469,8 @@ mod tests {
             repo: Some(std::env::current_dir().unwrap()),
             into_branch: None,
             dry: false,
-            yes: true,
             squash: None,
             amend: false,
-            allow_rewrite_protected: false,
             no_cache: false,
             drop: true,
         }

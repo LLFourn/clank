@@ -244,7 +244,7 @@ async fn resolve_open_target_path(
             .into_iter()
             .any(|(stem, _)| stem == name);
         if !known {
-            anyhow::bail!("`{name}` is not stashed (see `clank stash`)");
+            anyhow::bail!("`{name}` is not stashed (see `clank stash list`)");
         }
         return Ok(out_dir.join(format!("stash/{name}.html")));
     }
