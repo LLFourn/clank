@@ -259,7 +259,7 @@ fn start(args: AgentStartArgs) -> anyhow::Result<()> {
     // Codex shows an interactive "do you trust this directory?" prompt
     // for any repo root not recorded in `~/.codex/config.toml` — and
     // every codex launch in the codebase flows through THIS exec
-    // (zellij panes and console screens both run `clank agent start`),
+    // (every zellij pane runs `clank agent start`),
     // so ensuring trust here ensures it everywhere
     // (codex-trust-at-launch). Best-effort: a failure degrades to the
     // prompt, never a failed launch. Sits AFTER the `--print` return —

@@ -15,7 +15,6 @@ pub mod attending;
 pub mod auto;
 pub mod block;
 pub mod config;
-pub mod console;
 pub mod diff;
 pub mod doctor;
 pub mod events;
@@ -363,12 +362,10 @@ pub struct HtmlOpenArgs {
 pub struct OpenArgs {
     #[command(subcommand)]
     pub command: Option<OpenCmd>,
-    /// Bare `clank open`: launches the self-managed console in a
-    /// fresh terminal, or the zellij opener when `$ZELLIJ` is set or
-    /// a zellij-specific flag (--all/--fork/--pr/--print) is given.
-    /// The SAME OpenZellijArgs is flattened here so the bare form's
-    /// flags can't drift from the `zellij` subcommand's (ruthless
-    /// 8c2206d). Plan: clank-open-zellij-context, clank-console.
+    /// Bare `clank open` IS the zellij opener: a tab inside a live
+    /// session, attach-or-create outside one. The SAME OpenZellijArgs
+    /// is flattened here so the bare form's flags can't drift from the
+    /// `zellij` subcommand's (ruthless 8c2206d).
     #[command(flatten)]
     pub zellij: OpenZellijArgs,
 }

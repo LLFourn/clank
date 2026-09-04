@@ -105,10 +105,11 @@ clank agent add bob --tool codex --review commit
 clank open
 ```
 
-This is the step that makes the agents exist. In a plain terminal it
-opens clank's own console; inside zellij it builds a tab with the
-master on the stage and the reviewers stacked beside it. Each pane is
-a real agent CLI, started in this repo.
+This is the step that makes the agents exist. It needs
+[zellij](https://zellij.dev): outside a session it starts one for the
+repo; inside one it adds a tab. Either way the master sits on the
+stage with the reviewers stacked beside it, and each pane is a real
+agent CLI started in this repo.
 
 (`clank agent start <label>` launches ONE agent — resuming its session
 if it has one, or bootstrapping it with a seed prompt to bind if it
@@ -192,7 +193,7 @@ Run `clank <cmd> --help` for details; the skills carry the depth.
 | `team` | Global team templates: `save` / `list` / `show` / `delete` |
 | `fork` | Linked worktree with the whole team's sessions forked into it |
 | `pr-review` | Multi-agent review loop against a GitHub PR |
-| `open` | Agent workspace: self-managed console, or a zellij tab/layout |
+| `open` | The team workspace in zellij: a tab inside a session, attach-or-create outside one |
 | `log` | Chronological commit + review timeline (`--oneline`, `-j`) |
 | `html` | Render the event log + status to a static site; `html open` |
 | `diff` | Launch the configured editor on a plan / range diff |

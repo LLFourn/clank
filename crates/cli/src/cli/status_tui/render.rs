@@ -215,7 +215,7 @@ pub(super) fn render_at(
     }
 
     let mut out: Vec<String> = Vec::with_capacity(rows);
-    out.push(bar(snap, color, cols));
+    out.push(bar(snap, color, cols, view.reach));
 
     // The SCROLLABLE header (everything between the pinned bar and the
     // log region), built in FULL by [`scrollable_header`] so the loop
@@ -905,18 +905,74 @@ pub(super) fn block_ask_spans(snap: &StatusSnapshot, cols: usize) -> Vec<AskLine
 /// right, gap-filled, bold + reverse-video in the state color,
 /// padded to exactly `cols` display columns. The right segment is
 /// dropped when the pane is too narrow for both.
-pub(super) fn bar(snap: &StatusSnapshot, color: &str, cols: usize) -> String {
+pub(super) fn bar(
+    snap: &StatusSnapshot,
+    color: &str,
+    cols: usize,
+    reach: crate::cli::status_tui::zellij::ZellijReach,
+) -> String {
     let (left, right) = bar_text(snap);
-    let left = truncate_to(&left, cols);
+    // The connection glyph owns the LAST cells of the bar — its own
+    // display width plus one column of margin — so the lamp text never
+    // overwrites it and it never displaces the lamp: reachability is
+    // always in the same place, which is what makes it readable at a
+    // glance. Measured, not assumed: `⚡` is two cells wide, and a
+    // fixed two-column reservation rendered that state one column
+    // over (codex on d855068).
+    let (glyph, hue) = reach_glyph(reach);
+    let gw = display_width(glyph);
+    let reserve = gw + 1;
+    // A pane too narrow to hold the lamp AND the indicator keeps the
+    // lamp: the indicator is secondary, and a bar that overflows its
+    // pane is worse than one missing a glyph.
+    if cols < reserve + 1 {
+        let left = truncate_to(&left, cols);
+        let pad = cols.saturating_sub(display_width(&left));
+        return format!("\x1b[1;7;{color}m{left}{}\x1b[0m", " ".repeat(pad));
+    }
+    let inner = cols - reserve;
+    let left = truncate_to(&left, inner);
     let lw = display_width(&left);
     let rw = display_width(&right);
     // Keep the right segment only when it fits with ≥2 cols of gap.
-    let body = if !right.is_empty() && lw + 2 + rw <= cols {
-        format!("{left}{}{right}", " ".repeat(cols - lw - rw))
+    let body = if !right.is_empty() && lw + 2 + rw <= inner {
+        format!("{left}{}{right}", " ".repeat(inner - lw - rw))
     } else {
-        format!("{left}{}", " ".repeat(cols - lw))
+        format!("{left}{}", " ".repeat(inner - lw))
     };
-    format!("\x1b[1;7;{color}m{body}\x1b[0m")
+    // The glyph carries its OWN hue inside the reverse-video band: a
+    // state colour painted over the band's colour would vanish.
+    format!(
+        "\x1b[1;7;{color}m{body} \x1b[0m\x1b[1;7;{}m{glyph}\x1b[0m",
+        hue.sgr()
+    )
+}
+
+/// The zellij connection indicator: one glyph and the hue it reads in.
+///
+/// Three states because they call for different things from the
+/// operator — outside a session `clank open` STARTS one; inside a
+/// session that does not answer, zellij itself is the problem, and
+/// that case otherwise reads as "clank did nothing".
+pub(super) fn reach_glyph(
+    reach: crate::cli::status_tui::zellij::ZellijReach,
+) -> (&'static str, crate::cli::status_tui::derive::Hue) {
+    use crate::cli::status_tui::derive::Hue;
+    use crate::cli::status_tui::zellij::ZellijReach::*;
+    // No circles: `○`/`◉` were the rejected focus vocabulary, and the
+    // frame is guarded against them reappearing anywhere
+    // (`focus_is_shown_by_the_item_band_not_a_section_highlight`). A
+    // reachability glyph that reads as a selection marker would be
+    // worse than none.
+    match reach {
+        Connected => ("⚡", Hue::Green),
+        NotInSession => ("–", Hue::Indexed(63)),
+        // Space is reserved, the cell is drawn, and nothing is claimed:
+        // an empty indicator says "not yet known", where any glyph
+        // would say something the process has no evidence for.
+        Unknown => ("·", Hue::Indexed(63)),
+        Unreachable => ("✗", Hue::Red),
+    }
 }
 
 /// Bar text: (left = who + verb, right = where). Every state
@@ -2938,6 +2994,7 @@ mod tests {
                             plan_input: None,
                             picker: &[],
                             log_cursor: 0,
+                            reach: crate::cli::status_tui::zellij::ZellijReach::NotInSession,
                             lift,
                         };
                         let header_len = scrollable_header(s, rows, 60, 0, &view).len();
@@ -2975,6 +3032,7 @@ mod tests {
             mode: Mode::LogScroll,
             picker: &[],
             log_cursor: cursor,
+            reach: crate::cli::status_tui::zellij::ZellijReach::NotInSession,
             lift,
         }
     }
@@ -3187,6 +3245,7 @@ mod tests {
             picker: &[],
             log_cursor: 6,
             lift: 0,
+            reach: crate::cli::status_tui::zellij::ZellijReach::NotInSession,
         };
         let rule_of = |offset: usize| {
             let out = render_at(&s, 12, 60, offset, 0, &view).0;
@@ -3472,6 +3531,114 @@ mod tests {
         );
     }
 
+    /// The bar text WITHOUT its reachability cell. The indicator owns
+    /// the last two columns of every bar, so lamp-layout assertions
+    /// look at everything before it.
+    fn bar_body(line: &str) -> String {
+        let v = visible(line);
+        let (glyph, _) = reach_glyph(crate::cli::status_tui::zellij::ZellijReach::NotInSession);
+        v.strip_suffix(glyph)
+            .unwrap_or_else(|| panic!("bar ends with the reach glyph; got `{v}`"))
+            .trim_end()
+            .to_string()
+    }
+
+    /// All three reachability states render, each in its own hue, and
+    /// the indicator is where the operator will look for it: the
+    /// bar's last cell, regardless of state.
+    #[test]
+    fn the_bar_shows_every_reach_state_in_its_own_hue() {
+        use crate::cli::status_tui::derive::Hue;
+        use crate::cli::status_tui::zellij::ZellijReach::*;
+        let s = snap(vec![], vec![]);
+        for (reach, want_hue) in [
+            (Connected, Hue::Green),
+            (NotInSession, Hue::Indexed(63)),
+            (Unknown, Hue::Indexed(63)),
+            (Unreachable, Hue::Red),
+        ] {
+            let (glyph, hue) = reach_glyph(reach);
+            assert_eq!(hue, want_hue, "{reach:?} is coloured by its state");
+            let line = bar(&s, &state_color(&s).sgr(), 40, reach);
+            let v = visible(&line);
+            assert!(
+                v.ends_with(glyph),
+                "{reach:?}: the glyph is the bar's last cell; got `{v}`"
+            );
+            // The glyph carries its OWN colour: the bar is reverse-video
+            // in the state colour, and a glyph painted in that same
+            // colour would vanish into the band.
+            assert!(
+                line.contains(&format!("\x1b[1;7;{}m{glyph}", hue.sgr())),
+                "{reach:?}: glyph opens its own SGR in its own hue: {line:?}"
+            );
+        }
+    }
+
+    /// The bar is EXACTLY `cols` wide in every state. The connected
+    /// glyph is two cells, so a reservation that counted it as one
+    /// rendered `cols + 1` — invisible to suffix and colour checks.
+    #[test]
+    fn the_bar_is_exactly_cols_wide_in_every_reach_state() {
+        use crate::cli::status_tui::zellij::ZellijReach::*;
+        let s = snap(vec![plan_state("foo", reviewer_missing("codex"))], vec![]);
+        for reach in [Connected, NotInSession, Unknown, Unreachable] {
+            for cols in [4, 8, 12, 20, 40, 80] {
+                let v = visible(&bar(&s, &state_color(&s).sgr(), cols, reach));
+                assert_eq!(
+                    display_width(&v),
+                    cols,
+                    "{reach:?} at {cols} cols renders `{v}`"
+                );
+            }
+        }
+    }
+
+    /// Too narrow for both: the lamp survives, the indicator yields.
+    #[test]
+    fn a_bar_too_narrow_for_the_indicator_keeps_the_lamp() {
+        use crate::cli::status_tui::zellij::ZellijReach::Connected;
+        let s = snap(vec![], vec![]);
+        let v = visible(&bar(&s, &state_color(&s).sgr(), 3, Connected));
+        assert_eq!(display_width(&v), 3);
+        assert!(!v.contains('⚡'), "no room: the glyph yields, got `{v}`");
+        assert!(v.starts_with("💤"), "the lamp is what remains: `{v}`");
+    }
+
+    /// The pre-observation frame must not LOOK connected. The
+    /// connected glyph is the one claim that needs evidence.
+    #[test]
+    fn unknown_never_renders_the_connected_glyph() {
+        use crate::cli::status_tui::zellij::ZellijReach::{Connected, Unknown};
+        let s = snap(vec![], vec![]);
+        let (connected, _) = reach_glyph(Connected);
+        let v = visible(&bar(&s, &state_color(&s).sgr(), 40, Unknown));
+        assert!(
+            !v.contains(connected),
+            "no evidence yet, so no `{connected}`; got `{v}`"
+        );
+    }
+
+    /// The three states are three different glyphs. A single glyph
+    /// coloured three ways is invisible on a monochrome terminal, and
+    /// "not in a session" and "in a session that does not answer" call
+    /// for different actions.
+    #[test]
+    fn reach_states_are_distinguishable_without_colour() {
+        use crate::cli::status_tui::zellij::ZellijReach::*;
+        let glyphs: std::collections::HashSet<&str> =
+            [Connected, NotInSession, Unknown, Unreachable]
+                .into_iter()
+                .map(|r| reach_glyph(r).0)
+                .collect();
+        assert_eq!(glyphs.len(), 4, "each state has its own glyph");
+        // The rejected focus vocabulary must not come back as a
+        // reachability marker (`focus_is_shown_by_the_item_band…`).
+        for g in &glyphs {
+            assert!(!matches!(*g, "○" | "◉" | "▌"), "not a circle or rail: {g}");
+        }
+    }
+
     #[test]
     fn one_row_always_renders_active_agent_bar() {
         // THE invariant: even at 1 row the who's-active bar renders
@@ -3480,7 +3647,7 @@ mod tests {
         let s = snap(vec![plan_state("foo", reviewer_missing("codex"))], vec![]);
         let lines = render(&s, 1, 40);
         assert_eq!(lines.len(), 1);
-        let v = visible(&lines[0]);
+        let v = bar_body(&lines[0]);
         assert!(v.starts_with("👀 CODEX reviewing"), "got `{v}`");
         assert!(v.ends_with("foo"), "plan stem right-aligned; got `{v}`");
     }
@@ -3494,7 +3661,7 @@ mod tests {
             )],
             vec![],
         );
-        let v = visible(&render(&s, 1, 20)[0]);
+        let v = bar_body(&render(&s, 1, 20)[0]);
         assert_eq!(v, "👀 CODEX reviewing", "left segment only; got `{v}`");
     }
 
@@ -3502,7 +3669,7 @@ mod tests {
     fn idle_renders_idle_even_at_one_row() {
         // Truly idle: no plans AND empty queue.
         let s = snap(vec![], vec![]);
-        assert_eq!(visible(&render(&s, 1, 80)[0]), "💤 idle");
+        assert_eq!(bar_body(&render(&s, 1, 80)[0]), "💤 idle");
     }
 
     #[test]
@@ -3511,7 +3678,7 @@ mod tests {
         // MASTER's turn — promote. Names the agent; queue head on
         // the right with the remainder count.
         let s = snap(vec![], vec!["zellij-layout", "wait-hint"]);
-        let v = visible(&render(&s, 1, 60)[0]);
+        let v = bar_body(&render(&s, 1, 60)[0]);
         assert!(v.starts_with("📋 CLAUDE promote"), "got `{v}`");
         assert!(v.ends_with("zellij-layout +1"), "got `{v}`");
     }
@@ -3765,7 +3932,7 @@ mod tests {
             finalized_at: CommitSha::parse(&format!("{:0<40}", "bb")).unwrap(),
         });
         let texts: Vec<String> = render(&s, 6, 60).iter().map(|l| visible(l)).collect();
-        assert_eq!(texts[0], "💤 idle");
+        assert_eq!(bar_body(&render(&s, 6, 60)[0]), "💤 idle");
         assert!(
             texts.iter().any(|t| t.starts_with(" done  old-plan @ ")),
             "got {texts:?}"
@@ -3899,6 +4066,7 @@ mod tests {
                 picker: &picker,
                 log_cursor: 0,
                 lift: 0,
+                reach: crate::cli::status_tui::zellij::ZellijReach::NotInSession,
             },
         )
         .0;
@@ -3946,6 +4114,7 @@ mod tests {
             picker: &picker,
             log_cursor: 0,
             lift: 0,
+            reach: crate::cli::status_tui::zellij::ZellijReach::NotInSession,
         };
 
         // Tiny pane: never more lines than rows, and no element spans
@@ -4048,6 +4217,7 @@ mod tests {
                 picker: &picker,
                 log_cursor: 0,
                 lift: 0,
+                reach: crate::cli::status_tui::zellij::ZellijReach::NotInSession,
             },
         )
         .0
@@ -4401,6 +4571,7 @@ mod tests {
             picker: &[],
             log_cursor: 1,
             lift: 0,
+            reach: crate::cli::status_tui::zellij::ZellijReach::NotInSession,
         };
         let lines = render_at(&s, 40, 80, 0, 0, &view).0;
         assert!(

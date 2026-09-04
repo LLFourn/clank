@@ -1102,6 +1102,8 @@ pub(super) struct PanelView<'a> {
     /// focused log its minimum viewport in a short pane. 0 = today's
     /// rendering, byte for byte.
     pub(super) lift: usize,
+    /// Whether zellij answers, as the reconcile worker last saw it.
+    pub(super) reach: crate::cli::status_tui::zellij::ZellijReach,
 }
 
 impl<'a> PanelView<'a> {
@@ -1118,6 +1120,7 @@ impl<'a> PanelView<'a> {
             picker: &[],
             log_cursor: 0,
             lift: 0,
+            reach: crate::cli::status_tui::zellij::ZellijReach::NotInSession,
         }
     }
 }

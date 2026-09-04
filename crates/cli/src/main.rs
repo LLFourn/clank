@@ -103,11 +103,11 @@ enum Command {
     /// `auto on|off|status`, with an optional role designation; the
     /// Stop hook reads it to drive the work loop.
     Auto(cli::AutoArgs),
-    /// Open the team workspace
+    /// Open the team workspace in zellij
     ///
-    /// Context-aware: the self-managed console in a fresh terminal,
-    /// or a tab when already inside zellij. `open zellij` forces the
-    /// zellij layout; `open dry <path>` classifies without opening.
+    /// Inside a live session, a new tab; outside one, attach to (or
+    /// create) the repo's session. `open dry <path>` classifies
+    /// without opening.
     Open(cli::OpenArgs),
     /// Fork the team into a linked worktree
     ///

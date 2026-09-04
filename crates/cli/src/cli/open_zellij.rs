@@ -11,9 +11,23 @@ use anyhow::Context;
 use super::OpenZellijArgs;
 use super::{repo_basename, resolve_repo};
 
+/// Whether this process runs inside a live zellij session.
+///
+/// The ONLY reader of `$ZELLIJ`. Everything else asks this, so "am I
+/// in zellij" has one definition and the ownership gate can forbid
+/// the raw read everywhere else (zellij-is-the-workspace).
+pub(crate) fn in_session() -> bool {
+    std::env::var_os("ZELLIJ").is_some()
+}
+
 pub async fn run(args: OpenZellijArgs) -> anyhow::Result<()> {
+    // `--print` composes and prints; it never needs the binary, and a
+    // test that inspects the argv must not require zellij installed.
+    if !args.print {
+        require_zellij()?;
+    }
     let source = resolve_repo(args.repo.as_deref())?;
-    let in_zellij = std::env::var_os("ZELLIJ").is_some();
+    let in_zellij = in_session();
 
     // --all = the pwd repo AND all its worktrees (`git worktree list`),
     // regardless of which session/worktree we're in.
@@ -363,7 +377,7 @@ fn open_one(repo: &Path, print: bool) -> anyhow::Result<()> {
     // Inside zellij: new tab in the current session (no dedup —
     // see in_session_tab_argv). Outside: attach-or-create against
     // the deterministic session name.
-    let (pre_argv, spawn_argv) = if std::env::var_os("ZELLIJ").is_some() {
+    let (pre_argv, spawn_argv) = if in_session() {
         (None, in_session_tab_argv(&layout_path))
     } else {
         let listing = zellij_list_sessions();
@@ -391,7 +405,7 @@ fn open_one(repo: &Path, print: bool) -> anyhow::Result<()> {
     // glyph-stripped against the live tab list. The `?` only runs when
     // `$ZELLIJ` is set (short-circuit), so a failure to query is a
     // real in-session misconfiguration and surfaces as an error.
-    if std::env::var_os("ZELLIJ").is_some() && tab_is_open(&basename, &zellij_tab_names()?) {
+    if in_session() && tab_is_open(&basename, &zellij_tab_names()?) {
         eprintln!("tab `{basename}` already open");
         return Ok(());
     }
@@ -556,7 +570,7 @@ fn compose_kdl(
 /// when no client is identifiable. Never worse than the pane
 /// measurement (zellij-in-session-orientation).
 fn layout_term_size() -> (u16, u16) {
-    if std::env::var_os("ZELLIJ").is_some()
+    if in_session()
         && let Some(size) = zellij_client_window_size()
     {
         return size;
@@ -986,7 +1000,9 @@ fn agent_pane_label<'a>(pane: &'a ZellijPane, repo_path: &str) -> Option<&'a str
 /// so the worker takes it ONCE and threads it through the primitives).
 /// `None` outside zellij or on failure.
 pub(crate) fn snapshot_panes() -> Option<Vec<ZellijPane>> {
-    std::env::var_os("ZELLIJ")?;
+    if !in_session() {
+        return None;
+    }
     list_agent_panes()
 }
 
@@ -1369,6 +1385,88 @@ fn new_pane_argv(label: &str, repo: &str, stacked: bool) -> Vec<String> {
     ]);
     argv.extend(agent_start_argv(label, repo));
     argv
+}
+
+// ── Subprocess helpers the status TUI's reconciler calls ──────────
+//
+// These lived beside the reconciler, which made the TUI file a second
+// spawner. Every `zellij` process now starts from THIS file, so the
+// ownership gate can name one owner (zellij-is-the-workspace).
+
+/// The current tab's `(stable id, name)`, or `None` outside zellij or
+/// if the query fails. Raw `current-tab-info` text is parsed by the
+/// caller, which keeps the parser pure and testable without a spawn.
+pub(crate) fn current_tab_info() -> Option<String> {
+    if !in_session() {
+        return None;
+    }
+    let out = std::process::Command::new("zellij")
+        .args(["action", "current-tab-info"])
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+pub(crate) fn rename_tab(id: &str, name: &str) {
+    // `.output()` (NOT `.status()`): capture + discard the child's
+    // stdout/stderr so a rename error never bleeds onto the alt-screen
+    // the TUI owns. The loop is event-driven, so an inherited error
+    // line would PERSIST until the next watcher event, not flicker
+    // (ruthless 9c38523).
+    let _ = std::process::Command::new("zellij")
+        .args(["action", "rename-tab-by-id", id, name])
+        .output();
+}
+
+/// Raw `list-panes` text (`PANE_ID  TYPE  TITLE`, one per line) — the
+/// cheap listing the retitler parses. Distinct from
+/// [`list_agent_panes`], which is the `--json` form the reconciler
+/// needs geometry from.
+pub(crate) fn list_panes_text() -> Option<String> {
+    let out = std::process::Command::new("zellij")
+        .args(["action", "list-panes"])
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+pub(crate) fn rename_pane(id: &str, name: &str) {
+    // `.output()` (NOT `.status()`): isolate the child's stdout/stderr
+    // from the alt-screen — a stale pane id (closed between list-panes
+    // and the rename) or any zellij hiccup must not bleed an error line
+    // onto the TUI, which the event-driven loop would leave until the
+    // next watcher event (ruthless 9c38523).
+    let _ = std::process::Command::new("zellij")
+        .args(["action", "rename-pane", "--pane-id", id, name])
+        .output();
+}
+
+/// zellij is the workspace, so `clank open` without it is a setup
+/// problem, not a runtime one. Say so ONCE, before composing anything:
+/// the failure otherwise surfaced as a raw OS error from the spawn
+/// (`spawning zellij: No such file or directory`) after a silent
+/// empty `list-sessions`, which told the user nothing about what to
+/// install (zellij-is-the-workspace).
+fn require_zellij() -> anyhow::Result<()> {
+    require_zellij_given(placement_capability())
+}
+
+/// The decision, split from the probe so it is testable without
+/// uninstalling zellij: a missing binary is the ONE capability state
+/// that stops `open`. An old client is not — it still opens, it just
+/// cannot stack panes, and `doctor` reports that separately.
+fn require_zellij_given(cap: PlacementCapability) -> anyhow::Result<()> {
+    match cap {
+        PlacementCapability::NoZellij => anyhow::bail!(
+            "zellij is not installed (or not on PATH). `clank open` runs the team in a \
+             zellij session — install it from https://zellij.dev and re-run."
+        ),
+        PlacementCapability::ClientTooOld | PlacementCapability::ClientSupports => Ok(()),
+    }
 }
 
 /// What the INSTALLED zellij client can do about pane placement.
@@ -3199,6 +3297,30 @@ ttys004   zellij attach clank-foo
         // `new-pane` its parser rejects.
         assert_eq!(without[0], "new-pane");
         assert_eq!(without[1], "--name");
+    }
+
+    /// No zellij → one message that says what to install, and an
+    /// error (non-zero exit), not a raw OS error from a later spawn.
+    #[test]
+    fn open_without_zellij_says_to_install_it() {
+        let err = require_zellij_given(PlacementCapability::NoZellij).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("not installed"), "names the problem: {msg}");
+        assert!(msg.contains("zellij.dev"), "says where to get it: {msg}");
+        assert!(
+            msg.contains("clank open"),
+            "names the command that needs it: {msg}"
+        );
+    }
+
+    /// An OLD client is not a missing one. `open` still works — it
+    /// just cannot stack panes, which `doctor` reports on its own.
+    /// Refusing to open on an old client would turn a cosmetic gap
+    /// into a hard stop.
+    #[test]
+    fn open_proceeds_on_an_old_client() {
+        assert!(require_zellij_given(PlacementCapability::ClientTooOld).is_ok());
+        assert!(require_zellij_given(PlacementCapability::ClientSupports).is_ok());
     }
 
     #[test]

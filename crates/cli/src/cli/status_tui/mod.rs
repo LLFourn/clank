@@ -60,7 +60,7 @@ pub(crate) mod fixtures;
 
 // ── terminal plumbing ───────────────────────────────────────
 // The raw-mode alt-screen lifecycle, the size probe, and the frame
-// painter live in `super::term` (shared with the console).
+// painter live in `super::term`.
 
 /// What wakes the `--tui` loop.
 enum Ev {
@@ -1484,7 +1484,7 @@ pub(crate) async fn run_tui(
     // Declared BEFORE the alt-screen guard: reverse drop order joins
     // the worker AFTER the terminal is restored, on every exit path
     // (tui-reconcile-off-loop).
-    let reconcile_worker = zellij::ReconcileWorker::spawn(repo.clone());
+    let mut reconcile_worker = zellij::ReconcileWorker::spawn(repo.clone());
 
     let _guard = AltScreen::enter();
 
@@ -1729,6 +1729,9 @@ pub(crate) async fn run_tui(
             picker: &picker,
             log_cursor: log.cursor,
             lift: 0,
+            // A non-blocking drain: the worker reports after each
+            // batch, the loop never waits on zellij to paint.
+            reach: reconcile_worker.reach(),
         };
         // The ask lines depend on blocks (not the log fetch), so compute
         // them before filling. `head` is the count of scrollable rows that

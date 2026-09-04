@@ -300,7 +300,7 @@ async fn run_create(args: super::ForkCreateArgs) -> anyhow::Result<()> {
     // SOLE stdout line: the worktree path (composition contract).
     println!("{}", dest.display());
 
-    let inside_zellij = std::env::var_os("ZELLIJ").is_some();
+    let inside_zellij = super::open_zellij::in_session();
     if should_open(inside_zellij, args.no_open) {
         super::open_zellij::run(super::OpenZellijArgs {
             repo: Some(dest),

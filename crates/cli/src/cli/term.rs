@@ -1,12 +1,9 @@
-//! Shared raw-terminal plumbing for the full-screen TUIs (`clank
-//! status --tui` and the `clank open` console).
+//! Raw-terminal plumbing for `clank status --tui`.
 //!
 //! Hand-rolled on `libc` (no crossterm/termion): the alt-screen +
 //! raw-mode lifecycle, the `TIOCGWINSZ` size probe, and the
-//! flicker-free frame painter. Factored out of `status_tui` so the
-//! console reuses the *same* async-signal-safe restore path rather
-//! than forking a second copy of it (a forked teardown is two places
-//! to get the SIGINT/panic restore right).
+//! flicker-free frame painter, with ONE async-signal-safe restore
+//! path shared by Drop, the panic hook and the signal handler.
 //!
 //! Untested by design — every byte here touches a real terminal.
 
@@ -57,12 +54,10 @@ pub(crate) fn winsize_of_tty(dev: &str) -> Option<(u16, u16)> {
 }
 
 const ENTER_SEQ: &str = "\x1b[?1049h\x1b[?25l"; // alt-screen + hide cursor
-// SGR mouse reporting (button + drag) for the console's own selection.
-const MOUSE_ON: &str = "\x1b[?1002h\x1b[?1006h";
-// Restore: leave mouse modes (harmless if never enabled), show cursor,
-// leave alt-screen. Mouse-disable is FIRST and lives here — the single
-// signal-safe restore path (Drop + panic hook + signal handler) — so a
-// crash never leaves the terminal spewing mouse escapes.
+// Restore: leave mouse modes, show cursor, leave alt-screen. Nothing
+// here enables the mouse any more, but the disable STAYS: this is the
+// single signal-safe restore path, and it must be safe to fire from a
+// handler regardless of what state the terminal was found in.
 const RESTORE_SEQ: &str = "\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?25h\x1b[?1049l";
 
 /// RAII alt-screen guard. `Drop` restores on every normal exit
@@ -80,31 +75,10 @@ pub(crate) struct AltScreen {
 /// `static mut` (banned refs in edition 2024) or allocating.
 static TERMIOS_PTR: AtomicPtr<libc::termios> = AtomicPtr::new(std::ptr::null_mut());
 
-/// How aggressively to put the terminal into raw mode.
-enum RawLevel {
-    /// ICANON+ECHO off, signals (Ctrl-C) still act locally.
-    CookedSignals,
-    /// Everything off (cfmakeraw) — bytes pass straight through.
-    Full,
-}
-
 impl AltScreen {
-    /// Status-view raw mode: ICANON+ECHO off so keystrokes are read
-    /// (not echoed), but ISIG kept so Ctrl-C still exits the
-    /// read-only view. For `status --tui`.
+    /// ICANON+ECHO off so keystrokes are read (not echoed), but ISIG
+    /// kept so Ctrl-C still exits the view.
     pub(crate) fn enter() -> Self {
-        Self::enter_with(RawLevel::CookedSignals)
-    }
-
-    /// Full raw mode (cfmakeraw): ISIG/IXON/ICRNL/OPOST off too, so
-    /// EVERY byte — including Ctrl-C — is forwarded verbatim to the
-    /// active child instead of acting on the console itself. For the
-    /// console, which is a transparent multiplexer.
-    pub(crate) fn enter_raw() -> Self {
-        Self::enter_with(RawLevel::Full)
-    }
-
-    fn enter_with(level: RawLevel) -> Self {
         // VMIN=1 so a stdin read blocks until ≥1 byte (the kernel
         // notification the reader thread waits on — no polling).
         let mut orig: libc::termios = unsafe { std::mem::zeroed() };
@@ -112,22 +86,13 @@ impl AltScreen {
             libc::tcgetattr(libc::STDIN_FILENO, &mut orig);
             TERMIOS_PTR.store(Box::into_raw(Box::new(orig)), Ordering::Relaxed);
             let mut raw = orig;
-            match level {
-                RawLevel::CookedSignals => raw.c_lflag &= !(libc::ICANON | libc::ECHO),
-                RawLevel::Full => libc::cfmakeraw(&mut raw),
-            }
+            raw.c_lflag &= !(libc::ICANON | libc::ECHO);
             raw.c_cc[libc::VMIN] = 1;
             raw.c_cc[libc::VTIME] = 0;
             libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw);
         }
 
         print!("{ENTER_SEQ}");
-        // Full raw = the console: it owns the mouse for pane-aware
-        // selection. (status --tui, CookedSignals, leaves it to the
-        // terminal.) The matching disable is in RESTORE_SEQ.
-        if matches!(level, RawLevel::Full) {
-            print!("{MOUSE_ON}");
-        }
         let _ = std::io::stdout().flush();
 
         let prev = std::panic::take_hook();

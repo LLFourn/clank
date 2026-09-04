@@ -21,14 +21,25 @@
 //! there is a bug too. This differs from `git_boundary`, where
 //! fixtures may legitimately spawn `git`.
 //!
+//! The raw `$ZELLIJ` read is banned outside the owners for the same
+//! reason as the spawn: it is the other way to make a zellij decision
+//! without the owner knowing. `open_zellij::in_session` is the one
+//! definition of "inside zellij" (zellij-is-the-workspace).
+//!
 //! Comments are not scanned, matching `zellij_cost_boundary` — a gate
 //! that deletes the rationale for not calling something teaches
 //! nothing.
 
 use std::path::{Path, PathBuf};
 
-/// Implements the pane operations, and their sole caller.
-const OWNERS: &[&str] = &["cli/open_zellij.rs", "cli/status_tui/zellij.rs"];
+/// The ONE file that may start a `zellij` process or read `$ZELLIJ`.
+const SPAWNER: &str = "cli/open_zellij.rs";
+
+/// May CALL the pane-mutation helpers: the spawner that implements
+/// them, and the reconciler that is their sole legitimate caller. The
+/// reconciler is not a spawner — it reaches zellij only through the
+/// spawner's typed API (zellij-is-the-workspace).
+const MUTATION_CALLERS: &[&str] = &[SPAWNER, "cli/status_tui/zellij.rs"];
 
 /// Pane MUTATIONS. Reads (`snapshot_panes`, `agent_pane_pairs`,
 /// `reviewers_are_stacked`, …) are fine anywhere — observing panes
@@ -41,16 +52,38 @@ const PANE_MUTATIONS: &[&str] = &[
     "relocate_for_promote",
 ];
 
-/// What (if anything) a line illegally names.
-fn line_violation(line: &str) -> Option<String> {
+/// Whether a line starts a zellij process or reads its environment —
+/// legal in the spawner only.
+fn spawn_violation(line: &str) -> Option<String> {
     let code = line.split("//").next().unwrap_or("");
     if code.contains(r#"Command::new("zellij")"#) {
         return Some("raw `zellij` subprocess".to_string());
     }
+    // "Am I inside zellij" has ONE definition, `open_zellij::
+    // in_session`. A raw read elsewhere is a second one that can
+    // drift from it — and it is how callers reached around the seam
+    // to make zellij decisions the owner never saw
+    // (zellij-is-the-workspace).
+    if code.contains(r#"var_os("ZELLIJ")"#) || code.contains(r#"var("ZELLIJ")"#) {
+        return Some("raw `$ZELLIJ` read".to_string());
+    }
+    None
+}
+
+/// Whether a line calls a pane MUTATION — legal in the spawner and
+/// the reconciler only.
+fn mutation_violation(line: &str) -> Option<String> {
+    let code = line.split("//").next().unwrap_or("");
     PANE_MUTATIONS
         .iter()
         .find(|op| code.contains(*op))
         .map(|op| format!("pane mutation `{op}`"))
+}
+
+/// What (if anything) a line illegally names, for a file that is
+/// neither spawner nor reconciler.
+fn line_violation(line: &str) -> Option<String> {
+    spawn_violation(line).or_else(|| mutation_violation(line))
 }
 
 fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -102,12 +135,20 @@ fn only_the_pane_io_modules_operate_on_panes() {
     let mut violations: Vec<String> = Vec::new();
     for f in &files {
         let unix = f.to_string_lossy().replace('\\', "/");
-        if OWNERS.iter().any(|o| unix.ends_with(o)) || is_gate(&unix) {
+        if unix.ends_with(SPAWNER) || is_gate(&unix) {
             continue;
         }
+        // The reconciler may mutate panes but may not spawn: its only
+        // route to zellij is the spawner's typed API.
+        let check: fn(&str) -> Option<String> =
+            if MUTATION_CALLERS.iter().any(|o| unix.ends_with(o)) {
+                spawn_violation
+            } else {
+                line_violation
+            };
         let body = std::fs::read_to_string(f).unwrap_or_default();
         for (i, line) in body.lines().enumerate() {
-            if let Some(what) = line_violation(line) {
+            if let Some(what) = check(line) {
                 violations.push(format!("{}:{} — {what}", f.display(), i + 1));
             }
         }
@@ -142,6 +183,14 @@ fn scanner_catches_both_ways_around_the_seam() {
     assert!(
         line_violation(r#"    // we deliberately do NOT Command::new("zellij") here"#).is_none(),
         "rationale in a comment is not a call"
+    );
+    assert!(
+        line_violation(r#"    let inside = std::env::var_os("ZELLIJ").is_some();"#).is_some(),
+        "a raw $ZELLIJ read is the third way around the seam"
+    );
+    assert!(
+        line_violation("    let inside = open_zellij::in_session();").is_none(),
+        "asking the owner is the sanctioned form"
     );
     assert!(
         line_violation("    let panes = open_zellij::snapshot_panes();").is_none(),

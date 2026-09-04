@@ -15,24 +15,10 @@ pub async fn run(args: OpenArgs) -> anyhow::Result<()> {
         // Explicit escape hatch: force the zellij layout even outside
         // a session.
         Some(OpenCmd::Zellij(zellij)) => super::open_zellij::run(zellij).await,
-        // Bare `clank open`: the console IS the default workspace.
-        // Inside a live zellij session (`$ZELLIJ` set), or for the
-        // zellij-specific multi-worktree / layout flags, keep the
-        // zellij opener (add-a-tab, --all, --fork/--pr, --print).
-        // Otherwise — a plain `clank open` in a fresh terminal —
-        // launch the self-managed console.
-        None => {
-            let in_zellij = std::env::var_os("ZELLIJ").is_some();
-            let z = &args.zellij;
-            let console_default =
-                !in_zellij && z.fork.is_none() && z.pr.is_none() && !z.all && !z.print;
-            let repo = z.repo.clone();
-            if console_default {
-                super::console::run(repo.as_deref())
-            } else {
-                super::open_zellij::run(args.zellij).await
-            }
-        }
+        // Bare `clank open` and `clank open zellij` are the same
+        // thing. The subcommand survives as an alias so nothing that
+        // invokes it breaks (zellij-is-the-workspace).
+        None => super::open_zellij::run(args.zellij).await,
     }
 }
 
@@ -809,10 +795,8 @@ mod open_args_tests {
 
     #[test]
     fn bare_open_accepts_the_flattened_zellij_flags() {
-        // clank-open-zellij-context: the zellij flags work on the
-        // bare `clank open` form via the flattened (shared,
-        // drift-proof) OpenZellijArgs. (Routing — console vs zellij —
-        // is decided at run time from $ZELLIJ + these flags.)
+        // The zellij flags work on the bare `clank open` form via
+        // the flattened (shared, drift-proof) OpenZellijArgs.
         let o = parse(&["t", "open"]);
         assert!(o.command.is_none());
         assert!(!o.zellij.print);

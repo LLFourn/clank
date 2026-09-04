@@ -2,13 +2,6 @@
 resolver = "3"
 members = ["crates/core", "crates/cli"]
 
-# Vendored vt100 with a one-line scrollback fix (save to scrollback when a
-# scroll region's top is row 0, so TUIs with a fixed bottom bar — e.g.
-# codex — are scrollable in the console). Verbatim 0.16.2 + one line; see
-# vendor/vt100/VENDOR.md. Not a workspace member, so it's excluded from
-# build/fmt/clippy/the git-boundary scan.
-[patch.crates-io]
-vt100 = { path = "vendor/vt100" }
 
 [profile.release]
 lto = "thin"

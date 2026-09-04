@@ -16,15 +16,7 @@ use crate::cli::status::StatusSnapshot;
 /// zellij or if the query fails. Parses `zellij action
 /// current-tab-info` (`id: N` / `name: X` lines).
 fn current_tab() -> Option<(String, String)> {
-    std::env::var_os("ZELLIJ")?;
-    let out = std::process::Command::new("zellij")
-        .args(["action", "current-tab-info"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    parse_current_tab_info(&String::from_utf8_lossy(&out.stdout))
+    parse_current_tab_info(&crate::cli::open_zellij::current_tab_info()?)
 }
 
 /// Parse `zellij action current-tab-info` into `(id, name)`. The
@@ -47,14 +39,7 @@ fn parse_current_tab_info(stdout: &str) -> Option<(String, String)> {
 }
 
 fn rename_tab(id: &str, name: &str) {
-    // `.output()` (NOT `.status()`): capture + discard the child's
-    // stdout/stderr so a rename error never bleeds onto the alt-screen
-    // the TUI owns. The loop is event-driven, so an inherited error
-    // line would PERSIST until the next watcher event, not flicker
-    // (ruthless 9c38523).
-    let _ = std::process::Command::new("zellij")
-        .args(["action", "rename-tab-by-id", id, name])
-        .output();
+    crate::cli::open_zellij::rename_tab(id, name)
 }
 
 /// Mirrors the bar's emoji into the zellij tab name
@@ -65,19 +50,34 @@ fn rename_tab(id: &str, name: &str) {
 /// next TUI launch). `None` (no-op) outside zellij. Lifecycle is the
 /// pane's: this lives only as long as the `status --tui` process, so
 /// there's no separate watcher to leak.
-pub(super) struct TabIndicator {
+pub(super) struct TabIndicator<R = fn(&str, &str)>
+where
+    R: FnMut(&str, &str),
+{
     id: String,
     base: String,
     last: Option<String>,
+    /// The rename operation, INJECTED so the lifecycle — capture once,
+    /// rename only on change, restore on drop — is testable without a
+    /// zellij (zellij-is-the-workspace). Production passes the
+    /// spawner's `rename_tab`.
+    rename: R,
 }
 
 impl TabIndicator {
     pub(super) fn new() -> Option<Self> {
-        let (id, name) = current_tab()?;
+        Self::with_io(current_tab(), rename_tab as fn(&str, &str))
+    }
+}
+
+impl<R: FnMut(&str, &str)> TabIndicator<R> {
+    fn with_io(tab: Option<(String, String)>, rename: R) -> Option<Self> {
+        let (id, name) = tab?;
         Some(Self {
             id,
             base: strip_leading_emoji(&name),
             last: None,
+            rename,
         })
     }
 
@@ -85,38 +85,25 @@ impl TabIndicator {
         if emoji.is_empty() || self.last.as_deref() == Some(emoji) {
             return;
         }
-        rename_tab(&self.id, &format!("{emoji} {}", self.base));
+        (self.rename)(&self.id, &format!("{emoji} {}", self.base));
         self.last = Some(emoji.to_string());
     }
 }
 
-impl Drop for TabIndicator {
+impl<R: FnMut(&str, &str)> Drop for TabIndicator<R> {
     fn drop(&mut self) {
         if self.last.is_some() {
-            rename_tab(&self.id, &self.base);
+            (self.rename)(&self.id, &self.base);
         }
     }
 }
 
 fn list_panes() -> Option<String> {
-    let out = std::process::Command::new("zellij")
-        .args(["action", "list-panes"])
-        .output()
-        .ok()?;
-    out.status
-        .success()
-        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+    crate::cli::open_zellij::list_panes_text()
 }
 
 fn rename_pane(id: &str, name: &str) {
-    // `.output()` (NOT `.status()`): isolate the child's stdout/stderr
-    // from the alt-screen — a stale pane id (closed between list-panes
-    // and the rename) or any zellij hiccup must not bleed an error line
-    // onto the TUI, which the event-driven loop would leave until the
-    // next watcher event (ruthless 9c38523).
-    let _ = std::process::Command::new("zellij")
-        .args(["action", "rename-pane", "--pane-id", id, name])
-        .output();
+    crate::cli::open_zellij::rename_pane(id, name)
 }
 
 /// The agent panes in `zellij action list-panes` output
@@ -891,6 +878,104 @@ impl PaneReconciler {
     }
 }
 
+/// Whether zellij can be reached from this process, as last observed
+/// by the worker.
+///
+/// Three states rather than two, because they call for different
+/// actions from the operator: outside a session `clank open` would
+/// START one, while inside a session that does not answer something
+/// is wrong with zellij itself — and that case otherwise looks like
+/// "clank did nothing" (zellij-is-the-workspace).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ZellijReach {
+    /// `$ZELLIJ` is unset. Pane operations are unavailable by design.
+    NotInSession,
+    /// `$ZELLIJ` is set but no listing has returned yet. A distinct
+    /// state rather than a guess: seeding `Connected` before any
+    /// evidence showed a dead session as healthy on its first frame —
+    /// the exact ambiguity this indicator exists to remove (codex on
+    /// a9c9bd4).
+    Unknown,
+    /// In a session and the client answered the last listing.
+    Connected,
+    /// In a session but the client did NOT answer.
+    Unreachable,
+}
+
+/// A `PaneIo` that records whether each listing it performs was
+/// answered. Reachability is READ OFF work the batch was already
+/// doing — a batch that lists zero times (converged, cache warm)
+/// observes nothing, and the last value stands. This is what "costs no
+/// probe of its own" has to mean in code, not in a comment (codex on
+/// d855068).
+struct Observed<'a, I: PaneIo> {
+    inner: I,
+    seen: &'a std::cell::Cell<Option<ZellijReach>>,
+}
+
+impl<I: PaneIo> Observed<'_, I> {
+    fn note(&self, answered: bool) {
+        self.seen.set(Some(if answered {
+            ZellijReach::Connected
+        } else {
+            ZellijReach::Unreachable
+        }));
+    }
+}
+
+impl<I: PaneIo> PaneIo for Observed<'_, I> {
+    type Snap = I::Snap;
+    fn snapshot(&mut self) -> Option<Self::Snap> {
+        let s = self.inner.snapshot();
+        self.note(s.is_some());
+        s
+    }
+    fn pairs(&mut self, snap: &Self::Snap) -> Vec<(String, bool)> {
+        self.inner.pairs(snap)
+    }
+    fn verify(&mut self, reviewers: &[String]) -> Option<(Vec<(String, bool)>, bool)> {
+        let v = self.inner.verify(reviewers);
+        self.note(v.is_some());
+        v
+    }
+    fn capture_focus(&mut self, snap: &Self::Snap) -> Option<String> {
+        self.inner.capture_focus(snap)
+    }
+    fn restore_focus(&mut self, id: &str) {
+        self.inner.restore_focus(id)
+    }
+    fn add(
+        &mut self,
+        label: &str,
+        other_reviewers: &[String],
+        departing: &[String],
+        snap: &Self::Snap,
+    ) -> crate::cli::open_zellij::ReviewerPaneAdd {
+        self.inner.add(label, other_reviewers, departing, snap)
+    }
+    fn stack(&mut self, reviewers: &[String], snap: &Self::Snap, extra_ids: &[String]) -> bool {
+        self.inner.stack(reviewers, snap, extra_ids)
+    }
+    fn is_placed(&mut self, reviewers: &[String], snap: &Self::Snap) -> bool {
+        self.inner.is_placed(reviewers, snap)
+    }
+    fn relocate(
+        &mut self,
+        new_master: &str,
+        old_master: Option<&str>,
+        roster: &[String],
+        snap: &Self::Snap,
+    ) {
+        self.inner.relocate(new_master, old_master, roster, snap)
+    }
+    fn remove_all(&mut self, labels: &[String], snap: &Self::Snap) {
+        self.inner.remove_all(labels, snap)
+    }
+    fn may_reconcile(&mut self) -> bool {
+        self.inner.may_reconcile()
+    }
+}
+
 /// A message to the reconciliation worker. Both kinds coalesce
 /// independently (latest of each per batch): a roster view triggers a
 /// reconcile pass, glyph data a retitle pass.
@@ -960,33 +1045,88 @@ impl WorkerState {
 pub(super) struct ReconcileWorker {
     tx: Option<std::sync::mpsc::Sender<WorkerMsg>>,
     join: Option<std::thread::JoinHandle<()>>,
+    reach_rx: Option<std::sync::mpsc::Receiver<ZellijReach>>,
+    /// Last observed; `NotInSession` is fixed for the process's life,
+    /// since `$ZELLIJ` does not change under a running TUI.
+    reach: ZellijReach,
 }
 
 impl ReconcileWorker {
     /// Spawns the worker — a no-op handle outside zellij (no thread,
     /// sends go nowhere).
     pub(super) fn spawn(repo: std::path::PathBuf) -> Self {
-        if std::env::var_os("ZELLIJ").is_none() {
+        if !crate::cli::open_zellij::in_session() {
             return Self {
                 tx: None,
                 join: None,
+                reach_rx: None,
+                reach: ZellijReach::NotInSession,
             };
         }
         let (tx, rx) = std::sync::mpsc::channel::<WorkerMsg>();
+        let (reach_tx, reach_rx) = std::sync::mpsc::channel::<ZellijReach>();
+        let mut worker = Self::in_session(reach_rx);
         let join = std::thread::spawn(move || {
             let mut state = WorkerState::new();
-            let mut io = ZellijPaneIo {
+            let io = ZellijPaneIo {
                 repo: &repo,
                 lease: None,
             };
+            let seen = std::cell::Cell::new(None);
+            let mut io = Observed {
+                inner: io,
+                seen: &seen,
+            };
             worker_loop(&rx, |roster, glyphs| {
-                state.handle(roster, glyphs, &mut io, list_panes, rename_pane);
+                seen.set(None);
+                let list = || {
+                    let out = list_panes();
+                    seen.set(Some(if out.is_some() {
+                        ZellijReach::Connected
+                    } else {
+                        ZellijReach::Unreachable
+                    }));
+                    out
+                };
+                state.handle(roster, glyphs, &mut io, list, rename_pane);
+                // Only a batch that actually listed has anything to
+                // say; a cached batch keeps the loop's last value.
+                if let Some(reach) = seen.get() {
+                    let _ = reach_tx.send(reach);
+                }
             });
         });
+        worker.tx = Some(tx);
+        worker.join = Some(join);
+        worker
+    }
+
+    /// The in-session worker before any thread or report exists —
+    /// the ONE place the initial reach is decided.
+    ///
+    /// Pure, so a test can exercise the real seed: a test that built
+    /// its own struct literal proved nothing about `spawn`, and the
+    /// mutation it claimed to catch stayed green (codex on c842901).
+    /// `$ZELLIJ` being set proves a variable, not a client, so nothing
+    /// has been observed yet.
+    fn in_session(reach_rx: std::sync::mpsc::Receiver<ZellijReach>) -> Self {
         Self {
-            tx: Some(tx),
-            join: Some(join),
+            tx: None,
+            join: None,
+            reach_rx: Some(reach_rx),
+            reach: ZellijReach::Unknown,
         }
+    }
+
+    /// The last reachability the worker reported. Drains the channel
+    /// without blocking, so the render loop never waits on zellij.
+    pub(super) fn reach(&mut self) -> ZellijReach {
+        if let Some(rx) = &self.reach_rx {
+            while let Ok(r) = rx.try_recv() {
+                self.reach = r;
+            }
+        }
+        self.reach
     }
 
     /// Hand the worker a fresh snapshot's roster view. Non-blocking:
@@ -1047,6 +1187,173 @@ mod tests {
     use super::*;
     use crate::cli::status_tui::fixtures::{plan_state, reviewer_missing, snap};
     use clank_core::plan_view::WaitingOn;
+
+    // ── zellij-is-the-workspace: the tab indicator, fake-backed ──
+
+    /// Rename only on CHANGE, and put the base name back on drop.
+    /// Every rename is a zellij subprocess, so a redundant one per
+    /// frame is a cost, and a missing restore leaves a stale glyph
+    /// in the tab name after the TUI exits.
+    #[test]
+    fn tab_indicator_renames_on_change_only_and_restores_on_drop() {
+        let renames = std::cell::RefCell::new(Vec::<(String, String)>::new());
+        {
+            let mut tab = TabIndicator::with_io(
+                Some(("3".to_string(), "👀 clank".to_string())),
+                |id: &str, name: &str| renames.borrow_mut().push((id.into(), name.into())),
+            )
+            .expect("a tab to indicate");
+            tab.update("");
+            assert!(renames.borrow().is_empty(), "an empty glyph is a no-op");
+            tab.update("💤");
+            tab.update("💤");
+            tab.update("💤");
+            assert_eq!(
+                renames.borrow().as_slice(),
+                &[("3".to_string(), "💤 clank".to_string())],
+                "three identical updates are one rename"
+            );
+            tab.update("👀");
+            assert_eq!(renames.borrow().len(), 2, "a change renames again");
+        }
+        // The stale leading glyph in the captured name was stripped:
+        // the restore writes the BASE, never the glyph we found.
+        assert_eq!(
+            renames.borrow().last().unwrap(),
+            &("3".to_string(), "clank".to_string()),
+            "drop restores the base name"
+        );
+    }
+
+    /// Never touched → nothing to restore, so drop is silent.
+    #[test]
+    fn tab_indicator_untouched_restores_nothing() {
+        let renames = std::cell::RefCell::new(Vec::<(String, String)>::new());
+        {
+            let _tab = TabIndicator::with_io(
+                Some(("3".to_string(), "clank".to_string())),
+                |id: &str, name: &str| renames.borrow_mut().push((id.into(), name.into())),
+            );
+        }
+        assert!(renames.borrow().is_empty(), "no update, no restore");
+    }
+
+    /// Outside zellij there is no tab and no indicator: the rename
+    /// closure is never even constructed into anything.
+    #[test]
+    fn tab_indicator_is_none_without_a_tab() {
+        assert!(TabIndicator::with_io(None, |_: &str, _: &str| {}).is_none());
+    }
+
+    // ── zellij-is-the-workspace: reachability ──────────────────
+
+    /// Outside a session the worker never spawns and reach is fixed:
+    /// `$ZELLIJ` does not change under a running TUI.
+    #[test]
+    fn reach_is_not_in_session_when_there_is_no_worker() {
+        let mut w = ReconcileWorker {
+            tx: None,
+            join: None,
+            reach_rx: None,
+            reach: ZellijReach::NotInSession,
+        };
+        assert_eq!(w.reach(), ZellijReach::NotInSession);
+    }
+
+    /// The loop reads the LATEST report and never blocks: several
+    /// batches may have run between two frames, and only the last one
+    /// describes the present.
+    #[test]
+    fn reach_drains_to_the_latest_report_without_blocking() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut w = ReconcileWorker {
+            tx: None,
+            join: None,
+            reach_rx: Some(rx),
+            reach: ZellijReach::Connected,
+        };
+        // Nothing reported yet: the last value stands, and this must
+        // not wait for a report that is never coming.
+        assert_eq!(w.reach(), ZellijReach::Connected);
+        tx.send(ZellijReach::Unreachable).unwrap();
+        tx.send(ZellijReach::Connected).unwrap();
+        tx.send(ZellijReach::Unreachable).unwrap();
+        assert_eq!(w.reach(), ZellijReach::Unreachable, "the latest wins");
+        // A disconnected sender is not an error; the last value stands.
+        drop(tx);
+        assert_eq!(w.reach(), ZellijReach::Unreachable);
+    }
+
+    /// The indicator adds NO listing. Reachability is read off the
+    /// listings a batch already performs; the first draft appended an
+    /// unconditional `snapshot()` after `handle`, which turned the
+    /// converged steady state from zero zellij calls into one per
+    /// batch (codex on d855068). This pins the count.
+    #[test]
+    fn observing_reach_adds_no_snapshot() {
+        let seen = std::cell::Cell::new(None);
+        let inner = FakeIo::new(vec![
+            Some(live(&[("claude", true)])),
+            Some(live(&[("claude", true)])),
+        ]);
+        let mut io = Observed { inner, seen: &seen };
+        let mut state = WorkerState::new();
+        let view = view(&["claude"], Some("claude"));
+
+        // First batch: not converged, so the reconciler lists once.
+        state.handle(Some(view.clone()), None, &mut io, || None, |_, _| {});
+        assert_eq!(
+            io.inner.snapshots_taken, 1,
+            "the reconcile listing, and only it"
+        );
+        assert_eq!(
+            seen.get(),
+            Some(ZellijReach::Connected),
+            "read off that listing"
+        );
+
+        // Second batch, same roster: converged, ZERO listings — and
+        // therefore no observation, so the loop keeps its last value.
+        seen.set(None);
+        state.handle(Some(view), None, &mut io, || None, |_, _| {});
+        assert_eq!(
+            io.inner.snapshots_taken, 1,
+            "a converged batch lists nothing"
+        );
+        assert_eq!(seen.get(), None, "nothing listed, nothing observed");
+    }
+
+    /// Before the first listing returns, nothing may claim the client
+    /// is there. `$ZELLIJ` set is a variable, not an answer, and a
+    /// dead session leaves it set.
+    #[test]
+    fn a_fresh_worker_reports_unknown_not_connected() {
+        // Through the PRODUCTION initializer, not a literal of our
+        // own: only then does re-seeding `spawn` to `Connected`
+        // fail here.
+        let (_tx, rx) = std::sync::mpsc::channel::<ZellijReach>();
+        let mut w = ReconcileWorker::in_session(rx);
+        assert_eq!(w.reach(), ZellijReach::Unknown, "no evidence, no claim");
+        assert_ne!(w.reach(), ZellijReach::Connected);
+    }
+
+    /// A listing that fails is what `Unreachable` MEANS.
+    #[test]
+    fn a_failed_listing_reads_as_unreachable() {
+        let seen = std::cell::Cell::new(None);
+        let inner = FakeIo::new(vec![None]);
+        let mut io = Observed { inner, seen: &seen };
+        let mut state = WorkerState::new();
+        state.handle(
+            Some(view(&["claude"], Some("claude"))),
+            None,
+            &mut io,
+            || None,
+            |_, _| {},
+        );
+        assert_eq!(io.inner.snapshots_taken, 1);
+        assert_eq!(seen.get(), Some(ZellijReach::Unreachable));
+    }
 
     // ── tui-zellij-pane-reconcile: planning + convergence ──────
 

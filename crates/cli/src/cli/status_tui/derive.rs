@@ -597,7 +597,12 @@ mod tests {
     #[test]
     fn every_bar_carries_a_colour_not_just_reverse_video() {
         for (name, s) in rendered_branches() {
-            let line = crate::cli::status_tui::render::bar(&s, &state_color(&s).sgr(), 20);
+            let line = crate::cli::status_tui::render::bar(
+                &s,
+                &state_color(&s).sgr(),
+                20,
+                crate::cli::status_tui::zellij::ZellijReach::NotInSession,
+            );
             let sgr = line
                 .strip_prefix("\x1b[")
                 .and_then(|rest| rest.split_once('m'))
