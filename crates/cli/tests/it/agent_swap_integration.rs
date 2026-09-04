@@ -1,6 +1,6 @@
 //! `clank agent swap <out> <in>` — replace a roster member, keep the role.
 
-mod common;
+use crate::common;
 
 use clank::cli::teams_config::{AgentDescription, RosterRole};
 use clank_core::ids::AgentLabel;

@@ -5,7 +5,7 @@
 //! with a commit to review (`run_hook`) and an idle master
 //! (`run_idle_hook`) — exercises the guard completely.
 
-mod common;
+use crate::common;
 use common::TestEnv;
 
 use std::path::Path;

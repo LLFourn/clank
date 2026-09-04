@@ -3,7 +3,7 @@
 //! against the CURRENT team, not the one captured at arm time. All
 //! in-process (no binary spawning), poll mode for determinism.
 
-mod common;
+use crate::common;
 use common::TestEnv;
 
 use std::path::Path;

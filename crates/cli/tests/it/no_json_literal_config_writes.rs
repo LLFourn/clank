@@ -1,7 +1,7 @@
 //! Phase 4 of `typed-config-dogfood`: negative regression test
-//! that fails if any `crates/cli/tests/*.rs` file contains a
-//! raw JSON literal that looks like a `.clank/config.json`
-//! write.
+//! that fails if any `.rs` file under `crates/cli/tests/`, at any
+//! depth, contains a raw JSON literal that looks like a
+//! `.clank/config.json` write.
 //!
 //! The check is best-effort, NOT a formal grammar:
 //! - Scans each test file for `r#"{` substrings followed
@@ -117,34 +117,65 @@ fn flag_config_json_literal(body: &str, path: &Path) -> Option<String> {
     None
 }
 
+/// Every finding under `dir`, at any depth. Recursive because the
+/// test files live under `tests/it/` — a walk of the immediate
+/// children of `tests/` would stay green while scanning nothing
+/// (the-test-suite-takes-a-million-years).
+fn findings_under(dir: &Path) -> Vec<String> {
+    let mut findings = Vec::new();
+    let entries = fs::read_dir(dir).unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()));
+    for entry in entries {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            findings.extend(findings_under(&path));
+            continue;
+        }
+        if !path.extension().is_some_and(|e| e == "rs") {
+            continue;
+        }
+        // Skip ourselves — this file mentions the field names in its
+        // own source.
+        if path.file_name().and_then(|s| s.to_str()) == Some("no_json_literal_config_writes.rs") {
+            continue;
+        }
+        let raw = fs::read_to_string(&path).unwrap();
+        let filtered = body_without_allowed_lines(&raw);
+        if let Some(msg) = flag_config_json_literal(&filtered, &path) {
+            findings.push(msg);
+        }
+    }
+    findings
+}
+
 #[test]
 fn no_json_literal_config_writes_in_tests() {
     let tests_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
-    let entries = fs::read_dir(&tests_dir)
-        .unwrap_or_else(|e| panic!("read_dir {}: {e}", tests_dir.display()));
-    let mut findings: Vec<String> = Vec::new();
-    for entry in entries {
-        let entry = entry.unwrap();
-        let path = entry.path();
-        if path.extension().is_some_and(|e| e == "rs") {
-            // Skip ourselves — this file mentions the field
-            // names in its own source.
-            if path.file_name().and_then(|s| s.to_str()) == Some("no_json_literal_config_writes.rs")
-            {
-                continue;
-            }
-            let raw = fs::read_to_string(&path).unwrap();
-            let filtered = body_without_allowed_lines(&raw);
-            if let Some(msg) = flag_config_json_literal(&filtered, &path) {
-                findings.push(msg);
-            }
-        }
-    }
+    let findings = findings_under(&tests_dir);
     assert!(
         findings.is_empty(),
         "typed-config-dogfood acceptance violated — JSON literal config writes found:\n\n{}\n",
         findings.join("\n\n")
     );
+}
+
+#[test]
+fn a_nested_violation_is_found() {
+    // The gate must reach `tests/it/…` and deeper, not just the
+    // immediate children of `tests/`.
+    let root = tempfile::tempdir().unwrap();
+    let deep = root.path().join("it").join("deeper");
+    fs::create_dir_all(&deep).unwrap();
+    fs::write(root.path().join("top.rs"), "fn a() {}\n").unwrap();
+    let planted = "let c = r#\"{\"agents\": []}\"#;\n";
+    fs::write(deep.join("planted.rs"), planted).unwrap();
+    fs::write(deep.join("notes.md"), planted).unwrap();
+    let findings = findings_under(root.path());
+    assert_eq!(
+        findings.len(),
+        1,
+        "exactly the planted .rs file:\n{findings:?}"
+    );
+    assert!(findings[0].contains("planted.rs"), "{}", findings[0]);
 }
 
 #[test]

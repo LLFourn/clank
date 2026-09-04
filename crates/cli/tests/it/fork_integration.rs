@@ -2,7 +2,7 @@
 //! Drives `fork::run_fork` directly — no binary spawning; the open
 //! decision is pure-tested in the unit suite.
 
-mod common;
+use crate::common;
 
 use clank::cli::teams_config::RosterRole;
 use common::TestEnv;

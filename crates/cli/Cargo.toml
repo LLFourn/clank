@@ -88,6 +88,13 @@ gix = { version = "0.84", default-features = false, features = [
 ] }
 kdl = "4"
 
+[[bin]]
+name = "clank"
+path = "src/main.rs"
+# The bin holds no tests (the README tests live in the lib), so its
+# test target is one fewer binary to link and assess.
+test = false
+
 [dev-dependencies]
 filetime = "0.2"
 # test-only: paused-time (`start_paused`) so the github poll loop's

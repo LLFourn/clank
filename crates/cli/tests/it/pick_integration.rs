@@ -1,7 +1,7 @@
 //! In-process tests for `clank pick`. Drives `pick::run` directly — no
 //! binary spawning; git is spawned for fixture setup (allowed).
 
-mod common;
+use crate::common;
 
 use common::TestEnv;
 use std::path::Path;

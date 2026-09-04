@@ -3,7 +3,7 @@
 //! declared --verdict is the single source of truth, so a message
 //! like "CONTINUE: looks good" lands on disk as `CONTINUE looks good`.
 
-mod common;
+use crate::common;
 
 use common::TestEnv;
 use std::path::Path;

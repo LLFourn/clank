@@ -360,3 +360,18 @@ resume of it is what the tool itself refuses. A claude agent whose
 tab was closed keeps running as a background session; `clank agent
 start` notices and `claude attach`es to it instead of resuming, so the
 conversation carries on where it was.
+
+**Building takes minutes and `cargo test` seems to hang before any
+test runs** — on macOS, that is Gatekeeper. `syspolicyd` assesses
+every freshly built executable on its first launch, and a big test
+binary on a busy machine is a minute of it, at zero CPU in the
+process itself. Add your terminal to System Settings → Privacy &
+Security → **Developer Tools** (for Terminal.app:
+`sudo spctl developer-mode enable-terminal`); everything it spawns is
+then exempt, and a fresh binary starts in milliseconds.
+
+The grant follows the *responsible process*, and a zellij server is
+re-parented to launchd — so panes inside zellij are not covered by a
+grant to the terminal alone. Add `/opt/homebrew/bin/zellij` (⌘⇧G in
+the file picker) as well, then restart the sessions; `clank open`
+recreates one.

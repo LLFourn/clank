@@ -1,7 +1,7 @@
 //! In-process test: the status snapshot carries recent oneline log
 //! lines for the TUI's live-log pane (status-tui-live-log).
 
-mod common;
+use crate::common;
 
 use common::TestEnv;
 use std::path::Path;

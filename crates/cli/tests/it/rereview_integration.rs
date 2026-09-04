@@ -5,7 +5,7 @@
 //! gate does not rewind onto a self-review. That verdict is a roster
 //! artefact; this is how the new master converts it into a real one.
 
-mod common;
+use crate::common;
 
 use clank_core::ids::CommitSha;
 use common::TestEnv;

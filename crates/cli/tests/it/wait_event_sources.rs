@@ -2,7 +2,7 @@
 //! spawned when the wait parks, completion is the wake, process-group
 //! killed on any other exit. In-process; sh fixtures only.
 
-mod common;
+use crate::common;
 use common::TestEnv;
 
 use std::path::Path;

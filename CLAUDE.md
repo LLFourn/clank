@@ -23,3 +23,25 @@ production code outside the two layers names `git`/`gix`. Test code is exempt
 
 When you find a subprocess read/write that gix *could* do, convert it inside
 the layer — callers don't change.
+
+## Running tests
+
+Run the tests for what you touched, never the world. All integration
+tests are modules of ONE harness, `crates/cli/tests/it/`, so a lib
+change costs one link and one fresh binary, not twenty-four:
+
+```sh
+cargo test -p clank --lib <module>            # unit tests, e.g. cli::open_zellij
+cargo test -p clank --test it <module>::      # one integration module, e.g. fork_integration::
+cargo test -p clank --test it                 # every integration test, one process
+```
+
+Gates that scan source (`git_boundary`, `zellij_ownership_boundary`,
+`zellij_cost_boundary`, `no_json_literal_config_writes`) are modules
+of the same harness; run the one that guards the files you changed.
+The bin has no test target: its `Cli` and the README tests live in
+`cli::command`.
+
+On macOS, grant the terminal Developer Tools permission once, or every
+fresh test binary spends a minute in Gatekeeper before its first test
+(README → Troubleshooting).

@@ -4,7 +4,7 @@
 //! keeps the loop deterministic (500ms tick, no FSEvents dependency),
 //! and everything runs in-process via `clank::cli::wait::run`.
 
-mod common;
+use crate::common;
 use common::TestEnv;
 
 use std::path::Path;

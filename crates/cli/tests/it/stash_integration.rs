@@ -2,7 +2,7 @@
 //! `shelve clean` (plan-lifecycle-verbs). Drives the command cores
 //! directly — no binary spawning.
 
-mod common;
+use crate::common;
 
 use common::TestEnv;
 use std::path::Path;

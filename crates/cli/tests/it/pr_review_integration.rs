@@ -2,7 +2,7 @@
 //! verbs). Drive the cores directly — no binary spawning; git is
 //! spawned for the PR-head fetch (allowed).
 
-mod common;
+use crate::common;
 
 use common::TestEnv;
 use std::path::Path;

@@ -1,6 +1,6 @@
 //! Integration tests for `clank doctor`'s unbound-reviewer warning.
 
-mod common;
+use crate::common;
 
 use common::TestEnv;
 use std::path::Path;
