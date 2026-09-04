@@ -201,7 +201,19 @@ pub fn repo_checks(
         use crate::cli::open_zellij::PlacementCapability as P;
         let name = "zellij pane placement";
         match cap {
-            P::NoZellij => {}
+            // Silent while the console was the fallback. It is not:
+            // zellij is the workspace, and a machine without it can
+            // run everything except `clank open` — which is exactly
+            // what someone reading `doctor` before opening needs to
+            // know (zellij-is-the-workspace).
+            P::NoZellij => out.push(CheckResult::warn(
+                SECTION,
+                "zellij",
+                "zellij is not installed (or not on PATH). Everything but `clank \
+                 open` works without it; `clank open` runs the team in a zellij \
+                 session. Install it from https://zellij.dev."
+                    .to_string(),
+            )),
             P::ClientSupports => out.push(CheckResult::ok(
                 SECTION,
                 name,
@@ -1078,9 +1090,31 @@ mod tests {
                 .find(|r| r.name == "zellij pane placement")
         };
         assert!(row(None).is_none(), "unknown capability says nothing");
+        // No zellij USED to be silent, back when the console was the
+        // fallback. Now it is the one thing a reader of `doctor` most
+        // needs told before running `clank open`.
+        let missing = repo_checks(dir.path(), None, Some(P::NoZellij))
+            .into_iter()
+            .find(|r| r.name == "zellij")
+            .expect("no zellij is reported");
+        assert_eq!(
+            missing.status,
+            CheckStatus::Warn,
+            "a warning, not a failure"
+        );
+        assert!(
+            missing.message.contains("clank open"),
+            "names the one command that needs it: {}",
+            missing.message
+        );
+        assert!(
+            missing.message.contains("zellij.dev"),
+            "says where to get it: {}",
+            missing.message
+        );
         assert!(
             row(Some(P::NoZellij)).is_none(),
-            "no zellij at all is not a problem to report"
+            "and no PLACEMENT row: there is no client to say anything about"
         );
         assert_eq!(
             row(Some(P::ClientTooOld)).map(|r| r.status),

@@ -275,15 +275,40 @@ fn resolve_tabs(targets: &[PathBuf], include: Option<&[String]>) -> anyhow::Resu
 }
 
 /// Run a zellij spawn argv, mapping failure to a clear error.
+///
+/// zellij's own stderr is INHERITED, so whatever it complained about
+/// is already on the terminal above this message. The job here is to
+/// say what clank was doing and what to try — not to repeat an exit
+/// code the user can see.
 fn spawn_zellij(argv: &[String]) -> anyhow::Result<()> {
+    let what = spawn_kind(argv);
     let status = std::process::Command::new(&argv[0])
         .args(&argv[1..])
         .status()
-        .context("spawning zellij")?;
+        .with_context(|| {
+            format!(
+                "could not start zellij to {what}. `clank doctor` reports whether \
+                 zellij is installed and reachable."
+            )
+        })?;
     if !status.success() {
-        anyhow::bail!("zellij exited {status}");
+        anyhow::bail!(
+            "zellij failed to {what} (exit {status}) — its own error is printed \
+             above. If the session exists but its server is dead, \
+             `zellij delete-session <name>` and re-run `clank open`."
+        );
     }
     Ok(())
+}
+
+/// What a spawn argv is FOR, in the user's terms, for error messages.
+fn spawn_kind(argv: &[String]) -> &'static str {
+    match argv.get(1).map(String::as_str) {
+        Some("attach") => "attach to the repo's session",
+        Some("action") => "add a tab to the current session",
+        Some("--layout") | Some("-l") => "start the repo's session",
+        _ => "open the workspace",
+    }
 }
 
 /// Compose a multi-tab layout: the shared `default_tab_template` plus
@@ -420,14 +445,7 @@ fn open_one(repo: &Path, print: bool) -> anyhow::Result<()> {
     if spawn_argv[1] == "attach" {
         eprintln!("attaching to existing session `{name}`");
     }
-    let status = std::process::Command::new(&spawn_argv[0])
-        .args(&spawn_argv[1..])
-        .status()
-        .context("spawning zellij")?;
-    if !status.success() {
-        anyhow::bail!("zellij exited {status}");
-    }
-    Ok(())
+    spawn_zellij(&spawn_argv)
 }
 
 /// `zellij action query-tab-names` → one open tab name per line.
@@ -444,10 +462,15 @@ fn zellij_tab_names() -> anyhow::Result<Vec<String>> {
     let out = std::process::Command::new("zellij")
         .args(["action", "query-tab-names"])
         .output()
-        .context("running `zellij action query-tab-names` (is zellij on PATH?)")?;
+        .context("could not run `zellij action query-tab-names`")?;
+    // By here the binary is proven present, so a failure is the
+    // SESSION: `$ZELLIJ` is set but the server behind it does not
+    // answer — a dead or stale session, not a missing install.
     if !out.status.success() {
         anyhow::bail!(
-            "`zellij action query-tab-names` exited {} — can't reconcile open tabs",
+            "the zellij session this shell belongs to did not answer \
+             (`query-tab-names` exited {}). `$ZELLIJ` is set but the server \
+             behind it may be dead; open a fresh terminal and re-run `clank open`.",
             out.status
         );
     }
@@ -3311,6 +3334,44 @@ ttys004   zellij attach clank-foo
             msg.contains("clank open"),
             "names the command that needs it: {msg}"
         );
+    }
+
+    /// Every spawn shape names what clank was DOING, in the user's
+    /// terms, so a failure reads as "could not attach" rather than a
+    /// bare exit code. The argv shapes are the three `open` produces
+    /// plus the fallback.
+    #[test]
+    fn spawn_failures_say_what_was_being_attempted() {
+        let s = |v: &[&str]| spawn_kind(&v.iter().map(|x| x.to_string()).collect::<Vec<_>>());
+        assert_eq!(
+            s(&["zellij", "attach", "clank-foo"]),
+            "attach to the repo's session"
+        );
+        assert_eq!(
+            s(&["zellij", "--layout", "l.kdl"]),
+            "start the repo's session"
+        );
+        assert_eq!(
+            s(&["zellij", "action", "new-tab", "--layout", "l.kdl"]),
+            "add a tab to the current session"
+        );
+        assert_eq!(s(&["zellij"]), "open the workspace");
+    }
+
+    /// A spawn that cannot start at all (binary vanished between the
+    /// preflight and the spawn, or exists but is not executable) points
+    /// at `doctor` rather than surfacing a raw OS error.
+    #[test]
+    fn an_unstartable_spawn_points_at_doctor() {
+        let err =
+            spawn_zellij(&["/nonexistent/zellij".to_string(), "attach".to_string()]).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("could not start zellij"), "{msg}");
+        assert!(
+            msg.contains("attach to the repo's session"),
+            "names the attempt: {msg}"
+        );
+        assert!(msg.contains("clank doctor"), "says where to look: {msg}");
     }
 
     /// An OLD client is not a missing one. `open` still works — it
