@@ -33,13 +33,8 @@ pub async fn run(args: AttendingArgs) -> anyhow::Result<()> {
     let path = dir.join("attending");
 
     if args.clear {
-        match std::fs::remove_file(&path) {
-            Ok(()) => println!("no longer attending"),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                println!("was not attending anything")
-            }
-            Err(e) => return Err(e.into()),
-        }
+        let cleared = crate::cli::stop_hook::clear_attendance(&dir)?;
+        println!("{}", cleared_line(&cleared));
         return Ok(());
     }
 
@@ -93,6 +88,9 @@ pub async fn run(args: AttendingArgs) -> anyhow::Result<()> {
         );
     }
     let record = crate::cli::stop_hook::Attending {
+        expect: Some(crate::cli::stop_hook::Expectation::starting_now(
+            args.expect.as_secs(),
+        )),
         task: task_id.to_string(),
         desc: Some(desc.clone()),
         pid: Some(pid),
@@ -123,10 +121,70 @@ fn confirmation(rec: &crate::cli::stop_hook::Attending) -> String {
     let desc = rec.desc.as_deref().unwrap_or_default();
     let task = &rec.task;
     let pid = rec.pid.map(|p| p.to_string()).unwrap_or_default();
+    let mut line = format!(
+        "attending \"{desc}\" (`{task}`, pid {pid}) — your next turn-end stays silent while \
+         the tool still reports this work running"
+    );
+    if let Some(expect) = &rec.expect {
+        line.push_str(&format!(
+            "; if it is still going after {} you will be checked in on",
+            duration_arg(expect.secs)
+        ));
+    }
+    line
+}
+
+/// What `--clear` reports. It found the marker, the armed check-in,
+/// both, or neither — and says which, since "no longer attending"
+/// promises two different things.
+fn cleared_line(c: &crate::cli::stop_hook::Cleared) -> &'static str {
+    match (c.marker, c.check_in) {
+        (false, false) => "was not attending anything",
+        (true, false) => "no longer attending",
+        (_, true) => "no longer attending; the armed check-in is cancelled",
+    }
+}
+
+/// The value of `--expect`: clank's one duration grammar, and never
+/// none. `0` reads as "no bound" in that grammar, and there is no such
+/// attendance — an agent that wants to sleep through a hang can say
+/// `24h` and be honest about it.
+pub(crate) fn parse_expect(raw: &str) -> Result<std::time::Duration, String> {
+    match crate::cli::wait::parse_duration_str(raw) {
+        Ok(Some(d)) => Ok(d),
+        Ok(None) => Err(
+            "there is always a check-in; give a longer expectation instead (e.g. `--expect 2h`)"
+                .into(),
+        ),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// The command line that attends `task_id` again with a fresh
+/// expectation — what the check-in hands an agent to paste. Built
+/// here, next to the parser that will read it back, from the typed
+/// fields it needs, and shell-quoted: a description is user text, and
+/// `$(…)`, backticks and quotes inside it must arrive as the same
+/// letters rather than run.
+pub(crate) fn reattend_command(task_id: &str, desc: &str, pid: i32, expect_secs: u64) -> String {
+    use crate::shell_quote::shell_quote;
     format!(
-        "attending \"{desc}\" (`{task}`, pid {pid}) — your next turn-end stays silent for as \
-         long as the tool still reports this work running"
+        "clank attending {} --desc {} --pid {pid} --expect {}",
+        shell_quote(task_id),
+        shell_quote(desc),
+        duration_arg(expect_secs)
     )
+}
+
+/// `--expect`'s own form of a duration, for messages that name one.
+pub(crate) fn duration_arg(secs: u64) -> String {
+    if secs > 0 && secs.is_multiple_of(3600) {
+        format!("{}h", secs / 3600)
+    } else if secs > 0 && secs.is_multiple_of(60) {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{secs}s")
+    }
 }
 
 /// Collapse a description to the single terminal row it will be drawn
@@ -152,6 +210,7 @@ mod tests {
         AttendingArgs {
             task_id: task.map(str::to_string),
             pid: None,
+            expect: std::time::Duration::from_secs(300),
             desc: desc.map(str::to_string),
             clear: false,
             author: Some("claude".into()),
@@ -245,6 +304,7 @@ mod tests {
 
     fn rec(pid: Option<i32>, token: bool) -> crate::cli::stop_hook::Attending {
         crate::cli::stop_hook::Attending {
+            expect: None,
             task: "br9711ewy".into(),
             desc: Some("test run".into()),
             pid,
@@ -327,8 +387,14 @@ mod tests {
         let rec = record(dir.path()).expect("written");
         assert_eq!(rec.pid, Some(me));
         assert!(rec.token.is_some(), "and the identity that makes it usable");
-        assert!(
-            rec.provably_live(&["br9711ewy".to_string()], 0),
+        let turn: clank_core::HookInput = serde_json::from_value(serde_json::json!({
+            "session_id": "sess-evidence", "cwd": "/tmp", "stop_hook_active": false,
+            "background_tasks": [{"id": "br9711ewy", "command": "sleep 60"}],
+        }))
+        .unwrap();
+        assert_eq!(
+            rec.provably_live(&turn).as_deref(),
+            Some("br9711ewy"),
             "so it satisfies the hook's proof"
         );
     }
@@ -346,5 +412,125 @@ mod tests {
         .await
         .unwrap();
         assert!(record(dir.path()).is_none(), "the record is gone");
+    }
+
+    // ── the expectation (attending-checks-in-when-the-work-runs-long) ──
+
+    #[test]
+    fn expect_parses_the_shared_grammar_and_defaults_to_five_minutes() {
+        use clap::Parser;
+        #[derive(Parser, Debug)]
+        struct T {
+            #[command(flatten)]
+            a: AttendingArgs,
+        }
+        let t = T::try_parse_from(["t", "br9711ewy", "--desc", "test run"]).unwrap();
+        assert_eq!(
+            t.a.expect.as_secs(),
+            crate::cli::stop_hook::DEFAULT_EXPECT_SECS,
+            "clap's `5m` and the hook's fallback for a record without one are the same number"
+        );
+        let t =
+            T::try_parse_from(["t", "br9711ewy", "--desc", "test run", "--expect", "2h"]).unwrap();
+        assert_eq!(t.a.expect, std::time::Duration::from_secs(7200));
+        // `0` is "none" in the grammar, and there is no such attendance.
+        let err = T::try_parse_from(["t", "br9711ewy", "--desc", "test run", "--expect", "0"])
+            .expect_err("refused");
+        assert!(
+            err.to_string().contains("--expect"),
+            "names the flag: {err}"
+        );
+        assert!(
+            err.to_string().contains("longer"),
+            "and says what to do: {err}"
+        );
+        let err = T::try_parse_from(["t", "br9711ewy", "--desc", "test run", "--expect", "soon"])
+            .expect_err("refused");
+        assert!(err.to_string().contains("--expect"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn the_record_carries_the_expectation_from_now() {
+        let dir = tempfile::tempdir().unwrap();
+        run(AttendingArgs {
+            expect: std::time::Duration::from_secs(1200),
+            ..ok_args(Some("br9711ewy"), Some("test run"), dir.path())
+        })
+        .await
+        .unwrap();
+        let rec = record(dir.path()).expect("written");
+        let expect = rec.expect.expect("every marker has one");
+        assert_eq!(expect.secs, 1200);
+        let since = time::OffsetDateTime::parse(
+            &expect.since,
+            &time::format_description::well_known::Rfc3339,
+        )
+        .expect("an instant the hook can measure from");
+        assert!(
+            (time::OffsetDateTime::now_utc() - since).abs() < time::Duration::seconds(5),
+            "the clock starts at the attend"
+        );
+    }
+
+    #[test]
+    fn the_confirmation_names_the_bound() {
+        let mut r = rec(Some(41293), true);
+        r.expect = Some(crate::cli::stop_hook::Expectation::starting_now(1200));
+        let line = confirmation(&r);
+        assert!(line.contains("after 20m"), "{line}");
+        assert!(line.contains("checked in on"), "{line}");
+    }
+
+    #[tokio::test]
+    async fn clear_says_what_it_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let clear = || {
+            run(AttendingArgs {
+                clear: true,
+                ..args(None, None, dir.path())
+            })
+        };
+        let agent_dir = dir.path().join(".clank/agents/claude");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let holder = agent_dir.join("attending.holder");
+
+        // A marker only, then a holder only, then both, then neither.
+        run(ok_args(Some("br9711ewy"), Some("test run"), dir.path()))
+            .await
+            .unwrap();
+        clear().await.unwrap();
+        assert!(record(dir.path()).is_none());
+
+        std::fs::write(&holder, "id").unwrap();
+        clear().await.unwrap();
+        assert!(!holder.exists(), "--clear takes the armed check-in with it");
+
+        run(ok_args(Some("br9711ewy"), Some("test run"), dir.path()))
+            .await
+            .unwrap();
+        std::fs::write(&holder, "id").unwrap();
+        clear().await.unwrap();
+        assert!(record(dir.path()).is_none() && !holder.exists());
+
+        clear().await.unwrap();
+
+        use crate::cli::stop_hook::Cleared;
+        let line = |marker, check_in| cleared_line(&Cleared { marker, check_in });
+        assert_eq!(line(false, false), "was not attending anything");
+        assert_eq!(line(true, false), "no longer attending");
+        assert!(line(false, true).contains("check-in is cancelled"));
+        assert!(line(true, true).contains("check-in is cancelled"));
+    }
+
+    #[test]
+    fn duration_arg_is_what_expect_parses_back() {
+        for secs in [1, 59, 60, 90, 300, 3600, 7200, 86_400 * 2] {
+            let arg = duration_arg(secs);
+            assert_eq!(
+                parse_expect(&arg).unwrap(),
+                std::time::Duration::from_secs(secs),
+                "{arg} round-trips"
+            );
+        }
     }
 }

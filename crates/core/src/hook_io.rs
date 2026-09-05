@@ -316,20 +316,26 @@ impl HookInput {
         self.background_tasks.iter().any(|t| !t.is_clank_wait())
     }
 
-    /// How many LIVE background tasks are a `clank run` carrying this
+    /// The LIVE background tasks that are a `clank run` carrying this
     /// description.
     ///
     /// The caller wants exactly one. Zero proves nothing is running.
     /// Two or more means the description cannot tell them apart, and
     /// picking either would be a guess about whether an agent may be
-    /// silenced — so both cases must decline to suppress.
-    pub fn live_clank_run_matches(&self, desc: &str) -> usize {
+    /// silenced — so both cases must decline to suppress. The tasks
+    /// themselves are returned, not a count, because the unique match
+    /// carries the one thing a `clank run` marker cannot: the harness
+    /// task id the agent would need to re-attend it.
+    pub fn live_clank_runs(&self, desc: &str) -> Vec<&BackgroundTask> {
         self.background_tasks
             .iter()
             .filter(|t| t.status.as_deref() != Some("completed"))
-            .filter_map(|t| t.command.as_deref())
-            .filter(|cmd| clank_run_desc(cmd).as_deref() == Some(desc))
-            .count()
+            .filter(|t| {
+                t.command
+                    .as_deref()
+                    .is_some_and(|cmd| clank_run_desc(cmd).as_deref() == Some(desc))
+            })
+            .collect()
     }
 }
 
@@ -658,8 +664,13 @@ mod tests {
         let one = input(serde_json::json!([run(
             "clank run --desc \"test run\" -- cargo test"
         )]));
-        assert_eq!(one.live_clank_run_matches("test run"), 1);
-        assert_eq!(one.live_clank_run_matches("other"), 0);
+        assert_eq!(one.live_clank_runs("test run").len(), 1);
+        assert_eq!(
+            one.live_clank_runs("test run")[0].id.as_deref(),
+            Some("t"),
+            "the unique match carries the harness id the marker cannot"
+        );
+        assert_eq!(one.live_clank_runs("other").len(), 0);
 
         // A finished task is not evidence that anything is running.
         let done = input(serde_json::json!([{
@@ -667,7 +678,7 @@ mod tests {
             "status": "completed",
             "command": "clank run --desc \"test run\" -- cargo test"
         }]));
-        assert_eq!(done.live_clank_run_matches("test run"), 0);
+        assert_eq!(done.live_clank_runs("test run").len(), 0);
 
         // Two live runs sharing a description cannot be told apart, so
         // the caller's "exactly one" rule declines to suppress rather
@@ -676,7 +687,7 @@ mod tests {
             run("clank run --desc \"test run\" -- cargo test"),
             run("clank run --desc \"test run\" -- cargo build"),
         ]));
-        assert_eq!(two.live_clank_run_matches("test run"), 2);
+        assert_eq!(two.live_clank_runs("test run").len(), 2);
     }
 
     #[test]

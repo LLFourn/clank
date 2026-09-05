@@ -32,6 +32,7 @@ use super::{
     AgentAddArgs, AgentArgs, AgentCmd, AgentListArgs, AgentPromoteArgs, AgentRemoveArgs,
     AgentSetReviewArgs, AgentStartArgs, AgentSwapArgs, resolve_repo,
 };
+use crate::shell_quote::shell_quote;
 
 pub async fn run(args: AgentArgs) -> anyhow::Result<()> {
     match args.command {
@@ -819,22 +820,6 @@ fn print_composed(c: &ComposedLaunch) {
             eprintln!("env: {k}={v}");
         }
     }
-}
-
-fn shell_quote(s: &str) -> String {
-    // POSIX single-quote escaping. Closes out for embedded
-    // single quotes via the standard `'\''` dance.
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('\'');
-    for ch in s.chars() {
-        if ch == '\'' {
-            out.push_str("'\\''");
-        } else {
-            out.push(ch);
-        }
-    }
-    out.push('\'');
-    out
 }
 
 /// A fresh agent launch must not INHERIT another agent's identity:

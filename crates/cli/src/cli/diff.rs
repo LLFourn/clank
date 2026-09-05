@@ -19,6 +19,7 @@ use crate::lifecycle::{CommitSha, PlanKey};
 use clank_core::agent_config::LaunchConfig;
 
 use super::DiffArgs;
+use crate::shell_quote::shell_quote;
 
 /// Two semantically-distinct invocation kinds. Each surfaces a
 /// different env-var set and recognizes a different template-var
@@ -385,20 +386,6 @@ fn print_composed(c: &ComposedDiffLaunch) {
         eprintln!("env: {k}={escaped}");
     }
     eprintln!("wait: {}", c.wait);
-}
-
-fn shell_quote(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('\'');
-    for ch in s.chars() {
-        if ch == '\'' {
-            out.push_str("'\\''");
-        } else {
-            out.push(ch);
-        }
-    }
-    out.push('\'');
-    out
 }
 
 #[cfg(unix)]

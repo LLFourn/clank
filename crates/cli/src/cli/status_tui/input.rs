@@ -2714,6 +2714,7 @@ mod tests {
                 attending: attending
                     .contains(&i)
                     .then(|| crate::cli::stop_hook::Attended {
+                        expect: None,
                         task: format!("t{i}"),
                         desc: None,
                         pid: None,

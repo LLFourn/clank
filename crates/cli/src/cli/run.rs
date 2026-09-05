@@ -102,6 +102,11 @@ fn write_run_marker(args: &RunArgs) -> anyhow::Result<std::path::PathBuf> {
     };
 
     let record = crate::cli::stop_hook::Attending {
+        // The clock starts here, the instant before the exec: the
+        // expectation is about the work, and this is its start.
+        expect: Some(crate::cli::stop_hook::Expectation::starting_now(
+            args.expect.as_secs(),
+        )),
         // The description is the correlator. There is no harness task
         // id to record — the tool assigns one only after launching
         // this command, so it cannot exist yet.
@@ -134,7 +139,15 @@ mod tests {
 
     #[test]
     fn a_description_and_a_command_are_both_required() {
-        assert!(T::try_parse_from(["t", "--desc", "test run", "--", "echo", "hi"]).is_ok());
+        let t = T::try_parse_from(["t", "--desc", "test run", "--", "echo", "hi"]).unwrap();
+        assert_eq!(
+            t.a.expect.as_secs(),
+            crate::cli::stop_hook::DEFAULT_EXPECT_SECS,
+            "five minutes unless the caller says otherwise"
+        );
+        let t = T::try_parse_from(["t", "--desc", "test run", "--expect", "45m", "--", "make"])
+            .unwrap();
+        assert_eq!(t.a.expect, std::time::Duration::from_secs(2700));
         // The description is the correlator, so a run without one could
         // never be recognised among the harness's live tasks.
         assert!(
@@ -183,6 +196,7 @@ mod tests {
     fn run_args(desc: &str, cmd: &[&str], repo: &std::path::Path) -> RunArgs {
         RunArgs {
             desc: desc.to_string(),
+            expect: std::time::Duration::from_secs(300),
             author: Some("claude".into()),
             repo: Some(repo.to_path_buf()),
             command: cmd.iter().map(|s| s.to_string()).collect(),
@@ -213,9 +227,21 @@ mod tests {
             "with the identity that makes it usable"
         );
         assert_eq!(rec.correlation, crate::cli::stop_hook::Correlation::RunDesc);
-        assert!(
-            rec.provably_live(&[], 1),
+        assert_eq!(
+            rec.provably_live(&launched("bq1", "test run")).as_deref(),
+            Some("bq1"),
             "so the hook can prove it without the caller supplying anything"
+        );
+        let expect = rec.expect.expect("the expectation rides along");
+        assert_eq!(expect.secs, 300);
+        let since = time::OffsetDateTime::parse(
+            &expect.since,
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap();
+        assert!(
+            (time::OffsetDateTime::now_utc() - since).abs() < time::Duration::seconds(5),
+            "and its clock started at the marker, the instant before the exec"
         );
     }
 
@@ -266,6 +292,7 @@ mod tests {
         let desc = crate::cli::attending::normalise_desc("  test run  ");
         let pid = std::process::id() as i32;
         let rec = crate::cli::stop_hook::Attending {
+            expect: None,
             task: desc.clone(),
             desc: Some(desc),
             pid: Some(pid),
@@ -278,7 +305,24 @@ mod tests {
         // is the whole point of clank supplying the pid rather than
         // asking for it. A task id reading the same does NOT satisfy
         // it: this marker names a description.
-        assert!(rec.provably_live(&[], 1));
-        assert!(!rec.provably_live(&["test run".to_string()], 0));
+        assert!(rec.provably_live(&launched("bq1", "test run")).is_some());
+        let as_id: clank_core::HookInput = serde_json::from_value(serde_json::json!({
+            "session_id": "sess-evidence", "cwd": "/tmp", "stop_hook_active": false,
+            "background_tasks": [{"id": "test run", "command": "sleep 60"}],
+        }))
+        .unwrap();
+        assert!(rec.provably_live(&as_id).is_none());
+    }
+
+    /// The turn as the harness reports it after backgrounding this
+    /// run: the command line it captured, now with an id.
+    fn launched(id: &str, desc: &str) -> clank_core::HookInput {
+        serde_json::from_value(serde_json::json!({
+            "session_id": "sess-evidence", "cwd": "/tmp", "stop_hook_active": false,
+            "background_tasks": [
+                {"id": id, "command": format!("clank run --desc \"{desc}\" -- cargo test")}
+            ],
+        }))
+        .unwrap()
     }
 }

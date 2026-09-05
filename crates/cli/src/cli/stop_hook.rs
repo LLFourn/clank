@@ -177,14 +177,20 @@ async fn compute_outcome_with(
                 // Every path out of here holds a channel: this branch
                 // has just proven a completion wake is outstanding,
                 // and every other one parks.
-                let run_matches = attending
-                    .as_ref()
-                    .filter(|r| r.correlation == Correlation::RunDesc)
-                    .map_or(0, |r| input.live_clank_run_matches(&r.task));
-                if let Some(silence) =
-                    attendance_silence(attending.as_ref(), &live_ids, run_matches, &agent_dir)
-                {
-                    return silence;
+                if let Some(proven) = prove_attendance(attending.as_ref(), &input, &agent_dir) {
+                    // Only a hook that outlives the turn can hold the
+                    // check-in timer. The legacy claude hook is
+                    // synchronous — five minutes inside it would freeze
+                    // the session — so it silences at once, as before.
+                    if !async_loop {
+                        return HookOutcome::Silent {
+                            why: SilentReason::AttendingBackgroundTask,
+                        };
+                    }
+                    return attend(&proven, &agent_dir, poll_deadline(started), || {
+                        proven.rec.work_alive()
+                    })
+                    .await;
                 }
                 match disposition {
                     // A process is live with no `clank wait` watching. Peek (without
@@ -932,9 +938,66 @@ pub(crate) enum Correlation {
     RunDesc,
 }
 
+/// How long the attended work was expected to take, and from when.
+///
+/// The clock starts at the MARKER, not at the turn-end that consumes
+/// it: the expectation is about the work, which `clank run` starts
+/// the instant after writing the marker. `since` is also the
+/// attendance's identity — nanosecond RFC3339, written once, consumed
+/// at most once — which is what the check-in holder file records.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Expectation {
+    pub(crate) since: String,
+    pub(crate) secs: u64,
+}
+
+/// What a marker carries when the caller said nothing. Long enough
+/// for a build, short enough that a hang costs minutes, not an
+/// afternoon.
+pub(crate) const DEFAULT_EXPECT_SECS: u64 = 300;
+
+impl Expectation {
+    pub(crate) fn starting_now(secs: u64) -> Self {
+        Self {
+            since: now_rfc3339(),
+            secs,
+        }
+    }
+
+    fn since(&self) -> Option<time::OffsetDateTime> {
+        time::OffsetDateTime::parse(&self.since, &time::format_description::well_known::Rfc3339)
+            .ok()
+    }
+
+    /// The instant past which the work is overdue. A `since` that
+    /// cannot be parsed counts from `now`: a garbled record earns the
+    /// default wait, never an instant check-in.
+    fn due(&self, now: time::OffsetDateTime) -> time::OffsetDateTime {
+        self.since().unwrap_or(now) + time::Duration::seconds(self.secs as i64)
+    }
+
+    fn elapsed(&self, now: time::OffsetDateTime) -> time::Duration {
+        now - self.since().unwrap_or(now)
+    }
+
+    fn short(&self) -> String {
+        short_duration(time::Duration::seconds(self.secs as i64))
+    }
+}
+
+fn now_rfc3339() -> String {
+    time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_default()
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Attending {
     pub(crate) task: String,
+    /// Absent only on records written before it existed; both writers
+    /// always set it now.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) expect: Option<Expectation>,
     /// Two words for what is being waited on. Absent on records
     /// written before it existed, and on callers that omit it — the
     /// task id is the subject then.
@@ -976,25 +1039,40 @@ impl Attending {
     /// token still holds identifies the process that was attended.
     ///
     /// Anything unverifiable — no pid, no token, legacy record —
-    /// answers `false` and keeps its park. Noise, never silence.
-    /// `run_matches` is how many live background tasks are a
-    /// `clank run` carrying this marker's description. A run owned by
-    /// clank has no harness id to match on — the tool assigns one only
-    /// after launching the command — so the description is its handle,
-    /// and EXACTLY ONE match is required: zero proves nothing, and two
-    /// or more cannot say which is this marker's.
-    pub(crate) fn provably_live(&self, live_ids: &[String], run_matches: usize) -> bool {
-        let (Some(pid), Some(token)) = (self.pid, self.token.as_ref()) else {
-            return false;
-        };
+    /// answers `None` and keeps its park. Noise, never silence.
+    ///
+    /// The proof's product is the harness task id the evidence named,
+    /// because the check-in that follows must be able to say it: a
+    /// `clank run` marker holds only its description (the tool assigns
+    /// an id after launching the command), so the id is learned HERE,
+    /// from the one live run carrying that description — EXACTLY one;
+    /// zero proves nothing and two cannot say which is this marker's
+    /// — and a match the tool listed without an id proves nothing
+    /// either, since it could not be re-attended (codex on 134f354).
+    pub(crate) fn provably_live(&self, input: &HookInput) -> Option<String> {
         // Only the evidence this marker was written for. Accepting
         // either would let each path be satisfied by the other's
         // coincidence.
-        let correlated = match self.correlation {
-            Correlation::TaskId => live_ids.iter().any(|id| id == &self.task),
-            Correlation::RunDesc => run_matches == 1,
+        let task_id = match self.correlation {
+            Correlation::TaskId => input
+                .live_task_ids()
+                .into_iter()
+                .find(|id| id == &self.task)?,
+            Correlation::RunDesc => match input.live_clank_runs(&self.task).as_slice() {
+                [only] => only.id.clone()?,
+                _ => return None,
+            },
         };
-        correlated && pid_is_alive(pid) && token.still_holds(pid)
+        self.work_alive().then_some(task_id)
+    }
+
+    /// Is the recorded process still the process that was recorded?
+    /// `false` for a record that cannot say — no pid, no token.
+    pub(crate) fn work_alive(&self) -> bool {
+        match (self.pid, self.token.as_ref()) {
+            (Some(pid), Some(token)) => pid_is_alive(pid) && token.still_holds(pid),
+            _ => false,
+        }
     }
 }
 
@@ -1012,6 +1090,8 @@ impl Attending {
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Attended {
     pub(crate) task: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) expect: Option<Expectation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) desc: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1162,11 +1242,23 @@ impl Attended {
         })
     }
 
+    /// The WORK's age against its bound — `3m/5m`, and `12m/5m` once
+    /// overdue, which says so without a word. A record without an
+    /// expectation ages from the decision instead, as it always did.
     pub(crate) fn age(&self, now: time::OffsetDateTime) -> Option<String> {
-        let at =
-            time::OffsetDateTime::parse(&self.at, &time::format_description::well_known::Rfc3339)
-                .ok()?;
-        Some(short_duration(now - at))
+        let Some(expect) = self.expect.as_ref() else {
+            let at = time::OffsetDateTime::parse(
+                &self.at,
+                &time::format_description::well_known::Rfc3339,
+            )
+            .ok()?;
+            return Some(short_duration(now - at));
+        };
+        Some(format!(
+            "{}/{}",
+            short_duration(expect.elapsed(now)),
+            expect.short()
+        ))
     }
 }
 
@@ -1223,27 +1315,217 @@ fn consume_attending(agent_dir: &Path) -> Option<Attending> {
 }
 
 /// The attendance decision, taken at hook ENTRY where `live_ids` is
-/// still fresh. `Some` means this turn is silenced and the wake has
-/// been handed to the attended task's completion; `None` means carry
-/// on and park.
+/// still fresh. `Some` means this turn is silenced — the wake is
+/// handed to the attended task's completion, and to the check-in
+/// timer the caller then holds; `None` means carry on and park.
 ///
 /// It lives here, and not at wait-return, because the list handed to
 /// a returning park was snapshotted before the park began and may be
 /// arbitrarily old by then (codex on 81981f2).
-fn attendance_silence(
-    attending: Option<&Attending>,
-    live_ids: &[String],
-    run_matches: usize,
+fn prove_attendance<'a>(
+    attending: Option<&'a Attending>,
+    input: &HookInput,
     agent_dir: &Path,
-) -> Option<HookOutcome> {
+) -> Option<Proven<'a>> {
     let rec = attending?;
-    if !rec.provably_live(live_ids, run_matches) {
-        return None;
-    }
+    let task_id = rec.provably_live(input)?;
     record_attended(agent_dir, rec);
-    Some(HookOutcome::Silent {
-        why: SilentReason::AttendingBackgroundTask,
+    Some(Proven { rec, task_id })
+}
+
+/// A marker the turn's evidence has proven, with what the proof
+/// yielded: the harness task id it names. Required, not displayed —
+/// the check-in's recipe is built from this, so a marker that could
+/// not produce one is never proven.
+struct Proven<'a> {
+    rec: &'a Attending,
+    task_id: String,
+}
+
+// ── the check-in (attending-checks-in-when-the-work-runs-long) ──
+// A completion wake fires when the work COMPLETES. Work that hangs
+// never does, so a silenced turn-end also holds a timer: past the
+// expectation, if the work is still running, wake the agent once and
+// say so. Nothing is signalled — the bound is on the agent's sleep,
+// not the work's life.
+
+/// Names the attendance whose check-in is armed, by its identity
+/// (the marker's `since`). The timer's control file, on the
+/// `wait.holder` pattern: a newer attendance overwrites it, `--clear`
+/// removes it, and an unrelated turn-end leaves it alone — three
+/// states the timer can tell apart, where the `attended` projection
+/// (swept every entry) could not distinguish a clear from cleanup.
+fn holder_path(agent_dir: &Path) -> PathBuf {
+    agent_dir.join("attending.holder")
+}
+
+fn holder_reads(agent_dir: &Path, identity: &str) -> bool {
+    std::fs::read_to_string(holder_path(agent_dir)).is_ok_and(|h| h.trim() == identity)
+}
+
+/// What `clank attending --clear` found and removed.
+pub(crate) struct Cleared {
+    pub(crate) marker: bool,
+    pub(crate) check_in: bool,
+}
+
+/// Withdraw the attendance entirely: the marker for the next turn-end
+/// AND the holder, so an armed check-in timer reads nothing and
+/// yields. Removing only the marker — which the hook consumed at the
+/// turn-end that armed the timer — would cancel nothing (codex on
+/// ddb12fc).
+pub(crate) fn clear_attendance(agent_dir: &Path) -> std::io::Result<Cleared> {
+    let remove = |path: PathBuf| match std::fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    };
+    Ok(Cleared {
+        marker: remove(attending_path(agent_dir))?,
+        check_in: remove(holder_path(agent_dir))?,
     })
+}
+
+/// How often the timer re-asks whether it is still worth waking:
+/// liveness, holder, generation. Each is a `kill(pid, 0)`, a
+/// proc-table read or a small file — nothing spawns.
+const CHECK_IN_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Hold the check-in timer for a PROVEN attendance, and emit its
+/// outcome. Arms the holder, then waits for the earliest of: the work
+/// ending, the holder changing, the generation changing, the ceiling,
+/// or the bound — and only the bound, with the work still live, wakes.
+///
+/// Liveness is injected so the whole composition can be driven under
+/// a paused clock; the holder and generation are read from
+/// `agent_dir` for real, so the three holder transitions are tested
+/// as the file states they are rather than as flags.
+async fn attend(
+    proven: &Proven<'_>,
+    agent_dir: &Path,
+    ceiling: std::time::Instant,
+    mut work_alive: impl FnMut() -> bool,
+) -> HookOutcome {
+    let rec = proven.rec;
+    // A record without an expectation predates the field; it earns
+    // the default from now, and an identity minted now.
+    let expect = rec
+        .expect
+        .clone()
+        .unwrap_or_else(|| Expectation::starting_now(DEFAULT_EXPECT_SECS));
+    if let Err(e) = std::fs::write(holder_path(agent_dir), &expect.since) {
+        return HookOutcome::Diagnostic {
+            message: format!("hook: arming the check-in: {e}"),
+        };
+    }
+    let my_gen = read_generation(agent_dir);
+
+    let now = time::OffsetDateTime::now_utc();
+    let remaining: std::time::Duration = (expect.due(now) - now)
+        .try_into()
+        .unwrap_or(std::time::Duration::ZERO);
+    let due = tokio::time::Instant::now() + remaining;
+
+    let mut armed = || work_alive() && holder_reads(agent_dir, &expect.since);
+    let check_in = || {
+        check_in_reason(
+            rec,
+            &expect,
+            &proven.task_id,
+            time::OffsetDateTime::now_utc(),
+        )
+    };
+    let outcome = tokio::select! {
+        o = check_in_when_due(due, ceiling, &mut armed, check_in) => o,
+        () = generation_changed(agent_dir, my_gen) => {
+            return HookOutcome::Silent {
+                why: SilentReason::StaleGeneration,
+            };
+        }
+    };
+    // Wake guard, as the park has: never emit for a dead incarnation.
+    if read_generation(agent_dir) != my_gen {
+        return HookOutcome::Silent {
+            why: SilentReason::StaleGeneration,
+        };
+    }
+    // The holder is left as it is, on purpose. A compare-then-delete
+    // has a window in which it deletes a NEWER attendance's holder
+    // and silences that timer — the wrong direction. A stale holder
+    // costs nothing: only a live timer ever compares against it.
+    outcome
+}
+
+/// The wait itself. `armed` answers "still worth waking?" and is
+/// asked before every sleep AND once more when the bound arrives —
+/// that last ask is load-bearing: work that ended inside the final
+/// poll interval has a completion wake already in flight, and a
+/// check-in on top of it would be a wake for nothing.
+///
+/// The ceiling yields Silent, not a check-in: expiring there says
+/// nothing about the work, and the completion wake is still
+/// outstanding.
+async fn check_in_when_due(
+    due: tokio::time::Instant,
+    ceiling: std::time::Instant,
+    mut armed: impl FnMut() -> bool,
+    check_in: impl FnOnce() -> String,
+) -> HookOutcome {
+    let waiting = async {
+        loop {
+            if !armed() {
+                return HookOutcome::Silent {
+                    why: SilentReason::AttendingBackgroundTask,
+                };
+            }
+            let now = tokio::time::Instant::now();
+            if now >= due {
+                return HookOutcome::Continue { reason: check_in() };
+            }
+            tokio::time::sleep((due - now).min(CHECK_IN_POLL)).await;
+        }
+    };
+    under_deadline(waiting, ceiling)
+        .await
+        .unwrap_or(HookOutcome::Silent {
+            why: SilentReason::PollDeadline,
+        })
+}
+
+/// The check-in, written for an agent with no context. It must not
+/// read as an error or as work: an agent woken with "X has been
+/// running 12m" and nothing else will go looking for something to
+/// fix. Every value in the recipe is filled in, so it can be pasted.
+fn check_in_reason(
+    rec: &Attending,
+    expect: &Expectation,
+    task_id: &str,
+    now: time::OffsetDateTime,
+) -> String {
+    let subject = rec
+        .desc
+        .as_deref()
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+        .unwrap_or(&rec.task);
+    // Proven means a pid the token still holds, so this is never the
+    // default; it is typed as it is stored.
+    let pid = rec.pid.unwrap_or_default();
+    let recipe = crate::cli::attending::reattend_command(
+        task_id,
+        subject,
+        pid,
+        expect.secs.saturating_mul(2),
+    );
+    format!(
+        "clank: \"{subject}\" (pid {pid}) has been running for {elapsed} — you expected {expected}. \
+         It is still running; nothing has been cancelled and nothing has failed. This is a \
+         check-in, not a task.\n\nLook at its output so far and decide whether it is stuck. If it \
+         just needs longer, re-attend it with a bigger expectation and end your turn:\n\n    \
+         {recipe}\n\nOtherwise end your turn; its completion still wakes you when it ends.",
+        elapsed = short_duration(expect.elapsed(now)),
+        expected = expect.short(),
+    )
 }
 
 /// Leave the decision behind for `clank status`, since the marker
@@ -1256,6 +1538,7 @@ fn record_attended(agent_dir: &Path, rec: &Attending) {
     };
     let entry = Attended {
         task: rec.task.clone(),
+        expect: rec.expect.clone(),
         desc: rec.desc.clone(),
         pid: rec.pid,
         token: rec.token.clone(),
@@ -1303,8 +1586,10 @@ fn outcome_from_wait_output(
                          work ends. `clank attending <task-id> --desc \"two words\" --pid <pid>` \
                          does the same job when you already have a pid; without one clank cannot \
                          prove the work is still running and will refuse, because silencing a \
-                         turn with no provable wake is how an agent goes to sleep for good. Do \
-                         not end your turn to poll it.",
+                         turn with no provable wake is how an agent goes to sleep for good. \
+                         Either takes `--expect 30m` when the work will outlast the five-minute \
+                         default; past that you are checked in on once, and nothing is \
+                         cancelled. Do not end your turn to poll it.",
                         live_ids.join(", "),
                     ));
                 }
@@ -1777,6 +2062,7 @@ mod tests {
     fn write_provable_attending(dir: &Path, task: &str) -> i32 {
         let pid = std::process::id() as i32;
         let rec = Attending {
+            expect: None,
             desc: Some("test run".into()),
             token: crate::proc_identity::token_for(pid),
             task: task.to_string(),
@@ -1790,6 +2076,7 @@ mod tests {
 
     fn write_attending_pid(dir: &Path, task: &str, pid: Option<i32>) {
         let rec = Attending {
+            expect: None,
             desc: None,
             token: None,
             task: task.to_string(),
@@ -1830,7 +2117,48 @@ mod tests {
     /// then judge it against a fresh task list.
     fn entry_outcome(dir: &Path, live: &[String]) -> Option<HookOutcome> {
         let attending = consume_attending(dir);
-        attendance_silence(attending.as_ref(), live, 0, dir)
+        let ids: Vec<&str> = live.iter().map(String::as_str).collect();
+        prove_attendance(attending.as_ref(), &tasks_live(&ids), dir).map(|_| HookOutcome::Silent {
+            why: SilentReason::AttendingBackgroundTask,
+        })
+    }
+
+    /// A turn whose tool reported these background tasks, as
+    /// `(id, command)` — an id of `None` is a task the tool listed
+    /// without one.
+    fn turn_with(tasks: &[(Option<&str>, &str)]) -> HookInput {
+        let tasks: Vec<serde_json::Value> = tasks
+            .iter()
+            .map(|(id, command)| serde_json::json!({"id": id, "command": command}))
+            .collect();
+        serde_json::from_value(serde_json::json!({
+            "session_id": "sess-evidence",
+            "cwd": "/tmp",
+            "stop_hook_active": false,
+            "background_tasks": tasks,
+        }))
+        .unwrap()
+    }
+
+    /// Live tasks by id, none of them a `clank run`.
+    fn tasks_live(ids: &[&str]) -> HookInput {
+        let tasks: Vec<(Option<&str>, &str)> =
+            ids.iter().map(|id| (Some(*id), "sleep 60")).collect();
+        turn_with(&tasks)
+    }
+
+    /// Live `clank run`s, as `(id, desc)`.
+    fn runs_live(runs: &[(Option<&str>, &str)]) -> HookInput {
+        let lines: Vec<String> = runs
+            .iter()
+            .map(|(_, desc)| format!("clank run --desc \"{desc}\" -- cargo test"))
+            .collect();
+        let tasks: Vec<(Option<&str>, &str)> = runs
+            .iter()
+            .zip(&lines)
+            .map(|((id, _), line)| (*id, line.as_str()))
+            .collect();
+        turn_with(&tasks)
     }
 
     fn is_attending_silence(out: &HookOutcome) -> bool {
@@ -1895,58 +2223,67 @@ mod tests {
         let me = std::process::id() as i32;
         let token = crate::proc_identity::token_for(me);
         assert!(token.is_some(), "this platform must answer for its own pid");
-        let live = vec!["task-42".to_string()];
+        let live = tasks_live(&["task-42"]);
 
         let full = Attending {
+            expect: None,
             task: "task-42".into(),
             desc: None,
             pid: Some(me),
             token: token.clone(),
             correlation: Correlation::TaskId,
         };
-        assert!(full.provably_live(&live, 0), "all three signals agree");
+        assert_eq!(
+            full.provably_live(&live).as_deref(),
+            Some("task-42"),
+            "all three signals agree, and the proof names the task"
+        );
 
         // Each signal removed in turn — every one is load-bearing.
         assert!(
-            !full.provably_live(&[], 0),
+            full.provably_live(&tasks_live(&[])).is_none(),
             "not listed live: the completion wake has already been spent"
         );
         assert!(
-            !full.provably_live(&["other".to_string()], 0),
+            full.provably_live(&tasks_live(&["other"])).is_none(),
             "a DIFFERENT task being live says nothing about this one"
         );
         assert!(
-            !Attending {
+            Attending {
                 pid: None,
                 ..full.clone()
             }
-            .provably_live(&live, 0),
+            .provably_live(&live)
+            .is_none(),
             "no pid — the penlock marker's exact shape — cannot prove anything"
         );
         assert!(
-            !Attending {
+            Attending {
                 token: None,
                 ..full.clone()
             }
-            .provably_live(&live, 0),
+            .provably_live(&live)
+            .is_none(),
             "a bare pid is not an identity; pids are reused"
         );
         // A pid that cannot be alive, and a token that no longer holds
         // its pid, are each independently fatal.
         assert!(
-            !Attending {
+            Attending {
                 pid: Some(-1),
                 ..full.clone()
             }
-            .provably_live(&live, 0),
+            .provably_live(&live)
+            .is_none(),
             "an impossible pid is not alive"
         );
         assert!(
-            !Attending {
+            Attending {
                 token: Some(crate::proc_identity::ProcToken::Unrecognised),
                 ..full.clone()
             }
-            .provably_live(&live, 0),
+            .provably_live(&live)
+            .is_none(),
             "an unparseable token never matches, so it never proves"
         );
     }
@@ -1961,6 +2298,7 @@ mod tests {
     fn a_marker_is_only_satisfied_by_the_evidence_it_was_written_for() {
         let me = std::process::id() as i32;
         let base = Attending {
+            expect: None,
             task: "shared-text".into(),
             desc: Some("shared-text".into()),
             pid: Some(me),
@@ -1972,25 +2310,28 @@ mod tests {
             correlation: Correlation::RunDesc,
             ..base
         };
-        let as_id = ["shared-text".to_string()];
+        let as_id = tasks_live(&["shared-text"]);
+        let as_run = runs_live(&[(Some("bq1"), "shared-text")]);
 
         // Each is satisfied by its OWN evidence.
-        assert!(
-            manual.provably_live(&as_id, 0),
+        assert_eq!(
+            manual.provably_live(&as_id).as_deref(),
+            Some("shared-text"),
             "task id satisfies a manual marker"
         );
-        assert!(
-            owned.provably_live(&[], 1),
-            "a live run satisfies an owned marker"
+        assert_eq!(
+            owned.provably_live(&as_run).as_deref(),
+            Some("bq1"),
+            "a live run satisfies an owned marker, and yields the run's id"
         );
 
         // And by nothing else, however exactly the text coincides.
         assert!(
-            !manual.provably_live(&[], 1),
+            manual.provably_live(&as_run).is_none(),
             "a manual marker must NOT be satisfied by a run that shares its text"
         );
         assert!(
-            !owned.provably_live(&as_id, 0),
+            owned.provably_live(&as_id).is_none(),
             "an owned marker must NOT be satisfied by a task id that shares its text"
         );
     }
@@ -2004,6 +2345,7 @@ mod tests {
     fn an_owned_run_correlates_by_exactly_one_description_match() {
         let me = std::process::id() as i32;
         let rec = Attending {
+            expect: None,
             // What `clank run` writes: the description, because no
             // harness id exists when the marker is written.
             task: "test run".into(),
@@ -2013,17 +2355,36 @@ mod tests {
             correlation: Correlation::RunDesc,
         };
 
-        assert!(
-            rec.provably_live(&[], 1),
+        let one = runs_live(&[(Some("bq1"), "test run")]);
+        assert_eq!(
+            rec.provably_live(&one).as_deref(),
+            Some("bq1"),
             "one live run with this description is the proof"
         );
         assert!(
-            !rec.provably_live(&[], 0),
+            rec.provably_live(&runs_live(&[])).is_none(),
             "no live run: nothing shows the work is still going"
         );
         assert!(
-            !rec.provably_live(&[], 2),
+            rec.provably_live(&runs_live(&[
+                (Some("bq1"), "test run"),
+                (Some("bq2"), "test run")
+            ]))
+            .is_none(),
             "two live runs sharing a description is an ambiguity, not a proof"
+        );
+        assert!(
+            rec.provably_live(&runs_live(&[(Some("bq1"), "other")]))
+                .is_none(),
+            "a run with a different description is not this one"
+        );
+        // A match the tool listed WITHOUT an id could never be
+        // re-attended, so the check-in could not name it: not proven,
+        // and the turn parks instead (codex on 134f354).
+        assert!(
+            rec.provably_live(&runs_live(&[(None, "test run")]))
+                .is_none(),
+            "an id-less match proves nothing"
         );
 
         // The id path is unaffected — but it belongs to a marker
@@ -2033,17 +2394,19 @@ mod tests {
                 correlation: Correlation::TaskId,
                 ..rec.clone()
             }
-            .provably_live(&["test run".to_string()], 0)
+            .provably_live(&tasks_live(&["test run"]))
+            .is_some()
         );
 
         // And correlation never substitutes for identity: an
         // unprovable marker stays unprovable however it correlates.
         assert!(
-            !Attending {
+            Attending {
                 token: None,
                 ..rec.clone()
             }
-            .provably_live(&[], 1),
+            .provably_live(&one)
+            .is_none(),
             "correlation is not identity"
         );
     }
@@ -3427,6 +3790,506 @@ mod tests {
         assert!(
             out.contains("  - future_kind: p @ f6feba231685\n"),
             "unknown kind must render via the catchall arm; got:\n{out}"
+        );
+    }
+
+    // ── the check-in (attending-checks-in-when-the-work-runs-long) ──
+
+    /// A proven record for THIS process, expected to take `secs`,
+    /// whose clock started `ago` seconds back on the wall clock.
+    fn expected(ago: i64, secs: u64) -> Attending {
+        let pid = std::process::id() as i32;
+        let since = (time::OffsetDateTime::now_utc() - time::Duration::seconds(ago))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        Attending {
+            expect: Some(Expectation { since, secs }),
+            desc: Some("cargo build".into()),
+            token: crate::proc_identity::token_for(pid),
+            task: "cargo build".into(),
+            pid: Some(pid),
+            correlation: Correlation::RunDesc,
+        }
+    }
+
+    fn far_ceiling() -> std::time::Instant {
+        std::time::Instant::now() + std::time::Duration::from_secs(86_400)
+    }
+
+    fn holder_of(dir: &Path) -> Option<String> {
+        std::fs::read_to_string(holder_path(dir)).ok()
+    }
+
+    /// Drive `attend` with an injected liveness flag, and something to
+    /// do to the agent dir partway through the wait. Returns the
+    /// outcome and how much virtual time the wait took.
+    async fn attend_with(
+        dir: &Path,
+        rec: &Attending,
+        ceiling: std::time::Instant,
+        alive: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        meanwhile: impl FnOnce() + Send + 'static,
+        after: std::time::Duration,
+    ) -> (HookOutcome, std::time::Duration) {
+        let start = tokio::time::Instant::now();
+        let side = tokio::spawn(async move {
+            tokio::time::sleep(after).await;
+            meanwhile();
+        });
+        let proven = Proven {
+            rec,
+            task_id: "bq1x2y3z4".into(),
+        };
+        let out = attend(&proven, dir, ceiling, || {
+            alive.load(std::sync::atomic::Ordering::SeqCst)
+        })
+        .await;
+        side.abort();
+        (out, tokio::time::Instant::now() - start)
+    }
+
+    fn flag(v: bool) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(v))
+    }
+
+    const FIVE_M: std::time::Duration = std::time::Duration::from_secs(300);
+
+    /// The bound is measured from the marker's wall-clock `since`, so
+    /// the virtual wait is five minutes less the sliver of real time
+    /// between writing the record and arming the timer.
+    fn waited_the_bound(took: std::time::Duration) -> bool {
+        took + std::time::Duration::from_secs(1) >= FIVE_M
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_work_ending_before_the_bound_yields_without_a_check_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let rec = expected(0, 300);
+        let alive = flag(true);
+        let a = alive.clone();
+        let (out, took) = attend_with(
+            dir.path(),
+            &rec,
+            far_ceiling(),
+            alive,
+            move || a.store(false, std::sync::atomic::Ordering::SeqCst),
+            std::time::Duration::from_secs(60),
+        )
+        .await;
+        assert!(is_attending_silence(&out), "{out:?}");
+        assert!(
+            took < FIVE_M,
+            "yielded as soon as the work ended, not at the bound"
+        );
+        assert_eq!(
+            holder_of(dir.path()).as_deref(),
+            Some(rec.expect.as_ref().unwrap().since.as_str()),
+            "the holder is left alone on the way out"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_bound_arriving_with_the_work_live_checks_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let rec = expected(0, 300);
+        let (out, took) = attend_with(
+            dir.path(),
+            &rec,
+            far_ceiling(),
+            flag(true),
+            || {},
+            FIVE_M * 10,
+        )
+        .await;
+        let HookOutcome::Continue { reason } = &out else {
+            panic!("the bound wakes: {out:?}");
+        };
+        assert!(
+            waited_the_bound(took),
+            "waited the whole expectation: {took:?}"
+        );
+        let pid = std::process::id();
+        assert!(
+            reason.contains(&format!("\"cargo build\" (pid {pid})")),
+            "{reason}"
+        );
+        assert!(reason.contains("you expected 5m"), "{reason}");
+        assert!(reason.contains("nothing has been cancelled"), "{reason}");
+        assert!(reason.contains("check-in, not a task"), "{reason}");
+        assert!(
+            reason.contains(&format!(
+                "clank attending bq1x2y3z4 --desc 'cargo build' --pid {pid} --expect 10m"
+            )),
+            "a whole, pasteable recipe: {reason}"
+        );
+        assert_eq!(
+            holder_of(dir.path()).as_deref(),
+            Some(rec.expect.as_ref().unwrap().since.as_str()),
+            "firing does not delete the holder either"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_bound_already_past_at_entry_checks_in_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let rec = expected(600, 300);
+        let (out, took) =
+            attend_with(dir.path(), &rec, far_ceiling(), flag(true), || {}, FIVE_M).await;
+        let HookOutcome::Continue { reason } = &out else {
+            panic!("{out:?}");
+        };
+        assert!(
+            took < std::time::Duration::from_secs(1),
+            "no waiting: {took:?}"
+        );
+        assert!(
+            reason.contains("running for 10m — you expected 5m"),
+            "elapsed is the WORK's age, from the marker: {reason}"
+        );
+    }
+
+    /// The final ask is load-bearing: work that ended inside the last
+    /// poll interval has a completion wake in flight already.
+    #[tokio::test(start_paused = true)]
+    async fn work_ending_inside_the_last_poll_interval_is_not_checked_in_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let rec = expected(0, 300);
+        let alive = flag(true);
+        let a = alive.clone();
+        let (out, _) = attend_with(
+            dir.path(),
+            &rec,
+            far_ceiling(),
+            alive,
+            move || a.store(false, std::sync::atomic::Ordering::SeqCst),
+            FIVE_M - std::time::Duration::from_secs(1),
+        )
+        .await;
+        assert!(is_attending_silence(&out), "{out:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_re_attend_supersedes_the_armed_check_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let rec = expected(0, 300);
+        let holder = holder_path(dir.path());
+        let (out, took) = attend_with(
+            dir.path(),
+            &rec,
+            far_ceiling(),
+            flag(true),
+            move || std::fs::write(&holder, "2099-01-01T00:00:00.000000001Z").unwrap(),
+            std::time::Duration::from_secs(60),
+        )
+        .await;
+        assert!(
+            is_attending_silence(&out),
+            "a newer attendance owns the check-in: {out:?}"
+        );
+        assert!(took < FIVE_M);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn clear_cancels_the_armed_check_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let rec = expected(0, 300);
+        // A marker for the NEXT turn-end, which --clear must also take.
+        write_provable_attending(dir.path(), "next");
+        let agent_dir = dir.path().to_path_buf();
+        let cleared = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let c = cleared.clone();
+        let (out, took) = attend_with(
+            dir.path(),
+            &rec,
+            far_ceiling(),
+            flag(true),
+            move || *c.lock().unwrap() = Some(clear_attendance(&agent_dir).unwrap()),
+            std::time::Duration::from_secs(60),
+        )
+        .await;
+        assert!(is_attending_silence(&out), "{out:?}");
+        assert!(took < FIVE_M, "yielded at the clear, not the bound");
+        let cleared = cleared.lock().unwrap().take().expect("the clear ran");
+        assert!(
+            cleared.marker && cleared.check_in,
+            "it found and removed both"
+        );
+        assert!(!attending_path(dir.path()).exists());
+        assert!(holder_of(dir.path()).is_none());
+    }
+
+    /// A turn-end that attended nothing is not a withdrawal: the sweep
+    /// takes the marker and the projection, and the check-in stays.
+    #[tokio::test(start_paused = true)]
+    async fn an_unrelated_turn_end_leaves_the_check_in_armed() {
+        let dir = tempfile::tempdir().unwrap();
+        let rec = expected(0, 300);
+        record_attended(dir.path(), &rec);
+        let agent_dir = dir.path().to_path_buf();
+        let (out, took) = attend_with(
+            dir.path(),
+            &rec,
+            far_ceiling(),
+            flag(true),
+            move || {
+                let _ = consume_attending(&agent_dir);
+                assert!(
+                    read_attended(&agent_dir).is_none(),
+                    "the projection was swept"
+                );
+            },
+            std::time::Duration::from_secs(60),
+        )
+        .await;
+        assert!(
+            matches!(out, HookOutcome::Continue { .. }),
+            "still fires: {out:?}"
+        );
+        assert!(waited_the_bound(took), "{took:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_generation_change_silences_the_timer() {
+        let dir = tempfile::tempdir().unwrap();
+        let rec = expected(0, 300);
+        let agent_dir = dir.path().to_path_buf();
+        let (out, took) = attend_with(
+            dir.path(),
+            &rec,
+            far_ceiling(),
+            flag(true),
+            move || {
+                crate::agent_store::mint_wait_generation(&agent_dir).unwrap();
+            },
+            std::time::Duration::from_secs(60),
+        )
+        .await;
+        assert_eq!(
+            out,
+            HookOutcome::Silent {
+                why: SilentReason::StaleGeneration
+            }
+        );
+        assert!(took < FIVE_M);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_ceiling_yields_silence_never_a_check_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let rec = expected(0, 300);
+        let ceiling = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let (out, took) =
+            attend_with(dir.path(), &rec, ceiling, flag(true), || {}, FIVE_M * 10).await;
+        assert_eq!(
+            out,
+            HookOutcome::Silent {
+                why: SilentReason::PollDeadline
+            }
+        );
+        assert!(took < FIVE_M, "expired at the ceiling: {took:?}");
+    }
+
+    /// A record from before the field: the default expectation, from
+    /// now. Never an instant check-in for a marker that said nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_marker_without_an_expectation_earns_the_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let rec = Attending {
+            expect: None,
+            ..expected(0, 1)
+        };
+        let (out, took) = attend_with(
+            dir.path(),
+            &rec,
+            far_ceiling(),
+            flag(true),
+            || {},
+            FIVE_M * 10,
+        )
+        .await;
+        assert!(matches!(out, HookOutcome::Continue { .. }), "{out:?}");
+        assert!(waited_the_bound(took), "{took:?}");
+        assert!(
+            holder_of(dir.path()).is_some(),
+            "and an identity was minted for it"
+        );
+    }
+
+    /// The recipe is one shell-safe line however the description or
+    /// id reads: user text must arrive as the same letters, not run.
+    #[test]
+    fn the_recipe_is_shell_safe_for_any_description_or_id() {
+        let rec = Attending {
+            desc: Some("say $(rm -rf /) `id` \"hi\" it's".into()),
+            ..expected(0, 300)
+        };
+        let reason = check_in_reason(
+            &rec,
+            rec.expect.as_ref().unwrap(),
+            "b$1",
+            time::OffsetDateTime::now_utc(),
+        );
+        let pid = std::process::id();
+        assert!(
+            reason.contains(&format!(
+                "clank attending 'b$1' --desc 'say $(rm -rf /) `id` \"hi\" it'\\''s' --pid {pid} \
+                 --expect 10m"
+            )),
+            "{reason}"
+        );
+    }
+
+    /// Both hooks that reach the proof: the asyncRewake hook holds the
+    /// timer and — with the bound past — checks in at once, carrying
+    /// the harness id of the run it matched; the synchronous hook
+    /// cannot hold a timer and silences as it always did.
+    async fn proven_run_marker_outcome(async_loop: bool) -> HookOutcome {
+        use crate::cli::teams_config::{AgentDescription, RosterRole};
+        let dir = init_repo();
+        let repo = dir.path();
+        let sess = if async_loop {
+            "sess-run-async"
+        } else {
+            "sess-run-sync"
+        };
+        let label = bind(repo, "claude", sess);
+        crate::agent_store::set_auto_mode(repo, &label, AutoMode::On).unwrap();
+        crate::cli::agent::add_repo_roster_agent(
+            repo,
+            &label,
+            AgentDescription {
+                tool: Tool::Claude,
+                launch: None,
+                initial_prompt: None,
+            },
+            RosterRole::Commit,
+        )
+        .unwrap();
+        crate::cli::agent::set_repo_master(repo, &label).unwrap();
+        let agent_dir = crate::agent_store::agents_root(repo).join("claude");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        // What `clank run` wrote — the description as the task, no
+        // harness id — ten minutes ago, expecting five.
+        let rec = expected(600, 300);
+        std::fs::write(
+            agent_dir.join("attending"),
+            serde_json::to_string(&rec).unwrap(),
+        )
+        .unwrap();
+        let input: HookInput = serde_json::from_value(serde_json::json!({
+            "session_id": sess,
+            "cwd": "/tmp",
+            "stop_hook_active": false,
+            "background_tasks": [
+                {"id": "bq9run", "command": "clank run --desc \"cargo build\" -- cargo build"}
+            ],
+        }))
+        .unwrap();
+        compute_outcome_with(
+            Tool::Claude,
+            Some(repo),
+            input,
+            async_loop,
+            std::time::Instant::now(),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn the_check_in_for_a_run_marker_carries_the_matched_harness_id() {
+        let out = proven_run_marker_outcome(true).await;
+        let HookOutcome::Continue { reason } = &out else {
+            panic!("bound past, work live: {out:?}");
+        };
+        assert!(
+            reason.contains(&format!(
+                "clank attending bq9run --desc 'cargo build' --pid {} --expect 10m",
+                std::process::id()
+            )),
+            "the id the marker could not know, learned at the proof: {reason}"
+        );
+    }
+
+    /// The entry decision for a run the tool listed without an id:
+    /// the marker is consumed, nothing is proven, so nothing is
+    /// recorded and no timer is armed — the turn goes on to park, as
+    /// any unproven attendance does.
+    #[test]
+    fn a_run_match_without_an_id_is_not_proven_and_arms_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let rec = expected(0, 300);
+        std::fs::write(
+            attending_path(dir.path()),
+            serde_json::to_string(&rec).unwrap(),
+        )
+        .unwrap();
+        let attending = consume_attending(dir.path());
+        let turn = runs_live(&[(None, "cargo build")]);
+        assert!(
+            prove_attendance(attending.as_ref(), &turn, dir.path()).is_none(),
+            "a match that cannot be re-attended proves nothing"
+        );
+        assert!(
+            !attending_path(dir.path()).exists(),
+            "consumed all the same"
+        );
+        assert!(read_attended(dir.path()).is_none(), "no decision recorded");
+        assert!(holder_of(dir.path()).is_none(), "no check-in armed");
+        // The same turn WITH the id is the proof, and yields it.
+        let turn = runs_live(&[(Some("bq9run"), "cargo build")]);
+        let proven = prove_attendance(Some(&rec), &turn, dir.path()).expect("proven");
+        assert_eq!(proven.task_id, "bq9run");
+    }
+
+    #[tokio::test]
+    async fn outside_the_async_loop_attendance_silences_at_once() {
+        let out = proven_run_marker_outcome(false).await;
+        assert!(is_attending_silence(&out), "{out:?}");
+    }
+
+    #[test]
+    fn a_marker_without_an_expectation_still_parses() {
+        let rec: Attending = serde_json::from_str(
+            r#"{"task":"t","desc":"test run","pid":1,"correlation":"task_id"}"#,
+        )
+        .unwrap();
+        assert!(rec.expect.is_none());
+        let rec: Attended =
+            serde_json::from_str(r#"{"task":"t","pid":1,"at":"2026-08-20T14:51:09Z"}"#).unwrap();
+        assert!(rec.expect.is_none());
+    }
+
+    #[test]
+    fn the_projection_ages_the_work_against_its_bound() {
+        let now = time::OffsetDateTime::now_utc();
+        let at = |secs_ago: i64| {
+            (now - time::Duration::seconds(secs_ago))
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap()
+        };
+        let mut rec = Attended {
+            task: "t".into(),
+            expect: Some(Expectation {
+                since: at(180),
+                secs: 300,
+            }),
+            desc: None,
+            pid: None,
+            token: None,
+            at: at(10),
+        };
+        assert_eq!(rec.age(now).as_deref(), Some("3m/5m"));
+        rec.expect.as_mut().unwrap().since = at(720);
+        assert_eq!(
+            rec.age(now).as_deref(),
+            Some("12m/5m"),
+            "overdue says so by itself"
+        );
+        rec.expect = None;
+        assert_eq!(
+            rec.age(now).as_deref(),
+            Some("10s"),
+            "without one: from the decision, as before"
         );
     }
 }

@@ -5090,6 +5090,7 @@ mod tests {
         let mut s = two_agent_snap();
         s.plans = vec![plan_state("foo", WaitingOn::MasterToContinue)];
         s.agents[0].attending = Some(crate::cli::stop_hook::Attended {
+            expect: None,
             desc: None,
             token: None,
             task: "b72qah60w".to_string(),
@@ -5116,6 +5117,7 @@ mod tests {
     fn an_ended_wait_renders_no_marker_and_keeps_the_record() {
         let mut s = two_agent_snap();
         s.agents[0].attending = Some(crate::cli::stop_hook::Attended {
+            expect: None,
             desc: None,
             token: None,
             task: "b72qah60w".to_string(),
@@ -5151,6 +5153,7 @@ mod tests {
     fn a_wait_that_cannot_be_checked_is_not_drawn() {
         let mut s = two_agent_snap();
         s.agents[0].attending = Some(crate::cli::stop_hook::Attended {
+            expect: None,
             desc: None,
             token: None,
             task: "b72qah60w".to_string(),
@@ -5166,6 +5169,7 @@ mod tests {
         // so the assertion above is about checkability and not about a
         // snapshot that never drew a marker at all.
         s.agents[0].attending = Some(crate::cli::stop_hook::Attended {
+            expect: None,
             desc: None,
             token: None,
             task: "b72qah60w".to_string(),
@@ -5186,6 +5190,7 @@ mod tests {
     #[test]
     fn the_marker_names_its_subject_description_first_then_the_id() {
         let att = |desc: Option<&str>| crate::cli::stop_hook::Attended {
+            expect: None,
             desc: desc.map(str::to_string),
             token: None,
             task: "b72qah60w".to_string(),
@@ -5235,6 +5240,7 @@ mod tests {
             (None, Some(live), "not-a-timestamp"),
         ] {
             let att = crate::cli::stop_hook::Attended {
+                expect: None,
                 desc: desc.map(str::to_string),
                 token: None,
                 task: "b72qah60w".to_string(),
@@ -5248,6 +5254,27 @@ mod tests {
                 "marker names nothing for desc={desc:?} pid={pid:?} at={at}: {marker}"
             );
         }
+    }
+
+    /// The row's age is the work's, against its bound, through the
+    /// same accessor the status line uses: one form on both surfaces.
+    #[test]
+    fn the_marker_ages_the_work_against_its_bound() {
+        let now = time::OffsetDateTime::now_utc();
+        let since = (now - time::Duration::minutes(3))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        let att = crate::cli::stop_hook::Attended {
+            expect: Some(crate::cli::stop_hook::Expectation { since, secs: 300 }),
+            desc: Some("cargo build".into()),
+            token: None,
+            task: "b72qah60w".to_string(),
+            pid: Some(std::process::id() as i32),
+            at: "2026-08-20T14:51:09Z".to_string(),
+        };
+        let fields = att.marker_fields(now).expect("a live wait is drawn");
+        let marker = fit_marker(&fields, 80).unwrap();
+        assert!(marker.contains("cargo build · 3m/5m"), "{marker}");
     }
 
     /// Fields drop from the RIGHT as the pane narrows — pid, then age
@@ -5323,6 +5350,7 @@ mod tests {
         let mut s = two_agent_snap();
         s.plans = vec![plan_state("foo", WaitingOn::MasterToContinue)];
         s.agents[0].attending = Some(crate::cli::stop_hook::Attended {
+            expect: None,
             desc: None,
             token: None,
             // Nothing to name: the record is live but unnameable.
@@ -5358,6 +5386,7 @@ mod tests {
     fn a_narrow_pane_draws_no_marker_line_at_all() {
         let mut s = two_agent_snap();
         s.agents[0].attending = Some(crate::cli::stop_hook::Attended {
+            expect: None,
             desc: Some("running the whole test suite".to_string()),
             token: None,
             task: "b72qah60w".to_string(),
@@ -5422,6 +5451,7 @@ mod tests {
     fn the_wait_gets_an_indented_line_under_a_flush_agent_row() {
         let mut s = two_agent_snap();
         s.agents[0].attending = Some(crate::cli::stop_hook::Attended {
+            expect: None,
             desc: Some("test run".to_string()),
             token: None,
             task: "b72qah60w".to_string(),
@@ -5458,6 +5488,7 @@ mod tests {
     fn the_wait_page_explains_every_reason_it_cannot_stop_a_process() {
         let att = |pid: Option<i32>, token: Option<crate::proc_identity::ProcToken>| {
             crate::cli::stop_hook::Attended {
+                expect: None,
                 task: "b72qah60w".to_string(),
                 desc: Some("test run".to_string()),
                 pid,
@@ -5512,6 +5543,7 @@ mod tests {
     fn the_kill_confirm_says_what_it_does_not_reach() {
         let me = std::process::id() as i32;
         let att = crate::cli::stop_hook::Attended {
+            expect: None,
             task: "b72qah60w".to_string(),
             desc: Some("test run".to_string()),
             pid: Some(me),
@@ -5556,6 +5588,7 @@ mod tests {
     fn an_attending_row_is_built_to_fit_its_pane() {
         let mut s = two_agent_snap();
         s.agents[0].attending = Some(crate::cli::stop_hook::Attended {
+            expect: None,
             desc: None,
             token: None,
             task: "b72qah60w".to_string(),

@@ -1660,6 +1660,13 @@ pub struct RunArgs {
     /// generate an id for you.
     #[arg(long, value_name = "TEXT")]
     pub desc: String,
+    /// How long you expect this to take (`30s`, `5m`, `1h`; default
+    /// 5m). Not a timeout — nothing is cancelled. If the work is still
+    /// running past it you are woken once with a check-in, so a hang
+    /// cannot hold you asleep for hours.
+    #[arg(long, value_name = "DURATION", default_value = "5m",
+          value_parser = crate::cli::attending::parse_expect)]
+    pub expect: std::time::Duration,
     /// Agent label. Resolved from env when omitted.
     #[arg(long, value_name = "LABEL")]
     pub author: Option<String>,
@@ -1689,7 +1696,15 @@ pub struct AttendingArgs {
     /// is truncated to fit, never rejected.
     #[arg(long, value_name = "TEXT", required_unless_present = "clear")]
     pub desc: Option<String>,
-    /// Forget the recorded task.
+    /// How long you expect this to take (`30s`, `5m`, `1h`; default
+    /// 5m). Not a timeout — nothing is cancelled. If the work is still
+    /// running past it you are woken once with a check-in, so a hang
+    /// cannot hold you asleep for hours. The clock starts now.
+    #[arg(long, value_name = "DURATION", default_value = "5m",
+          value_parser = crate::cli::attending::parse_expect)]
+    pub expect: std::time::Duration,
+    /// Forget the recorded task, and cancel its check-in if one is
+    /// armed.
     #[arg(long)]
     pub clear: bool,
     /// Agent label. Resolved from env when omitted.

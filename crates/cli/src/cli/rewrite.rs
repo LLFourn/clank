@@ -10,6 +10,8 @@
 use std::collections::HashSet;
 use std::path::Path;
 
+use crate::shell_quote::shell_quote;
+
 use clank_core::api::{RewriteCommit, RewriteDisposition};
 use clank_core::ids::CommitSha;
 
@@ -657,22 +659,6 @@ fn print_squash_dry_run(
     println!("# without --dry to materialize the squashed commit.");
 }
 
-/// POSIX-style single-quote escaping for paths that might contain
-/// spaces or shell metacharacters. Operators copy-paste these into
-/// a shell so they need to be safe.
-fn shell_quote(s: &str) -> String {
-    if s.chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-'))
-    {
-        s.to_string()
-    } else {
-        // Wrap in single quotes; escape any existing single quotes
-        // with the standard `'\''` dance.
-        let escaped = s.replace('\'', r"'\''");
-        format!("'{escaped}'")
-    }
-}
-
 /// Walk `plan.steps` in order, producing a new tip SHA. When every
 /// step is `Drop`, the branch should move to `intro_parent` — that's
 /// "plan abandoned mid-flight, leave no trace." When `intro_parent`
@@ -1277,13 +1263,6 @@ mod tests {
             tree_has(dir.path(), "scrubbed", "README.md"),
             "seed file lost from rewritten branch"
         );
-    }
-
-    #[test]
-    fn shell_quote_handles_metachars() {
-        assert_eq!(shell_quote("simple/path.md"), "simple/path.md");
-        assert_eq!(shell_quote("a b.md"), "'a b.md'");
-        assert_eq!(shell_quote("isn't.md"), r"'isn'\''t.md'");
     }
 
     #[tokio::test]

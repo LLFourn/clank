@@ -163,6 +163,10 @@ pub enum Command {
     Unblock(crate::cli::UnblockArgs),
     /// Record the background task you are waiting on, so the Stop hook
     /// stops waking you with work you are already doing
+    ///
+    /// Say how long you expect it to take (`--expect`, default 5m): if
+    /// it is still running past that you are checked in on once, so a
+    /// hang cannot hold you asleep. Nothing is cancelled.
     Attending(crate::cli::AttendingArgs),
     /// Run a command under clank, so it knows exactly when the work ends
     ///
@@ -171,6 +175,8 @@ pub enum Command {
     /// it is attending, then BECOMES the command — same pid, same
     /// stdio, same exit status — so the harness task's lifetime is the
     /// work's lifetime and nothing has to be told when it finished.
+    /// `--expect 30m` says how long it should take; past that you are
+    /// checked in on once, and nothing is cancelled.
     Run(crate::cli::RunArgs),
     /// Read or write clank config values
     Config(crate::cli::ConfigArgs),

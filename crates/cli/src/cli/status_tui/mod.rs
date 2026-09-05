@@ -4453,6 +4453,7 @@ pub(crate) mod tests {
         token: bool,
     ) -> crate::cli::stop_hook::Attended {
         crate::cli::stop_hook::Attended {
+            expect: None,
             task: task.to_string(),
             desc: Some("test run".to_string()),
             pid,
