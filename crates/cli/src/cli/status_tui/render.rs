@@ -1696,7 +1696,14 @@ fn button_block(
     };
     lines.push(row_line(&label_spans, selected, "", cols));
     let indent = "     ";
-    for l in wrap(desc, cols.saturating_sub(indent.len()).max(8)) {
+    // `wrap("")` is one empty line, which under `back` was a blank
+    // row wearing the selection band.
+    let explanation = if desc.is_empty() {
+        Vec::new()
+    } else {
+        wrap(desc, cols.saturating_sub(indent.len()).max(8))
+    };
+    for l in explanation {
         let spans = if danger {
             vec![colored("2;31", format!("{indent}{l}"))]
         } else {
@@ -1933,12 +1940,15 @@ pub(super) fn render_plan_detail(
         cols,
     ));
     out.push(String::new());
+    // Contiguous: a block is its label plus dim explanation lines,
+    // which already sets blocks apart; a blank after each spent a
+    // third of a short pane on nothing.
     for (i, a) in actions.iter().enumerate() {
         let danger = matches!(a, PlanAction::Purge);
         let (key, label, desc) = plan_action_row(*a);
         out.extend(button_block(key, label, desc, danger, i == sel, cols));
-        out.push(String::new());
     }
+    let doc_focused = sel >= super::input::document_focus(actions);
     // The document rule is pushed AFTER the clamp below so its
     // flat-vs-lifted choice keys on the same offset the window uses.
     let chrome = out.len() + 1;
@@ -1963,11 +1973,13 @@ pub(super) fn render_plan_detail(
         .min(body_lines.len().saturating_sub(viewport.max(1)));
     // Lift on scroll (the log's app-bar elevation, reused): flat rule
     // at the document's top; the raised bar the moment lines scroll
-    // under it.
+    // under it. Elevation keys on SCROLL and the key hint on FOCUS —
+    // "content is under the bar" and "you are here" are different
+    // facts, and the rule already carries each its own way.
     out.push(if off > 0 {
-        region_rule_elevated("document", "↓/PgDn scroll", false, cols)
+        region_rule_elevated("document", DOC_HINT, doc_focused, cols)
     } else {
-        region_rule("document", "↓/PgDn scroll", false, cols)
+        region_rule("document", DOC_HINT, doc_focused, cols)
     });
     out.extend(body_lines.into_iter().skip(off).take(viewport));
 
@@ -1975,13 +1987,18 @@ pub(super) fn render_plan_detail(
         out.push(String::new());
     }
     out.truncate(rows.saturating_sub(1));
-    out.push(emit(
-        &[dim("  ↑↓ move · ⏎ select · esc back".to_string())],
-        "",
-        cols,
-    ));
+    let hint = if doc_focused {
+        "  ↑↓ scroll · esc back"
+    } else {
+        "  ↑↓ move · ⏎ select · esc back"
+    };
+    out.push(emit(&[dim(hint.to_string())], "", cols));
     (out, total)
 }
+
+/// The document rule's key hint, drawn only while the document has
+/// focus.
+const DOC_HINT: &str = "↑↓ scroll";
 
 /// The text for one plan-action button: hotkey, label, explanation.
 /// Explanations say what the action DOES — never what a later screen
@@ -2503,9 +2520,10 @@ mod tests {
         // paragraph.)
         let mut scrolled = page(st);
         scrolled.body = Some("line one\n\nline two\n\nline three\n\nline four\n".into());
-        let (top, _) = render_plan_detail(&scrolled, &actions, 0, 24, 90);
+        // Short enough that the body cannot fit under the buttons.
+        let (top, _) = render_plan_detail(&scrolled, &actions, 0, 16, 90);
         scrolled.scroll = 2;
-        let (moved, _) = render_plan_detail(&scrolled, &actions, 0, 24, 90);
+        let (moved, _) = render_plan_detail(&scrolled, &actions, 0, 16, 90);
         let purge_top = top.iter().position(|l| l.contains("purge…")).unwrap();
         let purge_moved = moved.iter().position(|l| l.contains("purge…")).unwrap();
         assert_eq!(purge_top, purge_moved, "buttons pinned while scrolling");
@@ -2532,15 +2550,15 @@ mod tests {
         let mut pp = page(st);
         pp.body = Some("p1\n\np2\n\np3\n\np4\n\np5\n\np6\n\np7\n".into());
         let actions = plan_actions(st);
-        let flat = super::region_rule("document", "↓/PgDn scroll", false, cols);
-        let lifted = super::region_rule_elevated("document", "↓/PgDn scroll", false, cols);
+        let flat = super::region_rule("document", DOC_HINT, false, cols);
+        let lifted = super::region_rule_elevated("document", DOC_HINT, false, cols);
 
-        let (top, _) = render_plan_detail(&pp, &actions, 0, 30, cols);
+        let (top, _) = render_plan_detail(&pp, &actions, 0, 18, cols);
         assert!(top.contains(&flat), "flat rule at the top");
         assert!(!top.contains(&lifted));
 
         pp.scroll = 2;
-        let (moved, _) = render_plan_detail(&pp, &actions, 0, 30, cols);
+        let (moved, _) = render_plan_detail(&pp, &actions, 0, 18, cols);
         assert!(moved.contains(&lifted), "raised bar while scrolled");
         assert!(!moved.contains(&flat));
 
@@ -2555,33 +2573,90 @@ mod tests {
     }
 
     #[test]
-    fn plan_detail_document_lines_are_never_highlighted() {
-        // The read-only-prose guarantee: the document has no cursor and
-        // no Enter target, so no body line ever carries the selection's
-        // reverse-video style — even while scrolled
-        // (plan-page-document-scroll-like-log).
+    fn document_focus_highlights_nothing_and_the_rule_says_where_you_are() {
+        // The document is a FOCUS position, not prose with a cursor:
+        // with focus there, no line on the page — button or body —
+        // carries the reverse band, and the rule carries the key hint
+        // it never showed while a button had focus. Before this the
+        // last button stayed lit for the whole read
+        // (the-plan-page-cursor-enters-the-document).
         let st = crate::cli::status_tui::input::PlanPageState {
             finished: false,
             multi_commit: true,
             repo_paused: false,
         };
+        let cols = 90;
         let mut pp = page(st);
         pp.body = Some("p1\n\np2\n\np3\n\np4\n\np5\n\np6\n\np7\n".into());
-        pp.scroll = 2;
         let actions = plan_actions(st);
-        // Select the LAST button (the position from which the document
-        // is scrolled).
-        let (lines, _) = render_plan_detail(&pp, &actions, actions.len() - 1, 30, 90);
-        let doc_rule = lines
-            .iter()
-            .position(|l| l.contains("DOCUMENT"))
-            .expect("document rule present");
-        for l in &lines[doc_rule + 1..] {
+        let doc = crate::cli::status_tui::input::document_focus(&actions);
+
+        for scroll in [0, 2] {
+            pp.scroll = scroll;
+            let (lines, _) = render_plan_detail(&pp, &actions, doc, 18, cols);
+            for l in &lines {
+                assert!(
+                    !l.contains("\x1b[7m"),
+                    "nothing is selected while the document has focus (scroll {scroll}): {l:?}"
+                );
+            }
+            let rule = lines.iter().find(|l| l.contains("DOCUMENT")).unwrap();
+            let expected = if scroll > 0 {
+                super::region_rule_elevated("document", DOC_HINT, true, cols)
+            } else {
+                super::region_rule("document", DOC_HINT, true, cols)
+            };
+            assert_eq!(rule, &expected, "focused rule carries the hint");
             assert!(
-                !l.contains("\x1b[7m"),
-                "document region must never carry the selection band: {l:?}"
+                lines.last().unwrap().contains("↑↓ scroll · esc back"),
+                "{:?}",
+                lines.last()
             );
         }
+
+        // A button selected: the band is on it and only it, and the
+        // rule is silent.
+        pp.scroll = 2;
+        let (lines, _) = render_plan_detail(&pp, &actions, actions.len() - 1, 18, cols);
+        let banded: Vec<&String> = lines.iter().filter(|l| l.contains("\x1b[7m")).collect();
+        assert_eq!(
+            banded.len(),
+            1,
+            "one band, and no blank row under `back` wearing it: {banded:?}"
+        );
+        assert!(banded[0].contains("back"));
+        assert!(lines.contains(&super::region_rule_elevated(
+            "document", DOC_HINT, false, cols
+        )));
+        assert!(
+            lines.last().unwrap().contains("⏎ select"),
+            "{:?}",
+            lines.last()
+        );
+    }
+
+    #[test]
+    fn plan_detail_buttons_are_contiguous() {
+        let st = crate::cli::status_tui::input::PlanPageState {
+            finished: false,
+            multi_commit: true,
+            repo_paused: false,
+        };
+        let pp = page(st);
+        let actions = plan_actions(st);
+        let (lines, _) = render_plan_detail(&pp, &actions, 0, 40, 90);
+        let first = lines
+            .iter()
+            .position(|l| l.contains("open in browser"))
+            .unwrap();
+        // "feedback" contains "back": find the button by its key.
+        let last = lines.iter().position(|l| l.contains("  esc  ")).unwrap();
+        assert!(last > first + 4, "five buttons span at least five rows");
+        assert!(
+            lines[first..=last].iter().all(|l| !l.trim().is_empty()),
+            "no blank row between the first button and the last: {:?}",
+            &lines[first..=last]
+        );
     }
 
     #[test]
@@ -2598,7 +2673,7 @@ mod tests {
         let mut pp = page(st);
         pp.body = Some("p1\n\np2\n\np3\n\np4\n\np5\n\nfinal-line\n".into());
         let actions = plan_actions(st);
-        let rows = 24;
+        let rows = 16;
         let (top, total) = render_plan_detail(&pp, &actions, 0, rows, 90);
         assert!(
             !top.join("\n").contains("final-line"),

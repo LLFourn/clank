@@ -3120,8 +3120,18 @@ pub(crate) async fn run_tui(
                         }
                     }
                     Mode::PlanDetail { sel } => {
+                        let before = plan_page.as_ref().map(|pp| plan_actions(pp.st));
                         match refetch_plan_page(&repo, &mut plan_page, &snapshot).await {
-                            true => Mode::PlanDetail { sel },
+                            true => {
+                                let after = plan_actions(plan_page.as_ref().expect("kept").st);
+                                Mode::PlanDetail {
+                                    sel: rebind_plan_sel(
+                                        before.as_deref().unwrap_or(&after),
+                                        sel,
+                                        &after,
+                                    ),
+                                }
+                            }
                             false => Mode::LogScroll,
                         }
                     }

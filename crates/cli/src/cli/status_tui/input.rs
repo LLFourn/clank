@@ -317,24 +317,50 @@ pub(super) fn plan_detail_nav(
         return PlanNav::Act(a);
     }
     let page = page as i32;
-    let last = actions.len().saturating_sub(1);
+    let doc = document_focus(actions);
     match key {
-        // Continuous options→document crossing
-        // (plan-page-document-scroll-like-log, mirroring the panel↔log
-        // model): ↓ walks the buttons and then keeps scrolling the
-        // document; ↑ climbs back out through the document's top. The
-        // document region is entered and left only via the LAST button
-        // — the cursor itself never enters the document (read-only
-        // prose, no Enter target).
-        Key::Up if sel == last && scroll > 0 => PlanNav::Scroll(-1),
+        // The options→document crossing mirrors the panel↔log model:
+        // ↓ walks the buttons, then moves FOCUS into the document —
+        // where no button is highlighted and Enter has no target —
+        // and only then scrolls it; ↑ climbs back out through the
+        // document's top. Keeping the cursor on the last button while
+        // the document scrolled left `esc back` lit for the whole
+        // read, with Enter primed to fire it
+        // (the-plan-page-cursor-enters-the-document).
+        Key::Up if sel == doc && scroll > 0 => PlanNav::Scroll(-1),
         Key::Up => PlanNav::Sel(sel.saturating_sub(1)),
-        Key::Down if sel < last => PlanNav::Sel(sel + 1),
+        Key::Down if sel < doc => PlanNav::Sel(sel + 1),
         Key::Down => PlanNav::Scroll(1),
         Key::PageUp => PlanNav::Scroll(-page),
         Key::Space | Key::PageDown => PlanNav::Scroll(page),
         Key::Enter => actions.get(sel).map_or(PlanNav::None, |a| PlanNav::Act(*a)),
         Key::Escape => PlanNav::Back,
         _ => PlanNav::None,
+    }
+}
+
+/// The plan page's cursor position for the DOCUMENT: one past the
+/// last button. A real focus position, like the log is for the panel,
+/// not a button that happens to scroll.
+pub(super) fn document_focus(actions: &[PlanAction]) -> usize {
+    actions.len()
+}
+
+/// Carry the plan-page cursor across a refresh by the ACTION under
+/// it, never its index: the list changes shape when a plan finishes
+/// (`ForceFinish` leaves, `Squash` may arrive), and a clamped index
+/// that was on `ForceFinish` lands on `Purge` — the next Enter would
+/// run a destructive action the operator never saw selected (codex on
+/// 40e5d34). Document focus stays document focus at the new length; a
+/// vanished action falls back to it, the one position with no Enter
+/// target.
+pub(super) fn rebind_plan_sel(before: &[PlanAction], sel: usize, after: &[PlanAction]) -> usize {
+    match before.get(sel) {
+        Some(want) => after
+            .iter()
+            .position(|a| a == want)
+            .unwrap_or_else(|| document_focus(after)),
+        None => document_focus(after),
     }
 }
 
@@ -1857,32 +1883,107 @@ mod tests {
             plan_detail_nav(0, &actions, Key::PageUp, 10, 0),
             PlanNav::Scroll(-10)
         );
-        // ── the options→document crossing (plan-page-document-scroll-like-log) ──
-        // ↓ on the LAST button keeps going: it scrolls the document.
+        // ── the options→document crossing (the-plan-page-cursor-enters-the-document) ──
+        // ↓ on the LAST button moves focus into the document — the
+        // panel's step into the log — and does not scroll yet.
+        let doc = document_focus(&actions);
         assert_eq!(
             plan_detail_nav(last, &actions, Key::Down, 10, 0),
+            PlanNav::Sel(doc)
+        );
+        // With the document focused, ↓ scrolls and keeps scrolling.
+        assert_eq!(
+            plan_detail_nav(doc, &actions, Key::Down, 10, 0),
             PlanNav::Scroll(1)
         );
         assert_eq!(
-            plan_detail_nav(last, &actions, Key::Down, 10, 5),
-            PlanNav::Scroll(1),
-            "keeps scrolling while in the document"
+            plan_detail_nav(doc, &actions, Key::Down, 10, 5),
+            PlanNav::Scroll(1)
         );
         // ↑ climbs back out THROUGH the document's top: unscroll first,
-        // then return to the buttons.
+        // then return to the last button.
         assert_eq!(
-            plan_detail_nav(last, &actions, Key::Up, 10, 3),
+            plan_detail_nav(doc, &actions, Key::Up, 10, 3),
             PlanNav::Scroll(-1)
         );
         assert_eq!(
-            plan_detail_nav(last, &actions, Key::Up, 10, 0),
-            PlanNav::Sel(last - 1),
+            plan_detail_nav(doc, &actions, Key::Up, 10, 0),
+            PlanNav::Sel(last),
             "at the document top, ↑ returns to the buttons"
         );
-        // A scrolled document never hijacks ↑ from a non-last button.
+        // Nothing to select in prose: Enter is a no-op there, so a
+        // stale keypress cannot fire `back`.
+        assert_eq!(
+            plan_detail_nav(doc, &actions, Key::Enter, 10, 4),
+            PlanNav::None
+        );
+        assert_eq!(
+            plan_detail_nav(doc, &actions, Key::Escape, 10, 4),
+            PlanNav::Back,
+            "esc still leaves from the document"
+        );
+        // A scrolled document never hijacks ↑ from a button.
         assert_eq!(
             plan_detail_nav(1, &actions, Key::Up, 10, 5),
             PlanNav::Sel(0)
+        );
+        assert_eq!(
+            plan_detail_nav(last, &actions, Key::Up, 10, 5),
+            PlanNav::Sel(last - 1),
+            "the last button is a button, not the document"
+        );
+    }
+
+    /// The refresh carries the cursor by identity. A plan finishing
+    /// is the shape change that matters: `Stash` and `ForceFinish`
+    /// leave, `Squash` may arrive, and every index after them shifts.
+    #[test]
+    fn plan_sel_rebinds_by_action_across_a_finish() {
+        use PlanAction::*;
+        let active = plan_actions(active_st());
+        let finished = plan_actions(PlanPageState {
+            finished: true,
+            multi_commit: true,
+            repo_paused: false,
+        });
+        assert_eq!(active, vec![OpenHtml, Stash, ForceFinish, Purge, Back]);
+        assert_eq!(finished, vec![OpenHtml, Squash, Purge, Back]);
+        let at = |list: &[PlanAction], a: PlanAction| list.iter().position(|x| *x == a).unwrap();
+
+        // Retained actions keep their identity at the new index.
+        for a in [OpenHtml, Purge, Back] {
+            assert_eq!(
+                rebind_plan_sel(&active, at(&active, a), &finished),
+                at(&finished, a),
+                "{a:?} stays {a:?}"
+            );
+        }
+        // A clamp would have put ForceFinish (2) on Purge (2): the
+        // destructive retargeting this exists to prevent.
+        assert_eq!(
+            rebind_plan_sel(&active, at(&active, ForceFinish), &finished),
+            document_focus(&finished),
+            "a vanished action falls back to the document, where Enter does nothing"
+        );
+        assert_eq!(
+            rebind_plan_sel(&active, at(&active, Stash), &finished),
+            document_focus(&finished)
+        );
+        // Document focus survives both shrink and growth, at the new
+        // length each way.
+        assert_eq!(
+            rebind_plan_sel(&active, document_focus(&active), &finished),
+            document_focus(&finished)
+        );
+        assert_eq!(
+            rebind_plan_sel(&finished, document_focus(&finished), &active),
+            document_focus(&active)
+        );
+        // An index past the document (never produced, but a refresh
+        // must not trust one) lands on the document too.
+        assert_eq!(
+            rebind_plan_sel(&active, 99, &finished),
+            document_focus(&finished)
         );
     }
 
