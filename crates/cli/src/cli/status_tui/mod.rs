@@ -1447,6 +1447,38 @@ struct Batch {
     )>,
 }
 
+/// What one event arriving BEHIND an overlay owes the page beneath.
+///
+/// The overlay answers the event itself — re-fetching its commit or
+/// document on a refresh, scrolling on a key — and then `continue`s
+/// past the loop bottom where the main page's refresh flush and log
+/// fill live. So the flags those need are raised from here, or never:
+/// a refresh consumed by an overlay used to leave the main page
+/// painting the snapshot from before the overlay opened until the
+/// NEXT watcher wake, which on a quiet repo is a restart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct BehindOverlay {
+    /// Flag the coalesced snapshot rebuild for the first pass after
+    /// the overlay closes.
+    refresh: bool,
+    /// Top up the log viewport, as a resize on the main page would.
+    fill: bool,
+}
+
+fn behind_overlay(ev: &Ev) -> BehindOverlay {
+    match ev {
+        Ev::Refresh => BehindOverlay {
+            refresh: true,
+            fill: false,
+        },
+        Ev::Resize => BehindOverlay {
+            refresh: false,
+            fill: true,
+        },
+        Ev::Stdin(_) | Ev::Content { .. } | Ev::Worker => BehindOverlay::default(),
+    }
+}
+
 /// Fold a drained event burst into a [`Batch`]. Stdin chunks are
 /// CONCATENATED — a CSI sequence split across two 16-byte reads
 /// reassembles here before parsing. Pure → unit-tested (the
@@ -1658,7 +1690,22 @@ pub(crate) async fn run_tui(
                 OverlayData::Error { .. } => None,
             };
             paint(&lines);
-            match ev_rx.recv_timeout(Duration::from_secs(60)) {
+            let ev = ev_rx.recv_timeout(Duration::from_secs(60));
+            // The page beneath is hidden, not gone: what a wake means
+            // for it is decided once, here, and carried out of this
+            // loop — the flush at the loop bottom is never reached
+            // while an overlay is open, so a flag not raised here is a
+            // wake lost for good (an-overlay-does-not-eat-the-refresh).
+            if let Ok(ev) = &ev {
+                let step = behind_overlay(ev);
+                if step.refresh {
+                    refresh_pending = true;
+                }
+                if step.fill {
+                    log.request_fill();
+                }
+            }
+            match ev {
                 // The page is behind this overlay, not gone: applying
                 // here keeps a completion that arrives mid-overlay
                 // instead of stranding the slot on Loading.
@@ -1735,7 +1782,8 @@ pub(crate) async fn run_tui(
                     }
                 }
                 // The overlay hides the notice row; the answer is
-                // drained and painted once the overlay closes.
+                // drained and painted once the overlay closes. Resize
+                // was noted above.
                 Ok(Ev::Resize) | Ok(Ev::Worker) => {}
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -3686,6 +3734,31 @@ pub(crate) mod tests {
         assert_eq!(mode, Mode::AgentDetail { idx: 1, sel: 0 });
         let after = std::fs::read_to_string(repo.path().join(".clank/config.json")).unwrap();
         assert_eq!(before, after, "a reopen is not a roster write");
+    }
+
+    /// A wake behind an overlay must still reach the page beneath:
+    /// the refresh flag for the flush the overlay loop skips, the fill
+    /// for a resize. Keys, worker wakes and body fetches owe it
+    /// nothing (an-overlay-does-not-eat-the-refresh).
+    #[test]
+    fn a_wake_behind_an_overlay_is_carried_to_the_page_beneath() {
+        assert_eq!(
+            behind_overlay(&Ev::Refresh),
+            BehindOverlay {
+                refresh: true,
+                fill: false
+            }
+        );
+        assert_eq!(
+            behind_overlay(&Ev::Resize),
+            BehindOverlay {
+                refresh: false,
+                fill: true
+            }
+        );
+        for quiet in [Ev::Stdin(b"j".to_vec()), Ev::Worker] {
+            assert_eq!(behind_overlay(&quiet), BehindOverlay::default());
+        }
     }
 
     #[test]
