@@ -289,7 +289,9 @@ pub(super) fn verb_of(w: &WaitingOn) -> &'static str {
         WaitingOn::GateReviewersMissing { .. } => "gate-reviewing",
         WaitingOn::MasterToRevise { .. } => "revising",
         WaitingOn::MasterToContinue => "working",
-        WaitingOn::MasterToCommit => "committing",
+        // Derived from a dirty plan body, not from any sight of a
+        // commit beginning: name the state, not an action nobody saw.
+        WaitingOn::MasterToCommit => "drafting",
         WaitingOn::MasterToFinalize => "finalizing",
         WaitingOn::MasterToFixCommitTag => "fixing tag",
         WaitingOn::Blocked { .. } => "blocked",
@@ -660,5 +662,16 @@ mod tests {
             AttentionState::Blocked,
             "a human block outranks the tag correction"
         );
+    }
+
+    /// Every verb names the STATE the master is in, never an action
+    /// clank cannot see. `MasterToCommit` is reached by editing the
+    /// plan file, so it is "drafting" — "committing" claimed to have
+    /// watched a commit start (a-dirty-plan-is-drafting-not-committing).
+    #[test]
+    fn a_dirty_plan_body_reads_as_drafting() {
+        assert_eq!(verb_of(&WaitingOn::MasterToCommit), "drafting");
+        assert_eq!(verb_of(&WaitingOn::MasterToContinue), "working");
+        assert_eq!(verb_of(&WaitingOn::MasterToFinalize), "finalizing");
     }
 }

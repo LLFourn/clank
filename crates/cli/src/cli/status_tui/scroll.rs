@@ -19,7 +19,7 @@ pub(super) enum InProgress {
     /// wait-text ("reviewing" / "gate-reviewing").
     PendingReview { label: String, verb: &'static str },
     /// Master is producing the next commit — master's panel row spins.
-    /// `verb` says which (working/revising/committing/finalizing) via
+    /// `verb` says which (working/revising/drafting/finalizing) via
     /// [`verb_of`].
     MasterWorking { name: String, verb: &'static str },
 }
@@ -46,7 +46,7 @@ pub(super) fn spinner_glyph(frame: usize) -> &'static str {
 /// the reviewer ("gate-reviewing"); anything else is "reviewing".
 ///
 /// MASTER's row keeps the single-active-plan derivation — its verbs
-/// (working/revising/committing/finalizing via [`verb_of`]) are
+/// (working/revising/drafting/finalizing via [`verb_of`]) are
 /// defined by plan states alone. Excluded: `Blocked` (a human's
 /// turn, shown by the block ask) and `MasterToFixCommitTag`
 /// (surfaced by the `fix` gauge). The match is exhaustive (no
