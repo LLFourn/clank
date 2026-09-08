@@ -109,7 +109,12 @@ This is the step that makes the agents exist. It needs
 [zellij](https://zellij.dev): outside a session it starts one for the
 repo; inside one it adds a tab. Either way the master sits on the
 stage with the reviewers stacked beside it, and each pane is a real
-agent CLI started in this repo.
+agent CLI started in this repo. The arrangement is a layout composed
+from the roster: when the roster changes — an agent added, removed or
+promoted — the running `clank status --tui` applies the recomposed
+layout to the live tab (zellij 0.45's `override-layout`), so alt+[ /
+alt+] flip the CURRENT roster's arrangement, not the one from when
+the session was opened.
 
 (`clank agent start <label>` launches ONE agent — resuming its session
 if it has one, or bootstrapping it with a seed prompt to bind if it

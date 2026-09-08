@@ -110,27 +110,35 @@ fn rename_pane(id: &str, name: &str) {
 /// never race the reconciler's role stamps (codex ff9579f).
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct StatusGlyphs {
-    /// label → (emoji as master, emoji as reviewer).
-    emoji: std::collections::BTreeMap<String, (&'static str, &'static str)>,
+    /// label → the title its pane should carry: status glyph plus
+    /// `<label> (<role>)`, the role being the ROSTER's. The pane's own
+    /// title used to supply the role, which made titles a second
+    /// source of truth for who is master — stamped by one path, parsed
+    /// by another, and wrong after a stale swap re-applied
+    /// (placement-is-a-layout-applied-not-panes-shuffled).
+    titles: std::collections::BTreeMap<String, String>,
 }
 
 impl StatusGlyphs {
     pub(super) fn of(snap: &StatusSnapshot) -> Self {
         use clank_core::vocab::Role;
-        let emoji = snap
+        let titles = snap
             .agents
             .iter()
             .map(|a| {
+                let role = if snap.master.as_deref() == Some(a.label.as_str()) {
+                    Role::Master
+                } else {
+                    Role::Reviewer
+                };
+                let emoji = agent_status_emoji(snap, &a.label, role);
                 (
                     a.label.clone(),
-                    (
-                        agent_status_emoji(snap, &a.label, Role::Master),
-                        agent_status_emoji(snap, &a.label, Role::Reviewer),
-                    ),
+                    format!("{emoji} {}", agent_pane_title(&a.label, role.as_str())),
                 )
             })
             .collect();
-        Self { emoji }
+        Self { titles }
     }
 }
 
@@ -144,12 +152,12 @@ pub(super) struct PaneStatus {
     /// Pane id → last title rendered. Dedup: rename a pane only when
     /// its desired title changes.
     last: std::collections::HashMap<String, String>,
-    /// `(pane_id, label, role)` from the batch's listing — the one the
+    /// `(pane_id, label)` from the batch's listing — the one the
     /// batch takes per REFRESH, never per render (status-tui-watch-cpu
     /// Fix 3: a per-render subprocess loaded the zellij server; a
     /// refresh is throttled and event-driven, and presence rides on
     /// the same listing).
-    panes: Vec<(String, String, clank_core::vocab::Role)>,
+    panes: Vec<(String, String)>,
 }
 
 impl PaneStatus {
@@ -179,7 +187,7 @@ impl PaneStatus {
     fn update_with(
         &mut self,
         glyphs: &StatusGlyphs,
-        fresh: Option<Vec<(String, String, clank_core::vocab::Role)>>,
+        fresh: Option<Vec<(String, String)>>,
         mut rename: impl FnMut(&str, &str),
     ) {
         if let Some(panes) = fresh {
@@ -189,19 +197,14 @@ impl PaneStatus {
         // borrow), then apply — keeps `self.panes` and `self.last`
         // borrows disjoint.
         let mut renames: Vec<(String, String)> = Vec::new();
-        for (id, label, role) in &self.panes {
+        for (id, label) in &self.panes {
             // A cached pane whose label the roster no longer knows gets
-            // no glyph — leave it; the reconciler owns its fate.
-            let Some((master, reviewer)) = glyphs.emoji.get(label) else {
+            // no title — leave it; the reconciler owns its fate.
+            let Some(title) = glyphs.titles.get(label) else {
                 continue;
             };
-            let emoji = match role {
-                clank_core::vocab::Role::Master => master,
-                clank_core::vocab::Role::Reviewer => reviewer,
-            };
-            let title = format!("{emoji} {}", agent_pane_title(label, role.as_str()));
             if self.last.get(id).map(String::as_str) != Some(title.as_str()) {
-                renames.push((id.clone(), title));
+                renames.push((id.clone(), title.clone()));
             }
         }
         for (id, title) in renames {
@@ -223,13 +226,13 @@ impl PaneStatus {
 /// or TUI start, not instantly.
 pub(super) struct PaneReconciler {
     converged: Option<RosterView>,
-    /// Consecutive failed placement repairs for `failing`. Three of the
-    /// four ways placement can fail cannot be fixed by trying again —
-    /// reviewers split across tabs, the instrument pane already inside
-    /// the stack (zellij has no `break-pane`), and a `stack-panes` the
-    /// server silently rejected. Retrying those forever is what turned
-    /// a wrong verdict into permanent focus churn, so repair is bounded
-    /// independently of whether the predicate is right
+    /// Consecutive passes for `failing` that did not verify. Any step
+    /// — an add, a close, the override, the read-back — can fail in a
+    /// way retrying does not fix (reviewers split across tabs, a
+    /// server that refuses the layout), and retrying every refresh is
+    /// what turned a wrong verdict into permanent focus churn. So the
+    /// whole transaction is bounded, independently of whether the
+    /// read-back's verdict is right
     /// (placement-reads-zellij-stacks-correctly).
     failed_repairs: u32,
     failing: Option<RosterView>,
@@ -328,10 +331,10 @@ impl ReopenOutcome {
 /// What one reconcile pass must do: open panes for roster members with
 /// none, close panes whose label left the roster (closing kills the
 /// pane's process tree — that is what guarantees the agent exits), and
-/// re-layout on a master change. `live` is `(label, master_titled)`
-/// pairs from the actual panes; the stage's CURRENT owner comes from
-/// the titles, so a master swap done while no TUI was running is still
-/// detected on startup (codex a730882 concern 2). Pure.
+/// re-layout on a master change. `live` is `(label, staged)` pairs
+/// from the actual panes; the stage's CURRENT owner comes from the
+/// listing's geometry, so a master swap done while no TUI was running
+/// is still detected on startup (codex a730882 concern 2). Pure.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct PanePlan {
     pub(super) add: Vec<String>,
@@ -340,11 +343,9 @@ pub(super) struct PanePlan {
     /// labels (a two-TUI race can double-open; each `remove` closes
     /// one matching pane).
     pub(super) remove: Vec<String>,
-    /// `(new_master, live_titled_master_if_any)` whenever the pane
-    /// TITLED master is not the roster master — including when nothing
-    /// is (a staged team replacement) and when the old one is leaving
-    /// the roster (it stays the relocation source; its removal runs
-    /// after the layout).
+    /// `(new_master, staged_pane_if_any)` whenever the pane on the
+    /// STAGE is not the roster master — including when nothing is (a
+    /// staged team replacement). Read from geometry, never titles.
     pub(super) relocate: Option<(String, Option<String>)>,
 }
 
@@ -376,14 +377,10 @@ pub(super) fn plan_panes(cur: &RosterView, live: &[(String, bool)]) -> PanePlan 
         };
         remove.extend(std::iter::repeat_n(label.to_string(), excess));
     }
-    // The stage invariant: EXACTLY one master-titled pane, and it is
-    // the roster master. Any stale titled pane (even alongside a
-    // correctly-titled master — a partial rename can leave two) forces
-    // a relocation that stages the roster master and demotes the first
-    // stale claimant; a titled pane whose label is LEAVING the roster
-    // still sources the demotion (its pane lives until the removes,
-    // which run after the layout). A roster master that is missing,
-    // reviewer-titled, or unopened is staged with no demotion source.
+    // The stage invariant: the pane on the stage is the roster master.
+    // Any other pane there — including one whose label is leaving —
+    // means a re-layout; a roster master that is missing, in the
+    // stack, or unopened is staged with no stale occupant to name.
     let titled: Vec<&str> = live
         .iter()
         .filter(|(_, titled)| *titled)
@@ -419,52 +416,44 @@ pub(super) trait PaneIo {
     type Snap;
     fn snapshot(&mut self) -> Option<Self::Snap>;
     fn pairs(&mut self, snap: &Self::Snap) -> Vec<(String, bool)>;
-    /// Post-action ground truth for convergence: the label/role pairs
+    /// Post-action ground truth for convergence: the label/stage pairs
     /// AND whether the reviewers are correctly placed, from ONE read.
-    /// Both, because a pass that only removed or relocated still has
-    /// to answer for placement — checking labels alone lets an
-    /// unstacked tab be cached (codex on d5121e1) — and splitting
-    /// them would cost a second session-wide listing.
+    /// Both, because a pass that only removed still has to answer for
+    /// placement — checking labels alone lets an unstacked tab be
+    /// cached (codex on d5121e1) — and splitting them would cost a
+    /// second session-wide listing.
     fn verify(&mut self, reviewers: &[String]) -> Option<(Vec<(String, bool)>, bool)>;
     /// The pane to restore focus to after the pass. Takes the pass's
     /// listing so the target costs no session-wide query of its own.
     fn capture_focus(&mut self, snap: &Self::Snap) -> Option<String>;
     fn restore_focus(&mut self, id: &str);
-    /// Create the pane; reports the id when one was made, plus any
-    /// reviewer pane found by TITLE that anchored it. The caller
-    /// accumulates both and stacks the whole set once via
-    /// [`Self::stack`] — a title-found anchor has no launch command to
-    /// be named by, so `stack` cannot rediscover it.
-    fn add(
-        &mut self,
-        label: &str,
-        other_reviewers: &[String],
-        departing: &[String],
-        snap: &Self::Snap,
-    ) -> crate::cli::open_zellij::ReviewerPaneAdd;
-    /// Put this repo's reviewer panes, plus `extra_ids` created this
-    /// pass, into one stack. Returns whether they ARE stacked
-    /// afterwards — read back, not assumed.
-    fn stack(&mut self, reviewers: &[String], snap: &Self::Snap, extra_ids: &[String]) -> bool;
+    /// Open the pane for `label` in the repo's tab, running its launch
+    /// command; reports the id when one was made. Where it lands is
+    /// the layout's business, applied afterwards.
+    fn add(&mut self, label: &str, snap: &Self::Snap) -> Option<String>;
     /// Whether the reviewers are ALREADY stacked in `snap`. Presence
     /// of every label does not imply correct placement, so the
-    /// converged path consults this before caching.
+    /// converged path consults this before caching — and before
+    /// re-laying a tab that is already right.
     fn is_placed(&mut self, reviewers: &[String], snap: &Self::Snap) -> bool;
-    fn relocate(
-        &mut self,
-        new_master: &str,
-        old_master: Option<&str>,
-        roster: &[String],
-        snap: &Self::Snap,
-    );
+    /// The tab layout for `master` and `reviewers` AS RUNNING — the
+    /// composition `clank open` launches from, at the tab's current
+    /// orientation, with the user's template if one is configured.
+    /// `None` when it cannot be composed (no tab of the repo's in the
+    /// listing, a template that no longer parses).
+    fn compose(&mut self, master: &str, reviewers: &[String], snap: &Self::Snap) -> Option<String>;
+    /// Apply `kdl` to the repo's tab in place. Whether it was
+    /// accepted; placement is read back, never assumed.
+    fn override_layout(&mut self, kdl: &str, snap: &Self::Snap) -> bool;
     fn remove_all(&mut self, labels: &[String], snap: &Self::Snap);
     /// The labels whose pane's PROCESS is still running. `pairs` counts
     /// an exited pane as its label's — identity, so a corpse can be
     /// closed — and this is the other question: is the agent open.
     fn live_labels(&mut self, snap: &Self::Snap) -> std::collections::BTreeSet<String>;
-    /// `(pane id, label, role)` for every pane TITLED as an agent's —
-    /// the retitler's map, read off the same listing presence uses.
-    fn title_rows(&mut self, snap: &Self::Snap) -> Vec<(String, String, clank_core::vocab::Role)>;
+    /// `(pane id, label)` for every pane running one of this repo's
+    /// agents — the retitler's map, read off the same listing presence
+    /// uses. The ROLE is the roster's, not the pane's.
+    fn title_rows(&mut self, snap: &Self::Snap) -> Vec<(String, String)>;
     /// Whether THIS process may drive pane reconciliation for the repo.
     ///
     /// Exactly one may, at a time — the same shape as the ingest lease
@@ -481,8 +470,8 @@ pub(super) trait PaneIo {
     /// with `already has an active writer`, leaving a corpse that the
     /// listing still counts as that label's pane.
     ///
-    /// Scoped to RECONCILE: structural pane work (create, stack,
-    /// relocate, close) and convergence caching. The RETITLE pass is
+    /// Scoped to RECONCILE: structural pane work (create, re-layout,
+    /// close) and convergence caching. The RETITLE pass is
     /// deliberately outside the lease — pane titles are SESSION-local,
     /// so a loser in a different zellij session never receives the
     /// holder's stamps and must apply its own; within one session the
@@ -576,37 +565,30 @@ impl PaneIo for ZellijPaneIo<'_> {
     fn restore_focus(&mut self, id: &str) {
         crate::cli::open_zellij::focus_pane(id);
     }
-    fn add(
-        &mut self,
-        label: &str,
-        other_reviewers: &[String],
-        departing: &[String],
-        snap: &Self::Snap,
-    ) -> crate::cli::open_zellij::ReviewerPaneAdd {
-        crate::cli::open_zellij::add_reviewer_pane(
-            self.repo,
-            label,
-            other_reviewers,
-            departing,
-            snap,
-        )
-    }
-    fn stack(&mut self, reviewers: &[String], snap: &Self::Snap, extra_ids: &[String]) -> bool {
-        crate::cli::open_zellij::stack_reviewer_panes(self.repo, reviewers, snap, extra_ids)
+    fn add(&mut self, label: &str, snap: &Self::Snap) -> Option<String> {
+        crate::cli::open_zellij::open_agent_pane(self.repo, label, snap)
     }
     fn is_placed(&mut self, reviewers: &[String], snap: &Self::Snap) -> bool {
         crate::cli::open_zellij::reviewers_are_stacked(snap, self.repo, reviewers)
     }
-    fn relocate(
-        &mut self,
-        new_master: &str,
-        old_master: Option<&str>,
-        roster: &[String],
-        snap: &Self::Snap,
-    ) {
-        crate::cli::open_zellij::relocate_for_promote(
-            self.repo, new_master, old_master, roster, snap,
-        );
+    fn compose(&mut self, master: &str, reviewers: &[String], snap: &Self::Snap) -> Option<String> {
+        let tab = crate::cli::open_zellij::repo_tab_id(snap, self.repo)?;
+        let orientation = crate::cli::open_zellij::tab_orientation(snap, self.repo, tab);
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        crate::cli::open_zellij::compose_live_layout(
+            self.repo,
+            home.as_deref(),
+            master,
+            reviewers,
+            orientation,
+        )
+        .ok()
+    }
+    fn override_layout(&mut self, kdl: &str, snap: &Self::Snap) -> bool {
+        let Some(tab) = crate::cli::open_zellij::repo_tab_id(snap, self.repo) else {
+            return false;
+        };
+        crate::cli::open_zellij::override_tab_layout(self.repo, tab, kdl)
     }
     fn remove_all(&mut self, labels: &[String], snap: &Self::Snap) {
         crate::cli::open_zellij::remove_reviewer_panes(self.repo, labels, snap);
@@ -614,8 +596,8 @@ impl PaneIo for ZellijPaneIo<'_> {
     fn live_labels(&mut self, snap: &Self::Snap) -> std::collections::BTreeSet<String> {
         crate::cli::open_zellij::live_agent_labels(snap, self.repo)
     }
-    fn title_rows(&mut self, snap: &Self::Snap) -> Vec<(String, String, clank_core::vocab::Role)> {
-        crate::cli::open_zellij::titled_agent_panes(snap)
+    fn title_rows(&mut self, snap: &Self::Snap) -> Vec<(String, String)> {
+        crate::cli::open_zellij::agent_panes_by_command(snap, self.repo)
     }
 }
 
@@ -638,9 +620,9 @@ impl PaneReconciler {
     /// the moment a listing shows it, and ages out otherwise — see
     /// [`PENDING_CREATE_PASSES`] for why it must.
     ///
-    /// Believed panes are reported NOT master-titled: the relocation
-    /// that stamps the title runs after the adds, so `false` is what a
-    /// listing would say about a pane created this pass.
+    /// Believed panes are reported NOT staged: the layout that places
+    /// them runs after the adds, so `false` is what a listing would say
+    /// about a pane created this pass.
     fn believe_pending(&mut self, live: &[(String, bool)]) -> Vec<(String, bool)> {
         self.confirm_listed(live);
         self.pending.retain(|_, left| {
@@ -664,11 +646,6 @@ impl PaneReconciler {
             .retain(|label, _| !listed.iter().any(|(l, _)| l == label));
     }
 
-    /// One reconciliation pass for `cur`, skipped when that exact view
-    /// was already VERIFIED converged. Cheap in the steady state: one
-    /// set comparison, no zellij calls. Runs on the [`ReconcileWorker`]
-    /// thread, never the TUI loop (tui-reconcile-off-loop). Returns
-    /// whether the pass issued actions.
     /// Record a failing pass for `cur`; `true` once the budget is
     /// spent and the tab should be left alone. Counted PER ROSTER: a
     /// roster change both invalidates the count and can make the
@@ -688,6 +665,21 @@ impl PaneReconciler {
         self.failing = None;
     }
 
+    /// One reconciliation pass for `cur`, skipped when that exact view
+    /// was already VERIFIED converged. Cheap in the steady state: one
+    /// set comparison, no zellij calls. Runs on the [`ReconcileWorker`]
+    /// thread, never the TUI loop (tui-reconcile-off-loop). Returns
+    /// whether the pass issued actions.
+    ///
+    /// Membership, then the layout, then the read-back: what the
+    /// roster says exists is opened or closed, and the arrangement is
+    /// the layout composed from the roster as running — the same
+    /// function `clank open` launches from, applied in place. Pane
+    /// shuffling with `stack-panes` and `move-pane` used to do the
+    /// arranging while zellij kept the swap variants written at open,
+    /// and every roster change made the two disagree: alt+[ after a
+    /// promotion put the OLD master back on the stage
+    /// (placement-is-a-layout-applied-not-panes-shuffled).
     fn reconcile(&mut self, cur: RosterView, io: &mut impl PaneIo) -> bool {
         if self.converged.as_ref() == Some(&cur) {
             return false;
@@ -707,152 +699,50 @@ impl PaneReconciler {
         };
         let plan = plan_panes(&cur, &self.believe_pending(&io.pairs(&snap)));
         let reviewers = cur.reviewers();
-        if plan.is_converged() {
-            // Every label is present — but presence is not PLACEMENT.
-            // A tab whose reviewers are not stacked (a failed or
-            // silently no-op `stack-panes` last pass, or a tab broken
-            // before this code existed) looks converged by label and
-            // would never be repaired (codex on 3d3ffce). Repair here,
-            // and only cache convergence once placement is confirmed.
-            if io.is_placed(&reviewers, &snap) {
-                self.converged = Some(cur);
-                return false;
-            }
-            let focus = io.capture_focus(&snap);
-            let placed = io.stack(&reviewers, &snap, &[]);
-            if let Some(id) = &focus {
-                io.restore_focus(id);
-            }
-            // `stack-panes` can only BUILD a stack, never take a pane
-            // out of one — measured: move-pane does nothing to a stack
-            // member, break-pane does not exist, and stacking with a
-            // fresh pane merges INTO the existing stack. So a lone
-            // reviewer sharing the instrument pane's stack cannot be
-            // repaired, and re-attempting it every refresh would
-            // reinstate exactly the unbounded work this plan removes.
-            //
-            // Cache only what we KNOW is beyond us: with fewer than
-            // two reviewers there is no action left to try, and the
-            // roster changing (a second reviewer arriving) both
-            // invalidates this and makes repair possible again.
-            // Anything else stays unconverged and retries.
-            if placed {
-                self.note_success();
-                self.converged = Some(cur);
-                return true;
-            }
-            // Give up on what we cannot fix, rather than acting on
-            // every refresh forever. `< 2` keeps its original meaning:
-            // with one reviewer there is no action left to try at all.
-            let spent = self.note_failure(&cur);
-            if reviewers.len() < 2 || spent {
-                self.converged = Some(cur);
-            }
-            return true;
+        // Every label present AND placed: nothing to do, and no
+        // re-layout — an override on a tab that is already right
+        // would only move the user's focus for nothing.
+        if plan.is_converged() && io.is_placed(&reviewers, &snap) {
+            self.converged = Some(cur);
+            return false;
         }
         // Pass-level focus transaction: capture the user's focus once
         // before the first action, restore once after the last
         // (zellij-one-listing-per-pass).
         let focus = io.capture_focus(&snap);
-        // Adds before the relocate (a swapped-in master may be brand
-        // new), removes last.
-        // Adds do not stack; the whole desired set is stacked ONCE
-        // below. Stacking per-add off the pass-start snapshot skipped
-        // it entirely whenever two reviewers arrived together — each
-        // call saw no existing reviewer and a one-element set (codex
-        // on 2d273c6). Ids created this pass are accumulated because
-        // that snapshot cannot name them.
-        // Tracked BY LABEL: `plan.add` can include a brand-new MASTER
-        // (a swap-in), and feeding that id to the reviewer stack would
-        // sweep the master into it — the same class of bug as the
-        // instrument pane being captured (codex on 3d3ffce).
-        let mut created: Vec<(String, String)> = Vec::new();
-        // Anchors are NOT label-keyed: they are existing panes, either
-        // matched on a `(reviewer)` title (so a master pane can never
-        // be one) or belonging to a reviewer leaving this pass.
-        //
-        // `plan.remove` is passed so a replacement can anchor on the
-        // pane being vacated. Nothing here knows or needs to know that
-        // a swap happened: any pass that both adds and removes gets
-        // the same preservation, which is why `agent swap` needs no
-        // signal of its own.
-        let mut anchors: Vec<String> = Vec::new();
-        for label in &plan.add {
-            let added = io.add(label, &reviewers, &plan.remove, &snap);
-            if let Some(id) = added.created {
-                // Believed live until a listing confirms it, so the
-                // next pass cannot open this label a second time.
-                self.pending.insert(label.clone(), PENDING_CREATE_PASSES);
-                created.push((label.clone(), id));
-            }
-            if let Some(id) = added.anchor {
-                anchors.push(id);
-            }
-        }
-        let mut created_reviewers: Vec<String> = created
-            .iter()
-            .filter(|(label, _)| reviewers.iter().any(|r| r == label))
-            .map(|(_, id)| id.clone())
-            .collect();
-        // A title-found anchor has no launch command to be named by, so
-        // `stack` cannot rediscover it from the snapshot — without this
-        // the id list falls short of the two entries `stack-panes`
-        // needs and the call is skipped entirely.
-        //
-        // Known and deliberate: the verifying read
-        // (`reviewers_are_stacked`) still identifies members by exact
-        // command, so it sees the newly stacked pane as a LONE reviewer
-        // and reports converged as long as it is not stacked with the
-        // instrument pane. Do not "fix" that blind spot by teaching the
-        // read-back to match titles — that is classification, which
-        // fails open on a label the glyph-strip cannot round-trip, and
-        // an unconverged read here means repairing every refresh
-        // forever (placement-reads-zellij-stacks-correctly).
-        for id in anchors {
-            if !created_reviewers.contains(&id) {
-                created_reviewers.push(id);
-            }
-        }
-        // Placement is part of the outcome, not a side effect. The
-        // verifying read below decides it for EVERY pass — including
-        // remove-only and relocate-only ones, which can leave a stack
-        // wrong without adding anything.
-        if !plan.add.is_empty() {
-            io.stack(&reviewers, &snap, &created_reviewers);
-        }
-        if let Some((new_master, old_master)) = &plan.relocate {
-            // Adds the relocation depends on aren't in the pass-start
-            // snapshot (new-pane reports no id; compose skips on an
-            // unclassified/absent master) — refresh ONCE after adds
-            // (codex 631636e). Refresh failure: proceed with the stale
-            // snapshot; compose may skip, verify catches it, the next
-            // refresh retries.
-            if !plan.add.is_empty()
-                && let Some(fresh) = io.snapshot()
-            {
-                snap = fresh;
-            }
-            // The relocation's classification set is the union of the
-            // desired roster and EVERY live agent label: all departing
-            // panes (master or reviewer) are still live here — removes
-            // run after the layout — and compose skips on any
-            // unclassified live agent pane (codex ae6338a, 8c4906d).
-            let mut all: std::collections::BTreeSet<String> = cur.labels.clone();
-            all.extend(io.pairs(&snap).into_iter().map(|(l, _)| l));
-            let all: Vec<String> = all.into_iter().collect();
-            io.relocate(new_master, old_master.as_deref(), &all, &snap);
-        }
+
+        // MEMBERSHIP first: departed labels closed (killing the pane's
+        // process tree is the agent-exit guarantee), missing ones
+        // opened. An exited pane is still its label's — the ✗ and the
+        // operator's reopen, never a relaunch from here.
         if !plan.remove.is_empty() {
             io.remove_all(&plan.remove, &snap);
         }
+        let mut membership_changed = !plan.remove.is_empty();
+        for label in &plan.add {
+            if io.add(label, &snap).is_some() {
+                // Believed live until a listing confirms it, so the
+                // next pass cannot open this label a second time.
+                self.pending.insert(label.clone(), PENDING_CREATE_PASSES);
+                membership_changed = true;
+            }
+        }
+        // The LAYOUT, from what is running now. A slot naming a pane
+        // that is not live makes zellij spawn a duplicate, so the
+        // listing is refreshed after any membership change and the
+        // roster is intersected with it. A refresh that fails leaves
+        // the pass to verify and retry.
+        if membership_changed && let Some(fresh) = io.snapshot() {
+            snap = fresh;
+        }
+        self.apply_layout(&cur, io, &snap);
+
         if let Some(id) = &focus {
             io.restore_focus(id);
         }
         // Converged only when a VERIFYING read confirms the target
         // state — every action above is best-effort, so observation is
-        // not achievement. The verify source is a FRESH listing —
-        // see `verify_pairs` for why the cheaper dump cannot do this
-        // job.
+        // not achievement.
         let verified = io.verify(&reviewers);
         if let Some((after, _)) = &verified {
             self.confirm_listed(after);
@@ -862,14 +752,37 @@ impl PaneReconciler {
             self.note_success();
             self.converged = Some(cur);
         } else if self.note_failure(&cur) {
-            // An add / remove / relocate that never verifies acts on
-            // the tab every refresh exactly like a failing restack did.
-            // The budget covers it, or the acceptance criterion ("no
-            // reachable state issues actions indefinitely") is false
-            // for three of the four action kinds (codex on dfeff8c).
+            // A pass that never verifies acts on the tab every refresh
+            // otherwise — the unbounded side-effect loop the budget
+            // exists to end (codex on dfeff8c, 40760e0). Left alone
+            // until the roster changes.
             self.converged = Some(cur);
         }
         true
+    }
+
+    /// Compose the tab layout for the roster AS RUNNING and apply it:
+    /// master on the stage, reviewers in the stack, the swap variants
+    /// alt+[ / alt+] will apply from now on — one action, one source
+    /// of truth for placement. No running master, no override: the
+    /// layout has no stage to give, and staging nobody would be a
+    /// re-layout for nothing; the reopen that brings the master back
+    /// applies one. Returns whether an override was issued and
+    /// accepted.
+    fn apply_layout<I: PaneIo>(&mut self, cur: &RosterView, io: &mut I, snap: &I::Snap) -> bool {
+        let running = io.live_labels(snap);
+        let Some(master) = cur.master.as_deref().filter(|m| running.contains(*m)) else {
+            return false;
+        };
+        let reviewers: Vec<String> = cur
+            .reviewers()
+            .into_iter()
+            .filter(|r| running.contains(r))
+            .collect();
+        let Some(kdl) = io.compose(master, &reviewers, snap) else {
+            return false;
+        };
+        io.override_layout(&kdl, snap)
     }
 
     /// Bring back ONE label's pane — the per-agent "reopen pane" item
@@ -925,57 +838,37 @@ impl PaneReconciler {
         }
         let reviewers = cur.reviewers();
         let focus = io.capture_focus(&snap);
-        // No departing panes: this closes nothing, so nothing is vacated
-        // to anchor on.
-        let added = io.add(label, &reviewers, &[], &snap);
+        let created = io.add(label, &snap);
         // Placement is FOR the new pane; without one there is nothing to
-        // place, and stacking or relocating anyway would rearrange live
-        // panes on behalf of a pane that does not exist (codex on
-        // 54acac6).
-        let Some(created) = added.created else {
+        // place, and re-laying the tab anyway would rearrange live panes
+        // on behalf of a pane that does not exist (codex on 54acac6).
+        if created.is_none() {
             if let Some(id) = &focus {
                 io.restore_focus(id);
             }
             return ReopenOutcome::NotCreated;
-        };
+        }
         self.pending
             .insert(label.to_string(), PENDING_CREATE_PASSES);
-        // A missing master is staged once it exists, exactly as a pass
-        // would; a relocation the plan wants for some OTHER label is not
-        // this request's to make.
-        let as_master = match &plan.relocate {
-            Some((new_master, old_master)) if new_master == label => {
-                if let Some(fresh) = io.snapshot() {
-                    snap = fresh;
-                }
-                let mut all: std::collections::BTreeSet<String> = cur.labels.clone();
-                all.extend(io.pairs(&snap).into_iter().map(|(l, _)| l));
-                let all: Vec<String> = all.into_iter().collect();
-                io.relocate(new_master, old_master.as_deref(), &all, &snap);
-                true
-            }
-            _ => {
-                let mut ids = vec![created];
-                if let Some(anchor) = added.anchor
-                    && !ids.contains(&anchor)
-                {
-                    ids.push(anchor);
-                }
-                io.stack(&reviewers, &snap, &ids);
-                false
-            }
-        };
+        // The layout may only name what is running, and the new pane is
+        // not in the pass-start listing: list again, then apply. A
+        // reopened master is staged by the same override that stacks a
+        // reopened reviewer.
+        if let Some(fresh) = io.snapshot() {
+            snap = fresh;
+        }
+        self.apply_layout(cur, io, &snap);
+        let as_master = cur.master.as_deref() == Some(label);
         // Reopened means READ BACK where it belongs, not merely created:
         // every action here is best-effort, and the notice must not
         // claim a placement the tab does not show. A master belongs on
-        // the stage (the pane the tab titles master is this one); a
-        // reviewer belongs in the stack. The same read-back confirms
-        // the label, so the belief does not outlive the pane.
+        // the stage; a reviewer belongs in the stack. The same read-back
+        // confirms the label, so the belief does not outlive the pane.
         let placed = io.verify(&reviewers).is_some_and(|(after, stacked)| {
             self.confirm_listed(&after);
             after
                 .iter()
-                .any(|(l, titled)| l == label && (if as_master { *titled } else { stacked }))
+                .any(|(l, staged)| l == label && (if as_master { *staged } else { stacked }))
         });
         if let Some(id) = &focus {
             io.restore_focus(id);
@@ -1054,29 +947,17 @@ impl<I: PaneIo> PaneIo for Observed<'_, I> {
     fn restore_focus(&mut self, id: &str) {
         self.inner.restore_focus(id)
     }
-    fn add(
-        &mut self,
-        label: &str,
-        other_reviewers: &[String],
-        departing: &[String],
-        snap: &Self::Snap,
-    ) -> crate::cli::open_zellij::ReviewerPaneAdd {
-        self.inner.add(label, other_reviewers, departing, snap)
-    }
-    fn stack(&mut self, reviewers: &[String], snap: &Self::Snap, extra_ids: &[String]) -> bool {
-        self.inner.stack(reviewers, snap, extra_ids)
+    fn add(&mut self, label: &str, snap: &Self::Snap) -> Option<String> {
+        self.inner.add(label, snap)
     }
     fn is_placed(&mut self, reviewers: &[String], snap: &Self::Snap) -> bool {
         self.inner.is_placed(reviewers, snap)
     }
-    fn relocate(
-        &mut self,
-        new_master: &str,
-        old_master: Option<&str>,
-        roster: &[String],
-        snap: &Self::Snap,
-    ) {
-        self.inner.relocate(new_master, old_master, roster, snap)
+    fn compose(&mut self, master: &str, reviewers: &[String], snap: &Self::Snap) -> Option<String> {
+        self.inner.compose(master, reviewers, snap)
+    }
+    fn override_layout(&mut self, kdl: &str, snap: &Self::Snap) -> bool {
+        self.inner.override_layout(kdl, snap)
     }
     fn remove_all(&mut self, labels: &[String], snap: &Self::Snap) {
         self.inner.remove_all(labels, snap)
@@ -1084,7 +965,7 @@ impl<I: PaneIo> PaneIo for Observed<'_, I> {
     fn live_labels(&mut self, snap: &Self::Snap) -> std::collections::BTreeSet<String> {
         self.inner.live_labels(snap)
     }
-    fn title_rows(&mut self, snap: &Self::Snap) -> Vec<(String, String, clank_core::vocab::Role)> {
+    fn title_rows(&mut self, snap: &Self::Snap) -> Vec<(String, String)> {
         self.inner.title_rows(snap)
     }
     fn may_reconcile(&mut self) -> bool {
@@ -1651,10 +1532,10 @@ mod tests {
     }
 
     #[test]
-    fn plan_detects_a_master_swap_from_live_titles_alone() {
+    fn plan_detects_a_master_swap_from_the_stage_alone() {
         // codex a730882 concern 2: promote ran while NO TUI was open —
-        // the roster says codex, the stage title still says claude. A
-        // fresh reconciler must infer the relocation from the titles.
+        // the roster says codex, the stage still holds claude. A fresh
+        // reconciler must see the re-layout from the geometry.
         let plan = plan_panes(
             &view(&["claude", "codex"], Some("codex")),
             &live(&[("claude", true), ("codex", false)]),
@@ -1670,9 +1551,8 @@ mod tests {
     #[test]
     fn plan_departing_old_master_is_still_the_relocation_source() {
         // codex c7be87f: the stale stage owner is LEAVING the roster —
-        // it must still source the relocation (its pane is alive until
-        // the removes run, which come after the layout), or the new
-        // master converges reviewer-titled in the stack.
+        // the plan still names the re-layout, or the new master
+        // converges in the stack.
         let plan = plan_panes(
             &view(&["codex"], Some("codex")),
             &live(&[("claude", true), ("codex", false)]),
@@ -1685,10 +1565,10 @@ mod tests {
     }
 
     #[test]
-    fn plan_stages_the_master_when_nothing_is_master_titled() {
-        // codex c7be87f: all panes reviewer-titled (e.g. a whole-team
+    fn plan_stages_the_master_when_nothing_is_staged() {
+        // codex c7be87f: nothing on the stage (e.g. a whole-team
         // replacement mid-convergence) — the roster master must still
-        // be staged, with no demotion source.
+        // be staged, with no stale occupant to name.
         let plan = plan_panes(
             &view(&["claude", "codex"], Some("claude")),
             &live(&[("claude", false), ("codex", false)]),
@@ -1698,10 +1578,11 @@ mod tests {
     }
 
     #[test]
-    fn plan_demotes_a_stale_master_title_even_when_the_master_is_titled() {
-        // codex ae6338a: a partial rename can leave TWO master-titled
-        // panes. Whichever order they list in, the stale claimant is
-        // demoted — and until then the layout must not verify.
+    fn plan_relays_when_a_stale_pane_shares_the_stage() {
+        // codex ae6338a: two panes reading as staged (a tie the
+        // geometry read should never produce, but a plan must not
+        // trust that). Whichever order they list in, the stale one is
+        // named — and until then the layout must not verify.
         for lv in [
             live(&[("codex", true), ("claude", true)]),
             live(&[("claude", true), ("codex", true)]),
@@ -1710,7 +1591,7 @@ mod tests {
             assert_eq!(
                 plan.relocate,
                 Some(("codex".to_string(), Some("claude".to_string()))),
-                "stale title demoted regardless of listing order"
+                "the stale occupant is named regardless of listing order"
             );
             assert!(!plan.is_converged());
         }
@@ -1744,8 +1625,6 @@ mod tests {
         focus_captures: usize,
         /// Scripted per-add creation results (default: created).
         add_results: std::collections::VecDeque<bool>,
-        add_anchors: std::collections::VecDeque<Option<String>>,
-        add_departing: Vec<Vec<String>>,
         /// Scripted lease answer; the real IO holds an flock.
         may_reconcile: bool,
         /// Labels whose panes are all EXITED: listed by `pairs`, absent
@@ -1753,11 +1632,23 @@ mod tests {
         dead: std::collections::BTreeSet<String>,
         /// Scripted retitler rows per listing; default derives them from
         /// the snapshot's pairs as `terminal_<label>`.
-        title_rows: std::collections::VecDeque<Vec<(String, String, clank_core::vocab::Role)>>,
-        stack_results: std::collections::VecDeque<bool>,
+        title_rows: std::collections::VecDeque<Vec<(String, String)>>,
         placed_results: std::collections::VecDeque<bool>,
         verify_placed: std::collections::VecDeque<bool>,
+        /// Every layout handed to `override_layout`, composed by the
+        /// REAL composition so tests read the KDL `clank open` would.
+        overrides: Vec<String>,
+        override_results: std::collections::VecDeque<bool>,
+        /// The home whose `~/.clank/config.json` supplies a template;
+        /// `None` composes the built-in.
+        home: Option<std::path::PathBuf>,
+        orientation: crate::cli::open_zellij::Orientation,
+        compose_fails: bool,
     }
+
+    /// The repo every fake composes for. Composition needs a path
+    /// string for the launch commands and a basename for the tab.
+    const FAKE_REPO: &str = "/tmp/fake-repo";
 
     impl FakeIo {
         fn new(snaps: Vec<Option<Vec<(String, bool)>>>) -> Self {
@@ -1776,15 +1667,22 @@ mod tests {
                 verifies_taken: 0,
                 focus_captures: 0,
                 add_results: std::collections::VecDeque::new(),
-                add_anchors: std::collections::VecDeque::new(),
-                add_departing: Vec::new(),
                 may_reconcile: true,
                 dead: std::collections::BTreeSet::new(),
                 title_rows: std::collections::VecDeque::new(),
-                stack_results: std::collections::VecDeque::new(),
                 placed_results: std::collections::VecDeque::new(),
                 verify_placed: std::collections::VecDeque::new(),
+                overrides: Vec::new(),
+                override_results: std::collections::VecDeque::new(),
+                home: None,
+                orientation: crate::cli::open_zellij::Orientation::Landscape,
+                compose_fails: false,
             }
+        }
+
+        /// The launch command a layout slot must carry for `label`.
+        fn launch(label: &str) -> String {
+            crate::cli::open_zellij::agent_start_command(label, FAKE_REPO)
         }
     }
 
@@ -1815,40 +1713,43 @@ mod tests {
         fn restore_focus(&mut self, id: &str) {
             self.log.push(format!("focus {id}"));
         }
-        fn add(
-            &mut self,
-            label: &str,
-            _other: &[String],
-            departing: &[String],
-            _snap: &Self::Snap,
-        ) -> crate::cli::open_zellij::ReviewerPaneAdd {
+        fn add(&mut self, label: &str, _snap: &Self::Snap) -> Option<String> {
             self.log.push(format!("add {label}"));
-            self.add_departing.push(departing.to_vec());
-            crate::cli::open_zellij::ReviewerPaneAdd {
-                created: self
-                    .add_results
-                    .pop_front()
-                    .unwrap_or(true)
-                    .then(|| format!("terminal_{label}")),
-                anchor: self.add_anchors.pop_front().flatten(),
-            }
-        }
-        fn stack(&mut self, _revs: &[String], _snap: &Self::Snap, extra: &[String]) -> bool {
-            self.log.push(format!("stack [{}]", extra.join(",")));
-            self.stack_results.pop_front().unwrap_or(true)
+            // A freshly opened pane is running, whatever its
+            // predecessor was.
+            self.dead.remove(label);
+            self.add_results
+                .pop_front()
+                .unwrap_or(true)
+                .then(|| format!("terminal_{label}"))
         }
         fn is_placed(&mut self, _revs: &[String], _snap: &Self::Snap) -> bool {
             self.placed_results.pop_front().unwrap_or(true)
         }
-        fn relocate(
+        fn compose(
             &mut self,
-            new_master: &str,
-            old_master: Option<&str>,
-            _roster: &[String],
+            master: &str,
+            reviewers: &[String],
             _snap: &Self::Snap,
-        ) {
+        ) -> Option<String> {
             self.log
-                .push(format!("relocate {new_master}<-{old_master:?}"));
+                .push(format!("compose {master} [{}]", reviewers.join(",")));
+            if self.compose_fails {
+                return None;
+            }
+            crate::cli::open_zellij::compose_live_layout(
+                std::path::Path::new(FAKE_REPO),
+                self.home.as_deref(),
+                master,
+                reviewers,
+                self.orientation,
+            )
+            .ok()
+        }
+        fn override_layout(&mut self, kdl: &str, _snap: &Self::Snap) -> bool {
+            self.log.push("override".to_string());
+            self.overrides.push(kdl.to_string());
+            self.override_results.pop_front().unwrap_or(true)
         }
         fn remove_all(&mut self, labels: &[String], _snap: &Self::Snap) {
             self.log.push(format!("remove {}", labels.join("+")));
@@ -1859,27 +1760,108 @@ mod tests {
                 .filter(|l| !self.dead.contains(l))
                 .collect()
         }
-        fn title_rows(
-            &mut self,
-            snap: &Self::Snap,
-        ) -> Vec<(String, String, clank_core::vocab::Role)> {
-            use clank_core::vocab::Role;
+        fn title_rows(&mut self, snap: &Self::Snap) -> Vec<(String, String)> {
             if let Some(rows) = self.title_rows.pop_front() {
                 return rows;
             }
             snap.iter()
-                .map(|(l, master)| {
+                .map(|(l, _)| (format!("terminal_{l}"), l.clone()))
+                .collect()
+        }
+    }
+
+    /// Every pane command in the layout, parsed rather than grepped,
+    /// as `(is_stage, command)` — the stage being a `pane` at
+    /// `size="65%"`, which the tab layout and both swap variants each
+    /// carry once.
+    fn pane_commands(kdl: &str) -> Vec<(bool, String)> {
+        let doc: kdl::KdlDocument = kdl.parse().expect("composed layout parses");
+        let mut out = Vec::new();
+        fn walk(nodes: &[kdl::KdlNode], out: &mut Vec<(bool, String)>) {
+            for n in nodes {
+                if n.name().value() == "pane"
+                    && let Some(children) = n.children()
+                    && let Some(cmd) = children.get_arg("command").and_then(|v| v.as_string())
+                {
+                    let stage = n.get("size").and_then(|e| e.value().as_string()) == Some("65%");
+                    let args: Vec<String> = children
+                        .get_args("args")
+                        .into_iter()
+                        .filter_map(|v| v.as_string().map(str::to_string))
+                        .collect();
+                    out.push((stage, format!("{cmd} {}", args.join(" "))));
+                }
+                if let Some(children) = n.children() {
+                    walk(children.nodes(), out);
+                }
+            }
+        }
+        walk(doc.nodes(), &mut out);
+        out
+    }
+
+    fn stage_commands(kdl: &str) -> Vec<String> {
+        pane_commands(kdl)
+            .into_iter()
+            .filter_map(|(stage, c)| stage.then_some(c))
+            .collect()
+    }
+
+    /// Whether the layout launches `label` anywhere.
+    fn launches(kdl: &str, label: &str) -> bool {
+        pane_commands(kdl)
+            .iter()
+            .any(|(_, c)| c == &FakeIo::launch(label))
+    }
+
+    /// Glyph data as `StatusGlyphs::of` would build it for a roster
+    /// whose master is `master`: every label's full pane title.
+    fn glyphs_for(master: &str, rows: &[(&str, &str, &str)]) -> StatusGlyphs {
+        StatusGlyphs {
+            titles: rows
+                .iter()
+                .map(|(label, as_master, as_reviewer)| {
+                    let (emoji, role) = if *label == master {
+                        (as_master, "master")
+                    } else {
+                        (as_reviewer, "reviewer")
+                    };
                     (
-                        format!("terminal_{l}"),
-                        l.clone(),
-                        if *master {
-                            Role::Master
-                        } else {
-                            Role::Reviewer
-                        },
+                        label.to_string(),
+                        format!("{emoji} {}", agent_pane_title(label, role)),
                     )
                 })
-                .collect()
+                .collect(),
+        }
+    }
+
+    /// The common case: `claude` is master.
+    fn glyphs(rows: &[(&str, &str, &str)]) -> StatusGlyphs {
+        glyphs_for("claude", rows)
+    }
+
+    fn converged_worker(
+        labels: &[&str],
+        master: &str,
+        live_now: Vec<(String, bool)>,
+    ) -> WorkerState {
+        let mut state = WorkerState::new();
+        let mut io = FakeIo::new(vec![Some(live_now)]);
+        state.handle(
+            wb(Some(view(labels, Some(master))), None, Vec::new()),
+            &mut io,
+            |_, _| {},
+        );
+        assert!(io.log.is_empty(), "converged from the start: {:?}", io.log);
+        state
+    }
+
+    fn reopen(state: &mut WorkerState, io: &mut FakeIo, label: &str) -> ReopenOutcome {
+        let out = state.handle(wb(None, None, vec![label.to_string()]), io, |_, _| {});
+        assert_eq!(out.len(), 1, "one request, one answer, nothing probed");
+        match &out[0] {
+            Report::Reopened(l, outcome) if l == label => outcome.clone(),
+            other => panic!("expected {label}'s outcome, got {other:?}"),
         }
     }
 
@@ -2002,227 +1984,61 @@ mod tests {
         );
     }
 
-    #[test]
-    fn reconciler_retries_after_a_failed_listing_and_verifies_convergence() {
-        // codex a730882 concern 1: a transient listing failure must NOT
-        // count as converged — the SAME unchanged roster retries on the
-        // next observe. And success is only recorded after a verifying
-        // re-list shows the target state.
-        let snap = roster_snap(&[("claude", true), ("codex", false)]);
-        let mut r = PaneReconciler::new();
+    // ── the-tui-knows-whether-a-pane-is-open: presence ──────────
 
-        // First observe: listing fails → nothing done, not converged.
-        let mut io = FakeIo::new(vec![None]);
-        r.reconcile(RosterView::of(&snap), &mut io);
-        assert!(io.log.is_empty());
-        assert_eq!(r.converged, None, "failure must not converge");
+    fn presence_of(reports: &[Report]) -> Option<Option<Vec<String>>> {
+        reports.iter().find_map(|r| match r {
+            Report::Presence(live) => Some(live.as_ref().map(|s| s.iter().cloned().collect())),
+            _ => None,
+        })
+    }
 
-        // Second observe, same roster: retries; the pass runs (codex
-        // pane missing → add) and the verifying read confirms.
-        let mut io = FakeIo::with_verify(
-            vec![Some(live(&[("claude", true)]))],
-            vec![Some(live(&[("claude", true), ("codex", false)]))],
+    // ── the reconcile pass: membership, then the layout, then the read-back ──
+    // (placement-is-a-layout-applied-not-panes-shuffled)
+
+    fn assert_stage(kdl: &str, label: &str) {
+        let stages = stage_commands(kdl);
+        assert!(
+            !stages.is_empty() && stages.iter().all(|c| c == &FakeIo::launch(label)),
+            "every stage slot — tab and both swap variants — pins `{label}`: {stages:?}"
         );
+    }
+
+    /// The report: promote codex, and the layout the tab receives —
+    /// the one alt+[ / alt+] will apply from now on — stages codex in
+    /// its tab layout AND in both swap variants. Claude is named
+    /// nowhere as a stage; it is a `children` occupant.
+    #[test]
+    fn a_promotion_re_lays_the_tab_with_the_new_master_on_every_stage() {
+        let snap = roster_snap(&[("codex", true), ("claude", false)]);
+        let mut r = PaneReconciler::new();
+        let before = live(&[("claude", true), ("codex", false)]);
+        let after = live(&[("claude", false), ("codex", true)]);
+        let mut io = FakeIo::with_verify(vec![Some(before)], vec![Some(after)]);
         r.reconcile(RosterView::of(&snap), &mut io);
         assert_eq!(
             io.log,
-            vec!["add codex", "stack [terminal_codex]", "focus user_pane"]
+            vec!["compose codex [claude]", "override", "focus user_pane"],
+            "no shuffling: one layout, applied"
         );
-        assert_eq!((io.snapshots_taken, io.verifies_taken), (1, 1));
-        assert!(r.converged.is_some(), "verified pass converges");
-
-        // Third observe, same roster: steady state, zero io.
-        let mut io = FakeIo::new(vec![]);
-        r.reconcile(RosterView::of(&snap), &mut io);
-        assert!(io.log.is_empty());
-    }
-
-    #[test]
-    fn reconciler_stays_unconverged_when_actions_did_not_stick() {
-        // Best-effort actions can silently fail: the verify re-list
-        // still shows the stale state → stay unconverged so the next
-        // refresh retries (observation is not achievement).
-        let snap = roster_snap(&[("claude", true), ("codex", false)]);
-        let mut r = PaneReconciler::new();
-        let stale = live(&[("claude", true)]);
-        let mut io = FakeIo::with_verify(vec![Some(stale.clone())], vec![Some(stale)]);
-        r.reconcile(RosterView::of(&snap), &mut io);
+        let kdl = &io.overrides[0];
+        assert_stage(kdl, "codex");
         assert_eq!(
-            io.log,
-            vec!["add codex", "stack [terminal_codex]", "focus user_pane"]
+            kdl.matches("swap_tiled_layout").count(),
+            2,
+            "both orientations travel with the override"
         );
-        assert_eq!(r.converged, None);
-    }
-
-    #[test]
-    fn reconciler_does_not_reopen_a_pane_whose_listing_has_not_caught_up() {
-        // The observed bug: `new-pane` returns before the listing
-        // reports the pane, so the next pass re-derived `add` from a
-        // snapshot that still showed the label missing and opened a
-        // SECOND pane for it (two `ruthless` panes, one of them never
-        // retitled). What a pass created is believed until a listing
-        // confirms it.
-        let snap = roster_snap(&[("claude", true), ("codex", false)]);
-        let mut r = PaneReconciler::new();
-        let stale = live(&[("claude", true)]);
-
-        // Pass 1 opens codex. The verifying re-list lags too, so
-        // nothing in this pass confirms the pane exists.
-        let mut io = FakeIo::with_verify(vec![Some(stale.clone())], vec![Some(stale.clone())]);
-        r.reconcile(RosterView::of(&snap), &mut io);
-        assert_eq!(io.log.iter().filter(|l| *l == "add codex").count(), 1);
-        assert_eq!(r.converged, None, "unconfirmed pass must retry");
-
-        // Pass 2's snapshot STILL does not show it. No second pane.
-        let mut io = FakeIo::new(vec![Some(stale)]);
-        r.reconcile(RosterView::of(&snap), &mut io);
         assert!(
-            !io.log.iter().any(|l| l == "add codex"),
-            "a believed pane must not be re-created: {:?}",
-            io.log
-        );
-    }
-
-    #[test]
-    fn a_confirmed_creation_stops_being_believed() {
-        // Discharge, direction one: the listing catches up, so the
-        // memory releases the label and stops shadowing reality.
-        let snap = roster_snap(&[("claude", true), ("codex", false)]);
-        let mut r = PaneReconciler::new();
-        let stale = live(&[("claude", true)]);
-        let mut io = FakeIo::with_verify(vec![Some(stale.clone())], vec![Some(stale)]);
-        r.reconcile(RosterView::of(&snap), &mut io);
-        assert!(r.pending.contains_key("codex"), "created pane is believed");
-
-        let mut io = FakeIo::new(vec![Some(live(&[("claude", true), ("codex", false)]))]);
-        r.reconcile(RosterView::of(&snap), &mut io);
-        assert!(
-            r.pending.is_empty(),
-            "a listed pane must stop being believed: {:?}",
-            r.pending
-        );
-    }
-
-    #[test]
-    fn a_creation_that_never_appears_stops_blocking_its_label() {
-        // Discharge, direction two: the memory MUST expire. A
-        // `new-pane` that reported an id which never reaches a listing
-        // would otherwise block its label forever, and the agent would
-        // never be opened again.
-        //
-        // Each pass grows the roster so none is skipped as converged;
-        // the snapshot never catches up.
-        let mut r = PaneReconciler::new();
-        let stale = live(&[("claude", true)]);
-        let mut adds = 0;
-        for extra in [Vec::new(), vec!["ruthless"], vec!["kimi", "ruthless"]] {
-            let mut labels = vec![("claude", true), ("codex", false)];
-            labels.extend(extra.iter().map(|l| (*l, false)));
-            let snap = roster_snap(&labels);
-            let mut io = FakeIo::with_verify(vec![Some(stale.clone())], vec![Some(stale.clone())]);
-            r.reconcile(RosterView::of(&snap), &mut io);
-            adds += io.log.iter().filter(|l| *l == "add codex").count();
-        }
-        assert_eq!(
-            adds, 2,
-            "codex is retried once the belief expires, not stranded"
-        );
-    }
-
-    #[test]
-    fn a_duplicate_and_unstacked_tab_converges() {
-        // The state the reported tab settled into: two panes for one
-        // roster label, and the reviewers not stacked. The excess pane
-        // is closed and the survivor joins the stack.
-        let snap = roster_snap(&[("claude", true), ("codex", false), ("ruthless", false)]);
-        let dup = live(&[
-            ("claude", true),
-            ("codex", false),
-            ("ruthless", false),
-            ("ruthless", false),
-        ]);
-        let clean = live(&[("claude", true), ("codex", false), ("ruthless", false)]);
-        let mut r = PaneReconciler::new();
-
-        // Pass 1 closes the excess pane; the tab is still unstacked, so
-        // the verify refuses convergence.
-        let mut io = FakeIo::with_verify(vec![Some(dup)], vec![Some(clean.clone())]);
-        io.verify_placed.push_back(false);
-        r.reconcile(RosterView::of(&snap), &mut io);
-        assert!(
-            io.log.iter().any(|l| l == "remove ruthless"),
-            "the excess pane is closed: {:?}",
-            io.log
-        );
-        assert_eq!(r.converged, None, "unstacked must not cache as converged");
-
-        // Pass 2 has nothing to add or remove and repairs placement.
-        let mut io = FakeIo::new(vec![Some(clean)]);
-        io.placed_results.push_back(false);
-        r.reconcile(RosterView::of(&snap), &mut io);
-        assert!(
-            io.log.iter().any(|l| l.starts_with("stack ")),
-            "placement is repaired: {:?}",
-            io.log
-        );
-        assert!(r.converged.is_some(), "repaired tab converges");
-    }
-
-    #[test]
-    fn reconciler_orders_adds_relocate_removes() {
-        // A swapped-in BRAND-NEW master while the old one leaves: open
-        // the new pane first, stage it (the departing pane is still
-        // alive to demote from), close the departed LAST — and only a
-        // verify showing the new master actually TITLED master
-        // converges.
-        let snap = roster_snap(&[("new-master", true), ("codex", false)]);
-        let mut r = PaneReconciler::new();
-        let before = live(&[("old", true), ("codex", false)]);
-        let after_add = live(&[("old", true), ("codex", false), ("new-master", false)]);
-        let after = live(&[("new-master", true), ("codex", false)]);
-        // Adds feed the relocation → the pass refreshes the snapshot
-        // once after the adds (codex 631636e): TWO snapshots, one
-        // verifying read.
-        let mut io = FakeIo::with_verify(vec![Some(before), Some(after_add)], vec![Some(after)]);
-        r.reconcile(RosterView::of(&snap), &mut io);
-        assert_eq!((io.snapshots_taken, io.verifies_taken), (2, 1));
-        assert_eq!(
-            io.log,
-            vec![
-                "add new-master",
-                // The new MASTER's id is NOT offered to the reviewer
-                // stack — feeding it in would sweep the master into
-                // the reviewers, the same class of bug as capturing
-                // the instrument pane.
-                "stack []",
-                "relocate new-master<-Some(\"old\")",
-                "remove old",
-                "focus user_pane"
-            ]
+            launches(kdl, "claude"),
+            "claude is still launched by the tab layout, in the stack"
         );
         assert!(r.converged.is_some());
     }
 
-    #[test]
-    fn reconciler_rejects_a_reviewer_titled_master_at_verify() {
-        // codex c7be87f: if the relocation didn't stick, the new master
-        // is present but reviewer-titled — verification must NOT bless
-        // that layout as converged.
-        let snap = roster_snap(&[("new-master", true), ("codex", false)]);
-        let mut r = PaneReconciler::new();
-        let before = live(&[("old", true), ("codex", false)]);
-        let after = live(&[("new-master", false), ("codex", false)]);
-        let mut io =
-            FakeIo::with_verify(vec![Some(before.clone()), Some(before)], vec![Some(after)]);
-        r.reconcile(RosterView::of(&snap), &mut io);
-        assert_eq!(r.converged, None, "master in the stack is not converged");
-    }
-
+    /// One listing, one verify, one focus transaction: the cost of a
+    /// promotion is unchanged by the model (zellij-one-listing-per-pass).
     #[test]
     fn promote_shaped_pass_takes_one_snapshot_one_verify_one_focus() {
-        // zellij-one-listing-per-pass: all panes pre-exist — the pass
-        // must cost exactly ONE --json snapshot, ONE verifying listing,
-        // and ONE focus capture/restore transaction.
         let snap = roster_snap(&[("codex", true), ("claude", false)]);
         let mut r = PaneReconciler::new();
         let before = live(&[("claude", true), ("codex", false)]);
@@ -2233,17 +2049,13 @@ mod tests {
             (io.snapshots_taken, io.verifies_taken, io.focus_captures),
             (1, 1, 1)
         );
-        assert_eq!(
-            io.log,
-            vec!["relocate codex<-Some(\"claude\")", "focus user_pane"]
-        );
-        assert!(r.converged.is_some());
     }
 
     #[test]
     fn converged_at_start_pass_takes_one_snapshot_and_nothing_else() {
         // The pass-start listing IS ground truth when the plan is
-        // empty: record convergence with no verify, no focus, no ops.
+        // empty and the tab is placed: no verify, no focus, no ops —
+        // and no override, which would move focus for nothing.
         let snap = roster_snap(&[("claude", true), ("codex", false)]);
         let mut r = PaneReconciler::new();
         let mut io = FakeIo::new(vec![Some(live(&[("claude", true), ("codex", false)]))]);
@@ -2253,569 +2065,638 @@ mod tests {
             (1, 0, 0)
         );
         assert!(io.log.is_empty());
+        assert!(io.overrides.is_empty());
         assert!(r.converged.is_some());
     }
 
+    /// A missing label is opened BEFORE the layout is composed, the
+    /// listing is taken again, and the layout names only what that
+    /// listing shows running — the duplicate-spawn measured on 0.45
+    /// (a slot with no live match) is unreachable by construction.
     #[test]
-    fn two_adds_from_a_reviewerless_snapshot_still_get_stacked() {
-        // The regression codex caught on 2d273c6: stacking per-add off
-        // the PASS-START snapshot meant each call saw no existing
-        // reviewer and a one-element set, so neither stacked and two
-        // reviewers sat unstacked. The ids created this pass must
-        // reach the stack even though the snapshot cannot name them.
+    fn an_add_is_opened_then_listed_then_named_by_the_layout() {
         let snap = roster_snap(&[("claude", true), ("r1", false), ("r2", false)]);
         let mut r = PaneReconciler::new();
-        // Live state has the MASTER only — no reviewer to anchor on.
         let before = live(&[("claude", true)]);
-        let mut io = FakeIo::with_verify(vec![Some(before)], vec![None]);
+        // The re-list after the add shows r1 up; r2 never appeared.
+        let relisted = live(&[("claude", true), ("r1", false)]);
+        let mut io = FakeIo::with_verify(vec![Some(before), Some(relisted)], vec![None]);
         r.reconcile(RosterView::of(&snap), &mut io);
+        assert_eq!(
+            io.log,
+            vec![
+                "add r1",
+                "add r2",
+                "compose claude [r1]",
+                "override",
+                "focus user_pane"
+            ]
+        );
+        assert_eq!(io.snapshots_taken, 2, "re-listed after the adds");
+        let kdl = &io.overrides[0];
+        assert!(launches(kdl, "r1"));
         assert!(
-            io.log
-                .contains(&"stack [terminal_r1,terminal_r2]".to_string()),
-            "both new panes must be stacked together; got {:?}",
+            !launches(kdl, "r2"),
+            "a label the re-list did not show is not a slot: {kdl}"
+        );
+    }
+
+    /// Departed labels are closed BEFORE the layout, and the layout
+    /// does not name them.
+    #[test]
+    fn a_departed_label_is_closed_before_the_layout_and_not_named() {
+        let snap = roster_snap(&[("claude", true), ("r1", false)]);
+        let before = live(&[("claude", true), ("r1", false), ("gone", false)]);
+        let relisted = live(&[("claude", true), ("r1", false)]);
+        let after = relisted.clone();
+        let mut r = PaneReconciler::new();
+        let mut io = FakeIo::with_verify(vec![Some(before), Some(relisted)], vec![Some(after)]);
+        io.placed_results = vec![false].into();
+        r.reconcile(RosterView::of(&snap), &mut io);
+        assert_eq!(
+            io.log,
+            vec![
+                "remove gone",
+                "compose claude [r1]",
+                "override",
+                "focus user_pane"
+            ]
+        );
+        assert!(!launches(&io.overrides[0], "gone"));
+    }
+
+    /// An exited reviewer is neither closed, nor reopened, nor named:
+    /// it stays with its ✗ for the operator's reopen. An exited MASTER
+    /// means no override at all — a layout without a stage is a
+    /// re-layout for nothing.
+    #[test]
+    fn an_exited_pane_is_left_alone_and_left_out_of_the_layout() {
+        // Exited reviewer: membership sees it (no add, no remove), the
+        // layout omits it.
+        let snap = roster_snap(&[("claude", true), ("r1", false), ("r2", false)]);
+        let all = live(&[("claude", true), ("r1", false), ("r2", false)]);
+        let mut r = PaneReconciler::new();
+        let mut io = FakeIo::with_verify(vec![Some(all.clone())], vec![Some(all.clone())]);
+        io.dead.insert("r2".into());
+        io.placed_results = vec![false].into();
+        r.reconcile(RosterView::of(&snap), &mut io);
+        assert_eq!(
+            io.log,
+            vec!["compose claude [r1]", "override", "focus user_pane"],
+            "no add, no remove for the corpse"
+        );
+        assert!(!launches(&io.overrides[0], "r2"));
+
+        // Exited master: membership only, no override issued.
+        let mut r = PaneReconciler::new();
+        let mut io = FakeIo::with_verify(vec![Some(all.clone())], vec![Some(all)]);
+        io.dead.insert("claude".into());
+        io.placed_results = vec![false].into();
+        r.reconcile(RosterView::of(&snap), &mut io);
+        assert_eq!(io.log, vec!["focus user_pane"]);
+        assert!(io.overrides.is_empty(), "no stage to give: no override");
+    }
+
+    /// The orientation the layout is composed at is the tab's, so a
+    /// user who flipped with alt+[ stays flipped.
+    #[test]
+    fn the_layout_keeps_the_tabs_orientation() {
+        let snap = roster_snap(&[("codex", true), ("claude", false)]);
+        let before = live(&[("claude", true), ("codex", false)]);
+        for (orientation, first_split) in [
+            (
+                crate::cli::open_zellij::Orientation::Landscape,
+                "split_direction=\"vertical\"",
+            ),
+            (
+                crate::cli::open_zellij::Orientation::Portrait,
+                "split_direction=\"horizontal\"",
+            ),
+        ] {
+            let mut r = PaneReconciler::new();
+            let mut io = FakeIo::with_verify(vec![Some(before.clone())], vec![None]);
+            io.orientation = orientation;
+            r.reconcile(RosterView::of(&snap), &mut io);
+            let kdl = &io.overrides[0];
+            let tab = kdl.split("swap_tiled_layout").next().unwrap();
+            assert!(
+                tab.contains(first_split),
+                "{orientation:?} main layout opens with {first_split}: {tab}"
+            );
+        }
+    }
+
+    /// A configured marker template is what a roster change applies:
+    /// the user's chrome, the new master at the marker's stage, and no
+    /// generated swap variants — never the built-in layout.
+    #[test]
+    fn a_roster_change_under_a_user_template_applies_that_template() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".clank")).unwrap();
+        std::fs::write(
+            home.path().join(".clank/config.json"),
+            serde_json::json!({
+                "zellij": {
+                    "layout": "layout {\n    tab name=\"USER-CHROME\" {\n        pane size=1 borderless=true {\n            plugin location=\"zellij:tab-bar\"\n        }\n        clank_agents\n    }\n}\n"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let snap = roster_snap(&[("codex", true), ("claude", false)]);
+        let before = live(&[("claude", true), ("codex", false)]);
+        let mut r = PaneReconciler::new();
+        let mut io = FakeIo::with_verify(vec![Some(before)], vec![None]);
+        io.home = Some(home.path().to_path_buf());
+        r.reconcile(RosterView::of(&snap), &mut io);
+        let kdl = &io.overrides[0];
+        assert!(
+            kdl.contains("USER-CHROME"),
+            "the template's own chrome: {kdl}"
+        );
+        assert_stage(kdl, "codex");
+        assert!(
+            !kdl.contains("swap_tiled_layout"),
+            "a template carries no generated swaps: {kdl}"
+        );
+        assert!(
+            !kdl.contains("default_tab_template"),
+            "and never the built-in's chrome: {kdl}"
+        );
+    }
+
+    /// The failure budget covers the WHOLE transaction: an override
+    /// the tab refuses, or a read-back that never confirms, spends it,
+    /// and at the limit the roster is left alone — no override on the
+    /// next refresh — until the roster changes.
+    #[test]
+    fn a_failing_override_is_bounded_and_a_roster_change_resets_the_budget() {
+        let snap = roster_snap(&[("claude", true), ("r1", false), ("r2", false)]);
+        let all = live(&[("claude", true), ("r1", false), ("r2", false)]);
+        let passes = 8;
+        let mut r = PaneReconciler::new();
+        let mut io = FakeIo::with_verify(vec![Some(all.clone()); passes], vec![None; passes]);
+        io.placed_results = vec![false; passes].into();
+        io.override_results = vec![false; passes].into();
+        for _ in 0..passes {
+            r.reconcile(RosterView::of(&snap), &mut io);
+        }
+        let overrides = io.log.iter().filter(|l| l.as_str() == "override").count();
+        assert_eq!(
+            overrides, MAX_FAILED_PASSES as usize,
+            "the budget bounds the overrides; {passes} refreshes issued {overrides}"
+        );
+        assert!(r.converged.is_some(), "left alone");
+
+        // A roster change is a new budget.
+        let grown = roster_snap(&[
+            ("claude", true),
+            ("r1", false),
+            ("r2", false),
+            ("r3", false),
+        ]);
+        let mut io = FakeIo::with_verify(vec![Some(all.clone()), Some(all)], vec![None]);
+        io.placed_results = vec![false].into();
+        r.reconcile(RosterView::of(&grown), &mut io);
+        assert!(
+            io.log.iter().any(|l| l == "override"),
+            "the new roster is acted on: {:?}",
             io.log
         );
     }
 
+    /// A pass whose actions did not stick stays unconverged and the
+    /// next refresh retries — up to the budget.
+    #[test]
+    fn reconciler_stays_unconverged_when_actions_did_not_stick() {
+        let snap = roster_snap(&[("claude", true), ("codex", false)]);
+        let mut r = PaneReconciler::new();
+        let before = live(&[("claude", true)]);
+        let after = live(&[("claude", true)]);
+        let mut io = FakeIo::with_verify(vec![Some(before)], vec![Some(after)]);
+        r.reconcile(RosterView::of(&snap), &mut io);
+        assert!(
+            r.converged.is_none(),
+            "not converged: the add did not stick"
+        );
+    }
+
+    /// A failed listing touches nothing and stays unconverged; the
+    /// next refresh retries and verifies.
+    #[test]
+    fn reconciler_retries_after_a_failed_listing_and_verifies_convergence() {
+        let snap = roster_snap(&[("claude", true), ("codex", false)]);
+        let mut r = PaneReconciler::new();
+        let mut io = FakeIo::with_verify(
+            vec![
+                None,
+                Some(live(&[("claude", true)])),
+                Some(live(&[("claude", true), ("codex", false)])),
+            ],
+            vec![Some(live(&[("claude", true), ("codex", false)]))],
+        );
+        assert!(!r.reconcile(RosterView::of(&snap), &mut io));
+        assert!(io.log.is_empty() && r.converged.is_none());
+        assert!(r.reconcile(RosterView::of(&snap), &mut io));
+        assert!(io.log.iter().any(|l| l == "add codex"));
+        assert!(r.converged.is_some());
+    }
+
+    /// The pane on the stage must be the roster master for the read-back
+    /// to converge: a re-layout that did not stick leaves the new master
+    /// in the stack, and that is not converged.
+    #[test]
+    fn reconciler_rejects_a_master_in_the_stack_at_verify() {
+        let snap = roster_snap(&[("new-master", true), ("codex", false)]);
+        let mut r = PaneReconciler::new();
+        let before = live(&[("old", true), ("codex", false)]);
+        let after = live(&[("new-master", false), ("codex", false)]);
+        let mut io =
+            FakeIo::with_verify(vec![Some(before.clone()), Some(before)], vec![Some(after)]);
+        r.reconcile(RosterView::of(&snap), &mut io);
+        assert_eq!(r.converged, None, "master in the stack is not converged");
+    }
+
+    /// Placement is part of the outcome for every pass: a remove-only
+    /// pass whose read-back says the reviewers are not stacked does
+    /// not converge.
     #[test]
     fn a_remove_only_pass_still_answers_for_placement() {
-        // codex on d5121e1: a pass that only REMOVES (or only
-        // relocates) adds nothing, so it used to skip the placement
-        // question entirely and cache on label/title alone — leaving
-        // an unstacked tab remembered as converged.
         let snap = roster_snap(&[("claude", true), ("r1", false)]);
-        // Live has a stale extra reviewer → the plan is remove-only.
         let before = live(&[("claude", true), ("r1", false), ("gone", false)]);
         let after = live(&[("claude", true), ("r1", false)]);
         let mut r = PaneReconciler::new();
-        let mut io = FakeIo::with_verify(vec![Some(before)], vec![Some(after)]);
+        let mut io =
+            FakeIo::with_verify(vec![Some(before), Some(after.clone())], vec![Some(after)]);
         io.verify_placed = vec![false].into();
         r.reconcile(RosterView::of(&snap), &mut io);
-        assert!(
-            io.log.iter().any(|l| l.starts_with("remove")),
-            "sanity: this pass removes; got {:?}",
-            io.log
-        );
-        assert!(
-            r.converged.is_none(),
-            "an unstacked result must not converge just because nothing was added"
-        );
+        assert!(io.log.iter().any(|l| l.starts_with("remove")));
+        assert!(r.converged.is_none());
     }
 
+    /// A tab whose labels are all present but not placed is re-laid,
+    /// not cached.
     #[test]
-    fn repair_is_bounded_when_placement_can_never_succeed() {
-        // THE churn. Three of the four ways placement can fail cannot
-        // be fixed by trying again — reviewers split across tabs, the
-        // instrument pane already inside the stack (no `break-pane`
-        // exists), and a `stack-panes` the server silently rejected.
-        // Retrying them every refresh is what moved the user's focus
-        // to a pane where nothing was happening, indefinitely.
-        //
-        // Asserted on the number of ACTIONS, not the verdict: the
-        // symptom was the repeated work, so a fix that keeps answering
-        // "not placed" is fine as long as it stops POKING the tab.
+    fn an_unplaced_tab_is_re_laid_instead_of_cached() {
         let snap = roster_snap(&[("claude", true), ("r1", false), ("r2", false)]);
-        let all_live = live(&[("claude", true), ("r1", false), ("r2", false)]);
-        let passes = 8;
+        let all = live(&[("claude", true), ("r1", false), ("r2", false)]);
         let mut r = PaneReconciler::new();
-        let mut io = FakeIo::with_verify(vec![Some(all_live.clone()); passes], vec![None; passes]);
-        // Placement NEVER succeeds, however many times it is tried.
-        io.placed_results = vec![false; passes * 2].into();
-        io.stack_results = vec![false; passes * 2].into();
-
-        for _ in 0..passes {
-            r.reconcile(RosterView::of(&snap), &mut io);
-        }
-
-        let attempts = io.log.iter().filter(|l| l.starts_with("stack ")).count();
-        assert!(
-            attempts <= MAX_FAILED_PASSES as usize,
-            "repair must be bounded: {attempts} attempts over {passes} passes; log {:?}",
-            io.log
-        );
-        assert!(
-            r.converged.is_some(),
-            "after the bound the tab is left alone until `clank open` rebuilds it"
-        );
-    }
-
-    #[test]
-    fn a_failing_add_is_bounded_too_not_only_a_failing_restack() {
-        // The budget originally lived only in the placement branch, so
-        // an add / remove / relocate that never verifies kept acting
-        // on the tab every refresh — the same churn by another door,
-        // and it falsified the plan's own acceptance criterion (codex
-        // on dfeff8c).
-        let snap = roster_snap(&[("claude", true), ("r1", false), ("r2", false)]);
-        // The listing never shows r2, so the pass always plans an add
-        // and the verifying read never confirms.
-        let missing = live(&[("claude", true), ("r1", false)]);
-        let passes = 8;
-        let mut r = PaneReconciler::new();
-        let mut io = FakeIo::with_verify(vec![Some(missing.clone()); passes], vec![None; passes]);
-
-        for _ in 0..passes {
-            r.reconcile(RosterView::of(&snap), &mut io);
-        }
-
-        let adds = io.log.iter().filter(|l| l.starts_with("add ")).count();
-        assert!(
-            adds <= MAX_FAILED_PASSES as usize,
-            "a never-verifying add must be bounded: {adds} over {passes} passes; log {:?}",
-            io.log
-        );
-    }
-
-    #[test]
-    fn a_roster_change_reopens_repair_after_the_bound() {
-        // The bound must not wedge a tab permanently: a roster change
-        // both invalidates the count and can make repair possible
-        // again (a member arriving or leaving changes the layout).
-        let snap_a = roster_snap(&[("claude", true), ("r1", false), ("r2", false)]);
-        let live_a = live(&[("claude", true), ("r1", false), ("r2", false)]);
-        let mut r = PaneReconciler::new();
-        let mut io = FakeIo::with_verify(vec![Some(live_a); 6], vec![None; 6]);
-        io.placed_results = vec![false; 12].into();
-        io.stack_results = vec![false; 12].into();
-        for _ in 0..4 {
-            r.reconcile(RosterView::of(&snap_a), &mut io);
-        }
-        let before = io.log.iter().filter(|l| l.starts_with("stack ")).count();
-
-        // A third reviewer joins: new roster, fresh budget.
-        let snap_b = roster_snap(&[
-            ("claude", true),
-            ("r1", false),
-            ("r2", false),
-            ("r3", false),
-        ]);
-        let live_b = live(&[
-            ("claude", true),
-            ("r1", false),
-            ("r2", false),
-            ("r3", false),
-        ]);
-        let mut io2 = FakeIo::with_verify(vec![Some(live_b); 3], vec![None; 3]);
-        io2.placed_results = vec![false; 6].into();
-        io2.stack_results = vec![false; 6].into();
-        r.reconcile(RosterView::of(&snap_b), &mut io2);
-        assert!(
-            io2.log.iter().any(|l| l.starts_with("stack ")),
-            "a changed roster retries; before={before}, log {:?}",
-            io2.log
-        );
-    }
-
-    #[test]
-    fn a_second_pass_repairs_placement_instead_of_caching_it() {
-        // codex on 3d3ffce: after a failed stack the panes EXIST, so
-        // the next pass sees every label and would take the
-        // label-only converged return — the broken placement would
-        // never be retried, and a tab broken before this code existed
-        // would be accepted as fine. Presence is not placement.
-        let snap = roster_snap(&[("claude", true), ("r1", false), ("r2", false)]);
-        let all_live = live(&[("claude", true), ("r1", false), ("r2", false)]);
-        let mut r = PaneReconciler::new();
-        let mut io = FakeIo::with_verify(vec![Some(all_live)], vec![None]);
-        // Labels all present, but NOT stacked; the repair fails too.
+        let mut io = FakeIo::with_verify(vec![Some(all.clone())], vec![Some(all)]);
         io.placed_results = vec![false].into();
-        io.stack_results = vec![false].into();
-        let acted = r.reconcile(RosterView::of(&snap), &mut io);
+        r.reconcile(RosterView::of(&snap), &mut io);
+        assert_eq!(
+            io.log,
+            vec!["compose claude [r1,r2]", "override", "focus user_pane"]
+        );
+        assert!(r.converged.is_some(), "the read-back confirmed it");
+    }
 
-        assert!(acted, "an unplaced tab is work, not a no-op");
-        assert!(
-            io.log.iter().any(|l| l.starts_with("stack ")),
-            "the second pass must attempt repair; got {:?}",
+    /// A pane created this pass is believed live until a listing shows
+    /// it, so a lagging listing cannot open a second one.
+    #[test]
+    fn reconciler_does_not_reopen_a_pane_whose_listing_has_not_caught_up() {
+        let snap = roster_snap(&[("claude", true), ("codex", false)]);
+        let mut r = PaneReconciler::new();
+        let stale = live(&[("claude", true)]);
+        let mut io = FakeIo::with_verify(
+            vec![
+                Some(stale.clone()),
+                Some(stale.clone()),
+                Some(stale.clone()),
+            ],
+            vec![Some(stale.clone()), Some(stale)],
+        );
+        r.reconcile(RosterView::of(&snap), &mut io);
+        r.reconcile(RosterView::of(&snap), &mut io);
+        assert_eq!(
+            io.log.iter().filter(|l| l.as_str() == "add codex").count(),
+            1,
+            "believed live, so not opened twice: {:?}",
             io.log
         );
-        assert!(
-            r.converged.is_none(),
-            "a failed repair must not be cached as converged"
-        );
     }
 
     #[test]
-    fn an_unrepairable_lone_reviewer_does_not_spin() {
-        // One reviewer stacked with the instrument pane cannot be
-        // separated by any action zellij offers, so retrying it on
-        // every refresh would reinstate the unbounded work this plan
-        // exists to remove. It is cached — but only because there is
-        // nothing left to try, and only until the roster changes.
-        let snap = roster_snap(&[("claude", true), ("r1", false)]);
-        let all_live = live(&[("claude", true), ("r1", false)]);
+    fn a_confirmed_creation_stops_being_believed() {
+        let snap = roster_snap(&[("claude", true), ("codex", false)]);
         let mut r = PaneReconciler::new();
-        let mut io = FakeIo::with_verify(vec![Some(all_live)], vec![None]);
-        io.placed_results = vec![false].into();
-        io.stack_results = vec![false].into();
+        let both = live(&[("claude", true), ("codex", false)]);
+        let mut io = FakeIo::with_verify(
+            vec![Some(live(&[("claude", true)])), Some(both.clone())],
+            vec![Some(both)],
+        );
         r.reconcile(RosterView::of(&snap), &mut io);
-        assert!(
-            r.converged.is_some(),
-            "with one reviewer there is no repair to retry; spinning helps nobody"
-        );
-
-        // TWO reviewers is repairable, so a failure must NOT be cached.
-        let snap2 = roster_snap(&[("claude", true), ("r1", false), ("r2", false)]);
-        let live2 = live(&[("claude", true), ("r1", false), ("r2", false)]);
-        let mut r2 = PaneReconciler::new();
-        let mut io2 = FakeIo::with_verify(vec![Some(live2)], vec![None]);
-        io2.placed_results = vec![false].into();
-        io2.stack_results = vec![false].into();
-        r2.reconcile(RosterView::of(&snap2), &mut io2);
-        assert!(
-            r2.converged.is_none(),
-            "a repairable failure must stay unconverged and retry"
-        );
+        assert!(r.pending.is_empty(), "the verify listed it: belief retired");
     }
 
+    /// The memory MUST expire: a `new-pane` that reported an id which
+    /// never reaches a listing would otherwise block its label forever.
+    /// Each pass grows the roster so none is skipped as converged; the
+    /// listing never catches up.
     #[test]
-    fn a_placed_tab_converges_without_acting() {
-        // The other half: when the labels are all present AND the
-        // reviewers are stacked, the pass must stay a no-op — the
-        // repair path must not fire on every refresh.
-        let snap = roster_snap(&[("claude", true), ("r1", false)]);
-        let all_live = live(&[("claude", true), ("r1", false)]);
+    fn a_creation_that_never_appears_stops_blocking_its_label() {
         let mut r = PaneReconciler::new();
-        let mut io = FakeIo::with_verify(vec![Some(all_live)], vec![None]);
-        io.placed_results = vec![true].into();
-        let acted = r.reconcile(RosterView::of(&snap), &mut io);
-        assert!(!acted);
-        assert!(
-            io.log.is_empty(),
-            "no actions on a placed tab: {:?}",
-            io.log
-        );
-        assert!(r.converged.is_some());
-    }
-
-    #[test]
-    fn unconfirmed_placement_keeps_the_pass_unconverged() {
-        // `stack-panes` exits 0 on a stale id without doing anything,
-        // so its status proves nothing and placement is READ BACK. If
-        // the reviewers are not stacked afterwards, the pass must not
-        // cache convergence — otherwise a silent no-op is remembered
-        // as success and never retried (codex on 2d273c6).
-        let snap = roster_snap(&[("claude", true), ("r1", false)]);
-        let mut r = PaneReconciler::new();
-        let before = live(&[("claude", true)]);
-        // Verify would say converged; placement says otherwise.
-        let after = live(&[("claude", true), ("r1", false)]);
-        let mut io = FakeIo::with_verify(vec![Some(before)], vec![Some(after)]);
-        // The VERIFYING read is what decides: `stack-panes` exits 0 on
-        // a stale id without doing anything, so its status proves
-        // nothing and is not consulted.
-        io.verify_placed = vec![false].into();
-        r.reconcile(RosterView::of(&snap), &mut io);
-        assert!(
-            r.converged.is_none(),
-            "placement not confirmed → the pass must stay unconverged so it retries"
-        );
-    }
-
-    // ── reopen-an-agents-pane-from-its-menu: the targeted reopen ──
-
-    /// A worker that has seen the roster and verified it converged —
-    /// the state a hand-closed pane leaves behind: nothing in the view
-    /// changed, so no pass will look again.
-    fn converged_worker(
-        labels: &[&str],
-        master: &str,
-        live_now: Vec<(String, bool)>,
-    ) -> WorkerState {
-        let mut state = WorkerState::new();
-        let mut io = FakeIo::new(vec![Some(live_now)]);
-        state.handle(
-            wb(Some(view(labels, Some(master))), None, Vec::new()),
-            &mut io,
-            |_, _| {},
-        );
-        assert!(io.log.is_empty(), "converged from the start: {:?}", io.log);
-        state
-    }
-
-    fn reopen(state: &mut WorkerState, io: &mut FakeIo, label: &str) -> ReopenOutcome {
-        let out = state.handle(wb(None, None, vec![label.to_string()]), io, |_, _| {});
-        assert_eq!(out.len(), 1, "one request, one answer, nothing probed");
-        match &out[0] {
-            Report::Reopened(l, outcome) if l == label => outcome.clone(),
-            other => panic!("expected {label}'s outcome, got {other:?}"),
+        let stale = live(&[("claude", true)]);
+        let mut adds = 0;
+        for extra in [Vec::new(), vec!["ruthless"], vec!["kimi", "ruthless"]] {
+            let mut labels = vec![("claude", true), ("codex", false)];
+            labels.extend(extra.iter().map(|l| (*l, false)));
+            let snap = roster_snap(&labels);
+            let mut io = FakeIo::with_verify(
+                vec![Some(stale.clone()), Some(stale.clone())],
+                vec![Some(stale.clone())],
+            );
+            r.reconcile(RosterView::of(&snap), &mut io);
+            adds += io.log.iter().filter(|l| *l == "add codex").count();
         }
+        assert_eq!(
+            adds, 2,
+            "codex is retried once the belief expires, not stranded"
+        );
     }
+
+    // ── reopen: one label, then the layout ──
 
     #[test]
     fn reopening_one_of_two_missing_panes_adds_only_that_one() {
-        // A full pass would add BOTH — the user asked for one (codex on
-        // 30ff9f3).
-        let all = live(&[("claude", true), ("r1", false), ("r2", false)]);
-        let mut state = converged_worker(&["claude", "r1", "r2"], "claude", all);
-        // The master's pane has lost its title too, so a full pass
-        // would ALSO relocate; that is not this request's to make.
+        let snap = roster_snap(&[("claude", true), ("r1", false), ("r2", false)]);
+        let mut r = PaneReconciler::new();
+        let before = live(&[("claude", true)]);
+        let relisted = live(&[("claude", true), ("r1", false)]);
         let mut io = FakeIo::with_verify(
-            vec![Some(live(&[("claude", false)]))],
-            vec![Some(live(&[("claude", false), ("r2", false)]))],
+            vec![Some(before), Some(relisted.clone())],
+            vec![Some(relisted)],
         );
-        assert_eq!(reopen(&mut state, &mut io, "r2"), ReopenOutcome::Reopened);
+        let out = r.reopen(&RosterView::of(&snap), "r1", &mut io);
+        assert_eq!(out, ReopenOutcome::Reopened);
         assert_eq!(
             io.log,
-            vec!["add r2", "stack [terminal_r2]", "focus user_pane"],
-            "exactly r2, stacked with the reviewers, focus restored"
+            vec![
+                "add r1",
+                "compose claude [r1]",
+                "override",
+                "focus user_pane"
+            ],
+            "r2 is not launched by r1's reopen"
         );
-        assert!(!io.log.iter().any(|l| l.contains("r1")), "r1 stays absent");
-        assert_eq!(
-            io.add_departing,
-            vec![Vec::<String>::new()],
-            "nothing is vacated"
-        );
+        assert!(!launches(&io.overrides[0], "r2"));
     }
 
     #[test]
-    fn reopening_the_master_adds_and_stages_it() {
-        let all = live(&[("claude", true), ("r1", false)]);
-        let mut state = converged_worker(&["claude", "r1"], "claude", all);
-        // The snapshot after the add is what the relocation classifies;
-        // the verify is what says it worked.
-        let mut io = FakeIo::with_verify(
-            vec![
-                Some(live(&[("r1", false)])),
-                Some(live(&[("r1", false), ("claude", false)])),
-            ],
-            vec![Some(live(&[("r1", false), ("claude", true)]))],
-        );
+    fn reopening_the_master_adds_and_stages_it_by_the_same_override() {
+        let snap = roster_snap(&[("claude", true), ("codex", false)]);
+        let mut r = PaneReconciler::new();
+        let before = live(&[("codex", false)]);
+        let relisted = live(&[("codex", false), ("claude", false)]);
+        let after = live(&[("codex", false), ("claude", true)]);
+        let mut io = FakeIo::with_verify(vec![Some(before), Some(relisted)], vec![Some(after)]);
         assert_eq!(
-            reopen(&mut state, &mut io, "claude"),
+            r.reopen(&RosterView::of(&snap), "claude", &mut io),
             ReopenOutcome::Reopened
         );
-        assert_eq!(
-            io.log,
-            vec!["add claude", "relocate claude<-None", "focus user_pane"]
-        );
-        assert_eq!(
-            io.snapshots_taken, 2,
-            "one to plan, one fresh for the relocation"
-        );
-        assert_eq!(io.verifies_taken, 1, "staged is read back, not assumed");
+        assert_stage(&io.overrides[0], "claude");
     }
 
     #[test]
     fn a_failed_add_places_nothing() {
-        // Stacking or relocating on behalf of a pane that was never
-        // made rearranges live panes for nothing (codex on 54acac6).
-        let all = live(&[("claude", true), ("r1", false), ("r2", false)]);
-        let mut state = converged_worker(&["claude", "r1", "r2"], "claude", all.clone());
-        let mut io = FakeIo::new(vec![Some(live(&[("claude", true), ("r1", false)]))]);
-        io.add_results.push_back(false);
-        assert_eq!(reopen(&mut state, &mut io, "r2"), ReopenOutcome::NotCreated);
-        assert_eq!(io.log, vec!["add r2", "focus user_pane"], "no stack");
-        let mut state = converged_worker(&["claude", "r1", "r2"], "claude", all);
-        let mut io = FakeIo::new(vec![Some(live(&[("r1", false), ("r2", false)]))]);
-        io.add_results.push_back(false);
+        let snap = roster_snap(&[("claude", true), ("codex", false)]);
+        let mut r = PaneReconciler::new();
+        let mut io = FakeIo::new(vec![Some(live(&[("claude", true)]))]);
+        io.add_results = vec![false].into();
         assert_eq!(
-            reopen(&mut state, &mut io, "claude"),
+            r.reopen(&RosterView::of(&snap), "codex", &mut io),
             ReopenOutcome::NotCreated
         );
-        assert_eq!(io.log, vec!["add claude", "focus user_pane"], "no relocate");
-        assert_eq!(
-            io.snapshots_taken, 1,
-            "no fresh listing for a relocation that must not run"
-        );
+        assert!(io.overrides.is_empty(), "nothing to place, nothing re-laid");
     }
 
     #[test]
     fn reopened_is_the_read_back_not_the_creation() {
-        // A reviewer the read-back lists but does not find stacked, and
-        // one the read-back does not list at all.
-        let all = live(&[("claude", true), ("r1", false), ("r2", false)]);
-        for (listed, stacked) in [
-            (
-                live(&[("claude", true), ("r1", false), ("r2", false)]),
-                false,
-            ),
-            (live(&[("claude", true), ("r1", false)]), true),
-        ] {
-            let mut state = converged_worker(&["claude", "r1", "r2"], "claude", all.clone());
-            let mut io = FakeIo::with_verify(
-                vec![Some(live(&[("claude", true), ("r1", false)]))],
-                vec![Some(listed)],
-            );
-            io.verify_placed.push_back(stacked);
-            assert_eq!(reopen(&mut state, &mut io, "r2"), ReopenOutcome::Unplaced);
-            assert_eq!(
-                io.log,
-                vec!["add r2", "stack [terminal_r2]", "focus user_pane"]
-            );
-        }
-        // A master the tab still does not title master after the
-        // relocation — and one whose read-back never answered.
-        for verify in [Some(live(&[("r1", false), ("claude", false)])), None] {
-            let mut state = converged_worker(&["claude", "r1", "r2"], "claude", all.clone());
-            let mut io = FakeIo::with_verify(
-                vec![
-                    Some(live(&[("r1", false), ("r2", false)])),
-                    Some(live(&[("r1", false), ("r2", false), ("claude", false)])),
-                ],
-                vec![verify],
-            );
-            assert_eq!(
-                reopen(&mut state, &mut io, "claude"),
-                ReopenOutcome::Unplaced
-            );
-            assert!(io.log.contains(&"relocate claude<-None".to_string()));
-        }
+        let snap = roster_snap(&[("claude", true), ("codex", false)]);
+        let mut r = PaneReconciler::new();
+        let before = live(&[("claude", true)]);
+        let relisted = live(&[("claude", true), ("codex", false)]);
+        // The read-back says the reviewer is NOT in the stack.
+        let mut io = FakeIo::with_verify(
+            vec![Some(before), Some(relisted.clone())],
+            vec![Some(relisted)],
+        );
+        io.verify_placed = vec![false].into();
+        assert_eq!(
+            r.reopen(&RosterView::of(&snap), "codex", &mut io),
+            ReopenOutcome::Unplaced
+        );
     }
 
     #[test]
     fn reopening_a_pane_that_exists_adds_nothing() {
-        let all = live(&[("claude", true), ("r1", false), ("r2", false)]);
-        let mut state = converged_worker(&["claude", "r1", "r2"], "claude", all.clone());
-        let mut io = FakeIo::new(vec![Some(all)]);
+        let snap = roster_snap(&[("claude", true), ("codex", false)]);
+        let mut r = PaneReconciler::new();
+        let mut io = FakeIo::new(vec![Some(live(&[("claude", true), ("codex", false)]))]);
         assert_eq!(
-            reopen(&mut state, &mut io, "r1"),
+            r.reopen(&RosterView::of(&snap), "codex", &mut io),
             ReopenOutcome::AlreadyOpen
         );
-        assert!(io.log.is_empty(), "no pane call: {:?}", io.log);
-        assert_eq!(io.snapshots_taken, 1, "the one listing that answered");
-        // r1 present, r2 missing: asking for r1 is still "already
-        // open" — the plan having SOME add is not this label's add.
-        let mut io = FakeIo::new(vec![Some(live(&[("claude", true), ("r1", false)]))]);
-        assert_eq!(
-            reopen(&mut state, &mut io, "r1"),
-            ReopenOutcome::AlreadyOpen
-        );
-        assert!(
-            io.log.is_empty(),
-            "r2 is not opened on r1's behalf: {:?}",
-            io.log
-        );
+        assert!(io.log.is_empty());
     }
 
     #[test]
     fn a_reopen_leaves_the_converged_cache_alone() {
-        // The retry loop seeing an unconverged tab would add the OTHER
-        // missing pane next round — the same leak one step removed.
-        let all = live(&[("claude", true), ("r1", false), ("r2", false)]);
-        let mut state = converged_worker(&["claude", "r1", "r2"], "claude", all);
+        let snap = roster_snap(&[("claude", true), ("codex", false)]);
+        let mut r = PaneReconciler::new();
+        let both = live(&[("claude", true), ("codex", false)]);
+        let mut io = FakeIo::new(vec![Some(both.clone())]);
+        r.reconcile(RosterView::of(&snap), &mut io);
+        let cached = r.converged.clone();
+        assert!(cached.is_some());
         let mut io = FakeIo::with_verify(
-            vec![Some(live(&[("claude", true)]))],
-            vec![Some(live(&[("claude", true), ("r2", false)]))],
+            vec![Some(live(&[("claude", true)])), Some(both.clone())],
+            vec![Some(both)],
         );
-        assert_eq!(reopen(&mut state, &mut io, "r2"), ReopenOutcome::Reopened);
-        let before = io.snapshots_taken;
-        // The same roster view again: still cached as converged, so no
-        // listing and no pass.
-        state.handle(
-            wb(
-                Some(view(&["claude", "r1", "r2"], Some("claude"))),
-                None,
-                Vec::new(),
-            ),
-            &mut io,
-            |_, _| {},
-        );
-        assert_eq!(io.snapshots_taken, before, "no pass ran");
-        assert!(
-            !io.log.iter().any(|l| l == "add r1"),
-            "r1 was never asked for"
-        );
+        r.reopen(&RosterView::of(&snap), "codex", &mut io);
+        assert_eq!(r.converged, cached, "a reopen never touches the cache");
     }
 
     #[test]
     fn a_reopen_without_the_lease_touches_nothing() {
-        // A reopen IS list-then-create, the two-TUI race the lease
-        // exists for (codex on 70df3aa).
-        let all = live(&[("claude", true), ("r1", false)]);
-        let mut state = converged_worker(&["claude", "r1"], "claude", all);
+        let snap = roster_snap(&[("claude", true), ("codex", false)]);
+        let mut r = PaneReconciler::new();
         let mut io = FakeIo::new(vec![Some(live(&[("claude", true)]))]);
         io.may_reconcile = false;
         assert_eq!(
-            reopen(&mut state, &mut io, "r1"),
+            r.reopen(&RosterView::of(&snap), "codex", &mut io),
             ReopenOutcome::HeldElsewhere
         );
-        assert_eq!(io.snapshots_taken, 0, "no listing");
-        assert!(io.log.is_empty(), "no pane call: {:?}", io.log);
-        assert_eq!(
-            ReopenOutcome::HeldElsewhere.describe("r1"),
-            "another status TUI holds this repo's panes — reopen from there"
-        );
+        assert_eq!(io.snapshots_taken, 0);
     }
 
     #[test]
     fn a_reopen_reports_an_unanswered_listing_and_an_unmade_pane() {
-        let all = live(&[("claude", true), ("r1", false)]);
-        let mut state = converged_worker(&["claude", "r1"], "claude", all);
+        let snap = roster_snap(&[("claude", true), ("codex", false)]);
+        let mut r = PaneReconciler::new();
         let mut io = FakeIo::new(vec![None]);
-        assert_eq!(reopen(&mut state, &mut io, "r1"), ReopenOutcome::NoListing);
-        assert!(io.log.is_empty());
-        let mut io = FakeIo::new(vec![Some(live(&[("claude", true)]))]);
-        io.add_results.push_back(false);
-        assert_eq!(reopen(&mut state, &mut io, "r1"), ReopenOutcome::NotCreated);
         assert_eq!(
-            reopen(&mut state, &mut FakeIo::new(vec![]), "nobody"),
+            r.reopen(&RosterView::of(&snap), "codex", &mut io),
+            ReopenOutcome::NoListing
+        );
+        assert_eq!(
+            r.reopen(&RosterView::of(&snap), "nobody", &mut io),
             ReopenOutcome::NotOnRoster
         );
     }
 
+    /// A pane the reconciler made, believed live, then closed by hand:
+    /// the first ask reopens it, because the verify that listed it
+    /// retired the belief (codex on 1bf604d).
     #[test]
     fn a_pane_the_reconciler_made_and_the_user_closed_reopens_on_the_first_ask() {
-        // The creating pass believes its pane until a listing shows
-        // it. The verify DID show it, the view was cached converged,
-        // and no later pass aged the belief — so a hand-closed pane
-        // was "already open" on the first reopen and only the second
-        // worked (codex on 1bf604d).
-        let mut state = WorkerState::new();
+        let snap = roster_snap(&[("claude", true), ("codex", false)]);
+        let mut r = PaneReconciler::new();
+        let both = live(&[("claude", true), ("codex", false)]);
         let mut io = FakeIo::with_verify(
-            vec![Some(live(&[("claude", true), ("r1", false)]))],
-            vec![Some(live(&[
-                ("claude", true),
-                ("r1", false),
-                ("r2", false),
-            ]))],
+            vec![Some(live(&[("claude", true)])), Some(both.clone())],
+            vec![Some(both.clone())],
         );
+        r.reconcile(RosterView::of(&snap), &mut io);
+        assert!(r.pending.is_empty());
+        // Hand-closed: the listing shows claude alone again.
+        let mut io = FakeIo::with_verify(
+            vec![Some(live(&[("claude", true)])), Some(both.clone())],
+            vec![Some(both)],
+        );
+        assert_eq!(
+            r.reopen(&RosterView::of(&snap), "codex", &mut io),
+            ReopenOutcome::Reopened
+        );
+    }
+
+    // ── retitles follow the roster ──
+
+    /// After a promotion the retitler stamps the NEW roles from the
+    /// roster's glyph data, off a fresh listing — nothing is read from
+    /// the panes' old titles.
+    #[test]
+    fn retitles_after_a_reconcile_follow_the_roster() {
+        let mut state = WorkerState::new();
+        let before = live(&[("claude", true), ("codex", false)]);
+        let after = live(&[("claude", false), ("codex", true)]);
+        let mut io =
+            FakeIo::with_verify(vec![Some(before), Some(after.clone())], vec![Some(after)]);
+        let renames = std::cell::RefCell::new(Vec::<(String, String)>::new());
+        let promoted = roster_snap(&[("codex", true), ("claude", false)]);
         state.handle(
             wb(
-                Some(view(&["claude", "r1", "r2"], Some("claude"))),
-                None,
+                Some(RosterView::of(&promoted)),
+                Some(glyphs_for(
+                    "codex",
+                    &[("claude", "M", "R"), ("codex", "M", "R")],
+                )),
                 Vec::new(),
             ),
             &mut io,
-            |_, _| {},
+            |id, title| renames.borrow_mut().push((id.into(), title.into())),
         );
-        assert_eq!(io.log[0], "add r2", "the pass created r2");
-        assert!(
-            state.reconciler.pending.is_empty(),
-            "the verify listed it: {:?}",
-            state.reconciler.pending
+        let mut got = renames.borrow().clone();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                (
+                    "terminal_claude".to_string(),
+                    "R claude (reviewer)".to_string()
+                ),
+                ("terminal_codex".to_string(), "M codex (master)".to_string()),
+            ]
         );
-        // The user closes r2 by hand.
-        let mut io = FakeIo::with_verify(
-            vec![Some(live(&[("claude", true), ("r1", false)]))],
-            vec![Some(live(&[
-                ("claude", true),
-                ("r1", false),
-                ("r2", false),
-            ]))],
-        );
-        assert_eq!(reopen(&mut state, &mut io, "r2"), ReopenOutcome::Reopened);
-        assert_eq!(io.log[0], "add r2", "the FIRST ask reopens it");
-        // And the reopen's own creation is confirmed by its read-back,
-        // so closing it again and asking again works the same way.
-        let mut io = FakeIo::with_verify(
-            vec![Some(live(&[("claude", true), ("r1", false)]))],
-            vec![Some(live(&[
-                ("claude", true),
-                ("r1", false),
-                ("r2", false),
-            ]))],
-        );
-        assert_eq!(reopen(&mut state, &mut io, "r2"), ReopenOutcome::Reopened);
-        assert_eq!(io.log[0], "add r2");
     }
 
-    // ── the-tui-knows-whether-a-pane-is-open: presence ──────────
+    /// A refresh whose listing fails after an acting reconcile renames
+    /// nothing: the rows were invalidated and there is nothing fresh
+    /// to stamp from (codex afb6d43).
+    #[test]
+    fn failed_re_list_after_an_acting_reconcile_renames_nothing() {
+        let mut state = WorkerState::new();
+        let before = live(&[("claude", true), ("codex", false)]);
+        let after = live(&[("claude", false), ("codex", true)]);
+        // Reconcile lists once; the retitle listing (the batch's second
+        // snapshot) fails.
+        let mut io = FakeIo::with_verify(vec![Some(before), None], vec![Some(after)]);
+        let renames = std::cell::RefCell::new(Vec::<(String, String)>::new());
+        let promoted = roster_snap(&[("codex", true), ("claude", false)]);
+        state.handle(
+            wb(
+                Some(RosterView::of(&promoted)),
+                Some(glyphs_for(
+                    "codex",
+                    &[("claude", "M", "R"), ("codex", "M", "R")],
+                )),
+                Vec::new(),
+            ),
+            &mut io,
+            |id, title| renames.borrow_mut().push((id.into(), title.into())),
+        );
+        assert!(renames.borrow().is_empty(), "{:?}", renames.borrow());
+    }
 
-    fn presence_of(reports: &[Report]) -> Option<Option<Vec<String>>> {
-        reports.iter().find_map(|r| match r {
-            Report::Presence(live) => Some(live.as_ref().map(|s| s.iter().cloned().collect())),
-            _ => None,
-        })
+    /// A roster change invalidates the cached rows even when another
+    /// TUI already converged the tab and this reconcile is a no-op.
+    #[test]
+    fn roster_change_invalidates_even_when_another_tui_already_converged() {
+        let mut state = WorkerState::new();
+        let both = live(&[("claude", true), ("codex", false)]);
+        let renames = std::cell::RefCell::new(Vec::<(String, String)>::new());
+        let first = roster_snap(&[("claude", true), ("codex", false)]);
+        let mut io = FakeIo::new(vec![Some(both.clone()), Some(both.clone())]);
+        state.handle(
+            wb(
+                Some(RosterView::of(&first)),
+                Some(glyphs(&[("claude", "M", "R"), ("codex", "M", "R")])),
+                Vec::new(),
+            ),
+            &mut io,
+            |id, title| renames.borrow_mut().push((id.into(), title.into())),
+        );
+        let n = renames.borrow().len();
+        assert_eq!(n, 2);
+        // Another TUI promoted codex and converged the tab: this
+        // reconcile finds it placed (no-op), but the roles changed.
+        let promoted = roster_snap(&[("codex", true), ("claude", false)]);
+        let staged = live(&[("claude", false), ("codex", true)]);
+        let mut io = FakeIo::new(vec![Some(staged.clone()), Some(staged)]);
+        state.handle(
+            wb(
+                Some(RosterView::of(&promoted)),
+                Some(glyphs_for(
+                    "codex",
+                    &[("claude", "M", "R"), ("codex", "M", "R")],
+                )),
+                Vec::new(),
+            ),
+            &mut io,
+            |id, title| renames.borrow_mut().push((id.into(), title.into())),
+        );
+        assert_eq!(renames.borrow().len(), n + 2, "both panes restamped");
+    }
+
+    /// A retitle that must list and a probe in the same batch share
+    /// one listing.
+    #[test]
+    fn a_retitle_that_must_list_and_a_probe_share_one_listing() {
+        let mut state = WorkerState::new();
+        let both = live(&[("claude", true), ("codex", false)]);
+        let mut io = FakeIo::new(vec![Some(both)]);
+        let reports = state.handle(
+            WorkerBatch {
+                roster: None,
+                glyphs: Some(glyphs(&[("claude", "M", "R"), ("codex", "M", "R")])),
+                reopens: Vec::new(),
+                probe: true,
+            },
+            &mut io,
+            |_, _| {},
+        );
+        assert_eq!(io.snapshots_taken, 1);
+        assert!(matches!(reports.as_slice(), [Report::Presence(Some(_))]));
     }
 
     #[test]
@@ -2858,9 +2739,7 @@ mod tests {
         // A refresh carries glyphs; it lists anyway, and the presence
         // rides on that.
         let mut io = FakeIo::new(vec![Some(live(&[("claude", true)]))]);
-        let refresh = StatusGlyphs {
-            emoji: [("claude".to_string(), ("M", "R"))].into_iter().collect(),
-        };
+        let refresh = glyphs(&[("claude", "M", "R")]);
         let reports = state.handle(wb(None, Some(refresh), Vec::new()), &mut io, |_, _| {});
         assert_eq!(presence_of(&reports), Some(Some(vec!["claude".into()])));
         // The NEXT refresh, with the retitler's map already in hand,
@@ -2868,13 +2747,7 @@ mod tests {
         // and presence rides on every one (codex on 44e937e).
         let mut io = FakeIo::new(vec![Some(live(&[("claude", true), ("r1", false)]))]);
         let reports = state.handle(
-            wb(
-                None,
-                Some(StatusGlyphs {
-                    emoji: [("claude".to_string(), ("M", "R"))].into_iter().collect(),
-                }),
-                Vec::new(),
-            ),
+            wb(None, Some(glyphs(&[("claude", "M", "R")])), Vec::new()),
             &mut io,
             |_, _| {},
         );
@@ -2989,6 +2862,7 @@ mod tests {
             vec![
                 Some(all.clone()),
                 Some(live(&[("claude", true), ("r1", false)])),
+                Some(all.clone()),
             ],
             vec![Some(all.clone())],
         );
@@ -2999,14 +2873,15 @@ mod tests {
             vec![
                 "remove r2",
                 "add r2",
-                "stack [terminal_r2]",
+                "compose claude [r1,r2]",
+                "override",
                 "focus user_pane"
             ],
-            "the corpse is closed, then a fresh listing, then the add"
+            "the corpse is closed, a fresh listing, the add, a fresh listing, the layout"
         );
         assert_eq!(
-            io.snapshots_taken, 2,
-            "listed again after the close so add does not find the corpse"
+            io.snapshots_taken, 3,
+            "listed after the close so add does not find the corpse, and after the add so the layout names it"
         );
         // Live: nothing closed.
         let mut state = converged_worker(&["claude", "r1", "r2"], "claude", all.clone());
@@ -3066,9 +2941,7 @@ mod tests {
         state.handle(
             wb(
                 Some(view(&["claude"], Some("claude"))),
-                Some(StatusGlyphs {
-                    emoji: [("claude".to_string(), ("M", "R"))].into_iter().collect(),
-                }),
+                Some(glyphs(&[("claude", "M", "R")])),
                 Vec::new(),
             ),
             &mut io,
@@ -3133,112 +3006,6 @@ mod tests {
     }
 
     #[test]
-    fn a_replacement_is_offered_the_departing_pane_as_an_anchor() {
-        // The swap shape: r1 leaves and r2 arrives in ONE pass. r2 has
-        // no peer on the new roster, so the only pane that knows which
-        // tab it belongs in is r1's — still live, because removes run
-        // after the layout.
-        let snap = roster_snap(&[("claude", true), ("r2", false)]);
-        let before = live(&[("claude", true), ("r1", false)]);
-        let mut r = PaneReconciler::new();
-        let mut io = FakeIo::with_verify(vec![Some(before)], vec![None]);
-        r.reconcile(RosterView::of(&snap), &mut io);
-        assert_eq!(io.add_departing, vec![vec!["r1".to_string()]]);
-        // And the departure is still applied, after the layout.
-        let add = io.log.iter().position(|l| l == "add r2");
-        let rm = io.log.iter().position(|l| l.starts_with("remove"));
-        assert!(
-            add < rm,
-            "the arriving pane must be placed before the departing one closes: {:?}",
-            io.log
-        );
-    }
-
-    #[test]
-    fn an_add_with_no_departure_is_offered_nothing() {
-        let snap = roster_snap(&[("claude", true), ("r1", false)]);
-        let before = live(&[("claude", true)]);
-        let mut r = PaneReconciler::new();
-        let mut io = FakeIo::with_verify(vec![Some(before)], vec![None]);
-        r.reconcile(RosterView::of(&snap), &mut io);
-        assert_eq!(io.add_departing, vec![Vec::<String>::new()]);
-    }
-
-    #[test]
-    fn a_title_found_anchor_joins_the_stack_call() {
-        // `stack` names members by exact launch command, so a pane
-        // found by TITLE is invisible to it. Unless the add hands the
-        // anchor id over, the list holds one entry, `stack-panes` gets
-        // no pair to work with, and the pane it was placed against
-        // never joins the stack.
-        let snap = roster_snap(&[("claude", true), ("r1", false)]);
-        let before = live(&[("claude", true)]);
-        let mut r = PaneReconciler::new();
-        let mut io = FakeIo::with_verify(vec![Some(before)], vec![None]);
-        io.add_anchors = vec![Some("terminal_99".to_string())].into();
-        r.reconcile(RosterView::of(&snap), &mut io);
-        assert!(
-            io.log
-                .contains(&"stack [terminal_r1,terminal_99]".to_string()),
-            "anchor must reach the stack set: {:?}",
-            io.log
-        );
-    }
-
-    #[test]
-    fn an_anchor_already_created_this_pass_is_not_stacked_twice() {
-        let snap = roster_snap(&[("claude", true), ("r1", false)]);
-        let before = live(&[("claude", true)]);
-        let mut r = PaneReconciler::new();
-        let mut io = FakeIo::with_verify(vec![Some(before)], vec![None]);
-        io.add_anchors = vec![Some("terminal_r1".to_string())].into();
-        r.reconcile(RosterView::of(&snap), &mut io);
-        assert!(
-            io.log.contains(&"stack [terminal_r1]".to_string()),
-            "duplicate id must not be repeated: {:?}",
-            io.log
-        );
-    }
-
-    #[test]
-    fn adds_are_independent_of_each_other() {
-        // Replaces `later_adds_stack_only_after_a_successful_creation`
-        // (codex 4df5f0c), whose subject is gone: adds no longer chain
-        // through focus, because each one stacks by pane ID afterwards
-        // rather than steering `new-pane --stacked`. What must hold now
-        // is that one add tells the next nothing — including when the
-        // first FAILS, which used to be load-bearing
-        // (zellij-pane-placement-and-cost).
-        let snap = roster_snap(&[("claude", true), ("r1", false), ("r2", false)]);
-        let before = live(&[("claude", true)]);
-
-        let mut r = PaneReconciler::new();
-        let mut io = FakeIo::with_verify(vec![Some(before.clone())], vec![None]);
-        r.reconcile(RosterView::of(&snap), &mut io);
-        assert_eq!(
-            io.log,
-            vec![
-                "add r1",
-                "add r2",
-                "stack [terminal_r1,terminal_r2]",
-                "focus user_pane"
-            ]
-        );
-
-        // A failed first add changes nothing about the second, and the
-        // stack still runs over what DID get made — it contributes no
-        // id, rather than aborting placement for the rest.
-        let mut r = PaneReconciler::new();
-        let mut io = FakeIo::with_verify(vec![Some(before)], vec![None]);
-        io.add_results = vec![false].into();
-        r.reconcile(RosterView::of(&snap), &mut io);
-        assert_eq!(
-            io.log,
-            vec!["add r1", "add r2", "stack [terminal_r2]", "focus user_pane"]
-        );
-    }
-
-    #[test]
     fn worker_coalesces_in_flight_arrivals_into_exactly_one_follow_up() {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::{Arc, Barrier, Mutex};
@@ -3289,14 +3056,12 @@ mod tests {
         // Queue two rosters AND two glyph updates, disconnect before
         // the worker starts: deterministic — one final batch with the
         // newest of EACH kind, then exit.
-        let glyphs_for = |label: &str| StatusGlyphs {
-            emoji: [(label.to_string(), ("M", "R"))].into_iter().collect(),
-        };
+        let named = |label: &str| glyphs(&[(label, "M", "R")]);
         let (tx, rx) = std::sync::mpsc::channel();
         tx.send(WorkerMsg::Roster(view(&["a"], None))).unwrap();
-        tx.send(WorkerMsg::Glyphs(glyphs_for("old"))).unwrap();
+        tx.send(WorkerMsg::Glyphs(named("old"))).unwrap();
         tx.send(WorkerMsg::Roster(view(&["b"], None))).unwrap();
-        tx.send(WorkerMsg::Glyphs(glyphs_for("new"))).unwrap();
+        tx.send(WorkerMsg::Glyphs(named("new"))).unwrap();
         drop(tx);
         let log: Arc<Mutex<Vec<(Option<RosterView>, Option<Vec<String>>)>>> =
             Arc::new(Mutex::new(Vec::new()));
@@ -3308,7 +3073,7 @@ mod tests {
                 move |WorkerBatch { roster, glyphs, .. }| {
                     log2.lock()
                         .unwrap()
-                        .push((roster, glyphs.map(|g| g.emoji.keys().cloned().collect())));
+                        .push((roster, glyphs.map(|g| g.titles.keys().cloned().collect())));
                 },
             );
         });
@@ -3318,211 +3083,6 @@ mod tests {
             &[(Some(view(&["b"], None)), Some(vec!["new".to_string()]))],
             "one batch, newest of each kind"
         );
-    }
-
-    #[test]
-    fn retitles_after_a_reconcile_use_fresh_titles_not_cached_roles() {
-        // codex ff9579f: the race this architecture removes — a retitle
-        // with cached PRE-relocation roles landing after the reconciler
-        // stamped new ones. Single owner + invalidation: after an
-        // acting reconcile, the retitle pass re-lists and stamps the
-        // POST-relocation roles.
-        let mut state = WorkerState::new();
-        let glyphs = || StatusGlyphs {
-            emoji: [
-                ("claude".to_string(), ("M", "R")),
-                ("codex".to_string(), ("M", "R")),
-            ]
-            .into_iter()
-            .collect(),
-        };
-        let mut renames: Vec<(String, String)> = Vec::new();
-        // Prime the retitler's cache with PRE-swap titles: claude is
-        // master, codex reviewer.
-        let mut io = FakeIo::new(vec![Some(live(&[("claude", true), ("codex", false)]))]);
-        state.handle(
-            wb(None, Some(glyphs()), Vec::new()),
-            &mut io,
-            |id, title| renames.push((id.to_string(), title.to_string())),
-        );
-        assert_eq!(io.snapshots_taken, 1, "primed once");
-        renames.clear();
-
-        // A roster batch swaps the master (reconciler acts: relocate),
-        // then the SAME worker retitles: it must re-list (cache
-        // invalidated) and stamp post-swap roles — never the cached
-        // pre-swap ones.
-        let mut io = FakeIo::new(vec![
-            Some(live(&[("claude", true), ("codex", false)])),
-            Some(live(&[("claude", false), ("codex", true)])),
-        ]);
-        state.handle(
-            wb(
-                Some(view(&["claude", "codex"], Some("codex"))),
-                Some(glyphs()),
-                Vec::new(),
-            ),
-            &mut io,
-            |id, title| renames.push((id.to_string(), title.to_string())),
-        );
-        assert_eq!(
-            io.snapshots_taken, 2,
-            "the pass's listing, then the retitle's — acting reconcile invalidates the cache"
-        );
-        assert!(
-            renames
-                .iter()
-                .any(|(id, t)| id == "terminal_codex" && t.contains("codex (master)")),
-            "post-swap role stamped from fresh titles: {renames:?}"
-        );
-        assert!(
-            !renames.iter().any(|(_, t)| t.contains("codex (reviewer)")),
-            "stale cached role never re-stamped: {renames:?}"
-        );
-    }
-
-    #[test]
-    fn failed_re_list_after_an_acting_reconcile_renames_nothing() {
-        // codex afb6d43: invalidation must clear the cached rows too —
-        // if the required fresh list FAILS, the retitle pass must emit
-        // ZERO renames rather than fall through to stale roles.
-        let mut state = WorkerState::new();
-        let glyphs = || StatusGlyphs {
-            emoji: [
-                ("claude".to_string(), ("M", "R")),
-                ("codex".to_string(), ("M", "R")),
-            ]
-            .into_iter()
-            .collect(),
-        };
-        let mut renames: Vec<(String, String)> = Vec::new();
-        let mut io = FakeIo::new(vec![Some(live(&[("claude", true), ("codex", false)]))]);
-        state.handle(wb(None, Some(glyphs()), Vec::new()), &mut io, |id, t| {
-            renames.push((id.to_string(), t.to_string()))
-        });
-        renames.clear();
-
-        // Acting reconcile (master swap), then the fresh list FAILS.
-        let mut io = FakeIo::new(vec![
-            Some(live(&[("claude", true), ("codex", false)])),
-            None,
-        ]);
-        state.handle(
-            wb(
-                Some(view(&["claude", "codex"], Some("codex"))),
-                Some(glyphs()),
-                Vec::new(),
-            ),
-            &mut io,
-            |id, t| renames.push((id.to_string(), t.to_string())),
-        );
-        assert!(
-            renames.is_empty(),
-            "no fresh list → no renames, never stale roles: {renames:?}"
-        );
-    }
-
-    #[test]
-    fn roster_change_invalidates_even_when_another_tui_already_converged() {
-        // codex afb6d43: reconcile can no-op (a second TUI already
-        // converged the live layout) while OUR cache still holds the
-        // previous roster's roles — the glyph pass must re-list, not
-        // rename the correct panes back to old roles.
-        let mut state = WorkerState::new();
-        let glyphs = || StatusGlyphs {
-            emoji: [
-                ("claude".to_string(), ("M", "R")),
-                ("codex".to_string(), ("M", "R")),
-            ]
-            .into_iter()
-            .collect(),
-        };
-        let mut renames: Vec<(String, String)> = Vec::new();
-        let pre = live(&[("claude", true), ("codex", false)]);
-        let mut io = FakeIo::new(vec![Some(pre.clone()), Some(pre)]);
-        state.handle(
-            wb(
-                Some(view(&["claude", "codex"], Some("claude"))),
-                Some(glyphs()),
-                Vec::new(),
-            ),
-            &mut io,
-            |id, t| renames.push((id.to_string(), t.to_string())),
-        );
-        renames.clear();
-
-        // New roster arrives; the OTHER TUI already converged live
-        // state (plan is empty → reconcile no-ops, acted = false).
-        let post = live(&[("claude", false), ("codex", true)]);
-        let mut io = FakeIo::new(vec![Some(post.clone()), Some(post)]);
-        state.handle(
-            wb(
-                Some(view(&["claude", "codex"], Some("codex"))),
-                Some(glyphs()),
-                Vec::new(),
-            ),
-            &mut io,
-            |id, t| renames.push((id.to_string(), t.to_string())),
-        );
-        assert_eq!(
-            io.snapshots_taken, 2,
-            "the pass's listing, then the retitle's: a roster change re-lists even though reconcile no-oped"
-        );
-        assert!(
-            !renames.iter().any(|(_, t)| t.contains("codex (reviewer)")),
-            "already-correct panes never renamed back to old roles: {renames:?}"
-        );
-    }
-
-    #[test]
-    fn a_retitle_that_must_list_and_a_probe_share_one_listing() {
-        // The retitler's map and presence are two projections of ONE
-        // listing: an unprimed retitler plus a probe in the same batch
-        // is a single snapshot, and both come out of it (codex on
-        // e310988).
-        let mut state = WorkerState::new();
-        let mut io = FakeIo::new(vec![Some(live(&[("claude", true), ("codex", false)]))]);
-        let mut renames: Vec<(String, String)> = Vec::new();
-        let reports = state.handle(
-            WorkerBatch {
-                glyphs: Some(StatusGlyphs {
-                    emoji: [
-                        ("claude".to_string(), ("M", "R")),
-                        ("codex".to_string(), ("M", "R")),
-                    ]
-                    .into_iter()
-                    .collect(),
-                }),
-                probe: true,
-                ..Default::default()
-            },
-            &mut io,
-            |id, t| renames.push((id.to_string(), t.to_string())),
-        );
-        assert_eq!(io.snapshots_taken, 1, "one listing for both");
-        assert_eq!(renames.len(), 2, "both panes stamped off it: {renames:?}");
-        assert_eq!(
-            presence_of(&reports),
-            Some(Some(vec!["claude".into(), "codex".into()])),
-            "presence off the same listing"
-        );
-        // And a retitle that had to list reports presence even when
-        // nobody probed — the listing was taken; the fact is free.
-        let mut state = WorkerState::new();
-        let mut io = FakeIo::new(vec![Some(live(&[("claude", true)]))]);
-        let reports = state.handle(
-            wb(
-                None,
-                Some(StatusGlyphs {
-                    emoji: [("claude".to_string(), ("M", "R"))].into_iter().collect(),
-                }),
-                Vec::new(),
-            ),
-            &mut io,
-            |_, _| {},
-        );
-        assert_eq!(io.snapshots_taken, 1);
-        assert_eq!(presence_of(&reports), Some(Some(vec!["claude".into()])));
     }
 
     #[test]
@@ -3545,35 +3105,27 @@ mod tests {
     }
 
     #[test]
-    fn titled_agent_panes_from_a_live_listing() {
-        use clank_core::vocab::Role;
-        // `list-panes --json` titles as zellij reports them; terminal_1
-        // carries a stale glyph that must be stripped.
+    fn agent_panes_by_command_from_a_live_listing() {
+        // `list-panes --json --command` as zellij reports it; the
+        // retitler's map is by LAUNCH COMMAND, never by title — a
+        // title is what this map is about to overwrite.
         let panes: Vec<crate::cli::open_zellij::ZellijPane> = serde_json::from_str(
             r#"[
               {"id":0,"is_plugin":true,"title":"(.) - zellij:link"},
-              {"id":0,"is_plugin":false,"title":"claude (master)"},
-              {"id":1,"is_plugin":false,"title":"👀 codex (reviewer)"},
-              {"id":2,"is_plugin":false,"title":"status"},
-              {"id":3,"is_plugin":false,"title":"ruthless (reviewer)"}
+              {"id":0,"is_plugin":false,"title":"stale (reviewer)","terminal_command":"clank agent start claude --repo /r"},
+              {"id":1,"is_plugin":false,"title":"👀 codex (reviewer)","terminal_command":"clank agent start codex --repo /r"},
+              {"id":2,"is_plugin":false,"title":"status","terminal_command":"clank status --repo /r --tui"},
+              {"id":3,"is_plugin":false,"title":"ruthless (reviewer)","terminal_command":"clank agent start ruthless --repo /other"}
             ]"#,
         )
         .unwrap();
         assert_eq!(
-            crate::cli::open_zellij::titled_agent_panes(&panes),
+            crate::cli::open_zellij::agent_panes_by_command(&panes, std::path::Path::new("/r")),
             vec![
-                ("terminal_0".to_string(), "claude".to_string(), Role::Master),
-                (
-                    "terminal_1".to_string(),
-                    "codex".to_string(),
-                    Role::Reviewer
-                ),
-                (
-                    "terminal_3".to_string(),
-                    "ruthless".to_string(),
-                    Role::Reviewer
-                ),
-            ]
+                ("terminal_0".to_string(), "claude".to_string()),
+                ("terminal_1".to_string(), "codex".to_string()),
+            ],
+            "the stale title on terminal_0 says nothing; the other repo's pane is not ours"
         );
     }
 
@@ -3584,10 +3136,9 @@ mod tests {
         // is what keeps that from being a rename per refresh.
         use std::cell::RefCell;
 
-        use clank_core::vocab::Role;
         let rows = vec![
-            ("0".to_string(), "claude".to_string(), Role::Master),
-            ("1".to_string(), "codex".to_string(), Role::Reviewer),
+            ("0".to_string(), "claude".to_string()),
+            ("1".to_string(), "codex".to_string()),
         ];
         let renames = RefCell::new(Vec::<(String, String)>::new());
         let mut ps = PaneStatus::new();
@@ -3599,8 +3150,9 @@ mod tests {
             });
         };
 
-        // Glyph derivation reads the ROSTER (StatusGlyphs::of), so the
-        // fixture must carry the team: claude master, codex commit.
+        // Titles are the ROSTER's (StatusGlyphs::of) — glyph and role
+        // both — so the fixture must carry the team: claude master,
+        // codex commit.
         let with_team = |mut s: StatusSnapshot| -> StatusSnapshot {
             s.agents = vec![
                 crate::cli::status::AgentAutoRow {
@@ -3672,22 +3224,29 @@ mod tests {
         );
     }
 
+    /// A pane's title is written from the roster and never read back
+    /// for its role: the same pane, titled for the wrong role by an
+    /// earlier session, is restamped from what the roster says.
     #[test]
-    fn agent_pane_title_round_trips_through_parse() {
-        use clank_core::vocab::Role;
-        // The shared builder's output is recoverable by the parser —
-        // pins layout + renamer to one format (no silent drift).
-        for (role, label) in [(Role::Master, "alice"), (Role::Reviewer, "bob")] {
-            let json = format!(
-                r#"[{{"id":9,"is_plugin":false,"title":"{}"}}]"#,
-                agent_pane_title(label, role.as_str())
-            );
-            let panes: Vec<crate::cli::open_zellij::ZellijPane> =
-                serde_json::from_str(&json).unwrap();
-            assert_eq!(
-                crate::cli::open_zellij::titled_agent_panes(&panes),
-                vec![("terminal_9".to_string(), label.to_string(), role)]
-            );
-        }
+    fn a_pane_title_follows_the_roster_not_the_pane() {
+        let renames = std::cell::RefCell::new(Vec::<(String, String)>::new());
+        let mut ps = PaneStatus::new();
+        let rows = vec![
+            ("terminal_0".to_string(), "claude".to_string()),
+            ("terminal_1".to_string(), "codex".to_string()),
+        ];
+        // codex is master now.
+        ps.update_with(
+            &glyphs_for("codex", &[("claude", "M", "R"), ("codex", "M", "R")]),
+            Some(rows),
+            |id, title| renames.borrow_mut().push((id.into(), title.into())),
+        );
+        assert_eq!(
+            renames.borrow().as_slice(),
+            &[
+                ("terminal_0".to_string(), "R claude (reviewer)".to_string()),
+                ("terminal_1".to_string(), "M codex (master)".to_string()),
+            ]
+        );
     }
 }

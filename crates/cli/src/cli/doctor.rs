@@ -225,9 +225,11 @@ pub fn repo_checks(
             P::ClientTooOld => out.push(CheckResult::warn(
                 SECTION,
                 name,
-                "this zellij has no `stack-panes`: reviewer panes will not be \
-                 stacked, and the symptom is panes beside the status pane \
-                 instead of in the reviewer stack. Upgrade zellij."
+                "this zellij has no `override-layout` (zellij 0.45): roster \
+                 changes are not placed — a promoted master stays in the \
+                 stack, an added reviewer lands loose — and alt+[ / alt+] \
+                 apply the arrangement from when the session was opened. \
+                 Upgrade zellij."
                     .to_string(),
             )),
         }
@@ -1119,7 +1121,7 @@ mod tests {
         assert_eq!(
             row(Some(P::ClientTooOld)).map(|r| r.status),
             Some(CheckStatus::Warn),
-            "a client without stack-panes must warn: the only other symptom \
+            "a client without override-layout must warn: the only other symptom \
              is panes in the wrong place"
         );
         assert_eq!(

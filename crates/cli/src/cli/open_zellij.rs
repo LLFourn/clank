@@ -382,11 +382,7 @@ fn open_one(repo: &Path, print: bool) -> anyhow::Result<()> {
     // (`zellij-layout-config-around-agent-panes`); None → the
     // built-in template.
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-    let user_template = home
-        .as_deref()
-        .map(crate::cli::team::read_user_config)
-        .transpose()?
-        .and_then(|cfg| cfg.zellij.and_then(|z| z.layout));
+    let user_template = user_layout_template(home.as_deref())?;
     // Orientation from the real WINDOW's dimensions — the client
     // tty when inside a session, the spawning terminal otherwise
     // (zellij-default-layout, zellij-in-session-orientation);
@@ -399,7 +395,7 @@ fn open_one(repo: &Path, print: bool) -> anyhow::Result<()> {
         &master_label,
         &reviewer_labels,
         user_template.as_deref(),
-        (cols, rows),
+        Orientation::detect((cols, rows)),
     )?;
     let layout_path = layout_file_path(&repo);
     let name = session_name(&basename);
@@ -509,6 +505,121 @@ fn layout_file_path(repo: &Path) -> PathBuf {
     repo.join(".clank/zellij/layout.kdl")
 }
 
+/// The user's layout chrome from `~/.clank/config.json#/zellij/layout`
+/// (`zellij-layout-config-around-agent-panes`); `None` → the built-in.
+/// The ONE source for both `clank open` and the live re-layout, so a
+/// workspace opened from a marker template is reconciled with it.
+pub(crate) fn user_layout_template(home: Option<&Path>) -> anyhow::Result<Option<String>> {
+    Ok(home
+        .map(crate::cli::team::read_user_config)
+        .transpose()?
+        .and_then(|cfg| cfg.zellij.and_then(|z| z.layout)))
+}
+
+/// The tab layout for the roster AS IT IS RUNNING, for
+/// `override-layout` on a live tab: the same composition `clank open`
+/// launches from, so every slot's command byte-matches a live pane's
+/// `invoked_with`, and the same swap variants, so alt+[ / alt+] apply
+/// the current roster at the other orientation
+/// (placement-is-a-layout-applied-not-panes-shuffled).
+///
+/// `reviewers` must be the reviewers with a RUNNING pane, not the
+/// roster's: a command slot with no live match makes zellij spawn a
+/// second stage pane and dump every existing pane into the stack
+/// (measured on 0.45.0).
+pub(crate) fn compose_live_layout(
+    repo: &Path,
+    home: Option<&Path>,
+    master: &str,
+    reviewers: &[String],
+    orientation: Orientation,
+) -> anyhow::Result<String> {
+    let basename = repo_basename(repo)?;
+    let template = user_layout_template(home)?;
+    compose_kdl(
+        &basename,
+        &repo.to_string_lossy(),
+        master,
+        reviewers,
+        template.as_deref(),
+        orientation,
+    )
+}
+
+/// Apply `kdl` to the tab `tab_id` of the current session, in place.
+///
+/// `override-layout` acts on the ACTIVE tab and, without
+/// `--apply-only-to-active-tab`, reshapes the whole session to the
+/// layout's tabs — it CLOSED the other tab when measured. So the tab
+/// is made active by its stable id (names may repeat across
+/// worktrees), the override is scoped to it, and the previously active
+/// tab is restored. Existing terminal panes the layout does not name —
+/// a shell the user opened, a reviewer whose process exited — are
+/// retained rather than closed. Writes the layout file `clank open`
+/// uses, so the file on disk tracks the roster too. Returns whether the
+/// override itself was accepted; the caller reads placement back.
+pub(crate) fn override_tab_layout(repo: &Path, tab_id: u32, kdl: &str) -> bool {
+    let Ok(path) = write_layout_file(repo, kdl) else {
+        return false;
+    };
+    let path = path.display().to_string();
+    override_transaction(
+        tab_id,
+        &path,
+        |args| zellij_action(args).is_some(),
+        active_tab_id,
+    )
+}
+
+/// The override as a CHECKED transaction over injected zellij actions,
+/// so every decision — not just the argv — is assertable without a
+/// spawn (codex on d758045). `override-layout` acts on whatever tab is
+/// active, so nothing here is fail-open: an active tab that cannot be
+/// identified refuses the override; the by-id focus must succeed AND
+/// read back as the target before the override is issued; and once
+/// the focus moved, the previous tab is restored whether or not the
+/// override was accepted.
+fn override_transaction(
+    tab_id: u32,
+    path: &str,
+    mut run: impl FnMut(&[&str]) -> bool,
+    mut active: impl FnMut() -> Option<u32>,
+) -> bool {
+    let Some(was_active) = active() else {
+        return false;
+    };
+    let target = tab_id.to_string();
+    let moved = was_active != tab_id;
+    if moved {
+        if !run(&["go-to-tab-by-id", &target]) {
+            return false;
+        }
+        if active() != Some(tab_id) {
+            run(&["go-to-tab-by-id", &was_active.to_string()]);
+            return false;
+        }
+    }
+    let applied = run(&override_layout_argv(path));
+    if moved {
+        run(&["go-to-tab-by-id", &was_active.to_string()]);
+    }
+    applied
+}
+
+/// Every flag is a measured necessity: without
+/// `--apply-only-to-active-tab` the override reshaped the SESSION and
+/// closed another tab; without the retain flags an unmatched pane (a
+/// user's shell, an exited reviewer) is closed.
+fn override_layout_argv(path: &str) -> [&str; 5] {
+    [
+        "override-layout",
+        path,
+        "--apply-only-to-active-tab",
+        "--retain-existing-terminal-panes",
+        "--retain-existing-plugin-panes",
+    ]
+}
+
 /// Write the KDL atomically: write to `<path>.tmp`, fsync, rename.
 fn write_layout_file(repo: &Path, kdl: &str) -> anyhow::Result<PathBuf> {
     let path = layout_file_path(repo);
@@ -569,9 +680,8 @@ fn compose_kdl(
     master: &str,
     reviewers: &[String],
     user_template: Option<&str>,
-    term: (u16, u16),
+    orientation: Orientation,
 ) -> anyhow::Result<String> {
-    let orientation = Orientation::detect(term);
     let agents = agent_group_kdl(
         repo_path,
         master,
@@ -677,7 +787,7 @@ fn pick_zellij_client_tty(ps_output: &str, session: Option<&str>) -> Option<Stri
 /// landscape. The ioctl's 24x80 fallback lands on landscape, the
 /// safe default.
 #[derive(Clone, Copy, PartialEq, Debug)]
-enum Orientation {
+pub(crate) enum Orientation {
     Landscape,
     Portrait,
 }
@@ -957,12 +1067,6 @@ pub(crate) struct ZellijPane {
     is_plugin: bool,
     #[serde(default)]
     terminal_command: Option<String>,
-    /// Pane title from `list-panes --json` (verified live: present,
-    /// with any status-emoji prefix). Carries the ROLE the pane was
-    /// titled with (`… (master)` / `… (reviewer)`), which the command
-    /// string does not.
-    #[serde(default)]
-    title: String,
     /// Which tab the pane lives in — `list-panes --json` spans ALL tabs,
     /// so this scopes a relocation to the caller's active tab.
     #[serde(default)]
@@ -1080,18 +1184,117 @@ pub(crate) fn snapshot_panes() -> Option<Vec<ZellijPane>> {
     list_agent_panes()
 }
 
-/// Project a pane listing to this repo's agents as
-/// `(label, master_titled)` — the label from the exact launch command,
-/// the role from the pane TITLE (`… (master)` suffix; titles are
-/// stamped by the layout and the promote relocation). Pure.
+/// Project a pane listing to this repo's agents as `(label, staged)`
+/// — the label from the exact launch command, `staged` from GEOMETRY:
+/// the pane holding the most cells of any agent pane in its tab is
+/// the one on the stage. Titles used to answer this and were a second
+/// source of truth for who is master — stamped by one path, parsed by
+/// another, and wrong after alt+[ re-applied a stale swap. Where a
+/// pane sits is what the layout decides and what the read-back checks
+/// (placement-is-a-layout-applied-not-panes-shuffled). Pure.
 pub(crate) fn agent_pane_pairs(panes: &[ZellijPane], repo: &Path) -> Vec<(String, bool)> {
+    let repo_str = repo.to_string_lossy();
+    let mine: Vec<(&ZellijPane, &str)> = panes
+        .iter()
+        .filter_map(|p| agent_pane_label(p, &repo_str).map(|l| (p, l)))
+        .collect();
+    let area = |p: &ZellijPane| u32::from(p.pane_columns) * u32::from(p.pane_rows);
+    mine.iter()
+        .map(|(p, l)| {
+            let biggest_in_tab = mine
+                .iter()
+                .filter(|(o, _)| o.tab_id == p.tab_id && o.id != p.id)
+                .all(|(o, _)| area(o) < area(p));
+            (l.to_string(), biggest_in_tab && area(p) > 0)
+        })
+        .collect()
+}
+
+/// `(pane id, label)` for every pane in the listing that is one of
+/// this repo's agents, by launch command. The retitler's map; the
+/// role each label has is the ROSTER's to say.
+pub(crate) fn agent_panes_by_command(panes: &[ZellijPane], repo: &Path) -> Vec<(String, String)> {
     let repo_str = repo.to_string_lossy();
     panes
         .iter()
-        .filter_map(|p| {
-            agent_pane_label(p, &repo_str).map(|l| (l.to_owned(), p.title.ends_with(" (master)")))
-        })
+        .filter_map(|p| agent_pane_label(p, &repo_str).map(|l| (p.pane_id(), l.to_owned())))
         .collect()
+}
+
+/// The tab this repo's panes live in: the tab of its instrument pane,
+/// else of any of its agent panes. `None` when the session shows
+/// nothing of the repo's.
+pub(crate) fn repo_tab_id(panes: &[ZellijPane], repo: &Path) -> Option<u32> {
+    let repo_str = repo.to_string_lossy();
+    let status_command = format!("clank status --repo {repo_str} --tui");
+    panes
+        .iter()
+        .find(|p| !p.is_plugin && p.terminal_command.as_deref() == Some(status_command.as_str()))
+        .or_else(|| {
+            panes
+                .iter()
+                .find(|p| agent_pane_label(p, &repo_str).is_some())
+        })
+        .map(|p| p.tab_id)
+}
+
+/// The tab's CURRENT orientation, so a re-layout keeps the arrangement
+/// the operator chose with alt+[ / alt+]: the instrument pane beside
+/// the stage is landscape, below it is portrait. Without both panes to
+/// compare, the tab's extent decides as it does at open.
+pub(crate) fn tab_orientation(panes: &[ZellijPane], repo: &Path, tab_id: u32) -> Orientation {
+    let repo_str = repo.to_string_lossy();
+    let status_command = format!("clank status --repo {repo_str} --tui");
+    let in_tab = |p: &&ZellijPane| !p.is_plugin && p.tab_id == tab_id;
+    let status = panes
+        .iter()
+        .filter(in_tab)
+        .find(|p| p.terminal_command.as_deref() == Some(status_command.as_str()));
+    let stage = agent_pane_pairs(panes, repo)
+        .iter()
+        .zip(
+            panes
+                .iter()
+                .filter(|p| agent_pane_label(p, &repo_str).is_some()),
+        )
+        .find(|((_, staged), p)| *staged && p.tab_id == tab_id)
+        .map(|(_, p)| p);
+    match (stage, status) {
+        (Some(stage), Some(status)) if status.pane_x >= stage.pane_x + stage.pane_columns => {
+            Orientation::Landscape
+        }
+        (Some(stage), Some(status)) if status.pane_y >= stage.pane_y + stage.pane_rows => {
+            Orientation::Portrait
+        }
+        _ => Orientation::detect(tab_dims(panes, tab_id)),
+    }
+}
+
+/// Open a pane for `label` in this repo's tab, running its launch
+/// command — its identity to every listing that follows. Placement is
+/// not attempted here: the layout applied afterwards puts it where it
+/// belongs. Focus only picks the TAB `new-pane` opens in. Returns the
+/// id zellij printed for the new pane, so the caller can believe it
+/// live before a listing lists it.
+pub(crate) fn open_agent_pane(repo: &Path, label: &str, panes: &[ZellijPane]) -> Option<String> {
+    let repo_str = repo.to_string_lossy();
+    if find_pane_by_command(panes, &agent_start_command(label, &repo_str)).is_some() {
+        return None;
+    }
+    let tab = repo_tab_id(panes, repo);
+    let in_tab = panes
+        .iter()
+        .find(|p| Some(p.tab_id) == tab && !p.is_plugin)
+        .map(ZellijPane::pane_id)
+        .or_else(caller_pane_id);
+    if let Some(id) = &in_tab {
+        zellij_action(&["focus-pane-id", id]);
+    }
+    let new_pane = new_pane_argv(label, &repo_str);
+    let refs: Vec<&str> = new_pane.iter().map(String::as_str).collect();
+    let out = zellij_action(&refs)?;
+    let created = String::from_utf8_lossy(&out).trim().to_string();
+    (!created.is_empty()).then_some(created)
 }
 
 /// This repo's agent labels with a LIVE pane: the process the launch
@@ -1163,126 +1366,6 @@ fn parse_active_tab_id(text: &str) -> Option<u32> {
     text.lines()
         .find_map(|l| l.strip_prefix("id:"))
         .and_then(|v| v.trim().parse().ok())
-}
-
-/// The first terminal pane running any of `cmds` — used to anchor a new
-/// reviewer pane onto the EXISTING reviewer stack (focus a current stack
-/// member, then `new-pane --stacked` joins that stack).
-fn find_anchor_pane<'a>(panes: &'a [ZellijPane], cmds: &[String]) -> Option<&'a ZellijPane> {
-    panes.iter().find(|p| {
-        !p.is_plugin
-            && p.terminal_command
-                .as_deref()
-                .is_some_and(|c| cmds.iter().any(|x| x == c))
-    })
-}
-
-/// A reviewer pane in `tab`, identified by the title zellij reports
-/// rather than by the command it was launched with.
-///
-/// ANCHORS placement only — never classification.
-/// `zellij-pane-placement-and-cost` rejected titles for deciding WHO a
-/// pane is: a title carries no ownership marker and cannot round-trip
-/// the legal label domain, so a wrong read fails OPEN and never
-/// converges. A wrong anchor costs one misplaced pane and reaches no
-/// roster decision, which is why the same objection does not apply.
-///
-/// Needed because [`find_anchor_pane`] matches the launch command
-/// byte-for-byte, so any divergence — a repo path spelled differently,
-/// a pane started before a rename, an agent restarted by hand — leaves
-/// a visible reviewer that cannot anchor anything. A hand-titled pane
-/// can anchor too; that is the accepted cost of not requiring a
-/// command, and it buys one misplaced pane at worst.
-///
-/// `tab` scoping is an invariant, not hygiene: `list-panes` spans ALL
-/// tabs, `(reviewer)` appears in nearly every clank tab, and zellij
-/// 0.45.0 exposes no action that moves a pane between tabs
-/// (`BreakPane*` are keybindings only) — so anchoring onto a foreign
-/// tab strands the pane there until someone closes and respawns it.
-///
-/// The status TUI stamps a status glyph onto agent titles and both
-/// shapes are live at once, so the glyph is stripped before matching —
-/// the same rule `parse_agent_panes` classifies with.
-fn find_reviewer_pane_by_title(panes: &[ZellijPane], tab: u32) -> Option<&ZellijPane> {
-    let suffix = format!(" ({})", clank_core::vocab::Role::Reviewer.as_str());
-    panes.iter().find(|p| {
-        !p.is_plugin
-            && p.tab_id == tab
-            && crate::cli::status_tui::strip_leading_emoji(&p.title).ends_with(&suffix)
-    })
-}
-
-/// Where to focus before `new-pane`, and whether the caller must be
-/// told which pane was used.
-#[derive(Debug, Default, PartialEq, Eq)]
-struct AnchorChoice {
-    /// Focus decides which TAB `new-pane` opens in — nothing more.
-    focus: Option<String>,
-    /// Set only when [`stack_reviewer_panes`] cannot rediscover the
-    /// anchor from the CURRENT roster, so the caller has to carry the
-    /// id over itself.
-    report: Option<String>,
-    /// Whether a new pane may be born directly into the anchor's
-    /// stack — true ONLY for an exact-command current reviewer whose
-    /// column is verified to hold nothing else.
-    ///
-    /// Deliberately much narrower than "the anchor looks like a
-    /// reviewer". Joining a stack is IRREVERSIBLE: `stack-panes` can
-    /// only build a stack, never take a pane out of one (measured,
-    /// `status_tui/zellij.rs`). So every anchor whose stack cannot be
-    /// PROVEN clean — the caller pane, a title match that admits
-    /// hand-titled false positives, a departing reviewer, or a column
-    /// already contaminated by the instrument pane — keeps the
-    /// recoverable create-then-`stack-panes` path, where the cost of
-    /// being wrong stays one misplaced pane (codex on 5f29616).
-    stackable: bool,
-}
-
-/// Pick the anchor for a pane about to be created, in descending order
-/// of how well it identifies the repo's tab:
-///
-/// 1. a CURRENT reviewer of this repo, by launch command — the stack
-///    call rediscovers it, so it is not reported;
-/// 2. a DEPARTING reviewer, by launch command — its pane is still live
-///    (removes run after the layout) and knows the tab the replacement
-///    belongs in, but `stack` is given the new roster and cannot name
-///    it, so it is reported;
-/// 3. any reviewer pane in the CALLER's tab, by title — reported for
-///    the same reason;
-/// 4. the caller's own pane — a tab, not a reviewer, so nothing to
-///    report.
-fn select_anchor(
-    panes: &[ZellijPane],
-    current_cmds: &[String],
-    departing_cmds: &[String],
-    caller: Option<String>,
-) -> AnchorChoice {
-    if let Some(p) = find_anchor_pane(panes, current_cmds) {
-        return AnchorChoice {
-            focus: Some(p.pane_id()),
-            report: None,
-            stackable: stack_is_clean(panes, p, current_cmds),
-        };
-    }
-    let reported = find_anchor_pane(panes, departing_cmds)
-        .map(ZellijPane::pane_id)
-        .or_else(|| {
-            caller
-                .as_deref()
-                .and_then(|r| panes.iter().find(|p| p.pane_id() == r))
-                .map(|p| p.tab_id)
-                .and_then(|tab| find_reviewer_pane_by_title(panes, tab))
-                .map(ZellijPane::pane_id)
-        });
-    AnchorChoice {
-        // Every anchor below the exact-command match is unproven: a
-        // title match accepts hand-titled false positives, a departing
-        // reviewer is on its way out, and the caller fallback is a tab
-        // hint rather than a stack. None may be joined irreversibly.
-        stackable: false,
-        focus: reported.clone().or(caller),
-        report: reported,
-    }
 }
 
 /// Two panes in the same column span of the same tab.
@@ -1364,69 +1447,6 @@ fn inside_stack(foreign: &ZellijPane, first: &ZellijPane, span: &StackSpan) -> b
             same_column(foreign, first) && foreign.pane_y >= *top && foreign.pane_y < *bottom
         }
     }
-}
-
-/// Whether the anchor's STACK holds only current reviewers of this
-/// repo.
-///
-/// The question is MEMBERSHIP, not neighbourhood, and membership is a
-/// property of the reviewer SET rather than of any pair. A healthy
-/// landscape tab has the full-height instrument pane starting exactly
-/// at the reviewer run's bottom: adjacent to the last collapsed
-/// reviewer, and not in the stack. Deciding by adjacency — even
-/// transitively — walks straight across that boundary and refuses the
-/// fast path in the normal multi-reviewer shape (codex on 1e57467).
-///
-/// So the reviewer set must first be PROVEN to be one stack, and only
-/// panes inside that proven extent count as members. An arrangement
-/// that proves nothing is not clean.
-fn stack_is_clean(panes: &[ZellijPane], anchor: &ZellijPane, current_cmds: &[String]) -> bool {
-    if anchor.pane_columns == 0 || anchor.pane_rows == 0 {
-        return false;
-    }
-    let is_current_reviewer = |p: &ZellijPane| {
-        !p.is_plugin
-            && p.terminal_command
-                .as_deref()
-                .is_some_and(|c| current_cmds.iter().any(|x| x == c))
-    };
-    let tab: Vec<&ZellijPane> = panes.iter().filter(|p| p.tab_id == anchor.tab_id).collect();
-    let mine: Vec<&ZellijPane> = tab
-        .iter()
-        .copied()
-        .filter(|p| is_current_reviewer(p))
-        .collect();
-    let foreign = || tab.iter().copied().filter(|p| !is_current_reviewer(p));
-
-    // The anchor alone: no stack of its own yet, so the only question
-    // is whether anything else already shares one with it.
-    if mine.len() <= 1 {
-        return !foreign().any(|p| same_stack(p, anchor));
-    }
-    let Some(span) = reviewer_stack_span(&mine) else {
-        return false;
-    };
-    let first = mine[0];
-    !foreign().any(|p| inside_stack(p, first, &span))
-}
-
-/// What [`add_reviewer_pane`] made, and what it leaned on to place it.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub(crate) struct ReviewerPaneAdd {
-    /// The pane created this pass — `None` when one already existed or
-    /// creation failed.
-    pub created: Option<String>,
-    /// The pane that anchored the new one, when [`stack_reviewer_panes`]
-    /// cannot rediscover it — a pane matched by TITLE (no launch
-    /// command to be named by) or a DEPARTING reviewer (named by
-    /// command, but no longer on the roster `stack` is given).
-    ///
-    /// Reported because `stack` names members by exact launch command
-    /// against the CURRENT roster: an anchor it cannot name is absent
-    /// from the id list, the list falls short of the two entries
-    /// `stack-panes` needs, and the call is skipped — so the pane this
-    /// anchored would never join the stack it was placed against.
-    pub anchor: Option<String>,
 }
 
 /// The pane the current clank process runs in, identified authoritatively
@@ -1570,34 +1590,11 @@ pub(crate) fn panes_in_all_sessions(deadline: std::time::Duration) -> Vec<Sessio
     panes
 }
 
-/// Whether `new-pane` can place a pane INTO a stack as it creates it.
-///
-/// Probed from the help TEXT, not the exit status: `new-pane` exists on
-/// every client, so its exit code distinguishes nothing — only the flag
-/// list does. Not from `--version` either, for the reason
-/// [`placement_capability`] gives.
-///
-/// This probe matters more than the arrangement it buys. zellij's
-/// parser REJECTS an unknown flag, so guessing wrong does not misplace
-/// the pane — it fails `new-pane` outright and the reviewer never
-/// spawns at all, which is far worse than the visible jump this
-/// removes.
-fn new_pane_can_stack() -> bool {
-    std::process::Command::new("zellij")
-        .args(["action", "new-pane", "--help"])
-        .output()
-        .is_ok_and(|o| {
-            o.status.success() && String::from_utf8_lossy(&o.stdout).contains("--stacked")
-        })
-}
-
-/// The `new-pane` argv, split out so the placement decision is
-/// assertable without spawning a zellij.
-fn new_pane_argv(label: &str, repo: &str, stacked: bool) -> Vec<String> {
+/// The `new-pane` argv, split out so it is assertable without
+/// spawning a zellij. Never `--stacked`: where the pane belongs is the
+/// layout's decision, applied right after.
+fn new_pane_argv(label: &str, repo: &str) -> Vec<String> {
     let mut argv = vec!["new-pane".to_string()];
-    if stacked {
-        argv.push("--stacked".to_string());
-    }
     argv.extend([
         "--name".to_string(),
         agent_pane_title(label, "reviewer"),
@@ -1641,29 +1638,6 @@ pub(crate) fn rename_tab(id: &str, name: &str) {
     let _ = std::process::Command::new("zellij")
         .args(["action", "rename-tab-by-id", id, name])
         .output();
-}
-
-/// `(pane id, label, role)` for every pane whose TITLE (after any
-/// status glyph) is `"<label> (master)"` / `"<label> (reviewer)"` —
-/// the exact format [`agent_pane_title`] emits. The retitler's map:
-/// by title, not command, because the title carries the ROLE the
-/// pane was last stamped with. Non-agent panes (status, plugins)
-/// don't match and are skipped. Pure.
-pub(crate) fn titled_agent_panes(
-    panes: &[ZellijPane],
-) -> Vec<(String, String, clank_core::vocab::Role)> {
-    use clank_core::vocab::Role;
-    let mut out = Vec::new();
-    for pane in panes {
-        let base = crate::cli::status_tui::strip_leading_emoji(&pane.title);
-        for role in [Role::Master, Role::Reviewer] {
-            if let Some(label) = base.strip_suffix(&format!(" ({})", role.as_str())) {
-                out.push((pane.pane_id(), label.to_string(), role));
-                break;
-            }
-        }
-    }
-    out
 }
 
 pub(crate) fn rename_pane(id: &str, name: &str) {
@@ -1710,8 +1684,9 @@ fn require_zellij_given(cap: PlacementCapability) -> anyhow::Result<()> {
 pub enum PlacementCapability {
     /// No zellij on PATH — nothing to say.
     NoZellij,
-    /// A client without `stack-panes`: reviewer panes will not be
-    /// stacked, and the only symptom is a wrong arrangement.
+    /// A client without `override-layout` (zellij 0.45): roster changes
+    /// are not placed and alt+[ / alt+] apply the arrangement from
+    /// when the session was opened, until an upgrade.
     ClientTooOld,
     /// The client parser accepts it. NOT a statement about a running
     /// SERVER: replacing the binary under a live session leaves an
@@ -1726,7 +1701,7 @@ pub fn placement_capability() -> PlacementCapability {
     // version arithmetic answers a different question than "does this
     // binary have the action".
     match std::process::Command::new("zellij")
-        .args(["action", "stack-panes", "--help"])
+        .args(["action", "override-layout", "--help"])
         .output()
     {
         Err(_) => PlacementCapability::NoZellij,
@@ -1769,136 +1744,6 @@ fn tab_dims(panes: &[ZellijPane], tab_id: u32) -> (u16, u16) {
         rows = rows.max(p.pane_y.saturating_add(p.pane_rows));
     }
     (cols, rows)
-}
-
-/// Best-effort: open a pane for a newly-added reviewer and put it in
-/// this repo's reviewer stack, working from the pass's shared `panes`
-/// listing (zellij-one-listing-per-pass).
-/// Idempotent: no-op if the pane already exists in the listing.
-///
-/// Stacking is NOT done here — see [`stack_reviewer_panes`], which
-/// the caller runs ONCE over the whole desired set. Doing it per-add
-/// off the pass-start snapshot silently skipped stacking whenever two
-/// reviewers were added at once: each call saw no existing reviewer
-/// and a one-element set (codex on 2d273c6). Returning the created id
-/// lets the caller accumulate what this pass actually made.
-///
-/// Placement is by pane id via `zellij action stack-panes`, NOT by
-/// `new-pane --stacked` onto whatever is focused. That
-/// focus-dependence is how the instrument pane ended up inside the
-/// reviewer stack: with no reviewer anchor the old code focused the
-/// caller, and a roster add is issued FROM the status TUI, so the
-/// caller IS the status pane. Naming the reviewer ids explicitly makes
-/// the instrument pane unstackable by construction — it is simply
-/// never in the list (zellij-pane-placement-and-cost).
-///
-/// ONE exception, and it does not reopen that hole. When the anchor is
-/// an exact-command CURRENT reviewer AND its column is verified to
-/// hold nothing else ([`stack_is_clean`]), the pane is born stacked so
-/// it never appears loose and jumps. The old bug was stacking onto an
-/// UNVERIFIED focus; here the focus is proven to be a clean reviewer
-/// column from the same pass-start listing, and every unproven anchor
-/// still takes the explicit-id path. This matters because joining a
-/// stack cannot be undone — so the fast path must be provably right,
-/// not merely likely.
-///
-/// Measured properties of `stack-panes` this relies on: running
-/// processes survive it, panes outside the id list are untouched, and
-/// a stale id is tolerated (exit 0, nothing damaged) — which matters
-/// because the listing threaded in here can be a pass old.
-pub(crate) fn add_reviewer_pane(
-    repo: &Path,
-    label: &str,
-    other_reviewers: &[String],
-    departing: &[String],
-    panes: &[ZellijPane],
-) -> ReviewerPaneAdd {
-    let repo_str = repo.to_string_lossy();
-    if find_pane_by_command(panes, &agent_start_command(label, &repo_str)).is_some() {
-        return ReviewerPaneAdd::default();
-    }
-    // Focus decides which TAB `new-pane` opens in — nothing more. An
-    // existing reviewer keeps the pane in the repo's tab; else the
-    // caller's own pane does. A wrong guess here used to also decide
-    // what got stacked, which is exactly what it no longer does.
-    let anchor_cmds: Vec<String> = other_reviewers
-        .iter()
-        .map(|l| agent_start_command(l, &repo_str))
-        .collect();
-    let departing_cmds: Vec<String> = departing
-        .iter()
-        .map(|l| agent_start_command(l, &repo_str))
-        .collect();
-    let choice = select_anchor(panes, &anchor_cmds, &departing_cmds, caller_pane_id());
-    let anchor = choice.report;
-    if let Some(id) = &choice.focus {
-        zellij_action(&["focus-pane-id", id]);
-    }
-
-    // Born in the stack rather than created loose and moved: the move
-    // is a SECOND action, and zellij has already drawn the pane in its
-    // default spot before it lands.
-    let new_pane = new_pane_argv(label, &repo_str, choice.stackable && new_pane_can_stack());
-    let refs: Vec<&str> = new_pane.iter().map(String::as_str).collect();
-    let Some(out) = zellij_action(&refs) else {
-        return ReviewerPaneAdd::default();
-    };
-    // `new-pane` prints the id it created, so the caller can stack the
-    // fresh pane without paying for another listing.
-    let created = String::from_utf8_lossy(&out).trim().to_string();
-    if created.is_empty() {
-        return ReviewerPaneAdd::default();
-    }
-    ReviewerPaneAdd {
-        created: Some(created),
-        anchor,
-    }
-}
-
-/// Put this repo's reviewer panes — the ones already live plus any
-/// `extra_ids` created this pass — into one stack.
-///
-/// Called ONCE per pass over the complete set, never per add. The
-/// instrument pane is not in the set, so it cannot be swept in.
-/// Returns whether the panes are stacked AFTERWARDS, read back rather
-/// than assumed: `stack-panes` exits 0 on a stale id without doing
-/// anything, so its status proves nothing (codex on 2d273c6).
-pub(crate) fn stack_reviewer_panes(
-    repo: &Path,
-    reviewers: &[String],
-    panes: &[ZellijPane],
-    extra_ids: &[String],
-) -> bool {
-    let repo_str = repo.to_string_lossy();
-    let mut ids: Vec<String> = panes
-        .iter()
-        .filter(|p| {
-            agent_pane_label(p, &repo_str).is_some_and(|l| reviewers.iter().any(|r| r == l))
-        })
-        .map(ZellijPane::pane_id)
-        .collect();
-    for id in extra_ids {
-        if !ids.contains(id) {
-            ids.push(id.clone());
-        }
-    }
-    // `stack-panes` needs two ids to express anything. It used to
-    // return `true` here, which reported SUCCESS for the single
-    // reviewer stacked with the instrument pane — the first-reviewer
-    // form of the reported bug — and the caller then cached that
-    // broken tab as repaired (codex on cc4ae5e). Whether one pane is
-    // correctly placed is a question only the read-back answers.
-    if ids.len() >= 2 {
-        let mut args: Vec<&str> = vec!["stack-panes", "--"];
-        args.extend(ids.iter().map(String::as_str));
-        zellij_action(&args);
-    }
-    match snapshot_panes() {
-        Some(fresh) => reviewers_are_stacked(&fresh, repo, reviewers),
-        // Cannot tell: report NOT placed so the pass stays
-        // unconverged and retries, rather than caching a guess.
-        None => false,
-    }
 }
 
 /// Whether this repo's reviewer panes form ONE zellij stack that the
@@ -2004,286 +1849,6 @@ fn remove_target_ids(labels: &[String], panes: &[ZellijPane], repo_path: &str) -
         }
     }
     ids
-}
-
-/// Outcome of [`compose_promote_layout`]: a ready-to-apply layout KDL, or
-/// a deliberate no-op (the skip-on-unrecognized safety rule — see the
-/// `agent-promote-zellij-relocation` plan).
-#[derive(Debug, PartialEq)]
-enum PromoteRelayout {
-    Apply(String),
-    Skip,
-}
-
-/// PURE core of the promote relocation: project the config role flip onto
-/// the live zellij panes by composing a fresh stage(new master 65%) + stack
-/// (other agents) + status layout, reusing the SAME composition `clank open`
-/// emits so every slot's command byte-matches the live `invoked_with`.
-///
-/// `override-layout` re-flows the WHOLE active tab with no positional
-/// fallback (a slot whose command is off by one byte spawns a new pane AND
-/// lets the unmatched original get closed), so classification is
-/// all-or-nothing, decided here before anything is applied:
-/// - Find the caller pane by `pane_id == caller_pane_ref`; its `tab_id` is
-///   the active tab. Absent → [`PromoteRelayout::Skip`] (no anchor for the
-///   active-tab filter, and declarative focus would have nowhere to land).
-/// - Every live terminal (non-plugin) pane in the active tab must classify
-///   as a roster-agent pane (command byte-equals `agent_start_command`) or
-///   the status pane. ANY unclassified live pane → Skip.
-/// - The new master must have a live pane in the active tab, else → Skip.
-/// - reviewers = live agent labels minus the new master, in on-screen
-///   (list-panes) order. A roster agent with no live pane is simply omitted
-///   (omit ≠ skip) — relocation still proceeds.
-///
-/// The composed KDL marks the caller's own pane `focus=true` so the
-/// override doesn't yank focus elsewhere.
-fn compose_promote_layout(
-    panes: &[ZellijPane],
-    caller_pane_ref: Option<&str>,
-    roster_labels: &[String],
-    new_master: &str,
-    repo_path: &str,
-    term: (u16, u16),
-) -> PromoteRelayout {
-    // The caller pane anchors the active-tab filter AND declarative focus.
-    let Some(caller_ref) = caller_pane_ref else {
-        return PromoteRelayout::Skip;
-    };
-    let Some(caller) = panes.iter().find(|p| p.pane_id() == caller_ref) else {
-        return PromoteRelayout::Skip;
-    };
-    let active_tab = caller.tab_id;
-    let caller_command = caller.terminal_command.clone();
-
-    // Pre-compute each roster label's launch command once for matching.
-    let agent_commands: Vec<(String, &String)> = roster_labels
-        .iter()
-        .map(|l| (agent_start_command(l, repo_path), l))
-        .collect();
-    let status_command = format!("clank status --repo {repo_path} --tui");
-
-    // Classify every live terminal pane in the active tab, preserving the
-    // on-screen order so the stack keeps its current arrangement.
-    let mut live_agents: Vec<String> = Vec::new();
-    for pane in panes
-        .iter()
-        .filter(|p| !p.is_plugin && p.tab_id == active_tab)
-    {
-        let cmd = pane.terminal_command.as_deref();
-        if cmd == Some(status_command.as_str()) {
-            continue;
-        }
-        match cmd.and_then(|c| {
-            agent_commands
-                .iter()
-                .find(|(start, _)| start == c)
-                .map(|(_, label)| (*label).clone())
-        }) {
-            Some(label) => live_agents.push(label),
-            // An unclassified live terminal pane (manual shell/editor, null
-            // command, or an agent pane whose command doesn't byte-match) —
-            // the whole relocation is unsafe, skip it.
-            None => return PromoteRelayout::Skip,
-        }
-    }
-
-    // The new master must actually have a live pane to reposition.
-    if !live_agents.iter().any(|l| l == new_master) {
-        return PromoteRelayout::Skip;
-    }
-
-    let reviewers: Vec<String> = live_agents
-        .into_iter()
-        .filter(|l| l != new_master)
-        .collect();
-
-    let kdl = match compose_kdl(
-        &caller_tab_name(repo_path),
-        repo_path,
-        new_master,
-        &reviewers,
-        None,
-        term,
-    ) {
-        Ok(k) => k,
-        Err(_) => return PromoteRelayout::Skip,
-    };
-
-    // Declarative focus: mark the caller's own pane focus=true so the
-    // override keeps focus where the operator ran promote. Matched by the
-    // caller pane's command (the byte-identical slot in the composed KDL).
-    match inject_focus_on_command(&kdl, caller_command.as_deref()) {
-        Ok(k) => PromoteRelayout::Apply(k),
-        Err(_) => PromoteRelayout::Skip,
-    }
-}
-
-/// Tab name for the composed promote layout. `override-layout
-/// --apply-only-to-active-tab` re-flows the existing tab in place, so the
-/// name is cosmetic; derive it from the repo basename to match `clank open`.
-fn caller_tab_name(repo_path: &str) -> String {
-    Path::new(repo_path)
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| repo_path.to_string())
-}
-
-/// Mark the agent/status pane whose `command "clank"` + `args …` reproduce
-/// `caller_command` with `focus=true`, editing the parsed KDL tree (never
-/// string-spliced). A no-match is fine — focus just isn't pinned — but a
-/// `None` caller command (the caller pane has no `invoked_with`) can't be
-/// matched, so callers that need focus should treat that as a skip upstream.
-fn inject_focus_on_command(kdl: &str, caller_command: Option<&str>) -> anyhow::Result<String> {
-    let Some(caller_command) = caller_command else {
-        return Ok(kdl.to_string());
-    };
-    let mut doc: kdl::KdlDocument = kdl.parse().map_err(|e: kdl::KdlError| {
-        anyhow::anyhow!("composed promote layout is not valid KDL: {e}")
-    })?;
-    mark_focus_in_doc(&mut doc, caller_command);
-    Ok(doc.to_string())
-}
-
-/// Depth-first: set `focus=true` on the first `pane` node whose
-/// `command`/`args` children reproduce `caller_command`. Returns whether a
-/// match was set so recursion can stop after the first hit.
-fn mark_focus_in_doc(doc: &mut kdl::KdlDocument, caller_command: &str) -> bool {
-    for node in doc.nodes_mut() {
-        if node.name().value() == "pane" && pane_command(node).as_deref() == Some(caller_command) {
-            node.entries_mut()
-                .retain(|e| e.name().map(|n| n.value()) != Some("focus"));
-            node.push(kdl::KdlEntry::new_prop("focus", true));
-            return true;
-        }
-        if let Some(children) = node.children_mut()
-            && mark_focus_in_doc(children, caller_command)
-        {
-            return true;
-        }
-    }
-    false
-}
-
-/// Reconstruct the `clank …` command string a composed agent pane launches,
-/// from its `command "clank"` + `args "…" "…"` child nodes — the form
-/// zellij reports as that pane's `terminal_command` once live.
-fn pane_command(node: &kdl::KdlNode) -> Option<String> {
-    let children = node.children()?;
-    let command = children
-        .nodes()
-        .iter()
-        .find(|n| n.name().value() == "command")?
-        .entries()
-        .first()?
-        .value()
-        .as_string()?
-        .to_string();
-    let args_node = children.nodes().iter().find(|n| n.name().value() == "args");
-    let mut parts = vec![command];
-    if let Some(args_node) = args_node {
-        for entry in args_node.entries() {
-            if entry.name().is_none()
-                && let Some(s) = entry.value().as_string()
-            {
-                parts.push(s.to_string());
-            }
-        }
-    }
-    Some(parts.join(" "))
-}
-
-/// Best-effort: inside a zellij session, project a just-applied master
-/// promotion onto the live layout — the new master becomes the 65% STAGE
-/// and the demoted old master joins the reviewer STACK, reusing the running
-/// panes (no respawn — `override-layout` matches on `invoked_with`).
-///
-/// No-op outside zellij, on any zellij failure, or when
-/// [`compose_promote_layout`] declines (the skip-on-unrecognized rule). The
-/// config role change is the source of truth and stands regardless.
-/// `roster_labels` is the full post-flip roster (master + reviewers);
-/// `old_master` titles the demoted pane.
-pub(crate) fn relocate_for_promote(
-    repo: &Path,
-    new_master: &str,
-    old_master: Option<&str>,
-    roster_labels: &[String],
-    panes: &[ZellijPane],
-) {
-    let repo_str = repo.to_string_lossy().into_owned();
-    // Orientation comes from the caller tab's full extent (what `clank open`
-    // sees), not `term_size()` (the caller's own pane = the 65% stage, which
-    // mis-reads a portrait tab as landscape). Fall back to `term_size` when
-    // the caller pane, its tab, or the geometry is unavailable / degenerate.
-    let caller_ref = caller_pane_id();
-    let term = caller_ref
-        .as_deref()
-        .and_then(|r| panes.iter().find(|p| p.pane_id() == r).map(|p| p.tab_id))
-        .map(|tab_id| tab_dims(panes, tab_id))
-        .filter(|(cols, rows)| *cols != 0 && *rows != 0)
-        .unwrap_or_else(|| {
-            let (rows, cols) = crate::cli::term::term_size();
-            (cols, rows)
-        });
-    let kdl = match compose_promote_layout(
-        panes,
-        caller_ref.as_deref(),
-        roster_labels,
-        new_master,
-        &repo_str,
-        term,
-    ) {
-        PromoteRelayout::Apply(kdl) => kdl,
-        PromoteRelayout::Skip => return,
-    };
-
-    let Ok(path) = write_layout_file(repo, &kdl) else {
-        return;
-    };
-    let path_str = path.display().to_string();
-    // No-op-on-failure: only stamp titles if the override actually applied,
-    // so a failed override leaves the layout untouched rather than a partial
-    // mutation (titles changed but panes not relocated).
-    if zellij_action(&[
-        "override-layout",
-        &path_str,
-        "--apply-only-to-active-tab",
-        "--retain-existing-plugin-panes",
-    ])
-    .is_none()
-    {
-        return;
-    }
-
-    // Stamp the new roles into the two changed panes' titles. This is
-    // REQUIRED, not cosmetic: `override-layout` keeps matched panes' existing
-    // titles, and the status-TUI retitle loop derives each agent's role by
-    // PARSING its pane title (`parse_agent_panes`) — so a stale title makes
-    // the TUI re-affirm the OLD role forever. `rename-pane --pane-id` targets
-    // by id (no focus change); the TUI re-adds the status emoji on its next
-    // refresh. Best-effort.
-    rename_agent_pane(panes, new_master, &repo_str, "master");
-    // No old master (nothing was master-titled — e.g. a whole-team
-    // replacement converging at startup): stage the new one, demote
-    // nobody.
-    if let Some(old) = old_master {
-        rename_agent_pane(panes, old, &repo_str, "reviewer");
-    }
-    // Focus restoration is the worker's pass-level transaction
-    // (zellij-one-listing-per-pass).
-}
-
-/// Best-effort `rename-pane --pane-id` of the pane running
-/// `agent_start_command(label, repo)` to `agent_pane_title(label, role)`.
-/// By-id, so no focus change; no-op if no such pane is live.
-fn rename_agent_pane(panes: &[ZellijPane], label: &str, repo_path: &str, role: &str) {
-    if let Some(pane) = find_pane_by_command(panes, &agent_start_command(label, repo_path)) {
-        zellij_action(&[
-            "rename-pane",
-            "--pane-id",
-            &pane.pane_id(),
-            &agent_pane_title(label, role),
-        ]);
-    }
 }
 
 /// Escape a string for use inside a KDL `"..."` quoted string.
@@ -2520,8 +2085,8 @@ mod tests {
     const TEST_REPO: &str = "/tmp/test-repo";
     /// 200x50 cells — comfortably landscape (cols >= 2*rows).
     const LANDSCAPE: (u16, u16) = (200, 50);
-    /// 80x60 cells — portrait (cols < 2*rows).
-    const PORTRAIT: (u16, u16) = (80, 60);
+    const LAND: Orientation = Orientation::Landscape;
+    const PORT: Orientation = Orientation::Portrait;
     const TEST_TAB: &str = "test-repo";
 
     // ── zellij-in-session-orientation: the client-tty picker ──
@@ -2607,14 +2172,14 @@ ttys004   zellij attach clank-foo
 
     #[test]
     fn compose_kdl_includes_tab_bar_and_status_bar_plugins() {
-        let kdl = compose_kdl(TEST_TAB, TEST_REPO, "m", &[], None, LANDSCAPE).unwrap();
+        let kdl = compose_kdl(TEST_TAB, TEST_REPO, "m", &[], None, LAND).unwrap();
         assert!(kdl.contains("plugin location=\"zellij:tab-bar\""));
         assert!(kdl.contains("plugin location=\"zellij:status-bar\""));
     }
 
     #[test]
     fn compose_kdl_wraps_panes_in_tab_block_with_name() {
-        let kdl = compose_kdl("basename", TEST_REPO, "alice", &[], None, LANDSCAPE).unwrap();
+        let kdl = compose_kdl("basename", TEST_REPO, "alice", &[], None, LAND).unwrap();
         assert!(
             kdl.contains("tab name=\"basename\""),
             "KDL should wrap panes in a tab block with name; got:\n{kdl}"
@@ -2629,7 +2194,7 @@ ttys004   zellij attach clank-foo
             "alice",
             &reviewers(&["bob", "carol"]),
             None,
-            LANDSCAPE,
+            LAND,
         )
         .unwrap();
         assert!(kdl.contains("name=\"alice (master)\""));
@@ -2755,7 +2320,6 @@ ttys004   zellij attach clank-foo
             id: 1,
             is_plugin: false,
             terminal_command: Some(cmd.to_string()),
-            title: String::new(),
             tab_id: tab,
             is_focused: false,
             exited: false,
@@ -2802,7 +2366,6 @@ ttys004   zellij attach clank-foo
             id: 1,
             is_plugin: false,
             terminal_command: Some(cmd.to_string()),
-            title: String::new(),
             tab_id: 1,
             is_focused: false,
             exited: false,
@@ -2833,7 +2396,6 @@ ttys004   zellij attach clank-foo
             id: 1,
             is_plugin: false,
             terminal_command: Some(cmd.to_string()),
-            title: String::new(),
             tab_id: 1,
             is_focused: false,
             exited: false,
@@ -2881,7 +2443,6 @@ ttys004   zellij attach clank-foo
             id: 1,
             is_plugin: false,
             terminal_command: Some(cmd.to_string()),
-            title: String::new(),
             tab_id: tab,
             is_focused: false,
             exited: false,
@@ -2908,12 +2469,11 @@ ttys004   zellij attach clank-foo
         // `list-panes` spans ALL tabs, so identical column spans can
         // collide across tabs and read as contiguous by coordinate
         // alone. Same-tab is an invariant, not a coincidence (codex on
-        // 5320c1d) — and no `stack-panes` call can join two tabs.
+        // 5320c1d) — and no layout can join two tabs.
         let pane = |cmd: &str, tab: u32, y: u16, h: u16| ZellijPane {
             id: 1,
             is_plugin: false,
             terminal_command: Some(cmd.to_string()),
-            title: String::new(),
             tab_id: tab,
             is_focused: false,
             exited: false,
@@ -2943,7 +2503,6 @@ ttys004   zellij attach clank-foo
             id: 1,
             is_plugin: false,
             terminal_command: Some(cmd.to_string()),
-            title: String::new(),
             tab_id: 1,
             is_focused: false,
             exited: false,
@@ -2980,7 +2539,6 @@ ttys004   zellij attach clank-foo
             id: 1,
             is_plugin: false,
             terminal_command: Some(cmd.to_string()),
-            title: String::new(),
             tab_id: 0,
             is_focused: false,
             exited: false,
@@ -3024,7 +2582,6 @@ ttys004   zellij attach clank-foo
             id: 1,
             is_plugin: false,
             terminal_command: Some(cmd.to_string()),
-            title: String::new(),
             tab_id: 0,
             is_focused: false,
             exited: false,
@@ -3078,7 +2635,6 @@ ttys004   zellij attach clank-foo
             id: 1,
             is_plugin,
             terminal_command: cmd.map(str::to_string),
-            title: String::new(),
             tab_id: 0,
             is_focused: false,
             exited: false,
@@ -3181,36 +2737,6 @@ ttys004   zellij attach clank-foo
     }
 
     #[test]
-    fn find_anchor_pane_picks_an_existing_reviewer_for_this_repo() {
-        let panes = parse_panes();
-        let anchor = find_anchor_pane(&panes, &[agent_start_command("codex", "/a")]);
-        assert_eq!(anchor.unwrap().pane_id(), "terminal_1");
-        // No reviewer of this repo present → no anchor (first reviewer case).
-        assert!(find_anchor_pane(&panes, &[agent_start_command("codex", "/c")]).is_none());
-    }
-
-    // Both title shapes an anchor search must accept. The status TUI
-    // stamps a status glyph onto every agent pane it classifies
-    // (`status_tui/zellij.rs`), so matching `agent_pane_title`'s bare
-    // output alone would miss them all; a pane the TUI has not
-    // classified keeps the bare form. The command-less pane is what
-    // anything not launched by clank looks like.
-    const TITLE_SHAPES_JSON: &str = r#"[
-      {"id":138,"is_plugin":false,"title":"🔨 claude (master)","terminal_command":"clank agent start claude --repo /a","tab_id":18},
-      {"id":140,"is_plugin":false,"title":"status","terminal_command":"clank status --repo /a --tui","tab_id":18},
-      {"id":201,"is_plugin":false,"title":"kimi (reviewer)","terminal_command":null,"tab_id":18},
-      {"id":111,"is_plugin":false,"title":"👀 codex (reviewer)","terminal_command":null,"tab_id":19},
-      {"id":113,"is_plugin":false,"title":"💤 ruthless (reviewer)","terminal_command":null,"tab_id":19},
-      {"id":150,"is_plugin":false,"title":"🔨 claude (master)","terminal_command":"clank agent start claude --repo /c","tab_id":20},
-      {"id":151,"is_plugin":false,"title":"status","terminal_command":"clank status --repo /c --tui","tab_id":20},
-      {"id":152,"is_plugin":true,"title":"ghost (reviewer)","terminal_command":null,"tab_id":20}
-    ]"#;
-
-    fn title_shape_panes() -> Vec<ZellijPane> {
-        serde_json::from_str(TITLE_SHAPES_JSON).expect("list-panes shape parses")
-    }
-
-    #[test]
     fn remove_closes_the_exited_copy_not_the_live_one() {
         // The reported shape: a duplicate pane whose tool refused the
         // session (`already has an active writer`) and exited 1, while
@@ -3265,118 +2791,6 @@ ttys004   zellij attach clank-foo
         );
     }
 
-    #[test]
-    fn anchor_prefers_a_current_reviewer_and_does_not_report_it() {
-        let panes = parse_panes();
-        let c = select_anchor(
-            &panes,
-            &[agent_start_command("codex", "/a")],
-            &[agent_start_command("gone", "/a")],
-            Some("terminal_0".to_string()),
-        );
-        assert_eq!(c.focus.as_deref(), Some("terminal_1"));
-        // `stack` names members by command against the current roster,
-        // so it finds this one on its own.
-        assert_eq!(c.report, None);
-        // This fixture carries no geometry, so the column cannot be
-        // PROVEN clean and the fast path is refused. Unverifiable is
-        // not the same as safe.
-        assert!(
-            !c.stackable,
-            "an unverifiable column takes the recoverable path"
-        );
-    }
-
-    #[test]
-    fn anchor_falls_back_to_a_departing_reviewer_and_reports_it() {
-        // The swap case: the arriving reviewer has no peer on the new
-        // roster, and the pane that knows the tab belongs to the agent
-        // leaving this pass. Its pane is still live because removes run
-        // after the layout.
-        let panes = parse_panes();
-        let c = select_anchor(
-            &panes,
-            &[agent_start_command("nobody", "/a")],
-            &[agent_start_command("codex", "/a")],
-            Some("terminal_0".to_string()),
-        );
-        assert_eq!(c.focus.as_deref(), Some("terminal_1"));
-        // Not on the roster `stack` is given, so it must be carried.
-        assert_eq!(c.report.as_deref(), Some("terminal_1"));
-    }
-
-    #[test]
-    fn a_departing_anchor_is_scoped_to_this_repo() {
-        // `codex` runs in BOTH /a and /b. Command identity carries the
-        // repo path, so a departing `codex` in /a lands on /a's pane —
-        // being pulled into another repo's tab is the failure zellij
-        // 0.45.0 cannot undo.
-        let panes = parse_panes();
-        let c = select_anchor(
-            &panes,
-            &[agent_start_command("nobody", "/a")],
-            &[agent_start_command("codex", "/a")],
-            None,
-        );
-        assert_eq!(c.report.as_deref(), Some("terminal_1"));
-        // A departing label with no pane in THIS repo anchors nothing.
-        let c = select_anchor(
-            &panes,
-            &[agent_start_command("nobody", "/a")],
-            &[agent_start_command("codex", "/c")],
-            None,
-        );
-        assert_eq!(c.report, None);
-    }
-
-    #[test]
-    fn anchor_falls_back_to_the_caller_pane_and_reports_nothing() {
-        // Caller sits in tab 20, which holds a master, the instrument
-        // pane and a plugin — no reviewer to anchor on.
-        let panes = title_shape_panes();
-        let c = select_anchor(
-            &panes,
-            &[agent_start_command("nobody", "/c")],
-            &[],
-            Some("terminal_151".to_string()),
-        );
-        // The caller pane picks a TAB and nothing more: it must never
-        // enter the stack set.
-        assert_eq!(c.focus.as_deref(), Some("terminal_151"));
-        assert_eq!(c.report, None);
-        assert!(
-            !c.stackable,
-            "focusing the caller is a tab hint, not a stack — `--stacked` here \
-             would put a reviewer into the status pane's stack"
-        );
-    }
-
-    /// Negative eligibility: a reported anchor is a reviewer by SHAPE,
-    /// which is not the same as a stack that can be safely joined.
-    ///
-    /// A departing reviewer is on its way out and a title match admits
-    /// hand-titled false positives. Their old cost was one misplaced
-    /// pane, recoverable by `stack-panes`; joining them with
-    /// `--stacked` is not recoverable at all.
-    #[test]
-    fn a_reported_anchor_is_never_joined_at_creation() {
-        let panes = parse_panes();
-        let c = select_anchor(
-            &panes,
-            &[agent_start_command("nobody", "/a")],
-            &[agent_start_command("gone", "/a")],
-            Some("terminal_0".to_string()),
-        );
-        assert!(
-            c.report.is_some(),
-            "the fixture must yield a departing anchor"
-        );
-        assert!(
-            !c.stackable,
-            "a departing anchor is not a proven-clean stack"
-        );
-    }
-
     /// The HEALTHY LANDSCAPE shape: the reviewer region and the
     /// instrument pane share the 35% column, with status as a
     /// full-height tile directly below. This is `agent_group_kdl`'s
@@ -3388,186 +2802,31 @@ ttys004   zellij attach clank-foo
       {"id":42,"is_plugin":false,"title":"status","terminal_command":"clank status --repo /a --tui","tab_id":6,"pane_x":100,"pane_columns":60,"pane_y":20,"pane_rows":20}
     ]"#;
 
-    /// The PORTRAIT shape: status sits beside the reviewers, in its
-    /// own column.
-    const PORTRAIT_HEALTHY_JSON: &str = r#"[
-      {"id":10,"is_plugin":false,"title":"status","terminal_command":"clank status --repo /a --tui","tab_id":3,"pane_x":0,"pane_columns":40,"pane_y":20,"pane_rows":20},
-      {"id":11,"is_plugin":false,"title":"codex (reviewer)","terminal_command":"clank agent start codex --repo /a","tab_id":3,"pane_x":40,"pane_columns":60,"pane_y":20,"pane_rows":20}
-    ]"#;
-
-    /// The known-broken geometry: status is an actual stack SIBLING,
-    /// collapsed to a title row and abutting the reviewer. Not merely
-    /// another tile in the column — that is the healthy shape above.
-    const CONTAMINATED_STACK_JSON: &str = r#"[
-      {"id":20,"is_plugin":false,"title":"codex (reviewer)","terminal_command":"clank agent start codex --repo /a","tab_id":4,"pane_x":40,"pane_columns":60,"pane_y":0,"pane_rows":19},
-      {"id":21,"is_plugin":false,"title":"status","terminal_command":"clank status --repo /a --tui","tab_id":4,"pane_x":40,"pane_columns":60,"pane_y":19,"pane_rows":1}
-    ]"#;
-
-    /// The MULTI-REVIEWER landscape, which is the normal shape once a
-    /// second reviewer exists: one expanded, the rest collapsed to
-    /// title rows, and the full-height instrument pane starting
-    /// exactly at the run's bottom.
-    ///
-    /// The last collapsed reviewer ABUTS status, so any adjacency-based
-    /// membership test walks into it and refuses the fast path here.
-    const LANDSCAPE_MULTI_HEALTHY_JSON: &str = r#"[
-      {"id":60,"is_plugin":false,"title":"codex (reviewer)","terminal_command":"clank agent start codex --repo /a","tab_id":8,"pane_x":100,"pane_columns":60,"pane_y":0,"pane_rows":18},
-      {"id":61,"is_plugin":false,"title":"ruthless (reviewer)","terminal_command":"clank agent start ruthless --repo /a","tab_id":8,"pane_x":100,"pane_columns":60,"pane_y":18,"pane_rows":1},
-      {"id":62,"is_plugin":false,"title":"status","terminal_command":"clank status --repo /a --tui","tab_id":8,"pane_x":100,"pane_columns":60,"pane_y":19,"pane_rows":21}
-    ]"#;
-
-    /// The IDENTICAL-geometry stack shape with the instrument pane as
-    /// a member — every pane reports the whole stack area.
-    const IDENTICAL_CONTAMINATED_JSON: &str = r#"[
-      {"id":70,"is_plugin":false,"title":"codex (reviewer)","terminal_command":"clank agent start codex --repo /a","tab_id":9,"pane_x":40,"pane_columns":60,"pane_y":0,"pane_rows":20},
-      {"id":71,"is_plugin":false,"title":"ruthless (reviewer)","terminal_command":"clank agent start ruthless --repo /a","tab_id":9,"pane_x":40,"pane_columns":60,"pane_y":0,"pane_rows":20},
-      {"id":72,"is_plugin":false,"title":"status","terminal_command":"clank status --repo /a --tui","tab_id":9,"pane_x":40,"pane_columns":60,"pane_y":0,"pane_rows":20}
-    ]"#;
-
-    /// Status INTERLEAVED between two reviewers, which shows up as the
-    /// reviewer rows no longer tiling contiguously.
-    const INTERLEAVED_CONTAMINATED_JSON: &str = r#"[
-      {"id":80,"is_plugin":false,"title":"codex (reviewer)","terminal_command":"clank agent start codex --repo /a","tab_id":10,"pane_x":40,"pane_columns":60,"pane_y":0,"pane_rows":1},
-      {"id":81,"is_plugin":false,"title":"status","terminal_command":"clank status --repo /a --tui","tab_id":10,"pane_x":40,"pane_columns":60,"pane_y":1,"pane_rows":1},
-      {"id":82,"is_plugin":false,"title":"ruthless (reviewer)","terminal_command":"clank agent start ruthless --repo /a","tab_id":10,"pane_x":40,"pane_columns":60,"pane_y":2,"pane_rows":18}
-    ]"#;
-
-    fn codex_and_ruthless() -> [String; 2] {
-        [
-            agent_start_command("codex", "/a"),
-            agent_start_command("ruthless", "/a"),
-        ]
-    }
-
-    #[test]
-    fn the_multi_reviewer_landscape_stack_may_be_joined_at_creation() {
-        let panes: Vec<ZellijPane> = serde_json::from_str(LANDSCAPE_MULTI_HEALTHY_JSON).unwrap();
-        let c = select_anchor(&panes, &codex_and_ruthless(), &[], None);
-        assert_eq!(c.focus.as_deref(), Some("terminal_60"));
-        // The premise: the last collapsed reviewer really does abut
-        // status, so this only passes because membership is decided by
-        // the proven run and not by adjacency.
-        assert!(
-            same_stack(&panes[2], &panes[1]),
-            "the fixture must abut status to the last collapsed reviewer"
-        );
-        assert!(
-            c.stackable,
-            "status begins AT the run's bottom, which is outside it — this is every landscape \
-             tab with two reviewers"
-        );
-    }
-
-    #[test]
-    fn an_instrument_pane_sharing_the_stack_area_forbids_the_fast_path() {
-        let panes: Vec<ZellijPane> = serde_json::from_str(IDENTICAL_CONTAMINATED_JSON).unwrap();
-        let c = select_anchor(&panes, &codex_and_ruthless(), &[], None);
-        assert_eq!(c.focus.as_deref(), Some("terminal_70"));
-        assert!(
-            !c.stackable,
-            "identical geometry IS the stack, and status reports it too"
-        );
-    }
-
-    #[test]
-    fn an_interleaved_instrument_pane_forbids_the_fast_path() {
-        let panes: Vec<ZellijPane> = serde_json::from_str(INTERLEAVED_CONTAMINATED_JSON).unwrap();
-        let c = select_anchor(&panes, &codex_and_ruthless(), &[], None);
-        assert_eq!(c.focus.as_deref(), Some("terminal_80"));
-        assert!(
-            !c.stackable,
-            "something sits between the reviewers, so their rows no longer tile and no span can \
-             be proven"
-        );
-    }
-
-    #[test]
-    fn the_healthy_landscape_stack_may_be_joined_at_creation() {
-        let panes: Vec<ZellijPane> = serde_json::from_str(LANDSCAPE_HEALTHY_JSON).unwrap();
-        let c = select_anchor(&panes, &[agent_start_command("codex", "/a")], &[], None);
-        assert_eq!(c.focus.as_deref(), Some("terminal_41"));
-        assert!(
-            c.stackable,
-            "status ABUTS the reviewer region in every landscape tab — abutting is the layout, \
-             not a stack, and refusing here disables the fix where the jump actually shows"
-        );
-    }
-
-    #[test]
-    fn the_healthy_portrait_stack_may_be_joined_at_creation() {
-        let panes: Vec<ZellijPane> = serde_json::from_str(PORTRAIT_HEALTHY_JSON).unwrap();
-        let c = select_anchor(&panes, &[agent_start_command("codex", "/a")], &[], None);
-        assert_eq!(c.focus.as_deref(), Some("terminal_11"));
-        assert!(c.stackable, "status in its own column is no sibling at all");
-    }
-
-    /// The exact-command anchor is NOT sufficient on its own.
-    #[test]
-    fn an_instrument_pane_inside_the_stack_forbids_the_fast_path() {
-        let panes: Vec<ZellijPane> = serde_json::from_str(CONTAMINATED_STACK_JSON).unwrap();
-        let c = select_anchor(&panes, &[agent_start_command("codex", "/a")], &[], None);
-        assert_eq!(
-            c.focus.as_deref(),
-            Some("terminal_20"),
-            "still the anchor for the tab"
-        );
-        assert!(
-            !c.stackable,
-            "status collapsed to a title row and abutting IS a stack member, and joining it \
-             cannot be undone"
-        );
-    }
-
-    /// The pane is born in the stack instead of being created loose and
-    /// moved — the move is a second action, and zellij draws the pane
-    /// in its default spot before it lands.
     /// Whatever creates the pane — the layout, an add, a reopen — the
     /// pane runs `clank agent start`, and THAT is where the session's
     /// holder is found before anything resumes (a-session-has-one-
     /// holder). A pane that launched the tool directly would skip it.
     #[test]
     fn every_new_pane_launches_through_agent_start() {
-        for stacked in [true, false] {
-            let argv = new_pane_argv("ruthless", "/repo", stacked);
-            let sep = argv
-                .iter()
-                .position(|a| a == "--")
-                .expect("a `--` separator");
-            assert_eq!(
-                argv[sep + 1..],
-                ["clank", "agent", "start", "ruthless", "--repo", "/repo"],
-                "{argv:?}"
-            );
-            assert_eq!(
-                argv[sep + 1..].join(" "),
-                agent_start_command("ruthless", "/repo"),
-                "byte-identical to the identity the scans match on"
-            );
-        }
-    }
-
-    #[test]
-    fn new_pane_is_born_stacked_only_when_there_is_a_stack() {
-        let with = new_pane_argv("ruthless", "/repo", true);
-        assert!(
-            with.iter().any(|a| a == "--stacked"),
-            "an anchored pane joins the stack at creation: {with:?}"
+        let argv = new_pane_argv("ruthless", "/repo");
+        let sep = argv
+            .iter()
+            .position(|a| a == "--")
+            .expect("a `--` separator");
+        assert_eq!(
+            argv[sep + 1..],
+            ["clank", "agent", "start", "ruthless", "--repo", "/repo"],
+            "{argv:?}"
         );
-        // Order matters to clap: flags precede the `--` separator.
-        let sep = with.iter().position(|a| a == "--").unwrap();
-        let flag = with.iter().position(|a| a == "--stacked").unwrap();
-        assert!(flag < sep, "the flag must sit before `--`: {with:?}");
-
-        let without = new_pane_argv("ruthless", "/repo", false);
-        assert!(
-            !without.iter().any(|a| a == "--stacked"),
-            "with no stack to join, the flag is a guess about layout: {without:?}"
+        assert_eq!(
+            argv[sep + 1..].join(" "),
+            agent_start_command("ruthless", "/repo"),
+            "byte-identical to the identity the scans match on"
         );
-        // The unstacked form is EXACTLY what shipped before, so an old
-        // client falls back to today's behaviour rather than to a
-        // `new-pane` its parser rejects.
-        assert_eq!(without[0], "new-pane");
-        assert_eq!(without[1], "--name");
+        assert!(
+            !argv.iter().any(|a| a == "--stacked"),
+            "placement is the layout's, applied after: {argv:?}"
+        );
     }
 
     /// No zellij → one message that says what to install, and an
@@ -3633,73 +2892,6 @@ ttys004   zellij attach clank-foo
     }
 
     #[test]
-    fn anchor_with_nothing_to_go_on_is_empty() {
-        let panes = parse_panes();
-        let c = select_anchor(&panes, &[agent_start_command("nobody", "/a")], &[], None);
-        assert_eq!(c, AnchorChoice::default());
-    }
-
-    #[test]
-    fn title_anchor_finds_the_reviewer_the_command_match_cannot_see() {
-        let panes = title_shape_panes();
-        // A reviewer pane the exact-command lookup cannot name, which
-        // is the whole reason the fallback exists.
-        assert!(find_anchor_pane(&panes, &[agent_start_command("kimi", "/a")]).is_none());
-        assert_eq!(
-            find_reviewer_pane_by_title(&panes, 18).map(ZellijPane::pane_id),
-            Some("terminal_201".to_string())
-        );
-    }
-
-    #[test]
-    fn title_anchor_accepts_the_glyph_stamped_shape() {
-        let panes = title_shape_panes();
-        assert_eq!(
-            find_reviewer_pane_by_title(&panes, 19).map(ZellijPane::pane_id),
-            Some("terminal_111".to_string())
-        );
-    }
-
-    #[test]
-    fn title_anchor_never_picks_master_status_or_a_plugin() {
-        let panes = title_shape_panes();
-        // Tab 20 holds a master, the instrument pane, and a PLUGIN
-        // whose title would otherwise match — the instrument pane
-        // getting stacked is the original bug this must not revive.
-        assert!(find_reviewer_pane_by_title(&panes, 20).is_none());
-    }
-
-    #[test]
-    fn title_anchor_is_scoped_to_one_tab() {
-        let panes = title_shape_panes();
-        // `list-panes` spans ALL tabs and `(reviewer)` is in nearly
-        // every one, so an unscoped match would anchor onto a foreign
-        // tab — which zellij 0.45.0 offers no way to undo.
-        for (tab, want) in [(18u32, "terminal_201"), (19, "terminal_111")] {
-            assert_eq!(
-                find_reviewer_pane_by_title(&panes, tab).map(ZellijPane::pane_id),
-                Some(want.to_string())
-            );
-        }
-        assert!(find_reviewer_pane_by_title(&panes, 99).is_none());
-    }
-
-    #[test]
-    fn a_title_matched_pane_is_still_not_a_roster_member() {
-        let panes = title_shape_panes();
-        // Anchoring accepts it; CLASSIFICATION must not. A title
-        // carries no ownership marker, so letting it name an agent
-        // fails open (zellij-pane-placement-and-cost).
-        let anchor = find_reviewer_pane_by_title(&panes, 18).expect("anchor found");
-        assert_eq!(agent_pane_label(anchor, "/a"), None);
-        assert!(
-            agent_pane_pairs(&panes, Path::new("/a"))
-                .iter()
-                .all(|(l, _)| l != "kimi")
-        );
-    }
-
-    #[test]
     fn compose_kdl_panes_set_cwd_to_repo_path() {
         // Codex 8075d43: pinning `--repo` on `clank agent start`
         // fixes config resolution but the exec'd tool (e.g.
@@ -3713,7 +2905,7 @@ ttys004   zellij attach clank-foo
             "alice",
             &reviewers(&["bob"]),
             None,
-            LANDSCAPE,
+            LAND,
         )
         .unwrap();
         assert!(
@@ -3734,7 +2926,7 @@ ttys004   zellij attach clank-foo
             "m",
             &reviewers(&["bob", "alice", "codex"]),
             None,
-            LANDSCAPE,
+            LAND,
         )
         .unwrap();
         let bob_idx = kdl.find("name=\"bob (reviewer)\"").unwrap();
@@ -3780,7 +2972,7 @@ ttys004   zellij attach clank-foo
         // Pane name + args interpolations both go through
         // kdl_escape. A pathological label with a literal quote
         // must not break the layout string.
-        let kdl = compose_kdl(TEST_TAB, TEST_REPO, r#"weird"name"#, &[], None, LANDSCAPE).unwrap();
+        let kdl = compose_kdl(TEST_TAB, TEST_REPO, r#"weird"name"#, &[], None, LAND).unwrap();
         // The raw `"name"` text MUST appear escaped, not as a
         // bare `"` that would close the KDL string early.
         assert!(
@@ -3809,7 +3001,7 @@ ttys004   zellij attach clank-foo
             "m",
             &[],
             None,
-            LANDSCAPE,
+            LAND,
         )
         .unwrap();
         assert!(
@@ -3845,7 +3037,7 @@ ttys004   zellij attach clank-foo
         // built-in now uses default_tab_template, so bars apply to
         // runtime-spawned tabs too (the plan's problem #2, fixed
         // for everyone, not just template authors).
-        let kdl = compose_kdl(TEST_TAB, TEST_REPO, "m", &[], None, LANDSCAPE).unwrap();
+        let kdl = compose_kdl(TEST_TAB, TEST_REPO, "m", &[], None, LAND).unwrap();
         assert!(kdl.contains("default_tab_template"), "got:\n{kdl}");
         let _: kdl::KdlDocument = kdl.parse().expect("built-in output is valid KDL");
         assert!(
@@ -3880,7 +3072,7 @@ ttys004   zellij attach clank-foo
             "alice",
             &reviewers(&["bob"]),
             Some(template),
-            LANDSCAPE,
+            LAND,
         )
         .unwrap();
         // Chrome preserved verbatim.
@@ -3909,7 +3101,7 @@ ttys004   zellij attach clank-foo
     }
 }
 "##;
-        let kdl = compose_kdl(TEST_TAB, TEST_REPO, "m", &[], Some(template), LANDSCAPE).unwrap();
+        let kdl = compose_kdl(TEST_TAB, TEST_REPO, "m", &[], Some(template), LAND).unwrap();
         assert!(!kdl.contains(AGENTS_MARKER));
         assert!(kdl.contains("name=\"m (master)\""));
     }
@@ -3917,8 +3109,7 @@ ttys004   zellij attach clank-foo
     #[test]
     fn template_without_marker_errors_naming_it() {
         let template = "layout {\n    tab {\n        pane\n    }\n}\n";
-        let err =
-            compose_kdl(TEST_TAB, TEST_REPO, "m", &[], Some(template), LANDSCAPE).unwrap_err();
+        let err = compose_kdl(TEST_TAB, TEST_REPO, "m", &[], Some(template), LAND).unwrap_err();
         assert!(
             err.to_string().contains("clank_agents"),
             "error must name the marker; got: {err}"
@@ -3928,8 +3119,7 @@ ttys004   zellij attach clank-foo
     #[test]
     fn template_with_invalid_kdl_errors_at_compose_not_zellij() {
         let template = "layout { tab { pane "; // unclosed
-        let err =
-            compose_kdl(TEST_TAB, TEST_REPO, "m", &[], Some(template), LANDSCAPE).unwrap_err();
+        let err = compose_kdl(TEST_TAB, TEST_REPO, "m", &[], Some(template), LAND).unwrap_err();
         assert!(err.to_string().contains("not valid KDL"), "got: {err}");
     }
 
@@ -3945,7 +3135,7 @@ ttys004   zellij attach clank-foo
     }
 }
 "##;
-        let kdl = compose_kdl(TEST_TAB, TEST_REPO, "m", &[], Some(template), LANDSCAPE).unwrap();
+        let kdl = compose_kdl(TEST_TAB, TEST_REPO, "m", &[], Some(template), LAND).unwrap();
         // The comment + the tab NAME survive untouched; the node is
         // replaced.
         assert!(kdl.contains("// put clank_agents here someday"));
@@ -3980,7 +3170,7 @@ ttys004   zellij attach clank-foo
             "alice",
             &reviewers(&["bob", "carol"]),
             None,
-            LANDSCAPE,
+            LAND,
         )
         .unwrap();
         // Stage: master gets the big pane.
@@ -4017,7 +3207,7 @@ ttys004   zellij attach clank-foo
             "alice",
             &reviewers(&["bob"]),
             None,
-            PORTRAIT,
+            PORT,
         )
         .unwrap();
         assert!(
@@ -4038,8 +3228,8 @@ ttys004   zellij attach clank-foo
         // Landscape dims → outer split is COLUMNS (vertical);
         // portrait dims → ROWS (horizontal). The base tab carries
         // the detected arrangement.
-        let land = compose_kdl(TEST_TAB, TEST_REPO, "m", &[], None, LANDSCAPE).unwrap();
-        let port = compose_kdl(TEST_TAB, TEST_REPO, "m", &[], None, PORTRAIT).unwrap();
+        let land = compose_kdl(TEST_TAB, TEST_REPO, "m", &[], None, LAND).unwrap();
+        let port = compose_kdl(TEST_TAB, TEST_REPO, "m", &[], None, PORT).unwrap();
         let base_tab = |k: &str| {
             let i = k.find("tab name=").unwrap();
             let j = k.find("swap_tiled_layout").unwrap_or(k.len());
@@ -4057,7 +3247,7 @@ ttys004   zellij attach clank-foo
 
     #[test]
     fn built_in_ships_both_swap_variants_user_templates_get_none() {
-        let built_in = compose_kdl(TEST_TAB, TEST_REPO, "m", &[], None, LANDSCAPE).unwrap();
+        let built_in = compose_kdl(TEST_TAB, TEST_REPO, "m", &[], None, LAND).unwrap();
         assert!(
             built_in.contains("swap_tiled_layout name=\"landscape\"")
                 && built_in.contains("swap_tiled_layout name=\"portrait\""),
@@ -4069,7 +3259,7 @@ ttys004   zellij attach clank-foo
             "m",
             &[],
             Some("layout {\n    clank_agents\n}\n"),
-            LANDSCAPE,
+            LAND,
         )
         .unwrap();
         assert!(
@@ -4080,7 +3270,7 @@ ttys004   zellij attach clank-foo
 
     #[test]
     fn zero_reviewers_skips_stack_keeps_tui() {
-        let kdl = compose_kdl(TEST_TAB, TEST_REPO, "m", &[], None, LANDSCAPE).unwrap();
+        let kdl = compose_kdl(TEST_TAB, TEST_REPO, "m", &[], None, LAND).unwrap();
         let doc: kdl::KdlDocument = kdl.parse().expect("valid KDL");
         assert!(
             stacked_panes(layout_child(&doc, "tab")).is_empty(),
@@ -4157,7 +3347,7 @@ ttys004   zellij attach clank-foo
             "alice",
             &reviewers(&["bob", "carol"]),
             None,
-            LANDSCAPE,
+            LAND,
         )
         .unwrap();
         let doc: kdl::KdlDocument = kdl.parse().expect("valid KDL");
@@ -4496,103 +3686,7 @@ dead-one [Created 10h ago] (EXITED - attach to resurrect)
         assert_eq!(session_name(&at_cap), format!("clank-{at_cap}"));
     }
 
-    #[test]
-    fn compose_relocation_requires_the_departing_old_master_in_the_set() {
-        // codex ae6338a: when the old master LEAVES the roster its pane
-        // is still live during the relocation (removes run after the
-        // layout). compose classifies panes against the supplied label
-        // set and skips on any unclassified agent pane — so the caller
-        // must include the departing source, or the relocation
-        // silently no-ops exactly when a team replacement needs it.
-        let panes = panes_from(&[
-            agent_pane(0, "old", false),
-            agent_pane(1, "codex", false),
-            status_pane(2),
-        ]);
-        let without_departing = compose_promote_layout(
-            &panes,
-            Some("terminal_2"),
-            &labels(&["codex"]),
-            "codex",
-            "/a",
-            (200, 50),
-        );
-        assert_eq!(
-            without_departing,
-            PromoteRelayout::Skip,
-            "unclassified live pane → skip (safety rule)"
-        );
-        let with_departing = compose_promote_layout(
-            &panes,
-            Some("terminal_2"),
-            &labels(&["codex", "old"]),
-            "codex",
-            "/a",
-            (200, 50),
-        );
-        assert!(
-            matches!(with_departing, PromoteRelayout::Apply(_)),
-            "departing source classified → relocation applies"
-        );
-    }
-
-    #[test]
-    fn compose_relocation_classifies_departing_reviewers_too() {
-        // codex 8c4906d: a team replacement can have a departing
-        // REVIEWER live during the relocation (removes run after the
-        // layout) alongside a master swap — the classification set
-        // must be roster ∪ every live agent label or compose skips.
-        let panes = panes_from(&[
-            agent_pane(0, "old-master", false),
-            agent_pane(1, "leaving-rev", false),
-            agent_pane(2, "codex", false),
-            status_pane(3),
-        ]);
-        // Roster after the change: codex master, old-master demoted...
-        // without the departing reviewer in the set → Skip.
-        let missing = compose_promote_layout(
-            &panes,
-            Some("terminal_3"),
-            &labels(&["codex", "old-master"]),
-            "codex",
-            "/a",
-            (200, 50),
-        );
-        assert_eq!(missing, PromoteRelayout::Skip);
-        let full = compose_promote_layout(
-            &panes,
-            Some("terminal_3"),
-            &labels(&["codex", "old-master", "leaving-rev"]),
-            "codex",
-            "/a",
-            (200, 50),
-        );
-        assert!(matches!(full, PromoteRelayout::Apply(_)));
-    }
-
     // ── agent-promote-zellij-relocation: compose_promote_layout ──
-
-    fn labels(ls: &[&str]) -> Vec<String> {
-        ls.iter().map(|s| s.to_string()).collect()
-    }
-
-    /// A live agent pane in `/a`, tab 0. `focused` marks the caller pane.
-    fn agent_pane(id: u32, label: &str, focused: bool) -> String {
-        format!(
-            r#"{{"id":{id},"is_plugin":false,"is_focused":{focused},"title":"{label} (x)","terminal_command":"clank agent start {label} --repo /a","tab_id":0}}"#
-        )
-    }
-
-    fn status_pane(id: u32) -> String {
-        format!(
-            r#"{{"id":{id},"is_plugin":false,"is_focused":false,"title":"status","terminal_command":"clank status --repo /a --tui","tab_id":0}}"#
-        )
-    }
-
-    fn panes_from(parts: &[String]) -> Vec<ZellijPane> {
-        let json = format!("[{}]", parts.join(","));
-        serde_json::from_str(&json).expect("fixture parses")
-    }
 
     #[test]
     fn tab_dims_reads_tab_extent_for_orientation() {
@@ -4642,8 +3736,8 @@ dead-one [Created 10h ago] (EXITED - attach to resurrect)
         .unwrap();
         assert_eq!(tab_dims(&with_plugin, 0), (178, 137));
 
-        // Geometry absent (older/odd list-panes) → (0,0); relocate_for_promote
-        // falls back to term_size rather than mis-orienting.
+        // Geometry absent (older/odd list-panes) → (0,0); the callers
+        // fall back to the size rule rather than mis-orienting.
         let no_geo: Vec<ZellijPane> = serde_json::from_str(
             r#"[
               {"id":0,"is_plugin":false,"is_focused":true,"terminal_command":"x","tab_id":0}
@@ -4653,223 +3747,237 @@ dead-one [Created 10h ago] (EXITED - attach to resurrect)
         assert_eq!(tab_dims(&no_geo, 0), (0, 0));
     }
 
-    #[test]
-    fn compose_promote_all_classified_makes_new_master_the_stage() {
-        // claude (current master, the caller pane) + codex reviewer + status.
-        // Promote codex → codex becomes the 65% stage, claude joins the
-        // stack; both panes are reused (slot commands byte-match the live
-        // terminal_commands).
-        let panes = panes_from(&[
-            agent_pane(0, "claude", true),
-            agent_pane(1, "codex", false),
-            status_pane(2),
-        ]);
-        let out = compose_promote_layout(
-            &panes,
-            Some("terminal_0"),
-            &labels(&["claude", "codex"]),
-            "codex",
-            "/a",
-            LANDSCAPE,
-        );
-        let PromoteRelayout::Apply(kdl) = out else {
-            panic!("expected Apply, got {out:?}");
-        };
-        // codex is the 65% stage.
-        assert!(
-            kdl.contains("pane size=\"65%\" name=\"codex (master)\""),
-            "codex must be the stage:\n{kdl}"
-        );
-        // claude is stacked (a reviewer slot).
-        assert!(kdl.contains("pane stacked=true"), "stack region:\n{kdl}");
-        assert!(
-            kdl.contains("name=\"claude (reviewer)\""),
-            "claude must join the stack:\n{kdl}"
-        );
-        // status pane present.
-        assert!(kdl.contains("name=\"status\""), "status pane:\n{kdl}");
-        // Slot commands byte-match the live terminal_commands.
-        assert!(kdl.contains("args \"agent\" \"start\" \"codex\" \"--repo\" \"/a\""));
-        assert!(kdl.contains("args \"agent\" \"start\" \"claude\" \"--repo\" \"/a\""));
-        // Multi-line KDL (zellij's parser rejects the compact form).
-        assert!(kdl.lines().count() > 5, "multi-line KDL:\n{kdl}");
-        // Caller's pane (claude) carries focus=true.
-        assert!(
-            kdl.contains("name=\"claude (reviewer)\" cwd=\"/a\" focus=true")
-                || focus_on_claude(&kdl),
-            "caller pane must have focus=true:\n{kdl}"
-        );
-        let _: kdl::KdlDocument = kdl.parse().expect("composed promote layout is valid KDL");
+    // ── the live layout (placement-is-a-layout-applied-not-panes-shuffled) ──
+
+    fn panes_of(json: &str) -> Vec<ZellijPane> {
+        serde_json::from_str(json).unwrap()
     }
 
-    /// `focus=true` lands on the (claude) pane node regardless of attribute
-    /// order in the serialized KDL.
-    fn focus_on_claude(kdl: &str) -> bool {
-        let doc: kdl::KdlDocument = kdl.parse().unwrap();
-        fn walk(doc: &kdl::KdlDocument) -> bool {
-            for n in doc.nodes() {
-                if n.name().value() == "pane"
-                    && pane_command(n).as_deref() == Some("clank agent start claude --repo /a")
-                    && n.entries().iter().any(|e| {
-                        e.name().map(|x| x.value()) == Some("focus")
-                            && e.value().as_bool() == Some(true)
-                    })
-                {
-                    return true;
-                }
-                if let Some(c) = n.children() {
-                    if walk(c) {
-                        return true;
-                    }
-                }
-            }
-            false
-        }
-        walk(&doc)
-    }
-
+    /// The stage is read from GEOMETRY — the biggest agent pane in its
+    /// tab — never from a title. A pane titled `(master)` that sits in
+    /// the stack is not the stage, and a promoted pane on the stage is,
+    /// whatever its title still says.
     #[test]
-    fn compose_promote_omits_roster_agent_with_no_live_pane() {
-        // glm is on the roster but has no live pane — it's omitted from the
-        // composed layout, and relocation still proceeds (omit ≠ skip).
-        let panes = panes_from(&[
-            agent_pane(0, "claude", true),
-            agent_pane(1, "codex", false),
-            status_pane(2),
-        ]);
-        let out = compose_promote_layout(
-            &panes,
-            Some("terminal_0"),
-            &labels(&["claude", "codex", "glm"]),
-            "codex",
-            "/a",
-            LANDSCAPE,
+    fn the_stage_is_the_biggest_agent_pane_not_the_titled_one() {
+        let panes = panes_of(
+            r#"[
+          {"id":1,"title":"claude (master)","terminal_command":"clank agent start claude --repo /a","tab_id":6,"pane_x":100,"pane_columns":60,"pane_y":0,"pane_rows":20},
+          {"id":2,"title":"codex (reviewer)","terminal_command":"clank agent start codex --repo /a","tab_id":6,"pane_x":0,"pane_columns":100,"pane_y":0,"pane_rows":40},
+          {"id":3,"title":"other (master)","terminal_command":"clank agent start other --repo /b","tab_id":9,"pane_x":0,"pane_columns":100,"pane_y":0,"pane_rows":40}
+        ]"#,
         );
-        let PromoteRelayout::Apply(kdl) = out else {
-            panic!("expected Apply, got {out:?}");
-        };
-        assert!(
-            !kdl.contains("\"glm\""),
-            "absent roster agent must be omitted:\n{kdl}"
-        );
-        assert!(kdl.contains("name=\"codex (master)\""));
-    }
-
-    #[test]
-    fn compose_promote_skips_on_unclassified_live_pane() {
-        // A manual shell pane (null terminal_command) in the active tab →
-        // Skip the whole relocation (config role change still stands).
-        let shell = r#"{"id":3,"is_plugin":false,"is_focused":false,"title":"zsh","terminal_command":null,"tab_id":0}"#.to_string();
-        let panes = panes_from(&[
-            agent_pane(0, "claude", true),
-            agent_pane(1, "codex", false),
-            status_pane(2),
-            shell,
-        ]);
-        let out = compose_promote_layout(
-            &panes,
-            Some("terminal_0"),
-            &labels(&["claude", "codex"]),
-            "codex",
-            "/a",
-            LANDSCAPE,
-        );
-        assert_eq!(out, PromoteRelayout::Skip);
-    }
-
-    #[test]
-    fn compose_promote_skips_on_command_byte_mismatch() {
-        // An agent pane whose command doesn't byte-match agent_start_command
-        // (here it carries the running foreground process, NOT invoked_with)
-        // → Skip (it would be unclassified, and override would close it).
-        let mismatch = r#"{"id":1,"is_plugin":false,"is_focused":false,"title":"codex (reviewer)","terminal_command":"codex resume abc-123","tab_id":0}"#.to_string();
-        let panes = panes_from(&[agent_pane(0, "claude", true), mismatch, status_pane(2)]);
-        let out = compose_promote_layout(
-            &panes,
-            Some("terminal_0"),
-            &labels(&["claude", "codex"]),
-            "codex",
-            "/a",
-            LANDSCAPE,
-        );
-        assert_eq!(out, PromoteRelayout::Skip);
-    }
-
-    #[test]
-    fn compose_promote_ignores_panes_in_other_tabs() {
-        // A pane in a DIFFERENT tab (tab 1) — even an unclassified one —
-        // must be ignored by the active-tab filter; relocation proceeds on
-        // the caller's tab (tab 0).
-        let other_tab_shell = r#"{"id":9,"is_plugin":false,"is_focused":true,"title":"shell","terminal_command":null,"tab_id":1}"#.to_string();
-        let panes = panes_from(&[
-            agent_pane(0, "claude", true),
-            agent_pane(1, "codex", false),
-            status_pane(2),
-            other_tab_shell,
-        ]);
-        let out = compose_promote_layout(
-            &panes,
-            Some("terminal_0"),
-            &labels(&["claude", "codex"]),
-            "codex",
-            "/a",
-            LANDSCAPE,
-        );
-        let PromoteRelayout::Apply(kdl) = out else {
-            panic!("expected Apply (other-tab pane ignored), got {out:?}");
-        };
-        assert!(kdl.contains("name=\"codex (master)\""));
-    }
-
-    #[test]
-    fn compose_promote_skips_when_new_master_has_no_live_pane() {
-        // Promote `glm`, which has no live pane → Skip (nothing to make the
-        // stage).
-        let panes = panes_from(&[
-            agent_pane(0, "claude", true),
-            agent_pane(1, "codex", false),
-            status_pane(2),
-        ]);
-        let out = compose_promote_layout(
-            &panes,
-            Some("terminal_0"),
-            &labels(&["claude", "codex", "glm"]),
-            "glm",
-            "/a",
-            LANDSCAPE,
-        );
-        assert_eq!(out, PromoteRelayout::Skip);
-    }
-
-    #[test]
-    fn compose_promote_skips_when_caller_pane_not_found() {
-        // The caller pane id isn't among the live panes (no active-tab
-        // anchor, no focus target) → Skip.
-        let panes = panes_from(&[
-            agent_pane(0, "claude", false),
-            agent_pane(1, "codex", false),
-            status_pane(2),
-        ]);
-        let out = compose_promote_layout(
-            &panes,
-            Some("terminal_99"),
-            &labels(&["claude", "codex"]),
-            "codex",
-            "/a",
-            LANDSCAPE,
-        );
-        assert_eq!(out, PromoteRelayout::Skip);
-        // Same for an absent caller ref (outside-zellij-ish).
         assert_eq!(
-            compose_promote_layout(
-                &panes,
-                None,
-                &labels(&["claude", "codex"]),
-                "codex",
-                "/a",
-                LANDSCAPE,
-            ),
-            PromoteRelayout::Skip
+            agent_pane_pairs(&panes, Path::new("/a")),
+            vec![("claude".to_string(), false), ("codex".to_string(), true)]
+        );
+        // Two panes of equal size stage nobody: the answer must be
+        // positive evidence, never a tie broken by listing order.
+        let tie = panes_of(
+            r#"[
+          {"id":1,"terminal_command":"clank agent start claude --repo /a","tab_id":6,"pane_columns":50,"pane_rows":20},
+          {"id":2,"terminal_command":"clank agent start codex --repo /a","tab_id":6,"pane_columns":50,"pane_rows":20}
+        ]"#,
+        );
+        assert!(
+            agent_pane_pairs(&tie, Path::new("/a"))
+                .iter()
+                .all(|(_, s)| !s)
+        );
+    }
+
+    #[test]
+    fn the_repo_tab_is_where_its_instrument_or_agent_panes_are() {
+        let panes = panes_of(LANDSCAPE_HEALTHY_JSON);
+        assert_eq!(repo_tab_id(&panes, Path::new("/a")), Some(6));
+        assert_eq!(repo_tab_id(&panes, Path::new("/elsewhere")), None);
+        let agents_only = panes_of(
+            r#"[{"id":1,"terminal_command":"clank agent start claude --repo /a","tab_id":4}]"#,
+        );
+        assert_eq!(repo_tab_id(&agents_only, Path::new("/a")), Some(4));
+    }
+
+    /// The tab's CURRENT orientation comes from where the instrument
+    /// pane sits relative to the stage, so a re-layout keeps what
+    /// alt+[ chose; without both to compare, the tab's extent decides.
+    #[test]
+    fn tab_orientation_is_read_from_the_stage_and_the_instrument_pane() {
+        // Each fixture is arranged AGAINST what its extent would say,
+        // so the geometry read is what answers, never the size rule.
+        // A tall tab (100x60 — the size rule says portrait) arranged
+        // landscape: the instrument pane beside the stage.
+        let landscape = panes_of(
+            r#"[
+          {"id":1,"terminal_command":"clank agent start claude --repo /a","tab_id":6,"pane_x":0,"pane_columns":60,"pane_y":0,"pane_rows":60},
+          {"id":2,"terminal_command":"clank agent start codex --repo /a","tab_id":6,"pane_x":60,"pane_columns":40,"pane_y":0,"pane_rows":30},
+          {"id":3,"terminal_command":"clank status --repo /a --tui","tab_id":6,"pane_x":60,"pane_columns":40,"pane_y":30,"pane_rows":30}
+        ]"#,
+        );
+        assert_eq!(
+            tab_orientation(&landscape, Path::new("/a"), 6),
+            Orientation::Landscape,
+            "a tall tab the user flipped to landscape stays landscape"
+        );
+        // A wide tab (200x50 — the size rule says landscape) arranged
+        // portrait: the stage on top, the side region below it.
+        let portrait = panes_of(
+            r#"[
+          {"id":1,"terminal_command":"clank agent start claude --repo /a","tab_id":3,"pane_x":0,"pane_columns":200,"pane_y":0,"pane_rows":30},
+          {"id":2,"terminal_command":"clank agent start codex --repo /a","tab_id":3,"pane_x":0,"pane_columns":120,"pane_y":30,"pane_rows":20},
+          {"id":3,"terminal_command":"clank status --repo /a --tui","tab_id":3,"pane_x":120,"pane_columns":80,"pane_y":30,"pane_rows":20}
+        ]"#,
+        );
+        assert_eq!(
+            tab_orientation(&portrait, Path::new("/a"), 3),
+            Orientation::Portrait,
+            "a wide tab the user flipped to portrait stays portrait"
+        );
+        // No instrument pane to compare against: the extent rule.
+        let bare = panes_of(
+            r#"[{"id":1,"terminal_command":"clank agent start claude --repo /a","tab_id":3,"pane_x":0,"pane_columns":200,"pane_y":0,"pane_rows":50}]"#,
+        );
+        assert_eq!(
+            tab_orientation(&bare, Path::new("/a"), 3),
+            Orientation::Landscape
+        );
+    }
+
+    /// Drive the transaction with scripted outcomes and record what it
+    /// ran: `(actions, result)`.
+    fn transact(
+        tab: u32,
+        actives: Vec<Option<u32>>,
+        outcomes: Vec<bool>,
+    ) -> (Vec<Vec<String>>, bool) {
+        let mut ran: Vec<Vec<String>> = Vec::new();
+        let mut actives = actives.into_iter();
+        let mut outcomes = outcomes.into_iter();
+        let result = override_transaction(
+            tab,
+            "/l.kdl",
+            |args| {
+                ran.push(args.iter().map(|a| a.to_string()).collect());
+                outcomes.next().unwrap_or(true)
+            },
+            || actives.next().unwrap_or(None),
+        );
+        (ran, result)
+    }
+
+    fn go_to(tab: u32) -> Vec<String> {
+        vec!["go-to-tab-by-id".to_string(), tab.to_string()]
+    }
+
+    /// The tab is focused BY ID — names may repeat across worktrees —
+    /// only when it is not already active, the override carries every
+    /// flag (each a measured necessity), and the previous tab is
+    /// restored after.
+    #[test]
+    fn the_override_focuses_by_id_overrides_the_active_tab_only_and_restores() {
+        let (ran, ok) = transact(6, vec![Some(2), Some(6)], vec![]);
+        assert!(ok);
+        assert_eq!(
+            ran,
+            vec![
+                go_to(6),
+                override_layout_argv("/l.kdl")
+                    .iter()
+                    .map(|a| a.to_string())
+                    .collect::<Vec<_>>(),
+                go_to(2),
+            ]
+        );
+        assert!(
+            ran.iter().flatten().all(|a| a != "go-to-tab-name"),
+            "never by name"
+        );
+        let (ran, ok) = transact(6, vec![Some(6)], vec![]);
+        assert!(ok);
+        assert_eq!(ran.len(), 1, "already active: no focus dance");
+        assert_eq!(ran[0][0], "override-layout");
+    }
+
+    /// Nothing here is fail-open (codex on d758045): `override-layout`
+    /// acts on whatever tab is active, so an active tab that cannot be
+    /// identified, a focus that fails, or a focus that does not read
+    /// back as the target each refuse the override — and a focus that
+    /// moved is undone even when the override is refused or fails.
+    #[test]
+    fn the_override_is_a_checked_transaction_that_never_lands_on_the_wrong_tab() {
+        // The active tab is unknown: refuse, touch nothing.
+        let (ran, ok) = transact(6, vec![None], vec![]);
+        assert!(!ok && ran.is_empty(), "{ran:?}");
+
+        // The focus action fails: no override, nothing to restore.
+        let (ran, ok) = transact(6, vec![Some(2)], vec![false]);
+        assert!(!ok);
+        assert_eq!(ran, vec![go_to(6)]);
+
+        // The focus "succeeded" but the active tab reads back as
+        // another: no override, and the previous tab is restored.
+        let (ran, ok) = transact(6, vec![Some(2), Some(3)], vec![true, true]);
+        assert!(!ok);
+        assert_eq!(ran, vec![go_to(6), go_to(2)]);
+
+        // The override itself fails: reported, and the previous tab is
+        // restored all the same.
+        let (ran, ok) = transact(6, vec![Some(2), Some(6)], vec![true, false, true]);
+        assert!(!ok);
+        assert_eq!(ran.len(), 3);
+        assert_eq!(ran[1][0], "override-layout");
+        assert_eq!(ran[2], go_to(2));
+    }
+
+    /// The live layout is the SAME composition `clank open` launches
+    /// from — same slots, same commands, both swap variants — and reads
+    /// the same template source, so a workspace opened from a marker
+    /// template is re-laid with it.
+    #[test]
+    fn the_live_layout_is_opens_composition_from_the_same_template_source() {
+        let repo = Path::new("/tmp/live-repo");
+        let built_in = compose_live_layout(
+            repo,
+            None,
+            "codex",
+            &["claude".to_string()],
+            Orientation::Landscape,
+        )
+        .unwrap();
+        let expected = compose_kdl(
+            "live-repo",
+            "/tmp/live-repo",
+            "codex",
+            &["claude".to_string()],
+            None,
+            LAND,
+        )
+        .unwrap();
+        assert_eq!(built_in, expected);
+        assert_eq!(built_in.matches("swap_tiled_layout").count(), 2);
+
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".clank")).unwrap();
+        std::fs::write(
+            home.path().join(".clank/config.json"),
+            serde_json::json!({"zellij": {"layout": "layout {\n    tab name=\"MINE\" {\n        clank_agents\n    }\n}\n"}})
+                .to_string(),
+        )
+        .unwrap();
+        let templated = compose_live_layout(
+            repo,
+            Some(home.path()),
+            "codex",
+            &["claude".to_string()],
+            Orientation::Landscape,
+        )
+        .unwrap();
+        assert!(templated.contains("MINE"));
+        assert!(
+            !templated.contains("swap_tiled_layout"),
+            "a template's contract: no generated swaps"
+        );
+        assert!(
+            templated.contains("\"codex\""),
+            "the roster still lands at the marker"
         );
     }
 }
