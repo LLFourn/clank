@@ -179,36 +179,6 @@ pub(super) fn row_line(spans: &[Span], selected: bool, color: &str, cols: usize)
     }
 }
 
-/// Columns of clear space kept between a row's own content and the
-/// right-hand column: below this the two read as one word.
-const MIN_GAP: usize = 2;
-
-/// Push `right` to the row's right edge, gap-filled.
-///
-/// `right` is SECONDARY by construction — an age beside a subject, an
-/// elapsed beside a verb — so it is kept only while the row's own
-/// content keeps every column it would have had, and is dropped WHOLE
-/// otherwise. A truncated `3…` in the time column would name nothing
-/// and would still cost the subject its space.
-///
-/// Returns spans, so the caller's [`row_line`] truncates and paints
-/// the selection band exactly as it does for any other row.
-pub(super) fn gap_fill(mut left: Vec<Span>, right: &[Span], cols: usize) -> Vec<Span> {
-    if right.is_empty() {
-        return left;
-    }
-    let width = |spans: &[Span]| -> usize { spans.iter().map(|Span(_, t)| display_width(t)).sum() };
-    let Some(gap) = cols.checked_sub(width(&left) + width(right)) else {
-        return left;
-    };
-    if gap < MIN_GAP {
-        return left;
-    }
-    left.push(plain(" ".repeat(gap)));
-    left.extend(right.iter().cloned());
-    left
-}
-
 /// Collapse a possibly-multiline / control-laden string to ONE display
 /// line: first line only, control chars dropped, truncated to `cols`.
 /// Every line a renderer emits must be a single terminal row — a raw
@@ -526,34 +496,6 @@ mod tests {
         assert_eq!(wrap("🔨🔨", 2), vec!["🔨", "🔨"]);
         // width 0 degrades to one line per newline-segment, no panic.
         assert_eq!(wrap("a b\nc", 0), vec!["a b", "c"]);
-    }
-
-    /// The right column is pushed to the edge, and is dropped WHOLE
-    /// the moment the row's own content would have to give up a
-    /// column for it — an age is worth nothing at the cost of the
-    /// subject it dates.
-    #[test]
-    fn gap_fill_pushes_right_or_drops_it_whole() {
-        let left = vec![plain("subject".to_string())];
-        let right = vec![dim("2d".to_string())];
-        let out = visible_of(&gap_fill(left.clone(), &right, 20));
-        assert_eq!(out, "subject           2d");
-        assert_eq!(display_width(&out), 20, "flush to the edge");
-
-        // Exactly the minimum gap still fits.
-        assert_eq!(
-            visible_of(&gap_fill(left.clone(), &right, 11)),
-            "subject  2d"
-        );
-        // One column tighter and the right segment goes, whole.
-        assert_eq!(visible_of(&gap_fill(left.clone(), &right, 10)), "subject");
-        assert_eq!(visible_of(&gap_fill(left.clone(), &right, 4)), "subject");
-        // Nothing to add is not a change.
-        assert_eq!(visible_of(&gap_fill(left, &[], 40)), "subject");
-    }
-
-    fn visible_of(spans: &[Span]) -> String {
-        spans.iter().map(|Span(_, t)| t.as_str()).collect()
     }
 
     #[test]

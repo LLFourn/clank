@@ -313,16 +313,26 @@ pub(super) fn render_at(
                 })
                 .max()
                 .unwrap_or(0);
+            let age_width = seq[off..end]
+                .iter()
+                .filter_map(|s| match s {
+                    Seg::Log(row) => row_age(row),
+                    Seg::Ask(_) => None,
+                })
+                .map(|t| display_width(&t))
+                .max()
+                .unwrap_or(0);
             for (local, s) in seq[off..end].iter().enumerate() {
-                // A log row's age joins the pane's time column; an ask
-                // is a question, not an event, and has none.
+                // Every log row LEADS with when it happened, in one
+                // gutter down the region. An ask is a question, not an
+                // event, and keeps the full width.
                 let spans = match s {
                     Seg::Ask(a) => a.spans.clone(),
-                    Seg::Log(row) => gap_fill(
-                        log_row_spans(row, author_width, &snap.log_decorations),
-                        row_age(row).as_slice(),
-                        cols,
-                    ),
+                    Seg::Log(row) => {
+                        let mut spans = vec![age_gutter(row, age_width)];
+                        spans.extend(log_row_spans(row, author_width, &snap.log_decorations));
+                        spans
+                    }
                 };
                 // The selected timeline entry gets the unified selection
                 // band — the same "selected" style as the panel/picker —
@@ -552,20 +562,19 @@ pub(super) fn scrollable_header(
                 .unwrap_or((false, None));
             // No live wait — including a record whose process has
             // ended, which leaves the agent free to be working.
-            // The elapsed rides WITH the spinner: it says how long
-            // this agent has owed what it owes, so an idle row has
-            // nothing to say and an attending one says it in its own
-            // marker below.
-            let mut elapsed: Vec<Span> = Vec::new();
+            // The elapsed rides WITH the spinner, next to the verb it
+            // qualifies: it says how long this agent has owed what it
+            // owes, so an idle row has nothing to say and an attending
+            // one says it in its own marker below.
             if !waiting {
                 if let Some((verb, since)) = verb_for(&a.label) {
                     spans.push(dim(format!("  {}", spinner_glyph(frame))));
                     spans.push(italic(format!(" {verb}…")));
-                    elapsed.extend(since.map(elapsed_span));
+                    spans.extend(since.map(|at| dim(format!(" {}", elapsed_text(at)))));
                 }
             }
             head_out.push(row_line(
-                &gap_fill(spans, &elapsed, cols),
+                &spans,
                 mode.selected() == at(PanelRow::Agent(i)),
                 color,
                 cols,
@@ -890,13 +899,12 @@ pub(super) fn log_row_spans(
     }
 }
 
-/// The row's place in the pane's one time column: how long ago its
-/// event happened.
+/// How long ago this row's event happened.
 ///
 /// `None` for what is not an event — an umbrella header, a read
 /// notice — and for a review whose file could not be read: a missing
 /// clock shows nothing rather than a wrong age.
-pub(super) fn row_age(row: &crate::cli::log::OnelineRow) -> Option<Span> {
+pub(super) fn row_age(row: &crate::cli::log::OnelineRow) -> Option<String> {
     use crate::cli::log::OnelineRow;
     let at = match row {
         OnelineRow::Commit { at, .. } | OnelineRow::PlainCommit { at, .. } => *at,
@@ -904,13 +912,36 @@ pub(super) fn row_age(row: &crate::cli::log::OnelineRow) -> Option<Span> {
         OnelineRow::Review { at, .. } => (*at)?,
         OnelineRow::Header { .. } | OnelineRow::Notice(_) => return None,
     };
-    Some(elapsed_span(at))
+    Some(elapsed_text(at))
 }
 
-/// One cell of the time column: an event's age, dim, at the coarse
-/// resolution the pane's idle repaint can keep true.
-pub(super) fn elapsed_span(at: i64) -> Span {
-    dim(crate::age::coarse(crate::age::elapsed(at)))
+/// The log's time gutter: the row's age, right-aligned in a field as
+/// wide as the widest age on screen, so the shas and subjects after it
+/// stay in one column.
+///
+/// It LEADS the row rather than closing it. At the right edge the age
+/// is the first thing a long subject pushes off the pane — which in
+/// this repo is nearly every row — and an age you have to widen the
+/// pane to see is not one you can glance at (lloyd on a9ea144).
+fn age_gutter(row: &crate::cli::log::OnelineRow, width: usize) -> Span {
+    use crate::cli::log::OnelineRow;
+    // An umbrella header and a read notice are not events: they keep
+    // the left margin, where a divider belongs. An EVENT whose time
+    // could not be read keeps the column anyway — it is still a row
+    // in the list, and stepping out of the column would say more
+    // about the missing clock than the blank does.
+    if width == 0 || matches!(row, OnelineRow::Header { .. } | OnelineRow::Notice(_)) {
+        return dim(String::new());
+    }
+    let age = row_age(row).unwrap_or_default();
+    let pad = width.saturating_sub(display_width(&age));
+    dim(format!("{}{age}  ", " ".repeat(pad)))
+}
+
+/// An event's age at the coarse resolution the pane's idle repaint
+/// can keep true.
+pub(super) fn elapsed_text(at: i64) -> String {
+    crate::age::coarse(crate::age::elapsed(at))
 }
 
 /// One rendered line of a pending block's question, tagged with the
@@ -3506,7 +3537,7 @@ mod tests {
         // Each row now ends with its age in the pane's time column, so
         // the subject is read out of the row, not off its end.
         assert!(
-            texts[5].contains("e5") && texts[5].ends_with("1h"),
+            texts[5].starts_with("1h  ") && texts[5].ends_with("e5"),
             "most recent at the TOP of the log: {texts:?}"
         );
         assert!(texts[6].contains("e4"), "got {texts:?}");
@@ -3566,12 +3597,12 @@ mod tests {
         // commit indented under it at column 2.
         assert!(texts.iter().any(|t| t == "foo"), "header: {texts:?}");
         assert!(
-            // plan commit: sha at col 2, empty (space) marker gutter,
-            // then the subject (adhoc-commit-marker).
+            // plan commit: its age leads, then the empty (space)
+            // marker gutter and the sha (adhoc-commit-marker).
             texts
                 .iter()
-                .any(|t| t.starts_with("  abc1234") && t.contains("intro")),
-            "commit indented: {texts:?}"
+                .any(|t| t.starts_with("1h  ") && t.contains("  abc1234 intro")),
+            "commit indented under its age: {texts:?}"
         );
         let raw = lines.join("");
         // The header carries the background-highlight SGR.
@@ -3619,17 +3650,17 @@ mod tests {
         // 6 bytes/2 cols) of where `needle` begins on a line.
         let col = |line: &str, needle: &str| display_width(&line[..line.find(needle).unwrap()]);
 
-        // The commit sha sits at column 2 (after "  ").
+        // The commit sha sits two columns past the time gutter.
         let commit = texts.iter().find(|t| t.contains("abc1234")).unwrap();
-        assert_eq!(col(commit, "abc1234"), 2, "sha at column 2: {commit:?}");
+        let sha_col = col(commit, "abc1234");
 
-        // Every review mark starts at that SAME column 2, and every
+        // Every review mark starts at that SAME column, and every
         // summary (`: why`) starts at one shared column regardless of
         // mark width or author length.
         let mut summary_cols = Vec::new();
         for (mark, name) in [("✓", "codex"), ("✓✓", "ruthless"), ("✗", "zz")] {
             let line = texts.iter().find(|t| t.contains(name)).unwrap();
-            assert_eq!(col(line, mark), 2, "mark at sha column: {line:?}");
+            assert_eq!(col(line, mark), sha_col, "mark at sha column: {line:?}");
             summary_cols.push(col(line, ": why"));
         }
         assert!(
@@ -5276,8 +5307,8 @@ mod tests {
         let out = render(&s, 40, 80);
         let codex_row = visible(line_with(&out, "codex"));
         assert!(
-            codex_row.contains("reviewing") && codex_row.ends_with("3h"),
-            "the elapsed closes the row, in the time column: {codex_row}"
+            codex_row.ends_with("reviewing… 3h"),
+            "the elapsed sits with the verb it qualifies: {codex_row}"
         );
         let claude_row = visible(line_with(&out, "claude"));
         assert!(
@@ -5331,11 +5362,13 @@ mod tests {
         );
     }
 
-    /// Every event in the log says how long ago it happened, in the
-    /// same column the agent rows use. A row that is not an event —
-    /// an umbrella header — says nothing.
+    /// Every event in the log LEADS with how long ago it happened,
+    /// in one gutter wide enough for the widest age on screen, so the
+    /// rows after it stay in one column. A row that is not an event —
+    /// an umbrella header — leaves the gutter blank rather than
+    /// stepping out of it.
     #[test]
-    fn log_rows_say_how_long_ago_in_the_time_column() {
+    fn log_rows_lead_with_how_long_ago() {
         use crate::cli::log::OnelineRow;
         let mut s = snap_with_log(&[]);
         let now = crate::age::now();
@@ -5357,36 +5390,47 @@ mod tests {
             },
         ];
         let out = render(&s, 40, 80);
+        // `20m` is the widest age here, so the gutter is 3 columns.
         let commit = visible(line_with(&out, "do a thing"));
-        assert!(commit.ends_with("2d"), "the commit's age: {commit}");
+        assert!(
+            commit.starts_with(" 2d  ") && commit.contains("abc1234 do a thing"),
+            "the commit's age leads: {commit:?}"
+        );
         let review = visible(line_with(&out, "lgtm"));
         assert!(
-            review.ends_with("20m"),
-            "the review's, from its file's write time: {review}"
+            review.starts_with("20m  "),
+            "the review's, from its file's write time: {review:?}"
         );
-        let header = visible(line_with(&out, "foo"));
         assert!(
-            !header.ends_with('m') && !header.ends_with('d'),
-            "an umbrella is not an event: {header}"
+            out.iter().any(|l| visible(l) == "foo"),
+            "an umbrella is a divider, not an event: it keeps the margin"
         );
         // A review whose file could not be read shows no age rather
-        // than a wrong one.
+        // than a wrong one — and still keeps its place in the column.
         s.log_rows[1] = OnelineRow::Review {
             at: None,
             verdict: clank_core::vocab::Verdict::Continue,
             author: "codex".into(),
             summary: "lgtm".into(),
         };
+        let out = render(&s, 40, 80);
+        let review = visible(line_with(&out, "lgtm"));
         assert!(
-            visible(line_with(&render(&s, 40, 80), "lgtm")).ends_with("lgtm"),
-            "no clock, no column"
+            review.starts_with("     ") && review.ends_with("lgtm"),
+            "no clock, blank gutter: {review:?}"
+        );
+        assert!(
+            visible(line_with(&out, "do a thing")).starts_with("2d  "),
+            "and the gutter narrows to the widest age left"
         );
     }
 
-    /// The time column is secondary: a pane too narrow for both drops
-    /// it WHOLE, and the row's own content keeps every column it had.
+    /// The age outlives the subject on a narrow pane. It leads the
+    /// row, so what a too-small pane takes is the tail of the
+    /// subject — the inverse of trailing it, where the age was the
+    /// first thing gone and every long-subject row lost its clock.
     #[test]
-    fn a_narrow_pane_drops_the_age_and_keeps_the_subject() {
+    fn a_narrow_pane_keeps_the_age_and_truncates_the_subject() {
         use crate::cli::log::OnelineRow;
         let mut s = snap_with_log(&[]);
         s.log_rows = vec![OnelineRow::Commit {
@@ -5396,15 +5440,15 @@ mod tests {
             marker: crate::cli::log::RowMarker::Plain,
         }];
         let wide = visible(line_with(&render(&s, 40, 80), "a subject"));
-        assert!(wide.ends_with("2d"));
-        let narrow = visible(line_with(&render(&s, 40, 34), "a subject"));
+        assert!(wide.starts_with("2d  ") && wide.ends_with("a subject of some length"));
+        let narrow = visible(line_with(&render(&s, 40, 24), "a subject"));
         assert!(
-            narrow.ends_with("a subject of some length"),
-            "the subject keeps its columns; the age is gone whole: {narrow:?}"
+            narrow.starts_with("2d  "),
+            "the age is still there: {narrow:?}"
         );
         assert!(
-            !narrow.contains("2d") && !narrow.contains('…'),
-            "dropped, never truncated to a fragment: {narrow:?}"
+            narrow.ends_with('…'),
+            "and the subject gave way instead: {narrow:?}"
         );
     }
 
