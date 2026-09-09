@@ -23,7 +23,7 @@ const ENV_GROK_MARKER: &str = "GROK_AGENT";
 /// (opencode-agent-tool M0). Present iff the shell call carried the
 /// exact session id; the plugin never guesses.
 const ENV_OPENCODE_SESSION: &str = "OPENCODE_SESSION_ID";
-const ENV_CLANK_AGENT: &str = "CLANK_AGENT";
+pub(crate) const ENV_CLANK_AGENT: &str = "CLANK_AGENT";
 
 /// Every env var that carries an agent IDENTITY (session ids,
 /// markers, the explicit label override). Fresh launches scrub these

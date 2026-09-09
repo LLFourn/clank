@@ -252,7 +252,7 @@ fn start(args: AgentStartArgs) -> anyhow::Result<()> {
                 session.tool.as_str(),
             ),
             Holder::ClaudeBackground { short_id } => (
-                compose_attach_launch(session.tool, desc.launch.as_ref(), &short_id),
+                compose_attach_launch(session.tool, &label, desc.launch.as_ref(), &short_id),
                 session.tool,
             ),
             Holder::Nobody => {
@@ -316,15 +316,14 @@ fn launch_program(tool: Tool, launch: Option<&LaunchConfig>) -> String {
 /// already running with them. The env goes along as for any launch.
 fn compose_attach_launch(
     tool: Tool,
+    label: &AgentLabel,
     launch: Option<&LaunchConfig>,
     short_id: &str,
 ) -> ComposedLaunch {
-    let mut env_overrides = tool_env_defaults(tool);
-    env_overrides.extend(launch.map(|l| l.env.clone()).unwrap_or_default());
     ComposedLaunch {
         program: launch_program(tool, launch),
         args: vec!["attach".into(), short_id.into()],
-        env_overrides,
+        env_overrides: launch_env(tool, label, launch),
     }
 }
 
@@ -446,21 +445,13 @@ fn compose_bootstrap_launch(
     push_prompt(
         desc.tool,
         &mut args,
-        name_led_prompt(desc.tool, &name, bootstrap_bind_prompt(label)),
-    );
-
-    let mut env_overrides = tool_env_defaults(desc.tool);
-    env_overrides.extend(
-        desc.launch
-            .as_ref()
-            .map(|l| l.env.clone())
-            .unwrap_or_default(),
+        name_led_prompt(desc.tool, &name, bootstrap_prompt(desc.tool, label)),
     );
 
     Ok(ComposedLaunch {
         program,
         args,
-        env_overrides,
+        env_overrides: launch_env(desc.tool, label, desc.launch.as_ref()),
     })
 }
 
@@ -564,17 +555,10 @@ fn compose_fork_launch(
         &mut args,
         name_led_prompt(spec.tool, &name, spec.prompt.clone()),
     );
-    let mut env_overrides = tool_env_defaults(spec.tool);
-    env_overrides.extend(
-        desc.launch
-            .as_ref()
-            .map(|l| l.env.clone())
-            .unwrap_or_default(),
-    );
     ComposedLaunch {
         program,
         args,
-        env_overrides,
+        env_overrides: launch_env(spec.tool, label, desc.launch.as_ref()),
     }
 }
 
@@ -639,12 +623,42 @@ fn name_led_prompt(tool: Tool, name: &str, prompt: String) -> String {
     }
 }
 
-/// Seed prompt for the bootstrap launch. Verbatim per the plan's
-/// PINNED string — `bootstrap_uses_tool_from_declaration` test
-/// asserts on this with `assert_eq!`, so a wording tweak fails the
-/// test deliberately.
-pub(super) fn bootstrap_bind_prompt(label: &AgentLabel) -> String {
-    format!("Run `clank as {}` to bind this session.", label.as_str())
+/// Seed prompt for the bootstrap launch — PINNED strings, asserted
+/// with `assert_eq!`, so a wording tweak fails a test deliberately.
+///
+/// A first turn has to END for the Stop hook to park, so every tool
+/// gets a prompt. What it says depends on who binds the session: a
+/// tool with a SessionStart hook clank installs (claude, codex) binds
+/// itself from `CLANK_AGENT` before this prompt is even read
+/// (a-session-binds-itself-at-start), so the prompt only opens the
+/// turn; a tool without one still has to be asked.
+pub(super) fn bootstrap_prompt(tool: Tool, label: &AgentLabel) -> String {
+    match tool {
+        Tool::Claude | Tool::Codex => "Session started.".to_string(),
+        Tool::OpenCode | Tool::Grok => {
+            format!("Run `clank as {}` to bind this session.", label.as_str())
+        }
+    }
+}
+
+/// The environment a launched tool runs under: the tool's defaults,
+/// the profile's overrides, and — last, so nothing can override it —
+/// the label this process tree IS. `exec_composed` scrubs every
+/// inherited identity var first, so this is never a parent's label
+/// leaking through; hooks inherit it and bind the session to it
+/// (a-session-binds-itself-at-start).
+fn launch_env(
+    tool: Tool,
+    label: &AgentLabel,
+    launch: Option<&LaunchConfig>,
+) -> std::collections::BTreeMap<String, String> {
+    let mut env = tool_env_defaults(tool);
+    env.extend(launch.map(|l| l.env.clone()).unwrap_or_default());
+    env.insert(
+        crate::agent_env::ENV_CLANK_AGENT.to_string(),
+        label.as_str().to_string(),
+    );
+    env
 }
 
 /// Env defaults a tool's launch always carries; `launch.env` merges
@@ -764,13 +778,10 @@ fn compose_launch(
         );
     }
 
-    let mut env_overrides = tool_env_defaults(tool);
-    env_overrides.extend(launch.map(|l| l.env.clone()).unwrap_or_default());
-
     ComposedLaunch {
         program,
         args,
-        env_overrides,
+        env_overrides: launch_env(tool, label, launch),
     }
 }
 
@@ -1846,14 +1857,14 @@ mod tests {
             args: vec!["--agent".into(), "reviewer".into()],
             env: BTreeMap::from([("CLANK_X".to_string(), "1".to_string())]),
         };
-        let c = compose_attach_launch(Tool::Claude, Some(&launch), "1f47fd71");
+        let c = compose_attach_launch(Tool::Claude, &label("claude"), Some(&launch), "1f47fd71");
         assert_eq!(c.program, "/opt/bin/claude-wrapper");
         assert_eq!(c.args, ["attach", "1f47fd71"]);
         assert_eq!(
             c.env_overrides.get("CLANK_X").map(String::as_str),
             Some("1")
         );
-        let bare = compose_attach_launch(Tool::Claude, None, "1f47fd71");
+        let bare = compose_attach_launch(Tool::Claude, &label("claude"), None, "1f47fd71");
         assert_eq!(bare.program, "claude");
         assert_eq!(bare.args, ["attach", "1f47fd71"]);
     }
@@ -2919,11 +2930,17 @@ mod tests {
             c.env_overrides.get("OPENCODE_DISABLE_CLAUDE_CODE_SKILLS"),
             Some(&"0".to_string())
         );
-        // Other tools carry no opencode default.
+        // Other tools carry no opencode default — only their own label.
         let desc = desc_with(Tool::Claude, None);
         let c = compose_bootstrap_launch(Path::new("/repo"), &label("phantom"), &desc)
             .expect("compose");
-        assert!(c.env_overrides.is_empty());
+        assert_eq!(
+            c.env_overrides
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["CLANK_AGENT"]
+        );
     }
 
     #[test]
@@ -2989,8 +3006,18 @@ mod tests {
                 // left alone.
                 "-n".to_string(),
                 "repo · phantom".to_string(),
-                "Run `clank as phantom` to bind this session.".to_string(),
+                // The session binds itself from the env; the prompt
+                // only opens the first turn so the Stop hook parks.
+                "Session started.".to_string(),
             ]
+        );
+        assert_eq!(
+            composed
+                .env_overrides
+                .get("CLANK_AGENT")
+                .map(String::as_str),
+            Some("phantom"),
+            "the label the SessionStart hook binds from"
         );
     }
 
@@ -3021,16 +3048,69 @@ mod tests {
             composed.args,
             // No name flag for this tool, so the title is DERIVED
             // from the opening message and the name has to lead it.
-            vec!["repo · phantom — Run `clank as phantom` to bind this session.".to_string()]
+            vec!["repo · phantom — Session started.".to_string()]
         );
     }
 
+    /// Pinned: exact equality so a future wording tweak fails the
+    /// test deliberately. The tools with a clank SessionStart hook
+    /// bind themselves and are only asked to open a turn; the rest are
+    /// still asked to bind.
     #[test]
-    fn bootstrap_bind_prompt_is_pinned_verbatim() {
-        // Pinned: exact equality so a future wording tweak fails
-        // the test deliberately.
-        let s = bootstrap_bind_prompt(&label("phantom"));
-        assert_eq!(s, "Run `clank as phantom` to bind this session.");
+    fn bootstrap_prompt_is_pinned_per_tool() {
+        let l = label("phantom");
+        for tool in [Tool::Claude, Tool::Codex] {
+            assert_eq!(bootstrap_prompt(tool, &l), "Session started.", "{tool:?}");
+        }
+        for tool in [Tool::OpenCode, Tool::Grok] {
+            assert_eq!(
+                bootstrap_prompt(tool, &l),
+                "Run `clank as phantom` to bind this session.",
+                "{tool:?}"
+            );
+        }
+    }
+
+    /// Every composed launch — bootstrap, resume, attach, fork — runs
+    /// the tool with the label it IS, after the scrub of whatever the
+    /// launching shell carried, and nothing in the profile can
+    /// override it.
+    #[test]
+    fn every_launch_carries_its_own_label_for_the_hooks() {
+        let launch = LaunchConfig {
+            command: None,
+            args: vec![],
+            env: [("CLANK_AGENT".to_string(), "impostor".to_string())]
+                .into_iter()
+                .collect(),
+        };
+        let desc = desc_with(Tool::Claude, Some(launch.clone()));
+        let boot = compose_bootstrap_launch(Path::new("/repo"), &label("real"), &desc).unwrap();
+        assert_eq!(
+            boot.env_overrides.get("CLANK_AGENT").map(String::as_str),
+            Some("real")
+        );
+        let attach = compose_attach_launch(Tool::Claude, &label("real"), Some(&launch), "1f47");
+        assert_eq!(
+            attach.env_overrides.get("CLANK_AGENT").map(String::as_str),
+            Some("real")
+        );
+        let session = Session {
+            id: clank_core::ids::SessionId::parse("9c96eb03-1458-4bac-abbb-90243cfd422c").unwrap(),
+            tool: Tool::Claude,
+            updated_at: String::new(),
+        };
+        let resume = compose_launch(
+            Path::new("/repo"),
+            &label("real"),
+            &session,
+            Some(&launch),
+            None,
+        );
+        assert_eq!(
+            resume.env_overrides.get("CLANK_AGENT").map(String::as_str),
+            Some("real")
+        );
     }
 
     #[test]

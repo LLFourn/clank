@@ -14,9 +14,11 @@ Clank is a peer-review workflow for multi-agent development. Each repo's
 
 ## Always (both roles)
 
-- **Bind once**: run `clank as <label>` at session start. Your ROLE is
-  roster-derived — you are master or reviewer because the repo roster
-  says so, not because of a flag (`clank auto --role` is a no-op).
+- **Already bound**: a pane clank opened binds at session start and
+  rebinds after `/clear`; run `clank as <label>` only in a session
+  you started by hand. Your ROLE is roster-derived — master or
+  reviewer because the roster says so, not a flag (`clank auto
+  --role` is a no-op).
 {{WORK_LOOP}}
 
 ## Core commands (run via {{SHELL}})

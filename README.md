@@ -46,8 +46,9 @@ not chase them.
   `clank finish`, which seals the plan (and, with `finish.autosquash`,
   collapses its commits into one).
 - Roles are a property of the repo's **roster** (`.clank/config.json`,
-  local-only), not per-session flags. Agents bind their session to a
-  roster label once with `clank as <label>`.
+  local-only), not per-session flags. A session clank launches is
+  bound to its roster label at session start (and rebound after
+  `/clear`); a session you start by hand binds with `clank as <label>`.
 
 ## Install
 
@@ -117,19 +118,17 @@ alt+] flip the CURRENT roster's arrangement, not the one from when
 the session was opened.
 
 (`clank agent start <label>` launches ONE agent — resuming its session
-if it has one, or bootstrapping it with a seed prompt to bind if it
-doesn't. `clank open` is what brings up the whole team.)
+if it has one, or starting a fresh one if it doesn't. `clank open` is
+what brings up the whole team.)
 
-**3. Each agent — bind once, in its own pane.**
+**3. Each agent is bound as it starts.**
 
-```sh
-clank as alice        # in alice's pane
-clank as bob          # in bob's pane
-```
-
-The binding is what tells clank which roster entry this session is, so
-work can be routed to it. The installed skills teach the agents to do
-this themselves on first turn.
+The pane's tool runs with `CLANK_AGENT=<label>` in its environment,
+and clank's SessionStart hook binds that label to the session the tool
+just created — so work can be routed to it — and rebinds it when
+`/clear` hands the process a new session id. Nothing to type. Only a
+session you started yourself needs `clank as <label>` (claude and
+codex; opencode and grok still bind from a seed prompt).
 
 **4. The master — write and promote a plan.**
 

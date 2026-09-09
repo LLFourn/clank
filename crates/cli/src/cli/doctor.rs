@@ -423,11 +423,7 @@ pub fn repo_checks(
 /// git matches patterns, not files.
 /// Classify installed-vs-capable loop-mode drift
 /// (claude-asyncrewake-work-loop). Pure; `None` = healthy.
-pub(crate) fn claude_mode_drift(
-    installed_async: bool,
-    session_start_installed: bool,
-    capable: bool,
-) -> Option<String> {
+pub(crate) fn claude_mode_drift(installed_async: bool, capable: bool) -> Option<String> {
     match (installed_async, capable) {
         (true, false) => Some(
             "the installed claude Stop hook is asyncrewake but this Claude Code \
@@ -438,11 +434,6 @@ pub(crate) fn claude_mode_drift(
         (false, true) => Some(
             "this Claude Code supports asyncRewake but the installed Stop hook is \
              the legacy background-arm loop; run `clank setup` to upgrade"
-                .to_string(),
-        ),
-        (true, true) if !session_start_installed => Some(
-            "asyncrewake Stop hook installed without its SessionStart companion \
-             (generation minting + catch-up); run `clank setup`"
                 .to_string(),
         ),
         _ => None,
@@ -472,23 +463,19 @@ fn check_claude_loop_mode(settings: &Path) -> Option<CheckResult> {
     };
     let stop_cmd = entry_cmd("Stop", "clank-stop-hook")?;
     let installed_async = stop_cmd.contains("--loop asyncrewake");
-    let session_start_installed =
-        entry_cmd("SessionStart", crate::cli::setup::SESSION_START_HOOK_ID).is_some();
     let capable = crate::cli::setup::probe_claude_asyncrewake()?;
-    Some(
-        match claude_mode_drift(installed_async, session_start_installed, capable) {
-            Some(msg) => CheckResult::warn(SECTION, "claude loop mode", msg),
-            None => CheckResult::ok(
-                SECTION,
-                "claude loop mode",
-                if installed_async {
-                    "asyncrewake (matches installed Claude Code)"
-                } else {
-                    "legacy background-arm (matches installed Claude Code)"
-                },
-            ),
-        },
-    )
+    Some(match claude_mode_drift(installed_async, capable) {
+        Some(msg) => CheckResult::warn(SECTION, "claude loop mode", msg),
+        None => CheckResult::ok(
+            SECTION,
+            "claude loop mode",
+            if installed_async {
+                "asyncrewake (matches installed Claude Code)"
+            } else {
+                "legacy background-arm (matches installed Claude Code)"
+            },
+        ),
+    })
 }
 
 /// The executable `clank agent start` will exec for a declaration:
@@ -682,10 +669,20 @@ fn user_checks() -> Vec<CheckResult> {
         "claude",
         "~/.claude/settings.json",
     ));
+    out.push(check_session_start(
+        &home.join(".claude/settings.json"),
+        "claude",
+        "~/.claude/settings.json SessionStart",
+    ));
     out.push(check_hook_entry(
         &home.join(".codex/hooks.json"),
         "codex",
         "~/.codex/hooks.json",
+    ));
+    out.push(check_session_start(
+        &home.join(".codex/hooks.json"),
+        "codex",
+        "~/.codex/hooks.json SessionStart",
     ));
     out.push(check_codex_rule(
         &home.join(".codex/rules/default.rules"),
@@ -800,6 +797,52 @@ fn check_hook_entry(path: &Path, tool: &str, display: &str) -> CheckResult {
             SECTION,
             display,
             format!("no clank Stop hook in {tool} config — run `clank setup`"),
+        )
+    }
+}
+
+/// The SessionStart companion is what binds a launched session and
+/// rebinds it after `/clear`; without it a cleared session silently
+/// stops being driven, and a launched one is never bound at all
+/// (a-session-binds-itself-at-start). Mode-independent, both tools.
+fn check_session_start(path: &Path, tool: &str, display: &str) -> CheckResult {
+    const SECTION: &str = "user";
+    let installed = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok())
+        .and_then(|v| {
+            v.get("hooks")?
+                .get("SessionStart")?
+                .as_array()
+                .map(|entries| {
+                    entries.iter().any(|wrapper| {
+                        wrapper
+                            .get("hooks")
+                            .and_then(|h| h.as_array())
+                            .is_some_and(|inner| {
+                                inner.iter().any(|h| {
+                                    h.get("id").and_then(|v| v.as_str())
+                                        == Some(crate::cli::setup::SESSION_START_HOOK_ID)
+                                })
+                            })
+                    })
+                })
+        })
+        .unwrap_or(false);
+    if installed {
+        CheckResult::ok(
+            SECTION,
+            display,
+            format!("{tool} SessionStart hook installed"),
+        )
+    } else {
+        CheckResult::warn(
+            SECTION,
+            display,
+            format!(
+                "no clank SessionStart hook in {tool} config: a {tool} session clank launches \
+                 is not bound, and one that runs `/clear` stops being tracked — run `clank setup`"
+            ),
         )
     }
 }
@@ -1005,14 +1048,14 @@ mod tests {
     fn claude_mode_drift_matrix() {
         // Both drift directions warn; matched modes are healthy; a
         // missing SessionStart companion under async is drift too.
-        assert!(super::claude_mode_drift(true, true, true).is_none());
-        assert!(super::claude_mode_drift(false, false, false).is_none());
-        let stale_async = super::claude_mode_drift(true, true, false).unwrap();
+        assert!(super::claude_mode_drift(true, true).is_none());
+        assert!(super::claude_mode_drift(false, false).is_none());
+        let stale_async = super::claude_mode_drift(true, false).unwrap();
         assert!(stale_async.contains("SYNCHRONOUS"), "{stale_async}");
-        let stale_legacy = super::claude_mode_drift(false, false, true).unwrap();
+        let stale_legacy = super::claude_mode_drift(false, true).unwrap();
         assert!(stale_legacy.contains("upgrade"), "{stale_legacy}");
-        let no_companion = super::claude_mode_drift(true, false, true).unwrap();
-        assert!(no_companion.contains("SessionStart"), "{no_companion}");
+        // The SessionStart companion is not a MODE question any more:
+        // its own check wants it in every mode, for both tools.
     }
 
     #[test]
@@ -1127,6 +1170,53 @@ mod tests {
         assert_eq!(
             row(Some(P::ClientSupports)).map(|r| r.status),
             Some(CheckStatus::Ok)
+        );
+    }
+
+    #[test]
+    fn the_doctor_wants_the_session_start_hook_for_both_tools_in_every_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let claude = dir.path().join("settings.json");
+        std::fs::write(
+            &claude,
+            serde_json::json!({"hooks": {"Stop": [{"hooks": [{"id": "clank-stop-hook", "command": "clank stop-hook --tool claude"}]}]}})
+                .to_string(),
+        )
+        .unwrap();
+        let legacy = check_session_start(&claude, "claude", "d");
+        assert_eq!(
+            legacy.status,
+            CheckStatus::Warn,
+            "a legacy-mode claude without the companion is not bound: {}",
+            legacy.message
+        );
+        let path = dir.path().join("hooks.json");
+        assert_eq!(
+            check_session_start(&path, "codex", "d").status,
+            CheckStatus::Warn
+        );
+        std::fs::write(
+            &path,
+            serde_json::json!({"hooks": {"Stop": [{"hooks": [{"id": "clank-stop-hook"}]}]}})
+                .to_string(),
+        )
+        .unwrap();
+        let only_stop = check_session_start(&path, "codex", "d");
+        assert_eq!(only_stop.status, CheckStatus::Warn);
+        assert!(
+            only_stop.message.contains("/clear"),
+            "{}",
+            only_stop.message
+        );
+        std::fs::write(
+            &path,
+            serde_json::json!({"hooks": {"SessionStart": [{"hooks": [{"id": crate::cli::setup::SESSION_START_HOOK_ID}]}]}})
+                .to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            check_session_start(&path, "codex", "d").status,
+            CheckStatus::Ok
         );
     }
 

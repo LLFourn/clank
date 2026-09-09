@@ -361,19 +361,76 @@ fn loop_policy(tool: Tool) -> LoopPolicy {
     }
 }
 
-/// SessionStart (claude-asyncrewake-work-loop): every incarnation
-/// MINTS a new wait generation — revoking any waiter surviving from
-/// a previous incarnation (whose wake pipe is dead, M0) — then
-/// surfaces pending work via `additionalContext` so a resumed
-/// session catches up immediately instead of waiting for its first
-/// turn-end park. Fail-open EVERYWHERE: a session start must never
-/// be broken by clank state, so every error path exits 0 quietly.
-async fn run_session_start(args: StopHookArgs) -> anyhow::Result<()> {
-    #[derive(serde::Deserialize)]
-    struct SessionStartInput {
-        session_id: String,
-        cwd: String,
+/// The SessionStart payload both tools send: claude documents it,
+/// codex 0.153 carries the same fields (read from the schema in its
+/// binary and confirmed with a hook that echoed its stdin).
+#[derive(serde::Deserialize)]
+struct SessionStartInput {
+    session_id: String,
+    cwd: String,
+    /// `startup` / `resume` / `clear` / `compact`. Absent on a payload
+    /// that predates it; nothing here branches on it, it is recorded
+    /// for the diagnostic line.
+    #[serde(default)]
+    source: Option<String>,
+}
+
+/// Who this session is, and — when clank launched it — the binding
+/// that says so.
+///
+/// A session clank launched carries `CLANK_AGENT` (set by `clank
+/// agent start` after scrubbing any inherited identity), and that
+/// label is bound to the id on stdin: on `startup` the first bind,
+/// on `clear` the rebind that keeps a session tracked across a new
+/// id, on `resume`/`compact` an idempotent re-assertion. The bind
+/// mints the wait generation as part of its claim, which is the
+/// stale-waiter revocation every session start needs anyway. A
+/// session clank did not launch has no label in its environment and
+/// is identified by its id, as `clank as` bound it
+/// (a-session-binds-itself-at-start).
+fn session_started(
+    repo: &Path,
+    tool: Tool,
+    input: &SessionStartInput,
+    launched_as: Option<&AgentLabel>,
+) -> Option<AgentLabel> {
+    let sid = clank_core::ids::SessionId::parse(&input.session_id).ok()?;
+    match launched_as {
+        Some(label) => {
+            // Fail-open by POLICY: a session start is never broken by
+            // clank state. A bind that fails leaves the previous
+            // binding, and the Stop hook still resolves this session
+            // by its label; the diagnostic names what did not happen.
+            if let Err(e) = crate::agent_store::bind_session_to_agent(repo, label, tool, &sid) {
+                eprintln!(
+                    "clank: could not bind `{}` to {} session {} ({}): {e:#}",
+                    label.as_str(),
+                    tool.as_str(),
+                    sid.as_str(),
+                    input.source.as_deref().unwrap_or("start"),
+                );
+            }
+            Some(label.clone())
+        }
+        None => {
+            let label = resolve_identity_for_hook(repo, tool, &sid).ok()?;
+            // Mint here — revoking any waiter surviving from a previous
+            // incarnation (whose wake pipe is dead, M0) — and discard
+            // the error by the same policy.
+            let agent_dir = crate::agent_store::agents_root(repo).join(label.as_str());
+            let _ = crate::agent_store::mint_wait_generation(&agent_dir);
+            Some(label)
+        }
     }
+}
+
+/// SessionStart (claude-asyncrewake-work-loop): every incarnation
+/// binds or MINTS — see [`session_started`] — then surfaces pending
+/// work via `additionalContext` so a resumed session catches up
+/// immediately instead of waiting for its first turn-end park.
+/// Fail-open EVERYWHERE: a session start must never be broken by
+/// clank state, so every error path exits 0 quietly.
+async fn run_session_start(args: StopHookArgs) -> anyhow::Result<()> {
     let mut raw = String::new();
     use std::io::Read as _;
     if std::io::stdin().read_to_string(&mut raw).is_err() {
@@ -386,20 +443,10 @@ async fn run_session_start(args: StopHookArgs) -> anyhow::Result<()> {
         return Ok(());
     };
     let tool: Tool = args.tool.into();
-    let Ok(sid) = clank_core::ids::SessionId::parse(&input.session_id) else {
+    let launched_as = crate::agent_env::explicit_label_from_env().ok().flatten();
+    let Some(label) = session_started(&repo, tool, &input, launched_as.as_ref()) else {
         return Ok(());
     };
-    let Ok(label) = resolve_identity_for_hook(&repo, tool, &sid) else {
-        return Ok(());
-    };
-
-    // Mint FIRST — stale-waiter revocation must not depend on the
-    // peek working (or on auto being on).
-    let agent_dir = crate::agent_store::agents_root(&repo).join(label.as_str());
-    // Fail-open by POLICY: a session start is never broken by clank
-    // state, so the mint error is explicitly discarded here (the
-    // bind-time mint is the one that must not fail silently).
-    let _ = crate::agent_store::mint_wait_generation(&agent_dir);
 
     let cfg = load_agent_config(&repo, &label).ok().flatten();
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
@@ -3093,6 +3140,122 @@ mod tests {
             try_wait_lease(dir.path()).unwrap().is_some()
         });
         assert!(freed, "dropping the holder frees the lease");
+    }
+
+    fn start_input(session: &str, source: &str) -> SessionStartInput {
+        SessionStartInput {
+            session_id: session.to_string(),
+            cwd: "/tmp".to_string(),
+            source: Some(source.to_string()),
+        }
+    }
+
+    fn bound_session(repo: &Path, label: &str) -> Option<(Tool, String)> {
+        let label = AgentLabel::parse(label).unwrap();
+        crate::agent_store::load_agent_config(repo, &label)
+            .unwrap()
+            .and_then(|c| c.session)
+            .map(|s| (s.tool, s.id.as_str().to_string()))
+    }
+
+    /// A session clank launched binds itself: `startup` is the first
+    /// bind, `clear` the rebind that keeps a cleared session tracked,
+    /// `resume` and `compact` re-assert. Nothing was typed in the
+    /// session (a-session-binds-itself-at-start).
+    #[test]
+    fn a_launched_session_binds_and_rebinds_from_its_label() {
+        let dir = init_repo();
+        let repo = dir.path();
+        let codex = AgentLabel::parse("codex").unwrap();
+        let first = "01a08361-f112-75d0-a49f-2e35b104e3b6";
+        let got = session_started(
+            repo,
+            Tool::Codex,
+            &start_input(first, "startup"),
+            Some(&codex),
+        );
+        assert_eq!(got.as_ref().map(|l| l.as_str()), Some("codex"));
+        assert_eq!(
+            bound_session(repo, "codex"),
+            Some((Tool::Codex, first.to_string())),
+            "bound on startup, with the tool the hook was installed for"
+        );
+        let generation = crate::agent_store::read_wait_generation(
+            &crate::agent_store::agents_root(repo).join("codex"),
+        );
+
+        // /clear: a new id for the same process.
+        let cleared = "01a08361-ffff-75d0-a49f-2e35b104e3b6";
+        session_started(
+            repo,
+            Tool::Codex,
+            &start_input(cleared, "clear"),
+            Some(&codex),
+        );
+        assert_eq!(
+            bound_session(repo, "codex"),
+            Some((Tool::Codex, cleared.to_string())),
+            "the report: the binding follows the new id"
+        );
+        assert_ne!(
+            crate::agent_store::read_wait_generation(
+                &crate::agent_store::agents_root(repo).join("codex")
+            ),
+            generation,
+            "a bind is a claim: the generation moved, revoking any stale waiter"
+        );
+
+        // resume / compact: idempotent re-assertions of the same id.
+        for source in ["resume", "compact"] {
+            session_started(
+                repo,
+                Tool::Codex,
+                &start_input(cleared, source),
+                Some(&codex),
+            );
+            assert_eq!(
+                bound_session(repo, "codex"),
+                Some((Tool::Codex, cleared.to_string())),
+                "{source}"
+            );
+        }
+    }
+
+    /// A label that another agent held is cleared off it by the bind:
+    /// one session, one label.
+    #[test]
+    fn a_launched_session_takes_its_id_off_any_other_label() {
+        let dir = init_repo();
+        let repo = dir.path();
+        let sid = "01a08361-f112-75d0-a49f-2e35b104e3b6";
+        bind_tool(repo, "old", sid, Tool::Codex);
+        let new = AgentLabel::parse("new").unwrap();
+        session_started(repo, Tool::Codex, &start_input(sid, "startup"), Some(&new));
+        assert_eq!(
+            bound_session(repo, "new"),
+            Some((Tool::Codex, sid.to_string()))
+        );
+        assert_eq!(bound_session(repo, "old"), None);
+    }
+
+    /// No label in the environment: a session clank did not launch.
+    /// It is identified by its id as `clank as` bound it, and an
+    /// unbound id binds nothing — today's quiet no-op.
+    #[test]
+    fn a_hand_started_session_is_identified_by_its_id_and_never_bound_here() {
+        let dir = init_repo();
+        let repo = dir.path();
+        let sid = "9c96eb03-1458-4bac-abbb-90243cfd422c";
+        assert!(session_started(repo, Tool::Claude, &start_input(sid, "startup"), None).is_none());
+        assert!(
+            crate::agent_store::load_all_agent_configs(repo)
+                .unwrap()
+                .is_empty(),
+            "nothing bound"
+        );
+        bind(repo, "claude", sid);
+        let got = session_started(repo, Tool::Claude, &start_input(sid, "clear"), None);
+        assert_eq!(got.as_ref().map(|l| l.as_str()), Some("claude"));
     }
 
     #[test]

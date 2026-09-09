@@ -341,38 +341,13 @@ pub async fn run(args: SetupArgs) -> anyhow::Result<()> {
     // The delivery mode is decided HERE, once, and encoded in the
     // installed entry's argv (claude-asyncrewake-work-loop): probe
     // the installed Claude Code; no binary / too old → legacy loop.
-    merge_hook_into_settings(
+    install_claude_hooks(
         &home.join(".claude/settings.json"),
-        ClaudeHook {
-            async_mode: claude_async,
-        },
+        claude_async,
         args.dry_run,
         &mut summary,
     )?;
-    if claude_async {
-        merge_hook_into_settings(
-            &home.join(".claude/settings.json"),
-            SessionStartHook,
-            args.dry_run,
-            &mut summary,
-        )?;
-    } else {
-        // A downgraded machine sheds the companion so no stale
-        // SessionStart entry outlives the mode that installed it.
-        remove_hook_entry(
-            &home.join(".claude/settings.json"),
-            "SessionStart",
-            SESSION_START_HOOK_ID,
-            args.dry_run,
-            &mut summary,
-        )?;
-    }
-    merge_hook_into_settings(
-        &home.join(".codex/hooks.json"),
-        CodexHook,
-        args.dry_run,
-        &mut summary,
-    )?;
+    install_codex_hooks(&home.join(".codex/hooks.json"), args.dry_run, &mut summary)?;
     install_codex_rule(
         &home.join(".codex/rules/default.rules"),
         args.dry_run,
@@ -726,9 +701,26 @@ impl HookKind for ClaudeHook {
     }
 }
 
-/// SessionStart companion (async mode only): mints the wait
-/// generation and delivers catch-up context. Fast — it must never
-/// hold a session start hostage.
+/// Every entry claude's `settings.json` gets: the Stop hook in the
+/// delivery mode the probe decided, and the SessionStart companion
+/// in EVERY mode — it binds the session clank launched
+/// (a-session-binds-itself-at-start), which no delivery mode can do
+/// without; it used to ride with asyncrewake alone, and a legacy
+/// claude then had its bind prompt taken away with nothing writing
+/// the id (codex on acdfb0e).
+fn install_claude_hooks(
+    path: &Path,
+    async_mode: bool,
+    dry_run: bool,
+    summary: &mut Vec<String>,
+) -> anyhow::Result<()> {
+    merge_hook_into_settings(path, ClaudeHook { async_mode }, dry_run, summary)?;
+    merge_hook_into_settings(path, SessionStartHook, dry_run, summary)
+}
+
+/// SessionStart companion: binds the launched session to its label,
+/// mints the wait generation and delivers catch-up context. Fast — it
+/// must never hold a session start hostage.
 struct SessionStartHook;
 impl HookKind for SessionStartHook {
     fn command(&self) -> &'static str {
@@ -790,6 +782,43 @@ impl HookKind for CodexHook {
     }
     fn status_message(&self) -> Option<&'static str> {
         Some("Clank: checking for pending review work")
+    }
+}
+
+/// Every entry codex's `hooks.json` gets: the Stop hook that drives
+/// the work loop and the SessionStart companion that binds the
+/// session. One function, so `run` cannot install one without the
+/// other.
+fn install_codex_hooks(
+    path: &Path,
+    dry_run: bool,
+    summary: &mut Vec<String>,
+) -> anyhow::Result<()> {
+    merge_hook_into_settings(path, CodexHook, dry_run, summary)?;
+    merge_hook_into_settings(path, CodexSessionStartHook, dry_run, summary)
+}
+
+/// Codex's SessionStart companion (a-session-binds-itself-at-start):
+/// binds the session clank launched to its label, and rebinds when
+/// `/clear` hands the process a new id — the same wire as claude's,
+/// which codex 0.153 emits with the same fields. Unconditional, unlike
+/// claude's: it does not depend on a delivery mode.
+struct CodexSessionStartHook;
+impl HookKind for CodexSessionStartHook {
+    fn command(&self) -> &'static str {
+        "clank stop-hook --tool codex --session-start"
+    }
+    fn tool_name(&self) -> &'static str {
+        "codex"
+    }
+    fn event(&self) -> &'static str {
+        "SessionStart"
+    }
+    fn id(&self) -> &'static str {
+        SESSION_START_HOOK_ID
+    }
+    fn timeout(&self) -> u64 {
+        15
     }
 }
 
@@ -868,49 +897,6 @@ fn merge_hook_into_settings(
         path = path.display(),
         tool = kind.tool_name(),
     ));
-    Ok(())
-}
-
-/// Remove a clank-owned hook entry (mode downgrades: the
-/// SessionStart companion leaves with the async mode). No-op when
-/// absent.
-fn remove_hook_entry(
-    path: &Path,
-    event: &str,
-    id: &str,
-    dry_run: bool,
-    summary: &mut Vec<String>,
-) -> anyhow::Result<()> {
-    let mut value: serde_json::Value = match std::fs::read_to_string(path) {
-        Ok(s) => serde_json::from_str(&s)
-            .with_context(|| format!("parsing `{}` as JSON", path.display()))?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e.into()),
-    };
-    let Some(arr) = value
-        .get_mut("hooks")
-        .and_then(|h| h.get_mut(event))
-        .and_then(|v| v.as_array_mut())
-    else {
-        return Ok(());
-    };
-    let before = arr.len();
-    arr.retain(|wrapper| !wrapper_is_clank_id(wrapper, id));
-    if arr.len() == before {
-        return Ok(());
-    }
-    if !dry_run {
-        std::fs::write(
-            path,
-            format!(
-                "{}
-",
-                serde_json::to_string_pretty(&value)?
-            ),
-        )
-        .with_context(|| format!("writing `{}`", path.display()))?;
-    }
-    summary.push(format!("  drop  {} (stale {event} hook)", path.display()));
     Ok(())
 }
 
@@ -1499,6 +1485,34 @@ mod tests {
         assert!(msg.contains("Clank"));
     }
 
+    /// The codex SessionStart companion is installed beside the Stop
+    /// entry, and a legacy file holding only the Stop entry gains it
+    /// without the Stop entry moving (a-session-binds-itself-at-start).
+    #[test]
+    fn codex_gets_a_session_start_hook_beside_its_stop_hook() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".codex/hooks.json");
+        let mut summary = Vec::new();
+        merge_hook_into_settings(&path, CodexHook, false, &mut summary).unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+        install_codex_hooks(&path, false, &mut summary).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let ss = &v["hooks"]["SessionStart"][0]["hooks"][0];
+        assert_eq!(
+            ss["command"],
+            "clank stop-hook --tool codex --session-start"
+        );
+        assert_eq!(ss["id"], SESSION_START_HOOK_ID);
+        assert_eq!(ss["timeout"], 15);
+        assert!(ss.get("asyncRewake").is_none(), "codex knows no such field");
+        let before: serde_json::Value = serde_json::from_str(&before).unwrap();
+        assert_eq!(
+            v["hooks"]["Stop"], before["hooks"]["Stop"],
+            "the Stop entry is untouched"
+        );
+    }
+
     #[test]
     fn codex_hook_carries_no_async_field_of_any_kind() {
         // codex 0.147.0 PARSES `async` (and knows `asyncRewake`) but
@@ -1667,18 +1681,32 @@ mod tests {
     }
 
     #[test]
-    fn claude_mode_writes_matching_entries_and_downgrade_sheds_companion() {
+    fn claude_mode_writes_matching_entries_and_the_companion_in_every_mode() {
         // The durable-mode contract (claude-asyncrewake-work-loop):
-        // async installs the --loop argv + asyncRewake field + the
-        // SessionStart companion; legacy installs neither, and a
-        // downgrade REMOVES a previously installed companion.
+        // async installs the --loop argv + asyncRewake field; legacy
+        // neither. The SessionStart companion is MODE-INDEPENDENT —
+        // it binds the launched session, so a downgrade keeps it
+        // (a-session-binds-itself-at-start).
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("settings.json");
         let mut summary = Vec::new();
 
-        merge_hook_into_settings(&path, ClaudeHook { async_mode: true }, false, &mut summary)
-            .unwrap();
-        merge_hook_into_settings(&path, SessionStartHook, false, &mut summary).unwrap();
+        // A LEGACY machine, from nothing: the companion is installed
+        // with the legacy Stop hook — binding does not wait for a
+        // capable Claude Code.
+        install_claude_hooks(&path, false, false, &mut summary).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            v["hooks"]["Stop"][0]["hooks"][0]["command"],
+            "clank stop-hook --tool claude"
+        );
+        assert_eq!(
+            v["hooks"]["SessionStart"][0]["hooks"][0]["id"], SESSION_START_HOOK_ID,
+            "legacy mode binds sessions too"
+        );
+
+        install_claude_hooks(&path, true, false, &mut summary).unwrap();
         let v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         let stop = &v["hooks"]["Stop"][0]["hooks"][0];
@@ -1695,28 +1723,17 @@ mod tests {
         );
         assert_eq!(ss["id"], SESSION_START_HOOK_ID);
 
-        // Downgrade: legacy entry replaces in place; the companion
-        // is dropped; asyncRewake is ABSENT (not false).
-        merge_hook_into_settings(&path, ClaudeHook { async_mode: false }, false, &mut summary)
-            .unwrap();
-        remove_hook_entry(
-            &path,
-            "SessionStart",
-            SESSION_START_HOOK_ID,
-            false,
-            &mut summary,
-        )
-        .unwrap();
+        // Downgrade: legacy entry replaces in place; asyncRewake is
+        // ABSENT (not false); the companion STAYS.
+        install_claude_hooks(&path, false, false, &mut summary).unwrap();
         let v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         let stop = &v["hooks"]["Stop"][0]["hooks"][0];
         assert_eq!(stop["command"], "clank stop-hook --tool claude");
         assert!(stop.get("asyncRewake").is_none(), "absent, not false");
-        assert!(
-            v["hooks"]["SessionStart"]
-                .as_array()
-                .is_none_or(|a| a.is_empty()),
-            "companion shed on downgrade"
+        assert_eq!(
+            v["hooks"]["SessionStart"][0]["hooks"][0]["id"], SESSION_START_HOOK_ID,
+            "the companion binds sessions in every mode"
         );
     }
 
