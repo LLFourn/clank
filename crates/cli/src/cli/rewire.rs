@@ -186,6 +186,20 @@ fn copy_file(action: &CopyAction) -> anyhow::Result<bool> {
             action.dst.display(),
         )
     })?;
+    // A review's file mtime is when the review was WRITTEN — the only
+    // record of it — so a migration to the rewritten sha must carry
+    // it, or every review on an amended commit would read as fresh.
+    // `fs::copy` alone does not: it preserves metadata on macOS (it
+    // is `fcopyfile(COPYFILE_ALL)` there) and copies only permissions
+    // on Linux, which is where this line is doing the work. Best
+    // effort — a filesystem that refuses the timestamp must not fail
+    // the migration, which is about the content.
+    if let Ok(src) = std::fs::metadata(&action.src)
+        && let Ok(modified) = src.modified()
+        && let Ok(dst) = std::fs::File::options().write(true).open(&action.dst)
+    {
+        let _ = dst.set_modified(modified);
+    }
     Ok(true)
 }
 
@@ -237,6 +251,66 @@ mod tests {
     fn write(p: &Path, body: &str) {
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         std::fs::write(p, body).unwrap();
+    }
+
+    /// A review was written when it was written. Moving it to the
+    /// rewritten commit is a migration of the SAME review, so its
+    /// time comes with it — without that, every amend would make the
+    /// whole gate read as reviewed seconds ago.
+    ///
+    /// Platform note for anyone mutating `copy_file` to check this
+    /// test: dropping the explicit `set_modified` leaves it PASSING
+    /// on macOS, where `fs::copy` preserves metadata by itself. The
+    /// assertion is the invariant, and on Linux — where `fs::copy`
+    /// carries permissions and nothing else — it is what fails.
+    #[test]
+    fn a_migrated_review_keeps_the_time_it_was_written() {
+        let dir = make_repo();
+        let (old, new) = (sha_full('a'), sha_full('b'));
+        let src = dir
+            .path()
+            .join(".clank/agents/alice/feedback")
+            .join(format!("{}.md", old.as_str()));
+        write(&src, "CONTINUE looks good\n");
+        let an_hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(&src)
+            .unwrap()
+            .set_modified(an_hour_ago)
+            .unwrap();
+        let written = crate::age::written_at(&src).unwrap();
+
+        assert_eq!(
+            apply_pairs(
+                dir.path(),
+                &[RewritePair {
+                    old,
+                    new: new.clone()
+                }]
+            )
+            .unwrap(),
+            1
+        );
+
+        let dst = dir
+            .path()
+            .join(".clank/agents/alice/feedback")
+            .join(format!("{}.md", &new.as_str()[..7]));
+        assert_eq!(
+            std::fs::read_to_string(&dst).unwrap(),
+            "CONTINUE looks good\n",
+            "the review arrived"
+        );
+        assert_eq!(
+            crate::age::written_at(&dst),
+            Some(written),
+            "and so did the time it was written"
+        );
+        assert!(
+            crate::age::elapsed(written) >= 3500,
+            "the fixture really is an hour old"
+        );
     }
 
     #[test]

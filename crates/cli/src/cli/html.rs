@@ -981,16 +981,6 @@ fn event_sha(e: &LogEvent) -> &CommitSha {
     }
 }
 
-fn event_ts(e: &LogEvent) -> i64 {
-    match e {
-        LogEvent::PlanIntro { ts, .. }
-        | LogEvent::PlanCommit { ts, .. }
-        | LogEvent::PlanFinalized { ts, .. }
-        | LogEvent::PlanDeleted { ts, .. }
-        | LogEvent::AdHoc { ts, .. } => *ts,
-    }
-}
-
 fn event_plan(e: &LogEvent) -> Option<&str> {
     match e {
         LogEvent::PlanIntro { plan, .. }
@@ -1289,7 +1279,7 @@ fn render_row(
         esc(body.trim())
     ));
     out.push_str(&format!("    <span class=\"marks\">{marks}</span>\n"));
-    let iso = fmt_ts(event_ts(event));
+    let iso = fmt_ts(event.ts());
     out.push_str(&format!(
         "    <time class=\"ts\" data-iso=\"{iso}\">{iso}</time>\n",
         iso = esc(&iso)

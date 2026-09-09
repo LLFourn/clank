@@ -422,6 +422,7 @@ pub fn submit_with(
         .map(|(author, v)| clank_core::wait::ReviewEntry {
             author: author.clone(),
             verdict: v.verdict,
+            at: crate::age::written_at(&reviewer_path(repo, pr, author)),
         })
         .collect();
     let gate =
@@ -752,6 +753,7 @@ pub fn pr_review_inputs(repo: &Path) -> Vec<clank_core::wait::PrReviewInput> {
                 .into_iter()
                 .filter(|(_, v)| v.reviewed_round == state.round)
                 .map(|(author, v)| clank_core::wait::ReviewEntry {
+                    at: crate::age::written_at(&reviewer_path(repo, pr, &author)),
                     author,
                     verdict: v.verdict,
                 })
@@ -760,6 +762,11 @@ pub fn pr_review_inputs(repo: &Path) -> Vec<clank_core::wait::PrReviewInput> {
                 pr,
                 repo: state.repo,
                 round: state.round,
+                // The round's state file is written by `start` and
+                // `propose` only, both master-only: its write time is
+                // when this round opened, which is when its reviewers
+                // were summoned.
+                opened_at: crate::age::written_at(&state_path(repo, pr)),
                 current_verdicts,
             })
         })

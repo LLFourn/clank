@@ -457,6 +457,9 @@ pub struct PrReviewInput {
     /// `owner/name` slug, for building the PR's GitHub URL.
     pub repo: String,
     pub round: u64,
+    /// When this round was opened (epoch seconds) — the PR analogue
+    /// of a commit's author time.
+    pub opened_at: Option<i64>,
     pub current_verdicts: Vec<ReviewEntry>,
 }
 
@@ -465,6 +468,8 @@ pub struct PrReviewInput {
 #[derive(Debug, Clone)]
 pub struct PrReviewWorkState {
     pub pr: u32,
+    /// See [`PlanWorkState::handover`].
+    pub handover: Handover,
     /// `owner/name` slug, for building the PR's GitHub URL.
     pub repo: String,
     pub round: u64,
@@ -479,6 +484,115 @@ pub struct PrReviewWorkState {
 pub struct ReviewEntry {
     pub author: AgentLabel,
     pub verdict: crate::vocab::Verdict,
+    /// When the verdict was written (epoch seconds), for the stage
+    /// boundaries in [`Handover`]. `None` where the caller has no
+    /// clock for it — a gate replayed hypothetically, a test fixture.
+    pub at: Option<i64>,
+}
+
+/// When each stage of the review chain closed for one work item — a
+/// commit, or a PR round.
+///
+/// Every boundary is the max over the verdicts REQUIRED to close that
+/// stage, never over "the newest verdict by anyone". That is what
+/// keeps an agent's clock monotone until the agent itself acts: a
+/// verdict from outside the required set — a still-pending peer's,
+/// an unsummoned reviewer's, a stale author's — moves nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Handover {
+    /// The work appeared: the commit's author time, or the round's
+    /// open time.
+    pub opened: Option<i64>,
+    /// The commit tier closed. `None` while any of its reviewers is
+    /// pending, and for an empty tier (nothing closed).
+    pub commit_tier_closed: Option<i64>,
+    /// The tier the milestone activated closed. `None` while any of
+    /// ITS reviewers is pending, and when no second tier is active.
+    pub second_tier_closed: Option<i64>,
+}
+
+/// The tier an agent answers on — which stage boundary handed it its
+/// obligation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandoverTier {
+    /// A commit-tier reviewer: summoned by the work itself.
+    Commit,
+    /// A plan / final / gate reviewer: summoned when the commit tier
+    /// closed.
+    Second,
+    /// Master: handed back by the last tier to close.
+    Master,
+}
+
+impl Handover {
+    /// When this agent's current obligation began.
+    pub fn since(&self, tier: HandoverTier) -> Option<i64> {
+        match tier {
+            HandoverTier::Commit => self.opened,
+            HandoverTier::Second => self.commit_tier_closed.or(self.opened),
+            HandoverTier::Master => self
+                .second_tier_closed
+                .or(self.commit_tier_closed)
+                .or(self.opened),
+        }
+    }
+}
+
+/// When each stage closed for one work item, from the same tier
+/// helpers [`compute_gate`] decides the stages with — so a boundary
+/// can never name a different required set than the gate did.
+///
+/// `opened` is supplied by the caller (a commit's author time, a PR
+/// round's open time); the rest is read off the verdicts.
+pub fn stage_closures(
+    opened: Option<i64>,
+    reviews: &[ReviewEntry],
+    commit_reviewers: &[AgentLabel],
+    plan_reviewers: &[AgentLabel],
+    final_reviewers: &[AgentLabel],
+    latest_touched_plan: bool,
+) -> Handover {
+    use crate::vocab::Verdict;
+
+    let by_label: std::collections::HashMap<&AgentLabel, &ReviewEntry> =
+        reviews.iter().map(|r| (&r.author, r)).collect();
+    // A tier closes when every one of ITS reviewers has submitted, at
+    // the last of their write times. An unwritable time (a verdict we
+    // have no clock for) leaves the boundary unknown rather than
+    // silently dating it from the reviewers we could read.
+    let closed_at = |tier: &[AgentLabel]| -> Option<i64> {
+        if tier.is_empty() {
+            return None;
+        }
+        tier.iter()
+            .map(|l| by_label.get(l).and_then(|r| r.at))
+            .collect::<Option<Vec<i64>>>()?
+            .into_iter()
+            .max()
+    };
+
+    let commit_tier_closed = closed_at(commit_reviewers);
+    // Whether a second tier was consulted at all, and which — the
+    // gate's own rule, so a stage it never opened cannot date an
+    // obligation. A plan-doc commit whose commit tier requested
+    // changes opens nothing, however many plan reviewers wrote
+    // anyway (codex on 52207fa).
+    let verdicts: std::collections::HashMap<&AgentLabel, &Verdict> =
+        reviews.iter().map(|r| (&r.author, &r.verdict)).collect();
+    let second_tier_closed = consulted_second_tier(
+        &verdicts,
+        commit_reviewers,
+        plan_reviewers,
+        final_reviewers,
+        latest_touched_plan,
+    )
+    .and_then(|second| closed_at(&second.active));
+
+    Handover {
+        opened,
+        commit_tier_closed,
+        second_tier_closed,
+    }
 }
 
 pub struct WorkPolicy {
@@ -549,6 +663,9 @@ pub struct MultiPlanOpen {
 #[derive(Debug, Clone)]
 pub struct PlanWorkState {
     pub plan: PlanKey,
+    /// When each stage of this plan's review chain closed — what
+    /// dates the elapsed shown beside a working agent.
+    pub handover: Handover,
     /// `Some(sha)` for plans with a reviewable commit (the normal
     /// case). `None` for blocked plans that have no reviewable
     /// commit yet (e.g. an intro-only plan with an open block).
@@ -564,6 +681,8 @@ pub struct PlanWorkState {
 pub struct AdHocWorkState {
     pub sha: CommitSha,
     pub gate: crate::vocab::CommitGateState,
+    /// See [`PlanWorkState::handover`].
+    pub handover: Handover,
 }
 
 impl AdHocWorkState {
@@ -672,36 +791,19 @@ pub fn compute_gate(
     let finished =
         |label: &AgentLabel| -> bool { matches!(by_label.get(label), Some(Verdict::Finished)) };
 
-    // The second tier is consulted ONLY at a MILESTONE on the latest
-    // reviewable commit — never on routine WIP commits. There are two,
-    // each with its OWN reviewer tier:
-    //   1. PLAN milestone — the commit changed the plan document
-    //      (`latest_touched_plan`) and the commit tier continued it.
-    //      Consults the `plan_reviewers` tier (plan + gate).
-    //   2. FINISH milestone — the commit tier marked it FINISHED.
-    //      Consults the `final_reviewers` tier (final + gate).
-    // A plan reviewer is never woken at the finish; a final reviewer is
-    // never woken on a plan commit. On any other commit (pure code,
-    // merely continued) NO second tier is consulted → `Continued`.
-    //
-    // Devolve guard: with an EMPTY commit tier, "all finished" is
-    // vacuously true on the empty set — which would make every commit a
-    // FINISHED milestone. With no commit reviewer to actually signal
-    // FINISHED, the milestone reduces to `latest_touched_plan` only, so
-    // a final-only repo (no commit tier) never reaches the finish.
-    let commit_finished = !commit_reviewers.is_empty() && commit_reviewers.iter().all(&finished);
-    let is_milestone = latest_touched_plan || commit_finished;
-    if !is_milestone {
-        return CommitGateState::Continued;
-    }
-
-    // The active second tier is the UNION of the milestones that fired.
-    let active = active_second_tier(
+    let Some(second) = consulted_second_tier(
+        &by_label,
+        commit_reviewers,
         plan_reviewers,
         final_reviewers,
         latest_touched_plan,
+    ) else {
+        return CommitGateState::Continued;
+    };
+    let SecondTier {
+        active,
         commit_finished,
-    );
+    } = second;
 
     // Same wait-for-all rule: a non-positive verdict wakes the master
     // only once every active reviewer has verdicted; while any is
@@ -775,6 +877,68 @@ fn tier_coverage(
         pending,
         non_positive,
     }
+}
+
+/// The second tier the gate is consulting on this commit, or `None`
+/// when it is consulting none.
+///
+/// THE activation rule, asked in ONE place: [`compute_gate`] routes
+/// by it and [`stage_closures`] dates by it, so a stage the gate
+/// never opened can never date an obligation. Two ways it opens none:
+///
+///   * The commit tier has not closed positively. It gates everything
+///     after it — while it is pending or negative the master is
+///     routed straight back, and no second-tier reviewer was summoned
+///     at all (a verdict one writes anyway is unsolicited).
+///   * No MILESTONE fired. The second tier is consulted only at one,
+///     never on a routine WIP commit. There are two, each with its
+///     own tier: the PLAN milestone (the commit changed the plan
+///     document) consults `plan_reviewers`; the FINISH milestone (the
+///     commit tier marked it FINISHED) consults `final_reviewers`. A
+///     plan reviewer is never woken at the finish, nor a final
+///     reviewer on a plan commit.
+///
+/// Devolve guard: with an EMPTY commit tier, "all finished" is
+/// vacuously true on the empty set — which would make every commit a
+/// FINISHED milestone. With no commit reviewer to actually signal
+/// FINISHED, the milestone reduces to `latest_touched_plan` only, so
+/// a final-only repo (no commit tier) never reaches the finish.
+fn consulted_second_tier(
+    by_label: &std::collections::HashMap<&AgentLabel, &crate::vocab::Verdict>,
+    commit_reviewers: &[AgentLabel],
+    plan_reviewers: &[AgentLabel],
+    final_reviewers: &[AgentLabel],
+    latest_touched_plan: bool,
+) -> Option<SecondTier> {
+    use crate::vocab::Verdict;
+    if !tier_coverage(commit_reviewers, by_label).all_positive() {
+        return None;
+    }
+    let commit_finished = !commit_reviewers.is_empty()
+        && commit_reviewers
+            .iter()
+            .all(|l| matches!(by_label.get(l), Some(Verdict::Finished)));
+    if !(latest_touched_plan || commit_finished) {
+        return None;
+    }
+    Some(SecondTier {
+        active: active_second_tier(
+            plan_reviewers,
+            final_reviewers,
+            latest_touched_plan,
+            commit_finished,
+        ),
+        commit_finished,
+    })
+}
+
+/// What [`consulted_second_tier`] answers with: the reviewers the
+/// milestone activated (the UNION when both fired, possibly empty),
+/// and which milestone it was — the finish is the one that can carry
+/// the gate to `Finished`.
+struct SecondTier {
+    active: Vec<AgentLabel>,
+    commit_finished: bool,
 }
 
 /// The active second-tier reviewers for a commit at its milestone(s):
@@ -908,6 +1072,10 @@ impl RepoState {
                         gate: CommitGateState::Blocked,
                         waiting_on: WaitingOn::Blocked { block },
                         touched_code,
+                        handover: Handover {
+                            opened: latest_event.map(|e| e.ts),
+                            ..Handover::default()
+                        },
                     });
                     continue;
                 }
@@ -1063,6 +1231,14 @@ impl RepoState {
                     gate,
                     waiting_on,
                     touched_code,
+                    handover: stage_closures(
+                        latest_event.map(|e| e.ts),
+                        &entries,
+                        commit_tier,
+                        plan_tier,
+                        final_tier,
+                        latest_touched_plan,
+                    ),
                 });
             }
         }
@@ -1085,6 +1261,14 @@ impl RepoState {
                 ad_hoc.push(AdHocWorkState {
                     sha: event.sha.clone(),
                     gate,
+                    handover: stage_closures(
+                        Some(event.ts),
+                        &entries,
+                        &policy.commit_reviewers,
+                        &policy.plan_reviewers,
+                        &policy.final_reviewers,
+                        false,
+                    ),
                 });
             }
         }
@@ -1116,6 +1300,14 @@ impl RepoState {
             };
             pr_reviews.push(PrReviewWorkState {
                 pr: input.pr,
+                handover: stage_closures(
+                    input.opened_at,
+                    &input.current_verdicts,
+                    &policy.commit_reviewers,
+                    &policy.plan_reviewers,
+                    &policy.final_reviewers,
+                    false,
+                ),
                 repo: input.repo,
                 round: input.round,
                 gate,
@@ -1549,7 +1741,251 @@ mod tests {
         ReviewEntry {
             author: label(who),
             verdict,
+            at: None,
         }
+    }
+
+    use crate::vocab::Verdict;
+
+    fn entry_at(verdict: Verdict, who: &str, at: i64) -> ReviewEntry {
+        ReviewEntry {
+            author: label(who),
+            verdict,
+            at: Some(at),
+        }
+    }
+
+    /// The commit tier closes at its LAST required verdict, and only
+    /// the required ones count. A second-tier reviewer writing
+    /// afterwards — unsummoned, or summoned by the close itself —
+    /// does not move the boundary, and neither does an author who is
+    /// on no tier at all (their feedback never gated it either).
+    #[test]
+    fn a_stage_closes_at_its_own_last_required_verdict() {
+        let commit = [label("codex"), label("dana")];
+        let gate = [label("ruthless")];
+        let h = stage_closures(
+            Some(100),
+            &[
+                entry_at(Verdict::Continue, "codex", 200),
+                entry_at(Verdict::Continue, "dana", 300),
+                entry_at(Verdict::Continue, "ruthless", 900),
+                entry_at(Verdict::Continue, "stranger", 999),
+            ],
+            &commit,
+            &gate,
+            &gate,
+            true,
+        );
+        assert_eq!(h.opened, Some(100));
+        assert_eq!(
+            h.commit_tier_closed,
+            Some(300),
+            "the last of ITS reviewers, not the newest verdict on the commit"
+        );
+        assert_eq!(h.second_tier_closed, Some(900));
+    }
+
+    /// A tier with anyone still pending has not closed, and neither
+    /// has an empty one — "no reviewers" is not "closed now".
+    #[test]
+    fn a_stage_with_anyone_pending_has_no_boundary() {
+        let commit = [label("codex"), label("dana")];
+        let h = stage_closures(
+            Some(100),
+            &[entry_at(Verdict::Continue, "codex", 200)],
+            &commit,
+            &[],
+            &[],
+            true,
+        );
+        assert_eq!(h.commit_tier_closed, None, "dana has not spoken");
+        assert_eq!(h.second_tier_closed, None, "no second tier exists");
+        // A verdict with no readable time leaves the boundary unknown
+        // rather than dating it from the reviewers that could be read.
+        let h = stage_closures(
+            Some(100),
+            &[
+                entry_at(Verdict::Continue, "codex", 200),
+                entry(Verdict::Continue, "dana"),
+            ],
+            &commit,
+            &[],
+            &[],
+            true,
+        );
+        assert_eq!(h.commit_tier_closed, None);
+    }
+
+    /// Which second tier must close depends on WHICH milestone fired
+    /// — `compute_gate`'s rule, read from its own helper. A plan
+    /// reviewer does not close a finish, and a final reviewer does
+    /// not close a plan milestone.
+    #[test]
+    fn the_second_tier_boundary_is_the_tier_the_milestone_activated() {
+        let commit = [label("codex")];
+        let plan_tier = [label("pat")];
+        let final_tier = [label("fin")];
+        let reviews = [
+            entry_at(Verdict::Finished, "codex", 200),
+            entry_at(Verdict::Continue, "pat", 300),
+            entry_at(Verdict::Continue, "fin", 400),
+        ];
+        // A finish milestone (commit tier FINISHED, plan untouched):
+        // the final tier closes it.
+        let finish = stage_closures(Some(100), &reviews, &commit, &plan_tier, &final_tier, false);
+        assert_eq!(finish.second_tier_closed, Some(400));
+        // A plan milestone with a continued commit tier: the plan
+        // tier closes it.
+        let plan = stage_closures(
+            Some(100),
+            &[
+                entry_at(Verdict::Continue, "codex", 200),
+                entry_at(Verdict::Continue, "pat", 300),
+                entry_at(Verdict::Continue, "fin", 400),
+            ],
+            &commit,
+            &plan_tier,
+            &final_tier,
+            true,
+        );
+        assert_eq!(plan.second_tier_closed, Some(300));
+        // Neither milestone: no second tier was consulted at all.
+        let routine = stage_closures(
+            Some(100),
+            &[entry_at(Verdict::Continue, "codex", 200)],
+            &commit,
+            &plan_tier,
+            &final_tier,
+            false,
+        );
+        assert_eq!(routine.second_tier_closed, None);
+    }
+
+    /// THE invariant the whole surface rests on: a clock is monotone
+    /// until the agent it belongs to acts. A peer is not a handover.
+    #[test]
+    fn a_peers_verdict_does_not_restart_a_pending_reviewers_clock() {
+        let commit = [label("codex")];
+        let second = [label("ruthless"), label("rex")];
+        let before = stage_closures(
+            Some(100),
+            &[entry_at(Verdict::Finished, "codex", 200)],
+            &commit,
+            &second,
+            &second,
+            false,
+        );
+        // ruthless submits; rex still owes one.
+        let after = stage_closures(
+            Some(100),
+            &[
+                entry_at(Verdict::Finished, "codex", 200),
+                entry_at(Verdict::Finished, "ruthless", 500),
+            ],
+            &commit,
+            &second,
+            &second,
+            false,
+        );
+        assert_eq!(
+            after.since(HandoverTier::Second),
+            before.since(HandoverTier::Second),
+            "rex was summoned when the commit tier closed and has been \
+             owing since; a peer submitting is not a new handover"
+        );
+        assert_eq!(after.since(HandoverTier::Second), Some(200));
+    }
+
+    /// The master analogue: handed the plan back when the tier that
+    /// routed it closed, and an unsummoned verdict written afterwards
+    /// does not restart that clock either.
+    #[test]
+    fn masters_clock_starts_at_the_tier_that_handed_it_back() {
+        let commit = [label("codex")];
+        let second = [label("ruthless")];
+        // The commit tier requested changes at 200 — no milestone, so
+        // no second tier was consulted. ruthless wrote anyway at 700.
+        let h = stage_closures(
+            Some(100),
+            &[
+                entry_at(Verdict::RequestChanges, "codex", 200),
+                entry_at(Verdict::Continue, "ruthless", 700),
+            ],
+            &commit,
+            &second,
+            &second,
+            false,
+        );
+        assert_eq!(h.since(HandoverTier::Master), Some(200));
+        // With nothing reviewed at all, the work itself is the only
+        // boundary there is.
+        let fresh = stage_closures(Some(100), &[], &commit, &second, &second, false);
+        assert_eq!(fresh.since(HandoverTier::Master), Some(100));
+        assert_eq!(fresh.since(HandoverTier::Commit), Some(100));
+        assert_eq!(fresh.since(HandoverTier::Second), Some(100));
+    }
+
+    /// A stage the gate never OPENED cannot date anything. The
+    /// commit tier gates the second one, so a plan-doc commit whose
+    /// commit tier requested changes consults no plan reviewer —
+    /// and a plan reviewer who writes anyway has not been handed
+    /// anything, least of all master's clock (codex on 52207fa).
+    #[test]
+    fn an_unopened_stage_dates_nothing() {
+        let commit = [label("codex")];
+        let plan_tier = [label("pat")];
+        let unsolicited = [
+            entry_at(Verdict::RequestChanges, "codex", 200),
+            entry_at(Verdict::Continue, "pat", 700),
+        ];
+        // The PLAN milestone shape: `latest_touched_plan` is true, so
+        // only the commit tier's outcome keeps the plan tier shut.
+        let h = stage_closures(Some(100), &unsolicited, &commit, &plan_tier, &[], true);
+        assert_eq!(
+            h.second_tier_closed, None,
+            "the plan tier was never consulted"
+        );
+        assert_eq!(
+            h.since(HandoverTier::Master),
+            Some(200),
+            "master was handed the plan back when the commit tier closed"
+        );
+        // The same while the commit tier is merely PENDING: nothing
+        // has closed, and an early plan-tier verdict dates nothing.
+        let pending = stage_closures(
+            Some(100),
+            &[entry_at(Verdict::Continue, "pat", 700)],
+            &commit,
+            &plan_tier,
+            &[],
+            true,
+        );
+        assert_eq!(pending.commit_tier_closed, None);
+        assert_eq!(pending.second_tier_closed, None);
+        assert_eq!(pending.since(HandoverTier::Master), Some(100));
+        // And the gate agrees about who is being consulted: it routes
+        // to the master, never to the plan tier.
+        assert_eq!(
+            compute_gate(&unsolicited, &commit, &plan_tier, &[], true),
+            crate::vocab::CommitGateState::ChangesRequested
+        );
+    }
+
+    /// A commit-tier reviewer is summoned by the commit and by
+    /// nothing else — not by a peer's verdict, not by a tier closing.
+    #[test]
+    fn a_commit_tier_reviewer_dates_from_the_commit() {
+        let commit = [label("codex"), label("dana")];
+        let h = stage_closures(
+            Some(100),
+            &[entry_at(Verdict::Continue, "dana", 400)],
+            &commit,
+            &[],
+            &[],
+            false,
+        );
+        assert_eq!(h.since(HandoverTier::Commit), Some(100));
     }
 
     #[test]
@@ -2043,6 +2479,7 @@ mod tests {
                 gate: CommitGateState::Unreviewed,
                 waiting_on,
                 touched_code: false,
+                handover: Handover::default(),
             }],
             ad_hoc: Vec::new(),
             pr_reviews: Vec::new(),
@@ -2275,7 +2712,11 @@ mod tests {
 
     #[test]
     fn adhoc_settled_fires_for_pending_at_arm_shas_only() {
-        let adhoc = |s: &str, gate| AdHocWorkState { sha: sha(s), gate };
+        let adhoc = |s: &str, gate| AdHocWorkState {
+            sha: sha(s),
+            gate,
+            handover: Handover::default(),
+        };
         // Armed while: aaa unreviewed, bbb changes-requested, ccc
         // pending-gate, ddd blocked, eee already continued.
         let at_arm = vec![
@@ -2333,6 +2774,7 @@ mod tests {
         let at_arm = vec![AdHocWorkState {
             sha: sha("aaa"),
             gate: CommitGateState::Unreviewed,
+            handover: Handover::default(),
         }];
         let snap = StartupSnapshot::capture(&RepoState::default(), &at_arm);
         // Still open → no wake.
@@ -2346,6 +2788,7 @@ mod tests {
             let now = vec![AdHocWorkState {
                 sha: sha("aaa"),
                 gate,
+                handover: Handover::default(),
             }];
             assert!(
                 detect_adhoc_settled(&snap, &now).is_empty(),
@@ -2456,11 +2899,13 @@ mod tests {
             pr: 123,
             repo: "o/r".into(),
             round,
+            opened_at: None,
             current_verdicts: verdicts
                 .iter()
                 .map(|(l, v)| ReviewEntry {
                     author: label(l),
                     verdict: *v,
+                    at: None,
                 })
                 .collect(),
         }
@@ -2474,6 +2919,60 @@ mod tests {
             .into_iter()
             .next()
             .unwrap()
+    }
+
+    /// A PR round is the same chain over a different work item: the
+    /// round OPENING is what a commit's landing is, and the verdicts
+    /// that close each tier are the current round's. The peer rule
+    /// holds here for the same reason it holds for a commit — the
+    /// boundary is a max over the required set.
+    #[test]
+    fn a_pr_rounds_stages_are_dated_by_the_round_and_its_verdicts() {
+        use crate::vocab::Verdict;
+        let dated = |round_at: i64, verdicts: &[(&str, Verdict, i64)]| {
+            pr_state(PrReviewInput {
+                pr: 123,
+                repo: "o/r".into(),
+                round: 1,
+                opened_at: Some(round_at),
+                current_verdicts: verdicts
+                    .iter()
+                    .map(|(l, v, at)| ReviewEntry {
+                        author: label(l),
+                        verdict: *v,
+                        at: Some(*at),
+                    })
+                    .collect(),
+            })
+            .handover
+        };
+        // Nobody has voted: the round opening is all there is, and it
+        // is what its commit-tier reviewer has been owing since.
+        let fresh = dated(1_000, &[]);
+        assert_eq!(fresh.opened, Some(1_000));
+        assert_eq!(fresh.commit_tier_closed, None);
+        assert_eq!(fresh.since(HandoverTier::Commit), Some(1_000));
+        // The commit tier finished at 1_500 — which is when the gate
+        // tier was summoned, and when master would be handed back if
+        // the gate tier were empty.
+        let closed = dated(1_000, &[("codex", Verdict::Finished, 1_500)]);
+        assert_eq!(closed.commit_tier_closed, Some(1_500));
+        assert_eq!(closed.since(HandoverTier::Second), Some(1_500));
+        // ruthless voting does not move what ruthless has owed since
+        // — nor any other pending second-tier reviewer's clock.
+        let voted = dated(
+            1_000,
+            &[
+                ("codex", Verdict::Finished, 1_500),
+                ("ruthless", Verdict::Finished, 9_000),
+            ],
+        );
+        assert_eq!(voted.since(HandoverTier::Second), Some(1_500));
+        assert_eq!(
+            voted.since(HandoverTier::Master),
+            Some(9_000),
+            "master is handed back by the tier that closed last"
+        );
     }
 
     #[test]
@@ -2551,6 +3050,7 @@ mod tests {
             ad_hoc: vec![AdHocWorkState {
                 sha: CommitSha::parse(&"a".repeat(40)).unwrap(),
                 gate,
+                handover: Handover::default(),
             }],
             pr_reviews: Vec::new(),
             head_correction: None,
@@ -2609,6 +3109,7 @@ mod tests {
                 round: 2,
                 gate,
                 missing_reviewers: missing.iter().map(|l| label(l)).collect(),
+                handover: Handover::default(),
             }],
             head_correction: None,
             multi_plan_open: None,
@@ -3295,6 +3796,7 @@ mod tests {
             vec![ReviewEntry {
                 author: label("codex"),
                 verdict: crate::vocab::Verdict::RequestChanges,
+                at: None,
             }],
         )]);
         let status = state.derive_status(&reviews, &adhoc_policy(), None);
@@ -3321,6 +3823,7 @@ mod tests {
                 vec![ReviewEntry {
                     author: label("codex"),
                     verdict: crate::vocab::Verdict::RequestChanges,
+                    at: None,
                 }],
             ),
             (
@@ -3328,6 +3831,7 @@ mod tests {
                 vec![ReviewEntry {
                     author: label("codex"),
                     verdict: crate::vocab::Verdict::Continue,
+                    at: None,
                 }],
             ),
         ]);
@@ -3422,6 +3926,7 @@ mod tests {
             vec![ReviewEntry {
                 author: label("codex"),
                 verdict: crate::vocab::Verdict::RequestChanges,
+                at: None,
             }],
         )];
         let mock = MockDirty::new().with_reviews(reviews);
@@ -3456,10 +3961,12 @@ mod tests {
                 ReviewEntry {
                     author: label("codex"),
                     verdict: crate::vocab::Verdict::Continue,
+                    at: None,
                 },
                 ReviewEntry {
                     author: label("ruthless"),
                     verdict: crate::vocab::Verdict::Continue,
+                    at: None,
                 },
             ],
         )];

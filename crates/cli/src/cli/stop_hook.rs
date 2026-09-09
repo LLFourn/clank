@@ -1318,16 +1318,11 @@ pub(crate) struct MarkerFields<'a> {
     pub(crate) pid: Option<i32>,
 }
 
-/// A duration at one significant unit — long enough to judge staleness
-/// by eye, short enough for a status line that must not wrap.
+/// The attendance marker's own clock. Seconds are kept here — an
+/// expectation is a BUDGET (`45s/5m`), read against a bound that is
+/// often minutes, not an age glanced at across the pane.
 fn short_duration(d: time::Duration) -> String {
-    let secs = d.whole_seconds().max(0);
-    match secs {
-        s if s < 60 => format!("{s}s"),
-        s if s < 3600 => format!("{}m", s / 60),
-        s if s < 86_400 => format!("{}h", s / 3600),
-        s => format!("{}d", s / 86_400),
-    }
+    crate::age::short(d.whole_seconds())
 }
 
 /// The last decision, for surfaces that report it. Read-only: status

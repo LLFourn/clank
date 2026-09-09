@@ -271,16 +271,6 @@ pub(crate) enum TimelineItem<'a> {
     Github(usize, &'a crate::cli::github_timeline::MergedEvent),
 }
 
-fn event_ts(e: &LogEvent) -> i64 {
-    match e {
-        LogEvent::PlanIntro { ts, .. }
-        | LogEvent::PlanCommit { ts, .. }
-        | LogEvent::PlanFinalized { ts, .. }
-        | LogEvent::PlanDeleted { ts, .. }
-        | LogEvent::AdHoc { ts, .. } => *ts,
-    }
-}
-
 /// Two-pointer newest-first merge preserving each list's own order.
 /// Github events OLDER than the oldest displayed commit fall outside
 /// the folded range and are excluded (when any commits are shown at
@@ -303,7 +293,7 @@ pub(crate) fn interleave_with_plain<'a>(
     let floor = plain
         .last()
         .map(|p| p.meta.author_ts)
-        .or_else(|| events.last().map(|e| event_ts(e)));
+        .or_else(|| events.last().map(|e| e.ts()));
     // The carried index is the ORIGINAL snapshot position — captured
     // by enumerate BEFORE the floor filter and the reversal, so the
     // displayed row and the event it opens share identity (codex
@@ -326,7 +316,7 @@ pub(crate) fn interleave_with_plain<'a>(
     let (mut i, mut j) = (0usize, 0usize);
     while i < history.len() || j < gh_desc.len() {
         let history_ts = |item: &TimelineItem<'_>| match item {
-            TimelineItem::Repo(event) => event_ts(event),
+            TimelineItem::Repo(event) => event.ts(),
             TimelineItem::Plain(commit) => commit.meta.author_ts,
             TimelineItem::Github(_, event) => i64::try_from(event.at).unwrap_or(i64::MAX),
         };
@@ -429,6 +419,9 @@ pub(crate) struct Review {
     pub(crate) verdict: Verdict,
     pub(crate) summary: String,
     pub(crate) body: String,
+    /// When the review was written — its file's mtime, the only
+    /// record a review has of its own time. `None` when unreadable.
+    pub(crate) at: Option<i64>,
 }
 
 pub(crate) fn collect_reviews(
@@ -450,6 +443,7 @@ pub(crate) fn collect_reviews(
                 out.entry(cf.sha.as_str().to_string())
                     .or_insert_with(Vec::new)
                     .push(Review {
+                        at: crate::age::written_at(&repo.join(&entry.source_path)),
                         author: author.as_str().to_string(),
                         verdict: entry.verdict,
                         summary,
@@ -746,6 +740,9 @@ pub(crate) enum OnelineRow {
     Header { plan: Option<String> },
     Commit {
         sha: CommitSha,
+        /// The commit's author time (epoch seconds) — what the TUI's
+        /// age column reads.
+        at: i64,
         /// Subject with the `[plan]` prefix STRIPPED when it
         /// matches the enclosing umbrella's plan (redundant under
         /// the header); verbatim otherwise.
@@ -760,6 +757,7 @@ pub(crate) enum OnelineRow {
     /// it accidentally.
     PlainCommit {
         sha: CommitSha,
+        at: i64,
         subject: String,
         refs: Vec<String>,
     },
@@ -767,6 +765,8 @@ pub(crate) enum OnelineRow {
         verdict: Verdict,
         author: String,
         summary: String,
+        /// See [`Review::at`].
+        at: Option<i64>,
     },
     /// A merged github event interleaved into the timeline
     /// (log-timeline-github-events); `line` is [`gh_describe`]'s
@@ -780,6 +780,8 @@ pub(crate) enum OnelineRow {
         line: String,
         unhandled: bool,
         baseline: bool,
+        /// The event's display time (epoch seconds).
+        at: u64,
     },
     /// A timeline-read notice (corrupt/foreign logs) surfaced as a
     /// dim row — the TUI's rendering of the snapshot's notices.
@@ -804,6 +806,7 @@ pub(crate) fn oneline_items_rows(
                 chunk.clear();
                 out.push(OnelineRow::PlainCommit {
                     sha: commit.meta.sha.clone(),
+                    at: commit.meta.author_ts,
                     subject: commit.meta.subject.clone(),
                     refs: commit.refs.clone(),
                 });
@@ -816,6 +819,7 @@ pub(crate) fn oneline_items_rows(
                     line: gh_describe(g),
                     unhandled: g.unhandled,
                     baseline: g.baseline,
+                    at: g.at,
                 });
             }
         }
@@ -904,11 +908,13 @@ pub(crate) fn oneline_rows(
                         verdict: r.verdict,
                         author: r.author.clone(),
                         summary: r.summary.clone(),
+                        at: r.at,
                     });
                 }
             }
             out.push(OnelineRow::Commit {
                 sha: sha.clone(),
+                at: event.ts(),
                 subject,
                 marker: RowMarker::of(event),
             });
@@ -928,6 +934,7 @@ pub(crate) fn oneline_plain_lines(rows: &[OnelineRow]) -> Vec<String> {
                 line,
                 unhandled,
                 baseline,
+                ..
             } => {
                 let mark = if *unhandled {
                     " ⚠"
@@ -939,7 +946,9 @@ pub(crate) fn oneline_plain_lines(rows: &[OnelineRow]) -> Vec<String> {
                 format!("gh {line}{mark}")
             }
             OnelineRow::Notice(n) => format!("({n})"),
-            OnelineRow::PlainCommit { sha, subject, refs } => {
+            OnelineRow::PlainCommit {
+                sha, subject, refs, ..
+            } => {
                 let refs = if refs.is_empty() {
                     String::new()
                 } else {
@@ -954,6 +963,7 @@ pub(crate) fn oneline_plain_lines(rows: &[OnelineRow]) -> Vec<String> {
                 sha,
                 subject,
                 marker,
+                ..
             } => {
                 format!("{} {} {subject}", marker.glyph(), short(sha))
             }
@@ -961,6 +971,7 @@ pub(crate) fn oneline_plain_lines(rows: &[OnelineRow]) -> Vec<String> {
                 verdict,
                 author,
                 summary,
+                ..
             } => {
                 let m = verdict_mark(*verdict, false);
                 let snip = if summary.is_empty() {
@@ -1049,6 +1060,7 @@ fn print_oneline_events(
                 sha,
                 subject,
                 marker,
+                ..
             } => {
                 // The marker icon LEADS the row (before the sha), then the
                 // sha, then the subject. Fixed 1-col icon keeps subjects
@@ -1068,6 +1080,7 @@ fn print_oneline_events(
                 verdict,
                 author,
                 summary,
+                ..
             } => {
                 let m = verdict_mark(verdict, c);
                 let snip = if summary.is_empty() {
@@ -1451,6 +1464,7 @@ mod json_output_tests {
         reviews.insert(
             sha.as_str().to_string(),
             vec![Review {
+                at: None,
                 author: "codex".into(),
                 verdict: Verdict::RequestChanges,
                 summary: "s".into(),
@@ -1555,6 +1569,47 @@ mod json_output_tests {
 
 #[cfg(test)]
 mod tests {
+
+    /// A review carries no time of its own: its file's mtime is the
+    /// only record of when it was written, and it is what the log's
+    /// time column reads.
+    #[test]
+    fn a_review_is_dated_by_the_file_it_was_written_to() {
+        let dir = tempfile::tempdir().unwrap();
+        let sha = CommitSha::parse(&"a".repeat(40)).unwrap();
+        let path = dir
+            .path()
+            .join(".clank/agents/codex/feedback")
+            .join(format!("{}.md", sha.as_str()));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "CONTINUE lgtm\n").unwrap();
+        let an_hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(an_hour_ago)
+            .unwrap();
+
+        let reviews = collect_reviews(dir.path(), &[sha.clone()]);
+        let [review] = reviews
+            .get(sha.as_str())
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+        else {
+            panic!("exactly one review was written");
+        };
+        assert_eq!(review.author, "codex");
+        assert_eq!(
+            review.at,
+            crate::age::written_at(&path),
+            "dated by its own file"
+        );
+        assert!(
+            crate::age::elapsed(review.at.unwrap()) >= 3500,
+            "an hour ago, not now"
+        );
+    }
     use super::*;
     use clank_core::ids::PlanKey;
 
@@ -1592,6 +1647,7 @@ mod tests {
         reviews.insert(
             sha("aa").as_str().to_string(),
             vec![Review {
+                at: None,
                 author: "codex".into(),
                 verdict: Verdict::Continue,
                 summary: "lgtm".into(),
@@ -1604,6 +1660,7 @@ mod tests {
         reviews.insert(
             sha("cc").as_str().to_string(),
             vec![Review {
+                at: None,
                 author: "codex".into(),
                 verdict: Verdict::Continue,
                 summary: "x".into(),
@@ -1637,6 +1694,7 @@ mod tests {
         // AdHoc arm now shares with the plan path — verdict mark,
         // author, summary snip, indented body.
         let rs = vec![Review {
+            at: None,
             author: "codex".into(),
             verdict: Verdict::RequestChanges,
             summary: "make it consistent".into(),
@@ -1704,11 +1762,13 @@ mod tests {
         // char (and 1 display col), so CHAR position of the subject matches
         // across rows (byte offsets differ — the glyphs are multi-byte).
         let impl_row = OnelineRow::Commit {
+            at: 0,
             sha: sha("aa"),
             subject: "x".into(),
             marker: RowMarker::Impl,
         };
         let adhoc_row = OnelineRow::Commit {
+            at: 0,
             sha: sha("bb"),
             subject: "x".into(),
             marker: RowMarker::AdHoc,

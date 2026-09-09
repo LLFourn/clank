@@ -2317,6 +2317,7 @@ mod dirty_and_wake_tests {
             head_subject: Some("do the thing".to_string()),
             dirty: None,
             plans: vec![PlanWorkState {
+                handover: Default::default(),
                 plan: plan_key("foo"),
                 sha: Some(sha("0123456789abcdef0123456789abcdef01234567")),
                 gate: CommitGateState::Unreviewed,

@@ -1437,6 +1437,26 @@ const REBUILD_MIN: Duration = Duration::from_secs(1);
 
 const REOPEN_NOTICE: &str = "reopen pane";
 
+/// The spinner's frame rate — the only thing on screen that needs a
+/// fast tick.
+const SPINNER_TICK: Duration = Duration::from_millis(120);
+
+/// How long the pane sleeps with nothing animating. Every elapsed
+/// clank draws is minute-resolution ([`crate::age::coarse`]), so this
+/// is what keeps them true: a repaint at least as often as the
+/// smallest unit shown, and no timer of their own.
+const IDLE_TICK: Duration = Duration::from_secs(60);
+
+/// The repaint cadence. Ages on screen never raise it — they are
+/// recomputed by the paint that was going to happen anyway.
+fn paint_interval(spinner_visible: bool) -> Duration {
+    if spinner_visible {
+        SPINNER_TICK
+    } else {
+        IDLE_TICK
+    }
+}
+
 /// The loop's recv timeout: the `base` cadence (spinner tick when one is
 /// visible, else the idle backstop), shortened to the time left before a
 /// DEFERRED refresh may run — so a coalesced burst still rebuilds within
@@ -1934,11 +1954,7 @@ pub(crate) async fn run_tui(
         // screen when a roster exists — tick whenever any agent is active
         // (no window math; the log carries no placeholders).
         let spinner_visible = !in_prog.is_empty() && !snapshot.agents.is_empty();
-        let base = if spinner_visible {
-            Duration::from_millis(120)
-        } else {
-            Duration::from_secs(60)
-        };
+        let base = paint_interval(spinner_visible);
         // A scheduled retry that has come due is promoted to a normal
         // deferred refresh; a pending one caps the sleep so the
         // deadline actually fires (a plain Timeout wake loops back
@@ -3279,6 +3295,7 @@ pub(crate) mod tests {
         with_history
             .log_rows
             .push(crate::cli::log::OnelineRow::PlainCommit {
+                at: 0,
                 sha: crate::lifecycle::CommitSha::parse(&format!("{:0<40}", "abc")).unwrap(),
                 subject: "first".into(),
                 refs: vec!["main".into()],
@@ -3909,6 +3926,27 @@ pub(crate) mod tests {
         assert!(!v.fill);
         v.request_fill();
         assert!(v.fill, "input/data/resize re-arm the fill");
+    }
+
+    /// An elapsed on screen costs the pane nothing: it is recomputed
+    /// by a paint that was already going to happen, so the cadence is
+    /// still decided by the spinner alone. And the idle cadence is
+    /// what keeps a minute-resolution age true — a repaint no rarer
+    /// than the smallest unit shown.
+    #[test]
+    fn a_clock_on_screen_arms_nothing_of_its_own() {
+        assert_eq!(paint_interval(true), SPINNER_TICK);
+        assert_eq!(
+            paint_interval(false),
+            IDLE_TICK,
+            "ages do not shorten the idle sleep"
+        );
+        assert!(
+            IDLE_TICK.as_secs() as i64 <= crate::age::COARSE_RESOLUTION_SECS,
+            "a {}s repaint cannot keep a {}s unit honest",
+            IDLE_TICK.as_secs(),
+            crate::age::COARSE_RESOLUTION_SECS
+        );
     }
 
     #[test]

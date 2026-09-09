@@ -278,17 +278,7 @@ fn describe(item: &WaitItem) -> String {
 }
 
 pub(crate) fn age(at: u64) -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let s = now.saturating_sub(at);
-    match s {
-        0..=59 => format!("{s}s"),
-        60..=3599 => format!("{}m", s / 60),
-        3600..=86_399 => format!("{}h", s / 3600),
-        _ => format!("{}d", s / 86_400),
-    }
+    crate::age::short(crate::age::elapsed(at as i64))
 }
 
 /// The one JSON envelope for both `list -j` and `show -j`: the

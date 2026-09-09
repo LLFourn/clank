@@ -377,6 +377,7 @@ mod tests {
         ];
         let mut s = with_agents(snap(vec![], vec![]), roster);
         s.ad_hoc = vec![clank_core::wait::AdHocWorkState {
+            handover: Default::default(),
             sha: crate::lifecycle::CommitSha::parse(&"b".repeat(40)).unwrap(),
             gate: clank_core::vocab::CommitGateState::Unreviewed,
         }];
@@ -412,6 +413,7 @@ mod tests {
         // (master's ad-hoc revise is out of this plan's scope).
         let mut done = with_agents(snap(vec![], vec![]), roster);
         done.ad_hoc = vec![clank_core::wait::AdHocWorkState {
+            handover: Default::default(),
             sha: crate::lifecycle::CommitSha::parse(&"b".repeat(40)).unwrap(),
             gate: clank_core::vocab::CommitGateState::ChangesRequested,
         }];
@@ -498,6 +500,7 @@ mod tests {
         );
         let mut s = snap(vec![], vec![]);
         s.pr_reviews.push(clank_core::wait::PrReviewWorkState {
+            handover: Default::default(),
             pr: 1,
             repo: "o/r".into(),
             round: 1,

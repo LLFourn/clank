@@ -314,9 +314,15 @@ pub(super) fn render_at(
                 .max()
                 .unwrap_or(0);
             for (local, s) in seq[off..end].iter().enumerate() {
+                // A log row's age joins the pane's time column; an ask
+                // is a question, not an event, and has none.
                 let spans = match s {
                     Seg::Ask(a) => a.spans.clone(),
-                    Seg::Log(row) => log_row_spans(row, author_width, &snap.log_decorations),
+                    Seg::Log(row) => gap_fill(
+                        log_row_spans(row, author_width, &snap.log_decorations),
+                        row_age(row).as_slice(),
+                        cols,
+                    ),
                 };
                 // The selected timeline entry gets the unified selection
                 // band — the same "selected" style as the panel/picker —
@@ -515,8 +521,12 @@ pub(super) fn scrollable_header(
         let activity = in_progress_rows(snap);
         let verb_for = |label: &str| {
             activity.iter().find_map(|p| match p {
-                InProgress::PendingReview { label: l, verb } if l == label => Some(*verb),
-                InProgress::MasterWorking { name, verb } if name == label => Some(*verb),
+                InProgress::PendingReview { label: l, verb, .. } if l == label => {
+                    Some((*verb, p.since()))
+                }
+                InProgress::MasterWorking { name, verb, .. } if name == label => {
+                    Some((*verb, p.since()))
+                }
                 _ => None,
             })
         };
@@ -542,14 +552,20 @@ pub(super) fn scrollable_header(
                 .unwrap_or((false, None));
             // No live wait — including a record whose process has
             // ended, which leaves the agent free to be working.
+            // The elapsed rides WITH the spinner: it says how long
+            // this agent has owed what it owes, so an idle row has
+            // nothing to say and an attending one says it in its own
+            // marker below.
+            let mut elapsed: Vec<Span> = Vec::new();
             if !waiting {
-                if let Some(verb) = verb_for(&a.label) {
+                if let Some((verb, since)) = verb_for(&a.label) {
                     spans.push(dim(format!("  {}", spinner_glyph(frame))));
                     spans.push(italic(format!(" {verb}…")));
+                    elapsed.extend(since.map(elapsed_span));
                 }
             }
             head_out.push(row_line(
-                &spans,
+                &gap_fill(spans, &elapsed, cols),
                 mode.selected() == at(PanelRow::Agent(i)),
                 color,
                 cols,
@@ -777,6 +793,7 @@ pub(super) fn log_row_spans(
             line,
             unhandled,
             baseline,
+            ..
         } => {
             // Pre-watch history renders fully DIM — it's context, not
             // team activity (github-watch-resilience).
@@ -791,7 +808,9 @@ pub(super) fn log_row_spans(
             spans
         }
         OnelineRow::Notice(n) => vec![dim(format!("({n})"))],
-        OnelineRow::PlainCommit { sha, subject, refs } => {
+        OnelineRow::PlainCommit {
+            sha, subject, refs, ..
+        } => {
             let mut spans = vec![
                 plain(" ".to_string()),
                 dim(format!(" {} ", &sha.as_str()[..7])),
@@ -806,6 +825,7 @@ pub(super) fn log_row_spans(
             sha,
             subject,
             marker,
+            ..
         } => {
             // The 1-col marker icon LEADS every commit row (finish `⚑`, impl
             // `⚒`, planning `✎`, adhoc `~`), then the sha, then the subject.
@@ -843,6 +863,7 @@ pub(super) fn log_row_spans(
             verdict,
             author,
             summary,
+            ..
         } => {
             let mark_color = verdict_color(*verdict);
             let mark = crate::cli::log::verdict_mark(*verdict, false);
@@ -867,6 +888,29 @@ pub(super) fn log_row_spans(
             ]
         }
     }
+}
+
+/// The row's place in the pane's one time column: how long ago its
+/// event happened.
+///
+/// `None` for what is not an event — an umbrella header, a read
+/// notice — and for a review whose file could not be read: a missing
+/// clock shows nothing rather than a wrong age.
+pub(super) fn row_age(row: &crate::cli::log::OnelineRow) -> Option<Span> {
+    use crate::cli::log::OnelineRow;
+    let at = match row {
+        OnelineRow::Commit { at, .. } | OnelineRow::PlainCommit { at, .. } => *at,
+        OnelineRow::Github { at, .. } => *at as i64,
+        OnelineRow::Review { at, .. } => (*at)?,
+        OnelineRow::Header { .. } | OnelineRow::Notice(_) => return None,
+    };
+    Some(elapsed_span(at))
+}
+
+/// One cell of the time column: an event's age, dim, at the coarse
+/// resolution the pane's idle repaint can keep true.
+pub(super) fn elapsed_span(at: i64) -> Span {
+    dim(crate::age::coarse(crate::age::elapsed(at)))
 }
 
 /// One rendered line of a pending block's question, tagged with the
@@ -2944,8 +2988,11 @@ mod tests {
         assert!(scrolled.len() < lines.len() || !scrolled[0].contains('✗'));
     }
 
+    /// An hour old, so the layout tests see a real time column rather
+    /// than the epoch.
     fn commit_row(subject: &str) -> crate::cli::log::OnelineRow {
         crate::cli::log::OnelineRow::Commit {
+            at: crate::age::now() - 3600,
             sha: crate::lifecycle::CommitSha::parse(&format!("{:0<40}", "abc1234")).unwrap(),
             subject: subject.to_string(),
             marker: crate::cli::log::RowMarker::Plain,
@@ -2972,6 +3019,7 @@ mod tests {
         let tip_sha = format!("{:0<40}", "aaaa111");
         let old_sha = format!("{:0<40}", "bbbb222");
         let row = |sha: &str, subject: &str| crate::cli::log::OnelineRow::Commit {
+            at: 0,
             sha: crate::lifecycle::CommitSha::parse(sha).unwrap(),
             subject: subject.to_string(),
             marker: crate::cli::log::RowMarker::Plain,
@@ -3455,12 +3503,14 @@ mod tests {
         let s = snap_with_log(&["e5", "e4", "e3", "e2", "e1"]);
         let texts: Vec<String> = render(&s, 8, 60).iter().map(|l| visible(l)).collect();
         assert_eq!(texts.len(), 8);
+        // Each row now ends with its age in the pane's time column, so
+        // the subject is read out of the row, not off its end.
         assert!(
-            texts[5].ends_with("e5"),
+            texts[5].contains("e5") && texts[5].ends_with("1h"),
             "most recent at the TOP of the log: {texts:?}"
         );
-        assert!(texts[6].ends_with("e4"), "got {texts:?}");
-        assert!(texts[7].ends_with("e3"), "got {texts:?}");
+        assert!(texts[6].contains("e4"), "got {texts:?}");
+        assert!(texts[7].contains("e3"), "got {texts:?}");
         assert!(
             !texts.iter().any(|t| t.ends_with("e1")),
             "oldest dropped first"
@@ -3504,6 +3554,7 @@ mod tests {
             },
             commit_row("intro"),
             OnelineRow::Review {
+                at: None,
                 verdict: Verdict::Continue,
                 author: "codex".into(),
                 summary: "lgtm".into(),
@@ -3545,6 +3596,7 @@ mod tests {
         use crate::cli::log::OnelineRow;
         use clank_core::vocab::Verdict;
         let review = |v, author: &str| OnelineRow::Review {
+            at: None,
             verdict: v,
             author: author.into(),
             summary: "why".into(),
@@ -5047,6 +5099,7 @@ mod tests {
         // Active (the zellij indicator follows it).
         let mut s = two_agent_snap(); // claude (master) + codex (commit)
         s.ad_hoc = vec![clank_core::wait::AdHocWorkState {
+            handover: Default::default(),
             sha: crate::lifecycle::CommitSha::parse(&format!("{:b<40}", "abc123")).unwrap(),
             gate: clank_core::vocab::CommitGateState::Unreviewed,
         }];
@@ -5136,6 +5189,7 @@ mod tests {
             path: std::path::PathBuf::new(),
         }];
         s.ad_hoc = vec![clank_core::wait::AdHocWorkState {
+            handover: Default::default(),
             sha: crate::lifecycle::CommitSha::parse(&format!("{:b<40}", "abc123")).unwrap(),
             gate: clank_core::vocab::CommitGateState::ChangesRequested,
         }];
@@ -5187,6 +5241,7 @@ mod tests {
         // "reviewing" verb; master's row stays still.
         let mut s = two_agent_snap(); // claude (master) + codex (commit)
         s.ad_hoc = vec![clank_core::wait::AdHocWorkState {
+            handover: Default::default(),
             sha: crate::lifecycle::CommitSha::parse(&"b".repeat(40)).unwrap(),
             gate: clank_core::vocab::CommitGateState::Unreviewed,
         }];
@@ -5200,6 +5255,156 @@ mod tests {
         assert!(
             !claude_row.contains(SPINNER[0]),
             "master row still: {claude_row}"
+        );
+    }
+
+    /// The elapsed rides WITH the spinner, in the pane's right-hand
+    /// time column: how long this agent has owed what it owes. An
+    /// idle agent has nothing to say there.
+    #[test]
+    fn a_working_agents_row_says_how_long_it_has_been_working() {
+        use crate::cli::status_tui::fixtures::plan_state_at;
+        let mut s = two_agent_snap(); // claude (master) + codex (commit)
+        s.plans = vec![plan_state_at(
+            "foo",
+            reviewer_missing("codex"),
+            clank_core::wait::Handover {
+                opened: Some(crate::age::now() - 3 * 3600),
+                ..Default::default()
+            },
+        )];
+        let out = render(&s, 40, 80);
+        let codex_row = visible(line_with(&out, "codex"));
+        assert!(
+            codex_row.contains("reviewing") && codex_row.ends_with("3h"),
+            "the elapsed closes the row, in the time column: {codex_row}"
+        );
+        let claude_row = visible(line_with(&out, "claude"));
+        assert!(
+            !claude_row.ends_with('h') && !claude_row.ends_with('m'),
+            "an idle agent is not owing anything for any length of time: {claude_row}"
+        );
+
+        // An undated obligation spins without a clock rather than
+        // inventing one.
+        s.plans = vec![plan_state("foo", reviewer_missing("codex"))];
+        let codex_row = visible(line_with(&render(&s, 40, 80), "codex"));
+        assert!(
+            codex_row.contains(SPINNER[0]) && codex_row.ends_with("reviewing…"),
+            "spinning, undated: {codex_row}"
+        );
+    }
+
+    /// An ATTENDING agent is blocked, not working: its wait marker is
+    /// its own clock (`⌛ … · 3m/5m`) and the row above it must not
+    /// carry a second one.
+    #[test]
+    fn an_attending_agent_carries_only_its_markers_clock() {
+        use crate::cli::status_tui::fixtures::plan_state_at;
+        let mut s = two_agent_snap();
+        s.plans = vec![plan_state_at(
+            "foo",
+            reviewer_missing("codex"),
+            clank_core::wait::Handover {
+                opened: Some(crate::age::now() - 3 * 3600),
+                ..Default::default()
+            },
+        )];
+        s.agents[1].attending = Some(crate::cli::stop_hook::Attended {
+            expect: None,
+            desc: Some("cargo test".to_string()),
+            token: None,
+            task: "cargo test".to_string(),
+            // A live pid, so the marker reads as a real wait.
+            pid: Some(std::process::id() as i32),
+            at: "2026-08-20T14:51:09Z".to_string(),
+        });
+        let out = render(&s, 40, 80);
+        let codex_row = visible(line_with(&out, "codex"));
+        assert!(
+            !codex_row.contains("3h") && !codex_row.contains(SPINNER[0]),
+            "blocked is not working, and carries no elapsed: {codex_row}"
+        );
+        assert!(
+            visible(line_with(&out, "⌛")).contains("cargo test"),
+            "the wait's own clock is the marker's"
+        );
+    }
+
+    /// Every event in the log says how long ago it happened, in the
+    /// same column the agent rows use. A row that is not an event —
+    /// an umbrella header — says nothing.
+    #[test]
+    fn log_rows_say_how_long_ago_in_the_time_column() {
+        use crate::cli::log::OnelineRow;
+        let mut s = snap_with_log(&[]);
+        let now = crate::age::now();
+        s.log_rows = vec![
+            OnelineRow::Header {
+                plan: Some("foo".into()),
+            },
+            OnelineRow::Review {
+                at: Some(now - 20 * 60),
+                verdict: clank_core::vocab::Verdict::Continue,
+                author: "codex".into(),
+                summary: "lgtm".into(),
+            },
+            OnelineRow::Commit {
+                at: now - 2 * 86_400,
+                sha: crate::lifecycle::CommitSha::parse(&format!("{:0<40}", "abc1234")).unwrap(),
+                subject: "do a thing".into(),
+                marker: crate::cli::log::RowMarker::Plain,
+            },
+        ];
+        let out = render(&s, 40, 80);
+        let commit = visible(line_with(&out, "do a thing"));
+        assert!(commit.ends_with("2d"), "the commit's age: {commit}");
+        let review = visible(line_with(&out, "lgtm"));
+        assert!(
+            review.ends_with("20m"),
+            "the review's, from its file's write time: {review}"
+        );
+        let header = visible(line_with(&out, "foo"));
+        assert!(
+            !header.ends_with('m') && !header.ends_with('d'),
+            "an umbrella is not an event: {header}"
+        );
+        // A review whose file could not be read shows no age rather
+        // than a wrong one.
+        s.log_rows[1] = OnelineRow::Review {
+            at: None,
+            verdict: clank_core::vocab::Verdict::Continue,
+            author: "codex".into(),
+            summary: "lgtm".into(),
+        };
+        assert!(
+            visible(line_with(&render(&s, 40, 80), "lgtm")).ends_with("lgtm"),
+            "no clock, no column"
+        );
+    }
+
+    /// The time column is secondary: a pane too narrow for both drops
+    /// it WHOLE, and the row's own content keeps every column it had.
+    #[test]
+    fn a_narrow_pane_drops_the_age_and_keeps_the_subject() {
+        use crate::cli::log::OnelineRow;
+        let mut s = snap_with_log(&[]);
+        s.log_rows = vec![OnelineRow::Commit {
+            at: crate::age::now() - 2 * 86_400,
+            sha: crate::lifecycle::CommitSha::parse(&format!("{:0<40}", "abc1234")).unwrap(),
+            subject: "a subject of some length".into(),
+            marker: crate::cli::log::RowMarker::Plain,
+        }];
+        let wide = visible(line_with(&render(&s, 40, 80), "a subject"));
+        assert!(wide.ends_with("2d"));
+        let narrow = visible(line_with(&render(&s, 40, 34), "a subject"));
+        assert!(
+            narrow.ends_with("a subject of some length"),
+            "the subject keeps its columns; the age is gone whole: {narrow:?}"
+        );
+        assert!(
+            !narrow.contains("2d") && !narrow.contains('…'),
+            "dropped, never truncated to a fragment: {narrow:?}"
         );
     }
 
@@ -5803,6 +6008,7 @@ mod tests {
         // must NOT render idle, in the TUI bar OR `clank status`.
         let mut s = snap(vec![], vec![]);
         s.pr_reviews.push(clank_core::wait::PrReviewWorkState {
+            handover: Default::default(),
             pr: 123,
             repo: "o/r".into(),
             round: 1,

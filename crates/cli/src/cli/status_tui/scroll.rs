@@ -17,11 +17,111 @@ pub(super) enum InProgress {
     /// A registered reviewer who still owes a verdict on the latest
     /// reviewable commit — their panel row spins. `verb` is the italic
     /// wait-text ("reviewing" / "gate-reviewing").
-    PendingReview { label: String, verb: &'static str },
+    PendingReview {
+        label: String,
+        verb: &'static str,
+        since: Option<i64>,
+    },
     /// Master is producing the next commit — master's panel row spins.
     /// `verb` says which (working/revising/drafting/finalizing) via
     /// [`verb_of`].
-    MasterWorking { name: String, verb: &'static str },
+    MasterWorking {
+        name: String,
+        verb: &'static str,
+        since: Option<i64>,
+    },
+}
+
+impl InProgress {
+    /// When this agent's oldest outstanding obligation began, if any
+    /// of them is dated.
+    pub(super) fn since(&self) -> Option<i64> {
+        match self {
+            InProgress::PendingReview { since, .. } | InProgress::MasterWorking { since, .. } => {
+                *since
+            }
+        }
+    }
+}
+
+/// When the agent's OLDEST current obligation was handed to it.
+///
+/// The obligations are not re-derived: `work_for` is the same source
+/// that decided this row spins at all, and each item is dated by the
+/// stage boundary of the work state it names — never by "the newest
+/// verdict", which a still-pending peer's verdict would move.
+///
+/// Read through `work_projection`, whose dropped multi-plan preempt
+/// is what keeps master's per-plan obligations visible here: the
+/// preempt is a routing decision with no stage of its own, and the
+/// question this answers is how long the WORK has been waiting.
+fn oldest_obligation(
+    snap: &StatusSnapshot,
+    work: &clank_core::wait::WorkStatus,
+    label: &str,
+    role: clank_core::vocab::Role,
+) -> Option<i64> {
+    use clank_core::wait::{HandoverTier, WaitItem};
+    let Ok(parsed) = clank_core::ids::AgentLabel::parse(label) else {
+        return None;
+    };
+    // The tier an agent answers on decides WHICH stage boundary
+    // handed it its work: the commit tier is summoned by the commit
+    // itself, everyone else by a tier closing.
+    let tier = match snap
+        .agents
+        .iter()
+        .find(|a| a.label == label)
+        .map(|a| a.role)
+    {
+        Some(crate::cli::teams_config::RosterRole::Master) => HandoverTier::Master,
+        Some(r) if r.in_commit_tier() => HandoverTier::Commit,
+        Some(_) => HandoverTier::Second,
+        // Off the roster entirely: no tier, so no clock to read.
+        None => return None,
+    };
+    let plan_at = |key: &clank_core::ids::PlanKey| {
+        snap.plans
+            .iter()
+            .find(|p| &p.plan == key)
+            .and_then(|p| p.handover.since(tier))
+    };
+    let adhoc_at = |sha: &crate::lifecycle::CommitSha| {
+        snap.ad_hoc
+            .iter()
+            .find(|a| &a.sha == sha)
+            .and_then(|a| a.handover.since(tier))
+    };
+    let pr_at = |pr: u32| {
+        snap.pr_reviews
+            .iter()
+            .find(|p| p.pr == pr)
+            .and_then(|p| p.handover.since(tier))
+    };
+    work.work_for(&parsed, role)
+        .iter()
+        .filter_map(|item| match item {
+            WaitItem::Master { plan, .. } | WaitItem::Reviewer { plan, .. } => plan_at(plan),
+            WaitItem::AdHocReview { sha, .. } | WaitItem::AdHocRevise { sha } => adhoc_at(sha),
+            WaitItem::PrReviewer { pr, .. } | WaitItem::PrMaster { pr, .. } => pr_at(*pr),
+            // Not obligations handed over by a review stage: a
+            // notification, an idle prompt, a preempt the panel
+            // surfaces elsewhere (the `fix` gauge, the queue).
+            WaitItem::Finished { .. }
+            | WaitItem::Idle { .. }
+            | WaitItem::AdHocSettled { .. }
+            | WaitItem::FixCommitTag { .. }
+            | WaitItem::MultiplePlansOpen { .. }
+            | WaitItem::PromoteFromQueue { .. }
+            | WaitItem::GithubEvent { .. }
+            | WaitItem::CommandEvent { .. }
+            | WaitItem::ForCommit { .. }
+            | WaitItem::ForFinished { .. }
+            | WaitItem::ForBlocked { .. }
+            | WaitItem::Blocked { .. }
+            | WaitItem::Unblocked { .. } => None,
+        })
+        .min()
 }
 
 /// The braille spinner cycle — width-1 glyphs so it drops into the
@@ -64,22 +164,31 @@ pub(super) fn in_progress_rows(snap: &StatusSnapshot) -> Vec<InProgress> {
             "reviewing"
         }
     };
+    let work = super::derive::work_projection(snap);
     let mut out: Vec<InProgress> = super::derive::awaited_reviewers(snap)
         .into_iter()
         .map(|label| {
             let verb = plan_verb(&label);
-            InProgress::PendingReview { label, verb }
+            let since = oldest_obligation(snap, &work, &label, clank_core::vocab::Role::Reviewer);
+            InProgress::PendingReview { label, verb, since }
         })
         .collect();
+    let master_since = |snap: &StatusSnapshot, name: &str| {
+        oldest_obligation(snap, &work, name, clank_core::vocab::Role::Master)
+    };
     if let [v] = snap.plans.as_slice() {
         match &v.waiting_on {
             WaitingOn::MasterToContinue
             | WaitingOn::MasterToRevise { .. }
             | WaitingOn::MasterToCommit
-            | WaitingOn::MasterToFinalize => out.push(InProgress::MasterWorking {
-                name: snap.master.as_deref().unwrap_or("master").to_string(),
-                verb: super::derive::verb_of(&v.waiting_on),
-            }),
+            | WaitingOn::MasterToFinalize => {
+                let name = snap.master.as_deref().unwrap_or("master").to_string();
+                out.push(InProgress::MasterWorking {
+                    since: master_since(snap, &name),
+                    name,
+                    verb: super::derive::verb_of(&v.waiting_on),
+                })
+            }
             WaitingOn::ReviewerApprovalsMissing { .. }
             | WaitingOn::GateReviewersMissing { .. }
             | WaitingOn::Blocked { .. }
@@ -93,8 +202,10 @@ pub(super) fn in_progress_rows(snap: &StatusSnapshot) -> Vec<InProgress> {
         // Plan-less ad-hoc revision: master's row spins with the
         // routed verb, mirroring bar_text and master_is_active
         // (codex 4a4be39).
+        let name = snap.master.as_deref().unwrap_or("master").to_string();
         out.push(InProgress::MasterWorking {
-            name: snap.master.as_deref().unwrap_or("master").to_string(),
+            since: master_since(snap, &name),
+            name,
             verb: "revising",
         });
     }
@@ -299,7 +410,8 @@ mod tests {
         );
         assert!(matches!(
             in_progress_rows(&s).as_slice(),
-            [InProgress::PendingReview { label, verb }] if label == "codex" && *verb == "reviewing"
+            [InProgress::PendingReview { label, verb, .. }]
+                if label == "codex" && *verb == "reviewing"
         ));
         // Master producing the next commit → one master row, per-state verb.
         let s = snap(vec![plan_state("foo", WaitingOn::MasterToContinue)], vec![]);
@@ -323,6 +435,185 @@ mod tests {
         assert!(in_progress_rows(&s).is_empty());
     }
 
+    /// The stage boundaries an agent's clock reads: the work appeared
+    /// at 100, the commit tier closed at 200, the second tier at 300.
+    fn stages(
+        commit_tier_closed: Option<i64>,
+        second_tier_closed: Option<i64>,
+    ) -> clank_core::wait::Handover {
+        clank_core::wait::Handover {
+            opened: Some(100),
+            commit_tier_closed,
+            second_tier_closed,
+        }
+    }
+
+    fn since_of(rows: &[InProgress], who: &str) -> Option<i64> {
+        rows.iter()
+            .find(|p| match p {
+                InProgress::PendingReview { label, .. } => label == who,
+                InProgress::MasterWorking { name, .. } => name == who,
+            })
+            .and_then(|p| p.since())
+    }
+
+    /// Each agent's clock starts at the boundary of the stage that
+    /// summoned it — which is a DIFFERENT boundary per tier, on the
+    /// same plan: the commit tier answers the commit, the gate tier
+    /// answers the commit tier closing. Collapsing the two would hand
+    /// a gate reviewer the whole commit review's time the moment it
+    /// was asked.
+    #[test]
+    fn an_agents_clock_starts_at_the_stage_that_summoned_it() {
+        use crate::cli::status_tui::fixtures::{plan_state_at, with_agents};
+        use crate::cli::teams_config::RosterRole;
+        let roster: &[(&str, RosterRole)] = &[
+            ("claude", RosterRole::Master),
+            ("codex", RosterRole::Commit),
+            ("ruthless", RosterRole::Gate),
+        ];
+        // The commit tier still owes: codex has owed since the commit.
+        let s = with_agents(
+            snap(
+                vec![plan_state_at(
+                    "foo",
+                    reviewer_missing("codex"),
+                    stages(None, None),
+                )],
+                vec![],
+            ),
+            roster,
+        );
+        assert_eq!(since_of(&in_progress_rows(&s), "codex"), Some(100));
+
+        // The commit tier closed at 200 and summoned the gate tier:
+        // ruthless has owed since 200, not since the commit.
+        let s = with_agents(
+            snap(
+                vec![plan_state_at(
+                    "foo",
+                    WaitingOn::GateReviewersMissing {
+                        missing: clank_core::repo_state::NonEmptyVec::new(vec![
+                            clank_core::ids::AgentLabel::parse("ruthless").unwrap(),
+                        ])
+                        .unwrap(),
+                    },
+                    stages(Some(200), None),
+                )],
+                vec![],
+            ),
+            roster,
+        );
+        assert_eq!(since_of(&in_progress_rows(&s), "ruthless"), Some(200));
+
+        // Master was handed the plan back by the last tier to close.
+        let s = with_agents(
+            snap(
+                vec![plan_state_at(
+                    "foo",
+                    WaitingOn::MasterToContinue,
+                    stages(Some(200), Some(300)),
+                )],
+                vec![],
+            ),
+            roster,
+        );
+        assert_eq!(since_of(&in_progress_rows(&s), "claude"), Some(300));
+        // With no second tier consulted, the commit tier's close is
+        // what handed it back.
+        let s = with_agents(
+            snap(
+                vec![plan_state_at(
+                    "foo",
+                    WaitingOn::MasterToContinue,
+                    stages(Some(200), None),
+                )],
+                vec![],
+            ),
+            roster,
+        );
+        assert_eq!(since_of(&in_progress_rows(&s), "claude"), Some(200));
+    }
+
+    /// A reviewer awaited by a PR round reads its clock from that
+    /// round's stages — the same rule over a different work item.
+    #[test]
+    fn a_pr_reviewer_is_dated_by_the_rounds_stages() {
+        use crate::cli::status_tui::fixtures::{pr_awaiting, with_agents};
+        use crate::cli::teams_config::RosterRole;
+        let mut s = with_agents(
+            snap(vec![], vec![]),
+            &[
+                ("claude", RosterRole::Master),
+                ("codex", RosterRole::Commit),
+            ],
+        );
+        let mut pr = pr_awaiting(&["codex"]);
+        pr.handover = clank_core::wait::Handover {
+            opened: Some(4_242),
+            ..Default::default()
+        };
+        s.pr_reviews = vec![pr];
+        assert_eq!(since_of(&in_progress_rows(&s), "codex"), Some(4_242));
+    }
+
+    /// An agent owing two things has been owing since the OLDER one:
+    /// the elapsed answers "how long has this agent had work waiting",
+    /// which the newer obligation cannot shorten.
+    #[test]
+    fn two_obligations_show_the_older() {
+        use crate::cli::status_tui::fixtures::{plan_state_at, with_agents};
+        use crate::cli::teams_config::RosterRole;
+        let old = clank_core::wait::Handover {
+            opened: Some(100),
+            ..Default::default()
+        };
+        let recent = clank_core::wait::Handover {
+            opened: Some(9_000),
+            ..Default::default()
+        };
+        let s = with_agents(
+            snap(
+                vec![
+                    plan_state_at("newer", reviewer_missing("codex"), recent),
+                    plan_state_at("older", reviewer_missing("codex"), old),
+                ],
+                vec![],
+            ),
+            &[
+                ("claude", RosterRole::Master),
+                ("codex", RosterRole::Commit),
+            ],
+        );
+        assert_eq!(since_of(&in_progress_rows(&s), "codex"), Some(100));
+    }
+
+    /// A work state with no dated stage draws no elapsed at all — and
+    /// the row still spins, because whether an agent is working and
+    /// whether we can date it are two questions.
+    #[test]
+    fn an_undated_obligation_still_spins() {
+        use crate::cli::status_tui::fixtures::{plan_state_at, with_agents};
+        use crate::cli::teams_config::RosterRole;
+        let s = with_agents(
+            snap(
+                vec![plan_state_at(
+                    "foo",
+                    reviewer_missing("codex"),
+                    clank_core::wait::Handover::default(),
+                )],
+                vec![],
+            ),
+            &[
+                ("claude", RosterRole::Master),
+                ("codex", RosterRole::Commit),
+            ],
+        );
+        let rows = in_progress_rows(&s);
+        assert_eq!(rows.len(), 1, "still spinning");
+        assert_eq!(since_of(&rows, "codex"), None);
+    }
+
     // A log of [Header(foo), Commit(latest reviewable sha)] for the active
     // plan `foo`, used to check WHERE placeholders get spliced.
     fn snap_with_header_and_commit(waiting: WaitingOn) -> StatusSnapshot {
@@ -334,6 +625,7 @@ mod tests {
                 plan: Some("foo".into()),
             },
             OnelineRow::Commit {
+                at: 0,
                 sha,
                 subject: "do a thing".into(),
                 marker: crate::cli::log::RowMarker::Plain,
@@ -393,11 +685,13 @@ mod tests {
         use clank_core::vocab::Verdict;
         let sha = |s: &str| CommitSha::parse(&format!("{:0<40}", s)).unwrap();
         let commit = |s: &str| OnelineRow::Commit {
+            at: 0,
             sha: sha(s),
             subject: "x".into(),
             marker: crate::cli::log::RowMarker::Plain,
         };
         let review = |a: &str| OnelineRow::Review {
+            at: None,
             verdict: Verdict::Continue,
             author: a.into(),
             summary: "ok".into(),

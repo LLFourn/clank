@@ -1075,6 +1075,9 @@ fn plan_roster_stand_ins(
                     target.reviews.push(clank_core::wait::ReviewEntry {
                         author: entrant.clone(),
                         verdict: *verdict,
+                        // A verdict tried on for size, not one anyone
+                        // wrote: it has no time.
+                        at: None,
                     });
                     let preserves = gates_for_target(target, &current) == expected_gates;
                     target.reviews.pop();
@@ -1091,6 +1094,7 @@ fn plan_roster_stand_ins(
             target.reviews.push(clank_core::wait::ReviewEntry {
                 author: entrant.clone(),
                 verdict,
+                at: None,
             });
             stand_ins.push(RosterStandIn {
                 author: entrant.clone(),
@@ -1940,6 +1944,7 @@ mod tests {
                 .map(|(author, verdict)| clank_core::wait::ReviewEntry {
                     author: label(author),
                     verdict: *verdict,
+                    at: None,
                 })
                 .collect(),
         }

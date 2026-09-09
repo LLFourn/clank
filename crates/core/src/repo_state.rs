@@ -240,6 +240,17 @@ pub enum LogEvent {
 }
 
 impl LogEvent {
+    /// When this event happened: the commit's author time.
+    pub fn ts(&self) -> i64 {
+        match self {
+            LogEvent::PlanIntro { ts, .. }
+            | LogEvent::PlanCommit { ts, .. }
+            | LogEvent::PlanFinalized { ts, .. }
+            | LogEvent::PlanDeleted { ts, .. }
+            | LogEvent::AdHoc { ts, .. } => *ts,
+        }
+    }
+
     /// The plan this event belongs to, or `None` for ad-hoc.
     pub fn plan(&self) -> Option<&PlanKey> {
         match self {

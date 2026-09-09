@@ -79,17 +79,21 @@ impl PlanStateLookup for FsPlanStateLookup<'_> {
             if !feedback_dir.is_dir() {
                 continue;
             }
-            if let Some(verdict) = try_read_verdict(&feedback_dir.join(format!("{sha_stem}.md"))) {
+            let full = feedback_dir.join(format!("{sha_stem}.md"));
+            if let Some(verdict) = try_read_verdict(&full) {
                 entries.push(ReviewEntry {
                     author: label.clone(),
                     verdict,
+                    at: crate::age::written_at(&full),
                 });
                 continue;
             }
-            if let Some(verdict) = try_read_verdict(&feedback_dir.join(format!("{sha_short}.md"))) {
+            let short = feedback_dir.join(format!("{sha_short}.md"));
+            if let Some(verdict) = try_read_verdict(&short) {
                 entries.push(ReviewEntry {
                     author: label,
                     verdict,
+                    at: crate::age::written_at(&short),
                 });
             }
         }

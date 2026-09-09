@@ -65,11 +65,25 @@ pub(crate) const REVERSE: &str = "\x1b[7m"; // emit_selected band
 
 pub(crate) fn plan_state(stem: &str, waiting_on: WaitingOn) -> PlanWorkState {
     PlanWorkState {
+        handover: Default::default(),
         plan: PlanKey::parse(stem).unwrap(),
         sha: Some(CommitSha::parse(&format!("{:0<40}", "abc123")).unwrap()),
         gate: CommitGateState::Unreviewed,
         waiting_on,
         touched_code: false,
+    }
+}
+
+/// A plan whose stages closed at the given times — the fixture for
+/// every "how long has this agent owed it" assertion.
+pub(crate) fn plan_state_at(
+    stem: &str,
+    waiting_on: WaitingOn,
+    handover: clank_core::wait::Handover,
+) -> PlanWorkState {
+    PlanWorkState {
+        handover,
+        ..plan_state(stem, waiting_on)
     }
 }
 
@@ -182,6 +196,7 @@ pub(crate) fn visible_untrimmed(line: &str) -> String {
 
 pub(crate) fn pr_work(round: u64, missing: &[&str]) -> clank_core::wait::PrReviewWorkState {
     clank_core::wait::PrReviewWorkState {
+        handover: Default::default(),
         pr: 5,
         repo: "LLFourn/clank".into(),
         round,
@@ -195,6 +210,7 @@ pub(crate) fn pr_work(round: u64, missing: &[&str]) -> clank_core::wait::PrRevie
 
 pub(crate) fn pr_awaiting(missing: &[&str]) -> clank_core::wait::PrReviewWorkState {
     clank_core::wait::PrReviewWorkState {
+        handover: Default::default(),
         pr: 1,
         repo: "o/r".into(),
         round: 1,
