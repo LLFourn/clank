@@ -8,8 +8,21 @@ pub async fn run(args: QueueArgs) -> anyhow::Result<()> {
         None => list(&repo),
         Some(QueueCmd::Add(a)) => add_cmd(&repo, a),
         Some(QueueCmd::Remove(r)) => remove(&repo, &r.name),
-        Some(QueueCmd::Promote(p)) => promote(&repo, &p.name),
+        Some(QueueCmd::Promote(p)) => {
+            promote(&repo, &p.name)?;
+            println!("promoted `{}` to active plan", p.name);
+            Ok(())
+        }
         Some(QueueCmd::Reprioritise(r)) => reprioritise(&repo, &r.name, r.priority),
+        Some(QueueCmd::Unqueue(u)) => {
+            let draft = unqueue(&repo, &u.name)?;
+            println!(
+                "unqueued `{}` → {}",
+                u.name,
+                draft.strip_prefix(&repo).unwrap_or(&draft).display()
+            );
+            Ok(())
+        }
     }
 }
 
@@ -135,11 +148,49 @@ fn queue_dir(repo: &Path) -> PathBuf {
     repo.join(".clank/queue")
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct QueueEntry {
     pub priority: u16,
     pub name: String,
     pub path: PathBuf,
+}
+
+impl QueueEntry {
+    /// The file's stem — `500-foo`, `foo`, `001-foo` — the one handle
+    /// that is unique per entry. The parse is lenient, so two files
+    /// can share a name and even a priority; anything keyed by those
+    /// collides. Pages, links and targets that must mean ONE entry
+    /// use this (a-queued-plan-has-a-page).
+    pub fn file_stem(&self) -> String {
+        self.path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| self.name.clone())
+    }
+}
+
+/// The entry `handle` means: its file stem exactly, else its NAME when
+/// that names exactly one entry. Ambiguity is an error naming the
+/// stems, so a caller can say which; a parsed name that no file
+/// carries is "not in the queue".
+pub fn resolve_entry(repo: &Path, handle: &str) -> anyhow::Result<QueueEntry> {
+    let entries = scan_queue(repo);
+    if let Some(e) = entries.iter().find(|e| e.file_stem() == handle) {
+        return Ok(e.clone());
+    }
+    let by_name: Vec<&QueueEntry> = entries.iter().filter(|e| e.name == handle).collect();
+    match by_name.as_slice() {
+        [one] => Ok((*one).clone()),
+        [] => anyhow::bail!("`{handle}` is not in the queue (see `clank queue`)"),
+        many => anyhow::bail!(
+            "`{handle}` names {} queue files ({}); pass the file stem",
+            many.len(),
+            many.iter()
+                .map(|e| e.file_stem())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
 }
 
 /// Validate that no two entries share the same `name`. Returns
@@ -367,7 +418,11 @@ fn reprioritise(repo: &Path, name: &str, priority: u16) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn promote(repo: &Path, name: &str) -> anyhow::Result<()> {
+/// Promote a queued item to an active plan: move it into `plans/`
+/// and commit the intro. Shared by the CLI verb and the TUI's page,
+/// so it prints nothing — the caller says what happened on its own
+/// surface.
+pub fn promote(repo: &Path, name: &str) -> anyhow::Result<()> {
     validate_name(name)?;
     let entries = scan_queue(repo);
     let entry = find_unique(&entries, name)?;
@@ -381,8 +436,30 @@ fn promote(repo: &Path, name: &str) -> anyhow::Result<()> {
     crate::git_plumbing::stage(repo, &plan_path)?;
     let msg = format!("[{name}] intro");
     crate::git_plumbing::commit_pathspec(repo, &plan_path, &msg)?;
-    println!("promoted `{name}` to active plan");
     Ok(())
+}
+
+/// Take a queued item OUT of the queue and back to the drafts dir —
+/// the inverse of `queue add`, which consumed the draft. `remove`
+/// deletes; this keeps the body. Refuses to overwrite a draft that
+/// already exists under the name, and names it. Shared by the CLI
+/// verb and the TUI's page, which never renames files itself
+/// (a-queued-plan-has-a-page). Returns the draft's path.
+pub fn unqueue(repo: &Path, name: &str) -> anyhow::Result<PathBuf> {
+    let entries = scan_queue(repo);
+    let entry = find_unique(&entries, name)?;
+    let drafts = repo.join(".clank/drafts");
+    let dest = drafts.join(format!("{name}.md"));
+    if dest.exists() {
+        anyhow::bail!(
+            "`{}` already exists; move it aside before unqueuing `{name}`",
+            dest.display()
+        );
+    }
+    std::fs::create_dir_all(&drafts)?;
+    std::fs::rename(&entry.path, &dest)
+        .map_err(|e| anyhow::anyhow!("moving `{}` to drafts: {e}", entry.path.display()))?;
+    Ok(dest)
 }
 
 #[cfg(test)]
@@ -407,6 +484,36 @@ mod tests {
         assert_eq!(entries[0].priority, 100);
         assert_eq!(entries[1].name, "gamma");
         assert_eq!(entries[2].name, "beta");
+    }
+
+    /// The inverse of `add`: the body goes back to the drafts dir and
+    /// the queue entry is gone; an existing draft is never overwritten.
+    #[test]
+    fn unqueue_moves_the_entry_back_to_drafts_and_never_overwrites() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        write(&repo.join(".clank/queue/500-foo.md"), "# foo\nthe body\n");
+        let draft = unqueue(repo, "foo").unwrap();
+        assert_eq!(draft, repo.join(".clank/drafts/foo.md"));
+        assert_eq!(
+            std::fs::read_to_string(&draft).unwrap(),
+            "# foo\nthe body\n"
+        );
+        assert!(scan_queue(repo).is_empty(), "out of the queue");
+
+        // Queue it again; a draft of the name still exists → refused,
+        // nothing moved.
+        write(&repo.join(".clank/queue/500-foo.md"), "# foo\nv2\n");
+        let err = unqueue(repo, "foo").unwrap_err().to_string();
+        assert!(err.contains("drafts/foo.md"), "names the file: {err}");
+        assert_eq!(scan_queue(repo).len(), 1, "still queued");
+        assert_eq!(
+            std::fs::read_to_string(&draft).unwrap(),
+            "# foo\nthe body\n"
+        );
+
+        // Unknown and ambiguous names refuse as every queue op does.
+        assert!(unqueue(repo, "nope").is_err());
     }
 
     #[test]

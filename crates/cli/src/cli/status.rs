@@ -172,11 +172,16 @@ pub(crate) struct AvailableAgent {
 }
 
 /// One queued plan as the snapshot carries it: display name + the
-/// `NNN` priority from its filename prefix (lower = promoted sooner).
+/// `NNN` priority from its filename prefix (lower = promoted sooner),
+/// and the file itself — the entry's IDENTITY. The parse is lenient
+/// (`foo.md`, `1-foo.md` and `001-foo.md` all read as one name and
+/// priority), so nothing derived from the filename can tell two
+/// entries apart; only the filename can (a-queued-plan-has-a-page).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct QueueItemView {
     pub(crate) priority: u16,
     pub(crate) name: String,
+    pub(crate) path: PathBuf,
 }
 
 /// Build the roster's auto-mode rows: master first, then reviewers in
@@ -482,6 +487,7 @@ impl StatusSnapshot {
             .map(|e| QueueItemView {
                 priority: e.priority,
                 name: e.name,
+                path: e.path,
             })
             .collect();
 
@@ -2401,10 +2407,12 @@ mod dirty_and_wake_tests {
             QueueItemView {
                 priority: 500,
                 name: "bar".to_string(),
+                path: PathBuf::new(),
             },
             QueueItemView {
                 priority: 500,
                 name: "baz".to_string(),
+                path: PathBuf::new(),
             },
         ];
         snap.stash = vec![StashItemView {

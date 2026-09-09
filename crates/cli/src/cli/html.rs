@@ -230,14 +230,11 @@ async fn resolve_open_target_path(
             .ok_or_else(|| anyhow::anyhow!("not a known commit: `{raw}`"))?;
         return Ok(out_dir.join(format!("commit/{}.html", sha.as_str())));
     }
-    if let Some(name) = args.queue.as_deref() {
-        let known = crate::cli::queue::scan_queue(repo)
-            .into_iter()
-            .any(|e| e.name == name);
-        if !known {
-            anyhow::bail!("`{name}` is not in the queue (see `clank queue`)");
-        }
-        return Ok(out_dir.join(format!("queue/{name}.html")));
+    if let Some(handle) = args.queue.as_deref() {
+        // Pages are keyed by FILE STEM, the one handle unique per entry;
+        // a bare name still works while it names one file.
+        let entry = crate::cli::queue::resolve_entry(repo, handle)?;
+        return Ok(out_dir.join(format!("queue/{}.html", entry.file_stem())));
     }
     if let Some(name) = args.stash.as_deref() {
         let known = crate::cli::stash::scan_stash(repo)
@@ -261,6 +258,29 @@ async fn resolve_open_target_path(
         }
         None => Ok(out_dir.join("index.html")),
     }
+}
+
+/// Queue pages — always fully re-rendered: the queue changes without
+/// commits (add/remove/promote/reprioritise), the files are few and
+/// cheap, and wiping the dir first drops pages for items that left the
+/// queue. One page per FILE, keyed by the file stem: two files can
+/// parse to one name (and one priority), and a name-keyed page would
+/// be the last writer's. Returns the entries the pages were written
+/// for, in queue order.
+fn write_queue_pages(
+    repo: &Path,
+    out_dir: &Path,
+) -> anyhow::Result<Vec<crate::cli::queue::QueueEntry>> {
+    let queue_entries = crate::cli::queue::scan_queue(repo);
+    let queue_dir = out_dir.join("queue");
+    let _ = std::fs::remove_dir_all(&queue_dir);
+    std::fs::create_dir_all(&queue_dir)?;
+    for entry in &queue_entries {
+        let body = std::fs::read_to_string(&entry.path).unwrap_or_default();
+        let page = render_queue_page(&entry.name, entry.priority, &body);
+        std::fs::write(queue_dir.join(format!("{}.html", entry.file_stem())), page)?;
+    }
+    Ok(queue_entries)
 }
 
 /// The command-line target for opening a plan/commit/queue page in the
@@ -437,19 +457,7 @@ async fn build_site(
         std::fs::write(stash_out.join(format!("{stem}.html")), page)?;
     }
 
-    // Queue pages — always fully re-rendered: the queue changes without
-    // commits (add/remove/promote/reprioritise), the files are few and
-    // cheap, and wiping the dir first drops pages for items that left
-    // the queue.
-    let queue_entries = crate::cli::queue::scan_queue(repo);
-    let queue_dir = out_dir.join("queue");
-    let _ = std::fs::remove_dir_all(&queue_dir);
-    std::fs::create_dir_all(&queue_dir)?;
-    for entry in &queue_entries {
-        let body = std::fs::read_to_string(&entry.path).unwrap_or_default();
-        let page = render_queue_page(&entry.name, entry.priority, &body);
-        std::fs::write(queue_dir.join(format!("{}.html", entry.name)), page)?;
-    }
+    let queue_entries = write_queue_pages(repo, out_dir)?;
 
     // Index page — always full re-render so the status header,
     // verdict marks, and umbrella grouping reflect current
@@ -1125,7 +1133,8 @@ fn render_index(
         out.push_str("  <div class=\"queue\">queue:\n    <ul>\n");
         for e in queue {
             out.push_str(&format!(
-                "      <li><a class=\"plan-pill\" href=\"queue/{name}.html\">{name}</a> <code>{prio:03}</code></li>\n",
+                "      <li><a class=\"plan-pill\" href=\"queue/{stem}.html\">{name}</a> <code>{prio:03}</code></li>\n",
+                stem = esc(&e.file_stem()),
                 name = esc(&e.name),
                 prio = e.priority,
             ));
@@ -2446,6 +2455,64 @@ mod tests {
         assert!(html.contains("#f26d6d"), "error accent");
     }
 
+    /// Two queue files with one parsed name AND priority get two pages,
+    /// and `--queue` reaches each by its file stem — a name that means
+    /// one file still works, a name that means two is refused with
+    /// the stems (a-queued-plan-has-a-page).
+    #[tokio::test]
+    async fn duplicate_queue_entries_get_distinct_pages_and_targets() {
+        let repo = tempfile::tempdir().unwrap();
+        let p = repo.path();
+        std::fs::create_dir_all(p.join(".clank/queue")).unwrap();
+        std::fs::write(p.join(".clank/queue/foo.md"), "# bare foo").unwrap();
+        std::fs::write(p.join(".clank/queue/999-foo.md"), "# prefixed foo").unwrap();
+        std::fs::write(p.join(".clank/queue/200-bar.md"), "# bar").unwrap();
+        let out = p.join(".clank/html");
+        let entries = write_queue_pages(p, &out).unwrap();
+        assert_eq!(entries.len(), 3);
+        let bare = std::fs::read_to_string(out.join("queue/foo.html")).unwrap();
+        let prefixed = std::fs::read_to_string(out.join("queue/999-foo.html")).unwrap();
+        assert!(bare.contains("bare foo") && !bare.contains("prefixed foo"));
+        assert!(prefixed.contains("prefixed foo") && !prefixed.contains("bare foo"));
+
+        let open = |queue: &str| crate::cli::HtmlOpenArgs {
+            plan: None,
+            commit: None,
+            queue: Some(queue.to_string()),
+            stash: None,
+            print_path: false,
+        };
+        async fn target(
+            p: &Path,
+            out: &Path,
+            args: crate::cli::HtmlOpenArgs,
+        ) -> anyhow::Result<std::path::PathBuf> {
+            resolve_open_target_path(p, "r", out, &args).await
+        }
+        assert_eq!(
+            target(p, &out, open("999-foo")).await.unwrap(),
+            out.join("queue/999-foo.html")
+        );
+        assert_eq!(
+            target(p, &out, open("foo")).await.unwrap(),
+            out.join("queue/foo.html"),
+            "an exact stem"
+        );
+        assert_eq!(
+            target(p, &out, open("bar")).await.unwrap(),
+            out.join("queue/200-bar.html"),
+            "a name that means one file"
+        );
+        std::fs::remove_file(p.join(".clank/queue/foo.md")).unwrap();
+        std::fs::write(p.join(".clank/queue/100-foo.md"), "# third foo").unwrap();
+        let err = target(p, &out, open("foo")).await.unwrap_err().to_string();
+        assert!(
+            err.contains("100-foo") && err.contains("999-foo"),
+            "ambiguity names the stems: {err}"
+        );
+        assert!(target(p, &out, open("nope")).await.is_err());
+    }
+
     #[test]
     fn render_queue_page_shows_name_priority_and_body() {
         let html = render_queue_page(
@@ -2505,7 +2572,7 @@ mod tests {
         );
         assert!(html.contains("stash/parked.html"), "stash item links");
         let s_pos = html.find("stash/parked.html").unwrap();
-        let q_pos = html.find("queue/queued-idea.html").unwrap();
+        let q_pos = html.find("queue/500-queued-idea.html").unwrap();
         assert!(s_pos < q_pos, "STASH block above QUEUE block");
 
         // Empty stash: no block.
@@ -2552,10 +2619,10 @@ mod tests {
             None,
         );
         assert!(
-            html.contains("queue/urgent-fix.html"),
+            html.contains("queue/100-urgent-fix.html"),
             "item links to its page"
         );
-        assert!(html.contains("queue/later-idea.html"));
+        assert!(html.contains("queue/800-later-idea.html"));
         assert!(
             html.contains("100") && html.contains("800"),
             "priorities shown"

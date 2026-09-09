@@ -218,9 +218,11 @@ fn apply_confirm(
         // Plan-page confirms are executed by `run_plan_confirm` in the
         // loop's Confirm arm (they're async and error-reporting); they
         // never reach this sync roster path.
-        ConfirmAction::StashPlan | ConfirmAction::PurgeArtifacts | ConfirmAction::PurgeDrop => {
-            Ok(())
-        }
+        ConfirmAction::StashPlan
+        | ConfirmAction::UnqueuePlan
+        | ConfirmAction::PromotePlan
+        | ConfirmAction::PurgeArtifacts
+        | ConfirmAction::PurgeDrop => Ok(()),
     }
 }
 
@@ -244,6 +246,8 @@ async fn run_plan_confirm(
             })
             .await
         }
+        ConfirmAction::UnqueuePlan => crate::cli::queue::unqueue(repo, stem).map(|_| ()),
+        ConfirmAction::PromotePlan => crate::cli::queue::promote(repo, stem),
         ConfirmAction::PurgeArtifacts | ConfirmAction::PurgeDrop => {
             crate::cli::purge::run(crate::cli::PurgeArgs {
                 plan: Some(stem.to_string()),
@@ -266,6 +270,8 @@ async fn run_plan_confirm(
 fn plan_confirm_title(action: ConfirmAction) -> String {
     match action {
         ConfirmAction::StashPlan => "stash push failed".to_string(),
+        ConfirmAction::UnqueuePlan => "unqueue failed".to_string(),
+        ConfirmAction::PromotePlan => "promote failed".to_string(),
         ConfirmAction::PurgeArtifacts => "purge failed".to_string(),
         ConfirmAction::PurgeDrop => "purge --drop failed".to_string(),
         _ => "action failed".to_string(),
@@ -527,31 +533,77 @@ async fn finalize_commit_of(
 /// (squash-worthiness) for finished plans re-derives the plan's native
 /// range via the cached fold — one-shot at page open / refresh, never
 /// per repaint.
+/// The page's facts, read from the SOURCE it opened on: the queue for
+/// a queued page, the plans for an active/finished one — never the
+/// other, since a queue entry may share a stem with an active plan
+/// (a-queued-plan-has-a-page). `None` = gone from that source.
 async fn plan_page_facts(
     repo: &std::path::Path,
     stem: &str,
     snapshot: &StatusSnapshot,
-) -> Option<input::PlanPageState> {
+    queued: Option<&std::path::Path>,
+) -> Option<(input::PlanPageState, Option<std::path::PathBuf>)> {
+    if let Some(entry) = queued {
+        let item = input::resolve_queued(&snapshot.queue, stem, entry, |q| {
+            (q.name.as_str(), q.path.as_path())
+        })?;
+        return Some((
+            input::PlanPageState::Queued {
+                priority: item.priority,
+            },
+            Some(item.path.clone()),
+        ));
+    }
     let active = snapshot.plans.iter().any(|p| p.plan.as_str() == stem);
     let finished_file = repo.join(crate::init_facts::finished_md_rel(stem)).exists();
     if !active && !finished_file {
         return None;
     }
-    let repo_paused = active
-        && snapshot
+    if active {
+        let repo_paused = snapshot
             .blocks
             .iter()
             .any(|b| b.answer.is_none() && b.name == "pause");
-    let multi_commit = if active {
-        true // squash isn't offered on active pages; value unused
-    } else {
-        finished_multi_commit(repo, stem).await
+        return Some((input::PlanPageState::Active { repo_paused }, None));
+    }
+    Some((
+        input::PlanPageState::Finished {
+            multi_commit: finished_multi_commit(repo, stem).await,
+        },
+        None,
+    ))
+}
+
+/// What `o` opens for a queued page: the html page keyed by its FILE
+/// stem (`999-foo`), which is what the generator writes per entry.
+/// The parsed name is not a handle — two files can share it — so a
+/// queued page with no entry opens nothing rather than a page that
+/// may be another file's. `None` for an active/finished page.
+fn queue_html_handle(page: &PlanPage) -> Option<String> {
+    if !page.st.is_queued() {
+        return None;
+    }
+    let entry = page.entry.as_deref()?;
+    Some(entry.file_stem()?.to_string_lossy().into_owned())
+}
+
+/// A value-row keystroke on a queued page: ONE validated mutation —
+/// the primitive `queue reprioritise` uses, never an inline rename —
+/// and the page follows the write: its priority, and its identity,
+/// since the rename moved the file (a later refresh resolves by that
+/// path; left behind, a duplicate-named survivor would close the page
+/// instead). `set_priority` refuses an ambiguous name rather than
+/// pick, and the error is the page's to show. No-op on a page that is
+/// not queued.
+fn change_priority(repo: &std::path::Path, page: &mut PlanPage, delta: i32) -> anyhow::Result<()> {
+    let input::PlanPageState::Queued { priority } = page.st else {
+        return Ok(());
     };
-    Some(input::PlanPageState {
-        finished: !active,
-        multi_commit,
-        repo_paused,
-    })
+    let next = input::next_priority(priority, delta);
+    let renamed = crate::cli::queue::set_priority(repo, &page.stem, next)?;
+    page.st = input::PlanPageState::Queued { priority: next };
+    page.entry = Some(renamed);
+    Ok(())
 }
 
 /// Refresh the open plan page's facts in place; `false` = the plan is
@@ -565,12 +617,18 @@ async fn refetch_plan_page(
     let Some(pp) = plan_page.as_mut() else {
         return false;
     };
-    match plan_page_facts(repo, &pp.stem, snapshot).await {
-        Some(st) => {
+    match plan_page_facts(repo, &pp.stem, snapshot, pp.entry.as_deref()).await {
+        Some((st, entry)) => {
             pp.st = st;
             // The document shown beneath the buttons may have changed
-            // (plan revised, finished) — re-read alongside the facts.
-            pp.body = read_plan_markdown(repo, &pp.stem);
+            // (plan revised, finished, re-queued) — re-read alongside
+            // the facts, from the same source and the same file. An
+            // external rename the resolver followed lands here too.
+            pp.body = match &entry {
+                Some(path) => std::fs::read_to_string(path).ok(),
+                None => read_plan_markdown(repo, &pp.stem),
+            };
+            pp.entry = entry;
             true
         }
         None => {
@@ -1166,15 +1224,10 @@ enum OverlayData {
         message: String,
     },
     Commit(CommitDetail),
-    /// (An ACTIVE plan's document has no overlay: the plan page renders
-    /// it beneath the action buttons — tui-plan-page-redesign.)
+    /// (An ACTIVE or QUEUED plan's document has no overlay: the plan
+    /// page renders it beneath the action buttons —
+    /// tui-plan-page-redesign, a-queued-plan-has-a-page.)
     ///
-    /// A QUEUED plan's markdown by name (source: `.clank/queue/`, not
-    /// `plans/`); `markdown` is `None` when it left the queue.
-    QueuedPlan {
-        name: String,
-        markdown: Option<String>,
-    },
     /// A STASHED plan's markdown by name — read from the stash record's
     /// protective ref (the plan file no longer exists on the branch);
     /// `None` when the item left the stash.
@@ -1203,13 +1256,6 @@ impl Overlay {
         Self {
             data: OverlayData::Commit(data),
             offset,
-        }
-    }
-    /// A queued-plan overlay, opened at the top.
-    fn queued(name: String, markdown: Option<String>) -> Self {
-        Self {
-            data: OverlayData::QueuedPlan { name, markdown },
-            offset: 0,
         }
     }
     /// A failed plan-page action's error, opened at the top
@@ -1328,16 +1374,6 @@ fn read_plan_markdown(repo: &std::path::Path, stem: &str) -> Option<String> {
         }
     }
     None
-}
-
-/// Read a queued plan's markdown by NAME via a fresh queue scan — the
-/// priority prefix can change under us (a reprioritise renames the file),
-/// so the path is resolved at read time, never cached.
-fn read_queue_markdown(repo: &std::path::Path, name: &str) -> Option<String> {
-    let entry = crate::cli::queue::scan_queue(repo)
-        .into_iter()
-        .find(|e| e.name == name)?;
-    std::fs::read_to_string(&entry.path).ok()
 }
 
 /// Read a stashed plan's markdown by NAME: resolve the item through the
@@ -1668,8 +1704,7 @@ pub(crate) async fn run_tui(
                     rows as usize,
                     cols as usize,
                 ),
-                OverlayData::QueuedPlan { name, markdown }
-                | OverlayData::StashedPlan { name, markdown } => render_plan_doc(
+                OverlayData::StashedPlan { name, markdown } => render_plan_doc(
                     name,
                     markdown.as_deref(),
                     overlay.offset,
@@ -1685,7 +1720,6 @@ pub(crate) async fn run_tui(
             // arm mutates it).
             let html_target: Option<HtmlTarget> = match &overlay.data {
                 OverlayData::Commit(d) => Some(HtmlTarget::Commit(d.sha.as_str().to_string())),
-                OverlayData::QueuedPlan { name, .. } => Some(HtmlTarget::Queue(name.clone())),
                 OverlayData::StashedPlan { name, .. } => Some(HtmlTarget::Stash(name.clone())),
                 OverlayData::Error { .. } => None,
             };
@@ -1757,13 +1791,6 @@ pub(crate) async fn run_tui(
                         OverlayData::Commit(d) => {
                             let sha = d.sha.clone();
                             fetch_commit_detail(&repo, &sha).map(OverlayData::Commit)
-                        }
-                        OverlayData::QueuedPlan { name, .. } => {
-                            let name = name.clone();
-                            Some(OverlayData::QueuedPlan {
-                                markdown: read_queue_markdown(&repo, &name),
-                                name,
-                            })
                         }
                         OverlayData::StashedPlan { name, .. } => {
                             let name = name.clone();
@@ -2194,16 +2221,19 @@ pub(crate) async fn run_tui(
                                 PanelAction::OpenQueueItem(q) => {
                                     if let Some(item) = snapshot.queue.get(q) {
                                         let name = item.name.clone();
-                                        let md = read_queue_markdown(&repo, &name);
-                                        detail = Some(Overlay::queued(name, md));
-                                    }
-                                }
-                                PanelAction::OpenQueueHtml(q) => {
-                                    if let Some(item) = snapshot.queue.get(q) {
-                                        open_overlay_in_browser(
-                                            &repo,
-                                            &HtmlTarget::Queue(item.name.clone()),
-                                        );
+                                        // The row IS the file: its body is
+                                        // read from its own path, never
+                                        // looked up by name.
+                                        plan_page = Some(PlanPage {
+                                            body: std::fs::read_to_string(&item.path).ok(),
+                                            stem: name,
+                                            st: input::PlanPageState::Queued {
+                                                priority: item.priority,
+                                            },
+                                            entry: Some(item.path.clone()),
+                                            scroll: 0,
+                                        });
+                                        mode = Mode::PlanDetail { sel: 0 };
                                     }
                                 }
                                 PanelAction::OpenStashItem(i) => {
@@ -2219,40 +2249,6 @@ pub(crate) async fn run_tui(
                                             &repo,
                                             &HtmlTarget::Stash(item.stem.clone()),
                                         );
-                                    }
-                                }
-                                PanelAction::NudgeQueue { idx, delta } => {
-                                    if let Some(item) = snapshot.queue.get(idx) {
-                                        let name = item.name.clone();
-                                        let next = (item.priority as i32 + delta as i32)
-                                            .clamp(0, 999)
-                                            as u16;
-                                        // ONE validated mutation — the same
-                                        // primitive `queue reprioritise` uses,
-                                        // never an inline rename.
-                                        if crate::cli::queue::set_priority(&repo, &name, next)
-                                            .is_ok()
-                                        {
-                                            snapshot.queue[idx].priority = next;
-                                            snapshot.queue.sort_by(|a, b| {
-                                                a.priority
-                                                    .cmp(&b.priority)
-                                                    .then(a.name.cmp(&b.name))
-                                            });
-                                            // Keep the cursor ON the nudged
-                                            // item as it moves through the
-                                            // re-sorted list.
-                                            if let Some(pos) =
-                                                snapshot.queue.iter().position(|i| i.name == name)
-                                            {
-                                                mode = Mode::AgentPanel {
-                                                    sel: row_position(
-                                                        &panel_row_list(&snapshot, cols as usize),
-                                                        crate::cli::status_tui::input::PanelRow::Queue(pos),
-                                                    ),
-                                                };
-                                            }
-                                        }
                                     }
                                 }
                                 PanelAction::None => {}
@@ -2634,11 +2630,46 @@ pub(crate) async fn run_tui(
                                     plan_page = None;
                                     mode = Mode::LogScroll;
                                 }
+                                // ONE validated mutation — the primitive
+                                // `queue reprioritise` uses, never an
+                                // inline rename. The page follows the
+                                // write; the panel re-sorts on the refresh
+                                // the rename wakes.
+                                PlanNav::Priority(delta) => {
+                                    if let Some(live) = plan_page.as_mut()
+                                        && let Err(e) = change_priority(&repo, live, delta)
+                                    {
+                                        detail = Some(Overlay::error(
+                                            "priority change failed".to_string(),
+                                            format!("{e:?}"),
+                                        ));
+                                    }
+                                }
                                 PlanNav::Act(a) => match a {
+                                    // A queued page opens ITS file's html —
+                                    // the file stem, never the parsed name a
+                                    // duplicate could share.
                                     PlanAction::OpenHtml => open_overlay_in_browser(
                                         &repo,
-                                        &HtmlTarget::Plan(pp.stem.clone()),
+                                        &match queue_html_handle(&pp) {
+                                            Some(stem) => HtmlTarget::Queue(stem),
+                                            None => HtmlTarget::Plan(pp.stem.clone()),
+                                        },
                                     ),
+                                    // A value row activates nothing; the
+                                    // nav never yields it, but the match
+                                    // must say so.
+                                    PlanAction::Priority => {}
+                                    PlanAction::Unqueue => {
+                                        mode = Mode::Confirm {
+                                            action: ConfirmAction::UnqueuePlan,
+                                        };
+                                    }
+                                    PlanAction::Promote => {
+                                        mode = Mode::Confirm {
+                                            action: ConfirmAction::PromotePlan,
+                                        };
+                                    }
                                     PlanAction::Stash => {
                                         mode = Mode::Confirm {
                                             action: ConfirmAction::StashPlan,
@@ -2822,13 +2853,14 @@ pub(crate) async fn run_tui(
                                     // page (buttons over the document —
                                     // tui-plan-page-redesign).
                                     Some(OverlayTarget::Plan { stem }) => {
-                                        if let Some(st) =
-                                            plan_page_facts(&repo, &stem, &snapshot).await
+                                        if let Some((st, _)) =
+                                            plan_page_facts(&repo, &stem, &snapshot, None).await
                                         {
                                             let body = read_plan_markdown(&repo, &stem);
                                             plan_page = Some(PlanPage {
                                                 stem,
                                                 st,
+                                                entry: None,
                                                 body,
                                                 scroll: 0,
                                             });
@@ -4060,9 +4092,7 @@ pub(crate) mod tests {
         };
         let subject_of = |o: &Overlay| match &o.data {
             OverlayData::Commit(d) => d.subject.clone(),
-            OverlayData::QueuedPlan { .. }
-            | OverlayData::StashedPlan { .. }
-            | OverlayData::Error { .. } => unreachable!(),
+            OverlayData::StashedPlan { .. } | OverlayData::Error { .. } => unreachable!(),
         };
         // A review row opens at a non-zero offset (commit row would be 0).
         let mut o = Overlay::commit(data("first"), 5);
@@ -4077,9 +4107,6 @@ pub(crate) mod tests {
         assert_eq!(o.offset, 8, "clamped to the last page");
         o.scroll(-100, 8);
         assert_eq!(o.offset, 0, "clamped at the top");
-        // A queued-plan overlay opens at the top.
-        let p = Overlay::queued("foo".into(), Some("# foo".into()));
-        assert_eq!(p.offset, 0);
     }
 
     #[test]
@@ -4121,6 +4148,262 @@ pub(crate) mod tests {
             (7, 5),
             "log focus keeps its scroll state"
         );
+    }
+
+    /// The page's facts come from the source it opened on, never the
+    /// other: a queue entry and an active plan may share a stem
+    /// (a-queued-plan-has-a-page).
+    #[tokio::test]
+    async fn plan_page_facts_reads_the_source_the_page_opened_on() {
+        use crate::cli::status_tui::fixtures::{plan_state, snap};
+        use clank_core::plan_view::WaitingOn;
+        let repo = tempfile::TempDir::new().unwrap();
+        let p = repo.path();
+        std::fs::create_dir_all(p.join(".clank/plans")).unwrap();
+        std::fs::write(p.join(".clank/plans/foo.md"), "# foo active").unwrap();
+        // The SAME stem in the queue, and only-queued `bar`.
+        let mut s = snap(
+            vec![plan_state("foo", WaitingOn::MasterToContinue)],
+            vec!["foo", "bar"],
+        );
+        s.queue[0].priority = 120;
+        let foo_entry = s.queue[0].path.clone();
+
+        // Opened from the queue: queued facts, whatever the plans say.
+        assert_eq!(
+            plan_page_facts(p, "foo", &s, Some(&foo_entry)).await,
+            Some((
+                input::PlanPageState::Queued { priority: 120 },
+                Some(foo_entry.clone())
+            ))
+        );
+        // Opened from the plans: active facts, whatever the queue says.
+        assert_eq!(
+            plan_page_facts(p, "foo", &s, None).await,
+            Some((input::PlanPageState::Active { repo_paused: false }, None))
+        );
+        // Gone from ITS source closes the page, even if the other
+        // source has the stem: `bar` promoted from a shell.
+        assert_eq!(
+            plan_page_facts(p, "bar", &s, None).await,
+            None,
+            "bar is queued, not a plan"
+        );
+        s.queue.retain(|q| q.name != "foo");
+        assert_eq!(
+            plan_page_facts(p, "foo", &s, Some(&foo_entry)).await,
+            None,
+            "the queued page closes though an active foo exists"
+        );
+        assert!(plan_page_facts(p, "foo", &s, None).await.is_some());
+    }
+
+    /// Two queue files parsing to one name — here to one name AND one
+    /// priority, which the lenient parse allows (`foo.md`, `999-foo.md`)
+    /// — are two entries. Each row opens its OWN body, each page
+    /// refreshes onto its own file, an entry gone with a duplicate
+    /// left closes its page rather than retarget, and a lone
+    /// survivor's rename is followed (codex on 2b35cb8, 791a448).
+    #[tokio::test]
+    async fn duplicate_queue_names_open_and_refresh_as_distinct_entries() {
+        use crate::cli::status_tui::fixtures::snap;
+        let repo = tempfile::TempDir::new().unwrap();
+        let p = repo.path();
+        std::fs::create_dir_all(p.join(".clank/queue")).unwrap();
+        let bare = p.join(".clank/queue/foo.md");
+        let prefixed = p.join(".clank/queue/999-foo.md");
+        std::fs::write(&bare, "# bare foo").unwrap();
+        std::fs::write(&prefixed, "# prefixed foo").unwrap();
+        let entries = crate::cli::queue::scan_queue(p);
+        assert_eq!(entries.len(), 2, "both files are entries");
+        assert_eq!(
+            (entries[0].priority, entries[1].priority),
+            (999, 999),
+            "and the parse cannot tell them apart"
+        );
+        let mut s = snap(vec![], vec![]);
+        s.queue = entries
+            .iter()
+            .map(|e| crate::cli::status::QueueItemView {
+                priority: e.priority,
+                name: e.name.clone(),
+                path: e.path.clone(),
+            })
+            .collect();
+
+        for (path, body) in [(&bare, "# bare foo"), (&prefixed, "# prefixed foo")] {
+            let mut page = Some(PlanPage {
+                stem: "foo".into(),
+                st: input::PlanPageState::Queued { priority: 999 },
+                entry: Some(path.clone()),
+                body: None,
+                scroll: 0,
+            });
+            assert!(refetch_plan_page(p, &mut page, &s).await);
+            let pg = page.unwrap();
+            assert_eq!(pg.entry.as_deref(), Some(path.as_path()));
+            assert_eq!(pg.body.as_deref(), Some(body), "{}", path.display());
+        }
+        // The prefixed entry renamed from a shell while its page is
+        // open: its file is gone and `foo` is still ambiguous — the
+        // page closes rather than show the other file.
+        s.queue.retain(|q| q.path != prefixed);
+        let renamed = p.join(".clank/queue/300-foo.md");
+        std::fs::rename(&prefixed, &renamed).unwrap();
+        s.queue.push(crate::cli::status::QueueItemView {
+            priority: 300,
+            name: "foo".into(),
+            path: renamed.clone(),
+        });
+        let mut page = Some(PlanPage {
+            stem: "foo".into(),
+            st: input::PlanPageState::Queued { priority: 999 },
+            entry: Some(prefixed.clone()),
+            body: None,
+            scroll: 0,
+        });
+        assert!(!refetch_plan_page(p, &mut page, &s).await);
+        assert!(page.is_none());
+        // With one `foo` left, the rename is followed: new file, new
+        // priority, its body.
+        s.queue.retain(|q| q.path != bare);
+        let mut page = Some(PlanPage {
+            stem: "foo".into(),
+            st: input::PlanPageState::Queued { priority: 999 },
+            entry: Some(prefixed.clone()),
+            body: None,
+            scroll: 0,
+        });
+        assert!(refetch_plan_page(p, &mut page, &s).await);
+        let pg = page.unwrap();
+        assert_eq!(pg.st, input::PlanPageState::Queued { priority: 300 });
+        assert_eq!(pg.entry.as_deref(), Some(renamed.as_path()));
+        assert_eq!(pg.body.as_deref(), Some("# prefixed foo"));
+    }
+
+    /// A priority change from the page renames the file, and the
+    /// page's identity follows the rename, so the refresh after it
+    /// finds the page's own file rather than a name it must guess at.
+    #[test]
+    fn a_priority_change_moves_the_page_with_its_file() {
+        let repo = tempfile::TempDir::new().unwrap();
+        let p = repo.path();
+        std::fs::create_dir_all(p.join(".clank/queue")).unwrap();
+        let before = p.join(".clank/queue/500-foo.md");
+        std::fs::write(&before, "# foo").unwrap();
+        let mut page = PlanPage {
+            stem: "foo".into(),
+            st: input::PlanPageState::Queued { priority: 500 },
+            entry: Some(before.clone()),
+            body: None,
+            scroll: 0,
+        };
+        change_priority(p, &mut page, 10).unwrap();
+        let after = p.join(".clank/queue/510-foo.md");
+        assert!(after.exists() && !before.exists(), "the file was renamed");
+        assert_eq!(page.st, input::PlanPageState::Queued { priority: 510 });
+        assert_eq!(page.entry.as_deref(), Some(after.as_path()));
+        // The ends absorb through the same path: 999 is a no-op rename.
+        change_priority(p, &mut page, 1000).unwrap();
+        assert_eq!(page.st, input::PlanPageState::Queued { priority: 999 });
+        assert!(p.join(".clank/queue/999-foo.md").exists());
+        // An ambiguous name is refused, and the page is left as it was.
+        std::fs::write(p.join(".clank/queue/foo.md"), "# other foo").unwrap();
+        assert!(change_priority(p, &mut page, -10).is_err());
+        assert_eq!(page.st, input::PlanPageState::Queued { priority: 999 });
+        // A page that is not queued has no priority to change.
+        let mut active = PlanPage {
+            stem: "foo".into(),
+            st: input::PlanPageState::Active { repo_paused: false },
+            entry: None,
+            body: None,
+            scroll: 0,
+        };
+        change_priority(p, &mut active, 10).unwrap();
+        assert_eq!(
+            active.st,
+            input::PlanPageState::Active { repo_paused: false }
+        );
+    }
+
+    /// `o` from a queued page opens ITS file's page — the stem, so the
+    /// two equal-name rows reach two pages — and an active page opens
+    /// the plan's.
+    #[test]
+    fn a_queued_page_opens_its_own_files_html() {
+        let page = |entry: Option<&str>, st| PlanPage {
+            stem: "foo".into(),
+            st,
+            entry: entry.map(std::path::PathBuf::from),
+            body: None,
+            scroll: 0,
+        };
+        let queued = input::PlanPageState::Queued { priority: 999 };
+        assert_eq!(
+            queue_html_handle(&page(Some("/q/.clank/queue/999-foo.md"), queued)).as_deref(),
+            Some("999-foo")
+        );
+        assert_eq!(
+            queue_html_handle(&page(Some("/q/.clank/queue/foo.md"), queued)).as_deref(),
+            Some("foo")
+        );
+        assert_eq!(
+            queue_html_handle(&page(None, queued)),
+            None,
+            "no file, no page to open — never a name that could be another's"
+        );
+        assert_eq!(
+            queue_html_handle(&page(
+                None,
+                input::PlanPageState::Active { repo_paused: false }
+            )),
+            None
+        );
+    }
+
+    /// The refresh keeps the page on its source and re-reads that
+    /// source's body: the same-stem regression, both directions.
+    #[tokio::test]
+    async fn a_refresh_never_flips_a_page_between_the_queue_and_the_plans() {
+        use crate::cli::status_tui::fixtures::{plan_state, snap};
+        use clank_core::plan_view::WaitingOn;
+        let repo = tempfile::TempDir::new().unwrap();
+        let p = repo.path();
+        std::fs::create_dir_all(p.join(".clank/plans")).unwrap();
+        std::fs::create_dir_all(p.join(".clank/queue")).unwrap();
+        std::fs::write(p.join(".clank/plans/foo.md"), "# foo active").unwrap();
+        let entry = p.join(".clank/queue/300-foo.md");
+        std::fs::write(&entry, "# foo queued").unwrap();
+        let mut s = snap(
+            vec![plan_state("foo", WaitingOn::MasterToContinue)],
+            vec!["foo"],
+        );
+        s.queue[0].priority = 300;
+        s.queue[0].path = entry.clone();
+
+        let mut queued = Some(PlanPage {
+            stem: "foo".into(),
+            st: input::PlanPageState::Queued { priority: 300 },
+            entry: Some(entry),
+            body: None,
+            scroll: 0,
+        });
+        assert!(refetch_plan_page(p, &mut queued, &s).await);
+        let q = queued.unwrap();
+        assert_eq!(q.st, input::PlanPageState::Queued { priority: 300 });
+        assert_eq!(q.body.as_deref(), Some("# foo queued"));
+
+        let mut active = Some(PlanPage {
+            stem: "foo".into(),
+            st: input::PlanPageState::Active { repo_paused: false },
+            entry: None,
+            body: None,
+            scroll: 0,
+        });
+        assert!(refetch_plan_page(p, &mut active, &s).await);
+        let a = active.unwrap();
+        assert_eq!(a.st, input::PlanPageState::Active { repo_paused: false });
+        assert_eq!(a.body.as_deref(), Some("# foo active"));
     }
 
     #[test]

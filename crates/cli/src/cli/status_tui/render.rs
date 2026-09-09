@@ -161,7 +161,11 @@ pub(super) fn render_at(
                 }
                 return (vec![region_rule("stop", "", true, cols)], 1);
             }
-            ConfirmAction::StashPlan | ConfirmAction::PurgeArtifacts | ConfirmAction::PurgeDrop => {
+            ConfirmAction::StashPlan
+            | ConfirmAction::UnqueuePlan
+            | ConfirmAction::PromotePlan
+            | ConfirmAction::PurgeArtifacts
+            | ConfirmAction::PurgeDrop => {
                 if let Mode::BlockAnswer { block } = mode {
                     if let Some(b) = snap.blocks.get(block) {
                         return render_block_answer(
@@ -1926,15 +1930,15 @@ pub(super) fn render_plan_detail(
 ) -> (Vec<String>, usize) {
     let st = pp.st;
     let mut out: Vec<String> = Vec::new();
-    let state_hint = if st.finished {
-        "finished".to_string()
-    } else if st.repo_paused {
-        "active · repo paused".to_string()
-    } else {
-        "active".to_string()
+    use super::input::PlanPageState as S;
+    let (kind, state_hint) = match st {
+        S::Queued { priority } => ("queue", format!("queued · priority {priority}")),
+        S::Active { repo_paused: true } => ("plan", "active · repo paused".to_string()),
+        S::Active { repo_paused: false } => ("plan", "active".to_string()),
+        S::Finished { .. } => ("plan", "finished".to_string()),
     };
     out.push(region_rule(
-        &format!("plan · {}", pp.stem),
+        &format!("{kind} · {}", pp.stem),
         &state_hint,
         true,
         cols,
@@ -1945,8 +1949,8 @@ pub(super) fn render_plan_detail(
     // third of a short pane on nothing.
     for (i, a) in actions.iter().enumerate() {
         let danger = matches!(a, PlanAction::Purge);
-        let (key, label, desc) = plan_action_row(*a);
-        out.extend(button_block(key, label, desc, danger, i == sel, cols));
+        let (key, label, desc) = plan_action_row(*a, st);
+        out.extend(button_block(key, &label, desc, danger, i == sel, cols));
     }
     let doc_focused = sel >= super::input::document_focus(actions);
     // The document rule is pushed AFTER the clamp below so its
@@ -1989,6 +1993,8 @@ pub(super) fn render_plan_detail(
     out.truncate(rows.saturating_sub(1));
     let hint = if doc_focused {
         "  ↑↓ scroll · esc back"
+    } else if actions.get(sel) == Some(&PlanAction::Priority) {
+        "  ↑↓ move · ←→ ␣ change · PgUp/PgDn ±100 · esc back"
     } else {
         "  ↑↓ move · ⏎ select · esc back"
     };
@@ -2002,9 +2008,44 @@ const DOC_HINT: &str = "↑↓ scroll";
 
 /// The text for one plan-action button: hotkey, label, explanation.
 /// Explanations say what the action DOES — never what a later screen
-/// will show.
-fn plan_action_row(a: PlanAction) -> (&'static str, &'static str, &'static str) {
+/// will show. The priority row is a VALUE control, so its label
+/// carries the value and its "key" is the change keys.
+fn plan_action_row(
+    a: PlanAction,
+    st: super::input::PlanPageState,
+) -> (&'static str, String, &'static str) {
+    let (key, label, desc) = match a {
+        PlanAction::Priority => {
+            let priority = match st {
+                super::input::PlanPageState::Queued { priority } => priority,
+                _ => 0,
+            };
+            return (
+                "←→",
+                format!("priority ◂ {priority:03} ▸"),
+                "lower runs sooner; ←→ by 10, PgUp/PgDn by 100",
+            );
+        }
+        PlanAction::Unqueue => (
+            "u",
+            "unqueue…",
+            "move it back to .clank/drafts/, out of the queue",
+        ),
+        PlanAction::Promote => (
+            "p",
+            "promote…",
+            "make it the active plan: commits the intro, starts the review cycle",
+        ),
+        other => plan_button_row(other),
+    };
+    (key, label.to_string(), desc)
+}
+
+fn plan_button_row(a: PlanAction) -> (&'static str, &'static str, &'static str) {
     match a {
+        PlanAction::Priority | PlanAction::Unqueue | PlanAction::Promote => {
+            unreachable!("named by plan_action_row")
+        }
         PlanAction::OpenHtml => ("o", "open in browser", "the plan's html page with feedback"),
         PlanAction::Stash => (
             "s",
@@ -2090,7 +2131,11 @@ pub(super) fn render_roster_confirm(
             .get(idx)
             .map(|a| format!("{} [{}]", a.label, a.tool))
             .unwrap_or_else(|| "?".to_string()),
-        ConfirmAction::StashPlan | ConfirmAction::PurgeArtifacts | ConfirmAction::PurgeDrop => {
+        ConfirmAction::StashPlan
+        | ConfirmAction::UnqueuePlan
+        | ConfirmAction::PromotePlan
+        | ConfirmAction::PurgeArtifacts
+        | ConfirmAction::PurgeDrop => {
             unreachable!("plan confirmations render through render_plan_confirm")
         }
     };
@@ -2104,7 +2149,11 @@ pub(super) fn render_roster_confirm(
             format!("remove reviewer `{target}`?"),
             "removes this agent from the local roster in .clank/config.json",
         ),
-        ConfirmAction::StashPlan | ConfirmAction::PurgeArtifacts | ConfirmAction::PurgeDrop => {
+        ConfirmAction::StashPlan
+        | ConfirmAction::UnqueuePlan
+        | ConfirmAction::PromotePlan
+        | ConfirmAction::PurgeArtifacts
+        | ConfirmAction::PurgeDrop => {
             unreachable!("plan confirmations render through render_plan_confirm")
         }
     };
@@ -2150,6 +2199,19 @@ pub(super) fn render_plan_confirm(
             "its commits are set aside on a protective ref; `clank stash pop` restores them"
                 .to_string(),
         ),
+        ConfirmAction::UnqueuePlan => (
+            format!("unqueue `{stem}`?"),
+            format!(
+                "moves it out of the queue to .clank/drafts/{stem}.md; `clank queue add {stem}` \
+                 puts it back"
+            ),
+        ),
+        ConfirmAction::PromotePlan => (
+            format!("promote `{stem}`?"),
+            "moves it into plans/ and COMMITS the intro — the review cycle starts on the \
+             reviewers' next wake"
+                .to_string(),
+        ),
         ConfirmAction::PurgeArtifacts => (
             format!("PURGE `{stem}` — rewrite history?"),
             "strips the plan's .clank/ files from history; implementation commits stay;              rewrites this branch in place"
@@ -2166,8 +2228,10 @@ pub(super) fn render_plan_confirm(
     out.push(region_rule(&format!("confirm · {stem}"), "", true, cols));
     out.push(String::new());
     let banner_color = match action {
-        ConfirmAction::StashPlan => "7", // reverse, uncolored
-        _ => "1;41;97",                  // bold white on red — the scary one
+        // Reverse, uncolored: reversible or ordinary. Red is for the
+        // history rewrites.
+        ConfirmAction::StashPlan | ConfirmAction::UnqueuePlan | ConfirmAction::PromotePlan => "7",
+        _ => "1;41;97", // bold white on red — the scary one
     };
     out.push(emit(
         &[colored(banner_color, format!(" {title} "))],
@@ -2441,6 +2505,7 @@ mod tests {
         super::super::input::PlanPage {
             stem: "my-plan".into(),
             st,
+            entry: None,
             body: Some("# my-plan\n\nThe document body rendered inline.\n".into()),
             scroll: 0,
         }
@@ -2448,11 +2513,7 @@ mod tests {
 
     #[test]
     fn plan_detail_renders_buttons_then_the_document() {
-        let st = crate::cli::status_tui::input::PlanPageState {
-            finished: false,
-            multi_commit: true,
-            repo_paused: false,
-        };
+        let st = crate::cli::status_tui::input::PlanPageState::Active { repo_paused: false };
         let pp = page(st);
         let actions = plan_actions(st);
         let (lines, total) = render_plan_detail(&pp, &actions, 1, 40, 90);
@@ -2499,11 +2560,7 @@ mod tests {
 
     #[test]
     fn plan_detail_wraps_explanations_and_scrolls_the_body() {
-        let st = crate::cli::status_tui::input::PlanPageState {
-            finished: false,
-            multi_commit: true,
-            repo_paused: false,
-        };
+        let st = crate::cli::status_tui::input::PlanPageState::Active { repo_paused: false };
         // Narrow pane: the purge explanation must WRAP, never clip.
         let pp = page(st);
         let actions = plan_actions(st);
@@ -2541,11 +2598,7 @@ mod tests {
         // the choice keys on the SAME clamped offset as the window, so
         // an over-scroll that clamps back to 0 stays FLAT
         // (plan-page-document-scroll-like-log).
-        let st = crate::cli::status_tui::input::PlanPageState {
-            finished: false,
-            multi_commit: true,
-            repo_paused: false,
-        };
+        let st = crate::cli::status_tui::input::PlanPageState::Active { repo_paused: false };
         let cols = 90;
         let mut pp = page(st);
         pp.body = Some("p1\n\np2\n\np3\n\np4\n\np5\n\np6\n\np7\n".into());
@@ -2580,11 +2633,7 @@ mod tests {
         // it never showed while a button had focus. Before this the
         // last button stayed lit for the whole read
         // (the-plan-page-cursor-enters-the-document).
-        let st = crate::cli::status_tui::input::PlanPageState {
-            finished: false,
-            multi_commit: true,
-            repo_paused: false,
-        };
+        let st = crate::cli::status_tui::input::PlanPageState::Active { repo_paused: false };
         let cols = 90;
         let mut pp = page(st);
         pp.body = Some("p1\n\np2\n\np3\n\np4\n\np5\n\np6\n\np7\n".into());
@@ -2635,13 +2684,41 @@ mod tests {
         );
     }
 
+    /// The queued state on the SAME page: the title says queue and
+    /// carries the priority, the buttons are the queued set with the
+    /// priority as a value row, and the document renders beneath.
+    #[test]
+    fn a_queued_plan_renders_on_the_plan_page() {
+        let st = crate::cli::status_tui::input::PlanPageState::Queued { priority: 500 };
+        let mut pp = page(st);
+        pp.body = Some("# queued\n\nThe queued body.\n".into());
+        let actions = plan_actions(st);
+        let (lines, _) = render_plan_detail(&pp, &actions, 1, 40, 90);
+        let text = lines.join("\n");
+        assert!(text.contains("QUEUE · MY-PLAN"), "{text}");
+        assert!(
+            text.contains("priority 500"),
+            "the rule carries the priority: {text}"
+        );
+        assert!(text.contains("open in browser"));
+        assert!(text.contains("priority ◂ 500 ▸"), "{text}");
+        assert!(text.contains("unqueue…"));
+        assert!(text.contains("promote…"));
+        assert!(
+            !text.contains("stash…") && !text.contains("purge…"),
+            "{text}"
+        );
+        assert!(text.contains("The queued body."), "{text}");
+        assert!(
+            lines.last().unwrap().contains("←→ ␣ change"),
+            "the value row's hint: {:?}",
+            lines.last()
+        );
+    }
+
     #[test]
     fn plan_detail_buttons_are_contiguous() {
-        let st = crate::cli::status_tui::input::PlanPageState {
-            finished: false,
-            multi_commit: true,
-            repo_paused: false,
-        };
+        let st = crate::cli::status_tui::input::PlanPageState::Active { repo_paused: false };
         let pp = page(st);
         let actions = plan_actions(st);
         let (lines, _) = render_plan_detail(&pp, &actions, 0, 40, 90);
@@ -2665,11 +2742,7 @@ mod tests {
         // overlay pattern); the returned virtual height must account for
         // the pinned hint row or the last line stays one step out of
         // reach (codex 9452520).
-        let st = crate::cli::status_tui::input::PlanPageState {
-            finished: false,
-            multi_commit: true,
-            repo_paused: false,
-        };
+        let st = crate::cli::status_tui::input::PlanPageState::Active { repo_paused: false };
         let mut pp = page(st);
         pp.body = Some("p1\n\np2\n\np3\n\np4\n\np5\n\nfinal-line\n".into());
         let actions = plan_actions(st);
@@ -4510,10 +4583,12 @@ mod tests {
             crate::cli::status::QueueItemView {
                 priority: 100,
                 name: "urgent-fix".into(),
+                path: std::path::PathBuf::new(),
             },
             crate::cli::status::QueueItemView {
                 priority: 800,
                 name: "later-idea".into(),
+                path: std::path::PathBuf::new(),
             },
         ];
         // sel 3 = first queue row (0-1 agents, 2 "+ add").
@@ -4592,6 +4667,7 @@ mod tests {
         s.queue = vec![crate::cli::status::QueueItemView {
             priority: 500,
             name: "queued-idea".into(),
+            path: std::path::PathBuf::new(),
         }];
         let out = render_at(
             &s,
@@ -5057,6 +5133,7 @@ mod tests {
         s.queue = vec![crate::cli::status::QueueItemView {
             priority: 500,
             name: "queued-plan".to_string(),
+            path: std::path::PathBuf::new(),
         }];
         s.ad_hoc = vec![clank_core::wait::AdHocWorkState {
             sha: crate::lifecycle::CommitSha::parse(&format!("{:b<40}", "abc123")).unwrap(),

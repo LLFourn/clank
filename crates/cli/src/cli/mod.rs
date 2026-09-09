@@ -1334,6 +1334,14 @@ pub enum QueueCmd {
     /// Change a queued item's priority (renames its `NNN-` prefix).
     #[command(alias = "reprioritize")]
     Reprioritise(QueueReprioritiseArgs),
+    /// Take an item out of the queue and back to `.clank/drafts/<name>.md`
+    /// — the inverse of `add`. `remove` deletes; this keeps the body.
+    Unqueue(QueueUnqueueArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct QueueUnqueueArgs {
+    pub name: String,
 }
 
 #[derive(Args, Debug)]

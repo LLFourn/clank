@@ -96,6 +96,7 @@ pub(crate) fn snap(plans: Vec<PlanWorkState>, queue: Vec<&str>) -> StatusSnapsho
             .map(|name| crate::cli::status::QueueItemView {
                 priority: 500,
                 name: name.to_string(),
+                path: std::path::PathBuf::from(format!("/r/.clank/queue/500-{name}.md")),
             })
             .collect(),
         master: Some("claude".into()),

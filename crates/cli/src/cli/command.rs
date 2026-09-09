@@ -377,6 +377,18 @@ mod tests {
     }
 
     #[test]
+    fn queue_unqueue_parses() {
+        let parsed = Cli::try_parse_from(["clank", "queue", "unqueue", "foo"]).unwrap();
+        let Command::Queue(q) = parsed.command else {
+            panic!("expected queue");
+        };
+        assert!(matches!(
+            q.command,
+            Some(crate::cli::QueueCmd::Unqueue(crate::cli::QueueUnqueueArgs { ref name })) if name == "foo"
+        ));
+    }
+
+    #[test]
     fn wait_command_parses() {
         assert!(matches!(
             Cli::try_parse_from(["clank", "wait"]).unwrap().command,

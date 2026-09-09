@@ -239,23 +239,48 @@ pub(super) enum PlanAction {
     Squash,
     /// The danger door: opens the purge chooser (artifacts vs drop).
     Purge,
+    /// A queued plan's priority — a VALUE row, changed in place with
+    /// ←/→ (±10) and PgUp/PgDn (±100), never activated.
+    Priority,
+    /// Move a queued plan back to `.clank/drafts/` — behind a confirm.
+    Unqueue,
+    /// `queue promote` a queued plan — behind a confirm: it commits.
+    Promote,
     /// Leave the page.
     Back,
 }
 
-/// Facts of the plan the page needs, derived by the loop from the
-/// snapshot + log sequence (pure inputs, so row derivation is
-/// unit-testable).
+/// The lifecycle the page OPENED on, with the facts that state's
+/// actions need — derived by the loop from the snapshot (pure inputs,
+/// so row derivation is unit-testable).
+///
+/// The variant is also the page's SOURCE: a refresh re-reads a queued
+/// page from the queue and an active/finished one from the plans, and
+/// never crosses. A queue entry may share a stem with an active plan
+/// (`queue add` allows it; only `promote` refuses), so the stem alone
+/// cannot say which the page is showing (a-queued-plan-has-a-page).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct PlanPageState {
-    pub finished: bool,
-    /// The plan's range still spans >1 commit (squash is pointless on
-    /// an already-collapsed plan).
-    pub multi_commit: bool,
-    /// The repo is paused by an unanswered block. Repo state, not the
-    /// plan's — shown on this page only to explain why an active plan
-    /// is not progressing. Pausing is driven by the global `b` key.
-    pub repo_paused: bool,
+pub(super) enum PlanPageState {
+    /// Not started: a `.clank/queue/NNN-<name>.md` entry.
+    Queued { priority: u16 },
+    Active {
+        /// The repo is paused by an unanswered block. Repo state, not
+        /// the plan's — shown on this page only to explain why an
+        /// active plan is not progressing. Pausing is driven by the
+        /// global `b` key.
+        repo_paused: bool,
+    },
+    Finished {
+        /// The plan's range still spans >1 commit (squash is pointless
+        /// on an already-collapsed plan).
+        multi_commit: bool,
+    },
+}
+
+impl PlanPageState {
+    pub(super) fn is_queued(self) -> bool {
+        matches!(self, PlanPageState::Queued { .. })
+    }
 }
 
 /// The page's rows for a plan state, in display order. Inapplicable
@@ -265,33 +290,36 @@ pub(super) struct PlanPageState {
 pub(super) fn plan_actions(st: PlanPageState) -> Vec<PlanAction> {
     use PlanAction::*;
     let mut v = vec![OpenHtml];
-    if st.finished {
-        if st.multi_commit {
-            v.push(Squash);
+    match st {
+        PlanPageState::Queued { .. } => v.extend([Priority, Unqueue, Promote]),
+        PlanPageState::Active { .. } => v.extend([Stash, ForceFinish, Purge]),
+        PlanPageState::Finished { multi_commit } => {
+            if multi_commit {
+                v.push(Squash);
+            }
+            v.push(Purge);
         }
-    } else {
-        v.push(Stash);
-        v.push(ForceFinish);
     }
-    v.push(Purge);
     v.push(Back);
     v
 }
 
 /// The plan page's direct hotkey for a key, if that action is present
 /// on this page. `s` stash · `f` force-finish · `c` squash (collapse) ·
-/// `b` block/unblock · `p` purge · `o` html — `q` stays global quit.
+/// `p` purge, or promote on a queued page (the two never share a
+/// page) · `u` unqueue · `o` html — `q` stays global quit.
 pub(super) fn plan_hotkey(key: Key, actions: &[PlanAction]) -> Option<PlanAction> {
     use PlanAction::*;
-    let want = match key {
-        Key::Html => OpenHtml,
-        Key::Char(b's') => Stash,
-        Key::Char(b'f') => ForceFinish,
-        Key::Char(b'c') => Squash,
-        Key::Char(b'p') => Purge,
+    let wants: &[PlanAction] = match key {
+        Key::Html => &[OpenHtml],
+        Key::Char(b's') => &[Stash],
+        Key::Char(b'f') => &[ForceFinish],
+        Key::Char(b'c') => &[Squash],
+        Key::Char(b'p') => &[Purge, Promote],
+        Key::Char(b'u') => &[Unqueue],
         _ => return None,
     };
-    actions.contains(&want).then_some(want)
+    wants.iter().copied().find(|w| actions.contains(w))
 }
 
 /// One keypress on the plan page → what the loop should do.
@@ -299,6 +327,9 @@ pub(super) fn plan_hotkey(key: Key, actions: &[PlanAction]) -> Option<PlanAction
 pub(super) enum PlanNav {
     Sel(usize),
     Act(PlanAction),
+    /// Change the queued plan's priority by `delta`; the loop clamps to
+    /// 0–999 and writes through `queue::set_priority`.
+    Priority(i32),
     /// Scroll the plan-document body below the buttons (↑↓ stay on
     /// button selection; paging keys own the document).
     Scroll(i32),
@@ -318,7 +349,16 @@ pub(super) fn plan_detail_nav(
     }
     let page = page as i32;
     let doc = document_focus(actions);
+    // The priority row is a VALUE, not a button: the change keys act on
+    // it in place, paging keys step it by 100, and Enter has nothing
+    // to activate. Everywhere else those keys keep their page meaning.
+    let on_value = actions.get(sel) == Some(&PlanAction::Priority);
     match key {
+        Key::Left if on_value => PlanNav::Priority(-10),
+        Key::Right | Key::Space if on_value => PlanNav::Priority(10),
+        Key::PageUp if on_value => PlanNav::Priority(-100),
+        Key::PageDown if on_value => PlanNav::Priority(100),
+        Key::Enter if on_value => PlanNav::None,
         // The options→document crossing mirrors the panel↔log model:
         // ↓ walks the buttons, then moves FOCUS into the document —
         // where no button is highlighted and Enter has no target —
@@ -337,6 +377,38 @@ pub(super) fn plan_detail_nav(
         Key::Escape => PlanNav::Back,
         _ => PlanNav::None,
     }
+}
+
+/// The queue entry a queued page means, among `items` keyed as
+/// `(name, path)`.
+///
+/// The entry's identity is its FILE. The parse is lenient — `foo.md`,
+/// `1-foo.md`, `001-foo.md`, `100-foo.md` all read as name `foo`,
+/// the first three even as one priority — and `scan_queue` keeps
+/// every file, so nothing parsed from the name can tell two entries
+/// apart: only the path can. The exact path wins; when it is gone
+/// (renamed from a shell while the page was open) the name is
+/// followed only if it is now UNAMBIGUOUS, and two survivors close
+/// the page rather than guess (codex on 2b35cb8, 791a448).
+pub(super) fn resolve_queued<'a, T>(
+    items: &'a [T],
+    name: &str,
+    path: &std::path::Path,
+    key: impl Fn(&T) -> (&str, &std::path::Path),
+) -> Option<&'a T> {
+    if let Some(exact) = items.iter().find(|i| key(i).1 == path) {
+        return Some(exact);
+    }
+    let mut same_name = items.iter().filter(|i| key(i).0 == name);
+    let only = same_name.next()?;
+    same_name.next().is_none().then_some(only)
+}
+
+/// A queued plan's next priority after a value-row keystroke: the
+/// range is the queue's own (`000`–`999` file prefixes), so the ends
+/// absorb rather than wrap or error.
+pub(super) fn next_priority(current: u16, delta: i32) -> u16 {
+    (i32::from(current) + delta).clamp(0, 999) as u16
 }
 
 /// The plan page's cursor position for the DOCUMENT: one past the
@@ -827,6 +899,10 @@ pub(super) enum ConfirmAction {
     RemoveAgent { idx: usize },
     /// `stash push` the open plan page's plan.
     StashPlan,
+    /// Move the open (queued) plan page's item back to drafts.
+    UnqueuePlan,
+    /// `queue promote` the open (queued) plan page's item.
+    PromotePlan,
     /// `purge` (artifacts only) the open plan page's plan.
     PurgeArtifacts,
     /// `purge --drop` the open plan page's plan — the scariest one.
@@ -851,7 +927,11 @@ impl ConfirmAction {
     pub(super) fn is_plan_page(self) -> bool {
         matches!(
             self,
-            ConfirmAction::StashPlan | ConfirmAction::PurgeArtifacts | ConfirmAction::PurgeDrop
+            ConfirmAction::StashPlan
+                | ConfirmAction::UnqueuePlan
+                | ConfirmAction::PromotePlan
+                | ConfirmAction::PurgeArtifacts
+                | ConfirmAction::PurgeDrop
         )
     }
 }
@@ -1193,6 +1273,10 @@ pub(super) fn event_detail_nav(
 pub(super) struct PlanPage {
     pub(super) stem: String,
     pub(super) st: PlanPageState,
+    /// A queued page's entry, by FILE — see [`resolve_queued`]. `None`
+    /// on an active/finished page. Replaced by what `set_priority`
+    /// returns after a rename from the page.
+    pub(super) entry: Option<std::path::PathBuf>,
     /// The plan document's markdown, read once when the page opens
     /// (and on refresh) — rendered beneath the buttons. `None` when the
     /// file is unreadable.
@@ -1273,21 +1357,14 @@ pub(super) enum PanelAction {
     OpenWait(usize),
     /// Open the add picker (Enter/Space on the "+ add" row).
     OpenPicker,
-    /// Open a queued plan's read overlay (Enter on a queue row).
+    /// Open a queued plan's page (Enter on a queue row) — the plan page
+    /// in its queued state; every other queue action lives there.
     OpenQueueItem(usize),
-    /// Open a queued plan's HTML page in the browser (`o` on a queue row).
-    OpenQueueHtml(usize),
     /// Open a stashed plan's read overlay (Enter on a STASH row) — the
     /// body comes from the record's protective ref.
     OpenStashItem(usize),
     /// Open a stashed plan's HTML page in the browser (`o` on a STASH row).
     OpenStashHtml(usize),
-    /// Nudge a queue row's priority by `delta` (+/- on a queue row); the
-    /// loop clamps to 0-999 and writes through `queue::set_priority`.
-    NudgeQueue {
-        idx: usize,
-        delta: i16,
-    },
 }
 
 /// Pure key routing for the agent panel. `agents` is the roster; the
@@ -1351,10 +1428,6 @@ pub(super) fn agent_panel_action(sel: usize, rows: &[PanelRow], key: Key) -> Pan
         Some(PanelRow::Stash(i)) => Some(i),
         _ => None,
     };
-    let queue_idx = match here {
-        Some(PanelRow::Queue(q)) => Some(q),
-        _ => None,
-    };
     let on_last = sel + 1 == total;
     match key {
         Key::Quit => PanelAction::Quit,
@@ -1364,10 +1437,10 @@ pub(super) fn agent_panel_action(sel: usize, rows: &[PanelRow], key: Key) -> Pan
         // navigation across the panel↔log boundary.
         Key::Down if on_last => PanelAction::EnterLog,
         Key::Down => PanelAction::MoveCursor(move_selection(sel, total, true)),
-        // Enter activates the row: the picker on "+ add", a read overlay
+        // Enter activates the row: the picker on "+ add", the plan page
         // on a queue row, the detail page on an agent. Space is the quick
         // inline auto-toggle (or the picker on "+ add"); it does nothing
-        // on a queue row (no accidental overlay).
+        // on a queue row (no accidental page).
         Key::Enter if on_add => PanelAction::OpenPicker,
         Key::Enter => match here {
             Some(PanelRow::Stash(i)) => PanelAction::OpenStashItem(i),
@@ -1376,18 +1449,12 @@ pub(super) fn agent_panel_action(sel: usize, rows: &[PanelRow], key: Key) -> Pan
             Some(PanelRow::Wait(i)) => PanelAction::OpenWait(i),
             _ => PanelAction::None,
         },
-        Key::Html => match (stash_idx, queue_idx) {
-            (Some(i), _) => PanelAction::OpenStashHtml(i),
-            (_, Some(q)) => PanelAction::OpenQueueHtml(q),
-            _ => PanelAction::None,
-        },
-        Key::Plus if queue_idx.is_some() => PanelAction::NudgeQueue {
-            idx: queue_idx.unwrap(),
-            delta: 50,
-        },
-        Key::Minus if queue_idx.is_some() => PanelAction::NudgeQueue {
-            idx: queue_idx.unwrap(),
-            delta: -50,
+        // A queue row answers Enter and nothing else: its actions —
+        // open, priority, unqueue, promote — are on its page, where
+        // they are visible (a-queued-plan-has-a-page).
+        Key::Html => match stash_idx {
+            Some(i) => PanelAction::OpenStashHtml(i),
+            None => PanelAction::None,
         },
         Key::Space if on_add => PanelAction::OpenPicker,
         // Space is the agent's inline auto-toggle and belongs to no
@@ -1770,11 +1837,7 @@ mod tests {
     // ── tui-plan-actions-page: row derivation + routing ──
 
     fn active_st() -> PlanPageState {
-        PlanPageState {
-            finished: false,
-            multi_commit: true,
-            repo_paused: false,
-        }
+        PlanPageState::Active { repo_paused: false }
     }
 
     #[test]
@@ -1790,26 +1853,18 @@ mod tests {
     fn a_paused_repo_adds_no_row_to_the_plan_page() {
         // Pause is repo state driven by the global `b`; the plan page
         // must not grow a per-plan block toggle again.
-        let st = PlanPageState {
-            repo_paused: true,
-            ..active_st()
-        };
+        let st = PlanPageState::Active { repo_paused: true };
         assert_eq!(plan_actions(st), plan_actions(active_st()));
     }
 
     #[test]
     fn plan_actions_finished_page_swaps_the_middle_block_for_squash() {
         use PlanAction::*;
-        let st = PlanPageState {
-            finished: true,
-            multi_commit: true,
-            repo_paused: false,
-        };
+        let st = PlanPageState::Finished { multi_commit: true };
         assert_eq!(plan_actions(st), vec![OpenHtml, Squash, Purge, Back]);
         // Already-collapsed plan: nothing to squash — the row is absent.
-        let one = PlanPageState {
+        let one = PlanPageState::Finished {
             multi_commit: false,
-            ..st
         };
         assert!(!plan_actions(one).contains(&Squash));
     }
@@ -1832,17 +1887,143 @@ mod tests {
             None,
             "`b` is global pause, never a plan-page row"
         );
-        let finished = plan_actions(PlanPageState {
-            finished: true,
-            multi_commit: true,
-            repo_paused: false,
-        });
+        let finished = plan_actions(PlanPageState::Finished { multi_commit: true });
         assert_eq!(plan_hotkey(Key::Char(b'c'), &finished), Some(Squash));
         assert_eq!(
             plan_hotkey(Key::Char(b's'), &finished),
             None,
             "no stash on finished"
         );
+    }
+
+    // ── a-queued-plan-has-a-page: the queued state of the same page ──
+
+    #[test]
+    fn plan_actions_queued_page_has_priority_unqueue_and_promote() {
+        use PlanAction::*;
+        assert_eq!(
+            plan_actions(PlanPageState::Queued { priority: 500 }),
+            vec![OpenHtml, Priority, Unqueue, Promote, Back]
+        );
+        // The active and finished lists are what they were.
+        assert_eq!(
+            plan_actions(active_st()),
+            vec![OpenHtml, Stash, ForceFinish, Purge, Back]
+        );
+        assert_eq!(
+            plan_actions(PlanPageState::Finished { multi_commit: true }),
+            vec![OpenHtml, Squash, Purge, Back]
+        );
+    }
+
+    /// `u` and `p` are hotkeys from any row; `p` is purge on a plan
+    /// page and promote on a queued one, which never share a page.
+    #[test]
+    fn queued_page_hotkeys() {
+        use PlanAction::*;
+        let queued = plan_actions(PlanPageState::Queued { priority: 500 });
+        assert_eq!(plan_hotkey(Key::Char(b'u'), &queued), Some(Unqueue));
+        assert_eq!(plan_hotkey(Key::Char(b'p'), &queued), Some(Promote));
+        assert_eq!(plan_hotkey(Key::Html, &queued), Some(OpenHtml));
+        assert_eq!(
+            plan_hotkey(Key::Char(b's'), &queued),
+            None,
+            "no stash to hit"
+        );
+        let active = plan_actions(active_st());
+        assert_eq!(plan_hotkey(Key::Char(b'p'), &active), Some(Purge));
+        assert_eq!(plan_hotkey(Key::Char(b'u'), &active), None);
+    }
+
+    /// The priority row is a VALUE: the change keys act on it in
+    /// place and Enter has nothing to activate; on every other row the
+    /// paging keys keep scrolling the document.
+    #[test]
+    fn the_priority_row_is_a_value_control() {
+        let actions = plan_actions(PlanPageState::Queued { priority: 500 });
+        let prio = actions
+            .iter()
+            .position(|a| *a == PlanAction::Priority)
+            .unwrap();
+        assert_eq!(
+            plan_detail_nav(prio, &actions, Key::Right, 10, 0),
+            PlanNav::Priority(10)
+        );
+        assert_eq!(
+            plan_detail_nav(prio, &actions, Key::Space, 10, 0),
+            PlanNav::Priority(10)
+        );
+        assert_eq!(
+            plan_detail_nav(prio, &actions, Key::Left, 10, 0),
+            PlanNav::Priority(-10)
+        );
+        assert_eq!(
+            plan_detail_nav(prio, &actions, Key::PageDown, 10, 0),
+            PlanNav::Priority(100)
+        );
+        assert_eq!(
+            plan_detail_nav(prio, &actions, Key::PageUp, 10, 0),
+            PlanNav::Priority(-100)
+        );
+        assert_eq!(
+            plan_detail_nav(prio, &actions, Key::Enter, 10, 0),
+            PlanNav::None,
+            "a value activates nothing"
+        );
+        // The ends absorb: 999 stays 999, 0 stays 0.
+        assert_eq!(next_priority(995, 10), 999);
+        assert_eq!(next_priority(999, 100), 999);
+        assert_eq!(next_priority(5, -10), 0);
+        assert_eq!(next_priority(500, -100), 400);
+        // Off the value row the keys mean what they always did.
+        assert_eq!(
+            plan_detail_nav(0, &actions, Key::PageDown, 10, 0),
+            PlanNav::Scroll(10)
+        );
+        assert_eq!(
+            plan_detail_nav(0, &actions, Key::Left, 10, 0),
+            PlanNav::None
+        );
+        assert_eq!(
+            plan_detail_nav(0, &actions, Key::Enter, 10, 0),
+            PlanNav::Act(PlanAction::OpenHtml)
+        );
+        let unq = actions
+            .iter()
+            .position(|a| *a == PlanAction::Unqueue)
+            .unwrap();
+        assert_eq!(
+            plan_detail_nav(unq, &actions, Key::Enter, 10, 0),
+            PlanNav::Act(PlanAction::Unqueue)
+        );
+    }
+
+    /// Two queue files parsing to one name — even one priority — are
+    /// two entries; a page means exactly the file it opened, follows a
+    /// lone rename, and closes rather than guess between survivors.
+    #[test]
+    fn a_queued_page_resolves_its_own_entry_among_duplicates() {
+        use std::path::{Path, PathBuf};
+        // Three files, two of which parse to the same name AND
+        // priority (the lenient parse): only the file tells them apart.
+        let items = [
+            ("foo".to_string(), PathBuf::from("/q/foo.md")),
+            ("foo".to_string(), PathBuf::from("/q/999-foo.md")),
+            ("bar".to_string(), PathBuf::from("/q/200-bar.md")),
+        ];
+        fn key(i: &(String, PathBuf)) -> (&str, &Path) {
+            (i.0.as_str(), i.1.as_path())
+        }
+        let at = |name: &str, path: &str| {
+            resolve_queued(&items, name, Path::new(path), key).map(|i| i.1.to_str().unwrap())
+        };
+        assert_eq!(at("foo", "/q/999-foo.md"), Some("/q/999-foo.md"));
+        assert_eq!(at("foo", "/q/foo.md"), Some("/q/foo.md"));
+        // Exact gone, name ambiguous: no guess.
+        assert_eq!(at("foo", "/q/300-foo.md"), None);
+        // Exact gone, name unique: the rename is followed.
+        assert_eq!(at("bar", "/q/900-bar.md"), Some("/q/200-bar.md"));
+        assert_eq!(at("nope", "/q/001-nope.md"), None);
     }
 
     #[test]
@@ -1941,11 +2122,7 @@ mod tests {
     fn plan_sel_rebinds_by_action_across_a_finish() {
         use PlanAction::*;
         let active = plan_actions(active_st());
-        let finished = plan_actions(PlanPageState {
-            finished: true,
-            multi_commit: true,
-            repo_paused: false,
-        });
+        let finished = plan_actions(PlanPageState::Finished { multi_commit: true });
         assert_eq!(active, vec![OpenHtml, Stash, ForceFinish, Purge, Back]);
         assert_eq!(finished, vec![OpenHtml, Squash, Purge, Back]);
         let at = |list: &[PlanAction], a: PlanAction| list.iter().position(|x| *x == a).unwrap();
@@ -2719,31 +2896,21 @@ mod tests {
         ];
         // Rows: 0-1 agents, 2 "+ add", 3-4 the two queue rows.
         let ql = 2;
-        // Enter on a queue row reads it; `o` opens its HTML page.
+        // Enter on a queue row opens its page; every other action lives
+        // there, so `o`, `+`, `-` and Space are inert on the row
+        // (a-queued-plan-has-a-page).
         assert_eq!(
             agent_panel_action(3, &panel_rows(agents.len(), &[], 0, ql), Key::Enter),
             PanelAction::OpenQueueItem(0)
         );
-        assert_eq!(
-            agent_panel_action(4, &panel_rows(agents.len(), &[], 0, ql), Key::Html),
-            PanelAction::OpenQueueHtml(1)
-        );
-        // +/- nudge the priority number by 50 (loop clamps + persists via
-        // queue::set_priority).
-        assert_eq!(
-            agent_panel_action(3, &panel_rows(agents.len(), &[], 0, ql), Key::Plus),
-            PanelAction::NudgeQueue { idx: 0, delta: 50 }
-        );
-        assert_eq!(
-            agent_panel_action(3, &panel_rows(agents.len(), &[], 0, ql), Key::Minus),
-            PanelAction::NudgeQueue { idx: 0, delta: -50 }
-        );
-        // Space on a queue row is inert (no accidental overlay); `o` on an
-        // agent row is inert too.
-        assert_eq!(
-            agent_panel_action(3, &panel_rows(agents.len(), &[], 0, ql), Key::Space),
-            PanelAction::None
-        );
+        for key in [Key::Html, Key::Plus, Key::Minus, Key::Space] {
+            assert_eq!(
+                agent_panel_action(4, &panel_rows(agents.len(), &[], 0, ql), key),
+                PanelAction::None,
+                "{key:?} does nothing on a queue row"
+            );
+        }
+        // `o` on an agent row is inert too.
         assert_eq!(
             agent_panel_action(1, &panel_rows(agents.len(), &[], 0, ql), Key::Html),
             PanelAction::None
