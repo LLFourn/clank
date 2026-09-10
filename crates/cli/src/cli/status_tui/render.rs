@@ -935,7 +935,7 @@ fn age_gutter(row: &crate::cli::log::OnelineRow, width: usize) -> Span {
     }
     let age = row_age(row).unwrap_or_default();
     let pad = width.saturating_sub(display_width(&age));
-    dim(format!("{}{age}  ", " ".repeat(pad)))
+    dim(format!("{}{age} ", " ".repeat(pad)))
 }
 
 /// An event's age at the coarse resolution the pane's idle repaint
@@ -3537,7 +3537,7 @@ mod tests {
         // Each row now ends with its age in the pane's time column, so
         // the subject is read out of the row, not off its end.
         assert!(
-            texts[5].starts_with("1h  ") && texts[5].ends_with("e5"),
+            texts[5].starts_with("1h ") && texts[5].ends_with("e5"),
             "most recent at the TOP of the log: {texts:?}"
         );
         assert!(texts[6].contains("e4"), "got {texts:?}");
@@ -3601,7 +3601,7 @@ mod tests {
             // marker gutter and the sha (adhoc-commit-marker).
             texts
                 .iter()
-                .any(|t| t.starts_with("1h  ") && t.contains("  abc1234 intro")),
+                .any(|t| t.starts_with("1h ") && t.contains("  abc1234 intro")),
             "commit indented under its age: {texts:?}"
         );
         let raw = lines.join("");
@@ -5393,12 +5393,12 @@ mod tests {
         // `20m` is the widest age here, so the gutter is 3 columns.
         let commit = visible(line_with(&out, "do a thing"));
         assert!(
-            commit.starts_with(" 2d  ") && commit.contains("abc1234 do a thing"),
+            commit.starts_with(" 2d ") && commit.contains("abc1234 do a thing"),
             "the commit's age leads: {commit:?}"
         );
         let review = visible(line_with(&out, "lgtm"));
         assert!(
-            review.starts_with("20m  "),
+            review.starts_with("20m "),
             "the review's, from its file's write time: {review:?}"
         );
         assert!(
@@ -5416,11 +5416,11 @@ mod tests {
         let out = render(&s, 40, 80);
         let review = visible(line_with(&out, "lgtm"));
         assert!(
-            review.starts_with("     ") && review.ends_with("lgtm"),
+            review.starts_with("    ") && review.ends_with("lgtm"),
             "no clock, blank gutter: {review:?}"
         );
         assert!(
-            visible(line_with(&out, "do a thing")).starts_with("2d  "),
+            visible(line_with(&out, "do a thing")).starts_with("2d "),
             "and the gutter narrows to the widest age left"
         );
     }
@@ -5440,7 +5440,7 @@ mod tests {
             marker: crate::cli::log::RowMarker::Plain,
         }];
         let wide = visible(line_with(&render(&s, 40, 80), "a subject"));
-        assert!(wide.starts_with("2d  ") && wide.ends_with("a subject of some length"));
+        assert!(wide.starts_with("2d ") && wide.ends_with("a subject of some length"));
         let narrow = visible(line_with(&render(&s, 40, 24), "a subject"));
         assert!(
             narrow.starts_with("2d  "),
