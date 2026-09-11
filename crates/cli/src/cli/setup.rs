@@ -319,13 +319,16 @@ pub async fn run(args: SetupArgs) -> anyhow::Result<()> {
     // ONE probe drives the skills AND the hook entries — the
     // installed teaching and the installed loop cannot disagree.
     let claude_async = probe_claude_asyncrewake() == Some(true);
+    let mut manifest = load_manifest(&home);
     for asset in user_asset_inventory(claude_async) {
         install_skill(
-            &home.join(&asset.rel),
+            &home,
+            &asset.rel,
             &asset.expected,
             &asset.canonical_alternates,
             args.force,
             args.dry_run,
+            &mut manifest,
             &mut summary,
         )?;
     }
@@ -409,44 +412,148 @@ fn home_dir() -> anyhow::Result<PathBuf> {
         .ok_or_else(|| anyhow::anyhow!("HOME env var is unset; cannot locate user config dirs"))
 }
 
+/// Provenance for setup-owned files: each installed relative path
+/// mapped to the blake3 of the content setup last wrote there. This
+/// is what makes "old setup" a defined state — without it an older
+/// setup-written version is indistinguishable from user drift, and
+/// every asset upgrade reads as foreign (setup-overwrites-its-own-old-versions).
+pub(crate) type SetupManifest = std::collections::BTreeMap<String, String>;
+
+fn manifest_path(home: &Path) -> PathBuf {
+    home.join(".clank/setup-manifest.json")
+}
+
+/// Missing OR CORRUPT reads as empty: an unknown file then follows
+/// the refuse path, which is the safe direction — never a silent
+/// overwrite on a guess.
+pub(crate) fn load_manifest(home: &Path) -> SetupManifest {
+    std::fs::read_to_string(manifest_path(home))
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
+}
+
+fn save_manifest(home: &Path, manifest: &SetupManifest) -> anyhow::Result<()> {
+    let path = manifest_path(home);
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("no parent for `{}`", path.display()))?;
+    std::fs::create_dir_all(parent)?;
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+    use std::io::Write;
+    tmp.write_all(serde_json::to_string_pretty(manifest)?.as_bytes())?;
+    tmp.as_file_mut().sync_all()?;
+    tmp.persist(&path).map_err(|e| anyhow::anyhow!(e.error))?;
+    Ok(())
+}
+
+pub(crate) fn content_hash(content: &str) -> String {
+    blake3::hash(content.as_bytes()).to_hex().to_string()
+}
+
+/// What a setup-owned file on disk IS, classified once so setup's
+/// install ladder and doctor's report can never diverge on what
+/// "old setup" means — the same parity rule the asset inventory
+/// carries (codex 0c90514), now over provenance too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AssetState {
+    Current,
+    ModeAlternate,
+    /// Matches the manifest's recorded hash: a setup-written OLDER
+    /// version. Setup overwrites without `--force`.
+    OldSetup,
+    /// Nothing recognises it: user drift. Setup refuses without
+    /// `--force`.
+    Drift,
+}
+
+pub(crate) fn classify_asset_state(
+    existing: &str,
+    expected: &str,
+    canonical_alternates: &[String],
+    recorded_hash: Option<&str>,
+) -> AssetState {
+    if existing == expected {
+        AssetState::Current
+    } else if canonical_alternates.iter().any(|a| a == existing) {
+        AssetState::ModeAlternate
+    } else if recorded_hash.is_some_and(|h| h == content_hash(existing)) {
+        AssetState::OldSetup
+    } else {
+        AssetState::Drift
+    }
+}
+
 /// Write a skill/command file the binary owns outright. Behavior:
 /// - missing → write
 /// - matches → no-op (record up-to-date)
-/// - drifted → refuse unless `--force`
+/// - canonical alternate → mode migration
+/// - matches the manifest's recorded hash → a known setup-written
+///   OLDER version: upgrade WITHOUT `--force`
+/// - drifted (no provenance) → refuse unless `--force`
+/// Every successful write records its hash, so the NEXT upgrade is
+/// silent. Pre-manifest files get one honest `--force` bridge:
+/// arbitrary existing content is never blessed into the manifest.
+#[allow(clippy::too_many_arguments)]
 fn install_skill(
-    path: &Path,
+    home: &Path,
+    rel: &str,
     expected: &str,
     canonical_alternates: &[String],
     force: bool,
     dry_run: bool,
+    manifest: &mut SetupManifest,
     summary: &mut Vec<String>,
 ) -> anyhow::Result<()> {
-    match std::fs::read_to_string(path) {
-        Ok(existing) if existing == expected => {
-            summary.push(format!("  ok    {}", path.display()));
-        }
-        // A file exactly matching another clank-generated canonical
-        // variant is OURS in a different mode — migrate freely.
-        // Genuinely modified content still refuses below.
-        Ok(existing) if canonical_alternates.contains(&existing) => {
-            if !dry_run {
-                std::fs::write(path, expected)
-                    .with_context(|| format!("writing `{}`", path.display()))?;
-            }
-            summary.push(format!("  mode  {}", path.display()));
-        }
-        Ok(_) if force => {
-            if !dry_run {
-                std::fs::write(path, expected)
-                    .with_context(|| format!("writing `{}`", path.display()))?;
-            }
-            summary.push(format!("  force {}", path.display()));
-        }
-        Ok(_) => {
-            anyhow::bail!(
-                "{} exists with different content; pass --force to overwrite.",
-                path.display()
+    let path = home.join(rel);
+    match std::fs::read_to_string(&path) {
+        Ok(existing) => {
+            let state = classify_asset_state(
+                &existing,
+                expected,
+                canonical_alternates,
+                manifest.get(rel).map(String::as_str),
             );
+            match state {
+                AssetState::Current => {
+                    record_setup_write(home, manifest, rel, expected, dry_run)?;
+                    summary.push(format!("  ok    {}", path.display()));
+                }
+                // OURS in a different mode — migrate freely.
+                AssetState::ModeAlternate => {
+                    if !dry_run {
+                        std::fs::write(&path, expected)
+                            .with_context(|| format!("writing `{}`", path.display()))?;
+                    }
+                    record_setup_write(home, manifest, rel, expected, dry_run)?;
+                    summary.push(format!("  mode  {}", path.display()));
+                }
+                // OURS from an older version — plain setup upgrades,
+                // and the new hash goes on record for the next one.
+                AssetState::OldSetup if !force => {
+                    if !dry_run {
+                        std::fs::write(&path, expected)
+                            .with_context(|| format!("writing `{}`", path.display()))?;
+                    }
+                    record_setup_write(home, manifest, rel, expected, dry_run)?;
+                    summary.push(format!("  upgrade {}", path.display()));
+                }
+                _ if force => {
+                    if !dry_run {
+                        std::fs::write(&path, expected)
+                            .with_context(|| format!("writing `{}`", path.display()))?;
+                    }
+                    record_setup_write(home, manifest, rel, expected, dry_run)?;
+                    summary.push(format!("  force {}", path.display()));
+                }
+                AssetState::Drift => {
+                    anyhow::bail!(
+                        "{} exists with different content; pass --force to overwrite.",
+                        path.display()
+                    );
+                }
+                AssetState::OldSetup => unreachable!("OldSetup without force upgrades above"),
+            }
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             if !dry_run {
@@ -454,12 +561,30 @@ fn install_skill(
                     std::fs::create_dir_all(parent)
                         .with_context(|| format!("creating `{}`", parent.display()))?;
                 }
-                std::fs::write(path, expected)
+                std::fs::write(&path, expected)
                     .with_context(|| format!("writing `{}`", path.display()))?;
             }
+            record_setup_write(home, manifest, rel, expected, dry_run)?;
             summary.push(format!("  write {}", path.display()));
         }
         Err(e) => return Err(e.into()),
+    }
+    Ok(())
+}
+
+/// One recorded write: the hash of every content setup lands goes
+/// into the manifest — `ok` included, so a matching-but-unrecorded
+/// file becomes provenance for the next upgrade.
+fn record_setup_write(
+    home: &Path,
+    manifest: &mut SetupManifest,
+    rel: &str,
+    content: &str,
+    dry_run: bool,
+) -> anyhow::Result<()> {
+    if !dry_run {
+        manifest.insert(rel.to_string(), content_hash(content));
+        save_manifest(home, manifest)?;
     }
     Ok(())
 }
@@ -1325,9 +1450,20 @@ mod tests {
     #[test]
     fn install_skill_writes_when_missing() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("a/b/SKILL.md");
+        let mut manifest = load_manifest(dir.path());
         let mut summary = Vec::new();
-        install_skill(&path, "hello", &[], false, false, &mut summary).unwrap();
+        install_skill(
+            dir.path(),
+            "a/b/SKILL.md",
+            "hello",
+            &[],
+            false,
+            false,
+            &mut manifest,
+            &mut summary,
+        )
+        .unwrap();
+        let path = dir.path().join("a/b/SKILL.md");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello");
         assert!(summary[0].contains("write"));
     }
@@ -1337,8 +1473,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("SKILL.md");
         write_file(&path, "hello");
+        let mut manifest = load_manifest(dir.path());
         let mut summary = Vec::new();
-        install_skill(&path, "hello", &[], false, false, &mut summary).unwrap();
+        install_skill(
+            dir.path(),
+            "SKILL.md",
+            "hello",
+            &[],
+            false,
+            false,
+            &mut manifest,
+            &mut summary,
+        )
+        .unwrap();
         assert!(summary[0].contains("ok"));
     }
 
@@ -1347,8 +1494,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("SKILL.md");
         write_file(&path, "edited by user\n");
+        let mut manifest = load_manifest(dir.path());
         let mut summary = Vec::new();
-        let err = install_skill(&path, "hello", &[], false, false, &mut summary).unwrap_err();
+        let err = install_skill(
+            dir.path(),
+            "SKILL.md",
+            "hello",
+            &[],
+            false,
+            false,
+            &mut manifest,
+            &mut summary,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("--force"), "unexpected: {err}");
         // File preserved.
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "edited by user\n");
@@ -1359,18 +1517,224 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("SKILL.md");
         write_file(&path, "edited by user\n");
+        let mut manifest = load_manifest(dir.path());
         let mut summary = Vec::new();
-        install_skill(&path, "hello", &[], true, false, &mut summary).unwrap();
+        install_skill(
+            dir.path(),
+            "SKILL.md",
+            "hello",
+            &[],
+            true,
+            false,
+            &mut manifest,
+            &mut summary,
+        )
+        .unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello");
         assert!(summary[0].contains("force"));
+    }
+
+    // ── provenance manifest (setup-overwrites-its-own-old-versions) ──
+
+    #[test]
+    fn install_skill_upgrades_a_known_old_version_without_force() {
+        // The file on disk is setup's OWN previous version: the
+        // manifest recorded its hash when setup wrote it. That is a
+        // defined OLD state, not user drift, so plain setup overwrites
+        // and records the new hash.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("SKILL.md");
+        write_file(&path, "setup v1 content");
+        let mut manifest = load_manifest(dir.path());
+        manifest.insert("SKILL.md".to_string(), content_hash("setup v1 content"));
+        let mut summary = Vec::new();
+        install_skill(
+            dir.path(),
+            "SKILL.md",
+            "setup v2 content",
+            &[],
+            false,
+            false,
+            &mut manifest,
+            &mut summary,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "setup v2 content"
+        );
+        assert!(summary[0].contains("upgrade"), "{summary:?}");
+        assert_eq!(
+            manifest.get("SKILL.md").map(String::as_str),
+            Some(content_hash("setup v2 content").as_str()),
+            "the new hash is on record for the next upgrade"
+        );
+    }
+
+    #[test]
+    fn install_skill_never_upgrades_unrecorded_drift() {
+        // No provenance entry for this path: different content is
+        // user drift, and the guard keeps its teeth.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("SKILL.md");
+        write_file(&path, "setup v1 content");
+        let mut manifest = load_manifest(dir.path());
+        manifest.insert("SKILL.md".to_string(), content_hash("some other file"));
+        let mut summary = Vec::new();
+        let err = install_skill(
+            dir.path(),
+            "SKILL.md",
+            "setup v2 content",
+            &[],
+            false,
+            false,
+            &mut manifest,
+            &mut summary,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("--force"), "{err}");
+    }
+
+    #[test]
+    fn a_force_write_records_provenance_for_the_next_upgrade() {
+        // The honest bridge: one --force against drift, and every
+        // upgrade after it is silent.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("SKILL.md");
+        write_file(&path, "edited by user\n");
+        let mut manifest = load_manifest(dir.path());
+        let mut summary = Vec::new();
+        install_skill(
+            dir.path(),
+            "SKILL.md",
+            "setup v1 content",
+            &[],
+            true,
+            false,
+            &mut manifest,
+            &mut summary,
+        )
+        .unwrap();
+        // The next setup with NEW expected content must not ask again.
+        install_skill(
+            dir.path(),
+            "SKILL.md",
+            "setup v2 content",
+            &[],
+            false,
+            false,
+            &mut manifest,
+            &mut summary,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "setup v2 content"
+        );
+    }
+
+    #[test]
+    fn an_ok_install_records_provenance_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("SKILL.md");
+        write_file(&path, "hello");
+        let mut manifest = load_manifest(dir.path());
+        let mut summary = Vec::new();
+        install_skill(
+            dir.path(),
+            "SKILL.md",
+            "hello",
+            &[],
+            false,
+            false,
+            &mut manifest,
+            &mut summary,
+        )
+        .unwrap();
+        assert_eq!(
+            manifest.get("SKILL.md").map(String::as_str),
+            Some(content_hash("hello").as_str())
+        );
+    }
+
+    #[test]
+    fn a_corrupt_manifest_is_empty_and_nothing_upgrades_on_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("SKILL.md");
+        write_file(&path, "setup v1 content");
+        write_file(&manifest_path(dir.path()), "{not json");
+        let mut manifest = load_manifest(dir.path());
+        assert!(manifest.is_empty(), "corrupt reads as empty");
+        let mut summary = Vec::new();
+        let err = install_skill(
+            dir.path(),
+            "SKILL.md",
+            "setup v2 content",
+            &[],
+            false,
+            false,
+            &mut manifest,
+            &mut summary,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("--force"), "{err}");
+    }
+
+    #[test]
+    fn the_manifest_round_trips_through_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut manifest = load_manifest(dir.path());
+        manifest.insert("a".to_string(), content_hash("1"));
+        save_manifest(dir.path(), &manifest).unwrap();
+        assert_eq!(load_manifest(dir.path()), manifest);
+    }
+
+    #[test]
+    fn classify_asset_state_is_the_one_definition_of_old_setup() {
+        let expected = "v2";
+        let alternate = "v2 other mode".to_string();
+        let recorded = content_hash("v1");
+        assert_eq!(
+            classify_asset_state("v2", expected, &[alternate.clone()], Some(&recorded)),
+            AssetState::Current
+        );
+        assert_eq!(
+            classify_asset_state("v2 other mode", expected, &[alternate.clone()], Some(&recorded)),
+            AssetState::ModeAlternate
+        );
+        // What doctor calls old, setup overwrites: manifest match.
+        assert_eq!(
+            classify_asset_state("v1", expected, &[alternate.clone()], Some(&recorded)),
+            AssetState::OldSetup
+        );
+        // No record of it at all: drift, which refuses.
+        assert_eq!(
+            classify_asset_state("v1", expected, &[alternate.clone()], None),
+            AssetState::Drift
+        );
+        assert_eq!(
+            classify_asset_state("edited", expected, &[alternate], Some(&recorded)),
+            AssetState::Drift
+        );
     }
 
     #[test]
     fn install_skill_dry_run_writes_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("SKILL.md");
+        let mut manifest = load_manifest(dir.path());
         let mut summary = Vec::new();
-        install_skill(&path, "hello", &[], false, true, &mut summary).unwrap();
+        install_skill(
+            dir.path(),
+            "SKILL.md",
+            "hello",
+            &[],
+            false,
+            true,
+            &mut manifest,
+            &mut summary,
+        )
+        .unwrap();
         assert!(!path.exists());
         assert!(summary[0].contains("write")); // reports the intent
     }
@@ -1613,12 +1977,15 @@ mod tests {
 
         // legacy → async.
         std::fs::write(&path, &legacy).unwrap();
+        let mut manifest = load_manifest(tmp.path());
         install_skill(
-            &path,
+            tmp.path(),
+            "SKILL.md",
             &asyncv,
             &[legacy.clone()],
             false,
             false,
+            &mut manifest,
             &mut summary,
         )
         .unwrap();
@@ -1627,11 +1994,13 @@ mod tests {
 
         // async → legacy (the downgrade).
         install_skill(
-            &path,
+            tmp.path(),
+            "SKILL.md",
             &legacy,
             &[asyncv.clone()],
             false,
             false,
+            &mut manifest,
             &mut summary,
         )
         .unwrap();
@@ -1641,11 +2010,13 @@ mod tests {
         // without --force.
         std::fs::write(&path, format!("{legacy}\n# my local note\n")).unwrap();
         let err = install_skill(
-            &path,
+            tmp.path(),
+            "SKILL.md",
             &asyncv,
             &[legacy.clone()],
             false,
             false,
+            &mut manifest,
             &mut summary,
         )
         .unwrap_err();
@@ -1653,7 +2024,17 @@ mod tests {
 
         // Dry-run migration reports but writes nothing.
         std::fs::write(&path, &legacy).unwrap();
-        install_skill(&path, &asyncv, &[legacy.clone()], false, true, &mut summary).unwrap();
+        install_skill(
+            tmp.path(),
+            "SKILL.md",
+            &asyncv,
+            &[legacy.clone()],
+            false,
+            true,
+            &mut manifest,
+            &mut summary,
+        )
+        .unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), legacy);
     }
 

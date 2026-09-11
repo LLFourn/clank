@@ -619,26 +619,9 @@ fn user_checks() -> Vec<CheckResult> {
     // opencode agents never bind and never receive work, silently
     // (the wire is exit-0/empty by design).
     let claude_async = crate::cli::setup::probe_claude_asyncrewake() == Some(true);
+    let setup_manifest = crate::cli::setup::load_manifest(&home);
     for asset in crate::cli::setup::user_asset_inventory(claude_async) {
-        // Stale canonical mode reads differently from arbitrary
-        // drift: plain `clank setup` migrates it, no --force needed.
-        let path = home.join(&asset.rel);
-        let display = format!("~/{}", asset.rel);
-        if let Ok(existing) = std::fs::read_to_string(&path)
-            && existing != asset.expected
-            && asset.canonical_alternates.contains(&existing)
-        {
-            out.push(CheckResult::warn(
-                SECTION,
-                display.clone(),
-                format!(
-                    "{display} is the canonical skill from the OTHER claude loop \
-                     mode; run `clank setup` (no --force needed) to migrate"
-                ),
-            ));
-            continue;
-        }
-        out.push(check_skill_file(&path, &asset.expected, &display));
+        out.push(check_setup_asset(&home, &asset, &setup_manifest));
     }
     // The pre-split `clank` skill must be gone — left in place it
     // shadows the role skills with stale, role-jamming guidance.
@@ -734,6 +717,55 @@ fn check_codex_rule(path: &Path, display: &str) -> CheckResult {
         display,
         "`clank` allow rule missing — run `clank setup` to add it".to_string(),
     )
+}
+
+/// One inventory asset's report row. Stale canonical mode and old
+/// setup versions are NOT arbitrary drift — plain `clank setup` fixes
+/// both without `--force`, and the report must say so, or the user
+/// learns to reach for the flag the drift guard needs (codex 1483318;
+/// setup-overwrites-its-own-old-versions).
+fn check_setup_asset(
+    home: &Path,
+    asset: &crate::cli::setup::OwnedAsset,
+    setup_manifest: &crate::cli::setup::SetupManifest,
+) -> CheckResult {
+    const SECTION: &str = "user";
+    let path = home.join(&asset.rel);
+    let display = format!("~/{}", asset.rel);
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        match crate::cli::setup::classify_asset_state(
+            &existing,
+            &asset.expected,
+            &asset.canonical_alternates,
+            setup_manifest.get(&asset.rel).map(String::as_str),
+        ) {
+            crate::cli::setup::AssetState::ModeAlternate => {
+                return CheckResult::warn(
+                    SECTION,
+                    display.clone(),
+                    format!(
+                        "{display} is the canonical skill from the OTHER claude loop \
+                         mode; run `clank setup` (no --force needed) to migrate"
+                    ),
+                );
+            }
+            // Doctor's "old" must mean setup overwrites it — plain
+            // `clank setup` upgrades without --force. Only content
+            // setup has no record of is drift that needs it.
+            crate::cli::setup::AssetState::OldSetup => {
+                return CheckResult::warn(
+                    SECTION,
+                    display.clone(),
+                    format!(
+                        "{display} is an old setup version; run `clank setup` \
+                         (no --force needed) to upgrade"
+                    ),
+                );
+            }
+            _ => {}
+        }
+    }
+    check_skill_file(&path, &asset.expected, &display)
 }
 
 fn check_skill_file(path: &Path, expected: &str, display: &str) -> CheckResult {
@@ -1312,6 +1344,48 @@ mod tests {
         let r = check_skill_file(&p, "expected", "test");
         assert_eq!(r.status, CheckStatus::Warn);
         assert!(r.message.contains("--force"));
+    }
+
+    #[test]
+    fn check_setup_asset_reports_old_setup_without_force_but_drift_with_it() {
+        // The report-text regression: a manifest-backed OLD version
+        // must read as setup-upgradable with NO flag, or the user
+        // learns to reach for --force where the drift guard needs it
+        // (setup-overwrites-its-own-old-versions).
+        let dir = tempfile::tempdir().unwrap();
+        let rel = "SKILL.md";
+        std::fs::write(dir.path().join(rel), "old setup content").unwrap();
+        let asset = crate::cli::setup::OwnedAsset {
+            rel: rel.to_string(),
+            expected: "new content".to_string(),
+            canonical_alternates: Vec::new(),
+        };
+        let mut manifest = crate::cli::setup::SetupManifest::new();
+        manifest.insert(
+            rel.to_string(),
+            crate::cli::setup::content_hash("old setup content"),
+        );
+        let r = check_setup_asset(dir.path(), &asset, &manifest);
+        assert_eq!(r.status, CheckStatus::Warn);
+        assert!(r.message.contains("old setup version"), "{}", r.message);
+        assert!(
+            r.message.contains("no --force needed"),
+            "an old setup version must be told plain setup upgrades it: {}",
+            r.message
+        );
+        assert!(
+            !r.message.contains("setup --force"),
+            "an old setup version must not be told to force: {}",
+            r.message
+        );
+
+        // The same bytes with NO provenance are drift, and the flag stays.
+        let r = check_setup_asset(
+            dir.path(),
+            &asset,
+            &crate::cli::setup::SetupManifest::new(),
+        );
+        assert!(r.message.contains("setup --force"), "{}", r.message);
     }
 
     #[test]
