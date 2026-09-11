@@ -339,6 +339,7 @@ struct BlockJson<'a> {
 struct DirtyStatsJson {
     insertions: u64,
     deletions: u64,
+    binary: u64,
     untracked: u64,
 }
 
@@ -618,6 +619,7 @@ impl StatusSnapshot {
             finished_plans,
             blocks,
             dirty_stats: self.dirty.map(|d| DirtyStatsJson {
+                binary: d.binary,
                 insertions: d.insertions,
                 deletions: d.deletions,
                 untracked: d.untracked,
@@ -1536,12 +1538,19 @@ pub(crate) fn pr_url(repo: &str, pr: u32) -> String {
     format!("https://github.com/{repo}/pull/{pr}")
 }
 
-/// `+12 −3 · 2 untracked`, omitting zero parts. A dirty tree whose
-/// numbers are all zero (e.g. a mode-only change) reads `changes`.
+/// `+12 −3 · 1 binary · 2 untracked`, omitting zero parts. A dirty
+/// tree whose numbers are all zero (e.g. a mode-only change) reads
+/// `changes`.
 pub(crate) fn dirty_summary(d: &DirtyStats) -> String {
     let mut parts = Vec::new();
     if d.insertions > 0 || d.deletions > 0 {
         parts.push(format!("+{} −{}", d.insertions, d.deletions));
+    }
+    // A binary file has no lines, so it is counted rather than
+    // measured — and named, because otherwise a tree holding nothing
+    // but a new PNG reads as clean-ish.
+    if d.binary > 0 {
+        parts.push(format!("{} binary", d.binary));
     }
     if d.untracked > 0 {
         parts.push(format!("{} untracked", d.untracked));
@@ -1617,20 +1626,58 @@ mod dirty_and_wake_tests {
         assert_eq!(d.untracked, 0);
     }
 
+    /// An uncommitted binary has no lines to count, and counting its
+    /// bytes-between-newlines is how one PNG read as thousands of
+    /// changed lines (lloyd on 2e27b70). git excludes binaries from
+    /// `--shortstat`; clank counts them, so the tree still says it is
+    /// carrying something.
+    #[test]
+    fn a_binary_change_is_counted_not_measured_in_lines() {
+        let dir = fixture_repo();
+        let r = dir.path();
+        // A committed "image": NUL early, then plenty of newlines for
+        // a line diff to feast on.
+        let mut png = vec![0x89, b'P', b'N', b'G', 0x00, 0x1a];
+        png.extend(std::iter::repeat_n(b"row\n", 2000).flatten().copied());
+        std::fs::write(r.join("shot.png"), &png).unwrap();
+        git(r, &["add", "-A"]);
+        git(r, &["commit", "--quiet", "-m", "add shot"]);
+
+        // Rewrite it with different bytes, and edit one text line.
+        png.extend(std::iter::repeat_n(b"more\n", 3000).flatten().copied());
+        std::fs::write(r.join("shot.png"), &png).unwrap();
+        std::fs::write(r.join("a.txt"), "one\ntwo\n").unwrap();
+
+        let d = crate::git_io::working_tree_dirty_at(r)
+            .unwrap()
+            .expect("dirty");
+        assert_eq!(
+            (d.insertions, d.deletions),
+            (0, 1),
+            "only the text edit has lines — `three` dropped from a.txt: {d:?}"
+        );
+        assert_eq!(d.binary, 1, "and the image is counted once");
+    }
+
     #[test]
     fn dirty_summary_omits_zero_parts() {
-        let s = |i, d, u| {
+        let s = |i, d, b, u| {
             dirty_summary(&DirtyStats {
                 insertions: i,
                 deletions: d,
+                binary: b,
                 untracked: u,
             })
         };
-        assert_eq!(s(12, 3, 0), "+12 −3");
-        assert_eq!(s(12, 3, 2), "+12 −3 · 2 untracked");
-        assert_eq!(s(0, 0, 2), "2 untracked");
-        assert_eq!(s(0, 0, 0), "changes");
-        assert_eq!(s(0, 5, 0), "+0 −5");
+        assert_eq!(s(12, 3, 0, 0), "+12 −3");
+        assert_eq!(s(12, 3, 0, 2), "+12 −3 · 2 untracked");
+        assert_eq!(s(0, 0, 0, 2), "2 untracked");
+        assert_eq!(s(0, 0, 0, 0), "changes");
+        assert_eq!(s(0, 5, 0, 0), "+0 −5");
+        // The reported case: a tree carrying one image and nothing
+        // else must not read as `changes`, nor as a line count.
+        assert_eq!(s(0, 0, 1, 0), "1 binary");
+        assert_eq!(s(12, 3, 2, 1), "+12 −3 · 2 binary · 1 untracked");
     }
 
     #[test]
@@ -2402,6 +2449,7 @@ mod dirty_and_wake_tests {
         snap.dirty = Some(DirtyStats {
             insertions: 3,
             deletions: 1,
+            binary: 0,
             untracked: 2,
         });
         snap.queue = vec![
@@ -2435,7 +2483,7 @@ mod dirty_and_wake_tests {
         assert_eq!(got["worktree_dirty"], true);
         assert_eq!(
             got["dirty_stats"],
-            serde_json::json!({"insertions": 3, "deletions": 1, "untracked": 2})
+            serde_json::json!({"insertions": 3, "deletions": 1, "binary": 0, "untracked": 2})
         );
         assert_eq!(got["queue_count"], 2);
         assert_eq!(got["queue"], serde_json::json!(["bar", "baz"]));

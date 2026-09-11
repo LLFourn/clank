@@ -69,6 +69,17 @@ pub(super) fn dirty_spans(d: &crate::git_io::DirtyStats) -> Vec<Span> {
         spans.push(colored("31", format!("−{}", d.deletions)));
         wrote = true;
     }
+    // Counted, not measured: a binary file has no lines, and diffing
+    // one as text is how a single uncommitted image read as thousands
+    // of changed lines (lloyd on 2e27b70).
+    if d.binary > 0 {
+        spans.push(dim(if wrote {
+            format!(" · {} binary", d.binary)
+        } else {
+            format!("{} binary", d.binary)
+        }));
+        wrote = true;
+    }
     if d.untracked > 0 {
         spans.push(dim(if wrote {
             format!(" · {} untracked", d.untracked)
@@ -3709,6 +3720,7 @@ mod tests {
         s.dirty = Some(DirtyStats {
             insertions: 160,
             deletions: 45,
+            binary: 0,
             untracked: 2,
         });
         let lines = render(&s, 40, 80);
@@ -3740,6 +3752,7 @@ mod tests {
         s.dirty = Some(DirtyStats {
             insertions: 3,
             deletions: 0,
+            binary: 0,
             untracked: 0,
         });
         let dirty = render(&s, 40, 80)
@@ -3753,6 +3766,7 @@ mod tests {
         s.dirty = Some(DirtyStats {
             insertions: 0,
             deletions: 0,
+            binary: 0,
             untracked: 0,
         });
         let dirty = render(&s, 40, 80)

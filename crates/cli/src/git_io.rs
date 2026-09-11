@@ -122,14 +122,15 @@ impl Repo {
         // errored (the untracked count still tells the story). gix's diff
         // algorithm may drift by a line from git's on some changes; that's
         // accepted for a display figure.
-        let (insertions, deletions) = match git.head_commit().ok().and_then(|c| c.tree().ok()) {
+        let counts = match git.head_commit().ok().and_then(|c| c.tree().ok()) {
             Some(head_tree) => count_dirty_lines(git, &head_tree, &workdir, &walk.changed),
-            None => (0, 0),
+            None => DirtyLines::default(),
         };
 
         Ok(Some(DirtyStats {
-            insertions,
-            deletions,
+            insertions: counts.insertions,
+            deletions: counts.deletions,
+            binary: counts.binary,
             untracked: walk.untracked.len() as u64,
         }))
     }
@@ -750,8 +751,6 @@ impl Repo {
             let new = new_id
                 .and_then(|id| repo.find_blob(id).ok().map(|b| b.data.clone()))
                 .unwrap_or_default();
-            // Git's binary heuristic: a NUL in the first 8000 bytes.
-            let is_binary = |b: &[u8]| b.iter().take(8000).any(|x| *x == 0);
             if is_binary(&old) || is_binary(&new) {
                 out.push(FileStat {
                     path,
@@ -776,6 +775,25 @@ impl Repo {
     }
 }
 
+/// Is this content binary, by git's own rule — a NUL byte within the
+/// first [`BINARY_SNIFF`] bytes (`buffer_is_binary`)?
+///
+/// A heuristic, and deliberately git's: every count clank reports as
+/// lines claims to mirror git's, so the two must agree about which
+/// files HAVE lines. Both diff paths ask here — the commit numstat,
+/// which reports binary as git's `-`, and the worktree's dirty
+/// figure, which counts them instead.
+///
+/// (`.gitattributes` can also declare a path binary with `-diff`.
+/// Not consulted: the NUL sniff is what catches the images and
+/// executables this exists for.)
+fn is_binary(bytes: &[u8]) -> bool {
+    bytes.iter().take(BINARY_SNIFF).any(|b| *b == 0)
+}
+
+/// git's sniff window (`buffer_is_binary`).
+const BINARY_SNIFF: usize = 8000;
+
 /// One file's `+/−` counts in a commit ([`Repo::commit_numstat`]).
 /// `None` counts = binary (git's `-`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -799,6 +817,9 @@ pub struct DirtyStats {
     pub insertions: u64,
     pub deletions: u64,
     pub untracked: u64,
+    /// Changed paths whose content is BINARY, counted rather than
+    /// measured in lines — the +/− numbers above exclude them.
+    pub binary: u64,
 }
 
 /// `None` = clean. Opens its own handle; prefer [`working_tree_dirty`]
@@ -996,15 +1017,22 @@ fn dir_has_nondir_descendant(dir: &Path) -> bool {
 /// path's HEAD blob against its current worktree content (the
 /// `git diff HEAD` shape). Renames aren't tracked — best-effort, as
 /// the dirty line is display-only.
+#[derive(Default)]
+struct DirtyLines {
+    insertions: u64,
+    deletions: u64,
+    binary: u64,
+}
+
 fn count_dirty_lines(
     git: &gix::Repository,
     head_tree: &gix::Tree<'_>,
     workdir: &Path,
     changed: &std::collections::BTreeSet<String>,
-) -> (u64, u64) {
+) -> DirtyLines {
     use gix::diff::blob::{Algorithm, InternedInput, diff_with_slider_heuristics};
 
-    let (mut insertions, mut deletions) = (0u64, 0u64);
+    let mut out = DirtyLines::default();
     for rel in changed {
         let old: Vec<u8> = head_tree
             .lookup_entry_by_path(rel)
@@ -1017,12 +1045,23 @@ fn count_dirty_lines(
         if old == new {
             continue;
         }
+        // A binary file has no lines to count, and counting them
+        // anyway is how one uncommitted PNG reads as thousands of
+        // changed lines — the diff sees runs of bytes between `\n`s
+        // and reports them as content. git excludes these from
+        // `--shortstat` for the same reason; clank counts them
+        // instead, because "why is my tree enormous" is answered by
+        // `1 binary`, not by silence.
+        if is_binary(&old) || is_binary(&new) {
+            out.binary += 1;
+            continue;
+        }
         let input = InternedInput::new(old.as_slice(), new.as_slice());
         let diff = diff_with_slider_heuristics(Algorithm::Histogram, &input);
-        insertions += u64::from(diff.count_additions());
-        deletions += u64::from(diff.count_removals());
+        out.insertions += u64::from(diff.count_additions());
+        out.deletions += u64::from(diff.count_removals());
     }
-    (insertions, deletions)
+    out
 }
 
 /// `rel_path`'s blob bytes at `commit`, or `None` if the commit/path
