@@ -189,7 +189,7 @@ pub fn repo_checks(
         }
     }
 
-    // Pane placement needs `zellij action stack-panes`; without it
+    // Pane placement needs `zellij action override-layout`; without it
     // reviewers are never stacked and the only symptom is a wrong
     // arrangement — which is how this reached us as "zellij is slow
     // and unreliable" (zellij-pane-placement-and-cost). The result is
@@ -217,9 +217,9 @@ pub fn repo_checks(
             P::ClientSupports => out.push(CheckResult::ok(
                 SECTION,
                 name,
-                "`stack-panes` available in the zellij client — reviewer panes \
-                 can be placed (a session started by an OLDER binary may still \
-                 reject it until restarted)"
+                "`override-layout` available in the zellij client — roster \
+                 changes can be placed (a session started by an OLDER binary \
+                 may still reject it until restarted)"
                     .to_string(),
             )),
             P::ClientTooOld => out.push(CheckResult::warn(
@@ -1167,9 +1167,16 @@ mod tests {
             "a client without override-layout must warn: the only other symptom \
              is panes in the wrong place"
         );
-        assert_eq!(
-            row(Some(P::ClientSupports)).map(|r| r.status),
-            Some(CheckStatus::Ok)
+        let ok = row(Some(P::ClientSupports)).expect("a supporting client says so");
+        assert_eq!(ok.status, CheckStatus::Ok);
+        // It names what was PROBED. The line said `stack-panes` for a
+        // release after that action stopped being how panes are
+        // placed — read by exactly the person debugging placement
+        // (nothing-refuses-in-silence).
+        assert!(
+            ok.message.contains("override-layout") && !ok.message.contains("stack-panes"),
+            "names the probed capability: {}",
+            ok.message
         );
     }
 

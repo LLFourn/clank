@@ -33,6 +33,7 @@ use super::term::{AltScreen, paint, term_size};
 use super::status::{StatusSnapshot, spawn_sigwinch_forwarder, watch_status_paths};
 
 mod event_content;
+mod lease;
 mod text;
 // Re-export for `open_zellij`'s tab/pane renamer, which strips the same
 // stale lamp prefix. (The IO shell itself uses no text primitives — the
@@ -964,6 +965,57 @@ fn mount_notice(rows: &mut Vec<crate::cli::log::OnelineRow>, prefix: &str, text:
     rows.insert(0, OnelineRow::Notice(format!("{prefix}: {text}")));
 }
 
+/// Deliver every reopen answer, and say whether the loop must go
+/// round again to paint one.
+///
+/// A failure the asker is still positioned to read becomes the
+/// overlay; everything else becomes the log notice. The return is the
+/// repaint: the overlay's own render branch is at the top of the
+/// loop, so mounting one here without re-entering leaves it unseen
+/// until something else wakes the pane.
+fn mount_reopen_outcomes(
+    outcomes: Vec<(String, zellij::ReopenOutcome)>,
+    mode: Mode,
+    snap: &mut StatusSnapshot,
+    detail: &mut Option<Overlay>,
+) -> bool {
+    let mut mounted = false;
+    for (label, outcome) in outcomes {
+        if reopen_overlay_for(&label, &outcome, mode, snap) {
+            *detail = Some(Overlay::error(
+                format!("reopen {label}"),
+                outcome.describe(&label),
+            ));
+            mounted = true;
+        } else {
+            mount_notice(&mut snap.log_rows, REOPEN_NOTICE, &outcome.describe(&label));
+        }
+    }
+    mounted
+}
+
+/// Does this reopen answer belong on screen NOW, in front of the user
+/// who asked for it?
+///
+/// Only a failure, and only while the asker is still on THAT agent's
+/// page: an outcome that arrives after they moved on is history, and
+/// a success needs no interruption — the pane it made is the answer.
+fn reopen_overlay_for(
+    label: &str,
+    outcome: &zellij::ReopenOutcome,
+    mode: Mode,
+    snap: &StatusSnapshot,
+) -> bool {
+    use zellij::ReopenOutcome as O;
+    if matches!(outcome, O::Reopened | O::AlreadyOpen) {
+        return false;
+    }
+    let Mode::AgentDetail { idx, .. } = mode else {
+        return false;
+    };
+    snap.agents.get(idx).is_some_and(|a| a.label == label)
+}
+
 fn roster_confirm_after_decision(
     action: ConfirmAction,
     roster_write_succeeded: bool,
@@ -1577,6 +1629,11 @@ pub(crate) async fn run_tui(
     home: Option<PathBuf>,
     policy: crate::rebuild::CachePolicy,
 ) -> anyhow::Result<()> {
+    // Ownership first, before a watcher, a worker or the alt screen:
+    // a second TUI for this repo must print where the first one is and
+    // leave the terminal exactly as it found it.
+    let _lease = lease::acquire(&repo).map_err(|why| anyhow::anyhow!("{why}"))?;
+
     let (tx, rx) = mpsc::channel::<()>();
     let _watcher = watch_status_paths(tx, &repo)?;
     // Resize is NOT a data change, so SIGWINCH gets its OWN channel and
@@ -1860,12 +1917,18 @@ pub(crate) async fn run_tui(
             reach: reconcile_worker.reach(),
             presence,
         };
-        for (label, outcome) in reconcile_worker.outcomes() {
-            mount_notice(
-                &mut snapshot.log_rows,
-                REOPEN_NOTICE,
-                &outcome.describe(&label),
-            );
+        // An overlay mounted here is drawn by the branch at the TOP of
+        // the loop, which this pass is already past: without going
+        // round again the refusal waits for the next event, and with
+        // nothing animating that is the 60-second idle tick (codex on
+        // 6303167).
+        if mount_reopen_outcomes(
+            reconcile_worker.outcomes(),
+            mode,
+            &mut snapshot,
+            &mut detail,
+        ) {
+            continue;
         }
         // The ask lines depend on blocks (not the log fetch), so compute
         // them before filling. `head` is the count of scrollable rows that
@@ -3766,6 +3829,101 @@ pub(crate) mod tests {
 
     /// Reopen stays on the page: the request goes to the worker and
     /// the answer arrives as a notice, so there is nowhere else to go.
+    /// A reopen is pressed on the detail page — a dedicated full
+    /// screen that never draws the log — so a failure mounted as a
+    /// log notice is invisible from where it was asked for, and the
+    /// refresh the reopen itself provokes clears it before the user
+    /// can get back to see it.
+    #[test]
+    fn a_failed_reopen_is_shown_on_the_page_that_asked() {
+        use zellij::ReopenOutcome as O;
+        let snap = two_agent_snap(); // claude (master) + codex (commit)
+        let on_codex = Mode::AgentDetail { idx: 1, sel: 0 };
+        assert!(
+            reopen_overlay_for("codex", &O::NotCreated, on_codex, &snap),
+            "the failure reaches the page it was asked from"
+        );
+        for outcome in [O::NoListing, O::Unplaced, O::NotOnRoster, O::NotInSession] {
+            assert!(reopen_overlay_for("codex", &outcome, on_codex, &snap));
+        }
+        // A success is its own answer — the pane is there.
+        for outcome in [O::Reopened, O::AlreadyOpen] {
+            assert!(!reopen_overlay_for("codex", &outcome, on_codex, &snap));
+        }
+        // Answers that arrive after the user moved on are history,
+        // and belong in the log where history lives.
+        assert!(
+            !reopen_overlay_for("codex", &O::NotCreated, Mode::AgentPanel { sel: 0 }, &snap),
+            "not while the panel is focused"
+        );
+        assert!(
+            !reopen_overlay_for("claude", &O::NotCreated, on_codex, &snap),
+            "not another agent's answer on this agent's page"
+        );
+        assert!(
+            !reopen_overlay_for(
+                "codex",
+                &O::NotCreated,
+                Mode::AgentDetail { idx: 9, sel: 0 },
+                &snap
+            ),
+            "a page whose agent is gone from the roster"
+        );
+    }
+
+    /// Mounting is only half: the overlay's render branch is at the
+    /// TOP of the loop, so an answer mounted below it is unseen until
+    /// something else wakes the pane — with nothing animating, the
+    /// 60-second idle tick. The return value IS the repaint.
+    #[test]
+    fn a_mounted_refusal_sends_the_loop_round_again() {
+        use zellij::ReopenOutcome as O;
+        let mut snap = two_agent_snap();
+        let mut detail: Option<Overlay> = None;
+        let on_codex = Mode::AgentDetail { idx: 1, sel: 0 };
+
+        let repaint = mount_reopen_outcomes(
+            vec![("codex".to_string(), O::NotCreated)],
+            on_codex,
+            &mut snap,
+            &mut detail,
+        );
+        assert!(repaint, "the loop must re-enter to draw it");
+        match detail.as_ref().map(|o| &o.data) {
+            Some(OverlayData::Error { title, message }) => {
+                assert_eq!(title, "reopen codex");
+                assert!(message.contains("codex"), "names the agent: {message}");
+            }
+            _ => panic!("a failure on this page is an overlay, not a log notice"),
+        }
+        assert!(
+            !snap
+                .log_rows
+                .iter()
+                .any(|r| matches!(r, crate::cli::log::OnelineRow::Notice(n)
+                    if n.starts_with(REOPEN_NOTICE))),
+            "and not also a notice nobody can see from that page"
+        );
+
+        // A success asks for nothing: no overlay, no extra paint, and
+        // the log keeps the record.
+        let mut detail: Option<Overlay> = None;
+        let repaint = mount_reopen_outcomes(
+            vec![("codex".to_string(), O::Reopened)],
+            on_codex,
+            &mut snap,
+            &mut detail,
+        );
+        assert!(!repaint && detail.is_none());
+        assert!(
+            snap.log_rows
+                .iter()
+                .any(|r| matches!(r, crate::cli::log::OnelineRow::Notice(n)
+                    if n.starts_with(REOPEN_NOTICE))),
+            "the notice carries the success"
+        );
+    }
+
     #[test]
     fn reopen_keeps_the_detail_page_open() {
         let repo = detail_repo();

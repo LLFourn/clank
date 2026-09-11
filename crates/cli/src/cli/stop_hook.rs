@@ -42,6 +42,7 @@ use super::{StopHookArgs, resolve_repo};
 use crate::agent_env::resolve_identity_for_hook;
 use crate::agent_store::load_agent_config;
 use crate::lifecycle::AgentLabel;
+use clank_core::ids::SessionId;
 use clank_core::{
     AutoMode, BgDisposition, CLAUDE_CONTINUATION_EXIT, CodexBlockDecision, HOOK_OK_EXIT, HookInput,
     HookOutcome, Role, SilentReason, Tool, background_disposition,
@@ -59,12 +60,68 @@ pub async fn run(args: StopHookArgs) -> anyhow::Result<()> {
     let async_loop =
         tool == Tool::Claude && args.loop_mode == Some(crate::cli::LoopModeArg::Asyncrewake);
     let outcome = match read_hook_stdin() {
-        Ok(input) => {
-            compute_outcome_with(tool, args.repo.as_deref(), input, async_loop, started).await
-        }
+        Ok(input) => match orphaned_by_its_pane(args.repo.as_deref(), &input.session_id) {
+            Some(message) => HookOutcome::Diagnostic { message },
+            None => {
+                compute_outcome_with(tool, args.repo.as_deref(), input, async_loop, started).await
+            }
+        },
         Err(e) => HookOutcome::Diagnostic { message: e },
     };
     emit_and_exit(outcome, tool);
+}
+
+/// Has this agent outlived the pane it was given? Then stop being
+/// that agent, and say so.
+///
+/// Asked before anything else the hook does, because everything else
+/// assumes the session is still the one clank opened. A pane closed
+/// out from under a process leaves it unreachable by the roster, by
+/// the human who closed it, and by the reconciler — still bound,
+/// still parked, still able to file reviews. That is what `glm` did
+/// (nothing-refuses-in-silence).
+///
+/// Releasing the label is the death available here: clank cannot end
+/// a process it cannot safely identify — the hook's parent is a
+/// shell, not the agent — but it can stop being the label. The wait
+/// generation goes with it, revoking anything parked, and the
+/// roster's next pass opens a fresh pane for the label it still
+/// wants.
+///
+/// Released against THIS hook's session id, never the label alone: by
+/// the time a paneless process gets here the roster may already have
+/// reopened the label under a new session, and clearing it blind
+/// would revoke the successor's wait (codex on 6303167). The identity
+/// still comes from the environment — that is what says which label
+/// this process is — but the release is keyed by the session the
+/// harness itself reports.
+///
+/// `None` — carry on — for every case that is not positive evidence
+/// of a lost pane (see [`crate::cli::open_zellij::pane_is_gone`]),
+/// including a session bound by hand with `clank as`, which never had
+/// a pane of clank's.
+fn orphaned_by_its_pane(repo: Option<&Path>, session: &SessionId) -> Option<String> {
+    if !crate::cli::open_zellij::own_pane_is_gone() {
+        return None;
+    }
+    let repo = crate::cli::resolve_repo(repo).ok()?;
+    let label = crate::agent_env::resolve_identity_from_env(&repo).ok()?;
+    // Three outcomes, three sentences. Collapsing the failure into
+    // "someone else holds it" would report a binding that is STILL
+    // THERE as safely handed over — in the plan about refusals you can
+    // see (codex on 7e1a33e).
+    let note = match crate::agent_store::release_binding(&repo, &label, session) {
+        Ok(true) => String::new(),
+        Ok(false) => " (another session already holds the label)".to_string(),
+        Err(e) => format!(" — but its binding could NOT be cleared: {e:#}"),
+    };
+    Some(format!(
+        "hook: this session's pane is gone, so it is no longer `{}`{}. \
+         An agent lives in its pane; nothing more will be routed here. \
+         Close this session — the roster reopens the label in a fresh pane.",
+        label.as_str(),
+        note
+    ))
 }
 
 /// Test-facing wrapper: production routes through
@@ -1032,7 +1089,7 @@ impl Expectation {
     }
 }
 
-fn now_rfc3339() -> String {
+pub(crate) fn now_rfc3339() -> String {
     time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_default()

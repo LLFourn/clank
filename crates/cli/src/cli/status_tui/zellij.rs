@@ -294,8 +294,6 @@ impl RosterView {
 pub(super) enum ReopenOutcome {
     Reopened,
     AlreadyOpen,
-    /// Another status TUI holds this repo's reconciliation lease.
-    HeldElsewhere,
     /// zellij did not answer the listing.
     NoListing,
     /// The listing said the pane was missing and `new-pane` made
@@ -313,9 +311,6 @@ impl ReopenOutcome {
         match self {
             Self::Reopened => format!("reopened `{label}`'s pane"),
             Self::AlreadyOpen => format!("`{label}` already has a pane in this tab"),
-            Self::HeldElsewhere => {
-                "another status TUI holds this repo's panes — reopen from there".to_string()
-            }
             Self::NoListing => "zellij did not answer; nothing was opened".to_string(),
             Self::NotCreated => format!("zellij did not create a pane for `{label}`"),
             Self::Unplaced => format!(
@@ -454,69 +449,11 @@ pub(super) trait PaneIo {
     /// agents — the retitler's map, read off the same listing presence
     /// uses. The ROLE is the roster's, not the pane's.
     fn title_rows(&mut self, snap: &Self::Snap) -> Vec<(String, String)>;
-    /// Whether THIS process may drive pane reconciliation for the repo.
-    ///
-    /// Exactly one may, at a time — the same shape as the ingest lease
-    /// (wal-single-ingest-writer). Two TUIs on one repo is a supported
-    /// and OBSERVED state (the `full-app-sim-driver` worktree had two
-    /// live `clank status --tui` processes), and the existing comment
-    /// on cache invalidation already anticipates one converging the
-    /// other's layout.
-    ///
-    /// What it does not survive is both ACTING. A worker serializes
-    /// passes only within its own process, so two drivers doing
-    /// list-then-create is a lock-free TOCTOU: both see a label
-    /// missing, both create, and the tool refuses the second session
-    /// with `already has an active writer`, leaving a corpse that the
-    /// listing still counts as that label's pane.
-    ///
-    /// Scoped to RECONCILE: structural pane work (create, re-layout,
-    /// close) and convergence caching. The RETITLE pass is
-    /// deliberately outside the lease — pane titles are SESSION-local,
-    /// so a loser in a different zellij session never receives the
-    /// holder's stamps and must apply its own; within one session the
-    /// two stamp identical titles from identical inputs.
-    fn may_reconcile(&mut self) -> bool;
 }
 
 /// The real zellij-backed [`PaneIo`].
 struct ZellijPaneIo<'a> {
     repo: &'a std::path::Path,
-    /// Held for as long as this process drives the repo. Re-attempted
-    /// while absent, so closing the holding TUI hands reconciliation
-    /// to a surviving one rather than stranding it.
-    lease: Option<ReconcileLease>,
-}
-
-/// flock RAII over `<repo>/.clank/zellij-reconcile.lock`.
-///
-/// Exclusive and NON-blocking: a second driver must degrade, not
-/// queue — queuing would apply a pass computed against a roster the
-/// holder has already changed.
-///
-/// flock dies with the process, so a killed TUI frees the lease with
-/// no cleanup protocol. Rust opens files `O_CLOEXEC`, so the zellij
-/// subprocesses this drives cannot carry the lease past their exec.
-struct ReconcileLease {
-    _file: std::fs::File,
-}
-
-impl ReconcileLease {
-    fn acquire(repo: &std::path::Path) -> Option<Self> {
-        use std::os::fd::AsRawFd;
-        let dir = repo.join(".clank");
-        std::fs::create_dir_all(&dir).ok()?;
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(dir.join("zellij-reconcile.lock"))
-            .ok()?;
-        // SAFETY: valid owned fd; flock has no memory effects.
-        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        (rc == 0).then_some(Self { _file: file })
-    }
 }
 
 impl PaneIo for ZellijPaneIo<'_> {
@@ -555,12 +492,6 @@ impl PaneIo for ZellijPaneIo<'_> {
     }
     fn capture_focus(&mut self, snap: &Self::Snap) -> Option<String> {
         crate::cli::open_zellij::pass_focus_target(snap)
-    }
-    fn may_reconcile(&mut self) -> bool {
-        if self.lease.is_none() {
-            self.lease = ReconcileLease::acquire(self.repo);
-        }
-        self.lease.is_some()
     }
     fn restore_focus(&mut self, id: &str) {
         crate::cli::open_zellij::focus_pane(id);
@@ -684,13 +615,6 @@ impl PaneReconciler {
         if self.converged.as_ref() == Some(&cur) {
             return false;
         }
-        // Not this process's to reconcile. Nothing is cached as
-        // converged: the holder's work is not ours to claim, and if
-        // the lease frees we must reconcile from whatever state it
-        // left. Retitles continue — see [`PaneIo::may_reconcile`].
-        if !io.may_reconcile() {
-            return false;
-        }
         // Listing failure → touch nothing AND stay unconverged, so the
         // next refresh retries (acting on a partial listing would
         // re-open every pane; forgetting the event would drop it).
@@ -798,8 +722,9 @@ impl PaneReconciler {
     /// cache (letting the loop see an unconverged tab would have it add
     /// the rest next round, the same leak one step removed).
     ///
-    /// It IS list-then-create, the exact two-TUI race the lease exists
-    /// for, so the lease is asked first and a refusal touches nothing.
+    /// It IS list-then-create — safe because one TUI per repo is
+    /// settled at startup ([`super::lease`]), so there is no second
+    /// driver in any session to race with.
     pub(super) fn reopen(
         &mut self,
         cur: &RosterView,
@@ -808,9 +733,6 @@ impl PaneReconciler {
     ) -> ReopenOutcome {
         if !cur.labels.contains(label) {
             return ReopenOutcome::NotOnRoster;
-        }
-        if !io.may_reconcile() {
-            return ReopenOutcome::HeldElsewhere;
         }
         let Some(mut snap) = io.snapshot() else {
             return ReopenOutcome::NoListing;
@@ -967,9 +889,6 @@ impl<I: PaneIo> PaneIo for Observed<'_, I> {
     }
     fn title_rows(&mut self, snap: &Self::Snap) -> Vec<(String, String)> {
         self.inner.title_rows(snap)
-    }
-    fn may_reconcile(&mut self) -> bool {
-        self.inner.may_reconcile()
     }
 }
 
@@ -1145,10 +1064,7 @@ impl ReconcileWorker {
         let mut worker = Self::in_session(report_rx);
         let join = std::thread::spawn(move || {
             let mut state = WorkerState::new();
-            let io = ZellijPaneIo {
-                repo: &repo,
-                lease: None,
-            };
+            let io = ZellijPaneIo { repo: &repo };
             let seen = std::cell::Cell::new(None);
             let mut io = Observed {
                 inner: io,
@@ -1625,8 +1541,6 @@ mod tests {
         focus_captures: usize,
         /// Scripted per-add creation results (default: created).
         add_results: std::collections::VecDeque<bool>,
-        /// Scripted lease answer; the real IO holds an flock.
-        may_reconcile: bool,
         /// Labels whose panes are all EXITED: listed by `pairs`, absent
         /// from `live_labels`.
         dead: std::collections::BTreeSet<String>,
@@ -1667,7 +1581,6 @@ mod tests {
                 verifies_taken: 0,
                 focus_captures: 0,
                 add_results: std::collections::VecDeque::new(),
-                may_reconcile: true,
                 dead: std::collections::BTreeSet::new(),
                 title_rows: std::collections::VecDeque::new(),
                 placed_results: std::collections::VecDeque::new(),
@@ -1702,9 +1615,6 @@ mod tests {
                 .pop_front()
                 .unwrap_or(None)
                 .map(|p| (p, placed))
-        }
-        fn may_reconcile(&mut self) -> bool {
-            self.may_reconcile
         }
         fn capture_focus(&mut self, _snap: &Self::Snap) -> Option<String> {
             self.focus_captures += 1;
@@ -2518,19 +2428,6 @@ mod tests {
     }
 
     #[test]
-    fn a_reopen_without_the_lease_touches_nothing() {
-        let snap = roster_snap(&[("claude", true), ("codex", false)]);
-        let mut r = PaneReconciler::new();
-        let mut io = FakeIo::new(vec![Some(live(&[("claude", true)]))]);
-        io.may_reconcile = false;
-        assert_eq!(
-            r.reopen(&RosterView::of(&snap), "codex", &mut io),
-            ReopenOutcome::HeldElsewhere
-        );
-        assert_eq!(io.snapshots_taken, 0);
-    }
-
-    #[test]
     fn a_reopen_reports_an_unanswered_listing_and_an_unmade_pane() {
         let snap = roster_snap(&[("claude", true), ("codex", false)]);
         let mut r = PaneReconciler::new();
@@ -2925,84 +2822,6 @@ mod tests {
             vec![("r1".to_string(), ReopenOutcome::NotInSession)]
         );
         assert!(w.outcomes().is_empty(), "drained");
-    }
-
-    #[test]
-    fn a_driver_without_the_lease_still_retitles() {
-        // NOT an oversight in the lease: pane titles are SESSION-local.
-        // A loser driving a different zellij session never sees the
-        // holder's stamps, so gating this would leave its own session
-        // permanently unglyphed. Within one session both write the
-        // same title from the same inputs.
-        let mut state = WorkerState::new();
-        let mut io = FakeIo::new(vec![Some(live(&[("claude", true)]))]);
-        io.may_reconcile = false;
-        let mut renames: Vec<(String, String)> = Vec::new();
-        state.handle(
-            wb(
-                Some(view(&["claude"], Some("claude"))),
-                Some(glyphs(&[("claude", "M", "R")])),
-                Vec::new(),
-            ),
-            &mut io,
-            |id, title| renames.push((id.to_string(), title.to_string())),
-        );
-        assert!(io.log.is_empty(), "no structural pane work: {:?}", io.log);
-        assert_eq!(
-            renames,
-            vec![(
-                "terminal_claude".to_string(),
-                "M claude (master)".to_string()
-            )],
-            "the retitle pass runs without the lease"
-        );
-        assert_eq!(
-            io.snapshots_taken, 1,
-            "the retitler's priming listing, and only it"
-        );
-    }
-
-    #[test]
-    fn the_reconcile_lease_admits_exactly_one_holder_and_frees_on_drop() {
-        // flock binds to the OPEN FILE DESCRIPTION, so a second
-        // acquire conflicts even from this process -- which is what
-        // makes it exclusive across the two TUIs it exists to
-        // separate.
-        let dir = tempfile::tempdir().unwrap();
-        let repo = dir.path();
-        let first = ReconcileLease::acquire(repo).expect("first driver takes it");
-        assert!(
-            ReconcileLease::acquire(repo).is_none(),
-            "a second driver must be refused, not queued"
-        );
-        drop(first);
-        assert!(
-            ReconcileLease::acquire(repo).is_some(),
-            "closing the holder must hand reconciliation over, not strand it"
-        );
-    }
-
-    #[test]
-    fn a_driver_without_the_lease_does_not_reconcile_and_caches_nothing() {
-        // Two TUIs on one repo is supported and observed. Their
-        // workers serialize only within a process, so both doing
-        // STRUCTURAL pane work is a lock-free TOCTOU that double-opens
-        // a pane -- and the second tool refuses the session, leaving a
-        // corpse the listing still counts.
-        //
-        // Scoped to reconcile: retitles are session-local and stay
-        // dual on purpose, pinned by
-        // `a_driver_without_the_lease_still_retitles`.
-        let snap = roster_snap(&[("claude", true), ("r1", false)]);
-        let before = live(&[("claude", true)]);
-        let mut r = PaneReconciler::new();
-        let mut io = FakeIo::with_verify(vec![Some(before)], vec![None]);
-        io.may_reconcile = false;
-        assert!(!r.reconcile(RosterView::of(&snap), &mut io));
-        assert!(io.log.is_empty(), "no zellij work: {:?}", io.log);
-        // Nothing cached: the holder's convergence is not ours to
-        // claim, and we must act on whatever it leaves if it exits.
-        assert!(r.converged.is_none());
     }
 
     #[test]

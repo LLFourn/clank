@@ -1590,6 +1590,57 @@ pub(crate) fn panes_in_all_sessions(deadline: std::time::Duration) -> Vec<Sessio
     panes
 }
 
+/// Is the pane this process was given gone?
+///
+/// An agent lives in its pane: the pane is where clank put it, what
+/// the roster grants and revokes, and what a human closes to stop it.
+/// A process that outlives its pane is reachable by none of those and
+/// still writing to the repo — which is what `glm` did for six
+/// minutes after its pane was closed, review included
+/// (nothing-refuses-in-silence).
+///
+/// TRUE only on positive evidence: this process is in a zellij
+/// session, it has a pane id, the listing answered with PANES in it,
+/// and its own id is not among the terminal ones. Every other shape — no
+/// session, no id, a listing that failed — concludes nothing, because
+/// a session bound by hand with `clank as` has no pane of clank's and
+/// must keep working.
+///
+/// Plugin panes are excluded: their ids live in a different space and
+/// collide with terminal ids (a session commonly lists both as `0`).
+pub(crate) fn pane_is_gone(
+    session: Option<&str>,
+    pane: Option<&str>,
+    listing: Option<&[ZellijPane]>,
+) -> bool {
+    let (Some(_), Some(pane), Some(panes)) = (session, pane, listing) else {
+        return false;
+    };
+    let Ok(mine) = pane.trim().parse::<u32>() else {
+        return false;
+    };
+    // An EMPTY listing is not an answer about this session: a session
+    // that can run this process holds at least its pane and a tab
+    // bar, so nothing in it means the read told us nothing — and the
+    // cost of reading that as "your pane is gone" is a working agent.
+    if panes.is_empty() {
+        return false;
+    }
+    !panes.iter().any(|p| !p.is_plugin && p.id == mine)
+}
+
+/// [`pane_is_gone`] against this process's own environment and a live
+/// listing. `false` outside zellij, where there is no pane to lose.
+pub(crate) fn own_pane_is_gone() -> bool {
+    let session = std::env::var("ZELLIJ_SESSION_NAME").ok();
+    let pane = std::env::var("ZELLIJ_PANE_ID").ok();
+    if session.is_none() || pane.is_none() {
+        return false;
+    }
+    let listing = snapshot_panes();
+    pane_is_gone(session.as_deref(), pane.as_deref(), listing.as_deref())
+}
+
 /// The `new-pane` argv, split out so it is assertable without
 /// spawning a zellij. Never `--stacked`: where the pane belongs is the
 /// layout's decision, applied right after.
@@ -3751,6 +3802,51 @@ dead-one [Created 10h ago] (EXITED - attach to resurrect)
 
     fn panes_of(json: &str) -> Vec<ZellijPane> {
         serde_json::from_str(json).unwrap()
+    }
+
+    /// An agent lives in its pane, so losing it is the end — but only
+    /// POSITIVE evidence says it was lost. Every uncertain shape means
+    /// a working agent, including a hand-started `clank as` session
+    /// that never had a pane of clank's to lose.
+    #[test]
+    fn a_lost_pane_is_only_what_the_listing_proves() {
+        let listing = panes_of(
+            r#"[
+          {"id":1,"title":"claude","terminal_command":"clank agent start claude --repo /a","tab_id":6},
+          {"id":0,"title":"zellij:tab-bar","is_plugin":true,"tab_id":6}
+        ]"#,
+        );
+        assert!(
+            pane_is_gone(Some("s"), Some("70"), Some(&listing)),
+            "in the session, with an id the listing does not have"
+        );
+        assert!(
+            !pane_is_gone(Some("s"), Some("1"), Some(&listing)),
+            "present"
+        );
+        // A plugin pane shares the id space with terminals (a session
+        // commonly lists both as 0), so it can never stand in for the
+        // terminal pane an agent runs in.
+        assert!(
+            pane_is_gone(Some("s"), Some("0"), Some(&listing)),
+            "the only 0 here is a plugin, so the terminal 0 is gone"
+        );
+        // Nothing concluded, nothing killed.
+        assert!(
+            !pane_is_gone(None, Some("70"), Some(&listing)),
+            "no session"
+        );
+        assert!(!pane_is_gone(Some("s"), None, Some(&listing)), "no pane id");
+        assert!(!pane_is_gone(Some("s"), Some("70"), None), "no listing");
+        assert!(
+            !pane_is_gone(Some("s"), Some("not-a-number"), Some(&listing)),
+            "an unparseable id proves nothing about the listing"
+        );
+        assert!(
+            !pane_is_gone(Some("s"), Some("70"), Some(&[])),
+            "an empty listing is a listing that told us nothing useful \
+             — the session has panes, we just cannot see them"
+        );
     }
 
     /// The stage is read from GEOMETRY — the biggest agent pane in its

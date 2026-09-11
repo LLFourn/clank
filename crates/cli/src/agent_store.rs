@@ -521,6 +521,82 @@ pub(crate) fn mint_wait_generation(agent_dir: &Path) -> anyhow::Result<u64> {
     Ok(next)
 }
 
+/// Release `label` — but only if `session` is still the session
+/// holding it. Returns whether it was released.
+///
+/// COMPARE-and-clear, never clear. The caller is a session that has
+/// decided it should stop being this label (its pane is gone), and by
+/// the time it reaches that conclusion the roster may already have
+/// reopened the label in a FRESH pane under a new session. Clearing
+/// unconditionally would take the replacement's binding away and bump
+/// its generation, revoking the wait of the agent that just took over
+/// — the paneless process killing its own successor (codex on
+/// 6303167).
+///
+/// The generation is minted for the same reason a BINDING mints one:
+/// a wait parked under the old identity must not survive the identity
+/// (codex 1483318). This is how an agent that lost its pane stops
+/// being that label — the process may linger, but nothing will hand
+/// it work again, and the roster's next reconcile opens a fresh pane
+/// for the label it still wants.
+pub fn release_binding(
+    repo: &Path,
+    label: &AgentLabel,
+    session: &SessionId,
+) -> anyhow::Result<bool> {
+    let _owned = binding_lock(repo, label)?;
+    release_locked(repo, label, session)
+}
+
+/// [`release_binding`]'s body, for callers already holding the label's
+/// binding lock.
+fn release_locked(repo: &Path, label: &AgentLabel, session: &SessionId) -> anyhow::Result<bool> {
+    let mut cfg = load_agent_config(repo, label)?.unwrap_or_default();
+    if cfg.session.as_ref().is_none_or(|s| &s.id != session) {
+        return Ok(false);
+    }
+    cfg.session = None;
+    mint_wait_generation(&agents_root(repo).join(label.as_str()))
+        .context("revoking the released agent's parked wait")?;
+    save_agent_config(repo, label, &cfg)?;
+    Ok(true)
+}
+
+/// Serializes every ownership transition on ONE label's binding.
+///
+/// Comparing the session before clearing is not enough on its own:
+/// read, compare, mint and write are four steps, and a replacement
+/// binding that lands between the read and the write is overwritten
+/// by a decision made before it existed (codex on 7e1a33e). Both
+/// sides of the transition — claiming the label and releasing it —
+/// take this lock, so the compare and everything it authorises happen
+/// against the same state.
+///
+/// BLOCKING, unlike the leases elsewhere: a caller here is not
+/// choosing whether to drive, it is performing a short file write it
+/// must not do concurrently. Held for one label only, and never
+/// across another label's, so there is no lock order to get wrong.
+fn binding_lock(repo: &Path, label: &AgentLabel) -> anyhow::Result<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    let dir = agents_root(repo).join(label.as_str());
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating `{}`", dir.display()))?;
+    let path = dir.join("binding.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("opening `{}`", path.display()))?;
+    // SAFETY: valid owned fd; flock has no memory effects.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(anyhow::anyhow!(
+            "locking `{}`: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(file)
+}
+
 pub fn bind_session_to_agent(
     repo: &Path,
     label: &AgentLabel,
@@ -540,6 +616,10 @@ pub fn bind_session_to_agent(
     // binding on the old agent (which `clank as` or `clank doctor`
     // can clean up later). The reverse (clear-then-bind) could
     // leave them with neither.
+    //
+    // Under the label's lock, so a release that read this binding a
+    // moment ago cannot land its clear on top of the claim.
+    let owned = binding_lock(repo, label)?;
     let mut cfg = load_agent_config(repo, label)?.unwrap_or_default();
     let now = OffsetDateTime::now_utc()
         .format(&Rfc3339)
@@ -559,13 +639,20 @@ pub fn bind_session_to_agent(
     mint_wait_generation(&agents_root(repo).join(label.as_str()))
         .context("persisting the wait-generation ownership claim")?;
     save_agent_config(repo, label, &cfg)?;
+    // Dropped before any OTHER label is touched: one lock at a time is
+    // what keeps two crossing binds from deadlocking on each other.
+    drop(owned);
 
     let mut cleared_from: Vec<AgentLabel> = Vec::new();
-    for (other_label, mut other_cfg) in stale {
-        other_cfg.session = None;
-        save_agent_config(repo, &other_label, &other_cfg)
-            .with_context(|| format!("clearing stale binding on `{}`", other_label.as_str()))?;
-        cleared_from.push(other_label);
+    for (other_label, _) in stale {
+        // The same compare-and-clear, for the same reason: the label
+        // may have been rebound since the scan above, and only the
+        // session that still holds it may give it up.
+        if release_binding(repo, &other_label, session_id)
+            .with_context(|| format!("clearing stale binding on `{}`", other_label.as_str()))?
+        {
+            cleared_from.push(other_label);
+        }
     }
 
     Ok(BindOutcome {
@@ -615,6 +702,161 @@ mod tests {
 
     fn label(s: &str) -> AgentLabel {
         AgentLabel::parse(s).unwrap()
+    }
+
+    /// Releasing the label is the death an agent that lost its pane
+    /// can perform on itself: it stops being the label, and the wait
+    /// generation goes with it so anything parked in that name is
+    /// revoked rather than left to collect work
+    /// (nothing-refuses-in-silence).
+    #[test]
+    fn releasing_forgets_the_session_and_revokes_its_parked_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let l = label("glm");
+        let sid = sess("e30f2b50-4cef-4955-86a0-fbfe64a768b3");
+        bind_session_to_agent(repo, &l, Tool::Claude, &sid).unwrap();
+        let armed = read_wait_generation(&agents_root(repo).join(l.as_str()));
+
+        assert!(
+            release_binding(repo, &l, &sid).unwrap(),
+            "it held the label"
+        );
+
+        assert!(
+            load_agent_config(repo, &l)
+                .unwrap()
+                .unwrap()
+                .session
+                .is_none(),
+            "no longer that session's label"
+        );
+        assert_ne!(
+            read_wait_generation(&agents_root(repo).join(l.as_str())),
+            armed,
+            "a new generation revokes whatever was parked under the old identity"
+        );
+        // Nothing left to release, and nothing to churn for a label
+        // someone else may take next.
+        let after = read_wait_generation(&agents_root(repo).join(l.as_str()));
+        assert!(!release_binding(repo, &l, &sid).unwrap());
+        assert_eq!(
+            read_wait_generation(&agents_root(repo).join(l.as_str())),
+            after
+        );
+    }
+
+    /// The race this is compare-and-clear for: the roster reopens the
+    /// label in a fresh pane, and only THEN does the old paneless
+    /// process reach its Stop hook. It must not take the
+    /// replacement's binding with it.
+    #[test]
+    fn a_paneless_session_cannot_release_its_successors_binding() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let l = label("glm");
+        let (old, new) = (
+            sess("e30f2b50-4cef-4955-86a0-fbfe64a768b3"),
+            sess("11111111-2222-3333-4444-555555555555"),
+        );
+        bind_session_to_agent(repo, &l, Tool::Claude, &old).unwrap();
+        bind_session_to_agent(repo, &l, Tool::Claude, &new).unwrap();
+        let armed = read_wait_generation(&agents_root(repo).join(l.as_str()));
+
+        assert!(
+            !release_binding(repo, &l, &old).unwrap(),
+            "the old session no longer holds the label, so it releases nothing"
+        );
+
+        assert_eq!(
+            load_agent_config(repo, &l)
+                .unwrap()
+                .unwrap()
+                .session
+                .map(|s| s.id),
+            Some(new),
+            "the replacement keeps the label"
+        );
+        assert_eq!(
+            read_wait_generation(&agents_root(repo).join(l.as_str())),
+            armed,
+            "and its parked wait is not revoked out from under it"
+        );
+    }
+
+    /// Comparing is not enough if the compare and the write are not
+    /// the same moment. This pins the SERIALIZATION: while the
+    /// label's lock is held, a release cannot proceed — so a
+    /// replacement that binds inside that window is read by the
+    /// release when it finally runs, not overwritten by a decision
+    /// taken before it existed (codex on 7e1a33e).
+    #[test]
+    fn a_release_cannot_straddle_a_rebind() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().to_path_buf();
+        let l = label("glm");
+        let (old, new) = (
+            sess("e30f2b50-4cef-4955-86a0-fbfe64a768b3"),
+            sess("11111111-2222-3333-4444-555555555555"),
+        );
+        bind_session_to_agent(&repo, &l, Tool::Claude, &old).unwrap();
+
+        let held = binding_lock(&repo, &l).unwrap();
+        let done = Arc::new(AtomicBool::new(false));
+        let releaser = {
+            let (repo, l, old, done) = (repo.clone(), l.clone(), old.clone(), done.clone());
+            std::thread::spawn(move || {
+                let out = release_binding(&repo, &l, &old);
+                done.store(true, Ordering::SeqCst);
+                out.unwrap()
+            })
+        };
+
+        // It must still be waiting: this is the window in which a
+        // lock-free release does its damage.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(
+            !done.load(Ordering::SeqCst),
+            "a release must wait for the label's lock, not act on a stale read"
+        );
+
+        // The replacement takes the label inside that window — what
+        // `bind_session_to_agent` does under this same lock.
+        let mut cfg = load_agent_config(&repo, &l).unwrap().unwrap_or_default();
+        cfg.session = Some(Session {
+            id: new.clone(),
+            tool: Tool::Claude,
+            updated_at: "2026-09-11T09:27:15Z".to_string(),
+        });
+        mint_wait_generation(&agents_root(&repo).join(l.as_str())).unwrap();
+        save_agent_config(&repo, &l, &cfg).unwrap();
+        let armed = read_wait_generation(&agents_root(&repo).join(l.as_str()));
+        drop(held);
+
+        assert!(
+            !releaser.join().unwrap(),
+            "the release finds the label already someone else's and gives up"
+        );
+        assert_eq!(
+            load_agent_config(&repo, &l)
+                .unwrap()
+                .unwrap()
+                .session
+                .map(|s| s.id),
+            Some(new),
+            "the replacement still holds the label"
+        );
+        assert_eq!(
+            read_wait_generation(&agents_root(&repo).join(l.as_str())),
+            armed,
+            "and its parked wait was never revoked"
+        );
+    }
+
+    fn sess(s: &str) -> SessionId {
+        SessionId::parse(s).unwrap()
     }
 
     fn desc(tool: Tool) -> AgentDescription {
