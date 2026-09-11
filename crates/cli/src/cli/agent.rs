@@ -778,10 +778,21 @@ fn compose_launch(
         );
     }
 
+    let mut env_overrides = launch_env(tool, label, launch);
+    if tool == Tool::OpenCode {
+        // The resume path knows the exact session at composition time;
+        // the plugin arms its bootstrap wait for THIS identity only.
+        // Fresh and fork launches omit it — their id is minted later.
+        env_overrides.insert(
+            crate::agent_env::ENV_CLANK_BOOTSTRAP_SESSION.to_string(),
+            session.id.as_str().to_string(),
+        );
+    }
+
     ComposedLaunch {
         program,
         args,
-        env_overrides: launch_env(tool, label, launch),
+        env_overrides,
     }
 }
 
@@ -1799,6 +1810,64 @@ mod tests {
             std::path::Path::new("/repo"),
         );
         assert_eq!(args, vec!["--session", "ses_8f2a1b3c4d5e6f70"]);
+    }
+
+    fn opencode_session() -> Session {
+        Session {
+            id: clank_core::ids::SessionId::parse("ses_8f2a1b3c4d5e6f70").unwrap(),
+            tool: Tool::OpenCode,
+            updated_at: "2026-06-04T12:00:00Z".to_string(),
+        }
+    }
+
+    const BOOTSTRAP_VAR: &str = "CLANK_BOOTSTRAP_SESSION_ID";
+
+    #[test]
+    fn an_opencode_resume_launch_carries_the_bootstrap_session_id() {
+        // The resume composition knows the exact session, so it hands
+        // the plugin its one owned identity for the load-time
+        // bootstrap arm (opencode-wake-bootstraps-and-surfaces).
+        let s = opencode_session();
+        let c = compose_launch(Path::new("/repo"), &label("kimi"), &s, None, None);
+        assert_eq!(
+            c.env_overrides.get(BOOTSTRAP_VAR).map(String::as_str),
+            Some("ses_8f2a1b3c4d5e6f70")
+        );
+    }
+
+    #[test]
+    fn non_opencode_resumes_do_not_carry_the_bootstrap_id() {
+        for s in [claude_session(), codex_session(), grok_session()] {
+            let c = compose_launch(Path::new("/repo"), &label("tester"), &s, None, None);
+            assert!(
+                !c.env_overrides.contains_key(BOOTSTRAP_VAR),
+                "{:?} must not carry it",
+                s.tool
+            );
+        }
+    }
+
+    #[test]
+    fn fresh_and_fork_launches_omit_the_bootstrap_id() {
+        // The id is unknowable until opencode mints it, so neither
+        // launch can own one — and neither may inherit a parent's.
+        let desc = desc_with(Tool::OpenCode, None);
+        let fresh = compose_bootstrap_launch(Path::new("/repo"), &label("kimi"), &desc).unwrap();
+        assert!(!fresh.env_overrides.contains_key(BOOTSTRAP_VAR));
+
+        let spec = crate::cli::fork::ForkSpec {
+            tool: Tool::OpenCode,
+            from_session: Some("ses_039d60658ffe0RPgue3noZ0Qqf".into()),
+            prompt: "orient".into(),
+        };
+        let fork = compose_fork_launch(
+            &label("kimi"),
+            &spec,
+            &desc,
+            Path::new("/repo/.clank/worktrees/x"),
+            None,
+        );
+        assert!(!fork.env_overrides.contains_key(BOOTSTRAP_VAR));
     }
 
     #[test]

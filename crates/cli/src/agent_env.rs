@@ -24,17 +24,26 @@ const ENV_GROK_MARKER: &str = "GROK_AGENT";
 /// exact session id; the plugin never guesses.
 const ENV_OPENCODE_SESSION: &str = "OPENCODE_SESSION_ID";
 pub(crate) const ENV_CLANK_AGENT: &str = "CLANK_AGENT";
+/// The session a RESUMED opencode launch owns, passed by
+/// `compose_launch` so the clank plugin can bootstrap its wait for
+/// exactly that identity at load (opencode-wake-bootstraps-and-surfaces).
+/// Unset on fresh/fork launches, where the id is unknowable until
+/// opencode mints it. An ownership token, so it rides the same
+/// hygiene as the other identity vars: a child must never inherit it.
+pub(crate) const ENV_CLANK_BOOTSTRAP_SESSION: &str = "CLANK_BOOTSTRAP_SESSION_ID";
 
 /// Every env var that carries an agent IDENTITY (session ids,
-/// markers, the explicit label override). Fresh launches scrub these
-/// from the child env so an agent never inherits its parent's
-/// identity; each tool re-exports its own to its shells.
+/// markers, the explicit label override, the bootstrap ownership
+/// token). Fresh launches scrub these from the child env so an agent
+/// never inherits its parent's identity; each tool re-exports its
+/// own to its shells.
 pub(crate) const SESSION_IDENTITY_VARS: &[&str] = &[
     ENV_CLAUDE_SESSION,
     ENV_CODEX_SESSION,
     ENV_OPENCODE_SESSION,
     ENV_GROK_MARKER,
     ENV_CLANK_AGENT,
+    ENV_CLANK_BOOTSTRAP_SESSION,
 ];
 
 /// Try to detect (tool, session_id) from the env vars set by the

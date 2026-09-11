@@ -61,7 +61,32 @@ const inject = (req) => {
     injectionReleases.push(resolve)
   })
 }
-const client = { session: { prompt: inject, promptAsync: inject } }
+
+// The wider client surface the plugin uses: promptAsync for
+// continuations, session.status for idle verification, tui.showToast
+// for diagnostics, app.log for the loop's own trace.
+const toasts = []
+const logs = []
+const statuses = new Map() // sessionID -> "idle" | "busy" (absent = not idle)
+const client = {
+  session: {
+    prompt: inject,
+    promptAsync: inject,
+    status: async () => ({
+      data: Object.fromEntries([...statuses].map(([k, v]) => [k, { type: v }])),
+    }),
+  },
+  tui: {
+    showToast: async (req) => {
+      toasts.push(req.body)
+    },
+  },
+  app: {
+    log: async (req) => {
+      logs.push(req.body)
+    },
+  },
+}
 
 const hooks = await ClankPlugin({ client, $, directory: "/fake/repo" })
 const fire = (type, sessionID) => hooks.event({ event: { type, properties: { sessionID } } })
@@ -169,5 +194,268 @@ await idle5
 await settle()
 assert(armedAtAbort === armsBeforeAbort + 2, `the wait must have armed (arms=${armedAtAbort})`)
 assert(injections.length === 3, "an abort during the wait must discard its continuation")
+
+// ── bootstrap / diagnostics / ownership (opencode-wake-bootstraps-and-surfaces) ──
+// Per-section fakes: arms tracked BY SESSION, stop-hook results
+// scripted per section, env var controlled per section.
+
+const makeSection = () => {
+  const armSessions = []
+  const results = []
+  const $f = (strings, ...values) => {
+    let sid
+    try {
+      sid = JSON.parse(values[0]).session_id
+    } catch {}
+    armSessions.push(sid)
+    const handle = {
+      env: () => handle,
+      quiet: () => handle,
+      nothrow: () => handle,
+      then: (resolve) => {
+        if (results[0] === "pending") {
+          results.shift()
+          return // never resolves: the wait stays in flight
+        }
+        resolve(results.shift() ?? { exitCode: 0, stdout: "", stderr: "" })
+      },
+    }
+    return handle
+  }
+  const injections2 = []
+  const toasts2 = []
+  const logs2 = []
+  const statuses2 = new Map()
+  const state = { deferStatus: false }
+  const statusReleases = []
+  const client2 = {
+    session: {
+      promptAsync: async (req) => {
+        injections2.push(req.path.id)
+      },
+      status: async () => {
+        // A deferred answer still carries the state at CALL time —
+        // that staleness is exactly what the generation guard is for.
+        // The SDK shape: { data: map } on success, { error } on failure.
+        if (state.statusError) return { error: state.statusError }
+        const snapshot = {
+          data: Object.fromEntries([...statuses2].map(([k, v]) => [k, { type: v }])),
+        }
+        if (state.deferStatus) {
+          return new Promise((r) => statusReleases.push(() => r(snapshot)))
+        }
+        return snapshot
+      },
+    },
+    tui: { showToast: async (req) => toasts2.push(req.body) },
+    app: { log: async (req) => logs2.push(req.body) },
+  }
+  return { $f, armSessions, results, client2, injections2, toasts2, logs2, statuses: statuses2, state, statusReleases }
+}
+
+const TOKEN = "ses_0bootstrap00000000000000000"
+const setToken = (v) => {
+  if (v === undefined) delete process.env.CLANK_BOOTSTRAP_SESSION_ID
+  else process.env.CLANK_BOOTSTRAP_SESSION_ID = v
+}
+
+// 1. The penlock case: a resumed, zero-event session whose launch
+// handed over its id gets its wait at plugin load, and work is
+// delivered without any turn having completed. The status fake uses
+// opencode's REAL shape: idle sessions are ABSENT from the map
+// (opencode deletes them), so an empty map here means idle.
+{
+  const s = makeSection()
+  s.results.push({ exitCode: 0, stdout: "bootstrap-work\n", stderr: "" })
+  setToken(TOKEN)
+  await ClankPlugin({ client: s.client2, $: s.$f, directory: "/fake/repo" })
+  setToken(undefined)
+  await settle()
+  assert(
+    s.armSessions.length === 1 && s.armSessions[0] === TOKEN,
+    `bootstrap must arm the token session: ${JSON.stringify(s.armSessions)}`,
+  )
+  assert(
+    s.injections2.length === 1 && s.injections2[0] === TOKEN,
+    "bootstrap work must inject without any turn",
+  )
+  assert(
+    s.logs2.some((l) => l.message === "arm"),
+    "the arm must be logged",
+  )
+}
+
+// 2. Detached init: a wait that never resolves must not block plugin
+// construction — opencode startup never waits on the long-poll.
+{
+  const s = makeSection()
+  s.results.push("pending")
+  setToken(TOKEN)
+  const hooks2 = await ClankPlugin({ client: s.client2, $: s.$f, directory: "/fake/repo" })
+  setToken(undefined)
+  assert(hooks2.event, "plugin construction resolves with a pending bootstrap wait")
+  await settle()
+  assert(s.armSessions.length === 1, "the detached arm still started")
+}
+
+// 3. One process, one owned session: with TWO bound sessions idle,
+// init arms and injects ONLY for the token session.
+{
+  const s = makeSection()
+  const OTHER = "ses_0other0000000000000000000"
+  s.results.push({ exitCode: 0, stdout: "a-work\n", stderr: "" })
+  setToken(TOKEN)
+  await ClankPlugin({ client: s.client2, $: s.$f, directory: "/fake/repo" })
+  setToken(undefined)
+  await settle()
+  assert(
+    s.armSessions.length === 1 && s.armSessions[0] === TOKEN,
+    `init must not arm another bound session: ${JSON.stringify(s.armSessions)}`,
+  )
+  assert(
+    !s.injections2.includes(OTHER),
+    "init must never promptAsync into another session",
+  )
+}
+
+// 4. A busy status blocks the bootstrap arm: the resume's own prompt
+// turn may still be running — never arm into it.
+{
+  const s = makeSection()
+  s.statuses.set(TOKEN, "busy")
+  setToken(TOKEN)
+  await ClankPlugin({ client: s.client2, $: s.$f, directory: "/fake/repo" })
+  setToken(undefined)
+  await settle()
+  assert(s.armSessions.length === 0, "a busy session must not be armed at load")
+}
+
+// 5. First-sighting is idle-verified: an arbitrary first event arms
+// only when session.status says idle — busy means no arm.
+{
+  const s = makeSection()
+  const hooks3 = await ClankPlugin({ client: s.client2, $: s.$f, directory: "/fake/repo" })
+  const IDLE_S = "ses_0seenidle0000000000000000"
+  const BUSY_S = "ses_0seenbusy0000000000000000"
+  // IDLE_S is ABSENT from the status map — opencode's idle shape.
+  s.statuses.set(BUSY_S, "busy")
+  const evt = (sessionID) =>
+    hooks3.event({ event: { type: "session.updated", properties: { sessionID } } })
+  await evt(IDLE_S)
+  await evt(BUSY_S)
+  await settle()
+  assert(
+    s.armSessions.length === 1 && s.armSessions[0] === IDLE_S,
+    `first-sighting arms only the status-idle session: ${JSON.stringify(s.armSessions)}`,
+  )
+}
+
+// 6. Diagnostics: exit 0 + empty stdout + stderr → toast + log,
+// NEVER a prompt. Repeated diagnostics still do not prompt or arm
+// through their own presentation.
+{
+  const s = makeSection()
+  const D = "ses_0diag00000000000000000000"
+  const hooks4 = await ClankPlugin({ client: s.client2, $: s.$f, directory: "/fake/repo" })
+  const diag = "hook: cannot resolve `x`'s role; arming no wait"
+  s.results.push(
+    { exitCode: 0, stdout: "", stderr: diag + "\n" },
+    { exitCode: 0, stdout: "", stderr: diag + "\n" },
+  )
+  const fire4 = () => hooks4.event({ event: { type: "session.idle", properties: { sessionID: D } } })
+  await fire4()
+  await settle()
+  assert(s.injections2.length === 0, "a diagnostic must not be injected")
+  assert(
+    s.toasts2.length === 1 && s.toasts2[0].message === diag,
+    `the diagnostic must toast: ${JSON.stringify(s.toasts2)}`,
+  )
+  assert(
+    s.logs2.some((l) => l.message === "diagnostic"),
+    "the diagnostic must be logged",
+  )
+  await fire4()
+  await settle()
+  assert(s.injections2.length === 0, "a repeated diagnostic still does not prompt")
+  assert(s.toasts2.length === 2, "a repeated diagnostic toasts again, not loops")
+}
+
+// 7. Deferred-status race: the activity generation is captured
+// BEFORE the status call. A user turn starting while status() is
+// pending must kill the arm, or the injection lands mid-turn with
+// the post-turn generation baked in as its baseline.
+{
+  const s = makeSection()
+  s.state.deferStatus = true
+  setToken(TOKEN)
+  const hooks7 = await ClankPlugin({ client: s.client2, $: s.$f, directory: "/fake/repo" })
+  setToken(undefined)
+  // The bootstrap's status call is now parked. A user turn starts —
+  // opencode would mark the session busy in the live map.
+  s.statuses.set(TOKEN, "busy")
+  await hooks7.event({
+    event: {
+      type: "message.updated",
+      properties: { sessionID: TOKEN, info: { id: "m_turn", role: "user" } },
+    },
+  })
+  // The status answer arrives (empty map = idle) — too late.
+  s.statusReleases.forEach((r) => r())
+  await settle()
+  assert(
+    s.armSessions.length === 0,
+    `an arm whose generation moved during the status check must drop: ${JSON.stringify(s.armSessions)}`,
+  )
+}
+
+// 8. A first-ever session.idle marks the session seen: the idle's
+// own housekeeping event must NOT read as a first sighting and
+// start a second wait behind the first.
+{
+  const s = makeSection()
+  const H = "ses_0housekeep000000000000000"
+  const hooks8 = await ClankPlugin({ client: s.client2, $: s.$f, directory: "/fake/repo" })
+  s.results.push({ exitCode: 0, stdout: "h-work\n", stderr: "" })
+  const fire8 = (type) => hooks8.event({ event: { type, properties: { sessionID: H } } })
+  await fire8("session.idle")
+  await fire8("session.updated") // the idle's own housekeeping
+  await settle()
+  const hArms = s.armSessions.filter((x) => x === H).length
+  assert(hArms === 1, `housekeeping after a first idle must not re-arm (arms for H=${hArms})`)
+}
+
+// 9. A rejected injection is caught and logged, never an unhandled
+// rejection — the bootstrap arm is detached.
+{
+  const s = makeSection()
+  s.client2.session.promptAsync = async () => {
+    throw new Error("tui gone")
+  }
+  s.results.push({ exitCode: 0, stdout: "doomed\n", stderr: "" })
+  setToken(TOKEN)
+  await ClankPlugin({ client: s.client2, $: s.$f, directory: "/fake/repo" })
+  setToken(undefined)
+  await settle()
+  assert(
+    s.logs2.some((l) => l.message === "inject failed"),
+    `the failed injection must be logged: ${JSON.stringify(s.logs2.map((l) => l.message))}`,
+  )
+}
+
+// 10. Unknown never arms: the SDK answers HTTP errors WITHOUT
+// throwing, as { error, request, response } with no `data`. Reading
+// that wrapper's absent key as "idle" would arm on a FAILED call.
+{
+  const s = makeSection()
+  s.state.statusError = { name: "ApiError", data: { message: "500" } }
+  setToken(TOKEN)
+  await ClankPlugin({ client: s.client2, $: s.$f, directory: "/fake/repo" })
+  setToken(undefined)
+  await settle()
+  assert(
+    s.armSessions.length === 0,
+    `a failed status call must never arm: ${JSON.stringify(s.armSessions)}`,
+  )
+}
 
 console.log("OK")
