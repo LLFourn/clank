@@ -156,6 +156,56 @@ impl Hue {
             Hue::Indexed(i) => format!("38;5;{i}"),
         }
     }
+
+    /// The same hue for a surface that has no terminal to map SGR
+    /// codes — the web page — so a blocked plan is one red on both.
+    /// The 16-colour codes take xterm's defaults; an index takes the
+    /// 256-palette's own arithmetic, exact for every value.
+    pub(super) fn hex(self) -> String {
+        let (r, g, b) = match self {
+            Hue::Red => (205, 49, 49),
+            Hue::Green => (13, 188, 121),
+            Hue::Yellow => (229, 229, 16),
+            Hue::Cyan => (17, 168, 205),
+            Hue::Indexed(i) => palette256(i),
+        };
+        format!("#{r:02x}{g:02x}{b:02x}")
+    }
+}
+
+/// xterm's 256-colour palette: the 16 system colours, a 6×6×6 cube
+/// with the standard 0/95/135/175/215/255 steps, then 24 greys.
+fn palette256(i: u8) -> (u8, u8, u8) {
+    const SYSTEM: [(u8, u8, u8); 16] = [
+        (0, 0, 0),
+        (205, 49, 49),
+        (13, 188, 121),
+        (229, 229, 16),
+        (36, 114, 200),
+        (188, 63, 188),
+        (17, 168, 205),
+        (229, 229, 229),
+        (102, 102, 102),
+        (241, 76, 76),
+        (35, 209, 139),
+        (245, 245, 67),
+        (59, 142, 234),
+        (214, 112, 214),
+        (41, 184, 219),
+        (255, 255, 255),
+    ];
+    match i {
+        0..=15 => SYSTEM[i as usize],
+        16..=231 => {
+            let n = i - 16;
+            let step = |v: u8| if v == 0 { 0 } else { 55 + v * 40 };
+            (step(n / 36), step((n / 6) % 6), step(n % 6))
+        }
+        232..=255 => {
+            let v = 8 + (i - 232) * 10;
+            (v, v, v)
+        }
+    }
 }
 
 /// The frame's one hue: red = a human must act (blocked), orange =

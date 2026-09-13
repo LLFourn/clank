@@ -1489,6 +1489,61 @@ const REBUILD_MIN: Duration = Duration::from_secs(1);
 
 const REOPEN_NOTICE: &str = "reopen pane";
 
+/// One agent's channel strip on the web page: what the TUI's agent
+/// row says, as data. `since` is the epoch second the elapsed counts
+/// from, so the page can keep it live without a status event.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct Strip {
+    pub(crate) label: String,
+    pub(crate) role: String,
+    pub(crate) verb: Option<String>,
+    pub(crate) since: Option<i64>,
+}
+
+/// The TUI's derived facts for the web page. Derived HERE, inside
+/// the module whose `pub(super)` items know how — the page must say
+/// what the pane says, and the only way to guarantee that is to ask
+/// the same functions.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct WebFacts {
+    /// The lamp's text and its plan, as `bar_text` gives them.
+    pub(crate) lamp: String,
+    pub(crate) plan: String,
+    /// The frame's hue as hex, from the same table as the bar.
+    pub(crate) hue: String,
+    pub(crate) strips: Vec<Strip>,
+}
+
+pub(crate) fn web_facts(snap: &StatusSnapshot) -> WebFacts {
+    let (lamp, plan) = render::bar_text(snap);
+    let activity = in_progress_rows(snap);
+    let strips = snap
+        .agents
+        .iter()
+        .map(|a| {
+            let live = activity.iter().find(|p| match p {
+                InProgress::PendingReview { label, .. } => label == &a.label,
+                InProgress::MasterWorking { name, .. } => name == &a.label,
+            });
+            Strip {
+                label: a.label.clone(),
+                role: render::tier_label(a.role).to_string(),
+                verb: live.map(|p| match p {
+                    InProgress::PendingReview { verb, .. }
+                    | InProgress::MasterWorking { verb, .. } => verb.to_string(),
+                }),
+                since: live.and_then(|p| p.since()),
+            }
+        })
+        .collect();
+    WebFacts {
+        lamp,
+        plan,
+        hue: derive::state_color(snap).hex(),
+        strips,
+    }
+}
+
 /// The spinner's frame rate — the only thing on screen that needs a
 /// fast tick.
 const SPINNER_TICK: Duration = Duration::from_millis(120);
@@ -4084,6 +4139,54 @@ pub(crate) mod tests {
         assert!(!v.fill);
         v.request_fill();
         assert!(v.fill, "input/data/resize re-arm the fill");
+    }
+
+    /// The web page's strips are the TUI's rows as data: same verb,
+    /// same `since`, same role names, same hue — asked of the same
+    /// functions, so the two surfaces cannot drift apart.
+    #[test]
+    fn the_web_facts_are_the_tuis_own_derivation() {
+        use crate::cli::status_tui::fixtures::{plan_state_at, reviewer_missing, with_agents};
+        use crate::cli::teams_config::RosterRole;
+        let s = with_agents(
+            crate::cli::status_tui::fixtures::snap(
+                vec![plan_state_at(
+                    "foo",
+                    reviewer_missing("codex"),
+                    clank_core::wait::Handover {
+                        opened: Some(1_000),
+                        ..Default::default()
+                    },
+                )],
+                vec![],
+            ),
+            &[
+                ("claude", RosterRole::Master),
+                ("codex", RosterRole::Commit),
+            ],
+        );
+        let facts = web_facts(&s);
+        let (lamp, plan) = render::bar_text(&s);
+        assert_eq!((facts.lamp, facts.plan), (lamp, plan));
+        assert_eq!(facts.hue, derive::state_color(&s).hex());
+        assert_eq!(
+            facts.strips,
+            vec![
+                Strip {
+                    label: "claude".into(),
+                    role: "master".into(),
+                    verb: None,
+                    since: None
+                },
+                Strip {
+                    label: "codex".into(),
+                    role: "commit".into(),
+                    verb: Some("reviewing".into()),
+                    since: Some(1_000)
+                },
+            ],
+            "the awaited reviewer carries its verb and clock; the idle master carries neither"
+        );
     }
 
     /// An elapsed on screen costs the pane nothing: it is recomputed

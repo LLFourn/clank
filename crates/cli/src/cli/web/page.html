@@ -1,0 +1,350 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>clank</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Martian+Mono:wght@700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css">
+<script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
+<style>
+  :root {
+    --base: #1a1917;
+    --bezel: #242220;
+    --edge: #302d29;
+    --ink: #e8e4dc;
+    --muted: #8a857c;
+    --amber: #e0a458;
+    --mono: ui-monospace, Menlo, "SF Mono", Consolas, monospace;
+    --plate: "Martian Mono", var(--mono);
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--base);
+    color: var(--ink);
+    font: 14px/1.4 var(--mono);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  /* The session name: the quietest thing on the page. */
+  .session {
+    padding: 8px 14px 4px;
+    color: var(--muted);
+    font-size: 12px;
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+  }
+  .session .live { color: var(--muted); }
+  .session .live.off { color: var(--amber); }
+
+  /* Channel strips: one per agent, and the strip is the tab. */
+  .strips {
+    display: flex;
+    overflow-x: auto;
+    scrollbar-width: none;
+    background: var(--bezel);
+    border-top: 1px solid var(--edge);
+    border-bottom: 1px solid var(--edge);
+  }
+  .strips::-webkit-scrollbar { display: none; }
+  .strip {
+    flex: 0 0 auto;
+    min-width: 132px;
+    padding: 10px 14px 9px;
+    border-right: 1px solid var(--edge);
+    border-bottom: 3px solid transparent;
+    cursor: pointer;
+    user-select: none;
+    text-align: left;
+    background: none;
+    color: inherit;
+    font: inherit;
+  }
+  .strip:focus-visible { outline: 2px solid var(--amber); outline-offset: -2px; }
+  .strip.on { border-bottom-color: var(--ink); }
+  .strip .name {
+    font-family: var(--plate);
+    font-weight: 700;
+    font-size: 17px;
+    letter-spacing: -0.01em;
+    line-height: 1.1;
+  }
+  .strip .role { color: var(--muted); font-size: 12px; margin-top: 3px; }
+  .strip .verb { font-size: 12px; margin-top: 6px; min-height: 1.4em; color: var(--muted); }
+  .strip .verb .dot {
+    display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+    background: var(--amber); margin-right: 6px; vertical-align: 1px;
+    animation: breathe 2.4s ease-in-out infinite;
+  }
+  .strip.working .verb { color: var(--ink); }
+  .strip.closed { opacity: 0.45; }
+  @keyframes breathe { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
+  @media (prefers-reduced-motion: reduce) { .strip .verb .dot { animation: none; } }
+
+  /* One pane at a time; the pane keeps its desktop size and the
+     viewport scrolls and pinches around it. */
+  .stage { flex: 1 1 auto; position: relative; overflow: hidden; }
+  .pane {
+    position: absolute; inset: 0;
+    overflow: auto;
+    -webkit-overflow-scrolling: touch;
+    touch-action: pan-x pan-y pinch-zoom;
+    padding: 6px 0 0 6px;
+    display: none;
+  }
+  .pane.on { display: block; }
+  .pane .term { width: max-content; }
+  .pane .gone {
+    position: absolute; inset: 0; display: none; align-items: center; justify-content: center;
+    color: var(--muted); background: color-mix(in srgb, var(--base) 70%, transparent);
+  }
+  .pane.closed .gone { display: flex; }
+  .empty {
+    position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+    color: var(--muted); padding: 24px; text-align: center;
+  }
+
+  /* The TUI's lamp line, verbatim, in the TUI's hue. */
+  .lamp {
+    padding: 6px 14px;
+    background: var(--bezel);
+    border-top: 1px solid var(--edge);
+    font-size: 13px;
+    display: flex; gap: 14px;
+    white-space: nowrap; overflow: hidden;
+  }
+  .lamp .text { font-weight: 700; }
+  .lamp .plan { color: var(--muted); overflow: hidden; text-overflow: ellipsis; }
+
+  /* Say something. */
+  .say {
+    display: flex; gap: 8px;
+    padding: 8px 10px calc(8px + env(safe-area-inset-bottom));
+    background: var(--bezel);
+    border-top: 1px solid var(--edge);
+  }
+  .say input {
+    flex: 1 1 auto; min-width: 0;
+    background: var(--base); color: var(--ink);
+    border: 1px solid var(--edge); border-radius: 4px;
+    padding: 9px 10px; font: 15px var(--mono);
+  }
+  .say input:focus { outline: 2px solid var(--amber); outline-offset: -1px; border-color: transparent; }
+  .say button {
+    background: var(--amber); color: var(--base);
+    border: 0; border-radius: 4px; padding: 0 16px;
+    font: 700 14px var(--mono); cursor: pointer;
+  }
+  .say button:disabled { opacity: 0.4; cursor: default; }
+  .say .sent { color: var(--muted); font-size: 12px; align-self: center; min-width: 4ch; }
+
+  .pane .head { display: none; }
+
+  /* Wide: every pane at once, each under its own strip — and that
+     strip is the selector here, since the top row is gone. */
+  @media (min-width: 960px) {
+    .strips { display: none; }
+    .stage { display: flex; overflow-x: auto; }
+    .stage > .pane, .stage > .pane.on {
+      position: static; display: flex; flex-direction: column;
+      flex: 1 0 auto; min-width: 0; border-right: 1px solid var(--edge);
+    }
+    .pane .head { display: block; width: 100%; border-right: 0; }
+    .pane .term { flex: 1 1 auto; overflow: auto; }
+    .pane.on .head { border-bottom-color: var(--ink); }
+  }
+</style>
+</head>
+<body>
+  <div class="session"><span id="session">clank</span><span class="live" id="live">connecting</span></div>
+  <div class="strips" id="strips" role="tablist"></div>
+  <div class="stage" id="stage"><div class="empty" id="empty">No agent panes in this session yet.</div></div>
+  <div class="lamp"><span class="text" id="lamp"></span><span class="plan" id="plan"></span></div>
+  <form class="say" id="say">
+    <input id="text" autocomplete="off" placeholder="Say something" aria-label="Say something to the selected agent">
+    <button id="send" type="submit" disabled>Send</button>
+    <span class="sent" id="sent"></span>
+  </form>
+
+<script>
+(() => {
+  const strips = document.getElementById('strips');
+  const stage = document.getElementById('stage');
+  const empty = document.getElementById('empty');
+  const lampEl = document.getElementById('lamp');
+  const planEl = document.getElementById('plan');
+  const liveEl = document.getElementById('live');
+  const form = document.getElementById('say');
+  const input = document.getElementById('text');
+  const send = document.getElementById('send');
+  const sentEl = document.getElementById('sent');
+
+  // pane id → { meta, strip, pane, term, el, closed }
+  const panes = new Map();
+  let selected = null;
+  // label → strip facts from the status feed
+  let facts = { strips: [], lamp: '', plan: '', hue: '' };
+
+  // The TUI's coarse ladder: seconds under a minute read `now`.
+  const coarse = (secs) => {
+    const s = Math.max(0, secs);
+    if (s < 60) return 'now';
+    if (s < 3600) return Math.floor(s / 60) + 'm';
+    if (s < 86400) return Math.floor(s / 3600) + 'h';
+    return Math.floor(s / 86400) + 'd';
+  };
+  const now = () => Math.floor(Date.now() / 1000);
+
+  function select(id) {
+    selected = id;
+    for (const [pid, p] of panes) {
+      const on = pid === id;
+      p.strip.classList.toggle('on', on);
+      p.strip.setAttribute('aria-selected', on ? 'true' : 'false');
+      p.pane.classList.toggle('on', on);
+      const head = p.pane.querySelector('.head');
+      head.classList.toggle('on', on);
+      head.setAttribute('aria-selected', on ? 'true' : 'false');
+    }
+    const p = panes.get(id);
+    send.disabled = !p || p.closed;
+    input.placeholder = p ? `Say something to ${p.meta.label}` : 'Say something';
+    if (p && !p.closed) p.term.scrollToBottom();
+  }
+
+  function makePane(meta) {
+    const strip = document.createElement('button');
+    strip.className = 'strip';
+    strip.type = 'button';
+    strip.setAttribute('role', 'tab');
+    strip.innerHTML = '<div class="name"></div><div class="role"></div><div class="verb"></div>';
+    strip.addEventListener('click', () => select(meta.id));
+    strips.appendChild(strip);
+
+    const pane = document.createElement('div');
+    pane.className = 'pane';
+    pane.innerHTML = '<button type="button" role="tab" class="head strip"><div class="name"></div><div class="role"></div><div class="verb"></div></button><div class="term"></div><div class="gone"></div>';
+    pane.querySelector('.head').addEventListener('click', () => select(meta.id));
+    stage.appendChild(pane);
+
+    const term = new Terminal({
+      cols: meta.columns || 80,
+      rows: meta.rows || 24,
+      disableStdin: true,
+      cursorBlink: false,
+      scrollback: 0,
+      fontFamily: 'ui-monospace, Menlo, "SF Mono", Consolas, monospace',
+      fontSize: 13,
+      allowProposedApi: true,
+      theme: { background: '#1a1917', foreground: '#e8e4dc' },
+    });
+    term.open(pane.querySelector('.term'));
+    const p = { meta, strip, pane, term, closed: false };
+    panes.set(meta.id, p);
+    paintStrip(p);
+    return p;
+  }
+
+  function paintStrip(p) {
+    const f = facts.strips.find((s) => s.label === p.meta.label);
+    const working = !!(f && f.verb);
+    const verb = p.closed ? 'pane closed'
+      : working ? `<span class="dot"></span>${f.verb}${f.since != null ? ' ' + coarse(now() - f.since) : ''}`
+      : '';
+    for (const root of [p.strip, p.pane.querySelector('.head')]) {
+      root.querySelector('.name').textContent = p.meta.label;
+      root.querySelector('.role').textContent = f ? f.role : '';
+      root.querySelector('.verb').innerHTML = verb;
+      root.classList.toggle('working', working && !p.closed);
+      root.classList.toggle('closed', p.closed);
+    }
+    p.pane.classList.toggle('closed', p.closed);
+    p.pane.querySelector('.gone').textContent = `${p.meta.label}'s pane closed`;
+  }
+
+  function onPanes(data) {
+    const seen = new Set();
+    for (const meta of data.panes) {
+      seen.add(meta.id);
+      let p = panes.get(meta.id);
+      if (!p) p = makePane(meta);
+      else if (p.meta.columns !== meta.columns || p.meta.rows !== meta.rows) {
+        p.meta = meta;
+        p.term.resize(meta.columns || 80, meta.rows || 24);
+      } else p.meta = meta;
+      p.closed = data.closed.includes(meta.id) || meta.exited;
+      paintStrip(p);
+    }
+    for (const [id, p] of panes) {
+      if (seen.has(id)) continue;
+      p.strip.remove(); p.pane.remove(); p.term.dispose(); panes.delete(id);
+    }
+    empty.style.display = panes.size ? 'none' : 'flex';
+    if (!panes.has(selected)) select(panes.keys().next().value || null);
+    else select(selected);
+  }
+
+  function onPane(data) {
+    const p = panes.get(data.pane_id);
+    if (!p) return;
+    // The server built the repaint: home, each row erased past its
+    // end, the rest of the screen cleared. Whether the pane is open
+    // is the table's to say, never a viewport's.
+    p.term.write(data.screen);
+  }
+
+  function onStatus(data) {
+    facts = data.facts || facts;
+    lampEl.textContent = facts.lamp || '';
+    lampEl.style.color = facts.hue || '';
+    planEl.textContent = facts.plan || '';
+    for (const p of panes.values()) paintStrip(p);
+  }
+
+  // Elapsed stays live between status events, at the TUI's cadence.
+  setInterval(() => { for (const p of panes.values()) paintStrip(p); }, 60000);
+
+  function connect() {
+    const es = new EventSource('/events');
+    es.addEventListener('panes', (e) => onPanes(JSON.parse(e.data)));
+    es.addEventListener('pane', (e) => onPane(JSON.parse(e.data)));
+    es.addEventListener('status', (e) => onStatus(JSON.parse(e.data)));
+    es.onopen = () => { liveEl.textContent = 'live'; liveEl.classList.remove('off'); };
+    es.onerror = () => { liveEl.textContent = 'reconnecting'; liveEl.classList.add('off'); };
+  }
+
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const text = input.value;
+    if (!selected || !text) return;
+    send.disabled = true;
+    try {
+      const r = await fetch('/say', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ pane: selected, text }),
+      });
+      if (!r.ok) throw new Error(await r.text());
+      input.value = '';
+      sentEl.textContent = 'Sent';
+      setTimeout(() => { sentEl.textContent = ''; }, 1500);
+    } catch (err) {
+      sentEl.textContent = 'Not sent';
+      console.error(err);
+    } finally {
+      send.disabled = !panes.get(selected) || panes.get(selected).closed;
+      input.focus();
+    }
+  });
+
+  document.getElementById('session').textContent = document.title = window.CLANK_SESSION || 'clank';
+  connect();
+})();
+</script>
+</body>
+</html>

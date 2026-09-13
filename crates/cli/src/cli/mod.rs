@@ -52,6 +52,7 @@ pub mod teams_config;
 pub(crate) mod term;
 pub mod unfinish;
 pub mod wait;
+pub(crate) mod web;
 
 #[derive(Args, Debug)]
 pub struct ConfigArgs {
@@ -1654,6 +1655,21 @@ pub struct BlockCreateArgs {
 pub struct BlockCleanArgs {
     #[arg(long, value_name = "PATH")]
     pub repo: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub struct WebArgs {
+    /// Repo root. Defaults to the cwd's git toplevel.
+    #[arg(long, value_name = "PATH")]
+    pub repo: Option<PathBuf>,
+    /// Port on 127.0.0.1 to serve the page on.
+    #[arg(long, default_value_t = 8088)]
+    pub port: u16,
+    /// The zellij session holding this repo's panes. Defaults to the
+    /// session this runs inside, else the one `clank open` names;
+    /// either way the listing is checked for the repo's panes.
+    #[arg(long, value_name = "NAME")]
+    pub session: Option<String>,
 }
 
 #[derive(Args, Debug)]

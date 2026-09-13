@@ -1184,6 +1184,179 @@ pub(crate) fn snapshot_panes() -> Option<Vec<ZellijPane>> {
     list_agent_panes()
 }
 
+/// The session `clank open` names for `repo` — the convention, not
+/// necessarily where the repo's panes ARE: `open_one` adds a tab to
+/// whatever session the caller is in. A caller that needs the truth
+/// verifies the listing (`repo_tab_id`).
+pub(crate) fn repo_session_name(repo: &Path) -> String {
+    let basename = repo.file_name().and_then(|s| s.to_str()).unwrap_or("repo");
+    session_name(basename)
+}
+
+/// The session this process runs inside, if any.
+pub(crate) fn current_session() -> Option<String> {
+    std::env::var("ZELLIJ_SESSION_NAME")
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
+/// [`snapshot_panes`] for a NAMED session, from inside it or not.
+/// `clank web` runs wherever it was started and asks about the
+/// session it was pointed at.
+pub(crate) fn snapshot_panes_in(session: &str) -> Option<Vec<ZellijPane>> {
+    let out = std::process::Command::new("zellij")
+        .args([
+            "--session",
+            session,
+            "action",
+            "list-panes",
+            "--json",
+            "--command",
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    serde_json::from_slice(&out.stdout).ok()
+}
+
+/// One agent pane as the web page needs it: identity, size, and
+/// whether its process has ended. Columns matter because a subscribed
+/// viewport carries rows (its line count) but not width.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct PaneMeta {
+    pub(crate) id: String,
+    pub(crate) label: String,
+    pub(crate) columns: u16,
+    pub(crate) rows: u16,
+    pub(crate) exited: bool,
+}
+
+/// This repo's agent panes from a listing, by label — the identity
+/// `agent_pane_label` reads off the launch command, never a title.
+pub(crate) fn agent_pane_table(panes: &[ZellijPane], repo: &Path) -> Vec<PaneMeta> {
+    let repo_str = repo.to_string_lossy();
+    let mut out: Vec<PaneMeta> = panes
+        .iter()
+        .filter_map(|p| {
+            let label = agent_pane_label(p, &repo_str)?;
+            Some(PaneMeta {
+                id: p.pane_id(),
+                label: label.to_string(),
+                columns: p.pane_columns,
+                rows: p.pane_rows,
+                exited: p.exited,
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| a.label.cmp(&b.label).then(a.id.cmp(&b.id)));
+    out
+}
+
+/// The `subscribe` argv for a set of panes, or nothing for none — a
+/// subscription to no panes is not a subscription. `--ansi` because
+/// the page renders through a terminal emulator that wants the
+/// escapes; `--format json` because each line then names its pane.
+pub(crate) fn subscribe_argv(session: &str, panes: &[String]) -> Option<Vec<String>> {
+    if panes.is_empty() {
+        return None;
+    }
+    let mut argv: Vec<String> = [
+        "--session",
+        session,
+        "subscribe",
+        "--format",
+        "json",
+        "--ansi",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    for p in panes {
+        argv.push("-p".to_string());
+        argv.push(p.clone());
+    }
+    Some(argv)
+}
+
+/// A running `zellij subscribe`, killed when dropped: it is a child
+/// of ours and must not outlive us.
+pub(crate) struct SubscribeChild(std::process::Child);
+
+impl SubscribeChild {
+    pub(crate) fn take_stdout(&mut self) -> Option<std::process::ChildStdout> {
+        self.0.stdout.take()
+    }
+}
+
+impl Drop for SubscribeChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Start streaming `panes`' viewports from `session`. `None` for no
+/// panes, or when zellij could not be started.
+pub(crate) fn subscribe_panes(session: &str, panes: &[String]) -> Option<SubscribeChild> {
+    let argv = subscribe_argv(session, panes)?;
+    std::process::Command::new("zellij")
+        .args(&argv)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()
+        .map(SubscribeChild)
+}
+
+/// The two actions that say `text` to a pane and press Enter, as
+/// argv after the session prefix; nothing for empty text. The text
+/// follows `--`, so a message beginning with `-` is a message, not a
+/// flag. Enter is byte 13 through `write`, not a newline through
+/// `write-chars`: a newline is what a multi-line paste is made of,
+/// and a chat prompt treats those differently from Return.
+///
+/// Not a pane MUTATION in the ownership gate's sense: typing into a
+/// pane leaves its place in the layout to the reconciler, which is
+/// what that gate protects.
+pub(crate) fn say_argvs(pane: &str, text: &str) -> Option<[Vec<String>; 2]> {
+    if text.is_empty() {
+        return None;
+    }
+    let chars = ["action", "write-chars", "-p", pane, "--", text]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let enter = ["action", "write", "-p", pane, "13"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    Some([chars, enter])
+}
+
+/// Say `text` to `pane` in `session` and press Enter.
+pub(crate) fn say_to_pane(session: &str, pane: &str, text: &str) -> anyhow::Result<()> {
+    let Some(argvs) = say_argvs(pane, text) else {
+        return Ok(());
+    };
+    for argv in argvs {
+        let out = std::process::Command::new("zellij")
+            .args(["--session", session])
+            .args(&argv)
+            .output()?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "zellij refused `{}` for {pane}: {}",
+                argv.get(1).map(String::as_str).unwrap_or("?"),
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Project a pane listing to this repo's agents as `(label, staged)`
 /// — the label from the exact launch command, `staged` from GEOMETRY:
 /// the pane holding the most cells of any agent pane in its tab is
@@ -1706,7 +1879,7 @@ pub(crate) fn rename_pane(id: &str, name: &str) {
 /// (`spawning zellij: No such file or directory`) after a silent
 /// empty `list-sessions`, which told the user nothing about what to
 /// install (zellij-is-the-workspace).
-fn require_zellij() -> anyhow::Result<()> {
+pub(crate) fn require_zellij() -> anyhow::Result<()> {
     require_zellij_given(placement_capability())
 }
 
@@ -3844,6 +4017,95 @@ dead-one [Created 10h ago] (EXITED - attach to resurrect)
             !pane_is_gone(Some("s"), Some("70"), Some(&[])),
             "an empty listing is a listing that told us nothing useful \
              — the session has panes, we just cannot see them"
+        );
+    }
+
+    /// The web page's pane table: this repo's agents only, by launch
+    /// command, with the width a subscribed viewport does not carry.
+    #[test]
+    fn the_pane_table_is_this_repos_agents_with_their_sizes() {
+        let panes = panes_of(
+            r#"[
+          {"id":1,"terminal_command":"clank agent start claude --repo /a","tab_id":6,"pane_columns":120,"pane_rows":40},
+          {"id":2,"terminal_command":"clank agent start codex --repo /a","tab_id":6,"pane_columns":60,"pane_rows":40,"exited":true},
+          {"id":3,"terminal_command":"clank agent start other --repo /b","tab_id":6,"pane_columns":60,"pane_rows":40},
+          {"id":4,"terminal_command":"clank status --repo /a --tui","tab_id":6,"pane_columns":60,"pane_rows":10},
+          {"id":0,"title":"zellij:tab-bar","is_plugin":true,"tab_id":6}
+        ]"#,
+        );
+        let table = agent_pane_table(&panes, Path::new("/a"));
+        assert_eq!(
+            table,
+            vec![
+                PaneMeta {
+                    id: "terminal_1".into(),
+                    label: "claude".into(),
+                    columns: 120,
+                    rows: 40,
+                    exited: false
+                },
+                PaneMeta {
+                    id: "terminal_2".into(),
+                    label: "codex".into(),
+                    columns: 60,
+                    rows: 40,
+                    exited: true
+                },
+            ],
+            "another repo's agent and the instrument pane are not agents of this repo"
+        );
+    }
+
+    /// The subscribe argv names every pane and asks for the escapes;
+    /// no panes is no subscription.
+    #[test]
+    fn the_subscribe_argv_names_every_pane_or_nothing() {
+        let argv = subscribe_argv("clank-a", &["terminal_1".into(), "terminal_7".into()]).unwrap();
+        assert_eq!(
+            argv,
+            vec![
+                "--session",
+                "clank-a",
+                "subscribe",
+                "--format",
+                "json",
+                "--ansi",
+                "-p",
+                "terminal_1",
+                "-p",
+                "terminal_7"
+            ]
+        );
+        assert_eq!(subscribe_argv("clank-a", &[]), None);
+    }
+
+    /// Text, then Enter as byte 13 — two actions — and a message that
+    /// starts with a dash is still a message. Empty text says nothing.
+    #[test]
+    fn saying_something_is_the_text_then_return() {
+        let [chars, enter] = say_argvs("terminal_3", "-n hello there").unwrap();
+        assert_eq!(
+            chars,
+            vec![
+                "action",
+                "write-chars",
+                "-p",
+                "terminal_3",
+                "--",
+                "-n hello there"
+            ]
+        );
+        assert_eq!(enter, vec!["action", "write", "-p", "terminal_3", "13"]);
+        assert_eq!(say_argvs("terminal_3", ""), None);
+    }
+
+    /// The convention is deterministic per repo, and it is only a
+    /// convention: the caller verifies where the panes actually are.
+    #[test]
+    fn the_repo_session_name_is_the_open_convention() {
+        assert_eq!(
+            repo_session_name(Path::new("/x/y/penlock-experiment")),
+            "clank-penlock-experiment"
         );
     }
 
