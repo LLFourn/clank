@@ -1559,10 +1559,7 @@ mod tests {
             &mut summary,
         )
         .unwrap();
-        assert_eq!(
-            std::fs::read_to_string(&path).unwrap(),
-            "setup v2 content"
-        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "setup v2 content");
         assert!(summary[0].contains("upgrade"), "{summary:?}");
         assert_eq!(
             manifest.get("SKILL.md").map(String::as_str),
@@ -1627,10 +1624,7 @@ mod tests {
             &mut summary,
         )
         .unwrap();
-        assert_eq!(
-            std::fs::read_to_string(&path).unwrap(),
-            "setup v2 content"
-        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "setup v2 content");
     }
 
     #[test]
@@ -1699,7 +1693,12 @@ mod tests {
             AssetState::Current
         );
         assert_eq!(
-            classify_asset_state("v2 other mode", expected, &[alternate.clone()], Some(&recorded)),
+            classify_asset_state(
+                "v2 other mode",
+                expected,
+                &[alternate.clone()],
+                Some(&recorded)
+            ),
             AssetState::ModeAlternate
         );
         // What doctor calls old, setup overwrites: manifest match.

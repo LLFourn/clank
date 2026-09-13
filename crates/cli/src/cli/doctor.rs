@@ -1380,11 +1380,7 @@ mod tests {
         );
 
         // The same bytes with NO provenance are drift, and the flag stays.
-        let r = check_setup_asset(
-            dir.path(),
-            &asset,
-            &crate::cli::setup::SetupManifest::new(),
-        );
+        let r = check_setup_asset(dir.path(), &asset, &crate::cli::setup::SetupManifest::new());
         assert!(r.message.contains("setup --force"), "{}", r.message);
     }
 

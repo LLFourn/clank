@@ -1238,36 +1238,34 @@ pub(crate) fn repo_tab_id(panes: &[ZellijPane], repo: &Path) -> Option<u32> {
         .map(|p| p.tab_id)
 }
 
-/// The tab's CURRENT orientation, so a re-layout keeps the arrangement
-/// the operator chose with alt+[ / alt+]: the instrument pane beside
-/// the stage is landscape, below it is portrait. Without both panes to
-/// compare, the tab's extent decides as it does at open.
-pub(crate) fn tab_orientation(panes: &[ZellijPane], repo: &Path, tab_id: u32) -> Orientation {
-    let repo_str = repo.to_string_lossy();
-    let status_command = format!("clank status --repo {repo_str} --tui");
-    let in_tab = |p: &&ZellijPane| !p.is_plugin && p.tab_id == tab_id;
-    let status = panes
-        .iter()
-        .filter(in_tab)
-        .find(|p| p.terminal_command.as_deref() == Some(status_command.as_str()));
-    let stage = agent_pane_pairs(panes, repo)
-        .iter()
-        .zip(
-            panes
-                .iter()
-                .filter(|p| agent_pane_label(p, &repo_str).is_some()),
-        )
-        .find(|((_, staged), p)| *staged && p.tab_id == tab_id)
-        .map(|(_, p)| p);
-    match (stage, status) {
-        (Some(stage), Some(status)) if status.pane_x >= stage.pane_x + stage.pane_columns => {
-            Orientation::Landscape
-        }
-        (Some(stage), Some(status)) if status.pane_y >= stage.pane_y + stage.pane_rows => {
-            Orientation::Portrait
-        }
-        _ => Orientation::detect(tab_dims(panes, tab_id)),
-    }
+/// The tab's orientation: its SHAPE decides, the same rule
+/// `clank open` composes with ([`Orientation::detect`]).
+///
+/// It used to be inferred from where the panes sat — the instrument
+/// pane beside the stage read landscape, below it portrait — so that a
+/// re-layout would keep whatever alt+[ last chose. That reading is
+/// taken at the one moment it cannot be trusted: a roster change adds
+/// the new pane with `new-pane`, which splits whatever is focused, and
+/// the reconciler then lists the tab and infers from that
+/// half-finished arrangement. The stage is merely the biggest agent
+/// pane, and a pane created seconds ago, before any layout placed it,
+/// is not reliably the one the operator sees — so a portrait tab could
+/// re-lay as landscape, on a swap, for no reason but the transient
+/// (lloyd on ed080a7).
+///
+/// The extent cannot do that. Panes TILE the tab, so
+/// `max(x + columns), max(y + rows)` is the tab's size however they
+/// are arranged inside it: adding a pane, closing one, or flipping the
+/// arrangement leaves it exactly as it was. That is the whole property
+/// — the answer is the same before and after the change that provoked
+/// the question.
+///
+/// The cost is stated where it is paid: alt+[ / alt+] are ZELLIJ's
+/// keys over the swap variants clank ships, so a manual flip still
+/// works and is still forgotten by the next re-layout, which returns
+/// the tab to the shape its size implies.
+pub(crate) fn tab_orientation(panes: &[ZellijPane], _repo: &Path, tab_id: u32) -> Orientation {
+    Orientation::detect(tab_dims(panes, tab_id))
 }
 
 /// Open a pane for `label` in this repo's tab, running its launch
@@ -3892,16 +3890,15 @@ dead-one [Created 10h ago] (EXITED - attach to resurrect)
         assert_eq!(repo_tab_id(&agents_only, Path::new("/a")), Some(4));
     }
 
-    /// The tab's CURRENT orientation comes from where the instrument
-    /// pane sits relative to the stage, so a re-layout keeps what
-    /// alt+[ chose; without both to compare, the tab's extent decides.
+    /// The tab's SHAPE answers, and the arrangement inside it does
+    /// not get a vote — these two fixtures are each arranged AGAINST
+    /// their extent, which is exactly how the old reading justified
+    /// itself and exactly what made a swap flip the layout.
     #[test]
-    fn tab_orientation_is_read_from_the_stage_and_the_instrument_pane() {
-        // Each fixture is arranged AGAINST what its extent would say,
-        // so the geometry read is what answers, never the size rule.
-        // A tall tab (100x60 — the size rule says portrait) arranged
-        // landscape: the instrument pane beside the stage.
-        let landscape = panes_of(
+    fn a_tabs_extent_decides_its_orientation_whatever_the_panes_say() {
+        // 100x60 — taller than 2:1, so portrait — arranged landscape:
+        // the instrument pane beside the stage.
+        let arranged_landscape = panes_of(
             r#"[
           {"id":1,"terminal_command":"clank agent start claude --repo /a","tab_id":6,"pane_x":0,"pane_columns":60,"pane_y":0,"pane_rows":60},
           {"id":2,"terminal_command":"clank agent start codex --repo /a","tab_id":6,"pane_x":60,"pane_columns":40,"pane_y":0,"pane_rows":30},
@@ -3909,13 +3906,12 @@ dead-one [Created 10h ago] (EXITED - attach to resurrect)
         ]"#,
         );
         assert_eq!(
-            tab_orientation(&landscape, Path::new("/a"), 6),
-            Orientation::Landscape,
-            "a tall tab the user flipped to landscape stays landscape"
+            tab_orientation(&arranged_landscape, Path::new("/a"), 6),
+            Orientation::Portrait,
+            "a tall tab is portrait however its panes are sitting"
         );
-        // A wide tab (200x50 — the size rule says landscape) arranged
-        // portrait: the stage on top, the side region below it.
-        let portrait = panes_of(
+        // 200x50 — wider than 2:1, so landscape — arranged portrait.
+        let arranged_portrait = panes_of(
             r#"[
           {"id":1,"terminal_command":"clank agent start claude --repo /a","tab_id":3,"pane_x":0,"pane_columns":200,"pane_y":0,"pane_rows":30},
           {"id":2,"terminal_command":"clank agent start codex --repo /a","tab_id":3,"pane_x":0,"pane_columns":120,"pane_y":30,"pane_rows":20},
@@ -3923,17 +3919,48 @@ dead-one [Created 10h ago] (EXITED - attach to resurrect)
         ]"#,
         );
         assert_eq!(
-            tab_orientation(&portrait, Path::new("/a"), 3),
-            Orientation::Portrait,
-            "a wide tab the user flipped to portrait stays portrait"
+            tab_orientation(&arranged_portrait, Path::new("/a"), 3),
+            Orientation::Landscape,
+            "and a wide one is landscape"
         );
-        // No instrument pane to compare against: the extent rule.
-        let bare = panes_of(
-            r#"[{"id":1,"terminal_command":"clank agent start claude --repo /a","tab_id":3,"pane_x":0,"pane_columns":200,"pane_y":0,"pane_rows":50}]"#,
+        // The boundary detect draws, in the units it draws it in:
+        // cells are ~2:1, so 2:1 columns:rows is the first landscape.
+        assert_eq!(Orientation::detect((100, 50)), Orientation::Landscape);
+        assert_eq!(Orientation::detect((99, 50)), Orientation::Portrait);
+    }
+
+    /// THE reported failure. A master swap adds a pane before any
+    /// layout places it, and `new-pane` puts it where zellij likes —
+    /// here beside the stage, which the old reading called landscape
+    /// on a portrait tab. The answer must not move: a re-layout
+    /// provoked by a roster change composes the same shape the tab
+    /// already had.
+    #[test]
+    fn adding_a_pane_does_not_change_the_tabs_orientation() {
+        // 80x137: portrait, stage over instrument.
+        let before = panes_of(
+            r#"[
+          {"id":1,"terminal_command":"clank agent start kimi --repo /a","tab_id":6,"pane_x":0,"pane_columns":80,"pane_y":0,"pane_rows":90},
+          {"id":3,"terminal_command":"clank status --repo /a --tui","tab_id":6,"pane_x":0,"pane_columns":80,"pane_y":90,"pane_rows":47}
+        ]"#,
+        );
+        // The swap: kimi's pane is gone, claude's is new and unplaced —
+        // smaller than the instrument pane, and beside it.
+        let after = panes_of(
+            r#"[
+          {"id":9,"terminal_command":"clank agent start claude --repo /a","tab_id":6,"pane_x":0,"pane_columns":40,"pane_y":0,"pane_rows":90},
+          {"id":3,"terminal_command":"clank status --repo /a --tui","tab_id":6,"pane_x":40,"pane_columns":40,"pane_y":0,"pane_rows":137}
+        ]"#,
         );
         assert_eq!(
-            tab_orientation(&bare, Path::new("/a"), 3),
-            Orientation::Landscape
+            tab_orientation(&before, Path::new("/a"), 6),
+            Orientation::Portrait
+        );
+        assert_eq!(
+            tab_orientation(&after, Path::new("/a"), 6),
+            tab_orientation(&before, Path::new("/a"), 6),
+            "the tab is the same size, so it is the same shape — the \
+             arrangement mid-swap is not evidence of anything"
         );
     }
 
