@@ -185,7 +185,7 @@ pub(super) fn row_line(spans: &[Span], selected: bool, color: &str, cols: usize)
 /// `initial_prompt` with newlines would otherwise inject extra rows and
 /// break the clamp.
 pub(super) fn one_line(s: &str, cols: usize) -> String {
-    let first: String = s
+    let first: String = strip_escapes(s)
         .lines()
         .next()
         .unwrap_or("")
@@ -193,6 +193,41 @@ pub(super) fn one_line(s: &str, cols: usize) -> String {
         .filter(|c| !c.is_control())
         .collect();
     truncate_to(&first, cols)
+}
+
+/// `s` without its escape sequences — CSI (`ESC [ … final`), OSC
+/// (`ESC ] … BEL` or `ESC \`) and a lone `ESC x` — whole, so a
+/// coloured diagnostic loses its colour and not just its ESC, which
+/// left `[31m` in the text (codex on 5fd8a69).
+pub(super) fn strip_escapes(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('[') => {
+                for c in chars.by_ref() {
+                    if ('\x40'..='\x7e').contains(&c) {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                let mut prev = '\0';
+                for c in chars.by_ref() {
+                    if c == '\x07' || (prev == '\x1b' && c == '\\') {
+                        break;
+                    }
+                    prev = c;
+                }
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 /// A section-divider rule (`── TITLE ─────`), dimmed. When `focused`

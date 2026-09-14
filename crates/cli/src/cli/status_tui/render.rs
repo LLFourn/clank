@@ -610,6 +610,12 @@ pub(super) fn scrollable_header(
             let spans = vec![plain("+ add agent".to_string())];
             head_out.push(row_line(&spans, add_selected, color, cols));
         }
+        head_out.push(row_line(
+            &remote_row(view.remote, view.remote_detail),
+            mode.selected() == at(PanelRow::Remote),
+            color,
+            cols,
+        ));
     }
 
     // The gauge body — the load-bearing state the log does NOT carry
@@ -1048,6 +1054,41 @@ pub(super) fn bar(
         rhue.sgr(),
         hue.sgr()
     )
+}
+
+/// The remote row under the agents: the bar's glyph in the bar's
+/// hue, the name, and what there is to say — the URL when on, the
+/// reason when failed.
+pub(super) fn remote_row(
+    remote: crate::cli::status_tui::remote::Shown,
+    detail: Option<&str>,
+) -> Vec<Span> {
+    use crate::cli::status_tui::remote::Shown::*;
+    use crate::cli::status_tui::text::Style;
+    let (glyph, _) = remote_glyph(remote);
+    let style = match remote {
+        On => Style::Color("32"),
+        Failed => Style::Color("31"),
+        Off | Starting => Style::Dim,
+    };
+    // The reason is the server's stderr tail — lines, and whatever
+    // control bytes it printed; the overlay shows it whole, the row
+    // its first line and nothing that could move the cursor (codex
+    // on 5fd8a69).
+    let said = match (remote, detail) {
+        (Off, _) => "off".to_string(),
+        (Starting, _) => "starting…".to_string(),
+        (On, Some(url)) => one_line(url, usize::MAX),
+        (On, None) => "on".to_string(),
+        (Failed, Some(why)) => format!("failed — {}", one_line(why, usize::MAX)),
+        (Failed, None) => "failed".to_string(),
+    };
+    let pad = MARK_FIELD.saturating_sub(display_width(glyph));
+    vec![
+        Span(style, format!("{glyph}{}", " ".repeat(pad))),
+        plain(" remote".to_string()),
+        dim(format!("  {said}")),
+    ]
 }
 
 /// The remote switch's glyph and hue: dim when off, the "not yet
@@ -3263,6 +3304,7 @@ mod tests {
                             log_cursor: 0,
                             reach: crate::cli::status_tui::zellij::ZellijReach::NotInSession,
                             remote: Default::default(),
+                            remote_detail: None,
                             presence: None,
                             lift,
                         };
@@ -3303,6 +3345,7 @@ mod tests {
             log_cursor: cursor,
             reach: crate::cli::status_tui::zellij::ZellijReach::NotInSession,
             remote: Default::default(),
+            remote_detail: None,
             presence: None,
             lift,
         }
@@ -3518,6 +3561,7 @@ mod tests {
             lift: 0,
             reach: crate::cli::status_tui::zellij::ZellijReach::NotInSession,
             remote: Default::default(),
+            remote_detail: None,
             presence: None,
         };
         let rule_of = |offset: usize| {
@@ -3881,6 +3925,68 @@ mod tests {
                     "{reach:?} at {cols} cols renders `{v}`"
                 );
             }
+        }
+    }
+
+    /// The row under the agents says the switch's state, the URL when
+    /// on and the reason when failed, and sits after `+ add agent`.
+    #[test]
+    fn the_remote_row_says_its_state_url_or_reason() {
+        use crate::cli::status_tui::remote::Shown::*;
+        let s = two_agent_snap();
+        let texts = |remote, detail: Option<&str>| {
+            let mut view = PanelView::just(Mode::AgentPanel { sel: 0 });
+            view.remote = remote;
+            view.remote_detail = detail;
+            scrollable_header(&s, 40, 80, 0, &view)
+                .iter()
+                .map(|l| visible(l).trim_end().to_string())
+                .collect::<Vec<_>>()
+        };
+        for (remote, detail, want) in [
+            (Off, None, "⌁  remote  off"),
+            (Starting, None, "·  remote  starting…"),
+            (
+                On,
+                Some("http://127.0.0.1:8088"),
+                "⌁  remote  http://127.0.0.1:8088",
+            ),
+            (
+                Failed,
+                Some("address in use"),
+                "⌁  remote  failed — address in use",
+            ),
+        ] {
+            let lines = texts(remote, detail);
+            let add = lines
+                .iter()
+                .position(|l| l.ends_with("+ add agent"))
+                .unwrap();
+            assert_eq!(lines[add + 1], want, "{lines:#?}");
+        }
+        let spans = remote_row(On, Some("http://x"));
+        assert!(matches!(
+            spans[0].0,
+            crate::cli::status_tui::text::Style::Color("32")
+        ));
+        let spans = remote_row(Failed, Some("why"));
+        assert!(matches!(
+            spans[0].0,
+            crate::cli::status_tui::text::Style::Color("31")
+        ));
+        // A reason is the server's stderr tail: several lines, and
+        // control bytes if it printed any. The row is ONE row — its
+        // first line, no control — selected or not.
+        let why = "cannot start\x1b[31m here\x1b]0;title\x07\nCaused by: no session\x07";
+        for selected in [false, true] {
+            let line = row_line(&remote_row(Failed, Some(why)), selected, "33", 60);
+            assert!(!line.contains('\n'), "{selected}: {line:?}");
+            let shown = visible(&line);
+            assert!(
+                !shown.chars().any(|c| c.is_control()),
+                "{selected}: {shown:?}"
+            );
+            assert_eq!(shown.trim_end(), "⌁  remote  failed — cannot start here");
         }
     }
 
@@ -4480,6 +4586,7 @@ mod tests {
                 lift: 0,
                 reach: crate::cli::status_tui::zellij::ZellijReach::NotInSession,
                 remote: Default::default(),
+                remote_detail: None,
                 presence: None,
             },
         )
@@ -4530,6 +4637,7 @@ mod tests {
             lift: 0,
             reach: crate::cli::status_tui::zellij::ZellijReach::NotInSession,
             remote: Default::default(),
+            remote_detail: None,
             presence: None,
         };
 
@@ -4635,6 +4743,7 @@ mod tests {
                 lift: 0,
                 reach: crate::cli::status_tui::zellij::ZellijReach::NotInSession,
                 remote: Default::default(),
+                remote_detail: None,
                 presence: None,
             },
         )
@@ -4784,7 +4893,7 @@ mod tests {
             80,
             0,
             0,
-            &PanelView::just(Mode::AgentPanel { sel: 3 }),
+            &PanelView::just(Mode::AgentPanel { sel: 4 }),
         )
         .0;
         let texts: Vec<String> = out.iter().map(|l| visible(l)).collect();
@@ -4861,7 +4970,7 @@ mod tests {
             80,
             0,
             0,
-            &PanelView::just(Mode::AgentPanel { sel: 3 }),
+            &PanelView::just(Mode::AgentPanel { sel: 4 }),
         )
         .0;
         let texts: Vec<String> = out.iter().map(|l| visible(l)).collect();
@@ -4886,7 +4995,7 @@ mod tests {
             texts.iter().any(|t| t.contains("dep finished — pop?")),
             "ready nudge shown"
         );
-        // sel 3 = the stash row (first row after "+ add") carries the band.
+        // sel 4 = the stash row (first after "+ add" and remote) carries the band.
         let row = texts.iter().position(|t| t.contains("parked")).unwrap();
         assert!(out[row].contains(REVERSE), "stash row selection band");
 
@@ -4994,6 +5103,7 @@ mod tests {
             lift: 0,
             reach: crate::cli::status_tui::zellij::ZellijReach::NotInSession,
             remote: Default::default(),
+            remote_detail: None,
             presence: None,
         };
         let lines = render_at(&s, 40, 80, 0, 0, &view).0;

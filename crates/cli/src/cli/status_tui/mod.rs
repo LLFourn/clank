@@ -2294,6 +2294,14 @@ pub(crate) async fn run_tui(
         // Presence may have moved an agent page's action list since
         // the last frame; the cursor follows its action before this
         // one paints.
+        // The remote's word is for the operator wherever they are:
+        // the overlay mounts over any page, and the loop goes round
+        // to draw it, as a reopen's does. Drained before the view
+        // borrows the switch for its row.
+        if let Some(n) = remote.drain().pop() {
+            detail = Some(Overlay::notice(n));
+            continue;
+        }
         let presence = reconcile_worker.presence();
         mode = settle_detail_cursor(mode, &snapshot.agents, &presence, &mut detail_shown);
         let view = PanelView {
@@ -2309,6 +2317,7 @@ pub(crate) async fn run_tui(
             // batch, the loop never waits on zellij to paint.
             reach: reconcile_worker.reach(),
             remote: remote.shown(),
+            remote_detail: remote.detail(),
             presence,
         };
         // An overlay mounted here is drawn by the branch at the TOP of
@@ -2322,13 +2331,6 @@ pub(crate) async fn run_tui(
             &mut snapshot,
             &mut detail,
         ) {
-            continue;
-        }
-        // The remote's word is for the operator wherever they are:
-        // the overlay mounts over any page, and the loop goes round
-        // to draw it, as a reopen's does.
-        if let Some(n) = remote.drain().pop() {
-            detail = Some(Overlay::notice(n));
             continue;
         }
         // The ask lines depend on blocks (not the log fetch), so compute
@@ -2684,6 +2686,12 @@ pub(crate) async fn run_tui(
                                         }
                                     }
                                 }
+                                PanelAction::ToggleRemote => {
+                                    if let Some(n) = remote.toggle() {
+                                        detail = Some(Overlay::notice(n));
+                                    }
+                                }
+                                PanelAction::OpenRemote => remote.open_again(),
                                 PanelAction::OpenPicker => {
                                     // Read the candidates FRESH right now.
                                     picker = crate::cli::status::available_agents(
@@ -5686,7 +5694,7 @@ pub(crate) mod tests {
 
         // Wide: agent 0's wait is drawable, so it takes a position.
         let with = panel_row_list(&s, 120);
-        assert_eq!(with.len(), 4, "A0, W0, A1, Add: {with:?}");
+        assert_eq!(with.len(), 5, "A0, W0, A1, Add, R: {with:?}");
         assert_eq!(
             row_position(&with, PanelRow::Agent(1)),
             2,
@@ -5697,7 +5705,7 @@ pub(crate) mod tests {
         // Same snapshot, a pane too narrow to draw the wait: the row
         // is gone and every position closes back up.
         let narrow = panel_row_list(&s, 6);
-        assert_eq!(narrow.len(), 3, "A0, A1, Add: {narrow:?}");
+        assert_eq!(narrow.len(), 4, "A0, A1, Add, R: {narrow:?}");
         assert_eq!(row_position(&narrow, PanelRow::Agent(1)), 1);
         assert_eq!(add_row_index(&narrow), 2);
 

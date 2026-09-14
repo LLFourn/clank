@@ -56,9 +56,17 @@ pub(super) trait Io {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum State {
     Off,
-    Starting { pid: u32 },
-    On { pid: u32, url: String },
-    Failed,
+    Starting {
+        pid: u32,
+    },
+    On {
+        pid: u32,
+        url: String,
+    },
+    /// `why` stays readable on the row after the overlay is gone.
+    Failed {
+        why: String,
+    },
 }
 
 pub(super) struct Remote<I: Io> {
@@ -92,7 +100,26 @@ impl<I: Io> Remote<I> {
             State::Off => Shown::Off,
             State::Starting { .. } => Shown::Starting,
             State::On { .. } => Shown::On,
-            State::Failed => Shown::Failed,
+            State::Failed { .. } => Shown::Failed,
+        }
+    }
+
+    /// What the row says beside the state: the URL when on, the
+    /// reason when failed, nothing otherwise.
+    pub(super) fn detail(&self) -> Option<&str> {
+        match &self.state {
+            State::On { url, .. } => Some(url),
+            State::Failed { why } => Some(why),
+            _ => None,
+        }
+    }
+
+    /// Send the browser to the URL again; nothing unless on.
+    pub(super) fn open_again(&mut self) {
+        if let State::On { url, .. } = &self.state {
+            let url = url.clone();
+            let report = self.reporter();
+            self.io.open(&url, report);
         }
     }
 
@@ -121,7 +148,7 @@ impl<I: Io> Remote<I> {
                 self.state = State::Off;
                 None
             }
-            State::Off | State::Failed => {
+            State::Off | State::Failed { .. } => {
                 self.generation += 1;
                 let report = self.reporter();
                 let argv = vec![
@@ -139,7 +166,7 @@ impl<I: Io> Remote<I> {
                         None
                     }
                     Err(why) => {
-                        self.state = State::Failed;
+                        self.state = State::Failed { why: why.clone() };
                         Some(Notice {
                             title: "remote".to_string(),
                             message: why,
@@ -151,7 +178,8 @@ impl<I: Io> Remote<I> {
     }
 
     /// Absorb what the processes reported since the last turn: the
-    /// listening line switches it on and sends the browser there; an
+    /// listening line switches it on and sends the browser there —
+    /// no notice, the row says the URL for as long as it is on; an
     /// exit switches it to failed with the reason; a browser that
     /// would not open is said, the server staying on. Outcomes of an
     /// earlier generation, or arriving once the switch is off, are
@@ -169,18 +197,14 @@ impl<I: Io> Remote<I> {
                     let pid = *pid;
                     let report = self.reporter();
                     self.io.open(&url, report);
-                    notices.push(Notice {
-                        title: "remote on".to_string(),
-                        message: format!("{url}\n\nopening in your browser"),
-                    });
                     self.state = State::On { pid, url };
                 }
                 (Outcome::Exited { why }, State::Starting { .. } | State::On { .. }) => {
-                    self.state = State::Failed;
                     notices.push(Notice {
                         title: "remote off".to_string(),
                         message: format!("clank web ended: {why}"),
                     });
+                    self.state = State::Failed { why };
                 }
                 (Outcome::BrowserFailed { why }, State::On { url, .. }) => {
                     notices.push(Notice {
@@ -482,16 +506,23 @@ mod tests {
             ]
         );
         assert!(r.drain().is_empty(), "nothing to say before the child does");
+        assert_eq!(r.detail(), None);
         fake.child_says(0, listening());
         assert_eq!(*wakes.lock().unwrap(), 1);
-        let notices = r.drain();
-        assert_eq!(notices.len(), 1);
-        assert_eq!(notices[0].title, "remote on");
-        assert!(notices[0].message.starts_with("http://127.0.0.1:8088\n"));
-        assert!(notices[0].message.contains("opening in your browser"));
+        assert!(
+            r.drain().is_empty(),
+            "listening is said by the row, not an overlay"
+        );
         assert_eq!(r.shown(), Shown::On);
+        assert_eq!(r.detail(), Some("http://127.0.0.1:8088"));
         assert_eq!(fake.log().opened, vec!["http://127.0.0.1:8088"]);
         assert_eq!(fake.log().started.len(), 1);
+        // `o` on the row: the browser goes there again; off, nothing.
+        r.open_again();
+        assert_eq!(fake.log().opened.len(), 2);
+        r.toggle();
+        r.open_again();
+        assert_eq!(fake.log().opened.len(), 2);
     }
 
     /// A child that ends before it listens is a failure with its
@@ -511,6 +542,11 @@ mod tests {
         assert_eq!(notices[0].title, "remote off");
         assert!(notices[0].message.contains("address in use"), "{notices:?}");
         assert_eq!(r.shown(), Shown::Failed);
+        assert_eq!(
+            r.detail(),
+            Some("cannot listen on 127.0.0.1:8088: address in use"),
+            "the reason stays on the row"
+        );
         assert!(fake.log().opened.is_empty());
         // Failed → the switch starts again.
         r.toggle();
@@ -527,6 +563,7 @@ mod tests {
         let notice = r.toggle().expect("a reason");
         assert!(notice.message.contains("current_exe failed"));
         assert_eq!(r.shown(), Shown::Failed);
+        assert_eq!(r.detail(), Some("current_exe failed"));
     }
 
     /// On → off ends the child by TERM; so does dropping the switch
@@ -583,7 +620,7 @@ mod tests {
         );
         assert_eq!(r.shown(), Shown::Starting);
         fake.child_says(1, listening());
-        assert_eq!(r.drain().len(), 1);
+        assert!(r.drain().is_empty());
         assert_eq!(r.shown(), Shown::On);
     }
 
@@ -595,7 +632,7 @@ mod tests {
         let (mut r, _) = remote(&fake);
         r.toggle();
         fake.child_says(0, listening());
-        assert_eq!(r.drain().len(), 1);
+        assert!(r.drain().is_empty());
         fake.opener_fails(0, "no opener");
         let notices = r.drain();
         assert_eq!(notices.len(), 1);

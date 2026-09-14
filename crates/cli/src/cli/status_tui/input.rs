@@ -686,6 +686,7 @@ pub(super) enum PanelAnchor {
         at: String,
     },
     Add,
+    Remote,
     Stash(String),
     Queue(String),
 }
@@ -723,6 +724,7 @@ pub(super) fn capture_anchor(
             .get(*i)
             .map(|n| PanelAnchor::Queue(n.clone()))
             .unwrap_or(PanelAnchor::Add),
+        Some(PanelRow::Remote) => PanelAnchor::Remote,
         _ => PanelAnchor::Add,
     }
 }
@@ -764,6 +766,7 @@ pub(super) fn rebind_anchor(
             .iter()
             .position(|n| n == name)
             .and_then(|i| find(PanelRow::Queue(i))),
+        PanelAnchor::Remote => find(PanelRow::Remote),
         PanelAnchor::Add => None,
     };
     at.unwrap_or_else(|| add_row_index(rows))
@@ -1307,8 +1310,11 @@ pub(super) struct PanelView<'a> {
     pub(super) lift: usize,
     /// Whether zellij answers, as the reconcile worker last saw it.
     pub(super) reach: crate::cli::status_tui::zellij::ZellijReach,
-    /// The remote switch, drawn beside the zellij glyph.
+    /// The remote switch, drawn beside the zellij glyph and as a row
+    /// under the agents; `remote_detail` is what the row says beside
+    /// its state — the URL when on, the reason when failed.
     pub(super) remote: crate::cli::status_tui::remote::Shown,
+    pub(super) remote_detail: Option<&'a str>,
     /// This repo's labels with a live pane, as the worker last listed
     /// them; `None` until a listing answers, or outside zellij.
     pub(super) presence: Option<std::collections::BTreeSet<String>>,
@@ -1334,6 +1340,7 @@ impl<'a> PanelView<'a> {
             lift: 0,
             reach: crate::cli::status_tui::zellij::ZellijReach::NotInSession,
             remote: Default::default(),
+            remote_detail: None,
             presence: None,
         }
     }
@@ -1360,6 +1367,10 @@ pub(super) enum PanelAction {
     OpenWait(usize),
     /// Open the add picker (Enter/Space on the "+ add" row).
     OpenPicker,
+    /// The remote switch (Enter/Space on the remote row).
+    ToggleRemote,
+    /// Open the remote's URL in the browser again (`o` on its row).
+    OpenRemote,
     /// Open a queued plan's page (Enter on a queue row) — the plan page
     /// in its queued state; every other queue action lives there.
     OpenQueueItem(usize),
@@ -1389,6 +1400,8 @@ pub(super) enum PanelRow {
     /// The wait attended by that agent, drawn beneath its row.
     Wait(usize),
     Add,
+    /// The remote switch, under the agent list: its state and URL.
+    Remote,
     Stash(usize),
     Queue(usize),
 }
@@ -1402,7 +1415,7 @@ pub(super) fn panel_rows(
     stash_len: usize,
     queue_len: usize,
 ) -> Vec<PanelRow> {
-    let mut out = Vec::with_capacity(agents_len + waits.len() + 1 + stash_len + queue_len);
+    let mut out = Vec::with_capacity(agents_len + waits.len() + 2 + stash_len + queue_len);
     for i in 0..agents_len {
         out.push(PanelRow::Agent(i));
         if waits.contains(&i) {
@@ -1410,6 +1423,7 @@ pub(super) fn panel_rows(
         }
     }
     out.push(PanelRow::Add);
+    out.push(PanelRow::Remote);
     out.extend((0..stash_len).map(PanelRow::Stash));
     out.extend((0..queue_len).map(PanelRow::Queue));
     out
@@ -1450,16 +1464,19 @@ pub(super) fn agent_panel_action(sel: usize, rows: &[PanelRow], key: Key) -> Pan
             Some(PanelRow::Queue(q)) => PanelAction::OpenQueueItem(q),
             Some(PanelRow::Agent(i)) => PanelAction::OpenDetail(i),
             Some(PanelRow::Wait(i)) => PanelAction::OpenWait(i),
+            Some(PanelRow::Remote) => PanelAction::ToggleRemote,
             _ => PanelAction::None,
         },
         // A queue row answers Enter and nothing else: its actions —
         // open, priority, unqueue, promote — are on its page, where
         // they are visible (a-queued-plan-has-a-page).
+        Key::Html if matches!(here, Some(PanelRow::Remote)) => PanelAction::OpenRemote,
         Key::Html => match stash_idx {
             Some(i) => PanelAction::OpenStashHtml(i),
             None => PanelAction::None,
         },
         Key::Space if on_add => PanelAction::OpenPicker,
+        Key::Space if matches!(here, Some(PanelRow::Remote)) => PanelAction::ToggleRemote,
         // Space is the agent's inline auto-toggle and belongs to no
         // other row kind — a wait has no auto mode to flip.
         Key::Space => match here {
@@ -2732,6 +2749,7 @@ mod tests {
                 PanelRow::Wait(0),
                 PanelRow::Agent(1),
                 PanelRow::Add,
+                PanelRow::Remote,
                 PanelRow::Stash(0),
                 PanelRow::Queue(0),
                 PanelRow::Queue(1),
@@ -2757,7 +2775,12 @@ mod tests {
     fn an_undrawable_wait_is_not_a_cursor_position() {
         assert_eq!(
             panel_rows(2, &[], 0, 0),
-            vec![PanelRow::Agent(0), PanelRow::Agent(1), PanelRow::Add]
+            vec![
+                PanelRow::Agent(0),
+                PanelRow::Agent(1),
+                PanelRow::Add,
+                PanelRow::Remote
+            ]
         );
     }
 
@@ -2870,9 +2893,9 @@ mod tests {
             PanelAction::MoveCursor(1)
         );
         assert_eq!(
-            agent_panel_action(2, &panel_rows(agents.len(), &[], 0, 0), Key::Down),
+            agent_panel_action(3, &panel_rows(agents.len(), &[], 0, 0), Key::Down),
             PanelAction::EnterLog,
-            "Down past +add flows into the log"
+            "Down past the remote row, the last, flows into the log"
         );
         assert_eq!(
             agent_panel_action(0, &panel_rows(agents.len(), &[], 0, 0), Key::Up),
@@ -2889,6 +2912,54 @@ mod tests {
         );
     }
 
+    /// The remote row sits under the agent list — after `+ add`,
+    /// before the stash and queue — and the cursor crosses it. Enter
+    /// and Space on it are the switch; `o` on it opens the URL, and
+    /// on no other row means that.
+    #[test]
+    fn the_remote_row_is_under_the_agents_and_is_the_switch() {
+        let rows = panel_rows(2, &[], 1, 1);
+        assert_eq!(
+            rows,
+            vec![
+                PanelRow::Agent(0),
+                PanelRow::Agent(1),
+                PanelRow::Add,
+                PanelRow::Remote,
+                PanelRow::Stash(0),
+                PanelRow::Queue(0),
+            ]
+        );
+        let r = rows.iter().position(|x| *x == PanelRow::Remote).unwrap();
+        assert_eq!(
+            agent_panel_action(r, &rows, Key::Enter),
+            PanelAction::ToggleRemote
+        );
+        assert_eq!(
+            agent_panel_action(r, &rows, Key::Space),
+            PanelAction::ToggleRemote
+        );
+        assert_eq!(
+            agent_panel_action(r, &rows, Key::Html),
+            PanelAction::OpenRemote
+        );
+        assert_eq!(
+            agent_panel_action(r, &rows, Key::Down),
+            PanelAction::MoveCursor(r + 1),
+            "the cursor crosses it"
+        );
+        assert_eq!(
+            agent_panel_action(r - 1, &rows, Key::Down),
+            PanelAction::MoveCursor(r)
+        );
+        assert_eq!(agent_panel_action(0, &rows, Key::Html), PanelAction::None);
+        assert_eq!(
+            agent_panel_action(r - 1, &rows, Key::Enter),
+            PanelAction::OpenPicker,
+            "+ add is still + add"
+        );
+    }
+
     #[test]
     fn agent_panel_action_routes_queue_rows() {
         use crate::cli::teams_config::RosterRole;
@@ -2897,18 +2968,18 @@ mod tests {
             agent_row("claude", RosterRole::Master, AutoMode::On),
             agent_row("codex", RosterRole::Commit, AutoMode::Off),
         ];
-        // Rows: 0-1 agents, 2 "+ add", 3-4 the two queue rows.
+        // Rows: 0-1 agents, 2 "+ add", 3 remote, 4-5 the two queue rows.
         let ql = 2;
         // Enter on a queue row opens its page; every other action lives
         // there, so `o`, `+`, `-` and Space are inert on the row
         // (a-queued-plan-has-a-page).
         assert_eq!(
-            agent_panel_action(3, &panel_rows(agents.len(), &[], 0, ql), Key::Enter),
+            agent_panel_action(4, &panel_rows(agents.len(), &[], 0, ql), Key::Enter),
             PanelAction::OpenQueueItem(0)
         );
         for key in [Key::Html, Key::Plus, Key::Minus, Key::Space] {
             assert_eq!(
-                agent_panel_action(4, &panel_rows(agents.len(), &[], 0, ql), key),
+                agent_panel_action(5, &panel_rows(agents.len(), &[], 0, ql), key),
                 PanelAction::None,
                 "{key:?} does nothing on a queue row"
             );
@@ -2918,19 +2989,19 @@ mod tests {
             agent_panel_action(1, &panel_rows(agents.len(), &[], 0, ql), Key::Html),
             PanelAction::None
         );
-        // Down from "+ add" now enters the queue, not the log; Down from
-        // the LAST queue row crosses into the log.
+        // Down from the remote row now enters the queue, not the log;
+        // Down from the LAST queue row crosses into the log.
         assert_eq!(
-            agent_panel_action(2, &panel_rows(agents.len(), &[], 0, ql), Key::Down),
-            PanelAction::MoveCursor(3)
+            agent_panel_action(3, &panel_rows(agents.len(), &[], 0, ql), Key::Down),
+            PanelAction::MoveCursor(4)
         );
         assert_eq!(
-            agent_panel_action(4, &panel_rows(agents.len(), &[], 0, ql), Key::Down),
+            agent_panel_action(5, &panel_rows(agents.len(), &[], 0, ql), Key::Down),
             PanelAction::EnterLog
         );
-        // With an empty queue, Down from "+ add" still enters the log.
+        // With an empty queue, Down from the remote row still enters the log.
         assert_eq!(
-            agent_panel_action(2, &panel_rows(agents.len(), &[], 0, 0), Key::Down),
+            agent_panel_action(3, &panel_rows(agents.len(), &[], 0, 0), Key::Down),
             PanelAction::EnterLog
         );
     }
@@ -2943,29 +3014,30 @@ mod tests {
             agent_row("claude", RosterRole::Master, AutoMode::On),
             agent_row("codex", RosterRole::Commit, AutoMode::Off),
         ];
-        // Rows: 0-1 agents, 2 "+ add", 3 the stash row, 4 the queue row.
+        // Rows: 0-1 agents, 2 "+ add", 3 remote, 4 the stash row, 5 the
+        // queue row.
         let (sl, ql) = (1, 1);
         assert_eq!(
-            agent_panel_action(3, &panel_rows(agents.len(), &[], sl, ql), Key::Enter),
+            agent_panel_action(4, &panel_rows(agents.len(), &[], sl, ql), Key::Enter),
             PanelAction::OpenStashItem(0)
         );
         assert_eq!(
-            agent_panel_action(3, &panel_rows(agents.len(), &[], sl, ql), Key::Html),
+            agent_panel_action(4, &panel_rows(agents.len(), &[], sl, ql), Key::Html),
             PanelAction::OpenStashHtml(0)
         );
         // The queue row sits AFTER the stash segment.
         assert_eq!(
-            agent_panel_action(4, &panel_rows(agents.len(), &[], sl, ql), Key::Enter),
+            agent_panel_action(5, &panel_rows(agents.len(), &[], sl, ql), Key::Enter),
             PanelAction::OpenQueueItem(0)
         );
         // +/- are queue-only; inert on a stash row.
         assert_eq!(
-            agent_panel_action(3, &panel_rows(agents.len(), &[], sl, ql), Key::Plus),
+            agent_panel_action(4, &panel_rows(agents.len(), &[], sl, ql), Key::Plus),
             PanelAction::None
         );
         // Down from the LAST row (the queue row) crosses into the log.
         assert_eq!(
-            agent_panel_action(4, &panel_rows(agents.len(), &[], sl, ql), Key::Down),
+            agent_panel_action(5, &panel_rows(agents.len(), &[], sl, ql), Key::Down),
             PanelAction::EnterLog
         );
     }
@@ -3030,22 +3102,27 @@ mod tests {
         let stash = labels(&["s1"]);
         let queue = labels(&["q1", "q2"]);
 
-        // No waits: [A0, A1, Add, S0, Q0, Q1]
+        // No waits: [A0, A1, Add, R, S0, Q0, Q1]
         let before = panel_rows(2, &[], 1, 2);
-        let anchor = capture_anchor(4, &before, &agents, &stash, &queue);
+        let anchor = capture_anchor(5, &before, &agents, &stash, &queue);
         assert_eq!(anchor, PanelAnchor::Queue("q1".to_string()));
 
-        // A wait appears above everything: [A0, W0, A1, Add, S0, Q0, Q1]
+        // A wait appears above everything: [A0, W0, A1, Add, R, S0, Q0, Q1]
         let after = panel_rows(2, &[0], 1, 2);
         assert_eq!(
             rebind_anchor(&anchor, &after, &agents, &stash, &queue),
-            5,
+            6,
             "the queue row moved down by the wait; the cursor moved with it"
         );
 
         // The stash row too.
-        let anchor = capture_anchor(3, &before, &agents, &stash, &queue);
+        let anchor = capture_anchor(4, &before, &agents, &stash, &queue);
         assert_eq!(anchor, PanelAnchor::Stash("s1".to_string()));
+        assert_eq!(rebind_anchor(&anchor, &after, &agents, &stash, &queue), 5);
+
+        // And the remote row, by its own name.
+        let anchor = capture_anchor(3, &before, &agents, &stash, &queue);
+        assert_eq!(anchor, PanelAnchor::Remote);
         assert_eq!(rebind_anchor(&anchor, &after, &agents, &stash, &queue), 4);
 
         // And an agent below the new wait.
@@ -3062,13 +3139,13 @@ mod tests {
         let agents = rows_for(&["claude", "codex"], &[]);
         let queue = vec!["a".to_string(), "b".to_string()];
         let rows = panel_rows(2, &[], 0, 2);
-        let anchor = capture_anchor(4, &rows, &agents, &[], &queue);
+        let anchor = capture_anchor(5, &rows, &agents, &[], &queue);
         assert_eq!(anchor, PanelAnchor::Queue("b".to_string()));
 
         let resorted = vec!["b".to_string(), "a".to_string()];
         assert_eq!(
             rebind_anchor(&anchor, &rows, &agents, &[], &resorted),
-            3,
+            4,
             "follows the item, not the slot"
         );
 
