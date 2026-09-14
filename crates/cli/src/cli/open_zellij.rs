@@ -981,8 +981,10 @@ fn agent_group_kdl(
         Orientation::Portrait => "size=\"30%\"",
     };
     let repo_esc = kdl_escape(repo_path);
+    // An empty name is an empty title; no name at all titles the
+    // pane with its whole command line (measured on zellij 0.46.0).
     out.push_str(&format!(
-        "        pane {tui_size} name=\"status\" cwd=\"{repo_esc}\" {{\n"
+        "        pane {tui_size} name=\"\" cwd=\"{repo_esc}\" {{\n"
     ));
     out.push_str("            command \"clank\"\n");
     out.push_str(&format!(
@@ -2371,7 +2373,7 @@ mod tests {
             );
             let status_line = kdl
                 .lines()
-                .find(|l| l.contains("name=\"status\""))
+                .find(|l| l.contains("name=\"\""))
                 .expect("an instrument pane line");
             assert!(
                 status_line.contains("size=\"30%\""),
@@ -3673,7 +3675,7 @@ keybinds {
         // 7d3b5d1): cwd AND --repo, against a repo that is NOT the
         // test process cwd.
         assert!(
-            kdl.contains(&format!("name=\"status\" cwd=\"{TEST_REPO}\"")),
+            kdl.contains(&format!("name=\"\" cwd=\"{TEST_REPO}\"")),
             "tui pane cwd pinned:\n{kdl}"
         );
         assert!(
@@ -3700,7 +3702,7 @@ keybinds {
         )
         .unwrap();
         assert!(
-            kdl.contains(&format!("name=\"status\" cwd=\"{TEST_REPO}\"")),
+            kdl.contains(&format!("name=\"\" cwd=\"{TEST_REPO}\"")),
             "portrait tui cwd pinned:\n{kdl}"
         );
         assert!(
