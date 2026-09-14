@@ -87,6 +87,15 @@ gix = { version = "0.84", default-features = false, features = [
     "parallel",              # Repository: Send under parallel feature
 ] }
 kdl = "4"
+# The remote's door (the-tui-mints-the-way-in): WebAuthn as the
+# relying party, a QR for the phone's registration link, and the
+# random, encoded, constant-time-compared tokens behind both.
+# webauthn-rs links the system OpenSSL.
+webauthn-rs = { version = "0.5", default-features = false }
+qrcode = { version = "0.14", default-features = false }
+getrandom = "0.3"
+base64 = "0.22"
+subtle = "2"
 
 [[bin]]
 name = "clank"
@@ -100,3 +109,4 @@ filetime = "0.2"
 # test-only: paused-time (`start_paused`) so the github poll loop's
 # inter-tick sleeps resolve instantly in tests (extra-wait-events).
 tokio = { version = "1", features = ["test-util"] }
+webauthn-authenticator-rs = { version = "0.5", default-features = false, features = ["softpasskey"] }

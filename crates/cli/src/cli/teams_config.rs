@@ -70,6 +70,10 @@ pub struct UserConfigFile {
     pub diff: Option<crate::cli::config::DiffConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zellij: Option<ZellijSection>,
+    /// The remote's door: the tunnel's URL and the registered
+    /// passkeys (the-tui-mints-the-way-in).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<crate::cli::web::door::RemoteSection>,
     /// Forward-compat catchall. A leftover legacy `default_agents`
     /// key (from a pre-hard-cut config) lands here and is ignored
     /// — there is no migration that reads it.

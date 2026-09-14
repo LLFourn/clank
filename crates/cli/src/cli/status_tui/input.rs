@@ -123,6 +123,9 @@ pub(super) enum Mode {
     EventDetail { sel: usize },
     /// The open WAIT page: which agent's wait, and the cursor row on it.
     WaitDetail { agent: usize, sel: usize },
+    /// The remote page (Enter on the remote row): the switch, the
+    /// links in, and the passkeys and sessions to revoke.
+    RemotePage { sel: usize },
     /// A one-line text input on the plan page (force-finish subject,
     /// squash message, block reason, drop type-to-confirm). The BUFFER
     /// lives in the loop's `plan_input` (Mode stays `Copy`); same
@@ -838,6 +841,92 @@ pub(super) fn wait_page_nav(sel: usize, actions: &[WaitAction], key: Key) -> Det
     }
 }
 
+/// A row on the REMOTE page. A passkey or session row carries the
+/// IDENTITY it was drawn with, not a position: the door's lists can
+/// change under the page — another TUI's removal, an expiry — and
+/// Backspace must revoke what was shown, or nothing, never a
+/// successor that slid into its place (codex on f657b4d).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum RemoteAction {
+    Switch,
+    /// The browser, through a login link; only while on.
+    Open,
+    /// A registration link for the phone, as a QR; only while on.
+    Phone,
+    /// A registered passkey, by its credential id.
+    Passkey(String),
+    /// An open session, by the hash the file keeps.
+    Session(String),
+    Back,
+}
+
+/// The remote page's rows. The two links are ABSENT while the
+/// remote is off rather than shown and inert: there is no URL to
+/// link into.
+pub(super) fn remote_actions(
+    on: bool,
+    passkeys: &[crate::cli::web::door::PasskeyRow],
+    sessions: &[crate::cli::web::door::SessionRecord],
+) -> Vec<RemoteAction> {
+    let mut out = vec![RemoteAction::Switch];
+    if on {
+        out.push(RemoteAction::Open);
+        out.push(RemoteAction::Phone);
+    }
+    out.extend(passkeys.iter().map(|p| RemoteAction::Passkey(p.id.clone())));
+    out.extend(
+        sessions
+            .iter()
+            .map(|s| RemoteAction::Session(s.id_hash.clone())),
+    );
+    out.push(RemoteAction::Back);
+    out
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum RemoteNav {
+    None,
+    Quit,
+    Back,
+    MoveCursor(usize),
+    Activate(RemoteAction),
+    /// Backspace on a passkey or a session row: the one destructive
+    /// key, on the one kind of row it applies to. Enter there is
+    /// nothing, so a row cannot be revoked by selecting it.
+    Revoke(RemoteAction),
+}
+
+pub(super) fn remote_page_nav(sel: usize, actions: &[RemoteAction], key: Key) -> RemoteNav {
+    let current = actions.get(sel).cloned().unwrap_or(RemoteAction::Back);
+    let has = |a: RemoteAction| actions.contains(&a);
+    match key {
+        Key::Quit => RemoteNav::Quit,
+        Key::Escape | Key::Focus | Key::Char(b'a') => RemoteNav::Back,
+        Key::Up => RemoteNav::MoveCursor(move_selection(sel, actions.len(), false)),
+        Key::Down => RemoteNav::MoveCursor(move_selection(sel, actions.len(), true)),
+        Key::Enter => match current {
+            RemoteAction::Passkey(_) | RemoteAction::Session(_) => RemoteNav::None,
+            RemoteAction::Back => RemoteNav::Back,
+            a => RemoteNav::Activate(a),
+        },
+        Key::Space | Key::Char(b'r') => RemoteNav::Activate(RemoteAction::Switch),
+        Key::Html if has(RemoteAction::Open) => RemoteNav::Activate(RemoteAction::Open),
+        Key::Char(b'p') if has(RemoteAction::Phone) => RemoteNav::Activate(RemoteAction::Phone),
+        Key::Delete => match current {
+            RemoteAction::Passkey(_) | RemoteAction::Session(_) => RemoteNav::Revoke(current),
+            _ => RemoteNav::None,
+        },
+        _ => RemoteNav::None,
+    }
+}
+
+/// What the remote page lists, read from the door for the frame.
+#[derive(Debug, Clone, Default)]
+pub(super) struct RemotePage {
+    pub(super) passkeys: Vec<crate::cli::web::door::PasskeyRow>,
+    pub(super) sessions: Vec<crate::cli::web::door::SessionRecord>,
+}
+
 pub(super) fn agent_detail_nav(sel: usize, actions: &[DetailAction], key: Key) -> DetailNav {
     let current = || actions.get(sel).copied().unwrap_or(DetailAction::Back);
     match key {
@@ -1315,6 +1404,8 @@ pub(super) struct PanelView<'a> {
     /// its state — the URL when on, the reason when failed.
     pub(super) remote: crate::cli::status_tui::remote::Shown,
     pub(super) remote_detail: Option<&'a str>,
+    /// The remote page's lists, read when that page is the mode.
+    pub(super) remote_page: Option<&'a RemotePage>,
     /// This repo's labels with a live pane, as the worker last listed
     /// them; `None` until a listing answers, or outside zellij.
     pub(super) presence: Option<std::collections::BTreeSet<String>>,
@@ -1341,6 +1432,7 @@ impl<'a> PanelView<'a> {
             reach: crate::cli::status_tui::zellij::ZellijReach::NotInSession,
             remote: Default::default(),
             remote_detail: None,
+            remote_page: None,
             presence: None,
         }
     }
@@ -1367,8 +1459,10 @@ pub(super) enum PanelAction {
     OpenWait(usize),
     /// Open the add picker (Enter/Space on the "+ add" row).
     OpenPicker,
-    /// The remote switch (Enter/Space on the remote row).
+    /// The remote switch (Space on the remote row).
     ToggleRemote,
+    /// Open the remote page (Enter on the remote row).
+    OpenRemotePage,
     /// Open the remote's URL in the browser again (`o` on its row).
     OpenRemote,
     /// Open a queued plan's page (Enter on a queue row) — the plan page
@@ -1464,7 +1558,7 @@ pub(super) fn agent_panel_action(sel: usize, rows: &[PanelRow], key: Key) -> Pan
             Some(PanelRow::Queue(q)) => PanelAction::OpenQueueItem(q),
             Some(PanelRow::Agent(i)) => PanelAction::OpenDetail(i),
             Some(PanelRow::Wait(i)) => PanelAction::OpenWait(i),
-            Some(PanelRow::Remote) => PanelAction::ToggleRemote,
+            Some(PanelRow::Remote) => PanelAction::OpenRemotePage,
             _ => PanelAction::None,
         },
         // A queue row answers Enter and nothing else: its actions —
@@ -2784,6 +2878,72 @@ mod tests {
         );
     }
 
+    /// The remote page's rows: the two links only while the remote
+    /// is on; Backspace revokes a passkey or session row and nothing
+    /// else, and Enter on such a row is nothing — a row is not
+    /// revoked by selecting it.
+    #[test]
+    fn the_remote_page_links_are_absent_while_off_and_backspace_revokes() {
+        use RemoteAction::*;
+        let key = |id: &str| crate::cli::web::door::PasskeyRow {
+            id: id.into(),
+            name: "phone".into(),
+            added: String::new(),
+        };
+        let session = |hash: &str| crate::cli::web::door::SessionRecord {
+            id_hash: hash.into(),
+            passkey: "phone".into(),
+            created: String::new(),
+            last_seen: String::new(),
+        };
+        let off = remote_actions(false, &[key("k1")], &[session("s1"), session("s2")]);
+        assert_eq!(
+            off,
+            vec![
+                Switch,
+                Passkey("k1".into()),
+                Session("s1".into()),
+                Session("s2".into()),
+                Back
+            ]
+        );
+        let on = remote_actions(true, &[], &[]);
+        assert_eq!(on, vec![Switch, Open, Phone, Back]);
+        assert_eq!(remote_page_nav(0, &off, Key::Html), RemoteNav::None);
+        assert_eq!(remote_page_nav(0, &off, Key::Char(b'p')), RemoteNav::None);
+        assert_eq!(
+            remote_page_nav(0, &on, Key::Html),
+            RemoteNav::Activate(Open)
+        );
+        assert_eq!(
+            remote_page_nav(0, &on, Key::Char(b'p')),
+            RemoteNav::Activate(Phone)
+        );
+        assert_eq!(
+            remote_page_nav(1, &off, Key::Delete),
+            RemoteNav::Revoke(Passkey("k1".into()))
+        );
+        assert_eq!(
+            remote_page_nav(3, &off, Key::Delete),
+            RemoteNav::Revoke(Session("s2".into()))
+        );
+        assert_eq!(remote_page_nav(0, &off, Key::Delete), RemoteNav::None);
+        assert_eq!(remote_page_nav(4, &off, Key::Delete), RemoteNav::None);
+        assert_eq!(remote_page_nav(1, &off, Key::Enter), RemoteNav::None);
+        assert_eq!(remote_page_nav(2, &off, Key::Enter), RemoteNav::None);
+        assert_eq!(
+            remote_page_nav(0, &off, Key::Enter),
+            RemoteNav::Activate(Switch)
+        );
+        assert_eq!(
+            remote_page_nav(2, &off, Key::Char(b'r')),
+            RemoteNav::Activate(Switch)
+        );
+        assert_eq!(remote_page_nav(3, &on, Key::Enter), RemoteNav::Back);
+        assert_eq!(remote_page_nav(0, &on, Key::Escape), RemoteNav::Back);
+        assert_eq!(remote_page_nav(0, &on, Key::Quit), RemoteNav::Quit);
+    }
+
     /// Enter opens the WAIT, not the agent it hangs under — the two
     /// rows are adjacent and an off-by-one here opens the wrong page.
     #[test]
@@ -2914,8 +3074,8 @@ mod tests {
 
     /// The remote row sits under the agent list — after `+ add`,
     /// before the stash and queue — and the cursor crosses it. Enter
-    /// and Space on it are the switch; `o` on it opens the URL, and
-    /// on no other row means that.
+    /// on it opens its page and Space is the switch; `o` on it opens
+    /// the URL, and on no other row means that.
     #[test]
     fn the_remote_row_is_under_the_agents_and_is_the_switch() {
         let rows = panel_rows(2, &[], 1, 1);
@@ -2933,7 +3093,7 @@ mod tests {
         let r = rows.iter().position(|x| *x == PanelRow::Remote).unwrap();
         assert_eq!(
             agent_panel_action(r, &rows, Key::Enter),
-            PanelAction::ToggleRemote
+            PanelAction::OpenRemotePage
         );
         assert_eq!(
             agent_panel_action(r, &rows, Key::Space),

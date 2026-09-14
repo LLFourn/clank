@@ -61,6 +61,8 @@ cargo install --path crates/cli --locked
 That puts `clank` on your `$PATH`. Keep `--locked`: without it
 `cargo install` ignores the committed `Cargo.lock` and re-resolves
 every dependency to the newest semver-compatible version.
+The build links the system OpenSSL for the remote's passkeys
+(`brew install openssl@3` on macOS, `libssl-dev` on Debian-likes).
 
 Then wire it into your agents (Claude Code, Codex CLI, Grok CLI,
 opencode — any or all):
@@ -177,13 +179,27 @@ pages. `--watch` gives a live non-fullscreen view; `-j` emits JSON.
 
 Enter selects whatever the cursor is on; every screen shows its own
 keys along the bottom. The `remote` row under the agent list is the
-switch for the remote: Enter serves this repo's page from inside the
-TUI on the port the repo remembers — sampled from the OS the first
-time and kept in `.clank/config.json` — opens it in your browser and
-leaves the URL on the row (`o` there opens it again); Enter again,
-or closing the TUI, stops it and everything it started. `r` from
-the log view is the same switch, and the glyph beside
-the zellij one at the bar's right end shows its state from any page.
+remote: Space there (or `r` from the log view) is the switch, which
+serves this repo's page from inside the TUI on the port the repo
+remembers — sampled from the OS the first time and kept in
+`.clank/config.json` — and sends your browser in; switching off, or
+closing the TUI, stops it and everything it started. The glyph
+beside the zellij one at the bar's right end shows its state from
+any page.
+
+The page is behind a door: every route but sign-in asks for a
+session, and the TUI is what opens one. `o` on the row (or on its
+page) opens the browser through a one-time login link, so this
+machine needs no ceremony. For a phone, Enter opens the remote page
+and `p` mints a registration link — shown as text and as a QR — that
+admits one passkey registration within five minutes; the phone
+signs in with that passkey (a YubiKey held to it works) from then
+on. The page lists the passkeys (kept in `~/.clank/config.json`
+under `remote.passkeys`) and the open sessions (thirty days, hashed
+in `~/.clank/remote-sessions.json`); Backspace on either revokes it,
+and a revoked session's stream ends at once. Set `remote.url` in the
+user config to the tunnel's public URL when there is one: it is the
+passkeys' relying party and where the phone's link points.
 
 ## Command reference
 

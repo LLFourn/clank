@@ -8,11 +8,15 @@
 //! one agent at a time. Terminals do not reflow, so a pane arrives at
 //! its desktop size; the page scrolls and pinches around it.
 //!
-//! Localhost, no authentication yet (the-tui-mints-the-way-in).
+//! Loopback only, behind a [`door::Door`]: every route but the two
+//! doors asks for a session, and the TUI mints the links that open
+//! one (the-tui-mints-the-way-in).
 
+pub(crate) mod door;
 mod feed;
 mod transcript;
 
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -23,6 +27,9 @@ use crate::cli::open_zellij::{self, PaneMeta, SubscribeChild};
 use feed::{Feed, SubscribeEvent, TableChange};
 
 const PAGE: &str = include_str!("page.html");
+const LOGIN: &str = include_str!("login.html");
+const REGISTER: &str = include_str!("register.html");
+const HTML: &str = "text/html; charset=utf-8";
 
 /// Which session to look in. `--session` wins; else the one this
 /// process runs inside; else the name `clank open` would have used.
@@ -193,6 +200,7 @@ impl Instance {
         repo: PathBuf,
         home: Option<PathBuf>,
         panes: Arc<dyn Panes>,
+        door: Arc<door::Door>,
         poll: std::time::Duration,
         grace: std::time::Duration,
     ) -> anyhow::Result<Self> {
@@ -200,6 +208,8 @@ impl Instance {
             .table()
             .ok_or_else(|| anyhow::anyhow!("zellij did not answer for `{}`", panes.session()))?;
         let (listener, port) = listen(&repo).await?;
+        let rp = Arc::new(door.relying_party(port)?);
+        let door_for_serve = door.clone();
         let feed = Feed::new(64);
         feed.panes(table.clone());
         let subscription = Arc::new(Mutex::new(subscribe(&*panes, &table, &feed)));
@@ -217,18 +227,24 @@ impl Instance {
             site_dir(&repo),
             cancelled.clone(),
             blocking.clone(),
+            door_for_serve,
+            rp,
         ));
         tasks.spawn(pane_poll(
             panes,
             feed.clone(),
             subscription.clone(),
-            cancelled,
+            cancelled.clone(),
             poll,
             blocking.clone(),
         ));
+        tasks.spawn(door_poll(door, cancelled, blocking.clone()));
         let builder = SiteBuilder::start(repo.clone(), home.clone());
         Ok(Self {
-            url: format!("http://127.0.0.1:{port}"),
+            // `localhost`, not `127.0.0.1`: the passkeys' relying
+            // party is `localhost`, and a browser's origin must say
+            // the RP's name (codex on 375f30c).
+            url: format!("http://localhost:{port}"),
             cancel,
             tasks,
             blocking,
@@ -732,10 +748,33 @@ async fn pane_poll(
     }
 }
 
+/// How often the door's files are read again for another TUI's
+/// revocation: the sessions are the user's, this remote is one of
+/// their TUIs, and a stream here must end when a sibling closes it.
+pub(crate) const DOOR_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+
+async fn door_poll(
+    door: Arc<door::Door>,
+    mut cancelled: tokio::sync::watch::Receiver<bool>,
+    blocking: Arc<Blocking>,
+) {
+    loop {
+        tokio::select! {
+            _ = cancelled.changed() => return,
+            _ = tokio::time::sleep(DOOR_POLL) => {}
+        }
+        let door = door.clone();
+        blocking.run(move || door.refresh()).await;
+    }
+}
+
 /// A Server-Sent Events body: frames arrive on a channel and go out
 /// as they come. Ends when the sender is dropped.
 struct SseBody {
     rx: tokio::sync::mpsc::Receiver<String>,
+    /// Raised when the authority behind the stream ended: what is
+    /// still queued is not delivered.
+    ended: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Body for SseBody {
@@ -745,10 +784,79 @@ impl Body for SseBody {
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
-        self.get_mut()
-            .rx
+        let this = self.get_mut();
+        if this.ended.load(std::sync::atomic::Ordering::Relaxed) {
+            return std::task::Poll::Ready(None);
+        }
+        this.rx
             .poll_recv(cx)
             .map(|next| next.map(|s| Ok(Frame::data(Bytes::from(s)))))
+    }
+}
+
+/// What ends a stream besides the browser leaving: the remote
+/// switched off, the session's term, the session revoked — here or
+/// in another TUI.
+struct Authority {
+    cancelled: tokio::sync::watch::Receiver<bool>,
+    revocations: tokio::sync::watch::Receiver<u64>,
+    door: Arc<door::Door>,
+    admitted: door::Admitted,
+}
+
+/// Forward the retained frames, then the live ones, until the
+/// browser is gone or the authority ends. The authority governs the
+/// SEND too, not only the wait for the next frame: a browser that
+/// has stopped reading fills the channel, and a forwarder blocked in
+/// a send would otherwise hold a revoked session's stream open and
+/// hand the frame over when the browser resumes (codex on f657b4d).
+/// Returns whether the authority ended, as opposed to the browser.
+async fn forward(
+    frames: Vec<String>,
+    mut rx: tokio::sync::broadcast::Receiver<String>,
+    feed: Feed,
+    tx: tokio::sync::mpsc::Sender<String>,
+    mut authority: Authority,
+) -> bool {
+    let mut queue: std::collections::VecDeque<String> = frames.into();
+    loop {
+        if queue.is_empty() {
+            let received = tokio::select! {
+                _ = authority.cancelled.changed() => return true,
+                _ = tokio::time::sleep_until(authority.admitted.expires) => return true,
+                _ = authority.revocations.changed() => {
+                    if !authority.door.is_live(&authority.admitted.id_hash) {
+                        return true;
+                    }
+                    continue;
+                }
+                r = rx.recv() => r,
+            };
+            match received {
+                Ok(f) => queue.push_back(f),
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    queue.extend(feed.resync())
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return false,
+            }
+            continue;
+        }
+        let frame = queue[0].clone();
+        tokio::select! {
+            _ = authority.cancelled.changed() => return true,
+            _ = tokio::time::sleep_until(authority.admitted.expires) => return true,
+            _ = authority.revocations.changed() => {
+                if !authority.door.is_live(&authority.admitted.id_hash) {
+                    return true;
+                }
+            }
+            sent = tx.send(frame) => {
+                if sent.is_err() {
+                    return false;
+                }
+                queue.pop_front();
+            }
+        }
     }
 }
 
@@ -784,7 +892,14 @@ async fn serve(
     site: PathBuf,
     mut cancelled: tokio::sync::watch::Receiver<bool>,
     blocking: Arc<Blocking>,
+    door: Arc<door::Door>,
+    rp: Arc<webauthn_rs::prelude::Webauthn>,
 ) {
+    let origins = rp
+        .get_allowed_origins()
+        .iter()
+        .map(|u| u.as_str().trim_end_matches('/').to_string())
+        .collect();
     let ctx = Arc::new(Ctx {
         feed,
         sayer,
@@ -796,18 +911,22 @@ async fn serve(
         pages: Pages { repo, site },
         workers: Mutex::new(tokio::task::JoinSet::new()),
         cancelled: cancelled.clone(),
+        secure_host: door.secure_host(),
+        door,
+        rp,
+        origins,
     });
     loop {
         let accepted = tokio::select! {
             _ = cancelled.changed() => break,
             accepted = listener.accept() => accepted,
         };
-        let Ok((stream, _)) = accepted else { break };
+        let Ok((stream, peer)) = accepted else { break };
         let io = hyper_util::rt::TokioIo::new(stream);
         let ctx2 = ctx.clone();
         let svc = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
             let ctx = ctx2.clone();
-            async move { Ok::<_, std::convert::Infallible>(route(req, &ctx).await) }
+            async move { Ok::<_, std::convert::Infallible>(route(req, peer.ip(), &ctx).await) }
         });
         let mut workers = ctx.workers.lock().unwrap_or_else(|e| e.into_inner());
         let mut cancel = cancelled.clone();
@@ -848,6 +967,12 @@ struct Ctx {
     /// they start, so none is detached.
     workers: Mutex<tokio::task::JoinSet<()>>,
     cancelled: tokio::sync::watch::Receiver<bool>,
+    door: Arc<door::Door>,
+    rp: Arc<webauthn_rs::prelude::Webauthn>,
+    /// The origins a browser may post from: the relying party's.
+    origins: Vec<String>,
+    /// The host a `Secure` cookie is for, when the tunnel is https.
+    secure_host: Option<String>,
 }
 
 /// Where the site's pages come from: the built site, and the repo
@@ -857,13 +982,170 @@ struct Pages {
     site: PathBuf,
 }
 
-async fn route(req: hyper::Request<hyper::body::Incoming>, ctx: &Ctx) -> Resp {
-    match (req.method().as_str(), req.uri().path()) {
-        ("GET", "/") => text(200, ctx.page.to_string(), "text/html; charset=utf-8"),
-        ("GET", "/events") => events(ctx),
+/// The two doors answer anyone; everything else asks the door for a
+/// session first, and a browser without one is sent to sign in
+/// while a script gets the refusal to act on. A post is also asked
+/// where it came from: the page's origin, or nothing.
+async fn route(req: hyper::Request<hyper::body::Incoming>, peer: IpAddr, ctx: &Ctx) -> Resp {
+    let method = req.method().as_str().to_string();
+    let path = req.uri().path().to_string();
+    match (method.as_str(), path.as_str()) {
+        ("GET", "/login") => return login(&req, peer, ctx),
+        ("GET", "/register") => return text(200, REGISTER, HTML),
+        ("POST", "/login/start" | "/login/finish" | "/register/start" | "/register/finish") => {
+            if !same_origin(&req, ctx) {
+                return text(403, "not from this page", "text/plain");
+            }
+            if !ctx.door.attempt_allowed(peer) {
+                return text(429, "too many attempts — wait a minute", "text/plain");
+            }
+            return ceremony(&path, req, ctx).await;
+        }
+        _ => {}
+    }
+    let cookie = req.headers().get("cookie").and_then(|v| v.to_str().ok());
+    let Some(admitted) = ctx.door.admit(cookie) else {
+        return match (method.as_str(), path.as_str()) {
+            ("GET", p) if p == "/" || p.starts_with("/html/") => redirect("/login"),
+            _ => text(401, "no session: sign in at /login", "text/plain"),
+        };
+    };
+    match (method.as_str(), path.as_str()) {
+        ("GET", "/") => text(200, ctx.page.to_string(), HTML),
+        ("GET", "/whoami") => text(204, "", "text/plain"),
+        ("GET", "/events") => events(ctx, admitted),
+        ("POST", "/say") if !same_origin(&req, ctx) => {
+            text(403, "not from this page", "text/plain")
+        }
         ("POST", "/say") => say(req, ctx).await,
-        ("GET", path) if path.starts_with("/html/") => {
-            site_page(&ctx.pages, &path["/html/".len()..])
+        ("GET", p) if p.starts_with("/html/") => site_page(&ctx.pages, &p["/html/".len()..]),
+        _ => text(404, "not here", "text/plain"),
+    }
+}
+
+fn same_origin(req: &hyper::Request<hyper::body::Incoming>, ctx: &Ctx) -> bool {
+    req.headers()
+        .get("origin")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|o| ctx.origins.iter().any(|a| a == o.trim_end_matches('/')))
+}
+
+fn redirect(to: &str) -> Resp {
+    hyper::Response::builder()
+        .status(303)
+        .header("location", to)
+        .body(Full::new(Bytes::new()).boxed())
+        .expect("static response")
+}
+
+/// A response that opens a session: the cookie, `Secure` when the
+/// request came to the tunnel's host.
+fn with_session(req_host: Option<&str>, token: &str, ctx: &Ctx, mut resp: Resp) -> Resp {
+    let secure = ctx
+        .secure_host
+        .as_deref()
+        .is_some_and(|h| req_host == Some(h));
+    if let Ok(v) = hyper::header::HeaderValue::from_str(&door::session_cookie(token, secure)) {
+        resp.headers_mut().insert("set-cookie", v);
+    }
+    resp
+}
+
+fn host_of(req: &hyper::Request<hyper::body::Incoming>) -> Option<String> {
+    req.headers()
+        .get("host")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+}
+
+/// `/login`: the passkey page — or, with a link token the TUI
+/// minted, straight in. A spent token is said on the page, not in
+/// the URL it came with.
+fn login(req: &hyper::Request<hyper::body::Incoming>, peer: IpAddr, ctx: &Ctx) -> Resp {
+    let Some(token) = door::query_token(req.uri().query()) else {
+        return text(200, LOGIN, HTML);
+    };
+    if !ctx.door.attempt_allowed(peer) {
+        return text(429, "too many attempts — wait a minute", "text/plain");
+    }
+    if !ctx.door.consume(door::Link::Login, &token) {
+        return redirect("/login?why=link");
+    }
+    match ctx.door.open_session("the TUI's link") {
+        Ok(session) => with_session(host_of(req).as_deref(), &session, ctx, redirect("/")),
+        Err(e) => text(500, format!("the store refused: {e:#}"), "text/plain"),
+    }
+}
+
+fn refused(r: door::Refused) -> Resp {
+    let status = match r {
+        door::Refused::Link | door::Refused::Credential(_) => 403,
+        door::Refused::Ceremony => 400,
+        door::Refused::NoPasskeys => 404,
+        door::Refused::Store(_) => 500,
+    };
+    text(status, r.to_string(), "text/plain")
+}
+
+/// The four ceremony posts, each a JSON body: start answers the
+/// browser's options and the id to finish with; finish answers a
+/// session.
+async fn ceremony(path: &str, req: hyper::Request<hyper::body::Incoming>, ctx: &Ctx) -> Resp {
+    let host = host_of(&req);
+    let body = http_body_util::Limited::new(req.into_body(), 64 * 1024);
+    let Ok(bytes) = body.collect().await.map(|c| c.to_bytes()) else {
+        return text(413, "too long", "text/plain");
+    };
+    let json = |v: serde_json::Value| text(200, v.to_string(), "application/json");
+    let bad = || text(400, "not the shape expected", "text/plain");
+    match path {
+        "/register/start" => {
+            #[derive(serde::Deserialize)]
+            struct Start {
+                token: String,
+                name: String,
+            }
+            let Ok(start) = serde_json::from_slice::<Start>(&bytes) else {
+                return bad();
+            };
+            let name = start.name.trim();
+            let name = if name.is_empty() { "phone" } else { name };
+            match ctx.door.start_registration(&ctx.rp, &start.token, name) {
+                Ok((id, options)) => json(serde_json::json!({"id": id, "options": options})),
+                Err(r) => refused(r),
+            }
+        }
+        "/register/finish" => {
+            let Ok(finish) = serde_json::from_slice::<door::Finish<_>>(&bytes) else {
+                return bad();
+            };
+            match ctx
+                .door
+                .finish_registration(&ctx.rp, &finish.id, &finish.credential)
+            {
+                Ok(session) => {
+                    with_session(host.as_deref(), &session, ctx, text(204, "", "text/plain"))
+                }
+                Err(r) => refused(r),
+            }
+        }
+        "/login/start" => match ctx.door.start_login(&ctx.rp) {
+            Ok((id, options)) => json(serde_json::json!({"id": id, "options": options})),
+            Err(r) => refused(r),
+        },
+        "/login/finish" => {
+            let Ok(finish) = serde_json::from_slice::<door::Finish<_>>(&bytes) else {
+                return bad();
+            };
+            match ctx
+                .door
+                .finish_login(&ctx.rp, &finish.id, &finish.credential)
+            {
+                Ok(session) => {
+                    with_session(host.as_deref(), &session, ctx, text(204, "", "text/plain"))
+                }
+                Err(r) => refused(r),
+            }
         }
         _ => text(404, "not here", "text/plain"),
     }
@@ -950,45 +1232,36 @@ fn site_page(pages: &Pages, rel: &str) -> Resp {
 /// The handoff: subscribe, then the retained state, then live —
 /// the order `Feed::connect` documents. A lagged browser gets the
 /// state again.
-fn events(ctx: &Ctx) -> Resp {
-    let (frames, mut rx) = ctx.feed.connect();
+fn events(ctx: &Ctx, admitted: door::Admitted) -> Resp {
+    let (frames, rx) = ctx.feed.connect();
     let (tx, body_rx) = tokio::sync::mpsc::channel::<String>(64);
-    let feed = ctx.feed.clone();
-    let mut cancelled = ctx.cancelled.clone();
+    let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // The stream holds its session: a revocation ends it here, not
+    // at the next request the browser never makes.
+    let authority = Authority {
+        cancelled: ctx.cancelled.clone(),
+        revocations: ctx.door.watch_revocations(),
+        door: ctx.door.clone(),
+        admitted,
+    };
     // The forwarder is a worker of the accept loop's, not a task of
     // its own: it ends on the cancel the loop shares, or when the
     // browser is gone, and the loop joins it (codex on 55db154).
+    let flag = ended.clone();
+    let feed = ctx.feed.clone();
     ctx.workers
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .spawn(async move {
-            for f in frames {
-                if tx.send(f).await.is_err() {
-                    return;
-                }
-            }
-            loop {
-                let received = tokio::select! {
-                    _ = cancelled.changed() => return,
-                    r = rx.recv() => r,
-                };
-                let next = match received {
-                    Ok(f) => vec![f],
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => feed.resync(),
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
-                };
-                for f in next {
-                    if tx.send(f).await.is_err() {
-                        return;
-                    }
-                }
+            if forward(frames, rx, feed, tx, authority).await {
+                flag.store(true, std::sync::atomic::Ordering::Relaxed);
             }
         });
     hyper::Response::builder()
         .status(200)
         .header("content-type", "text/event-stream")
         .header("cache-control", "no-cache")
-        .body(SseBody { rx: body_rx }.boxed())
+        .body(SseBody { rx: body_rx, ended }.boxed())
         .expect("static response")
 }
 
@@ -1107,6 +1380,84 @@ mod tests {
             who: transcript::Who::Agent,
             body: transcript::Body::Text { text: id.into() },
         }
+    }
+
+    /// The forwarder with a browser that has stopped reading: the
+    /// channel fills on the retained frames alone, and the forwarder
+    /// still ends — by revocation, by the deadline, by the cancel —
+    /// with nobody draining it, and says the authority ended.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_forwarder_blocked_on_a_full_channel_still_ends_with_its_authority() {
+        use std::time::Duration;
+        let door = Arc::new(door::Door::new(None));
+        let feed = Feed::new(16);
+        let admit = |door: &door::Door| {
+            let token = door.open_session("phone").unwrap();
+            door.admit(Some(&format!("{}={token}", door::COOKIE)))
+                .unwrap()
+        };
+        let start = |admitted: door::Admitted, cancelled: tokio::sync::watch::Receiver<bool>| {
+            let (_, rx) = feed.connect();
+            let (tx, body_rx) = tokio::sync::mpsc::channel::<String>(1);
+            let authority = Authority {
+                cancelled,
+                revocations: door.watch_revocations(),
+                door: door.clone(),
+                admitted,
+            };
+            let frames = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+            (
+                tokio::spawn(forward(frames, rx, feed.clone(), tx, authority)),
+                body_rx,
+            )
+        };
+        let (cancel, cancelled) = tokio::sync::watch::channel(false);
+
+        // Revoked while blocked on the second retained frame.
+        let admitted = admit(&door);
+        let (task, body) = start(admitted.clone(), cancelled.clone());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!task.is_finished(), "blocked: nobody reads");
+        door.revoke_session(&admitted.id_hash).unwrap();
+        let ended = tokio::time::timeout(Duration::from_secs(2), task).await;
+        assert!(
+            ended.expect("ends without a reader").unwrap(),
+            "the authority ended it"
+        );
+        drop(body);
+
+        // Its term ends while blocked.
+        let mut admitted = admit(&door);
+        admitted.expires = tokio::time::Instant::now() + Duration::from_millis(300);
+        let (task, body) = start(admitted, cancelled.clone());
+        let ended = tokio::time::timeout(Duration::from_secs(2), task).await;
+        assert!(
+            ended.expect("ends at its deadline").unwrap(),
+            "the authority ended it"
+        );
+        drop(body);
+
+        // The remote switched off while blocked.
+        let (task, body) = start(admit(&door), cancelled);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let _ = cancel.send(true);
+        let ended = tokio::time::timeout(Duration::from_secs(2), task).await;
+        assert!(
+            ended.expect("ends on the cancel").unwrap(),
+            "the authority ended it"
+        );
+        drop(body);
+
+        // The browser leaving is the other ending, and not an
+        // authority's.
+        let (_kept, cancelled) = tokio::sync::watch::channel(false);
+        let (task, body) = start(admit(&door), cancelled);
+        drop(body);
+        let ended = tokio::time::timeout(Duration::from_secs(2), task).await;
+        assert!(
+            !ended.expect("ends when the browser is gone").unwrap(),
+            "not an authority's ending"
+        );
     }
 
     fn repo_with_config() -> tempfile::TempDir {
@@ -1263,9 +1614,12 @@ mod tests {
         git(&["commit", "--quiet", "-m", "history before adoption"]);
         let old_sha = git(&["rev-parse", "HEAD"]);
         let (cancel, cancelled) = tokio::sync::watch::channel(false);
+        let door = Arc::new(door::Door::new(None));
+        let rp = Arc::new(door.relying_party(port).unwrap());
         let server = tokio::spawn({
             let feed = feed.clone();
             let (repo, site) = (repo.path().to_path_buf(), site.path().to_path_buf());
+            let door = door.clone();
             async move {
                 serve(
                     listener,
@@ -1276,12 +1630,102 @@ mod tests {
                     site,
                     cancelled,
                     Arc::new(Blocking::default()),
+                    door,
+                    rp,
                 )
                 .await
             }
         });
-        let base = format!("http://127.0.0.1:{port}");
-        let client = reqwest::Client::new();
+        let base = format!("http://localhost:{port}");
+        let anon = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+
+        // Nothing but the doors answers without a session: a browser
+        // is sent to sign in, a script is refused.
+        for (path, status) in [
+            ("/", 303),
+            ("/html/plan/foo.html", 303),
+            ("/html/style.css", 303),
+            ("/events", 401),
+            ("/whoami", 401),
+        ] {
+            let r = anon.get(format!("{base}{path}")).send().await.unwrap();
+            assert_eq!(r.status(), status, "{path}");
+            if status == 303 {
+                assert_eq!(r.headers().get("location").unwrap(), "/login", "{path}");
+            }
+        }
+        let r = anon
+            .post(format!("{base}/say"))
+            .header("origin", &base)
+            .json(&serde_json::json!({"pane": "terminal_5", "text": "no"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 401);
+        assert!(said.lock().unwrap().is_empty(), "nothing was typed");
+        let r = anon.get(format!("{base}/login")).send().await.unwrap();
+        assert_eq!(r.status(), 200);
+        assert!(
+            r.text()
+                .await
+                .unwrap()
+                .contains("Sign in with your passkey")
+        );
+        let r = anon.get(format!("{base}/register")).send().await.unwrap();
+        assert_eq!(r.status(), 200);
+        assert!(r.text().await.unwrap().contains("register this device"));
+        assert_eq!(
+            anon.post(format!("{base}/login/start"))
+                .body("{}")
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            403,
+            "a ceremony post from nowhere"
+        );
+
+        // A login link the TUI minted: in, once.
+        let link = format!("{base}/login?t={}", door.mint(door::Link::Login));
+        let welcome = anon.get(&link).send().await.unwrap();
+        assert_eq!(welcome.status(), 303);
+        assert_eq!(welcome.headers().get("location").unwrap(), "/");
+        let set = welcome
+            .headers()
+            .get("set-cookie")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            set.contains("HttpOnly") && set.contains("SameSite=Strict") && !set.contains("Secure"),
+            "{set}"
+        );
+        let cookie = set.split(';').next().unwrap().to_string();
+        let again = anon.get(&link).send().await.unwrap();
+        assert_eq!(again.status(), 303);
+        assert_eq!(again.headers().get("location").unwrap(), "/login?why=link");
+        assert!(again.headers().get("set-cookie").is_none());
+
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("cookie", cookie.parse().unwrap());
+        let client = reqwest::Client::builder()
+            .default_headers(headers)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        assert_eq!(
+            client
+                .get(format!("{base}/whoami"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            204
+        );
 
         // The site: a page and the stylesheet it links, served under
         // /html/ with their own types; a name the builder never
@@ -1423,9 +1867,20 @@ mod tests {
             "the frame carries what the terminal is told, not the raw rows: {got}"
         );
 
-        // A message.
+        // A message: from the page's origin, or not at all.
+        for wrong in [None, Some("http://evil.example")] {
+            let mut r = client
+                .post(format!("{base}/say"))
+                .json(&serde_json::json!({"pane": "terminal_5", "text": "-n hi"}));
+            if let Some(o) = wrong {
+                r = r.header("origin", o);
+            }
+            assert_eq!(r.send().await.unwrap().status(), 403, "{wrong:?}");
+        }
+        assert!(said.lock().unwrap().is_empty());
         let r = client
             .post(format!("{base}/say"))
+            .header("origin", &base)
             .json(&serde_json::json!({"pane": "terminal_5", "text": "-n hi"}))
             .send()
             .await
@@ -1437,6 +1892,7 @@ mod tests {
         );
         let bad = client
             .post(format!("{base}/say"))
+            .header("origin", &base)
             .body("not json")
             .send()
             .await
@@ -1450,6 +1906,95 @@ mod tests {
                 .unwrap()
                 .status(),
             404
+        );
+
+        // Revoked from the TUI: the open stream ends, and the cookie
+        // admits nothing more.
+        let hash = door.sessions().unwrap()[0].id_hash.clone();
+        door.revoke_session(&hash).unwrap();
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match resp.chunk().await {
+                    Ok(None) | Err(_) => break,
+                    Ok(Some(_)) => {}
+                }
+            }
+        })
+        .await;
+        assert!(ended.is_ok(), "the stream ends on revocation");
+        assert_eq!(
+            client
+                .get(format!("{base}/whoami"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            401
+        );
+
+        // A session at the end of its term: the stream ends by its
+        // own deadline, with no request made and no page opened.
+        let link = format!("{base}/login?t={}", door.mint(door::Link::Login));
+        let welcome = anon.get(&link).send().await.unwrap();
+        let cookie = welcome
+            .headers()
+            .get("set-cookie")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+        let hash = door.sessions().unwrap()[0].id_hash.clone();
+        door.backdate(
+            &hash,
+            time::Duration::days(door::SESSION_DAYS) - time::Duration::seconds(2),
+        )
+        .unwrap();
+        let mut ending = anon
+            .get(format!("{base}/events"))
+            .header("cookie", &cookie)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ending.status(), 200);
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(6), async {
+            loop {
+                match ending.chunk().await {
+                    Ok(None) | Err(_) => break,
+                    Ok(Some(_)) => {}
+                }
+            }
+        })
+        .await;
+        assert!(ended.is_ok(), "the stream ends at its deadline");
+
+        // Guessing at the link door is rate-limited per address.
+        let mut refused_at = None;
+        for i in 0..=door::ATTEMPTS_PER_MINUTE {
+            let r = anon
+                .get(format!("{base}/login?t=guess"))
+                .send()
+                .await
+                .unwrap();
+            if r.status() == 429 {
+                refused_at = Some(i);
+                break;
+            }
+            assert_eq!(r.status(), 303);
+        }
+        assert!(
+            refused_at.is_some(),
+            "the guesses are cut off within the limit"
+        );
+        assert_eq!(
+            anon.get(format!("{base}/login?t=guess"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            429
         );
 
         // Cancel ends the accept loop and its connections; the task

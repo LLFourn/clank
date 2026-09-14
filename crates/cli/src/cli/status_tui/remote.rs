@@ -7,6 +7,7 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use crate::cli::web::door::{Door, Link};
 use crate::cli::web::{Instance, Panes};
 
 /// What the bar and the row draw.
@@ -75,6 +76,10 @@ pub(super) struct Remote<O: Opener> {
     repo: PathBuf,
     home: Option<PathBuf>,
     panes: PanesSource,
+    /// The door outlives any one instance: its sessions and passkeys
+    /// are the user's, listed and revoked from the row whether the
+    /// remote is on or off.
+    door: Arc<Door>,
     /// How often the panes are re-listed, and how long a stop lets
     /// the tasks end on their own; the production values, or a test's.
     poll: std::time::Duration,
@@ -95,6 +100,7 @@ impl<O: Opener> Remote<O> {
         repo: PathBuf,
         home: Option<PathBuf>,
         panes: PanesSource,
+        door: Arc<Door>,
         poll: std::time::Duration,
         grace: std::time::Duration,
         opener: O,
@@ -104,6 +110,7 @@ impl<O: Opener> Remote<O> {
             repo,
             home,
             panes,
+            door,
             poll,
             grace,
             opener,
@@ -177,9 +184,12 @@ impl<O: Opener> Remote<O> {
                 // synchronously, which is not the loop's to wait for
                 // (codex on 369e74e).
                 let panes = self.panes.clone();
+                let door = self.door.clone();
                 let task = tokio::spawn(async move {
                     let started = match tokio::task::spawn_blocking(move || panes()).await {
-                        Ok(Ok(panes)) => Instance::start(repo, home, panes, poll, grace).await,
+                        Ok(Ok(panes)) => {
+                            Instance::start(repo, home, panes, door, poll, grace).await
+                        }
                         Ok(Err(e)) => Err(e),
                         Err(_) => Err(anyhow::anyhow!("finding zellij panicked")),
                     };
@@ -203,13 +213,50 @@ impl<O: Opener> Remote<O> {
         }
     }
 
-    /// Send the browser to the URL again; nothing unless on.
+    /// Send the browser in again — through a fresh login link, so
+    /// the desktop needs no ceremony; nothing unless on.
     pub(super) fn open_again(&mut self) {
-        if let State::On { instance } = &self.state {
-            let url = instance.url.clone();
+        if let Some(url) = self.login_link() {
             let report = self.reporter();
             self.opener.open(&url, report);
         }
+    }
+
+    /// A one-time login link into the running remote: the local
+    /// URL, for the browser on this machine.
+    fn login_link(&self) -> Option<String> {
+        match &self.state {
+            State::On { instance } => Some(format!(
+                "{}/login?t={}",
+                instance.url,
+                self.door.mint(Link::Login)
+            )),
+            _ => None,
+        }
+    }
+
+    /// A one-time registration link for the phone: the tunnel's
+    /// public URL when one is configured — the phone cannot reach
+    /// loopback — else the local one; nothing unless on.
+    pub(super) fn phone_link(&self) -> Option<String> {
+        match &self.state {
+            State::On { instance } => {
+                let base = self
+                    .door
+                    .public_url()
+                    .unwrap_or_else(|| instance.url.clone());
+                Some(format!(
+                    "{}/register?t={}",
+                    base.trim_end_matches('/'),
+                    self.door.mint(Link::Register)
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    pub(super) fn door(&self) -> &Arc<Door> {
+        &self.door
     }
 
     /// End the remote, everything joined: the TUI's exit path, where
@@ -252,9 +299,8 @@ impl<O: Opener> Remote<O> {
             match (outcome, &self.state) {
                 (Outcome::Started(instance), State::Starting { .. }) => {
                     instance.observe(snap);
-                    let report = self.reporter();
-                    self.opener.open(&instance.url, report);
                     self.state = State::On { instance };
+                    self.open_again();
                 }
                 (Outcome::Started(instance), _) => {
                     tokio::spawn(instance.stop());
@@ -278,6 +324,38 @@ impl<O: Opener> Remote<O> {
         }
         notices
     }
+}
+
+/// A QR of `text` as lines of half-block cells, two module rows per
+/// line, a quiet zone around: light modules are the block, dark ones
+/// the gap, so drawn white-on-black the code reads dark-on-light as
+/// a camera expects. Empty if the text is too long to encode.
+pub(super) fn qr_lines(text: &str) -> Vec<String> {
+    let Ok(code) = qrcode::QrCode::new(text.as_bytes()) else {
+        return Vec::new();
+    };
+    let width = code.width();
+    let colors = code.to_colors();
+    const QUIET: usize = 4;
+    let side = width + 2 * QUIET;
+    let dark = |x: usize, y: usize| {
+        (QUIET..QUIET + width).contains(&x)
+            && (QUIET..QUIET + width).contains(&y)
+            && colors[(y - QUIET) * width + (x - QUIET)] == qrcode::Color::Dark
+    };
+    (0..side)
+        .step_by(2)
+        .map(|y| {
+            (0..side)
+                .map(|x| match (dark(x, y), dark(x, y + 1)) {
+                    (false, false) => '█',
+                    (false, true) => '▀',
+                    (true, false) => '▄',
+                    (true, true) => ' ',
+                })
+                .collect()
+        })
+        .collect()
 }
 
 /// The platform opener on a thread of its own: off the loop, and with
@@ -321,6 +399,29 @@ impl Opener for Browser {
 mod tests {
     use super::*;
     use crate::cli::open_zellij::{PaneMeta, SubscribeChild};
+
+    /// Two module rows per line, a four-module quiet zone of light
+    /// cells, and the finder pattern where every QR has one: the
+    /// first module row is seven dark, the second dark-light-dark.
+    #[test]
+    fn a_qr_is_half_block_lines_with_a_quiet_zone() {
+        let lines = qr_lines("http://localhost:1234/register?t=abc");
+        let side = lines[0].chars().count();
+        assert!(side >= 21 + 8);
+        assert_eq!(lines.len(), side.div_ceil(2));
+        assert!(
+            lines[0].chars().all(|c| c == '█'),
+            "quiet zone: {}",
+            lines[0]
+        );
+        let third: Vec<char> = lines[2].chars().collect();
+        assert_eq!(&third[..4], ['█'; 4], "{}", lines[2]);
+        assert_eq!(third[4], ' ', "dark over dark: {}", lines[2]);
+        assert_eq!(third[5], '▄', "dark over light: {}", lines[2]);
+        assert_eq!(third[10], ' ', "{}", lines[2]);
+        assert_eq!(third[11], '█', "{}", lines[2]);
+        assert!(qr_lines(&"x".repeat(5000)).is_empty(), "too long to encode");
+    }
 
     /// A zellij with no agent panes and nothing to subscribe to, or
     /// one that does not answer.
@@ -396,6 +497,7 @@ mod tests {
                 std::thread::sleep(slow);
                 Ok(Arc::new(FakePanes { answers, slow }) as Arc<dyn Panes>)
             }),
+            Arc::new(Door::new(None)),
             poll,
             grace,
             rec.clone(),
@@ -547,13 +649,47 @@ mod tests {
             crate::agent_store::web_port(repo.path()).unwrap(),
             Some(port)
         );
-        let page = reqwest::get(&url).await.unwrap();
+        // The browser is sent in through a login link: the page
+        // itself asks for a session first.
+        assert!(url.starts_with("http://localhost:"), "{url}");
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let opened = rec.opened.lock().unwrap().clone();
+        assert_eq!(opened.len(), 1);
+        assert!(
+            opened[0].starts_with(&format!("{url}/login?t=")),
+            "{opened:?}"
+        );
+        let welcome = client.get(&opened[0]).send().await.unwrap();
+        assert_eq!(welcome.status(), 303);
+        let cookie = welcome
+            .headers()
+            .get("set-cookie")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+        let page = client
+            .get(&url)
+            .header("cookie", &cookie)
+            .send()
+            .await
+            .unwrap();
         assert_eq!(page.status(), 200);
         assert!(page.text().await.unwrap().contains("<title>clank</title>"));
-        assert_eq!(*rec.opened.lock().unwrap(), vec![url.clone()]);
         // Seeded: the stream opens with the snapshot's facts, before
         // any repository change.
-        let mut stream = reqwest::get(format!("{url}/events")).await.unwrap();
+        let mut stream = client
+            .get(format!("{url}/events"))
+            .header("cookie", &cookie)
+            .send()
+            .await
+            .unwrap();
         let mut opening = String::new();
         while !opening.contains("event: status") {
             let chunk = tokio::time::timeout(Duration::from_secs(5), stream.chunk())

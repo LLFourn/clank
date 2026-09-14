@@ -1279,6 +1279,13 @@ enum OverlayData {
         message: String,
     },
     Commit(CommitDetail),
+    /// A link to follow from another device, with its QR
+    /// (the-tui-mints-the-way-in).
+    Link {
+        title: String,
+        url: String,
+        qr: Vec<String>,
+    },
     /// (An ACTIVE or QUEUED plan's document has no overlay: the plan
     /// page renders it beneath the action buttons —
     /// tui-plan-page-redesign, a-queued-plan-has-a-page.)
@@ -1326,6 +1333,16 @@ impl Overlay {
     /// calmer title.
     fn notice(n: remote::Notice) -> Self {
         Self::error(n.title, n.message)
+    }
+    fn link(title: String, url: String) -> Self {
+        Self {
+            data: OverlayData::Link {
+                title,
+                qr: remote::qr_lines(&url),
+                url,
+            },
+            offset: 0,
+        }
     }
     /// A stashed-plan overlay, opened at the top.
     fn stashed(name: String, markdown: Option<String>) -> Self {
@@ -2066,6 +2083,7 @@ pub(crate) async fn run_tui(
                         as std::sync::Arc<dyn crate::cli::web::Panes>,
                 )
             }),
+            std::sync::Arc::new(crate::cli::web::door::Door::new(home.clone())),
             crate::cli::web::PANE_POLL,
             crate::cli::web::STOP_GRACE,
             remote::Browser,
@@ -2207,6 +2225,9 @@ pub(crate) async fn run_tui(
                 OverlayData::Error { title, message } => {
                     render_error_doc(title, message, overlay.offset, rows as usize, cols as usize)
                 }
+                OverlayData::Link { title, url, qr } => {
+                    render_link_doc(title, url, qr, overlay.offset, rows as usize, cols as usize)
+                }
             };
             // Extract the html-open target by value up front so the
             // `OpenHtml` arm doesn't hold a borrow of `detail` (the `Back`
@@ -2214,7 +2235,7 @@ pub(crate) async fn run_tui(
             let html_target: Option<HtmlTarget> = match &overlay.data {
                 OverlayData::Commit(d) => Some(HtmlTarget::Commit(d.sha.as_str().to_string())),
                 OverlayData::StashedPlan { name, .. } => Some(HtmlTarget::Stash(name.clone())),
-                OverlayData::Error { .. } => None,
+                OverlayData::Error { .. } | OverlayData::Link { .. } => None,
             };
             paint(&lines);
             let ev = ev_rx.recv_timeout(Duration::from_secs(60));
@@ -2295,7 +2316,7 @@ pub(crate) async fn run_tui(
                         // An error is a moment, not a live document —
                         // a background refresh must not clear or morph
                         // it while the user reads.
-                        OverlayData::Error { .. } => None,
+                        OverlayData::Error { .. } | OverlayData::Link { .. } => None,
                     };
                     if let (Some(data), Some(o)) = (new, detail.as_mut()) {
                         o.refresh(data);
@@ -2328,6 +2349,12 @@ pub(crate) async fn run_tui(
         let presence = reconcile_worker.presence();
         mode = settle_detail_cursor(mode, &snapshot.agents, &presence, &mut detail_shown);
         let remote_detail = remote.detail();
+        let remote_page = matches!(mode, Mode::RemotePage { .. }).then(|| {
+            crate::cli::status_tui::input::RemotePage {
+                passkeys: remote.door().passkeys().unwrap_or_default(),
+                sessions: remote.door().sessions().unwrap_or_default(),
+            }
+        });
         let view = PanelView {
             wait_page: wait_page.as_ref(),
             mode,
@@ -2342,6 +2369,7 @@ pub(crate) async fn run_tui(
             reach: reconcile_worker.reach(),
             remote: remote.shown(),
             remote_detail: remote_detail.as_deref(),
+            remote_page: remote_page.as_ref(),
             presence,
         };
         // An overlay mounted here is drawn by the branch at the TOP of
@@ -2630,6 +2658,66 @@ pub(crate) async fn run_tui(
                     // confirm_decision); the loop only executes the result
                     // (where IO happens).
                     match mode {
+                        Mode::RemotePage { sel } => {
+                            use crate::cli::status_tui::input::{RemoteAction, RemoteNav};
+                            let door = remote.door().clone();
+                            // The rows the key was pressed on are the
+                            // rows that were PAINTED, not a fresh
+                            // read: what the door holds now may differ.
+                            let page = remote_page.clone().unwrap_or_default();
+                            let actions = crate::cli::status_tui::input::remote_actions(
+                                remote.shown() == remote::Shown::On,
+                                &page.passkeys,
+                                &page.sessions,
+                            );
+                            let sel = sel.min(actions.len().saturating_sub(1));
+                            match crate::cli::status_tui::input::remote_page_nav(sel, &actions, k) {
+                                RemoteNav::Quit => break 'evloop,
+                                RemoteNav::Back => {
+                                    let rows = panel_row_list(&snapshot, cols as usize);
+                                    mode = Mode::AgentPanel {
+                                        sel: rows
+                                            .iter()
+                                            .position(|r| {
+                                                *r == crate::cli::status_tui::input::PanelRow::Remote
+                                            })
+                                            .unwrap_or(0),
+                                    };
+                                }
+                                RemoteNav::MoveCursor(s) => mode = Mode::RemotePage { sel: s },
+                                RemoteNav::Activate(RemoteAction::Switch) => {
+                                    if let Some(n) = remote.toggle() {
+                                        detail = Some(Overlay::notice(n));
+                                    }
+                                }
+                                RemoteNav::Activate(RemoteAction::Open) => remote.open_again(),
+                                RemoteNav::Activate(RemoteAction::Phone) => {
+                                    if let Some(url) = remote.phone_link() {
+                                        detail =
+                                            Some(Overlay::link("link a phone".to_string(), url));
+                                    }
+                                }
+                                RemoteNav::Revoke(RemoteAction::Passkey(id)) => {
+                                    if let Err(e) = door.remove_passkey(&id) {
+                                        detail = Some(Overlay::error(
+                                            "passkey not removed".to_string(),
+                                            format!("{e:#}"),
+                                        ));
+                                    }
+                                }
+                                RemoteNav::Revoke(RemoteAction::Session(hash)) => {
+                                    if let Err(e) = door.revoke_session(&hash) {
+                                        detail = Some(Overlay::error(
+                                            "session not revoked".to_string(),
+                                            format!("{e:#}"),
+                                        ));
+                                    }
+                                }
+                                RemoteNav::Activate(_) | RemoteNav::Revoke(_) | RemoteNav::None => {
+                                }
+                            }
+                            continue;
+                        }
                         Mode::WaitDetail { agent, sel } => {
                             let att = snapshot
                                 .agents
@@ -2716,6 +2804,7 @@ pub(crate) async fn run_tui(
                                     }
                                 }
                                 PanelAction::OpenRemote => remote.open_again(),
+                                PanelAction::OpenRemotePage => mode = Mode::RemotePage { sel: 0 },
                                 PanelAction::OpenPicker => {
                                     // Read the candidates FRESH right now.
                                     picker = crate::cli::status::available_agents(
@@ -3769,6 +3858,9 @@ pub(crate) async fn run_tui(
                             cols as usize,
                         )),
                     },
+                    // The page reads the door each frame; nothing in
+                    // the snapshot is its.
+                    Mode::RemotePage { sel } => Mode::RemotePage { sel },
                 };
                 if let Some(tab) = tab.as_mut() {
                     tab.update(&bar_emoji(&snapshot));
@@ -4886,7 +4978,9 @@ pub(crate) mod tests {
         };
         let subject_of = |o: &Overlay| match &o.data {
             OverlayData::Commit(d) => d.subject.clone(),
-            OverlayData::StashedPlan { .. } | OverlayData::Error { .. } => unreachable!(),
+            OverlayData::StashedPlan { .. }
+            | OverlayData::Error { .. }
+            | OverlayData::Link { .. } => unreachable!(),
         };
         // A review row opens at a non-zero offset (commit row would be 0).
         let mut o = Overlay::commit(data("first"), 5);

@@ -152,6 +152,25 @@ pub(super) fn render_at(
         let actions = wait_actions(att.killable_pid().is_some());
         return render_wait_page(&a.label, att, &actions, sel, rows, cols);
     }
+    if let Mode::RemotePage { sel } = mode {
+        let empty = RemotePage::default();
+        let page = view.remote_page.unwrap_or(&empty);
+        let actions = remote_actions(
+            view.remote == crate::cli::status_tui::remote::Shown::On,
+            &page.passkeys,
+            &page.sessions,
+        );
+        let sel = sel.min(actions.len().saturating_sub(1));
+        return render_remote_page(
+            view.remote,
+            view.remote_detail,
+            page,
+            &actions,
+            sel,
+            rows,
+            cols,
+        );
+    }
     if let Mode::Confirm { action } = mode {
         match action {
             ConfirmAction::AddCandidate { .. } | ConfirmAction::RemoveAgent { .. } => {
@@ -1538,6 +1557,156 @@ pub(super) fn render_wait_page(
     let len = out.len();
     out.truncate(rows);
     (out, len)
+}
+
+/// The remote page: the switch and its state, the two ways in
+/// while it is on, then what the door holds — every passkey and
+/// every open session, each a row Backspace revokes.
+pub(super) fn render_remote_page(
+    remote: crate::cli::status_tui::remote::Shown,
+    detail: Option<&str>,
+    page: &RemotePage,
+    actions: &[RemoteAction],
+    sel: usize,
+    rows: usize,
+    cols: usize,
+) -> (Vec<String>, usize) {
+    use crate::cli::status_tui::remote::Shown;
+    let mut out: Vec<String> = Vec::new();
+    out.push(region_rule(
+        "remote",
+        "⏎ select · ␣ switch · o open · p phone · ⌫ revoke · esc back",
+        true,
+        cols,
+    ));
+    out.push(String::new());
+    let mut state = vec![plain("   ".to_string())];
+    state.extend(remote_row(remote, detail));
+    out.push(emit(&state, "", cols));
+    out.push(String::new());
+    let date = |s: &str| s.get(..10).unwrap_or(s).to_string();
+    let minute = |s: &str| s.get(..16).unwrap_or(s).replace('T', " ");
+    let section = |out: &mut Vec<String>, title: &str, empty: Option<&str>| {
+        out.push(String::new());
+        out.push(emit(&[dim(format!("   {title}"))], "", cols));
+        if let Some(e) = empty {
+            out.push(emit(&[dim(format!("     {e}"))], "", cols));
+        }
+    };
+    let mut sel_line = 0;
+    let (mut passkeys_titled, mut sessions_titled) = (false, false);
+    for (i, a) in actions.iter().enumerate() {
+        let spans = match a {
+            RemoteAction::Switch => vec![plain(format!(
+                "   {} {}",
+                REMOTE_ICON,
+                match remote {
+                    Shown::On => "switch off",
+                    Shown::Starting => "starting…",
+                    Shown::Stopping => "stopping…",
+                    Shown::Off | Shown::Failed => "switch on",
+                }
+            ))],
+            RemoteAction::Open => vec![plain("   ↗ open in the browser".to_string())],
+            RemoteAction::Phone => vec![plain("   ▦ link a phone".to_string())],
+            RemoteAction::Passkey(id) => {
+                if !passkeys_titled {
+                    section(&mut out, "passkeys", None);
+                    passkeys_titled = true;
+                }
+                let (name, added) = page
+                    .passkeys
+                    .iter()
+                    .find(|p| p.id == *id)
+                    .map(|p| (p.name.as_str(), date(&p.added)))
+                    .unwrap_or(("?", String::new()));
+                vec![
+                    plain(format!("     {name}")),
+                    dim(format!("  added {added}")),
+                ]
+            }
+            RemoteAction::Session(hash) => {
+                if !sessions_titled {
+                    if page.passkeys.is_empty() {
+                        section(&mut out, "passkeys", Some("none yet — link a phone"));
+                    }
+                    section(&mut out, "sessions", None);
+                    sessions_titled = true;
+                }
+                let (passkey, since) = page
+                    .sessions
+                    .iter()
+                    .find(|s| s.id_hash == *hash)
+                    .map(|s| {
+                        (
+                            s.passkey.as_str(),
+                            format!("since {} · seen {}", date(&s.created), minute(&s.last_seen)),
+                        )
+                    })
+                    .unwrap_or(("?", String::new()));
+                vec![plain(format!("     {passkey}")), dim(format!("  {since}"))]
+            }
+            RemoteAction::Back => {
+                if page.passkeys.is_empty() && page.sessions.is_empty() {
+                    section(&mut out, "passkeys", Some("none yet — link a phone"));
+                }
+                if page.sessions.is_empty() {
+                    section(&mut out, "sessions", Some("none open"));
+                }
+                out.push(String::new());
+                vec![plain("   ‹ back".to_string())]
+            }
+        };
+        if sel == i {
+            sel_line = out.len();
+        }
+        out.push(row_line(&spans, sel == i, "", cols));
+    }
+    // Windowed so the selected row is always on screen: a list
+    // longer than the pane is still every one of its rows before
+    // Backspace (codex on 5d24c05).
+    let len = out.len();
+    let start = sel_line.saturating_sub(rows.saturating_sub(1));
+    let windowed = out.into_iter().skip(start).take(rows).collect();
+    (windowed, len)
+}
+
+/// A link the operator is to follow elsewhere: the URL in words for
+/// typing, and as a QR for a phone's camera, drawn white on black
+/// whatever the terminal's theme so the camera sees a QR.
+pub(super) fn render_link_doc(
+    title: &str,
+    url: &str,
+    qr: &[String],
+    offset: usize,
+    rows: usize,
+    cols: usize,
+) -> (Vec<String>, usize) {
+    let mut content: Vec<String> = Vec::new();
+    content.push(region_rule(title, "esc back", true, cols));
+    content.push(String::new());
+    for line in wrap(url, cols.saturating_sub(2).max(1)) {
+        content.push(emit(&[plain(format!("  {line}"))], "", cols));
+    }
+    content.push(String::new());
+    for line in wrap(
+        "Scan it with the phone, or type it. It admits one registration, within five minutes.",
+        cols.saturating_sub(2).max(1),
+    ) {
+        content.push(emit(&[dim(format!("  {line}"))], "", cols));
+    }
+    content.push(String::new());
+    for line in qr {
+        content.push(emit(
+            &[plain("  ".to_string()), colored("97;40", line.clone())],
+            "",
+            cols,
+        ));
+    }
+    let total = content.len();
+    let off = offset.min(total.saturating_sub(1));
+    let windowed = content.into_iter().skip(off).take(rows).collect();
+    (windowed, total)
 }
 
 /// The kill confirm. Names the target AND the blast radius: signalling
@@ -3302,6 +3471,7 @@ mod tests {
                             reach: crate::cli::status_tui::zellij::ZellijReach::NotInSession,
                             remote: Default::default(),
                             remote_detail: None,
+                            remote_page: None,
                             presence: None,
                             lift,
                         };
@@ -3343,6 +3513,7 @@ mod tests {
             reach: crate::cli::status_tui::zellij::ZellijReach::NotInSession,
             remote: Default::default(),
             remote_detail: None,
+            remote_page: None,
             presence: None,
             lift,
         }
@@ -3559,6 +3730,7 @@ mod tests {
             reach: crate::cli::status_tui::zellij::ZellijReach::NotInSession,
             remote: Default::default(),
             remote_detail: None,
+            remote_page: None,
             presence: None,
         };
         let rule_of = |offset: usize| {
@@ -3931,6 +4103,92 @@ mod tests {
 
     /// The row under the agents says the switch's state, the URL when
     /// on and the reason when failed, and sits after `+ add agent`.
+    /// The page says the switch's direction, offers the two links
+    /// only while on, and lists what the door holds.
+    #[test]
+    fn the_remote_page_offers_the_links_only_while_on() {
+        use crate::cli::status_tui::remote::Shown;
+        let page = RemotePage {
+            passkeys: vec![crate::cli::web::door::PasskeyRow {
+                id: "k1".into(),
+                name: "phone".into(),
+                added: "2026-09-14T10:00:00Z".into(),
+            }],
+            sessions: vec![crate::cli::web::door::SessionRecord {
+                id_hash: "ab".repeat(32),
+                passkey: "phone".into(),
+                created: "2026-09-14T10:01:00Z".into(),
+                last_seen: "2026-09-15T08:30:00Z".into(),
+            }],
+        };
+        let text = |shown: Shown, detail: Option<&str>| {
+            let actions = remote_actions(shown == Shown::On, &page.passkeys, &page.sessions);
+            render_remote_page(shown, detail, &page, &actions, 0, 40, 80)
+                .0
+                .iter()
+                .map(|l| strip_escapes(l))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let off = text(Shown::Off, None);
+        assert!(off.contains("switch on"), "{off}");
+        assert!(!off.contains("open in the browser"), "{off}");
+        assert!(!off.contains("link a phone"), "{off}");
+        assert!(off.contains("phone  added 2026-09-14"), "{off}");
+        assert!(
+            off.contains("phone  since 2026-09-14 · seen 2026-09-15 08:30"),
+            "{off}"
+        );
+        assert!(!off.contains(&"ab".repeat(32)), "the hash is not shown");
+        let on = text(Shown::On, Some("http://localhost:5"));
+        assert!(on.contains("switch off"), "{on}");
+        assert!(on.contains("http://localhost:5"), "{on}");
+        assert!(
+            on.contains("open in the browser") && on.contains("link a phone"),
+            "{on}"
+        );
+        let empty = RemotePage::default();
+        let actions = remote_actions(false, &[], &[]);
+        let bare = render_remote_page(Shown::Off, None, &empty, &actions, 0, 40, 80)
+            .0
+            .join("\n");
+        assert!(
+            bare.contains("none yet — link a phone") && bare.contains("none open"),
+            "{bare}"
+        );
+
+        // A pane shorter than the list: the selected row is on
+        // screen wherever it is, so every session can be read before
+        // it is revoked.
+        let many = RemotePage {
+            passkeys: Vec::new(),
+            sessions: (0..12)
+                .map(|i| crate::cli::web::door::SessionRecord {
+                    id_hash: format!("{i:064}"),
+                    passkey: format!("key{i}"),
+                    created: "2026-09-01T00:00:00Z".into(),
+                    last_seen: "2026-09-01T00:00:00Z".into(),
+                })
+                .collect(),
+        };
+        let actions = remote_actions(false, &[], &many.sessions);
+        let at = |sel: usize| {
+            let (lines, total) = render_remote_page(Shown::Off, None, &many, &actions, sel, 8, 80);
+            assert!(total > 8);
+            assert_eq!(lines.len(), 8);
+            lines
+                .iter()
+                .map(|l| strip_escapes(l))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert!(at(0).contains("switch on"));
+        assert!(!at(0).contains("key11"));
+        assert!(at(12).contains("key11"), "{}", at(12));
+        assert!(at(13).contains("‹ back"), "{}", at(13));
+        assert!(at(5).contains("key4"), "{}", at(5));
+    }
+
     #[test]
     fn the_remote_row_says_its_state_url_or_reason() {
         use crate::cli::status_tui::remote::Shown::*;
@@ -4548,6 +4806,7 @@ mod tests {
                 reach: crate::cli::status_tui::zellij::ZellijReach::NotInSession,
                 remote: Default::default(),
                 remote_detail: None,
+                remote_page: None,
                 presence: None,
             },
         )
@@ -4599,6 +4858,7 @@ mod tests {
             reach: crate::cli::status_tui::zellij::ZellijReach::NotInSession,
             remote: Default::default(),
             remote_detail: None,
+            remote_page: None,
             presence: None,
         };
 
@@ -4705,6 +4965,7 @@ mod tests {
                 reach: crate::cli::status_tui::zellij::ZellijReach::NotInSession,
                 remote: Default::default(),
                 remote_detail: None,
+                remote_page: None,
                 presence: None,
             },
         )
@@ -5065,6 +5326,7 @@ mod tests {
             reach: crate::cli::status_tui::zellij::ZellijReach::NotInSession,
             remote: Default::default(),
             remote_detail: None,
+            remote_page: None,
             presence: None,
         };
         let lines = render_at(&s, 40, 80, 0, 0, &view).0;

@@ -486,7 +486,13 @@
     es.addEventListener('turns', (e) => applyTurns(JSON.parse(e.data)));
     es.addEventListener('turn', (e) => applyTurn(JSON.parse(e.data)));
     es.onopen = () => { liveEl.textContent = 'live'; liveEl.classList.remove('off'); };
-    es.onerror = () => { liveEl.textContent = 'reconnecting'; liveEl.classList.add('off'); };
+    // A stream the door closed — the session revoked or expired —
+    // ends the same way a dropped connection does; the page asks
+    // which before it lets the browser retry forever.
+    es.onerror = async () => {
+      liveEl.textContent = 'reconnecting'; liveEl.classList.add('off');
+      try { if ((await fetch('/whoami')).status === 401) { es.close(); location.replace('/login'); } } catch (e) {}
+    };
   }
 
   form.addEventListener('submit', async (e) => {
