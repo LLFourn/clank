@@ -99,12 +99,15 @@
   .view.on { display: block; }
   .empty { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: var(--muted); padding: 24px; text-align: center; }
 
-  /* Transcript: turns in a column, a gutter that says who and when. */
+  /* Transcript: turns in a column. The agent's are plain; what the
+     person said sits in a block of its own, so who is speaking needs
+     no label. How long ago is the one thing worth a mark, at the
+     right edge of every turn. */
   .turns { padding: 10px 14px 14px; max-width: 86ch; }
-  .turn { display: grid; grid-template-columns: 8ch 1fr; gap: 0 12px; padding: 6px 0; align-items: baseline; }
-  .turn .gutter { color: var(--muted); font-size: 12px; line-height: 1.6; }
-  .turn .gutter .who { display: block; }
-  .turn.person .gutter .who { color: var(--ink); }
+  .turn { position: relative; padding: 6px 5ch 6px 0; }
+  .turn .age { position: absolute; right: 0; top: 6px; color: var(--muted); font-size: 11px; line-height: 1.6; }
+  .turn.person { margin: 10px 0; padding: 8px 5ch 8px 12px; background: var(--bezel); border-left: 3px solid var(--hue); border-radius: 0 4px 4px 0; color: var(--ink); }
+  .turn.person .age { right: 10px; top: 8px; }
   .turn .text { white-space: pre-wrap; overflow-wrap: anywhere; }
   .turn.harness .text { color: var(--muted); font-size: 12px; }
   .turn.thinking .text, .turn .tool .in, .turn .tool .out { color: var(--muted); }
@@ -328,14 +331,12 @@
   // repaint that rebuilt them would close every <details> the reader
   // had opened (codex on 056a342). Harness turns are not rendered at
   // all — the adapters mark them so this can be the clean transcript.
-  function turnHtml(label, t) {
-    const who = t.who === 'person' ? 'you' : label;
-    const age = t.at ? coarse(now() - t.at) : '';
-    const gutter = `<span class="gutter"><span class="who">${esc(who)}</span><span class="age">${esc(age)}</span></span>`;
+  function turnHtml(t) {
     const b = t.body;
-    if (b.kind === 'text') return `${gutter}<span class="text"></span>`;
-    if (b.kind === 'thinking') return `${gutter}<details><summary>thinking</summary><pre class="text"></pre></details>`;
-    return `${gutter}<details class="tool"><summary><span class="name"></span> <span class="in"></span><span class="pending"></span></summary><pre class="in"></pre><pre class="out"></pre></details>`;
+    const age = `<span class="age"></span>`;
+    if (b.kind === 'text') return `${age}<span class="text"></span>`;
+    if (b.kind === 'thinking') return `${age}<details><summary>thinking</summary><pre class="text"></pre></details>`;
+    return `${age}<details class="tool"><summary><span class="name"></span> <span class="in"></span><span class="pending"></span></summary><pre class="in"></pre><pre class="out"></pre></details>`;
   }
   function fillTurn(el, t) {
     const b = t.body;
@@ -354,7 +355,7 @@
     const box = v.transcript.querySelector('.turns');
     const w = agents.get(label);
     const shown = (w ? w.turns : []).filter((t) => t.who !== 'harness');
-    if (!shown.length) { box.innerHTML = `<div class="turn empty-note"><span class="gutter"></span><span class="text">Nothing said yet.</span></div>`; return; }
+    if (!shown.length) { box.innerHTML = `<div class="turn empty-note"><span class="text">Nothing said yet.</span></div>`; return; }
     if (box.querySelector('.empty-note')) box.innerHTML = '';
     const atBottom = v.transcript.scrollTop + v.transcript.clientHeight >= v.transcript.scrollHeight - 40;
     const keep = new Set();
@@ -366,7 +367,7 @@
         el = document.createElement('div');
         el.dataset.id = t.id;
         el.className = `turn ${t.who} ${t.body.kind}`;
-        el.innerHTML = turnHtml(label, t);
+        el.innerHTML = turnHtml(t);
         box.insertBefore(el, cursor);
       } else if (el !== cursor) {
         box.insertBefore(el, cursor);
