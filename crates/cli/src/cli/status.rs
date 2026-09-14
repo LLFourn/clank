@@ -42,7 +42,7 @@ pub struct StatusSnapshot {
     pub(crate) master: Option<String>,
     /// The team roster (master first, then reviewers; deduped) with
     /// each agent's EFFECTIVE auto-mode — the armed/disarmed state the
-    /// `--tui` agent panel renders and toggles. Empty on a teamless
+    /// TUI agent panel renders and toggles. Empty on a teamless
     /// repo (mirrors `master: None`). Built in the snapshot (not read
     /// ad hoc in render) so the nothing-changed gate covers it: every
     /// agent's `config.json` lives under the fingerprinted `agents/`
@@ -101,7 +101,7 @@ pub struct StatusSnapshot {
     pub(crate) head_correction: Option<clank_core::wait::HeadCorrection>,
 }
 
-/// One team agent as the `--tui` agent panel sees it: its label,
+/// One team agent as the TUI's agent panel sees it: its label,
 /// roster role, and EFFECTIVE auto-mode. The auto-mode is the
 /// *armed* state (takes effect at that agent's next Stop-hook
 /// decision), NOT a live run indicator.
@@ -156,7 +156,7 @@ pub(crate) fn agent_invocation(desc: &crate::cli::teams_config::AgentDescription
 }
 
 /// A global-library agent that is NOT yet on this repo's roster — a
-/// candidate the `--tui` "+ add" picker can add as a reviewer. Read
+/// candidate the TUI's "+ add" picker can add as a reviewer. Read
 /// FRESH from the `~/.clank` library when the picker opens (not cached
 /// in the snapshot), so it can't go stale. `invocation` is the launch
 /// command + args (or the bare tool name) — what actually runs — and
@@ -233,7 +233,7 @@ fn roster_auto_rows(
 
 /// Global-library agents (`~/.clank` `agents`) not already on `roster`
 /// — the "+ add" candidates, each with its tool. Read FRESH from the
-/// library by the `--tui` loop when the picker opens (never cached), so
+/// library by the TUI loop when the picker opens (never cached), so
 /// a `clank agent add --global` made elsewhere shows up immediately.
 /// Empty without a resolvable home or library (read-only degrade; the
 /// picker then shows its empty-state hint).
@@ -814,6 +814,9 @@ pub async fn run(args: StatusArgs) -> anyhow::Result<()> {
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
 
     if args.tui {
+        // The flag outgrew the command; the name says so once, and the
+        // panes of sessions opened before the rename keep working.
+        eprintln!("`clank status --tui` is `clank tui` now");
         return crate::cli::status_tui::run_tui(repo, basename, home, policy).await;
     }
 
@@ -2097,7 +2100,7 @@ mod dirty_and_wake_tests {
         );
     }
 
-    /// The agent-panel auto toggle (`status --tui` SPC, or an external
+    /// The agent-panel auto toggle (`clank tui` SPC, or an external
     /// `clank auto`) writes `agents/<label>/config.json`. The repaint
     /// rests on the fingerprint covering that file — which it does only
     /// because the fingerprint recurses over ALL of `agents/`, not

@@ -52,7 +52,7 @@ investigated while authoring this checklist and need no plan.
   `go-to-tab` / pane focus / renames) off the same wait-surface
   data the status TUI consumes, so the active agent's pane comes
   forward (or inactive panes collapse) automatically. Building
-  blocks shipped this cycle: `clank status --tui` (the
+  blocks shipped this cycle: `clank tui` (the
   instrument-panel pane, snapshot-driven) and user-authored
   layout templates (`zellij.layout` + `clank_agents` marker).
   This item is the ACTIVE half: a `clank zellij follow`-style
@@ -124,9 +124,9 @@ investigated while authoring this checklist and need no plan.
   in item 2 is now scoped to the genuine N-reviewers case.
 - First-run init: bare `clank init` adopts the user's `default`
   team; no-team warns with exact commands.
-- Status visibility: `clank status --tui` instrument panel;
+- Status visibility: `clank tui` instrument panel;
   user-authored zellij layout chrome (`zellij.layout` +
-  `clank_agents` marker) with the `--tui` pane as the documented
+  `clank_agents` marker) with the `clank tui` pane as the documented
   example.
 - Wake payloads: stop-hook/wait emit one-line hints; the HOW
   lives in the skills.

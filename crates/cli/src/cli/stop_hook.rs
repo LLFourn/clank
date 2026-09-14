@@ -431,7 +431,7 @@ struct SessionStartInput {
     #[serde(default)]
     source: Option<String>,
     /// Claude sends the session's own transcript file; codex does not.
-    /// Recorded on the binding so `clank web` can read what the agent
+    /// Recorded on the binding so the remote can read what the agent
     /// said without guessing the path.
     #[serde(default)]
     transcript_path: Option<String>,

@@ -516,7 +516,7 @@ pub(crate) fn compose_squash_message(
 
 /// The TUI's provenance line for a squash whose finalize predates
 /// mandatory finish messages (no WHY body to carry).
-pub(super) const TUI_SQUASH_PROVENANCE: &str = "collapsed to one commit from clank status --tui; \
+pub(super) const TUI_SQUASH_PROVENANCE: &str = "collapsed to one commit from clank tui; \
      the original finish predates mandatory finish messages.";
 
 /// THE drop-arming predicate: the RAW buffer must equal the stem

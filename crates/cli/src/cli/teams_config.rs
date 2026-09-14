@@ -86,7 +86,7 @@ pub struct ZellijSection {
     /// KDL layout TEMPLATE wrapping clank's agent panes. Must
     /// contain a `clank_agents` marker node, which clank replaces
     /// with the composed agent pane group — master stage + stacked
-    /// reviewers + a `clank status --tui` instrument pane (the
+    /// reviewers + a `clank tui` instrument pane (the
     /// group BRINGS its own status pane; don't add another). Unset
     /// → clank's built-in layout. Example with custom chrome:
     ///

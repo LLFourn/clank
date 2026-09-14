@@ -68,7 +68,7 @@ pub fn update_agent_config(
 
 /// Set this agent's auto-mode, preserving the rest of its config.
 /// The single write path for arming/disarming auto — `clank auto`
-/// and the `status --tui` toggle both call it, so neither can drop
+/// and the `clank tui` toggle both call it, so neither can drop
 /// `wait_events` on a flip.
 pub fn set_auto_mode(repo: &Path, label: &AgentLabel, mode: AutoMode) -> anyhow::Result<()> {
     update_agent_config(repo, label, |cfg| cfg.auto_mode = Some(mode))
@@ -305,13 +305,13 @@ pub fn try_resolve_via_team_with(
 /// save` and `clank export`, which need the repo's self-contained
 /// config and must reject the legacy shape rather than silently
 /// publishing/dumping a half-parsed one.
-/// The port `clank web` listens on for this repo, if one was ever
+/// The port the remote listens on for this repo, if one was ever
 /// sampled and kept.
 pub fn web_port(repo: &Path) -> anyhow::Result<Option<u16>> {
     Ok(load_repo_config_required(repo)?.web.and_then(|w| w.port))
 }
 
-/// Keep `port` as this repo's: the next `clank web` binds it rather
+/// Keep `port` as this repo's: the next remote binds it rather
 /// than asking the OS again, so the URL stays what it was.
 pub fn record_web_port(repo: &Path, port: u16) -> anyhow::Result<()> {
     let mut file = load_repo_config_required(repo)?;

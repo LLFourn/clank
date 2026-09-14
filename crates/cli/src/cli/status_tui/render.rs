@@ -1088,7 +1088,7 @@ pub(super) fn remote_hue(
     use crate::cli::status_tui::remote::Shown::*;
     match remote {
         Off => Hue::Indexed(245),
-        Starting => Hue::Yellow,
+        Starting | Stopping => Hue::Yellow,
         On => Hue::Green,
         Failed => Hue::Red,
     }
@@ -1107,7 +1107,7 @@ pub(super) fn remote_row(
     let style = match remote {
         On => Style::Color("32"),
         Failed => Style::Color("31"),
-        Starting => Style::Color("33"),
+        Starting | Stopping => Style::Color("33"),
         Off => Style::Dim,
     };
     // The reason is the server's stderr tail — lines, and whatever
@@ -1117,6 +1117,7 @@ pub(super) fn remote_row(
     let said = match (remote, detail) {
         (Off, _) => "off".to_string(),
         (Starting, _) => "starting…".to_string(),
+        (Stopping, _) => "stopping…".to_string(),
         (On, Some(url)) => one_line(url, usize::MAX),
         (On, None) => "on".to_string(),
         (Failed, Some(why)) => format!("failed — {}", one_line(why, usize::MAX)),
@@ -3946,6 +3947,7 @@ mod tests {
         for (remote, detail, want) in [
             (Off, None, "☁  remote  off"),
             (Starting, None, "☁  remote  starting…"),
+            (Stopping, None, "☁  remote  stopping…"),
             (
                 On,
                 Some("http://127.0.0.1:8088"),
@@ -4002,6 +4004,7 @@ mod tests {
         for (remote, want) in [
             (Off, Hue::Indexed(245)),
             (Starting, Hue::Yellow),
+            (Stopping, Hue::Yellow),
             (On, Hue::Green),
             (Failed, Hue::Red),
         ] {

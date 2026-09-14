@@ -41,7 +41,7 @@ pub enum Command {
     /// Show the repo's clank state
     ///
     /// HEAD, plans, phases, and the roster. `--watch` renders live,
-    /// `--tui` is the full-screen pane, `-j` emits JSON.
+    /// `-j` emits JSON; the full-screen pane is `clank tui`.
     Status(crate::cli::StatusArgs),
     /// Block until this agent has actionable work
     ///
@@ -168,9 +168,12 @@ pub enum Command {
     /// it is still running past that you are checked in on once, so a
     /// hang cannot hold you asleep. Nothing is cancelled.
     Attending(crate::cli::AttendingArgs),
-    /// Serve this repo's agent panes to a browser, one at a time
-    /// (a local proof of concept: 127.0.0.1, no authentication).
-    Web(crate::cli::WebArgs),
+    /// The full-screen pane: the repo's state live, the agents, the
+    /// plan and its gate, and the remote switch
+    ///
+    /// One per repo. The `--tui` flag it grew out of still opens it,
+    /// and says so.
+    Tui(crate::cli::TuiArgs),
     /// Run a command under clank, so it knows exactly when the work ends
     ///
     /// Background this instead of the bare command:
@@ -244,7 +247,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Command::Block(args) => crate::cli::block::run(args).await,
         Command::Unblock(args) => crate::cli::block::run_unblock(args).await,
         Command::Attending(args) => crate::cli::attending::run(args).await,
-        Command::Web(args) => crate::cli::web::run(args).await,
+        Command::Tui(args) => crate::cli::status_tui::run(args).await,
         Command::Run(args) => crate::cli::run::run(args),
     }
 }

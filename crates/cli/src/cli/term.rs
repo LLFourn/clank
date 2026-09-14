@@ -1,4 +1,4 @@
-//! Raw-terminal plumbing for `clank status --tui`.
+//! Raw-terminal plumbing for `clank tui`.
 //!
 //! Hand-rolled on `libc` (no crossterm/termion): the alt-screen +
 //! raw-mode lifecycle, the `TIOCGWINSZ` size probe, and the

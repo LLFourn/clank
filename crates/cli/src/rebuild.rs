@@ -606,7 +606,7 @@ mod tests {
     /// `StatusSnapshot` (which runs `rebuild_repo_with_policy` AND
     /// `recent_log_rows`/`rebuild_from`) repeatedly at a stable head
     /// must not rewrite any cache file. This is the closest in-process
-    /// proxy for "a status --tui render leaves the cache alone."
+    /// proxy for "a clank tui render leaves the cache alone."
     #[cfg(unix)]
     #[tokio::test]
     async fn repeated_status_snapshots_at_stable_head_do_not_churn_cache() {

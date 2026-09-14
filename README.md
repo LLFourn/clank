@@ -112,7 +112,7 @@ repo; inside one it adds a tab. Either way the master sits on the
 stage with the reviewers stacked beside it, and each pane is a real
 agent CLI started in this repo. The arrangement is a layout composed
 from the roster: when the roster changes — an agent added, removed or
-promoted — the running `clank status --tui` applies the recomposed
+promoted — the running `clank tui` applies the recomposed
 layout to the live tab (zellij 0.45's `override-layout`), so alt+[ /
 alt+] flip the CURRENT roster's arrangement, not the one from when
 the session was opened. The layout also hands Alt+arrows to the
@@ -166,7 +166,7 @@ commits collapse into one.
 
 ```sh
 clank status            # one-shot repo state
-clank status --tui      # full-screen: the way you actually drive it
+clank tui               # full-screen: the way you actually drive it
 ```
 
 The TUI is the primary interface once a team is running: agent rows
@@ -177,13 +177,12 @@ pages. `--watch` gives a live non-fullscreen view; `-j` emits JSON.
 
 Enter selects whatever the cursor is on; every screen shows its own
 keys along the bottom. The `remote` row under the agent list is the
-switch for `clank web`: Enter starts the server for this repo on the
-port the repo remembers — sampled from the OS the first time and
-kept in `.clank/config.json` — opens it in your browser and leaves
-the URL on the row (`o` there opens it again); Enter again, or
-closing the TUI, stops it. A server already up for the repo is
-adopted rather than duplicated; `clank web --port` still says
-exactly where. `r` from the log view is the same switch, and the glyph beside
+switch for the remote: Enter serves this repo's page from inside the
+TUI on the port the repo remembers — sampled from the OS the first
+time and kept in `.clank/config.json` — opens it in your browser and
+leaves the URL on the row (`o` there opens it again); Enter again,
+or closing the TUI, stops it and everything it started. `r` from
+the log view is the same switch, and the glyph beside
 the zellij one at the bar's right end shows its state from any page.
 
 ## Command reference
@@ -197,7 +196,8 @@ Run `clank <cmd> --help` for details; the skills carry the depth.
 | `doctor` | Diagnose repo / user / session setup; exits 1 on FAIL |
 | `as` | Bind this agent session to a roster label |
 | `auto` | Per-agent auto-mode on / off / status |
-| `status` | Repo state; `--watch` live, `--tui` full-screen pane (Enter on a github row opens the event page: preview, ack, open-in-browser), `-j` JSON |
+| `tui` | The full-screen pane: the way you drive a running team |
+| `status` | Repo state; `--watch` live (Enter on a github row opens the event page: preview, ack, open-in-browser), `-j` JSON |
 | `wait` | Block for work; `--peek`, `--for`, `--event` (see above) |
 | `events` | Github event inbox: `list` / `ack` / `show` (see below) |
 | `feedback` | `write` / `read` review feedback via a typed surface |

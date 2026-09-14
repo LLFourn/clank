@@ -7,7 +7,7 @@
 //! the working tree, so it is storm-safe by construction (no
 //! `build/`/`target/` churn can reach it).
 //!
-//! `status --tui` additionally runs a SEPARATE diff watcher (in
+//! `clank tui` additionally runs a SEPARATE diff watcher (in
 //! `cli::status`) over the working tree to refresh dirty/diff lines;
 //! that one is NOT a source of gate state. This module is the part the
 //! two commands share so "who is the waiting-upon agent" is derived

@@ -1,4 +1,4 @@
-//! Zellij tab/pane mirroring for `status --tui`. When running inside
+//! Zellij tab/pane mirroring for `clank tui`. When running inside
 //! zellij, the status pane (which already holds the whole snapshot)
 //! mirrors the bar's lamp emoji onto the tab name and each agent's
 //! status glyph onto its own pane name. The module IS the namespace —
@@ -49,7 +49,7 @@ fn rename_tab(id: &str, name: &str) {
 /// CHANGE; restores the base name on drop (covers a normal/unwound
 /// exit — a signal-killed exit leaves the last glyph, re-synced by the
 /// next TUI launch). `None` (no-op) outside zellij. Lifecycle is the
-/// pane's: this lives only as long as the `status --tui` process, so
+/// pane's: this lives only as long as the `clank tui` process, so
 /// there's no separate watcher to leak.
 pub(super) struct TabIndicator<R = fn(&str, &str)>
 where
@@ -143,7 +143,7 @@ impl StatusGlyphs {
 }
 
 /// Mirrors each AGENT's status glyph onto its OWN pane name
-/// (tui-agent-pane-status-emoji). The `status --tui` pane already
+/// (tui-agent-pane-status-emoji). The `clank tui` pane already
 /// holds the whole snapshot and can rename any pane by id, so it owns
 /// this centrally — the Stop hook stays clean. Renames a pane only
 /// when its desired title CHANGES (dedup per id). `None` (no-op)

@@ -1,4 +1,5 @@
-//! `clank web` — one repo's agents in a browser, one pane at a time.
+//! The remote: one repo's agents in a browser, one pane at a time,
+//! served from inside `clank tui` as one owned [`Instance`].
 //!
 //! `zellij web` shares a session at ONE geometry, sized to its
 //! smallest client, so a phone gets the desktop's tab or shrinks the
@@ -7,8 +8,7 @@
 //! one agent at a time. Terminals do not reflow, so a pane arrives at
 //! its desktop size; the page scrolls and pinches around it.
 //!
-//! Localhost, no authentication: a proof of concept
-//! (clank-web-shows-each-agent-on-a-phone).
+//! Localhost, no authentication yet (the-tui-mints-the-way-in).
 
 mod feed;
 mod transcript;
@@ -19,7 +19,6 @@ use std::sync::{Arc, Mutex};
 use http_body_util::{BodyExt, Full};
 use hyper::body::{Body, Bytes, Frame};
 
-use super::{WebArgs, resolve_repo};
 use crate::cli::open_zellij::{self, PaneMeta, SubscribeChild};
 use feed::{Feed, SubscribeEvent, TableChange};
 
@@ -41,287 +40,404 @@ pub(crate) fn choose_session(explicit: Option<&str>, current: Option<&str>, repo
 /// zellij, tests record.
 type Sayer = Arc<dyn Fn(&str, &str) -> anyhow::Result<()> + Send + Sync>;
 
-pub async fn run(args: WebArgs) -> anyhow::Result<()> {
-    let shutdown = Shutdown::arm(args.attached_to)?;
-    let repo = resolve_repo(args.repo.as_deref())?;
-    open_zellij::require_zellij()?;
-    let session = choose_session(
-        args.session.as_deref(),
-        open_zellij::current_session().as_deref(),
-        &repo,
-    );
-    let panes = open_zellij::snapshot_panes_in(&session).ok_or_else(|| {
-        anyhow::anyhow!(
-            "zellij did not answer for session `{session}` — is it running? \
-             (`zellij list-sessions`; pass --session to name another)"
-        )
-    })?;
-    if open_zellij::repo_tab_id(&panes, &repo).is_none() {
-        anyhow::bail!(
-            "session `{session}` holds none of {}'s panes — no status pane, no agent pane. \
-             `clank open` puts a repo's tab in whatever session you were in; find it with \
-             `zellij list-sessions` and pass --session.",
-            repo.display()
-        );
+/// What the server needs of zellij, behind a trait so an instance
+/// runs in a test without one: the session, its panes, a
+/// subscription to some of them, and a way to type into one.
+pub(crate) trait Panes: Send + Sync + 'static {
+    fn session(&self) -> &str;
+    /// This repo's agent panes as the session shows them now; `None`
+    /// when zellij does not answer.
+    fn table(&self) -> Option<Vec<PaneMeta>>;
+    fn subscribe(&self, ids: &[String]) -> Option<SubscribeChild>;
+    fn say(&self, pane: &str, text: &str) -> anyhow::Result<()>;
+}
+
+/// The real session this TUI runs in.
+pub(crate) struct Zellij {
+    session: String,
+    repo: PathBuf,
+}
+
+impl Zellij {
+    /// The session this process is in, else the name `clank open`
+    /// would have used; verified to hold the repo's tab.
+    pub(crate) fn find(repo: &Path) -> anyhow::Result<Self> {
+        open_zellij::require_zellij()?;
+        let session = choose_session(None, open_zellij::current_session().as_deref(), repo);
+        let panes = open_zellij::snapshot_panes_in(&session).ok_or_else(|| {
+            anyhow::anyhow!("zellij did not answer for session `{session}` — is it running?")
+        })?;
+        if open_zellij::repo_tab_id(&panes, repo).is_none() {
+            anyhow::bail!(
+                "session `{session}` holds none of {}'s panes — no status pane, no agent pane",
+                repo.display()
+            );
+        }
+        Ok(Self {
+            session,
+            repo: repo.to_path_buf(),
+        })
+    }
+}
+
+impl Panes for Zellij {
+    fn session(&self) -> &str {
+        &self.session
+    }
+    fn table(&self) -> Option<Vec<PaneMeta>> {
+        let panes = open_zellij::snapshot_panes_in(&self.session)?;
+        Some(open_zellij::agent_pane_table(&panes, &self.repo))
+    }
+    fn subscribe(&self, ids: &[String]) -> Option<SubscribeChild> {
+        open_zellij::subscribe_panes(&self.session, ids)
+    }
+    fn say(&self, pane: &str, text: &str) -> anyhow::Result<()> {
+        open_zellij::say_to_pane(&self.session, pane, text)
+    }
+}
+
+/// A running remote: everything it started, owned here, ended
+/// together. The listener and its connections, the pane poll and the
+/// `zellij subscribe` child it restarts, the transcript tails, the
+/// site builder — one cancel signal, and [`Instance::stop`] joins
+/// them all before it returns, so a restart never races a producer of
+/// the last instance and no stream outlives the remote that served it
+/// (clank-tui-runs-the-remote-in-process). Dropping one without
+/// `stop` still cancels, aborts and kills; it just does not wait.
+pub(crate) struct Instance {
+    pub(crate) url: String,
+    cancel: tokio::sync::watch::Sender<bool>,
+    tasks: tokio::task::JoinSet<()>,
+    /// The blocking work in flight — a pane listing, a say — waited
+    /// for at stop however long it takes: aborting the task awaiting
+    /// it would leave the subprocess running (codex on 369e74e).
+    blocking: Arc<Blocking>,
+    grace: std::time::Duration,
+    subscription: Arc<Mutex<Option<Subscription>>>,
+    tails: Arc<Mutex<Tails>>,
+    builder: Option<SiteBuilder>,
+    feed: Feed,
+    repo: PathBuf,
+    home: Option<PathBuf>,
+}
+
+/// Blocking operations, tracked so `stop` can wait for every one:
+/// the awaiter may be cancelled, the operation cannot be, so the
+/// handle is kept here and the awaiter reads a channel instead.
+#[derive(Default)]
+pub(crate) struct Blocking {
+    handles: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+}
+
+impl Blocking {
+    /// Run `f` off the runtime's threads; `None` if the operation's
+    /// thread panicked. The operation runs to completion whether or
+    /// not this future is dropped.
+    async fn run<T: Send + 'static>(
+        self: &Arc<Self>,
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> Option<T> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let handle = tokio::task::spawn_blocking(move || {
+            let _ = tx.send(f());
+        });
+        {
+            let mut handles = self.handles.lock().unwrap_or_else(|e| e.into_inner());
+            handles.retain(|h| !h.is_finished());
+            handles.push(handle);
+        }
+        rx.await.ok()
     }
 
-    // The port before any child: a bind that fails returns from here
-    // with nothing to clean up. It once came after the subscription,
-    // and the error path left a `zellij subscribe` streaming to nobody
-    // — the poll task's clone of it outlived the function, and the
-    // process ended without dropping it (an occupied port, live).
-    let (listener, port) = match listen(&repo, args.port).await? {
-        Listen::Bound { listener, port } => (listener, port),
-        Listen::AlreadyOn { identity } => {
-            println!(
-                "clank web: already on http://127.0.0.1:{}  (pid {}, attached to {})",
-                identity.port,
-                identity.pid,
-                identity
-                    .attached_to
-                    .map_or("nobody".to_string(), |m| m.to_string())
-            );
-            return Ok(());
+    /// Wait for every operation in flight.
+    async fn join_all(&self) {
+        let handles: Vec<_> =
+            std::mem::take(&mut *self.handles.lock().unwrap_or_else(|e| e.into_inner()));
+        for h in handles {
+            let _ = h.await;
         }
-    };
-    let identity = Identity {
-        clank: "web".to_string(),
-        repo: canonical(&repo),
-        session: session.clone(),
-        pid: std::process::id(),
-        port,
-        attached_to: args.attached_to,
-    };
-    let feed = Feed::new(64);
-    let table = open_zellij::agent_pane_table(&panes, &repo);
-    feed.panes(table.clone());
-    let armed = shutdown.witness();
-    let subscription = Arc::new(Mutex::new(start_subscription(
-        armed, &session, &table, &feed,
-    )));
+    }
+}
 
-    spawn_status_loop(repo.clone(), feed.clone());
-    spawn_pane_poll(
-        armed,
-        session.clone(),
-        repo.clone(),
-        feed.clone(),
-        subscription.clone(),
-    );
+/// The tails: the live ones by label, and the retired ones kept until
+/// joined — a retired tail is a thread still finishing its poll, and
+/// dropping its handle would be exactly the detached work this
+/// instance exists not to have.
+#[derive(Default)]
+struct Tails {
+    handles: std::collections::HashMap<String, TailHandle>,
+    retired: Vec<TailHandle>,
+    next_owner: u64,
+}
 
-    println!(
-        "clank web: http://127.0.0.1:{port}  (session {session}, {} agent pane{})",
-        table.len(),
-        if table.len() == 1 { "" } else { "s" }
-    );
-    let say_session = session.clone();
-    let sayer: Sayer =
-        Arc::new(move |pane, text| open_zellij::say_to_pane(&say_session, pane, text));
-    // A signal runs no destructors, so the subscription child — a
-    // `zellij subscribe` that would otherwise stream to nobody for as
-    // long as the session lives — is dropped here on purpose before
-    // the process ends. The smoke test that found this left one.
-    let site = site_dir(&repo);
-    let served = tokio::select! {
-        r = serve(listener, feed, sayer, &session, repo.clone(), site, identity) => r,
-        _ = shutdown.asked() => Ok(()),
-    };
-    drop(
-        subscription
+impl Tails {
+    /// Join the retired tails that have finished; the rest wait for
+    /// the next pass, or for `stop`.
+    fn reap(&mut self) {
+        let (done, pending): (Vec<_>, Vec<_>) = self
+            .retired
+            .drain(..)
+            .partition(|h| h.thread.as_ref().is_none_or(|t| t.is_finished()));
+        for h in done {
+            h.stop_and_join();
+        }
+        self.retired = pending;
+    }
+}
+
+impl Instance {
+    /// Bind the repo's port, subscribe to its panes, and serve. Fails
+    /// before anything is started when the port will not bind or
+    /// zellij does not answer — nothing to clean up on that path.
+    pub(crate) async fn start(
+        repo: PathBuf,
+        home: Option<PathBuf>,
+        panes: Arc<dyn Panes>,
+        poll: std::time::Duration,
+        grace: std::time::Duration,
+    ) -> anyhow::Result<Self> {
+        let table = panes
+            .table()
+            .ok_or_else(|| anyhow::anyhow!("zellij did not answer for `{}`", panes.session()))?;
+        let (listener, port) = listen(&repo).await?;
+        let feed = Feed::new(64);
+        feed.panes(table.clone());
+        let subscription = Arc::new(Mutex::new(subscribe(&*panes, &table, &feed)));
+        let (cancel, cancelled) = tokio::sync::watch::channel(false);
+        let mut tasks = tokio::task::JoinSet::new();
+        let blocking = Arc::new(Blocking::default());
+        let say_panes = panes.clone();
+        let sayer: Sayer = Arc::new(move |pane, text| say_panes.say(pane, text));
+        tasks.spawn(serve(
+            listener,
+            feed.clone(),
+            sayer,
+            panes.session().to_string(),
+            repo.clone(),
+            site_dir(&repo),
+            cancelled.clone(),
+            blocking.clone(),
+        ));
+        tasks.spawn(pane_poll(
+            panes,
+            feed.clone(),
+            subscription.clone(),
+            cancelled,
+            poll,
+            blocking.clone(),
+        ));
+        let builder = SiteBuilder::start(repo.clone(), home.clone());
+        Ok(Self {
+            url: format!("http://127.0.0.1:{port}"),
+            cancel,
+            tasks,
+            blocking,
+            grace,
+            subscription,
+            tails: Arc::new(Mutex::new(Tails::default())),
+            builder: Some(builder),
+            feed,
+            repo,
+            home,
+        })
+    }
+
+    /// The TUI rebuilt its snapshot: the page's facts follow, the
+    /// transcript tails are retargeted to the roster's bindings, and
+    /// the site is rebuilt in the background.
+    pub(crate) fn observe(&self, snap: &crate::cli::status::StatusSnapshot) {
+        let with = {
+            let mut tails = self.tails.lock().unwrap_or_else(|e| e.into_inner());
+            tails.reap();
+            let Tails {
+                handles,
+                retired,
+                next_owner,
+            } = &mut *tails;
+            reconcile_tails(
+                &self.repo,
+                self.home.as_deref(),
+                snap,
+                &self.feed,
+                handles,
+                retired,
+                next_owner,
+            )
+        };
+        self.feed.status(serde_json::json!({
+            "facts": crate::cli::status_tui::web_facts(snap, &with),
+            "snapshot": snap.to_json(),
+        }));
+        if let Some(b) = &self.builder {
+            b.request();
+        }
+    }
+
+    /// End everything and wait for it, in order: the cancel signal;
+    /// the tasks, each finishing on its own — the accept loop ends its
+    /// connections and forwarders, the poll finishes the listing it is
+    /// in — within a grace, aborted only past it; then the subscribe
+    /// child and its reader, the tails live and retired, and the
+    /// builder, joined off the runtime's threads.
+    pub(crate) async fn stop(mut self) {
+        let _ = self.cancel.send(true);
+        let deadline = tokio::time::Instant::now() + self.grace;
+        while !self.tasks.is_empty() {
+            match tokio::time::timeout_at(deadline, self.tasks.join_next()).await {
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(_) => {
+                    self.tasks.shutdown().await;
+                    break;
+                }
+            }
+        }
+        // Whatever blocking work an aborted task was awaiting is still
+        // running; this is where it is waited for.
+        self.blocking.join_all().await;
+        let sub = self
+            .subscription
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .take(),
-    );
-    served
-}
-
-/// Ctrl-C, or SIGTERM where there is one — a pane closing, a `pkill`.
-/// Who this server is, for whoever finds its port taken: `GET
-/// /identity`. `repo` is canonical so two spellings of one path
-/// compare equal; `attached_to` is the process it ends with.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-struct Identity {
-    clank: String,
-    repo: String,
-    session: String,
-    pid: u32,
-    port: u16,
-    #[serde(default)]
-    attached_to: Option<u32>,
-}
-
-fn canonical(repo: &Path) -> String {
-    repo.canonicalize()
-        .unwrap_or_else(|_| repo.to_path_buf())
-        .to_string_lossy()
-        .into_owned()
-}
-
-enum Listen {
-    Bound {
-        listener: tokio::net::TcpListener,
-        port: u16,
-    },
-    /// This repo's server is up already; nothing to start.
-    AlreadyOn { identity: Identity },
-}
-
-/// Where to listen. `explicit` means exactly that port and records
-/// nothing. Otherwise the port the repo remembers; when that will
-/// not bind, whoever holds it is asked: this repo's own server is
-/// reported as already on, anything else — another repo's, a
-/// stranger, a port that answers nothing — has the number now, so a
-/// fresh one is sampled from the OS, remembered in the repo's
-/// config, and bound (a-repo-remembers-its-port).
-async fn listen(repo: &Path, explicit: Option<u16>) -> anyhow::Result<Listen> {
-    let bind = |port: u16| tokio::net::TcpListener::bind(("127.0.0.1", port));
-    if let Some(port) = explicit {
-        let listener = bind(port)
-            .await
-            .map_err(|e| anyhow::anyhow!("cannot listen on 127.0.0.1:{port}: {e}"))?;
-        return Ok(Listen::Bound { listener, port });
+            .take();
+        let tails = self.tails.clone();
+        let builder = self.builder.take();
+        let joined = tokio::task::spawn_blocking(move || {
+            if let Some(sub) = sub {
+                sub.end();
+            }
+            let handles: Vec<TailHandle> = {
+                let mut tails = tails.lock().unwrap_or_else(|e| e.into_inner());
+                let mut all: Vec<TailHandle> = tails.handles.drain().map(|(_, h)| h).collect();
+                all.append(&mut tails.retired);
+                all
+            };
+            for h in handles {
+                h.stop_and_join();
+            }
+            if let Some(b) = builder {
+                b.stop();
+            }
+        })
+        .await;
+        let _ = joined;
     }
-    if let Some(port) = crate::agent_store::web_port(repo)? {
-        if let Ok(listener) = bind(port).await {
-            return Ok(Listen::Bound { listener, port });
+}
+
+impl Drop for Instance {
+    fn drop(&mut self) {
+        let _ = self.cancel.send(true);
+        // The child dies with its handle; the reader is not waited for
+        // here — `stop` is where waiting happens.
+        drop(
+            self.subscription
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take(),
+        );
+    }
+}
+
+/// How long the tasks get to end on their own after the cancel
+/// signal before they are aborted: a listing zellij answers slowly,
+/// a connection mid-response.
+pub(crate) const STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The site, rebuilt off the loop on a thread of its own (the
+/// builder's snapshot future is not `Send`, so not a task): one
+/// request per rebuild, a burst folded into one build, ended and
+/// joined by `stop`.
+struct SiteBuilder {
+    request: std::sync::mpsc::SyncSender<()>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl SiteBuilder {
+    fn start(repo: PathBuf, home: Option<PathBuf>) -> Self {
+        let (request, requests) = std::sync::mpsc::sync_channel::<()>(1);
+        let thread = std::thread::spawn(move || {
+            let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                return;
+            };
+            while requests.recv().is_ok() {
+                while requests.try_recv().is_ok() {}
+                if let Err(e) = rt.block_on(crate::cli::html::generate(
+                    &repo,
+                    &site_dir(&repo),
+                    home.as_deref(),
+                    false,
+                )) {
+                    eprintln!("remote: site build failed: {e:#}");
+                }
+            }
+        });
+        Self {
+            request,
+            thread: Some(thread),
         }
-        if let Some(identity) = identity_at(port).await
-            && identity.repo == canonical(repo)
-        {
-            return Ok(Listen::AlreadyOn { identity });
+    }
+    fn request(&self) {
+        let _ = self.request.try_send(());
+    }
+    fn stop(mut self) {
+        let (tx, _) = std::sync::mpsc::sync_channel::<()>(1);
+        drop(std::mem::replace(&mut self.request, tx));
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
         }
+    }
+}
+
+/// Where to listen: the port the repo remembers, else one the OS
+/// gives, remembered from then on so the URL stays what it was
+/// (a-repo-remembers-its-port). A remembered port that will not bind
+/// is somebody else's now — one TUI per repo, and the remote is the
+/// TUI's, so it cannot be ours — and a fresh one takes its place.
+async fn listen(repo: &Path) -> anyhow::Result<(tokio::net::TcpListener, u16)> {
+    let bind = |port: u16| tokio::net::TcpListener::bind(("127.0.0.1", port));
+    if let Some(port) = crate::agent_store::web_port(repo)?
+        && let Ok(listener) = bind(port).await
+    {
+        return Ok((listener, port));
     }
     let listener = bind(0)
         .await
         .map_err(|e| anyhow::anyhow!("cannot listen on 127.0.0.1: {e}"))?;
     let port = listener.local_addr()?.port();
     crate::agent_store::record_web_port(repo, port)?;
-    Ok(Listen::Bound { listener, port })
+    Ok((listener, port))
 }
 
-/// Whatever answers `/identity` on `port` as a clank server, within
-/// a second; anything else is `None`.
-async fn identity_at(port: u16) -> Option<Identity> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(1))
-        .build()
-        .ok()?;
-    let identity: Identity = client
-        .get(format!("http://127.0.0.1:{port}/identity"))
-        .send()
-        .await
-        .ok()?
-        .json()
-        .await
-        .ok()?;
-    (identity.clank == "web").then_some(identity)
+/// A `zellij subscribe` child and the thread reading it: the child
+/// is killed on drop, and the reader ends at the EOF that follows.
+struct Subscription {
+    child: SubscribeChild,
+    reader: std::thread::JoinHandle<()>,
 }
 
-/// The ways this server is asked to stop — SIGTERM, Ctrl-C, the
-/// process it is attached to going away — armed BEFORE any child of
-/// its own exists. A signal handler is installed when its stream is
-/// first created; until then SIGTERM is the default action, which
-/// runs no destructor and would leave a `zellij subscribe` streaming
-/// to nobody. So the streams are created here, first, and whatever
-/// spawns a child takes this as its witness (codex on 1764612).
-struct Shutdown {
-    #[cfg(unix)]
-    term: Option<tokio::signal::unix::Signal>,
-    attached_to: Option<u32>,
-}
-
-/// Proof that [`Shutdown::arm`] has run: only it makes one, and
-/// whatever spawns a child of this server's takes one.
-#[derive(Clone, Copy)]
-struct Armed(());
-
-impl Shutdown {
-    fn witness(&self) -> Armed {
-        Armed(())
-    }
-
-    fn arm(attached_to: Option<u32>) -> anyhow::Result<Self> {
-        #[cfg(unix)]
-        let term = {
-            use tokio::signal::unix::{SignalKind, signal};
-            // A runtime without signal support still gets Ctrl-C
-            // and the attached pid; it is not a reason to refuse.
-            signal(SignalKind::terminate()).ok()
-        };
-        Ok(Self {
-            #[cfg(unix)]
-            term,
-            attached_to,
-        })
-    }
-
-    async fn asked(mut self) {
-        #[cfg(unix)]
-        let term = async {
-            match self.term.as_mut() {
-                Some(t) => {
-                    t.recv().await;
-                }
-                None => std::future::pending::<()>().await,
-            }
-        };
-        #[cfg(not(unix))]
-        let term = std::future::pending::<()>();
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            _ = term => {}
-            _ = attached_gone(self.attached_to) => {}
-        }
+impl Subscription {
+    /// Kill the child and wait for the reader.
+    fn end(self) {
+        drop(self.child);
+        let _ = self.reader.join();
     }
 }
 
-/// Resolves once the process this server is attached to is gone;
-/// never, when it is attached to none. `kill(pid, 0)` rather than a
-/// parent check: the TUI spawns the server, but nothing says it stays
-/// the parent for the server's whole life.
-async fn attached_gone(pid: Option<u32>) {
-    let Some(pid) = pid else {
-        return std::future::pending().await;
-    };
-    loop {
-        if !process_exists(pid) {
-            return;
-        }
-        tokio::time::sleep(ATTACHED_POLL).await;
-    }
-}
-
-const ATTACHED_POLL: std::time::Duration = std::time::Duration::from_secs(2);
-
-fn process_exists(pid: u32) -> bool {
-    if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
-        return true;
-    }
-    // Another user's process answers EPERM and is just as alive.
-    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-}
-
-/// Start (or restart) the one subscription child for `table`'s live
-/// panes, and the thread that reads it into the feed. The previous
-/// child, if any, is the caller's to drop — dropping kills it, and
-/// its reader thread ends on EOF.
-/// `_armed`: no child of this server's before its shutdown is armed
-/// — see [`Shutdown`].
-fn start_subscription(
-    _armed: Armed,
-    session: &str,
-    table: &[PaneMeta],
-    feed: &Feed,
-) -> Option<SubscribeChild> {
+/// Subscribe to the panes that are alive; the child's lines feed the
+/// page until the child ends.
+fn subscribe(panes: &dyn Panes, table: &[PaneMeta], feed: &Feed) -> Option<Subscription> {
     let ids: Vec<String> = table
         .iter()
         .filter(|p| !p.exited)
         .map(|p| p.id.clone())
         .collect();
-    let mut child = open_zellij::subscribe_panes(session, &ids)?;
+    let mut child = panes.subscribe(&ids)?;
     let stdout = child.take_stdout()?;
     let feed = feed.clone();
-    std::thread::spawn(move || {
+    let reader = std::thread::spawn(move || {
         use std::io::BufRead;
         for line in std::io::BufReader::new(stdout).lines() {
             let Ok(line) = line else { break };
@@ -330,85 +446,7 @@ fn start_subscription(
             }
         }
     });
-    Some(child)
-}
-
-/// The status feed: the TUI's own watcher wakes a rebuild, and the
-/// rebuilt snapshot goes out with the TUI's derived facts. The same
-/// thread follows each agent's transcript, because which transcripts
-/// exist is a fact of the rebuilt snapshot: an agent rebound to a new
-/// session gets a new tail and a new window.
-///
-/// One thread owns the watcher, its wake channel, and the rebuild —
-/// on a runtime of its own. `build_async` holds a `git_io::Repo`
-/// across its awaits, which is not `Send`, so it cannot be spawned
-/// onto the server's runtime; the TUI never spawns it either. Nothing
-/// non-`Send` crosses a thread this way: only the `Feed` does.
-fn spawn_status_loop(repo: PathBuf, feed: Feed) {
-    std::thread::spawn(move || {
-        let (tx, rx) = std::sync::mpsc::channel::<()>();
-        let Ok(_watchers) = crate::cli::status::watch_status_paths(tx, &repo) else {
-            return;
-        };
-        let Ok(rt) = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .enable_all()
-            .build()
-        else {
-            return;
-        };
-        let basename = repo
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("repo")
-            .to_string();
-        let home = std::env::var_os("HOME").map(PathBuf::from);
-        let mut tails: std::collections::HashMap<String, TailHandle> = Default::default();
-        let mut next_owner: u64 = 0;
-        loop {
-            let built = rt.block_on(crate::cli::status::StatusSnapshot::build_async(
-                &repo,
-                &basename,
-                home.as_deref(),
-                crate::rebuild::CachePolicy::Use,
-                None,
-                true,
-            ));
-            if let Ok(snap) = built {
-                // The pages the ledger links, from the same builder
-                // `clank html` runs — incremental, and off the
-                // request path.
-                if let Err(e) = rt.block_on(crate::cli::html::generate(
-                    &repo,
-                    &site_dir(&repo),
-                    home.as_deref(),
-                    false,
-                )) {
-                    eprintln!("clank web: site build failed: {e:#}");
-                }
-                let with = reconcile_tails(
-                    &repo,
-                    home.as_deref(),
-                    &snap,
-                    &feed,
-                    &mut tails,
-                    &mut next_owner,
-                );
-                feed.status(serde_json::json!({
-                    "facts": crate::cli::status_tui::web_facts(&snap, &with),
-                    "snapshot": snap.to_json(),
-                }));
-            }
-            if rx.recv().is_err() {
-                break;
-            }
-            // A burst of wakes is one rebuild.
-            while rx
-                .recv_timeout(std::time::Duration::from_millis(300))
-                .is_ok()
-            {}
-        }
-    });
+    Some(Subscription { child, reader })
 }
 
 /// A transcript being followed for one agent, for one session, from
@@ -418,6 +456,17 @@ struct TailHandle {
     session: String,
     path: PathBuf,
     stop: Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl TailHandle {
+    /// Stop the tail and wait for it: within one poll of the file.
+    fn stop_and_join(mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
 }
 
 impl Drop for TailHandle {
@@ -443,6 +492,7 @@ fn reconcile_tails(
     snap: &crate::cli::status::StatusSnapshot,
     feed: &Feed,
     tails: &mut std::collections::HashMap<String, TailHandle>,
+    retired: &mut Vec<TailHandle>,
     next_owner: &mut u64,
 ) -> std::collections::BTreeSet<String> {
     let mut wanted = Wanted::default();
@@ -469,7 +519,7 @@ fn reconcile_tails(
         }
     }
     let roster = snap.agents.iter().map(|a| a.label.clone()).collect();
-    retarget_tails(&wanted, &roster, feed, tails, next_owner)
+    retarget_tails(&wanted, &roster, feed, tails, retired, next_owner)
 }
 
 /// The window an agent shows is decided HERE, synchronously, and the
@@ -485,21 +535,29 @@ fn retarget_tails(
     roster: &std::collections::BTreeSet<String>,
     feed: &Feed,
     tails: &mut std::collections::HashMap<String, TailHandle>,
+    retired: &mut Vec<TailHandle>,
     next_owner: &mut u64,
 ) -> std::collections::BTreeSet<String> {
-    let mut retired = Vec::new();
-    tails.retain(|label, h| {
-        let same = wanted
-            .get(label)
-            .is_some_and(|(sid, path)| sid == &h.session && path == &h.path);
-        if !same && !wanted.contains_key(label) {
-            retired.push(label.clone());
+    // A tail no longer wanted is stopped, and its handle KEPT for the
+    // join: the thread is still finishing its poll (codex on 55db154).
+    let gone: Vec<String> = tails
+        .iter()
+        .filter(|(label, h)| {
+            !wanted
+                .get(*label)
+                .is_some_and(|(sid, path)| sid == &h.session && path == &h.path)
+        })
+        .map(|(label, _)| label.clone())
+        .collect();
+    for label in gone {
+        if let Some(h) = tails.remove(&label) {
+            h.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            retired.push(h);
         }
-        same
-    });
-    for label in retired {
-        *next_owner += 1;
-        feed.claim_turns(&label, *next_owner, None);
+        if !wanted.contains_key(&label) {
+            *next_owner += 1;
+            feed.claim_turns(&label, *next_owner, None);
+        }
     }
     for (label, (session, path)) in wanted {
         if tails.contains_key(label) {
@@ -516,13 +574,15 @@ fn retarget_tails(
             path.clone(),
             stop.clone(),
         );
-        std::thread::spawn(move || run_tail(feed, label2, owner, session2, path2, stop2));
+        let thread =
+            std::thread::spawn(move || run_tail(feed, label2, owner, session2, path2, stop2));
         tails.insert(
             label.clone(),
             TailHandle {
                 session: session.clone(),
                 path: path.clone(),
                 stop,
+                thread: Some(thread),
             },
         );
     }
@@ -631,31 +691,45 @@ fn window_turns(tool: clank_core::vocab::Tool, lines: &[String]) -> Vec<transcri
 /// How often the pane set is re-listed. A status change is a hint,
 /// not the trigger: the TUI creates panes asynchronously after the
 /// change the watcher sees, and a resize changes nothing it watches.
-const PANE_POLL: std::time::Duration = std::time::Duration::from_secs(4);
+pub(crate) const PANE_POLL: std::time::Duration = std::time::Duration::from_secs(4);
 
-fn spawn_pane_poll(
-    armed: Armed,
-    session: String,
-    repo: PathBuf,
+/// Re-list the panes every [`PANE_POLL`]; a change of membership
+/// restarts the subscription for the panes there are now. Ends on
+/// the cancel signal, its subscription with it (`stop` ends that).
+async fn pane_poll(
+    panes: Arc<dyn Panes>,
     feed: Feed,
-    subscription: Arc<Mutex<Option<SubscribeChild>>>,
+    subscription: Arc<Mutex<Option<Subscription>>>,
+    mut cancelled: tokio::sync::watch::Receiver<bool>,
+    poll: std::time::Duration,
+    blocking: Arc<Blocking>,
 ) {
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(PANE_POLL).await;
-            let s = session.clone();
-            let Ok(Some(panes)) =
-                tokio::task::spawn_blocking(move || open_zellij::snapshot_panes_in(&s)).await
-            else {
-                continue;
-            };
-            let table = open_zellij::agent_pane_table(&panes, &repo);
-            if feed.panes(table.clone()) == TableChange::Membership {
-                let fresh = start_subscription(armed, &session, &table, &feed);
-                *subscription.lock().unwrap_or_else(|e| e.into_inner()) = fresh;
+    loop {
+        tokio::select! {
+            _ = cancelled.changed() => return,
+            _ = tokio::time::sleep(poll) => {}
+        }
+        // The listing is waited for, not abandoned: a blocking call
+        // cannot be cancelled, so cancel is checked after it.
+        let listing = panes.clone();
+        let listed = blocking.run(move || listing.table()).await;
+        if *cancelled.borrow() {
+            return;
+        }
+        let Some(Some(table)) = listed else {
+            continue;
+        };
+        if feed.panes(table.clone()) == TableChange::Membership {
+            let fresh = subscribe(&*panes, &table, &feed);
+            let old = std::mem::replace(
+                &mut *subscription.lock().unwrap_or_else(|e| e.into_inner()),
+                fresh,
+            );
+            if let Some(old) = old {
+                old.end();
             }
         }
-    });
+    }
 }
 
 /// A Server-Sent Events body: frames arrive on a channel and go out
@@ -698,41 +772,82 @@ fn site_dir(repo: &Path) -> PathBuf {
     repo.join(".clank/html")
 }
 
+/// Accept until cancelled; every connection is a task of this loop's
+/// own set, aborted and joined when it ends — so no stream outlives
+/// the remote that served it.
 async fn serve(
     listener: tokio::net::TcpListener,
     feed: Feed,
     sayer: Sayer,
-    session: &str,
+    session: String,
     repo: PathBuf,
     site: PathBuf,
-    identity: Identity,
-) -> anyhow::Result<()> {
-    let pages = Arc::new(Pages {
-        repo,
-        site,
-        identity,
+    mut cancelled: tokio::sync::watch::Receiver<bool>,
+    blocking: Arc<Blocking>,
+) {
+    let ctx = Arc::new(Ctx {
+        feed,
+        sayer,
+        blocking,
+        page: Arc::from(PAGE.replace(
+            "window.CLANK_SESSION || 'clank'",
+            &format!("{}", serde_json::json!(session)),
+        )),
+        pages: Pages { repo, site },
+        workers: Mutex::new(tokio::task::JoinSet::new()),
+        cancelled: cancelled.clone(),
     });
-    let page: Arc<str> = Arc::from(PAGE.replace(
-        "window.CLANK_SESSION || 'clank'",
-        &format!("{}", serde_json::json!(session)),
-    ));
     loop {
-        let (stream, _) = listener.accept().await?;
+        let accepted = tokio::select! {
+            _ = cancelled.changed() => break,
+            accepted = listener.accept() => accepted,
+        };
+        let Ok((stream, _)) = accepted else { break };
         let io = hyper_util::rt::TokioIo::new(stream);
-        let (feed, sayer, page, pages) = (feed.clone(), sayer.clone(), page.clone(), pages.clone());
+        let ctx2 = ctx.clone();
         let svc = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
-            let (feed, sayer, page, pages) =
-                (feed.clone(), sayer.clone(), page.clone(), pages.clone());
-            async move {
-                Ok::<_, std::convert::Infallible>(route(req, &feed, &sayer, &page, &pages).await)
+            let ctx = ctx2.clone();
+            async move { Ok::<_, std::convert::Infallible>(route(req, &ctx).await) }
+        });
+        let mut workers = ctx.workers.lock().unwrap_or_else(|e| e.into_inner());
+        let mut cancel = cancelled.clone();
+        workers.spawn(async move {
+            // A connection ends on the cancel too: gracefully, so a
+            // response in flight completes and an idle keep-alive is
+            // closed rather than waited on for a request that never
+            // comes.
+            let conn = hyper::server::conn::http1::Builder::new().serve_connection(io, svc);
+            tokio::pin!(conn);
+            tokio::select! {
+                _ = conn.as_mut() => {}
+                _ = cancel.changed() => {
+                    conn.as_mut().graceful_shutdown();
+                    let _ = conn.await;
+                }
             }
         });
-        tokio::spawn(async move {
-            let _ = hyper::server::conn::http1::Builder::new()
-                .serve_connection(io, svc)
-                .await;
-        });
+        // Finished workers are reaped as they come, so the set holds
+        // only the live ones.
+        while workers.try_join_next().is_some() {}
     }
+    // Every connection and forwarder is a worker: told to end by the
+    // cancel they share, and waited for here — this loop is what
+    // `stop` joins.
+    let mut workers = std::mem::take(&mut *ctx.workers.lock().unwrap_or_else(|e| e.into_inner()));
+    while let Some(_done) = workers.join_next().await {}
+}
+
+/// What a request is answered from, and where its workers go.
+struct Ctx {
+    feed: Feed,
+    sayer: Sayer,
+    blocking: Arc<Blocking>,
+    page: Arc<str>,
+    pages: Pages,
+    /// The accept loop's set: connections, and the SSE forwarders
+    /// they start, so none is detached.
+    workers: Mutex<tokio::task::JoinSet<()>>,
+    cancelled: tokio::sync::watch::Receiver<bool>,
 }
 
 /// Where the site's pages come from: the built site, and the repo
@@ -740,26 +855,16 @@ async fn serve(
 struct Pages {
     repo: PathBuf,
     site: PathBuf,
-    identity: Identity,
 }
 
-async fn route(
-    req: hyper::Request<hyper::body::Incoming>,
-    feed: &Feed,
-    sayer: &Sayer,
-    page: &str,
-    pages: &Pages,
-) -> Resp {
+async fn route(req: hyper::Request<hyper::body::Incoming>, ctx: &Ctx) -> Resp {
     match (req.method().as_str(), req.uri().path()) {
-        ("GET", "/") => text(200, page.to_string(), "text/html; charset=utf-8"),
-        ("GET", "/events") => events(feed),
-        ("POST", "/say") => say(req, sayer).await,
-        ("GET", "/identity") => text(
-            200,
-            serde_json::to_string(&pages.identity).unwrap_or_default(),
-            "application/json",
-        ),
-        ("GET", path) if path.starts_with("/html/") => site_page(pages, &path["/html/".len()..]),
+        ("GET", "/") => text(200, ctx.page.to_string(), "text/html; charset=utf-8"),
+        ("GET", "/events") => events(ctx),
+        ("POST", "/say") => say(req, ctx).await,
+        ("GET", path) if path.starts_with("/html/") => {
+            site_page(&ctx.pages, &path["/html/".len()..])
+        }
         _ => text(404, "not here", "text/plain"),
     }
 }
@@ -845,29 +950,40 @@ fn site_page(pages: &Pages, rel: &str) -> Resp {
 /// The handoff: subscribe, then the retained state, then live —
 /// the order `Feed::connect` documents. A lagged browser gets the
 /// state again.
-fn events(feed: &Feed) -> Resp {
-    let (frames, mut rx) = feed.connect();
+fn events(ctx: &Ctx) -> Resp {
+    let (frames, mut rx) = ctx.feed.connect();
     let (tx, body_rx) = tokio::sync::mpsc::channel::<String>(64);
-    let feed = feed.clone();
-    tokio::spawn(async move {
-        for f in frames {
-            if tx.send(f).await.is_err() {
-                return;
-            }
-        }
-        loop {
-            let next = match rx.recv().await {
-                Ok(f) => vec![f],
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => feed.resync(),
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
-            };
-            for f in next {
+    let feed = ctx.feed.clone();
+    let mut cancelled = ctx.cancelled.clone();
+    // The forwarder is a worker of the accept loop's, not a task of
+    // its own: it ends on the cancel the loop shares, or when the
+    // browser is gone, and the loop joins it (codex on 55db154).
+    ctx.workers
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .spawn(async move {
+            for f in frames {
                 if tx.send(f).await.is_err() {
                     return;
                 }
             }
-        }
-    });
+            loop {
+                let received = tokio::select! {
+                    _ = cancelled.changed() => return,
+                    r = rx.recv() => r,
+                };
+                let next = match received {
+                    Ok(f) => vec![f],
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => feed.resync(),
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                };
+                for f in next {
+                    if tx.send(f).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        });
     hyper::Response::builder()
         .status(200)
         .header("content-type", "text/event-stream")
@@ -882,7 +998,7 @@ struct Say {
     text: String,
 }
 
-async fn say(req: hyper::Request<hyper::body::Incoming>, sayer: &Sayer) -> Resp {
+async fn say(req: hyper::Request<hyper::body::Incoming>, ctx: &Ctx) -> Resp {
     let body = http_body_util::Limited::new(req.into_body(), 64 * 1024);
     let Ok(bytes) = body.collect().await.map(|c| c.to_bytes()) else {
         return text(413, "too much to say at once", "text/plain");
@@ -890,12 +1006,17 @@ async fn say(req: hyper::Request<hyper::body::Incoming>, sayer: &Sayer) -> Resp 
     let Ok(say) = serde_json::from_slice::<Say>(&bytes) else {
         return text(400, "expected {\"pane\": …, \"text\": …}", "text/plain");
     };
-    let sayer = sayer.clone();
-    let sent = tokio::task::spawn_blocking(move || sayer(&say.pane, &say.text)).await;
+    // Typing into an agent after the switch is off is exactly what
+    // off forbids; a say already under way is waited for by `stop`.
+    if *ctx.cancelled.borrow() {
+        return text(503, "the remote is off", "text/plain");
+    }
+    let sayer = ctx.sayer.clone();
+    let sent = ctx.blocking.run(move || sayer(&say.pane, &say.text)).await;
     match sent {
-        Ok(Ok(())) => text(204, "", "text/plain"),
-        Ok(Err(e)) => text(502, format!("{e:#}"), "text/plain"),
-        Err(_) => text(500, "the sender panicked", "text/plain"),
+        Some(Ok(())) => text(204, "", "text/plain"),
+        Some(Err(e)) => text(502, format!("{e:#}"), "text/plain"),
+        None => text(500, "the sender panicked", "text/plain"),
     }
 }
 
@@ -913,13 +1034,21 @@ mod tests {
         use std::collections::{BTreeSet, HashMap};
         let feed = Feed::new(16);
         let mut tails = HashMap::new();
+        let mut retired = Vec::new();
         let mut next_owner = 0;
         let roster: BTreeSet<String> = ["claude".to_string(), "codex".to_string()].into();
         let dir = tempfile::tempdir().unwrap();
         let file = |n: &str| dir.path().join(n);
         let mut wanted = Wanted::default();
         wanted.insert("claude".into(), ("s1".into(), file("s1.jsonl")));
-        let with = retarget_tails(&wanted, &roster, &feed, &mut tails, &mut next_owner);
+        let with = retarget_tails(
+            &wanted,
+            &roster,
+            &feed,
+            &mut tails,
+            &mut retired,
+            &mut next_owner,
+        );
         assert_eq!(with, ["claude".to_string()].into());
         let owner1 = feed.snapshot().turns["claude"].owner;
         feed.turns_reset("claude", owner1, "s1", 1, vec![say("a")]);
@@ -927,7 +1056,15 @@ mod tests {
 
         let (_, mut rx) = feed.connect();
         wanted.insert("claude".into(), ("s2".into(), file("s2.jsonl")));
-        retarget_tails(&wanted, &roster, &feed, &mut tails, &mut next_owner);
+        retarget_tails(
+            &wanted,
+            &roster,
+            &feed,
+            &mut tails,
+            &mut retired,
+            &mut next_owner,
+        );
+        assert_eq!(retired.len(), 1, "the s1 tail is kept for its join");
         let owner2 = feed.snapshot().turns["claude"].owner;
         assert_ne!(owner1, owner2);
         let mut page = feed::PageModel::default();
@@ -938,8 +1075,23 @@ mod tests {
         assert_eq!(feed.snapshot().turns["claude"].session, "s2");
 
         wanted.remove("claude");
-        let with = retarget_tails(&wanted, &roster, &feed, &mut tails, &mut next_owner);
+        let with = retarget_tails(
+            &wanted,
+            &roster,
+            &feed,
+            &mut tails,
+            &mut retired,
+            &mut next_owner,
+        );
         assert!(with.is_empty() && tails.is_empty());
+        assert_eq!(retired.len(), 2);
+        // Retired tails are joined, not dropped: each thread ends
+        // within a poll of the file once its stop flag is set.
+        let started = std::time::Instant::now();
+        for h in retired.drain(..) {
+            h.stop_and_join();
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
         page.apply(&rx.try_recv().unwrap());
         assert_eq!(page.agents["claude"].session, "");
         feed.turns_reset("claude", owner2, "s2", 1, vec![say("late")]);
@@ -957,34 +1109,6 @@ mod tests {
         }
     }
 
-    /// Attached to a process that is gone, the server ends at once;
-    /// attached to one that lives, or to none, it does not.
-    #[tokio::test]
-    async fn the_server_ends_with_the_process_it_is_attached_to() {
-        use std::time::Duration;
-        // A pid no process has: the largest macOS/Linux will hand out
-        // is far below this, and a kill(pid, 0) on it is ESRCH.
-        let gone = 4_000_000u32;
-        assert!(!process_exists(gone));
-        tokio::time::timeout(Duration::from_secs(1), attached_gone(Some(gone)))
-            .await
-            .expect("ends at once");
-        let me = std::process::id();
-        assert!(process_exists(me));
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), attached_gone(Some(me)))
-                .await
-                .is_err(),
-            "still attached"
-        );
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), attached_gone(None))
-                .await
-                .is_err(),
-            "attached to nothing, ends for nothing"
-        );
-    }
-
     fn repo_with_config() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         crate::agent_store::write_typed_config(
@@ -995,108 +1119,31 @@ mod tests {
         dir
     }
 
-    /// A clank identity server on `port`, answering for `repo`.
-    fn identity_server(port: u16, repo: &Path) -> (tokio::task::JoinHandle<()>, Identity) {
-        let identity = Identity {
-            clank: "web".into(),
-            repo: canonical(repo),
-            session: "s".into(),
-            pid: 777,
-            port,
-            attached_to: None,
-        };
-        let listener = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
-        let site = tempfile::tempdir().unwrap();
-        let (repo, id) = (repo.to_path_buf(), identity.clone());
-        let handle = tokio::spawn(async move {
-            let _site = site;
-            let sayer: Sayer = Arc::new(|_, _| Ok(()));
-            let _ = serve(listener, Feed::new(4), sayer, "s", repo, PathBuf::new(), id).await;
-        });
-        (handle, identity)
-    }
-
-    fn free_port() -> u16 {
-        std::net::TcpListener::bind(("127.0.0.1", 0))
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port()
-    }
-
     /// The port policy, against real listeners: nothing remembered →
     /// one sampled and remembered; remembered and free → that one;
-    /// `--port` → exactly that, nothing remembered; remembered but a
-    /// stranger's → a fresh one, remembered in its place; remembered
-    /// and this repo's own server → already on; another repo's → a
-    /// fresh one.
+    /// remembered but taken → a fresh one, remembered in its place.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_repo_remembers_its_port_and_asks_who_holds_it() {
+    async fn a_repo_remembers_its_port() {
         let repo = repo_with_config();
         assert_eq!(crate::agent_store::web_port(repo.path()).unwrap(), None);
-        let Listen::Bound { listener, port } = listen(repo.path(), None).await.unwrap() else {
-            panic!("bound")
-        };
+        let (listener, port) = listen(repo.path()).await.unwrap();
         assert_eq!(
             crate::agent_store::web_port(repo.path()).unwrap(),
             Some(port)
         );
         drop(listener);
-        let Listen::Bound { port: again, .. } = listen(repo.path(), None).await.unwrap() else {
-            panic!("bound")
-        };
+        let (_l, again) = listen(repo.path()).await.unwrap();
         assert_eq!(again, port, "remembered, and free");
+        drop(_l);
 
-        let explicit = free_port();
-        let Listen::Bound { port: told, .. } = listen(repo.path(), Some(explicit)).await.unwrap()
-        else {
-            panic!("bound")
-        };
-        assert_eq!(told, explicit);
-        assert_eq!(
-            crate::agent_store::web_port(repo.path()).unwrap(),
-            Some(port),
-            "--port remembers nothing"
-        );
-
-        // A stranger on the remembered port: not asked twice, replaced.
         let stranger = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
-        let Listen::Bound { port: fresh, .. } = listen(repo.path(), None).await.unwrap() else {
-            panic!("bound")
-        };
+        let (_l, fresh) = listen(repo.path()).await.unwrap();
         assert_ne!(fresh, port);
         assert_eq!(
             crate::agent_store::web_port(repo.path()).unwrap(),
             Some(fresh)
         );
         drop(stranger);
-
-        // This repo's own server on the remembered port: already on.
-        let (server, identity) = identity_server(fresh, repo.path());
-        let Listen::AlreadyOn { identity: found } = listen(repo.path(), None).await.unwrap() else {
-            panic!("already on")
-        };
-        assert_eq!(found, identity);
-        assert_eq!(
-            crate::agent_store::web_port(repo.path()).unwrap(),
-            Some(fresh)
-        );
-        server.abort();
-
-        // Another repo's server on it: theirs now; a fresh one.
-        let other = repo_with_config();
-        let (server, _) = identity_server(fresh, other.path());
-        let Listen::Bound { port: moved, .. } = listen(repo.path(), None).await.unwrap() else {
-            panic!("bound")
-        };
-        assert_ne!(moved, fresh);
-        assert_eq!(
-            crate::agent_store::web_port(repo.path()).unwrap(),
-            Some(moved)
-        );
-        server.abort();
     }
 
     /// The site's shapes and nothing else, decided on the name alone:
@@ -1215,19 +1262,23 @@ mod tests {
         git(&["add", "readme"]);
         git(&["commit", "--quiet", "-m", "history before adoption"]);
         let old_sha = git(&["rev-parse", "HEAD"]);
-        let identity = Identity {
-            clank: "web".into(),
-            repo: canonical(repo.path()),
-            session: "clank-test".into(),
-            pid: std::process::id(),
-            port,
-            attached_to: Some(4242),
-        };
+        let (cancel, cancelled) = tokio::sync::watch::channel(false);
         let server = tokio::spawn({
             let feed = feed.clone();
             let (repo, site) = (repo.path().to_path_buf(), site.path().to_path_buf());
-            let identity = identity.clone();
-            async move { serve(listener, feed, sayer, "clank-test", repo, site, identity).await }
+            async move {
+                serve(
+                    listener,
+                    feed,
+                    sayer,
+                    "clank-test".to_string(),
+                    repo,
+                    site,
+                    cancelled,
+                    Arc::new(Blocking::default()),
+                )
+                .await
+            }
         });
         let base = format!("http://127.0.0.1:{port}");
         let client = reqwest::Client::new();
@@ -1326,17 +1377,16 @@ mod tests {
         assert_eq!(none.status(), 404);
         assert!(none.text().await.unwrap().contains("no such commit"));
 
-        // Who is serving, as JSON, for whoever finds the port taken.
-        let who: Identity = client
-            .get(format!("{base}/identity"))
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
-        assert_eq!(who, identity);
-        assert_eq!(identity_at(port).await, Some(identity.clone()));
+        assert_eq!(
+            client
+                .get(format!("{base}/identity"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            404,
+            "no identity route: the remote is the TUI's, nobody asks"
+        );
 
         let page = client.get(&base).send().await.unwrap();
         assert_eq!(page.status(), 200);
@@ -1402,6 +1452,12 @@ mod tests {
             404
         );
 
-        server.abort();
+        // Cancel ends the accept loop and its connections; the task
+        // returns rather than being aborted.
+        let _ = cancel.send(true);
+        tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .expect("the accept loop ends on cancel")
+            .unwrap();
     }
 }

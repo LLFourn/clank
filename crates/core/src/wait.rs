@@ -1561,7 +1561,7 @@ impl WorkStatus {
 
     /// Whether `author` (in `role`) has any actionable work right now —
     /// the SINGLE predicate behind both the stop-hook (`clank wait`,
-    /// which acts iff `work_for` is non-empty) and the `status --tui`
+    /// which acts iff `work_for` is non-empty) and the `clank tui`
     /// per-agent indicator. Defining the TUI's "needs to act" as this
     /// keeps the two from drifting: in particular it inherits
     /// `work_for`'s GLOBAL `head_correction` preempt, so a broken HEAD

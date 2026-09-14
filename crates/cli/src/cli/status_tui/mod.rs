@@ -1,4 +1,4 @@
-//! `clank status --tui` — full-screen, READ-ONLY, live-updating
+//! `clank tui` — full-screen, READ-ONLY, live-updating
 //! status view sized for a small zellij pane.
 //!
 //! A third render target over the same machinery `--watch` uses
@@ -64,7 +64,7 @@ pub(crate) mod fixtures;
 // The raw-mode alt-screen lifecycle, the size probe, and the frame
 // painter live in `super::term`.
 
-/// What wakes the `--tui` loop.
+/// What wakes the TUI loop.
 enum Ev {
     /// A status/data change — probe the signature; rebuild iff it moved.
     Refresh,
@@ -322,7 +322,7 @@ async fn submit_plan_input(
                 .map(|p| p.gate.as_str().to_string())
                 .unwrap_or_else(|| "unknown".to_string());
             let why = format!(
-                "force-finished from clank status --tui; the review gate was \
+                "force-finished from clank tui; the review gate was \
                  `{gate}` at bypass."
             );
             let res = crate::cli::finish::run(crate::cli::FinishArgs {
@@ -489,7 +489,7 @@ async fn resume_from_pause(
         crate::cli::block::run_unblock(crate::cli::UnblockArgs {
             agent: b.agent.clone(),
             name: b.name.clone(),
-            message: "resumed from clank status --tui".to_string(),
+            message: "resumed from clank tui".to_string(),
             repo: Some(repo.to_path_buf()),
         })
         .await?;
@@ -1146,7 +1146,7 @@ fn rebind_remove_confirm_after_refresh(
 }
 
 // `strip_leading_emoji` lives in `text` (it's a name/width helper); the
-// `--tui` loop's doc moved down onto `run_tui` where it belongs.
+// the TUI loop's doc moved down onto `run_tui` where it belongs.
 
 /// The log viewport's scroll state, bundled so the invariants that used
 /// to live in loose-variable comments are enforced by methods:
@@ -1997,13 +1997,26 @@ fn coalesce(events: impl IntoIterator<Item = Ev>) -> Batch {
     b
 }
 
-/// The `--tui` loop, fully event-driven: the watcher covers the
+/// The TUI loop, fully event-driven: the watcher covers the
 /// working tree (gitignore-filtered), `.clank/`, and the git dir;
 /// SIGWINCH arrives on the same channel, so a resize is just
 /// another wake. Between events there is nothing to redraw —
 /// nothing rendered is clock-relative — so the only timeout is a
 /// slow backstop against watcher pathologies the error channel
 /// doesn't surface (tui-event-driven-dirty-stats).
+/// `clank tui`: resolve the repo and run the loop.
+pub async fn run(args: crate::cli::TuiArgs) -> anyhow::Result<()> {
+    let repo = crate::cli::resolve_repo(args.repo.as_deref())?;
+    let basename = crate::cli::repo_basename(&repo)?;
+    let policy = if args.no_cache {
+        crate::rebuild::CachePolicy::Bypass
+    } else {
+        crate::rebuild::CachePolicy::Use
+    };
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    run_tui(repo, basename, home, policy).await
+}
+
 pub(crate) async fn run_tui(
     repo: PathBuf,
     basename: String,
@@ -2043,9 +2056,19 @@ pub(crate) async fn run_tui(
     // after the terminal is back, so a slow exit is seen in a shell.
     let mut remote = {
         let wake = ev_tx.clone();
+        let zellij_repo = repo.clone();
         remote::Remote::new(
             repo.clone(),
-            remote::Processes::clank(),
+            home.clone(),
+            std::sync::Arc::new(move || {
+                Ok(
+                    std::sync::Arc::new(crate::cli::web::Zellij::find(&zellij_repo)?)
+                        as std::sync::Arc<dyn crate::cli::web::Panes>,
+                )
+            }),
+            crate::cli::web::PANE_POLL,
+            crate::cli::web::STOP_GRACE,
+            remote::Browser,
             std::sync::Arc::new(move || {
                 let _ = wake.send(Ev::Remote);
             }),
@@ -2298,7 +2321,7 @@ pub(crate) async fn run_tui(
         // the overlay mounts over any page, and the loop goes round
         // to draw it, as a reopen's does. Drained before the view
         // borrows the switch for its row.
-        if let Some(n) = remote.drain().pop() {
+        if let Some(n) = remote.drain(&snapshot).pop() {
             detail = Some(Overlay::notice(n));
             continue;
         }
@@ -3499,6 +3522,7 @@ pub(crate) async fn run_tui(
                     crate::cli::status::tui_log_with_events(&repo, log.window, adopted_at).await;
                 let refresh_ok =
                     apply_refresh(&mut snapshot, fresh.rows, rebuilt, &mut refresh_failures);
+                remote.observe(&snapshot);
                 // Rows and events must come from the SAME read —
                 // event_idx targets this list (set after apply so a
                 // replaced snapshot's own build-time read never
@@ -3756,6 +3780,7 @@ pub(crate) async fn run_tui(
             }
         }
     }
+    remote.stop().await;
     Ok(())
 }
 

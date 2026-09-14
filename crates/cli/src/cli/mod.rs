@@ -497,8 +497,9 @@ pub struct StatusArgs {
     #[arg(long)]
     pub watch: bool,
     /// Full-screen read-only live status view, sized for a small
-    /// zellij pane. No input handling — close the pane (or Ctrl-C)
-    /// to exit. Conflicts with --json/--watch/--plan.
+    /// The full-screen pane — an alias for `clank tui`, kept so the
+    /// panes of sessions opened before the rename keep working; it
+    /// says so on stderr. Conflicts with --json/--watch/--plan.
     #[arg(long, conflicts_with_all = ["json", "watch", "plan"])]
     pub tui: bool,
 }
@@ -1658,24 +1659,13 @@ pub struct BlockCleanArgs {
 }
 
 #[derive(Args, Debug)]
-pub struct WebArgs {
+pub struct TuiArgs {
     /// Repo root. Defaults to the cwd's git toplevel.
     #[arg(long, value_name = "PATH")]
     pub repo: Option<PathBuf>,
-    /// Listen on exactly this port; without it, the port the repo
-    /// remembers (sampled from the OS the first time)
-    #[arg(long, value_name = "PORT")]
-    pub port: Option<u16>,
-    /// The zellij session holding this repo's panes. Defaults to the
-    /// session this runs inside, else the one `clank open` names;
-    /// either way the listing is checked for the repo's panes.
-    #[arg(long, value_name = "NAME")]
-    pub session: Option<String>,
-    /// Exit when this process is gone: the status TUI that switched
-    /// this server on, so a TUI that dies without unwinding takes
-    /// the server with it
-    #[arg(long, value_name = "PID")]
-    pub attached_to: Option<u32>,
+    /// Rebuild the fold from scratch rather than from the cache.
+    #[arg(long)]
+    pub no_cache: bool,
 }
 
 #[derive(Args, Debug)]
@@ -1683,7 +1673,7 @@ pub struct RunArgs {
     /// TWO WORDS for what you are waiting on — `--desc "test run"`.
     ///
     /// Required, and load-bearing twice over: it is what
-    /// `clank status --tui` shows, AND it is how the Stop hook
+    /// `clank tui` shows, AND it is how the Stop hook
     /// recognises this run among the tool's live background tasks.
     /// The hook reads the command line the harness recorded, so the
     /// description has to be ON it — which is why clank cannot just
@@ -1721,7 +1711,7 @@ pub struct AttendingArgs {
     #[arg(long, value_name = "PID")]
     pub pid: Option<i32>,
     /// TWO WORDS for what you are waiting on — `--desc "test run"`.
-    /// Required: this is what `clank status --tui` shows, and a wait
+    /// Required: this is what `clank tui` shows, and a wait
     /// nobody can identify is worse than no wait at all. Longer text
     /// is truncated to fit, never rejected.
     #[arg(long, value_name = "TEXT", required_unless_present = "clear")]

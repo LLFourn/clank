@@ -914,7 +914,7 @@ enum ReviewerStack<'a> {
 
 /// The agent pane group clank owns: master is the STAGE (~65%),
 /// reviewers STACK in the smaller region, and a `clank status
-/// --tui` instrument pane sits beside/below the stack
+/// tui` instrument pane sits beside/below the stack
 /// (zellij-default-layout). Landscape: master left, right column
 /// = stack over tui. Portrait: master top, bottom row = stack
 /// beside tui. An empty roster: no stack region — stage + tui.
@@ -988,7 +988,7 @@ fn agent_group_kdl(
     ));
     out.push_str("            command \"clank\"\n");
     out.push_str(&format!(
-        "            args \"status\" \"--repo\" \"{repo_esc}\" \"--tui\"\n"
+        "            args \"tui\" \"--repo\" \"{repo_esc}\"\n"
     ));
     out.push_str("        }\n");
     out.push_str("    }\n");
@@ -1095,7 +1095,7 @@ pub(crate) fn validate_template(template: &str) -> anyhow::Result<()> {
 /// 8075d43 + 361b104).
 /// The pane name for an agent: `"<label> (<role>)"`. The SINGLE
 /// source of this format — the zellij layout names panes with it here,
-/// and `status --tui` matches it to map panes back to agents
+/// and `clank tui` matches it to map panes back to agents
 /// (tui-agent-pane-status-emoji). A round-trip test pins the two
 /// together so the format can't drift silently.
 pub(crate) fn agent_pane_title(label: &str, role_str: &str) -> String {
@@ -1292,7 +1292,7 @@ pub(crate) fn current_session() -> Option<String> {
 }
 
 /// [`snapshot_panes`] for a NAMED session, from inside it or not.
-/// `clank web` runs wherever it was started and asks about the
+/// The remote runs wherever the TUI was started and asks about the
 /// session it was pointed at.
 pub(crate) fn snapshot_panes_in(session: &str) -> Option<Vec<ZellijPane>> {
     let out = std::process::Command::new("zellij")
@@ -1485,15 +1485,27 @@ pub(crate) fn agent_panes_by_command(panes: &[ZellijPane], repo: &Path) -> Vec<(
         .collect()
 }
 
+/// This repo's instrument pane: `clank tui --repo <repo>`, or the
+/// `clank status --repo <repo> --tui` a session opened before the
+/// rename still runs — both are the TUI, and a reconciler that knew
+/// only the new spelling would treat every open session's pane as
+/// nobody's.
+pub(crate) fn is_status_pane(pane: &ZellijPane, repo_str: &str) -> bool {
+    !pane.is_plugin
+        && pane.terminal_command.as_deref().is_some_and(|c| {
+            c == format!("clank tui --repo {repo_str}")
+                || c == format!("clank status --repo {repo_str} --tui")
+        })
+}
+
 /// The tab this repo's panes live in: the tab of its instrument pane,
 /// else of any of its agent panes. `None` when the session shows
 /// nothing of the repo's.
 pub(crate) fn repo_tab_id(panes: &[ZellijPane], repo: &Path) -> Option<u32> {
     let repo_str = repo.to_string_lossy();
-    let status_command = format!("clank status --repo {repo_str} --tui");
     panes
         .iter()
-        .find(|p| !p.is_plugin && p.terminal_command.as_deref() == Some(status_command.as_str()))
+        .find(|p| is_status_pane(p, &repo_str))
         .or_else(|| {
             panes
                 .iter()
@@ -2100,10 +2112,9 @@ pub(crate) fn reviewers_are_stacked(
     let Some(first) = mine.first() else {
         return true;
     };
-    let status_command = format!("clank status --repo {repo_str} --tui");
     let statuses: Vec<&ZellijPane> = panes
         .iter()
-        .filter(|p| !p.is_plugin && p.terminal_command.as_deref() == Some(status_command.as_str()))
+        .filter(|p| is_status_pane(p, &repo_str))
         .collect();
     // A lone reviewer forms no stack of its own; the only question is
     // whether the instrument pane shares one WITH it — the reported
@@ -3362,7 +3373,7 @@ ttys004   zellij attach clank-foo
     #[test]
     fn user_template_chrome_preserved_and_marker_substituted() {
         // The documented example: user-authored chrome (compact-bar
-        // + a `clank status --tui` pane) around the marker.
+        // + a `clank tui` pane) around the marker.
         let template = r##"layout {
     default_tab_template {
         pane size=1 borderless=true {
@@ -3374,7 +3385,7 @@ ttys004   zellij attach clank-foo
         clank_agents
         pane size=8 {
             command "clank"
-            args "status" "--tui"
+            args "tui"
         }
     }
 }
@@ -3394,7 +3405,7 @@ ttys004   zellij attach clank-foo
             "got:\n{kdl}"
         );
         assert!(kdl.contains("tab name=\"my-clank\""));
-        assert!(kdl.contains("\"status\" \"--tui\""));
+        assert!(kdl.contains("\"tui\""));
         // The built-in bars are NOT injected — user owns the chrome.
         assert!(!kdl.contains("zellij:tab-bar"));
         // Marker replaced with the agent group.
@@ -3679,9 +3690,7 @@ keybinds {
             "tui pane cwd pinned:\n{kdl}"
         );
         assert!(
-            kdl.contains(&format!(
-                "args \"status\" \"--repo\" \"{TEST_REPO}\" \"--tui\""
-            )),
+            kdl.contains(&format!("args \"tui\" \"--repo\" \"{TEST_REPO}\"")),
             "tui pane --repo pinned:\n{kdl}"
         );
         let _: kdl::KdlDocument = kdl.parse().expect("valid KDL");
@@ -3706,9 +3715,7 @@ keybinds {
             "portrait tui cwd pinned:\n{kdl}"
         );
         assert!(
-            kdl.contains(&format!(
-                "args \"status\" \"--repo\" \"{TEST_REPO}\" \"--tui\""
-            )),
+            kdl.contains(&format!("args \"tui\" \"--repo\" \"{TEST_REPO}\"")),
             "portrait tui --repo pinned:\n{kdl}"
         );
         let _: kdl::KdlDocument = kdl.parse().expect("valid KDL");
@@ -3768,7 +3775,7 @@ keybinds {
             "no empty stack region in the tab:\n{kdl}"
         );
         assert!(
-            kdl.contains("\"--tui\""),
+            kdl.contains("\"tui\""),
             "instrument pane still ships:\n{kdl}"
         );
         // The variants still carry the slot: the first reviewer added
@@ -3863,7 +3870,7 @@ keybinds {
                 "master slot keeps its command:\n{text}"
             );
             assert!(
-                text.contains("\"--tui\""),
+                text.contains("\"tui\""),
                 "status slot keeps its command:\n{text}"
             );
         }

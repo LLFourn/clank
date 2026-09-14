@@ -47,7 +47,7 @@ instructions) with each event — including events logged before the
 prompt was written: it is joined from the CURRENT config at render
 time, never stored in the log.
 
-In `clank status --tui`, pressing Enter on a github timeline row
+In `clank tui`, pressing Enter on a github timeline row
 opens the EVENT PAGE: the same facts plus every agent's copy, with
 `open in browser` and `ack` actions (ack marks every copy handled —
 the same fanout as `clank events ack` per copy).

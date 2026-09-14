@@ -86,7 +86,7 @@ pub(super) fn acquire(repo: &Path) -> Result<StatusLease, String> {
         Err(e) => {
             return Err(format!(
                 "cannot take this repo's status lease at {}: {e}. \
-                 One `clank status --tui` per repo is decided by that file; \
+                 One `clank tui` per repo is decided by that file; \
                  without it clank cannot tell whether another one is already \
                  driving this repo's panes.",
                 path.display()
@@ -115,11 +115,11 @@ fn read_holder(path: &Path) -> Option<Holder> {
 pub(super) fn busy_message(holder: Option<Holder>) -> String {
     match holder {
         Some(h) => format!(
-            "this repo's status is already open in another `clank status --tui`: {}. \
+            "this repo's status is already open in another `clank tui`: {}. \
              Close that one, or use it — two of them cannot both drive the panes.",
             h.describe()
         ),
-        None => "this repo's status is already open in another `clank status --tui` \
+        None => "this repo's status is already open in another `clank tui` \
                  (its holder record is unreadable). Close it, or use it — two of them \
                  cannot both drive the panes."
             .to_string(),
