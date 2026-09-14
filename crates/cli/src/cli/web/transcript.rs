@@ -37,12 +37,80 @@ pub(crate) enum Body {
         text: String,
     },
     /// A tool call and, once it has one, its output — ONE turn, so
-    /// the output arriving later is an upsert of the same id.
+    /// the output arriving later is an upsert of the same id. Images
+    /// in the output ride with it.
     Tool {
         name: String,
         input: String,
         output: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<Image>,
     },
+    /// A picture pasted or returned, as the transcript keeps it.
+    Image {
+        #[serde(flatten)]
+        image: Image,
+    },
+}
+
+/// One image out of a transcript: its type and base64 data — or, over
+/// [`IMAGE_CAP`] decoded, no data and its size, so the page can name
+/// what it will not carry.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct Image {
+    pub(crate) media_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) data: Option<String>,
+    pub(crate) bytes: usize,
+}
+
+/// The largest image shipped to the page, decoded.
+pub(crate) const IMAGE_CAP: usize = 2 * 1024 * 1024;
+
+impl Image {
+    fn new(media_type: &str, base64: &str) -> Self {
+        let bytes = base64.trim_end_matches('=').len() * 3 / 4;
+        Self {
+            media_type: media_type.to_string(),
+            data: (bytes <= IMAGE_CAP).then(|| base64.to_string()),
+            bytes,
+        }
+    }
+
+    /// A `data:<type>;base64,<data>` URL — codex's shape; anything
+    /// else is not an image the transcript carries.
+    fn from_data_url(url: &str) -> Option<Self> {
+        let rest = url.strip_prefix("data:")?;
+        let (media_type, data) = rest.split_once(";base64,")?;
+        Some(Self::new(media_type, data))
+    }
+}
+
+/// Every image in a content list, in either harness's shape: a
+/// claude `image` block with a base64 source, or a codex
+/// `input_image` with a data URL.
+fn images_in(v: &serde_json::Value) -> Vec<Image> {
+    let Some(blocks) = v.as_array() else {
+        return Vec::new();
+    };
+    blocks.iter().filter_map(image_block).collect()
+}
+
+fn image_block(b: &serde_json::Value) -> Option<Image> {
+    match b.get("type").and_then(|t| t.as_str())? {
+        "image" => {
+            let source = b.get("source")?;
+            if source.get("type").and_then(|t| t.as_str()) != Some("base64") {
+                return None;
+            }
+            Some(Image::new(
+                source.get("media_type")?.as_str()?,
+                source.get("data")?.as_str()?,
+            ))
+        }
+        "input_image" => Image::from_data_url(b.get("image_url")?.as_str()?),
+        _ => None,
+    }
 }
 
 /// One thing said. `id` is the harness's own identity for it — a
@@ -67,6 +135,7 @@ pub(crate) enum Parsed {
     ToolOutput {
         id: String,
         output: String,
+        images: Vec<Image>,
     },
 }
 
@@ -195,6 +264,7 @@ mod claude {
                                     })
                                     .unwrap_or_default(),
                                 output: None,
+                                images: Vec::new(),
                             },
                         }));
                     }
@@ -222,27 +292,47 @@ mod claude {
                 },
                 body: Body::Text { text: text.clone() },
             })],
-            serde_json::Value::Array(blocks) => blocks
-                .iter()
-                .enumerate()
-                .filter_map(|(i, b)| match b.get("type").and_then(|t| t.as_str())? {
-                    "tool_result" => Some(Parsed::ToolOutput {
-                        id: b.get("tool_use_id")?.as_str()?.to_string(),
-                        output: b.get("content").map(text_of).unwrap_or_default(),
-                    }),
-                    // A text block in a user list is a note the
-                    // harness inserted, never something typed.
-                    "text" => Some(Parsed::Turn(Turn {
-                        id: format!("{uuid}:{i}"),
-                        at,
-                        who: Who::Harness,
-                        body: Body::Text {
-                            text: b.get("text")?.as_str()?.to_string(),
-                        },
-                    })),
-                    _ => None,
-                })
-                .collect(),
+            serde_json::Value::Array(blocks) => {
+                // A typed message is a string — unless a picture was
+                // pasted with it, which makes it a list of the text
+                // and the image, both the person's. Any other list is
+                // the harness's: tool results, and notes beside them.
+                let pasted = blocks.iter().any(|b| image_block(b).is_some());
+                blocks
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, b)| match b.get("type").and_then(|t| t.as_str())? {
+                        "tool_result" => Some(Parsed::ToolOutput {
+                            id: b.get("tool_use_id")?.as_str()?.to_string(),
+                            output: b.get("content").map(text_of).unwrap_or_default(),
+                            images: b.get("content").map(images_in).unwrap_or_default(),
+                        }),
+                        "text" => {
+                            let text = b.get("text")?.as_str()?.to_string();
+                            let who = if pasted && !is_harness_text(&text) {
+                                Who::Person
+                            } else {
+                                Who::Harness
+                            };
+                            Some(Parsed::Turn(Turn {
+                                id: format!("{uuid}:{i}"),
+                                at,
+                                who,
+                                body: Body::Text { text },
+                            }))
+                        }
+                        "image" => Some(Parsed::Turn(Turn {
+                            id: format!("{uuid}:{i}"),
+                            at,
+                            who: Who::Person,
+                            body: Body::Image {
+                                image: image_block(b)?,
+                            },
+                        })),
+                        _ => None,
+                    })
+                    .collect()
+            }
             _ => Vec::new(),
         }
     }
@@ -281,18 +371,51 @@ mod codex {
         let s = |k: &str| p.get(k).and_then(|v| v.as_str()).map(str::to_string);
         match p.get("type").and_then(|v| v.as_str()) {
             Some("message") => {
-                let text = p.get("content").map(text_of).unwrap_or_default();
-                let who = match s("role").as_deref() {
-                    Some("user") if is_harness_text(&text) => Who::Harness,
-                    Some("user") => Who::Person,
-                    _ => Who::Agent,
+                let msg = id("msg");
+                let user = s("role").as_deref() == Some("user");
+                let who = |text: &str| match (user, is_harness_text(text)) {
+                    (true, true) => Who::Harness,
+                    (true, false) => Who::Person,
+                    (false, _) => Who::Agent,
                 };
-                vec![Parsed::Turn(Turn {
-                    id: id("msg"),
-                    at,
-                    who,
-                    body: Body::Text { text },
-                })]
+                let text_turn = |id: String, text: String| {
+                    Parsed::Turn(Turn {
+                        id,
+                        at,
+                        who: who(&text),
+                        body: Body::Text { text },
+                    })
+                };
+                // A list is walked in order, one turn per block, so a
+                // picture stays beside the words it came with (codex
+                // on 219a1bc); a bare string is the message.
+                let Some(blocks) = p.get("content").and_then(|c| c.as_array()) else {
+                    let text = p.get("content").map(text_of).unwrap_or_default();
+                    return vec![text_turn(msg, text)];
+                };
+                let out: Vec<Parsed> = blocks
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, b)| {
+                        if let Some(image) = image_block(b) {
+                            return Some(Parsed::Turn(Turn {
+                                id: format!("{msg}:{i}"),
+                                at,
+                                who: who(""),
+                                body: Body::Image { image },
+                            }));
+                        }
+                        let text = b.get("text")?.as_str()?;
+                        (!text.is_empty())
+                            .then(|| text_turn(format!("{msg}:{i}"), text.to_string()))
+                    })
+                    .collect();
+                if out.is_empty() {
+                    // Nothing readable in the list: the message still
+                    // happened, so its (empty) words stand in.
+                    return vec![text_turn(msg, String::new())];
+                }
+                out
             }
             Some("reasoning") => {
                 let text = p.get("summary").map(text_of).unwrap_or_default();
@@ -324,6 +447,7 @@ mod codex {
                         name: s("name").unwrap_or_else(|| "tool".into()),
                         input,
                         output: None,
+                        images: Vec::new(),
                     },
                 })]
             }
@@ -334,6 +458,7 @@ mod codex {
                 vec![Parsed::ToolOutput {
                     id: cid,
                     output: p.get("output").map(text_of).unwrap_or_default(),
+                    images: p.get("output").map(images_in).unwrap_or_default(),
                 }]
             }
             _ => Vec::new(),
@@ -552,7 +677,7 @@ mod tests {
     #[test]
     fn claude_lines_become_turns_and_the_harness_is_not_the_person() {
         let got = all(Tool::Claude, CLAUDE);
-        assert_eq!(got.len(), 7, "{got:#?}");
+        assert_eq!(got.len(), 9, "{got:#?}");
         let t = turn(&got[0]);
         assert_eq!((t.who, &t.id), (Who::Person, &"u-1".to_string()));
         assert_eq!(
@@ -570,13 +695,14 @@ mod tests {
             "the block's id, so its result can find it"
         );
         assert!(
-            matches!(&tool.body, Body::Tool { name, input, output: None } if name == "Bash" && input.contains("cargo test"))
+            matches!(&tool.body, Body::Tool { name, input, output: None, .. } if name == "Bash" && input.contains("cargo test"))
         );
         assert_eq!(
             got[3],
             Parsed::ToolOutput {
                 id: "toolu_01".into(),
-                output: "test result: ok. 1296 passed".into()
+                output: "test result: ok. 1296 passed".into(),
+                images: vec![]
             }
         );
         assert!(matches!(&turn(&got[4]).body, Body::Text { text } if text.starts_with("Fixed")));
@@ -602,10 +728,10 @@ mod tests {
     #[test]
     fn codex_items_become_turns_by_the_same_rules() {
         let got = all(Tool::Codex, CODEX);
-        assert_eq!(got.len(), 9, "{got:#?}");
+        assert_eq!(got.len(), 11, "{got:#?}");
         assert_eq!(
             (turn(&got[0]).who, turn(&got[0]).id.as_str()),
-            (Who::Person, "msg_u1")
+            (Who::Person, "msg_u1:0")
         );
         assert_eq!(
             turn(&got[1]).who,
@@ -624,7 +750,8 @@ mod tests {
             got[4],
             Parsed::ToolOutput {
                 id: "call_A".into(),
-                output: "Script completed\n\n1296 passed".into()
+                output: "Script completed\n\n1296 passed".into(),
+                images: vec![]
             }
         );
         assert!(
@@ -634,7 +761,8 @@ mod tests {
             got[6],
             Parsed::ToolOutput {
                 id: "call_B".into(),
-                output: "a b c".into()
+                output: "a b c".into(),
+                images: vec![]
             }
         );
         assert!(matches!(&turn(&got[7]).body, Body::Text { text } if text.starts_with("CONTINUE")));
@@ -729,6 +857,160 @@ mod tests {
         assert_eq!(
             transcript_path(Tool::Grok, "x", None, cwd, home.path()),
             None
+        );
+    }
+
+    const PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+
+    fn png(image: &Image) -> bool {
+        image.media_type == "image/png" && image.data.as_deref() == Some(PNG) && image.bytes == 70
+    }
+
+    /// A pasted picture is a turn of the person's, beside the text it
+    /// came with — which is the person's too, not a harness note, list
+    /// or no list; a picture in a tool's result rides on the output;
+    /// one over the cap is named, not shipped.
+    #[test]
+    fn a_pasted_image_is_a_turn_of_the_persons() {
+        let line = |content: serde_json::Value| {
+            format!(
+                r#"{{"type":"user","uuid":"u","timestamp":"2026-09-11T00:00:00Z","message":{{"role":"user","content":{}}}}}"#,
+                content
+            )
+        };
+        let img = serde_json::json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":PNG}});
+        let got = parse(
+            Tool::Claude,
+            &line(serde_json::json!([{"type":"text","text":"here's what I see"}, img])),
+        );
+        assert_eq!(got.len(), 2);
+        assert_eq!(
+            (turn(&got[0]).who, turn(&got[0]).id.as_str()),
+            (Who::Person, "u:0")
+        );
+        let t = turn(&got[1]);
+        assert_eq!((t.who, t.id.as_str()), (Who::Person, "u:1"));
+        assert!(
+            matches!(&t.body, Body::Image { image } if png(image)),
+            "{t:?}"
+        );
+
+        let got = parse(
+            Tool::Claude,
+            &line(
+                serde_json::json!([{"type":"tool_result","tool_use_id":"toolu_9","content":[{"type":"text","text":"a picture"}, img]}]),
+            ),
+        );
+        match &got[0] {
+            Parsed::ToolOutput { id, output, images } => {
+                assert_eq!((id.as_str(), output.as_str()), ("toolu_9", "a picture"));
+                assert_eq!(images.len(), 1);
+                assert!(png(&images[0]));
+            }
+            other => panic!("{other:?}"),
+        }
+
+        let big = "A".repeat(IMAGE_CAP / 3 * 4 + 400);
+        let got = parse(
+            Tool::Claude,
+            &line(
+                serde_json::json!([{"type":"image","source":{"type":"base64","media_type":"image/jpeg","data":big}}]),
+            ),
+        );
+        match &turn(&got[0]).body {
+            Body::Image { image } => {
+                assert_eq!(image.data, None, "over the cap: not shipped");
+                assert!(image.bytes > IMAGE_CAP);
+                assert_eq!(image.media_type, "image/jpeg");
+            }
+            other => panic!("{other:?}"),
+        }
+        // A harness note in a list stays the harness's: no picture there.
+        let got = parse(
+            Tool::Claude,
+            &line(serde_json::json!([{"type":"text","text":"note"}])),
+        );
+        assert_eq!(turn(&got[0]).who, Who::Harness);
+    }
+
+    /// codex: an `input_image` with a data URL is a picture of the
+    /// person's beside their words; any other URL is nothing.
+    #[test]
+    fn a_codex_input_image_is_a_turn_of_the_persons() {
+        let line = |content: serde_json::Value| {
+            format!(
+                r#"{{"timestamp":"2026-08-27T08:33:20.000Z","ordinal":1,"type":"response_item","payload":{{"type":"message","id":"m7","role":"user","content":{}}}}}"#,
+                content
+            )
+        };
+        let got = parse(
+            Tool::Codex,
+            &line(serde_json::json!([
+                {"type":"input_text","text":"look"},
+                {"type":"input_image","image_url":format!("data:image/png;base64,{PNG}")}
+            ])),
+        );
+        assert_eq!(got.len(), 2);
+        assert_eq!(
+            (turn(&got[0]).who, turn(&got[0]).id.as_str()),
+            (Who::Person, "m7:0")
+        );
+        let t = turn(&got[1]);
+        assert_eq!((t.who, t.id.as_str()), (Who::Person, "m7:1"));
+        assert!(matches!(&t.body, Body::Image { image } if png(image)));
+        let got = parse(
+            Tool::Codex,
+            &line(
+                serde_json::json!([{"type":"input_image","image_url":"https://example.com/x.png"}]),
+            ),
+        );
+        assert_eq!(
+            got.len(),
+            1,
+            "no picture, and the message's (empty) words stand in"
+        );
+        assert_eq!(turn(&got[0]).id, "m7");
+        assert!(matches!(&turn(&got[0]).body, Body::Text { text } if text.is_empty()));
+
+        // Mixed content keeps its order: a caption, its picture, the
+        // next caption, its picture — each by its block.
+        let got = parse(
+            Tool::Codex,
+            &line(serde_json::json!([
+                {"type":"input_text","text":"before"},
+                {"type":"input_image","image_url":format!("data:image/png;base64,{PNG}")},
+                {"type":"input_text","text":"after"},
+                {"type":"input_image","image_url":format!("data:image/png;base64,{PNG}")}
+            ])),
+        );
+        let kinds: Vec<(String, &str)> = got
+            .iter()
+            .map(|p| {
+                let t = turn(p);
+                (
+                    t.id.clone(),
+                    match &t.body {
+                        Body::Text { text } => text.as_str(),
+                        Body::Image { .. } => "<image>",
+                        _ => "?",
+                    },
+                )
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                ("m7:0".to_string(), "before"),
+                ("m7:1".to_string(), "<image>"),
+                ("m7:2".to_string(), "after"),
+                ("m7:3".to_string(), "<image>"),
+            ]
+        );
+        // A bare string is the message, under the message's id.
+        let got = parse(Tool::Codex, &line(serde_json::json!("plain")));
+        assert_eq!(
+            (turn(&got[0]).id.as_str(), turn(&got[0]).who),
+            ("m7", Who::Person)
         );
     }
 

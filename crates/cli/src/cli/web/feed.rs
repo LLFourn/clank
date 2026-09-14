@@ -397,6 +397,7 @@ impl Feed {
         generation: u32,
         id: &str,
         output: String,
+        images: Vec<crate::cli::web::transcript::Image>,
     ) {
         self.publish(|s| {
             let Some(window) = s.turns.get_mut(agent) else {
@@ -409,10 +410,16 @@ impl Feed {
             let Some(turn) = window.turns.iter_mut().find(|t| t.id == id) else {
                 return Vec::new();
             };
-            let Body::Tool { output: slot, .. } = &mut turn.body else {
+            let Body::Tool {
+                output: slot,
+                images: shots,
+                ..
+            } = &mut turn.body
+            else {
                 return Vec::new();
             };
             *slot = Some(output);
+            *shots = images;
             vec![turn_frame(agent, session, generation, turn)]
         });
     }
@@ -806,6 +813,7 @@ mod tests {
                 name: "Bash".into(),
                 input: "ls".into(),
                 output: None,
+                images: vec![],
             },
         }
     }
@@ -944,7 +952,7 @@ mod tests {
         feed.claim_turns("claude", 1, Some("s1"));
         feed.turns_reset("claude", 1, "s1", 1, vec![call("toolu_01")]);
         let (frames, mut rx) = feed.connect();
-        feed.tool_output("claude", 1, "s1", 1, "toolu_01", "ok".into());
+        feed.tool_output("claude", 1, "s1", 1, "toolu_01", "ok".into(), vec![]);
         let mut page = PageModel::default();
         for f in frames {
             page.apply(&f);
@@ -954,7 +962,7 @@ mod tests {
         assert_eq!(w.turns.len(), 1, "still one turn");
         assert!(matches!(&w.turns[0].body, Body::Tool { output: Some(o), .. } if o == "ok"));
         // An output for a call older than the window is nothing.
-        feed.tool_output("claude", 1, "s1", 1, "toolu_ancient", "x".into());
+        feed.tool_output("claude", 1, "s1", 1, "toolu_ancient", "x".into(), vec![]);
         assert!(rx.try_recv().is_err());
     }
 

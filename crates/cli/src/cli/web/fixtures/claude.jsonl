@@ -8,3 +8,4 @@
 {"type":"assistant","uuid":"a-side","timestamp":"2026-09-11T00:23:02.000Z","isSidechain":true,"message":{"id":"msg_s","role":"assistant","content":[{"type":"text","text":"a subagent speaking"}]}}
 {"type":"permission-mode","mode":"default"}
 {"type":"queue-operation","operation":"enqueue"}
+{"type":"user","uuid":"u-img","timestamp":"2026-09-11T00:00:09Z","message":{"role":"user","content":[{"type":"text","text":"and a picture"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="}}]}}

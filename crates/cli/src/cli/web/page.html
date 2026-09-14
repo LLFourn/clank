@@ -119,6 +119,17 @@
   .turn details[open] summary::before { content: "▾ "; }
   .turn .tool .name { color: var(--ink); }
   .turn pre { margin: 6px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; max-height: 40vh; overflow: auto; }
+  /* A picture, as pasted: no wider than the column, no taller than
+     most of the screen; the full thing a tap away. */
+  .turn .shot { display: block; max-width: 100%; max-height: 60vh; margin: 6px 0 0; border-radius: 4px; border: 1px solid var(--edge); cursor: zoom-in; }
+  .turn .shots { margin-top: 6px; }
+  .turn .unshipped { color: var(--muted); font-size: 12px; }
+  /* The full picture, in the page: a browser will not open a data
+     URL as a page of its own, so the viewer is ours — natural size,
+     scrollable, gone on a tap or Escape. */
+  .viewer { display: none; position: fixed; inset: 0; z-index: 6; background: rgba(0, 0, 0, .88); overflow: auto; cursor: zoom-out; }
+  .viewer.open { display: block; }
+  .viewer img { display: block; margin: 24px auto; max-width: none; }
   .turn pre[hidden] { display: none; }
 
   /* Terminal: the pane at its desktop size, in a scroller. */
@@ -192,6 +203,7 @@
     <button class="send" id="send" type="submit" disabled>Send</button>
     <span class="sent" id="sent"></span>
   </form>
+  <div class="viewer" id="viewer" role="dialog" aria-label="Full-size image"></div>
   <aside class="ledger" id="ledger">
     <button class="close" id="close">close</button>
     <div class="facts" id="facts"></div>
@@ -342,12 +354,38 @@
     const age = `<span class="age"></span>`;
     if (b.kind === 'text') return `${age}<span class="text"></span>`;
     if (b.kind === 'thinking') return `${age}<details><summary>thinking</summary><pre class="text"></pre></details>`;
-    return `${age}<details class="tool"><summary><span class="name"></span> <span class="in"></span><span class="pending"></span></summary><pre class="in"></pre><pre class="out"></pre></details>`;
+    if (b.kind === 'image') return `${age}<span class="shots"></span>`;
+    return `${age}<details class="tool"><summary><span class="name"></span> <span class="in"></span><span class="pending"></span></summary><pre class="in"></pre><pre class="out"></pre><div class="shots"></div></details>`;
+  }
+  // An image the transcript carried: the picture on a data URL, the
+  // full thing in a new tab; one over the cap named by its size.
+  function shotHtml(img) {
+    if (img.data == null) return `<span class="unshipped">image, ${mb(img.bytes)} — not shown</span>`;
+    const src = `data:${img.media_type};base64,${img.data}`;
+    return `<img class="shot" loading="lazy" src="${esc(src)}" alt="pasted image">`;
+  }
+  const viewerEl = $('viewer');
+  function showFull(src) {
+    viewerEl.innerHTML = `<img src="${esc(src)}" alt="pasted image, full size">`;
+    viewerEl.classList.add('open');
+  }
+  function hideFull() { viewerEl.classList.remove('open'); viewerEl.innerHTML = ''; }
+  viewsEl.addEventListener('click', (e) => { const img = e.target.closest('img.shot'); if (img) showFull(img.getAttribute('src')); });
+  viewerEl.addEventListener('click', hideFull);
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && viewerEl.classList.contains('open')) hideFull(); });
+  function mb(bytes) { return (bytes / 1048576).toFixed(1) + ' MB'; }
+  function fillShots(box, images, key) {
+    // Repainted only when the set changes: a rebuilt <img> reloads.
+    const k = images.map((i) => (i.data ? i.data.length : 'x') + ':' + i.bytes).join(',');
+    if (box.dataset.k === k) return;
+    box.dataset.k = k;
+    box.innerHTML = images.map(shotHtml).join('');
   }
   function fillTurn(el, t) {
     const b = t.body;
     el.querySelector('.age').textContent = t.at ? coarse(now() - t.at) : '';
     if (b.kind === 'text' || b.kind === 'thinking') { el.querySelector('.text').textContent = b.text; return; }
+    if (b.kind === 'image') { fillShots(el.querySelector('.shots'), [b]); return; }
     el.querySelector('summary .name').textContent = b.name;
     el.querySelector('summary .in').textContent = b.input.slice(0, 120);
     el.querySelector('summary .pending').textContent = b.output == null ? ' …' : '';
@@ -355,6 +393,7 @@
     const out = el.querySelector('pre.out');
     out.textContent = b.output == null ? '' : b.output;
     out.hidden = b.output == null;
+    fillShots(el.querySelector('.shots'), b.images || []);
   }
   function paintTranscript(label) {
     const v = views.get(label); if (!v) return;

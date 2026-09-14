@@ -592,8 +592,8 @@ fn run_tail(
                     transcript::Parsed::Turn(t) => {
                         feed.turn(&agent, owner, &session, generation, t)
                     }
-                    transcript::Parsed::ToolOutput { id, output } => {
-                        feed.tool_output(&agent, owner, &session, generation, &id, output)
+                    transcript::Parsed::ToolOutput { id, output, images } => {
+                        feed.tool_output(&agent, owner, &session, generation, &id, output, images)
                     }
                 }
             }
@@ -610,11 +610,16 @@ fn window_turns(tool: clank_core::vocab::Tool, lines: &[String]) -> Vec<transcri
         for parsed in transcript::parse(tool, line) {
             match parsed {
                 transcript::Parsed::Turn(t) => turns.push(t),
-                transcript::Parsed::ToolOutput { id, output } => {
+                transcript::Parsed::ToolOutput { id, output, images } => {
                     if let Some(t) = turns.iter_mut().find(|t| t.id == id)
-                        && let transcript::Body::Tool { output: slot, .. } = &mut t.body
+                        && let transcript::Body::Tool {
+                            output: slot,
+                            images: shots,
+                            ..
+                        } = &mut t.body
                     {
                         *slot = Some(output);
+                        *shots = images;
                     }
                 }
             }
