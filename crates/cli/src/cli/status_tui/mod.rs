@@ -1550,6 +1550,10 @@ pub(crate) struct LedgerRow {
     pub(crate) author: Option<String>,
     pub(crate) verdict: Option<String>,
     pub(crate) age: Option<String>,
+    /// The row's page in the `clank html` site, relative to its root
+    /// (`commit/<sha>.html`, `plan/<stem>.html`); a review's is its
+    /// commit's. `None` for the ad-hoc umbrella and github rows.
+    pub(crate) page: Option<String>,
 }
 
 /// What has been done, and what the repo is carrying.
@@ -1669,7 +1673,7 @@ pub(crate) fn web_facts(
             .filter(|b| b.answer.is_none())
             .map(|b| b.question.clone())
             .collect(),
-        rows: snap.log_rows.iter().map(ledger_row).collect(),
+        rows: ledger_rows(&snap.log_rows),
     };
 
     WebFacts {
@@ -1756,10 +1760,40 @@ fn gate_word(g: clank_core::vocab::CommitGateState) -> &'static str {
     }
 }
 
+/// The log's rows for the page. The log is newest first, and a
+/// review sits ABOVE the commit it reviewed (`log.rs`, the review
+/// rows) naming no sha of its own — so its page is the next commit's
+/// BELOW it, found by walking up from the bottom, and never one from
+/// past an umbrella, which is a group of its own. Measured live
+/// before it was believed: the first cut carried the commit above.
+fn ledger_rows(rows: &[crate::cli::log::OnelineRow]) -> Vec<LedgerRow> {
+    use crate::cli::log::OnelineRow;
+    let mut commit_page: Option<String> = None;
+    let mut out: Vec<LedgerRow> = rows
+        .iter()
+        .rev()
+        .map(|r| {
+            let mut row = ledger_row(r);
+            match r {
+                OnelineRow::Commit { .. } | OnelineRow::PlainCommit { .. } => {
+                    commit_page = row.page.clone();
+                }
+                OnelineRow::Review { .. } => row.page = commit_page.clone(),
+                OnelineRow::Header { .. } => commit_page = None,
+                OnelineRow::Github { .. } | OnelineRow::Notice(_) => {}
+            }
+            row
+        })
+        .collect();
+    out.reverse();
+    out
+}
+
 fn ledger_row(row: &crate::cli::log::OnelineRow) -> LedgerRow {
     use crate::cli::log::OnelineRow;
     let age = render::row_age(row);
     let short = |s: &crate::lifecycle::CommitSha| s.as_str()[..7.min(s.as_str().len())].to_string();
+    let commit_page = |s: &crate::lifecycle::CommitSha| Some(format!("commit/{}.html", s.as_str()));
     match row {
         OnelineRow::Header { plan } => LedgerRow {
             kind: "header".into(),
@@ -1769,6 +1803,7 @@ fn ledger_row(row: &crate::cli::log::OnelineRow) -> LedgerRow {
             author: None,
             verdict: None,
             age,
+            page: plan.as_ref().map(|p| format!("plan/{p}.html")),
         },
         OnelineRow::Commit {
             sha,
@@ -1783,7 +1818,10 @@ fn ledger_row(row: &crate::cli::log::OnelineRow) -> LedgerRow {
             author: None,
             verdict: None,
             age,
+            page: commit_page(sha),
         },
+        // Pre-adoption history: the site never builds this page, so
+        // the server renders it on request from git (codex on b1c0cf8).
         OnelineRow::PlainCommit { sha, subject, .. } => LedgerRow {
             kind: "commit".into(),
             glyph: None,
@@ -1792,6 +1830,7 @@ fn ledger_row(row: &crate::cli::log::OnelineRow) -> LedgerRow {
             author: None,
             verdict: None,
             age,
+            page: commit_page(sha),
         },
         OnelineRow::Review {
             verdict,
@@ -1806,6 +1845,7 @@ fn ledger_row(row: &crate::cli::log::OnelineRow) -> LedgerRow {
             author: Some(author.clone()),
             verdict: Some(verdict_word(*verdict).into()),
             age,
+            page: None,
         },
         OnelineRow::Github { line, .. } => LedgerRow {
             kind: "github".into(),
@@ -1815,6 +1855,7 @@ fn ledger_row(row: &crate::cli::log::OnelineRow) -> LedgerRow {
             author: None,
             verdict: None,
             age,
+            page: None,
         },
         OnelineRow::Notice(n) => LedgerRow {
             kind: "notice".into(),
@@ -1824,6 +1865,7 @@ fn ledger_row(row: &crate::cli::log::OnelineRow) -> LedgerRow {
             author: None,
             verdict: None,
             age,
+            page: None,
         },
     }
 }
@@ -4550,6 +4592,61 @@ pub(crate) mod tests {
             ),
             ("review", Some("ruthless"), Some("continued"), Some("2m")),
             "the ledger is the TUI's rows with the TUI's ages"
+        );
+    }
+
+    /// Every row that has a page names it: a plan umbrella its plan
+    /// page, a commit its commit page (pre-adoption ones too — the
+    /// server renders those on request), a review — which sits above
+    /// its commit in the newest-first log — the page of the commit
+    /// BELOW it and not the one above, never one from past an
+    /// umbrella; the ad-hoc umbrella and github rows none.
+    #[test]
+    fn ledger_rows_name_their_pages() {
+        use crate::cli::log::{OnelineRow, RowMarker};
+        let sha = |c: char| crate::lifecycle::CommitSha::parse(&c.to_string().repeat(40)).unwrap();
+        let review = || OnelineRow::Review {
+            at: None,
+            verdict: clank_core::vocab::Verdict::Continue,
+            author: "codex".into(),
+            summary: "ok".into(),
+        };
+        let rows = vec![
+            OnelineRow::Header {
+                plan: Some("foo".into()),
+            },
+            review(),
+            OnelineRow::Commit {
+                sha: sha('a'),
+                at: 0,
+                subject: "one".into(),
+                marker: RowMarker::Plain,
+            },
+            review(),
+            OnelineRow::Header { plan: None },
+            review(),
+            OnelineRow::PlainCommit {
+                sha: sha('b'),
+                at: 0,
+                subject: "two".into(),
+                refs: vec![],
+            },
+        ];
+        let pages: Vec<Option<String>> = ledger_rows(&rows).into_iter().map(|r| r.page).collect();
+        let a = Some(format!("commit/{}.html", "a".repeat(40)));
+        let b = Some(format!("commit/{}.html", "b".repeat(40)));
+        assert_eq!(
+            pages,
+            vec![
+                Some("plan/foo.html".into()),
+                a.clone(),
+                a,
+                None,
+                None,
+                b.clone(),
+                b,
+            ],
+            "the review above `a` is a's; the one below it is an older commit's, not shown"
         );
     }
 

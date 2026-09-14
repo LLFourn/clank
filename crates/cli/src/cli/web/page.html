@@ -39,7 +39,9 @@
     padding: 8px 14px 4px; color: var(--muted); font-size: 12px;
   }
   .top .live.off { color: var(--hue); }
-  .top .menu { padding: 4px 8px; }
+  /* A thumb's target, not a glyph's: the phone's only way into the
+     ledger. */
+  .top .menu { min-width: 44px; min-height: 44px; margin: -8px -10px -8px 0; font-size: 26px; line-height: 1; display: inline-flex; align-items: center; justify-content: center; color: var(--ink); }
 
   /* The floor: whose turn it is, said once, large. */
   .floor {
@@ -148,6 +150,10 @@
   .row .age { color: var(--muted); font-size: 12px; }
   .row.header .main { font-weight: 700; padding-top: 6px; }
   .row .glyph { display: inline-block; width: 1.5em; }
+  /* A row with a page in the site: the name is the link, in its own
+     colour, marked only by the underline. */
+  .row a { color: inherit; text-decoration: none; border-bottom: 1px dotted var(--muted); }
+  .row a:hover, .row a:focus-visible { border-bottom-color: var(--ink); outline: none; }
   .row .sha, .row .author { color: var(--muted); }
   .row.review .glyph { color: var(--hue); }
   .row.notice .main { color: var(--muted); }
@@ -412,10 +418,15 @@
       (L.queue || L.stash) ? `<div class="line">${L.queue ? `${L.queue} queued` : ''}${L.queue && L.stash ? ', ' : ''}${L.stash ? `${L.stash} stashed` : ''}</div>` : '',
     ].join('');
     $('blocks').innerHTML = L.blocks.map((b) => `<div class="block">${esc(b)}\n<span class="line">Answer it at the terminal, or with clank block answer.</span></div>`).join('');
+    // A row's page is the clank html one, in a window of its own. The
+    // builder writes a plan's name verbatim, spaces and all; the link
+    // encodes each segment and the server decodes it.
+    const href = (page) => 'html/' + page.split('/').map(encodeURIComponent).join('/');
+    const link = (r, inner) => r.page ? `<a href="${esc(href(r.page))}" target="_blank" rel="noopener">${inner}</a>` : inner;
     $('rows').innerHTML = L.rows.map((r) => {
-      const main = r.kind === 'header' ? esc(r.text)
-        : r.kind === 'commit' ? `<span class="glyph">${esc(r.glyph || '')}</span><span class="sha">${esc(r.sha || '')}</span> ${esc(r.text)}`
-        : r.kind === 'review' ? `<span class="glyph">${esc(r.glyph || '')}</span><span class="author">${esc(r.author || '')}</span>${r.text ? ': ' + esc(r.text) : ''}`
+      const main = r.kind === 'header' ? link(r, esc(r.text))
+        : r.kind === 'commit' ? `<span class="glyph">${esc(r.glyph || '')}</span>${link(r, `<span class="sha">${esc(r.sha || '')}</span>`)} ${esc(r.text)}`
+        : r.kind === 'review' ? `<span class="glyph">${esc(r.glyph || '')}</span>${link(r, `<span class="author">${esc(r.author || '')}</span>`)}${r.text ? ': ' + esc(r.text) : ''}`
         : esc(r.text);
       return `<div class="row ${r.kind}"><span class="main">${main}</span><span class="age">${esc(r.age || '')}</span></div>`;
     }).join('');

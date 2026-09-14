@@ -1316,9 +1316,53 @@ fn render_commit_page(
     reviews: &BTreeMap<String, Vec<Review>>,
 ) -> String {
     let sha = event_sha(event);
-    let plan = event_plan(event);
-    let kind = event_kind_label(event);
+    let empty: Vec<Review> = Vec::new();
+    let reviews_here = reviews.get(sha.as_str()).unwrap_or(&empty);
+    // A plan-only commit is read for its plan, so the plan is the
+    // centrepiece and the diff folded; any other commit the reverse.
+    let plan_is_centerpiece = matches!(
+        event,
+        LogEvent::PlanIntro { .. }
+            | LogEvent::PlanFinalized { .. }
+            | LogEvent::PlanCommit {
+                touched_plan: true,
+                touched_code: false,
+                ..
+            }
+    );
+    let plan_md = plan_is_centerpiece
+        .then(|| plan_body_at_commit(repo, event))
+        .flatten();
+    render_commit_doc(
+        repo,
+        sha,
+        event_plan(event),
+        event_kind_label(event),
+        plan_md.as_deref(),
+        reviews_here,
+    )
+}
+
+/// The page for a commit the fold knows nothing of — history from
+/// before adoption, which the site never builds because its events
+/// begin at adoption. Rendered on request from git alone: no plan,
+/// no reviews, the diff open (codex on b1c0cf8).
+pub(crate) fn render_history_commit_page(repo: &Path, sha: &CommitSha) -> String {
+    render_commit_doc(repo, sha, None, "history", None, &[])
+}
+
+/// One commit's page from its parts: `plan_md` present means the
+/// plan is the centrepiece and the diff is folded.
+fn render_commit_doc(
+    repo: &Path,
+    sha: &CommitSha,
+    plan: Option<&str>,
+    kind: &str,
+    plan_md: Option<&str>,
+    reviews_here: &[Review],
+) -> String {
     let subject = commit_subject(repo, sha);
+    let plan_is_centerpiece = plan_md.is_some();
 
     let mut out = String::new();
     write_doc_open(
@@ -1360,33 +1404,17 @@ fn render_commit_page(
     ));
     out.push_str("</header>\n");
 
-    let plan_md = plan_body_at_commit(repo, event);
-    let plan_is_centerpiece = matches!(
-        event,
-        LogEvent::PlanIntro { .. }
-            | LogEvent::PlanFinalized { .. }
-            | LogEvent::PlanCommit {
-                touched_plan: true,
-                touched_code: false,
-                ..
-            }
-    );
-
     out.push_str("<main>\n");
-    if plan_is_centerpiece {
-        if let Some(md) = &plan_md {
-            out.push_str("<section class=\"plan-body\">\n");
-            out.push_str("  <h3>Plan at this commit</h3>\n");
-            out.push_str("  <article class=\"md\">\n");
-            out.push_str(&render_markdown(md));
-            out.push_str("  </article>\n");
-            out.push_str("</section>\n");
-        }
+    if let Some(md) = plan_md {
+        out.push_str("<section class=\"plan-body\">\n");
+        out.push_str("  <h3>Plan at this commit</h3>\n");
+        out.push_str("  <article class=\"md\">\n");
+        out.push_str(&render_markdown(md));
+        out.push_str("  </article>\n");
+        out.push_str("</section>\n");
     }
 
     // Feedback.
-    let empty: Vec<Review> = Vec::new();
-    let reviews_here = reviews.get(sha.as_str()).unwrap_or(&empty);
     out.push_str("<section class=\"feedback\">\n");
     out.push_str("  <h3>Reviews</h3>\n");
     if reviews_here.is_empty() {
@@ -2319,6 +2347,7 @@ h2 { font-size: 1rem; text-transform: uppercase; letter-spacing: .05em; color: v
 .kind-finish, .kind-intro { color: var(--finished); }
 .kind-code, .kind-mixed { color: var(--approve); }
 .kind-delete { color: var(--changes); }
+.kind-history { color: var(--fg-dim); }
 .subject { color: var(--fg); }
 .marks { display: inline-flex; gap: .25rem; }
 .mark { font: 600 .8rem/1 var(--mono); padding: 0 .2rem; border-radius: 3px; }

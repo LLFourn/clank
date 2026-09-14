@@ -98,8 +98,9 @@ pub async fn run(args: WebArgs) -> anyhow::Result<()> {
     // `zellij subscribe` that would otherwise stream to nobody for as
     // long as the session lives — is dropped here on purpose before
     // the process ends. The smoke test that found this left one.
+    let site = site_dir(&repo);
     let served = tokio::select! {
-        r = serve(listener, feed, sayer, &session) => r,
+        r = serve(listener, feed, sayer, &session, repo.clone(), site) => r,
         _ = shutdown.asked() => Ok(()),
     };
     drop(
@@ -270,6 +271,17 @@ fn spawn_status_loop(repo: PathBuf, feed: Feed) {
                 true,
             ));
             if let Ok(snap) = built {
+                // The pages the ledger links, from the same builder
+                // `clank html` runs — incremental, and off the
+                // request path.
+                if let Err(e) = rt.block_on(crate::cli::html::generate(
+                    &repo,
+                    &site_dir(&repo),
+                    home.as_deref(),
+                    false,
+                )) {
+                    eprintln!("clank web: site build failed: {e:#}");
+                }
                 let with = reconcile_tails(
                     &repo,
                     home.as_deref(),
@@ -571,12 +583,21 @@ fn text(status: u16, body: impl Into<Bytes>, content_type: &str) -> Resp {
 /// an events stream holds its connection open for as long as the
 /// browser stays, so serving inline would let one browser block the
 /// next.
+/// Where `clank html` writes the site this server serves under
+/// `/html/`.
+fn site_dir(repo: &Path) -> PathBuf {
+    repo.join(".clank/html")
+}
+
 async fn serve(
     listener: tokio::net::TcpListener,
     feed: Feed,
     sayer: Sayer,
     session: &str,
+    repo: PathBuf,
+    site: PathBuf,
 ) -> anyhow::Result<()> {
+    let pages = Arc::new(Pages { repo, site });
     let page: Arc<str> = Arc::from(PAGE.replace(
         "window.CLANK_SESSION || 'clank'",
         &format!("{}", serde_json::json!(session)),
@@ -584,10 +605,13 @@ async fn serve(
     loop {
         let (stream, _) = listener.accept().await?;
         let io = hyper_util::rt::TokioIo::new(stream);
-        let (feed, sayer, page) = (feed.clone(), sayer.clone(), page.clone());
+        let (feed, sayer, page, pages) = (feed.clone(), sayer.clone(), page.clone(), pages.clone());
         let svc = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
-            let (feed, sayer, page) = (feed.clone(), sayer.clone(), page.clone());
-            async move { Ok::<_, std::convert::Infallible>(route(req, &feed, &sayer, &page).await) }
+            let (feed, sayer, page, pages) =
+                (feed.clone(), sayer.clone(), page.clone(), pages.clone());
+            async move {
+                Ok::<_, std::convert::Infallible>(route(req, &feed, &sayer, &page, &pages).await)
+            }
         });
         tokio::spawn(async move {
             let _ = hyper::server::conn::http1::Builder::new()
@@ -597,18 +621,105 @@ async fn serve(
     }
 }
 
+/// Where the site's pages come from: the built site, and the repo
+/// for a commit page the site never builds.
+struct Pages {
+    repo: PathBuf,
+    site: PathBuf,
+}
+
 async fn route(
     req: hyper::Request<hyper::body::Incoming>,
     feed: &Feed,
     sayer: &Sayer,
     page: &str,
+    pages: &Pages,
 ) -> Resp {
     match (req.method().as_str(), req.uri().path()) {
         ("GET", "/") => text(200, page.to_string(), "text/html; charset=utf-8"),
         ("GET", "/events") => events(feed),
         ("POST", "/say") => say(req, sayer).await,
+        ("GET", path) if path.starts_with("/html/") => site_page(pages, &path["/html/".len()..]),
         _ => text(404, "not here", "text/plain"),
     }
+}
+
+/// The site's shapes, and nothing else: a request names a page the
+/// builder writes, never a file. Under `plan/`, `queue/` and `stash/`
+/// a name is what `PlanKey` accepts — one segment, any letters,
+/// spaces and all, no leading dot — decoded from the URL first, since
+/// the builder writes the stem verbatim and the link encodes it
+/// (codex on 4432a11); under `commit/` a hex sha; and the two files
+/// at the root every page links.
+fn site_file(rel: &str) -> Option<(&'static str, String)> {
+    const HTML: &str = "text/html; charset=utf-8";
+    match rel {
+        "index.html" => return Some((HTML, rel.to_string())),
+        "style.css" => return Some(("text/css; charset=utf-8", rel.to_string())),
+        _ => {}
+    }
+    let (dir, file) = rel.split_once('/')?;
+    let file = percent_decode(file)?;
+    let stem = file.strip_suffix(".html")?;
+    let ok = match dir {
+        "commit" => (7..=40).contains(&stem.len()) && stem.chars().all(|c| c.is_ascii_hexdigit()),
+        "plan" | "queue" | "stash" => clank_core::ids::PlanKey::parse(stem).is_ok(),
+        _ => false,
+    };
+    ok.then(|| (HTML, format!("{dir}/{file}")))
+}
+
+/// One path segment, decoded: `%XX` to bytes, the whole a string.
+/// A separator or a NUL that only appears once decoded is refused
+/// here rather than passed on as a name.
+fn percent_decode(segment: &str) -> Option<String> {
+    let bytes = segment.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = bytes.get(i + 1..i + 3)?;
+            let hex = std::str::from_utf8(hex).ok()?;
+            out.push(u8::from_str_radix(hex, 16).ok()?);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    let decoded = String::from_utf8(out).ok()?;
+    (!decoded.contains(['/', '\\', '\0'])).then_some(decoded)
+}
+
+fn site_page(pages: &Pages, rel: &str) -> Resp {
+    let Some((ctype, file)) = site_file(rel) else {
+        return text(404, "not a page of this site", "text/plain");
+    };
+    if let Ok(body) = std::fs::read_to_string(pages.site.join(&file)) {
+        return text(200, body, ctype);
+    }
+    // A commit page the site has not written is one of two things: a
+    // commit from before adoption, which the site never writes and
+    // git still has, rendered here on request; or one the next build
+    // will write.
+    if let Some(sha) = file
+        .strip_prefix("commit/")
+        .and_then(|f| f.strip_suffix(".html"))
+    {
+        return match crate::git_io::resolve_commit(&pages.repo, sha) {
+            Some(full) => text(
+                200,
+                crate::cli::html::render_history_commit_page(&pages.repo, &full),
+                ctype,
+            ),
+            None => text(404, "no such commit in this repo", "text/plain"),
+        };
+    }
+    text(
+        404,
+        "not built yet: the site is rebuilt after each status refresh; try again shortly",
+        "text/plain",
+    )
 }
 
 /// The handoff: subscribe, then the retained state, then live —
@@ -754,6 +865,60 @@ mod tests {
         );
     }
 
+    /// The site's shapes and nothing else, decided on the name alone:
+    /// a plan's name is whatever `PlanKey` accepts, decoded from the
+    /// URL; a separator, however encoded, is not a name.
+    #[test]
+    fn only_the_sites_own_shapes_are_pages() {
+        let sha = "a".repeat(40);
+        for ok in [
+            "index.html",
+            "style.css",
+            "plan/foo.html",
+            "plan/a-plan_2.v1.html",
+            "plan/fix%20UI.html",
+            "plan/r%C3%A9sum%C3%A9.html",
+            "queue/500-foo.html",
+            "stash/foo.html",
+            &format!("commit/{sha}.html"),
+            "commit/abc1234.html",
+        ] {
+            assert!(site_file(ok).is_some(), "{ok}");
+        }
+        assert_eq!(
+            site_file("plan/fix%20UI%20r%C3%A9sum%C3%A9.html")
+                .unwrap()
+                .1,
+            "plan/fix UI résumé.html",
+            "decoded to the name the builder wrote"
+        );
+        for bad in [
+            "",
+            "plan/",
+            "plan/.html",
+            "plan/.hidden.html",
+            "plan/foo",
+            "plan/foo.html/x",
+            "plan/../style.css",
+            "plan/..%2Fstyle.css",
+            "plan/%2E%2E.html",
+            "plan/a%2Fb.html",
+            "plan/a%5Cb.html",
+            "plan/a%00b.html",
+            "plan/%ZZ.html",
+            "plan/%C3.html",
+            "plan/_.html",
+            "commit/abc.html",
+            "commit/xyz1234.html",
+            "other/foo.html",
+            "secret.txt",
+            "/etc/passwd",
+        ] {
+            assert!(site_file(bad).is_none(), "{bad:?}");
+        }
+        assert_eq!(site_file("style.css").unwrap().0, "text/css; charset=utf-8");
+    }
+
     #[test]
     fn the_session_is_explicit_then_current_then_the_convention() {
         let repo = Path::new("/x/penlock-experiment");
@@ -792,12 +957,131 @@ mod tests {
             recorder.lock().unwrap().push((pane.into(), text.into()));
             Ok(())
         });
+        let site = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo.path())
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        };
+        git(&["init", "--quiet", "--initial-branch=main"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        std::fs::write(repo.path().join("readme"), "before clank\n").unwrap();
+        git(&["add", "readme"]);
+        git(&["commit", "--quiet", "-m", "history before adoption"]);
+        let old_sha = git(&["rev-parse", "HEAD"]);
         let server = tokio::spawn({
             let feed = feed.clone();
-            async move { serve(listener, feed, sayer, "clank-test").await }
+            let (repo, site) = (repo.path().to_path_buf(), site.path().to_path_buf());
+            async move { serve(listener, feed, sayer, "clank-test", repo, site).await }
         });
         let base = format!("http://127.0.0.1:{port}");
         let client = reqwest::Client::new();
+
+        // The site: a page and the stylesheet it links, served under
+        // /html/ with their own types; a name the builder never
+        // writes, or a walk, is not a page; a page not built yet says
+        // so.
+        std::fs::create_dir_all(site.path().join("plan")).unwrap();
+        std::fs::write(
+            site.path().join("plan/foo.html"),
+            "<link rel=\"stylesheet\" href=\"../style.css\"><h1>foo</h1>",
+        )
+        .unwrap();
+        std::fs::write(site.path().join("style.css"), "h1 { color: red }").unwrap();
+        std::fs::write(site.path().join("secret.txt"), "no").unwrap();
+        let plan = client
+            .get(format!("{base}/html/plan/foo.html"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(plan.status(), 200);
+        assert_eq!(
+            plan.headers().get("content-type").unwrap(),
+            "text/html; charset=utf-8"
+        );
+        assert!(plan.text().await.unwrap().contains("<h1>foo</h1>"));
+        let css = client
+            .get(format!("{base}/html/style.css"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(css.status(), 200);
+        assert_eq!(
+            css.headers().get("content-type").unwrap(),
+            "text/css; charset=utf-8"
+        );
+        assert_eq!(css.text().await.unwrap(), "h1 { color: red }");
+        // The client resolves `..` before sending; a walk that
+        // survives resolution is refused by name (the unit test holds
+        // the server's own `..` refusal).
+        for walk in [
+            "/html/secret.txt",
+            "/html/plan/../secret.txt",
+            "/html/../Cargo.toml",
+        ] {
+            let r = client.get(format!("{base}{walk}")).send().await.unwrap();
+            assert_eq!(r.status(), 404, "{walk}");
+        }
+        let r = client
+            .get(format!("{base}/html/secret.txt"))
+            .send()
+            .await
+            .unwrap();
+        assert!(r.text().await.unwrap().contains("not a page"));
+        // A stem with a space and an accent, as the builder writes
+        // it, reached through the encoded link.
+        std::fs::write(site.path().join("plan/fix UI résumé.html"), "<h1>ok</h1>").unwrap();
+        let odd = client
+            .get(format!("{base}/html/plan/fix%20UI%20r%C3%A9sum%C3%A9.html"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(odd.status(), 200);
+        assert_eq!(odd.text().await.unwrap(), "<h1>ok</h1>");
+        let missing = client
+            .get(format!("{base}/html/plan/bar.html"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), 404);
+        assert!(missing.text().await.unwrap().contains("not built yet"));
+        // A commit the site never wrote — history from before
+        // adoption — is rendered on request from git, whole sha or
+        // short; a sha git does not have is said to be none.
+        for rev in [old_sha.as_str(), &old_sha[..7]] {
+            let history = client
+                .get(format!("{base}/html/commit/{rev}.html"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(history.status(), 200, "{rev}");
+            let body = history.text().await.unwrap();
+            assert!(body.contains("history before adoption"), "{rev}: {body}");
+            assert!(body.contains("kind-history"), "{rev}");
+            assert!(
+                body.contains("before clank"),
+                "{rev}: the diff is on the page"
+            );
+        }
+        let none = client
+            .get(format!("{base}/html/commit/{}.html", "f".repeat(40)))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(none.status(), 404);
+        assert!(none.text().await.unwrap().contains("no such commit"));
 
         let page = client.get(&base).send().await.unwrap();
         assert_eq!(page.status(), 200);
