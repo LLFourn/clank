@@ -197,9 +197,23 @@ signs in with that passkey (a YubiKey held to it works) from then
 on. The page lists the passkeys (kept in `~/.clank/config.json`
 under `remote.passkeys`) and the open sessions (thirty days, hashed
 in `~/.clank/remote-sessions.json`); Backspace on either revokes it,
-and a revoked session's stream ends at once. Set `remote.url` in the
-user config to the tunnel's public URL when there is one: it is the
-passkeys' relying party and where the phone's link points.
+and a revoked session's stream ends at once.
+
+A phone reaches the page through a tunnel, configured once in
+`~/.clank/config.json` under `remote.tunnel` and brought up with the
+remote: `{"provider": "ngrok", "domain": "you.ngrok.app"}` runs
+ngrok natively through its SDK, with the authtoken read from
+`NGROK_AUTHTOKEN` or the ngrok agent's own config file (never
+clank's); `{"provider": "command", "run": ["cloudflared", "tunnel",
+"run", "--url", "http://localhost:{port}", "clank"], "url":
+"https://clank.example.com"}` runs any binary that forwards a fixed
+hostname to the port. The tunnel's URL is the passkeys' relying
+party and where the phone's link points, and it is on the row only
+once the TUI has reached its own remote through it — the nonce and
+the event stream both, since a tunnel that buffers streams cannot
+carry the page (Cloudflare's quick tunnels do not). One TUI holds a
+hostname at a time; a second is told whose it is. Switching the
+remote off ends the tunnel with it.
 
 ## Command reference
 

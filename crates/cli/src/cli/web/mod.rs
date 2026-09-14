@@ -15,6 +15,7 @@
 pub(crate) mod door;
 mod feed;
 mod transcript;
+pub(crate) mod tunnel;
 
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -113,6 +114,9 @@ impl Panes for Zellij {
 /// `stop` still cancels, aborts and kills; it just does not wait.
 pub(crate) struct Instance {
     pub(crate) url: String,
+    /// The tunnel's URL, once proven to reach this remote.
+    pub(crate) public_url: Option<String>,
+    tunnel: Option<tunnel::Tunnel>,
     cancel: tokio::sync::watch::Sender<bool>,
     tasks: tokio::task::JoinSet<()>,
     /// The blocking work in flight — a pane listing, a say — waited
@@ -201,15 +205,24 @@ impl Instance {
         home: Option<PathBuf>,
         panes: Arc<dyn Panes>,
         door: Arc<door::Door>,
+        mut tunnel: Option<tunnel::Start>,
         poll: std::time::Duration,
         grace: std::time::Duration,
     ) -> anyhow::Result<Self> {
         let table = panes
             .table()
             .ok_or_else(|| anyhow::anyhow!("zellij did not answer for `{}`", panes.session()))?;
+        // The public origin, resolved ONCE for this start: the relying
+        // party, the cookie's host, the links and the tunnel itself
+        // are one configuration until the next start.
+        let public = tunnel
+            .as_ref()
+            .map(|t| webauthn_rs::prelude::Url::parse(&t.provider.url()))
+            .transpose()?;
         let (listener, port) = listen(&repo).await?;
-        let rp = Arc::new(door.relying_party(port)?);
+        let rp = Arc::new(door.relying_party(port, public.as_ref())?);
         let door_for_serve = door.clone();
+        let nonce = door::random_token();
         let feed = Feed::new(64);
         feed.panes(table.clone());
         let subscription = Arc::new(Mutex::new(subscribe(&*panes, &table, &feed)));
@@ -229,6 +242,8 @@ impl Instance {
             blocking.clone(),
             door_for_serve,
             rp,
+            nonce.clone(),
+            public.as_ref().and_then(secure_host_of),
         ));
         tasks.spawn(pane_poll(
             panes,
@@ -240,11 +255,13 @@ impl Instance {
         ));
         tasks.spawn(door_poll(door, cancelled, blocking.clone()));
         let builder = SiteBuilder::start(repo.clone(), home.clone());
-        Ok(Self {
+        let mut instance = Self {
             // `localhost`, not `127.0.0.1`: the passkeys' relying
             // party is `localhost`, and a browser's origin must say
             // the RP's name (codex on 375f30c).
             url: format!("http://localhost:{port}"),
+            public_url: None,
+            tunnel: None,
             cancel,
             tasks,
             blocking,
@@ -255,7 +272,28 @@ impl Instance {
             feed,
             repo,
             home,
-        })
+        };
+        // The tunnel comes up against the running server — its
+        // readiness is this remote's own nonce read back through the
+        // public URL — and a tunnel that does not come up takes the
+        // remote down with it: a start is up whole or not at all.
+        if let Some(start) = tunnel.as_mut() {
+            let Some(home) = instance.home.clone() else {
+                instance.stop().await;
+                anyhow::bail!("a tunnel needs a home for its lease");
+            };
+            match tunnel::Tunnel::up(start, &home, port, &nonce).await {
+                Ok(t) => {
+                    instance.public_url = Some(t.url.clone());
+                    instance.tunnel = Some(t);
+                }
+                Err(e) => {
+                    instance.stop().await;
+                    return Err(e);
+                }
+            }
+        }
+        Ok(instance)
     }
 
     /// The TUI rebuilt its snapshot: the page's facts follow, the
@@ -296,6 +334,11 @@ impl Instance {
     /// child and its reader, the tails live and retired, and the
     /// builder, joined off the runtime's threads.
     pub(crate) async fn stop(mut self) {
+        // The public URL goes first: nothing reaches a remote that
+        // is ending.
+        if let Some(t) = self.tunnel.take() {
+            t.stop().await;
+        }
         let _ = self.cancel.send(true);
         let deadline = tokio::time::Instant::now() + self.grace;
         while !self.tasks.is_empty() {
@@ -894,6 +937,8 @@ async fn serve(
     blocking: Arc<Blocking>,
     door: Arc<door::Door>,
     rp: Arc<webauthn_rs::prelude::Webauthn>,
+    nonce: String,
+    secure_host: Option<String>,
 ) {
     let origins = rp
         .get_allowed_origins()
@@ -911,10 +956,11 @@ async fn serve(
         pages: Pages { repo, site },
         workers: Mutex::new(tokio::task::JoinSet::new()),
         cancelled: cancelled.clone(),
-        secure_host: door.secure_host(),
+        secure_host,
         door,
         rp,
         origins,
+        nonce,
     });
     loop {
         let accepted = tokio::select! {
@@ -956,6 +1002,18 @@ async fn serve(
     while let Some(_done) = workers.join_next().await {}
 }
 
+/// The host a `Secure` cookie is for: the public URL's, when it is
+/// https. Plain loopback gets a plain cookie.
+fn secure_host_of(url: &webauthn_rs::prelude::Url) -> Option<String> {
+    (url.scheme() == "https").then(|| {
+        let host = url.host_str().unwrap_or_default();
+        match url.port() {
+            Some(p) => format!("{host}:{p}"),
+            None => host.to_string(),
+        }
+    })
+}
+
 /// What a request is answered from, and where its workers go.
 struct Ctx {
     feed: Feed,
@@ -973,6 +1031,9 @@ struct Ctx {
     origins: Vec<String>,
     /// The host a `Secure` cookie is for, when the tunnel is https.
     secure_host: Option<String>,
+    /// This start's nonce: what the tunnel probe reads back to know
+    /// the public URL is this remote and not another.
+    nonce: String,
 }
 
 /// Where the site's pages come from: the built site, and the repo
@@ -992,6 +1053,16 @@ async fn route(req: hyper::Request<hyper::body::Incoming>, peer: IpAddr, ctx: &C
     match (method.as_str(), path.as_str()) {
         ("GET", "/login") => return login(&req, peer, ctx),
         ("GET", "/register") => return text(200, REGISTER, HTML),
+        // The readiness probes: the nonce, and the nonce as the first
+        // event of a stream that stays open. Nothing of the page.
+        ("GET", "/instance") => {
+            return text(
+                200,
+                serde_json::json!({ "nonce": ctx.nonce }).to_string(),
+                "application/json",
+            );
+        }
+        ("GET", "/instance/stream") => return instance_stream(ctx),
         ("POST", "/login/start" | "/login/finish" | "/register/start" | "/register/finish") => {
             if !same_origin(&req, ctx) {
                 return text(403, "not from this page", "text/plain");
@@ -1227,6 +1298,38 @@ fn site_page(pages: &Pages, rel: &str) -> Resp {
         "not built yet: the site is rebuilt after each status refresh; try again shortly",
         "text/plain",
     )
+}
+
+/// One event carrying the nonce, then open until the remote ends:
+/// a tunnel that buffers streams never delivers the event.
+fn instance_stream(ctx: &Ctx) -> Resp {
+    let (tx, body_rx) = tokio::sync::mpsc::channel::<String>(1);
+    let mut cancelled = ctx.cancelled.clone();
+    let first = format!("event: instance\ndata: {}\n\n", ctx.nonce);
+    ctx.workers
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .spawn(async move {
+            if tx.send(first).await.is_err() {
+                return;
+            }
+            tokio::select! {
+                _ = cancelled.changed() => {}
+                _ = tx.closed() => {}
+            }
+        });
+    hyper::Response::builder()
+        .status(200)
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .body(
+            SseBody {
+                rx: body_rx,
+                ended: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }
+            .boxed(),
+        )
+        .expect("static response")
 }
 
 /// The handoff: subscribe, then the retained state, then live —
@@ -1615,7 +1718,7 @@ mod tests {
         let old_sha = git(&["rev-parse", "HEAD"]);
         let (cancel, cancelled) = tokio::sync::watch::channel(false);
         let door = Arc::new(door::Door::new(None));
-        let rp = Arc::new(door.relying_party(port).unwrap());
+        let rp = Arc::new(door.relying_party(port, None).unwrap());
         let server = tokio::spawn({
             let feed = feed.clone();
             let (repo, site) = (repo.path().to_path_buf(), site.path().to_path_buf());
@@ -1632,6 +1735,8 @@ mod tests {
                     Arc::new(Blocking::default()),
                     door,
                     rp,
+                    "nonce-of-this-start".to_string(),
+                    None,
                 )
                 .await
             }
@@ -1641,6 +1746,34 @@ mod tests {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap();
+
+        // The readiness probes answer without a session: the nonce,
+        // and the nonce as the first event of a stream that stays
+        // open.
+        let r = anon.get(format!("{base}/instance")).send().await.unwrap();
+        assert_eq!(r.status(), 200);
+        assert_eq!(
+            r.json::<serde_json::Value>().await.unwrap()["nonce"],
+            "nonce-of-this-start"
+        );
+        let mut probe = anon
+            .get(format!("{base}/instance/stream"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(probe.status(), 200);
+        let first = probe.chunk().await.unwrap().unwrap();
+        assert_eq!(
+            std::str::from_utf8(&first).unwrap(),
+            "event: instance\ndata: nonce-of-this-start\n\n"
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(300), probe.chunk())
+                .await
+                .is_err(),
+            "the stream stays open"
+        );
+        drop(probe);
 
         // Nothing but the doors answers without a session: a browser
         // is sent to sign in, a script is refused.

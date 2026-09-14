@@ -64,11 +64,11 @@ pub struct StoredPasskey {
 /// `~/.clank/config.json#/remote`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RemoteSection {
-    /// The public URL the tunnel gives this machine, when there is
-    /// one: the relying party's origin, and the host a `Secure`
-    /// cookie is for.
+    /// The tunnel that gives this machine a public URL, when there
+    /// is one: its fixed URL is the relying party's origin, the host
+    /// a `Secure` cookie is for, and where the phone's link points.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) url: Option<String>,
+    pub(crate) tunnel: Option<super::tunnel::TunnelSection>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) passkeys: Vec<StoredPasskey>,
 }
@@ -139,8 +139,6 @@ struct Memory {
 /// (codex on 5d24c05).
 pub(crate) struct Door {
     home: Option<PathBuf>,
-    /// The tunnel's URL as configured; `None` is loopback only.
-    url: Option<Url>,
     inner: Mutex<Inner>,
     /// Bumped whenever the live set changes: a stream holding a
     /// session watches this and asks whether it is still live.
@@ -194,15 +192,8 @@ impl Door {
     /// every use. Without a home nothing persists — a session lasts
     /// as long as the process.
     pub(crate) fn new(home: Option<PathBuf>) -> Self {
-        let url = home
-            .as_deref()
-            .and_then(|h| crate::cli::team::read_user_config(h).ok())
-            .and_then(|c| c.remote)
-            .and_then(|r| r.url)
-            .and_then(|u| Url::parse(&u).ok());
         let door = Self {
             home,
-            url,
             inner: Mutex::new(Inner::default()),
             revoked: tokio::sync::watch::channel(0).0,
         };
@@ -211,44 +202,32 @@ impl Door {
     }
 
     /// The relying party for a remote on `port`: the tunnel's URL
-    /// when one is configured, else `localhost` — which is why the
+    /// when a start has one, else `localhost` — which is why the
     /// remote's own URL says `localhost` and not `127.0.0.1`: the
-    /// browser's origin must be the RP's (codex on 375f30c).
-    pub(crate) fn relying_party(&self, port: u16) -> anyhow::Result<Webauthn> {
+    /// browser's origin must be the RP's (codex on 375f30c). The
+    /// public URL is the start's, resolved once and handed here, so
+    /// the relying party, the cookie and the links are one
+    /// configuration for the life of the instance (codex on 6f60efa).
+    pub(crate) fn relying_party(
+        &self,
+        port: u16,
+        public: Option<&Url>,
+    ) -> anyhow::Result<Webauthn> {
         let local = Url::parse(&format!("http://localhost:{port}"))?;
-        let (rp_id, origin) = match &self.url {
+        let (rp_id, origin) = match public {
             Some(url) => (
                 url.host_str()
-                    .ok_or_else(|| anyhow::anyhow!("remote.url `{url}` has no host"))?
+                    .ok_or_else(|| anyhow::anyhow!("the tunnel's URL `{url}` has no host"))?
                     .to_string(),
                 url.clone(),
             ),
             None => ("localhost".to_string(), local.clone()),
         };
         let mut builder = WebauthnBuilder::new(&rp_id, &origin)?.rp_name("clank");
-        if self.url.is_some() {
+        if public.is_some() {
             builder = builder.append_allowed_origin(&local);
         }
         Ok(builder.build()?)
-    }
-
-    /// The host a `Secure` cookie is set for: the tunnel's, which is
-    /// https. Plain loopback gets a plain cookie.
-    pub(crate) fn secure_host(&self) -> Option<String> {
-        let url = self.url.as_ref()?;
-        (url.scheme() == "https").then(|| {
-            let host = url.host_str().unwrap_or_default();
-            match url.port() {
-                Some(p) => format!("{host}:{p}"),
-                None => host.to_string(),
-            }
-        })
-    }
-
-    /// The tunnel's public URL as configured, for a link a phone
-    /// must be able to follow.
-    pub(crate) fn public_url(&self) -> Option<String> {
-        self.url.as_ref().map(|u| u.to_string())
     }
 
     pub(crate) fn watch_revocations(&self) -> tokio::sync::watch::Receiver<u64> {
@@ -748,7 +727,7 @@ pub(crate) fn query_token(query: Option<&str>) -> Option<String> {
     })
 }
 
-fn random_token() -> String {
+pub(crate) fn random_token() -> String {
     let mut bytes = [0u8; 32];
     fill_random(&mut bytes);
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
@@ -944,7 +923,7 @@ mod tests {
     async fn a_passkey_registers_from_a_link_and_logs_in() {
         let home = tempfile::tempdir().unwrap();
         let door = Door::new(Some(home.path().to_path_buf()));
-        let rp = door.relying_party(4321).unwrap();
+        let rp = door.relying_party(4321, None).unwrap();
         let origin = Url::parse("http://localhost:4321").unwrap();
         let mut phone = WebauthnAuthenticator::new(SoftPasskey::new(true));
 
@@ -1070,8 +1049,5 @@ mod tests {
         assert!(plain.contains("HttpOnly") && plain.contains("SameSite=Strict"));
         assert!(!plain.contains("Secure"));
         assert!(session_cookie("tok", true).ends_with("; Secure"));
-        let door = Door::new(None);
-        assert_eq!(door.secure_host(), None);
-        assert_eq!(door.public_url(), None);
     }
 }

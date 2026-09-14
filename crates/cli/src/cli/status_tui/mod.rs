@@ -33,7 +33,7 @@ use super::term::{AltScreen, paint, term_size};
 use super::status::{StatusSnapshot, spawn_sigwinch_forwarder, watch_status_paths};
 
 mod event_content;
-mod lease;
+pub(crate) mod lease;
 mod text;
 // Re-export for `open_zellij`'s tab/pane renamer, which strips the same
 // stale lamp prefix. (The IO shell itself uses no text primitives — the
@@ -2091,6 +2091,10 @@ pub(crate) async fn run_tui(
                 let _ = wake.send(Ev::Remote);
             }),
         )
+        .tunnel_from({
+            let home = home.clone();
+            std::sync::Arc::new(move || crate::cli::web::tunnel::configured(home.as_deref()))
+        })
     };
 
     let _guard = AltScreen::enter();

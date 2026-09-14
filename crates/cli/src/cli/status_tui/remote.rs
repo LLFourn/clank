@@ -25,10 +25,16 @@ pub(super) enum Shown {
 /// was asked for came up, or did not; the stop it was asked for is
 /// done; the browser could not be opened.
 pub(super) enum Outcome {
-    Started(Instance),
-    StartFailed { why: String },
+    /// Boxed: an instance is the whole remote, and the other
+    /// outcomes are a sentence.
+    Started(Box<Instance>),
+    StartFailed {
+        why: String,
+    },
     Stopped,
-    BrowserFailed { why: String },
+    BrowserFailed {
+        why: String,
+    },
 }
 
 /// A titled page for the operator, in the error overlay's shape.
@@ -52,6 +58,19 @@ pub(super) trait Opener: Send + 'static {
 /// runs and the row says why the remote cannot.
 pub(super) type PanesSource = Arc<dyn Fn() -> anyhow::Result<Arc<dyn Panes>> + Send + Sync>;
 
+/// Where the tunnel provider comes from when the switch is thrown:
+/// the user config as it is then, so a tunnel configured after the
+/// TUI started is the next start's.
+pub(super) type TunnelSource = Arc<
+    dyn Fn() -> anyhow::Result<
+            Option<(
+                Arc<dyn crate::cli::web::tunnel::Provider>,
+                std::time::Duration,
+            )>,
+        > + Send
+        + Sync,
+>;
+
 /// Starting and stopping are tasks in flight, held so the TUI's exit
 /// can wait for them; the loop is never inside either (codex on
 /// 55db154).
@@ -59,9 +78,12 @@ enum State {
     Off,
     Starting {
         task: tokio::task::JoinHandle<()>,
+        /// Thrown to abandon a tunnel still coming up: the exit path
+        /// does not wait out a connect that has stalled.
+        abort: tokio::sync::watch::Sender<bool>,
     },
     On {
-        instance: Instance,
+        instance: Box<Instance>,
     },
     Stopping {
         task: tokio::task::JoinHandle<()>,
@@ -80,6 +102,7 @@ pub(super) struct Remote<O: Opener> {
     /// are the user's, listed and revoked from the row whether the
     /// remote is on or off.
     door: Arc<Door>,
+    tunnel: TunnelSource,
     /// How often the panes are re-listed, and how long a stop lets
     /// the tasks end on their own; the production values, or a test's.
     poll: std::time::Duration,
@@ -111,6 +134,7 @@ impl<O: Opener> Remote<O> {
             home,
             panes,
             door,
+            tunnel: Arc::new(|| Ok(None)),
             poll,
             grace,
             opener,
@@ -119,6 +143,12 @@ impl<O: Opener> Remote<O> {
             outcomes: Arc::new(Mutex::new(Vec::new())),
             wake,
         }
+    }
+
+    /// Where the tunnel provider is read from at each start.
+    pub(super) fn tunnel_from(mut self, source: TunnelSource) -> Self {
+        self.tunnel = source;
+        self
     }
 
     pub(super) fn shown(&self) -> Shown {
@@ -135,7 +165,12 @@ impl<O: Opener> Remote<O> {
     /// reason when failed, nothing otherwise.
     pub(super) fn detail(&self) -> Option<String> {
         match &self.state {
-            State::On { instance } => Some(instance.url.clone()),
+            State::On { instance } => Some(
+                instance
+                    .public_url
+                    .clone()
+                    .unwrap_or_else(|| instance.url.clone()),
+            ),
             State::Failed { why } => Some(why.clone()),
             _ => None,
         }
@@ -185,22 +220,33 @@ impl<O: Opener> Remote<O> {
                 // (codex on 369e74e).
                 let panes = self.panes.clone();
                 let door = self.door.clone();
+                let tunnel = self.tunnel.clone();
+                let (abort, abandoned) = tokio::sync::watch::channel(false);
                 let task = tokio::spawn(async move {
-                    let started = match tokio::task::spawn_blocking(move || panes()).await {
-                        Ok(Ok(panes)) => {
-                            Instance::start(repo, home, panes, door, poll, grace).await
+                    let found = tokio::task::spawn_blocking(move || Ok((panes()?, tunnel()?)))
+                        .await
+                        .unwrap_or_else(|_| Err(anyhow::anyhow!("finding zellij panicked")));
+                    let started = match found {
+                        Ok((panes, configured)) => {
+                            let start = configured.map(|(provider, grace)| {
+                                crate::cli::web::tunnel::Start {
+                                    provider,
+                                    grace,
+                                    abort: abandoned,
+                                }
+                            });
+                            Instance::start(repo, home, panes, door, start, poll, grace).await
                         }
-                        Ok(Err(e)) => Err(e),
-                        Err(_) => Err(anyhow::anyhow!("finding zellij panicked")),
+                        Err(e) => Err(e),
                     };
                     report(match started {
-                        Ok(instance) => Outcome::Started(instance),
+                        Ok(instance) => Outcome::Started(Box::new(instance)),
                         Err(e) => Outcome::StartFailed {
                             why: format!("{e:#}"),
                         },
                     });
                 });
-                self.state = State::Starting { task };
+                self.state = State::Starting { task, abort };
                 None
             }
         }
@@ -235,15 +281,17 @@ impl<O: Opener> Remote<O> {
         }
     }
 
-    /// A one-time registration link for the phone: the tunnel's
-    /// public URL when one is configured — the phone cannot reach
-    /// loopback — else the local one; nothing unless on.
+    /// A one-time registration link for the phone: the running
+    /// tunnel's proven URL — the phone cannot reach loopback — else
+    /// the local one; nothing unless on. The instance's, not the
+    /// config's: a domain changed while the remote is on is the
+    /// next start's (codex on 6f60efa).
     pub(super) fn phone_link(&self) -> Option<String> {
         match &self.state {
             State::On { instance } => {
-                let base = self
-                    .door
-                    .public_url()
+                let base = instance
+                    .public_url
+                    .clone()
                     .unwrap_or_else(|| instance.url.clone());
                 Some(format!(
                     "{}/register?t={}",
@@ -265,17 +313,29 @@ impl<O: Opener> Remote<O> {
     pub(super) async fn stop(&mut self) {
         match std::mem::replace(&mut self.state, State::Off) {
             State::On { instance } => instance.stop().await,
-            State::Starting { task } | State::Stopping { task } => {
+            State::Starting { task, abort } => {
+                let _ = abort.send(true);
                 let _ = task.await;
-                for (_, outcome) in
-                    std::mem::take(&mut *self.outcomes.lock().unwrap_or_else(|e| e.into_inner()))
-                {
-                    if let Outcome::Started(instance) = outcome {
-                        instance.stop().await;
-                    }
-                }
+                self.stop_landed().await;
+            }
+            State::Stopping { task } => {
+                let _ = task.await;
+                self.stop_landed().await;
             }
             State::Off | State::Failed { .. } => {}
+        }
+    }
+
+    /// Stop an instance a start reported while the exit was under
+    /// way: nothing else will. The queue is taken before the await,
+    /// not held across it.
+    async fn stop_landed(&mut self) {
+        let queued: Vec<(u64, Outcome)> =
+            std::mem::take(&mut *self.outcomes.lock().unwrap_or_else(|e| e.into_inner()));
+        for (_, outcome) in queued {
+            if let Outcome::Started(instance) = outcome {
+                instance.stop().await;
+            }
         }
     }
 
@@ -587,6 +647,191 @@ mod tests {
             baseline,
             "off means every task of the remote's is joined"
         );
+    }
+
+    /// A provider whose "tunnel" is the loopback itself: its URL is
+    /// wherever the test points it, and it records whether it was
+    /// started and stopped. A `pending` one never finishes starting.
+    struct FakeTunnel {
+        url: String,
+        pending: bool,
+        started: Arc<std::sync::atomic::AtomicBool>,
+        stopped: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl crate::cli::web::tunnel::Provider for FakeTunnel {
+        fn url(&self) -> String {
+            self.url.clone()
+        }
+        fn start(
+            &self,
+            _port: u16,
+        ) -> futures_util::future::BoxFuture<
+            '_,
+            anyhow::Result<Box<dyn crate::cli::web::tunnel::Handle>>,
+        > {
+            self.started
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            let stopped = self.stopped.clone();
+            let pending = self.pending;
+            Box::pin(async move {
+                if pending {
+                    std::future::pending::<()>().await;
+                }
+                Ok(Box::new(FakeHandle { stopped }) as Box<dyn crate::cli::web::tunnel::Handle>)
+            })
+        }
+    }
+
+    struct FakeHandle {
+        stopped: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl crate::cli::web::tunnel::Handle for FakeHandle {
+        fn stop(self: Box<Self>) -> futures_util::future::BoxFuture<'static, Option<String>> {
+            self.stopped
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            Box::pin(async { None })
+        }
+    }
+
+    /// A remote with a tunnel provider, on a port decided now so the
+    /// provider's fixed URL can name it — its own, unless `url` says
+    /// otherwise — with a one-second grace.
+    async fn tunnelled(
+        home: &std::path::Path,
+        url: Option<String>,
+        pending: bool,
+    ) -> (Remote<Recorder>, tempfile::TempDir, Arc<FakeTunnel>) {
+        let repo = repo_with_config();
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        crate::agent_store::record_web_port(repo.path(), port).unwrap();
+        let provider = Arc::new(FakeTunnel {
+            url: url.unwrap_or_else(|| format!("http://localhost:{port}")),
+            pending,
+            started: Default::default(),
+            stopped: Default::default(),
+        });
+        let source = provider.clone();
+        let r = Remote::new(
+            repo.path().to_path_buf(),
+            Some(home.to_path_buf()),
+            Arc::new(|| {
+                Ok(Arc::new(FakePanes {
+                    answers: true,
+                    slow: std::time::Duration::ZERO,
+                }) as Arc<dyn Panes>)
+            }),
+            Arc::new(Door::new(None)),
+            crate::cli::web::PANE_POLL,
+            crate::cli::web::STOP_GRACE,
+            Recorder::default(),
+            Arc::new(|| {}),
+        )
+        .tunnel_from(Arc::new(move || {
+            Ok(Some((
+                source.clone() as Arc<dyn crate::cli::web::tunnel::Provider>,
+                std::time::Duration::from_secs(1),
+            )))
+        }));
+        (r, repo, provider)
+    }
+
+    /// With a provider configured, on means the tunnel is leased,
+    /// started and proven — the row shows the public URL — and off
+    /// ends it and releases the endpoint. A second remote on the
+    /// same endpoint is refused naming the holder and starts no
+    /// tunnel; one whose URL is not proven is refused and the tunnel
+    /// that was started is stopped. (Another remote's nonce is the
+    /// probe's own test: an IP is no relying party.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_tunnel_is_leased_proven_and_ends_with_the_remote() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let home = tempfile::tempdir().unwrap();
+        let snap = snap();
+        let (mut a, _repo_a, tunnel_a) = tunnelled(home.path(), None, false).await;
+        assert_eq!(a.toggle(), None);
+        settle(&mut a, &snap).await;
+        assert_eq!(a.shown(), Shown::On);
+        assert_eq!(
+            a.detail().as_deref(),
+            Some(tunnel_a.url.as_str()),
+            "the public URL"
+        );
+        assert!(tunnel_a.started.load(Relaxed) && !tunnel_a.stopped.load(Relaxed));
+
+        // The same endpoint, claimed by another remote.
+        let (mut b, _repo_b, tunnel_b) =
+            tunnelled(home.path(), Some(tunnel_a.url.clone()), false).await;
+        assert_eq!(b.toggle(), None);
+        let notices = settle(&mut b, &snap).await;
+        assert_eq!(b.shown(), Shown::Failed);
+        let why = b.detail().unwrap();
+        assert!(why.contains("held by"), "{why}");
+        assert!(!notices.is_empty());
+        assert!(
+            !tunnel_b.started.load(Relaxed),
+            "refused before anything started"
+        );
+
+        assert_eq!(a.toggle(), None);
+        settle(&mut a, &snap).await;
+        assert_eq!(a.shown(), Shown::Off);
+        assert!(
+            tunnel_a.stopped.load(Relaxed),
+            "the tunnel ends with the remote"
+        );
+
+        // Released: b's start is refused by the probe now, not the
+        // lease — nothing answers at a's old URL.
+        assert_eq!(b.toggle(), None);
+        settle(&mut b, &snap).await;
+        assert_eq!(b.shown(), Shown::Failed);
+        let why = b.detail().unwrap();
+        assert!(why.contains("not reachable"), "{why}");
+        assert!(
+            tunnel_b.started.load(Relaxed) && tunnel_b.stopped.load(Relaxed),
+            "the tunnel that was started is stopped"
+        );
+        b.stop().await;
+    }
+
+    /// A provider that never finishes connecting: the start fails at
+    /// the grace, and the exit path abandons it at once rather than
+    /// waiting the grace out (codex on 6f60efa).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pending_tunnel_is_abandoned_by_the_grace_and_by_quitting() {
+        let home = tempfile::tempdir().unwrap();
+        let snap = snap();
+        let (mut p, _repo_p, _tunnel_p) = tunnelled(home.path(), None, true).await;
+        assert_eq!(p.toggle(), None);
+        let started = std::time::Instant::now();
+        settle(&mut p, &snap).await;
+        assert_eq!(p.shown(), Shown::Failed);
+        let why = p.detail().unwrap();
+        assert!(why.contains("did not come up within 1s"), "{why}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(4),
+            "bounded by the grace"
+        );
+        p.stop().await;
+
+        let (mut q, _repo_q, _tunnel_q) = tunnelled(home.path(), None, true).await;
+        assert_eq!(q.toggle(), None);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(q.shown(), Shown::Starting);
+        let quitting = std::time::Instant::now();
+        q.stop().await;
+        assert!(
+            quitting.elapsed() < std::time::Duration::from_millis(800),
+            "quitting does not wait out the connect: {:?}",
+            quitting.elapsed()
+        );
+        assert_eq!(q.shown(), Shown::Off);
     }
 
     fn port_of(url: &str) -> u16 {

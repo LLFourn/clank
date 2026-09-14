@@ -19,7 +19,7 @@ pub(super) struct StatusLease {
 /// Who holds it, for the refusal message. Best-effort: written after
 /// the lock is taken, read back without it.
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
-pub(super) struct Holder {
+pub(crate) struct Holder {
     pub(super) pid: i32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) session: Option<String>,
@@ -29,7 +29,7 @@ pub(super) struct Holder {
 }
 
 impl Holder {
-    fn here() -> Self {
+    pub(crate) fn here() -> Self {
         Self {
             pid: std::process::id() as i32,
             session: std::env::var("ZELLIJ_SESSION_NAME").ok(),
@@ -39,7 +39,7 @@ impl Holder {
     }
 
     /// Where to go and close it.
-    fn describe(&self) -> String {
+    pub(crate) fn describe(&self) -> String {
         let mut out = format!("pid {}", self.pid);
         if let Some(session) = &self.session {
             out.push_str(&format!(" in session {session}"));
