@@ -435,11 +435,13 @@ impl Feed {
 /// the reducer the page's JavaScript mirrors line for line. Kept in
 /// Rust so the duplicate-and-stale contract codex asked for is a
 /// test here rather than a hope in a browser.
+#[cfg(test)]
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct PageModel {
     pub(crate) agents: BTreeMap<String, AgentTurns>,
 }
 
+#[cfg(test)]
 impl PageModel {
     /// One SSE frame as the browser receives it. Frames that are not
     /// about turns leave the model alone.

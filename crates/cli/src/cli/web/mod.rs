@@ -222,13 +222,11 @@ fn spawn_status_loop(repo: PathBuf, feed: Feed) {
 }
 
 /// A transcript being followed for one agent, for one session, from
-/// one file. `owner` is the token the feed will honour for this tail
-/// and no other — the stop flag is a courtesy, the token is the
-/// guarantee.
+/// one file. The stop flag is a courtesy; the token the feed's window
+/// records for the tail is the guarantee.
 struct TailHandle {
     session: String,
     path: PathBuf,
-    owner: u64,
     stop: Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -334,7 +332,6 @@ fn retarget_tails(
             TailHandle {
                 session: session.clone(),
                 path: path.clone(),
-                owner,
                 stop,
             },
         );
@@ -618,14 +615,14 @@ mod tests {
         wanted.insert("claude".into(), ("s1".into(), file("s1.jsonl")));
         let with = retarget_tails(&wanted, &roster, &feed, &mut tails, &mut next_owner);
         assert_eq!(with, ["claude".to_string()].into());
-        let owner1 = tails["claude"].owner;
+        let owner1 = feed.snapshot().turns["claude"].owner;
         feed.turns_reset("claude", owner1, "s1", 1, vec![say("a")]);
         assert_eq!(feed.snapshot().turns["claude"].turns.len(), 1);
 
         let (_, mut rx) = feed.connect();
         wanted.insert("claude".into(), ("s2".into(), file("s2.jsonl")));
         retarget_tails(&wanted, &roster, &feed, &mut tails, &mut next_owner);
-        let owner2 = tails["claude"].owner;
+        let owner2 = feed.snapshot().turns["claude"].owner;
         assert_ne!(owner1, owner2);
         let mut page = feed::PageModel::default();
         page.apply(&rx.try_recv().unwrap());
