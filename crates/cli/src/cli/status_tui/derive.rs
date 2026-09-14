@@ -657,6 +657,7 @@ mod tests {
                 &state_color(&s).sgr(),
                 20,
                 crate::cli::status_tui::zellij::ZellijReach::NotInSession,
+                Default::default(),
             );
             let sgr = line
                 .strip_prefix("\x1b[")

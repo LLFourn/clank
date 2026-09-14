@@ -47,6 +47,7 @@ mod markdown;
 pub(crate) mod input;
 use input::*;
 
+mod remote;
 mod render;
 use render::*;
 
@@ -89,6 +90,8 @@ enum Ev {
     /// every loop turn drains the worker's outcomes before painting,
     /// so the event only has to end the wait.
     Worker,
+    /// The remote server spoke or ended; drained the same way.
+    Remote,
 }
 
 /// Execute a confirmed roster mutation via the existing `clank agent`
@@ -1318,6 +1321,12 @@ impl Overlay {
             offset: 0,
         }
     }
+    /// The error doc is the TUI's one titled page; a notice — the
+    /// remote switch saying where it listens — is that page with a
+    /// calmer title.
+    fn notice(n: remote::Notice) -> Self {
+        Self::error(n.title, n.message)
+    }
     /// A stashed-plan overlay, opened at the top.
     fn stashed(name: String, markdown: Option<String>) -> Self {
         Self {
@@ -1913,7 +1922,7 @@ fn behind_overlay(ev: &Ev) -> BehindOverlay {
             refresh: false,
             fill: true,
         },
-        Ev::Stdin(_) | Ev::Content { .. } | Ev::Worker => BehindOverlay::default(),
+        Ev::Stdin(_) | Ev::Content { .. } | Ev::Worker | Ev::Remote => BehindOverlay::default(),
     }
 }
 
@@ -1940,7 +1949,7 @@ fn coalesce(events: impl IntoIterator<Item = Ev>) -> Batch {
                 target,
                 state,
             } => b.content.push((generation, target, state)),
-            Ev::Worker => {}
+            Ev::Worker | Ev::Remote => {}
         }
     }
     b
@@ -1987,6 +1996,18 @@ pub(crate) async fn run_tui(
         zellij::ReconcileWorker::spawn(repo.clone(), move || {
             let _ = wake.send(Ev::Worker);
         })
+    };
+    // Declared here for the same reason: its drop ends the server
+    // after the terminal is back, so a slow exit is seen in a shell.
+    let mut remote = {
+        let wake = ev_tx.clone();
+        remote::Remote::new(
+            repo.clone(),
+            remote::Processes::clank(),
+            std::sync::Arc::new(move || {
+                let _ = wake.send(Ev::Remote);
+            }),
+        )
     };
 
     let _guard = AltScreen::enter();
@@ -2218,7 +2239,7 @@ pub(crate) async fn run_tui(
                 // The overlay hides the notice row; the answer is
                 // drained and painted once the overlay closes. Resize
                 // was noted above.
-                Ok(Ev::Resize) | Ok(Ev::Worker) => {}
+                Ok(Ev::Resize) | Ok(Ev::Worker) | Ok(Ev::Remote) => {}
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     anyhow::bail!("event channel disconnected")
@@ -2245,6 +2266,7 @@ pub(crate) async fn run_tui(
             // A non-blocking drain: the worker reports after each
             // batch, the loop never waits on zellij to paint.
             reach: reconcile_worker.reach(),
+            remote: remote.shown(),
             presence,
         };
         // An overlay mounted here is drawn by the branch at the TOP of
@@ -2258,6 +2280,13 @@ pub(crate) async fn run_tui(
             &mut snapshot,
             &mut detail,
         ) {
+            continue;
+        }
+        // The remote's word is for the operator wherever they are:
+        // the overlay mounts over any page, and the loop goes round
+        // to draw it, as a reopen's does.
+        if let Some(n) = remote.drain().pop() {
+            detail = Some(Overlay::notice(n));
             continue;
         }
         // The ask lines depend on blocks (not the log fetch), so compute
@@ -3175,6 +3204,11 @@ pub(crate) async fn run_tui(
                             }
                             Key::Focus | Key::Char(b'a') => {
                                 mode = mode.toggle_focus(snapshot.agents.len())
+                            }
+                            Key::Char(b'r') => {
+                                if let Some(n) = remote.toggle() {
+                                    detail = Some(Overlay::notice(n));
+                                }
                             }
                             Key::Up => {
                                 match log_up_target(log.cursor, log.offset, snapshot.agents.len()) {

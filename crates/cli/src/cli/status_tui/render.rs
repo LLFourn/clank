@@ -237,7 +237,7 @@ pub(super) fn render_at(
     }
 
     let mut out: Vec<String> = Vec::with_capacity(rows);
-    out.push(bar(snap, color, cols, view.reach));
+    out.push(bar(snap, color, cols, view.reach, view.remote));
 
     // The SCROLLABLE header (everything between the pinned bar and the
     // log region), built in FULL by [`scrollable_header`] so the loop
@@ -1007,6 +1007,7 @@ pub(super) fn bar(
     color: &str,
     cols: usize,
     reach: crate::cli::status_tui::zellij::ZellijReach,
+    remote: crate::cli::status_tui::remote::Shown,
 ) -> String {
     let (left, right) = bar_text(snap);
     // The connection glyph owns the LAST cells of the bar — its own
@@ -1015,10 +1016,13 @@ pub(super) fn bar(
     // always in the same place, which is what makes it readable at a
     // glance. Measured, not assumed: `⚡` is two cells wide, and a
     // fixed two-column reservation rendered that state one column
-    // over (codex on d855068).
+    // over (codex on d855068). The remote switch sits just before it,
+    // in the same reservation, measured the same way.
     let (glyph, hue) = reach_glyph(reach);
+    let (rglyph, rhue) = remote_glyph(remote);
     let gw = display_width(glyph);
-    let reserve = gw + 1;
+    let rw = display_width(rglyph);
+    let reserve = rw + 1 + gw + 1;
     // A pane too narrow to hold the lamp AND the indicator keeps the
     // lamp: the indicator is secondary, and a bar that overflows its
     // pane is worse than one missing a glyph.
@@ -1037,12 +1041,29 @@ pub(super) fn bar(
     } else {
         format!("{left}{}", " ".repeat(inner - lw))
     };
-    // The glyph carries its OWN hue inside the reverse-video band: a
+    // Each glyph carries its OWN hue inside the reverse-video band: a
     // state colour painted over the band's colour would vanish.
     format!(
-        "\x1b[1;7;{color}m{body} \x1b[0m\x1b[1;7;{}m{glyph}\x1b[0m",
+        "\x1b[1;7;{color}m{body} \x1b[0m\x1b[1;7;{}m{rglyph}\x1b[0m\x1b[1;7;{color}m \x1b[0m\x1b[1;7;{}m{glyph}\x1b[0m",
+        rhue.sgr(),
         hue.sgr()
     )
+}
+
+/// The remote switch's glyph and hue: dim when off, the "not yet
+/// known" mark while the server is starting, lit when it listens,
+/// red when it failed — the zellij glyph's own vocabulary.
+pub(super) fn remote_glyph(
+    remote: crate::cli::status_tui::remote::Shown,
+) -> (&'static str, crate::cli::status_tui::derive::Hue) {
+    use crate::cli::status_tui::derive::Hue;
+    use crate::cli::status_tui::remote::Shown::*;
+    match remote {
+        Off => ("⌁", Hue::Indexed(63)),
+        Starting => ("·", Hue::Indexed(63)),
+        On => ("⌁", Hue::Green),
+        Failed => ("⌁", Hue::Red),
+    }
 }
 
 /// The zellij connection indicator: one glyph and the hue it reads in.
@@ -3241,6 +3262,7 @@ mod tests {
                             picker: &[],
                             log_cursor: 0,
                             reach: crate::cli::status_tui::zellij::ZellijReach::NotInSession,
+                            remote: Default::default(),
                             presence: None,
                             lift,
                         };
@@ -3280,6 +3302,7 @@ mod tests {
             picker: &[],
             log_cursor: cursor,
             reach: crate::cli::status_tui::zellij::ZellijReach::NotInSession,
+            remote: Default::default(),
             presence: None,
             lift,
         }
@@ -3494,6 +3517,7 @@ mod tests {
             log_cursor: 6,
             lift: 0,
             reach: crate::cli::status_tui::zellij::ZellijReach::NotInSession,
+            remote: Default::default(),
             presence: None,
         };
         let rule_of = |offset: usize| {
@@ -3787,14 +3811,18 @@ mod tests {
         );
     }
 
-    /// The bar text WITHOUT its reachability cell. The indicator owns
-    /// the last two columns of every bar, so lamp-layout assertions
-    /// look at everything before it.
+    /// The bar text WITHOUT its indicator cells: the reach glyph, and
+    /// the remote switch one cell before it. Lamp-layout assertions
+    /// look at everything before them.
     fn bar_body(line: &str) -> String {
         let v = visible(line);
         let (glyph, _) = reach_glyph(crate::cli::status_tui::zellij::ZellijReach::NotInSession);
+        let (remote, _) = remote_glyph(Default::default());
         v.strip_suffix(glyph)
             .unwrap_or_else(|| panic!("bar ends with the reach glyph; got `{v}`"))
+            .trim_end()
+            .strip_suffix(remote)
+            .unwrap_or_else(|| panic!("the remote switch precedes the reach glyph; got `{v}`"))
             .trim_end()
             .to_string()
     }
@@ -3815,7 +3843,7 @@ mod tests {
         ] {
             let (glyph, hue) = reach_glyph(reach);
             assert_eq!(hue, want_hue, "{reach:?} is coloured by its state");
-            let line = bar(&s, &state_color(&s).sgr(), 40, reach);
+            let line = bar(&s, &state_color(&s).sgr(), 40, reach, Default::default());
             let v = visible(&line);
             assert!(
                 v.ends_with(glyph),
@@ -3840,7 +3868,13 @@ mod tests {
         let s = snap(vec![plan_state("foo", reviewer_missing("codex"))], vec![]);
         for reach in [Connected, NotInSession, Unknown, Unreachable] {
             for cols in [4, 8, 12, 20, 40, 80] {
-                let v = visible(&bar(&s, &state_color(&s).sgr(), cols, reach));
+                let v = visible(&bar(
+                    &s,
+                    &state_color(&s).sgr(),
+                    cols,
+                    reach,
+                    Default::default(),
+                ));
                 assert_eq!(
                     display_width(&v),
                     cols,
@@ -3850,12 +3884,57 @@ mod tests {
         }
     }
 
+    /// The remote switch sits one cell before the zellij glyph, in its
+    /// own hue, in every state — and the zellij glyph stays where it
+    /// was, the bar exactly `cols` wide.
+    #[test]
+    fn the_remote_glyph_sits_before_the_zellij_glyph_in_its_own_hue() {
+        use crate::cli::status_tui::derive::Hue;
+        use crate::cli::status_tui::remote::Shown::{self, *};
+        use crate::cli::status_tui::zellij::ZellijReach::Connected;
+        let s = snap(vec![plan_state("foo", reviewer_missing("codex"))], vec![]);
+        for (remote, want_hue) in [
+            (Off, Hue::Indexed(63)),
+            (Starting, Hue::Indexed(63)),
+            (On, Hue::Green),
+            (Failed, Hue::Red),
+        ] {
+            let (glyph, hue) = remote_glyph(remote);
+            assert_eq!(hue, want_hue, "{remote:?}");
+            assert_eq!(display_width(glyph), 1, "{remote:?}: one cell, measured");
+            for cols in [8, 12, 20, 40, 80] {
+                let line = bar(&s, &state_color(&s).sgr(), cols, Connected, remote);
+                let v = visible(&line);
+                assert_eq!(display_width(&v), cols, "{remote:?} at {cols}: `{v}`");
+                assert!(
+                    v.ends_with(&format!("{glyph} ⚡")),
+                    "{remote:?} at {cols}: remote, a cell, then zellij; got `{v}`"
+                );
+                assert!(
+                    line.contains(&format!("\x1b[1;7;{}m{glyph}", hue.sgr())),
+                    "{remote:?}: its own hue: {line:?}"
+                );
+            }
+        }
+        assert_ne!(
+            remote_glyph(Shown::Off).0,
+            remote_glyph(Shown::Starting).0,
+            "starting is the not-yet-known mark, not a dim on"
+        );
+    }
+
     /// Too narrow for both: the lamp survives, the indicator yields.
     #[test]
     fn a_bar_too_narrow_for_the_indicator_keeps_the_lamp() {
         use crate::cli::status_tui::zellij::ZellijReach::Connected;
         let s = snap(vec![], vec![]);
-        let v = visible(&bar(&s, &state_color(&s).sgr(), 3, Connected));
+        let v = visible(&bar(
+            &s,
+            &state_color(&s).sgr(),
+            3,
+            Connected,
+            Default::default(),
+        ));
         assert_eq!(display_width(&v), 3);
         assert!(!v.contains('⚡'), "no room: the glyph yields, got `{v}`");
         assert!(v.starts_with("💤"), "the lamp is what remains: `{v}`");
@@ -3868,7 +3947,13 @@ mod tests {
         use crate::cli::status_tui::zellij::ZellijReach::{Connected, Unknown};
         let s = snap(vec![], vec![]);
         let (connected, _) = reach_glyph(Connected);
-        let v = visible(&bar(&s, &state_color(&s).sgr(), 40, Unknown));
+        let v = visible(&bar(
+            &s,
+            &state_color(&s).sgr(),
+            40,
+            Unknown,
+            Default::default(),
+        ));
         assert!(
             !v.contains(connected),
             "no evidence yet, so no `{connected}`; got `{v}`"
@@ -3917,7 +4002,8 @@ mod tests {
             )],
             vec![],
         );
-        let v = bar_body(&render(&s, 1, 20)[0]);
+        // 18 cells of lamp, a margin, the two indicator cells and theirs.
+        let v = bar_body(&render(&s, 1, 22)[0]);
         assert_eq!(v, "👀 CODEX reviewing", "left segment only; got `{v}`");
     }
 
@@ -4393,6 +4479,7 @@ mod tests {
                 log_cursor: 0,
                 lift: 0,
                 reach: crate::cli::status_tui::zellij::ZellijReach::NotInSession,
+                remote: Default::default(),
                 presence: None,
             },
         )
@@ -4442,6 +4529,7 @@ mod tests {
             log_cursor: 0,
             lift: 0,
             reach: crate::cli::status_tui::zellij::ZellijReach::NotInSession,
+            remote: Default::default(),
             presence: None,
         };
 
@@ -4546,6 +4634,7 @@ mod tests {
                 log_cursor: 0,
                 lift: 0,
                 reach: crate::cli::status_tui::zellij::ZellijReach::NotInSession,
+                remote: Default::default(),
                 presence: None,
             },
         )
@@ -4904,6 +4993,7 @@ mod tests {
             log_cursor: 1,
             lift: 0,
             reach: crate::cli::status_tui::zellij::ZellijReach::NotInSession,
+            remote: Default::default(),
             presence: None,
         };
         let lines = render_at(&s, 40, 80, 0, 0, &view).0;

@@ -2017,8 +2017,10 @@ fn fmt_ts(ts: i64) -> String {
         .unwrap_or_default()
 }
 
-pub(crate) fn launch_opener(path: &Path) -> anyhow::Result<()> {
-    let path_str = path.to_string_lossy().to_string();
+/// The platform's opener, as a command with nothing to open yet. The
+/// CLI runs it in the foreground; the TUI runs it off its loop with
+/// its output kept off the raw screen (codex on 1764612).
+pub(crate) fn opener() -> anyhow::Result<Command> {
     #[cfg(target_os = "macos")]
     let prog = "open";
     #[cfg(target_os = "linux")]
@@ -2027,19 +2029,21 @@ pub(crate) fn launch_opener(path: &Path) -> anyhow::Result<()> {
     let prog = "explorer";
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
-        anyhow::bail!(
-            "no known opener for this platform; open `{}` manually",
-            path_str
-        );
+        anyhow::bail!("no known opener for this platform");
     }
     #[allow(unreachable_code)]
-    {
-        let status = Command::new(prog).arg(&path_str).status()?;
-        if !status.success() {
-            anyhow::bail!("`{prog} {path_str}` exited non-zero");
-        }
-        Ok(())
+    Ok(Command::new(prog))
+}
+
+pub(crate) fn launch_opener(path: &Path) -> anyhow::Result<()> {
+    let path_str = path.to_string_lossy().to_string();
+    let mut cmd = opener().map_err(|e| anyhow::anyhow!("{e}; open `{path_str}` manually"))?;
+    let prog = cmd.get_program().to_string_lossy().into_owned();
+    let status = cmd.arg(&path_str).status()?;
+    if !status.success() {
+        anyhow::bail!("`{prog} {path_str}` exited non-zero");
     }
+    Ok(())
 }
 
 // ─────────────────────── document chrome ────────────────────

@@ -1670,6 +1670,11 @@ pub struct WebArgs {
     /// either way the listing is checked for the repo's panes.
     #[arg(long, value_name = "NAME")]
     pub session: Option<String>,
+    /// Exit when this process is gone: the status TUI that switched
+    /// this server on, so a TUI that dies without unwinding takes
+    /// the server with it
+    #[arg(long, value_name = "PID")]
+    pub attached_to: Option<u32>,
 }
 
 #[derive(Args, Debug)]

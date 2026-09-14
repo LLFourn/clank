@@ -176,7 +176,10 @@ remove), the plan and its verdicts, queued plans, and github event
 pages. `--watch` gives a live non-fullscreen view; `-j` emits JSON.
 
 Enter selects whatever the cursor is on; every screen shows its own
-keys along the bottom.
+keys along the bottom. `r` is the remote switch: it starts `clank
+web` for this repo, opens http://127.0.0.1:8088 in your browser, and
+lights the glyph beside the zellij one at the bar's right end; `r`
+again, or closing the TUI, stops the server.
 
 ## Command reference
 

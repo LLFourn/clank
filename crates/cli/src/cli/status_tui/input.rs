@@ -1307,6 +1307,8 @@ pub(super) struct PanelView<'a> {
     pub(super) lift: usize,
     /// Whether zellij answers, as the reconcile worker last saw it.
     pub(super) reach: crate::cli::status_tui::zellij::ZellijReach,
+    /// The remote switch, drawn beside the zellij glyph.
+    pub(super) remote: crate::cli::status_tui::remote::Shown,
     /// This repo's labels with a live pane, as the worker last listed
     /// them; `None` until a listing answers, or outside zellij.
     pub(super) presence: Option<std::collections::BTreeSet<String>>,
@@ -1331,6 +1333,7 @@ impl<'a> PanelView<'a> {
             log_cursor: 0,
             lift: 0,
             reach: crate::cli::status_tui::zellij::ZellijReach::NotInSession,
+            remote: Default::default(),
             presence: None,
         }
     }

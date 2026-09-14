@@ -42,6 +42,7 @@ pub(crate) fn choose_session(explicit: Option<&str>, current: Option<&str>, repo
 type Sayer = Arc<dyn Fn(&str, &str) -> anyhow::Result<()> + Send + Sync>;
 
 pub async fn run(args: WebArgs) -> anyhow::Result<()> {
+    let shutdown = Shutdown::arm(args.attached_to)?;
     let repo = resolve_repo(args.repo.as_deref())?;
     open_zellij::require_zellij()?;
     let session = choose_session(
@@ -67,10 +68,14 @@ pub async fn run(args: WebArgs) -> anyhow::Result<()> {
     let feed = Feed::new(64);
     let table = open_zellij::agent_pane_table(&panes, &repo);
     feed.panes(table.clone());
-    let subscription = Arc::new(Mutex::new(start_subscription(&session, &table, &feed)));
+    let armed = shutdown.witness();
+    let subscription = Arc::new(Mutex::new(start_subscription(
+        armed, &session, &table, &feed,
+    )));
 
     spawn_status_loop(repo.clone(), feed.clone());
     spawn_pane_poll(
+        armed,
         session.clone(),
         repo.clone(),
         feed.clone(),
@@ -95,7 +100,7 @@ pub async fn run(args: WebArgs) -> anyhow::Result<()> {
     // the process ends. The smoke test that found this left one.
     let served = tokio::select! {
         r = serve(listener, feed, sayer, &session) => r,
-        _ = shutdown_signal() => Ok(()),
+        _ = shutdown.asked() => Ok(()),
     };
     drop(
         subscription
@@ -107,33 +112,102 @@ pub async fn run(args: WebArgs) -> anyhow::Result<()> {
 }
 
 /// Ctrl-C, or SIGTERM where there is one — a pane closing, a `pkill`.
-async fn shutdown_signal() {
+/// The ways this server is asked to stop — SIGTERM, Ctrl-C, the
+/// process it is attached to going away — armed BEFORE any child of
+/// its own exists. A signal handler is installed when its stream is
+/// first created; until then SIGTERM is the default action, which
+/// runs no destructor and would leave a `zellij subscribe` streaming
+/// to nobody. So the streams are created here, first, and whatever
+/// spawns a child takes this as its witness (codex on 1764612).
+struct Shutdown {
     #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-        match signal(SignalKind::terminate()) {
-            Ok(mut term) => {
-                tokio::select! {
-                    _ = tokio::signal::ctrl_c() => {}
-                    _ = term.recv() => {}
+    term: Option<tokio::signal::unix::Signal>,
+    attached_to: Option<u32>,
+}
+
+/// Proof that [`Shutdown::arm`] has run: only it makes one, and
+/// whatever spawns a child of this server's takes one.
+#[derive(Clone, Copy)]
+struct Armed(());
+
+impl Shutdown {
+    fn witness(&self) -> Armed {
+        Armed(())
+    }
+
+    fn arm(attached_to: Option<u32>) -> anyhow::Result<Self> {
+        #[cfg(unix)]
+        let term = {
+            use tokio::signal::unix::{SignalKind, signal};
+            // A runtime without signal support still gets Ctrl-C
+            // and the attached pid; it is not a reason to refuse.
+            signal(SignalKind::terminate()).ok()
+        };
+        Ok(Self {
+            #[cfg(unix)]
+            term,
+            attached_to,
+        })
+    }
+
+    async fn asked(mut self) {
+        #[cfg(unix)]
+        let term = async {
+            match self.term.as_mut() {
+                Some(t) => {
+                    t.recv().await;
                 }
+                None => std::future::pending::<()>().await,
             }
-            Err(_) => {
-                let _ = tokio::signal::ctrl_c().await;
-            }
+        };
+        #[cfg(not(unix))]
+        let term = std::future::pending::<()>();
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term => {}
+            _ = attached_gone(self.attached_to) => {}
         }
     }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
+}
+
+/// Resolves once the process this server is attached to is gone;
+/// never, when it is attached to none. `kill(pid, 0)` rather than a
+/// parent check: the TUI spawns the server, but nothing says it stays
+/// the parent for the server's whole life.
+async fn attached_gone(pid: Option<u32>) {
+    let Some(pid) = pid else {
+        return std::future::pending().await;
+    };
+    loop {
+        if !process_exists(pid) {
+            return;
+        }
+        tokio::time::sleep(ATTACHED_POLL).await;
     }
+}
+
+const ATTACHED_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+
+fn process_exists(pid: u32) -> bool {
+    if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
+        return true;
+    }
+    // Another user's process answers EPERM and is just as alive.
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 /// Start (or restart) the one subscription child for `table`'s live
 /// panes, and the thread that reads it into the feed. The previous
 /// child, if any, is the caller's to drop — dropping kills it, and
 /// its reader thread ends on EOF.
-fn start_subscription(session: &str, table: &[PaneMeta], feed: &Feed) -> Option<SubscribeChild> {
+/// `_armed`: no child of this server's before its shutdown is armed
+/// — see [`Shutdown`].
+fn start_subscription(
+    _armed: Armed,
+    session: &str,
+    table: &[PaneMeta],
+    feed: &Feed,
+) -> Option<SubscribeChild> {
     let ids: Vec<String> = table
         .iter()
         .filter(|p| !p.exited)
@@ -439,6 +513,7 @@ fn window_turns(tool: clank_core::vocab::Tool, lines: &[String]) -> Vec<transcri
 const PANE_POLL: std::time::Duration = std::time::Duration::from_secs(4);
 
 fn spawn_pane_poll(
+    armed: Armed,
     session: String,
     repo: PathBuf,
     feed: Feed,
@@ -455,7 +530,7 @@ fn spawn_pane_poll(
             };
             let table = open_zellij::agent_pane_table(&panes, &repo);
             if feed.panes(table.clone()) == TableChange::Membership {
-                let fresh = start_subscription(&session, &table, &feed);
+                let fresh = start_subscription(armed, &session, &table, &feed);
                 *subscription.lock().unwrap_or_else(|e| e.into_inner()) = fresh;
             }
         }
@@ -649,6 +724,34 @@ mod tests {
             who: transcript::Who::Agent,
             body: transcript::Body::Text { text: id.into() },
         }
+    }
+
+    /// Attached to a process that is gone, the server ends at once;
+    /// attached to one that lives, or to none, it does not.
+    #[tokio::test]
+    async fn the_server_ends_with_the_process_it_is_attached_to() {
+        use std::time::Duration;
+        // A pid no process has: the largest macOS/Linux will hand out
+        // is far below this, and a kill(pid, 0) on it is ESRCH.
+        let gone = 4_000_000u32;
+        assert!(!process_exists(gone));
+        tokio::time::timeout(Duration::from_secs(1), attached_gone(Some(gone)))
+            .await
+            .expect("ends at once");
+        let me = std::process::id();
+        assert!(process_exists(me));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), attached_gone(Some(me)))
+                .await
+                .is_err(),
+            "still attached"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), attached_gone(None))
+                .await
+                .is_err(),
+            "attached to nothing, ends for nothing"
+        );
     }
 
     #[test]
