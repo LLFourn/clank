@@ -152,10 +152,19 @@ mod tests {
         assert!(refused.contains("Close that one"), "says what to do");
 
         drop(first);
-        assert!(
-            acquire(dir.path()).is_ok(),
-            "freed, so the next TUI may have it"
-        );
+        // Another test's child process, forked but not yet exec'd,
+        // holds a copy of the closed description and with it the
+        // lock, for the microseconds until exec closes it (CLOEXEC):
+        // twice a flake under a loaded full suite. The property is
+        // that closing frees it, not that it is free on the very next
+        // instruction.
+        let freed = (0..200).any(|_| {
+            acquire(dir.path()).is_ok() || {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                false
+            }
+        });
+        assert!(freed, "freed, so the next TUI may have it");
     }
 
     #[test]
