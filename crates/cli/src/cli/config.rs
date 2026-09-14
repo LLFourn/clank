@@ -269,6 +269,15 @@ pub struct HooksSection {
 /// caught the missing aliases on 9218aa9 — without them, a
 /// config using the legacy keys would lose its review settings
 /// after any agent-mutation round-trip.
+/// `clank web`'s remembered facts for this repo: the port it listens
+/// on, sampled from the OS the first time and kept so the URL is the
+/// same next time (a-repo-remembers-its-port).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WebSection {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ReviewSection {
     #[serde(

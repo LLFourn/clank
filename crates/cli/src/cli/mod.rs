@@ -1662,9 +1662,10 @@ pub struct WebArgs {
     /// Repo root. Defaults to the cwd's git toplevel.
     #[arg(long, value_name = "PATH")]
     pub repo: Option<PathBuf>,
-    /// Port on 127.0.0.1 to serve the page on.
-    #[arg(long, default_value_t = 8088)]
-    pub port: u16,
+    /// Listen on exactly this port; without it, the port the repo
+    /// remembers (sampled from the OS the first time)
+    #[arg(long, value_name = "PORT")]
+    pub port: Option<u16>,
     /// The zellij session holding this repo's panes. Defaults to the
     /// session this runs inside, else the one `clank open` names;
     /// either way the listing is checked for the repo's panes.

@@ -339,6 +339,8 @@ pub struct RepoConfigFile {
     pub hooks: Option<crate::cli::config::HooksSection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diff: Option<crate::cli::config::DiffConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web: Option<crate::cli::config::WebSection>,
     /// Forward-compat catchall for unknown OBJECT fields. Old-shape
     /// markers do NOT reach here: the loader's legacy-shape check
     /// fail-closes a `team`/`promoted` key (or an array `agents`)

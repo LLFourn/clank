@@ -177,10 +177,13 @@ pages. `--watch` gives a live non-fullscreen view; `-j` emits JSON.
 
 Enter selects whatever the cursor is on; every screen shows its own
 keys along the bottom. The `remote` row under the agent list is the
-switch for `clank web`: Enter starts the server for this repo, opens
-http://127.0.0.1:8088 in your browser and leaves the URL on the row
-(`o` there opens it again); Enter again, or closing the TUI, stops
-it. `r` from the log view is the same switch, and the glyph beside
+switch for `clank web`: Enter starts the server for this repo on the
+port the repo remembers — sampled from the OS the first time and
+kept in `.clank/config.json` — opens it in your browser and leaves
+the URL on the row (`o` there opens it again); Enter again, or
+closing the TUI, stops it. A server already up for the repo is
+adopted rather than duplicated; `clank web --port` still says
+exactly where. `r` from the log view is the same switch, and the glyph beside
 the zellij one at the bar's right end shows its state from any page.
 
 ## Command reference

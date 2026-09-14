@@ -2304,6 +2304,7 @@ pub(crate) async fn run_tui(
         }
         let presence = reconcile_worker.presence();
         mode = settle_detail_cursor(mode, &snapshot.agents, &presence, &mut detail_shown);
+        let remote_detail = remote.detail();
         let view = PanelView {
             wait_page: wait_page.as_ref(),
             mode,
@@ -2317,7 +2318,7 @@ pub(crate) async fn run_tui(
             // batch, the loop never waits on zellij to paint.
             reach: reconcile_worker.reach(),
             remote: remote.shown(),
-            remote_detail: remote.detail(),
+            remote_detail: remote_detail.as_deref(),
             presence,
         };
         // An overlay mounted here is drawn by the branch at the TOP of

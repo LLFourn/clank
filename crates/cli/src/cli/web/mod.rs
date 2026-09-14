@@ -65,6 +65,33 @@ pub async fn run(args: WebArgs) -> anyhow::Result<()> {
         );
     }
 
+    // The port before any child: a bind that fails returns from here
+    // with nothing to clean up. It once came after the subscription,
+    // and the error path left a `zellij subscribe` streaming to nobody
+    // — the poll task's clone of it outlived the function, and the
+    // process ended without dropping it (an occupied port, live).
+    let (listener, port) = match listen(&repo, args.port).await? {
+        Listen::Bound { listener, port } => (listener, port),
+        Listen::AlreadyOn { identity } => {
+            println!(
+                "clank web: already on http://127.0.0.1:{}  (pid {}, attached to {})",
+                identity.port,
+                identity.pid,
+                identity
+                    .attached_to
+                    .map_or("nobody".to_string(), |m| m.to_string())
+            );
+            return Ok(());
+        }
+    };
+    let identity = Identity {
+        clank: "web".to_string(),
+        repo: canonical(&repo),
+        session: session.clone(),
+        pid: std::process::id(),
+        port,
+        attached_to: args.attached_to,
+    };
     let feed = Feed::new(64);
     let table = open_zellij::agent_pane_table(&panes, &repo);
     feed.panes(table.clone());
@@ -82,12 +109,8 @@ pub async fn run(args: WebArgs) -> anyhow::Result<()> {
         subscription.clone(),
     );
 
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", args.port))
-        .await
-        .map_err(|e| anyhow::anyhow!("cannot listen on 127.0.0.1:{}: {e}", args.port))?;
     println!(
-        "clank web: http://127.0.0.1:{}  (session {session}, {} agent pane{})",
-        args.port,
+        "clank web: http://127.0.0.1:{port}  (session {session}, {} agent pane{})",
         table.len(),
         if table.len() == 1 { "" } else { "s" }
     );
@@ -100,7 +123,7 @@ pub async fn run(args: WebArgs) -> anyhow::Result<()> {
     // the process ends. The smoke test that found this left one.
     let site = site_dir(&repo);
     let served = tokio::select! {
-        r = serve(listener, feed, sayer, &session, repo.clone(), site) => r,
+        r = serve(listener, feed, sayer, &session, repo.clone(), site, identity) => r,
         _ = shutdown.asked() => Ok(()),
     };
     drop(
@@ -113,6 +136,87 @@ pub async fn run(args: WebArgs) -> anyhow::Result<()> {
 }
 
 /// Ctrl-C, or SIGTERM where there is one — a pane closing, a `pkill`.
+/// Who this server is, for whoever finds its port taken: `GET
+/// /identity`. `repo` is canonical so two spellings of one path
+/// compare equal; `attached_to` is the process it ends with.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct Identity {
+    clank: String,
+    repo: String,
+    session: String,
+    pid: u32,
+    port: u16,
+    #[serde(default)]
+    attached_to: Option<u32>,
+}
+
+fn canonical(repo: &Path) -> String {
+    repo.canonicalize()
+        .unwrap_or_else(|_| repo.to_path_buf())
+        .to_string_lossy()
+        .into_owned()
+}
+
+enum Listen {
+    Bound {
+        listener: tokio::net::TcpListener,
+        port: u16,
+    },
+    /// This repo's server is up already; nothing to start.
+    AlreadyOn { identity: Identity },
+}
+
+/// Where to listen. `explicit` means exactly that port and records
+/// nothing. Otherwise the port the repo remembers; when that will
+/// not bind, whoever holds it is asked: this repo's own server is
+/// reported as already on, anything else — another repo's, a
+/// stranger, a port that answers nothing — has the number now, so a
+/// fresh one is sampled from the OS, remembered in the repo's
+/// config, and bound (a-repo-remembers-its-port).
+async fn listen(repo: &Path, explicit: Option<u16>) -> anyhow::Result<Listen> {
+    let bind = |port: u16| tokio::net::TcpListener::bind(("127.0.0.1", port));
+    if let Some(port) = explicit {
+        let listener = bind(port)
+            .await
+            .map_err(|e| anyhow::anyhow!("cannot listen on 127.0.0.1:{port}: {e}"))?;
+        return Ok(Listen::Bound { listener, port });
+    }
+    if let Some(port) = crate::agent_store::web_port(repo)? {
+        if let Ok(listener) = bind(port).await {
+            return Ok(Listen::Bound { listener, port });
+        }
+        if let Some(identity) = identity_at(port).await
+            && identity.repo == canonical(repo)
+        {
+            return Ok(Listen::AlreadyOn { identity });
+        }
+    }
+    let listener = bind(0)
+        .await
+        .map_err(|e| anyhow::anyhow!("cannot listen on 127.0.0.1: {e}"))?;
+    let port = listener.local_addr()?.port();
+    crate::agent_store::record_web_port(repo, port)?;
+    Ok(Listen::Bound { listener, port })
+}
+
+/// Whatever answers `/identity` on `port` as a clank server, within
+/// a second; anything else is `None`.
+async fn identity_at(port: u16) -> Option<Identity> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(1))
+        .build()
+        .ok()?;
+    let identity: Identity = client
+        .get(format!("http://127.0.0.1:{port}/identity"))
+        .send()
+        .await
+        .ok()?
+        .json()
+        .await
+        .ok()?;
+    (identity.clank == "web").then_some(identity)
+}
+
 /// The ways this server is asked to stop — SIGTERM, Ctrl-C, the
 /// process it is attached to going away — armed BEFORE any child of
 /// its own exists. A signal handler is installed when its stream is
@@ -596,8 +700,13 @@ async fn serve(
     session: &str,
     repo: PathBuf,
     site: PathBuf,
+    identity: Identity,
 ) -> anyhow::Result<()> {
-    let pages = Arc::new(Pages { repo, site });
+    let pages = Arc::new(Pages {
+        repo,
+        site,
+        identity,
+    });
     let page: Arc<str> = Arc::from(PAGE.replace(
         "window.CLANK_SESSION || 'clank'",
         &format!("{}", serde_json::json!(session)),
@@ -622,10 +731,11 @@ async fn serve(
 }
 
 /// Where the site's pages come from: the built site, and the repo
-/// for a commit page the site never builds.
+/// for a commit page the site never builds — and who is serving.
 struct Pages {
     repo: PathBuf,
     site: PathBuf,
+    identity: Identity,
 }
 
 async fn route(
@@ -639,6 +749,11 @@ async fn route(
         ("GET", "/") => text(200, page.to_string(), "text/html; charset=utf-8"),
         ("GET", "/events") => events(feed),
         ("POST", "/say") => say(req, sayer).await,
+        ("GET", "/identity") => text(
+            200,
+            serde_json::to_string(&pages.identity).unwrap_or_default(),
+            "application/json",
+        ),
         ("GET", path) if path.starts_with("/html/") => site_page(pages, &path["/html/".len()..]),
         _ => text(404, "not here", "text/plain"),
     }
@@ -865,6 +980,120 @@ mod tests {
         );
     }
 
+    fn repo_with_config() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        crate::agent_store::write_typed_config(
+            &dir.path().join(".clank/config.json"),
+            &crate::cli::teams_config::RepoConfigFile::default(),
+        )
+        .unwrap();
+        dir
+    }
+
+    /// A clank identity server on `port`, answering for `repo`.
+    fn identity_server(port: u16, repo: &Path) -> (tokio::task::JoinHandle<()>, Identity) {
+        let identity = Identity {
+            clank: "web".into(),
+            repo: canonical(repo),
+            session: "s".into(),
+            pid: 777,
+            port,
+            attached_to: None,
+        };
+        let listener = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+        let site = tempfile::tempdir().unwrap();
+        let (repo, id) = (repo.to_path_buf(), identity.clone());
+        let handle = tokio::spawn(async move {
+            let _site = site;
+            let sayer: Sayer = Arc::new(|_, _| Ok(()));
+            let _ = serve(listener, Feed::new(4), sayer, "s", repo, PathBuf::new(), id).await;
+        });
+        (handle, identity)
+    }
+
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind(("127.0.0.1", 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    /// The port policy, against real listeners: nothing remembered →
+    /// one sampled and remembered; remembered and free → that one;
+    /// `--port` → exactly that, nothing remembered; remembered but a
+    /// stranger's → a fresh one, remembered in its place; remembered
+    /// and this repo's own server → already on; another repo's → a
+    /// fresh one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_repo_remembers_its_port_and_asks_who_holds_it() {
+        let repo = repo_with_config();
+        assert_eq!(crate::agent_store::web_port(repo.path()).unwrap(), None);
+        let Listen::Bound { listener, port } = listen(repo.path(), None).await.unwrap() else {
+            panic!("bound")
+        };
+        assert_eq!(
+            crate::agent_store::web_port(repo.path()).unwrap(),
+            Some(port)
+        );
+        drop(listener);
+        let Listen::Bound { port: again, .. } = listen(repo.path(), None).await.unwrap() else {
+            panic!("bound")
+        };
+        assert_eq!(again, port, "remembered, and free");
+
+        let explicit = free_port();
+        let Listen::Bound { port: told, .. } = listen(repo.path(), Some(explicit)).await.unwrap()
+        else {
+            panic!("bound")
+        };
+        assert_eq!(told, explicit);
+        assert_eq!(
+            crate::agent_store::web_port(repo.path()).unwrap(),
+            Some(port),
+            "--port remembers nothing"
+        );
+
+        // A stranger on the remembered port: not asked twice, replaced.
+        let stranger = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+        let Listen::Bound { port: fresh, .. } = listen(repo.path(), None).await.unwrap() else {
+            panic!("bound")
+        };
+        assert_ne!(fresh, port);
+        assert_eq!(
+            crate::agent_store::web_port(repo.path()).unwrap(),
+            Some(fresh)
+        );
+        drop(stranger);
+
+        // This repo's own server on the remembered port: already on.
+        let (server, identity) = identity_server(fresh, repo.path());
+        let Listen::AlreadyOn { identity: found } = listen(repo.path(), None).await.unwrap() else {
+            panic!("already on")
+        };
+        assert_eq!(found, identity);
+        assert_eq!(
+            crate::agent_store::web_port(repo.path()).unwrap(),
+            Some(fresh)
+        );
+        server.abort();
+
+        // Another repo's server on it: theirs now; a fresh one.
+        let other = repo_with_config();
+        let (server, _) = identity_server(fresh, other.path());
+        let Listen::Bound { port: moved, .. } = listen(repo.path(), None).await.unwrap() else {
+            panic!("bound")
+        };
+        assert_ne!(moved, fresh);
+        assert_eq!(
+            crate::agent_store::web_port(repo.path()).unwrap(),
+            Some(moved)
+        );
+        server.abort();
+    }
+
     /// The site's shapes and nothing else, decided on the name alone:
     /// a plan's name is whatever `PlanKey` accepts, decoded from the
     /// URL; a separator, however encoded, is not a name.
@@ -981,10 +1210,19 @@ mod tests {
         git(&["add", "readme"]);
         git(&["commit", "--quiet", "-m", "history before adoption"]);
         let old_sha = git(&["rev-parse", "HEAD"]);
+        let identity = Identity {
+            clank: "web".into(),
+            repo: canonical(repo.path()),
+            session: "clank-test".into(),
+            pid: std::process::id(),
+            port,
+            attached_to: Some(4242),
+        };
         let server = tokio::spawn({
             let feed = feed.clone();
             let (repo, site) = (repo.path().to_path_buf(), site.path().to_path_buf());
-            async move { serve(listener, feed, sayer, "clank-test", repo, site).await }
+            let identity = identity.clone();
+            async move { serve(listener, feed, sayer, "clank-test", repo, site, identity).await }
         });
         let base = format!("http://127.0.0.1:{port}");
         let client = reqwest::Client::new();
@@ -1082,6 +1320,18 @@ mod tests {
             .unwrap();
         assert_eq!(none.status(), 404);
         assert!(none.text().await.unwrap().contains("no such commit"));
+
+        // Who is serving, as JSON, for whoever finds the port taken.
+        let who: Identity = client
+            .get(format!("{base}/identity"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(who, identity);
+        assert_eq!(identity_at(port).await, Some(identity.clone()));
 
         let page = client.get(&base).send().await.unwrap();
         assert_eq!(page.status(), 200);

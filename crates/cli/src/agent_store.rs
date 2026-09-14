@@ -305,6 +305,43 @@ pub fn try_resolve_via_team_with(
 /// save` and `clank export`, which need the repo's self-contained
 /// config and must reject the legacy shape rather than silently
 /// publishing/dumping a half-parsed one.
+/// The port `clank web` listens on for this repo, if one was ever
+/// sampled and kept.
+pub fn web_port(repo: &Path) -> anyhow::Result<Option<u16>> {
+    Ok(load_repo_config_required(repo)?.web.and_then(|w| w.port))
+}
+
+/// Keep `port` as this repo's: the next `clank web` binds it rather
+/// than asking the OS again, so the URL stays what it was.
+pub fn record_web_port(repo: &Path, port: u16) -> anyhow::Result<()> {
+    let mut file = load_repo_config_required(repo)?;
+    file.web.get_or_insert_with(Default::default).port = Some(port);
+    write_typed_config(&repo.join(".clank/config.json"), &file)
+}
+
+/// Atomic write of a typed config: the whole value to a temp file
+/// beside `path`, synced, then renamed over it. The one writer for
+/// `.clank/config.json` and `~/.clank/config.json`.
+pub(crate) fn write_typed_config<T: serde::Serialize>(
+    path: &Path,
+    value: &T,
+) -> anyhow::Result<()> {
+    use std::io::Write;
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("no parent for `{}`", path.display()))?;
+    std::fs::create_dir_all(parent)?;
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".clank-config-")
+        .suffix(".json.tmp")
+        .tempfile_in(parent)?;
+    tmp.write_all(serde_json::to_string_pretty(value)?.as_bytes())?;
+    tmp.write_all(b"\n")?;
+    tmp.as_file_mut().sync_all()?;
+    tmp.persist(path).map_err(|e| e.error)?;
+    Ok(())
+}
+
 pub fn load_repo_config_required(
     repo: &Path,
 ) -> anyhow::Result<crate::cli::teams_config::RepoConfigFile> {

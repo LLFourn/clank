@@ -1721,7 +1721,7 @@ fn read_user_config(home: &Path) -> anyhow::Result<UserConfigFile> {
 /// `review`, `hooks`, and any unknown fields (via the `extra`
 /// flatten catchall on [`UserConfigFile`]).
 fn write_user_config(home: &Path, file: &UserConfigFile) -> anyhow::Result<()> {
-    write_typed_config(&home.join(".clank/config.json"), file)
+    crate::agent_store::write_typed_config(&home.join(".clank/config.json"), file)
 }
 
 /// Read `<repo>/.clank/config.json` as the typed
@@ -1747,24 +1747,7 @@ fn read_repo_config(repo: &Path) -> anyhow::Result<RepoConfigFile> {
 /// Atomic write of `<repo>/.clank/config.json`. The `extra`
 /// flatten catchall preserves unknown sections on round-trip.
 fn write_repo_config_raw(repo: &Path, file: &RepoConfigFile) -> anyhow::Result<()> {
-    write_typed_config(&repo.join(".clank/config.json"), file)
-}
-
-fn write_typed_config<T: serde::Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
-    use std::io::Write;
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("no parent for `{}`", path.display()))?;
-    std::fs::create_dir_all(parent)?;
-    let mut tmp = tempfile::Builder::new()
-        .prefix(".clank-config-")
-        .suffix(".json.tmp")
-        .tempfile_in(parent)?;
-    tmp.write_all(serde_json::to_string_pretty(value)?.as_bytes())?;
-    tmp.write_all(b"\n")?;
-    tmp.as_file_mut().sync_all()?;
-    tmp.persist(path).map_err(|e| e.error)?;
-    Ok(())
+    crate::agent_store::write_typed_config(&repo.join(".clank/config.json"), file)
 }
 
 #[cfg(test)]

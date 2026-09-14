@@ -9,8 +9,6 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-pub(super) const PORT: u16 = 8088;
-
 /// What the bar draws.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(super) enum Shown {
@@ -21,13 +19,28 @@ pub(super) enum Shown {
     Failed,
 }
 
-/// What a process reported back: the server is listening, the server
-/// is gone, the browser could not be opened.
+/// What a process reported back: the server is listening; this
+/// repo's server was already up (the launcher found it, said so and
+/// left); a process — a server, or the launcher — is gone; the
+/// browser could not be opened. An exit names its pid, so the
+/// launcher's own exit after an `already on` is not the server's.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Outcome {
-    Listening { url: String },
-    Exited { why: String },
-    BrowserFailed { why: String },
+    Listening {
+        url: String,
+    },
+    AlreadyOn {
+        url: String,
+        pid: u32,
+        attached_to: Option<u32>,
+    },
+    Exited {
+        pid: u32,
+        why: String,
+    },
+    BrowserFailed {
+        why: String,
+    },
 }
 
 /// A titled page for the operator, in the error overlay's shape.
@@ -51,6 +64,11 @@ pub(super) trait Io {
     fn terminate(&mut self, pid: u32);
     /// Open `url` in the browser; a failure arrives through `report`.
     fn open(&mut self, url: &str, report: Report);
+    /// Report `Exited` for `pid` once it is gone — for a server this
+    /// switch adopted rather than started, whose exit no `wait` of
+    /// ours will see.
+    fn watch(&mut self, pid: u32, report: Report);
+    fn alive(&self, pid: u32) -> bool;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,9 +77,12 @@ enum State {
     Starting {
         pid: u32,
     },
+    /// `owner` is the live process an already-running server follows
+    /// that is not this TUI: shown, opened, never ended from here.
     On {
         pid: u32,
         url: String,
+        owner: Option<u32>,
     },
     /// `why` stays readable on the row after the overlay is gone.
     Failed {
@@ -106,10 +127,15 @@ impl<I: Io> Remote<I> {
 
     /// What the row says beside the state: the URL when on, the
     /// reason when failed, nothing otherwise.
-    pub(super) fn detail(&self) -> Option<&str> {
+    pub(super) fn detail(&self) -> Option<String> {
         match &self.state {
-            State::On { url, .. } => Some(url),
-            State::Failed { why } => Some(why),
+            State::On {
+                url,
+                owner: Some(owner),
+                ..
+            } => Some(format!("{url}  pid {owner}'s")),
+            State::On { url, .. } => Some(url.clone()),
+            State::Failed { why } => Some(why.clone()),
             _ => None,
         }
     }
@@ -142,6 +168,12 @@ impl<I: Io> Remote<I> {
     /// something to say right away.
     pub(super) fn toggle(&mut self) -> Option<Notice> {
         match &self.state {
+            State::On {
+                owner: Some(owner), ..
+            } => Some(Notice {
+                title: "remote".to_string(),
+                message: format!("this server follows pid {owner}, not this TUI: stop it there"),
+            }),
             State::Starting { pid } | State::On { pid, .. } => {
                 let pid = *pid;
                 self.io.terminate(pid);
@@ -151,12 +183,14 @@ impl<I: Io> Remote<I> {
             State::Off | State::Failed { .. } => {
                 self.generation += 1;
                 let report = self.reporter();
+                // No `--port`: the server binds the port the repo
+                // remembers, or samples one, and reports a server
+                // already up — the switch's whole adoption path runs
+                // through that default (codex on fc1c941).
                 let argv = vec![
                     "web".to_string(),
                     "--repo".to_string(),
                     self.repo.to_string_lossy().into_owned(),
-                    "--port".to_string(),
-                    PORT.to_string(),
                     "--attached-to".to_string(),
                     std::process::id().to_string(),
                 ];
@@ -192,14 +226,44 @@ impl<I: Io> Remote<I> {
             if generation != self.generation {
                 continue;
             }
+            let held = match &self.state {
+                State::Starting { pid } | State::On { pid, .. } => Some(*pid),
+                _ => None,
+            };
             match (outcome, &self.state) {
                 (Outcome::Listening { url }, State::Starting { pid }) => {
                     let pid = *pid;
                     let report = self.reporter();
                     self.io.open(&url, report);
-                    self.state = State::On { pid, url };
+                    self.state = State::On {
+                        pid,
+                        url,
+                        owner: None,
+                    };
                 }
-                (Outcome::Exited { why }, State::Starting { .. } | State::On { .. }) => {
+                // The launcher found this repo's server up. A server
+                // following some other live process is theirs — shown,
+                // never ended from here. Any other is adopted: owned,
+                // and watched, since no `wait` of ours will see it go.
+                (
+                    Outcome::AlreadyOn {
+                        url,
+                        pid,
+                        attached_to,
+                    },
+                    State::Starting { .. },
+                ) => {
+                    let me = std::process::id();
+                    let owner = attached_to.filter(|m| *m != me && self.io.alive(*m));
+                    if owner.is_none() {
+                        let report = self.reporter();
+                        self.io.watch(pid, report);
+                    }
+                    let report = self.reporter();
+                    self.io.open(&url, report);
+                    self.state = State::On { pid, url, owner };
+                }
+                (Outcome::Exited { pid, why }, _) if held == Some(pid) => {
                     notices.push(Notice {
                         title: "remote off".to_string(),
                         message: format!("clank web ended: {why}"),
@@ -221,10 +285,42 @@ impl<I: Io> Remote<I> {
 
 impl<I: Io> Drop for Remote<I> {
     fn drop(&mut self) {
-        if let State::Starting { pid } | State::On { pid, .. } = &self.state {
-            self.io.terminate(*pid);
+        match &self.state {
+            State::On { owner: Some(_), .. } => {}
+            State::Starting { pid } | State::On { pid, .. } => self.io.terminate(*pid),
+            _ => {}
         }
     }
+}
+
+/// `clank web: already on <url>  (pid <n>, attached to <m>|nobody)`,
+/// as the launcher prints it.
+fn parse_already_on(rest: &str) -> Option<Outcome> {
+    let rest = rest.strip_prefix("already on ")?;
+    let url = rest.split_whitespace().next()?.to_string();
+    let inside = rest.split_once('(')?.1.strip_suffix(')')?;
+    let (pid, attached) = inside.split_once(',')?;
+    let pid: u32 = pid.trim().strip_prefix("pid ")?.trim().parse().ok()?;
+    let attached = attached.trim().strip_prefix("attached to ")?.trim();
+    let attached_to = match attached {
+        "nobody" => None,
+        m => Some(m.parse().ok()?),
+    };
+    Some(Outcome::AlreadyOn {
+        url,
+        pid,
+        attached_to,
+    })
+}
+
+/// How often an adopted server is looked for.
+const WATCH_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+
+fn process_exists(pid: u32) -> bool {
+    if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 /// The real processes: a program run as `clank web`, SIGTERM, the
@@ -325,6 +421,10 @@ impl Io for Processes {
             drop(tail_tx);
         }
         let report = Arc::new(Mutex::new(report));
+        // The exit report waits for the reader too: the launcher's
+        // `already on` line must land before the launcher's exit, or
+        // the exit would be taken for the server's.
+        let (read_tx, read_rx) = std::sync::mpsc::channel::<()>();
         if let Some(stdout) = stdout {
             let report = report.clone();
             std::thread::spawn(move || {
@@ -332,18 +432,30 @@ impl Io for Processes {
                     .lines()
                     .map_while(Result::ok)
                 {
-                    if let Some(rest) = line.strip_prefix("clank web: ")
-                        && let Some(url) = rest.split_whitespace().next()
-                    {
-                        (report.lock().unwrap_or_else(|e| e.into_inner()))(Outcome::Listening {
-                            url: url.to_string(),
-                        });
+                    let Some(rest) = line.strip_prefix("clank web: ") else {
+                        continue;
+                    };
+                    let outcome = match parse_already_on(rest) {
+                        Some(o) => Some(o),
+                        None => rest
+                            .split_whitespace()
+                            .next()
+                            .map(|url| Outcome::Listening {
+                                url: url.to_string(),
+                            }),
+                    };
+                    if let Some(o) = outcome {
+                        (report.lock().unwrap_or_else(|e| e.into_inner()))(o);
                     }
                 }
+                let _ = read_tx.send(());
             });
+        } else {
+            drop(read_tx);
         }
         std::thread::spawn(move || {
             let status = child.wait();
+            let _ = read_rx.recv_timeout(STDERR_GRACE);
             let stderr = tail_rx
                 .recv_timeout(STDERR_GRACE)
                 .map(|t| t.trim().to_string())
@@ -356,9 +468,25 @@ impl Io for Processes {
             } else {
                 stderr
             };
-            (report.lock().unwrap_or_else(|e| e.into_inner()))(Outcome::Exited { why });
+            (report.lock().unwrap_or_else(|e| e.into_inner()))(Outcome::Exited { pid, why });
         });
         Ok(pid)
+    }
+
+    fn watch(&mut self, pid: u32, mut report: Report) {
+        std::thread::spawn(move || {
+            while process_exists(pid) {
+                std::thread::sleep(WATCH_POLL);
+            }
+            report(Outcome::Exited {
+                pid,
+                why: "the server is gone".to_string(),
+            });
+        });
+    }
+
+    fn alive(&self, pid: u32) -> bool {
+        process_exists(pid)
     }
 
     fn terminate(&mut self, pid: u32) {
@@ -422,6 +550,9 @@ mod tests {
         opened: Vec<String>,
         reports: Vec<Report>,
         open_reports: Vec<Report>,
+        watched: Vec<u32>,
+        watch_reports: Vec<Report>,
+        alive: Vec<u32>,
         refuse_start: Option<String>,
     }
 
@@ -444,6 +575,15 @@ mod tests {
                 why: why.to_string(),
             });
         }
+        /// The `n`th watched pid is gone.
+        fn watched_gone(&self, n: usize) {
+            let mut log = self.log();
+            let pid = log.watched[n];
+            (log.watch_reports[n])(Outcome::Exited {
+                pid,
+                why: "the server is gone".into(),
+            });
+        }
     }
 
     impl Io for Fake {
@@ -463,6 +603,14 @@ mod tests {
             let mut log = self.log();
             log.opened.push(url.to_string());
             log.open_reports.push(report);
+        }
+        fn watch(&mut self, pid: u32, report: Report) {
+            let mut log = self.log();
+            log.watched.push(pid);
+            log.watch_reports.push(report);
+        }
+        fn alive(&self, pid: u32) -> bool {
+            self.log().alive.contains(&pid)
         }
     }
 
@@ -499,12 +647,12 @@ mod tests {
                 "web",
                 "--repo",
                 "/r",
-                "--port",
-                "8088",
                 "--attached-to",
                 &std::process::id().to_string()
-            ]
+            ],
+            "no --port: the repo's remembered port, and the already-on path, are the server's default"
         );
+        assert!(!argv.iter().any(|a| a == "--port"));
         assert!(r.drain().is_empty(), "nothing to say before the child does");
         assert_eq!(r.detail(), None);
         fake.child_says(0, listening());
@@ -514,7 +662,7 @@ mod tests {
             "listening is said by the row, not an overlay"
         );
         assert_eq!(r.shown(), Shown::On);
-        assert_eq!(r.detail(), Some("http://127.0.0.1:8088"));
+        assert_eq!(r.detail().as_deref(), Some("http://127.0.0.1:8088"));
         assert_eq!(fake.log().opened, vec!["http://127.0.0.1:8088"]);
         assert_eq!(fake.log().started.len(), 1);
         // `o` on the row: the browser goes there again; off, nothing.
@@ -535,6 +683,7 @@ mod tests {
         fake.child_says(
             0,
             Outcome::Exited {
+                pid: 1001,
                 why: "cannot listen on 127.0.0.1:8088: address in use".into(),
             },
         );
@@ -543,7 +692,7 @@ mod tests {
         assert!(notices[0].message.contains("address in use"), "{notices:?}");
         assert_eq!(r.shown(), Shown::Failed);
         assert_eq!(
-            r.detail(),
+            r.detail().as_deref(),
             Some("cannot listen on 127.0.0.1:8088: address in use"),
             "the reason stays on the row"
         );
@@ -563,7 +712,7 @@ mod tests {
         let notice = r.toggle().expect("a reason");
         assert!(notice.message.contains("current_exe failed"));
         assert_eq!(r.shown(), Shown::Failed);
-        assert_eq!(r.detail(), Some("current_exe failed"));
+        assert_eq!(r.detail().as_deref(), Some("current_exe failed"));
     }
 
     /// On → off ends the child by TERM; so does dropping the switch
@@ -601,6 +750,7 @@ mod tests {
         fake.child_says(
             0,
             Outcome::Exited {
+                pid: 1001,
                 why: "terminated".into(),
             },
         );
@@ -650,6 +800,113 @@ mod tests {
         assert!(r.drain().is_empty());
     }
 
+    fn already_on(attached_to: Option<u32>) -> Outcome {
+        Outcome::AlreadyOn {
+            url: "http://127.0.0.1:53210".into(),
+            pid: 777,
+            attached_to,
+        }
+    }
+
+    /// The launcher found this repo's server up and left: the switch
+    /// is on with THAT pid, the URL shown and opened, the pid watched;
+    /// the launcher's own exit is not the server's; the watcher
+    /// saying the pid is gone is; Enter and drop end the adopted pid.
+    #[test]
+    fn a_server_already_up_is_adopted_watched_and_owned() {
+        let fake = Fake::default();
+        let (mut r, _) = remote(&fake);
+        r.toggle();
+        fake.child_says(0, already_on(None));
+        fake.child_says(
+            0,
+            Outcome::Exited {
+                pid: 1001,
+                why: "exit status: 0".into(),
+            },
+        );
+        assert!(r.drain().is_empty());
+        assert_eq!(
+            r.shown(),
+            Shown::On,
+            "the launcher's exit is not the server's"
+        );
+        assert_eq!(r.detail().as_deref(), Some("http://127.0.0.1:53210"));
+        assert_eq!(fake.log().opened, vec!["http://127.0.0.1:53210"]);
+        assert_eq!(fake.log().watched, vec![777]);
+
+        fake.watched_gone(0);
+        let notices = r.drain();
+        assert_eq!(r.shown(), Shown::Failed);
+        assert!(
+            notices[0].message.contains("the server is gone"),
+            "{notices:?}"
+        );
+        assert_eq!(r.detail().as_deref(), Some("the server is gone"));
+
+        // Adopted again: Enter ends it, and so would leaving.
+        r.toggle();
+        fake.child_says(1, already_on(Some(std::process::id())));
+        r.drain();
+        assert_eq!(r.shown(), Shown::On, "attached to this TUI is ours");
+        assert_eq!(r.toggle(), None);
+        assert_eq!(fake.log().terminated, vec![777]);
+        r.toggle();
+        fake.child_says(2, already_on(None));
+        r.drain();
+        drop(r);
+        assert_eq!(fake.log().terminated, vec![777, 777]);
+    }
+
+    /// A server following another LIVE process is somebody else's:
+    /// shown with the owner, opened, not watched, and neither Enter
+    /// nor leaving ends it. Attached to a dead pid, it is adopted.
+    #[test]
+    fn a_server_following_another_live_process_is_shown_not_owned() {
+        let fake = Fake::default();
+        fake.log().alive = vec![4242];
+        let (mut r, _) = remote(&fake);
+        r.toggle();
+        fake.child_says(0, already_on(Some(4242)));
+        assert!(r.drain().is_empty());
+        assert_eq!(r.shown(), Shown::On);
+        assert_eq!(
+            r.detail().as_deref(),
+            Some("http://127.0.0.1:53210  pid 4242's")
+        );
+        assert_eq!(fake.log().opened.len(), 1);
+        assert!(fake.log().watched.is_empty(), "not ours to watch");
+        let refused = r.toggle().expect("says whose it is");
+        assert!(refused.message.contains("4242"), "{refused:?}");
+        assert_eq!(r.shown(), Shown::On);
+        drop(r);
+        assert!(fake.log().terminated.is_empty(), "never ended from here");
+
+        let (mut r, _) = remote(&fake);
+        r.toggle();
+        fake.child_says(1, already_on(Some(9999)));
+        r.drain();
+        assert_eq!(fake.log().watched, vec![777], "a dead owner: adopted");
+    }
+
+    /// The launcher's line, as the server prints it.
+    #[test]
+    fn the_already_on_line_is_read_whole() {
+        assert_eq!(
+            parse_already_on("already on http://127.0.0.1:53210  (pid 777, attached to nobody)"),
+            Some(already_on(None))
+        );
+        assert_eq!(
+            parse_already_on("already on http://127.0.0.1:53210  (pid 777, attached to 4242)"),
+            Some(already_on(Some(4242)))
+        );
+        assert_eq!(
+            parse_already_on("http://127.0.0.1:53210  (session s)"),
+            None
+        );
+        assert_eq!(parse_already_on("already on http://x (pid seven)"), None);
+    }
+
     fn outcomes_of(processes: &mut Processes) -> (u32, std::sync::mpsc::Receiver<Outcome>) {
         let (tx, rx) = std::sync::mpsc::channel();
         let pid = processes
@@ -682,8 +939,25 @@ mod tests {
         p.terminate(pid);
         assert!(matches!(
             rx.recv_timeout(WAIT).unwrap(),
-            Outcome::Exited { .. }
+            Outcome::Exited { pid: p, .. } if p == pid
         ));
+    }
+
+    /// The launcher's line through the real reader, and its own exit
+    /// after it — in that order, whatever the threads' timing.
+    #[test]
+    fn an_already_on_line_lands_before_the_launchers_exit() {
+        for _ in 0..5 {
+            let mut p = Processes::shell(
+                "echo 'clank web: already on http://127.0.0.1:53210  (pid 777, attached to nobody)'",
+            );
+            let (pid, rx) = outcomes_of(&mut p);
+            assert_eq!(rx.recv_timeout(WAIT).unwrap(), already_on(None));
+            assert!(matches!(
+                rx.recv_timeout(WAIT).unwrap(),
+                Outcome::Exited { pid: p, .. } if p == pid
+            ));
+        }
     }
 
     /// A child whose own child outlives it, holding its pipes, is
@@ -695,7 +969,7 @@ mod tests {
         let started = std::time::Instant::now();
         let (_, rx) = outcomes_of(&mut p);
         match rx.recv_timeout(WAIT).unwrap() {
-            Outcome::Exited { why } => assert!(why == "held" || why.contains('2'), "{why}"),
+            Outcome::Exited { why, .. } => assert!(why == "held" || why.contains('2'), "{why}"),
             other => panic!("{other:?}"),
         }
         assert!(
@@ -710,17 +984,18 @@ mod tests {
     #[test]
     fn a_childs_last_words_are_its_reason() {
         let mut p = Processes::shell("echo 'cannot listen: address in use' >&2; exit 1");
-        let (_, rx) = outcomes_of(&mut p);
+        let (pid, rx) = outcomes_of(&mut p);
         assert_eq!(
             rx.recv_timeout(WAIT).unwrap(),
             Outcome::Exited {
+                pid,
                 why: "cannot listen: address in use".into()
             }
         );
         let mut p = Processes::shell("exit 3");
         let (_, rx) = outcomes_of(&mut p);
         match rx.recv_timeout(WAIT).unwrap() {
-            Outcome::Exited { why } => assert!(why.contains('3'), "{why}"),
+            Outcome::Exited { why, .. } => assert!(why.contains('3'), "{why}"),
             other => panic!("{other:?}"),
         }
     }
@@ -735,7 +1010,7 @@ mod tests {
         );
         let (_, rx) = outcomes_of(&mut p);
         match rx.recv_timeout(WAIT).unwrap() {
-            Outcome::Exited { why } => {
+            Outcome::Exited { why, .. } => {
                 assert!(
                     why.ends_with("ligne 299 ééééééééééééééééééééééééééééééé"),
                     "{why}"
