@@ -1016,22 +1016,20 @@ pub(super) fn bar(
     remote: crate::cli::status_tui::remote::Shown,
 ) -> String {
     let (left, right) = bar_text(snap);
-    // The connection glyph owns the LAST cells of the bar — its own
-    // display width plus one column of margin — so the lamp text never
-    // overwrites it and it never displaces the lamp: reachability is
-    // always in the same place, which is what makes it readable at a
-    // glance. Measured, not assumed: `⚡` is two cells wide, and a
-    // fixed two-column reservation rendered that state one column
-    // over (codex on d855068). The remote switch sits just before it,
-    // in the same reservation, measured the same way.
-    let (glyph, hue) = reach_glyph(reach);
-    let (rglyph, rhue) = remote_glyph(remote);
-    let gw = display_width(glyph);
-    let rw = display_width(rglyph);
-    let reserve = rw + 1 + gw + 1;
-    // A pane too narrow to hold the lamp AND the indicator keeps the
-    // lamp: the indicator is secondary, and a bar that overflows its
-    // pane is worse than one missing a glyph.
+    // The instruments own the LAST cells of the bar — their width plus
+    // a margin each side — so the lamp text never overwrites them and
+    // they never displace the lamp: always in the same place, which is
+    // what makes them readable at a glance. Measured, not assumed
+    // (codex on d855068).
+    let items = cluster(reach, remote);
+    let reserve = items
+        .iter()
+        .map(|(text, _)| display_width(text) + 1)
+        .sum::<usize>()
+        + 1;
+    // A pane too narrow to hold the lamp AND the instruments keeps the
+    // lamp: the instruments are secondary, and a bar that overflows
+    // its pane is worse than one missing them.
     if cols < reserve + 1 {
         let left = truncate_to(&left, cols);
         let pad = cols.saturating_sub(display_width(&left));
@@ -1047,13 +1045,53 @@ pub(super) fn bar(
     } else {
         format!("{left}{}", " ".repeat(inner - lw))
     };
-    // Each glyph carries its OWN hue inside the reverse-video band: a
-    // state colour painted over the band's colour would vanish.
-    format!(
-        "\x1b[1;7;{color}m{body} \x1b[0m\x1b[1;7;{}m{rglyph}\x1b[0m\x1b[1;7;{color}m \x1b[0m\x1b[1;7;{}m{glyph}\x1b[0m",
-        rhue.sgr(),
-        hue.sgr()
-    )
+    // The instruments sit on a band of their own colour, each in its
+    // own hue as a FOREGROUND: a hue painted as a background was a
+    // patch on the lamp, and a hue matching the lamp's would vanish
+    // (lloyd on 49f522f).
+    let mut band = format!("\x1b[0;{BAND_BG}m ");
+    for (text, hue) in &items {
+        band.push_str(&format!("\x1b[1;{}m{text}\x1b[0;{BAND_BG}m ", hue.sgr()));
+    }
+    format!("\x1b[1;7;{color}m{body}\x1b[0m{band}\x1b[0m")
+}
+
+/// The instruments' band: a dark gray no state colour is.
+const BAND_BG: &str = "48;5;238";
+
+/// The instruments, left to right, each with the hue it reads in.
+/// zellij speaks only when something is wrong — not in a session, or
+/// one that does not answer — with the one word that names what to
+/// do; connected, or not yet known, says nothing. The remote is one
+/// icon, coloured by its state: `☁` is text-presentation, one cell,
+/// not an emoji.
+pub(super) fn cluster(
+    reach: crate::cli::status_tui::zellij::ZellijReach,
+    remote: crate::cli::status_tui::remote::Shown,
+) -> Vec<(String, crate::cli::status_tui::derive::Hue)> {
+    use crate::cli::status_tui::derive::Hue;
+    use crate::cli::status_tui::zellij::ZellijReach;
+    let mut items = Vec::new();
+    if matches!(reach, ZellijReach::NotInSession | ZellijReach::Unreachable) {
+        items.push(("! zellij".to_string(), Hue::Red));
+    }
+    items.push((REMOTE_ICON.to_string(), remote_hue(remote)));
+    items
+}
+
+pub(super) const REMOTE_ICON: &str = "☁";
+
+pub(super) fn remote_hue(
+    remote: crate::cli::status_tui::remote::Shown,
+) -> crate::cli::status_tui::derive::Hue {
+    use crate::cli::status_tui::derive::Hue;
+    use crate::cli::status_tui::remote::Shown::*;
+    match remote {
+        Off => Hue::Indexed(245),
+        Starting => Hue::Yellow,
+        On => Hue::Green,
+        Failed => Hue::Red,
+    }
 }
 
 /// The remote row under the agents: the bar's glyph in the bar's
@@ -1065,11 +1103,12 @@ pub(super) fn remote_row(
 ) -> Vec<Span> {
     use crate::cli::status_tui::remote::Shown::*;
     use crate::cli::status_tui::text::Style;
-    let (glyph, _) = remote_glyph(remote);
+    let glyph = REMOTE_ICON;
     let style = match remote {
         On => Style::Color("32"),
         Failed => Style::Color("31"),
-        Off | Starting => Style::Dim,
+        Starting => Style::Color("33"),
+        Off => Style::Dim,
     };
     // The reason is the server's stderr tail — lines, and whatever
     // control bytes it printed; the overlay shows it whole, the row
@@ -1089,49 +1128,6 @@ pub(super) fn remote_row(
         plain(" remote".to_string()),
         dim(format!("  {said}")),
     ]
-}
-
-/// The remote switch's glyph and hue: dim when off, the "not yet
-/// known" mark while the server is starting, lit when it listens,
-/// red when it failed — the zellij glyph's own vocabulary.
-pub(super) fn remote_glyph(
-    remote: crate::cli::status_tui::remote::Shown,
-) -> (&'static str, crate::cli::status_tui::derive::Hue) {
-    use crate::cli::status_tui::derive::Hue;
-    use crate::cli::status_tui::remote::Shown::*;
-    match remote {
-        Off => ("⌁", Hue::Indexed(63)),
-        Starting => ("·", Hue::Indexed(63)),
-        On => ("⌁", Hue::Green),
-        Failed => ("⌁", Hue::Red),
-    }
-}
-
-/// The zellij connection indicator: one glyph and the hue it reads in.
-///
-/// Three states because they call for different things from the
-/// operator — outside a session `clank open` STARTS one; inside a
-/// session that does not answer, zellij itself is the problem, and
-/// that case otherwise reads as "clank did nothing".
-pub(super) fn reach_glyph(
-    reach: crate::cli::status_tui::zellij::ZellijReach,
-) -> (&'static str, crate::cli::status_tui::derive::Hue) {
-    use crate::cli::status_tui::derive::Hue;
-    use crate::cli::status_tui::zellij::ZellijReach::*;
-    // No circles: `○`/`◉` were the rejected focus vocabulary, and the
-    // frame is guarded against them reappearing anywhere
-    // (`focus_is_shown_by_the_item_band_not_a_section_highlight`). A
-    // reachability glyph that reads as a selection marker would be
-    // worse than none.
-    match reach {
-        Connected => ("⚡", Hue::Green),
-        NotInSession => ("–", Hue::Indexed(63)),
-        // Space is reserved, the cell is drawn, and nothing is claimed:
-        // an empty indicator says "not yet known", where any glyph
-        // would say something the process has no evidence for.
-        Unknown => ("·", Hue::Indexed(63)),
-        Unreachable => ("✗", Hue::Red),
-    }
 }
 
 /// Bar text: (left = who + verb, right = where). Every state
@@ -3855,50 +3851,54 @@ mod tests {
         );
     }
 
-    /// The bar text WITHOUT its indicator cells: the reach glyph, and
-    /// the remote switch one cell before it. Lamp-layout assertions
-    /// look at everything before them.
+    /// The bar text WITHOUT its instruments band: the cloud, and the
+    /// zellij warning before it when there is one. Lamp-layout
+    /// assertions look at everything before them.
     fn bar_body(line: &str) -> String {
-        let v = visible(line);
-        let (glyph, _) = reach_glyph(crate::cli::status_tui::zellij::ZellijReach::NotInSession);
-        let (remote, _) = remote_glyph(Default::default());
-        v.strip_suffix(glyph)
-            .unwrap_or_else(|| panic!("bar ends with the reach glyph; got `{v}`"))
-            .trim_end()
-            .strip_suffix(remote)
-            .unwrap_or_else(|| panic!("the remote switch precedes the reach glyph; got `{v}`"))
+        let v = visible_untrimmed(line);
+        let body = v
+            .strip_suffix(&format!(" {REMOTE_ICON} "))
+            .unwrap_or_else(|| panic!("bar ends with the instruments band; got `{v}`"));
+        body.strip_suffix(" ! zellij")
+            .unwrap_or(body)
             .trim_end()
             .to_string()
     }
 
-    /// All three reachability states render, each in its own hue, and
-    /// the indicator is where the operator will look for it: the
-    /// bar's last cell, regardless of state.
+    /// zellij is silent when connected or not yet known, and says
+    /// `! zellij` in red — the word that names what to do — when not
+    /// in a session or in one that does not answer. The instruments
+    /// sit on their own gray band, in their own FOREGROUND hues: the
+    /// bar's colour never reaches them, and no hue is a background.
     #[test]
-    fn the_bar_shows_every_reach_state_in_its_own_hue() {
-        use crate::cli::status_tui::derive::Hue;
+    fn zellij_speaks_only_when_disconnected_on_the_bands_own_gray() {
         use crate::cli::status_tui::zellij::ZellijReach::*;
         let s = snap(vec![], vec![]);
-        for (reach, want_hue) in [
-            (Connected, Hue::Green),
-            (NotInSession, Hue::Indexed(63)),
-            (Unknown, Hue::Indexed(63)),
-            (Unreachable, Hue::Red),
+        let color = state_color(&s).sgr();
+        for (reach, warns) in [
+            (Connected, false),
+            (Unknown, false),
+            (NotInSession, true),
+            (Unreachable, true),
         ] {
-            let (glyph, hue) = reach_glyph(reach);
-            assert_eq!(hue, want_hue, "{reach:?} is coloured by its state");
-            let line = bar(&s, &state_color(&s).sgr(), 40, reach, Default::default());
-            let v = visible(&line);
+            let line = bar(&s, &color, 40, reach, Default::default());
+            let v = visible_untrimmed(&line);
+            assert_eq!(v.contains("! zellij"), warns, "{reach:?}: `{v}`");
+            assert!(v.ends_with(&format!("{REMOTE_ICON} ")), "{reach:?}: `{v}`");
+            if warns {
+                assert!(
+                    line.contains("\x1b[1;31m! zellij"),
+                    "{reach:?}: red, as a foreground: {line:?}"
+                );
+            }
+            let band = &line[line.find(BAND_BG).expect("the band opens with its gray")..];
             assert!(
-                v.ends_with(glyph),
-                "{reach:?}: the glyph is the bar's last cell; got `{v}`"
+                !band.contains(&format!("7;{color}")),
+                "{reach:?}: the bar's colour stops at the band: {band:?}"
             );
-            // The glyph carries its OWN colour: the bar is reverse-video
-            // in the state colour, and a glyph painted in that same
-            // colour would vanish into the band.
             assert!(
-                line.contains(&format!("\x1b[1;7;{}m{glyph}", hue.sgr())),
-                "{reach:?}: glyph opens its own SGR in its own hue: {line:?}"
+                !band.contains(";7;"),
+                "{reach:?}: nothing reversed on the band"
             );
         }
     }
@@ -3912,7 +3912,7 @@ mod tests {
         let s = snap(vec![plan_state("foo", reviewer_missing("codex"))], vec![]);
         for reach in [Connected, NotInSession, Unknown, Unreachable] {
             for cols in [4, 8, 12, 20, 40, 80] {
-                let v = visible(&bar(
+                let v = visible_untrimmed(&bar(
                     &s,
                     &state_color(&s).sgr(),
                     cols,
@@ -3944,17 +3944,17 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         for (remote, detail, want) in [
-            (Off, None, "⌁  remote  off"),
-            (Starting, None, "·  remote  starting…"),
+            (Off, None, "☁  remote  off"),
+            (Starting, None, "☁  remote  starting…"),
             (
                 On,
                 Some("http://127.0.0.1:8088"),
-                "⌁  remote  http://127.0.0.1:8088",
+                "☁  remote  http://127.0.0.1:8088",
             ),
             (
                 Failed,
                 Some("address in use"),
-                "⌁  remote  failed — address in use",
+                "☁  remote  failed — address in use",
             ),
         ] {
             let lines = texts(remote, detail);
@@ -3986,47 +3986,40 @@ mod tests {
                 !shown.chars().any(|c| c.is_control()),
                 "{selected}: {shown:?}"
             );
-            assert_eq!(shown.trim_end(), "⌁  remote  failed — cannot start here");
+            assert_eq!(shown.trim_end(), "☁  remote  failed — cannot start here");
         }
     }
 
-    /// The remote switch sits one cell before the zellij glyph, in its
-    /// own hue, in every state — and the zellij glyph stays where it
-    /// was, the bar exactly `cols` wide.
+    /// The remote is one icon in its state's hue, the last thing on the
+    /// bar, the bar exactly `cols` wide around it.
     #[test]
-    fn the_remote_glyph_sits_before_the_zellij_glyph_in_its_own_hue() {
+    fn the_cloud_is_coloured_by_the_remotes_state() {
         use crate::cli::status_tui::derive::Hue;
-        use crate::cli::status_tui::remote::Shown::{self, *};
+        use crate::cli::status_tui::remote::Shown::*;
         use crate::cli::status_tui::zellij::ZellijReach::Connected;
         let s = snap(vec![plan_state("foo", reviewer_missing("codex"))], vec![]);
-        for (remote, want_hue) in [
-            (Off, Hue::Indexed(63)),
-            (Starting, Hue::Indexed(63)),
+        assert_eq!(display_width(REMOTE_ICON), 1, "one cell, measured");
+        for (remote, want) in [
+            (Off, Hue::Indexed(245)),
+            (Starting, Hue::Yellow),
             (On, Hue::Green),
             (Failed, Hue::Red),
         ] {
-            let (glyph, hue) = remote_glyph(remote);
-            assert_eq!(hue, want_hue, "{remote:?}");
-            assert_eq!(display_width(glyph), 1, "{remote:?}: one cell, measured");
+            assert_eq!(remote_hue(remote), want, "{remote:?}");
             for cols in [8, 12, 20, 40, 80] {
                 let line = bar(&s, &state_color(&s).sgr(), cols, Connected, remote);
-                let v = visible(&line);
+                let v = visible_untrimmed(&line);
                 assert_eq!(display_width(&v), cols, "{remote:?} at {cols}: `{v}`");
                 assert!(
-                    v.ends_with(&format!("{glyph} ⚡")),
-                    "{remote:?} at {cols}: remote, a cell, then zellij; got `{v}`"
+                    v.ends_with(&format!(" {REMOTE_ICON} ")),
+                    "{remote:?}: `{v}`"
                 );
                 assert!(
-                    line.contains(&format!("\x1b[1;7;{}m{glyph}", hue.sgr())),
-                    "{remote:?}: its own hue: {line:?}"
+                    line.contains(&format!("\x1b[1;{}m{REMOTE_ICON}", want.sgr())),
+                    "{remote:?}: its own hue as a foreground: {line:?}"
                 );
             }
         }
-        assert_ne!(
-            remote_glyph(Shown::Off).0,
-            remote_glyph(Shown::Starting).0,
-            "starting is the not-yet-known mark, not a dim on"
-        );
     }
 
     /// Too narrow for both: the lamp survives, the indicator yields.
@@ -4042,48 +4035,11 @@ mod tests {
             Default::default(),
         ));
         assert_eq!(display_width(&v), 3);
-        assert!(!v.contains('⚡'), "no room: the glyph yields, got `{v}`");
-        assert!(v.starts_with("💤"), "the lamp is what remains: `{v}`");
-    }
-
-    /// The pre-observation frame must not LOOK connected. The
-    /// connected glyph is the one claim that needs evidence.
-    #[test]
-    fn unknown_never_renders_the_connected_glyph() {
-        use crate::cli::status_tui::zellij::ZellijReach::{Connected, Unknown};
-        let s = snap(vec![], vec![]);
-        let (connected, _) = reach_glyph(Connected);
-        let v = visible(&bar(
-            &s,
-            &state_color(&s).sgr(),
-            40,
-            Unknown,
-            Default::default(),
-        ));
         assert!(
-            !v.contains(connected),
-            "no evidence yet, so no `{connected}`; got `{v}`"
+            !v.contains(REMOTE_ICON),
+            "no room: the instruments yield, got `{v}`"
         );
-    }
-
-    /// The three states are three different glyphs. A single glyph
-    /// coloured three ways is invisible on a monochrome terminal, and
-    /// "not in a session" and "in a session that does not answer" call
-    /// for different actions.
-    #[test]
-    fn reach_states_are_distinguishable_without_colour() {
-        use crate::cli::status_tui::zellij::ZellijReach::*;
-        let glyphs: std::collections::HashSet<&str> =
-            [Connected, NotInSession, Unknown, Unreachable]
-                .into_iter()
-                .map(|r| reach_glyph(r).0)
-                .collect();
-        assert_eq!(glyphs.len(), 4, "each state has its own glyph");
-        // The rejected focus vocabulary must not come back as a
-        // reachability marker (`focus_is_shown_by_the_item_band…`).
-        for g in &glyphs {
-            assert!(!matches!(*g, "○" | "◉" | "▌"), "not a circle or rail: {g}");
-        }
+        assert!(v.starts_with("💤"), "the lamp is what remains: `{v}`");
     }
 
     #[test]
@@ -4108,8 +4064,10 @@ mod tests {
             )],
             vec![],
         );
-        // 18 cells of lamp, a margin, the two indicator cells and theirs.
-        let v = bar_body(&render(&s, 1, 22)[0]);
+        // 18 cells of lamp, then the band: a margin, `! zellij` (the
+        // test view is outside a session), a margin, the cloud, a
+        // margin.
+        let v = bar_body(&render(&s, 1, 30)[0]);
         assert_eq!(v, "👀 CODEX reviewing", "left segment only; got `{v}`");
     }
 
