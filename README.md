@@ -115,7 +115,9 @@ from the roster: when the roster changes — an agent added, removed or
 promoted — the running `clank status --tui` applies the recomposed
 layout to the live tab (zellij 0.45's `override-layout`), so alt+[ /
 alt+] flip the CURRENT roster's arrangement, not the one from when
-the session was opened.
+the session was opened. The layout also hands Alt+arrows to the
+agents — codex edits its last message on Alt+Up — so in a clank
+session focus moves on Alt+h/j/k/l, in every mode.
 
 (`clank agent start <label>` launches ONE agent — resuming its session
 if it has one, or starting a fresh one if it doesn't. `clank open` is

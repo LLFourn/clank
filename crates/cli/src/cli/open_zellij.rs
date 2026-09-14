@@ -351,9 +351,7 @@ fn compose_multitab(tabs: &[TabSpec], term: (u16, u16)) -> anyhow::Result<String
     s.push_str("}\n");
     // Fail loudly if we somehow produced invalid KDL rather than handing
     // zellij a broken layout.
-    s.parse::<kdl::KdlDocument>()
-        .map_err(|e| anyhow::anyhow!("composed multi-tab layout is invalid KDL: {e}"))?;
-    Ok(s)
+    with_pane_keys(&s)
 }
 
 /// Open (or, inside a session, idempotently ensure) the agent
@@ -688,19 +686,110 @@ fn compose_kdl(
         ReviewerStack::Roster(reviewers),
         orientation,
     );
-    match user_template {
+    let composed = match user_template {
         // User templates: unchanged marker contract — the detected
         // orientation's group, NO swap blocks (swap_tiled_layout is
         // a layout-root construct; splicing it into arbitrary user
         // templates is fragile — template authors write their own
         // swaps).
-        Some(t) => substitute_marker(t, &agents),
+        Some(t) => substitute_marker(t, &agents)?,
         None => {
             let built_in = BUILT_IN_TEMPLATE.replace("__TAB__", &kdl_escape(tab_name));
             let base = substitute_marker(&built_in, &agents)?;
             // BOTH orientations ship as swap variants so alt+[ /
             // alt+] flips the arrangement at runtime.
-            add_swap_variants(&base, repo_path, master)
+            add_swap_variants(&base, repo_path, master)?
+        }
+    };
+    with_pane_keys(&composed)
+}
+
+/// Keys zellij binds to pane focus by default (beside `Alt h/j/k/l`)
+/// that the programs in clank's panes need for themselves: codex
+/// edits its previous message on Alt+Up.
+const PANE_KEYS: [&str; 4] = ["Alt Up", "Alt Down", "Alt Left", "Alt Right"];
+
+/// The layout with its first root `keybinds` node unbinding
+/// [`PANE_KEYS`] in its first global `unbind`, creating either when
+/// absent and leaving everything else as written. zellij reads only
+/// that first node and that first `unbind` (zellij-utils
+/// `kdl/mod.rs:5002` and `:4738` at ff0925f), so a second block would
+/// be ignored for a template carrying its own; and the global unbind
+/// is applied after every bind block, so nothing else in the node can
+/// rebind the keys (codex on 5262fa7). The result is re-parsed before
+/// it is handed back: a layout zellij cannot read must fail here, not
+/// at `clank open`.
+fn with_pane_keys(kdl: &str) -> anyhow::Result<String> {
+    let mut doc: kdl::KdlDocument = kdl
+        .parse()
+        .map_err(|e: kdl::KdlError| anyhow::anyhow!("composed layout is not valid KDL: {e}"))?;
+    ensure_pane_keys(&mut doc);
+    let out = doc.to_string();
+    out.parse::<kdl::KdlDocument>().map_err(|e| {
+        anyhow::anyhow!("layout is not valid KDL after merging the pane keys: {e}\n{out}")
+    })?;
+    Ok(out)
+}
+
+fn ensure_pane_keys(doc: &mut kdl::KdlDocument) {
+    let nodes = doc.nodes_mut();
+    let keybinds = match nodes.iter().position(|n| n.name().value() == "keybinds") {
+        Some(i) => &mut nodes[i],
+        None => {
+            // Parsed whole: kdl keeps the whitespace a node was parsed
+            // with and gives a built one none. A template's last node
+            // may end at EOF, or with `;`, with no newline of its own
+            // for this one to follow (codex on 9081ceb).
+            let fresh: kdl::KdlDocument =
+                "keybinds {\n    unbind\n}\n".parse().expect("literal KDL");
+            let mut node = fresh.nodes()[0].clone();
+            let ended = nodes
+                .last()
+                .and_then(|n| n.trailing())
+                .is_some_and(|t| t.ends_with('\n'));
+            if !nodes.is_empty() && !ended {
+                node.set_leading("\n");
+            }
+            nodes.push(node);
+            nodes.last_mut().expect("just pushed")
+        }
+    };
+    let children = keybinds
+        .children_mut()
+        .get_or_insert_with(|| {
+            let mut block = kdl::KdlDocument::new();
+            block.set_leading("");
+            block.set_trailing("");
+            block
+        })
+        .nodes_mut();
+    let unbind = match children.iter().position(|n| n.name().value() == "unbind") {
+        Some(i) => &mut children[i],
+        None => {
+            // The node ends itself: whatever follows — a child on the
+            // next line, one on the same line, or the closing brace
+            // — owes it no newline (codex on 49fc3d8). The child it
+            // displaces from the front gives up the one newline it
+            // opened with, so the pretty case stays pretty.
+            let mut fresh = kdl::KdlNode::new("unbind");
+            fresh.set_leading("\n    ");
+            fresh.set_trailing("\n");
+            if let Some(next) = children.first_mut()
+                && let Some(rest) = next.leading().and_then(|l| l.strip_prefix('\n'))
+            {
+                next.set_leading(rest.to_string());
+            }
+            children.insert(0, fresh);
+            &mut children[0]
+        }
+    };
+    for key in PANE_KEYS {
+        let present = unbind
+            .entries()
+            .iter()
+            .any(|e| e.name().is_none() && e.value().as_string() == Some(key));
+        if !present {
+            unbind.push(kdl::KdlEntry::new(key));
         }
     }
 }
@@ -3326,6 +3415,184 @@ ttys004   zellij attach clank-foo
         let kdl = compose_kdl(TEST_TAB, TEST_REPO, "m", &[], Some(template), LAND).unwrap();
         assert!(!kdl.contains(AGENTS_MARKER));
         assert!(kdl.contains("name=\"m (master)\""));
+    }
+
+    /// (how many root `keybinds` nodes, the first one's first global
+    /// `unbind`'s keys)
+    fn pane_keys_of(kdl: &str) -> (usize, Vec<String>) {
+        let doc: kdl::KdlDocument = kdl.parse().unwrap();
+        let count = doc
+            .nodes()
+            .iter()
+            .filter(|n| n.name().value() == "keybinds")
+            .count();
+        let keys = doc
+            .get("keybinds")
+            .and_then(|k| k.children())
+            .and_then(|c| c.get("unbind"))
+            .map(|u| {
+                u.entries()
+                    .iter()
+                    .filter_map(|e| e.value().as_string().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        (count, keys)
+    }
+
+    fn pane_keys() -> Vec<String> {
+        PANE_KEYS.iter().map(|k| k.to_string()).collect()
+    }
+
+    /// Every layout clank creates a session with unbinds the four
+    /// Alt+arrows, so they reach the agent in the pane; the `layout`
+    /// node comes first and is as it was.
+    #[test]
+    fn every_composed_layout_unbinds_the_pane_keys() {
+        let kdl = compose_kdl(TEST_TAB, TEST_REPO, "m", &[], None, LAND).unwrap();
+        assert_eq!(pane_keys_of(&kdl), (1, pane_keys()), "{kdl}");
+        assert!(kdl.ends_with(BLOCK), "{kdl}");
+        let doc: kdl::KdlDocument = kdl.parse().unwrap();
+        assert_eq!(doc.nodes()[0].name().value(), "layout");
+        let swaps = doc.nodes()[0]
+            .children()
+            .unwrap()
+            .nodes()
+            .iter()
+            .filter(|n| n.name().value() == "swap_tiled_layout")
+            .count();
+        assert_eq!(swaps, 2);
+
+        let tabs = vec![TabSpec {
+            name: "main".into(),
+            repo_path: "/repo".into(),
+            master: "alice".into(),
+            reviewers: vec!["bob".into()],
+        }];
+        let kdl = compose_multitab(&tabs, LANDSCAPE).unwrap();
+        assert_eq!(pane_keys_of(&kdl), (1, pane_keys()), "{kdl}");
+        assert!(kdl.starts_with("layout {"));
+        assert!(kdl.ends_with(BLOCK), "{kdl}");
+    }
+
+    const BLOCK: &str =
+        "}\nkeybinds {\n    unbind \"Alt Up\" \"Alt Down\" \"Alt Left\" \"Alt Right\"\n}\n";
+
+    /// A template with its own `keybinds` keeps it: zellij reads only
+    /// the first such node and its first global `unbind`, so the keys
+    /// go INTO those — other unbinds, modes, binds and
+    /// `clear-defaults` as written, and the marker still substituted.
+    #[test]
+    fn a_templates_own_keybinds_are_merged_not_shadowed() {
+        let template = r##"keybinds clear-defaults=true {
+    unbind "Ctrl q"
+    locked {
+        bind "Alt Up" { MoveFocus "Up"; }
+    }
+    unbind "Ctrl w"
+}
+layout {
+    clank_agents
+}
+"##;
+        let kdl = compose_kdl(TEST_TAB, TEST_REPO, "m", &[], Some(template), LAND).unwrap();
+        let mut want = vec!["Ctrl q".to_string()];
+        want.extend(pane_keys());
+        assert_eq!(pane_keys_of(&kdl), (1, want), "{kdl}");
+        assert!(kdl.contains("keybinds clear-defaults=true {"), "{kdl}");
+        assert!(
+            kdl.contains("bind \"Alt Up\" { MoveFocus \"Up\"; }"),
+            "{kdl}"
+        );
+        assert!(kdl.contains("unbind \"Ctrl w\"\n"), "{kdl}");
+        assert!(kdl.contains("name=\"m (master)\""));
+    }
+
+    /// A template whose `keybinds` has modes but no global `unbind`
+    /// gets one, first; the modes are as written.
+    #[test]
+    fn a_templates_keybinds_without_a_global_unbind_gets_one() {
+        let template = r##"layout {
+    clank_agents
+}
+keybinds {
+    normal {
+        bind "Ctrl x" { Quit; }
+    }
+}
+"##;
+        let kdl = compose_kdl(TEST_TAB, TEST_REPO, "m", &[], Some(template), LAND).unwrap();
+        assert_eq!(pane_keys_of(&kdl), (1, pane_keys()), "{kdl}");
+        let doc: kdl::KdlDocument = kdl.parse().unwrap();
+        let children = doc.get("keybinds").unwrap().children().unwrap().nodes();
+        assert_eq!(children[0].name().value(), "unbind");
+        assert_eq!(children.len(), 2, "{kdl}");
+        assert!(
+            kdl.contains(
+                "keybinds {\n    unbind \"Alt Up\" \"Alt Down\" \"Alt Left\" \"Alt Right\"\n    normal {\n        bind \"Ctrl x\" { Quit; }\n    }\n}\n"
+            ),
+            "{kdl}"
+        );
+    }
+
+    /// Already unbinding the four is nothing to change: byte for byte.
+    #[test]
+    fn a_template_already_unbinding_the_keys_is_unchanged() {
+        let text = "layout {\n    pane\n}\nkeybinds {\n    unbind \"Alt Up\" \"Alt Down\" \"Alt Left\" \"Alt Right\" \"Ctrl q\"\n}\n";
+        assert_eq!(with_pane_keys(text).unwrap(), text);
+    }
+
+    /// The appended `keybinds` separates itself from a template's
+    /// last node, which may end at EOF or with `;` and no newline
+    /// (codex on 9081ceb); one that ends with a newline gets no blank
+    /// line.
+    #[test]
+    fn an_appended_keybinds_needs_no_newline_from_the_template() {
+        for template in [
+            "layout {\n    pane\n}",
+            "layout { pane; }",
+            "layout { pane; };",
+            "layout {\n    pane\n} // the end",
+        ] {
+            let out = with_pane_keys(template).unwrap();
+            assert_eq!(pane_keys_of(&out), (1, pane_keys()), "{template:?}\n{out}");
+            let doc: kdl::KdlDocument = out.parse().unwrap();
+            assert_eq!(doc.nodes()[0].name().value(), "layout", "{out}");
+        }
+        assert_eq!(
+            with_pane_keys("layout {\n    pane\n}").unwrap(),
+            "layout {\n    pane\n}\nkeybinds {\n    unbind \"Alt Up\" \"Alt Down\" \"Alt Left\" \"Alt Right\"\n}\n"
+        );
+        assert_eq!(
+            with_pane_keys("layout {\n    pane\n}\n").unwrap(),
+            "layout {\n    pane\n}\nkeybinds {\n    unbind \"Alt Up\" \"Alt Down\" \"Alt Left\" \"Alt Right\"\n}\n"
+        );
+    }
+
+    /// The inserted `unbind` ends itself: an empty block, a block
+    /// whose children sit on one line, and a bare node all come back
+    /// as KDL zellij can read, with what they had (codex on 49fc3d8).
+    #[test]
+    fn an_inserted_unbind_needs_no_newline_from_its_neighbours() {
+        for (template, keeps) in [
+            ("layout {\n    pane\n}\nkeybinds {}\n", ""),
+            ("layout {\n    pane\n}\nkeybinds {\n}\n", ""),
+            (
+                "layout {\n    pane\n}\nkeybinds { normal { bind \"Ctrl x\" { Quit; }; }; }\n",
+                "bind \"Ctrl x\" { Quit; }",
+            ),
+            ("layout {\n    pane\n}\nkeybinds\n", ""),
+        ] {
+            let out = with_pane_keys(template).unwrap();
+            assert_eq!(pane_keys_of(&out), (1, pane_keys()), "{template:?}\n{out}");
+            assert!(out.contains(keeps), "{template:?}\n{out}");
+            let doc: kdl::KdlDocument = out.parse().unwrap();
+            assert_eq!(doc.nodes()[0].name().value(), "layout");
+        }
+        assert_eq!(
+            with_pane_keys("layout {\n    pane\n}\nkeybinds {}\n").unwrap(),
+            "layout {\n    pane\n}\nkeybinds {\n    unbind \"Alt Up\" \"Alt Down\" \"Alt Left\" \"Alt Right\"\n}\n"
+        );
     }
 
     #[test]
