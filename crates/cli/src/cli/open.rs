@@ -845,6 +845,7 @@ mod tests {
                 id: clank_core::ids::SessionId::parse(id).unwrap(),
                 tool,
                 updated_at: "2026-08-03T00:00:00Z".to_string(),
+                transcript: None,
             }),
             ..Default::default()
         }

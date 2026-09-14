@@ -48,6 +48,7 @@ fn bind_session(env: &TestEnv, label: &str, tool: clank_core::vocab::Tool, id: &
             id: clank_core::ids::SessionId::parse(id).unwrap(),
             tool,
             updated_at: "2026-06-10T12:00:00Z".to_string(),
+            transcript: None,
         }),
         wait_events: Vec::new(),
     };
@@ -298,6 +299,7 @@ fn fork_from_worktree_lands_sibling_under_main_not_nested() {
                 id: clank_core::ids::SessionId::parse(id).unwrap(),
                 tool,
                 updated_at: "2026-06-17T00:00:00Z".to_string(),
+                transcript: None,
             }),
             wait_events: Vec::new(),
         };

@@ -131,6 +131,7 @@ mod tests {
                 id: sid(id),
                 tool,
                 updated_at: "2026-05-23T00:00:00+00:00".into(),
+                transcript: None,
             }),
             ..Default::default()
         }

@@ -15,334 +15,443 @@
     --edge: #302d29;
     --ink: #e8e4dc;
     --muted: #8a857c;
-    --amber: #e0a458;
+    --hue: #5f5fff;
     --mono: ui-monospace, Menlo, "SF Mono", Consolas, monospace;
     --plate: "Martian Mono", var(--mono);
   }
   * { box-sizing: border-box; }
   html, body { height: 100%; margin: 0; }
   body {
-    background: var(--base);
-    color: var(--ink);
-    font: 14px/1.4 var(--mono);
-    display: flex;
-    flex-direction: column;
+    background: var(--base); color: var(--ink);
+    font: 14px/1.45 var(--mono);
+    display: grid;
+    grid-template-rows: auto auto auto 1fr auto;
+    grid-template-columns: 1fr;
+    grid-template-areas: "top" "floor" "track" "agent" "say";
     overflow: hidden;
   }
+  button { font: inherit; color: inherit; background: none; border: 0; cursor: pointer; padding: 0; text-align: left; }
+  button:focus-visible { outline: 2px solid var(--hue); outline-offset: -2px; }
 
-  /* The session name: the quietest thing on the page. */
-  .session {
-    padding: 8px 14px 4px;
-    color: var(--muted);
-    font-size: 12px;
-    display: flex;
-    justify-content: space-between;
-    gap: 12px;
+  .top {
+    grid-area: top;
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 8px 14px 4px; color: var(--muted); font-size: 12px;
   }
-  .session .live { color: var(--muted); }
-  .session .live.off { color: var(--amber); }
+  .top .live.off { color: var(--hue); }
+  .top .menu { padding: 4px 8px; }
 
-  /* Channel strips: one per agent, and the strip is the tab. */
-  .strips {
-    display: flex;
-    overflow-x: auto;
-    scrollbar-width: none;
-    background: var(--bezel);
-    border-top: 1px solid var(--edge);
-    border-bottom: 1px solid var(--edge);
+  /* The floor: whose turn it is, said once, large. */
+  .floor {
+    grid-area: floor;
+    padding: 6px 14px 12px;
+    font-size: 15px; line-height: 1.35;
+    min-height: 3.2em;
   }
-  .strips::-webkit-scrollbar { display: none; }
-  .strip {
-    flex: 0 0 auto;
-    min-width: 132px;
-    padding: 10px 14px 9px;
-    border-right: 1px solid var(--edge);
-    border-bottom: 3px solid transparent;
-    cursor: pointer;
-    user-select: none;
-    text-align: left;
-    background: none;
-    color: inherit;
-    font: inherit;
-  }
-  .strip:focus-visible { outline: 2px solid var(--amber); outline-offset: -2px; }
-  .strip.on { border-bottom-color: var(--ink); }
-  .strip .name {
-    font-family: var(--plate);
-    font-weight: 700;
-    font-size: 17px;
-    letter-spacing: -0.01em;
-    line-height: 1.1;
-  }
-  .strip .role { color: var(--muted); font-size: 12px; margin-top: 3px; }
-  .strip .verb { font-size: 12px; margin-top: 6px; min-height: 1.4em; color: var(--muted); }
-  .strip .verb .dot {
-    display: inline-block; width: 7px; height: 7px; border-radius: 50%;
-    background: var(--amber); margin-right: 6px; vertical-align: 1px;
+  .floor .who { font-family: var(--plate); font-weight: 700; font-size: 22px; color: var(--hue); letter-spacing: -0.01em; }
+  .floor .verb { font-style: italic; }
+  .floor .obj { color: var(--ink); }
+  .floor .since { font-family: var(--plate); font-weight: 700; font-size: 22px; margin-left: 10px; color: var(--ink); }
+  .floor .dot {
+    display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+    background: var(--hue); margin-right: 8px; vertical-align: 3px;
     animation: breathe 2.4s ease-in-out infinite;
   }
-  .strip.working .verb { color: var(--ink); }
-  .strip.closed { opacity: 0.45; }
+  /* One line, however long the question: the full text is in the
+     ledger. An unbounded ask here once grew the header until the
+     agent view had no height left (codex on 056a342). */
+  .floor .ask { display: block; color: var(--ink); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 4px; max-width: 100%; }
   @keyframes breathe { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
-  @media (prefers-reduced-motion: reduce) { .strip .verb .dot { animation: none; } }
+  @media (prefers-reduced-motion: reduce) { .floor .dot { animation: none; } }
 
-  /* One pane at a time; the pane keeps its desktop size and the
-     viewport scrolls and pinches around it. */
-  .stage { flex: 1 1 auto; position: relative; overflow: hidden; }
-  .pane {
-    position: absolute; inset: 0;
-    overflow: auto;
-    -webkit-overflow-scrolling: touch;
-    touch-action: pan-x pan-y pinch-zoom;
-    padding: 6px 0 0 6px;
-    display: none;
+  /* The track: the cycle's positions, master first. */
+  .track {
+    grid-area: track;
+    display: flex; overflow-x: auto; scrollbar-width: none;
+    background: var(--bezel); border-top: 1px solid var(--edge); border-bottom: 1px solid var(--edge);
   }
-  .pane.on { display: block; }
-  .pane .term { width: max-content; }
-  .pane .gone {
-    position: absolute; inset: 0; display: none; align-items: center; justify-content: center;
-    color: var(--muted); background: color-mix(in srgb, var(--base) 70%, transparent);
+  .track::-webkit-scrollbar { display: none; }
+  .pos {
+    flex: 0 0 auto; min-width: 140px; padding: 9px 14px 8px;
+    border-right: 1px solid var(--edge); border-bottom: 3px solid transparent;
+    transition: border-color 200ms;
   }
-  .pane.closed .gone { display: flex; }
-  .empty {
-    position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
-    color: var(--muted); padding: 24px; text-align: center;
-  }
+  .pos.on { border-bottom-color: var(--ink); }
+  .pos .name { font-family: var(--plate); font-weight: 700; font-size: 16px; line-height: 1.1; }
+  .pos .name .dot { display: none; width: 7px; height: 7px; border-radius: 50%; background: var(--hue); margin-left: 8px; vertical-align: 2px; animation: breathe 2.4s ease-in-out infinite; }
+  .pos.holds .name .dot { display: inline-block; }
+  .pos .role, .pos .last { color: var(--muted); font-size: 12px; margin-top: 3px; white-space: nowrap; }
 
-  /* The TUI's lamp line, verbatim, in the TUI's hue. */
-  .lamp {
-    padding: 6px 14px;
-    background: var(--bezel);
-    border-top: 1px solid var(--edge);
-    font-size: 13px;
-    display: flex; gap: 14px;
-    white-space: nowrap; overflow: hidden;
+  /* One agent. */
+  .agent { grid-area: agent; display: grid; grid-template-rows: auto 1fr; min-height: 0; }
+  .head {
+    display: flex; align-items: baseline; gap: 14px;
+    padding: 8px 14px; border-bottom: 1px solid var(--edge);
   }
-  .lamp .text { font-weight: 700; }
-  .lamp .plan { color: var(--muted); overflow: hidden; text-overflow: ellipsis; }
+  .head .name { font-family: var(--plate); font-weight: 700; font-size: 15px; }
+  .head .modes { margin-left: auto; display: flex; gap: 12px; font-size: 13px; }
+  .head .modes button { color: var(--muted); padding: 2px 0; border-bottom: 2px solid transparent; }
+  .head .modes button.on { color: var(--ink); border-bottom-color: var(--ink); }
+  .head .modes button:disabled { opacity: 0.4; cursor: default; }
+  .head .why { color: var(--muted); font-size: 12px; }
+  .views { position: relative; min-height: 0; }
+  .view { position: absolute; inset: 0; overflow: auto; display: none; }
+  .view.on { display: block; }
+  .empty { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: var(--muted); padding: 24px; text-align: center; }
+
+  /* Transcript: turns in a column, a gutter that says who and when. */
+  .turns { padding: 10px 14px 14px; max-width: 86ch; }
+  .turn { display: grid; grid-template-columns: 8ch 1fr; gap: 0 12px; padding: 6px 0; align-items: baseline; }
+  .turn .gutter { color: var(--muted); font-size: 12px; line-height: 1.6; }
+  .turn .gutter .who { display: block; }
+  .turn.person .gutter .who { color: var(--ink); }
+  .turn .text { white-space: pre-wrap; overflow-wrap: anywhere; }
+  .turn.harness .text { color: var(--muted); font-size: 12px; }
+  .turn.thinking .text, .turn .tool .in, .turn .tool .out { color: var(--muted); }
+  .turn details summary { cursor: pointer; list-style: none; color: var(--muted); }
+  .turn details summary::-webkit-details-marker { display: none; }
+  .turn details summary::before { content: "▸ "; }
+  .turn details[open] summary::before { content: "▾ "; }
+  .turn .tool .name { color: var(--ink); }
+  .turn pre { margin: 6px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; max-height: 40vh; overflow: auto; }
+  .turn pre[hidden] { display: none; }
+
+  /* Terminal: the pane at its desktop size, in a scroller. */
+  .terminal { -webkit-overflow-scrolling: touch; touch-action: pan-x pan-y pinch-zoom; padding: 6px 0 0 6px; }
+  .terminal .term { width: max-content; }
+  .terminal .gone { position: absolute; inset: 0; display: none; align-items: center; justify-content: center; color: var(--muted); background: color-mix(in srgb, var(--base) 70%, transparent); }
+  .terminal.closed .gone { display: flex; }
 
   /* Say something. */
-  .say {
-    display: flex; gap: 8px;
-    padding: 8px 10px calc(8px + env(safe-area-inset-bottom));
-    background: var(--bezel);
-    border-top: 1px solid var(--edge);
-  }
-  .say input {
-    flex: 1 1 auto; min-width: 0;
-    background: var(--base); color: var(--ink);
-    border: 1px solid var(--edge); border-radius: 4px;
-    padding: 9px 10px; font: 15px var(--mono);
-  }
-  .say input:focus { outline: 2px solid var(--amber); outline-offset: -1px; border-color: transparent; }
-  .say button {
-    background: var(--amber); color: var(--base);
-    border: 0; border-radius: 4px; padding: 0 16px;
-    font: 700 14px var(--mono); cursor: pointer;
-  }
-  .say button:disabled { opacity: 0.4; cursor: default; }
+  .say { grid-area: say; display: flex; gap: 8px; padding: 8px 10px calc(8px + env(safe-area-inset-bottom)); background: var(--bezel); border-top: 1px solid var(--edge); }
+  .say input { flex: 1 1 auto; min-width: 0; background: var(--base); color: var(--ink); border: 1px solid var(--edge); border-radius: 4px; padding: 9px 10px; font: 15px var(--mono); }
+  .say input:focus { outline: 2px solid var(--hue); outline-offset: -1px; border-color: transparent; }
+  .say button.send { background: var(--hue); color: var(--base); border-radius: 4px; padding: 0 16px; font-weight: 700; }
+  .say button.send:disabled { opacity: 0.4; cursor: default; }
   .say .sent { color: var(--muted); font-size: 12px; align-self: center; min-width: 4ch; }
 
-  .pane .head { display: none; }
+  /* The ledger: a drawer on a phone, a column on a desk. */
+  .ledger { display: none; background: var(--bezel); border-left: 1px solid var(--edge); overflow: auto; font-size: 13px; }
+  .ledger.open { display: block; position: fixed; inset: 0; z-index: 2; border: 0; }
+  .ledger .close { display: block; padding: 10px 14px; color: var(--muted); }
+  .ledger .facts { padding: 6px 14px 10px; border-bottom: 1px solid var(--edge); }
+  .ledger .facts .plan { font-family: var(--plate); font-weight: 700; }
+  .ledger .facts .gate { color: var(--hue); }
+  .ledger .facts .line { color: var(--muted); font-size: 12px; margin-top: 2px; }
+  .ledger .block { padding: 8px 14px; border-bottom: 1px solid var(--edge); white-space: pre-wrap; }
+  .ledger .rows { padding: 6px 0; }
+  .row { display: grid; grid-template-columns: 1fr auto; gap: 8px; padding: 2px 14px; white-space: nowrap; overflow: hidden; }
+  .row .main { overflow: hidden; text-overflow: ellipsis; }
+  .row .age { color: var(--muted); font-size: 12px; }
+  .row.header .main { font-weight: 700; padding-top: 6px; }
+  .row .glyph { display: inline-block; width: 1.5em; }
+  .row .sha, .row .author { color: var(--muted); }
+  .row.review .glyph { color: var(--hue); }
+  .row.notice .main { color: var(--muted); }
 
-  /* Wide: every pane at once, each under its own strip — and that
-     strip is the selector here, since the top row is gone. */
   @media (min-width: 960px) {
-    .strips { display: none; }
-    .stage { display: flex; overflow-x: auto; }
-    .stage > .pane, .stage > .pane.on {
-      position: static; display: flex; flex-direction: column;
-      flex: 1 0 auto; min-width: 0; border-right: 1px solid var(--edge);
+    body {
+      grid-template-columns: 1fr 38ch;
+      grid-template-areas: "top ledger" "floor ledger" "track ledger" "agent ledger" "say ledger";
     }
-    .pane .head { display: block; width: 100%; border-right: 0; }
-    .pane .term { flex: 1 1 auto; overflow: auto; }
-    .pane.on .head { border-bottom-color: var(--ink); }
+    .top .menu { display: none; }
+    .ledger { display: block; grid-area: ledger; }
+    .ledger .close { display: none; }
   }
 </style>
 </head>
 <body>
-  <div class="session"><span id="session">clank</span><span class="live" id="live">connecting</span></div>
-  <div class="strips" id="strips" role="tablist"></div>
-  <div class="stage" id="stage"><div class="empty" id="empty">No agent panes in this session yet.</div></div>
-  <div class="lamp"><span class="text" id="lamp"></span><span class="plan" id="plan"></span></div>
+  <div class="top">
+    <span id="session">clank</span>
+    <span><span class="live" id="live">connecting</span> <button class="menu" id="menu" aria-label="Open the ledger">≡</button></span>
+  </div>
+  <div class="floor" id="floor"></div>
+  <div class="track" id="track" role="tablist"></div>
+  <div class="agent">
+    <div class="head">
+      <span class="name" id="agentname"></span>
+      <span class="why" id="why"></span>
+      <span class="modes">
+        <button id="mode-transcript" data-mode="transcript">transcript</button>
+        <button id="mode-terminal" data-mode="terminal">terminal</button>
+      </span>
+    </div>
+    <div class="views" id="views"><div class="empty" id="empty">No agents in this session yet.</div></div>
+  </div>
   <form class="say" id="say">
-    <input id="text" autocomplete="off" placeholder="Say something" aria-label="Say something to the selected agent">
-    <button id="send" type="submit" disabled>Send</button>
+    <input id="text" autocomplete="off" placeholder="Say something" aria-label="Say something to the shown agent">
+    <button class="send" id="send" type="submit" disabled>Send</button>
     <span class="sent" id="sent"></span>
   </form>
+  <aside class="ledger" id="ledger">
+    <button class="close" id="close">close</button>
+    <div class="facts" id="facts"></div>
+    <div id="blocks"></div>
+    <div class="rows" id="rows"></div>
+  </aside>
 
 <script>
 (() => {
-  const strips = document.getElementById('strips');
-  const stage = document.getElementById('stage');
-  const empty = document.getElementById('empty');
-  const lampEl = document.getElementById('lamp');
-  const planEl = document.getElementById('plan');
-  const liveEl = document.getElementById('live');
-  const form = document.getElementById('say');
-  const input = document.getElementById('text');
-  const send = document.getElementById('send');
-  const sentEl = document.getElementById('sent');
-
-  // pane id → { meta, strip, pane, term, el, closed }
-  const panes = new Map();
-  let selected = null;
-  // label → strip facts from the status feed
-  let facts = { strips: [], lamp: '', plan: '', hue: '' };
+  const $ = (id) => document.getElementById(id);
+  const floorEl = $('floor'), trackEl = $('track'), viewsEl = $('views'), emptyEl = $('empty');
+  const nameEl = $('agentname'), whyEl = $('why'), liveEl = $('live');
+  const modeBtns = { transcript: $('mode-transcript'), terminal: $('mode-terminal') };
+  const form = $('say'), input = $('text'), send = $('send'), sentEl = $('sent');
+  const ledgerEl = $('ledger');
 
   // The TUI's coarse ladder: seconds under a minute read `now`.
-  const coarse = (secs) => {
-    const s = Math.max(0, secs);
-    if (s < 60) return 'now';
-    if (s < 3600) return Math.floor(s / 60) + 'm';
-    if (s < 86400) return Math.floor(s / 3600) + 'h';
-    return Math.floor(s / 86400) + 'd';
-  };
+  const coarse = (secs) => { const s = Math.max(0, secs); if (s < 60) return 'now'; if (s < 3600) return Math.floor(s / 60) + 'm'; if (s < 86400) return Math.floor(s / 3600) + 'h'; return Math.floor(s / 86400) + 'd'; };
   const now = () => Math.floor(Date.now() / 1000);
+  const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
-  function select(id) {
-    selected = id;
-    for (const [pid, p] of panes) {
-      const on = pid === id;
-      p.strip.classList.toggle('on', on);
-      p.strip.setAttribute('aria-selected', on ? 'true' : 'false');
-      p.pane.classList.toggle('on', on);
-      const head = p.pane.querySelector('.head');
-      head.classList.toggle('on', on);
-      head.setAttribute('aria-selected', on ? 'true' : 'false');
+  // ---- state ----
+  let facts = null;                         // the status frame's facts
+  const panes = new Map();                  // pane id → { meta, closed }
+  const paneOf = new Map();                 // label → pane id
+  const agents = new Map();                 // label → { session, generation, turns[] }  (mirrors PageModel)
+  const views = new Map();                  // label → { transcript: el, terminal: el, term }
+  let selected = null;
+  const modes = JSON.parse(localStorage.getItem('clank.modes') || '{}');
+
+  // ---- the reducer the server tests (feed.rs PageModel) ----
+  function applyTurns(d) {
+    agents.set(d.agent, { session: d.session, generation: d.generation, turns: d.turns.slice() });
+    if (d.agent === selected) paintTranscript(d.agent);
+  }
+  function applyTurn(d) {
+    const w = agents.get(d.agent);
+    if (!w || w.session !== d.session || w.generation !== d.generation) return;
+    const i = w.turns.findIndex((t) => t.id === d.turn.id);
+    if (i >= 0) w.turns[i] = d.turn; else w.turns.push(d.turn);
+    if (w.turns.length > 200) w.turns.splice(0, w.turns.length - 200);
+    if (d.agent === selected) paintTranscript(d.agent);
+  }
+
+  // ---- the floor ----
+  function paintFloor() {
+    if (!facts) return;
+    const f = facts.floor;
+    document.documentElement.style.setProperty('--hue', f.hue || '#5f5fff');
+    let html;
+    if (f.ask) {
+      html = `<span class="who">you</span> <span class="verb">are asked</span><span class="ask">${esc(f.ask)}</span>`;
+    } else if (f.correction) {
+      html = `<span class="who">${esc(facts.track.find((p) => p.role === 'master')?.label || 'master')}</span> <span class="verb">must fix HEAD's tag</span>`;
+    } else if (f.holders.length) {
+      // Holders with the SAME verb and object share one clause; a
+      // different obligation is its own clause, so nobody is shown
+      // doing someone else's work (codex on 056a342).
+      const groups = [];
+      for (const h of f.holders) {
+        const g = groups.find((g) => g.verb === h.verb && g.object === h.object);
+        if (g) g.holders.push(h); else groups.push({ verb: h.verb, object: h.object, holders: [h] });
+      }
+      const clause = (g) => {
+        const names = g.holders.map((h) => esc(h.label));
+        const who = names.length === 1 ? names[0] : names.slice(0, -1).join(', ') + ' and ' + names.slice(-1);
+        const clocks = g.holders.map((h) => h.since != null ? coarse(now() - h.since) : '').filter(Boolean).join(', ');
+        return `<span class="who">${who}</span> <span class="verb">${names.length === 1 ? 'is' : 'are'} ${esc(g.verb)}</span> <span class="obj">${esc(g.object)}</span>${clocks ? `<span class="since">${clocks}</span>` : ''}`;
+      };
+      html = `<span class="dot"></span>` + groups.map(clause).join('<span class="obj">; </span>');
+    } else {
+      html = `<span class="who">nobody</span> <span class="verb">— idle</span>`;
     }
-    const p = panes.get(id);
-    send.disabled = !p || p.closed;
-    input.placeholder = p ? `Say something to ${p.meta.label}` : 'Say something';
-    if (p && !p.closed) p.term.scrollToBottom();
+    floorEl.innerHTML = html;
   }
 
-  function makePane(meta) {
-    const strip = document.createElement('button');
-    strip.className = 'strip';
-    strip.type = 'button';
-    strip.setAttribute('role', 'tab');
-    strip.innerHTML = '<div class="name"></div><div class="role"></div><div class="verb"></div>';
-    strip.addEventListener('click', () => select(meta.id));
-    strips.appendChild(strip);
-
-    const pane = document.createElement('div');
-    pane.className = 'pane';
-    pane.innerHTML = '<button type="button" role="tab" class="head strip"><div class="name"></div><div class="role"></div><div class="verb"></div></button><div class="term"></div><div class="gone"></div>';
-    pane.querySelector('.head').addEventListener('click', () => select(meta.id));
-    stage.appendChild(pane);
-
-    const term = new Terminal({
-      cols: meta.columns || 80,
-      rows: meta.rows || 24,
-      disableStdin: true,
-      cursorBlink: false,
-      scrollback: 0,
-      fontFamily: 'ui-monospace, Menlo, "SF Mono", Consolas, monospace',
-      fontSize: 13,
-      allowProposedApi: true,
-      theme: { background: '#1a1917', foreground: '#e8e4dc' },
-    });
-    term.open(pane.querySelector('.term'));
-    const p = { meta, strip, pane, term, closed: false };
-    panes.set(meta.id, p);
-    paintStrip(p);
-    return p;
-  }
-
-  function paintStrip(p) {
-    const f = facts.strips.find((s) => s.label === p.meta.label);
-    const working = !!(f && f.verb);
-    const verb = p.closed ? 'pane closed'
-      : working ? `<span class="dot"></span>${f.verb}${f.since != null ? ' ' + coarse(now() - f.since) : ''}`
-      : '';
-    for (const root of [p.strip, p.pane.querySelector('.head')]) {
-      root.querySelector('.name').textContent = p.meta.label;
-      root.querySelector('.role').textContent = f ? f.role : '';
-      root.querySelector('.verb').innerHTML = verb;
-      root.classList.toggle('working', working && !p.closed);
-      root.classList.toggle('closed', p.closed);
-    }
-    p.pane.classList.toggle('closed', p.closed);
-    p.pane.querySelector('.gone').textContent = `${p.meta.label}'s pane closed`;
-  }
-
-  function onPanes(data) {
+  // ---- the track ----
+  function paintTrack() {
+    if (!facts) return;
     const seen = new Set();
-    for (const meta of data.panes) {
+    for (const p of facts.track) {
+      seen.add(p.label);
+      let el = trackEl.querySelector(`[data-label="${CSS.escape(p.label)}"]`);
+      if (!el) {
+        el = document.createElement('button');
+        el.className = 'pos'; el.setAttribute('role', 'tab'); el.dataset.label = p.label;
+        el.innerHTML = '<div class="name"><span class="n"></span><span class="dot"></span></div><div class="role"></div><div class="last"></div>';
+        el.addEventListener('click', () => select(p.label));
+        trackEl.appendChild(el);
+      }
+      el.querySelector('.n').textContent = p.label;
+      el.querySelector('.role').textContent = p.role;
+      el.querySelector('.last').textContent = p.last || '';
+      el.classList.toggle('holds', p.holds);
+      el.classList.toggle('on', p.label === selected);
+      el.setAttribute('aria-selected', p.label === selected ? 'true' : 'false');
+      ensureViews(p.label);
+    }
+    for (const el of [...trackEl.querySelectorAll('.pos')]) if (!seen.has(el.dataset.label)) el.remove();
+    emptyEl.style.display = facts.track.length ? 'none' : 'flex';
+    if (!selected || !seen.has(selected)) select(facts.track[0]?.label || null);
+  }
+
+  // ---- the agent ----
+  function ensureViews(label) {
+    if (views.has(label)) return;
+    const transcript = document.createElement('div'); transcript.className = 'view transcript'; transcript.innerHTML = '<div class="turns"></div>';
+    const terminal = document.createElement('div'); terminal.className = 'view terminal'; terminal.innerHTML = '<div class="term"></div><div class="gone"></div>';
+    viewsEl.append(transcript, terminal);
+    const term = new Terminal({ cols: 80, rows: 24, disableStdin: true, cursorBlink: false, scrollback: 0, fontFamily: 'ui-monospace, Menlo, "SF Mono", Consolas, monospace', fontSize: 13, allowProposedApi: true, theme: { background: '#1a1917', foreground: '#e8e4dc' } });
+    term.open(terminal.querySelector('.term'));
+    views.set(label, { transcript, terminal, term });
+  }
+
+  function hasTranscript(label) { return !!facts?.track.find((p) => p.label === label)?.transcript; }
+  function modeFor(label) {
+    const wanted = modes[label] || (hasTranscript(label) ? 'transcript' : 'terminal');
+    return wanted === 'transcript' && !hasTranscript(label) ? 'terminal' : wanted;
+  }
+
+  function select(label) {
+    selected = label;
+    for (const el of trackEl.querySelectorAll('.pos')) { const on = el.dataset.label === label; el.classList.toggle('on', on); el.setAttribute('aria-selected', on ? 'true' : 'false'); }
+    nameEl.textContent = label || '';
+    const mode = label ? modeFor(label) : null;
+    for (const [m, btn] of Object.entries(modeBtns)) {
+      btn.classList.toggle('on', m === mode);
+      btn.disabled = !label || (m === 'transcript' && !hasTranscript(label));
+    }
+    whyEl.textContent = label && !hasTranscript(label) ? `no transcript for ${label} yet` : '';
+    for (const [l, v] of views) {
+      v.transcript.classList.toggle('on', l === label && mode === 'transcript');
+      v.terminal.classList.toggle('on', l === label && mode === 'terminal');
+    }
+    const pid = label && paneOf.get(label); const p = pid && panes.get(pid);
+    send.disabled = !p || p.closed;
+    input.placeholder = label ? `Say something to ${label}` : 'Say something';
+    if (label) { paintTranscript(label); if (p && !p.closed) views.get(label).term.scrollToBottom(); }
+  }
+  for (const [m, btn] of Object.entries(modeBtns)) btn.addEventListener('click', () => { if (!selected) return; modes[selected] = m; localStorage.setItem('clank.modes', JSON.stringify(modes)); select(selected); });
+
+  // Turns are rendered ONCE and updated in place, keyed by id: a
+  // repaint that rebuilt them would close every <details> the reader
+  // had opened (codex on 056a342). Harness turns are not rendered at
+  // all — the adapters mark them so this can be the clean transcript.
+  function turnHtml(label, t) {
+    const who = t.who === 'person' ? 'you' : label;
+    const age = t.at ? coarse(now() - t.at) : '';
+    const gutter = `<span class="gutter"><span class="who">${esc(who)}</span><span class="age">${esc(age)}</span></span>`;
+    const b = t.body;
+    if (b.kind === 'text') return `${gutter}<span class="text"></span>`;
+    if (b.kind === 'thinking') return `${gutter}<details><summary>thinking</summary><pre class="text"></pre></details>`;
+    return `${gutter}<details class="tool"><summary><span class="name"></span> <span class="in"></span><span class="pending"></span></summary><pre class="in"></pre><pre class="out"></pre></details>`;
+  }
+  function fillTurn(el, t) {
+    const b = t.body;
+    el.querySelector('.age').textContent = t.at ? coarse(now() - t.at) : '';
+    if (b.kind === 'text' || b.kind === 'thinking') { el.querySelector('.text').textContent = b.text; return; }
+    el.querySelector('summary .name').textContent = b.name;
+    el.querySelector('summary .in').textContent = b.input.slice(0, 120);
+    el.querySelector('summary .pending').textContent = b.output == null ? ' …' : '';
+    el.querySelector('pre.in').textContent = b.input;
+    const out = el.querySelector('pre.out');
+    out.textContent = b.output == null ? '' : b.output;
+    out.hidden = b.output == null;
+  }
+  function paintTranscript(label) {
+    const v = views.get(label); if (!v) return;
+    const box = v.transcript.querySelector('.turns');
+    const w = agents.get(label);
+    const shown = (w ? w.turns : []).filter((t) => t.who !== 'harness');
+    if (!shown.length) { box.innerHTML = `<div class="turn empty-note"><span class="gutter"></span><span class="text">Nothing said yet.</span></div>`; return; }
+    if (box.querySelector('.empty-note')) box.innerHTML = '';
+    const atBottom = v.transcript.scrollTop + v.transcript.clientHeight >= v.transcript.scrollHeight - 40;
+    const keep = new Set();
+    let cursor = box.firstElementChild;
+    for (const t of shown) {
+      keep.add(t.id);
+      let el = box.querySelector(`[data-id="${CSS.escape(t.id)}"]`);
+      if (!el) {
+        el = document.createElement('div');
+        el.dataset.id = t.id;
+        el.className = `turn ${t.who} ${t.body.kind}`;
+        el.innerHTML = turnHtml(label, t);
+        box.insertBefore(el, cursor);
+      } else if (el !== cursor) {
+        box.insertBefore(el, cursor);
+      }
+      fillTurn(el, t);
+      cursor = el.nextElementSibling;
+    }
+    for (const el of [...box.querySelectorAll('.turn[data-id]')]) if (!keep.has(el.dataset.id)) el.remove();
+    if (atBottom) v.transcript.scrollTop = v.transcript.scrollHeight;
+  }
+
+  // ---- panes (terminal mode) ----
+  function onPanes(d) {
+    const seen = new Set();
+    for (const meta of d.panes) {
       seen.add(meta.id);
-      let p = panes.get(meta.id);
-      if (!p) p = makePane(meta);
-      else if (p.meta.columns !== meta.columns || p.meta.rows !== meta.rows) {
-        p.meta = meta;
-        p.term.resize(meta.columns || 80, meta.rows || 24);
-      } else p.meta = meta;
-      p.closed = data.closed.includes(meta.id) || meta.exited;
-      paintStrip(p);
+      const prev = panes.get(meta.id);
+      panes.set(meta.id, { meta, closed: d.closed.includes(meta.id) || meta.exited });
+      paneOf.set(meta.label, meta.id);
+      ensureViews(meta.label);
+      const v = views.get(meta.label);
+      if (!prev || prev.meta.columns !== meta.columns || prev.meta.rows !== meta.rows) v.term.resize(meta.columns || 80, meta.rows || 24);
+      v.terminal.classList.toggle('closed', panes.get(meta.id).closed);
+      v.terminal.querySelector('.gone').textContent = `${meta.label}'s pane closed`;
     }
-    for (const [id, p] of panes) {
-      if (seen.has(id)) continue;
-      p.strip.remove(); p.pane.remove(); p.term.dispose(); panes.delete(id);
-    }
-    empty.style.display = panes.size ? 'none' : 'flex';
-    if (!panes.has(selected)) select(panes.keys().next().value || null);
-    else select(selected);
+    for (const id of [...panes.keys()]) if (!seen.has(id)) panes.delete(id);
+    if (selected) select(selected);
+  }
+  function onPane(d) {
+    const p = panes.get(d.pane_id); if (!p) return;
+    views.get(p.meta.label)?.term.write(d.screen);
   }
 
-  function onPane(data) {
-    const p = panes.get(data.pane_id);
-    if (!p) return;
-    // The server built the repaint: home, each row erased past its
-    // end, the rest of the screen cleared. Whether the pane is open
-    // is the table's to say, never a viewport's.
-    p.term.write(data.screen);
+  // ---- the ledger ----
+  function paintLedger() {
+    if (!facts) return;
+    const L = facts.ledger;
+    $('facts').innerHTML = [
+      L.plan ? `<div class="plan">${esc(L.plan)}</div>` : `<div class="line">no active plan</div>`,
+      L.gate ? `<div>gate <span class="gate">${esc(L.gate)}</span></div>` : '',
+      L.dirty ? `<div class="line">dirty ${esc(L.dirty)}</div>` : '',
+      (L.queue || L.stash) ? `<div class="line">${L.queue ? `${L.queue} queued` : ''}${L.queue && L.stash ? ', ' : ''}${L.stash ? `${L.stash} stashed` : ''}</div>` : '',
+    ].join('');
+    $('blocks').innerHTML = L.blocks.map((b) => `<div class="block">${esc(b)}\n<span class="line">Answer it at the terminal, or with clank block answer.</span></div>`).join('');
+    $('rows').innerHTML = L.rows.map((r) => {
+      const main = r.kind === 'header' ? esc(r.text)
+        : r.kind === 'commit' ? `<span class="glyph">${esc(r.glyph || '')}</span><span class="sha">${esc(r.sha || '')}</span> ${esc(r.text)}`
+        : r.kind === 'review' ? `<span class="glyph">${esc(r.glyph || '')}</span><span class="author">${esc(r.author || '')}</span>${r.text ? ': ' + esc(r.text) : ''}`
+        : esc(r.text);
+      return `<div class="row ${r.kind}"><span class="main">${main}</span><span class="age">${esc(r.age || '')}</span></div>`;
+    }).join('');
   }
+  $('menu').addEventListener('click', () => ledgerEl.classList.add('open'));
+  $('close').addEventListener('click', () => ledgerEl.classList.remove('open'));
 
-  function onStatus(data) {
-    facts = data.facts || facts;
-    lampEl.textContent = facts.lamp || '';
-    lampEl.style.color = facts.hue || '';
-    planEl.textContent = facts.plan || '';
-    for (const p of panes.values()) paintStrip(p);
-  }
+  // ---- status ----
+  function onStatus(d) { facts = d.facts; paintFloor(); paintTrack(); paintLedger(); if (selected) select(selected); }
+  setInterval(() => { paintFloor(); if (selected) paintTranscript(selected); }, 60000);
 
-  // Elapsed stays live between status events, at the TUI's cadence.
-  setInterval(() => { for (const p of panes.values()) paintStrip(p); }, 60000);
-
+  // ---- the stream ----
   function connect() {
     const es = new EventSource('/events');
+    es.addEventListener('status', (e) => onStatus(JSON.parse(e.data)));
     es.addEventListener('panes', (e) => onPanes(JSON.parse(e.data)));
     es.addEventListener('pane', (e) => onPane(JSON.parse(e.data)));
-    es.addEventListener('status', (e) => onStatus(JSON.parse(e.data)));
+    es.addEventListener('turns', (e) => applyTurns(JSON.parse(e.data)));
+    es.addEventListener('turn', (e) => applyTurn(JSON.parse(e.data)));
     es.onopen = () => { liveEl.textContent = 'live'; liveEl.classList.remove('off'); };
     es.onerror = () => { liveEl.textContent = 'reconnecting'; liveEl.classList.add('off'); };
   }
 
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
-    const text = input.value;
-    if (!selected || !text) return;
+    const pid = selected && paneOf.get(selected); const text = input.value;
+    if (!pid || !text) return;
     send.disabled = true;
     try {
-      const r = await fetch('/say', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ pane: selected, text }),
-      });
+      const r = await fetch('/say', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ pane: pid, text }) });
       if (!r.ok) throw new Error(await r.text());
-      input.value = '';
-      sentEl.textContent = 'Sent';
-      setTimeout(() => { sentEl.textContent = ''; }, 1500);
-    } catch (err) {
-      sentEl.textContent = 'Not sent';
-      console.error(err);
-    } finally {
-      send.disabled = !panes.get(selected) || panes.get(selected).closed;
-      input.focus();
-    }
+      input.value = ''; sentEl.textContent = 'Sent'; setTimeout(() => { sentEl.textContent = ''; }, 1500);
+    } catch (err) { sentEl.textContent = 'Not sent'; console.error(err); }
+    finally { const p = panes.get(pid); send.disabled = !p || p.closed; input.focus(); }
   });
 
-  document.getElementById('session').textContent = document.title = window.CLANK_SESSION || 'clank';
+  $('session').textContent = document.title = window.CLANK_SESSION || 'clank';
   connect();
 })();
 </script>

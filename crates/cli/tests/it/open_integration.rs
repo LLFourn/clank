@@ -191,6 +191,7 @@ fn clank_initialized_with_master_and_reviewer() {
                     .unwrap(),
                 tool: clank_core::vocab::Tool::Claude,
                 updated_at: "2026-01-01T00:00:00Z".to_string(),
+                transcript: None,
             }),
             ..Default::default()
         })
@@ -205,6 +206,7 @@ fn clank_initialized_with_master_and_reviewer() {
                     .unwrap(),
                 tool: clank_core::vocab::Tool::Codex,
                 updated_at: "2026-01-01T00:00:00Z".to_string(),
+                transcript: None,
             }),
             ..Default::default()
         })

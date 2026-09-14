@@ -240,6 +240,13 @@ pub struct Session {
     /// because the `time` crate's `local-offset` codepath has
     /// known soundness issues in multi-threaded programs.
     pub updated_at: String,
+    /// Where this session's own transcript lives, when the harness
+    /// said (Claude's SessionStart hook does). Absent for harnesses
+    /// that keep no readable transcript, or whose file is found
+    /// another way (codex, by session id). `default` so every
+    /// binding written before this field existed still reads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript: Option<String>,
 }
 
 #[cfg(test)]
@@ -268,6 +275,7 @@ mod tests {
                 id: session_id("742f6a04-f174-409a-ab01-419a16c5f372"),
                 tool: Tool::Claude,
                 updated_at: "2026-05-23T16:24:47+10:00".into(),
+                transcript: None,
             }),
             wait_events: Vec::new(),
         };

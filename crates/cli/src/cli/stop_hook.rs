@@ -430,6 +430,11 @@ struct SessionStartInput {
     /// for the diagnostic line.
     #[serde(default)]
     source: Option<String>,
+    /// Claude sends the session's own transcript file; codex does not.
+    /// Recorded on the binding so `clank web` can read what the agent
+    /// said without guessing the path.
+    #[serde(default)]
+    transcript_path: Option<String>,
 }
 
 /// Who this session is, and — when clank launched it — the binding
@@ -466,6 +471,11 @@ fn session_started(
                     sid.as_str(),
                     input.source.as_deref().unwrap_or("start"),
                 );
+            } else if let Some(path) = input.transcript_path.as_deref() {
+                // Same fail-open policy: a transcript clank cannot
+                // record is a page without one, not a session that
+                // cannot start.
+                let _ = crate::agent_store::record_transcript(repo, label, &sid, path);
             }
             Some(label.clone())
         }
@@ -3199,6 +3209,7 @@ mod tests {
             session_id: session.to_string(),
             cwd: "/tmp".to_string(),
             source: Some(source.to_string()),
+            transcript_path: None,
         }
     }
 

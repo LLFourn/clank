@@ -1,0 +1,10 @@
+{"type":"user","uuid":"u-1","timestamp":"2026-09-11T00:22:06.058Z","isSidechain":false,"message":{"role":"user","content":"fix the layout on portrait screens"}}
+{"type":"assistant","uuid":"a-1","timestamp":"2026-09-11T00:22:09.000Z","isSidechain":false,"message":{"id":"msg_1","role":"assistant","content":[{"type":"thinking","thinking":"The extent decides.","signature":"x"}]}}
+{"type":"assistant","uuid":"a-2","timestamp":"2026-09-11T00:22:10.000Z","isSidechain":false,"message":{"id":"msg_1","role":"assistant","content":[{"type":"tool_use","id":"toolu_01","name":"Bash","input":{"command":"cargo test -p clank"}}]}}
+{"type":"user","uuid":"u-2","timestamp":"2026-09-11T00:22:40.000Z","isSidechain":false,"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_01","content":"test result: ok. 1296 passed"}]}}
+{"type":"assistant","uuid":"a-3","timestamp":"2026-09-11T00:22:41.000Z","isSidechain":false,"message":{"id":"msg_2","role":"assistant","content":[{"type":"text","text":"Fixed: the tab's extent decides its orientation."}]}}
+{"type":"user","uuid":"u-3","timestamp":"2026-09-11T00:23:00.000Z","isSidechain":false,"message":{"role":"user","content":"<task-notification>\n<summary>Stop hook feedback</summary>\n</task-notification>\n<system-reminder>\nClank wait returned work\n</system-reminder>"}}
+{"type":"user","uuid":"u-4","timestamp":"2026-09-11T00:23:01.000Z","isSidechain":false,"message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user for tool use]"}]}}
+{"type":"assistant","uuid":"a-side","timestamp":"2026-09-11T00:23:02.000Z","isSidechain":true,"message":{"id":"msg_s","role":"assistant","content":[{"type":"text","text":"a subagent speaking"}]}}
+{"type":"permission-mode","mode":"default"}
+{"type":"queue-operation","operation":"enqueue"}

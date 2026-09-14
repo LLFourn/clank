@@ -11,6 +11,7 @@
 //! (clank-web-shows-each-agent-on-a-phone).
 
 mod feed;
+mod transcript;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -154,7 +155,10 @@ fn start_subscription(session: &str, table: &[PaneMeta], feed: &Feed) -> Option<
 }
 
 /// The status feed: the TUI's own watcher wakes a rebuild, and the
-/// rebuilt snapshot goes out with the TUI's derived strip data.
+/// rebuilt snapshot goes out with the TUI's derived facts. The same
+/// thread follows each agent's transcript, because which transcripts
+/// exist is a fact of the rebuilt snapshot: an agent rebound to a new
+/// session gets a new tail and a new window.
 ///
 /// One thread owns the watcher, its wake channel, and the rebuild —
 /// on a runtime of its own. `build_async` holds a `git_io::Repo`
@@ -180,6 +184,8 @@ fn spawn_status_loop(repo: PathBuf, feed: Feed) {
             .unwrap_or("repo")
             .to_string();
         let home = std::env::var_os("HOME").map(PathBuf::from);
+        let mut tails: std::collections::HashMap<String, TailHandle> = Default::default();
+        let mut next_owner: u64 = 0;
         loop {
             let built = rt.block_on(crate::cli::status::StatusSnapshot::build_async(
                 &repo,
@@ -190,8 +196,16 @@ fn spawn_status_loop(repo: PathBuf, feed: Feed) {
                 true,
             ));
             if let Ok(snap) = built {
+                let with = reconcile_tails(
+                    &repo,
+                    home.as_deref(),
+                    &snap,
+                    &feed,
+                    &mut tails,
+                    &mut next_owner,
+                );
                 feed.status(serde_json::json!({
-                    "facts": crate::cli::status_tui::web_facts(&snap),
+                    "facts": crate::cli::status_tui::web_facts(&snap, &with),
                     "snapshot": snap.to_json(),
                 }));
             }
@@ -205,6 +219,221 @@ fn spawn_status_loop(repo: PathBuf, feed: Feed) {
             {}
         }
     });
+}
+
+/// A transcript being followed for one agent, for one session, from
+/// one file. `owner` is the token the feed will honour for this tail
+/// and no other — the stop flag is a courtesy, the token is the
+/// guarantee.
+struct TailHandle {
+    session: String,
+    path: PathBuf,
+    owner: u64,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for TailHandle {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Which transcript each agent on the roster should be showing: the
+/// bound session's file, for harnesses that keep one.
+type Wanted = std::collections::HashMap<String, (String, PathBuf)>;
+
+/// Start a tail for every bound agent whose harness keeps a
+/// transcript, stop the tails of agents rebound elsewhere, moved to
+/// another file, or gone, and say which agents have one. A new
+/// session OR a new path is a new tail: a path recorded after the
+/// tail started, or a newer rollout for the same session, would
+/// otherwise leave the old tail reading the wrong file (codex on
+/// 056a342).
+fn reconcile_tails(
+    repo: &Path,
+    home: Option<&Path>,
+    snap: &crate::cli::status::StatusSnapshot,
+    feed: &Feed,
+    tails: &mut std::collections::HashMap<String, TailHandle>,
+    next_owner: &mut u64,
+) -> std::collections::BTreeSet<String> {
+    let mut wanted = Wanted::default();
+    if let Some(home) = home {
+        for a in &snap.agents {
+            let Ok(label) = crate::lifecycle::AgentLabel::parse(&a.label) else {
+                continue;
+            };
+            let Ok(Some(cfg)) = crate::agent_store::load_agent_config(repo, &label) else {
+                continue;
+            };
+            let Some(session) = cfg.session else {
+                continue;
+            };
+            if !transcript::has_adapter(session.tool) {
+                continue;
+            }
+            let recorded = session.transcript.as_deref().map(Path::new);
+            if let Some(path) =
+                transcript::transcript_path(session.tool, session.id.as_str(), recorded, repo, home)
+            {
+                wanted.insert(a.label.clone(), (session.id.as_str().to_string(), path));
+            }
+        }
+    }
+    let roster = snap.agents.iter().map(|a| a.label.clone()).collect();
+    retarget_tails(&wanted, &roster, feed, tails, next_owner)
+}
+
+/// The window an agent shows is decided HERE, synchronously, and the
+/// tail only fills what it was handed: every change of scope — a new
+/// session, a new file, a binding cleared or moved to a harness
+/// without a transcript — is claimed with the next token before any
+/// thread runs, so the superseded thread is refused however far into
+/// a read it is, and the page never shows a session the roster no
+/// longer binds while the new file takes its time to open (codex on
+/// eb143e7).
+fn retarget_tails(
+    wanted: &Wanted,
+    roster: &std::collections::BTreeSet<String>,
+    feed: &Feed,
+    tails: &mut std::collections::HashMap<String, TailHandle>,
+    next_owner: &mut u64,
+) -> std::collections::BTreeSet<String> {
+    let mut retired = Vec::new();
+    tails.retain(|label, h| {
+        let same = wanted
+            .get(label)
+            .is_some_and(|(sid, path)| sid == &h.session && path == &h.path);
+        if !same && !wanted.contains_key(label) {
+            retired.push(label.clone());
+        }
+        same
+    });
+    for label in retired {
+        *next_owner += 1;
+        feed.claim_turns(&label, *next_owner, None);
+    }
+    for (label, (session, path)) in wanted {
+        if tails.contains_key(label) {
+            continue;
+        }
+        *next_owner += 1;
+        let owner = *next_owner;
+        feed.claim_turns(label, owner, Some(session));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (feed, label2, session2, path2, stop2) = (
+            feed.clone(),
+            label.clone(),
+            session.clone(),
+            path.clone(),
+            stop.clone(),
+        );
+        std::thread::spawn(move || run_tail(feed, label2, owner, session2, path2, stop2));
+        tails.insert(
+            label.clone(),
+            TailHandle {
+                session: session.clone(),
+                path: path.clone(),
+                owner,
+                stop,
+            },
+        );
+    }
+    feed.forget_turns_except(roster);
+    tails.keys().cloned().collect()
+}
+
+/// The last window of a transcript, then only what is appended;
+/// bytes enough for the page's last few screens, never the history.
+const TAIL_WINDOW: u64 = 4 * 1024 * 1024;
+const TAIL_POLL: std::time::Duration = std::time::Duration::from_millis(500);
+
+fn run_tail(
+    feed: Feed,
+    agent: String,
+    owner: u64,
+    session: String,
+    path: PathBuf,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+) {
+    use std::sync::atomic::Ordering;
+    let tool = if path.to_string_lossy().contains("/.codex/") {
+        clank_core::vocab::Tool::Codex
+    } else {
+        clank_core::vocab::Tool::Claude
+    };
+    // The file may not exist yet: a session that has not spoken.
+    let (mut tail, lines) = loop {
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        match transcript::Tail::open(&path, TAIL_WINDOW) {
+            Ok(opened) => break opened,
+            Err(_) => std::thread::sleep(std::time::Duration::from_secs(2)),
+        }
+    };
+    let mut generation = 1u32;
+    feed.turns_reset(
+        &agent,
+        owner,
+        &session,
+        generation,
+        window_turns(tool, &lines),
+    );
+    loop {
+        std::thread::sleep(TAIL_POLL);
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        let Ok(polled) = tail.poll() else {
+            continue;
+        };
+        if polled.reset {
+            generation += 1;
+            feed.turns_reset(
+                &agent,
+                owner,
+                &session,
+                generation,
+                window_turns(tool, &polled.lines),
+            );
+            continue;
+        }
+        for line in &polled.lines {
+            for parsed in transcript::parse(tool, line) {
+                match parsed {
+                    transcript::Parsed::Turn(t) => {
+                        feed.turn(&agent, owner, &session, generation, t)
+                    }
+                    transcript::Parsed::ToolOutput { id, output } => {
+                        feed.tool_output(&agent, owner, &session, generation, &id, output)
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A window of lines as turns, with each tool's output already on
+/// its call — the batch equivalent of what the live path does one
+/// line at a time.
+fn window_turns(tool: clank_core::vocab::Tool, lines: &[String]) -> Vec<transcript::Turn> {
+    let mut turns: Vec<transcript::Turn> = Vec::new();
+    for line in lines {
+        for parsed in transcript::parse(tool, line) {
+            match parsed {
+                transcript::Parsed::Turn(t) => turns.push(t),
+                transcript::Parsed::ToolOutput { id, output } => {
+                    if let Some(t) = turns.iter_mut().find(|t| t.id == id)
+                        && let transcript::Body::Tool { output: slot, .. } = &mut t.body
+                    {
+                        *slot = Some(output);
+                    }
+                }
+            }
+        }
+    }
+    turns
 }
 
 /// How often the pane set is re-listed. A status change is a hint,
@@ -370,6 +599,60 @@ async fn say(req: hyper::Request<hyper::body::Incoming>, sayer: &Sayer) -> Resp 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Moving a binding replaces the shown window at once, empty and
+    /// scoped to the new session; clearing it (or moving it to a
+    /// harness without a transcript) leaves an empty, session-less
+    /// window rather than the last conversation; and in both cases
+    /// the superseded tail is refused. None of it waits on a file.
+    #[test]
+    fn retargeting_replaces_the_window_before_any_tail_reads() {
+        use std::collections::{BTreeSet, HashMap};
+        let feed = Feed::new(16);
+        let mut tails = HashMap::new();
+        let mut next_owner = 0;
+        let roster: BTreeSet<String> = ["claude".to_string(), "codex".to_string()].into();
+        let dir = tempfile::tempdir().unwrap();
+        let file = |n: &str| dir.path().join(n);
+        let mut wanted = Wanted::default();
+        wanted.insert("claude".into(), ("s1".into(), file("s1.jsonl")));
+        let with = retarget_tails(&wanted, &roster, &feed, &mut tails, &mut next_owner);
+        assert_eq!(with, ["claude".to_string()].into());
+        let owner1 = tails["claude"].owner;
+        feed.turns_reset("claude", owner1, "s1", 1, vec![say("a")]);
+        assert_eq!(feed.snapshot().turns["claude"].turns.len(), 1);
+
+        let (_, mut rx) = feed.connect();
+        wanted.insert("claude".into(), ("s2".into(), file("s2.jsonl")));
+        retarget_tails(&wanted, &roster, &feed, &mut tails, &mut next_owner);
+        let owner2 = tails["claude"].owner;
+        assert_ne!(owner1, owner2);
+        let mut page = feed::PageModel::default();
+        page.apply(&rx.try_recv().unwrap());
+        assert_eq!(page.agents["claude"].session, "s2");
+        assert!(page.agents["claude"].turns.is_empty());
+        feed.turns_reset("claude", owner1, "s1", 2, vec![say("stale")]);
+        assert_eq!(feed.snapshot().turns["claude"].session, "s2");
+
+        wanted.remove("claude");
+        let with = retarget_tails(&wanted, &roster, &feed, &mut tails, &mut next_owner);
+        assert!(with.is_empty() && tails.is_empty());
+        page.apply(&rx.try_recv().unwrap());
+        assert_eq!(page.agents["claude"].session, "");
+        feed.turns_reset("claude", owner2, "s2", 1, vec![say("late")]);
+        assert!(feed.snapshot().turns["claude"].turns.is_empty());
+        // Nothing to retire for an agent that never had a tail.
+        assert!(rx.try_recv().is_err());
+    }
+
+    fn say(id: &str) -> transcript::Turn {
+        transcript::Turn {
+            id: id.into(),
+            at: None,
+            who: transcript::Who::Agent,
+            body: transcript::Body::Text { text: id.into() },
+        }
+    }
 
     #[test]
     fn the_session_is_explicit_then_current_then_the_convention() {

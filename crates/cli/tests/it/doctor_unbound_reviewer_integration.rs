@@ -34,6 +34,7 @@ fn session(tool: clank_core::vocab::Tool, id: &str) -> clank_core::agent_config:
         id: clank_core::ids::SessionId::parse(id).unwrap(),
         tool,
         updated_at: "2026-06-04T12:00:00Z".to_string(),
+        transcript: None,
     }
 }
 

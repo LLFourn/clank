@@ -13,7 +13,45 @@ use std::sync::{Arc, Mutex};
 
 use tokio::sync::broadcast;
 
+use super::transcript::{Body, Turn};
 use crate::cli::open_zellij::PaneMeta;
+
+/// Turns retained per agent — the last few screens, not the history.
+pub(crate) const TURNS_KEPT: usize = 200;
+
+/// One agent's transcript window, scoped to the session it came from
+/// and the generation of the read: a turn from another session or an
+/// earlier read of the file is not this window's.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub(crate) struct AgentTurns {
+    pub(crate) session: String,
+    pub(crate) generation: u32,
+    pub(crate) turns: Vec<Turn>,
+    /// Which tail may write this window. A stop flag cannot stop a
+    /// thread already inside a read from publishing afterwards, and a
+    /// stale RESET would replace the window a newer tail just built —
+    /// after which every real turn is refused as stale. So each tail
+    /// is issued a token when it is started, the window records the
+    /// current one, and every publication, resets included, must
+    /// carry it (codex on 056a342). Never sent to the page.
+    #[serde(skip)]
+    pub(crate) owner: u64,
+}
+
+impl AgentTurns {
+    /// Replace the turn with this id, or append it; the window stays
+    /// bounded from the front.
+    fn upsert(&mut self, turn: Turn) {
+        match self.turns.iter_mut().find(|t| t.id == turn.id) {
+            Some(slot) => *slot = turn,
+            None => self.turns.push(turn),
+        }
+        if self.turns.len() > TURNS_KEPT {
+            let drop = self.turns.len() - TURNS_KEPT;
+            self.turns.drain(..drop);
+        }
+    }
+}
 
 /// One line of `zellij subscribe --format json`. Five fields on the
 /// wire; every one optional here except the kind, so a zellij that
@@ -69,6 +107,8 @@ pub(crate) struct Retained {
     /// Panes the child reported closed; a listing that drops them
     /// clears them.
     pub(crate) closed: BTreeSet<String>,
+    /// Each agent's transcript window, by label.
+    pub(crate) turns: BTreeMap<String, AgentTurns>,
 }
 
 impl Retained {
@@ -79,6 +119,12 @@ impl Retained {
         let mut out = vec![sse_frame("panes", &panes_data(&self.panes, &self.closed))];
         if let Some(status) = &self.status {
             out.push(sse_frame("status", status));
+        }
+        // A `turns` frame REPLACES the agent's window on the page, so a
+        // replay is never a duplicate — unlike a turn, which is why
+        // viewports may be replayed as-is and turns may not.
+        for (agent, window) in &self.turns {
+            out.push(turns_frame(agent, window));
         }
         for (id, viewport) in &self.viewports {
             out.push(pane_frame(id, viewport));
@@ -95,6 +141,30 @@ fn pane_frame(id: &str, viewport: &[String]) -> String {
     sse_frame(
         "pane",
         &serde_json::json!({ "pane_id": id, "screen": repaint(viewport) }),
+    )
+}
+
+fn turns_frame(agent: &str, window: &AgentTurns) -> String {
+    sse_frame(
+        "turns",
+        &serde_json::json!({
+            "agent": agent,
+            "session": window.session,
+            "generation": window.generation,
+            "turns": window.turns,
+        }),
+    )
+}
+
+fn turn_frame(agent: &str, session: &str, generation: u32, turn: &Turn) -> String {
+    sse_frame(
+        "turn",
+        &serde_json::json!({
+            "agent": agent,
+            "session": session,
+            "generation": generation,
+            "turn": turn,
+        }),
     )
 }
 
@@ -245,9 +315,183 @@ impl Feed {
         change
     }
 
+    /// Scope `agent`'s window to `session` — nothing of it read yet —
+    /// for the tail holding `owner`, and show that scope NOW. Called by
+    /// whoever starts a tail, BEFORE it can publish: any tail with an
+    /// earlier token is refused from here on, however far into a read
+    /// it already was, and the page stops showing the old session the
+    /// moment the binding moves, not when the new file finally opens
+    /// (codex on eb143e7). No session is a scope too — a binding
+    /// cleared, or moved to a harness that keeps no transcript.
+    pub(crate) fn claim_turns(&self, agent: &str, owner: u64, session: Option<&str>) {
+        self.publish(|s| {
+            let window = AgentTurns {
+                session: session.unwrap_or_default().to_string(),
+                generation: 0,
+                turns: Vec::new(),
+                owner,
+            };
+            let frame = turns_frame(agent, &window);
+            s.turns.insert(agent.to_string(), window);
+            vec![frame]
+        });
+    }
+
+    /// A transcript (re)read from its file: the agent's window becomes
+    /// exactly these turns, under this session and generation — if
+    /// the tail still owns the window.
+    pub(crate) fn turns_reset(
+        &self,
+        agent: &str,
+        owner: u64,
+        session: &str,
+        generation: u32,
+        turns: Vec<Turn>,
+    ) {
+        self.publish(|s| {
+            if s.turns.get(agent).is_none_or(|w| w.owner != owner) {
+                return Vec::new();
+            }
+            let mut window = AgentTurns {
+                session: session.to_string(),
+                generation,
+                turns: Vec::new(),
+                owner,
+            };
+            for t in turns {
+                window.upsert(t);
+            }
+            let frame = turns_frame(agent, &window);
+            s.turns.insert(agent.to_string(), window);
+            vec![frame]
+        });
+    }
+
+    /// One turn appended to a transcript. Dropped unless it is from
+    /// the tail that owns the window, for the session and generation
+    /// the window holds.
+    pub(crate) fn turn(&self, agent: &str, owner: u64, session: &str, generation: u32, turn: Turn) {
+        self.publish(|s| {
+            let Some(window) = s.turns.get_mut(agent) else {
+                return Vec::new();
+            };
+            if window.owner != owner || window.session != session || window.generation != generation
+            {
+                return Vec::new();
+            }
+            let frame = turn_frame(agent, session, generation, &turn);
+            window.upsert(turn);
+            vec![frame]
+        });
+    }
+
+    /// A tool's output, for the tool turn with this id: the turn is
+    /// re-sent whole with its output attached — one id, one turn, so
+    /// there is no separate attach message to arrive out of order.
+    /// An id nobody has (a call older than the window) is nothing.
+    pub(crate) fn tool_output(
+        &self,
+        agent: &str,
+        owner: u64,
+        session: &str,
+        generation: u32,
+        id: &str,
+        output: String,
+    ) {
+        self.publish(|s| {
+            let Some(window) = s.turns.get_mut(agent) else {
+                return Vec::new();
+            };
+            if window.owner != owner || window.session != session || window.generation != generation
+            {
+                return Vec::new();
+            }
+            let Some(turn) = window.turns.iter_mut().find(|t| t.id == id) else {
+                return Vec::new();
+            };
+            let Body::Tool { output: slot, .. } = &mut turn.body else {
+                return Vec::new();
+            };
+            *slot = Some(output);
+            vec![turn_frame(agent, session, generation, turn)]
+        });
+    }
+
+    /// Drop the windows of agents no longer on the roster.
+    pub(crate) fn forget_turns_except(&self, keep: &BTreeSet<String>) {
+        self.publish(|s| {
+            s.turns.retain(|agent, _| keep.contains(agent));
+            Vec::new()
+        });
+    }
+
     #[cfg(test)]
     pub(crate) fn snapshot(&self) -> Retained {
         self.state.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+}
+
+/// What the page holds of transcripts, and how a frame changes it —
+/// the reducer the page's JavaScript mirrors line for line. Kept in
+/// Rust so the duplicate-and-stale contract codex asked for is a
+/// test here rather than a hope in a browser.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct PageModel {
+    pub(crate) agents: BTreeMap<String, AgentTurns>,
+}
+
+impl PageModel {
+    /// One SSE frame as the browser receives it. Frames that are not
+    /// about turns leave the model alone.
+    pub(crate) fn apply(&mut self, frame: &str) {
+        let mut event = "";
+        let mut data = "";
+        for line in frame.lines() {
+            if let Some(e) = line.strip_prefix("event: ") {
+                event = e;
+            } else if let Some(d) = line.strip_prefix("data: ") {
+                data = d;
+            }
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else {
+            return;
+        };
+        let field = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+        let generation = v.get("generation").and_then(|g| g.as_u64()).unwrap_or(0) as u32;
+        match event {
+            "turns" => {
+                let Ok(turns) = serde_json::from_value::<Vec<Turn>>(
+                    v.get("turns").cloned().unwrap_or_default(),
+                ) else {
+                    return;
+                };
+                self.agents.insert(
+                    field("agent"),
+                    AgentTurns {
+                        session: field("session"),
+                        generation,
+                        turns,
+                        // The token is the server's; a page has none.
+                        owner: 0,
+                    },
+                );
+            }
+            "turn" => {
+                let Some(window) = self.agents.get_mut(&field("agent")) else {
+                    return;
+                };
+                if window.session != field("session") || window.generation != generation {
+                    return;
+                }
+                let Ok(turn) =
+                    serde_json::from_value::<Turn>(v.get("turn").cloned().unwrap_or_default())
+                else {
+                    return;
+                };
+                window.upsert(turn);
+            }
+            _ => {}
+        }
     }
 }
 
@@ -540,6 +784,231 @@ mod tests {
         // The escapes a viewport already carries pass through untouched.
         let styled = repaint(&["\x1b[1mbold\x1b[m".into()]);
         assert!(styled.contains("\x1b[1mbold\x1b[m\x1b[K"));
+    }
+
+    fn say(id: &str, text: &str) -> Turn {
+        Turn {
+            id: id.into(),
+            at: Some(1_000),
+            who: super::super::transcript::Who::Agent,
+            body: Body::Text { text: text.into() },
+        }
+    }
+
+    fn call(id: &str) -> Turn {
+        Turn {
+            id: id.into(),
+            at: Some(1_000),
+            who: super::super::transcript::Who::Agent,
+            body: Body::Tool {
+                name: "Bash".into(),
+                input: "ls".into(),
+                output: None,
+            },
+        }
+    }
+
+    /// A tail whose window was handed to a newer tail cannot reset it
+    /// — not even from a read it began before the handover — and its
+    /// turns are refused too. Without this a stale reset would win,
+    /// and every real turn after it would be dropped as stale.
+    #[test]
+    fn a_superseded_tail_cannot_reset_the_window() {
+        let feed = Feed::new(16);
+        feed.claim_turns("claude", 1, Some("s1"));
+        feed.turns_reset("claude", 1, "s1", 1, vec![say("a", "one")]);
+        feed.claim_turns("claude", 2, Some("s2"));
+        feed.turns_reset("claude", 2, "s2", 1, vec![say("z", "new")]);
+        // The old tail, late out of its read.
+        feed.turns_reset("claude", 1, "s1", 2, vec![say("stale", "x")]);
+        feed.turn("claude", 1, "s2", 1, say("sneak", "x"));
+        let w = &feed.snapshot().turns["claude"];
+        assert_eq!((w.session.as_str(), w.owner), ("s2", 2));
+        assert_eq!(
+            w.turns.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
+            vec!["z"]
+        );
+        // The current tail still can.
+        feed.turn("claude", 2, "s2", 1, say("y", "more"));
+        assert_eq!(feed.snapshot().turns["claude"].turns.len(), 2);
+        // No claim, no window to reset into.
+        feed.turns_reset("codex", 9, "s9", 1, vec![say("q", "x")]);
+        assert!(!feed.snapshot().turns.contains_key("codex"));
+    }
+
+    /// A claim is itself a publication: the window becomes the new
+    /// session's, empty, for everyone connected and everyone who
+    /// connects after — the old conversation is gone from the page
+    /// before the new file is so much as opened, and a binding with
+    /// no transcript leaves nothing behind either. Only the claiming
+    /// tail can then fill it.
+    #[test]
+    fn a_claim_shows_the_new_scope_before_anything_is_read() {
+        let feed = Feed::new(16);
+        feed.claim_turns("claude", 1, Some("s1"));
+        feed.turns_reset("claude", 1, "s1", 1, vec![say("a", "one")]);
+        let (_, mut rx) = feed.connect();
+        feed.claim_turns("claude", 2, Some("s2"));
+        let mut page = PageModel::default();
+        page.apply(&rx.try_recv().unwrap());
+        assert_eq!(
+            page.agents["claude"],
+            AgentTurns {
+                session: "s2".into(),
+                generation: 0,
+                turns: vec![],
+                owner: 0
+            }
+        );
+        let (snapshot, _) = feed.connect();
+        let mut fresh = PageModel::default();
+        for f in &snapshot {
+            fresh.apply(f);
+        }
+        assert_eq!(fresh.agents["claude"].session, "s2");
+        assert!(fresh.agents["claude"].turns.is_empty());
+        // The old tail, however late, cannot put s1 back.
+        feed.turns_reset("claude", 1, "s1", 2, vec![say("stale", "x")]);
+        assert_eq!(feed.snapshot().turns["claude"].session, "s2");
+        feed.turns_reset("claude", 2, "s2", 1, vec![say("z", "new")]);
+        page.apply(&rx.try_recv().unwrap());
+        assert_eq!(page.agents["claude"].turns.len(), 1);
+
+        feed.claim_turns("claude", 3, None);
+        page.apply(&rx.try_recv().unwrap());
+        assert_eq!(
+            (
+                page.agents["claude"].session.as_str(),
+                page.agents["claude"].turns.len()
+            ),
+            ("", 0)
+        );
+        feed.turn("claude", 2, "s2", 1, say("late", "x"));
+        assert!(feed.snapshot().turns["claude"].turns.is_empty());
+    }
+
+    /// The contract: a turn present in the retained window AND
+    /// arriving live is ONE turn on the page — the handoff may deliver
+    /// it twice, and the upsert by id absorbs that.
+    #[test]
+    fn a_turn_delivered_twice_is_one_turn_on_the_page() {
+        let feed = Feed::new(16);
+        feed.claim_turns("claude", 1, Some("s1"));
+        feed.turns_reset("claude", 1, "s1", 1, vec![say("a", "one")]);
+        let (snapshot, mut rx) = feed.connect();
+        feed.turn("claude", 1, "s1", 1, say("b", "two"));
+        let mut page = PageModel::default();
+        for f in &snapshot {
+            page.apply(f);
+        }
+        // What the handoff can do: the same turn from the snapshot's
+        // successor AND the stream.
+        page.apply(
+            &feed
+                .resync()
+                .into_iter()
+                .find(|f| f.starts_with("event: turns\n"))
+                .unwrap(),
+        );
+        page.apply(&rx.try_recv().unwrap());
+        let w = &page.agents["claude"];
+        assert_eq!(
+            w.turns.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+    }
+
+    /// A reconnect's `turns` frame replaces the window rather than
+    /// doubling it, and a lag resync is only ever redundant.
+    #[test]
+    fn a_reconnect_replaces_the_window() {
+        let feed = Feed::new(16);
+        feed.claim_turns("claude", 1, Some("s1"));
+        feed.turns_reset("claude", 1, "s1", 1, vec![say("a", "one"), say("b", "two")]);
+        let mut page = PageModel::default();
+        for _ in 0..3 {
+            for f in feed.resync() {
+                page.apply(&f);
+            }
+        }
+        assert_eq!(page.agents["claude"].turns.len(), 2);
+    }
+
+    /// A tool's output re-sends the tool's turn whole and lands on
+    /// the same id — no attach message, no ordering to get wrong.
+    #[test]
+    fn a_tools_output_lands_on_the_tools_own_turn() {
+        let feed = Feed::new(16);
+        feed.claim_turns("claude", 1, Some("s1"));
+        feed.turns_reset("claude", 1, "s1", 1, vec![call("toolu_01")]);
+        let (frames, mut rx) = feed.connect();
+        feed.tool_output("claude", 1, "s1", 1, "toolu_01", "ok".into());
+        let mut page = PageModel::default();
+        for f in frames {
+            page.apply(&f);
+        }
+        page.apply(&rx.try_recv().unwrap());
+        let w = &page.agents["claude"];
+        assert_eq!(w.turns.len(), 1, "still one turn");
+        assert!(matches!(&w.turns[0].body, Body::Tool { output: Some(o), .. } if o == "ok"));
+        // An output for a call older than the window is nothing.
+        feed.tool_output("claude", 1, "s1", 1, "toolu_ancient", "x".into());
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// A turn for a stale session or generation is dropped — by the
+    /// feed and by the page — and a `turns` frame with a new
+    /// generation clears what was there.
+    #[test]
+    fn stale_turns_are_dropped_and_a_new_generation_clears() {
+        let feed = Feed::new(16);
+        feed.claim_turns("claude", 1, Some("s1"));
+        feed.turns_reset("claude", 1, "s1", 1, vec![say("a", "one")]);
+        let (frames, mut rx) = feed.connect();
+        feed.turn("claude", 1, "s1", 0, say("old-gen", "x"));
+        feed.turn("claude", 1, "s0", 1, say("old-session", "x"));
+        assert!(rx.try_recv().is_err(), "the feed forwards neither");
+        let mut page = PageModel::default();
+        for f in frames {
+            page.apply(&f);
+        }
+        // The page enforces the same scope on its own.
+        page.apply(&turn_frame("claude", "s1", 0, &say("old-gen", "x")));
+        page.apply(&turn_frame("claude", "s0", 1, &say("old-session", "x")));
+        assert_eq!(page.agents["claude"].turns.len(), 1);
+        // The file was re-read: generation 2 replaces the window.
+        feed.turns_reset("claude", 1, "s1", 2, vec![say("z", "fresh")]);
+        page.apply(&rx.try_recv().unwrap());
+        let w = &page.agents["claude"];
+        assert_eq!(
+            (w.generation, w.turns[0].id.as_str(), w.turns.len()),
+            (2, "z", 1)
+        );
+        // A rebind to another session is a new window too.
+        feed.turns_reset("claude", 1, "s2", 1, vec![]);
+        page.apply(&rx.try_recv().unwrap());
+        assert_eq!(
+            (
+                page.agents["claude"].session.as_str(),
+                page.agents["claude"].turns.len()
+            ),
+            ("s2", 0)
+        );
+    }
+
+    /// The window is bounded from the front, on the feed and on the
+    /// page alike.
+    #[test]
+    fn the_window_keeps_the_last_turns_only() {
+        let feed = Feed::new(16);
+        let many: Vec<Turn> = (0..TURNS_KEPT + 5)
+            .map(|i| say(&format!("t{i}"), "x"))
+            .collect();
+        feed.claim_turns("claude", 1, Some("s1"));
+        feed.turns_reset("claude", 1, "s1", 1, many);
+        let w = &feed.snapshot().turns["claude"];
+        assert_eq!(w.turns.len(), TURNS_KEPT);
+        assert_eq!(w.turns[0].id, "t5");
     }
 
     /// A listing that drops a pane drops what was retained for it:

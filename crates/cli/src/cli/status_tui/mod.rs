@@ -1489,15 +1489,70 @@ const REBUILD_MIN: Duration = Duration::from_secs(1);
 
 const REOPEN_NOTICE: &str = "reopen pane";
 
-/// One agent's channel strip on the web page: what the TUI's agent
-/// row says, as data. `since` is the epoch second the elapsed counts
-/// from, so the page can keep it live without a status event.
+/// One holder of the floor: an agent the gate is waiting on, with
+/// the TUI's verb, what it owes, and since when.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub(crate) struct Strip {
+pub(crate) struct Holder {
+    pub(crate) label: String,
+    pub(crate) verb: String,
+    /// The sha, plan, PR or block the routing names — what the verb
+    /// is about.
+    pub(crate) object: String,
+    pub(crate) since: Option<i64>,
+}
+
+/// Whose turn it is — everyone's whose turn it is. A relay has one
+/// baton; a review does not: two reviewers missing on one commit are
+/// two holders, each with its own clock. Empty holders and no ask is
+/// the idle line.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct Floor {
+    pub(crate) holders: Vec<Holder>,
+    /// A pending block's question: the person's turn.
+    pub(crate) ask: Option<String>,
+    /// HEAD's tag needs fixing: nothing was handed over, something is
+    /// wrong, and no clock applies.
+    pub(crate) correction: bool,
+    pub(crate) hue: String,
+}
+
+/// One position on the track: master first, then the reviewers in
+/// roster order. `holds` marks a holder of the floor — any number
+/// may; `last` is the agent's newest act in the log.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct Position {
     pub(crate) label: String,
     pub(crate) role: String,
-    pub(crate) verb: Option<String>,
-    pub(crate) since: Option<i64>,
+    pub(crate) holds: bool,
+    pub(crate) last: Option<String>,
+    /// Whether clank can show this agent's transcript, or only its
+    /// terminal.
+    pub(crate) transcript: bool,
+}
+
+/// One row of the ledger: the TUI's log row as data, in the TUI's
+/// order, with the same age.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct LedgerRow {
+    pub(crate) kind: String,
+    pub(crate) glyph: Option<String>,
+    pub(crate) sha: Option<String>,
+    pub(crate) text: String,
+    pub(crate) author: Option<String>,
+    pub(crate) verdict: Option<String>,
+    pub(crate) age: Option<String>,
+}
+
+/// What has been done, and what the repo is carrying.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct Ledger {
+    pub(crate) plan: Option<String>,
+    pub(crate) gate: Option<String>,
+    pub(crate) dirty: Option<String>,
+    pub(crate) queue: usize,
+    pub(crate) stash: usize,
+    pub(crate) blocks: Vec<String>,
+    pub(crate) rows: Vec<LedgerRow>,
 }
 
 /// The TUI's derived facts for the web page. Derived HERE, inside
@@ -1511,36 +1566,256 @@ pub(crate) struct WebFacts {
     pub(crate) plan: String,
     /// The frame's hue as hex, from the same table as the bar.
     pub(crate) hue: String,
-    pub(crate) strips: Vec<Strip>,
+    pub(crate) floor: Floor,
+    pub(crate) track: Vec<Position>,
+    pub(crate) ledger: Ledger,
 }
 
-pub(crate) fn web_facts(snap: &StatusSnapshot) -> WebFacts {
+/// `with_transcript`: the agents whose transcript the server is
+/// following — the page's knowledge, not the snapshot's.
+pub(crate) fn web_facts(
+    snap: &StatusSnapshot,
+    with_transcript: &std::collections::BTreeSet<String>,
+) -> WebFacts {
+    use clank_core::vocab::Role;
     let (lamp, plan) = render::bar_text(snap);
-    let activity = in_progress_rows(snap);
-    let strips = snap
-        .agents
-        .iter()
-        .map(|a| {
-            let live = activity.iter().find(|p| match p {
-                InProgress::PendingReview { label, .. } => label == &a.label,
-                InProgress::MasterWorking { name, .. } => name == &a.label,
-            });
-            Strip {
-                label: a.label.clone(),
-                role: render::tier_label(a.role).to_string(),
-                verb: live.map(|p| match p {
-                    InProgress::PendingReview { verb, .. }
-                    | InProgress::MasterWorking { verb, .. } => verb.to_string(),
-                }),
-                since: live.and_then(|p| p.since()),
+    let hue = derive::state_color(snap).hex();
+    let work = derive::work_projection(snap);
+
+    // The holders are the TUI's spinning rows; what each owes comes
+    // from the same routing that made it spin.
+    let mut holders: Vec<Holder> = in_progress_rows(snap)
+        .into_iter()
+        .map(|p| {
+            let (label, verb, since, role) = match p {
+                InProgress::PendingReview { label, verb, since } => {
+                    (label, verb, since, Role::Reviewer)
+                }
+                InProgress::MasterWorking { name, verb, since } => {
+                    (name, verb, since, Role::Master)
+                }
+            };
+            let object = clank_core::ids::AgentLabel::parse(&label)
+                .ok()
+                .and_then(|l| work.work_for(&l, role).into_iter().next())
+                .map(|item| object_of(&item))
+                .unwrap_or_default();
+            Holder {
+                label,
+                verb: verb.to_string(),
+                object,
+                since,
             }
         })
         .collect();
+    // Oldest first; an undated holder last.
+    holders.sort_by_key(|h| h.since.map(|s| (0, s)).unwrap_or((1, 0)));
+
+    let ask = snap
+        .blocks
+        .iter()
+        .find(|b| b.answer.is_none())
+        .map(|b| b.question.clone());
+    let floor = Floor {
+        holders,
+        ask,
+        correction: snap.head_correction.is_some(),
+        hue: hue.clone(),
+    };
+
+    // Master first, then the roster's order.
+    let mut ordered: Vec<&crate::cli::status::AgentAutoRow> = Vec::new();
+    if let Some(m) = snap
+        .agents
+        .iter()
+        .find(|a| a.role == crate::cli::teams_config::RosterRole::Master)
+    {
+        ordered.push(m);
+    }
+    ordered.extend(
+        snap.agents
+            .iter()
+            .filter(|a| a.role != crate::cli::teams_config::RosterRole::Master),
+    );
+    let track = ordered
+        .into_iter()
+        .map(|a| Position {
+            label: a.label.clone(),
+            role: render::tier_label(a.role).to_string(),
+            holds: floor.holders.iter().any(|h| h.label == a.label),
+            last: last_act(snap, &a.label, a.role),
+            transcript: with_transcript.contains(&a.label),
+        })
+        .collect();
+
+    let ledger = Ledger {
+        plan: snap.plans.first().map(|p| p.plan.as_str().to_string()),
+        gate: snap.plans.first().map(|p| gate_word(p.gate).to_string()),
+        dirty: snap.dirty.as_ref().map(crate::cli::status::dirty_summary),
+        queue: snap.queue.len(),
+        stash: snap.stash.len(),
+        blocks: snap
+            .blocks
+            .iter()
+            .filter(|b| b.answer.is_none())
+            .map(|b| b.question.clone())
+            .collect(),
+        rows: snap.log_rows.iter().map(ledger_row).collect(),
+    };
+
     WebFacts {
         lamp,
         plan,
-        hue: derive::state_color(snap).hex(),
-        strips,
+        hue,
+        floor,
+        track,
+        ledger,
+    }
+}
+
+/// What a routed item is about, as the floor says it.
+fn object_of(item: &clank_core::wait::WaitItem) -> String {
+    use clank_core::wait::WaitItem;
+    let short = |s: &clank_core::ids::CommitSha| s.as_str()[..7.min(s.as_str().len())].to_string();
+    match item {
+        WaitItem::Master { plan, .. } => plan.as_str().to_string(),
+        WaitItem::Reviewer { sha, .. } => short(sha),
+        WaitItem::AdHocReview { sha, .. } | WaitItem::AdHocRevise { sha } => {
+            format!("{} (ad-hoc)", short(sha))
+        }
+        WaitItem::PrReviewer { pr, round } | WaitItem::PrMaster { pr, round, .. } => {
+            format!("PR #{pr}, round {round}")
+        }
+        _ => String::new(),
+    }
+}
+
+/// The agent's newest act in the log: a reviewer's newest verdict,
+/// the master's newest commit.
+fn last_act(
+    snap: &StatusSnapshot,
+    label: &str,
+    role: crate::cli::teams_config::RosterRole,
+) -> Option<String> {
+    use crate::cli::log::OnelineRow;
+    if role == crate::cli::teams_config::RosterRole::Master {
+        let row = snap
+            .log_rows
+            .iter()
+            .find(|r| matches!(r, OnelineRow::Commit { .. }))?;
+        let OnelineRow::Commit { marker, .. } = row else {
+            return None;
+        };
+        return Some(match render::row_age(row) {
+            Some(age) => format!("{} committed, {age} ago", marker.glyph()),
+            None => format!("{} committed", marker.glyph()),
+        });
+    }
+    let row = snap
+        .log_rows
+        .iter()
+        .find(|r| matches!(r, OnelineRow::Review { author, .. } if author == label))?;
+    let OnelineRow::Review { verdict, .. } = row else {
+        return None;
+    };
+    let mark = crate::cli::log::verdict_mark(*verdict, false);
+    Some(match render::row_age(row) {
+        Some(age) => format!("{mark} {}, {age} ago", verdict_word(*verdict)),
+        None => format!("{mark} {}", verdict_word(*verdict)),
+    })
+}
+
+fn verdict_word(v: clank_core::vocab::Verdict) -> &'static str {
+    use clank_core::vocab::Verdict;
+    match v {
+        Verdict::Continue => "continued",
+        Verdict::Finished => "finished",
+        Verdict::RequestChanges => "requested changes",
+        Verdict::Unmarked => "unmarked",
+    }
+}
+
+fn gate_word(g: clank_core::vocab::CommitGateState) -> &'static str {
+    use clank_core::vocab::CommitGateState as G;
+    match g {
+        G::Unreviewed => "unreviewed",
+        G::Continued => "continued",
+        G::ContinuedPendingGate => "awaiting the gate",
+        G::ChangesRequested => "changes requested",
+        G::Finished => "finished",
+        G::Blocked => "blocked",
+    }
+}
+
+fn ledger_row(row: &crate::cli::log::OnelineRow) -> LedgerRow {
+    use crate::cli::log::OnelineRow;
+    let age = render::row_age(row);
+    let short = |s: &crate::lifecycle::CommitSha| s.as_str()[..7.min(s.as_str().len())].to_string();
+    match row {
+        OnelineRow::Header { plan } => LedgerRow {
+            kind: "header".into(),
+            glyph: None,
+            sha: None,
+            text: plan.clone().unwrap_or_else(|| "adhoc".into()),
+            author: None,
+            verdict: None,
+            age,
+        },
+        OnelineRow::Commit {
+            sha,
+            subject,
+            marker,
+            ..
+        } => LedgerRow {
+            kind: "commit".into(),
+            glyph: Some(marker.glyph().to_string()),
+            sha: Some(short(sha)),
+            text: subject.clone(),
+            author: None,
+            verdict: None,
+            age,
+        },
+        OnelineRow::PlainCommit { sha, subject, .. } => LedgerRow {
+            kind: "commit".into(),
+            glyph: None,
+            sha: Some(short(sha)),
+            text: subject.clone(),
+            author: None,
+            verdict: None,
+            age,
+        },
+        OnelineRow::Review {
+            verdict,
+            author,
+            summary,
+            ..
+        } => LedgerRow {
+            kind: "review".into(),
+            glyph: Some(crate::cli::log::verdict_mark(*verdict, false)),
+            sha: None,
+            text: summary.clone(),
+            author: Some(author.clone()),
+            verdict: Some(verdict_word(*verdict).into()),
+            age,
+        },
+        OnelineRow::Github { line, .. } => LedgerRow {
+            kind: "github".into(),
+            glyph: None,
+            sha: None,
+            text: line.clone(),
+            author: None,
+            verdict: None,
+            age,
+        },
+        OnelineRow::Notice(n) => LedgerRow {
+            kind: "notice".into(),
+            glyph: None,
+            sha: None,
+            text: n.clone(),
+            author: None,
+            verdict: None,
+            age,
+        },
     }
 }
 
@@ -4141,18 +4416,26 @@ pub(crate) mod tests {
         assert!(v.fill, "input/data/resize re-arm the fill");
     }
 
-    /// The web page's strips are the TUI's rows as data: same verb,
-    /// same `since`, same role names, same hue — asked of the same
-    /// functions, so the two surfaces cannot drift apart.
+    /// The floor, the track and the ledger are the TUI's own
+    /// derivations as data — asked of the same functions, so the two
+    /// surfaces cannot drift apart. Two reviewers missing on one
+    /// commit are two holders with their own clocks, oldest first;
+    /// the track is master-first with every holder marked.
     #[test]
     fn the_web_facts_are_the_tuis_own_derivation() {
-        use crate::cli::status_tui::fixtures::{plan_state_at, reviewer_missing, with_agents};
+        use crate::cli::status_tui::fixtures::{plan_state_at, with_agents};
         use crate::cli::teams_config::RosterRole;
-        let s = with_agents(
+        use clank_core::ids::AgentLabel;
+        let missing = clank_core::repo_state::NonEmptyVec::new(vec![
+            AgentLabel::parse("codex").unwrap(),
+            AgentLabel::parse("ruthless").unwrap(),
+        ])
+        .unwrap();
+        let mut s = with_agents(
             crate::cli::status_tui::fixtures::snap(
                 vec![plan_state_at(
                     "foo",
-                    reviewer_missing("codex"),
+                    clank_core::plan_view::WaitingOn::ReviewerApprovalsMissing { missing },
                     clank_core::wait::Handover {
                         opened: Some(1_000),
                         ..Default::default()
@@ -4161,31 +4444,78 @@ pub(crate) mod tests {
                 vec![],
             ),
             &[
-                ("claude", RosterRole::Master),
                 ("codex", RosterRole::Commit),
+                ("claude", RosterRole::Master),
+                ("ruthless", RosterRole::Commit),
             ],
         );
-        let facts = web_facts(&s);
+        s.log_rows = vec![crate::cli::log::OnelineRow::Review {
+            at: Some(crate::age::now() - 120),
+            verdict: clank_core::vocab::Verdict::Continue,
+            author: "ruthless".into(),
+            summary: "fine".into(),
+        }];
+        let with = ["codex".to_string()].into_iter().collect();
+        let facts = web_facts(&s, &with);
         let (lamp, plan) = render::bar_text(&s);
-        assert_eq!((facts.lamp, facts.plan), (lamp, plan));
+        assert_eq!((facts.lamp.clone(), facts.plan.clone()), (lamp, plan));
         assert_eq!(facts.hue, derive::state_color(&s).hex());
+
+        let holders: Vec<(&str, &str, &str, Option<i64>)> = facts
+            .floor
+            .holders
+            .iter()
+            .map(|h| {
+                (
+                    h.label.as_str(),
+                    h.verb.as_str(),
+                    h.object.as_str(),
+                    h.since,
+                )
+            })
+            .collect();
         assert_eq!(
-            facts.strips,
+            holders,
             vec![
-                Strip {
-                    label: "claude".into(),
-                    role: "master".into(),
-                    verb: None,
-                    since: None
-                },
-                Strip {
-                    label: "codex".into(),
-                    role: "commit".into(),
-                    verb: Some("reviewing".into()),
-                    since: Some(1_000)
-                },
+                ("codex", "reviewing", "abc1230", Some(1_000)),
+                ("ruthless", "reviewing", "abc1230", Some(1_000)),
             ],
-            "the awaited reviewer carries its verb and clock; the idle master carries neither"
+            "both missing reviewers hold the floor, on the sha they owe"
+        );
+        assert_eq!(facts.floor.ask, None);
+        assert!(!facts.floor.correction);
+
+        let track: Vec<(&str, &str, bool, bool)> = facts
+            .track
+            .iter()
+            .map(|p| (p.label.as_str(), p.role.as_str(), p.holds, p.transcript))
+            .collect();
+        assert_eq!(
+            track,
+            vec![
+                ("claude", "master", false, false),
+                ("codex", "commit", true, true),
+                ("ruthless", "commit", true, false),
+            ],
+            "master first, then roster order; every holder marked; transcript per agent"
+        );
+        assert_eq!(
+            facts.track[2].last.as_deref(),
+            Some("✓ continued, 2m ago"),
+            "a reviewer's last act is its newest verdict, aged"
+        );
+        assert_eq!(facts.ledger.plan.as_deref(), Some("foo"));
+        assert_eq!(facts.ledger.gate.as_deref(), Some("unreviewed"));
+        let row = &facts.ledger.rows[0];
+        assert_eq!(
+            (
+                row.kind.as_str(),
+                row.author.as_deref(),
+                row.verdict.as_deref(),
+                row.age.as_deref()
+            ),
+            ("review", Some("ruthless"), Some("continued"), Some("2m")),
+            "the ledger is the TUI's rows with the TUI's ages"
         );
     }
 

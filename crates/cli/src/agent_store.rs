@@ -597,6 +597,29 @@ fn binding_lock(repo: &Path, label: &AgentLabel) -> anyhow::Result<std::fs::File
     Ok(file)
 }
 
+/// Record where `session`'s transcript lives — only while that session
+/// still holds the label. Compare-and-set under the binding lock for
+/// the same reason release is: a path arriving after the label was
+/// rebound belongs to a session that is no longer this agent.
+pub fn record_transcript(
+    repo: &Path,
+    label: &AgentLabel,
+    session: &SessionId,
+    transcript: &str,
+) -> anyhow::Result<bool> {
+    let _owned = binding_lock(repo, label)?;
+    let mut cfg = load_agent_config(repo, label)?.unwrap_or_default();
+    let Some(bound) = cfg.session.as_mut().filter(|s| &s.id == session) else {
+        return Ok(false);
+    };
+    if bound.transcript.as_deref() == Some(transcript) {
+        return Ok(true);
+    }
+    bound.transcript = Some(transcript.to_string());
+    save_agent_config(repo, label, &cfg)?;
+    Ok(true)
+}
+
 pub fn bind_session_to_agent(
     repo: &Path,
     label: &AgentLabel,
@@ -628,6 +651,7 @@ pub fn bind_session_to_agent(
         id: session_id.clone(),
         tool,
         updated_at: now,
+        transcript: None,
     });
     // A binding is an ownership CLAIM on the label: mint the wait
     // generation FIRST, so a completed claim can never exist without
@@ -829,6 +853,7 @@ mod tests {
             id: new.clone(),
             tool: Tool::Claude,
             updated_at: "2026-09-11T09:27:15Z".to_string(),
+            transcript: None,
         });
         mint_wait_generation(&agents_root(&repo).join(l.as_str())).unwrap();
         save_agent_config(&repo, &l, &cfg).unwrap();
@@ -852,6 +877,52 @@ mod tests {
             read_wait_generation(&agents_root(&repo).join(l.as_str())),
             armed,
             "and its parked wait was never revoked"
+        );
+    }
+
+    /// The transcript path is recorded only while the session that
+    /// reported it still holds the label — a path arriving after a
+    /// rebind belongs to a session that is no longer this agent.
+    #[test]
+    fn a_transcript_is_recorded_for_the_bound_session_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let l = label("claude");
+        let (old, new) = (
+            sess("e30f2b50-4cef-4955-86a0-fbfe64a768b3"),
+            sess("11111111-2222-3333-4444-555555555555"),
+        );
+        bind_session_to_agent(repo, &l, Tool::Claude, &old).unwrap();
+        assert!(record_transcript(repo, &l, &old, "/t/old.jsonl").unwrap());
+        assert_eq!(
+            load_agent_config(repo, &l)
+                .unwrap()
+                .unwrap()
+                .session
+                .unwrap()
+                .transcript
+                .as_deref(),
+            Some("/t/old.jsonl")
+        );
+        assert!(
+            record_transcript(repo, &l, &old, "/t/old.jsonl").unwrap(),
+            "same path: still bound"
+        );
+
+        bind_session_to_agent(repo, &l, Tool::Claude, &new).unwrap();
+        assert!(
+            !record_transcript(repo, &l, &old, "/t/late.jsonl").unwrap(),
+            "the old session's path does not land on the new binding"
+        );
+        assert_eq!(
+            load_agent_config(repo, &l)
+                .unwrap()
+                .unwrap()
+                .session
+                .unwrap()
+                .transcript,
+            None,
+            "a fresh binding starts without a transcript until its own session reports one"
         );
     }
 

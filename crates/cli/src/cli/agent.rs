@@ -1817,6 +1817,7 @@ mod tests {
             id: clank_core::ids::SessionId::parse("ses_8f2a1b3c4d5e6f70").unwrap(),
             tool: Tool::OpenCode,
             updated_at: "2026-06-04T12:00:00Z".to_string(),
+            transcript: None,
         }
     }
 
@@ -1891,6 +1892,7 @@ mod tests {
             id: clank_core::ids::SessionId::parse("11111111-1111-1111-1111-111111111111").unwrap(),
             tool: Tool::Claude,
             updated_at: "2026-06-04T12:00:00Z".to_string(),
+            transcript: None,
         }
     }
 
@@ -1901,6 +1903,7 @@ mod tests {
             id: clank_core::ids::SessionId::parse("aaaaaaaa-1111-2222-3333-444444444444").unwrap(),
             tool: Tool::Claude,
             updated_at: "2026-06-04T12:00:00Z".to_string(),
+            transcript: None,
         }
     }
 
@@ -1909,6 +1912,7 @@ mod tests {
             id: clank_core::ids::SessionId::parse("bbbbbbbb-1111-2222-3333-444444444444").unwrap(),
             tool: Tool::Codex,
             updated_at: "2026-06-04T12:00:00Z".to_string(),
+            transcript: None,
         }
     }
 
@@ -1917,6 +1921,7 @@ mod tests {
             id: clank_core::ids::SessionId::parse("cccccccc-1111-2222-3333-444444444444").unwrap(),
             tool: Tool::Grok,
             updated_at: "2026-06-04T12:00:00Z".to_string(),
+            transcript: None,
         }
     }
 
@@ -3173,6 +3178,7 @@ mod tests {
             id: clank_core::ids::SessionId::parse("9c96eb03-1458-4bac-abbb-90243cfd422c").unwrap(),
             tool: Tool::Claude,
             updated_at: String::new(),
+            transcript: None,
         };
         let resume = compose_launch(
             Path::new("/repo"),
