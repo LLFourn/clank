@@ -200,21 +200,35 @@ is good for one use within five minutes. Sessions last thirty days,
 hashed in `~/.clank/remote-sessions.json`, and the page lists them;
 Backspace revokes one, and a revoked session's stream ends at once.
 
-A phone reaches the page through a tunnel, configured once in
-`~/.clank/config.json` under `remote.tunnel` and brought up with the
-remote: `{"provider": "ngrok", "domain": "you.ngrok.app"}` runs
-ngrok natively through its SDK, with the authtoken read from
-`NGROK_AUTHTOKEN` or the ngrok agent's own config file (never
-clank's); `{"provider": "command", "run": ["cloudflared", "tunnel",
-"run", "--url", "http://localhost:{port}", "clank"], "url":
-"https://clank.example.com"}` runs any binary that forwards a fixed
-hostname to the port. The tunnel's URL is where the phone's link
-points, and it is on the row only
-once the TUI has reached its own remote through it — the nonce and
-the event stream both, since a tunnel that buffers streams cannot
-carry the page (Cloudflare's quick tunnels do not). One TUI holds a
-hostname at a time; a second is told whose it is. Switching the
-remote off ends the tunnel with it.
+A phone reaches the page through a tunnel, and there is no remote
+without one: with nothing configured the row reads `not configured`
+and the switch refuses, because a page on loopback reaches nobody.
+Configure it once in `~/.clank/config.json` under `remote.tunnel`:
+
+- `{"provider": "quick"}` — no account, no domain, nothing to
+  install. An ephemeral `*.trycloudflare.com` handed out at start,
+  spoken natively. Start here.
+- `{"provider": "ngrok", "domain": "you.ngrok.app"}` — a domain you
+  own, through ngrok's SDK, with the authtoken read from
+  `NGROK_AUTHTOKEN` or the ngrok agent's own config file (never
+  clank's).
+- `{"provider": "command", "run": ["ssh", "-R",
+  "80:localhost:{port}", "nokey@localhost.run"]}` — any binary that
+  forwards this port, with `{port}` substituted. Without a `url` the
+  hostname is read from what the child prints on either stream,
+  which is how the ssh services announce theirs; add
+  `"url_contains": "localhost.run"` when it prints a banner or help
+  link first. With a `url` (`"https://clank.example.com"`, a named
+  cloudflared tunnel) the hostname is yours and is claimed before
+  the child runs.
+
+A hostname you own is leased before its connector starts, because a
+second connector against it would be routed to by the edge before
+any teardown could undo it; one handed out at start is leased the
+moment it is known. Either way one TUI holds it at a time and a
+second is told whose it is. The URL reaches the row only once the
+TUI has reached its own remote through it, and switching the remote
+off ends the tunnel with it.
 
 ## Command reference
 

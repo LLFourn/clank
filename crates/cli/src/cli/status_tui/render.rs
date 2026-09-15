@@ -1105,7 +1105,7 @@ pub(super) fn remote_hue(
     use crate::cli::status_tui::derive::Hue;
     use crate::cli::status_tui::remote::Shown::*;
     match remote {
-        Off => Hue::Indexed(245),
+        Off | Unconfigured => Hue::Indexed(245),
         Starting | Stopping => Hue::Yellow,
         On => Hue::Green,
         Failed => Hue::Red,
@@ -1126,13 +1126,14 @@ pub(super) fn remote_row(
         On => Style::Color("32"),
         Failed => Style::Color("31"),
         Starting | Stopping => Style::Color("33"),
-        Off => Style::Dim,
+        Off | Unconfigured => Style::Dim,
     };
     // The reason is the server's stderr tail — lines, and whatever
     // control bytes it printed; the overlay shows it whole, the row
     // its first line and nothing that could move the cursor (codex
     // on 5fd8a69).
     let said = match (remote, detail) {
+        (Unconfigured, _) => "not configured".to_string(),
         (Off, _) => "off".to_string(),
         (Starting, _) => "starting…".to_string(),
         (Stopping, _) => "stopping…".to_string(),
@@ -1605,6 +1606,7 @@ pub(super) fn render_remote_page(
                     Shown::On => "switch off",
                     Shown::Starting => "starting…",
                     Shown::Stopping => "stopping…",
+                    Shown::Unconfigured => "switch on — nothing is configured",
                     Shown::Off | Shown::Failed => "switch on",
                 }
             ))],

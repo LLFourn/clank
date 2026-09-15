@@ -477,22 +477,47 @@
   function onStatus(d) { facts = d.facts; paintFloor(); paintTrack(); paintLedger(); if (selected) select(selected); }
   setInterval(() => { paintFloor(); if (selected) paintTranscript(selected); }, 60000);
 
-  // ---- the stream ----
+  // ---- the live channel ----
+  // A WebSocket, not an EventSource: the accountless tunnel's edge
+  // buffers a response body until it completes and so never delivers
+  // a stream, while an upgrade's frames come through at once. The
+  // frames themselves are unchanged — `event: NAME\ndata: JSON` —
+  // so the server side of the feed did not have to move.
+  const handlers = { status: onStatus, panes: onPanes, pane: onPane, turns: applyTurns, turn: applyTurn };
+  let socket = null, retry = 0, closedForGood = false;
+
+  function deliver(text) {
+    const cut = text.indexOf('\n');
+    if (cut < 0) return;
+    const event = text.slice(0, cut).replace(/^event: /, '');
+    const data = text.slice(cut + 1).replace(/^data: /, '').replace(/\n+$/, '');
+    const handler = handlers[event];
+    if (!handler || !data) return;
+    try { handler(JSON.parse(data)); } catch (err) { console.error(event, err); }
+  }
+
   function connect() {
-    const es = new EventSource('/events');
-    es.addEventListener('status', (e) => onStatus(JSON.parse(e.data)));
-    es.addEventListener('panes', (e) => onPanes(JSON.parse(e.data)));
-    es.addEventListener('pane', (e) => onPane(JSON.parse(e.data)));
-    es.addEventListener('turns', (e) => applyTurns(JSON.parse(e.data)));
-    es.addEventListener('turn', (e) => applyTurn(JSON.parse(e.data)));
-    es.onopen = () => { liveEl.textContent = 'live'; liveEl.classList.remove('off'); };
-    // A stream the door closed — the session revoked or expired —
-    // ends the same way a dropped connection does; the page asks
-    // which before it lets the browser retry forever.
-    es.onerror = async () => {
+    if (closedForGood) return;
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    socket = new WebSocket(`${proto}//${location.host}/events`);
+    socket.onopen = () => { retry = 0; liveEl.textContent = 'live'; liveEl.classList.remove('off'); };
+    socket.onmessage = (e) => deliver(e.data);
+    // Unlike an EventSource, a socket does not retry itself. A close
+    // the door caused — the session revoked or expired — must not be
+    // retried forever, so the page asks which before backing off.
+    socket.onclose = async () => {
       liveEl.textContent = 'reconnecting'; liveEl.classList.add('off');
-      try { if ((await fetch('/whoami')).status === 401) { es.close(); location.replace('/login'); } } catch (e) {}
+      try {
+        if ((await fetch('/whoami')).status === 401) {
+          closedForGood = true;
+          location.replace('/login');
+          return;
+        }
+      } catch (err) {}
+      retry = Math.min(retry + 1, 6);
+      setTimeout(connect, Math.min(250 * 2 ** retry, 10000));
     };
+    socket.onerror = () => { try { socket.close(); } catch (err) {} };
   }
 
   form.addEventListener('submit', async (e) => {

@@ -98,6 +98,15 @@ base64 = "0.22"
 subtle = "2"
 ngrok = { version = "0.19", default-features = false, features = ["ring"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
+# The accountless tunnel: an ephemeral *.trycloudflare.com, no
+# account and no binary. Its edge buffers streamed responses, which
+# is why the page's live channel has a long-poll mode.
+cloudflare-quick-tunnel = "0.3"
+# The page's live channel is a WebSocket, because the accountless
+# tunnel's edge buffers a response body until it completes and so
+# never delivers a stream — an upgrade is not a body (measured).
+hyper-tungstenite = "0.30"
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 
 [[bin]]
 name = "clank"

@@ -10,6 +10,28 @@ use std::sync::{Arc, Mutex};
 use crate::cli::web::door::{Door, Link};
 use crate::cli::web::{Instance, Panes};
 
+/// What the tunnel source last said, as the row draws it.
+enum Configured {
+    /// No tunnel in the config: the switch refuses.
+    Absent,
+    /// A tunnel the source could build.
+    Ready,
+    /// A tunnel IS configured but could not be built — ngrok with no
+    /// authtoken, a config that will not parse. The reason is the
+    /// operator's to see; "not configured" is not it.
+    Broken(String),
+}
+
+/// What the row says beside `remote` when no tunnel is configured.
+const UNCONFIGURED: &str = "not configured";
+
+/// And what the switch says when it is thrown anyway.
+const UNCONFIGURED_HOW: &str = "No remote is configured, so there is nowhere to serve it.\n\n\
+     Add a tunnel to ~/.clank/config.json, for example:\n\n\
+     \"remote\": { \"tunnel\": { \"provider\": \"quick\" } }\n\n\
+     `quick` needs no account and no domain; `ngrok` and `command` \
+     are the other providers.";
+
 /// What the bar and the row draw.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(super) enum Shown {
@@ -19,6 +41,11 @@ pub(super) enum Shown {
     On,
     Stopping,
     Failed,
+    /// No tunnel configured. The remote exists to be reached from
+    /// elsewhere, and a page bound to loopback reaches nobody, so
+    /// this is a state rather than a start that quietly serves
+    /// nothing useful (the-tunnel-says-its-own-name).
+    Unconfigured,
 }
 
 /// What a task or thread of the switch's reported back: the start it
@@ -103,6 +130,12 @@ pub(super) struct Remote<O: Opener> {
     /// remote is on or off.
     door: Arc<Door>,
     tunnel: TunnelSource,
+    /// What the tunnel source last said. For DRAWING only — the row
+    /// is painted far more often than the config changes, so it
+    /// reads a remembered answer — and never for deciding whether a
+    /// start is legal, which only the fresh read in the start task
+    /// may decide (codex on 5149876).
+    configured: std::cell::RefCell<Configured>,
     /// How often the panes are re-listed, and how long a stop lets
     /// the tasks end on their own; the production values, or a test's.
     poll: std::time::Duration,
@@ -135,6 +168,7 @@ impl<O: Opener> Remote<O> {
             panes,
             door,
             tunnel: Arc::new(|| Ok(None)),
+            configured: std::cell::RefCell::new(Configured::Absent),
             poll,
             grace,
             opener,
@@ -148,12 +182,31 @@ impl<O: Opener> Remote<O> {
     /// Where the tunnel provider is read from at each start.
     pub(super) fn tunnel_from(mut self, source: TunnelSource) -> Self {
         self.tunnel = source;
+        self.recheck_configured();
         self
+    }
+
+    /// Re-read what the tunnel source says. Cheap enough for a
+    /// snapshot rebuild and far too dear for a frame, which is why
+    /// the row reads a remembered answer. An error is KEPT as an
+    /// error: a provider that is configured but cannot be built —
+    /// ngrok without an authtoken, a config that will not parse —
+    /// must not be reported as no tunnel at all (codex on 5149876).
+    fn recheck_configured(&self) {
+        *self.configured.borrow_mut() = match (self.tunnel)() {
+            Ok(Some(_)) => Configured::Ready,
+            Ok(None) => Configured::Absent,
+            Err(e) => Configured::Broken(format!("{e:#}")),
+        };
     }
 
     pub(super) fn shown(&self) -> Shown {
         match self.state {
-            State::Off => Shown::Off,
+            State::Off => match &*self.configured.borrow() {
+                Configured::Absent => Shown::Unconfigured,
+                Configured::Broken(_) => Shown::Failed,
+                Configured::Ready => Shown::Off,
+            },
             State::Starting { .. } => Shown::Starting,
             State::On { .. } => Shown::On,
             State::Stopping { .. } => Shown::Stopping,
@@ -172,6 +225,11 @@ impl<O: Opener> Remote<O> {
                     .unwrap_or_else(|| instance.url.clone()),
             ),
             State::Failed { why } => Some(why.clone()),
+            State::Off => match &*self.configured.borrow() {
+                Configured::Absent => Some(UNCONFIGURED.to_string()),
+                Configured::Broken(why) => Some(why.clone()),
+                Configured::Ready => None,
+            },
             _ => None,
         }
     }
@@ -211,6 +269,18 @@ impl<O: Opener> Remote<O> {
                 None
             }
             State::Off | State::Failed { .. } => {
+                // A fast, fresh refusal so the common "never set it
+                // up" case answers on the keypress. It is NOT the
+                // gate: the start task reads again, because the
+                // config can change while zellij is being found.
+                self.recheck_configured();
+                if matches!(&*self.configured.borrow(), Configured::Absent) {
+                    self.state = State::Off;
+                    return Some(Notice {
+                        title: "remote".to_string(),
+                        message: UNCONFIGURED_HOW.to_string(),
+                    });
+                }
                 self.generation += 1;
                 let mut report = self.reporter();
                 let (repo, home, poll, grace) =
@@ -227,16 +297,18 @@ impl<O: Opener> Remote<O> {
                         .await
                         .unwrap_or_else(|_| Err(anyhow::anyhow!("finding zellij panicked")));
                     let started = match found {
-                        Ok((panes, configured)) => {
-                            let start = configured.map(|(provider, grace)| {
-                                crate::cli::web::tunnel::Start {
-                                    provider,
-                                    grace,
-                                    abort: abandoned,
-                                }
-                            });
-                            Instance::start(repo, home, panes, door, start, poll, grace).await
+                        // THE gate: the tunnel read fresh, beside the
+                        // panes, in the same task that starts. A
+                        // remote with none is not started at all.
+                        Ok((panes, Some((provider, tunnel_grace)))) => {
+                            let start = crate::cli::web::tunnel::Start {
+                                provider,
+                                grace: tunnel_grace,
+                                abort: abandoned,
+                            };
+                            Instance::start(repo, home, panes, door, Some(start), poll, grace).await
                         }
+                        Ok((_, None)) => Err(anyhow::anyhow!("{UNCONFIGURED_HOW}")),
                         Err(e) => Err(e),
                     };
                     report(match started {
@@ -254,6 +326,7 @@ impl<O: Opener> Remote<O> {
 
     /// The TUI rebuilt its snapshot; the page follows.
     pub(super) fn observe(&self, snap: &crate::cli::status::StatusSnapshot) {
+        self.recheck_configured();
         if let State::On { instance } = &self.state {
             instance.observe(snap);
         }
@@ -542,6 +615,10 @@ mod tests {
 
     /// `slow` is both how long finding zellij takes and how long each
     /// listing does.
+    /// A remote with a tunnel that forwards to the instance's own
+    /// loopback URL. Every remote has one now — a remote with no
+    /// tunnel refuses to start at all — so the lifecycle tests carry
+    /// the smallest tunnel that is still a tunnel.
     fn remote_with(
         repo: &std::path::Path,
         answers: bool,
@@ -549,10 +626,33 @@ mod tests {
         poll: std::time::Duration,
         grace: std::time::Duration,
     ) -> (Remote<Recorder>, Recorder) {
+        // A tunnel needs a home for its lease, and this fake one
+        // needs the port before the instance binds it, so the port
+        // is settled up front — but ONLY when zellij will answer,
+        // because a start that fails before listening must leave the
+        // repo with no port remembered.
+        let home = repo.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let port = if answers {
+            let l = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let p = l.local_addr().unwrap().port();
+            drop(l);
+            crate::agent_store::record_web_port(repo, p).unwrap();
+            p
+        } else {
+            0
+        };
         let rec = Recorder::default();
+        let provider = Arc::new(FakeTunnel {
+            allocated: false,
+            url: format!("http://localhost:{port}"),
+            pending: false,
+            started: Default::default(),
+            stopped: Default::default(),
+        });
         let r = Remote::new(
             repo.to_path_buf(),
-            None,
+            Some(home),
             Arc::new(move || {
                 std::thread::sleep(slow);
                 Ok(Arc::new(FakePanes { answers, slow }) as Arc<dyn Panes>)
@@ -562,8 +662,162 @@ mod tests {
             grace,
             rec.clone(),
             Arc::new(|| {}),
-        );
+        )
+        .tunnel_from(Arc::new(move || {
+            Ok(Some((
+                provider.clone() as Arc<dyn crate::cli::web::tunnel::Provider>,
+                std::time::Duration::from_secs(5),
+            )))
+        }));
         (r, rec)
+    }
+
+    /// The display cache is not the gate. A source that said Some
+    /// when the row was painted and says None by the time the start
+    /// task reads it must NOT bind a loopback-only server: the
+    /// fresh read in the task decides (codex on 5149876).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_tunnel_removed_after_the_row_was_painted_still_refuses() {
+        let repo = repo_with_config();
+        let home = repo.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counting = reads.clone();
+        let rec = Recorder::default();
+        let mut r = Remote::new(
+            repo.path().to_path_buf(),
+            Some(home),
+            Arc::new(|| {
+                Ok(Arc::new(FakePanes {
+                    answers: true,
+                    slow: std::time::Duration::ZERO,
+                }) as Arc<dyn Panes>)
+            }),
+            Arc::new(Door::new(None)),
+            crate::cli::web::PANE_POLL,
+            crate::cli::web::STOP_GRACE,
+            rec.clone(),
+            Arc::new(|| {}),
+        )
+        .tunnel_from(Arc::new(move || {
+            // Configured for the first two reads — the one that fills
+            // the row's cache and the one the toggle makes — and gone
+            // by the time the start task looks.
+            if counting.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 2 {
+                Ok(Some((
+                    Arc::new(FakeTunnel {
+                        allocated: false,
+                        url: "http://localhost:1".to_string(),
+                        pending: false,
+                        started: Default::default(),
+                        stopped: Default::default(),
+                    }) as Arc<dyn crate::cli::web::tunnel::Provider>,
+                    std::time::Duration::from_secs(1),
+                )))
+            } else {
+                Ok(None)
+            }
+        }));
+        assert_eq!(r.shown(), Shown::Off, "the row saw a configured tunnel");
+
+        let snap = snap();
+        assert_eq!(r.toggle(), None, "the keypress had a tunnel to start");
+        let notices = settle(&mut r, &snap).await;
+        assert_eq!(r.shown(), Shown::Failed, "the fresh read refused it");
+        let why = r.detail().unwrap();
+        assert!(why.contains("No remote is configured"), "{why}");
+        assert!(!notices.is_empty());
+        assert!(rec.opened.lock().unwrap().is_empty(), "no browser");
+        assert_eq!(
+            crate::agent_store::web_port(repo.path()).unwrap(),
+            None,
+            "and nothing was bound"
+        );
+        r.stop().await;
+    }
+
+    /// A tunnel that IS configured but cannot be built — ngrok with
+    /// no authtoken, a config that will not parse — is an error to
+    /// show, not an absence to misreport (codex on 5149876).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_source_that_errors_is_not_the_same_as_no_tunnel() {
+        let repo = repo_with_config();
+        let rec = Recorder::default();
+        let mut r = Remote::new(
+            repo.path().to_path_buf(),
+            Some(repo.path().to_path_buf()),
+            Arc::new(|| {
+                Ok(Arc::new(FakePanes {
+                    answers: true,
+                    slow: std::time::Duration::ZERO,
+                }) as Arc<dyn Panes>)
+            }),
+            Arc::new(Door::new(None)),
+            crate::cli::web::PANE_POLL,
+            crate::cli::web::STOP_GRACE,
+            rec.clone(),
+            Arc::new(|| {}),
+        )
+        .tunnel_from(Arc::new(|| {
+            anyhow::bail!("ngrok: no authtoken — set NGROK_AUTHTOKEN")
+        }));
+
+        assert_eq!(r.shown(), Shown::Failed, "not `unconfigured`");
+        let why = r.detail().unwrap();
+        assert!(why.contains("no authtoken"), "the reason is shown: {why}");
+        assert!(
+            !why.contains("not configured") && !why.contains("No remote is configured"),
+            "a broken tunnel is not an absent one: {why}"
+        );
+
+        // And throwing the switch reports the same reason rather
+        // than telling the operator to add a tunnel they have.
+        let snap = snap();
+        assert_eq!(r.toggle(), None, "it is not refused as absent");
+        settle(&mut r, &snap).await;
+        assert_eq!(r.shown(), Shown::Failed);
+        let why = r.detail().unwrap();
+        assert!(why.contains("no authtoken"), "{why}");
+        r.stop().await;
+    }
+
+    /// The switch refuses when no tunnel is configured, and says the
+    /// config line to add: a page on loopback reaches nobody, which
+    /// is the whole point of the remote.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unconfigured_remote_refuses_and_binds_nothing() {
+        let repo = repo_with_config();
+        let (mut r, rec) = {
+            let rec = Recorder::default();
+            let r = Remote::new(
+                repo.path().to_path_buf(),
+                None,
+                Arc::new(|| {
+                    Ok(Arc::new(FakePanes {
+                        answers: true,
+                        slow: std::time::Duration::ZERO,
+                    }) as Arc<dyn Panes>)
+                }),
+                Arc::new(Door::new(None)),
+                crate::cli::web::PANE_POLL,
+                crate::cli::web::STOP_GRACE,
+                rec.clone(),
+                Arc::new(|| {}),
+            )
+            .tunnel_from(Arc::new(|| Ok(None)));
+            (r, rec)
+        };
+        assert_eq!(r.shown(), Shown::Unconfigured);
+        assert_eq!(r.detail().as_deref(), Some("not configured"));
+
+        let notice = r.toggle().expect("the switch says why");
+        assert!(notice.message.contains("remote.tunnel") || notice.message.contains("\"tunnel\""));
+        assert!(notice.message.contains("quick"), "{}", notice.message);
+        assert_eq!(r.shown(), Shown::Unconfigured, "and nothing started");
+        assert!(rec.opened.lock().unwrap().is_empty(), "no browser");
+        // Nothing was bound: the repo never had to remember a port.
+        assert_eq!(crate::agent_store::web_port(repo.path()).unwrap(), None);
+        r.stop().await;
     }
 
     /// A listing longer than the grace: the poll's task is aborted
@@ -654,31 +908,41 @@ mod tests {
     /// started and stopped. A `pending` one never finishes starting.
     struct FakeTunnel {
         url: String,
+        /// True when the hostname is only known at start — the kind
+        /// leased after discovery rather than claimed before.
+        allocated: bool,
         pending: bool,
         started: Arc<std::sync::atomic::AtomicBool>,
         stopped: Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl crate::cli::web::tunnel::Provider for FakeTunnel {
-        fn url(&self) -> String {
-            self.url.clone()
+        fn reservation(&self) -> Option<String> {
+            self.allocated
+                .then_some(())
+                .map_or(Some(self.url.clone()), |_| None)
         }
         fn start(
             &self,
             _port: u16,
+            _deadline: tokio::time::Instant,
         ) -> futures_util::future::BoxFuture<
             '_,
-            anyhow::Result<Box<dyn crate::cli::web::tunnel::Handle>>,
+            anyhow::Result<(String, Box<dyn crate::cli::web::tunnel::Handle>)>,
         > {
             self.started
                 .store(true, std::sync::atomic::Ordering::Relaxed);
             let stopped = self.stopped.clone();
             let pending = self.pending;
+            let url = self.url.clone();
             Box::pin(async move {
                 if pending {
                     std::future::pending::<()>().await;
                 }
-                Ok(Box::new(FakeHandle { stopped }) as Box<dyn crate::cli::web::tunnel::Handle>)
+                Ok((
+                    url,
+                    Box::new(FakeHandle { stopped }) as Box<dyn crate::cli::web::tunnel::Handle>,
+                ))
             })
         }
     }
@@ -703,6 +967,15 @@ mod tests {
         url: Option<String>,
         pending: bool,
     ) -> (Remote<Recorder>, tempfile::TempDir, Arc<FakeTunnel>) {
+        tunnelled_with(home, url, pending, false).await
+    }
+
+    async fn tunnelled_with(
+        home: &std::path::Path,
+        url: Option<String>,
+        pending: bool,
+        allocated: bool,
+    ) -> (Remote<Recorder>, tempfile::TempDir, Arc<FakeTunnel>) {
         let repo = repo_with_config();
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
@@ -711,6 +984,7 @@ mod tests {
         drop(listener);
         crate::agent_store::record_web_port(repo.path(), port).unwrap();
         let provider = Arc::new(FakeTunnel {
+            allocated,
             url: url.unwrap_or_else(|| format!("http://localhost:{port}")),
             pending,
             started: Default::default(),
@@ -800,6 +1074,125 @@ mod tests {
         b.stop().await;
     }
 
+    /// An ALLOCATED endpoint — a hostname that does not exist until
+    /// the tunnel is handed one — is leased after the start reports
+    /// it, and a second remote on the same allocated name is refused
+    /// by that lease. A CLAIMED endpoint whose tunnel comes up
+    /// somewhere else is an error, not a hostname to adopt.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_allocated_endpoint_is_leased_once_the_start_names_it() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let home = tempfile::tempdir().unwrap();
+        let snap = snap();
+
+        // Allocated: reservation() is None, so nothing is leased
+        // before the start; the URL it reports is leased after.
+        let (mut a, _repo_a, tunnel_a) = tunnelled_with(home.path(), None, false, true).await;
+        assert!(
+            crate::cli::web::tunnel::Provider::reservation(&*tunnel_a).is_none(),
+            "nothing to claim up front"
+        );
+        assert_eq!(a.toggle(), None);
+        settle(&mut a, &snap).await;
+        assert_eq!(a.shown(), Shown::On);
+        assert_eq!(a.detail().as_deref(), Some(tunnel_a.url.as_str()));
+        assert!(tunnel_a.started.load(Relaxed));
+
+        // A second remote handed the SAME allocated name: the lease
+        // taken after discovery still excludes it, and its tunnel is
+        // stopped rather than left running.
+        let (mut b, _repo_b, tunnel_b) =
+            tunnelled_with(home.path(), Some(tunnel_a.url.clone()), false, true).await;
+        assert_eq!(b.toggle(), None);
+        settle(&mut b, &snap).await;
+        assert_eq!(b.shown(), Shown::Failed);
+        let why = b.detail().unwrap();
+        assert!(why.contains("held by"), "{why}");
+        assert!(
+            tunnel_b.started.load(Relaxed) && tunnel_b.stopped.load(Relaxed),
+            "started to learn the name, then stopped"
+        );
+        a.stop().await;
+        b.stop().await;
+    }
+
+    /// A claimed reservation the tunnel contradicts is refused, and
+    /// what it did start is torn down.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reservation_the_tunnel_contradicts_is_an_error() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let home = tempfile::tempdir().unwrap();
+        let repo = repo_with_config();
+        let rec = Recorder::default();
+        // Claims one hostname, comes up on another.
+        let provider = Arc::new(FakeTunnel {
+            allocated: false,
+            url: "http://localhost:9".to_string(),
+            pending: false,
+            started: Default::default(),
+            stopped: Default::default(),
+        });
+        let claimed = Arc::new(Claiming {
+            claim: "http://elsewhere.example:1".to_string(),
+            inner: provider.clone(),
+        });
+        let mut r = Remote::new(
+            repo.path().to_path_buf(),
+            Some(home.path().to_path_buf()),
+            Arc::new(|| {
+                Ok(Arc::new(FakePanes {
+                    answers: true,
+                    slow: std::time::Duration::ZERO,
+                }) as Arc<dyn Panes>)
+            }),
+            Arc::new(Door::new(None)),
+            crate::cli::web::PANE_POLL,
+            crate::cli::web::STOP_GRACE,
+            rec.clone(),
+            Arc::new(|| {}),
+        )
+        .tunnel_from(Arc::new(move || {
+            Ok(Some((
+                claimed.clone() as Arc<dyn crate::cli::web::tunnel::Provider>,
+                std::time::Duration::from_secs(2),
+            )))
+        }));
+        let snap = snap();
+        assert_eq!(r.toggle(), None);
+        settle(&mut r, &snap).await;
+        assert_eq!(r.shown(), Shown::Failed);
+        let why = r.detail().unwrap();
+        assert!(
+            why.contains("reserved") && why.contains("came up on"),
+            "{why}"
+        );
+        assert!(provider.stopped.load(Relaxed), "what started is stopped");
+        r.stop().await;
+    }
+
+    /// Wraps a provider to claim a DIFFERENT endpoint than the one
+    /// its start will report.
+    struct Claiming {
+        claim: String,
+        inner: Arc<FakeTunnel>,
+    }
+
+    impl crate::cli::web::tunnel::Provider for Claiming {
+        fn reservation(&self) -> Option<String> {
+            Some(self.claim.clone())
+        }
+        fn start(
+            &self,
+            port: u16,
+            deadline: tokio::time::Instant,
+        ) -> futures_util::future::BoxFuture<
+            '_,
+            anyhow::Result<(String, Box<dyn crate::cli::web::tunnel::Handle>)>,
+        > {
+            self.inner.start(port, deadline)
+        }
+    }
+
     /// A provider that never finishes connecting: the start fails at
     /// the grace, and the exit path abandons it at once rather than
     /// waiting the grace out (codex on 6f60efa).
@@ -814,9 +1207,16 @@ mod tests {
         assert_eq!(p.shown(), Shown::Failed);
         let why = p.detail().unwrap();
         assert!(why.contains("did not come up within 1s"), "{why}");
+        // A provider that ignores its deadline is cut off by the
+        // caller's backstop, one stop-bound later. Still bounded,
+        // just not by the grace alone.
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(4),
-            "bounded by the grace"
+            started.elapsed()
+                < std::time::Duration::from_secs(1)
+                    + crate::cli::web::tunnel::STOP_BOUND
+                    + std::time::Duration::from_secs(3),
+            "bounded by the grace and the backstop: {:?}",
+            started.elapsed()
         );
         p.stop().await;
 
@@ -927,23 +1327,39 @@ mod tests {
             .unwrap();
         assert_eq!(page.status(), 200);
         assert!(page.text().await.unwrap().contains("<title>clank</title>"));
-        // Seeded: the stream opens with the snapshot's facts, before
-        // any repository change.
-        let mut stream = client
-            .get(format!("{url}/events"))
-            .header("cookie", &cookie)
-            .send()
-            .await
-            .unwrap();
+        // Seeded: the socket opens with the snapshot's facts, before
+        // any repository change. It is a WebSocket now, and it
+        // carries the page's origin like any other request from it.
         let mut opening = String::new();
-        while !opening.contains("event: status") {
-            let chunk = tokio::time::timeout(Duration::from_secs(5), stream.chunk())
-                .await
-                .expect("a frame")
-                .unwrap()
-                .expect("the retained state");
-            opening.push_str(&String::from_utf8_lossy(&chunk));
-        }
+        let mut socket = {
+            use futures_util::StreamExt;
+            let request = tokio_tungstenite::tungstenite::handshake::client::Request::builder()
+                .uri(format!("{}/events", url.replacen("http://", "ws://", 1)))
+                .header("host", url.replacen("http://", "", 1))
+                .header("origin", &url)
+                .header("cookie", &cookie)
+                .header("connection", "Upgrade")
+                .header("upgrade", "websocket")
+                .header("sec-websocket-version", "13")
+                .header(
+                    "sec-websocket-key",
+                    tokio_tungstenite::tungstenite::handshake::client::generate_key(),
+                )
+                .body(())
+                .unwrap();
+            let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+            while !opening.contains("event: status") {
+                let frame = tokio::time::timeout(Duration::from_secs(5), socket.next())
+                    .await
+                    .expect("a frame")
+                    .expect("the retained state")
+                    .unwrap();
+                if let tokio_tungstenite::tungstenite::Message::Text(said) = frame {
+                    opening.push_str(&said);
+                }
+            }
+            socket
+        };
         assert!(opening.contains("\"facts\""), "{opening}");
         r.open_again();
         assert_eq!(rec.opened.lock().unwrap().len(), 2);
@@ -962,12 +1378,24 @@ mod tests {
             pressed.elapsed()
         );
         assert!(reqwest::get(&url).await.is_err(), "nothing answers");
-        // The stream that was open is over: its next read is the end,
-        // not a wait.
-        let ended = tokio::time::timeout(Duration::from_secs(2), stream.chunk()).await;
+        // The socket that was open is over: its next read is the
+        // end, not a wait.
+        let ended = {
+            use futures_util::StreamExt;
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    match socket.next().await {
+                        None | Some(Err(_)) => return,
+                        Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))) => return,
+                        Some(Ok(_)) => {}
+                    }
+                }
+            })
+            .await
+        };
         assert!(
-            matches!(ended, Ok(Ok(None)) | Ok(Err(_))),
-            "the open stream ended with the remote: {ended:?}"
+            ended.is_ok(),
+            "the open socket ended with the remote rather than hanging"
         );
         let freed = std::net::TcpListener::bind(("127.0.0.1", port)).is_ok();
 

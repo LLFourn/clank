@@ -14,13 +14,33 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "provider", rename_all = "kebab-case")]
 pub enum TunnelSection {
+    /// The accountless one: an ephemeral `*.trycloudflare.com`,
+    /// nothing to sign up for and nothing to install. Its hostname
+    /// is ALLOCATED — it does not exist until the tunnel is handed
+    /// one — so there is nothing to configure at all.
+    Quick,
     /// ngrok through its SDK: nothing installed. The authtoken is
     /// the agent's own — `NGROK_AUTHTOKEN`, or the agent's config
     /// file — never clank's config.
     Ngrok { domain: String },
     /// A binary that forwards `url` to the port: `{port}` in `run`
     /// is the port.
-    Command { run: Vec<String>, url: String },
+    /// A binary that forwards this port. With `url` the endpoint is
+    /// CLAIMED — a named cloudflared tunnel, an owned hostname — and
+    /// leased before the child runs. Without it the endpoint is
+    /// ALLOCATED: the child prints the hostname it was given (ssh to
+    /// localhost.run and its kind) and it is read from that output.
+    Command {
+        run: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        url: Option<String>,
+        /// Which announced URL is the endpoint, when the child says
+        /// more than one — a banner or a help link before the real
+        /// thing. The first URL CONTAINING this is chosen. Unset,
+        /// the protocol is "the first URL the child prints".
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        url_contains: Option<String>,
+    },
 }
 
 /// How long a start has to come up: the provider's connect, then
@@ -28,13 +48,28 @@ pub enum TunnelSection {
 pub(crate) const TUNNEL_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
 /// How long a stop waits for the provider to end before letting go
 /// of it: the SDK's close, a child's exit.
-const STOP_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+pub(crate) const STOP_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// A tunnel provider: a fixed URL, and a start that yields the handle
 /// the remote owns.
 pub(crate) trait Provider: Send + Sync + 'static {
-    fn url(&self) -> String;
-    fn start(&self, port: u16) -> BoxFuture<'_, anyhow::Result<Box<dyn Handle>>>;
+    /// The endpoint this provider ALREADY OWNS and will claim, when
+    /// it knows the name before it starts — ngrok's domain, a
+    /// command with a configured URL. `None` means the hostname does
+    /// not exist until the tunnel is handed one, and can only be
+    /// leased once the start reports it.
+    fn reservation(&self) -> Option<String>;
+    /// Start, and say the public URL the tunnel actually has.
+    /// Start, and say the public URL the tunnel actually has. The
+    /// deadline is the provider's OWN: one that waits for something
+    /// — a child that has yet to announce its hostname — must give
+    /// up by then and tear down what it started, because a caller
+    /// that cancels it instead cannot run its cleanup.
+    fn start(
+        &self,
+        port: u16,
+        deadline: tokio::time::Instant,
+    ) -> BoxFuture<'_, anyhow::Result<(String, Box<dyn Handle>)>>;
 }
 
 /// A running tunnel, ended by `stop` and nothing else. Stop answers
@@ -71,6 +106,7 @@ pub(crate) fn configured(
         return Ok(None);
     };
     let provider: std::sync::Arc<dyn Provider> = match section {
+        TunnelSection::Quick => std::sync::Arc::new(Quick),
         TunnelSection::Ngrok { domain } => std::sync::Arc::new(Ngrok {
             authtoken: ngrok_authtoken(home).ok_or_else(|| {
                 anyhow::anyhow!(
@@ -80,7 +116,15 @@ pub(crate) fn configured(
             })?,
             domain,
         }),
-        TunnelSection::Command { run, url } => std::sync::Arc::new(Command { run, url }),
+        TunnelSection::Command {
+            run,
+            url,
+            url_contains,
+        } => std::sync::Arc::new(Command {
+            run,
+            url,
+            url_contains,
+        }),
     };
     Ok(Some((provider, TUNNEL_GRACE)))
 }
@@ -130,13 +174,17 @@ struct NgrokHandle {
 }
 
 impl Provider for Ngrok {
-    fn url(&self) -> String {
-        format!("https://{}", self.domain)
+    fn reservation(&self) -> Option<String> {
+        Some(format!("https://{}", self.domain))
     }
-    fn start(&self, port: u16) -> BoxFuture<'_, anyhow::Result<Box<dyn Handle>>> {
+    fn start(
+        &self,
+        port: u16,
+        _deadline: tokio::time::Instant,
+    ) -> BoxFuture<'_, anyhow::Result<(String, Box<dyn Handle>)>> {
         let (domain, authtoken) = (self.domain.clone(), self.authtoken.clone());
         Box::pin(async move {
-            let build = move || -> BoxFuture<'static, anyhow::Result<((), Close)>> {
+            let build = move || -> BoxFuture<'static, anyhow::Result<(String, Close)>> {
                 Box::pin(async move {
                     use ngrok::config::ForwarderBuilder;
                     let session = ngrok::Session::builder()
@@ -152,6 +200,11 @@ impl Provider for Ngrok {
                         .listen_and_forward(to)
                         .await
                         .map_err(|e| anyhow::anyhow!("ngrok: {e}"))?;
+                    let forwarder_url = {
+                        use ngrok::tunnel::EndpointInfo;
+                        let u = forwarder.url().to_string();
+                        (!u.is_empty()).then_some(u)
+                    };
                     // The graceful close, run on the isolated runtime
                     // before it is dropped: the unlisten RPC, then the
                     // session. Whatever it does not finish, the drop
@@ -165,11 +218,14 @@ impl Provider for Ngrok {
                             let _ = session.close().await;
                         })
                     });
-                    Ok(((), close))
+                    // The endpoint the session actually bound, not
+                    // the one we asked for.
+                    let url = forwarder_url.unwrap_or(format!("https://{domain}"));
+                    Ok((url, close))
                 })
             };
-            let ((), isolated) = Isolated::start(build).await?;
-            Ok(Box::new(NgrokHandle { isolated }) as Box<dyn Handle>)
+            let (url, isolated) = Isolated::start(build).await?;
+            Ok((url, Box::new(NgrokHandle { isolated }) as Box<dyn Handle>))
         })
     }
 }
@@ -294,27 +350,96 @@ impl Drop for Isolated {
     }
 }
 
+// ---- the quick tunnel ----
+
+/// Cloudflare's quick tunnel, spoken natively. No account, no
+/// binary, and a hostname handed out at start — so it reserves
+/// nothing and leases what it is given.
+pub(crate) struct Quick;
+
+struct QuickHandle {
+    isolated: Isolated,
+}
+
+impl Provider for Quick {
+    fn reservation(&self) -> Option<String> {
+        None
+    }
+    fn start(
+        &self,
+        port: u16,
+        _deadline: tokio::time::Instant,
+    ) -> BoxFuture<'_, anyhow::Result<(String, Box<dyn Handle>)>> {
+        Box::pin(async move {
+            // On a runtime of its own for the same reason ngrok is:
+            // the connector spawns reactors and per-stream work, and
+            // dropping that runtime is what makes a stop total.
+            let build = move || -> BoxFuture<'static, anyhow::Result<(String, Close)>> {
+                Box::pin(async move {
+                    let handle = cloudflare_quick_tunnel::QuickTunnelManager::new(port)
+                        .start()
+                        .await
+                        .map_err(|e| anyhow::anyhow!("quick tunnel: {e}"))?;
+                    let url = handle.url.clone();
+                    let close: Close = Box::new(move || {
+                        Box::pin(async move {
+                            let _ = handle.shutdown().await;
+                        })
+                    });
+                    Ok((url, close))
+                })
+            };
+            let (url, isolated) = Isolated::start(build).await?;
+            Ok((url, Box::new(QuickHandle { isolated }) as Box<dyn Handle>))
+        })
+    }
+}
+
+impl Handle for QuickHandle {
+    fn stop(self: Box<Self>) -> BoxFuture<'static, Option<String>> {
+        Box::pin(async move {
+            self.isolated.shutdown().await;
+            None
+        })
+    }
+}
+
 // ---- command ----
 
 pub(crate) struct Command {
     run: Vec<String>,
-    url: String,
+    /// `None` when the child is the one who learns the hostname.
+    url: Option<String>,
+    /// Which of the child's URLs is the endpoint.
+    url_contains: Option<String>,
 }
 
 struct CommandHandle {
     child: tokio::process::Child,
+    /// What the child announced on stdout. Kept apart from stderr:
+    /// one is where an endpoint is announced, the other is where
+    /// diagnostics go, and the reason must not be read out of the
+    /// announcement (codex on 49e387f).
+    stdout: std::sync::Arc<std::sync::Mutex<String>>,
     /// The last of the child's stderr, kept for the reason when the
     /// tunnel does not come up; the reader ends at the pipe's EOF,
     /// and stop waits for it — for a bound — so the reason is whole.
     stderr: std::sync::Arc<std::sync::Mutex<String>>,
     reader: Option<tokio::task::JoinHandle<()>>,
+    out_reader: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Provider for Command {
-    fn url(&self) -> String {
-        self.url.trim_end_matches('/').to_string()
+    fn reservation(&self) -> Option<String> {
+        self.url
+            .as_deref()
+            .map(|u| u.trim_end_matches('/').to_string())
     }
-    fn start(&self, port: u16) -> BoxFuture<'_, anyhow::Result<Box<dyn Handle>>> {
+    fn start(
+        &self,
+        port: u16,
+        deadline: tokio::time::Instant,
+    ) -> BoxFuture<'_, anyhow::Result<(String, Box<dyn Handle>)>> {
         Box::pin(async move {
             let argv: Vec<String> = self
                 .run
@@ -330,41 +455,115 @@ impl Provider for Command {
             let mut child = tokio::process::Command::new(program)
                 .args(args)
                 .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
+                // BOTH are announcement channels: cloudflared says
+                // its hostname on stderr, the ssh services on
+                // stdout, and a command that says it on the one we
+                // discarded looked like a command that said nothing.
+                .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
                 .process_group(0)
                 .kill_on_drop(true)
                 .spawn()
                 .map_err(|e| anyhow::anyhow!("tunnel command `{program}`: {e}"))?;
             let stderr = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-            let reader = child.stderr.take().map(|pipe| {
-                let tail = stderr.clone();
-                tokio::spawn(async move {
-                    use tokio::io::AsyncBufReadExt;
-                    let mut lines = tokio::io::BufReader::new(pipe).lines();
-                    while let Ok(Some(line)) = lines.next_line().await {
-                        let mut t = tail.lock().unwrap_or_else(|e| e.into_inner());
-                        t.push_str(&line);
-                        t.push('\n');
-                        if t.len() > 4096 {
-                            let cut = t.len() - 4096;
-                            let at = t
-                                .char_indices()
-                                .map(|(i, _)| i)
-                                .find(|i| *i >= cut)
-                                .unwrap_or(0);
-                            t.drain(..at);
-                        }
-                    }
-                })
-            });
-            Ok(Box::new(CommandHandle {
+            let stdout = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+            let reader = child
+                .stderr
+                .take()
+                .map(|pipe| tail_into(pipe, stderr.clone()));
+            let out_reader = child
+                .stdout
+                .take()
+                .map(|pipe| tail_into(pipe, stdout.clone()));
+            let handle = CommandHandle {
                 child,
+                stdout,
                 stderr,
                 reader,
-            }) as Box<dyn Handle>)
+                out_reader,
+            };
+            let url = match self.url.as_deref() {
+                Some(u) => u.trim_end_matches('/').to_string(),
+                // Allocated: the child was handed a hostname and
+                // says it on its output. Wait for it rather than
+                // guess — the caller's grace bounds the wait.
+                None => match tokio::time::timeout_at(
+                    deadline,
+                    said_url(&handle, self.url_contains.as_deref()),
+                )
+                .await
+                {
+                    Ok(u) => u,
+                    Err(_) => {
+                        let said = end(Box::new(handle) as Box<dyn Handle>).await;
+                        anyhow::bail!(
+                            "the tunnel command printed no URL to read its hostname from{}",
+                            said.map(|s| format!("\n{s}")).unwrap_or_default()
+                        );
+                    }
+                },
+            };
+            Ok((url, Box::new(handle) as Box<dyn Handle>))
         })
     }
+}
+
+/// The first URL the child printed, waited for. The child announces
+/// its allocated hostname on stderr — `cloudflared` and the ssh
+/// services both do — so this watches the tail the reader is filling
+/// rather than racing it for the pipe. Gives up only when the
+/// CALLER bounds it, and tears the child down when the bound runs
+/// out — a cancelled future cannot clean up after itself.
+async fn said_url(handle: &CommandHandle, wanted: Option<&str>) -> String {
+    loop {
+        for said in [&handle.stdout, &handle.stderr] {
+            if let Some(found) = pick_url(&said.lock().unwrap_or_else(|e| e.into_inner()), wanted) {
+                return found;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+/// Read a pipe into a bounded tail.
+fn tail_into(
+    pipe: impl tokio::io::AsyncRead + Unpin + Send + 'static,
+    tail: std::sync::Arc<std::sync::Mutex<String>>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        use tokio::io::AsyncBufReadExt;
+        let mut lines = tokio::io::BufReader::new(pipe).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let mut t = tail.lock().unwrap_or_else(|e| e.into_inner());
+            t.push_str(&line);
+            t.push('\n');
+            if t.len() > 4096 {
+                let cut = t.len() - 4096;
+                let at = t
+                    .char_indices()
+                    .map(|(i, _)| i)
+                    .find(|i| *i >= cut)
+                    .unwrap_or(0);
+                t.drain(..at);
+            }
+        }
+    })
+}
+
+/// The endpoint among what a child printed: the first URL matching
+/// the operator's selector, or — with no selector — the first URL at
+/// all, which is the documented protocol.
+fn pick_url(said: &str, wanted: Option<&str>) -> Option<String> {
+    said.split_whitespace()
+        .filter(|word| word.starts_with("https://") || word.starts_with("http://"))
+        .map(|word| {
+            word.trim_end_matches(|c: char| {
+                matches!(c, '.' | ',' | ')' | ']' | '"' | '\'' | '|' | '>')
+            })
+            .trim_end_matches('/')
+            .to_string()
+        })
+        .find(|url| wanted.is_none_or(|w| url.contains(w)))
 }
 
 /// Whether any process of the group is left, zombies included.
@@ -405,18 +604,49 @@ impl Handle for CommandHandle {
             // The reader ends at the pipe's EOF; one held open past
             // the bound by a process that left the group is aborted
             // and joined, not left behind.
-            if let Some(mut r) = this.reader.take()
-                && tokio::time::timeout(std::time::Duration::from_secs(1), &mut r)
-                    .await
-                    .is_err()
-            {
-                r.abort();
-                let _ = r.await;
+            for reader in [this.reader.take(), this.out_reader.take()] {
+                if let Some(mut r) = reader
+                    && tokio::time::timeout(std::time::Duration::from_secs(1), &mut r)
+                        .await
+                        .is_err()
+                {
+                    r.abort();
+                    let _ = r.await;
+                }
             }
             let tail = this.stderr.lock().unwrap_or_else(|e| e.into_inner());
             let tail = tail.trim();
             (!tail.is_empty()).then(|| tail.to_string())
         })
+    }
+}
+
+impl Drop for CommandHandle {
+    /// Cancellation gets the SAME owned teardown as the deadline. A
+    /// dropped future cannot await, so this is synchronous and
+    /// bounded: the group is signalled and reaped here rather than
+    /// left to `kill_on_drop`, which reaches only the one process
+    /// that was spawned and leaves a wrapper's forwarding child and
+    /// its pipes behind (codex on 49e387f).
+    fn drop(&mut self) {
+        if let Some(pid) = self.child.id() {
+            let group = pid as i32;
+            signal_group(group, libc::SIGTERM);
+            let gone = std::time::Instant::now() + std::time::Duration::from_millis(500);
+            while group_alive(group) && std::time::Instant::now() < gone {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            if group_alive(group) {
+                signal_group(group, libc::SIGKILL);
+            }
+        }
+        // The pipes close with the group; the readers end on their
+        // own, and an abort is the bound on one that does not.
+        for reader in [self.reader.take(), self.out_reader.take()] {
+            if let Some(r) = reader {
+                r.abort();
+            }
+        }
     }
 }
 
@@ -498,8 +728,8 @@ pub(crate) enum NotUp {
     NoAnswer(String),
     /// `/instance` answered with another remote's nonce.
     AnotherInstance,
-    /// The route answers but the event stream does not arrive: the
-    /// tunnel buffers streams, and the page lives on one.
+    /// The route answers but the live channel does not: a tunnel
+    /// that will not carry a WebSocket cannot carry the page.
     NoStream(String),
 }
 
@@ -510,7 +740,7 @@ impl std::fmt::Display for NotUp {
             NotUp::AnotherInstance => write!(f, "another clank remote answers at that URL"),
             NotUp::NoStream(why) => write!(
                 f,
-                "the tunnel does not carry event streams, which the page lives on: {why}"
+                "the tunnel does not carry websockets, which the page lives on: {why}"
             ),
         }
     }
@@ -543,30 +773,38 @@ pub(crate) async fn probe(
         }
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
-    let stream = async {
-        let mut resp = client
-            .get(format!("{url}/instance/stream"))
-            .timeout(std::time::Duration::from_secs(600))
-            .send()
+    // The route answering is not the page working: the live channel
+    // is a WebSocket, so the probe opens one and waits for the frame
+    // the readiness socket sends at once. A tunnel that routes but
+    // will not carry an upgrade fails HERE rather than later, in a
+    // browser, silently.
+    let socket = async {
+        let ws = url
+            .replacen("https://", "wss://", 1)
+            .replacen("http://", "ws://", 1);
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!("{ws}/instance/stream"))
             .await
             .map_err(|e| e.to_string())?;
-        if !resp.status().is_success() {
-            return Err(format!("HTTP {}", resp.status()));
-        }
-        let mut got = String::new();
-        while !got.contains(nonce) {
-            match resp.chunk().await {
-                Ok(Some(c)) => got.push_str(&String::from_utf8_lossy(&c)),
-                Ok(None) => return Err("the stream ended before its first event".to_string()),
-                Err(e) => return Err(e.to_string()),
+        loop {
+            match futures_util::StreamExt::next(&mut socket).await {
+                Some(Ok(tokio_tungstenite::tungstenite::Message::Text(said))) => {
+                    return if said.contains(nonce) {
+                        Ok(())
+                    } else {
+                        Err(format!("another instance answered: {said}"))
+                    };
+                }
+                // A ping or an empty frame is not the answer yet.
+                Some(Ok(_)) => continue,
+                Some(Err(e)) => return Err(e.to_string()),
+                None => return Err("the socket closed before its first frame".to_string()),
             }
         }
-        Ok(())
     };
-    match tokio::time::timeout_at(deadline, stream).await {
+    match tokio::time::timeout_at(deadline, socket).await {
         Ok(Ok(())) => Ok(()),
         Ok(Err(why)) => Err(NotUp::NoStream(why)),
-        Err(_) => Err(NotUp::NoStream("no event within the grace".to_string())),
+        Err(_) => Err(NotUp::NoStream("no frame within the grace".to_string())),
     }
 }
 
@@ -585,7 +823,9 @@ pub(crate) struct Start {
 pub(crate) struct Tunnel {
     pub(crate) url: String,
     handle: Option<Box<dyn Handle>>,
-    _lease: Lease,
+    /// Held for the life of the tunnel, whether it was claimed
+    /// before the start or leased once the start named it.
+    _lease: Option<Lease>,
 }
 
 impl Tunnel {
@@ -599,18 +839,55 @@ impl Tunnel {
         nonce: &str,
     ) -> anyhow::Result<Self> {
         let deadline = tokio::time::Instant::now() + start.grace;
-        let url = start.provider.url();
-        let lease = Lease::take(home, &endpoint_identity(&url)?)?;
-        let handle = tokio::select! {
+        // A CLAIMED endpoint is leased before its connector runs: a
+        // second connector against an owned hostname is not refused
+        // by the service — a named tunnel joins as a replica and the
+        // edge routes to the wrong instance — and no teardown undoes
+        // that interval. An ALLOCATED one has no name to lease yet.
+        let reservation = start.provider.reservation();
+        let claimed = match &reservation {
+            Some(url) => Some(Lease::take(home, &endpoint_identity(url)?)?),
+            None => None,
+        };
+        let (url, handle) = tokio::select! {
             _ = abandoned(&mut start.abort) => anyhow::bail!("the start was abandoned"),
-            started = tokio::time::timeout_at(deadline, start.provider.start(port)) => match started {
-                Ok(Ok(handle)) => handle,
+            // The provider gives up AT the deadline and tears down
+            // what it started; this outer bound is the backstop for
+            // a provider that does not, and so must fall a little
+            // later — sharing the instant would cancel the cleanup.
+            started = tokio::time::timeout_at(deadline + STOP_BOUND, start.provider.start(port, deadline)) => match started {
+                Ok(Ok(up)) => up,
                 Ok(Err(e)) => return Err(e),
                 Err(_) => anyhow::bail!(
                     "the tunnel did not come up within {}s: still connecting",
                     start.grace.as_secs()
                 ),
             },
+        };
+        let settled = async {
+            if let Some(reserved) = &reservation {
+                // A reservation the tunnel contradicts is an error,
+                // not a hostname to adopt silently.
+                let (want, got) = (endpoint_identity(reserved)?, endpoint_identity(&url)?);
+                if want != got {
+                    anyhow::bail!("reserved `{want}` but the tunnel came up on `{got}`");
+                }
+                return Ok(None);
+            }
+            // Allocated: the name exists now, so lease it now. Safe
+            // to lease late precisely because a freshly allocated
+            // name has no other holder.
+            Ok(Some(Lease::take(home, &endpoint_identity(&url)?)?))
+        }
+        .await;
+        let allocated = match settled {
+            Ok(lease) => lease,
+            Err(why) => {
+                return Err(match end(handle).await {
+                    Some(said) => anyhow::anyhow!("{why}\n{said}"),
+                    None => why,
+                });
+            }
         };
         let proven = tokio::select! {
             _ = abandoned(&mut start.abort) => Err(anyhow::anyhow!("the start was abandoned")),
@@ -625,7 +902,7 @@ impl Tunnel {
         Ok(Self {
             url,
             handle: Some(handle),
-            _lease: lease,
+            _lease: claimed.or(allocated),
         })
     }
 
@@ -689,7 +966,7 @@ mod tests {
                 };
                 let io = hyper_util::rt::TokioIo::new(stream);
                 let svc = hyper::service::service_fn(
-                    move |req: hyper::Request<hyper::body::Incoming>| async move {
+                    move |mut req: hyper::Request<hyper::body::Incoming>| async move {
                         use http_body_util::{BodyExt, Full};
                         let reply = |status: u16, body: String, ctype: &str| {
                             hyper::Response::builder()
@@ -698,42 +975,44 @@ mod tests {
                                 .body(Full::new(hyper::body::Bytes::from(body)).boxed())
                                 .unwrap()
                         };
-                        let resp = match req.uri().path() {
-                            "/instance" => reply(
+                        if req.uri().path() == "/instance" {
+                            return Ok::<_, std::convert::Infallible>(reply(
                                 200,
                                 serde_json::json!({ "nonce": nonce }).to_string(),
                                 "application/json",
-                            ),
-                            "/instance/stream" if hangs => {
-                                let (tx, rx) = tokio::sync::mpsc::channel::<String>(1);
-                                std::mem::forget(tx);
-                                hyper::Response::builder()
-                                    .status(200)
-                                    .header("content-type", "text/event-stream")
-                                    .body(
-                                        super::super::SseBody {
-                                            rx,
-                                            ended: std::sync::Arc::new(
-                                                std::sync::atomic::AtomicBool::new(false),
-                                            ),
-                                        }
-                                        .boxed(),
-                                    )
-                                    .unwrap()
-                            }
-                            "/instance/stream" if streams => reply(
-                                200,
-                                format!("event: instance\ndata: {nonce}\n\n"),
-                                "text/event-stream",
-                            ),
-                            _ => reply(404, "no".to_string(), "text/plain"),
+                            ));
+                        }
+                        if req.uri().path() != "/instance/stream" || (!streams && !hangs) {
+                            return Ok(reply(404, "no".to_string(), "text/plain"));
+                        }
+                        // The live channel as a tunnel would present
+                        // it: an upgrade that speaks at once, or one
+                        // that upgrades and then says nothing —
+                        // which is how a buffering edge looks.
+                        let Ok((response, socket)) = hyper_tungstenite::upgrade(&mut req, None)
+                        else {
+                            return Ok(reply(400, "not a websocket".into(), "text/plain"));
                         };
-                        Ok::<_, std::convert::Infallible>(resp)
+                        tokio::spawn(async move {
+                            use futures_util::SinkExt;
+                            let Ok(mut socket) = socket.await else { return };
+                            if streams
+                                && socket
+                                    .send(hyper_tungstenite::tungstenite::Message::text(nonce))
+                                    .await
+                                    .is_err()
+                            {
+                                return;
+                            }
+                            std::future::pending::<()>().await;
+                        });
+                        Ok(response.map(|b| b.map_err(|e| match e {}).boxed()))
                     },
                 );
                 tokio::spawn(async move {
                     let _ = hyper::server::conn::http1::Builder::new()
                         .serve_connection(io, svc)
+                        .with_upgrades()
                         .await;
                 });
             }
@@ -796,11 +1075,15 @@ mod tests {
         };
         let command = Command {
             run: vec![],
-            url: "https://clank.example.com/".into(),
+            url: Some("https://clank.example.com/".into()),
+            url_contains: None,
         };
-        let id = endpoint_identity(&ngrok.url()).unwrap();
+        let id = endpoint_identity(&ngrok.reservation().unwrap()).unwrap();
         assert_eq!(id, "clank.example.com");
-        assert_eq!(endpoint_identity(&command.url()).unwrap(), id);
+        assert_eq!(
+            endpoint_identity(&command.reservation().unwrap()).unwrap(),
+            id
+        );
         assert_eq!(
             endpoint_identity("https://clank.example.com/some/path").unwrap(),
             id
@@ -813,7 +1096,13 @@ mod tests {
         assert!(endpoint_identity("not a url").is_err());
         let home = tempfile::tempdir().unwrap();
         let held = Lease::take(home.path(), &id).unwrap();
-        assert!(Lease::take(home.path(), &endpoint_identity(&command.url()).unwrap()).is_err());
+        assert!(
+            Lease::take(
+                home.path(),
+                &endpoint_identity(&command.reservation().unwrap()).unwrap()
+            )
+            .is_err()
+        );
         drop(held);
     }
 
@@ -880,7 +1169,8 @@ mod tests {
         let mut up = start(
             Command {
                 run: run("forwarding {port}"),
-                url: url.clone(),
+                url: Some(url.clone()),
+                url_contains: None,
             },
             5,
         );
@@ -911,7 +1201,8 @@ mod tests {
                         grandchild.display()
                     ),
                 ],
-                url: url.clone(),
+                url: Some(url.clone()),
+                url_contains: None,
             },
             5,
         );
@@ -944,7 +1235,8 @@ mod tests {
                         grandchild.display()
                     ),
                 ],
-                url: url.clone(),
+                url: Some(url.clone()),
+                url_contains: None,
             },
             5,
         );
@@ -960,20 +1252,21 @@ mod tests {
         assert!(!alive(pid), "the wrapper is gone");
         assert!(!alive(pid2), "the TERM-ignoring survivor is ended too");
 
-        // A tunnel that routes but buffers the stream: the failure
-        // takes the grace, and the child's stderr is the reason's
-        // second line.
+        // A tunnel that routes but will not carry the live channel:
+        // the failure takes the grace, and the child's stderr is the
+        // reason's second line.
         std::fs::remove_file(&pidfile).unwrap();
         let (buffered, _srv2) = fake_public("n1", false, true).await;
         let mut up = start(
             Command {
                 run: run("warming up"),
-                url: buffered,
+                url: Some(buffered),
+                url_contains: None,
             },
             2,
         );
         let why = err_of(Tunnel::up(&mut up, home.path(), 4242, "n1").await);
-        assert!(why.contains("does not carry event streams"), "{why}");
+        assert!(why.contains("does not carry websockets"), "{why}");
         assert!(why.contains("warming up"), "the child's stderr: {why}");
         let pid = pid_from(&pidfile).await;
         assert!(!alive(pid), "nothing left running");
@@ -1104,7 +1397,188 @@ mod tests {
         assert!(why.contains("no route to host"), "{why}");
     }
 
-    /// The provider comes from the user config; ngrok's token from
+    /// A command that is handed its hostname says it on stderr, and
+    /// that is the URL the tunnel came up on — no `url` in the
+    /// config at all, so nothing is reserved and the name is leased
+    /// once it is known.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_command_without_a_url_reads_it_off_the_child() {
+        assert_eq!(
+            pick_url(
+                "2026-09-15 INF |  https://odd-name.trycloudflare.com  |",
+                None
+            )
+            .as_deref(),
+            Some("https://odd-name.trycloudflare.com")
+        );
+        assert_eq!(
+            pick_url("Connect to http://x.localhost.run/ or press ^C", None).as_deref(),
+            Some("http://x.localhost.run")
+        );
+        assert_eq!(pick_url("nothing to see", None), None);
+        // A banner before the endpoint: with no selector the first
+        // wins, which is the documented protocol; the selector is
+        // how an operator says which one is theirs.
+        let noisy =
+            "docs at https://help.example.com/tunnels\ntunnel: https://real.trycloudflare.com\n";
+        assert_eq!(
+            pick_url(noisy, None).as_deref(),
+            Some("https://help.example.com/tunnels")
+        );
+        assert_eq!(
+            pick_url(noisy, Some("trycloudflare.com")).as_deref(),
+            Some("https://real.trycloudflare.com"),
+            "the selector picks the endpoint out of the noise"
+        );
+
+        let home = tempfile::tempdir().unwrap();
+        let (url, _srv) = fake_public("n1", true, false).await;
+        let provider = Command {
+            run: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                format!("sleep 0.3; echo 'tunnel ready at {url}' >&2; exec sleep 100"),
+            ],
+            url: None,
+            url_contains: None,
+        };
+        assert!(
+            provider.reservation().is_none(),
+            "an allocated endpoint claims nothing up front"
+        );
+        let mut up = Start {
+            provider: std::sync::Arc::new(provider),
+            grace: Duration::from_secs(8),
+            abort: tokio::sync::watch::channel(false).1,
+        };
+        let tunnel = Tunnel::up(&mut up, home.path(), 4242, "n1").await.unwrap();
+        assert_eq!(tunnel.url, url, "the URL is the child's, not the config's");
+        assert!(
+            Lease::take(home.path(), &endpoint_identity(&url).unwrap()).is_err(),
+            "leased under the name it reported"
+        );
+        tunnel.stop().await;
+        assert!(Lease::take(home.path(), &endpoint_identity(&url).unwrap()).is_ok());
+    }
+
+    /// The endpoint may be announced on STDOUT — the ssh services
+    /// do — and a help URL printed before it is not the endpoint.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_endpoint_announced_on_stdout_is_found_and_selected() {
+        let home = tempfile::tempdir().unwrap();
+        let (url, _srv) = fake_public("n1", true, false).await;
+        let provider = Command {
+            run: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                // A banner first, on stdout, then the real one.
+                format!(
+                    "echo 'see https://help.example.com/docs'; sleep 0.2; echo 'forwarding {url}'; exec sleep 100"
+                ),
+            ],
+            url: None,
+            url_contains: Some(url.strip_prefix("http://").unwrap_or(&url).to_string()),
+        };
+        let mut up = Start {
+            provider: std::sync::Arc::new(provider),
+            grace: Duration::from_secs(8),
+            abort: tokio::sync::watch::channel(false).1,
+        };
+        let tunnel = Tunnel::up(&mut up, home.path(), 4242, "n1").await.unwrap();
+        assert_eq!(
+            tunnel.url, url,
+            "the selected announcement, not the banner and not stderr"
+        );
+        tunnel.stop().await;
+    }
+
+    /// A start ABANDONED while the child has yet to announce gets
+    /// the same owned teardown as one that runs out of time: the
+    /// whole group, wrapper and forwarding child alike.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_abandoned_discovery_ends_the_whole_group() {
+        let home = tempfile::tempdir().unwrap();
+        let pidfile = home.path().join("pid");
+        let grandchild = home.path().join("pid2");
+        let provider = Command {
+            run: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                // A wrapper that does not exec, with a forwarding
+                // child of its own — and neither ever says a URL.
+                format!(
+                    "echo $$ > '{}'; sleep 100 & echo $! > '{}'; wait",
+                    pidfile.display(),
+                    grandchild.display()
+                ),
+            ],
+            url: None,
+            url_contains: None,
+        };
+        let (abort, abandoned) = tokio::sync::watch::channel(false);
+        let mut up = Start {
+            provider: std::sync::Arc::new(provider),
+            grace: Duration::from_secs(30),
+            abort: abandoned,
+        };
+        let home2 = home.path().to_path_buf();
+        let starting =
+            tokio::spawn(async move { err_of(Tunnel::up(&mut up, &home2, 4242, "n1").await) });
+        let (pid, pid2) = (pid_from(&pidfile).await, pid_from(&grandchild).await);
+        assert!(alive(pid) && alive(pid2), "both are up");
+
+        // Quit while it is still waiting for the announcement.
+        let _ = abort.send(true);
+        let why = tokio::time::timeout(Duration::from_secs(8), starting)
+            .await
+            .expect("the abandoned start returns")
+            .unwrap();
+        assert!(why.contains("abandoned"), "{why}");
+        let gone = std::time::Instant::now() + Duration::from_secs(3);
+        while (alive(pid) || alive(pid2)) && std::time::Instant::now() < gone {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!alive(pid), "the wrapper is gone");
+        assert!(!alive(pid2), "and its forwarding child with it");
+    }
+
+    /// A command that never says a URL fails within the grace, and
+    /// leaves nothing running.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_command_that_names_no_url_fails_and_leaves_nothing() {
+        let home = tempfile::tempdir().unwrap();
+        let pidfile = home.path().join("pid");
+        let provider = Command {
+            run: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                format!(
+                    "echo 'could not reach the service' >&2; echo $$ > '{}'; exec sleep 100",
+                    pidfile.display()
+                ),
+            ],
+            url: None,
+            url_contains: None,
+        };
+        let mut up = Start {
+            provider: std::sync::Arc::new(provider),
+            grace: Duration::from_secs(2),
+            abort: tokio::sync::watch::channel(false).1,
+        };
+        let started = std::time::Instant::now();
+        let why = err_of(Tunnel::up(&mut up, home.path(), 4242, "n1").await);
+        assert!(
+            why.contains("printed no URL") || why.contains("did not come up"),
+            "{why}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(6),
+            "bounded by the grace"
+        );
+        let pid = pid_from(&pidfile).await;
+        assert!(!alive(pid), "nothing left running");
+    }
+
     /// The provider comes from the user config; ngrok's token from
     /// the agent's own file, never clank's.
     #[test]
@@ -1121,7 +1595,20 @@ mod tests {
             r#"{"provider":"command","run":["cloudflared","--url","http://localhost:{port}"],"url":"https://c.example.com/"}"#,
         )
         .unwrap();
-        assert!(matches!(section, TunnelSection::Command { .. }));
+        assert!(matches!(
+            section,
+            TunnelSection::Command { url: Some(_), .. }
+        ));
+        // No `url`: the child will say it.
+        let section: TunnelSection = serde_json::from_str(
+            r#"{"provider":"command","run":["ssh","-R","80:localhost:{port}","nokey@localhost.run"]}"#,
+        )
+        .unwrap();
+        assert!(matches!(section, TunnelSection::Command { url: None, .. }));
+        // The accountless one needs nothing else at all.
+        let section: TunnelSection = serde_json::from_str(r#"{"provider":"quick"}"#).unwrap();
+        assert_eq!(section, TunnelSection::Quick);
+        assert!(Quick.reservation().is_none());
 
         assert_eq!(
             authtoken_in("version: 2\nauthtoken: \"abc\"\n").as_deref(),
@@ -1138,10 +1625,11 @@ mod tests {
         };
         write(TunnelSection::Command {
             run: vec!["true".into()],
-            url: "https://c.example.com".into(),
+            url: Some("https://c.example.com".into()),
+            url_contains: None,
         });
         let (p, grace) = configured(Some(home.path())).unwrap().unwrap();
-        assert_eq!(p.url(), "https://c.example.com");
+        assert_eq!(p.reservation().as_deref(), Some("https://c.example.com"));
         assert_eq!(grace, TUNNEL_GRACE);
 
         write(TunnelSection::Ngrok {
@@ -1158,7 +1646,7 @@ mod tests {
         )
         .unwrap();
         let (p, _) = configured(Some(home.path())).unwrap().unwrap();
-        assert_eq!(p.url(), "https://clank.ngrok.app");
+        assert_eq!(p.reservation().as_deref(), Some("https://clank.ngrok.app"));
         let cfg = std::fs::read_to_string(home.path().join(".clank/config.json")).unwrap();
         assert!(
             !cfg.contains("tok_123"),

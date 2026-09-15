@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use http_body_util::{BodyExt, Full};
-use hyper::body::{Body, Bytes, Frame};
+use hyper::body::Bytes;
 
 use crate::cli::open_zellij::{self, PaneMeta, SubscribeChild};
 use feed::{Feed, SubscribeEvent, TableChange};
@@ -211,10 +211,14 @@ impl Instance {
         let table = panes
             .table()
             .ok_or_else(|| anyhow::anyhow!("zellij did not answer for `{}`", panes.session()))?;
-        // The public origin, resolved ONCE for this start: the
-        // origins a post may come from, the links, and the tunnel
-        // itself are one configuration until the next start.
-        let public = tunnel.as_ref().map(|t| t.provider.url());
+        // The public origin is no longer knowable before the start:
+        // an allocated hostname does not exist until the tunnel is
+        // handed one, and the tunnel cannot come up until this
+        // server is answering its probe. So the server starts with
+        // no public origin and is TOLD one when the tunnel reports
+        // it — once, for the life of the instance.
+        let public: Arc<std::sync::RwLock<Option<Seen>>> = Arc::default();
+        let sockets: Arc<std::sync::atomic::AtomicUsize> = Arc::default();
         let (listener, port) = listen(&repo).await?;
         let door_for_serve = door.clone();
         let nonce = door::random_token();
@@ -237,7 +241,8 @@ impl Instance {
             blocking.clone(),
             door_for_serve,
             nonce.clone(),
-            public,
+            public.clone(),
+            sockets,
         ));
         tasks.spawn(pane_poll(
             panes,
@@ -278,6 +283,12 @@ impl Instance {
             };
             match tunnel::Tunnel::up(start, &home, port, &nonce).await {
                 Ok(t) => {
+                    // What the tunnel actually came up on decides the
+                    // origin a post may carry and the host a `Secure`
+                    // cookie is for.
+                    if let Some(seen) = seen_as(&t.url) {
+                        *public.write().unwrap_or_else(|e| e.into_inner()) = Some(seen);
+                    }
                     instance.public_url = Some(t.url.clone());
                     instance.tunnel = Some(t);
                 }
@@ -805,35 +816,9 @@ async fn door_poll(
     }
 }
 
-/// A Server-Sent Events body: frames arrive on a channel and go out
-/// as they come. Ends when the sender is dropped.
-struct SseBody {
-    rx: tokio::sync::mpsc::Receiver<String>,
-    /// Raised when the authority behind the stream ended: what is
-    /// still queued is not delivered.
-    ended: Arc<std::sync::atomic::AtomicBool>,
-}
-
-impl Body for SseBody {
-    type Data = Bytes;
-    type Error = std::convert::Infallible;
-    fn poll_frame(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
-        let this = self.get_mut();
-        if this.ended.load(std::sync::atomic::Ordering::Relaxed) {
-            return std::task::Poll::Ready(None);
-        }
-        this.rx
-            .poll_recv(cx)
-            .map(|next| next.map(|s| Ok(Frame::data(Bytes::from(s)))))
-    }
-}
-
-/// What ends a stream besides the browser leaving: the remote
-/// switched off, the session's term, the session revoked — here or
-/// in another TUI.
+/// What ends a socket besides the peer leaving: the remote switched
+/// off, the session's term, the session revoked — here or in another
+/// TUI.
 struct Authority {
     cancelled: tokio::sync::watch::Receiver<bool>,
     revocations: tokio::sync::watch::Receiver<u64>,
@@ -841,58 +826,131 @@ struct Authority {
     admitted: door::Admitted,
 }
 
-/// Forward the retained frames, then the live ones, until the
-/// browser is gone or the authority ends. The authority governs the
-/// SEND too, not only the wait for the next frame: a browser that
-/// has stopped reading fills the channel, and a forwarder blocked in
-/// a send would otherwise hold a revoked session's stream open and
-/// hand the frame over when the browser resumes (codex on f657b4d).
-/// Returns whether the authority ended, as opposed to the browser.
-async fn forward(
+impl Authority {
+    /// Resolves when this socket's authority is over, and not before:
+    /// a revocation of somebody else's session is not this one's.
+    /// Cancel-safe, so it may sit in a `select!` arm that loses.
+    async fn ended(&mut self) {
+        loop {
+            tokio::select! {
+                _ = self.cancelled.changed() => return,
+                _ = tokio::time::sleep_until(self.admitted.expires) => return,
+                _ = self.revocations.changed() => {
+                    if !self.door.is_live(&self.admitted.id_hash) {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// How long the closing handshake gets before the socket is dropped
+/// instead: a peer that has stopped reading will never complete it.
+const SOCKET_CLOSE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Why a pump stopped, which decides whether anything more may be
+/// written to the socket.
+enum Ended {
+    /// The remote stopped, the term ran out, or the session was
+    /// revoked. Nothing further is owed to this peer.
+    Authority,
+    /// The peer left, or the feed did. A goodbye is due.
+    Peer,
+}
+
+/// ONE task owns the socket: the authority that ends it, the frames
+/// going out, and the frames coming in are selected over together.
+///
+/// Splitting them — an authority governing a producer, a separate
+/// task doing the sending — let queued frames reach a peer after its
+/// session was revoked, left a blocked send hanging on a peer that
+/// had stopped reading, and noticed no peer that simply went away
+/// (codex on 7a2a06d). Reading is not optional either: it is how a
+/// close is seen, and how the library gets to answer a ping.
+///
+/// The write is two steps on purpose. `send` is feed-then-flush, and
+/// cancelling it once the sink has ACCEPTED the frame but is still
+/// flushing would resubmit that frame on the next pass — a pane
+/// frame written to the terminal twice is visible corruption. `feed`
+/// can only be cancelled before acceptance, and `flush` is
+/// idempotent, so each frame is submitted exactly once however often
+/// a control frame interrupts (codex on 0c132af).
+async fn pump(
+    socket: hyper_tungstenite::HyperWebsocketStream,
     frames: Vec<String>,
     mut rx: tokio::sync::broadcast::Receiver<String>,
     feed: Feed,
-    tx: tokio::sync::mpsc::Sender<String>,
     mut authority: Authority,
-) -> bool {
+) {
+    use futures_util::{SinkExt, StreamExt};
+    use hyper_tungstenite::tungstenite::Message;
+    let (mut out, mut incoming) = socket.split();
     let mut queue: std::collections::VecDeque<String> = frames.into();
-    loop {
-        if queue.is_empty() {
-            let received = tokio::select! {
-                _ = authority.cancelled.changed() => return true,
-                _ = tokio::time::sleep_until(authority.admitted.expires) => return true,
-                _ = authority.revocations.changed() => {
-                    if !authority.door.is_live(&authority.admitted.id_hash) {
-                        return true;
+    // Accepted by the sink, not yet flushed to the transport.
+    let mut unflushed = false;
+    let ended = loop {
+        if let Some(next) = queue.front().cloned() {
+            tokio::select! {
+                biased;
+                () = authority.ended() => break Ended::Authority,
+                peer = incoming.next() => match peer {
+                    None | Some(Err(_)) | Some(Ok(Message::Close(_))) => break Ended::Peer,
+                    Some(Ok(_)) => {}
+                },
+                fed = out.feed(Message::text(next)) => {
+                    if fed.is_err() {
+                        break Ended::Peer;
                     }
-                    continue;
+                    queue.pop_front();
+                    unflushed = true;
                 }
-                r = rx.recv() => r,
-            };
-            match received {
-                Ok(f) => queue.push_back(f),
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                    queue.extend(feed.resync())
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => return false,
             }
-            continue;
+        } else if unflushed {
+            tokio::select! {
+                biased;
+                () = authority.ended() => break Ended::Authority,
+                peer = incoming.next() => match peer {
+                    None | Some(Err(_)) | Some(Ok(Message::Close(_))) => break Ended::Peer,
+                    Some(Ok(_)) => {}
+                },
+                flushed = out.flush() => {
+                    if flushed.is_err() {
+                        break Ended::Peer;
+                    }
+                    unflushed = false;
+                }
+            }
+        } else {
+            tokio::select! {
+                biased;
+                () = authority.ended() => break Ended::Authority,
+                peer = incoming.next() => match peer {
+                    None | Some(Err(_)) | Some(Ok(Message::Close(_))) => break Ended::Peer,
+                    Some(Ok(_)) => {}
+                },
+                frame = rx.recv() => match frame {
+                    Ok(f) => queue.push_back(f),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        queue.extend(feed.resync())
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break Ended::Peer,
+                },
+            }
         }
-        let frame = queue[0].clone();
-        tokio::select! {
-            _ = authority.cancelled.changed() => return true,
-            _ = tokio::time::sleep_until(authority.admitted.expires) => return true,
-            _ = authority.revocations.changed() => {
-                if !authority.door.is_live(&authority.admitted.id_hash) {
-                    return true;
-                }
-            }
-            sent = tx.send(frame) => {
-                if sent.is_err() {
-                    return false;
-                }
-                queue.pop_front();
-            }
+    };
+    match ended {
+        // DROPPED, not closed. A close writes its frame and flushes
+        // the transport on the way out, which would hand a revoked
+        // peer the very data this is refusing it (codex on 0c132af).
+        Ended::Authority => {
+            drop(out);
+            drop(incoming);
+        }
+        // The peer is going anyway; a bounded goodbye is courteous
+        // and cannot hand anyone anything they should not have.
+        Ended::Peer => {
+            let _ = tokio::time::timeout(SOCKET_CLOSE, out.close()).await;
         }
     }
 }
@@ -931,25 +989,22 @@ async fn serve(
     blocking: Arc<Blocking>,
     door: Arc<door::Door>,
     nonce: String,
-    public: Option<String>,
+    public: Arc<std::sync::RwLock<Option<Seen>>>,
+    sockets: Arc<std::sync::atomic::AtomicUsize>,
 ) {
     // A post may come from the page this remote serves: the tunnel's
     // origin when there is one, and the loopback origin the browser
     // on this machine uses.
     let port = listener.local_addr().map(|a| a.port()).unwrap_or_default();
-    let public = public.as_deref().and_then(seen_as);
-    let mut origins: Vec<String> = [
+    // The loopback origins are known now; the tunnel's is published
+    // later, when it has one.
+    let origins: Vec<String> = [
         format!("http://localhost:{port}"),
         format!("http://127.0.0.1:{port}"),
     ]
     .iter()
     .filter_map(|u| seen_as(u).map(|s| s.origin))
     .collect();
-    origins.extend(public.as_ref().map(|s| s.origin.clone()));
-    let secure_host = public
-        .as_ref()
-        .filter(|s| s.https)
-        .map(|s| s.authority.clone());
     let ctx = Arc::new(Ctx {
         feed,
         sayer,
@@ -964,7 +1019,8 @@ async fn serve(
         door,
         origins,
         nonce,
-        secure_host,
+        public,
+        sockets,
     });
     loop {
         let accepted = tokio::select! {
@@ -985,7 +1041,12 @@ async fn serve(
             // response in flight completes and an idle keep-alive is
             // closed rather than waited on for a request that never
             // comes.
-            let conn = hyper::server::conn::http1::Builder::new().serve_connection(io, svc);
+            // `with_upgrades`, because the live channel is a
+            // WebSocket now: without it the handshake is answered
+            // and the upgrade never completes.
+            let conn = hyper::server::conn::http1::Builder::new()
+                .serve_connection(io, svc)
+                .with_upgrades();
             tokio::pin!(conn);
             tokio::select! {
                 _ = conn.as_mut() => {}
@@ -1058,9 +1119,38 @@ struct Ctx {
     /// This start's nonce: what the tunnel probe reads back to know
     /// the public URL is this remote and not another.
     nonce: String,
-    /// The configured public host when it is https: a request that
-    /// arrives AT it is over TLS whether or not the connector says so.
-    secure_host: Option<String>,
+    /// The URL the tunnel came up on, once it has: the origin a post
+    /// may carry beside the loopback ones, and the host that says a
+    /// request arrived over TLS. Empty until the tunnel reports.
+    public: Arc<std::sync::RwLock<Option<Seen>>>,
+    /// How many sockets are live. A socket that ends must decrement
+    /// it, which is how "nothing accumulates" is observable at all.
+    sockets: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// A live socket, counted for as long as its pump runs.
+struct Live(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Live {
+    fn new(count: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Live(count)
+    }
+}
+
+impl Drop for Live {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl Ctx {
+    fn public(&self) -> Option<Seen> {
+        self.public
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
 }
 
 /// Where the site's pages come from: the built site, and the repo
@@ -1088,7 +1178,7 @@ async fn route(req: hyper::Request<hyper::body::Incoming>, peer: IpAddr, ctx: &C
                 "application/json",
             );
         }
-        ("GET", "/instance/stream") => return instance_stream(ctx),
+        ("GET", "/instance/stream") => return instance_stream(req, ctx),
         // The paste box. Rate-limited per address like the link
         // door, and only from the page that offers it.
         ("POST", "/login") => {
@@ -1112,7 +1202,7 @@ async fn route(req: hyper::Request<hyper::body::Incoming>, peer: IpAddr, ctx: &C
     match (method.as_str(), path.as_str()) {
         ("GET", "/") => text(200, ctx.page.to_string(), HTML),
         ("GET", "/whoami") => text(204, "", "text/plain"),
-        ("GET", "/events") => events(ctx, admitted),
+        ("GET", "/events") => events(req, ctx, admitted),
         ("POST", "/say") if !same_origin(&req, ctx) => {
             text(403, "not from this page", "text/plain")
         }
@@ -1130,7 +1220,9 @@ fn same_origin(req: &hyper::Request<hyper::body::Incoming>, ctx: &Ctx) -> bool {
         .get("origin")
         .and_then(|v| v.to_str().ok())
         .and_then(seen_as)
-        .is_some_and(|o| ctx.origins.contains(&o.origin))
+        .is_some_and(|o| {
+            ctx.origins.contains(&o.origin) || ctx.public().is_some_and(|p| p.origin == o.origin)
+        })
 }
 
 fn redirect(to: &str) -> Resp {
@@ -1176,9 +1268,9 @@ fn secure_transport(req: &hyper::Request<hyper::body::Incoming>, ctx: &Ctx) -> b
     };
     forwarded
         || ctx
-            .secure_host
-            .as_deref()
-            .is_some_and(|h| arrived_at().as_deref() == Some(h))
+            .public()
+            .filter(|p| p.https)
+            .is_some_and(|p| arrived_at().as_deref() == Some(p.authority.as_str()))
 }
 
 fn host_of(req: &hyper::Request<hyper::body::Incoming>) -> Option<String> {
@@ -1246,34 +1338,56 @@ async fn paste(req: hyper::Request<hyper::body::Incoming>, ctx: &Ctx) -> Resp {
 
 /// One event carrying the nonce, then open until the remote ends:
 /// a tunnel that buffers streams never delivers the event.
-fn instance_stream(ctx: &Ctx) -> Resp {
-    let (tx, body_rx) = tokio::sync::mpsc::channel::<String>(1);
+/// The readiness socket: the nonce as one frame, then open until the
+/// remote ends. It answers WITHOUT a session — it is how the tunnel
+/// is proven before anyone can log in — so it carries the nonce and
+/// nothing else, ever (codex on 651e48b).
+fn instance_stream(req: hyper::Request<hyper::body::Incoming>, ctx: &Ctx) -> Resp {
+    if !hyper_tungstenite::is_upgrade_request(&req) {
+        return text(
+            426,
+            "upgrade to a websocket to prove the tunnel",
+            "text/plain",
+        );
+    }
+    let mut req = req;
+    let (response, socket) = match hyper_tungstenite::upgrade(&mut req, None) {
+        Ok(up) => up,
+        Err(e) => return text(400, format!("not a websocket: {e}"), "text/plain"),
+    };
+    let nonce = ctx.nonce.clone();
     let mut cancelled = ctx.cancelled.clone();
-    let first = format!("event: instance\ndata: {}\n\n", ctx.nonce);
+    let sockets = ctx.sockets.clone();
     ctx.workers
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .spawn(async move {
-            if tx.send(first).await.is_err() {
+            use futures_util::{SinkExt, StreamExt};
+            use hyper_tungstenite::tungstenite::Message;
+            let Ok(socket) = socket.await else { return };
+            let _live = Live::new(sockets);
+            let (mut out, mut incoming) = socket.split();
+            if out.send(Message::text(nonce)).await.is_err() {
                 return;
             }
-            tokio::select! {
-                _ = cancelled.changed() => {}
-                _ = tx.closed() => {}
+            // Then READ until the prober goes away. A probe that has
+            // its answer disconnects, and a socket nobody reads from
+            // notices nothing — every finished probe would otherwise
+            // leave a worker behind for the life of the TUI (codex on
+            // 7a2a06d).
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = cancelled.changed() => break,
+                    peer = incoming.next() => match peer {
+                        None | Some(Err(_)) | Some(Ok(Message::Close(_))) => break,
+                        Some(Ok(_)) => {}
+                    },
+                }
             }
+            let _ = tokio::time::timeout(SOCKET_CLOSE, out.close()).await;
         });
-    hyper::Response::builder()
-        .status(200)
-        .header("content-type", "text/event-stream")
-        .header("cache-control", "no-cache")
-        .body(
-            SseBody {
-                rx: body_rx,
-                ended: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            }
-            .boxed(),
-        )
-        .expect("static response")
+    response.map(|b| b.map_err(|e| match e {}).boxed())
 }
 
 /// The site's shapes, and nothing else: a request names a page the
@@ -1357,37 +1471,49 @@ fn site_page(pages: &Pages, rel: &str) -> Resp {
 /// The handoff: subscribe, then the retained state, then live —
 /// the order `Feed::connect` documents. A lagged browser gets the
 /// state again.
-fn events(ctx: &Ctx, admitted: door::Admitted) -> Resp {
+/// The page's live channel. A WebSocket rather than a stream because
+/// the accountless tunnel's edge buffers a response BODY until it
+/// completes and so delivers a stream never — an upgrade is not a
+/// body (measured, the-tunnel-says-its-own-name). The frames are the
+/// same the feed publishes, in the same order, retained state first.
+fn events(req: hyper::Request<hyper::body::Incoming>, ctx: &Ctx, admitted: door::Admitted) -> Resp {
+    if !hyper_tungstenite::is_upgrade_request(&req) {
+        return text(
+            426,
+            "the live channel is a websocket: connect to /events with an upgrade",
+            "text/plain",
+        );
+    }
+    // An upgrade is a request like any other: it carries the page's
+    // origin or it is not the page's (codex on 651e48b).
+    if !same_origin(&req, ctx) {
+        return text(403, "not from this page", "text/plain");
+    }
     let (frames, rx) = ctx.feed.connect();
-    let (tx, body_rx) = tokio::sync::mpsc::channel::<String>(64);
-    let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    // The stream holds its session: a revocation ends it here, not
-    // at the next request the browser never makes.
     let authority = Authority {
         cancelled: ctx.cancelled.clone(),
         revocations: ctx.door.watch_revocations(),
         door: ctx.door.clone(),
         admitted,
     };
-    // The forwarder is a worker of the accept loop's, not a task of
-    // its own: it ends on the cancel the loop shares, or when the
-    // browser is gone, and the loop joins it (codex on 55db154).
-    let flag = ended.clone();
+    let mut req = req;
+    let (response, socket) = match hyper_tungstenite::upgrade(&mut req, None) {
+        Ok(up) => up,
+        Err(e) => return text(400, format!("not a websocket: {e}"), "text/plain"),
+    };
     let feed = ctx.feed.clone();
+    let sockets = ctx.sockets.clone();
+    // ONE worker of the accept loop's, so nothing is detached and the
+    // loop joins it when it ends (codex on 55db154).
     ctx.workers
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .spawn(async move {
-            if forward(frames, rx, feed, tx, authority).await {
-                flag.store(true, std::sync::atomic::Ordering::Relaxed);
-            }
+            let Ok(socket) = socket.await else { return };
+            let _live = Live::new(sockets);
+            pump(socket, frames, rx, feed, authority).await;
         });
-    hyper::Response::builder()
-        .status(200)
-        .header("content-type", "text/event-stream")
-        .header("cache-control", "no-cache")
-        .body(SseBody { rx: body_rx, ended }.boxed())
-        .expect("static response")
+    response.map(|b| b.map_err(|e| match e {}).boxed())
 }
 
 #[derive(serde::Deserialize)]
@@ -1559,7 +1685,9 @@ mod tests {
                     Arc::new(Blocking::default()),
                     door,
                     "nonce".to_string(),
-                    Some(public.to_string()),
+                    // Published as the tunnel would publish it.
+                    Arc::new(std::sync::RwLock::new(seen_as(public))),
+                    Arc::default(),
                 )
                 .await
             }
@@ -1610,82 +1738,325 @@ mod tests {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), server).await;
     }
 
-    /// The forwarder with a browser that has stopped reading: the
-    /// channel fills on the retained frames alone, and the forwarder
-    /// still ends — by revocation, by the deadline, by the cancel —
-    /// with nobody draining it, and says the authority ended.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_forwarder_blocked_on_a_full_channel_still_ends_with_its_authority() {
-        use std::time::Duration;
-        let door = Arc::new(door::Door::new(None));
-        let feed = Feed::new(16);
-        let admit = |door: &door::Door| {
-            let token = door.open_session("phone").unwrap();
-            door.admit(Some(&format!("{}={token}", door::COOKIE)))
-                .unwrap()
-        };
-        let start = |admitted: door::Admitted, cancelled: tokio::sync::watch::Receiver<bool>| {
-            let (_, rx) = feed.connect();
-            let (tx, body_rx) = tokio::sync::mpsc::channel::<String>(1);
-            let authority = Authority {
-                cancelled,
-                revocations: door.watch_revocations(),
-                door: door.clone(),
-                admitted,
-            };
-            let frames = vec!["a".to_string(), "b".to_string(), "c".to_string()];
-            (
-                tokio::spawn(forward(frames, rx, feed.clone(), tx, authority)),
-                body_rx,
-            )
-        };
+    /// A socket server for the transport's own tests: the feed and
+    /// the door are the caller's, so it can revoke, expire and push
+    /// frames while a real client is attached.
+    async fn socket_server(
+        door: Arc<door::Door>,
+        feed: Feed,
+    ) -> (
+        String,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::sync::watch::Sender<bool>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let sockets: Arc<std::sync::atomic::AtomicUsize> = Arc::default();
         let (cancel, cancelled) = tokio::sync::watch::channel(false);
+        // Leaked on purpose: the server outlives this function, and
+        // a tempdir removed under it would break the site route.
+        let site = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+        let repo = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+        let server = tokio::spawn({
+            let (sockets, door) = (sockets.clone(), door.clone());
+            let (repo, site) = (repo.path().to_path_buf(), site.path().to_path_buf());
+            let sayer: Sayer = Arc::new(|_, _| Ok(()));
+            async move {
+                serve(
+                    listener,
+                    feed,
+                    sayer,
+                    "clank-test".to_string(),
+                    repo,
+                    site,
+                    cancelled,
+                    Arc::new(Blocking::default()),
+                    door,
+                    "nonce-of-this-start".to_string(),
+                    Arc::default(),
+                    sockets,
+                )
+                .await;
+            }
+        });
+        (format!("localhost:{port}"), sockets, cancel, server)
+    }
 
-        // Revoked while blocked on the second retained frame.
-        let admitted = admit(&door);
-        let (task, body) = start(admitted.clone(), cancelled.clone());
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        assert!(!task.is_finished(), "blocked: nobody reads");
-        door.revoke_session(&admitted.id_hash).unwrap();
-        let ended = tokio::time::timeout(Duration::from_secs(2), task).await;
-        assert!(
-            ended.expect("ends without a reader").unwrap(),
-            "the authority ended it"
-        );
-        drop(body);
+    fn socket_to(
+        host: &str,
+        path: &str,
+        cookie: Option<&str>,
+    ) -> tokio_tungstenite::tungstenite::handshake::client::Request {
+        let mut b = tokio_tungstenite::tungstenite::handshake::client::Request::builder()
+            .uri(format!("ws://{host}{path}"))
+            .header("host", host)
+            .header("origin", format!("http://{host}"))
+            .header("connection", "Upgrade")
+            .header("upgrade", "websocket")
+            .header("sec-websocket-version", "13")
+            .header(
+                "sec-websocket-key",
+                tokio_tungstenite::tungstenite::handshake::client::generate_key(),
+            );
+        if let Some(c) = cookie {
+            b = b.header("cookie", c);
+        }
+        b.body(()).unwrap()
+    }
 
-        // Its term ends while blocked.
-        let mut admitted = admit(&door);
-        admitted.expires = tokio::time::Instant::now() + Duration::from_millis(300);
-        let (task, body) = start(admitted, cancelled.clone());
-        let ended = tokio::time::timeout(Duration::from_secs(2), task).await;
-        assert!(
-            ended.expect("ends at its deadline").unwrap(),
-            "the authority ended it"
-        );
-        drop(body);
+    async fn settles_to_zero(sockets: &std::sync::atomic::AtomicUsize, why: &str) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+        while sockets.load(std::sync::atomic::Ordering::Relaxed) != 0 {
+            assert!(tokio::time::Instant::now() < deadline, "{why}");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
 
-        // The remote switched off while blocked.
-        let (task, body) = start(admit(&door), cancelled);
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let _ = cancel.send(true);
-        let ended = tokio::time::timeout(Duration::from_secs(2), task).await;
-        assert!(
-            ended.expect("ends on the cancel").unwrap(),
-            "the authority ended it"
-        );
-        drop(body);
+    /// The transport itself, not the producer behind it: a peer that
+    /// has STOPPED READING fills the socket, and the pump still ends
+    /// on revocation rather than staying blocked in a send and
+    /// handing the frames over if the peer ever resumes (codex on
+    /// 7a2a06d).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_socket_whose_peer_stopped_reading_still_ends_on_revocation() {
+        let door = Arc::new(door::Door::new(None));
+        let feed = Feed::new(256);
+        feed.panes(vec![PaneMeta {
+            id: "terminal_5".into(),
+            label: "claude".into(),
+            columns: 100,
+            rows: 3,
+            exited: false,
+        }]);
+        let (host, sockets, _cancel, server) = socket_server(door.clone(), feed.clone()).await;
+        let opened = door.open_session("token").unwrap();
+        let cookie = format!("{}={opened}", door::COOKIE);
 
-        // The browser leaving is the other ending, and not an
-        // authority's.
-        let (_kept, cancelled) = tokio::sync::watch::channel(false);
-        let (task, body) = start(admit(&door), cancelled);
-        drop(body);
-        let ended = tokio::time::timeout(Duration::from_secs(2), task).await;
-        assert!(
-            !ended.expect("ends when the browser is gone").unwrap(),
-            "not an authority's ending"
+        let (peer, _) =
+            tokio_tungstenite::connect_async(socket_to(&host, "/events", Some(&cookie)))
+                .await
+                .expect("the page's socket");
+        // Never read from it again; just keep it alive.
+        let peer = Box::new(peer);
+        while sockets.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        // Push far more than any buffer will hold, so the pump is
+        // genuinely blocked in a send with nobody draining. Loopback
+        // buffers are generous, so this has to be megabytes, and it
+        // has to stay under the feed's capacity or the receiver lags
+        // and resyncs to a handful of frames instead.
+        let wide = "x".repeat(64 * 1024);
+        for _ in 0..200 {
+            feed.event(SubscribeEvent {
+                event: "pane_update".into(),
+                pane_id: Some("terminal_5".into()),
+                viewport: Some(vec![wide.clone()]),
+                scrollback: None,
+                is_initial: false,
+            });
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            sockets.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "still attached, and blocked"
         );
+
+        let hash = door.sessions().unwrap()[0].id_hash.clone();
+        door.revoke_session(&hash).unwrap();
+        settles_to_zero(
+            &sockets,
+            "a revoked socket ended even though its peer stopped reading",
+        )
+        .await;
+        drop(peer);
+        server.abort();
+    }
+
+    /// A revoked socket is DROPPED, not closed. A graceful close
+    /// writes its frame and flushes the transport on the way out,
+    /// which would hand the peer the very data the revocation is
+    /// refusing it — so the peer here reads normally, and still gets
+    /// no goodbye (codex on 0c132af).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_revoked_socket_is_dropped_without_a_goodbye() {
+        use futures_util::StreamExt;
+        use hyper_tungstenite::tungstenite::Message;
+        let door = Arc::new(door::Door::new(None));
+        let feed = Feed::new(64);
+        feed.panes(vec![PaneMeta {
+            id: "terminal_5".into(),
+            label: "claude".into(),
+            columns: 100,
+            rows: 3,
+            exited: false,
+        }]);
+        let (host, sockets, _cancel, server) = socket_server(door.clone(), feed.clone()).await;
+        let opened = door.open_session("token").unwrap();
+        let cookie = format!("{}={opened}", door::COOKIE);
+        let (mut peer, _) =
+            tokio_tungstenite::connect_async(socket_to(&host, "/events", Some(&cookie)))
+                .await
+                .expect("the page's socket");
+
+        // Read the retained state, so the transport is idle and a
+        // close WOULD get through if one were sent.
+        let first = tokio::time::timeout(std::time::Duration::from_secs(5), peer.next())
+            .await
+            .expect("a frame");
+        assert!(matches!(first, Some(Ok(Message::Text(_)))));
+        while sockets.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let hash = door.sessions().unwrap()[0].id_hash.clone();
+        door.revoke_session(&hash).unwrap();
+        let saw_close = tokio::time::timeout(std::time::Duration::from_secs(8), async {
+            loop {
+                match peer.next().await {
+                    None | Some(Err(_)) => return false,
+                    Some(Ok(Message::Close(_))) => return true,
+                    Some(Ok(_)) => {}
+                }
+            }
+        })
+        .await
+        .expect("the revoked socket ends rather than hanging");
+        assert!(
+            !saw_close,
+            "a revoked socket is dropped, not closed — a close would flush what it held"
+        );
+        server.abort();
+    }
+
+    /// Backpressure interrupted by control frames: the peer pings
+    /// while it reads, so the pump's write is cancelled and resumed
+    /// again and again. Every frame must arrive EXACTLY once — a
+    /// send cancelled after the sink accepted it would resubmit, and
+    /// a pane frame written to the terminal twice is corruption
+    /// (codex on 0c132af).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_write_interrupted_by_control_frames_delivers_each_frame_once() {
+        use futures_util::{SinkExt, StreamExt};
+        use hyper_tungstenite::tungstenite::Message;
+        let door = Arc::new(door::Door::new(None));
+        let feed = Feed::new(512);
+        feed.panes(vec![PaneMeta {
+            id: "terminal_5".into(),
+            label: "claude".into(),
+            columns: 100,
+            rows: 3,
+            exited: false,
+        }]);
+        let (host, _sockets, _cancel, server) = socket_server(door.clone(), feed.clone()).await;
+        let opened = door.open_session("token").unwrap();
+        let cookie = format!("{}={opened}", door::COOKIE);
+        let (mut peer, _) =
+            tokio_tungstenite::connect_async(socket_to(&host, "/events", Some(&cookie)))
+                .await
+                .expect("the page's socket");
+
+        // Big enough frames that the sink is mid-flush when a
+        // control frame lands.
+        const SENT: usize = 60;
+        let bulk = "y".repeat(48 * 1024);
+        for i in 0..SENT {
+            feed.event(SubscribeEvent {
+                event: "pane_update".into(),
+                pane_id: Some("terminal_5".into()),
+                viewport: Some(vec![format!("seq-{i}-{bulk}")]),
+                scrollback: None,
+                is_initial: false,
+            });
+        }
+
+        let mut seen: Vec<usize> = Vec::new();
+        let collected = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            while seen.len() < SENT {
+                // Ping between reads, so the pump's write keeps
+                // losing its select to an incoming control frame.
+                let _ = peer.send(Message::Ping(Vec::new().into())).await;
+                match peer.next().await {
+                    Some(Ok(Message::Text(said))) => {
+                        for (i, _) in (0..SENT).map(|i| (i, ())) {
+                            if said.contains(&format!("seq-{i}-")) {
+                                seen.push(i);
+                                break;
+                            }
+                        }
+                    }
+                    Some(Ok(_)) => {}
+                    None | Some(Err(_)) => return false,
+                }
+            }
+            true
+        })
+        .await;
+        assert!(
+            collected.is_ok(),
+            "the frames arrived: {} of {SENT}",
+            seen.len()
+        );
+
+        let mut once = seen.clone();
+        once.sort_unstable();
+        once.dedup();
+        assert_eq!(
+            once.len(),
+            seen.len(),
+            "every frame exactly once, never resubmitted: {seen:?}"
+        );
+        server.abort();
+    }
+
+    /// A peer that simply goes away is noticed, and a probe that has
+    /// its answer leaves nothing behind: neither socket may pile up
+    /// for the life of the TUI (codex on 7a2a06d).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_peer_that_leaves_is_noticed_and_probes_do_not_pile_up() {
+        use futures_util::StreamExt;
+        let door = Arc::new(door::Door::new(None));
+        let (host, sockets, _cancel, server) = socket_server(door.clone(), Feed::new(16)).await;
+
+        // The readiness socket, connected and dropped ten times.
+        for _ in 0..10 {
+            let (mut probe, _) =
+                tokio_tungstenite::connect_async(socket_to(&host, "/instance/stream", None))
+                    .await
+                    .expect("no session needed");
+            let first = tokio::time::timeout(std::time::Duration::from_secs(5), probe.next())
+                .await
+                .expect("a frame")
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                first,
+                tokio_tungstenite::tungstenite::Message::text("nonce-of-this-start")
+            );
+            let _ = probe.close(None).await;
+            drop(probe);
+        }
+        settles_to_zero(&sockets, "finished probes left their sockets behind").await;
+
+        // And the live socket: a peer that closes ends the pump.
+        let opened = door.open_session("token").unwrap();
+        let cookie = format!("{}={opened}", door::COOKIE);
+        let (mut peer, _) =
+            tokio_tungstenite::connect_async(socket_to(&host, "/events", Some(&cookie)))
+                .await
+                .expect("the page's socket");
+        while sockets.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let _ = peer.close(None).await;
+        drop(peer);
+        settles_to_zero(&sockets, "an idle peer that closed left its pump running").await;
+        server.abort();
     }
 
     fn repo_with_config() -> tempfile::TempDir {
@@ -1859,12 +2230,14 @@ mod tests {
                     Arc::new(Blocking::default()),
                     door,
                     "nonce-of-this-start".to_string(),
-                    None,
+                    Arc::default(),
+                    Arc::default(),
                 )
                 .await
             }
         });
         let base = format!("http://localhost:{port}");
+        let ws = format!("ws://localhost:{port}");
         let anon = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .build()
@@ -1879,24 +2252,39 @@ mod tests {
             r.json::<serde_json::Value>().await.unwrap()["nonce"],
             "nonce-of-this-start"
         );
-        let mut probe = anon
-            .get(format!("{base}/instance/stream"))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(probe.status(), 200);
-        let first = probe.chunk().await.unwrap().unwrap();
+        // Plain GET is not the live channel any more, and says so.
         assert_eq!(
-            std::str::from_utf8(&first).unwrap(),
-            "event: instance\ndata: nonce-of-this-start\n\n"
-        );
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(300), probe.chunk())
+            anon.get(format!("{base}/instance/stream"))
+                .send()
                 .await
-                .is_err(),
-            "the stream stays open"
+                .unwrap()
+                .status(),
+            426
         );
-        drop(probe);
+        // The readiness socket: no session, the nonce, and nothing
+        // else — it is how the tunnel is proven before anyone can
+        // log in (codex on 651e48b).
+        {
+            use futures_util::StreamExt;
+            let (mut probe, _) = tokio_tungstenite::connect_async(format!("{ws}/instance/stream"))
+                .await
+                .expect("the readiness socket needs no session");
+            let first = tokio::time::timeout(std::time::Duration::from_secs(5), probe.next())
+                .await
+                .expect("a frame")
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                first,
+                tokio_tungstenite::tungstenite::Message::text("nonce-of-this-start")
+            );
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(300), probe.next())
+                    .await
+                    .is_err(),
+                "the socket stays open and says nothing else"
+            );
+        }
 
         // Nothing but the doors answers without a session: a browser
         // is sent to sign in, a script is refused.
@@ -2139,15 +2527,66 @@ mod tests {
             "the session is baked into the page"
         );
 
-        // The stream: state first (the table), then a live frame.
-        let mut resp = client.get(format!("{base}/events")).send().await.unwrap();
+        // The live channel: a socket, needing a session and the
+        // page's own origin; state first (the table), then live.
         assert_eq!(
-            resp.headers().get("content-type").unwrap(),
-            "text/event-stream"
+            client
+                .get(format!("{base}/events"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            426,
+            "a plain GET is not the live channel"
         );
+        use futures_util::StreamExt;
+        let socket_request = |cookie: Option<&str>, origin: Option<&str>| {
+            let mut b = tokio_tungstenite::tungstenite::handshake::client::Request::builder()
+                .uri(format!("{ws}/events"))
+                .header("host", format!("localhost:{port}"))
+                .header("connection", "Upgrade")
+                .header("upgrade", "websocket")
+                .header("sec-websocket-version", "13")
+                .header(
+                    "sec-websocket-key",
+                    tokio_tungstenite::tungstenite::handshake::client::generate_key(),
+                );
+            if let Some(c) = cookie {
+                b = b.header("cookie", c);
+            }
+            if let Some(o) = origin {
+                b = b.header("origin", o);
+            }
+            b.body(()).unwrap()
+        };
+        assert!(
+            tokio_tungstenite::connect_async(socket_request(None, Some(&base)))
+                .await
+                .is_err(),
+            "no session, no live channel"
+        );
+        assert!(
+            tokio_tungstenite::connect_async(socket_request(
+                Some(&cookie),
+                Some("http://evil.example")
+            ))
+            .await
+            .is_err(),
+            "an upgrade from elsewhere is not the page's"
+        );
+        let (mut live, _) =
+            tokio_tungstenite::connect_async(socket_request(Some(&cookie), Some(&base)))
+                .await
+                .expect("the page's own socket");
         let mut got = String::new();
         while !got.contains("event: panes\n") {
-            got.push_str(std::str::from_utf8(&resp.chunk().await.unwrap().unwrap()).unwrap());
+            if let Some(Ok(tokio_tungstenite::tungstenite::Message::Text(said))) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), live.next())
+                    .await
+                    .expect("a frame")
+            {
+                got.push_str(&said);
+            }
         }
         assert!(got.contains("terminal_5"));
         feed.event(SubscribeEvent {
@@ -2158,7 +2597,13 @@ mod tests {
             is_initial: false,
         });
         while !got.contains("event: pane\n") {
-            got.push_str(std::str::from_utf8(&resp.chunk().await.unwrap().unwrap()).unwrap());
+            if let Some(Ok(tokio_tungstenite::tungstenite::Message::Text(said))) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), live.next())
+                    .await
+                    .expect("a frame")
+            {
+                got.push_str(&said);
+            }
         }
         assert!(
             got.contains("\"screen\":\"\\u001b[Hhello\\u001b[K\\u001b[J\""),
@@ -2220,14 +2665,15 @@ mod tests {
         door.revoke_session(&hash).unwrap();
         let ended = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
-                match resp.chunk().await {
-                    Ok(None) | Err(_) => break,
-                    Ok(Some(_)) => {}
+                match live.next().await {
+                    None | Some(Err(_)) => break,
+                    Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))) => break,
+                    Some(Ok(_)) => {}
                 }
             }
         })
         .await;
-        assert!(ended.is_ok(), "the stream ends on revocation");
+        assert!(ended.is_ok(), "the socket closes on revocation");
         assert_eq!(
             client
                 .get(format!("{base}/whoami"))
@@ -2266,23 +2712,23 @@ mod tests {
             time::Duration::days(door::SESSION_DAYS) - time::Duration::seconds(2),
         )
         .unwrap();
-        let mut ending = anon
-            .get(format!("{base}/events"))
-            .header("cookie", &cookie)
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(ending.status(), 200);
+        // Expiry ends a socket as revocation does, and with no
+        // request made in between (codex on 651e48b).
+        let (mut ending, _) =
+            tokio_tungstenite::connect_async(socket_request(Some(&cookie), Some(&base)))
+                .await
+                .expect("a session still inside its term");
         let ended = tokio::time::timeout(std::time::Duration::from_secs(6), async {
             loop {
-                match ending.chunk().await {
-                    Ok(None) | Err(_) => break,
-                    Ok(Some(_)) => {}
+                match ending.next().await {
+                    None | Some(Err(_)) => break,
+                    Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))) => break,
+                    Some(Ok(_)) => {}
                 }
             }
         })
         .await;
-        assert!(ended.is_ok(), "the stream ends at its deadline");
+        assert!(ended.is_ok(), "the socket closes at its deadline");
 
         // Guessing at the link door is rate-limited per address.
         let mut refused_at = None;
