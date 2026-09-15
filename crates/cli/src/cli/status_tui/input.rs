@@ -124,7 +124,7 @@ pub(super) enum Mode {
     /// The open WAIT page: which agent's wait, and the cursor row on it.
     WaitDetail { agent: usize, sel: usize },
     /// The remote page (Enter on the remote row): the switch, the
-    /// links in, and the passkeys and sessions to revoke.
+    /// links in, and the token and sessions to revoke.
     RemotePage { sel: usize },
     /// A one-line text input on the plan page (force-finish subject,
     /// squash message, block reason, drop type-to-confirm). The BUFFER
@@ -841,20 +841,21 @@ pub(super) fn wait_page_nav(sel: usize, actions: &[WaitAction], key: Key) -> Det
     }
 }
 
-/// A row on the REMOTE page. A passkey or session row carries the
-/// IDENTITY it was drawn with, not a position: the door's lists can
-/// change under the page — another TUI's removal, an expiry — and
-/// Backspace must revoke what was shown, or nothing, never a
-/// successor that slid into its place (codex on f657b4d).
+/// A row on the REMOTE page. A session row carries the IDENTITY it
+/// was drawn with, not a position: the door's list can change under
+/// the page — another TUI's revocation, an expiry — and Backspace
+/// must revoke what was shown, or nothing, never a successor that
+/// slid into its place (codex on f657b4d).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum RemoteAction {
     Switch,
     /// The browser, through a login link; only while on.
     Open,
-    /// A registration link for the phone, as a QR; only while on.
+    /// A link for the phone, as a QR; only while on.
     Phone,
-    /// A registered passkey, by its credential id.
-    Passkey(String),
+    /// The token, shown for reading off and pasting. Backspace
+    /// rotates it, which is the credential's own revocation.
+    Token,
     /// An open session, by the hash the file keeps.
     Session(String),
     Back,
@@ -862,10 +863,10 @@ pub(super) enum RemoteAction {
 
 /// The remote page's rows. The two links are ABSENT while the
 /// remote is off rather than shown and inert: there is no URL to
-/// link into.
+/// link into. The token is always there — it is the same token
+/// whether the remote is up or not.
 pub(super) fn remote_actions(
     on: bool,
-    passkeys: &[crate::cli::web::door::PasskeyRow],
     sessions: &[crate::cli::web::door::SessionRecord],
 ) -> Vec<RemoteAction> {
     let mut out = vec![RemoteAction::Switch];
@@ -873,7 +874,7 @@ pub(super) fn remote_actions(
         out.push(RemoteAction::Open);
         out.push(RemoteAction::Phone);
     }
-    out.extend(passkeys.iter().map(|p| RemoteAction::Passkey(p.id.clone())));
+    out.push(RemoteAction::Token);
     out.extend(
         sessions
             .iter()
@@ -890,9 +891,9 @@ pub(super) enum RemoteNav {
     Back,
     MoveCursor(usize),
     Activate(RemoteAction),
-    /// Backspace on a passkey or a session row: the one destructive
-    /// key, on the one kind of row it applies to. Enter there is
-    /// nothing, so a row cannot be revoked by selecting it.
+    /// Backspace on the token or a session row: the one destructive
+    /// key, on the rows it applies to. Enter there is nothing, so a
+    /// row cannot be revoked by selecting it.
     Revoke(RemoteAction),
 }
 
@@ -905,7 +906,7 @@ pub(super) fn remote_page_nav(sel: usize, actions: &[RemoteAction], key: Key) ->
         Key::Up => RemoteNav::MoveCursor(move_selection(sel, actions.len(), false)),
         Key::Down => RemoteNav::MoveCursor(move_selection(sel, actions.len(), true)),
         Key::Enter => match current {
-            RemoteAction::Passkey(_) | RemoteAction::Session(_) => RemoteNav::None,
+            RemoteAction::Token | RemoteAction::Session(_) => RemoteNav::None,
             RemoteAction::Back => RemoteNav::Back,
             a => RemoteNav::Activate(a),
         },
@@ -913,17 +914,18 @@ pub(super) fn remote_page_nav(sel: usize, actions: &[RemoteAction], key: Key) ->
         Key::Html if has(RemoteAction::Open) => RemoteNav::Activate(RemoteAction::Open),
         Key::Char(b'p') if has(RemoteAction::Phone) => RemoteNav::Activate(RemoteAction::Phone),
         Key::Delete => match current {
-            RemoteAction::Passkey(_) | RemoteAction::Session(_) => RemoteNav::Revoke(current),
+            RemoteAction::Token | RemoteAction::Session(_) => RemoteNav::Revoke(current),
             _ => RemoteNav::None,
         },
         _ => RemoteNav::None,
     }
 }
 
-/// What the remote page lists, read from the door for the frame.
+/// What the remote page shows, read from the door for the frame.
 #[derive(Debug, Clone, Default)]
 pub(super) struct RemotePage {
-    pub(super) passkeys: Vec<crate::cli::web::door::PasskeyRow>,
+    /// This machine's token, as the row prints it for pasting.
+    pub(super) token: String,
     pub(super) sessions: Vec<crate::cli::web::door::SessionRecord>,
 }
 
@@ -2879,36 +2881,31 @@ mod tests {
     }
 
     /// The remote page's rows: the two links only while the remote
-    /// is on; Backspace revokes a passkey or session row and nothing
-    /// else, and Enter on such a row is nothing — a row is not
-    /// revoked by selecting it.
+    /// is on; the token always; Backspace revokes the token (by
+    /// rotating it) or a session and nothing else, and Enter on
+    /// such a row is nothing — a row is not revoked by selecting it.
     #[test]
     fn the_remote_page_links_are_absent_while_off_and_backspace_revokes() {
         use RemoteAction::*;
-        let key = |id: &str| crate::cli::web::door::PasskeyRow {
-            id: id.into(),
-            name: "phone".into(),
-            added: String::new(),
-        };
         let session = |hash: &str| crate::cli::web::door::SessionRecord {
             id_hash: hash.into(),
-            passkey: "phone".into(),
+            how: "token".into(),
             created: String::new(),
             last_seen: String::new(),
         };
-        let off = remote_actions(false, &[key("k1")], &[session("s1"), session("s2")]);
+        let off = remote_actions(false, &[session("s1"), session("s2")]);
         assert_eq!(
             off,
             vec![
                 Switch,
-                Passkey("k1".into()),
+                Token,
                 Session("s1".into()),
                 Session("s2".into()),
                 Back
             ]
         );
-        let on = remote_actions(true, &[], &[]);
-        assert_eq!(on, vec![Switch, Open, Phone, Back]);
+        let on = remote_actions(true, &[]);
+        assert_eq!(on, vec![Switch, Open, Phone, Token, Back]);
         assert_eq!(remote_page_nav(0, &off, Key::Html), RemoteNav::None);
         assert_eq!(remote_page_nav(0, &off, Key::Char(b'p')), RemoteNav::None);
         assert_eq!(
@@ -2921,7 +2918,8 @@ mod tests {
         );
         assert_eq!(
             remote_page_nav(1, &off, Key::Delete),
-            RemoteNav::Revoke(Passkey("k1".into()))
+            RemoteNav::Revoke(Token),
+            "backspace on the token rotates it"
         );
         assert_eq!(
             remote_page_nav(3, &off, Key::Delete),
@@ -2939,7 +2937,7 @@ mod tests {
             remote_page_nav(2, &off, Key::Char(b'r')),
             RemoteNav::Activate(Switch)
         );
-        assert_eq!(remote_page_nav(3, &on, Key::Enter), RemoteNav::Back);
+        assert_eq!(remote_page_nav(4, &on, Key::Enter), RemoteNav::Back);
         assert_eq!(remote_page_nav(0, &on, Key::Escape), RemoteNav::Back);
         assert_eq!(remote_page_nav(0, &on, Key::Quit), RemoteNav::Quit);
     }

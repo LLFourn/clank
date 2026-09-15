@@ -61,8 +61,6 @@ cargo install --path crates/cli --locked
 That puts `clank` on your `$PATH`. Keep `--locked`: without it
 `cargo install` ignores the committed `Cargo.lock` and re-resolves
 every dependency to the newest semver-compatible version.
-The build links the system OpenSSL for the remote's passkeys
-(`brew install openssl@3` on macOS, `libssl-dev` on Debian-likes).
 
 Then wire it into your agents (Claude Code, Codex CLI, Grok CLI,
 opencode — any or all):
@@ -187,17 +185,20 @@ closing the TUI, stops it and everything it started. The glyph
 beside the zellij one at the bar's right end shows its state from
 any page.
 
-The page is behind a door: every route but sign-in asks for a
-session, and the TUI is what opens one. `o` on the row (or on its
-page) opens the browser through a one-time login link, so this
-machine needs no ceremony. For a phone, Enter opens the remote page
-and `p` mints a registration link — shown as text and as a QR — that
-admits one passkey registration within five minutes; the phone
-signs in with that passkey (a YubiKey held to it works) from then
-on. The page lists the passkeys (kept in `~/.clank/config.json`
-under `remote.passkeys`) and the open sessions (thirty days, hashed
-in `~/.clank/remote-sessions.json`); Backspace on either revokes it,
-and a revoked session's stream ends at once.
+The page is behind a door, and the key is one token. Enter on the
+row opens the remote page, which prints it; paste it into the page
+and you are in. It is minted on first use and kept at user level in
+`~/.clank/config.json` under `remote.token`, so it is the same token
+for every repo's remote on this machine and it survives restarts —
+paste it once per device, not once per session. Backspace on the
+token row rotates it, which ends every session it opened.
+
+The links make the paste optional rather than necessary: `o` on the
+row opens the browser through a one-time link, so this machine never
+pastes, and `p` shows that link as a QR for a phone's camera. Each
+is good for one use within five minutes. Sessions last thirty days,
+hashed in `~/.clank/remote-sessions.json`, and the page lists them;
+Backspace revokes one, and a revoked session's stream ends at once.
 
 A phone reaches the page through a tunnel, configured once in
 `~/.clank/config.json` under `remote.tunnel` and brought up with the
@@ -207,8 +208,8 @@ ngrok natively through its SDK, with the authtoken read from
 clank's); `{"provider": "command", "run": ["cloudflared", "tunnel",
 "run", "--url", "http://localhost:{port}", "clank"], "url":
 "https://clank.example.com"}` runs any binary that forwards a fixed
-hostname to the port. The tunnel's URL is the passkeys' relying
-party and where the phone's link points, and it is on the row only
+hostname to the port. The tunnel's URL is where the phone's link
+points, and it is on the row only
 once the TUI has reached its own remote through it — the nonce and
 the event stream both, since a tunnel that buffers streams cannot
 carry the page (Cloudflare's quick tunnels do not). One TUI holds a

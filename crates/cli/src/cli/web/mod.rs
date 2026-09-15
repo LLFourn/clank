@@ -29,7 +29,6 @@ use feed::{Feed, SubscribeEvent, TableChange};
 
 const PAGE: &str = include_str!("page.html");
 const LOGIN: &str = include_str!("login.html");
-const REGISTER: &str = include_str!("register.html");
 const HTML: &str = "text/html; charset=utf-8";
 
 /// Which session to look in. `--session` wins; else the one this
@@ -212,15 +211,11 @@ impl Instance {
         let table = panes
             .table()
             .ok_or_else(|| anyhow::anyhow!("zellij did not answer for `{}`", panes.session()))?;
-        // The public origin, resolved ONCE for this start: the relying
-        // party, the cookie's host, the links and the tunnel itself
-        // are one configuration until the next start.
-        let public = tunnel
-            .as_ref()
-            .map(|t| webauthn_rs::prelude::Url::parse(&t.provider.url()))
-            .transpose()?;
+        // The public origin, resolved ONCE for this start: the
+        // origins a post may come from, the links, and the tunnel
+        // itself are one configuration until the next start.
+        let public = tunnel.as_ref().map(|t| t.provider.url());
         let (listener, port) = listen(&repo).await?;
-        let rp = Arc::new(door.relying_party(port, public.as_ref())?);
         let door_for_serve = door.clone();
         let nonce = door::random_token();
         let feed = Feed::new(64);
@@ -241,9 +236,8 @@ impl Instance {
             cancelled.clone(),
             blocking.clone(),
             door_for_serve,
-            rp,
             nonce.clone(),
-            public.as_ref().and_then(secure_host_of),
+            public,
         ));
         tasks.spawn(pane_poll(
             panes,
@@ -256,9 +250,9 @@ impl Instance {
         tasks.spawn(door_poll(door, cancelled, blocking.clone()));
         let builder = SiteBuilder::start(repo.clone(), home.clone());
         let mut instance = Self {
-            // `localhost`, not `127.0.0.1`: the passkeys' relying
-            // party is `localhost`, and a browser's origin must say
-            // the RP's name (codex on 375f30c).
+            // `localhost`, not `127.0.0.1`: it is the name a
+            // browser on this machine is sent to, and the origin a
+            // post from that page carries.
             url: format!("http://localhost:{port}"),
             public_url: None,
             tunnel: None,
@@ -936,15 +930,26 @@ async fn serve(
     mut cancelled: tokio::sync::watch::Receiver<bool>,
     blocking: Arc<Blocking>,
     door: Arc<door::Door>,
-    rp: Arc<webauthn_rs::prelude::Webauthn>,
     nonce: String,
-    secure_host: Option<String>,
+    public: Option<String>,
 ) {
-    let origins = rp
-        .get_allowed_origins()
-        .iter()
-        .map(|u| u.as_str().trim_end_matches('/').to_string())
-        .collect();
+    // A post may come from the page this remote serves: the tunnel's
+    // origin when there is one, and the loopback origin the browser
+    // on this machine uses.
+    let port = listener.local_addr().map(|a| a.port()).unwrap_or_default();
+    let public = public.as_deref().and_then(seen_as);
+    let mut origins: Vec<String> = [
+        format!("http://localhost:{port}"),
+        format!("http://127.0.0.1:{port}"),
+    ]
+    .iter()
+    .filter_map(|u| seen_as(u).map(|s| s.origin))
+    .collect();
+    origins.extend(public.as_ref().map(|s| s.origin.clone()));
+    let secure_host = public
+        .as_ref()
+        .filter(|s| s.https)
+        .map(|s| s.authority.clone());
     let ctx = Arc::new(Ctx {
         feed,
         sayer,
@@ -956,11 +961,10 @@ async fn serve(
         pages: Pages { repo, site },
         workers: Mutex::new(tokio::task::JoinSet::new()),
         cancelled: cancelled.clone(),
-        secure_host,
         door,
-        rp,
         origins,
         nonce,
+        secure_host,
     });
     loop {
         let accepted = tokio::select! {
@@ -1002,15 +1006,38 @@ async fn serve(
     while let Some(_done) = workers.join_next().await {}
 }
 
-/// The host a `Secure` cookie is for: the public URL's, when it is
-/// https. Plain loopback gets a plain cookie.
-fn secure_host_of(url: &webauthn_rs::prelude::Url) -> Option<String> {
-    (url.scheme() == "https").then(|| {
-        let host = url.host_str().unwrap_or_default();
-        match url.port() {
+/// A URL as a BROWSER reads it: the origin it puts in `Origin` and
+/// the authority it puts in `Host`. Both come from one parse, because
+/// two hand-rolled readings of the same string disagree with the
+/// browser and with each other — `https://host:443` is sent as
+/// `https://host`, and a mixed-case host is sent lowercased, so a raw
+/// comparison refused the page's own posts (codex on 9c690a2). The
+/// parser normalizes exactly as the browser does: it lowercases the
+/// host and drops a port that is the scheme's default.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Seen {
+    /// `https://clank.example.com` — what `Origin` carries.
+    origin: String,
+    /// `clank.example.com` — what `Host` carries.
+    authority: String,
+    https: bool,
+}
+
+fn seen_as(raw: &str) -> Option<Seen> {
+    let url = url::Url::parse(raw).ok()?;
+    let host = url.host_str()?.to_ascii_lowercase();
+    if host.is_empty() {
+        return None;
+    }
+    Some(Seen {
+        origin: url.origin().ascii_serialization(),
+        // `port()` is None when it is the scheme's default, which is
+        // exactly when the browser leaves it out of `Host`.
+        authority: match url.port() {
             Some(p) => format!("{host}:{p}"),
-            None => host.to_string(),
-        }
+            None => host,
+        },
+        https: url.scheme() == "https",
     })
 }
 
@@ -1026,14 +1053,14 @@ struct Ctx {
     workers: Mutex<tokio::task::JoinSet<()>>,
     cancelled: tokio::sync::watch::Receiver<bool>,
     door: Arc<door::Door>,
-    rp: Arc<webauthn_rs::prelude::Webauthn>,
     /// The origins a browser may post from: the relying party's.
     origins: Vec<String>,
-    /// The host a `Secure` cookie is for, when the tunnel is https.
-    secure_host: Option<String>,
     /// This start's nonce: what the tunnel probe reads back to know
     /// the public URL is this remote and not another.
     nonce: String,
+    /// The configured public host when it is https: a request that
+    /// arrives AT it is over TLS whether or not the connector says so.
+    secure_host: Option<String>,
 }
 
 /// Where the site's pages come from: the built site, and the repo
@@ -1052,7 +1079,6 @@ async fn route(req: hyper::Request<hyper::body::Incoming>, peer: IpAddr, ctx: &C
     let path = req.uri().path().to_string();
     match (method.as_str(), path.as_str()) {
         ("GET", "/login") => return login(&req, peer, ctx),
-        ("GET", "/register") => return text(200, REGISTER, HTML),
         // The readiness probes: the nonce, and the nonce as the first
         // event of a stream that stays open. Nothing of the page.
         ("GET", "/instance") => {
@@ -1063,14 +1089,16 @@ async fn route(req: hyper::Request<hyper::body::Incoming>, peer: IpAddr, ctx: &C
             );
         }
         ("GET", "/instance/stream") => return instance_stream(ctx),
-        ("POST", "/login/start" | "/login/finish" | "/register/start" | "/register/finish") => {
+        // The paste box. Rate-limited per address like the link
+        // door, and only from the page that offers it.
+        ("POST", "/login") => {
             if !same_origin(&req, ctx) {
                 return text(403, "not from this page", "text/plain");
             }
             if !ctx.door.attempt_allowed(peer) {
                 return text(429, "too many attempts — wait a minute", "text/plain");
             }
-            return ceremony(&path, req, ctx).await;
+            return paste(req, ctx).await;
         }
         _ => {}
     }
@@ -1094,11 +1122,15 @@ async fn route(req: hyper::Request<hyper::body::Incoming>, peer: IpAddr, ctx: &C
     }
 }
 
+/// The `Origin` this request carries, normalized the same way the
+/// allowlist was, so the two are compared as origins rather than as
+/// strings.
 fn same_origin(req: &hyper::Request<hyper::body::Incoming>, ctx: &Ctx) -> bool {
     req.headers()
         .get("origin")
         .and_then(|v| v.to_str().ok())
-        .is_some_and(|o| ctx.origins.iter().any(|a| a == o.trim_end_matches('/')))
+        .and_then(seen_as)
+        .is_some_and(|o| ctx.origins.contains(&o.origin))
 }
 
 fn redirect(to: &str) -> Resp {
@@ -1110,16 +1142,43 @@ fn redirect(to: &str) -> Resp {
 }
 
 /// A response that opens a session: the cookie, `Secure` when the
-/// request came to the tunnel's host.
-fn with_session(req_host: Option<&str>, token: &str, ctx: &Ctx, mut resp: Resp) -> Resp {
-    let secure = ctx
-        .secure_host
-        .as_deref()
-        .is_some_and(|h| req_host == Some(h));
+/// request itself arrived over https — which a tunnel says with the
+/// forwarded proto, and plain loopback never does. Following the
+/// REQUEST rather than a configured host is what lets an ephemeral
+/// hostname work at all (the-way-in-is-a-token).
+fn with_session(_req_host: Option<&str>, secure: bool, token: &str, mut resp: Resp) -> Resp {
     if let Ok(v) = hyper::header::HeaderValue::from_str(&door::session_cookie(token, secure)) {
         resp.headers_mut().insert("set-cookie", v);
     }
     resp
+}
+
+/// Whether this request's transport is https, and so whether the
+/// session cookie is `Secure`. TWO sources, because neither alone is
+/// enough: a tunnel that terminates TLS at its edge says so in the
+/// forwarded proto, which is the only signal an ephemeral hostname
+/// has; but a connector that merely forwards bytes (ssh, a plain TCP
+/// forward behind a TLS endpoint) adds no header at all, and for
+/// those the configured public https host is what says the transport
+/// is secure. Trusting only the header silently downgraded those
+/// (codex on f71e7b9).
+fn secure_transport(req: &hyper::Request<hyper::body::Incoming>, ctx: &Ctx) -> bool {
+    let forwarded = req
+        .headers()
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|p| p.split(',').next().is_some_and(|p| p.trim() == "https"));
+    // The `Host` is compared as an authority, not a string: a client
+    // that spells the default port still names the same host.
+    let arrived_at = || {
+        let host = host_of(req)?;
+        seen_as(&format!("https://{host}")).map(|s| s.authority)
+    };
+    forwarded
+        || ctx
+            .secure_host
+            .as_deref()
+            .is_some_and(|h| arrived_at().as_deref() == Some(h))
 }
 
 fn host_of(req: &hyper::Request<hyper::body::Incoming>) -> Option<String> {
@@ -1129,9 +1188,9 @@ fn host_of(req: &hyper::Request<hyper::body::Incoming>) -> Option<String> {
         .map(str::to_string)
 }
 
-/// `/login`: the passkey page — or, with a link token the TUI
-/// minted, straight in. A spent token is said on the page, not in
-/// the URL it came with.
+/// `/login`: the paste box — or, with a link the TUI minted,
+/// straight in. A spent link is said on the page, not in the URL it
+/// came with.
 fn login(req: &hyper::Request<hyper::body::Incoming>, peer: IpAddr, ctx: &Ctx) -> Resp {
     let Some(token) = door::query_token(req.uri().query()) else {
         return text(200, LOGIN, HTML);
@@ -1143,83 +1202,78 @@ fn login(req: &hyper::Request<hyper::body::Incoming>, peer: IpAddr, ctx: &Ctx) -
         return redirect("/login?why=link");
     }
     match ctx.door.open_session("the TUI's link") {
-        Ok(session) => with_session(host_of(req).as_deref(), &session, ctx, redirect("/")),
+        Ok(session) => with_session(
+            host_of(req).as_deref(),
+            secure_transport(req, ctx),
+            &session,
+            redirect("/"),
+        ),
         Err(e) => text(500, format!("the store refused: {e:#}"), "text/plain"),
     }
 }
 
 fn refused(r: door::Refused) -> Resp {
     let status = match r {
-        door::Refused::Link | door::Refused::Credential(_) => 403,
-        door::Refused::Ceremony => 400,
-        door::Refused::NoPasskeys => 404,
+        door::Refused::Token => 403,
         door::Refused::Store(_) => 500,
     };
     text(status, r.to_string(), "text/plain")
 }
 
-/// The four ceremony posts, each a JSON body: start answers the
-/// browser's options and the id to finish with; finish answers a
-/// session.
-async fn ceremony(path: &str, req: hyper::Request<hyper::body::Incoming>, ctx: &Ctx) -> Resp {
+/// The paste box's post: the token, whole, in a JSON body. A
+/// correct one opens the same session a minted link would.
+async fn paste(req: hyper::Request<hyper::body::Incoming>, ctx: &Ctx) -> Resp {
     let host = host_of(&req);
-    let body = http_body_util::Limited::new(req.into_body(), 64 * 1024);
+    let secure = secure_transport(&req, ctx);
+    let body = http_body_util::Limited::new(req.into_body(), 8 * 1024);
     let Ok(bytes) = body.collect().await.map(|c| c.to_bytes()) else {
         return text(413, "too long", "text/plain");
     };
-    let json = |v: serde_json::Value| text(200, v.to_string(), "application/json");
-    let bad = || text(400, "not the shape expected", "text/plain");
-    match path {
-        "/register/start" => {
-            #[derive(serde::Deserialize)]
-            struct Start {
-                token: String,
-                name: String,
-            }
-            let Ok(start) = serde_json::from_slice::<Start>(&bytes) else {
-                return bad();
-            };
-            let name = start.name.trim();
-            let name = if name.is_empty() { "phone" } else { name };
-            match ctx.door.start_registration(&ctx.rp, &start.token, name) {
-                Ok((id, options)) => json(serde_json::json!({"id": id, "options": options})),
-                Err(r) => refused(r),
-            }
-        }
-        "/register/finish" => {
-            let Ok(finish) = serde_json::from_slice::<door::Finish<_>>(&bytes) else {
-                return bad();
-            };
-            match ctx
-                .door
-                .finish_registration(&ctx.rp, &finish.id, &finish.credential)
-            {
-                Ok(session) => {
-                    with_session(host.as_deref(), &session, ctx, text(204, "", "text/plain"))
-                }
-                Err(r) => refused(r),
-            }
-        }
-        "/login/start" => match ctx.door.start_login(&ctx.rp) {
-            Ok((id, options)) => json(serde_json::json!({"id": id, "options": options})),
-            Err(r) => refused(r),
-        },
-        "/login/finish" => {
-            let Ok(finish) = serde_json::from_slice::<door::Finish<_>>(&bytes) else {
-                return bad();
-            };
-            match ctx
-                .door
-                .finish_login(&ctx.rp, &finish.id, &finish.credential)
-            {
-                Ok(session) => {
-                    with_session(host.as_deref(), &session, ctx, text(204, "", "text/plain"))
-                }
-                Err(r) => refused(r),
-            }
-        }
-        _ => text(404, "not here", "text/plain"),
+    let Ok(pasted) = serde_json::from_slice::<door::Paste>(&bytes) else {
+        return text(400, "expected {\"token\": …}", "text/plain");
+    };
+    match ctx.door.open_session_for_token(pasted.token.trim()) {
+        Err(e) => refused(door::Refused::Store(format!("{e:#}"))),
+        Ok(None) => refused(door::Refused::Token),
+        Ok(Some(session)) => with_session(
+            host.as_deref(),
+            secure,
+            &session,
+            text(204, "", "text/plain"),
+        ),
     }
+}
+
+/// One event carrying the nonce, then open until the remote ends:
+/// a tunnel that buffers streams never delivers the event.
+fn instance_stream(ctx: &Ctx) -> Resp {
+    let (tx, body_rx) = tokio::sync::mpsc::channel::<String>(1);
+    let mut cancelled = ctx.cancelled.clone();
+    let first = format!("event: instance\ndata: {}\n\n", ctx.nonce);
+    ctx.workers
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .spawn(async move {
+            if tx.send(first).await.is_err() {
+                return;
+            }
+            tokio::select! {
+                _ = cancelled.changed() => {}
+                _ = tx.closed() => {}
+            }
+        });
+    hyper::Response::builder()
+        .status(200)
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .body(
+            SseBody {
+                rx: body_rx,
+                ended: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }
+            .boxed(),
+        )
+        .expect("static response")
 }
 
 /// The site's shapes, and nothing else: a request names a page the
@@ -1298,38 +1352,6 @@ fn site_page(pages: &Pages, rel: &str) -> Resp {
         "not built yet: the site is rebuilt after each status refresh; try again shortly",
         "text/plain",
     )
-}
-
-/// One event carrying the nonce, then open until the remote ends:
-/// a tunnel that buffers streams never delivers the event.
-fn instance_stream(ctx: &Ctx) -> Resp {
-    let (tx, body_rx) = tokio::sync::mpsc::channel::<String>(1);
-    let mut cancelled = ctx.cancelled.clone();
-    let first = format!("event: instance\ndata: {}\n\n", ctx.nonce);
-    ctx.workers
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .spawn(async move {
-            if tx.send(first).await.is_err() {
-                return;
-            }
-            tokio::select! {
-                _ = cancelled.changed() => {}
-                _ = tx.closed() => {}
-            }
-        });
-    hyper::Response::builder()
-        .status(200)
-        .header("content-type", "text/event-stream")
-        .header("cache-control", "no-cache")
-        .body(
-            SseBody {
-                rx: body_rx,
-                ended: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            }
-            .boxed(),
-        )
-        .expect("static response")
 }
 
 /// The handoff: subscribe, then the retained state, then live —
@@ -1483,6 +1505,109 @@ mod tests {
             who: transcript::Who::Agent,
             body: transcript::Body::Text { text: id.into() },
         }
+    }
+
+    /// A remote behind a connector that forwards bytes and adds no
+    /// headers — ssh, a plain TCP forward — still issues a `Secure`
+    /// cookie when the request arrived at the configured public
+    /// https host. Trusting only the forwarded proto downgraded
+    /// exactly these (codex on f71e7b9).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_public_https_host_is_secure_without_a_forwarded_header() {
+        // One parse, normalized as the browser normalizes: the host
+        // lowercased, a default port dropped from both the origin
+        // and the authority.
+        let plain = seen_as("https://Clank.Example.com/some/path").unwrap();
+        assert_eq!(plain.origin, "https://clank.example.com");
+        assert_eq!(plain.authority, "clank.example.com");
+        assert!(plain.https);
+        let defaulted = seen_as("https://Clank.Example.COM:443").unwrap();
+        assert_eq!(
+            defaulted, plain,
+            "an explicit default port is the same origin"
+        );
+        let odd = seen_as("https://clank.example.com:8443").unwrap();
+        assert_eq!(odd.origin, "https://clank.example.com:8443");
+        assert_eq!(odd.authority, "clank.example.com:8443");
+        assert!(!seen_as("http://clank.example.com").unwrap().https);
+        assert!(seen_as("not a url").is_none());
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // Spelled with the default port and mixed case, as a config
+        // may carry it; the browser will send neither.
+        let public = "https://Clank.Example.com:443";
+        let door = Arc::new(door::Door::new(None));
+        let (cancel, cancelled) = tokio::sync::watch::channel(false);
+        let site = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let server = tokio::spawn({
+            let (door, feed) = (door.clone(), Feed::new(8));
+            let (repo, site) = (repo.path().to_path_buf(), site.path().to_path_buf());
+            let sayer: Sayer = Arc::new(|_, _| Ok(()));
+            async move {
+                serve(
+                    listener,
+                    feed,
+                    sayer,
+                    "clank-test".to_string(),
+                    repo,
+                    site,
+                    cancelled,
+                    Arc::new(Blocking::default()),
+                    door,
+                    "nonce".to_string(),
+                    Some(public.to_string()),
+                )
+                .await
+            }
+        });
+        let anon = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let token = door.token().unwrap();
+        // The request carries the public Host and NO forwarded proto,
+        // as an ssh-style forward would deliver it.
+        let r = anon
+            .post(format!("http://127.0.0.1:{port}/login"))
+            .header("host", "clank.example.com")
+            // As a browser sends it: lowercased, no default port.
+            .header("origin", "https://clank.example.com")
+            .json(&serde_json::json!({ "token": token }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 204, "the page's own origin is not a stranger");
+        let set = r
+            .headers()
+            .get("set-cookie")
+            .expect("a session")
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            set.contains("; Secure"),
+            "the public https host is secure: {set}"
+        );
+
+        // The same remote reached on loopback is not https, and its
+        // cookie says so — a Secure cookie there would never come back.
+        let r = anon
+            .post(format!("http://127.0.0.1:{port}/login"))
+            .header("origin", format!("http://127.0.0.1:{port}"))
+            .json(&serde_json::json!({ "token": token }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 204);
+        let set = r.headers().get("set-cookie").unwrap().to_str().unwrap();
+        assert!(!set.contains("Secure"), "loopback is plain: {set}");
+
+        let _ = cancel.send(true);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), server).await;
     }
 
     /// The forwarder with a browser that has stopped reading: the
@@ -1718,7 +1843,6 @@ mod tests {
         let old_sha = git(&["rev-parse", "HEAD"]);
         let (cancel, cancelled) = tokio::sync::watch::channel(false);
         let door = Arc::new(door::Door::new(None));
-        let rp = Arc::new(door.relying_party(port, None).unwrap());
         let server = tokio::spawn({
             let feed = feed.clone();
             let (repo, site) = (repo.path().to_path_buf(), site.path().to_path_buf());
@@ -1734,7 +1858,6 @@ mod tests {
                     cancelled,
                     Arc::new(Blocking::default()),
                     door,
-                    rp,
                     "nonce-of-this-start".to_string(),
                     None,
                 )
@@ -1801,24 +1924,66 @@ mod tests {
         assert!(said.lock().unwrap().is_empty(), "nothing was typed");
         let r = anon.get(format!("{base}/login")).send().await.unwrap();
         assert_eq!(r.status(), 200);
-        assert!(
-            r.text()
+        assert!(r.text().await.unwrap().contains("Paste the token"));
+        assert_eq!(
+            anon.get(format!("{base}/register"))
+                .send()
                 .await
                 .unwrap()
-                .contains("Sign in with your passkey")
+                .status(),
+            401,
+            "the registration ceremony is gone"
         );
-        let r = anon.get(format!("{base}/register")).send().await.unwrap();
-        assert_eq!(r.status(), 200);
-        assert!(r.text().await.unwrap().contains("register this device"));
         assert_eq!(
-            anon.post(format!("{base}/login/start"))
+            anon.post(format!("{base}/login"))
                 .body("{}")
                 .send()
                 .await
                 .unwrap()
                 .status(),
             403,
-            "a ceremony post from nowhere"
+            "a paste from nowhere"
+        );
+
+        // The paste box: the wrong token is refused, the right one
+        // opens a session, and the token is the user-level one.
+        let token = door.token().unwrap();
+        let wrong = anon
+            .post(format!("{base}/login"))
+            .header("origin", &base)
+            .json(&serde_json::json!({"token": "not-it"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(wrong.status(), 403);
+        assert!(wrong.headers().get("set-cookie").is_none());
+        let right = anon
+            .post(format!("{base}/login"))
+            .header("origin", &base)
+            .json(&serde_json::json!({"token": token}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(right.status(), 204);
+        let pasted = right
+            .headers()
+            .get("set-cookie")
+            .expect("the paste opens a session")
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            anon.get(format!("{base}/whoami"))
+                .header("cookie", &pasted)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            204,
+            "the pasted session is a session"
         );
 
         // A login link the TUI minted: in, once.
@@ -2043,7 +2208,15 @@ mod tests {
 
         // Revoked from the TUI: the open stream ends, and the cookie
         // admits nothing more.
-        let hash = door.sessions().unwrap()[0].id_hash.clone();
+        // The stream belongs to the LINK session, not the pasted
+        // one: revoke by what opened it, never by position.
+        let hash = door
+            .sessions()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.how == "the TUI's link")
+            .expect("the link's session")
+            .id_hash;
         door.revoke_session(&hash).unwrap();
         let ended = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
@@ -2079,7 +2252,15 @@ mod tests {
             .next()
             .unwrap()
             .to_string();
-        let hash = door.sessions().unwrap()[0].id_hash.clone();
+        // The one just opened by this link: the earlier link session
+        // was revoked above, so it is the only one of its kind.
+        let hash = door
+            .sessions()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.how == "the TUI's link")
+            .expect("the fresh link's session")
+            .id_hash;
         door.backdate(
             &hash,
             time::Duration::days(door::SESSION_DAYS) - time::Duration::seconds(2),
@@ -2128,6 +2309,20 @@ mod tests {
                 .unwrap()
                 .status(),
             429
+        );
+        // The paste box is behind the SAME limiter: past the limit
+        // even the right token is refused, so the box cannot be used
+        // to guess around the link door's budget.
+        assert_eq!(
+            anon.post(format!("{base}/login"))
+                .header("origin", &base)
+                .json(&serde_json::json!({"token": token}))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            429,
+            "the paste box consults the rate limit"
         );
 
         // Cancel ends the accept loop and its connections; the task

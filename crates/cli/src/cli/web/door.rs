@@ -1,10 +1,10 @@
-//! The door: who the remote lets in. A session is a cookie the
-//! browser holds and a hashed record here; it opens from a passkey
-//! ceremony or from a one-time link the TUI minted, and closes when
-//! it is revoked from the TUI, or after [`SESSION_DAYS`]. Nothing
-//! secret is kept: the file holds hashes, the tokens live only until
-//! used or expired, and the passkeys are public keys
-//! (the-tui-mints-the-way-in).
+//! The door: who the remote lets in. The credential is ONE token,
+//! the user's and not a session's, read off the TUI and pasted into
+//! the page; it opens a session, which is a cookie the browser holds
+//! and a hashed record here, closed when it is revoked from the TUI
+//! or after [`SESSION_DAYS`]. A passkey was bound to a hostname and
+//! so demanded a stable domain and the account behind it; a token is
+//! bound to nothing (the-way-in-is-a-token).
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -14,25 +14,20 @@ use std::sync::Mutex;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
-use webauthn_rs::prelude::*;
 
 pub(crate) const SESSION_DAYS: i64 = 30;
 /// A minted link is good for this long, and for one use.
 pub(crate) const LINK_TTL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
-/// A ceremony the browser never finishes is forgotten after this.
-const CEREMONY_TTL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 /// Login attempts one address may make in a minute before it is
 /// refused for the rest of it.
 pub(crate) const ATTEMPTS_PER_MINUTE: u32 = 10;
 pub(crate) const COOKIE: &str = "clank_session";
 const SESSIONS_FILE: &str = ".clank/remote-sessions.json";
 
-/// What the two doors admit: a login link opens a session for the
-/// holder; a registration link admits one passkey registration.
+/// A one-time link the TUI minted: the way in that saves a paste.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Link {
     Login,
-    Register,
 }
 
 /// One open session as the file keeps it: the hash of the cookie,
@@ -40,7 +35,10 @@ pub(crate) enum Link {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct SessionRecord {
     pub(crate) id_hash: String,
-    pub(crate) passkey: String,
+    /// How it was opened — the pasted token, or a minted link. The
+    /// serde alias keeps sessions written before the token readable.
+    #[serde(alias = "passkey")]
+    pub(crate) how: String,
     pub(crate) created: String,
     pub(crate) last_seen: String,
 }
@@ -51,26 +49,18 @@ struct SessionsFile {
     sessions: Vec<SessionRecord>,
 }
 
-/// A registered passkey as `~/.clank/config.json#/remote/passkeys`
-/// keeps it: the credential (id, COSE key, sign count) and how the
-/// operator named it.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StoredPasskey {
-    pub(crate) name: String,
-    pub(crate) added: String,
-    pub(crate) key: Passkey,
-}
-
 /// `~/.clank/config.json#/remote`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RemoteSection {
     /// The tunnel that gives this machine a public URL, when there
-    /// is one: its fixed URL is the relying party's origin, the host
-    /// a `Secure` cookie is for, and where the phone's link points.
+    /// is one: where the phone's link points.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) tunnel: Option<super::tunnel::TunnelSection>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(crate) passkeys: Vec<StoredPasskey>,
+    /// The one credential, minted on first use and kept HERE — at
+    /// user level, so every repo's remote on this machine takes the
+    /// same one and it survives restarts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) token: Option<String>,
 }
 
 /// A session the door admitted: what the routes carry.
@@ -81,43 +71,19 @@ pub(crate) struct Admitted {
     pub(crate) expires: tokio::time::Instant,
 }
 
-/// A passkey as the TUI lists it: the credential id is what a
-/// removal names.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PasskeyRow {
-    pub(crate) id: String,
-    pub(crate) name: String,
-    pub(crate) added: String,
-}
-
-struct Token {
+/// A one-time link the TUI minted.
+struct Minted {
     kind: Link,
     hash: [u8; 32],
     expires: tokio::time::Instant,
 }
 
-enum Ceremony {
-    Register {
-        name: String,
-        state: PasskeyRegistration,
-    },
-    Login {
-        state: PasskeyAuthentication,
-    },
-}
-
-struct Pending {
-    started: tokio::time::Instant,
-    ceremony: Ceremony,
-}
-
 /// What this instance keeps in memory: the links it minted, the
-/// ceremonies in flight, the attempts it has seen, the live set as
-/// last read — and, without a home, the sessions and passkeys.
+/// attempts it has seen, the live set as last read — and, without a
+/// home, the store itself.
 #[derive(Default)]
 struct Inner {
-    tokens: Vec<Token>,
-    ceremonies: HashMap<String, Pending>,
+    minted: Vec<Minted>,
     attempts: HashMap<IpAddr, (tokio::time::Instant, u32)>,
     /// The live session ids as last read, so a change — another
     /// TUI's revocation, an expiry — is noticed and announced.
@@ -129,7 +95,19 @@ struct Inner {
 #[derive(Default)]
 struct Memory {
     sessions: Vec<SessionRecord>,
-    passkeys: Vec<StoredPasskey>,
+    remote: RemoteSection,
+}
+
+/// Both halves of the store, as one locked read gives them.
+struct Store {
+    sessions: Vec<SessionRecord>,
+    remote: RemoteSection,
+}
+
+/// Which halves an edit changed, so only those are written.
+struct Wrote {
+    sessions: bool,
+    remote: bool,
 }
 
 /// The remote's authority is the user's, not one TUI's: every TUI
@@ -143,27 +121,28 @@ pub(crate) struct Door {
     /// Bumped whenever the live set changes: a stream holding a
     /// session watches this and asks whether it is still live.
     revoked: tokio::sync::watch::Sender<u64>,
+    /// How many times the store has been opened. The tests assert on
+    /// it because "one authority transaction" is not observable from
+    /// outcomes alone: a verify-then-open split into two holds gives
+    /// the same answers until a rotation happens to land between
+    /// them, which a test cannot schedule (codex on f71e7b9).
+    #[cfg(test)]
+    transactions: std::sync::atomic::AtomicUsize,
 }
 
-/// What the browser posts to finish a ceremony it started.
+/// What the page posts to the paste box.
 #[derive(Deserialize)]
-pub(crate) struct Finish<C> {
-    pub(crate) id: String,
-    pub(crate) credential: C,
+pub(crate) struct Paste {
+    pub(crate) token: String,
 }
 
-/// Why a ceremony did not finish, in words for the browser.
+/// Why the door did not open, in words for the browser.
 #[derive(Debug)]
 pub(crate) enum Refused {
-    /// The link is spent, expired, or was never minted.
-    Link,
-    /// No ceremony by that id: expired, finished, or invented.
-    Ceremony,
-    /// The authenticator's answer did not verify, or is a credential
-    /// this door never registered.
-    Credential(String),
-    /// Nothing to authenticate against.
-    NoPasskeys,
+    /// The token is not this machine's. A SPENT LINK is not here: it
+    /// redirects to the page saying so, which is where someone who
+    /// followed a stale link can paste the token instead.
+    Token,
     /// The store could not be read or written; nothing was changed.
     Store(String),
 }
@@ -171,15 +150,9 @@ pub(crate) enum Refused {
 impl std::fmt::Display for Refused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Refused::Link => write!(
+            Refused::Token => write!(
                 f,
-                "this link is spent or expired — mint another from the TUI"
-            ),
-            Refused::Ceremony => write!(f, "no such ceremony — start again"),
-            Refused::Credential(why) => write!(f, "the credential did not verify: {why}"),
-            Refused::NoPasskeys => write!(
-                f,
-                "no passkey is registered — mint a registration link from the TUI"
+                "that is not this machine's token — read it off the remote page in the TUI"
             ),
             Refused::Store(why) => write!(f, "the store refused: {why}"),
         }
@@ -187,7 +160,7 @@ impl std::fmt::Display for Refused {
 }
 
 impl Door {
-    /// The door for this user: passkeys in `~/.clank/config.json`,
+    /// The door for this user: the token in `~/.clank/config.json`,
     /// open sessions in `~/.clank/remote-sessions.json`, read on
     /// every use. Without a home nothing persists — a session lasts
     /// as long as the process.
@@ -196,38 +169,11 @@ impl Door {
             home,
             inner: Mutex::new(Inner::default()),
             revoked: tokio::sync::watch::channel(0).0,
+            #[cfg(test)]
+            transactions: std::sync::atomic::AtomicUsize::new(0),
         };
         door.refresh();
         door
-    }
-
-    /// The relying party for a remote on `port`: the tunnel's URL
-    /// when a start has one, else `localhost` — which is why the
-    /// remote's own URL says `localhost` and not `127.0.0.1`: the
-    /// browser's origin must be the RP's (codex on 375f30c). The
-    /// public URL is the start's, resolved once and handed here, so
-    /// the relying party, the cookie and the links are one
-    /// configuration for the life of the instance (codex on 6f60efa).
-    pub(crate) fn relying_party(
-        &self,
-        port: u16,
-        public: Option<&Url>,
-    ) -> anyhow::Result<Webauthn> {
-        let local = Url::parse(&format!("http://localhost:{port}"))?;
-        let (rp_id, origin) = match public {
-            Some(url) => (
-                url.host_str()
-                    .ok_or_else(|| anyhow::anyhow!("the tunnel's URL `{url}` has no host"))?
-                    .to_string(),
-                url.clone(),
-            ),
-            None => ("localhost".to_string(), local.clone()),
-        };
-        let mut builder = WebauthnBuilder::new(&rp_id, &origin)?.rp_name("clank");
-        if public.is_some() {
-            builder = builder.append_allowed_origin(&local);
-        }
-        Ok(builder.build()?)
     }
 
     pub(crate) fn watch_revocations(&self) -> tokio::sync::watch::Receiver<u64> {
@@ -244,13 +190,67 @@ impl Door {
         &self,
         edit: impl FnOnce(&mut Vec<SessionRecord>) -> (R, bool),
     ) -> anyhow::Result<R> {
+        self.with_store(|store| {
+            let (r, changed) = edit(&mut store.sessions);
+            (
+                r,
+                Wrote {
+                    sessions: changed,
+                    remote: false,
+                },
+            )
+        })
+    }
+
+    /// The `remote` section, the same way, in the user config.
+    fn with_remote<R>(
+        &self,
+        edit: impl FnOnce(&mut RemoteSection) -> (R, bool),
+    ) -> anyhow::Result<R> {
+        self.with_store(|store| {
+            let (r, changed) = edit(&mut store.remote);
+            (
+                r,
+                Wrote {
+                    sessions: false,
+                    remote: changed,
+                },
+            )
+        })
+    }
+
+    /// BOTH halves of the store — the credential and the sessions it
+    /// opened — read, edited and written under ONE hold of the
+    /// user-level lock. They are two files but one authority: a
+    /// verify-then-open across two holds let another TUI's rotation
+    /// land between them and hand out a live session for a credential
+    /// that no longer exists (codex on f71e7b9).
+    ///
+    /// The sessions are written FIRST. The two files cannot be made
+    /// atomic, so the order decides which way a half-written change
+    /// fails: sessions-then-credential leaves the old credential
+    /// valid over emptied sessions, which refuses too much. The
+    /// reverse would leave a rotated credential over sessions the old
+    /// one opened, which admits too much.
+    fn with_store<R>(&self, edit: impl FnOnce(&mut Store) -> (R, Wrote)) -> anyhow::Result<R> {
+        #[cfg(test)]
+        self.transactions
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let Some(home) = &self.home else {
             let mut inner = self.lock();
-            return Ok(edit(&mut inner.memory.sessions).0);
+            let Memory { sessions, remote } = &mut inner.memory;
+            let mut store = Store {
+                sessions: std::mem::take(sessions),
+                remote: remote.clone(),
+            };
+            let (r, _) = edit(&mut store);
+            *sessions = store.sessions;
+            *remote = store.remote;
+            return Ok(r);
         };
         let _lock = store_lock(home)?;
         let path = sessions_path(home);
-        let mut sessions = match std::fs::read_to_string(&path) {
+        let sessions = match std::fs::read_to_string(&path) {
             Ok(s) => {
                 serde_json::from_str::<SessionsFile>(&s)
                     .map_err(|e| anyhow::anyhow!("parsing `{}`: {e}", path.display()))?
@@ -259,30 +259,125 @@ impl Door {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(e) => anyhow::bail!("reading `{}`: {e}", path.display()),
         };
-        let (r, changed) = edit(&mut sessions);
-        if changed {
-            crate::agent_store::write_typed_config(&path, &SessionsFile { sessions })?;
+        let mut cfg = crate::cli::team::read_user_config(home)?;
+        let mut store = Store {
+            sessions,
+            remote: cfg.remote.clone().unwrap_or_default(),
+        };
+        let (r, wrote) = edit(&mut store);
+        if wrote.sessions {
+            crate::agent_store::write_typed_config(
+                &path,
+                &SessionsFile {
+                    sessions: store.sessions,
+                },
+            )?;
+        }
+        if wrote.remote {
+            cfg.remote = Some(store.remote);
+            crate::cli::team::write_user_config(home, &cfg)?;
         }
         Ok(r)
     }
 
-    /// The passkeys, the same way, in the user config.
-    fn with_passkeys<R>(
-        &self,
-        edit: impl FnOnce(&mut Vec<StoredPasskey>) -> (R, bool),
-    ) -> anyhow::Result<R> {
-        let Some(home) = &self.home else {
-            let mut inner = self.lock();
-            return Ok(edit(&mut inner.memory.passkeys).0);
+    // ---- the token ----
+
+    /// This machine's token, minted on first use and kept at user
+    /// level from then on. Read under the same lock as everything
+    /// else, so two TUIs minting at once settle on one token rather
+    /// than overwriting each other.
+    pub(crate) fn token(&self) -> anyhow::Result<String> {
+        self.with_remote(|remote| match &remote.token {
+            Some(t) if !t.is_empty() => (t.clone(), false),
+            _ => {
+                let minted = random_token();
+                remote.token = Some(minted.clone());
+                (minted, true)
+            }
+        })
+    }
+
+    /// Mint a new token and end every session the old one opened,
+    /// as ONE transition: rotation is the revocation of the
+    /// credential itself, so a reader must never see the new token
+    /// beside the old one's sessions.
+    pub(crate) fn rotate_token(&self) -> anyhow::Result<String> {
+        let minted = random_token();
+        let fresh = minted.clone();
+        self.with_store(move |store| {
+            store.sessions.clear();
+            store.remote.token = Some(fresh);
+            (
+                (),
+                Wrote {
+                    sessions: true,
+                    remote: true,
+                },
+            )
+        })?;
+        self.refresh();
+        Ok(minted)
+    }
+
+    /// Verify `presented` and open a session for it in ONE hold of
+    /// the lock, so a rotation cannot land between the two and leave
+    /// the old credential holding a live session (codex on f71e7b9).
+    /// `None` is a token that is not this machine's.
+    pub(crate) fn open_session_for_token(&self, presented: &str) -> anyhow::Result<Option<String>> {
+        let cookie = random_token();
+        let now = rfc3339(now_utc());
+        let record = SessionRecord {
+            id_hash: hex(&hash_token(&cookie)),
+            how: "token".to_string(),
+            created: now.clone(),
+            last_seen: now,
         };
-        let _lock = store_lock(home)?;
-        let mut cfg = crate::cli::team::read_user_config(home)?;
-        let remote = cfg.remote.get_or_insert_with(Default::default);
-        let (r, changed) = edit(&mut remote.passkeys);
-        if changed {
-            crate::cli::team::write_user_config(home, &cfg)?;
+        let opened = self.with_store(move |store| {
+            let ours = match store.remote.token.clone() {
+                Some(t) if !t.is_empty() => t,
+                // Nothing minted yet: mint here rather than admit,
+                // so a first paste cannot race the first mint.
+                _ => {
+                    let minted = random_token();
+                    store.remote.token = Some(minted.clone());
+                    minted
+                }
+            };
+            let minted_now = store.remote.token.as_deref() != Some(ours.as_str());
+            if !admits(&ours, presented) {
+                return (
+                    None,
+                    Wrote {
+                        sessions: false,
+                        remote: !minted_now,
+                    },
+                );
+            }
+            store.sessions.push(record);
+            (
+                Some(cookie),
+                Wrote {
+                    sessions: true,
+                    remote: true,
+                },
+            )
+        })?;
+        if opened.is_some() {
+            self.refresh();
         }
-        Ok(r)
+        Ok(opened)
+    }
+
+    /// Whether `presented` is this machine's token, as a question
+    /// on its own. TEST-ONLY on purpose: answering it without also
+    /// opening the session leaves a gap a rotation can land in, so
+    /// production has no way to ask it separately — the only
+    /// admission is [`Door::open_session_for_token`], which does
+    /// both under one lock (codex on f71e7b9).
+    #[cfg(test)]
+    pub(crate) fn admits_token(&self, presented: &str) -> anyhow::Result<bool> {
+        let ours = self.token()?;
+        Ok(admits(&ours, presented))
     }
 
     /// Read the live set again and, if it is not what it was, tell
@@ -357,14 +452,15 @@ impl Door {
         admitted
     }
 
-    /// Open a session for the holder of `passkey`; the cookie value,
-    /// handed out once. Not opened at all if it cannot be written.
-    pub(crate) fn open_session(&self, passkey: &str) -> anyhow::Result<String> {
+    /// Open a session, `how` saying what opened it; the cookie
+    /// value, handed out once. Not opened at all if it cannot be
+    /// written.
+    pub(crate) fn open_session(&self, how: &str) -> anyhow::Result<String> {
         let token = random_token();
         let now = rfc3339(now_utc());
         let record = SessionRecord {
             id_hash: hex(&hash_token(&token)),
-            passkey: passkey.to_string(),
+            how: how.to_string(),
             created: now.clone(),
             last_seen: now,
         };
@@ -410,8 +506,8 @@ impl Door {
         let token = random_token();
         let mut inner = self.lock();
         let now = tokio::time::Instant::now();
-        inner.tokens.retain(|t| t.expires > now);
-        inner.tokens.push(Token {
+        inner.minted.retain(|t| t.expires > now);
+        inner.minted.push(Minted {
             kind,
             hash: hash_token(&token),
             expires: now + LINK_TTL,
@@ -425,14 +521,14 @@ impl Door {
         let hash = hash_token(token);
         let mut inner = self.lock();
         let now = tokio::time::Instant::now();
-        inner.tokens.retain(|t| t.expires > now);
+        inner.minted.retain(|t| t.expires > now);
         let at = inner
-            .tokens
+            .minted
             .iter()
             .position(|t| t.kind == kind && bool::from(t.hash.ct_eq(&hash)));
         match at {
             Some(i) => {
-                inner.tokens.remove(i);
+                inner.minted.remove(i);
                 true
             }
             None => false,
@@ -452,191 +548,14 @@ impl Door {
         *count <= ATTEMPTS_PER_MINUTE
     }
 
-    // ---- passkeys ----
-
-    pub(crate) fn passkeys(&self) -> anyhow::Result<Vec<PasskeyRow>> {
-        self.with_passkeys(|passkeys| {
-            (
-                passkeys
-                    .iter()
-                    .map(|p| PasskeyRow {
-                        id: cred_id_str(&p.key),
-                        name: p.name.clone(),
-                        added: p.added.clone(),
-                    })
-                    .collect(),
-                false,
-            )
-        })
-    }
-
-    /// Forget the passkey with credential id `id`; one another TUI
-    /// already removed is nothing, never its neighbour. The sessions
-    /// it opened stay open until they are revoked or expire. An
-    /// error means it is still there.
-    pub(crate) fn remove_passkey(&self, id: &str) -> anyhow::Result<()> {
-        self.with_passkeys(|passkeys| {
-            let before = passkeys.len();
-            passkeys.retain(|p| cred_id_str(&p.key) != id);
-            ((), passkeys.len() != before)
-        })
-    }
-
-    // ---- ceremonies ----
-
-    /// Begin registering a passkey named `name` for the holder of a
-    /// registration link, which is spent here: the link admits one
-    /// attempt. The id names the ceremony to `finish_registration`.
-    pub(crate) fn start_registration(
-        &self,
-        rp: &Webauthn,
-        token: &str,
-        name: &str,
-    ) -> Result<(String, CreationChallengeResponse), Refused> {
-        if !self.consume(Link::Register, token) {
-            return Err(Refused::Link);
-        }
-        let exclude: Vec<CredentialID> = self
-            .with_passkeys(|passkeys| {
-                (
-                    passkeys.iter().map(|p| p.key.cred_id().clone()).collect(),
-                    false,
-                )
-            })
-            .map_err(|e| Refused::Store(format!("{e:#}")))?;
-        let mut user = [0u8; 16];
-        fill_random(&mut user);
-        let (challenge, state) = rp
-            .start_passkey_registration(Uuid::from_bytes(user), name, name, Some(exclude))
-            .map_err(|e| Refused::Credential(e.to_string()))?;
-        let id = self.remember(Ceremony::Register {
-            name: name.to_string(),
-            state,
-        });
-        Ok((id, challenge))
-    }
-
-    /// Verify the browser's answer, keep the passkey, and open a
-    /// session for it: the cookie value. The passkey is written
-    /// before anything is admitted; if it cannot be, nothing is.
-    pub(crate) fn finish_registration(
-        &self,
-        rp: &Webauthn,
-        id: &str,
-        credential: &RegisterPublicKeyCredential,
-    ) -> Result<String, Refused> {
-        let (name, state) = match self.take(id)? {
-            Ceremony::Register { name, state } => (name, state),
-            Ceremony::Login { .. } => return Err(Refused::Ceremony),
-        };
-        let key = rp
-            .finish_passkey_registration(credential, &state)
-            .map_err(|e| Refused::Credential(e.to_string()))?;
-        let added = rfc3339(now_utc());
-        let stored = self
-            .with_passkeys(|passkeys| {
-                if passkeys.iter().any(|p| p.key.cred_id() == key.cred_id()) {
-                    return (false, false);
-                }
-                passkeys.push(StoredPasskey {
-                    name: name.clone(),
-                    added,
-                    key,
-                });
-                (true, true)
-            })
-            .map_err(|e| Refused::Store(format!("{e:#}")))?;
-        if !stored {
-            return Err(Refused::Credential("already registered".into()));
-        }
-        self.open_session(&name)
-            .map_err(|e| Refused::Store(format!("{e:#}")))
-    }
-
-    /// Begin a login against every registered passkey.
-    pub(crate) fn start_login(
-        &self,
-        rp: &Webauthn,
-    ) -> Result<(String, RequestChallengeResponse), Refused> {
-        let keys: Vec<Passkey> = self
-            .with_passkeys(|passkeys| (passkeys.iter().map(|p| p.key.clone()).collect(), false))
-            .map_err(|e| Refused::Store(format!("{e:#}")))?;
-        if keys.is_empty() {
-            return Err(Refused::NoPasskeys);
-        }
-        let (challenge, state) = rp
-            .start_passkey_authentication(&keys)
-            .map_err(|e| Refused::Credential(e.to_string()))?;
-        let id = self.remember(Ceremony::Login { state });
-        Ok((id, challenge))
-    }
-
-    /// Verify the assertion, note the sign count, and open a session
-    /// for the passkey that signed: the cookie value.
-    pub(crate) fn finish_login(
-        &self,
-        rp: &Webauthn,
-        id: &str,
-        credential: &PublicKeyCredential,
-    ) -> Result<String, Refused> {
-        let state = match self.take(id)? {
-            Ceremony::Login { state } => state,
-            Ceremony::Register { .. } => return Err(Refused::Ceremony),
-        };
-        let result = rp
-            .finish_passkey_authentication(credential, &state)
-            .map_err(|e| Refused::Credential(e.to_string()))?;
-        let name = self
-            .with_passkeys(|passkeys| {
-                let Some(p) = passkeys
-                    .iter_mut()
-                    .find(|p| p.key.cred_id() == result.cred_id())
-                else {
-                    return (None, false);
-                };
-                let counted = p.key.update_credential(&result).is_some();
-                (Some(p.name.clone()), counted)
-            })
-            .map_err(|e| Refused::Store(format!("{e:#}")))?;
-        let Some(name) = name else {
-            return Err(Refused::Credential("not a passkey of this door".into()));
-        };
-        self.open_session(&name)
-            .map_err(|e| Refused::Store(format!("{e:#}")))
-    }
-
-    fn remember(&self, ceremony: Ceremony) -> String {
-        let id = random_token();
-        let mut inner = self.lock();
-        let now = tokio::time::Instant::now();
-        inner
-            .ceremonies
-            .retain(|_, p| now - p.started < CEREMONY_TTL);
-        inner.ceremonies.insert(
-            id.clone(),
-            Pending {
-                started: now,
-                ceremony,
-            },
-        );
-        id
-    }
-
-    fn take(&self, id: &str) -> Result<Ceremony, Refused> {
-        let mut inner = self.lock();
-        let now = tokio::time::Instant::now();
-        inner
-            .ceremonies
-            .retain(|_, p| now - p.started < CEREMONY_TTL);
-        inner
-            .ceremonies
-            .remove(id)
-            .map(|p| p.ceremony)
-            .ok_or(Refused::Ceremony)
-    }
-
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// How many times the store has been opened so far.
+    #[cfg(test)]
+    pub(crate) fn transactions(&self) -> usize {
+        self.transactions.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Move a session's creation back, so its expiry is soon: for the
@@ -654,8 +573,9 @@ impl Door {
     }
 }
 
-fn cred_id_str(key: &Passkey) -> String {
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key.cred_id().as_ref())
+/// Whole, and in constant time.
+fn admits(ours: &str, presented: &str) -> bool {
+    bool::from(hash_token(ours).ct_eq(&hash_token(presented)))
 }
 
 /// Drop the sessions past their term; whether any were.
@@ -677,8 +597,8 @@ fn deadline(record: &SessionRecord, now: time::OffsetDateTime) -> tokio::time::I
 }
 
 /// The one lock every TUI of this user takes around a read-edit-write
-/// of the sessions file or the passkeys. BLOCKING: the sections are
-/// one small file each.
+/// of the sessions file or the `remote` section. BLOCKING: the
+/// sections are one small file each.
 fn store_lock(home: &Path) -> anyhow::Result<std::fs::File> {
     use std::os::fd::AsRawFd;
     let dir = home.join(".clank");
@@ -777,25 +697,127 @@ pub(crate) fn sessions_path(home: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use webauthn_authenticator_rs::WebauthnAuthenticator;
-    use webauthn_authenticator_rs::softpasskey::SoftPasskey;
 
     fn cookie(token: &str) -> String {
         format!("other=1; {COOKIE}={token}")
     }
 
-    /// A link is for one door, one use, five minutes.
+    /// A link is for one use, five minutes.
     #[tokio::test(start_paused = true)]
     async fn a_link_admits_once_and_not_after_five_minutes() {
         let door = Door::new(None);
         let t = door.mint(Link::Login);
-        assert!(!door.consume(Link::Register, &t), "the other door");
         assert!(door.consume(Link::Login, &t));
         assert!(!door.consume(Link::Login, &t), "spent");
-        let late = door.mint(Link::Register);
+        let late = door.mint(Link::Login);
         tokio::time::advance(LINK_TTL + std::time::Duration::from_secs(1)).await;
-        assert!(!door.consume(Link::Register, &late), "expired");
+        assert!(!door.consume(Link::Login, &late), "expired");
         assert!(!door.consume(Link::Login, "not-a-token"));
+    }
+
+    /// The token is minted once, kept at user level, and read back
+    /// by any door on the same home — another repo's remote, or a
+    /// fresh process. Only the whole token admits.
+    #[tokio::test]
+    async fn the_token_is_the_users_and_outlives_the_process() {
+        let home = tempfile::tempdir().unwrap();
+        let door = Door::new(Some(home.path().to_path_buf()));
+        let token = door.token().unwrap();
+        assert!(token.len() >= 32, "a guessable token is no token");
+        assert_eq!(door.token().unwrap(), token, "minted once, not per call");
+
+        // Another repo's remote on this machine, and a fresh
+        // process, take the same one: it lives in the user config.
+        let elsewhere = Door::new(Some(home.path().to_path_buf()));
+        assert_eq!(elsewhere.token().unwrap(), token);
+        let cfg = crate::cli::team::read_user_config(home.path()).unwrap();
+        assert_eq!(cfg.remote.unwrap().token.as_deref(), Some(token.as_str()));
+
+        assert!(door.admits_token(&token).unwrap());
+        assert!(!door.admits_token("").unwrap());
+        assert!(!door.admits_token(&token[..token.len() - 1]).unwrap());
+        assert!(
+            !door.admits_token(&format!("{token}x")).unwrap(),
+            "a prefix of the token is not the token"
+        );
+    }
+
+    /// Rotating mints a new token, refuses the old one, and ends
+    /// every session the old one opened — the credential's own
+    /// revocation.
+    #[tokio::test]
+    async fn rotating_the_token_ends_the_sessions_it_opened() {
+        let home = tempfile::tempdir().unwrap();
+        let door = Door::new(Some(home.path().to_path_buf()));
+        let token = door.token().unwrap();
+        let cookie_a = door.open_session("token").unwrap();
+        let cookie_b = door.open_session("token").unwrap();
+        assert!(door.admit(Some(&cookie(&cookie_a))).is_some());
+        assert_eq!(door.sessions().unwrap().len(), 2);
+        let watch = door.watch_revocations();
+
+        let fresh = door.rotate_token().unwrap();
+        assert_ne!(fresh, token);
+        assert!(
+            !door.admits_token(&token).unwrap(),
+            "the old one is refused"
+        );
+        assert!(door.admits_token(&fresh).unwrap());
+        assert!(door.sessions().unwrap().is_empty(), "its sessions are gone");
+        assert!(door.admit(Some(&cookie(&cookie_a))).is_none());
+        assert!(door.admit(Some(&cookie(&cookie_b))).is_none());
+        assert!(watch.has_changed().unwrap(), "open streams are told");
+        assert_eq!(
+            Door::new(Some(home.path().to_path_buf())).token().unwrap(),
+            fresh,
+            "the rotation is persisted"
+        );
+    }
+
+    /// A login that verified against the old token must not land a
+    /// session after another TUI has rotated. Verification and the
+    /// session are ONE hold of the lock, so the interleaving that
+    /// used to hand out a live session for a dead credential cannot
+    /// be constructed: whichever order the two doors run in, a
+    /// rotation leaves NO session behind (codex on f71e7b9).
+    #[tokio::test]
+    async fn a_login_cannot_straddle_a_rotation() {
+        let home = tempfile::tempdir().unwrap();
+        let a = Door::new(Some(home.path().to_path_buf()));
+        let b = Door::new(Some(home.path().to_path_buf()));
+        let old = a.token().unwrap();
+
+        // Verification and the session are ONE hold of the store.
+        // This is the assertion a split cannot satisfy: with two
+        // holds there is a gap, and a rotation landing in it hands
+        // out a session for a credential that no longer exists.
+        let before = a.transactions();
+        let opened = a.open_session_for_token(&old).unwrap().expect("admitted");
+        assert_eq!(
+            a.transactions() - before,
+            2,
+            "one transaction verifies AND opens together, one refreshes \
+             the live set for the streams; a split verify/open is three"
+        );
+        assert!(a.admit(Some(&cookie(&opened))).is_some());
+        b.rotate_token().unwrap();
+        assert!(
+            a.admit(Some(&cookie(&opened))).is_none(),
+            "the rotation ended it"
+        );
+        assert!(a.sessions().unwrap().is_empty());
+
+        // The rotation lands first: the old token opens nothing at
+        // all, so there is no session to be left behind.
+        let older = b.token().unwrap();
+        b.rotate_token().unwrap();
+        assert!(
+            a.open_session_for_token(&older).unwrap().is_none(),
+            "a spent credential opens nothing"
+        );
+        assert!(a.sessions().unwrap().is_empty(), "and leaves nothing");
+        let now = b.token().unwrap();
+        assert!(a.open_session_for_token(&now).unwrap().is_some());
     }
 
     /// The file keeps the hash and never the cookie; a revoked
@@ -806,13 +828,13 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let door = Door::new(Some(home.path().to_path_buf()));
         assert!(door.admit(Some("clank_session=nothing")).is_none());
-        let token = door.open_session("phone").unwrap();
+        let token = door.open_session("token").unwrap();
         let file = std::fs::read_to_string(sessions_path(home.path())).unwrap();
         assert!(!file.contains(&token), "the cookie is not on disk");
         let admitted = door.admit(Some(&cookie(&token))).expect("admitted");
         assert!(file.contains(&admitted.id_hash));
         assert_eq!(door.sessions().unwrap().len(), 1);
-        assert_eq!(door.sessions().unwrap()[0].passkey, "phone");
+        assert_eq!(door.sessions().unwrap()[0].how, "token");
         assert!(door.is_live(&admitted.id_hash));
 
         let watch = door.watch_revocations();
@@ -825,12 +847,12 @@ mod tests {
         // A reopened door reads the file: a session from another
         // process is admitted, an old one is not.
         let fresh = Door::new(Some(home.path().to_path_buf()));
-        let token = fresh.open_session("phone").unwrap();
+        let token = fresh.open_session("token").unwrap();
         let old = time::OffsetDateTime::now_utc() - time::Duration::days(SESSION_DAYS + 1);
         let mut records = fresh.sessions().unwrap();
         records.push(SessionRecord {
             id_hash: "00".repeat(32),
-            passkey: "stale".into(),
+            how: "stale".into(),
             created: rfc3339(old),
             last_seen: rfc3339(old),
         });
@@ -848,6 +870,18 @@ mod tests {
         );
     }
 
+    /// A session written before the token — its field named
+    /// `passkey` — is still readable rather than locking the user out
+    /// of every open session on upgrade.
+    #[test]
+    fn a_session_written_before_the_token_still_reads() {
+        let file: SessionsFile = serde_json::from_str(
+            r#"{"sessions":[{"id_hash":"ab","passkey":"phone","created":"c","last_seen":"s"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(file.sessions[0].how, "phone");
+    }
+
     /// Two TUIs, one user: a session opened by one is admitted by
     /// the other; revoked by the other, it is refused by the first
     /// at once and its watch is bumped by the next refresh; and the
@@ -858,7 +892,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let a = Door::new(Some(home.path().to_path_buf()));
         let b = Door::new(Some(home.path().to_path_buf()));
-        let token = a.open_session("phone").unwrap();
+        let token = a.open_session("token").unwrap();
         let admitted = b
             .admit(Some(&cookie(&token)))
             .expect("b admits a's session");
@@ -874,7 +908,7 @@ mod tests {
             "a's own read tells its streams"
         );
         watch.mark_unchanged();
-        let other = a.open_session("laptop").unwrap();
+        let other = a.open_session("token").unwrap();
         let file = std::fs::read_to_string(sessions_path(home.path())).unwrap();
         assert!(
             !file.contains(&admitted.id_hash),
@@ -893,10 +927,12 @@ mod tests {
         let path = sessions_path(home.path());
         std::fs::remove_file(&path).unwrap();
         std::fs::create_dir(&path).unwrap();
-        let hash = b.admit(Some(&cookie(&other))).map(|s| s.id_hash);
-        assert!(hash.is_none(), "an unreadable store admits nobody");
+        assert!(
+            b.admit(Some(&cookie(&other))).is_none(),
+            "an unreadable store admits nobody"
+        );
         assert!(a.revoke_session("anything").is_err());
-        assert!(a.open_session("x").is_err());
+        assert!(a.open_session("token").is_err());
         assert!(a.sessions().is_err());
     }
 
@@ -916,128 +952,8 @@ mod tests {
         assert!(door.attempt_allowed(a));
     }
 
-    /// A passkey registers from a link, is kept in the user config,
-    /// and logs in; a credential registered to another relying party
-    /// does not.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_passkey_registers_from_a_link_and_logs_in() {
-        let home = tempfile::tempdir().unwrap();
-        let door = Door::new(Some(home.path().to_path_buf()));
-        let rp = door.relying_party(4321, None).unwrap();
-        let origin = Url::parse("http://localhost:4321").unwrap();
-        let mut phone = WebauthnAuthenticator::new(SoftPasskey::new(true));
-
-        let link = door.mint(Link::Register);
-        assert!(matches!(
-            door.start_registration(&rp, "bogus", "phone"),
-            Err(Refused::Link)
-        ));
-        let (id, options) = door.start_registration(&rp, &link, "phone").unwrap();
-        assert!(
-            matches!(
-                door.start_registration(&rp, &link, "again"),
-                Err(Refused::Link)
-            ),
-            "the link admits one registration"
-        );
-        let credential = phone.do_registration(origin.clone(), options).unwrap();
-        assert!(matches!(
-            door.finish_registration(&rp, "no-such-ceremony", &credential),
-            Err(Refused::Ceremony)
-        ));
-        let session = door.finish_registration(&rp, &id, &credential).unwrap();
-        assert!(door.admit(Some(&cookie(&session))).is_some());
-        assert_eq!(door.passkeys().unwrap()[0].name, "phone");
-        let cfg = crate::cli::team::read_user_config(home.path()).unwrap();
-        assert_eq!(
-            cfg.remote.unwrap().passkeys.len(),
-            1,
-            "kept in the user config"
-        );
-
-        let (id, options) = door.start_login(&rp).unwrap();
-        let assertion = phone.do_authentication(origin.clone(), options).unwrap();
-        let session = door.finish_login(&rp, &id, &assertion).unwrap();
-        let admitted = door.admit(Some(&cookie(&session))).unwrap();
-        assert_eq!(
-            door.sessions()
-                .unwrap()
-                .iter()
-                .find(|s| s.id_hash == admitted.id_hash)
-                .unwrap()
-                .passkey,
-            "phone"
-        );
-        assert!(
-            matches!(
-                door.finish_login(&rp, &id, &assertion),
-                Err(Refused::Ceremony)
-            ),
-            "a ceremony finishes once"
-        );
-
-        // A key registered to example.com, imported as if it were
-        // ours: its assertion names the wrong relying party.
-        let elsewhere =
-            WebauthnBuilder::new("example.com", &Url::parse("https://example.com").unwrap())
-                .unwrap()
-                .build()
-                .unwrap();
-        let other_door = Door::new(None);
-        let mut other = WebauthnAuthenticator::new(SoftPasskey::new(true));
-        let link = other_door.mint(Link::Register);
-        let (id, options) = other_door
-            .start_registration(&elsewhere, &link, "theirs")
-            .unwrap();
-        let cred = other
-            .do_registration(Url::parse("https://example.com").unwrap(), options)
-            .unwrap();
-        other_door
-            .finish_registration(&elsewhere, &id, &cred)
-            .unwrap();
-        let theirs = other_door.lock().memory.passkeys[0].clone();
-        {
-            let mut cfg = crate::cli::team::read_user_config(home.path()).unwrap();
-            cfg.remote.as_mut().unwrap().passkeys.push(theirs);
-            crate::cli::team::write_user_config(home.path(), &cfg).unwrap();
-        }
-        let door = Door::new(Some(home.path().to_path_buf()));
-        assert_eq!(door.passkeys().unwrap().len(), 2);
-        let (id, _ours) = door.start_login(&rp).unwrap();
-        let (_, their_options) = other_door.start_login(&elsewhere).unwrap();
-        let forged = other
-            .do_authentication(Url::parse("https://example.com").unwrap(), their_options)
-            .unwrap();
-        assert!(
-            matches!(
-                door.finish_login(&rp, &id, &forged),
-                Err(Refused::Credential(_))
-            ),
-            "another relying party's assertion is refused"
-        );
-        // Two TUIs looking at [phone, theirs]: one removes `phone`;
-        // the other, still showing both, removes `phone` too — by
-        // its id, so nothing happens, and `theirs` is not taken in
-        // its place (codex on f657b4d).
-        let shown = door.passkeys().unwrap();
-        let sibling = Door::new(Some(home.path().to_path_buf()));
-        sibling.remove_passkey(&shown[0].id).unwrap();
-        door.remove_passkey(&shown[0].id).unwrap();
-        let left = door.passkeys().unwrap();
-        assert_eq!(left.len(), 1);
-        assert_eq!(left[0].id, shown[1].id, "the neighbour is untouched");
-        let cfg = crate::cli::team::read_user_config(home.path()).unwrap();
-        assert_eq!(cfg.remote.unwrap().passkeys.len(), 1);
-        door.remove_passkey(&shown[1].id).unwrap();
-        assert!(door.passkeys().unwrap().is_empty());
-        assert!(matches!(door.start_login(&rp), Err(Refused::NoPasskeys)));
-
-        let none = Door::new(None);
-        assert!(matches!(none.start_login(&rp), Err(Refused::NoPasskeys)));
-    }
-
     #[test]
-    fn the_cookie_is_read_out_of_the_header_and_set_for_the_tunnel_only() {
+    fn the_cookie_is_read_out_of_the_header_and_set_when_secure() {
         assert_eq!(
             cookie_value("a=1; clank_session=tok ; b=2", COOKIE).as_deref(),
             Some("tok")

@@ -6,52 +6,59 @@
 <title>clank · sign in</title>
 <style>
   body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: #1a1917; color: #e8e4dc; font: 16px/1.5 ui-monospace, "SF Mono", Menlo, monospace; }
-  main { width: min(28rem, calc(100vw - 2rem)); padding: 1.5rem; background: #242220; border-radius: 6px; }
-  h1 { margin: 0 0 1rem; font-size: 1.1rem; font-weight: 700; }
+  main { width: min(30rem, calc(100vw - 2rem)); padding: 1.5rem; background: #242220; border-radius: 6px; }
+  h1 { margin: 0 0 .25rem; font-size: 1.1rem; font-weight: 700; }
+  p.lede { margin: 0 0 1.25rem; color: #8a857c; }
+  label { display: block; color: #8a857c; }
+  input { display: block; width: 100%; box-sizing: border-box; margin: .35rem 0 1rem; padding: .7rem; border: 1px solid #3a3835; border-radius: 4px; background: #1a1917; color: inherit; font: inherit; letter-spacing: .04em; }
+  input:focus { outline: 2px solid #e0a458; outline-offset: 1px; }
   button { width: 100%; padding: .75rem; border: 0; border-radius: 4px; background: #e0a458; color: #1a1917; font: inherit; font-weight: 700; cursor: pointer; }
   button:disabled { opacity: .5; cursor: default; }
-  p { margin: 1rem 0 0; color: #8a857c; }
-  p.bad { color: #e07070; }
+  p.say { margin: 1rem 0 0; color: #8a857c; }
+  p.say.bad { color: #e07070; }
 </style>
 </head>
 <body>
 <main>
   <h1>clank</h1>
-  <button id="go">Sign in with your passkey</button>
-  <p id="say"></p>
+  <p class="lede">Paste the token from the remote page in your clank TUI.</p>
+  <form id="f">
+    <label for="token">Token</label>
+    <input id="token" name="token" type="password" autocomplete="off" autocapitalize="off"
+           autocorrect="off" spellcheck="false" required>
+    <button id="go" type="submit">Sign in</button>
+  </form>
+  <p class="say" id="say"></p>
 </main>
 <script>
 (() => {
   const say = document.getElementById('say'), go = document.getElementById('go');
-  const dec = s => Uint8Array.from(atob(s.replace(/-/g, '+').replace(/_/g, '/')), c => c.charCodeAt(0));
-  const enc = b => btoa(String.fromCharCode(...new Uint8Array(b))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-  const post = async (path, body) => {
-    const r = await fetch(path, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
-    if (!r.ok) throw new Error(await r.text());
-    return r.status === 204 ? null : r.json();
-  };
+  const form = document.getElementById('f'), token = document.getElementById('token');
   if (new URLSearchParams(location.search).get('why') === 'link') {
-    say.textContent = 'That link is spent or expired. Mint another from the TUI, or sign in with your passkey.';
-    say.className = 'bad';
+    say.textContent = 'That link is spent or expired. Paste the token instead, or mint a new link from the TUI.';
+    say.className = 'say bad';
   }
-  if (!window.PublicKeyCredential) { go.disabled = true; say.textContent = 'This browser has no passkey support.'; say.className = 'bad'; }
-  go.addEventListener('click', async () => {
-    go.disabled = true; say.className = ''; say.textContent = 'Waiting for your authenticator…';
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const value = token.value.trim();
+    if (!value) return;
+    go.disabled = true; say.className = 'say'; say.textContent = 'Checking…';
     try {
-      const { id, options } = await post('/login/start', {});
-      const pk = options.publicKey;
-      pk.challenge = dec(pk.challenge);
-      for (const c of pk.allowCredentials || []) c.id = dec(c.id);
-      const cred = await navigator.credentials.get({ publicKey: pk });
-      const r = cred.response;
-      await post('/login/finish', { id, credential: {
-        id: cred.id, rawId: enc(cred.rawId), type: cred.type,
-        response: { authenticatorData: enc(r.authenticatorData), clientDataJSON: enc(r.clientDataJSON), signature: enc(r.signature), userHandle: r.userHandle ? enc(r.userHandle) : null },
-        extensions: cred.getClientExtensionResults(),
-      } });
+      const r = await fetch('/login', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ token: value }),
+      });
+      if (!r.ok) throw new Error(await r.text());
       location.replace('/');
-    } catch (e) { say.textContent = e.message || String(e); say.className = 'bad'; go.disabled = false; }
+    } catch (err) {
+      say.textContent = err.message || String(err);
+      say.className = 'say bad';
+      go.disabled = false;
+      token.select();
+    }
   });
+  token.focus();
 })();
 </script>
 </body>

@@ -2355,7 +2355,7 @@ pub(crate) async fn run_tui(
         let remote_detail = remote.detail();
         let remote_page = matches!(mode, Mode::RemotePage { .. }).then(|| {
             crate::cli::status_tui::input::RemotePage {
-                passkeys: remote.door().passkeys().unwrap_or_default(),
+                token: remote.door().token().unwrap_or_default(),
                 sessions: remote.door().sessions().unwrap_or_default(),
             }
         });
@@ -2671,7 +2671,6 @@ pub(crate) async fn run_tui(
                             let page = remote_page.clone().unwrap_or_default();
                             let actions = crate::cli::status_tui::input::remote_actions(
                                 remote.shown() == remote::Shown::On,
-                                &page.passkeys,
                                 &page.sessions,
                             );
                             let sel = sel.min(actions.len().saturating_sub(1));
@@ -2701,10 +2700,13 @@ pub(crate) async fn run_tui(
                                             Some(Overlay::link("link a phone".to_string(), url));
                                     }
                                 }
-                                RemoteNav::Revoke(RemoteAction::Passkey(id)) => {
-                                    if let Err(e) = door.remove_passkey(&id) {
+                                // Rotating is the credential's own
+                                // revocation: the old token stops
+                                // working and its sessions end.
+                                RemoteNav::Revoke(RemoteAction::Token) => {
+                                    if let Err(e) = door.rotate_token() {
                                         detail = Some(Overlay::error(
-                                            "passkey not removed".to_string(),
+                                            "token not rotated".to_string(),
                                             format!("{e:#}"),
                                         ));
                                     }

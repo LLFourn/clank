@@ -71,7 +71,7 @@ pub struct UserConfigFile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zellij: Option<ZellijSection>,
     /// The remote's door: the tunnel's URL and the registered
-    /// passkeys (the-tui-mints-the-way-in).
+    /// token (the-way-in-is-a-token).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote: Option<crate::cli::web::door::RemoteSection>,
     /// Forward-compat catchall. A leftover legacy `default_agents`

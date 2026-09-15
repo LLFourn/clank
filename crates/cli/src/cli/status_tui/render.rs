@@ -157,7 +157,6 @@ pub(super) fn render_at(
         let page = view.remote_page.unwrap_or(&empty);
         let actions = remote_actions(
             view.remote == crate::cli::status_tui::remote::Shown::On,
-            &page.passkeys,
             &page.sessions,
         );
         let sel = sel.min(actions.len().saturating_sub(1));
@@ -1560,8 +1559,8 @@ pub(super) fn render_wait_page(
 }
 
 /// The remote page: the switch and its state, the two ways in
-/// while it is on, then what the door holds — every passkey and
-/// every open session, each a row Backspace revokes.
+/// while it is on, then what the door holds — the token to paste
+/// and every open session, each a row Backspace revokes.
 pub(super) fn render_remote_page(
     remote: crate::cli::status_tui::remote::Shown,
     detail: Option<&str>,
@@ -1594,7 +1593,9 @@ pub(super) fn render_remote_page(
         }
     };
     let mut sel_line = 0;
-    let (mut passkeys_titled, mut sessions_titled) = (false, false);
+    let mut sessions_titled = false;
+    // Filled by the token row, emitted just under it.
+    let mut token_lines: Vec<String> = Vec::new();
     for (i, a) in actions.iter().enumerate() {
         let spans = match a {
             RemoteAction::Switch => vec![plain(format!(
@@ -1609,47 +1610,41 @@ pub(super) fn render_remote_page(
             ))],
             RemoteAction::Open => vec![plain("   ↗ open in the browser".to_string())],
             RemoteAction::Phone => vec![plain("   ▦ link a phone".to_string())],
-            RemoteAction::Passkey(id) => {
-                if !passkeys_titled {
-                    section(&mut out, "passkeys", None);
-                    passkeys_titled = true;
-                }
-                let (name, added) = page
-                    .passkeys
-                    .iter()
-                    .find(|p| p.id == *id)
-                    .map(|p| (p.name.as_str(), date(&p.added)))
-                    .unwrap_or(("?", String::new()));
+            // The token is the thing to be READ OFF the pane and
+            // typed elsewhere, so it must never be elided: the row
+            // itself is short, and the credential is wrapped whole
+            // onto the lines under it, at any width (codex on
+            // f71e7b9).
+            RemoteAction::Token => {
+                section(&mut out, "token — paste this into the page", None);
+                token_lines = wrap(&page.token, cols.saturating_sub(5).max(1))
+                    .into_iter()
+                    .map(|line| emit(&[plain(format!("     {line}"))], "", cols))
+                    .collect();
                 vec![
-                    plain(format!("     {name}")),
-                    dim(format!("  added {added}")),
+                    plain("     ⧉ token".to_string()),
+                    dim("  ⌫ rotates".to_string()),
                 ]
             }
             RemoteAction::Session(hash) => {
                 if !sessions_titled {
-                    if page.passkeys.is_empty() {
-                        section(&mut out, "passkeys", Some("none yet — link a phone"));
-                    }
                     section(&mut out, "sessions", None);
                     sessions_titled = true;
                 }
-                let (passkey, since) = page
+                let (how, since) = page
                     .sessions
                     .iter()
                     .find(|s| s.id_hash == *hash)
                     .map(|s| {
                         (
-                            s.passkey.as_str(),
+                            s.how.as_str(),
                             format!("since {} · seen {}", date(&s.created), minute(&s.last_seen)),
                         )
                     })
                     .unwrap_or(("?", String::new()));
-                vec![plain(format!("     {passkey}")), dim(format!("  {since}"))]
+                vec![plain(format!("     {how}")), dim(format!("  {since}"))]
             }
             RemoteAction::Back => {
-                if page.passkeys.is_empty() && page.sessions.is_empty() {
-                    section(&mut out, "passkeys", Some("none yet — link a phone"));
-                }
                 if page.sessions.is_empty() {
                     section(&mut out, "sessions", Some("none open"));
                 }
@@ -1661,6 +1656,7 @@ pub(super) fn render_remote_page(
             sel_line = out.len();
         }
         out.push(row_line(&spans, sel == i, "", cols));
+        out.append(&mut token_lines);
     }
     // Windowed so the selected row is always on screen: a list
     // longer than the pane is still every one of its rows before
@@ -4109,20 +4105,16 @@ mod tests {
     fn the_remote_page_offers_the_links_only_while_on() {
         use crate::cli::status_tui::remote::Shown;
         let page = RemotePage {
-            passkeys: vec![crate::cli::web::door::PasskeyRow {
-                id: "k1".into(),
-                name: "phone".into(),
-                added: "2026-09-14T10:00:00Z".into(),
-            }],
+            token: "TOKEN-abc123".into(),
             sessions: vec![crate::cli::web::door::SessionRecord {
                 id_hash: "ab".repeat(32),
-                passkey: "phone".into(),
+                how: "token".into(),
                 created: "2026-09-14T10:01:00Z".into(),
                 last_seen: "2026-09-15T08:30:00Z".into(),
             }],
         };
         let text = |shown: Shown, detail: Option<&str>| {
-            let actions = remote_actions(shown == Shown::On, &page.passkeys, &page.sessions);
+            let actions = remote_actions(shown == Shown::On, &page.sessions);
             render_remote_page(shown, detail, &page, &actions, 0, 40, 80)
                 .0
                 .iter()
@@ -4134,9 +4126,12 @@ mod tests {
         assert!(off.contains("switch on"), "{off}");
         assert!(!off.contains("open in the browser"), "{off}");
         assert!(!off.contains("link a phone"), "{off}");
-        assert!(off.contains("phone  added 2026-09-14"), "{off}");
         assert!(
-            off.contains("phone  since 2026-09-14 · seen 2026-09-15 08:30"),
+            off.contains("TOKEN-abc123"),
+            "the token is printed for pasting: {off}"
+        );
+        assert!(
+            off.contains("token  since 2026-09-14 · seen 2026-09-15 08:30"),
             "{off}"
         );
         assert!(!off.contains(&"ab".repeat(32)), "the hash is not shown");
@@ -4147,31 +4142,30 @@ mod tests {
             on.contains("open in the browser") && on.contains("link a phone"),
             "{on}"
         );
+        assert!(on.contains("TOKEN-abc123"), "the token shows while on too");
+
         let empty = RemotePage::default();
-        let actions = remote_actions(false, &[], &[]);
+        let actions = remote_actions(false, &[]);
         let bare = render_remote_page(Shown::Off, None, &empty, &actions, 0, 40, 80)
             .0
             .join("\n");
-        assert!(
-            bare.contains("none yet — link a phone") && bare.contains("none open"),
-            "{bare}"
-        );
+        assert!(bare.contains("none open"), "{bare}");
 
         // A pane shorter than the list: the selected row is on
         // screen wherever it is, so every session can be read before
         // it is revoked.
         let many = RemotePage {
-            passkeys: Vec::new(),
+            token: "T".into(),
             sessions: (0..12)
                 .map(|i| crate::cli::web::door::SessionRecord {
                     id_hash: format!("{i:064}"),
-                    passkey: format!("key{i}"),
+                    how: format!("key{i}"),
                     created: "2026-09-01T00:00:00Z".into(),
                     last_seen: "2026-09-01T00:00:00Z".into(),
                 })
                 .collect(),
         };
-        let actions = remote_actions(false, &[], &many.sessions);
+        let actions = remote_actions(false, &many.sessions);
         let at = |sel: usize| {
             let (lines, total) = render_remote_page(Shown::Off, None, &many, &actions, sel, 8, 80);
             assert!(total > 8);
@@ -4184,9 +4178,49 @@ mod tests {
         };
         assert!(at(0).contains("switch on"));
         assert!(!at(0).contains("key11"));
-        assert!(at(12).contains("key11"), "{}", at(12));
-        assert!(at(13).contains("‹ back"), "{}", at(13));
-        assert!(at(5).contains("key4"), "{}", at(5));
+        assert!(at(13).contains("key11"), "{}", at(13));
+        assert!(at(14).contains("‹ back"), "{}", at(14));
+        assert!(at(6).contains("key4"), "{}", at(6));
+    }
+
+    /// The token is what gets read off the pane and typed into a
+    /// phone, so a narrow pane must still show every byte of it: a
+    /// real-length credential at a width that would elide it is
+    /// wrapped whole instead (codex on f71e7b9).
+    #[test]
+    fn a_narrow_pane_shows_the_whole_token() {
+        use crate::cli::status_tui::remote::Shown;
+        // As `random_token` renders one: 32 bytes, url-safe base64.
+        let token = "sSJm3kQ0Xn7bK2pL9vTf4hR1yZ8wC6dGaE5uNoIqPrM";
+        assert_eq!(token.len(), 43);
+        let page = RemotePage {
+            token: token.into(),
+            sessions: Vec::new(),
+        };
+        let actions = remote_actions(false, &[]);
+        for cols in [80, 48, 40, 30, 24] {
+            let lines = render_remote_page(Shown::Off, None, &page, &actions, 0, 40, cols)
+                .0
+                .iter()
+                .map(|l| strip_escapes(l))
+                .collect::<Vec<_>>();
+            let joined: String = lines
+                .iter()
+                .map(|l| l.trim().to_string())
+                .collect::<Vec<_>>()
+                .join("");
+            assert!(
+                joined.contains(token),
+                "the whole token is readable at {cols}: {lines:?}"
+            );
+            // And no piece of it was elided on the way.
+            assert!(
+                !lines.iter().any(|l| l.contains('…')
+                    && l.chars().any(|c| token.contains(c) && c != ' ')
+                    && l.trim_start().starts_with(|c: char| token.contains(c))),
+                "a token line was elided at {cols}: {lines:?}"
+            );
+        }
     }
 
     #[test]

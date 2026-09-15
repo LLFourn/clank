@@ -49,7 +49,7 @@ pub(crate) trait Handle: Send + 'static {
 /// ignored — `https://clank.example.com/` and ngrok's
 /// `clank.example.com` are one endpoint (codex on 6f60efa).
 pub(crate) fn endpoint_identity(url: &str) -> anyhow::Result<String> {
-    let parsed = webauthn_rs::prelude::Url::parse(url)?;
+    let parsed = url::Url::parse(url)?;
     let host = parsed
         .host_str()
         .ok_or_else(|| anyhow::anyhow!("the tunnel's URL `{url}` has no host"))?
@@ -145,7 +145,7 @@ impl Provider for Ngrok {
                         .connect()
                         .await
                         .map_err(|e| anyhow::anyhow!("ngrok: {e}"))?;
-                    let to = webauthn_rs::prelude::Url::parse(&format!("http://localhost:{port}"))?;
+                    let to = url::Url::parse(&format!("http://localhost:{port}"))?;
                     let forwarder = session
                         .http_endpoint()
                         .domain(&domain)

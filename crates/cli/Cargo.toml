@@ -87,12 +87,12 @@ gix = { version = "0.84", default-features = false, features = [
     "parallel",              # Repository: Send under parallel feature
 ] }
 kdl = "4"
-# The remote's door (the-tui-mints-the-way-in): WebAuthn as the
-# relying party, a QR for the phone's registration link, and the
-# random, encoded, constant-time-compared tokens behind both.
-# webauthn-rs links the system OpenSSL.
-webauthn-rs = { version = "0.5", default-features = false }
+# The remote's door (the-way-in-is-a-token): a QR of the phone's
+# link, and the random, encoded, constant-time-compared credentials
+# behind the token and the sessions it opens.
 qrcode = { version = "0.14", default-features = false }
+# Parsing the tunnel's public URL into the host its lease is keyed by.
+url = "2"
 getrandom = "0.3"
 base64 = "0.22"
 subtle = "2"
@@ -111,4 +111,3 @@ filetime = "0.2"
 # test-only: paused-time (`start_paused`) so the github poll loop's
 # inter-tick sleeps resolve instantly in tests (extra-wait-events).
 tokio = { version = "1", features = ["test-util"] }
-webauthn-authenticator-rs = { version = "0.5", default-features = false, features = ["softpasskey"] }

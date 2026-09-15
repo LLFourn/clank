@@ -98,8 +98,8 @@ pub(super) struct Remote<O: Opener> {
     repo: PathBuf,
     home: Option<PathBuf>,
     panes: PanesSource,
-    /// The door outlives any one instance: its sessions and passkeys
-    /// are the user's, listed and revoked from the row whether the
+    /// The door outlives any one instance: its token and sessions
+    /// are the user's, shown and revoked from the row whether the
     /// remote is on or off.
     door: Arc<Door>,
     tunnel: TunnelSource,
@@ -281,11 +281,11 @@ impl<O: Opener> Remote<O> {
         }
     }
 
-    /// A one-time registration link for the phone: the running
-    /// tunnel's proven URL — the phone cannot reach loopback — else
-    /// the local one; nothing unless on. The instance's, not the
-    /// config's: a domain changed while the remote is on is the
-    /// next start's (codex on 6f60efa).
+    /// A one-time link for the phone: the running tunnel's proven
+    /// URL — the phone cannot reach loopback — else the local one;
+    /// nothing unless on. The instance's, not the config's: a
+    /// domain changed while the remote is on is the next start's
+    /// (codex on 6f60efa).
     pub(super) fn phone_link(&self) -> Option<String> {
         match &self.state {
             State::On { instance } => {
@@ -294,9 +294,9 @@ impl<O: Opener> Remote<O> {
                     .clone()
                     .unwrap_or_else(|| instance.url.clone());
                 Some(format!(
-                    "{}/register?t={}",
+                    "{}/login?t={}",
                     base.trim_end_matches('/'),
-                    self.door.mint(Link::Register)
+                    self.door.mint(Link::Login)
                 ))
             }
             _ => None,
