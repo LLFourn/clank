@@ -746,6 +746,26 @@ impl std::fmt::Display for NotUp {
     }
 }
 
+/// An error AND what caused it. `reqwest`'s own `Display` says only
+/// "error sending request for url (…)" and drops the chain beneath —
+/// the dns failure, the refused connection, the certificate — which
+/// is the part that says what to do about it. A reason nobody can
+/// read is a reason nobody can act on.
+fn because(e: &(dyn std::error::Error + 'static)) -> String {
+    let mut said = e.to_string();
+    let mut source = e.source();
+    while let Some(next) = source {
+        let text = next.to_string();
+        // Chains often repeat themselves; say each thing once.
+        if !said.contains(&text) {
+            said.push_str(": ");
+            said.push_str(&text);
+        }
+        source = next.source();
+    }
+    said
+}
+
 /// Prove the public URL is this remote, and live: `GET /instance`
 /// answers `nonce` (retried until the deadline), then
 /// `/instance/stream` delivers its first event before it.
@@ -763,10 +783,10 @@ pub(crate) async fn probe(
             Ok(r) if r.status().is_success() => match r.json::<serde_json::Value>().await {
                 Ok(v) if v["nonce"] == nonce => break,
                 Ok(_) => return Err(NotUp::AnotherInstance),
-                Err(e) => e.to_string(),
+                Err(e) => because(&e),
             },
             Ok(r) => format!("HTTP {}", r.status()),
-            Err(e) => e.to_string(),
+            Err(e) => because(&e),
         };
         if tokio::time::Instant::now() + std::time::Duration::from_secs(1) >= deadline {
             return Err(NotUp::NoAnswer(last));
@@ -784,7 +804,7 @@ pub(crate) async fn probe(
             .replacen("http://", "ws://", 1);
         let (mut socket, _) = tokio_tungstenite::connect_async(format!("{ws}/instance/stream"))
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| because(&e))?;
         loop {
             match futures_util::StreamExt::next(&mut socket).await {
                 Some(Ok(tokio_tungstenite::tungstenite::Message::Text(said))) => {
@@ -796,7 +816,7 @@ pub(crate) async fn probe(
                 }
                 // A ping or an empty frame is not the answer yet.
                 Some(Ok(_)) => continue,
-                Some(Err(e)) => return Err(e.to_string()),
+                Some(Err(e)) => return Err(because(&e)),
                 None => return Err("the socket closed before its first frame".to_string()),
             }
         }
@@ -1062,6 +1082,40 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(6),
             "bounded by the grace"
+        );
+    }
+
+    /// The reason a probe failed must name the CAUSE, not just the
+    /// request: reqwest says "error sending request for url (…)" and
+    /// hides the dns failure or refused connection beneath it, which
+    /// is the part that says what to do.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_probe_says_what_actually_went_wrong() {
+        // Nothing is listening here.
+        let dead = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let url = format!("http://127.0.0.1:{}", dead.local_addr().unwrap().port());
+        drop(dead);
+        let why = match probe(
+            &url,
+            "n1",
+            tokio::time::Instant::now() + Duration::from_secs(2),
+        )
+        .await
+        {
+            Err(NotUp::NoAnswer(why)) => why,
+            other => panic!("expected no answer, got {other:?}"),
+        };
+        assert!(
+            why.to_lowercase().contains("refused")
+                || why.to_lowercase().contains("connect")
+                || why.to_lowercase().contains("os error"),
+            "the cause is in the reason, not just the request: {why}"
+        );
+        assert!(
+            why != "error sending request",
+            "the bare request error is not a reason"
         );
     }
 
