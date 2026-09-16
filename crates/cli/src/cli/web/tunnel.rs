@@ -1071,6 +1071,9 @@ mod tests {
                 let Ok((stream, _)) = listener.accept().await else {
                     return;
                 };
+                let Ok(stream) = crate::cli::web::repaired(stream).await else {
+                    continue;
+                };
                 let io = hyper_util::rt::TokioIo::new(stream);
                 let svc = hyper::service::service_fn(
                     move |mut req: hyper::Request<hyper::body::Incoming>| async move {
@@ -1083,14 +1086,23 @@ mod tests {
                                 .unwrap()
                         };
                         if req.uri().path() == "/instance" {
-                            return Ok::<_, std::convert::Infallible>(reply(
+                            // The double stands in for OUR server, so
+                            // it closes after an ordinary response the
+                            // same way: otherwise the connector pools
+                            // this socket and sends the handshake down
+                            // it, where the repair cannot reach.
+                            let mut resp = reply(
                                 200,
                                 serde_json::json!({ "nonce": nonce }).to_string(),
                                 "application/json",
-                            ));
+                            );
+                            crate::cli::web::alone_on_its_connection(&mut resp);
+                            return Ok::<_, std::convert::Infallible>(resp);
                         }
                         if req.uri().path() != "/instance/stream" || (!streams && !hangs) {
-                            return Ok(reply(404, "no".to_string(), "text/plain"));
+                            let mut resp = reply(404, "no".to_string(), "text/plain");
+                            crate::cli::web::alone_on_its_connection(&mut resp);
+                            return Ok(resp);
                         }
                         // The live channel as a tunnel would present
                         // it: an upgrade that speaks at once, or one
@@ -1297,6 +1309,125 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         panic!("the connector outlived the abandoned start");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "live: needs the internet"]
+    async fn a_real_native_quick_tunnel_comes_up() {
+        let home = tempfile::tempdir().unwrap();
+        let (url, _srv) = fake_public("n1", true, false).await;
+        let port: u16 = url
+            .strip_prefix("http://127.0.0.1:")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let mut up = Start {
+            provider: std::sync::Arc::new(Quick),
+            grace: Duration::from_secs(90),
+            abort: tokio::sync::watch::channel(false).1,
+            ask: std::sync::Arc::new(crate::cli::web::dns::Net::default()),
+        };
+        let began = std::time::Instant::now();
+        let tunnel = match Tunnel::up(&mut up, home.path(), port, "n1").await {
+            Ok(t) => t,
+            // The regression this plan exists for lands HERE. Printing
+            // it and returning would let the bug ship green.
+            Err(e) => panic!("the native connector must carry the page's socket: {e:#}"),
+        };
+        println!("LIVE quick: UP at {} in {:?}", tunnel.url, began.elapsed());
+        tunnel.stop().await;
+    }
+
+    /// Can the native connector pump a websocket AT ALL, given an
+    /// origin that answers 101 correctly? Isolates the crate from
+    /// clank's server.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "live: needs the internet"]
+    async fn can_the_native_connector_pump_a_socket() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let Ok(n) = s.read(&mut buf).await else {
+                        return;
+                    };
+                    let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let key = head
+                        .lines()
+                        .find(|l| l.to_ascii_lowercase().starts_with("sec-websocket-key:"))
+                        .map(|l| l.split(':').nth(1).unwrap().trim().to_string());
+                    let Some(key) = key else {
+                        let _ = s
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi")
+                            .await;
+                        return;
+                    };
+                    use base64::Engine as _;
+                    use sha1::Digest as _;
+                    let mut h = sha1::Sha1::new();
+                    h.update(format!("{key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11").as_bytes());
+                    let accept = base64::engine::general_purpose::STANDARD.encode(h.finalize());
+                    let resp = format!(
+                        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\
+                         Connection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+                    );
+                    let _ = s.write_all(resp.as_bytes()).await;
+                    // One unmasked text frame: {"hello":1}
+                    let payload = br#"{"hello":1}"#;
+                    let mut frame = vec![0x81u8, payload.len() as u8];
+                    frame.extend_from_slice(payload);
+                    let _ = s.write_all(&frame).await;
+                    let _ = s.flush().await;
+                    tokio::time::sleep(Duration::from_secs(20)).await;
+                });
+            }
+        });
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let (url, handle) = Quick.start(port, deadline).await.expect("quick started");
+        println!("LIVE pump url: {url}");
+        let ws = url.replacen("https://", "wss://", 1);
+        let outcome = async {
+            let (mut sock, resp) = tokio::time::timeout(
+                Duration::from_secs(25),
+                tokio_tungstenite::connect_async(format!("{ws}/instance/stream")),
+            )
+            .await
+            .map_err(|_| "the handshake timed out".to_string())?
+            .map_err(|e| format!("the handshake failed: {e}"))?;
+            let status = resp.status();
+            let frame = tokio::time::timeout(
+                Duration::from_secs(10),
+                futures_util::StreamExt::next(&mut sock),
+            )
+            .await
+            .map_err(|_| "no frame before the deadline".to_string())?;
+            match frame {
+                Some(Ok(m)) => Ok((status, m)),
+                other => Err(format!("no frame: {other:?}")),
+            }
+        }
+        .await;
+        // Tear the tunnel down BEFORE asserting, so a failure does not
+        // leave a connector running.
+        let _ = end(handle).await;
+        let (status, frame) = outcome.unwrap_or_else(|why| {
+            panic!("the connector must pump a socket given a 101 origin: {why}")
+        });
+        assert_eq!(status, 101, "the edge carried the upgrade");
+        assert!(
+            matches!(&frame, tokio_tungstenite::tungstenite::Message::Text(t) if t.contains("hello")),
+            "the origin's frame arrived whole: {frame:?}"
+        );
+        println!("LIVE pump: {status}, frame {frame:?}");
     }
 
     /// The pin is what the probe connects to — both halves of it.

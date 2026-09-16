@@ -118,6 +118,8 @@ path = "src/main.rs"
 test = false
 
 [dev-dependencies]
+# Only to answer a handshake by hand in the live connector test.
+sha1 = "0.11.0"
 filetime = "0.2"
 # test-only: paused-time (`start_paused`) so the github poll loop's
 # inter-tick sleeps resolve instantly in tests (extra-wait-events).
