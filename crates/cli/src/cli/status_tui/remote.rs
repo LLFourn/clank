@@ -336,31 +336,22 @@ impl<O: Opener> Remote<O> {
     /// Send the browser in again — through a fresh login link, so
     /// the desktop needs no ceremony; nothing unless on.
     pub(super) fn open_again(&mut self) {
-        if let Some(url) = self.login_link() {
+        if let Some(url) = self.link() {
             let report = self.reporter();
             self.opener.open(&url, report);
         }
     }
 
-    /// A one-time login link into the running remote: the local
-    /// URL, for the browser on this machine.
-    fn login_link(&self) -> Option<String> {
-        match &self.state {
-            State::On { instance } => Some(format!(
-                "{}/login?t={}",
-                instance.url,
-                self.door.mint(Link::Login)
-            )),
-            _ => None,
-        }
-    }
-
-    /// A one-time link for the phone: the running tunnel's proven
-    /// URL — the phone cannot reach loopback — else the local one;
-    /// nothing unless on. The instance's, not the config's: a
-    /// domain changed while the remote is on is the next start's
-    /// (codex on 6f60efa).
-    pub(super) fn phone_link(&self) -> Option<String> {
+    /// A one-time link into the running remote: the tunnel's proven
+    /// URL when there is one, else the local one.
+    ///
+    /// ONE link, not one per destination. The row's `detail` already
+    /// preferred the public URL while the browser was sent to
+    /// loopback, and a second place to express the preference is
+    /// exactly how the two came to disagree. The instance's URL, not
+    /// the config's: a domain changed while the remote is on belongs
+    /// to the next start (codex on 6f60efa).
+    pub(super) fn link(&self) -> Option<String> {
         match &self.state {
             State::On { instance } => {
                 let base = instance
@@ -450,7 +441,16 @@ impl<O: Opener> Remote<O> {
                 (Outcome::BrowserFailed { why }, State::On { instance }) => {
                     notices.push(Notice {
                         title: "remote on".to_string(),
-                        message: format!("{}\n\ncould not open a browser: {why}", instance.url),
+                        // The URL it actually tried, not loopback: a
+                        // failure that names a different address than
+                        // the one it used sends the user nowhere.
+                        message: format!(
+                            "{}\n\ncould not open a browser: {why}",
+                            instance
+                                .public_url
+                                .clone()
+                                .unwrap_or_else(|| instance.url.clone())
+                        ),
                     });
                 }
                 _ => {}
@@ -531,6 +531,35 @@ impl Opener for Browser {
 
 #[cfg(test)]
 mod tests {
+
+    /// The browser is sent where the row says. ONE link, so the two
+    /// cannot drift: the bug was a `detail` that preferred the tunnel
+    /// while the opener preferred loopback.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_browser_is_opened_at_the_url_the_row_shows() {
+        let repo = repo_with_config();
+        let (mut r, rec) = remote(repo.path(), true);
+        let snap = snap();
+        r.toggle();
+        settle(&mut r, &snap).await;
+        assert_eq!(r.shown(), Shown::On);
+
+        let shown = r.detail().expect("on, so the row shows a URL");
+        let link = r.link().expect("on, so there is a link");
+        assert!(
+            link.starts_with(&format!("{shown}/login?t=")),
+            "the link is built on the URL the row shows: {link} vs {shown}"
+        );
+
+        let opened = rec.opened.lock().unwrap().clone();
+        assert_eq!(opened.len(), 1, "opened once on coming on");
+        assert!(
+            opened[0].starts_with(&format!("{shown}/login?t=")),
+            "the browser was sent to the row's URL: {:?} vs {shown}",
+            opened[0]
+        );
+        r.stop().await;
+    }
     use super::*;
     use crate::cli::open_zellij::{PaneMeta, SubscribeChild};
 
@@ -646,7 +675,11 @@ mod tests {
         let rec = Recorder::default();
         let provider = Arc::new(FakeTunnel {
             allocated: false,
-            url: format!("http://localhost:{port}"),
+            // The loopback LITERAL, while the instance reports itself
+            // as `localhost`. Both reach the same server, so the probe
+            // passes, but they differ as strings — which is the only
+            // way a test can tell the public URL from the local one.
+            url: format!("http://127.0.0.1:{port}"),
             pending: false,
             started: Default::default(),
             stopped: Default::default(),
@@ -1300,7 +1333,7 @@ mod tests {
         );
         // The browser is sent in through a login link: the page
         // itself asks for a session first.
-        assert!(url.starts_with("http://localhost:"), "{url}");
+        assert!(url.starts_with("http://127.0.0.1:"), "{url}");
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .build()
@@ -1457,6 +1490,14 @@ mod tests {
             notices[0]
                 .message
                 .contains("could not open a browser: no opener")
+        );
+        // And it names the URL it actually tried. Naming a different
+        // one sends the reader somewhere the feature did not go.
+        let shown = r.detail().expect("still on");
+        assert!(
+            notices[0].message.starts_with(&shown),
+            "the notice names the URL the row shows: {:?} vs {shown}",
+            notices[0].message
         );
         assert_eq!(r.shown(), Shown::On);
 

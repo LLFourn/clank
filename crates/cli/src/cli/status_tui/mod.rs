@@ -2785,7 +2785,7 @@ pub(crate) async fn run_tui(
                                 }
                                 RemoteNav::Activate(RemoteAction::Open) => remote.open_again(),
                                 RemoteNav::Activate(RemoteAction::Phone) => {
-                                    if let Some(url) = remote.phone_link() {
+                                    if let Some(url) = remote.link() {
                                         detail =
                                             Some(Overlay::link("link a phone".to_string(), url));
                                     }
