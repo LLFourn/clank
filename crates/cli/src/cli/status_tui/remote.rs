@@ -16,8 +16,8 @@ enum Configured {
     Absent,
     /// A tunnel the source could build.
     Ready,
-    /// A tunnel IS configured but could not be built — ngrok with no
-    /// authtoken, a config that will not parse. The reason is the
+    /// A tunnel IS configured but could not be built — a retired
+    /// provider, a config that will not parse. The reason is the
     /// operator's to see; "not configured" is not it.
     Broken(String),
 }
@@ -29,8 +29,8 @@ const UNCONFIGURED: &str = "not configured";
 const UNCONFIGURED_HOW: &str = "No remote is configured, so there is nowhere to serve it.\n\n\
      Add a tunnel to ~/.clank/config.json, for example:\n\n\
      \"remote\": { \"tunnel\": { \"provider\": \"quick\" } }\n\n\
-     `quick` needs no account and no domain; `ngrok` and `command` \
-     are the other providers.";
+     `quick` needs no account, no domain and nothing installed; \
+     `command` runs any binary that forwards the port.";
 
 /// What the bar and the row draw.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -190,8 +190,8 @@ impl<O: Opener> Remote<O> {
     /// snapshot rebuild and far too dear for a frame, which is why
     /// the row reads a remembered answer. An error is KEPT as an
     /// error: a provider that is configured but cannot be built —
-    /// ngrok without an authtoken, a config that will not parse —
-    /// must not be reported as no tunnel at all (codex on 5149876).
+    /// a retired one, a config that will not parse — must not be
+    /// reported as no tunnel at all (codex on 5149876).
     fn recheck_configured(&self) {
         *self.configured.borrow_mut() = match (self.tunnel)() {
             Ok(Some(_)) => Configured::Ready,
@@ -770,9 +770,9 @@ mod tests {
         r.stop().await;
     }
 
-    /// A tunnel that IS configured but cannot be built — ngrok with
-    /// no authtoken, a config that will not parse — is an error to
-    /// show, not an absence to misreport (codex on 5149876).
+    /// A tunnel that IS configured but cannot be built — a retired
+    /// provider, a config that will not parse — is an error to show,
+    /// not an absence to misreport (codex on 5149876).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_source_that_errors_is_not_the_same_as_no_tunnel() {
         let repo = repo_with_config();
@@ -793,12 +793,12 @@ mod tests {
             Arc::new(|| {}),
         )
         .tunnel_from(Arc::new(|| {
-            anyhow::bail!("ngrok: no authtoken — set NGROK_AUTHTOKEN")
+            anyhow::bail!("the `ngrok` provider is gone: use `quick`")
         }));
 
         assert_eq!(r.shown(), Shown::Failed, "not `unconfigured`");
         let why = r.detail().unwrap();
-        assert!(why.contains("no authtoken"), "the reason is shown: {why}");
+        assert!(why.contains("is gone"), "the reason is shown: {why}");
         assert!(
             !why.contains("not configured") && !why.contains("No remote is configured"),
             "a broken tunnel is not an absent one: {why}"
@@ -811,7 +811,7 @@ mod tests {
         settle(&mut r, &snap).await;
         assert_eq!(r.shown(), Shown::Failed);
         let why = r.detail().unwrap();
-        assert!(why.contains("no authtoken"), "{why}");
+        assert!(why.contains("is gone"), "{why}");
         r.stop().await;
     }
 

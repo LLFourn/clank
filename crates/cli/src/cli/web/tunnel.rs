@@ -19,9 +19,14 @@ pub enum TunnelSection {
     /// is ALLOCATED — it does not exist until the tunnel is handed
     /// one — so there is nothing to configure at all.
     Quick,
-    /// ngrok through its SDK: nothing installed. The authtoken is
-    /// the agent's own — `NGROK_AUTHTOKEN`, or the agent's config
-    /// file — never clank's config.
+    /// RETIRED, and kept in the schema only so that a config still
+    /// naming it PARSES — the same reason `quick`'s variant stayed.
+    ///
+    /// It asked for an account before anything worked, and a reserved
+    /// domain on top of that, which was clank's demand rather than
+    /// ngrok's. The accountless tunnel needs neither, and `command`
+    /// runs ngrok's own agent for anyone who wants it, so clank does
+    /// not have to model it.
     Ngrok { domain: String },
     /// A binary that forwards `url` to the port: `{port}` in `run`
     /// is the port.
@@ -54,7 +59,7 @@ pub(crate) const STOP_BOUND: std::time::Duration = std::time::Duration::from_sec
 /// the remote owns.
 pub(crate) trait Provider: Send + Sync + 'static {
     /// The endpoint this provider ALREADY OWNS and will claim, when
-    /// it knows the name before it starts — ngrok's domain, a
+    /// it knows the name before it starts — a configured URL, a
     /// command with a configured URL. `None` means the hostname does
     /// not exist until the tunnel is handed one, and can only be
     /// leased once the start reports it.
@@ -81,7 +86,7 @@ pub(crate) trait Handle: Send + 'static {
 
 /// The public endpoint an URL names, provider-independent, for the
 /// lease: host and port, lowercased, the path and a trailing slash
-/// ignored — `https://clank.example.com/` and ngrok's
+/// ignored — `https://clank.example.com/` and
 /// `clank.example.com` are one endpoint (codex on 6f60efa).
 pub(crate) fn endpoint_identity(url: &str) -> anyhow::Result<String> {
     let parsed = url::Url::parse(url)?;
@@ -95,6 +100,24 @@ pub(crate) fn endpoint_identity(url: &str) -> anyhow::Result<String> {
     })
 }
 
+/// What to say to a config that still names ngrok. A reason without
+/// the replacement line is a reason that leaves the user to guess at
+/// JSON.
+/// The `url` is not decoration: it makes the endpoint CLAIMED, so
+/// clank never has to read one off the child. The agent's endpoint
+/// goes to its own terminal UI, not to stdout — `agent.log` is off by
+/// default — so a recipe without it would wait for a line that never
+/// comes and time out on a tunnel that came up fine.
+pub(crate) const NGROK_RETIRED: &str = "the `ngrok` provider is gone: it wanted an account before \
+     anything worked, and clank asked for a reserved domain on top of that.\n\n\
+     The accountless tunnel needs neither:\n\n\
+     \"tunnel\": { \"provider\": \"quick\" }\n\n\
+     Or keep ngrok, through its own agent, naming the domain you \
+     reserved on both sides:\n\n\
+     \"tunnel\": { \"provider\": \"command\",\n\
+     \u{20}            \"run\": [\"ngrok\", \"http\", \"--url\", \"https://you.ngrok.app\", \"{port}\"],\n\
+     \u{20}            \"url\": \"https://you.ngrok.app\" }";
+
 /// The provider the user config names, if any, with the grace a
 /// start gets.
 pub(crate) fn configured(
@@ -107,15 +130,7 @@ pub(crate) fn configured(
     };
     let provider: std::sync::Arc<dyn Provider> = match section {
         TunnelSection::Quick => std::sync::Arc::new(Quick),
-        TunnelSection::Ngrok { domain } => std::sync::Arc::new(Ngrok {
-            authtoken: ngrok_authtoken(home).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "ngrok: no authtoken — set NGROK_AUTHTOKEN, or `ngrok config add-authtoken …` \
-                     so the agent's config file has it"
-                )
-            })?,
-            domain,
-        }),
+        TunnelSection::Ngrok { .. } => anyhow::bail!(NGROK_RETIRED),
         TunnelSection::Command {
             run,
             url,
@@ -127,116 +142,6 @@ pub(crate) fn configured(
         }),
     };
     Ok(Some((provider, TUNNEL_GRACE)))
-}
-
-/// The ngrok agent's authtoken, from the environment or the agent's
-/// own config file: the credential stays in ngrok's files.
-pub(crate) fn ngrok_authtoken(home: &Path) -> Option<String> {
-    if let Ok(t) = std::env::var("NGROK_AUTHTOKEN")
-        && !t.trim().is_empty()
-    {
-        return Some(t.trim().to_string());
-    }
-    [
-        home.join("Library/Application Support/ngrok/ngrok.yml"),
-        home.join(".config/ngrok/ngrok.yml"),
-        home.join(".ngrok2/ngrok.yml"),
-    ]
-    .iter()
-    .filter_map(|p| std::fs::read_to_string(p).ok())
-    .find_map(|yml| authtoken_in(&yml))
-}
-
-fn authtoken_in(yml: &str) -> Option<String> {
-    yml.lines().find_map(|line| {
-        let value = line.trim().strip_prefix("authtoken:")?.trim();
-        let value = value.trim_matches(|c| c == '"' || c == '\'');
-        (!value.is_empty()).then(|| value.to_string())
-    })
-}
-
-// ---- ngrok ----
-
-pub(crate) struct Ngrok {
-    domain: String,
-    authtoken: String,
-}
-
-/// The ngrok tunnel runs on a runtime of its own so a stop OWNS the
-/// whole connector: the SDK detaches a task per accepted connection
-/// (`forward_tunnel` discards each `forward_to` handle) and spawns an
-/// unlisten task on drop that keeps a `Session` clone, so aborting
-/// the accept loop alone would leave connection and control tasks —
-/// and the transport — alive past the lease's release (codex on
-/// 22eed48). Dropping the isolated runtime cancels every one of them.
-struct NgrokHandle {
-    isolated: Isolated,
-}
-
-impl Provider for Ngrok {
-    fn reservation(&self) -> Option<String> {
-        Some(format!("https://{}", self.domain))
-    }
-    fn start(
-        &self,
-        port: u16,
-        _deadline: tokio::time::Instant,
-    ) -> BoxFuture<'_, anyhow::Result<(String, Box<dyn Handle>)>> {
-        let (domain, authtoken) = (self.domain.clone(), self.authtoken.clone());
-        Box::pin(async move {
-            let build = move || -> BoxFuture<'static, anyhow::Result<(String, Close)>> {
-                Box::pin(async move {
-                    use ngrok::config::ForwarderBuilder;
-                    let session = ngrok::Session::builder()
-                        .authtoken(&authtoken)
-                        .metadata("clank remote")
-                        .connect()
-                        .await
-                        .map_err(|e| anyhow::anyhow!("ngrok: {e}"))?;
-                    let to = url::Url::parse(&format!("http://localhost:{port}"))?;
-                    let forwarder = session
-                        .http_endpoint()
-                        .domain(&domain)
-                        .listen_and_forward(to)
-                        .await
-                        .map_err(|e| anyhow::anyhow!("ngrok: {e}"))?;
-                    let forwarder_url = {
-                        use ngrok::tunnel::EndpointInfo;
-                        let u = forwarder.url().to_string();
-                        (!u.is_empty()).then_some(u)
-                    };
-                    // The graceful close, run on the isolated runtime
-                    // before it is dropped: the unlisten RPC, then the
-                    // session. Whatever it does not finish, the drop
-                    // finishes by force.
-                    let close: Close = Box::new(move || {
-                        Box::pin(async move {
-                            use ngrok::tunnel::TunnelCloser;
-                            let mut forwarder = forwarder;
-                            let mut session = session;
-                            let _ = forwarder.close().await;
-                            let _ = session.close().await;
-                        })
-                    });
-                    // The endpoint the session actually bound, not
-                    // the one we asked for.
-                    let url = forwarder_url.unwrap_or(format!("https://{domain}"));
-                    Ok((url, close))
-                })
-            };
-            let (url, isolated) = Isolated::start(build).await?;
-            Ok((url, Box::new(NgrokHandle { isolated }) as Box<dyn Handle>))
-        })
-    }
-}
-
-impl Handle for NgrokHandle {
-    fn stop(self: Box<Self>) -> BoxFuture<'static, Option<String>> {
-        Box::pin(async move {
-            self.isolated.shutdown().await;
-            None
-        })
-    }
 }
 
 /// How long the graceful close gets on the isolated runtime before it
@@ -371,9 +276,9 @@ impl Provider for Quick {
         _deadline: tokio::time::Instant,
     ) -> BoxFuture<'_, anyhow::Result<(String, Box<dyn Handle>)>> {
         Box::pin(async move {
-            // On a runtime of its own for the same reason ngrok is:
-            // the connector spawns reactors and per-stream work, and
-            // dropping that runtime is what makes a stop total.
+            // On a runtime of its own: the connector spawns reactors
+            // and per-stream work, and dropping that runtime is what
+            // makes a stop total.
             let build = move || -> BoxFuture<'static, anyhow::Result<(String, Close)>> {
                 Box::pin(async move {
                     let handle = cloudflare_quick_tunnel::QuickTunnelManager::new(port)
@@ -1586,16 +1491,18 @@ mod tests {
     /// it: the lease is keyed by host and port, not the spelling.
     #[test]
     fn the_endpoint_identity_is_the_host_whoever_names_it() {
-        let ngrok = Ngrok {
-            domain: "Clank.Example.com".into(),
-            authtoken: "t".into(),
+        // Two spellings of one endpoint: case, and a trailing slash.
+        let shouted = Command {
+            run: vec![],
+            url: Some("https://Clank.Example.com".into()),
+            url_contains: None,
         };
         let command = Command {
             run: vec![],
             url: Some("https://clank.example.com/".into()),
             url_contains: None,
         };
-        let id = endpoint_identity(&ngrok.reservation().unwrap()).unwrap();
+        let id = endpoint_identity(&shouted.reservation().unwrap()).unwrap();
         assert_eq!(id, "clank.example.com");
         assert_eq!(
             endpoint_identity(&command.reservation().unwrap()).unwrap(),
@@ -2101,10 +2008,80 @@ mod tests {
         assert!(!alive(pid), "nothing left running");
     }
 
-    /// The provider comes from the user config; ngrok's token from
-    /// the agent's own file, never clank's.
+    /// The recipe the refusal tells you to paste has to WORK, and the
+    /// first one did not. `Command` waits for a whitespace-delimited
+    /// URL on the child's output, and ngrok's agent writes its
+    /// endpoint to its own terminal UI rather than to stdout, so a
+    /// recipe without a `url` waits for a line that never comes and
+    /// times out on a tunnel that came up fine (codex on 65e3359).
+    ///
+    /// Checked by PARSING the advertised text, so the message and the
+    /// contract cannot drift: a recipe edited into something the
+    /// provider refuses fails here.
     #[test]
-    fn the_config_names_the_provider_and_the_token_is_the_agents() {
+    fn the_advertised_ngrok_recipe_meets_the_command_contract() {
+        // Every `"tunnel": { … }` block the refusal offers, lifted out
+        // of the prose it is embedded in.
+        let recipes: Vec<String> = NGROK_RETIRED
+            .match_indices("\"tunnel\":")
+            .map(|(at, _)| {
+                let from = NGROK_RETIRED[at..].find('{').expect("a block") + at;
+                let mut depth = 0i32;
+                let mut end = from;
+                for (i, c) in NGROK_RETIRED[from..].char_indices() {
+                    match c {
+                        '{' => depth += 1,
+                        '}' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                end = from + i + 1;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                NGROK_RETIRED[from..end].to_string()
+            })
+            .collect();
+        assert_eq!(recipes.len(), 2, "both replacements are offered");
+
+        for r in &recipes {
+            let section: TunnelSection =
+                serde_json::from_str(r).unwrap_or_else(|e| panic!("`{r}` does not parse: {e}"));
+            match section {
+                // The accountless one configures nothing by design.
+                TunnelSection::Quick => {}
+                TunnelSection::Command { run, url, .. } => {
+                    let url = url.expect(
+                        "the command recipe must CLAIM its endpoint: ngrok's agent does not \
+                         print one, so clank would wait for a line that never comes",
+                    );
+                    assert!(
+                        endpoint_identity(&url).is_ok(),
+                        "the claimed endpoint is a URL clank can lease: {url}"
+                    );
+                    // The child is told the same endpoint, or it would
+                    // serve a different one than clank leased.
+                    assert!(
+                        run.iter().any(|a| a == &url),
+                        "the run line names the same endpoint: {run:?} vs {url}"
+                    );
+                    assert!(
+                        run.iter().any(|a| a == "{port}"),
+                        "and the port clank bound: {run:?}"
+                    );
+                }
+                other => panic!("the refusal offers something unusable: {other:?}"),
+            }
+        }
+    }
+
+    /// The provider comes from the user config, and a retired one is
+    /// refused at USE rather than at parse — the roster and team
+    /// commands read this same file.
+    #[test]
+    fn the_config_names_the_provider_and_a_retired_one_is_refused() {
         let section: TunnelSection =
             serde_json::from_str(r#"{"provider":"ngrok","domain":"clank.ngrok.app"}"#).unwrap();
         assert_eq!(
@@ -2132,12 +2109,6 @@ mod tests {
         assert_eq!(section, TunnelSection::Quick);
         assert!(Quick.reservation().is_none());
 
-        assert_eq!(
-            authtoken_in("version: 2\nauthtoken: \"abc\"\n").as_deref(),
-            Some("abc")
-        );
-        assert_eq!(authtoken_in("version: 2\n"), None);
-
         let home = tempfile::tempdir().unwrap();
         assert!(configured(Some(home.path())).unwrap().is_none());
         let write = |tunnel: TunnelSection| {
@@ -2154,25 +2125,21 @@ mod tests {
         assert_eq!(p.reservation().as_deref(), Some("https://c.example.com"));
         assert_eq!(grace, TUNNEL_GRACE);
 
+        // A config still naming ngrok PARSES — it has to, since the
+        // roster and team commands read this same file — and is
+        // refused at USE, with both replacements to paste.
         write(TunnelSection::Ngrok {
             domain: "clank.ngrok.app".into(),
         });
-        if std::env::var_os("NGROK_AUTHTOKEN").is_none() {
-            let why = err_of(configured(Some(home.path())));
-            assert!(why.contains("authtoken"), "{why}");
-        }
-        std::fs::create_dir_all(home.path().join(".config/ngrok")).unwrap();
-        std::fs::write(
-            home.path().join(".config/ngrok/ngrok.yml"),
-            "version: \"3\"\nauthtoken: tok_123\n",
-        )
-        .unwrap();
-        let (p, _) = configured(Some(home.path())).unwrap().unwrap();
-        assert_eq!(p.reservation().as_deref(), Some("https://clank.ngrok.app"));
-        let cfg = std::fs::read_to_string(home.path().join(".clank/config.json")).unwrap();
+        let why = err_of(configured(Some(home.path())));
+        assert!(why.contains("quick"), "the accountless one: {why}");
         assert!(
-            !cfg.contains("tok_123"),
-            "the token is not in clank's config"
+            why.contains("ngrok\", \"http"),
+            "or ngrok's own agent: {why}"
         );
+        // The rest of the file is still readable, which is the whole
+        // reason the variant stays in the schema.
+        let cfg = crate::cli::team::read_user_config(home.path()).unwrap();
+        assert!(cfg.remote.is_some(), "the config still parses");
     }
 }

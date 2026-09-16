@@ -17,6 +17,7 @@ mod fork_integration;
 mod git_boundary;
 mod html_integration;
 mod no_json_literal_config_writes;
+mod no_ngrok;
 mod open_integration;
 mod pick_integration;
 mod pr_review_integration;

@@ -208,10 +208,6 @@ Configure it once in `~/.clank/config.json` under `remote.tunnel`:
 - `{"provider": "quick"}` — no account, no domain, nothing to
   install. An ephemeral `*.trycloudflare.com` handed out at start,
   spoken natively. Start here.
-- `{"provider": "ngrok", "domain": "you.ngrok.app"}` — a domain you
-  own, through ngrok's SDK, with the authtoken read from
-  `NGROK_AUTHTOKEN` or the ngrok agent's own config file (never
-  clank's).
 - `{"provider": "command", "run": ["ssh", "-R",
   "80:localhost:{port}", "nokey@localhost.run"]}` — any binary that
   forwards this port, with `{port}` substituted. Without a `url` the
@@ -221,6 +217,21 @@ Configure it once in `~/.clank/config.json` under `remote.tunnel`:
   link first. With a `url` (`"https://clank.example.com"`, a named
   cloudflared tunnel) the hostname is yours and is claimed before
   the child runs.
+
+ngrok has no provider of its own — it wanted an account before
+anything worked, and a reserved domain on top of that — but its agent
+is a binary that forwards a port like any other:
+
+```json
+"tunnel": { "provider": "command",
+            "run": ["ngrok", "http", "--url", "https://you.ngrok.app", "{port}"],
+            "url": "https://you.ngrok.app" }
+```
+
+The `url` is not decoration. The agent writes its endpoint to its own
+terminal UI rather than to stdout, so without it clank would wait for
+a line that never comes; naming the domain on both sides claims the
+endpoint instead of reading one.
 
 A hostname you own is leased before its connector starts, because a
 second connector against it would be routed to by the edge before
