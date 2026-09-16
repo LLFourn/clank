@@ -281,7 +281,18 @@ pub(super) fn render_at(
     }
 
     let mut out: Vec<String> = Vec::with_capacity(rows);
-    out.push(bar(snap, color, cols, view.reach, view.remote));
+    // The panel — and with it the remote row — is drawn only for a
+    // non-empty roster. Read from the same fact the panel reads, here,
+    // so the two cannot drift apart.
+    let remote_in_body = !snap.agents.is_empty();
+    out.push(bar(
+        snap,
+        color,
+        cols,
+        view.reach,
+        view.remote,
+        remote_in_body,
+    ));
 
     // The SCROLLABLE header (everything between the pinned bar and the
     // log region), built in FULL by [`scrollable_header`] so the loop
@@ -1058,6 +1069,11 @@ pub(super) fn bar(
     cols: usize,
     reach: crate::cli::status_tui::zellij::ZellijReach,
     remote: crate::cli::status_tui::remote::Shown,
+    // The panel is drawn only for a non-empty roster, and the remote
+    // row lives in it. Derived at the ONE place that knows, rather
+    // than re-derived here from the roster, so the bar cannot come to
+    // disagree with what is actually on screen.
+    remote_in_body: bool,
 ) -> String {
     let (left, right) = bar_text(snap);
     // The instruments own the LAST cells of the bar — their width plus
@@ -1065,12 +1081,21 @@ pub(super) fn bar(
     // they never displace the lamp: always in the same place, which is
     // what makes them readable at a glance. Measured, not assumed
     // (codex on d855068).
-    let items = cluster(reach, remote);
-    let reserve = items
-        .iter()
-        .map(|(text, _)| display_width(text) + 1)
-        .sum::<usize>()
-        + 1;
+    let items = cluster(reach, remote, remote_in_body);
+    // NO instruments, no margin and no band: the trailing `+ 1` is the
+    // gap AFTER the last one, and with none it was an empty patch that
+    // cost the bar a cell — dropping the right segment at widths where
+    // it fits (the-bar-does-not-repeat-the-body).
+    let reserve = match items.is_empty() {
+        true => 0,
+        false => {
+            items
+                .iter()
+                .map(|(text, _)| display_width(text) + 1)
+                .sum::<usize>()
+                + 1
+        }
+    };
     // A pane too narrow to hold the lamp AND the instruments keeps the
     // lamp: the instruments are secondary, and a bar that overflows
     // its pane is worse than one missing them.
@@ -1093,9 +1118,12 @@ pub(super) fn bar(
     // own hue as a FOREGROUND: a hue painted as a background was a
     // patch on the lamp, and a hue matching the lamp's would vanish
     // (lloyd on 49f522f).
-    let mut band = format!("\x1b[0;{BAND_BG}m ");
-    for (text, hue) in &items {
-        band.push_str(&format!("\x1b[1;{}m{text}\x1b[0;{BAND_BG}m ", hue.sgr()));
+    let mut band = String::new();
+    if !items.is_empty() {
+        band.push_str(&format!("\x1b[0;{BAND_BG}m "));
+        for (text, hue) in &items {
+            band.push_str(&format!("\x1b[1;{}m{text}\x1b[0;{BAND_BG}m ", hue.sgr()));
+        }
     }
     format!("\x1b[1;7;{color}m{body}\x1b[0m{band}\x1b[0m")
 }
@@ -1112,14 +1140,26 @@ const BAND_BG: &str = "48;5;238";
 pub(super) fn cluster(
     reach: crate::cli::status_tui::zellij::ZellijReach,
     remote: crate::cli::status_tui::remote::Shown,
+    // Whether the BODY is drawing the remote row this frame.
+    remote_in_body: bool,
 ) -> Vec<(String, crate::cli::status_tui::derive::Hue)> {
     use crate::cli::status_tui::derive::Hue;
     use crate::cli::status_tui::zellij::ZellijReach;
     let mut items = Vec::new();
+    // An ALARM: drawn only when something is wrong, and said nowhere
+    // else, so it earns the cells whatever the body is doing.
     if matches!(reach, ZellijReach::NotInSession | ZellijReach::Unreachable) {
         items.push(("! zellij".to_string(), Hue::Red));
     }
-    items.push((REMOTE_ICON.to_string(), remote_hue(remote)));
+    // A STATUS, and the body says it in words with its URL or its
+    // reason. A lamp beside that is a worse copy of a better row, paid
+    // for twice: it costs the cells, and the reserve it takes is
+    // subtracted from the width the bar's own text gets. The one case
+    // it is not a copy is the one where the body draws no row at all
+    // (the-bar-does-not-repeat-the-body).
+    if !remote_in_body {
+        items.push((REMOTE_ICON.to_string(), remote_hue(remote)));
+    }
     items
 }
 
@@ -4639,7 +4679,9 @@ mod tests {
             (NotInSession, true),
             (Unreachable, true),
         ] {
-            let line = bar(&s, &color, 40, reach, Default::default());
+            // `false`: the body draws no remote row here, so the lamp
+            // is carried and this test's tail assertion still holds.
+            let line = bar(&s, &color, 40, reach, Default::default(), false);
             let v = visible_untrimmed(&line);
             assert_eq!(v.contains("! zellij"), warns, "{reach:?}: `{v}`");
             assert!(v.ends_with(&format!("{REMOTE_ICON} ")), "{reach:?}: `{v}`");
@@ -4669,19 +4711,22 @@ mod tests {
         use crate::cli::status_tui::zellij::ZellijReach::*;
         let s = snap(vec![plan_state("foo", reviewer_missing("codex"))], vec![]);
         for reach in [Connected, NotInSession, Unknown, Unreachable] {
-            for cols in [4, 8, 12, 20, 40, 80] {
-                let v = visible_untrimmed(&bar(
-                    &s,
-                    &state_color(&s).sgr(),
-                    cols,
-                    reach,
-                    Default::default(),
-                ));
-                assert_eq!(
-                    display_width(&v),
-                    cols,
-                    "{reach:?} at {cols} cols renders `{v}`"
-                );
+            for in_body in [false, true] {
+                for cols in [4, 8, 12, 20, 40, 80] {
+                    let v = visible_untrimmed(&bar(
+                        &s,
+                        &state_color(&s).sgr(),
+                        cols,
+                        reach,
+                        Default::default(),
+                        in_body,
+                    ));
+                    assert_eq!(
+                        display_width(&v),
+                        cols,
+                        "{reach:?} at {cols} cols (in_body {in_body}) renders `{v}`"
+                    );
+                }
             }
         }
     }
@@ -5076,15 +5121,129 @@ mod tests {
         }
     }
 
-    /// The remote is one icon in its state's hue, the last thing on the
-    /// bar, the bar exactly `cols` wide around it.
+    /// An empty cluster owns no cell. The trailing margin is the gap
+    /// AFTER the last instrument, so with none it was an empty
+    /// dark-gray patch that cost the bar a column — and at the exact
+    /// width where the right segment just fits, that column was what
+    /// dropped it (the-bar-does-not-repeat-the-body).
     #[test]
-    fn the_cloud_is_coloured_by_the_remotes_state() {
-        use crate::cli::status_tui::derive::Hue;
+    fn an_empty_cluster_costs_the_bar_nothing() {
+        use crate::cli::status_tui::remote::Shown;
+        use crate::cli::status_tui::zellij::ZellijReach::Connected;
+        let s = snap(vec![plan_state("foo", reviewer_missing("codex"))], vec![]);
+        let color = state_color(&s).sgr();
+        let (left, right) = bar_text(&s);
+        assert!(!right.is_empty(), "this fixture has a right segment");
+
+        // The narrowest width that holds left + a two-column gap +
+        // right. With the patch still reserved, one more was needed.
+        let exact = display_width(&left) + 2 + display_width(&right);
+        let line = bar(&s, &color, exact, Connected, Shown::On, true);
+        let v = visible_untrimmed(&line);
+        assert_eq!(display_width(&v), exact);
+        assert!(
+            v.contains(&right),
+            "the right segment fits at exactly its own width: {v:?}"
+        );
+
+        // And nothing of the instrument band is painted.
+        assert!(
+            !line.contains(BAND_BG),
+            "an empty cluster paints no band: {line:?}"
+        );
+        assert!(!v.contains(REMOTE_ICON), "and no lamp: {v:?}");
+
+        // The band comes back the moment there IS an instrument, and
+        // then it owns its margin again.
+        let alarmed = bar(
+            &s,
+            &color,
+            exact,
+            crate::cli::status_tui::zellij::ZellijReach::NotInSession,
+            Shown::On,
+            true,
+        );
+        assert!(alarmed.contains(BAND_BG), "an alarm still gets its band");
+        assert_eq!(
+            display_width(&visible_untrimmed(&alarmed)),
+            exact,
+            "and still exactly fills the pane"
+        );
+    }
+
+    /// The claim the removal rests on: with a roster, the body names
+    /// the remote's state AND where it is, in words. Without one, the
+    /// panel is not drawn at all — which is why the lamp is kept there.
+    #[test]
+    fn the_body_says_what_the_lamp_did_whenever_it_draws_at_all() {
+        use crate::cli::status_tui::remote::Shown;
+        let mut s = two_agent_snap();
+        let mut view = PanelView::just(Mode::LogScroll);
+        view.remote = Shown::On;
+        view.remote_detail = Some("https://x.trycloudflare.com");
+        let page = render_at(&s, 40, 80, 0, 0, &view).0.join("\n");
+        let text = page.lines().map(visible).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("remote"), "the row is drawn: {text}");
+        assert!(
+            text.contains("https://x.trycloudflare.com"),
+            "in WORDS, with where it is — which a glyph cannot say: {text}"
+        );
+        // A failure reads the same way, which is the other thing the
+        // lamp could only hint at with a colour.
+        view.remote = Shown::Failed;
+        view.remote_detail = Some("the tunnel's name never appeared in DNS");
+        let failed = render_at(&s, 40, 80, 0, 0, &view)
+            .0
+            .iter()
+            .map(|l| visible(l))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(failed.contains("never appeared in DNS"), "{failed}");
+
+        // …and because the row is there, the bar spends no cells
+        // repeating it. Read off the WHOLE render, so the call site's
+        // own derivation is what is under test, not a flag handed to
+        // `bar` by a test.
+        let bar_line = visible(&render_at(&s, 40, 80, 0, 0, &view).0[0]);
+        assert!(
+            !bar_line.contains(REMOTE_ICON),
+            "the bar repeats a row the body drew: {bar_line}"
+        );
+
+        // With no roster the panel is absent, so there is no row to
+        // repeat — and that is exactly when the lamp is kept.
+        s.agents.clear();
+        let bare = render_at(&s, 40, 80, 0, 0, &view)
+            .0
+            .iter()
+            .map(|l| visible(l))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !bare.contains("never appeared in DNS"),
+            "no panel, so no row: {bare}"
+        );
+        let bare_bar = visible(&render_at(&s, 40, 80, 0, 0, &view).0[0]);
+        assert!(
+            bare_bar.contains(REMOTE_ICON),
+            "with nothing below to say it, the bar must: {bare_bar}"
+        );
+    }
+
+    /// The lamp is drawn only when the BODY is not drawing the remote
+    /// row. With a roster the row says the state in words, with its URL
+    /// or its failure reason, so a coloured glyph beside it is a worse
+    /// copy of a better row — and one paid for twice, since the cells
+    /// it reserves come off the width the bar's own text gets. With no
+    /// roster the panel is not drawn at all, and then the lamp is the
+    /// only thing that says anything (the-bar-does-not-repeat-the-body).
+    #[test]
+    fn the_lamp_is_drawn_only_when_the_body_has_no_row_for_it() {
         use crate::cli::status_tui::remote::Shown::*;
         use crate::cli::status_tui::zellij::ZellijReach::Connected;
         let s = snap(vec![plan_state("foo", reviewer_missing("codex"))], vec![]);
         assert_eq!(display_width(REMOTE_ICON), 1, "one cell, measured");
+
         for (remote, want) in [
             (Off, Hue::Indexed(245)),
             (Starting, Hue::Yellow),
@@ -5094,7 +5253,9 @@ mod tests {
         ] {
             assert_eq!(remote_hue(remote), want, "{remote:?}");
             for cols in [8, 12, 20, 40, 80] {
-                let line = bar(&s, &state_color(&s).sgr(), cols, Connected, remote);
+                // The body draws no row: the lamp is there, in its
+                // own hue, in the last cells.
+                let line = bar(&s, &state_color(&s).sgr(), cols, Connected, remote, false);
                 let v = visible_untrimmed(&line);
                 assert_eq!(display_width(&v), cols, "{remote:?} at {cols}: `{v}`");
                 assert!(
@@ -5105,7 +5266,44 @@ mod tests {
                     line.contains(&format!("\x1b[1;{}m{REMOTE_ICON}", want.sgr())),
                     "{remote:?}: its own hue as a foreground: {line:?}"
                 );
+
+                // The body draws the row: no lamp at all.
+                let with_body = bar(&s, &state_color(&s).sgr(), cols, Connected, remote, true);
+                assert!(
+                    !visible_untrimmed(&with_body).contains(REMOTE_ICON),
+                    "{remote:?} at {cols} repeats the body: {:?}",
+                    visible_untrimmed(&with_body)
+                );
             }
+        }
+
+        // And with a roster the bar does not vary with remote state at
+        // all — no cell of it is spent on something said below.
+        let bars: Vec<String> = [Off, Starting, Stopping, On, Failed]
+            .into_iter()
+            .map(|r| visible_untrimmed(&bar(&s, &state_color(&s).sgr(), 40, Connected, r, true)))
+            .collect();
+        assert!(
+            bars.windows(2).all(|w| w[0] == w[1]),
+            "the bar changes with a state the body owns: {bars:?}"
+        );
+
+        // The zellij ALARM is not a status and stays either way: it is
+        // drawn only when something is wrong, and said nowhere else.
+        use crate::cli::status_tui::zellij::ZellijReach::NotInSession;
+        for in_body in [false, true] {
+            let v = visible_untrimmed(&bar(
+                &s,
+                &state_color(&s).sgr(),
+                40,
+                NotInSession,
+                Off,
+                in_body,
+            ));
+            assert!(
+                v.contains("! zellij"),
+                "alarm kept (in_body {in_body}): {v}"
+            );
         }
     }
 
@@ -5114,12 +5312,15 @@ mod tests {
     fn a_bar_too_narrow_for_the_indicator_keeps_the_lamp() {
         use crate::cli::status_tui::zellij::ZellijReach::Connected;
         let s = snap(vec![], vec![]);
+        // No roster, so the lamp WOULD be carried — which is what
+        // makes this the case where the pane has to refuse it.
         let v = visible(&bar(
             &s,
             &state_color(&s).sgr(),
             3,
             Connected,
             Default::default(),
+            false,
         ));
         assert_eq!(display_width(&v), 3);
         assert!(
