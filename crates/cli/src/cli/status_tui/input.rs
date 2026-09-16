@@ -81,14 +81,22 @@ pub(super) enum Mode {
     AgentPanel { sel: usize },
     /// Choosing a library agent to add; `sel` indexes the freshly-read
     /// candidate list the loop holds.
-    AddPicker {
+    AddPicker { sel: usize },
+    /// The second step of adding a reviewer: WHAT they review.
+    ///
+    /// The tier used to be cycled with `←→` on the picker's rows —
+    /// a choice among more than two, expressed as a hidden multi-key
+    /// control on a row that was asking a different question. The row
+    /// meant "this agent"; the arrows meant something else, and
+    /// nothing on the row said so (one-menu-not-five).
+    AddReviews {
+        /// Index into the loop's candidate list, as `AddPicker` used.
+        candidate: usize,
+        /// The coverage so far, as the roster spells it. Held as the
+        /// SAME type the agent page toggles, so the two surfaces
+        /// cannot mean different things by the same ticks.
+        kind: crate::cli::teams_config::ReviewKind,
         sel: usize,
-        /// The tier the candidate will be added AT, cycled with
-        /// ←/→ before Enter. Held in the mode rather than beside it so
-        /// every construction site — the refresh rebind included —
-        /// has to decide, and a redraw cannot silently reset a choice
-        /// the user already made.
-        tier: crate::cli::teams_config::ReviewKind,
     },
     /// Choosing the agent to swap IN for `out`. Same candidate list as
     /// `AddPicker` — library minus roster is exactly who may replace a
@@ -126,6 +134,19 @@ pub(super) enum Mode {
     /// The remote page (Enter on the remote row): the switch, the
     /// links in, and the token and sessions to revoke.
     RemotePage { sel: usize },
+    /// The token's own page: the credential as content, and the one
+    /// action that changes it. It is not a row on the remote page
+    /// because reading a credential off a pane and rotating it are two
+    /// interactions, and a menu row affords one (one-menu-not-five).
+    TokenPage { scroll: usize },
+    /// The open sessions, each revocable. A list to manage is a page.
+    SessionsPage { sel: usize },
+    /// A queued plan's priority. It used to be a row on the plan page
+    /// changed with `←→` and `PgUp/PgDn`, whose four keys had to be
+    /// taught in the footer because a row cannot teach them. A page
+    /// can say what it does, and can be TYPED into
+    /// (one-menu-not-five).
+    PriorityPage { value: u16 },
     /// A one-line text input on the plan page (force-finish subject,
     /// squash message, block reason, drop type-to-confirm). The BUFFER
     /// lives in the loop's `plan_input` (Mode stays `Copy`); same
@@ -177,6 +198,10 @@ pub(super) enum DetailAction {
     TierFinal,
     /// Promote a reviewer to master (the core also demotes the old one).
     PromoteToMaster,
+    /// The agent's facts, as a document that scrolls: the invocation
+    /// is a configured command line with no bound relative to the
+    /// pane, so it cannot be pinned beside a menu.
+    Info,
     /// Replace this reviewer with another, keeping its role. Opens a
     /// picker: unlike every sibling action it needs a SECOND operand,
     /// since it acts on this agent AND an incoming one.
@@ -200,14 +225,18 @@ pub(super) fn detail_actions(
 ) -> Vec<DetailAction> {
     use crate::cli::teams_config::RosterRole;
     use DetailAction::*;
+    // `Info` is on EVERY role: an invocation is unbounded and cannot
+    // sit on the page beside a menu, so the row that opens it is the
+    // only way to read one (one-menu-not-five).
     let mut actions = match role {
-        RosterRole::Master => vec![ToggleAuto, Swap, Back],
+        RosterRole::Master => vec![ToggleAuto, Info, Swap, Back],
         RosterRole::Commit | RosterRole::Plan | RosterRole::Final | RosterRole::Gate => {
             vec![
                 ToggleAuto,
                 TierCommit,
                 TierPlan,
                 TierFinal,
+                Info,
                 PromoteToMaster,
                 Swap,
                 Remove,
@@ -311,18 +340,105 @@ pub(super) fn plan_actions(st: PlanPageState) -> Vec<PlanAction> {
 /// on this page. `s` stash · `f` force-finish · `c` squash (collapse) ·
 /// `p` purge, or promote on a queued page (the two never share a
 /// page) · `u` unqueue · `o` html — `q` stays global quit.
-pub(super) fn plan_hotkey(key: Key, actions: &[PlanAction]) -> Option<PlanAction> {
+/// The key that names a plan row, for the row to display.
+///
+/// THE source: `plan_hotkey` reads it too, so a row cannot advertise a
+/// key that fires something else. It did — the priority row showed `p`
+/// while `p` opened promote, and hotkeys dispatch before the cursor
+/// does, so the advertised key confirmed a different action entirely
+/// (one-menu-not-five).
+pub(super) fn plan_action_key(a: PlanAction) -> &'static str {
     use PlanAction::*;
-    let wants: &[PlanAction] = match key {
-        Key::Html => &[OpenHtml],
-        Key::Char(b's') => &[Stash],
-        Key::Char(b'f') => &[ForceFinish],
-        Key::Char(b'c') => &[Squash],
-        Key::Char(b'p') => &[Purge, Promote],
-        Key::Char(b'u') => &[Unqueue],
+    match a {
+        OpenHtml => "o",
+        Stash => "s",
+        ForceFinish => "f",
+        Squash => "c",
+        Purge => "p",
+        Promote => "p",
+        Unqueue => "u",
+        // Not `p`: purge and promote have it, and a queued page offers
+        // promote beside this very row.
+        Priority => "v",
+        // Reached by `esc`, which the hint carries; it has no letter
+        // of its own to advertise.
+        Back => "esc",
+    }
+}
+
+pub(super) fn plan_hotkey(key: Key, actions: &[PlanAction]) -> Option<PlanAction> {
+    let want = match key {
+        Key::Html => "o",
+        Key::Char(c) => {
+            let s = [c];
+            match std::str::from_utf8(&s) {
+                Ok(_) => match c {
+                    b's' | b'f' | b'c' | b'p' | b'u' | b'v' => match c {
+                        b's' => "s",
+                        b'f' => "f",
+                        b'c' => "c",
+                        b'p' => "p",
+                        b'u' => "u",
+                        _ => "v",
+                    },
+                    _ => return None,
+                },
+                Err(_) => return None,
+            }
+        }
+        _ => return None,
+    };
+    // `p` names two rows, and only one of them is ever on a page.
+    actions
+        .iter()
+        .copied()
+        .find(|a| plan_action_key(*a) == want)
+}
+
+/// A key pressed on the agent page → the row it belongs to, when that
+/// row is on this page.
+///
+/// The agent page had no row keys at all while the plan and event pages
+/// bound theirs, which is half of why the three looked like three
+/// different products (one-menu-not-five). Same shape as
+/// [`plan_hotkey`]: a key names rows, and only a row actually present
+/// answers.
+pub(super) fn detail_hotkey(key: Key, actions: &[DetailAction]) -> Option<DetailAction> {
+    use DetailAction::*;
+    let wants: &[DetailAction] = match key {
+        // NOT `a`, which is this TUI's back key everywhere — including
+        // three lines below, where the agent page reads it as Back.
+        Key::Char(b't') => &[ToggleAuto],
+        Key::Char(b'c') => &[TierCommit],
+        Key::Char(b'p') => &[TierPlan],
+        Key::Char(b'f') => &[TierFinal],
+        Key::Char(b'm') => &[PromoteToMaster],
+        Key::Char(b's') => &[Swap],
+        Key::Char(b'i') => &[Info],
+        Key::Char(b'r') => &[Reopen],
+        Key::Char(b'x') => &[Remove],
         _ => return None,
     };
     wants.iter().copied().find(|w| actions.contains(w))
+}
+
+/// The key that names a row on the agent page, for the row to display.
+/// The binding above and this label are ONE fact; a row whose key does
+/// nothing is worse than a row with no key.
+pub(super) fn detail_action_key(a: DetailAction) -> &'static str {
+    use DetailAction::*;
+    match a {
+        ToggleAuto => "t",
+        TierCommit => "c",
+        TierPlan => "p",
+        TierFinal => "f",
+        PromoteToMaster => "m",
+        Swap => "s",
+        Info => "i",
+        Reopen => "r",
+        Remove => "x",
+        Back => "esc",
+    }
 }
 
 /// One keypress on the plan page → what the loop should do.
@@ -330,9 +446,10 @@ pub(super) fn plan_hotkey(key: Key, actions: &[PlanAction]) -> Option<PlanAction
 pub(super) enum PlanNav {
     Sel(usize),
     Act(PlanAction),
-    /// Change the queued plan's priority by `delta`; the loop clamps to
-    /// 0–999 and writes through `queue::set_priority`.
-    Priority(i32),
+    /// Open the priority page. The value is not changed here: four
+    /// keys on a row have to be taught in the footer, and a page can
+    /// say what it does (one-menu-not-five).
+    Priority,
     /// Scroll the plan-document body below the buttons (↑↓ stay on
     /// button selection; paging keys own the document).
     Scroll(i32),
@@ -357,11 +474,9 @@ pub(super) fn plan_detail_nav(
     // to activate. Everywhere else those keys keep their page meaning.
     let on_value = actions.get(sel) == Some(&PlanAction::Priority);
     match key {
-        Key::Left if on_value => PlanNav::Priority(-10),
-        Key::Right | Key::Space if on_value => PlanNav::Priority(10),
-        Key::PageUp if on_value => PlanNav::Priority(-100),
-        Key::PageDown if on_value => PlanNav::Priority(100),
-        Key::Enter if on_value => PlanNav::None,
+        // The priority row is an ACTION now: it opens the page that
+        // owns the number, so it needs no keys of its own.
+        Key::Enter if on_value => PlanNav::Priority,
         // The options→document crossing mirrors the panel↔log model:
         // ↓ walks the buttons, then moves FOCUS into the document —
         // where no button is highlighted and Enter has no target —
@@ -405,13 +520,6 @@ pub(super) fn resolve_queued<'a, T>(
     let mut same_name = items.iter().filter(|i| key(i).0 == name);
     let only = same_name.next()?;
     same_name.next().is_none().then_some(only)
-}
-
-/// A queued plan's next priority after a value-row keystroke: the
-/// range is the queue's own (`000`–`999` file prefixes), so the ends
-/// absorb rather than wrap or error.
-pub(super) fn next_priority(current: u16, delta: i32) -> u16 {
-    (i32::from(current) + delta).clamp(0, 999) as u16
 }
 
 /// The plan page's cursor position for the DOCUMENT: one past the
@@ -572,27 +680,6 @@ pub(super) fn tier_boxes(kind: crate::cli::teams_config::ReviewKind) -> (bool, b
         Final => (false, false, true),
         Gate => (false, true, true),
     }
-}
-
-/// Step the add-picker's tier. ←/→ already mean "cycle the selected
-/// toggle" on the detail page, so they carry the same meaning here.
-///
-/// The ORDER is the review pipeline — commit, plan, final, then gate
-/// (which is both plan and final) — so stepping reads as widening
-/// scope rather than as an arbitrary rotation.
-pub(super) fn tier_cycle(
-    tier: crate::cli::teams_config::ReviewKind,
-    forward: bool,
-) -> crate::cli::teams_config::ReviewKind {
-    use crate::cli::teams_config::ReviewKind::*;
-    const ORDER: [crate::cli::teams_config::ReviewKind; 4] = [Commit, Plan, Final, Gate];
-    let at = ORDER.iter().position(|k| *k == tier).unwrap_or(0);
-    let next = if forward {
-        (at + 1) % ORDER.len()
-    } else {
-        (at + ORDER.len() - 1) % ORDER.len()
-    };
-    ORDER[next]
 }
 
 /// The reviewer tier after toggling one checkbox — `None` = no-op.
@@ -853,35 +940,44 @@ pub(super) enum RemoteAction {
     Open,
     /// A link for the phone, as a QR; only while on.
     Phone,
-    /// The token, shown for reading off and pasting. Backspace
-    /// rotates it, which is the credential's own revocation.
+    /// Opens the token page. The credential itself is not a row: it
+    /// used to wrap its own characters into this list, so selectable
+    /// and unselectable lines shared one sequence with only the
+    /// selection band to tell them apart (one-menu-not-five).
     Token,
-    /// An open session, by the hash the file keeps.
-    Session(String),
-    Back,
+    /// Opens the sessions page. Each open session used to be a row
+    /// here, pushing its own heading into the menu.
+    Sessions,
 }
 
 /// The remote page's rows. The two links are ABSENT while the
 /// remote is off rather than shown and inert: there is no URL to
 /// link into. The token is always there — it is the same token
 /// whether the remote is up or not.
-pub(super) fn remote_actions(
-    on: bool,
-    sessions: &[crate::cli::web::door::SessionRecord],
-) -> Vec<RemoteAction> {
+pub(super) fn remote_actions(on: bool) -> Vec<RemoteAction> {
     let mut out = vec![RemoteAction::Switch];
     if on {
         out.push(RemoteAction::Open);
         out.push(RemoteAction::Phone);
     }
     out.push(RemoteAction::Token);
-    out.extend(
-        sessions
-            .iter()
-            .map(|s| RemoteAction::Session(s.id_hash.clone())),
-    );
-    out.push(RemoteAction::Back);
+    out.push(RemoteAction::Sessions);
+    // No `back` row: `esc` is already the way out and already in the
+    // hint, and a row that duplicates a key is a row that can be
+    // selected by accident.
     out
+}
+
+/// The key that names a remote row, for the row to display. The
+/// binding below and this label are ONE fact.
+pub(super) fn remote_action_key(a: &RemoteAction) -> &'static str {
+    match a {
+        RemoteAction::Switch => "r",
+        RemoteAction::Open => "o",
+        RemoteAction::Phone => "p",
+        RemoteAction::Token => "t",
+        RemoteAction::Sessions => "s",
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -891,33 +987,206 @@ pub(super) enum RemoteNav {
     Back,
     MoveCursor(usize),
     Activate(RemoteAction),
-    /// Backspace on the token or a session row: the one destructive
-    /// key, on the rows it applies to. Enter there is nothing, so a
-    /// row cannot be revoked by selecting it.
-    Revoke(RemoteAction),
 }
 
 pub(super) fn remote_page_nav(sel: usize, actions: &[RemoteAction], key: Key) -> RemoteNav {
-    let current = actions.get(sel).cloned().unwrap_or(RemoteAction::Back);
-    let has = |a: RemoteAction| actions.contains(&a);
+    let current = actions.get(sel).cloned();
+    let hotkey = |k: &'static str| actions.iter().find(|a| remote_action_key(a) == k).cloned();
     match key {
         Key::Quit => RemoteNav::Quit,
         Key::Escape | Key::Focus | Key::Char(b'a') => RemoteNav::Back,
         Key::Up => RemoteNav::MoveCursor(move_selection(sel, actions.len(), false)),
         Key::Down => RemoteNav::MoveCursor(move_selection(sel, actions.len(), true)),
         Key::Enter => match current {
-            RemoteAction::Token | RemoteAction::Session(_) => RemoteNav::None,
-            RemoteAction::Back => RemoteNav::Back,
-            a => RemoteNav::Activate(a),
+            Some(a) => RemoteNav::Activate(a),
+            None => RemoteNav::None,
         },
-        Key::Space | Key::Char(b'r') => RemoteNav::Activate(RemoteAction::Switch),
-        Key::Html if has(RemoteAction::Open) => RemoteNav::Activate(RemoteAction::Open),
-        Key::Char(b'p') if has(RemoteAction::Phone) => RemoteNav::Activate(RemoteAction::Phone),
-        Key::Delete => match current {
-            RemoteAction::Token | RemoteAction::Session(_) => RemoteNav::Revoke(current),
-            _ => RemoteNav::None,
+        // Every row's key fires it from anywhere. `Space` ticks the
+        // switch, which is the page's one checkbox.
+        Key::Space => RemoteNav::Activate(RemoteAction::Switch),
+        Key::Html => match hotkey("o") {
+            Some(a) => RemoteNav::Activate(a),
+            None => RemoteNav::None,
+        },
+        Key::Char(c) => match hotkey(match c {
+            b'r' => "r",
+            b'p' => "p",
+            b't' => "t",
+            b's' => "s",
+            _ => return RemoteNav::None,
+        }) {
+            Some(a) => RemoteNav::Activate(a),
+            None => RemoteNav::None,
         },
         _ => RemoteNav::None,
+    }
+}
+
+/// The rows of the "what do they review" step: the same three
+/// checkboxes the agent page has, then the row that commits.
+pub(super) fn add_review_rows() -> Vec<DetailAction> {
+    vec![
+        DetailAction::TierCommit,
+        DetailAction::TierPlan,
+        DetailAction::TierFinal,
+    ]
+}
+
+/// What one key does on that step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AddReviewNav {
+    None,
+    Quit,
+    /// Back to choosing WHO, with nothing written.
+    Back,
+    MoveCursor(usize),
+    /// Tick a box; the exclusivity is the roster's, not this page's.
+    Toggle(DetailAction),
+    /// Add them, with the coverage as it stands.
+    Confirm,
+}
+
+pub(super) fn add_review_nav(sel: usize, key: Key) -> AddReviewNav {
+    let rows = add_review_rows();
+    match key {
+        Key::Quit => AddReviewNav::Quit,
+        Key::Escape | Key::Focus | Key::Char(b'a') | Key::Left => AddReviewNav::Back,
+        Key::Up => AddReviewNav::MoveCursor(move_selection(sel, rows.len(), false)),
+        Key::Down => AddReviewNav::MoveCursor(move_selection(sel, rows.len(), true)),
+        Key::Space | Key::Right => match rows.get(sel) {
+            Some(a) => AddReviewNav::Toggle(*a),
+            None => AddReviewNav::None,
+        },
+        // The row keys are the agent page's, so the two steps are
+        // learned once.
+        Key::Char(c) => match rows
+            .iter()
+            .find(|a| detail_action_key(**a).as_bytes() == [c])
+        {
+            Some(a) => AddReviewNav::Toggle(*a),
+            None => AddReviewNav::None,
+        },
+        Key::Enter => AddReviewNav::Confirm,
+        _ => AddReviewNav::None,
+    }
+}
+
+/// What one key does on the priority page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PriorityNav {
+    None,
+    Quit,
+    /// Leave WITHOUT writing: the value is committed on Enter, so a
+    /// half-typed number does not become the plan's priority.
+    Cancel,
+    /// Write `value` and go back.
+    Commit(u16),
+    /// The value as it now reads, after a nudge or a digit.
+    Set(u16),
+}
+
+/// Priorities are 0–999, which is what `queue::set_priority` accepts.
+pub(super) const PRIORITY_MAX: u16 = 999;
+
+pub(super) fn priority_page_nav(value: u16, key: Key) -> PriorityNav {
+    let step = |by: i32| PriorityNav::Set((value as i32 + by).clamp(0, PRIORITY_MAX as i32) as u16);
+    match key {
+        Key::Quit => PriorityNav::Quit,
+        Key::Escape | Key::Focus | Key::Char(b'a') => PriorityNav::Cancel,
+        Key::Enter => PriorityNav::Commit(value),
+        Key::Left | Key::Minus => step(-10),
+        Key::Right | Key::Plus => step(10),
+        Key::PageUp => step(-100),
+        Key::PageDown => step(100),
+        Key::Up => step(1),
+        Key::Down => step(-1),
+        // Typed, digit by digit, which is why this is a page: a number
+        // you can say outright beats one you have to walk to.
+        Key::Char(c) if c.is_ascii_digit() => {
+            let next = value as u32 * 10 + u32::from(c - b'0');
+            PriorityNav::Set(next.min(PRIORITY_MAX as u32) as u16)
+        }
+        Key::Delete => PriorityNav::Set(value / 10),
+        _ => PriorityNav::None,
+    }
+}
+
+/// The page a remote row opens, if it opens one.
+///
+/// Named rather than inlined so the frame can ask which modes READ THE
+/// DOOR and get an answer that cannot drift from the rows: a page
+/// opened from here without its data shows a blank credential and an
+/// empty session list, which is what happened.
+pub(super) fn remote_destination(a: &RemoteAction) -> Option<Mode> {
+    match a {
+        RemoteAction::Token => Some(Mode::TokenPage { scroll: 0 }),
+        RemoteAction::Sessions => Some(Mode::SessionsPage { sel: 0 }),
+        RemoteAction::Switch | RemoteAction::Open | RemoteAction::Phone => None,
+    }
+}
+
+/// Whether this mode needs the door read for its frame.
+pub(super) fn reads_the_door(mode: Mode) -> bool {
+    matches!(
+        mode,
+        Mode::RemotePage { .. } | Mode::TokenPage { .. } | Mode::SessionsPage { .. }
+    )
+}
+
+/// What one key does on the token page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TokenNav {
+    None,
+    Quit,
+    Back,
+    /// Mint a new credential. The old one stops working and every
+    /// session it opened ends, which is why it is the destructive row.
+    Rotate,
+    /// A signed step. The LOOP clamps it against the extent the last
+    /// render reported, the way the plan document does: a page that
+    /// stored its own unbounded offset would let Down at the bottom
+    /// pile up invisible overscroll that Up then has to spend.
+    Scroll(i32),
+}
+
+pub(super) fn token_page_nav(key: Key) -> TokenNav {
+    match key {
+        Key::Quit => TokenNav::Quit,
+        Key::Escape | Key::Focus | Key::Char(b'a') | Key::Left => TokenNav::Back,
+        // Enter AND the row's own key: it is the only row, so there is
+        // nothing to select and nothing to disambiguate.
+        Key::Enter | Key::Char(b'x') => TokenNav::Rotate,
+        // A credential plus its instructions can outgrow any pane, and
+        // the exact characters are the whole point of the page.
+        Key::Up => TokenNav::Scroll(-1),
+        Key::Down => TokenNav::Scroll(1),
+        Key::PageUp => TokenNav::Scroll(-10),
+        Key::PageDown => TokenNav::Scroll(10),
+        _ => TokenNav::None,
+    }
+}
+
+/// What one key does on the sessions page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum SessionsNav {
+    None,
+    Quit,
+    Back,
+    MoveCursor(usize),
+    /// Backspace on a session. Enter does NOTHING here: a session must
+    /// not be revocable by selecting it and pressing the key that
+    /// means "go".
+    Revoke(usize),
+}
+
+pub(super) fn sessions_page_nav(sel: usize, count: usize, key: Key) -> SessionsNav {
+    match key {
+        Key::Quit => SessionsNav::Quit,
+        Key::Escape | Key::Focus | Key::Char(b'a') | Key::Left => SessionsNav::Back,
+        Key::Up => SessionsNav::MoveCursor(move_selection(sel, count, false)),
+        Key::Down => SessionsNav::MoveCursor(move_selection(sel, count, true)),
+        Key::Delete if sel < count => SessionsNav::Revoke(sel),
+        _ => SessionsNav::None,
     }
 }
 
@@ -940,7 +1209,14 @@ pub(super) fn agent_detail_nav(sel: usize, actions: &[DetailAction], key: Key) -
         Key::Left | Key::Right | Key::Space if is_toggle(current()) => {
             DetailNav::Activate(current())
         }
-        _ => DetailNav::None,
+        // A row's key fires that row, wherever the cursor is. The plan
+        // and event pages always worked this way; this page did not,
+        // which is why its rows showed no keys to fire
+        // (one-menu-not-five).
+        _ => match detail_hotkey(key, actions) {
+            Some(a) => DetailNav::Activate(a),
+            None => DetailNav::None,
+        },
     }
 }
 
@@ -2055,67 +2331,147 @@ mod tests {
         assert_eq!(plan_hotkey(Key::Char(b'u'), &active), None);
     }
 
-    /// The priority row is a VALUE: the change keys act on it in
-    /// place and Enter has nothing to activate; on every other row the
-    /// paging keys keep scrolling the document.
+    /// Every key a plan row ADVERTISES fires that row. The priority
+    /// row showed `p` while `p` opened promote, and hotkeys dispatch
+    /// before the cursor does, so the advertised key confirmed a
+    /// different action entirely — on a page where the neighbouring
+    /// rows are purge and promote (one-menu-not-five).
     #[test]
-    fn the_priority_row_is_a_value_control() {
+    fn every_plan_key_fires_the_row_that_shows_it() {
+        let states = [
+            PlanPageState::Queued { priority: 500 },
+            PlanPageState::Active { repo_paused: false },
+            PlanPageState::Finished { multi_commit: true },
+        ];
+        for st in states {
+            let actions = plan_actions(st);
+            for a in &actions {
+                let shown = plan_action_key(*a);
+                if shown == "esc" {
+                    continue; // reached by esc, advertises no letter
+                }
+                let key = match shown {
+                    "o" => Key::Html,
+                    k => Key::Char(k.as_bytes()[0]),
+                };
+                assert_eq!(
+                    plan_hotkey(key, &actions),
+                    Some(*a),
+                    "{a:?} shows `{shown}` but that key fires {:?} in {st:?}",
+                    plan_hotkey(key, &actions)
+                );
+            }
+            // And no two rows ON THE SAME PAGE claim one key, which is
+            // what makes the check above decidable.
+            let mut keys: Vec<&str> = actions.iter().map(|a| plan_action_key(*a)).collect();
+            keys.retain(|k| *k != "esc");
+            let mut sorted = keys.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            assert_eq!(
+                sorted.len(),
+                keys.len(),
+                "duplicate key in {st:?}: {keys:?}"
+            );
+        }
+    }
+
+    /// Walking down past the last row enters the document, and `↑` at
+    /// its first line comes back out onto that row. Only inside does
+    /// `↑` scroll (the-plan-page-cursor-enters-the-document,
+    /// one-menu-not-five).
+    #[test]
+    fn the_document_is_entered_and_left_through_its_top() {
+        let actions = plan_actions(PlanPageState::Active { repo_paused: false });
+        let last = actions.len() - 1;
+        let doc = document_focus(&actions);
+        assert_eq!(doc, actions.len(), "one past the last row is the document");
+
+        // Down off the last row enters it.
+        assert_eq!(
+            plan_detail_nav(last, &actions, Key::Down, 10, 0),
+            PlanNav::Sel(doc)
+        );
+        // Down again scrolls, rather than walking further.
+        assert_eq!(
+            plan_detail_nav(doc, &actions, Key::Down, 10, 0),
+            PlanNav::Scroll(1)
+        );
+        // Up inside scrolls back.
+        assert_eq!(
+            plan_detail_nav(doc, &actions, Key::Up, 10, 5),
+            PlanNav::Scroll(-1)
+        );
+        // Up AT THE TOP leaves, landing on the last row — not
+        // swallowed, and not left with `esc back` lit for the whole
+        // read.
+        assert_eq!(
+            plan_detail_nav(doc, &actions, Key::Up, 10, 0),
+            PlanNav::Sel(last)
+        );
+    }
+
+    /// The priority row OPENS a page now. It was a value control with
+    /// four keys — `←→` ±10, `PgUp/PgDn` ±100 — none of which a row
+    /// can teach, so they lived in the footer. On a page they can be
+    /// said out loud, and the number can simply be typed
+    /// (one-menu-not-five).
+    #[test]
+    fn the_priority_row_opens_its_page() {
         let actions = plan_actions(PlanPageState::Queued { priority: 500 });
         let prio = actions
             .iter()
             .position(|a| *a == PlanAction::Priority)
             .unwrap();
         assert_eq!(
-            plan_detail_nav(prio, &actions, Key::Right, 10, 0),
-            PlanNav::Priority(10)
+            plan_detail_nav(prio, &actions, Key::Enter, 10, 0),
+            PlanNav::Priority,
+            "enter opens the page"
         );
-        assert_eq!(
-            plan_detail_nav(prio, &actions, Key::Space, 10, 0),
-            PlanNav::Priority(10)
-        );
-        assert_eq!(
-            plan_detail_nav(prio, &actions, Key::Left, 10, 0),
-            PlanNav::Priority(-10)
-        );
+        // And the row's own keys are the document's again, because the
+        // row no longer claims them.
         assert_eq!(
             plan_detail_nav(prio, &actions, Key::PageDown, 10, 0),
-            PlanNav::Priority(100)
-        );
-        assert_eq!(
-            plan_detail_nav(prio, &actions, Key::PageUp, 10, 0),
-            PlanNav::Priority(-100)
-        );
-        assert_eq!(
-            plan_detail_nav(prio, &actions, Key::Enter, 10, 0),
-            PlanNav::None,
-            "a value activates nothing"
-        );
-        // The ends absorb: 999 stays 999, 0 stays 0.
-        assert_eq!(next_priority(995, 10), 999);
-        assert_eq!(next_priority(999, 100), 999);
-        assert_eq!(next_priority(5, -10), 0);
-        assert_eq!(next_priority(500, -100), 400);
-        // Off the value row the keys mean what they always did.
-        assert_eq!(
-            plan_detail_nav(0, &actions, Key::PageDown, 10, 0),
             PlanNav::Scroll(10)
         );
         assert_eq!(
-            plan_detail_nav(0, &actions, Key::Left, 10, 0),
-            PlanNav::None
+            plan_detail_nav(prio, &actions, Key::PageUp, 10, 0),
+            PlanNav::Scroll(-10)
         );
+    }
+
+    /// The page nudges, pages, and takes a typed number. Nothing is
+    /// written until Enter: a half-typed number must not become the
+    /// plan's priority, so leaving cancels.
+    #[test]
+    fn the_priority_page_nudges_or_is_typed() {
+        use PriorityNav::*;
+        assert_eq!(priority_page_nav(500, Key::Right), Set(510));
+        assert_eq!(priority_page_nav(500, Key::Left), Set(490));
+        assert_eq!(priority_page_nav(500, Key::PageDown), Set(600));
+        assert_eq!(priority_page_nav(500, Key::PageUp), Set(400));
+        assert_eq!(priority_page_nav(500, Key::Up), Set(501));
+        assert_eq!(priority_page_nav(500, Key::Down), Set(499));
+        // The ends absorb.
+        assert_eq!(priority_page_nav(995, Key::Right), Set(PRIORITY_MAX));
+        assert_eq!(priority_page_nav(999, Key::PageDown), Set(PRIORITY_MAX));
+        assert_eq!(priority_page_nav(5, Key::Left), Set(0));
+        assert_eq!(priority_page_nav(0, Key::PageUp), Set(0));
+        // Typed, digit by digit, and rubbed out the same way.
+        assert_eq!(priority_page_nav(0, Key::Char(b'4')), Set(4));
+        assert_eq!(priority_page_nav(4, Key::Char(b'2')), Set(42));
+        assert_eq!(priority_page_nav(42, Key::Char(b'0')), Set(420));
         assert_eq!(
-            plan_detail_nav(0, &actions, Key::Enter, 10, 0),
-            PlanNav::Act(PlanAction::OpenHtml)
+            priority_page_nav(420, Key::Char(b'9')),
+            Set(PRIORITY_MAX),
+            "a fifth digit cannot exceed the range"
         );
-        let unq = actions
-            .iter()
-            .position(|a| *a == PlanAction::Unqueue)
-            .unwrap();
-        assert_eq!(
-            plan_detail_nav(unq, &actions, Key::Enter, 10, 0),
-            PlanNav::Act(PlanAction::Unqueue)
-        );
+        assert_eq!(priority_page_nav(420, Key::Delete), Set(42));
+        // Committed only on Enter; leaving writes nothing.
+        assert_eq!(priority_page_nav(420, Key::Enter), Commit(420));
+        assert_eq!(priority_page_nav(420, Key::Escape), Cancel);
+        assert_eq!(priority_page_nav(420, Key::Quit), Quit);
+        assert_eq!(priority_page_nav(420, Key::Char(b'z')), None);
     }
 
     /// Two queue files parsing to one name — even one priority — are
@@ -2489,14 +2845,7 @@ mod tests {
         assert_eq!(Mode::LogScroll.toggle_focus(0), Mode::LogScroll);
         // From any agent-region mode (panel, picker, confirm): back to log.
         assert_eq!(Mode::AgentPanel { sel: 1 }.toggle_focus(2), Mode::LogScroll);
-        assert_eq!(
-            Mode::AddPicker {
-                sel: 0,
-                tier: crate::cli::teams_config::ReviewKind::Commit
-            }
-            .toggle_focus(2),
-            Mode::LogScroll
-        );
+        assert_eq!(Mode::AddPicker { sel: 0 }.toggle_focus(2), Mode::LogScroll);
         assert_eq!(
             Mode::Confirm {
                 action: ConfirmAction::RemoveAgent { idx: 0 }
@@ -2521,13 +2870,14 @@ mod tests {
         use DetailAction::*;
         assert_eq!(
             detail_actions(RosterRole::Master, Presence::Live),
-            vec![ToggleAuto, Swap, Back]
+            vec![ToggleAuto, Info, Swap, Back]
         );
         let reviewer = vec![
             ToggleAuto,
             TierCommit,
             TierPlan,
             TierFinal,
+            Info,
             PromoteToMaster,
             Swap,
             Remove,
@@ -2694,19 +3044,58 @@ mod tests {
         assert!(detail_actions(RosterRole::Master, Presence::Live).contains(&DetailAction::Swap));
     }
 
-    /// ←/→ walk the review pipeline and wrap, in both directions.
+    /// Adding a reviewer asks WHO, then WHAT they review — and the
+    /// second question uses the roster's own toggle, so the add step
+    /// and the agent page cannot mean different things by the same
+    /// ticks (one-menu-not-five).
     #[test]
-    fn tier_cycle_walks_the_pipeline_and_wraps() {
-        use crate::cli::teams_config::ReviewKind::*;
-        let mut t = Commit;
-        for want in [Plan, Final, Gate, Commit] {
-            t = tier_cycle(t, true);
-            assert_eq!(t, want, "forward");
+    fn adding_a_reviewer_asks_who_then_what() {
+        use crate::cli::teams_config::ReviewKind;
+        // The picker chooses WHO and nothing else: its arrows no
+        // longer carry a hidden second question.
+        assert_eq!(add_review_nav(0, Key::Escape), AddReviewNav::Back);
+
+        // The three checkboxes are the agent page's, keys included.
+        let rows = add_review_rows();
+        assert_eq!(
+            rows,
+            vec![
+                DetailAction::TierCommit,
+                DetailAction::TierPlan,
+                DetailAction::TierFinal
+            ]
+        );
+        for (i, a) in rows.iter().enumerate() {
+            let key = detail_action_key(*a).as_bytes()[0];
+            assert_eq!(
+                add_review_nav(0, Key::Char(key)),
+                AddReviewNav::Toggle(*a),
+                "row {i} answers its own key"
+            );
         }
-        for want in [Gate, Final, Plan, Commit] {
-            t = tier_cycle(t, false);
-            assert_eq!(t, want, "backward");
-        }
+        assert_eq!(
+            add_review_nav(1, Key::Space),
+            AddReviewNav::Toggle(DetailAction::TierPlan),
+            "space ticks the selected row"
+        );
+
+        // And the exclusivity is the ROSTER's, shared with the agent
+        // page rather than restated here: ticking commit is not
+        // plan+final.
+        let mut kind = ReviewKind::Commit;
+        kind = tier_after_toggle(kind, DetailAction::TierPlan).unwrap_or(kind);
+        assert_eq!(kind, ReviewKind::Plan, "commit gives way to plan");
+        kind = tier_after_toggle(kind, DetailAction::TierFinal).unwrap_or(kind);
+        assert_eq!(kind, ReviewKind::Gate, "plan and final together");
+        kind = tier_after_toggle(kind, DetailAction::TierCommit).unwrap_or(kind);
+        assert_eq!(kind, ReviewKind::Commit, "commit subsumes both");
+        assert_ne!(kind, ReviewKind::Gate, "commit is NOT plan+final");
+
+        // Nothing is written until the last step.
+        assert_eq!(add_review_nav(0, Key::Enter), AddReviewNav::Confirm);
+        assert_eq!(add_review_nav(0, Key::Quit), AddReviewNav::Quit);
+        assert_eq!(add_review_nav(0, Key::Down), AddReviewNav::MoveCursor(1));
+        assert_eq!(add_review_nav(2, Key::Down), AddReviewNav::MoveCursor(2));
     }
 
     #[test]
@@ -2884,66 +3273,117 @@ mod tests {
         );
     }
 
-    /// The remote page's rows: the two links only while the remote
-    /// is on; the token always; Backspace revokes the token (by
-    /// rotating it) or a session and nothing else, and Enter on
-    /// such a row is nothing — a row is not revoked by selecting it.
+    /// The remote page is a MENU: every row is a row a key acts on,
+    /// and the credential and the sessions are pages rather than lines
+    /// wrapped into the list (one-menu-not-five).
     #[test]
-    fn the_remote_page_links_are_absent_while_off_and_backspace_revokes() {
+    fn the_remote_page_is_all_rows_and_no_content() {
         use RemoteAction::*;
-        let session = |hash: &str| crate::cli::web::door::SessionRecord {
-            id_hash: hash.into(),
-            how: "token".into(),
-            created: String::new(),
-            last_seen: String::new(),
-        };
-        let off = remote_actions(false, &[session("s1"), session("s2")]);
-        assert_eq!(
-            off,
-            vec![
-                Switch,
-                Token,
-                Session("s1".into()),
-                Session("s2".into()),
-                Back
-            ]
-        );
-        let on = remote_actions(true, &[]);
-        assert_eq!(on, vec![Switch, Open, Phone, Token, Back]);
+        let off = remote_actions(false);
+        assert_eq!(off, vec![Switch, Token, Sessions]);
+        let on = remote_actions(true);
+        assert_eq!(on, vec![Switch, Open, Phone, Token, Sessions]);
+        // No `back` row: esc is the way out, and it is in the hint.
+        assert!(!on.iter().any(|a| remote_action_key(a) == "esc"));
+
+        // Every row has a key, every key is distinct, and every key
+        // fires its row from anywhere on the page.
+        let keys: Vec<&str> = on.iter().map(remote_action_key).collect();
+        let mut sorted = keys.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), keys.len(), "distinct keys: {keys:?}");
+        for (i, a) in on.iter().enumerate() {
+            let key = match remote_action_key(a) {
+                "o" => Key::Html,
+                k => Key::Char(k.as_bytes()[0]),
+            };
+            assert_eq!(
+                remote_page_nav(0, &on, key),
+                RemoteNav::Activate(a.clone()),
+                "row {i} ({a:?}) does not answer its own key"
+            );
+        }
+        // A key for a row that is not on the page does nothing.
         assert_eq!(remote_page_nav(0, &off, Key::Html), RemoteNav::None);
         assert_eq!(remote_page_nav(0, &off, Key::Char(b'p')), RemoteNav::None);
+
+        // Enter takes the selected row; space ticks the one checkbox.
         assert_eq!(
-            remote_page_nav(0, &on, Key::Html),
-            RemoteNav::Activate(Open)
+            remote_page_nav(1, &off, Key::Enter),
+            RemoteNav::Activate(Token)
         );
         assert_eq!(
-            remote_page_nav(0, &on, Key::Char(b'p')),
-            RemoteNav::Activate(Phone)
-        );
-        assert_eq!(
-            remote_page_nav(1, &off, Key::Delete),
-            RemoteNav::Revoke(Token),
-            "backspace on the token rotates it"
-        );
-        assert_eq!(
-            remote_page_nav(3, &off, Key::Delete),
-            RemoteNav::Revoke(Session("s2".into()))
-        );
-        assert_eq!(remote_page_nav(0, &off, Key::Delete), RemoteNav::None);
-        assert_eq!(remote_page_nav(4, &off, Key::Delete), RemoteNav::None);
-        assert_eq!(remote_page_nav(1, &off, Key::Enter), RemoteNav::None);
-        assert_eq!(remote_page_nav(2, &off, Key::Enter), RemoteNav::None);
-        assert_eq!(
-            remote_page_nav(0, &off, Key::Enter),
+            remote_page_nav(2, &off, Key::Space),
             RemoteNav::Activate(Switch)
         );
-        assert_eq!(
-            remote_page_nav(2, &off, Key::Char(b'r')),
-            RemoteNav::Activate(Switch)
-        );
-        assert_eq!(remote_page_nav(4, &on, Key::Enter), RemoteNav::Back);
         assert_eq!(remote_page_nav(0, &on, Key::Escape), RemoteNav::Back);
         assert_eq!(remote_page_nav(0, &on, Key::Quit), RemoteNav::Quit);
+    }
+
+    /// A page opened from the remote menu must have the door read for
+    /// it. Both new pages shipped without that: the token page drew a
+    /// blank credential and the sessions page said `none open`, so no
+    /// real session could be revoked. The rows and the frame agree
+    /// HERE, once, rather than in two places that can drift.
+    #[test]
+    fn every_page_a_remote_row_opens_reads_the_door() {
+        for on in [false, true] {
+            for a in remote_actions(on) {
+                let Some(dest) = remote_destination(&a) else {
+                    continue;
+                };
+                assert!(
+                    reads_the_door(dest),
+                    "{a:?} opens {dest:?}, which would be drawn with no door data"
+                );
+            }
+        }
+        // And the page they are opened FROM reads it too.
+        assert!(reads_the_door(Mode::RemotePage { sel: 0 }));
+        // Pages that do not touch the door do not pay for it.
+        assert!(!reads_the_door(Mode::LogScroll));
+        assert!(!reads_the_door(Mode::AgentDetail { idx: 0, sel: 0 }));
+        // The rows that ACT rather than navigate open nothing.
+        assert_eq!(remote_destination(&RemoteAction::Switch), None);
+        assert_eq!(remote_destination(&RemoteAction::Open), None);
+        assert_eq!(remote_destination(&RemoteAction::Phone), None);
+    }
+
+    /// A session ends on Backspace and never on Enter: it must not go
+    /// because someone pressed the key that means "go".
+    #[test]
+    fn a_session_is_revoked_only_by_backspace() {
+        assert_eq!(sessions_page_nav(1, 3, Key::Delete), SessionsNav::Revoke(1));
+        assert_eq!(sessions_page_nav(1, 3, Key::Enter), SessionsNav::None);
+        // Past the end — a list that shrank under the cursor.
+        assert_eq!(sessions_page_nav(3, 3, Key::Delete), SessionsNav::None);
+        assert_eq!(sessions_page_nav(0, 0, Key::Delete), SessionsNav::None);
+        assert_eq!(
+            sessions_page_nav(0, 3, Key::Down),
+            SessionsNav::MoveCursor(1)
+        );
+        assert_eq!(sessions_page_nav(0, 3, Key::Escape), SessionsNav::Back);
+    }
+
+    /// Rotating is destructive and the page is one row, so both Enter
+    /// and the row's own key do it.
+    #[test]
+    fn the_token_page_rotates_and_backs_out() {
+        assert_eq!(token_page_nav(Key::Enter), TokenNav::Rotate);
+        assert_eq!(token_page_nav(Key::Char(b'x')), TokenNav::Rotate);
+        assert_eq!(token_page_nav(Key::Escape), TokenNav::Back);
+        assert_eq!(token_page_nav(Key::Left), TokenNav::Back);
+        assert_eq!(token_page_nav(Key::Quit), TokenNav::Quit);
+        // The credential can outgrow a pane, so the page scrolls. The
+        // step is a DELTA: the loop clamps it against what the last
+        // render reported, so Down at the bottom cannot pile up
+        // invisible overscroll for Up to spend.
+        assert_eq!(token_page_nav(Key::Down), TokenNav::Scroll(1));
+        assert_eq!(token_page_nav(Key::Up), TokenNav::Scroll(-1));
+        assert_eq!(token_page_nav(Key::PageDown), TokenNav::Scroll(10));
+        assert_eq!(token_page_nav(Key::PageUp), TokenNav::Scroll(-10));
+        assert_eq!(token_page_nav(Key::Right), TokenNav::None);
     }
 
     /// Enter opens the WAIT, not the agent it hangs under — the two

@@ -122,8 +122,22 @@ pub(super) fn render_at(
 
     // Picker/detail/confirm modes are DEDICATED full screens — they
     // replace the normal bar/gauges/log layout while open.
-    if let Mode::AddPicker { sel, tier } = mode {
-        return render_add_screen(picker, rows, cols, sel, tier);
+    if let Mode::AddPicker { sel } = mode {
+        // Choosing WHO: no tier is shown, because the tier is the next
+        // question and this screen is not the place it is answered.
+        return render_candidate_screen(picker, rows, cols, sel, None, None);
+    }
+    if let Mode::AddReviews {
+        candidate,
+        kind,
+        sel,
+    } = mode
+    {
+        let who = picker
+            .get(candidate)
+            .map(|c| c.label.as_str())
+            .unwrap_or("");
+        return render_add_reviews(who, kind, sel, rows, cols);
     }
     if let Mode::SwapPicker { out, sel } = mode {
         // A stale `out` falls through to the panel, as the detail page
@@ -152,13 +166,25 @@ pub(super) fn render_at(
         let actions = wait_actions(att.killable_pid().is_some());
         return render_wait_page(&a.label, att, &actions, sel, rows, cols);
     }
+    if let Mode::PriorityPage { value } = mode {
+        let stem = view.plan_page.map(|p| p.stem.as_str()).unwrap_or("");
+        return render_priority_page(stem, value, rows, cols);
+    }
+    if let Mode::TokenPage { scroll } = mode {
+        let empty = RemotePage::default();
+        let page = view.remote_page.unwrap_or(&empty);
+        return render_token_page(page, scroll, rows, cols);
+    }
+    if let Mode::SessionsPage { sel } = mode {
+        let empty = RemotePage::default();
+        let page = view.remote_page.unwrap_or(&empty);
+        let sel = sel.min(page.sessions.len().saturating_sub(1));
+        return render_sessions_page(page, sel, rows, cols);
+    }
     if let Mode::RemotePage { sel } = mode {
         let empty = RemotePage::default();
         let page = view.remote_page.unwrap_or(&empty);
-        let actions = remote_actions(
-            view.remote == crate::cli::status_tui::remote::Shown::On,
-            &page.sessions,
-        );
+        let actions = remote_actions(view.remote == crate::cli::status_tui::remote::Shown::On);
         let sel = sel.min(actions.len().saturating_sub(1));
         return render_remote_page(
             view.remote,
@@ -1305,14 +1331,77 @@ pub(super) fn bar_emoji(snap: &StatusSnapshot) -> String {
 /// Output is hard-clamped to `rows` and every line is single-row, so a
 /// tiny pane or a multiline prompt can never overflow the terminal.
 /// Returns `(lines, 0)` — a picker has no scrollable log.
-pub(super) fn render_add_screen(
-    picker: &[crate::cli::status::AvailableAgent],
+/// The second step of adding a reviewer: WHAT they review, as the same
+/// three checkboxes the agent page has, with the same exclusivity.
+pub(super) fn render_add_reviews(
+    who: &str,
+    kind: crate::cli::teams_config::ReviewKind,
+    sel: usize,
     rows: usize,
     cols: usize,
-    sel: usize,
-    tier: crate::cli::teams_config::ReviewKind,
 ) -> (Vec<String>, usize) {
-    render_candidate_screen(picker, rows, cols, sel, None, Some(tier))
+    let (commit, plan, final_) = super::input::tier_boxes(kind);
+    let mut out = vec![
+        region_rule(&format!("add · {who}"), "what do they review?", true, cols),
+        String::new(),
+    ];
+    let subsumed = "commit already covers this";
+    let menu: Vec<MenuRow<'_>> = super::input::add_review_rows()
+        .into_iter()
+        .map(|a| {
+            let key = super::input::detail_action_key(a);
+            match a {
+                DetailAction::TierPlan => MenuRow::Check {
+                    key,
+                    label: "reviews plans",
+                    on: plan,
+                    desc: match commit {
+                        true => subsumed,
+                        false => "the plan before it is implemented",
+                    },
+                },
+                DetailAction::TierFinal => MenuRow::Check {
+                    key,
+                    label: "reviews finals",
+                    on: final_,
+                    desc: match commit {
+                        true => subsumed,
+                        false => "the work before the plan is finalized",
+                    },
+                },
+                _ => MenuRow::Check {
+                    key,
+                    label: "reviews commits",
+                    on: commit,
+                    desc: "every commit, which covers the other two",
+                },
+            }
+        })
+        .collect();
+    // Windowed like every other menu: three multi-line blocks
+    // outgrow a short pane, and Down still selects a row that
+    // top-only truncation has hidden.
+    let (body, starts) = menu_lines(&menu, sel, cols);
+    let viewport = rows.saturating_sub(out.len() + 1).max(1);
+    let (from, to) = match starts.get(sel) {
+        Some(&s) => (s, starts.get(sel + 1).copied().unwrap_or(body.len())),
+        None => (0, 0),
+    };
+    out.extend(
+        body.into_iter()
+            .skip(keep_visible(from, to, viewport))
+            .take(viewport),
+    );
+    while out.len() < rows.saturating_sub(1) {
+        out.push(String::new());
+    }
+    out.truncate(rows.saturating_sub(1));
+    out.push(emit(
+        &[dim("  ↑↓ move · ␣ tick · ⏎ add · esc back".to_string())],
+        "",
+        cols,
+    ));
+    (out, 0)
 }
 
 /// The candidate list, framed by what choosing one will DO.
@@ -1385,100 +1474,6 @@ pub(super) fn render_candidate_screen(
     // Hard backstop: never hand back more lines than the pane has.
     out.truncate(rows);
     (out, 0)
-}
-
-/// The label for a detail-page action, given the agent it acts on
-/// (so "switch tier" and "toggle auto" name their destination).
-/// A two-state segmented toggle value, e.g. `on │ off`. Positions are
-/// STABLE (the active option doesn't jump sides when flipped); the active
-/// one is bold, the other dim. When the row is selected, the segment is
-/// flanked with dim `‹ ›` to signal ←/→/␣ cycle it.
-fn toggle_segment(left: (&str, bool), right: (&str, bool), selected: bool) -> Vec<Span> {
-    let opt = |(text, active): (&str, bool)| {
-        if active {
-            bold(text.to_string())
-        } else {
-            dim(text.to_string())
-        }
-    };
-    let mut s = Vec::new();
-    if selected {
-        s.push(dim("‹ "));
-    }
-    s.push(opt(left));
-    s.push(dim(" │ "));
-    s.push(opt(right));
-    if selected {
-        s.push(dim(" ›"));
-    }
-    s
-}
-
-/// One detail-page row's spans: a fixed-width caret gutter (so rows don't
-/// jitter as the cursor moves) then a segmented toggle (auto), a review
-/// checkbox (`[x] commit` / `[ ] plan` / `[ ] final`), a glyph-prefixed
-/// action, or the destructive red `✗ remove`. Selection is a `▸` caret —
-/// NOT the reverse band — so the inline toggle value and the red
-/// destructive cue stay visible. The caret turns red on the selected
-/// Remove row as an extra danger cue.
-pub(super) fn detail_row_spans(
-    action: DetailAction,
-    agent: &crate::cli::status::AgentAutoRow,
-    selected: bool,
-) -> Vec<Span> {
-    use clank_core::vocab::AutoMode;
-    let danger = matches!(action, DetailAction::Remove);
-    // Gutter: caret+space when selected, two spaces otherwise — always 2
-    // display columns, so content never shifts horizontally.
-    let mut spans = vec![match (selected, danger) {
-        (true, true) => colored("31", "▸ "),
-        (true, false) => bold("▸ "),
-        (false, _) => plain("  "),
-    }];
-    match action {
-        DetailAction::ToggleAuto => {
-            let on = agent.auto_mode == AutoMode::On;
-            spans.push(dim(format!("{:<10}", "auto")));
-            spans.extend(toggle_segment(("on", on), ("off", !on), selected));
-        }
-        // No `…`: that is this UI's TRUNCATION marker, and
-        // `detail_page_invocation_wraps_in_full_without_ellipsis` reads
-        // its presence as a truncated invocation. `+ add agent` sets
-        // the convention for a picker-opening row — a bare label.
-        DetailAction::Swap => spans.push(plain("⇄ swap for another".to_string())),
-        DetailAction::TierCommit | DetailAction::TierPlan | DetailAction::TierFinal => {
-            let kind = super::input::role_review_kind(agent.role)
-                .unwrap_or(crate::cli::teams_config::ReviewKind::Commit);
-            let (commit, plan, final_) = super::input::tier_boxes(kind);
-            let (name, checked, label_col) = match action {
-                DetailAction::TierCommit => ("commit", commit, "reviews"),
-                DetailAction::TierPlan => ("plan", plan, ""),
-                _ => ("final", final_, ""),
-            };
-            spans.push(dim(format!("{label_col:<10}")));
-            // Checked → bold; unchecked → plain; plan/final render fully
-            // DIM while commit is ticked (commit subsumes the gate points)
-            // — still toggleable: ticking one LEAVES commit mode.
-            let grayed = commit && !matches!(action, DetailAction::TierCommit);
-            let box_txt = format!("[{}] {name}", if checked { "x" } else { " " });
-            if selected {
-                spans.push(dim("‹ "));
-            }
-            spans.push(match (checked, grayed) {
-                (true, _) => bold(box_txt),
-                (false, true) => dim(box_txt),
-                (false, false) => plain(box_txt),
-            });
-            if selected {
-                spans.push(dim(" ›"));
-            }
-        }
-        DetailAction::PromoteToMaster => spans.push(plain("⇧ promote to master")),
-        DetailAction::Reopen => spans.push(plain("↻ reopen pane")),
-        DetailAction::Remove => spans.push(colored("31", "✗ remove from team")),
-        DetailAction::Back => spans.push(dim("← back")),
-    }
-    spans
 }
 
 /// The full-screen per-agent detail/config page: a read-only info block
@@ -1559,9 +1554,15 @@ pub(super) fn render_wait_page(
     (out, len)
 }
 
-/// The remote page: the switch and its state, the two ways in
-/// while it is on, then what the door holds — the token to paste
-/// and every open session, each a row Backspace revokes.
+/// The remote page: the switch and its state, the two ways in while
+/// it is on, and the rows that open the token and the sessions.
+///
+/// Its title used to carry `⏎ select · ␣ switch · o open · p phone ·
+/// ⌫ revoke · esc back` — six keys as far from their targets as the
+/// layout allows — because rows that manipulated things IN PLACE had
+/// nowhere else to teach their keys. They are pages now, so the title
+/// says what a title says: what this is, and how it is doing
+/// (one-menu-not-five).
 pub(super) fn render_remote_page(
     remote: crate::cli::status_tui::remote::Shown,
     detail: Option<&str>,
@@ -1573,100 +1574,279 @@ pub(super) fn render_remote_page(
 ) -> (Vec<String>, usize) {
     use crate::cli::status_tui::remote::Shown;
     let mut out: Vec<String> = Vec::new();
-    out.push(region_rule(
-        "remote",
-        "⏎ select · ␣ switch · o open · p phone · ⌫ revoke · esc back",
-        true,
+    out.push(region_rule("remote", state_word(remote), true, cols));
+    out.push(String::new());
+    // Where it is, or why it is not — the one fact a title cannot hold.
+    let detail_lines: Vec<String> = match detail {
+        Some(d) => {
+            let colour = match remote {
+                Shown::Failed => "31",
+                _ => "2",
+            };
+            wrap(d, cols.saturating_sub(3).max(1))
+                .into_iter()
+                .map(|line| emit(&[colored(colour, format!("   {line}"))], "", cols))
+                .collect()
+        }
+        None => Vec::new(),
+    };
+
+    let sessions = page.sessions.len();
+    let menu: Vec<MenuRow<'_>> = actions
+        .iter()
+        .map(|a| {
+            let key = super::input::remote_action_key(a);
+            match a {
+                RemoteAction::Switch => MenuRow::Check {
+                    key,
+                    label: "serving",
+                    on: matches!(remote, Shown::On | Shown::Starting),
+                    desc: match remote {
+                        Shown::Unconfigured => {
+                            "no tunnel is configured, so there is nowhere to serve it"
+                        }
+                        Shown::Starting => "coming up",
+                        Shown::Stopping => "going down",
+                        _ => "serve this repo through the tunnel",
+                    },
+                },
+                RemoteAction::Open => MenuRow::Action {
+                    key,
+                    label: "open in the browser",
+                    value: None,
+                    desc: "a one-time link, on this machine",
+                    danger: false,
+                },
+                RemoteAction::Phone => MenuRow::Action {
+                    key,
+                    label: "link a phone",
+                    value: None,
+                    desc: "the same link as a QR code",
+                    danger: false,
+                },
+                RemoteAction::Token => MenuRow::Action {
+                    key,
+                    label: "token",
+                    value: None,
+                    desc: "the credential to paste into the page, and rotate",
+                    danger: false,
+                },
+                RemoteAction::Sessions => MenuRow::Action {
+                    key,
+                    label: "sessions",
+                    value: Some(match sessions {
+                        0 => "none open".to_string(),
+                        1 => "1 open".to_string(),
+                        n => format!("{n} open"),
+                    }),
+                    desc: "who is signed in, and revoke",
+                    danger: false,
+                },
+            }
+        })
+        .collect();
+    let (body, starts) = menu_lines(&menu, sel, cols);
+    // The MENU is reserved FIRST and the reason gets what is left. A
+    // failure reason has no bound, and a pane it fills is a pane with
+    // no actions on it — including the switch that would turn the
+    // remote off and try again.
+    let room = rows.saturating_sub(out.len() + 1);
+    let viewport = body.len().min(room).max(1);
+    let for_detail = room.saturating_sub(viewport);
+    out.extend(detail_lines.into_iter().take(for_detail));
+    let (from, to) = match starts.get(sel) {
+        Some(&s) => (s, starts.get(sel + 1).copied().unwrap_or(body.len())),
+        None => (0, 0),
+    };
+    let off = keep_visible(from, to, viewport);
+    out.extend(body.into_iter().skip(off).take(viewport));
+    while out.len() < rows.saturating_sub(1) {
+        out.push(String::new());
+    }
+    out.truncate(rows.saturating_sub(1));
+    out.push(emit(
+        &[dim("  ↑↓ move · ⏎ select · esc back".to_string())],
+        "",
         cols,
     ));
-    out.push(String::new());
-    let mut state = vec![plain("   ".to_string())];
-    state.extend(remote_row(remote, detail));
-    out.push(emit(&state, "", cols));
-    out.push(String::new());
-    let date = |s: &str| s.get(..10).unwrap_or(s).to_string();
-    let minute = |s: &str| s.get(..16).unwrap_or(s).replace('T', " ");
-    let section = |out: &mut Vec<String>, title: &str, empty: Option<&str>| {
-        out.push(String::new());
-        out.push(emit(&[dim(format!("   {title}"))], "", cols));
-        if let Some(e) = empty {
-            out.push(emit(&[dim(format!("     {e}"))], "", cols));
-        }
-    };
-    let mut sel_line = 0;
-    let mut sessions_titled = false;
-    // Filled by the token row, emitted just under it.
-    let mut token_lines: Vec<String> = Vec::new();
-    for (i, a) in actions.iter().enumerate() {
-        let spans = match a {
-            RemoteAction::Switch => vec![plain(format!(
-                "   {} {}",
-                REMOTE_ICON,
-                match remote {
-                    Shown::On => "switch off",
-                    Shown::Starting => "starting…",
-                    Shown::Stopping => "stopping…",
-                    Shown::Unconfigured => "switch on — nothing is configured",
-                    Shown::Off | Shown::Failed => "switch on",
-                }
-            ))],
-            RemoteAction::Open => vec![plain("   ↗ open in the browser".to_string())],
-            RemoteAction::Phone => vec![plain("   ▦ link a phone".to_string())],
-            // The token is the thing to be READ OFF the pane and
-            // typed elsewhere, so it must never be elided: the row
-            // itself is short, and the credential is wrapped whole
-            // onto the lines under it, at any width (codex on
-            // f71e7b9).
-            RemoteAction::Token => {
-                section(&mut out, "token — paste this into the page", None);
-                token_lines = wrap(&page.token, cols.saturating_sub(5).max(1))
-                    .into_iter()
-                    .map(|line| emit(&[plain(format!("     {line}"))], "", cols))
-                    .collect();
-                vec![
-                    plain("     ⧉ token".to_string()),
-                    dim("  ⌫ rotates".to_string()),
-                ]
-            }
-            RemoteAction::Session(hash) => {
-                if !sessions_titled {
-                    section(&mut out, "sessions", None);
-                    sessions_titled = true;
-                }
-                let (how, since) = page
-                    .sessions
-                    .iter()
-                    .find(|s| s.id_hash == *hash)
-                    .map(|s| {
-                        (
-                            s.how.as_str(),
-                            format!("since {} · seen {}", date(&s.created), minute(&s.last_seen)),
-                        )
-                    })
-                    .unwrap_or(("?", String::new()));
-                vec![plain(format!("     {how}")), dim(format!("  {since}"))]
-            }
-            RemoteAction::Back => {
-                if page.sessions.is_empty() {
-                    section(&mut out, "sessions", Some("none open"));
-                }
-                out.push(String::new());
-                vec![plain("   ‹ back".to_string())]
-            }
-        };
-        if sel == i {
-            sel_line = out.len();
-        }
-        out.push(row_line(&spans, sel == i, "", cols));
-        out.append(&mut token_lines);
+    (out, 0)
+}
+
+/// A queued plan's priority, on a page with room to say how to change
+/// it. Nudged, or typed outright.
+pub(super) fn render_priority_page(
+    stem: &str,
+    value: u16,
+    rows: usize,
+    cols: usize,
+) -> (Vec<String>, usize) {
+    let mut out = vec![
+        region_rule(&format!("priority · {stem}"), "", true, cols),
+        String::new(),
+    ];
+    for line in wrap("lower runs sooner. 0–999.", cols.saturating_sub(3).max(1)) {
+        out.push(emit(&[dim(format!("   {line}"))], "", cols));
     }
-    // Windowed so the selected row is always on screen: a list
-    // longer than the pane is still every one of its rows before
-    // Backspace (codex on 5d24c05).
-    let len = out.len();
-    let start = sel_line.saturating_sub(rows.saturating_sub(1));
-    let windowed = out.into_iter().skip(start).take(rows).collect();
-    (windowed, len)
+    out.push(String::new());
+    out.push(emit(&[bold(format!("     {value}"))], "", cols));
+    while out.len() < rows.saturating_sub(1) {
+        out.push(String::new());
+    }
+    out.truncate(rows.saturating_sub(1));
+    out.push(emit(
+        &[dim(
+            "  type a number · ←→ ±10 · PgUp/PgDn ±100 · ⏎ set · esc cancel".to_string(),
+        )],
+        "",
+        cols,
+    ));
+    (out, 0)
+}
+
+/// The token's page: the credential as CONTENT, whole and never
+/// elided — it is read off the pane and typed elsewhere — and the one
+/// The token's page: the credential as CONTENT, whole and never
+/// elided — it is read off the pane and typed elsewhere — and the one
+/// action that replaces it.
+///
+/// It SCROLLS rather than truncating. A credential plus its
+/// instructions plus a destructive row outgrows a short pane, and both
+/// halves of what it holds are things you cannot do without: the exact
+/// characters, and the row that replaces them.
+pub(super) fn render_token_page(
+    page: &RemotePage,
+    scroll: usize,
+    rows: usize,
+    cols: usize,
+) -> (Vec<String>, usize) {
+    let mut body: Vec<String> = Vec::new();
+    // Wrapped, not emitted raw: `emit` truncates with `…`, and an
+    // ellipsis on a page whose whole job is an exact string is the
+    // wrong thing to teach the eye.
+    for line in wrap(
+        "paste this into the page to sign in",
+        cols.saturating_sub(3).max(1),
+    ) {
+        body.push(emit(&[dim(format!("   {line}"))], "", cols));
+    }
+    body.push(String::new());
+    for line in wrap(&page.token, cols.saturating_sub(5).max(1)) {
+        body.push(emit(&[plain(format!("     {line}"))], "", cols));
+    }
+    body.push(String::new());
+    body.extend(render_menu(
+        &[MenuRow::Action {
+            key: "x",
+            label: "rotate",
+            value: None,
+            desc: "mint a new one; the old stops working and every session it opened ends",
+            danger: true,
+        }],
+        usize::MAX, // nothing is selected: there is one row and Enter takes it
+        cols,
+    ));
+
+    let mut out = vec![region_rule("token", "", true, cols), String::new()];
+    let viewport = rows.saturating_sub(out.len() + 1).max(1);
+    // The same bottom the loop clamps to: it works from the extent
+    // below minus the pane, this works from the body minus the
+    // viewport, and `extent = body + chrome` makes those equal.
+    let off = scroll.min(body.len().saturating_sub(viewport));
+    out.extend(body.iter().skip(off).take(viewport).cloned());
+    while out.len() < rows.saturating_sub(1) {
+        out.push(String::new());
+    }
+    out.truncate(rows.saturating_sub(1));
+    let more = body.len() > viewport;
+    out.push(emit(
+        &[dim(match more {
+            true => "  ↑↓ scroll · ⏎ rotate · esc back".to_string(),
+            false => "  ⏎ rotate · esc back".to_string(),
+        })],
+        "",
+        cols,
+    ));
+    // Chrome the loop must account for when it clamps: the rule, the
+    // blank under it, and the pinned hint.
+    (out, body.len() + TOKEN_CHROME)
+}
+
+/// Rows of the token page that are not body: rule, blank, hint.
+const TOKEN_CHROME: usize = 3;
+
+/// The open sessions, one row each, revoked with Backspace. Enter does
+/// nothing here on purpose: a session must not end because someone
+/// pressed the key that means "go".
+pub(super) fn render_sessions_page(
+    page: &RemotePage,
+    sel: usize,
+    rows: usize,
+    cols: usize,
+) -> (Vec<String>, usize) {
+    let mut out: Vec<String> = Vec::new();
+    out.push(region_rule("sessions", "", true, cols));
+    out.push(String::new());
+    if page.sessions.is_empty() {
+        out.push(emit(&[dim("   none open".to_string())], "", cols));
+    } else {
+        let date = |s: &str| s.get(..10).unwrap_or(s).to_string();
+        let minute = |s: &str| s.get(..16).unwrap_or(s).replace('T', " ");
+        let rows_of: Vec<(String, String)> = page
+            .sessions
+            .iter()
+            .map(|s| {
+                (
+                    s.how.clone(),
+                    format!("since {} · seen {}", date(&s.created), minute(&s.last_seen)),
+                )
+            })
+            .collect();
+        let menu: Vec<MenuRow<'_>> = rows_of
+            .iter()
+            .map(|(how, when)| MenuRow::Action {
+                // The key that acts on this row IS Backspace.
+                key: "⌫",
+                label: how,
+                value: None,
+                desc: when,
+                danger: true,
+            })
+            .collect();
+        let (body, starts) = menu_lines(&menu, sel, cols);
+        let viewport = rows.saturating_sub(out.len() + 1).max(1);
+        let (from, to) = match starts.get(sel) {
+            Some(&s) => (s, starts.get(sel + 1).copied().unwrap_or(body.len())),
+            None => (0, 0),
+        };
+        out.extend(
+            body.into_iter()
+                .skip(keep_visible(from, to, viewport))
+                .take(viewport),
+        );
+    }
+    while out.len() < rows.saturating_sub(1) {
+        out.push(String::new());
+    }
+    out.truncate(rows.saturating_sub(1));
+    out.push(emit(
+        &[dim("  ↑↓ move · ⌫ revoke · esc back".to_string())],
+        "",
+        cols,
+    ));
+    (out, 0)
+}
+
+/// How the remote is doing, for the title's right-hand side.
+fn state_word(remote: crate::cli::status_tui::remote::Shown) -> &'static str {
+    use crate::cli::status_tui::remote::Shown::*;
+    match remote {
+        On => "on",
+        Off => "off",
+        Starting => "starting…",
+        Stopping => "stopping…",
+        Failed => "failed",
+        Unconfigured => "not configured",
+    }
 }
 
 /// A link the operator is to follow elsewhere: the URL in words for
@@ -1746,76 +1926,147 @@ pub(super) fn render_agent_detail(
     rows: usize,
     cols: usize,
 ) -> (Vec<String>, usize) {
+    use clank_core::vocab::AutoMode;
     let mut out: Vec<String> = Vec::new();
     out.push(region_rule(
         &format!("agent · {}", agent.label),
-        "",
+        agent.tool.as_str(),
         true,
         cols,
     ));
     out.push(String::new());
-    // Read-only info — auto/review are NOT here; they're live toggle rows
-    // below (one place to see AND change each, no duplication).
-    if out.len() < rows {
-        out.push(emit(
-            &[dim(format!("   {:<11}", "tool")), plain(agent.tool.clone())],
-            "",
-            cols,
-        ));
-    }
-    // The invocation in FULL, wrapped — a copy-pastable command line, never
-    // `…`-truncated (a long launch command must be recoverable by eye).
-    const INFO_INDENT: usize = 14; // "   " + 11-col label
-    let inv_lines = wrap(&agent.invocation, cols.saturating_sub(INFO_INDENT).max(1));
-    for (i, line) in inv_lines.iter().enumerate() {
-        if out.len() >= rows {
-            break;
-        }
-        let label = if i == 0 { "invocation" } else { "" };
-        out.push(emit(
-            &[dim(format!("   {label:<11}")), plain(line.clone())],
-            "",
-            cols,
-        ));
-    }
-    // Session binding: an unbound agent can't receive work — surface that
-    // as a PROBLEM, not a dash.
-    if out.len() < rows {
-        let mut spans = vec![dim(format!("   {:<11}", "session"))];
+
+    let kind = super::input::role_review_kind(agent.role)
+        .unwrap_or(crate::cli::teams_config::ReviewKind::Commit);
+    let (commit, plan, final_) = super::input::tier_boxes(kind);
+    // A ticked `commit` subsumes the gate points. That used to be said
+    // in colour alone — plan/final drawn dim — which a row has no way
+    // to explain. The block already has a line for saying why.
+    let subsumed = "commit already covers this";
+    let menu: Vec<MenuRow<'_>> = actions
+        .iter()
+        .map(|a| {
+            let key = super::input::detail_action_key(*a);
+            match a {
+                DetailAction::ToggleAuto => MenuRow::Check {
+                    key,
+                    label: "auto",
+                    on: agent.auto_mode == AutoMode::On,
+                    desc: "wake this agent when work arrives",
+                },
+                DetailAction::TierCommit => MenuRow::Check {
+                    key,
+                    label: "reviews commits",
+                    on: commit,
+                    desc: "every commit, which covers the other two",
+                },
+                DetailAction::TierPlan => MenuRow::Check {
+                    key,
+                    label: "reviews plans",
+                    on: plan,
+                    desc: match commit {
+                        true => subsumed,
+                        false => "the plan before it is implemented",
+                    },
+                },
+                DetailAction::TierFinal => MenuRow::Check {
+                    key,
+                    label: "reviews finals",
+                    on: final_,
+                    desc: match commit {
+                        true => subsumed,
+                        false => "the work before the plan is finalized",
+                    },
+                },
+                DetailAction::PromoteToMaster => MenuRow::Action {
+                    key,
+                    label: "promote to master",
+                    value: None,
+                    desc: "this agent implements; the incumbent steps down",
+                    danger: false,
+                },
+                DetailAction::Swap => MenuRow::Action {
+                    key,
+                    label: "swap for another",
+                    value: None,
+                    desc: "replace this agent, keeping its role",
+                    danger: false,
+                },
+                DetailAction::Info => MenuRow::Action {
+                    key,
+                    label: "invocation & session",
+                    value: None,
+                    desc: "the full command line, and what it is bound to",
+                    danger: false,
+                },
+                DetailAction::Reopen => MenuRow::Action {
+                    key,
+                    label: "reopen pane",
+                    value: None,
+                    desc: "its pane is gone; start it again",
+                    danger: false,
+                },
+                DetailAction::Remove => MenuRow::Action {
+                    key,
+                    label: "remove from team",
+                    value: None,
+                    desc: "take this agent off the roster",
+                    danger: true,
+                },
+                DetailAction::Back => MenuRow::Action {
+                    key,
+                    label: "back",
+                    value: None,
+                    desc: "",
+                    danger: false,
+                },
+            }
+        })
+        .collect();
+    let (menu_body, starts) = menu_lines(&menu, sel, cols);
+
+    // Content: ONE line, the binding, always visible. The invocation
+    // is a configured command line with no bound relative to the pane,
+    // so it lives on the `i` document where it can scroll. Pinned here
+    // it pushed this warning off a short pane; windowed here it
+    // competed with the menu for the same rows.
+    let content: Vec<String> = vec![
+        String::new(),
         match agent.session.as_deref() {
-            Some(id) => spans.push(dim(one_line(id, cols.saturating_sub(INFO_INDENT)))),
-            None => spans.push(colored(
-                "31",
-                format!("✗ unbound — run `clank as {}` in its session", agent.label),
-            )),
-        }
-        out.push(emit(&spans, "", cols));
-    }
-    if out.len() < rows {
+            Some(_) => emit(&[dim("   session   bound".to_string())], "", cols),
+            None => emit(
+                &[
+                    dim("   session   ".to_string()),
+                    colored("31", "✗ unbound".to_string()),
+                ],
+                "",
+                cols,
+            ),
+        },
+    ];
+
+    // The menu gets whatever the title, the content and the hint leave,
+    // and never less than one line.
+    let viewport = rows.saturating_sub(out.len() + content.len() + 1).max(1);
+    let (start, end) = match starts.get(sel) {
+        Some(&s) => (s, starts.get(sel + 1).copied().unwrap_or(menu_body.len())),
+        None => (0, 0),
+    };
+    // Selection-driven: this page has no scroll of its own, so the
+    // cursor is the only thing that can move the window — and a row
+    // Enter would fire must never be off screen while it does.
+    let off = keep_visible(start, end, viewport);
+    out.extend(menu_body.into_iter().skip(off).take(viewport));
+    while out.len() + content.len() < rows.saturating_sub(1) {
         out.push(String::new());
     }
-    if out.len() < rows {
-        out.push(region_rule("actions", "", false, cols));
-    }
-    for (i, a) in actions.iter().enumerate() {
-        if out.len() >= rows.saturating_sub(1) {
-            break;
-        }
-        out.push(emit(&detail_row_spans(*a, agent, i == sel), "", cols));
-    }
-    if out.len() < rows {
-        out.push(String::new());
-    }
-    if out.len() < rows {
-        out.push(emit(
-            &[dim(
-                "  ↑↓ move · ←→ ␣ change · ⏎ select · esc back".to_string()
-            )],
-            "",
-            cols,
-        ));
-    }
-    out.truncate(rows);
+    out.extend(content);
+    out.truncate(rows.saturating_sub(1));
+    out.push(emit(
+        &[dim("  ↑↓ move · ⏎ select · esc back".to_string())],
+        "",
+        cols,
+    ));
     (out, 0)
 }
 
@@ -1996,6 +2247,130 @@ pub(super) fn commit_review_offset(doc: &CommitDoc<'_>, author: &str, cols: usiz
 /// the label. Selection reverses the whole block; danger blocks render
 /// red (dim red until selected). The hotkey letter renders accent so
 /// the direct keys are discoverable from the buttons themselves.
+/// One row of an action menu. There are exactly two kinds, and the
+/// difference is how much interaction the thing behind the row needs:
+/// an [`MenuRow::Action`] runs on `Enter` (or opens a page), a
+/// [`MenuRow::Check`] ticks on `Space`. Anything richer — text, a
+/// number, a credential, a list to manage — is a PAGE, reached by an
+/// action, because a row that manipulates something in place has to
+/// teach its keys somewhere and the only somewhere is the title or the
+/// footer (one-menu-not-five).
+pub(super) enum MenuRow<'a> {
+    Action {
+        key: &'a str,
+        label: &'a str,
+        /// What the thing is set to now, when the action opens a page
+        /// that changes it — `priority 500`, `4 sessions open`. The
+        /// overview survives the move onto that page.
+        value: Option<String>,
+        desc: &'a str,
+        danger: bool,
+    },
+    Check {
+        key: &'a str,
+        label: &'a str,
+        on: bool,
+        desc: &'a str,
+    },
+}
+
+impl MenuRow<'_> {
+    fn spans(&self) -> Vec<Span> {
+        match self {
+            MenuRow::Action {
+                key,
+                label,
+                value,
+                danger,
+                ..
+            } => {
+                let mut spans = if *danger {
+                    vec![colored("31", format!("  {key}  {label}"))]
+                } else {
+                    vec![accent(format!("  {key}  ")), plain(label.to_string())]
+                };
+                if let Some(v) = value {
+                    spans.push(dim(format!("  {v}")));
+                }
+                spans
+            }
+            MenuRow::Check { key, label, on, .. } => {
+                // The box and its label are ONE span: split across two,
+                // the SGR codes land between them and the row is no
+                // longer searchable as the text a reader sees.
+                let box_label = format!("[{}] {label}", if *on { "x" } else { " " });
+                vec![
+                    accent(format!("  {key}  ")),
+                    match on {
+                        true => bold(box_label),
+                        false => plain(box_label),
+                    },
+                ]
+            }
+        }
+    }
+
+    fn desc(&self) -> &str {
+        match self {
+            MenuRow::Action { desc, .. } | MenuRow::Check { desc, .. } => desc,
+        }
+    }
+
+    fn danger(&self) -> bool {
+        matches!(self, MenuRow::Action { danger: true, .. })
+    }
+}
+
+/// THE menu renderer. Every action menu in the TUI draws through this,
+/// so "consistent" is a property of the code rather than of everyone
+/// remembering.
+pub(super) fn render_menu(rows: &[MenuRow<'_>], sel: usize, cols: usize) -> Vec<String> {
+    menu_lines(rows, sel, cols).0
+}
+
+/// The menu, and where each row STARTS in it.
+///
+/// A row is a block, not a line — a label plus however many lines its
+/// explanation wrapped to — so a page that has to keep the selected row
+/// on screen cannot work from the row index alone. Returning the
+/// offsets from the one place that lays them out is what stops a second
+/// function re-deriving positions that could drift.
+pub(super) fn menu_lines(
+    rows: &[MenuRow<'_>],
+    sel: usize,
+    cols: usize,
+) -> (Vec<String>, Vec<usize>) {
+    let mut out = Vec::new();
+    let mut starts = Vec::with_capacity(rows.len());
+    for (i, row) in rows.iter().enumerate() {
+        starts.push(out.len());
+        out.extend(block_lines(
+            &row.spans(),
+            row.desc(),
+            row.danger(),
+            i == sel,
+            cols,
+        ));
+    }
+    (out, starts)
+}
+
+/// Where a `viewport`-tall window must sit for the block `start..end`
+/// to be on screen.
+///
+/// Derived from the selection alone rather than remembered, because
+/// this page has no scroll of its own: the cursor is the only thing
+/// that moves the window, so there is no second source for the two to
+/// disagree about. A block taller than the window shows its START,
+/// since the label is the part that says which row this is.
+///
+/// No clamp against the content height: `end` never exceeds it, so the
+/// result never does either. A clamp no input can reach is a line
+/// nothing can test.
+pub(super) fn keep_visible(start: usize, end: usize, viewport: usize) -> usize {
+    end.saturating_sub(viewport).min(start)
+}
+
 fn button_block(
     key: &str,
     label: &str,
@@ -2004,13 +2379,28 @@ fn button_block(
     selected: bool,
     cols: usize,
 ) -> Vec<String> {
-    let mut lines: Vec<String> = Vec::new();
-    let label_spans = if danger {
-        vec![colored("31", format!("  {key}  {label}"))]
-    } else {
-        vec![accent(format!("  {key}  ")), plain(label.to_string())]
+    let row = MenuRow::Action {
+        key,
+        label,
+        value: None,
+        desc,
+        danger,
     };
-    lines.push(row_line(&label_spans, selected, "", cols));
+    block_lines(&row.spans(), desc, danger, selected, cols)
+}
+
+/// The shape every menu row has: the label line, then its explanation
+/// wrapped and indented under it, all of it wearing the selection band
+/// together.
+fn block_lines(
+    label_spans: &[Span],
+    desc: &str,
+    danger: bool,
+    selected: bool,
+    cols: usize,
+) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    lines.push(row_line(label_spans, selected, "", cols));
     let indent = "     ";
     // `wrap("")` is one empty line, which under `back` was a blank
     // row wearing the selection band.
@@ -2081,11 +2471,24 @@ pub(super) fn render_event_detail(
         cols,
     ));
     out.push(String::new());
-    for (i, a) in actions.iter().enumerate() {
-        let (key, label, desc) = event_action_row(*a);
-        out.extend(button_block(key, label, desc, false, i == sel, cols));
-        out.push(String::new());
-    }
+    let menu: Vec<MenuRow<'_>> = actions
+        .iter()
+        .map(|a| {
+            let (key, label, desc) = event_action_row(*a);
+            MenuRow::Action {
+                key,
+                label,
+                value: None,
+                desc,
+                danger: false,
+            }
+        })
+        .collect();
+    // Contiguous, like the plan page: a block is its label plus its
+    // dim explanation, which already sets blocks apart, and a blank
+    // after each spent a third of a short pane on nothing. The event
+    // page used to disagree; one menu means one answer.
+    out.extend(render_menu(&menu, sel, cols));
     let chrome = out.len() + 1;
 
     // The details body: built in full, windowed below.
@@ -2259,43 +2662,76 @@ pub(super) fn render_plan_detail(
     // Contiguous: a block is its label plus dim explanation lines,
     // which already sets blocks apart; a blank after each spent a
     // third of a short pane on nothing.
-    for (i, a) in actions.iter().enumerate() {
-        let danger = matches!(a, PlanAction::Purge);
-        let (key, label, desc) = plan_action_row(*a, st);
-        out.extend(button_block(key, &label, desc, danger, i == sel, cols));
-    }
+    let built: Vec<(&str, String, &str, bool)> = actions
+        .iter()
+        .map(|a| {
+            let (key, label, desc) = plan_action_row(*a, st);
+            (key, label, desc, matches!(a, PlanAction::Purge))
+        })
+        .collect();
+    let menu: Vec<MenuRow<'_>> = built
+        .iter()
+        .map(|(key, label, desc, danger)| MenuRow::Action {
+            key,
+            label,
+            value: None,
+            desc,
+            danger: *danger,
+        })
+        .collect();
+    out.extend(render_menu(&menu, sel, cols));
     let doc_focused = sel >= super::input::document_focus(actions);
-    // The document rule is pushed AFTER the clamp below so its
-    // flat-vs-lifted choice keys on the same offset the window uses.
-    let chrome = out.len() + 1;
 
     let body_lines = match pp.body.as_deref() {
         Some(md) => super::markdown::render_markdown(md, cols),
         None => vec![emit(&[dim("  (no plan document)".to_string())], "", cols)],
     };
+
+    // FOCUSED: the document takes the whole pane. Sharing it with the
+    // menu gave the document whatever the buttons did not want, which
+    // on a short pane was a line or two — and reading is the reason
+    // you walked down there (one-menu-not-five).
+    if doc_focused {
+        let mut doc = vec![match pp.scroll > 0 {
+            true => region_rule_elevated("document", DOC_HINT, true, cols),
+            false => region_rule("document", DOC_HINT, true, cols),
+        }];
+        let viewport = rows.saturating_sub(2);
+        let total = 1 + body_lines.len() + 1;
+        let off = pp
+            .scroll
+            .min(body_lines.len().saturating_sub(viewport.max(1)));
+        doc.extend(body_lines.into_iter().skip(off).take(viewport));
+        while doc.len() < rows.saturating_sub(1) {
+            doc.push(String::new());
+        }
+        doc.truncate(rows.saturating_sub(1));
+        doc.push(emit(
+            &[dim(
+                "  ↑↓ scroll · ↑ at the top returns · esc back".to_string()
+            )],
+            "",
+            cols,
+        ));
+        return (doc, total);
+    }
+
+    // The document rule is pushed AFTER the clamp below so its
+    // flat-vs-lifted choice keys on the same offset the window uses.
+    let chrome = out.len() + 1;
     // +1 for the pinned hint row: the loop clamps scroll to
     // `total - rows` and the body viewport is `rows - chrome - 1`, so
     // without it the final document line would be unreachable
     // (codex 9452520).
     let total = chrome + body_lines.len() + 1;
-    // The document fills whatever the buttons left; hint stays pinned
-    // on the last row.
     let viewport = rows.saturating_sub(chrome + 1);
-    // Clamped ONCE; the window slice and the lift indicator both read
-    // this value, so the bar can never disagree with the actual scroll
-    // (plan-page-document-scroll-like-log).
     let off = pp
         .scroll
         .min(body_lines.len().saturating_sub(viewport.max(1)));
-    // Lift on scroll (the log's app-bar elevation, reused): flat rule
-    // at the document's top; the raised bar the moment lines scroll
-    // under it. Elevation keys on SCROLL and the key hint on FOCUS —
-    // "content is under the bar" and "you are here" are different
-    // facts, and the rule already carries each its own way.
     out.push(if off > 0 {
-        region_rule_elevated("document", DOC_HINT, doc_focused, cols)
+        region_rule_elevated("document", DOC_HINT, false, cols)
     } else {
-        region_rule("document", DOC_HINT, doc_focused, cols)
+        region_rule("document", DOC_HINT, false, cols)
     });
     out.extend(body_lines.into_iter().skip(off).take(viewport));
 
@@ -2303,10 +2739,8 @@ pub(super) fn render_plan_detail(
         out.push(String::new());
     }
     out.truncate(rows.saturating_sub(1));
-    let hint = if doc_focused {
-        "  ↑↓ scroll · esc back"
-    } else if actions.get(sel) == Some(&PlanAction::Priority) {
-        "  ↑↓ move · ←→ ␣ change · PgUp/PgDn ±100 · esc back"
+    let hint = if actions.get(sel) == Some(&PlanAction::Priority) {
+        "  ↑↓ move · ⏎ opens the priority page · esc back"
     } else {
         "  ↑↓ move · ⏎ select · esc back"
     };
@@ -2326,25 +2760,30 @@ fn plan_action_row(
     a: PlanAction,
     st: super::input::PlanPageState,
 ) -> (&'static str, String, &'static str) {
+    // From the SOURCE, never a literal here: this row is what tells
+    // the operator the key exists, so the row and the binding must be
+    // one fact. They were not, and `p` on the priority row opened the
+    // promote confirmation.
+    let key = super::input::plan_action_key(a);
     let (key, label, desc) = match a {
         PlanAction::Priority => {
             let priority = match st {
                 super::input::PlanPageState::Queued { priority } => priority,
                 _ => 0,
             };
-            return (
-                "←→",
-                format!("priority ◂ {priority:03} ▸"),
-                "lower runs sooner; ←→ by 10, PgUp/PgDn by 100",
-            );
+            // An ordinary row that opens a page, showing what the
+            // value is now. Its key used to be `←→` — a row teaching
+            // its own controls, which is what forced the four-key
+            // footer (one-menu-not-five).
+            return (key, format!("priority  {priority:03}"), "lower runs sooner");
         }
         PlanAction::Unqueue => (
-            "u",
+            key,
             "unqueue…",
             "move it back to .clank/drafts/, out of the queue",
         ),
         PlanAction::Promote => (
-            "p",
+            key,
             "promote…",
             "make it the active plan: commits the intro, starts the review cycle",
         ),
@@ -2354,28 +2793,31 @@ fn plan_action_row(
 }
 
 fn plan_button_row(a: PlanAction) -> (&'static str, &'static str, &'static str) {
+    // Same source as its caller: a row advertises the key that fires
+    // it, or it advertises a lie.
+    let key = super::input::plan_action_key(a);
     match a {
         PlanAction::Priority | PlanAction::Unqueue | PlanAction::Promote => {
             unreachable!("named by plan_action_row")
         }
-        PlanAction::OpenHtml => ("o", "open in browser", "the plan's html page with feedback"),
+        PlanAction::OpenHtml => (key, "open in browser", "the plan's html page with feedback"),
         PlanAction::Stash => (
-            "s",
+            key,
             "stash…",
             "set the plan's commits aside; pop later to resume where it left off",
         ),
         PlanAction::ForceFinish => (
-            "f",
+            key,
             "force finish…",
             "finalize NOW, bypassing the review gate",
         ),
-        PlanAction::Squash => ("c", "squash…", "collapse the plan's commits into one"),
+        PlanAction::Squash => (key, "squash…", "collapse the plan's commits into one"),
         PlanAction::Purge => (
-            "p",
+            key,
             "purge…",
             "remove this plan's reviews and feedback from history, or delete the plan entirely",
         ),
-        PlanAction::Back => ("esc", "back", ""),
+        PlanAction::Back => (key, "back", ""),
     }
 }
 
@@ -2744,6 +3186,33 @@ pub(super) fn render_pause_input(
 }
 
 /// A failed action's error, full-window and scrollable (errors surface
+/// A read-only document: a rule, then the text, windowed and
+/// scrollable. Unlike the failure overlay it is not red — nothing has
+/// gone wrong — and unlike the plan document it is not markdown.
+pub(super) fn render_info_doc(
+    title: &str,
+    body: &str,
+    offset: usize,
+    rows: usize,
+    cols: usize,
+) -> (Vec<String>, usize) {
+    let mut lines: Vec<String> = Vec::new();
+    lines.push(region_rule(title, "y copy · esc back", true, cols));
+    lines.push(String::new());
+    for raw in body.lines() {
+        if raw.is_empty() {
+            lines.push(String::new());
+            continue;
+        }
+        for line in wrap(raw, cols.saturating_sub(2).max(1)) {
+            lines.push(emit(&[plain(format!("  {line}"))], "", cols));
+        }
+    }
+    let total = lines.len();
+    let off = offset.min(total.saturating_sub(1));
+    (lines.into_iter().skip(off).take(rows).collect(), total)
+}
+
 /// IN the TUI, not on a corrupted alt-screen stderr).
 pub(super) fn render_error_doc(
     title: &str,
@@ -2810,6 +3279,98 @@ pub(super) fn render_plan_doc(
 
 #[cfg(test)]
 mod tests {
+    /// One renderer means the two row kinds cannot disagree about
+    /// shape. They differ in what sits after the key and nowhere else.
+    #[test]
+    fn an_action_and_a_check_share_one_shape() {
+        use super::MenuRow;
+        use crate::cli::status_tui::fixtures::visible_untrimmed as raw;
+        let rows = vec![
+            MenuRow::Action {
+                key: "s",
+                label: "stash",
+                value: None,
+                desc: "set the plan aside",
+                danger: false,
+            },
+            MenuRow::Check {
+                key: "a",
+                label: "auto",
+                on: true,
+                desc: "wake on work",
+            },
+        ];
+        let lines = super::render_menu(&rows, 0, 60);
+        assert_eq!(lines.len(), 4, "a label and an explanation each: {lines:?}");
+
+        // The key sits in the same cells for both.
+        assert!(raw(&lines[0]).starts_with("  s  "), "{:?}", raw(&lines[0]));
+        assert!(raw(&lines[2]).starts_with("  a  "), "{:?}", raw(&lines[2]));
+        // The explanation is indented the same for both.
+        assert!(
+            raw(&lines[1]).starts_with("     set the plan aside"),
+            "{:?}",
+            raw(&lines[1])
+        );
+        assert!(
+            raw(&lines[3]).starts_with("     wake on work"),
+            "{:?}",
+            raw(&lines[3])
+        );
+        // A check says its state where an action says its label.
+        assert!(raw(&lines[2]).contains("[x] auto"), "{:?}", raw(&lines[2]));
+        assert!(
+            raw(&super::render_menu(
+                &[MenuRow::Check {
+                    key: "a",
+                    label: "auto",
+                    on: false,
+                    desc: ""
+                }],
+                9,
+                60
+            )[0])
+            .contains("[ ] auto"),
+            "unticked says so"
+        );
+
+        // The band covers a whole block, label and explanation alike,
+        // and covers nothing of an unselected one.
+        let band = "\x1b[7m";
+        assert!(
+            lines[0].contains(band) && lines[1].contains(band),
+            "selected"
+        );
+        assert!(
+            !lines[2].contains(band) && !lines[3].contains(band),
+            "unselected"
+        );
+    }
+
+    /// The value an action opens a page to change is shown ON the row,
+    /// so moving it to a page does not cost the overview.
+    #[test]
+    fn an_action_that_opens_a_page_still_shows_its_value() {
+        use super::MenuRow;
+        use crate::cli::status_tui::fixtures::visible_untrimmed as raw;
+        let lines = super::render_menu(
+            &[MenuRow::Action {
+                key: "p",
+                label: "priority",
+                value: Some("500".to_string()),
+                desc: "",
+                danger: false,
+            }],
+            9,
+            60,
+        );
+        assert!(
+            raw(&lines[0]).contains("priority  500"),
+            "{:?}",
+            raw(&lines[0])
+        );
+    }
+
     use super::*;
     use crate::cli::status_tui::fixtures::{
         REVERSE, agent_row, cand, line_with, plan_state, pr_work, reviewer_missing, snap,
@@ -2976,9 +3537,21 @@ mod tests {
             };
             assert_eq!(rule, &expected, "focused rule carries the hint");
             assert!(
-                lines.last().unwrap().contains("↑↓ scroll · esc back"),
+                lines.last().unwrap().contains("↑↓ scroll"),
                 "{:?}",
                 lines.last()
+            );
+            // The focused document owns the WHOLE pane now: no action
+            // row is drawn beside it, because reading is the reason
+            // you walked down there.
+            let visible_text: String = lines
+                .iter()
+                .map(|l| visible(l))
+                .collect::<Vec<_>>()
+                .join("");
+            assert!(
+                !visible_text.contains("stash") && !visible_text.contains("purge"),
+                "the menu is not drawn while the document has focus: {visible_text}"
             );
         }
 
@@ -3020,7 +3593,11 @@ mod tests {
             "the rule carries the priority: {text}"
         );
         assert!(text.contains("open in browser"));
-        assert!(text.contains("priority ◂ 500 ▸"), "{text}");
+        // An ordinary row showing its value, and a key that opens the
+        // page that owns it — not a control wearing arrows it has to
+        // teach in the footer (one-menu-not-five).
+        assert!(text.contains("priority  500"), "{text}");
+        assert!(!text.contains('◂'), "no in-place control: {text}");
         assert!(text.contains("unqueue…"));
         assert!(text.contains("promote…"));
         assert!(
@@ -3028,8 +3605,11 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("The queued body."), "{text}");
+        // The row OPENS the page that owns the number; the four change
+        // keys it used to need are on that page, where they can be
+        // said out loud (one-menu-not-five).
         assert!(
-            lines.last().unwrap().contains("←→ ␣ change"),
+            lines.last().unwrap().contains("priority page"),
             "the value row's hint: {:?}",
             lines.last()
         );
@@ -4106,12 +4686,13 @@ mod tests {
         }
     }
 
-    /// The row under the agents says the switch's state, the URL when
-    /// on and the reason when failed, and sits after `+ add agent`.
-    /// The page says the switch's direction, offers the two links
-    /// only while on, and lists what the door holds.
+    /// The remote page is a menu and nothing else. The credential's
+    /// characters and the session metadata used to be lines INSIDE the
+    /// action list, so what was selectable and what was not shared one
+    /// sequence; they are pages now, and the rows that open them say
+    /// how many (one-menu-not-five).
     #[test]
-    fn the_remote_page_offers_the_links_only_while_on() {
+    fn the_remote_page_holds_rows_only() {
         use crate::cli::status_tui::remote::Shown;
         let page = RemotePage {
             token: "TOKEN-abc123".into(),
@@ -4123,7 +4704,7 @@ mod tests {
             }],
         };
         let text = |shown: Shown, detail: Option<&str>| {
-            let actions = remote_actions(shown == Shown::On, &page.sessions);
+            let actions = remote_actions(shown == Shown::On);
             render_remote_page(shown, detail, &page, &actions, 0, 40, 80)
                 .0
                 .iter()
@@ -4131,65 +4712,269 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\n")
         };
+
         let off = text(Shown::Off, None);
-        assert!(off.contains("switch on"), "{off}");
+        assert!(
+            off.contains("[ ] serving"),
+            "the switch is a checkbox: {off}"
+        );
         assert!(!off.contains("open in the browser"), "{off}");
         assert!(!off.contains("link a phone"), "{off}");
+        // The credential is NOT on this page any more.
         assert!(
-            off.contains("TOKEN-abc123"),
-            "the token is printed for pasting: {off}"
+            !off.contains("TOKEN-abc123"),
+            "the credential belongs to its own page: {off}"
         );
+        assert!(off.contains("1 open"), "the row says how many: {off}");
         assert!(
-            off.contains("token  since 2026-09-14 · seen 2026-09-15 08:30"),
-            "{off}"
+            !off.contains("seen 2026-09-15"),
+            "session metadata is not in the menu: {off}"
         );
-        assert!(!off.contains(&"ab".repeat(32)), "the hash is not shown");
+        assert!(!off.contains(&"ab".repeat(32)), "the hash is never shown");
+
+        // The title carries STATE, never a key legend. This is the
+        // complaint that started the plan.
+        let title = text(Shown::Off, None).lines().next().unwrap().to_string();
+        assert!(title.contains("off"), "state in the title: {title}");
+        for legend in ["⏎", "␣", "⌫", "esc back"] {
+            assert!(
+                !title.contains(legend),
+                "the title carries a key legend ({legend}): {title}"
+            );
+        }
+
         let on = text(Shown::On, Some("http://localhost:5"));
-        assert!(on.contains("switch off"), "{on}");
-        assert!(on.contains("http://localhost:5"), "{on}");
+        assert!(on.contains("[x] serving"), "{on}");
+        assert!(on.contains("http://localhost:5"), "where it is: {on}");
         assert!(
             on.contains("open in the browser") && on.contains("link a phone"),
             "{on}"
         );
-        assert!(on.contains("TOKEN-abc123"), "the token shows while on too");
+
+        // Every painted row is a row a key acts on: the menu's line
+        // count is the blocks the rows produce, and nothing besides.
+        assert_eq!(
+            remote_actions(true).len(),
+            5,
+            "switch, open, phone, token, sessions"
+        );
 
         let empty = RemotePage::default();
-        let actions = remote_actions(false, &[]);
-        let bare = render_remote_page(Shown::Off, None, &empty, &actions, 0, 40, 80)
+        let bare = render_remote_page(Shown::Off, None, &empty, &remote_actions(false), 0, 40, 80)
             .0
+            .iter()
+            .map(|l| strip_escapes(l))
+            .collect::<Vec<_>>()
             .join("\n");
         assert!(bare.contains("none open"), "{bare}");
+    }
 
-        // A pane shorter than the list: the selected row is on
-        // screen wherever it is, so every session can be read before
-        // it is revoked.
-        let many = RemotePage {
+    /// The credential reads off its own page, whole, and the one
+    /// action there is the destructive one.
+    #[test]
+    fn the_token_page_prints_the_credential_whole() {
+        let page = RemotePage {
+            token: "TOKEN-abcdefghijklmnopqrstuvwxyz0123456789".into(),
+            sessions: vec![],
+        };
+        // Narrow enough to force a wrap: a credential is typed
+        // elsewhere, so it must never be elided.
+        let out = render_token_page(&page, 0, 20, 24)
+            .0
+            .iter()
+            .map(|l| strip_escapes(l))
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(!out.contains('…'), "never truncated: {out}");
+        let joined: String = out.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(joined.contains(&page.token), "the whole credential: {out}");
+        assert!(out.contains("rotate"), "and the row that replaces it");
+    }
+
+    /// The coverage step is a menu like any other, so a short pane
+    /// keeps its selected row on screen. Down still selects the third
+    /// checkbox and Space still changes it, so a row hidden by
+    /// truncation would be a box ticked blind.
+    #[test]
+    fn the_coverage_step_keeps_its_selection_on_a_short_pane() {
+        use crate::cli::teams_config::ReviewKind;
+        for rows in [8, 12, 20] {
+            for sel in 0..3 {
+                let lines = render_add_reviews("codex", ReviewKind::Commit, sel, rows, 40).0;
+                assert_eq!(lines.len(), rows, "fills {rows} rows at sel {sel}");
+                let banded = lines
+                    .iter()
+                    .find(|l| l.contains("\x1b[7m"))
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "nothing selected at {rows}/{sel}:\n{}",
+                            lines
+                                .iter()
+                                .map(|l| visible(l))
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        )
+                    });
+                let want = ["reviews commits", "reviews plans", "reviews finals"][sel];
+                assert!(
+                    visible(banded).contains(want),
+                    "the band is on another row at {rows}/{sel}: {:?}",
+                    visible(banded)
+                );
+            }
+        }
+        // The ticks say what the roster says, and the two other rows
+        // explain why they are covered.
+        let shown: String = render_add_reviews("codex", ReviewKind::Commit, 0, 20, 60)
+            .0
+            .iter()
+            .map(|l| visible(l))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(shown.contains("[x] reviews commits"), "{shown}");
+        assert!(shown.contains("commit already covers this"), "{shown}");
+        assert!(
+            shown.contains("what do they review?"),
+            "the title asks: {shown}"
+        );
+    }
+
+    /// A pane too small for the page still reaches both things the
+    /// page exists for: the exact characters, and the row that
+    /// replaces them. It scrolls rather than truncating.
+    #[test]
+    fn a_tiny_token_page_reaches_the_whole_credential_and_the_row() {
+        let token = "sSJm3kQ0Xn7bK2pL9vTf4hR1yZ8wC6dGaE5uNoIqPrM";
+        assert_eq!(token.len(), 43);
+        let page = RemotePage {
+            token: token.into(),
+            sessions: vec![],
+        };
+        // The case codex named: 8 rows, 24 columns.
+        let (_, total) = render_token_page(&page, 0, 8, 24);
+        let mut seen = String::new();
+        let mut saw_rotate = false;
+        for scroll in 0..=total {
+            let lines = render_token_page(&page, scroll, 8, 24).0;
+            assert_eq!(lines.len(), 8, "fills the pane at scroll {scroll}");
+            // The BODY is never elided; the pinned hint may be, and a
+            // clipped hint costs nothing while a clipped credential is
+            // the whole failure.
+            let body: String = lines[..lines.len() - 1]
+                .iter()
+                .map(|l| strip_escapes(l))
+                .collect();
+            assert!(!body.contains('…'), "never elided: {body}");
+            let text: String = body;
+            seen.push_str(&text);
+            saw_rotate |= text.contains("rotate");
+        }
+        let joined: String = seen.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            joined.contains(token),
+            "the whole credential is reachable by scrolling: {seen}"
+        );
+        assert!(saw_rotate, "and so is the row that replaces it: {seen}");
+        // The hint says the page scrolls, since otherwise nothing does.
+        let hint = strip_escapes(render_token_page(&page, 0, 8, 24).0.last().unwrap());
+        assert!(hint.contains("↑↓ scroll"), "{hint}");
+    }
+
+    /// A failure reason has no bound. A pane it fills is a pane with no
+    /// actions on it — including the switch that would turn the remote
+    /// off and try again — so the menu is reserved first.
+    #[test]
+    fn a_long_failure_reason_never_costs_the_menu() {
+        use crate::cli::status_tui::remote::Shown;
+        let page = RemotePage::default();
+        let actions = remote_actions(false);
+        let reason = "not reachable through the tunnel: ".to_string()
+            + &(0..30)
+                .map(|i| format!("cause {i} of the chain"))
+                .collect::<Vec<_>>()
+                .join(": ");
+        for rows in [6, 10, 24] {
+            for sel in 0..actions.len() {
+                let lines = render_remote_page(
+                    Shown::Failed,
+                    Some(&reason),
+                    &page,
+                    &actions,
+                    sel,
+                    rows,
+                    40,
+                )
+                .0;
+                assert_eq!(lines.len(), rows, "fills {rows} rows at sel {sel}");
+                let banded = lines
+                    .iter()
+                    .find(|l| l.contains("\x1b[7m"))
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "the reason ate the menu at {rows} rows:\n{}",
+                            lines
+                                .iter()
+                                .map(|l| strip_escapes(l))
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        )
+                    });
+                let key = crate::cli::status_tui::input::remote_action_key(&actions[sel]);
+                assert!(
+                    strip_escapes(banded).trim_start().starts_with(key),
+                    "sel {sel} is off screen at {rows} rows: {:?}",
+                    strip_escapes(banded)
+                );
+            }
+        }
+    }
+
+    /// Sessions are a list of objects, each revocable, on a page where
+    /// they have room to say when they were opened.
+    #[test]
+    fn the_sessions_page_lists_each_one() {
+        let page = RemotePage {
             token: "T".into(),
             sessions: (0..12)
                 .map(|i| crate::cli::web::door::SessionRecord {
                     id_hash: format!("{i:064}"),
                     how: format!("key{i}"),
                     created: "2026-09-01T00:00:00Z".into(),
-                    last_seen: "2026-09-01T00:00:00Z".into(),
+                    last_seen: "2026-09-02T03:04:00Z".into(),
                 })
                 .collect(),
         };
-        let actions = remote_actions(false, &many.sessions);
-        let at = |sel: usize| {
-            let (lines, total) = render_remote_page(Shown::Off, None, &many, &actions, sel, 8, 80);
-            assert!(total > 8);
-            assert_eq!(lines.len(), 8);
-            lines
+        let shown = render_sessions_page(&page, 0, 30, 60)
+            .0
+            .iter()
+            .map(|l| strip_escapes(l))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(shown.contains("key0"), "{shown}");
+        assert!(
+            shown.contains("since 2026-09-01 · seen 2026-09-02 03:04"),
+            "{shown}"
+        );
+        assert!(!shown.contains(&format!("{:064}", 0)), "no hashes");
+        assert!(
+            shown.contains("⌫ revoke"),
+            "the key that acts is in the hint"
+        );
+
+        // A pane shorter than the list keeps the selected row on
+        // screen, so every session can be read before it is revoked.
+        for sel in 0..page.sessions.len() {
+            let lines = render_sessions_page(&page, sel, 10, 60).0;
+            let banded = lines
                 .iter()
-                .map(|l| strip_escapes(l))
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
-        assert!(at(0).contains("switch on"));
-        assert!(!at(0).contains("key11"));
-        assert!(at(13).contains("key11"), "{}", at(13));
-        assert!(at(14).contains("‹ back"), "{}", at(14));
-        assert!(at(6).contains("key4"), "{}", at(6));
+                .find(|l| l.contains("\x1b[7m"))
+                .unwrap_or_else(|| panic!("nothing selected at {sel}"));
+            assert!(
+                strip_escapes(banded).contains(&format!("key{sel}")),
+                "sel {sel} is off screen: {:?}",
+                strip_escapes(banded)
+            );
+        }
     }
 
     /// The token is what gets read off the pane and typed into a
@@ -4198,7 +4983,6 @@ mod tests {
     /// wrapped whole instead (codex on f71e7b9).
     #[test]
     fn a_narrow_pane_shows_the_whole_token() {
-        use crate::cli::status_tui::remote::Shown;
         // As `random_token` renders one: 32 bytes, url-safe base64.
         let token = "sSJm3kQ0Xn7bK2pL9vTf4hR1yZ8wC6dGaE5uNoIqPrM";
         assert_eq!(token.len(), 43);
@@ -4206,9 +4990,8 @@ mod tests {
             token: token.into(),
             sessions: Vec::new(),
         };
-        let actions = remote_actions(false, &[]);
         for cols in [80, 48, 40, 30, 24] {
-            let lines = render_remote_page(Shown::Off, None, &page, &actions, 0, 40, cols)
+            let lines = render_token_page(&page, 0, 40, cols)
                 .0
                 .iter()
                 .map(|l| strip_escapes(l))
@@ -4731,7 +5514,7 @@ mod tests {
         let page = render_at(&s, 40, 80, 0, 0, &view).0.join("\n");
         let band = page
             .lines()
-            .find(|l| l.contains("▸ "))
+            .find(|l| l.contains("\x1b[7m"))
             .expect("a selected row");
         assert!(
             visible(band).contains("back"),
@@ -4839,10 +5622,7 @@ mod tests {
                 event_page: None,
                 wait_page: None,
                 plan_input: None,
-                mode: Mode::AddPicker {
-                    sel: 0,
-                    tier: crate::cli::teams_config::ReviewKind::Commit,
-                },
+                mode: Mode::AddPicker { sel: 0 },
                 picker: &picker,
                 log_cursor: 0,
                 lift: 0,
@@ -4891,10 +5671,7 @@ mod tests {
             event_page: None,
             wait_page: None,
             plan_input: None,
-            mode: Mode::AddPicker {
-                sel: 0,
-                tier: crate::cli::teams_config::ReviewKind::Commit,
-            },
+            mode: Mode::AddPicker { sel: 0 },
             picker: &picker,
             log_cursor: 0,
             lift: 0,
@@ -4937,10 +5714,7 @@ mod tests {
             80,
             0,
             0,
-            &PanelView::just(Mode::AddPicker {
-                sel: 0,
-                tier: crate::cli::teams_config::ReviewKind::Commit,
-            }),
+            &PanelView::just(Mode::AddPicker { sel: 0 }),
         )
         .0
         .join("\n");
@@ -5084,21 +5858,37 @@ mod tests {
         .0;
         let rev_j = rev.join("\n");
         assert!(rev_j.contains("AGENT · CODEX"), "detail title");
-        assert!(rev_j.contains("codex --profile deep"), "invocation shown");
-        assert!(rev_j.contains("0d9af2c1-session-id"), "bound session shown");
+        // The page says the BINDING and offers the row that opens the
+        // rest; the command line itself is unbounded and lives on that
+        // document (one-menu-not-five).
+        assert!(rev_j.contains("session"), "the binding is on the page");
+        assert!(
+            rev_j.contains("invocation & session"),
+            "and the row that opens the full facts: {rev_j}"
+        );
+        assert!(
+            !rev_j.contains("codex --profile deep"),
+            "the command line is not pinned beside the menu: {rev_j}"
+        );
         assert!(!rev_j.contains("purpose"), "the dead purpose row is gone");
         // The review tier is three checkboxes exposing the REAL domain —
         // a Commit reviewer: [x] commit, with plan/final unticked.
-        assert!(rev_j.contains("[x] commit"), "commit checked: {rev_j}");
-        assert!(rev_j.contains("[ ] plan"), "plan unticked");
-        assert!(rev_j.contains("[ ] final"), "final unticked");
+        assert!(
+            rev_j.contains("[x] reviews commits"),
+            "commit checked: {rev_j}"
+        );
+        assert!(rev_j.contains("[ ] reviews plans"), "plan unticked");
+        assert!(rev_j.contains("[ ] reviews finals"), "final unticked");
         assert!(!rev_j.contains("gate"), "no internal 'gate' word: {rev_j}");
         assert!(rev_j.contains("promote to master") && rev_j.contains("remove from team"));
-        // Selected row (the commit checkbox, sel=1) is marked by the ▸
-        // caret — not the reverse-video band.
+        // Selected row (the commit checkbox, sel=1) wears the BAND, as
+        // every menu in the TUI now does. The agent page used to mark
+        // selection with a `▸` caret while the plan page used the band,
+        // which was half of why the two looked unrelated
+        // (one-menu-not-five).
         assert!(
-            line_with(&rev, "[x] commit").contains('▸'),
-            "selected row carries the caret"
+            line_with(&rev, "[x] reviews commits").contains("\x1b[7m"),
+            "selected row wears the band"
         );
         // Full screen: not the normal layout.
         assert!(!rev_j.contains("git"), "detail replaces the normal layout");
@@ -5115,21 +5905,32 @@ mod tests {
         )
         .0;
         let mas_j = mas.join("\n");
+        // Auto is a CHECKBOX now, like every other on/off in the TUI —
+        // it was a bespoke `on │ off` segment, which is the same row
+        // wearing a third control style (one-menu-not-five).
         assert!(
-            mas_j.contains("auto") && mas_j.contains("on") && mas_j.contains("off"),
-            "master keeps the auto toggle: {mas_j}"
+            mas_j.contains("[x] auto"),
+            "master keeps the auto checkbox: {mas_j}"
         );
         assert!(
-            !mas_j.contains("[ ] plan") && !mas_j.contains("promote") && !mas_j.contains("remove"),
+            !mas_j.contains("reviews plans")
+                && !mas_j.contains("promote")
+                && !mas_j.contains("remove"),
             "master's action set is reduced: {mas_j}"
         );
-        assert!(
-            mas_j.contains("unbound") && mas_j.contains("clank as claude"),
-            "unbound session surfaced as a problem with the fix: {mas_j}"
-        );
+        // The PROBLEM stays on the page, in red — an agent that cannot
+        // receive work must not need a keystroke to notice. The FIX is
+        // a sentence, so it reads off the `i` document with the rest of
+        // the facts, which is the only place unbounded text can live.
+        assert!(mas_j.contains("unbound"), "unbound surfaced: {mas_j}");
         assert!(
             line_with(&mas, "unbound").contains("\x1b[31m"),
             "unbound renders red"
+        );
+        let facts = crate::cli::status_tui::agent_facts(&s.agents[0]);
+        assert!(
+            facts.contains("clank as claude"),
+            "and the fix is one keystroke away: {facts}"
         );
     }
 
@@ -5300,36 +6101,37 @@ mod tests {
         )
         .0
         .join("\n");
-        // Gate == plan+final: both ticked, commit unticked.
-        assert!(out.contains("[ ] commit"), "commit unticked: {out}");
-        assert!(out.contains("[x] plan"), "plan ticked");
-        assert!(out.contains("[x] final"), "final ticked");
+        // Gate == plan+final: both ticked, commit unticked. The rows
+        // say what they mean now that there is no shared label column
+        // to lean on — each menu row stands alone.
+        assert!(
+            out.contains("[ ] reviews commits"),
+            "commit unticked: {out}"
+        );
+        assert!(out.contains("[x] reviews plans"), "plan ticked");
+        assert!(out.contains("[x] reviews finals"), "final ticked");
     }
 
+    /// The FULL command is readable — wrapped, never `…`-truncated,
+    /// because a launch command must be recoverable by eye and
+    /// pastable. It reads off the `i` document now rather than the
+    /// agent page: unbounded text cannot share a pane with a menu, and
+    /// pinning it there pushed the session warning off short panes
+    /// (one-menu-not-five).
     #[test]
-    fn detail_page_invocation_wraps_in_full_without_ellipsis() {
+    fn the_invocation_reads_in_full_without_ellipsis() {
         use crate::cli::teams_config::RosterRole;
         use clank_core::vocab::AutoMode;
-        let mut s = two_agent_snap();
         let mut codex = agent_row("codex", RosterRole::Commit, AutoMode::Off);
         codex.invocation =
             "codex --profile deep --sandbox danger-full-access --config model_reasoning_effort=high"
                 .to_string();
-        // A short bound session so no OTHER info row needs truncation at
-        // this narrow width — the no-ellipsis assert below is global.
         codex.session = Some("s1".to_string());
-        s.agents = vec![agent_row("claude", RosterRole::Master, AutoMode::On), codex];
-        let out = render_at(
-            &s,
-            40,
-            48, // narrow: the invocation cannot fit one line
-            0,
-            0,
-            &PanelView::just(Mode::AgentDetail { idx: 1, sel: 0 }),
-        )
-        .0;
-        // The FULL command is present (copy-pastable) — wrapped, never
-        // `…`-truncated. Reassemble the visible text and check every token.
+        let body = crate::cli::status_tui::agent_facts(&codex);
+
+        // Narrow enough that the command cannot fit one line, and tall
+        // enough to hold what it wraps to.
+        let (out, total) = render_info_doc("agent · codex", &body, 0, 40, 48);
         let all: String = out.iter().map(|l| visible(l)).collect::<Vec<_>>().join(" ");
         for token in [
             "codex",
@@ -5337,13 +6139,24 @@ mod tests {
             "deep",
             "--sandbox",
             "danger-full-access",
+            "--config",
             "model_reasoning_effort=high",
         ] {
-            assert!(all.contains(token), "token `{token}` lost: {all}");
+            assert!(all.contains(token), "lost `{token}`: {all}");
         }
+        assert!(!all.contains('…'), "nothing truncated: {all}");
+        assert!(all.contains("s1"), "the binding is here too: {all}");
+
+        // And it SCROLLS, which is the whole reason it is a document:
+        // a pane too short for it still reaches the end.
+        let (short, short_total) = render_info_doc("agent · codex", &body, 0, 3, 48);
+        assert_eq!(short.len(), 3, "windowed to the pane");
+        assert_eq!(short_total, total, "the extent does not depend on the pane");
+        let (tail, _) = render_info_doc("agent · codex", &body, total - 1, 3, 48);
         assert!(
-            !out.iter().any(|l| visible(l).contains('…')),
-            "invocation must never be ellipsized"
+            visible(&tail[0]).contains("s1"),
+            "scrolled to the end: {:?}",
+            visible(&tail[0])
         );
     }
 
@@ -7034,70 +7847,163 @@ mod tests {
         assert!(!red_swap, "swap is not destructive styling");
     }
 
+    /// On a pane too short for the whole menu, the selected row must
+    /// still be on screen — Enter fires it, and firing a row nobody can
+    /// see is how an agent gets removed by accident. The binding stays
+    /// visible at every size, and the row that reaches the rest is
+    /// always among the rows.
     #[test]
-    fn agent_detail_renders_toggles_red_remove_and_stable_gutter() {
+    fn a_short_pane_keeps_the_selection_and_the_binding() {
+        use crate::cli::teams_config::RosterRole;
+        use clank_core::vocab::AutoMode;
+        let mut agent = agent_row("codex", RosterRole::Commit, AutoMode::On);
+        // A command line with no bound relative to the pane: the case
+        // that used to push the warning off the bottom.
+        agent.invocation = format!("codex {}", "--flag value ".repeat(40));
+        agent.session = None;
+        let actions = detail_actions(RosterRole::Commit, Presence::Live);
+        assert!(actions.len() > 4, "a menu taller than these panes");
+
+        // 8 rows is the case codex named: title, blank, one menu line,
+        // the binding and the hint, and nothing spare.
+        for rows in [8, 12, 20] {
+            for sel in 0..actions.len() {
+                let (lines, _) = render_agent_detail(&agent, &actions, sel, rows, 40);
+                assert_eq!(lines.len(), rows, "fills {rows} rows exactly at sel {sel}");
+                let texts: Vec<String> = lines.iter().map(|l| visible(l)).collect();
+                let shown = texts.join("\n");
+
+                // The selected row's LABEL is on screen, not merely its
+                // explanation: the label says which row Enter takes.
+                let key = crate::cli::status_tui::input::detail_action_key(actions[sel]);
+                assert!(
+                    texts.iter().any(|t| t.trim_start().starts_with(key)),
+                    "sel {sel} ({:?}, key `{key}`) off screen at {rows} rows:\n{shown}",
+                    actions[sel]
+                );
+                let banded = lines
+                    .iter()
+                    .find(|l| l.contains("\x1b[7m"))
+                    .unwrap_or_else(|| panic!("nothing selected at {rows}/{sel}:\n{shown}"));
+                assert!(
+                    visible(banded).trim_start().starts_with(key),
+                    "the band is on another row at {rows}/{sel}: {:?}",
+                    visible(banded)
+                );
+
+                // The alarm survives every position and every height.
+                assert!(
+                    shown.contains("unbound"),
+                    "the unbound warning is pinned at {rows}/{sel}:\n{shown}"
+                );
+            }
+        }
+
+        // And the full command is reachable: the row exists, its key
+        // fires it, and the document it opens holds the whole thing.
+        assert!(
+            actions.contains(&crate::cli::status_tui::input::DetailAction::Info),
+            "a row reaches the rest of the facts"
+        );
+        let facts = crate::cli::status_tui::agent_facts(&agent);
+        assert!(facts.contains(&agent.invocation), "whole, on the document");
+        assert!(facts.contains("clank as codex"), "with the fix for unbound");
+        // Even a tiny pane reaches the end by scrolling — the text
+        // wraps, so the end is a WINDOW rather than a single line.
+        let (_, total) = render_info_doc("t", &facts, 0, 4, 40);
+        let (tail, _) = render_info_doc("t", &facts, total.saturating_sub(4), 4, 40);
+        let end: String = tail
+            .iter()
+            .map(|l| visible(l))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            end.contains("clank as codex"),
+            "the document scrolls to its end: {end:?}"
+        );
+    }
+
+    /// The window sits where the selected block requires and nowhere
+    /// else. Every clamp here is reachable; a defensive one that no
+    /// input can distinguish would be noise.
+    #[test]
+    fn the_window_follows_the_selected_block() {
+        use super::keep_visible;
+        // Fits above the fold: no scroll at all.
+        assert_eq!(keep_visible(0, 2, 10), 0);
+        assert_eq!(keep_visible(6, 8, 10), 0);
+        // Below the fold: just far enough to show the block's end.
+        assert_eq!(keep_visible(12, 14, 10), 4);
+        assert_eq!(keep_visible(28, 30, 10), 20);
+        // A block taller than the window shows its start, not its end.
+        assert_eq!(keep_visible(12, 40, 10), 12);
+    }
+
+    /// The agent page draws through the one menu renderer: checkboxes
+    /// for the on/off rows, a red destructive row, a key on every row,
+    /// and the band for selection. It used to have a segmented
+    /// `on │ off` control, a `▸` caret and no keys at all — three
+    /// deviations from the page beside it (one-menu-not-five).
+    #[test]
+    fn the_agent_page_is_the_same_menu_as_every_other() {
         use crate::cli::teams_config::RosterRole;
         use clank_core::vocab::AutoMode;
         let agent = agent_row("codex", RosterRole::Commit, AutoMode::On);
-        let actions = detail_actions(RosterRole::Commit, Presence::Live); // auto,tier,promote,remove,back
-        // Select the auto toggle (row 0).
+        let actions = detail_actions(RosterRole::Commit, Presence::Live);
         let (lines, _) = render_agent_detail(&agent, &actions, 0, 24, 60);
         let texts: Vec<String> = lines.iter().map(|l| visible(l)).collect();
         let raw = lines.join("\n");
 
-        // auto is a segmented toggle; the review tier is checkbox rows —
-        // each shown ONCE (not also a read-only info line).
+        // Each on/off is a checkbox, said once.
         let auto = texts.iter().find(|t| t.contains("auto")).expect("auto row");
-        let commit_row = texts
-            .iter()
-            .find(|t| t.contains("commit"))
-            .expect("commit checkbox row");
-        assert!(
-            auto.contains("on") && auto.contains("off"),
-            "auto segmented: {auto:?}"
-        );
-        assert!(
-            commit_row.contains("[x] commit"),
-            "commit-tier reviewer has commit ticked: {commit_row:?}"
-        );
+        assert!(auto.contains("[x] auto"), "auto is a checkbox: {auto:?}");
         assert_eq!(
             texts.iter().filter(|t| t.contains("auto")).count(),
             1,
-            "auto once"
+            "auto once — not also a read-only info line"
         );
-        assert_eq!(
-            texts.iter().filter(|t| t.contains("commit")).count(),
-            1,
-            "commit checkbox once"
+        assert!(
+            !raw.contains("on \u{2502} off"),
+            "the bespoke segmented control is gone: {raw:?}"
+        );
+        let commit_row = texts
+            .iter()
+            .find(|t| t.contains("reviews commits"))
+            .expect("commit row");
+        assert!(commit_row.contains("[x] reviews commits"), "{commit_row:?}");
+
+        // A ticked box is bold, as it was — read off an UNSELECTED row,
+        // since the selected one's band subsumes its own styling.
+        assert!(
+            raw.contains("\x1b[1m[x] reviews commits\x1b[0m"),
+            "ticked renders bold: {raw:?}"
         );
 
-        // auto is ON → the active "on" renders bold; the ticked checkbox
-        // renders bold too.
-        assert!(
-            raw.contains("\x1b[1mon\x1b[0m"),
-            "active option bold: {raw:?}"
-        );
-        assert!(
-            raw.contains("\x1b[1m[x] commit\x1b[0m"),
-            "ticked checkbox bold: {raw:?}"
-        );
-        // Selected row gets the ▸ caret; the gutter is a fixed 2 DISPLAY
-        // columns (▸ is one column but 3 bytes), so the label column is
-        // identical on selected and unselected rows — no horizontal jitter
-        // as the cursor moves.
-        let gutter = |row: &str, label: &str| display_width(&row[..row.find(label).unwrap()]);
-        assert_eq!(gutter(auto, "auto"), 2, "selected caret gutter is 2 cols");
-        assert_eq!(
-            gutter(commit_row, "reviews"),
-            2,
-            "unselected gutter is the same 2 cols"
-        );
-        assert!(auto.starts_with("▸ "), "selected row caret: {auto:?}");
+        // EVERY row carries a key, and it is the key that fires it.
+        for a in &actions {
+            let key = crate::cli::status_tui::input::detail_action_key(*a);
+            assert!(
+                texts.iter().any(|t| t.trim_start().starts_with(key)),
+                "no row shows the key `{key}` for {a:?}: {texts:?}"
+            );
+        }
 
-        // remove is destructive: ✗ glyph + red SGR.
+        // Selection is the band, and the label column does not move
+        // with it — no horizontal jitter as the cursor travels.
         assert!(
-            raw.contains("\x1b[31m✗ remove from team\x1b[0m"),
-            "red remove with ✗: {raw:?}"
+            lines[2].contains("\x1b[7m"),
+            "row 0 selected: {:?}",
+            lines[2]
+        );
+        let col = |row: &str, label: &str| display_width(&row[..row.find(label).unwrap()]);
+        assert_eq!(col(auto, "[x]"), 5, "key column then the box");
+        assert_eq!(col(commit_row, "[x]"), 5, "identical on an unselected row");
+
+        // remove is destructive: red, and no longer wearing a glyph the
+        // plan page's destructive row never had.
+        assert!(
+            raw.contains("\x1b[31m  x  remove from team\x1b[0m"),
+            "red remove: {raw:?}"
         );
     }
 }

@@ -599,13 +599,15 @@ fn queue_html_handle(page: &PlanPage) -> Option<String> {
 /// instead). `set_priority` refuses an ambiguous name rather than
 /// pick, and the error is the page's to show. No-op on a page that is
 /// not queued.
-fn change_priority(repo: &std::path::Path, page: &mut PlanPage, delta: i32) -> anyhow::Result<()> {
-    let input::PlanPageState::Queued { priority } = page.st else {
+/// Write a queued plan's priority and keep the open page's copy of it
+/// in step. The page is the only place the value is shown, so a write
+/// that did not update it would leave the pane lying until a refresh.
+fn set_priority_to(repo: &std::path::Path, page: &mut PlanPage, value: u16) -> anyhow::Result<()> {
+    let input::PlanPageState::Queued { .. } = page.st else {
         return Ok(());
     };
-    let next = input::next_priority(priority, delta);
-    let renamed = crate::cli::queue::set_priority(repo, &page.stem, next)?;
-    page.st = input::PlanPageState::Queued { priority: next };
+    let renamed = crate::cli::queue::set_priority(repo, &page.stem, value)?;
+    page.st = input::PlanPageState::Queued { priority: value };
     page.entry = Some(renamed);
     Ok(())
 }
@@ -892,13 +894,32 @@ async fn finished_multi_commit(repo: &std::path::Path, stem: &str) -> bool {
 /// returns to the panel (the agent's own action set changes shape);
 /// Remove defers to the Confirm modal. The TUI is a front-end to the
 /// cores, never a reimplemented write.
+/// An agent's facts as a document: the command it is launched with,
+/// whole, and whether a session is bound to it.
+pub(super) fn agent_facts(agent: &crate::cli::status::AgentAutoRow) -> String {
+    let session = match agent.session.as_deref() {
+        Some(id) => format!("session     {id}"),
+        None => format!(
+            "session     unbound — run `clank as {}` in its session",
+            agent.label
+        ),
+    };
+    format!(
+        "tool        {}\n\ninvocation\n{}\n\n{session}",
+        agent.tool, agent.invocation
+    )
+}
+
 fn apply_detail_action(
     action: DetailAction,
     idx: usize,
     sel: usize,
     snapshot: &mut StatusSnapshot,
     repo: &std::path::Path,
-    error: &mut Option<(String, String)>,
+    // An overlay this action wants opened. Not an "error": a row may
+    // want to SHOW something, and the failure case is one of those
+    // rather than the only one.
+    open: &mut Option<Overlay>,
     // Where this agent's ROW sits in the panel. Not `idx`: a wait
     // above it makes those different numbers, and Back would land on
     // whatever now occupies the index (codex on a561012).
@@ -938,7 +959,10 @@ fn apply_detail_action(
             // unchanged roster reads as "clank ignored me" (codex
             // e4bccc5).
             Err(e) => {
-                *error = Some(("promote failed".to_string(), format!("{e:?}")));
+                *open = Some(Overlay::error(
+                    "promote failed".to_string(),
+                    format!("{e:?}"),
+                ));
                 Mode::AgentDetail { idx, sel }
             }
         },
@@ -948,6 +972,13 @@ fn apply_detail_action(
         // The request itself goes to the zellij worker at the call
         // site (this function holds no worker); the page stays open
         // and the answer lands in the notice row.
+        DetailAction::Info => {
+            *open = Some(Overlay::info(
+                format!("agent · {label_str}"),
+                agent_facts(&snapshot.agents[idx]),
+            ));
+            Mode::AgentDetail { idx, sel }
+        }
         DetailAction::Reopen => Mode::AgentDetail { idx, sel },
         DetailAction::Back => Mode::AgentPanel { sel: agent_row },
     }
@@ -1032,9 +1063,16 @@ fn roster_confirm_after_decision(
         return (Mode::AgentPanel { sel: add_row }, true);
     }
     match action {
-        ConfirmAction::AddCandidate { idx, tier } if idx < picker_len => {
-            (Mode::AddPicker { sel: idx, tier }, false)
-        }
+        // A refused add drops back to the step that asked WHAT they
+        // review, with the coverage the operator had already chosen.
+        ConfirmAction::AddCandidate { idx, tier } if idx < picker_len => (
+            Mode::AddReviews {
+                candidate: idx,
+                kind: tier,
+                sel: 0,
+            },
+            false,
+        ),
         ConfirmAction::RemoveAgent { idx } if idx < agents_len => {
             (Mode::AgentDetail { idx, sel: 0 }, false)
         }
@@ -1097,17 +1135,36 @@ fn apply_swap(
     }
 }
 
+/// Where this mode's candidate sits in the picker list, if it holds
+/// one.
+///
+/// Every such mode holds it BY INDEX, and a refresh can reorder the
+/// list under it, so the label is captured from here before the
+/// refresh and the index re-located after. It is ONE function because
+/// it was two: the step that asks what a reviewer reviews was added to
+/// the rebind and not to the capture, so an ordinary background
+/// refresh dropped the list and sent the operator back to the panel
+/// mid-choice (one-menu-not-five).
+fn candidate_index(mode: Mode) -> Option<usize> {
+    match mode {
+        Mode::AddPicker { sel } => Some(sel),
+        Mode::SwapPicker { sel, .. } => Some(sel),
+        Mode::AddReviews { candidate, .. } => Some(candidate),
+        Mode::Confirm {
+            action: ConfirmAction::AddCandidate { idx, .. },
+        } => Some(idx),
+        _ => None,
+    }
+}
+
 fn rebind_add_picker_after_refresh(
     old_sel: usize,
     label: Option<&str>,
     picker: &[crate::cli::status::AvailableAgent],
     add_row: usize,
-    // Survives the refresh: the tier is the user's choice, not a
-    // property of the list being redrawn under them.
-    tier: crate::cli::teams_config::ReviewKind,
 ) -> Mode {
     match rebind_picker_sel_by_label(old_sel, label, picker) {
-        Some(sel) => Mode::AddPicker { sel, tier },
+        Some(sel) => Mode::AddPicker { sel },
         None => Mode::AgentPanel { sel: add_row },
     }
 }
@@ -1279,6 +1336,18 @@ enum OverlayData {
         message: String,
     },
     Commit(CommitDetail),
+    /// An agent's read-only facts, full and scrollable.
+    ///
+    /// They do not live on the agent page because an invocation is a
+    /// user-configured command line with no bound relative to the pane:
+    /// pinned there it pushed the session warning off a short pane, and
+    /// windowed there it competed with the menu for the same rows. A
+    /// document that scrolls is the shape that always fits, and `y`
+    /// copies the command out of it (one-menu-not-five).
+    Info {
+        title: String,
+        body: String,
+    },
     /// A link to follow from another device, with its QR
     /// (the-tui-mints-the-way-in).
     Link {
@@ -1324,6 +1393,9 @@ struct Overlay {
 fn copyable(data: &OverlayData) -> Option<&str> {
     match data {
         OverlayData::Error { message, .. } => Some(message),
+        // An invocation is a command line to paste somewhere else,
+        // which is the same need the failure overlay had.
+        OverlayData::Info { body, .. } => Some(body),
         _ => None,
     }
 }
@@ -1386,6 +1458,14 @@ impl Overlay {
         Self {
             data: OverlayData::Commit(data),
             offset,
+            copied: None,
+        }
+    }
+    /// An agent's facts as a scrollable document.
+    fn info(title: String, body: String) -> Self {
+        Self {
+            data: OverlayData::Info { title, body },
+            offset: 0,
             copied: None,
         }
     }
@@ -2301,6 +2381,9 @@ pub(crate) async fn run_tui(
                     rows as usize,
                     cols as usize,
                 ),
+                OverlayData::Info { title, body } => {
+                    render_info_doc(title, body, overlay.offset, rows as usize, cols as usize)
+                }
                 OverlayData::Error { title, message } => render_error_doc(
                     title,
                     message,
@@ -2319,7 +2402,9 @@ pub(crate) async fn run_tui(
             let html_target: Option<HtmlTarget> = match &overlay.data {
                 OverlayData::Commit(d) => Some(HtmlTarget::Commit(d.sha.as_str().to_string())),
                 OverlayData::StashedPlan { name, .. } => Some(HtmlTarget::Stash(name.clone())),
-                OverlayData::Error { .. } | OverlayData::Link { .. } => None,
+                OverlayData::Error { .. } | OverlayData::Link { .. } | OverlayData::Info { .. } => {
+                    None
+                }
             };
             paint(&lines);
             let ev = ev_rx.recv_timeout(hint.wait());
@@ -2410,7 +2495,9 @@ pub(crate) async fn run_tui(
                         // An error is a moment, not a live document —
                         // a background refresh must not clear or morph
                         // it while the user reads.
-                        OverlayData::Error { .. } | OverlayData::Link { .. } => None,
+                        OverlayData::Error { .. }
+                        | OverlayData::Link { .. }
+                        | OverlayData::Info { .. } => None,
                     };
                     if let (Some(data), Some(o)) = (new, detail.as_mut()) {
                         o.refresh(data);
@@ -2443,7 +2530,12 @@ pub(crate) async fn run_tui(
         let presence = reconcile_worker.presence();
         mode = settle_detail_cursor(mode, &snapshot.agents, &presence, &mut detail_shown);
         let remote_detail = remote.detail();
-        let remote_page = matches!(mode, Mode::RemotePage { .. }).then(|| {
+        // Every page that READS the door, not just the one that used to
+        // hold its contents. The token page and the sessions page were
+        // added without this and got `RemotePage::default()` instead:
+        // a blank credential, and a session list so empty that nothing
+        // could be revoked.
+        let remote_page = crate::cli::status_tui::input::reads_the_door(mode).then(|| {
             crate::cli::status_tui::input::RemotePage {
                 token: remote.door().token().unwrap_or_default(),
                 sessions: remote.door().sessions().unwrap_or_default(),
@@ -2754,14 +2846,11 @@ pub(crate) async fn run_tui(
                     match mode {
                         Mode::RemotePage { sel } => {
                             use crate::cli::status_tui::input::{RemoteAction, RemoteNav};
-                            let door = remote.door().clone();
                             // The rows the key was pressed on are the
                             // rows that were PAINTED, not a fresh
                             // read: what the door holds now may differ.
-                            let page = remote_page.clone().unwrap_or_default();
                             let actions = crate::cli::status_tui::input::remote_actions(
                                 remote.shown() == remote::Shown::On,
-                                &page.sessions,
                             );
                             let sel = sel.min(actions.len().saturating_sub(1));
                             match crate::cli::status_tui::input::remote_page_nav(sel, &actions, k) {
@@ -2790,27 +2879,150 @@ pub(crate) async fn run_tui(
                                             Some(Overlay::link("link a phone".to_string(), url));
                                     }
                                 }
-                                // Rotating is the credential's own
-                                // revocation: the old token stops
-                                // working and its sessions end.
-                                RemoteNav::Revoke(RemoteAction::Token) => {
-                                    if let Err(e) = door.rotate_token() {
+                                // Both are PAGES now: reading a credential
+                                // off a pane and rotating it are two
+                                // interactions, and a list of sessions
+                                // to manage is a list of objects.
+                                RemoteNav::Activate(ref a)
+                                    if crate::cli::status_tui::input::remote_destination(a)
+                                        .is_some() =>
+                                {
+                                    mode = crate::cli::status_tui::input::remote_destination(a)
+                                        .expect("just checked");
+                                }
+                                // Every remaining Activate opens a page,
+                                // which the guard above took.
+                                RemoteNav::Activate(_) | RemoteNav::None => {}
+                            }
+                            continue;
+                        }
+                        Mode::PriorityPage { value } => {
+                            use crate::cli::status_tui::input::PriorityNav;
+                            match crate::cli::status_tui::input::priority_page_nav(value, k) {
+                                PriorityNav::Quit => break 'evloop,
+                                // Nothing written: a half-typed number
+                                // must not become the plan's priority.
+                                PriorityNav::Cancel => mode = Mode::PlanDetail { sel: 0 },
+                                PriorityNav::Set(v) => mode = Mode::PriorityPage { value: v },
+                                PriorityNav::Commit(v) => {
+                                    if let Some(live) = plan_page.as_mut()
+                                        && let Err(e) = set_priority_to(&repo, live, v)
+                                    {
+                                        detail = Some(Overlay::error(
+                                            "priority change failed".to_string(),
+                                            format!("{e:?}"),
+                                        ));
+                                    }
+                                    mode = Mode::PlanDetail { sel: 0 };
+                                    refresh_pending = true;
+                                }
+                                PriorityNav::None => {}
+                            }
+                            continue;
+                        }
+                        Mode::AddReviews {
+                            candidate,
+                            kind,
+                            sel,
+                        } => {
+                            use crate::cli::status_tui::input::AddReviewNav;
+                            match crate::cli::status_tui::input::add_review_nav(sel, k) {
+                                AddReviewNav::Quit => break 'evloop,
+                                // Nothing is written until Confirm, so
+                                // stepping back leaves the roster alone.
+                                AddReviewNav::Back => {
+                                    mode = Mode::AddPicker { sel: candidate };
+                                }
+                                AddReviewNav::MoveCursor(s) => {
+                                    mode = Mode::AddReviews {
+                                        candidate,
+                                        kind,
+                                        sel: s,
+                                    };
+                                }
+                                AddReviewNav::Toggle(a) => {
+                                    // The roster's own rule, so the two
+                                    // surfaces cannot disagree about what
+                                    // a tick means.
+                                    let kind =
+                                        crate::cli::status_tui::input::tier_after_toggle(kind, a)
+                                            .unwrap_or(kind);
+                                    mode = Mode::AddReviews {
+                                        candidate,
+                                        kind,
+                                        sel,
+                                    };
+                                }
+                                AddReviewNav::Confirm => {
+                                    mode = Mode::Confirm {
+                                        action: ConfirmAction::AddCandidate {
+                                            idx: candidate,
+                                            tier: kind,
+                                        },
+                                    };
+                                }
+                                AddReviewNav::None => {}
+                            }
+                            continue;
+                        }
+                        Mode::TokenPage { scroll } => {
+                            use crate::cli::status_tui::input::TokenNav;
+                            match crate::cli::status_tui::input::token_page_nav(k) {
+                                TokenNav::Quit => break 'evloop,
+                                TokenNav::Back => mode = Mode::RemotePage { sel: 0 },
+                                TokenNav::Scroll(delta) => {
+                                    // Clamped against what the last
+                                    // render reported, exactly as the
+                                    // plan document is.
+                                    let max_off =
+                                        screen_total.saturating_sub((rows as usize).max(1));
+                                    mode = Mode::TokenPage {
+                                        scroll: (scroll as i64 + delta as i64)
+                                            .clamp(0, max_off as i64)
+                                            as usize,
+                                    };
+                                }
+                                TokenNav::Rotate => {
+                                    if let Err(e) = remote.door().rotate_token() {
                                         detail = Some(Overlay::error(
                                             "token not rotated".to_string(),
                                             format!("{e:#}"),
                                         ));
                                     }
+                                    // A new credential is a new
+                                    // document: read it from the top.
+                                    mode = Mode::TokenPage { scroll: 0 };
                                 }
-                                RemoteNav::Revoke(RemoteAction::Session(hash)) => {
-                                    if let Err(e) = door.revoke_session(&hash) {
+                                TokenNav::None => {}
+                            }
+                            continue;
+                        }
+                        Mode::SessionsPage { sel } => {
+                            use crate::cli::status_tui::input::SessionsNav;
+                            let page = remote_page.clone().unwrap_or_default();
+                            let count = page.sessions.len();
+                            match crate::cli::status_tui::input::sessions_page_nav(sel, count, k) {
+                                SessionsNav::Quit => break 'evloop,
+                                SessionsNav::Back => mode = Mode::RemotePage { sel: 0 },
+                                SessionsNav::MoveCursor(s) => {
+                                    mode = Mode::SessionsPage { sel: s };
+                                }
+                                SessionsNav::Revoke(at) => {
+                                    // The rows the key was pressed on are
+                                    // the rows that were PAINTED.
+                                    if let Some(s) = page.sessions.get(at)
+                                        && let Err(e) = remote.door().revoke_session(&s.id_hash)
+                                    {
                                         detail = Some(Overlay::error(
                                             "session not revoked".to_string(),
                                             format!("{e:#}"),
                                         ));
                                     }
+                                    mode = Mode::SessionsPage {
+                                        sel: at.min(count.saturating_sub(2)),
+                                    };
                                 }
-                                RemoteNav::Activate(_) | RemoteNav::Revoke(_) | RemoteNav::None => {
-                                }
+                                SessionsNav::None => {}
                             }
                             continue;
                         }
@@ -2907,10 +3119,7 @@ pub(crate) async fn run_tui(
                                         home.as_deref(),
                                         &snapshot.agents,
                                     );
-                                    mode = Mode::AddPicker {
-                                        sel: 0,
-                                        tier: crate::cli::teams_config::ReviewKind::Commit,
-                                    };
+                                    mode = Mode::AddPicker { sel: 0 };
                                 }
                                 PanelAction::OpenDetail(i) => {
                                     mode = Mode::AgentDetail { idx: i, sel: 0 };
@@ -2995,7 +3204,7 @@ pub(crate) async fn run_tui(
                                             &snapshot.agents,
                                         );
                                     }
-                                    let mut err: Option<(String, String)> = None;
+                                    let mut err: Option<Overlay> = None;
                                     let agent_row = row_position(
                                         &panel_row_list(&snapshot, cols as usize),
                                         crate::cli::status_tui::input::PanelRow::Agent(idx),
@@ -3009,8 +3218,8 @@ pub(crate) async fn run_tui(
                                         &mut err,
                                         agent_row,
                                     );
-                                    if let Some((title, msg)) = err {
-                                        detail = Some(Overlay::error(title, msg));
+                                    if err.is_some() {
+                                        detail = err;
                                     }
                                     if action == DetailAction::Reopen
                                         && let Some(agent) = snapshot.agents.get(idx)
@@ -3022,7 +3231,7 @@ pub(crate) async fn run_tui(
                             }
                         }
                         // Picker: choose a candidate to add.
-                        Mode::AddPicker { sel, tier } => match k {
+                        Mode::AddPicker { sel } => match k {
                             Key::Quit => break 'evloop,
                             // Esc/Tab close the picker back onto the +add row.
                             Key::Escape | Key::Focus | Key::Char(b'a') => {
@@ -3036,34 +3245,29 @@ pub(crate) async fn run_tui(
                             Key::Up => {
                                 mode = Mode::AddPicker {
                                     sel: move_selection(sel, picker.len(), false),
-                                    tier,
                                 }
                             }
                             Key::Down => {
                                 mode = Mode::AddPicker {
                                     sel: move_selection(sel, picker.len(), true),
-                                    tier,
                                 }
                             }
-                            // The tier belongs to the ADD, not to the
-                            // highlighted row, so moving the cursor keeps it.
-                            Key::Left | Key::Right => {
-                                mode = Mode::AddPicker {
-                                    sel,
-                                    tier: crate::cli::status_tui::input::tier_cycle(
-                                        tier,
-                                        k == Key::Right,
-                                    ),
-                                }
-                            }
+                            // Choosing WHO is all this step does. What
+                            // they review is the next question, and it
+                            // is asked out loud rather than hidden on
+                            // these rows' arrow keys.
                             Key::Enter => {
                                 if sel < picker.len() {
-                                    mode = Mode::Confirm {
-                                        action: ConfirmAction::AddCandidate { idx: sel, tier },
+                                    mode = Mode::AddReviews {
+                                        candidate: sel,
+                                        kind: crate::cli::teams_config::ReviewKind::Commit,
+                                        sel: 0,
                                     };
                                 }
                             }
-                            Key::Space
+                            Key::Left
+                            | Key::Right
+                            | Key::Space
                             | Key::PageUp
                             | Key::PageDown
                             | Key::Top
@@ -3332,14 +3536,20 @@ pub(crate) async fn run_tui(
                                 // inline rename. The page follows the
                                 // write; the panel re-sorts on the refresh
                                 // the rename wakes.
-                                PlanNav::Priority(delta) => {
-                                    if let Some(live) = plan_page.as_mut()
-                                        && let Err(e) = change_priority(&repo, live, delta)
+                                // The row opens the page that owns the
+                                // value; nothing changes here.
+                                PlanNav::Priority => {
+                                    if let Some(live) = plan_page.as_ref()
+                                        && let input::PlanPageState::Queued { priority } = live.st
                                     {
-                                        detail = Some(Overlay::error(
-                                            "priority change failed".to_string(),
-                                            format!("{e:?}"),
-                                        ));
+                                        mode = Mode::PriorityPage { value: priority };
+                                    }
+                                }
+                                PlanNav::Act(PlanAction::Priority) => {
+                                    if let Some(live) = plan_page.as_ref()
+                                        && let input::PlanPageState::Queued { priority } = live.st
+                                    {
+                                        mode = Mode::PriorityPage { value: priority };
                                     }
                                 }
                                 PlanNav::Act(a) => match a {
@@ -3642,22 +3852,13 @@ pub(crate) async fn run_tui(
                     }
                     _ => None,
                 };
-                let picker_label = match mode {
-                    Mode::AddPicker { sel, .. }
-                    | Mode::SwapPicker { sel, .. }
-                    | Mode::Confirm {
-                        action: ConfirmAction::AddCandidate { idx: sel, .. },
-                    } => picker.get(sel).map(|c| c.label.clone()),
-                    _ => None,
-                };
-                let keep_picker = matches!(
-                    mode,
-                    Mode::AddPicker { .. }
-                        | Mode::SwapPicker { .. }
-                        | Mode::Confirm {
-                            action: ConfirmAction::AddCandidate { .. }
-                        }
-                );
+                // EVERY mode that holds a candidate by index, including
+                // the step that asks what they review: a refresh there
+                // without the label drops the list and sends the
+                // operator back to the panel mid-choice.
+                let picker_label =
+                    candidate_index(mode).and_then(|i| picker.get(i).map(|c| c.label.clone()));
+                let keep_picker = candidate_index(mode).is_some();
                 // Same identity rule for a panel cursor on a QUEUE row: a
                 // reprioritise renames the queue file, so THIS refresh is
                 // often self-inflicted and re-sorts the list — capture the
@@ -3734,6 +3935,44 @@ pub(crate) async fn run_tui(
                 mode = match mode {
                     Mode::LogScroll => Mode::LogScroll,
                     Mode::PauseInput => Mode::PauseInput,
+                    // The token has no index to rebind. A session list
+                    // can shrink under the cursor, so it is clamped
+                    // against the refreshed count rather than trusted.
+                    Mode::TokenPage { scroll } => Mode::TokenPage { scroll },
+                    Mode::PriorityPage { value } => Mode::PriorityPage { value },
+                    // The candidate is re-located by label the way the
+                    // picker's is; a list that changed under the step
+                    // must not add a DIFFERENT agent.
+                    Mode::AddReviews {
+                        candidate,
+                        kind,
+                        sel,
+                    } => match rebind_picker_sel_by_label(
+                        candidate,
+                        picker_label.as_deref(),
+                        &picker,
+                    ) {
+                        Some(candidate) => Mode::AddReviews {
+                            candidate,
+                            kind,
+                            sel,
+                        },
+                        None => Mode::AgentPanel {
+                            sel: crate::cli::status_tui::input::add_row_index(&panel_row_list(
+                                &snapshot,
+                                cols as usize,
+                            )),
+                        },
+                    },
+                    Mode::SessionsPage { sel } => Mode::SessionsPage {
+                        sel: sel.min(
+                            remote_page
+                                .as_ref()
+                                .map(|p| p.sessions.len())
+                                .unwrap_or(0)
+                                .saturating_sub(1),
+                        ),
+                    },
                     // The answered block may be gone after a refresh;
                     // an out-of-range index must not answer a
                     // DIFFERENT agent's question, so drop to the log.
@@ -3836,7 +4075,7 @@ pub(crate) async fn run_tui(
                     // candidate by identity: if the selected candidate is
                     // still available after a config refresh, keep the page;
                     // otherwise close to the panel.
-                    Mode::AddPicker { sel, tier } => rebind_add_picker_after_refresh(
+                    Mode::AddPicker { sel } => rebind_add_picker_after_refresh(
                         sel,
                         picker_label.as_deref(),
                         &picker,
@@ -3844,7 +4083,6 @@ pub(crate) async fn run_tui(
                             &snapshot,
                             cols as usize,
                         )),
-                        tier,
                     ),
                     Mode::Confirm {
                         action: ConfirmAction::AddCandidate { idx, tier },
@@ -5067,6 +5305,66 @@ pub(crate) mod tests {
         assert!(!many.resize);
     }
 
+    /// Every mode that holds a candidate by index says so in ONE
+    /// place, so the refresh captures its label and keeps its list.
+    /// The coverage step was added to the rebind and not to the
+    /// capture, so an ordinary background refresh dropped the list and
+    /// sent the operator back to the panel mid-choice.
+    #[test]
+    fn every_mode_holding_a_candidate_keeps_it_across_a_refresh() {
+        use crate::cli::teams_config::ReviewKind;
+        let holders = [
+            Mode::AddPicker { sel: 2 },
+            Mode::SwapPicker { out: 0, sel: 2 },
+            Mode::AddReviews {
+                candidate: 2,
+                kind: ReviewKind::Commit,
+                sel: 0,
+            },
+            Mode::Confirm {
+                action: ConfirmAction::AddCandidate {
+                    idx: 2,
+                    tier: ReviewKind::Commit,
+                },
+            },
+        ];
+        for mode in holders {
+            assert_eq!(
+                candidate_index(mode),
+                Some(2),
+                "{mode:?} holds a candidate the refresh must capture"
+            );
+        }
+        // And pages that hold none do not pin the list open.
+        for mode in [
+            Mode::LogScroll,
+            Mode::AgentDetail { idx: 0, sel: 0 },
+            Mode::RemotePage { sel: 0 },
+        ] {
+            assert_eq!(candidate_index(mode), None, "{mode:?}");
+        }
+
+        // A reorder under the coverage step re-locates the candidate
+        // by LABEL, so the roster gains the agent that was chosen.
+        let before = ["alpha", "beta", "gamma"];
+        let after = ["gamma", "alpha", "beta"];
+        let picker: Vec<crate::cli::status::AvailableAgent> = after
+            .iter()
+            .map(|l| crate::cli::status::AvailableAgent {
+                label: (*l).to_string(),
+                tool: "x".into(),
+                invocation: "x".into(),
+                description: None,
+            })
+            .collect();
+        let was = before[2]; // gamma, at index 2 before the reorder
+        assert_eq!(
+            rebind_picker_sel_by_label(2, Some(was), &picker),
+            Some(0),
+            "gamma moved to the front and the choice followed it"
+        );
+    }
+
     #[test]
     fn roster_confirm_decision_returns_to_origin_pages() {
         assert_eq!(
@@ -5081,13 +5379,17 @@ pub(crate) mod tests {
                 2
             ),
             (
-                Mode::AddPicker {
-                    sel: 1,
-                    tier: crate::cli::teams_config::ReviewKind::Commit
+                Mode::AddReviews {
+                    candidate: 1,
+                    kind: crate::cli::teams_config::ReviewKind::Commit,
+                    sel: 0
                 },
                 false
             ),
-            "cancel/failed add returns to the selected picker candidate"
+            // Back to the step that asked WHAT they review, carrying
+            // the coverage already chosen — not back to choosing WHO,
+            // which the operator already answered.
+            "a refused add returns to the review step, not the picker"
         );
         assert_eq!(
             roster_confirm_after_decision(ConfirmAction::RemoveAgent { idx: 1 }, false, 0, 2, 2),
@@ -5191,7 +5493,8 @@ pub(crate) mod tests {
             OverlayData::Commit(d) => d.subject.clone(),
             OverlayData::StashedPlan { .. }
             | OverlayData::Error { .. }
-            | OverlayData::Link { .. } => unreachable!(),
+            | OverlayData::Link { .. }
+            | OverlayData::Info { .. } => unreachable!(),
         };
         // A review row opens at a non-zero offset (commit row would be 0).
         let mut o = Overlay::commit(data("first"), 5);
@@ -5223,10 +5526,7 @@ pub(crate) mod tests {
 
         // Every panel-family mode enforces; the log mode never touches it.
         for mode in [
-            Mode::AddPicker {
-                sel: 0,
-                tier: crate::cli::teams_config::ReviewKind::Commit,
-            },
+            Mode::AddPicker { sel: 0 },
             Mode::AgentDetail { idx: 0, sel: 0 },
             Mode::Confirm {
                 action: ConfirmAction::RemoveAgent { idx: 0 },
@@ -5397,18 +5697,19 @@ pub(crate) mod tests {
             body: None,
             scroll: 0,
         };
-        change_priority(p, &mut page, 10).unwrap();
+        set_priority_to(p, &mut page, 510).unwrap();
         let after = p.join(".clank/queue/510-foo.md");
         assert!(after.exists() && !before.exists(), "the file was renamed");
         assert_eq!(page.st, input::PlanPageState::Queued { priority: 510 });
         assert_eq!(page.entry.as_deref(), Some(after.as_path()));
-        // The ends absorb through the same path: 999 is a no-op rename.
-        change_priority(p, &mut page, 1000).unwrap();
+        // The page clamps before it writes, so the ceiling arrives
+        // here already applied.
+        set_priority_to(p, &mut page, 999).unwrap();
         assert_eq!(page.st, input::PlanPageState::Queued { priority: 999 });
         assert!(p.join(".clank/queue/999-foo.md").exists());
         // An ambiguous name is refused, and the page is left as it was.
         std::fs::write(p.join(".clank/queue/foo.md"), "# other foo").unwrap();
-        assert!(change_priority(p, &mut page, -10).is_err());
+        assert!(set_priority_to(p, &mut page, 989).is_err());
         assert_eq!(page.st, input::PlanPageState::Queued { priority: 999 });
         // A page that is not queued has no priority to change.
         let mut active = PlanPage {
@@ -5418,7 +5719,7 @@ pub(crate) mod tests {
             body: None,
             scroll: 0,
         };
-        change_priority(p, &mut active, 10).unwrap();
+        set_priority_to(p, &mut active, 510).unwrap();
         assert_eq!(
             active.st,
             input::PlanPageState::Active { repo_paused: false }
@@ -5754,7 +6055,7 @@ pub(crate) mod tests {
         // ignored me". A failing core (no repo at the path) must
         // surface through the error out-param and keep the page open.
         let mut s = two_agent_snap();
-        let mut err: Option<(String, String)> = None;
+        let mut err: Option<Overlay> = None;
         let next = apply_detail_action(
             DetailAction::PromoteToMaster,
             1,
@@ -5764,9 +6065,12 @@ pub(crate) mod tests {
             &mut err,
             1,
         );
-        let (title, msg) = err.expect("failure must be reported, not swallowed");
+        let opened = err.expect("failure must be reported, not swallowed");
+        let OverlayData::Error { title, message } = &opened.data else {
+            panic!("a failure opens the FAILURE overlay, not another kind");
+        };
         assert_eq!(title, "promote failed");
-        assert!(!msg.is_empty());
+        assert!(!message.is_empty());
         assert_eq!(
             next,
             Mode::AgentDetail { idx: 1, sel: 4 },
