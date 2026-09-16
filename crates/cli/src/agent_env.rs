@@ -2,6 +2,13 @@
 //! that knows about `CLAUDE_CODE_SESSION_ID`, `CODEX_THREAD_ID`,
 //! and `CLANK_AGENT`. Every command that builds `IdentityInputs`
 //! goes through here.
+//!
+//! Each reader comes in two: the `_from_env` one a command calls,
+//! which reads the running process, and an `_in` one taking an
+//! [`Ambient`], which reads what its caller states. A test uses the
+//! second, because the process environment cannot be set up per-test
+//! — Rust runs tests in threads of one process — and because a
+//! developer's shell would otherwise decide what the fixture meant.
 
 use std::env;
 use std::path::Path;
@@ -46,6 +53,80 @@ pub(crate) const SESSION_IDENTITY_VARS: &[&str] = &[
     ENV_CLANK_BOOTSTRAP_SESSION,
 ];
 
+/// Everything identity comes from OUTSIDE the program: the identity
+/// variables, and the two ambient facts grok's detection needs to
+/// find a session directory. A test states all of it and inherits
+/// nothing; the binary reads the process.
+///
+/// This exists because the process environment is an input like any
+/// other, and a developer's shell is not a fixture: every agent
+/// running inside clank exports `CLANK_AGENT`, which outranks every
+/// other signal here, so any test that reached this module read the
+/// room instead of its own setup.
+pub(crate) trait Ambient {
+    fn var(&self, key: &str) -> Option<String>;
+    fn home(&self) -> Option<std::path::PathBuf>;
+    fn cwd(&self) -> Option<std::path::PathBuf>;
+}
+
+/// The real one. Named at `main`'s edges and nowhere below them.
+pub(crate) struct Process;
+
+impl Ambient for Process {
+    fn var(&self, key: &str) -> Option<String> {
+        env::var(key).ok()
+    }
+    fn home(&self) -> Option<std::path::PathBuf> {
+        env::var_os("HOME").map(std::path::PathBuf::from)
+    }
+    fn cwd(&self) -> Option<std::path::PathBuf> {
+        env::current_dir().ok()
+    }
+}
+
+/// A stated environment: what a test says, and nothing else. The
+/// default states nothing at all, which is what almost every test
+/// wants — it is only ever wrong by being too empty, never by being
+/// the developer's shell.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct Stated {
+    vars: std::collections::BTreeMap<String, String>,
+    home: Option<std::path::PathBuf>,
+    cwd: Option<std::path::PathBuf>,
+}
+
+#[cfg(test)]
+impl Stated {
+    pub(crate) fn saying(pairs: &[(&str, &str)]) -> Self {
+        Self {
+            vars: pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            ..Default::default()
+        }
+    }
+    pub(crate) fn at(mut self, home: &std::path::Path, cwd: &std::path::Path) -> Self {
+        self.home = Some(home.to_path_buf());
+        self.cwd = Some(cwd.to_path_buf());
+        self
+    }
+}
+
+#[cfg(test)]
+impl Ambient for Stated {
+    fn var(&self, key: &str) -> Option<String> {
+        self.vars.get(key).cloned()
+    }
+    fn home(&self) -> Option<std::path::PathBuf> {
+        self.home.clone()
+    }
+    fn cwd(&self) -> Option<std::path::PathBuf> {
+        self.cwd.clone()
+    }
+}
+
 /// Try to detect (tool, session_id) from the env vars set by the
 /// running agent. Returns `Ok(Some(...))` when exactly one of the
 /// session env vars is set (the common case); `Ok(None)` when
@@ -85,21 +166,21 @@ fn select_explicit_session(
 }
 
 pub fn detect_session_from_env() -> Result<Option<(Tool, SessionId)>, EnvError> {
+    detect_session_in(&Process)
+}
+
+pub(crate) fn detect_session_in(env: &dyn Ambient) -> Result<Option<(Tool, SessionId)>, EnvError> {
     let explicit = select_explicit_session(&[
         (
             ENV_CLAUDE_SESSION,
             Tool::Claude,
-            env::var(ENV_CLAUDE_SESSION).ok(),
+            env.var(ENV_CLAUDE_SESSION),
         ),
-        (
-            ENV_CODEX_SESSION,
-            Tool::Codex,
-            env::var(ENV_CODEX_SESSION).ok(),
-        ),
+        (ENV_CODEX_SESSION, Tool::Codex, env.var(ENV_CODEX_SESSION)),
         (
             ENV_OPENCODE_SESSION,
             Tool::OpenCode,
-            env::var(ENV_OPENCODE_SESSION).ok(),
+            env.var(ENV_OPENCODE_SESSION),
         ),
     ])?;
     match explicit {
@@ -110,12 +191,13 @@ pub fn detect_session_from_env() -> Result<Option<(Tool, SessionId)>, EnvError> 
         None => {
             // Blank marker = scrubbed-by-blanking, same as the
             // explicit vars above.
-            if !env::var(ENV_GROK_MARKER).is_ok_and(|v| !v.is_empty()) {
+            if !env.var(ENV_GROK_MARKER).is_some_and(|v| !v.is_empty()) {
                 return Ok(None);
             }
-            let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-            let cwd = std::env::current_dir().ok();
-            match (home, cwd) {
+            // Grok's session lives on disk, so a stated environment
+            // must state the disk too — falling back to the real HOME
+            // here would put the developer's sessions back in.
+            match (env.home(), env.cwd()) {
                 (Some(home), Some(cwd)) => {
                     Ok(grok_session_for_cwd(&home, &cwd).map(|sid| (Tool::Grok, sid)))
                 }
@@ -165,7 +247,11 @@ fn grok_session_for_cwd(home: &std::path::Path, cwd: &std::path::Path) -> Option
 /// string is treated as "unset" so users can clear the override
 /// with `CLANK_AGENT= clank ...`.
 pub fn explicit_label_from_env() -> Result<Option<AgentLabel>, EnvError> {
-    let Ok(raw) = env::var(ENV_CLANK_AGENT) else {
+    explicit_label_in(&Process)
+}
+
+pub(crate) fn explicit_label_in(env: &dyn Ambient) -> Result<Option<AgentLabel>, EnvError> {
+    let Some(raw) = env.var(ENV_CLANK_AGENT) else {
         return Ok(None);
     };
     if raw.is_empty() {
@@ -252,6 +338,10 @@ impl std::error::Error for EnvError {}
 /// receive `session_id` via stdin and `tool` via `--tool`, not
 /// from env — see `cli::stop_hook` (later commit).
 pub fn resolve_identity_from_env(repo: &Path) -> anyhow::Result<AgentLabel> {
+    resolve_identity_in(repo, &Process)
+}
+
+pub(crate) fn resolve_identity_in(repo: &Path, env: &dyn Ambient) -> anyhow::Result<AgentLabel> {
     // Highest precedence: explicit CLANK_AGENT override. Short-
     // circuit BEFORE touching session env — otherwise lower-
     // precedence env state (BothToolsDetected, an unparseable
@@ -259,11 +349,11 @@ pub fn resolve_identity_from_env(repo: &Path) -> anyhow::Result<AgentLabel> {
     // resolver would happily return the explicit label. This
     // mirrors the pure resolver's precedence rule and is what
     // codex's review on `99ce55b` flagged.
-    if let Some(label) = explicit_label_from_env()? {
+    if let Some(label) = explicit_label_in(env)? {
         return Ok(label);
     }
 
-    let detected = detect_session_from_env()?;
+    let detected = detect_session_in(env)?;
     let agent_configs = load_all_agent_configs_lossy(repo)?;
     let (tool, session_id_owned) = match detected {
         Some((t, sid)) => (t, Some(sid)),
@@ -296,16 +386,19 @@ pub fn resolve_identity_from_env(repo: &Path) -> anyhow::Result<AgentLabel> {
     })
 }
 
-/// Hook-specific identity resolution: caller passes `tool`
-/// (from `--tool`) and `session_id` (from hook stdin); env
-/// `CLANK_AGENT` still wins if set. Used by `clank stop-hook`,
-/// NOT by regular CLI commands (which read session_id from env).
-pub fn resolve_identity_for_hook(
+/// Hook-specific identity resolution: caller passes `tool` (from
+/// `--tool`), `session_id` (from hook stdin), and the environment
+/// `CLANK_AGENT` may override from. Used by `clank stop-hook`, NOT by
+/// regular CLI commands (which read session_id from env). The hook
+/// names its own [`Process`] at the edge, so there is no wrapper
+/// here that hides one.
+pub(crate) fn resolve_identity_for_hook_in(
     repo: &Path,
     tool: Tool,
     session_id: &SessionId,
+    env: &dyn Ambient,
 ) -> anyhow::Result<AgentLabel> {
-    if let Some(label) = explicit_label_from_env()? {
+    if let Some(label) = explicit_label_in(env)? {
         return Ok(label);
     }
     let agent_configs = load_all_agent_configs_lossy(repo)?;
@@ -334,6 +427,72 @@ pub fn resolve_identity_for_hook(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The seam has to carry what a test SAYS, not merely refuse what
+    /// the shell holds: an empty environment and a stated one must
+    /// give different answers, or the tests below prove nothing.
+    #[test]
+    fn a_stated_environment_is_the_only_one_read() {
+        assert_eq!(explicit_label_in(&Stated::default()).unwrap(), None);
+        assert_eq!(
+            explicit_label_in(&Stated::saying(&[(ENV_CLANK_AGENT, "codex")]))
+                .unwrap()
+                .map(|l| l.as_str().to_string()),
+            Some("codex".to_string()),
+            "the override still wins — through the seam, from the fixture"
+        );
+        assert_eq!(
+            explicit_label_in(&Stated::saying(&[(ENV_CLANK_AGENT, "")])).unwrap(),
+            None,
+            "blank still clears the override"
+        );
+        assert_eq!(detect_session_in(&Stated::default()).unwrap(), None);
+        let sid = "11111111-2222-3333-4444-555555555555";
+        assert_eq!(
+            detect_session_in(&Stated::saying(&[(ENV_CODEX_SESSION, sid)]))
+                .unwrap()
+                .map(|(tool, s)| (tool, s.as_str().to_string())),
+            Some((Tool::Codex, sid.to_string()))
+        );
+    }
+
+    /// Grok's session lives on disk, so a stated environment must
+    /// state the disk too. Falling back to the real `HOME` or cwd
+    /// here would put the developer's own grok sessions back into
+    /// the fixture (codex on 5607750).
+    #[test]
+    fn grok_detection_reads_the_stated_disk_not_the_developers() {
+        let home = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let sid = "11111111-2222-3333-4444-555555555555";
+        let encoded: String = cwd
+            .path()
+            .to_string_lossy()
+            .bytes()
+            .map(|b| match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    (b as char).to_string()
+                }
+                _ => format!("%{b:02X}"),
+            })
+            .collect();
+        std::fs::create_dir_all(home.path().join(".grok/sessions").join(&encoded).join(sid))
+            .unwrap();
+
+        let marked = || Stated::saying(&[(ENV_GROK_MARKER, "1")]);
+        assert_eq!(
+            detect_session_in(&marked().at(home.path(), cwd.path()))
+                .unwrap()
+                .map(|(tool, s)| (tool, s.as_str().to_string())),
+            Some((Tool::Grok, sid.to_string())),
+            "the stated disk is where the session is found"
+        );
+        assert_eq!(
+            detect_session_in(&marked()).unwrap(),
+            None,
+            "no stated home and cwd means no session — not the real ones"
+        );
+    }
 
     fn cands(
         claude: Option<&str>,

@@ -19,31 +19,10 @@
 //! call has to name the action as a string literal, which is what is
 //! matched.
 
-use std::path::{Path, PathBuf};
+use crate::common::{crates_dir, rs_files};
 
 /// Actions served by `populate_session_layout_metadata`.
 const EXPENSIVE_ACTIONS: &[&str] = &["list-clients", "dump-layout"];
-
-fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for e in entries.flatten() {
-        let p = e.path();
-        if p.is_dir() {
-            rs_files(&p, out);
-        } else if p.extension().is_some_and(|x| x == "rs") {
-            out.push(p);
-        }
-    }
-}
-
-fn crates_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("crates/cli has a parent")
-        .to_path_buf()
-}
 
 #[test]
 fn no_process_enumerating_zellij_actions_in_production() {

@@ -9,48 +9,10 @@
 //! This is the whole point of the centralization: a new git/gix use
 //! anywhere else fails `cargo test`, so the boundary can't erode.
 
-use std::path::{Path, PathBuf};
+use crate::common::{crates_dir, rs_files, strip_test_code};
 
 /// The only files allowed to name `git`/`gix` directly.
 const LAYER_FILES: &[&str] = &["git_io.rs", "git_plumbing.rs"];
-
-/// Remove `#[cfg(test)]` items (modules and fns — both brace-delimited
-/// in this tree) so the scan sees only production code.
-fn strip_test_code(src: &str) -> String {
-    let mut out = String::new();
-    let mut in_test = false;
-    let mut depth = 0i32;
-    let mut entered = false; // seen the item's opening brace yet?
-    for line in src.lines() {
-        if !in_test {
-            if line.trim_start().starts_with("#[cfg(test)]") {
-                in_test = true;
-                depth = 0;
-                entered = false;
-                // fall through: count this attr line's braces (usually none)
-            } else {
-                out.push_str(line);
-                out.push('\n');
-                continue;
-            }
-        }
-        for c in line.chars() {
-            match c {
-                '{' => {
-                    depth += 1;
-                    entered = true;
-                }
-                '}' => depth -= 1,
-                _ => {}
-            }
-        }
-        if entered && depth <= 0 {
-            in_test = false;
-        }
-        // lines while `in_test` are dropped
-    }
-    out
-}
 
 /// What (if anything) a production line illegally names.
 fn line_violation(line: &str) -> Option<&'static str> {
@@ -67,28 +29,6 @@ fn line_violation(line: &str) -> Option<&'static str> {
         return Some("`gix` crate import");
     }
     None
-}
-
-fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for e in entries.flatten() {
-        let p = e.path();
-        if p.is_dir() {
-            rs_files(&p, out);
-        } else if p.extension().is_some_and(|x| x == "rs") {
-            out.push(p);
-        }
-    }
-}
-
-/// The workspace `crates/` dir (this test's manifest is `crates/cli`).
-fn crates_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("crates/cli has a parent")
-        .to_path_buf()
 }
 
 #[test]

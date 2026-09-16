@@ -39,7 +39,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use super::{StopHookArgs, resolve_repo};
-use crate::agent_env::resolve_identity_for_hook;
+use crate::agent_env::{Ambient, Process, resolve_identity_for_hook_in};
 use crate::agent_store::load_agent_config;
 use crate::lifecycle::AgentLabel;
 use clank_core::ids::SessionId;
@@ -60,12 +60,22 @@ pub async fn run(args: StopHookArgs) -> anyhow::Result<()> {
     let async_loop =
         tool == Tool::Claude && args.loop_mode == Some(crate::cli::LoopModeArg::Asyncrewake);
     let outcome = match read_hook_stdin() {
-        Ok(input) => match orphaned_by_its_pane(args.repo.as_deref(), &input.session_id) {
-            Some(message) => HookOutcome::Diagnostic { message },
-            None => {
-                compute_outcome_with(tool, args.repo.as_deref(), input, async_loop, started).await
+        Ok(input) => {
+            match orphaned_by_its_pane(args.repo.as_deref(), &input.session_id, &Process) {
+                Some(message) => HookOutcome::Diagnostic { message },
+                None => {
+                    compute_outcome_with(
+                        tool,
+                        args.repo.as_deref(),
+                        input,
+                        async_loop,
+                        started,
+                        &Process,
+                    )
+                    .await
+                }
             }
-        },
+        }
         Err(e) => HookOutcome::Diagnostic { message: e },
     };
     emit_and_exit(outcome, tool);
@@ -100,12 +110,16 @@ pub async fn run(args: StopHookArgs) -> anyhow::Result<()> {
 /// of a lost pane (see [`crate::cli::open_zellij::pane_is_gone`]),
 /// including a session bound by hand with `clank as`, which never had
 /// a pane of clank's.
-fn orphaned_by_its_pane(repo: Option<&Path>, session: &SessionId) -> Option<String> {
+fn orphaned_by_its_pane(
+    repo: Option<&Path>,
+    session: &SessionId,
+    env: &dyn Ambient,
+) -> Option<String> {
     if !crate::cli::open_zellij::own_pane_is_gone() {
         return None;
     }
     let repo = crate::cli::resolve_repo(repo).ok()?;
-    let label = crate::agent_env::resolve_identity_from_env(&repo).ok()?;
+    let label = crate::agent_env::resolve_identity_in(&repo, env).ok()?;
     // Three outcomes, three sentences. Collapsing the failure into
     // "someone else holds it" would report a binding that is STILL
     // THERE as safely handed over — in the plan about refusals you can
@@ -132,7 +146,33 @@ async fn compute_outcome(
     repo_override: Option<&Path>,
     input: HookInput,
 ) -> HookOutcome {
-    compute_outcome_with(tool, repo_override, input, false, std::time::Instant::now()).await
+    compute_outcome_in(
+        tool,
+        repo_override,
+        input,
+        &crate::agent_env::Stated::default(),
+    )
+    .await
+}
+
+/// The same, for a test that wants to STATE an environment — an
+/// exported `CLANK_AGENT`, say — rather than the empty one.
+#[cfg(test)]
+async fn compute_outcome_in(
+    tool: Tool,
+    repo_override: Option<&Path>,
+    input: HookInput,
+    env: &dyn Ambient,
+) -> HookOutcome {
+    compute_outcome_with(
+        tool,
+        repo_override,
+        input,
+        false,
+        std::time::Instant::now(),
+        env,
+    )
+    .await
 }
 
 async fn compute_outcome_with(
@@ -141,6 +181,7 @@ async fn compute_outcome_with(
     input: HookInput,
     async_loop: bool,
     started: std::time::Instant,
+    env: &dyn Ambient,
 ) -> HookOutcome {
     // Decide how the agent's in-flight background work affects this
     // turn-end, BEFORE any clank resolution (`background_disposition` is a
@@ -163,7 +204,7 @@ async fn compute_outcome_with(
         Err(e) => return HookOutcome::Diagnostic { message: e },
     };
 
-    let label = match resolve_identity_for_hook(&repo, tool, &input.session_id) {
+    let label = match resolve_identity_for_hook_in(&repo, tool, &input.session_id, env) {
         Ok(l) => l,
         Err(e) => {
             return HookOutcome::Diagnostic {
@@ -455,6 +496,7 @@ fn session_started(
     tool: Tool,
     input: &SessionStartInput,
     launched_as: Option<&AgentLabel>,
+    env: &dyn Ambient,
 ) -> Option<AgentLabel> {
     let sid = clank_core::ids::SessionId::parse(&input.session_id).ok()?;
     match launched_as {
@@ -480,7 +522,7 @@ fn session_started(
             Some(label.clone())
         }
         None => {
-            let label = resolve_identity_for_hook(repo, tool, &sid).ok()?;
+            let label = resolve_identity_for_hook_in(repo, tool, &sid, env).ok()?;
             // Mint here — revoking any waiter surviving from a previous
             // incarnation (whose wake pipe is dead, M0) — and discard
             // the error by the same policy.
@@ -510,8 +552,8 @@ async fn run_session_start(args: StopHookArgs) -> anyhow::Result<()> {
         return Ok(());
     };
     let tool: Tool = args.tool.into();
-    let launched_as = crate::agent_env::explicit_label_from_env().ok().flatten();
-    let Some(label) = session_started(&repo, tool, &input, launched_as.as_ref()) else {
+    let launched_as = crate::agent_env::explicit_label_in(&Process).ok().flatten();
+    let Some(label) = session_started(&repo, tool, &input, launched_as.as_ref(), &Process) else {
         return Ok(());
     };
 
@@ -2128,6 +2170,14 @@ fn emit_and_exit(outcome: HookOutcome, tool: Tool) -> ! {
 mod tests {
     use super::*;
 
+    /// The environment a test brings: nothing. Identity resolution
+    /// must see the fixture's own setup and not the shell that
+    /// happens to be running `cargo test` — every agent inside clank
+    /// exports `CLANK_AGENT`, which outranks everything else.
+    fn stated() -> crate::agent_env::Stated {
+        crate::agent_env::Stated::default()
+    }
+
     fn init_repo() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         let ok = std::process::Command::new("git")
@@ -3236,6 +3286,7 @@ mod tests {
             Tool::Codex,
             &start_input(first, "startup"),
             Some(&codex),
+            &stated(),
         );
         assert_eq!(got.as_ref().map(|l| l.as_str()), Some("codex"));
         assert_eq!(
@@ -3254,6 +3305,7 @@ mod tests {
             Tool::Codex,
             &start_input(cleared, "clear"),
             Some(&codex),
+            &stated(),
         );
         assert_eq!(
             bound_session(repo, "codex"),
@@ -3275,6 +3327,7 @@ mod tests {
                 Tool::Codex,
                 &start_input(cleared, source),
                 Some(&codex),
+                &stated(),
             );
             assert_eq!(
                 bound_session(repo, "codex"),
@@ -3293,7 +3346,13 @@ mod tests {
         let sid = "01a08361-f112-75d0-a49f-2e35b104e3b6";
         bind_tool(repo, "old", sid, Tool::Codex);
         let new = AgentLabel::parse("new").unwrap();
-        session_started(repo, Tool::Codex, &start_input(sid, "startup"), Some(&new));
+        session_started(
+            repo,
+            Tool::Codex,
+            &start_input(sid, "startup"),
+            Some(&new),
+            &stated(),
+        );
         assert_eq!(
             bound_session(repo, "new"),
             Some((Tool::Codex, sid.to_string()))
@@ -3309,7 +3368,16 @@ mod tests {
         let dir = init_repo();
         let repo = dir.path();
         let sid = "9c96eb03-1458-4bac-abbb-90243cfd422c";
-        assert!(session_started(repo, Tool::Claude, &start_input(sid, "startup"), None).is_none());
+        assert!(
+            session_started(
+                repo,
+                Tool::Claude,
+                &start_input(sid, "startup"),
+                None,
+                &stated()
+            )
+            .is_none()
+        );
         assert!(
             crate::agent_store::load_all_agent_configs(repo)
                 .unwrap()
@@ -3317,7 +3385,13 @@ mod tests {
             "nothing bound"
         );
         bind(repo, "claude", sid);
-        let got = session_started(repo, Tool::Claude, &start_input(sid, "clear"), None);
+        let got = session_started(
+            repo,
+            Tool::Claude,
+            &start_input(sid, "clear"),
+            None,
+            &stated(),
+        );
         assert_eq!(got.as_ref().map(|l| l.as_str()), Some("claude"));
     }
 
@@ -3499,6 +3573,48 @@ mod tests {
             HookOutcome::Silent {
                 why: SilentReason::AutoOff
             },
+        );
+    }
+
+    /// The seam carries what a test SAYS, not just the absence of a
+    /// shell. `CLANK_AGENT` outranks the session binding — which is
+    /// the production behaviour, and is precisely why a developer's
+    /// exported copy of it used to decide four tests.
+    #[tokio::test]
+    async fn a_stated_override_outranks_the_session_binding() {
+        let dir = init_repo();
+        let repo = dir.path();
+        let label = bind(repo, "codex", "sess-stated-override");
+        crate::agent_store::set_auto_mode(repo, &label, AutoMode::Off).unwrap();
+
+        let stated_elsewhere =
+            crate::agent_env::Stated::saying(&[("CLANK_AGENT", "somebody-else")]);
+        let outcome = compute_outcome_in(
+            Tool::Claude,
+            Some(repo),
+            hook_input("sess-stated-override", Some("done")),
+            &stated_elsewhere,
+        )
+        .await;
+        match outcome {
+            HookOutcome::Diagnostic { message } => assert!(
+                message.contains("somebody-else"),
+                "the stated override decided the identity, not the binding: {message}"
+            ),
+            other => panic!("expected the stated label to be used: {other:?}"),
+        }
+
+        assert_eq!(
+            compute_outcome(
+                Tool::Claude,
+                Some(repo),
+                hook_input("sess-stated-override", Some("done"))
+            )
+            .await,
+            HookOutcome::Silent {
+                why: SilentReason::AutoOff
+            },
+            "and with nothing stated, the binding decides"
         );
     }
 
@@ -4417,6 +4533,7 @@ mod tests {
             input,
             async_loop,
             std::time::Instant::now(),
+            &stated(),
         )
         .await
     }

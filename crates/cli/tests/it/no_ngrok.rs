@@ -12,7 +12,8 @@
 //! and team commands and a variant removed from the enum would take
 //! `clank team` down with the tunnel.
 
-use std::path::{Path, PathBuf};
+use crate::common::{crates_dir, rs_files};
+use std::path::Path;
 
 /// Using the SDK, as opposed to SAYING the word. Prose may name it —
 /// the retired variant explains itself, and a test may describe what
@@ -23,27 +24,6 @@ const USES: &[&str] = &[
     "NGROK_AUTHTOKEN",
     "extern crate ngrok",
 ];
-
-fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for e in entries.flatten() {
-        let p = e.path();
-        if p.is_dir() {
-            rs_files(&p, out);
-        } else if p.extension().is_some_and(|x| x == "rs") {
-            out.push(p);
-        }
-    }
-}
-
-fn crates_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("crates/cli has a parent")
-        .to_path_buf()
-}
 
 #[test]
 fn nothing_calls_the_ngrok_sdk() {

@@ -30,7 +30,7 @@
 //! that deletes the rationale for not calling something teaches
 //! nothing.
 
-use std::path::{Path, PathBuf};
+use crate::common::{crates_dir, rs_files};
 
 /// The ONE file that may start a `zellij` process or read `$ZELLIJ`.
 const SPAWNER: &str = "cli/open_zellij.rs";
@@ -84,27 +84,6 @@ fn mutation_violation(line: &str) -> Option<String> {
 /// neither spawner nor reconciler.
 fn line_violation(line: &str) -> Option<String> {
     spawn_violation(line).or_else(|| mutation_violation(line))
-}
-
-fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for e in entries.flatten() {
-        let p = e.path();
-        if p.is_dir() {
-            rs_files(&p, out);
-        } else if p.extension().is_some_and(|x| x == "rs") {
-            out.push(p);
-        }
-    }
-}
-
-fn crates_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("crates/cli has a parent")
-        .to_path_buf()
 }
 
 /// An enforcement gate has to name what it bans, as data.
