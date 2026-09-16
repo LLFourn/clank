@@ -107,6 +107,8 @@ cloudflare-quick-tunnel = "0.3"
 # never delivers a stream — an upgrade is not a body (measured).
 hyper-tungstenite = "0.30"
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+hickory-resolver = "0.24"
+hickory-client = "0.24"
 
 [[bin]]
 name = "clank"

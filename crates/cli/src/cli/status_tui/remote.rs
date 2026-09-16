@@ -305,6 +305,7 @@ impl<O: Opener> Remote<O> {
                                 provider,
                                 grace: tunnel_grace,
                                 abort: abandoned,
+                                ask: std::sync::Arc::new(crate::cli::web::dns::Net::default()),
                             };
                             Instance::start(repo, home, panes, door, Some(start), poll, grace).await
                         }
@@ -985,7 +986,10 @@ mod tests {
         crate::agent_store::record_web_port(repo.path(), port).unwrap();
         let provider = Arc::new(FakeTunnel {
             allocated,
-            url: url.unwrap_or_else(|| format!("http://localhost:{port}")),
+            // The literal it actually binds, not a name: an
+            // allocated endpoint is resolved at its own nameservers
+            // now, and `localhost` has no zone to ask.
+            url: url.unwrap_or_else(|| format!("http://127.0.0.1:{port}")),
             pending,
             started: Default::default(),
             stopped: Default::default(),

@@ -45,7 +45,7 @@ pub enum TunnelSection {
 
 /// How long a start has to come up: the provider's connect, then
 /// the probe through the public URL, together.
-pub(crate) const TUNNEL_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+pub(crate) const TUNNEL_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
 /// How long a stop waits for the provider to end before letting go
 /// of it: the SDK's close, a child's exit.
 pub(crate) const STOP_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
@@ -726,6 +726,10 @@ impl Lease {
 pub(crate) enum NotUp {
     /// Nothing answered `/instance` within the grace.
     NoAnswer(String),
+    /// The name the tunnel came up on was never published. The
+    /// tunnel itself may be perfectly healthy: this says the edge
+    /// could not be found, not that it would not answer.
+    NoName(String),
     /// `/instance` answered with another remote's nonce.
     AnotherInstance,
     /// The route answers but the live channel does not: a tunnel
@@ -737,6 +741,7 @@ impl std::fmt::Display for NotUp {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             NotUp::NoAnswer(why) => write!(f, "not reachable through the tunnel: {why}"),
+            NotUp::NoName(why) => write!(f, "the tunnel's name never appeared in DNS: {why}"),
             NotUp::AnotherInstance => write!(f, "another clank remote answers at that URL"),
             NotUp::NoStream(why) => write!(
                 f,
@@ -773,9 +778,17 @@ pub(crate) async fn probe(
     url: &str,
     nonce: &str,
     deadline: tokio::time::Instant,
+    pin: Option<std::net::SocketAddr>,
 ) -> Result<(), NotUp> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
+    let host = url::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_string))
+        .ok_or_else(|| NotUp::NoName(format!("`{url}` has no host")))?;
+    let mut building = reqwest::Client::builder().timeout(std::time::Duration::from_secs(5));
+    if let Some(addr) = pin {
+        building = building.resolve(&host, addr);
+    }
+    let client = building
         .build()
         .map_err(|e| NotUp::NoAnswer(e.to_string()))?;
     loop {
@@ -802,9 +815,25 @@ pub(crate) async fn probe(
         let ws = url
             .replacen("https://", "wss://", 1)
             .replacen("http://", "ws://", 1);
-        let (mut socket, _) = tokio_tungstenite::connect_async(format!("{ws}/instance/stream"))
-            .await
-            .map_err(|e| because(&e))?;
+        let asked = format!("{ws}/instance/stream");
+        let (mut socket, _) = match pin {
+            // The pin has to reach the socket too, or the half of the
+            // probe that proves the page works is the half that asks
+            // the resolver we went out of our way to avoid.
+            Some(addr) => {
+                use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+                let request = asked.into_client_request().map_err(|e| because(&e))?;
+                let tcp = tokio::net::TcpStream::connect(addr)
+                    .await
+                    .map_err(|e| because(&e))?;
+                tokio_tungstenite::client_async_tls_with_config(request, tcp, None, None)
+                    .await
+                    .map_err(|e| because(&e))?
+            }
+            None => tokio_tungstenite::connect_async(asked)
+                .await
+                .map_err(|e| because(&e))?,
+        };
         loop {
             match futures_util::StreamExt::next(&mut socket).await {
                 Some(Ok(tokio_tungstenite::tungstenite::Message::Text(said))) => {
@@ -828,6 +857,31 @@ pub(crate) async fn probe(
     }
 }
 
+/// The address `url`'s host is published at, found without ever
+/// asking a caching resolver about that host.
+async fn find(
+    url: &str,
+    deadline: tokio::time::Instant,
+    ask: &dyn super::dns::Ask,
+) -> Result<std::net::SocketAddr, NotUp> {
+    let parsed = url::Url::parse(url).map_err(|e| NotUp::NoName(e.to_string()))?;
+    let port = parsed
+        .port_or_known_default()
+        .ok_or_else(|| NotUp::NoName(format!("`{url}` has no port")))?;
+    // `host_str` keeps the brackets on an IPv6 literal, which no
+    // address parser accepts; the typed host is the one that says
+    // what it actually is.
+    let domain = match parsed.host() {
+        Some(url::Host::Ipv4(ip)) => return Ok(std::net::SocketAddr::new(ip.into(), port)),
+        Some(url::Host::Ipv6(ip)) => return Ok(std::net::SocketAddr::new(ip.into(), port)),
+        Some(url::Host::Domain(name)) => name.to_string(),
+        None => return Err(NotUp::NoName(format!("`{url}` has no host"))),
+    };
+    super::dns::address(ask, &domain, port, deadline)
+        .await
+        .map_err(NotUp::NoName)
+}
+
 /// What a start brings up, if the user config names a tunnel: the
 /// provider, the grace the whole start gets, and the switch that
 /// aborts it — the TUI quitting, or the remote switched off, while
@@ -836,6 +890,9 @@ pub(crate) struct Start {
     pub(crate) provider: std::sync::Arc<dyn Provider>,
     pub(crate) grace: std::time::Duration,
     pub(crate) abort: tokio::sync::watch::Receiver<bool>,
+    /// How the minted name is looked up. Injected for the same
+    /// reason the provider is: a test cannot wait on real DNS.
+    pub(crate) ask: std::sync::Arc<dyn super::dns::Ask>,
 }
 
 /// A tunnel the remote owns: leased, started, proven. `stop` ends
@@ -909,9 +966,39 @@ impl Tunnel {
                 });
             }
         };
+        // Only an ALLOCATED name carries the hazard: it was minted by
+        // this start, seconds ago, and asking a caching resolver about
+        // it before it is published burns it for half an hour. A
+        // claimed name pre-dates the start and already resolves, so
+        // the ordinary path is both correct and safe for it — and
+        // staying on it keeps us out of CNAME chains and split-horizon
+        // setups we have no business second-guessing.
+        let minted = reservation.is_none();
+        let ask = start.ask.clone();
+        let pinned = tokio::select! {
+            _ = abandoned(&mut start.abort) => Err(anyhow::anyhow!("the start was abandoned")),
+            found = async {
+                match minted {
+                    false => Ok(None),
+                    true => find(&url, deadline, ask.as_ref())
+                        .await
+                        .map(Some)
+                        .map_err(|e| anyhow::anyhow!("{e}")),
+                }
+            } => found,
+        };
+        let pin = match pinned {
+            Ok(pin) => pin,
+            Err(why) => {
+                return Err(match end(handle).await {
+                    Some(said) => anyhow::anyhow!("{why}\n{said}"),
+                    None => why,
+                });
+            }
+        };
         let proven = tokio::select! {
             _ = abandoned(&mut start.abort) => Err(anyhow::anyhow!("the start was abandoned")),
-            probed = probe(&url, nonce, deadline) => probed.map_err(|e| anyhow::anyhow!("{e}")),
+            probed = probe(&url, nonce, deadline, pin) => probed.map_err(|e| anyhow::anyhow!("{e}")),
         };
         if let Err(why) = proven {
             return Err(match end(handle).await {
@@ -1040,6 +1127,250 @@ mod tests {
         (url, task)
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "live: needs cloudflared and the internet"]
+    async fn a_real_quick_tunnel_comes_up() {
+        let home = tempfile::tempdir().unwrap();
+        let (url, _srv) = fake_public("n1", true, false).await;
+        let port: u16 = url
+            .strip_prefix("http://127.0.0.1:")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let mut up = start(
+            Command {
+                run: vec![
+                    "cloudflared".to_string(),
+                    "tunnel".to_string(),
+                    "--url".to_string(),
+                    "http://localhost:{port}".to_string(),
+                    "--no-autoupdate".to_string(),
+                ],
+                url: None,
+                url_contains: Some("trycloudflare.com".to_string()),
+            },
+            90,
+        );
+        let began = std::time::Instant::now();
+        let tunnel = Tunnel::up(&mut up, home.path(), port, "n1").await.unwrap();
+        println!("LIVE: up at {} in {:?}", tunnel.url, began.elapsed());
+        tunnel.stop().await;
+    }
+
+    /// An IPv6 literal is already an address. `host_str` keeps the
+    /// brackets, which no address parser accepts, so the typed host
+    /// is what decides — otherwise `[::1]` goes looking for a zone.
+    #[tokio::test]
+    async fn an_ipv6_literal_is_an_address_not_a_name() {
+        let never = Never;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        assert_eq!(
+            find("http://[::1]:8080", deadline, &never).await,
+            Ok("[::1]:8080".parse().unwrap())
+        );
+        assert_eq!(
+            find("http://127.0.0.1:8080", deadline, &never).await,
+            Ok("127.0.0.1:8080".parse().unwrap())
+        );
+        assert_eq!(
+            find("https://[2606:4700::1111]/x", deadline, &never).await,
+            Ok("[2606:4700::1111]:443".parse().unwrap())
+        );
+    }
+
+    /// A resolver that is never allowed to be asked.
+    struct Never;
+
+    impl crate::cli::web::dns::Ask for Never {
+        fn zone_servers<'a>(
+            &'a self,
+            _: &'a str,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Vec<String>, String>> + Send + 'a>,
+        > {
+            panic!("an address was sent to DNS")
+        }
+        fn addresses<'a>(
+            &'a self,
+            _: &'a str,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<Vec<std::net::IpAddr>, String>> + Send + 'a,
+            >,
+        > {
+            panic!("an address was sent to DNS")
+        }
+        fn direct<'a>(
+            &'a self,
+            _: &'a [std::net::SocketAddr],
+            _: &'a str,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<crate::cli::web::dns::Reply, String>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            panic!("an address was sent to DNS")
+        }
+    }
+
+    /// A resolver that accepts the question and never answers.
+    struct Stalled;
+
+    impl crate::cli::web::dns::Ask for Stalled {
+        fn zone_servers<'a>(
+            &'a self,
+            _: &'a str,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Vec<String>, String>> + Send + 'a>,
+        > {
+            Box::pin(std::future::pending())
+        }
+        fn addresses<'a>(
+            &'a self,
+            _: &'a str,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<Vec<std::net::IpAddr>, String>> + Send + 'a,
+            >,
+        > {
+            Box::pin(std::future::pending())
+        }
+        fn direct<'a>(
+            &'a self,
+            _: &'a [std::net::SocketAddr],
+            _: &'a str,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<crate::cli::web::dns::Reply, String>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    /// Switching the remote off while DNS is still pending must end
+    /// the start and take the connector with it. DNS is part of the
+    /// start's lifecycle, not a step outside it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_abort_during_discovery_ends_the_connector() {
+        let home = tempfile::tempdir().unwrap();
+        let pidfile = home.path().join("pid");
+        let (quit, abort) = tokio::sync::watch::channel(false);
+        let mut up = Start {
+            provider: std::sync::Arc::new(Command {
+                run: vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    format!(
+                        "echo $$ > '{}'; echo 'at http://stalled.example:1' >&2; exec sleep 100",
+                        pidfile.display()
+                    ),
+                ],
+                url: None,
+                url_contains: Some("stalled.example".to_string()),
+            }),
+            grace: Duration::from_secs(60),
+            abort,
+            ask: std::sync::Arc::new(Stalled),
+        };
+        let running = tokio::spawn(async move {
+            let home = home;
+            let why = err_of(Tunnel::up(&mut up, home.path(), 4242, "n1").await);
+            (why, pid_from(&pidfile).await)
+        });
+        // Let the child announce and DNS get under way, then quit.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        quit.send(true).unwrap();
+        let (why, pid) = tokio::time::timeout(Duration::from_secs(10), running)
+            .await
+            .expect("the abort must not wait for DNS")
+            .unwrap();
+        assert!(why.contains("abandoned"), "{why}");
+        for _ in 0..40 {
+            if !alive(pid) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("the connector outlived the abandoned start");
+    }
+
+    /// The pin is what the probe connects to — both halves of it.
+    /// The name here is reserved by RFC 2606 never to resolve, so a
+    /// probe that succeeds can only have used the address, and one
+    /// that fails without it proves the name was never the route.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_probe_connects_to_the_pin_not_the_name() {
+        let grace = || tokio::time::Instant::now() + Duration::from_secs(3);
+        let (url, _srv) = fake_public("n1", true, false).await;
+        let addr: std::net::SocketAddr = url.strip_prefix("http://").unwrap().parse().unwrap();
+        let named = format!("http://pinned.invalid:{}", addr.port());
+
+        assert_eq!(probe(&named, "n1", grace(), Some(addr)).await, Ok(()));
+        assert!(
+            matches!(
+                probe(&named, "n1", grace(), None).await,
+                Err(NotUp::NoAnswer(_))
+            ),
+            "without the pin the name must be what fails"
+        );
+    }
+
+    /// A CLAIMED endpoint keeps the ordinary resolver: it pre-dates
+    /// the start, so there is no unpublished name to protect, and the
+    /// failure it reports is the ordinary one. An ALLOCATED name takes
+    /// the authoritative path, and says so when the name is the thing
+    /// that is missing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn only_a_minted_name_takes_the_authoritative_path() {
+        let home = tempfile::tempdir().unwrap();
+        let unresolvable = "http://nope.invalid:1".to_string();
+
+        let mut up = start(
+            Command {
+                run: vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "exec sleep 100".to_string(),
+                ],
+                url: Some(unresolvable.clone()),
+                url_contains: None,
+            },
+            3,
+        );
+        let why = err_of(Tunnel::up(&mut up, home.path(), 4242, "n1").await);
+        assert!(
+            why.contains("not reachable through the tunnel"),
+            "a claimed name keeps the ordinary path: {why}"
+        );
+        assert!(
+            !why.contains("never appeared in DNS"),
+            "a claimed name must not take the authoritative path: {why}"
+        );
+
+        let mut up = start(
+            Command {
+                run: vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    format!("echo 'at {unresolvable}' >&2; exec sleep 100"),
+                ],
+                url: None,
+                url_contains: Some("nope.invalid".to_string()),
+            },
+            3,
+        );
+        let why = err_of(Tunnel::up(&mut up, home.path(), 4242, "n1").await);
+        assert!(
+            why.contains("never appeared in DNS"),
+            "a minted name takes the authoritative path: {why}"
+        );
+    }
+
     /// Up is the nonce read back AND the first event of the stream
     /// delivered: another nonce is another remote; a route without
     /// a stream, or a stream that never delivers, is a tunnel that
@@ -1048,21 +1379,21 @@ mod tests {
     async fn a_probe_proves_the_nonce_and_the_stream() {
         let grace = || tokio::time::Instant::now() + Duration::from_secs(3);
         let (url, _srv) = fake_public("n1", true, false).await;
-        assert_eq!(probe(&url, "n1", grace()).await, Ok(()));
+        assert_eq!(probe(&url, "n1", grace(), None).await, Ok(()));
         assert_eq!(
-            probe(&url, "n2", grace()).await,
+            probe(&url, "n2", grace(), None).await,
             Err(NotUp::AnotherInstance),
             "another remote's nonce"
         );
         let (url, _srv) = fake_public("n1", false, false).await;
         assert!(
-            matches!(probe(&url, "n1", grace()).await, Err(NotUp::NoStream(why)) if why.contains("404")),
+            matches!(probe(&url, "n1", grace(), None).await, Err(NotUp::NoStream(why)) if why.contains("404")),
             "a route without a stream"
         );
         let (url, _srv) = fake_public("n1", false, true).await;
         let started = std::time::Instant::now();
         assert!(
-            matches!(probe(&url, "n1", grace()).await, Err(NotUp::NoStream(why)) if why.contains("grace")),
+            matches!(probe(&url, "n1", grace(), None).await, Err(NotUp::NoStream(why)) if why.contains("grace")),
             "a stream that never delivers"
         );
         assert!(
@@ -1076,7 +1407,7 @@ mod tests {
         drop(dead);
         let started = std::time::Instant::now();
         assert!(matches!(
-            probe(&url, "n1", grace()).await,
+            probe(&url, "n1", grace(), None).await,
             Err(NotUp::NoAnswer(_))
         ));
         assert!(
@@ -1101,6 +1432,7 @@ mod tests {
             &url,
             "n1",
             tokio::time::Instant::now() + Duration::from_secs(2),
+            None,
         )
         .await
         {
@@ -1198,6 +1530,7 @@ mod tests {
             provider: std::sync::Arc::new(provider),
             grace: Duration::from_secs(grace),
             abort: tokio::sync::watch::channel(false).1,
+            ask: std::sync::Arc::new(crate::cli::web::dns::Net::default()),
         }
     }
 
@@ -1504,6 +1837,7 @@ mod tests {
             provider: std::sync::Arc::new(provider),
             grace: Duration::from_secs(8),
             abort: tokio::sync::watch::channel(false).1,
+            ask: std::sync::Arc::new(crate::cli::web::dns::Net::default()),
         };
         let tunnel = Tunnel::up(&mut up, home.path(), 4242, "n1").await.unwrap();
         assert_eq!(tunnel.url, url, "the URL is the child's, not the config's");
@@ -1537,6 +1871,7 @@ mod tests {
             provider: std::sync::Arc::new(provider),
             grace: Duration::from_secs(8),
             abort: tokio::sync::watch::channel(false).1,
+            ask: std::sync::Arc::new(crate::cli::web::dns::Net::default()),
         };
         let tunnel = Tunnel::up(&mut up, home.path(), 4242, "n1").await.unwrap();
         assert_eq!(
@@ -1574,6 +1909,7 @@ mod tests {
             provider: std::sync::Arc::new(provider),
             grace: Duration::from_secs(30),
             abort: abandoned,
+            ask: std::sync::Arc::new(crate::cli::web::dns::Net::default()),
         };
         let home2 = home.path().to_path_buf();
         let starting =
@@ -1618,6 +1954,7 @@ mod tests {
             provider: std::sync::Arc::new(provider),
             grace: Duration::from_secs(2),
             abort: tokio::sync::watch::channel(false).1,
+            ask: std::sync::Arc::new(crate::cli::web::dns::Net::default()),
         };
         let started = std::time::Instant::now();
         let why = err_of(Tunnel::up(&mut up, home.path(), 4242, "n1").await);

@@ -12,6 +12,7 @@
 //! doors asks for a session, and the TUI mints the links that open
 //! one (the-tui-mints-the-way-in).
 
+pub(crate) mod dns;
 pub(crate) mod door;
 mod feed;
 mod transcript;
