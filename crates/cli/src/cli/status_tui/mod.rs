@@ -1667,11 +1667,11 @@ const REBUILD_MIN: Duration = Duration::from_secs(1);
 
 const REOPEN_NOTICE: &str = "reopen pane";
 
-/// One holder of the floor: an agent the gate is waiting on, with
-/// the TUI's verb, what it owes, and since when.
+/// What the gate is waiting on this agent for, with the TUI's verb
+/// and since when. The clock is what the page's `auto` compares to
+/// find whoever has been kept waiting longest.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub(crate) struct Holder {
-    pub(crate) label: String,
+pub(crate) struct Owed {
     pub(crate) verb: String,
     /// The sha, plan, PR or block the routing names — what the verb
     /// is about.
@@ -1679,29 +1679,15 @@ pub(crate) struct Holder {
     pub(crate) since: Option<i64>,
 }
 
-/// Whose turn it is — everyone's whose turn it is. A relay has one
-/// baton; a review does not: two reviewers missing on one commit are
-/// two holders, each with its own clock. Empty holders and no ask is
-/// the idle line.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub(crate) struct Floor {
-    pub(crate) holders: Vec<Holder>,
-    /// A pending block's question: the person's turn.
-    pub(crate) ask: Option<String>,
-    /// HEAD's tag needs fixing: nothing was handed over, something is
-    /// wrong, and no clock applies.
-    pub(crate) correction: bool,
-    pub(crate) hue: String,
-}
-
-/// One position on the track: master first, then the reviewers in
-/// roster order. `holds` marks a holder of the floor — any number
-/// may; `last` is the agent's newest act in the log.
+/// One agent: master first, then the reviewers in roster order.
+/// `owes` is both what this agent is doing and the fact that it is
+/// this agent's turn — there is no separate list of holders to
+/// disagree with. `last` is the agent's newest act in the log.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct Position {
     pub(crate) label: String,
     pub(crate) role: String,
-    pub(crate) holds: bool,
+    pub(crate) owes: Option<Owed>,
     pub(crate) last: Option<String>,
     /// Whether clank can show this agent's transcript, or only its
     /// terminal.
@@ -1748,8 +1734,11 @@ pub(crate) struct WebFacts {
     pub(crate) plan: String,
     /// The frame's hue as hex, from the same table as the bar.
     pub(crate) hue: String,
-    pub(crate) floor: Floor,
-    pub(crate) track: Vec<Position>,
+    /// HEAD's tag needs fixing, said as `clank status` says it.
+    /// Master's to repair, but not an obligation the gate routes, so
+    /// it belongs to the session and not to an agent.
+    pub(crate) correction: Option<String>,
+    pub(crate) agents: Vec<Position>,
     pub(crate) ledger: Ledger,
 }
 
@@ -1764,9 +1753,9 @@ pub(crate) fn web_facts(
     let hue = derive::state_color(snap).hex();
     let work = derive::work_projection(snap);
 
-    // The holders are the TUI's spinning rows; what each owes comes
-    // from the same routing that made it spin.
-    let mut holders: Vec<Holder> = in_progress_rows(snap)
+    // What each agent owes is the TUI's spinning row; the verb and the
+    // object come from the same routing that made it spin.
+    let mut owed: std::collections::HashMap<String, Owed> = in_progress_rows(snap)
         .into_iter()
         .map(|p| {
             let (label, verb, since, role) = match p {
@@ -1782,28 +1771,16 @@ pub(crate) fn web_facts(
                 .and_then(|l| work.work_for(&l, role).into_iter().next())
                 .map(|item| object_of(&item))
                 .unwrap_or_default();
-            Holder {
+            (
                 label,
-                verb: verb.to_string(),
-                object,
-                since,
-            }
+                Owed {
+                    verb: verb.to_string(),
+                    object,
+                    since,
+                },
+            )
         })
         .collect();
-    // Oldest first; an undated holder last.
-    holders.sort_by_key(|h| h.since.map(|s| (0, s)).unwrap_or((1, 0)));
-
-    let ask = snap
-        .blocks
-        .iter()
-        .find(|b| b.answer.is_none())
-        .map(|b| b.question.clone());
-    let floor = Floor {
-        holders,
-        ask,
-        correction: snap.head_correction.is_some(),
-        hue: hue.clone(),
-    };
 
     // Master first, then the roster's order.
     let mut ordered: Vec<&crate::cli::status::AgentAutoRow> = Vec::new();
@@ -1819,12 +1796,12 @@ pub(crate) fn web_facts(
             .iter()
             .filter(|a| a.role != crate::cli::teams_config::RosterRole::Master),
     );
-    let track = ordered
+    let agents = ordered
         .into_iter()
         .map(|a| Position {
             label: a.label.clone(),
             role: render::tier_label(a.role).to_string(),
-            holds: floor.holders.iter().any(|h| h.label == a.label),
+            owes: owed.remove(&a.label),
             last: last_act(snap, &a.label, a.role),
             transcript: with_transcript.contains(&a.label),
         })
@@ -1849,8 +1826,14 @@ pub(crate) fn web_facts(
         lamp,
         plan,
         hue,
-        floor,
-        track,
+        correction: snap.head_correction.as_ref().map(|c| {
+            format!(
+                "HEAD {} — amend the tag ({})",
+                c.sha.as_str(),
+                crate::cli::status::describe_head_violation(&c.violation)
+            )
+        }),
+        agents,
         ledger,
     }
 }
@@ -5067,11 +5050,103 @@ pub(crate) mod tests {
         assert!(v.fill, "input/data/resize re-arm the fill");
     }
 
-    /// The floor, the track and the ledger are the TUI's own
-    /// derivations as data — asked of the same functions, so the two
-    /// surfaces cannot drift apart. Two reviewers missing on one
-    /// commit are two holders with their own clocks, oldest first;
-    /// the track is master-first with every holder marked.
+    /// The page reads these facts by name, in JavaScript, where a
+    /// renamed field is not an error but a blank space. Every
+    /// `facts.…` path the page walks must exist in the serialized
+    /// facts, and the entries the page destructures — an agent, and
+    /// what it owes — are pinned by shape.
+    #[test]
+    fn the_page_reads_only_fields_the_facts_have() {
+        use std::collections::BTreeSet;
+        const PAGE: &str = include_str!("../web/page.html");
+        let s = fixtures::with_agents(
+            fixtures::snap(
+                vec![fixtures::plan_state_at(
+                    "foo",
+                    clank_core::plan_view::WaitingOn::MasterToContinue,
+                    clank_core::wait::Handover {
+                        opened: Some(1_000),
+                        ..Default::default()
+                    },
+                )],
+                vec![],
+            ),
+            &[("claude", crate::cli::teams_config::RosterRole::Master)],
+        );
+        let v = serde_json::to_value(web_facts(&s, &Default::default())).unwrap();
+
+        let keys = |x: &serde_json::Value| -> BTreeSet<String> {
+            x.as_object()
+                .map(|m| m.keys().cloned().collect())
+                .unwrap_or_default()
+        };
+        let set = |ks: &[&str]| -> BTreeSet<String> { ks.iter().map(|k| k.to_string()).collect() };
+        assert_eq!(
+            keys(&v["agents"][0]),
+            set(&["label", "role", "owes", "last", "transcript"]),
+            "the picker and the header destructure an agent by these names"
+        );
+        assert_eq!(
+            keys(&v["agents"][0]["owes"]),
+            set(&["verb", "object", "since"]),
+            "the state line destructures an obligation by these names"
+        );
+
+        // `const L = facts.ledger` is the page's one alias; a rename
+        // there would hide the ledger's fields from this scan.
+        let alias = "const L = facts.ledger;";
+        assert!(PAGE.contains(alias), "the page's ledger alias is `{alias}`");
+        let script = &PAGE[PAGE.find("<script>").expect("the page has a script")..];
+        let mut walked = 0;
+        for (root, base) in [("facts.", &v), ("L.", &v["ledger"])] {
+            for (i, _) in script.match_indices(root) {
+                // `HTML.` and the like are not the alias.
+                if i > 0
+                    && script[..i]
+                        .chars()
+                        .next_back()
+                        .is_some_and(|c| c.is_alphanumeric() || c == '_')
+                {
+                    continue;
+                }
+                let mut rest = &script[i + root.len()..];
+                let mut at = base;
+                let mut path = Vec::new();
+                loop {
+                    let seg: String = rest
+                        .chars()
+                        .take_while(|c| c.is_alphanumeric() || *c == '_')
+                        .collect();
+                    if seg.is_empty() {
+                        break;
+                    }
+                    rest = &rest[seg.len()..];
+                    let Some(map) = at.as_object() else { break };
+                    assert!(
+                        map.contains_key(&seg),
+                        "the page reads {root}{}{seg}, which the facts do not have",
+                        path.iter().map(|s| format!("{s}.")).collect::<String>()
+                    );
+                    at = &map[&seg];
+                    path.push(seg);
+                    walked += 1;
+                    if let Some(tail) = rest.strip_prefix('.') {
+                        rest = tail;
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+        assert!(walked > 8, "the scan found almost nothing to check");
+    }
+
+    /// The agents and the ledger are the TUI's own derivations as
+    /// data — asked of the same functions, so the two surfaces cannot
+    /// drift apart. One list, master-first: two reviewers missing on
+    /// one commit each carry what they owe, on the sha they owe it
+    /// on, with their own clock; an agent the gate is not waiting on
+    /// owes nothing.
     #[test]
     fn the_web_facts_are_the_tuis_own_derivation() {
         use crate::cli::status_tui::fixtures::{plan_state_at, with_agents};
@@ -5112,46 +5187,43 @@ pub(crate) mod tests {
         assert_eq!((facts.lamp.clone(), facts.plan.clone()), (lamp, plan));
         assert_eq!(facts.hue, derive::state_color(&s).hex());
 
-        let holders: Vec<(&str, &str, &str, Option<i64>)> = facts
-            .floor
-            .holders
+        let agents: Vec<(&str, &str, Option<(&str, &str, Option<i64>)>, bool)> = facts
+            .agents
             .iter()
-            .map(|h| {
+            .map(|p| {
                 (
-                    h.label.as_str(),
-                    h.verb.as_str(),
-                    h.object.as_str(),
-                    h.since,
+                    p.label.as_str(),
+                    p.role.as_str(),
+                    p.owes
+                        .as_ref()
+                        .map(|o| (o.verb.as_str(), o.object.as_str(), o.since)),
+                    p.transcript,
                 )
             })
             .collect();
         assert_eq!(
-            holders,
+            agents,
             vec![
-                ("codex", "reviewing", "abc1230", Some(1_000)),
-                ("ruthless", "reviewing", "abc1230", Some(1_000)),
+                ("claude", "master", None, false),
+                (
+                    "codex",
+                    "commit",
+                    Some(("reviewing", "abc1230", Some(1_000))),
+                    true
+                ),
+                (
+                    "ruthless",
+                    "commit",
+                    Some(("reviewing", "abc1230", Some(1_000))),
+                    false
+                ),
             ],
-            "both missing reviewers hold the floor, on the sha they owe"
+            "master first, then roster order; what each owes is on its own entry, \
+             with the clock `auto` picks the oldest by; transcript per agent"
         );
-        assert_eq!(facts.floor.ask, None);
-        assert!(!facts.floor.correction);
-
-        let track: Vec<(&str, &str, bool, bool)> = facts
-            .track
-            .iter()
-            .map(|p| (p.label.as_str(), p.role.as_str(), p.holds, p.transcript))
-            .collect();
+        assert_eq!(facts.correction, None);
         assert_eq!(
-            track,
-            vec![
-                ("claude", "master", false, false),
-                ("codex", "commit", true, true),
-                ("ruthless", "commit", true, false),
-            ],
-            "master first, then roster order; every holder marked; transcript per agent"
-        );
-        assert_eq!(
-            facts.track[2].last.as_deref(),
+            facts.agents[2].last.as_deref(),
             Some("✓ continued, 2m ago"),
             "a reviewer's last act is its newest verdict, aged"
         );
@@ -5167,6 +5239,26 @@ pub(crate) mod tests {
             ),
             ("review", Some("ruthless"), Some("continued"), Some("2m")),
             "the ledger is the TUI's rows with the TUI's ages"
+        );
+
+        // A broken HEAD tag belongs to the session, not to an agent,
+        // and reaches the page as the sentence `clank status` prints:
+        // the commit to amend and what the tag got wrong.
+        let mut broken = s;
+        broken.head_correction = Some(clank_core::wait::HeadCorrection {
+            sha: clank_core::ids::CommitSha::parse(&format!("{:0<40}", "dec0de")).unwrap(),
+            violation: clank_core::wait::HeadTagViolation {
+                unknown: vec![],
+                untagged_touched: vec![clank_core::ids::PlanKey::parse("foo").unwrap()],
+                extra_named: vec![],
+            },
+        });
+        let c = web_facts(&broken, &with)
+            .correction
+            .expect("a broken tag reaches the page");
+        assert!(
+            c.contains("dec0de") && c.contains("foo"),
+            "the correction names the commit to amend and the plan the tag missed: {c}"
         );
     }
 

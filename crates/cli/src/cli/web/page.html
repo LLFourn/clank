@@ -25,77 +25,67 @@
     background: var(--base); color: var(--ink);
     font: 14px/1.45 var(--mono);
     display: grid;
-    grid-template-rows: auto auto auto 1fr auto;
+    grid-template-rows: auto auto 1fr auto;
     grid-template-columns: 1fr;
-    grid-template-areas: "top" "floor" "track" "agent" "say";
+    grid-template-areas: "bar" "strip" "agent" "say";
     overflow: hidden;
   }
   button { font: inherit; color: inherit; background: none; border: 0; cursor: pointer; padding: 0; text-align: left; }
   button:focus-visible { outline: 2px solid var(--hue); outline-offset: -2px; }
 
-  .top {
-    grid-area: top;
-    display: flex; justify-content: space-between; align-items: center;
-    padding: 8px 14px 4px; color: var(--muted); font-size: 12px;
+  /* The header: the shown agent, said once, and what it owes. */
+  .bar {
+    grid-area: bar; position: relative;
+    display: grid; grid-template-columns: minmax(0, 1fr) auto;
+    padding: 6px 14px 8px;
   }
-  .top .live.off { color: var(--hue); }
-  /* A thumb's target, not a glyph's: the phone's only way into the
-     ledger. */
-  .top .menu { min-width: 44px; min-height: 44px; margin: -8px -10px -8px 0; font-size: 26px; line-height: 1; display: inline-flex; align-items: center; justify-content: center; color: var(--ink); }
-
-  /* The floor: whose turn it is, said once, large. */
-  .floor {
-    grid-area: floor;
-    padding: 6px 14px 12px;
-    font-size: 15px; line-height: 1.35;
-    min-height: 3.2em;
-  }
-  .floor .who { font-family: var(--plate); font-weight: 700; font-size: 22px; color: var(--hue); letter-spacing: -0.01em; }
-  .floor .verb { font-style: italic; }
-  .floor .obj { color: var(--ink); }
-  .floor .since { font-family: var(--plate); font-weight: 700; font-size: 22px; margin-left: 10px; color: var(--ink); }
-  .floor .dot {
-    display: inline-block; width: 8px; height: 8px; border-radius: 50%;
-    background: var(--hue); margin-right: 8px; vertical-align: 3px;
+  .bar .who { display: inline-flex; align-items: baseline; gap: 7px; padding: 6px 2px 6px 0; margin: -6px 0; max-width: 100%; }
+  .bar .who .name { font-family: var(--plate); font-weight: 700; font-size: 22px; letter-spacing: -0.02em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .bar .who .caret { color: var(--muted); font-size: 13px; }
+  /* Pinned, with the turn somewhere else: the one thing the header
+     cannot say when it is showing a name of your choosing. */
+  .bar .who .away { display: none; width: 7px; height: 7px; border-radius: 50%; background: var(--hue); animation: breathe 2.4s ease-in-out infinite; }
+  .bar .who.elsewhere .away { display: inline-block; }
+  .bar .who .tag { color: var(--muted); font-size: 11px; }
+  .bar .more { grid-column: 2; min-width: 44px; min-height: 44px; margin: -8px -12px 0 0; font-size: 20px; letter-spacing: 2px; color: var(--ink); display: inline-flex; align-items: center; justify-content: center; }
+  .state { grid-column: 1 / -1; display: flex; align-items: baseline; gap: 14px; margin-top: 1px; }
+  .state .doing { flex: 1 1 auto; min-width: 0; color: var(--muted); font-size: 12px; }
+  .doing { display: flex; align-items: baseline; gap: 9px; }
+  .doing .said { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .doing .obj { color: var(--ink); }
+  .doing .clock { flex: 0 0 auto; font-family: var(--plate); font-weight: 700; color: var(--ink); }
+  .state .doing .dot, .picker .doing .dot {
+    display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+    background: var(--hue); margin-right: 7px; vertical-align: 1px;
     animation: breathe 2.4s ease-in-out infinite;
   }
-  /* One line, however long the question: the full text is in the
-     ledger. An unbounded ask here once grew the header until the
-     agent view had no height left (codex on 056a342). */
-  .floor .ask { display: block; color: var(--ink); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 4px; max-width: 100%; }
+  .state .modes { flex: 0 0 auto; display: flex; gap: 11px; font-size: 12px; }
+  .state .modes button { color: var(--muted); padding: 2px 0; border-bottom: 2px solid transparent; }
+  .state .modes button.on { color: var(--ink); border-bottom-color: var(--ink); }
+  .state .modes button:disabled { opacity: 0.4; cursor: default; }
   @keyframes breathe { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
-  @media (prefers-reduced-motion: reduce) { .floor .dot { animation: none; } }
+  @media (prefers-reduced-motion: reduce) { .dot, .away { animation: none; } }
 
-  /* The track: the cycle's positions, master first. */
-  .track {
-    grid-area: track;
-    display: flex; overflow-x: auto; scrollbar-width: none;
+  /* The picker: every agent, and `auto` — whoever's turn it is. */
+  .picker {
+    position: absolute; top: 100%; left: 0; right: 0; z-index: 4;
     background: var(--bezel); border-top: 1px solid var(--edge); border-bottom: 1px solid var(--edge);
+    box-shadow: 0 18px 44px rgba(0, 0, 0, .5);
+    max-height: 62vh; overflow: auto;
   }
-  .track::-webkit-scrollbar { display: none; }
-  .pos {
-    flex: 0 0 auto; min-width: 140px; padding: 9px 14px 8px;
-    border-right: 1px solid var(--edge); border-bottom: 3px solid transparent;
-    transition: border-color 200ms;
-  }
-  .pos.on { border-bottom-color: var(--ink); }
-  .pos .name { font-family: var(--plate); font-weight: 700; font-size: 16px; line-height: 1.1; }
-  .pos .name .dot { display: none; width: 7px; height: 7px; border-radius: 50%; background: var(--hue); margin-left: 8px; vertical-align: 2px; animation: breathe 2.4s ease-in-out infinite; }
-  .pos.holds .name .dot { display: inline-block; }
-  .pos .role, .pos .last { color: var(--muted); font-size: 12px; margin-top: 3px; white-space: nowrap; }
+  .picker .opt { display: block; width: 100%; padding: 9px 14px 10px; border-bottom: 1px solid var(--edge); border-left: 3px solid transparent; }
+  .picker .opt:last-child { border-bottom: 0; }
+  .picker .opt[aria-selected="true"] { border-left-color: var(--hue); }
+  .picker .opt .nm { font-family: var(--plate); font-weight: 700; font-size: 15px; }
+  .picker .opt .role { color: var(--muted); font-size: 11px; margin-left: 8px; }
+  .picker .opt .doing { color: var(--muted); font-size: 12px; margin-top: 2px; }
+
+  /* An interruption, not chrome: here while it is true, gone after. */
+  .strip { grid-area: strip; padding: 9px 14px; background: color-mix(in srgb, var(--hue) 13%, var(--bezel)); border-top: 1px solid var(--edge); border-bottom: 1px solid var(--edge); font-size: 12px; white-space: pre-wrap; }
+  .strip .how { display: block; color: var(--muted); margin-top: 3px; }
 
   /* One agent. */
-  .agent { grid-area: agent; display: grid; grid-template-rows: auto 1fr; min-height: 0; }
-  .head {
-    display: flex; align-items: baseline; gap: 14px;
-    padding: 8px 14px; border-bottom: 1px solid var(--edge);
-  }
-  .head .name { font-family: var(--plate); font-weight: 700; font-size: 15px; }
-  .head .modes { margin-left: auto; display: flex; gap: 12px; font-size: 13px; }
-  .head .modes button { color: var(--muted); padding: 2px 0; border-bottom: 2px solid transparent; }
-  .head .modes button.on { color: var(--ink); border-bottom-color: var(--ink); }
-  .head .modes button:disabled { opacity: 0.4; cursor: default; }
-  .head .why { color: var(--muted); font-size: 12px; }
+  .agent { grid-area: agent; display: grid; min-height: 0; border-top: 1px solid var(--edge); }
   .views { position: relative; min-height: 0; }
   .view { position: absolute; inset: 0; overflow: auto; display: none; }
   .view.on { display: block; }
@@ -149,12 +139,13 @@
   /* The ledger: a drawer on a phone, a column on a desk. */
   .ledger { display: none; background: var(--bezel); border-left: 1px solid var(--edge); overflow: auto; font-size: 13px; }
   .ledger.open { display: block; position: fixed; inset: 0; z-index: 2; border: 0; }
-  .ledger .close { display: block; padding: 10px 14px; color: var(--muted); }
+  .ledger .lhead { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; padding: 10px 14px 8px; }
+  .ledger .lhead .session { font-family: var(--plate); font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ledger .close { color: var(--muted); }
   .ledger .facts { padding: 6px 14px 10px; border-bottom: 1px solid var(--edge); }
   .ledger .facts .plan { font-family: var(--plate); font-weight: 700; }
   .ledger .facts .gate { color: var(--hue); }
   .ledger .facts .line { color: var(--muted); font-size: 12px; margin-top: 2px; }
-  .ledger .block { padding: 8px 14px; border-bottom: 1px solid var(--edge); white-space: pre-wrap; }
   .ledger .rows { padding: 6px 0; }
   .row { display: grid; grid-template-columns: 1fr auto; gap: 8px; padding: 2px 14px; white-space: nowrap; overflow: hidden; }
   .row .main { overflow: hidden; text-overflow: ellipsis; }
@@ -172,30 +163,31 @@
   @media (min-width: 960px) {
     body {
       grid-template-columns: 1fr 38ch;
-      grid-template-areas: "top ledger" "floor ledger" "track ledger" "agent ledger" "say ledger";
+      grid-template-areas: "bar ledger" "strip ledger" "agent ledger" "say ledger";
     }
-    .top .menu { display: none; }
+    .bar .more { display: none; }
     .ledger { display: block; grid-area: ledger; }
     .ledger .close { display: none; }
   }
 </style>
 </head>
 <body>
-  <div class="top">
-    <span id="session">clank</span>
-    <span><span class="live" id="live">connecting</span> <button class="menu" id="menu" aria-label="Open the ledger">≡</button></span>
-  </div>
-  <div class="floor" id="floor"></div>
-  <div class="track" id="track" role="tablist"></div>
-  <div class="agent">
-    <div class="head">
-      <span class="name" id="agentname"></span>
-      <span class="why" id="why"></span>
+  <header class="bar">
+    <button class="who" id="who" aria-haspopup="listbox" aria-expanded="false" aria-controls="picker">
+      <span class="name" id="whoname"></span><span class="caret">▾</span><span class="away"></span><span class="tag" id="autotag">auto</span>
+    </button>
+    <button class="more" id="more" aria-label="Open the ledger">···</button>
+    <div class="state">
+      <span class="doing" id="doing"></span>
       <span class="modes">
         <button id="mode-transcript" data-mode="transcript">transcript</button>
         <button id="mode-terminal" data-mode="terminal">terminal</button>
       </span>
     </div>
+    <div class="picker" id="picker" role="listbox" aria-label="Choose an agent" hidden></div>
+  </header>
+  <div class="strip" id="strip" hidden></div>
+  <div class="agent">
     <div class="views" id="views"><div class="empty" id="empty">No agents in this session yet.</div></div>
   </div>
   <form class="say" id="say">
@@ -205,17 +197,17 @@
   </form>
   <div class="viewer" id="viewer" role="dialog" aria-label="Full-size image"></div>
   <aside class="ledger" id="ledger">
-    <button class="close" id="close">close</button>
+    <div class="lhead"><span class="session" id="session"></span><button class="close" id="close">close</button></div>
     <div class="facts" id="facts"></div>
-    <div id="blocks"></div>
     <div class="rows" id="rows"></div>
   </aside>
 
 <script>
 (() => {
   const $ = (id) => document.getElementById(id);
-  const floorEl = $('floor'), trackEl = $('track'), viewsEl = $('views'), emptyEl = $('empty');
-  const nameEl = $('agentname'), whyEl = $('why'), liveEl = $('live');
+  const viewsEl = $('views'), emptyEl = $('empty');
+  const whoEl = $('who'), whoName = $('whoname'), autoTag = $('autotag'), doingEl = $('doing');
+  const pickerEl = $('picker'), stripEl = $('strip');
   const modeBtns = { transcript: $('mode-transcript'), terminal: $('mode-terminal') };
   const form = $('say'), input = $('text'), send = $('send'), sentEl = $('sent');
   const ledgerEl = $('ledger');
@@ -231,13 +223,28 @@
   const paneOf = new Map();                 // label → pane id
   const agents = new Map();                 // label → { session, generation, turns[] }  (mirrors PageModel)
   const views = new Map();                  // label → { transcript: el, terminal: el, term }
-  let selected = null;
-  const modes = JSON.parse(localStorage.getItem('clank.modes') || '{}');
+  let shown = null;                         // the agent on screen
+  let live = null;                          // null: never opened; then true/false
+  // A browser can refuse storage outright — a private window, blocked
+  // site data — and then even READING throws. Remembering which view
+  // someone prefers is not worth the whole page.
+  const remembered = (key, fallback) => {
+    try { return JSON.parse(localStorage.getItem(key) || 'null') ?? fallback; } catch (err) { return fallback; }
+  };
+  const remember = (key, value) => { try { localStorage.setItem(key, JSON.stringify(value)); } catch (err) {} };
+  const modes = remembered('clank.modes', {});
+  // Auto follows the turn; a pin names one agent. Kept, so a
+  // deliberate pin survives a reload and a phone waking up.
+  let selection = (() => {
+    const s = remembered('clank.selection', null);
+    return s && typeof s.label === 'string' ? { label: s.label } : { auto: true };
+  })();
+  const keepSelection = () => remember('clank.selection', selection);
 
   // ---- the reducer the server tests (feed.rs PageModel) ----
   function applyTurns(d) {
     agents.set(d.agent, { session: d.session, generation: d.generation, turns: d.turns.slice() });
-    if (d.agent === selected) paintTranscript(d.agent);
+    if (d.agent === shown) paintTranscript(d.agent);
   }
   function applyTurn(d) {
     const w = agents.get(d.agent);
@@ -245,66 +252,118 @@
     const i = w.turns.findIndex((t) => t.id === d.turn.id);
     if (i >= 0) w.turns[i] = d.turn; else w.turns.push(d.turn);
     if (w.turns.length > 200) w.turns.splice(0, w.turns.length - 200);
-    if (d.agent === selected) paintTranscript(d.agent);
+    if (d.agent === shown) paintTranscript(d.agent);
   }
 
-  // ---- the floor ----
-  function paintFloor() {
-    if (!facts) return;
-    const f = facts.floor;
-    document.documentElement.style.setProperty('--hue', f.hue || '#5f5fff');
-    let html;
-    if (f.ask) {
-      html = `<span class="who">you</span> <span class="verb">are asked</span><span class="ask">${esc(f.ask)}</span>`;
-    } else if (f.correction) {
-      html = `<span class="who">${esc(facts.track.find((p) => p.role === 'master')?.label || 'master')}</span> <span class="verb">must fix HEAD's tag</span>`;
-    } else if (f.holders.length) {
-      // Holders with the SAME verb and object share one clause; a
-      // different obligation is its own clause, so nobody is shown
-      // doing someone else's work (codex on 056a342).
-      const groups = [];
-      for (const h of f.holders) {
-        const g = groups.find((g) => g.verb === h.verb && g.object === h.object);
-        if (g) g.holders.push(h); else groups.push({ verb: h.verb, object: h.object, holders: [h] });
-      }
-      const clause = (g) => {
-        const names = g.holders.map((h) => esc(h.label));
-        const who = names.length === 1 ? names[0] : names.slice(0, -1).join(', ') + ' and ' + names.slice(-1);
-        const clocks = g.holders.map((h) => h.since != null ? coarse(now() - h.since) : '').filter(Boolean).join(', ');
-        return `<span class="who">${who}</span> <span class="verb">${names.length === 1 ? 'is' : 'are'} ${esc(g.verb)}</span> <span class="obj">${esc(g.object)}</span>${clocks ? `<span class="since">${clocks}</span>` : ''}`;
-      };
-      html = `<span class="dot"></span>` + groups.map(clause).join('<span class="obj">; </span>');
-    } else {
-      html = `<span class="who">nobody</span> <span class="verb">— idle</span>`;
+  // ---- who is shown ----
+  const roster = () => (facts ? facts.agents : []);
+  const masterLabel = () => (roster().find((a) => a.role === 'master') || roster()[0] || {}).label || null;
+  // Whoever has been kept waiting longest: the oldest obligation, an
+  // undated one last. Equal clocks keep the roster's order — sort is
+  // stable — so auto cannot flip between two agents routed in the
+  // same instant.
+  function upNow() {
+    const owing = roster().filter((a) => a.owes);
+    if (!owing.length) return null;
+    const key = (a) => (a.owes.since == null ? Infinity : a.owes.since);
+    return owing.slice().sort((x, y) => key(x) - key(y))[0].label;
+  }
+  function target() {
+    if (!selection.auto) {
+      if (roster().some((a) => a.label === selection.label)) return selection.label;
+      selection = { auto: true };           // the pinned agent left the roster
+      keepSelection();
     }
-    floorEl.innerHTML = html;
+    return upNow() || masterLabel();
+  }
+  // The one place the view moves by itself. What is in the say box was
+  // typed to whoever is shown, and /say delivers it to whoever is
+  // shown: any move under a draft hands the message to the wrong
+  // agent. So a draft owns the view until it is sent or cleared —
+  // including when the agent it was typed to leaves the roster, where
+  // the honest answer is a disabled send button, not a new recipient.
+  function retarget() {
+    if (input.value !== '') return;
+    const want = target();
+    if (want !== shown) show(want);
+  }
+  input.addEventListener('input', retarget);
+
+  // ---- the header ----
+  // Two regions, always: the sentence gives way, the clock does not.
+  // One shrinking span would take the clock over the edge with it.
+  const said = (html) => `<span class="said">${html}</span>`;
+  function clause(a) {
+    if (!a) return '';
+    if (!a.owes) return said(esc(a.last || 'idle'));
+    const o = a.owes;
+    return said(`<span class="dot"></span>${esc(o.verb)} <span class="obj">${esc(o.object)}</span>`)
+      + (o.since != null ? `<span class="clock">${coarse(now() - o.since)}</span>` : '');
+  }
+  function paintHeader() {
+    whoName.textContent = shown || (roster().length ? '' : 'no agents');
+    autoTag.hidden = !selection.auto;
+    whoEl.classList.toggle('elsewhere', !selection.auto && roster().some((a) => a.owes && a.label !== shown));
+    const a = roster().find((x) => x.label === shown);
+    doingEl.innerHTML = live !== true
+      ? said(live === null ? 'connecting…' : 'reconnecting…')
+      // A draft can hold the view on an agent that has left; say so,
+      // because the send button going quiet is not an explanation.
+      : (shown && !a ? said(`${esc(shown)} has left the roster`) : clause(a));
   }
 
-  // ---- the track ----
-  function paintTrack() {
-    if (!facts) return;
-    const seen = new Set();
-    for (const p of facts.track) {
-      seen.add(p.label);
-      let el = trackEl.querySelector(`[data-label="${CSS.escape(p.label)}"]`);
-      if (!el) {
-        el = document.createElement('button');
-        el.className = 'pos'; el.setAttribute('role', 'tab'); el.dataset.label = p.label;
-        el.innerHTML = '<div class="name"><span class="n"></span><span class="dot"></span></div><div class="role"></div><div class="last"></div>';
-        el.addEventListener('click', () => select(p.label));
-        trackEl.appendChild(el);
-      }
-      el.querySelector('.n').textContent = p.label;
-      el.querySelector('.role').textContent = p.role;
-      el.querySelector('.last').textContent = p.last || '';
-      el.classList.toggle('holds', p.holds);
-      el.classList.toggle('on', p.label === selected);
-      el.setAttribute('aria-selected', p.label === selected ? 'true' : 'false');
-      ensureViews(p.label);
-    }
-    for (const el of [...trackEl.querySelectorAll('.pos')]) if (!seen.has(el.dataset.label)) el.remove();
-    emptyEl.style.display = facts.track.length ? 'none' : 'flex';
-    if (!selected || !seen.has(selected)) select(facts.track[0]?.label || null);
+  // ---- the picker ----
+  function optHtml(key, name, role, doing, on) {
+    return `<button class="opt" role="option" data-key="${esc(key)}" aria-selected="${on}">`
+      + `<span class="nm">${esc(name)}</span>${role ? `<span class="role">${esc(role)}</span>` : ''}`
+      + `<span class="doing">${doing}</span></button>`;
+  }
+  function paintPicker() {
+    const had = document.activeElement && document.activeElement.closest('.opt');
+    const up = upNow() || masterLabel();
+    const rows = [optHtml('auto', 'auto', '', said(`follows the turn — ${esc(up || 'nobody')} now`), !!selection.auto)];
+    for (const a of roster()) rows.push(optHtml(`pin:${a.label}`, a.label, a.role, clause(a), selection.label === a.label));
+    pickerEl.innerHTML = rows.join('');
+    if (had) pickerEl.querySelector(`.opt[data-key="${CSS.escape(had.dataset.key)}"]`)?.focus();
+  }
+  function openPicker(open) {
+    pickerEl.hidden = !open;
+    whoEl.setAttribute('aria-expanded', open ? 'true' : 'false');
+    if (open) { paintPicker(); pickerEl.querySelector('.opt[aria-selected="true"]')?.focus(); }
+  }
+  whoEl.addEventListener('click', () => openPicker(pickerEl.hidden));
+  pickerEl.addEventListener('click', (e) => {
+    const opt = e.target.closest('.opt'); if (!opt) return;
+    const k = opt.dataset.key;
+    selection = k === 'auto' ? { auto: true } : { label: k.slice(4) };
+    keepSelection();
+    openPicker(false);
+    show(target());                        // an explicit pick moves, draft or not
+    whoEl.focus();
+  });
+  document.addEventListener('click', (e) => {
+    if (!pickerEl.hidden && !pickerEl.contains(e.target) && !whoEl.contains(e.target)) openPicker(false);
+  });
+  document.addEventListener('keydown', (e) => {
+    if (pickerEl.hidden) return;
+    if (e.key === 'Escape') { openPicker(false); whoEl.focus(); return; }
+    if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
+    const opts = [...pickerEl.querySelectorAll('.opt')];
+    const at = opts.indexOf(document.activeElement);
+    const next = at < 0 ? opts[0] : opts[(at + (e.key === 'ArrowDown' ? 1 : opts.length - 1)) % opts.length];
+    if (next) { next.focus(); e.preventDefault(); }
+  });
+
+  // ---- an interruption, while it lasts ----
+  function paintStrip() {
+    const asks = facts ? facts.ledger.blocks : [];
+    const fix = facts && facts.correction;
+    if (!asks.length && !fix) { stripEl.hidden = true; stripEl.innerHTML = ''; return; }
+    stripEl.hidden = false;
+    stripEl.innerHTML = [
+      ...asks.map((b) => `${esc(b)}<span class="how">Answer it at the terminal, or with clank block answer.</span>`),
+      fix ? `${esc(fix)}<span class="how">${esc(masterLabel() || 'master')}'s to repair.</span>` : '',
+    ].filter(Boolean).join('');
   }
 
   // ---- the agent ----
@@ -318,32 +377,36 @@
     views.set(label, { transcript, terminal, term });
   }
 
-  function hasTranscript(label) { return !!facts?.track.find((p) => p.label === label)?.transcript; }
+  function hasTranscript(label) { return !!roster().find((a) => a.label === label)?.transcript; }
   function modeFor(label) {
     const wanted = modes[label] || (hasTranscript(label) ? 'transcript' : 'terminal');
     return wanted === 'transcript' && !hasTranscript(label) ? 'terminal' : wanted;
   }
 
-  function select(label) {
-    selected = label;
-    for (const el of trackEl.querySelectorAll('.pos')) { const on = el.dataset.label === label; el.classList.toggle('on', on); el.setAttribute('aria-selected', on ? 'true' : 'false'); }
-    nameEl.textContent = label || '';
+  // Whoever is on screen is who /say reaches, so the button follows
+  // the shown agent's pane and nothing else.
+  function syncSend() {
+    const p = panes.get(shown && paneOf.get(shown));
+    send.disabled = !p || p.closed;
+  }
+  function show(label) {
+    shown = label;
     const mode = label ? modeFor(label) : null;
     for (const [m, btn] of Object.entries(modeBtns)) {
       btn.classList.toggle('on', m === mode);
       btn.disabled = !label || (m === 'transcript' && !hasTranscript(label));
     }
-    whyEl.textContent = label && !hasTranscript(label) ? `no transcript for ${label} yet` : '';
     for (const [l, v] of views) {
       v.transcript.classList.toggle('on', l === label && mode === 'transcript');
       v.terminal.classList.toggle('on', l === label && mode === 'terminal');
     }
-    const pid = label && paneOf.get(label); const p = pid && panes.get(pid);
-    send.disabled = !p || p.closed;
+    syncSend();
     input.placeholder = label ? `Say something to ${label}` : 'Say something';
+    const p = panes.get(label && paneOf.get(label));
     if (label) { paintTranscript(label); if (p && !p.closed) views.get(label).term.scrollToBottom(); }
+    paintHeader();
   }
-  for (const [m, btn] of Object.entries(modeBtns)) btn.addEventListener('click', () => { if (!selected) return; modes[selected] = m; localStorage.setItem('clank.modes', JSON.stringify(modes)); select(selected); });
+  for (const [m, btn] of Object.entries(modeBtns)) btn.addEventListener('click', () => { if (!shown) return; modes[shown] = m; remember('clank.modes', modes); show(shown); });
 
   // Turns are rendered ONCE and updated in place, keyed by id: a
   // repaint that rebuilt them would close every <details> the reader
@@ -439,7 +502,7 @@
       v.terminal.querySelector('.gone').textContent = `${meta.label}'s pane closed`;
     }
     for (const id of [...panes.keys()]) if (!seen.has(id)) panes.delete(id);
-    if (selected) select(selected);
+    if (shown) show(shown);
   }
   function onPane(d) {
     const p = panes.get(d.pane_id); if (!p) return;
@@ -456,7 +519,6 @@
       L.dirty ? `<div class="line">dirty ${esc(L.dirty)}</div>` : '',
       (L.queue || L.stash) ? `<div class="line">${L.queue ? `${L.queue} queued` : ''}${L.queue && L.stash ? ', ' : ''}${L.stash ? `${L.stash} stashed` : ''}</div>` : '',
     ].join('');
-    $('blocks').innerHTML = L.blocks.map((b) => `<div class="block">${esc(b)}\n<span class="line">Answer it at the terminal, or with clank block answer.</span></div>`).join('');
     // A row's page is the clank html one, in a window of its own. The
     // builder writes a plan's name verbatim, spaces and all; the link
     // encodes each segment and the server decodes it.
@@ -470,12 +532,20 @@
       return `<div class="row ${r.kind}"><span class="main">${main}</span><span class="age">${esc(r.age || '')}</span></div>`;
     }).join('');
   }
-  $('menu').addEventListener('click', () => ledgerEl.classList.add('open'));
+  $('more').addEventListener('click', () => ledgerEl.classList.add('open'));
   $('close').addEventListener('click', () => ledgerEl.classList.remove('open'));
 
   // ---- status ----
-  function onStatus(d) { facts = d.facts; paintFloor(); paintTrack(); paintLedger(); if (selected) select(selected); }
-  setInterval(() => { paintFloor(); if (selected) paintTranscript(selected); }, 60000);
+  function onStatus(d) {
+    facts = d.facts;
+    document.documentElement.style.setProperty('--hue', facts.hue || '#5f5fff');
+    for (const a of roster()) ensureViews(a.label);
+    emptyEl.style.display = roster().length ? 'none' : 'flex';
+    if (shown) retarget(); else show(target());
+    show(shown);                            // the frame may have opened or closed a pane
+    paintPicker(); paintStrip(); paintLedger();
+  }
+  setInterval(() => { paintHeader(); if (!pickerEl.hidden) paintPicker(); if (shown) paintTranscript(shown); }, 60000);
 
   // ---- the live channel ----
   // A WebSocket, not an EventSource: the accountless tunnel's edge
@@ -500,13 +570,13 @@
     if (closedForGood) return;
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     socket = new WebSocket(`${proto}//${location.host}/events`);
-    socket.onopen = () => { retry = 0; liveEl.textContent = 'live'; liveEl.classList.remove('off'); };
+    socket.onopen = () => { retry = 0; live = true; paintHeader(); };
     socket.onmessage = (e) => deliver(e.data);
     // Unlike an EventSource, a socket does not retry itself. A close
     // the door caused — the session revoked or expired — must not be
     // retried forever, so the page asks which before backing off.
     socket.onclose = async () => {
-      liveEl.textContent = 'reconnecting'; liveEl.classList.add('off');
+      live = false; paintHeader();
       try {
         if ((await fetch('/whoami')).status === 401) {
           closedForGood = true;
@@ -522,15 +592,18 @@
 
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
-    const pid = selected && paneOf.get(selected); const text = input.value;
+    const pid = shown && paneOf.get(shown), text = input.value;
     if (!pid || !text) return;
     send.disabled = true;
     try {
       const r = await fetch('/say', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ pane: pid, text }) });
       if (!r.ok) throw new Error(await r.text());
+      // Setting .value fires no input event, so the draft's release
+      // has to say so itself.
       input.value = ''; sentEl.textContent = 'Sent'; setTimeout(() => { sentEl.textContent = ''; }, 1500);
+      retarget();
     } catch (err) { sentEl.textContent = 'Not sent'; console.error(err); }
-    finally { const p = panes.get(pid); send.disabled = !p || p.closed; input.focus(); }
+    finally { syncSend(); input.focus(); }
   });
 
   $('session').textContent = document.title = window.CLANK_SESSION || 'clank';

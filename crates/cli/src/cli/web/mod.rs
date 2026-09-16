@@ -29,6 +29,17 @@ use crate::cli::open_zellij::{self, PaneMeta, SubscribeChild};
 use feed::{Feed, SubscribeEvent, TableChange};
 
 const PAGE: &str = include_str!("page.html");
+
+/// The expression `page_for` replaces to name the session. The page
+/// is not a template — this exact substring is the whole mechanism,
+/// so a reflow that splits it serves every session a page called
+/// `clank` and nothing fails.
+const SESSION_ANCHOR: &str = "window.CLANK_SESSION || 'clank'";
+
+/// The page with this session's name compiled into it.
+fn page_for(session: &str) -> String {
+    PAGE.replace(SESSION_ANCHOR, &serde_json::json!(session).to_string())
+}
 const LOGIN: &str = include_str!("login.html");
 const HTML: &str = "text/html; charset=utf-8";
 
@@ -1010,10 +1021,7 @@ async fn serve(
         feed,
         sayer,
         blocking,
-        page: Arc::from(PAGE.replace(
-            "window.CLANK_SESSION || 'clank'",
-            &format!("{}", serde_json::json!(session)),
-        )),
+        page: Arc::from(page_for(&session)),
         pages: Pages { repo, site },
         workers: Mutex::new(tokio::task::JoinSet::new()),
         cancelled: cancelled.clone(),
@@ -1757,6 +1765,57 @@ mod tests {
          Cf-Visitor: {\"scheme\":\"https\"}\r\n\
          X-Forwarded-Proto: https\r\n\
          Connection: keep-alive\r\n\r\n";
+
+    /// The session's name reaches the page by string replacement, not
+    /// by a template: `SESSION_ANCHOR` must survive every edit to
+    /// `page.html`. Nothing else notices if it doesn't — the page
+    /// still serves, titled `clank`, for every session.
+    #[test]
+    fn the_session_is_compiled_into_the_page() {
+        let page = page_for("a session, \"quoted\"");
+        assert!(
+            PAGE.contains(SESSION_ANCHOR),
+            "the anchor page_for replaces is gone from page.html"
+        );
+        assert!(
+            page.contains(r#""a session, \"quoted\"""#),
+            "the session is compiled in, escaped as JSON"
+        );
+        assert!(
+            !page.contains(SESSION_ANCHOR),
+            "no un-replaced fallback is left to serve"
+        );
+    }
+
+    /// Every id the page's script reaches for exists in the markup,
+    /// and every id in the markup is reached for. A rename on one
+    /// side or a node left behind by a redesign fails here rather
+    /// than silently in a browser.
+    #[test]
+    fn the_page_asks_for_exactly_the_ids_it_has() {
+        let cut = PAGE.find("<script>").expect("the page has a script");
+        let ids: std::collections::BTreeSet<String> = PAGE[..cut]
+            .match_indices(" id=\"")
+            .map(|(i, m)| {
+                let rest = &PAGE[i + m.len()..];
+                rest[..rest.find('"').unwrap()].to_string()
+            })
+            .collect();
+        let asked: std::collections::BTreeSet<String> = PAGE[cut..]
+            .match_indices("$('")
+            .map(|(i, m)| {
+                let rest = &PAGE[cut + i + m.len()..];
+                rest[..rest.find('\'').unwrap()].to_string()
+            })
+            .collect();
+        assert!(!ids.is_empty() && !asked.is_empty());
+        let orphans: Vec<&String> = ids.difference(&asked).collect();
+        let missing: Vec<&String> = asked.difference(&ids).collect();
+        assert!(
+            orphans.is_empty() && missing.is_empty(),
+            "in the markup but never asked for: {orphans:?}; asked for but not in the markup: {missing:?}"
+        );
+    }
 
     #[test]
     fn the_captured_handshake_is_made_askable() {
