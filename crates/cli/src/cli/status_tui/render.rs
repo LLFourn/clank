@@ -2751,9 +2751,16 @@ pub(super) fn render_error_doc(
     offset: usize,
     rows: usize,
     cols: usize,
+    copied: bool,
 ) -> (Vec<String>, usize) {
     let mut content: Vec<String> = Vec::new();
-    content.push(region_rule(&format!("✗ {title}"), "esc back", true, cols));
+    // OSC 52 is never acknowledged, so the hint saying it happened is
+    // the only feedback there can be; without it the key reads as dead.
+    let hint = match copied {
+        true => "copied · esc back",
+        false => "y copy · esc back",
+    };
+    content.push(region_rule(&format!("✗ {title}"), hint, true, cols));
     content.push(String::new());
     for raw in message.lines() {
         if raw.is_empty() {
@@ -3245,14 +3252,14 @@ mod tests {
     #[test]
     fn error_doc_renders_red_and_scrolls() {
         let msg = "stash push refuses: foreign commit(s)\nline two";
-        let (lines, total) = render_error_doc("stash push failed", msg, 0, 10, 80);
+        let (lines, total) = render_error_doc("stash push failed", msg, 0, 10, 80, false);
         let text = lines.join("\n");
         assert!(text.contains("✗ STASH PUSH FAILED"));
         assert!(text.contains("\x1b[31m"), "error body is red");
         assert!(text.contains("foreign commit"));
         assert!(total >= 4);
         // Windowing honors the offset like the other doc overlays.
-        let (scrolled, _) = render_error_doc("t", msg, 2, 10, 80);
+        let (scrolled, _) = render_error_doc("t", msg, 2, 10, 80, false);
         assert!(scrolled.len() < lines.len() || !scrolled[0].contains('✗'));
     }
 

@@ -955,6 +955,9 @@ pub(super) enum DocNav {
     Scroll(i32),
     /// `o` — open the overlay's plan/commit as its HTML page in the browser.
     OpenHtml,
+    /// `y` — put the overlay's full text on the clipboard. A reason
+    /// nobody can copy out is a reason that dies with the overlay.
+    Copy,
 }
 
 /// Pure key routing for a document overlay. `page` is the viewport height
@@ -971,6 +974,7 @@ pub(super) fn doc_nav(key: Key, page: usize) -> DocNav {
         Key::PageUp => DocNav::Scroll(-page),
         Key::Space | Key::PageDown => DocNav::Scroll(page),
         Key::Html => DocNav::OpenHtml,
+        Key::Yes => DocNav::Copy,
         _ => DocNav::None,
     }
 }
@@ -3364,8 +3368,10 @@ mod tests {
         assert_eq!(doc_nav(Key::Left, 10), DocNav::Back);
         // `o` opens the overlay's page in the browser.
         assert_eq!(doc_nav(Key::Html, 10), DocNav::OpenHtml);
+        // `y` yanks the overlay's text to the clipboard.
+        assert_eq!(doc_nav(Key::Yes, 10), DocNav::Copy);
         // Unmapped keys do nothing.
-        assert_eq!(doc_nav(Key::Yes, 10), DocNav::None);
+        assert_eq!(doc_nav(Key::Char(b'z'), 10), DocNav::None);
     }
 
     #[test]

@@ -144,6 +144,28 @@ extern "C" fn restore_and_exit(sig: libc::c_int) {
 /// One frame: cursor home, each line + clear-to-EOL, then clear
 /// any leftover rows from a taller previous frame. No full-screen
 /// clear → no flicker.
+/// The OSC 52 sequence that puts `text` on the clipboard of whatever
+/// terminal is really in front of the user.
+///
+/// It is the only path that survives the trip: clank runs inside
+/// zellij, often over ssh, so a local clipboard call would write to
+/// the wrong machine's clipboard, or to none. The terminal never
+/// acknowledges the write, so nothing downstream can wait on it.
+pub(crate) fn osc52(text: &str) -> String {
+    use base64::Engine as _;
+    format!(
+        "\x1b]52;c;{}\x07",
+        base64::engine::general_purpose::STANDARD.encode(text)
+    )
+}
+
+/// Put `text` on the terminal's clipboard.
+pub(crate) fn copy(text: &str) {
+    let mut out = std::io::stdout();
+    let _ = out.write_all(osc52(text).as_bytes());
+    let _ = out.flush();
+}
+
 pub(crate) fn paint(lines: &[String]) {
     let mut buf = String::from("\x1b[H");
     for (i, line) in lines.iter().enumerate() {

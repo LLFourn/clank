@@ -1309,6 +1309,74 @@ enum OverlayData {
 struct Overlay {
     data: OverlayData,
     offset: usize,
+    /// When the text was last copied, so the hint can say so and then
+    /// stop saying so. The terminal never answers an OSC 52, so this
+    /// is the only acknowledgement there is.
+    copied: Option<std::time::Instant>,
+}
+
+/// What `y` puts on the clipboard: the retained reason, whole.
+///
+/// The RETAINED one, not the rendered window — what is painted is
+/// wrapped to the region and clipped to its height, and a clipped
+/// reason is exactly the one you cannot act on. Only a failure
+/// carries text worth taking somewhere else.
+fn copyable(data: &OverlayData) -> Option<&str> {
+    match data {
+        OverlayData::Error { message, .. } => Some(message),
+        _ => None,
+    }
+}
+
+/// How long the overlay says `copied` before going back to `y copy`.
+const COPIED_FOR: Duration = Duration::from_secs(2);
+
+/// How long an overlay with nothing to say waits for an event.
+const OVERLAY_IDLE: Duration = Duration::from_secs(60);
+
+/// Whether the overlay is still saying `copied`, and for how much
+/// longer.
+///
+/// One value decides both what is painted and how long the loop then
+/// sleeps. Deciding them separately lets them disagree across the
+/// two-second boundary: the screen says `copied` while the sleep
+/// concludes there is nothing to come back for, and the word stays up
+/// for a minute.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Hint {
+    Copied(Duration),
+    Idle,
+}
+
+impl Hint {
+    fn saying_copied(self) -> bool {
+        matches!(self, Hint::Copied(_))
+    }
+    /// How long the loop may sleep on this hint: just long enough to
+    /// come back and unsay it, or the idle backstop.
+    fn wait(self) -> Duration {
+        match self {
+            Hint::Copied(left) => left,
+            Hint::Idle => OVERLAY_IDLE,
+        }
+    }
+}
+
+/// The hint as of ONE reading of the clock.
+///
+/// `now` is passed in rather than read here so the caller samples
+/// once, and so the boundary itself can be tested. Every subtraction
+/// is saturating or checked: crossing the boundary between two reads
+/// of the clock used to underflow `Duration` and take the whole TUI
+/// down over a copy.
+fn hint_at(copied: Option<std::time::Instant>, now: std::time::Instant) -> Hint {
+    let Some(at) = copied else {
+        return Hint::Idle;
+    };
+    match COPIED_FOR.checked_sub(now.saturating_duration_since(at)) {
+        Some(left) if !left.is_zero() => Hint::Copied(left),
+        _ => Hint::Idle,
+    }
 }
 
 impl Overlay {
@@ -1318,6 +1386,7 @@ impl Overlay {
         Self {
             data: OverlayData::Commit(data),
             offset,
+            copied: None,
         }
     }
     /// A failed plan-page action's error, opened at the top
@@ -1326,6 +1395,7 @@ impl Overlay {
         Self {
             data: OverlayData::Error { title, message },
             offset: 0,
+            copied: None,
         }
     }
     /// The error doc is the TUI's one titled page; a notice — the
@@ -1342,6 +1412,7 @@ impl Overlay {
                 url,
             },
             offset: 0,
+            copied: None,
         }
     }
     /// A stashed-plan overlay, opened at the top.
@@ -1349,6 +1420,7 @@ impl Overlay {
         Self {
             data: OverlayData::StashedPlan { name, markdown },
             offset: 0,
+            copied: None,
         }
     }
     /// Swap in freshly-fetched data, PRESERVING the scroll offset (the
@@ -2212,6 +2284,9 @@ pub(crate) async fn run_tui(
         if detail.is_some() {
             let page = (rows as usize).saturating_sub(3).max(1);
             let overlay = detail.as_ref().unwrap();
+            // Sampled once: the hint that gets painted and the wait
+            // that must come back to unpaint it are one decision.
+            let hint = hint_at(overlay.copied, std::time::Instant::now());
             let (lines, total) = match &overlay.data {
                 OverlayData::Commit(d) => render_commit_detail(
                     &commit_doc(d),
@@ -2226,9 +2301,14 @@ pub(crate) async fn run_tui(
                     rows as usize,
                     cols as usize,
                 ),
-                OverlayData::Error { title, message } => {
-                    render_error_doc(title, message, overlay.offset, rows as usize, cols as usize)
-                }
+                OverlayData::Error { title, message } => render_error_doc(
+                    title,
+                    message,
+                    overlay.offset,
+                    rows as usize,
+                    cols as usize,
+                    hint.saying_copied(),
+                ),
                 OverlayData::Link { title, url, qr } => {
                     render_link_doc(title, url, qr, overlay.offset, rows as usize, cols as usize)
                 }
@@ -2242,7 +2322,7 @@ pub(crate) async fn run_tui(
                 OverlayData::Error { .. } | OverlayData::Link { .. } => None,
             };
             paint(&lines);
-            let ev = ev_rx.recv_timeout(Duration::from_secs(60));
+            let ev = ev_rx.recv_timeout(hint.wait());
             // The page beneath is hidden, not gone: what a wake means
             // for it is decided once, here, and carried out of this
             // loop — the flush at the loop bottom is never reached
@@ -2292,6 +2372,16 @@ pub(crate) async fn run_tui(
                             DocNav::OpenHtml => {
                                 if let Some(t) = &html_target {
                                     open_overlay_in_browser(&repo, t);
+                                }
+                            }
+                            DocNav::Copy => {
+                                // Only the error overlay carries a
+                                // reason worth taking somewhere else.
+                                if let Some(d) = detail.as_mut()
+                                    && let Some(text) = copyable(&d.data)
+                                {
+                                    super::term::copy(text);
+                                    d.copied = Some(std::time::Instant::now());
                                 }
                             }
                             DocNav::None => {}
@@ -3884,6 +3974,121 @@ pub(crate) async fn run_tui(
 
 #[cfg(test)]
 pub(crate) mod tests {
+    /// `y` copies the reason that was RETAINED, not the one that was
+    /// painted. The painted one is wrapped to the region and clipped
+    /// to its height, which is how a reason arrives useless.
+    #[test]
+    fn copying_takes_the_whole_reason_not_the_window() {
+        let long = format!(
+            "not reachable through the tunnel: {}",
+            (0..40)
+                .map(|i| format!("cause number {i} of the chain"))
+                .collect::<Vec<_>>()
+                .join(": ")
+        );
+        let overlay = super::Overlay::error("REMOTE".to_string(), long.clone());
+
+        let copied = super::copyable(&overlay.data).expect("a failure is copyable");
+        assert_eq!(copied, long, "the retained message, whole");
+
+        // The same reason as painted into a small region: wrapped,
+        // and cut off at the bottom.
+        let (painted, total) = super::render::render_error_doc("REMOTE", &long, 0, 6, 40, false);
+        assert!(total > painted.len(), "the window really does clip");
+        let shown: String = painted.join("");
+        assert!(
+            !shown.contains("cause number 39"),
+            "the window drops the tail, which is why the window is not what we copy"
+        );
+        assert!(copied.contains("cause number 39"), "the copy keeps it");
+    }
+
+    /// One reading of the clock decides both the word on screen and
+    /// the sleep that comes back to remove it. The boundary is the
+    /// whole test: crossing it between two readings used to underflow
+    /// `Duration` and take the TUI down over a copy, and deciding the
+    /// two separately left `copied` on screen for a minute.
+    #[test]
+    fn the_hint_and_its_repaint_are_one_decision() {
+        use std::time::{Duration, Instant};
+        let at = Instant::now();
+
+        assert_eq!(super::hint_at(None, at), super::Hint::Idle);
+        assert_eq!(super::hint_at(None, at).wait(), super::OVERLAY_IDLE);
+
+        // Fresh: says copied, and sleeps only until it stops being true.
+        let fresh = super::hint_at(Some(at), at);
+        assert_eq!(fresh, super::Hint::Copied(super::COPIED_FOR));
+        assert!(fresh.saying_copied());
+        assert_eq!(fresh.wait(), super::COPIED_FOR);
+
+        // A hair before the boundary: still copied, and the sleep left
+        // is small but never zero, so the repaint is still owed.
+        let nearly = super::hint_at(Some(at), at + super::COPIED_FOR - Duration::from_nanos(1));
+        assert_eq!(nearly, super::Hint::Copied(Duration::from_nanos(1)));
+
+        // EXACTLY the boundary: idle, not a panic and not a zero sleep.
+        let exact = super::hint_at(Some(at), at + super::COPIED_FOR);
+        assert_eq!(exact, super::Hint::Idle);
+        assert!(!exact.saying_copied());
+        assert_eq!(
+            exact.wait(),
+            super::OVERLAY_IDLE,
+            "an expired hint owes no repaint, or the overlay busy-loops"
+        );
+
+        // Past it, by a lot. The subtraction that used to panic.
+        let gone = super::hint_at(Some(at), at + Duration::from_secs(600));
+        assert_eq!(gone, super::Hint::Idle);
+
+        // A clock that went backwards is not a hint from the future.
+        let backwards = super::hint_at(Some(at + Duration::from_secs(5)), at);
+        assert_eq!(backwards, super::Hint::Copied(super::COPIED_FOR));
+    }
+
+    /// Only a failure carries text worth taking elsewhere.
+    #[test]
+    fn a_link_overlay_is_not_copyable() {
+        let link = super::Overlay::link("phone".to_string(), "https://x.example".to_string());
+        assert_eq!(super::copyable(&link.data), None);
+    }
+
+    /// OSC 52 is never acknowledged, so the hint is the whole of the
+    /// feedback: it has to say `copied`, and then stop saying it.
+    #[test]
+    fn the_hint_says_copied_and_then_stops() {
+        let rule = |copied| {
+            super::render::render_error_doc("REMOTE", "boom", 0, 6, 60, copied).0[0].clone()
+        };
+        assert!(rule(false).contains("y copy"), "{}", rule(false));
+        assert!(!rule(false).contains("copied"), "{}", rule(false));
+        assert!(rule(true).contains("copied"), "{}", rule(true));
+        assert!(!rule(true).contains("y copy"), "{}", rule(true));
+    }
+
+    /// The sequence the terminal is handed: OSC 52, the `c` (clipboard)
+    /// selection, the payload base64'd, terminated.
+    #[test]
+    fn the_sequence_is_a_well_formed_osc_52() {
+        use base64::Engine as _;
+        let text = "not reachable through the tunnel: dns error\nsecond line";
+        let seq = crate::cli::term::osc52(text);
+        let body = seq
+            .strip_prefix("\x1b]52;c;")
+            .and_then(|s| s.strip_suffix("\x07"))
+            .unwrap_or_else(|| panic!("not an OSC 52: {seq:?}"));
+        assert_eq!(
+            String::from_utf8(
+                base64::engine::general_purpose::STANDARD
+                    .decode(body)
+                    .unwrap()
+            )
+            .unwrap(),
+            text,
+            "what the terminal decodes is what the user saw"
+        );
+    }
+
     #[test]
     fn empty_log_refuses_log_focus() {
         let snapshot = crate::cli::status_tui::fixtures::two_agent_snap();
