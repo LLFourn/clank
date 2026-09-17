@@ -496,6 +496,213 @@ const ok = (name, cond, detail = '') => out.push(`${cond ? 'PASS' : 'FAIL'}  ${n
     ok('no errors around the two races', errors.length === 0, errors.join('; '));
   }
 
+  // ---- a pasted image is an attachment
+  {
+    const { page, errors } = await open();
+    await page.evaluate((d) => window.__send('status', d), facts([agent('claude', 'master')]));
+    await page.evaluate((d) => window.__send('panes', d), panes(['claude']));
+    await page.evaluate(() => {
+      window.__n = 0; window.__ups = []; window.__uploaded = [];
+      window.fetch = (url, opts) => {
+        if (url === '/upload') {
+          const n = ++window.__n;
+          window.__uploaded.push(opts.headers['content-type']);
+          return new Promise((res) => { window.__ups.push(() => res({ ok: true, status: 200, json: async () => ({ path: `/a/${n}.png` }) })); });
+        }
+        return Promise.resolve({ ok: true, status: 204, text: async () => '' });
+      };
+    });
+    // A real paste event, carrying a real file.
+    const paste = (kinds) => page.evaluate((list) => {
+      const dt = new DataTransfer();
+      for (const k of list) {
+        if (k === 'text') dt.setData('text/plain', 'just words');
+        else dt.items.add(new File([new Uint8Array([1, 2, 3])], `${k}.png`, { type: 'image/png' }));
+      }
+      document.querySelector('#text').dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
+    }, kinds);
+
+    await paste(['shot']);
+    await page.waitForFunction(() => window.__ups.length === 1);
+    ok('a pasted image is uploaded', await page.evaluate(() => window.__uploaded[0]) === 'image/png');
+    ok('and holds the draft while it goes', await page.isDisabled('#send'));
+    await page.evaluate(() => window.__ups.shift()());
+    await page.waitForTimeout(60);
+    ok('its path lands in the box', (await page.inputValue('#text')) === '/a/1.png', await page.inputValue('#text'));
+
+    // Two at once, named in the order they were pasted.
+    await page.fill('#text', '');
+    const base = await page.evaluate(() => window.__n);
+    await paste(['one', 'two']);
+    await page.waitForFunction(() => window.__ups.length === 1);
+    ok('the second waits for the first', await page.evaluate(() => window.__n) === base + 1,
+       'or two uploads race and the paths land out of order');
+    await page.evaluate(() => window.__ups.shift()());
+    await page.waitForFunction(() => window.__ups.length === 1);
+    await page.evaluate(() => window.__ups.shift()());
+    await page.waitForTimeout(60);
+    ok('two pasted images name two paths, in order',
+       (await page.inputValue('#text')) === '/a/2.png /a/3.png', await page.inputValue('#text'));
+
+    // Text is the browser's business.
+    await page.fill('#text', '');
+    const before = await page.evaluate(() => window.__n);
+    await paste(['text']);
+    await page.waitForTimeout(60);
+    ok('a text paste attaches nothing', await page.evaluate(() => window.__n) === before);
+    ok('and is not swallowed', await page.evaluate(() => {
+      const dt = new DataTransfer();
+      dt.setData('text/plain', 'words');
+      const ev = new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true });
+      document.querySelector('#text').dispatchEvent(ev);
+      return !ev.defaultPrevented;
+    }));
+
+    // A refused paste behaves like a refused `+`.
+    await page.evaluate(() => { window.fetch = async () => ({ ok: false, status: 413, text: async () => 'too big', json: async () => ({ path: '/a/nope.png' }) }); });
+    await paste(['huge']);
+    await page.waitForTimeout(80);
+    ok('a refused paste leaves the box alone', (await page.inputValue('#text')) === '');
+    ok('and says so', (await page.textContent('#sent')).includes('Not attached'));
+    ok('and Send recovers', !(await page.isDisabled('#send')));
+    // A browser that fills `items` but not `files` — the fallback the
+    // real surface differs on. Chromium fills both, so the branch
+    // needs a clipboard of its own to be exercised at all.
+    await page.evaluate(() => { window.__n = 0; window.__ups = []; window.fetch = (url, opts) => {
+      if (url === '/upload') { const n = ++window.__n; return new Promise((res) => { window.__ups.push(() => res({ ok: true, status: 200, json: async () => ({ path: `/b/${n}.png` }) })); }); }
+      return Promise.resolve({ ok: true, status: 204, text: async () => '' }); }; });
+    await page.fill('#text', '');
+    await page.evaluate(() => {
+      const file = new File([new Uint8Array([9])], 'i.png', { type: 'image/png' });
+      const ev = new Event('paste', { bubbles: true, cancelable: true });
+      Object.defineProperty(ev, 'clipboardData', {
+        value: { files: [], items: [{ kind: 'file', getAsFile: () => file }] },
+      });
+      document.querySelector('#text').dispatchEvent(ev);
+    });
+    await page.waitForFunction(() => window.__ups.length === 1);
+    await page.evaluate(() => window.__ups.shift()());
+    await page.waitForTimeout(60);
+    ok('a clipboard with only `items` still attaches', (await page.inputValue('#text')) === '/b/1.png',
+       await page.inputValue('#text'));
+    ok('and exactly once', await page.evaluate(() => window.__n) === 1);
+
+    // And the other way round: a browser that fills `files` and
+    // leaves `items` empty. Both surfaces exist in the wild and
+    // Chromium fills both, so neither branch is exercised by a real
+    // clipboard here.
+    await page.fill('#text', '');
+    await page.evaluate(() => {
+      const file = new File([new Uint8Array([9])], 'f.png', { type: 'image/png' });
+      const ev = new Event('paste', { bubbles: true, cancelable: true });
+      Object.defineProperty(ev, 'clipboardData', { value: { files: [file], items: [] } });
+      document.querySelector('#text').dispatchEvent(ev);
+    });
+    await page.waitForFunction(() => window.__ups.length === 1);
+    await page.evaluate(() => window.__ups.shift()());
+    await page.waitForTimeout(60);
+    ok('a clipboard with only `files` attaches too', (await page.inputValue('#text')) === '/b/2.png',
+       await page.inputValue('#text'));
+    ok('and still exactly once', await page.evaluate(() => window.__n) === 2);
+
+    ok('the native file picker stays out of sight', await page.isHidden('#file'));
+    ok('while + still reaches it', await page.evaluate(() => {
+      let opened = false;
+      const f = document.querySelector('#file');
+      const was = f.click; f.click = () => { opened = true; };
+      document.querySelector('#attach').click();
+      f.click = was;
+      return opened;
+    }));
+    ok('no errors around pasting', errors.length === 0, errors.join('; '));
+  }
+
+  // ---- a pasted batch is one hold, however its files fare
+  {
+    const { page, errors } = await open();
+    const now = Math.floor(Date.now() / 1000);
+    const two = (claudeWorks) => page.evaluate(([n, w]) => window.__send('status', {
+      facts: {
+        lamp: 'l', plan: 'foo', hue: '#5f5fff', correction: null,
+        agents: [
+          { label: 'claude', role: 'master', owes: w ? { verb: 'working', object: 'x', since: n - 9 } : null, last: null, transcript: false, ended: null },
+          { label: 'codex', role: 'commit', owes: w ? null : { verb: 'reviewing', object: 'y', since: n - 3 }, last: null, transcript: false, ended: null },
+        ],
+        ledger: { plan: 'foo', gate: 'unreviewed', dirty: null, queue: 0, stash: 0, blocks: [], rows: [] },
+      },
+    }), [now, claudeWorks]);
+    await two(true);
+    await page.evaluate((d) => window.__send('panes', d), panes(['claude', 'codex']));
+    ok('auto is on claude', (await page.textContent('#whoname')) === 'claude');
+
+    await page.evaluate(() => {
+      window.__n = 0; window.__settle = [];
+      window.fetch = (url, opts) => {
+        if (url === '/upload') { const n = ++window.__n; return new Promise((ok_, no) => { window.__settle.push({ ok: () => ok_({ ok: true, status: 200, json: async () => ({ path: `/c/${n}.png` }) }), bad: () => ok_({ ok: false, status: 413, text: async () => 'no', json: async () => ({ path: '/c/x.png' }) }) }); }); }
+        if (url === '/say') { window.__said = JSON.parse(opts.body); return Promise.resolve({ ok: true, status: 204, text: async () => '' }); }
+        return Promise.resolve({ ok: true, status: 204, text: async () => '' });
+      };
+    });
+    await page.evaluate(() => {
+      const dt = new DataTransfer();
+      for (const n of ['a', 'b']) dt.items.add(new File([new Uint8Array([1])], `${n}.png`, { type: 'image/png' }));
+      document.querySelector('#text').dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
+    });
+    await page.waitForFunction(() => window.__settle.length === 1);
+
+    // The turn moves while the batch is still going up.
+    await two(false);
+    // The FIRST file fails, which leaves the box empty.
+    await page.evaluate(() => window.__settle.shift().bad());
+    await page.waitForTimeout(60);
+    ok('a failed file does not release the batch', (await page.textContent('#whoname')) === 'claude',
+       'or the next image lands in front of another agent');
+    await page.waitForFunction(() => window.__settle.length === 1);
+    await page.evaluate(() => window.__settle.shift().ok());
+    await page.waitForTimeout(60);
+    ok('the surviving file lands on the agent it was pasted to', (await page.textContent('#whoname')) === 'claude');
+    ok('and its path is in the box', (await page.inputValue('#text')) === '/c/2.png', await page.inputValue('#text'));
+    await page.click('#send');
+    await page.waitForTimeout(60);
+    ok('so the message goes where it was written', await page.evaluate(() => window.__said.pane) === 'pane-claude',
+       JSON.stringify(await page.evaluate(() => window.__said)));
+
+    // Every file failing still gives the composer back.
+    await page.fill('#text', '');
+    await page.evaluate(() => {
+      const dt = new DataTransfer();
+      dt.items.add(new File([new Uint8Array([1])], 'c.png', { type: 'image/png' }));
+      document.querySelector('#text').dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
+    });
+    await page.waitForFunction(() => window.__settle.length === 1);
+    await page.evaluate(() => window.__settle.shift().bad());
+    await page.waitForTimeout(60);
+    ok('a batch that all failed releases the hold', (await page.textContent('#whoname')) === 'codex');
+    ok('and Send is usable again', !(await page.isDisabled('#send')) || (await page.inputValue('#text')) === '');
+    ok('no errors around the batch', errors.length === 0, errors.join('; '));
+  }
+
+  // ---- the composer is a bubble under the column it belongs to
+  {
+    const { page, errors } = await open();
+    await page.evaluate((d) => window.__send('status', d), facts([agent('claude', 'master', null, null, true)]));
+    await page.evaluate((d) => window.__send('panes', d), panes(['claude']));
+    await page.evaluate((d) => window.__send('turns', d), turns('claude', []));
+    await page.setViewportSize({ width: 1400, height: 900 });
+    await page.waitForTimeout(40);
+    const m = await page.evaluate(() => {
+      const r = (s) => { const b = document.querySelector(s).getBoundingClientRect(); return { l: Math.round(b.left), r: Math.round(b.right), w: Math.round(b.width) }; };
+      const input = r('#text'), bubble = r('.bubble');
+      return { bubble, turns: r('.turns'), input, send: r('#send'), attach: r('#attach') };
+    });
+    ok('the composer and the reading column are the same column',
+       Math.abs(m.bubble.l - m.turns.l) <= 1 && Math.abs(m.bubble.r - m.turns.r) <= 1, JSON.stringify(m));
+    ok('and it is wider than it was', m.turns.w > 700, JSON.stringify(m));
+    ok('the writing area has the whole width', m.input.w > m.bubble.w - 40, JSON.stringify(m));
+    ok('with the controls on the row beneath it', m.attach.l < m.send.l && m.attach.l < m.input.r, JSON.stringify(m));
+    ok('no errors around the bubble', errors.length === 0, errors.join('; '));
+  }
+
   // ---- the composer fits a phone
   {
     const { page, errors } = await open();

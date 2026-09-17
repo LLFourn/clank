@@ -121,7 +121,7 @@ const ok = (n, c, d = '') => out.push(`${c ? 'PASS' : 'FAIL'}  ${n}${d ? '  — 
       const host = document.querySelector('.view.transcript').getBoundingClientRect();
       return { w: Math.round(b.width), left: Math.round(b.left - host.left), right: Math.round(host.right - b.right) };
     });
-    ok(`a readable measure at ${w}px`, m.w <= 700, JSON.stringify(m));
+    ok(`a readable measure at ${w}px`, m.w <= 760, JSON.stringify(m));
     if (w > 700) ok(`centred at ${w}px`, Math.abs(m.left - m.right) <= 2, JSON.stringify(m));
   }
 

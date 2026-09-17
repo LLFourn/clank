@@ -27,10 +27,19 @@
     /* The terminal keeps its own ground at every width: agents choose
        ANSI colours assuming a dark one, and bright-white-on-white is
        not something CSS out here can fix. */
+    /* One measure for the reading column and the composer, so the
+       two line up. 68ch of proportional text came out at 605px and
+       still read narrow beside the reference. */
+    --column: 46rem;
     --pane: #1a1917;
     --pane-ink: #e8e4dc;
   }
   * { box-sizing: border-box; }
+  /* Hidden means hidden. A `display` rule written for one control
+     otherwise reaches every element it matches — a `.say input`
+     declaration put the native file picker on screen beside `+`
+     (codex on d772e3e) — and two controls here rely on `hidden`. */
+  [hidden] { display: none !important; }
   /* A grid item's `min-width: auto` is its CONTENT's minimum, so one
      unshrinkable row — the composer, with its buttons — widens the
      whole column and pushes Send off a 320px screen (codex on
@@ -111,7 +120,7 @@
      person said sits in a block of its own, so who is speaking needs
      no label. How long ago is the one thing worth a mark, at the
      right edge of every turn. */
-  .turns { padding: 18px 20px 28px; max-width: 68ch; margin-inline: auto; font-size: 16px; line-height: 1.62; }
+  .turns { padding: 18px 20px 28px; max-width: var(--column); margin-inline: auto; font-size: 16px; line-height: 1.62; }
   .turn { position: relative; padding: 10px 0; }
   .turn .age { float: right; margin: 4px 0 0 12px; color: var(--muted); font-size: 11px; font-family: var(--mono); }
   /* What the person said is a block of its own, so who is speaking
@@ -177,17 +186,25 @@
   .terminal.closed .gone { display: flex; }
 
   /* Say something. */
-  .say { grid-area: say; display: flex; gap: 8px; padding: 8px 10px calc(8px + env(safe-area-inset-bottom)); background: var(--bezel); border-top: 1px solid var(--edge); }
-  .say input { flex: 1 1 0; min-width: 0; background: var(--base); color: var(--ink); border: 1px solid var(--edge); border-radius: 6px; padding: 10px 12px; font: 15px var(--text); }
-  .say input:focus { outline: 2px solid var(--hue); outline-offset: -1px; border-color: transparent; }
-  .say button.send { background: var(--hue-deep); color: #fff; border-radius: 6px; padding: 0 16px; font-weight: 700; }
+  /* One bubble: what you are writing across the top, what you can do
+     with it on the row beneath. A single row made the writing area
+     compete with every button for the same line, which is how Send
+     ended up off a 320px screen. */
+  .say { grid-area: say; padding: 10px 14px calc(12px + env(safe-area-inset-bottom)); background: var(--base); }
+  .bubble { max-width: var(--column); margin-inline: auto; background: var(--bezel); border: 1px solid var(--edge); border-radius: 18px; padding: 10px 8px 8px 14px; }
+  .say #text { display: block; width: 100%; background: none; color: var(--ink); border: 0; padding: 2px 6px 6px 0; font: 16px var(--text); }
+  .say #text:focus { outline: none; }
+  .bubble:focus-within { border-color: color-mix(in srgb, var(--hue) 45%, var(--edge)); }
+  .tools { display: flex; align-items: center; gap: 8px; }
+  .tools .sent { margin-left: auto; }
+  .say button.send { background: var(--hue-deep); color: #fff; border-radius: 999px; padding: 7px 18px; font-weight: 700; }
   /* Beside Send, never instead of it: whether an agent is working is
      evidence, not a fact, and no amount of doubt should leave a person
      unable to speak. */
-  .say button.stop { background: none; color: var(--ink); border: 1px solid var(--edge); border-radius: 6px; padding: 0 12px; }
-  .say button.attach { min-width: 40px; font-size: 21px; line-height: 1; color: var(--muted); display: inline-flex; align-items: center; justify-content: center; }
+  .say button.stop { background: none; color: var(--ink); border: 1px solid var(--edge); border-radius: 999px; padding: 6px 14px; }
+  .say button.attach { min-width: 36px; min-height: 36px; font-size: 22px; line-height: 1; color: var(--muted); display: inline-flex; align-items: center; justify-content: center; }
   .say button.send:disabled { opacity: 0.4; cursor: default; }
-  .say .sent { color: var(--muted); font-size: 12px; align-self: center; white-space: nowrap; }
+  .say .sent { color: var(--muted); font-size: 12px; white-space: nowrap; }
 
   /* The ledger: a drawer on a phone, a column on a desk. */
   .ledger { display: none; background: var(--bezel); border-left: 1px solid var(--edge); overflow: auto; font-size: 13px; }
@@ -244,12 +261,16 @@
     <div class="views" id="views"><div class="empty" id="empty">No agents in this session yet.</div></div>
   </div>
   <form class="say" id="say">
-    <input id="text" autocomplete="off" placeholder="Say something" aria-label="Say something to the shown agent">
-    <button class="attach" id="attach" type="button" aria-label="Attach a file">+</button>
-    <input class="file" id="file" type="file" accept="image/png,image/jpeg,image/gif,image/webp,application/pdf,text/plain,text/markdown,text/csv,application/json" hidden>
-    <button class="stop" id="stop" type="button" hidden aria-label="Stop the shown agent">Stop</button>
-    <button class="send" id="send" type="submit" disabled>Send</button>
-    <span class="sent" id="sent"></span>
+    <div class="bubble">
+      <input id="text" autocomplete="off" placeholder="Say something" aria-label="Say something to the shown agent">
+      <div class="tools">
+        <button class="attach" id="attach" type="button" aria-label="Attach a file">+</button>
+        <input class="file" id="file" type="file" accept="image/png,image/jpeg,image/gif,image/webp,application/pdf,text/plain,text/markdown,text/csv,application/json" hidden>
+        <span class="sent" id="sent"></span>
+        <button class="stop" id="stop" type="button" hidden aria-label="Stop the shown agent">Stop</button>
+        <button class="send" id="send" type="submit" disabled>Send</button>
+      </div>
+    </div>
   </form>
   <div class="viewer" id="viewer" role="dialog" aria-label="Full-size image"></div>
   <aside class="ledger" id="ledger">
@@ -804,11 +825,12 @@
   // and read something.
   let pending = 0;      // uploads on their way into the box
   let sending = 0;      // messages dispatched and not yet answered
-  attachBtn.addEventListener('click', () => fileInput.click());
-  fileInput.addEventListener('change', async () => {
-    const file = fileInput.files && fileInput.files[0];
-    fileInput.value = '';
-    if (!file) return;
+  // One file, one attachment, however it arrived. The button and the
+  // clipboard are two ways IN; everything after that — the upload,
+  // the path, the hold on the draft, the shut Send — belongs to the
+  // file, and writing it twice would mean getting one of those wrong
+  // in one of the copies.
+  async function attach(file) {
     sentEl.textContent = 'Attaching…';
     pending += 1;
     syncSend();                       // Send waits for it
@@ -828,6 +850,51 @@
       syncSend();                     // Send was waiting for this
       retarget();                     // and so was the view
     }
+  }
+
+  attachBtn.addEventListener('click', () => fileInput.click());
+  fileInput.addEventListener('change', () => {
+    const file = fileInput.files && fileInput.files[0];
+    fileInput.value = '';
+    if (file) attach(file);
+  });
+
+  // A screenshot is pasted far more often than it is picked out of a
+  // file dialog, and the focus is usually in the transcript when it
+  // is taken — so the document listens, not the box.
+  document.addEventListener('paste', (e) => {
+    const board = e.clipboardData;
+    if (!board) return;
+    // `files` where the browser fills it, `items` where it does not,
+    // and never both: a browser that populates each would otherwise
+    // attach the same image twice.
+    let files = [...(board.files || [])];
+    if (!files.length && board.items) {
+      files = [...board.items]
+        .filter((i) => i.kind === 'file')
+        .map((i) => i.getAsFile())
+        .filter(Boolean);
+    }
+    if (!files.length) return;        // a text paste belongs to the browser
+    // Claimed HERE, synchronously. After the first await the event is
+    // long over and `preventDefault` does nothing.
+    e.preventDefault();
+    // ONE hold for the whole batch. `attach` releases its own as each
+    // file finishes, and a file that FAILS leaves the box empty — so
+    // between two pasted images the hold would lapse, the view could
+    // follow the turn to another agent, and the second path would
+    // land in front of them (codex on d772e3e).
+    pending += 1;
+    syncSend();
+    (async () => {
+      try {
+        for (const file of files) await attach(file);
+      } finally {
+        pending -= 1;
+        syncSend();
+        retarget();
+      }
+    })();
   });
 
   stopBtn.addEventListener('click', async () => {
