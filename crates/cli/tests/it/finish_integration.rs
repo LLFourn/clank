@@ -207,6 +207,210 @@ fn finish_refuses_an_open_block_even_when_the_gate_is_finished() {
     assert!(err.to_string().contains("block"), "{err}");
 }
 
+/// `--purge` on a dirty repo, on the current branch: it DOES change
+/// the tree, so the worktree would have to move and the refusal
+/// stands — and because the refusal is found first, nothing is
+/// finalized and not one byte of the uncommitted work is touched.
+///
+/// The other refusal tests reach the blocker a different way (an
+/// existing `--into-branch`, which is rejected before the tree is ever
+/// considered) or call the engine directly, below the boundary this
+/// protects (codex on eca016b).
+#[test]
+fn a_dirty_purge_refuses_and_leaves_everything_where_it_was() {
+    let env = TestEnv::init();
+    env.register_team("claude", &["codex"], &[]);
+    let repo = env.repo();
+    write(repo, "README", "base\n");
+    commit(repo, "base");
+    write(repo, ".clank/plans/foo.md", "# foo\n\nbody\n");
+    commit(repo, "[foo] intro");
+    let intro = git_out(repo, &["rev-parse", "HEAD"]);
+    write(
+        repo,
+        &format!(".clank/agents/codex/feedback/{}.md", &intro[..7]),
+        "FINISHED ship it\n",
+    );
+
+    write(repo, "README", "base, edited\n");
+    write(repo, "staged.rs", "// staged\n");
+    git(repo, &["add", "staged.rs"]);
+    write(repo, "loose.txt", "loose\n");
+    let before = (
+        git_out(repo, &["rev-parse", "HEAD"]),
+        git_out(repo, &["rev-parse", "--abbrev-ref", "HEAD"]),
+        git_out(repo, &["diff"]),
+        git_out(repo, &["diff", "--cached"]),
+        std::fs::read(repo.join("loose.txt")).unwrap(),
+    );
+    assert!(
+        !before.2.is_empty() && !before.3.is_empty(),
+        "the fixture must be dirty both ways"
+    );
+
+    let mut args = finish_args(repo, "foo", None);
+    args.purge = true;
+    args.message = vec![
+        "strip foo artifacts".into(),
+        "the plan is done and the bookkeeping is noise".into(),
+    ];
+    let err = block_on(clank::cli::finish::run(args))
+        .expect_err("a purge changes the tree, so it needs a clean worktree");
+    assert!(
+        err.to_string().contains("working tree dirty"),
+        "with the message it always had, got: {err}"
+    );
+
+    assert_eq!(
+        git_out(repo, &["rev-parse", "HEAD"]),
+        before.0,
+        "HEAD unmoved"
+    );
+    assert_eq!(
+        git_out(repo, &["rev-parse", "--abbrev-ref", "HEAD"]),
+        before.1,
+        "branch unmoved"
+    );
+    assert!(
+        repo.join(".clank/plans/foo.md").exists(),
+        "the plan is still active"
+    );
+    assert!(
+        !repo.join(".clank/finished/foo.md").exists(),
+        "and nothing was finalized"
+    );
+    assert_eq!(
+        git_out(repo, &["diff"]),
+        before.2,
+        "unstaged work untouched"
+    );
+    assert_eq!(
+        git_out(repo, &["diff", "--cached"]),
+        before.3,
+        "staged work untouched"
+    );
+    assert_eq!(
+        std::fs::read(repo.join("loose.txt")).unwrap(),
+        before.4,
+        "and the untracked file, byte for byte"
+    );
+}
+
+/// Autosquash is `--squash` by another route, and a dirty repo is no
+/// more its business than it is `--squash`'s.
+#[test]
+fn autosquash_works_on_a_dirty_repo_too() {
+    let env = TestEnv::init();
+    env.register_team("claude", &["codex"], &[]);
+    let repo = env.repo();
+    write(repo, "README", "base\n");
+    commit(repo, "base");
+    write(repo, ".clank/plans/foo.md", "# foo\n\nbody\n");
+    commit(repo, "[foo] intro");
+    write(repo, "src/foo.rs", "// foo\n");
+    commit(repo, "[foo] implement");
+    let head = git_out(repo, &["rev-parse", "HEAD"]);
+    write(
+        repo,
+        &format!(".clank/agents/codex/feedback/{}.md", &head[..7]),
+        "FINISHED ship it\n",
+    );
+    // `finish.autosquash` on, and a plain finish with a message.
+    let cfg = std::fs::read_to_string(repo.join(".clank/config.json")).unwrap();
+    let mut v: serde_json::Value = serde_json::from_str(&cfg).unwrap();
+    v["finish"] = serde_json::json!({ "autosquash": true });
+    write(
+        repo,
+        ".clank/config.json",
+        &serde_json::to_string_pretty(&v).unwrap(),
+    );
+
+    write(repo, "README", "base, edited\n");
+    let unstaged = git_out(repo, &["diff"]);
+    assert!(!unstaged.is_empty(), "the fixture must be dirty");
+
+    let mut args = finish_args(repo, "foo", None);
+    args.message = vec![
+        "all of it".into(),
+        "it exists because the thing needed doing".into(),
+    ];
+    block_on(clank::cli::finish::run(args)).expect("autosquash on a dirty repo");
+
+    assert_eq!(
+        git_out(repo, &["rev-list", "--count", "HEAD"]),
+        "2",
+        "autosquash collapsed the plan to one commit"
+    );
+    assert_eq!(git_out(repo, &["diff"]), unstaged, "the edit survived");
+}
+
+/// `clank finish --squash` on a DIRTY repo: the plan finalizes, the
+/// range collapses, and the uncommitted work is exactly where it was.
+///
+/// This used to finalize and THEN refuse, leaving the plan finished
+/// but unsquashed. The refusal was over-broad — a squash lands the
+/// same tree it started from, so the working copy never needed to
+/// move.
+#[test]
+fn finish_squash_works_on_a_dirty_repo_and_keeps_the_work() {
+    let env = TestEnv::init();
+    env.register_team("claude", &["codex"], &[]);
+    let repo = env.repo();
+    write(repo, "README", "base\n");
+    commit(repo, "base");
+    write(repo, ".clank/plans/foo.md", "# foo\n\nbody\n");
+    commit(repo, "[foo] intro");
+    write(repo, "src/foo.rs", "// foo\n");
+    commit(repo, "[foo] implement");
+    let head = git_out(repo, &["rev-parse", "HEAD"]);
+    write(
+        repo,
+        &format!(".clank/agents/codex/feedback/{}.md", &head[..7]),
+        "FINISHED ship it\n",
+    );
+
+    // Dirty, three ways.
+    write(repo, "README", "base, edited\n");
+    write(repo, "staged.rs", "// staged\n");
+    git(repo, &["add", "staged.rs"]);
+    write(repo, "loose.txt", "loose\n");
+    let unstaged = git_out(repo, &["diff"]);
+    let staged = git_out(repo, &["diff", "--cached"]);
+    assert!(
+        !unstaged.is_empty() && !staged.is_empty(),
+        "dirty both ways"
+    );
+
+    let mut args = finish_args(repo, "foo", None);
+    args.message = vec![
+        "all of it".into(),
+        "it exists because the thing needed doing".into(),
+    ];
+    args.squash = Some("[foo] all of it\n\nkept as one commit".into());
+    block_on(clank::cli::finish::run(args)).expect("a dirty tree is no reason to refuse a squash");
+
+    assert_eq!(
+        git_out(repo, &["rev-list", "--count", "HEAD"]),
+        "2",
+        "the base, and the whole plan collapsed into one commit"
+    );
+    assert!(
+        git_out(repo, &["log", "-1", "--format=%s"]).contains("all of it"),
+        "the squash message landed"
+    );
+    assert_eq!(git_out(repo, &["diff"]), unstaged, "unstaged work survived");
+    assert_eq!(
+        git_out(repo, &["diff", "--cached"]),
+        staged,
+        "staged work survived"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.join("loose.txt")).unwrap(),
+        "loose\n",
+        "and the untracked file, byte for byte"
+    );
+}
+
 #[test]
 fn tui_composed_squash_message_squashes_a_no_squash_finished_plan() {
     // The TUI squash path end-to-end minus the widget
@@ -278,7 +482,7 @@ body
 }
 
 #[test]
-fn refused_squash_leaves_the_validated_message_not_the_placeholder() {
+fn a_refused_squash_finalizes_nothing() {
     // codex 053f9d1: `finish --squash` stamps the transient finalize commit
     // with the (validated) squash message BEFORE the squash runs, so a squash
     // that is REFUSED (here: `--into-branch` naming a branch that already
@@ -311,20 +515,27 @@ fn refused_squash_leaves_the_validated_message_not_the_placeholder() {
         "expected the existing-branch refusal, got: {err}"
     );
 
-    // HEAD carries the validated squash subject (plan-tagged), NOT the placeholder.
-    let subject = git_out(repo, &["log", "-1", "--format=%s"]);
+    // Nothing landed. The refusal is found BEFORE the finalize commit
+    // is written, so there is no message on HEAD to get right — which
+    // is a stronger answer to codex 053f9d1 than stamping the correct
+    // one on a commit the operator did not want.
     assert_eq!(
-        subject, "[foo] collapse foo into one",
-        "refused squash must leave the landing message"
+        git_out(repo, &["rev-parse", "HEAD"]),
+        intro,
+        "a refused squash finalizes nothing"
     );
-    assert_ne!(
-        subject, "[foo] finish",
-        "placeholder must not remain on HEAD"
+    assert!(
+        repo.join(".clank/plans/foo.md").exists(),
+        "the plan is still active"
+    );
+    assert!(
+        !repo.join(".clank/finished/foo.md").exists(),
+        "and was not moved to finished/"
     );
 }
 
 #[test]
-fn refused_purge_leaves_the_validated_message_not_the_placeholder() {
+fn a_refused_purge_finalizes_nothing() {
     // codex 53a9edb: `--purge` on a READY plan CREATES the finalize commit,
     // then runs the strip rewrite — which can be refused (here: the
     // `--into-branch` target already exists), leaving the finalize commit
@@ -356,14 +567,16 @@ fn refused_purge_leaves_the_validated_message_not_the_placeholder() {
         "expected the existing-branch refusal, got: {err}"
     );
 
-    let subject = git_out(repo, &["log", "-1", "--format=%s"]);
+    // Nothing landed — same as the squash case, and for the same
+    // reason: the refusal is found before the finalize commit exists.
     assert_eq!(
-        subject, "[foo] strip foo artifacts",
-        "refused purge must leave the validated message"
+        git_out(repo, &["rev-parse", "HEAD"]),
+        intro,
+        "a refused purge finalizes nothing"
     );
-    assert_ne!(
-        subject, "[foo] finish",
-        "placeholder must not remain on HEAD"
+    assert!(
+        repo.join(".clank/plans/foo.md").exists(),
+        "the plan is still active"
     );
 }
 

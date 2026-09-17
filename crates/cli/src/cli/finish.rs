@@ -144,6 +144,18 @@ pub async fn run(mut args: FinishArgs) -> anyhow::Result<()> {
         .await;
     }
 
+    // Ask the rewrite whether it would refuse BEFORE anything lands.
+    // It runs after the finalize commit, so a refusal found there
+    // leaves the plan finished and uncollapsed — the operator asked
+    // for one thing and got half of it, with only the retroactive
+    // path back (codex on f1096ca).
+    if args.purge || args.squash.is_some() {
+        let default_msg = format!("[{stem}] finish");
+        let msg = commit_message.as_deref().unwrap_or(&default_msg);
+        let post = post_finalize_state(&repo, &state, &stem, msg)?;
+        preflight_rewrite(&repo, &post, &plan_key, args.clone()).await?;
+    }
+
     finalize(&repo, &stem, &preview, commit_message.as_deref()).await?;
     println!("finalized `{stem}`");
 
@@ -185,6 +197,20 @@ async fn dry_run_fresh_composite(
     println!("#   sealed approvals: {}", approvers.join(", "));
     println!("#");
 
+    let post_state = post_finalize_state(repo, state, stem, msg)?;
+    rewrite_with_state(repo, &post_state, plan_key, args).await
+}
+
+/// The repo as it will be once `finalize` lands, over a SYNTHETIC
+/// finalize commit — bit-for-bit the one the live path writes. The dry
+/// preview and the pre-finalize check both ask this, so neither can be
+/// reasoning about a different repo than the live run.
+fn post_finalize_state(
+    repo: &Path,
+    state: &crate::repo_state::RepoState,
+    stem: &str,
+    msg: &str,
+) -> anyhow::Result<crate::repo_state::RepoState> {
     let head = state
         .head
         .clone()
@@ -212,8 +238,7 @@ async fn dry_run_fresh_composite(
         );
     }
     post_state.head = Some(synth);
-
-    rewrite_with_state(repo, &post_state, plan_key, args).await
+    Ok(post_state)
 }
 
 /// Join repeated `-m` values into one message, git-style: each becomes a
@@ -365,6 +390,30 @@ async fn rewrite_with_state(
     plan_key: &crate::lifecycle::PlanKey,
     args: FinishArgs,
 ) -> anyhow::Result<()> {
+    rewrite_or_assess(repo, state, plan_key, args, false).await
+}
+
+/// Ask the engine whether the rewrite would refuse, over the state the
+/// live run will see. Shares ONE opts construction with the live path
+/// below: a preflight that built its own would be free to disagree
+/// with what actually happens, which is the whole thing it exists to
+/// prevent.
+async fn preflight_rewrite(
+    repo: &std::path::Path,
+    state: &crate::repo_state::RepoState,
+    plan_key: &crate::lifecycle::PlanKey,
+    args: FinishArgs,
+) -> anyhow::Result<()> {
+    rewrite_or_assess(repo, state, plan_key, args, true).await
+}
+
+async fn rewrite_or_assess(
+    repo: &std::path::Path,
+    state: &crate::repo_state::RepoState,
+    plan_key: &crate::lifecycle::PlanKey,
+    args: FinishArgs,
+    assess_only: bool,
+) -> anyhow::Result<()> {
     // `--purge` semantics: strip the plan's `.clank/` paths from
     // history (including the just-landed finalize snapshot). Use
     // include_finalize=true so the snapshot is in the strip set.
@@ -381,7 +430,7 @@ async fn rewrite_with_state(
     // plan file — tag the squash MSG so it doesn't trip `fix_commit_tag`
     // (ruthless 28e3be4).
     let squash_msg = args.squash.as_deref().map(|m| ensure_plan_tag(m, stem));
-    let outcome = crate::cli::rewrite::run(crate::cli::rewrite::RewriteOpts {
+    let opts = crate::cli::rewrite::RewriteOpts {
         repo,
         intro_sha: preview.intro_sha.as_ref(),
         head_sha: &preview.head_sha,
@@ -392,8 +441,14 @@ async fn rewrite_with_state(
         squash: squash_msg.as_deref(),
         squash_tip: preview.squash_tip.as_ref(),
         head_strip_paths: &preview.head_strip_paths,
-    })
-    .await?;
+    };
+    if assess_only {
+        if let Some(first) = crate::cli::rewrite::preflight(opts).await?.first() {
+            anyhow::bail!("{first}");
+        }
+        return Ok(());
+    }
+    let outcome = crate::cli::rewrite::run(opts).await?;
     if args.dry {
         return Ok(());
     }

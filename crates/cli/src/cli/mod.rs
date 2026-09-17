@@ -1404,7 +1404,7 @@ pub struct QueueReprioritiseArgs {
     pub priority: u16,
 }
 
-#[derive(Args, Debug)]
+#[derive(Args, Debug, Clone)]
 pub struct FinishArgs {
     /// Plan to finalize. Accepts `<repo>/<stem>.md` or just `<stem>`.
     /// Optional when the cwd-repo has exactly one in-flight active plan.

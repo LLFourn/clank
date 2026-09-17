@@ -87,6 +87,24 @@ pub struct RewriteOutcome {
 /// commit-by-commit shape even when a blocker would prevent the
 /// live run.
 pub async fn run(opts: RewriteOpts<'_>) -> anyhow::Result<RewriteOutcome> {
+    run_inner(opts, false).await.map(|(_, outcome)| outcome)
+}
+
+/// Would this rewrite refuse, and why? The same computation `run`
+/// makes, stopped before it prints or applies anything.
+///
+/// `finish` asks BEFORE it finalizes, because the rewrite runs after
+/// the finalize commit lands: a refusal discovered there leaves a plan
+/// finished and uncollapsed, with no way on but the retroactive path
+/// (codex on f1096ca).
+pub(crate) async fn preflight(opts: RewriteOpts<'_>) -> anyhow::Result<Vec<String>> {
+    run_inner(opts, true).await.map(|(blockers, _)| blockers)
+}
+
+async fn run_inner(
+    opts: RewriteOpts<'_>,
+    assess_only: bool,
+) -> anyhow::Result<(Vec<String>, RewriteOutcome)> {
     // Build the execution plan from inputs we always have (commits
     // + maybe-intro_parent). Pre-flight checks below decide whether
     // to enforce or just report.
@@ -150,13 +168,42 @@ pub async fn run(opts: RewriteOpts<'_>) -> anyhow::Result<RewriteOutcome> {
         }
     }
 
+    // Whether a dirty tree matters here cannot be known until the tip
+    // exists: a rewrite that lands the SAME tree needs no worktree
+    // sync and so has no quarrel with one. A squash is normally
+    // exactly that — the collapsed range ends where it began — which
+    // is why `--purge` and the strip set are the wrong thing to ask
+    // (codex on 714e2cd).
+    //
+    // A live run builds regardless; it needs the tip. A DRY run builds
+    // only when the answer could change what it prints, so `--dry` on
+    // a clean tree still writes nothing at all.
+    let asked = opts.into_branch.is_none() && working_tree_dirty(opts.repo)?;
+    let built = if blockers.is_empty() && (!opts.dry || asked) {
+        Some(build_new_tip(&opts, &plan, boundary, intro_parent.as_deref()).await?)
+    } else {
+        None
+    };
+    let resync = match &built {
+        Some((tip, _)) => opts.into_branch.is_none() && moves_the_tree(opts.repo, &opts, tip)?,
+        None => false,
+    };
+    if asked && resync {
+        blockers.push("working tree dirty; commit or stash first".to_string());
+    }
+
+    // The question was only whether this would refuse.
+    if assess_only {
+        return Ok((blockers, RewriteOutcome::default()));
+    }
+
     if opts.dry {
         if let Some(msg) = opts.squash {
             print_squash_dry_run(&opts, &plan, boundary, &blockers, msg);
         } else {
             print_rebase_todo(&opts, &plan, &blockers);
         }
-        return Ok(RewriteOutcome::default());
+        return Ok((blockers, RewriteOutcome::default()));
     }
 
     if let Some(first) = blockers.first() {
@@ -164,68 +211,8 @@ pub async fn run(opts: RewriteOpts<'_>) -> anyhow::Result<RewriteOutcome> {
         // message --dry would have reported.
         anyhow::bail!("{first}");
     }
-    // Re-prove intro exists since the live path uses it for the
-    // conditional ref update — the blockers list already caught
-    // the None case, this re-check is just for the type system.
-    let intro = opts
-        .intro_sha
-        .expect("blockers would have caught a missing intro");
-    let _ = intro;
+    let (new_tip, pairs) = built.expect("a plan with no blockers was built above");
 
-    let mut pairs: Vec<(CommitSha, CommitSha)> = Vec::new();
-    let new_tip = if let Some(message) = opts.squash {
-        // None only for an empty range, which the empty-range blocker
-        // already bailed on above.
-        let boundary = boundary.expect("empty squash range is caught by blockers");
-        let squash_source = opts.squash_tip.unwrap_or(opts.head_sha);
-        let squashed = apply_squash(
-            opts.repo,
-            squash_source,
-            opts.head_strip_paths,
-            intro_parent.as_deref(),
-            message,
-        )
-        .await?;
-        let squashed_sha = parse_rewritten(&squashed)?;
-        // Every collapsed old maps to the one squash commit (the feedback
-        // migrator keeps the LATEST old per new — the finalize commit's).
-        for step in &plan.steps[..=boundary] {
-            pairs.push((parse_rewritten(&step.sha)?, squashed_sha.clone()));
-        }
-        // RESTACK the steps after the squash tip individually, per their
-        // manifest disposition — purge stripping applies to their trees too.
-        let mut parent = squashed;
-        for step in &plan.steps[boundary + 1..] {
-            let replayed = match step.disposition {
-                RewriteDisposition::Drop => None,
-                RewriteDisposition::KeepVerbatim => {
-                    let tree = git_plumbing::commit_tree_oid(opts.repo, &step.sha)?;
-                    Some(git_plumbing::replay_commit(
-                        opts.repo,
-                        &step.sha,
-                        &tree,
-                        Some(&parent),
-                    )?)
-                }
-                RewriteDisposition::Rewrite => {
-                    let tree = git_plumbing::strip_tree(opts.repo, &step.sha, &step.strip_paths)?;
-                    Some(git_plumbing::replay_commit(
-                        opts.repo,
-                        &step.sha,
-                        &tree,
-                        Some(&parent),
-                    )?)
-                }
-            };
-            if let Some(new) = replayed {
-                pairs.push((parse_rewritten(&step.sha)?, parse_rewritten(&new)?));
-                parent = new;
-            }
-        }
-        parent
-    } else {
-        apply_plan(opts.repo, &plan, intro_parent.as_deref(), &mut pairs).await?
-    };
     let updated_branch = match opts.into_branch {
         Some(name) => {
             // Create-or-fail: refuse if the ref already exists (atomic
@@ -258,19 +245,28 @@ pub async fn run(opts: RewriteOpts<'_>) -> anyhow::Result<RewriteOutcome> {
                     short(opts.head_sha.as_str()),
                 )
             })?;
-            // Re-sync the worktree to the new tip. Kept on git: a
+            // Re-sync the worktree to the new tip — but ONLY when the
+            // tree actually changed. `reset_hard` discards staged and
+            // unstaged work, so running it after a tree-preserving
+            // squash would destroy exactly the edits that made the
+            // tree dirty (codex on 714e2cd). Kept on git: a
             // worktree-state checkout whose exact semantics
             // (gitignore/fileMode/autocrlf) must match git's.
-            git_plumbing::reset_hard(opts.repo, "HEAD")?;
+            if resync {
+                git_plumbing::reset_hard(opts.repo, "HEAD")?;
+            }
             current
         }
     };
 
-    Ok(RewriteOutcome {
-        new_tip: Some(new_tip),
-        updated_branch: Some(updated_branch),
-        pairs,
-    })
+    Ok((
+        blockers,
+        RewriteOutcome {
+            new_tip: Some(new_tip),
+            updated_branch: Some(updated_branch),
+            pairs,
+        },
+    ))
 }
 
 fn parse_rewritten(sha: &str) -> anyhow::Result<CommitSha> {
@@ -457,6 +453,82 @@ fn build_plan(commits: &[RewriteCommit], intro_parent: Option<&str>) -> Executio
 
 /// Pre-flight diagnostics. Live run bails on the first; `--dry`
 /// reports the full list as a footer after the listing.
+/// Whether landing `new_tip` on the current branch would change the
+/// tree the working copy is checked out to.
+fn moves_the_tree(repo: &Path, opts: &RewriteOpts<'_>, new_tip: &str) -> anyhow::Result<bool> {
+    Ok(git_plumbing::commit_tree_oid(repo, new_tip)?
+        != git_plumbing::commit_tree_oid(repo, opts.head_sha.as_str())?)
+}
+
+/// Write the rewritten history as dangling objects and return its tip.
+///
+/// Nothing is referenced here — the branch does not move until the
+/// caller decides it may. That is what lets the dirty-tree question be
+/// answered against the tree this actually produces rather than a
+/// guess made before it existed.
+async fn build_new_tip(
+    opts: &RewriteOpts<'_>,
+    plan: &ExecutionPlan,
+    boundary: Option<usize>,
+    intro_parent: Option<&str>,
+) -> anyhow::Result<(String, Vec<(CommitSha, CommitSha)>)> {
+    let mut pairs: Vec<(CommitSha, CommitSha)> = Vec::new();
+    let new_tip = if let Some(message) = opts.squash {
+        // None only for an empty range, which the empty-range blocker
+        // already bailed on above.
+        let boundary = boundary.expect("empty squash range is caught by blockers");
+        let squash_source = opts.squash_tip.unwrap_or(opts.head_sha);
+        let squashed = apply_squash(
+            opts.repo,
+            squash_source,
+            opts.head_strip_paths,
+            intro_parent,
+            message,
+        )
+        .await?;
+        let squashed_sha = parse_rewritten(&squashed)?;
+        // Every collapsed old maps to the one squash commit (the feedback
+        // migrator keeps the LATEST old per new — the finalize commit's).
+        for step in &plan.steps[..=boundary] {
+            pairs.push((parse_rewritten(&step.sha)?, squashed_sha.clone()));
+        }
+        // RESTACK the steps after the squash tip individually, per their
+        // manifest disposition — purge stripping applies to their trees too.
+        let mut parent = squashed;
+        for step in &plan.steps[boundary + 1..] {
+            let replayed = match step.disposition {
+                RewriteDisposition::Drop => None,
+                RewriteDisposition::KeepVerbatim => {
+                    let tree = git_plumbing::commit_tree_oid(opts.repo, &step.sha)?;
+                    Some(git_plumbing::replay_commit(
+                        opts.repo,
+                        &step.sha,
+                        &tree,
+                        Some(&parent),
+                    )?)
+                }
+                RewriteDisposition::Rewrite => {
+                    let tree = git_plumbing::strip_tree(opts.repo, &step.sha, &step.strip_paths)?;
+                    Some(git_plumbing::replay_commit(
+                        opts.repo,
+                        &step.sha,
+                        &tree,
+                        Some(&parent),
+                    )?)
+                }
+            };
+            if let Some(new) = replayed {
+                pairs.push((parse_rewritten(&step.sha)?, parse_rewritten(&new)?));
+                parent = new;
+            }
+        }
+        parent
+    } else {
+        apply_plan(opts.repo, plan, intro_parent, &mut pairs).await?
+    };
+    Ok((new_tip, pairs))
+}
+
 fn collect_blockers(opts: &RewriteOpts<'_>) -> anyhow::Result<Vec<String>> {
     let mut blockers = Vec::new();
     if !opts.linear {
@@ -469,9 +541,10 @@ fn collect_blockers(opts: &RewriteOpts<'_>) -> anyhow::Result<Vec<String>> {
     if opts.intro_sha.is_none() {
         blockers.push("rewrite range is empty; nothing to do".to_string());
     }
-    if working_tree_dirty(opts.repo)? {
-        blockers.push("working tree dirty; commit or stash first".to_string());
-    }
+    // The dirty check is NOT here: it depends on the tree this
+    // rewrite will actually land, which does not exist until the
+    // history is built. `run` adds it once it knows (codex on
+    // 714e2cd).
     if let Some(branch) = opts.into_branch
         && branch_exists(opts.repo, branch)?
     {
@@ -1262,6 +1335,153 @@ mod tests {
         assert!(
             tree_has(dir.path(), "scrubbed", "README.md"),
             "seed file lost from rewritten branch"
+        );
+    }
+
+    /// A squash that lands the same tree leaves the working copy
+    /// alone — staged, unstaged and untracked work all survive it.
+    ///
+    /// This is the whole point of the change. The path used to refuse
+    /// outright on a dirty tree, and simply lifting that refusal would
+    /// have been worse than the refusal: `reset_hard` runs after the
+    /// branch moves and would have thrown every one of these away
+    /// (codex on 714e2cd).
+    #[tokio::test]
+    async fn a_tree_preserving_squash_leaves_the_working_copy_alone() {
+        let dir = init_repo();
+        let repo = dir.path();
+        write(repo, "base.txt", "base\n");
+        let base = commit(repo, "base");
+        write(repo, ".clank/plans/foo.md", "# foo\n");
+        let intro = commit(repo, "[foo] plan");
+        write(repo, "work.txt", "one\n");
+        let head = commit(repo, "[foo] work");
+
+        // Three kinds of uncommitted work, one of each.
+        write(repo, "base.txt", "base, edited\n"); // unstaged
+        write(repo, "staged.txt", "staged\n");
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+            String::from_utf8_lossy(&out.stdout).to_string()
+        };
+        git(&["add", "staged.txt"]);
+        write(repo, "untracked.txt", "untracked\n");
+
+        let before_unstaged = git(&["diff"]);
+        let before_staged = git(&["diff", "--cached"]);
+        assert!(
+            !before_unstaged.is_empty() && !before_staged.is_empty(),
+            "the fixture must actually be dirty both ways"
+        );
+
+        let preview = mk_preview(
+            &intro,
+            &head,
+            vec![
+                (
+                    intro.clone(),
+                    "[foo] plan".into(),
+                    RewriteDisposition::KeepVerbatim,
+                    false,
+                    vec![],
+                ),
+                (
+                    head.clone(),
+                    "[foo] work".into(),
+                    RewriteDisposition::KeepVerbatim,
+                    false,
+                    vec![],
+                ),
+            ],
+        );
+        let outcome = super::run(RewriteOpts {
+            repo,
+            intro_sha: preview.intro_sha.as_ref(),
+            head_sha: &preview.head_sha,
+            linear: preview.linear,
+            commits: &preview.commits,
+            into_branch: None,
+            dry: false,
+            squash: Some("[foo] all of it"),
+            squash_tip: None,
+            head_strip_paths: &[],
+        })
+        .await
+        .expect("a squash that keeps the tree does not need a clean one");
+
+        let tip = outcome.new_tip.expect("the branch moved");
+        assert_eq!(
+            git_plumbing::commit_tree_oid(repo, &tip).unwrap(),
+            git_plumbing::commit_tree_oid(repo, &head).unwrap(),
+            "the squash landed the same tree it started from"
+        );
+        assert_eq!(git(&["diff"]), before_unstaged, "unstaged work survived");
+        assert_eq!(
+            git(&["diff", "--cached"]),
+            before_staged,
+            "staged work survived"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.join("untracked.txt")).unwrap(),
+            "untracked\n",
+            "and so did the untracked file, byte for byte"
+        );
+    }
+
+    /// A rewrite that CHANGES the tree still refuses a dirty one:
+    /// there the worktree must be resynced, and resyncing over
+    /// uncommitted work is what destroys it.
+    #[tokio::test]
+    async fn a_tree_changing_rewrite_still_wants_a_clean_worktree() {
+        let dir = init_repo();
+        let repo = dir.path();
+        write(repo, "base.txt", "base\n");
+        let base = commit(repo, "base");
+        write(repo, ".clank/plans/foo.md", "# foo\n");
+        let intro = commit(repo, "[foo] plan");
+        let _ = base;
+        write(repo, "dirt.txt", "dirt\n");
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["add", "dirt.txt"])
+            .output()
+            .unwrap();
+
+        let preview = mk_preview(
+            &intro,
+            &intro,
+            vec![(
+                intro.clone(),
+                "[foo] plan".into(),
+                RewriteDisposition::Rewrite,
+                false,
+                vec![".clank/plans/foo.md".to_string()],
+            )],
+        );
+        let err = super::run(RewriteOpts {
+            repo,
+            intro_sha: preview.intro_sha.as_ref(),
+            head_sha: &preview.head_sha,
+            linear: preview.linear,
+            commits: &preview.commits,
+            into_branch: None,
+            dry: false,
+            squash: None,
+            squash_tip: None,
+            head_strip_paths: &[".clank/plans/foo.md".to_string()],
+        })
+        .await
+        .expect_err("stripping a path changes the tree, so the worktree must move");
+        assert!(
+            err.to_string().contains("working tree dirty"),
+            "with the message it always had: {err}"
         );
     }
 
