@@ -217,6 +217,20 @@ async fn compute_outcome_with(
     // `AutoMode::Off` and the empty-items path both used to exit
     // above the old reap, which is how markers outlived their turn.
     let agent_dir = crate::agent_store::agents_root(&repo).join(label.as_str());
+
+    // This hook IS the turn ending, so the stamp goes down here —
+    // before the branches below, and long before the wait this may
+    // park. A stamp written after the wait returns would be dated
+    // when the NEXT turn's work arrived, which is the opposite of
+    // what it means. Best-effort: a turn-end must never fail over a
+    // note about one.
+    crate::agent_store::record_turn_end(
+        &agent_dir,
+        crate::age::now(),
+        input.session_id.as_str(),
+        crate::agent_store::read_wait_generation(&agent_dir),
+    );
+
     let attending = consume_attending(&agent_dir);
 
     // Config may be ABSENT (bound via `clank as` but auto never

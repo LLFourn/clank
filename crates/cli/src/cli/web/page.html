@@ -31,6 +31,11 @@
     --pane-ink: #e8e4dc;
   }
   * { box-sizing: border-box; }
+  /* A grid item's `min-width: auto` is its CONTENT's minimum, so one
+     unshrinkable row — the composer, with its buttons — widens the
+     whole column and pushes Send off a 320px screen (codex on
+     a757522). Every area here scrolls or truncates internally. */
+  body > * { min-width: 0; }
   html, body { height: 100%; margin: 0; }
   body {
     background: var(--base); color: var(--ink);
@@ -173,11 +178,16 @@
 
   /* Say something. */
   .say { grid-area: say; display: flex; gap: 8px; padding: 8px 10px calc(8px + env(safe-area-inset-bottom)); background: var(--bezel); border-top: 1px solid var(--edge); }
-  .say input { flex: 1 1 auto; min-width: 0; background: var(--base); color: var(--ink); border: 1px solid var(--edge); border-radius: 6px; padding: 10px 12px; font: 15px var(--text); }
+  .say input { flex: 1 1 0; min-width: 0; background: var(--base); color: var(--ink); border: 1px solid var(--edge); border-radius: 6px; padding: 10px 12px; font: 15px var(--text); }
   .say input:focus { outline: 2px solid var(--hue); outline-offset: -1px; border-color: transparent; }
   .say button.send { background: var(--hue-deep); color: #fff; border-radius: 6px; padding: 0 16px; font-weight: 700; }
+  /* Beside Send, never instead of it: whether an agent is working is
+     evidence, not a fact, and no amount of doubt should leave a person
+     unable to speak. */
+  .say button.stop { background: none; color: var(--ink); border: 1px solid var(--edge); border-radius: 6px; padding: 0 12px; }
+  .say button.attach { min-width: 40px; font-size: 21px; line-height: 1; color: var(--muted); display: inline-flex; align-items: center; justify-content: center; }
   .say button.send:disabled { opacity: 0.4; cursor: default; }
-  .say .sent { color: var(--muted); font-size: 12px; align-self: center; min-width: 4ch; }
+  .say .sent { color: var(--muted); font-size: 12px; align-self: center; white-space: nowrap; }
 
   /* The ledger: a drawer on a phone, a column on a desk. */
   .ledger { display: none; background: var(--bezel); border-left: 1px solid var(--edge); overflow: auto; font-size: 13px; }
@@ -235,6 +245,9 @@
   </div>
   <form class="say" id="say">
     <input id="text" autocomplete="off" placeholder="Say something" aria-label="Say something to the shown agent">
+    <button class="attach" id="attach" type="button" aria-label="Attach a file">+</button>
+    <input class="file" id="file" type="file" accept="image/png,image/jpeg,image/gif,image/webp,application/pdf,text/plain,text/markdown,text/csv,application/json" hidden>
+    <button class="stop" id="stop" type="button" hidden aria-label="Stop the shown agent">Stop</button>
     <button class="send" id="send" type="submit" disabled>Send</button>
     <span class="sent" id="sent"></span>
   </form>
@@ -252,7 +265,8 @@
   const whoEl = $('who'), whoName = $('whoname'), autoTag = $('autotag'), doingEl = $('doing');
   const pickerEl = $('picker'), stripEl = $('strip');
   const modeBtns = { transcript: $('mode-transcript'), terminal: $('mode-terminal') };
-  const form = $('say'), input = $('text'), send = $('send'), sentEl = $('sent');
+  const form = $('say'), input = $('text'), send = $('send'), sentEl = $('sent'), stopBtn = $('stop');
+  const attachBtn = $('attach'), fileInput = $('file');
   const ledgerEl = $('ledger');
 
   // The TUI's coarse ladder: seconds under a minute read `now`.
@@ -285,17 +299,42 @@
   const keepSelection = () => remember('clank.selection', selection);
 
   // ---- the reducer the server tests (feed.rs PageModel) ----
+  // What a turn IS, for telling activity apart. Ids alone would miss
+  // a tool's output arriving, and timestamps alone cannot tell two
+  // turns in the same second apart — or any turn whose harness sent
+  // no timestamp at all (codex on e14c244).
+  const mark = (t) => `${t.id}/${t.body.kind}/${(t.body.text || '').length}/${t.body.output == null ? '-' : t.body.output.length}`;
+  const sig = (list) => list.map(mark).join(',');
+  // A count of the times an agent's transcript actually CHANGED. An
+  // identical replay does not move it, so a deliberate Stop survives
+  // being resynced; anything genuinely new does, whatever its clock
+  // says.
+  const revisionOf = (label) => agents.get(label)?.rev ?? 0;
+
   function applyTurns(d) {
-    agents.set(d.agent, { session: d.session, generation: d.generation, turns: d.turns.slice() });
-    if (d.agent === shown) paintTranscript(d.agent);
+    const was = agents.get(d.agent);
+    const changed = !was
+      || was.session !== d.session
+      || was.generation !== d.generation
+      || sig(was.turns) !== sig(d.turns);
+    agents.set(d.agent, {
+      session: d.session,
+      generation: d.generation,
+      turns: d.turns.slice(),
+      rev: (was?.rev ?? 0) + (changed ? 1 : 0),
+    });
+    if (d.agent === shown) { paintTranscript(d.agent); syncSend(); }
   }
   function applyTurn(d) {
     const w = agents.get(d.agent);
     if (!w || w.session !== d.session || w.generation !== d.generation) return;
     const i = w.turns.findIndex((t) => t.id === d.turn.id);
+    if (i < 0 || mark(w.turns[i]) !== mark(d.turn)) w.rev = (w.rev ?? 0) + 1;
     if (i >= 0) w.turns[i] = d.turn; else w.turns.push(d.turn);
     if (w.turns.length > 200) w.turns.splice(0, w.turns.length - 200);
-    if (d.agent === shown) paintTranscript(d.agent);
+    // After the turn is in, not before: `workingOf` reads the newest
+    // one, so asking first would answer about the previous turn.
+    if (d.agent === shown) { paintTranscript(d.agent); syncSend(); }
   }
 
   // ---- who is shown ----
@@ -326,7 +365,11 @@
   // including when the agent it was typed to leaves the roster, where
   // the honest answer is a disabled send button, not a new recipient.
   function retarget() {
-    if (input.value !== '') return;
+    // A draft is the box's text OR an upload on its way into it: the
+    // path lands in whatever box exists when the response comes back,
+    // so an automatic move mid-upload would attach a photo to the
+    // wrong agent (codex on a757522).
+    if (input.value !== '' || pending > 0 || sending > 0) return;
     const want = target();
     if (want !== shown) show(want);
   }
@@ -428,9 +471,57 @@
 
   // Whoever is on screen is who /say reaches, so the button follows
   // the shown agent's pane and nothing else.
+  // Whether an agent is mid-turn, decided HERE because only here are
+  // both halves live: the server's turn-end stamp arrives with the
+  // status, and turns arrive on their own — a long read-only turn
+  // changes nothing a status frame is published for.
+  //
+  // `unknown` whenever the evidence cannot answer, which is the
+  // normal case rather than an edge: two of the four harnesses have
+  // no transcript adapter and grok's hooks are passive, so no end is
+  // ever recorded for them.
+  //
+  // A tie reads as NOT working. The hook fires in the same second as
+  // a turn's last message most of the time and these are epoch
+  // seconds, so `>=` would leave an idle agent busy forever after
+  // nearly every turn; `>` is wrong only until the next turn lands.
+  const newestOf = (label) => {
+    const mine = agents.get(label);
+    return mine ? mine.turns.reduce((m, t) => (t.at != null && t.at > m ? t.at : m), -1) : -1;
+  };
+  function workingOf(label) {
+    const a = roster().find((x) => x.label === label);
+    if (!a || !a.transcript || a.ended == null) return 'unknown';
+    return newestOf(label) > a.ended ? 'yes' : 'no';
+  }
+
+  // Stop was pressed, and nothing has happened since. Suppression is
+  // scoped to the ACTIVITY it stopped — the pane, the incarnation,
+  // and how far the transcript had got — and then DERIVED rather than
+  // maintained, so both ways a transcript arrives are covered by one
+  // rule. Clearing it on the incremental path alone left a reconnect
+  // (which resends the whole window) unable to re-arm the button, and
+  // a new session in the SAME pane looked like the old one (codex on
+  // 210afee).
+  const stopped = new Map();
+  function stopping(label) {
+    const s = stopped.get(label);
+    if (!s) return false;
+    if (paneOf.get(label) !== s.pane) return false;         // a new pane is new work
+    const w = agents.get(label);
+    if (!w) return true;                                    // no transcript: nothing can say otherwise
+    if (w.session !== s.session || w.generation !== s.generation) return false;
+    return revisionOf(label) === s.rev;                     // any new activity re-arms
+  }
   function syncSend() {
     const p = panes.get(shown && paneOf.get(shown));
-    send.disabled = !p || p.closed;
+    // Not while a file is still arriving — a message is not ready
+    // until everything it names is in it — and not while one is
+    // already on its way, or finishing an upload would re-open the
+    // button and let the same instruction go twice (codex on
+    // 37014d0).
+    send.disabled = !p || p.closed || pending > 0 || sending > 0;
+    stopBtn.hidden = !p || p.closed || workingOf(shown) === 'no' || stopping(shown);
   }
   function show(label) {
     shown = label;
@@ -705,20 +796,107 @@
     socket.onerror = () => { try { socket.close(); } catch (err) {} };
   }
 
+  // An attachment is a FILE and the message names it: a pane is a
+  // keyboard, and bytes cannot be typed. The path lands in the box as
+  // TEXT, where it can be read and edited before it is sent — an
+  // invisible attachment would hide the one thing that has to be true
+  // for this to work, which is that the agent is being asked to go
+  // and read something.
+  let pending = 0;      // uploads on their way into the box
+  let sending = 0;      // messages dispatched and not yet answered
+  attachBtn.addEventListener('click', () => fileInput.click());
+  fileInput.addEventListener('change', async () => {
+    const file = fileInput.files && fileInput.files[0];
+    fileInput.value = '';
+    if (!file) return;
+    sentEl.textContent = 'Attaching…';
+    pending += 1;
+    syncSend();                       // Send waits for it
+    try {
+      const r = await fetch('/upload', { method: 'POST', headers: { 'content-type': file.type || 'application/octet-stream' }, body: file });
+      if (!r.ok) throw new Error(await r.text());
+      const { path } = await r.json();
+      input.value = input.value ? `${input.value} ${path}` : path;
+      sentEl.textContent = '';
+      input.focus();
+    } catch (err) {
+      sentEl.textContent = 'Not attached';
+      setTimeout(() => { sentEl.textContent = ''; }, 2000);
+      console.error(err);
+    } finally {
+      pending -= 1;
+      syncSend();                     // Send was waiting for this
+      retarget();                     // and so was the view
+    }
+  });
+
+  stopBtn.addEventListener('click', async () => {
+    // Captured now: by the time this returns, `shown` may be someone
+    // else, and a stop must never settle the wrong agent's button.
+    const label = shown, pid = label && paneOf.get(label);
+    if (!pid) return;
+    const w = agents.get(label);
+    stopped.set(label, {
+      pane: pid,
+      session: w && w.session,
+      generation: w && w.generation,
+      rev: revisionOf(label),
+    });
+    syncSend();
+    try {
+      const r = await fetch('/stop', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ pane: pid }) });
+      if (!r.ok) throw new Error(await r.text());
+    } catch (err) {
+      // It was not stopped, so the button must come back — the agent
+      // is still running and this is the only way to try again.
+      if (stopped.get(label)?.pane === pid) stopped.delete(label);
+      syncSend();
+      sentEl.textContent = 'Not stopped';
+      setTimeout(() => { sentEl.textContent = ''; }, 1500);
+      console.error(err);
+    }
+  });
+
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
-    const pid = shown && paneOf.get(shown), text = input.value;
+    const shownWas = shown, pid = shown && paneOf.get(shown), text = input.value;
     if (!pid || !text) return;
+    // A keyboard can submit a form whose button is disabled.
+    if (pending > 0 || sending > 0) {
+      sentEl.textContent = pending > 0 ? 'Still attaching' : 'Still sending';
+      setTimeout(() => { sentEl.textContent = ''; }, 1500);
+      return;
+    }
+    // The submitted text LEAVES the draft here, at dispatch. It now
+    // belongs to the request; the box is the next message. Nothing
+    // downstream has to work out which characters were sent — the
+    // answer used to be a prefix comparison, and replacing "hi" with
+    // "history matters" made it "story matters" (codex on 37014d0).
+    input.value = '';
+    sending += 1;
+    syncSend();
+
     send.disabled = true;
     try {
       const r = await fetch('/say', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ pane: pid, text }) });
       if (!r.ok) throw new Error(await r.text());
       // Setting .value fires no input event, so the draft's release
       // has to say so itself.
-      input.value = ''; sentEl.textContent = 'Sent'; setTimeout(() => { sentEl.textContent = ''; }, 1500);
+      sentEl.textContent = 'Sent'; setTimeout(() => { sentEl.textContent = ''; }, 1500);
+      stopped.delete(shownWas);       // new work: whatever was stopped is not any more
       retarget();
-    } catch (err) { sentEl.textContent = 'Not sent'; console.error(err); }
-    finally { syncSend(); input.focus(); }
+    } catch (err) {
+      // It never went, so give it back — in front of anything typed
+      // since, which is the order they were written in.
+      input.value = input.value ? `${text} ${input.value}` : text;
+      sentEl.textContent = 'Not sent';
+      console.error(err);
+    } finally {
+      sending -= 1;
+      syncSend();
+      retarget();
+      input.focus();
+    }
   });
 
   $('session').textContent = document.title = window.CLANK_SESSION || 'clank';

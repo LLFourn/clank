@@ -608,6 +608,9 @@ mod tests {
         fn say(&self, _pane: &str, _text: &str) -> anyhow::Result<()> {
             Ok(())
         }
+        fn stop(&self, _pane: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
     }
 
     #[derive(Clone, Default)]

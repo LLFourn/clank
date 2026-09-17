@@ -24,8 +24,11 @@ not re-resolving after a send, and a clock clipped with the sentence
 beside it) and one found here (a browser refusing site data killed the
 page on its first statement).
 
-Two things learned from mutating these, both worth keeping in mind
-when adding more: a crash is a failed check (an assertion that cannot
+Three things learned from mutating these, all worth keeping in mind
+when adding more. A scripted mutation must assert its anchor is
+UNIQUE, not merely present — the same line appeared in `applyTurns`
+and `applyTurn`, so a mutation aimed at one silently hit the other and
+read as "not caught". And: a crash is a failed check (an assertion that cannot
 RUN has still told you something, so the run reports it rather than
 exiting quietly), and a transparent element is not a dark one — a
 colour check that ignores alpha passes for the unpainted element it

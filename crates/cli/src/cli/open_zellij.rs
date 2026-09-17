@@ -1427,6 +1427,25 @@ pub(crate) fn say_argvs(pane: &str, text: &str) -> Option<[Vec<String>; 2]> {
     Some([chars, enter])
 }
 
+/// Interrupt whatever `pane` is doing: byte 27, Escape, which is how
+/// a harness's own user stops it. Sent the same way Return is.
+///
+/// Harmless at an idle prompt, which is what makes the page able to
+/// offer it whenever an agent MIGHT be working — see `Working`.
+pub(crate) fn stop_pane(session: &str, pane: &str) -> anyhow::Result<()> {
+    let out = std::process::Command::new("zellij")
+        .args(["--session", session])
+        .args(["action", "write", "-p", pane, "27"])
+        .output()?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "zellij refused `write` for {pane}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
 /// Say `text` to `pane` in `session` and press Enter.
 pub(crate) fn say_to_pane(session: &str, pane: &str, text: &str) -> anyhow::Result<()> {
     let Some(argvs) = say_argvs(pane, text) else {

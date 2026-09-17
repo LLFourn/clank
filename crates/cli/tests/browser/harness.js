@@ -29,7 +29,7 @@ const facts = (agents, extra = {}) => ({
     ...extra,
   },
 });
-const agent = (label, role, owes = null, last = null, transcript = false) => ({ label, role, owes, last, transcript });
+const agent = (label, role, owes = null, last = null, transcript = false, ended = null) => ({ label, role, owes, last, transcript, ended });
 const turn = (id, who, body, at) => ({ id, who, at: at || Math.floor(Date.now()/1000), body });
 const text = (id, who, md, html) => turn(id, who, { kind: 'text', text: md, html });
 const tool = (id, name, input, output) => turn(id, 'agent', { kind: 'tool', name, input, output, images: [] });

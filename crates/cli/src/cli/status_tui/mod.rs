@@ -1688,6 +1688,14 @@ pub(crate) struct Position {
     pub(crate) label: String,
     pub(crate) role: String,
     pub(crate) owes: Option<Owed>,
+    /// When this agent's session last ENDED a turn. The EVIDENCE for
+    /// whether it is working, not the verdict: the verdict also needs
+    /// the newest turn, and turns reach the page on their own cadence
+    /// — a status frame is published when the repo changes, which a
+    /// long read-only turn never does (codex on 90c1740). The page
+    /// holds both and decides continuously; this is the half only the
+    /// server can see.
+    pub(crate) ended: Option<i64>,
     pub(crate) last: Option<String>,
     /// Whether clank can show this agent's transcript, or only its
     /// terminal.
@@ -1747,6 +1755,7 @@ pub(crate) struct WebFacts {
 pub(crate) fn web_facts(
     snap: &StatusSnapshot,
     with_transcript: &std::collections::BTreeSet<String>,
+    ended: &std::collections::BTreeMap<String, i64>,
 ) -> WebFacts {
     use clank_core::vocab::Role;
     let (lamp, plan) = render::bar_text(snap);
@@ -1802,6 +1811,7 @@ pub(crate) fn web_facts(
             label: a.label.clone(),
             role: render::tier_label(a.role).to_string(),
             owes: owed.remove(&a.label),
+            ended: ended.get(&a.label).copied(),
             last: last_act(snap, &a.label, a.role),
             transcript: with_transcript.contains(&a.label),
         })
@@ -5073,7 +5083,8 @@ pub(crate) mod tests {
             ),
             &[("claude", crate::cli::teams_config::RosterRole::Master)],
         );
-        let v = serde_json::to_value(web_facts(&s, &Default::default())).unwrap();
+        let v =
+            serde_json::to_value(web_facts(&s, &Default::default(), &Default::default())).unwrap();
 
         let keys = |x: &serde_json::Value| -> BTreeSet<String> {
             x.as_object()
@@ -5083,7 +5094,7 @@ pub(crate) mod tests {
         let set = |ks: &[&str]| -> BTreeSet<String> { ks.iter().map(|k| k.to_string()).collect() };
         assert_eq!(
             keys(&v["agents"][0]),
-            set(&["label", "role", "owes", "last", "transcript"]),
+            set(&["label", "role", "owes", "ended", "last", "transcript"]),
             "the picker and the header destructure an agent by these names"
         );
         assert_eq!(
@@ -5182,7 +5193,7 @@ pub(crate) mod tests {
             summary: "fine".into(),
         }];
         let with = ["codex".to_string()].into_iter().collect();
-        let facts = web_facts(&s, &with);
+        let facts = web_facts(&s, &with, &Default::default());
         let (lamp, plan) = render::bar_text(&s);
         assert_eq!((facts.lamp.clone(), facts.plan.clone()), (lamp, plan));
         assert_eq!(facts.hue, derive::state_color(&s).hex());
@@ -5253,7 +5264,7 @@ pub(crate) mod tests {
                 extra_named: vec![],
             },
         });
-        let c = web_facts(&broken, &with)
+        let c = web_facts(&broken, &with, &Default::default())
             .correction
             .expect("a broken tag reaches the page");
         assert!(

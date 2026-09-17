@@ -58,6 +58,8 @@ pub(crate) fn choose_session(explicit: Option<&str>, current: Option<&str>, repo
 /// How the page says something to a pane; the production one runs
 /// zellij, tests record.
 type Sayer = Arc<dyn Fn(&str, &str) -> anyhow::Result<()> + Send + Sync>;
+/// Interrupting one pane, for the same reason `Sayer` exists.
+type Stopper = Arc<dyn Fn(&str) -> anyhow::Result<()> + Send + Sync>;
 
 /// What the server needs of zellij, behind a trait so an instance
 /// runs in a test without one: the session, its panes, a
@@ -69,6 +71,8 @@ pub(crate) trait Panes: Send + Sync + 'static {
     fn table(&self) -> Option<Vec<PaneMeta>>;
     fn subscribe(&self, ids: &[String]) -> Option<SubscribeChild>;
     fn say(&self, pane: &str, text: &str) -> anyhow::Result<()>;
+    /// Interrupt the pane — Escape, the way its own user would.
+    fn stop(&self, pane: &str) -> anyhow::Result<()>;
 }
 
 /// The real session this TUI runs in.
@@ -112,6 +116,9 @@ impl Panes for Zellij {
     }
     fn say(&self, pane: &str, text: &str) -> anyhow::Result<()> {
         open_zellij::say_to_pane(&self.session, pane, text)
+    }
+    fn stop(&self, pane: &str) -> anyhow::Result<()> {
+        open_zellij::stop_pane(&self.session, pane)
     }
 }
 
@@ -242,10 +249,13 @@ impl Instance {
         let blocking = Arc::new(Blocking::default());
         let say_panes = panes.clone();
         let sayer: Sayer = Arc::new(move |pane, text| say_panes.say(pane, text));
+        let stop_panes = panes.clone();
+        let stopper: Stopper = Arc::new(move |pane| stop_panes.stop(pane));
         tasks.spawn(serve(
             listener,
             feed.clone(),
             sayer,
+            stopper,
             panes.session().to_string(),
             repo.clone(),
             site_dir(&repo),
@@ -335,8 +345,26 @@ impl Instance {
                 next_owner,
             )
         };
+        // When each agent last ENDED a turn. A stamp belongs to the
+        // session and incarnation that wrote it: a rebound label or a
+        // reminted wait must not be read against its predecessor's
+        // clock. Whether that means WORKING is the page's to decide —
+        // it needs the newest turn too, and turns arrive on their own
+        // cadence: a long read-only turn changes nothing this status
+        // frame is published for (codex on 90c1740).
+        let ended: std::collections::BTreeMap<String, i64> = snap
+            .agents
+            .iter()
+            .filter_map(|a| {
+                let dir = crate::agent_store::agents_root(&self.repo).join(&a.label);
+                let stamp = crate::agent_store::read_turn_end(&dir)?;
+                (a.session.as_deref() == Some(stamp.session.as_str())
+                    && stamp.generation == crate::agent_store::read_wait_generation(&dir))
+                .then(|| (a.label.clone(), stamp.at))
+            })
+            .collect();
         self.feed.status(serde_json::json!({
-            "facts": crate::cli::status_tui::web_facts(snap, &with),
+            "facts": crate::cli::status_tui::web_facts(snap, &with, &ended),
             "snapshot": snap.to_json(),
         }));
         if let Some(b) = &self.builder {
@@ -994,6 +1022,7 @@ async fn serve(
     listener: tokio::net::TcpListener,
     feed: Feed,
     sayer: Sayer,
+    stopper: Stopper,
     session: String,
     repo: PathBuf,
     site: PathBuf,
@@ -1020,6 +1049,7 @@ async fn serve(
     let ctx = Arc::new(Ctx {
         feed,
         sayer,
+        stopper,
         blocking,
         page: Arc::from(page_for(&session)),
         pages: Pages { repo, site },
@@ -1028,6 +1058,7 @@ async fn serve(
         door,
         origins,
         nonce,
+        uploads: std::sync::atomic::AtomicU64::new(0),
         public,
         sockets,
     });
@@ -1133,6 +1164,7 @@ fn seen_as(raw: &str) -> Option<Seen> {
 struct Ctx {
     feed: Feed,
     sayer: Sayer,
+    stopper: Stopper,
     blocking: Arc<Blocking>,
     page: Arc<str>,
     pages: Pages,
@@ -1146,6 +1178,8 @@ struct Ctx {
     /// This start's nonce: what the tunnel probe reads back to know
     /// the public URL is this remote and not another.
     nonce: String,
+    /// Bumped per attachment, so two in one second cannot collide.
+    uploads: std::sync::atomic::AtomicU64,
     /// The URL the tunnel came up on, once it has: the origin a post
     /// may carry beside the loopback ones, and the host that says a
     /// request arrived over TLS. Empty until the tunnel reports.
@@ -1412,6 +1446,10 @@ async fn route(req: hyper::Request<hyper::body::Incoming>, peer: IpAddr, ctx: &C
             text(403, "not from this page", "text/plain")
         }
         ("POST", "/say") => say(req, ctx).await,
+        ("POST", "/stop") if !same_origin(&req, ctx) => text(403, "cross-origin", "text/plain"),
+        ("POST", "/stop") => stop(req, ctx).await,
+        ("POST", "/upload") if !same_origin(&req, ctx) => text(403, "cross-origin", "text/plain"),
+        ("POST", "/upload") => upload(req, ctx).await,
         ("GET", p) if p.starts_with("/html/") => site_page(&ctx.pages, &p["/html/".len()..]),
         _ => text(404, "not here", "text/plain"),
     }
@@ -1727,6 +1765,159 @@ struct Say {
     text: String,
 }
 
+#[derive(serde::Deserialize)]
+struct Stop {
+    pane: String,
+}
+
+/// What a file's bytes are called on disk, chosen from the media
+/// type the browser declared — never from anything the client names.
+/// An unknown type still lands, as `.bin`: attaching something clank
+/// does not recognise should fail at the agent that reads it, not
+/// here, and a name clank invented cannot be a path or a program.
+fn extension_for(media_type: &str) -> &'static str {
+    match media_type.split(';').next().unwrap_or("").trim() {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "application/pdf" => "pdf",
+        "text/plain" => "txt",
+        "text/markdown" => "md",
+        "text/csv" => "csv",
+        "application/json" => "json",
+        _ => "bin",
+    }
+}
+
+/// The most attachments kept. Every one is a file nobody deletes, on
+/// a machine that runs for weeks — Claude Code's own image cache is
+/// the cautionary example, keeping every pasted image forever. A
+/// count, not an age: it needs no clock to enforce and none to test.
+const ATTACHMENTS_KEPT: usize = 20;
+
+/// Delete all but the newest [`ATTACHMENTS_KEPT`] files in `dir`.
+fn prune_attachments(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut files: Vec<(std::time::SystemTime, std::path::PathBuf)> = entries
+        .flatten()
+        .filter_map(|e| {
+            let meta = e.metadata().ok()?;
+            meta.is_file().then_some(())?;
+            Some((meta.modified().ok()?, e.path()))
+        })
+        .collect();
+    if files.len() <= ATTACHMENTS_KEPT {
+        return;
+    }
+    files.sort_by_key(|(at, _)| *at);
+    for (_, path) in &files[..files.len() - ATTACHMENTS_KEPT] {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Take a file and put it where the agent can read it.
+///
+/// The bytes cannot reach an agent as bytes — a pane is a keyboard —
+/// so an attachment is a FILE and the message names its path. The
+/// name is the server's: the client says only what type it is, and a
+/// type it invents can at worst produce `.bin`.
+async fn upload(req: hyper::Request<hyper::body::Incoming>, ctx: &Ctx) -> Resp {
+    let media_type = req
+        .headers()
+        .get(hyper::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .to_string();
+    let body = http_body_util::Limited::new(req.into_body(), 12 * 1024 * 1024);
+    let Ok(bytes) = body.collect().await.map(|c| c.to_bytes()) else {
+        return text(413, "that file is too big to attach", "text/plain");
+    };
+    if bytes.is_empty() {
+        return text(400, "an empty file", "text/plain");
+    }
+    if *ctx.cancelled.borrow() {
+        return text(503, "the remote is off", "text/plain");
+    }
+    let dir = ctx.pages.repo.join(".clank/attachments");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return text(500, "cannot keep attachments here", "text/plain");
+    }
+    // A name unique to this upload, created with `create_new` so a
+    // collision FAILS instead of overwriting. Seconds and the
+    // server's nonce are not enough on their own: the nonce is fixed
+    // for the whole run, so two files attached in the same second got
+    // the same name and the second silently replaced the first —
+    // including a path already sent to an agent (codex on a757522).
+    let ext = extension_for(&media_type);
+    let nonce = &ctx.nonce[..8.min(ctx.nonce.len())];
+    let mut path = None;
+    for _ in 0..64 {
+        let n = ctx
+            .uploads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let candidate = dir.join(format!("{}-{nonce}-{n}.{ext}", crate::age::now()));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(mut f) => {
+                use std::io::Write as _;
+                if f.write_all(&bytes).is_err() {
+                    return text(500, "cannot write the attachment", "text/plain");
+                }
+                path = Some(candidate);
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return text(500, "cannot write the attachment", "text/plain"),
+        }
+    }
+    let Some(path) = path else {
+        return text(
+            500,
+            "cannot find a free name for the attachment",
+            "text/plain",
+        );
+    };
+    prune_attachments(&dir);
+    let Some(shown) = path.to_str() else {
+        return text(500, "the attachment has no sayable path", "text/plain");
+    };
+    text(
+        200,
+        serde_json::json!({ "path": shown }).to_string(),
+        "application/json",
+    )
+}
+
+/// Interrupt the shown agent: Escape to its pane.
+///
+/// Offered whenever an agent MIGHT be working, so it must be safe
+/// when it is not — Escape at an idle prompt does nothing, which is
+/// what lets the page stop needing certainty.
+async fn stop(req: hyper::Request<hyper::body::Incoming>, ctx: &Ctx) -> Resp {
+    let body = http_body_util::Limited::new(req.into_body(), 4 * 1024);
+    let Ok(bytes) = body.collect().await.map(|c| c.to_bytes()) else {
+        return text(413, "too much", "text/plain");
+    };
+    let Ok(which) = serde_json::from_slice::<Stop>(&bytes) else {
+        return text(400, "expected {\"pane\": …}", "text/plain");
+    };
+    if *ctx.cancelled.borrow() {
+        return text(503, "the remote is off", "text/plain");
+    }
+    let stopper = ctx.stopper.clone();
+    match ctx.blocking.run(move || stopper(&which.pane)).await {
+        Some(Ok(())) => text(204, "", "text/plain"),
+        Some(Err(e)) => text(502, format!("{e:#}"), "text/plain"),
+        None => text(500, "the sender panicked", "text/plain"),
+    }
+}
+
 async fn say(req: hyper::Request<hyper::body::Incoming>, ctx: &Ctx) -> Resp {
     let body = http_body_util::Limited::new(req.into_body(), 64 * 1024);
     let Ok(bytes) = body.collect().await.map(|c| c.to_bytes()) else {
@@ -1765,6 +1956,63 @@ mod tests {
          Cf-Visitor: {\"scheme\":\"https\"}\r\n\
          X-Forwarded-Proto: https\r\n\
          Connection: keep-alive\r\n\r\n";
+
+    /// The name on disk is the SERVER's, derived from the media type
+    /// the browser declared and nothing else. A client that invents a
+    /// type gets `.bin`, which is neither a path nor a program.
+    #[test]
+    fn a_file_is_named_by_its_type_not_by_its_sender() {
+        for (declared, want) in [
+            ("image/png", "png"),
+            ("image/jpeg", "jpg"),
+            ("image/jpeg; charset=binary", "jpg"),
+            ("  text/plain  ", "txt"),
+            ("application/pdf", "pdf"),
+            ("application/octet-stream", "bin"),
+            ("", "bin"),
+            ("../../etc/passwd", "bin"),
+            ("text/html", "bin"),
+            ("application/x-sh", "bin"),
+        ] {
+            assert_eq!(extension_for(declared), want, "{declared:?}");
+        }
+    }
+
+    /// Attachments are bounded, because nothing else will bound them:
+    /// every one is a file on a machine that runs for weeks.
+    #[test]
+    fn only_the_newest_attachments_are_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut made = Vec::new();
+        for i in 0..ATTACHMENTS_KEPT + 7 {
+            let p = dir.path().join(format!("{i:03}.png"));
+            std::fs::write(&p, [i as u8]).unwrap();
+            // Distinct mtimes, so "newest" means something: a
+            // filesystem's resolution is not this test's business.
+            let when = std::time::SystemTime::UNIX_EPOCH
+                + std::time::Duration::from_secs(1_700_000_000 + i as u64);
+            filetime::set_file_mtime(&p, filetime::FileTime::from_system_time(when)).unwrap();
+            made.push(p);
+        }
+        prune_attachments(dir.path());
+        let left: std::collections::BTreeSet<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(left.len(), ATTACHMENTS_KEPT, "the cap holds: {left:?}");
+        assert!(
+            left.contains(&format!("{:03}.png", ATTACHMENTS_KEPT + 6)),
+            "the newest is kept: {left:?}"
+        );
+        assert!(!left.contains("000.png"), "the oldest is not: {left:?}");
+
+        // Under the cap, nothing is touched.
+        let few = tempfile::tempdir().unwrap();
+        std::fs::write(few.path().join("a.png"), b"a").unwrap();
+        prune_attachments(few.path());
+        assert!(few.path().join("a.png").exists());
+    }
 
     /// The session's name reaches the page by string replacement, not
     /// by a template: `SESSION_ANCHOR` must survive every edit to
@@ -2061,11 +2309,13 @@ mod tests {
             let (door, feed) = (door.clone(), Feed::new(8));
             let (repo, site) = (repo.path().to_path_buf(), site.path().to_path_buf());
             let sayer: Sayer = Arc::new(|_, _| Ok(()));
+            let stopper: Stopper = Arc::new(|_| Ok(()));
             async move {
                 serve(
                     listener,
                     feed,
                     sayer,
+                    stopper,
                     "clank-test".to_string(),
                     repo,
                     site,
@@ -2152,11 +2402,13 @@ mod tests {
             let (sockets, door) = (sockets.clone(), door.clone());
             let (repo, site) = (repo.path().to_path_buf(), site.path().to_path_buf());
             let sayer: Sayer = Arc::new(|_, _| Ok(()));
+            let stopper: Stopper = Arc::new(|_| Ok(()));
             async move {
                 serve(
                     listener,
                     feed,
                     sayer,
+                    stopper,
                     "clank-test".to_string(),
                     repo,
                     site,
@@ -2621,6 +2873,12 @@ mod tests {
             recorder.lock().unwrap().push((pane.into(), text.into()));
             Ok(())
         });
+        let halted: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let halts = halted.clone();
+        let stopper: Stopper = Arc::new(move |pane| {
+            halts.lock().unwrap().push(pane.into());
+            Ok(())
+        });
         let site = tempfile::tempdir().unwrap();
         let repo = tempfile::tempdir().unwrap();
         let git = |args: &[&str]| {
@@ -2656,6 +2914,7 @@ mod tests {
                     listener,
                     feed,
                     sayer,
+                    stopper,
                     "clank-test".to_string(),
                     repo,
                     site,
@@ -3074,6 +3333,108 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(bad.status(), 400);
+
+        // An attachment becomes a file the agent can be told to read.
+        for wrong in [None, Some("http://evil.example")] {
+            let mut r = client
+                .post(format!("{base}/upload"))
+                .header("content-type", "image/png")
+                .body("bytes");
+            if let Some(o) = wrong {
+                r = r.header("origin", o);
+            }
+            assert_eq!(r.send().await.unwrap().status(), 403, "{wrong:?}");
+        }
+        let up = client
+            .post(format!("{base}/upload"))
+            .header("origin", &base)
+            .header("content-type", "image/png")
+            .body("PNGBYTES")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(up.status(), 200);
+        let where_ = up.json::<serde_json::Value>().await.unwrap()["path"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            where_.ends_with(".png") && where_.contains(".clank/attachments/"),
+            "the server names it, under the gitignored directory: {where_}"
+        );
+        assert_eq!(std::fs::read(&where_).unwrap(), b"PNGBYTES");
+        // Empty is refused, because an empty attachment is a mistake
+        // with a path that an agent would go and read.
+        assert_eq!(
+            client
+                .post(format!("{base}/upload"))
+                .header("origin", &base)
+                .header("content-type", "image/png")
+                .body("")
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            400
+        );
+
+        // Two attachments in the same second are two files. The name
+        // used to be seconds plus the server's nonce, which is fixed
+        // for the whole run — so the second upload silently replaced
+        // the first, at a path that may already have been sent to an
+        // agent (codex on a757522).
+        let mut paths = Vec::new();
+        for body in ["FIRST", "SECOND", "THIRD"] {
+            let r = client
+                .post(format!("{base}/upload"))
+                .header("origin", &base)
+                .header("content-type", "image/png")
+                .body(body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status(), 200);
+            paths.push(
+                r.json::<serde_json::Value>().await.unwrap()["path"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+            );
+        }
+        let distinct: std::collections::BTreeSet<&String> = paths.iter().collect();
+        assert_eq!(distinct.len(), 3, "three uploads, three files: {paths:?}");
+        for (path, body) in paths.iter().zip(["FIRST", "SECOND", "THIRD"]) {
+            assert_eq!(
+                std::fs::read_to_string(path).unwrap(),
+                body,
+                "each keeps its own bytes"
+            );
+        }
+
+        // Stop reaches the pane, and is refused cross-origin like
+        // anything else that types into an agent.
+        for wrong in [None, Some("http://evil.example")] {
+            let mut r = client
+                .post(format!("{base}/stop"))
+                .json(&serde_json::json!({"pane": "terminal_5"}));
+            if let Some(o) = wrong {
+                r = r.header("origin", o);
+            }
+            assert_eq!(r.send().await.unwrap().status(), 403, "{wrong:?}");
+        }
+        assert!(halted.lock().unwrap().is_empty());
+        let r = client
+            .post(format!("{base}/stop"))
+            .header("origin", &base)
+            .json(&serde_json::json!({"pane": "terminal_5"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 204);
+        assert_eq!(
+            halted.lock().unwrap().as_slice(),
+            &["terminal_5".to_string()]
+        );
         assert_eq!(
             client
                 .get(format!("{base}/nope"))

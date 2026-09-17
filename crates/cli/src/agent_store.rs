@@ -543,6 +543,46 @@ pub(crate) fn read_wait_generation(agent_dir: &Path) -> u64 {
         .unwrap_or(0)
 }
 
+/// When this agent's session last ENDED a turn, and which session and
+/// incarnation it was: `<epoch> <session> <generation>`.
+///
+/// Three fields because one is not enough. A stamp belongs to the
+/// session that wrote it — a rebound label or a reminted incarnation
+/// must not be measured against its predecessor's clock — and the
+/// epoch alone cannot say which.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TurnEnd {
+    pub(crate) at: i64,
+    pub(crate) session: String,
+    pub(crate) generation: u64,
+}
+
+pub(crate) fn read_turn_end(agent_dir: &Path) -> Option<TurnEnd> {
+    let raw = std::fs::read_to_string(agent_dir.join("turn.end")).ok()?;
+    let mut parts = raw.trim().split(' ');
+    Some(TurnEnd {
+        at: parts.next()?.parse().ok()?,
+        session: parts.next()?.to_string(),
+        generation: parts.next()?.parse().ok()?,
+    })
+}
+
+/// Record that this session just ended a turn. Best-effort by policy:
+/// the hook that calls this must never fail a turn-end over a note
+/// about one.
+pub(crate) fn record_turn_end(agent_dir: &Path, at: i64, session: &str, generation: u64) {
+    if std::fs::create_dir_all(agent_dir).is_err() {
+        return;
+    }
+    // A plain write, like `wait.gen` beside it: a torn or missing
+    // stamp reads as `None`, which is `Unknown`, which shows Stop —
+    // the harmless direction, so atomicity would be buying nothing.
+    let _ = std::fs::write(
+        agent_dir.join("turn.end"),
+        format!("{at} {session} {generation}\n"),
+    );
+}
+
 /// Bump the generation. FALLIBLE — the caller owns the policy: a
 /// session BINDING must propagate (an ownership claim that cannot
 /// persist its revocation would leave a dead predecessor's waiter

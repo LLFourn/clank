@@ -226,6 +226,14 @@ impl Tool {
             Tool::OpenCode => "opencode",
         }
     }
+
+    /// The inverse of [`Tool::as_str`], for the places that store a
+    /// tool as the string it prints as.
+    pub fn from_str(s: &str) -> Option<Self> {
+        [Tool::Claude, Tool::Codex, Tool::Grok, Tool::OpenCode]
+            .into_iter()
+            .find(|t| t.as_str() == s)
+    }
 }
 
 /// Auto-mode setting for an agent's stop-hook behavior.
