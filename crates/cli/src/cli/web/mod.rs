@@ -2457,6 +2457,38 @@ mod tests {
         dir
     }
 
+    /// Establish "remembered, and free" without ever releasing a port
+    /// and hoping: ask `listen` for a candidate and let IT tell us
+    /// whether the port was free, retrying with the next candidate
+    /// when it was not.
+    ///
+    /// There is no window to lose. A probe that binds a port, drops
+    /// it and reports the number is the same assumption this plan
+    /// exists to remove — codex ran 16 copies of the earlier attempt
+    /// at once and 11 lost that race. Here a lost port is not a
+    /// failure, it is the next iteration: `listen` returning
+    /// something else means someone held the candidate, which is the
+    /// OTHER branch of the policy and equally correct.
+    ///
+    /// The candidates sit below the OS ephemeral range (49152 and up
+    /// here, 32768 on Linux) so the allocator cannot hand one to a
+    /// test that asked for any port, and the band is offset by pid so
+    /// concurrent copies of this test do not walk in step.
+    ///
+    /// The teeth: a policy that ignored the remembered port would
+    /// return a fresh one every time and exhaust the whole band.
+    async fn remembered_and_free(repo: &Path) -> (tokio::net::TcpListener, u16) {
+        let stagger = (std::process::id() % 89) as u16 * 8;
+        for candidate in (21_037 + stagger)..(21_037 + stagger + 64) {
+            crate::agent_store::record_web_port(repo, candidate).unwrap();
+            let (listener, got) = listen(repo).await.unwrap();
+            if got == candidate {
+                return (listener, candidate);
+            }
+        }
+        panic!("64 candidates below the ephemeral range, every one of them taken");
+    }
+
     /// The port policy, against real listeners: nothing remembered →
     /// one sampled and remembered; remembered and free → that one;
     /// remembered but taken → a fresh one, remembered in its place.
@@ -2464,24 +2496,37 @@ mod tests {
     async fn a_repo_remembers_its_port() {
         let repo = repo_with_config();
         assert_eq!(crate::agent_store::web_port(repo.path()).unwrap(), None);
-        let (listener, port) = listen(repo.path()).await.unwrap();
+
+        // Nothing remembered: one is sampled and written down. This
+        // phase asserts nothing about a port staying free, so the
+        // ephemeral one it samples is fine.
+        let (listener, sampled) = listen(repo.path()).await.unwrap();
         assert_eq!(
             crate::agent_store::web_port(repo.path()).unwrap(),
-            Some(port)
+            Some(sampled)
         );
         drop(listener);
-        let (_l, again) = listen(repo.path()).await.unwrap();
-        assert_eq!(again, port, "remembered, and free");
-        drop(_l);
 
-        let stranger = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
-        let (_l, fresh) = listen(repo.path()).await.unwrap();
+        // Remembered and free: that one.
+        let (held, port) = remembered_and_free(repo.path()).await;
+        assert_eq!(
+            crate::agent_store::web_port(repo.path()).unwrap(),
+            Some(port),
+            "remembered, and free"
+        );
+
+        // Remembered but taken: a fresh one, written down in its
+        // place. `held` still owns the port, so nothing is released
+        // and there is no race to lose — the earlier version dropped
+        // it and re-bound a stranger, which is the same defect one
+        // line further down (codex on 657d596).
+        let (_fresh, fresh) = listen(repo.path()).await.unwrap();
         assert_ne!(fresh, port);
         assert_eq!(
             crate::agent_store::web_port(repo.path()).unwrap(),
             Some(fresh)
         );
-        drop(stranger);
+        drop(held);
     }
 
     /// The site's shapes and nothing else, decided on the name alone:
