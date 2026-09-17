@@ -10,20 +10,31 @@
 <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
 <style>
   :root {
-    --base: #1a1917;
-    --bezel: #242220;
-    --edge: #302d29;
-    --ink: #e8e4dc;
-    --muted: #8a857c;
+    --base: #faf9f7;
+    --bezel: #f1efe9;
+    --edge: #e3ded4;
+    --ink: #262420;
+    --muted: #6a655c;
     --hue: #5f5fff;
+    /* The state hues were picked to glow on a dark ground. Anything
+       that must carry TEXT — a filled button — takes them mixed
+       toward the ink instead, or a yellow `reviewing` lamp puts pale
+       letters on pale yellow. */
+    --hue-deep: color-mix(in srgb, var(--hue) 58%, #17150f);
     --mono: ui-monospace, Menlo, "SF Mono", Consolas, monospace;
+    --text: ui-sans-serif, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
     --plate: "Martian Mono", var(--mono);
+    /* The terminal keeps its own ground at every width: agents choose
+       ANSI colours assuming a dark one, and bright-white-on-white is
+       not something CSS out here can fix. */
+    --pane: #1a1917;
+    --pane-ink: #e8e4dc;
   }
   * { box-sizing: border-box; }
   html, body { height: 100%; margin: 0; }
   body {
     background: var(--base); color: var(--ink);
-    font: 14px/1.45 var(--mono);
+    font: 14px/1.5 var(--text);
     display: grid;
     grid-template-rows: auto auto 1fr auto;
     grid-template-columns: 1fr;
@@ -95,23 +106,55 @@
      person said sits in a block of its own, so who is speaking needs
      no label. How long ago is the one thing worth a mark, at the
      right edge of every turn. */
-  .turns { padding: 10px 14px 14px; max-width: 86ch; }
-  .turn { position: relative; padding: 6px 5ch 6px 0; }
-  .turn .age { position: absolute; right: 0; top: 6px; color: var(--muted); font-size: 11px; line-height: 1.6; }
-  .turn.person { margin: 10px 0; padding: 8px 5ch 8px 12px; background: var(--bezel); border-left: 3px solid var(--hue); border-radius: 0 4px 4px 0; color: var(--ink); }
-  .turn.person .age { right: 10px; top: 8px; }
-  .turn .text { white-space: pre-wrap; overflow-wrap: anywhere; }
-  .turn.harness .text { color: var(--muted); font-size: 12px; }
-  .turn.thinking .text, .turn .tool .in, .turn .tool .out { color: var(--muted); }
-  .turn details summary { cursor: pointer; list-style: none; color: var(--muted); }
-  .turn details summary::-webkit-details-marker { display: none; }
+  .turns { padding: 18px 20px 28px; max-width: 68ch; margin-inline: auto; font-size: 16px; line-height: 1.62; }
+  .turn { position: relative; padding: 10px 0; }
+  .turn .age { float: right; margin: 4px 0 0 12px; color: var(--muted); font-size: 11px; font-family: var(--mono); }
+  /* What the person said is a block of its own, so who is speaking
+     needs no label. */
+  .turn.person { margin: 14px 0; padding: 12px 14px; background: var(--bezel); border: 1px solid var(--edge); border-radius: 10px; }
+  .turn .text { overflow-wrap: anywhere; }
+  .turn.harness .text { color: var(--muted); font-size: 13px; }
+  .turn.thinking .text { color: var(--muted); }
+
+  /* Rendered prose. `render_markdown` is the only thing allowed to
+     produce this markup; it escapes raw HTML and refuses a
+     destination whose scheme is not on its list. */
+  .prose > :first-child { margin-top: 0; }
+  .prose > :last-child { margin-bottom: 0; }
+  .prose p, .prose ul, .prose ol, .prose blockquote, .prose table { margin: 0 0 0.85em; }
+  .prose h1, .prose h2, .prose h3, .prose h4 { margin: 1.4em 0 0.5em; line-height: 1.25; font-weight: 650; }
+  .prose h1 { font-size: 1.4em; }
+  .prose h2 { font-size: 1.22em; }
+  .prose h3 { font-size: 1.08em; }
+  .prose h4 { font-size: 1em; }
+  .prose ul, .prose ol { padding-left: 1.4em; }
+  .prose li { margin: 0.25em 0; }
+  .prose blockquote { margin-left: 0; padding: 0.1em 0 0.1em 1em; border-left: 3px solid var(--edge); color: var(--muted); }
+  .prose a { color: var(--hue-deep); text-underline-offset: 2px; }
+  .prose code { font-family: var(--mono); font-size: 0.86em; background: var(--bezel); border: 1px solid var(--edge); border-radius: 4px; padding: 0.1em 0.32em; }
+  .prose pre { margin: 0 0 0.9em; padding: 10px 12px; background: var(--bezel); border: 1px solid var(--edge); border-radius: 8px; overflow-x: auto; }
+  .prose pre code { font-size: 0.85em; background: none; border: 0; padding: 0; }
+  .prose table { border-collapse: collapse; display: block; overflow-x: auto; }
+  .prose th, .prose td { border: 1px solid var(--edge); padding: 4px 9px; text-align: left; }
+  .prose hr { border: 0; border-top: 1px solid var(--edge); margin: 1.2em 0; }
+  .prose img { max-width: 100%; border-radius: 6px; }
+
+  /* What was DONE, one tap from what was said: a run of tool calls
+     with no prose between them is one row. */
+  .did { margin: 4px 0 10px; }
+  .did > summary, .turn.tool details > summary { cursor: pointer; list-style: none; color: var(--muted); font-family: var(--mono); font-size: 13px; padding: 3px 0; }
+  .did > summary::-webkit-details-marker, .turn.tool summary::-webkit-details-marker { display: none; }
+  .did > summary::before { content: "▸ "; }
+  .did[open] > summary::before { content: "▾ "; }
+  .did .members { padding-left: 14px; border-left: 1px solid var(--edge); margin-left: 3px; }
+  .turn details summary { cursor: pointer; list-style: none; color: var(--muted); font-family: var(--mono); font-size: 13px; }
   .turn details summary::before { content: "▸ "; }
   .turn details[open] summary::before { content: "▾ "; }
   .turn .tool .name { color: var(--ink); }
-  .turn pre { margin: 6px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; max-height: 40vh; overflow: auto; }
+  .turn pre { margin: 6px 0 0; padding: 8px 10px; background: var(--bezel); border: 1px solid var(--edge); border-radius: 6px; white-space: pre-wrap; overflow-wrap: anywhere; font-family: var(--mono); font-size: 12px; max-height: 40vh; overflow: auto; }
   /* A picture, as pasted: no wider than the column, no taller than
      most of the screen; the full thing a tap away. */
-  .turn .shot { display: block; max-width: 100%; max-height: 60vh; margin: 6px 0 0; border-radius: 4px; border: 1px solid var(--edge); cursor: zoom-in; }
+  .turn .shot { display: block; max-width: 100%; max-height: 60vh; margin: 6px 0 0; border-radius: 6px; border: 1px solid var(--edge); cursor: zoom-in; }
   .turn .shots { margin-top: 6px; }
   .turn .unshipped { color: var(--muted); font-size: 12px; }
   /* The full picture, in the page: a browser will not open a data
@@ -123,16 +166,16 @@
   .turn pre[hidden] { display: none; }
 
   /* Terminal: the pane at its desktop size, in a scroller. */
-  .terminal { -webkit-overflow-scrolling: touch; touch-action: pan-x pan-y pinch-zoom; padding: 6px 0 0 6px; }
+  .terminal { -webkit-overflow-scrolling: touch; touch-action: pan-x pan-y pinch-zoom; padding: 6px 0 0 6px; background: var(--pane); color: var(--pane-ink); }
   .terminal .term { width: max-content; }
-  .terminal .gone { position: absolute; inset: 0; display: none; align-items: center; justify-content: center; color: var(--muted); background: color-mix(in srgb, var(--base) 70%, transparent); }
+  .terminal .gone { position: absolute; inset: 0; display: none; align-items: center; justify-content: center; color: var(--pane-ink); background: color-mix(in srgb, var(--pane) 78%, transparent); }
   .terminal.closed .gone { display: flex; }
 
   /* Say something. */
   .say { grid-area: say; display: flex; gap: 8px; padding: 8px 10px calc(8px + env(safe-area-inset-bottom)); background: var(--bezel); border-top: 1px solid var(--edge); }
-  .say input { flex: 1 1 auto; min-width: 0; background: var(--base); color: var(--ink); border: 1px solid var(--edge); border-radius: 4px; padding: 9px 10px; font: 15px var(--mono); }
+  .say input { flex: 1 1 auto; min-width: 0; background: var(--base); color: var(--ink); border: 1px solid var(--edge); border-radius: 6px; padding: 10px 12px; font: 15px var(--text); }
   .say input:focus { outline: 2px solid var(--hue); outline-offset: -1px; border-color: transparent; }
-  .say button.send { background: var(--hue); color: var(--base); border-radius: 4px; padding: 0 16px; font-weight: 700; }
+  .say button.send { background: var(--hue-deep); color: #fff; border-radius: 6px; padding: 0 16px; font-weight: 700; }
   .say button.send:disabled { opacity: 0.4; cursor: default; }
   .say .sent { color: var(--muted); font-size: 12px; align-self: center; min-width: 4ch; }
 
@@ -415,7 +458,7 @@
   function turnHtml(t) {
     const b = t.body;
     const age = `<span class="age"></span>`;
-    if (b.kind === 'text') return `${age}<span class="text"></span>`;
+    if (b.kind === 'text') return `${age}<div class="text prose"></div>`;
     if (b.kind === 'thinking') return `${age}<details><summary>thinking</summary><pre class="text"></pre></details>`;
     if (b.kind === 'image') return `${age}<span class="shots"></span>`;
     return `${age}<details class="tool"><summary><span class="name"></span> <span class="in"></span><span class="pending"></span></summary><pre class="in"></pre><pre class="out"></pre><div class="shots"></div></details>`;
@@ -447,7 +490,16 @@
   function fillTurn(el, t) {
     const b = t.body;
     el.querySelector('.age').textContent = t.at ? coarse(now() - t.at) : '';
-    if (b.kind === 'text' || b.kind === 'thinking') { el.querySelector('.text').textContent = b.text; return; }
+    if (b.kind === 'text') {
+      // The ONLY innerHTML in this file that carries agent words.
+      // `render_markdown` made this markup: raw HTML escaped, every
+      // destination checked against an allow-list. A turn from before
+      // that existed has no `html`, and falls back to its own text.
+      const box = el.querySelector('.text');
+      if (b.html) box.innerHTML = b.html; else box.textContent = b.text;
+      return;
+    }
+    if (b.kind === 'thinking') { el.querySelector('.text').textContent = b.text; return; }
     if (b.kind === 'image') { fillShots(el.querySelector('.shots'), [b]); return; }
     el.querySelector('summary .name').textContent = b.name;
     el.querySelector('summary .in').textContent = b.input.slice(0, 120);
@@ -458,6 +510,37 @@
     out.hidden = b.output == null;
     fillShots(el.querySelector('.shots'), b.images || []);
   }
+  // A run of tool calls with no prose between them is one row: what
+  // was said stays readable, what was DONE is one tap away.
+  function slotsOf(turns) {
+    const slots = [];
+    for (const t of turns) {
+      const last = slots[slots.length - 1];
+      if (t.body.kind === 'tool' && last && last.tools) last.turns.push(t);
+      else slots.push({ tools: t.body.kind === 'tool', turns: [t] });
+    }
+    return slots;
+  }
+
+  // Put `t`'s element in `parent` at `cursor`, making it if it is
+  // new. Looked up from `box` rather than `parent` because a turn
+  // moves between the top level and a group as its run grows, and
+  // rebuilding it would close whatever the reader had opened.
+  function placeTurn(box, parent, t, cursor) {
+    let el = box.querySelector(`[data-id="${CSS.escape(t.id)}"]`);
+    if (!el) {
+      el = document.createElement('div');
+      el.dataset.id = t.id;
+      el.className = `turn ${t.who} ${t.body.kind}`;
+      el.innerHTML = turnHtml(t);
+      parent.insertBefore(el, cursor);
+    } else if (el !== cursor) {
+      parent.insertBefore(el, cursor);
+    }
+    fillTurn(el, t);
+    return el.nextElementSibling;
+  }
+
   function paintTranscript(label) {
     const v = views.get(label); if (!v) return;
     const box = v.transcript.querySelector('.turns');
@@ -468,22 +551,54 @@
     const atBottom = v.transcript.scrollTop + v.transcript.clientHeight >= v.transcript.scrollHeight - 40;
     const keep = new Set();
     let cursor = box.firstElementChild;
-    for (const t of shown) {
-      keep.add(t.id);
-      let el = box.querySelector(`[data-id="${CSS.escape(t.id)}"]`);
-      if (!el) {
-        el = document.createElement('div');
-        el.dataset.id = t.id;
-        el.className = `turn ${t.who} ${t.body.kind}`;
-        el.innerHTML = turnHtml(t);
-        box.insertBefore(el, cursor);
-      } else if (el !== cursor) {
-        box.insertBefore(el, cursor);
+    for (const slot of slotsOf(shown)) {
+      if (!slot.tools || slot.turns.length === 1) {
+        for (const t of slot.turns) { keep.add(t.id); cursor = placeTurn(box, box, t, cursor); }
+        continue;
       }
-      fillTurn(el, t);
-      cursor = el.nextElementSibling;
+      const key = `g:${slot.turns[0].id}`;
+      keep.add(key);
+      let g = box.querySelector(`[data-id="${CSS.escape(key)}"]`);
+      if (!g) {
+        // A wrapper is born closed, and that is wrong twice over.
+        //
+        // A lone call becoming a run must not take back what the
+        // reader is looking at: their opened output would vanish
+        // under a closed wrapper (codex on f100b52).
+        //
+        // And the key is the first member's id, so retention evicting
+        // that turn REKEYS the run: a wrapper is replaced mid-read,
+        // and asking "is anything inside open" would reopen a run the
+        // reader had deliberately closed around an open child (codex
+        // on 5d3bf82). A replacement inherits what it replaces; only
+        // a genuine lone-call transition consults the call itself.
+        const had = slot.turns
+          .map((t) => box.querySelector(`[data-id="${CSS.escape(t.id)}"]`))
+          .find((el) => el && el.closest('.did'));
+        const showing = had
+          ? had.closest('.did').open
+          : slot.turns.some((t) => {
+              const was = box.querySelector(`[data-id="${CSS.escape(t.id)}"]`);
+              return !!was?.querySelector('details')?.open;
+            });
+        g = document.createElement('details');
+        g.className = 'did'; g.dataset.id = key;
+        g.innerHTML = '<summary></summary><div class="members"></div>';
+        g.open = showing;
+        box.insertBefore(g, cursor);
+      } else if (g !== cursor) {
+        box.insertBefore(g, cursor);
+      }
+      const running = slot.turns.some((t) => t.body.output == null);
+      g.querySelector('summary').textContent = `${running ? 'Running' : 'Ran'} ${slot.turns.length} commands${running ? '…' : ''}`;
+      const members = g.querySelector('.members');
+      const mine = new Set();
+      let mc = members.firstElementChild;
+      for (const t of slot.turns) { mine.add(t.id); mc = placeTurn(box, members, t, mc); }
+      for (const el of [...members.children]) if (!mine.has(el.dataset.id)) el.remove();
+      cursor = g.nextElementSibling;
     }
-    for (const el of [...box.querySelectorAll('.turn[data-id]')]) if (!keep.has(el.dataset.id)) el.remove();
+    for (const el of [...box.children]) if (!keep.has(el.dataset.id)) el.remove();
     if (atBottom) v.transcript.scrollTop = v.transcript.scrollHeight;
   }
 

@@ -30,8 +30,16 @@ pub(crate) enum Who {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum Body {
+    /// Prose, with the markdown it was written as already rendered.
+    /// Rendering happens HERE because only here can it be done
+    /// safely: `html::render_markdown` escapes raw HTML and checks
+    /// every destination against an allow-list, and the page sets
+    /// this with `innerHTML`. `text` stays the source of truth;
+    /// `html` is derived from it by [`Body::prose`].
     Text {
         text: String,
+        #[serde(default)]
+        html: String,
     },
     Thinking {
         text: String,
@@ -51,6 +59,16 @@ pub(crate) enum Body {
         #[serde(flatten)]
         image: Image,
     },
+}
+
+impl Body {
+    /// A prose turn: the text as written, and as rendered.
+    pub(crate) fn prose(text: String) -> Self {
+        Body::Text {
+            html: crate::cli::html::render_markdown(&text),
+            text,
+        }
+    }
 }
 
 /// One image out of a transcript: its type and base64 data — or, over
@@ -242,9 +260,7 @@ mod claude {
             .filter_map(|(i, b)| {
                 let id = format!("{uuid}:{i}");
                 let body = match b.get("type").and_then(|t| t.as_str())? {
-                    "text" => Body::Text {
-                        text: b.get("text")?.as_str()?.to_string(),
-                    },
+                    "text" => Body::prose(b.get("text")?.as_str()?.to_string()),
                     "thinking" => Body::Thinking {
                         text: b.get("thinking")?.as_str()?.to_string(),
                     },
@@ -290,7 +306,7 @@ mod claude {
                 } else {
                     Who::Person
                 },
-                body: Body::Text { text: text.clone() },
+                body: Body::prose(text.clone()),
             })],
             serde_json::Value::Array(blocks) => {
                 // A typed message is a string — unless a picture was
@@ -318,7 +334,7 @@ mod claude {
                                 id: format!("{uuid}:{i}"),
                                 at,
                                 who,
-                                body: Body::Text { text },
+                                body: Body::prose(text),
                             }))
                         }
                         "image" => Some(Parsed::Turn(Turn {
@@ -383,7 +399,7 @@ mod codex {
                         id,
                         at,
                         who: who(&text),
-                        body: Body::Text { text },
+                        body: Body::prose(text),
                     })
                 };
                 // A list is walked in order, one turn per block, so a
@@ -685,7 +701,7 @@ mod tests {
             Some(utc(2026, 9, 11, 0, 22, 6)),
             "the line's own timestamp"
         );
-        assert!(matches!(&t.body, Body::Text { text } if text.starts_with("fix the layout")));
+        assert!(matches!(&t.body, Body::Text { text, .. } if text.starts_with("fix the layout")));
         assert!(
             matches!(&turn(&got[1]).body, Body::Thinking { text } if text == "The extent decides.")
         );
@@ -705,7 +721,9 @@ mod tests {
                 images: vec![]
             }
         );
-        assert!(matches!(&turn(&got[4]).body, Body::Text { text } if text.starts_with("Fixed")));
+        assert!(
+            matches!(&turn(&got[4]).body, Body::Text { text, .. } if text.starts_with("Fixed"))
+        );
         assert_eq!(
             turn(&got[5]).who,
             Who::Harness,
@@ -717,7 +735,7 @@ mod tests {
             "an interruption note is the harness"
         );
         assert!(
-            !got.iter().any(|p| matches!(p, Parsed::Turn(t) if matches!(&t.body, Body::Text { text } if text.contains("subagent")))),
+            !got.iter().any(|p| matches!(p, Parsed::Turn(t) if matches!(&t.body, Body::Text { text, .. } if text.contains("subagent")))),
             "sidechain lines are another conversation"
         );
     }
@@ -765,7 +783,9 @@ mod tests {
                 images: vec![]
             }
         );
-        assert!(matches!(&turn(&got[7]).body, Body::Text { text } if text.starts_with("CONTINUE")));
+        assert!(
+            matches!(&turn(&got[7]).body, Body::Text { text, .. } if text.starts_with("CONTINUE"))
+        );
         assert_eq!(turn(&got[7]).at, Some(utc(2026, 8, 27, 8, 33, 50)));
         assert_eq!(
             turn(&got[8]).who,
@@ -970,7 +990,7 @@ mod tests {
             "no picture, and the message's (empty) words stand in"
         );
         assert_eq!(turn(&got[0]).id, "m7");
-        assert!(matches!(&turn(&got[0]).body, Body::Text { text } if text.is_empty()));
+        assert!(matches!(&turn(&got[0]).body, Body::Text { text, .. } if text.is_empty()));
 
         // Mixed content keeps its order: a caption, its picture, the
         // next caption, its picture — each by its block.
@@ -990,7 +1010,7 @@ mod tests {
                 (
                     t.id.clone(),
                     match &t.body {
-                        Body::Text { text } => text.as_str(),
+                        Body::Text { text, .. } => text.as_str(),
                         Body::Image { .. } => "<image>",
                         _ => "?",
                     },

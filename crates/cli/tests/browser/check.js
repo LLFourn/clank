@@ -3,6 +3,7 @@ const out = [];
 const ok = (name, cond, detail = '') => out.push(`${cond ? 'PASS' : 'FAIL'}  ${name}${detail ? '  — ' + detail : ''}`);
 
 (async () => {
+  try {
   // ---- P1: the draft's recipient survives the roster losing its agent
   {
     const { browser, page } = await open();
@@ -54,24 +55,57 @@ const ok = (name, cond, detail = '') => out.push(`${cond ? 'PASS' : 'FAIL'}  ${n
   // ---- P2: the clock is never clipped with the sentence
   {
     const { browser, page } = await open();
-    await page.evaluate((d) => window.__send('status', d), facts([
-      agent('claude', 'master', { verb: 'working', object: 'the-agents-name-is-said-once', since: Math.floor(Date.now()/1000) - 240 }),
-    ]));
+    // Long enough to overflow a phone in a PROPORTIONAL font. The
+    // fixture that caught the original bug was sized for monospace
+    // and stopped overflowing when the page changed font — passing
+    // while testing nothing (codex on f100b52).
+    const long = 'a-plan-whose-name-runs-on-far-past-the-width-of-any-phone-ever-made';
+    await page.evaluate(([obj, since]) => window.__send('status', {
+      facts: {
+        lamp: 'lamp', plan: 'foo', hue: '#5f5fff', correction: null,
+        agents: [{ label: 'claude', role: 'master', owes: { verb: 'working', object: obj, since }, last: null, transcript: false }],
+        ledger: { plan: 'foo', gate: 'unreviewed', dirty: null, queue: 0, stash: 0, blocks: [], rows: [] },
+      },
+    }), [long, Math.floor(Date.now() / 1000) - 240]);
     for (const w of [320, 390, 430]) {
       await page.setViewportSize({ width: w, height: 780 });
       await page.waitForTimeout(30);
       const seen = await page.evaluate(() => {
-        const c = document.querySelector('#doing .clock'), box = document.querySelector('#doing');
+        const c = document.querySelector('#doing .clock'), s = document.querySelector('#doing .said');
+        const box = document.querySelector('#doing');
         const r = c.getBoundingClientRect(), b = box.getBoundingClientRect();
-        return { text: c.textContent, right: Math.round(r.right), edge: Math.round(b.right), w: Math.round(r.width) };
+        const sr = s.getBoundingClientRect(), cs = getComputedStyle(s);
+        return {
+          text: c.textContent, right: Math.round(r.right), edge: Math.round(b.right),
+          w: Math.round(r.width), overflows: s.scrollWidth > s.clientWidth,
+          clear: Math.round(sr.right) <= Math.round(r.left) + 1,
+          // Painted overflow is not observable from the DOM — a box
+          // with `overflow: visible` still reports the same geometry
+          // while its text runs across the clock. The declaration is
+          // the mechanism, so the declaration is what gets asserted.
+          hides: cs.overflow === 'hidden' && cs.textOverflow === 'ellipsis',
+        };
       });
       ok(`the clock is whole at ${w}px`, seen.w > 0 && seen.right <= seen.edge + 1, JSON.stringify(seen));
+      ok(`the sentence gives way at ${w}px`, seen.overflows && seen.hides && seen.clear, JSON.stringify(seen));
+      ok(`the clock still says the age at ${w}px`, seen.text === '4m', seen.text);
     }
-    const ell = await page.evaluate(() => {
+    // And nothing is clipped when it fits: the ellipsis is a response
+    // to the width, not a permanent state.
+    await page.setViewportSize({ width: 1400, height: 780 });
+    await page.evaluate((since) => window.__send('status', {
+      facts: {
+        lamp: 'lamp', plan: 'foo', hue: '#5f5fff', correction: null,
+        agents: [{ label: 'claude', role: 'master', owes: { verb: 'working', object: 'foo', since }, last: null, transcript: false }],
+        ledger: { plan: 'foo', gate: 'unreviewed', dirty: null, queue: 0, stash: 0, blocks: [], rows: [] },
+      },
+    }), Math.floor(Date.now() / 1000) - 240);
+    await page.waitForTimeout(30);
+    const roomy = await page.evaluate(() => {
       const s = document.querySelector('#doing .said');
-      return s.scrollWidth > s.clientWidth;
+      return s.scrollWidth <= s.clientWidth;
     });
-    ok('the sentence is the part that gives way', ell);
+    ok('a short obligation is not clipped when there is room', roomy);
     await browser.close();
   }
 
@@ -116,7 +150,13 @@ const ok = (name, cond, detail = '') => out.push(`${cond ? 'PASS' : 'FAIL'}  ${n
     ok('storage refused: the page still runs', false, err.message.split('\n')[0]);
   }
 
-  await done();
+  } catch (err) {
+    // A crash is a failed check, not a quiet exit: an assertion that
+    // cannot run has told you something, and grepping for FAIL must
+    // see it.
+    ok('the run completed', false, String(err).split('\n')[0]);
+  }
+  try { await done(); } catch (err) {}
   console.log(out.join('\n'));
   process.exit(out.some((l) => l.startsWith('FAIL')) ? 1 : 0);
 })();

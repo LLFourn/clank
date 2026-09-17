@@ -2017,7 +2017,7 @@ mod tests {
             id: id.into(),
             at: None,
             who: transcript::Who::Agent,
-            body: transcript::Body::Text { text: id.into() },
+            body: transcript::Body::prose(id.into()),
         }
     }
 

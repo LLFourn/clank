@@ -800,7 +800,7 @@ mod tests {
             id: id.into(),
             at: Some(1_000),
             who: super::super::transcript::Who::Agent,
-            body: Body::Text { text: text.into() },
+            body: Body::prose(text.into()),
         }
     }
 

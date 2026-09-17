@@ -23,7 +23,13 @@ use crate::cli::status::StatusSnapshot;
 /// directory layout under `.clank/html/` changes shape. A
 /// bump forces a full rebuild of every per-commit and
 /// per-plan page on the next `clank html` invocation.
-const BUILDER_VERSION: &str = "2";
+///
+/// 3: markdown destinations are checked against an allow-list and
+/// raw HTML is escaped rather than dropped. Without the bump, a page
+/// already on disk keeps the rendering it was built with — including
+/// live `javascript:` links — because only missing pages and the top
+/// ten commits are rewritten (codex on 2709ac1).
+const BUILDER_VERSION: &str = "3";
 const TOP_N_FEEDBACK_RECHECK: usize = 10;
 
 pub async fn run(args: HtmlArgs) -> anyhow::Result<()> {
@@ -1887,17 +1893,51 @@ fn esc(s: &str) -> String {
     out
 }
 
-fn render_markdown(md: &str) -> String {
+/// The schemes a rendered destination may carry. A destination with
+/// NO scheme — a relative path, a fragment — is fine too; it can only
+/// point within the site that served it.
+const SAFE_SCHEMES: &[&str] = &["http", "https", "mailto"];
+
+/// Whether `dest` may become an `href`/`src`.
+///
+/// pulldown-cmark escapes a destination for the ATTRIBUTE it lands in
+/// and says nothing about what it means, so `[x](javascript:…)` — with
+/// no raw HTML anywhere — otherwise renders as an executable link
+/// (codex on b83432b).
+///
+/// An allow-list needs no defence against obfuscation, which is the
+/// point of writing it this way round: `java&#9;script:` and
+/// `%6aavascript:` do not appear in the list either. Stripping
+/// whitespace first, as this did, could only ever make MORE
+/// destinations match — leniency wearing a safety coat, and a
+/// mutation that removed it changed nothing.
+pub(crate) fn safe_destination(dest: &str) -> bool {
+    // A colon before any `/`, `?` or `#` is a scheme; after one of
+    // those it is just a character in a path or query.
+    let Some(colon) = dest.find(':') else {
+        return true;
+    };
+    if dest[..colon].contains(['/', '?', '#']) {
+        return true;
+    }
+    SAFE_SCHEMES.contains(&dest[..colon].to_ascii_lowercase().as_str())
+}
+
+pub(crate) fn render_markdown(md: &str) -> String {
     use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd, html};
     let mut opts = Options::empty();
     opts.insert(Options::ENABLE_TABLES);
     opts.insert(Options::ENABLE_STRIKETHROUGH);
     opts.insert(Options::ENABLE_TASKLISTS);
-    // Strip raw HTML events — feedback bodies and plan markdown
-    // can contain user-controlled HTML that we don't want to
-    // pass through verbatim. pulldown-cmark's `Html` and
-    // `InlineHtml` events represent literal HTML tags from the
-    // source.
+    // Raw HTML is shown, not obeyed: a `<div>` in the source becomes
+    // the CHARACTERS `<div>`. Dropping the event instead — which this
+    // did — keeps the tag's text content, so `<script>alert(1)</script>`
+    // came out as the words `alert(1)` in the prose. That silently
+    // rewrites what someone wrote, and a transcript of agents
+    // discussing HTML would be full of it.
+    //
+    // Link and image destinations go through `safe_destination`; see
+    // there for why escaping them is not enough.
     //
     // Within a fenced code block: buffer the text events,
     // pass the buffered source through syntect, and emit the
@@ -1908,10 +1948,39 @@ fn render_markdown(md: &str) -> String {
     let mut buffer: Vec<Event<'_>> = Vec::new();
     let mut in_fenced: Option<String> = None; // Some(lang) while inside a fenced block
     let mut code_buf = String::new();
+    // One entry per open link/image: whether its start was dropped,
+    // so its end can be dropped with it and no other.
+    let mut nested: Vec<bool> = Vec::new();
     for ev in Parser::new_ext(md, opts) {
-        if matches!(&ev, Event::Html(_) | Event::InlineHtml(_)) {
-            continue;
-        }
+        // An unsafe destination loses its tag, not its words: the
+        // link text (or the image's alt) stays as prose, so the
+        // sentence still reads and nothing is clickable. A blanked
+        // `href=""` would still be a link, to this page.
+        //
+        // An image nests inside a link, so each END must find its own
+        // START: a count of dropped starts would let a kept image's
+        // `</img>` be eaten by the rejected link around it, folding
+        // the link's visible words into the image's alt text (codex
+        // on 2709ac1). A stack pairs them.
+        let ev = match ev {
+            Event::Html(raw) | Event::InlineHtml(raw) => Event::Text(raw),
+            Event::Start(Tag::Link { ref dest_url, .. })
+            | Event::Start(Tag::Image { ref dest_url, .. }) => {
+                let drop = !safe_destination(dest_url);
+                nested.push(drop);
+                if drop {
+                    continue;
+                }
+                ev
+            }
+            Event::End(TagEnd::Link | TagEnd::Image) => {
+                if nested.pop().unwrap_or(false) {
+                    continue;
+                }
+                ev
+            }
+            other => other,
+        };
         match (&in_fenced, &ev) {
             (None, Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(info)))) => {
                 // Flush pending non-code events to push_html.
@@ -2732,6 +2801,38 @@ mod tests {
         );
     }
 
+    /// A page built by an older builder is STALE, which is the only
+    /// thing that reaches pages already on disk: `build_site` rewrites
+    /// missing pages and the top ten commits, so without a version
+    /// bump a plan page generated before this change keeps the markup
+    /// it was built with — `javascript:` destinations included (codex
+    /// on 2709ac1).
+    #[test]
+    fn a_page_from_an_older_builder_is_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let page = |version: &str| {
+            std::fs::write(
+                dir.path().join("index.html"),
+                format!(
+                    "<meta name=\"clank:builder-version\" content=\"{version}\">\n\
+                     <meta name=\"clank:last-built-sha\" content=\"abc1230\">\n"
+                ),
+            )
+            .unwrap();
+            read_prior_build(dir.path())
+        };
+        for old in ["1", "2"] {
+            assert!(
+                matches!(page(old), PriorBuild::Stale),
+                "a page built by version {old} must be rewritten"
+            );
+        }
+        assert!(
+            matches!(page(BUILDER_VERSION), PriorBuild::Fresh { .. }),
+            "our own version is not stale"
+        );
+    }
+
     #[test]
     fn theme_chrome_injects_early_script_and_toggle() {
         let mut out = String::new();
@@ -2747,6 +2848,116 @@ mod tests {
         let body = out.find("<body>").expect("body opens");
         let btn = out.find(r#"class="theme-toggle""#).expect("toggle present");
         assert!(btn > body, "toggle after <body>");
+    }
+
+    /// What may become an `href`. pulldown-cmark escapes a
+    /// destination for the attribute it lands in and says nothing
+    /// about what it MEANS, so this is the only thing standing
+    /// between a markdown link and script execution in the remote's
+    /// authenticated origin (codex on b83432b).
+    /// An image nests inside a link, so a rejected link and an
+    /// accepted image are two tags whose ends must not be confused.
+    /// Counting dropped starts let the image's end be eaten by the
+    /// link around it, and the link's visible words slid into the
+    /// image's alt text (codex on 2709ac1).
+    #[test]
+    fn a_rejected_link_around_an_accepted_image_keeps_both_straight() {
+        let html = render_markdown(
+            "[![icon](https://example.com/i.png) IMPORTANT WORDS](javascript:alert(1)) after",
+        );
+        assert!(
+            html.contains("IMPORTANT WORDS") && !html.contains("alt=\"icon IMPORTANT WORDS\""),
+            "the link's words stay visible, not folded into the alt: {html}"
+        );
+        assert!(
+            html.contains("<img src=\"https://example.com/i.png\" alt=\"icon\""),
+            "the safe image survives with its own alt: {html}"
+        );
+        assert!(
+            !html.contains("javascript:") && !html.contains("</a>"),
+            "and the unsafe link leaves no tag behind: {html}"
+        );
+
+        // The other order: a safe link around an unsafe image.
+        let html = render_markdown("[![x](javascript:alert(1)) words](https://example.com)");
+        assert!(
+            html.contains("<a href=\"https://example.com\">") && html.contains("words"),
+            "the safe link survives: {html}"
+        );
+        assert!(!html.contains("<img"), "the unsafe image does not: {html}");
+    }
+
+    #[test]
+    fn only_a_safe_scheme_survives_as_a_destination() {
+        for ok in [
+            "https://example.com/a?b=1#c",
+            "http://example.com",
+            "HTTPS://EXAMPLE.COM",
+            "mailto:someone@example.com",
+            "./plan/foo.html",
+            "commit/abc1230.html",
+            "#a-fragment",
+            "",
+            // A colon that is not a scheme: it comes after the path
+            // has already begun.
+            "./odd:name.html",
+            "?q=a:b",
+        ] {
+            assert!(safe_destination(ok), "{ok:?} should be a link");
+        }
+        for bad in [
+            "javascript:alert(1)",
+            "JaVaScRiPt:alert(1)",
+            // Obfuscation gains nothing against an allow-list: these
+            // are not `javascript`, and they are not `https` either.
+            "java\tscript:alert(1)",
+            "java\nscript:alert(1)",
+            "  javascript:alert(1)",
+            "jav\u{0}ascript:alert(1)",
+            "data:text/html;base64,PHNjcmlwdD4=",
+            "data:image/png;base64,iVBOR",
+            "vbscript:msgbox(1)",
+            "file:///etc/passwd",
+        ] {
+            assert!(!safe_destination(bad), "{bad:?} must not be a link");
+        }
+    }
+
+    /// The rendered output, end to end: an unsafe destination keeps
+    /// its words and loses its tag, and raw HTML is shown rather than
+    /// obeyed or silently unwrapped.
+    #[test]
+    fn unsafe_markdown_renders_as_words() {
+        let html = render_markdown("[open me](javascript:alert%281%29) and [ok](https://e.com)");
+        assert!(
+            !html.contains("javascript:"),
+            "no executable destination survives: {html}"
+        );
+        assert!(html.contains("open me"), "the words stay: {html}");
+        assert!(
+            !html.contains("<a href=\"\""),
+            "and not as a link to this page: {html}"
+        );
+        assert!(
+            html.contains("<a href=\"https://e.com\">ok</a>"),
+            "a safe link is untouched: {html}"
+        );
+
+        let html = render_markdown("![x](javascript:alert(1))");
+        assert!(!html.contains("<img"), "no image either: {html}");
+
+        // Dropping the raw-HTML events kept their TEXT, so a script
+        // tag came out as the words `alert(1)`. Escaping shows the
+        // source, which is what a transcript must do.
+        let html = render_markdown("a <div>literal</div> tag and <script>alert(1)</script>");
+        assert!(
+            html.contains("&lt;div&gt;") && html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"),
+            "raw HTML is shown as its source: {html}"
+        );
+        assert!(
+            !html.contains("<div>") && !html.contains("<script>"),
+            "and never as markup: {html}"
+        );
     }
 
     #[test]

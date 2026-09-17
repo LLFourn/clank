@@ -29,7 +29,12 @@ const facts = (agents, extra = {}) => ({
     ...extra,
   },
 });
-const agent = (label, role, owes = null, last = null) => ({ label, role, owes, last, transcript: false });
+const agent = (label, role, owes = null, last = null, transcript = false) => ({ label, role, owes, last, transcript });
+const turn = (id, who, body, at) => ({ id, who, at: at || Math.floor(Date.now()/1000), body });
+const text = (id, who, md, html) => turn(id, who, { kind: 'text', text: md, html });
+const tool = (id, name, input, output) => turn(id, 'agent', { kind: 'tool', name, input, output, images: [] });
+const turns = (agent, list) => ({ agent, session: 's1', generation: 1, turns: list });
+
 const panes = (labels) => ({ panes: labels.map((l) => ({ id: 'pane-' + l, label: l, columns: 80, rows: 24, exited: false })), closed: [] });
 
 let server, port, browser;
@@ -58,4 +63,4 @@ async function open(deny) {
   return { browser: ctx, page, errors };
 }
 const done = async () => { await browser.close(); server.close(); };
-module.exports = { open, done, facts, agent, panes };
+module.exports = { open, done, facts, agent, panes, turn, text, tool, turns };
