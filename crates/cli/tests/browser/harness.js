@@ -24,7 +24,7 @@ const STUB = `
 
 const facts = (agents, extra = {}) => ({
   facts: {
-    lamp: 'lamp', plan: 'foo', hue: '#5f5fff', correction: null,
+    project: 'the-repo', lamp: 'lamp', plan: 'foo', hue: '#5f5fff', correction: null,
     agents, ledger: { plan: 'foo', gate: 'unreviewed', dirty: null, queue: 0, stash: 0, blocks: [], rows: [] },
     ...extra,
   },

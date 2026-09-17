@@ -64,7 +64,14 @@
     display: grid; grid-template-columns: minmax(0, 1fr) auto;
     padding: 6px 14px 8px;
   }
-  .bar .who { display: inline-flex; align-items: baseline; gap: 7px; padding: 6px 2px 6px 0; margin: -6px 0; max-width: 100%; }
+  /* The repo, then the agent, on one line: a page about a repo says
+     which repo, and two remotes open at once are otherwise identical.
+     The project gives way first when the screen is narrow — it is the
+     context, the agent is the subject. */
+  .bar .ident { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+  .bar .project { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font-size: 13px; }
+  .bar .project::after { content: "/"; margin-left: 8px; opacity: .5; }
+  .bar .who { display: inline-flex; align-items: baseline; gap: 7px; padding: 6px 2px 6px 0; margin: -6px 0; min-width: 0; }
   .bar .who .name { font-family: var(--plate); font-weight: 700; font-size: 22px; letter-spacing: -0.02em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .bar .who .caret { color: var(--muted); font-size: 13px; }
   /* Pinned, with the turn somewhere else: the one thing the header
@@ -243,9 +250,12 @@
 </head>
 <body>
   <header class="bar">
-    <button class="who" id="who" aria-haspopup="listbox" aria-expanded="false" aria-controls="picker">
+    <div class="ident">
+      <span class="project" id="project" hidden></span>
+      <button class="who" id="who" aria-haspopup="listbox" aria-expanded="false" aria-controls="picker">
       <span class="name" id="whoname"></span><span class="caret">▾</span><span class="away"></span><span class="tag" id="autotag">auto</span>
-    </button>
+      </button>
+    </div>
     <button class="more" id="more" aria-label="Open the ledger">···</button>
     <div class="state">
       <span class="doing" id="doing"></span>
@@ -284,6 +294,7 @@
   const $ = (id) => document.getElementById(id);
   const viewsEl = $('views'), emptyEl = $('empty');
   const whoEl = $('who'), whoName = $('whoname'), autoTag = $('autotag'), doingEl = $('doing');
+  const projectEl = $('project');
   const pickerEl = $('picker'), stripEl = $('strip');
   const modeBtns = { transcript: $('mode-transcript'), terminal: $('mode-terminal') };
   const form = $('say'), input = $('text'), send = $('send'), sentEl = $('sent'), stopBtn = $('stop');
@@ -408,6 +419,14 @@
       + (o.since != null ? `<span class="clock">${coarse(now() - o.since)}</span>` : '');
   }
   function paintHeader() {
+    // textContent: a repo can be named anything a directory can be.
+    const project = facts ? facts.project : '';
+    projectEl.textContent = project || '';
+    projectEl.hidden = !project;
+    // The tab, the bookmark and the home-screen icon all carry this.
+    // The session name — the multiplexer's name for a window — is a
+    // different question, and stays in the ledger where it is asked.
+    document.title = project || 'clank';
     whoName.textContent = shown || (roster().length ? '' : 'no agents');
     autoTag.hidden = !selection.auto;
     whoEl.classList.toggle('elsewhere', !selection.auto && roster().some((a) => a.owes && a.label !== shown));
@@ -966,7 +985,7 @@
     }
   });
 
-  $('session').textContent = document.title = window.CLANK_SESSION || 'clank';
+  $('session').textContent = window.CLANK_SESSION || 'clank';
   connect();
 })();
 </script>

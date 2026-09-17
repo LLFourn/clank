@@ -682,6 +682,60 @@ const ok = (name, cond, detail = '') => out.push(`${cond ? 'PASS' : 'FAIL'}  ${n
     ok('no errors around the batch', errors.length === 0, errors.join('; '));
   }
 
+  // ---- the page says which repo it is about
+  {
+    const { page, errors } = await open();
+    ok('before any frame the tab is not a session name', await page.title() === 'clank',
+       await page.title());
+    ok('and nothing claims to be a project yet', await page.isHidden('#project'));
+
+    await page.evaluate((d) => window.__send('status', d), facts([agent('claude', 'master')]));
+    await page.evaluate((d) => window.__send('panes', d), panes(['claude']));
+    // Deliberately not `clank`: that is the page's own fallback, and
+    // a check using it cannot tell the project from the default.
+    ok('the top bar names the project', (await page.textContent('#project')) === 'the-repo',
+       await page.textContent('#project'));
+    ok('and so does the tab', await page.title() === 'the-repo', await page.title());
+
+    // The session is a different question, asked in the ledger.
+    ok('the ledger still names the session', (await page.textContent('#session')).length > 0,
+       await page.textContent('#session'));
+
+    // A name is whatever a directory can be called, so it goes in as
+    // text and never as markup.
+    await page.evaluate(() => window.__send('status', {
+      facts: {
+        project: '<img src=x onerror=alert(1)>', lamp: 'l', plan: 'foo', hue: '#5f5fff', correction: null,
+        agents: [{ label: 'claude', role: 'master', owes: null, last: null, transcript: false, ended: null }],
+        ledger: { plan: 'foo', gate: 'unreviewed', dirty: null, queue: 0, stash: 0, blocks: [], rows: [] },
+      },
+    }));
+    ok('an awkward name is shown, not run', (await page.textContent('#project')) === '<img src=x onerror=alert(1)>');
+    ok('and no element came of it', await page.locator('#project img').count() === 0);
+
+    // Long names, narrow screen: the header still fits, and the agent
+    // keeps its place while the project gives way.
+    await page.evaluate(() => window.__send('status', {
+      facts: {
+        project: 'a-repository-with-a-really-quite-long-directory-name', lamp: 'l', plan: 'foo', hue: '#5f5fff', correction: null,
+        agents: [{ label: 'a-very-long-agent-label-indeed', role: 'master', owes: null, last: null, transcript: false, ended: null }],
+        ledger: { plan: 'foo', gate: 'unreviewed', dirty: null, queue: 0, stash: 0, blocks: [], rows: [] },
+      },
+    }));
+    for (const w of [320, 390]) {
+      await page.setViewportSize({ width: w, height: 800 });
+      await page.waitForTimeout(40);
+      const m = await page.evaluate(() => ({
+        doc: document.documentElement.scrollWidth,
+        more: Math.round(document.querySelector('#more').getBoundingClientRect().right),
+        name: Math.round(document.querySelector('#whoname').getBoundingClientRect().width),
+      }));
+      ok(`long names still fit at ${w}px`, m.doc <= w && m.more <= w, JSON.stringify(m));
+      ok(`and the agent keeps room at ${w}px`, m.name > 40, JSON.stringify(m));
+    }
+    ok('no errors around naming', errors.length === 0, errors.join('; '));
+  }
+
   // ---- the composer is a bubble under the column it belongs to
   {
     const { page, errors } = await open();

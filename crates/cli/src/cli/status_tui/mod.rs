@@ -1737,6 +1737,10 @@ pub(crate) struct Ledger {
 /// the same functions.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct WebFacts {
+    /// The repo this page is about, named as `clank status` names it.
+    /// A second opinion about a repo's name would be worse than none,
+    /// so this is the snapshot's own basename and nothing else.
+    pub(crate) project: String,
     /// The lamp's text and its plan, as `bar_text` gives them.
     pub(crate) lamp: String,
     pub(crate) plan: String,
@@ -1833,6 +1837,7 @@ pub(crate) fn web_facts(
     };
 
     WebFacts {
+        project: snap.basename.clone(),
         lamp,
         plan,
         hue,
@@ -5197,6 +5202,10 @@ pub(crate) mod tests {
         let (lamp, plan) = render::bar_text(&s);
         assert_eq!((facts.lamp.clone(), facts.plan.clone()), (lamp, plan));
         assert_eq!(facts.hue, derive::state_color(&s).hex());
+        assert_eq!(
+            facts.project, s.basename,
+            "the page says which repo it is about, in the repo's own name"
+        );
 
         let agents: Vec<(&str, &str, Option<(&str, &str, Option<i64>)>, bool)> = facts
             .agents
