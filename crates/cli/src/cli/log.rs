@@ -879,13 +879,11 @@ pub(crate) fn oneline_rows(
             run.iter()
                 .any(|e| stands_for.get(e.sha().as_str()).is_some_and(|p| p == plan))
         };
-        if let Some(plan) = umbrella_plan.as_deref()
-            && !collapses(plan)
-        {
-            out.push(OnelineRow::Header {
-                plan: Some(plan.to_string()),
-            });
-        }
+        // Decided from the run, emitted after it.
+        let footer = match umbrella_plan.as_deref() {
+            Some(plan) if !collapses(plan) => Some(plan.to_string()),
+            _ => None,
+        };
         for event in run {
             let (sha, subject) = match event {
                 LogEvent::PlanIntro { sha, subject, .. }
@@ -949,6 +947,19 @@ pub(crate) fn oneline_rows(
                 marker: RowMarker::of(event),
                 stands_for: stands_for.get(sha.as_str()).cloned(),
             });
+        }
+        // The name goes UNDER its run, because the list is newest-first
+        // and a plan's beginning is at its bottom: printed first, the
+        // name sits beside the finish and leaves the intro that opened
+        // the plan orphaned at the far end. Same clock as a review,
+        // which renders above the commit it followed.
+        //
+        // It is a FOOTER FOR THIS RUN, not one global name: sections
+        // are cut per chunk, so a run split across pages gets its name
+        // on each, rather than one label attached to an intro that may
+        // be off-page (codex on 51fb3c8).
+        if let Some(plan) = footer {
+            out.push(OnelineRow::Header { plan: Some(plan) });
         }
     }
     out
@@ -1439,6 +1450,43 @@ mod json_output_tests {
         assert!(!colored.contains(DIM), "{colored:?}");
     }
 
+    /// A run split by a github row is TWO sections, so each gets its
+    /// own name — the change is a footer per run, not one global name
+    /// pinned to an intro that may be off this page (codex on
+    /// 51fb3c8).
+    #[test]
+    fn a_run_split_by_a_github_row_names_each_half() {
+        use crate::lifecycle::{CommitSha, PlanKey};
+        let commit = |ts: i64| LogEvent::PlanCommit {
+            plan: PlanKey::parse("foo").unwrap(),
+            sha: CommitSha::parse(&format!("{ts:0<40x}")).unwrap(),
+            ts,
+            touched_plan: false,
+            touched_code: true,
+            subject: "[foo] work".into(),
+        };
+        let (newer, older) = (commit(200), commit(100));
+        let events: Vec<&LogEvent> = vec![&newer, &older];
+        // A github event dated between them splits the run.
+        let gh_events = vec![gh(150, "between", true)];
+        let items = interleave(&events, &gh_events);
+        let rows = oneline_items_rows(&items, &Default::default(), &Default::default());
+        let shape: Vec<&str> = rows
+            .iter()
+            .map(|r| match r {
+                OnelineRow::Header { plan } => plan.as_deref().unwrap_or("adhoc"),
+                OnelineRow::Github { .. } => "gh",
+                OnelineRow::Commit { .. } => "commit",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            vec!["commit", "foo", "gh", "commit", "foo"],
+            "each half closes with its own name: {rows:?}"
+        );
+    }
+
     #[test]
     fn oneline_items_rows_splice_github_rows_for_the_tui() {
         let e = adhoc(100, "c");
@@ -1813,20 +1861,22 @@ mod tests {
             }],
         );
         let lines = oneline_plain_lines(&oneline_rows(&refs, &reviews, &Default::default()));
-        // Umbrella shape (log-plan-umbrellas + adhoc-commit-marker): one
-        // plan header at col 0; each commit LEADS with its 1-col marker icon
-        // (planning `✎`, finish `⚑`, ad-hoc `~`), then the sha, then the
-        // subject (finish now shows its real whole-plan message). The ad-hoc
-        // commit folds UNDER the plan umbrella (no separate "adhoc" header).
+        // Umbrella shape (log-plan-umbrellas + adhoc-commit-marker):
+        // each commit LEADS with its 1-col marker icon (planning `✎`,
+        // finish `⚑`, ad-hoc `~`), then the sha, then the subject
+        // (finish shows its real whole-plan message). The plan's name
+        // sits at col 0 UNDER its run — newest-first, so a plan's
+        // beginning is at its bottom. The ad-hoc commit still has no
+        // header of its own; it simply follows, marked per row.
         assert_eq!(
             lines,
             vec![
-                "foo".to_string(),
                 // review renders ABOVE its commit (newest-first time
                 // order — status-timeline-progress)
                 "    ✓ codex: lgtm".to_string(),
                 "✎ aa00000 intro".to_string(),
                 "⚑ bb00000 wrap up".to_string(),
+                "foo".to_string(),
                 "    ✓ codex: x".to_string(),
                 "~ cc00000 drive-by".to_string(),
             ]
@@ -1985,14 +2035,15 @@ mod tests {
         let events = [&e1, &e2];
         let rows = oneline_rows(&events, &Default::default(), &Default::default());
         let lines = oneline_plain_lines(&rows);
-        assert_eq!(lines[0], "foo", "umbrella header at col 0");
         assert!(
-            lines[1].ends_with(" intro"),
+            lines[0].ends_with(" intro"),
             "matching prefix stripped: {lines:?}"
         );
         assert!(
-            lines[2].ends_with(" [foo,bar] shared change"),
+            lines[1].ends_with(" [foo,bar] shared change"),
             "multi-plan prefix kept verbatim: {lines:?}"
         );
+        // The name closes its run: last, at col 0.
+        assert_eq!(lines[2], "foo", "umbrella name under its commits");
     }
 }

@@ -680,6 +680,95 @@ mod tests {
         }
     }
 
+    /// Rows from the PRODUCER, not hand-built ones: the fixtures above
+    /// place the name on top, so they cannot tell whether navigation
+    /// survives the name moving under its run (codex on 51fb3c8).
+    ///
+    /// Two plans in sequence, each with a review over its newest
+    /// commit. A review must reach its own commit, and the name must
+    /// still open its own plan.
+    #[test]
+    fn navigation_survives_the_name_moving_under_its_run() {
+        use crate::cli::log::{OnelineRow, oneline_rows};
+        use crate::lifecycle::{CommitSha, PlanKey};
+        use clank_core::repo_state::LogEvent;
+        use clank_core::vocab::Verdict;
+        let sha = |s: &str| CommitSha::parse(&format!("{:0<40}", s)).unwrap();
+        let commit = |plan: &str, s: &str, ts: i64| LogEvent::PlanCommit {
+            plan: PlanKey::parse(plan).unwrap(),
+            sha: sha(s),
+            ts,
+            touched_plan: false,
+            touched_code: true,
+            subject: format!("[{plan}] work"),
+        };
+        // Newest-first, as the log renders: plan `bee` then plan `ant`.
+        let events = [
+            commit("bee", "b2", 4),
+            commit("bee", "b1", 3),
+            commit("ant", "a2", 2),
+            commit("ant", "a1", 1),
+        ];
+        let refs: Vec<&LogEvent> = events.iter().collect();
+        let mut reviews = std::collections::BTreeMap::new();
+        for (s, who) in [("b2", "codex"), ("a2", "kimi")] {
+            reviews.insert(
+                sha(s).as_str().to_string(),
+                vec![crate::cli::log::Review {
+                    at: None,
+                    author: who.into(),
+                    verdict: Verdict::Continue,
+                    summary: "ok".into(),
+                    body: String::new(),
+                }],
+            );
+        }
+        let rows = oneline_rows(&refs, &reviews, &Default::default());
+        // The shape under test: each run's name closes it.
+        let shape: Vec<&str> = rows
+            .iter()
+            .map(|r| match r {
+                OnelineRow::Header { plan } => plan.as_deref().unwrap_or("adhoc"),
+                OnelineRow::Review { .. } => "review",
+                _ => "commit",
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                "review", "commit", "commit", "bee", "review", "commit", "commit", "ant"
+            ],
+            "{rows:?}"
+        );
+
+        let seq: Vec<Seg> = rows.iter().map(Seg::Log).collect();
+        let commit_of = |t: Option<OverlayTarget>| match t {
+            Some(OverlayTarget::Commit { sha, focus }) => Some((sha, focus)),
+            _ => None,
+        };
+        // Each review reaches ITS OWN commit, not the neighbouring
+        // plan's — the failure a misplaced section break causes.
+        assert_eq!(
+            commit_of(entry_overlay_target(&seq, 0)),
+            Some((sha("b2"), Some("codex".to_string()))),
+            "the first review targets the newest commit of its own run"
+        );
+        assert_eq!(
+            commit_of(entry_overlay_target(&seq, 4)),
+            Some((sha("a2"), Some("kimi".to_string()))),
+            "and the review after a name targets the run BELOW it"
+        );
+        // Each name still opens its own plan's document.
+        assert!(matches!(
+            entry_overlay_target(&seq, 3),
+            Some(OverlayTarget::Plan { stem }) if stem == "bee"
+        ));
+        assert!(matches!(
+            entry_overlay_target(&seq, 7),
+            Some(OverlayTarget::Plan { stem }) if stem == "ant"
+        ));
+    }
+
     #[test]
     fn entry_overlay_target_resolves_positionally() {
         use crate::cli::log::OnelineRow;

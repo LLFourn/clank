@@ -5535,6 +5535,70 @@ pub(crate) mod tests {
     /// its commit in the newest-first log — the page of the commit
     /// BELOW it and not the one above, never one from past an
     /// umbrella; the ad-hoc umbrella and github rows none.
+    /// Attribution from PRODUCER rows: the fixture above places the
+    /// name on top, so it cannot tell whether the ledger still
+    /// attributes correctly with the name under its run (codex on
+    /// 51fb3c8).
+    ///
+    /// Two plans in sequence. Each review must carry its own commit's
+    /// page, and each name its own plan's.
+    #[test]
+    fn ledger_attribution_survives_the_name_moving_under_its_run() {
+        use crate::cli::log::{OnelineRow, oneline_rows};
+        use crate::lifecycle::{CommitSha, PlanKey};
+        use clank_core::repo_state::LogEvent;
+        let sha = |s: &str| CommitSha::parse(&format!("{:0<40}", s)).unwrap();
+        let commit = |plan: &str, s: &str, ts: i64| LogEvent::PlanCommit {
+            plan: PlanKey::parse(plan).unwrap(),
+            sha: sha(s),
+            ts,
+            touched_plan: false,
+            touched_code: true,
+            subject: format!("[{plan}] work"),
+        };
+        let events = [
+            commit("bee", "b2", 4),
+            commit("bee", "b1", 3),
+            commit("ant", "a2", 2),
+            commit("ant", "a1", 1),
+        ];
+        let refs: Vec<&LogEvent> = events.iter().collect();
+        let mut reviews = std::collections::BTreeMap::new();
+        for s in ["b2", "a2"] {
+            reviews.insert(
+                sha(s).as_str().to_string(),
+                vec![crate::cli::log::Review {
+                    at: None,
+                    author: "codex".into(),
+                    verdict: clank_core::vocab::Verdict::Continue,
+                    summary: "ok".into(),
+                    body: String::new(),
+                }],
+            );
+        }
+        let rows = oneline_rows(&refs, &reviews, &Default::default());
+        assert!(
+            matches!(rows.last(), Some(OnelineRow::Header { plan: Some(p) }) if p == "ant"),
+            "the producer puts the name last: {rows:?}"
+        );
+        let page = |s: &str| Some(format!("commit/{}.html", sha(s).as_str()));
+        let pages: Vec<Option<String>> = ledger_rows(&rows).into_iter().map(|r| r.page).collect();
+        assert_eq!(
+            pages,
+            vec![
+                page("b2"), // the review above b2
+                page("b2"),
+                page("b1"),
+                Some("plan/bee.html".into()),
+                page("a2"), // and this review belongs to the run BELOW the name
+                page("a2"),
+                page("a1"),
+                Some("plan/ant.html".into()),
+            ],
+            "{rows:?}"
+        );
+    }
+
     #[test]
     fn ledger_rows_name_their_pages() {
         use crate::cli::log::{OnelineRow, RowMarker};
