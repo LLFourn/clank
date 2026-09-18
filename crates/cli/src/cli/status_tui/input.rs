@@ -155,7 +155,7 @@ pub(super) enum Mode {
 }
 
 /// What the open plan-page input is FOR — picks the screen chrome, the
-/// submit action, and the validation (drop requires the exact stem).
+/// submit action, and the validation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PlanInputKind {
     /// The WHAT subject for `finish --force`; the WHY paragraph is
@@ -164,9 +164,6 @@ pub(super) enum PlanInputKind {
     /// The squash message for a finished plan (prefilled with the
     /// finalize commit's subject).
     SquashMessage,
-    /// Type-the-stem arming for `purge --drop` — the scariest screen;
-    /// submit is a no-op until the buffer equals the stem exactly.
-    DropStem,
 }
 
 /// Whether an agent has a pane with a running process, as the zellij
@@ -629,15 +626,6 @@ pub(crate) fn compose_squash_message(
 /// mandatory finish messages (no WHY body to carry).
 pub(super) const TUI_SQUASH_PROVENANCE: &str = "collapsed to one commit from clank tui; \
      the original finish predates mandatory finish messages.";
-
-/// THE drop-arming predicate: the RAW buffer must equal the stem
-/// exactly — no trim, no case-fold. One definition shared by the
-/// armed/not-armed indicator AND the submit gate, so they cannot
-/// disagree (codex 0daf087: submit trimmed while the indicator
-/// didn't, so ` <stem> ` dropped a plan the screen called not armed).
-pub(super) fn drop_armed(buf: &str, stem: &str) -> bool {
-    buf == stem
-}
 
 /// Apply one [`TextKey`] to the input. Pure; the caller owns what
 /// Submit/Cancel mean for its screen.
@@ -1280,7 +1268,14 @@ pub(super) enum ConfirmAction {
     /// `purge` (artifacts only) the open plan page's plan.
     PurgeArtifacts,
     /// `purge --drop` the open plan page's plan — the scariest one.
-    PurgeDrop,
+    /// Dropping a plan, carrying the number of commits it would take
+    /// — the screen's own figure, computed when the screen opens.
+    ///
+    /// On the variant rather than beside it: the count and the mode
+    /// must not be able to disagree, and a snapshot field read as
+    /// `0` when a plan was FINISHED promised a drop of nothing and
+    /// then dropped everything (codex on 3ed8a39).
+    PurgeDrop { commits: usize },
     /// SIGTERM the open wait page's process. Carries no pid: the
     /// target is re-resolved from the page's identity AFTER the
     /// confirm, because everything checked before it is stale by the
@@ -1305,7 +1300,7 @@ impl ConfirmAction {
                 | ConfirmAction::UnqueuePlan
                 | ConfirmAction::PromotePlan
                 | ConfirmAction::PurgeArtifacts
-                | ConfirmAction::PurgeDrop
+                | ConfirmAction::PurgeDrop { .. }
         )
     }
 }
@@ -2640,6 +2635,34 @@ mod tests {
         );
     }
 
+    /// Drop is a one-keystroke confirm like every other destructive
+    /// action on the plan page, and it defaults to NO. Typing the stem
+    /// used to be the gate; git's reflog was already the safeguard the
+    /// gate was imitating, so what is left is the cost of one `y`.
+    #[test]
+    fn dropping_takes_one_keystroke_and_never_enter() {
+        let drop = ConfirmAction::PurgeDrop { commits: 7 };
+        assert!(drop.is_plan_page(), "it is a plan-page confirm");
+        assert!(!drop.default_yes(), "and Enter must not confirm it");
+        assert_eq!(confirm_decision(drop, Key::Yes), Some(true));
+        for cancel in [Key::No, Key::Escape, Key::Quit, Key::Enter] {
+            assert_eq!(
+                confirm_decision(drop, cancel),
+                Some(false),
+                "{cancel:?} cancels"
+            );
+        }
+        // Nothing else on that page confirms on Enter either, so the
+        // drop is not a special case that could drift back.
+        for other in [
+            ConfirmAction::PurgeArtifacts,
+            ConfirmAction::StashPlan,
+            ConfirmAction::UnqueuePlan,
+        ] {
+            assert!(!other.default_yes(), "{other:?} defaults no too");
+        }
+    }
+
     #[test]
     fn purge_choice_nav_routes_both_choices_and_escape() {
         assert_eq!(
@@ -2666,7 +2689,7 @@ mod tests {
         for a in [
             ConfirmAction::StashPlan,
             ConfirmAction::PurgeArtifacts,
-            ConfirmAction::PurgeDrop,
+            ConfirmAction::PurgeDrop { commits: 7 },
         ] {
             assert!(!a.default_yes(), "{a:?} must never Enter-confirm");
             assert!(a.is_plan_page());
@@ -2767,22 +2790,6 @@ mod tests {
         let legacy = compose_squash_message("collapse it all", "  ", TUI_SQUASH_PROVENANCE);
         validate(Some(&legacy), "my-plan").expect("provenance fallback");
         assert!(legacy.contains("predates mandatory finish messages"));
-    }
-
-    #[test]
-    fn drop_arming_rejects_whitespace_padding() {
-        // codex 0daf087 regression: submit used a TRIMMED compare while
-        // the indicator used the raw buffer, so ` <stem> ` executed a
-        // drop the screen called not armed. The predicate is raw-exact
-        // and shared by both.
-        assert!(drop_armed("my-plan", "my-plan"));
-        assert!(!drop_armed(" my-plan", "my-plan"));
-        assert!(!drop_armed("my-plan ", "my-plan"));
-        assert!(!drop_armed(" my-plan ", "my-plan"));
-        assert!(!drop_armed("My-plan", "my-plan"), "no case folding");
-        assert!(!drop_armed("my-pla", "my-plan"));
-        // The trap the trimmed compare fell into:
-        assert_eq!(" my-plan ".trim(), "my-plan", "trim WOULD have matched");
     }
 
     #[test]

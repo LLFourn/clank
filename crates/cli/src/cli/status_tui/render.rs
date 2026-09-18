@@ -220,7 +220,7 @@ pub(super) fn render_at(
             | ConfirmAction::UnqueuePlan
             | ConfirmAction::PromotePlan
             | ConfirmAction::PurgeArtifacts
-            | ConfirmAction::PurgeDrop => {
+            | ConfirmAction::PurgeDrop { .. } => {
                 if let Mode::BlockAnswer { block } = mode {
                     if let Some(b) = snap.blocks.get(block) {
                         return render_block_answer(
@@ -241,7 +241,7 @@ pub(super) fn render_at(
                     );
                 }
                 if let Some(pp) = view.plan_page {
-                    return render_plan_confirm(&pp.stem, action, rows, cols);
+                    return render_plan_confirm(snap, &pp.stem, action, rows, cols);
                 }
             }
         }
@@ -2934,7 +2934,7 @@ pub(super) fn render_roster_confirm(
         | ConfirmAction::UnqueuePlan
         | ConfirmAction::PromotePlan
         | ConfirmAction::PurgeArtifacts
-        | ConfirmAction::PurgeDrop => {
+        | ConfirmAction::PurgeDrop { .. } => {
             unreachable!("plan confirmations render through render_plan_confirm")
         }
     };
@@ -2952,7 +2952,7 @@ pub(super) fn render_roster_confirm(
         | ConfirmAction::UnqueuePlan
         | ConfirmAction::PromotePlan
         | ConfirmAction::PurgeArtifacts
-        | ConfirmAction::PurgeDrop => {
+        | ConfirmAction::PurgeDrop { .. } => {
             unreachable!("plan confirmations render through render_plan_confirm")
         }
     };
@@ -2987,6 +2987,7 @@ pub(super) fn render_roster_confirm(
 /// action — a full-width red reverse banner for drop, a red banner for
 /// artifacts purge, a plain highlight for stash. Default is ALWAYS No.
 pub(super) fn render_plan_confirm(
+    snap: &StatusSnapshot,
     stem: &str,
     action: ConfirmAction,
     rows: usize,
@@ -3016,11 +3017,25 @@ pub(super) fn render_plan_confirm(
             "strips the plan's .clank/ files from history; implementation commits stay;              rewrites this branch in place"
                 .to_string(),
         ),
-        ConfirmAction::PurgeDrop => (
-            format!("DROP `{stem}` — plan AND code vanish?"),
-            "every commit attributed to the plan is dropped from history, including the              implementation. The plan body is NOT saved. This rewrites the branch."
-                .to_string(),
-        ),
+        ConfirmAction::PurgeDrop { commits: count } => {
+            // Say the SIZE and the BRANCH, because this is the screen
+            // that decides it — and say the way back, because there
+            // is one: the commits become unreachable, not destroyed,
+            // and the reflog holds them until it expires or gc runs.
+            // A confirm that names the recovery is a better safeguard
+            // than one that makes you transcribe a name.
+            let branch = snap.branch.as_deref().unwrap_or("HEAD");
+            (
+                format!("DROP `{stem}` — plan AND code vanish?"),
+                format!(
+                    "drops {count} commit(s) attributed to the plan — the implementation \
+                     included — and rewrites `{branch}` in place. The plan body is NOT \
+                     saved; `clank stash push --to-queue` is how you keep it. Recoverable \
+                     from the reflog (`git reflog`, then `git reset --hard`) until that \
+                     expires or gc prunes it."
+                ),
+            )
+        }
         _ => (String::new(), String::new()),
     };
     let mut out: Vec<String> = Vec::new();
@@ -3059,10 +3074,7 @@ pub(super) fn render_plan_confirm(
 }
 
 /// The one-line plan-page text input, chrome picked by KIND. The
-/// input line renders the cursor as a reverse-video cell; DropStem
-/// gets the scary banner plus a LIVE armed/not-armed indicator (the
-/// consequence of a match is irreversible, so the screen must show
-/// the state before Enter does anything).
+/// input line renders the cursor as a reverse-video cell.
 pub(super) fn render_plan_input(
     stem: &str,
     kind: PlanInputKind,
@@ -3083,52 +3095,15 @@ pub(super) fn render_plan_input(
              is kept from the finish message)",
             "⏎ squash",
         ),
-        PlanInputKind::DropStem => (
-            format!("DROP · {stem}"),
-            "",
-            "⏎ drop (armed only when the name matches)",
-        ),
     };
     let mut out: Vec<String> = Vec::new();
     out.push(region_rule(&title, "", true, cols));
     out.push(String::new());
-    if matches!(kind, PlanInputKind::DropStem) {
-        out.push(emit(
-            &[colored(
-                "1;41;97",
-                format!(" DROP `{stem}` — the plan AND its code vanish from history "),
-            )],
-            "",
-            cols,
-        ));
-        out.push(String::new());
-        out.push(emit(
-            &[plain(format!(
-                "  Type the plan's name (`{stem}`) to arm the drop:"
-            ))],
-            "",
-            cols,
-        ));
-    } else {
-        for line in wrap(prompt, cols.saturating_sub(4).max(1)) {
-            out.push(emit(&[dim(format!("  {line}"))], "", cols));
-        }
+    for line in wrap(prompt, cols.saturating_sub(4).max(1)) {
+        out.push(emit(&[dim(format!("  {line}"))], "", cols));
     }
     out.push(String::new());
     push_input_line(&mut out, input, cols);
-    if matches!(kind, PlanInputKind::DropStem) {
-        out.push(String::new());
-        let armed = super::input::drop_armed(&input.buf, stem);
-        out.push(emit(
-            &[if armed {
-                colored("1;31", "  ARMED — ⏎ drops the plan".to_string())
-            } else {
-                dim("  not armed (name doesn't match yet)".to_string())
-            }],
-            "",
-            cols,
-        ));
-    }
     if out.len() < rows {
         out.push(String::new());
     }
@@ -3722,11 +3697,18 @@ mod tests {
         assert!(!text.contains("next screen"));
     }
 
+    /// The one screen that decides a drop: it says how much goes, off
+    /// which branch, that the body is not saved — and the way back,
+    /// which is what makes one keystroke the right cost instead of
+    /// making the operator transcribe a name.
     #[test]
-    fn drop_confirm_is_the_scariest_screen_and_defaults_no() {
+    fn drop_confirm_says_the_size_the_branch_and_the_way_back() {
+        let mut snap = snap(vec![], vec![]);
+        snap.branch = Some("main".into());
         let (lines, _) = render_plan_confirm(
+            &snap,
             "my-plan",
-            crate::cli::status_tui::input::ConfirmAction::PurgeDrop,
+            crate::cli::status_tui::input::ConfirmAction::PurgeDrop { commits: 7 },
             24,
             90,
         );
@@ -3736,10 +3718,14 @@ mod tests {
             "bold white-on-red banner: {text:?}"
         );
         assert!(text.contains("DROP `my-plan`"));
-        assert!(text.contains("NOT saved"));
+        assert!(text.contains("7 commit"), "the size of it: {text}");
+        assert!(text.contains("`main`"), "and which branch: {text}");
+        assert!(text.contains("NOT"), "the body is not saved: {text}");
+        assert!(text.contains("reflog"), "and the way back: {text}");
         assert!(text.contains("[y]es  [N]o  (⏎ = no)"), "default is No");
         // Stash's confirm is deliberately NOT the red banner.
         let (calm, _) = render_plan_confirm(
+            &snap,
             "my-plan",
             crate::cli::status_tui::input::ConfirmAction::StashPlan,
             24,
@@ -3748,27 +3734,6 @@ mod tests {
         assert!(
             !calm.join("").contains("\x1b[1;41;97m"),
             "gradient: stash stays calm"
-        );
-    }
-
-    #[test]
-    fn drop_input_arms_only_on_the_exact_stem() {
-        use crate::cli::status_tui::input::{PlanInputKind, TextInput};
-        let near_miss = TextInput::prefilled("my-pla");
-        let (lines, _) = render_plan_input("my-plan", PlanInputKind::DropStem, &near_miss, 24, 90);
-        let text = lines.join("\n");
-        assert!(text.contains("\x1b[1;41;97m"), "scary banner always on");
-        assert!(text.contains("not armed"), "{text}");
-        let exact = TextInput::prefilled("my-plan");
-        let (lines, _) = render_plan_input("my-plan", PlanInputKind::DropStem, &exact, 24, 90);
-        assert!(lines.join("\n").contains("ARMED"), "exact match arms");
-        // Whitespace padding must show not-armed — and the submit gate
-        // uses the SAME predicate, so what renders is what executes.
-        let padded = TextInput::prefilled(" my-plan ");
-        let (lines, _) = render_plan_input("my-plan", PlanInputKind::DropStem, &padded, 24, 90);
-        assert!(
-            lines.join("\n").contains("not armed"),
-            "padding stays disarmed"
         );
     }
 

@@ -226,7 +226,7 @@ fn apply_confirm(
         | ConfirmAction::UnqueuePlan
         | ConfirmAction::PromotePlan
         | ConfirmAction::PurgeArtifacts
-        | ConfirmAction::PurgeDrop => Ok(()),
+        | ConfirmAction::PurgeDrop { .. } => Ok(()),
     }
 }
 
@@ -252,7 +252,7 @@ async fn run_plan_confirm(
         }
         ConfirmAction::UnqueuePlan => crate::cli::queue::unqueue(repo, stem).map(|_| ()),
         ConfirmAction::PromotePlan => crate::cli::queue::promote(repo, stem),
-        ConfirmAction::PurgeArtifacts | ConfirmAction::PurgeDrop => {
+        ConfirmAction::PurgeArtifacts | ConfirmAction::PurgeDrop { .. } => {
             crate::cli::purge::run(crate::cli::PurgeArgs {
                 plan: Some(stem.to_string()),
                 all: false,
@@ -261,7 +261,7 @@ async fn run_plan_confirm(
                 dry: false,
                 squash: None,
                 amend: false,
-                drop: matches!(action, ConfirmAction::PurgeDrop),
+                drop: matches!(action, ConfirmAction::PurgeDrop { .. }),
                 no_cache: false,
             })
             .await
@@ -277,7 +277,7 @@ fn plan_confirm_title(action: ConfirmAction) -> String {
         ConfirmAction::UnqueuePlan => "unqueue failed".to_string(),
         ConfirmAction::PromotePlan => "promote failed".to_string(),
         ConfirmAction::PurgeArtifacts => "purge failed".to_string(),
-        ConfirmAction::PurgeDrop => "purge --drop failed".to_string(),
+        ConfirmAction::PurgeDrop { .. } => "purge --drop failed".to_string(),
         _ => "action failed".to_string(),
     }
 }
@@ -292,9 +292,40 @@ enum InputSubmit {
     Failed(String, String),
 }
 
+/// How many commits a drop of `stem` would take, asked of the same
+/// preview the purge engine uses — so the screen's number is the
+/// number that will be acted on, for an ACTIVE plan and a FINISHED
+/// one alike.
+///
+/// The fold cannot answer for a finished plan: it keeps a plan's
+/// commit list only while the plan is active, and reading the absence
+/// as `0` told the operator a drop would take nothing (codex on
+/// 3ed8a39).
+///
+/// FALLIBLE, and the caller must not open the screen without an
+/// answer. The preview's failure is the one a test can force; the
+/// rebuild's `?` is error propagation on principle rather than proven
+/// behaviour, because `rebuild_repo_with_policy` answers for anything
+/// a directory can be. A failure here is not "zero commits": `run_plan_confirm`
+/// reruns the rebuild and the preview after `y`, so a read that fails
+/// while the screen opens and succeeds a moment later would drop real
+/// commits after advertising none (codex on 230585f). No number, no
+/// screen.
+async fn drop_size(repo: &std::path::Path, stem: &str) -> anyhow::Result<usize> {
+    let plan_key = crate::lifecycle::PlanKey::parse(stem)
+        .map_err(|e| anyhow::anyhow!("`{stem}` is not a plan name: {e}"))?;
+    let state = crate::rebuild::rebuild_repo_with_policy(repo, crate::rebuild::CachePolicy::Use)
+        .await
+        .map_err(|e| anyhow::anyhow!("reading the repo failed: {e}"))?;
+    let preview = crate::preview::build_rewrite_preview(repo, &state, &plan_key, true)
+        .await
+        .map_err(|e| anyhow::anyhow!("working out what a drop would take failed: {e}"))?;
+    Ok(preview.commits.len())
+}
+
 /// Execute a submitted plan-page input. Validation lives here so the
 /// screens can't diverge from what actually runs: an empty buffer
-/// never acts, and DropStem only arms on the EXACT stem.
+/// never acts.
 async fn submit_plan_input(
     kind: PlanInputKind,
     buf: &str,
@@ -375,19 +406,6 @@ async fn submit_plan_input(
             match res {
                 Ok(()) => InputSubmit::Done,
                 Err(e) => InputSubmit::Failed("squash failed".into(), format!("{e:?}")),
-            }
-        }
-        PlanInputKind::DropStem => {
-            // RAW buffer, not the trimmed `text`: the gate must be the
-            // SAME predicate the armed indicator renders (codex
-            // 0daf087 — a trimmed compare here executed drops the
-            // screen showed as not armed).
-            if !input::drop_armed(buf, stem) {
-                return InputSubmit::Stay; // not armed — keep typing or esc
-            }
-            match run_plan_confirm(ConfirmAction::PurgeDrop, repo, stem).await {
-                Ok(()) => InputSubmit::Done,
-                Err(e) => InputSubmit::Failed("purge --drop failed".into(), format!("{e:?}")),
             }
         }
     }
@@ -3633,13 +3651,40 @@ pub(crate) async fn run_tui(
                                     };
                                 }
                                 PlanNavPurge::Choose(PurgeChoice::Drop) => {
-                                    // The scariest gate: type the stem to
-                                    // arm (a y/N would be one habitual
-                                    // keystroke from losing real work).
-                                    plan_input = Some(TextInput::default());
-                                    mode = Mode::PlanInput {
-                                        kind: PlanInputKind::DropStem,
+                                    // The same one-keystroke confirm every
+                                    // other destructive action on this page
+                                    // uses, defaulting to No. Typing the
+                                    // stem guarded against something git
+                                    // already guards against: the commits
+                                    // become unreachable, not destroyed, and
+                                    // the confirm names the way back.
+                                    //
+                                    // But only with a real number in hand.
+                                    // Opening this screen without one is how
+                                    // "drops 0 commit(s)" came to precede a
+                                    // real drop.
+                                    let sized = match plan_page.as_ref() {
+                                        Some(pp) => drop_size(&repo, &pp.stem).await,
+                                        None => Err(anyhow::anyhow!("no plan is open")),
                                     };
+                                    match sized {
+                                        Ok(commits) => {
+                                            mode = Mode::Confirm {
+                                                action: ConfirmAction::PurgeDrop { commits },
+                                            };
+                                        }
+                                        Err(e) => {
+                                            detail = Some(Overlay::error(
+                                                "cannot size the drop".to_string(),
+                                                format!(
+                                                    "{e:#}\n\nNothing was changed. The drop is \
+                                                     not offered without knowing what it would \
+                                                     take."
+                                                ),
+                                            ));
+                                            mode = Mode::PlanDetail { sel: 0 };
+                                        }
+                                    }
                                 }
                                 PlanNavPurge::Choose(PurgeChoice::Back) => {
                                     mode = Mode::PlanDetail { sel: 0 };
@@ -5314,6 +5359,121 @@ pub(crate) mod tests {
             c.contains("dec0de") && c.contains("foo"),
             "the correction names the commit to amend and the plan the tag missed: {c}"
         );
+    }
+
+    /// What the drop screen says it will take, asked of real repo
+    /// states — active, finished-as-one-commit, and finished
+    /// unsquashed. The count used to come from a snapshot map built
+    /// only from ACTIVE plans, so every finished plan's screen said
+    /// `0 commit(s)` and then dropped its real commits (codex on
+    /// 3ed8a39); a test that injected the number could not see that.
+    #[tokio::test]
+    async fn the_drop_screen_counts_active_and_finished_plans_alike() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        };
+        let write = |rel: &str, body: &str| {
+            let p = repo.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, body).unwrap();
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "t"]);
+        write("README", "base\n");
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "base"]);
+
+        // An ACTIVE plan of two commits.
+        write(".clank/plans/live.md", "# live\n");
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "[live] intro"]);
+        write("src/live.rs", "// live\n");
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "[live] implement"]);
+        assert_eq!(
+            drop_size(repo, "live").await.unwrap(),
+            2,
+            "an active plan counts its own commits"
+        );
+
+        // A FINISHED plan collapsed to ONE commit: the same commit
+        // introduces the plan and finishes it.
+        write(".clank/finished/solo.md", "# solo\n");
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "[solo] all of it"]);
+        assert_eq!(
+            drop_size(repo, "solo").await.unwrap(),
+            1,
+            "a squashed finished plan is one commit, not zero"
+        );
+
+        // A FINISHED plan that was NOT squashed: intro, work, finish.
+        write(".clank/plans/pair.md", "# pair\n");
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "[pair] intro"]);
+        write("src/pair.rs", "// pair\n");
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "[pair] implement"]);
+        std::fs::rename(
+            repo.join(".clank/plans/pair.md"),
+            repo.join(".clank/finished/pair.md"),
+        )
+        .unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "[pair] finish"]);
+        assert_eq!(
+            drop_size(repo, "pair").await.unwrap(),
+            3,
+            "an unsquashed finished plan counts all of them"
+        );
+    }
+
+    /// No number, no screen. A rebuild or preview that fails while the
+    /// drop screen opens must not become `commits: 0` — `run_plan_confirm`
+    /// reruns both after `y`, so a transient failure would let a real
+    /// drop follow a screen that advertised none (codex on 230585f).
+    #[tokio::test]
+    async fn a_drop_with_no_preview_is_refused_not_zeroed() {
+        let dir = tempfile::tempdir().unwrap();
+        // Not a git repo at all: the rebuild cannot answer.
+        assert!(
+            drop_size(dir.path(), "whatever").await.is_err(),
+            "an unreadable repo is an error, never a count"
+        );
+
+        // A real repo, but no such plan — the preview has nothing to
+        // size, and that is still not zero.
+        let repo = dir.path();
+        let git = |args: &[&str]| {
+            let _ = std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .output()
+                .unwrap();
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(repo.join("README"), "base\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "base"]);
+        assert!(
+            drop_size(repo, "no-such-plan").await.is_err(),
+            "a plan the preview cannot find is an error, never a count"
+        );
+
+        // And a name that is not a plan name never reaches the repo.
+        assert!(drop_size(repo, "not/a/stem").await.is_err());
     }
 
     /// A collapsed row is still a COMMIT to everything that navigates
