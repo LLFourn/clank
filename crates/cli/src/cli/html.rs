@@ -24,12 +24,21 @@ use crate::cli::status::StatusSnapshot;
 /// bump forces a full rebuild of every per-commit and
 /// per-plan page on the next `clank html` invocation.
 ///
+/// 4: diffs are bounded — a deleted file's body and a binary's bytes
+/// are never fetched, and what is shown spends a rendered-byte
+/// budget. Pages already on disk hold the unbounded rendering, which
+/// on one repo was 166 GB across 661 files.
+///
+/// 5: the budget is spent per rendered element and the named rows
+/// carry their own class, so a page built by 4 has both the wrong
+/// markup and a ceiling it could exceed.
+///
 /// 3: markdown destinations are checked against an allow-list and
 /// raw HTML is escaped rather than dropped. Without the bump, a page
 /// already on disk keeps the rendering it was built with — including
 /// live `javascript:` links — because only missing pages and the top
 /// ten commits are rewritten (codex on 2709ac1).
-const BUILDER_VERSION: &str = "3";
+const BUILDER_VERSION: &str = "5";
 const TOP_N_FEEDBACK_RECHECK: usize = 10;
 
 pub async fn run(args: HtmlArgs) -> anyhow::Result<()> {
@@ -1453,20 +1462,23 @@ fn render_commit_doc(
     out.push_str("</section>\n");
 
     // Diff.
-    let diff = commit_diff(repo, sha);
+    // Metadata first: status and counts for every path, bounded by
+    // the FILE COUNT. Only what will be shown is then fetched, one
+    // file at a time, through a reader that stops at its budget — so
+    // a commit that deleted a hundred megabytes is never read, let
+    // alone rendered.
+    let changed = crate::git_io::commit_changed_paths(repo, sha.as_str()).unwrap_or_default();
     out.push_str("<section class=\"diff\">\n");
     out.push_str(&format!(
         "  <details{}><summary>Diff ({} file{})</summary>\n",
         if plan_is_centerpiece { "" } else { " open" },
-        diff.len(),
-        if diff.len() == 1 { "" } else { "s" }
+        changed.len(),
+        if changed.len() == 1 { "" } else { "s" }
     ));
-    if diff.is_empty() {
+    if changed.is_empty() {
         out.push_str("  <p class=\"empty\">No file changes.</p>\n");
     } else {
-        for fp in &diff {
-            out.push_str(&render_file_patch(fp));
-        }
+        out.push_str(&render_changed_files(repo, sha, &changed));
     }
     out.push_str("  </details>\n");
     out.push_str("</section>\n");
@@ -1702,8 +1714,10 @@ fn waiting_on_label(w: &clank_core::plan_view::WaitingOn) -> String {
 
 // ─────────────────────────── diff ───────────────────────────
 
+/// One file's hunks. The PATH is deliberately not here: it comes
+/// from `--raw`, which spells it exactly, while a `diff --git` line
+/// quotes and prefixes it.
 struct FilePatch {
-    header: String,
     hunks: Vec<Hunk>,
 }
 
@@ -1730,17 +1744,300 @@ fn parse_hunk_header(line: &str) -> Option<(u32, u32)> {
     Some((old_start, new_start))
 }
 
-fn commit_diff(repo: &Path, sha: &CommitSha) -> Vec<FilePatch> {
-    let Ok(out) = crate::git_io::commit_diff_text(repo, sha.as_str()) else {
-        return Vec::new();
+/// The most bytes a whole commit page's diff may reach, closing
+/// markup and tally included. Nothing on the page exceeds this.
+///
+/// Rendered, not source: counting source bytes would let a page
+/// expand its way past the ceiling on the way out.
+const PAGE_BYTE_BUDGET: usize = 4 * 1024 * 1024;
+
+/// Bytes of the ceiling held back so that whatever is open can always
+/// be closed and the tally can always be written.
+///
+/// Covers one open hunk and file close, one cut notice, and the
+/// closing `N further file(s) omitted`. The notice is what makes this
+/// a constant: past [`NOTE_PATH_MAX`] it drops the recovery command
+/// rather than growing with the path.
+const TAIL_RESERVE: usize = 1024;
+
+/// The longest path the cut notice will spell a command for.
+const NOTE_PATH_MAX: usize = 200;
+
+/// Bytes held back from the patches for the named rows: enough for
+/// the capped number of ordinary ones.
+///
+/// A page whose patches filled the ceiling should still NAME the files
+/// it could not show: a name is the cheap half and often the useful
+/// one. Without a reserve the first oversized patch would swallow the
+/// whole list into the tally. It is not a licence to overspend —
+/// unusually long paths exhaust it and are tallied like anything
+/// else.
+const SUMMARY_RESERVE: usize = SUMMARY_ROW_CAP * 160;
+
+/// The most bytes of one file's patch ever READ from git.
+///
+/// Purely an acquisition bound — how much is held in memory at once,
+/// and so how much of a huge patch can possibly be shown. It does NOT
+/// bound the page: the rendered size of a patch cannot be predicted
+/// from its source size (a file of blank lines costs two source bytes
+/// a line and about two hundred rendered), so the page enforces its
+/// own ceiling per element instead of trusting a ratio.
+const FILE_BYTE_BUDGET: usize = 256 * 1024;
+
+/// The most summary rows to name once the budget is spent. 39,000
+/// filenames is also a page nobody can open.
+const SUMMARY_ROW_CAP: usize = 200;
+
+/// What became of one file's patch on the page.
+#[derive(Debug, PartialEq, Eq)]
+enum Placed {
+    /// Every hunk fit.
+    Whole,
+    /// The prefix that fit is shown; the page is full.
+    Cut,
+    /// Not even the heading fit — name it instead.
+    Nothing,
+}
+
+/// A commit page's diff under construction, and the ceiling it spends.
+///
+/// Every changed path lands here exactly once: as a patch, as a named
+/// row, or — once neither fits — as one more in the tally. Bytes are
+/// counted as RENDERED, because that is what reaches the disk, and
+/// they are counted at every append: a budget checked once per file
+/// is not a budget.
+#[derive(Default)]
+struct DiffPage {
+    out: String,
+    spent: usize,
+    named: usize,
+    unnamed: usize,
+}
+
+impl DiffPage {
+    /// Bytes a named row may still spend: everything but the tail.
+    fn room_for_row(&self) -> usize {
+        PAGE_BYTE_BUDGET
+            .saturating_sub(TAIL_RESERVE)
+            .saturating_sub(self.spent)
+    }
+
+    /// Bytes a patch may still spend: the rows' reserve is not its to
+    /// take.
+    fn room_for_patch(&self) -> usize {
+        self.room_for_row().saturating_sub(SUMMARY_RESERVE)
+    }
+
+    /// Append a patch element only if the whole of it fits. Half an
+    /// element is not an element, so this is the only way patch
+    /// content goes on the page.
+    fn try_push(&mut self, s: &str) -> bool {
+        if s.len() > self.room_for_patch() {
+            return false;
+        }
+        self.spent += s.len();
+        self.out.push_str(s);
+        true
+    }
+
+    /// Closing markup, a cut notice, the tally: spends the reserve and
+    /// is never refused, which is what the reserve is for.
+    fn push_tail(&mut self, s: &str) {
+        self.spent += s.len();
+        self.out.push_str(s);
+    }
+
+    fn name(&mut self, c: &crate::git_io::ChangedPath) {
+        if self.named >= SUMMARY_ROW_CAP {
+            self.unnamed += 1;
+            return;
+        }
+        let row = render_changed_summary(c);
+        if row.len() > self.room_for_row() {
+            self.unnamed += 1;
+            return;
+        }
+        self.spent += row.len();
+        self.out.push_str(&row);
+        self.named += 1;
+    }
+
+    /// One file's patch, element by element, stopping when the page
+    /// is full rather than deciding up front whether it will fit.
+    fn push_file(&mut self, fp: &FilePatch, path: &str) -> Placed {
+        if !self.try_push(&format!(
+            "  <details open class=\"file\"><summary>{}</summary>\n",
+            esc(path)
+        )) {
+            return Placed::Nothing;
+        }
+        let ext = std::path::Path::new(path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|s| s.to_string());
+        let mut hunk_open = false;
+        let mut cut = false;
+        for hunk in &fp.hunks {
+            if !self.try_push("    <div class=\"hunk\">\n") {
+                cut = true;
+                break;
+            }
+            hunk_open = true;
+            if !self.try_push(&format!(
+                "      <div class=\"line hunk-hdr\"><span class=\"src\">{}</span></div>\n",
+                esc(&hunk.header_line)
+            )) {
+                cut = true;
+                break;
+            }
+            let mut old_no = hunk.old_start;
+            let mut new_no = hunk.new_start;
+            for line in &hunk.body {
+                let row = render_diff_line(line, ext.as_deref(), &mut old_no, &mut new_no);
+                if !self.try_push(&row) {
+                    cut = true;
+                    break;
+                }
+            }
+            if cut || !self.try_push("    </div>\n") {
+                cut = true;
+                break;
+            }
+            hunk_open = false;
+        }
+        if hunk_open {
+            self.push_tail("    </div>\n");
+        }
+        self.push_tail("  </details>\n");
+        if cut { Placed::Cut } else { Placed::Whole }
+    }
+
+    fn finish(mut self) -> String {
+        if self.unnamed > 0 {
+            self.push_tail(&format!(
+                "  <p class=\"omitted\">{} further file(s) omitted.</p>\n",
+                self.unnamed
+            ));
+        }
+        self.out
+    }
+}
+
+/// Every changed path, as much of it as the ceiling allows.
+///
+/// A deletion and a binary change are never fetched: their bodies are
+/// exactly what filled 166 GB, and the row already carries what there
+/// is to say. Everything else is fetched per file and rendered into
+/// the page until the page is full.
+fn render_changed_files(
+    repo: &Path,
+    sha: &CommitSha,
+    changed: &[crate::git_io::ChangedPath],
+) -> String {
+    let mut page = DiffPage::default();
+    let mut full = false;
+    for c in changed {
+        // Never fetched — a deletion's former content and a binary's
+        // bytes are not diffs anyone reads.
+        if full || c.is_delete() || c.is_binary() {
+            page.name(c);
+            continue;
+        }
+        let Ok(patch) =
+            crate::git_io::file_patch_text(repo, sha.as_str(), &c.path, FILE_BYTE_BUDGET)
+        else {
+            page.name(c);
+            continue;
+        };
+        let text = String::from_utf8_lossy(&patch.bytes).to_string();
+        let files = parse_unified_diff(&text);
+        // One literal path must bring back exactly one file. With
+        // literal pathspecs nothing else can happen, so no test can
+        // reach this branch — it is here because the alternative,
+        // showing "the first one", is how a deleted file's body got
+        // onto the page in the first place.
+        let [fp] = &files[..] else {
+            page.name(c);
+            continue;
+        };
+        match page.push_file(fp, &c.path) {
+            Placed::Nothing => page.name(c),
+            Placed::Cut => {
+                page.push_tail(&cut_notice(sha, &c.path, true));
+                full = true;
+            }
+            Placed::Whole if patch.truncated => {
+                let notice = cut_notice(sha, &c.path, false);
+                if !page.try_push(&notice) {
+                    page.push_tail(&notice);
+                    full = true;
+                }
+            }
+            Placed::Whole => {}
+        }
+    }
+    page.finish()
+}
+
+/// A path as one shell word, spelled exactly.
+///
+/// Literal semantics come from `--literal-pathspecs` on the command,
+/// which is the same mechanism the fetch itself uses. A `:(literal)`
+/// prefix must NOT be added on top: the flag disables pathspec magic,
+/// so the prefix would become part of the filename git looks for and
+/// the command would find nothing (codex on 5096f03).
+fn shell_word(path: &str) -> String {
+    format!("'{}'", path.replace('\'', "'\\''"))
+}
+
+/// Says the patch is cut and how to read the rest.
+///
+/// Past [`NOTE_PATH_MAX`] the command is dropped rather than spelled,
+/// so the notice stays inside [`TAIL_RESERVE`] for any name git can
+/// produce — a wrong command would be worse than none.
+fn cut_notice(sha: &CommitSha, path: &str, page_full: bool) -> String {
+    let why = if page_full {
+        "The rest of this page is omitted".to_string()
+    } else {
+        format!("This patch is longer than {} KiB", FILE_BYTE_BUDGET / 1024)
     };
-    let text = String::from_utf8_lossy(&out).to_string();
-    parse_unified_diff(&text)
+    if path.len() > NOTE_PATH_MAX {
+        return format!("  <p class=\"omitted\">{}.</p>\n", esc(&why));
+    }
+    format!(
+        "  <p class=\"omitted\">{} and is cut here. <code>git \
+         --literal-pathspecs show {} -- {}</code> has the rest.</p>\n",
+        esc(&why),
+        esc(&sha.as_str()[..12.min(sha.as_str().len())]),
+        esc(&shell_word(path)),
+    )
+}
+
+/// What a file contributes to a page when its patch is not shown.
+fn render_changed_summary(c: &crate::git_io::ChangedPath) -> String {
+    use crate::git_io::Counts;
+    let what = match (c.status, c.counts) {
+        ('D', Counts::Binary) => "deleted, binary".to_string(),
+        ('A', Counts::Binary) => "added, binary".to_string(),
+        (_, Counts::Binary) => "binary, changed".to_string(),
+        ('D', Counts::Lines(_, r)) => format!("deleted, {r} line(s)"),
+        ('A', Counts::Lines(a, _)) => format!("added, {a} line(s)"),
+        (_, Counts::Lines(a, r)) => format!("+{a} −{r}"),
+        ('D', Counts::Unknown) => "deleted".to_string(),
+        ('A', Counts::Unknown) => "added".to_string(),
+        (_, Counts::Unknown) => "changed".to_string(),
+    };
+    format!(
+        "  <div class=\"file named\"><span class=\"path\">{}</span> \
+         <span class=\"what\">{}</span></div>\n",
+        esc(&c.path),
+        esc(&what),
+    )
 }
 
 fn parse_unified_diff(text: &str) -> Vec<FilePatch> {
     let mut files: Vec<FilePatch> = Vec::new();
-    let mut cur_header: Option<String> = None;
+    let mut in_file = false;
     let mut cur_hunks: Vec<Hunk> = Vec::new();
     let mut cur_hunk: Option<Hunk> = None;
     for line in text.lines() {
@@ -1748,13 +2045,12 @@ fn parse_unified_diff(text: &str) -> Vec<FilePatch> {
             if let Some(h) = cur_hunk.take() {
                 cur_hunks.push(h);
             }
-            if let Some(header) = cur_header.take() {
+            if in_file {
                 files.push(FilePatch {
-                    header,
                     hunks: std::mem::take(&mut cur_hunks),
                 });
             }
-            cur_header = Some(line.to_string());
+            in_file = true;
         } else if line.starts_with("@@") {
             if let Some(h) = cur_hunk.take() {
                 cur_hunks.push(h);
@@ -1768,89 +2064,56 @@ fn parse_unified_diff(text: &str) -> Vec<FilePatch> {
             });
         } else if let Some(h) = cur_hunk.as_mut() {
             h.body.push(line.to_string());
-        } else if let Some(h) = cur_header.as_mut() {
-            // Pre-hunk metadata lines (index, ---, +++).
-            h.push('\n');
-            h.push_str(line);
         }
+        // Anything else is pre-hunk metadata (index, ---, +++), which
+        // only ever carried the path this no longer reads.
     }
     if let Some(h) = cur_hunk.take() {
         cur_hunks.push(h);
     }
-    if let Some(header) = cur_header.take() {
-        files.push(FilePatch {
-            header,
-            hunks: cur_hunks,
-        });
+    if in_file {
+        files.push(FilePatch { hunks: cur_hunks });
     }
     files
 }
 
-fn render_file_patch(fp: &FilePatch) -> String {
-    // Extract a + b path from the `diff --git a/<a> b/<b>` line for
-    // the file heading.
-    let first = fp.header.lines().next().unwrap_or("").to_string();
-    let path = first
-        .strip_prefix("diff --git ")
-        .and_then(|rest| rest.split_once(' '))
-        .map(|(_a, b)| b.trim_start_matches("b/").to_string())
-        .unwrap_or_else(|| "(unknown)".to_string());
-    let ext = std::path::Path::new(&path)
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|s| s.to_string());
-    let mut s = String::new();
-    s.push_str(&format!(
-        "  <details open class=\"file\"><summary>{}</summary>\n",
-        esc(&path)
-    ));
-    for hunk in &fp.hunks {
-        s.push_str("    <div class=\"hunk\">\n");
-        // Hunk header line: full-width band, no line numbers.
-        s.push_str(&format!(
-            "      <div class=\"line hunk-hdr\"><span class=\"src\">{}</span></div>\n",
-            esc(&hunk.header_line)
-        ));
-        let mut old_no = hunk.old_start;
-        let mut new_no = hunk.new_start;
-        for line in &hunk.body {
-            let (cls, sign, source) = classify_line(line);
-            let (old_label, new_label) = match cls {
-                "add" => {
-                    let l = (String::new(), new_no.to_string());
-                    new_no += 1;
-                    l
-                }
-                "del" => {
-                    let l = (old_no.to_string(), String::new());
-                    old_no += 1;
-                    l
-                }
-                "ctx" => {
-                    let l = (old_no.to_string(), new_no.to_string());
-                    old_no += 1;
-                    new_no += 1;
-                    l
-                }
-                _ => (String::new(), String::new()),
-            };
-            let highlighted = if source.is_empty() {
-                String::new()
-            } else {
-                crate::cli::html_highlight::highlight_line(ext.as_deref(), source)
-            };
-            s.push_str(&format!(
-                "      <div class=\"line {cls}\"><span class=\"ln old\">{}</span><span class=\"ln new\">{}</span><span class=\"sign\">{}</span><span class=\"src\">{}</span></div>\n",
-                esc(&old_label),
-                esc(&new_label),
-                esc(sign),
-                highlighted
-            ));
+/// One diff line as its own append unit, advancing the line numbers.
+///
+/// A unit, not a fragment: the page stops between whole rows, so a
+/// budget can never leave an unclosed element behind.
+fn render_diff_line(line: &str, ext: Option<&str>, old_no: &mut u32, new_no: &mut u32) -> String {
+    let (cls, sign, source) = classify_line(line);
+    let (old_label, new_label) = match cls {
+        "add" => {
+            let l = (String::new(), new_no.to_string());
+            *new_no += 1;
+            l
         }
-        s.push_str("    </div>\n");
-    }
-    s.push_str("  </details>\n");
-    s
+        "del" => {
+            let l = (old_no.to_string(), String::new());
+            *old_no += 1;
+            l
+        }
+        "ctx" => {
+            let l = (old_no.to_string(), new_no.to_string());
+            *old_no += 1;
+            *new_no += 1;
+            l
+        }
+        _ => (String::new(), String::new()),
+    };
+    let highlighted = if source.is_empty() {
+        String::new()
+    } else {
+        crate::cli::html_highlight::highlight_line(ext, source)
+    };
+    format!(
+        "      <div class=\"line {cls}\"><span class=\"ln old\">{}</span><span class=\"ln new\">{}</span><span class=\"sign\">{}</span><span class=\"src\">{}</span></div>\n",
+        esc(&old_label),
+        esc(&new_label),
+        esc(sign),
+        highlighted
+    )
 }
 
 fn classify_line(line: &str) -> (&'static str, &'static str, &str) {
@@ -2457,6 +2720,9 @@ section h3 { font-size: .9rem; text-transform: uppercase; letter-spacing: .05em;
 .review .summary { margin: .25rem 0 .5rem; font-weight: 500; }
 .file { margin: .5rem 0; }
 .file summary { font: 500 .9rem/1.4 var(--mono); cursor: pointer; padding: .25rem .45rem; background: var(--code-bg); border: 1px solid var(--rule); border-radius: 3px; }
+.file.named { font: 500 .9rem/1.4 var(--mono); padding: .25rem .45rem; background: var(--code-bg); border: 1px solid var(--rule); border-radius: 3px; display: flex; gap: .6rem; justify-content: space-between; flex-wrap: wrap; }
+.file.named .what { color: var(--fg-dim); font-weight: 400; }
+.omitted { font: .85rem/1.4 var(--mono); color: var(--fg-dim); margin: .5rem 0; }
 .hunk { font: .8rem/1.25 var(--mono); margin: .35rem 0; background: var(--bg); border: 1px solid var(--rule); border-radius: 3px; overflow-x: auto; }
 .line {
   display: grid;
@@ -2495,6 +2761,474 @@ section h3 { font-size: .9rem; text-transform: uppercase; letter-spacing: .05em;
 
 #[cfg(test)]
 mod tests {
+
+    fn diff_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "t@e.com"]);
+        git(&["config", "user.name", "t"]);
+        dir
+    }
+
+    fn commit_all(repo: &Path, msg: &str) -> CommitSha {
+        for args in [vec!["add", "-A"], vec!["commit", "-qm", msg]] {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(&args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+        }
+        let head = String::from_utf8(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        CommitSha::parse(head.trim()).unwrap()
+    }
+
+    fn render(repo: &Path, sha: &CommitSha) -> String {
+        let changed = crate::git_io::commit_changed_paths(repo, sha.as_str()).unwrap();
+        render_changed_files(repo, sha, &changed)
+    }
+
+    /// A deleted file's body is never shown — and, because it is never
+    /// FETCHED, never held either. This is the 166 GB.
+    #[test]
+    fn a_deleted_file_is_a_row_not_its_former_contents() {
+        let dir = diff_repo();
+        let repo = dir.path();
+        let needle = "UNMISTAKABLE-DELETED-CONTENT";
+        let body: String = (0..50_000).map(|i| format!("{needle} {i}\n")).collect();
+        std::fs::write(repo.join("huge.json"), &body).unwrap();
+        std::fs::write(repo.join("keep.txt"), "a\n").unwrap();
+        commit_all(repo, "add");
+        std::fs::remove_file(repo.join("huge.json")).unwrap();
+        let sha = commit_all(repo, "delete it");
+
+        let html = render(repo, &sha);
+        assert!(
+            !html.contains(needle),
+            "the deleted content must not be on the page ({} bytes)",
+            html.len()
+        );
+        assert!(html.contains("huge.json"), "but the path is: {html}");
+        assert!(html.contains("deleted"), "and what happened to it: {html}");
+        assert!(html.contains("50000"), "and how much went: {html}");
+        assert!(
+            html.len() < 4096,
+            "a deletion costs a row: {} bytes",
+            html.len()
+        );
+    }
+
+    /// The three changes `--numstat` cannot tell apart, each rendered
+    /// for what it IS: only the deletion becomes a row.
+    #[test]
+    fn a_lines_only_edit_and_an_emptied_file_are_not_deletions() {
+        let dir = diff_repo();
+        let repo = dir.path();
+        std::fs::write(repo.join("keep.txt"), "a\nb\nc\n").unwrap();
+        std::fs::write(repo.join("empty.txt"), "p\nq\n").unwrap();
+        std::fs::write(repo.join("gone.txt"), "x\ny\n").unwrap();
+        commit_all(repo, "base");
+        std::fs::write(repo.join("keep.txt"), "a\n").unwrap();
+        std::fs::write(repo.join("empty.txt"), "").unwrap();
+        std::fs::remove_file(repo.join("gone.txt")).unwrap();
+        let sha = commit_all(repo, "change");
+
+        let html = render(repo, &sha);
+        // The edits keep their hunks: `b` and `c` were removed from
+        // keep.txt and the page shows the removal.
+        assert!(html.contains("@@"), "the modifications keep hunks: {html}");
+        assert!(html.contains("keep.txt") && html.contains("empty.txt"));
+        // And only the real deletion is summarised as one.
+        let deleted_rows = html.matches("deleted").count();
+        assert_eq!(deleted_rows, 1, "one deletion, not three: {html}");
+    }
+
+    /// Binary is named as binary and inlined nowhere — including a
+    /// DELETED binary, whose status and lack of counts must both show.
+    #[test]
+    fn binary_is_named_never_inlined() {
+        let dir = diff_repo();
+        let repo = dir.path();
+        std::fs::write(repo.join("pic.bin"), [0u8, 1, 2, 0, 3]).unwrap();
+        std::fs::write(repo.join("old.bin"), [0u8, 9, 0, 9]).unwrap();
+        commit_all(repo, "add binary");
+        std::fs::write(repo.join("pic.bin"), vec![0u8; 200_000]).unwrap();
+        std::fs::remove_file(repo.join("old.bin")).unwrap();
+        std::fs::write(repo.join("new.bin"), [0u8, 7, 0, 7]).unwrap();
+        let sha = commit_all(repo, "change binary");
+
+        let html = render(repo, &sha);
+        // A row, not a patch: the row form is the proof that the bytes
+        // were never fetched.
+        assert!(
+            html.contains("<span class=\"path\">pic.bin</span>"),
+            "named in a summary row: {html}"
+        );
+        assert!(html.contains("binary, changed"), "{html}");
+        assert!(
+            html.contains("deleted, binary"),
+            "a deleted binary says both: {html}"
+        );
+        assert!(html.contains("added, binary"), "and an added one: {html}");
+        assert!(!html.contains("@@"), "no hunks for binary: {html}");
+        assert!(html.len() < 4096, "{} bytes", html.len());
+    }
+
+    /// ONE line, tens of megabytes of it. A line cap does not bound
+    /// this; a byte cap does.
+    #[test]
+    fn one_enormous_line_is_still_bounded() {
+        let dir = diff_repo();
+        let repo = dir.path();
+        std::fs::write(repo.join("min.json"), "{}\n").unwrap();
+        commit_all(repo, "base");
+        // 8 MB on a single line, no newlines inside it.
+        let one_line = format!("{{\"a\":\"{}\"}}\n", "x".repeat(8 * 1024 * 1024));
+        std::fs::write(repo.join("min.json"), &one_line).unwrap();
+        let sha = commit_all(repo, "minified");
+
+        let html = render(repo, &sha);
+        assert!(
+            html.len() < PAGE_BYTE_BUDGET,
+            "a single line must not escape the budget: {} bytes",
+            html.len()
+        );
+        // Cut, not dropped: the file is still shown, and the page says
+        // where the rest lives.
+        assert!(html.contains("@@"), "the patch is still shown: {html}");
+        assert!(
+            html.contains("is cut here"),
+            "and says it was cut: {}",
+            &html[..600.min(html.len())]
+        );
+    }
+
+    /// Escaping expands: one `<` becomes four bytes. The budget is
+    /// spent in RENDERED bytes, so a page cannot quadruple its way
+    /// past the ceiling.
+    #[test]
+    fn rendered_expansion_is_counted_against_the_budget() {
+        let dir = diff_repo();
+        let repo = dir.path();
+        // 20 KiB of source that renders to about 1 MiB — the worst
+        // case, four-byte lines of `<&>`. Twelve of them are 240 KiB
+        // of source and 12 MiB of page: counting source bytes would
+        // admit every one, counting rendered bytes admits four.
+        let spiky: String = (0..5_000).map(|_| "<&>\n").collect();
+        for i in 0..12 {
+            std::fs::write(repo.join(format!("angle{i}.txt")), "x\n").unwrap();
+        }
+        commit_all(repo, "base");
+        for i in 0..12 {
+            std::fs::write(repo.join(format!("angle{i}.txt")), &spiky).unwrap();
+        }
+        let sha = commit_all(repo, "spiky");
+
+        let html = render(repo, &sha);
+        assert!(
+            html.len() <= PAGE_BYTE_BUDGET,
+            "the ceiling is the ceiling: {} bytes",
+            html.len()
+        );
+        // Some rendered, some named: a page that showed everything did
+        // not count expansion, and a page that showed nothing would
+        // pass the size assertion without proving anything.
+        assert!(html.contains("@@"), "some files are shown");
+        assert!(
+            html.contains("class=\"file named\""),
+            "and the overflow becomes rows: {} bytes, {} rows",
+            html.len(),
+            html.matches("class=\"file named\"").count()
+        );
+    }
+
+    /// A big MANY-LINE text file is shown as far as the cap and says
+    /// where the rest is. This is what the derived cap buys: pick it
+    /// too large and this file renders past the page ceiling and
+    /// becomes a row. A single long line cannot prove it — that
+    /// renders as one cheap row either way.
+    #[test]
+    fn a_big_many_line_file_is_shown_as_far_as_the_cap() {
+        let dir = diff_repo();
+        let repo = dir.path();
+        std::fs::write(repo.join("many.txt"), "x\n").unwrap();
+        commit_all(repo, "base");
+        let many: String = (0..100_000).map(|i| format!("line {i}\n")).collect();
+        assert!(many.len() > FILE_BYTE_BUDGET * 4, "bigger than the cap");
+        std::fs::write(repo.join("many.txt"), &many).unwrap();
+        let sha = commit_all(repo, "many lines");
+
+        let html = render(repo, &sha);
+        assert!(html.contains("@@"), "shown, not reduced to a row");
+        assert!(html.contains("is cut here"), "and says it was cut");
+        assert!(
+            !html.contains("class=\"file named\""),
+            "a cut patch is not also a row"
+        );
+        assert!(html.len() < PAGE_BYTE_BUDGET, "{} bytes", html.len());
+    }
+
+    /// Enough files to exhaust the ceiling on summaries alone: the
+    /// page still ends properly, and says how many it did not name.
+    #[test]
+    fn summaries_are_capped_and_the_rest_are_counted() {
+        let dir = diff_repo();
+        let repo = dir.path();
+        for i in 0..(SUMMARY_ROW_CAP + 50) {
+            std::fs::write(repo.join(format!("f{i}.bin")), [0u8, 1, 0, 2]).unwrap();
+        }
+        let sha = commit_all(repo, "many binaries");
+
+        let html = render(repo, &sha);
+        assert!(
+            html.matches("class=\"file named\"").count() <= SUMMARY_ROW_CAP,
+            "rows are capped"
+        );
+        assert!(
+            html.contains("further file(s) omitted"),
+            "and the rest are counted: {html}"
+        );
+        // The row's class must be one the stylesheet actually carries:
+        // `.file summary` is a descendant selector for a <details>'s
+        // own <summary> and matches no compound class.
+        let sheet = css();
+        for rule in [".file.named {", ".file.named .what {", ".omitted {"] {
+            assert!(sheet.contains(rule), "the stylesheet styles {rule}");
+        }
+        assert!(html.len() < PAGE_BYTE_BUDGET, "{} bytes", html.len());
+    }
+
+    /// Two-byte lines: a file of blank additions costs almost nothing
+    /// to fetch and about two hundred rendered bytes a line. No
+    /// source-to-rendered ratio survives this, so the page must
+    /// enforce its ceiling per element and still SHOW the prefix.
+    #[test]
+    fn a_file_of_very_short_lines_is_shown_and_cut() {
+        let dir = diff_repo();
+        let repo = dir.path();
+        std::fs::write(repo.join("blank.txt"), "x\n").unwrap();
+        commit_all(repo, "base");
+        let blanks: String = std::iter::repeat_n("\n", 100_000).collect();
+        std::fs::write(repo.join("blank.txt"), &blanks).unwrap();
+        let sha = commit_all(repo, "blank lines");
+
+        let html = render(repo, &sha);
+        assert!(html.len() <= PAGE_BYTE_BUDGET, "{} bytes", html.len());
+        assert!(
+            html.contains("@@"),
+            "shown, not reduced to a row: {}",
+            html.len()
+        );
+        assert!(
+            html.contains("cut here"),
+            "and says so: {}",
+            &html[html.len().saturating_sub(400)..]
+        );
+        assert!(
+            html.trim_end().ends_with("</p>") || html.trim_end().ends_with("</details>"),
+            "ending on a closed element: {}",
+            &html[html.len().saturating_sub(200)..]
+        );
+    }
+
+    /// A patch that nearly fills the ceiling, then more files than the
+    /// remainder can show. Every one of those appends is checked, so
+    /// the page ends inside the ceiling — and the files it could not
+    /// show are still NAMED, because names have their own reserve.
+    #[test]
+    fn a_nearly_full_page_still_names_what_it_cannot_show() {
+        let dir = diff_repo();
+        let repo = dir.path();
+        std::fs::write(repo.join("big.txt"), "x\n").unwrap();
+        commit_all(repo, "base");
+        let blanks: String = std::iter::repeat_n("\n", 100_000).collect();
+        std::fs::write(repo.join("big.txt"), &blanks).unwrap();
+        // `z` so these sort AFTER the patch: rows placed before the
+        // page fills up fit trivially and test nothing. Long enough
+        // that the capped rows then WANT more than their reserve,
+        // which is what makes the check on each one load-bearing.
+        for i in 0..SUMMARY_ROW_CAP {
+            let name = format!("z{i:03}-{}.bin", "n".repeat(240));
+            std::fs::write(repo.join(name), [0u8, 1, 0, 2]).unwrap();
+        }
+        let sha = commit_all(repo, "a big patch and many binaries");
+
+        let html = render(repo, &sha);
+        assert!(
+            html.len() <= PAGE_BYTE_BUDGET,
+            "the real ceiling, tail included: {} bytes",
+            html.len()
+        );
+        assert!(html.contains("@@"), "the patch is shown");
+        assert!(
+            html.contains("class=\"file named\""),
+            "and the binaries are named"
+        );
+        // The rows wanted more than their reserve, so some were
+        // tallied rather than overspending the ceiling.
+        let rows = html.matches("class=\"file named\"").count();
+        assert!(rows < SUMMARY_ROW_CAP, "rows stop at the reserve: {rows}");
+        assert!(html.contains("further file(s) omitted"), "and are counted");
+    }
+
+    /// The bug the deletion skip cannot survive on its own: a file
+    /// actually named `a*.txt` fetched as a pathspec brings back its
+    /// deleted sibling, and the renderer would show that instead.
+    #[test]
+    fn a_glob_shaped_name_shows_its_own_patch_only() {
+        let dir = diff_repo();
+        let repo = dir.path();
+        std::fs::write(repo.join("a*.txt"), "STAR_WAS_HERE\n").unwrap();
+        std::fs::write(repo.join("a!.txt"), "BANG_MUST_NOT_APPEAR\n").unwrap();
+        commit_all(repo, "base");
+        std::fs::write(repo.join("a*.txt"), "STAR_IS_CHANGED\n").unwrap();
+        std::fs::remove_file(repo.join("a!.txt")).unwrap();
+        let sha = commit_all(repo, "star and bang");
+
+        let html = render(repo, &sha);
+        assert!(
+            !html.contains("BANG_MUST_NOT_APPEAR"),
+            "a deleted body reached the page through a glob: {html}"
+        );
+        assert!(html.contains("STAR_IS_CHANGED"), "its own patch: {html}");
+        // And the deletion is still named for what it is.
+        assert!(html.contains("a!.txt"), "{html}");
+    }
+
+    /// The page's own words, un-escaped and RUN. Asserting the string
+    /// a test itself composed proves only that two copies of the same
+    /// mistake agree — and they did: `--literal-pathspecs` plus a
+    /// `:(literal)` prefix cancel out, so every command the page
+    /// printed found nothing.
+    #[test]
+    fn the_recovery_command_the_page_prints_returns_the_patch() {
+        let dir = diff_repo();
+        let repo = dir.path();
+        // An ordinary name, and one carrying both a glob character and
+        // an apostrophe.
+        let names = ["plain.txt", "it's a*.txt"];
+        for n in names {
+            std::fs::write(repo.join(n), "x\n").unwrap();
+        }
+        std::fs::write(repo.join("it's a!.txt"), "DECOY_MUST_NOT_APPEAR\n").unwrap();
+        commit_all(repo, "base");
+        // One long line each: past the acquisition cap, so both are cut
+        // and both get a notice, yet each renders as one cheap row.
+        for (i, n) in names.iter().enumerate() {
+            let line = format!("MARKER{i}{}\n", "x".repeat(400_000));
+            std::fs::write(repo.join(n), line).unwrap();
+        }
+        std::fs::remove_file(repo.join("it's a!.txt")).unwrap();
+        let sha = commit_all(repo, "long lines");
+
+        let html = render(repo, &sha);
+        let unescape = |s: &str| {
+            s.replace("&lt;", "<")
+                .replace("&gt;", ">")
+                .replace("&quot;", "\"")
+                .replace("&#39;", "'")
+                .replace("&amp;", "&")
+        };
+        let commands: Vec<String> = html
+            .split("<code>")
+            .skip(1)
+            .filter_map(|s| s.split("</code>").next())
+            .map(unescape)
+            .collect();
+        assert_eq!(
+            commands.len(),
+            2,
+            "a command per cut file: {}",
+            html.matches("cut here").count()
+        );
+
+        let mut markers_found = Vec::new();
+        for cmd in &commands {
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(cmd)
+                .current_dir(repo)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "`{cmd}` failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let text = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                text.contains("@@"),
+                "`{cmd}` returned no patch ({} bytes)",
+                text.len()
+            );
+            assert!(
+                !text.contains("DECOY_MUST_NOT_APPEAR"),
+                "`{cmd}` reached another file"
+            );
+            for i in 0..names.len() {
+                if text.contains(&format!("MARKER{i}")) {
+                    markers_found.push(i);
+                }
+            }
+        }
+        markers_found.sort_unstable();
+        assert_eq!(
+            markers_found,
+            vec![0, 1],
+            "each command returns its own file, and only it"
+        );
+    }
+
+    /// A quote in a path must not end the shell word the page offers.
+    #[test]
+    fn the_recovery_command_is_one_shell_word() {
+        assert_eq!(shell_word("it's a*.txt"), "'it'\\''s a*.txt'");
+        let long = "x".repeat(NOTE_PATH_MAX + 1);
+        let sha = CommitSha::parse("0123456789abcdef0123456789abcdef01234567").unwrap();
+        let notice = cut_notice(&sha, &long, false);
+        assert!(
+            !notice.contains("git "),
+            "a path too long to spell gets no command rather than a wrong one"
+        );
+        assert!(notice.len() < TAIL_RESERVE, "{} bytes", notice.len());
+    }
+
+    /// The ordinary case is untouched.
+    #[test]
+    fn a_small_diff_still_renders_its_hunks() {
+        let dir = diff_repo();
+        let repo = dir.path();
+        std::fs::write(repo.join("a.txt"), "one\ntwo\n").unwrap();
+        commit_all(repo, "base");
+        std::fs::write(repo.join("a.txt"), "one\ntwo\nthree\n").unwrap();
+        let sha = commit_all(repo, "add a line");
+
+        let html = render(repo, &sha);
+        assert!(html.contains("a.txt"), "{html}");
+        assert!(html.contains("@@"), "hunk header: {html}");
+        assert!(html.contains("three"), "the added line: {html}");
+        assert!(!html.contains("omitted"), "nothing was omitted: {html}");
+    }
     use super::*;
 
     #[test]
@@ -2821,7 +3555,7 @@ mod tests {
             .unwrap();
             read_prior_build(dir.path())
         };
-        for old in ["1", "2"] {
+        for old in ["1", "2", "3", "4"] {
             assert!(
                 matches!(page(old), PriorBuild::Stale),
                 "a page built by version {old} must be rewritten"

@@ -2245,10 +2245,241 @@ pub fn commit_show_patch(repo: &Path, sha: &str) -> Result<Vec<u8>, GitIoError> 
     read_git_stdout(repo, &["show", "--format=fuller", "--patch", sha])
 }
 
-/// `git show --no-color --pretty=format: <sha>` — just a commit's diff
-/// (empty pretty header), for the HTML renderer's unified-diff parser.
-pub fn commit_diff_text(repo: &Path, sha: &str) -> Result<Vec<u8>, GitIoError> {
-    read_git_stdout(repo, &["show", "--no-color", "--pretty=format:", sha])
+/// What `--numstat` had to say about one path.
+///
+/// `Binary` and `Unknown` are NOT the same thing: the first is git
+/// declining to count lines, the second is a row that could not be
+/// joined. Conflating them makes an unparsed path invisible, since a
+/// binary is deliberately never fetched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Counts {
+    Lines(u64, u64),
+    /// git's `-\t-`.
+    Binary,
+    /// No numstat row reached this path.
+    Unknown,
+}
+
+/// One changed path in a commit, from `--raw` (status) and
+/// `--numstat` (counts). Counts alone cannot say WHAT happened — a
+/// deletion, a lines-only edit and a file emptied in place are all
+/// `0  N` — so the status is read from raw and never inferred.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangedPath {
+    /// git's status letter: `A`, `D`, `M`, `R`, `C`, `T`.
+    pub status: char,
+    pub path: String,
+    /// A rename's or copy's source.
+    pub from: Option<String>,
+    pub counts: Counts,
+}
+
+impl ChangedPath {
+    /// Only a declared binary. An unjoined row is fetched like any
+    /// other text file rather than hidden as if it had no lines.
+    pub fn is_binary(&self) -> bool {
+        matches!(self.counts, Counts::Binary)
+    }
+    pub fn is_delete(&self) -> bool {
+        self.status == 'D'
+    }
+}
+
+/// Every path a commit changed, with its status and line counts and
+/// nothing else — bounded by the number of files, never by their
+/// content. This is what lets a caller decide which patches are worth
+/// fetching before fetching any of them.
+///
+/// NUL-delimited both ways: a display path cannot be split on
+/// whitespace, and a rename row carries two of them.
+pub fn commit_changed_paths(repo: &Path, sha: &str) -> Result<Vec<ChangedPath>, GitIoError> {
+    let raw = read_git_stdout(
+        repo,
+        &[
+            "show",
+            "--raw",
+            "-z",
+            "--no-renames",
+            "--pretty=format:",
+            sha,
+        ],
+    )?;
+    let nums = read_git_stdout(
+        repo,
+        &[
+            "show",
+            "--numstat",
+            "-z",
+            "--no-renames",
+            "--pretty=format:",
+            sha,
+        ],
+    )?;
+    let mut out = parse_raw_z(&String::from_utf8_lossy(&raw));
+    let counts = parse_numstat_z(&String::from_utf8_lossy(&nums));
+    for entry in &mut out {
+        entry.counts = counts.get(&entry.path).copied().unwrap_or(Counts::Unknown);
+    }
+    Ok(out)
+}
+
+/// `:<mode> <mode> <sha> <sha> <STATUS>\0<path>\0[<path2>\0]` per
+/// change. `--no-renames` keeps this to one path per row, which is
+/// what the rest of the pipeline wants; the second-path handling is
+/// kept so turning renames back on cannot silently mis-pair rows.
+fn parse_raw_z(text: &str) -> Vec<ChangedPath> {
+    let mut out = Vec::new();
+    let mut fields = text.split('\0').filter(|s| !s.is_empty()).peekable();
+    while let Some(meta) = fields.next() {
+        let Some(rest) = meta.strip_prefix(':') else {
+            continue;
+        };
+        let Some(status_field) = rest.split(' ').nth(4) else {
+            continue;
+        };
+        let Some(status) = status_field.chars().next() else {
+            continue;
+        };
+        let Some(path) = fields.next() else { break };
+        // R and C carry a second path: the row is `from` then `to`.
+        let (from, path) = if matches!(status, 'R' | 'C') {
+            match fields.next() {
+                Some(to) => (Some(path.to_string()), to.to_string()),
+                None => (None, path.to_string()),
+            }
+        } else {
+            (None, path.to_string())
+        };
+        out.push(ChangedPath {
+            status,
+            path,
+            from,
+            counts: Counts::Unknown,
+        });
+    }
+    out
+}
+
+/// `<added>\t<removed>\t<path>\0` per change under `-z`, with `-` for
+/// both counts when the content is binary.
+///
+/// Only the TWO count separators are structure; every byte after them
+/// is the path, tabs included. A filename may contain a tab, and `-z`
+/// does not quote it — splitting on all tabs silently shortens such a
+/// path, which then joins to nothing.
+fn parse_numstat_z(text: &str) -> std::collections::BTreeMap<String, Counts> {
+    let mut out = std::collections::BTreeMap::new();
+    let mut fields = text.split('\0').filter(|s| !s.is_empty()).peekable();
+    while let Some(record) = fields.next() {
+        let mut parts = record.splitn(3, '\t');
+        let added = parts.next().unwrap_or("");
+        let removed = parts.next().unwrap_or("");
+        // A rename under `-z` ends its counts with an empty path and
+        // carries `from` then `to` as their own NUL fields; the `to`
+        // is the path the rest of the pipeline knows.
+        let path = match parts.next().filter(|p| !p.is_empty()) {
+            Some(p) => p.to_string(),
+            None => {
+                let Some(first) = fields.next() else { break };
+                match fields.next() {
+                    Some(to) => to.to_string(),
+                    None => first.to_string(),
+                }
+            }
+        };
+        let counts = match (added.parse::<u64>(), removed.parse::<u64>()) {
+            (Ok(a), Ok(r)) => Counts::Lines(a, r),
+            // `-\t-` is git saying "binary", not "zero".
+            _ => Counts::Binary,
+        };
+        out.insert(path, counts);
+    }
+    out
+}
+
+/// Run a git command and keep at most `cap` bytes of its output.
+///
+/// Subprocess, not gix: what is bounded here is git's own unified-diff
+/// text, which gix cannot yet reproduce byte for byte — and a streamed
+/// pipe is the only way to stop reading it early.
+///
+/// The point is that the REST IS NEVER HELD: `git show` of a commit
+/// that deleted a hundred megabytes would otherwise be buffered whole
+/// before anyone could decline to use it. Reads `cap + 1` so output
+/// landing exactly on the cap is not reported as cut, then closes the
+/// pipe and kills AND REAPS the child — dropping a `Child` does
+/// neither, which leaves a producer writing into a closed pipe or a
+/// zombie behind it.
+pub fn bounded_git_stdout(
+    repo: &Path,
+    args: &[&str],
+    cap: usize,
+) -> Result<BoundedOutput, GitIoError> {
+    use std::io::Read as _;
+    let mut child = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| subprocess_err(format!("git {}", args.join(" ")), None, e))?;
+    let mut buf = Vec::new();
+    if let Some(stdout) = child.stdout.as_mut() {
+        // cap + 1: the extra byte is how "exactly the cap" is told
+        // apart from "more than the cap".
+        let _ = stdout.take(cap as u64 + 1).read_to_end(&mut buf);
+    }
+    drop(child.stdout.take());
+    let _ = child.kill();
+    let _ = child.wait();
+    let truncated = buf.len() > cap;
+    buf.truncate(cap);
+    Ok(BoundedOutput {
+        bytes: buf,
+        truncated,
+    })
+}
+
+/// One file's patch, at most `cap` bytes of it.
+///
+/// Fetched per path so a commit's other files cannot make this one
+/// expensive, and never fetched at all for a deletion or a binary —
+/// their bodies are the thing that filled 166 GB.
+///
+/// `--literal-pathspecs` is load-bearing, not tidiness: `--` takes a
+/// PATHSPEC, so a file actually named `a*.txt` would otherwise fetch
+/// every `a….txt` in the commit. A caller that then took the first
+/// patch would show a DIFFERENT file — including the body of a
+/// deleted one this whole path exists to never read.
+pub fn file_patch_text(
+    repo: &Path,
+    sha: &str,
+    path: &str,
+    cap: usize,
+) -> Result<BoundedOutput, GitIoError> {
+    bounded_git_stdout(
+        repo,
+        &[
+            "--literal-pathspecs",
+            "show",
+            "--no-color",
+            "--pretty=format:",
+            "--no-renames",
+            sha,
+            "--",
+            path,
+        ],
+        cap,
+    )
+}
+
+/// What a bounded read returned, and whether there was more.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundedOutput {
+    pub bytes: Vec<u8>,
+    /// True when the producer had more to say than `cap` allowed.
+    pub truncated: bool,
 }
 
 /// `(author "Name <email>", date "%ai", body)` for `sha`, all empty on
@@ -2270,6 +2501,231 @@ pub fn commit_meta(repo: &Path, sha: &CommitSha) -> (String, String, String) {
 
 #[cfg(test)]
 mod tests {
+
+    /// Counts cannot say what happened; status must come from `--raw`.
+    /// Measured: a lines-only edit, a deletion and a file emptied in
+    /// place are all `0  N` in numstat.
+    #[test]
+    fn changed_paths_carry_status_that_counts_cannot_give() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "t@e.com"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(repo.join("keep.txt"), "a\nb\nc\n").unwrap();
+        std::fs::write(repo.join("gone.txt"), "x\ny\n").unwrap();
+        std::fs::write(repo.join("empty.txt"), "p\nq\n").unwrap();
+        std::fs::write(repo.join("with space.txt"), "s\n").unwrap();
+        std::fs::write(repo.join("tab\tname.txt"), "u\n").unwrap();
+        std::fs::write(repo.join("pic.bin"), [0u8, 1, 2, 0, 3]).unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "base"]);
+
+        std::fs::write(repo.join("keep.txt"), "a\n").unwrap(); // lines removed
+        std::fs::remove_file(repo.join("gone.txt")).unwrap(); // deleted
+        std::fs::write(repo.join("empty.txt"), "").unwrap(); // emptied
+        std::fs::write(repo.join("with space.txt"), "s\nt\n").unwrap();
+        std::fs::write(repo.join("tab\tname.txt"), "u\nv\n").unwrap();
+        std::fs::write(repo.join("pic.bin"), [0u8, 9, 9, 0, 9]).unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "change"]);
+
+        let head = String::from_utf8(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        let changed = commit_changed_paths(repo, &head).unwrap();
+        let by = |p: &str| {
+            changed
+                .iter()
+                .find(|c| c.path == p)
+                .unwrap_or_else(|| panic!("{p} missing from {changed:?}"))
+        };
+        assert_eq!(by("gone.txt").status, 'D', "{changed:?}");
+        assert_eq!(by("empty.txt").status, 'M', "emptied is not deleted");
+        assert_eq!(by("keep.txt").status, 'M', "lines removed is not deleted");
+        // All three are the same counts — which is the whole point.
+        assert_eq!(by("gone.txt").counts, Counts::Lines(0, 2));
+        assert_eq!(by("empty.txt").counts, Counts::Lines(0, 2));
+        assert_eq!(by("keep.txt").counts, Counts::Lines(0, 2));
+        // A path with a space survives, because `-z` says where it ends;
+        // a path with a TAB survives only if the counts are split on
+        // the two separators and not on every tab.
+        assert_eq!(
+            by("tab\tname.txt").counts,
+            Counts::Lines(1, 0),
+            "{changed:?}"
+        );
+        assert!(!by("tab\tname.txt").is_binary(), "not binary either");
+        // A path with a space survives, because `-z` says where it ends.
+        assert_eq!(by("with space.txt").counts, Counts::Lines(1, 0));
+        // Binary is `None`, not zero.
+        assert!(by("pic.bin").is_binary(), "{changed:?}");
+        assert!(!by("keep.txt").is_binary(), "text is not binary");
+        // The predicates callers branch on read the STATUS. Derive
+        // them from the counts instead and all three become deletions.
+        assert!(by("gone.txt").is_delete());
+        assert!(!by("empty.txt").is_delete(), "emptied is not deleted");
+        assert!(!by("keep.txt").is_delete(), "lines removed is not deleted");
+    }
+
+    /// `--` takes a pathspec. A file named `a*.txt` fetched without
+    /// literal semantics brings back every `a?.txt` in the commit —
+    /// including a deleted one, whose body is the thing this pipeline
+    /// exists to never read.
+    #[test]
+    fn a_glob_shaped_name_fetches_only_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "t@e.com"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(repo.join("a*.txt"), "STAR_WAS_HERE\n").unwrap();
+        std::fs::write(repo.join("a!.txt"), "BANG_MUST_NOT_APPEAR\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "base"]);
+        std::fs::write(repo.join("a*.txt"), "STAR_IS_CHANGED\n").unwrap();
+        std::fs::remove_file(repo.join("a!.txt")).unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "star and bang"]);
+
+        let patch = file_patch_text(repo, "HEAD", "a*.txt", 1 << 16).unwrap();
+        let text = String::from_utf8_lossy(&patch.bytes).to_string();
+        assert!(text.contains("STAR_IS_CHANGED"), "its own patch: {text}");
+        assert!(
+            !text.contains("BANG_MUST_NOT_APPEAR"),
+            "and nobody else's: {text}"
+        );
+        assert_eq!(
+            text.matches("diff --git").count(),
+            1,
+            "exactly one file: {text}"
+        );
+    }
+
+    /// A filename may contain a tab, and `-z` does not quote it. Only
+    /// the two count separators are structure.
+    #[test]
+    fn a_tab_inside_a_name_still_joins_to_its_counts() {
+        let counts = parse_numstat_z("1\t0\ttab\tname.txt\0-\t-\tpic.bin\0");
+        assert_eq!(
+            counts.get("tab\tname.txt").copied(),
+            Some(Counts::Lines(1, 0)),
+            "{counts:?}"
+        );
+        assert_eq!(counts.get("pic.bin").copied(), Some(Counts::Binary));
+        // A path that joined to nothing is UNKNOWN, never binary:
+        // a binary is deliberately never fetched, so calling it one
+        // would hide the file entirely.
+        assert_eq!(counts.get("absent.txt").copied(), None);
+        let unjoined = ChangedPath {
+            status: 'M',
+            path: "absent.txt".to_string(),
+            from: None,
+            counts: Counts::Unknown,
+        };
+        assert!(
+            !unjoined.is_binary(),
+            "unknown counts must not hide a file as binary"
+        );
+    }
+
+    /// A rename row carries TWO paths, so a parser that assumed one
+    /// would pair every later row with the wrong path. `--no-renames`
+    /// means production never sees one — this keeps that from being
+    /// the only reason the parser is correct.
+    #[test]
+    fn a_rename_row_consumes_both_of_its_paths() {
+        let raw = concat!(
+            ":100644 100644 aaa bbb R100\0old name.txt\0new name.txt\0",
+            ":100644 100644 ccc ddd M\0after.txt\0",
+        );
+        let rows = parse_raw_z(raw);
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[0].status, 'R');
+        assert_eq!(rows[0].from.as_deref(), Some("old name.txt"));
+        assert_eq!(rows[0].path, "new name.txt");
+        // The row after a rename is where mis-pairing would show.
+        assert_eq!(rows[1].path, "after.txt", "{rows:?}");
+        assert_eq!(rows[1].status, 'M');
+        assert!(rows[1].from.is_none());
+    }
+
+    /// A bounded read keeps the cap and nothing more, tells the truth
+    /// about having been cut, and does not report a cut when the
+    /// output happened to land exactly on the cap.
+    #[test]
+    fn a_bounded_read_keeps_the_cap_and_says_when_there_was_more() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let git = |args: &[&str]| {
+            let _ = std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .output()
+                .unwrap();
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "t@e.com"]);
+        git(&["config", "user.name", "t"]);
+        let big: String = (0..20_000).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(repo.join("big.txt"), &big).unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "big"]);
+
+        let out = bounded_git_stdout(repo, &["show", "--pretty=format:", "HEAD"], 4096).unwrap();
+        assert_eq!(out.bytes.len(), 4096, "kept exactly the cap");
+        assert!(out.truncated, "and said there was more");
+
+        // A cap far past the output: nothing is cut, and the flag says so.
+        let all = bounded_git_stdout(
+            repo,
+            &["show", "--pretty=format:", "--numstat", "HEAD"],
+            1 << 20,
+        )
+        .unwrap();
+        assert!(!all.truncated, "a cap nobody reached is not a truncation");
+
+        // And exactly ON the cap: `cap + 1` is how that is told apart.
+        let exact = bounded_git_stdout(
+            repo,
+            &["show", "--pretty=format:", "--numstat", "HEAD"],
+            all.bytes.len(),
+        )
+        .unwrap();
+        assert!(
+            !exact.truncated,
+            "output landing on the cap is not truncated: {} bytes",
+            exact.bytes.len()
+        );
+    }
     #[test]
     fn error_display_carries_provenance() {
         // The bug this pins (tui-transient-refresh-resilience): a
