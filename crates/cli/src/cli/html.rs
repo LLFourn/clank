@@ -1788,6 +1788,28 @@ const FILE_BYTE_BUDGET: usize = 256 * 1024;
 /// filenames is also a page nobody can open.
 const SUMMARY_ROW_CAP: usize = 200;
 
+/// The most files one page will ATTEMPT to fetch.
+///
+/// The byte ceiling bounds what a page contains, not what building it
+/// costs: every file is read before the ceiling can stop it. Measured
+/// on a 48,199-path commit whose patches average 1.1 KB, the ceiling
+/// fills at ~628 files, and a fetch costs ~5.5 ms warm or ~98 ms cold
+/// — the first read of that blob from disk. That is ~60 s for one
+/// page, cold, rebuilt per snapshot.
+///
+/// Fetching fewer files is the only lever that helps. Two others were
+/// measured and rejected: acquiring by the blob shas `--raw` already
+/// carries is 5.1 ms against 5.6 ms for the pathspec form and would
+/// put patch identity back on a sha pair instead of the stated path;
+/// and batching, while a bare `git` spawn is 3.5 ms of the warm cost,
+/// does nothing for the cold case that actually hurts.
+///
+/// 50 keeps the fetch phase to roughly five seconds on that workload
+/// — an estimate from it, not a deadline; no git read here has one.
+/// Commits above 50 files were going to be truncated by the byte
+/// ceiling anyway.
+const FETCH_CAP: usize = 50;
+
 /// What became of one file's patch on the page.
 #[derive(Debug, PartialEq, Eq)]
 enum Placed {
@@ -1934,18 +1956,43 @@ fn render_changed_files(
     sha: &CommitSha,
     changed: &[crate::git_io::ChangedPath],
 ) -> String {
+    render_changed_files_with(sha, changed, |path| {
+        crate::git_io::file_patch_text(repo, sha.as_str(), path, FILE_BYTE_BUDGET).ok()
+    })
+}
+
+/// The rendering, with acquisition passed in.
+///
+/// Injected because the thing to prove about the fetch cap is work
+/// NOT DONE, which no assertion on the output can see: a fetch that
+/// errored or came back empty leaves nothing on the page and still
+/// cost its subprocess.
+fn render_changed_files_with(
+    sha: &CommitSha,
+    changed: &[crate::git_io::ChangedPath],
+    mut fetch: impl FnMut(&str) -> Option<crate::git_io::BoundedOutput>,
+) -> String {
     let mut page = DiffPage::default();
     let mut full = false;
+    let mut attempted = 0usize;
     for c in changed {
         // Never fetched — a deletion's former content and a binary's
-        // bytes are not diffs anyone reads.
+        // bytes are not diffs anyone reads. Costing nothing, these
+        // spend none of the fetch budget either, and neither do the
+        // files reached after the page filled up.
         if full || c.is_delete() || c.is_binary() {
             page.name(c);
             continue;
         }
-        let Ok(patch) =
-            crate::git_io::file_patch_text(repo, sha.as_str(), &c.path, FILE_BYTE_BUDGET)
-        else {
+        if attempted >= FETCH_CAP {
+            page.name(c);
+            continue;
+        }
+        // Counted before the attempt, not after a success: an error,
+        // an empty result and an unparsable one each cost the same
+        // subprocess as a patch that renders.
+        attempted += 1;
+        let Some(patch) = fetch(&c.path) else {
             page.name(c);
             continue;
         };
@@ -3211,6 +3258,193 @@ mod tests {
             "a path too long to spell gets no command rather than a wrong one"
         );
         assert!(notice.len() < TAIL_RESERVE, "{} bytes", notice.len());
+    }
+
+    fn a_change(status: char, path: &str) -> crate::git_io::ChangedPath {
+        crate::git_io::ChangedPath {
+            status,
+            path: path.to_string(),
+            from: None,
+            counts: match status {
+                'B' => crate::git_io::Counts::Binary,
+                _ => crate::git_io::Counts::Lines(1, 1),
+            },
+        }
+    }
+
+    /// A real one-hunk patch, small enough that the byte ceiling
+    /// cannot be what stops the page — otherwise it would mask the
+    /// fetch limit.
+    ///
+    /// Built by joining whole lines. A `\` continuation inside the
+    /// literal is not safe: cargo fmt joined the lines and kept the
+    /// indentation as CONTENT, so nothing began with `@@` and every
+    /// fixture parsed to a file with no hunks (codex on 56e3d2b).
+    fn a_tiny_patch(path: &str) -> crate::git_io::BoundedOutput {
+        let lines = [
+            format!("diff --git a/{path} b/{path}"),
+            format!("--- a/{path}"),
+            format!("+++ b/{path}"),
+            "@@ -3,3 +7,3 @@".to_string(),
+            " kept".to_string(),
+            "-old".to_string(),
+            "+new".to_string(),
+            // A context line AFTER the removal, or a removal that
+            // fails to advance the old-side number renders the same.
+            " tail".to_string(),
+        ];
+        crate::git_io::BoundedOutput {
+            bytes: format!("{}\n", lines.join("\n")).into_bytes(),
+            truncated: false,
+        }
+    }
+
+    fn a_sha() -> CommitSha {
+        CommitSha::parse("0123456789abcdef0123456789abcdef01234567").unwrap()
+    }
+
+    /// The page reads at most its cap, however many files changed.
+    /// Asserted on the FETCH COUNT, because the cost is the reading.
+    #[test]
+    fn a_page_attempts_no_more_fetches_than_its_cap() {
+        let changed: Vec<_> = (0..FETCH_CAP + 25)
+            .map(|i| a_change('M', &format!("f{i:03}.txt")))
+            .collect();
+        let mut attempts = 0usize;
+        let html = render_changed_files_with(&a_sha(), &changed, |path| {
+            attempts += 1;
+            Some(a_tiny_patch(path))
+        });
+        assert_eq!(attempts, FETCH_CAP, "the cap is on the reading");
+        assert_eq!(
+            html.matches("<details open class=\"file\">").count(),
+            FETCH_CAP,
+            "and what it read is what it shows"
+        );
+        assert_eq!(
+            html.matches("class=\"file named\"").count(),
+            25,
+            "the rest are named: {}",
+            html.len()
+        );
+        assert!(html.len() < PAGE_BYTE_BUDGET / 2, "the ceiling never bit");
+    }
+
+    /// A fetch that fails leaves nothing on the page and still cost a
+    /// subprocess, so it must spend its attempt. Counting successes
+    /// would let 39,000 failures through.
+    #[test]
+    fn a_failed_fetch_still_spends_its_attempt() {
+        let changed: Vec<_> = (0..FETCH_CAP + 25)
+            .map(|i| a_change('M', &format!("f{i:03}.txt")))
+            .collect();
+        let mut attempts = 0usize;
+        let html = render_changed_files_with(&a_sha(), &changed, |_| {
+            attempts += 1;
+            None
+        });
+        assert_eq!(attempts, FETCH_CAP, "failures are attempts");
+        assert!(!html.contains("@@"), "nothing was shown");
+        assert_eq!(
+            html.matches("class=\"file named\"").count(),
+            FETCH_CAP + 25,
+            "and every file is named"
+        );
+    }
+
+    /// An empty or unparsable result is the same subprocess as a
+    /// patch. Only the successes would be counted if the tally sat
+    /// after the parse.
+    #[test]
+    fn an_unparsable_fetch_still_spends_its_attempt() {
+        let changed: Vec<_> = (0..FETCH_CAP + 5)
+            .map(|i| a_change('M', &format!("f{i:03}.txt")))
+            .collect();
+        let mut attempts = 0usize;
+        render_changed_files_with(&a_sha(), &changed, |_| {
+            attempts += 1;
+            Some(crate::git_io::BoundedOutput {
+                bytes: Vec::new(),
+                truncated: false,
+            })
+        });
+        assert_eq!(attempts, FETCH_CAP);
+    }
+
+    /// Deletions and binaries cost nothing, so they must not spend the
+    /// budget — or a commit that deleted 39,000 files would show none
+    /// of the ones it changed.
+    #[test]
+    fn skipped_files_do_not_spend_the_fetch_budget() {
+        let mut changed: Vec<_> = (0..500)
+            .map(|i| a_change('D', &format!("gone{i:03}.txt")))
+            .collect();
+        changed.extend((0..300).map(|i| a_change('B', &format!("pic{i:03}.bin"))));
+        changed.extend((0..FETCH_CAP).map(|i| a_change('M', &format!("real{i:03}.txt"))));
+        let mut attempts = 0usize;
+        let html = render_changed_files_with(&a_sha(), &changed, |path| {
+            attempts += 1;
+            Some(a_tiny_patch(path))
+        });
+        assert_eq!(attempts, FETCH_CAP, "every real change was read");
+        assert_eq!(
+            html.matches("<details open class=\"file\">").count(),
+            FETCH_CAP,
+            "and shown"
+        );
+    }
+
+    /// Under the cap, a patch renders every row of itself: the hunk
+    /// header, the context, the removal and the addition, with the
+    /// line numbers each of them advances.
+    ///
+    /// Asserted whole. The counting tests above pass on a file with
+    /// NO hunks — `<details>` is emitted either way — so only the
+    /// complete output can tell a rendered patch from an empty shell,
+    /// which is how a fixture with a broken `@@` line went unnoticed.
+    #[test]
+    fn a_file_under_the_cap_renders_every_row_of_its_patch() {
+        let changed = vec![a_change('M', "f0.txt")];
+        let html = render_changed_files_with(&a_sha(), &changed, |path| Some(a_tiny_patch(path)));
+        let expected = concat!(
+            "  <details open class=\"file\"><summary>f0.txt</summary>\n",
+            "    <div class=\"hunk\">\n",
+            "      <div class=\"line hunk-hdr\"><span class=\"src\">@@ -3,3 +7,3 @@</span></div>\n",
+            "      <div class=\"line ctx\"><span class=\"ln old\">3</span>",
+            "<span class=\"ln new\">7</span><span class=\"sign\"> </span>",
+            "<span class=\"src\"><span class=\"hl-text hl-plain\">kept\n</span></span></div>\n",
+            "      <div class=\"line del\"><span class=\"ln old\">4</span>",
+            "<span class=\"ln new\"></span><span class=\"sign\">-</span>",
+            "<span class=\"src\"><span class=\"hl-text hl-plain\">old\n</span></span></div>\n",
+            "      <div class=\"line add\"><span class=\"ln old\"></span>",
+            "<span class=\"ln new\">8</span><span class=\"sign\">+</span>",
+            "<span class=\"src\"><span class=\"hl-text hl-plain\">new\n</span></span></div>\n",
+            "      <div class=\"line ctx\"><span class=\"ln old\">5</span>",
+            "<span class=\"ln new\">9</span><span class=\"sign\"> </span>",
+            "<span class=\"src\"><span class=\"hl-text hl-plain\">tail\n</span></span></div>\n",
+            "    </div>\n",
+            "  </details>\n",
+        );
+        assert_eq!(html, expected);
+    }
+
+    /// Under the cap nothing is withheld: every file is read and shown.
+    #[test]
+    fn every_file_under_the_cap_is_still_fetched() {
+        let changed: Vec<_> = (0..3)
+            .map(|i| a_change('M', &format!("f{i}.txt")))
+            .collect();
+        let mut attempts = 0usize;
+        let html = render_changed_files_with(&a_sha(), &changed, |path| {
+            attempts += 1;
+            Some(a_tiny_patch(path))
+        });
+        assert_eq!(attempts, 3);
+        assert_eq!(html.matches("<details open class=\"file\">").count(), 3);
+        assert!(
+            !html.contains("class=\"file named\""),
+            "nothing was withheld: {html}"
+        );
     }
 
     /// The ordinary case is untouched.
