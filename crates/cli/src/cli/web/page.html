@@ -228,6 +228,10 @@
   .row .main { overflow: hidden; text-overflow: ellipsis; }
   .row .age { color: var(--muted); font-size: 12px; }
   .row.header .main { font-weight: 700; padding-top: 6px; }
+  /* A commit that stands for its whole plan says the plan's name, and
+     wears the emphasis of the header it replaced — otherwise the name
+     reads as an ordinary subject (codex on f99d42a). */
+  .row.commit .plan { font-weight: 700; }
   .row .glyph { display: inline-block; width: 1.5em; }
   /* A row with a page in the site: the name is the link, in its own
      colour, marked only by the underline. */
@@ -772,7 +776,7 @@
     const link = (r, inner) => r.page ? `<a href="${esc(href(r.page))}" target="_blank" rel="noopener">${inner}</a>` : inner;
     $('rows').innerHTML = L.rows.map((r) => {
       const main = r.kind === 'header' ? link(r, esc(r.text))
-        : r.kind === 'commit' ? `<span class="glyph">${esc(r.glyph || '')}</span>${link(r, `<span class="sha">${esc(r.sha || '')}</span>`)} ${esc(r.text)}`
+        : r.kind === 'commit' ? `<span class="glyph">${esc(r.glyph || '')}</span>${link(r, `<span class="sha">${esc(r.sha || '')}</span>`)} ${r.stands_for ? `<span class="plan">${esc(r.stands_for)}</span>` : esc(r.text)}`
         : r.kind === 'review' ? `<span class="glyph">${esc(r.glyph || '')}</span>${link(r, `<span class="author">${esc(r.author || '')}</span>`)}${r.text ? ': ' + esc(r.text) : ''}`
         : esc(r.text);
       return `<div class="row ${r.kind}"><span class="main">${main}</span><span class="age">${esc(r.age || '')}</span></div>`;

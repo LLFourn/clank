@@ -629,6 +629,8 @@ mod tests {
                 sha,
                 subject: "do a thing".into(),
                 marker: crate::cli::log::RowMarker::Plain,
+
+                stands_for: None,
             },
         ];
         s
@@ -689,6 +691,8 @@ mod tests {
             sha: sha(s),
             subject: "x".into(),
             marker: crate::cli::log::RowMarker::Plain,
+
+            stands_for: None,
         };
         let review = |a: &str| OnelineRow::Review {
             at: None,

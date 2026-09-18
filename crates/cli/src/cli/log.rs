@@ -751,6 +751,17 @@ pub(crate) enum OnelineRow {
         /// surrounding umbrella — `~`), `Finish` (the plan's finalize
         /// commit — `⚑`), or `Plain`.
         marker: RowMarker,
+        /// The plan this row also STANDS FOR, when that plan is
+        /// finished and this is its only commit. The umbrella exists
+        /// to group several commits; with one there is nothing to
+        /// group, so the header is suppressed and the name is drawn
+        /// here instead of the subject.
+        ///
+        /// Still a `Commit`, deliberately: reviews bind to their sha
+        /// by scanning forward for the next one, and the ledger
+        /// attributes pages the same way in reverse. A separate row
+        /// kind would orphan every review above it (codex on d420716).
+        stands_for: Option<String>,
     },
     /// A pre-adoption Git commit. It is intentionally a distinct row kind:
     /// no plan umbrella, marker, reviews, or fold attribution can attach to
@@ -792,9 +803,17 @@ pub(crate) enum OnelineRow {
 /// TUI's log pane (and testable without a repo): repo chunks through
 /// [`oneline_rows`], github entries as [`OnelineRow::Github`] rows in
 /// timeline position.
+/// Finalize SHAs that stand for their whole plan, mapped to its name.
+///
+/// Keyed by SHA, never by name: `FinishedPlan` is an INSTANCE record
+/// and a plan name can recur, so a later plan called `foo` must not
+/// inherit an earlier `foo`'s eligibility (codex on 5b1e87c).
+pub(crate) type StandsFor = std::collections::BTreeMap<String, String>;
+
 pub(crate) fn oneline_items_rows(
     items: &[TimelineItem],
     reviews: &std::collections::BTreeMap<String, Vec<Review>>,
+    stands_for: &StandsFor,
 ) -> Vec<OnelineRow> {
     let mut out = Vec::new();
     let mut chunk: Vec<&LogEvent> = Vec::new();
@@ -802,7 +821,7 @@ pub(crate) fn oneline_items_rows(
         match item {
             TimelineItem::Repo(e) => chunk.push(e),
             TimelineItem::Plain(commit) => {
-                out.extend(oneline_rows(&chunk, reviews));
+                out.extend(oneline_rows(&chunk, reviews, stands_for));
                 chunk.clear();
                 out.push(OnelineRow::PlainCommit {
                     sha: commit.meta.sha.clone(),
@@ -812,7 +831,7 @@ pub(crate) fn oneline_items_rows(
                 });
             }
             TimelineItem::Github(idx, g) => {
-                out.extend(oneline_rows(&chunk, reviews));
+                out.extend(oneline_rows(&chunk, reviews, stands_for));
                 chunk.clear();
                 out.push(OnelineRow::Github {
                     event_idx: *idx,
@@ -824,7 +843,7 @@ pub(crate) fn oneline_items_rows(
             }
         }
     }
-    out.extend(oneline_rows(&chunk, reviews));
+    out.extend(oneline_rows(&chunk, reviews, stands_for));
     out
 }
 
@@ -839,6 +858,7 @@ pub(crate) fn oneline_items_rows(
 pub(crate) fn oneline_rows(
     events: &[&LogEvent],
     reviews: &std::collections::BTreeMap<String, Vec<Review>>,
+    stands_for: &StandsFor,
 ) -> Vec<OnelineRow> {
     use clank_core::repo_state::{UmbrellaKey, parse_subject, umbrella_sections};
     let mut out = Vec::new();
@@ -851,9 +871,19 @@ pub(crate) fn oneline_rows(
         // per-row, so there is no "adhoc" header. A header prints only
         // for a real plan umbrella; a leading ad-hoc run (no plan)
         // renders its marked rows with no header (adhoc-commit-marker).
-        if umbrella_plan.is_some() {
+        // A finished plan of ONE commit needs no umbrella: there is
+        // nothing to group, and the row below carries the name. Asked
+        // of the run's own commits, so a chunk holding only part of a
+        // plan cannot answer for the whole of it.
+        let collapses = |plan: &str| {
+            run.iter()
+                .any(|e| stands_for.get(e.sha().as_str()).is_some_and(|p| p == plan))
+        };
+        if let Some(plan) = umbrella_plan.as_deref()
+            && !collapses(plan)
+        {
             out.push(OnelineRow::Header {
-                plan: umbrella_plan.clone(),
+                plan: Some(plan.to_string()),
             });
         }
         for event in run {
@@ -917,6 +947,7 @@ pub(crate) fn oneline_rows(
                 at: event.ts(),
                 subject,
                 marker: RowMarker::of(event),
+                stands_for: stands_for.get(sha.as_str()).cloned(),
             });
         }
     }
@@ -1043,7 +1074,7 @@ fn print_oneline_events(
     reviews: &std::collections::BTreeMap<String, Vec<Review>>,
     c: bool,
 ) {
-    for row in oneline_rows(events, reviews) {
+    for row in oneline_rows(events, reviews, &Default::default()) {
         match row {
             // oneline_rows never produces these; the interleaving
             // caller prints github rows itself.
@@ -1415,7 +1446,7 @@ mod json_output_tests {
         let gh_events = vec![gh(150, "arrived", true)];
         let items = interleave(&events, &gh_events);
         let reviews = std::collections::BTreeMap::new();
-        let rows = oneline_items_rows(&items, &reviews);
+        let rows = oneline_items_rows(&items, &reviews, &Default::default());
         assert!(
             matches!(&rows[0], OnelineRow::Github { unhandled: true, line, .. } if line.contains("o/r#12")),
             "{rows:?}"
@@ -1617,6 +1648,120 @@ mod tests {
         CommitSha::parse(&format!("{s:0<40}")).unwrap()
     }
 
+    /// A finished plan of ONE commit loses its umbrella and says its
+    /// name on the commit row. A plan with two keeps both.
+    #[test]
+    fn a_one_commit_finished_plan_collapses_and_a_two_commit_one_does_not() {
+        let one = [LogEvent::PlanFinalized {
+            plan: PlanKey::parse("solo").unwrap(),
+            sha: sha("aa"),
+            ts: 2,
+            subject: "[solo] did the thing".into(),
+        }];
+        let stands: super::StandsFor = [(sha("aa").as_str().to_string(), "solo".to_string())]
+            .into_iter()
+            .collect();
+        let refs: Vec<&LogEvent> = one.iter().collect();
+        let rows = oneline_rows(&refs, &Default::default(), &stands);
+        assert!(
+            !rows.iter().any(|r| matches!(r, OnelineRow::Header { .. })),
+            "no umbrella over a single commit: {rows:?}"
+        );
+        match &rows[0] {
+            OnelineRow::Commit {
+                sha: s,
+                marker,
+                stands_for,
+                ..
+            } => {
+                assert_eq!(s, &sha("aa"));
+                assert_eq!(*marker, RowMarker::Finish, "the flag still marks it");
+                assert_eq!(stands_for.as_deref(), Some("solo"));
+            }
+            other => panic!("expected one commit row, got {other:?}"),
+        }
+
+        // Two commits: the umbrella earns its place.
+        let two = [
+            LogEvent::PlanIntro {
+                plan: PlanKey::parse("duo").unwrap(),
+                sha: sha("cc"),
+                ts: 1,
+                subject: "[duo] intro".into(),
+            },
+            LogEvent::PlanFinalized {
+                plan: PlanKey::parse("duo").unwrap(),
+                sha: sha("dd"),
+                ts: 2,
+                subject: "[duo] wrap up".into(),
+            },
+        ];
+        let refs: Vec<&LogEvent> = two.iter().collect();
+        let rows = oneline_rows(&refs, &Default::default(), &Default::default());
+        assert!(
+            rows.iter()
+                .any(|r| matches!(r, OnelineRow::Header { plan: Some(p) } if p == "duo")),
+            "a two-commit plan keeps its umbrella: {rows:?}"
+        );
+    }
+
+    /// The case the first draft of this plan would have got wrong: a
+    /// GitHub event splits a two-commit plan into chunks, so one chunk
+    /// holds ONLY its finalize. Eligibility comes from the fold, not
+    /// from what a chunk happens to contain, so it must not collapse.
+    #[test]
+    fn a_plan_split_across_chunks_is_not_a_one_commit_plan() {
+        let intro = LogEvent::PlanIntro {
+            plan: PlanKey::parse("split").unwrap(),
+            sha: sha("11"),
+            ts: 1,
+            subject: "[split] intro".into(),
+        };
+        let fin = LogEvent::PlanFinalized {
+            plan: PlanKey::parse("split").unwrap(),
+            sha: sha("22"),
+            ts: 3,
+            subject: "[split] wrap up".into(),
+        };
+        let event = crate::cli::github_timeline::MergedEvent {
+            at: 2,
+            repo: "o/r".into(),
+            event: "pr_comment".into(),
+            detail: None,
+            number: Some(1),
+            title: None,
+            actor: None,
+            url: None,
+            seen_by: Vec::new(),
+            members: Vec::new(),
+            unhandled: false,
+            baseline: false,
+        };
+        let items = vec![
+            TimelineItem::Repo(&fin),
+            TimelineItem::Github(0, &event),
+            TimelineItem::Repo(&intro),
+        ];
+        // The fold says this plan is TWO commits, so nothing is
+        // eligible — even though the first chunk shows one.
+        let rows = oneline_items_rows(&items, &Default::default(), &Default::default());
+        let headers = rows
+            .iter()
+            .filter(|r| matches!(r, OnelineRow::Header { plan: Some(p) } if p == "split"))
+            .count();
+        assert_eq!(headers, 2, "each chunk keeps its umbrella: {rows:?}");
+        assert!(
+            rows.iter().all(|r| !matches!(
+                r,
+                OnelineRow::Commit {
+                    stands_for: Some(_),
+                    ..
+                }
+            )),
+            "and no row claims to stand for the whole plan: {rows:?}"
+        );
+    }
+
     #[test]
     fn oneline_rows_round_trip_shapes() {
         // Concern 2 (ruthless 54c37f6): the factoring must preserve
@@ -1667,7 +1812,7 @@ mod tests {
                 body: String::new(),
             }],
         );
-        let lines = oneline_plain_lines(&oneline_rows(&refs, &reviews));
+        let lines = oneline_plain_lines(&oneline_rows(&refs, &reviews, &Default::default()));
         // Umbrella shape (log-plan-umbrellas + adhoc-commit-marker): one
         // plan header at col 0; each commit LEADS with its 1-col marker icon
         // (planning `✎`, finish `⚑`, ad-hoc `~`), then the sha, then the
@@ -1734,7 +1879,7 @@ mod tests {
             },
         ];
         let refs: Vec<&LogEvent> = events.iter().collect();
-        let rows = oneline_rows(&refs, &Default::default());
+        let rows = oneline_rows(&refs, &Default::default(), &Default::default());
         // Exactly one header (foo) — no "adhoc" header.
         let headers: Vec<_> = rows
             .iter()
@@ -1766,12 +1911,16 @@ mod tests {
             sha: sha("aa"),
             subject: "x".into(),
             marker: RowMarker::Impl,
+
+            stands_for: None,
         };
         let adhoc_row = OnelineRow::Commit {
             at: 0,
             sha: sha("bb"),
             subject: "x".into(),
             marker: RowMarker::AdHoc,
+
+            stands_for: None,
         };
         let lines = oneline_plain_lines(&[impl_row, adhoc_row]);
         let col = |line: &str| line.chars().position(|c| c == 'x').unwrap();
@@ -1834,7 +1983,7 @@ mod tests {
             subject: "[foo,bar] shared change".into(),
         };
         let events = [&e1, &e2];
-        let rows = oneline_rows(&events, &Default::default());
+        let rows = oneline_rows(&events, &Default::default(), &Default::default());
         let lines = oneline_plain_lines(&rows);
         assert_eq!(lines[0], "foo", "umbrella header at col 0");
         assert!(

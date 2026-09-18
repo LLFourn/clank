@@ -736,6 +736,42 @@ const ok = (name, cond, detail = '') => out.push(`${cond ? 'PASS' : 'FAIL'}  ${n
     ok('no errors around naming', errors.length === 0, errors.join('; '));
   }
 
+  // ---- a plan that is one commit reads as one line
+  {
+    const { page, errors } = await open();
+    const ledger = (rows) => page.evaluate((list) => window.__send('status', {
+      facts: {
+        project: 'the-repo', lamp: 'l', plan: 'foo', hue: '#5f5fff', correction: null,
+        agents: [{ label: 'claude', role: 'master', owes: null, last: null, transcript: false, ended: null }],
+        ledger: { plan: 'foo', gate: 'unreviewed', dirty: null, queue: 0, stash: 0, blocks: [], rows: list },
+      },
+    }), rows);
+
+    await ledger([
+      { kind: 'commit', glyph: '⚑', sha: 'abc1230', text: 'solo', stands_for: 'solo', author: null, verdict: null, age: '2m', page: 'commit/abc1230.html' },
+      { kind: 'header', glyph: null, sha: null, text: 'duo', author: null, verdict: null, age: null, page: 'plan/duo.html' },
+      { kind: 'commit', glyph: '⚑', sha: 'def4560', text: 'wrap it up', author: null, verdict: null, age: '9m', page: 'commit/def4560.html' },
+    ]);
+    await page.click('#more');
+    await page.waitForTimeout(40);
+
+    const compact = page.locator('.row.commit').first();
+    ok('a collapsed row wears the header\'s emphasis',
+       await compact.locator('.plan').count() === 1);
+    ok('and the name is the plan\'s', (await compact.locator('.plan').textContent()) === 'solo');
+    ok('with its sha still beside it', (await compact.locator('.sha').textContent()) === 'abc1230');
+    ok('and its own commit page, not the plan\'s',
+       (await compact.locator('a').getAttribute('href')) === 'html/commit/abc1230.html',
+       await compact.locator('a').getAttribute('href'));
+
+    const plain = page.locator('.row.commit').nth(1);
+    ok('an ordinary commit still shows its subject',
+       (await plain.textContent()).includes('wrap it up'));
+    ok('and wears no plan emphasis', await plain.locator('.plan').count() === 0);
+    ok('the two-commit plan keeps its header', await page.locator('.row.header').count() === 1);
+    ok('no errors around the ledger', errors.length === 0, errors.join('; '));
+  }
+
   // ---- the composer is a bubble under the column it belongs to
   {
     const { page, errors } = await open();

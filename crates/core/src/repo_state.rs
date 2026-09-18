@@ -251,6 +251,17 @@ impl LogEvent {
         }
     }
 
+    /// The commit this event is about.
+    pub fn sha(&self) -> &CommitSha {
+        match self {
+            LogEvent::PlanIntro { sha, .. }
+            | LogEvent::PlanCommit { sha, .. }
+            | LogEvent::PlanFinalized { sha, .. }
+            | LogEvent::PlanDeleted { sha, .. }
+            | LogEvent::AdHoc { sha, .. } => sha,
+        }
+    }
+
     /// The plan this event belongs to, or `None` for ad-hoc.
     pub fn plan(&self) -> Option<&PlanKey> {
         match self {

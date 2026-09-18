@@ -71,6 +71,11 @@ pub struct StatusSnapshot {
     /// the snapshot means scrolling never rebuilds the whole repo merely to
     /// rediscover where plain Git history begins.
     pub(crate) log_adopted_at: Option<crate::lifecycle::CommitSha>,
+    /// Finalize SHAs that stand for their whole plan — carried so a
+    /// LATER page collapses the same rows the first one did, rather
+    /// than answering from whatever that page happens to contain
+    /// (codex on 5b1e87c).
+    pub(crate) log_stands_for: crate::cli::log::StandsFor,
     /// Cursor for the next older TUI page. `None` means the currently loaded
     /// rows reach the repository root.
     pub(crate) log_next: Option<crate::cli::log::HistoryCursor>,
@@ -544,6 +549,7 @@ impl StatusSnapshot {
             stash,
             log_rows,
             log_adopted_at: state.fold.adopted_at.clone(),
+            log_stands_for: stands_for_plans(state),
             log_next,
             github_events,
             log_decorations,
@@ -962,6 +968,7 @@ async fn recent_log_rows(repo: &Path, state: &RepoState) -> TuiLogRead {
                 LOG_WINDOW,
                 state.fold.adopted_at.as_ref(),
                 true,
+                &stands_for_plans(state),
             )
             .await
         }
@@ -1021,8 +1028,32 @@ pub(crate) async fn tui_log_page(
     cursor: &crate::cli::log::HistoryCursor,
     page_size: usize,
     adopted_at: Option<&crate::lifecycle::CommitSha>,
+    stands_for: &crate::cli::log::StandsFor,
 ) -> TuiLogRead {
-    log_rows_page(repo, cursor, page_size, adopted_at, false).await
+    log_rows_page(repo, cursor, page_size, adopted_at, false, stands_for).await
+}
+
+/// Which finalize commits stand for their whole plan: a finished plan
+/// whose intro IS its finalize has one commit, and one commit needs no
+/// umbrella over it.
+///
+/// Read from the FOLD, so the answer does not depend on what any
+/// window or chunk happens to show — a plan whose earlier commits fell
+/// outside the page must not look like a plan that never had them
+/// (codex on d420716).
+pub(crate) fn stands_for_plans(state: &RepoState) -> crate::cli::log::StandsFor {
+    state
+        .fold
+        .finished_plans
+        .iter()
+        .filter(|f| f.intro == f.finalized_at)
+        .map(|f| {
+            (
+                f.finalized_at.as_str().to_string(),
+                f.plan.as_str().to_string(),
+            )
+        })
+        .collect()
 }
 
 /// Rows AND the index-aligned merged events — the TUI sets both on
@@ -1031,9 +1062,10 @@ pub(crate) async fn tui_log_with_events(
     repo: &Path,
     window: usize,
     adopted_at: Option<&crate::lifecycle::CommitSha>,
+    stands_for: &crate::cli::log::StandsFor,
 ) -> TuiLogRead {
     match crate::cli::log::git_rev_parse(repo, "HEAD") {
-        Some(head) => log_rows_windowed(repo, &head, window, adopted_at, true).await,
+        Some(head) => log_rows_windowed(repo, &head, window, adopted_at, true, stands_for).await,
         None => TuiLogRead::default(),
     }
 }
@@ -1045,12 +1077,21 @@ async fn log_rows_windowed(
     window: usize,
     adopted_at: Option<&crate::lifecycle::CommitSha>,
     include_github: bool,
+    stands_for: &crate::cli::log::StandsFor,
 ) -> TuiLogRead {
     let cursor = crate::cli::log::HistoryCursor {
         tip: head.clone(),
         post_adoption: adopted_at.is_some(),
     };
-    log_rows_page(repo, &cursor, window, adopted_at, include_github).await
+    log_rows_page(
+        repo,
+        &cursor,
+        window,
+        adopted_at,
+        include_github,
+        stands_for,
+    )
+    .await
 }
 
 async fn log_rows_page(
@@ -1059,6 +1100,7 @@ async fn log_rows_page(
     window: usize,
     adopted_at: Option<&crate::lifecycle::CommitSha>,
     include_github: bool,
+    stands_for: &crate::cli::log::StandsFor,
 ) -> TuiLogRead {
     use clank_core::repo_state::LogEvent;
 
@@ -1093,7 +1135,9 @@ async fn log_rows_page(
         .iter()
         .map(|n| crate::cli::log::OnelineRow::Notice(n.clone()))
         .collect();
-    rows.extend(crate::cli::log::oneline_items_rows(&items, &reviews));
+    rows.extend(crate::cli::log::oneline_items_rows(
+        &items, &reviews, stands_for,
+    ));
     TuiLogRead {
         rows,
         github_events: snap.events,
@@ -1587,6 +1631,100 @@ mod watch_failure_tests {
 
 #[cfg(test)]
 mod dirty_and_wake_tests {
+
+    /// The refresh read collapses what the first read collapsed.
+    ///
+    /// `tui_log_with_events` is the refresh path, and it used to be
+    /// handed an empty map — so a single-commit plan showed compact on
+    /// open and grew its header back on the next tick, and a plan
+    /// finished while the TUI was up never showed compact at all
+    /// (codex on f99d42a).
+    #[tokio::test]
+    async fn the_refresh_read_collapses_what_the_first_read_did() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(repo.join("README"), "base\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "base"]);
+        let adopted = crate::lifecycle::CommitSha::parse(&git(&["rev-parse", "HEAD"])).unwrap();
+        // One commit that both introduces and finishes the plan —
+        // what a squashed plan looks like on disk.
+        std::fs::create_dir_all(repo.join(".clank/finished")).unwrap();
+        std::fs::write(repo.join(".clank/finished/solo.md"), "# solo\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "[solo] did the whole thing"]);
+        let sha = git(&["rev-parse", "HEAD"]);
+
+        let stands: crate::cli::log::StandsFor =
+            [(sha.clone(), "solo".to_string())].into_iter().collect();
+        let read = tui_log_with_events(repo, 30, Some(&adopted), &stands).await;
+        assert!(
+            read.rows.iter().any(|r| matches!(
+                r,
+                crate::cli::log::OnelineRow::Commit { stands_for: Some(p), .. } if p == "solo"
+            )),
+            "the refresh read collapses it: {:?}",
+            read.rows
+        );
+        assert!(
+            !read
+                .rows
+                .iter()
+                .any(|r| matches!(r, crate::cli::log::OnelineRow::Header { plan: Some(p) } if p == "solo")),
+            "and drops the umbrella: {:?}",
+            read.rows
+        );
+    }
+
+    /// Which finished plans stand for themselves: the ones whose intro
+    /// IS their finalize. Read from the fold, so a plan split across
+    /// chunks or falling off the end of a page cannot look like one
+    /// (codex on d420716).
+    #[test]
+    fn only_a_finished_plan_of_one_commit_stands_for_itself() {
+        use clank_core::repo_state::FinishedPlan;
+        let sha = |s: &str| crate::lifecycle::CommitSha::parse(&format!("{s:0<40}")).unwrap();
+        let plan = |s: &str| crate::lifecycle::PlanKey::parse(s).unwrap();
+        let mut state = RepoState::empty(std::path::PathBuf::from("/tmp"));
+        state.fold.finished_plans = vec![
+            // One commit: intro and finalize are the same commit.
+            FinishedPlan {
+                plan: plan("solo"),
+                intro: sha("aa"),
+                finalized_at: sha("aa"),
+            },
+            // Two: they are not.
+            FinishedPlan {
+                plan: plan("duo"),
+                intro: sha("bb"),
+                finalized_at: sha("cc"),
+            },
+        ];
+        let stands = stands_for_plans(&state);
+        assert_eq!(
+            stands.get(sha("aa").as_str()).map(String::as_str),
+            Some("solo"),
+            "the one-commit plan stands for itself"
+        );
+        assert!(
+            !stands.values().any(|p| p == "duo"),
+            "the two-commit plan does not: {stands:?}"
+        );
+        assert_eq!(stands.len(), 1, "and nothing else crept in: {stands:?}");
+    }
     use super::*;
     use std::process::Command;
 
@@ -1790,7 +1928,8 @@ mod dirty_and_wake_tests {
         assert!(head_row.refs.iter().any(|name| name == "main"));
 
         let items = crate::cli::log::interleave_with_plain(&[], &history.plain, &[]);
-        let rows = crate::cli::log::oneline_items_rows(&items, &Default::default());
+        let rows =
+            crate::cli::log::oneline_items_rows(&items, &Default::default(), &Default::default());
         assert_eq!(rows.len(), 3);
         assert!(
             rows.iter()
@@ -1837,7 +1976,8 @@ mod dirty_and_wake_tests {
 
         let folded: Vec<&clank_core::repo_state::LogEvent> = history.folded.iter().rev().collect();
         let items = crate::cli::log::interleave_with_plain(&folded, &history.plain, &[]);
-        let rows = crate::cli::log::oneline_items_rows(&items, &Default::default());
+        let rows =
+            crate::cli::log::oneline_items_rows(&items, &Default::default(), &Default::default());
         let actual: Vec<_> = rows
             .iter()
             .filter_map(|row| match row {
@@ -1927,7 +2067,7 @@ mod dirty_and_wake_tests {
     async fn unborn_repo_has_no_log_rows() {
         let dir = tempfile::tempdir().unwrap();
         git(dir.path(), &["init", "--quiet", "-b", "main"]);
-        let read = tui_log_with_events(dir.path(), 30, None).await;
+        let read = tui_log_with_events(dir.path(), 30, None, &Default::default()).await;
         assert!(read.rows.is_empty());
         assert!(read.github_events.is_empty());
         assert!(read.next.is_none());
@@ -2387,6 +2527,7 @@ mod dirty_and_wake_tests {
             stash: Vec::new(),
             log_rows: Vec::new(),
             log_adopted_at: None,
+            log_stands_for: Default::default(),
             log_next: None,
             github_events: Vec::new(),
             log_decorations: Default::default(),

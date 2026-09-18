@@ -906,6 +906,7 @@ pub(super) fn log_row_spans(
             sha,
             subject,
             marker,
+            stands_for,
             ..
         } => {
             // The 1-col marker icon LEADS every commit row (finish `⚑`, impl
@@ -917,11 +918,15 @@ pub(super) fn log_row_spans(
                 RowMarker::AdHoc => colored("33", g),  // yellow (unchanged)
                 _ => plain(g),
             };
-            let mut spans = vec![
-                icon,
-                dim(format!(" {} ", &sha.as_str()[..7])),
-                plain(subject.clone()),
-            ];
+            // A finished plan of one commit says its NAME here, in the
+            // header's own highlight, and the header above it is gone:
+            // the subject of such a commit is the plan's finish message,
+            // so printing both said one thing twice.
+            let said = match stands_for {
+                Some(plan) => Span(Style::Highlight, plan.clone()),
+                None => plain(subject.clone()),
+            };
+            let mut spans = vec![icon, dim(format!(" {} ", &sha.as_str()[..7])), said];
             // Branch tips on this commit (tui-log-branch-decorations):
             // git-decorate colors — local branches green, remote-tracking
             // red — inside dim parens so the names read as annotation,
@@ -3891,6 +3896,8 @@ mod tests {
             sha: crate::lifecycle::CommitSha::parse(&format!("{:0<40}", "abc1234")).unwrap(),
             subject: subject.to_string(),
             marker: crate::cli::log::RowMarker::Plain,
+
+            stands_for: None,
         }
     }
 
@@ -3918,6 +3925,8 @@ mod tests {
             sha: crate::lifecycle::CommitSha::parse(sha).unwrap(),
             subject: subject.to_string(),
             marker: crate::cli::log::RowMarker::Plain,
+
+            stands_for: None,
         };
         s.log_rows = vec![row(&tip_sha, "tip subject"), row(&old_sha, "older subject")];
         s.log_decorations = [(
@@ -6881,6 +6890,8 @@ mod tests {
                 sha: crate::lifecycle::CommitSha::parse(&format!("{:0<40}", "abc1234")).unwrap(),
                 subject: "do a thing".into(),
                 marker: crate::cli::log::RowMarker::Plain,
+
+                stands_for: None,
             },
         ];
         let out = render(&s, 40, 80);
@@ -6932,6 +6943,8 @@ mod tests {
             sha: crate::lifecycle::CommitSha::parse(&format!("{:0<40}", "abc1234")).unwrap(),
             subject: "a subject of some length".into(),
             marker: crate::cli::log::RowMarker::Plain,
+
+            stands_for: None,
         }];
         let wide = visible(line_with(&render(&s, 40, 80), "a subject"));
         assert!(wide.starts_with("2d ") && wide.ends_with("a subject of some length"));

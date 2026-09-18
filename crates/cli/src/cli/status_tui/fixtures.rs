@@ -118,6 +118,7 @@ pub(crate) fn snap(plans: Vec<PlanWorkState>, queue: Vec<&str>) -> StatusSnapsho
         stash: Vec::new(),
         log_rows: Vec::new(),
         log_adopted_at: None,
+        log_stands_for: Default::default(),
         log_next: None,
         github_events: Vec::new(),
         log_decorations: Default::default(),

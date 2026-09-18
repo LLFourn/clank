@@ -1712,6 +1712,12 @@ pub(crate) struct LedgerRow {
     pub(crate) text: String,
     pub(crate) author: Option<String>,
     pub(crate) verdict: Option<String>,
+    /// The plan this commit row stands for, when it is that plan's
+    /// only commit. Carried SEPARATELY from `text` so the page can
+    /// give the name the emphasis the header it replaced had — text
+    /// alone left it reading as an ordinary subject (codex on
+    /// f99d42a).
+    pub(crate) stands_for: Option<String>,
     pub(crate) age: Option<String>,
     /// The row's page in the `clank html` site, relative to its root
     /// (`commit/<sha>.html`, `plan/<stem>.html`); a review's is its
@@ -1969,6 +1975,7 @@ fn ledger_row(row: &crate::cli::log::OnelineRow) -> LedgerRow {
             text: plan.clone().unwrap_or_else(|| "adhoc".into()),
             author: None,
             verdict: None,
+            stands_for: None,
             age,
             page: plan.as_ref().map(|p| format!("plan/{p}.html")),
         },
@@ -1976,12 +1983,18 @@ fn ledger_row(row: &crate::cli::log::OnelineRow) -> LedgerRow {
             sha,
             subject,
             marker,
+            stands_for,
             ..
         } => LedgerRow {
+            // Still `commit`: the page keeps its own kind, its own
+            // sha and its own link, and a review above it still
+            // attributes to it. Only the words change — the plan's
+            // name where its finish message would have been.
             kind: "commit".into(),
             glyph: Some(marker.glyph().to_string()),
             sha: Some(short(sha)),
-            text: subject.clone(),
+            text: stands_for.clone().unwrap_or_else(|| subject.clone()),
+            stands_for: stands_for.clone(),
             author: None,
             verdict: None,
             age,
@@ -1996,6 +2009,7 @@ fn ledger_row(row: &crate::cli::log::OnelineRow) -> LedgerRow {
             text: subject.clone(),
             author: None,
             verdict: None,
+            stands_for: None,
             age,
             page: commit_page(sha),
         },
@@ -2011,6 +2025,7 @@ fn ledger_row(row: &crate::cli::log::OnelineRow) -> LedgerRow {
             text: summary.clone(),
             author: Some(author.clone()),
             verdict: Some(verdict_word(*verdict).into()),
+            stands_for: None,
             age,
             page: None,
         },
@@ -2021,6 +2036,7 @@ fn ledger_row(row: &crate::cli::log::OnelineRow) -> LedgerRow {
             text: line.clone(),
             author: None,
             verdict: None,
+            stands_for: None,
             age,
             page: None,
         },
@@ -2031,6 +2047,7 @@ fn ledger_row(row: &crate::cli::log::OnelineRow) -> LedgerRow {
             text: n.clone(),
             author: None,
             verdict: None,
+            stands_for: None,
             age,
             page: None,
         },
@@ -2602,6 +2619,7 @@ pub(crate) async fn run_tui(
                     &tip,
                     page_size,
                     snapshot.log_adopted_at.as_ref(),
+                    &snapshot.log_stands_for,
                 )
                 .await;
                 log.window += page_size;
@@ -3902,8 +3920,24 @@ pub(crate) async fn run_tui(
                     .ok()
                     .and_then(|fresh| fresh.log_adopted_at.as_ref())
                     .or(snapshot.log_adopted_at.as_ref());
-                let fresh =
-                    crate::cli::status::tui_log_with_events(&repo, log.window, adopted_at).await;
+                // Eligibility from the REBUILT state where there is
+                // one, the retained snapshot where the rebuild
+                // failed. Reading it from neither — which is what an
+                // empty map here did — collapsed a plan on first load
+                // and gave it back its header on the next refresh
+                // (codex on f99d42a).
+                let stands_for = rebuilt
+                    .as_ref()
+                    .ok()
+                    .map(|fresh| fresh.log_stands_for.clone())
+                    .unwrap_or_else(|| snapshot.log_stands_for.clone());
+                let fresh = crate::cli::status::tui_log_with_events(
+                    &repo,
+                    log.window,
+                    adopted_at,
+                    &stands_for,
+                )
+                .await;
                 let refresh_ok =
                     apply_refresh(&mut snapshot, fresh.rows, rebuilt, &mut refresh_failures);
                 remote.observe(&snapshot);
@@ -5282,6 +5316,59 @@ pub(crate) mod tests {
         );
     }
 
+    /// A collapsed row is still a COMMIT to everything that navigates
+    /// by commits: a review above it opens its own sha, and the row
+    /// keeps its own commit page. Only the words change.
+    #[test]
+    fn a_collapsed_row_still_owns_its_sha_and_its_reviews() {
+        use crate::cli::log::{OnelineRow, RowMarker};
+        let sha = clank_core::ids::CommitSha::parse(&format!("{:0<40}", "abc")).unwrap();
+        let rows = vec![
+            OnelineRow::Review {
+                verdict: clank_core::vocab::Verdict::Finished,
+                author: "codex".into(),
+                summary: "ship it".into(),
+                at: Some(crate::age::now() - 60),
+            },
+            OnelineRow::Commit {
+                sha: sha.clone(),
+                at: crate::age::now() - 120,
+                subject: "[solo] did the thing".into(),
+                marker: RowMarker::Finish,
+                stands_for: Some("solo".into()),
+            },
+        ];
+        let ledger = ledger_rows(&rows);
+        let commit = ledger
+            .iter()
+            .find(|r| r.kind == "commit")
+            .expect("the collapsed row is still a commit");
+        assert_eq!(
+            commit.text, "solo",
+            "it says the plan's name, not the finish message"
+        );
+        assert_eq!(
+            commit.stands_for.as_deref(),
+            Some("solo"),
+            "and says WHY it says that, so the page can give the name the \
+             emphasis the header it replaced had"
+        );
+        assert_eq!(commit.sha.as_deref(), Some(&sha.as_str()[..7]));
+        assert_eq!(
+            commit.page.as_deref(),
+            Some(format!("commit/{}.html", sha.as_str()).as_str()),
+            "and keeps its own commit page, not the plan's"
+        );
+        let review = ledger
+            .iter()
+            .find(|r| r.kind == "review")
+            .expect("the review survived");
+        assert_eq!(
+            review.page, commit.page,
+            "a review above it still attributes to that commit"
+        );
+    }
+
     /// Every row that has a page names it: a plan umbrella its plan
     /// page, a commit its commit page (pre-adoption ones too — the
     /// server renders those on request), a review — which sits above
@@ -5308,6 +5395,8 @@ pub(crate) mod tests {
                 at: 0,
                 subject: "one".into(),
                 marker: RowMarker::Plain,
+
+                stands_for: None,
             },
             review(),
             OnelineRow::Header { plan: None },
