@@ -75,9 +75,10 @@ clank doctor      # verify
 `~/.codex/`, `~/.grok/`, and `~/.config/opencode/`, a `/clank` slash
 command for claude, the clank opencode plugin
 (`~/.config/opencode/plugin/clank.js` — session binding + work loop),
-and tag-merges a Stop hook entry into claude's `settings.json` and
-codex's `hooks.json` (grok has no active hooks — its skill carries the
-work loop).
+and merges its Stop and SessionStart hooks into claude's
+`settings.json` and codex's `hooks.json`, replacing any entry that
+runs `clank stop-hook` (grok has no active hooks — its skill carries
+the work loop).
 
 Re-run `clank setup` after upgrading the binary; `--force` refreshes
 skill files you have locally edited.
@@ -302,8 +303,8 @@ committed. Everything else is per-user state.
 ~/.grok/skills/{clank-master,clank-reviewer,clank-pr-review}/
 ~/.config/opencode/skills/{clank-master,clank-reviewer,clank-pr-review}/
 ~/.config/opencode/plugin/clank.js  # opencode binding + work-loop plugin
-~/.claude/settings.json             # claude Stop hook tag-merged in
-~/.codex/hooks.json                 # codex Stop hook tag-merged in
+~/.claude/settings.json             # claude Stop + SessionStart hooks merged in
+~/.codex/hooks.json                 # codex Stop + SessionStart hooks merged in
 ~/.clank/config.json                # agent library, teams, hooks, defaults
 ```
 

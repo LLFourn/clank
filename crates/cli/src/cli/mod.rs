@@ -984,7 +984,7 @@ pub struct SetupArgs {
     /// Overwrite skill/command files even if they've drifted
     /// from the embedded content (e.g. user manually edited).
     /// Hook entries in settings.json / hooks.json are always
-    /// tag-merged regardless of this flag.
+    /// merged regardless of this flag.
     #[arg(long)]
     pub force: bool,
     /// Show what would change without writing anything.

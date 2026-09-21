@@ -441,28 +441,26 @@ pub(crate) fn claude_mode_drift(installed_async: bool, capable: bool) -> Option<
 }
 
 /// The mode check against the LIVE settings + binary. `None` when
-/// the settings or the claude binary are absent (other checks cover
-/// those).
+/// the settings, a clank Stop hook or the claude binary is absent
+/// (other checks cover those).
 fn check_claude_loop_mode(settings: &Path) -> Option<CheckResult> {
     const SECTION: &str = "user";
     let raw = std::fs::read_to_string(settings).ok()?;
     let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    let entry_cmd = |event: &str, id: &str| -> Option<String> {
-        v.get("hooks")?
-            .get(event)?
-            .as_array()?
-            .iter()
-            .flat_map(|w| {
-                w.get("hooks")
-                    .and_then(|h| h.as_array())
-                    .into_iter()
-                    .flatten()
-            })
-            .find(|h| h.get("id").and_then(|i| i.as_str()) == Some(id))
-            .and_then(|h| h.get("command").and_then(|c| c.as_str()).map(String::from))
+    let installed_async = match installed_loop_mode(&v)? {
+        Ok(mode) => matches!(mode, Some(crate::cli::LoopModeArg::Asyncrewake)),
+        Err(e) => {
+            let reason = e.to_string();
+            return Some(CheckResult::warn(
+                SECTION,
+                "claude loop mode",
+                format!(
+                    "the installed Stop hook's arguments do not parse ({}) — run `clank setup`",
+                    reason.lines().next().unwrap_or_default()
+                ),
+            ));
+        }
     };
-    let stop_cmd = entry_cmd("Stop", "clank-stop-hook")?;
-    let installed_async = stop_cmd.contains("--loop asyncrewake");
     let capable = crate::cli::setup::probe_claude_asyncrewake()?;
     Some(match claude_mode_drift(installed_async, capable) {
         Some(msg) => CheckResult::warn(SECTION, "claude loop mode", msg),
@@ -476,6 +474,29 @@ fn check_claude_loop_mode(settings: &Path) -> Option<CheckResult> {
             },
         ),
     })
+}
+
+/// The `--loop` mode the installed claude Stop hook runs in, read by
+/// the parser the hook's own argv goes through, so doctor and the hook
+/// cannot disagree about what an entry says. `None` when no clank Stop
+/// hook is installed; `Err` when the hook would reject its arguments.
+fn installed_loop_mode(
+    settings: &serde_json::Value,
+) -> Option<Result<Option<crate::cli::LoopModeArg>, clap::Error>> {
+    let stop = *crate::cli::setup::clank_hook_entries(settings, "Stop").first()?;
+    let args = crate::cli::setup::clank_hook_args(stop)?;
+    let argv = ["clank", "stop-hook"]
+        .into_iter()
+        .map(String::from)
+        .chain(args);
+    Some(
+        <crate::cli::command::Cli as clap::Parser>::try_parse_from(argv).map(|cli| {
+            let crate::cli::command::Command::StopHook(args) = cli.command else {
+                unreachable!("the argv names the stop-hook subcommand")
+            };
+            args.loop_mode
+        }),
+    )
 }
 
 /// The executable `clank agent start` will exec for a declaration:
@@ -785,6 +806,41 @@ fn check_skill_file(path: &Path, expected: &str, display: &str) -> CheckResult {
 }
 
 fn check_hook_entry(path: &Path, tool: &str, display: &str) -> CheckResult {
+    check_clank_hook(
+        path,
+        "Stop",
+        tool,
+        display,
+        format!("no clank Stop hook in {tool} config — run `clank setup`"),
+    )
+}
+
+/// The SessionStart companion is what binds a launched session and
+/// rebinds it after `/clear`; without it a cleared session silently
+/// stops being driven, and a launched one is never bound at all
+/// (a-session-binds-itself-at-start). Mode-independent, both tools.
+fn check_session_start(path: &Path, tool: &str, display: &str) -> CheckResult {
+    check_clank_hook(
+        path,
+        "SessionStart",
+        tool,
+        display,
+        format!(
+            "no clank SessionStart hook in {tool} config: a {tool} session clank launches \
+             is not bound, and one that runs `/clear` stops being tracked — run `clank setup`"
+        ),
+    )
+}
+
+/// Exactly one clank entry under `event` is healthy. More than one
+/// is not: each runs on every event, and setup collapses them.
+fn check_clank_hook(
+    path: &Path,
+    event: &str,
+    tool: &str,
+    display: &str,
+    missing: String,
+) -> CheckResult {
     const SECTION: &str = "user";
     let body = match std::fs::read_to_string(path) {
         Ok(s) => s,
@@ -797,85 +853,17 @@ fn check_hook_entry(path: &Path, tool: &str, display: &str) -> CheckResult {
         Ok(v) => v,
         Err(e) => return CheckResult::fail(SECTION, display, format!("parse failed: {e}")),
     };
-    let stop = match v
-        .get("hooks")
-        .and_then(|h| h.get("Stop"))
-        .and_then(|s| s.as_array())
-    {
-        Some(s) => s,
-        None => {
-            return CheckResult::warn(
-                SECTION,
-                display,
-                "no Stop hooks configured — run `clank setup`".to_string(),
-            );
-        }
-    };
-    let has_clank = stop.iter().any(|wrapper| {
-        let Some(inner) = wrapper.get("hooks").and_then(|h| h.as_array()) else {
-            return false;
-        };
-        inner.iter().any(|h| {
-            h.get("id").and_then(|v| v.as_str()) == Some("clank-stop-hook")
-                || h.get("command")
-                    .and_then(|c| c.as_str())
-                    .is_some_and(|cmd| cmd.starts_with("clank stop-hook"))
-        })
-    });
-    if has_clank {
-        CheckResult::ok(SECTION, display, format!("{tool} Stop hook installed"))
-    } else {
-        CheckResult::warn(
-            SECTION,
-            display,
-            format!("no clank Stop hook in {tool} config — run `clank setup`"),
-        )
-    }
-}
-
-/// The SessionStart companion is what binds a launched session and
-/// rebinds it after `/clear`; without it a cleared session silently
-/// stops being driven, and a launched one is never bound at all
-/// (a-session-binds-itself-at-start). Mode-independent, both tools.
-fn check_session_start(path: &Path, tool: &str, display: &str) -> CheckResult {
-    const SECTION: &str = "user";
-    let installed = std::fs::read_to_string(path)
-        .ok()
-        .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok())
-        .and_then(|v| {
-            v.get("hooks")?
-                .get("SessionStart")?
-                .as_array()
-                .map(|entries| {
-                    entries.iter().any(|wrapper| {
-                        wrapper
-                            .get("hooks")
-                            .and_then(|h| h.as_array())
-                            .is_some_and(|inner| {
-                                inner.iter().any(|h| {
-                                    h.get("id").and_then(|v| v.as_str())
-                                        == Some(crate::cli::setup::SESSION_START_HOOK_ID)
-                                })
-                            })
-                    })
-                })
-        })
-        .unwrap_or(false);
-    if installed {
-        CheckResult::ok(
-            SECTION,
-            display,
-            format!("{tool} SessionStart hook installed"),
-        )
-    } else {
-        CheckResult::warn(
+    match crate::cli::setup::clank_hook_entries(&v, event).len() {
+        0 => CheckResult::warn(SECTION, display, missing),
+        1 => CheckResult::ok(SECTION, display, format!("{tool} {event} hook installed")),
+        n => CheckResult::warn(
             SECTION,
             display,
             format!(
-                "no clank SessionStart hook in {tool} config: a {tool} session clank launches \
-                 is not bound, and one that runs `/clear` stops being tracked — run `clank setup`"
+                "{n} clank {event} entries in {tool} config: each runs on every {event} — \
+                 run `clank setup` to collapse them to one"
             ),
-        )
+        ),
     }
 }
 
@@ -1218,7 +1206,7 @@ mod tests {
         let claude = dir.path().join("settings.json");
         std::fs::write(
             &claude,
-            serde_json::json!({"hooks": {"Stop": [{"hooks": [{"id": "clank-stop-hook", "command": "clank stop-hook --tool claude"}]}]}})
+            serde_json::json!({"hooks": {"Stop": [{"hooks": [{"command": "clank stop-hook --tool claude"}]}]}})
                 .to_string(),
         )
         .unwrap();
@@ -1236,7 +1224,7 @@ mod tests {
         );
         std::fs::write(
             &path,
-            serde_json::json!({"hooks": {"Stop": [{"hooks": [{"id": "clank-stop-hook"}]}]}})
+            serde_json::json!({"hooks": {"Stop": [{"hooks": [{"command": "clank stop-hook --tool codex"}]}]}})
                 .to_string(),
         )
         .unwrap();
@@ -1249,7 +1237,7 @@ mod tests {
         );
         std::fs::write(
             &path,
-            serde_json::json!({"hooks": {"SessionStart": [{"hooks": [{"id": crate::cli::setup::SESSION_START_HOOK_ID}]}]}})
+            serde_json::json!({"hooks": {"SessionStart": [{"hooks": [{"command": "clank stop-hook --tool codex --session-start"}]}]}})
                 .to_string(),
         )
         .unwrap();
@@ -1257,6 +1245,67 @@ mod tests {
             check_session_start(&path, "codex", "d").status,
             CheckStatus::Ok
         );
+    }
+
+    /// A claude that rewrites its settings drops clank's `id`s
+    /// (a-hook-is-known-by-what-it-runs): an id-less SessionStart
+    /// entry is installed, and the copies setup piled up while it
+    /// could not see them are named.
+    #[test]
+    fn an_id_less_session_start_is_installed_and_its_copies_are_counted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let entry = serde_json::json!({"hooks": [{
+            "type": "command",
+            "command": "clank stop-hook --tool claude --session-start",
+            "timeout": 15
+        }]});
+        std::fs::write(
+            &path,
+            serde_json::json!({"hooks": {"SessionStart": [entry]}}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            check_session_start(&path, "claude", "d").status,
+            CheckStatus::Ok
+        );
+        std::fs::write(
+            &path,
+            serde_json::json!({"hooks": {"SessionStart": [entry, entry, entry]}}).to_string(),
+        )
+        .unwrap();
+        let copies = check_session_start(&path, "claude", "d");
+        assert_eq!(copies.status, CheckStatus::Warn);
+        assert!(
+            copies.message.contains("3 clank SessionStart entries"),
+            "{}",
+            copies.message
+        );
+    }
+
+    #[test]
+    fn the_installed_loop_mode_is_read_as_the_hook_reads_it() {
+        use crate::cli::LoopModeArg::Asyncrewake;
+        let mode = |command: &str| {
+            installed_loop_mode(&serde_json::json!({"hooks": {"Stop": [
+                {"hooks": [{"type": "command", "command": command}]}
+            ]}}))
+            .map(|parsed| parsed.map_err(|e| e.kind()))
+        };
+        assert_eq!(
+            mode("clank stop-hook --tool claude --loop asyncrewake"),
+            Some(Ok(Some(Asyncrewake)))
+        );
+        assert_eq!(
+            mode("clank stop-hook --tool claude --loop=asyncrewake"),
+            Some(Ok(Some(Asyncrewake)))
+        );
+        assert_eq!(mode("clank stop-hook --tool claude"), Some(Ok(None)));
+        assert!(matches!(
+            mode("clank stop-hook --tool claude --loop bogus"),
+            Some(Err(_))
+        ));
+        assert_eq!(mode("/other/hook --loop asyncrewake"), None);
     }
 
     #[test]
@@ -1393,13 +1442,13 @@ mod tests {
     }
 
     #[test]
-    fn check_hook_entry_ok_when_id_present() {
+    fn check_hook_entry_ok_for_the_command_alone() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("settings.json");
         std::fs::write(
             &p,
             r#"{"hooks":{"Stop":[
-                {"hooks":[{"id":"clank-stop-hook","type":"command","command":"clank stop-hook --tool claude"}]}
+                {"hooks":[{"type":"command","command":"clank stop-hook --tool claude"}]}
             ]}}"#,
         )
         .unwrap();
