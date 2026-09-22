@@ -14,8 +14,13 @@
   input:focus { outline: 2px solid #e0a458; outline-offset: 1px; }
   button { width: 100%; padding: .75rem; border: 0; border-radius: 4px; background: #e0a458; color: #1a1917; font: inherit; font-weight: 700; cursor: pointer; }
   button:disabled { opacity: .5; cursor: default; }
+  button.scan { margin-top: .6rem; background: #2c2a27; color: #e8e4dc; }
+  .lens { display: none; margin-top: .9rem; }
+  .lens.on { display: block; }
+  .lens video { width: 100%; border-radius: 4px; background: #000; }
   p.say { margin: 1rem 0 0; color: #8a857c; }
   p.say.bad { color: #e07070; }
+  main.trying { opacity: .6; }
 </style>
 </head>
 <body>
@@ -28,12 +33,67 @@
            autocorrect="off" spellcheck="false" required>
     <button id="go" type="submit">Sign in</button>
   </form>
+  <button class="scan" id="scan" type="button" hidden>Scan it from the TUI</button>
+  <div class="lens" id="lens"><video id="cam" playsinline muted></video></div>
   <p class="say" id="say"></p>
 </main>
 <script>
 (() => {
   const say = document.getElementById('say'), go = document.getElementById('go');
   const form = document.getElementById('f'), token = document.getElementById('token');
+  const KEEP = 'clank.token', TRIED = 'clank.tried';
+  const keep = {
+    get: () => { try { return localStorage.getItem(KEEP); } catch (err) { return null; } },
+    clear: () => { try { localStorage.removeItem(KEEP); } catch (err) {} },
+  };
+  const post = (value) => fetch('/login', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ token: value }),
+  });
+  // Whether a refusal was of the CREDENTIAL. Only that means what is
+  // stored has stopped being a way in; a rate limit or a store
+  // failure is this minute's problem, and throwing the token away
+  // over one turns a wait into a paste.
+  async function refusedCredential(r) {
+    if (r.status !== 403) return false;
+    try { return (await r.clone().json()).refused === 'token'; } catch (err) { return false; }
+  }
+  // The remembered credential signs this browser back in, so a
+  // returning phone is not a form.
+  //
+  // The guard is set only once a sign-in has SUCCEEDED and we are
+  // still here: that is the one unrecoverable shape — a cookie the
+  // browser refuses to keep — and retrying it loops between this page
+  // and that one. A refusal or a failure leaves the guard alone, so
+  // the next load tries again, and arriving signed in clears it
+  // (page.html), so a cookie lost later is signed back in.
+  (async () => {
+    let tried = false;
+    try { tried = sessionStorage.getItem(TRIED) === '1'; } catch (err) {}
+    const stored = keep.get();
+    if (!stored || tried) return;
+    document.querySelector('main').classList.add('trying');
+    try {
+      const r = await post(stored);
+      if (r.ok) {
+        try { sessionStorage.setItem(TRIED, '1'); } catch (err) {}
+        location.replace('/');
+        return;
+      }
+      if (await refusedCredential(r)) {
+        keep.clear();
+        say.textContent = 'This device was signed out — the token changed. Paste or scan the new one.';
+      } else {
+        say.textContent = 'Could not sign in just now. Reload to try again, or paste the token.';
+      }
+      say.className = 'say bad';
+    } catch (err) {
+      say.textContent = 'Could not reach clank. Reload to try again, or paste the token.';
+      say.className = 'say bad';
+    }
+    document.querySelector('main').classList.remove('trying');
+  })();
   if (new URLSearchParams(location.search).get('why') === 'link') {
     say.textContent = 'That link is spent or expired. Paste the token instead, or mint a new link from the TUI.';
     say.className = 'say bad';
@@ -44,11 +104,7 @@
     if (!value) return;
     go.disabled = true; say.className = 'say'; say.textContent = 'Checking…';
     try {
-      const r = await fetch('/login', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ token: value }),
-      });
+      const r = await post(value);
       if (!r.ok) throw new Error(await r.text());
       location.replace('/');
     } catch (err) {
@@ -58,6 +114,136 @@
       token.select();
     }
   });
+  // The camera reads the same token off the pane it is printed on.
+  // Offered only where a camera can be opened at all: a secure context
+  // (the tunnel is https; loopback counts) with a device to ask for.
+  const scan = document.getElementById('scan'), lens = document.getElementById('lens');
+  const cam = document.getElementById('cam');
+  const canScan = window.isSecureContext && navigator.mediaDevices
+    && typeof navigator.mediaDevices.getUserMedia === 'function';
+  if (canScan) scan.hidden = false;
+
+  // Every start takes the next number and every stop burns it, so a
+  // camera or a decoder that arrives late can tell whether anyone is
+  // still waiting for it. Without that, hiding the page mid-open let
+  // the camera come up on a page nobody was looking at, and a second
+  // press opened a second camera the first Stop could not reach.
+  let stream = null, frame = 0, decoder = null, attempt = 0, starting = false;
+  // 251 KiB fetched when someone scans, not on every sign-in: most
+  // people paste, and the page is the one thing between them and in.
+  function decoderReady() {
+    if (window.jsQR) return Promise.resolve(window.jsQR);
+    if (!decoder) {
+      decoder = new Promise((ok, no) => {
+        const el = document.createElement('script');
+        el.src = '/jsqr.js';
+        el.onload = () => (window.jsQR ? ok(window.jsQR) : no(new Error('no decoder')));
+        el.onerror = () => no(new Error('the decoder did not load'));
+        document.head.appendChild(el);
+      // A rejection kept here would be handed to every later press
+      // without asking again, so a moment offline would mean no
+      // scanner until the page was reloaded.
+      }).catch((err) => { decoder = null; throw err; });
+    }
+    return decoder;
+  }
+  // Every way out of scanning goes through here: the tracks stay on
+  // until something stops them, and a camera left running on a phone
+  // is a light nobody asked for.
+  function stopScan() {
+    attempt += 1;
+    starting = false;
+    if (frame) { cancelAnimationFrame(frame); frame = 0; }
+    if (stream) { stream.getTracks().forEach((t) => t.stop()); stream = null; }
+    lens.classList.remove('on');
+    scan.textContent = 'Scan it from the TUI';
+  }
+  document.addEventListener('visibilitychange', () => { if (document.hidden) stopScan(); });
+  window.addEventListener('pagehide', stopScan);
+
+  const refuse = (text) => { say.textContent = text; say.className = 'say bad'; };
+  scan.addEventListener('click', async () => {
+    // A press while running stops it, and a press while opening
+    // cancels that opening: either way the next press starts afresh.
+    if (stream || starting) { stopScan(); return; }
+    say.className = 'say'; say.textContent = '';
+    scan.textContent = 'Opening the camera…';
+    const mine = (attempt += 1);
+    starting = true;
+    let read;
+    try {
+      read = await decoderReady();
+    } catch (err) {
+      if (mine !== attempt) return;
+      stopScan();
+      // Told apart from a missing camera: this one is worth pressing
+      // again, and the decoder will be asked for again.
+      refuse('The scanner did not load. Try again, or paste the token.');
+      return;
+    }
+    if (mine !== attempt) return;
+    let opened;
+    try {
+      opened = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: { ideal: 'environment' } },
+        audio: false,
+      });
+    } catch (err) {
+      if (mine !== attempt) return;
+      stopScan();
+      // A refusal is the browser's to give and the page's to say:
+      // a black rectangle that never decodes explains nothing.
+      refuse((err && err.name === 'NotAllowedError')
+        ? 'The camera was refused. Allow it, or paste the token.'
+        : 'No camera here. Paste the token instead.');
+      return;
+    }
+    // Stopped while it was opening: the camera arrived for nobody.
+    if (mine !== attempt) {
+      opened.getTracks().forEach((t) => t.stop());
+      return;
+    }
+    stream = opened;
+    starting = false;
+    cam.srcObject = stream;
+    await cam.play().catch(() => {});
+    // Stopped while it was starting to play: `stopScan` already took
+    // the tracks, and lighting the lens now would leave a dead
+    // rectangle over a button that says Stop.
+    if (mine !== attempt) {
+      opened.getTracks().forEach((t) => t.stop());
+      return;
+    }
+    lens.classList.add('on');
+    scan.textContent = 'Stop scanning';
+    const board = document.createElement('canvas');
+    const brush = board.getContext('2d', { willReadFrequently: true });
+    const look = () => {
+      frame = 0;
+      if (!stream || mine !== attempt) return;
+      const w = cam.videoWidth, h = cam.videoHeight;
+      if (w && h) {
+        // Downscaled: a phone's frame is more pixels than a QR needs,
+        // and the decode runs per frame.
+        const scale = Math.min(1, 640 / Math.max(w, h));
+        board.width = Math.round(w * scale);
+        board.height = Math.round(h * scale);
+        brush.drawImage(cam, 0, 0, board.width, board.height);
+        const px = brush.getImageData(0, 0, board.width, board.height);
+        const found = read(px.data, px.width, px.height);
+        const value = found && found.data && found.data.trim();
+        if (value) {
+          stopScan();
+          token.value = value;
+          form.requestSubmit ? form.requestSubmit() : form.dispatchEvent(new Event('submit'));
+          return;
+        }
+      }
+      frame = requestAnimationFrame(look);
+    };
+    frame = requestAnimationFrame(look);
+  });
+
   token.focus();
 })();
 </script>

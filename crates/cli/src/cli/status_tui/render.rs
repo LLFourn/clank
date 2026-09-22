@@ -1825,6 +1825,34 @@ pub(super) fn render_token_page(
         body.push(emit(&[plain(format!("     {line}"))], "", cols));
     }
     body.push(String::new());
+    // The same string for a camera. A pane too narrow for the code
+    // keeps the text and drops the cells: a QR clipped to the pane is
+    // not a QR, and the token is what this page is for.
+    let qr = super::remote::qr_lines(&page.token);
+    if !page.token.is_empty()
+        && qr
+            .first()
+            .is_some_and(|l| l.chars().count() + QR_GUTTER <= cols)
+    {
+        for line in wrap(
+            "or scan it into the sign-in page",
+            cols.saturating_sub(3).max(1),
+        ) {
+            body.push(emit(&[dim(format!("   {line}"))], "", cols));
+        }
+        body.push(String::new());
+        for line in qr {
+            // White on black whatever the terminal's theme, as the
+            // link's QR is drawn: a camera reads the cells, not the
+            // palette.
+            body.push(emit(
+                &[plain(" ".repeat(QR_GUTTER)), colored("97;40", line)],
+                "",
+                cols,
+            ));
+        }
+        body.push(String::new());
+    }
     body.extend(render_menu(
         &[MenuRow::Action {
             key: "x",
@@ -1864,6 +1892,9 @@ pub(super) fn render_token_page(
 
 /// Rows of the token page that are not body: rule, blank, hint.
 const TOKEN_CHROME: usize = 3;
+
+/// The indent the token's QR is drawn at, which its width must leave.
+const QR_GUTTER: usize = 2;
 
 /// The open sessions, one row each, revoked with Backspace. Enter does
 /// nothing here on purpose: a session must not end because someone
@@ -5103,6 +5134,65 @@ mod tests {
         let joined: String = out.chars().filter(|c| !c.is_whitespace()).collect();
         assert!(joined.contains(&page.token), "the whole credential: {out}");
         assert!(out.contains("rotate"), "and the row that replaces it");
+    }
+
+    /// The credential is also a QR, so the phone's camera takes it
+    /// off the pane instead of thumbs (the-phone-scans-the-token-and-keeps-it).
+    #[test]
+    fn the_token_page_draws_the_token_as_a_qr() {
+        let token = "sSJm3kQ0Xn7bK2pL9vTf4hR1yZ8wC6dGaE5uNoIqPrM";
+        let page = RemotePage {
+            token: token.into(),
+            sessions: Vec::new(),
+        };
+        let drawn = |cols: usize| {
+            render_token_page(&page, 0, 60, cols)
+                .0
+                .iter()
+                .map(|l| strip_escapes(l))
+                .collect::<Vec<_>>()
+        };
+        let wide = drawn(80);
+        let cells = |lines: &[String]| {
+            lines
+                .iter()
+                .filter(|l| {
+                    l.contains('\u{2588}') || l.contains('\u{2580}') || l.contains('\u{2584}')
+                })
+                .count()
+        };
+        assert!(cells(&wide) > 8, "the code is drawn: {wide:?}");
+        assert!(
+            wide.iter().any(|l| l.contains("scan it")),
+            "and said to be scannable: {wide:?}"
+        );
+        // Every drawn row fits the pane: a clipped QR reads as nothing.
+        for line in &wide {
+            assert!(
+                crate::cli::status_tui::text::display_width(line.trim_end()) <= 80,
+                "{line:?}"
+            );
+        }
+        let narrow = drawn(24);
+        assert_eq!(cells(&narrow), 0, "no room for the code: {narrow:?}");
+        assert!(
+            narrow.iter().any(|l| l.contains("sSJm3")),
+            "the token is still readable: {narrow:?}"
+        );
+        assert!(
+            !narrow.iter().any(|l| l.contains("scan it")),
+            "and nothing promises a code that is not there: {narrow:?}"
+        );
+
+        // A door that could not be read has no token, and a QR of
+        // nothing is a code that scans to nothing.
+        let empty = RemotePage::default();
+        let lines = render_token_page(&empty, 0, 60, 80)
+            .0
+            .iter()
+            .map(|l| strip_escapes(l))
+            .collect::<Vec<_>>();
+        assert_eq!(cells(&lines), 0, "{lines:?}");
     }
 
     /// The coverage step is a menu like any other, so a short pane

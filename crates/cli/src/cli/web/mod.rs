@@ -41,6 +41,11 @@ fn page_for(session: &str) -> String {
     PAGE.replace(SESSION_ANCHOR, &serde_json::json!(session).to_string())
 }
 const LOGIN: &str = include_str!("login.html");
+/// The QR decoder the sign-in page scans with — vendored, unmodified,
+/// Apache-2.0; `web/vendor/README.md` says where it came from.
+const JSQR: &str = include_str!("vendor/jsQR.js");
+#[cfg(test)]
+const VENDOR_NOTICE: &str = include_str!("vendor/README.md");
 const HTML: &str = "text/html; charset=utf-8";
 
 /// Which session to look in. `--session` wins; else the one this
@@ -1408,6 +1413,11 @@ async fn route(req: hyper::Request<hyper::body::Incoming>, peer: IpAddr, ctx: &C
     let path = req.uri().path().to_string();
     match (method.as_str(), path.as_str()) {
         ("GET", "/login") => return login(&req, peer, ctx),
+        // The decoder, on the unauthenticated side because the page
+        // that scans has no session yet. Immutable: it is one
+        // published build, and the page fetches it only when someone
+        // presses `scan`.
+        ("GET", "/jsqr.js") => return decoder(&req),
         // The readiness probes: the nonce, and the nonce as the first
         // event of a stream that stays open. Nothing of the page.
         ("GET", "/instance") => {
@@ -1441,6 +1451,29 @@ async fn route(req: hyper::Request<hyper::body::Incoming>, peer: IpAddr, ctx: &C
     match (method.as_str(), path.as_str()) {
         ("GET", "/") => text(200, ctx.page.to_string(), HTML),
         ("GET", "/whoami") => text(204, "", "text/plain"),
+        // The credential, to a browser that is already in. Every door
+        // ends at a page with a session, so this is the one place a
+        // device is provisioned, whichever door it came through
+        // (the-phone-scans-the-token-and-keeps-it).
+        ("GET", "/token") => match ctx.door.token_for_session(&admitted.id_hash) {
+            Ok(Some(token)) => text(
+                200,
+                serde_json::json!({ "token": token }).to_string(),
+                "application/json",
+            ),
+            // Revoked between admitting and reading: the same answer a
+            // request with no session gets.
+            Ok(None) => text(401, "no session: sign in at /login", "text/plain"),
+            Err(e) => text(500, format!("the store refused: {e:#}"), "text/plain"),
+        },
+        ("POST", "/forget") if !same_origin(&req, ctx) => text(403, "cross-origin", "text/plain"),
+        // Forgetting is signing out: the store the page clears is only
+        // half of it, since a live cookie would fetch the token again
+        // on the next load.
+        ("POST", "/forget") => match ctx.door.revoke_session(&admitted.id_hash) {
+            Ok(()) => end_session(secure_transport(&req, ctx), text(204, "", "text/plain")),
+            Err(e) => text(500, format!("the store refused: {e:#}"), "text/plain"),
+        },
         ("GET", "/events") => events(req, ctx, admitted),
         ("POST", "/say") if !same_origin(&req, ctx) => {
             text(403, "not from this page", "text/plain")
@@ -1453,6 +1486,83 @@ async fn route(req: hyper::Request<hyper::body::Incoming>, peer: IpAddr, ctx: &C
         ("GET", p) if p.starts_with("/html/") => site_page(&ctx.pages, &p["/html/".len()..]),
         _ => text(404, "not here", "text/plain"),
     }
+}
+
+/// The vendored decoder, compressed when the caller takes it that
+/// way: 251 KiB raw against 56 on the wire, over a phone's connection.
+fn decoder(req: &hyper::Request<hyper::body::Incoming>) -> Resp {
+    static GZIPPED: std::sync::OnceLock<Option<Vec<u8>>> = std::sync::OnceLock::new();
+    let takes_gzip = accepts_gzip(
+        req.headers()
+            .get("accept-encoding")
+            .and_then(|v| v.to_str().ok()),
+    );
+    let mut builder = hyper::Response::builder()
+        .status(200)
+        .header("content-type", "text/javascript; charset=utf-8")
+        .header("cache-control", "public, max-age=31536000, immutable")
+        // Two answers live at this URL, and a cache that kept one for
+        // a year would hand compressed bytes to a caller that said it
+        // could not read them (RFC 9110 §12.5.5).
+        .header("vary", "accept-encoding");
+    // The header goes on only where there are gzip bytes to label:
+    // compressing into a `Vec` cannot fail, but a fallback that served
+    // the plain script under `content-encoding: gzip` would be a body
+    // no browser could read, and that is not a thing to leave
+    // possible (ruthless on 4ab4b43).
+    let compressed = takes_gzip
+        .then(|| {
+            GZIPPED
+                .get_or_init(|| {
+                    use std::io::Write;
+                    let mut w =
+                        flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+                    w.write_all(JSQR.as_bytes()).ok()?;
+                    w.finish().ok()
+                })
+                .clone()
+        })
+        .flatten();
+    let body = match compressed {
+        Some(gz) => {
+            builder = builder.header("content-encoding", "gzip");
+            Bytes::from(gz)
+        }
+        None => Bytes::from_static(JSQR.as_bytes()),
+    };
+    builder
+        .body(Full::new(body).boxed())
+        .expect("static response")
+}
+
+/// Whether the caller takes gzip, by what `Accept-Encoding` says
+/// rather than by what it contains: `gzip;q=0` names gzip to REFUSE
+/// it, and `*` accepts what is not named. Weight 0 is refusal;
+/// anything else, including no weight at all, is acceptance
+/// (RFC 9110 §12.5.3).
+fn accepts_gzip(header: Option<&str>) -> bool {
+    let Some(header) = header else {
+        return false;
+    };
+    let mut wildcard = None;
+    for entry in header.split(',') {
+        let mut parts = entry.split(';').map(str::trim);
+        let coding = parts.next().unwrap_or_default().to_ascii_lowercase();
+        if coding != "gzip" && coding != "x-gzip" && coding != "*" {
+            continue;
+        }
+        let refused = parts.any(|p| {
+            p.strip_prefix("q=")
+                .and_then(|q| q.trim().parse::<f32>().ok())
+                .is_some_and(|q| q <= 0.0)
+        });
+        if coding == "*" {
+            wildcard = Some(!refused);
+        } else {
+            return !refused;
+        }
+    }
+    wildcard.unwrap_or(false)
 }
 
 /// The `Origin` this request carries, normalized the same way the
@@ -1483,6 +1593,15 @@ fn redirect(to: &str) -> Resp {
 /// hostname work at all (the-way-in-is-a-token).
 fn with_session(_req_host: Option<&str>, secure: bool, token: &str, mut resp: Resp) -> Resp {
     if let Ok(v) = hyper::header::HeaderValue::from_str(&door::session_cookie(token, secure)) {
+        resp.headers_mut().insert("set-cookie", v);
+    }
+    resp
+}
+
+/// A response that ends a session: the cookie spent, so the browser
+/// stops presenting a name the door no longer knows.
+fn end_session(secure: bool, mut resp: Resp) -> Resp {
+    if let Ok(v) = hyper::header::HeaderValue::from_str(&door::expired_cookie(secure)) {
         resp.headers_mut().insert("set-cookie", v);
     }
     resp
@@ -1547,12 +1666,18 @@ fn login(req: &hyper::Request<hyper::body::Incoming>, peer: IpAddr, ctx: &Ctx) -
     }
 }
 
+/// A refusal the page can tell apart. 403 alone cannot: a request
+/// from another origin is refused with it too, and only a refusal of
+/// the CREDENTIAL means the browser should stop keeping it.
 fn refused(r: door::Refused) -> Resp {
-    let status = match r {
-        door::Refused::Token => 403,
-        door::Refused::Store(_) => 500,
-    };
-    text(status, r.to_string(), "text/plain")
+    match r {
+        door::Refused::Token => text(
+            403,
+            serde_json::json!({ "refused": "token", "say": r.to_string() }).to_string(),
+            "application/json",
+        ),
+        door::Refused::Store(_) => text(500, r.to_string(), "text/plain"),
+    }
 }
 
 /// The paste box's post: the token, whole, in a JSON body. A
@@ -3572,5 +3697,450 @@ mod tests {
             .await
             .expect("the accept loop ends on cancel")
             .unwrap();
+    }
+    /// The pages and the routes they call ship together: a page that
+    /// asks for a path the server does not answer is a phone that
+    /// waits for nothing.
+    #[test]
+    fn the_pages_call_the_doors_the_server_answers() {
+        assert!(PAGE.contains("'/token'"), "the page provisions itself");
+        assert!(PAGE.contains("'/forget'"), "and can be forgotten");
+        assert!(
+            LOGIN.contains("clank.token"),
+            "the sign-in page reads what was kept"
+        );
+        assert!(
+            LOGIN.contains("'token'"),
+            "and keys its discard on the door's mark for a refused credential"
+        );
+        assert!(
+            LOGIN.contains("'/jsqr.js'") && LOGIN.contains("getUserMedia"),
+            "the sign-in page scans with the decoder the server serves"
+        );
+        // Both halves of forgetting, in the page that does it.
+        let forget = PAGE.split("'/forget'").nth(1).unwrap_or_default();
+        assert!(
+            forget.contains("keep.clear()"),
+            "the store is cleared with the session: {forget:.200}"
+        );
+    }
+
+    /// `Accept-Encoding` names codings to REFUSE as well as to take,
+    /// so containing "gzip" is not accepting it (RFC 9110 §12.5.3).
+    #[test]
+    fn a_refusal_of_gzip_is_read_as_one() {
+        for taken in [
+            "gzip",
+            "gzip, deflate, br",
+            "deflate, gzip;q=0.5",
+            "*",
+            "br;q=1.0, *;q=0.5",
+            "GZIP",
+            "x-gzip",
+        ] {
+            assert!(accepts_gzip(Some(taken)), "{taken}");
+        }
+        for refused in [
+            "gzip;q=0",
+            "gzip;q=0, identity",
+            "identity",
+            "br, deflate",
+            "*;q=0",
+            "*;q=0, br",
+            "",
+        ] {
+            assert!(!accepts_gzip(Some(refused)), "{refused}");
+        }
+        assert!(!accepts_gzip(None), "a caller that said nothing");
+        // A named coding beats the wildcard, whichever way each goes.
+        assert!(accepts_gzip(Some("*;q=0, gzip")));
+        assert!(!accepts_gzip(Some("gzip;q=0, *")));
+    }
+
+    /// A blob nobody can check is a blob nobody should ship: the
+    /// vendored decoder is the published build, byte for byte, and
+    /// `web/vendor/README.md` names this digest beside where it came
+    /// from. An edit here fails rather than passing quietly.
+    #[test]
+    fn the_vendored_decoder_is_what_the_notice_says() {
+        let digest = blake3::hash(JSQR.as_bytes()).to_hex().to_string();
+        assert_eq!(
+            digest, "7e156db57fefffb4ea40e40c88fd63b8e5052eae37b7e47c6652160041a90818",
+            "jsqr 1.4.0 from unpkg; see web/vendor/README.md"
+        );
+        assert!(
+            VENDOR_NOTICE.contains(&digest) && VENDOR_NOTICE.contains("Apache-2.0"),
+            "the notice names this file and its licence"
+        );
+    }
+
+    /// The decoder is served to a browser that has no session yet —
+    /// the page that scans is the page that signs in — and compressed
+    /// when the caller takes it that way.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_decoder_is_served_before_a_session_and_compressed() {
+        let (base, _door, anon, cancel, _site, _repo) = door_only().await;
+        let plain = anon
+            .get(format!("{base}/jsqr.js"))
+            .header("accept-encoding", "identity")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(plain.status(), 200, "no session needed");
+        assert_eq!(
+            plain.headers().get("content-type").unwrap(),
+            "text/javascript; charset=utf-8"
+        );
+        assert!(
+            plain
+                .headers()
+                .get("cache-control")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("immutable"),
+            "fetched once per device"
+        );
+        let plain_headers = plain
+            .headers()
+            .get("vary")
+            .expect("says what it varied on")
+            .to_str()
+            .unwrap()
+            .to_ascii_lowercase();
+        assert_eq!(plain.text().await.unwrap().len(), JSQR.len());
+
+        // Asked for compressed, it arrives compressed and says so —
+        // this client does not decode for us, so these are the bytes
+        // that crossed the wire.
+        let zipped = anon
+            .get(format!("{base}/jsqr.js"))
+            .header("accept-encoding", "gzip, deflate")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(zipped.status(), 200);
+        assert_eq!(zipped.headers().get("content-encoding").unwrap(), "gzip");
+        let zipped_vary = zipped
+            .headers()
+            .get("vary")
+            .map(|v| v.to_str().unwrap().to_ascii_lowercase());
+        let wire = zipped.bytes().await.unwrap();
+        assert!(
+            wire.len() * 3 < JSQR.len(),
+            "{} on the wire against {}",
+            wire.len(),
+            JSQR.len()
+        );
+        let mut unpacked = String::new();
+        std::io::Read::read_to_string(&mut flate2::read::GzDecoder::new(&wire[..]), &mut unpacked)
+            .expect("gzip, as labelled");
+        assert_eq!(unpacked.len(), JSQR.len(), "the same script, unpacked");
+
+        // Both answers say what they varied on, or a cache holding one
+        // for a year hands it to a caller that cannot read it.
+        for r in [&plain_headers, zipped_vary.as_ref().unwrap()] {
+            assert_eq!(r.as_str(), "accept-encoding");
+        }
+
+        // Named as refused: the whole script, uncompressed, though the
+        // header contains the word.
+        let refused = anon
+            .get(format!("{base}/jsqr.js"))
+            .header("accept-encoding", "gzip;q=0, identity")
+            .send()
+            .await
+            .unwrap();
+        assert!(refused.headers().get("content-encoding").is_none());
+        assert_eq!(refused.text().await.unwrap().len(), JSQR.len());
+        let _ = cancel.send(true);
+    }
+
+    /// A server with nothing but its door, for the routes that are
+    /// only about getting in.
+    async fn door_only() -> (
+        String,
+        Arc<door::Door>,
+        reqwest::Client,
+        tokio::sync::watch::Sender<bool>,
+        tempfile::TempDir,
+        tempfile::TempDir,
+    ) {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let site = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        for args in [
+            vec!["init", "--quiet", "--initial-branch=main"],
+            vec!["config", "user.email", "t@t"],
+            vec!["config", "user.name", "t"],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(repo.path())
+                    .args(&args)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success()
+            );
+        }
+        let (cancel, cancelled) = tokio::sync::watch::channel(false);
+        let door = Arc::new(door::Door::new(Some(site.path().to_path_buf())));
+        tokio::spawn({
+            let (repo, pages) = (repo.path().to_path_buf(), site.path().to_path_buf());
+            let door = door.clone();
+            let sayer: Sayer = Arc::new(|_, _| Ok(()));
+            let stopper: Stopper = Arc::new(|_| Ok(()));
+            async move {
+                serve(
+                    listener,
+                    Feed::new(16),
+                    sayer,
+                    stopper,
+                    "clank-test".to_string(),
+                    repo,
+                    pages,
+                    cancelled,
+                    Arc::new(Blocking::default()),
+                    door,
+                    "nonce-of-this-start".to_string(),
+                    Arc::default(),
+                    Arc::default(),
+                )
+                .await
+            }
+        });
+        let anon = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        (
+            format!("http://localhost:{port}"),
+            door,
+            anon,
+            cancel,
+            site,
+            repo,
+        )
+    }
+
+    /// The phone's actual way in is the link the TUI mints, which is
+    /// redeemed server-side and never touches the sign-in page. Being
+    /// signed in is therefore what hands the credential over, and the
+    /// credential is what gets back in once the cookie is gone
+    /// (the-phone-scans-the-token-and-keeps-it).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_phone_paired_by_the_link_is_handed_the_token_and_keeps_it() {
+        let (base, door, anon, cancel, _site, _repo) = door_only().await;
+
+        // Nothing stored and no session: the door hands out nothing.
+        assert_eq!(
+            anon.get(format!("{base}/token"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            401,
+            "the token is not a thing the door gives away"
+        );
+
+        // The scan-to-phone link, redeemed as the phone redeems it.
+        let link = format!("{base}/login?t={}", door.mint(door::Link::Login));
+        let welcome = anon.get(&link).send().await.unwrap();
+        assert_eq!(welcome.status(), 303);
+        let cookie = welcome
+            .headers()
+            .get("set-cookie")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+
+        // Signed in, the page asks for the credential it will keep.
+        let handed = anon
+            .get(format!("{base}/token"))
+            .header("cookie", &cookie)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(handed.status(), 200);
+        let token = handed.json::<serde_json::Value>().await.unwrap()["token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(token, door.token().unwrap());
+
+        // The cookie goes — expired, cleared, a new browser session —
+        // and the kept credential is the way back in, with no paste.
+        let back = anon
+            .post(format!("{base}/login"))
+            .header("origin", &base)
+            .json(&serde_json::json!({ "token": token }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(back.status(), 204, "the paste path, as the page posts it");
+        let second = back
+            .headers()
+            .get("set-cookie")
+            .expect("a new session")
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+        assert_ne!(second, cookie, "a new session, not the old one");
+        assert_eq!(
+            anon.get(format!("{base}/whoami"))
+                .header("cookie", &second)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            204
+        );
+        let _ = cancel.send(true);
+    }
+
+    /// The page keeps the credential unless the door says the
+    /// CREDENTIAL was refused. 403 alone cannot say that — a request
+    /// from another origin is refused with it too — and a rate limit
+    /// or a store failure is this minute's problem, not a reason to
+    /// throw away a working token (codex on 1c932ab).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn only_a_refused_credential_is_marked_as_one() {
+        let (base, _door, anon, cancel, _site, _repo) = door_only().await;
+        let wrong = anon
+            .post(format!("{base}/login"))
+            .header("origin", &base)
+            .json(&serde_json::json!({ "token": "not-it" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(wrong.status(), 403);
+        assert_eq!(
+            wrong.json::<serde_json::Value>().await.unwrap()["refused"],
+            "token",
+            "the one refusal that means: stop keeping this"
+        );
+
+        let elsewhere = anon
+            .post(format!("{base}/login"))
+            .json(&serde_json::json!({ "token": "not-it" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(elsewhere.status(), 403, "same status");
+        assert!(
+            !elsewhere.text().await.unwrap().contains("\"refused\""),
+            "and no mark, so a page cannot read it as a rotation"
+        );
+        let _ = cancel.send(true);
+    }
+
+    /// Forgetting ends the session as well as the store: a live cookie
+    /// would fetch the token again on the next load, and the device
+    /// could never stay forgotten.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn forgetting_a_device_signs_it_out() {
+        let (base, door, anon, cancel, _site, _repo) = door_only().await;
+        let token = door.token().unwrap();
+        let sign_in = || async {
+            anon.post(format!("{base}/login"))
+                .header("origin", &base)
+                .json(&serde_json::json!({ "token": token }))
+                .send()
+                .await
+                .unwrap()
+                .headers()
+                .get("set-cookie")
+                .expect("a session")
+                .to_str()
+                .unwrap()
+                .split(';')
+                .next()
+                .unwrap()
+                .to_string()
+        };
+        let cookie = sign_in().await;
+
+        assert_eq!(
+            anon.post(format!("{base}/forget"))
+                .header("cookie", &cookie)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            403,
+            "not from this page"
+        );
+        assert_eq!(
+            anon.post(format!("{base}/forget"))
+                .header("origin", &base)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            401,
+            "and not from nowhere"
+        );
+
+        let gone = anon
+            .post(format!("{base}/forget"))
+            .header("origin", &base)
+            .header("cookie", &cookie)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(gone.status(), 204);
+        let spent = gone
+            .headers()
+            .get("set-cookie")
+            .expect("the cookie is spent")
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(spent.contains("Max-Age=0"), "{spent}");
+        assert_eq!(
+            anon.get(format!("{base}/whoami"))
+                .header("cookie", &cookie)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            401,
+            "the session it was signed in on is over"
+        );
+        assert_eq!(
+            anon.get(format!("{base}/token"))
+                .header("cookie", &cookie)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            401,
+            "so nothing re-provisions it"
+        );
+
+        // Signing in again is the explicit choice that remembers it.
+        let after = sign_in().await;
+        assert_eq!(
+            anon.get(format!("{base}/token"))
+                .header("cookie", &after)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+        let _ = cancel.send(true);
     }
 }

@@ -301,6 +301,7 @@ dependencies = [
  "cloudflare-quick-tunnel",
  "dunce",
  "filetime",
+ "flate2",
  "futures-util",
  "getrandom 0.3.4",
  "gix",

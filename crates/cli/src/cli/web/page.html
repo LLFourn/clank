@@ -219,6 +219,7 @@
   .ledger .lhead { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; padding: 10px 14px 8px; }
   .ledger .lhead .session { font-family: var(--plate); font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .ledger .close { color: var(--muted); }
+  .ledger .forget { color: var(--muted); font-size: 12px; margin-left: auto; }
   .ledger .facts { padding: 6px 14px 10px; border-bottom: 1px solid var(--edge); }
   .ledger .facts .plan { font-family: var(--plate); font-weight: 700; }
   .ledger .facts .gate { color: var(--hue); }
@@ -288,7 +289,7 @@
   </form>
   <div class="viewer" id="viewer" role="dialog" aria-label="Full-size image"></div>
   <aside class="ledger" id="ledger">
-    <div class="lhead"><span class="session" id="session"></span><button class="close" id="close">close</button></div>
+    <div class="lhead"><span class="session" id="session"></span><button class="forget" id="forget">forget this device</button><button class="close" id="close">close</button></div>
     <div class="facts" id="facts"></div>
     <div class="rows" id="rows"></div>
   </aside>
@@ -296,6 +297,46 @@
 <script>
 (() => {
   const $ = (id) => document.getElementById(id);
+  // The credential this browser signs itself back in with. A store
+  // that throws — private browsing, storage off — is a browser that
+  // pastes the token again, not a page that breaks.
+  const KEEP = 'clank.token';
+  const keep = {
+    get: () => { try { return localStorage.getItem(KEEP); } catch (err) { return null; } },
+    set: (v) => { try { localStorage.setItem(KEEP, v); } catch (err) {} },
+    clear: () => { try { localStorage.removeItem(KEEP); } catch (err) {} },
+  };
+  // Being signed in is what provisions the device: the minted link
+  // never passes through the sign-in page, so asking here is what
+  // covers every door (the-phone-scans-the-token-and-keeps-it).
+  // Set the moment a forget begins, and cleared only when the door
+  // REFUSED it — a sign-out that failed is not a sign-out, and the
+  // session is still live. While it is set, everything that could
+  // write the credential back, or navigate before the door has
+  // answered, asks first: a fetch in flight when the button is
+  // pressed lands AFTER it, and the whole point was to keep nothing.
+  let forgetting = false;
+  // Asked on every arrival, not only an empty store: a token that was
+  // rotated while this browser was away leaves a dead string here, and
+  // a fresh pairing — a new link, a new paste — would not replace it.
+  // The next lost cookie would then sign in with the rotated-out one
+  // and demand another scan, having just been paired.
+  async function remember() {
+    if (forgetting) return;
+    try {
+      const r = await fetch('/token');
+      if (!r.ok) return;
+      const { token } = await r.json();
+      // Asked again after the await: this is the arrival the forget
+      // was racing.
+      if (token && !forgetting) keep.set(token);
+    } catch (err) {}
+  }
+  remember();
+  // Arriving here IS the confirmation that the cookie stuck, so the
+  // sign-in page's one-shot guard is spent: a cookie lost later is
+  // signed back in rather than left at the form (login.html).
+  try { sessionStorage.removeItem('clank.tried'); } catch (err) {}
   const viewsEl = $('views'), emptyEl = $('empty');
   const whoEl = $('who'), whoName = $('whoname'), autoTag = $('autotag'), doingEl = $('doing');
   const projectEl = $('project');
@@ -304,6 +345,29 @@
   const form = $('say'), input = $('text'), send = $('send'), sentEl = $('sent'), stopBtn = $('stop');
   const attachBtn = $('attach'), fileInput = $('file');
   const ledgerEl = $('ledger');
+  // Forgetting has to end the session too: with the cookie alive, the
+  // next load would ask for the token again and be remembered against
+  // the user's wishes.
+  const forgetEl = $('forget');
+  forgetEl.addEventListener('click', async () => {
+    if (forgetting) return;
+    forgetting = true;
+    forgetEl.disabled = true;
+    forgetEl.textContent = 'forgetting…';
+    let ok = false;
+    try { ok = (await fetch('/forget', { method: 'POST' })).ok; } catch (err) {}
+    // A failed sign-out is not a sign-out: the cookie is still live
+    // and would fetch the credential again, so say so rather than
+    // clear the store and navigate as if it worked.
+    if (!ok) {
+      forgetting = false;
+      forgetEl.disabled = false;
+      forgetEl.textContent = 'could not sign out — try again';
+      return;
+    }
+    keep.clear();
+    location.replace('/login');
+  });
 
   // The TUI's coarse ladder: seconds under a minute read `now`.
   const coarse = (secs) => { const s = Math.max(0, secs); if (s < 60) return 'now'; if (s < 3600) return Math.floor(s / 60) + 'm'; if (s < 86400) return Math.floor(s / 3600) + 'h'; return Math.floor(s / 86400) + 'd'; };
@@ -827,13 +891,22 @@
     // retried forever, so the page asks which before backing off.
     socket.onclose = async () => {
       live = false; paintHeader();
+      // A forget ends the session on purpose and does its own
+      // navigating; racing it to the sign-in page would arrive with
+      // the credential still stored, which signs straight back in.
+      // Asked again after the probe, because a probe already in
+      // flight when the button was pressed answers 401 either way.
       try {
-        if ((await fetch('/whoami')).status === 401) {
+        if (forgetting) return;
+        const gone = (await fetch('/whoami')).status === 401;
+        if (forgetting) return;
+        if (gone) {
           closedForGood = true;
           location.replace('/login');
           return;
         }
       } catch (err) {}
+      if (forgetting) return;
       retry = Math.min(retry + 1, 6);
       setTimeout(connect, Math.min(250 * 2 ** retry, 10000));
     };

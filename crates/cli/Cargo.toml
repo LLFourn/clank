@@ -30,6 +30,9 @@ signal-hook = "0.3"
 
 # Hashing
 blake3 = "1"
+# Only to serve the vendored decoder compressed: 251 KiB of it, 56 on
+# the wire (see `web/vendor/README.md`).
+flate2 = "1"
 
 # Path canonicalization
 dunce = "1"

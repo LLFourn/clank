@@ -105,6 +105,7 @@ struct Store {
 }
 
 /// Which halves an edit changed, so only those are written.
+#[derive(Default)]
 struct Wrote {
     sessions: bool,
     remote: bool,
@@ -293,6 +294,45 @@ impl Door {
                 let minted = random_token();
                 remote.token = Some(minted.clone());
                 (minted, true)
+            }
+        })
+    }
+
+    /// The credential, to a session that is STILL one — the session
+    /// checked and the token read under ONE hold of the lock, for the
+    /// reason [`with_store`] gives. Admitting in one transaction and
+    /// reading in another let a rotation land between them and hand
+    /// the NEW token to the session that rotation had just revoked,
+    /// which is a revoked device signing itself back in for good
+    /// (codex on 1c932ab).
+    ///
+    /// `None` means the session is no longer one; the caller refuses
+    /// as it would refuse any request without a session.
+    pub(crate) fn token_for_session(&self, id_hash: &str) -> anyhow::Result<Option<String>> {
+        self.with_store(|store| {
+            let now = now_utc();
+            let live = store
+                .sessions
+                .iter()
+                .any(|s| s.id_hash == id_hash && is_fresh(s, now));
+            if !live {
+                return (None, Wrote::default());
+            }
+            match &store.remote.token {
+                Some(t) if !t.is_empty() => (Some(t.clone()), Wrote::default()),
+                // First use mints it, as `token` does: a page asking
+                // before anyone has looked at the TUI is not an error.
+                _ => {
+                    let minted = random_token();
+                    store.remote.token = Some(minted.clone());
+                    (
+                        Some(minted),
+                        Wrote {
+                            sessions: false,
+                            remote: true,
+                        },
+                    )
+                }
             }
         })
     }
@@ -581,10 +621,13 @@ fn admits(ours: &str, presented: &str) -> bool {
 /// Drop the sessions past their term; whether any were.
 fn expire(sessions: &mut Vec<SessionRecord>, now: time::OffsetDateTime) -> bool {
     let before = sessions.len();
-    sessions.retain(|s| {
-        parse_rfc3339(&s.created).is_some_and(|c| now - c < time::Duration::days(SESSION_DAYS))
-    });
+    sessions.retain(|s| is_fresh(s, now));
     sessions.len() != before
+}
+
+/// Whether a session is still within its term.
+fn is_fresh(s: &SessionRecord, now: time::OffsetDateTime) -> bool {
+    parse_rfc3339(&s.created).is_some_and(|c| now - c < time::Duration::days(SESSION_DAYS))
 }
 
 /// When a session's term ends, as an instant a stream can sleep to.
@@ -627,6 +670,16 @@ pub(crate) fn session_cookie(token: &str, secure: bool) -> String {
     format!(
         "{COOKIE}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}{}",
         SESSION_DAYS * 24 * 60 * 60,
+        if secure { "; Secure" } else { "" }
+    )
+}
+
+/// The `Set-Cookie` that ENDS a session: the same cookie, spent. A
+/// browser told to forget a device must not keep sending a name the
+/// door has already revoked.
+pub(crate) fn expired_cookie(secure: bool) -> String {
+    format!(
+        "{COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0{}",
         if secure { "; Secure" } else { "" }
     )
 }
@@ -818,6 +871,57 @@ mod tests {
         assert!(a.sessions().unwrap().is_empty(), "and leaves nothing");
         let now = b.token().unwrap();
         assert!(a.open_session_for_token(&now).unwrap().is_some());
+    }
+
+    /// The credential goes only to a session that is still one, and
+    /// the check and the read are ONE hold of the store. Two holds
+    /// let a rotation land between them: the first accepts the old
+    /// session, the rotation revokes it, and the second hands that
+    /// revoked session the NEW token — which it could then sign back
+    /// in with, past the revocation that was the point of rotating
+    /// (codex on 1c932ab).
+    #[tokio::test]
+    async fn a_revoked_session_is_handed_no_token() {
+        let home = tempfile::tempdir().unwrap();
+        let a = Door::new(Some(home.path().to_path_buf()));
+        let b = Door::new(Some(home.path().to_path_buf()));
+        let opened = a.open_session("token").unwrap();
+        let id_hash = a.admit(Some(&cookie(&opened))).expect("admitted").id_hash;
+
+        let before = a.transactions();
+        assert_eq!(
+            a.token_for_session(&id_hash).unwrap().as_deref(),
+            Some(a.token().unwrap().as_str()),
+            "a live session is handed the credential"
+        );
+        assert_eq!(
+            a.transactions() - before,
+            2,
+            "one transaction checks AND reads together; the second is \
+             this assertion's own read of the token"
+        );
+
+        // The interleaving: admitted, then rotated elsewhere.
+        let fresh = b.rotate_token().unwrap();
+        assert_eq!(
+            a.token_for_session(&id_hash).unwrap(),
+            None,
+            "the session the rotation ended is handed nothing"
+        );
+        assert_ne!(fresh, "", "and the new credential is intact");
+        assert_eq!(b.token().unwrap(), fresh);
+
+        // A session opened on the new credential is handed it.
+        let after = a.open_session_for_token(&fresh).unwrap().expect("admitted");
+        let id_hash = a.admit(Some(&cookie(&after))).expect("admitted").id_hash;
+        assert_eq!(
+            a.token_for_session(&id_hash).unwrap().as_deref(),
+            Some(fresh.as_str())
+        );
+
+        // And a session that was revoked on its own is handed nothing.
+        a.revoke_session(&id_hash).unwrap();
+        assert_eq!(a.token_for_session(&id_hash).unwrap(), None);
     }
 
     /// The file keeps the hash and never the cookie; a revoked
