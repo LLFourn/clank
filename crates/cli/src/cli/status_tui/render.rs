@@ -416,7 +416,12 @@ pub(super) fn render_at(
                     Seg::Ask(a) => a.spans.clone(),
                     Seg::Log(row) => {
                         let mut spans = vec![age_gutter(row, age_width)];
-                        spans.extend(log_row_spans(row, author_width, &snap.log_decorations));
+                        spans.extend(log_row_spans(
+                            row,
+                            author_width,
+                            &snap.log_decorations,
+                            cols,
+                        ));
                         spans
                     }
                 };
@@ -862,13 +867,28 @@ fn fit_marker(fields: &crate::cli::stop_hook::MarkerFields<'_>, budget: usize) -
     (kept >= MIN_SUBJECT).then(|| format!("{GLYPH}{cut}"))
 }
 
+/// `──── name ────`: the name highlighted and centred between dim rules
+/// that reach both edges of a pane `cols` wide — the extra column of an
+/// odd remainder on the right. A pane too narrow for the name cuts the
+/// name, never the rule: one `─` and a space stay on each side.
+fn breaker_spans(name: &str, cols: usize) -> Vec<Span> {
+    let name = truncate_to(name, cols.saturating_sub(4));
+    let fill = cols.saturating_sub(display_width(&name) + 2);
+    let left = fill / 2;
+    vec![
+        dim(format!("{} ", "─".repeat(left))),
+        Span(Style::Highlight, name),
+        dim(format!(" {}", "─".repeat(fill - left))),
+    ]
+}
+
 /// Widest verdict mark in display columns: `✓✓` (Finished) is 2,
 /// the rest are 1. Review marks sit in a field this wide so the
 /// author column is constant regardless of verdict.
 pub(super) const MARK_FIELD: usize = 2;
 
-/// Style one log row for the pane. Umbrella headers get a
-/// background highlight so they read as section dividers; commit
+/// Style one log row for a pane `cols` wide. An umbrella header is a
+/// breaker across the whole pane (a-plan-name-is-a-breaker); commit
 /// shas are dim at column 2 with plain subjects; review marks
 /// (green ✓ / cyan ✓✓ / red ✗) start at that SAME column 2, and the
 /// author is padded to `author_width` so every summary begins at one
@@ -877,15 +897,11 @@ pub(super) fn log_row_spans(
     row: &crate::cli::log::OnelineRow,
     author_width: usize,
     decorations: &std::collections::BTreeMap<String, Vec<String>>,
+    cols: usize,
 ) -> Vec<Span> {
     use crate::cli::log::{OnelineRow, RowMarker};
     match row {
-        OnelineRow::Header { plan } => {
-            vec![Span(
-                Style::Highlight,
-                plan.clone().unwrap_or_else(|| "adhoc".to_string()),
-            )]
-        }
+        OnelineRow::Header { plan } => breaker_spans(plan.as_deref().unwrap_or("adhoc"), cols),
         // A merged github event in the timeline: cyan `gh` badge, the
         // shared describe line, and the open-work mark while any
         // agent's copy is unhandled (log-timeline-github-events).
@@ -4613,9 +4629,14 @@ mod tests {
         ];
         let lines = render(&s, 10, 60);
         let texts: Vec<String> = lines.iter().map(|l| visible(l)).collect();
-        // Umbrella header (visible text is the bare plan name) and the
+        // Umbrella header (a breaker carrying the plan name) and the
         // commit indented under it at column 2.
-        assert!(texts.iter().any(|t| t == "foo"), "header: {texts:?}");
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.starts_with('─') && t.contains(" foo ") && t.ends_with('─')),
+            "header: {texts:?}"
+        );
         assert!(
             // plan commit: its age leads, then the empty (space)
             // marker gutter and the sha (adhoc-commit-marker).
@@ -7059,7 +7080,8 @@ mod tests {
             "the review's, from its file's write time: {review:?}"
         );
         assert!(
-            out.iter().any(|l| visible(l) == "foo"),
+            out.iter()
+                .any(|l| visible(l).starts_with('─') && visible(l).contains(" foo ")),
             "an umbrella is a divider, not an event: it keeps the margin"
         );
         // A review whose file could not be read shows no age rather
@@ -8209,6 +8231,39 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(!commit.contains(STANDBY_MEANS), "{commit}");
+    }
+
+    fn breaker(plan: &str, cols: usize) -> String {
+        let row = crate::cli::log::OnelineRow::Header {
+            plan: Some(plan.to_string()),
+        };
+        let spans = log_row_spans(&row, 0, &Default::default(), cols);
+        crate::cli::status_tui::fixtures::visible_untrimmed(&emit(&spans, "", cols))
+    }
+
+    #[test]
+    fn a_plan_header_is_a_breaker_across_the_pane() {
+        for cols in [40, 41] {
+            let line = breaker("the-plan-name", cols);
+            assert_eq!(display_width(&line), cols, "{line:?}");
+            assert!(line.starts_with('─') && line.ends_with('─'), "{line:?}");
+            let (left, rest) = line
+                .split_once(" the-plan-name ")
+                .expect("the name, spaced");
+            let (l, r) = (left.chars().count(), rest.chars().count());
+            assert!(
+                r == l || r == l + 1,
+                "centred, extra on the right: {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_narrow_pane_cuts_the_name_not_the_rule() {
+        let line = breaker("a-plan-name-far-too-long-for-this-pane", 20);
+        assert_eq!(display_width(&line), 20, "{line:?}");
+        assert!(line.starts_with("─ ") && line.ends_with(" ─"), "{line:?}");
+        assert!(line.contains('…'), "{line:?}");
     }
 
     fn page_text(
