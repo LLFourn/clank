@@ -181,6 +181,22 @@ pub enum WaitItem {
         name: String,
         priority: u16,
     },
+    /// A pending message in the agent's own inbox: produced by the CLI,
+    /// which reads the inbox, never by `work_for`. Returned on every
+    /// arm until the message is handled (it leaves the inbox).
+    Message {
+        /// The message's file stem, the handle `clank inbox` takes.
+        handle: String,
+        priority: u16,
+        /// The sending agent and its repo; both absent when a person
+        /// sent it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repo: Option<String>,
+        /// The message's first line.
+        subject: String,
+    },
     /// Extra-wake-source events (extra-wait-events): produced by the
     /// CLI's external source tasks, never by `work_for`. A GitHub
     /// event on a watched repo…

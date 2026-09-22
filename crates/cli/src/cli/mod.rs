@@ -28,6 +28,7 @@ pub mod github_events;
 pub(crate) mod github_timeline;
 pub mod html;
 pub mod html_highlight;
+pub mod inbox;
 pub mod init;
 pub mod log;
 pub mod open;
@@ -41,6 +42,7 @@ pub mod rereview;
 pub mod rewire;
 pub mod rewrite;
 pub mod run;
+pub mod send;
 pub(crate) mod session_holder;
 pub mod setup;
 pub mod stash;
@@ -676,6 +678,65 @@ pub enum WaitFor {
     /// The repo came to a stop-point: a plan finalized OR a new
     /// unanswered block appeared (someone needs the human).
     Stopped,
+}
+
+#[derive(Args, Debug)]
+#[command(group(clap::ArgGroup::new("recipient").required(true).args(["to", "master"])))]
+#[command(group(clap::ArgGroup::new("body").required(true).args(["message", "file"])))]
+pub struct SendArgs {
+    /// The recipient's repo. Defaults to the cwd's git toplevel.
+    #[arg(long, value_name = "PATH")]
+    pub repo: Option<PathBuf>,
+    /// The agent to send to, by its label on that repo's roster.
+    #[arg(long, value_name = "LABEL")]
+    pub to: Option<String>,
+    /// Send to whoever that repo's roster names master.
+    #[arg(long)]
+    pub master: bool,
+    /// Where the message sits in the inbox: 0-999, lower is read first.
+    #[arg(long, default_value_t = 500)]
+    pub priority: u16,
+    /// The message. Repeat for paragraphs, as with `git commit -m`.
+    #[arg(short = 'm', long = "message", value_name = "TEXT")]
+    pub message: Vec<String>,
+    /// Read the message from a file; `-` reads stdin.
+    #[arg(short = 'F', long = "file", value_name = "PATH")]
+    pub file: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub struct InboxArgs {
+    /// Repo root. Defaults to the cwd's git toplevel.
+    #[arg(long, value_name = "PATH", global = true)]
+    pub repo: Option<PathBuf>,
+    /// Agent whose inbox to use (default: the session's binding).
+    #[arg(long, value_name = "LABEL", global = true)]
+    pub author: Option<String>,
+    #[command(subcommand)]
+    pub command: Option<InboxCmd>,
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum InboxCmd {
+    /// List pending messages in the order they wake (the default).
+    List,
+    /// Print one message whole.
+    Show {
+        /// The message's name or file stem.
+        name: String,
+    },
+    /// Mark a message handled: it leaves the inbox and stops waking you.
+    Done {
+        /// The message's name or file stem.
+        name: String,
+    },
+    /// Move a message to another priority.
+    Reprioritise {
+        /// The message's name or file stem.
+        name: String,
+        /// 0-999, lower is read first.
+        priority: u16,
+    },
 }
 
 #[derive(Args, Debug)]

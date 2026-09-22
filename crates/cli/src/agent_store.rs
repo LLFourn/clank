@@ -654,14 +654,19 @@ fn release_locked(repo: &Path, label: &AgentLabel, session: &SessionId) -> anyho
 /// must not do concurrently. Held for one label only, and never
 /// across another label's, so there is no lock order to get wrong.
 fn binding_lock(repo: &Path, label: &AgentLabel) -> anyhow::Result<std::fs::File> {
-    use std::os::fd::AsRawFd;
     let dir = agents_root(repo).join(label.as_str());
     std::fs::create_dir_all(&dir).with_context(|| format!("creating `{}`", dir.display()))?;
-    let path = dir.join("binding.lock");
+    exclusive_lock(&dir.join("binding.lock"))
+}
+
+/// Block until this process holds `path`'s exclusive flock, creating
+/// the file if need be. Held until the returned file is dropped.
+pub(crate) fn exclusive_lock(path: &Path) -> anyhow::Result<std::fs::File> {
+    use std::os::fd::AsRawFd;
     let file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&path)
+        .open(path)
         .with_context(|| format!("opening `{}`", path.display()))?;
     // SAFETY: valid owned fd; flock has no memory effects.
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {

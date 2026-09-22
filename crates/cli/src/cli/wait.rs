@@ -107,6 +107,7 @@ fn firings_from_items(items: &[WaitItem]) -> Vec<HookFiring> {
             // ad-hoc commits have no plan.
             | WaitItem::AdHocSettled { .. }
             | WaitItem::PromoteFromQueue { .. }
+            | WaitItem::Message { .. }
             | WaitItem::Blocked { .. }
             | WaitItem::Unblocked { .. }
             // Observer items never fire hooks: the observer path is
@@ -130,6 +131,16 @@ fn firings_from_items(items: &[WaitItem]) -> Vec<HookFiring> {
 }
 
 pub async fn run(args: WaitArgs) -> anyhow::Result<()> {
+    let json = args.json;
+    if let Some(items) = items(args).await? {
+        emit(&items, json);
+    }
+    Ok(())
+}
+
+/// What this wait wakes with — the same items `run` prints — or `None`
+/// when an observer (`--for`) already reported its own.
+pub async fn items(args: WaitArgs) -> anyhow::Result<Option<Vec<WaitItem>>> {
     // Before ANY setup: the fold and the watcher attach can block for
     // seconds, and an owner that dies in that window must still reap
     // this process (remove-wait-timeout).
@@ -148,7 +159,8 @@ pub async fn run(args: WaitArgs) -> anyhow::Result<()> {
     // resolution: the observed repo has no session binding for the
     // caller, and --author is deliberately ignored.
     if let Some(event) = args.r#for {
-        return run_observer(&repo, event, poll_mode, args.no_cache, args.json).await;
+        run_observer(&repo, event, poll_mode, args.no_cache, args.json).await?;
+        return Ok(None);
     }
 
     // Resolve --author via the shared identity resolver when
@@ -205,30 +217,18 @@ pub async fn run(args: WaitArgs) -> anyhow::Result<()> {
             .iter()
             .any(|i| matches!(i, WaitItem::Unblocked { .. }));
         if has_answer {
-            emit(&br.items, args.json);
-            return Ok(());
+            return Ok(Some(br.items));
         }
 
         if !br.suppress_all {
-            let mut items = initial_status.work_for(&author, inputs.role);
-            // Finished is a NOTIFICATION, not work, and only MASTER
-            // acts on it (the finalization-lifecycle role + home of
-            // the plan_finalized hook). A reviewer has no action on a
-            // finish, so injecting it into the work stream would wake
-            // an idle reviewer via the `!items.is_empty()` gate below
-            // for nothing (`finish-does-not-wake-reviewers`).
-            if inputs.role == Role::Master {
-                items.extend(detect_finished(&snapshot, &initial_state.fold));
-                // Ad-hoc settles are the same shape: a verdict
-                // notification only master acts on. Initial-pass
-                // emission is vacuous by construction (the snapshot
-                // was captured from THIS derive, so nothing has
-                // settled yet) but keeps the two sites symmetric.
-                items.extend(clank_core::wait::detect_adhoc_settled(
-                    &snapshot,
-                    &initial_status.ad_hoc,
-                ));
-            }
+            let items = items_for(
+                &repo,
+                &author,
+                &inputs,
+                &initial_status,
+                &initial_state.fold,
+                &snapshot,
+            );
             if !items.is_empty() {
                 // `--peek` is a pure probe: report work-presence, fire NO
                 // lifecycle hooks (the Stop hook may peek on every stop).
@@ -237,39 +237,27 @@ pub async fn run(args: WaitArgs) -> anyhow::Result<()> {
                         hook_config::run_hook(&repo, &inputs.hook_config, firing);
                     }
                 }
-                emit(&items, args.json);
-                return Ok(());
+                return Ok(Some(items));
             }
         } // !suppress_all
     }
 
-    // Master with nothing active is pointed at the queue. A pending
+    // A master with nothing active and nothing queued is idle. A pending
     // block parks this agent entirely (`initial_suppress_all`), so
-    // reaching here means there is no block to work around.
-    if !initial_suppress_all && inputs.role == Role::Master && initial_state.fold.plans.is_empty() {
-        let queue = match crate::cli::queue::scan_queue_no_dups(&repo) {
-            Ok(q) => q,
-            Err(e) => {
-                eprintln!("wait: {e}");
-                Vec::new()
-            }
-        };
-        let items = queue_promote_outcome(&queue);
-        if !items.is_empty() {
-            emit(&items, args.json);
-            return Ok(());
-        }
-        // The idle hook is a side effect; `--peek` must not fire it.
-        if !args.peek {
-            hook_config::run_idle_hook(&repo, &inputs.hook_config);
-        }
+    // reaching here means there is no block to work around. The idle
+    // hook is a side effect; `--peek` must not fire it.
+    if !initial_suppress_all
+        && !args.peek
+        && inputs.role == Role::Master
+        && initial_state.fold.plans.is_empty()
+    {
+        hook_config::run_idle_hook(&repo, &inputs.hook_config);
     }
 
     // `--peek`: the initial pass found no actionable work → report empty
     // and return immediately, never entering the (blocking) watcher loop.
     if args.peek {
-        emit(&[], args.json);
-        return Ok(());
+        return Ok(Some(Vec::new()));
     }
 
     let (tx, rx) = mpsc::channel::<()>();
@@ -380,42 +368,14 @@ pub async fn run(args: WaitArgs) -> anyhow::Result<()> {
                 let status = state
                     .fold
                     .derive_status(&reviews, &inputs.work_policy, head.as_ref());
-                let mut items = status.work_for(&author, inputs.role);
-                // Master-only Finished notice (watch loop); see the
-                // initial-pass rationale above
-                // (`finish-does-not-wake-reviewers`). Ad-hoc settles
-                // ride the same master-only gate: a CONTINUE/FINISHED
-                // verdict on an ad-hoc commit routes work to no one,
-                // so without this the parked master never wakes
-                // (adhoc-continue-wake-investigation).
-                if inputs.role == Role::Master {
-                    items.extend(detect_finished(&snapshot, &state.fold));
-                    items.extend(clank_core::wait::detect_adhoc_settled(
-                        &snapshot,
-                        &status.ad_hoc,
-                    ));
-                }
+                let items = items_for(&repo, &author, &inputs, &status, &state.fold, &snapshot);
                 if !items.is_empty() {
                     for firing in &firings_from_items(&items) {
                         hook_config::run_hook(&repo, &inputs.hook_config, firing);
                     }
                     Some(items)
                 } else {
-                    // Same gate as the initial pass. Unreachable while a
-                    // block pends: `br.suppress_all` short-circuits above.
-                    if inputs.role == Role::Master && state.fold.plans.is_empty() {
-                        let queue = match crate::cli::queue::scan_queue_no_dups(&repo) {
-                            Ok(q) => q,
-                            Err(e) => {
-                                eprintln!("wait: {e}");
-                                Vec::new()
-                            }
-                        };
-                        let items = queue_promote_outcome(&queue);
-                        (!items.is_empty()).then_some(items)
-                    } else {
-                        None
-                    }
+                    None
                 }
             };
 
@@ -434,9 +394,7 @@ pub async fn run(args: WaitArgs) -> anyhow::Result<()> {
     // the source tasks; command children die by process-group kill
     // (extra-wait-events).
     sources.shutdown().await;
-    let items = outcome?;
-    emit(&items, args.json);
-    Ok(())
+    Ok(Some(outcome?))
 }
 
 /// The watcher's sync channel, bridged into async.
@@ -979,13 +937,62 @@ fn check_blocks(repo: &Path, author: &AgentLabel) -> BlockResult {
     result
 }
 
+/// Everything this agent is woken for at one fold: its repo work, the
+/// master's notices, the queue when the master has nothing active, and
+/// its pending messages. The initial pass and every refold ask this one
+/// function, so a message reaches the agent whichever path returns —
+/// including `--peek`, which is the initial pass.
+fn items_for(
+    repo: &Path,
+    author: &AgentLabel,
+    inputs: &WaitInputs,
+    status: &clank_core::wait::WorkStatus,
+    fold: &clank_core::repo_state::RepoState,
+    snapshot: &StartupSnapshot,
+) -> Vec<WaitItem> {
+    let mut items = status.work_for(author, inputs.role);
+    // Finished and ad-hoc settles are NOTIFICATIONS only the master
+    // acts on; handed to a reviewer they would wake it for nothing
+    // (`finish-does-not-wake-reviewers`, adhoc-continue-wake-
+    // investigation).
+    if inputs.role == Role::Master {
+        items.extend(detect_finished(snapshot, fold));
+        items.extend(clank_core::wait::detect_adhoc_settled(
+            snapshot,
+            &status.ad_hoc,
+        ));
+        if items.is_empty() && fold.plans.is_empty() {
+            let queue = crate::cli::queue::scan_queue_no_dups(repo).unwrap_or_else(|e| {
+                eprintln!("wait: {e}");
+                Vec::new()
+            });
+            items.extend(queue_promote_outcome(&queue));
+        }
+    }
+    items.extend(message_items(repo, author));
+    items
+}
+
+/// This agent's pending messages, in the order they wake. A message is
+/// not repo work — a pending one never hides the queue from the master.
+fn message_items(repo: &Path, author: &AgentLabel) -> Vec<WaitItem> {
+    crate::inbox::scan(repo, author)
+        .into_iter()
+        .map(|m| WaitItem::Message {
+            handle: m.entry.file_stem(),
+            priority: m.entry.priority,
+            subject: m.subject().to_string(),
+            from: m.from,
+            repo: m.repo.map(|r| r.display().to_string()),
+        })
+        .collect()
+}
+
 /// The master-with-nothing-active outcome: a `PromoteFromQueue` for
-/// the first queued item, or empty when the queue is empty (the
-/// caller then parks). Both call sites are reached only when no
-/// block pends — a block sets `suppress_all` upstream — so there is
-/// no Blocked context to co-surface here and no suppression to apply.
-/// Shared by the initial pass and the watch-loop pass so the two
-/// cannot drift.
+/// the first queued item, or empty when the queue is empty. Reached
+/// only through [`items_for`], which no pass calls while a block pends
+/// — a block sets `suppress_all` upstream — so there is no Blocked
+/// context to co-surface here and no suppression to apply.
 fn queue_promote_outcome(queue: &[crate::cli::queue::QueueEntry]) -> Vec<WaitItem> {
     queue
         .first()
@@ -1040,7 +1047,7 @@ fn short(sha: &CommitSha) -> &str {
 /// irrelevant (the stop-hook parses the JSON).
 #[derive(serde::Serialize)]
 #[serde(tag = "kind")]
-enum WaitJsonItem<'a> {
+pub(crate) enum WaitJsonItem<'a> {
     #[serde(rename = "master")]
     Master {
         plan: &'a str,
@@ -1089,6 +1096,16 @@ enum WaitJsonItem<'a> {
     },
     #[serde(rename = "promote_from_queue")]
     PromoteFromQueue { name: &'a str, priority: u16 },
+    #[serde(rename = "message")]
+    Message {
+        handle: &'a str,
+        priority: u16,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        from: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        repo: Option<&'a str>,
+        subject: &'a str,
+    },
     #[serde(rename = "github_event")]
     GithubEvent {
         repo: &'a str,
@@ -1139,7 +1156,7 @@ fn plan_path(plan: &PlanKey) -> String {
     crate::init_facts::plan_md_rel(plan.as_str())
 }
 
-fn render_json(item: &WaitItem) -> WaitJsonItem<'_> {
+pub(crate) fn render_json(item: &WaitItem) -> WaitJsonItem<'_> {
     match item {
         WaitItem::Master {
             plan,
@@ -1202,6 +1219,19 @@ fn render_json(item: &WaitItem) -> WaitJsonItem<'_> {
         WaitItem::PromoteFromQueue { name, priority } => WaitJsonItem::PromoteFromQueue {
             name,
             priority: *priority,
+        },
+        WaitItem::Message {
+            handle,
+            priority,
+            from,
+            repo,
+            subject,
+        } => WaitJsonItem::Message {
+            handle,
+            priority: *priority,
+            from: from.as_deref(),
+            repo: repo.as_deref(),
+            subject,
         },
         WaitItem::GithubEvent {
             repo,
@@ -1358,6 +1388,16 @@ fn render_human(item: &WaitItem) -> String {
         WaitItem::PromoteFromQueue { name, priority } => {
             format!("promote  {name}  (priority {priority:03})")
         }
+        WaitItem::Message {
+            handle,
+            from,
+            repo,
+            subject,
+            ..
+        } => format!(
+            "message  {handle}  {}  {subject}",
+            crate::inbox::sender_words(from.as_deref(), repo.as_deref())
+        ),
         WaitItem::GithubEvent {
             repo,
             event,

@@ -17,6 +17,7 @@ mod fork_integration;
 mod git_boundary;
 mod html_integration;
 mod identity_env_boundary;
+mod inbox_wakes;
 mod no_json_literal_config_writes;
 mod no_ngrok;
 mod open_integration;

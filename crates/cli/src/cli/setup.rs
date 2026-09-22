@@ -1144,6 +1144,34 @@ mod tests {
         );
     }
 
+    /// Every role handles its inbox the same way, and the master's
+    /// command list names the sender (a-message-wakes-its-agent-until-
+    /// it-is-handled).
+    #[test]
+    fn both_role_skills_teach_the_inbox_loop() {
+        for tool in [Tool::Claude, Tool::Codex, Tool::Grok, Tool::OpenCode] {
+            for role in [Role::Master, Role::Reviewer] {
+                let skill = compose_skill(role, tool);
+                for step in [
+                    "clank inbox show",
+                    "clank inbox done",
+                    "clank send",
+                    "--master",
+                ] {
+                    assert!(
+                        skill.contains(step),
+                        "{role:?}/{tool:?} skill lacks `{step}`"
+                    );
+                }
+            }
+            assert!(
+                compose_skill(Role::Master, tool)
+                    .contains("- `clank send (--to <label> | --master)"),
+                "{tool:?}: the master's command list names `clank send`"
+            );
+        }
+    }
+
     #[test]
     fn role_skills_are_lean_each_lacks_the_other_roles_commands() {
         for tool in [Tool::Claude, Tool::Codex] {
@@ -1202,14 +1230,17 @@ mod tests {
     /// is worth more than the space.
     #[test]
     fn the_codex_reviewer_skill_stays_under_its_ceiling() {
-        // 5,667B before the compression that introduced this test.
-        const CEILING: usize = 5_300;
+        // 5,667B before the compression that introduced this test, at
+        // 5,300. Raised once, by the 285B the inbox section costs: every
+        // role must be told how a message is handled
+        // (a-message-wakes-its-agent-until-it-is-handled).
+        const CEILING: usize = 5_600;
         let len = compose_skill(Role::Reviewer, Tool::Codex).len();
         assert!(
             len <= CEILING,
             "codex reviewer skill is {len}B, over the {CEILING}B ceiling (5,667B \
-             before compression) — re-read in full every reviewing turn, so \
-             growth here is paid again on every wake"
+             before compression, 5,300B until the inbox) — re-read in full every \
+             reviewing turn, so growth here is paid again on every wake"
         );
     }
 

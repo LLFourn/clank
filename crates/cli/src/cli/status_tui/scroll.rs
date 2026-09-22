@@ -113,6 +113,7 @@ fn oldest_obligation(
             | WaitItem::FixCommitTag { .. }
             | WaitItem::MultiplePlansOpen { .. }
             | WaitItem::PromoteFromQueue { .. }
+            | WaitItem::Message { .. }
             | WaitItem::GithubEvent { .. }
             | WaitItem::CommandEvent { .. }
             | WaitItem::ForCommit { .. }

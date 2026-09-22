@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use super::{QueueArgs, QueueCmd, resolve_repo};
+use crate::priority_dir::{self, Lookup};
 
 pub async fn run(args: QueueArgs) -> anyhow::Result<()> {
     let repo = resolve_repo(args.repo.as_deref())?;
@@ -32,15 +33,13 @@ pub async fn run(args: QueueArgs) -> anyhow::Result<()> {
 /// draft body fails only after we know the queue item could land.
 fn add_cmd(repo: &Path, args: super::QueueAddArgs) -> anyhow::Result<()> {
     validate_name(&args.name)?;
-    if args.priority > 999 {
-        anyhow::bail!("priority must be 0-999");
-    }
+    priority_dir::check_priority(args.priority)?;
     let scanned = scan_queue(repo);
     let conflicts: Vec<&QueueEntry> = scanned.iter().filter(|e| e.name == args.name).collect();
     if !conflicts.is_empty() {
         let listed = conflicts
             .iter()
-            .map(|e| format!("{:03}-{}.md", e.priority, e.name))
+            .map(|e| priority_dir::file_name(e.priority, &e.name))
             .collect::<Vec<_>>()
             .join(", ");
         anyhow::bail!(
@@ -148,26 +147,7 @@ fn queue_dir(repo: &Path) -> PathBuf {
     repo.join(".clank/queue")
 }
 
-#[derive(Clone, Debug)]
-pub struct QueueEntry {
-    pub priority: u16,
-    pub name: String,
-    pub path: PathBuf,
-}
-
-impl QueueEntry {
-    /// The file's stem — `500-foo`, `foo`, `001-foo` — the one handle
-    /// that is unique per entry. The parse is lenient, so two files
-    /// can share a name and even a priority; anything keyed by those
-    /// collides. Pages, links and targets that must mean ONE entry
-    /// use this (a-queued-plan-has-a-page).
-    pub fn file_stem(&self) -> String {
-        self.path
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| self.name.clone())
-    }
-}
+pub type QueueEntry = priority_dir::Entry;
 
 /// The entry `handle` means: its file stem exactly, else its NAME when
 /// that names exactly one entry. Ambiguity is an error naming the
@@ -175,14 +155,10 @@ impl QueueEntry {
 /// carries is "not in the queue".
 pub fn resolve_entry(repo: &Path, handle: &str) -> anyhow::Result<QueueEntry> {
     let entries = scan_queue(repo);
-    if let Some(e) = entries.iter().find(|e| e.file_stem() == handle) {
-        return Ok(e.clone());
-    }
-    let by_name: Vec<&QueueEntry> = entries.iter().filter(|e| e.name == handle).collect();
-    match by_name.as_slice() {
-        [one] => Ok((*one).clone()),
-        [] => anyhow::bail!("`{handle}` is not in the queue (see `clank queue`)"),
-        many => anyhow::bail!(
+    match priority_dir::by_handle(&entries, handle) {
+        Lookup::One(e) => Ok(e.clone()),
+        Lookup::None => anyhow::bail!("`{handle}` is not in the queue (see `clank queue`)"),
+        Lookup::Many(many) => anyhow::bail!(
             "`{handle}` names {} queue files ({}); pass the file stem",
             many.len(),
             many.iter()
@@ -216,7 +192,7 @@ pub fn scan_queue_no_dups(repo: &Path) -> anyhow::Result<Vec<QueueEntry>> {
                     e.path
                         .file_name()
                         .map(|f| f.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| format!("{:03}-{}.md", e.priority, e.name))
+                        .unwrap_or_else(|| priority_dir::file_name(e.priority, &e.name))
                 })
                 .collect();
             (name.to_string(), files)
@@ -236,52 +212,8 @@ pub fn scan_queue_no_dups(repo: &Path) -> anyhow::Result<Vec<QueueEntry>> {
     );
 }
 
-/// Default priority for queue files WITHOUT a `NNN-` prefix: the end
-/// of the queue — explicit priorities always sort sooner
-/// (lenient-queue-filenames).
-pub const DEFAULT_QUEUE_PRIORITY: u16 = 999;
-
-/// Parse a queue file stem into `(priority, name)`. Lenient by design
-/// (lenient-queue-filenames): the strict `NNN-name` shape is a WRITER
-/// convention, not a reader contract — a hand-dropped `foo.md` must
-/// not be silently invisible. Split at the FIRST `-`: 1–3 ASCII
-/// digits on the left = an explicit priority (zero-padding optional,
-/// so `12-foo` works); anything else — no dash, non-digits (`2fa-x`),
-/// out-of-range digits (`1234-x`) — is a NAME at
-/// [`DEFAULT_QUEUE_PRIORITY`]. Total: every stem parses.
-pub fn parse_queue_stem(stem: &str) -> (u16, String) {
-    if let Some((left, rest)) = stem.split_once('-')
-        && (1..=3).contains(&left.len())
-        && left.bytes().all(|b| b.is_ascii_digit())
-        && !rest.is_empty()
-        && let Ok(priority) = left.parse::<u16>()
-    {
-        return (priority, rest.to_string());
-    }
-    (DEFAULT_QUEUE_PRIORITY, stem.to_string())
-}
-
 pub fn scan_queue(repo: &Path) -> Vec<QueueEntry> {
-    let dir = queue_dir(repo);
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return Vec::new();
-    };
-    let mut out: Vec<QueueEntry> = Vec::new();
-    for entry in entries.flatten() {
-        let fname = entry.file_name();
-        let Some(s) = fname.to_str() else { continue };
-        let Some(stem) = s.strip_suffix(".md") else {
-            continue;
-        };
-        let (priority, name) = parse_queue_stem(stem);
-        out.push(QueueEntry {
-            priority,
-            name,
-            path: entry.path(),
-        });
-    }
-    out.sort_by(|a, b| a.priority.cmp(&b.priority).then(a.name.cmp(&b.name)));
-    out
+    priority_dir::scan(&queue_dir(repo))
 }
 
 fn list(repo: &Path) -> anyhow::Result<()> {
@@ -318,15 +250,13 @@ pub(crate) fn add(
     source: BodySource,
 ) -> anyhow::Result<PathBuf> {
     validate_name(name)?;
-    if priority > 999 {
-        anyhow::bail!("priority must be 0-999");
-    }
+    priority_dir::check_priority(priority)?;
     let scanned = scan_queue(repo);
     let conflicts: Vec<&QueueEntry> = scanned.iter().filter(|e| e.name == name).collect();
     if !conflicts.is_empty() {
         let listed = conflicts
             .iter()
-            .map(|e| format!("{:03}-{}.md", e.priority, e.name))
+            .map(|e| priority_dir::file_name(e.priority, &e.name))
             .collect::<Vec<_>>()
             .join(", ");
         anyhow::bail!(
@@ -347,7 +277,7 @@ pub(crate) fn add(
     // `.clank/.gitignore` allow-list (`/*`) — no per-dir entry to add.
     let dir = queue_dir(repo);
     std::fs::create_dir_all(&dir)?;
-    let dest = dir.join(format!("{priority:03}-{name}.md"));
+    let dest = dir.join(priority_dir::file_name(priority, name));
     std::fs::write(&dest, body)?;
     // The queue entry is the record now — consume the draft. Strictly
     // after the write so a failed write leaves the draft for a retry;
@@ -364,14 +294,13 @@ pub(crate) fn add(
 }
 
 fn find_unique<'a>(entries: &'a [QueueEntry], name: &str) -> anyhow::Result<&'a QueueEntry> {
-    let matches: Vec<&QueueEntry> = entries.iter().filter(|e| e.name == name).collect();
-    match matches.as_slice() {
-        [] => anyhow::bail!("`{name}` not in queue"),
-        [only] => Ok(*only),
-        many => {
+    match priority_dir::by_name(entries, name) {
+        Lookup::None => anyhow::bail!("`{name}` not in queue"),
+        Lookup::One(only) => Ok(only),
+        Lookup::Many(many) => {
             let listed = many
                 .iter()
-                .map(|e| format!("{:03}-{}.md", e.priority, e.name))
+                .map(|e| priority_dir::file_name(e.priority, &e.name))
                 .collect::<Vec<_>>()
                 .join(", ");
             anyhow::bail!(
@@ -395,18 +324,10 @@ fn remove(repo: &Path, name: &str) -> anyhow::Result<()> {
 /// nudge go through (no ad-hoc renames). Same priority is a no-op.
 /// Returns the entry's (possibly new) path.
 pub fn set_priority(repo: &Path, name: &str, priority: u16) -> anyhow::Result<PathBuf> {
-    if priority > 999 {
-        anyhow::bail!("priority must be 0-999");
-    }
+    priority_dir::check_priority(priority)?;
     let entries = scan_queue(repo);
     let entry = find_unique(&entries, name)?;
-    if entry.priority == priority {
-        return Ok(entry.path.clone());
-    }
-    let dest = queue_dir(repo).join(format!("{priority:03}-{name}.md"));
-    std::fs::rename(&entry.path, &dest)
-        .map_err(|e| anyhow::anyhow!("renaming `{}`: {e}", entry.path.display()))?;
-    Ok(dest)
+    priority_dir::set_priority(&queue_dir(repo), entry, priority)
 }
 
 fn reprioritise(repo: &Path, name: &str, priority: u16) -> anyhow::Result<()> {
@@ -579,20 +500,6 @@ mod tests {
             ],
             "explicit priorities sort sooner; bare files at 999 tie-break by name"
         );
-    }
-
-    #[test]
-    fn parse_queue_stem_edges() {
-        assert_eq!(parse_queue_stem("500-foo"), (500, "foo".into()));
-        assert_eq!(parse_queue_stem("012-foo"), (12, "foo".into()));
-        assert_eq!(parse_queue_stem("0-foo"), (0, "foo".into()));
-        assert_eq!(parse_queue_stem("foo"), (999, "foo".into()));
-        // Not all digits before the first dash → a name.
-        assert_eq!(parse_queue_stem("2fa-support"), (999, "2fa-support".into()));
-        // Four digits exceed 0-999 → a name, not a bad priority.
-        assert_eq!(parse_queue_stem("1234-foo"), (999, "1234-foo".into()));
-        // A dash with nothing after it is a name, not an empty stem.
-        assert_eq!(parse_queue_stem("123-"), (999, "123-".into()));
     }
 
     #[test]

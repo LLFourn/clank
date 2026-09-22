@@ -1849,6 +1849,10 @@ pub(crate) struct WaitItem {
     instructions: Option<String>,
     exit_code: Option<i64>,
     output_tail: Option<String>,
+    // An inbox message's payload.
+    handle: Option<String>,
+    from: Option<String>,
+    subject: Option<String>,
 }
 
 fn parse_wait_json(raw: &[u8]) -> Result<Vec<WaitItem>, String> {
@@ -1911,6 +1915,7 @@ pub(crate) fn discharge_of(kind: &str, reason: Option<&str>) -> Option<Discharge
             "fires until one plan is active — `clank finish` one, or `clank stash push` the rest",
         ),
         "promote_from_queue" => Until("fires until the item is promoted or removed from the queue"),
+        "message" => Until("fires until the message is handled — `clank inbox done <handle>`"),
         "github_event" => Until("fires until the event is acked — `clank events ack`"),
         "adhoc_review" => Until("fires until feedback exists for that sha"),
         "adhoc_revise" => Until("fires until you commit the revision"),
@@ -1996,6 +2001,12 @@ fn render_wait_items_ref(items: &[&WaitItem], label: &AgentLabel, role: Role) ->
             "adhoc_settled" => {
                 let gate = item.gate.as_deref().unwrap_or("?");
                 out.push_str(&format!("  - adhoc-settled: {short} (gate {gate})\n"));
+            }
+            "message" => {
+                let handle = item.handle.as_deref().unwrap_or("?");
+                let from = crate::inbox::sender_words(item.from.as_deref(), item.repo.as_deref());
+                let subject = item.subject.as_deref().unwrap_or("");
+                out.push_str(&format!("  - message: {handle} {from}: {subject}\n"));
             }
             "promote_from_queue" => {
                 let name = item.name.as_deref().unwrap_or("?");
@@ -2819,6 +2830,7 @@ mod tests {
             W::FixCommitTag { .. } => "fix_commit_tag",
             W::MultiplePlansOpen { .. } => "multiple_plans_open",
             W::PromoteFromQueue { .. } => "promote_from_queue",
+            W::Message { .. } => "message",
             W::GithubEvent { .. } => "github_event",
             W::CommandEvent { .. } => "command_event",
             W::ForCommit { .. } => "for_commit",
@@ -2854,6 +2866,7 @@ mod tests {
             "fix_commit_tag",
             "multiple_plans_open",
             "promote_from_queue",
+            "message",
             "github_event",
             "adhoc_review",
             "adhoc_revise",
@@ -3939,6 +3952,40 @@ mod tests {
                 "wake must not carry `{tutorial}`; got:\n{out}"
             );
         }
+    }
+
+    /// A real message item, through the wait's own JSON, renders as
+    /// its line and says what ends it — so the two sides' field names
+    /// cannot drift apart.
+    #[test]
+    fn a_message_renders_its_handle_sender_and_subject() {
+        let item = |from: Option<&str>, repo: Option<&str>| {
+            serde_json::to_value(crate::cli::wait::render_json(
+                &clank_core::wait::WaitItem::Message {
+                    handle: "500-00000001-rebase-please".to_string(),
+                    priority: 500,
+                    from: from.map(String::from),
+                    repo: repo.map(String::from),
+                    subject: "Rebase please".to_string(),
+                },
+            ))
+            .unwrap()
+        };
+        let out = items_text(&[item(Some("claude"), Some("/src/clank")), item(None, None)]);
+        assert!(
+            out.contains(
+                "  - message: 500-00000001-rebase-please from claude (/src/clank): Rebase please\n"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains("  - message: 500-00000001-rebase-please from a person: Rebase please\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("fires until the message is handled — `clank inbox done <handle>`"),
+            "{out}"
+        );
     }
 
     #[test]

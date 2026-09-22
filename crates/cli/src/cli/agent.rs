@@ -412,7 +412,7 @@ fn find_in_set(
         .map(|r| r.desc.clone())
 }
 
-fn registered_labels(set: &crate::cli::teams_config::RegisteredSet) -> Vec<String> {
+pub(crate) fn registered_labels(set: &crate::cli::teams_config::RegisteredSet) -> Vec<String> {
     let mut out = vec![set.master.as_str().to_string()];
     out.extend(set.reviewers.iter().map(|r| r.label.as_str().to_string()));
     out

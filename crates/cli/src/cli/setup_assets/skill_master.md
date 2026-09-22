@@ -74,6 +74,8 @@ must amend BEFORE anything else proceeds. Three ways to break it:
   activates a queued plan), `clank agent set-review <name>
   commit|plan|final|gate` (change a reviewer's tier in place),
   `clank agent remove <name>`, `clank agent list`
+- `clank send (--to <label> | --master) [--repo <path>] -m "…"` —
+  message an agent, here or in another repo (see Inbox).
 - `clank block create <name> -m "question"` — ask the human. A block is
   always repo-wide: one pending block parks you entirely until it is
   answered, so raise one only when you genuinely cannot proceed.

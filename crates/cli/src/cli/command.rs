@@ -66,6 +66,17 @@ pub enum Command {
     /// agent until acked. `list` shows the unhandled backlog, `ack`
     /// closes items out, `show` prints one full record.
     Events(crate::cli::EventsArgs),
+    /// Put a message in an agent's inbox
+    ///
+    /// Addressed by repo (`--repo`, default the current one) and label
+    /// (`--to`), or `--master` for whoever that repo's roster names
+    /// master. The message wakes its agent until it is handled.
+    Send(crate::cli::SendArgs),
+    /// This agent's inbox: list, show, done, reprioritise
+    ///
+    /// Messages sent with `clank send` wait here, in priority then
+    /// send order, and wake the agent until `done` removes them.
+    Inbox(crate::cli::InboxArgs),
     /// Print the repo timeline: commits, reviews, github events
     ///
     /// Chronological and newest-first, with github events interleaved
@@ -238,6 +249,8 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Command::Wait(args) => crate::cli::wait::run(args).await,
         Command::Feedback(args) => crate::cli::feedback::run(args).await,
         Command::Events(args) => crate::cli::events::run(args).await,
+        Command::Send(args) => crate::cli::send::run(args),
+        Command::Inbox(args) => crate::cli::inbox::run(args),
         Command::As(args) => crate::cli::as_cmd::run(args).await,
         Command::Auto(args) => crate::cli::auto::run(args).await,
         Command::StopHook(args) => crate::cli::stop_hook::run(args).await,
