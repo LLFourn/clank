@@ -358,7 +358,7 @@ impl Instance {
             .filter_map(|a| {
                 let dir = crate::agent_store::agents_root(&self.repo).join(&a.label);
                 let stamp = crate::agent_store::read_turn_end(&dir)?;
-                (a.session.as_deref() == Some(stamp.session.as_str())
+                (a.session.as_ref().map(|s| s.id.as_str()) == Some(stamp.session.as_str())
                     && stamp.generation == crate::agent_store::read_wait_generation(&dir))
                 .then(|| (a.label.clone(), stamp.at))
             })

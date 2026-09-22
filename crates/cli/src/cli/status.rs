@@ -122,10 +122,12 @@ pub(crate) struct AgentAutoRow {
     /// the bare tool).
     pub(crate) tool: String,
     pub(crate) invocation: String,
-    /// The session id this label is bound to (`clank as`), from the
-    /// agent's local config. `None` = unbound — surfaced as a problem on
-    /// the detail page, since an unbound agent can't receive work.
-    pub(crate) session: Option<String>,
+    /// The session this label is bound to (`clank as`), from the
+    /// agent's local config: its id AND its own tool, which wins over a
+    /// roster entry that may have changed since it bound. `None` =
+    /// unbound — surfaced as a problem on the detail page, since an
+    /// unbound agent can't receive work.
+    pub(crate) session: Option<clank_core::Session>,
     /// The last attendance DECISION the Stop hook made, or `None` if
     /// its most recent turn-end was not an attending silence.
     ///
@@ -217,10 +219,7 @@ fn roster_auto_rows(
             .ok()
             .flatten();
         let auto_mode = crate::cli::team::resolve_effective_auto_mode(cfg.as_ref(), home);
-        let session = cfg
-            .as_ref()
-            .and_then(|c| c.session.as_ref())
-            .map(|s| s.id.as_str().to_string());
+        let session = cfg.as_ref().and_then(|c| c.session.clone());
         rows.push(AgentAutoRow {
             label: label.as_str().to_string(),
             role,

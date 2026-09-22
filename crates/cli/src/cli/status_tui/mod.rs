@@ -202,7 +202,7 @@ fn apply_confirm(
     match action {
         // Executed at the call site, which holds the page identity the
         // post-confirm revalidation needs.
-        ConfirmAction::KillAttended => Ok(()),
+        ConfirmAction::KillAttended | ConfirmAction::ClearSession { .. } => Ok(()),
         ConfirmAction::AddCandidate { idx, tier } => {
             if let Some(c) = picker.get(idx)
                 && let Ok(label) = clank_core::ids::AgentLabel::parse(&c.label)
@@ -915,8 +915,8 @@ async fn finished_multi_commit(repo: &std::path::Path, stem: &str) -> bool {
 /// An agent's facts as a document: the command it is launched with,
 /// whole, and whether a session is bound to it.
 pub(super) fn agent_facts(agent: &crate::cli::status::AgentAutoRow) -> String {
-    let session = match agent.session.as_deref() {
-        Some(id) => format!("session     {id}"),
+    let session = match agent.session.as_ref() {
+        Some(bound) => format!("session     {}", bound.id.as_str()),
         None => format!(
             "session     unbound — run `clank as {}` in its session",
             agent.label
@@ -987,6 +987,9 @@ fn apply_detail_action(
         DetailAction::Remove => Mode::Confirm {
             action: ConfirmAction::RemoveAgent { idx },
         },
+        DetailAction::ClearSession => {
+            unreachable!("the loop opens the clear confirm through open_clear_confirm")
+        }
         // The request itself goes to the zellij worker at the call
         // site (this function holds no worker); the page stays open
         // and the answer lands in the notice row.
@@ -1000,6 +1003,55 @@ fn apply_detail_action(
         DetailAction::Reopen => Mode::AgentDetail { idx, sel },
         DetailAction::Back => Mode::AgentPanel { sel: agent_row },
     }
+}
+
+/// Release the session the clear confirm named, and return to that
+/// agent's page whatever happened.
+///
+/// Compare-and-clear through [`crate::agent_store::release_binding`]
+/// against the target captured when the confirm opened, so a binding
+/// that changed after it was shown is left alone, and the page says so.
+fn clear_target_session(
+    repo: &std::path::Path,
+    snapshot: &mut StatusSnapshot,
+    target: Option<&crate::cli::status_tui::input::ClearTarget>,
+    open: &mut Option<Overlay>,
+) -> Mode {
+    let not_cleared = |why: String| Some(Overlay::error("nothing was cleared".to_string(), why));
+    let Some(target) = target else {
+        *open = not_cleared("the confirm had no session to clear".to_string());
+        return Mode::AgentPanel { sel: 0 };
+    };
+    let Some(idx) = relocate_detail(&target.label, &snapshot.agents) else {
+        *open = not_cleared(format!("`{}` is no longer on the roster", target.label));
+        return Mode::AgentPanel { sel: 0 };
+    };
+    let page = Mode::AgentDetail { idx, sel: 0 };
+    let label = match clank_core::ids::AgentLabel::parse(&target.label) {
+        Ok(label) => label,
+        Err(e) => {
+            *open = not_cleared(format!("{e}"));
+            return page;
+        }
+    };
+    let id = &target.session.id;
+    match crate::agent_store::release_binding(repo, &label, id) {
+        Ok(true) => snapshot.agents[idx].session = None,
+        Ok(false) => {
+            *open = not_cleared(format!(
+                "`{label}` is no longer bound to {}: its binding changed after the confirm \
+                 showed it",
+                id.as_str()
+            ))
+        }
+        Err(e) => {
+            *open = Some(Overlay::error(
+                "clear session failed".to_string(),
+                format!("{e:?}"),
+            ))
+        }
+    }
+    page
 }
 
 /// The screens whose content is an agent's pane presence: the roster
@@ -2366,6 +2418,8 @@ pub(crate) async fn run_tui(
     // ⟺ mode is `EventDetail` (set/cleared together, like plan_page).
     let mut event_page: Option<EventPage> = None;
     let mut wait_page: Option<crate::cli::status_tui::input::WaitPage> = None;
+    let mut seen_session: Option<crate::cli::status_tui::input::SeenSession> = None;
+    let mut clear_target: Option<crate::cli::status_tui::input::ClearTarget> = None;
     // Monotonic across the whole session: every request the page makes
     // gets a number, and only the newest one's answer is wanted
     // (tui-github-event-content, Contract 3).
@@ -2562,6 +2616,20 @@ pub(crate) async fn run_tui(
         }
         let presence = reconcile_worker.presence();
         mode = settle_detail_cursor(mode, &snapshot.agents, &presence, &mut detail_shown);
+        crate::cli::status_tui::input::settle_seen_session(
+            mode,
+            &snapshot.agents,
+            &mut seen_session,
+            |tool, id| crate::session_probe::session_jsonl_exists(&tool, id, home.as_deref()),
+        );
+        if !matches!(
+            mode,
+            Mode::Confirm {
+                action: ConfirmAction::ClearSession { .. }
+            }
+        ) {
+            clear_target = None;
+        }
         let remote_detail = remote.detail();
         // Every page that READS the door, not just the one that used to
         // hold its contents. The token page and the sessions page were
@@ -2576,6 +2644,8 @@ pub(crate) async fn run_tui(
         });
         let view = PanelView {
             wait_page: wait_page.as_ref(),
+            seen_session: seen_session.as_ref(),
+            clear_target: clear_target.as_ref(),
             mode,
             plan_page: plan_page.as_ref(),
             event_page: event_page.as_ref(),
@@ -3200,7 +3270,11 @@ pub(crate) async fn run_tui(
                                 .agents
                                 .get(idx)
                                 .map(|a| {
-                                    detail_actions(a.role, reconcile_worker.presence_of(&a.label))
+                                    detail_actions(
+                                        a.role,
+                                        reconcile_worker.presence_of(&a.label),
+                                        a.session.is_some(),
+                                    )
                                 })
                                 .unwrap_or_default();
                             // The list the operator SAW is what their
@@ -3225,6 +3299,20 @@ pub(crate) async fn run_tui(
                                 }
                                 DetailNav::MoveCursor(s) => {
                                     mode = Mode::AgentDetail { idx, sel: s }
+                                }
+                                // The confirm and what it will release are
+                                // taken in this one keystroke: keys arrive
+                                // in batches, and no painted frame need
+                                // stand between opening a page and `u`.
+                                DetailNav::Activate(DetailAction::ClearSession) => {
+                                    if let Some((next, target)) = snapshot
+                                        .agents
+                                        .get(idx)
+                                        .and_then(crate::cli::status_tui::input::open_clear_confirm)
+                                    {
+                                        mode = next;
+                                        clear_target = Some(target);
+                                    }
                                 }
                                 DetailNav::Activate(action) => {
                                     // Swap opens a picker, so its
@@ -3352,6 +3440,25 @@ pub(crate) async fn run_tui(
                         },
                         // Confirm: one decision, resolved in one place.
                         Mode::Confirm { action } => {
+                            if let ConfirmAction::ClearSession { scroll } = action
+                                && let Some(target) = clear_target.as_ref()
+                                && let Some(scroll) =
+                                    crate::cli::status_tui::input::clear_confirm_scroll(
+                                        scroll,
+                                        k,
+                                        crate::cli::status_tui::render::clear_confirm_max_scroll(
+                                            target,
+                                            reconcile_worker.presence_of(&target.label),
+                                            rows as usize,
+                                            cols as usize,
+                                        ),
+                                    )
+                            {
+                                mode = Mode::Confirm {
+                                    action: ConfirmAction::ClearSession { scroll },
+                                };
+                                continue;
+                            }
                             if let Some(go) = confirm_decision(action, k) {
                                 if action.is_plan_page() {
                                     // Plan-page confirms execute the async
@@ -3410,6 +3517,27 @@ pub(crate) async fn run_tui(
                                     }
                                     wait_page = None;
                                     mode = Mode::AgentPanel { sel: 0 };
+                                    continue;
+                                }
+                                if let ConfirmAction::ClearSession { .. } = action {
+                                    mode = if go {
+                                        refresh_pending = true;
+                                        clear_target_session(
+                                            &repo,
+                                            &mut snapshot,
+                                            clear_target.as_ref(),
+                                            &mut detail,
+                                        )
+                                    } else {
+                                        clear_target
+                                            .as_ref()
+                                            .and_then(|t| {
+                                                relocate_detail(&t.label, &snapshot.agents)
+                                            })
+                                            .map_or(Mode::AgentPanel { sel: 0 }, |idx| {
+                                                Mode::AgentDetail { idx, sel: 0 }
+                                            })
+                                    };
                                     continue;
                                 }
                                 let mut roster_write_succeeded = false;
@@ -4105,7 +4233,8 @@ pub(crate) async fn run_tui(
                         Mode::LogScroll
                     }
                     Mode::Confirm {
-                        action: ConfirmAction::RemoveAgent { .. },
+                        action:
+                            ConfirmAction::RemoveAgent { .. } | ConfirmAction::ClearSession { .. },
                     } if snapshot.agents.is_empty() => Mode::LogScroll,
                     Mode::AgentPanel { sel } => Mode::AgentPanel {
                         sel: panel_anchor
@@ -4186,6 +4315,26 @@ pub(crate) async fn run_tui(
                             cols as usize,
                         )),
                     ),
+                    // The clear confirm's target is the captured
+                    // `clear_target`, fixed across refreshes, so a rebind
+                    // under it cannot change what "yes" releases. It
+                    // stays up while its agent is on the roster.
+                    Mode::Confirm {
+                        action: ConfirmAction::ClearSession { scroll },
+                    } => match clear_target
+                        .as_ref()
+                        .and_then(|t| relocate_detail(&t.label, &snapshot.agents))
+                    {
+                        Some(_) => Mode::Confirm {
+                            action: ConfirmAction::ClearSession { scroll },
+                        },
+                        None => Mode::AgentPanel {
+                            sel: crate::cli::status_tui::input::add_row_index(&panel_row_list(
+                                &snapshot,
+                                cols as usize,
+                            )),
+                        },
+                    },
                     // The plan page tracks its plan by STEM: recompute
                     // the facts against the fresh snapshot (block state /
                     // finished-ness can flip under us); a vanished plan
@@ -6471,6 +6620,171 @@ pub(crate) mod tests {
         );
         let after = std::fs::read_to_string(repo.path().join(".clank/config.json")).unwrap();
         assert_eq!(before, after, "unticking the last coverage is a no-op");
+    }
+
+    fn bind(repo: &std::path::Path, label: &str, id: &str) {
+        let cfg = clank_core::AgentConfig {
+            session: Some(bound(clank_core::vocab::Tool::Codex, id)),
+            ..Default::default()
+        };
+        crate::agent_store::save_agent_config(
+            repo,
+            &clank_core::ids::AgentLabel::parse(label).unwrap(),
+            &cfg,
+        )
+        .unwrap();
+    }
+
+    fn bound_id(repo: &std::path::Path, label: &str) -> Option<String> {
+        crate::agent_store::load_agent_config(
+            repo,
+            &clank_core::ids::AgentLabel::parse(label).unwrap(),
+        )
+        .unwrap()
+        .and_then(|c| c.session)
+        .map(|s| s.id.as_str().to_string())
+    }
+
+    fn target(label: &str, id: &str) -> crate::cli::status_tui::input::ClearTarget {
+        crate::cli::status_tui::input::ClearTarget {
+            label: label.to_string(),
+            session: bound(clank_core::vocab::Tool::Codex, id),
+        }
+    }
+
+    #[test]
+    fn confirming_the_clear_releases_the_session_the_confirm_named() {
+        let repo = detail_repo();
+        bind(repo.path(), "codex", "session-a");
+        let dir = crate::agent_store::agents_root(repo.path()).join("codex");
+        let generation = crate::agent_store::read_wait_generation(&dir);
+        let mut s = two_agent_snap();
+        s.agents[1].session = Some(bound(clank_core::vocab::Tool::Codex, "session-a"));
+        let mut open = None;
+
+        let next = clear_target_session(
+            repo.path(),
+            &mut s,
+            Some(&target("codex", "session-a")),
+            &mut open,
+        );
+
+        assert!(open.is_none(), "a released binding opens no overlay");
+        assert_eq!(next, Mode::AgentDetail { idx: 1, sel: 0 });
+        assert_eq!(bound_id(repo.path(), "codex"), None);
+        assert!(
+            crate::agent_store::read_wait_generation(&dir) > generation,
+            "the parked wait is revoked"
+        );
+        assert!(s.agents[1].session.is_none(), "the page shows it unbound");
+    }
+
+    #[test]
+    fn a_binding_that_changed_after_the_confirm_showed_it_is_not_cleared() {
+        let repo = detail_repo();
+        bind(repo.path(), "codex", "session-b");
+        let mut s = two_agent_snap();
+        s.agents[1].session = Some(bound(clank_core::vocab::Tool::Codex, "session-a"));
+        let mut open = None;
+
+        let next = clear_target_session(
+            repo.path(),
+            &mut s,
+            Some(&target("codex", "session-a")),
+            &mut open,
+        );
+
+        assert_eq!(next, Mode::AgentDetail { idx: 1, sel: 0 });
+        assert_eq!(bound_id(repo.path(), "codex").as_deref(), Some("session-b"));
+        let said = open.expect("the page says nothing was cleared");
+        let OverlayData::Error { title, message } = &said.data else {
+            panic!("a refusal is an error overlay");
+        };
+        assert_eq!(title, "nothing was cleared");
+        assert!(message.contains("changed"), "{message}");
+    }
+
+    /// Keys arrive in batches: Enter on a panel row and `u` can both be
+    /// handled before any frame of the page is painted or settled. The
+    /// keystroke that opens the confirm must capture what it releases.
+    #[test]
+    fn a_batched_enter_then_u_opens_a_confirm_that_knows_its_session() {
+        use crate::cli::status_tui::input::{
+            ClearTarget, DetailNav, Presence, agent_detail_nav, detail_actions, open_clear_confirm,
+        };
+        let repo = detail_repo();
+        bind(repo.path(), "codex", "session-a");
+        let mut s = two_agent_snap();
+        s.agents[1].session = Some(bound(clank_core::vocab::Tool::Codex, "session-a"));
+
+        // Enter on codex's panel row opened its page; nothing settled.
+        let actions = detail_actions(s.agents[1].role, Presence::Unknown, true);
+        let nav = agent_detail_nav(0, &actions, Key::Char(b'u'));
+        assert_eq!(nav, DetailNav::Activate(DetailAction::ClearSession));
+        let (mode, target) = open_clear_confirm(&s.agents[1]).expect("codex is bound");
+
+        assert_eq!(
+            mode,
+            Mode::Confirm {
+                action: ConfirmAction::ClearSession { scroll: 0 }
+            }
+        );
+        assert_eq!(
+            target,
+            ClearTarget {
+                label: "codex".to_string(),
+                session: bound(clank_core::vocab::Tool::Codex, "session-a"),
+            }
+        );
+        let mut open = None;
+        clear_target_session(repo.path(), &mut s, Some(&target), &mut open);
+        assert!(open.is_none(), "the batched confirm clears what it named");
+        assert_eq!(bound_id(repo.path(), "codex"), None);
+    }
+
+    /// A batch that leaves one agent's painted page for another's and
+    /// presses `u` targets the agent it landed on, not the session the
+    /// last frame showed.
+    #[test]
+    fn a_batch_that_switches_agents_clears_the_agent_it_landed_on() {
+        use crate::cli::status_tui::input::{SeenSession, open_clear_confirm, settle_seen_session};
+        let repo = detail_repo();
+        bind(repo.path(), "claude", "session-a");
+        bind(repo.path(), "codex", "session-b");
+        let mut s = two_agent_snap();
+        s.agents[0].session = Some(bound(clank_core::vocab::Tool::Codex, "session-a"));
+        s.agents[1].session = Some(bound(clank_core::vocab::Tool::Codex, "session-b"));
+        let mut seen: Option<SeenSession> = None;
+        settle_seen_session(
+            Mode::AgentDetail { idx: 0, sel: 0 },
+            &s.agents,
+            &mut seen,
+            |_, _| Some(true),
+        );
+        assert_eq!(seen.as_ref().map(|s| s.id.as_str()), Some("session-a"));
+
+        let (_, target) = open_clear_confirm(&s.agents[1]).expect("codex is bound");
+        assert_eq!(
+            (target.label.as_str(), target.session.id.as_str()),
+            ("codex", "session-b")
+        );
+        let mut open = None;
+        clear_target_session(repo.path(), &mut s, Some(&target), &mut open);
+        assert_eq!(bound_id(repo.path(), "codex"), None);
+        assert_eq!(
+            bound_id(repo.path(), "claude").as_deref(),
+            Some("session-a"),
+            "the page painted last is untouched"
+        );
+    }
+
+    #[test]
+    fn an_unbound_agent_opens_no_clear_confirm() {
+        let s = two_agent_snap();
+        assert_eq!(
+            crate::cli::status_tui::input::open_clear_confirm(&s.agents[1]),
+            None
+        );
     }
 
     #[test]

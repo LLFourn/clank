@@ -151,11 +151,15 @@ pub(super) fn render_at(
     if let Mode::AgentDetail { idx, sel } = mode
         && let Some(agent) = snap.agents.get(idx)
     {
-        let actions = detail_actions(agent.role, view.presence_of(&agent.label));
+        let actions = detail_actions(
+            agent.role,
+            view.presence_of(&agent.label),
+            agent.session.is_some(),
+        );
         // The loop settles the cursor by action before every frame;
         // this is only the guard against an index past the end.
         let sel = sel.min(actions.len().saturating_sub(1));
-        return render_agent_detail(agent, &actions, sel, rows, cols);
+        return render_agent_detail(agent, view.seen_session, &actions, sel, rows, cols);
     }
     if let Mode::WaitDetail { agent, sel } = mode
         && let Some((a, att)) = snap
@@ -200,6 +204,17 @@ pub(super) fn render_at(
         match action {
             ConfirmAction::AddCandidate { .. } | ConfirmAction::RemoveAgent { .. } => {
                 return render_roster_confirm(snap, picker, action, rows, cols);
+            }
+            ConfirmAction::ClearSession { scroll } => {
+                if let Some(target) = view.clear_target {
+                    return render_clear_session_confirm(
+                        target,
+                        view.presence_of(&target.label),
+                        scroll,
+                        rows,
+                        cols,
+                    );
+                }
             }
             ConfirmAction::KillAttended => {
                 if let Some((a, att)) = view
@@ -1966,6 +1981,7 @@ pub(super) fn render_kill_confirm(
 
 pub(super) fn render_agent_detail(
     agent: &crate::cli::status::AgentAutoRow,
+    seen: Option<&super::input::SeenSession>,
     actions: &[DetailAction],
     sel: usize,
     rows: usize,
@@ -2044,6 +2060,13 @@ pub(super) fn render_agent_detail(
                     desc: "the full command line, and what it is bound to",
                     danger: false,
                 },
+                DetailAction::ClearSession => MenuRow::Action {
+                    key,
+                    label: "clear session",
+                    value: None,
+                    desc: "forget the bound session, so the next start is fresh",
+                    danger: true,
+                },
                 DetailAction::Reopen => MenuRow::Action {
                     key,
                     label: "reopen pane",
@@ -2070,26 +2093,67 @@ pub(super) fn render_agent_detail(
         .collect();
     let (menu_body, starts) = menu_lines(&menu, sel, cols);
 
-    // Content: ONE line, the binding, always visible. The invocation
-    // is a configured command line with no bound relative to the pane,
-    // so it lives on the `i` document where it can scroll. Pinned here
-    // it pushed this warning off a short pane; windowed here it
-    // competed with the menu for the same rows.
-    let content: Vec<String> = vec![
-        String::new(),
-        match agent.session.as_deref() {
-            Some(_) => emit(&[dim("   session   bound".to_string())], "", cols),
-            None => emit(
-                &[
-                    dim("   session   ".to_string()),
-                    colored("31", "✗ unbound".to_string()),
-                ],
-                "",
-                cols,
-            ),
-        },
-    ];
+    // Content: the binding, always visible. The invocation is a
+    // configured command line with no bound relative to the pane, so it
+    // lives on the `i` document where it can scroll. Pinned here it
+    // pushed this warning off a short pane; windowed here it competed
+    // with the menu for the same rows.
+    const LEAD: &str = "   ";
+    let label = format!("{LEAD}session   ");
+    let mut content: Vec<String> = vec![String::new()];
+    match agent.session.as_ref() {
+        // The id is what you compare against the tool's store, so it is
+        // never cut: beside its label when the pane is wide enough,
+        // under it — wrapped if it must be — when not.
+        Some(bound) => {
+            let id = bound.id.as_str();
+            let beside = display_width(&label) + display_width(id) <= cols;
+            let indent = if beside {
+                display_width(&label)
+            } else {
+                LEAD.len()
+            };
+            if beside {
+                content.push(emit(&[dim(label.clone()), plain(id.to_string())], "", cols));
+            } else {
+                content.push(emit(&[dim(label.trim_end().to_string())], "", cols));
+                for chunk in wrap(id, cols.saturating_sub(indent).max(1)) {
+                    content.push(emit(&[dim(" ".repeat(indent)), plain(chunk)], "", cols));
+                }
+            }
+            // Only an answer about THIS session: one probed for a
+            // session bound before it says nothing about this one.
+            let tool = bound.tool.as_str();
+            let state = match seen.filter(|s| s.is_of(bound)).and_then(|s| s.present) {
+                Some(true) => Some(("32", format!("✓ {tool} has it"))),
+                Some(false) => Some(("31", format!("✗ gone — {tool} has no such session"))),
+                None => None,
+            };
+            if let Some((color, text)) = state {
+                for line in wrap(&text, cols.saturating_sub(indent).max(1)) {
+                    content.push(emit(
+                        &[dim(" ".repeat(indent)), colored(color, line)],
+                        "",
+                        cols,
+                    ));
+                }
+            }
+        }
+        None => content.push(emit(
+            &[dim(label), colored("31", "✗ unbound".to_string())],
+            "",
+            cols,
+        )),
+    }
 
+    // The binding outranks the gaps around the menu: a pane too short
+    // for all of them keeps every line of the binding.
+    if out.len() + 1 + content.len() + 1 > rows && content.first().is_some_and(String::is_empty) {
+        content.remove(0);
+    }
+    if out.len() + 1 + content.len() + 1 > rows && out.last().is_some_and(String::is_empty) {
+        out.pop();
+    }
     // The menu gets whatever the title, the content and the hint leave,
     // and never less than one line.
     let viewport = rows.saturating_sub(out.len() + content.len() + 1).max(1);
@@ -2930,6 +2994,9 @@ pub(super) fn render_roster_confirm(
             .get(idx)
             .map(|a| format!("{} [{}]", a.label, a.tool))
             .unwrap_or_else(|| "?".to_string()),
+        ConfirmAction::ClearSession { .. } => {
+            unreachable!("the clear confirm renders through render_clear_session_confirm")
+        }
         ConfirmAction::StashPlan
         | ConfirmAction::UnqueuePlan
         | ConfirmAction::PromotePlan
@@ -2948,6 +3015,7 @@ pub(super) fn render_roster_confirm(
             format!("remove reviewer `{target}`?"),
             "removes this agent from the local roster in .clank/config.json",
         ),
+        ConfirmAction::ClearSession { .. } => unreachable!("returned above"),
         ConfirmAction::StashPlan
         | ConfirmAction::UnqueuePlan
         | ConfirmAction::PromotePlan
@@ -2980,6 +3048,88 @@ pub(super) fn render_roster_confirm(
         out.push(emit(&[accent(format!("  {keys}"))], "", cols));
     }
     out.truncate(rows);
+    (out, 0)
+}
+
+/// The clear confirm's body at `cols`, one entry per line: what it
+/// releases, what that does, and — unless the pane is known to be gone —
+/// what it does not. A launched agent carries `CLANK_AGENT`, which names
+/// its label before any binding is read, so a process still running
+/// resolves the label again at its next turn.
+fn clear_confirm_body(
+    target: &super::input::ClearTarget,
+    presence: super::input::Presence,
+    cols: usize,
+) -> Vec<String> {
+    let label = &target.label;
+    let mut says = vec![format!(
+        "Forgets {} session {} and ends the wait it has parked, so {label}'s next start is a \
+         fresh session.",
+        target.session.tool.as_str(),
+        target.session.id.as_str()
+    )];
+    if presence != super::input::Presence::Missing {
+        says.push(format!(
+            "It does not stop a session that is still running: close {label}'s pane before \
+             starting it fresh."
+        ));
+    }
+    let mut body = vec![emit(
+        &[highlight(format!(" clear `{label}`'s session? "))],
+        "",
+        cols,
+    )];
+    for paragraph in says {
+        body.push(String::new());
+        for line in wrap(&paragraph, cols.saturating_sub(4).max(1)) {
+            body.push(emit(&[plain(format!("  {line}"))], "", cols));
+        }
+    }
+    body
+}
+
+/// The rows the clear confirm's body gets: everything but the rule
+/// above it and the decision line below.
+fn clear_confirm_viewport(rows: usize) -> usize {
+    rows.saturating_sub(2).max(1)
+}
+
+/// The last body offset the clear confirm can scroll to at this size.
+pub(super) fn clear_confirm_max_scroll(
+    target: &super::input::ClearTarget,
+    presence: super::input::Presence,
+    rows: usize,
+    cols: usize,
+) -> usize {
+    clear_confirm_body(target, presence, cols)
+        .len()
+        .saturating_sub(clear_confirm_viewport(rows))
+}
+
+/// The clear-session confirm. The decision line is pinned to the bottom
+/// and the body scrolls above it: `y` is live on this screen, so the
+/// keys that answer it and everything it would do must both be
+/// reachable however short the pane.
+pub(super) fn render_clear_session_confirm(
+    target: &super::input::ClearTarget,
+    presence: super::input::Presence,
+    scroll: usize,
+    rows: usize,
+    cols: usize,
+) -> (Vec<String>, usize) {
+    let body = clear_confirm_body(target, presence, cols);
+    let viewport = clear_confirm_viewport(rows);
+    let scroll = scroll.min(body.len().saturating_sub(viewport));
+    let mut out = vec![region_rule("confirm · agents", "", true, cols)];
+    let shown = body.len().min(viewport);
+    out.extend(body.iter().skip(scroll).take(viewport).cloned());
+    out.extend(std::iter::repeat_n(String::new(), viewport - shown));
+    let keys = if body.len() > viewport {
+        "  [y]es  [N]o  (⏎ = no)  ·  ↑↓ more"
+    } else {
+        "  [y]es  [N]o  (⏎ = no)"
+    };
+    out.push(emit(&[accent(keys.to_string())], "", cols));
     (out, 0)
 }
 
@@ -4064,6 +4214,8 @@ mod tests {
                             plan_page: None,
                             event_page: None,
                             wait_page: None,
+                            seen_session: None,
+                            clear_target: None,
                             plan_input: None,
                             picker: &[],
                             log_cursor: 0,
@@ -4105,6 +4257,8 @@ mod tests {
             plan_page: None,
             event_page: None,
             wait_page: None,
+            seen_session: None,
+            clear_target: None,
             plan_input: None,
             mode: Mode::LogScroll,
             picker: &[],
@@ -4321,6 +4475,8 @@ mod tests {
             plan_page: None,
             event_page: None,
             wait_page: None,
+            seen_session: None,
+            clear_target: None,
             plan_input: None,
             mode: Mode::LogScroll,
             picker: &[],
@@ -5796,6 +5952,8 @@ mod tests {
                 plan_page: None,
                 event_page: None,
                 wait_page: None,
+                seen_session: None,
+                clear_target: None,
                 plan_input: None,
                 mode: Mode::AddPicker { sel: 0 },
                 picker: &picker,
@@ -5845,6 +6003,8 @@ mod tests {
             plan_page: None,
             event_page: None,
             wait_page: None,
+            seen_session: None,
+            clear_target: None,
             plan_input: None,
             mode: Mode::AddPicker { sel: 0 },
             picker: &picker,
@@ -5944,6 +6104,8 @@ mod tests {
                 plan_page: None,
                 event_page: None,
                 wait_page: None,
+                seen_session: None,
+                clear_target: None,
                 plan_input: None,
                 mode: Mode::Confirm {
                     action: ConfirmAction::AddCandidate {
@@ -6017,7 +6179,10 @@ mod tests {
         let mut s = two_agent_snap();
         let mut codex = agent_row("codex", RosterRole::Commit, AutoMode::Off);
         codex.invocation = "codex --profile deep".to_string();
-        codex.session = Some("0d9af2c1-session-id".to_string());
+        codex.session = Some(crate::cli::status_tui::fixtures::bound(
+            clank_core::vocab::Tool::Codex,
+            "0d9af2c1-session-id",
+        ));
         s.agents = vec![agent_row("claude", RosterRole::Master, AutoMode::On), codex];
 
         // Reviewer detail (idx 1): info + full action set; the review tier
@@ -6301,7 +6466,10 @@ mod tests {
         codex.invocation =
             "codex --profile deep --sandbox danger-full-access --config model_reasoning_effort=high"
                 .to_string();
-        codex.session = Some("s1".to_string());
+        codex.session = Some(crate::cli::status_tui::fixtures::bound(
+            clank_core::vocab::Tool::Codex,
+            "s1-session",
+        ));
         let body = crate::cli::status_tui::agent_facts(&codex);
 
         // Narrow enough that the command cannot fit one line, and tall
@@ -6349,6 +6517,8 @@ mod tests {
             plan_page: None,
             event_page: None,
             wait_page: None,
+            seen_session: None,
+            clear_target: None,
             plan_input: None,
             mode: Mode::LogScroll,
             picker: &[],
@@ -7974,12 +8144,12 @@ mod tests {
         use clank_core::vocab::AutoMode;
         for role in [RosterRole::Master, RosterRole::Commit] {
             let agent = agent_row("kimi", role, AutoMode::On);
-            let actions = detail_actions(role, Presence::Missing);
+            let actions = detail_actions(role, Presence::Missing, false);
             let sel = actions
                 .iter()
                 .position(|a| *a == DetailAction::Reopen)
                 .expect("reopen is on every page");
-            let (lines, _) = render_agent_detail(&agent, &actions, sel, 24, 60);
+            let (lines, _) = render_agent_detail(&agent, None, &actions, sel, 24, 60);
             let row = lines
                 .iter()
                 .find(|l| visible(l).contains("reopen pane"))
@@ -7992,6 +8162,187 @@ mod tests {
         }
     }
 
+    fn page_text(
+        agent: &crate::cli::status::AgentAutoRow,
+        seen: Option<&crate::cli::status_tui::input::SeenSession>,
+    ) -> String {
+        use crate::cli::teams_config::RosterRole;
+        let actions = detail_actions(RosterRole::Commit, Presence::Live, agent.session.is_some());
+        let (lines, _) = render_agent_detail(agent, seen, &actions, 0, 40, 80);
+        lines
+            .iter()
+            .map(|l| visible(l))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn the_agent_page_names_its_session_and_whether_the_tool_has_it() {
+        use crate::cli::status_tui::fixtures::bound;
+        use crate::cli::status_tui::input::SeenSession;
+        use crate::cli::teams_config::RosterRole;
+        use clank_core::vocab::{AutoMode, Tool};
+        let id = "019f5eed-8d98-7bc3-8c8b-2f84f27e35a3";
+        let mut agent = agent_row("grok", RosterRole::Commit, AutoMode::On);
+        agent.session = Some(bound(Tool::Grok, id));
+        let seen = |present| SeenSession {
+            tool: Tool::Grok,
+            id: id.to_string(),
+            present,
+        };
+
+        let has = page_text(&agent, Some(&seen(Some(true))));
+        assert!(has.contains(id) && has.contains("✓ grok has it"), "{has}");
+        let gone = page_text(&agent, Some(&seen(Some(false))));
+        assert!(
+            gone.contains(id) && gone.contains("✗ gone — grok has no such session"),
+            "{gone}"
+        );
+        let unknown = page_text(&agent, Some(&seen(None)));
+        assert!(
+            unknown.contains(id) && !unknown.contains('✓') && !unknown.contains("✗ gone"),
+            "{unknown}"
+        );
+
+        agent.session = None;
+        let unbound = page_text(&agent, None);
+        assert!(unbound.contains("✗ unbound"), "{unbound}");
+    }
+
+    #[test]
+    fn an_answer_about_one_session_is_not_shown_for_another() {
+        use crate::cli::status_tui::fixtures::bound;
+        use crate::cli::status_tui::input::SeenSession;
+        use crate::cli::teams_config::RosterRole;
+        use clank_core::vocab::{AutoMode, Tool};
+        let mut agent = agent_row("grok", RosterRole::Commit, AutoMode::On);
+        agent.session = Some(bound(Tool::Grok, "session-b"));
+        let about_a = SeenSession {
+            tool: Tool::Grok,
+            id: "session-a".to_string(),
+            present: Some(false),
+        };
+        let text = page_text(&agent, Some(&about_a));
+        assert!(text.contains("session-b"), "{text}");
+        assert!(
+            !text.contains("✗ gone") && !text.contains('✓'),
+            "A's answer is not B's: {text}"
+        );
+    }
+
+    fn grok_target() -> crate::cli::status_tui::input::ClearTarget {
+        crate::cli::status_tui::input::ClearTarget {
+            label: "grok".to_string(),
+            session: crate::cli::status_tui::fixtures::bound(
+                clank_core::vocab::Tool::Grok,
+                "019f5eed-8d98-7bc3-8c8b-2f84f27e35a3",
+            ),
+        }
+    }
+
+    /// Every frame of the clear confirm at this size, scrolled from the
+    /// top to its last offset, and the body those frames reveal.
+    fn clear_confirm_frames(
+        presence: Presence,
+        rows: usize,
+        cols: usize,
+    ) -> (Vec<Vec<String>>, String) {
+        let target = grok_target();
+        let max = clear_confirm_max_scroll(&target, presence, rows, cols);
+        let frames: Vec<Vec<String>> = (0..=max)
+            .map(|scroll| {
+                let (lines, _) =
+                    render_clear_session_confirm(&target, presence, scroll, rows, cols);
+                lines.iter().map(|l| visible(l)).collect()
+            })
+            .collect();
+        let mut body: Vec<String> = Vec::new();
+        for (scroll, frame) in frames.iter().enumerate() {
+            for (i, line) in frame[1..frame.len() - 1].iter().enumerate() {
+                if body.len() <= scroll + i {
+                    body.push(line.clone());
+                }
+            }
+        }
+        let text = body
+            .join(" ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        (frames, text)
+    }
+
+    /// Clearing forgets a binding; it cannot disarm a process that is
+    /// still running under `CLANK_AGENT`, and the confirm must not say
+    /// it does. `y` is live on this screen at any size, so however
+    /// short the pane its answer keys stay on screen and the whole of
+    /// what it does is reachable by scrolling.
+    #[test]
+    fn the_clear_confirm_says_what_clearing_does_and_does_not_do_at_any_size() {
+        let id = grok_target().session.id.as_str().to_string();
+        for (rows, cols) in [(8, 40), (12, 40), (40, 80)] {
+            for presence in [Presence::Missing, Presence::Live, Presence::Unknown] {
+                let (frames, text) = clear_confirm_frames(presence, rows, cols);
+                for frame in &frames {
+                    assert_eq!(frame.len(), rows, "{rows}x{cols}: {frame:?}");
+                    let keys = frame.last().unwrap();
+                    assert!(
+                        keys.contains("[y]es") && keys.contains("[N]o"),
+                        "{rows}x{cols} {presence:?}: the answer keys are on screen: {frame:?}"
+                    );
+                }
+                assert!(text.contains("clear `grok`'s session?"), "{text}");
+                assert!(text.contains(&id), "{rows}x{cols}: the whole id: {text}");
+                assert!(text.contains("next start is a fresh session"), "{text}");
+                assert!(!text.contains("stops receiving work"), "{text}");
+                let warns = text.contains("does not stop a session that is still running")
+                    && text.contains("close grok's pane");
+                assert_eq!(
+                    warns,
+                    presence != Presence::Missing,
+                    "{rows}x{cols} {presence:?}: {text}"
+                );
+            }
+        }
+    }
+
+    /// The binding is the page's one fact: a short or narrow pane keeps
+    /// the whole id and its state, and gives up menu rows instead.
+    #[test]
+    fn a_small_pane_keeps_the_whole_session_id_and_its_state() {
+        use crate::cli::status_tui::fixtures::bound;
+        use crate::cli::status_tui::input::SeenSession;
+        use crate::cli::teams_config::RosterRole;
+        use clank_core::vocab::{AutoMode, Tool};
+        let id = "019f5eed-8d98-7bc3-8c8b-2f84f27e35a3";
+        let mut agent = agent_row("grok", RosterRole::Commit, AutoMode::On);
+        agent.session = Some(bound(Tool::Grok, id));
+        let seen = SeenSession {
+            tool: Tool::Grok,
+            id: id.to_string(),
+            present: Some(false),
+        };
+        let actions = detail_actions(RosterRole::Commit, Presence::Live, true);
+        for (rows, cols) in [(8, 40), (12, 40), (8, 24)] {
+            let (lines, _) = render_agent_detail(&agent, Some(&seen), &actions, 0, rows, cols);
+            let text: Vec<String> = lines.iter().map(|l| visible(l)).collect();
+            assert_eq!(text.len(), rows, "{rows}x{cols}: {text:?}");
+            assert!(
+                text.last().unwrap().contains("↑↓ move"),
+                "{rows}x{cols}: {text:?}"
+            );
+            let squeezed: String = text.iter().map(|l| l.replace(' ', "")).collect();
+            assert!(
+                squeezed.contains(id),
+                "{rows}x{cols}: the whole id: {text:?}"
+            );
+            assert!(
+                squeezed.contains("✗gone—grokhasnosuchsession"),
+                "{rows}x{cols}: {text:?}"
+            );
+        }
+    }
+
     /// Swap opens a picker rather than acting, so it must not read as
     /// a toggle or a destructive action.
     #[test]
@@ -7999,12 +8350,12 @@ mod tests {
         use crate::cli::teams_config::RosterRole;
         use clank_core::vocab::AutoMode;
         let agent = agent_row("kimi", RosterRole::Commit, AutoMode::On);
-        let actions = detail_actions(RosterRole::Commit, Presence::Live);
+        let actions = detail_actions(RosterRole::Commit, Presence::Live, false);
         let sel = actions
             .iter()
             .position(|a| *a == DetailAction::Swap)
             .expect("swap is on a reviewer page");
-        let (lines, _) = render_agent_detail(&agent, &actions, sel, 24, 60);
+        let (lines, _) = render_agent_detail(&agent, None, &actions, sel, 24, 60);
         let row = lines
             .iter()
             .map(|l| visible(l))
@@ -8040,14 +8391,14 @@ mod tests {
         // that used to push the warning off the bottom.
         agent.invocation = format!("codex {}", "--flag value ".repeat(40));
         agent.session = None;
-        let actions = detail_actions(RosterRole::Commit, Presence::Live);
+        let actions = detail_actions(RosterRole::Commit, Presence::Live, false);
         assert!(actions.len() > 4, "a menu taller than these panes");
 
         // 8 rows is the case codex named: title, blank, one menu line,
         // the binding and the hint, and nothing spare.
         for rows in [8, 12, 20] {
             for sel in 0..actions.len() {
-                let (lines, _) = render_agent_detail(&agent, &actions, sel, rows, 40);
+                let (lines, _) = render_agent_detail(&agent, None, &actions, sel, rows, 40);
                 assert_eq!(lines.len(), rows, "fills {rows} rows exactly at sel {sel}");
                 let texts: Vec<String> = lines.iter().map(|l| visible(l)).collect();
                 let shown = texts.join("\n");
@@ -8128,8 +8479,8 @@ mod tests {
         use crate::cli::teams_config::RosterRole;
         use clank_core::vocab::AutoMode;
         let agent = agent_row("codex", RosterRole::Commit, AutoMode::On);
-        let actions = detail_actions(RosterRole::Commit, Presence::Live);
-        let (lines, _) = render_agent_detail(&agent, &actions, 0, 24, 60);
+        let actions = detail_actions(RosterRole::Commit, Presence::Live, false);
+        let (lines, _) = render_agent_detail(&agent, None, &actions, 0, 24, 60);
         let texts: Vec<String> = lines.iter().map(|l| visible(l)).collect();
         let raw = lines.join("\n");
 

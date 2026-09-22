@@ -26,6 +26,16 @@ pub(crate) fn agent_row(
     }
 }
 
+/// A binding to `id` in `tool`'s store, as an agent config holds one.
+pub(crate) fn bound(tool: clank_core::vocab::Tool, id: &str) -> clank_core::Session {
+    clank_core::Session {
+        id: clank_core::ids::SessionId::parse(id).unwrap(),
+        tool,
+        updated_at: "2026-09-22T00:00:00Z".to_string(),
+        transcript: None,
+    }
+}
+
 pub(crate) fn two_agent_snap() -> StatusSnapshot {
     use crate::cli::teams_config::RosterRole;
     use clank_core::vocab::AutoMode;

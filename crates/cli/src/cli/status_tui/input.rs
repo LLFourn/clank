@@ -203,6 +203,9 @@ pub(super) enum DetailAction {
     /// picker: unlike every sibling action it needs a SECOND operand,
     /// since it acts on this agent AND an incoming one.
     Swap,
+    /// Forget the agent's bound session (behind the confirm) — offered
+    /// only while one is bound.
+    ClearSession,
     /// Bring back this agent's pane — offered only when the worker's
     /// last listing found no live one.
     Reopen,
@@ -214,41 +217,39 @@ pub(super) enum DetailAction {
 
 /// The detail-page actions for `role`, in display order. Master gets a
 /// reduced set (no review checkboxes / promote / remove): the UI hide is
-/// primary, and the cores refuse anyway (defense in depth). Reopen is
-/// there only for an agent with no live pane.
+/// primary, and the cores refuse anyway (defense in depth). Clearing the
+/// session is there only while one is `bound`; Reopen only for an agent
+/// with no live pane.
 pub(super) fn detail_actions(
     role: crate::cli::teams_config::RosterRole,
     presence: Presence,
+    bound: bool,
 ) -> Vec<DetailAction> {
     use crate::cli::teams_config::RosterRole;
     use DetailAction::*;
+    let reviewer = role != RosterRole::Master;
+    let mut actions = vec![ToggleAuto];
+    if reviewer {
+        actions.extend([TierCommit, TierPlan, TierFinal]);
+    }
     // `Info` is on EVERY role: an invocation is unbounded and cannot
     // sit on the page beside a menu, so the row that opens it is the
     // only way to read one (one-menu-not-five).
-    let mut actions = match role {
-        RosterRole::Master => vec![ToggleAuto, Info, Swap, Back],
-        RosterRole::Commit | RosterRole::Plan | RosterRole::Final | RosterRole::Gate => {
-            vec![
-                ToggleAuto,
-                TierCommit,
-                TierPlan,
-                TierFinal,
-                Info,
-                PromoteToMaster,
-                Swap,
-                Remove,
-                Back,
-            ]
-        }
-    };
-    if presence == Presence::Missing {
-        let back = actions.len() - 1;
-        let at = match role {
-            RosterRole::Master => back,
-            _ => back - 1,
-        };
-        actions.insert(at, Reopen);
+    actions.push(Info);
+    if reviewer {
+        actions.push(PromoteToMaster);
     }
+    actions.push(Swap);
+    if bound {
+        actions.push(ClearSession);
+    }
+    if presence == Presence::Missing {
+        actions.push(Reopen);
+    }
+    if reviewer {
+        actions.push(Remove);
+    }
+    actions.push(Back);
     actions
 }
 
@@ -412,6 +413,7 @@ pub(super) fn detail_hotkey(key: Key, actions: &[DetailAction]) -> Option<Detail
         Key::Char(b'm') => &[PromoteToMaster],
         Key::Char(b's') => &[Swap],
         Key::Char(b'i') => &[Info],
+        Key::Char(b'u') => &[ClearSession],
         Key::Char(b'r') => &[Reopen],
         Key::Char(b'x') => &[Remove],
         _ => return None,
@@ -432,6 +434,7 @@ pub(super) fn detail_action_key(a: DetailAction) -> &'static str {
         PromoteToMaster => "m",
         Swap => "s",
         Info => "i",
+        ClearSession => "u",
         Reopen => "r",
         Remove => "x",
         Back => "esc",
@@ -1259,6 +1262,10 @@ pub(super) enum ConfirmAction {
     },
     /// Remove the agent at this index in `snapshot.agents`.
     RemoveAgent { idx: usize },
+    /// Release the loop's [`ClearTarget`], captured in the keystroke
+    /// that opened this confirm. `scroll` is the offset into its body,
+    /// which a short pane cannot show whole.
+    ClearSession { scroll: usize },
     /// `stash push` the open plan page's plan.
     StashPlan,
     /// Move the open (queued) plan page's item back to drafts.
@@ -1523,7 +1530,11 @@ pub(super) fn settle_detail_cursor(
         *shown = None;
         return mode;
     };
-    let now = detail_actions(agent.role, presence_in(presence, &agent.label));
+    let now = detail_actions(
+        agent.role,
+        presence_in(presence, &agent.label),
+        agent.session.is_some(),
+    );
     let sel = match shown {
         Some(last) if *last != now => rebind_detail_sel(last, sel, &now),
         Some(_) => sel,
@@ -1531,6 +1542,104 @@ pub(super) fn settle_detail_cursor(
     };
     *shown = Some(now);
     Mode::AgentDetail { idx, sel }
+}
+
+/// What the open agent page knows about the session its agent is bound
+/// to: which session — the bound session's own tool and id — and
+/// whether that tool still has it. Lives in the loop beside `mode`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct SeenSession {
+    pub(super) tool: clank_core::vocab::Tool,
+    pub(super) id: String,
+    /// The probe's answer; `None` when the tool's store cannot be
+    /// probed, which is never shown as gone.
+    pub(super) present: Option<bool>,
+}
+
+impl SeenSession {
+    pub(super) fn is_of(&self, session: &clank_core::Session) -> bool {
+        self.tool == session.tool && self.id == session.id.as_str()
+    }
+}
+
+/// What the clear confirm will release: an agent and the session it was
+/// bound to when the confirm opened.
+///
+/// Captured from the roster row in the SAME keystroke that opens the
+/// confirm, never from a painted frame: keys arrive in batches, and a
+/// batch that opens a page and presses `u` — or leaves one agent's page
+/// for another's — acts before any frame shows what it acts on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ClearTarget {
+    pub(super) label: String,
+    pub(super) session: clank_core::Session,
+}
+
+impl ClearTarget {
+    pub(super) fn of(agent: &crate::cli::status::AgentAutoRow) -> Option<Self> {
+        Some(Self {
+            label: agent.label.clone(),
+            session: agent.session.clone()?,
+        })
+    }
+}
+
+/// Open the clear confirm on `agent`: the confirm and what it will
+/// release, taken together, or `None` when the agent is not bound.
+pub(super) fn open_clear_confirm(
+    agent: &crate::cli::status::AgentAutoRow,
+) -> Option<(Mode, ClearTarget)> {
+    let target = ClearTarget::of(agent)?;
+    let confirm = Mode::Confirm {
+        action: ConfirmAction::ClearSession { scroll: 0 },
+    };
+    Some((confirm, target))
+}
+
+/// The clear confirm's body offset after `key`, or `None` when the key
+/// does not scroll. `max` is the last offset the body has at the pane's
+/// current size; an offset left past it by a pane that grew steps from
+/// `max`, not from where it was.
+pub(super) fn clear_confirm_scroll(scroll: usize, key: Key, max: usize) -> Option<usize> {
+    let scroll = scroll.min(max);
+    match key {
+        Key::Up => Some(scroll.saturating_sub(1)),
+        Key::Down => Some((scroll + 1).min(max)),
+        Key::Top => Some(0),
+        Key::Bottom => Some(max),
+        _ => None,
+    }
+}
+
+/// Settle the agent page's [`SeenSession`] before a frame.
+///
+/// The probe walks the tool's session store — for codex, every rollout
+/// file when the id is missing — and the snapshot is rebuilt on every
+/// repo change, so it is asked here, once for each session the open
+/// page shows, and never by the snapshot. A different session bound
+/// under the page is asked about afresh rather than inheriting the old
+/// answer. It exists only while an agent page is open, so opening the
+/// page again asks again.
+pub(super) fn settle_seen_session(
+    mode: Mode,
+    agents: &[crate::cli::status::AgentAutoRow],
+    seen: &mut Option<SeenSession>,
+    probe: impl FnOnce(clank_core::vocab::Tool, &str) -> Option<bool>,
+) {
+    match mode {
+        Mode::AgentDetail { idx, .. } => match agents.get(idx).and_then(|a| a.session.as_ref()) {
+            None => *seen = None,
+            Some(bound) if seen.as_ref().is_some_and(|s| s.is_of(bound)) => {}
+            Some(bound) => {
+                *seen = Some(SeenSession {
+                    tool: bound.tool,
+                    id: bound.id.as_str().to_string(),
+                    present: probe(bound.tool, bound.id.as_str()),
+                })
+            }
+        },
+        _ => *seen = None,
+    }
 }
 
 /// Whether `label` has a live pane, given the worker's last report.
@@ -1663,6 +1772,8 @@ pub(super) struct PanelView<'a> {
     pub(super) plan_page: Option<&'a PlanPage>,
     pub(super) event_page: Option<&'a EventPage>,
     pub(super) wait_page: Option<&'a WaitPage>,
+    pub(super) seen_session: Option<&'a SeenSession>,
+    pub(super) clear_target: Option<&'a ClearTarget>,
     pub(super) plan_input: Option<&'a TextInput>,
     pub(super) picker: &'a [crate::cli::status::AvailableAgent],
     /// The selected log ENTRY (index into the scroll sequence) — drawn
@@ -1702,6 +1813,8 @@ impl<'a> PanelView<'a> {
             plan_page: None,
             event_page: None,
             wait_page: None,
+            seen_session: None,
+            clear_target: None,
             plan_input: None,
             picker: &[],
             log_cursor: 0,
@@ -2872,11 +2985,102 @@ mod tests {
     }
 
     #[test]
+    fn clearing_the_session_is_offered_only_while_one_is_bound() {
+        use crate::cli::teams_config::RosterRole;
+        for role in [RosterRole::Master, RosterRole::Commit] {
+            assert!(
+                detail_actions(role, Presence::Live, true).contains(&DetailAction::ClearSession),
+                "{role:?}, bound"
+            );
+            assert!(
+                !detail_actions(role, Presence::Live, false).contains(&DetailAction::ClearSession),
+                "{role:?}, unbound"
+            );
+        }
+    }
+
+    /// The probe walks a tool's whole store when a session is missing,
+    /// so it is asked once per session an open page shows: not again
+    /// for a rebuild, afresh for a different session, never off the
+    /// page, and again when the page is opened again.
+    #[test]
+    fn the_probe_is_asked_once_for_each_session_an_open_page_shows() {
+        use crate::cli::status_tui::fixtures::bound;
+        use crate::cli::teams_config::RosterRole;
+        use clank_core::vocab::{AutoMode, Tool};
+        let mut agents = vec![agent_row("grok", RosterRole::Commit, AutoMode::On)];
+        agents[0].session = Some(bound(Tool::Grok, "session-a"));
+        let asked = std::cell::RefCell::new(Vec::<String>::new());
+        let probe = |_: Tool, id: &str| {
+            asked.borrow_mut().push(id.to_string());
+            Some(false)
+        };
+        let page = Mode::AgentDetail { idx: 0, sel: 0 };
+        let mut seen = None;
+
+        settle_seen_session(page, &agents, &mut seen, probe);
+        settle_seen_session(page, &agents, &mut seen, probe);
+        assert_eq!(*asked.borrow(), ["session-a"], "a rebuild asks nothing");
+
+        agents[0].session = Some(bound(Tool::Grok, "session-b"));
+        settle_seen_session(page, &agents, &mut seen, probe);
+        assert_eq!(*asked.borrow(), ["session-a", "session-b"]);
+        assert_eq!(seen.as_ref().map(|s| s.id.as_str()), Some("session-b"));
+
+        let confirm = Mode::Confirm {
+            action: ConfirmAction::ClearSession { scroll: 0 },
+        };
+        settle_seen_session(confirm, &agents, &mut seen, probe);
+        assert_eq!(seen, None, "the answer belongs to the open page alone");
+        assert_eq!(asked.borrow().len(), 2);
+
+        agents[0].session = Some(bound(Tool::Grok, "session-c"));
+        settle_seen_session(page, &agents, &mut seen, probe);
+        assert_eq!(*asked.borrow(), ["session-a", "session-b", "session-c"]);
+
+        settle_seen_session(Mode::AgentPanel { sel: 0 }, &agents, &mut seen, probe);
+        assert_eq!(seen, None, "leaving the page drops the answer");
+        settle_seen_session(page, &agents, &mut seen, probe);
+        assert_eq!(
+            *asked.borrow(),
+            ["session-a", "session-b", "session-c", "session-c"],
+            "opening the page again asks again"
+        );
+    }
+
+    #[test]
+    fn the_clear_confirm_scrolls_within_its_body() {
+        assert_eq!(clear_confirm_scroll(0, Key::Down, 3), Some(1));
+        assert_eq!(
+            clear_confirm_scroll(3, Key::Down, 3),
+            Some(3),
+            "stops at the end"
+        );
+        assert_eq!(
+            clear_confirm_scroll(0, Key::Up, 3),
+            Some(0),
+            "stops at the top"
+        );
+        assert_eq!(clear_confirm_scroll(2, Key::Top, 3), Some(0));
+        assert_eq!(clear_confirm_scroll(0, Key::Bottom, 3), Some(3));
+        assert_eq!(
+            clear_confirm_scroll(9, Key::Up, 3),
+            Some(2),
+            "an offset a grown pane left past the end steps from the end"
+        );
+        assert_eq!(
+            clear_confirm_scroll(1, Key::Yes, 3),
+            None,
+            "`y` answers, it does not scroll"
+        );
+    }
+
+    #[test]
     fn detail_actions_are_reduced_for_master() {
         use crate::cli::teams_config::RosterRole;
         use DetailAction::*;
         assert_eq!(
-            detail_actions(RosterRole::Master, Presence::Live),
+            detail_actions(RosterRole::Master, Presence::Live, false),
             vec![ToggleAuto, Info, Swap, Back]
         );
         let reviewer = vec![
@@ -2890,8 +3094,14 @@ mod tests {
             Remove,
             Back,
         ];
-        assert_eq!(detail_actions(RosterRole::Commit, Presence::Live), reviewer);
-        assert_eq!(detail_actions(RosterRole::Gate, Presence::Live), reviewer);
+        assert_eq!(
+            detail_actions(RosterRole::Commit, Presence::Live, false),
+            reviewer
+        );
+        assert_eq!(
+            detail_actions(RosterRole::Gate, Presence::Live, false),
+            reviewer
+        );
     }
 
     /// Reopen is offered to EVERY role when the pane is missing —
@@ -2903,8 +3113,8 @@ mod tests {
     fn the_detail_cursor_follows_its_action_when_reopen_comes_and_goes() {
         use crate::cli::teams_config::RosterRole;
         use DetailAction::*;
-        let missing = detail_actions(RosterRole::Commit, Presence::Missing);
-        let live = detail_actions(RosterRole::Commit, Presence::Live);
+        let missing = detail_actions(RosterRole::Commit, Presence::Missing, false);
+        let live = detail_actions(RosterRole::Commit, Presence::Live, false);
         // Reopen selected, the pane comes back: the row is gone, and
         // the cursor must NOT land on remove, which now sits at that
         // index. It lands on Back.
@@ -3007,7 +3217,7 @@ mod tests {
             RosterRole::Final,
             RosterRole::Gate,
         ] {
-            let missing = detail_actions(role, Presence::Missing);
+            let missing = detail_actions(role, Presence::Missing, false);
             assert!(missing.contains(&DetailAction::Reopen), "{role:?}");
             assert_eq!(
                 missing.last(),
@@ -3024,7 +3234,7 @@ mod tests {
             }
             for presence in [Presence::Live, Presence::Unknown] {
                 assert!(
-                    !detail_actions(role, presence).contains(&DetailAction::Reopen),
+                    !detail_actions(role, presence, false).contains(&DetailAction::Reopen),
                     "{role:?} {presence:?}"
                 );
             }
@@ -3044,11 +3254,13 @@ mod tests {
             RosterRole::Gate,
         ] {
             assert!(
-                detail_actions(tier, Presence::Live).contains(&DetailAction::Swap),
+                detail_actions(tier, Presence::Live, false).contains(&DetailAction::Swap),
                 "{tier:?} must be swappable"
             );
         }
-        assert!(detail_actions(RosterRole::Master, Presence::Live).contains(&DetailAction::Swap));
+        assert!(
+            detail_actions(RosterRole::Master, Presence::Live, false).contains(&DetailAction::Swap)
+        );
     }
 
     /// Adding a reviewer asks WHO, then WHAT they review — and the

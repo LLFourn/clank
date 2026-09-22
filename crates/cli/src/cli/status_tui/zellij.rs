@@ -2720,7 +2720,7 @@ mod tests {
         assert_eq!(w.presence_of("r1"), Presence::Live);
         assert_eq!(auto_mark(AutoMode::On, w.presence_of("r1")).1.trim(), "▶");
         assert!(
-            !detail_actions(RosterRole::Commit, w.presence_of("r1"))
+            !detail_actions(RosterRole::Commit, w.presence_of("r1"), false)
                 .contains(&DetailAction::Reopen)
         );
 
@@ -2732,7 +2732,8 @@ mod tests {
         assert_eq!(w.presence_of("r1"), Presence::Missing);
         assert_eq!(auto_mark(AutoMode::On, w.presence_of("r1")).1.trim(), "?");
         assert!(
-            detail_actions(RosterRole::Commit, w.presence_of("r1")).contains(&DetailAction::Reopen)
+            detail_actions(RosterRole::Commit, w.presence_of("r1"), false)
+                .contains(&DetailAction::Reopen)
         );
 
         // Back again.
@@ -2743,7 +2744,7 @@ mod tests {
         assert_eq!(w.presence_of("r1"), Presence::Live);
         assert_eq!(auto_mark(AutoMode::On, w.presence_of("r1")).1.trim(), "▶");
         assert!(
-            !detail_actions(RosterRole::Commit, w.presence_of("r1"))
+            !detail_actions(RosterRole::Commit, w.presence_of("r1"), false)
                 .contains(&DetailAction::Reopen)
         );
     }
