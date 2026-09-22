@@ -38,7 +38,7 @@ pub(crate) fn recipient(repo: &Path, to: Option<&str>, master: bool) -> anyhow::
     }
     let raw = to.ok_or_else(|| anyhow::anyhow!("name a recipient: --to <label> or --master"))?;
     let label = AgentLabel::parse(raw).map_err(|e| anyhow::anyhow!("invalid --to `{raw}`: {e}"))?;
-    if set.master != label && !set.reviewers.iter().any(|r| r.label == label) {
+    if set.master != label && !set.members.iter().any(|r| r.label == label) {
         anyhow::bail!(
             "`{label}` is not on `{}`'s roster ({})",
             repo.display(),

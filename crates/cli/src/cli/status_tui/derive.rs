@@ -276,7 +276,7 @@ pub(super) fn awaited_reviewers(snap: &StatusSnapshot) -> Vec<String> {
     let work = work_projection(snap);
     snap.agents
         .iter()
-        .filter(|a| a.role != crate::cli::teams_config::RosterRole::Master)
+        .filter(|a| a.role.resolved() == Role::Reviewer)
         .filter(|a| {
             clank_core::ids::AgentLabel::parse(&a.label)
                 .is_ok_and(|l| work.is_actionable(&l, Role::Reviewer))
@@ -309,6 +309,7 @@ pub(super) fn agent_status_emoji(
                 "💤"
             }
         }
+        clank_core::vocab::Role::Standby => "💤",
     }
 }
 
@@ -468,6 +469,30 @@ mod tests {
             gate: clank_core::vocab::CommitGateState::ChangesRequested,
         }];
         assert!(awaited_reviewers(&done).is_empty());
+    }
+
+    /// An Unreviewed ad-hoc commit is owed to every reviewer by role
+    /// alone; a standby agent is not a reviewer, so the panel never
+    /// shows it awaited.
+    #[test]
+    fn a_standby_agent_is_never_awaited() {
+        use crate::cli::teams_config::RosterRole;
+        use clank_core::vocab::Role;
+        let mut s = with_agents(
+            snap(vec![], vec![]),
+            &[
+                ("claude", RosterRole::Master),
+                ("codex", RosterRole::Commit),
+                ("sb", RosterRole::Standby),
+            ],
+        );
+        s.ad_hoc = vec![clank_core::wait::AdHocWorkState {
+            handover: Default::default(),
+            sha: crate::lifecycle::CommitSha::parse(&"b".repeat(40)).unwrap(),
+            gate: clank_core::vocab::CommitGateState::Unreviewed,
+        }];
+        assert_eq!(awaited_reviewers(&s), ["codex"]);
+        assert_eq!(agent_status_emoji(&s, "sb", Role::Standby), "💤");
     }
 
     #[test]

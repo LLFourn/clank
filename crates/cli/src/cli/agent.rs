@@ -108,11 +108,11 @@ fn list(args: AgentListArgs) -> anyhow::Result<()> {
             skeleton.as_ref().and_then(|c| c.session.as_ref()),
         ));
     }
-    for r in &set.reviewers {
+    for r in &set.members {
         let skeleton = load_agent_config(&repo, &r.label)?;
         rows.push(AgentRow::from_join(
             &r.label,
-            "reviewer",
+            r.role.resolved().as_str(),
             role_word(r.role),
             r.desc.tool,
             skeleton.as_ref().and_then(|c| c.session.as_ref()),
@@ -406,7 +406,7 @@ fn find_in_set(
     if &set.master == label {
         return Some(set.master_desc.clone());
     }
-    set.reviewers
+    set.members
         .iter()
         .find(|r| &r.label == label)
         .map(|r| r.desc.clone())
@@ -414,7 +414,7 @@ fn find_in_set(
 
 pub(crate) fn registered_labels(set: &crate::cli::teams_config::RegisteredSet) -> Vec<String> {
     let mut out = vec![set.master.as_str().to_string()];
-    out.extend(set.reviewers.iter().map(|r| r.label.as_str().to_string()));
+    out.extend(set.members.iter().map(|r| r.label.as_str().to_string()));
     out
 }
 
@@ -1333,9 +1333,9 @@ pub fn add_repo_roster_agent(
         RosterTransitionPolicy::PreserveGate,
     )?;
     eprintln!(
-        "added `{}` to this repo's roster as a `{}` reviewer",
+        "added `{}` to this repo's roster: {}",
         label.as_str(),
-        role_word(role)
+        role_phrase(role)
     );
     Ok(())
 }
@@ -1393,9 +1393,9 @@ pub fn add_repo_roster_agent_by_name(
         RosterTransitionPolicy::PreserveGate,
     )?;
     eprintln!(
-        "added `{}` to this repo's roster as a `{}` reviewer (copied from the library)",
+        "added `{}` to this repo's roster: {} (copied from the library)",
         label.as_str(),
-        role_word(role)
+        role_phrase(role)
     );
     Ok(())
 }
@@ -1563,9 +1563,9 @@ pub fn set_repo_review(repo: &Path, label: &AgentLabel, tier: ReviewKind) -> any
     let new_role = RosterRole::from(tier);
     if agent.role == new_role {
         eprintln!(
-            "note: `{}` is already a `{}` reviewer",
+            "note: `{}` is already {}",
             label.as_str(),
-            role_word(new_role)
+            role_phrase(new_role)
         );
         return Ok(());
     }
@@ -1576,11 +1576,7 @@ pub fn set_repo_review(repo: &Path, label: &AgentLabel, tier: ReviewKind) -> any
         &repo_cfg,
         RosterTransitionPolicy::PreserveGate,
     )?;
-    eprintln!(
-        "set `{}` as a `{}` reviewer",
-        label.as_str(),
-        role_word(new_role)
-    );
+    eprintln!("`{}` is now {}", label.as_str(), role_phrase(new_role));
     Ok(())
 }
 
@@ -1670,6 +1666,20 @@ fn role_word(role: RosterRole) -> &'static str {
         RosterRole::Plan => "plan",
         RosterRole::Final => "final",
         RosterRole::Gate => "gate",
+        RosterRole::Standby => "standby",
+    }
+}
+
+/// What a roster role makes an agent, said in a sentence: "a `commit`
+/// reviewer", or "on standby" — standby reviews nothing, so it is not
+/// a kind of reviewer.
+fn role_phrase(role: RosterRole) -> String {
+    match role {
+        RosterRole::Standby => "on standby".to_string(),
+        RosterRole::Master => "the master".to_string(),
+        RosterRole::Commit | RosterRole::Plan | RosterRole::Final | RosterRole::Gate => {
+            format!("a `{}` reviewer", role_word(role))
+        }
     }
 }
 
@@ -2473,6 +2483,29 @@ mod tests {
             read_repo(repo.path()).agents[&codex].role,
             RosterRole::Commit
         );
+    }
+
+    #[test]
+    fn set_repo_review_moves_into_standby_and_back_into_a_tier() {
+        let repo = tempfile::tempdir().unwrap();
+        seed_repo_config(
+            repo.path(),
+            r#"{ "agents": {
+                "claude": { "tool": "claude", "role": "master" },
+                "codex": { "tool": "codex", "role": "commit" }
+            } }"#,
+        );
+        let codex = AgentLabel::parse("codex").unwrap();
+        set_repo_review(repo.path(), &codex, ReviewKind::Standby).unwrap();
+        assert_eq!(
+            read_repo(repo.path()).agents[&codex].role,
+            RosterRole::Standby
+        );
+        let tiers = crate::agent_store::load_reviewer_tiers(repo.path()).unwrap();
+        assert!(tiers.commit.is_empty(), "standby left the commit tier");
+        set_repo_review(repo.path(), &codex, ReviewKind::Commit).unwrap();
+        let tiers = crate::agent_store::load_reviewer_tiers(repo.path()).unwrap();
+        assert_eq!(tiers.commit, [codex], "back into the commit tier");
     }
 
     #[test]

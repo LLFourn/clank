@@ -1388,6 +1388,13 @@ fn missing_for_gate(
 
 impl WorkStatus {
     pub fn work_for(&self, author: &AgentLabel, role: Role) -> Vec<WaitItem> {
+        // Standby reviews nothing, and nothing else in repo state is
+        // anyone's but the master's or a reviewer's. What still wakes it
+        // — its inbox, its own wake sources, a block — is not produced
+        // here, so this cannot mute it.
+        if role == Role::Standby {
+            return Vec::new();
+        }
         // A broken HEAD tag preempts everything
         // (`commit-tag-fixup-is-first-class-state`): master fixes the
         // commit message before any review motion; reviewers are NOT
@@ -1401,7 +1408,7 @@ impl WorkStatus {
                     sha: correction.sha.clone(),
                     violation: correction.violation.clone(),
                 }],
-                Role::Reviewer => Vec::new(),
+                Role::Reviewer | Role::Standby => Vec::new(),
             };
         }
 
@@ -2514,6 +2521,37 @@ mod tests {
         let missing = labels.iter().map(|l| label(l)).collect();
         let missing = crate::repo_state::NonEmptyVec::new(missing).unwrap();
         WaitingOn::GateReviewersMissing { missing }
+    }
+
+    /// Standby reviews nothing: every review a reviewer in the same
+    /// place is owed — a plan's commit tier, its gate, an Unreviewed
+    /// ad-hoc commit (which goes to ANY reviewer), a PR — is withheld
+    /// (a-standby-agent-wakes-only-for-messages).
+    #[test]
+    fn a_standby_agent_is_owed_no_review_of_any_kind() {
+        let owed = [
+            work_status_with_one_plan(missing(&["sb"])),
+            work_status_with_one_plan(gate_missing(&["sb"])),
+            WorkStatus {
+                ad_hoc: vec![AdHocWorkState {
+                    sha: sha("bbbb"),
+                    gate: CommitGateState::Unreviewed,
+                    handover: Handover::default(),
+                }],
+                ..work_status_with_one_plan(WaitingOn::MasterToContinue)
+            },
+            ws_pr(CommitGateState::Unreviewed, &["sb"]),
+        ];
+        for ws in &owed {
+            assert!(
+                !ws.work_for(&label("sb"), Role::Reviewer).is_empty(),
+                "a reviewer here is owed a review: {ws:?}"
+            );
+            assert!(
+                ws.work_for(&label("sb"), Role::Standby).is_empty(),
+                "standby is owed nothing: {ws:?}"
+            );
+        }
     }
 
     #[test]

@@ -136,6 +136,9 @@ pub struct AgentDescription {
 ///   FINISHED.
 /// - `Gate`: both `Plan` and `Final` (the pre-split behavior; kept so
 ///   existing `role: gate` configs are unchanged).
+///
+/// `Standby` reviews nothing: it is in no tier and is woken for
+/// everything but reviews (a-standby-agent-wakes-only-for-messages).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RosterRole {
@@ -144,6 +147,7 @@ pub enum RosterRole {
     Plan,
     Final,
     Gate,
+    Standby,
 }
 
 impl RosterRole {
@@ -157,6 +161,18 @@ impl RosterRole {
 
     pub(crate) fn in_final_tier(self) -> bool {
         matches!(self, Self::Final | Self::Gate)
+    }
+
+    /// The role this roster entry resolves to — what it is woken for.
+    /// The one mapping: a surface that reads "not the master" as
+    /// "a reviewer" hands a standby agent review work it never gets.
+    pub fn resolved(self) -> clank_core::vocab::Role {
+        use clank_core::vocab::Role;
+        match self {
+            Self::Master => Role::Master,
+            Self::Commit | Self::Plan | Self::Final | Self::Gate => Role::Reviewer,
+            Self::Standby => Role::Standby,
+        }
     }
 }
 
@@ -302,8 +318,9 @@ pub enum TeamResolveError {
     },
 }
 
-/// What kind of review a reviewer does — names what they review, not
-/// an abstract "tier". Maps 1:1 onto the reviewer [`RosterRole`]s.
+/// What kind of review a non-master agent does — names what they
+/// review, not an abstract "tier". Maps 1:1 onto the non-master
+/// [`RosterRole`]s; `Standby` is reviewing nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReviewKind {
@@ -311,6 +328,7 @@ pub enum ReviewKind {
     Plan,
     Final,
     Gate,
+    Standby,
 }
 
 impl From<ReviewKind> for RosterRole {
@@ -320,6 +338,7 @@ impl From<ReviewKind> for RosterRole {
             ReviewKind::Plan => RosterRole::Plan,
             ReviewKind::Final => RosterRole::Final,
             ReviewKind::Gate => RosterRole::Gate,
+            ReviewKind::Standby => RosterRole::Standby,
         }
     }
 }
@@ -363,14 +382,16 @@ pub struct RepoConfigFile {
 pub struct RegisteredSet {
     pub master: AgentLabel,
     pub master_desc: AgentDescription,
-    /// Every reviewer with its role. THE source of truth for reviewer
-    /// enumeration — display surfaces iterate this and read `role`.
-    pub reviewers: Vec<RegisteredReviewer>,
+    /// Every agent but the master, with its role — reviewers and
+    /// standby agents alike. THE source of truth for enumerating the
+    /// rest of the team; display surfaces iterate this and read `role`,
+    /// and the tier accessors below are what decide review work.
+    pub members: Vec<RegisteredMember>,
 }
 
 impl RegisteredSet {
     fn labels_with_role(&self, want: impl Fn(RosterRole) -> bool) -> Vec<AgentLabel> {
-        self.reviewers
+        self.members
             .iter()
             .filter(|r| want(r.role))
             .map(|r| r.label.clone())
@@ -393,10 +414,11 @@ impl RegisteredSet {
     }
 }
 
-/// One resolved reviewer: its label, description, and roster role
-/// (`Commit` / `Plan` / `Final` / `Gate` — never `Master`).
+/// One resolved non-master agent: its label, description, and roster
+/// role (`Commit` / `Plan` / `Final` / `Gate` / `Standby` — never
+/// `Master`).
 #[derive(Debug, Clone)]
-pub struct RegisteredReviewer {
+pub struct RegisteredMember {
     pub label: AgentLabel,
     pub desc: AgentDescription,
     pub role: RosterRole,
@@ -425,7 +447,7 @@ pub enum ResolutionError {
 /// self-contained — every agent's definition lives in the roster.
 pub fn resolve_registered_set(repo: &RepoConfigFile) -> Result<RegisteredSet, ResolutionError> {
     let mut master: Option<(AgentLabel, AgentDescription)> = None;
-    let mut reviewers = Vec::new();
+    let mut members = Vec::new();
 
     for (label, agent) in &repo.agents {
         match agent.role {
@@ -439,9 +461,11 @@ pub fn resolve_registered_set(repo: &RepoConfigFile) -> Result<RegisteredSet, Re
                 }
                 master = Some((label.clone(), agent.to_description()));
             }
-            // Every non-master role is a reviewer in the single
-            // collection, tagged with its role.
-            role => reviewers.push(RegisteredReviewer {
+            role @ (RosterRole::Commit
+            | RosterRole::Plan
+            | RosterRole::Final
+            | RosterRole::Gate
+            | RosterRole::Standby) => members.push(RegisteredMember {
                 label: label.clone(),
                 desc: agent.to_description(),
                 role,
@@ -453,7 +477,7 @@ pub fn resolve_registered_set(repo: &RepoConfigFile) -> Result<RegisteredSet, Re
     Ok(RegisteredSet {
         master,
         master_desc,
-        reviewers,
+        members,
     })
 }
 
@@ -525,6 +549,20 @@ mod tests {
 
     fn team_ref(role: RosterRole) -> TeamMember {
         TeamMember::Ref(TeamRef { agent: None, role })
+    }
+
+    #[test]
+    fn standby_round_trips_in_a_roster_and_a_team() {
+        let m = team_ref(RosterRole::Standby);
+        let json = serde_json::to_string(&m).unwrap();
+        assert_eq!(json, r#"{"role":"standby"}"#);
+        assert_eq!(serde_json::from_str::<TeamMember>(&json).unwrap(), m);
+
+        let raw = r#"{"agents":{"claude":{"tool":"claude","role":"master"},"sb":{"tool":"codex","role":"standby"}}}"#;
+        let repo: RepoConfigFile = serde_json::from_str(raw).unwrap();
+        assert_eq!(repo.agents[&label("sb")].role, RosterRole::Standby);
+        let back = serde_json::to_value(&repo).unwrap();
+        assert_eq!(back["agents"]["sb"]["role"], "standby");
     }
 
     #[test]
@@ -692,10 +730,10 @@ mod tests {
         let r = resolve_registered_set(&repo).unwrap();
         assert_eq!(r.master.as_str(), "claude");
         assert_eq!(r.master_desc.tool, Tool::Claude);
-        assert_eq!(r.reviewers.len(), 1);
-        assert_eq!(r.reviewers[0].label.as_str(), "codex");
-        assert_eq!(r.reviewers[0].role, RosterRole::Commit);
-        assert_eq!(r.reviewers[0].desc.tool, Tool::Codex);
+        assert_eq!(r.members.len(), 1);
+        assert_eq!(r.members[0].label.as_str(), "codex");
+        assert_eq!(r.members[0].role, RosterRole::Commit);
+        assert_eq!(r.members[0].desc.tool, Tool::Codex);
         assert!(r.plan_tier().is_empty() && r.final_tier().is_empty());
     }
 
@@ -725,9 +763,9 @@ mod tests {
         ]);
         let r = resolve_registered_set(&repo).unwrap();
         // One role-tagged collection — a gate reviewer is listed ONCE.
-        assert_eq!(r.reviewers.len(), 4);
+        assert_eq!(r.members.len(), 4);
         let role_of = |name: &str| {
-            r.reviewers
+            r.members
                 .iter()
                 .find(|x| x.label.as_str() == name)
                 .map(|x| x.role)

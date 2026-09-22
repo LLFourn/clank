@@ -267,14 +267,15 @@ pub fn repo_checks(
         "master",
         registered.master_desc.clone(),
     ));
-    for r in &registered.reviewers {
+    for r in &registered.members {
         use crate::cli::teams_config::RosterRole;
         let role_str = match r.role {
             RosterRole::Commit => "commit reviewer",
             RosterRole::Plan => "plan reviewer",
             RosterRole::Final => "final reviewer",
             RosterRole::Gate => "gate reviewer",
-            RosterRole::Master => "master", // unreachable: master isn't a reviewer
+            RosterRole::Standby => "standby",
+            RosterRole::Master => "master", // unreachable: master isn't a member
         };
         members.push((r.label.clone(), role_str, r.desc.clone()));
     }

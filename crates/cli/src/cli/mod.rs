@@ -1141,8 +1141,8 @@ pub enum AgentCmd {
     /// DESCRIPTION to the user-scope library (no repo change);
     /// repo-scope `--tool` defines a fresh agent inline; repo-scope
     /// by-name (no `--tool`) copies a description from the
-    /// user-scope library. `--review commit|plan|final|gate` sets
-    /// the tier (default `commit`).
+    /// user-scope library. `--review commit|plan|final|gate|standby`
+    /// sets the tier (default `commit`); `standby` reviews nothing.
     Add(AgentAddArgs),
     /// Promote an agent to the repo's master:
     /// `repo.agents[<name>].role = master`, demoting the previous
@@ -1155,10 +1155,10 @@ pub enum AgentCmd {
     /// (and scrubs any team template referencing it). Per-agent
     /// skeleton dir + feedback history are preserved.
     Remove(AgentRemoveArgs),
-    /// Change a reviewer's tier (commit / plan / final / gate) in
-    /// place — no remove/re-add, so the agent's session and zellij
-    /// pane are undisturbed. Refuses on the master (not a reviewer
-    /// tier).
+    /// Change a non-master agent's tier (commit / plan / final / gate,
+    /// or standby: reviewing nothing) in place — no remove/re-add, so
+    /// the agent's session and zellij pane are undisturbed. Refuses on
+    /// the master (not a reviewer tier).
     SetReview(AgentSetReviewArgs),
     /// Replace a reviewer with another, keeping the role: one config
     /// write, so the role is never observed vacant and the gate's
@@ -1369,6 +1369,8 @@ pub enum ReviewKindArg {
     Plan,
     Final,
     Gate,
+    /// Reviews nothing; woken for everything else.
+    Standby,
 }
 
 impl From<ReviewKindArg> for crate::cli::teams_config::ReviewKind {
@@ -1379,6 +1381,7 @@ impl From<ReviewKindArg> for crate::cli::teams_config::ReviewKind {
             ReviewKindArg::Plan => ReviewKind::Plan,
             ReviewKindArg::Final => ReviewKind::Final,
             ReviewKindArg::Gate => ReviewKind::Gate,
+            ReviewKindArg::Standby => ReviewKind::Standby,
         }
     }
 }
@@ -2165,6 +2168,16 @@ mod agent_team_cli_parse_tests {
         assert!(
             AgentT::try_parse_from(["t", "set-review", "codex", "nope"]).is_err(),
             "invalid tier must be rejected"
+        );
+    }
+
+    #[test]
+    fn standby_is_a_review_setting_on_add_and_set_review() {
+        assert!(AgentT::try_parse_from(["t", "set-review", "codex", "standby"]).is_ok());
+        assert!(AgentT::try_parse_from(["t", "add", "sb", "--review", "standby"]).is_ok());
+        assert_eq!(
+            crate::cli::teams_config::ReviewKind::from(crate::cli::ReviewKindArg::Standby),
+            crate::cli::teams_config::ReviewKind::Standby
         );
     }
 

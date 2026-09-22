@@ -259,9 +259,10 @@ impl AutoMode {
     }
 }
 
-/// Role an agent plays — their default perspective for `wait`,
-/// `stop-hook`, etc. Per-user preference stored on the agent's
-/// own [`AgentConfig`]; not a repo-shared assertion.
+/// Role an agent plays — their perspective for `wait`, `stop-hook`,
+/// etc. — as resolved from the repo roster. `Standby` is on the roster
+/// and reviews nothing: it is handed no repo work, and everything else
+/// wakes it as it wakes anyone (a-standby-agent-wakes-only-for-messages).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Role {
@@ -273,6 +274,7 @@ pub enum Role {
     #[serde(alias = "reviewers")]
     #[default]
     Reviewer,
+    Standby,
 }
 
 impl Role {
@@ -280,6 +282,7 @@ impl Role {
         match self {
             Role::Master => "master",
             Role::Reviewer => "reviewer",
+            Role::Standby => "standby",
         }
     }
 }

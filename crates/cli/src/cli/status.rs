@@ -208,7 +208,7 @@ fn roster_auto_rows(
     // `AgentDescription` (tool/launch/initial_prompt) rides along for the
     // detail page.
     let roster = std::iter::once((&set.master, RosterRole::Master, &set.master_desc))
-        .chain(set.reviewers.iter().map(|r| (&r.label, r.role, &r.desc)));
+        .chain(set.members.iter().map(|r| (&r.label, r.role, &r.desc)));
     let mut seen = std::collections::HashSet::new();
     let mut rows = Vec::new();
     for (label, role, desc) in roster {

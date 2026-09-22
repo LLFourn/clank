@@ -121,16 +121,11 @@ pub(super) struct StatusGlyphs {
 
 impl StatusGlyphs {
     pub(super) fn of(snap: &StatusSnapshot) -> Self {
-        use clank_core::vocab::Role;
         let titles = snap
             .agents
             .iter()
             .map(|a| {
-                let role = if snap.master.as_deref() == Some(a.label.as_str()) {
-                    Role::Master
-                } else {
-                    Role::Reviewer
-                };
+                let role = a.role.resolved();
                 let emoji = agent_status_emoji(snap, &a.label, role);
                 (
                     a.label.clone(),
@@ -2946,6 +2941,26 @@ mod tests {
                 ("terminal_1".to_string(), "codex".to_string()),
             ],
             "the stale title on terminal_0 says nothing; the other repo's pane is not ours"
+        );
+    }
+
+    /// The worker owns pane titles and titles each from the roster
+    /// role: a standby agent's pane says so, not `reviewer`, whatever
+    /// its creation-time stamp was.
+    #[test]
+    fn a_standby_agents_pane_is_titled_standby() {
+        let mut s = crate::cli::status_tui::fixtures::two_agent_snap();
+        s.master = Some("claude".into());
+        s.agents[1].role = crate::cli::teams_config::RosterRole::Standby;
+        let mut titled = Vec::new();
+        PaneStatus::new().update_with(
+            &StatusGlyphs::of(&s),
+            Some(vec![("1".to_string(), "codex".to_string())]),
+            |id, title| titled.push((id.to_string(), title.to_string())),
+        );
+        assert_eq!(
+            titled,
+            [("1".to_string(), "💤 codex (standby)".to_string())]
         );
     }
 

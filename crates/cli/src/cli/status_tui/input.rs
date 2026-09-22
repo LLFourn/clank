@@ -660,9 +660,10 @@ pub(super) fn text_input_nav(input: &mut TextInput, k: TextKey) -> InputNav {
     }
 }
 
-/// A reviewer tier's checkbox state, `(commit, plan, final)`. The four
-/// `ReviewKind`s map 1:1 onto the reachable states — `Gate` IS
-/// `plan`+`final`; the checkboxes expose the model the roster already has.
+/// A non-master agent's checkbox state, `(commit, plan, final)`. The
+/// five `ReviewKind`s map 1:1 onto the reachable states — `Gate` IS
+/// `plan`+`final`, `Standby` is none ticked; the checkboxes expose the
+/// model the roster already has.
 pub(super) fn tier_boxes(kind: crate::cli::teams_config::ReviewKind) -> (bool, bool, bool) {
     use crate::cli::teams_config::ReviewKind::*;
     match kind {
@@ -670,14 +671,15 @@ pub(super) fn tier_boxes(kind: crate::cli::teams_config::ReviewKind) -> (bool, b
         Plan => (false, true, false),
         Final => (false, false, true),
         Gate => (false, true, true),
+        Standby => (false, false, false),
     }
 }
 
-/// The reviewer tier after toggling one checkbox — `None` = no-op.
-/// Rules: `commit` is exclusive (ticking it clears `plan`/`final`;
-/// ticking `plan`/`final` while in commit mode LEAVES commit mode); and
-/// unticking the last remaining coverage is a no-op (a reviewer must
-/// review something).
+/// The review kind after toggling one checkbox — `None` = not a
+/// checkbox. Rules: `commit` is exclusive (ticking it clears
+/// `plan`/`final`; ticking `plan`/`final` while in commit mode LEAVES
+/// commit mode); and unticking the last box leaves the agent reviewing
+/// nothing, which is standby.
 pub(super) fn tier_after_toggle(
     current: crate::cli::teams_config::ReviewKind,
     action: DetailAction,
@@ -685,17 +687,17 @@ pub(super) fn tier_after_toggle(
     use crate::cli::teams_config::ReviewKind::*;
     let (commit, plan, final_) = tier_boxes(current);
     match action {
-        DetailAction::TierCommit => (!commit).then_some(Commit),
+        DetailAction::TierCommit => Some(if commit { Standby } else { Commit }),
         DetailAction::TierPlan => match (commit, plan, final_) {
             (true, _, _) => Some(Plan),
             (false, true, true) => Some(Final),
-            (false, true, false) => None, // last coverage — keep it
+            (false, true, false) => Some(Standby),
             (false, false, _) => Some(if final_ { Gate } else { Plan }),
         },
         DetailAction::TierFinal => match (commit, final_, plan) {
             (true, _, _) => Some(Final),
             (false, true, true) => Some(Plan),
-            (false, true, false) => None, // last coverage — keep it
+            (false, true, false) => Some(Standby),
             (false, false, _) => Some(if plan { Gate } else { Final }),
         },
         _ => None,
@@ -713,6 +715,7 @@ pub(super) fn role_review_kind(
         RosterRole::Plan => Some(ReviewKind::Plan),
         RosterRole::Final => Some(ReviewKind::Final),
         RosterRole::Gate => Some(ReviewKind::Gate),
+        RosterRole::Standby => Some(ReviewKind::Standby),
     }
 }
 
@@ -727,6 +730,7 @@ pub(super) fn review_kind_role(
         ReviewKind::Plan => RosterRole::Plan,
         ReviewKind::Final => RosterRole::Final,
         ReviewKind::Gate => RosterRole::Gate,
+        ReviewKind::Standby => RosterRole::Standby,
     }
 }
 
@@ -3322,21 +3326,33 @@ mod tests {
         use crate::cli::teams_config::ReviewKind::*;
         use DetailAction::*;
         // commit is exclusive; ticking plan/final leaves commit mode.
-        assert_eq!(tier_after_toggle(Commit, TierCommit), None, "last coverage");
+        assert_eq!(
+            tier_after_toggle(Commit, TierCommit),
+            Some(Standby),
+            "last box"
+        );
         assert_eq!(tier_after_toggle(Commit, TierPlan), Some(Plan));
         assert_eq!(tier_after_toggle(Commit, TierFinal), Some(Final));
         // plan-only.
         assert_eq!(tier_after_toggle(Plan, TierCommit), Some(Commit));
-        assert_eq!(tier_after_toggle(Plan, TierPlan), None, "last coverage");
+        assert_eq!(tier_after_toggle(Plan, TierPlan), Some(Standby), "last box");
         assert_eq!(tier_after_toggle(Plan, TierFinal), Some(Gate));
         // final-only.
         assert_eq!(tier_after_toggle(Final, TierCommit), Some(Commit));
         assert_eq!(tier_after_toggle(Final, TierPlan), Some(Gate));
-        assert_eq!(tier_after_toggle(Final, TierFinal), None, "last coverage");
+        assert_eq!(
+            tier_after_toggle(Final, TierFinal),
+            Some(Standby),
+            "last box"
+        );
         // gate == plan+final; unticking one leaves the other.
         assert_eq!(tier_after_toggle(Gate, TierCommit), Some(Commit));
         assert_eq!(tier_after_toggle(Gate, TierPlan), Some(Final));
         assert_eq!(tier_after_toggle(Gate, TierFinal), Some(Plan));
+        // standby reviews nothing; any tick enters that tier.
+        assert_eq!(tier_after_toggle(Standby, TierCommit), Some(Commit));
+        assert_eq!(tier_after_toggle(Standby, TierPlan), Some(Plan));
+        assert_eq!(tier_after_toggle(Standby, TierFinal), Some(Final));
     }
 
     #[test]

@@ -129,6 +129,7 @@ struct RosterJson<'a> {
     plan_reviewers: Vec<&'a str>,
     final_reviewers: Vec<&'a str>,
     gate_reviewers: Vec<&'a str>,
+    standby: Vec<&'a str>,
 }
 
 impl<'a> RosterJson<'a> {
@@ -138,6 +139,7 @@ impl<'a> RosterJson<'a> {
         let mut plan_reviewers = Vec::new();
         let mut final_reviewers = Vec::new();
         let mut gate_reviewers = Vec::new();
+        let mut standby = Vec::new();
         for (label, member) in team {
             match member.role() {
                 RosterRole::Master => master = Some(label.as_str()),
@@ -145,6 +147,7 @@ impl<'a> RosterJson<'a> {
                 RosterRole::Plan => plan_reviewers.push(label.as_str()),
                 RosterRole::Final => final_reviewers.push(label.as_str()),
                 RosterRole::Gate => gate_reviewers.push(label.as_str()),
+                RosterRole::Standby => standby.push(label.as_str()),
             }
         }
         Self {
@@ -153,6 +156,7 @@ impl<'a> RosterJson<'a> {
             plan_reviewers,
             final_reviewers,
             gate_reviewers,
+            standby,
         }
     }
 }
@@ -216,6 +220,7 @@ fn print_roster(team: &TeamRoster, library: &BTreeMap<AgentLabel, AgentDescripti
     println!("  plan reviewers:   {}", by_role(RosterRole::Plan));
     println!("  final reviewers:  {}", by_role(RosterRole::Final));
     println!("  gate reviewers:   {}", by_role(RosterRole::Gate));
+    println!("  standby:          {}", by_role(RosterRole::Standby));
 }
 
 // ── subcommands ─────────────────────────────────────────────
@@ -443,6 +448,7 @@ mod tests {
         team.insert(lbl("scout"), team_ref(RosterRole::Plan));
         team.insert(lbl("shipper"), team_ref(RosterRole::Final));
         team.insert(lbl("ruthless"), team_ref(RosterRole::Gate));
+        team.insert(lbl("idle"), team_ref(RosterRole::Standby));
 
         assert_eq!(
             serde_json::to_value(RosterJson::from_team(&team)).unwrap(),
@@ -452,6 +458,7 @@ mod tests {
                 "plan_reviewers": ["scout"],
                 "final_reviewers": ["shipper"],
                 "gate_reviewers": ["ruthless"],
+                "standby": ["idle"],
             })
         );
 
@@ -468,6 +475,7 @@ mod tests {
                 "plan_reviewers": ["scout"],
                 "final_reviewers": ["shipper"],
                 "gate_reviewers": ["ruthless"],
+                "standby": ["idle"],
             })
         );
 
@@ -481,6 +489,7 @@ mod tests {
                 "plan_reviewers": [],
                 "final_reviewers": [],
                 "gate_reviewers": [],
+                "standby": [],
             })
         );
     }

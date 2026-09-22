@@ -11,8 +11,12 @@ use super::scroll::*;
 use super::text::*;
 use crate::cli::status::{StatusSnapshot, short_sha};
 
+/// What standby means, said wherever a page shows an agent reviewing
+/// nothing.
+const STANDBY_MEANS: &str = "standby — reviews nothing; woken by everything else";
+
 /// The roster tier as shown in the UI: `master` / `commit` / `plan` /
-/// `final` / `gate`.
+/// `final` / `gate` / `standby`.
 pub(super) fn tier_label(role: crate::cli::teams_config::RosterRole) -> &'static str {
     use crate::cli::teams_config::RosterRole;
     match role {
@@ -21,6 +25,7 @@ pub(super) fn tier_label(role: crate::cli::teams_config::RosterRole) -> &'static
         RosterRole::Plan => "plan",
         RosterRole::Final => "final",
         RosterRole::Gate => "gate",
+        RosterRole::Standby => "standby",
     }
 }
 
@@ -1405,6 +1410,10 @@ pub(super) fn render_add_reviews(
         region_rule(&format!("add · {who}"), "what do they review?", true, cols),
         String::new(),
     ];
+    if kind == crate::cli::teams_config::ReviewKind::Standby {
+        out.push(emit(&[dim(format!("  {STANDBY_MEANS}"))], "", cols));
+        out.push(String::new());
+    }
     let subsumed = "commit already covers this";
     let menu: Vec<MenuRow<'_>> = super::input::add_review_rows()
         .into_iter()
@@ -2100,7 +2109,15 @@ pub(super) fn render_agent_detail(
     // with the menu for the same rows.
     const LEAD: &str = "   ";
     let label = format!("{LEAD}session   ");
+    let role_label = format!("{LEAD}role      ");
     let mut content: Vec<String> = vec![String::new()];
+    if agent.role == crate::cli::teams_config::RosterRole::Standby {
+        content.push(emit(
+            &[dim(role_label), plain(STANDBY_MEANS.to_string())],
+            "",
+            cols,
+        ));
+    }
     match agent.session.as_ref() {
         // The id is what you compare against the tool's store, so it is
         // never cut: beside its label when the pane is wide enough,
@@ -8160,6 +8177,38 @@ mod tests {
             );
             assert!(!visible(row).contains('…'), "no truncation marker: {row:?}");
         }
+    }
+
+    /// Both pages that show an agent reviewing nothing say what that
+    /// means.
+    #[test]
+    fn a_page_showing_standby_says_what_it_means() {
+        use crate::cli::teams_config::{ReviewKind, RosterRole};
+        use clank_core::vocab::AutoMode;
+        let agent = agent_row("sb", RosterRole::Standby, AutoMode::On);
+        let actions = detail_actions(RosterRole::Standby, Presence::Live, false);
+        let (lines, _) = render_agent_detail(&agent, None, &actions, 0, 40, 80);
+        let page: String = lines
+            .iter()
+            .map(|l| visible(l))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(page.contains(STANDBY_MEANS), "{page}");
+
+        let (lines, _) = render_add_reviews("sb", ReviewKind::Standby, 0, 24, 80);
+        let add: String = lines
+            .iter()
+            .map(|l| visible(l))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(add.contains(STANDBY_MEANS), "{add}");
+        let (lines, _) = render_add_reviews("sb", ReviewKind::Commit, 0, 24, 80);
+        let commit: String = lines
+            .iter()
+            .map(|l| visible(l))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!commit.contains(STANDBY_MEANS), "{commit}");
     }
 
     fn page_text(

@@ -260,7 +260,7 @@ fn resolve_tabs(targets: &[PathBuf], include: Option<&[String]>) -> anyhow::Resu
             continue;
         };
         let reviewers = set
-            .reviewers
+            .members
             .iter()
             .map(|r| r.label.as_str().to_string())
             .collect();
@@ -371,7 +371,7 @@ fn open_one(repo: &Path, print: bool) -> anyhow::Result<()> {
     };
     let master_label = set.master.as_str().to_string();
     let reviewer_labels: Vec<String> = set
-        .reviewers
+        .members
         .iter()
         .map(|r| r.label.as_str().to_string())
         .collect();

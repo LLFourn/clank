@@ -6597,8 +6597,8 @@ pub(crate) mod tests {
         );
         assert!(matches!(next, Mode::AgentDetail { idx: 1, sel: 3 }));
 
-        // Unticking down to the last coverage is a no-op (still gate→final
-        // →final stays; final is the only box left, untick refused).
+        // Unticking down to the last box and then that one leaves the
+        // agent reviewing nothing: standby, written through the core.
         apply_detail_action(
             DetailAction::TierPlan,
             1,
@@ -6608,7 +6608,6 @@ pub(crate) mod tests {
             &mut None,
             1,
         );
-        let before = std::fs::read_to_string(repo.path().join(".clank/config.json")).unwrap();
         apply_detail_action(
             DetailAction::TierFinal,
             1,
@@ -6618,8 +6617,12 @@ pub(crate) mod tests {
             &mut None,
             1,
         );
-        let after = std::fs::read_to_string(repo.path().join(".clank/config.json")).unwrap();
-        assert_eq!(before, after, "unticking the last coverage is a no-op");
+        let parsed: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(repo.path().join(".clank/config.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(parsed["agents"]["codex"]["role"], "standby");
+        assert_eq!(s.agents[1].role, RosterRole::Standby);
     }
 
     fn bind(repo: &std::path::Path, label: &str, id: &str) {

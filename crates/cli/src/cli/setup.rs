@@ -52,8 +52,8 @@ const OBSOLETE_SKILL: &str = "clank";
 /// Lead with the role guard ("Use ONLY when … Do NOT use …") and name
 /// the other skill, so an agent never loads the wrong role's skill (and
 /// runs commands it must never touch).
-const MASTER_DESC: &str = "Clank multi-agent workflow, MASTER role. Use ONLY when you are the master in a clank repo (implement plan milestones, promote/finish plans, manage the roster). Do NOT use as a reviewer — use clank-reviewer instead.";
-const REVIEWER_DESC: &str = "Clank multi-agent workflow, REVIEWER role. Use ONLY when you are a reviewer in a clank repo (review commits and write verdicts). Do NOT use as the master — use clank-master instead.";
+const MASTER_DESC: &str = "Clank multi-agent workflow, MASTER role. Use ONLY when you are the master in a clank repo (implement plan milestones, promote/finish plans, manage the roster). Do NOT use as a reviewer or on standby — use clank-reviewer instead.";
+const REVIEWER_DESC: &str = "Clank multi-agent workflow, REVIEWER and STANDBY roles. Use ONLY when you are a reviewer or on standby in a clank repo. Do NOT use as the master — use clank-master instead.";
 
 /// How each tool's agents receive work (claude-stop-hook-minimal-hint):
 /// claude parks an armed background `clank wait` whose completion wake
@@ -150,13 +150,31 @@ pub fn compose_skill(role: Role, tool: Tool) -> String {
 /// it encodes in the hook entry, and doctor verifies with the same
 /// value — the skill on disk always matches the installed loop.
 pub fn compose_skill_with(role: Role, tool: Tool, claude_async: bool) -> String {
-    let (name, description, body, other) = match role {
-        Role::Master => (MASTER_SKILL, MASTER_DESC, SKILL_MASTER_BODY, REVIEWER_SKILL),
-        Role::Reviewer => (
+    // The guard belongs to the SKILL, not to one role: the reviewer
+    // skill serves standby agents too, and a guard naming only
+    // `reviewer` tells a standby agent to switch to the master's.
+    let (name, description, body, guard) = match role {
+        Role::Master => (
+            MASTER_SKILL,
+            MASTER_DESC,
+            SKILL_MASTER_BODY,
+            format!(
+                "> ROLE GUARD: this skill is for the **master** role. If your role \
+                 in this repo is not master, stop and use `{REVIEWER_SKILL}` instead — \
+                 your role is what `clank status` and your work items report.\n\n"
+            ),
+        ),
+        Role::Reviewer | Role::Standby => (
             REVIEWER_SKILL,
             REVIEWER_DESC,
             SKILL_REVIEWER_BODY,
-            MASTER_SKILL,
+            format!(
+                "> ROLE GUARD: this skill is for the **reviewer** and **standby** \
+                 roles. If your role in this repo is neither, stop and use \
+                 `{MASTER_SKILL}` instead — your role is what `clank status` and your \
+                 work items report. A standby agent writes no verdicts and handles \
+                 every other item as usual.\n\n"
+            ),
         ),
     };
     let mut out = String::new();
@@ -164,12 +182,7 @@ pub fn compose_skill_with(role: Role, tool: Tool, claude_async: bool) -> String 
     out.push_str(&format!("name: {name}\n"));
     out.push_str(&format!("description: {description}\n"));
     out.push_str("---\n\n");
-    out.push_str(&format!(
-        "> ROLE GUARD: this skill is for the **{role}** role. If your role \
-         in this repo is not {role}, stop and use `{other}` instead — your \
-         role is what `clank status` and your work items report.\n\n",
-        role = role.as_str(),
-    ));
+    out.push_str(&guard);
     out.push_str(SKILL_SHARED_CORE);
     out.push_str(body);
     if tool == Tool::Claude {
@@ -1205,6 +1218,42 @@ mod tests {
         }
     }
 
+    /// One skill serves reviewers and standby agents, and it tells a
+    /// standby agent to write no verdicts without telling it to ignore
+    /// anything else it is woken with
+    /// (a-standby-agent-wakes-only-for-messages).
+    #[test]
+    fn the_reviewer_skill_serves_standby_without_narrowing_what_it_handles() {
+        for tool in [Tool::Claude, Tool::Codex, Tool::Grok, Tool::OpenCode] {
+            let reviewer = compose_skill(Role::Reviewer, tool);
+            assert_eq!(
+                compose_skill(Role::Standby, tool),
+                reviewer,
+                "{tool:?}: one skill serves both"
+            );
+            let guard = reviewer
+                .lines()
+                .find(|l| l.starts_with("> ROLE GUARD"))
+                .unwrap();
+            assert!(
+                guard.contains("**standby**") && guard.contains("writes no verdicts"),
+                "{tool:?}: {guard}"
+            );
+            for narrowing in ["messages only", "only messages", "act on messages"] {
+                assert!(!guard.contains(narrowing), "{tool:?}: {guard}");
+            }
+            let description = reviewer
+                .lines()
+                .find(|l| l.starts_with("description:"))
+                .unwrap();
+            assert!(description.contains("standby"), "{tool:?}: {description}");
+            assert!(
+                !compose_skill(Role::Master, tool).contains("**standby**"),
+                "{tool:?}: the master skill's guard is the master's alone"
+            );
+        }
+    }
+
     /// The normative inventory, asserted PER TOOL.
     ///
     /// `compose_skill` takes the tool and the compositions are allowed
@@ -1231,16 +1280,20 @@ mod tests {
     #[test]
     fn the_codex_reviewer_skill_stays_under_its_ceiling() {
         // 5,667B before the compression that introduced this test, at
-        // 5,300. Raised once, by the 285B the inbox section costs: every
-        // role must be told how a message is handled
-        // (a-message-wakes-its-agent-until-it-is-handled).
-        const CEILING: usize = 5_600;
+        // 5,300. Raised by the 285B the inbox section costs — every role
+        // must be told how a message is handled
+        // (a-message-wakes-its-agent-until-it-is-handled) — and by the
+        // 112B that let the guard and description admit standby agents,
+        // who would otherwise be told to use the master's skill
+        // (a-standby-agent-wakes-only-for-messages).
+        const CEILING: usize = 5_700;
         let len = compose_skill(Role::Reviewer, Tool::Codex).len();
         assert!(
             len <= CEILING,
             "codex reviewer skill is {len}B, over the {CEILING}B ceiling (5,667B \
-             before compression, 5,300B until the inbox) — re-read in full every \
-             reviewing turn, so growth here is paid again on every wake"
+             before compression, 5,300B until the inbox, 5,600B until standby) — \
+             re-read in full every reviewing turn, so growth here is paid again \
+             on every wake"
         );
     }
 

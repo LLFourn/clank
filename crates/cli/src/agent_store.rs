@@ -100,8 +100,9 @@ fn no_team_configured() -> anyhow::Error {
 }
 
 /// Resolve an agent's role for this repo via the roster-resolved
-/// registered set: `label == master` → `Master`; in either
-/// reviewer tier → `Reviewer`; otherwise a typed not-registered error.
+/// registered set: `label == master` → `Master`; a standby member →
+/// `Standby`; any other member → `Reviewer`; otherwise a typed
+/// not-registered error.
 ///
 /// Errors if the repo has no master designated — there is no
 /// legacy fallback.
@@ -243,12 +244,10 @@ pub fn role_from_registered_set(
     if &set.master == label {
         return Some(Role::Master);
     }
-    let is_reviewer = set.reviewers.iter().any(|r| &r.label == label);
-    if is_reviewer {
-        Some(Role::Reviewer)
-    } else {
-        None
-    }
+    set.members
+        .iter()
+        .find(|m| &m.label == label)
+        .map(|m| m.role.resolved())
 }
 
 pub fn try_resolve_via_team(
@@ -801,9 +800,7 @@ fn save_json<T: serde::Serialize>(path: &Path, value: &T) -> anyhow::Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::teams_config::{
-        AgentDescription, RegisteredReviewer, RegisteredSet, RosterRole,
-    };
+    use crate::cli::teams_config::{AgentDescription, RegisteredMember, RegisteredSet, RosterRole};
     use clank_core::vocab::{Role, Tool};
 
     fn label(s: &str) -> AgentLabel {
@@ -1021,7 +1018,7 @@ mod tests {
     }
 
     fn registered_set(master: &str, commit: &[&str], gate: &[&str]) -> RegisteredSet {
-        let rev = |l: &&str, role: RosterRole| RegisteredReviewer {
+        let rev = |l: &&str, role: RosterRole| RegisteredMember {
             label: label(l),
             desc: desc(Tool::Claude),
             role,
@@ -1029,12 +1026,31 @@ mod tests {
         RegisteredSet {
             master: label(master),
             master_desc: desc(Tool::Claude),
-            reviewers: commit
+            members: commit
                 .iter()
                 .map(|l| rev(l, RosterRole::Commit))
                 .chain(gate.iter().map(|l| rev(l, RosterRole::Gate)))
                 .collect(),
         }
+    }
+
+    #[test]
+    fn a_standby_member_resolves_to_standby_and_reviews_in_no_tier() {
+        let mut set = registered_set("claude", &[], &[]);
+        set.members.push(RegisteredMember {
+            label: label("sb"),
+            desc: desc(Tool::Claude),
+            role: RosterRole::Standby,
+        });
+        assert_eq!(
+            role_from_registered_set(&set, &label("sb")),
+            Some(clank_core::vocab::Role::Standby)
+        );
+        let tiers = ReviewerTiers::from_registered(&set);
+        assert!(
+            tiers.commit.is_empty() && tiers.plan.is_empty() && tiers.final_.is_empty(),
+            "a master plus standby agents is master-only: {tiers:?}"
+        );
     }
 
     #[test]

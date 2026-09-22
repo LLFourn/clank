@@ -24,6 +24,7 @@ mod open_integration;
 mod pick_integration;
 mod pr_review_integration;
 mod rereview_integration;
+mod standby_wakes;
 mod stash_integration;
 mod status_log_integration;
 mod stop_hook_peek_no_hooks;
