@@ -266,22 +266,20 @@ pub(super) fn scroll_to_show(cursor: usize, offset: usize, capacity: usize, tota
     off.min(max_off)
 }
 
-/// What pressing Enter on a scroll entry opens, or `None` for an entry
-/// with no document (an ad-hoc header, an ask line, an in-progress
-/// placeholder).
-pub(super) enum OverlayTarget {
-    /// A commit's detail view. `focus` is the reviewer whose feedback the
-    /// view should open scrolled to — set when Enter lands on a `Review`
-    /// row; `None` (a `Commit` row) opens at the top.
+/// The page pressing Enter on a scroll entry opens.
+pub(super) enum EntryTarget {
+    /// A commit's page. `focus` is the reviewer whose feedback the page
+    /// should open scrolled to — set when Enter lands on a `Review` row;
+    /// `None` (a `Commit` row) opens at the top.
     Commit {
         sha: crate::lifecycle::CommitSha,
         focus: Option<String>,
     },
-    /// A plan's rendered markdown document, by stem.
-    Plan { stem: String },
+    /// A plan's page.
+    Plan { key: crate::lifecycle::PlanKey },
 }
 
-/// The document a scroll entry "drills into", or `None` if it has none
+/// The page a scroll entry "drills into", or `None` if it has none
 /// (an ad-hoc header, an ask line, an in-progress placeholder). A
 /// `Commit` seg → its own commit (no focus). A `Review` seg carries NO
 /// sha (reviews are positional), so it scans FORWARD — reviews render
@@ -289,12 +287,12 @@ pub(super) enum OverlayTarget {
 /// `Header` or the end of the sequence: a stray or tail review (which
 /// `build_scroll` flushes with no following commit in its section) must
 /// NOT bind to the next section's commit. The review's author rides along
-/// as the scroll focus. A plan `Header` → that plan's document.
-pub(super) fn entry_overlay_target(seq: &[Seg], cursor: usize) -> Option<OverlayTarget> {
+/// as the scroll focus. A plan `Header` → that plan's page.
+pub(super) fn entry_target(seq: &[Seg], cursor: usize) -> Option<EntryTarget> {
     use crate::cli::log::OnelineRow;
     match seq.get(cursor)? {
         Seg::Log(OnelineRow::Commit { sha, .. })
-        | Seg::Log(OnelineRow::PlainCommit { sha, .. }) => Some(OverlayTarget::Commit {
+        | Seg::Log(OnelineRow::PlainCommit { sha, .. }) => Some(EntryTarget::Commit {
             sha: sha.clone(),
             focus: None,
         }),
@@ -307,14 +305,14 @@ pub(super) fn entry_overlay_target(seq: &[Seg], cursor: usize) -> Option<Overlay
                     _ => None,                                         // skip reviews
                 })
                 .flatten()?;
-            Some(OverlayTarget::Commit {
+            Some(EntryTarget::Commit {
                 sha,
                 focus: Some(author.clone()),
             })
         }
-        Seg::Log(OnelineRow::Header { plan: Some(stem) }) => {
-            Some(OverlayTarget::Plan { stem: stem.clone() })
-        }
+        Seg::Log(OnelineRow::Header { plan: Some(stem) }) => crate::lifecycle::PlanKey::parse(stem)
+            .ok()
+            .map(|key| EntryTarget::Plan { key }),
         _ => None, // ad-hoc header, ask, in-progress
     }
 }
@@ -743,35 +741,35 @@ mod tests {
         );
 
         let seq: Vec<Seg> = rows.iter().map(Seg::Log).collect();
-        let commit_of = |t: Option<OverlayTarget>| match t {
-            Some(OverlayTarget::Commit { sha, focus }) => Some((sha, focus)),
+        let commit_of = |t: Option<EntryTarget>| match t {
+            Some(EntryTarget::Commit { sha, focus }) => Some((sha, focus)),
             _ => None,
         };
         // Each review reaches ITS OWN commit, not the neighbouring
         // plan's — the failure a misplaced section break causes.
         assert_eq!(
-            commit_of(entry_overlay_target(&seq, 0)),
+            commit_of(entry_target(&seq, 0)),
             Some((sha("b2"), Some("codex".to_string()))),
             "the first review targets the newest commit of its own run"
         );
         assert_eq!(
-            commit_of(entry_overlay_target(&seq, 4)),
+            commit_of(entry_target(&seq, 4)),
             Some((sha("a2"), Some("kimi".to_string()))),
             "and the review after a name targets the run BELOW it"
         );
         // Each name still opens its own plan's document.
         assert!(matches!(
-            entry_overlay_target(&seq, 3),
-            Some(OverlayTarget::Plan { stem }) if stem == "bee"
+            entry_target(&seq, 3),
+            Some(EntryTarget::Plan { key }) if key.as_str() == "bee"
         ));
         assert!(matches!(
-            entry_overlay_target(&seq, 7),
-            Some(OverlayTarget::Plan { stem }) if stem == "ant"
+            entry_target(&seq, 7),
+            Some(EntryTarget::Plan { key }) if key.as_str() == "ant"
         ));
     }
 
     #[test]
-    fn entry_overlay_target_resolves_positionally() {
+    fn entry_target_resolves_positionally() {
         use crate::cli::log::OnelineRow;
         use crate::lifecycle::CommitSha;
         use clank_core::vocab::Verdict;
@@ -795,8 +793,8 @@ mod tests {
         };
 
         // Helpers to read the resolved target.
-        let commit_of = |t: Option<OverlayTarget>| match t {
-            Some(OverlayTarget::Commit { sha, focus }) => Some((sha, focus)),
+        let commit_of = |t: Option<EntryTarget>| match t {
+            Some(EntryTarget::Commit { sha, focus }) => Some((sha, focus)),
             _ => None,
         };
 
@@ -810,38 +808,35 @@ mod tests {
         ];
         let seq: Vec<Seg> = rows.iter().map(Seg::Log).collect();
         // A commit row → its own sha, no review focus.
-        assert_eq!(
-            commit_of(entry_overlay_target(&seq, 2)),
-            Some((sha("c1"), None))
-        );
+        assert_eq!(commit_of(entry_target(&seq, 2)), Some((sha("c1"), None)));
         // A review directly above its commit → that commit, focused on the
         // review's author.
         assert_eq!(
-            commit_of(entry_overlay_target(&seq, 1)),
+            commit_of(entry_target(&seq, 1)),
             Some((sha("c1"), Some("aaa".to_string())))
         );
         // A plan header → that plan's document.
         assert!(matches!(
-            entry_overlay_target(&seq, 0),
-            Some(OverlayTarget::Plan { stem }) if stem == "foo"
+            entry_target(&seq, 0),
+            Some(EntryTarget::Plan { key }) if key.as_str() == "foo"
         ));
         // A TAIL review with no following commit → None (not a panic, not
         // a bind to some earlier commit).
-        assert!(entry_overlay_target(&seq, 4).is_none());
+        assert!(entry_target(&seq, 4).is_none());
         // Out-of-range cursor → None.
-        assert!(entry_overlay_target(&seq, 99).is_none());
+        assert!(entry_target(&seq, 99).is_none());
 
         // An ad-hoc header (plan: None) has no document.
         let adhoc = [OnelineRow::Header { plan: None }];
         let seq_adhoc: Vec<Seg> = adhoc.iter().map(Seg::Log).collect();
-        assert!(entry_overlay_target(&seq_adhoc, 0).is_none());
+        assert!(entry_target(&seq_adhoc, 0).is_none());
 
         // A stray review whose section ends at a Header before any commit
         // must NOT bind to the NEXT section's commit (the wrong-entry bug).
         let rows2 = [review("zzz"), header(), commit("c2")];
         let seq2: Vec<Seg> = rows2.iter().map(Seg::Log).collect();
         assert!(
-            entry_overlay_target(&seq2, 0).is_none(),
+            entry_target(&seq2, 0).is_none(),
             "review before a section break stops at the header"
         );
     }

@@ -239,6 +239,7 @@ pub(super) fn render_at(
             ConfirmAction::StashPlan
             | ConfirmAction::UnqueuePlan
             | ConfirmAction::PromotePlan
+            | ConfirmAction::RestorePlan
             | ConfirmAction::PurgeArtifacts
             | ConfirmAction::PurgeDrop { .. } => {
                 if let Mode::BlockAnswer { block } = mode {
@@ -274,6 +275,11 @@ pub(super) fn render_at(
         && let Mode::EventDetail { sel } = mode
     {
         return render_event_detail(ep, &super::input::actions_for(ep), sel, rows, cols);
+    }
+    if let Some(cp) = view.commit_page
+        && let Mode::CommitPage { sel } = mode
+    {
+        return render_commit_page(cp, &commit_actions(&cp.plans), sel, rows, cols);
     }
     // The plan-actions page family (tui-plan-actions-page): page and
     // purge chooser are dedicated full screens too.
@@ -2214,7 +2220,7 @@ pub(super) fn render_agent_detail(
 
 /// The fixed ANSI color for a verdict mark — green continue, cyan
 /// finished, red request-changes, dim unmarked. Shared by the log
-/// review rows and the commit-detail reviewer headers.
+/// review rows and the commit page's reviewer headers.
 fn verdict_color(verdict: clank_core::vocab::Verdict) -> &'static str {
     use clank_core::vocab::Verdict;
     match verdict {
@@ -2225,11 +2231,6 @@ fn verdict_color(verdict: clank_core::vocab::Verdict) -> &'static str {
     }
 }
 
-/// The full commit-detail content (the SINGLE layout source): the
-/// commit's subject + message, then each reviewer's verdict mark + full
-/// feedback body. Records the first line of each reviewer's block by
-/// author so the review-focus scroll lands on the SAME lines the view
-/// windows (no second function re-deriving positions that could drift).
 /// Truncate a path to `max` display chars keeping the FILENAME (the
 /// discriminating end) — `crates/…/render.rs`, never `crates/cli/s…`.
 fn middle_truncate_path(path: &str, max: usize) -> String {
@@ -2248,10 +2249,9 @@ pub(super) struct CommitLayout {
     pub(super) review_line: std::collections::BTreeMap<String, usize>,
 }
 
-/// Everything the commit overlay renders, borrowed from
-/// [`super::CommitDetail`] — ONE bundle so the layout builder, the
-/// windowing renderer, and the review-offset derivation can't drift
-/// apart in their inputs.
+/// Everything the commit document renders, borrowed from a
+/// [`CommitDetail`] — ONE bundle so the layout builder and the
+/// review-offset derivation can't drift apart in their inputs.
 pub(super) struct CommitDoc<'a> {
     pub(super) short_sha: &'a str,
     pub(super) subject: &'a str,
@@ -2260,6 +2260,21 @@ pub(super) struct CommitDoc<'a> {
     pub(super) reviews: &'a [(String, clank_core::vocab::Verdict, String)],
 }
 
+pub(super) fn commit_doc(d: &CommitDetail) -> CommitDoc<'_> {
+    CommitDoc {
+        short_sha: &d.short,
+        subject: &d.subject,
+        body: &d.body,
+        stats: &d.stats,
+        reviews: &d.reviews,
+    }
+}
+
+/// The commit document (the SINGLE layout source): hash, subject,
+/// stats, message, then each reviewer's verdict mark + full feedback
+/// body. Records the first line of each reviewer's block by author so
+/// the review-focus scroll lands on the SAME lines the page windows (no
+/// second function re-deriving positions that could drift).
 pub(super) fn build_commit_lines(doc: &CommitDoc<'_>, cols: usize) -> CommitLayout {
     let CommitDoc {
         short_sha,
@@ -2270,15 +2285,6 @@ pub(super) fn build_commit_lines(doc: &CommitDoc<'_>, cols: usize) -> CommitLayo
     } = *doc;
     let mut lines: Vec<String> = Vec::new();
     let mut review_line = std::collections::BTreeMap::new();
-    // The rule title is upper-cased, so keep the (lowercase) sha out of it
-    // and on its own line below.
-    lines.push(region_rule(
-        "commit",
-        "↑↓ scroll · o browser · Esc back",
-        true,
-        cols,
-    ));
-    lines.push(String::new());
     // The hash is IDENTITY, not content: its own dim line, so the title
     // wraps flush-left at full width instead of hanging in a sha-wide
     // gutter (tui-commit-overlay-stats, lloyd).
@@ -2352,28 +2358,68 @@ pub(super) fn build_commit_lines(doc: &CommitDoc<'_>, cols: usize) -> CommitLayo
     CommitLayout { lines, review_line }
 }
 
-/// The full-window commit-detail view (the `Enter`-on-a-log-entry drill
-/// in), scrolled by `offset`. Read-only, like the add-picker /
-/// agent-detail screens. Returns the windowed lines (clamped to `rows`)
-/// AND the TOTAL content height, so the loop clamps the scroll offset to
-/// the last page.
-pub(super) fn render_commit_detail(
-    doc: &CommitDoc<'_>,
-    offset: usize,
+/// A commit's page: its rows over its document
+/// (every-object-in-the-tui-has-a-page). The rule is the page's title;
+/// what the keys do is on the rows.
+pub(super) fn render_commit_page(
+    cp: &CommitPage,
+    actions: &[CommitAction],
+    sel: usize,
     rows: usize,
     cols: usize,
 ) -> (Vec<String>, usize) {
-    let layout = build_commit_lines(doc, cols);
-    let total = layout.lines.len();
-    let off = offset.min(total.saturating_sub(1));
-    let windowed = layout.lines.into_iter().skip(off).take(rows).collect();
-    (windowed, total)
+    // The rule title is upper-cased, so the (lowercase) sha stays in
+    // the document, on its own line.
+    let head = vec![region_rule("commit", "", true, cols), String::new()];
+    let built: Vec<(&str, String, &str)> = actions
+        .iter()
+        .enumerate()
+        .map(|(i, a)| {
+            let key = commit_action_key(actions, i).map_or("", |(_, shown)| shown);
+            match a {
+                CommitAction::OpenHtml => (
+                    key,
+                    "open in browser".to_string(),
+                    "the commit's html page with its reviews",
+                ),
+                CommitAction::OpenPlan(stem) => (
+                    key,
+                    format!("open plan {stem}"),
+                    "the plan this commit is tagged with",
+                ),
+                CommitAction::Back => (key, "back".to_string(), ""),
+            }
+        })
+        .collect();
+    let menu: Vec<MenuRow<'_>> = built
+        .iter()
+        .map(|(key, label, desc)| MenuRow::Action {
+            key,
+            label,
+            value: None,
+            desc,
+            danger: false,
+        })
+        .collect();
+    let document = Document {
+        lines: build_commit_lines(&commit_doc(&cp.detail), cols).lines,
+        scroll: cp.scroll,
+    };
+    menu_over_document(
+        head,
+        &menu,
+        sel,
+        document,
+        "  ↑↓ move · ⏎ select · esc back",
+        rows,
+        cols,
+    )
 }
 
 /// The scroll offset that brings reviewer `author`'s feedback to the top
-/// of the commit-detail view (its block's first line), falling back to
-/// the topmost reviewer block, then 0. Derived from the SAME layout the
-/// view windows, so the focus can't drift from what's drawn.
+/// of the commit document (its block's first line), falling back to the
+/// topmost reviewer block, then 0. Derived from the SAME layout the
+/// page windows, so the focus can't drift from what's drawn.
 pub(super) fn commit_review_offset(doc: &CommitDoc<'_>, author: &str, cols: usize) -> usize {
     let layout = build_commit_lines(doc, cols);
     layout
@@ -2793,6 +2839,7 @@ pub(super) fn render_plan_detail(
         S::Active { repo_paused: true } => ("plan", "active · repo paused".to_string()),
         S::Active { repo_paused: false } => ("plan", "active".to_string()),
         S::Finished { .. } => ("plan", "finished".to_string()),
+        S::Stashed => ("stash", "stashed".to_string()),
     };
     out.push(region_rule(
         &format!("{kind} · {}", pp.stem),
@@ -2821,28 +2868,59 @@ pub(super) fn render_plan_detail(
             danger: *danger,
         })
         .collect();
-    out.extend(render_menu(&menu, sel, cols));
-    let doc_focused = sel >= super::input::document_focus(actions);
-
     let body_lines = match pp.body.as_deref() {
         Some(md) => super::markdown::render_markdown(md, cols),
         None => vec![emit(&[dim("  (no plan document)".to_string())], "", cols)],
     };
+    let hint = if actions.get(sel) == Some(&PlanAction::Priority) {
+        "  ↑↓ move · ⏎ opens the priority page · esc back"
+    } else {
+        "  ↑↓ move · ⏎ select · esc back"
+    };
+    let document = Document {
+        lines: body_lines,
+        scroll: pp.scroll,
+    };
+    menu_over_document(out, &menu, sel, document, hint, rows, cols)
+}
 
+/// The document beneath a page's menu, and how far it is scrolled.
+struct Document {
+    lines: Vec<String>,
+    scroll: usize,
+}
+
+/// A page that is a menu over a document: `out` (its title lines), then
+/// `menu` with the cursor at `sel` — one past its last row being the
+/// document's focus — above a window on `document`, with `hint` pinned
+/// at the bottom. Returns the lines and the virtual height the loop
+/// clamps the document's scroll against.
+fn menu_over_document(
+    mut out: Vec<String>,
+    menu: &[MenuRow<'_>],
+    sel: usize,
+    document: Document,
+    hint: &str,
+    rows: usize,
+    cols: usize,
+) -> (Vec<String>, usize) {
+    let Document {
+        lines: body_lines,
+        scroll,
+    } = document;
+    let doc_focused = sel >= menu.len();
     // FOCUSED: the document takes the whole pane. Sharing it with the
     // menu gave the document whatever the buttons did not want, which
     // on a short pane was a line or two — and reading is the reason
     // you walked down there (one-menu-not-five).
     if doc_focused {
-        let mut doc = vec![match pp.scroll > 0 {
+        let mut doc = vec![match scroll > 0 {
             true => region_rule_elevated("document", DOC_HINT, true, cols),
             false => region_rule("document", DOC_HINT, true, cols),
         }];
         let viewport = rows.saturating_sub(2);
         let total = 1 + body_lines.len() + 1;
-        let off = pp
-            .scroll
-            .min(body_lines.len().saturating_sub(viewport.max(1)));
+        let off = scroll.min(body_lines.len().saturating_sub(viewport.max(1)));
         doc.extend(body_lines.into_iter().skip(off).take(viewport));
         while doc.len() < rows.saturating_sub(1) {
             doc.push(String::new());
@@ -2858,6 +2936,20 @@ pub(super) fn render_plan_detail(
         return (doc, total);
     }
 
+    // The menu gets what the title, the document's rule and the hint
+    // leave, windowed on the selected row: a row off screen cannot be
+    // seen to be selected, and a row with no key cannot be reached
+    // any other way.
+    let (lines, starts) = menu_lines(menu, sel, cols);
+    let room = rows.saturating_sub(out.len() + 2).max(1);
+    let from = starts[sel];
+    let to = starts.get(sel + 1).copied().unwrap_or(lines.len());
+    out.extend(
+        lines
+            .into_iter()
+            .skip(keep_visible(from, to, room))
+            .take(room),
+    );
     // The document rule is pushed AFTER the clamp below so its
     // flat-vs-lifted choice keys on the same offset the window uses.
     let chrome = out.len() + 1;
@@ -2867,9 +2959,7 @@ pub(super) fn render_plan_detail(
     // (codex 9452520).
     let total = chrome + body_lines.len() + 1;
     let viewport = rows.saturating_sub(chrome + 1);
-    let off = pp
-        .scroll
-        .min(body_lines.len().saturating_sub(viewport.max(1)));
+    let off = scroll.min(body_lines.len().saturating_sub(viewport.max(1)));
     out.push(if off > 0 {
         region_rule_elevated("document", DOC_HINT, false, cols)
     } else {
@@ -2881,11 +2971,6 @@ pub(super) fn render_plan_detail(
         out.push(String::new());
     }
     out.truncate(rows.saturating_sub(1));
-    let hint = if actions.get(sel) == Some(&PlanAction::Priority) {
-        "  ↑↓ move · ⏎ opens the priority page · esc back"
-    } else {
-        "  ↑↓ move · ⏎ select · esc back"
-    };
     out.push(emit(&[dim(hint.to_string())], "", cols));
     (out, total)
 }
@@ -2954,6 +3039,11 @@ fn plan_button_row(a: PlanAction) -> (&'static str, &'static str, &'static str) 
             "finalize NOW, bypassing the review gate",
         ),
         PlanAction::Squash => (key, "squash…", "collapse the plan's commits into one"),
+        PlanAction::Restore => (
+            key,
+            "restore…",
+            "put its commits back on this branch, unreviewed: they are new commits",
+        ),
         PlanAction::Purge => (
             key,
             "purge…",
@@ -3033,6 +3123,7 @@ pub(super) fn render_roster_confirm(
         ConfirmAction::StashPlan
         | ConfirmAction::UnqueuePlan
         | ConfirmAction::PromotePlan
+        | ConfirmAction::RestorePlan
         | ConfirmAction::PurgeArtifacts
         | ConfirmAction::PurgeDrop { .. } => {
             unreachable!("plan confirmations render through render_plan_confirm")
@@ -3052,6 +3143,7 @@ pub(super) fn render_roster_confirm(
         ConfirmAction::StashPlan
         | ConfirmAction::UnqueuePlan
         | ConfirmAction::PromotePlan
+        | ConfirmAction::RestorePlan
         | ConfirmAction::PurgeArtifacts
         | ConfirmAction::PurgeDrop { .. } => {
             unreachable!("plan confirmations render through render_plan_confirm")
@@ -3189,6 +3281,12 @@ pub(super) fn render_plan_confirm(
                  puts it back"
             ),
         ),
+        ConfirmAction::RestorePlan => (
+            format!("restore `{stem}`?"),
+            "cherry-picks its stashed commits back onto this branch and makes it the active plan \
+             again; the replayed commits are new, so their reviews start over"
+                .to_string(),
+        ),
         ConfirmAction::PromotePlan => (
             format!("promote `{stem}`?"),
             "moves it into plans/ and COMMITS the intro — the review cycle starts on the \
@@ -3227,7 +3325,10 @@ pub(super) fn render_plan_confirm(
     let banner_color = match action {
         // Reverse, uncolored: reversible or ordinary. Red is for the
         // history rewrites.
-        ConfirmAction::StashPlan | ConfirmAction::UnqueuePlan | ConfirmAction::PromotePlan => "7",
+        ConfirmAction::StashPlan
+        | ConfirmAction::UnqueuePlan
+        | ConfirmAction::PromotePlan
+        | ConfirmAction::RestorePlan => "7",
         _ => "1;41;97", // bold white on red — the scary one
     };
     out.push(emit(
@@ -3442,37 +3543,6 @@ pub(super) fn render_error_doc(
         for line in wrap(raw, cols.saturating_sub(2).max(1)) {
             content.push(emit(&[colored("31", format!("  {line}"))], "", cols));
         }
-    }
-    let total = content.len();
-    let off = offset.min(total.saturating_sub(1));
-    let windowed = content.into_iter().skip(off).take(rows).collect();
-    (windowed, total)
-}
-
-/// The full-window plan-document view (the `Enter`-on-a-plan-header drill
-/// in): the plan stem as the rule title, then the plan's markdown rendered
-/// to styled lines (or a dim "plan file not found" when the file is
-/// absent), scrolled by `offset`. Returns the windowed lines (clamped to
-/// `rows`) AND the TOTAL content height, so the loop clamps the offset to
-/// the last page — same shape as [`render_commit_detail`].
-pub(super) fn render_plan_doc(
-    stem: &str,
-    markdown: Option<&str>,
-    offset: usize,
-    rows: usize,
-    cols: usize,
-) -> (Vec<String>, usize) {
-    let mut content: Vec<String> = Vec::new();
-    content.push(region_rule(
-        stem,
-        "↑↓ scroll · o browser · Esc back",
-        true,
-        cols,
-    ));
-    content.push(String::new());
-    match markdown {
-        Some(md) => content.extend(super::markdown::render_markdown(md, cols)),
-        None => content.push(emit(&[dim("plan file not found")], "", cols)),
     }
     let total = content.len();
     let off = offset.min(total.saturating_sub(1));
@@ -3816,6 +3886,34 @@ mod tests {
             "the value row's hint: {:?}",
             lines.last()
         );
+    }
+
+    /// A stash row opens the plan page, not a scroll-only document
+    /// whose rule lists its keys (every-object-in-the-tui-has-a-page).
+    #[test]
+    fn a_stashed_plan_renders_on_the_plan_page() {
+        let st = crate::cli::status_tui::input::PlanPageState::Stashed;
+        let mut pp = page(st);
+        pp.body = Some("# stashed\n\nThe stashed body.\n".into());
+        let actions = plan_actions(st);
+        let (lines, _) = render_plan_detail(&pp, &actions, 0, 40, 90);
+        let text = lines.join("\n");
+        let rule = lines
+            .iter()
+            .find(|l| l.contains("STASH · MY-PLAN"))
+            .unwrap_or_else(|| panic!("{text}"));
+        assert!(rule.contains("stashed"), "{rule}");
+        assert!(
+            !rule.contains("Esc") && !rule.contains("scroll"),
+            "the rule advertises no keys: {rule}"
+        );
+        assert!(text.contains("open in browser"), "{text}");
+        assert!(text.contains("restore…"), "{text}");
+        assert!(
+            !text.contains("stash…") && !text.contains("purge…"),
+            "{text}"
+        );
+        assert!(text.contains("The stashed body."), "{text}");
     }
 
     #[test]
@@ -4245,6 +4343,7 @@ mod tests {
                         let view = PanelView {
                             mode,
                             plan_page: None,
+                            commit_page: None,
                             event_page: None,
                             wait_page: None,
                             seen_session: None,
@@ -4288,6 +4387,7 @@ mod tests {
     fn lift_view(cursor: usize, lift: usize) -> PanelView<'static> {
         PanelView {
             plan_page: None,
+            commit_page: None,
             event_page: None,
             wait_page: None,
             seen_session: None,
@@ -4506,6 +4606,7 @@ mod tests {
         s.log_rows = (0..12).map(|i| commit_row(&format!("c{i}"))).collect();
         let view = PanelView {
             plan_page: None,
+            commit_page: None,
             event_page: None,
             wait_page: None,
             seen_session: None,
@@ -5988,6 +6089,7 @@ mod tests {
             0,
             &PanelView {
                 plan_page: None,
+                commit_page: None,
                 event_page: None,
                 wait_page: None,
                 seen_session: None,
@@ -6039,6 +6141,7 @@ mod tests {
         ];
         let view = PanelView {
             plan_page: None,
+            commit_page: None,
             event_page: None,
             wait_page: None,
             seen_session: None,
@@ -6140,6 +6243,7 @@ mod tests {
             0,
             &PanelView {
                 plan_page: None,
+                commit_page: None,
                 event_page: None,
                 wait_page: None,
                 seen_session: None,
@@ -6553,6 +6657,7 @@ mod tests {
         // two_agent_snap has no ask/in-progress rows).
         let view = PanelView {
             plan_page: None,
+            commit_page: None,
             event_page: None,
             wait_page: None,
             seen_session: None,
@@ -7875,7 +7980,7 @@ mod tests {
                 "fix the thing".to_string(),
             ),
         ];
-        let (lines, total) = render_commit_detail(
+        let lines = build_commit_lines(
             &doc(
                 "abc1234",
                 "do the thing",
@@ -7883,10 +7988,9 @@ mod tests {
                 &[],
                 &reviews,
             ),
-            0,
-            40,
             60,
-        );
+        )
+        .lines;
         let joined = lines
             .iter()
             .map(|l| visible(l))
@@ -7905,27 +8009,6 @@ mod tests {
         assert!(
             joined.contains("ruthless") && joined.contains("fix the thing"),
             "reviewer 2 verdict author + body"
-        );
-        assert!(total >= lines.len(), "reports total content height");
-        assert!(lines.len() <= 40, "full-window: clamped to the row budget");
-
-        // Scrolling shifts the window — the heading is no longer line 0.
-        let (scrolled, _) = render_commit_detail(
-            &doc(
-                "abc1234",
-                "do the thing",
-                "a longer body paragraph",
-                &[],
-                &reviews,
-            ),
-            3,
-            40,
-            60,
-        );
-        assert_ne!(
-            visible(&scrolled[0]),
-            visible(&lines[0]),
-            "offset shifts the visible window"
         );
     }
 
@@ -8013,7 +8096,7 @@ mod tests {
         let subject =
             "[a-really-long-plan-name] make the thing work end to end without going off the screen";
         let cols = 40;
-        let (lines, _) = render_commit_detail(&doc("abc1234", subject, "", &[], &[]), 0, 40, cols);
+        let lines = build_commit_lines(&doc("abc1234", subject, "", &[], &[]), cols).lines;
         let visibles: Vec<String> = lines.iter().map(|l| visible(l)).collect();
         let joined = visibles.join("\n");
         // Every word of the subject survives (nothing dropped to an
@@ -8057,6 +8140,182 @@ mod tests {
                 "line wider than {cols}: {l:?}"
             );
         }
+    }
+
+    fn key(s: &str) -> crate::lifecycle::PlanKey {
+        crate::lifecycle::PlanKey::parse(s).unwrap()
+    }
+
+    fn commit_page(plans: &[&str]) -> CommitPage {
+        CommitPage {
+            detail: CommitDetail {
+                sha: crate::lifecycle::CommitSha::parse(&"a".repeat(40)).unwrap(),
+                short: "aaaaaaa".into(),
+                subject: "[foo] do the thing".into(),
+                body: (1..=30).map(|i| format!("line {i}\n\n")).collect(),
+                reviews: Vec::new(),
+                stats: Vec::new(),
+            },
+            plans: plans
+                .iter()
+                .map(|s| crate::lifecycle::PlanKey::parse(s).unwrap())
+                .collect(),
+            scroll: 0,
+            left_at: 0,
+        }
+    }
+
+    /// A commit is a page: its rows name their keys, its rule names
+    /// only the page, and its document scrolls beneath
+    /// (every-object-in-the-tui-has-a-page).
+    #[test]
+    fn a_commit_renders_as_a_page_with_a_row_per_plan() {
+        let cp = commit_page(&["foo", "bar"]);
+        let actions = commit_actions(&cp.plans);
+        let (lines, _) = render_commit_page(&cp, &actions, 0, 40, 80);
+        let vis: Vec<String> = lines.iter().map(|l| visible(l)).collect();
+        let rule = &vis[0];
+        assert!(rule.contains("COMMIT"), "{rule}");
+        assert!(
+            !rule.contains("Esc") && !rule.contains("browser") && !rule.contains("scroll"),
+            "the rule advertises no keys: {rule}"
+        );
+        let row = |label: &str| {
+            vis.iter()
+                .find(|l| l.contains(label))
+                .unwrap_or_else(|| panic!("`{label}` missing: {vis:#?}"))
+                .clone()
+        };
+        assert!(row("open in browser").contains('o'));
+        assert!(
+            row("open plan foo").contains('1'),
+            "{}",
+            row("open plan foo")
+        );
+        assert!(
+            row("open plan bar").contains('2'),
+            "{}",
+            row("open plan bar")
+        );
+        assert!(row("back").contains("esc"));
+        let menu_end = vis.iter().position(|l| l.contains("back")).unwrap();
+        let doc = vis.iter().position(|l| l.contains("do the thing")).unwrap();
+        assert!(doc > menu_end, "the document is beneath the rows");
+
+        let (ad_hoc, _) = render_commit_page(&commit_page(&[]), &commit_actions(&[]), 0, 40, 80);
+        assert!(
+            !ad_hoc.iter().any(|l| visible(l).contains("open plan")),
+            "an ad-hoc commit has no plan to open"
+        );
+    }
+
+    /// Every key a commit row shows fires that row, and no two rows
+    /// share one.
+    #[test]
+    fn every_commit_key_fires_the_row_that_shows_it() {
+        let plans: Vec<crate::lifecycle::PlanKey> = (0..10)
+            .map(|i| crate::lifecycle::PlanKey::parse(&format!("p{i}")).unwrap())
+            .collect();
+        let actions = commit_actions(&plans);
+        let mut shown = Vec::new();
+        for (i, a) in actions.iter().enumerate() {
+            let Some((key, label)) = commit_action_key(&actions, i) else {
+                assert_eq!(
+                    *a,
+                    CommitAction::OpenPlan(key("p9")),
+                    "only a tenth plan row"
+                );
+                continue;
+            };
+            shown.push(label);
+            assert_eq!(
+                commit_page_nav(0, &actions, key, 10, 0),
+                CommitNav::Act(a.clone()),
+                "{a:?} shows `{label}`"
+            );
+        }
+        let mut unique = shown.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), shown.len(), "{shown:?}");
+    }
+
+    /// A menu taller than its room is windowed on the selected row, so
+    /// the row the cursor is on is on screen to be seen and fired — the
+    /// tenth plan row has no key, so the cursor is the only way to it.
+    #[test]
+    fn the_selected_row_of_a_tall_menu_is_on_screen() {
+        let names: Vec<String> = (0..10).map(|i| format!("p{i}")).collect();
+        let cp = commit_page(&names.iter().map(String::as_str).collect::<Vec<_>>());
+        let actions = commit_actions(&cp.plans);
+        let shows = |sel: usize, rows: usize, label: &str| {
+            render_commit_page(&cp, &actions, sel, rows, 80)
+                .0
+                .iter()
+                .any(|l| visible(l).contains(label))
+        };
+        assert!(
+            !shows(0, 20, "open plan p9"),
+            "the fixture overflows the pane"
+        );
+        assert!(shows(10, 20, "open plan p9"), "the selected tenth plan row");
+        assert!(shows(11, 20, "back"), "the last row");
+        assert!(shows(0, 20, "open in browser"), "back at the top");
+
+        let st = crate::cli::status_tui::input::PlanPageState::Active { repo_paused: false };
+        let pp = page(st);
+        let plan = plan_actions(st);
+        let (short, _) = render_plan_detail(&pp, &plan, plan.len() - 1, 8, 90);
+        assert!(
+            short.iter().any(|l| visible(l).contains("  esc  ")),
+            "a short pane shows the plan page's selected last row: {short:?}"
+        );
+    }
+
+    /// ↓ walks the rows into the document, which then scrolls; Enter
+    /// there has no row to fire.
+    #[test]
+    fn the_commit_page_cursor_enters_the_document() {
+        let cp = commit_page(&["foo"]);
+        let actions = commit_actions(&cp.plans);
+        let doc = document_focus(&actions);
+        assert_eq!(
+            commit_page_nav(doc - 1, &actions, Key::Down, 10, 0),
+            CommitNav::Sel(doc)
+        );
+        assert_eq!(
+            commit_page_nav(doc, &actions, Key::Down, 10, 0),
+            CommitNav::Scroll(1)
+        );
+        assert_eq!(
+            commit_page_nav(doc, &actions, Key::Up, 10, 4),
+            CommitNav::Scroll(-1)
+        );
+        assert_eq!(
+            commit_page_nav(doc, &actions, Key::Up, 10, 0),
+            CommitNav::Sel(doc - 1)
+        );
+        assert_eq!(
+            commit_page_nav(doc, &actions, Key::Enter, 10, 0),
+            CommitNav::None
+        );
+        assert_eq!(
+            commit_page_nav(doc, &actions, Key::Quit, 10, 0),
+            CommitNav::Act(CommitAction::Back),
+            "q leaves the page, not the TUI"
+        );
+        assert_eq!(
+            commit_page_nav(1, &actions, Key::Enter, 10, 0),
+            CommitNav::Act(CommitAction::OpenPlan(key("foo")))
+        );
+
+        let (focused, _) = render_commit_page(&cp, &actions, doc, 12, 80);
+        assert!(
+            !focused
+                .iter()
+                .any(|l| visible(l).contains("open in browser")),
+            "focused, the document has the pane"
+        );
     }
 
     #[test]
@@ -8105,27 +8364,6 @@ mod tests {
         assert_eq!(
             commit_review_offset(&doc("abc1234", "s", "b", &[], &[]), "x", cols),
             0
-        );
-    }
-
-    #[test]
-    fn render_plan_doc_titles_and_reports_missing() {
-        let (lines, total) = render_plan_doc("my-plan", Some("# Heading\n\nbody"), 0, 40, 60);
-        assert!(total >= 3);
-        assert!(
-            visible(&lines[0]).contains("MY-PLAN"),
-            "stem in the rule title: {:?}",
-            visible(&lines[0])
-        );
-        assert!(
-            lines.iter().any(|l| visible(l).contains("Heading")),
-            "markdown rendered into the body"
-        );
-        // A missing file degrades to a dim note, never a blank screen.
-        let (miss, _) = render_plan_doc("gone", None, 0, 40, 60);
-        assert!(
-            miss.iter()
-                .any(|l| visible(l).contains("plan file not found"))
         );
     }
 

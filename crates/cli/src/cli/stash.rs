@@ -447,7 +447,10 @@ pub async fn run_push(args: StashPushArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_pop_inner(repo_override: Option<&Path>, plan: Option<&str>) -> anyhow::Result<()> {
+pub(crate) async fn run_pop_inner(
+    repo_override: Option<&Path>,
+    plan: Option<&str>,
+) -> anyhow::Result<()> {
     let repo = super::resolve_repo(repo_override)?;
     let stem = resolve_stashed(&scan_stash(&repo), plan)?;
 

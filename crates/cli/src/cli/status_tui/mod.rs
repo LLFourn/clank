@@ -225,6 +225,7 @@ fn apply_confirm(
         ConfirmAction::StashPlan
         | ConfirmAction::UnqueuePlan
         | ConfirmAction::PromotePlan
+        | ConfirmAction::RestorePlan
         | ConfirmAction::PurgeArtifacts
         | ConfirmAction::PurgeDrop { .. } => Ok(()),
     }
@@ -252,6 +253,9 @@ async fn run_plan_confirm(
         }
         ConfirmAction::UnqueuePlan => crate::cli::queue::unqueue(repo, stem).map(|_| ()),
         ConfirmAction::PromotePlan => crate::cli::queue::promote(repo, stem),
+        ConfirmAction::RestorePlan => {
+            crate::cli::stash::run_pop_inner(Some(repo), Some(stem)).await
+        }
         ConfirmAction::PurgeArtifacts | ConfirmAction::PurgeDrop { .. } => {
             crate::cli::purge::run(crate::cli::PurgeArgs {
                 plan: Some(stem.to_string()),
@@ -270,12 +274,40 @@ async fn run_plan_confirm(
     }
 }
 
+/// A stashed plan's page, its document read from the stash.
+fn stash_page(repo: &std::path::Path, stem: &str) -> PlanPage {
+    PlanPage {
+        body: read_stash_markdown(repo, stem),
+        stem: stem.to_string(),
+        st: input::PlanPageState::Stashed,
+        entry: None,
+        scroll: 0,
+    }
+}
+
+/// What a plan-page confirm's outcome does to the open page. Restoring
+/// moves the plan's source: it is read from the plans now, and a
+/// refresh still reading the stash it left would close the page.
+fn settle_plan_confirm(
+    action: ConfirmAction,
+    outcome: &anyhow::Result<()>,
+    page: &mut Option<PlanPage>,
+) {
+    if action == ConfirmAction::RestorePlan
+        && outcome.is_ok()
+        && let Some(pp) = page.as_mut()
+    {
+        pp.st = input::PlanPageState::Active { repo_paused: false };
+    }
+}
+
 /// The error overlay's title for a failed plan-page action.
 fn plan_confirm_title(action: ConfirmAction) -> String {
     match action {
         ConfirmAction::StashPlan => "stash push failed".to_string(),
         ConfirmAction::UnqueuePlan => "unqueue failed".to_string(),
         ConfirmAction::PromotePlan => "promote failed".to_string(),
+        ConfirmAction::RestorePlan => "stash pop failed".to_string(),
         ConfirmAction::PurgeArtifacts => "purge failed".to_string(),
         ConfirmAction::PurgeDrop { .. } => "purge --drop failed".to_string(),
         _ => "action failed".to_string(),
@@ -563,25 +595,33 @@ async fn plan_page_facts(
     repo: &std::path::Path,
     stem: &str,
     snapshot: &StatusSnapshot,
-    queued: Option<&std::path::Path>,
+    source: PlanSource<'_>,
 ) -> Option<(input::PlanPageState, Option<std::path::PathBuf>)> {
-    if let Some(entry) = queued {
-        let item = input::resolve_queued(&snapshot.queue, stem, entry, |q| {
-            (q.name.as_str(), q.path.as_path())
-        })?;
-        return Some((
-            input::PlanPageState::Queued {
-                priority: item.priority,
-            },
-            Some(item.path.clone()),
-        ));
+    match source {
+        PlanSource::Queue(entry) => {
+            let item = input::resolve_queued(&snapshot.queue, stem, entry, |q| {
+                (q.name.as_str(), q.path.as_path())
+            })?;
+            return Some((
+                input::PlanPageState::Queued {
+                    priority: item.priority,
+                },
+                Some(item.path.clone()),
+            ));
+        }
+        PlanSource::Stash => {
+            return snapshot
+                .stash
+                .iter()
+                .any(|s| s.stem == stem)
+                .then_some((input::PlanPageState::Stashed, None));
+        }
+        PlanSource::Plans => {}
     }
-    let active = snapshot.plans.iter().any(|p| p.plan.as_str() == stem);
-    let finished_file = repo.join(crate::init_facts::finished_md_rel(stem)).exists();
-    if !active && !finished_file {
+    if !has_plan_page(repo, stem, snapshot) {
         return None;
     }
-    if active {
+    if snapshot.plans.iter().any(|p| p.plan.as_str() == stem) {
         let repo_paused = snapshot
             .blocks
             .iter()
@@ -594,6 +634,13 @@ async fn plan_page_facts(
         },
         None,
     ))
+}
+
+/// Whether `stem` is an active or finished plan: what a page opened
+/// from the plans can show.
+fn has_plan_page(repo: &std::path::Path, stem: &str, snapshot: &StatusSnapshot) -> bool {
+    snapshot.plans.iter().any(|p| p.plan.as_str() == stem)
+        || repo.join(crate::init_facts::finished_md_rel(stem)).exists()
 }
 
 /// What `o` opens for a queued page: the html page keyed by its FILE
@@ -630,6 +677,24 @@ fn set_priority_to(repo: &std::path::Path, page: &mut PlanPage, value: u16) -> a
     Ok(())
 }
 
+/// Where a plan page reads its plan from: the source its state names,
+/// in the form the facts lookup takes.
+enum PlanSource<'a> {
+    Plans,
+    Queue(&'a std::path::Path),
+    Stash,
+}
+
+impl PlanPage {
+    fn source(&self) -> PlanSource<'_> {
+        match (self.st, self.entry.as_deref()) {
+            (input::PlanPageState::Queued { .. }, Some(entry)) => PlanSource::Queue(entry),
+            (input::PlanPageState::Stashed, _) => PlanSource::Stash,
+            _ => PlanSource::Plans,
+        }
+    }
+}
+
 /// Refresh the open plan page's facts in place; `false` = the plan is
 /// gone and the page must close (clears `plan_page`, restoring the
 /// mode⟺Some invariant at both callers).
@@ -641,16 +706,17 @@ async fn refetch_plan_page(
     let Some(pp) = plan_page.as_mut() else {
         return false;
     };
-    match plan_page_facts(repo, &pp.stem, snapshot, pp.entry.as_deref()).await {
+    match plan_page_facts(repo, &pp.stem, snapshot, pp.source()).await {
         Some((st, entry)) => {
             pp.st = st;
             // The document shown beneath the buttons may have changed
             // (plan revised, finished, re-queued) — re-read alongside
             // the facts, from the same source and the same file. An
             // external rename the resolver followed lands here too.
-            pp.body = match &entry {
-                Some(path) => std::fs::read_to_string(path).ok(),
-                None => read_plan_markdown(repo, &pp.stem),
+            pp.body = match (&entry, st) {
+                (Some(path), _) => std::fs::read_to_string(path).ok(),
+                (None, input::PlanPageState::Stashed) => read_stash_markdown(repo, &pp.stem),
+                (None, _) => read_plan_markdown(repo, &pp.stem),
             };
             pp.entry = entry;
             true
@@ -1380,32 +1446,13 @@ fn initial_mode(snapshot: &StatusSnapshot) -> Mode {
     }
 }
 
-/// The fetched DATA for a commit-detail overlay: the commit and every
-/// reviewer's verdict + full feedback body. Anchored by `sha` (not a log
-/// index) so a `Refresh` re-fetches the SAME commit.
-struct CommitDetail {
-    sha: crate::lifecycle::CommitSha,
-    short: String,
-    subject: String,
-    body: String,
-    /// `(author, verdict, full feedback body)` per reviewer.
-    reviews: Vec<(String, clank_core::vocab::Verdict, String)>,
-    /// Per-file +/− counts vs first parent (display; empty when the
-    /// numstat read fails — the overlay still opens).
-    stats: Vec<crate::git_io::FileStat>,
-}
-
-/// What a full-window document overlay is showing. Each kind carries the
-/// identity needed to re-fetch on a background `Refresh` (a commit sha; a
-/// plan stem), so the watcher firing never loses the reader's place.
+/// What a full-window document overlay is showing. None re-fetches on a
+/// background `Refresh`: each is a moment or a fixed text, and objects
+/// that change under the reader are pages (every-object-in-the-tui-has-a-page).
 enum OverlayData {
     /// A failed action's error text (no re-fetch identity — the error
     /// is a moment, not a live document; Refresh leaves it as-is).
-    Error {
-        title: String,
-        message: String,
-    },
-    Commit(CommitDetail),
+    Error { title: String, message: String },
     /// An agent's read-only facts, full and scrollable.
     ///
     /// They do not live on the agent page because an invocation is a
@@ -1414,10 +1461,7 @@ enum OverlayData {
     /// windowed there it competed with the menu for the same rows. A
     /// document that scrolls is the shape that always fits, and `y`
     /// copies the command out of it (one-menu-not-five).
-    Info {
-        title: String,
-        body: String,
-    },
+    Info { title: String, body: String },
     /// A link to follow from another device, with its QR
     /// (the-tui-mints-the-way-in).
     Link {
@@ -1425,26 +1469,11 @@ enum OverlayData {
         url: String,
         qr: Vec<String>,
     },
-    /// (An ACTIVE or QUEUED plan's document has no overlay: the plan
-    /// page renders it beneath the action buttons —
-    /// tui-plan-page-redesign, a-queued-plan-has-a-page.)
-    ///
-    /// A STASHED plan's markdown by name — read from the stash record's
-    /// protective ref (the plan file no longer exists on the branch);
-    /// `None` when the item left the stash.
-    StashedPlan {
-        name: String,
-        markdown: Option<String>,
-    },
 }
 
-/// An open document overlay: the fetched [`OverlayData`] and the scroll
-/// `offset`, kept SEPARATE so a background `Refresh` (which re-fetches the
-/// data, so a new verdict / edited plan shows up live) swaps only the data
-/// and never resets the reader's scroll position — the watcher fires
-/// constantly in an active session. `Some` ⟺ an overlay is showing; the
-/// log keeps its cursor underneath, restored on dismiss. Mirrors how
-/// [`LogView`] keeps its cursor across refreshes.
+/// An open document overlay: its [`OverlayData`] and the scroll
+/// `offset`. `Some` ⟺ an overlay is showing; the page beneath keeps its
+/// cursor, restored on dismiss.
 struct Overlay {
     data: OverlayData,
     offset: usize,
@@ -1522,15 +1551,6 @@ fn hint_at(copied: Option<std::time::Instant>, now: std::time::Instant) -> Hint 
 }
 
 impl Overlay {
-    /// A commit overlay opened at `offset` (0 for a commit row; a
-    /// reviewer's block for a review row — see [`render::commit_review_offset`]).
-    fn commit(data: CommitDetail, offset: usize) -> Self {
-        Self {
-            data: OverlayData::Commit(data),
-            offset,
-            copied: None,
-        }
-    }
     /// An agent's facts as a scrollable document.
     fn info(title: String, body: String) -> Self {
         Self {
@@ -1565,19 +1585,6 @@ impl Overlay {
             copied: None,
         }
     }
-    /// A stashed-plan overlay, opened at the top.
-    fn stashed(name: String, markdown: Option<String>) -> Self {
-        Self {
-            data: OverlayData::StashedPlan { name, markdown },
-            offset: 0,
-            copied: None,
-        }
-    }
-    /// Swap in freshly-fetched data, PRESERVING the scroll offset (the
-    /// next render's clamp handles content that shrank).
-    fn refresh(&mut self, data: OverlayData) {
-        self.data = data;
-    }
     /// Scroll by a signed line delta, clamped to `[0, max_off]`.
     fn scroll(&mut self, delta: i32, max_off: usize) {
         self.offset = (self.offset as i32 + delta).clamp(0, max_off as i32) as usize;
@@ -1608,17 +1615,6 @@ fn feedback_display_body(raw: &str) -> String {
 /// that file (the same per-agent file the log's review summaries come
 /// from). `None` if the commit can't be read; a missing feedback file
 /// degrades to an empty body.
-/// Borrow a [`CommitDetail`] as the render layer's [`render::CommitDoc`].
-fn commit_doc(d: &CommitDetail) -> render::CommitDoc<'_> {
-    render::CommitDoc {
-        short_sha: &d.short,
-        subject: &d.subject,
-        body: &d.body,
-        stats: &d.stats,
-        reviews: &d.reviews,
-    }
-}
-
 fn fetch_commit_detail(
     repo: &std::path::Path,
     sha: &crate::lifecycle::CommitSha,
@@ -1647,7 +1643,7 @@ fn fetch_commit_detail(
                 })
         })
         .unwrap_or_default();
-    // Stats degrade to empty on failure — the overlay still opens
+    // Stats degrade to empty on failure — the page still opens
     // (subject/body/reviews are the load-bearing content).
     let stats = crate::git_io::commit_numstat_at(repo, sha).unwrap_or_default();
     Some(CommitDetail {
@@ -1658,6 +1654,157 @@ fn fetch_commit_detail(
         body,
         reviews,
     })
+}
+
+/// The plans `subject`'s `[plan]` tag names that have a page, in tag
+/// order, each once. A name that is not a plan key names no plan — as
+/// the fold's classifier has it — and is never a path to read.
+fn commit_plans(
+    repo: &std::path::Path,
+    subject: &str,
+    snapshot: &StatusSnapshot,
+) -> Vec<crate::lifecycle::PlanKey> {
+    let Some(clank_core::repo_state::TitlePrefix::Plans(names)) =
+        clank_core::repo_state::parse_title_prefix(subject)
+    else {
+        return Vec::new();
+    };
+    let mut plans = Vec::new();
+    for key in names
+        .iter()
+        .filter_map(|n| crate::lifecycle::PlanKey::parse(n).ok())
+    {
+        if !plans.contains(&key) && has_plan_page(repo, key.as_str(), snapshot) {
+            plans.push(key);
+        }
+    }
+    plans
+}
+
+/// A commit's page, opened on its rows — or, from a review row, with
+/// the document focused at `focus`'s feedback. `None` when the commit
+/// cannot be read.
+fn open_commit_page(
+    repo: &std::path::Path,
+    sha: &crate::lifecycle::CommitSha,
+    focus: Option<&str>,
+    snapshot: &StatusSnapshot,
+    cols: usize,
+) -> Option<(CommitPage, Mode)> {
+    let detail = fetch_commit_detail(repo, sha)?;
+    let plans = commit_plans(repo, &detail.subject, snapshot);
+    let (sel, scroll) = match focus {
+        Some(author) => (
+            document_focus(&commit_actions(&plans)),
+            commit_review_offset(&commit_doc(&detail), author, cols),
+        ),
+        None => (0, 0),
+    };
+    Some((
+        CommitPage {
+            detail,
+            plans,
+            scroll,
+            left_at: 0,
+        },
+        Mode::CommitPage { sel },
+    ))
+}
+
+/// Re-read the open commit page by its sha, keeping the reader's
+/// scroll, and carry the cursor by the row under it. A commit that
+/// cannot be read now keeps what the page showed.
+fn refresh_commit_page(
+    repo: &std::path::Path,
+    cp: &mut CommitPage,
+    sel: usize,
+    snapshot: &StatusSnapshot,
+) -> Mode {
+    let before = commit_actions(&cp.plans);
+    if let Some(detail) = fetch_commit_detail(repo, &cp.detail.sha) {
+        cp.detail = detail;
+    }
+    cp.plans = commit_plans(repo, &cp.detail.subject, snapshot);
+    Mode::CommitPage {
+        sel: rebind_page_sel(&before, sel, &commit_actions(&cp.plans)),
+    }
+}
+
+/// Close the plan page, returning to the commit page `beneath` it, when
+/// it was opened from one, on the row it was left on; else to the log.
+fn close_plan_page(
+    repo: &std::path::Path,
+    plan_page: &mut Option<PlanPage>,
+    beneath: &mut Option<CommitPage>,
+    commit_page: &mut Option<CommitPage>,
+    snapshot: &StatusSnapshot,
+) -> Mode {
+    *plan_page = None;
+    let Some(mut cp) = beneath.take() else {
+        return Mode::LogScroll;
+    };
+    let left_at = cp.left_at;
+    let mode = refresh_commit_page(repo, &mut cp, left_at, snapshot);
+    *commit_page = Some(cp);
+    mode
+}
+
+/// Refresh the open plan page, or close it if its plan is gone; `Err`
+/// is where closing it landed.
+async fn refetch_or_close(
+    repo: &std::path::Path,
+    plan_page: &mut Option<PlanPage>,
+    beneath: &mut Option<CommitPage>,
+    commit_page: &mut Option<CommitPage>,
+    snapshot: &StatusSnapshot,
+) -> Result<(), Mode> {
+    match refetch_plan_page(repo, plan_page, snapshot).await {
+        true => Ok(()),
+        false => Err(close_plan_page(
+            repo,
+            plan_page,
+            beneath,
+            commit_page,
+            snapshot,
+        )),
+    }
+}
+
+/// An active or finished plan's page, from the plans.
+async fn open_plan_page(
+    repo: &std::path::Path,
+    key: &crate::lifecycle::PlanKey,
+    snapshot: &StatusSnapshot,
+) -> Option<PlanPage> {
+    let stem = key.as_str();
+    let (st, _) = plan_page_facts(repo, stem, snapshot, PlanSource::Plans).await?;
+    Some(PlanPage {
+        stem: stem.to_string(),
+        st,
+        entry: None,
+        body: read_plan_markdown(repo, stem),
+        scroll: 0,
+    })
+}
+
+/// The page of the plan on commit row `key`. The commit page moves
+/// `beneath` it, remembering that row for the plan page's Back — the
+/// row fired, not the cursor, which a digit key leaves elsewhere.
+async fn open_plan_from_commit(
+    repo: &std::path::Path,
+    commit_page: &mut Option<CommitPage>,
+    beneath: &mut Option<CommitPage>,
+    key: &crate::lifecycle::PlanKey,
+    snapshot: &StatusSnapshot,
+) -> Option<PlanPage> {
+    let pp = open_plan_page(repo, key, snapshot).await?;
+    let mut cp = commit_page.take()?;
+    cp.left_at = commit_actions(&cp.plans)
+        .iter()
+        .position(|a| matches!(a, CommitAction::OpenPlan(k) if k == key))
+        .unwrap_or(0);
+    *beneath = Some(cp);
+    Some(pp)
 }
 
 /// Read a plan stem's markdown from the WORKING TREE: the active
@@ -1690,8 +1837,8 @@ fn read_stash_markdown(repo: &std::path::Path, name: &str) -> Option<String> {
     crate::git_io::show_blob(repo, &tip, std::path::Path::new(&rel)).ok()
 }
 
-/// What an open overlay can render as HTML — a plan stem or a full commit
-/// sha, owned so the overlay's borrow is released before dispatch.
+/// What a page can open as HTML — a plan stem, a full commit sha, a
+/// queue entry's file stem, a stash stem.
 enum HtmlTarget {
     Plan(String),
     Commit(String),
@@ -1699,13 +1846,13 @@ enum HtmlTarget {
     Stash(String),
 }
 
-/// Open the overlay's plan/commit as its rendered HTML page in the host
-/// browser. Spawns the built `clank` DETACHED with stdio nulled: the TUI
+/// Open a page's object as its rendered HTML page in the host browser.
+/// Spawns the built `clank` DETACHED with stdio nulled: the TUI
 /// owns the terminal (raw/alt-screen), so build progress must not print into
 /// the pane, and detaching lets the browser open when the incremental build
 /// finishes without freezing the loop. For a commit whose page was evicted
 /// from the incremental window, pass `--rebuild` so the open still succeeds.
-fn open_overlay_in_browser(repo: &std::path::Path, target: &HtmlTarget) {
+fn open_in_browser(repo: &std::path::Path, target: &HtmlTarget) {
     use crate::cli::html::HtmlOpenTarget;
     let (open_target, rebuild) = match target {
         HtmlTarget::Plan(stem) => (HtmlOpenTarget::Plan(stem.as_str()), false),
@@ -2192,8 +2339,8 @@ struct Batch {
 
 /// What one event arriving BEHIND an overlay owes the page beneath.
 ///
-/// The overlay answers the event itself — re-fetching its commit or
-/// document on a refresh, scrolling on a key — and then `continue`s
+/// The overlay answers the event itself — scrolling on a key — and
+/// then `continue`s
 /// past the loop bottom where the main page's refresh flush and log
 /// fill live. So the flags those need are raised from here, or never:
 /// a refresh consumed by an overlay used to leave the main page
@@ -2397,8 +2544,8 @@ pub(crate) async fn run_tui(
     let mut log = LogView::new();
     log.next = snapshot.log_next.clone();
     log.complete = log.next.is_none();
-    // The document overlay, when open (Enter on a log entry): a commit's
-    // detail or a plan's rendered markdown.
+    // The document overlay, when open: an agent's facts, a failure, a
+    // link.
     let mut detail: Option<Overlay> = None;
     let mut detail_shown: Option<Vec<DetailAction>> = None;
     // Which region owns the keyboard. Starts on the log; Tab moves it to
@@ -2414,6 +2561,10 @@ pub(crate) async fn run_tui(
     // a plan-page Confirm — set and cleared ONLY together with those
     // mode transitions.
     let mut plan_page: Option<PlanPage> = None;
+    // The open commit page, and the one a plan page opened from it
+    // returns to; see `Mode::CommitPage`.
+    let mut commit_page: Option<CommitPage> = None;
+    let mut commit_beneath: Option<CommitPage> = None;
     // The open EVENT page (tui-github-event-page); invariant: `Some`
     // ⟺ mode is `EventDetail` (set/cleared together, like plan_page).
     let mut event_page: Option<EventPage> = None;
@@ -2444,7 +2595,7 @@ pub(crate) async fn run_tui(
         // Every pass, before any render: see the fn's invariant doc.
         enforce_panel_tops_log(mode, &mut log);
 
-        // The commit-detail overlay owns the whole pane until dismissed:
+        // A document overlay owns the whole pane until dismissed:
         // render it, route its own (scroll / back) keys, and skip the
         // normal log/panel path. Nothing here animates, so the wait is
         // the slow backstop.
@@ -2455,19 +2606,6 @@ pub(crate) async fn run_tui(
             // that must come back to unpaint it are one decision.
             let hint = hint_at(overlay.copied, std::time::Instant::now());
             let (lines, total) = match &overlay.data {
-                OverlayData::Commit(d) => render_commit_detail(
-                    &commit_doc(d),
-                    overlay.offset,
-                    rows as usize,
-                    cols as usize,
-                ),
-                OverlayData::StashedPlan { name, markdown } => render_plan_doc(
-                    name,
-                    markdown.as_deref(),
-                    overlay.offset,
-                    rows as usize,
-                    cols as usize,
-                ),
                 OverlayData::Info { title, body } => {
                     render_info_doc(title, body, overlay.offset, rows as usize, cols as usize)
                 }
@@ -2481,16 +2619,6 @@ pub(crate) async fn run_tui(
                 ),
                 OverlayData::Link { title, url, qr } => {
                     render_link_doc(title, url, qr, overlay.offset, rows as usize, cols as usize)
-                }
-            };
-            // Extract the html-open target by value up front so the
-            // `OpenHtml` arm doesn't hold a borrow of `detail` (the `Back`
-            // arm mutates it).
-            let html_target: Option<HtmlTarget> = match &overlay.data {
-                OverlayData::Commit(d) => Some(HtmlTarget::Commit(d.sha.as_str().to_string())),
-                OverlayData::StashedPlan { name, .. } => Some(HtmlTarget::Stash(name.clone())),
-                OverlayData::Error { .. } | OverlayData::Link { .. } | OverlayData::Info { .. } => {
-                    None
                 }
             };
             paint(&lines);
@@ -2541,11 +2669,6 @@ pub(crate) async fn run_tui(
                                     d.scroll(delta, max_off);
                                 }
                             }
-                            DocNav::OpenHtml => {
-                                if let Some(t) = &html_target {
-                                    open_overlay_in_browser(&repo, t);
-                                }
-                            }
                             DocNav::Copy => {
                                 // Only the error overlay carries a
                                 // reason worth taking somewhere else.
@@ -2563,37 +2686,10 @@ pub(crate) async fn run_tui(
                         }
                     }
                 }
-                // Data changed under us — re-fetch by IDENTITY (commit sha /
-                // plan stem), but KEEP the scroll offset (refresh swaps
-                // data, not view-state).
-                Ok(Ev::Refresh) => {
-                    let new = match &detail.as_ref().unwrap().data {
-                        OverlayData::Commit(d) => {
-                            let sha = d.sha.clone();
-                            fetch_commit_detail(&repo, &sha).map(OverlayData::Commit)
-                        }
-                        OverlayData::StashedPlan { name, .. } => {
-                            let name = name.clone();
-                            Some(OverlayData::StashedPlan {
-                                markdown: read_stash_markdown(&repo, &name),
-                                name,
-                            })
-                        }
-                        // An error is a moment, not a live document —
-                        // a background refresh must not clear or morph
-                        // it while the user reads.
-                        OverlayData::Error { .. }
-                        | OverlayData::Link { .. }
-                        | OverlayData::Info { .. } => None,
-                    };
-                    if let (Some(data), Some(o)) = (new, detail.as_mut()) {
-                        o.refresh(data);
-                    }
-                }
                 // The overlay hides the notice row; the answer is
-                // drained and painted once the overlay closes. Resize
-                // was noted above.
-                Ok(Ev::Resize) | Ok(Ev::Worker) | Ok(Ev::Remote) => {}
+                // drained and painted once the overlay closes. A refresh
+                // and a resize were noted above.
+                Ok(Ev::Refresh) | Ok(Ev::Resize) | Ok(Ev::Worker) | Ok(Ev::Remote) => {}
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     anyhow::bail!("event channel disconnected")
@@ -2648,6 +2744,7 @@ pub(crate) async fn run_tui(
             clear_target: clear_target.as_ref(),
             mode,
             plan_page: plan_page.as_ref(),
+            commit_page: commit_page.as_ref(),
             event_page: event_page.as_ref(),
             plan_input: plan_input.as_ref(),
             picker: &picker,
@@ -3248,14 +3345,13 @@ pub(crate) async fn run_tui(
                                 }
                                 PanelAction::OpenStashItem(i) => {
                                     if let Some(item) = snapshot.stash.get(i) {
-                                        let name = item.stem.clone();
-                                        let md = read_stash_markdown(&repo, &name);
-                                        detail = Some(Overlay::stashed(name, md));
+                                        plan_page = Some(stash_page(&repo, &item.stem));
+                                        mode = Mode::PlanDetail { sel: 0 };
                                     }
                                 }
                                 PanelAction::OpenStashHtml(i) => {
                                     if let Some(item) = snapshot.stash.get(i) {
-                                        open_overlay_in_browser(
+                                        open_in_browser(
                                             &repo,
                                             &HtmlTarget::Stash(item.stem.clone()),
                                         );
@@ -3467,10 +3563,13 @@ pub(crate) async fn run_tui(
                                     // is bypassed with yes:true); an Err
                                     // opens the error overlay instead of
                                     // vanishing (errors-in-the-TUI).
-                                    if go && let Some(pp) = plan_page.as_ref() {
-                                        if let Err(e) =
-                                            run_plan_confirm(action, &repo, &pp.stem).await
-                                        {
+                                    if go
+                                        && let Some(stem) =
+                                            plan_page.as_ref().map(|pp| pp.stem.clone())
+                                    {
+                                        let outcome = run_plan_confirm(action, &repo, &stem).await;
+                                        settle_plan_confirm(action, &outcome, &mut plan_page);
+                                        if let Err(e) = outcome {
                                             detail = Some(Overlay::error(
                                                 plan_confirm_title(action),
                                                 format!("{e:?}"),
@@ -3669,6 +3768,46 @@ pub(crate) async fn run_tui(
                                 EventNav::None => {}
                             }
                         }
+                        Mode::CommitPage { sel } => {
+                            let Some(cp) = commit_page.as_mut() else {
+                                mode = Mode::LogScroll; // invariant breach — bail out
+                                continue;
+                            };
+                            let actions = commit_actions(&cp.plans);
+                            match commit_page_nav(sel, &actions, k, page, cp.scroll) {
+                                CommitNav::Sel(x) => mode = Mode::CommitPage { sel: x },
+                                CommitNav::Scroll(delta) => {
+                                    let max_off =
+                                        screen_total.saturating_sub((rows as usize).max(1));
+                                    cp.scroll = (cp.scroll as i64 + delta as i64)
+                                        .clamp(0, max_off as i64)
+                                        as usize;
+                                }
+                                CommitNav::Act(CommitAction::OpenHtml) => open_in_browser(
+                                    &repo,
+                                    &HtmlTarget::Commit(cp.detail.sha.as_str().to_string()),
+                                ),
+                                CommitNav::Act(CommitAction::OpenPlan(key)) => {
+                                    if let Some(pp) = open_plan_from_commit(
+                                        &repo,
+                                        &mut commit_page,
+                                        &mut commit_beneath,
+                                        &key,
+                                        &snapshot,
+                                    )
+                                    .await
+                                    {
+                                        plan_page = Some(pp);
+                                        mode = Mode::PlanDetail { sel: 0 };
+                                    }
+                                }
+                                CommitNav::Act(CommitAction::Back) => {
+                                    commit_page = None;
+                                    mode = Mode::LogScroll;
+                                }
+                                CommitNav::None => {}
+                            }
+                        }
                         Mode::PlanDetail { sel } => {
                             if k == Key::Quit {
                                 break 'evloop;
@@ -3690,8 +3829,13 @@ pub(crate) async fn run_tui(
                                     }
                                 }
                                 PlanNav::Back => {
-                                    plan_page = None;
-                                    mode = Mode::LogScroll;
+                                    mode = close_plan_page(
+                                        &repo,
+                                        &mut plan_page,
+                                        &mut commit_beneath,
+                                        &mut commit_page,
+                                        &snapshot,
+                                    );
                                 }
                                 // ONE validated mutation — the primitive
                                 // `queue reprioritise` uses, never an
@@ -3718,11 +3862,14 @@ pub(crate) async fn run_tui(
                                     // A queued page opens ITS file's html —
                                     // the file stem, never the parsed name a
                                     // duplicate could share.
-                                    PlanAction::OpenHtml => open_overlay_in_browser(
+                                    PlanAction::OpenHtml => open_in_browser(
                                         &repo,
-                                        &match queue_html_handle(&pp) {
-                                            Some(stem) => HtmlTarget::Queue(stem),
-                                            None => HtmlTarget::Plan(pp.stem.clone()),
+                                        &match (queue_html_handle(&pp), pp.st) {
+                                            (Some(stem), _) => HtmlTarget::Queue(stem),
+                                            (None, input::PlanPageState::Stashed) => {
+                                                HtmlTarget::Stash(pp.stem.clone())
+                                            }
+                                            (None, _) => HtmlTarget::Plan(pp.stem.clone()),
                                         },
                                     ),
                                     // A value row activates nothing; the
@@ -3744,10 +3891,20 @@ pub(crate) async fn run_tui(
                                             action: ConfirmAction::StashPlan,
                                         };
                                     }
+                                    PlanAction::Restore => {
+                                        mode = Mode::Confirm {
+                                            action: ConfirmAction::RestorePlan,
+                                        };
+                                    }
                                     PlanAction::Purge => mode = Mode::PurgeChoice { sel: 0 },
                                     PlanAction::Back => {
-                                        plan_page = None;
-                                        mode = Mode::LogScroll;
+                                        mode = close_plan_page(
+                                            &repo,
+                                            &mut plan_page,
+                                            &mut commit_beneath,
+                                            &mut commit_page,
+                                            &snapshot,
+                                        );
                                     }
                                     PlanAction::ForceFinish => {
                                         plan_input = Some(TextInput::default());
@@ -3880,11 +4037,10 @@ pub(crate) async fn run_tui(
                             Key::Top => log.jump_top(),
                             Key::Bottom => log.jump_bottom(total),
                             // Enter drills into the entry under the cursor:
-                            // build the same scroll sequence the cursor indexes,
-                            // map the entry to its document, fetch + open the
-                            // overlay. A commit/review opens the commit detail (a
-                            // review scrolled to that reviewer's feedback); a plan
-                            // header opens the plan's rendered markdown. Ask /
+                            // build the same scroll sequence the cursor indexes
+                            // and open the entry's page. A commit/review opens the
+                            // commit page (a review scrolled to that reviewer's
+                            // feedback); a plan header opens the plan page. Ask /
                             // in-progress / ad-hoc rows resolve to None.
                             Key::Enter => {
                                 let seq = build_scroll(&snapshot, &ask_lines);
@@ -3936,35 +4092,27 @@ pub(crate) async fn run_tui(
                                     }
                                     continue;
                                 }
-                                match entry_overlay_target(&seq, log.cursor) {
-                                    Some(OverlayTarget::Commit { sha, focus }) => {
-                                        if let Some(data) = fetch_commit_detail(&repo, &sha) {
-                                            let offset = match &focus {
-                                                Some(author) => commit_review_offset(
-                                                    &commit_doc(&data),
-                                                    author,
-                                                    cols as usize,
-                                                ),
-                                                None => 0,
-                                            };
-                                            detail = Some(Overlay::commit(data, offset));
+                                match entry_target(&seq, log.cursor) {
+                                    Some(EntryTarget::Commit { sha, focus }) => {
+                                        if let Some((cp, m)) = open_commit_page(
+                                            &repo,
+                                            &sha,
+                                            focus.as_deref(),
+                                            &snapshot,
+                                            cols as usize,
+                                        ) {
+                                            commit_page = Some(cp);
+                                            mode = m;
                                         }
                                     }
                                     // A plan header opens the ACTIONS
                                     // page (buttons over the document —
                                     // tui-plan-page-redesign).
-                                    Some(OverlayTarget::Plan { stem }) => {
-                                        if let Some((st, _)) =
-                                            plan_page_facts(&repo, &stem, &snapshot, None).await
+                                    Some(EntryTarget::Plan { key }) => {
+                                        if let Some(pp) =
+                                            open_plan_page(&repo, &key, &snapshot).await
                                         {
-                                            let body = read_plan_markdown(&repo, &stem);
-                                            plan_page = Some(PlanPage {
-                                                stem,
-                                                st,
-                                                entry: None,
-                                                body,
-                                                scroll: 0,
-                                            });
+                                            plan_page = Some(pp);
                                             mode = Mode::PlanDetail { sel: 0 };
                                         }
                                     }
@@ -4366,26 +4514,46 @@ pub(crate) async fn run_tui(
                             None => Mode::LogScroll,
                         }
                     }
+                    Mode::CommitPage { sel } => match commit_page.as_mut() {
+                        Some(cp) => refresh_commit_page(&repo, cp, sel, &snapshot),
+                        None => Mode::LogScroll,
+                    },
                     Mode::PlanDetail { sel } => {
                         let before = plan_page.as_ref().map(|pp| plan_actions(pp.st));
-                        match refetch_plan_page(&repo, &mut plan_page, &snapshot).await {
-                            true => {
+                        match refetch_or_close(
+                            &repo,
+                            &mut plan_page,
+                            &mut commit_beneath,
+                            &mut commit_page,
+                            &snapshot,
+                        )
+                        .await
+                        {
+                            Ok(()) => {
                                 let after = plan_actions(plan_page.as_ref().expect("kept").st);
                                 Mode::PlanDetail {
-                                    sel: rebind_plan_sel(
+                                    sel: rebind_page_sel(
                                         before.as_deref().unwrap_or(&after),
                                         sel,
                                         &after,
                                     ),
                                 }
                             }
-                            false => Mode::LogScroll,
+                            Err(closed) => closed,
                         }
                     }
                     Mode::PurgeChoice { .. } => {
-                        match refetch_plan_page(&repo, &mut plan_page, &snapshot).await {
-                            true => Mode::PlanDetail { sel: 0 },
-                            false => Mode::LogScroll,
+                        match refetch_or_close(
+                            &repo,
+                            &mut plan_page,
+                            &mut commit_beneath,
+                            &mut commit_page,
+                            &snapshot,
+                        )
+                        .await
+                        {
+                            Ok(()) => Mode::PlanDetail { sel: 0 },
+                            Err(closed) => closed,
                         }
                     }
                     // A half-typed input SURVIVES a background refresh
@@ -4393,18 +4561,34 @@ pub(crate) async fn run_tui(
                     // clearing it would eat the user's text); it closes
                     // only when its plan vanished.
                     Mode::PlanInput { kind } => {
-                        match refetch_plan_page(&repo, &mut plan_page, &snapshot).await {
-                            true => Mode::PlanInput { kind },
-                            false => {
+                        match refetch_or_close(
+                            &repo,
+                            &mut plan_page,
+                            &mut commit_beneath,
+                            &mut commit_page,
+                            &snapshot,
+                        )
+                        .await
+                        {
+                            Ok(()) => Mode::PlanInput { kind },
+                            Err(closed) => {
                                 plan_input = None;
-                                Mode::LogScroll
+                                closed
                             }
                         }
                     }
                     Mode::Confirm { action } if action.is_plan_page() => {
-                        match refetch_plan_page(&repo, &mut plan_page, &snapshot).await {
-                            true => Mode::PlanDetail { sel: 0 },
-                            false => Mode::LogScroll,
+                        match refetch_or_close(
+                            &repo,
+                            &mut plan_page,
+                            &mut commit_beneath,
+                            &mut commit_page,
+                            &snapshot,
+                        )
+                        .await
+                        {
+                            Ok(()) => Mode::PlanDetail { sel: 0 },
+                            Err(closed) => closed,
                         }
                     }
                     // A refresh cancels the confirm back to the panel.
@@ -6054,35 +6238,205 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn overlay_refresh_keeps_scroll_offset() {
-        let data = |subject: &str| CommitDetail {
-            stats: Vec::new(),
-            sha: crate::lifecycle::CommitSha::parse(&format!("{:0<40}", "abc")).unwrap(),
-            short: "abc".into(),
-            subject: subject.into(),
-            body: "body".into(),
-            reviews: Vec::new(),
-        };
-        let subject_of = |o: &Overlay| match &o.data {
-            OverlayData::Commit(d) => d.subject.clone(),
-            OverlayData::StashedPlan { .. }
-            | OverlayData::Error { .. }
-            | OverlayData::Link { .. }
-            | OverlayData::Info { .. } => unreachable!(),
-        };
-        // A review row opens at a non-zero offset (commit row would be 0).
-        let mut o = Overlay::commit(data("first"), 5);
-        assert_eq!(o.offset, 5, "opened at the review-focus offset");
-        // THE bug this guards: a background re-fetch (verdict landed, file
-        // churn) swaps the data but must KEEP the reader's scroll position.
-        o.refresh(OverlayData::Commit(data("updated")));
-        assert_eq!(subject_of(&o), "updated", "data was swapped");
-        assert_eq!(o.offset, 5, "scroll offset survives a refresh");
-        // Scrolling clamps to [0, max_off].
+    fn overlay_scroll_clamps_to_the_document() {
+        let mut o = Overlay::info("facts".into(), "body".into());
         o.scroll(100, 8);
         assert_eq!(o.offset, 8, "clamped to the last page");
         o.scroll(-100, 8);
         assert_eq!(o.offset, 0, "clamped at the top");
+    }
+
+    fn git_in(p: &std::path::Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(p)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}");
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+
+    /// Active `foo`, finished `bar`, a queued entry, and a commit per
+    /// kind of tag: the intro, `[foo,bar,misc,foo]`, an ad-hoc `tweak`,
+    /// a plan that has no page, and names that are not plan keys — one
+    /// a path that would reach the queued entry.
+    fn repo_with_tagged_commits() -> tempfile::TempDir {
+        let repo = tempfile::TempDir::new().unwrap();
+        let p = repo.path();
+        git_in(p, &["init", "--quiet", "--initial-branch=main"]);
+        git_in(p, &["config", "user.email", "t@t"]);
+        git_in(p, &["config", "user.name", "t"]);
+        git_in(p, &["config", "commit.gpgsign", "false"]);
+        let write = |rel: &str, body: &str| {
+            std::fs::create_dir_all(p.join(rel).parent().unwrap()).unwrap();
+            std::fs::write(p.join(rel), body).unwrap();
+        };
+        write(".clank/plans/foo.md", "# foo\n");
+        write(".clank/finished/bar.md", "# bar\n");
+        write(".clank/queue/500-queued.md", "# queued\n");
+        for (i, subject) in [
+            "[foo] intro",
+            "[foo,bar,misc,foo] both",
+            "tweak",
+            "[gone] a purged plan's commit",
+            "[../queue/500-queued,.hidden,_] not plan keys",
+        ]
+        .iter()
+        .enumerate()
+        {
+            write(&format!("f{i}.rs"), subject);
+            git_in(p, &["add", "-A"]);
+            git_in(p, &["commit", "--quiet", "-m", subject]);
+        }
+        repo
+    }
+
+    fn sha_of(p: &std::path::Path, subject: &str) -> crate::lifecycle::CommitSha {
+        let log = git_in(p, &["log", "--format=%H %s"]);
+        let (sha, _) = log
+            .lines()
+            .filter_map(|l| l.split_once(' '))
+            .find(|(_, s)| *s == subject)
+            .unwrap_or_else(|| panic!("no commit `{subject}`"));
+        crate::lifecycle::CommitSha::parse(sha).unwrap()
+    }
+
+    fn key(s: &str) -> crate::lifecycle::PlanKey {
+        crate::lifecycle::PlanKey::parse(s).unwrap()
+    }
+
+    /// A commit's page offers each plan its OWN tag names that has a
+    /// page, once, in tag order (every-object-in-the-tui-has-a-page).
+    #[test]
+    fn a_commit_page_offers_the_plans_its_tag_names() {
+        use crate::cli::status_tui::fixtures::{plan_state, snap};
+        use clank_core::plan_view::WaitingOn;
+        let repo = repo_with_tagged_commits();
+        let p = repo.path();
+        let s = snap(vec![plan_state("foo", WaitingOn::MasterToContinue)], vec![]);
+        let rows = |subject: &str| {
+            let (cp, mode) = open_commit_page(p, &sha_of(p, subject), None, &s, 80).unwrap();
+            assert_eq!(mode, Mode::CommitPage { sel: 0 }, "opens on its rows");
+            commit_actions(&cp.plans)
+        };
+        use CommitAction::*;
+        assert_eq!(
+            rows("[foo,bar,misc,foo] both"),
+            [OpenHtml, OpenPlan(key("foo")), OpenPlan(key("bar")), Back],
+            "active and finished plans, once each; `misc` has no page"
+        );
+        assert_eq!(rows("tweak"), [OpenHtml, Back], "an ad-hoc commit");
+        assert_eq!(
+            rows("[gone] a purged plan's commit"),
+            [OpenHtml, Back],
+            "a tag naming no plan"
+        );
+        assert_eq!(
+            rows("[../queue/500-queued,.hidden,_] not plan keys"),
+            [OpenHtml, Back],
+            "a name that is not a plan key is not a path to read"
+        );
+    }
+
+    /// A plan opened from a commit page returns to it, at its scroll
+    /// and on the row that opened it — whatever the cursor — through
+    /// Back and through the refresh that finds the plan gone, which
+    /// returns to no row; with no commit page beneath, to the log.
+    #[tokio::test]
+    async fn a_plan_opened_from_a_commit_page_returns_to_it() {
+        use crate::cli::status_tui::fixtures::{plan_state, snap};
+        use clank_core::plan_view::WaitingOn;
+        let repo = repo_with_tagged_commits();
+        let p = repo.path();
+        let s = snap(vec![plan_state("foo", WaitingOn::MasterToContinue)], vec![]);
+        let both = sha_of(p, "[foo,bar,misc,foo] both");
+        let (mut cp, _) = open_commit_page(p, &both, None, &s, 80).unwrap();
+        cp.scroll = 3;
+        let (mut commit_page, mut beneath) = (Some(cp), None);
+
+        let mut plan_page =
+            open_plan_from_commit(p, &mut commit_page, &mut beneath, &key("bar"), &s).await;
+        assert!(
+            matches!(
+                plan_page.as_ref().map(|pp| pp.st),
+                Some(input::PlanPageState::Finished { .. })
+            ),
+            "{plan_page:?}"
+        );
+        assert!(commit_page.is_none(), "the commit page waits beneath");
+        let back = close_plan_page(p, &mut plan_page, &mut beneath, &mut commit_page, &s);
+        assert_eq!(back, Mode::CommitPage { sel: 2 }, "on bar's row");
+        assert!(plan_page.is_none() && beneath.is_none());
+        assert_eq!(commit_page.as_ref().unwrap().scroll, 3, "at its scroll");
+
+        let mut plan_page =
+            open_plan_from_commit(p, &mut commit_page, &mut beneath, &key("bar"), &s).await;
+        std::fs::remove_file(p.join(".clank/finished/bar.md")).unwrap();
+        let closed = refetch_or_close(p, &mut plan_page, &mut beneath, &mut commit_page, &s)
+            .await
+            .expect_err("bar's page closes");
+        let cp = commit_page.as_ref().unwrap();
+        assert_eq!(cp.plans, [key("foo")], "bar has no page to offer now");
+        assert_eq!(
+            closed,
+            Mode::CommitPage {
+                sel: document_focus(&commit_actions(&cp.plans))
+            },
+            "its row is gone, so the cursor is on none"
+        );
+
+        let mut plan_page = open_plan_page(p, &key("foo"), &s).await;
+        assert!(plan_page.is_some());
+        assert_eq!(
+            close_plan_page(p, &mut plan_page, &mut None, &mut None, &s),
+            Mode::LogScroll
+        );
+    }
+
+    /// A review row opens the page with the document focused on that
+    /// reviewer's feedback, as the overlay it replaces did.
+    #[test]
+    fn a_review_row_opens_the_commit_page_at_its_feedback() {
+        use crate::cli::status_tui::fixtures::snap;
+        let repo = repo_with_tagged_commits();
+        let p = repo.path();
+        let sha = sha_of(p, "[foo,bar,misc,foo] both");
+        for (author, verdict) in [
+            ("codex", "REQUEST_CHANGES fix it"),
+            ("ruthless", "CONTINUE lgtm"),
+        ] {
+            let label = clank_core::ids::AgentLabel::parse(author).unwrap();
+            let rel =
+                crate::disk_format::feedback_path_wire(&label, &sha, std::slice::from_ref(&sha));
+            std::fs::create_dir_all(p.join(&rel).parent().unwrap()).unwrap();
+            std::fs::write(
+                p.join(&rel),
+                format!("{verdict}\n\nthe details of {author}\n"),
+            )
+            .unwrap();
+        }
+        let s = snap(vec![], vec![]);
+        let (cp, mode) = open_commit_page(p, &sha, Some("ruthless"), &s, 80).unwrap();
+        let actions = commit_actions(&cp.plans);
+        assert_eq!(
+            mode,
+            Mode::CommitPage {
+                sel: document_focus(&actions)
+            }
+        );
+        let layout = build_commit_lines(&commit_doc(&cp.detail), 80);
+        assert_eq!(cp.scroll, layout.review_line["ruthless"]);
+        assert!(
+            cp.scroll > layout.review_line["codex"],
+            "not the first review"
+        );
+
+        let (lines, _) = render_commit_page(&cp, &actions, document_focus(&actions), 5, 80);
+        assert!(
+            crate::cli::status_tui::fixtures::visible(&lines[1]).contains("ruthless"),
+            "the reviewer's block heads the document: {lines:?}"
+        );
     }
 
     #[test]
@@ -6144,7 +6498,7 @@ pub(crate) mod tests {
 
         // Opened from the queue: queued facts, whatever the plans say.
         assert_eq!(
-            plan_page_facts(p, "foo", &s, Some(&foo_entry)).await,
+            plan_page_facts(p, "foo", &s, PlanSource::Queue(&foo_entry)).await,
             Some((
                 input::PlanPageState::Queued { priority: 120 },
                 Some(foo_entry.clone())
@@ -6152,23 +6506,121 @@ pub(crate) mod tests {
         );
         // Opened from the plans: active facts, whatever the queue says.
         assert_eq!(
-            plan_page_facts(p, "foo", &s, None).await,
+            plan_page_facts(p, "foo", &s, PlanSource::Plans).await,
             Some((input::PlanPageState::Active { repo_paused: false }, None))
         );
         // Gone from ITS source closes the page, even if the other
         // source has the stem: `bar` promoted from a shell.
         assert_eq!(
-            plan_page_facts(p, "bar", &s, None).await,
+            plan_page_facts(p, "bar", &s, PlanSource::Plans).await,
             None,
             "bar is queued, not a plan"
         );
         s.queue.retain(|q| q.name != "foo");
         assert_eq!(
-            plan_page_facts(p, "foo", &s, Some(&foo_entry)).await,
+            plan_page_facts(p, "foo", &s, PlanSource::Queue(&foo_entry)).await,
             None,
             "the queued page closes though an active foo exists"
         );
-        assert!(plan_page_facts(p, "foo", &s, None).await.is_some());
+        assert!(
+            plan_page_facts(p, "foo", &s, PlanSource::Plans)
+                .await
+                .is_some()
+        );
+
+        // A stash may share the stem too: opened from the stash, the
+        // page is stashed whatever the plans say, and closes with the
+        // stash though an active foo exists.
+        s.stash.push(crate::cli::status::StashItemView {
+            stem: "foo".into(),
+            waiting_for: None,
+            ready: false,
+            commits: 2,
+        });
+        assert_eq!(
+            plan_page_facts(p, "foo", &s, PlanSource::Stash).await,
+            Some((input::PlanPageState::Stashed, None))
+        );
+        s.stash.clear();
+        assert_eq!(
+            plan_page_facts(p, "foo", &s, PlanSource::Stash).await,
+            None,
+            "the stashed page closes though an active foo exists"
+        );
+    }
+
+    /// A stash row's page reads the stash, offers what a stashed plan
+    /// can do, and restoring it leaves the page on the now-active plan.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stash_page_reads_the_stash_and_restores_into_an_active_plan() {
+        let repo = tempfile::TempDir::new().unwrap();
+        let p = repo.path();
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(p)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?}"
+            )
+        };
+        git(&["init", "--quiet", "--initial-branch=main"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        let write = |rel: &str, body: &str| {
+            std::fs::create_dir_all(p.join(rel).parent().unwrap()).unwrap();
+            std::fs::write(p.join(rel), body).unwrap();
+        };
+        write(
+            ".clank/config.json",
+            r#"{"agents":{"claude":{"tool":"claude","role":"master"}}}"#,
+        );
+        write(
+            ".clank/.gitignore",
+            "/cache/\n/agents/\n/stash/\n/shelved/\n",
+        );
+        write("base.rs", "// base\n");
+        git(&["add", "-A"]);
+        git(&["commit", "--quiet", "-m", "base"]);
+        write(".clank/plans/foo.md", "# foo\n\nthe stashed plan\n");
+        git(&["add", "-A"]);
+        git(&["commit", "--quiet", "-m", "[foo] intro"]);
+        run_plan_confirm(ConfirmAction::StashPlan, p, "foo")
+            .await
+            .unwrap();
+        assert!(!p.join(".clank/plans/foo.md").exists(), "stashed");
+
+        let page = stash_page(p, "foo");
+        assert_eq!(page.st, input::PlanPageState::Stashed);
+        assert!(
+            page.body
+                .as_deref()
+                .is_some_and(|b| b.contains("the stashed plan")),
+            "{:?}",
+            page.body
+        );
+        assert_eq!(
+            input::plan_actions(page.st),
+            [
+                input::PlanAction::OpenHtml,
+                input::PlanAction::Restore,
+                input::PlanAction::Back
+            ]
+        );
+
+        let mut open = Some(page);
+        let outcome = run_plan_confirm(ConfirmAction::RestorePlan, p, "foo").await;
+        settle_plan_confirm(ConfirmAction::RestorePlan, &outcome, &mut open);
+        assert!(outcome.is_ok(), "{outcome:?}");
+        assert!(p.join(".clank/plans/foo.md").exists(), "restored");
+        assert_eq!(
+            open.map(|pg| pg.st),
+            Some(input::PlanPageState::Active { repo_paused: false })
+        );
     }
 
     /// Two queue files parsing to one name — here to one name AND one

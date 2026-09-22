@@ -35,7 +35,7 @@ pub(super) enum Key {
     /// "+ add", choose a candidate) or, in a confirm, follow the
     /// default.
     Enter,
-    /// ← (left arrow) — back out of the commit-detail overlay; cycle the
+    /// ← (left arrow) — back out of a document overlay; cycle the
     /// selected toggle on the agent-detail page; a no-op elsewhere.
     Left,
     /// → (right arrow) — cycle the selected toggle on the agent-detail
@@ -47,8 +47,8 @@ pub(super) enum Key {
     Yes,
     /// `n` — decline.
     No,
-    /// `o` — open the current plan/commit detail overlay as its rendered
-    /// HTML page in the browser (or a queue row's page from the panel).
+    /// `o` — open the current page's object as its rendered HTML page in
+    /// the browser (or a queue row's page from the panel).
     Html,
     /// `+` — nudge the selected queue row's priority number up (later).
     Plus,
@@ -116,6 +116,12 @@ pub(super) enum Mode {
     PlanDetail { sel: usize },
     /// The purge second screen: artifacts-only vs drop-everything.
     PurgeChoice { sel: usize },
+    /// A commit's page (every-object-in-the-tui-has-a-page); `sel` is
+    /// the cursor over its rows. The commit lives in the loop's
+    /// `commit_page`, set and cleared with this mode; while a plan page
+    /// opened from it is up, it waits in `commit_beneath` for that
+    /// page's Back.
+    CommitPage { sel: usize },
     /// Typing the repo pause question. Deliberately NOT a
     /// `PlanInput`: a pause is repo state, so this mode must work
     /// with no plan page open (and with no plans at all).
@@ -276,6 +282,8 @@ pub(super) enum PlanAction {
     Unqueue,
     /// `queue promote` a queued plan — behind a confirm: it commits.
     Promote,
+    /// `stash pop` a stashed plan — behind a confirm, as stashing is.
+    Restore,
     /// Leave the page.
     Back,
 }
@@ -285,10 +293,11 @@ pub(super) enum PlanAction {
 /// so row derivation is unit-testable).
 ///
 /// The variant is also the page's SOURCE: a refresh re-reads a queued
-/// page from the queue and an active/finished one from the plans, and
-/// never crosses. A queue entry may share a stem with an active plan
-/// (`queue add` allows it; only `promote` refuses), so the stem alone
-/// cannot say which the page is showing (a-queued-plan-has-a-page).
+/// page from the queue, a stashed one from the stash and an
+/// active/finished one from the plans, and never crosses. A queue entry
+/// or a stash may share a stem with an active plan (`queue add` allows
+/// it; only `promote` and `pop` refuse), so the stem alone cannot say
+/// which the page is showing (a-queued-plan-has-a-page).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PlanPageState {
     /// Not started: a `.clank/queue/NNN-<name>.md` entry.
@@ -305,6 +314,9 @@ pub(super) enum PlanPageState {
         /// on an already-collapsed plan).
         multi_commit: bool,
     },
+    /// Set aside with `clank stash push`; its document is read from the
+    /// stash (every-object-in-the-tui-has-a-page).
+    Stashed,
 }
 
 impl PlanPageState {
@@ -329,6 +341,7 @@ pub(super) fn plan_actions(st: PlanPageState) -> Vec<PlanAction> {
             }
             v.push(Purge);
         }
+        PlanPageState::Stashed => v.push(Restore),
     }
     v.push(Back);
     v
@@ -355,6 +368,7 @@ pub(super) fn plan_action_key(a: PlanAction) -> &'static str {
         Purge => "p",
         Promote => "p",
         Unqueue => "u",
+        Restore => "r",
         // Not `p`: purge and promote have it, and a queued page offers
         // promote beside this very row.
         Priority => "v",
@@ -371,12 +385,13 @@ pub(super) fn plan_hotkey(key: Key, actions: &[PlanAction]) -> Option<PlanAction
             let s = [c];
             match std::str::from_utf8(&s) {
                 Ok(_) => match c {
-                    b's' | b'f' | b'c' | b'p' | b'u' | b'v' => match c {
+                    b's' | b'f' | b'c' | b'p' | b'u' | b'r' | b'v' => match c {
                         b's' => "s",
                         b'f' => "f",
                         b'c' => "c",
                         b'p' => "p",
                         b'u' => "u",
+                        b'r' => "r",
                         _ => "v",
                     },
                     _ => return None,
@@ -467,34 +482,56 @@ pub(super) fn plan_detail_nav(
     if let Some(a) = plan_hotkey(key, actions) {
         return PlanNav::Act(a);
     }
-    let page = page as i32;
-    let doc = document_focus(actions);
-    // The priority row is a VALUE, not a button: the change keys act on
-    // it in place, paging keys step it by 100, and Enter has nothing
-    // to activate. Everywhere else those keys keep their page meaning.
+    match page_move(sel, document_focus(actions), key, page, scroll) {
+        Some(PageMove::Sel(x)) => return PlanNav::Sel(x),
+        Some(PageMove::Scroll(d)) => return PlanNav::Scroll(d),
+        None => {}
+    }
+    // The priority row is a VALUE, not a button: it opens the page
+    // that owns the number, so it needs no keys of its own.
     let on_value = actions.get(sel) == Some(&PlanAction::Priority);
     match key {
-        // The priority row is an ACTION now: it opens the page that
-        // owns the number, so it needs no keys of its own.
         Key::Enter if on_value => PlanNav::Priority,
-        // The options→document crossing mirrors the panel↔log model:
-        // ↓ walks the buttons, then moves FOCUS into the document —
-        // where no button is highlighted and Enter has no target —
-        // and only then scrolls it; ↑ climbs back out through the
-        // document's top. Keeping the cursor on the last button while
-        // the document scrolled left `esc back` lit for the whole
-        // read, with Enter primed to fire it
-        // (the-plan-page-cursor-enters-the-document).
-        Key::Up if sel == doc && scroll > 0 => PlanNav::Scroll(-1),
-        Key::Up => PlanNav::Sel(sel.saturating_sub(1)),
-        Key::Down if sel < doc => PlanNav::Sel(sel + 1),
-        Key::Down => PlanNav::Scroll(1),
-        Key::PageUp => PlanNav::Scroll(-page),
-        Key::Space | Key::PageDown => PlanNav::Scroll(page),
         Key::Enter => actions.get(sel).map_or(PlanNav::None, |a| PlanNav::Act(*a)),
         Key::Escape => PlanNav::Back,
         _ => PlanNav::None,
     }
+}
+
+/// A cursor or scroll move on a page that is a menu over a document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PageMove {
+    Sel(usize),
+    Scroll(i32),
+}
+
+/// The move `key` makes on a menu-over-document page whose document
+/// focus is `doc`; `None` when the key is not a move.
+///
+/// The options→document crossing mirrors the panel↔log model: ↓ walks
+/// the buttons, then moves FOCUS into the document — where no button
+/// is highlighted and Enter has no target — and only then scrolls it;
+/// ↑ climbs back out through the document's top. Keeping the cursor on
+/// the last button while the document scrolled left `esc back` lit for
+/// the whole read, with Enter primed to fire it
+/// (the-plan-page-cursor-enters-the-document).
+pub(super) fn page_move(
+    sel: usize,
+    doc: usize,
+    key: Key,
+    page: usize,
+    scroll: usize,
+) -> Option<PageMove> {
+    let page = page as i32;
+    Some(match key {
+        Key::Up if sel == doc && scroll > 0 => PageMove::Scroll(-1),
+        Key::Up => PageMove::Sel(sel.saturating_sub(1)),
+        Key::Down if sel < doc => PageMove::Sel(sel + 1),
+        Key::Down => PageMove::Scroll(1),
+        Key::PageUp => PageMove::Scroll(-page),
+        Key::Space | Key::PageDown => PageMove::Scroll(page),
+        _ => return None,
+    })
 }
 
 /// The queue entry a queued page means, among `items` keyed as
@@ -522,22 +559,22 @@ pub(super) fn resolve_queued<'a, T>(
     same_name.next().is_none().then_some(only)
 }
 
-/// The plan page's cursor position for the DOCUMENT: one past the
-/// last button. A real focus position, like the log is for the panel,
-/// not a button that happens to scroll.
-pub(super) fn document_focus(actions: &[PlanAction]) -> usize {
+/// A page's cursor position for the DOCUMENT: one past the last
+/// button. A real focus position, like the log is for the panel, not a
+/// button that happens to scroll.
+pub(super) fn document_focus<A>(actions: &[A]) -> usize {
     actions.len()
 }
 
-/// Carry the plan-page cursor across a refresh by the ACTION under
-/// it, never its index: the list changes shape when a plan finishes
+/// Carry a page's cursor across a refresh by the ACTION under it,
+/// never its index: the list changes shape when a plan finishes
 /// (`ForceFinish` leaves, `Squash` may arrive), and a clamped index
 /// that was on `ForceFinish` lands on `Purge` — the next Enter would
 /// run a destructive action the operator never saw selected (codex on
 /// 40e5d34). Document focus stays document focus at the new length; a
 /// vanished action falls back to it, the one position with no Enter
 /// target.
-pub(super) fn rebind_plan_sel(before: &[PlanAction], sel: usize, after: &[PlanAction]) -> usize {
+pub(super) fn rebind_page_sel<A: PartialEq>(before: &[A], sel: usize, after: &[A]) -> usize {
     match before.get(sel) {
         Some(want) => after
             .iter()
@@ -1215,17 +1252,15 @@ pub(super) fn agent_detail_nav(sel: usize, actions: &[DetailAction], key: Key) -
     }
 }
 
-/// What a keystroke means in a full-window document overlay (commit
-/// detail or plan markdown): dismiss it, scroll its body by a signed line
-/// delta, or nothing. The overlay is READ-ONLY, so (like a pager)
-/// `q`/Esc/Enter back out to the log rather than quitting the TUI.
+/// What a keystroke means in a full-window document overlay (an
+/// agent's facts, a failure, a link): dismiss it, scroll its body by a
+/// signed line delta, copy it, or nothing. The overlay is READ-ONLY, so
+/// (like a pager) `q`/Esc/Enter back out rather than quitting the TUI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum DocNav {
     None,
     Back,
     Scroll(i32),
-    /// `o` — open the overlay's plan/commit as its HTML page in the browser.
-    OpenHtml,
     /// `y` — put the overlay's full text on the clipboard. A reason
     /// nobody can copy out is a reason that dies with the overlay.
     Copy,
@@ -1244,7 +1279,6 @@ pub(super) fn doc_nav(key: Key, page: usize) -> DocNav {
         Key::Down => DocNav::Scroll(1),
         Key::PageUp => DocNav::Scroll(-page),
         Key::Space | Key::PageDown => DocNav::Scroll(page),
-        Key::Html => DocNav::OpenHtml,
         Key::Yes => DocNav::Copy,
         _ => DocNav::None,
     }
@@ -1276,6 +1310,8 @@ pub(super) enum ConfirmAction {
     UnqueuePlan,
     /// `queue promote` the open (queued) plan page's item.
     PromotePlan,
+    /// `stash pop` the open (stashed) plan page's plan.
+    RestorePlan,
     /// `purge` (artifacts only) the open plan page's plan.
     PurgeArtifacts,
     /// `purge --drop` the open plan page's plan — the scariest one.
@@ -1310,6 +1346,7 @@ impl ConfirmAction {
             ConfirmAction::StashPlan
                 | ConfirmAction::UnqueuePlan
                 | ConfirmAction::PromotePlan
+                | ConfirmAction::RestorePlan
                 | ConfirmAction::PurgeArtifacts
                 | ConfirmAction::PurgeDrop { .. }
         )
@@ -1748,6 +1785,106 @@ pub(super) fn event_detail_nav(
     }
 }
 
+/// The commit a commit page shows: the commit and every reviewer's
+/// verdict and full feedback body. Anchored by `sha`, so a refresh
+/// re-reads the SAME commit.
+pub(super) struct CommitDetail {
+    pub(super) sha: crate::lifecycle::CommitSha,
+    pub(super) short: String,
+    pub(super) subject: String,
+    pub(super) body: String,
+    /// `(author, verdict, full feedback body)` per reviewer.
+    pub(super) reviews: Vec<(String, clank_core::vocab::Verdict, String)>,
+    /// Per-file +/− counts vs first parent (display; empty when the
+    /// numstat read fails — the page still opens).
+    pub(super) stats: Vec<crate::git_io::FileStat>,
+}
+
+/// The open commit page (every-object-in-the-tui-has-a-page).
+pub(super) struct CommitPage {
+    pub(super) detail: CommitDetail,
+    /// The plans the subject's `[plan]` tag names that have a page, in
+    /// tag order — the commit's own attribution, not the umbrella the
+    /// log draws it under.
+    pub(super) plans: Vec<crate::lifecycle::PlanKey>,
+    /// Scroll offset into the document beneath the rows.
+    pub(super) scroll: usize,
+    /// The row a plan page was opened from, as indexed in the rows the
+    /// page had then: where that page's Back returns.
+    pub(super) left_at: usize,
+}
+
+/// One row of the commit page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum CommitAction {
+    OpenHtml,
+    /// Open the page of a plan the commit's tag names.
+    OpenPlan(crate::lifecycle::PlanKey),
+    Back,
+}
+
+pub(super) fn commit_actions(plans: &[crate::lifecycle::PlanKey]) -> Vec<CommitAction> {
+    let mut v = vec![CommitAction::OpenHtml];
+    v.extend(plans.iter().cloned().map(CommitAction::OpenPlan));
+    v.push(CommitAction::Back);
+    v
+}
+
+/// The key the row at `i` shows and fires. Plan rows are numbered from
+/// `1`, not lettered: a commit tagged with several plans has a row for
+/// each, and one letter names only one of them. A tenth plan row is
+/// reached by the cursor alone.
+pub(super) fn commit_action_key(actions: &[CommitAction], i: usize) -> Option<(Key, &'static str)> {
+    const DIGITS: [&str; 9] = ["1", "2", "3", "4", "5", "6", "7", "8", "9"];
+    match actions.get(i)? {
+        CommitAction::OpenHtml => Some((Key::Html, "o")),
+        CommitAction::Back => Some((Key::Escape, "esc")),
+        CommitAction::OpenPlan(_) => {
+            let n = actions[..i]
+                .iter()
+                .filter(|a| matches!(a, CommitAction::OpenPlan(_)))
+                .count();
+            let shown = DIGITS.get(n)?;
+            Some((Key::Char(shown.as_bytes()[0]), shown))
+        }
+    }
+}
+
+/// One keypress on the commit page → what the loop should do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum CommitNav {
+    Sel(usize),
+    Scroll(i32),
+    Act(CommitAction),
+    None,
+}
+
+pub(super) fn commit_page_nav(
+    sel: usize,
+    actions: &[CommitAction],
+    key: Key,
+    page: usize,
+    scroll: usize,
+) -> CommitNav {
+    if let Some(i) =
+        (0..actions.len()).find(|&i| commit_action_key(actions, i).is_some_and(|(k, _)| k == key))
+    {
+        return CommitNav::Act(actions[i].clone());
+    }
+    match page_move(sel, document_focus(actions), key, page, scroll) {
+        Some(PageMove::Sel(x)) => CommitNav::Sel(x),
+        Some(PageMove::Scroll(d)) => CommitNav::Scroll(d),
+        None if key == Key::Enter => actions
+            .get(sel)
+            .cloned()
+            .map_or(CommitNav::None, CommitNav::Act),
+        // `q` backed out of the commit view this page replaced; quitting
+        // the TUI on it now would punish the habit.
+        None if key == Key::Quit => CommitNav::Act(CommitAction::Back),
+        None => CommitNav::None,
+    }
+}
+
 /// The open plan page's identity + derived facts (tui-plan-actions-page).
 /// Lives in the loop beside `mode` (which stays `Copy`); set and cleared
 /// together with `Mode::PlanDetail`/`PurgeChoice`.
@@ -1774,6 +1911,7 @@ pub(super) struct PlanPage {
 pub(super) struct PanelView<'a> {
     pub(super) mode: Mode,
     pub(super) plan_page: Option<&'a PlanPage>,
+    pub(super) commit_page: Option<&'a CommitPage>,
     pub(super) event_page: Option<&'a EventPage>,
     pub(super) wait_page: Option<&'a WaitPage>,
     pub(super) seen_session: Option<&'a SeenSession>,
@@ -1815,6 +1953,7 @@ impl<'a> PanelView<'a> {
         Self {
             mode,
             plan_page: None,
+            commit_page: None,
             event_page: None,
             wait_page: None,
             seen_session: None,
@@ -2443,6 +2582,21 @@ mod tests {
         assert_eq!(plan_hotkey(Key::Char(b'u'), &active), None);
     }
 
+    /// A stashed plan can be read, opened and restored — nothing an
+    /// active plan's history needs (every-object-in-the-tui-has-a-page).
+    #[test]
+    fn a_stashed_plan_page_offers_restore() {
+        use PlanAction::*;
+        let stashed = plan_actions(PlanPageState::Stashed);
+        assert_eq!(stashed, vec![OpenHtml, Restore, Back]);
+        assert_eq!(plan_hotkey(Key::Char(b'r'), &stashed), Some(Restore));
+        assert_eq!(plan_hotkey(Key::Char(b's'), &stashed), None);
+        assert_eq!(
+            plan_hotkey(Key::Char(b'r'), &plan_actions(active_st())),
+            None
+        );
+    }
+
     /// Every key a plan row ADVERTISES fires that row. The priority
     /// row showed `p` while `p` opened promote, and hotkeys dispatch
     /// before the cursor does, so the advertised key confirmed a
@@ -2454,6 +2608,7 @@ mod tests {
             PlanPageState::Queued { priority: 500 },
             PlanPageState::Active { repo_paused: false },
             PlanPageState::Finished { multi_commit: true },
+            PlanPageState::Stashed,
         ];
         for st in states {
             let actions = plan_actions(st);
@@ -2718,7 +2873,7 @@ mod tests {
         // Retained actions keep their identity at the new index.
         for a in [OpenHtml, Purge, Back] {
             assert_eq!(
-                rebind_plan_sel(&active, at(&active, a), &finished),
+                rebind_page_sel(&active, at(&active, a), &finished),
                 at(&finished, a),
                 "{a:?} stays {a:?}"
             );
@@ -2726,28 +2881,28 @@ mod tests {
         // A clamp would have put ForceFinish (2) on Purge (2): the
         // destructive retargeting this exists to prevent.
         assert_eq!(
-            rebind_plan_sel(&active, at(&active, ForceFinish), &finished),
+            rebind_page_sel(&active, at(&active, ForceFinish), &finished),
             document_focus(&finished),
             "a vanished action falls back to the document, where Enter does nothing"
         );
         assert_eq!(
-            rebind_plan_sel(&active, at(&active, Stash), &finished),
+            rebind_page_sel(&active, at(&active, Stash), &finished),
             document_focus(&finished)
         );
         // Document focus survives both shrink and growth, at the new
         // length each way.
         assert_eq!(
-            rebind_plan_sel(&active, document_focus(&active), &finished),
+            rebind_page_sel(&active, document_focus(&active), &finished),
             document_focus(&finished)
         );
         assert_eq!(
-            rebind_plan_sel(&finished, document_focus(&finished), &active),
+            rebind_page_sel(&finished, document_focus(&finished), &active),
             document_focus(&active)
         );
         // An index past the document (never produced, but a refresh
         // must not trust one) lands on the document too.
         assert_eq!(
-            rebind_plan_sel(&active, 99, &finished),
+            rebind_page_sel(&active, 99, &finished),
             document_focus(&finished)
         );
     }
@@ -2805,6 +2960,7 @@ mod tests {
     fn plan_page_confirms_default_no_and_return_to_the_page() {
         for a in [
             ConfirmAction::StashPlan,
+            ConfirmAction::RestorePlan,
             ConfirmAction::PurgeArtifacts,
             ConfirmAction::PurgeDrop { commits: 7 },
         ] {
@@ -4041,8 +4197,6 @@ mod tests {
         assert_eq!(doc_nav(Key::Enter, 10), DocNav::Back);
         assert_eq!(doc_nav(Key::Quit, 10), DocNav::Back);
         assert_eq!(doc_nav(Key::Left, 10), DocNav::Back);
-        // `o` opens the overlay's page in the browser.
-        assert_eq!(doc_nav(Key::Html, 10), DocNav::OpenHtml);
         // `y` yanks the overlay's text to the clipboard.
         assert_eq!(doc_nav(Key::Yes, 10), DocNav::Copy);
         // Unmapped keys do nothing.
