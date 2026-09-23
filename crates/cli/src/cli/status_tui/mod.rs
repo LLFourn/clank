@@ -3069,7 +3069,7 @@ pub(crate) async fn run_tui(
                                 }
                                 RemoteNav::MoveCursor(s) => mode = Mode::RemotePage { sel: s },
                                 RemoteNav::Activate(RemoteAction::Switch) => {
-                                    if let Some(n) = remote.toggle() {
+                                    if let Some(n) = remote.toggle(&snapshot) {
                                         detail = Some(Overlay::notice(n));
                                     }
                                 }
@@ -3308,7 +3308,7 @@ pub(crate) async fn run_tui(
                                     }
                                 }
                                 PanelAction::ToggleRemote => {
-                                    if let Some(n) = remote.toggle() {
+                                    if let Some(n) = remote.toggle(&snapshot) {
                                         detail = Some(Overlay::notice(n));
                                     }
                                 }
@@ -4021,7 +4021,7 @@ pub(crate) async fn run_tui(
                                 mode = mode.toggle_focus(snapshot.agents.len())
                             }
                             Key::Char(b'r') => {
-                                if let Some(n) = remote.toggle() {
+                                if let Some(n) = remote.toggle(&snapshot) {
                                     detail = Some(Overlay::notice(n));
                                 }
                             }

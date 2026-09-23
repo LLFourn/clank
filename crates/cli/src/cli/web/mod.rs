@@ -177,6 +177,53 @@ impl Panes for Zellij {
     }
 }
 
+/// The status frame: the TUI's own derivation of what the page
+/// shows, and the snapshot beneath it. `with` is the set whose
+/// transcripts are being tailed — empty for the seed, which is
+/// published before anything is tailed.
+pub(crate) fn status_payload(
+    repo: &Path,
+    snap: &crate::cli::status::StatusSnapshot,
+    with: &std::collections::BTreeSet<String>,
+) -> serde_json::Value {
+    // When each agent last ENDED a turn. A stamp belongs to the
+    // session and incarnation that wrote it: a rebound label or a
+    // reminted wait must not be read against its predecessor's
+    // clock. Whether that means WORKING is the page's to decide —
+    // it needs the newest turn too, and turns arrive on their own
+    // cadence: a long read-only turn changes nothing this status
+    // frame is published for (codex on 90c1740).
+    let ended: std::collections::BTreeMap<String, i64> = snap
+        .agents
+        .iter()
+        .filter_map(|a| {
+            let dir = crate::agent_store::agents_root(repo).join(&a.label);
+            let stamp = crate::agent_store::read_turn_end(&dir)?;
+            (a.session.as_ref().map(|s| s.id.as_str()) == Some(stamp.session.as_str())
+                && stamp.generation == crate::agent_store::read_wait_generation(&dir))
+            .then(|| (a.label.clone(), stamp.at))
+        })
+        .collect();
+    serde_json::json!({
+        "facts": crate::cli::status_tui::web_facts(snap, with, &ended),
+        "snapshot": snap.to_json(),
+    })
+}
+
+/// How an instance is to run: the tunnel it comes up behind, if any;
+/// how often its panes are re-listed; how long its tasks are given to
+/// end; and what the TUI knew when the start was asked for. One thing,
+/// because they are answered together at the one place that starts a
+/// remote — and eight positional arguments at that call site said
+/// less than these four names do (ruthless on 06e16bf).
+pub(crate) struct Startup {
+    pub(crate) tunnel: Option<tunnel::Start>,
+    pub(crate) poll: std::time::Duration,
+    pub(crate) grace: std::time::Duration,
+    /// Published before the server can answer anyone; see `start`.
+    pub(crate) seed: serde_json::Value,
+}
+
 /// A running remote: everything it started, owned here, ended
 /// together. The listener and its connections, the pane poll and the
 /// `zellij subscribe` child it restarts, the transcript tails, the
@@ -278,10 +325,14 @@ impl Instance {
         home: Option<PathBuf>,
         panes: Arc<dyn Panes>,
         door: Arc<door::Door>,
-        mut tunnel: Option<tunnel::Start>,
-        poll: std::time::Duration,
-        grace: std::time::Duration,
+        how: Startup,
     ) -> anyhow::Result<Self> {
+        let Startup {
+            mut tunnel,
+            poll,
+            grace,
+            seed,
+        } = how;
         let table = panes
             .table()
             .ok_or_else(|| anyhow::anyhow!("zellij did not answer for `{}`", panes.session()))?;
@@ -298,6 +349,12 @@ impl Instance {
         let nonce = door::random_token();
         let feed = Feed::new(64);
         feed.panes(table.clone());
+        // Published BEFORE the server can answer anyone, so a browser
+        // arriving in the moment between the listener accepting and
+        // the TUI's next rebuild is TOLD the facts rather than left to
+        // infer them from silence — on an idle repo that next rebuild
+        // need not come (a-page-that-has-not-heard-is-not-empty).
+        feed.status(seed);
         let subscription = Arc::new(Mutex::new(subscribe(&*panes, &table, &feed)));
         let (cancel, cancelled) = tokio::sync::watch::channel(false);
         let mut tasks = tokio::task::JoinSet::new();
@@ -400,28 +457,7 @@ impl Instance {
                 next_owner,
             )
         };
-        // When each agent last ENDED a turn. A stamp belongs to the
-        // session and incarnation that wrote it: a rebound label or a
-        // reminted wait must not be read against its predecessor's
-        // clock. Whether that means WORKING is the page's to decide —
-        // it needs the newest turn too, and turns arrive on their own
-        // cadence: a long read-only turn changes nothing this status
-        // frame is published for (codex on 90c1740).
-        let ended: std::collections::BTreeMap<String, i64> = snap
-            .agents
-            .iter()
-            .filter_map(|a| {
-                let dir = crate::agent_store::agents_root(&self.repo).join(&a.label);
-                let stamp = crate::agent_store::read_turn_end(&dir)?;
-                (a.session.as_ref().map(|s| s.id.as_str()) == Some(stamp.session.as_str())
-                    && stamp.generation == crate::agent_store::read_wait_generation(&dir))
-                .then(|| (a.label.clone(), stamp.at))
-            })
-            .collect();
-        self.feed.status(serde_json::json!({
-            "facts": crate::cli::status_tui::web_facts(snap, &with, &ended),
-            "snapshot": snap.to_json(),
-        }));
+        self.feed.status(status_payload(&self.repo, snap, &with));
         if let Some(b) = &self.builder {
             b.request();
         }
@@ -4293,6 +4329,197 @@ mod tests {
             "a woff2 gains nothing from gzip"
         );
         let _ = cancel.send(true);
+    }
+
+    /// A zellij with no panes, for a remote started to be asked one
+    /// question.
+    struct NoPanes;
+    impl Panes for NoPanes {
+        fn session(&self) -> &str {
+            "s"
+        }
+        fn table(&self) -> Option<Vec<PaneMeta>> {
+            Some(Vec::new())
+        }
+        fn subscribe(&self, _ids: &[String]) -> Option<SubscribeChild> {
+            None
+        }
+        fn say(&self, _pane: &str, _text: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn stop(&self, _pane: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The seed reaches a browser through the RUNNING remote, not just
+    /// through a feed: it is published before the server can answer,
+    /// so the first browser is told the roster even though the TUI has
+    /// not rebuilt since (a-page-that-has-not-heard-is-not-empty).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_remote_answers_its_first_browser_with_what_the_tui_knew() {
+        use crate::cli::status_tui::fixtures::{agent_row, snap};
+        use clank_core::vocab::AutoMode;
+        use futures_util::StreamExt;
+        let repo = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let mut s = snap(vec![], vec![]);
+        s.agents = vec![agent_row(
+            "claude",
+            crate::cli::teams_config::RosterRole::Master,
+            AutoMode::On,
+        )];
+        // The port this remote remembers lives in the repo's config.
+        std::fs::create_dir_all(repo.path().join(".clank")).unwrap();
+        std::fs::write(
+            repo.path().join(".clank/config.json"),
+            r#"{"agents":{"claude":{"tool":"claude","role":"master"}}}"#,
+        )
+        .unwrap();
+        let door = Arc::new(door::Door::new(Some(home.path().to_path_buf())));
+        let instance = Instance::start(
+            repo.path().to_path_buf(),
+            Some(home.path().to_path_buf()),
+            Arc::new(NoPanes),
+            door.clone(),
+            Startup {
+                tunnel: None,
+                poll: std::time::Duration::from_secs(3600),
+                grace: std::time::Duration::from_millis(200),
+                seed: status_payload(repo.path(), &s, &Default::default()),
+            },
+        )
+        .await
+        .expect("a remote with no tunnel");
+
+        let opened = door.open_session("token").unwrap();
+        let cookie = format!("{}={opened}", door::COOKIE);
+        let host = instance.url.trim_start_matches("http://").to_string();
+        let (mut peer, _) =
+            tokio_tungstenite::connect_async(socket_to(&host, "/events", Some(&cookie)))
+                .await
+                .expect("the page's socket");
+
+        // The first frames a page is replayed, before anything has
+        // rebuilt: one of them says who is here. Bounded, because what
+        // this guards is frames that never come — and a test that
+        // waits forever for them reports nothing at all.
+        let mut said_who = None;
+        for _ in 0..4 {
+            let next = tokio::time::timeout(std::time::Duration::from_secs(5), peer.next()).await;
+            let Ok(Some(Ok(msg))) = next else {
+                break;
+            };
+            let text = msg.to_text().unwrap_or_default().to_string();
+            if let Some(data) = text.split("data: ").nth(1) {
+                let v: serde_json::Value = serde_json::from_str(data.trim()).unwrap_or_default();
+                if v["facts"]["agents"][0]["label"] == "claude" {
+                    said_who = Some(v);
+                    break;
+                }
+            }
+        }
+        assert!(
+            said_who.is_some(),
+            "a browser arriving before the first rebuild is told the roster"
+        );
+        instance.stop().await;
+    }
+
+    /// A browser that arrives before the TUI has rebuilt anything is
+    /// told the facts anyway: the seed is published before the server
+    /// can answer, so the first frames a page is replayed name the
+    /// roster. Without it, a page on an idle repo could wait for a
+    /// rebuild that never came (a-page-that-has-not-heard-is-not-empty).
+    #[test]
+    fn a_browser_that_arrives_first_is_still_told_the_facts() {
+        use crate::cli::status_tui::fixtures::{agent_row, snap};
+        use clank_core::vocab::AutoMode;
+        let mut s = snap(vec![], vec![]);
+        s.agents = vec![agent_row(
+            "claude",
+            crate::cli::teams_config::RosterRole::Master,
+            AutoMode::On,
+        )];
+        let seed = status_payload(std::path::Path::new("/nowhere"), &s, &Default::default());
+
+        // As `start` does it: the seed goes in before anything can
+        // subscribe, and what a browser is replayed carries it.
+        let feed = Feed::new(8);
+        feed.status(seed);
+        let (frames, _rx) = feed.connect();
+        let status = frames
+            .iter()
+            .find(|f| f.starts_with("event: status\n"))
+            .expect("a page arriving first is given the facts");
+        let data: serde_json::Value =
+            serde_json::from_str(status.split("data: ").nth(1).unwrap().trim()).unwrap();
+        assert_eq!(
+            data["facts"]["agents"][0]["label"], "claude",
+            "the roster the TUI knew, not silence"
+        );
+
+        // And a later publication is what a later browser is given.
+        let mut newer = snap(vec![], vec![]);
+        newer.agents = vec![
+            agent_row(
+                "claude",
+                crate::cli::teams_config::RosterRole::Master,
+                AutoMode::On,
+            ),
+            agent_row(
+                "codex",
+                crate::cli::teams_config::RosterRole::Commit,
+                AutoMode::On,
+            ),
+        ];
+        feed.status(status_payload(
+            std::path::Path::new("/nowhere"),
+            &newer,
+            &Default::default(),
+        ));
+        let (later, _rx) = feed.connect();
+        let status = later
+            .iter()
+            .find(|f| f.starts_with("event: status\n"))
+            .expect("still a status frame");
+        let data: serde_json::Value =
+            serde_json::from_str(status.split("data: ").nth(1).unwrap().trim()).unwrap();
+        assert_eq!(
+            data["facts"]["agents"].as_array().unwrap().len(),
+            2,
+            "the newest facts, not the seed"
+        );
+    }
+
+    /// The page says it is waiting until it has heard, and says a
+    /// session is empty only once something said so. The markup's own
+    /// default is the waiting one, because that is what is true before
+    /// a line of script has run — which is how a dead script came to
+    /// read as an empty repo.
+    #[test]
+    fn the_page_does_not_call_silence_an_empty_roster() {
+        let markup = &PAGE[..PAGE.find("<script nonce").expect("the page's script")];
+        assert!(
+            markup.contains("Waiting for this session"),
+            "the empty note starts as waiting"
+        );
+        assert!(
+            !markup.contains("No agents in this session"),
+            "and never claims an empty roster before anything has arrived"
+        );
+        // Both states exist, and the one that names the roster is
+        // reached only through `heard`.
+        assert!(PAGE.contains("let heard = false;"));
+        assert!(
+            PAGE.contains("heard\n      ? 'No agents in this session yet.'")
+                || PAGE.contains("heard ? 'No agents in this session yet.'"),
+            "the note names an empty roster only when a frame said so"
+        );
+        assert!(
+            PAGE.contains("heard && !roster().length ? 'no agents' : ''"),
+            "and the header says it on the same condition"
+        );
     }
 
     /// Both pages are served under a policy, and the policy admits

@@ -253,7 +253,7 @@ impl<O: Opener> Remote<O> {
     /// `Stopped`. Neither is done on the loop, so a slow zellij or a
     /// long join never freezes the pane. A press while either is in
     /// flight is nothing.
-    pub(super) fn toggle(&mut self) -> Option<Notice> {
+    pub(super) fn toggle(&mut self, snap: &crate::cli::status::StatusSnapshot) -> Option<Notice> {
         match std::mem::replace(&mut self.state, State::Off) {
             State::On { instance } => {
                 let mut report = self.reporter();
@@ -291,6 +291,12 @@ impl<O: Opener> Remote<O> {
                 let panes = self.panes.clone();
                 let door = self.door.clone();
                 let tunnel = self.tunnel.clone();
+                // What the TUI knows NOW, carried into the start so
+                // the feed has facts before it can answer a browser:
+                // the snapshot cannot be carried (it is not `Clone`),
+                // and the page needs the derivation, not the source
+                // (a-page-that-has-not-heard-is-not-empty).
+                let seed = crate::cli::web::status_payload(&self.repo, snap, &Default::default());
                 let (abort, abandoned) = tokio::sync::watch::channel(false);
                 let task = tokio::spawn(async move {
                     let found = tokio::task::spawn_blocking(move || Ok((panes()?, tunnel()?)))
@@ -307,7 +313,19 @@ impl<O: Opener> Remote<O> {
                                 abort: abandoned,
                                 ask: std::sync::Arc::new(crate::cli::web::dns::Net::default()),
                             };
-                            Instance::start(repo, home, panes, door, Some(start), poll, grace).await
+                            Instance::start(
+                                repo,
+                                home,
+                                panes,
+                                door,
+                                crate::cli::web::Startup {
+                                    tunnel: Some(start),
+                                    poll,
+                                    grace,
+                                    seed,
+                                },
+                            )
+                            .await
                         }
                         Ok((_, None)) => Err(anyhow::anyhow!("{UNCONFIGURED_HOW}")),
                         Err(e) => Err(e),
@@ -540,7 +558,7 @@ mod tests {
         let repo = repo_with_config();
         let (mut r, rec) = remote(repo.path(), true);
         let snap = snap();
-        r.toggle();
+        r.toggle(&snap);
         settle(&mut r, &snap).await;
         assert_eq!(r.shown(), Shown::On);
 
@@ -758,7 +776,7 @@ mod tests {
         assert_eq!(r.shown(), Shown::Off, "the row saw a configured tunnel");
 
         let snap = snap();
-        assert_eq!(r.toggle(), None, "the keypress had a tunnel to start");
+        assert_eq!(r.toggle(&snap), None, "the keypress had a tunnel to start");
         let notices = settle(&mut r, &snap).await;
         assert_eq!(r.shown(), Shown::Failed, "the fresh read refused it");
         let why = r.detail().unwrap();
@@ -810,7 +828,7 @@ mod tests {
         // And throwing the switch reports the same reason rather
         // than telling the operator to add a tunnel they have.
         let snap = snap();
-        assert_eq!(r.toggle(), None, "it is not refused as absent");
+        assert_eq!(r.toggle(&snap), None, "it is not refused as absent");
         settle(&mut r, &snap).await;
         assert_eq!(r.shown(), Shown::Failed);
         let why = r.detail().unwrap();
@@ -847,7 +865,7 @@ mod tests {
         assert_eq!(r.shown(), Shown::Unconfigured);
         assert_eq!(r.detail().as_deref(), Some("not configured"));
 
-        let notice = r.toggle().expect("the switch says why");
+        let notice = r.toggle(&snap()).expect("the switch says why");
         assert!(notice.message.contains("remote.tunnel") || notice.message.contains("\"tunnel\""));
         assert!(notice.message.contains("quick"), "{}", notice.message);
         assert_eq!(r.shown(), Shown::Unconfigured, "and nothing started");
@@ -875,11 +893,11 @@ mod tests {
             Duration::from_millis(150),
         );
         let snap = snap();
-        r.toggle();
+        r.toggle(&snap);
         settle(&mut r, &snap).await;
         tokio::time::sleep(Duration::from_millis(50)).await;
         let pressed = std::time::Instant::now();
-        r.toggle();
+        r.toggle(&snap);
         settle(&mut r, &snap).await;
         assert_eq!(r.shown(), Shown::Off);
         assert!(
@@ -913,13 +931,13 @@ mod tests {
             crate::cli::web::STOP_GRACE,
         );
         let snap = snap();
-        r.toggle();
+        r.toggle(&snap);
         settle(&mut r, &snap).await;
         // Past the first poll's sleep, so a listing is under way.
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(metrics.num_alive_tasks() > baseline);
         let pressed = std::time::Instant::now();
-        r.toggle();
+        r.toggle(&snap);
         assert_eq!(r.shown(), Shown::Stopping);
         settle(&mut r, &snap).await;
         assert_eq!(r.shown(), Shown::Off);
@@ -1068,7 +1086,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let snap = snap();
         let (mut a, _repo_a, tunnel_a) = tunnelled(home.path(), None, false).await;
-        assert_eq!(a.toggle(), None);
+        assert_eq!(a.toggle(&snap), None);
         settle(&mut a, &snap).await;
         assert_eq!(a.shown(), Shown::On);
         assert_eq!(
@@ -1081,7 +1099,7 @@ mod tests {
         // The same endpoint, claimed by another remote.
         let (mut b, _repo_b, tunnel_b) =
             tunnelled(home.path(), Some(tunnel_a.url.clone()), false).await;
-        assert_eq!(b.toggle(), None);
+        assert_eq!(b.toggle(&snap), None);
         let notices = settle(&mut b, &snap).await;
         assert_eq!(b.shown(), Shown::Failed);
         let why = b.detail().unwrap();
@@ -1092,7 +1110,7 @@ mod tests {
             "refused before anything started"
         );
 
-        assert_eq!(a.toggle(), None);
+        assert_eq!(a.toggle(&snap), None);
         settle(&mut a, &snap).await;
         assert_eq!(a.shown(), Shown::Off);
         assert!(
@@ -1102,7 +1120,7 @@ mod tests {
 
         // Released: b's start is refused by the probe now, not the
         // lease — nothing answers at a's old URL.
-        assert_eq!(b.toggle(), None);
+        assert_eq!(b.toggle(&snap), None);
         settle(&mut b, &snap).await;
         assert_eq!(b.shown(), Shown::Failed);
         let why = b.detail().unwrap();
@@ -1132,7 +1150,7 @@ mod tests {
             crate::cli::web::tunnel::Provider::reservation(&*tunnel_a).is_none(),
             "nothing to claim up front"
         );
-        assert_eq!(a.toggle(), None);
+        assert_eq!(a.toggle(&snap), None);
         settle(&mut a, &snap).await;
         assert_eq!(a.shown(), Shown::On);
         assert_eq!(a.detail().as_deref(), Some(tunnel_a.url.as_str()));
@@ -1143,7 +1161,7 @@ mod tests {
         // stopped rather than left running.
         let (mut b, _repo_b, tunnel_b) =
             tunnelled_with(home.path(), Some(tunnel_a.url.clone()), false, true).await;
-        assert_eq!(b.toggle(), None);
+        assert_eq!(b.toggle(&snap), None);
         settle(&mut b, &snap).await;
         assert_eq!(b.shown(), Shown::Failed);
         let why = b.detail().unwrap();
@@ -1198,7 +1216,7 @@ mod tests {
             )))
         }));
         let snap = snap();
-        assert_eq!(r.toggle(), None);
+        assert_eq!(r.toggle(&snap), None);
         settle(&mut r, &snap).await;
         assert_eq!(r.shown(), Shown::Failed);
         let why = r.detail().unwrap();
@@ -1241,7 +1259,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let snap = snap();
         let (mut p, _repo_p, _tunnel_p) = tunnelled(home.path(), None, true).await;
-        assert_eq!(p.toggle(), None);
+        assert_eq!(p.toggle(&snap), None);
         let started = std::time::Instant::now();
         settle(&mut p, &snap).await;
         assert_eq!(p.shown(), Shown::Failed);
@@ -1261,7 +1279,7 @@ mod tests {
         p.stop().await;
 
         let (mut q, _repo_q, _tunnel_q) = tunnelled(home.path(), None, true).await;
-        assert_eq!(q.toggle(), None);
+        assert_eq!(q.toggle(&snap), None);
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert_eq!(q.shown(), Shown::Starting);
         let quitting = std::time::Instant::now();
@@ -1320,7 +1338,7 @@ mod tests {
         );
         let snap = snap();
         let pressed = std::time::Instant::now();
-        assert_eq!(r.toggle(), None);
+        assert_eq!(r.toggle(&snap), None);
         assert!(
             pressed.elapsed() < Duration::from_millis(100),
             "not on the loop"
@@ -1405,7 +1423,7 @@ mod tests {
         assert_eq!(rec.opened.lock().unwrap().len(), 2);
 
         let pressed = std::time::Instant::now();
-        assert_eq!(r.toggle(), None);
+        assert_eq!(r.toggle(&snap), None);
         assert!(pressed.elapsed() < Duration::from_millis(100));
         assert_eq!(r.shown(), Shown::Stopping);
         settle(&mut r, &snap).await;
@@ -1439,7 +1457,7 @@ mod tests {
         );
         let freed = std::net::TcpListener::bind(("127.0.0.1", port)).is_ok();
 
-        r.toggle();
+        r.toggle(&snap);
         settle(&mut r, &snap).await;
         assert_eq!(r.shown(), Shown::On);
         if freed {
@@ -1458,7 +1476,11 @@ mod tests {
         let repo = repo_with_config();
         let (mut r, rec) = remote(repo.path(), false);
         let snap = snap();
-        assert_eq!(r.toggle(), None, "nothing to say until the task has tried");
+        assert_eq!(
+            r.toggle(&snap),
+            None,
+            "nothing to say until the task has tried"
+        );
         let notices = settle(&mut r, &snap).await;
         assert_eq!(notices.len(), 1);
         assert!(notices[0].message.contains("did not answer"), "{notices:?}");
@@ -1470,7 +1492,7 @@ mod tests {
             None,
             "the port is sampled only once zellij has answered"
         );
-        r.toggle();
+        r.toggle(&snap);
         assert_eq!(r.shown(), Shown::Starting, "failed → a new try");
         r.stop().await;
     }
@@ -1482,7 +1504,7 @@ mod tests {
         let repo = repo_with_config();
         let (mut r, rec) = remote(repo.path(), true);
         let snap = snap();
-        r.toggle();
+        r.toggle(&snap);
         settle(&mut r, &snap).await;
         (rec.reports.lock().unwrap()[0])(Outcome::BrowserFailed {
             why: "no opener".into(),
@@ -1504,9 +1526,9 @@ mod tests {
         );
         assert_eq!(r.shown(), Shown::On);
 
-        r.toggle();
+        r.toggle(&snap);
         settle(&mut r, &snap).await;
-        r.toggle();
+        r.toggle(&snap);
         settle(&mut r, &snap).await;
         (rec.reports.lock().unwrap()[0])(Outcome::BrowserFailed { why: "late".into() });
         assert!(r.drain(&snap).is_empty(), "an earlier start's opener");

@@ -281,7 +281,7 @@
   </header>
   <div class="strip" id="strip" hidden></div>
   <div class="agent">
-    <div class="views" id="views"><div class="empty" id="empty">No agents in this session yet.</div></div>
+    <div class="views" id="views"><div class="empty" id="empty">Waiting for this session…</div></div>
   </div>
   <form class="say" id="say">
     <div class="bubble">
@@ -388,6 +388,11 @@
 
   // ---- state ----
   let facts = null;                         // the status frame's facts
+  // Whether a status frame has EVER arrived. Before one has, the page
+  // knows nothing about the roster — and a page that has not heard is
+  // not a session with no agents in it
+  // (a-page-that-has-not-heard-is-not-empty).
+  let heard = false;
   const panes = new Map();                  // pane id → { meta, closed }
   const paneOf = new Map();                 // label → pane id
   const agents = new Map();                 // label → { session, generation, turns[] }  (mirrors PageModel)
@@ -498,6 +503,15 @@
     return said(`<span class="dot"></span>${esc(o.verb)} <span class="obj">${esc(o.object)}</span>`)
       + (o.since != null ? `<span class="clock">${coarse(now() - o.since)}</span>` : '');
   }
+  // What the middle of the page says when there is no agent to draw:
+  // that nothing has arrived, or that nothing is there — never the
+  // second while the first is true.
+  function paintEmpty() {
+    emptyEl.textContent = heard
+      ? 'No agents in this session yet.'
+      : 'Waiting for this session…';
+    emptyEl.style.display = heard && roster().length ? 'none' : 'flex';
+  }
   function paintHeader() {
     // textContent: a repo can be named anything a directory can be.
     const project = facts ? facts.project : '';
@@ -507,12 +521,17 @@
     // The session name — the multiplexer's name for a window — is a
     // different question, and stays in the ledger where it is asked.
     document.title = project || 'clank';
-    whoName.textContent = shown || (roster().length ? '' : 'no agents');
+    // `no agents` is something only a page that HAS heard can say.
+    whoName.textContent = shown || (heard && !roster().length ? 'no agents' : '');
     autoTag.hidden = !selection.auto;
     whoEl.classList.toggle('elsewhere', !selection.auto && roster().some((a) => a.owes && a.label !== shown));
     const a = roster().find((x) => x.label === shown);
     doingEl.innerHTML = live !== true
       ? said(live === null ? 'connecting…' : 'reconnecting…')
+      // Connected, and nothing said yet: the socket opening is not
+      // the facts arriving.
+      : !heard
+      ? said('waiting…')
       // A draft can hold the view on an agent that has left; say so,
       // because the send button going quiet is not an explanation.
       : (shown && !a ? said(`${esc(shown)} has left the roster`) : clause(a));
@@ -867,9 +886,10 @@
   // ---- status ----
   function onStatus(d) {
     facts = d.facts;
+    heard = true;
     document.documentElement.style.setProperty('--hue', facts.hue || '#5f5fff');
     for (const a of roster()) ensureViews(a.label);
-    emptyEl.style.display = roster().length ? 'none' : 'flex';
+    paintEmpty();
     if (shown) retarget(); else show(target());
     show(shown);                            // the frame may have opened or closed a pane
     paintPicker(); paintStrip(); paintLedger();
@@ -899,7 +919,7 @@
     if (closedForGood) return;
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     socket = new WebSocket(`${proto}//${location.host}/events`);
-    socket.onopen = () => { retry = 0; live = true; paintHeader(); };
+    socket.onopen = () => { retry = 0; live = true; paintHeader(); paintEmpty(); };
     socket.onmessage = (e) => deliver(e.data);
     // Unlike an EventSource, a socket does not retry itself. A close
     // the door caused — the session revoked or expired — must not be
