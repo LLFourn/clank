@@ -705,9 +705,12 @@
     if (b.kind === 'thinking') { el.querySelector('.text').textContent = b.text; return; }
     if (b.kind === 'image') { fillShots(el.querySelector('.shots'), [b]); return; }
     el.querySelector('summary .name').textContent = b.name;
-    el.querySelector('summary .in').textContent = b.input.slice(0, 120);
+    // What the call SAYS it is doing, and the call itself to read. A
+    // turn from before those were derived has neither, and falls back
+    // to the input it always had, as a prose turn does without html.
+    el.querySelector('summary .in').textContent = b.title || b.input.slice(0, 120);
     el.querySelector('summary .pending').textContent = b.output == null ? ' …' : '';
-    el.querySelector('pre.in').textContent = b.input;
+    el.querySelector('pre.in').textContent = b.detail || b.input;
     const out = el.querySelector('pre.out');
     out.textContent = b.output == null ? '' : b.output;
     out.hidden = b.output == null;

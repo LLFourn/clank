@@ -3871,6 +3871,18 @@ mod tests {
             LOGIN.contains("'/jsqr.js'") && LOGIN.contains("getUserMedia"),
             "the sign-in page scans with the decoder the server serves"
         );
+        // A call's row draws what the derivation said, and a turn
+        // recorded before there was one falls back to the input it has
+        // always had. Pinned here because deleting either fallback
+        // breaks nothing else (ruthless on aff7367).
+        assert!(
+            PAGE.contains("b.title || b.input"),
+            "the collapsed row draws the title, or the input it always had"
+        );
+        assert!(
+            PAGE.contains("b.detail || b.input"),
+            "and the expansion draws the call, or that same input"
+        );
         // Both halves of forgetting, in the page that does it.
         let forget = PAGE.split("'/forget'").nth(1).unwrap_or_default();
         assert!(

@@ -50,6 +50,15 @@ pub(crate) enum Body {
     Tool {
         name: String,
         input: String,
+        /// What the call SAYS it is doing: one line, derived from the
+        /// input by [`told`]. Empty on a turn recorded before this
+        /// existed, which the page draws as it used to.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        title: String,
+        /// The call as something to read — a command as its own text,
+        /// not a JSON string literal with `\n` in it.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        detail: String,
         output: Option<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         images: Vec<Image>,
@@ -59,6 +68,154 @@ pub(crate) enum Body {
         #[serde(flatten)]
         image: Image,
     },
+}
+
+/// What a tool call says it is doing, and the call itself to read.
+pub(crate) struct Told {
+    pub(crate) title: String,
+    pub(crate) detail: String,
+}
+
+/// The field that IS the point of a call, per tool. Knowledge about
+/// tools, kept where it can be tested rather than in a slice index in
+/// a `<script>`: Claude's shell calls carry a `description` written
+/// for a reader, and every other tool has one field that says what
+/// the call is about.
+fn headline(name: &str) -> &'static [&'static str] {
+    match name {
+        "Bash" | "BashOutput" => &["description", "command"],
+        "Task" => &["description", "prompt"],
+        "Read" | "Edit" | "Write" => &["file_path"],
+        "NotebookEdit" => &["notebook_path"],
+        "Glob" | "Grep" => &["pattern"],
+        "WebFetch" => &["url"],
+        "WebSearch" => &["query"],
+        // codex's own, and the shells an MCP server tends to expose.
+        "shell" | "exec" | "local_shell" | "container.exec" => &["command", "cmd"],
+        // A tool nobody taught this: the fields that usually say what
+        // a call is for, before falling back to whatever it has.
+        _ => &[
+            "description",
+            "command",
+            "cmd",
+            "query",
+            "prompt",
+            "url",
+            "file_path",
+            "path",
+        ],
+    }
+}
+
+/// A value as a TITLE: a line someone can READ. A string is itself
+/// and a list of strings is the command line it spells; everything
+/// else — a structure, a count, a flag — is not a title.
+///
+/// `{"status":"open"}` as a title spends the row on the shape of the
+/// call instead of its point (codex on b09ad51), and `20` or `false`
+/// spends it on whichever piece of metadata sorted first: a call
+/// titled `20` says less than the tool's own name (codex on b3725e8).
+/// They stay in the detail, where a number is worth reading.
+fn as_title(v: &serde_json::Value) -> Option<String> {
+    match v {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Array(items) => {
+            let words: Vec<&str> = items.iter().filter_map(|i| i.as_str()).collect();
+            (words.len() == items.len() && !words.is_empty()).then(|| words.join(" "))
+        }
+        _ => None,
+    }
+}
+
+/// A value in the DETAIL, which keeps EVERYTHING. What the title
+/// could not say is exactly what someone expands a call to read, so a
+/// structure is its JSON and a null is a null — dropping either left
+/// a search whose query was gone from both lines (codex on b09ad51).
+fn in_detail(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// How much of a title a row can hold; the detail keeps the rest.
+const TITLE_MAX: usize = 120;
+
+/// One line, cut to fit, with the cut shown.
+fn to_a_line(s: &str) -> String {
+    let line = s
+        .split('\n')
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .trim();
+    match line.char_indices().nth(TITLE_MAX) {
+        Some((at, _)) => format!("{}…", &line[..at]),
+        None => line.to_string(),
+    }
+}
+
+/// What to show for a call to `name` made with `input`.
+///
+/// The title is the call's own sentence where it has one, and never
+/// the object it was called with: a row that reads
+/// `{"command":"for f in .clank/agents/…` has spent its line before
+/// reaching the verb (a-tool-call-says-what-it-did).
+pub(crate) fn told(name: &str, input: &str) -> Told {
+    let Ok(serde_json::Value::Object(fields)) = serde_json::from_str::<serde_json::Value>(input)
+    else {
+        // Not an object: codex's shell input is the command itself,
+        // and a command is already what there is to say.
+        return Told {
+            title: to_a_line(input),
+            detail: input.to_string(),
+        };
+    };
+    let titled = |keys: &[&str]| {
+        keys.iter().find_map(|k| {
+            fields
+                .get(*k)
+                .and_then(as_title)
+                .filter(|v| !v.trim().is_empty())
+        })
+    };
+    let title = titled(headline(name))
+        // Whatever it does have that reads as a line, so a tool nobody
+        // taught this still says something; and its own name when
+        // nothing does, rather than its braces.
+        .or_else(|| {
+            fields
+                .values()
+                .filter_map(as_title)
+                .find(|v| !v.trim().is_empty())
+        })
+        .unwrap_or_else(|| name.to_string());
+    // A command that IS a string reads as itself; an argv does not,
+    // because joining it with spaces loses where its arguments ended
+    // — `["printf", "%s", "a b"]` and `["printf", "%s", "a", "b"]`
+    // are different calls that ran differently, and the expansion is
+    // where that difference has to survive (codex on b3725e8).
+    let sole_command = (fields.len() == 1)
+        .then(|| {
+            ["command", "cmd"]
+                .iter()
+                .find_map(|k| fields.get(*k).and_then(|v| v.as_str()))
+        })
+        .flatten();
+    // Everything else is its fields, one to a line and NONE left out,
+    // so the expansion is the call rather than the part of it that
+    // formatted nicely.
+    let detail = match sole_command {
+        Some(command) => command.to_string(),
+        None => fields
+            .iter()
+            .map(|(k, v)| format!("{k}: {}", in_detail(v)))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    };
+    Told {
+        title: to_a_line(&title),
+        detail,
+    }
 }
 
 impl Body {
@@ -265,20 +422,25 @@ mod claude {
                         text: b.get("thinking")?.as_str()?.to_string(),
                     },
                     "tool_use" => {
+                        let name = b.get("name")?.as_str()?.to_string();
+                        let input = b
+                            .get("input")
+                            .map(|i| match i.as_str() {
+                                Some(s) => s.to_string(),
+                                None => i.to_string(),
+                            })
+                            .unwrap_or_default();
+                        let Told { title, detail } = told(&name, &input);
                         // The block's own id, so the result can find it.
                         return Some(Parsed::Turn(Turn {
                             id: b.get("id")?.as_str()?.to_string(),
                             at,
                             who: Who::Agent,
                             body: Body::Tool {
-                                name: b.get("name")?.as_str()?.to_string(),
-                                input: b
-                                    .get("input")
-                                    .map(|i| match i.as_str() {
-                                        Some(s) => s.to_string(),
-                                        None => i.to_string(),
-                                    })
-                                    .unwrap_or_default(),
+                                name,
+                                input,
+                                title,
+                                detail,
                                 output: None,
                                 images: Vec::new(),
                             },
@@ -449,19 +611,28 @@ mod codex {
                 let Some(cid) = call_id() else {
                     return Vec::new();
                 };
+                // A custom call carries its input as text; a function
+                // call carries its arguments as JSON — in a STRING,
+                // which is why the object has to be read out of it
+                // before anything can be said about the call (codex on
+                // 3ad0dfc).
                 let input = if kind == "custom_tool_call" {
                     s("input")
                 } else {
                     s("arguments")
                 }
                 .unwrap_or_default();
+                let name = s("name").unwrap_or_else(|| "tool".into());
+                let Told { title, detail } = told(&name, &input);
                 vec![Parsed::Turn(Turn {
                     id: cid,
                     at,
                     who: Who::Agent,
                     body: Body::Tool {
-                        name: s("name").unwrap_or_else(|| "tool".into()),
+                        name,
                         input,
+                        title,
+                        detail,
                         output: None,
                         images: Vec::new(),
                     },
@@ -661,6 +832,181 @@ mod tests {
 
     const CLAUDE: &str = include_str!("fixtures/claude.jsonl");
     const CODEX: &str = include_str!("fixtures/codex.jsonl");
+
+    /// A call says what it is DOING, never the object it was called
+    /// with: the row that draws it has one line, and
+    /// `{"command":"for f in .clank/agents/…` spends it before the
+    /// verb (a-tool-call-says-what-it-did).
+    #[test]
+    fn a_call_is_titled_by_what_it_is_for() {
+        let told_by = |name: &str, input: &str| {
+            let Told { title, detail } = told(name, input);
+            (title, detail)
+        };
+
+        // The shape that started this: Claude writes the sentence.
+        let (title, detail) = told_by(
+            "Bash",
+            r#"{"command":"for f in .clank/agents/*/feedback/*.md; do cat $f; done","description":"Read intro review feedback"}"#,
+        );
+        assert_eq!(title, "Read intro review feedback");
+        assert!(
+            detail.contains("for f in .clank/agents") && detail.contains("description:"),
+            "the call, whole: {detail}"
+        );
+
+        // Without one, the command itself — as its own text, so a
+        // multi-line command reads as the lines it is.
+        let (title, detail) = told_by("Bash", "{\"command\":\"cargo test\\n  --all\"}");
+        assert_eq!(title, "cargo test");
+        assert_eq!(detail, "cargo test\n  --all", "no JSON punctuation");
+
+        // The field that is the point of the call, per tool.
+        assert_eq!(
+            told_by("Read", r#"{"file_path":"/repo/src/lib.rs","limit":40}"#).0,
+            "/repo/src/lib.rs"
+        );
+        assert_eq!(
+            told_by("Grep", r#"{"pattern":"fn told","path":"x"}"#).0,
+            "fn told"
+        );
+        assert_eq!(
+            told_by(
+                "WebFetch",
+                r#"{"url":"https://example.com/x","prompt":"read it"}"#
+            )
+            .0,
+            "https://example.com/x"
+        );
+
+        // codex sends its shell input as the command itself; a
+        // function call sends the SAME thing as JSON in a string, and
+        // both have to read as the command (codex on 3ad0dfc).
+        assert_eq!(told_by("exec", "ls -la").0, "ls -la");
+        assert_eq!(told_by("shell", r#"{"cmd":"ls"}"#).0, "ls");
+        assert_eq!(told_by("shell", r#"{"cmd":["ls","-la"]}"#).0, "ls -la");
+        // An argv's boundaries survive the expansion: these two ran
+        // differently, and a detail that joined them would say the
+        // same thing about both (codex on b3725e8).
+        let spaced = told_by("shell", r#"{"cmd":["printf","%s","a b"]}"#).1;
+        let split = told_by("shell", r#"{"cmd":["printf","%s","a","b"]}"#).1;
+        assert_ne!(spaced, split, "two calls, two details");
+        assert!(spaced.contains(r#""a b""#), "the argument, whole: {spaced}");
+
+        // A tool nobody taught this still says something readable.
+        assert_eq!(
+            told_by("mcp__thing__do", r#"{"widget":"the blue one"}"#).0,
+            "the blue one"
+        );
+        // A count is not a sentence. Metadata sorting before the
+        // subject used to title the call `20` or `false`, which says
+        // less than the tool's name does (codex on b3725e8).
+        assert_eq!(
+            told_by("mcp__thing__do", r#"{"count":3}"#).0,
+            "mcp__thing__do"
+        );
+        assert_eq!(
+            told_by("mcp_list", r#"{"limit":20,"repository":"llfourn/clank"}"#).0,
+            "llfourn/clank",
+            "the readable field, not the one that sorted first"
+        );
+        assert_eq!(
+            told_by(
+                "mcp_filter",
+                r#"{"filter":{"status":"open"},"verbose":false}"#
+            )
+            .0,
+            "mcp_filter"
+        );
+        assert!(
+            told_by("mcp__thing__do", r#"{"count":3}"#)
+                .1
+                .contains("count: 3"),
+            "and the number is in the detail, where it is worth reading"
+        );
+        assert_eq!(
+            told_by("mcp__thing__do", "{}").0,
+            "mcp__thing__do",
+            "and with nothing to say, the tool's own name"
+        );
+        // A STRUCTURE is not a line: its JSON in the title is the
+        // fault this is for, so the name is better (codex on b09ad51).
+        let (title, detail) = told_by("mcp_filter", r#"{"filter":{"status":"open"}}"#);
+        assert_eq!(title, "mcp_filter");
+        assert!(
+            detail.contains(r#"{"status":"open"}"#),
+            "and the structure is in the detail, whole: {detail}"
+        );
+
+        // Nothing is dropped from a detail: a field the title could
+        // not use is exactly what someone expands the call to read.
+        let (_, detail) = told_by(
+            "web_search",
+            r#"{"search_query":[{"q":"rust docs"}],"response_length":"short"}"#,
+        );
+        assert!(
+            detail.contains("rust docs") && detail.contains("response_length: short"),
+            "every field, including the structured one: {detail}"
+        );
+        let (_, detail) = told_by("thing", r#"{"a":null,"b":"x"}"#);
+        assert!(detail.contains("a: null"), "a null is a value: {detail}");
+
+        // A title is a line's worth; the detail keeps the rest.
+        let long = "x".repeat(400);
+        let (title, detail) = told_by("Bash", &serde_json::json!({ "command": long }).to_string());
+        assert!(
+            title.chars().count() <= 121 && title.ends_with('…'),
+            "{title}"
+        );
+        assert_eq!(detail.len(), 400, "the detail is not cut");
+    }
+
+    /// Both agents' fixtures, through the parser rather than the
+    /// helper: neither draws raw JSON at a reader.
+    #[test]
+    fn neither_agents_calls_show_their_json() {
+        for (who, tool, text) in [
+            ("claude", Tool::Claude, CLAUDE),
+            ("codex", Tool::Codex, CODEX),
+        ] {
+            let calls: Vec<(String, String)> = text
+                .lines()
+                .flat_map(|l| parse(tool, l))
+                .filter_map(|p| match p {
+                    Parsed::Turn(Turn {
+                        body: Body::Tool { title, detail, .. },
+                        ..
+                    }) => Some((title, detail)),
+                    _ => None,
+                })
+                .collect();
+            assert!(!calls.is_empty(), "{who} has calls to show");
+            for (title, detail) in &calls {
+                assert!(!title.is_empty(), "{who}: a call with nothing to say");
+                assert!(
+                    !title.starts_with('{'),
+                    "{who}: raw JSON as a title: {title}"
+                );
+                assert!(
+                    !detail.starts_with('{'),
+                    "{who}: raw JSON as a detail: {detail}"
+                );
+            }
+        }
+        // The fixture codex named: arguments are JSON inside a string.
+        let shell = CODEX
+            .lines()
+            .flat_map(|l| parse(Tool::Codex, l))
+            .find_map(|p| match p {
+                Parsed::Turn(Turn {
+                    body: Body::Tool { name, title, .. },
+                    ..
+                }) if name == "shell" => Some(title),
+                _ => None,
+            })
+            .expect("the shell call");
+        assert_eq!(shell, "ls", "the command, out of its JSON string");
+    }
 
     /// An oracle built from the calendar, not parsed from a string —
     /// so a parser reading the wrong field cannot agree with it by

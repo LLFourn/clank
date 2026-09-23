@@ -812,6 +812,8 @@ mod tests {
             body: Body::Tool {
                 name: "Bash".into(),
                 input: "ls".into(),
+                title: "ls".into(),
+                detail: "ls".into(),
                 output: None,
                 images: vec![],
             },
