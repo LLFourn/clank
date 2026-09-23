@@ -265,7 +265,7 @@ Run `clank <cmd> --help` for details; the skills carry the depth.
 | `unfinish` | Move a finalized plan back to active |
 | `agent` | Roster: `add` / `promote` / `remove` / `list` / `set-review` / `start` |
 | `team` | Global team templates: `save` / `list` / `show` / `delete` |
-| `fork` | Linked worktree with the whole team's sessions forked into it |
+| `fork` | Linked worktree with the whole team's sessions forked into it (`--fresh` starts them new instead, orientation prompt intact; it seeds a fork being created, and reopening one never re-seeds) |
 | `pr-review` | Multi-agent review loop against a GitHub PR |
 | `open` | The team workspace in zellij: a tab inside a session, attach-or-create outside one |
 | `log` | Chronological commit + review timeline (`--oneline`, `-j`) |

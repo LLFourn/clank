@@ -60,6 +60,11 @@ pub(crate) enum SeedSource {
     /// A binding existed, but its transcript is gone. Carries the dead
     /// id so the caller can see which session was abandoned.
     FreshStale { dead: String },
+    /// `--fresh`: the operator asked for a clean start, so the
+    /// binding was not consulted. Distinct from the other two because
+    /// nothing is WRONG here — a warning about a missing or dead
+    /// session would be reporting a problem that was the request.
+    FreshByRequest,
 }
 
 /// Decide what a member's fork spec carries, given the source binding.
@@ -74,7 +79,13 @@ pub(crate) fn classify_binding(
     tool: clank_core::vocab::Tool,
     bound: Option<String>,
     home: Option<&Path>,
+    fresh: bool,
 ) -> (Option<String>, SeedSource) {
+    // Asked for cleanly: the binding is not consulted, so a live one
+    // is not probed and a dead one is not news.
+    if fresh {
+        return (None, SeedSource::FreshByRequest);
+    }
     match bound {
         None => (None, SeedSource::FreshNoBinding),
         Some(sid) => {
@@ -99,6 +110,9 @@ pub(crate) struct SeedReport {
 }
 
 pub(crate) fn summarize_seeds(members: &[(String, SeedSource)], source: &Path) -> SeedReport {
+    // `FreshByRequest` is deliberately absent from both warning
+    // lists: a missing or dead session is not a problem when not
+    // consulting them WAS the request.
     let no_binding: Vec<&str> = members
         .iter()
         .filter(|(_, s)| *s == SeedSource::FreshNoBinding)
@@ -710,7 +724,7 @@ pub async fn run_fork_pinned(
         // no transcript and no error, and the fork's gate then waits
         // forever on a reviewer that never started. One decision
         // drives the spec, the warnings and the counts.
-        let (from_session, source_kind) = classify_binding(tool, bound, home);
+        let (from_session, source_kind) = classify_binding(tool, bound, home, args.fresh);
         classified.push((label.as_str().to_string(), source_kind));
         seeds.push(MemberSeed {
             label: label.clone(),
@@ -1275,6 +1289,7 @@ detached
     fn fork_args(name: &str, source: &Path) -> ForkCreateArgs {
         ForkCreateArgs {
             name: Some(name.to_string()),
+            fresh: false,
             source: Some(source.to_path_buf()),
             pr: None,
             branch: None,
@@ -1309,6 +1324,7 @@ detached
             clank_core::vocab::Tool::Claude,
             Some("dddddddd-1111-2222-3333-444444444444".into()),
             Some(empty_home.path()),
+            false,
         );
         assert_eq!(from_session, None, "the dead id is dropped, not carried");
         assert_eq!(
@@ -1321,6 +1337,69 @@ detached
     }
 
     #[test]
+    fn fresh_returns_before_the_binding_is_probed() {
+        // `home: None` reads as "definitely gone" for a probeable
+        // tool, so this shows only that the flag short-circuits — the
+        // case that matters, a LIVE session being ignored, needs a
+        // real transcript and lives in fork_integration
+        // (`fresh_ignores_live_sessions_and_still_orients`).
+        let (from_session, kind) = classify_binding(
+            clank_core::vocab::Tool::Claude,
+            Some("aaaaaaaa-1111-2222-3333-444444444444".into()),
+            None,
+            true,
+        );
+        assert_eq!(from_session, None, "nothing to fork from");
+        assert_eq!(
+            kind,
+            SeedSource::FreshByRequest,
+            "and the reason is the request, not a missing transcript",
+        );
+    }
+
+    #[test]
+    fn a_fresh_fork_reports_no_problem_because_there_is_none() {
+        // A missing or dead session is worth a warning; not looking
+        // for one is not. The counts still say what happened.
+        let members = vec![
+            ("claude".to_string(), SeedSource::FreshByRequest),
+            ("codex".to_string(), SeedSource::FreshByRequest),
+        ];
+        let report = summarize_seeds(&members, Path::new("/src/repo"));
+        assert_eq!(report.to_fork, 0);
+        assert_eq!(report.fresh, 2);
+        assert!(
+            report.warnings.is_empty(),
+            "nothing went wrong: {:?}",
+            report.warnings,
+        );
+    }
+
+    #[test]
+    fn the_other_fresh_reasons_still_warn() {
+        // The flag must not have muted the cases that ARE problems.
+        let members = vec![
+            ("claude".to_string(), SeedSource::FreshNoBinding),
+            (
+                "codex".to_string(),
+                SeedSource::FreshStale {
+                    dead: "dddddddd".into(),
+                },
+            ),
+        ];
+        let report = summarize_seeds(&members, Path::new("/src/repo"));
+        assert_eq!(report.fresh, 2);
+        assert_eq!(report.warnings.len(), 2, "{:?}", report.warnings);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("no bound session"))
+        );
+        assert!(report.warnings.iter().any(|w| w.contains("dddddddd")));
+    }
+
+    #[test]
     fn a_live_binding_is_kept_for_the_spec() {
         // The guard against "fixing" the bug by disabling session
         // forking outright.
@@ -1330,6 +1409,7 @@ detached
             clank_core::vocab::Tool::Claude,
             Some(sid.into()),
             Some(home.path()),
+            false,
         );
         assert_eq!(from_session.as_deref(), Some(sid));
         assert_eq!(kind, SeedSource::Resume);
@@ -1345,6 +1425,7 @@ detached
             clank_core::vocab::Tool::OpenCode,
             Some("ses_0af1b2c3d4e5f607".into()),
             Some(empty_home.path()),
+            false,
         );
         assert_eq!(from_session.as_deref(), Some("ses_0af1b2c3d4e5f607"));
         assert_eq!(kind, SeedSource::Resume);
@@ -1357,6 +1438,7 @@ detached
             clank_core::vocab::Tool::Claude,
             None,
             Some(empty_home.path()),
+            false,
         );
         assert_eq!(from_session, None);
         assert_eq!(kind, SeedSource::FreshNoBinding);

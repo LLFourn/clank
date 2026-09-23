@@ -150,6 +150,9 @@ pub async fn run(args: PrReviewArgs) -> anyhow::Result<()> {
             super::fork::run(crate::cli::ForkArgs {
                 command: crate::cli::ForkCmd::Create(crate::cli::ForkCreateArgs {
                     name: None,
+                    // This door carries the team's sessions across,
+                    // like `fork create` without `--fresh`.
+                    fresh: false,
                     source: repo_arg,
                     pr: Some(a.pr),
                     branch: None,

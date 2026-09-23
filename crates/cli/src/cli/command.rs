@@ -409,6 +409,22 @@ mod tests {
     }
 
     #[test]
+    fn fork_fresh_parses_and_is_off_by_default() {
+        let create = |argv: &[&str]| {
+            let parsed = Cli::try_parse_from(argv.iter().copied()).unwrap();
+            let Command::Fork(args) = parsed.command else {
+                panic!("expected fork");
+            };
+            let crate::cli::ForkCmd::Create(create) = args.command else {
+                panic!("expected create");
+            };
+            create
+        };
+        assert!(!create(&["clank", "fork", "create", "spike"]).fresh);
+        assert!(create(&["clank", "fork", "create", "spike", "--fresh"]).fresh);
+    }
+
+    #[test]
     fn the_readme_lists_the_ci_wake_source() {
         // A reviewer should be able to configure one from the README
         // alone, including the part that surprises people: an arm

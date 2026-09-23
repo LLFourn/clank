@@ -200,6 +200,14 @@ pub struct ForkCreateArgs {
     /// tab name. Defaults to `pr-<N>` when `--pr` is given.
     #[arg(required_unless_present = "pr")]
     pub name: Option<String>,
+    /// Start every agent in a NEW session instead of forking the one
+    /// it is in. The orientation prompt still rides along, so a fresh
+    /// agent does not start blind.
+    ///
+    /// Seeds a fork being CREATED. Reopening an existing fork never
+    /// re-seeds, with or without this.
+    #[arg(long)]
+    pub fresh: bool,
     /// Repo to fork from. Defaults to the cwd's git toplevel.
     pub source: Option<PathBuf>,
     /// Fork onto a GitHub PR: fetches `pull/<N>/head`, bases the

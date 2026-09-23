@@ -115,6 +115,7 @@ fn source_with_bound_team() -> TestEnv {
 fn fork_args(env: &TestEnv, name: &str) -> clank::cli::ForkCreateArgs {
     clank::cli::ForkCreateArgs {
         name: Some(name.into()),
+        fresh: false,
         source: Some(env.repo().to_path_buf()),
         pr: None,
         branch: None,
@@ -203,6 +204,66 @@ fn fork_creates_worktree_and_seeds_team() {
         assert!(
             prompt.contains(&format!("clank as {label}")),
             "bind instruction: {prompt}"
+        );
+    }
+}
+
+/// `--fresh` through the real seeding path, with LIVE bindings — the
+/// fixture gives both members a session AND its transcript, so these
+/// are sessions that would otherwise fork. Every persisted spec must
+/// carry none, and still carry its orientation (codex 4fd1337: the
+/// unit test claimed this with `home: None`, which the probe reads as
+/// "definitely gone", so it proved the opposite case).
+#[test]
+fn fresh_ignores_live_sessions_and_still_orients() {
+    let env = source_with_bound_team();
+    let mut args = fork_args(&env, "clean");
+    args.fresh = true;
+
+    let dest = block_on(clank::cli::fork::run_fork(&args, Some(env.home()))).unwrap();
+
+    for label in ["claude", "codex"] {
+        let spec: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dest.join(format!(".clank/agents/{label}/fork.json")))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            spec["from_session"],
+            serde_json::Value::Null,
+            "{label} starts clean even though its session is live and resumable",
+        );
+        let prompt = spec["prompt"].as_str().unwrap();
+        assert!(prompt.contains("worktree `clean`"), "orientation: {prompt}");
+        assert!(
+            prompt.contains(&format!("clank as {label}")),
+            "bind instruction: {prompt}",
+        );
+    }
+}
+
+/// The default is unchanged by the flag existing: the same fixture,
+/// without `--fresh`, still forks both sessions.
+#[test]
+fn without_fresh_live_sessions_are_still_forked() {
+    let env = source_with_bound_team();
+    let dest = block_on(clank::cli::fork::run_fork(
+        &fork_args(&env, "carried"),
+        Some(env.home()),
+    ))
+    .unwrap();
+    for (label, id_prefix) in [("claude", "11111111"), ("codex", "22222222")] {
+        let spec: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dest.join(format!(".clank/agents/{label}/fork.json")))
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            spec["from_session"]
+                .as_str()
+                .unwrap()
+                .starts_with(id_prefix),
+            "{label} still forks its source session",
         );
     }
 }
