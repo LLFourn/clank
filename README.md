@@ -360,9 +360,10 @@ user-global default (`~/.clank/config.json`'s `"auto"`) when unset —
   repeatable `--event '<json>'`): `github` entries watch any repo
   (PRs opened/updated/merged, comments, issues, branch pushes — your
   own actions filtered by default — and CI conclusions,
-  `ci_passed` / `ci_failed`, scopable to named PRs with
-  `"prs":[7,9]`), and `command` entries spawn an argv whose
-  completion is the wake. A watch can carry a `"prompt"`
+  `ci_passed` / `ci_failed`), and `command` entries spawn an argv whose
+  completion is the wake. `"prs":[7,9]` scopes a watch to named PRs —
+  every kind that names one, comments and updates and merges and CI
+  alike; `pr_opened`, issues and branch pushes are outside it. A watch can carry a `"prompt"`
   — operator instructions stamped onto every wake item it produces,
   telling the agent exactly how to react:
 

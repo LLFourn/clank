@@ -90,11 +90,19 @@ pub struct GithubSource {
     /// number-scoped already.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub branches: Vec<String>,
-    /// CI scope: only these PR numbers wake the agent. Empty = every
-    /// PR the watch sees. Applies to `ci_passed` / `ci_failed` only,
-    /// the way [`branches`](Self::branches) applies to `branch_push`
-    /// — and unlike a branch list it also bounds the work, since each
-    /// PR in scope is a pair of requests per poll.
+    /// PR scope: only these PR numbers wake the agent. Empty = every
+    /// PR the watch sees.
+    ///
+    /// Applies to every kind that NAMES a PR — `pr_updated`,
+    /// `pr_merged`, `pr_comment` and the two CI kinds — the way
+    /// [`branches`](Self::branches) applies to `branch_push`.
+    /// `pr_opened` is deliberately outside it (a PR that does not
+    /// exist yet cannot be in a list written before it), as are the
+    /// issue kinds and `branch_push`.
+    ///
+    /// For the feed kinds it filters events that arrive anyway; for
+    /// CI it also bounds the WORK, since each PR in scope is a pair
+    /// of requests per poll.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub prs: Vec<u64>,
     /// Operator instructions stamped onto every wake item this
@@ -156,6 +164,53 @@ impl GithubEventKind {
     /// single check suite is evidence about the PR.
     pub fn is_ci(self) -> bool {
         matches!(self, Self::CiPassed | Self::CiFailed)
+    }
+
+    /// Whether [`GithubSource::prs`] scopes this kind — i.e. whether
+    /// it names a PR that could be in such a list.
+    ///
+    /// `PrOpened` is NOT scoped: a PR that does not exist yet cannot
+    /// appear in a list written before it, so a watch that wants new
+    /// PRs and a named PR's activity lists both and gets both.
+    pub fn is_pr_scoped(self) -> bool {
+        matches!(
+            self,
+            Self::PrUpdated | Self::PrMerged | Self::PrComment | Self::CiPassed | Self::CiFailed
+        )
+    }
+
+    /// The wire name, and its inverse. The pair lives together so a
+    /// kind added to one is missing from the other loudly.
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::PrOpened => "pr_opened",
+            Self::PrUpdated => "pr_updated",
+            Self::PrMerged => "pr_merged",
+            Self::PrComment => "pr_comment",
+            Self::IssueOpened => "issue_opened",
+            Self::IssueClosed => "issue_closed",
+            Self::IssueComment => "issue_comment",
+            Self::BranchPush => "branch_push",
+            Self::CiPassed => "ci_passed",
+            Self::CiFailed => "ci_failed",
+        }
+    }
+
+    pub fn from_wire(s: &str) -> Option<Self> {
+        [
+            Self::PrOpened,
+            Self::PrUpdated,
+            Self::PrMerged,
+            Self::PrComment,
+            Self::IssueOpened,
+            Self::IssueClosed,
+            Self::IssueComment,
+            Self::BranchPush,
+            Self::CiPassed,
+            Self::CiFailed,
+        ]
+        .into_iter()
+        .find(|k| k.wire() == s)
     }
 }
 

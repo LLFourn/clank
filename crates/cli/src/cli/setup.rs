@@ -1085,6 +1085,20 @@ mod tests {
             SKILL_MASTER_BODY.contains("no actor"),
             "and that the own-actions filter has nothing to say about a conclusion",
         );
+        // The scope is no longer CI's alone, and which kinds it does
+        // NOT govern is the part a reader would otherwise assume.
+        let master: String = SKILL_MASTER_BODY
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            master.contains("every kind that NAMES a PR"),
+            "the scope's reach is stated: {master}",
+        );
+        assert!(
+            master.contains("`pr_opened` is outside it"),
+            "and its exception: {master}",
+        );
     }
 
     #[test]

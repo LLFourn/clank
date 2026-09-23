@@ -68,6 +68,13 @@ watched repos collide — the error message shows the qualified forms).
   not backlog). Editing a source's config (kinds, branches, the PR
   scope, filters) starts a fresh log — same silent baseline. Adding
   an EMPTY `prs` list changes nothing and keeps the log.
+- `"prs":[7,9]` scopes the watch to those PRs, for every kind that
+  NAMES one — comments, updates, merges, and the CI conclusions.
+  `pr_opened` stays unscoped (a PR that does not exist yet cannot be
+  in the list), as do the issue kinds and `branch_push`. It applies
+  wherever an event reaches you, the re-presented backlog included, so
+  narrowing a watch stops replaying the PRs it no longer minds —
+  without acking them.
 
 ## CI conclusions are read, not received
 

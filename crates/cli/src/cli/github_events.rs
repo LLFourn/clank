@@ -545,7 +545,8 @@ fn map_page(
             own_login,
             src.include_own_actions,
             &src.branches,
-        ) {
+        ) && in_scope(src, &classified.item)
+        {
             classified.feed_id = Some(id.to_string());
             items.push(classified);
         }
@@ -1642,6 +1643,7 @@ async fn source_supervisor<F, R, C, RF, RFut>(
         {
             for row in read.rows {
                 if !row.acked
+                    && in_scope(src, &row.item)
                     && presented.insert((row.seq, row.ident.clone()))
                     && tx.send(row.item).is_err()
                 {
@@ -1658,6 +1660,54 @@ async fn source_supervisor<F, R, C, RF, RFut>(
 /// checks too.
 fn ci_state(dir: &std::path::Path, key: &str) -> Option<std::path::PathBuf> {
     Some(dir.join(format!("{key}.ci.json")))
+}
+
+/// Is this item in scope for this watch?
+///
+/// ONE rule, applied wherever an item reaches the agent — both
+/// classifiers, the warm backlog replay, and the follower's tail.
+///
+/// Two reasons it cannot live in the classifiers alone. The standing
+/// one: the replay paths never classify anything, they send SAVED
+/// rows, so a rule that only filters arrivals does not govern them
+/// at all. And the one this plan created: a watch whose config did
+/// not change keeps its source key across this upgrade, while its
+/// log holds comments on other PRs that were legitimately accepted
+/// when `prs` scoped CI alone (codex 8043f14).
+///
+/// Editing the list is NOT that case — `source_key` hashes a
+/// non-empty `prs`, so a changed list is a different log.
+///
+/// Works on the ITEM, because a saved row is all the replay paths
+/// have.
+pub(crate) fn in_scope(src: &GithubSource, item: &WaitItem) -> bool {
+    if src.prs.is_empty() {
+        return true;
+    }
+    let WaitItem::GithubEvent { event, number, .. } = item else {
+        return true;
+    };
+    // A kind the scope does not govern — `pr_opened`, the issue
+    // kinds, `branch_push` — passes untouched, as does a kind this
+    // binary does not know.
+    match clank_core::agent_config::GithubEventKind::from_wire(event) {
+        Some(kind) if kind.is_pr_scoped() => match number {
+            Some(n) => src.prs.contains(n),
+            None => {
+                // An eligible event we cannot place. Dropping it
+                // silently is the failure a scope makes hard to
+                // notice, so it goes loudly — unlike an out-of-scope
+                // PR, which is the scope working.
+                eprintln!(
+                    "wait: github {} — a {event} event carried no PR number; \
+                     dropped, since `prs` cannot place it",
+                    src.repo
+                );
+                false
+            }
+        },
+        _ => true,
+    }
 }
 
 /// Webhook events that mean "this PR's checks may have moved".
@@ -2143,6 +2193,13 @@ pub(crate) async fn poll_loop<F: EventFetcher, R: LoginResolver, C: CiReader>(
             if suppress_backlog.contains(&(entry.seq, entry.ident.clone())) {
                 continue;
             }
+            // Saved rows never pass a classifier, so this is the
+            // only place the scope can govern them — and a log
+            // written when `prs` meant less than it does now is full
+            // of them.
+            if !in_scope(src, &entry.item) {
+                continue;
+            }
             if tx.send(entry.item.clone()).is_err() {
                 return; // wait gone
             }
@@ -2408,7 +2465,8 @@ async fn drain_relay_window(
                         own_login,
                         src.include_own_actions,
                         &src.branches,
-                    ) && !coordinator.deliver(c)
+                    ) && in_scope(src, &c.item)
+                        && !coordinator.deliver(c)
                     {
                         return false; // wait gone
                     }
@@ -4885,6 +4943,230 @@ mod tests {
         }
     }
 
+    /// The FOLLOWER's path: a second wait that cannot take the lease
+    /// tails the holder's log and presents its rows directly, with no
+    /// classifier between. codex 8043f14 named it alongside the
+    /// backlog replay for exactly this reason.
+    #[tokio::test(start_paused = true)]
+    async fn the_follower_tail_is_filtered_by_the_scope() {
+        let dir = wal_tempdir();
+        let mut s = src(&[GithubEventKind::PrComment], true);
+        s.prs = vec![7];
+        let key = source_key(&s);
+        // Somebody else holds the lease and has logged both PRs.
+        let _lease = crate::cli::github_event_log::IngestLease::try_acquire(&dir, &key).unwrap();
+        {
+            let mut log = crate::cli::github_event_log::EventLog::open(&dir, &key).unwrap();
+            for number in [8u64, 7] {
+                log.append_inbox(
+                    crate::cli::github_event_log::Transport::Poll,
+                    Some(&format!("feed{number}")),
+                    Some(&format!("pr_issue_comment#{number}")),
+                    None,
+                    &gh_item("pr_comment", Some(number)),
+                )
+                .unwrap();
+            }
+        }
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let d = dir.clone();
+        let s2 = s.clone();
+        let handle = tokio::spawn(async move {
+            source_supervisor(
+                &s2,
+                FeedSide {
+                    fetcher: &ScriptFetcher::new(vec![]),
+                    login: &FixedLogin("me"),
+                },
+                &NoCi,
+                &tx,
+                Some(d),
+                || async { None },
+            )
+            .await;
+        });
+        tokio::time::sleep(Duration::from_secs(120)).await;
+        handle.abort();
+        let _ = handle.await;
+
+        let mut numbers = Vec::new();
+        while let Ok(item) = rx.try_recv() {
+            if let WaitItem::GithubEvent { number, .. } = item {
+                numbers.push(number);
+            }
+        }
+        assert_eq!(
+            numbers,
+            vec![Some(7)],
+            "the tail presents through the scope, not around it",
+        );
+    }
+
+    #[test]
+    fn the_feed_page_is_filtered_by_the_scope() {
+        // The classification path: a page carrying comments on two
+        // PRs yields only the one in scope.
+        let mut s = src(&[GithubEventKind::PrComment], true);
+        s.prs = vec![7];
+        let page: Vec<serde_json::Value> = [7u64, 8]
+            .iter()
+            .map(|n| {
+                ev(
+                    &format!("c{n}"),
+                    "IssueCommentEvent",
+                    serde_json::json!({
+                        "action": "created",
+                        "issue": {"number": n, "pull_request": {}},
+                        "comment": {"id": n * 100}
+                    }),
+                    "them",
+                )
+            })
+            .collect();
+        let (items, ids) = map_page(&s, &page, &BTreeSet::new(), None);
+        assert_eq!(ids.len(), 2, "both ids are still cursor-observed");
+        let numbers: Vec<Option<u64>> = items
+            .iter()
+            .map(|c| match &c.item {
+                WaitItem::GithubEvent { number, .. } => *number,
+                _ => None,
+            })
+            .collect();
+        assert_eq!(numbers, vec![Some(7)], "only the watched PR is presented");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_relay_is_filtered_by_the_scope() {
+        let mut s = src(&[GithubEventKind::PrComment], true);
+        s.prs = vec![7];
+        let inbox = std::sync::Arc::new(RelayInbox::new());
+        for number in [8u64, 7] {
+            inbox.push((
+                "issue_comment".to_string(),
+                serde_json::json!({
+                    "action": "created",
+                    "issue": {"number": number, "pull_request": {}},
+                    "comment": {"id": number * 100},
+                    "sender": {"login": "them"}
+                }),
+            ));
+        }
+        let f = ScriptFetcher::new(vec![Box::new(|_p, _e| Ok(ok(vec![], None, None)))]);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let loop_inbox = inbox.clone();
+        let handle = tokio::spawn(async move {
+            poll_loop(
+                &s,
+                FeedSide {
+                    fetcher: &f,
+                    login: &FixedLogin("me"),
+                },
+                ChecksSide {
+                    reader: &NoCi,
+                    state: None,
+                },
+                &tx,
+                Some(loop_inbox),
+                None,
+                Default::default(),
+            )
+            .await;
+        });
+        let item = tokio::time::timeout(Duration::from_secs(300), rx.recv())
+            .await
+            .expect("the watched PR's comment arrives")
+            .expect("open");
+        handle.abort();
+        let _ = handle.await;
+        let WaitItem::GithubEvent { number, .. } = item else {
+            panic!("a github event");
+        };
+        assert_eq!(
+            number,
+            Some(7),
+            "8's delivery was dropped, so the FIRST thing out is 7",
+        );
+    }
+
+    /// codex 8043f14: the log outlives the meaning of the scope. This
+    /// watch's config did not change — `[7]` then and now — so it
+    /// keeps its key, and its log holds a comment on 8 that was
+    /// legitimately accepted when `prs` scoped CI alone. The backlog
+    /// replay never classifies anything, so only a rule applied THERE
+    /// keeps that comment from waking it.
+    #[tokio::test(start_paused = true)]
+    async fn a_widened_meaning_is_applied_to_the_old_log() {
+        let dir = wal_tempdir();
+        // An old log: comments on 7 AND 8, neither acked.
+        {
+            let mut log = open_log(&dir);
+            for number in [7u64, 8] {
+                log.append_inbox(
+                    crate::cli::github_event_log::Transport::Poll,
+                    Some(&format!("feed{number}")),
+                    Some(&format!("pr_issue_comment#{number}")),
+                    None,
+                    &gh_item("pr_comment", Some(number)),
+                )
+                .unwrap();
+            }
+        }
+
+        let mut s = src(&[GithubEventKind::PrComment], true);
+        s.prs = vec![7];
+        let f = ScriptFetcher::new(vec![]);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let d = dir.clone();
+        let handle = tokio::spawn(async move {
+            poll_loop(
+                &s,
+                FeedSide {
+                    fetcher: &f,
+                    login: &FixedLogin("me"),
+                },
+                ChecksSide {
+                    reader: &NoCi,
+                    state: None,
+                },
+                &tx,
+                None,
+                Some(open_log(&d)),
+                Default::default(),
+            )
+            .await;
+        });
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        handle.abort();
+        let _ = handle.await;
+
+        let mut numbers = Vec::new();
+        while let Ok(item) = rx.try_recv() {
+            if let WaitItem::GithubEvent { number, .. } = item {
+                numbers.push(number);
+            }
+        }
+        assert_eq!(
+            numbers,
+            vec![Some(7)],
+            "the backlog is replayed through the scope, not around it",
+        );
+        // The row for 8 is still in the log, unacked: out of scope is
+        // not the same as handled, and narrowing a watch must not
+        // silently ack somebody's history.
+        let rows = open_log(&dir).read_rows().unwrap().unwrap().rows;
+        assert!(
+            rows.iter().any(|r| !r.acked
+                && matches!(
+                    &r.item,
+                    WaitItem::GithubEvent {
+                        number: Some(8),
+                        ..
+                    }
+                )),
+            "8's row is untouched, just unpresented",
+        );
+    }
+
     /// codex ae48e92 [P1]: a state file written before any of this
     /// existed must still restore feed catch-up. It does not name the
     /// feed's horizon at all any more — the WAL's own feed ids are
@@ -7157,11 +7439,88 @@ mod tests {
         );
     }
 
+    fn gh_item(event: &str, number: Option<u64>) -> WaitItem {
+        WaitItem::GithubEvent {
+            repo: "o/r".into(),
+            event: event.into(),
+            detail: None,
+            number,
+            title: None,
+            actor: None,
+            url: None,
+            instructions: None,
+            content: None,
+        }
+    }
+
+    #[test]
+    fn the_scope_governs_the_kinds_that_name_a_pr() {
+        let mut s = src(&[GithubEventKind::PrComment], true);
+        s.prs = vec![7];
+        for kind in [
+            "pr_comment",
+            "pr_updated",
+            "pr_merged",
+            "ci_failed",
+            "ci_passed",
+        ] {
+            assert!(in_scope(&s, &gh_item(kind, Some(7))), "{kind} on 7");
+            assert!(!in_scope(&s, &gh_item(kind, Some(8))), "{kind} on 8");
+        }
+    }
+
+    #[test]
+    fn the_kinds_that_name_no_pr_are_untouched() {
+        let mut s = src(&[GithubEventKind::PrOpened], true);
+        s.prs = vec![7];
+        // A PR that does not exist yet cannot be in a list written
+        // before it, so `pr_opened` is outside the scope by design.
+        assert!(in_scope(&s, &gh_item("pr_opened", Some(8))));
+        for kind in [
+            "issue_opened",
+            "issue_closed",
+            "issue_comment",
+            "branch_push",
+        ] {
+            assert!(in_scope(&s, &gh_item(kind, Some(8))), "{kind}");
+            assert!(
+                in_scope(&s, &gh_item(kind, None)),
+                "{kind} without a number"
+            );
+        }
+        // A kind this binary does not know passes rather than
+        // vanishing: the scope is not a place to lose events.
+        assert!(in_scope(&s, &gh_item("telepathy", Some(8))));
+    }
+
+    #[test]
+    fn an_empty_scope_is_every_pr() {
+        let s = src(&[GithubEventKind::PrComment], true);
+        assert!(s.prs.is_empty());
+        assert!(in_scope(&s, &gh_item("pr_comment", Some(8))));
+        assert!(in_scope(&s, &gh_item("pr_comment", None)));
+    }
+
+    #[test]
+    fn a_scoped_event_with_no_number_cannot_be_placed() {
+        let mut s = src(&[GithubEventKind::PrComment], true);
+        s.prs = vec![7];
+        assert!(
+            !in_scope(&s, &gh_item("pr_comment", None)),
+            "it is dropped — loudly, since a scope that swallows events \
+             silently is the thing that makes one hard to trust",
+        );
+    }
+
     #[test]
     fn source_key_separates_a_narrowed_pr_scope() {
-        // Narrowing the PR scope changes which CI conclusions are
+        // Narrowing the PR scope changes which events are
         // presentable, so it is a DIFFERENT log — reusing the old
-        // cursor would read a baseline taken for another set.
+        // cursor would read a baseline taken for another set. This is
+        // also the claim the `in_scope` rationale must NOT contradict:
+        // an EDITED list re-keys, so the replay filtering exists for
+        // the unchanged-config upgrade, not for edits (ruthless
+        // 8388d12).
         let mut a = src(&[GithubEventKind::CiFailed], false);
         let all = source_key(&a);
         a.prs = vec![7];

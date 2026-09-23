@@ -98,10 +98,15 @@ this agent's `.clank/agents/<label>/config.json` under `wait_events`
   `"branches":["main"]`. `ci_failed` = a check on a PR's head reached
   a terminal state that is not a success (cancelled and timed-out
   included); `ci_passed` = every check reporting on it finished and
-  none failed. Scope them with `"prs":[7,9]` — empty means every open
-  PR, and each PR in scope costs requests every poll, so name them
-  when you can. A conclusion has no actor, so `include_own_actions`
-  does not apply to it. List as many `github` entries as you want to
+  none failed. A conclusion has no actor, so `include_own_actions`
+  does not apply to it.
+  `"prs":[7,9]` scopes the watch to those PRs — it governs every kind
+  that NAMES a PR (`pr_updated`, `pr_merged`, `pr_comment` and the two
+  CI kinds), so a watch minding two PRs is not woken by the other
+  forty. `pr_opened` is outside it by design (a PR that does not exist
+  yet cannot be in your list), as are the issue kinds and
+  `branch_push`. Empty = every PR; for CI it also bounds the requests
+  each poll costs, so name them when you can. List as many `github` entries as you want to
   watch several repos. By default your OWN actions (the authenticated
   `gh` login) don't wake you — including your own pushes — set
   `"include_own_actions":true` to override. `"poll_interval"`
