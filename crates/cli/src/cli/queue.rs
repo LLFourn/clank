@@ -324,9 +324,36 @@ fn remove(repo: &Path, name: &str) -> anyhow::Result<()> {
 /// nudge go through (no ad-hoc renames). Same priority is a no-op.
 /// Returns the entry's (possibly new) path.
 pub fn set_priority(repo: &Path, name: &str, priority: u16) -> anyhow::Result<PathBuf> {
-    priority_dir::check_priority(priority)?;
     let entries = scan_queue(repo);
-    let entry = find_unique(&entries, name)?;
+    let entry = find_unique(&entries, name)?.clone();
+    set_priority_of(repo, &entry, priority)
+}
+
+/// Move a queued file onto a name NOBODY holds — the move and the
+/// claim in one step, so two callers wanting one destination cannot
+/// both believe they got it. A plan body is the thing being moved;
+/// there is no second copy to recover it from.
+fn take_the_name(from: &Path, to: &Path) -> std::io::Result<()> {
+    priority_dir::rename_noreplace(from, to)
+}
+
+/// The entry a FILE STEM names, exactly. Unlike [`resolve_entry`]
+/// there is no fallback to the parsed name: a handle whose file is
+/// gone is GONE, not resolved to a sibling that happens to share its
+/// name. What a surface addresses by stem, it addresses one of
+/// (a-queued-plan-has-a-page), and a queue that changed under a phone
+/// must refuse rather than act on the wrong plan.
+pub fn entry_by_stem(repo: &Path, stem: &str) -> anyhow::Result<QueueEntry> {
+    scan_queue(repo)
+        .into_iter()
+        .find(|e| e.file_stem() == stem)
+        .ok_or_else(|| anyhow::anyhow!("`{stem}` is no longer in the queue"))
+}
+
+/// Change THIS entry's priority. The primitive both the name-addressed
+/// verb and an entry-addressed caller go through.
+pub fn set_priority_of(repo: &Path, entry: &QueueEntry, priority: u16) -> anyhow::Result<PathBuf> {
+    priority_dir::check_priority(priority)?;
     priority_dir::set_priority(&queue_dir(repo), entry, priority)
 }
 
@@ -344,16 +371,34 @@ fn reprioritise(repo: &Path, name: &str, priority: u16) -> anyhow::Result<()> {
 /// so it prints nothing — the caller says what happened on its own
 /// surface.
 pub fn promote(repo: &Path, name: &str) -> anyhow::Result<()> {
-    validate_name(name)?;
     let entries = scan_queue(repo);
-    let entry = find_unique(&entries, name)?;
+    let entry = find_unique(&entries, name)?.clone();
+    promote_entry(repo, &entry)
+}
+
+/// Promote THIS entry, whatever else shares its name.
+pub fn promote_entry(repo: &Path, entry: &QueueEntry) -> anyhow::Result<()> {
+    let name = entry.name.clone();
+    let name = name.as_str();
+    validate_name(name)?;
     let plan_path = crate::init_facts::plan_md_rel(name);
     let dest = repo.join(&plan_path);
-    if dest.exists() {
-        anyhow::bail!("plan `{name}` already exists in plans/");
-    }
     std::fs::create_dir_all(dest.parent().unwrap())?;
-    std::fs::rename(&entry.path, &dest)?;
+    // Atomically, and refusing a taken name: two queue files may parse
+    // to ONE name, so two promotes can want this exact destination —
+    // and a check followed by a rename lets both pass the check and
+    // the second overwrite the first's plan (codex on 22e5fbe).
+    take_the_name(&entry.path, &dest).map_err(|e| {
+        // Only a TAKEN NAME is that; a source that moved between the
+        // lookup and here, or a refusal from the filesystem, says what
+        // it was rather than an explanation that fits the other case
+        // (codex on 66488eb).
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            anyhow::anyhow!("plan `{name}` already exists in plans/")
+        } else {
+            anyhow::anyhow!("moving `{}` into plans: {e}", entry.path.display())
+        }
+    })?;
     crate::git_plumbing::stage(repo, &plan_path)?;
     let msg = format!("[{name}] intro");
     crate::git_plumbing::commit_pathspec(repo, &plan_path, &msg)?;
@@ -368,18 +413,29 @@ pub fn promote(repo: &Path, name: &str) -> anyhow::Result<()> {
 /// (a-queued-plan-has-a-page). Returns the draft's path.
 pub fn unqueue(repo: &Path, name: &str) -> anyhow::Result<PathBuf> {
     let entries = scan_queue(repo);
-    let entry = find_unique(&entries, name)?;
+    let entry = find_unique(&entries, name)?.clone();
+    unqueue_entry(repo, &entry)
+}
+
+/// Take THIS entry out of the queue, whatever else shares its name.
+pub fn unqueue_entry(repo: &Path, entry: &QueueEntry) -> anyhow::Result<PathBuf> {
+    let name = entry.name.as_str();
     let drafts = repo.join(".clank/drafts");
     let dest = drafts.join(format!("{name}.md"));
-    if dest.exists() {
-        anyhow::bail!(
-            "`{}` already exists; move it aside before unqueuing `{name}`",
-            dest.display()
-        );
-    }
     std::fs::create_dir_all(&drafts)?;
-    std::fs::rename(&entry.path, &dest)
-        .map_err(|e| anyhow::anyhow!("moving `{}` to drafts: {e}", entry.path.display()))?;
+    // The same hazard as a promote: two entries of one name both want
+    // `drafts/<name>.md`, and an overwriting rename keeps one body and
+    // loses the other (codex on 22e5fbe).
+    take_the_name(&entry.path, &dest).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            anyhow::anyhow!(
+                "`{}` already exists; move it aside before unqueuing `{name}`",
+                dest.display()
+            )
+        } else {
+            anyhow::anyhow!("moving `{}` to drafts: {e}", entry.path.display())
+        }
+    })?;
     Ok(dest)
 }
 
@@ -390,6 +446,208 @@ mod tests {
     fn write(path: &Path, body: &str) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, body).unwrap();
+    }
+
+    /// A handle is a FILE, and two queued files may parse to one
+    /// name. A surface that addresses an entry by stem acts on that
+    /// entry, and one whose file is gone is gone — not resolved to the
+    /// sibling that shares its name, which is the way a phone ends up
+    /// promoting a plan nobody asked for
+    /// (the-queue-is-workable-from-the-phone).
+    #[test]
+    fn a_handle_names_one_file_and_never_its_sibling() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let q = repo.join(".clank/queue");
+        write(&q.join("100-foo.md"), "# foo\n\nthe first\n");
+        write(&q.join("900-foo.md"), "# foo\n\nthe second\n");
+
+        // The lenient parse gives both the same name, so the name is
+        // not an address: `resolve_entry` refuses it, and by stem each
+        // is itself.
+        assert!(resolve_entry(repo, "foo").is_err(), "the name is ambiguous");
+        assert!(
+            entry_by_stem(repo, "foo").is_err(),
+            "a NAME is not a handle, even when it names something"
+        );
+        assert_eq!(entry_by_stem(repo, "100-foo").unwrap().priority, 100);
+        assert_eq!(entry_by_stem(repo, "900-foo").unwrap().priority, 900);
+
+        // The entry-addressed mutation acts on the file it was given.
+        let entry = entry_by_stem(repo, "900-foo").unwrap();
+        let draft = unqueue_entry(repo, &entry).unwrap();
+        assert!(
+            std::fs::read_to_string(&draft)
+                .unwrap()
+                .contains("the second"),
+            "the one that was named, not its sibling"
+        );
+        assert!(q.join("100-foo.md").exists(), "and the other is untouched");
+
+        // A handle whose file is gone stays gone, though a file that
+        // parses to the same name is right there.
+        assert!(
+            entry_by_stem(repo, "900-foo").is_err(),
+            "a spent handle resolves to nothing"
+        );
+    }
+
+    /// Two entries of ONE name want one destination, and a plan body
+    /// is the thing being moved — there is no second copy. Whichever
+    /// order they run in, one moves and the other is refused with its
+    /// source intact; a check followed by a rename let both pass the
+    /// check and the second overwrite the first (codex on 22e5fbe).
+    #[test]
+    fn two_entries_of_one_name_cannot_overwrite_each_other() {
+        for (first, second) in [("100-foo", "900-foo"), ("900-foo", "100-foo")] {
+            let dir = tempfile::tempdir().unwrap();
+            let repo = dir.path();
+            let q = repo.join(".clank/queue");
+            write(&q.join("100-foo.md"), "# foo\n\nthe first\n");
+            write(&q.join("900-foo.md"), "# foo\n\nthe second\n");
+
+            let one = entry_by_stem(repo, first).unwrap();
+            let two = entry_by_stem(repo, second).unwrap();
+            unqueue_entry(repo, &one).expect("the first move takes the name");
+            let refused = unqueue_entry(repo, &two).expect_err("the name is taken");
+            assert!(
+                refused.to_string().contains("already exists"),
+                "and says so: {refused}"
+            );
+
+            // Neither body is lost: one is in the drafts, the other is
+            // still queued where it was.
+            let draft = std::fs::read_to_string(repo.join(".clank/drafts/foo.md")).unwrap();
+            let left = std::fs::read_to_string(&two.path).expect("the refused entry is untouched");
+            let bodies = [draft.clone(), left.clone()];
+            assert!(
+                bodies.iter().any(|b| b.contains("the first"))
+                    && bodies.iter().any(|b| b.contains("the second")),
+                "both bodies survive: {bodies:?}"
+            );
+        }
+    }
+
+    /// A refusal says what actually happened. Only a taken name is a
+    /// taken name: a source that moved between the lookup and the
+    /// move said "already exists in plans/" while plans/ held nothing
+    /// (codex on 66488eb).
+    #[test]
+    fn a_promote_that_fails_for_another_reason_says_that_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        write(&repo.join(".clank/queue/100-foo.md"), "# foo\n");
+        let entry = entry_by_stem(repo, "100-foo").unwrap();
+        // Gone between the lookup and the move, as another surface
+        // promoting it would leave it.
+        std::fs::remove_file(&entry.path).unwrap();
+
+        let said = promote_entry(repo, &entry)
+            .expect_err("there is nothing to move")
+            .to_string();
+        assert!(
+            !said.contains("already exists"),
+            "plans/ holds nothing; that is not what happened: {said}"
+        );
+        assert!(said.contains("100-foo.md"), "it names the file: {said}");
+        assert!(
+            !repo.join(".clank/plans/foo.md").exists(),
+            "and nothing was made"
+        );
+    }
+
+    /// The two moves at ONCE, which is the shape the phone makes
+    /// possible: each request runs on its own worker, and a check
+    /// followed by a rename lets both pass the check and the second
+    /// overwrite the first — one body gone, and a plan body is the
+    /// thing being moved (codex on 22e5fbe).
+    #[test]
+    fn concurrent_unqueues_of_one_name_keep_both_bodies() {
+        for round in 0..25 {
+            let dir = tempfile::tempdir().unwrap();
+            let repo = dir.path().to_path_buf();
+            let q = repo.join(".clank/queue");
+            write(&q.join("100-foo.md"), "# foo\n\nthe first\n");
+            write(&q.join("900-foo.md"), "# foo\n\nthe second\n");
+            let one = entry_by_stem(&repo, "100-foo").unwrap();
+            let two = entry_by_stem(&repo, "900-foo").unwrap();
+
+            let gate = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let hands: Vec<_> = [one, two]
+                .into_iter()
+                .map(|entry| {
+                    let (repo, gate) = (repo.clone(), gate.clone());
+                    std::thread::spawn(move || {
+                        gate.wait();
+                        unqueue_entry(&repo, &entry)
+                    })
+                })
+                .collect();
+            let done: Vec<_> = hands.into_iter().map(|h| h.join().unwrap()).collect();
+
+            assert_eq!(
+                done.iter().filter(|r| r.is_ok()).count(),
+                1,
+                "round {round}: one takes the name, one is refused: {done:?}"
+            );
+            // Neither body is lost: one moved, the other is still
+            // queued where it was.
+            let mut bodies =
+                vec![std::fs::read_to_string(repo.join(".clank/drafts/foo.md")).unwrap()];
+            for left in std::fs::read_dir(&q).unwrap() {
+                bodies.push(std::fs::read_to_string(left.unwrap().path()).unwrap());
+            }
+            assert!(
+                bodies.iter().any(|b| b.contains("the first")),
+                "round {round}: the first body survives: {bodies:?}"
+            );
+            assert!(
+                bodies.iter().any(|b| b.contains("the second")),
+                "round {round}: the second body survives: {bodies:?}"
+            );
+        }
+    }
+
+    /// A promote wants `plans/<name>.md`, which two entries of one name
+    /// both want. The second is refused rather than replacing the plan
+    /// the first just made.
+    #[test]
+    fn a_promote_does_not_replace_the_plan_another_entry_made() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        write(
+            &repo.join(".clank/plans/foo.md"),
+            "# foo\n\nalready active\n",
+        );
+        write(
+            &repo.join(".clank/queue/100-foo.md"),
+            "# foo\n\nthe queued one\n",
+        );
+        let entry = entry_by_stem(repo, "100-foo").unwrap();
+        let refused = promote_entry(repo, &entry).expect_err("the plan name is taken");
+        assert!(refused.to_string().contains("already exists"), "{refused}");
+        assert!(
+            std::fs::read_to_string(repo.join(".clank/plans/foo.md"))
+                .unwrap()
+                .contains("already active"),
+            "the active plan is untouched"
+        );
+        assert!(entry.path.exists(), "and the queued one stays queued");
+    }
+
+    /// The name-addressed verbs are the same work, reached the way the
+    /// CLI reaches it: one implementation of what promoting means.
+    #[test]
+    fn the_named_verbs_go_through_the_entry_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        write(&repo.join(".clank/queue/500-solo.md"), "# solo\n");
+        let moved = set_priority(repo, "solo", 120).unwrap();
+        assert_eq!(moved.file_name().unwrap(), "120-solo.md");
+        let entry = entry_by_stem(repo, "120-solo").unwrap();
+        assert_eq!(entry.priority, 120);
+        let draft = unqueue(repo, "solo").unwrap();
+        assert!(draft.ends_with(".clank/drafts/solo.md"));
     }
 
     #[test]

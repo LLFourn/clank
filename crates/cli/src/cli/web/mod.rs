@@ -1590,6 +1590,8 @@ async fn route(req: hyper::Request<hyper::body::Incoming>, peer: IpAddr, ctx: &C
         ("POST", "/say") => say(req, ctx).await,
         ("POST", "/stop") if !same_origin(&req, ctx) => text(403, "cross-origin", "text/plain"),
         ("POST", "/stop") => stop(req, ctx).await,
+        ("POST", "/queue") if !same_origin(&req, ctx) => text(403, "cross-origin", "text/plain"),
+        ("POST", "/queue") => queue_action(req, ctx).await,
         ("POST", "/upload") if !same_origin(&req, ctx) => text(403, "cross-origin", "text/plain"),
         ("POST", "/upload") => upload(req, ctx).await,
         ("GET", p) if p.starts_with("/html/") => site_page(&ctx.pages, &p["/html/".len()..]),
@@ -2163,6 +2165,67 @@ async fn stop(req: hyper::Request<hyper::body::Incoming>, ctx: &Ctx) -> Resp {
         Some(Ok(())) => text(204, "", "text/plain"),
         Some(Err(e)) => text(502, format!("{e:#}"), "text/plain"),
         None => text(500, "the sender panicked", "text/plain"),
+    }
+}
+
+/// What the page asks of the queue. The handle is a FILE's stem, not
+/// a path: what a browser sends names an entry, it does not point at
+/// one, and the server resolves it against the queue as it is now
+/// (the-queue-is-workable-from-the-phone).
+#[derive(serde::Deserialize)]
+#[serde(tag = "do", rename_all = "lowercase")]
+enum QueueAsk {
+    Promote { handle: String },
+    Unqueue { handle: String },
+    Priority { handle: String, priority: u16 },
+}
+
+/// Promote, unqueue or reprioritise one queued plan — the primitives
+/// the pane's own page calls, so promoting means one thing on both
+/// surfaces. Blocking work (the queue's files, and a promote's commit)
+/// runs off the loop, as a say does.
+async fn queue_action(req: hyper::Request<hyper::body::Incoming>, ctx: &Ctx) -> Resp {
+    let body = http_body_util::Limited::new(req.into_body(), 4 * 1024);
+    let Ok(bytes) = body.collect().await.map(|c| c.to_bytes()) else {
+        return text(413, "too long", "text/plain");
+    };
+    let Ok(ask) = serde_json::from_slice::<QueueAsk>(&bytes) else {
+        return text(400, "expected {\"do\": …, \"handle\": …}", "text/plain");
+    };
+    if *ctx.cancelled.borrow() {
+        return text(503, "the remote is off", "text/plain");
+    }
+    let repo = ctx.pages.repo.clone();
+    let done = ctx
+        .blocking
+        .run(move || {
+            use crate::cli::queue;
+            let handle = match &ask {
+                QueueAsk::Promote { handle }
+                | QueueAsk::Unqueue { handle }
+                | QueueAsk::Priority { handle, .. } => handle.clone(),
+            };
+            let entry = queue::entry_by_stem(&repo, &handle)?;
+            match ask {
+                QueueAsk::Promote { .. } => queue::promote_entry(&repo, &entry),
+                QueueAsk::Unqueue { .. } => queue::unqueue_entry(&repo, &entry).map(|_| ()),
+                QueueAsk::Priority { priority, .. } => {
+                    queue::set_priority_of(&repo, &entry, priority).map(|_| ())
+                }
+            }
+        })
+        .await;
+    match done {
+        Some(Ok(())) => text(204, "", "text/plain"),
+        // A refusal is the repo's answer — the queue moved, a draft of
+        // that name is already there — and the phone is where you are
+        // least able to go and look, so it is said rather than dropped.
+        Some(Err(e)) => text(
+            409,
+            serde_json::json!({ "why": format!("{e:#}") }).to_string(),
+            "application/json",
+        ),
+        None => text(500, "the queue's work panicked", "text/plain"),
     }
 }
 
@@ -4054,6 +4117,27 @@ mod tests {
             PAGE.contains("b.detail || b.input"),
             "and the expansion draws the call, or that same input"
         );
+        // The queue's controls and the route they post to, together.
+        assert!(PAGE.contains("'/queue'"), "the page asks the queue route");
+        assert!(
+            PAGE.contains("data-handle") && PAGE.contains("data-do"),
+            "and names an entry by its file, with what to do to it"
+        );
+        // A status frame arrives for anything; the queue is redrawn
+        // only when the queue changed, or an edit and a confirmation
+        // are taken from under whoever is making them.
+        assert!(
+            PAGE.contains("if (sig === queueDrawn) return;"),
+            "the queue is redrawn only when it changed"
+        );
+        // The refusal region is the page's own markup, not part of the
+        // list it is about: a request refused because another surface
+        // took the last entry has an empty list and a reason to show.
+        let markup = &PAGE[..PAGE.find("<script nonce").expect("the page's script")];
+        assert!(
+            markup.contains("id=\"qwhy\""),
+            "the refusal region outlives the queue it is about"
+        );
         // Both halves of forgetting, in the page that does it.
         let forget = PAGE.split("'/forget'").nth(1).unwrap_or_default();
         assert!(
@@ -4327,6 +4411,164 @@ mod tests {
         assert!(
             font.headers().get("content-encoding").is_none(),
             "a woff2 gains nothing from gzip"
+        );
+        let _ = cancel.send(true);
+    }
+
+    /// The phone's queue actions land in the queue itself, addressed
+    /// by file: the entry the page named is the one that moves, a
+    /// handle whose file is gone is refused with the reason rather
+    /// than resolved to its sibling, and the guards are `/say`'s
+    /// (the-queue-is-workable-from-the-phone).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_queue_moves_by_the_handle_the_page_named() {
+        let (base, door, anon, cancel, _site, repo) = door_only().await;
+        let q = repo.path().join(".clank/queue");
+        std::fs::create_dir_all(&q).unwrap();
+        std::fs::write(q.join("100-foo.md"), "# foo\n\nthe first\n").unwrap();
+        std::fs::write(q.join("900-foo.md"), "# foo\n\nthe second\n").unwrap();
+        let cookie = door
+            .open_session("token")
+            .map(|t| format!("{}={t}", door::COOKIE))
+            .unwrap();
+        let ask = |body: serde_json::Value, cookie: Option<String>, origin: bool| {
+            let mut r = anon.post(format!("{base}/queue")).json(&body);
+            if origin {
+                r = r.header("origin", &base);
+            }
+            if let Some(c) = cookie {
+                r = r.header("cookie", c);
+            }
+            async move { r.send().await.unwrap() }
+        };
+
+        // The guards first: `/say`'s, on a route that promotes.
+        assert_eq!(
+            ask(
+                serde_json::json!({"do": "promote", "handle": "100-foo"}),
+                None,
+                true
+            )
+            .await
+            .status(),
+            401,
+            "no session"
+        );
+        assert_eq!(
+            ask(
+                serde_json::json!({"do": "promote", "handle": "100-foo"}),
+                Some(cookie.clone()),
+                false
+            )
+            .await
+            .status(),
+            403,
+            "not from this page"
+        );
+
+        // A priority moves THAT file, and the other is untouched.
+        let r = ask(
+            serde_json::json!({"do": "priority", "handle": "900-foo", "priority": 300}),
+            Some(cookie.clone()),
+            true,
+        )
+        .await;
+        assert_eq!(r.status(), 204);
+        assert!(q.join("300-foo.md").exists() && !q.join("900-foo.md").exists());
+        assert!(q.join("100-foo.md").exists(), "its sibling stayed put");
+        assert!(
+            std::fs::read_to_string(q.join("300-foo.md"))
+                .unwrap()
+                .contains("the second"),
+            "and it is the file that was named"
+        );
+
+        // The handle it moved under is spent: it is NOT resolved to
+        // the sibling that parses to the same name.
+        let r = ask(
+            serde_json::json!({"do": "unqueue", "handle": "900-foo"}),
+            Some(cookie.clone()),
+            true,
+        )
+        .await;
+        assert_eq!(r.status(), 409, "a handle whose file is gone");
+        let said: serde_json::Value = r.json().await.unwrap();
+        assert!(
+            said["why"]
+                .as_str()
+                .unwrap()
+                .contains("no longer in the queue"),
+            "and it says why: {said}"
+        );
+        assert!(q.join("100-foo.md").exists(), "nothing else was taken");
+
+        // Unqueue by the handle that does exist: the body lands in the
+        // drafts, which is what unqueue means.
+        let r = ask(
+            serde_json::json!({"do": "unqueue", "handle": "100-foo"}),
+            Some(cookie.clone()),
+            true,
+        )
+        .await;
+        assert_eq!(r.status(), 204);
+        assert!(
+            std::fs::read_to_string(repo.path().join(".clank/drafts/foo.md"))
+                .unwrap()
+                .contains("the first")
+        );
+        let _ = cancel.send(true);
+    }
+
+    /// A promote from the phone is the pane's promote: the body it
+    /// named becomes the active plan and its intro is committed, and
+    /// the sibling that parses to the same name stays queued — which
+    /// is what addressing an entry by its file is for
+    /// (the-queue-is-workable-from-the-phone).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_promote_from_the_page_makes_the_plan_and_leaves_its_sibling() {
+        let (base, door, anon, cancel, _site, repo) = door_only().await;
+        let q = repo.path().join(".clank/queue");
+        std::fs::create_dir_all(&q).unwrap();
+        std::fs::write(q.join("100-foo.md"), "# foo\n\nthe queued one\n").unwrap();
+        std::fs::write(q.join("900-foo.md"), "# foo\n\nits namesake\n").unwrap();
+        let cookie = door
+            .open_session("token")
+            .map(|t| format!("{}={t}", door::COOKIE))
+            .unwrap();
+
+        let r = anon
+            .post(format!("{base}/queue"))
+            .header("origin", &base)
+            .header("cookie", &cookie)
+            .json(&serde_json::json!({"do": "promote", "handle": "100-foo"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 204);
+
+        // It is the active plan, with the body that was named.
+        let plan = std::fs::read_to_string(repo.path().join(".clank/plans/foo.md"))
+            .expect("the plan the page named");
+        assert!(plan.contains("the queued one"), "{plan}");
+        assert!(!q.join("100-foo.md").exists(), "and it left the queue");
+        // Its namesake is untouched, still queued.
+        assert!(
+            std::fs::read_to_string(q.join("900-foo.md"))
+                .unwrap()
+                .contains("its namesake")
+        );
+
+        // The intro is committed, as the pane's promote commits it.
+        let log = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo.path())
+            .args(["log", "-1", "--format=%s"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&log.stdout).trim(),
+            "[foo] intro",
+            "the promote committed the intro"
         );
         let _ = cancel.send(true);
     }

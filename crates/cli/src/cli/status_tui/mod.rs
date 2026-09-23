@@ -1942,13 +1942,29 @@ pub(crate) struct LedgerRow {
     pub(crate) page: Option<String>,
 }
 
+/// One queued plan, as the page draws it and names it back.
+///
+/// The HANDLE is the file's stem, not the parsed name: `queue add`
+/// allows two files that parse to one name, so a page that said
+/// "promote foo" would promote whichever was found first
+/// (a-queued-plan-has-a-page).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct Queued {
+    pub(crate) name: String,
+    pub(crate) priority: u16,
+    pub(crate) handle: String,
+}
+
 /// What has been done, and what the repo is carrying.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct Ledger {
     pub(crate) plan: Option<String>,
     pub(crate) gate: Option<String>,
     pub(crate) dirty: Option<String>,
-    pub(crate) queue: usize,
+    /// What is queued, in the order it will run. The count the page
+    /// shows is these entries' length: a number beside the list is a
+    /// second thing to keep true (the-queue-is-workable-from-the-phone).
+    pub(crate) queue: Vec<Queued>,
     pub(crate) stash: usize,
     pub(crate) blocks: Vec<String>,
     pub(crate) rows: Vec<LedgerRow>,
@@ -2048,7 +2064,19 @@ pub(crate) fn web_facts(
         plan: snap.plans.first().map(|p| p.plan.as_str().to_string()),
         gate: snap.plans.first().map(|p| gate_word(p.gate).to_string()),
         dirty: snap.dirty.as_ref().map(crate::cli::status::dirty_summary),
-        queue: snap.queue.len(),
+        queue: snap
+            .queue
+            .iter()
+            .map(|q| Queued {
+                name: q.name.clone(),
+                priority: q.priority,
+                handle: q
+                    .path
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            })
+            .collect(),
         stash: snap.stash.len(),
         blocks: snap
             .blocks
@@ -5574,6 +5602,39 @@ pub(crate) mod tests {
     }
 
     /// The agents and the ledger are the TUI's own derivations as
+    /// The queue reaches the page as ENTRIES, in the order it will
+    /// run them, each named by its file — a count cannot be acted on,
+    /// and a parsed name is not an address
+    /// (the-queue-is-workable-from-the-phone).
+    #[test]
+    fn the_facts_carry_the_queue_in_the_order_it_runs() {
+        use crate::cli::status_tui::fixtures::snap;
+        let mut s = snap(vec![], vec!["later", "sooner"]);
+        s.queue[0].priority = 900;
+        s.queue[0].path = std::path::PathBuf::from("/r/.clank/queue/900-later.md");
+        s.queue[1].priority = 100;
+        s.queue[1].path = std::path::PathBuf::from("/r/.clank/queue/100-sooner.md");
+        s.queue.sort_by_key(|q| q.priority);
+
+        let facts = web_facts(&s, &Default::default(), &Default::default());
+        let queued: Vec<(&str, u16, &str)> = facts
+            .ledger
+            .queue
+            .iter()
+            .map(|q| (q.name.as_str(), q.priority, q.handle.as_str()))
+            .collect();
+        assert_eq!(
+            queued,
+            [("sooner", 100, "100-sooner"), ("later", 900, "900-later")],
+            "the order the queue runs them, each by its file"
+        );
+
+        // The count the page shows is these entries; there is no
+        // second number to keep true.
+        let v = serde_json::to_value(&facts).unwrap();
+        assert_eq!(v["ledger"]["queue"].as_array().unwrap().len(), 2);
+    }
+
     /// data — asked of the same functions, so the two surfaces cannot
     /// drift apart. One list, master-first: two reviewers missing on
     /// one commit each carry what they owe, on the sha they owe it

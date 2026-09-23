@@ -232,6 +232,15 @@
   .ledger .facts .plan { font-family: var(--plate); font-weight: 700; }
   .ledger .facts .gate { color: var(--hue); }
   .ledger .facts .line { color: var(--muted); font-size: 12px; margin-top: 2px; }
+  .ledger .queue { padding: 2px 14px 8px; border-bottom: 1px solid var(--edge); }
+  .ledger .queue:empty { display: none; }
+  .ledger .queue .head { color: var(--muted); font-size: 12px; padding: 4px 0; }
+  .ledger .queue .q { display: flex; align-items: baseline; gap: 8px; padding: 3px 0; }
+  .ledger .queue .q .nm { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ledger .queue .q .pri { flex: 0 0 auto; width: 3.4em; padding: 2px 4px; border: 1px solid var(--edge); border-radius: 3px; background: var(--base); color: var(--muted); font-family: var(--mono); font-size: 12px; text-align: right; }
+  .ledger .queue .q button { flex: 0 0 auto; color: var(--muted); font-size: 12px; padding: 2px 4px; }
+  .ledger .queue .q button.armed { color: var(--ink); font-weight: 700; }
+  .ledger .qwhy { color: var(--bad, #d05a4a); font-size: 12px; padding: 0 14px 8px; }
   .ledger .rows { padding: 6px 0; }
   .row { display: grid; grid-template-columns: 1fr auto; gap: 8px; padding: 2px 14px; white-space: nowrap; overflow: hidden; }
   .row .main { overflow: hidden; text-overflow: ellipsis; }
@@ -299,6 +308,8 @@
   <aside class="ledger" id="ledger">
     <div class="lhead"><span class="session" id="session"></span><button class="forget" id="forget">forget this device</button><button class="close" id="close">close</button></div>
     <div class="facts" id="facts"></div>
+    <div class="queue" id="queue"></div>
+    <div class="qwhy" id="qwhy" hidden></div>
     <div class="rows" id="rows"></div>
   </aside>
 
@@ -857,6 +868,149 @@
     views.get(p.meta.label)?.term.write(d.screen);
   }
 
+  // ---- the queue ----
+  // Two taps for what cannot be taken back, as the pane asks before it
+  // promotes: the first arms the button and says so, the second does
+  // it. A redraw disarms, so an action cannot ride a row that moved.
+  let armed = null;
+  // The queue as last DRAWN, and what was said about the last action.
+  // A status frame arrives for anything — a file changing, an agent
+  // speaking — and redrawing rows that did not change would take the
+  // priority someone is typing, the button they armed, and the
+  // refusal they have not read yet (codex on 22e5fbe).
+  let queueDrawn = null;
+  let queueSaid = '';
+  function disarm() {
+    armed = null;
+    for (const b of $('queue').querySelectorAll('button[data-do]')) {
+      b.classList.remove('armed');
+      b.textContent = b.dataset.do;
+    }
+  }
+  function queueWhy(text) {
+    queueSaid = text || '';
+    paintQueueWhy();
+  }
+  // Outside the list, because the refusal outlives it: the entry a
+  // request was refused FOR is often the one another surface has just
+  // taken, and an empty queue is exactly when the reason matters
+  // (codex on 66488eb).
+  function paintQueueWhy() {
+    const box = $('qwhy');
+    box.textContent = queueSaid;
+    box.hidden = !queueSaid;
+  }
+  // The page does not edit its own copy of the queue: it asks, and the
+  // status frame the change wakes is what redraws it.
+  async function askQueue(body) {
+    queueWhy('');
+    try {
+      const r = await fetch('/queue', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      if (r.ok) return;
+      // A refusal is the repo's answer — the queue moved under the
+      // phone, a draft of that name is already there — and saying it
+      // is the whole difference from nothing happening.
+      const said = await r.json().catch(() => null);
+      queueWhy((said && said.why) || 'the queue refused that');
+    } catch (err) {
+      queueWhy('could not reach clank');
+    }
+  }
+  // What is queued, in the order it will run. Named by its file,
+  // which is what an action names back: two queued files can parse to
+  // one name (the-queue-is-workable-from-the-phone).
+  //
+  // Redrawn only when the queue itself changed, and what someone was
+  // in the middle of is carried across that redraw by HANDLE — except
+  // for an entry that moved or left, whose pending edit is no longer
+  // about anything that is there.
+  function paintQueue(queue) {
+    const box = $('queue');
+    const sig = JSON.stringify(queue);
+    if (sig === queueDrawn) return;
+    const was = queueDrawn === null ? [] : JSON.parse(queueDrawn);
+    const before = new Map(was.map((q) => [q.handle, q.priority]));
+    // A half-typed priority belongs to the handle, not to the node
+    // that is about to be replaced.
+    const typing = {};
+    for (const input of box.querySelectorAll('input.pri')) {
+      if (input.value !== input.defaultValue) {
+        typing[input.closest('.q').dataset.handle] = input.value;
+      }
+    }
+    const held = document.activeElement;
+    const focused = held && held.closest && held.closest('.q')
+      ? held.closest('.q').dataset.handle
+      : null;
+    const wasArmed = armed;
+    queueDrawn = sig;
+    box.innerHTML = queue.length
+      ? `<div class="head">queued</div>`
+        + queue.map((q) => `<div class="q" data-handle="${esc(q.handle)}">`
+          + `<span class="nm">${esc(q.name)}</span>`
+          + `<input class="pri" inputmode="numeric" value="${esc(String(q.priority).padStart(3, '0'))}" aria-label="priority of ${esc(q.name)}">`
+          + `<button data-do="promote">promote</button>`
+          + `<button data-do="unqueue">unqueue</button>`
+          + `</div>`).join('')
+      : '';
+    armed = null;
+    // An entry still there, unmoved, keeps what was being done to it.
+    const settled = (handle) => queue.some(
+      (q) => q.handle === handle && before.get(handle) === q.priority,
+    );
+    for (const [handle, value] of Object.entries(typing)) {
+      if (!settled(handle)) continue;
+      const input = box.querySelector(`.q[data-handle="${CSS.escape(handle)}"] input.pri`);
+      if (input) input.value = value;
+    }
+    if (wasArmed && settled(wasArmed.split(':')[0])) {
+      const [handle, what] = wasArmed.split(':');
+      const btn = box.querySelector(`.q[data-handle="${CSS.escape(handle)}"] button[data-do="${what}"]`);
+      if (btn) {
+        armed = wasArmed;
+        btn.classList.add('armed');
+        btn.textContent = `${what}?`;
+      }
+    }
+    if (focused && settled(focused)) {
+      const input = box.querySelector(`.q[data-handle="${CSS.escape(focused)}"] input.pri`);
+      if (input) input.focus();
+    }
+    paintQueueWhy();
+  }
+
+  $('queue').addEventListener('click', (e) => {
+    const btn = e.target.closest('button[data-do]');
+    if (!btn) { disarm(); return; }
+    const row = btn.closest('.q');
+    const key = `${row.dataset.handle}:${btn.dataset.do}`;
+    if (armed !== key) {
+      disarm();
+      armed = key;
+      btn.classList.add('armed');
+      btn.textContent = `${btn.dataset.do}?`;
+      return;
+    }
+    disarm();
+    askQueue({ do: btn.dataset.do, handle: row.dataset.handle });
+  });
+  // A priority is a number, not a decision to confirm: it is undone by
+  // typing another one.
+  $('queue').addEventListener('change', (e) => {
+    const input = e.target.closest('input.pri');
+    if (!input) return;
+    const priority = Number(input.value);
+    if (!Number.isInteger(priority) || priority < 0 || priority > 999) {
+      queueWhy('a priority is 0 to 999');
+      return;
+    }
+    askQueue({ do: 'priority', handle: input.closest('.q').dataset.handle, priority });
+  });
+
   // ---- the ledger ----
   function paintLedger() {
     if (!facts) return;
@@ -865,8 +1019,9 @@
       L.plan ? `<div class="plan">${esc(L.plan)}</div>` : `<div class="line">no active plan</div>`,
       L.gate ? `<div>gate <span class="gate">${esc(L.gate)}</span></div>` : '',
       L.dirty ? `<div class="line">dirty ${esc(L.dirty)}</div>` : '',
-      (L.queue || L.stash) ? `<div class="line">${L.queue ? `${L.queue} queued` : ''}${L.queue && L.stash ? ', ' : ''}${L.stash ? `${L.stash} stashed` : ''}</div>` : '',
+      (L.queue.length || L.stash) ? `<div class="line">${L.queue.length ? `${L.queue.length} queued` : ''}${L.queue.length && L.stash ? ', ' : ''}${L.stash ? `${L.stash} stashed` : ''}</div>` : '',
     ].join('');
+    paintQueue(L.queue);
     // A row's page is the clank html one, in a window of its own. The
     // builder writes a plan's name verbatim, spaces and all; the link
     // encodes each segment and the server decodes it.
