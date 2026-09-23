@@ -4,11 +4,19 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>clank</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Martian+Mono:wght@700&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css">
-<script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
+<link rel="stylesheet" href="/xterm.css">
+<script src="/xterm.js"></script>
 <style>
+  /* The face, declared here and served from this binary: the
+     stylesheet that used to declare it was fetched from Google, on a
+     page that keeps a credential. */
+  @font-face {
+    font-family: "Martian Mono";
+    font-style: normal;
+    font-weight: 700;
+    font-display: swap;
+    src: url("/plate.woff2") format("woff2");
+  }
   :root {
     --base: #faf9f7;
     --bezel: #f1efe9;
@@ -294,7 +302,7 @@
     <div class="rows" id="rows"></div>
   </aside>
 
-<script>
+<script nonce="__CLANK_NONCE__">
 (() => {
   const $ = (id) => document.getElementById(id);
   // The credential this browser signs itself back in with. A store

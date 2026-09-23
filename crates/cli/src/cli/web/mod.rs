@@ -40,10 +40,60 @@ const SESSION_ANCHOR: &str = "window.CLANK_SESSION || 'clank'";
 fn page_for(session: &str) -> String {
     PAGE.replace(SESSION_ANCHOR, &serde_json::json!(session).to_string())
 }
+
+/// Where each page's own script says which policy admits it. Replaced
+/// per RESPONSE, because a nonce that repeats admits anything that saw
+/// it once.
+const NONCE_ANCHOR: &str = "__CLANK_NONCE__";
+
+/// What this origin may run, load and talk to. It keeps the remote's
+/// credential and can type into agents, so the answer is: what this
+/// binary shipped, and nothing else
+/// (the-credential-is-not-a-cdns-to-take).
+///
+/// Scripts are admitted by NONCE, not by `'unsafe-inline'` — the pages
+/// carry their own blocks and nothing else runs, so markup that
+/// arrives from anywhere cannot bring a script with it. Styles are
+/// inline-allowed because xterm writes stylesheets at run time; that
+/// still admits no stylesheet FILE but this origin's. Images take
+/// `data:` because the transcript's pictures arrive that way, and
+/// `media:` takes `blob:` for the camera's own preview.
+fn policy(nonce: &str) -> String {
+    format!(
+        "default-src 'none'; \
+         script-src 'self' 'nonce-{nonce}'; \
+         style-src 'self' 'unsafe-inline'; \
+         img-src 'self' data:; \
+         media-src 'self' blob:; \
+         font-src 'self'; \
+         connect-src 'self'; \
+         form-action 'self'; \
+         base-uri 'none'; \
+         frame-ancestors 'none'"
+    )
+}
+
+/// A page, with the nonce its scripts carry and the policy that
+/// admits exactly those.
+fn guarded_page(html: &str) -> Resp {
+    let nonce = door::random_token();
+    let mut resp = text(200, html.replace(NONCE_ANCHOR, &nonce), HTML);
+    if let Ok(v) = hyper::header::HeaderValue::from_str(&policy(&nonce)) {
+        resp.headers_mut().insert("content-security-policy", v);
+    }
+    resp
+}
 const LOGIN: &str = include_str!("login.html");
-/// The QR decoder the sign-in page scans with — vendored, unmodified,
-/// Apache-2.0; `web/vendor/README.md` says where it came from.
+/// What the pages load, all of it from this binary: the sign-in
+/// page's QR decoder, the terminal the agent panes are drawn with, and
+/// the face their names are set in. Vendored, unmodified, each with
+/// its licence and digest in `web/vendor/README.md` — a page that
+/// keeps a credential runs nobody else's code
+/// (the-credential-is-not-a-cdns-to-take).
 const JSQR: &str = include_str!("vendor/jsQR.js");
+const XTERM_JS: &str = include_str!("vendor/xterm.js");
+const XTERM_CSS: &str = include_str!("vendor/xterm.css");
+const PLATE_FONT: &[u8] = include_bytes!("vendor/plate.woff2");
 #[cfg(test)]
 const VENDOR_NOTICE: &str = include_str!("vendor/README.md");
 const HTML: &str = "text/html; charset=utf-8";
@@ -1449,12 +1499,35 @@ async fn route(req: hyper::Request<hyper::body::Incoming>, peer: IpAddr, ctx: &C
         };
     };
     match (method.as_str(), path.as_str()) {
-        ("GET", "/") => text(200, ctx.page.to_string(), HTML),
+        ("GET", "/") => guarded_page(&ctx.page),
         ("GET", "/whoami") => text(204, "", "text/plain"),
         // The credential, to a browser that is already in. Every door
         // ends at a page with a session, so this is the one place a
         // device is provisioned, whichever door it came through
         // (the-phone-scans-the-token-and-keeps-it).
+        // The terminal and the face its names are set in: behind the
+        // door, since only a page with a session draws a pane.
+        ("GET", "/xterm.js") => {
+            static GZ: std::sync::OnceLock<Option<Vec<u8>>> = std::sync::OnceLock::new();
+            served(
+                &req,
+                XTERM_JS.as_bytes(),
+                "text/javascript; charset=utf-8",
+                Some(&GZ),
+            )
+        }
+        ("GET", "/xterm.css") => {
+            static GZ: std::sync::OnceLock<Option<Vec<u8>>> = std::sync::OnceLock::new();
+            served(
+                &req,
+                XTERM_CSS.as_bytes(),
+                "text/css; charset=utf-8",
+                Some(&GZ),
+            )
+        }
+        // A woff2 carries its own compression; gzip over it spends
+        // time to add bytes.
+        ("GET", "/plate.woff2") => served(&req, PLATE_FONT, "font/woff2", None),
         ("GET", "/token") => match ctx.door.token_for_session(&admitted.id_hash) {
             Ok(Some(token)) => text(
                 200,
@@ -1492,6 +1565,24 @@ async fn route(req: hyper::Request<hyper::body::Incoming>, peer: IpAddr, ctx: &C
 /// way: 251 KiB raw against 56 on the wire, over a phone's connection.
 fn decoder(req: &hyper::Request<hyper::body::Incoming>) -> Resp {
     static GZIPPED: std::sync::OnceLock<Option<Vec<u8>>> = std::sync::OnceLock::new();
+    served(
+        req,
+        JSQR.as_bytes(),
+        "text/javascript; charset=utf-8",
+        Some(&GZIPPED),
+    )
+}
+
+/// A vendored asset, served from the binary: its type, an immutable
+/// cache because each is one published build, and gzip for the ones
+/// that gain by it — a woff2 is already compressed, and compressing it
+/// again spends time to add bytes.
+fn served(
+    req: &hyper::Request<hyper::body::Incoming>,
+    body: &'static [u8],
+    ctype: &'static str,
+    gz: Option<&'static std::sync::OnceLock<Option<Vec<u8>>>>,
+) -> Resp {
     let takes_gzip = accepts_gzip(
         req.headers()
             .get("accept-encoding")
@@ -1499,7 +1590,7 @@ fn decoder(req: &hyper::Request<hyper::body::Incoming>) -> Resp {
     );
     let mut builder = hyper::Response::builder()
         .status(200)
-        .header("content-type", "text/javascript; charset=utf-8")
+        .header("content-type", ctype)
         .header("cache-control", "public, max-age=31536000, immutable")
         // Two answers live at this URL, and a cache that kept one for
         // a year would hand compressed bytes to a caller that said it
@@ -1510,25 +1601,21 @@ fn decoder(req: &hyper::Request<hyper::body::Incoming>) -> Resp {
     // the plain script under `content-encoding: gzip` would be a body
     // no browser could read, and that is not a thing to leave
     // possible (ruthless on 4ab4b43).
-    let compressed = takes_gzip
-        .then(|| {
-            GZIPPED
-                .get_or_init(|| {
-                    use std::io::Write;
-                    let mut w =
-                        flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
-                    w.write_all(JSQR.as_bytes()).ok()?;
-                    w.finish().ok()
-                })
-                .clone()
+    let compressed = gz.filter(|_| takes_gzip).and_then(|cell| {
+        cell.get_or_init(|| {
+            use std::io::Write;
+            let mut w = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+            w.write_all(body).ok()?;
+            w.finish().ok()
         })
-        .flatten();
+        .clone()
+    });
     let body = match compressed {
         Some(gz) => {
             builder = builder.header("content-encoding", "gzip");
             Bytes::from(gz)
         }
-        None => Bytes::from_static(JSQR.as_bytes()),
+        None => Bytes::from_static(body),
     };
     builder
         .body(Full::new(body).boxed())
@@ -1647,7 +1734,7 @@ fn host_of(req: &hyper::Request<hyper::body::Incoming>) -> Option<String> {
 /// came with.
 fn login(req: &hyper::Request<hyper::body::Incoming>, peer: IpAddr, ctx: &Ctx) -> Resp {
     let Some(token) = door::query_token(req.uri().query()) else {
-        return text(200, LOGIN, HTML);
+        return guarded_page(LOGIN);
     };
     if !ctx.door.attempt_allowed(peer) {
         return text(429, "too many attempts — wait a minute", "text/plain");
@@ -2166,7 +2253,11 @@ mod tests {
     /// than silently in a browser.
     #[test]
     fn the_page_asks_for_exactly_the_ids_it_has() {
-        let cut = PAGE.find("<script>").expect("the page has a script");
+        // The page's own block, wherever its open tag ends: it
+        // carries a nonce now, which the policy admits it by.
+        let cut = PAGE
+            .find("<script nonce")
+            .expect("the page has a script of its own");
         let ids: std::collections::BTreeSet<String> = PAGE[..cut]
             .match_indices(" id=\"")
             .map(|(i, m)| {
@@ -3747,6 +3838,19 @@ mod tests {
         parse_as(script, Kind::Classic)
     }
 
+    /// The paths the pages load, and the vendored file each is served
+    /// from. A page may load nothing else: a script from somebody
+    /// else's host runs on the origin that keeps the credential, and
+    /// whose code it is, is their decision, not ours.
+    const SERVED_FROM_VENDOR: &[(&str, &str)] = &[
+        ("/jsqr.js", "vendor/jsQR.js"),
+        ("/xterm.js", "vendor/xterm.js"),
+    ];
+
+    /// The nonce attribute as the pages carry it, before a response
+    /// replaces its value.
+    const NONCE_ATTR: &str = concat!("nonce=\"", "__CLANK_NONCE__", "\"");
+
     /// Every script the binary ships, with the page it came from: the
     /// pages' blocks and the vendored decoder, which this binary
     /// serves as surely as it serves them. Upstream's provenance is
@@ -3759,7 +3863,10 @@ mod tests {
     /// this plan exists to close (ruthless on 9473655). A shape
     /// nobody decided about fails rather than being skipped.
     fn shipped_scripts() -> Vec<(&'static str, String, Kind)> {
-        let mut out = vec![("vendor/jsQR.js", JSQR.to_string(), Kind::Classic)];
+        let mut out = vec![
+            ("vendor/jsQR.js", JSQR.to_string(), Kind::Classic),
+            ("vendor/xterm.js", XTERM_JS.to_string(), Kind::Classic),
+        ];
         for (page, html) in [("page.html", PAGE), ("login.html", LOGIN)] {
             let mut rest = html;
             while let Some(at) = rest.find("<script") {
@@ -3771,14 +3878,37 @@ mod tests {
                 let source = &body[..end];
                 rest = &body[end..];
                 match () {
-                    // Fetched from somewhere else: not ours to parse,
-                    // and not ours to ship. A LOCAL src would be, so
-                    // it has to be said which this is.
-                    _ if attrs.contains("src=") => assert!(
-                        attrs.contains("src=\"http"),
-                        "{page}: a script this binary serves must be in the inventory: {attrs}"
-                    ),
-                    _ if attrs.is_empty() => out.push((page, source.to_string(), Kind::Classic)),
+                    // A path of this binary's own: it must be an
+                    // asset the inventory holds, so a page cannot load
+                    // a script that nothing checks. A src to somebody
+                    // ELSE's host is refused outright — that is the
+                    // arrangement this page was built to leave
+                    // (the-credential-is-not-a-cdns-to-take).
+                    _ if attrs.contains("src=") => {
+                        let path = attrs
+                            .split("src=\"")
+                            .nth(1)
+                            .and_then(|s| s.split('"').next())
+                            .unwrap_or_default();
+                        let held = SERVED_FROM_VENDOR
+                            .iter()
+                            .find(|(served, _)| *served == path)
+                            .map(|(_, asset)| *asset);
+                        match held {
+                            Some(asset) => assert!(
+                                out.iter().any(|(name, ..)| *name == asset),
+                                "{page}: {path} is served from {asset}, which is not inventoried"
+                            ),
+                            None => panic!(
+                                "{page}: this page loads {path}, which this binary does not serve"
+                            ),
+                        }
+                    }
+                    // A nonce is how the policy admits the page's own
+                    // block; it says nothing about what the block is.
+                    _ if attrs.trim_start_matches(NONCE_ATTR).trim().is_empty() => {
+                        out.push((page, source.to_string(), Kind::Classic))
+                    }
                     _ if attrs.contains("type=\"module\"") => {
                         out.push((page, source.to_string(), Kind::Module))
                     }
@@ -3800,7 +3930,12 @@ mod tests {
         let scripts = shipped_scripts();
         // Named, so a script dropping out of the inventory is a
         // failure rather than a test that quietly checks less.
-        for wanted in ["page.html", "login.html", "vendor/jsQR.js"] {
+        for wanted in [
+            "page.html",
+            "login.html",
+            "vendor/jsQR.js",
+            "vendor/xterm.js",
+        ] {
             let found: usize = scripts
                 .iter()
                 .filter(|(name, body, _)| *name == wanted && !body.trim().is_empty())
@@ -3928,16 +4063,48 @@ mod tests {
     /// `web/vendor/README.md` names this digest beside where it came
     /// from. An edit here fails rather than passing quietly.
     #[test]
-    fn the_vendored_decoder_is_what_the_notice_says() {
-        let digest = blake3::hash(JSQR.as_bytes()).to_hex().to_string();
-        assert_eq!(
-            digest, "7e156db57fefffb4ea40e40c88fd63b8e5052eae37b7e47c6652160041a90818",
-            "jsqr 1.4.0 from unpkg; see web/vendor/README.md"
-        );
-        assert!(
-            VENDOR_NOTICE.contains(&digest) && VENDOR_NOTICE.contains("Apache-2.0"),
-            "the notice names this file and its licence"
-        );
+    fn the_vendored_assets_are_what_the_notice_says() {
+        // The registry's own digest, so this is checkable against
+        // where each came from rather than against itself.
+        for (what, bytes, sha256, licence) in [
+            (
+                "jsQR.js",
+                JSQR.as_bytes(),
+                "bc40c8a15196236b2314db0856f72ca0b49980cd5413b8c852a7349f5fee0859",
+                "Apache-2.0",
+            ),
+            (
+                "xterm.js",
+                XTERM_JS.as_bytes(),
+                "4196e242ef1cf4c2adead8d97f4a772a69576076f70b095e004b4abbb049e7bf",
+                "MIT",
+            ),
+            (
+                "xterm.css",
+                XTERM_CSS.as_bytes(),
+                "f7f724aea2bb620a6482bfb8e4bdecfae1152b0c7facef55fbda61f3b6cfedb2",
+                "MIT",
+            ),
+            (
+                "plate.woff2",
+                PLATE_FONT,
+                "723569a183da9c0bb9fb829bd3a3fb3c6e044e0ad405a6feb6fce8a45480fb52",
+                "OFL-1.1",
+            ),
+        ] {
+            let digest: String = {
+                use sha2::Digest;
+                sha2::Sha256::digest(bytes)
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect()
+            };
+            assert_eq!(digest, sha256, "{what} is not the build the notice names");
+            assert!(
+                VENDOR_NOTICE.contains(sha256) && VENDOR_NOTICE.contains(licence),
+                "{what}: the notice names this file and its licence"
+            );
+        }
     }
 
     /// The decoder is served to a browser that has no session yet —
@@ -4019,6 +4186,208 @@ mod tests {
             .unwrap();
         assert!(refused.headers().get("content-encoding").is_none());
         assert_eq!(refused.text().await.unwrap().len(), JSQR.len());
+        let _ = cancel.send(true);
+    }
+
+    /// The pages name no host but their own. A script, a stylesheet
+    /// or a font from somebody else's host runs on the origin that
+    /// keeps the credential and can call `/say`, and whose code that
+    /// is, is their decision — so the next convenient CDN link has to
+    /// meet this test (the-credential-is-not-a-cdns-to-take).
+    #[test]
+    fn the_pages_reach_out_to_nobody() {
+        for (page, html) in [("page.html", PAGE), ("login.html", LOGIN)] {
+            for (at, _) in html.match_indices("//") {
+                // Only in a URL: `//` inside the scripts is a comment.
+                let before = &html[..at];
+                if !before.ends_with("http:") && !before.ends_with("https:") {
+                    continue;
+                }
+                let line = html[..at].lines().count();
+                panic!(
+                    "{page}:{line} names another host: {}",
+                    &html[at..(at + 60).min(html.len())]
+                );
+            }
+            assert!(
+                !html.contains("preconnect") && !html.contains("dns-prefetch"),
+                "{page}: not even a hint at one"
+            );
+        }
+    }
+
+    /// The terminal and the face are served from this binary, behind
+    /// the door — only a page with a session draws a pane — and the
+    /// font arrives as it was stored, since a woff2 is compressed
+    /// already.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_pages_assets_come_from_this_binary() {
+        let (base, door, anon, cancel, _site, _repo) = door_only().await;
+        for path in ["/xterm.js", "/xterm.css", "/plate.woff2"] {
+            assert_eq!(
+                anon.get(format!("{base}{path}"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                401,
+                "{path} is behind the door"
+            );
+        }
+        let cookie = anon
+            .post(format!("{base}/login"))
+            .header("origin", &base)
+            .json(&serde_json::json!({ "token": door.token().unwrap() }))
+            .send()
+            .await
+            .unwrap()
+            .headers()
+            .get("set-cookie")
+            .expect("a session")
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+
+        for (path, ctype, len) in [
+            (
+                "/xterm.js",
+                "text/javascript; charset=utf-8",
+                XTERM_JS.len(),
+            ),
+            ("/xterm.css", "text/css; charset=utf-8", XTERM_CSS.len()),
+            ("/plate.woff2", "font/woff2", PLATE_FONT.len()),
+        ] {
+            let r = anon
+                .get(format!("{base}{path}"))
+                .header("cookie", &cookie)
+                .header("accept-encoding", "gzip")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status(), 200, "{path}");
+            assert_eq!(r.headers().get("content-type").unwrap(), ctype, "{path}");
+            let zipped = r.headers().get("content-encoding").is_some();
+            let bytes = r.bytes().await.unwrap();
+            if zipped {
+                let mut out = Vec::new();
+                std::io::Read::read_to_end(&mut flate2::read::GzDecoder::new(&bytes[..]), &mut out)
+                    .expect("gzip, as labelled");
+                assert_eq!(out.len(), len, "{path} unpacks to what is vendored");
+            } else {
+                assert_eq!(bytes.len(), len, "{path} is served whole");
+            }
+        }
+        // The font is stored compressed, so it is not compressed again.
+        let font = anon
+            .get(format!("{base}/plate.woff2"))
+            .header("cookie", &cookie)
+            .header("accept-encoding", "gzip")
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            font.headers().get("content-encoding").is_none(),
+            "a woff2 gains nothing from gzip"
+        );
+        let _ = cancel.send(true);
+    }
+
+    /// Both pages are served under a policy, and the policy admits
+    /// this origin and nothing else. Removing the links was the
+    /// arrangement; this is the enforcement — a page string can be
+    /// read for `https://`, but not for what a script does at run
+    /// time (codex on b5c90e0).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn both_pages_are_served_under_a_policy() {
+        let (base, door, anon, cancel, _site, _repo) = door_only().await;
+        let cookie = anon
+            .post(format!("{base}/login"))
+            .header("origin", &base)
+            .json(&serde_json::json!({ "token": door.token().unwrap() }))
+            .send()
+            .await
+            .unwrap()
+            .headers()
+            .get("set-cookie")
+            .expect("a session")
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+
+        for (what, path, with_cookie) in [("the page", "/", true), ("sign-in", "/login", false)] {
+            let mut ask = anon.get(format!("{base}{path}"));
+            if with_cookie {
+                ask = ask.header("cookie", &cookie);
+            }
+            let r = ask.send().await.unwrap();
+            assert_eq!(r.status(), 200, "{what}");
+            let policy = r
+                .headers()
+                .get("content-security-policy")
+                .unwrap_or_else(|| panic!("{what} is served without a policy"))
+                .to_str()
+                .unwrap()
+                .to_string();
+            let html = r.text().await.unwrap();
+
+            // Nothing by default, and every relaxation is this origin
+            // or a scheme the page's own content needs.
+            assert!(policy.contains("default-src 'none'"), "{what}: {policy}");
+            for named in [
+                "script-src 'self' 'nonce-",
+                "style-src 'self' 'unsafe-inline'",
+                "img-src 'self' data:",
+                "font-src 'self'",
+                "connect-src 'self'",
+                "frame-ancestors 'none'",
+            ] {
+                assert!(policy.contains(named), "{what} wants {named}: {policy}");
+            }
+            assert!(
+                !policy.contains("script-src 'self' 'unsafe-inline'"),
+                "{what}: a script is admitted by nonce, not by being inline"
+            );
+
+            // The nonce in the header is the one the page's own block
+            // carries, and it is fresh each time — one that repeated
+            // would admit whatever had seen it once.
+            let nonce = policy
+                .split("'nonce-")
+                .nth(1)
+                .and_then(|s| s.split('\'').next())
+                .expect("a nonce")
+                .to_string();
+            assert!(
+                html.contains(&format!("<script nonce=\"{nonce}\"")),
+                "{what}: the page's script carries the header's nonce"
+            );
+            assert!(
+                !html.contains(NONCE_ANCHOR),
+                "{what}: no unreplaced anchor is left in what is served"
+            );
+            let again = anon
+                .get(format!("{base}{path}"))
+                .header("cookie", &cookie)
+                .send()
+                .await
+                .unwrap();
+            assert!(
+                !again
+                    .headers()
+                    .get("content-security-policy")
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .contains(&nonce),
+                "{what}: a nonce is minted per response"
+            );
+        }
         let _ = cancel.send(true);
     }
 

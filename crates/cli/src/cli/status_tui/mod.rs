@@ -5524,7 +5524,11 @@ pub(crate) mod tests {
         // there would hide the ledger's fields from this scan.
         let alias = "const L = facts.ledger;";
         assert!(PAGE.contains(alias), "the page's ledger alias is `{alias}`");
-        let script = &PAGE[PAGE.find("<script>").expect("the page has a script")..];
+        // The page's own block; its open tag carries the nonce the
+        // policy admits it by (the-credential-is-not-a-cdns-to-take).
+        let script = &PAGE[PAGE
+            .find("<script nonce")
+            .expect("the page has a script of its own")..];
         let mut walked = 0;
         for (root, base) in [("facts.", &v), ("L.", &v["ledger"])] {
             for (i, _) in script.match_indices(root) {
