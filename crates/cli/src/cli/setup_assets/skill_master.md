@@ -91,11 +91,17 @@ this agent's `.clank/agents/<label>/config.json` under `wait_events`
 
 - `{"kind":"github","repo":"owner/name","events":["pr_opened",
   "pr_updated","pr_merged","pr_comment","issue_opened","issue_closed",
-  "issue_comment","branch_push"]}` — wakes you with a `github_event`
-  item when that repo sees the listed activity (polled via `gh`; auth
-  is `gh`'s). `pr_updated` = new commits on a PR; `branch_push` = a
-  push to a branch (never a tag), scopable with
-  `"branches":["main"]`. List as many `github` entries as you want to
+  "issue_comment","branch_push","ci_passed","ci_failed"]}` — wakes you
+  with a `github_event` item when that repo sees the listed activity
+  (polled via `gh`; auth is `gh`'s). `pr_updated` = new commits on a
+  PR; `branch_push` = a push to a branch (never a tag), scopable with
+  `"branches":["main"]`. `ci_failed` = a check on a PR's head reached
+  a terminal state that is not a success (cancelled and timed-out
+  included); `ci_passed` = every check reporting on it finished and
+  none failed. Scope them with `"prs":[7,9]` — empty means every open
+  PR, and each PR in scope costs requests every poll, so name them
+  when you can. A conclusion has no actor, so `include_own_actions`
+  does not apply to it. List as many `github` entries as you want to
   watch several repos. By default your OWN actions (the authenticated
   `gh` login) don't wake you — including your own pushes — set
   `"include_own_actions":true` to override. `"poll_interval"`

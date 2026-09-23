@@ -195,6 +195,16 @@ struct StateFile {
     etag: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     poll_interval_floor: Option<u64>,
+    /// Whether the FEED has completed a baseline.
+    ///
+    /// `None` means a file written before this field existed, which
+    /// is why it is an option rather than a bool: defaulting a
+    /// missing field to false told every already-installed agent that
+    /// its feed had never baselined, and swallowed the events it
+    /// missed while away (codex ae48e92). A reader that finds it
+    /// absent falls back to the evidence the WAL itself carries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    feed_baselined: Option<bool>,
     saved_at: u64,
 }
 
@@ -267,6 +277,10 @@ pub(crate) struct LoadedLog {
     pub(crate) action_keys: Vec<String>,
     pub(crate) etag: Option<String>,
     pub(crate) poll_interval_floor: Option<u64>,
+    /// Whether the feed baselined — see [`StateFile`]. `None` from a
+    /// file that predates the field; the caller falls back to the
+    /// WAL's own evidence.
+    pub(crate) feed_baselined: Option<bool>,
     /// The WAL was quarantined (interior corruption) — caller warns
     /// once and baselines fresh.
     pub(crate) log_quarantined: bool,
@@ -425,8 +439,13 @@ impl SharedWal {
         self.with(|log| log.append_observation(feed_id, action_key, baseline));
     }
 
-    pub(crate) fn save_state(&self, etag: Option<&str>, poll_interval_floor: Option<u64>) {
-        self.with(|log| log.save_state(etag, poll_interval_floor));
+    pub(crate) fn save_state(
+        &self,
+        etag: Option<&str>,
+        poll_interval_floor: Option<u64>,
+        feed_baselined: bool,
+    ) {
+        self.with(|log| log.save_state(etag, poll_interval_floor, feed_baselined));
     }
 
     pub(crate) fn compact(&self) {
@@ -789,6 +808,7 @@ impl EventLog {
                 Ok(s) => {
                     out.etag = s.etag;
                     out.poll_interval_floor = s.poll_interval_floor;
+                    out.feed_baselined = s.feed_baselined;
                 }
                 Err(_) => out.state_corrupt = true,
             },
@@ -958,10 +978,12 @@ impl EventLog {
         &self,
         etag: Option<&str>,
         poll_interval_floor: Option<u64>,
+        feed_baselined: bool,
     ) -> std::io::Result<()> {
         let state = StateFile {
             etag: etag.map(str::to_owned),
             poll_interval_floor,
+            feed_baselined: Some(feed_baselined),
             saved_at: now_epoch(),
         };
         let tmp = self.state_path.with_extension("json.tmp");
@@ -1363,7 +1385,7 @@ mod tests {
         let mut log = log_in(&dir);
         log.append_inbox(Transport::Poll, Some("1"), None, None, &item(1))
             .unwrap();
-        log.save_state(Some("etag-x"), Some(60)).unwrap();
+        log.save_state(Some("etag-x"), Some(60), true).unwrap();
         std::fs::write(dir.join("github-o-r-abcd.state.json"), b"{broken").unwrap();
         let loaded = log_in(&dir).load();
         assert!(loaded.state_corrupt, "cache corruption is reported…");
@@ -1377,7 +1399,7 @@ mod tests {
     fn state_roundtrip() {
         let dir = tempdir();
         let log = log_in(&dir);
-        log.save_state(Some("W/\"abc\""), Some(90)).unwrap();
+        log.save_state(Some("W/\"abc\""), Some(90), true).unwrap();
         let loaded = log_in(&dir).load();
         assert_eq!(loaded.etag.as_deref(), Some("W/\"abc\""));
         assert_eq!(loaded.poll_interval_floor, Some(90));

@@ -1064,6 +1064,60 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_ci_watch_can_be_configured_from_the_docs_alone() {
+        // The kinds, the scope, and the one filter that does not
+        // apply to a conclusion — in the agent's own instructions.
+        // In the events ARRAY, not merely in the prose beside it —
+        // an agent copies the array.
+        let body: String = SKILL_MASTER_BODY
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            body.contains(r#""ci_passed","ci_failed""#),
+            "the kinds are in the events list an agent would copy",
+        );
+        assert!(
+            SKILL_MASTER_BODY.contains(r#""prs":[7,9]"#),
+            "the scope is shown, not just named",
+        );
+        assert!(
+            SKILL_MASTER_BODY.contains("no actor"),
+            "and that the own-actions filter has nothing to say about a conclusion",
+        );
+    }
+
+    #[test]
+    fn the_github_skill_does_not_promise_catch_up_it_cannot_do() {
+        // The feed's catch-up sentence is true of the feed and false
+        // of a state read: the plan's own correction (a-red-build-is-
+        // a-wake). Reading the CURRENT result is all an arm can do.
+        // Whitespace-normalized: a doc test that a reflow can break
+        // teaches people to reflow around the test.
+        let ci: String = GITHUB_SKILL_BODY
+            .split("## CI conclusions are read, not received")
+            .nth(1)
+            .expect("the github skill explains what a read is")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(ci.contains("not recoverable"), "{ci}");
+        assert!(ci.contains("sees the CURRENT result"), "{ci}");
+        assert!(
+            ci.contains("announced once"),
+            "and that an unchanged build stays quiet: {ci}",
+        );
+        // The two claims a reader could act on wrongly: that
+        // something watches between waits (nothing does), and that a
+        // cue always means an immediate read (a storm is dropped).
+        assert!(
+            ci.contains("as long as your `clank wait` does"),
+            "observation needs an armed wait: {ci}",
+        );
+        assert!(ci.contains("DROPPED, not queued"), "{ci}");
+    }
+
+    #[test]
     fn the_master_skill_sends_readers_to_the_command_not_the_files() {
         let reading = SKILL_MASTER_BODY
             .split("### Reading feedback")

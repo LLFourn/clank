@@ -65,8 +65,41 @@ watched repos collide — the error message shows the qualified forms).
   "may have been missed" warning — treat it as a cue to sweep the
   watched repo manually.
 - The very first arm of a new source baselines silently (history is
-  not backlog). Editing a source's config (kinds, branches, filters)
-  starts a fresh log — same silent baseline.
+  not backlog). Editing a source's config (kinds, branches, the PR
+  scope, filters) starts a fresh log — same silent baseline. Adding
+  an EMPTY `prs` list changes nothing and keeps the log.
+
+## CI conclusions are read, not received
+
+`ci_passed` / `ci_failed` do not come from the event feed — GitHub
+does not put check results there. They are READ: every watched PR's
+head is asked what its checks say, and the answer is reduced to one
+result for the PR (a check suite is one App's view, and a repo's
+checks routinely come from several, plus the older commit statuses).
+
+Two consequences worth knowing:
+
+- **There is no backlog to catch up on.** An arm sees the CURRENT
+  result. A build that went red and was replaced by a green one while
+  nothing was armed is not recoverable — the red is simply gone.
+  Nothing watches on your behalf between waits: the watch runs for
+  exactly as long as your `clank wait` does, so an armed wait is the
+  only thing that can see a transition. `prs` does not change that —
+  it bounds WHICH PRs are read, and so how many requests each poll
+  costs.
+- **An unchanged build is silent.** The same conclusion on the same
+  head is announced once; a new push is a new head and so a new
+  result. A re-run going red → green → red announces red once, not
+  twice.
+
+With `"delivery":"realtime"` a finished check suite makes the checks
+be read straight away instead of at the next poll — unless they were
+read moments ago. Cues arriving in quick succession are DROPPED, not
+queued (several apps finishing at once would otherwise buy a round of
+requests each), so a conclusion can still wait for the next scheduled
+read. The webhook is only a cue: the conclusion always comes from the
+same read, so realtime and polling watches cannot tell you different
+things.
 
 ## Realtime notes
 

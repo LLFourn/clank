@@ -359,8 +359,10 @@ user-global default (`~/.clank/config.json`'s `"auto"`) when unset —
 - **Extra wake sources** (`wait_events` in the agent's config, or
   repeatable `--event '<json>'`): `github` entries watch any repo
   (PRs opened/updated/merged, comments, issues, branch pushes — your
-  own actions filtered by default), and `command` entries spawn an
-  argv whose completion is the wake. A watch can carry a `"prompt"`
+  own actions filtered by default — and CI conclusions,
+  `ci_passed` / `ci_failed`, scopable to named PRs with
+  `"prs":[7,9]`), and `command` entries spawn an argv whose
+  completion is the wake. A watch can carry a `"prompt"`
   — operator instructions stamped onto every wake item it produces,
   telling the agent exactly how to react:
 
@@ -396,7 +398,11 @@ user-global default (`~/.clank/config.json`'s `"auto"`) when unset —
   until acked with `clank events ack`. That makes delivery
   at-least-once: events that fire while no wait is armed (agent
   offline, wait killed, the gap before a re-arm) are caught up on the
-  next arm by reconciling GitHub's event feed against the inbox.
+  next arm by reconciling GitHub's event feed against the inbox. CI
+  conclusions are the exception — they are not in that feed, they are
+  read from each watched PR's checks, so an arm sees the CURRENT
+  result: a build that went red and was replaced by a green one while
+  nothing was armed is not recoverable.
   `clank events list` / `show` inspect it; the `clank-github` skill
   teaches agents the react-then-ack loop.
 

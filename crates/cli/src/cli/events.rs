@@ -847,6 +847,7 @@ mod tests {
             poll_interval: None,
             include_own_actions: false,
             branches: Vec::new(),
+            prs: Vec::new(),
             prompt: prompt.map(str::to_string),
             delivery: Delivery::Poll,
         };
@@ -895,6 +896,7 @@ mod tests {
             poll_interval: None,
             include_own_actions: false,
             branches: Vec::new(),
+            prs: Vec::new(),
             prompt: prompt.map(str::to_string),
             delivery: Delivery::Poll,
         };

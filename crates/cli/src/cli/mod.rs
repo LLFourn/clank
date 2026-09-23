@@ -23,6 +23,7 @@ pub mod export;
 pub mod feedback;
 pub mod finish;
 pub mod fork;
+pub(crate) mod github_ci;
 pub(crate) mod github_event_log;
 pub mod github_events;
 pub(crate) mod github_timeline;

@@ -1298,6 +1298,7 @@ mod tests {
                     poll_interval: None,
                     include_own_actions: false,
                     branches: Vec::new(),
+                    prs: Vec::new(),
                     prompt: None,
                     delivery: Default::default(),
                 },

@@ -90,6 +90,13 @@ pub struct GithubSource {
     /// number-scoped already.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub branches: Vec<String>,
+    /// CI scope: only these PR numbers wake the agent. Empty = every
+    /// PR the watch sees. Applies to `ci_passed` / `ci_failed` only,
+    /// the way [`branches`](Self::branches) applies to `branch_push`
+    /// — and unlike a branch list it also bounds the work, since each
+    /// PR in scope is a pair of requests per poll.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prs: Vec<u64>,
     /// Operator instructions stamped onto every wake item this
     /// watch presents (github-watch-prompts): free text telling the
     /// agent exactly how to react. Presentation config — never
@@ -134,6 +141,22 @@ pub enum GithubEventKind {
     /// branch pushes and never match). Scope with
     /// [`GithubSource::branches`].
     BranchPush,
+    /// Every check reporting on a PR's head commit has finished and
+    /// none failed. Scope with [`GithubSource::prs`].
+    CiPassed,
+    /// A check on a PR's head commit reached a terminal state that is
+    /// not a success. Scope with [`GithubSource::prs`].
+    CiFailed,
+}
+
+impl GithubEventKind {
+    /// Whether this kind is read from a PR's checks rather than from
+    /// the repo's event feed. The two CI kinds are a reduction over
+    /// every check reporting on a PR head (`github_ci`), because no
+    /// single check suite is evidence about the PR.
+    pub fn is_ci(self) -> bool {
+        matches!(self, Self::CiPassed | Self::CiFailed)
+    }
 }
 
 /// Spawn a command when the wait arms; its COMPLETION is the wake.
@@ -345,6 +368,7 @@ mod tests {
             poll_interval: None,
             include_own_actions: false,
             branches: vec!["main".into()],
+            prs: vec![7, 9],
             delivery: Delivery::Realtime,
             prompt: None,
         });

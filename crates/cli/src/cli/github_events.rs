@@ -305,6 +305,12 @@ fn content_ref(
         }
         // A push has no single object to read a body from.
         GithubEventKind::BranchPush => None,
+        // Not classified from a payload: a CI conclusion is read from
+        // a PR's checks, never from the feed or a webhook body
+        // (`github_ci`).
+        GithubEventKind::CiPassed | GithubEventKind::CiFailed => {
+            unreachable!("ci kinds are not classified from a payload")
+        }
     }
 }
 
@@ -350,10 +356,13 @@ fn action_key(
             Some(format!("{ns}#{id}"))
         }
         GithubEventKind::BranchPush => unreachable!("push keys are built in the push arms"),
+        GithubEventKind::CiPassed | GithubEventKind::CiFailed => {
+            unreachable!("ci keys are built by the ci reader, which has no payload")
+        }
     }
 }
 
-fn kind_str(kind: GithubEventKind) -> &'static str {
+pub(crate) fn kind_str(kind: GithubEventKind) -> &'static str {
     match kind {
         GithubEventKind::PrOpened => "pr_opened",
         GithubEventKind::PrUpdated => "pr_updated",
@@ -363,6 +372,8 @@ fn kind_str(kind: GithubEventKind) -> &'static str {
         GithubEventKind::IssueOpened => "issue_opened",
         GithubEventKind::IssueClosed => "issue_closed",
         GithubEventKind::IssueComment => "issue_comment",
+        GithubEventKind::CiPassed => "ci_passed",
+        GithubEventKind::CiFailed => "ci_failed",
     }
 }
 
@@ -952,8 +963,10 @@ pub(crate) fn shared_session() -> std::sync::Arc<GithubSession<ReqwestSend>> {
 }
 
 impl<S: HttpSend> GithubSession<S> {
+    // `pub(crate)` so the CI reader's tests script this same session
+    // rather than opening a second, differently-behaved one.
     #[cfg(test)]
-    fn for_tests(
+    pub(crate) fn for_tests(
         http: S,
         acquire: fn() -> std::pin::Pin<
             Box<dyn std::future::Future<Output = anyhow::Result<String>> + Send>,
@@ -1064,6 +1077,41 @@ impl<S: HttpSend> EventFetcher for GhFetcher<S> {
     }
 }
 
+/// Reads a repo's CI conclusions — injected like the events fetcher,
+/// so the loop's CI horizon is testable without a network.
+pub(crate) trait CiReader {
+    fn read(
+        &self,
+    ) -> impl Future<
+        Output = anyhow::Result<
+            Vec<(
+                crate::cli::github_ci::PrHead,
+                crate::cli::github_ci::CiRollup,
+            )>,
+        >,
+    > + Send;
+}
+
+/// Production reader: the checks endpoints over the SHARED session.
+struct GhCi<S: HttpSend> {
+    repo: String,
+    prs: Vec<u64>,
+    session: std::sync::Arc<GithubSession<S>>,
+}
+
+impl<S: HttpSend> CiReader for GhCi<S> {
+    async fn read(
+        &self,
+    ) -> anyhow::Result<
+        Vec<(
+            crate::cli::github_ci::PrHead,
+            crate::cli::github_ci::CiRollup,
+        )>,
+    > {
+        crate::cli::github_ci::read_conclusions(&self.session, &self.repo, &self.prs).await
+    }
+}
+
 /// The authenticated login for the own-action filter — `GET /user`
 /// over the SAME session and 401 story as the events endpoint.
 async fn fetch_authenticated_login<S: HttpSend>(
@@ -1163,6 +1211,10 @@ fn webhook_event_names(events: &[GithubEventKind]) -> Vec<&'static str> {
             GithubEventKind::IssueOpened | GithubEventKind::IssueClosed => "issues",
             GithubEventKind::IssueComment => "issue_comment",
             GithubEventKind::BranchPush => "push",
+            // A completed suite is only a TRIGGER to re-read the
+            // PR's checks — one App's suite is not the PR's result —
+            // so the noisy per-job `check_run` is not subscribed.
+            GithubEventKind::CiPassed | GithubEventKind::CiFailed => "check_suite",
         };
         if !names.contains(&name) {
             names.push(name);
@@ -1175,6 +1227,11 @@ fn webhook_event_names(events: &[GithubEventKind]) -> Vec<&'static str> {
                 names.push(extra);
             }
         }
+    }
+    // The older commit-status API reports outside check suites, and a
+    // PR's result is the union of both surfaces.
+    if events.iter().any(|k| k.is_ci()) && !names.contains(&"status") {
+        names.push("status");
     }
     names
 }
@@ -1384,13 +1441,21 @@ pub(crate) async fn run_github_source(
                 repo: src.repo.clone(),
                 session: session.clone(),
             };
+            let ci = GhCi {
+                repo: src.repo.clone(),
+                prs: src.prs.clone(),
+                session: session.clone(),
+            };
             let login = GhLogin(session);
             let realtime = src.delivery == clank_core::agent_config::Delivery::Realtime;
             let src2 = src.clone();
             source_supervisor(
                 &src,
-                &login,
-                &fetcher,
+                FeedSide {
+                    fetcher: &fetcher,
+                    login: &login,
+                },
+                &ci,
                 &itx,
                 events_dir,
                 move || async move {
@@ -1436,16 +1501,17 @@ async fn stamp_instructions_forwarder(
 /// takes over (starting transports only then) when the holder dies.
 /// Presentation never acknowledges: `clank wait` — leased or tailing
 /// — writes no ack records, ever.
-async fn source_supervisor<F, R, RF, RFut>(
+async fn source_supervisor<F, R, C, RF, RFut>(
     src: &GithubSource,
-    login: &R,
-    fetcher: &F,
+    feed_side: FeedSide<'_, F, R>,
+    reader: &C,
     tx: &tokio::sync::mpsc::UnboundedSender<WaitItem>,
     events_dir: Option<std::path::PathBuf>,
     relay_start: RF,
 ) where
     F: EventFetcher,
     R: LoginResolver,
+    C: CiReader,
     RF: FnOnce() -> RFut,
     RFut: std::future::Future<Output = Option<(std::sync::Arc<RelayInbox>, RelayGuard)>>,
 {
@@ -1454,7 +1520,22 @@ async fn source_supervisor<F, R, RF, RFut>(
     let Some(dir) = events_dir else {
         let relay = relay_start().await;
         let inbox = relay.as_ref().map(|(i, _)| i.clone());
-        poll_loop(src, login, fetcher, tx, inbox, None, Default::default()).await;
+        poll_loop(
+            src,
+            FeedSide {
+                fetcher: feed_side.fetcher,
+                login: feed_side.login,
+            },
+            ChecksSide {
+                reader,
+                state: None,
+            },
+            tx,
+            inbox,
+            None,
+            Default::default(),
+        )
+        .await;
         return;
     };
     let key = source_key(src);
@@ -1487,7 +1568,22 @@ async fn source_supervisor<F, R, RF, RFut>(
                     None => None,
                 };
                 let inbox = relay.as_ref().map(|(i, _)| i.clone());
-                poll_loop(src, login, fetcher, tx, inbox, None, Default::default()).await;
+                poll_loop(
+                    src,
+                    FeedSide {
+                        fetcher: feed_side.fetcher,
+                        login: feed_side.login,
+                    },
+                    ChecksSide {
+                        reader,
+                        state: ci_state(&dir, &key),
+                    },
+                    tx,
+                    inbox,
+                    None,
+                    Default::default(),
+                )
+                .await;
                 return;
             }
         };
@@ -1508,7 +1604,22 @@ async fn source_supervisor<F, R, RF, RFut>(
                 None => None,
             };
             let inbox = relay.as_ref().map(|(i, _)| i.clone());
-            poll_loop(src, login, fetcher, tx, inbox, log, presented).await;
+            poll_loop(
+                src,
+                FeedSide {
+                    fetcher: feed_side.fetcher,
+                    login: feed_side.login,
+                },
+                ChecksSide {
+                    reader,
+                    state: ci_state(&dir, &key),
+                },
+                tx,
+                inbox,
+                log,
+                presented,
+            )
+            .await;
             drop(lease);
             // RelayGuard drops here (and on task abort): listener +
             // supervisor die with the source; the forwarder child by
@@ -1542,12 +1653,125 @@ async fn source_supervisor<F, R, RF, RFut>(
     }
 }
 
+/// Where a source's CI horizon persists: beside its WAL, keyed the
+/// same way, so a config edit that re-keys the log re-establishes the
+/// checks too.
+fn ci_state(dir: &std::path::Path, key: &str) -> Option<std::path::PathBuf> {
+    Some(dir.join(format!("{key}.ci.json")))
+}
+
+/// Webhook events that mean "this PR's checks may have moved".
+///
+/// They are a CUE, never a conclusion: one App's suite is not the
+/// PR's result, so what arrives is used to decide WHEN to re-read,
+/// and the read is the same one the poll does. That is what keeps a
+/// realtime watch and a polling watch from ever disagreeing.
+fn is_ci_cue(event_name: &str) -> bool {
+    matches!(event_name, "check_suite" | "status")
+}
+
+/// How close together a cue may make the checks be re-read.
+///
+/// Without it a busy PR — several apps, several pushes — turns every
+/// suite completion into a round of requests, and an unscoped watch
+/// pays that for every open PR at once. Cues inside the floor are
+/// dropped rather than queued: the next scheduled tick reads the same
+/// present state anyway.
+const CI_RECHECK_FLOOR: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// The feed half's collaborators: who to ask for events, and who
+/// resolves the login its own-action filter needs.
+///
+/// Grouped because they ARE one half — the same move this plan made
+/// for the state it keeps (ruthless de2b1f7). A loop that takes nine
+/// loose arguments is one where the two halves can be crossed by
+/// accident, which is the mistake this plan kept making.
+pub(crate) struct FeedSide<'a, F: EventFetcher, R: LoginResolver> {
+    pub(crate) fetcher: &'a F,
+    pub(crate) login: &'a R,
+}
+
+/// The checks half's collaborators: who to ask for conclusions, and
+/// where what it learns persists.
+pub(crate) struct ChecksSide<'a, C: CiReader> {
+    pub(crate) reader: &'a C,
+    /// `None` for an unbound wait with no persistence dir.
+    pub(crate) state: Option<std::path::PathBuf>,
+}
+
+/// The FEED's half of a watch: its cursor over the event stream, and
+/// whether it has a horizon at all.
+///
+/// A type rather than four locals beside CI's four, because every
+/// finding on this plan bar one was two of those locals being taken
+/// for each other — a shared "warm", a shared key set, a shared save
+/// (codex 7c132ec, ae48e92, 4b6035b, 4a6b328). What a loaded log
+/// means for the feed is now one pure function that can be asked
+/// directly, instead of a rule that only a two-arm async test can
+/// reach.
+struct FeedHorizon {
+    /// Bounded recency window over feed ids — right for a stream,
+    /// where an id that falls out will not arrive again.
+    seen: SeenSet,
+    etag: Option<String>,
+    /// The server's requested minimum interval, remembered across
+    /// ticks. Not part of the horizon: a rate limit still applies to
+    /// a source that has to re-baseline.
+    floor: Option<u64>,
+    /// Has a baseline fetch succeeded? Until it has, what the feed
+    /// returns is history rather than news.
+    established: bool,
+}
+
+impl FeedHorizon {
+    /// What a loaded log means for the feed. Pure: the quarantine's
+    /// durable invalidation is the caller's, since it writes.
+    fn restore(loaded: &crate::cli::github_event_log::LoadedLog) -> Self {
+        let mut seen = SeenSet::new(SEEN_CAP);
+        seen.extend(loaded.feed_ids.iter().cloned());
+
+        // Did the FEED baseline? It records that itself; a reader
+        // only has to decide what an OLD file means, where the field
+        // is absent — and what a REJECTED log means, whatever the
+        // file says.
+        //
+        // Absent, the answer is the rule that predates the field — a
+        // valid WAL — minus the one state it cannot distinguish: a
+        // log holding ONLY checks rows, which is evidence about the
+        // checks and none about the feed. An empty feed baseline
+        // followed by a relay delivery leaves exactly such a log
+        // except that its rows are the feed's, so the question is
+        // whose rows they are, not whether any exist.
+        let evidence = loaded.warm
+            && (!loaded.feed_ids.is_empty()
+                || loaded
+                    .action_keys
+                    .iter()
+                    .any(|k| !crate::cli::github_ci::is_ci_key(k)));
+        // A quarantined log answers for nothing: whatever the sidecar
+        // claims, the horizon it was written alongside is gone.
+        let established = !loaded.log_quarantined && loaded.feed_baselined.unwrap_or(evidence);
+
+        Self {
+            seen,
+            // Conditional-request metadata belongs to the horizon it
+            // was taken against: an ETag restored for a feed that has
+            // not established makes every fetch a 304, so the
+            // baseline never completes and pre-baseline relay
+            // deliveries buffer for good.
+            etag: established.then(|| loaded.etag.clone()).flatten(),
+            floor: established.then_some(loaded.poll_interval_floor).flatten(),
+            established,
+        }
+    }
+}
+
 /// Stable per-source WAL key: the sanitized repo plus a short hash of
-/// the source's full identity. Different kinds/branches/own-action
-/// settings classify differently — a different presentable set is a
-/// DIFFERENT log (a config edit re-baselines rather than misreading
-/// an old cursor). FNV-1a inlined for cross-release stability, like
-/// the zellij session hash.
+/// the source's full identity. Different kinds/branches/PR scopes/
+/// own-action settings classify differently — a different presentable
+/// set is a DIFFERENT log (a config edit re-baselines rather than
+/// misreading an old cursor). FNV-1a inlined for cross-release
+/// stability, like the zellij session hash.
 pub(crate) fn source_key(src: &GithubSource) -> String {
     let slug: String = src
         .repo
@@ -1560,10 +1784,19 @@ pub(crate) fn source_key(src: &GithubSource) -> String {
             }
         })
         .collect();
-    let identity = format!(
+    let mut identity = format!(
         "{}|{:?}|{:?}|{}",
         src.repo, src.events, src.branches, src.include_own_actions
     );
+    // Appended only when set, so every watch that predates the PR
+    // scope keeps its key byte for byte. Re-keying is not free: the
+    // old log's rows stay listed as unhandled with nothing to
+    // re-present them, the prompt sidecar orphans, and — while both
+    // configs are armed — the ingest lease is a different file, so
+    // two loops ingest the same repo into two logs.
+    if !src.prs.is_empty() {
+        identity.push_str(&format!("|prs{:?}", src.prs));
+    }
     let mut h: u32 = 0x811c9dc5;
     for b in identity.as_bytes() {
         h ^= u32::from(*b);
@@ -1619,12 +1852,21 @@ impl Coordinator {
         }
     }
 
-    /// Warm start from a persisted log: the action-key horizon is
-    /// already durable, so relay deliveries need no baseline buffering
-    /// — a replay of a pre-restart action drops at the gate instead of
-    /// double-emitting (github-offline-catchup).
-    pub(crate) fn warm(&mut self, keys: impl IntoIterator<Item = String>) {
+    /// Restore the durable action-key horizon. Dedup only — this says
+    /// nothing about whether any source has baselined.
+    pub(crate) fn remember_keys(&mut self, keys: impl IntoIterator<Item = String>) {
         self.keys.extend(keys);
+    }
+
+    /// The FEED has a horizon, so relay deliveries need no baseline
+    /// buffering: a replay of a pre-restart action drops at the gate
+    /// instead of double-emitting (github-offline-catchup).
+    ///
+    /// Separate from [`remember_keys`](Self::remember_keys) because
+    /// this gate is the feed's alone. Opening it because SOME record
+    /// existed let a checks-only log release a queued webhook before
+    /// any feed baseline had run (codex ae48e92).
+    pub(crate) fn feed_established(&mut self) {
         self.baseline_done = true;
     }
 
@@ -1665,11 +1907,7 @@ impl Coordinator {
     /// pre-baseline relay backlog through the gate (pre-seeded keys
     /// drop; genuinely-new actions emit once).
     pub(crate) fn baseline(&mut self, baseline: Vec<Classified>) -> bool {
-        for c in baseline {
-            self.wal
-                .baseline_inbox(c.feed_id.as_deref(), c.key.as_deref(), c.event_at, &c.item);
-            self.keys.extend(c.key);
-        }
+        self.seed(baseline);
         self.baseline_done = true;
         while let Some(c) = self.buffered.pop_front() {
             if !self.gate(c, crate::cli::github_event_log::Transport::Relay) {
@@ -1677,6 +1915,22 @@ impl Coordinator {
             }
         }
         true
+    }
+
+    /// Record actions as already-known without emitting them: their
+    /// keys join the gate and their payloads land as born-handled
+    /// baseline records.
+    ///
+    /// Separate from [`baseline`](Self::baseline) because a source
+    /// has more than one horizon to establish. The feed's baseline
+    /// also opens the relay gate; a CI baseline establishes only
+    /// itself, since nothing buffers on it (a-red-build-is-a-wake).
+    pub(crate) fn seed(&mut self, actions: Vec<Classified>) {
+        for c in actions {
+            self.wal
+                .baseline_inbox(c.feed_id.as_deref(), c.key.as_deref(), c.event_at, &c.item);
+            self.keys.extend(c.key);
+        }
     }
 
     /// A relay delivery: buffered until the baseline succeeds, gated
@@ -1797,10 +2051,10 @@ impl RelayInbox {
 /// cadence, warning each failure, and only begins polling once the
 /// filter is established (codex a989653). Generic over the fetcher +
 /// login resolver, so tested end-to-end without `gh`.
-pub(crate) async fn poll_loop<F: EventFetcher, R: LoginResolver>(
+pub(crate) async fn poll_loop<F: EventFetcher, R: LoginResolver, C: CiReader>(
     src: &GithubSource,
-    login: &R,
-    fetcher: &F,
+    feed_side: FeedSide<'_, F, R>,
+    checks: ChecksSide<'_, C>,
     tx: &tokio::sync::mpsc::UnboundedSender<WaitItem>,
     mut relay: Option<std::sync::Arc<RelayInbox>>,
     mut log: Option<crate::cli::github_event_log::EventLog>,
@@ -1810,11 +2064,34 @@ pub(crate) async fn poll_loop<F: EventFetcher, R: LoginResolver>(
         .poll_interval
         .as_deref()
         .and_then(|s| crate::cli::wait::parse_duration_str(s).ok().flatten());
-    let mut seen = SeenSet::new(SEEN_CAP);
-    let mut etag: Option<String> = None;
-    let mut floor: Option<u64> = None;
-    let mut established = false; // has a baseline fetch succeeded?
+    let mut feed = FeedHorizon {
+        seen: SeenSet::new(SEEN_CAP),
+        etag: None,
+        floor: None,
+        established: false,
+    };
+    // CI's horizon is its own object with its own file: read from the
+    // PRs rather than the feed, established on its own terms, and
+    // remembered per PR. Sharing the feed's state is what made one
+    // half's history establish the other and let eviction re-announce
+    // unchanged builds (codex 7c132ec, ae48e92).
+    let mut ci_horizon = crate::cli::github_ci::CiHorizon::load(checks.state.as_deref());
     let mut own_login: Option<String> = None;
+    // Two schedules, independent on purpose (codex 9bfe171).
+    //
+    // `feed_due` is WHEN THE FEED POLLS NEXT, advanced only when it
+    // actually polls. A cue-driven tick skips the feed, so if it also
+    // pushed this out, cues arriving between the checks floor and the
+    // feed interval would starve the feed forever — and the feed is
+    // the completeness backstop for everything the relay drops.
+    //
+    // `last_checks_attempt` is PERMISSION TO LOOK AGAIN, advanced by
+    // every attempt whatever it returns. Advancing it only on success
+    // would let a broken checks endpoint retry on every queued cue,
+    // which is when a storm is least affordable.
+    let mut checks_only_tick = false;
+    let mut feed_due = tokio::time::Instant::now();
+    let mut last_checks_attempt: Option<tokio::time::Instant> = None;
 
     // Warm start (github-offline-catchup): rebuild both horizons from
     // the WAL and re-present the unhandled backlog IMMEDIATELY — an
@@ -1824,7 +2101,6 @@ pub(crate) async fn poll_loop<F: EventFetcher, R: LoginResolver>(
     // first fetch a RECONCILE — events that fired while no wait was
     // armed emit instead of being swallowed by a fresh baseline.
     let mut warm_keys: Vec<String> = Vec::new();
-    let mut warm = false;
     if let Some(l) = log.as_mut() {
         let loaded = l.load();
         if loaded.log_quarantined {
@@ -1833,6 +2109,15 @@ pub(crate) async fn poll_loop<F: EventFetcher, R: LoginResolver>(
                  re-baselining (unhandled events, if any, were lost)",
                 src.repo
             );
+            // Say it durably, not just on stdout. The sidecar
+            // outlives the log it describes, and its "the feed
+            // baselined" is a statement about a horizon that no
+            // longer exists — left standing, the next arm restores a
+            // stale ETag against a cursor nothing can reconstruct and
+            // emits the first page as new wakes. Written now, because
+            // a failed fetch writes nothing and another restart would
+            // find the old claim again (codex 4a6b328).
+            let _ = l.save_state(None, None, false);
         }
         if loaded.state_corrupt {
             eprintln!(
@@ -1862,32 +2147,75 @@ pub(crate) async fn poll_loop<F: EventFetcher, R: LoginResolver>(
                 return; // wait gone
             }
         }
-        seen.extend(loaded.feed_ids);
-        // Cache metadata is SUBORDINATE to a valid WAL horizon (codex
-        // 7c9e7fe): a cold start (absent or quarantined log) must
-        // fetch UNCONDITIONALLY — a stale ETag from a surviving
-        // state.json could 304 forever, never establishing the
-        // baseline and leaving pre-baseline relay deliveries buffered
-        // for good.
-        if loaded.warm {
-            etag = loaded.etag;
-            floor = loaded.poll_interval_floor;
-        }
+        feed = FeedHorizon::restore(&loaded);
         warm_keys = loaded.action_keys;
-        warm = loaded.warm;
     }
     let wal = crate::cli::github_event_log::SharedWal::new(log);
     let mut coordinator = Coordinator::with_wal(tx.clone(), wal.clone());
-    if warm {
-        coordinator.warm(warm_keys);
-        established = true;
+    // The key horizon covers BOTH halves — it is what stops a relay
+    // delivery and a poll of the same action emitting twice — so it
+    // is restored from any valid log. Opening the relay's gate is a
+    // statement about the FEED alone, and a log holding only checks
+    // rows is no evidence for it (codex ae48e92).
+    coordinator.remember_keys(warm_keys);
+    if feed.established {
+        coordinator.feed_established();
     }
 
     loop {
+        // The CI read comes BEFORE the own-action gate below, and
+        // keeps its own horizon: a conclusion is nobody's action, so
+        // the filter that gate establishes has nothing to say about
+        // it, and waiting on a login it does not need would hold a
+        // red build behind an unrelated outage. Its failures are its
+        // own too — the feed's poll is unaffected either way.
+        if src.events.iter().any(|k| k.is_ci()) {
+            let attempt = checks.reader.read().await;
+            last_checks_attempt = Some(tokio::time::Instant::now());
+            match attempt {
+                Ok(results) => {
+                    let wakes = crate::cli::github_ci::wakes(&src.repo, &src.events, &results);
+                    let in_scope: std::collections::BTreeSet<u64> =
+                        results.iter().map(|(pr, _)| pr.number).collect();
+                    for c in ci_horizon.absorb(wakes, &in_scope) {
+                        if !coordinator.offer(c) {
+                            return; // wait gone
+                        }
+                    }
+                    // A completed read is its OWN durability point:
+                    // waiting for the feed's tick to persist it would
+                    // put this half's memory back under the other's
+                    // availability.
+                    ci_horizon.save(checks.state.as_deref());
+                }
+                Err(e) => eprintln!("wait: github {} ci read failed: {e}", src.repo),
+            }
+        }
+
+        if checks_only_tick {
+            // A cue moved the checks, not the feed: go back to
+            // waiting out the deadline the feed already had.
+            checks_only_tick = false;
+            if !drain_relay_window(
+                feed_due,
+                &mut relay,
+                src,
+                own_login.as_deref(),
+                &mut coordinator,
+                &mut checks_only_tick,
+                last_checks_attempt,
+            )
+            .await
+            {
+                return; // wait gone
+            }
+            continue;
+        }
+
         // Establish the own-action filter before ANY poll when it's
         // requested — never poll unfiltered.
         if !src.include_own_actions && own_login.is_none() {
-            match login.resolve().await {
+            match feed_side.login.resolve().await {
                 Ok(l) => own_login = Some(l),
                 Err(e) => {
                     eprintln!(
@@ -1898,26 +2226,26 @@ pub(crate) async fn poll_loop<F: EventFetcher, R: LoginResolver>(
                     // The relay inbox is bounded at INGRESS, so
                     // deliveries simply wait in it while we retry —
                     // no drain needed here (codex 840725c).
-                    tokio::time::sleep(effective_interval(configured, floor)).await;
+                    tokio::time::sleep(effective_interval(configured, feed.floor)).await;
                     continue;
                 }
             }
         }
         let outcome = poll_once(
             src,
-            &seen.as_btree(),
-            etag.as_deref(),
+            &feed.seen.as_btree(),
+            feed.etag.as_deref(),
             own_login.as_deref(),
-            fetcher,
+            feed_side.fetcher,
         )
         .await;
         // The server floor binds unconditionally — including on a 304
         // and on a tick whose deeper page FAILED (codex e9b8b66).
-        floor = outcome.poll_interval.or(floor);
+        feed.floor = outcome.poll_interval.or(feed.floor);
         match outcome.result {
             Ok(PollDelta::NotModified) => {
                 // Nothing new, but the floor may have moved.
-                wal.save_state(etag.as_deref(), floor);
+                wal.save_state(feed.etag.as_deref(), feed.floor, feed.established);
             }
             Ok(PollDelta::Fetched {
                 items,
@@ -1949,7 +2277,7 @@ pub(crate) async fn poll_loop<F: EventFetcher, R: LoginResolver>(
                 // against the PRE-tick cursor; pages can repeat an id
                 // within one tick, so dedupe locally.
                 {
-                    let pre = seen.as_btree();
+                    let pre = feed.seen.as_btree();
                     let presentable: std::collections::HashSet<&str> =
                         items.iter().filter_map(|c| c.feed_id.as_deref()).collect();
                     let mut recorded: std::collections::HashSet<&str> =
@@ -1959,17 +2287,17 @@ pub(crate) async fn poll_loop<F: EventFetcher, R: LoginResolver>(
                             && !presentable.contains(id.as_str())
                             && recorded.insert(id)
                         {
-                            wal.obs(Some(id), None, !established);
+                            wal.obs(Some(id), None, !feed.established);
                         }
                     }
                 }
-                seen.extend(new_ids);
-                etag = outcome.etag.or(etag);
+                feed.seen.extend(new_ids);
+                feed.etag = outcome.etag.or(feed.etag);
                 // Overrun is meaningless at the baseline tick (which
                 // pages the whole bounded feed into the cursor by
                 // design); only a DELTA poll that overran can have lost
                 // events.
-                if overrun && established {
+                if overrun && feed.established {
                     eprintln!(
                         "wait: github {} — more than {MAX_PAGES} pages of new events since the \
                          last poll; older ones may have been missed",
@@ -1983,7 +2311,7 @@ pub(crate) async fn poll_loop<F: EventFetcher, R: LoginResolver>(
                 // baseline seeds its key gate, delta polls offer
                 // through it (a webhook that already emitted an action
                 // suppresses the poll's copy, and vice versa).
-                if established {
+                if feed.established {
                     for c in items {
                         if !coordinator.offer(c) {
                             return; // wait gone
@@ -1992,10 +2320,10 @@ pub(crate) async fn poll_loop<F: EventFetcher, R: LoginResolver>(
                 } else if !coordinator.baseline(items) {
                     return; // wait gone
                 }
-                established = true;
+                feed.established = true;
                 // A completed tick is the durability point for the
                 // cache metadata; failed ticks touch nothing.
-                wal.save_state(etag.as_deref(), floor);
+                wal.save_state(feed.etag.as_deref(), feed.floor, feed.established);
                 wal.compact();
             }
             Err(e) => {
@@ -2011,43 +2339,93 @@ pub(crate) async fn poll_loop<F: EventFetcher, R: LoginResolver>(
         // gate) instead of waiting for the next poll. A closed relay
         // falls back to polling alone, loudly, once; polling never
         // stopped, so nothing is lost.
-        let deadline = tokio::time::Instant::now() + effective_interval(configured, floor);
-        loop {
-            let Some(inbox) = relay.as_ref() else {
-                tokio::time::sleep_until(deadline).await;
-                break;
-            };
-            tokio::select! {
-                _ = tokio::time::sleep_until(deadline) => break,
-                delivery = inbox.recv() => match delivery {
-                    Some((name, payload)) => {
-                        if let Some(c) = classify_webhook(
-                            &src.repo,
-                            &name,
-                            &payload,
-                            &src.events,
-                            own_login.as_deref(),
-                            src.include_own_actions,
-                            &src.branches,
-                        ) && !coordinator.deliver(c)
+        feed_due = tokio::time::Instant::now() + effective_interval(configured, feed.floor);
+        if !drain_relay_window(
+            feed_due,
+            &mut relay,
+            src,
+            own_login.as_deref(),
+            &mut coordinator,
+            &mut checks_only_tick,
+            last_checks_attempt,
+        )
+        .await
+        {
+            return; // wait gone
+        }
+    }
+}
+
+/// Wait out the inter-tick window, handling relay deliveries as they
+/// arrive. Returns false when the wait side is gone.
+///
+/// The relay is the LATENCY path — a delivery classifies and emits
+/// IMMEDIATELY through the same coordinator gate instead of waiting
+/// for the next poll. A closed relay falls back to polling alone,
+/// loudly, once; polling never stopped, so nothing is lost.
+///
+/// A CI cue is the exception: it carries no conclusion, so it ends the
+/// window instead of emitting, and the loop re-reads the checks.
+#[allow(clippy::too_many_arguments)]
+async fn drain_relay_window(
+    deadline: tokio::time::Instant,
+    relay: &mut Option<std::sync::Arc<RelayInbox>>,
+    src: &GithubSource,
+    own_login: Option<&str>,
+    coordinator: &mut Coordinator,
+    checks_only_tick: &mut bool,
+    last_checks_attempt: Option<tokio::time::Instant>,
+) -> bool {
+    let wants_ci = src.events.iter().any(|k| k.is_ci());
+    loop {
+        let Some(inbox) = relay.as_ref() else {
+            tokio::time::sleep_until(deadline).await;
+            return true;
+        };
+        tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => return true,
+            delivery = inbox.recv() => match delivery {
+                Some((name, payload)) => {
+                    if is_ci_cue(&name) {
+                        // Not an event to present: a cue to look. Too
+                        // soon after the last look and there is
+                        // nothing to gain — the next scheduled read
+                        // sees the same present state.
+                        if wants_ci
+                            && last_checks_attempt
+                                .is_none_or(|t| t.elapsed() >= CI_RECHECK_FLOOR)
                         {
-                            return; // wait gone
+                            *checks_only_tick = true;
+                            return true;
                         }
+                        continue;
                     }
-                    None => {
-                        // THE one fallback diagnostic (codex 4d77b83):
-                        // the supervisor records why, this line renders
-                        // it, nobody else prints.
-                        eprintln!(
-                            "wait: github {} — realtime relay ended ({}); \
-                             continuing on polling alone",
-                            src.repo,
-                            relay.as_ref().map(|i| i.reason()).unwrap_or_default()
-                        );
-                        relay = None;
+                    if let Some(c) = classify_webhook(
+                        &src.repo,
+                        &name,
+                        &payload,
+                        &src.events,
+                        own_login,
+                        src.include_own_actions,
+                        &src.branches,
+                    ) && !coordinator.deliver(c)
+                    {
+                        return false; // wait gone
                     }
-                },
-            }
+                }
+                None => {
+                    // THE one fallback diagnostic (codex 4d77b83):
+                    // the supervisor records why, this line renders
+                    // it, nobody else prints.
+                    eprintln!(
+                        "wait: github {} — realtime relay ended ({}); \
+                         continuing on polling alone",
+                        src.repo,
+                        relay.as_ref().map(|i| i.reason()).unwrap_or_default()
+                    );
+                    *relay = None;
+                }
+            },
         }
     }
 }
@@ -2055,6 +2433,7 @@ pub(crate) async fn poll_loop<F: EventFetcher, R: LoginResolver>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::github_ci;
     use std::sync::Mutex;
 
     fn src(events: &[GithubEventKind], include_own: bool) -> GithubSource {
@@ -2064,6 +2443,7 @@ mod tests {
             poll_interval: None,
             include_own_actions: include_own,
             branches: Vec::new(),
+            prs: Vec::new(),
             prompt: None,
             delivery: clank_core::agent_config::Delivery::Poll,
         }
@@ -2419,6 +2799,7 @@ mod tests {
             poll_interval: None,
             include_own_actions: true, // don't filter — assert full mapping
             branches: Vec::new(),
+            prs: Vec::new(),
             delivery: clank_core::agent_config::Delivery::Poll,
             prompt: None,
         };
@@ -3124,8 +3505,14 @@ mod tests {
         let handle = tokio::spawn(async move {
             poll_loop(
                 &src(&[GithubEventKind::IssueOpened], false),
-                &FixedLogin("me"),
-                &f,
+                FeedSide {
+                    fetcher: &f,
+                    login: &FixedLogin("me"),
+                },
+                ChecksSide {
+                    reader: &NoCi,
+                    state: None,
+                },
                 &tx,
                 Some(loop_inbox),
                 None,
@@ -3396,8 +3783,11 @@ mod tests {
         let run = tokio::spawn(async move {
             source_supervisor(
                 &s,
-                &FixedLogin("me"),
-                &f,
+                FeedSide {
+                    fetcher: &f,
+                    login: &FixedLogin("me"),
+                },
+                &NoCi,
                 &tx,
                 Some(d),
                 move || async move {
@@ -3517,8 +3907,14 @@ mod tests {
         let run = tokio::spawn(async move {
             poll_loop(
                 &s,
-                &FixedLogin("me"),
-                &fetcher,
+                FeedSide {
+                    fetcher: &fetcher,
+                    login: &FixedLogin("me"),
+                },
+                ChecksSide {
+                    reader: &NoCi,
+                    state: None,
+                },
                 &tx,
                 None,
                 None,
@@ -3638,6 +4034,22 @@ mod tests {
     }
 
     // ── session auth: sharing + uniform 401 recovery ──────────
+
+    /// A CI reader that finds nothing — the horizon stays cold and
+    /// the feed's own tests are untouched by it.
+    struct NoCi;
+    impl CiReader for NoCi {
+        async fn read(
+            &self,
+        ) -> anyhow::Result<
+            Vec<(
+                crate::cli::github_ci::PrHead,
+                crate::cli::github_ci::CiRollup,
+            )>,
+        > {
+            Ok(Vec::new())
+        }
+    }
 
     struct ScriptHttp {
         /// Scripted statuses per request, in order; exhausted → 200.
@@ -3996,8 +4408,14 @@ mod tests {
         let handle = tokio::spawn(async move {
             poll_loop(
                 &src(&[GithubEventKind::IssueOpened], false),
-                &FixedLogin("me"),
-                &f,
+                FeedSide {
+                    fetcher: &f,
+                    login: &FixedLogin("me"),
+                },
+                ChecksSide {
+                    reader: &NoCi,
+                    state: None,
+                },
                 &tx,
                 None,
                 None,
@@ -4018,6 +4436,1442 @@ mod tests {
         // (codex a989653 — don't leave the JoinHandle to time out).
         handle.abort();
         let _ = handle.await;
+    }
+
+    /// A CI reader scripted tick by tick; exhausted → the last
+    /// result repeats, which is what an unchanged build looks like.
+    struct ScriptCi(
+        Mutex<std::collections::VecDeque<Vec<(github_ci::PrHead, github_ci::CiRollup)>>>,
+    );
+    impl ScriptCi {
+        fn new(rounds: Vec<Vec<(github_ci::PrHead, github_ci::CiRollup)>>) -> Self {
+            Self(Mutex::new(rounds.into()))
+        }
+    }
+    impl CiReader for ScriptCi {
+        async fn read(&self) -> anyhow::Result<Vec<(github_ci::PrHead, github_ci::CiRollup)>> {
+            let mut q = self.0.lock().unwrap();
+            let next = if q.len() > 1 {
+                q.pop_front().unwrap()
+            } else {
+                q.front().cloned().unwrap_or_default()
+            };
+            Ok(next)
+        }
+    }
+
+    /// A reader that always fails — the CI horizon is broken, the
+    /// feed's is not.
+    struct DeadCi;
+    impl CiReader for DeadCi {
+        async fn read(&self) -> anyhow::Result<Vec<(github_ci::PrHead, github_ci::CiRollup)>> {
+            anyhow::bail!("checks unreachable")
+        }
+    }
+
+    fn red(number: u64, head: &str, job: &str) -> (github_ci::PrHead, github_ci::CiRollup) {
+        (
+            github_ci::PrHead {
+                number,
+                head: head.into(),
+            },
+            github_ci::CiRollup::Failed {
+                failing: vec![job.into()],
+            },
+        )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_build_that_was_already_red_is_not_news_but_a_new_one_is() {
+        // The first read is the state of the world (seeded, silent).
+        // The same conclusion on the same head stays silent however
+        // many ticks pass. A new head that fails is a wake.
+        let ci = ScriptCi::new(vec![
+            vec![red(7, "head1", "fmt")],
+            vec![red(7, "head1", "fmt")],
+            vec![red(7, "head2", "test")],
+        ]);
+        let f = ScriptFetcher::new(vec![Box::new(|_p, _e| Ok(ok(vec![], None, None)))]);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = tokio::spawn(async move {
+            poll_loop(
+                &src(&[GithubEventKind::CiFailed], true),
+                FeedSide {
+                    fetcher: &f,
+                    login: &FixedLogin("me"),
+                },
+                ChecksSide {
+                    reader: &ci,
+                    state: None,
+                },
+                &tx,
+                None,
+                None,
+                Default::default(),
+            )
+            .await;
+        });
+        let item = tokio::time::timeout(Duration::from_secs(300), rx.recv())
+            .await
+            .expect("the new head's failure wakes")
+            .expect("channel open");
+        let WaitItem::GithubEvent {
+            event,
+            number,
+            title,
+            ..
+        } = item
+        else {
+            panic!("a github event");
+        };
+        assert_eq!(event, "ci_failed");
+        assert_eq!(number, Some(7));
+        assert_eq!(
+            title.as_deref(),
+            Some("CI failed: test"),
+            "the wake is the NEW head's failure, not the seeded one",
+        );
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_broken_checks_read_does_not_stop_the_feed() {
+        // Separate horizons: the CI read failing every tick must not
+        // cost the feed its baseline or its wakes.
+        let f = ScriptFetcher::new(vec![
+            Box::new(|_p, _e| Ok(ok(vec![issue("1", 1)], None, None))),
+            Box::new(|_p, _e| Ok(ok(vec![], None, None))),
+            Box::new(|_p, _e| Ok(ok(vec![issue("2", 2), issue("1", 1)], None, None))),
+        ]);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = tokio::spawn(async move {
+            poll_loop(
+                &src(
+                    &[GithubEventKind::IssueOpened, GithubEventKind::CiFailed],
+                    true,
+                ),
+                FeedSide {
+                    fetcher: &f,
+                    login: &FixedLogin("me"),
+                },
+                ChecksSide {
+                    reader: &DeadCi,
+                    state: None,
+                },
+                &tx,
+                None,
+                None,
+                Default::default(),
+            )
+            .await;
+        });
+        let item = tokio::time::timeout(Duration::from_secs(300), rx.recv())
+            .await
+            .expect("the feed still wakes")
+            .expect("channel open");
+        match item {
+            WaitItem::GithubEvent { number, .. } => assert_eq!(number, Some(2)),
+            other => panic!("expected the feed's event, got {other:?}"),
+        }
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_broken_feed_does_not_stop_the_checks() {
+        // The other half of the separate horizons: a feed that errors
+        // every tick must not hold back a build's wake. The feed's
+        // baseline never establishes here — the CI horizon is its own.
+        struct DeadFeed;
+        impl EventFetcher for DeadFeed {
+            async fn fetch(&self, _page: u32, _etag: Option<String>) -> anyhow::Result<GhResponse> {
+                anyhow::bail!("events unreachable")
+            }
+        }
+        let ci = ScriptCi::new(vec![
+            vec![red(7, "head1", "fmt")],
+            vec![red(7, "head2", "test")],
+        ]);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = tokio::spawn(async move {
+            poll_loop(
+                &src(
+                    &[GithubEventKind::IssueOpened, GithubEventKind::CiFailed],
+                    true,
+                ),
+                FeedSide {
+                    fetcher: &DeadFeed,
+                    login: &FixedLogin("me"),
+                },
+                ChecksSide {
+                    reader: &ci,
+                    state: None,
+                },
+                &tx,
+                None,
+                None,
+                Default::default(),
+            )
+            .await;
+        });
+        let item = tokio::time::timeout(Duration::from_secs(300), rx.recv())
+            .await
+            .expect("the build's wake does not wait on the feed")
+            .expect("channel open");
+        let WaitItem::GithubEvent { event, title, .. } = item else {
+            panic!("a github event");
+        };
+        assert_eq!(event, "ci_failed");
+        assert_eq!(title.as_deref(), Some("CI failed: test"));
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_build_wakes_even_while_the_own_action_filter_is_down() {
+        // The gate exists so the agent's own actions cannot wake it.
+        // A conclusion is nobody's action, so holding it behind a
+        // login that will not resolve would keep a red build silent
+        // for a reason that does not apply to it.
+        struct NoLogin;
+        impl LoginResolver for NoLogin {
+            async fn resolve(&self) -> anyhow::Result<String> {
+                anyhow::bail!("gh down")
+            }
+        }
+        let ci = ScriptCi::new(vec![
+            vec![red(7, "head1", "fmt")],
+            vec![red(7, "head2", "test")],
+        ]);
+        let f = ScriptFetcher::new(vec![]);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = tokio::spawn(async move {
+            poll_loop(
+                // include_own_actions = false: the gate is armed.
+                &src(&[GithubEventKind::CiFailed], false),
+                FeedSide {
+                    fetcher: &f,
+                    login: &NoLogin,
+                },
+                ChecksSide {
+                    reader: &ci,
+                    state: None,
+                },
+                &tx,
+                None,
+                None,
+                Default::default(),
+            )
+            .await;
+        });
+        let item = tokio::time::timeout(Duration::from_secs(300), rx.recv())
+            .await
+            .expect("a conclusion does not wait on the actor filter")
+            .expect("channel open");
+        let WaitItem::GithubEvent { event, actor, .. } = item else {
+            panic!("a github event");
+        };
+        assert_eq!(event, "ci_failed");
+        assert_eq!(actor, None, "nothing to filter in the first place");
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    /// codex 7c132ec, probe 1: a log holding only CI rows must not
+    /// mark the FEED established. It did, so the feed's first real
+    /// fetch emitted its existing history instead of baselining it.
+    #[tokio::test(start_paused = true)]
+    async fn one_halfs_history_does_not_establish_the_other() {
+        let dir = wal_tempdir();
+        let s1 = src(
+            &[GithubEventKind::IssueOpened, GithubEventKind::CiFailed],
+            true,
+        );
+        // Arm 1: the events endpoint is down; the checks read works.
+        struct DeadFeed;
+        impl EventFetcher for DeadFeed {
+            async fn fetch(&self, _page: u32, _etag: Option<String>) -> anyhow::Result<GhResponse> {
+                anyhow::bail!("events unreachable")
+            }
+        }
+        let ci = ScriptCi::new(vec![vec![red(7, "head1", "fmt")]]);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let d = dir.clone();
+        let run1 = tokio::spawn(async move {
+            poll_loop(
+                &s1,
+                FeedSide {
+                    fetcher: &DeadFeed,
+                    login: &FixedLogin("me"),
+                },
+                ChecksSide {
+                    reader: &ci,
+                    state: Some(d.join("t.ci.json")),
+                },
+                &tx,
+                None,
+                Some(open_log(&d)),
+                Default::default(),
+            )
+            .await;
+        });
+        tokio::time::sleep(Duration::from_secs(120)).await;
+        assert!(rx.try_recv().is_err(), "the first checks read is seeded");
+        run1.abort();
+        let _ = run1.await;
+
+        // Arm 2: the feed comes back and returns history it has never
+        // shown us. That is a BASELINE, not a backlog of wakes.
+        let f = ScriptFetcher::new(vec![Box::new(|_p, _e| {
+            Ok(ok(vec![issue("1", 1), issue("2", 2)], None, None))
+        })]);
+        let ci2 = ScriptCi::new(vec![vec![red(7, "head1", "fmt")]]);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let s2 = src(
+            &[GithubEventKind::IssueOpened, GithubEventKind::CiFailed],
+            true,
+        );
+        let d = dir.clone();
+        let run2 = tokio::spawn(async move {
+            poll_loop(
+                &s2,
+                FeedSide {
+                    fetcher: &f,
+                    login: &FixedLogin("me"),
+                },
+                ChecksSide {
+                    reader: &ci2,
+                    state: Some(d.join("t.ci.json")),
+                },
+                &tx,
+                None,
+                Some(open_log(&d)),
+                Default::default(),
+            )
+            .await;
+        });
+        tokio::time::sleep(Duration::from_secs(120)).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "the feed's own history is baselined, not replayed as wakes",
+        );
+        run2.abort();
+        let _ = run2.await;
+    }
+
+    /// The inverse: a feed-only log must not mark CI established,
+    /// which would swallow the first conclusion it ever reads.
+    #[tokio::test(start_paused = true)]
+    async fn a_feed_only_log_still_seeds_the_first_checks_read() {
+        let dir = wal_tempdir();
+        let f = ScriptFetcher::new(vec![Box::new(|_p, _e| {
+            Ok(ok(vec![issue("1", 1)], None, None))
+        })]);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let s1 = src(&[GithubEventKind::IssueOpened], true);
+        let d = dir.clone();
+        let run1 = tokio::spawn(async move {
+            poll_loop(
+                &s1,
+                FeedSide {
+                    fetcher: &f,
+                    login: &FixedLogin("me"),
+                },
+                ChecksSide {
+                    reader: &NoCi,
+                    state: Some(d.join("t.ci.json")),
+                },
+                &tx,
+                None,
+                Some(open_log(&d)),
+                Default::default(),
+            )
+            .await;
+        });
+        tokio::time::sleep(Duration::from_secs(120)).await;
+        run1.abort();
+        let _ = run1.await;
+
+        // Arm 2 adds a CI kind: its first read is the state of the
+        // world, so a build that was ALREADY red says nothing, and
+        // the next one that changes does.
+        let ci = ScriptCi::new(vec![
+            vec![red(7, "head1", "fmt")],
+            vec![red(7, "head2", "test")],
+        ]);
+        let f2 = ScriptFetcher::new(vec![]);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let s2 = src(
+            &[GithubEventKind::IssueOpened, GithubEventKind::CiFailed],
+            true,
+        );
+        let d = dir.clone();
+        let run2 = tokio::spawn(async move {
+            poll_loop(
+                &s2,
+                FeedSide {
+                    fetcher: &f2,
+                    login: &FixedLogin("me"),
+                },
+                ChecksSide {
+                    reader: &ci,
+                    state: Some(d.join("t.ci.json")),
+                },
+                &tx,
+                None,
+                Some(open_log(&d)),
+                Default::default(),
+            )
+            .await;
+        });
+        let item = tokio::time::timeout(Duration::from_secs(300), rx.recv())
+            .await
+            .expect("the CHANGED conclusion wakes")
+            .expect("open");
+        let WaitItem::GithubEvent { title, .. } = item else {
+            panic!("a github event");
+        };
+        assert_eq!(
+            title.as_deref(),
+            Some("CI failed: test"),
+            "head1's failure was the baseline, head2's is the news",
+        );
+        run2.abort();
+        let _ = run2.await;
+    }
+
+    /// codex 7c132ec, probe 2: the unchanged conclusion's memory must
+    /// outlive a restart. It used to live in the shared key horizon,
+    /// a recency window over EVENTS — but a state read re-observes
+    /// the same conclusion forever, so eviction woke the same build
+    /// again.
+    #[tokio::test(start_paused = true)]
+    async fn an_unchanged_build_stays_quiet_across_a_restart() {
+        let dir = wal_tempdir();
+        for arm in 0..2 {
+            let ci = ScriptCi::new(vec![vec![red(7, "head1", "fmt")]]);
+            let f = ScriptFetcher::new(vec![]);
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let s = src(&[GithubEventKind::CiFailed], true);
+            let d = dir.clone();
+            let handle = tokio::spawn(async move {
+                poll_loop(
+                    &s,
+                    FeedSide {
+                        fetcher: &f,
+                        login: &FixedLogin("me"),
+                    },
+                    ChecksSide {
+                        reader: &ci,
+                        state: None,
+                    },
+                    &tx,
+                    None,
+                    Some(open_log(&d)),
+                    Default::default(),
+                )
+                .await;
+            });
+            tokio::time::sleep(Duration::from_secs(600)).await;
+            assert!(
+                rx.try_recv().is_err(),
+                "arm {arm}: the same red build on the same head is not news",
+            );
+            handle.abort();
+            let _ = handle.await;
+            // Compaction rewrites the log; the CI memory is not in it.
+            open_log(&dir).maybe_compact().unwrap();
+        }
+    }
+
+    /// codex ae48e92 [P1]: a state file written before any of this
+    /// existed must still restore feed catch-up. It does not name the
+    /// feed's horizon at all any more — the WAL's own feed ids are
+    /// the evidence — so a legacy file is simply a file.
+    #[tokio::test(start_paused = true)]
+    async fn a_state_file_from_before_this_plan_keeps_catch_up() {
+        let dir = wal_tempdir();
+        let f = ScriptFetcher::new(vec![Box::new(|_p, _e| {
+            Ok(ok(vec![issue("1", 1)], None, None))
+        })]);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let s1 = src(&[GithubEventKind::IssueOpened], true);
+        let d = dir.clone();
+        let run1 = tokio::spawn(async move {
+            poll_loop(
+                &s1,
+                FeedSide {
+                    fetcher: &f,
+                    login: &FixedLogin("me"),
+                },
+                ChecksSide {
+                    reader: &NoCi,
+                    state: Some(d.join("t.ci.json")),
+                },
+                &tx,
+                None,
+                Some(open_log(&d)),
+                Default::default(),
+            )
+            .await;
+        });
+        tokio::time::sleep(Duration::from_secs(120)).await;
+        run1.abort();
+        let _ = run1.await;
+
+        // Rewrite the cache the way an older clank wrote it: etag,
+        // floor, saved_at, and nothing else.
+        std::fs::write(
+            dir.join("t.state.json"),
+            r#"{"poll_interval_floor":60,"saved_at":1}"#,
+        )
+        .unwrap();
+
+        let f = ScriptFetcher::new(vec![Box::new(|_p, _e| {
+            Ok(ok(vec![issue("2", 2), issue("1", 1)], None, None))
+        })]);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let s2 = src(&[GithubEventKind::IssueOpened], true);
+        let d = dir.clone();
+        let run2 = tokio::spawn(async move {
+            poll_loop(
+                &s2,
+                FeedSide {
+                    fetcher: &f,
+                    login: &FixedLogin("me"),
+                },
+                ChecksSide {
+                    reader: &NoCi,
+                    state: Some(d.join("t.ci.json")),
+                },
+                &tx,
+                None,
+                Some(open_log(&d)),
+                Default::default(),
+            )
+            .await;
+        });
+        let woke = tokio::time::timeout(Duration::from_secs(300), rx.recv())
+            .await
+            .expect("the event missed while away still wakes after an upgrade")
+            .expect("open");
+        let WaitItem::GithubEvent { number, .. } = woke else {
+            panic!("a github event");
+        };
+        assert_eq!(number, Some(2));
+        run2.abort();
+        let _ = run2.await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_finished_suite_makes_the_checks_be_read_now() {
+        // The cue carries no conclusion — one App's suite is not the
+        // PR's result — so it ends the window and the loop re-reads.
+        // Same read as the poll's, which is what stops a realtime
+        // watch and a polling watch from disagreeing.
+        let ci = ScriptCi::new(vec![
+            vec![red(7, "head1", "fmt")],
+            vec![red(7, "head2", "test")],
+        ]);
+        // One tick's worth of feed, then nothing: if the wake waited
+        // for the next scheduled read it would take the poll cadence.
+        let f = std::sync::Arc::new(ScriptFetcher::new(vec![]));
+        let fetches = f.clone();
+        let inbox = std::sync::Arc::new(RelayInbox::new());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let s = src(&[GithubEventKind::CiFailed], true);
+        let loop_inbox = inbox.clone();
+        let handle = tokio::spawn(async move {
+            poll_loop(
+                &s,
+                FeedSide {
+                    fetcher: &*f,
+                    login: &FixedLogin("me"),
+                },
+                ChecksSide {
+                    reader: &ci,
+                    state: None,
+                },
+                &tx,
+                Some(loop_inbox),
+                None,
+                Default::default(),
+            )
+            .await;
+        });
+        // Let the first read establish, then a suite finishes
+        // mid-window. The poll cadence is 60s, so a wake that only
+        // arrived on the next scheduled tick would land at 60s — the
+        // clock is what distinguishes "the cue did it" from "the
+        // poll would have anyway".
+        tokio::time::sleep(Duration::from_secs(20)).await;
+        let cue_at = tokio::time::Instant::now();
+        inbox.push((
+            "check_suite".to_string(),
+            serde_json::json!({ "action": "completed" }),
+        ));
+        let item = tokio::time::timeout(Duration::from_secs(300), rx.recv())
+            .await
+            .expect("the cue makes the conclusion be read")
+            .expect("open");
+        assert!(
+            cue_at.elapsed() < Duration::from_secs(30),
+            "the wake followed the cue, not the next scheduled read: {:?}",
+            cue_at.elapsed(),
+        );
+        // And it cost the feed nothing: the checks moved, the feed
+        // did not, and its cadence is the server's to set.
+        assert_eq!(
+            fetches.calls.lock().unwrap().len(),
+            1,
+            "only the first tick's fetch — a cue does not re-poll the events feed",
+        );
+        let WaitItem::GithubEvent { event, title, .. } = item else {
+            panic!("a github event");
+        };
+        assert_eq!(event, "ci_failed");
+        assert_eq!(title.as_deref(), Some("CI failed: test"));
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_watch_with_no_ci_kinds_ignores_the_cue() {
+        // check_suite is only subscribed for a CI watch, but a relay
+        // can deliver what it likes: a watch that did not ask for
+        // conclusions must not spend requests on them.
+        struct CountingCi(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+        impl CiReader for CountingCi {
+            async fn read(&self) -> anyhow::Result<Vec<(github_ci::PrHead, github_ci::CiRollup)>> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(Vec::new())
+            }
+        }
+        let reads: std::sync::Arc<std::sync::atomic::AtomicUsize> = Default::default();
+        let f = std::sync::Arc::new(ScriptFetcher::new(vec![]));
+        let calls = f.clone();
+        let inbox = std::sync::Arc::new(RelayInbox::new());
+        inbox.push((
+            "check_suite".to_string(),
+            serde_json::json!({ "action": "completed" }),
+        ));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let s = src(&[GithubEventKind::IssueOpened], true);
+        let loop_inbox = inbox.clone();
+        let counter = reads.clone();
+        let handle = tokio::spawn(async move {
+            poll_loop(
+                &s,
+                FeedSide {
+                    fetcher: &*f,
+                    login: &FixedLogin("me"),
+                },
+                ChecksSide {
+                    reader: &CountingCi(counter),
+                    state: None,
+                },
+                &tx,
+                Some(loop_inbox),
+                None,
+                Default::default(),
+            )
+            .await;
+        });
+        tokio::time::sleep(Duration::from_secs(600)).await;
+        handle.abort();
+        let _ = handle.await;
+        assert_eq!(
+            reads.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no ci kind configured, so nothing reads the checks",
+        );
+        // Ten windows at the 60s cadence: the cue must not have
+        // swallowed one of them by ending a window it has no business
+        // ending.
+        assert!(
+            calls.calls.lock().unwrap().len() >= 10,
+            "the feed kept its own cadence: {} fetches",
+            calls.calls.lock().unwrap().len(),
+        );
+    }
+
+    /// codex 9bfe171: a cue must not postpone the FEED. Cues spaced
+    /// between the checks floor and the feed interval used to reset
+    /// the deadline every time, so the feed never polled again — and
+    /// the feed is the completeness backstop for everything the relay
+    /// drops.
+    #[tokio::test(start_paused = true)]
+    async fn a_stream_of_cues_does_not_starve_the_feed() {
+        struct QuietCi;
+        impl CiReader for QuietCi {
+            async fn read(&self) -> anyhow::Result<Vec<(github_ci::PrHead, github_ci::CiRollup)>> {
+                Ok(Vec::new())
+            }
+        }
+        let f = std::sync::Arc::new(ScriptFetcher::new(vec![]));
+        let fetches = f.clone();
+        let inbox = std::sync::Arc::new(RelayInbox::new());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let s = src(
+            &[GithubEventKind::IssueOpened, GithubEventKind::CiFailed],
+            true,
+        );
+        let loop_inbox = inbox.clone();
+        let handle = tokio::spawn(async move {
+            poll_loop(
+                &s,
+                FeedSide {
+                    fetcher: &*f,
+                    login: &FixedLogin("me"),
+                },
+                ChecksSide {
+                    reader: &QuietCi,
+                    state: None,
+                },
+                &tx,
+                Some(loop_inbox),
+                None,
+                Default::default(),
+            )
+            .await;
+        });
+        // A cue every 20s for 140s: past the 15s checks floor, inside
+        // the 60s feed interval. The feed is due at 0, 60 and 120.
+        for _ in 0..7 {
+            inbox.push((
+                "check_suite".to_string(),
+                serde_json::json!({ "action": "completed" }),
+            ));
+            tokio::time::sleep(Duration::from_secs(20)).await;
+        }
+        handle.abort();
+        let _ = handle.await;
+        assert!(
+            fetches.calls.lock().unwrap().len() >= 3,
+            "the feed kept its own schedule through the cues: {} fetches",
+            fetches.calls.lock().unwrap().len(),
+        );
+    }
+
+    /// codex 9bfe171: a FAILED read has to consume the cooldown too.
+    /// Recording only successes let every queued cue retry a broken
+    /// endpoint immediately — a storm exactly when it costs most.
+    #[tokio::test(start_paused = true)]
+    async fn a_failing_checks_endpoint_is_still_rate_limited() {
+        struct CountingDeadCi(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+        impl CiReader for CountingDeadCi {
+            async fn read(&self) -> anyhow::Result<Vec<(github_ci::PrHead, github_ci::CiRollup)>> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                anyhow::bail!("checks unreachable")
+            }
+        }
+        let attempts: std::sync::Arc<std::sync::atomic::AtomicUsize> = Default::default();
+        let f = ScriptFetcher::new(vec![]);
+        let inbox = std::sync::Arc::new(RelayInbox::new());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let s = src(&[GithubEventKind::CiFailed], true);
+        let loop_inbox = inbox.clone();
+        let counter = attempts.clone();
+        let handle = tokio::spawn(async move {
+            poll_loop(
+                &s,
+                FeedSide {
+                    fetcher: &f,
+                    login: &FixedLogin("me"),
+                },
+                ChecksSide {
+                    reader: &CountingDeadCi(counter),
+                    state: None,
+                },
+                &tx,
+                Some(loop_inbox),
+                None,
+                Default::default(),
+            )
+            .await;
+        });
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let before = attempts.load(std::sync::atomic::Ordering::SeqCst);
+        for _ in 0..10 {
+            inbox.push((
+                "check_suite".to_string(),
+                serde_json::json!({ "action": "completed" }),
+            ));
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let after = attempts.load(std::sync::atomic::Ordering::SeqCst);
+        handle.abort();
+        let _ = handle.await;
+        assert!(
+            after - before <= 1,
+            "a failing endpoint gets the same floor as a working one: {before} → {after}",
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cues_inside_the_floor_do_not_each_cost_a_read() {
+        // A busy PR finishes several suites at once. Re-reading for
+        // every one of them is a round of requests per app per push,
+        // and an unscoped watch pays it for every open PR.
+        struct CountingCi(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+        impl CiReader for CountingCi {
+            async fn read(&self) -> anyhow::Result<Vec<(github_ci::PrHead, github_ci::CiRollup)>> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(vec![red(7, "head1", "fmt")])
+            }
+        }
+        let reads: std::sync::Arc<std::sync::atomic::AtomicUsize> = Default::default();
+        let f = ScriptFetcher::new(vec![]);
+        let inbox = std::sync::Arc::new(RelayInbox::new());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let s = src(&[GithubEventKind::CiFailed], true);
+        let loop_inbox = inbox.clone();
+        let counter = reads.clone();
+        let handle = tokio::spawn(async move {
+            poll_loop(
+                &s,
+                FeedSide {
+                    fetcher: &f,
+                    login: &FixedLogin("me"),
+                },
+                ChecksSide {
+                    reader: &CountingCi(counter),
+                    state: None,
+                },
+                &tx,
+                Some(loop_inbox),
+                None,
+                Default::default(),
+            )
+            .await;
+        });
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let before = reads.load(std::sync::atomic::Ordering::SeqCst);
+        for _ in 0..10 {
+            inbox.push((
+                "check_suite".to_string(),
+                serde_json::json!({ "action": "completed" }),
+            ));
+        }
+        // Well inside the floor.
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let after = reads.load(std::sync::atomic::Ordering::SeqCst);
+        handle.abort();
+        let _ = handle.await;
+        assert!(
+            after - before <= 1,
+            "ten cues in five seconds bought at most one read, not ten: {before} → {after}",
+        );
+    }
+
+    /// codex 4b6035b: a feed whose baseline saw NO events, followed
+    /// by a relay delivery, leaves a WAL with rows but no feed ids
+    /// and a saved ETag. That is an established feed, and reading
+    /// "no feed ids" as "never baselined" cost it twice: the restored
+    /// ETag 304s forever so the baseline never completes, and a
+    /// genuinely new issue is recorded as history instead of
+    /// delivered.
+    #[tokio::test(start_paused = true)]
+    async fn an_empty_baseline_and_a_relay_row_is_an_established_feed() {
+        let dir = wal_tempdir();
+        // Arm 1: the feed baselines on an EMPTY feed and saves an
+        // ETag; a webhook arrives and is emitted through the gate.
+        let inbox = std::sync::Arc::new(RelayInbox::new());
+        inbox.push((
+            "issues".to_string(),
+            serde_json::json!({
+                "action": "opened",
+                "issue": { "number": 4, "title": "t", "html_url": "u" },
+                "sender": { "login": "them" }
+            }),
+        ));
+        let f = ScriptFetcher::new(vec![Box::new(|_p, _e| {
+            Ok(ok(vec![], Some("\"e1\""), None))
+        })]);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let s1 = src(&[GithubEventKind::IssueOpened], true);
+        let d = dir.clone();
+        let loop_inbox = inbox.clone();
+        let run1 = tokio::spawn(async move {
+            poll_loop(
+                &s1,
+                FeedSide {
+                    fetcher: &f,
+                    login: &FixedLogin("me"),
+                },
+                ChecksSide {
+                    reader: &NoCi,
+                    state: Some(d.join("t.ci.json")),
+                },
+                &tx,
+                Some(loop_inbox),
+                Some(open_log(&d)),
+                Default::default(),
+            )
+            .await;
+        });
+        let relayed = tokio::time::timeout(Duration::from_secs(300), rx.recv())
+            .await
+            .expect("the webhook emits once the empty baseline is done")
+            .expect("open");
+        let WaitItem::GithubEvent { number, .. } = relayed else {
+            panic!("a github event");
+        };
+        assert_eq!(number, Some(4));
+        run1.abort();
+        let _ = run1.await;
+        // Ack it, so the backlog cannot be what wakes arm 2.
+        {
+            let mut log = open_log(&dir);
+            let seqs: Vec<u64> = log
+                .read_rows()
+                .unwrap()
+                .map(|r| r.rows.iter().map(|row| row.seq).collect())
+                .unwrap_or_default();
+            for seq in seqs {
+                log.append_ack(seq).unwrap();
+            }
+        }
+
+        // Arm 2: a new issue, created after that baseline. It is
+        // CATCH-UP, not history.
+        let f = ScriptFetcher::new(vec![Box::new(|_p, _e| {
+            Ok(ok(vec![issue("9", 9)], None, None))
+        })]);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let s2 = src(&[GithubEventKind::IssueOpened], true);
+        let d = dir.clone();
+        let run2 = tokio::spawn(async move {
+            poll_loop(
+                &s2,
+                FeedSide {
+                    fetcher: &f,
+                    login: &FixedLogin("me"),
+                },
+                ChecksSide {
+                    reader: &NoCi,
+                    state: Some(d.join("t.ci.json")),
+                },
+                &tx,
+                None,
+                Some(open_log(&d)),
+                Default::default(),
+            )
+            .await;
+        });
+        let woke = tokio::time::timeout(Duration::from_secs(300), rx.recv())
+            .await
+            .expect("an event after an empty baseline is delivered, not re-baselined")
+            .expect("open");
+        let WaitItem::GithubEvent { number, .. } = woke else {
+            panic!("a github event");
+        };
+        assert_eq!(number, Some(9));
+        run2.abort();
+        let _ = run2.await;
+    }
+
+    /// The purest form of codex 4b6035b: a feed that baselined on an
+    /// empty feed and wrote NOTHING at all. No rows, so no evidence —
+    /// the recorded fact is the only thing that can say it happened,
+    /// and without it the next arm re-baselines and swallows the
+    /// event that arrived in between.
+    #[tokio::test(start_paused = true)]
+    async fn an_empty_baseline_that_wrote_nothing_is_still_a_baseline() {
+        let dir = wal_tempdir();
+        let f = ScriptFetcher::new(vec![Box::new(|_p, _e| Ok(ok(vec![], None, None)))]);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let s1 = src(&[GithubEventKind::IssueOpened], true);
+        let d = dir.clone();
+        let run1 = tokio::spawn(async move {
+            poll_loop(
+                &s1,
+                FeedSide {
+                    fetcher: &f,
+                    login: &FixedLogin("me"),
+                },
+                ChecksSide {
+                    reader: &NoCi,
+                    state: Some(d.join("t.ci.json")),
+                },
+                &tx,
+                None,
+                Some(open_log(&d)),
+                Default::default(),
+            )
+            .await;
+        });
+        tokio::time::sleep(Duration::from_secs(120)).await;
+        run1.abort();
+        let _ = run1.await;
+
+        let f = ScriptFetcher::new(vec![Box::new(|_p, _e| {
+            Ok(ok(vec![issue("9", 9)], None, None))
+        })]);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let s2 = src(&[GithubEventKind::IssueOpened], true);
+        let d = dir.clone();
+        let run2 = tokio::spawn(async move {
+            poll_loop(
+                &s2,
+                FeedSide {
+                    fetcher: &f,
+                    login: &FixedLogin("me"),
+                },
+                ChecksSide {
+                    reader: &NoCi,
+                    state: Some(d.join("t.ci.json")),
+                },
+                &tx,
+                None,
+                Some(open_log(&d)),
+                Default::default(),
+            )
+            .await;
+        });
+        let woke = tokio::time::timeout(Duration::from_secs(300), rx.recv())
+            .await
+            .expect("the event that arrived after an empty baseline is catch-up")
+            .expect("open");
+        let WaitItem::GithubEvent { number, .. } = woke else {
+            panic!("a github event");
+        };
+        assert_eq!(number, Some(9));
+        run2.abort();
+        let _ = run2.await;
+    }
+
+    /// The same state, but written by a clank that had no such field:
+    /// only the WAL can answer, and a relay row is the feed's row.
+    #[tokio::test(start_paused = true)]
+    async fn a_legacy_relay_only_log_is_an_established_feed() {
+        let dir = wal_tempdir();
+        // A relay-delivered issue, emitted and acked, is all the log
+        // holds — no feed ids at all.
+        {
+            let mut log = open_log(&dir);
+            let item = WaitItem::GithubEvent {
+                repo: "o/r".into(),
+                event: "issue_opened".into(),
+                detail: None,
+                number: Some(4),
+                title: None,
+                actor: None,
+                url: None,
+                instructions: None,
+                content: None,
+            };
+            log.append_inbox(
+                crate::cli::github_event_log::Transport::Relay,
+                None,
+                Some("issue_opened#4"),
+                None,
+                &item,
+            )
+            .unwrap();
+            let seqs: Vec<u64> = log
+                .read_rows()
+                .unwrap()
+                .map(|r| r.rows.iter().map(|row| row.seq).collect())
+                .unwrap_or_default();
+            for seq in seqs {
+                log.append_ack(seq).unwrap();
+            }
+        }
+        // …beside a cache file from before the field existed.
+        std::fs::write(
+            dir.join("t.state.json"),
+            r#"{"etag":"W/"e1"","saved_at":1}"#,
+        )
+        .unwrap();
+
+        let f = ScriptFetcher::new(vec![Box::new(|_p, _e| {
+            Ok(ok(vec![issue("9", 9)], None, None))
+        })]);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let s = src(&[GithubEventKind::IssueOpened], true);
+        let d = dir.clone();
+        let handle = tokio::spawn(async move {
+            poll_loop(
+                &s,
+                FeedSide {
+                    fetcher: &f,
+                    login: &FixedLogin("me"),
+                },
+                ChecksSide {
+                    reader: &NoCi,
+                    state: Some(d.join("t.ci.json")),
+                },
+                &tx,
+                None,
+                Some(open_log(&d)),
+                Default::default(),
+            )
+            .await;
+        });
+        let woke = tokio::time::timeout(Duration::from_secs(300), rx.recv())
+            .await
+            .expect("an upgrade from a relay-only log keeps its catch-up")
+            .expect("open");
+        let WaitItem::GithubEvent { number, .. } = woke else {
+            panic!("a github event");
+        };
+        assert_eq!(number, Some(9));
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    /// codex ae48e92 [P2]: a log holding only checks rows must not
+    /// open the RELAY's gate. That gate is the feed's statement that
+    /// it has a horizon; without one, a queued delivery would emit
+    /// history nobody had baselined.
+    #[tokio::test(start_paused = true)]
+    async fn a_checks_only_log_does_not_release_a_queued_webhook() {
+        struct DeadFeed;
+        impl EventFetcher for DeadFeed {
+            async fn fetch(&self, _page: u32, _etag: Option<String>) -> anyhow::Result<GhResponse> {
+                anyhow::bail!("events unreachable")
+            }
+        }
+        let dir = wal_tempdir();
+        // Arm 1: only the checks read works, so the log holds only
+        // its rows.
+        let ci = ScriptCi::new(vec![
+            vec![red(7, "head1", "fmt")],
+            vec![red(7, "head2", "test")],
+        ]);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let s1 = src(
+            &[GithubEventKind::IssueOpened, GithubEventKind::CiFailed],
+            true,
+        );
+        let d = dir.clone();
+        let run1 = tokio::spawn(async move {
+            poll_loop(
+                &s1,
+                FeedSide {
+                    fetcher: &DeadFeed,
+                    login: &FixedLogin("me"),
+                },
+                ChecksSide {
+                    reader: &ci,
+                    state: Some(d.join("t.ci.json")),
+                },
+                &tx,
+                None,
+                Some(open_log(&d)),
+                Default::default(),
+            )
+            .await;
+        });
+        let _ = tokio::time::timeout(Duration::from_secs(300), rx.recv()).await;
+        run1.abort();
+        let _ = run1.await;
+
+        // Arm 2: the feed is still down and an issues webhook is
+        // waiting. It must stay buffered.
+        let inbox = std::sync::Arc::new(RelayInbox::new());
+        inbox.push((
+            "issues".to_string(),
+            serde_json::json!({
+                "action": "opened",
+                "issue": { "number": 9, "title": "t", "html_url": "u" },
+                "sender": { "login": "them" }
+            }),
+        ));
+        let ci2 = ScriptCi::new(vec![vec![red(7, "head2", "test")]]);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let s2 = src(
+            &[GithubEventKind::IssueOpened, GithubEventKind::CiFailed],
+            true,
+        );
+        let d = dir.clone();
+        let loop_inbox = inbox.clone();
+        let run2 = tokio::spawn(async move {
+            poll_loop(
+                &s2,
+                FeedSide {
+                    fetcher: &DeadFeed,
+                    login: &FixedLogin("me"),
+                },
+                ChecksSide {
+                    reader: &ci2,
+                    state: Some(d.join("t.ci.json")),
+                },
+                &tx,
+                Some(loop_inbox),
+                Some(open_log(&d)),
+                Default::default(),
+            )
+            .await;
+        });
+        tokio::time::sleep(Duration::from_secs(600)).await;
+        // Arm 1's CI wake was never acked, so it re-presents here —
+        // that is the at-least-once backlog, not the webhook.
+        let mut seen = Vec::new();
+        while let Ok(item) = rx.try_recv() {
+            let WaitItem::GithubEvent { event, .. } = &item else {
+                continue;
+            };
+            seen.push(event.clone());
+        }
+        assert!(
+            !seen.iter().any(|e| e == "issue_opened"),
+            "the feed has never baselined, so its relay gate stays shut — got {seen:?}",
+        );
+        run2.abort();
+        let _ = run2.await;
+    }
+
+    /// codex 7c132ec probe 2, as it was run: more in-scope PRs than
+    /// the shared key horizon holds. That horizon is a recency window
+    /// over EVENTS; a state read re-observes the same conclusions
+    /// forever, so the evicted ones came back as new wakes — 1001 of
+    /// them at once. The per-PR memory is what makes this quiet, in
+    /// one run and across a restart.
+    ///
+    /// The feed is DOWN throughout, which is the other half of the
+    /// claim: every other save happens on a completed feed tick, so
+    /// this half has to persist on its own or it remembers nothing
+    /// across arms.
+    #[tokio::test(start_paused = true)]
+    async fn more_prs_than_the_key_horizon_holds_still_wake_once() {
+        struct DeadFeed;
+        impl EventFetcher for DeadFeed {
+            async fn fetch(&self, _page: u32, _etag: Option<String>) -> anyhow::Result<GhResponse> {
+                anyhow::bail!("events unreachable")
+            }
+        }
+        let many: Vec<(github_ci::PrHead, github_ci::CiRollup)> = (1..=(SEEN_CAP as u64 + 1))
+            .map(|n| red(n, &format!("head{n}"), "fmt"))
+            .collect();
+        let dir = wal_tempdir();
+        for arm in 0..2 {
+            let ci = ScriptCi::new(vec![many.clone()]);
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let s = src(
+                &[GithubEventKind::IssueOpened, GithubEventKind::CiFailed],
+                true,
+            );
+            let d = dir.clone();
+            let handle = tokio::spawn(async move {
+                poll_loop(
+                    &s,
+                    FeedSide {
+                        fetcher: &DeadFeed,
+                        login: &FixedLogin("me"),
+                    },
+                    ChecksSide {
+                        reader: &ci,
+                        state: None,
+                    },
+                    &tx,
+                    None,
+                    Some(open_log(&d)),
+                    Default::default(),
+                )
+                .await;
+            });
+            tokio::time::sleep(Duration::from_secs(600)).await;
+            let woke = rx.try_recv();
+            assert!(
+                woke.is_err(),
+                "arm {arm}: every one of these builds was already red — {woke:?}",
+            );
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
+
+    /// Retention follows the PRs: one that leaves the scope takes its
+    /// memory with it, so the saved state cannot grow forever on a
+    /// repo whose PRs come and go.
+    #[tokio::test(start_paused = true)]
+    async fn a_pr_that_leaves_the_scope_takes_its_memory_with_it() {
+        let dir = wal_tempdir();
+        let ci = ScriptCi::new(vec![
+            vec![red(7, "head7", "fmt"), red(9, "head9", "fmt")],
+            vec![red(7, "head7", "fmt")],
+        ]);
+        let f = ScriptFetcher::new(vec![]);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let s = src(&[GithubEventKind::CiFailed], true);
+        let d = dir.clone();
+        let handle = tokio::spawn(async move {
+            poll_loop(
+                &s,
+                FeedSide {
+                    fetcher: &f,
+                    login: &FixedLogin("me"),
+                },
+                ChecksSide {
+                    reader: &ci,
+                    state: Some(d.join("t.ci.json")),
+                },
+                &tx,
+                None,
+                Some(open_log(&d)),
+                Default::default(),
+            )
+            .await;
+        });
+        tokio::time::sleep(Duration::from_secs(600)).await;
+        handle.abort();
+        let _ = handle.await;
+
+        let horizon: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("t.ci.json")).unwrap()).unwrap();
+        let said = &horizon["said"];
+        assert!(said.get("7").is_some(), "the PR still in scope: {horizon}");
+        assert!(
+            said.get("9").is_none(),
+            "the PR that left the scope is forgotten: {horizon}",
+        );
+        assert!(
+            !std::fs::exists(dir.join("t.state.json")).unwrap_or(false)
+                || !std::fs::read_to_string(dir.join("t.state.json"))
+                    .unwrap()
+                    .contains("ci"),
+            "and none of it is in the feed's cache",
+        );
+    }
+
+    /// A read that found nothing to report still establishes the
+    /// horizon — otherwise every arm re-baselines and the first real
+    /// conclusion is swallowed as "the state of the world".
+    #[tokio::test(start_paused = true)]
+    async fn a_checks_read_with_nothing_to_report_still_establishes() {
+        let dir = wal_tempdir();
+        let ci = ScriptCi::new(vec![vec![]]);
+        let f = ScriptFetcher::new(vec![]);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let s = src(&[GithubEventKind::CiFailed], true);
+        let d = dir.clone();
+        let run1 = tokio::spawn(async move {
+            poll_loop(
+                &s,
+                FeedSide {
+                    fetcher: &f,
+                    login: &FixedLogin("me"),
+                },
+                ChecksSide {
+                    reader: &ci,
+                    state: Some(d.join("t.ci.json")),
+                },
+                &tx,
+                None,
+                Some(open_log(&d)),
+                Default::default(),
+            )
+            .await;
+        });
+        tokio::time::sleep(Duration::from_secs(120)).await;
+        run1.abort();
+        let _ = run1.await;
+
+        let ci2 = ScriptCi::new(vec![vec![red(7, "head1", "fmt")]]);
+        let f2 = ScriptFetcher::new(vec![]);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let s2 = src(&[GithubEventKind::CiFailed], true);
+        let d = dir.clone();
+        let run2 = tokio::spawn(async move {
+            poll_loop(
+                &s2,
+                FeedSide {
+                    fetcher: &f2,
+                    login: &FixedLogin("me"),
+                },
+                ChecksSide {
+                    reader: &ci2,
+                    state: Some(d.join("t.ci.json")),
+                },
+                &tx,
+                None,
+                Some(open_log(&d)),
+                Default::default(),
+            )
+            .await;
+        });
+        let item = tokio::time::timeout(Duration::from_secs(300), rx.recv())
+            .await
+            .expect("the first conclusion after an empty read is news")
+            .expect("open");
+        assert!(matches!(item, WaitItem::GithubEvent { .. }));
+        run2.abort();
+        let _ = run2.await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unchanged_build_writes_nothing_tick_after_tick() {
+        // The CI read re-observes the SAME conclusion every tick. If
+        // each one reached the gate it would append an observation
+        // record per PR per tick — a log that grows forever over a
+        // build that has not changed, and compaction churn behind it.
+        let dir = wal_tempdir();
+        let ci = ScriptCi::new(vec![vec![red(7, "head1", "fmt")]]);
+        let f = ScriptFetcher::new(vec![]);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let s = src(&[GithubEventKind::CiFailed], true);
+        let d = dir.clone();
+        let handle = tokio::spawn(async move {
+            poll_loop(
+                &s,
+                FeedSide {
+                    fetcher: &f,
+                    login: &FixedLogin("me"),
+                },
+                ChecksSide {
+                    reader: &ci,
+                    state: Some(d.join("t.ci.json")),
+                },
+                &tx,
+                None,
+                Some(open_log(&d)),
+                Default::default(),
+            )
+            .await;
+        });
+        // Let many ticks pass (paused clock: instantly).
+        tokio::time::sleep(Duration::from_secs(3600)).await;
+        handle.abort();
+        let _ = handle.await;
+
+        let lines = std::fs::read_to_string(dir.join("t.jsonl"))
+            .map(|t| t.lines().filter(|l| !l.trim().is_empty()).count())
+            .unwrap_or(0);
+        assert_eq!(
+            lines, 0,
+            "a build nobody has been told about writes nothing at all — what CI \
+             remembers is its own file, not a record in the event log",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_watch_that_wants_only_red_is_never_woken_by_green() {
+        let results = vec![
+            (
+                github_ci::PrHead {
+                    number: 7,
+                    head: "head1".into(),
+                },
+                github_ci::CiRollup::Passed,
+            ),
+            red(9, "head2", "fmt"),
+        ];
+        let only_red = github_ci::wakes("o/r", &[GithubEventKind::CiFailed], &results);
+        assert_eq!(only_red.len(), 1);
+        assert_eq!(only_red[0].action.key.as_deref(), Some("ci_failed#9@head2"));
+        let both = github_ci::wakes(
+            "o/r",
+            &[GithubEventKind::CiFailed, GithubEventKind::CiPassed],
+            &results,
+        );
+        assert_eq!(both.len(), 2);
+        assert!(
+            github_ci::wakes("o/r", &[GithubEventKind::PrOpened], &results).is_empty(),
+            "a watch with no ci kinds reads no ci wakes",
+        );
     }
 
     #[tokio::test]
@@ -4103,8 +5957,14 @@ mod tests {
         let handle = tokio::spawn(async move {
             poll_loop(
                 &src(&[GithubEventKind::IssueOpened], false),
-                &login,
-                &f,
+                FeedSide {
+                    fetcher: &f,
+                    login: &login,
+                },
+                ChecksSide {
+                    reader: &NoCi,
+                    state: None,
+                },
                 &tx,
                 None,
                 None,
@@ -4149,8 +6009,14 @@ mod tests {
         let handle = tokio::spawn(async move {
             poll_loop(
                 &src(&[GithubEventKind::IssueOpened], false),
-                &FixedLogin("me"),
-                &*f2,
+                FeedSide {
+                    fetcher: &*f2,
+                    login: &FixedLogin("me"),
+                },
+                ChecksSide {
+                    reader: &NoCi,
+                    state: None,
+                },
                 &tx,
                 None,
                 None,
@@ -4197,8 +6063,14 @@ mod tests {
         let handle = tokio::spawn(async move {
             poll_loop(
                 &src(&[GithubEventKind::IssueOpened], false),
-                &FixedLogin("me"),
-                &*f2,
+                FeedSide {
+                    fetcher: &*f2,
+                    login: &FixedLogin("me"),
+                },
+                ChecksSide {
+                    reader: &NoCi,
+                    state: None,
+                },
                 &tx,
                 None,
                 None,
@@ -4255,8 +6127,14 @@ mod tests {
         let handle = tokio::spawn(async move {
             poll_loop(
                 &s,
-                &FixedLogin("me"),
-                &f,
+                FeedSide {
+                    fetcher: &f,
+                    login: &FixedLogin("me"),
+                },
+                ChecksSide {
+                    reader: &NoCi,
+                    state: None,
+                },
                 &tx,
                 Some(loop_inbox),
                 None,
@@ -4337,8 +6215,14 @@ mod tests {
         let handle = tokio::spawn(async move {
             poll_loop(
                 &src(&[GithubEventKind::IssueOpened], false),
-                &login,
-                &f,
+                FeedSide {
+                    fetcher: &f,
+                    login: &login,
+                },
+                ChecksSide {
+                    reader: &NoCi,
+                    state: None,
+                },
                 &tx,
                 Some(loop_inbox),
                 None,
@@ -4392,8 +6276,14 @@ mod tests {
         let handle = tokio::spawn(async move {
             poll_loop(
                 &src(&[GithubEventKind::IssueOpened], false),
-                &PendingLogin,
-                &f,
+                FeedSide {
+                    fetcher: &f,
+                    login: &PendingLogin,
+                },
+                ChecksSide {
+                    reader: &NoCi,
+                    state: None,
+                },
                 &tx,
                 Some(loop_inbox),
                 None,
@@ -4439,8 +6329,14 @@ mod tests {
         let handle = tokio::spawn(async move {
             poll_loop(
                 &src(&[GithubEventKind::IssueOpened], false),
-                &login,
-                &f,
+                FeedSide {
+                    fetcher: &f,
+                    login: &login,
+                },
+                ChecksSide {
+                    reader: &NoCi,
+                    state: None,
+                },
                 &tx,
                 Some(loop_inbox),
                 None,
@@ -4476,8 +6372,14 @@ mod tests {
         let handle = tokio::spawn(async move {
             poll_loop(
                 &src(&[GithubEventKind::IssueOpened], false),
-                &FixedLogin("me"),
-                &PendingFetcher,
+                FeedSide {
+                    fetcher: &PendingFetcher,
+                    login: &FixedLogin("me"),
+                },
+                ChecksSide {
+                    reader: &NoCi,
+                    state: None,
+                },
                 &tx,
                 None,
                 None,
@@ -4633,8 +6535,14 @@ mod tests {
         let run1 = tokio::spawn(async move {
             poll_loop(
                 &s1,
-                &FixedLogin("me"),
-                &f,
+                FeedSide {
+                    fetcher: &f,
+                    login: &FixedLogin("me"),
+                },
+                ChecksSide {
+                    reader: &NoCi,
+                    state: Some(d.join("t.ci.json")),
+                },
                 &tx,
                 None,
                 Some(open_log(&d)),
@@ -4660,8 +6568,14 @@ mod tests {
         let run2 = tokio::spawn(async move {
             poll_loop(
                 &s2,
-                &FixedLogin("me"),
-                &f,
+                FeedSide {
+                    fetcher: &f,
+                    login: &FixedLogin("me"),
+                },
+                ChecksSide {
+                    reader: &NoCi,
+                    state: Some(d.join("t.ci.json")),
+                },
                 &tx,
                 None,
                 Some(open_log(&d)),
@@ -4712,8 +6626,14 @@ mod tests {
         let run = tokio::spawn(async move {
             poll_loop(
                 &s,
-                &FixedLogin("me"),
-                &f,
+                FeedSide {
+                    fetcher: &f,
+                    login: &FixedLogin("me"),
+                },
+                ChecksSide {
+                    reader: &NoCi,
+                    state: Some(d.join("t.ci.json")),
+                },
                 &tx,
                 None,
                 Some(open_log(&d)),
@@ -4747,7 +6667,7 @@ mod tests {
         {
             // A valid cache from a previous life…
             let log = open_log(&dir);
-            log.save_state(Some("\"stale\""), Some(1)).unwrap();
+            log.save_state(Some("\"stale\""), Some(1), true).unwrap();
             // …and a WAL that quarantines (interior corruption).
             std::fs::write(
                 dir.join("t.jsonl"),
@@ -4758,7 +6678,7 @@ mod tests {
         // Conditioned request → 304 (the trap); unconditional → Ok.
         // One closure per PAGE fetch: tick 1 = pages 1+2 (boundary),
         // tick 2 = new event page + fully-seen boundary page.
-        let f = ScriptFetcher::new(vec![
+        let f = std::sync::Arc::new(ScriptFetcher::new(vec![
             Box::new(|_p, etag| {
                 if etag.is_some() {
                     Ok(GhResponse::NotModified {
@@ -4772,7 +6692,8 @@ mod tests {
             // Tick 2 after the baseline: a genuinely new event emits.
             Box::new(|_p, _e| Ok(ok(vec![issue("2", 2)], None, None))),
             Box::new(|_p, _e| Ok(ok(vec![issue("1", 1)], None, None))),
-        ]);
+        ]));
+        let calls = f.clone();
         let inbox = std::sync::Arc::new(RelayInbox::new());
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let s = src(&[GithubEventKind::IssueOpened], true);
@@ -4787,8 +6708,14 @@ mod tests {
         let run = tokio::spawn(async move {
             poll_loop(
                 &s,
-                &FixedLogin("me"),
-                &f,
+                FeedSide {
+                    fetcher: &*f,
+                    login: &FixedLogin("me"),
+                },
+                ChecksSide {
+                    reader: &NoCi,
+                    state: Some(d.join("t.ci.json")),
+                },
                 &tx,
                 Some(loop_inbox),
                 Some(open_log(&d)),
@@ -4812,8 +6739,119 @@ mod tests {
             unreachable!()
         };
         assert_eq!(*number, Some(2));
+        // The stated invariant, asserted rather than inferred: the
+        // FIRST request after a quarantine carried no ETag at all. A
+        // conditional one would 304 against a horizon that no longer
+        // exists, and the script advancing past it is what let this
+        // test pass while the request was wrong (codex 4a6b328).
+        let first_request = calls.calls.lock().unwrap()[0].clone();
+        assert_eq!(
+            first_request,
+            (1, None),
+            "page 1, unconditional — the surviving etag belongs to the quarantined log",
+        );
         run.abort();
         let _ = run.await;
+    }
+
+    /// codex 4a6b328: a quarantined WAL must override the sidecar's
+    /// claim that the feed baselined. The claim was written alongside
+    /// a horizon that no longer exists, so trusting it replays the
+    /// first page as wakes — and the claim has to be invalidated
+    /// DURABLY, or a failed fetch and another restart find it again.
+    #[tokio::test(start_paused = true)]
+    async fn a_quarantined_log_overrides_the_saved_baseline() {
+        let dir = wal_tempdir();
+        {
+            let log = open_log(&dir);
+            log.save_state(Some("\"stale\""), Some(1), true).unwrap();
+            std::fs::write(
+                dir.join("t.jsonl"),
+                "not json\n{\"t\":\"ack\",\"seq\":1,\"at\":1}\n",
+            )
+            .unwrap();
+        }
+        // Every fetch FAILS, so no tick ever completes and nothing
+        // is saved by the normal path. Then the process dies. This is
+        // the window the quarantine's own write closes: a scripted
+        // fetcher would fall through to NotModified, complete a tick
+        // and save the flag as a side effect, hiding the gap.
+        struct DeadFeed;
+        impl EventFetcher for DeadFeed {
+            async fn fetch(&self, _page: u32, _etag: Option<String>) -> anyhow::Result<GhResponse> {
+                anyhow::bail!("network")
+            }
+        }
+        let f = DeadFeed;
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let s1 = src(&[GithubEventKind::IssueOpened], true);
+        let d = dir.clone();
+        let run1 = tokio::spawn(async move {
+            poll_loop(
+                &s1,
+                FeedSide {
+                    fetcher: &f,
+                    login: &FixedLogin("me"),
+                },
+                ChecksSide {
+                    reader: &NoCi,
+                    state: Some(d.join("t.ci.json")),
+                },
+                &tx,
+                None,
+                Some(open_log(&d)),
+                Default::default(),
+            )
+            .await;
+        });
+        tokio::time::sleep(Duration::from_secs(120)).await;
+        run1.abort();
+        let _ = run1.await;
+
+        // Second arm: the log is gone (quarantined), so an old issue
+        // on the first fetch is HISTORY.
+        // Two closures: the page with the old issue, then an empty
+        // one so pagination ENDS normally — a tick that never
+        // completes would pass this test for the wrong reason.
+        let f = std::sync::Arc::new(ScriptFetcher::new(vec![
+            Box::new(|_p, _e| Ok(ok(vec![issue("1", 1)], None, None))),
+            Box::new(|_p, _e| Ok(ok(vec![], None, None))),
+        ]));
+        let calls = f.clone();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let s2 = src(&[GithubEventKind::IssueOpened], true);
+        let d = dir.clone();
+        let run2 = tokio::spawn(async move {
+            poll_loop(
+                &s2,
+                FeedSide {
+                    fetcher: &*f,
+                    login: &FixedLogin("me"),
+                },
+                ChecksSide {
+                    reader: &NoCi,
+                    state: Some(d.join("t.ci.json")),
+                },
+                &tx,
+                None,
+                Some(open_log(&d)),
+                Default::default(),
+            )
+            .await;
+        });
+        tokio::time::sleep(Duration::from_secs(600)).await;
+        let leaked = rx.try_recv();
+        assert!(
+            leaked.is_err(),
+            "the first page after a quarantine is the baseline — {leaked:?}",
+        );
+        assert_eq!(
+            calls.calls.lock().unwrap()[0].1,
+            None,
+            "and it was asked for unconditionally",
+        );
+        run2.abort();
+        let _ = run2.await;
     }
 
     /// codex 7c9e7fe: pagination shift repeating a PRESENTABLE event
@@ -4838,8 +6876,14 @@ mod tests {
         let run = tokio::spawn(async move {
             poll_loop(
                 &s,
-                &FixedLogin("me"),
-                &f,
+                FeedSide {
+                    fetcher: &f,
+                    login: &FixedLogin("me"),
+                },
+                ChecksSide {
+                    reader: &NoCi,
+                    state: Some(d.join("t.ci.json")),
+                },
                 &tx,
                 None,
                 Some(open_log(&d)),
@@ -4887,8 +6931,14 @@ mod tests {
         let run1 = tokio::spawn(async move {
             poll_loop(
                 &s1,
-                &FixedLogin("me"),
-                &f,
+                FeedSide {
+                    fetcher: &f,
+                    login: &FixedLogin("me"),
+                },
+                ChecksSide {
+                    reader: &NoCi,
+                    state: Some(d.join("t.ci.json")),
+                },
                 &tx,
                 Some(loop_inbox),
                 Some(open_log(&d)),
@@ -4930,8 +6980,14 @@ mod tests {
         let run2 = tokio::spawn(async move {
             poll_loop(
                 &s2,
-                &FixedLogin("me"),
-                &f,
+                FeedSide {
+                    fetcher: &f,
+                    login: &FixedLogin("me"),
+                },
+                ChecksSide {
+                    reader: &NoCi,
+                    state: Some(d.join("t.ci.json")),
+                },
                 &tx,
                 None,
                 Some(open_log(&d)),
@@ -4993,14 +7049,142 @@ mod tests {
         fwd.await.unwrap();
     }
 
+    // ── what a loaded log means for the feed ─────────────────
+    //
+    // Every one of these was reachable before only through a two-arm
+    // async test with a temp dir, which is why three of them were
+    // wrong at once.
+
+    fn loaded(warm: bool) -> crate::cli::github_event_log::LoadedLog {
+        crate::cli::github_event_log::LoadedLog {
+            warm,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_cold_log_has_no_horizon_and_no_etag() {
+        let h = FeedHorizon::restore(&loaded(false));
+        assert!(!h.established);
+        assert_eq!(h.etag, None);
+    }
+
+    #[test]
+    fn the_recorded_fact_decides_when_it_is_there() {
+        let mut l = loaded(true);
+        l.feed_baselined = Some(true);
+        l.etag = Some("\"e\"".into());
+        let h = FeedHorizon::restore(&l);
+        assert!(
+            h.established,
+            "even with no rows at all — an empty baseline"
+        );
+        assert_eq!(h.etag.as_deref(), Some("\"e\""));
+
+        l.feed_baselined = Some(false);
+        l.feed_ids = vec!["1".into()];
+        let h = FeedHorizon::restore(&l);
+        assert!(!h.established, "an explicit no outranks the rows");
+        assert_eq!(h.etag, None, "and the etag goes with the horizon");
+    }
+
+    #[test]
+    fn an_old_file_is_answered_by_whose_rows_the_log_holds() {
+        // No flag at all: the pre-field rule, minus checks-only rows.
+        let mut l = loaded(true);
+        l.feed_ids = vec!["1".into()];
+        assert!(
+            FeedHorizon::restore(&l).established,
+            "feed ids are the feed's"
+        );
+
+        let mut l = loaded(true);
+        l.action_keys = vec!["issue_opened#4".into()];
+        assert!(
+            FeedHorizon::restore(&l).established,
+            "a relay row is the feed's too — an empty baseline then a webhook",
+        );
+
+        let mut l = loaded(true);
+        l.action_keys = vec!["ci_failed#7@abc".into(), "ci_passed#9@def".into()];
+        assert!(
+            !FeedHorizon::restore(&l).established,
+            "a checks-only log says nothing about the feed",
+        );
+    }
+
+    #[test]
+    fn a_quarantined_log_answers_for_the_cache_beside_it() {
+        let mut l = loaded(false);
+        l.log_quarantined = true;
+        l.feed_baselined = Some(true);
+        l.etag = Some("\"stale\"".into());
+        l.poll_interval_floor = Some(60);
+        let h = FeedHorizon::restore(&l);
+        assert!(!h.established, "the horizon it was written beside is gone");
+        assert_eq!(h.etag, None, "so the conditional request goes with it");
+        assert_eq!(h.floor, None);
+    }
+
+    #[test]
+    fn the_feed_ids_become_the_cursor() {
+        let mut l = loaded(true);
+        l.feed_ids = vec!["1".into(), "2".into()];
+        let h = FeedHorizon::restore(&l);
+        assert!(h.seen.as_btree().contains("1"));
+        assert!(h.seen.as_btree().contains("2"));
+    }
+
     #[test]
     fn source_key_ignores_the_prompt() {
         // Editing a watch's prompt must NOT re-key its WAL (the
         // prompt is presentation config; identity is repo/kinds/
-        // branches/own-actions).
+        // branches/prs/own-actions).
         let mut a = src(&[GithubEventKind::IssueOpened], false);
         let key = source_key(&a);
         a.prompt = Some("do the thing".into());
         assert_eq!(source_key(&a), key);
+    }
+
+    #[test]
+    fn a_watch_without_a_pr_scope_keeps_the_key_it_had() {
+        // Pinned: this is the key this source had before `prs`
+        // existed. Moving it orphans every armed watch's WAL, its
+        // cursor and its prompt sidecar at once.
+        assert_eq!(
+            source_key(&src(&[GithubEventKind::IssueOpened], false)),
+            "github-o-r-4586904a",
+        );
+    }
+
+    #[test]
+    fn source_key_separates_a_narrowed_pr_scope() {
+        // Narrowing the PR scope changes which CI conclusions are
+        // presentable, so it is a DIFFERENT log — reusing the old
+        // cursor would read a baseline taken for another set.
+        let mut a = src(&[GithubEventKind::CiFailed], false);
+        let all = source_key(&a);
+        a.prs = vec![7];
+        let one = source_key(&a);
+        assert_ne!(one, all);
+        a.prs = vec![7, 9];
+        assert_ne!(source_key(&a), one);
+    }
+
+    #[test]
+    fn the_ci_kinds_subscribe_to_suites_and_statuses() {
+        // A PR's result spans both check surfaces; per-job check_run
+        // deliveries are noise the rollup read does not need.
+        let names = webhook_event_names(&[GithubEventKind::CiPassed]);
+        assert_eq!(names, vec!["check_suite", "status"]);
+        assert_eq!(
+            webhook_event_names(&[GithubEventKind::CiFailed, GithubEventKind::CiPassed]),
+            vec!["check_suite", "status"],
+            "both kinds, one subscription each",
+        );
+        assert!(
+            !webhook_event_names(&[GithubEventKind::BranchPush]).contains(&"status"),
+            "a non-CI watch does not subscribe to statuses",
+        );
     }
 }

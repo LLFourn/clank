@@ -409,6 +409,23 @@ mod tests {
     }
 
     #[test]
+    fn the_readme_lists_the_ci_wake_source() {
+        // A reviewer should be able to configure one from the README
+        // alone, including the part that surprises people: an arm
+        // sees the current result, not a backlog.
+        let readme: String = include_str!("../../../../README.md")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(readme.contains("ci_passed"), "the kinds are listed");
+        assert!(readme.contains(r#""prs":[7,9]"#), "and the scope");
+        assert!(
+            readme.contains("is not recoverable"),
+            "and what a state read cannot do",
+        );
+    }
+
+    #[test]
     fn feedback_read_refuses_a_plan_and_a_commit_together() {
         assert!(
             Cli::try_parse_from([

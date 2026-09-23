@@ -304,6 +304,32 @@ async fn a_bad_github_poll_interval_fails_loud_at_arm_time() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_ci_watch_arms() {
+    // The kinds are readable now, so a watch that names them arms
+    // like any other. (It replaces the refusal that stood between the
+    // vocabulary landing and the reader landing.) No network: the
+    // wait parks and the test's timeout ends it.
+    let env = idle_env();
+    let repo = env.repo();
+    let ev = serde_json::json!({
+        "kind": "github",
+        "repo": "o/r",
+        "events": ["ci_failed"],
+        "prs": [7],
+    })
+    .to_string();
+    let armed = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        clank::cli::wait::run(wait_args(repo, vec![ev])),
+    )
+    .await;
+    assert!(
+        armed.is_err(),
+        "arming succeeds and the wait parks; it does not refuse: {armed:?}",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_malformed_config_wait_events_is_a_hard_error() {
     // codex 1bbb61d: an unknown tagged kind in the FILE config must
     // propagate, not be silently treated as no sources.
