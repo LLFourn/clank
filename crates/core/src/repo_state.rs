@@ -525,6 +525,23 @@ impl RepoState {
         Self::default()
     }
 
+    /// The finalize record for `plan`, if it has one.
+    ///
+    /// A name can be finished more than once (re-introduced and
+    /// re-finalized), so `finished_plans` may hold several records
+    /// for it. Which one a reader means has to be the SAME everywhere
+    /// — a reader that picks a different record than the one whose
+    /// `[intro, finalized_at]` interval it then walks reports one
+    /// cycle's boundary against another's commits (codex a7f47e4).
+    /// This is that choice, in one place: the first, which is what
+    /// the rewrite preview walks.
+    ///
+    /// Says nothing about whether the plan is ALSO active — a
+    /// re-introduced plan is in both sets, and `plans` wins.
+    pub fn finished_record(&self, plan: &PlanKey) -> Option<&FinishedPlan> {
+        self.finished_plans.iter().find(|f| &f.plan == plan)
+    }
+
     /// Apply one `CommitEvent` to this state.
     pub fn apply_commit(&mut self, event: &CommitEvent) -> Vec<LogEvent> {
         let was_adopted = self.adopted;

@@ -11,6 +11,7 @@ mod common;
 mod agent_swap_integration;
 mod diff_tree_changes_scenarios;
 mod doctor_unbound_reviewer_integration;
+mod feedback_read_integration;
 mod feedback_write_integration;
 mod finish_integration;
 mod fork_integration;

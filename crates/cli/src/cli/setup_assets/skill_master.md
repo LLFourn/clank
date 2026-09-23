@@ -125,6 +125,12 @@ arm. The `clank-github` skill carries the full inbox flow.
 ### Reading feedback
 
 Reviewers write CONTINUE / FINISHED / REQUEST_CHANGES on your commits;
-read them with `clank feedback read --commit <sha>`. CONTINUE → keep
-going. REQUEST_CHANGES → address it, re-commit, STOP. Gate FINISHED →
-you will be handed a finalize item.
+read them with `clank feedback read --commit <sha>`, or read the whole
+cycle at once with `clank feedback read --plan` (bare = the active
+plan): every commit of the plan oldest first, each with its verdicts.
+CONTINUE → keep going. REQUEST_CHANGES → address it, re-commit, STOP.
+Gate FINISHED → you will be handed a finalize item.
+
+The feedback files under `.clank/agents/*/feedback/` are not to be read
+by hand — where they live and what they're named is the command's
+business, and it is the surface that stays true when the layout moves.

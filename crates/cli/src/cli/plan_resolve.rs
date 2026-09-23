@@ -23,14 +23,14 @@ pub fn resolve_plan(
         let stem = parse_arg(raw, expected_basename)?;
         let key = PlanKey::parse(&stem)
             .map_err(|e| anyhow::anyhow!("invalid plan stem `{stem}`: {e}"))?;
-        let known = state.fold.plans.contains_key(&key)
-            || state.fold.finished_plans.iter().any(|f| f.plan == key);
+        let known =
+            state.fold.plans.contains_key(&key) || state.fold.finished_record(&key).is_some();
         if !known {
             anyhow::bail!(
                 "plan `{}/{}.md` not found in repo. candidates: {}",
                 expected_basename,
                 stem,
-                candidate_summary(state, expected_basename),
+                candidate_summary(state, expected_basename, &stem),
             );
         }
         return Ok(key);
@@ -72,16 +72,49 @@ fn infer_single_visible_active(
     }
 }
 
-fn candidate_summary(state: &RepoState, basename: &str) -> String {
+/// How many finished plans a "not found" diagnostic names. A repo
+/// accumulates hundreds of them; naming all of them buries the two or
+/// three the reader could have meant (ruthless 863f359).
+const FINISHED_NAMED: usize = 5;
+
+/// Candidates for a "plan not found": every active plan, and the
+/// finished plans that resemble what was asked for — or, when none
+/// does, the most recently finished, with the rest counted.
+fn candidate_summary(state: &RepoState, basename: &str, asked: &str) -> String {
     let mut names: Vec<String> = state
         .fold
         .plans
         .keys()
         .map(|k| format!("{basename}/{}.md", k.as_str()))
         .collect();
-    for fp in &state.fold.finished_plans {
-        names.push(format!("{basename}/{}.md (finished)", fp.plan.as_str()));
+
+    // `finished_plans` is the fold's ordered log and a plan can be
+    // re-finalized, so walk it newest-first and keep each name once.
+    let mut finished: Vec<&str> = Vec::new();
+    for fp in state.fold.finished_plans.iter().rev() {
+        let stem = fp.plan.as_str();
+        if !finished.contains(&stem) {
+            finished.push(stem);
+        }
     }
+    let resembling: Vec<&str> = finished
+        .iter()
+        .copied()
+        .filter(|stem| stem.contains(asked) || asked.contains(*stem))
+        .collect();
+    let named: Vec<&str> = if resembling.is_empty() {
+        finished.iter().copied().take(FINISHED_NAMED).collect()
+    } else {
+        resembling.into_iter().take(FINISHED_NAMED).collect()
+    };
+    for stem in &named {
+        names.push(format!("{basename}/{stem}.md (finished)"));
+    }
+    let unnamed = finished.len() - named.len();
+    if unnamed > 0 {
+        names.push(format!("and {unnamed} more finished"));
+    }
+
     if names.is_empty() {
         "(none)".to_string()
     } else {
@@ -134,32 +167,54 @@ pub async fn commits_for_plan(
     state: &RepoState,
     plan_key: &PlanKey,
 ) -> anyhow::Result<Vec<CommitSha>> {
+    Ok(plan_history(repo_root, state, plan_key).await?.commits)
+}
+
+/// A plan's commits together with the lifecycle they came from, so a
+/// reader cannot pair one with the other's facts.
+pub struct PlanHistory {
+    /// `None` while the plan is active. A plan re-introduced after a
+    /// finish is in BOTH sets, and its commits are the new cycle's —
+    /// so the old finalize is not this history's (codex a7f47e4).
+    pub finished: Option<clank_core::repo_state::FinishedPlan>,
+    pub commits: Vec<CommitSha>,
+}
+
+/// See [`commits_for_plan`] for where each path's commits come from.
+pub async fn plan_history(
+    repo_root: &Path,
+    state: &RepoState,
+    plan_key: &PlanKey,
+) -> anyhow::Result<PlanHistory> {
     // Active path: fold's per-plan timeline is already
     // plan-attributed. Cheap — no preview rebuild needed.
     if let Some(ps) = state.fold.plans.get(plan_key) {
-        return Ok(ps.commits.iter().map(|e| e.sha.clone()).collect());
+        return Ok(PlanHistory {
+            finished: None,
+            commits: ps.commits.iter().map(|e| e.sha.clone()).collect(),
+        });
     }
-    // Finished path: preview rebuild + foreign filter.
-    let is_finished = state
-        .fold
-        .finished_plans
-        .iter()
-        .any(|f| &f.plan == plan_key);
-    if !is_finished {
+    // Finished path: preview rebuild + foreign filter. The record is
+    // the one the preview itself walks — `finished_record` is the
+    // single chooser.
+    let Some(record) = state.fold.finished_record(plan_key) else {
         anyhow::bail!(
             "plan `{}` not found in active or finished sets",
             plan_key.as_str()
         );
-    }
+    };
     let preview = crate::preview::build_rewrite_preview(repo_root, state, plan_key, true)
         .await
         .map_err(|e| anyhow::anyhow!("rewrite preview failed for `{}`: {e}", plan_key.as_str()))?;
-    Ok(preview
-        .commits
-        .iter()
-        .filter(|c| !c.foreign)
-        .map(|c| c.sha.clone())
-        .collect())
+    Ok(PlanHistory {
+        finished: Some(record.clone()),
+        commits: preview
+            .commits
+            .iter()
+            .filter(|c| !c.foreign)
+            .map(|c| c.sha.clone())
+            .collect(),
+    })
 }
 
 #[cfg(test)]
@@ -195,5 +250,86 @@ mod tests {
     #[test]
     fn rejects_nested_under_clank_plans() {
         assert!(parse_arg(".clank/plans/team/foo.md", "myrepo").is_err());
+    }
+
+    fn state_with(active: &[&str], finished: &[&str]) -> RepoState {
+        let mut state = RepoState::empty(std::path::PathBuf::from("/nowhere"));
+        for stem in active {
+            state
+                .fold
+                .plans
+                .insert(PlanKey::parse(stem).unwrap(), Default::default());
+        }
+        let sha = CommitSha::parse("0123456789abcdef0123456789abcdef01234567").unwrap();
+        for stem in finished {
+            state
+                .fold
+                .finished_plans
+                .push(clank_core::repo_state::FinishedPlan {
+                    plan: PlanKey::parse(stem).unwrap(),
+                    intro: sha.clone(),
+                    finalized_at: sha.clone(),
+                });
+        }
+        state
+    }
+
+    #[test]
+    fn an_unknown_plan_names_the_active_ones_and_counts_the_finished() {
+        let finished: Vec<String> = (0..20).map(|i| format!("old-plan-{i:02}")).collect();
+        let refs: Vec<&str> = finished.iter().map(String::as_str).collect();
+        let state = state_with(&["live-one"], &refs);
+        let err = resolve_plan(&state, "repo", Some("nope"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("repo/live-one.md"), "{err}");
+        assert!(err.contains("repo/old-plan-19.md (finished)"), "{err}");
+        assert!(
+            !err.contains("old-plan-00"),
+            "the oldest finished are not named: {err}"
+        );
+        assert!(err.contains("and 15 more finished"), "{err}");
+    }
+
+    #[test]
+    fn a_replanned_name_is_counted_once() {
+        // A plan can be re-introduced and re-finalized, so the log
+        // carries its name twice.
+        let state = state_with(&[], &["twice", "twice", "other"]);
+        let err = resolve_plan(&state, "repo", Some("nope"))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err.matches("repo/twice.md").count(), 1, "{err}");
+        assert!(
+            !err.contains("more finished"),
+            "two names, both named: {err}"
+        );
+    }
+
+    #[test]
+    fn a_near_miss_names_the_finished_plan_it_resembles() {
+        let state = state_with(
+            &[],
+            &[
+                "the-cloud-is-always-the-cloud",
+                "something-else",
+                "and-another",
+                "a-fourth",
+                "a-fifth",
+                "a-sixth",
+            ],
+        );
+        let err = resolve_plan(&state, "repo", Some("cloud-is-always"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("repo/the-cloud-is-always-the-cloud.md (finished)"),
+            "{err}"
+        );
+        assert!(
+            !err.contains("something-else"),
+            "only what it resembles: {err}"
+        );
+        assert!(err.contains("and 5 more finished"), "{err}");
     }
 }

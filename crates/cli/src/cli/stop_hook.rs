@@ -1956,6 +1956,31 @@ fn discharge_suffix(kind: &str, reason: Option<&str>) -> String {
     }
 }
 
+/// What READS the feedback a wake is about, on the wake that is about
+/// it. The skill has always said `clank feedback read`, and a reader
+/// who does not remember it reaches for the files instead — which are
+/// right there, and wrong in the same way every time the layout moves
+/// (the-nudge-names-the-command).
+///
+/// Only wakes whose work IS the feedback on a sha, and only their own
+/// sha: a finalize notice carries the finalization commit, which is
+/// not the commit anyone wrote feedback on (codex on 4837ea8).
+fn read_hint(item: &WaitItem) -> String {
+    let about_feedback = match (item.kind.as_deref(), item.reason.as_deref()) {
+        (Some("master"), Some("address_commit_changes" | "ready_to_finalize")) => true,
+        // The same need on a commit that belongs to no plan.
+        (Some("adhoc_revise"), _) => true,
+        _ => false,
+    };
+    match (about_feedback, item.sha.as_deref()) {
+        (true, Some(sha)) => format!(
+            "      · read it: clank feedback read --commit {}\n",
+            short_sha(sha)
+        ),
+        _ => String::new(),
+    }
+}
+
 fn render_wait_items(items: &[WaitItem], label: &AgentLabel, role: Role) -> String {
     let refs: Vec<&WaitItem> = items.iter().collect();
     render_wait_items_ref(&refs, label, role)
@@ -2134,6 +2159,7 @@ fn render_wait_items_ref(items: &[&WaitItem], label: &AgentLabel, role: Role) ->
             other => out.push_str(&format!("  - {other}: {plan} @ {short}\n")),
         }
         out.push_str(&discharge_suffix(kind, item.reason.as_deref()));
+        out.push_str(&read_hint(item));
     }
     out.push_str("\nAct on these items now.");
     out
@@ -2929,6 +2955,70 @@ mod tests {
         assert!(t.contains("CANNOT"), "{t}");
         assert!(t.contains("human"), "{t}");
         assert!(t.contains("not answer it yourself"), "{t}");
+    }
+
+    /// A second sha, distinct from `FULL_SHA`: what a finalization
+    /// commit is to the commit that was reviewed.
+    const OTHER_SHA: &str = "fedcba9876543210fedcba9876543210fedcba98";
+
+    /// The wake that sends a master to feedback names what reads it,
+    /// on that wake's own sha. Nothing else does: a reviewer WRITES
+    /// feedback, a continue has none to read, and a finalize notice
+    /// carries the finalization commit rather than the reviewed one
+    /// (the-nudge-names-the-command).
+    #[test]
+    fn the_wakes_about_feedback_name_what_reads_it() {
+        let render = |item: serde_json::Value| {
+            let items: Vec<WaitItem> = serde_json::from_value(serde_json::json!([item])).unwrap();
+            let refs: Vec<&WaitItem> = items.iter().collect();
+            render_wait_items_ref(&refs, &AgentLabel::parse("claude").unwrap(), Role::Master)
+        };
+        let reads = format!("clank feedback read --commit {}", &FULL_SHA[..12]);
+
+        for about_feedback in [
+            serde_json::json!({"kind":"master","plan":"p","sha":FULL_SHA,
+              "next":"revise","reason":"address_commit_changes","gate":"changes_requested"}),
+            serde_json::json!({"kind":"master","plan":"p","sha":FULL_SHA,
+              "next":"finalize","reason":"ready_to_finalize","gate":"finished"}),
+            serde_json::json!({"kind":"adhoc_revise","sha":FULL_SHA}),
+        ] {
+            let out = render(about_feedback.clone());
+            assert!(out.contains(&reads), "{about_feedback}: {out}");
+        }
+
+        // Both shas on one item: the hint names the REVIEWED one. A
+        // finalize wake can carry the finalization commit too, and
+        // reading feedback on that one finds none (codex on 4837ea8).
+        let out = render(serde_json::json!({
+            "kind":"master","plan":"p","sha":FULL_SHA,"finalized_at":OTHER_SHA,
+            "next":"finalize","reason":"ready_to_finalize","gate":"finished"
+        }));
+        assert!(out.contains(&reads), "{out}");
+        assert!(
+            !out.contains(&format!("feedback read --commit {}", &OTHER_SHA[..12])),
+            "not the commit the finalization made: {out}"
+        );
+        // And with only that later sha, there is nothing to read.
+        let out = render(serde_json::json!({
+            "kind":"master","plan":"p","finalized_at":OTHER_SHA,
+            "next":"finalize","reason":"ready_to_finalize","gate":"finished"
+        }));
+        assert!(!out.contains("feedback read"), "{out}");
+
+        for not_about_feedback in [
+            serde_json::json!({"kind":"master","plan":"p","sha":FULL_SHA,
+              "next":"continue","reason":"gate_continue","gate":"continued"}),
+            serde_json::json!({"kind":"reviewer","plan":"p","sha":FULL_SHA}),
+            // The finalize NOTICE: its sha is the finalization commit,
+            // which nobody wrote feedback on.
+            serde_json::json!({"kind":"finished","plan":"p","finalized_at":FULL_SHA}),
+        ] {
+            let out = render(not_about_feedback.clone());
+            assert!(
+                !out.contains("feedback read"),
+                "{not_about_feedback}: {out}"
+            );
+        }
     }
 
     #[test]

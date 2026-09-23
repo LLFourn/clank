@@ -51,12 +51,7 @@ pub async fn build_finish_preview(
     let plan_path = crate::init_facts::plan_md_rel(plan_key.as_str());
 
     let active = state.fold.plans.get(plan_key);
-    let is_finished = active.is_none()
-        && state
-            .fold
-            .finished_plans
-            .iter()
-            .any(|f| &f.plan == plan_key);
+    let is_finished = active.is_none() && state.fold.finished_record(plan_key).is_some();
     if !is_finished && active.is_none() {
         return Err(PreviewError::PlanNotFound(plan_id_str));
     }
@@ -163,12 +158,7 @@ pub async fn build_rewrite_preview(
     // fold itself drops finished plans' per-commit timeline).
     let (intro_sha, finalized_at) = if let Some(ps) = state.fold.plans.get(plan_key) {
         (ps.commits.first().map(|e| e.sha.clone()), None)
-    } else if let Some(fp) = state
-        .fold
-        .finished_plans
-        .iter()
-        .find(|f| &f.plan == plan_key)
-    {
+    } else if let Some(fp) = state.fold.finished_record(plan_key) {
         (Some(fp.intro.clone()), Some(fp.finalized_at.clone()))
     } else {
         return Err(PreviewError::PlanNotFound(plan_id_str));

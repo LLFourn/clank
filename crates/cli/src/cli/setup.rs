@@ -1064,6 +1064,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_master_skill_sends_readers_to_the_command_not_the_files() {
+        let reading = SKILL_MASTER_BODY
+            .split("### Reading feedback")
+            .nth(1)
+            .expect("the skill has a Reading feedback section");
+        assert!(
+            reading.contains("clank feedback read --commit <sha>"),
+            "{reading}"
+        );
+        assert!(reading.contains("clank feedback read --plan"), "{reading}");
+        assert!(
+            reading.contains(".clank/agents/*/feedback/") && reading.contains("not to be read"),
+            "the files are named only to say they are not the way in: {reading}",
+        );
+    }
+
+    #[test]
     fn seed_autosquash_seeds_when_absent_and_is_idempotent() {
         let tmp = tempfile::tempdir().unwrap();
         let cfg = tmp.path().join(".clank/config.json");
@@ -1822,6 +1839,8 @@ mod tests {
         // Every block is repo-wide, so the recipe must NOT carry a
         // scope flag — `--plan` is rejected at the parser now, and a
         // skill that still teaches it hands agents a failing command.
+        // Scoped to the recipe's own paragraph: `--plan` is a real
+        // flag on other commands the skill teaches.
         // `block create` is a MASTER command — reviewers must not
         // carry it.
         for tool in [Tool::Claude, Tool::Codex] {
@@ -1830,9 +1849,13 @@ mod tests {
                 body.contains(r#"clank block create <name> -m "question""#),
                 "master must document the flat block create recipe"
             );
+            let recipe = body
+                .split("\n\n")
+                .find(|para| para.contains("clank block create"))
+                .expect("the block create recipe");
             assert!(
-                !body.contains("--plan"),
-                "block create recipe must not carry the deleted --plan flag"
+                !recipe.contains("--plan"),
+                "block create recipe must not carry the deleted --plan flag: {recipe}"
             );
             assert!(
                 !compose_skill(Role::Reviewer, tool).contains("clank block create"),

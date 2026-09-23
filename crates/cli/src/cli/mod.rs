@@ -816,8 +816,12 @@ pub enum FeedbackCmd {
 #[derive(Args, Debug)]
 pub struct FeedbackReadArgs {
     /// Commit SHA (default: HEAD).
-    #[arg(long, value_name = "SHA")]
+    #[arg(long, value_name = "SHA", conflicts_with = "plan")]
     pub commit: Option<String>,
+    /// Read a whole plan's review cycle: every commit of the plan,
+    /// oldest first. Bare `--plan` reads the active plan.
+    #[arg(long, value_name = "NAME", num_args = 0..=1, default_missing_value = "")]
+    pub plan: Option<String>,
     #[arg(long, value_name = "PATH")]
     pub repo: Option<PathBuf>,
     #[arg(short = 'j', long)]

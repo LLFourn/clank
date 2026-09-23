@@ -409,6 +409,46 @@ mod tests {
     }
 
     #[test]
+    fn feedback_read_refuses_a_plan_and_a_commit_together() {
+        assert!(
+            Cli::try_parse_from([
+                "clank", "feedback", "read", "--plan", "foo", "--commit", "abc1234",
+            ])
+            .is_err(),
+            "a plan's cycle and one commit are different questions",
+        );
+    }
+
+    #[test]
+    fn bare_feedback_read_plan_is_the_active_plan() {
+        let read = |argv: &[&str]| {
+            let parsed = Cli::try_parse_from(argv.iter().copied()).unwrap();
+            let Command::Feedback(args) = parsed.command else {
+                panic!("expected feedback");
+            };
+            let crate::cli::FeedbackCmd::Read(read) = args.command else {
+                panic!("expected read");
+            };
+            read
+        };
+        let bare = read(&["clank", "feedback", "read", "--plan"]);
+        assert_eq!(bare.plan.as_deref(), Some(""));
+        assert!(!bare.json);
+
+        let flagged = read(&["clank", "feedback", "read", "--plan", "-j"]);
+        assert_eq!(flagged.plan.as_deref(), Some(""), "-j is not a plan name");
+        assert!(flagged.json);
+
+        assert_eq!(
+            read(&["clank", "feedback", "read", "--plan", "foo"])
+                .plan
+                .as_deref(),
+            Some("foo"),
+        );
+        assert_eq!(read(&["clank", "feedback", "read"]).plan, None);
+    }
+
+    #[test]
     fn wait_command_parses() {
         assert!(matches!(
             Cli::try_parse_from(["clank", "wait"]).unwrap().command,
