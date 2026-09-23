@@ -189,7 +189,7 @@ pub(crate) async fn fetch_content<F: ContentFetch>(
 /// standing up a second authorized path.
 pub(crate) struct SessionFetch(
     pub(crate)  std::sync::Arc<
-        crate::cli::github_events::GithubSession<crate::cli::github_events::ReqwestSend>,
+        crate::cli::github::session::GithubSession<crate::cli::github::session::ReqwestSend>,
     >,
 );
 

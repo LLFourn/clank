@@ -1417,12 +1417,12 @@ impl WaitPage {
 #[derive(Debug, Clone)]
 pub(super) struct EventPage {
     /// The targeted copy — the FULL key.
-    pub(super) target: crate::cli::github_timeline::MemberKey,
+    pub(super) target: crate::cli::github::timeline::MemberKey,
     /// The component's sorted member keys as of the last successful
     /// refresh; retargeting follows the first surviving key.
-    pub(super) retained: Vec<crate::cli::github_timeline::MemberKey>,
+    pub(super) retained: Vec<crate::cli::github::timeline::MemberKey>,
     /// The component's current merged view.
-    pub(super) event: crate::cli::github_timeline::MergedEvent,
+    pub(super) event: crate::cli::github::timeline::MergedEvent,
     /// Standing watch prompts, deduplicated: `None` attribution when
     /// every member's prompt agrees, per-agent attribution when they
     /// differ (tui-github-event-page).
@@ -1718,7 +1718,7 @@ pub(super) enum EventEffect {
     /// Launch this exact URL via the shared opener.
     Open(String),
     /// Fan these member keys through the shared events-ack core.
-    AckFanout(Vec<crate::cli::github_timeline::MemberKey>),
+    AckFanout(Vec<crate::cli::github::timeline::MemberKey>),
     /// Close the page.
     Close,
     /// Re-request the body under a fresh generation.

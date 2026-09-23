@@ -627,10 +627,10 @@ pub(crate) fn resolve_wait_event_sources(
 ) -> anyhow::Result<
     Vec<(
         clank_core::agent_config::WaitEventSource,
-        crate::cli::github_events::SourceOrigin,
+        crate::cli::github::supervisor::SourceOrigin,
     )>,
 > {
-    use crate::cli::github_events::SourceOrigin;
+    use crate::cli::github::supervisor::SourceOrigin;
     // Provenance rides the merge (github-watch-prompts, codex
     // 16ea191): who declared a source decides who stores its prompt.
     let mut sources: Vec<_> = crate::agent_store::load_agent_config(repo, author)?
@@ -721,7 +721,7 @@ impl EventSources {
     fn spawn(
         sources: &[(
             clank_core::agent_config::WaitEventSource,
-            crate::cli::github_events::SourceOrigin,
+            crate::cli::github::supervisor::SourceOrigin,
         )],
         events_dir: Option<&std::path::Path>,
     ) -> Self {
@@ -734,12 +734,14 @@ impl EventSources {
                     tasks.push(tokio::spawn(run_command_source(c.clone(), tx.clone())));
                 }
                 WaitEventSource::Github(g) => {
-                    tasks.push(tokio::spawn(crate::cli::github_events::run_github_source(
-                        g.clone(),
-                        tx.clone(),
-                        events_dir.map(std::path::Path::to_path_buf),
-                        *origin,
-                    )));
+                    tasks.push(tokio::spawn(
+                        crate::cli::github::supervisor::run_github_source(
+                            g.clone(),
+                            tx.clone(),
+                            events_dir.map(std::path::Path::to_path_buf),
+                            *origin,
+                        ),
+                    ));
                 }
             }
         }

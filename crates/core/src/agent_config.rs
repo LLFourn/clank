@@ -160,7 +160,7 @@ pub enum GithubEventKind {
 impl GithubEventKind {
     /// Whether this kind is read from a PR's checks rather than from
     /// the repo's event feed. The two CI kinds are a reduction over
-    /// every check reporting on a PR head (`github_ci`), because no
+    /// every check reporting on a PR head (`github::ci`), because no
     /// single check suite is evidence about the PR.
     pub fn is_ci(self) -> bool {
         matches!(self, Self::CiPassed | Self::CiFailed)

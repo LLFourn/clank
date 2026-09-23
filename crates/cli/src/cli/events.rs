@@ -7,7 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::cli::github_event_log::{EventLog, EventRow};
+use crate::cli::github::log::{EventLog, EventRow};
 use clank_core::ids::AgentLabel;
 use clank_core::wait::WaitItem;
 
@@ -80,7 +80,7 @@ pub(crate) fn join_prompts(
     let mut prompts = std::collections::HashMap::new();
     let mut declared = std::collections::HashSet::new();
     for g in config {
-        let key = crate::cli::github_events::source_key(g);
+        let key = crate::cli::github::supervisor::source_key(g);
         if let Some(p) = &g.prompt {
             prompts.insert(key.clone(), p.clone());
         }
@@ -428,11 +428,11 @@ fn append_ack_target(t: &AckTarget) -> anyhow::Result<()> {
 /// Vanished and already-handled members resolve to explicit no-ops.
 pub(crate) fn ack_members(
     repo: &Path,
-    members: &[crate::cli::github_timeline::MemberKey],
+    members: &[crate::cli::github::timeline::MemberKey],
 ) -> anyhow::Result<usize> {
     let mut by_agent: std::collections::BTreeMap<
         &str,
-        Vec<&crate::cli::github_timeline::MemberKey>,
+        Vec<&crate::cli::github::timeline::MemberKey>,
     > = Default::default();
     for m in members {
         by_agent.entry(m.agent.as_str()).or_default().push(m);
@@ -524,7 +524,7 @@ fn show(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::github_event_log::Transport;
+    use crate::cli::github::log::Transport;
 
     fn item(n: u64) -> WaitItem {
         WaitItem::GithubEvent {
@@ -715,7 +715,7 @@ mod tests {
         // across BOTH agents' WALs through the shared core, with the
         // discriminated selector where a WAL's seq is ambiguous, and
         // vanished/already-acked copies skipped.
-        use crate::cli::github_timeline::MemberKey;
+        use crate::cli::github::timeline::MemberKey;
         let root = tempdir();
         let repo = root.as_path();
         let mk_agent = |agent: &str| {
@@ -761,7 +761,7 @@ mod tests {
 
     #[test]
     fn ack_members_discriminates_damaged_seqs_and_two_phases_on_failure() {
-        use crate::cli::github_timeline::MemberKey;
+        use crate::cli::github::timeline::MemberKey;
         let root = tempdir();
         let repo = root.as_path();
         let a = crate::agent_store::agents_root(repo)
@@ -838,7 +838,7 @@ mod tests {
         // prompt wins; a configured watch REMOVED from config leaves
         // no prompt (its arm never wrote a sidecar — and removes any
         // leftover); genuine CLI-only metadata stays visible.
-        use crate::cli::github_events::{SourceOrigin, write_watch_sidecar};
+        use crate::cli::github::supervisor::{SourceOrigin, write_watch_sidecar};
         use clank_core::agent_config::{Delivery, GithubEventKind, GithubSource};
         let dir = tempdir();
         let gh = |repo: &str, prompt: Option<&str>| GithubSource {
@@ -851,7 +851,7 @@ mod tests {
             prompt: prompt.map(str::to_string),
             delivery: Delivery::Poll,
         };
-        let key = |g: &GithubSource| crate::cli::github_events::source_key(g);
+        let key = |g: &GithubSource| crate::cli::github::supervisor::source_key(g);
         let configured = gh("o/a", Some("configured intent"));
         let cli_only = gh("o/c", Some("cli intent"));
 
@@ -903,7 +903,7 @@ mod tests {
         let declared_prompted = gh("o/a", Some("from config"));
         let declared_promptless = gh("o/b", None);
         let cli_only = gh("o/c", Some("from --event"));
-        let key = |g: &GithubSource| crate::cli::github_events::source_key(g);
+        let key = |g: &GithubSource| crate::cli::github::supervisor::source_key(g);
         // Sidecars: a STALE one for the declared-promptless source
         // (must be suppressed — config is authoritative for declared
         // sources) and a live one for the CLI-only source.

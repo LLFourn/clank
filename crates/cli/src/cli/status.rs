@@ -127,7 +127,7 @@ pub struct StatusSnapshot {
     /// `OnelineRow::Github` rows in `log_rows` (set together —
     /// tui-github-event-page).
     #[serde(skip)]
-    pub(crate) github_events: Vec<crate::cli::github_timeline::MergedEvent>,
+    pub(crate) github_events: Vec<crate::cli::github::timeline::MergedEvent>,
     /// The fold's pending AD-HOC commit review, if any — carried so
     /// the TUI's activity projection sees the same work `clank wait`
     /// delivers (tui-adhoc-review-activity).
@@ -542,7 +542,7 @@ impl StatusSnapshot {
         plan_arg: Option<&str>,
         watch_mode: bool,
         log_rows: Vec<crate::cli::log::OnelineRow>,
-        github_events: Vec<crate::cli::github_timeline::MergedEvent>,
+        github_events: Vec<crate::cli::github::timeline::MergedEvent>,
         log_next: Option<crate::cli::log::HistoryCursor>,
     ) -> anyhow::Result<Self> {
         // One ODB handle for the whole snapshot: HEAD facts, the dirty
@@ -1050,7 +1050,7 @@ fn log_decorations(
 #[derive(Default)]
 pub(crate) struct TuiLogRead {
     pub(crate) rows: Vec<crate::cli::log::OnelineRow>,
-    pub(crate) github_events: Vec<crate::cli::github_timeline::MergedEvent>,
+    pub(crate) github_events: Vec<crate::cli::github::timeline::MergedEvent>,
     pub(crate) next: Option<crate::cli::log::HistoryCursor>,
 }
 
@@ -1159,9 +1159,9 @@ async fn log_rows_page(
     // (log-timeline-github-events); read notices lead the pane as dim
     // rows — the TUI's rendering of the snapshot's diagnostics.
     let snap = if include_github {
-        crate::cli::github_timeline::timeline_snapshot(repo)
+        crate::cli::github::timeline::timeline_snapshot(repo)
     } else {
-        crate::cli::github_timeline::TimelineSnapshot::default()
+        crate::cli::github::timeline::TimelineSnapshot::default()
     };
     let items = crate::cli::log::interleave_with_plain(&newest_first, &history.plain, &snap.events);
     let mut rows: Vec<crate::cli::log::OnelineRow> = snap

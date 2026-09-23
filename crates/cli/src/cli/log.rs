@@ -86,11 +86,11 @@ pub async fn run(args: LogArgs) -> anyhow::Result<()> {
     // Github events interleave by time (log-timeline-github-events)
     // unless excluded; a plan-scoped view is plan work only, so the
     // repo-wide github stream stays out of it too.
-    let gh_events: Vec<crate::cli::github_timeline::MergedEvent> =
+    let gh_events: Vec<crate::cli::github::timeline::MergedEvent> =
         if args.no_github || plan_filter.is_some() {
             Vec::new()
         } else {
-            let snap = crate::cli::github_timeline::timeline_snapshot(&repo);
+            let snap = crate::cli::github::timeline::timeline_snapshot(&repo);
             for n in &snap.notices {
                 eprintln!("log: {n}");
             }
@@ -268,7 +268,7 @@ async fn history_from_page(
 pub(crate) enum TimelineItem<'a> {
     Repo(&'a LogEvent),
     Plain(&'a PlainCommit),
-    Github(usize, &'a crate::cli::github_timeline::MergedEvent),
+    Github(usize, &'a crate::cli::github::timeline::MergedEvent),
 }
 
 /// Two-pointer newest-first merge preserving each list's own order.
@@ -280,7 +280,7 @@ pub(crate) enum TimelineItem<'a> {
 #[cfg(test)]
 pub(crate) fn interleave<'a>(
     events: &[&'a LogEvent],
-    gh: &'a [crate::cli::github_timeline::MergedEvent],
+    gh: &'a [crate::cli::github::timeline::MergedEvent],
 ) -> Vec<TimelineItem<'a>> {
     interleave_with_plain(events, &[], gh)
 }
@@ -288,7 +288,7 @@ pub(crate) fn interleave<'a>(
 pub(crate) fn interleave_with_plain<'a>(
     events: &[&'a LogEvent],
     plain: &'a [PlainCommit],
-    gh: &'a [crate::cli::github_timeline::MergedEvent],
+    gh: &'a [crate::cli::github::timeline::MergedEvent],
 ) -> Vec<TimelineItem<'a>> {
     let floor = plain
         .last()
@@ -298,7 +298,7 @@ pub(crate) fn interleave_with_plain<'a>(
     // by enumerate BEFORE the floor filter and the reversal, so the
     // displayed row and the event it opens share identity (codex
     // d7f4d40: a derived-list position inverted the mapping).
-    let mut gh_desc: Vec<(usize, &crate::cli::github_timeline::MergedEvent)> = gh
+    let mut gh_desc: Vec<(usize, &crate::cli::github::timeline::MergedEvent)> = gh
         .iter()
         .enumerate()
         .filter(|(_, g)| {
@@ -347,7 +347,7 @@ pub(crate) fn interleave_with_plain<'a>(
 /// pre-watch (baseline) history — it's context, not team activity —
 /// while live rows get the cyan badge; no-color output keeps the
 /// textual markers (codex c917ba7).
-fn gh_colored_row(g: &crate::cli::github_timeline::MergedEvent, mark: &str) -> String {
+fn gh_colored_row(g: &crate::cli::github::timeline::MergedEvent, mark: &str) -> String {
     let line = gh_describe(g);
     if g.baseline {
         format!("{DIM}gh {line}{mark}{Z}")
@@ -359,7 +359,7 @@ fn gh_colored_row(g: &crate::cli::github_timeline::MergedEvent, mark: &str) -> S
 /// One-line description shared by the oneline and human renderers —
 /// mirrors the `clank events` CLI's shape so the two surfaces read
 /// the same.
-fn gh_describe(g: &crate::cli::github_timeline::MergedEvent) -> String {
+fn gh_describe(g: &crate::cli::github::timeline::MergedEvent) -> String {
     // WHO first: scanning the timeline, the actor is the fastest way to
     // tell your own activity from someone else's, so it leads rather
     // than trailing after a title that can be long enough to truncate.
@@ -1350,8 +1350,8 @@ fn json_rows<'a>(
 mod json_output_tests {
     use super::*;
 
-    fn gh(at: u64, key_hint: &str, unhandled: bool) -> crate::cli::github_timeline::MergedEvent {
-        crate::cli::github_timeline::MergedEvent {
+    fn gh(at: u64, key_hint: &str, unhandled: bool) -> crate::cli::github::timeline::MergedEvent {
+        crate::cli::github::timeline::MergedEvent {
             at,
             repo: "o/r".into(),
             event: "pr_comment".into(),
@@ -1431,7 +1431,7 @@ mod json_output_tests {
         // color paths — not just a cyan badge — and keeps the textual
         // marker without ANSI in plain output.
         let base = gh(100, "old news", false);
-        let base = crate::cli::github_timeline::MergedEvent {
+        let base = crate::cli::github::timeline::MergedEvent {
             baseline: true,
             ..base
         };
@@ -1771,7 +1771,7 @@ mod tests {
             ts: 3,
             subject: "[split] wrap up".into(),
         };
-        let event = crate::cli::github_timeline::MergedEvent {
+        let event = crate::cli::github::timeline::MergedEvent {
             at: 2,
             repo: "o/r".into(),
             event: "pr_comment".into(),

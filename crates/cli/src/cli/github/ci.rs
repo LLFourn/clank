@@ -14,7 +14,8 @@
 use clank_core::agent_config::GithubEventKind;
 use clank_core::wait::WaitItem;
 
-use super::github_events::{Classified, GithubSession, HttpSend};
+use super::feed::Classified;
+use super::session::{GithubSession, HttpSend};
 
 /// What one check says about a commit.
 ///
@@ -338,7 +339,7 @@ pub(crate) fn is_ci_key(key: &str) -> bool {
 /// result between them (a re-run going red, green, red is two wakes,
 /// not three).
 pub(crate) fn action_key(kind: GithubEventKind, pr: u64, head: &str) -> String {
-    format!("{}#{pr}@{head}", crate::cli::github_events::kind_str(kind))
+    format!("{}#{pr}@{head}", crate::cli::github::feed::kind_str(kind))
 }
 
 /// Every in-scope PR's current result. `prs` empty means every open
@@ -390,7 +391,7 @@ pub(crate) fn item(repo: &str, pr: &PrHead, rollup: &CiRollup) -> Option<WaitIte
     };
     Some(WaitItem::GithubEvent {
         repo: repo.to_string(),
-        event: crate::cli::github_events::kind_str(kind).to_string(),
+        event: crate::cli::github::feed::kind_str(kind).to_string(),
         detail: None,
         number: Some(pr.number),
         title: Some(title),
@@ -511,7 +512,7 @@ impl CiHorizon {
             }
             let fresh = said
                 .kinds
-                .insert(crate::cli::github_events::kind_str(w.kind).to_string());
+                .insert(crate::cli::github::feed::kind_str(w.kind).to_string());
             if fresh && self.established {
                 news.push(w.action);
             }
@@ -551,11 +552,48 @@ pub(crate) fn wakes(
         .collect()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// Reads a repo's CI conclusions — injected like the events fetcher,
+/// so the loop's CI horizon is testable without a network.
+pub(crate) trait CiReader {
+    fn read(
+        &self,
+    ) -> impl Future<
+        Output = anyhow::Result<
+            Vec<(
+                crate::cli::github::ci::PrHead,
+                crate::cli::github::ci::CiRollup,
+            )>,
+        >,
+    > + Send;
+}
 
-    use crate::cli::github_events::MiniResponse;
+/// Production reader: the checks endpoints over the SHARED session.
+pub(super) struct GhCi<S: HttpSend> {
+    pub(super) repo: String,
+    pub(super) prs: Vec<u64>,
+    pub(super) session: std::sync::Arc<GithubSession<S>>,
+}
+
+impl<S: HttpSend> CiReader for GhCi<S> {
+    async fn read(
+        &self,
+    ) -> anyhow::Result<
+        Vec<(
+            crate::cli::github::ci::PrHead,
+            crate::cli::github::ci::CiRollup,
+        )>,
+    > {
+        crate::cli::github::ci::read_conclusions(&self.session, &self.repo, &self.prs).await
+    }
+}
+
+#[cfg(test)]
+pub(super) mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    use crate::cli::github::ci;
+    use crate::cli::github::session::MiniResponse;
 
     /// Scripted HTTP that answers by URL and records what was asked,
     /// so the reader's own urls are under test rather than assumed.
@@ -1328,6 +1366,102 @@ mod tests {
                 failing: vec!["test".into()]
             },
             "and an unreadable entry is never named as a failure",
+        );
+    }
+
+    // ── session auth: sharing + uniform 401 recovery ──────────
+
+    /// A CI reader that finds nothing — the horizon stays cold and
+    /// the feed's own tests are untouched by it.
+    pub(in crate::cli::github) struct NoCi;
+
+    impl CiReader for NoCi {
+        async fn read(
+            &self,
+        ) -> anyhow::Result<
+            Vec<(
+                crate::cli::github::ci::PrHead,
+                crate::cli::github::ci::CiRollup,
+            )>,
+        > {
+            Ok(Vec::new())
+        }
+    }
+
+    /// A CI reader scripted tick by tick; exhausted → the last
+    /// result repeats, which is what an unchanged build looks like.
+    pub(in crate::cli::github) struct ScriptCi(
+        Mutex<std::collections::VecDeque<Vec<(ci::PrHead, ci::CiRollup)>>>,
+    );
+
+    impl ScriptCi {
+        pub(in crate::cli::github) fn new(rounds: Vec<Vec<(ci::PrHead, ci::CiRollup)>>) -> Self {
+            Self(Mutex::new(rounds.into()))
+        }
+    }
+
+    impl CiReader for ScriptCi {
+        async fn read(&self) -> anyhow::Result<Vec<(ci::PrHead, ci::CiRollup)>> {
+            let mut q = self.0.lock().unwrap();
+            let next = if q.len() > 1 {
+                q.pop_front().unwrap()
+            } else {
+                q.front().cloned().unwrap_or_default()
+            };
+            Ok(next)
+        }
+    }
+
+    /// A reader that always fails — the CI horizon is broken, the
+    /// feed's is not.
+    pub(in crate::cli::github) struct DeadCi;
+
+    impl CiReader for DeadCi {
+        async fn read(&self) -> anyhow::Result<Vec<(ci::PrHead, ci::CiRollup)>> {
+            anyhow::bail!("checks unreachable")
+        }
+    }
+
+    pub(in crate::cli::github) fn red(
+        number: u64,
+        head: &str,
+        job: &str,
+    ) -> (ci::PrHead, ci::CiRollup) {
+        (
+            ci::PrHead {
+                number,
+                head: head.into(),
+            },
+            ci::CiRollup::Failed {
+                failing: vec![job.into()],
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn a_watch_that_wants_only_red_is_never_woken_by_green() {
+        let results = vec![
+            (
+                ci::PrHead {
+                    number: 7,
+                    head: "head1".into(),
+                },
+                ci::CiRollup::Passed,
+            ),
+            red(9, "head2", "fmt"),
+        ];
+        let only_red = ci::wakes("o/r", &[GithubEventKind::CiFailed], &results);
+        assert_eq!(only_red.len(), 1);
+        assert_eq!(only_red[0].action.key.as_deref(), Some("ci_failed#9@head2"));
+        let both = ci::wakes(
+            "o/r",
+            &[GithubEventKind::CiFailed, GithubEventKind::CiPassed],
+            &results,
+        );
+        assert_eq!(both.len(), 2);
+        assert!(
+            ci::wakes("o/r", &[GithubEventKind::PrOpened], &results).is_empty(),
+            "a watch with no ci kinds reads no ci wakes",
         );
     }
 }

@@ -1244,7 +1244,7 @@ impl EventLog {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
     fn item(n: u64) -> WaitItem {
@@ -2093,5 +2093,90 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    // ── the ingest lease: one writer, tailers present (wal-single-ingest-writer) ──
+
+    #[test]
+    fn ingest_lease_is_exclusive_and_freed_on_drop() {
+        let dir = wal_tempdir();
+        let a = crate::cli::github::log::IngestLease::try_acquire(&dir, "k").unwrap();
+        assert!(a.is_some());
+        assert!(
+            crate::cli::github::log::IngestLease::try_acquire(&dir, "k")
+                .unwrap()
+                .is_none(),
+            "held lease reads as CONTENDED, not an error"
+        );
+        assert!(
+            crate::cli::github::log::IngestLease::try_acquire(&dir, "other")
+                .unwrap()
+                .is_some(),
+            "leases are per source"
+        );
+        drop(a);
+        // NOT instantaneous under concurrent forks: an `flock` lives on
+        // the open file DESCRIPTION, `fork()` duplicates the fd into the
+        // child, and `O_CLOEXEC` closes it only at `exec()`. So while any
+        // other test in this binary spawns a process, a dropped holder's
+        // lock can still be held by that child for the fork→exec window.
+        // The property under test is that the drop RELEASES, not that it
+        // releases within one instruction.
+        let freed = (0..200).any(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            crate::cli::github::log::IngestLease::try_acquire(&dir, "k")
+                .unwrap()
+                .is_some()
+        });
+        assert!(freed, "dropping the holder frees the lease");
+        // A REAL failure (the "dir" is a file) is an error, never
+        // contention (codex 8bf682e).
+        let file_path = dir.join("not-a-dir");
+        std::fs::write(&file_path, b"x").unwrap();
+        assert!(
+            crate::cli::github::log::IngestLease::try_acquire(&file_path, "k").is_err(),
+            "an unusable dir must surface as an error"
+        );
+    }
+
+    // ── the WAL wiring: offline catch-up end to end ──
+
+    pub(in crate::cli::github) fn wal_tempdir() -> std::path::PathBuf {
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "clank-gh-wal-wiring-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    pub(in crate::cli::github) fn open_log(
+        dir: &std::path::Path,
+    ) -> crate::cli::github::log::EventLog {
+        crate::cli::github::log::EventLog::open(dir, "t").unwrap()
+    }
+
+    #[test]
+    fn a_legacy_event_row_still_decodes_and_stays_byte_identical() {
+        // Every row logged before the reference existed lacks the key.
+        // It must decode (serde default) AND re-serialize unchanged,
+        // or the WAL rewrites itself on first read.
+        let legacy = r#"{"kind":"github_event","repo":"o/r","event":"pr_comment","detail":"review","number":42,"title":"t","actor":"a","url":"u"}"#;
+        let item: clank_core::wait::WaitItem =
+            serde_json::from_str(legacy).expect("legacy rows must still decode");
+        match &item {
+            clank_core::wait::WaitItem::GithubEvent { content, .. } => {
+                assert!(content.is_none(), "absent, not defaulted to something");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_eq!(
+            serde_json::to_string(&item).unwrap(),
+            legacy,
+            "a legacy row must round-trip byte-for-byte"
+        );
     }
 }

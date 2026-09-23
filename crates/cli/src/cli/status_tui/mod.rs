@@ -756,7 +756,7 @@ struct Retarget {
 /// `None` means the component is gone and the page should close.
 fn retarget_event_page(
     page: &mut Option<EventPage>,
-    events: &[crate::cli::github_timeline::MergedEvent],
+    events: &[crate::cli::github::timeline::MergedEvent],
     repo: &std::path::Path,
     sel: usize,
     next_generation: &mut u64,
@@ -774,7 +774,7 @@ fn retarget_event_page(
     // continuously while a failure persists (Contract 4) and would
     // discard a body already on screen.
     let now =
-        crate::cli::github_timeline::resolve_content_ref(&ep.event.members, &ep.target).cloned();
+        crate::cli::github::timeline::resolve_content_ref(&ep.event.members, &ep.target).cloned();
     let mut fetch = None;
     if content_needs_refetch(ep.content.as_ref().map(|c| &c.target), now.as_ref()) {
         ep.content = now.map(|target| {
@@ -819,7 +819,7 @@ fn spawn_content_fetch(
 ) {
     let tx = ev_tx.clone();
     tokio::spawn(async move {
-        let fetcher = event_content::SessionFetch(crate::cli::github_events::shared_session());
+        let fetcher = event_content::SessionFetch(crate::cli::github::session::shared_session());
         let state = event_content::fetch_content(&fetcher, &repo, &target).await;
         let _ = tx.send(Ev::Content {
             generation,
@@ -831,7 +831,7 @@ fn spawn_content_fetch(
 
 fn refetch_event_page(
     page: &mut Option<EventPage>,
-    events: &[crate::cli::github_timeline::MergedEvent],
+    events: &[crate::cli::github::timeline::MergedEvent],
 ) -> bool {
     let Some(p) = page.as_mut() else {
         return false;
@@ -857,7 +857,7 @@ fn refetch_event_page(
 /// when they differ (tui-github-event-page).
 fn event_prompts(
     repo: &std::path::Path,
-    event: &crate::cli::github_timeline::MergedEvent,
+    event: &crate::cli::github::timeline::MergedEvent,
 ) -> Vec<(Option<String>, String)> {
     use std::collections::BTreeSet;
     let mut per_agent: std::collections::HashMap<
@@ -4086,7 +4086,7 @@ pub(crate) async fn run_tui(
                                         && let Some(first) = ev.members.first()
                                     {
                                         let want =
-                                            crate::cli::github_timeline::resolve_content_ref(
+                                            crate::cli::github::timeline::resolve_content_ref(
                                                 &ev.members,
                                                 &first.key,
                                             )
@@ -4793,24 +4793,24 @@ pub(crate) mod tests {
         seq: u64,
         ident: &str,
         acked: bool,
-    ) -> crate::cli::github_timeline::MemberRef {
-        crate::cli::github_timeline::MemberRef {
-            key: crate::cli::github_timeline::MemberKey {
+    ) -> crate::cli::github::timeline::MemberRef {
+        crate::cli::github::timeline::MemberRef {
+            key: crate::cli::github::timeline::MemberKey {
                 agent: agent.into(),
                 source: "github-o-r-aaaa".into(),
                 seq,
                 ident: ident.into(),
             },
             acked,
-            transport: crate::cli::github_event_log::Transport::Poll,
+            transport: crate::cli::github::log::Transport::Poll,
             content: None,
         }
     }
 
     fn mk_event(
-        members: Vec<crate::cli::github_timeline::MemberRef>,
-    ) -> crate::cli::github_timeline::MergedEvent {
-        crate::cli::github_timeline::MergedEvent {
+        members: Vec<crate::cli::github::timeline::MemberRef>,
+    ) -> crate::cli::github::timeline::MergedEvent {
+        crate::cli::github::timeline::MergedEvent {
             at: 1,
             repo: "o/r".into(),
             event: "issue_opened".into(),
@@ -4917,7 +4917,7 @@ pub(crate) mod tests {
         // carries the exact URL production hands the shared opener,
         // and the exact unhandled keys the fanout receives; a no-URL
         // browser action resolves to None (belt: the menu omits it).
-        let handled = crate::cli::github_timeline::MemberRef {
+        let handled = crate::cli::github::timeline::MemberRef {
             acked: true,
             ..mk_member("beta", 2, "f:2", true)
         };

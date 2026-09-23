@@ -6796,7 +6796,7 @@ mod tests {
         use super::super::event_content::{ContentSlot, ContentState, EventBody};
         use clank_core::wait::ContentRef;
 
-        let ev = crate::cli::github_timeline::MergedEvent {
+        let ev = crate::cli::github::timeline::MergedEvent {
             at: 0,
             repo: "o/r".into(),
             event: "pr_comment".into(),
@@ -6808,15 +6808,15 @@ mod tests {
             seen_by: vec!["alpha".into()],
             unhandled: true,
             baseline: false,
-            members: vec![crate::cli::github_timeline::MemberRef {
-                key: crate::cli::github_timeline::MemberKey {
+            members: vec![crate::cli::github::timeline::MemberRef {
+                key: crate::cli::github::timeline::MemberKey {
                     agent: "alpha".into(),
                     source: "github-o-r-aaaa".into(),
                     seq: 1,
                     ident: String::new(),
                 },
                 acked: false,
-                transport: crate::cli::github_event_log::Transport::Poll,
+                transport: crate::cli::github::log::Transport::Poll,
                 content: None,
             }],
         };
@@ -6858,8 +6858,8 @@ mod tests {
         // omitted without a URL, ack omitted when handled), every
         // member with per-copy transport + state, and prompts with
         // attribution only when they differ.
-        use crate::cli::github_event_log::Transport;
-        use crate::cli::github_timeline::{MemberKey, MemberRef, MergedEvent};
+        use crate::cli::github::log::Transport;
+        use crate::cli::github::timeline::{MemberKey, MemberRef, MergedEvent};
         let member = |agent: &str, acked: bool, transport| MemberRef {
             key: MemberKey {
                 agent: agent.into(),

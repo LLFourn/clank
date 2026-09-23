@@ -20,7 +20,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use crate::cli::github_event_log::EventLog;
+use crate::cli::github::log::EventLog;
 use clank_core::wait::WaitItem;
 
 /// A copy's IMMUTABLE identity — the COMPLETE copy key
@@ -47,7 +47,7 @@ pub(crate) struct MemberRef {
     #[serde(flatten)]
     pub(crate) key: MemberKey,
     pub(crate) acked: bool,
-    pub(crate) transport: crate::cli::github_event_log::Transport,
+    pub(crate) transport: crate::cli::github::log::Transport,
     /// This copy's content reference (tui-github-event-content).
     /// Absent on rows logged before it existed, which is why the
     /// component-level resolution below cannot simply take member
@@ -141,7 +141,7 @@ struct Copy {
     source: String,
     seq: u64,
     ident: String,
-    transport: crate::cli::github_event_log::Transport,
+    transport: crate::cli::github::log::Transport,
     display_at: u64,
     aliases: Vec<(String, String)>,
     item: WaitItem,
@@ -368,7 +368,7 @@ mod tests {
                 ident: String::new(),
             },
             acked: false,
-            transport: crate::cli::github_event_log::Transport::Poll,
+            transport: crate::cli::github::log::Transport::Poll,
             content,
         }
     }
@@ -426,7 +426,7 @@ mod tests {
         assert_eq!(resolve_content_ref(&members, &gone), None);
     }
     use super::*;
-    use crate::cli::github_event_log::Transport;
+    use crate::cli::github::log::Transport;
     use std::path::PathBuf;
 
     fn item(repo: &str, n: u64, title: Option<&str>) -> WaitItem {
