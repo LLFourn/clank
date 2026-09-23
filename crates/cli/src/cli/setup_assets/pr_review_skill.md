@@ -1,6 +1,6 @@
 ---
 name: clank-pr-review
-description: Run the clank multi-agent review loop against a GitHub PR. Master drafts inline review comments; reviewers iterate on them until the team agrees; the agreed set is submitted as one published review. Load this when working in a `clank pr-review` session.
+description: Run the clank multi-agent review loop against a GitHub PR. Master drafts inline review comments; reviewers iterate on them until the team agrees; the agreed draft is handed to the human UNSUBMITTED. Load this when working in a `clank pr-review` session.
 ---
 
 # Clank PR review
@@ -17,7 +17,11 @@ review GitHub allows per user per PR.
 - **Master** integrates each reply, deletes it, and bumps the round.
 - **Converged** = every reviewer's verdict is FINISHED for the
   current round and only master's top-level comments remain.
-- **Submit** publishes the pending review as one review.
+- **Finish** hands the draft over. NOTHING is published: the review
+  stays pending, which only its author can see, and the human reads it
+  in GitHub's interface, edits what they disagree with, and submits it
+  or does not. Whether a review goes out as APPROVE or REQUEST_CHANGES
+  is not yours to decide, and a published review cannot be recalled.
 
 The verdict files under `.clank/pr-reviews/<pr>/reviews/` are the
 AUTHORITATIVE convergence signal — the GitHub comments are the
@@ -42,18 +46,20 @@ set) = reviewer. The `🤖` marker is for human attribution only.
   — reviewer: record your authoritative verdict for the current
   round. Author + PR inferred from your binding + the single
   active review.
-- `clank pr-review submit --event <approve|request-changes|comment>`
-  — MASTER ONLY. Mandatory `--event` (GitHub's canonical review
-  outcome). Gate must be converged; re-sweeps reviewer replies, then
-  publishes the pending review with that event and `master.md`'s
-  body. `request-changes`/`comment` require a body; `approve` may
-  omit it.
+- `clank pr-review finish` — MASTER ONLY, and it submits nothing.
+  Gate must be converged; removes every 👍 the loop left on your
+  comments (a reviewer's approval is scaffolding, not a finding),
+  puts `master.md`'s `## Review summary` onto the pending review so
+  the human reads it above your comments, tells you how many reviewer
+  replies are still in the draft, and retires the local scratch.
+  Nothing you can pass makes it publish. Retryable: if it fails
+  partway the scratch survives, so run it again.
 - `clank pr-review abort` — MASTER ONLY. Discard the pending review
   + local scratch.
 
 ## gh incantations (verified) — the comment substance
 
-clank owns the lifecycle (start/submit/abort); the comments
+clank owns the lifecycle (start/finish/abort); the comments
 themselves are raw `gh`. `SLUG` is the `repo` from
 `.clank/pr-reviews/<pr>/pr.json` (`owner/name`); `SHA` is its
 pinned `head_sha`. Run these EXACTLY — small mistakes post to a
@@ -117,17 +123,18 @@ cannot combine with `--jq`.
 **Master**
 1. `clank pr-review start <pr>`; read the PR; draft top-level
    comments (first via the create call, more via
-   `addPullRequestReviewThread`). Keep `master.md` updated with
-   your summary + the body you'll submit. Reviewers are NOT summoned
-   during drafting (round 0).
+   `addPullRequestReviewThread`). Keep `master.md` updated, including
+   `## Review summary` — that text goes onto the draft itself, and it
+   is what the human reads first. Reviewers are NOT summoned during
+   drafting (round 0).
 2. `clank pr-review propose` — opens the review (round 0 → 1) and
    summons reviewers. Do this only once the draft is ready.
 3. When reviewers reply: integrate each into your comments, then
    DELETE the reply, then `clank pr-review propose` again to re-open
    at a fresh round (their stale approvals no longer count).
 4. When `clank pr-review status` shows converged → `clank pr-review
-   submit --event <approve|request-changes|comment>` (the outcome
-   you're publishing to the PR).
+   finish`. That is the end of your part: the draft is the human's to
+   read, edit and submit. Do NOT submit it, and do not ask them to.
 
 **Reviewer**
 1. On a wake, read master's pending comments + the PR.

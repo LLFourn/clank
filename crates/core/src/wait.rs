@@ -54,8 +54,10 @@ pub enum PrMasterNext {
     /// feedback into the pending review, delete the reply, bump the
     /// round.
     Integrate,
-    /// Both tiers FINISHED: submit the pending review.
-    Submit,
+    /// Both tiers FINISHED: hand the draft over. Nothing is
+    /// published — `clank pr-review finish` cleans the draft and
+    /// leaves it for the human to read and submit.
+    Finish,
     /// Commit tier continued-not-finished (no milestone). Keep
     /// refining / nudge reviewers toward FINISHED.
     Continue,
@@ -1560,7 +1562,7 @@ impl WorkStatus {
                     } else {
                         match pr.gate {
                             CommitGateState::ChangesRequested => Some(PrMasterNext::Integrate),
-                            CommitGateState::Finished => Some(PrMasterNext::Submit),
+                            CommitGateState::Finished => Some(PrMasterNext::Finish),
                             CommitGateState::Continued => Some(PrMasterNext::Continue),
                             // Unreviewed / ContinuedPendingGate →
                             // reviewers' turn; Blocked is unreachable
@@ -3188,7 +3190,7 @@ mod tests {
         use crate::vocab::CommitGateState;
         let cases = [
             (CommitGateState::ChangesRequested, PrMasterNext::Integrate),
-            (CommitGateState::Finished, PrMasterNext::Submit),
+            (CommitGateState::Finished, PrMasterNext::Finish),
             (CommitGateState::Continued, PrMasterNext::Continue),
         ];
         for (gate, next) in cases {

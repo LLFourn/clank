@@ -903,18 +903,16 @@ pub enum PrReviewCmd {
     Propose(PrReviewProposeArgs),
     /// Discard a PR review's local scratch (master-only).
     Abort(PrReviewAbortArgs),
-    /// Publish the converged review to the PR (master-only).
-    Submit(PrReviewSubmitArgs),
+    /// Hand the converged review over as a DRAFT (master-only).
+    /// Nothing is submitted: the pending review stays yours to read,
+    /// edit and submit on GitHub.
+    Finish(PrReviewFinishArgs),
     /// Round + per-reviewer verdicts + who we're waiting on.
     Status(PrReviewStatusArgs),
 }
 
 #[derive(Args, Debug)]
-pub struct PrReviewSubmitArgs {
-    /// The review outcome to publish (GitHub's canonical events).
-    /// Required — master must state the verdict.
-    #[arg(long, value_enum)]
-    pub event: crate::cli::pr_review::ReviewEvent,
+pub struct PrReviewFinishArgs {
     /// PR number. Defaults to the single active review.
     #[arg(long)]
     pub pr: Option<u32>,

@@ -1571,10 +1571,16 @@ mod tests {
             "clank pr-review start",
             "clank pr-review propose",
             "clank pr-review note",
-            "clank pr-review submit",
+            "clank pr-review finish",
         ] {
             assert!(body.contains(verb), "skill must document `{verb}`");
         }
+        // The terminal verb submits nothing, so the skill must not
+        // teach an outcome to publish with.
+        assert!(
+            !body.contains("--event"),
+            "the skill still teaches a review outcome"
+        );
         // The verified gh paths (top-level add, threaded reply).
         assert!(
             body.contains("addPullRequestReviewThread"),

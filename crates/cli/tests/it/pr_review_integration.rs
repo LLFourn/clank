@@ -349,55 +349,262 @@ fn pr_review_inputs_drop_stale_round_verdicts() {
     );
 }
 
+/// A scripted handoff boundary: records what the remote half was
+/// asked to do, and can fail on demand. There is no submit here to
+/// script — the trait has no such method, which is the plan's claim
+/// made structural.
+#[derive(Default)]
+struct FakeGh {
+    pending: Option<u64>,
+    replies: usize,
+    thumbs: usize,
+    fail_on_summary: bool,
+    calls: std::sync::Mutex<Vec<String>>,
+}
+
+impl clank::cli::pr_review::Handoff for FakeGh {
+    fn pending(
+        &self,
+        _slug: &str,
+        _pr: u32,
+    ) -> anyhow::Result<Option<clank::cli::pr_review::gh::PendingReview>> {
+        self.calls.lock().unwrap().push("pending".into());
+        Ok(self
+            .pending
+            .map(|id| clank::cli::pr_review::gh::PendingReview {
+                id,
+                node_id: "PRR_x".into(),
+            }))
+    }
+    fn open_with_summary(
+        &self,
+        _slug: &str,
+        _pr: u32,
+        head_sha: &str,
+        body: &str,
+    ) -> anyhow::Result<()> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("open:{head_sha}:{body}"));
+        Ok(())
+    }
+    fn set_summary(&self, _slug: &str, _pr: u32, id: u64, body: &str) -> anyhow::Result<()> {
+        self.calls.lock().unwrap().push(format!("set:{id}:{body}"));
+        if self.fail_on_summary {
+            anyhow::bail!("gh exploded");
+        }
+        Ok(())
+    }
+    fn replies_left(&self, _slug: &str, _pr: u32, _id: u64) -> anyhow::Result<usize> {
+        self.calls.lock().unwrap().push("replies".into());
+        Ok(self.replies)
+    }
+    fn sweep_thumbs(&self, _slug: &str, _pr: u32, _id: u64) -> anyhow::Result<usize> {
+        self.calls.lock().unwrap().push("sweep".into());
+        Ok(self.thumbs)
+    }
+}
+
+/// Converge the gate so `finish` can run.
+fn converge(repo: &Path, pr: u32) {
+    propose_with(repo, None, &label("claude"), Some(pr)).unwrap();
+    note_with(repo, &label("codex"), Some(pr), Verdict::Finished, "ok").unwrap();
+    note_with(repo, &label("ruthless"), Some(pr), Verdict::Finished, "ok").unwrap();
+}
+
+fn write_summary(repo: &Path, pr: u32, text: &str) {
+    let md = repo.join(format!(".clank/pr-reviews/{pr}/master.md"));
+    let body = std::fs::read_to_string(&md).unwrap().replace(
+        "<the overview that goes on the draft review itself — the human reads
+it above your comments and submits, or does not>",
+        text,
+    );
+    std::fs::write(&md, body).unwrap();
+}
+
 #[test]
-fn submit_is_master_only_and_refuses_until_converged() {
-    use clank::cli::pr_review::{ReviewEvent, submit_with};
+fn a_converged_review_is_handed_over_as_a_draft() {
+    let (env, _) = env_with_pr(123);
+    let repo = env.repo();
+    start_with(repo, "o/r", 123, None, None).unwrap();
+    write_summary(repo, 123, "The refactor is clean.");
+    converge(repo, 123);
+
+    let gh = FakeGh {
+        pending: Some(42),
+        replies: 2,
+        thumbs: 3,
+        ..Default::default()
+    };
+    clank::cli::pr_review::finish_through(repo, Some(env.home()), &label("claude"), Some(123), &gh)
+        .unwrap();
+
+    let calls = gh.calls.lock().unwrap().clone();
+    assert!(
+        calls.contains(&"set:42:The refactor is clean.".to_string()),
+        "the summary goes onto the existing draft: {calls:?}",
+    );
+    // The scaffolding comes off BEFORE the summary is written: the
+    // draft is clean by the time it carries the overview.
+    let sweep = calls.iter().position(|c| c == "sweep");
+    let set = calls.iter().position(|c| c.starts_with("set:"));
+    assert!(
+        sweep.is_some() && sweep < set,
+        "the thumbs are swept, and swept first: {calls:?}",
+    );
+    assert!(
+        !repo.join(".clank/pr-reviews/123").exists(),
+        "the scratch is retired once the remote work is done",
+    );
+}
+
+#[test]
+fn a_failed_handoff_keeps_the_scratch_and_the_retry_works() {
+    let (env, _) = env_with_pr(123);
+    let repo = env.repo();
+    start_with(repo, "o/r", 123, None, None).unwrap();
+    write_summary(repo, 123, "Needs another look at the parser.");
+    converge(repo, 123);
+
+    let broken = FakeGh {
+        pending: Some(42),
+        fail_on_summary: true,
+        ..Default::default()
+    };
+    let err = clank::cli::pr_review::finish_through(
+        repo,
+        Some(env.home()),
+        &label("claude"),
+        Some(123),
+        &broken,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("gh exploded"), "{err}");
+    assert!(
+        repo.join(".clank/pr-reviews/123/master.md").is_file(),
+        "a failed handoff strands nothing: the scratch is still there to retry",
+    );
+
+    let working = FakeGh {
+        pending: Some(42),
+        ..Default::default()
+    };
+    clank::cli::pr_review::finish_through(
+        repo,
+        Some(env.home()),
+        &label("claude"),
+        Some(123),
+        &working,
+    )
+    .unwrap();
+    assert!(!repo.join(".clank/pr-reviews/123").exists());
+    let calls = working.calls.lock().unwrap().clone();
+    assert!(
+        calls
+            .iter()
+            .any(|c| c.contains("Needs another look at the parser")),
+        "the retry carried the same summary: {calls:?}",
+    );
+}
+
+#[test]
+fn a_review_with_no_comments_is_handed_over_as_a_summary() {
+    let (env, pr_sha) = env_with_pr(123);
+    let repo = env.repo();
+    start_with(repo, "o/r", 123, None, None).unwrap();
+    write_summary(repo, 123, "Read it end to end; nothing to raise.");
+    converge(repo, 123);
+
+    // No pending review: nobody drafted an inline comment.
+    let gh = FakeGh::default();
+    clank::cli::pr_review::finish_through(repo, Some(env.home()), &label("claude"), Some(123), &gh)
+        .unwrap();
+
+    // The PINNED sha reaches the boundary: the draft is attached to
+    // what the team read, not to wherever the PR has moved since —
+    // and the pin dies with the scratch, so nothing can recover it
+    // afterwards.
+    let calls = gh.calls.lock().unwrap().clone();
+    assert!(
+        calls.contains(&format!(
+            "open:{pr_sha}:Read it end to end; nothing to raise."
+        )),
+        "a summary-only draft is opened, pinned, rather than the summary being lost: {calls:?}",
+    );
+    assert!(!repo.join(".clank/pr-reviews/123").exists());
+}
+
+#[test]
+fn a_second_finish_touches_nothing_remote() {
+    let (env, _) = env_with_pr(123);
+    let repo = env.repo();
+    start_with(repo, "o/r", 123, None, None).unwrap();
+    write_summary(repo, 123, "Done.");
+    converge(repo, 123);
+    let first = FakeGh {
+        pending: Some(42),
+        ..Default::default()
+    };
+    clank::cli::pr_review::finish_through(
+        repo,
+        Some(env.home()),
+        &label("claude"),
+        Some(123),
+        &first,
+    )
+    .unwrap();
+
+    let second = FakeGh {
+        pending: Some(42),
+        ..Default::default()
+    };
+    let err = clank::cli::pr_review::finish_through(
+        repo,
+        Some(env.home()),
+        &label("claude"),
+        Some(123),
+        &second,
+    )
+    .unwrap_err();
+    assert!(
+        second.calls.lock().unwrap().is_empty(),
+        "it refuses before touching the remote: {err}",
+    );
+}
+
+#[test]
+fn finish_is_master_only_and_refuses_until_converged() {
+    use clank::cli::pr_review::finish_with;
     let (env, _) = env_with_pr(123);
     let repo = env.repo();
     start_with(repo, "o/r", 123, None, None).unwrap();
 
-    // Reviewer cannot submit. (Event is irrelevant — these refuse
-    // before any gh call.)
-    let err = submit_with(
-        repo,
-        Some(env.home()),
-        &label("codex"),
-        Some(123),
-        ReviewEvent::Approve,
-    )
-    .unwrap_err()
-    .to_string();
+    // A reviewer cannot hand the review over. (These refuse before
+    // any gh call.)
+    let err = finish_with(repo, Some(env.home()), &label("codex"), Some(123))
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("master-only"), "got: {err}");
 
     // Master, but not converged (no verdicts) → refuses BEFORE any
     // gh call (fails the gate check).
-    let err = submit_with(
-        repo,
-        Some(env.home()),
-        &label("claude"),
-        Some(123),
-        ReviewEvent::Approve,
-    )
-    .unwrap_err()
-    .to_string();
+    let err = finish_with(repo, Some(env.home()), &label("claude"), Some(123))
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("not converged"), "got: {err}");
 
     // Even one tier finished isn't enough (ruthless still owes).
     note_with(repo, &label("codex"), Some(123), Verdict::Finished, "ok").unwrap();
-    let err = submit_with(
-        repo,
-        Some(env.home()),
-        &label("claude"),
-        Some(123),
-        ReviewEvent::Approve,
-    )
-    .unwrap_err()
-    .to_string();
+    let err = finish_with(repo, Some(env.home()), &label("claude"), Some(123))
+        .unwrap_err()
+        .to_string();
     assert!(
         err.contains("not converged"),
         "commit-only finished still blocks: {err}"
     );
-    // The scratch is untouched by a refused submit.
+    // The scratch is untouched by a refused handoff.
     assert!(repo.join(".clank/pr-reviews/123").exists());
 }
 

@@ -2246,14 +2246,14 @@ mod tests {
                 serde_json::to_value(render_json(&WaitItem::PrMaster {
                     pr: 7,
                     round: 2,
-                    next: PrMasterNext::Submit,
+                    next: PrMasterNext::Finish,
                 }))
                 .unwrap(),
                 serde_json::json!({
                     "kind": "pr_master",
                     "pr": 7,
                     "round": 2,
-                    "next": PrMasterNext::Submit,
+                    "next": PrMasterNext::Finish,
                 }),
             ),
             (

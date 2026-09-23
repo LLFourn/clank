@@ -43,8 +43,9 @@ const MASTER_TEMPLATE: &str = "\
 ## General concerns
 <cross-cutting points not tied to a single line>
 
-## Submit body
-<the text posted as the review summary when you submit>
+## Review summary
+<the overview that goes on the draft review itself — the human reads
+it above your comments and submits, or does not>
 ";
 
 fn load_state(repo: &Path, pr: u32) -> anyhow::Result<PrReviewState> {
@@ -199,9 +200,9 @@ pub async fn run(args: PrReviewArgs) -> anyhow::Result<()> {
             abort_with(&repo, home.as_deref(), &caller, a.pr)?;
             Ok(())
         }
-        PrReviewCmd::Submit(a) => {
+        PrReviewCmd::Finish(a) => {
             let caller = crate::agent_env::resolve_identity_from_env(&repo)?;
-            submit_with(&repo, home.as_deref(), &caller, a.pr, a.event)
+            finish_with(&repo, home.as_deref(), &caller, a.pr)
         }
         PrReviewCmd::Status(a) => {
             print!("{}", status_with(&repo, home.as_deref(), a.pr)?);
@@ -346,14 +347,14 @@ pub fn abort_with(
 }
 
 /// The text posted as the published review's summary: the content
-/// under the `## Submit body` heading of `master.md`, to the next
+/// under the `## Review summary` heading of `master.md`, to the next
 /// `## ` heading or EOF. Errors if missing or still empty/the
 /// placeholder — clank won't publish a blank or template summary.
-fn extract_submit_body(master_md: &str) -> anyhow::Result<String> {
+fn extract_summary(master_md: &str) -> anyhow::Result<String> {
     let mut lines = master_md.lines();
-    let found = lines.by_ref().any(|l| l.trim() == "## Submit body");
+    let found = lines.by_ref().any(|l| l.trim() == "## Review summary");
     if !found {
-        anyhow::bail!("master.md has no `## Submit body` section to publish");
+        anyhow::bail!("master.md has no `## Review summary` section to hand over");
     }
     let body: String = lines
         .take_while(|l| !l.trim_start().starts_with("## "))
@@ -362,55 +363,90 @@ fn extract_submit_body(master_md: &str) -> anyhow::Result<String> {
     let body = body.trim();
     if body.is_empty() || body.starts_with('<') {
         anyhow::bail!(
-            "master.md `## Submit body` is empty or still the placeholder; \
+            "master.md `## Review summary` is empty or still the placeholder; \
              write the review summary before submitting"
         );
     }
     Ok(body.to_string())
 }
 
-/// The outcome master publishes the review with — GitHub's three
-/// canonical review events (NOT clank's `Verdict`, which has
-/// `finished`, a clank concept with no GitHub equivalent). Mandatory
-/// on `clank pr-review submit` so master states the verdict explicitly
-/// (pr-review-submit-outcome).
-#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ReviewEvent {
-    Approve,
-    RequestChanges,
-    Comment,
+/// The remote half of the handoff, injected so its ORDER — every
+/// remote step, and only then the local scratch — is testable
+/// without a network (codex 6b8aaed). Production is [`RealGh`].
+pub trait Handoff {
+    fn pending(&self, slug: &str, pr: u32) -> anyhow::Result<Option<gh::PendingReview>>;
+    /// `head_sha` is the review's PINNED commit — what the team
+    /// actually read — not whatever the PR points at now.
+    fn open_with_summary(
+        &self,
+        slug: &str,
+        pr: u32,
+        head_sha: &str,
+        body: &str,
+    ) -> anyhow::Result<()>;
+    fn set_summary(&self, slug: &str, pr: u32, id: u64, body: &str) -> anyhow::Result<()>;
+    fn replies_left(&self, slug: &str, pr: u32, id: u64) -> anyhow::Result<usize>;
+    /// Remove the loop's 👍 scaffolding; returns how many.
+    fn sweep_thumbs(&self, slug: &str, pr: u32, id: u64) -> anyhow::Result<usize>;
 }
 
-impl ReviewEvent {
-    /// The GitHub `event` value for the reviews API.
-    pub fn as_github(self) -> &'static str {
-        match self {
-            ReviewEvent::Approve => "APPROVE",
-            ReviewEvent::RequestChanges => "REQUEST_CHANGES",
-            ReviewEvent::Comment => "COMMENT",
-        }
-    }
+pub struct RealGh;
 
-    /// GitHub requires a non-empty body for REQUEST_CHANGES and
-    /// COMMENT, but allows an empty body for APPROVE.
-    fn body_required(self) -> bool {
-        !matches!(self, ReviewEvent::Approve)
+impl Handoff for RealGh {
+    fn pending(&self, slug: &str, pr: u32) -> anyhow::Result<Option<gh::PendingReview>> {
+        gh::resolve_pending_review(slug, pr)
+    }
+    fn open_with_summary(
+        &self,
+        slug: &str,
+        pr: u32,
+        head_sha: &str,
+        body: &str,
+    ) -> anyhow::Result<()> {
+        gh::create_summary_review(slug, pr, head_sha, body)
+    }
+    fn set_summary(&self, slug: &str, pr: u32, id: u64, body: &str) -> anyhow::Result<()> {
+        gh::set_review_body(slug, pr, id, body)
+    }
+    fn replies_left(&self, slug: &str, pr: u32, id: u64) -> anyhow::Result<usize> {
+        gh::count_replies(slug, pr, id)
+    }
+    fn sweep_thumbs(&self, slug: &str, pr: u32, id: u64) -> anyhow::Result<usize> {
+        gh::sweep_thumbs_up(slug, pr, id)
     }
 }
 
-/// Publish the converged review to the PR. MASTER-ONLY. Gate must
-/// be FINISHED; then re-sweep reviewer replies (so only master's
-/// top-level comments publish), and submit with `event` as the
-/// outcome and master.md's summary as the body. On success the local
-/// scratch is removed (the published review is the durable record).
-pub fn submit_with(
+/// Hand the converged review over. MASTER-ONLY, and it submits
+/// NOTHING.
+///
+/// The review stays a pending review — visible to its author, nobody
+/// else — so the operator reads it in GitHub's own interface, edits
+/// what they disagree with, and submits it or does not. Whether a
+/// review goes out as APPROVE or REQUEST_CHANGES, and in what words,
+/// is not a thing a team of agents decides on someone's behalf, and a
+/// published review cannot be taken back.
+///
+/// A RETRYABLE handoff: the gate, then the remote work, and only then
+/// the local scratch. Anything that fails leaves the scratch where it
+/// was, so running it again resumes rather than stranding the review
+/// half-handed-over.
+pub fn finish_with(
     repo: &Path,
     home: Option<&Path>,
     caller: &AgentLabel,
     pr: Option<u32>,
-    event: ReviewEvent,
 ) -> anyhow::Result<()> {
-    require_master(repo, home, caller, "submit")?;
+    finish_through(repo, home, caller, pr, &RealGh)
+}
+
+pub fn finish_through(
+    repo: &Path,
+    home: Option<&Path>,
+    caller: &AgentLabel,
+    pr: Option<u32>,
+    gh: &impl Handoff,
+) -> anyhow::Result<()> {
+    require_master(repo, home, caller, "finish")?;
     let pr = resolve_pr(repo, pr)?;
     let state = load_state(repo, pr)?;
 
@@ -438,40 +474,55 @@ pub fn submit_with(
         );
     }
 
-    // Body: required for REQUEST_CHANGES / COMMENT (GitHub rejects an
-    // empty body), optional for APPROVE (don't force a summary just to
-    // approve) — pr-review-submit-outcome.
     let md = std::fs::read_to_string(pr_dir(repo, pr).join("master.md"))?;
-    let body: Option<String> = if event.body_required() {
-        Some(extract_submit_body(&md)?)
-    } else {
-        extract_submit_body(&md).ok()
+    let summary = extract_summary(&md)?;
+
+    // A review with no inline comments has no draft yet — so make
+    // one, carrying the summary. "I read it and this is what I think"
+    // is a review, and it should not need an invented line comment to
+    // exist, nor lose its summary to a refusal (codex 6b8aaed).
+    let mut thumbs = 0;
+    let replies = match gh.pending(&state.repo, pr)? {
+        Some(review) => {
+            // Clean first, then write the summary onto what is left:
+            // the scaffolding comes off the draft before it is handed
+            // over, not after.
+            thumbs = gh.sweep_thumbs(&state.repo, pr, review.id)?;
+            gh.set_summary(&state.repo, pr, review.id, &summary)?;
+            gh.replies_left(&state.repo, pr, review.id)?
+        }
+        None => {
+            gh.open_with_summary(&state.repo, pr, state.head_sha.as_str(), &summary)?;
+            0
+        }
     };
 
-    // RE-SWEEP reviewer replies IMMEDIATELY before publishing: this
-    // is the guard against a reply landing after the convergence
-    // check (ruthless e9d1bbb #2). It is best-effort, not atomic —
-    // GitHub offers no transaction across sweep + submit, and a
-    // reviewer's raw `gh` can't be intercepted — so a reply in the
-    // sub-second sweep→submit gap could still publish. Keeping the
-    // two calls adjacent with nothing between them is the honest
-    // minimum; there is no stronger guarantee available. (An earlier
-    // `submitting` flag claimed a freeze it couldn't enforce against
-    // raw gh, so it was removed rather than left as a false model.)
-    let swept = gh::sweep_replies(&state.repo, pr)?;
-    gh::submit_review(&state.repo, pr, event, body.as_deref())?;
-    if swept > 0 {
-        eprintln!(
-            "swept {swept} reviewer repl{} before publishing",
-            if swept == 1 { "y" } else { "ies" }
+    // Remote work done — only NOW is the scratch expendable. Failing
+    // before this point leaves it for the next attempt.
+    std::fs::remove_dir_all(pr_dir(repo, pr))
+        .with_context(|| format!("removing PR #{pr} review scratch after handoff"))?;
+
+    println!(
+        "review for PR #{pr} is ready — it is a DRAFT and nothing was submitted\n  \
+         read it: https://github.com/{}/pull/{pr}/files",
+        state.repo
+    );
+    // Reviewer replies that survived integration are SURFACED, never
+    // deleted. Publishing swept them so they could not post onto the
+    // PR; nothing publishes now, and a reply still in the draft is
+    // feedback master did not integrate — deleting it here would
+    // erase the one thing this handoff exists to put in front of a
+    // human.
+    if thumbs > 0 {
+        println!("  removed {thumbs} 👍 the review loop left on your comments",);
+    }
+    if replies > 0 {
+        println!(
+            "  {replies} reviewer repl{} still in it: read {} before you submit",
+            if replies == 1 { "y" } else { "ies" },
+            if replies == 1 { "it" } else { "them" },
         );
     }
-
-    // Published — the review on GitHub is the durable record; drop
-    // the local scratch so the wait surface stops surfacing it.
-    std::fs::remove_dir_all(pr_dir(repo, pr))
-        .with_context(|| format!("removing PR #{pr} review scratch after publish"))?;
-    println!("published review for PR #{pr}");
     Ok(())
 }
 
@@ -506,28 +557,19 @@ pub mod gh {
         ]
     }
 
-    pub(super) fn submit_argv(
-        slug: &str,
-        pr: u32,
-        review_id: u64,
-        event: super::ReviewEvent,
-        body: Option<&str>,
-    ) -> Vec<String> {
-        let mut argv = vec![
+    /// Set a PENDING review's body without submitting it. GitHub's
+    /// update-a-review endpoint is independent of submission, which
+    /// is what lets the summary sit on the draft instead of being
+    /// held back for a publish that never comes.
+    pub(super) fn update_body_argv(slug: &str, pr: u32, review_id: u64, body: &str) -> Vec<String> {
+        vec![
             "api".into(),
             "--method".into(),
-            "POST".into(),
-            format!("repos/{slug}/pulls/{pr}/reviews/{review_id}/events"),
+            "PUT".into(),
+            format!("repos/{slug}/pulls/{pr}/reviews/{review_id}"),
             "-f".into(),
-            format!("event={}", event.as_github()),
-        ];
-        // Omit `body` entirely for a bodyless APPROVE (GitHub allows
-        // it; an empty `-f body=` is unnecessary).
-        if let Some(body) = body {
-            argv.push("-f".into());
-            argv.push(format!("body={body}"));
-        }
-        argv
+            format!("body={body}"),
+        ]
     }
 
     pub(super) fn discard_argv(slug: &str, pr: u32, review_id: u64) -> Vec<String> {
@@ -548,13 +590,79 @@ pub mod gh {
         ]
     }
 
-    pub(super) fn delete_comment_argv(slug: &str, comment_id: u64) -> Vec<String> {
+    pub(super) fn comment_reactions_argv(slug: &str, comment_id: u64) -> Vec<String> {
+        vec![
+            "api".into(),
+            format!("repos/{slug}/pulls/comments/{comment_id}/reactions"),
+            "--paginate".into(),
+            "--slurp".into(),
+        ]
+    }
+
+    pub(super) fn delete_reaction_argv(
+        slug: &str,
+        comment_id: u64,
+        reaction_id: u64,
+    ) -> Vec<String> {
         vec![
             "api".into(),
             "--method".into(),
             "DELETE".into(),
-            format!("repos/{slug}/pulls/comments/{comment_id}"),
+            format!("repos/{slug}/pulls/comments/{comment_id}/reactions/{reaction_id}"),
         ]
+    }
+
+    /// Every comment id in a slurped `…/reviews/{id}/comments`
+    /// response — replies AND master's top-level comments, since a
+    /// reviewer's 👍 lands on the latter.
+    pub(super) fn parse_comment_ids(json: &str) -> anyhow::Result<Vec<u64>> {
+        let pages: serde_json::Value =
+            serde_json::from_str(json).context("parsing slurped review comments")?;
+        let Some(pages) = pages.as_array() else {
+            anyhow::bail!("slurped review comments is not an array of pages");
+        };
+        let mut ids = Vec::new();
+        for page in pages {
+            let Some(comments) = page.as_array() else {
+                anyhow::bail!("a comments page is not an array");
+            };
+            for c in comments {
+                ids.push(
+                    c.get("id")
+                        .and_then(|v| v.as_u64())
+                        .context("review comment missing numeric id")?,
+                );
+            }
+        }
+        Ok(ids)
+    }
+
+    /// Ids of the `+1` reactions in a slurped reactions response.
+    ///
+    /// ONLY `+1`: a reviewer's approval is scaffolding this loop put
+    /// there, and anything else on the comment is not ours to remove.
+    pub(super) fn parse_thumbs_up_ids(json: &str) -> anyhow::Result<Vec<u64>> {
+        let pages: serde_json::Value =
+            serde_json::from_str(json).context("parsing slurped reactions")?;
+        let Some(pages) = pages.as_array() else {
+            anyhow::bail!("slurped reactions is not an array of pages");
+        };
+        let mut ids = Vec::new();
+        for page in pages {
+            let Some(reactions) = page.as_array() else {
+                anyhow::bail!("a reactions page is not an array");
+            };
+            for r in reactions {
+                if r.get("content").and_then(|v| v.as_str()) == Some("+1") {
+                    ids.push(
+                        r.get("id")
+                            .and_then(|v| v.as_u64())
+                            .context("reaction missing numeric id")?,
+                    );
+                }
+            }
+        }
+        Ok(ids)
     }
 
     /// Numeric ids of the THREADED REPLIES (reviewer comments) in a
@@ -637,20 +745,6 @@ pub mod gh {
         parse_pending_review(&run_gh(&resolve_argv(slug, pr))?)
     }
 
-    /// Submit the pending review with `event` as the outcome and
-    /// `body` (optional for APPROVE) as the summary. Errors if
-    /// there's no pending review to submit.
-    pub fn submit_review(
-        slug: &str,
-        pr: u32,
-        event: super::ReviewEvent,
-        body: Option<&str>,
-    ) -> anyhow::Result<()> {
-        let review = resolve_pending_review(slug, pr)?
-            .context("no pending review to submit (has master drafted any comments?)")?;
-        run_gh(&submit_argv(slug, pr, review.id, event, body)).map(|_| ())
-    }
-
     /// Discard the pending review if one exists; no-op otherwise.
     pub fn discard_pending_review(slug: &str, pr: u32) -> anyhow::Result<()> {
         if let Some(review) = resolve_pending_review(slug, pr)? {
@@ -659,20 +753,92 @@ pub mod gh {
         Ok(())
     }
 
-    /// Delete every threaded reply (reviewer comment) from the
-    /// pending review, leaving only master's top-level comments.
-    /// Returns the count deleted. Run IMMEDIATELY before submit so a
-    /// reply landing during convergence can't publish onto the PR
-    /// (the submit TOCTOU guard).
-    pub fn sweep_replies(slug: &str, pr: u32) -> anyhow::Result<usize> {
-        let Some(review) = resolve_pending_review(slug, pr)? else {
-            return Ok(0);
-        };
-        let ids = parse_reply_ids(&run_gh(&review_comments_argv(slug, pr, review.id))?)?;
-        for id in &ids {
-            run_gh(&delete_comment_argv(slug, *id))?;
+    /// Open a pending review carrying only `body` — no inline
+    /// comments, no event. A review whose finding is "I read it and
+    /// this is what I think" is a real review, and it should not need
+    /// an invented line comment to exist (codex 6b8aaed).
+    pub(super) fn create_summary_argv(
+        slug: &str,
+        pr: u32,
+        head_sha: &str,
+        body: &str,
+    ) -> Vec<String> {
+        vec![
+            "api".into(),
+            "--method".into(),
+            "POST".into(),
+            format!("repos/{slug}/pulls/{pr}/reviews"),
+            // The PINNED sha, never GitHub's default. Omitting it
+            // attaches the review to the PR's most recent commit, so
+            // a push between `start` and `finish` would leave a
+            // summary describing what the team read attached to code
+            // it never saw — and retiring the scratch takes the pin
+            // with it (codex d19fc6c).
+            "-f".into(),
+            format!("commit_id={head_sha}"),
+            "-f".into(),
+            format!("body={body}"),
+        ]
+    }
+
+    /// Put `body` on the pending review. Submits nothing.
+    pub fn set_review_body(slug: &str, pr: u32, review_id: u64, body: &str) -> anyhow::Result<()> {
+        run_gh(&update_body_argv(slug, pr, review_id, body)).map(|_| ())
+    }
+
+    /// Open a summary-only pending review. Nothing is submitted: no
+    /// `event` is sent, which is what makes the new review PENDING.
+    pub fn create_summary_review(
+        slug: &str,
+        pr: u32,
+        head_sha: &str,
+        body: &str,
+    ) -> anyhow::Result<()> {
+        run_gh(&create_summary_argv(slug, pr, head_sha, body)).map(|_| ())
+    }
+
+    /// Remove every 👍 the loop left on the draft's comments, and
+    /// say how many. Idempotent: a draft with none loses nothing.
+    ///
+    /// Reviewers approve a comment by reacting rather than replying,
+    /// so those reactions mean "this reviewer agreed with master's
+    /// draft" — scaffolding, not a finding about the code. Handing
+    /// the draft over covered in the team's own thumbs would be
+    /// handing over the scaffolding with the building.
+    pub fn sweep_thumbs_up(slug: &str, pr: u32, review_id: u64) -> anyhow::Result<usize> {
+        sweep_thumbs_with(slug, pr, review_id, &|argv| run_gh(argv))
+    }
+
+    /// The sweep over an injected caller, so WHICH comments it asks
+    /// about is testable — a reviewer's 👍 lands on master's
+    /// top-level comments, which the reply parser filters out, and
+    /// nothing else would notice that mistake.
+    pub(super) fn sweep_thumbs_with(
+        slug: &str,
+        pr: u32,
+        review_id: u64,
+        call: &dyn Fn(&[String]) -> anyhow::Result<String>,
+    ) -> anyhow::Result<usize> {
+        let comments = parse_comment_ids(&call(&review_comments_argv(slug, pr, review_id))?)?;
+        let mut removed = 0;
+        for comment in comments {
+            for reaction in parse_thumbs_up_ids(&call(&comment_reactions_argv(slug, comment))?)? {
+                call(&delete_reaction_argv(slug, comment, reaction))?;
+                removed += 1;
+            }
         }
-        Ok(ids.len())
+        Ok(removed)
+    }
+
+    /// How many threaded replies are still in the draft.
+    ///
+    /// Counted, never deleted. While the review was published this
+    /// swept them first, so a reply landing after convergence could
+    /// not post onto the PR; nothing publishes now, and a surviving
+    /// reply is feedback master did not integrate — the handoff
+    /// exists to put that in front of a human, not to erase it.
+    pub fn count_replies(slug: &str, pr: u32, review_id: u64) -> anyhow::Result<usize> {
+        Ok(parse_reply_ids(&run_gh(&review_comments_argv(slug, pr, review_id))?)?.len())
     }
 }
 
@@ -872,39 +1038,6 @@ mod tests {
             gh::resolve_argv("o/r", 7),
             vec!["api", "repos/o/r/pulls/7/reviews", "--paginate", "--slurp"]
         );
-        // request-changes / comment carry the body; the event maps to
-        // GitHub's vocabulary.
-        assert_eq!(
-            gh::submit_argv(
-                "o/r",
-                7,
-                42,
-                ReviewEvent::RequestChanges,
-                Some("summary body")
-            ),
-            vec![
-                "api",
-                "--method",
-                "POST",
-                "repos/o/r/pulls/7/reviews/42/events",
-                "-f",
-                "event=REQUEST_CHANGES",
-                "-f",
-                "body=summary body"
-            ]
-        );
-        // A bodyless APPROVE omits `-f body=` entirely.
-        assert_eq!(
-            gh::submit_argv("o/r", 7, 42, ReviewEvent::Approve, None),
-            vec![
-                "api",
-                "--method",
-                "POST",
-                "repos/o/r/pulls/7/reviews/42/events",
-                "-f",
-                "event=APPROVE",
-            ]
-        );
         assert_eq!(
             gh::discard_argv("o/r", 7, 42),
             vec!["api", "--method", "DELETE", "repos/o/r/pulls/7/reviews/42"]
@@ -912,32 +1045,191 @@ mod tests {
     }
 
     #[test]
-    fn review_event_github_mapping_and_body_rule() {
-        assert_eq!(ReviewEvent::Approve.as_github(), "APPROVE");
-        assert_eq!(ReviewEvent::RequestChanges.as_github(), "REQUEST_CHANGES");
-        assert_eq!(ReviewEvent::Comment.as_github(), "COMMENT");
-        // Only APPROVE may publish without a body.
-        assert!(!ReviewEvent::Approve.body_required());
-        assert!(ReviewEvent::RequestChanges.body_required());
-        assert!(ReviewEvent::Comment.body_required());
-    }
-
-    #[test]
-    fn submit_requires_a_github_event() {
+    fn finish_states_no_outcome() {
         use clap::Parser;
         #[derive(Parser)]
         struct T {
             #[command(flatten)]
-            f: crate::cli::PrReviewSubmitArgs,
+            f: crate::cli::PrReviewFinishArgs,
         }
-        // --event is mandatory; the values are GitHub's, not clank's.
-        assert!(T::try_parse_from(["t"]).is_err(), "--event required");
-        assert!(T::try_parse_from(["t", "--event", "approve"]).is_ok());
-        assert!(T::try_parse_from(["t", "--event", "request-changes"]).is_ok());
-        assert!(T::try_parse_from(["t", "--event", "comment"]).is_ok());
+        // The whole point: clank no longer names a GitHub review
+        // outcome, so there is nothing to pass and nothing required.
+        assert!(T::try_parse_from(["t"]).is_ok());
+        assert!(T::try_parse_from(["t", "--pr", "7"]).is_ok());
+    }
+
+    #[test]
+    fn the_sweep_reaches_master_s_own_comments() {
+        // The 👍 that matters is on a TOP-LEVEL comment — a reviewer
+        // approving master's draft. Asking only about replies would
+        // leave exactly the reactions this is for.
+        let asked = std::sync::Mutex::new(Vec::new());
+        let call = |argv: &[String]| -> anyhow::Result<String> {
+            let url = argv.iter().find(|a| a.contains("repos/")).unwrap().clone();
+            asked.lock().unwrap().push(url.clone());
+            Ok(if url.ends_with("/comments") {
+                // One top-level comment, one reply.
+                r#"[[{"id": 10}, {"id": 11, "in_reply_to_id": 10}]]"#.to_string()
+            } else if url.contains("/comments/10/reactions") {
+                r#"[[{"id": 500, "content": "+1"}]]"#.to_string()
+            } else {
+                "[[]]".to_string()
+            })
+        };
+        let removed = gh::sweep_thumbs_with("o/r", 7, 42, &call).unwrap();
+        assert_eq!(removed, 1, "the top-level comment's 👍 was removed");
+        let asked = asked.lock().unwrap().clone();
         assert!(
-            T::try_parse_from(["t", "--event", "finished"]).is_err(),
-            "clank's `finished` is not a GitHub review event"
+            asked
+                .iter()
+                .any(|u| u == "repos/o/r/pulls/comments/10/reactions"),
+            "master's own comment was asked about: {asked:?}",
+        );
+        assert!(
+            asked
+                .iter()
+                .any(|u| u == "repos/o/r/pulls/comments/10/reactions/500"),
+            "and its 👍 deleted: {asked:?}",
+        );
+    }
+
+    #[test]
+    fn sweeping_a_cleaned_draft_changes_nothing() {
+        // The plan promises finish is retryable, which only means
+        // something if the second run is a no-op. A fake that keeps
+        // returning the reaction it was told to delete cannot show
+        // that, so this one removes it — and keeps the reaction that
+        // was never ours.
+        let state = std::sync::Mutex::new(vec![
+            (500u64, "+1".to_string()),
+            (501u64, "heart".to_string()),
+        ]);
+        let deletes = std::sync::Mutex::new(0usize);
+        let call = |argv: &[String]| -> anyhow::Result<String> {
+            let url = argv.iter().find(|a| a.contains("repos/")).unwrap().clone();
+            if url.ends_with("/comments") {
+                return Ok(r#"[[{"id": 10}]]"#.to_string());
+            }
+            if let Some(rest) = url.strip_prefix("repos/o/r/pulls/comments/10/reactions") {
+                if let Some(id) = rest.strip_prefix('/') {
+                    let id: u64 = id.parse().unwrap();
+                    state.lock().unwrap().retain(|(r, _)| *r != id);
+                    *deletes.lock().unwrap() += 1;
+                    return Ok(String::new());
+                }
+                let page: Vec<String> = state
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|(id, content)| format!(r#"{{"id": {id}, "content": "{content}"}}"#))
+                    .collect();
+                return Ok(format!("[[{}]]", page.join(",")));
+            }
+            Ok("[[]]".to_string())
+        };
+
+        assert_eq!(gh::sweep_thumbs_with("o/r", 7, 42, &call).unwrap(), 1);
+        assert_eq!(
+            gh::sweep_thumbs_with("o/r", 7, 42, &call).unwrap(),
+            0,
+            "the draft is already clean: nothing more to remove",
+        );
+        assert_eq!(*deletes.lock().unwrap(), 1, "and nothing deleted twice");
+        assert_eq!(
+            *state.lock().unwrap(),
+            vec![(501, "heart".to_string())],
+            "the reaction that was never the loop's is still there",
+        );
+    }
+
+    #[test]
+    fn only_the_loops_thumbs_are_swept() {
+        // A reviewer's 👍 is scaffolding. Anything else on the
+        // comment belongs to whoever put it there.
+        let json = r#"[[
+            {"id": 1, "content": "+1"},
+            {"id": 2, "content": "heart"},
+            {"id": 3, "content": "+1"},
+            {"id": 4, "content": "-1"}
+        ]]"#;
+        assert_eq!(gh::parse_thumbs_up_ids(json).unwrap(), vec![1, 3]);
+    }
+
+    #[test]
+    fn reactions_are_read_from_every_comment_not_just_replies() {
+        // Reviewers react on MASTER's top-level comments, which is
+        // exactly what the reply parser filters out.
+        let json = r#"[[
+            {"id": 10},
+            {"id": 11, "in_reply_to_id": 10}
+        ]]"#;
+        assert_eq!(gh::parse_comment_ids(json).unwrap(), vec![10, 11]);
+        assert_eq!(gh::parse_reply_ids(json).unwrap(), vec![11]);
+    }
+
+    #[test]
+    fn the_reaction_endpoints_are_the_documented_ones() {
+        assert_eq!(
+            gh::comment_reactions_argv("o/r", 99),
+            vec![
+                "api",
+                "repos/o/r/pulls/comments/99/reactions",
+                "--paginate",
+                "--slurp",
+            ]
+        );
+        assert_eq!(
+            gh::delete_reaction_argv("o/r", 99, 7),
+            vec![
+                "api",
+                "--method",
+                "DELETE",
+                "repos/o/r/pulls/comments/99/reactions/7",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_summary_only_draft_is_pinned_and_unsubmitted() {
+        let argv = gh::create_summary_argv("o/r", 7, "deadbee", "the summary");
+        assert_eq!(
+            argv,
+            vec![
+                "api",
+                "--method",
+                "POST",
+                "repos/o/r/pulls/7/reviews",
+                "-f",
+                "commit_id=deadbee",
+                "-f",
+                "body=the summary",
+            ],
+            "the review is attached to what was READ, not to the PR's head now",
+        );
+        assert!(
+            !argv.iter().any(|a| a.starts_with("event=")),
+            "and no event, which is what leaves it pending: {argv:?}",
+        );
+    }
+
+    #[test]
+    fn the_body_endpoint_updates_without_submitting() {
+        let argv = gh::update_body_argv("o/r", 7, 42, "the summary");
+        assert_eq!(
+            argv,
+            vec![
+                "api",
+                "--method",
+                "PUT",
+                "repos/o/r/pulls/7/reviews/42",
+                "-f",
+                "body=the summary",
+            ],
+            "PUT on the review itself — not the /events endpoint, which submits",
+        );
+        assert!(
+            !argv.iter().any(|a| a.contains("events")),
+            "nothing here can publish: {argv:?}",
         );
     }
 
@@ -1009,25 +1301,21 @@ mod tests {
                 "--slurp"
             ]
         );
-        assert_eq!(
-            gh::delete_comment_argv("o/r", 99),
-            vec!["api", "--method", "DELETE", "repos/o/r/pulls/comments/99"]
-        );
     }
 
     #[test]
-    fn extract_submit_body_matrix() {
-        let ok = "# notes\n\n## Submit body\nShip it: the refactor is clean.\n";
+    fn extract_summary_matrix() {
+        let ok = "# notes\n\n## Review summary\nShip it: the refactor is clean.\n";
         assert_eq!(
-            extract_submit_body(ok).unwrap(),
+            extract_summary(ok).unwrap(),
             "Ship it: the refactor is clean."
         );
         // Stops at the next ## heading.
-        let multi = "## Submit body\nthe summary\n\n## Other\nignored\n";
-        assert_eq!(extract_submit_body(multi).unwrap(), "the summary");
+        let multi = "## Review summary\nthe summary\n\n## Other\nignored\n";
+        assert_eq!(extract_summary(multi).unwrap(), "the summary");
         // Missing section, empty, and the unfilled placeholder all error.
-        assert!(extract_submit_body("# notes\nno section").is_err());
-        assert!(extract_submit_body("## Submit body\n\n").is_err());
-        assert!(extract_submit_body("## Submit body\n<the text…>\n").is_err());
+        assert!(extract_summary("# notes\nno section").is_err());
+        assert!(extract_summary("## Review summary\n\n").is_err());
+        assert!(extract_summary("## Review summary\n<the text…>\n").is_err());
     }
 }
