@@ -321,7 +321,11 @@
   // a fresh pairing — a new link, a new paste — would not replace it.
   // The next lost cookie would then sign in with the rotated-out one
   // and demand another scan, having just been paired.
-  async function remember() {
+  // Named for what it does and not for `remember`, which this file
+  // already had three hundred lines down for the view preferences: two
+  // declarations of one name is a SyntaxError, and a SyntaxError in an
+  // inline script is the whole page (a-page-that-does-not-parse-is-not-a-page).
+  async function provision() {
     if (forgetting) return;
     try {
       const r = await fetch('/token');
@@ -332,7 +336,7 @@
       if (token && !forgetting) keep.set(token);
     } catch (err) {}
   }
-  remember();
+  provision();
   // Arriving here IS the confirmation that the cookie stuck, so the
   // sign-in page's one-shot guard is spent: a cookie lost later is
   // signed back in rather than left at the form (login.html).
