@@ -19,8 +19,21 @@ use clank_core::repo_state::FinishedPlan;
 use clank_core::vocab::CommitGateState;
 use clank_core::wait::PlanWorkState;
 
+/// The snapshot IS the wire: `status -j` serializes the model the pane
+/// renders, so the two can differ about presentation and not about
+/// facts (status-is-one-model-rendered-two-ways).
+///
+/// DERIVED, so a fact added here is emitted without being written down
+/// twice — the roster went missing for as long as it did because a
+/// hand-written projection had to be remembered. What is written down
+/// is only what cannot be defaulted: the log's machinery, skipped by
+/// name, and the shapes the wire fixed before this was one model.
+#[derive(serde::Serialize)]
 pub struct StatusSnapshot {
+    /// Where this was read. `--repo` means the reader need not be
+    /// standing in it, and the pane says it too (codex on 772b84f).
     pub(crate) repo_path: PathBuf,
+    #[serde(rename = "repo_basename")]
     pub(crate) basename: String,
     pub(crate) branch: Option<String>,
     pub(crate) head_sha: Option<String>,
@@ -28,13 +41,26 @@ pub struct StatusSnapshot {
     /// `Some` iff the worktree is dirty — carries the +/− line
     /// counts vs HEAD and the untracked-file count
     /// (tui-event-driven-dirty-stats).
+    /// Two keys on the wire: the flag it has always carried, and the
+    /// counts, which are there only when it is true.
+    #[serde(flatten, with = "dirty_wire")]
     pub(crate) dirty: Option<DirtyStats>,
+    #[serde(serialize_with = "plans_wire")]
     pub(crate) plans: Vec<PlanWorkState>,
+    /// A list on the wire, of nought or one. It is `Some` only where
+    /// there is no active plan — which `select_plans_and_finished`
+    /// decides, so nothing here has to decide it again.
+    #[serde(rename = "finished_plans", serialize_with = "as_list")]
     pub(crate) last_finished: Option<FinishedPlan>,
+    #[serde(serialize_with = "blocks_wire")]
     pub(crate) blocks: Vec<crate::cli::block::BlockEntry>,
     /// Queued plans (name + priority) in priority order — the TUI's
     /// QUEUE section renders and reprioritises these; counts everywhere
     /// else derive from it.
+    /// Three keys on the wire: the count and the names consumers
+    /// read, and the entries that order them and tell two of one name
+    /// apart. All absent when nothing is queued.
+    #[serde(flatten, with = "queue_wire")]
     pub(crate) queue: Vec<QueueItemView>,
     /// The team's master label, when a team resolves (render path:
     /// degrades to None on a teamless repo). The TUI's idle+queue
@@ -52,10 +78,12 @@ pub struct StatusSnapshot {
     /// Shelved plans (stem, what they're waiting for if `--for`
     /// was used, and whether that wait is over). Plan:
     /// plan-lifecycle-verbs.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) stash: Vec<StashItemView>,
     /// This repo's forks (name, kind). Durable repo state of exactly
     /// the kind status already reports — their absence here is why a
     /// fork could sit stranded unnoticed (fork-cli-is-a-noun).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) forks: Vec<(String, &'static str)>,
     /// Recent activity as STRUCTURED oneline rows (umbrella
     /// headers + commits + reviews), NEWEST FIRST (the git-log
@@ -66,18 +94,22 @@ pub struct StatusSnapshot {
     /// is the machine log surface (log-plan-umbrellas, ruthless
     /// 3ea8580 concern 1). Plans: status-tui-live-log,
     /// log-plan-umbrellas.
+    #[serde(skip)]
     pub(crate) log_rows: Vec<crate::cli::log::OnelineRow>,
     /// Durable fold boundary used by on-demand log paging. Keeping it in
     /// the snapshot means scrolling never rebuilds the whole repo merely to
     /// rediscover where plain Git history begins.
+    #[serde(skip)]
     pub(crate) log_adopted_at: Option<crate::lifecycle::CommitSha>,
     /// Finalize SHAs that stand for their whole plan — carried so a
     /// LATER page collapses the same rows the first one did, rather
     /// than answering from whatever that page happens to contain
     /// (codex on 5b1e87c).
+    #[serde(skip)]
     pub(crate) log_stands_for: crate::cli::log::StandsFor,
     /// Cursor for the next older TUI page. `None` means the currently loaded
     /// rows reach the repository root.
+    #[serde(skip)]
     pub(crate) log_next: Option<crate::cli::log::HistoryCursor>,
     /// sha → branch names whose tips sit on that commit
     /// (tui-log-branch-decorations): HEAD's branch, its upstream, the
@@ -85,17 +117,21 @@ pub struct StatusSnapshot {
     /// decoration; valid across paged log growth (tips
     /// don't move with scrolling) and rebuilt with the snapshot. NOT
     /// in `to_json`.
+    #[serde(skip)]
     pub(crate) log_decorations: std::collections::BTreeMap<String, Vec<String>>,
     /// Active GitHub PR reviews (clank-pr-review-mode), for the
     /// `pr` gauge. Empty in the common (no-PR-review) case.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) pr_reviews: Vec<clank_core::wait::PrReviewWorkState>,
     /// The timeline's merged github events, index-aligned with the
     /// `OnelineRow::Github` rows in `log_rows` (set together —
     /// tui-github-event-page).
+    #[serde(skip)]
     pub(crate) github_events: Vec<crate::cli::github_timeline::MergedEvent>,
     /// The fold's pending AD-HOC commit review, if any — carried so
     /// the TUI's activity projection sees the same work `clank wait`
     /// delivers (tui-adhoc-review-activity).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) ad_hoc: Vec<clank_core::wait::AdHocWorkState>,
     /// A broken HEAD commit tag, when present
     /// (commit-tag-fixup-is-first-class-state). The SINGLE source the
@@ -103,6 +139,10 @@ pub struct StatusSnapshot {
     /// plan row carries it — the unknown-tag-only case, where `T = ∅`
     /// and the tag names no real plan, has no row to mark (codex
     /// 2bf46d9).
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "correction_wire"
+    )]
     pub(crate) head_correction: Option<clank_core::wait::HeadCorrection>,
 }
 
@@ -110,12 +150,14 @@ pub struct StatusSnapshot {
 /// roster role, and EFFECTIVE auto-mode. The auto-mode is the
 /// *armed* state (takes effect at that agent's next Stop-hook
 /// decision), NOT a live run indicator.
+#[derive(serde::Serialize)]
 pub(crate) struct AgentAutoRow {
     pub(crate) label: String,
     /// The roster TIER — Master / Commit / Plan / Final / Gate — so the
     /// panel can distinguish the kinds of reviewers (not just master vs
     /// reviewer).
     pub(crate) role: crate::cli::teams_config::RosterRole,
+    #[serde(rename = "auto")]
     pub(crate) auto_mode: clank_core::vocab::AutoMode,
     /// Roster `AgentDescription` facts the detail page surfaces: the
     /// tool and the invocation that runs it (launch command + args, or
@@ -184,11 +226,19 @@ pub(crate) struct AvailableAgent {
 /// (`foo.md`, `1-foo.md` and `001-foo.md` all read as one name and
 /// priority), so nothing derived from the filename can tell two
 /// entries apart; only the filename can (a-queued-plan-has-a-page).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct QueueItemView {
     pub(crate) priority: u16,
     pub(crate) name: String,
+    /// The file, as the handle that tells two entries of one name
+    /// apart — not the path, which is this machine's business
+    /// (the-queue-is-workable-from-the-phone).
+    #[serde(rename = "handle", serialize_with = "stem_of")]
     pub(crate) path: PathBuf,
+}
+
+fn stem_of<S: serde::Serializer>(path: &Path, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_str(&path.file_stem().unwrap_or_default().to_string_lossy())
 }
 
 /// Build the roster's auto-mode rows: master first, then reviewers in
@@ -266,7 +316,10 @@ pub(crate) fn available_agents(
 }
 
 /// One stashed plan as the renderers see it.
+#[derive(serde::Serialize)]
 pub(crate) struct StashItemView {
+    /// The wire has called this `plan` since before it was a stash.
+    #[serde(rename = "plan")]
     pub(crate) stem: String,
     pub(crate) waiting_for: Option<String>,
     /// True when `waiting_for` names a plan that has finished —
@@ -276,90 +329,162 @@ pub(crate) struct StashItemView {
     pub(crate) commits: usize,
 }
 
-/// Typed `status --json` shape (typed-json-not-json-macro,
-/// replacing the old `json!` builder in `to_json`). The keys +
-/// values here ARE the wire contract `status --json` consumers
-/// parse; key order is irrelevant. Conditional keys are
-/// `Option`/empty-skipped, populated under the SAME conditions as
-/// before. Borrows from `&StatusSnapshot`.
-#[derive(serde::Serialize)]
-struct StatusJson<'a> {
-    repo_basename: &'a str,
-    branch: Option<&'a str>,
-    head_sha: Option<&'a str>,
-    head_subject: Option<&'a str>,
-    worktree_dirty: bool,
-    plans: Vec<PlanJson<'a>>,
-    finished_plans: Vec<FinishedPlanJson<'a>>,
-    blocks: Vec<BlockJson<'a>>,
-    /// Only when the worktree is dirty (tui-event-driven-dirty-stats).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    dirty_stats: Option<DirtyStatsJson>,
-    /// Emitted with `queue` only when the queue is non-empty
-    /// (clank-status-tui); kept for consumers that read the count.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    queue_count: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    queue: Option<Vec<&'a str>>,
-    /// Only when non-empty. RENAMED from `shelved`
-    /// (rename-shelve-to-stash) — a breaking wire change for dogfood
-    /// consumers.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    stash: Vec<StashJson<'a>>,
-    /// Only when a HEAD commit-tag violation is present
-    /// (commit-tag-fixup-is-first-class-state).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    head_correction: Option<HeadCorrectionJson<'a>>,
+/// The shapes the wire fixed before the snapshot serialized itself.
+/// Each is here because a default would change what a consumer parses,
+/// and nothing else about the model is written down twice
+/// (codex on 772b84f).
+mod dirty_wire {
+    /// One field, two keys: the flag, and the counts only when dirty.
+    pub(super) fn serialize<S: serde::Serializer>(
+        dirty: &Option<super::DirtyStats>,
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut m = s.serialize_map(None)?;
+        m.serialize_entry("worktree_dirty", &dirty.is_some())?;
+        if let Some(d) = dirty {
+            m.serialize_entry("dirty_stats", d)?;
+        }
+        m.end()
+    }
 }
 
-#[derive(serde::Serialize)]
-struct PlanJson<'a> {
-    plan: &'a str,
-    /// `None` when the plan is blocked with no reviewable commit yet.
-    latest_reviewable_sha: Option<&'a str>,
-    gate_state: CommitGateState,
-    /// Structured `WaitingOn` via its serde derive (per
-    /// status-blocks-dominate-gate).
-    waiting_on: &'a WaitingOn,
+mod queue_wire {
+    /// One field, three keys: the count and the names consumers read,
+    /// and the entries that order them and tell two of one name apart.
+    pub(super) fn serialize<S: serde::Serializer>(
+        queue: &[super::QueueItemView],
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut m = s.serialize_map(None)?;
+        if !queue.is_empty() {
+            m.serialize_entry("queue_count", &queue.len())?;
+            m.serialize_entry(
+                "queue",
+                &queue.iter().map(|q| q.name.as_str()).collect::<Vec<_>>(),
+            )?;
+            m.serialize_entry("queue_entries", queue)?;
+        }
+        m.end()
+    }
 }
 
-#[derive(serde::Serialize)]
-struct FinishedPlanJson<'a> {
-    plan: &'a str,
-    intro: &'a str,
-    finalized_at: &'a str,
+/// Nought or one, as a list: the key has always been an array.
+fn as_list<T: serde::Serialize, S: serde::Serializer>(
+    one: &Option<T>,
+    s: S,
+) -> Result<S::Ok, S::Error> {
+    s.collect_seq(one.iter())
 }
 
-#[derive(serde::Serialize)]
-struct BlockJson<'a> {
-    agent: &'a str,
-    name: &'a str,
-    question: &'a str,
-    answer: Option<&'a str>,
-    pending: bool,
+fn plans_wire<S: serde::Serializer>(
+    plans: &[clank_core::wait::PlanWorkState],
+    s: S,
+) -> Result<S::Ok, S::Error> {
+    s.collect_seq(plans.iter().map(Planned))
 }
 
-#[derive(serde::Serialize)]
-struct DirtyStatsJson {
-    insertions: u64,
-    deletions: u64,
-    binary: u64,
-    untracked: u64,
+fn blocks_wire<S: serde::Serializer>(
+    blocks: &[crate::cli::block::BlockEntry],
+    s: S,
+) -> Result<S::Ok, S::Error> {
+    s.collect_seq(blocks.iter().map(Answerable))
 }
 
-#[derive(serde::Serialize)]
-struct StashJson<'a> {
-    plan: &'a str,
-    waiting_for: Option<&'a str>,
-    ready: bool,
+fn correction_wire<S: serde::Serializer>(
+    correction: &Option<clank_core::wait::HeadCorrection>,
+    s: S,
+) -> Result<S::Ok, S::Error> {
+    match correction {
+        Some(c) => serde::Serialize::serialize(&Corrected(c), s),
+        None => s.serialize_none(),
+    }
 }
 
-#[derive(serde::Serialize)]
-struct HeadCorrectionJson<'a> {
-    sha: &'a str,
-    unknown: &'a [String],
-    untagged_touched: Vec<&'a str>,
-    extra_named: Vec<&'a str>,
+/// A plan as the wire says it: two of its keys were named otherwise
+/// before this was one model, and renaming them would break every
+/// consumer to tidy a word. The rest is the model's own, so a field
+/// added to `PlanWorkState` stops this compiling rather than going
+/// missing.
+struct Planned<'a>(&'a clank_core::wait::PlanWorkState);
+
+impl serde::Serialize for Planned<'_> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let clank_core::wait::PlanWorkState {
+            plan,
+            handover,
+            sha,
+            gate,
+            waiting_on,
+            touched_code,
+        } = self.0;
+        let mut m = s.serialize_map(Some(6))?;
+        m.serialize_entry("plan", plan.as_str())?;
+        // The wire's older names for these two.
+        m.serialize_entry("latest_reviewable_sha", &sha.as_ref().map(|s| s.as_str()))?;
+        m.serialize_entry("gate_state", gate)?;
+        m.serialize_entry("waiting_on", waiting_on)?;
+        m.serialize_entry("handover", handover)?;
+        m.serialize_entry("touched_code", touched_code)?;
+        m.end()
+    }
+}
+
+/// A head correction as the wire says it: the violation's fields sit
+/// beside the sha rather than under it, which is the shape consumers
+/// parse. Exhaustive at both levels.
+struct Corrected<'a>(&'a clank_core::wait::HeadCorrection);
+
+impl serde::Serialize for Corrected<'_> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let clank_core::wait::HeadCorrection { sha, violation } = self.0;
+        let clank_core::wait::HeadTagViolation {
+            unknown,
+            untagged_touched,
+            extra_named,
+        } = violation;
+        let mut m = s.serialize_map(Some(4))?;
+        m.serialize_entry("sha", sha.as_str())?;
+        m.serialize_entry("unknown", unknown)?;
+        m.serialize_entry(
+            "untagged_touched",
+            &untagged_touched
+                .iter()
+                .map(PlanKey::as_str)
+                .collect::<Vec<_>>(),
+        )?;
+        m.serialize_entry(
+            "extra_named",
+            &extra_named.iter().map(PlanKey::as_str).collect::<Vec<_>>(),
+        )?;
+        m.end()
+    }
+}
+
+/// A block as the wire says it: its own fields, and the `pending` the
+/// wire has always computed from the answer.
+struct Answerable<'a>(&'a crate::cli::block::BlockEntry);
+
+impl serde::Serialize for Answerable<'_> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let crate::cli::block::BlockEntry {
+            agent,
+            name,
+            question,
+            answer,
+        } = self.0;
+        let mut m = s.serialize_map(Some(5))?;
+        m.serialize_entry("agent", agent)?;
+        m.serialize_entry("name", name)?;
+        m.serialize_entry("question", question)?;
+        m.serialize_entry("answer", answer)?;
+        m.serialize_entry("pending", &answer.is_none())?;
+        m.end()
+    }
 }
 
 /// In-process convenience for tests / callers that want a status
@@ -565,97 +690,7 @@ impl StatusSnapshot {
     }
 
     pub fn to_json(&self) -> serde_json::Value {
-        let plans = self
-            .plans
-            .iter()
-            .map(|v| PlanJson {
-                plan: v.plan.as_str(),
-                latest_reviewable_sha: v.sha.as_ref().map(|s| s.as_str()),
-                gate_state: v.gate,
-                waiting_on: &v.waiting_on,
-            })
-            .collect();
-
-        // Mirror the prior shape: the finished-plan row appears only
-        // when there are no active plans.
-        let finished_plans = if self.plans.is_empty() {
-            self.last_finished
-                .as_ref()
-                .map(|fp| FinishedPlanJson {
-                    plan: fp.plan.as_str(),
-                    intro: fp.intro.as_str(),
-                    finalized_at: fp.finalized_at.as_str(),
-                })
-                .into_iter()
-                .collect()
-        } else {
-            Vec::new()
-        };
-
-        let blocks = self
-            .blocks
-            .iter()
-            .map(|b| BlockJson {
-                agent: &b.agent,
-                name: &b.name,
-                question: &b.question,
-                answer: b.answer.as_deref(),
-                pending: b.answer.is_none(),
-            })
-            .collect();
-
-        let stash = self
-            .stash
-            .iter()
-            .map(|sv| StashJson {
-                plan: &sv.stem,
-                waiting_for: sv.waiting_for.as_deref(),
-                ready: sv.ready,
-            })
-            .collect();
-
-        let json = StatusJson {
-            repo_basename: &self.basename,
-            branch: self.branch.as_deref(),
-            head_sha: self.head_sha.as_deref(),
-            head_subject: self.head_subject.as_deref(),
-            worktree_dirty: self.dirty.is_some(),
-            plans,
-            finished_plans,
-            blocks,
-            dirty_stats: self.dirty.map(|d| DirtyStatsJson {
-                binary: d.binary,
-                insertions: d.insertions,
-                deletions: d.deletions,
-                untracked: d.untracked,
-            }),
-            // queue_count + queue travel together, present only when
-            // the queue is non-empty (clank-status-tui).
-            queue_count: (!self.queue.is_empty()).then_some(self.queue.len()),
-            // The JSON wire shape stays a names array (priority is a
-            // TUI/HTML display concern; consumers read names).
-            queue: (!self.queue.is_empty())
-                .then(|| self.queue.iter().map(|q| q.name.as_str()).collect()),
-            stash,
-            head_correction: self.head_correction.as_ref().map(|c| HeadCorrectionJson {
-                sha: c.sha.as_str(),
-                unknown: &c.violation.unknown,
-                untagged_touched: c
-                    .violation
-                    .untagged_touched
-                    .iter()
-                    .map(PlanKey::as_str)
-                    .collect(),
-                extra_named: c
-                    .violation
-                    .extra_named
-                    .iter()
-                    .map(PlanKey::as_str)
-                    .collect(),
-            }),
-        };
-
-        serde_json::to_value(&json).expect("StatusJson serializes")
+        serde_json::to_value(self).expect("the snapshot serializes")
     }
 
     pub fn to_human(&self) -> String {
@@ -2547,16 +2582,23 @@ mod dirty_and_wake_tests {
         let got = snap.to_json();
 
         let want = serde_json::json!({
+            // Where it was read: `--repo` means the reader need not be
+            // standing in it (codex on 772b84f).
+            "repo_path": "/repo",
             "repo_basename": "repo",
             "branch": "main",
             "head_sha": "abcd123",
             "head_subject": "do the thing",
             "worktree_dirty": false,
             "plans": [{
+                // The two keys the wire fixed before this was one
+                // model, and the rest of what a plan's state holds.
                 "plan": "foo",
                 "latest_reviewable_sha": "0123456789abcdef0123456789abcdef01234567",
                 "gate_state": "unreviewed",
                 "waiting_on": WaitingOn::MasterToContinue,
+                "handover": {"opened": null, "commit_tier_closed": null, "second_tier_closed": null},
+                "touched_code": true,
             }],
             "finished_plans": [],
             "blocks": [{
@@ -2566,6 +2608,10 @@ mod dirty_and_wake_tests {
                 "answer": null,
                 "pending": true,
             }],
+            // The roster, always said: a teamless repo says so rather
+            // than saying nothing (status-is-one-model-rendered-two-ways).
+            "master": null,
+            "agents": [],
         });
         assert_eq!(got, want);
 
@@ -2582,6 +2628,162 @@ mod dirty_and_wake_tests {
                 "key `{absent}` must be absent when empty"
             );
         }
+    }
+
+    /// Every fact the model carries either reaches the JSON or is
+    /// named below as the log's machinery. Destructured WITHOUT `..`,
+    /// so a field added to the snapshot does not COMPILE until someone
+    /// decides which it is: the roster was missing for as long as it
+    /// was because nothing made its absence fail
+    /// (status-is-one-model-rendered-two-ways).
+    #[test]
+    fn every_fact_the_model_carries_reaches_the_json() {
+        use crate::cli::teams_config::RosterRole;
+        use clank_core::vocab::AutoMode;
+        let mut snap = minimal_snapshot();
+        snap.master = Some("claude".to_string());
+        let roster_row = |label: &str, role: RosterRole, auto: AutoMode| AgentAutoRow {
+            role,
+            auto_mode: auto,
+            ..agent_row(label, None)
+        };
+        snap.agents = vec![
+            AgentAutoRow {
+                // A bound agent and an unbound one, since "has a
+                // session" is a fact the pane shows and a bool that is
+                // always false says nothing.
+                session: Some(crate::cli::status_tui::fixtures::bound(
+                    clank_core::vocab::Tool::Claude,
+                    "0199a0f2-1111-4444-8888-aaaaaaaaaaaa",
+                )),
+                ..roster_row("claude", RosterRole::Master, AutoMode::On)
+            },
+            roster_row("ruthless", RosterRole::Final, AutoMode::Off),
+        ];
+        snap.queue = vec![QueueItemView {
+            priority: 120,
+            name: "later".to_string(),
+            path: PathBuf::from("/r/.clank/queue/120-later.md"),
+        }];
+        snap.forks = vec![("spike".to_string(), "worktree")];
+        snap.pr_reviews = vec![clank_core::wait::PrReviewWorkState {
+            pr: 7,
+            handover: Default::default(),
+            repo: "llfourn/clank".to_string(),
+            round: 2,
+            gate: CommitGateState::Unreviewed,
+            missing_reviewers: vec![clank_core::ids::AgentLabel::parse("codex").unwrap()],
+        }];
+        snap.ad_hoc = vec![clank_core::wait::AdHocWorkState {
+            sha: sha("deadbeef"),
+            gate: CommitGateState::Unreviewed,
+            handover: Default::default(),
+        }];
+        let v = snap.to_json();
+
+        let StatusSnapshot {
+            // The facts, each asserted below.
+            basename,
+            branch,
+            head_sha,
+            head_subject,
+            dirty,
+            plans,
+            last_finished: _,
+            blocks,
+            queue,
+            master,
+            agents,
+            stash: _,
+            forks,
+            pr_reviews,
+            ad_hoc,
+            head_correction: _,
+            // Emitted, and pinned by the wire fixture below rather
+            // than here: `--repo` means the reader need not be
+            // standing in it (codex on 772b84f).
+            repo_path: _,
+            // The LOG and the paging that walks it: rows, the fold
+            // boundary, the cursor, what a finalize stands for, the
+            // branch decorations, and the github events index-aligned
+            // with those rows. `clank log --json` is the log's surface
+            // and says so; this is the state's.
+            log_rows: _,
+            log_adopted_at: _,
+            log_stands_for: _,
+            log_next: _,
+            log_decorations: _,
+            github_events: _,
+        } = &snap;
+
+        assert_eq!(v["repo_basename"], **basename);
+        assert_eq!(v["branch"], *branch.as_deref().unwrap());
+        assert_eq!(v["head_sha"], *head_sha.as_deref().unwrap());
+        assert_eq!(v["head_subject"], *head_subject.as_deref().unwrap());
+        assert_eq!(v["worktree_dirty"], dirty.is_some());
+        assert_eq!(v["plans"].as_array().unwrap().len(), plans.len());
+        assert_eq!(v["blocks"].as_array().unwrap().len(), blocks.len());
+        assert_eq!(v["master"], *master.as_deref().unwrap());
+        // The TIER, not "master or reviewer": the pane draws the
+        // difference between a commit reviewer and a final one.
+        // The TIER, and the facts the pane draws beside it: what tool
+        // the agent is, how it is invoked, the session it is bound to,
+        // what it is attending. A bool saying "a session exists" is
+        // not those facts (codex on d7af56f).
+        assert_eq!(
+            v["agents"],
+            serde_json::json!([
+                {
+                    "label": "claude",
+                    "role": "master",
+                    "auto": "on",
+                    "tool": "claude",
+                    "invocation": "claude",
+                    "session": {
+                        "id": "0199a0f2-1111-4444-8888-aaaaaaaaaaaa",
+                        "tool": "claude",
+                        "updated_at": "2026-09-22T00:00:00Z",
+                    },
+                    "attending": null,
+                },
+                {
+                    "label": "ruthless",
+                    "role": "final",
+                    "auto": "off",
+                    "tool": "claude",
+                    "invocation": "claude",
+                    "session": null,
+                    "attending": null,
+                },
+            ]),
+            "the roster's tiers and the rest of what it holds"
+        );
+        assert_eq!(agents.len(), 2);
+        // The names array consumers read, AND the entries that order
+        // and identify them.
+        assert_eq!(v["queue"], serde_json::json!(["later"]));
+        assert_eq!(v["queue_count"], queue.len());
+        assert_eq!(
+            v["queue_entries"],
+            serde_json::json!([{"name": "later", "priority": 120, "handle": "120-later"}])
+        );
+        assert_eq!(
+            v["forks"],
+            // Against the MODEL's own value, which is what this test
+            // is for: a literal here would hold the JSON against
+            // something written down twice (ruthless on 840b0ee).
+            // Nothing fixed a shape for this key, so it is the pair
+            // the model holds.
+            serde_json::to_value(forks).unwrap()
+        );
+        assert_eq!(v["pr_reviews"].as_array().unwrap().len(), pr_reviews.len());
+        assert_eq!(v["pr_reviews"][0]["pr"], 7);
+        assert_eq!(
+            v["pr_reviews"][0]["missing_reviewers"],
+            serde_json::json!(["codex"])
+        );
+        assert_eq!(v["ad_hoc"].as_array().unwrap().len(), ad_hoc.len());
+        assert_eq!(v["ad_hoc"][0]["sha"], "deadbeef");
     }
 
     #[test]
@@ -2634,7 +2836,9 @@ mod dirty_and_wake_tests {
         // deliberate breaking wire change for dogfood consumers.
         assert_eq!(
             got["stash"],
-            serde_json::json!([{"plan": "old", "waiting_for": "bar", "ready": true}])
+            // `commits` is how big a pop is, which the pane shows and
+            // the wire used to drop.
+            serde_json::json!([{"plan": "old", "waiting_for": "bar", "ready": true, "commits": 2}])
         );
         assert_eq!(got["shelved"], serde_json::Value::Null, "old key gone");
         assert_eq!(

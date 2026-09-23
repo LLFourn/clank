@@ -812,7 +812,7 @@ pub fn commit_numstat_at(repo: &Path, sha: &CommitSha) -> Result<Vec<FileStat>, 
 /// unstaged together) and the untracked-file count. Untracked lines
 /// are NOT folded into the +/− numbers — a diff against HEAD doesn't
 /// see them, and pretending otherwise lies.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct DirtyStats {
     pub insertions: u64,
     pub deletions: u64,

@@ -481,7 +481,7 @@ pub struct PrReviewInput {
 
 /// Per-PR-review gate + routing state, the PR analogue of
 /// `PlanWorkState`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct PrReviewWorkState {
     pub pr: u32,
     /// See [`PlanWorkState::handover`].
@@ -514,7 +514,7 @@ pub struct ReviewEntry {
 /// keeps an agent's clock monotone until the agent itself acts: a
 /// verdict from outside the required set — a still-pending peer's,
 /// an unsummoned reviewer's, a stale author's — moves nothing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
 pub struct Handover {
     /// The work appeared: the commit's author time, or the round's
     /// open time.
@@ -676,7 +676,7 @@ pub struct MultiPlanOpen {
     pub sha: CommitSha,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct PlanWorkState {
     pub plan: PlanKey,
     /// When each stage of this plan's review chain closed — what
@@ -693,7 +693,7 @@ pub struct PlanWorkState {
     pub touched_code: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct AdHocWorkState {
     pub sha: CommitSha,
     pub gate: crate::vocab::CommitGateState,
