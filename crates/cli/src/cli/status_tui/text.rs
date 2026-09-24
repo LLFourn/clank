@@ -485,8 +485,31 @@ pub(super) fn truncate_to(s: &str, cols: usize) -> String {
         t.push(c);
         w += cw;
     }
+    // A base kept WITHOUT its selector is not the glyph anyone asked
+    // for: cutting `U+2601 U+FE0F` between the two leaves a bare
+    // cloud, whose presentation the renderer then picks for itself --
+    // the exact ambiguity the selector exists to remove
+    // (the-cloud-is-always-the-cloud).
+    //
+    // Only that case. A selector that was KEPT always has its base,
+    // because the scan runs in order and a selector follows the char
+    // it belongs to -- so a retained trailing selector means the pair
+    // is whole, and dropping it would throw away a glyph that fits
+    // (codex 03c64bd).
+    if s.chars()
+        .nth(t.chars().count())
+        .is_some_and(is_variation_selector)
+    {
+        t.pop();
+    }
     t.push('…');
     t
+}
+
+/// `U+FE00`–`U+FE0F`: a mark that belongs to the char BEFORE it and
+/// says how to draw it. Never meaningful alone.
+fn is_variation_selector(c: char) -> bool {
+    matches!(c, '\u{FE00}'..='\u{FE0F}')
 }
 
 /// Strip a leading signal-lamp emoji (`"👀 frostsnap"` → `"frostsnap"`)
@@ -504,6 +527,42 @@ pub(crate) fn strip_leading_emoji(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// A cut never separates a variation selector from its base --
+    /// and never throws away a pair that fits.
+    ///
+    /// Asserted as EXACT outputs per width, not as "both present or
+    /// both absent": that biconditional is satisfied by deleting both,
+    /// which is precisely the regression it let through
+    /// (codex 03c64bd).
+    #[test]
+    fn truncation_keeps_a_variation_selector_with_its_base() {
+        let s = "\u{2601}\u{FE0F} remote";
+        assert_eq!(super::display_width(s), 9);
+        for (cols, want) in [
+            (0, ""),
+            // Budget 0 after the ellipsis: nothing fits.
+            (1, "…"),
+            // Budget 1: the cloud alone would fit, but its selector
+            // would not -- so the pair goes rather than shipping a
+            // bare codepoint.
+            (2, "…"),
+            // Budget 2: the WHOLE pair fits and must be kept.
+            (3, "\u{2601}\u{FE0F}…"),
+            (4, "\u{2601}\u{FE0F} …"),
+            (5, "\u{2601}\u{FE0F} r…"),
+            // Room for everything: no ellipsis at all.
+            (9, "\u{2601}\u{FE0F} remote"),
+            (20, "\u{2601}\u{FE0F} remote"),
+        ] {
+            let cut = super::truncate_to(s, cols);
+            assert_eq!(cut, want, "at {cols} cols");
+            assert!(
+                super::display_width(&cut) <= cols,
+                "at {cols} cols it overflows: {cut:?}",
+            );
+        }
+    }
+
     use super::*;
 
     #[test]

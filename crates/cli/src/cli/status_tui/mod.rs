@@ -4408,7 +4408,10 @@ pub(crate) async fn run_tui(
                     // is gone: an agent can handle its messages while
                     // the page is open, and a stale index would show
                     // another agent's inbox under this one's name.
-                    Mode::InboxDetail { agent, scroll } => {
+                    //
+                    // The stored index is deliberately NOT read: the
+                    // label is what re-locates it.
+                    Mode::InboxDetail { scroll, .. } => {
                         match detail_label
                             .as_deref()
                             .and_then(|l| relocate_detail(l, &snapshot.agents))

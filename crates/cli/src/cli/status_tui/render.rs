@@ -1361,8 +1361,8 @@ const BAND_BG: &str = "48;5;238";
 /// zellij speaks only when something is wrong — not in a session, or
 /// one that does not answer — with the one word that names what to
 /// do; connected, or not yet known, says nothing. The remote is one
-/// icon, coloured by its state: `☁` is text-presentation, one cell,
-/// not an emoji.
+/// icon, coloured by its state: see [`REMOTE_ICON`] for what it asks
+/// the renderer to draw.
 pub(super) fn cluster(
     reach: crate::cli::status_tui::zellij::ZellijReach,
     remote: crate::cli::status_tui::remote::Shown,
@@ -1389,7 +1389,30 @@ pub(super) fn cluster(
     items
 }
 
-pub(super) const REMOTE_ICON: &str = "☁";
+/// The remote's icon: `U+2601` CLOUD followed by `U+FE0F`,
+/// VARIATION SELECTOR-16.
+///
+/// The selector is the whole point. `U+2601` alone has two
+/// presentations — a monochrome text glyph and the colour emoji — and
+/// a bare codepoint leaves the choice to the renderer, which is how
+/// one terminal showed both at once: a colour cloud on one pane's
+/// remote row and a monochrome bump on another's. VS16 REQUESTS the
+/// emoji, so nothing downstream gets a vote.
+///
+/// Two display columns, and the arithmetic that gets there is a
+/// compensating pair rather than a truth about each char: VS16 is
+/// really zero-width, but `char_width` counts every non-WIDE char as
+/// one, so a NARROW base plus its selector totals the 2 the emoji
+/// actually occupies. `the_remote_icon_measures_the_two_cells_it_draws`
+/// pins the total — "correcting" VS16 to zero would silently misalign
+/// the row.
+///
+/// The narrow base is doing that work, so the sum is not a rule about
+/// selectors. A VS16 sequence on a WIDE base would measure 2 + 1 = 3
+/// for a glyph the terminal draws in 2. This is the only such
+/// sequence in production today; a second one needs its width checked
+/// rather than assumed from this one (ruthless 1ff418f).
+pub(super) const REMOTE_ICON: &str = "\u{2601}\u{FE0F}";
 
 pub(super) fn remote_hue(
     remote: crate::cli::status_tui::remote::Shown,
@@ -3768,6 +3791,112 @@ pub(super) fn render_error_doc(
 
 #[cfg(test)]
 mod tests {
+    /// The icon ASKS for the emoji, in both row states.
+    ///
+    /// A bare `U+2601` has two presentations and leaves the choice to
+    /// the renderer; the selector removes the choice. It has to
+    /// survive drawing, because a row that loses it downstream is
+    /// back to asking nothing -- and the selected row is drawn
+    /// inverted, a different path from the dim one.
+    #[test]
+    fn the_remote_icon_carries_its_selector_into_every_row_state() {
+        use crate::cli::status_tui::remote::Shown::*;
+        assert_eq!(
+            REMOTE_ICON.chars().collect::<Vec<_>>(),
+            vec!['\u{2601}', '\u{FE0F}'],
+            "cloud then VARIATION SELECTOR-16",
+        );
+        for state in [Off, Unconfigured, Starting, Stopping, On, Failed] {
+            let drawn: String = remote_row(state, Some("http://x"))
+                .iter()
+                .map(|s| s.1.clone())
+                .collect();
+            assert!(
+                drawn.contains(REMOTE_ICON),
+                "{state:?} must carry the whole sequence: {drawn:?}",
+            );
+            assert!(
+                !drawn.contains("\u{2601} ") && !drawn.contains("\u{2601}\u{2601}"),
+                "{state:?} must not carry a BARE cloud: {drawn:?}",
+            );
+        }
+    }
+
+    /// Two cells, measured -- the width the emoji actually occupies.
+    ///
+    /// The arithmetic is a compensating pair, not a truth about each
+    /// char: VS16 is really zero-width, and `char_width` counts every
+    /// non-WIDE char as one, so the sequence totals 2. Pinned because
+    /// "correcting" VS16 to zero would misalign the row silently.
+    #[test]
+    fn the_remote_icon_measures_the_two_cells_it_draws() {
+        assert_eq!(display_width(REMOTE_ICON), 2);
+        // The row's name therefore starts at the same column as an
+        // agent row's, in EVERY state -- the width cannot depend on
+        // the colour.
+        use crate::cli::status_tui::remote::Shown::*;
+        let column = |state| {
+            let spans = remote_row(state, Some("http://x"));
+            display_width(&spans[0].1)
+        };
+        let first = column(Off);
+        assert_eq!(first, super::MARK_FIELD, "padded to the mark field");
+        for state in [Unconfigured, Starting, Stopping, On, Failed] {
+            assert_eq!(column(state), first, "{state:?} starts the name elsewhere");
+        }
+    }
+
+    /// The drawn row keeps the whole glyph, and both states agree
+    /// about it.
+    ///
+    /// Selected rows go through `emit_selected` -- inverted, the whole
+    /// line truncated at once -- while unselected goes through `emit`,
+    /// which truncates span by span. A cut that split the pair showed
+    /// up in one path and not the other, which is how codex found it
+    /// at three columns (03c64bd).
+    #[test]
+    fn the_row_keeps_the_whole_glyph_at_every_width_and_state() {
+        use crate::cli::status_tui::remote::Shown::*;
+        use crate::cli::status_tui::text::row_line;
+        let spans = remote_row(On, Some("http://127.0.0.1:8088"));
+        let raw: String = spans.iter().map(|s| s.1.clone()).collect();
+        let seen = |selected, cols| {
+            visible(&row_line(&spans, selected, "32", cols))
+                .trim_end()
+                .to_string()
+        };
+
+        for cols in 0..=display_width(&raw) + 2 {
+            for state in [seen(false, cols), seen(true, cols)] {
+                // Never a base without its selector: that is the bare
+                // codepoint whose presentation the renderer picks.
+                assert_eq!(
+                    state.contains('\u{2601}'),
+                    state.contains('\u{FE0F}'),
+                    "at {cols} cols the pair was split: {state:?}",
+                );
+            }
+        }
+        // NOT asserted: that the two states render identically at
+        // every width. They do not, and it is not this icon's doing --
+        // `emit` truncates span by span and stops without an ellipsis
+        // when a span exactly fills the row, while `emit_selected`
+        // truncates the whole line and adds one. Plain spans
+        // ["ab", "cdef"] at 2 columns give "ab" against "a…", and the
+        // remote row differs at 9 for the same reason. That is
+        // `row_line`'s asymmetry, older than this plan and worth its
+        // own; pinning it here would be asserting something this
+        // change neither caused nor fixed.
+        // And where the pair exactly fits, it is THERE -- the split
+        // assertion alone is satisfied by dropping both.
+        assert!(
+            seen(false, 3).contains(REMOTE_ICON) && seen(true, 3).contains(REMOTE_ICON),
+            "three columns fit the whole glyph: {:?} / {:?}",
+            seen(false, 3),
+            seen(true, 3),
+        );
+    }
+
     /// Every character of a long paragraph is reachable by scrolling.
     ///
     /// The document used to keep each paragraph as ONE line and clip
@@ -5816,6 +5945,18 @@ mod tests {
         }
     }
 
+    /// The remote row as it is DRAWN: the icon, padded to the mark
+    /// field exactly as `remote_row` pads it, then the name and what
+    /// there is to say.
+    ///
+    /// Built from `REMOTE_ICON` rather than spelled out, so a change
+    /// to the icon's width moves the expectation with the code instead
+    /// of leaving a literal that has to be hand-edited.
+    fn row_text(said: &str) -> String {
+        let pad = super::MARK_FIELD.saturating_sub(display_width(super::REMOTE_ICON));
+        format!("{}{} remote  {said}", super::REMOTE_ICON, " ".repeat(pad))
+    }
+
     #[test]
     fn the_remote_row_says_its_state_url_or_reason() {
         use crate::cli::status_tui::remote::Shown::*;
@@ -5830,18 +5971,18 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         for (remote, detail, want) in [
-            (Off, None, "☁  remote  off"),
-            (Starting, None, "☁  remote  starting…"),
-            (Stopping, None, "☁  remote  stopping…"),
+            (Off, None, &row_text("off")),
+            (Starting, None, &row_text("starting…")),
+            (Stopping, None, &row_text("stopping…")),
             (
                 On,
                 Some("http://127.0.0.1:8088"),
-                "☁  remote  http://127.0.0.1:8088",
+                &row_text("http://127.0.0.1:8088"),
             ),
             (
                 Failed,
                 Some("address in use"),
-                "☁  remote  failed — address in use",
+                &row_text("failed — address in use"),
             ),
         ] {
             let lines = texts(remote, detail);
@@ -5849,7 +5990,7 @@ mod tests {
                 .iter()
                 .position(|l| l.ends_with("+ add agent"))
                 .unwrap();
-            assert_eq!(lines[add + 1], want, "{lines:#?}");
+            assert_eq!(lines[add + 1], *want, "{lines:#?}");
         }
         let spans = remote_row(On, Some("http://x"));
         assert!(matches!(
@@ -5873,7 +6014,7 @@ mod tests {
                 !shown.chars().any(|c| c.is_control()),
                 "{selected}: {shown:?}"
             );
-            assert_eq!(shown.trim_end(), "☁  remote  failed — cannot start here");
+            assert_eq!(shown.trim_end(), row_text("failed — cannot start here"));
         }
     }
 
@@ -5998,7 +6139,11 @@ mod tests {
         use crate::cli::status_tui::remote::Shown::*;
         use crate::cli::status_tui::zellij::ZellijReach::Connected;
         let s = snap(vec![plan_state("foo", reviewer_missing("codex"))], vec![]);
-        assert_eq!(display_width(REMOTE_ICON), 1, "one cell, measured");
+        assert_eq!(
+            display_width(REMOTE_ICON),
+            2,
+            "the emoji the selector asks for is two cells, and the reserve is measured",
+        );
 
         for (remote, want) in [
             (Off, Hue::Indexed(245)),
@@ -6110,9 +6255,21 @@ mod tests {
         );
         // 18 cells of lamp, then the band: a margin, `! zellij` (the
         // test view is outside a session), a margin, the cloud, a
-        // margin.
-        let v = bar_body(&render(&s, 1, 30)[0]);
+        // margin. The cloud is TWO cells -- it asks for the emoji --
+        // so the band reserves one more than it did when the icon was
+        // a bare codepoint the renderer might draw either way.
+        // 29 cells of everything else, plus whatever the cloud costs:
+        // written as a sum so the boundary MOVES with the icon. A
+        // reserve that stopped counting the icon would fail here
+        // rather than quietly giving the bar a cell it does not have.
+        let fits = 29 + display_width(REMOTE_ICON) as u16;
+        let v = bar_body(&render(&s, 1, fits)[0]);
         assert_eq!(v, "👀 CODEX reviewing", "left segment only; got `{v}`");
+        // Pinned from BOTH sides: measured on this tree, 31 fits and
+        // 30 truncates, so the assertion above is at the boundary
+        // rather than comfortably past it.
+        let v = bar_body(&render(&s, 1, fits - 1)[0]);
+        assert!(v.ends_with('…'), "a cell short must truncate; got `{v}`",);
     }
 
     #[test]
