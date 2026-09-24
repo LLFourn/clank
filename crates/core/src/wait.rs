@@ -508,6 +508,10 @@ pub trait PlanStateLookup {
 #[derive(Debug, Clone)]
 pub struct PrReviewInput {
     pub pr: u32,
+    /// Whether THIS review's handoff was found impossible — the
+    /// caller resolves `handoff_blocked == Some(instance)`, so a
+    /// stale block from an earlier run never reaches here.
+    pub handoff_blocked: bool,
     /// `owner/name` slug, for building the PR's GitHub URL.
     pub repo: String,
     pub round: u64,
@@ -532,6 +536,39 @@ pub struct PrReviewWorkState {
     /// current-round verdict (the ones to wake). Empty when it's
     /// master's turn.
     pub missing_reviewers: Vec<AgentLabel>,
+    /// Handoff has been found IMPOSSIBLE for this review, so master
+    /// is not woken to retry it.
+    ///
+    /// A converged review otherwise emits `Finish` on every arm until
+    /// the scratch goes, and the scratch only goes on a handoff that
+    /// worked — so a handoff that CANNOT work re-fires forever. That
+    /// is the shape this suppresses, and only that shape: an ordinary
+    /// transient failure leaves this false and keeps its retry.
+    ///
+    /// Scoped to the review that hit it. `pr-review start` makes a new
+    /// instance, which does not inherit the block.
+    ///
+    /// Ask [`Self::handoff_stopped`] rather than this field: the flag
+    /// alone does not say whether anything has actually stopped.
+    #[serde(default)]
+    pub handoff_blocked: bool,
+}
+
+impl PrReviewWorkState {
+    /// Whether the block is actually STOPPING anything here.
+    ///
+    /// `handoff_blocked` survives `propose`, which reopens the round,
+    /// so a review being reviewed again can carry it while reviewers
+    /// still owe verdicts and master still owes an integration. Only
+    /// the CONVERGED stage is suppressed.
+    ///
+    /// This exists because the rule was written out separately by
+    /// every reader, and two of the three got it wrong in the same
+    /// way -- a bare bool hands each one the same coin flip
+    /// (ruthless 329d579).
+    pub fn handoff_stopped(&self) -> bool {
+        self.handoff_blocked && self.gate == crate::vocab::CommitGateState::Finished
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1354,6 +1391,7 @@ impl RepoState {
             };
             pr_reviews.push(PrReviewWorkState {
                 pr: input.pr,
+                handoff_blocked: input.handoff_blocked,
                 handover: stage_closures(
                     input.opened_at,
                     &input.current_verdicts,
@@ -1595,6 +1633,13 @@ impl WorkStatus {
                         // the review. Always master's turn, regardless
                         // of gate.
                         Some(PrMasterNext::Draft)
+                    } else if pr.handoff_stopped() {
+                        // A handoff that cannot succeed is not work:
+                        // waking master to retry it is the
+                        // forever-loop, not a nudge toward it. Asked
+                        // as a question, so this is the ONE place the
+                        // rule is written.
+                        None
                     } else {
                         match pr.gate {
                             CommitGateState::ChangesRequested => Some(PrMasterNext::Integrate),
@@ -2988,6 +3033,7 @@ mod tests {
 
     fn pr_input(round: u64, verdicts: &[(&str, crate::vocab::Verdict)]) -> PrReviewInput {
         PrReviewInput {
+            handoff_blocked: false,
             pr: 123,
             repo: "o/r".into(),
             round,
@@ -3023,6 +3069,7 @@ mod tests {
         use crate::vocab::Verdict;
         let dated = |round_at: i64, verdicts: &[(&str, Verdict, i64)]| {
             pr_state(PrReviewInput {
+                handoff_blocked: false,
                 pr: 123,
                 repo: "o/r".into(),
                 round: 1,
@@ -3196,6 +3243,7 @@ mod tests {
             plans: Vec::new(),
             ad_hoc: Vec::new(),
             pr_reviews: vec![PrReviewWorkState {
+                handoff_blocked: false,
                 pr: 123,
                 repo: "o/r".into(),
                 round: 2,
@@ -3206,6 +3254,67 @@ mod tests {
             head_correction: None,
             multi_plan_open: None,
         }
+    }
+
+    /// A handoff that CANNOT succeed is not work.
+    ///
+    /// The scratch only goes on a handoff that worked, and the gate
+    /// stays Finished, so a converged review whose handoff is
+    /// impossible would otherwise emit `Finish` on every arm forever.
+    /// That is the reported bug: "finish exits 1 without recording
+    /// anything, so the wake item re-fires on every Stop, forever."
+    #[test]
+    fn a_blocked_handoff_stops_offering_finish() {
+        use crate::vocab::CommitGateState;
+        let mut ws = ws_pr(CommitGateState::Finished, &[]);
+        assert_eq!(
+            ws.work_for(&label("claude"), Role::Master),
+            vec![WaitItem::PrMaster {
+                pr: 123,
+                round: 2,
+                next: PrMasterNext::Finish,
+            }],
+            "a converged review asks master to finish",
+        );
+
+        ws.pr_reviews[0].handoff_blocked = true;
+        assert!(
+            ws.work_for(&label("claude"), Role::Master).is_empty(),
+            "a handoff that cannot work must not keep waking master",
+        );
+    }
+
+    /// Only the CONVERGED arm is suppressed: a blocked handoff says
+    /// nothing about a review that is still being reviewed, and
+    /// silencing those would strand the whole review rather than one
+    /// step of it.
+    #[test]
+    fn a_blocked_handoff_silences_nothing_else() {
+        use crate::vocab::CommitGateState;
+        for (gate, next) in [
+            (CommitGateState::ChangesRequested, PrMasterNext::Integrate),
+            (CommitGateState::Continued, PrMasterNext::Continue),
+        ] {
+            let mut ws = ws_pr(gate, &[]);
+            ws.pr_reviews[0].handoff_blocked = true;
+            assert_eq!(
+                ws.work_for(&label("claude"), Role::Master),
+                vec![WaitItem::PrMaster {
+                    pr: 123,
+                    round: 2,
+                    next,
+                }],
+                "{gate:?} is still master's turn",
+            );
+        }
+        // And reviewers are untouched: the block is master's handoff,
+        // not the review.
+        let mut ws = ws_pr(CommitGateState::Unreviewed, &["codex"]);
+        ws.pr_reviews[0].handoff_blocked = true;
+        assert_eq!(
+            ws.work_for(&label("codex"), Role::Reviewer),
+            vec![WaitItem::PrReviewer { pr: 123, round: 2 }],
+        );
     }
 
     #[test]

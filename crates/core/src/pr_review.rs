@@ -69,6 +69,14 @@ pub struct PrReviewState {
     /// watcher that sees `0` owns nothing and stops.
     #[serde(default)]
     pub instance: u64,
+    /// The `instance` whose handoff was found impossible, if one was.
+    ///
+    /// The instance is stored rather than a flag, so the block cannot
+    /// outlive the review that earned it: a later run on the same PR
+    /// carries a different instance and is not blocked. Cleared by an
+    /// explicit `finish`, which is the operator saying to try again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff_blocked: Option<u64>,
     /// The agent whose config STARTING this review added the PR's
     /// watch to, when it added one.
     ///
@@ -107,6 +115,7 @@ impl PrReviewState {
             round: 0,
             instance: 0,
             watch_owner: None,
+            handoff_blocked: None,
         }
     }
 }

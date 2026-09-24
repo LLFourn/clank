@@ -603,7 +603,11 @@ struct FakeGh {
     pending: Option<u64>,
     replies: usize,
     thumbs: usize,
-    fail_on_summary: bool,
+    /// What `set_summary` fails with, VERBATIM. A bool would only
+    /// say that it failed, and the whole point here is which sentence
+    /// GitHub answers with: the missing-body refusal is the one
+    /// `finish` must treat differently from every other 422.
+    summary_error: Option<String>,
     calls: std::sync::Mutex<Vec<String>>,
 }
 
@@ -636,8 +640,17 @@ impl clank::cli::pr_review::Handoff for FakeGh {
     }
     fn set_summary(&self, _slug: &str, _pr: u32, id: u64, body: &str) -> anyhow::Result<()> {
         self.calls.lock().unwrap().push(format!("set:{id}:{body}"));
-        if self.fail_on_summary {
-            anyhow::bail!("gh exploded");
+        if let Some(said) = &self.summary_error {
+            // A `GhFailure`, not a bare error: production classifies
+            // by downcasting to it and reading `said` ALONE. The argv
+            // carries the summary, so building the real one here is
+            // what puts this fake on the same boundary the classifier
+            // meets in production (codex 904bc9b).
+            return Err(clank::cli::pr_review::gh::GhFailure {
+                said: said.clone(),
+                argv: clank::cli::pr_review::gh::update_body_argv("o/r", 123, id, body),
+            }
+            .into());
         }
         Ok(())
     }
@@ -714,7 +727,7 @@ fn a_failed_handoff_keeps_the_scratch_and_the_retry_works() {
 
     let broken = FakeGh {
         pending: Some(42),
-        fail_on_summary: true,
+        summary_error: Some("gh exploded".into()),
         ..Default::default()
     };
     let err = clank::cli::pr_review::finish_through(
@@ -866,5 +879,296 @@ fn status_fails_closed_without_a_team() {
     assert!(
         !err.to_string().contains("converged"),
         "must not fabricate convergence: {err}"
+    );
+}
+
+/// GitHub's refusal, verbatim, as the probe on a live PR recorded it
+/// (LLFourn/clank#3, since deleted). REST `PUT` and GraphQL
+/// `updatePullRequestReview` both answer with this sentence when the
+/// review was created without a body.
+const MISSING_BODY: &str = "HTTP 422: Could not edit a review with a missing body \
+    (https://api.github.com/repos/o/r/pulls/123/reviews/42)";
+
+/// A review the loop created bodyless cannot be handed over, and
+/// master must stop being woken to try.
+///
+/// The gate stays Finished and the scratch only goes on a handoff
+/// that WORKED, so without suppression the converged review emits
+/// `Finish` on every arm forever — which is what the bug report
+/// described: "finish exits 1 without recording anything, so the wake
+/// item re-fires on every Stop, forever."
+#[test]
+fn a_handoff_that_cannot_work_stops_waking_master() {
+    let (env, _) = env_with_pr(123);
+    let repo = env.repo();
+    start_with(repo, "o/r", 123, None, None).unwrap();
+    write_summary(repo, 123, "Needs another look at the parser.");
+    converge(repo, 123);
+
+    // Converged and not yet attempted: master is asked to finish.
+    let finish_items = |repo: &Path| -> usize {
+        clank::cli::pr_review::pr_review_inputs(repo)
+            .into_iter()
+            .filter(|i| i.handoff_blocked)
+            .count()
+    };
+    assert_eq!(
+        finish_items(repo),
+        0,
+        "nothing is blocked before the attempt"
+    );
+
+    let bodyless = FakeGh {
+        pending: Some(42),
+        summary_error: Some(MISSING_BODY.into()),
+        ..Default::default()
+    };
+    let err = clank::cli::pr_review::finish_through(
+        repo,
+        Some(env.home()),
+        &label("claude"),
+        Some(123),
+        &bodyless,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.contains("created without a body"),
+        "the cause is named, not left as a 422: {err}"
+    );
+    assert!(
+        !err.to_lowercase().contains("github's interface")
+            && !err.to_lowercase().contains("submit"),
+        "no repair is prescribed -- entering a summary in the UI submits, and a published \
+         review cannot be recalled: {err}"
+    );
+
+    // Everything local survives: the draft is still on GitHub, the
+    // summary is still here, and the review is still a review.
+    assert!(
+        repo.join(".clank/pr-reviews/123/master.md").is_file(),
+        "the summary must survive a blocked handoff",
+    );
+
+    // THE POINT: asked again and again, the projection no longer
+    // offers the handoff.
+    for _ in 0..3 {
+        assert_eq!(
+            finish_items(repo),
+            1,
+            "a handoff that cannot work must not keep waking master",
+        );
+    }
+
+    // And the operator can SEE it. Once the failure scrolls out of
+    // the terminal, status is the only place left that knows master
+    // has deliberately stopped (codex 904bc9b).
+    let said = status_with(repo, Some(env.home()), Some(123)).unwrap();
+    assert!(
+        said.contains("handoff BLOCKED"),
+        "pr-review status must say the handoff stopped: {said}"
+    );
+    assert!(
+        said.contains("converged"),
+        "and convergence stays a separate fact -- the team did agree: {said}"
+    );
+    assert!(
+        said.contains("clank pr-review finish"),
+        "with the one thing that runs it again: {said}"
+    );
+}
+
+/// Only the DIAGNOSED refusal blocks. An ordinary failure is still
+/// worth retrying, and must keep its wake.
+#[test]
+fn an_ordinary_handoff_failure_still_wakes_master() {
+    let (env, _) = env_with_pr(123);
+    let repo = env.repo();
+    start_with(repo, "o/r", 123, None, None).unwrap();
+    write_summary(repo, 123, "Needs another look at the parser.");
+    converge(repo, 123);
+
+    // Including another 422: the STATUS is not the diagnosis, the
+    // sentence is. Blocking on the code would silence refusals that
+    // are worth retrying.
+    for transient in [
+        "HTTP 502: Bad Gateway",
+        "HTTP 422: Validation Failed (some other reason entirely)",
+        "error: connection reset",
+    ] {
+        let flaky = FakeGh {
+            pending: Some(42),
+            summary_error: Some(transient.into()),
+            ..Default::default()
+        };
+        assert!(
+            clank::cli::pr_review::finish_through(
+                repo,
+                Some(env.home()),
+                &label("claude"),
+                Some(123),
+                &flaky,
+            )
+            .is_err()
+        );
+        assert!(
+            clank::cli::pr_review::pr_review_inputs(repo)
+                .into_iter()
+                .all(|i| !i.handoff_blocked),
+            "`{transient}` keeps its retry: suppressing it would strand the review",
+        );
+    }
+}
+
+/// A summary that QUOTES GitHub's refusal must not make a transient
+/// failure permanent.
+///
+/// The argv carries `body=<the summary>`, and a summary is free text
+/// an agent wrote — a review of this very bug would quote the refusal
+/// in it. Classifying on the formatted error chain reads our own
+/// request back as the server's verdict (codex 904bc9b).
+#[test]
+fn a_summary_quoting_the_refusal_keeps_its_retry() {
+    let (env, _) = env_with_pr(123);
+    let repo = env.repo();
+    start_with(repo, "o/r", 123, None, None).unwrap();
+    write_summary(
+        repo,
+        123,
+        "The handoff broke: GitHub answers \"Could not edit a review with a missing body\".",
+    );
+    converge(repo, 123);
+
+    let flaky = FakeGh {
+        pending: Some(42),
+        summary_error: Some("HTTP 502: Bad Gateway".into()),
+        ..Default::default()
+    };
+    let err = clank::cli::pr_review::finish_through(
+        repo,
+        Some(env.home()),
+        &label("claude"),
+        Some(123),
+        &flaky,
+    )
+    .unwrap_err();
+    assert!(
+        format!("{err:#}").contains("Could not edit a review with a missing body"),
+        "the fixture must really carry the phrase in the request: {err:#}"
+    );
+    assert!(
+        clank::cli::pr_review::pr_review_inputs(repo)
+            .into_iter()
+            .all(|i| !i.handoff_blocked),
+        "a 502 stays retryable however the summary is worded",
+    );
+    assert!(
+        repo.join(".clank/pr-reviews/123/master.md").is_file(),
+        "and the review survives it",
+    );
+}
+
+/// The block belongs to the review that earned it.
+///
+/// `start` opens a NEW review with a new instance, and a block
+/// recorded against the old one must not silence it — the stored
+/// instance is what makes that automatic rather than remembered.
+#[test]
+fn a_later_review_does_not_inherit_the_block() {
+    let (env, _) = env_with_pr(123);
+    let repo = env.repo();
+    start_with(repo, "o/r", 123, None, None).unwrap();
+    write_summary(repo, 123, "Needs another look at the parser.");
+    converge(repo, 123);
+
+    let bodyless = FakeGh {
+        pending: Some(42),
+        summary_error: Some(MISSING_BODY.into()),
+        ..Default::default()
+    };
+    assert!(
+        clank::cli::pr_review::finish_through(
+            repo,
+            Some(env.home()),
+            &label("claude"),
+            Some(123),
+            &bodyless,
+        )
+        .is_err()
+    );
+    assert!(
+        clank::cli::pr_review::pr_review_inputs(repo)
+            .into_iter()
+            .any(|i| i.handoff_blocked)
+    );
+
+    // A fresh review on the same PR: a different instance, so the old
+    // block does not reach it.
+    abort_with(repo, Some(env.home()), &label("claude"), Some(123)).unwrap();
+    start_with(repo, "o/r", 123, None, None).unwrap();
+    assert!(
+        clank::cli::pr_review::pr_review_inputs(repo)
+            .into_iter()
+            .all(|i| !i.handoff_blocked),
+        "a new review inherits nothing from the one it replaced",
+    );
+}
+
+/// Running `finish` again is the operator asking, so the block lifts
+/// for that attempt — and a run that then fails transiently leaves
+/// master wakeable rather than silently blocked.
+#[test]
+fn an_explicit_retry_lifts_the_block() {
+    let (env, _) = env_with_pr(123);
+    let repo = env.repo();
+    start_with(repo, "o/r", 123, None, None).unwrap();
+    write_summary(repo, 123, "Needs another look at the parser.");
+    converge(repo, 123);
+
+    let bodyless = FakeGh {
+        pending: Some(42),
+        summary_error: Some(MISSING_BODY.into()),
+        ..Default::default()
+    };
+    let run = |gh: &FakeGh| {
+        clank::cli::pr_review::finish_through(
+            repo,
+            Some(env.home()),
+            &label("claude"),
+            Some(123),
+            gh,
+        )
+    };
+    assert!(run(&bodyless).is_err());
+    assert!(
+        clank::cli::pr_review::pr_review_inputs(repo)
+            .into_iter()
+            .any(|i| i.handoff_blocked)
+    );
+
+    // A retry that hits something else clears the block: the reason
+    // for suppression is gone, so the wake comes back.
+    let flaky = FakeGh {
+        pending: Some(42),
+        summary_error: Some("HTTP 502: Bad Gateway".into()),
+        ..Default::default()
+    };
+    assert!(run(&flaky).is_err());
+    assert!(
+        clank::cli::pr_review::pr_review_inputs(repo)
+            .into_iter()
+            .all(|i| !i.handoff_blocked),
+        "the diagnosis no longer holds, so master is wakeable again",
+    );
+
+    // And a retry that works hands over as normal.
+    let working = FakeGh {
+        pending: Some(42),
+        ..Default::default()
+    };
+    run(&working).unwrap();
+    assert!(
+        !repo.join(".clank/pr-reviews/123").exists(),
+        "a handoff that worked takes the scratch with it",
     );
 }

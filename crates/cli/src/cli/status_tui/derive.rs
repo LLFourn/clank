@@ -575,6 +575,7 @@ mod tests {
         );
         let mut s = snap(vec![], vec![]);
         s.pr_reviews.push(clank_core::wait::PrReviewWorkState {
+            handoff_blocked: false,
             handover: Default::default(),
             pr: 1,
             repo: "o/r".into(),

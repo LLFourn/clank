@@ -747,7 +747,12 @@ impl StatusSnapshot {
                 // Not opened yet: master is drafting, no reviewers.
                 let _ = writeln!(out, "pr #{}: round 0 — master drafting", pr.pr);
             } else {
-                let waiting = if pr.missing_reviewers.is_empty() {
+                let waiting = if pr.handoff_stopped() {
+                    // Master was deliberately taken off this: saying
+                    // it is waiting on them shows actionable work
+                    // that nobody is coming to do.
+                    "nobody — handoff blocked, run `clank pr-review finish`".to_string()
+                } else if pr.missing_reviewers.is_empty() {
                     "master".to_string()
                 } else {
                     pr.missing_reviewers
@@ -2573,6 +2578,69 @@ mod dirty_and_wake_tests {
         );
     }
 
+    /// `clank status` names the blocked handoff only where master has
+    /// actually stopped.
+    ///
+    /// The block survives `propose`, so a reopened round can carry it
+    /// while reviewers genuinely owe verdicts. Saying "waiting on
+    /// nobody" then hides real work -- and core keeps emitting those
+    /// items, so the line would contradict the wake model
+    /// (codex e70f8a9).
+    #[test]
+    fn a_blocked_handoff_only_changes_the_converged_line() {
+        use clank_core::vocab::CommitGateState;
+        let line = |gate, blocked, missing: &[&str]| {
+            let mut snap = minimal_snapshot();
+            // The shared fixture, not a literal: core's struct grows,
+            // and a second hand-built copy would need editing every
+            // time (ruthless 329d579).
+            let mut pr = crate::cli::status_tui::fixtures::pr_work(2, missing);
+            pr.pr = 7;
+            pr.repo = "o/r".to_string();
+            pr.gate = gate;
+            pr.handoff_blocked = blocked;
+            snap.pr_reviews = vec![pr];
+            snap.to_human()
+                .lines()
+                .find(|l| l.starts_with("pr #7"))
+                .expect("the PR line is rendered")
+                .to_string()
+        };
+
+        let stopped = line(CommitGateState::Finished, true, &[]);
+        assert!(
+            stopped.contains("handoff blocked"),
+            "converged and blocked: master is not coming: {stopped}",
+        );
+        assert!(
+            stopped.contains("clank pr-review finish"),
+            "with the one thing that runs it again: {stopped}",
+        );
+        assert!(
+            line(CommitGateState::Finished, false, &[]).contains("waiting on master"),
+            "converged and not blocked is master's to hand over",
+        );
+
+        // Reopened after a blocked handoff: reviewers owe verdicts,
+        // and that is what the line must say.
+        let reopened = line(CommitGateState::Unreviewed, true, &["codex"]);
+        assert!(
+            reopened.contains("waiting on codex"),
+            "a reopened round is waiting on its reviewers: {reopened}",
+        );
+        assert!(
+            !reopened.contains("handoff blocked"),
+            "and not on a handoff that is not due yet: {reopened}",
+        );
+        // Changes requested with the block still set: master's turn,
+        // and a real one.
+        let integrating = line(CommitGateState::ChangesRequested, true, &[]);
+        assert!(
+            integrating.contains("waiting on master") && !integrating.contains("handoff blocked"),
+            "master owes an integration here: {integrating}",
+        );
+    }
+
     fn minimal_snapshot() -> StatusSnapshot {
         StatusSnapshot {
             forks: Vec::new(),
@@ -2709,6 +2777,7 @@ mod dirty_and_wake_tests {
         }];
         snap.forks = vec![("spike".to_string(), "worktree")];
         snap.pr_reviews = vec![clank_core::wait::PrReviewWorkState {
+            handoff_blocked: false,
             pr: 7,
             handover: Default::default(),
             repo: "llfourn/clank".to_string(),

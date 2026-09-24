@@ -1381,6 +1381,12 @@ pub(super) fn pr_bar_text(
         };
         (emoji, reviewer.as_str().to_string(), "reviewing")
     } else {
+        if pr.handoff_stopped() {
+            return (
+                format!("🚫 {} handoff blocked", master.to_uppercase()),
+                right,
+            );
+        }
         let verb = match pr.gate {
             CommitGateState::Finished => "submitting",
             CommitGateState::ChangesRequested => "integrating",
@@ -3583,6 +3589,52 @@ pub(super) fn render_error_doc(
 
 #[cfg(test)]
 mod tests {
+    /// A blocked handoff names only the stage that stopped.
+    ///
+    /// The block survives `propose`, so a reopened round can carry it
+    /// while master is genuinely integrating or refining. Saying
+    /// "handoff blocked" there names the wrong thing, and core only
+    /// suppresses the Finished arm — the bar must agree with the wake
+    /// model, not with the flag (codex e70f8a9).
+    #[test]
+    fn a_blocked_handoff_only_renames_the_converged_stage() {
+        use clank_core::vocab::CommitGateState;
+        let bar = |gate, blocked| {
+            let mut pr = crate::cli::status_tui::fixtures::pr_work(2, &[]);
+            pr.gate = gate;
+            pr.handoff_blocked = blocked;
+            super::pr_bar_text(&pr, "claude").0
+        };
+        assert!(
+            bar(CommitGateState::Finished, true).contains("handoff blocked"),
+            "the converged stage is the one that stopped",
+        );
+        assert!(
+            bar(CommitGateState::Finished, false).contains("submitting"),
+            "and without a block it is master's to hand over",
+        );
+        for still_working in [
+            CommitGateState::ChangesRequested,
+            CommitGateState::Continued,
+            CommitGateState::Unreviewed,
+            // Reachable for PR reviews -- core pairs it with
+            // Unreviewed as a reviewers'-turn state, and it is what
+            // this repo's own gate sits in (ruthless 329d579).
+            CommitGateState::ContinuedPendingGate,
+        ] {
+            let said = bar(still_working, true);
+            assert!(
+                !said.contains("handoff blocked"),
+                "{still_working:?} is master still working, not a dead handoff: {said}",
+            );
+            assert_eq!(
+                said,
+                bar(still_working, false),
+                "{still_working:?} reads the same with or without the block",
+            );
+        }
+    }
+
     /// One renderer means the two row kinds cannot disagree about
     /// shape. They differ in what sits after the key and nowhere else.
     #[test]
@@ -7928,6 +7980,7 @@ mod tests {
         // must NOT render idle, in the TUI bar OR `clank status`.
         let mut s = snap(vec![], vec![]);
         s.pr_reviews.push(clank_core::wait::PrReviewWorkState {
+            handoff_blocked: false,
             handover: Default::default(),
             pr: 123,
             repo: "o/r".into(),

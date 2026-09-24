@@ -106,10 +106,19 @@ real PR.
 ```
 gh api repos/$SLUG/pulls/$PR/reviews \
   -f commit_id=$SHA \
+  -f body='(draft — the summary lands when the team converges)' \
   -f 'comments[][path]=path/to/file.rs' -F 'comments[][line]=42' \
   -f 'comments[][side]=RIGHT' -f 'comments[][body]=<your comment>'
 ```
 (no `event` → the review stays PENDING/draft.)
+
+The `-f body=` is NOT optional and is not decoration. GitHub refuses
+to edit a review whose body is empty — REST `PUT` and GraphQL
+`updatePullRequestReview` both answer `Could not edit a review with a
+missing body` — so a review created without one can never be given
+one, and `clank pr-review finish` cannot put the agreed summary on it.
+The placeholder exists to be replaced; dropping it strands the whole
+review at handoff.
 
 **Master — add another top-level comment to the existing draft:**
 ```

@@ -207,6 +207,7 @@ pub(crate) fn visible_untrimmed(line: &str) -> String {
 
 pub(crate) fn pr_work(round: u64, missing: &[&str]) -> clank_core::wait::PrReviewWorkState {
     clank_core::wait::PrReviewWorkState {
+        handoff_blocked: false,
         handover: Default::default(),
         pr: 5,
         repo: "LLFourn/clank".into(),
@@ -221,6 +222,7 @@ pub(crate) fn pr_work(round: u64, missing: &[&str]) -> clank_core::wait::PrRevie
 
 pub(crate) fn pr_awaiting(missing: &[&str]) -> clank_core::wait::PrReviewWorkState {
     clank_core::wait::PrReviewWorkState {
+        handoff_blocked: false,
         handover: Default::default(),
         pr: 1,
         repo: "o/r".into(),

@@ -764,6 +764,35 @@ pub fn finish_with(
     finish_through(repo, home, caller, pr, &RealGh)
 }
 
+/// GitHub's refusal to give a body to a review that has none.
+///
+/// Probed on a live PR: REST `PUT .../reviews/<id>` and GraphQL
+/// `updatePullRequestReview` both answer with this sentence, so the
+/// text is the contract, not the status code — a 422 alone covers
+/// other refusals that ARE worth retrying.
+///
+/// Read off the SERVER's answer only. The formatted error chain also
+/// carries the argv, and the argv carries the review summary an agent
+/// wrote; a summary quoting this sentence would otherwise make every
+/// transient failure look permanent.
+fn is_missing_body_refusal(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<gh::GhFailure>().is_some_and(|f| {
+        f.said
+            .contains("Could not edit a review with a missing body")
+    })
+}
+
+/// Record that THIS review cannot be handed over, so the converged
+/// gate stops waking master to retry what cannot work.
+///
+/// Stamped with the instance: a later run on the same PR is a
+/// different review and inherits nothing.
+fn block_handoff(repo: &Path, pr: u32, state: &PrReviewState) -> anyhow::Result<()> {
+    let mut next = state.clone();
+    next.handoff_blocked = Some(state.instance);
+    save_state(repo, pr, &next)
+}
+
 pub fn finish_through(
     repo: &Path,
     home: Option<&Path>,
@@ -806,6 +835,17 @@ pub fn finish_through(
     // one, carrying the summary. "I read it and this is what I think"
     // is a review, and it should not need an invented line comment to
     // exist, nor lose its summary to a refusal (codex 6b8aaed).
+    // Running `finish` IS the operator asking again, so a block from
+    // a previous attempt is lifted before this one. Cleared here and
+    // not on success, so a run that fails for some OTHER reason
+    // leaves master wakeable — only the diagnosed refusal below
+    // re-blocks, and only for this instance.
+    if state.handoff_blocked.is_some() {
+        let mut cleared = state.clone();
+        cleared.handoff_blocked = None;
+        save_state(repo, pr, &cleared)?;
+    }
+
     let mut thumbs = 0;
     let replies = match gh.pending(&state.repo, pr)? {
         Some(review) => {
@@ -813,7 +853,23 @@ pub fn finish_through(
             // the scaffolding comes off the draft before it is handed
             // over, not after.
             thumbs = gh.sweep_thumbs(&state.repo, pr, review.id)?;
-            gh.set_summary(&state.repo, pr, review.id, &summary)?;
+            if let Err(e) = gh.set_summary(&state.repo, pr, review.id, &summary) {
+                if is_missing_body_refusal(&e) {
+                    block_handoff(repo, pr, &state)?;
+                    anyhow::bail!(
+                        "PR #{pr}: this review was created without a body, and GitHub will not \
+                         add one — REST and GraphQL both refuse with \"Could not edit a review \
+                         with a missing body\", so the agreed summary cannot be put on it.\n  \
+                         Nothing was changed: the draft, its comments and the local review are \
+                         all still there, and the summary is in \
+                         .clank/pr-reviews/{pr}/master.md.\n  \
+                         Handing this one over automatically is not possible, so master will \
+                         not be woken to retry it. `clank pr-review finish` runs again if you \
+                         want it to."
+                    );
+                }
+                return Err(e);
+            }
             gh.replies_left(&state.repo, pr, review.id)?
         }
         None => {
@@ -887,7 +943,7 @@ pub mod gh {
     /// update-a-review endpoint is independent of submission, which
     /// is what lets the summary sit on the draft instead of being
     /// held back for a publish that never comes.
-    pub(super) fn update_body_argv(slug: &str, pr: u32, review_id: u64, body: &str) -> Vec<String> {
+    pub fn update_body_argv(slug: &str, pr: u32, review_id: u64, body: &str) -> Vec<String> {
         vec![
             "api".into(),
             "--method".into(),
@@ -1052,16 +1108,52 @@ pub mod gh {
         Ok(None)
     }
 
+    /// What a `gh` call FAILED with, keeping the server's answer
+    /// apart from the request that provoked it.
+    ///
+    /// The two must not be one string. The argv carries `body=<the
+    /// review summary>`, and a summary is free text an agent wrote —
+    /// a review OF this very bug would quote GitHub's refusal in it.
+    /// Classifying on the formatted whole then reads our own request
+    /// back as the server's verdict and blocks a handoff that was
+    /// only transiently broken (codex 904bc9b).
+    #[derive(Debug)]
+    pub struct GhFailure {
+        /// `gh`'s stderr: the server's message and nothing of ours.
+        pub said: String,
+        /// The request, for the operator to read. NEVER classified on.
+        pub argv: Vec<String>,
+    }
+
+    impl std::fmt::Display for GhFailure {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "gh {:?} failed: {}", self.argv, self.said)
+        }
+    }
+
+    impl std::error::Error for GhFailure {}
+
+    /// Split one failed `gh` call into the server's answer and our
+    /// request.
+    ///
+    /// Named and separate so the split can be TESTED: it is the whole
+    /// invariant, and `run_gh` itself needs a real `gh` to run. Only
+    /// `stderr` may reach `said` — folding the argv in is the bug
+    /// this exists to prevent.
+    pub(super) fn failure_from(args: &[String], stderr: &[u8]) -> GhFailure {
+        GhFailure {
+            said: String::from_utf8_lossy(stderr).trim().to_string(),
+            argv: args.to_vec(),
+        }
+    }
+
     fn run_gh(args: &[String]) -> anyhow::Result<String> {
         let out = std::process::Command::new("gh")
             .args(args)
             .output()
             .context("spawning gh")?;
         if !out.status.success() {
-            anyhow::bail!(
-                "gh {args:?} failed: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
+            return Err(failure_from(args, &out.stderr).into());
         }
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     }
@@ -1218,6 +1310,17 @@ pub fn status_with(repo: &Path, home: Option<&Path>, pr: Option<u32>) -> anyhow:
     let pending = pending_reviewers(state.round, &reviewers, &verdicts);
     if pending.is_empty() {
         let _ = writeln!(out, "converged: all reviewers FINISHED");
+        // Convergence stays a separate fact: the team DID agree, and
+        // what failed afterwards is the handoff.
+        if state.handoff_blocked == Some(state.instance) {
+            let _ = writeln!(
+                out,
+                "handoff BLOCKED: this review was created without a body, and GitHub will not \
+                 add one, so the summary cannot be put on it.\n  \
+                 Nothing was lost -- the draft and the summary are both still there.\n  \
+                 Master is not being woken to retry; `clank pr-review finish` runs it again."
+            );
+        }
     } else {
         let _ = writeln!(
             out,
@@ -1257,6 +1360,9 @@ pub fn pr_review_inputs(repo: &Path) -> Vec<clank_core::wait::PrReviewInput> {
                 pr,
                 repo: state.repo,
                 round: state.round,
+                // Resolved against THIS instance: a block recorded by
+                // an earlier run on the same PR is not this run's.
+                handoff_blocked: state.handoff_blocked == Some(state.instance),
                 // The round's state file is written by `start` and
                 // `propose` only, both master-only: its write time is
                 // when this round opened, which is when its reviewers
@@ -1862,6 +1968,90 @@ mod tests {
         assert_eq!(
             gh::discard_argv("o/r", 7, 42),
             vec!["api", "--method", "DELETE", "repos/o/r/pulls/7/reviews/42"]
+        );
+    }
+
+    /// The classifier reads the SERVER's answer, not the request.
+    ///
+    /// `GhFailure` keeps them apart on purpose: the argv carries
+    /// `body=<the review summary>`, and a summary is free text an
+    /// agent wrote. A review OF this very bug would quote GitHub's
+    /// refusal in its summary — and then every transient failure on
+    /// that review would be classified permanent and its retry
+    /// suppressed (codex 904bc9b).
+    #[test]
+    fn a_summary_quoting_the_refusal_does_not_make_a_failure_permanent() {
+        let refusal = "Could not edit a review with a missing body";
+        // A real review summary about this bug. It is the argv, not
+        // the answer.
+        let argv = gh::update_body_argv(
+            "o/r",
+            123,
+            42,
+            &format!("The handoff broke because GitHub says \"{refusal}\"."),
+        );
+        assert!(
+            argv.iter().any(|a| a.contains(refusal)),
+            "the fixture must actually carry the phrase in the request",
+        );
+
+        let transient: anyhow::Error = gh::GhFailure {
+            said: "HTTP 502: Bad Gateway".to_string(),
+            argv: argv.clone(),
+        }
+        .into();
+        assert!(
+            format!("{transient:#}").contains(refusal),
+            "the formatted chain DOES contain it -- that is the trap",
+        );
+        assert!(
+            !is_missing_body_refusal(&transient),
+            "a 502 is retryable however the summary is worded",
+        );
+
+        // And the real thing is still recognised.
+        let real: anyhow::Error = gh::GhFailure {
+            said: format!("HTTP 422: {refusal} (https://api.github.com/...)"),
+            argv,
+        }
+        .into();
+        assert!(is_missing_body_refusal(&real));
+
+        // An error that is not a gh failure at all classifies as
+        // retryable rather than matching on stray text.
+        assert!(!is_missing_body_refusal(&anyhow::anyhow!(
+            "spawning gh: {refusal}"
+        )));
+    }
+
+    /// Only the server's answer reaches `said`.
+    ///
+    /// `run_gh` needs a real `gh`, so the split it performs lives in
+    /// `failure_from` where it can be asked directly. Folding the argv
+    /// into `said` would make the classifier read our own request back
+    /// as the verdict, which is the bug the type exists to prevent.
+    #[test]
+    fn the_servers_answer_is_kept_apart_from_our_request() {
+        let refusal = "Could not edit a review with a missing body";
+        let argv = gh::update_body_argv("o/r", 123, 42, &format!("GitHub says \"{refusal}\"."));
+        let f = gh::failure_from(&argv, b"  HTTP 502: Bad Gateway\n");
+
+        assert_eq!(
+            f.said, "HTTP 502: Bad Gateway",
+            "stderr, trimmed, and nothing else"
+        );
+        assert!(
+            !f.said.contains(refusal),
+            "the request must not leak into the answer: {}",
+            f.said
+        );
+        assert!(
+            f.argv.iter().any(|a| a.contains(refusal)),
+            "while the request is kept, for the operator to read",
+        );
+        assert!(
+            !is_missing_body_refusal(&f.into()),
+            "so a 502 stays retryable however the summary is worded",
         );
     }
 

@@ -1588,6 +1588,64 @@ mod tests {
         );
     }
 
+    /// The creating call sends a body, because a review that has none
+    /// can never be given one.
+    ///
+    /// Probed against the live API (LLFourn/clank#3, since deleted):
+    /// a pending review created without a body refuses the summary
+    /// from BOTH update routes — REST `PUT .../reviews/<id>` and
+    /// GraphQL `updatePullRequestReview` — with "Could not edit a
+    /// review with a missing body", while the same PUT succeeds and
+    /// stays PENDING on a review created with one. So `finish` cannot
+    /// hand over a review this call made bodyless, and the failure
+    /// only appears at the END of a converged review.
+    ///
+    /// Read out of the SKILL TEXT rather than restated here: a
+    /// handwritten fixture carrying a body would still pass if this
+    /// command lost its own (codex 61a135e).
+    #[test]
+    fn the_skill_creates_the_pending_review_with_a_body() {
+        let body = PR_REVIEW_SKILL_BODY;
+        let at = body
+            .find("first comment (creates the pending review)")
+            .expect("the skill names the creating call");
+        let fence = body[at..]
+            .find("```")
+            .map(|i| at + i + 3)
+            .expect("the creating call is in a fence");
+        let end = body[fence..]
+            .find("```")
+            .map(|i| fence + i)
+            .expect("the fence closes");
+        let call = &body[fence..end];
+        assert!(
+            call.contains("/reviews"),
+            "found the wrong block: {call:.120}"
+        );
+        assert!(
+            call.contains("-f body="),
+            "the creating call must send a review body, or `finish` can never \
+             set the summary on what it makes: {call}"
+        );
+        // A body that is only whitespace is a missing body to GitHub,
+        // so the placeholder has to carry text.
+        let after = call.split("-f body=").nth(1).unwrap_or_default();
+        let quoted = after
+            .split('\'')
+            .nth(1)
+            .expect("the body is single-quoted in the call");
+        assert!(
+            !quoted.trim().is_empty(),
+            "the placeholder body must not be empty: {quoted:?}"
+        );
+        // `event` would submit it, which is the one thing the whole
+        // handoff model forbids.
+        assert!(
+            !call.contains("-f event="),
+            "the creating call must leave the review PENDING: {call}"
+        );
+    }
+
     #[test]
     fn pr_review_skill_carries_verbs_and_verified_incantations() {
         let body = PR_REVIEW_SKILL_BODY;
