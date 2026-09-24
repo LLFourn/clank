@@ -2383,6 +2383,42 @@ mod dirty_and_wake_tests {
         );
     }
 
+    /// Drain until the channel has been quiet for a poll cycle and a
+    /// bit, so an assertion about what the NEXT write does is not
+    /// answering for something earlier.
+    ///
+    /// Quiet is EVIDENCE, not a barrier. `RepoStateWatcher` restats
+    /// every `POLL_INTERVAL`, so a change can always be reported
+    /// later; observing silence for longer than a cycle is the most a
+    /// test can establish.
+    fn settle(rx: &mpsc::Receiver<()>) {
+        const QUIET: Duration =
+            crate::repo_watch::POLL_INTERVAL.saturating_add(Duration::from_millis(200));
+        // A channel that never goes quiet must FAIL, not hang: a
+        // watcher waking forever is the bug this test would be there
+        // to catch.
+        const BUDGET: Duration = Duration::from_secs(20);
+        let deadline = std::time::Instant::now() + BUDGET;
+        loop {
+            match rx.recv_timeout(QUIET) {
+                Err(mpsc::RecvTimeoutError::Timeout) => return,
+                // A dead channel is not a quiet one, and only here
+                // can the two be told apart: every assertion below
+                // uses `recv_timeout(..).is_err()`, which a
+                // disconnect satisfies just as silence does, so both
+                // no-wake assertions would pass vacuously.
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!("the watcher channel is closed; no assertion after this means anything")
+                }
+                Ok(()) => assert!(
+                    std::time::Instant::now() < deadline,
+                    "the watcher never went quiet in {BUDGET:?} — no wake is expected \
+                     here, so something is waking on its own"
+                ),
+            }
+        }
+    }
+
     #[test]
     fn watcher_wakes_on_tracked_edit_not_on_ignored() {
         let dir = fixture_repo();
@@ -2399,27 +2435,33 @@ mod dirty_and_wake_tests {
 
         let (tx, rx) = mpsc::channel::<()>();
         let _watcher = watch_status_paths(tx, r).unwrap();
-        // Let the watcher settle (registration races the first writes).
-        std::thread::sleep(Duration::from_millis(250));
-        while rx.try_recv().is_ok() {}
 
-        // Root-ignored path: no wake.
+        // Root-ignored path: no wake. The window is the NATIVE
+        // watcher's, not the poller's: it sends straight from its
+        // callback, so a wake it was going to send arrives inside
+        // this window. The poller's cadence is already spent by
+        // `settle`.
+        const NO_WAKE: Duration = Duration::from_millis(500);
+        settle(&rx);
         std::fs::write(r.join("target/debug/out.o"), "junk").unwrap();
         assert!(
-            rx.recv_timeout(Duration::from_millis(500)).is_err(),
+            rx.recv_timeout(NO_WAKE).is_err(),
             "ignored build artifact woke the loop"
         );
 
         // NESTED-ignored path: no wake (THE storm fix — this is what
         // pegged a core, ~250 wakes/s of `frostsnapp/build/` churn).
+        settle(&rx);
         std::fs::write(r.join("sub/build/out.o"), "junk").unwrap();
         assert!(
-            rx.recv_timeout(Duration::from_millis(500)).is_err(),
+            rx.recv_timeout(NO_WAKE).is_err(),
             "nested-gitignored build artifact woke the loop"
         );
 
         // Tracked-file edit: wakes (this is what keeps `dirty:`
-        // fresh without any poll).
+        // fresh without any poll). Settled first, so an event left
+        // over from the setup cannot pass this for the edit.
+        settle(&rx);
         std::fs::write(r.join("a.txt"), "edited\n").unwrap();
         assert!(
             rx.recv_timeout(Duration::from_secs(5)).is_ok(),

@@ -168,7 +168,7 @@ pub struct RepoStateWatcher {
 ///
 /// Matches the shortest refold cadence a caller uses, so the watcher
 /// is never the slower of the two signals.
-const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+pub(crate) const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
 impl RepoStateWatcher {
     pub fn attach(repo: &Path, poll_mode: bool, tx: Sender<()>) -> anyhow::Result<Self> {
