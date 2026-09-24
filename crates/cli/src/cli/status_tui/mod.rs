@@ -1930,6 +1930,13 @@ pub(crate) struct LedgerRow {
     pub(crate) text: String,
     pub(crate) author: Option<String>,
     pub(crate) verdict: Option<String>,
+    /// The class the page colours the mark by, for a review row.
+    ///
+    /// Separate from `verdict`, which is the word a reader sees: a
+    /// colour taken from prose is a colour that breaks when the prose
+    /// is reworded, and "requested changes" is not one class.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) verdict_class: Option<String>,
     /// The plan this commit row stands for, when it is that plan's
     /// only commit. Carried SEPARATELY from `text` so the page can
     /// give the name the emphasis the header it replaced had — text
@@ -2161,6 +2168,23 @@ fn last_act(
     })
 }
 
+/// The CSS class the remote page colours a review mark by.
+///
+/// Derived here rather than from `verdict_word` in the page's script,
+/// because the words are prose and one of them has a SPACE in it:
+/// interpolating "requested changes" into a class attribute makes two
+/// classes, neither of which any rule names (codex 90780fa). These
+/// tokens are the wire contract between the row and the stylesheet.
+pub(crate) fn verdict_class(v: clank_core::vocab::Verdict) -> &'static str {
+    use clank_core::vocab::Verdict;
+    match v {
+        Verdict::Continue => "v-continue",
+        Verdict::Finished => "v-finished",
+        Verdict::RequestChanges => "v-changes",
+        Verdict::Unmarked => "v-unmarked",
+    }
+}
+
 fn verdict_word(v: clank_core::vocab::Verdict) -> &'static str {
     use clank_core::vocab::Verdict;
     match v {
@@ -2225,6 +2249,7 @@ fn ledger_row(row: &crate::cli::log::OnelineRow) -> LedgerRow {
             text: plan.clone().unwrap_or_else(|| "adhoc".into()),
             author: None,
             verdict: None,
+            verdict_class: None,
             stands_for: None,
             age,
             page: plan.as_ref().map(|p| format!("plan/{p}.html")),
@@ -2247,6 +2272,7 @@ fn ledger_row(row: &crate::cli::log::OnelineRow) -> LedgerRow {
             stands_for: stands_for.clone(),
             author: None,
             verdict: None,
+            verdict_class: None,
             age,
             page: commit_page(sha),
         },
@@ -2259,6 +2285,7 @@ fn ledger_row(row: &crate::cli::log::OnelineRow) -> LedgerRow {
             text: subject.clone(),
             author: None,
             verdict: None,
+            verdict_class: None,
             stands_for: None,
             age,
             page: commit_page(sha),
@@ -2275,6 +2302,7 @@ fn ledger_row(row: &crate::cli::log::OnelineRow) -> LedgerRow {
             text: summary.clone(),
             author: Some(author.clone()),
             verdict: Some(verdict_word(*verdict).into()),
+            verdict_class: Some(verdict_class(*verdict).into()),
             stands_for: None,
             age,
             page: None,
@@ -2286,6 +2314,7 @@ fn ledger_row(row: &crate::cli::log::OnelineRow) -> LedgerRow {
             text: line.clone(),
             author: None,
             verdict: None,
+            verdict_class: None,
             stands_for: None,
             age,
             page: None,
@@ -2297,6 +2326,7 @@ fn ledger_row(row: &crate::cli::log::OnelineRow) -> LedgerRow {
             text: n.clone(),
             author: None,
             verdict: None,
+            verdict_class: None,
             stands_for: None,
             age,
             page: None,
@@ -5806,6 +5836,15 @@ pub(crate) mod tests {
             ),
             ("review", Some("ruthless"), Some("continued"), Some("2m")),
             "the ledger is the TUI's rows with the TUI's ages"
+        );
+        // And the class the page colours it by. Separate from the
+        // word: a row that carried the word alone would leave the
+        // page with nothing to colour by, and every assertion about
+        // the stylesheet would be about a class nothing wears.
+        assert_eq!(
+            row.verdict_class.as_deref(),
+            Some("v-continue"),
+            "a review row carries the class its verdict colours by",
         );
 
         // A broken HEAD tag belongs to the session, not to an agent,

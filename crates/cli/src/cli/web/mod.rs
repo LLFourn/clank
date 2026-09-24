@@ -4004,6 +4004,164 @@ mod tests {
         out
     }
 
+    /// Every verdict class the ROW can emit has a colour rule, and
+    /// none of them is the approving colour.
+    ///
+    /// The two ends are asserted TOGETHER on purpose. "the markup
+    /// carries a class" and "the stylesheet defines a colour" are
+    /// both satisfiable while a refusal still renders green, because
+    /// nothing makes the class the row writes and the class the rule
+    /// names be the same string. This walks the producer's own values.
+    #[test]
+    fn every_verdict_the_row_emits_has_its_own_colour() {
+        use clank_core::vocab::Verdict;
+        let classes = [
+            Verdict::Continue,
+            Verdict::Finished,
+            Verdict::RequestChanges,
+            Verdict::Unmarked,
+        ]
+        .map(crate::cli::status_tui::verdict_class);
+
+        // DISTINCT, one per verdict. Every class having a rule is
+        // satisfied by two verdicts sharing one class -- which is the
+        // bug itself, a refusal wearing the approving mark's colour.
+        let unique: std::collections::BTreeSet<_> = classes.iter().collect();
+        assert_eq!(
+            unique.len(),
+            classes.len(),
+            "two verdicts share a class, so one of them cannot be right: {classes:?}",
+        );
+
+        // A class token is one word: "requested changes" interpolated
+        // raw would be two classes, neither of them ruled.
+        for c in classes {
+            assert!(
+                !c.contains(char::is_whitespace) && !c.is_empty(),
+                "`{c}` is not a single class token",
+            );
+            assert!(
+                PAGE.contains(&format!(".row.review .glyph.{c} {{")),
+                "the row emits `{c}` and the stylesheet never names it",
+            );
+        }
+
+        // The variable each rule names.
+        let var_of = |class: &str| {
+            let at = PAGE
+                .find(&format!(".row.review .glyph.{class} {{"))
+                .expect("the rule is there");
+            let rule = &PAGE[at..PAGE[at..].find('}').unwrap() + at];
+            rule.split("color:")
+                .nth(1)
+                .unwrap()
+                .trim()
+                .trim_end_matches(';')
+                .trim_start_matches("var(")
+                .trim_end_matches(')')
+                .to_string()
+        };
+        // ...RESOLVED to the colour it holds. Comparing the
+        // declarations would only establish that the rules name
+        // different variables, and two variables can hold the same
+        // colour -- setting `--changes` to `--ok`'s hex then passes
+        // every assertion here while each refusal renders green,
+        // which is this plan's entire complaint (ruthless 244972c).
+        let colour_of = |class: &str| {
+            let name = var_of(class);
+            let at = PAGE
+                .find(&format!("{name}:"))
+                .unwrap_or_else(|| panic!("the palette does not define `{name}`"));
+            PAGE[at + name.len() + 1..]
+                .split(';')
+                .next()
+                .expect("the declaration ends")
+                .trim()
+                .to_string()
+        };
+        let changes = colour_of("v-changes");
+        assert_ne!(
+            changes,
+            colour_of("v-continue"),
+            "a refusal must not be the approving COLOUR, whatever it is called",
+        );
+        assert_ne!(changes, colour_of("v-finished"));
+        assert_ne!(changes, colour_of("v-unmarked"));
+        // All four distinct: a shared colour anywhere means two
+        // verdicts a reader cannot tell apart.
+        let shades: std::collections::BTreeSet<_> = classes.iter().map(|c| colour_of(c)).collect();
+        assert_eq!(
+            shades.len(),
+            classes.len(),
+            "two verdicts render the same colour: {shades:?}",
+        );
+
+        // And the ROW markup actually carries it. Every assertion
+        // above is about a class nothing wears unless the review
+        // branch interpolates it into the glyph's attribute -- the
+        // call site, unproven by testing both ends (test-the-wiring).
+        let review_branch = PAGE
+            .split("r.kind === 'review' ?")
+            .nth(1)
+            .and_then(|s| s.split('\n').next())
+            .expect("the page builds review rows");
+        assert!(
+            review_branch.contains("class=\"glyph ${esc(r.verdict_class"),
+            "the glyph span must carry the row's verdict class: {review_branch}",
+        );
+
+        // And each names a variable the palette defines -- `colour_of`
+        // panics otherwise, so resolving all four is the check.
+        for class in classes {
+            assert!(
+                !colour_of(class).is_empty(),
+                "`{class}` resolves to nothing",
+            );
+        }
+    }
+
+    /// The glyph column is sized for the widest mark there is.
+    ///
+    /// What this CAN establish is the arithmetic: the box keeps the
+    /// per-character allowance it had when it was built for
+    /// one-character marks, applied to the longest mark the log
+    /// actually emits. What it CANNOT is that the browser lays it out
+    /// that way -- the glyph advance is the font's, not something a
+    /// terminal-side assertion reaches (codex 90780fa).
+    #[test]
+    fn the_glyph_column_keeps_its_allowance_for_the_widest_mark() {
+        use clank_core::vocab::Verdict;
+        let widest = [
+            Verdict::Continue,
+            Verdict::Finished,
+            Verdict::RequestChanges,
+            Verdict::Unmarked,
+        ]
+        .into_iter()
+        .map(|v| crate::cli::log::verdict_mark(v, false).chars().count())
+        .max()
+        .expect("there are verdicts");
+        assert_eq!(widest, 2, "FINISHED's `✓✓` is the long one");
+
+        // The allowance the box was built with, before it had to hold
+        // more than one character.
+        const PER_CHAR_EM: f32 = 1.5;
+        let at = PAGE
+            .find(".row .glyph { display: inline-block; width: ")
+            .expect("the glyph box is sized");
+        let em: f32 = PAGE[at..]
+            .split("width: ")
+            .nth(1)
+            .and_then(|s| s.split("em").next())
+            .and_then(|s| s.trim().parse().ok())
+            .expect("its width is in em");
+        assert!(
+            em >= PER_CHAR_EM * widest as f32,
+            "{em}em holds {} characters at {PER_CHAR_EM}em each, and the widest mark is {widest}",
+            em / PER_CHAR_EM,
+        );
+    }
+
     /// The pages are PARSED, not grepped: a duplicate declaration is a
     /// SyntaxError, a SyntaxError in an inline script is the whole
     /// page, and the page ships inside this binary. It went out once —

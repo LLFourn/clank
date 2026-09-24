@@ -24,6 +24,12 @@
     --ink: #262420;
     --muted: #6a655c;
     --hue: #5f5fff;
+    /* The verdict colours. Independent of `--hue`, which the script
+       reassigns per session state -- a mark that tracked it could not
+       be right about its own verdict. */
+    --ok: #2f8f4e;
+    --done: #2a7f9e;
+    --changes: #c2401f;
     /* The state hues were picked to glow on a dark ground. Anything
        that must carry TEXT — a filled button — takes them mixed
        toward the ink instead, or a yellow `reviewing` lamp puts pale
@@ -250,13 +256,38 @@
      wears the emphasis of the header it replaced — otherwise the name
      reads as an ordinary subject (codex on f99d42a). */
   .row.commit .plan { font-weight: 700; }
-  .row .glyph { display: inline-block; width: 1.5em; }
+  /* EVERY row's glyph, not only a review's -- which is what keeps the
+     text after it aligned across commit, review and notice rows.
+     Sized for the WIDEST mark, not the narrowest. The box was 1.5em,
+     which is one character's allowance; FINISHED's mark is `✓✓`, two
+     of them, so it overflowed and sat under the author beside it.
+     3em keeps the SAME allowance per character rather than picking a
+     number that looked about right -- arithmetic this side of the
+     browser can defend, where the actual glyph advance is not. */
+  .row .glyph { display: inline-block; width: 3em; }
   /* A row with a page in the site: the name is the link, in its own
      colour, marked only by the underline. */
   .row a { color: inherit; text-decoration: none; border-bottom: 1px dotted var(--muted); }
   .row a:hover, .row a:focus-visible { border-bottom-color: var(--ink); outline: none; }
   .row .sha, .row .author { color: var(--muted); }
+  /* A review mark takes the colour of its VERDICT, not the session's.
+     `--hue` is set per session state from the script below, so a
+     refusal was drawn in whatever the session happened to be -- the
+     same green as an approval, or yellow. Every other surface already
+     colours these by verdict: the TUI through `verdict_color`, the
+     generated site through `.mark-request-changes`.
+
+     The unclassed rule is a BELT, and unreachable today: every review
+     row `ledger_row` builds carries a verdict class, and only review
+     rows get `.row.review`. It covers a payload whose `verdict_class`
+     is absent -- the field is skipped when None -- rather than any
+     path taken now. Nothing exercises it, so it is a rule that cannot
+     be wrong because it never runs (ruthless 244972c). */
   .row.review .glyph { color: var(--hue); }
+  .row.review .glyph.v-continue { color: var(--ok); }
+  .row.review .glyph.v-finished { color: var(--done); }
+  .row.review .glyph.v-changes { color: var(--changes); }
+  .row.review .glyph.v-unmarked { color: var(--muted); }
   .row.notice .main { color: var(--muted); }
 
   @media (min-width: 960px) {
@@ -1050,7 +1081,7 @@
     $('rows').innerHTML = L.rows.map((r) => {
       const main = r.kind === 'header' ? link(r, esc(r.text))
         : r.kind === 'commit' ? `<span class="glyph">${esc(r.glyph || '')}</span>${link(r, `<span class="sha">${esc(r.sha || '')}</span>`)} ${r.stands_for ? `<span class="plan">${esc(r.stands_for)}</span>` : esc(r.text)}`
-        : r.kind === 'review' ? `<span class="glyph">${esc(r.glyph || '')}</span>${link(r, `<span class="author">${esc(r.author || '')}</span>`)}${r.text ? ': ' + esc(r.text) : ''}`
+        : r.kind === 'review' ? `<span class="glyph ${esc(r.verdict_class || '')}">${esc(r.glyph || '')}</span>${link(r, `<span class="author">${esc(r.author || '')}</span>`)}${r.text ? ': ' + esc(r.text) : ''}`
         : esc(r.text);
       return `<div class="row ${r.kind}"><span class="main">${main}</span><span class="age">${esc(r.age || '')}</span></div>`;
     }).join('');
