@@ -213,7 +213,12 @@
      ended up off a 320px screen. */
   .say { grid-area: say; padding: 10px 14px calc(12px + env(safe-area-inset-bottom)); background: var(--base); }
   .bubble { max-width: var(--column); margin-inline: auto; background: var(--bezel); border: 1px solid var(--edge); border-radius: 18px; padding: 10px 8px 8px 14px; }
-  .say #text { display: block; width: 100%; background: none; color: var(--ink); border: 0; padding: 2px 6px 6px 0; font: 16px var(--text); }
+  /* A paragraph, not a search term: it WRAPS and grows downward, and
+     the height is set from the script because a textarea has no
+     content-sized height of its own. `resize: none` because the
+     script owns the height; `overflow-y: auto` only bites once the
+     cap is reached. */
+  .say #text { display: block; width: 100%; background: none; color: var(--ink); border: 0; padding: 2px 6px 6px 0; font: 16px var(--text); resize: none; overflow-y: auto; line-height: 1.45; }
   .say #text:focus { outline: none; }
   .bubble:focus-within { border-color: color-mix(in srgb, var(--hue) 45%, var(--edge)); }
   .tools { display: flex; align-items: center; gap: 8px; }
@@ -325,7 +330,7 @@
   </div>
   <form class="say" id="say">
     <div class="bubble">
-      <input id="text" autocomplete="off" placeholder="Say something" aria-label="Say something to the shown agent">
+      <textarea id="text" rows="1" autocomplete="off" placeholder="Say something" aria-label="Say something to the shown agent"></textarea>
       <div class="tools">
         <button class="attach" id="attach" type="button" aria-label="Attach a file">+</button>
         <input class="file" id="file" type="file" accept="image/png,image/jpeg,image/gif,image/webp,application/pdf,text/plain,text/markdown,text/csv,application/json" hidden>
@@ -428,6 +433,54 @@
   const pickerEl = $('picker'), stripEl = $('strip');
   const modeBtns = { transcript: $('mode-transcript'), terminal: $('mode-terminal') };
   const form = $('say'), input = $('text'), send = $('send'), sentEl = $('sent'), stopBtn = $('stop');
+  /*__CLANK_COMPOSER__*/
+  // The box's height is the script's to set: a textarea has none of
+  // its own that follows its content. Measured by collapsing to one
+  // row first, so `scrollHeight` reports what the CONTENT needs
+  // rather than what the box currently is -- without that it can only
+  // ever grow, which is the reported bug pointing the other way.
+  //
+  // Called after every write, not only on `input`: setting `.value`
+  // fires no event, and the attach, the dispatch clear and the
+  // failed-send restore all write it (codex a664d6c).
+  function resize() {
+    const line = parseFloat(getComputedStyle(input).lineHeight) || 16;
+    input.style.height = 'auto';
+    const m = {
+      contentPx: input.scrollHeight,
+      lineHeightPx: line,
+      viewportPx: composerViewport(window),
+    };
+    input.style.height = `${composerHeight(m)}px`;
+    input.style.overflowY = composerScrolls(m) ? 'auto' : 'hidden';
+  }
+  input.addEventListener('input', resize);
+  // A viewport change re-wraps the text and moves the cap, and says
+  // so through neither. BOTH viewports: a software keyboard opening
+  // resizes the visual one and not the window, so the window's event
+  // never fires for the case this box is for.
+  window.addEventListener('resize', resize);
+  if (window.visualViewport) window.visualViewport.addEventListener('resize', resize);
+  // Enter's meaning is `composerKey`'s to decide; the submit path is
+  // the form's, so the upload and in-flight guards there still apply.
+  input.addEventListener('keydown', (e) => {
+    switch (composerKey({
+      key: e.key,
+      shiftKey: e.shiftKey,
+      altKey: e.altKey,
+      ctrlKey: e.ctrlKey,
+      metaKey: e.metaKey,
+      isComposing: e.isComposing,
+      keyCode: e.keyCode,
+      hasKeyboard: window.matchMedia('(pointer: fine)').matches,
+    })) {
+      case 'send':
+        e.preventDefault();
+        form.requestSubmit ? form.requestSubmit() : form.dispatchEvent(new Event('submit'));
+        return;
+      default:
+    }
+  });
   const attachBtn = $('attach'), fileInput = $('file');
   const ledgerEl = $('ledger');
   // Forgetting has to end the session too: with the cookie alive, the
@@ -1176,6 +1229,7 @@
       if (!r.ok) throw new Error(await r.text());
       const { path } = await r.json();
       input.value = input.value ? `${input.value} ${path}` : path;
+      resize();
       sentEl.textContent = '';
       input.focus();
     } catch (err) {
@@ -1277,6 +1331,7 @@
     // answer used to be a prefix comparison, and replacing "hi" with
     // "history matters" made it "story matters" (codex on 37014d0).
     input.value = '';
+    resize();
     sending += 1;
     syncSend();
 
@@ -1293,6 +1348,7 @@
       // It never went, so give it back — in front of anything typed
       // since, which is the order they were written in.
       input.value = input.value ? `${text} ${input.value}` : text;
+      resize();
       sentEl.textContent = 'Not sent';
       console.error(err);
     } finally {

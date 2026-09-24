@@ -42,6 +42,13 @@ const DOOR_JS: &str = include_str!("door.js");
 /// it stops getting them, which `rendered_pages` is what notices.
 const DOOR_ANCHOR: &str = "/*__CLANK_DOOR__*/";
 
+/// The message box's decisions: what a keypress means, how tall the
+/// box should be. Session page only — the sign-in page composes
+/// nothing.
+const COMPOSER_JS: &str = include_str!("composer.js");
+
+const COMPOSER_ANCHOR: &str = "/*__CLANK_COMPOSER__*/";
+
 /// The expression `page_for` replaces to name the session. The page
 /// is not a template — this exact substring is the whole mechanism,
 /// so a reflow that splits it serves every session a page called
@@ -52,6 +59,7 @@ const SESSION_ANCHOR: &str = "window.CLANK_SESSION || 'clank'";
 fn page_for(session: &str) -> String {
     PAGE.replace(SESSION_ANCHOR, &serde_json::json!(session).to_string())
         .replace(DOOR_ANCHOR, DOOR_JS)
+        .replace(COMPOSER_ANCHOR, COMPOSER_JS)
 }
 
 /// Where each page's own script says which policy admits it. Replaced
@@ -3927,6 +3935,18 @@ mod tests {
                 "{name}: the door module did not land in this page"
             );
         }
+        // The composer is the session page's alone.
+        for (name, html) in &pages {
+            assert!(
+                !html.contains(COMPOSER_ANCHOR),
+                "{name}: the composer anchor survived rendering"
+            );
+            assert_eq!(
+                html.contains("function composerKey"),
+                *name == "page.html",
+                "{name}: only the session page composes",
+            );
+        }
         pages
     }
 
@@ -5275,7 +5295,7 @@ mod tests {
 /// predicate-shaped version of these tests (fd3ae49).
 #[cfg(test)]
 mod door_js_tests {
-    use super::{DOOR_JS, login_page, page_for};
+    use super::{COMPOSER_JS, DOOR_JS, login_page, page_for};
 
     /// Runs the SHIPPED module, threads `events` through `doorStep`
     /// from a starting environment, and returns the JSON of every
@@ -5528,6 +5548,238 @@ mod door_js_tests {
         assert_eq!(dos(&r["steps"][0]), ["store"]);
         assert_eq!(r["steps"][0][0]["token"], "fresh");
         assert_eq!(r["state"]["stored"], "fresh");
+    }
+
+    /// Runs the shipped COMPOSER module and returns `expr`'s value.
+    fn composer<T>(expr: &str) -> T
+    where
+        T: for<'js> rquickjs::FromJs<'js>,
+    {
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(
+            |ctx| match ctx.eval::<T, _>(format!("{COMPOSER_JS}\n{expr}")) {
+                Ok(v) => v,
+                Err(e) => {
+                    let detail = ctx.catch();
+                    panic!("`{expr}` did not run: {e} {detail:?}");
+                }
+            },
+        )
+    }
+
+    /// Enter sends where there is a keyboard, and inserts where the
+    /// return key IS the newline key.
+    ///
+    /// A blanket unshifted-Enter send leaves a phone unable to type a
+    /// second line at all, and this page is mostly read on one
+    /// (codex a664d6c).
+    #[test]
+    fn enter_sends_on_a_keyboard_and_writes_a_newline_on_a_phone() {
+        let key = |ev: &str| composer::<String>(&format!("composerKey({ev})"));
+        assert_eq!(key("{key:'Enter', hasKeyboard:true}"), "send");
+        assert_eq!(
+            key("{key:'Enter', hasKeyboard:false}"),
+            "newline",
+            "a touch keyboard's return must still make a line",
+        );
+        assert_eq!(
+            key("{key:'Enter', shiftKey:true, hasKeyboard:true}"),
+            "newline"
+        );
+        // Every other key is the textarea's own business.
+        for other in ["{key:'a', hasKeyboard:true}", "{key:'Escape'}", "null"] {
+            assert_eq!(key(other), "pass", "{other}");
+        }
+    }
+
+    /// An Enter that CONFIRMS an IME composition never sends.
+    ///
+    /// The composer is choosing characters, not finishing a message;
+    /// sending there cuts a sentence off mid-word in every language
+    /// that needs one. Both signals, because older engines report the
+    /// legacy keyCode and no `isComposing`.
+    #[test]
+    fn an_ime_confirmation_is_not_a_send() {
+        let key = |ev: &str| composer::<String>(&format!("composerKey({ev})"));
+        assert_eq!(
+            key("{key:'Enter', isComposing:true, hasKeyboard:true}"),
+            "pass"
+        );
+        assert_eq!(key("{key:'Enter', keyCode:229, hasKeyboard:true}"), "pass");
+    }
+
+    /// The box grows with its content, stops at a third of the
+    /// viewport, and SHRINKS back.
+    #[test]
+    fn the_box_grows_to_a_cap_and_shrinks_again() {
+        let h = |m: &str| composer::<i64>(&format!("composerHeight({m})"));
+        let viewport = "viewportPx:900, lineHeightPx:20";
+        assert_eq!(
+            h(&format!("{{contentPx:0, {viewport}}}")),
+            20,
+            "one row at rest"
+        );
+        assert_eq!(h(&format!("{{contentPx:20, {viewport}}}")), 20);
+        assert_eq!(
+            h(&format!("{{contentPx:140, {viewport}}}")),
+            140,
+            "grows with content"
+        );
+        assert_eq!(
+            h(&format!("{{contentPx:5000, {viewport}}}")),
+            300,
+            "a third of 900"
+        );
+        // The shrink is the same function of the content, not a
+        // maximum anything remembers: a box that only grew would be
+        // the reported bug pointing the other way.
+        assert_eq!(h(&format!("{{contentPx:40, {viewport}}}")), 40);
+
+        // The cap follows the VIEWPORT, which changes without an
+        // input event -- a phone rotating, a keyboard opening.
+        assert_eq!(h("{contentPx:5000, viewportPx:300, lineHeightPx:20}"), 100);
+        // And never below one row, however small the viewport gets.
+        assert_eq!(h("{contentPx:5000, viewportPx:10, lineHeightPx:20}"), 20);
+    }
+
+    /// It scrolls only once it has stopped growing.
+    #[test]
+    fn the_box_scrolls_only_at_its_cap() {
+        let s = |m: &str| composer::<bool>(&format!("composerScrolls({m})"));
+        assert!(!s("{contentPx:140, viewportPx:900, lineHeightPx:20}"));
+        assert!(s("{contentPx:5000, viewportPx:900, lineHeightPx:20}"));
+    }
+
+    /// Every write to the box resizes it, not only the ones a person
+    /// types.
+    ///
+    /// Setting `.value` fires no `input` event, so the attach, the
+    /// dispatch clear and the failed-send restore each have to say so
+    /// themselves -- and the window resize has no input event either.
+    /// Asserted on the RENDERED page, since that is what ships.
+    #[test]
+    fn every_write_to_the_box_resizes_it() {
+        let page = page_for("s");
+        let body = COMPOSER_JS.trim();
+        let wiring = page.replace(body, "");
+        assert!(
+            !wiring.contains("function composerHeight"),
+            "the module was not cut out, so this proves nothing"
+        );
+        for (what, write) in [
+            (
+                "the attach",
+                "input.value = input.value ? `${input.value} ${path}` : path;",
+            ),
+            ("the dispatch clear", "input.value = '';"),
+            (
+                "the failed-send restore",
+                "input.value = input.value ? `${text} ${input.value}` : text;",
+            ),
+        ] {
+            let at = wiring
+                .find(write)
+                .unwrap_or_else(|| panic!("{what} still writes the box"));
+            let after = &wiring[at + write.len()..];
+            let next = after.find("resize()").unwrap_or(usize::MAX);
+            assert!(next < 120, "{what} writes the box and does not resize it",);
+        }
+        assert!(
+            wiring.contains("window.addEventListener('resize', resize)"),
+            "a viewport change re-wraps the text and moves the cap",
+        );
+        assert!(
+            wiring.contains("input.addEventListener('input', resize)"),
+            "and typing resizes it",
+        );
+    }
+
+    /// The box is sized against the viewport the reader can SEE.
+    ///
+    /// A software keyboard shrinks only the visual viewport, leaving
+    /// `innerHeight` at its pre-keyboard value -- so sizing against
+    /// that keeps a cap computed for a screen that is no longer
+    /// visible, while typing, on a phone. Which is the whole case
+    /// this box exists for (codex d36f50e).
+    #[test]
+    fn the_cap_follows_the_viewport_the_keyboard_left() {
+        let v = |win: &str| composer::<i64>(&format!("composerViewport({win})"));
+        assert_eq!(
+            v("{innerHeight:900, visualViewport:{height:300}}"),
+            300,
+            "the keyboard is open: 300 is what is left to see",
+        );
+        // Fallbacks, in order, for a browser without the API.
+        assert_eq!(v("{innerHeight:900}"), 900);
+        assert_eq!(v("{innerHeight:900, visualViewport:null}"), 900);
+        assert_eq!(v("null"), 0);
+        // A reported height of ZERO is treated as absent, DELIBERATELY:
+        // a cap of nothing would collapse the box. Today that is
+        // operator precedence rather than a decision anyone wrote, so
+        // this line is what makes it one (ruthless 7ef1088).
+        assert_eq!(v("{innerHeight:900, visualViewport:{height:0}}"), 900);
+
+        // End to end through the sizing: the cap moves with it.
+        let keyboard_shut = "{contentPx:5000, lineHeightPx:20, \
+            viewportPx:composerViewport({innerHeight:900, visualViewport:{height:900}})}";
+        let keyboard_open = "{contentPx:5000, lineHeightPx:20, \
+            viewportPx:composerViewport({innerHeight:900, visualViewport:{height:300}})}";
+        assert_eq!(
+            composer::<i64>(&format!("composerHeight({keyboard_shut})")),
+            300
+        );
+        assert_eq!(
+            composer::<i64>(&format!("composerHeight({keyboard_open})")),
+            100,
+            "with the keyboard open the box must give back the room",
+        );
+    }
+
+    /// And the page ASKS for that viewport, and listens to it.
+    ///
+    /// The sizing test supplies `viewportPx` itself, so it cannot
+    /// catch the page handing over `innerHeight` -- the adapter is
+    /// where this bug lived.
+    #[test]
+    fn the_page_reads_and_watches_the_visual_viewport() {
+        let wiring = page_for("s").replace(COMPOSER_JS.trim(), "");
+        assert!(
+            !wiring.contains("function composerViewport"),
+            "the module was not cut out, so this proves nothing"
+        );
+        assert!(
+            wiring.contains("viewportPx: composerViewport(window)"),
+            "the page must ask the module which viewport to size against",
+        );
+        assert!(
+            !wiring.contains("viewportPx: window.innerHeight"),
+            "innerHeight does not change when a keyboard opens",
+        );
+        assert!(
+            wiring.contains("window.visualViewport.addEventListener('resize', resize)"),
+            "a keyboard opening resizes the VISUAL viewport and not the window, \
+             so the window's event never fires for it",
+        );
+    }
+
+    /// The composer's decisions reach the page through the module,
+    /// not a second copy.
+    #[test]
+    fn the_page_asks_the_composer_module_it_ships() {
+        let page = page_for("s");
+        let wiring = page.replace(COMPOSER_JS.trim(), "");
+        assert!(
+            wiring.contains("composerKey({"),
+            "the keydown handler must ask the module"
+        );
+        assert!(wiring.contains("composerHeight(m)"));
+        assert!(wiring.contains("composerScrolls(m)"));
+        // And the element is one that can grow downward at all.
+        assert!(
+            page.contains("<textarea id=\"text\""),
+            "an <input> is one line forever, which is the bug",
+        );
     }
 
     /// The module the tests run is the module the pages ship. Without
