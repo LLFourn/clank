@@ -69,6 +69,19 @@ pub struct PrReviewState {
     /// watcher that sees `0` owns nothing and stops.
     #[serde(default)]
     pub instance: u64,
+    /// The agent whose config STARTING this review added the PR's
+    /// watch to, when it added one.
+    ///
+    /// Absent when a watch of the same identity was already there —
+    /// somebody wrote it by hand — so ending the review leaves theirs
+    /// alone rather than taking something it never gave.
+    ///
+    /// The OWNER is remembered, not just the fact: master can change
+    /// while a review is open, and resolving it again at the end would
+    /// leave the old master's entry configured and delete an unrelated
+    /// one from the new master's config (codex ded5760).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watch_owner: Option<String>,
 }
 
 impl PrReviewState {
@@ -93,6 +106,7 @@ impl PrReviewState {
             head_sha: head_sha.into(),
             round: 0,
             instance: 0,
+            watch_owner: None,
         }
     }
 }

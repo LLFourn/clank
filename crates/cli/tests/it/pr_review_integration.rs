@@ -235,6 +235,150 @@ fn draft_horizon(repo: &std::path::Path, pr: u32) -> std::path::PathBuf {
     found.pop().unwrap()
 }
 
+/// The github watches in master's config.
+fn watches(repo: &std::path::Path) -> Vec<clank_core::agent_config::GithubSource> {
+    clank::agent_store::load_agent_config(repo, &label("claude"))
+        .unwrap()
+        .map(|cfg| {
+            cfg.wait_events
+                .into_iter()
+                .filter_map(|s| match s {
+                    clank_core::agent_config::WaitEventSource::Github(g) => Some(g),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[test]
+fn starting_a_review_watches_that_pr_and_finishing_stops() {
+    let (env, _) = env_with_pr(123);
+    let repo = env.repo();
+    assert!(watches(repo).is_empty());
+
+    start_with(repo, "o/r", 123, None, None).unwrap();
+    let armed = watches(repo);
+    assert_eq!(
+        armed.len(),
+        1,
+        "start writes the watch into master's config"
+    );
+    assert_eq!(armed[0].prs, [123]);
+    let prompt = armed[0]
+        .prompt
+        .as_deref()
+        .expect("a watch nobody wrote says what it is for");
+    assert!(
+        prompt.contains("Do not reply"),
+        "awareness, not a conversation: {prompt}"
+    );
+    assert!(
+        prompt.contains("first PARK"),
+        "and it says what it did NOT see: a feed watch's first fetch is a silent \
+         baseline, so activity while master was drafting is already history: {prompt}"
+    );
+
+    write_summary(repo, 123, "Looks good.");
+    converge(repo, 123);
+    let gh = FakeGh {
+        pending: Some(42),
+        ..Default::default()
+    };
+    clank::cli::pr_review::finish_through(repo, Some(env.home()), &label("claude"), Some(123), &gh)
+        .unwrap();
+    assert!(
+        watches(repo).is_empty(),
+        "handing the review over takes the watch with it — nothing to clean up by hand"
+    );
+}
+
+#[test]
+fn a_review_is_cleaned_up_from_the_config_that_received_it() {
+    // Master can change while a review is open. Resolving master again
+    // at the end would leave the old one's entry configured and delete
+    // an unrelated watch from the new one's (codex ded5760).
+    let (env, _) = env_with_pr(123);
+    let repo = env.repo();
+    start_with(repo, "o/r", 123, None, None).unwrap();
+    assert_eq!(watches(repo).len(), 1, "armed in claude's config");
+
+    // codex takes over as master, already watching this PR its own way.
+    let mut theirs = clank::cli::pr_review::review_source("o/r", 123);
+    theirs.prompt = Some("codex's own".into());
+    clank::agent_store::update_agent_config(repo, &label("codex"), |cfg| {
+        cfg.wait_events
+            .push(clank_core::agent_config::WaitEventSource::Github(
+                theirs.clone(),
+            ));
+    })
+    .unwrap();
+    clank::cli::agent::set_repo_master(repo, &label("codex")).unwrap();
+
+    abort_with(repo, Some(env.home()), &label("codex"), Some(123)).unwrap();
+
+    assert!(
+        watches(repo).is_empty(),
+        "the entry goes from the config that received it, not whoever is master now"
+    );
+    let theirs_now = clank::agent_store::load_agent_config(repo, &label("codex"))
+        .unwrap()
+        .map(|c| c.wait_events)
+        .unwrap_or_default();
+    assert_eq!(
+        theirs_now,
+        [clank_core::agent_config::WaitEventSource::Github(theirs)],
+        "and the new master's own watch is not collateral"
+    );
+}
+
+#[test]
+fn aborting_a_review_stops_watching_too() {
+    let (env, _) = env_with_pr(123);
+    let repo = env.repo();
+    start_with(repo, "o/r", 123, None, None).unwrap();
+    assert_eq!(watches(repo).len(), 1);
+
+    abort_with(repo, Some(env.home()), &label("claude"), Some(123)).unwrap();
+    assert!(watches(repo).is_empty());
+}
+
+#[test]
+fn a_watch_you_wrote_yourself_is_left_exactly_as_it_was() {
+    let (env, _) = env_with_pr(123);
+    let repo = env.repo();
+
+    // The same WATCH, typed by hand — same repo, kinds and PR scope,
+    // but your own wording and cadence. `source_key` covers none of
+    // those, so downstream this IS the review's watch: a second entry
+    // beside it would share one WAL, one horizon and one lease, and
+    // the later prompt would win for both.
+    let mut mine = clank::cli::pr_review::review_source("o/r", 123);
+    mine.prompt = Some("my own words".into());
+    mine.poll_interval = Some("5m".into());
+    clank::agent_store::update_agent_config(repo, &label("claude"), |cfg| {
+        cfg.wait_events
+            .push(clank_core::agent_config::WaitEventSource::Github(
+                mine.clone(),
+            ));
+    })
+    .unwrap();
+
+    start_with(repo, "o/r", 123, None, None).unwrap();
+    assert_eq!(
+        watches(repo),
+        std::slice::from_ref(&mine),
+        "nothing is added, and your prompt and interval are untouched"
+    );
+
+    abort_with(repo, Some(env.home()), &label("claude"), Some(123)).unwrap();
+    assert_eq!(
+        watches(repo),
+        [mine],
+        "and the review does not take away a watch it never gave you"
+    );
+}
+
 #[test]
 fn the_draft_watch_is_masters_alone() {
     let (env, _) = env_with_pr(123);

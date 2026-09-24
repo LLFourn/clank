@@ -45,9 +45,20 @@ Nothing delivers a draft edit — no webhook, no events feed — so these
 come from re-reading, which means you learn that something changed
 between two reads, not every intermediate edit.
 
-This covers the PENDING review only. Published activity on the PR —
-the human's own comments, pushes, CI — does not reach you this way
-yet.
+This covers the PENDING review only.
+
+## The PR's public side
+
+`clank pr-review start` also adds an ordinary github watch for that PR
+to your config — new comments, pushes, the merge — and `finish` or
+`abort` removes it. Those arrive as normal `github` items and are
+acked the normal way; the watch's own instructions say to read and not
+reply.
+
+It starts listening when you first PARK, so anything that happened on
+the PR while you were drafting is already history. Read the PR itself
+before your first round rather than trusting the watch to have caught
+it.
 
 The verdict files under `.clank/pr-reviews/<pr>/reviews/` are the
 AUTHORITATIVE convergence signal — the GitHub comments are the

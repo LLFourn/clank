@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 
 use crate::cli::github::draft::DraftHorizon;
 use anyhow::Context;
+use clank_core::agent_config::{GithubEventKind, GithubSource, WaitEventSource};
 use clank_core::ids::AgentLabel;
 use clank_core::pr_review::{PrReviewState, ReviewerVerdict, pending_reviewers};
 use clank_core::vocab::{Role, Verdict};
@@ -319,6 +320,8 @@ pub fn start_with(
     // records; a pending review that somehow predates it then
     // presents its comments, which is the informative answer.
     save_draft_horizon(repo, pr, state.instance, &DraftHorizon::started())?;
+    state.watch_owner = add_review_watch(repo, slug, pr)?.map(|l| l.as_str().to_string());
+    save_state(repo, pr, &state)?;
     // `.clank/pr-reviews/` is covered by the `.clank/.gitignore` allow-list
     // (`/*`) — no per-dir entry to add.
     Ok(dir)
@@ -380,6 +383,107 @@ pub fn propose_with(
     save_state(repo, pr, &state)?;
 
     Ok(state.round)
+}
+
+/// The watch master gets while it has this review open.
+///
+/// Derived from the review rather than configured, so nothing has to
+/// be written into `config.json` and nothing is left behind when the
+/// review ends. Only what the events feed reports as it happens: a
+/// new comment, a push, the merge. Edits are deliberately absent —
+/// the feed carries no row for one, and catching them means
+/// abandoning the feed entirely (`the-published-half-of-a-reviewed-pr`,
+/// stashed).
+///
+/// `include_own_actions` is ON. Every agent shares the human's `gh`
+/// identity, so the default would hide exactly the comments this
+/// exists to surface; master seeing its own published comments is the
+/// price, and the prompt says so.
+pub fn review_source(slug: &str, pr: u32) -> GithubSource {
+    GithubSource {
+        repo: slug.to_string(),
+        events: vec![
+            GithubEventKind::PrComment,
+            GithubEventKind::PrUpdated,
+            GithubEventKind::PrMerged,
+        ],
+        prs: vec![u64::from(pr)],
+        include_own_actions: true,
+        poll_interval: None,
+        branches: Vec::new(),
+        prompt: Some(
+            "From the PR review you have open. AWARENESS: read it before your next round, \
+             then `clank events ack` it. Do not reply to it and do not act on it — the \
+             human working on this PR is not asking you a question. You will see your own \
+             published comments here too, because every agent shares one gh identity. \
+             This watch starts listening when you first PARK, so anything that happened \
+             on the PR while you were drafting is already history — read the PR itself \
+             rather than trusting these to have caught it."
+                .to_string(),
+        ),
+        delivery: Default::default(),
+    }
+}
+
+/// Add the review's watch to master's config, or take it away.
+///
+/// The watch is an ORDINARY `wait_events` entry, written for you at
+/// `start` and removed at `finish`/`abort`. Everything downstream
+/// treats it as what it is — one you could have typed yourself — so
+/// its WAL, its prompt, its acking and its cleanup are the behaviour
+/// that already exists rather than a second set of rules.
+///
+/// Add the watch to master's config, and say WHOSE config it went in.
+/// `None` when nothing was added.
+///
+/// "Already there" is judged by watch IDENTITY, not by the whole
+/// entry: `source_key` covers repo/kinds/prs/own-actions and excludes
+/// the prompt, the poll interval and the delivery mode, so a watch of
+/// yours differing only in those is the SAME watch to everything
+/// downstream. Appending beside it would give one WAL, one horizon and
+/// one lease to two entries, and the later prompt would win for both
+/// (codex ded5760).
+fn add_review_watch(repo: &Path, slug: &str, pr: u32) -> anyhow::Result<Option<AgentLabel>> {
+    let Some(master) = crate::agent_store::try_resolve_via_team(repo)?.map(|set| set.master) else {
+        // No team, so no master to watch on behalf of.
+        return Ok(None);
+    };
+    let ours = review_source(slug, pr);
+    let key = crate::cli::github::supervisor::source_key(&ours);
+    let mut added = false;
+    crate::agent_store::update_agent_config(repo, &master, |cfg| {
+        let already = cfg.wait_events.iter().any(|s| match s {
+            WaitEventSource::Github(g) => crate::cli::github::supervisor::source_key(g) == key,
+            _ => false,
+        });
+        if !already {
+            cfg.wait_events.push(WaitEventSource::Github(ours.clone()));
+            added = true;
+        }
+    })?;
+    Ok(added.then_some(master))
+}
+
+/// Remove the entry `start` added, from the config it added it to.
+///
+/// Matched whole, not by identity: an entry edited since — a prompt
+/// changed, an interval added — is one somebody has taken over, and
+/// taking it away would be deleting their work.
+fn remove_review_watch(
+    repo: &Path,
+    slug: &str,
+    pr: u32,
+    owner: Option<&str>,
+) -> anyhow::Result<()> {
+    let Some(owner) = owner else {
+        return Ok(());
+    };
+    let owner = AgentLabel::parse(owner)
+        .map_err(|e| anyhow::anyhow!("PR review recorded an unreadable watch owner: {e}"))?;
+    let ours = WaitEventSource::Github(review_source(slug, pr));
+    crate::agent_store::update_agent_config(repo, &owner, |cfg| {
+        cfg.wait_events.retain(|s| s != &ours);
+    })
 }
 
 /// How often the open review's draft is re-read while master is
@@ -561,6 +665,7 @@ pub fn abort_with(
     if let Err(e) = gh::discard_pending_review(&state.repo, pr) {
         eprintln!("warning: discarding the GitHub pending review failed: {e:#}");
     }
+    remove_review_watch(repo, &state.repo, pr, state.watch_owner.as_deref())?;
     std::fs::remove_dir_all(pr_dir(repo, pr))
         .with_context(|| format!("removing PR #{pr} review scratch"))?;
     Ok(())
@@ -719,6 +824,7 @@ pub fn finish_through(
 
     // Remote work done — only NOW is the scratch expendable. Failing
     // before this point leaves it for the next attempt.
+    remove_review_watch(repo, &state.repo, pr, state.watch_owner.as_deref())?;
     std::fs::remove_dir_all(pr_dir(repo, pr))
         .with_context(|| format!("removing PR #{pr} review scratch after handoff"))?;
 
@@ -1663,6 +1769,34 @@ mod tests {
                 .absorb_snapshot(9, &[(1, "master's first comment")])
                 .is_empty(),
             "which is exactly what a default horizon cannot say"
+        );
+    }
+
+    #[test]
+    fn the_review_watch_is_this_pr_and_what_the_feed_actually_reports() {
+        let w = review_source("o/r", 42);
+        assert_eq!(w.prs, [42]);
+        assert!(
+            w.events.iter().all(|k| k.is_pr_scoped()),
+            "a kind the `prs` list cannot confine would leak the rest of the repo: {:?}",
+            w.events
+        );
+        assert_eq!(
+            w.events,
+            [
+                GithubEventKind::PrComment,
+                GithubEventKind::PrUpdated,
+                GithubEventKind::PrMerged
+            ],
+            "comments, pushes and the merge — what the feed reports as it happens"
+        );
+        assert!(
+            w.include_own_actions,
+            "one shared gh identity, so the default hides the human's own comments"
+        );
+        assert!(
+            w.prompt.is_some(),
+            "a watch nobody wrote has to say what it is for"
         );
     }
 
