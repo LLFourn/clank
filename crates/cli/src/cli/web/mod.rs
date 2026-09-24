@@ -3888,54 +3888,7 @@ mod tests {
             .expect("the accept loop ends on cancel")
             .unwrap();
     }
-    /// How a browser will read a script: the pages' own blocks are
-    /// classic, a `type="module"` block is a module, and the two are
-    /// not interchangeable — module syntax does not run in a classic
-    /// script, and a classic script's top-level `return` is not a
-    /// module's (codex on b5170be).
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    enum Kind {
-        Classic,
-        Module,
-    }
-
-    /// A script as a JavaScript engine reads it: parsed, then its
-    /// scopes built, so the early errors a browser reports before
-    /// running a line are reported here too. A redeclaration is one of
-    /// those, and it is not a parse error — it is a fact about a
-    /// SCOPE, which is why the check has to know about scopes and a
-    /// grep over the file never could.
-    ///
-    /// Nothing is executed: there is no DOM here to execute against.
-    fn parse_as(script: &str, kind: Kind) -> Result<(), String> {
-        let allocator = oxc_allocator::Allocator::default();
-        // Spelled out, because this type's Default is a MODULE: as one,
-        // `export`, a top-level `await` and `import.meta` all pass, and
-        // none of them runs in what is shipped.
-        let source = match kind {
-            Kind::Classic => oxc_span::SourceType::script(),
-            Kind::Module => oxc_span::SourceType::mjs(),
-        };
-        let parsed = oxc_parser::Parser::new(&allocator, script, source).parse();
-        if let Some(e) = parsed.diagnostics.first() {
-            return Err(format!("{e:?}"));
-        }
-        // The checks that catch `break` outside a loop or a private
-        // field declared twice are off unless asked for. A guard that
-        // accepts what the browser rejects is the fault this plan is
-        // about (codex on 79fc29f).
-        let semantic = oxc_semantic::SemanticBuilder::new()
-            .with_check_syntax_error(true)
-            .build(&parsed.program);
-        match semantic.diagnostics.first() {
-            Some(e) => Err(format!("{e:?}")),
-            None => Ok(()),
-        }
-    }
-
-    fn parse_js(script: &str) -> Result<(), String> {
-        parse_as(script, Kind::Classic)
-    }
+    use crate::cli::js_guard::{Kind, parse_as, script_tags};
 
     /// The paths the pages load, and the vendored file each is served
     /// from. A page may load nothing else: a script from somebody
@@ -3967,15 +3920,8 @@ mod tests {
             ("vendor/xterm.js", XTERM_JS.to_string(), Kind::Classic),
         ];
         for (page, html) in [("page.html", PAGE), ("login.html", LOGIN)] {
-            let mut rest = html;
-            while let Some(at) = rest.find("<script") {
-                let after = &rest[at + "<script".len()..];
-                let shut = after.find('>').expect("an open tag that ends");
-                let attrs = after[..shut].trim().to_string();
-                let body = &after[shut + 1..];
-                let end = body.find("</script>").expect("a script that is closed");
-                let source = &body[..end];
-                rest = &body[end..];
+            for tag in script_tags(html) {
+                let (attrs, source) = (tag.attrs, tag.body);
                 match () {
                     // A path of this binary's own: it must be an
                     // asset the inventory holds, so a page cannot load
@@ -4045,44 +3991,6 @@ mod tests {
             if let Err(e) = parse_as(script, *kind) {
                 panic!("{page} does not parse as {kind:?}: {e}");
             }
-        }
-        // The check is shown to FAIL on the fault it is for, in the
-        // shape that shipped: a name declared twice in one scope.
-        // The shape that shipped: a name declared twice INSIDE the
-        // page's own closure, which is where its script lives. A
-        // global-only check reads this as fine, so the check has to
-        // see scopes.
-        let twice = "(() => { const a = 1; async function a() {} })();";
-        assert!(
-            parse_js(twice).is_err(),
-            "a redeclaration inside a closure must fail: that is the whole point"
-        );
-        assert!(parse_js("(() => { const a = 1; async function b() {} })();").is_ok());
-        // The two kinds mean different things, which is the whole
-        // reason a tag's own attributes decide which it is read as.
-        assert!(parse_as("export {};", Kind::Module).is_ok());
-        assert!(parse_as("export {};", Kind::Classic).is_err());
-        // And an ordinary syntax error, which is the easier half.
-        assert!(parse_js("const a = ;").is_err());
-        // The checks a loose configuration leaves off, each of them a
-        // program a browser refuses to run: this guard exists to be
-        // as strict as the thing it stands in for (codex on 79fc29f).
-        for browser_refuses in [
-            "return;",
-            "(() => { break; })();",
-            "(() => { continue; })();",
-            "class C { #x; #x; }",
-            "'use strict'; with (x) {}",
-            // Module syntax: valid somewhere, not in a classic script,
-            // which is what these pages load as.
-            "export {};",
-            "await 0;",
-            "import.meta;",
-        ] {
-            assert!(
-                parse_js(browser_refuses).is_err(),
-                "a browser refuses `{browser_refuses}`, and so must this"
-            );
         }
     }
 

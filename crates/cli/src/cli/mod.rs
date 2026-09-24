@@ -28,6 +28,8 @@ pub mod html;
 pub mod html_highlight;
 pub mod inbox;
 pub mod init;
+#[cfg(test)]
+pub mod js_guard;
 pub mod log;
 pub mod open;
 pub mod open_zellij;

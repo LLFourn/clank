@@ -3990,3 +3990,139 @@ mod tests {
         );
     }
 }
+
+/// The generated site's scripts, read as a browser will read them.
+///
+/// `html.rs` emits inline JS into every page it writes, from this
+/// binary, into the same browsers as the remote's pages — and a
+/// SyntaxError among them blanks those pages with the same silence:
+/// the site builds, the file holds every string a grep looks for, and
+/// nothing runs (ruthless on 9473655).
+#[cfg(test)]
+mod script_tests {
+    use super::*;
+    use crate::cli::js_guard::{parse_js, script_tags};
+
+    /// Every script this module writes, named, and taken from what the
+    /// renderers COMPOSE rather than from the constants they compose.
+    ///
+    /// The difference is the fault: `THEME_HEAD_SCRIPT` carries its own
+    /// `<script>` tags, the footer block is two constants concatenated
+    /// inside one tag that neither of them contains, and the loading
+    /// page's watchdog reaches the page through `format!` — where
+    /// `{{`/`}}` are Rust escapes, so the shipped text is not the
+    /// literal in the source. A fragment that parses alone and not
+    /// together is the shape that shipped last time.
+    fn site_scripts() -> Vec<(&'static str, String)> {
+        let mut docs: Vec<(&'static str, String)> = Vec::new();
+
+        // Both document-opening paths: they emit the head script
+        // separately, so covering one says nothing about the other.
+        let mut with_meta = String::new();
+        write_doc_open_with_meta(&mut with_meta, "t", ".", "");
+        write_doc_close(&mut with_meta);
+        docs.push(("write_doc_open_with_meta", with_meta));
+
+        let mut plain = String::new();
+        write_doc_open(&mut plain, "t", ".");
+        write_doc_close(&mut plain);
+        docs.push(("write_doc_open", plain));
+
+        // Every state, because the refresh directive and the accent
+        // differ per state and each one is a page that ships.
+        for (name, state) in [
+            ("loading:preparing", LoadingState::Preparing),
+            (
+                "loading:building",
+                LoadingState::Building { done: 1, total: 3 },
+            ),
+            ("loading:done", LoadingState::Done { url: "a/b.html" }),
+            ("loading:error", LoadingState::Error { message: "boom" }),
+        ] {
+            docs.push((name, render_loading_page("label", state)));
+        }
+
+        let mut out = Vec::new();
+        for (name, html) in &docs {
+            for tag in script_tags(html) {
+                // The site's pages have no nonce, no `src` and no
+                // module: every block is one this module wrote inline,
+                // as a classic script. A shape nobody decided about
+                // fails rather than being skipped — the same rule the
+                // remote's inventory keeps.
+                assert!(
+                    tag.attrs.is_empty(),
+                    "{name}: a script tag nobody decided about: <script {}>",
+                    tag.attrs
+                );
+                out.push((*name, tag.body.to_string()));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn the_sites_scripts_parse() {
+        let scripts = site_scripts();
+        // Named and counted, so a renderer that stops emitting a
+        // script — or an extraction that silently finds none — is a
+        // failure rather than a test that quietly checks less.
+        for wanted in [
+            "write_doc_open_with_meta",
+            "write_doc_open",
+            "loading:preparing",
+            "loading:building",
+            "loading:done",
+            "loading:error",
+        ] {
+            let found = scripts
+                .iter()
+                .filter(|(name, body)| *name == wanted && !body.trim().is_empty())
+                .count();
+            assert!(found > 0, "{wanted} ships a script and must be checked");
+        }
+        // Both doc-open paths emit the head script AND the footer
+        // block; one tag would mean the composition went unread.
+        for doc in ["write_doc_open_with_meta", "write_doc_open"] {
+            assert_eq!(
+                scripts.iter().filter(|(name, _)| *name == doc).count(),
+                2,
+                "{doc}: the head script and the footer block are both scripts"
+            );
+        }
+
+        for (name, script) in &scripts {
+            if let Err(e) = parse_js(script) {
+                panic!("{name} does not parse: {e}");
+            }
+        }
+    }
+
+    /// The composed footer block is the one that can break without any
+    /// single constant being wrong: two IIFEs concatenated into one
+    /// tag share a scope, so a name each declares at top level
+    /// collides only once they are joined.
+    #[test]
+    fn the_footer_block_is_checked_as_composed() {
+        let mut out = String::new();
+        write_doc_close(&mut out);
+        let tags = script_tags(&out);
+        assert_eq!(tags.len(), 1, "the footer is one tag holding both pieces");
+        let composed = tags[0].body;
+        assert!(
+            composed.contains("data-iso") && composed.contains("theme-toggle"),
+            "both pieces reach the page through this one tag"
+        );
+        assert!(parse_js(composed).is_ok());
+
+        // The fault this shape invites, shown to fail: each half parses
+        // alone, and together they redeclare. A guard reading the
+        // constants piecewise passes both halves and ships the break.
+        let (a, b) = ("var r = 1;", "let r = 2;");
+        assert!(parse_js(a).is_ok() && parse_js(b).is_ok());
+        assert!(
+            parse_js(&format!("{a}{b}")).is_err(),
+            "a collision that only exists once the pieces are joined must fail"
+        );
+    }
+}
