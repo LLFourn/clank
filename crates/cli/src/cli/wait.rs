@@ -120,6 +120,9 @@ fn firings_from_items(items: &[WaitItem]) -> Vec<HookFiring> {
             // extra-wait-events).
             | WaitItem::GithubEvent { .. }
             | WaitItem::CommandEvent { .. }
+            // Awareness is not an obligation: nothing is owed, so
+            // there is no lifecycle moment to fire on.
+            | WaitItem::DraftChanged { .. }
             // PR-review items surface via the stop-hook's `clank wait`
             // pull (like ad-hoc/queue items) rather than a dedicated
             // proactive OS hook — HookFiring is plan+sha keyed and PR
@@ -132,10 +135,50 @@ fn firings_from_items(items: &[WaitItem]) -> Vec<HookFiring> {
 
 pub async fn run(args: WaitArgs) -> anyhow::Result<()> {
     let json = args.json;
+    let repo = resolve_repo(args.repo.as_deref())?;
     if let Some(items) = items(args).await? {
         emit(&items, json);
+        // Printed is delivered. A channel send is not: it succeeds
+        // while the receiver is alive, and this wait could still have
+        // failed or been cancelled between the send and here, leaving
+        // the watch's only copy of a change gone (codex 29431d9). So
+        // the draft watch is told AFTER the items are out, and only
+        // then stops owing them.
+        mark_drafts_delivered(&repo, &items);
     }
     Ok(())
+}
+
+/// Tell each PR review's draft watch which of its changes reached
+/// master. The sources are already shut down by the time `items`
+/// returns, so nothing else is writing those files.
+fn mark_drafts_delivered(repo: &std::path::Path, items: &[WaitItem]) {
+    for ((pr, instance), revisions) in deliveries(items) {
+        crate::cli::pr_review::draft_changes_delivered(repo, pr, instance, &revisions);
+    }
+}
+
+/// Which revisions of which review RUN this wait handed over.
+///
+/// Keyed by run, not by PR: revisions restart at 1 for each run, so
+/// acknowledging by `(pr, revision)` lets a wait that started before a
+/// restart settle a debt belonging to the run that replaced it — a
+/// change nobody has seen (codex 96dbec8).
+fn deliveries(items: &[WaitItem]) -> std::collections::BTreeMap<(u32, u64), Vec<u64>> {
+    let mut owed: std::collections::BTreeMap<(u32, u64), Vec<u64>> =
+        std::collections::BTreeMap::new();
+    for item in items {
+        if let WaitItem::DraftChanged {
+            pr,
+            instance,
+            revision,
+            ..
+        } = item
+        {
+            owed.entry((*pr, *instance)).or_default().push(*revision);
+        }
+    }
+    owed
 }
 
 /// What this wait wakes with — the same items `run` prints — or `None`
@@ -287,7 +330,19 @@ pub async fn items(args: WaitArgs) -> anyhow::Result<Option<Vec<WaitItem>>> {
     let events_dir = crate::agent_store::agents_root(&repo)
         .join(author.as_str())
         .join("events");
-    let mut sources = EventSources::spawn(&event_sources, Some(&events_dir));
+    // Master's open PR reviews get a draft watch each, derived from
+    // the review rather than configured: it exists only while master
+    // is parked with a review open, and dies with the wait.
+    let drafts: Vec<(u32, String)> = if inputs.role == Role::Master {
+        crate::cli::pr_review::pr_review_inputs(&repo)
+            .into_iter()
+            .map(|i| (i.pr, i.repo))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let mut sources =
+        EventSources::spawn(&event_sources, Some(&events_dir), &repo, &author, &drafts);
     // Once the source channel closes (every source task finished, or
     // there were none), its `recv()` is permanently ready with `None`
     // — a guard disables that select branch so it can't hot-loop the
@@ -383,6 +438,7 @@ pub async fn items(args: WaitArgs) -> anyhow::Result<Option<Vec<WaitItem>>> {
             // produced during the refold, then repo + external merge into
             // ONE result. Park only when BOTH are empty (codex 907acd5).
             drain_external(&mut sources.rx, &mut sources_open, &mut external);
+            drop_items_not_for(inputs.role, &mut external);
             if let Some(items) = combine_beat_result(repo_items, external) {
                 return Ok(items);
             }
@@ -663,6 +719,18 @@ pub(crate) fn resolve_wait_event_sources(
 /// repo work carries external items along; external-only still
 /// returns; both empty parks (`None`). Pure — the deterministic proof
 /// that a beat with BOTH ready emits ONE combined result.
+/// Drop what this role must not be handed.
+///
+/// A draft change belongs to MASTER. The role is re-derived every
+/// wake, so a demotion mid-wait drops what the old watch queued rather
+/// than returning it — returning it would ACK it, settling a debt owed
+/// to the agent that is master now (codex edf3a63).
+fn drop_items_not_for(role: Role, external: &mut Vec<WaitItem>) {
+    if role != Role::Master {
+        external.retain(|i| !matches!(i, WaitItem::DraftChanged { .. }));
+    }
+}
+
 fn combine_beat_result(
     repo_items: Option<Vec<WaitItem>>,
     external: Vec<WaitItem>,
@@ -724,6 +792,9 @@ impl EventSources {
             crate::cli::github::supervisor::SourceOrigin,
         )],
         events_dir: Option<&std::path::Path>,
+        repo: &std::path::Path,
+        author: &AgentLabel,
+        drafts: &[(u32, String)],
     ) -> Self {
         use clank_core::agent_config::WaitEventSource;
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -744,6 +815,16 @@ impl EventSources {
                     ));
                 }
             }
+        }
+        for (pr, slug) in drafts {
+            tasks.push(tokio::spawn(crate::cli::pr_review::run_draft_source(
+                repo.to_path_buf(),
+                slug.clone(),
+                *pr,
+                author.clone(),
+                tx.clone(),
+                crate::cli::pr_review::DRAFT_POLL,
+            )));
         }
         Self { rx, tasks }
     }
@@ -1126,6 +1207,19 @@ pub(crate) enum WaitJsonItem<'a> {
         exit_code: Option<i32>,
         output_tail: &'a str,
     },
+    #[serde(rename = "draft_changed")]
+    DraftChanged {
+        pr: u32,
+        /// Opaque: which run of that PR's review. It exists so an ack
+        /// cannot cross runs, and means nothing to a reader.
+        instance: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        comment: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        path: Option<&'a str>,
+        change: &'a str,
+        revision: u64,
+    },
     #[serde(rename = "for_commit")]
     ForCommit { sha: &'a str, subject: &'a str },
     #[serde(rename = "for_finished")]
@@ -1254,6 +1348,21 @@ pub(crate) fn render_json(item: &WaitItem) -> WaitJsonItem<'_> {
             actor: actor.as_deref(),
             url: url.as_deref(),
             instructions: instructions.as_deref(),
+        },
+        WaitItem::DraftChanged {
+            pr,
+            instance,
+            comment,
+            path,
+            change,
+            revision,
+        } => WaitJsonItem::DraftChanged {
+            pr: *pr,
+            instance: *instance,
+            comment: *comment,
+            path: path.as_deref(),
+            change: change.wire(),
+            revision: *revision,
         },
         WaitItem::CommandEvent {
             name,
@@ -1441,6 +1550,20 @@ fn render_human(item: &WaitItem) -> String {
                 line.push_str(&one_line(i, 300));
             }
             line
+        }
+        WaitItem::DraftChanged {
+            pr,
+            comment,
+            path,
+            change,
+            revision,
+            ..
+        } => {
+            let about = match (comment, path.as_deref()) {
+                (Some(c), Some(p)) => format!("  {p}  comment {c}"),
+                _ => String::new(),
+            };
+            format!("draft    #{pr}  {}{about}  (r{revision})", change.wire())
         }
         WaitItem::CommandEvent {
             name,
@@ -2047,6 +2170,86 @@ mod tests {
 
     #[test]
     fn human_lines_carry_no_tutorial() {
+        let item = |pr: u32, instance: u64, revision: u64| WaitItem::DraftChanged {
+            pr,
+            instance,
+            comment: Some(1),
+            path: Some("f.rs".into()),
+            change: clank_core::pr_review::DraftChange::Edited,
+            revision,
+        };
+        let github = WaitItem::CommandEvent {
+            name: "watch".into(),
+            exit_code: Some(0),
+            output_tail: String::new(),
+        };
+        let mut for_standby = vec![item(12, 100, 1), github.clone()];
+        drop_items_not_for(Role::Standby, &mut for_standby);
+        assert_eq!(
+            for_standby,
+            std::slice::from_ref(&github),
+            "a demoted agent must not be handed master's draft change: returning it \
+             would acknowledge it away from the agent it is owed to"
+        );
+        let mut for_master = vec![item(12, 100, 1), github.clone()];
+        drop_items_not_for(Role::Master, &mut for_master);
+        assert_eq!(for_master.len(), 2);
+        let mut other_sources = vec![github.clone()];
+        drop_items_not_for(Role::Reviewer, &mut other_sources);
+        assert_eq!(
+            other_sources,
+            std::slice::from_ref(&github),
+            "and an operator's own sources are none of this filter's business"
+        );
+
+        let draft_item = |pr: u32, instance: u64, revision: u64| WaitItem::DraftChanged {
+            pr,
+            instance,
+            comment: Some(1),
+            path: Some("f.rs".into()),
+            change: clank_core::pr_review::DraftChange::Edited,
+            revision,
+        };
+        let grouped = deliveries(&[
+            draft_item(12, 100, 1),
+            draft_item(12, 200, 1),
+            draft_item(12, 100, 2),
+            WaitItem::Idle {
+                prompt: "nothing".into(),
+            },
+        ]);
+        assert_eq!(
+            grouped.into_iter().collect::<Vec<_>>(),
+            [((12, 100), vec![1, 2]), ((12, 200), vec![1])],
+            "one PR, two runs, both with a revision 1 — acknowledged separately or one \
+             settles a debt that is not its own"
+        );
+
+        let draft = render_human(&WaitItem::DraftChanged {
+            pr: 12,
+            instance: 77,
+            comment: Some(4088032661),
+            path: Some("crates/cli/src/lib.rs".into()),
+            change: clank_core::pr_review::DraftChange::Removed,
+            revision: 3,
+        });
+        assert_eq!(
+            draft,
+            "draft    #12  removed  crates/cli/src/lib.rs  comment 4088032661  (r3)"
+        );
+        let wire = serde_json::to_value(render_json(&WaitItem::DraftChanged {
+            pr: 12,
+            instance: 77,
+            comment: Some(4088032661),
+            path: Some("crates/cli/src/lib.rs".into()),
+            change: clank_core::pr_review::DraftChange::Removed,
+            revision: 3,
+        }))
+        .unwrap();
+        assert_eq!(wire["kind"], "draft_changed");
+        assert_eq!(wire["change"], "removed");
+        assert_eq!(wire["revision"], 3);
+
         let promote = render_human(&WaitItem::PromoteFromQueue {
             name: "some-plan".into(),
             priority: 300,

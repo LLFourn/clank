@@ -12,6 +12,34 @@ use serde::{Deserialize, Serialize};
 use crate::ids::AgentLabel;
 use crate::vocab::Verdict;
 
+/// What happened to one draft comment between two observations.
+///
+/// The draft is state, not a stream: nothing delivers an edit to a
+/// pending review, so these are differences an observer noticed, not
+/// events github reported (`the-review-session-watches-its-pr`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DraftChange {
+    Added,
+    Edited,
+    Removed,
+    /// The pending review itself is no longer there — discarded, or
+    /// submitted. ONE change, not one per comment: a submitted review
+    /// deleted nothing, and saying otherwise would misreport it.
+    Gone,
+}
+
+impl DraftChange {
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::Added => "added",
+            Self::Edited => "edited",
+            Self::Removed => "removed",
+            Self::Gone => "gone",
+        }
+    }
+}
+
 /// `.clank/pr-reviews/<pr>/pr.json` — the review target plus the
 /// round/submit coordination state.
 ///
@@ -32,9 +60,31 @@ pub struct PrReviewState {
     /// reviewed so a post-approval edit reopens the gate.
     #[serde(default)]
     pub round: u64,
+    /// This run of the review, distinct from any earlier run on the
+    /// same PR. A background watcher derived from the review checks
+    /// it before committing anything, so a task belonging to an
+    /// aborted review cannot write over the one that replaced it
+    /// (codex 66f7789). Absent on files written before it existed,
+    /// which reads as `0` — indistinguishable from another `0`, so a
+    /// watcher that sees `0` owns nothing and stops.
+    #[serde(default)]
+    pub instance: u64,
 }
 
 impl PrReviewState {
+    /// A fresh instance token. Monotonic within a process and
+    /// time-seeded across them, which is all this needs: it must
+    /// differ from the token of the review it replaces.
+    pub fn new_instance() -> u64 {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(1);
+        nanos ^ (NEXT.fetch_add(1, Ordering::Relaxed) << 48)
+    }
+
     /// Fresh state at round 0 with no pending review yet.
     pub fn new(repo: impl Into<String>, number: u32, head_sha: impl Into<String>) -> Self {
         Self {
@@ -42,6 +92,7 @@ impl PrReviewState {
             number,
             head_sha: head_sha.into(),
             round: 0,
+            instance: 0,
         }
     }
 }

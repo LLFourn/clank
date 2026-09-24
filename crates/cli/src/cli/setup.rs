@@ -1575,6 +1575,20 @@ mod tests {
     }
 
     #[test]
+    fn the_pr_review_skill_says_a_draft_wake_is_not_a_conversation() {
+        let s = PR_REVIEW_SKILL_BODY;
+        assert!(s.contains("Do not answer it"), "the one rule this wake has");
+        assert!(
+            s.contains("There is nothing to ack"),
+            "an awareness item with an ack instruction would grow a workflow"
+        );
+        assert!(
+            s.contains("your OWN writes"),
+            "master must not read its own edit as the operator's"
+        );
+    }
+
+    #[test]
     fn pr_review_skill_carries_verbs_and_verified_incantations() {
         let body = PR_REVIEW_SKILL_BODY;
         assert!(

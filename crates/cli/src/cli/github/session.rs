@@ -319,6 +319,69 @@ impl<S: HttpSend> LoginResolver for GhLogin<S> {
     }
 }
 
+/// Items per page. GitHub's maximum, so the common repo is one page.
+pub(super) const PER_PAGE: usize = 100;
+
+/// Pages a collection may span before the reader refuses it. At 100
+/// an item that is 2000 checks or open PRs, past which the assumption
+/// is wrong somewhere and guessing is worse than saying so.
+pub(super) const MAX_COLLECTION_PAGES: u32 = 20;
+
+/// Every element of a paginated collection, or an error — never a
+/// prefix of one.
+///
+/// Completeness is the contract both readers are built on. The CI
+/// reduction calls a PR green when it has seen no failure, so a page
+/// left unread is a green light nobody earned; the draft reader treats
+/// every remembered comment the snapshot omits as deleted, so half a
+/// page is the operator appearing to throw the review away. A later page that fails fails the whole
+/// read, a body whose collection is not where it should be is an
+/// error rather than an empty list — silence and "nothing failed"
+/// must not be the same answer — and a collection past [`MAX_COLLECTION_PAGES`]
+/// is refused rather than truncated (codex 3707a88).
+///
+/// `field` names the array inside the body, or `None` when the body
+/// IS the array.
+pub(super) async fn read_every_page<S: HttpSend>(
+    session: &GithubSession<S>,
+    url_for_page: impl Fn(u32) -> String,
+    field: Option<&str>,
+) -> anyhow::Result<Vec<serde_json::Value>> {
+    let mut all: Vec<serde_json::Value> = Vec::new();
+    for page in 1..=MAX_COLLECTION_PAGES {
+        let url = url_for_page(page);
+        let resp = session.get(&url, None).await?;
+        if !(200..300).contains(&resp.status) {
+            anyhow::bail!(
+                "github {url}: {}: {}",
+                resp.status,
+                resp.body.chars().take(200).collect::<String>()
+            );
+        }
+        let body: serde_json::Value = serde_json::from_str(&resp.body)
+            .map_err(|e| anyhow::anyhow!("github {url}: body is not json: {e}"))?;
+        let items = match field {
+            None => body.as_array(),
+            Some(name) => body.get(name).and_then(|v| v.as_array()),
+        }
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "github {url}: no `{}` array in the response",
+                field.unwrap_or("top-level")
+            )
+        })?;
+        let len = items.len();
+        all.extend(items.iter().cloned());
+        if len < PER_PAGE {
+            return Ok(all);
+        }
+    }
+    anyhow::bail!(
+        "github {}: more than {MAX_COLLECTION_PAGES} pages — refusing to report a partial collection",
+        url_for_page(1),
+    )
+}
+
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;

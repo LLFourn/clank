@@ -1849,6 +1849,12 @@ pub(crate) struct WaitItem {
     instructions: Option<String>,
     exit_code: Option<i64>,
     output_tail: Option<String>,
+    /// A draft change's payload (the-review-session-watches-its-pr).
+    /// `pr` is shared with the pr-review items above.
+    comment: Option<u64>,
+    path: Option<String>,
+    change: Option<String>,
+    revision: Option<u64>,
     // An inbox message's payload.
     handle: Option<String>,
     from: Option<String>,
@@ -1929,6 +1935,12 @@ pub(crate) fn discharge_of(kind: &str, reason: Option<&str>) -> Option<Discharge
         "idle" => Until("fires while there is nothing else to do"),
         "finished" => OneShot("a finalize notice — it will not fire again for that sha"),
         "adhoc_settled" => OneShot("a settle notice — it will not fire again for that sha"),
+        // Awareness. The observer records every change it reports, so
+        // this one is spent — and there is nothing to answer: replying
+        // to the operator's edit is what the watch must not cause.
+        "draft_changed" => {
+            OneShot("read the draft before your next round; do not reply to it, and do not ack it")
+        }
         // REPEATING, despite looking like a one-off. Command sources
         // are spawned once per wait, and every stop-hook re-arm starts
         // them again — so a source that exits immediately re-fires on
@@ -2150,6 +2162,21 @@ fn render_wait_items_ref(items: &[&WaitItem], label: &AgentLabel, role: Role) ->
                     .map(|l| format!(": {l}"))
                     .unwrap_or_default();
                 out.push_str(&format!("  - command: {name} {exit}{snip}\n"));
+            }
+            "draft_changed" => {
+                let pr = item.pr.map(|n| format!("#{n}")).unwrap_or("?".into());
+                let change = item.change.as_deref().unwrap_or("?");
+                // The revision rides along because two edits of ONE
+                // comment are two changes: without it the second
+                // line reads as a duplicate of the first.
+                let r = item.revision.map(|r| format!(" r{r}")).unwrap_or_default();
+                match (item.comment, item.path.as_deref()) {
+                    (Some(c), Some(p)) => {
+                        out.push_str(&format!("  - draft {pr}: {change} {p} (comment {c}){r}\n"))
+                    }
+                    // `gone` is about the review, not a comment in it.
+                    _ => out.push_str(&format!("  - draft {pr}: {change}{r}\n")),
+                }
             }
             // Its OWN variant, not a `master` reason — `work_for`
             // emits it directly. It rendered through the catchall
@@ -2859,6 +2886,7 @@ mod tests {
             W::Message { .. } => "message",
             W::GithubEvent { .. } => "github_event",
             W::CommandEvent { .. } => "command_event",
+            W::DraftChanged { .. } => "draft_changed",
             W::ForCommit { .. } => "for_commit",
             W::ForFinished { .. } => "for_finished",
             W::ForBlocked { .. } => "for_blocked",
@@ -2910,7 +2938,7 @@ mod tests {
                 "{k} repeats and must state what ends it"
             );
         }
-        for k in ["finished", "adhoc_settled"] {
+        for k in ["finished", "adhoc_settled", "draft_changed"] {
             assert!(
                 matches!(discharge_of(k, None), Some(OneShot(_))),
                 "{k} is one-shot and must say so rather than stay silent"
@@ -3796,6 +3824,41 @@ mod tests {
         let input = hook_input("sess-unbound", None);
         let outcome = compute_outcome(Tool::Claude, Some(repo), input).await;
         assert!(matches!(outcome, HookOutcome::Diagnostic { .. }));
+    }
+
+    #[test]
+    fn a_draft_change_says_what_moved_and_that_nothing_is_owed() {
+        // Built from wait's ACTUAL --json field names, the same wire
+        // the hook consumes.
+        let raw = serde_json::json!({
+            "items": [{
+                "kind": "draft_changed",
+                "pr": 12,
+                "comment": 4088032661u64,
+                "path": "crates/cli/src/lib.rs",
+                "change": "edited",
+                "revision": 3
+            }]
+        });
+        let items = parse_wait_json(raw.to_string().as_bytes()).unwrap();
+        let label = AgentLabel::parse("claude").unwrap();
+        let out = render_wait_items(&items, &label, Role::Master);
+        assert!(
+            out.contains("  - draft #12: edited crates/cli/src/lib.rs (comment 4088032661) r3"),
+            "the hint says what moved rather than `? @ ?`: {out}"
+        );
+        assert!(
+            out.contains("read the draft before your next round"),
+            "and what to do with it: {out}"
+        );
+        assert!(
+            out.contains("do not reply to it"),
+            "awareness must not read as a request to answer the operator: {out}"
+        );
+        assert!(
+            !out.contains("fires until"),
+            "it is spent once reported, so it must not claim a condition that ends it: {out}"
+        );
     }
 
     #[test]

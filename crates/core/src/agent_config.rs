@@ -196,21 +196,24 @@ impl GithubEventKind {
         }
     }
 
+    /// Every kind. The one list: `from_wire` reads it, and a caller
+    /// selecting a subset (`is_pr_scoped`, `is_ci`) filters it, so a
+    /// kind added to the enum cannot be missing from one of them.
+    pub const ALL: [Self; 10] = [
+        Self::PrOpened,
+        Self::PrUpdated,
+        Self::PrMerged,
+        Self::PrComment,
+        Self::IssueOpened,
+        Self::IssueClosed,
+        Self::IssueComment,
+        Self::BranchPush,
+        Self::CiPassed,
+        Self::CiFailed,
+    ];
+
     pub fn from_wire(s: &str) -> Option<Self> {
-        [
-            Self::PrOpened,
-            Self::PrUpdated,
-            Self::PrMerged,
-            Self::PrComment,
-            Self::IssueOpened,
-            Self::IssueClosed,
-            Self::IssueComment,
-            Self::BranchPush,
-            Self::CiPassed,
-            Self::CiFailed,
-        ]
-        .into_iter()
-        .find(|k| k.wire() == s)
+        Self::ALL.into_iter().find(|k| k.wire() == s)
     }
 }
 

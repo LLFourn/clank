@@ -237,6 +237,42 @@ pub enum WaitItem {
         /// Last ≤1 KiB of interleaved stdout+stderr.
         output_tail: String,
     },
+    /// The open review's DRAFT changed under master
+    /// (`the-review-session-watches-its-pr`). Master only, produced by
+    /// the CLI's draft observer, never by `work_for`.
+    ///
+    /// AWARENESS, not work. Master re-reads the draft before its next
+    /// round and answers nothing — replying to the operator's edit is
+    /// the one thing this must not cause. Nothing delivers a draft
+    /// edit, so these are differences an observer noticed between two
+    /// complete reads, which is why they carry the observer's own
+    /// `revision` rather than a github identity: a comment edited
+    /// twice is two changes, and github offers no counter that says so.
+    ///
+    /// Unfiltered on purpose. One shared `gh` account and no write
+    /// path clank owns means no provenance exists to suppress the
+    /// agents' own changes with, and every stand-in for it erases the
+    /// operator's edits too (codex ce892ea).
+    DraftChanged {
+        pr: u32,
+        /// Which RUN of that PR's review this belongs to. Revisions
+        /// restart at 1 for each run, so `(pr, revision)` is ambiguous
+        /// across a review that was aborted and started again — and an
+        /// old wait acknowledging a new run's change would delete a
+        /// change nobody has seen (codex 96dbec8).
+        instance: u64,
+        /// The draft comment that changed, and the file it sits on —
+        /// both absent when the change is the whole pending review
+        /// going away.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        comment: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+        change: crate::pr_review::DraftChange,
+        /// The observer's count of changes it has reported for this
+        /// review. Monotonic across rounds.
+        revision: u64,
+    },
     /// Observer-mode events (`wait --for`, wait-for-observer-mode):
     /// produced only by the CLI observer path, never by `work_for`.
     /// Distinct kinds so a consumer can't mistake an observation of a

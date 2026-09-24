@@ -15,7 +15,7 @@ use clank_core::agent_config::GithubEventKind;
 use clank_core::wait::WaitItem;
 
 use super::feed::Classified;
-use super::session::{GithubSession, HttpSend};
+use super::session::{GithubSession, HttpSend, PER_PAGE, read_every_page};
 
 /// What one check says about a commit.
 ///
@@ -173,14 +173,6 @@ pub(crate) struct PrHead {
     pub(crate) head: String,
 }
 
-/// Items per page. GitHub's maximum, so the common repo is one page.
-const PER_PAGE: usize = 100;
-
-/// Pages a collection may span before the reader refuses it. At 100
-/// an item that is 2000 checks or open PRs, past which the assumption
-/// is wrong somewhere and guessing is worse than saying so.
-const MAX_PAGES: u32 = 20;
-
 /// The open PRs of `repo` with their head commits. This is also what
 /// bounds the work: only open PRs are read for checks.
 ///
@@ -236,59 +228,6 @@ pub(crate) async fn checks_for<S: HttpSend>(
     let mut reports = reports_from_check_runs(&runs);
     reports.extend(reports_from_commit_statuses(&statuses));
     Ok(reports)
-}
-
-/// Every element of a paginated collection, or an error — never a
-/// prefix of one.
-///
-/// Completeness is the contract the reduction is built on: it calls a
-/// PR green when it has seen no failure, so a page left unread is a
-/// green light nobody earned. A later page that fails fails the whole
-/// read, a body whose collection is not where it should be is an
-/// error rather than an empty list — silence and "nothing failed"
-/// must not be the same answer — and a collection past [`MAX_PAGES`]
-/// is refused rather than truncated (codex 3707a88).
-///
-/// `field` names the array inside the body, or `None` when the body
-/// IS the array.
-async fn read_every_page<S: HttpSend>(
-    session: &GithubSession<S>,
-    url_for_page: impl Fn(u32) -> String,
-    field: Option<&str>,
-) -> anyhow::Result<Vec<serde_json::Value>> {
-    let mut all: Vec<serde_json::Value> = Vec::new();
-    for page in 1..=MAX_PAGES {
-        let url = url_for_page(page);
-        let resp = session.get(&url, None).await?;
-        if !(200..300).contains(&resp.status) {
-            anyhow::bail!(
-                "github {url}: {}: {}",
-                resp.status,
-                resp.body.chars().take(200).collect::<String>()
-            );
-        }
-        let body: serde_json::Value = serde_json::from_str(&resp.body)
-            .map_err(|e| anyhow::anyhow!("github {url}: body is not json: {e}"))?;
-        let items = match field {
-            None => body.as_array(),
-            Some(name) => body.get(name).and_then(|v| v.as_array()),
-        }
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "github {url}: no `{}` array in the response",
-                field.unwrap_or("top-level")
-            )
-        })?;
-        let len = items.len();
-        all.extend(items.iter().cloned());
-        if len < PER_PAGE {
-            return Ok(all);
-        }
-    }
-    anyhow::bail!(
-        "github {}: more than {MAX_PAGES} pages — refusing to report a partial collection",
-        url_for_page(1),
-    )
 }
 
 /// Pure half of [`open_prs`]. A PR with no number or no head sha is
@@ -593,18 +532,18 @@ pub(super) mod tests {
     use std::sync::Mutex;
 
     use crate::cli::github::ci;
-    use crate::cli::github::session::MiniResponse;
+    use crate::cli::github::session::{MAX_COLLECTION_PAGES, MiniResponse};
 
     /// Scripted HTTP that answers by URL and records what was asked,
     /// so the reader's own urls are under test rather than assumed.
     #[derive(Clone)]
-    struct Routes {
+    pub(in crate::cli::github) struct Routes {
         bodies: std::sync::Arc<Vec<(&'static str, String)>>,
         asked: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
         status: u16,
     }
     impl Routes {
-        fn new(bodies: Vec<(&'static str, serde_json::Value)>) -> Self {
+        pub(in crate::cli::github) fn new(bodies: Vec<(&'static str, serde_json::Value)>) -> Self {
             Self {
                 bodies: std::sync::Arc::new(
                     bodies
@@ -616,14 +555,14 @@ pub(super) mod tests {
                 status: 200,
             }
         }
-        fn failing(status: u16) -> Self {
+        pub(in crate::cli::github) fn failing(status: u16) -> Self {
             Self {
                 bodies: Default::default(),
                 asked: Default::default(),
                 status,
             }
         }
-        fn asked(&self) -> Vec<String> {
+        pub(in crate::cli::github) fn asked(&self) -> Vec<String> {
             self.asked.lock().unwrap().clone()
         }
     }
@@ -1027,7 +966,7 @@ pub(super) mod tests {
         assert!(err.contains("partial"), "{err}");
         assert_eq!(
             calls.load(std::sync::atomic::Ordering::SeqCst),
-            MAX_PAGES as usize,
+            MAX_COLLECTION_PAGES as usize,
             "it reads to the cap, then refuses",
         );
     }

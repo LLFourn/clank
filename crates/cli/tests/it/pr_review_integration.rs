@@ -8,7 +8,9 @@ use common::TestEnv;
 use std::path::Path;
 use std::process::Command;
 
-use clank::cli::pr_review::{abort_with, note_with, propose_with, start_with, status_with};
+use clank::cli::pr_review::{
+    abort_with, draft_watch_belongs_to, note_with, propose_with, start_with, status_with,
+};
 use clank_core::ids::AgentLabel;
 use clank_core::pr_review::ReviewerVerdict;
 use clank_core::vocab::Verdict;
@@ -193,6 +195,105 @@ fn status_reports_pending_then_converged() {
     note_with(repo, &label("ruthless"), Some(123), Verdict::Finished, "ok").unwrap();
     let s = status_with(repo, Some(env.home()), Some(123)).unwrap();
     assert!(s.contains("converged"), "{s}");
+}
+
+#[test]
+fn the_observers_memory_dies_with_the_review_that_owned_it() {
+    let (env, _) = env_with_pr(123);
+    let repo = env.repo();
+    start_with(repo, "o/r", 123, None, None).unwrap();
+
+    // Anchored by `start`; what is under test is WHERE it lives.
+    let horizon = draft_horizon(repo, 123);
+    let anchored = std::fs::read_to_string(&horizon).unwrap();
+
+    propose_with(repo, Some(env.home()), &label("claude"), Some(123)).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&horizon).unwrap(),
+        anchored,
+        "a round boundary is not authorship: proposing must not touch what the watch has seen"
+    );
+
+    abort_with(repo, Some(env.home()), &label("claude"), Some(123)).unwrap();
+    assert!(!horizon.exists());
+}
+
+/// The review's own draft horizon file. Named for the review RUN, so
+/// two runs of one PR cannot share it.
+fn draft_horizon(repo: &std::path::Path, pr: u32) -> std::path::PathBuf {
+    let dir = repo.join(".clank/pr-reviews").join(pr.to_string());
+    let mut found: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("draft-") && n.ends_with(".json"))
+        })
+        .collect();
+    assert_eq!(found.len(), 1, "exactly one run's horizon in {dir:?}");
+    found.pop().unwrap()
+}
+
+#[test]
+fn the_draft_watch_is_masters_alone() {
+    let (env, _) = env_with_pr(123);
+    let repo = env.repo();
+    start_with(repo, "o/r", 123, None, None).unwrap();
+
+    assert!(draft_watch_belongs_to(repo, &label("claude")));
+    for not_master in ["codex", "ruthless"] {
+        assert!(
+            !draft_watch_belongs_to(repo, &label(not_master)),
+            "{not_master} is a reviewer; the draft watch would write over master's horizon"
+        );
+    }
+    assert!(
+        !draft_watch_belongs_to(repo, &label("nobody")),
+        "an agent the roster does not know cannot prove it owns the review"
+    );
+}
+
+#[test]
+fn starting_a_review_anchors_the_draft_baseline() {
+    // Round 0 always hands master a PrMaster item, so the first wait
+    // that PARKS comes after master has drafted. If the baseline were
+    // taken then, an operator edit made in between would be swallowed
+    // (codex 29431d9), so it is anchored at start instead.
+    let (env, _) = env_with_pr(123);
+    let repo = env.repo();
+    start_with(repo, "o/r", 123, None, None).unwrap();
+
+    let horizon = std::fs::read_to_string(draft_horizon(repo, 123)).expect("anchored");
+    assert!(
+        horizon.contains("absent"),
+        "a review begins from NO draft, not from never having looked: {horizon}"
+    );
+}
+
+#[test]
+fn an_unusable_horizon_cannot_half_advance_a_round() {
+    // It used to be able to: propose committed the round, then wrote
+    // the horizon, and a failed write returned Err with the round
+    // already advanced and verdicts already stale (codex ce892ea).
+    // propose writes nothing now, so an unwritable draft.json is not
+    // propose's problem at all.
+    let (env, _) = env_with_pr(123);
+    let repo = env.repo();
+    start_with(repo, "o/r", 123, None, None).unwrap();
+    let horizon = draft_horizon(repo, 123);
+    std::fs::remove_file(&horizon).unwrap();
+    std::fs::create_dir(&horizon).unwrap();
+
+    assert_eq!(
+        propose_with(repo, Some(env.home()), &label("claude"), Some(123)).unwrap(),
+        1
+    );
+    assert_eq!(
+        propose_with(repo, Some(env.home()), &label("claude"), Some(123)).unwrap(),
+        2,
+        "each propose advances the round exactly once"
+    );
 }
 
 #[test]

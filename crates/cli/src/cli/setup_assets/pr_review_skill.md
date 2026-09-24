@@ -23,6 +23,32 @@ review GitHub allows per user per PR.
   or does not. Whether a review goes out as APPROVE or REQUEST_CHANGES
   is not yours to decide, and a published review cannot be recalled.
 
+## `draft` wakes — awareness, and nothing else
+
+While master is parked with a review open, clank re-reads the pending
+review and wakes master with a `draft` item for each change: a comment
+added, edited or removed, or `gone` for the whole review (discarded,
+or submitted by the human).
+
+**Do not answer it.** Re-read the draft before your next round so you
+are integrating against what is actually there, and carry on. Replying
+to the operator's edit, or "fixing" it, is the one thing these wakes
+must not cause — the human editing the draft is the intended workflow,
+not a request for discussion. There is nothing to ack.
+
+You will see your OWN writes this way too, usually once after a round
+of drafting. That is deliberate: all agents share one `gh` identity
+and clank does not perform the writes, so there is no way to tell your
+edit from the human's. A wake you can ignore is the cheaper mistake.
+
+Nothing delivers a draft edit — no webhook, no events feed — so these
+come from re-reading, which means you learn that something changed
+between two reads, not every intermediate edit.
+
+This covers the PENDING review only. Published activity on the PR —
+the human's own comments, pushes, CI — does not reach you this way
+yet.
+
 The verdict files under `.clank/pr-reviews/<pr>/reviews/` are the
 AUTHORITATIVE convergence signal — the GitHub comments are the
 substance, the files are the gate. Master vs reviewer is
