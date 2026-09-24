@@ -30,6 +30,18 @@ use feed::{Feed, SubscribeEvent, TableChange};
 
 const PAGE: &str = include_str!("page.html");
 
+/// The credential decisions both pages make, inlined into each at
+/// `DOOR_ANCHOR`. One file so there is one source of truth, inlined
+/// rather than served so the sign-in page needs no second request
+/// before it can decide whether to sign itself in — and so the
+/// sign-in page's copy is trivially on the unauthenticated side of
+/// the door rather than a route that has to be kept there.
+const DOOR_JS: &str = include_str!("door.js");
+
+/// Where each page takes the decisions. A page that stops containing
+/// it stops getting them, which `rendered_pages` is what notices.
+const DOOR_ANCHOR: &str = "/*__CLANK_DOOR__*/";
+
 /// The expression `page_for` replaces to name the session. The page
 /// is not a template — this exact substring is the whole mechanism,
 /// so a reflow that splits it serves every session a page called
@@ -39,6 +51,7 @@ const SESSION_ANCHOR: &str = "window.CLANK_SESSION || 'clank'";
 /// The page with this session's name compiled into it.
 fn page_for(session: &str) -> String {
     PAGE.replace(SESSION_ANCHOR, &serde_json::json!(session).to_string())
+        .replace(DOOR_ANCHOR, DOOR_JS)
 }
 
 /// Where each page's own script says which policy admits it. Replaced
@@ -84,6 +97,11 @@ fn guarded_page(html: &str) -> Resp {
     resp
 }
 const LOGIN: &str = include_str!("login.html");
+
+/// The sign-in page with the door decisions compiled into it.
+fn login_page() -> String {
+    LOGIN.replace(DOOR_ANCHOR, DOOR_JS)
+}
 /// What the pages load, all of it from this binary: the sign-in
 /// page's QR decoder, the terminal the agent panes are drawn with, and
 /// the face their names are set in. Vendored, unmodified, each with
@@ -1772,7 +1790,7 @@ fn host_of(req: &hyper::Request<hyper::body::Incoming>) -> Option<String> {
 /// came with.
 fn login(req: &hyper::Request<hyper::body::Incoming>, peer: IpAddr, ctx: &Ctx) -> Resp {
     let Some(token) = door::query_token(req.uri().query()) else {
-        return guarded_page(LOGIN);
+        return guarded_page(&login_page());
     };
     if !ctx.door.attempt_allowed(peer) {
         return text(429, "too many attempts — wait a minute", "text/plain");
@@ -3890,6 +3908,28 @@ mod tests {
     }
     use crate::cli::js_guard::{Kind, parse_as, script_tags};
 
+    /// The pages AS SERVED, with the door module compiled in.
+    ///
+    /// The raw constants carry `/*__CLANK_DOOR__*/` and nothing else:
+    /// checking those reads a comment where the decisions will be, so
+    /// a module that does not parse, or that collides with the page it
+    /// lands in, would ship unread. Same rule as the generated site's
+    /// guard — read what the renderer COMPOSES.
+    fn rendered_pages() -> Vec<(&'static str, String)> {
+        let pages = vec![("page.html", page_for("s")), ("login.html", login_page())];
+        for (name, html) in &pages {
+            assert!(
+                !html.contains(DOOR_ANCHOR),
+                "{name}: the door anchor survived rendering, so the page ships without the decisions"
+            );
+            assert!(
+                html.contains("function signInVerdict"),
+                "{name}: the door module did not land in this page"
+            );
+        }
+        pages
+    }
+
     /// The paths the pages load, and the vendored file each is served
     /// from. A page may load nothing else: a script from somebody
     /// else's host runs on the origin that keeps the credential, and
@@ -3919,8 +3959,8 @@ mod tests {
             ("vendor/jsQR.js", JSQR.to_string(), Kind::Classic),
             ("vendor/xterm.js", XTERM_JS.to_string(), Kind::Classic),
         ];
-        for (page, html) in [("page.html", PAGE), ("login.html", LOGIN)] {
-            for tag in script_tags(html) {
+        for (page, html) in rendered_pages() {
+            for tag in script_tags(&html) {
                 let (attrs, source) = (tag.attrs, tag.body);
                 match () {
                     // A path of this binary's own: it must be an
@@ -4046,11 +4086,19 @@ mod tests {
             markup.contains("id=\"qwhy\""),
             "the refusal region outlives the queue it is about"
         );
-        // Both halves of forgetting, in the page that does it.
-        let forget = PAGE.split("'/forget'").nth(1).unwrap_or_default();
+        // Both halves of forgetting, in the page that does it: the
+        // door is asked, and the `discard` that answer can produce is
+        // wired to the store. WHEN it is produced is the state
+        // machine's business and is driven in `door_js_tests`; this
+        // asserts only that the page can carry it out.
+        assert!(PAGE.contains("'/forget'"), "the page asks the door");
+        let discard = PAGE
+            .split("case 'discard':")
+            .nth(1)
+            .expect("the page performs a discard");
         assert!(
-            forget.contains("keep.clear()"),
-            "the store is cleared with the session: {forget:.200}"
+            discard.starts_with(" keep.clear();"),
+            "the store is cleared with the session: {discard:.80}"
         );
     }
 
@@ -4224,7 +4272,9 @@ mod tests {
     /// meet this test (the-credential-is-not-a-cdns-to-take).
     #[test]
     fn the_pages_reach_out_to_nobody() {
-        for (page, html) in [("page.html", PAGE), ("login.html", LOGIN)] {
+        // As served: a host named by the door module would reach the
+        // browser just as surely as one named in the page.
+        for (page, html) in rendered_pages() {
             for (at, _) in html.match_indices("//") {
                 // Only in a URL: `//` inside the scripts is a comment.
                 let before = &html[..at];
@@ -5054,5 +5104,320 @@ mod tests {
             200
         );
         let _ = cancel.send(true);
+    }
+}
+
+/// The credential's lifecycle, DRIVEN.
+///
+/// Every bug this module exists to stop was about order, so every test
+/// here is a SEQUENCE: events dispatched one after another, each
+/// reading the state the last one left. Supplying `tried` or
+/// `sealed` by hand would answer for a state the page can reach
+/// only by a path nothing checks, which is the gap codex found in the
+/// predicate-shaped version of these tests (fd3ae49).
+#[cfg(test)]
+mod door_js_tests {
+    use super::{DOOR_JS, login_page, page_for};
+
+    /// Runs the SHIPPED module, threads `events` through `doorStep`
+    /// from a starting environment, and returns the JSON of every
+    /// step's effects plus the final state.
+    ///
+    /// `DOOR_JS` is the same constant both pages are rendered with, so
+    /// a decision that changes here changes there; a harness carrying
+    /// its own copy of the logic would pass while the pages shipped
+    /// something else.
+    fn drive(env: &str, events: &[&str]) -> serde_json::Value {
+        let script = format!(
+            r#"{DOOR_JS}
+            (() => {{
+              let state = doorStart({env});
+              const steps = [];
+              for (const ev of [{}]) {{
+                const r = doorStep(state, ev);
+                state = r.state;
+                steps.push(r.effects);
+              }}
+              return JSON.stringify({{ steps, state }});
+            }})()"#,
+            events.join(", ")
+        );
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        let raw: String = ctx.with(|ctx| match ctx.eval::<String, _>(script) {
+            Ok(v) => v,
+            Err(e) => {
+                let detail = ctx.catch();
+                panic!("the door module did not run: {e} {detail:?}");
+            }
+        });
+        serde_json::from_str(&raw).unwrap()
+    }
+
+    /// The effect kinds one step produced, in order.
+    fn dos(step: &serde_json::Value) -> Vec<String> {
+        step.as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["do"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// A sign-in that SUCCEEDS navigates and spends the guard — and
+    /// the guard then stops the next load asking again, which is the
+    /// loop between the two pages this exists to break.
+    #[test]
+    fn a_sign_in_that_succeeds_navigates_and_then_does_not_repeat() {
+        let r = drive(
+            "{stored:'t', tried:false}",
+            &[
+                "{t:'load'}",
+                "{t:'signInReply', reply:{ok:true, status:204, body:null}}",
+                "{t:'load'}",
+            ],
+        );
+        assert_eq!(dos(&r["steps"][0]), ["signIn"], "a stored token signs in");
+        assert_eq!(
+            dos(&r["steps"][1]),
+            ["guard", "navigate"],
+            "success spends the guard and goes"
+        );
+        assert_eq!(r["steps"][1][0]["set"], true);
+        assert_eq!(r["steps"][1][1]["to"], "/");
+        assert!(
+            dos(&r["steps"][2]).is_empty(),
+            "the spent guard stops the next load: this is the loop"
+        );
+    }
+
+    /// A recoverable failure leaves the guard alone, so the NEXT load
+    /// tries again. Spending it here would strand a browser that only
+    /// hit a bad minute at the form.
+    #[test]
+    fn a_recoverable_failure_is_retried_on_the_next_load() {
+        for reply in [
+            "{ok:false, status:429, body:null}",
+            "{ok:false, status:500, body:null}",
+            "{ok:false, status:403, body:null}",
+            "{ok:false, status:403, body:{refused:'origin'}}",
+            "null",
+        ] {
+            let r = drive(
+                "{stored:'t', tried:false}",
+                &[
+                    "{t:'load'}",
+                    &format!("{{t:'signInReply', reply:{reply}}}"),
+                    "{t:'load'}",
+                ],
+            );
+            let said = dos(&r["steps"][1]);
+            assert_eq!(said, ["say"], "{reply}: says so and keeps everything");
+            assert_eq!(
+                r["state"]["stored"], "t",
+                "{reply}: the credential survives a bad minute"
+            );
+            assert_eq!(
+                dos(&r["steps"][2]),
+                ["signIn"],
+                "{reply}: the next load must try again"
+            );
+        }
+    }
+
+    /// Only a refusal that NAMES the credential discards it, and a
+    /// discarded credential does not sign in again.
+    #[test]
+    fn a_refusal_of_the_credential_discards_it_and_stops_trying() {
+        let r = drive(
+            "{stored:'t', tried:false}",
+            &[
+                "{t:'load'}",
+                "{t:'signInReply', reply:{ok:false, status:403, body:{refused:'token'}}}",
+                "{t:'load'}",
+            ],
+        );
+        assert_eq!(dos(&r["steps"][1]), ["discard", "say"]);
+        assert_eq!(r["steps"][1][1]["why"], "dead");
+        assert!(r["state"]["stored"].is_null());
+        assert!(
+            dos(&r["steps"][2]).is_empty(),
+            "nothing is stored, so there is nothing to sign in with"
+        );
+    }
+
+    /// Arriving signed in releases the guard, so a cookie lost LATER
+    /// is signed back in rather than left at the form.
+    #[test]
+    fn arriving_signed_in_releases_the_guard_for_a_later_loss() {
+        let r = drive(
+            "{stored:'t', tried:true}",
+            &["{t:'load'}", "{t:'signedIn'}", "{t:'load'}"],
+        );
+        assert!(
+            dos(&r["steps"][0]).is_empty(),
+            "the guard was spent, so this load does not ask"
+        );
+        assert_eq!(dos(&r["steps"][1]), ["guard"]);
+        assert_eq!(r["steps"][1][0]["set"], false);
+        assert_eq!(
+            dos(&r["steps"][2]),
+            ["signIn"],
+            "released: a cookie lost later signs back in"
+        );
+    }
+
+    /// A sign-out the door REFUSED keeps everything — and the button
+    /// works again afterwards, which is what `retry` has to mean.
+    #[test]
+    fn a_forget_the_door_refused_keeps_everything_and_can_be_repeated() {
+        let r = drive(
+            "{stored:'t', tried:false}",
+            &[
+                "{t:'forget'}",
+                "{t:'forgetReply', ok:false}",
+                "{t:'forget'}",
+                "{t:'forgetReply', ok:true}",
+            ],
+        );
+        assert_eq!(dos(&r["steps"][0]), ["forget"]);
+        assert_eq!(dos(&r["steps"][1]), ["say"], "a failure discards nothing");
+        assert_eq!(r["steps"][1][0]["why"], "forgetFailed");
+        assert_eq!(
+            dos(&r["steps"][2]),
+            ["forget"],
+            "and the button is live again"
+        );
+        assert_eq!(dos(&r["steps"][3]), ["discard", "navigate"]);
+        assert_eq!(r["steps"][3][1]["to"], "/login");
+        assert!(r["state"]["stored"].is_null());
+    }
+
+    /// A press while a sign-out is in flight is not a second sign-out.
+    #[test]
+    fn a_second_press_during_a_forget_does_nothing() {
+        let r = drive("{stored:'t'}", &["{t:'forget'}", "{t:'forget'}"]);
+        assert_eq!(dos(&r["steps"][0]), ["forget"]);
+        assert!(dos(&r["steps"][1]).is_empty());
+    }
+
+    /// THE RACE: the provisioning fetch was in flight when the forget
+    /// began, so its reply lands after. It must write nothing.
+    ///
+    /// Reached by dispatching the forget BETWEEN the two, rather than
+    /// by handing the step a `sealed` flag — a page that captured
+    /// the flag early and decided on it late is the bug, and this
+    /// ordering is the only thing that can tell the two apart.
+    #[test]
+    fn a_provision_that_lands_after_a_forget_begins_writes_nothing() {
+        let r = drive(
+            "{stored:null}",
+            &[
+                "{t:'forget'}",
+                "{t:'provisionReply', token:'late'}",
+                "{t:'forgetReply', ok:true}",
+            ],
+        );
+        assert!(
+            dos(&r["steps"][1]).is_empty(),
+            "the forget was racing this arrival and won"
+        );
+        assert!(
+            r["state"]["stored"].is_null(),
+            "nothing may be kept across a sign-out"
+        );
+    }
+
+    /// THE RACE, PAST THE SIGN-OUT: the seal outlives a forget that
+    /// SUCCEEDED, because navigating does not stop a promise that was
+    /// already in flight from resolving first.
+    ///
+    /// Every other sequence dispatches the late reply before the
+    /// door answers, so this is the one transition that pins the seal
+    /// as terminal. Without it, adding `s.sealed = false` to the ok
+    /// branch — which reads as ordinary tidying-up — passes every
+    /// other test in this module and puts the credential back after
+    /// the user signed out (ruthless a5504e9).
+    #[test]
+    fn a_provision_that_lands_after_a_completed_sign_out_writes_nothing() {
+        let r = drive(
+            "{stored:'t'}",
+            &[
+                "{t:'forget'}",
+                "{t:'forgetReply', ok:true}",
+                "{t:'provisionReply', token:'late'}",
+            ],
+        );
+        assert_eq!(dos(&r["steps"][1]), ["discard", "navigate"]);
+        assert!(
+            dos(&r["steps"][2]).is_empty(),
+            "the sign-out is done and the seal holds: nothing may be written back"
+        );
+        assert!(
+            r["state"]["stored"].is_null(),
+            "the credential must not survive a completed sign-out"
+        );
+        assert_eq!(
+            r["state"]["sealed"], true,
+            "the seal is terminal on success -- clearing it re-arms the race"
+        );
+    }
+
+    /// The same reply with no forget in flight is kept: the race is
+    /// what stops it, not the reply.
+    #[test]
+    fn a_provision_that_lands_before_any_forget_is_kept() {
+        let r = drive("{stored:null}", &["{t:'provisionReply', token:'fresh'}"]);
+        assert_eq!(dos(&r["steps"][0]), ["store"]);
+        assert_eq!(r["steps"][0][0]["token"], "fresh");
+        assert_eq!(r["state"]["stored"], "fresh");
+    }
+
+    /// The module the tests run is the module the pages ship. Without
+    /// this, every sequence above could hold of a file no page loads.
+    #[test]
+    fn both_pages_ship_the_module_these_tests_run() {
+        let body = DOOR_JS.trim();
+        for (name, page) in [("page.html", page_for("s")), ("login.html", login_page())] {
+            assert!(
+                page.contains(body),
+                "{name} must carry the module verbatim, or these verdicts are about nothing"
+            );
+        }
+    }
+
+    /// And each page DRIVES it.
+    ///
+    /// Carrying the module proves nothing about using it: a page that
+    /// decides for itself passes the test above while every sequence
+    /// here describes code nothing runs. So the module body is cut out
+    /// and the wiring that remains must dispatch the events that page
+    /// is responsible for.
+    #[test]
+    fn each_page_dispatches_the_events_it_is_responsible_for() {
+        let body = DOOR_JS.trim();
+        for (name, page, wanted) in [
+            ("login.html", login_page(), &["load", "signInReply"][..]),
+            (
+                "page.html",
+                page_for("s"),
+                &["signedIn", "forget", "forgetReply", "provisionReply"][..],
+            ),
+        ] {
+            let wiring = page.replace(body, "");
+            assert!(
+                !wiring.contains("function doorStep"),
+                "{name}: the module was not cut out, so this proves nothing"
+            );
+            assert!(
+                wiring.contains("doorStep(door, event)"),
+                "{name} must step the machine it ships"
+            );
+            for ev in wanted {
+                assert!(
+                    wiring.contains(&format!("t: '{ev}'")),
+                    "{name} never dispatches `{ev}`"
+                );
+            }
+        }
     }
 }

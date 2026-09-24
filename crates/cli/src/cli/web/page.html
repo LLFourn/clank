@@ -334,7 +334,38 @@
   // write the credential back, or navigate before the door has
   // answered, asks first: a fetch in flight when the button is
   // pressed lands AFTER it, and the whole point was to keep nothing.
-  let forgetting = false;
+  /*__CLANK_DOOR__*/
+  const SAID = { forgetFailed: 'could not sign out — try again' };
+  // The page holds the state and performs the effects; `doorStep` owns
+  // what follows what -- including whether a provisioning reply that
+  // lands after a forget may still be written.
+  let door = doorStart({ stored: keep.get(), tried: false });
+  const perform = (fx) => {
+    switch (fx.do) {
+      case 'store': keep.set(fx.token); return;
+      case 'discard': keep.clear(); return;
+      case 'navigate': location.replace(fx.to); return;
+      case 'guard':
+        try {
+          if (fx.set) sessionStorage.setItem('clank.tried', '1');
+          else sessionStorage.removeItem('clank.tried');
+        } catch (err) {}
+        return;
+      case 'forget': forgetAtDoor(); return;
+      case 'say':
+        // Keyed by reason, not hardcoded: the machine is shared with
+        // the sign-in page, and a second reason arriving here would
+        // otherwise show the words for the first one.
+        forgetEl.disabled = false;
+        forgetEl.textContent = SAID[fx.why] || 'something went wrong — try again';
+        return;
+    }
+  };
+  function dispatch(event) {
+    const next = doorStep(door, event);
+    door = next.state;
+    next.effects.forEach(perform);
+  }
   // Asked on every arrival, not only an empty store: a token that was
   // rotated while this browser was away leaves a dead string here, and
   // a fresh pairing — a new link, a new paste — would not replace it.
@@ -345,21 +376,21 @@
   // declarations of one name is a SyntaxError, and a SyntaxError in an
   // inline script is the whole page (a-page-that-does-not-parse-is-not-a-page).
   async function provision() {
-    if (forgetting) return;
     try {
       const r = await fetch('/token');
       if (!r.ok) return;
       const { token } = await r.json();
-      // Asked again after the await: this is the arrival the forget
-      // was racing.
-      if (token && !forgetting) keep.set(token);
+      // Dispatched, not decided: the forget this was racing may have
+      // begun during the await, and `doorStep` reads the state as it
+      // is now rather than as this function last saw it.
+      dispatch({ t: 'provisionReply', token });
     } catch (err) {}
   }
   provision();
   // Arriving here IS the confirmation that the cookie stuck, so the
   // sign-in page's one-shot guard is spent: a cookie lost later is
   // signed back in rather than left at the form (login.html).
-  try { sessionStorage.removeItem('clank.tried'); } catch (err) {}
+  dispatch({ t: 'signedIn' });
   const viewsEl = $('views'), emptyEl = $('empty');
   const whoEl = $('who'), whoName = $('whoname'), autoTag = $('autotag'), doingEl = $('doing');
   const projectEl = $('project');
@@ -372,25 +403,14 @@
   // next load would ask for the token again and be remembered against
   // the user's wishes.
   const forgetEl = $('forget');
-  forgetEl.addEventListener('click', async () => {
-    if (forgetting) return;
-    forgetting = true;
+  async function forgetAtDoor() {
     forgetEl.disabled = true;
     forgetEl.textContent = 'forgetting…';
     let ok = false;
     try { ok = (await fetch('/forget', { method: 'POST' })).ok; } catch (err) {}
-    // A failed sign-out is not a sign-out: the cookie is still live
-    // and would fetch the credential again, so say so rather than
-    // clear the store and navigate as if it worked.
-    if (!ok) {
-      forgetting = false;
-      forgetEl.disabled = false;
-      forgetEl.textContent = 'could not sign out — try again';
-      return;
-    }
-    keep.clear();
-    location.replace('/login');
-  });
+    dispatch({ t: 'forgetReply', ok });
+  }
+  forgetEl.addEventListener('click', () => dispatch({ t: 'forget' }));
 
   // The TUI's coarse ladder: seconds under a minute read `now`.
   const coarse = (secs) => { const s = Math.max(0, secs); if (s < 60) return 'now'; if (s < 3600) return Math.floor(s / 60) + 'm'; if (s < 86400) return Math.floor(s / 3600) + 'h'; return Math.floor(s / 86400) + 'd'; };
@@ -1087,16 +1107,16 @@
       // Asked again after the probe, because a probe already in
       // flight when the button was pressed answers 401 either way.
       try {
-        if (forgetting) return;
+        if (door.sealed) return;
         const gone = (await fetch('/whoami')).status === 401;
-        if (forgetting) return;
+        if (door.sealed) return;
         if (gone) {
           closedForGood = true;
           location.replace('/login');
           return;
         }
       } catch (err) {}
-      if (forgetting) return;
+      if (door.sealed) return;
       retry = Math.min(retry + 1, 6);
       setTimeout(connect, Math.min(250 * 2 ** retry, 10000));
     };

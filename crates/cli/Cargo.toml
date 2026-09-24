@@ -136,6 +136,12 @@ oxc_allocator = "0.151"
 oxc_parser = "0.151"
 oxc_span = "0.151"
 oxc_semantic = "0.151"
+# test-only: a JS engine, so the decisions the pages make about the
+# credential are RUN by `cargo test` rather than read by a reviewer.
+# Chosen on cost against boa_engine: 3s vs 16s clean build, 12 vs 319
+# dependency-tree lines. No runtime beyond Rust and a C compiler, which
+# the toolchain already needs (the-pages-logic-can-be-tested).
+rquickjs = "0.14"
 filetime = "0.2"
 # test-only: paused-time (`start_paused`) so the github poll loop's
 # inter-tick sleeps resolve instantly in tests (extra-wait-events).

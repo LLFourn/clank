@@ -51,14 +51,15 @@
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ token: value }),
   });
-  // Whether a refusal was of the CREDENTIAL. Only that means what is
-  // stored has stopped being a way in; a rate limit or a store
-  // failure is this minute's problem, and throwing the token away
-  // over one turns a wait into a paste.
-  async function refusedCredential(r) {
-    if (r.status !== 403) return false;
-    try { return (await r.clone().json()).refused === 'token'; } catch (err) { return false; }
-  }
+  /*__CLANK_DOOR__*/
+  // The reply as a verdict takes: status and parsed body, or null for
+  // a body that was not JSON. The awaiting stays here; the decision
+  // does not.
+  const replyOf = async (r) => ({
+    ok: r.ok,
+    status: r.status,
+    body: await r.clone().json().catch(() => null),
+  });
   // The remembered credential signs this browser back in, so a
   // returning phone is not a form.
   //
@@ -68,32 +69,50 @@
   // and that one. A refusal or a failure leaves the guard alone, so
   // the next load tries again, and arriving signed in clears it
   // (page.html), so a cookie lost later is signed back in.
-  (async () => {
-    let tried = false;
-    try { tried = sessionStorage.getItem(TRIED) === '1'; } catch (err) {}
-    const stored = keep.get();
-    if (!stored || tried) return;
-    document.querySelector('main').classList.add('trying');
-    try {
-      const r = await post(stored);
-      if (r.ok) {
-        try { sessionStorage.setItem(TRIED, '1'); } catch (err) {}
-        location.replace('/');
+  const SAID = {
+    dead: 'This device was signed out — the token changed. Paste or scan the new one.',
+    refused: 'Could not sign in just now. Reload to try again, or paste the token.',
+    unreachable: 'Could not reach clank. Reload to try again, or paste the token.',
+  };
+  // The page holds the state and performs the effects; every decision
+  // about what follows what belongs to `doorStep`.
+  let tried = false;
+  try { tried = sessionStorage.getItem(TRIED) === '1'; } catch (err) {}
+  let door = doorStart({ stored: keep.get(), tried });
+  const perform = async (fx) => {
+    switch (fx.do) {
+      case 'signIn':
+        document.querySelector('main').classList.add('trying');
+        try {
+          dispatch({ t: 'signInReply', reply: await replyOf(await post(fx.token)) });
+        } catch (err) {
+          dispatch({ t: 'signInReply', reply: null });
+        }
+        document.querySelector('main').classList.remove('trying');
         return;
-      }
-      if (await refusedCredential(r)) {
-        keep.clear();
-        say.textContent = 'This device was signed out — the token changed. Paste or scan the new one.';
-      } else {
-        say.textContent = 'Could not sign in just now. Reload to try again, or paste the token.';
-      }
-      say.className = 'say bad';
-    } catch (err) {
-      say.textContent = 'Could not reach clank. Reload to try again, or paste the token.';
-      say.className = 'say bad';
+      case 'guard':
+        try {
+          if (fx.set) sessionStorage.setItem(TRIED, '1');
+          else sessionStorage.removeItem(TRIED);
+        } catch (err) {}
+        return;
+      case 'discard': keep.clear(); return;
+      case 'navigate': location.replace(fx.to); return;
+      case 'say':
+        // Same fallback as page.html: the machine is shared, and a
+        // reason this table does not cover would otherwise render the
+        // word `undefined` into the page.
+        say.textContent = SAID[fx.why] || 'Could not sign in just now. Reload to try again, or paste the token.';
+        say.className = 'say bad';
+        return;
     }
-    document.querySelector('main').classList.remove('trying');
-  })();
+  };
+  function dispatch(event) {
+    const next = doorStep(door, event);
+    door = next.state;
+    next.effects.forEach(perform);
+  }
+  dispatch({ t: 'load' });
   if (new URLSearchParams(location.search).get('why') === 'link') {
     say.textContent = 'That link is spent or expired. Paste the token instead, or mint a new link from the TUI.';
     say.className = 'say bad';
