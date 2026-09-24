@@ -105,6 +105,7 @@ pub(crate) fn reviewer_missing(label: &str) -> WaitingOn {
 
 pub(crate) fn snap(plans: Vec<PlanWorkState>, queue: Vec<&str>) -> StatusSnapshot {
     StatusSnapshot {
+        inboxes: Vec::new(),
         forks: Vec::new(),
         repo_path: "/r".into(),
         basename: "r".into(),
@@ -203,6 +204,29 @@ pub(crate) fn visible_untrimmed(line: &str) -> String {
         }
     }
     out
+}
+
+/// An agent's inbox as the panel projects it. `ages` gives each
+/// message's age in seconds, or `None` for one with no usable stamp.
+pub(crate) fn inbox(
+    label: &str,
+    subjects: &[(&str, Option<i64>)],
+) -> crate::cli::status::InboxView {
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    crate::cli::status::InboxView {
+        label: label.to_string(),
+        messages: subjects
+            .iter()
+            .enumerate()
+            .map(|(n, (subject, age))| crate::cli::status::InboxMessageView {
+                handle: format!("500-0000000{n}-{subject}"),
+                subject: subject.to_string(),
+                from: "from a person".to_string(),
+                sent_at: age.map(|a| now - a),
+                body: format!("{subject}\n\nthe body of {subject}"),
+            })
+            .collect(),
+    }
 }
 
 pub(crate) fn pr_work(round: u64, missing: &[&str]) -> clank_core::wait::PrReviewWorkState {

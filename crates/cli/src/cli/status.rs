@@ -75,6 +75,16 @@ pub struct StatusSnapshot {
     /// dir, so an external `clank auto` flip repaints. Plan:
     /// tui-agent-auto-toggle.
     pub(crate) agents: Vec<AgentAutoRow>,
+    /// What is waiting in each agent's inbox, read ONCE per snapshot.
+    ///
+    /// One projection so the rows the cursor can reach and the rows
+    /// drawn agree: scanning again during paint or navigation lets an
+    /// agent handle a message between the two and leaves the cursor on
+    /// a row that is no longer there (codex ed1baf5).
+    ///
+    /// Keyed by LABEL, not index: the roster reorders.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) inboxes: Vec<InboxView>,
     /// Shelved plans (stem, what they're waiting for if `--for`
     /// was used, and whether that wait is over). Plan:
     /// plan-lifecycle-verbs.
@@ -226,6 +236,63 @@ pub(crate) struct AvailableAgent {
 /// (`foo.md`, `1-foo.md` and `001-foo.md` all read as one name and
 /// priority), so nothing derived from the filename can tell two
 /// entries apart; only the filename can (a-queued-plan-has-a-page).
+/// One agent's pending messages, as the panel needs them.
+///
+/// Present only when there is something waiting: an empty inbox has no
+/// row, so it has no entry here either.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct InboxView {
+    pub(crate) label: String,
+    /// In `inbox::scan` order -- the order they wake the agent in.
+    /// EVERY message, so the page can show them all; a row that opened
+    /// only the first would strand the rest (codex ed1baf5).
+    pub(crate) messages: Vec<InboxMessageView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct InboxMessageView {
+    /// The handle `clank inbox` takes.
+    pub(crate) handle: String,
+    /// The first non-blank line, without a heading's `#`s.
+    pub(crate) subject: String,
+    /// Who sent it, already worded.
+    pub(crate) from: String,
+    /// When it was sent. ABSENT for a message written by hand without
+    /// metadata, or one whose stamp will not parse -- the inbox takes
+    /// those, and an unknown age is a fact to show, not one to invent.
+    pub(crate) sent_at: Option<i64>,
+    pub(crate) body: String,
+}
+
+impl InboxView {
+    pub(crate) fn read(repo: &Path, label: &str) -> Option<Self> {
+        let parsed = clank_core::ids::AgentLabel::parse(label).ok()?;
+        let messages: Vec<InboxMessageView> = crate::inbox::scan(repo, &parsed)
+            .into_iter()
+            .map(|m| InboxMessageView {
+                // `file_stem`, not `name`: name is priority-STRIPPED
+                // and two entries can share one. The handle shown is
+                // the handle `clank inbox` resolves, and resolving a
+                // shadowed name selects a DIFFERENT message
+                // (codex 3bc0d05).
+                handle: m.entry.file_stem(),
+                subject: m.subject().to_string(),
+                from: crate::inbox::sender_words(m.from.as_deref(), None),
+                sent_at: m.sent.as_deref().and_then(|s| {
+                    time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339)
+                        .ok()
+                        .map(|t| t.unix_timestamp())
+                }),
+                body: m.body.clone(),
+            })
+            .collect();
+        (!messages.is_empty()).then_some(InboxView {
+            label: label.to_string(),
+            messages,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct QueueItemView {
     pub(crate) priority: u16,
@@ -576,6 +643,10 @@ impl StatusSnapshot {
             .as_ref()
             .map(|set| roster_auto_rows(repo, home, set))
             .unwrap_or_default();
+        let inboxes = agents
+            .iter()
+            .filter_map(|a| InboxView::read(repo, &a.label))
+            .collect();
         let tiers = registered
             .as_ref()
             .map(crate::agent_store::ReviewerTiers::from_registered)
@@ -657,6 +728,7 @@ impl StatusSnapshot {
         let log_decorations = log_decorations(&git, branch.as_deref());
 
         Ok(Self {
+            inboxes,
             forks,
             repo_path: repo.to_path_buf(),
             basename: basename.to_string(),
@@ -2643,6 +2715,7 @@ mod dirty_and_wake_tests {
 
     fn minimal_snapshot() -> StatusSnapshot {
         StatusSnapshot {
+            inboxes: Vec::new(),
             forks: Vec::new(),
             repo_path: PathBuf::from("/repo"),
             basename: "repo".to_string(),
@@ -2794,6 +2867,7 @@ mod dirty_and_wake_tests {
 
         let StatusSnapshot {
             // The facts, each asserted below.
+            inboxes: _,
             basename,
             branch,
             head_sha,

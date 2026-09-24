@@ -175,6 +175,14 @@ pub(super) fn render_at(
         let actions = wait_actions(att.killable_pid().is_some());
         return render_wait_page(&a.label, att, &actions, sel, rows, cols);
     }
+    if let Mode::InboxDetail { agent, scroll } = mode
+        && let Some(inbox) = snap
+            .agents
+            .get(agent)
+            .and_then(|a| snap.inboxes.iter().find(|x| x.label == a.label))
+    {
+        return render_inbox_page(inbox, scroll, rows, cols);
+    }
     if let Mode::PriorityPage { value } = mode {
         let stem = view.plan_page.map(|p| p.stem.as_str()).unwrap_or("");
         return render_priority_page(stem, value, rows, cols);
@@ -615,6 +623,7 @@ pub(super) fn scrollable_header(
             .enumerate()
             .filter_map(|(i, (_, m))| m.is_some().then_some(i))
             .collect::<Vec<_>>(),
+        &inbox_rows(snap),
         snap.stash.len(),
         snap.queue.len(),
     );
@@ -684,6 +693,19 @@ pub(super) fn scrollable_header(
                 head_out.push(row_line(
                     &[dim(format!("{ATTENDING_INDENT}{marker}"))],
                     mode.selected() == at(PanelRow::Wait(i)),
+                    color,
+                    cols,
+                ));
+            }
+            // Mail waiting, on its own line beneath the agent. One row
+            // however many are waiting; Enter opens all of them.
+            if let Some(inbox) = snap.inboxes.iter().find(|x| x.label == a.label) {
+                head_out.push(row_line(
+                    &[dim(format!(
+                        "{ATTENDING_INDENT}{}",
+                        inbox_row_text(inbox, cols.saturating_sub(ATTENDING_INDENT.len()))
+                    ))],
+                    mode.selected() == at(PanelRow::Inbox(i)),
                     color,
                     cols,
                 ));
@@ -807,6 +829,163 @@ pub(super) fn agent_wait_view(snap: &StatusSnapshot, cols: usize) -> Vec<(bool, 
 }
 
 /// The agent indices whose wait the cursor may land on.
+/// The agent indices that have mail, resolved from the snapshot's one
+/// inbox projection.
+///
+/// By LABEL, because the roster reorders between snapshots and an
+/// index resolved from a stale list points at somebody else.
+/// The panel line for an agent with mail: how many, the newest one's
+/// title, and how long ago it was sent.
+///
+/// The title is `Message::subject` as the inbox already derives it —
+/// the first non-blank line with a heading's `#`s stripped.
+/// The inbox as a page: the whole document, windowed by `scroll`.
+fn render_inbox_page(
+    inbox: &crate::cli::status::InboxView,
+    scroll: usize,
+    rows: usize,
+    cols: usize,
+) -> (Vec<String>, usize) {
+    let doc = inbox_document(inbox, cols);
+    let scroll = inbox_scroll_now(scroll, doc.len(), rows);
+    let mut out: Vec<String> = doc
+        .into_iter()
+        .skip(scroll)
+        .take(page_height(rows))
+        .collect();
+    out.push("esc/enter back · ↑↓ scroll".to_string());
+    (out, 0)
+}
+
+pub(super) fn inbox_row_text(inbox: &crate::cli::status::InboxView, budget: usize) -> String {
+    let n = inbox.messages.len();
+    let newest = inbox
+        .messages
+        .iter()
+        .max_by_key(|m| m.sent_at.unwrap_or(i64::MIN));
+    let count = if n == 1 {
+        "✉ 1 message".to_string()
+    } else {
+        format!("✉ {n} messages")
+    };
+    let Some(m) = newest else { return count };
+    // An unknown age is SAID, not invented: the inbox takes
+    // hand-written messages with no metadata (codex ed1baf5).
+    let age = match m.sent_at {
+        Some(at) => {
+            let secs = time::OffsetDateTime::now_utc().unix_timestamp() - at;
+            crate::age::coarse(secs.max(0))
+        }
+        None => "unknown".to_string(),
+    };
+    let head = format!("{count} · {age} · ");
+    let room = budget.saturating_sub(head.chars().count());
+    let mut title: String = m.subject.chars().take(room).collect();
+    if m.subject.chars().count() > room && room > 1 {
+        title.truncate(title.char_indices().nth(room - 1).map_or(0, |(i, _)| i));
+        title.push('…');
+    }
+    format!("{head}{title}")
+}
+
+/// Every pending message, as one scrollable document.
+///
+/// All of them, not the newest: a row that opened only the first would
+/// leave the rest unreachable, and the panel deliberately shows one
+/// row however many are waiting (codex ed1baf5). Each keeps its handle
+/// and sender, so a reader can act on it with `clank inbox`.
+pub(super) fn inbox_document(inbox: &crate::cli::status::InboxView, cols: usize) -> Vec<String> {
+    let mut out = vec![
+        format!("inbox · {}", inbox.label),
+        String::new(),
+        "reading changes nothing: these stay in the inbox and keep waking their agent.".to_string(),
+        // --author, because the inbox is the AGENT's: without it a
+        // human, or an agent bound to another label, handles their own
+        // (codex 3bc0d05).
+        format!(
+            "handle them with `clank inbox done --author {} <handle>`.",
+            inbox.label
+        ),
+        String::new(),
+    ];
+    for (n, m) in inbox.messages.iter().enumerate() {
+        if n > 0 {
+            out.push(String::new());
+            out.push("─".repeat(cols.min(60)));
+            out.push(String::new());
+        }
+        let age = match m.sent_at {
+            Some(at) => {
+                let secs = time::OffsetDateTime::now_utc().unix_timestamp() - at;
+                format!("{} ago", crate::age::coarse(secs.max(0)))
+            }
+            None => "sent: unknown".to_string(),
+        };
+        out.push(format!("{} · {}", m.subject, age));
+        out.push(format!("{} · {}", m.from, m.handle));
+        out.push(String::new());
+        out.extend(m.body.lines().map(|l| l.to_string()));
+    }
+    // WRAPPED once, here, where the document is built: every
+    // character then has a line of its own to be scrolled to.
+    // Clipping at paint time instead put the tail of a long paragraph
+    // beyond reach at any offset, and vertical scrolling cannot
+    // recover horizontally clipped text (codex 3bc0d05).
+    //
+    // `text::wrap` measures DISPLAY width, so a wide glyph counts as
+    // the columns it occupies rather than as one char.
+    out.into_iter()
+        .flat_map(|l| {
+            let wrapped = crate::cli::status_tui::text::wrap(&l, cols);
+            if wrapped.is_empty() {
+                vec![String::new()]
+            } else {
+                wrapped
+            }
+        })
+        .collect()
+}
+
+/// The highest scroll offset that still shows text.
+///
+/// Derived from the RENDERED height, and applied both when a key
+/// scrolls and when the document changes underneath — a message
+/// handled while the page is open shortens it, and a preserved offset
+/// would leave nothing but the footer on screen (codex 3bc0d05).
+pub(super) fn inbox_max_scroll(lines: usize, rows: usize) -> usize {
+    lines.saturating_sub(page_height(rows))
+}
+
+/// The lines of document a page of `rows` can show, after its footer.
+pub(super) fn page_height(rows: usize) -> usize {
+    rows.saturating_sub(1).max(1)
+}
+
+/// The stored offset, as it applies to the document that exists NOW.
+///
+/// Both the reader and the navigation ask this, because a stored
+/// offset outlives the document it was taken from: messages get
+/// handled and the terminal gets resized. Clamping in the renderer
+/// alone left the two disagreeing — the page drew offset 3 while Up
+/// walked 100, 99, 98 against the old value, so it sat frozen for as
+/// many presses as the difference (codex 5addb90).
+pub(super) fn inbox_scroll_now(scroll: usize, lines: usize, rows: usize) -> usize {
+    scroll.min(inbox_max_scroll(lines, rows))
+}
+
+pub(super) fn inbox_rows(snap: &StatusSnapshot) -> Vec<usize> {
+    snap.agents
+        .iter()
+        .enumerate()
+        .filter_map(|(i, a)| {
+            snap.inboxes
+                .iter()
+                .any(|inbox| inbox.label == a.label)
+                .then_some(i)
+        })
+        .collect()
+}
+
 pub(super) fn drawable_waits(snap: &StatusSnapshot, cols: usize) -> Vec<usize> {
     agent_wait_view(snap, cols)
         .into_iter()
@@ -3589,6 +3768,172 @@ pub(super) fn render_error_doc(
 
 #[cfg(test)]
 mod tests {
+    /// Every character of a long paragraph is reachable by scrolling.
+    ///
+    /// The document used to keep each paragraph as ONE line and clip
+    /// at paint time, so anything past `cols` could not be reached at
+    /// any offset -- vertical scrolling cannot recover horizontally
+    /// clipped text (codex 3bc0d05).
+    #[test]
+    fn a_long_paragraph_is_reachable_by_scrolling() {
+        let mut inbox = crate::cli::status_tui::fixtures::inbox("claude", &[("note", Some(60))]);
+        inbox.messages[0].body = format!("note\n\n{} TAIL_MUST_BE_READABLE", "x ".repeat(80));
+
+        let (cols, rows) = (40, 10);
+        let doc_len = super::inbox_document(&inbox, cols).len();
+        let mut seen = String::new();
+        for scroll in 0..=super::inbox_max_scroll(doc_len, rows) {
+            seen.push_str(
+                &super::render_inbox_page(&inbox, scroll, rows, cols)
+                    .0
+                    .join("\n"),
+            );
+        }
+        assert!(
+            seen.contains("TAIL_MUST_BE_READABLE"),
+            "the tail of a wrapped paragraph must be reachable somewhere",
+        );
+        // And nothing is wider than the screen it is read on.
+        for line in super::inbox_document(&inbox, cols) {
+            assert!(
+                crate::cli::status_tui::text::display_width(&line) <= cols,
+                "{line:?} is wider than {cols}",
+            );
+        }
+    }
+
+    /// Wide glyphs are measured by DISPLAY width, not character count.
+    #[test]
+    fn the_document_wraps_wide_glyphs_by_their_width() {
+        let mut inbox = crate::cli::status_tui::fixtures::inbox("claude", &[("note", Some(60))]);
+        inbox.messages[0].body = "note\n\n".to_string() + &"漢".repeat(60);
+        let cols = 20;
+        for line in super::inbox_document(&inbox, cols) {
+            assert!(
+                crate::cli::status_tui::text::display_width(&line) <= cols,
+                "{line:?} overflows {cols} columns",
+            );
+        }
+    }
+
+    /// A scroll offset taken from a longer document is clamped, not
+    /// obeyed: a message handled while the page is open shortens it,
+    /// and the old offset would leave nothing but the footer.
+    #[test]
+    fn a_stale_scroll_offset_still_shows_the_message() {
+        let inbox = crate::cli::status_tui::fixtures::inbox("claude", &[("short", Some(60))]);
+        let (page, _) = super::render_inbox_page(&inbox, 100, 10, 60);
+        let shown = page.join("\n");
+        assert!(
+            shown.contains("short"),
+            "a stale offset must not scroll past the whole document: {shown}",
+        );
+    }
+
+    /// The hint names the AGENT whose inbox it is.
+    #[test]
+    fn the_done_hint_is_addressed_to_the_right_inbox() {
+        let inbox = crate::cli::status_tui::fixtures::inbox("codex", &[("note", Some(60))]);
+        let doc = super::inbox_document(&inbox, 80).join(" ");
+        assert!(
+            doc.contains("--author codex"),
+            "without --author a human handles their OWN inbox: {doc}",
+        );
+    }
+
+    /// The row says how many are waiting, how long ago the newest was
+    /// sent, and its title.
+    #[test]
+    fn the_inbox_row_names_the_count_the_age_and_the_title() {
+        use crate::cli::status_tui::fixtures::inbox;
+        let one = inbox("claude", &[("a bug report", Some(90))]);
+        let said = super::inbox_row_text(&one, 80);
+        assert!(said.contains("1 message"), "{said}");
+        assert!(
+            !said.contains("1 messages"),
+            "singular, not `1 messages`: {said}"
+        );
+        assert!(said.contains("a bug report"), "{said}");
+        // `coarse` truncates, so 90s reads 1m.
+        assert!(said.contains("1m"), "the age, coarsely: {said}");
+
+        let many = inbox("claude", &[("older", Some(7200)), ("newest", Some(60))]);
+        let said = super::inbox_row_text(&many, 80);
+        assert!(said.contains("2 messages"), "{said}");
+        assert!(
+            said.contains("newest") && !said.contains("older"),
+            "the row shows the NEWEST; the page shows them all: {said}"
+        );
+    }
+
+    /// A message with no usable timestamp says so.
+    ///
+    /// The inbox takes hand-written messages with no metadata, and
+    /// `Message.sent` is an `Option` — inventing an age for one, or
+    /// failing the page, are both worse than saying it is unknown
+    /// (codex ed1baf5).
+    #[test]
+    fn a_message_with_no_stamp_reads_unknown_rather_than_now() {
+        use crate::cli::status_tui::fixtures::inbox;
+        let said = super::inbox_row_text(&inbox("claude", &[("hand written", None)]), 80);
+        // The AGE field, not the whole line: "unknown" contains
+        // "now", so a substring search over the row is a trap.
+        let age = said.split(" · ").nth(1).expect("the row has an age field");
+        assert_eq!(age, "unknown", "{said}");
+        let doc = super::inbox_document(&inbox("claude", &[("hand written", None)]), 80);
+        assert!(
+            doc.iter().any(|l| l.contains("sent: unknown")),
+            "and the page says it too: {doc:?}"
+        );
+    }
+
+    /// The page shows EVERY message, with the handle needed to act on
+    /// it. One row that opened only the first would strand the rest.
+    #[test]
+    fn the_inbox_page_shows_every_message_and_its_handle() {
+        use crate::cli::status_tui::fixtures::inbox;
+        let three = inbox(
+            "claude",
+            &[
+                ("first", Some(300)),
+                ("second", Some(200)),
+                ("third", Some(100)),
+            ],
+        );
+        let doc = super::inbox_document(&three, 80).join("\n");
+        for subject in ["first", "second", "third"] {
+            assert!(doc.contains(subject), "{subject} is unreachable: {doc}");
+            assert!(
+                doc.contains(&format!("the body of {subject}")),
+                "the BODY, not just the title: {doc}"
+            );
+        }
+        assert!(
+            three.messages.iter().all(|m| doc.contains(&m.handle)),
+            "each keeps the handle `clank inbox` takes: {doc}"
+        );
+        // Reading is not handling: the page has to say so, because
+        // nothing about looking at it changes the agent's wake.
+        assert!(
+            doc.contains("clank inbox done"),
+            "the page names what DOES handle a message: {doc}"
+        );
+    }
+
+    /// A long title is cut to the row, not wrapped onto one.
+    #[test]
+    fn a_long_title_is_cut_to_the_panel_width() {
+        use crate::cli::status_tui::fixtures::inbox;
+        let long = "x".repeat(300);
+        let said = super::inbox_row_text(&inbox("claude", &[(long.as_str(), Some(60))]), 40);
+        assert!(
+            said.chars().count() <= 40,
+            "{} chars: {said}",
+            said.chars().count()
+        );
+        assert!(said.ends_with('…'), "and says it was cut: {said}");
+    }
+
     /// A blocked handoff names only the stage that stopped.
     ///
     /// The block survives `propose`, so a reopened round can carry it

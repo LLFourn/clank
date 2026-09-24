@@ -320,6 +320,152 @@ fn parse(entry: priority_dir::Entry, raw: &str) -> Message {
 
 #[cfg(test)]
 mod tests {
+    /// The panel's projection reads the inbox and takes nothing.
+    ///
+    /// This is the promise the TUI row rests on: the agent is still
+    /// the recipient, and a human looking over its shoulder must not
+    /// handle its mail by looking. `clank inbox done` is what handles
+    /// a message (a-waiting-message-is-a-line-under-the-name).
+    #[test]
+    fn projecting_an_inbox_for_the_panel_consumes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let label = AgentLabel::parse("claude").unwrap();
+        send(
+            repo,
+            &label,
+            500,
+            None,
+            "2026-09-24T06:44:34Z",
+            "## A title\n\nbody",
+        )
+        .unwrap();
+        send(
+            repo,
+            &label,
+            500,
+            None,
+            "2026-09-24T07:00:00Z",
+            "plain subject\n\nmore",
+        )
+        .unwrap();
+
+        let before = scan(repo, &label);
+        assert_eq!(before.len(), 2);
+
+        // What the panel does, twice: the projection is a READ.
+        for _ in 0..2 {
+            let view = crate::cli::status::InboxView::read(repo, "claude")
+                .expect("two messages are waiting");
+            assert_eq!(view.messages.len(), 2);
+            // The title is the first non-blank line with the heading
+            // markers stripped -- the thing the row shows.
+            assert_eq!(view.messages[0].subject, "A title");
+            assert_eq!(view.messages[1].subject, "plain subject");
+            assert!(view.messages.iter().all(|m| m.sent_at.is_some()));
+        }
+
+        let after = scan(repo, &label);
+        assert_eq!(after.len(), 2, "looking at the inbox must not empty it",);
+        assert_eq!(
+            before
+                .iter()
+                .map(|m| m.entry.name.clone())
+                .collect::<Vec<_>>(),
+            after
+                .iter()
+                .map(|m| m.entry.name.clone())
+                .collect::<Vec<_>>(),
+            "and must not reorder or rename anything",
+        );
+    }
+
+    /// The handle shown is the handle that resolves to THAT message.
+    ///
+    /// `entry.name` is priority-stripped, so `100-500-note.md` and
+    /// `500-note.md` both carry the name `500-note` — and resolving it
+    /// picks one of them. A row showing that name would offer a handle
+    /// that selects a DIFFERENT message than the one it is describing
+    /// (codex 3bc0d05).
+    #[test]
+    fn the_handle_shown_resolves_to_the_message_it_describes() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let label = AgentLabel::parse("claude").unwrap();
+        let inbox = inbox_dir(repo, &label);
+        std::fs::create_dir_all(&inbox).unwrap();
+        std::fs::write(inbox.join("100-500-note.md"), "FIRST\n\nbody").unwrap();
+        std::fs::write(inbox.join("500-note.md"), "SECOND\n\nbody").unwrap();
+
+        let view = crate::cli::status::InboxView::read(repo, "claude").expect("two are waiting");
+        assert_eq!(view.messages.len(), 2);
+        for m in &view.messages {
+            let found = resolve(repo, &label, &m.handle)
+                .unwrap_or_else(|e| panic!("`{}` must resolve: {e:#}", m.handle));
+            assert_eq!(
+                found.subject(),
+                m.subject,
+                "handle `{}` is shown for `{}` but resolves to `{}`",
+                m.handle,
+                m.subject,
+                found.subject(),
+            );
+        }
+    }
+
+    /// An agent with an EMPTY inbox projects nothing.
+    ///
+    /// The row exists only where there is mail, and `inbox_rows`
+    /// derives the panel's rows from this projection — so a view
+    /// returned for an empty inbox would grow a row under every agent
+    /// on the roster.
+    #[test]
+    fn an_empty_inbox_projects_no_view_at_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let label = AgentLabel::parse("claude").unwrap();
+        // Never written to.
+        assert!(crate::cli::status::InboxView::read(repo, "claude").is_none());
+
+        // Written to, then handled: still nothing.
+        send(
+            repo,
+            &label,
+            500,
+            None,
+            "2026-09-24T06:44:34Z",
+            "a note\n\nbody",
+        )
+        .unwrap();
+        assert!(crate::cli::status::InboxView::read(repo, "claude").is_some());
+        let one = scan(repo, &label).pop().expect("it is there");
+        std::fs::remove_file(&one.entry.path).unwrap();
+        assert!(
+            crate::cli::status::InboxView::read(repo, "claude").is_none(),
+            "an inbox that empties loses its row",
+        );
+    }
+
+    /// A message with no `sent:` line still projects, with no age.
+    #[test]
+    fn a_hand_written_message_projects_without_a_stamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let label = AgentLabel::parse("claude").unwrap();
+        let inbox = inbox_dir(repo, &label);
+        std::fs::create_dir_all(&inbox).unwrap();
+        // Written by hand, no metadata at all -- which the inbox takes.
+        std::fs::write(inbox.join("500-00000001-note.md"), "# Just a note\n\nbody").unwrap();
+
+        let view = crate::cli::status::InboxView::read(repo, "claude").expect("it is waiting");
+        assert_eq!(view.messages.len(), 1);
+        assert_eq!(view.messages[0].subject, "Just a note");
+        assert_eq!(
+            view.messages[0].sent_at, None,
+            "no stamp is an absence to report, not an age to invent",
+        );
+    }
+
     use super::*;
 
     const SENT: &str = "2026-09-22T10:15:00Z";

@@ -116,6 +116,7 @@ fn panel_row_list(
     crate::cli::status_tui::input::panel_rows(
         snap.agents.len(),
         &crate::cli::status_tui::render::drawable_waits(snap, cols),
+        &crate::cli::status_tui::render::inbox_rows(snap),
         snap.stash.len(),
         snap.queue.len(),
     )
@@ -3259,6 +3260,39 @@ pub(crate) async fn run_tui(
                             }
                             continue;
                         }
+                        Mode::InboxDetail { agent, scroll } => {
+                            // An agent that handles its mail while the
+                            // page is open leaves nothing to read, so
+                            // the page closes rather than showing a
+                            // document about messages that are gone.
+                            let lines = snapshot
+                                .agents
+                                .get(agent)
+                                .and_then(|a| snapshot.inboxes.iter().find(|i| i.label == a.label))
+                                .map(|i| {
+                                    crate::cli::status_tui::render::inbox_document(i, cols as usize)
+                                        .len()
+                                })
+                                .unwrap_or(0);
+                            if lines == 0 {
+                                mode = Mode::AgentPanel { sel: 0 };
+                                continue;
+                            }
+                            match crate::cli::status_tui::input::inbox_page_nav(
+                                scroll,
+                                lines,
+                                rows as usize,
+                                k,
+                            ) {
+                                DetailNav::Quit => break 'evloop,
+                                DetailNav::Back => mode = Mode::AgentPanel { sel: 0 },
+                                DetailNav::MoveCursor(s) => {
+                                    mode = Mode::InboxDetail { agent, scroll: s }
+                                }
+                                _ => {}
+                            }
+                            continue;
+                        }
                         Mode::WaitDetail { agent, sel } => {
                             let att = snapshot
                                 .agents
@@ -3295,6 +3329,17 @@ pub(crate) async fn run_tui(
                                     }
                                 }
                                 PanelAction::MoveCursor(s) => mode = Mode::AgentPanel { sel: s },
+                                PanelAction::OpenInbox(agent) => {
+                                    // Only if it still has mail: the
+                                    // agent may have handled it since
+                                    // this snapshot was taken.
+                                    let has = snapshot.agents.get(agent).is_some_and(|a| {
+                                        snapshot.inboxes.iter().any(|i| i.label == a.label)
+                                    });
+                                    if has {
+                                        mode = Mode::InboxDetail { agent, scroll: 0 };
+                                    }
+                                }
                                 PanelAction::OpenWait(agent) => {
                                     if let Some((label, att)) =
                                         snapshot.agents.get(agent).and_then(|a| {
@@ -4216,7 +4261,8 @@ pub(crate) async fn run_tui(
                     | Mode::Confirm {
                         action: ConfirmAction::RemoveAgent { idx },
                     }
-                    | Mode::SwapPicker { out: idx, .. } => {
+                    | Mode::SwapPicker { out: idx, .. }
+                    | Mode::InboxDetail { agent: idx, .. } => {
                         snapshot.agents.get(idx).map(|a| a.label.clone())
                     }
                     _ => None,
@@ -4358,6 +4404,23 @@ pub(crate) async fn run_tui(
                                 .saturating_sub(1),
                         ),
                     },
+                    // Re-located by LABEL and dropped when the mail
+                    // is gone: an agent can handle its messages while
+                    // the page is open, and a stale index would show
+                    // another agent's inbox under this one's name.
+                    Mode::InboxDetail { agent, scroll } => {
+                        match detail_label
+                            .as_deref()
+                            .and_then(|l| relocate_detail(l, &snapshot.agents))
+                            .filter(|i| {
+                                snapshot.agents.get(*i).is_some_and(|a| {
+                                    snapshot.inboxes.iter().any(|x| x.label == a.label)
+                                })
+                            }) {
+                            Some(agent) => Mode::InboxDetail { agent, scroll },
+                            None => Mode::AgentPanel { sel: 0 },
+                        }
+                    }
                     // The answered block may be gone after a refresh;
                     // an out-of-range index must not answer a
                     // DIFFERENT agent's question, so drop to the log.
