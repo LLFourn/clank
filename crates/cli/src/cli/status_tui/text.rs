@@ -124,20 +124,40 @@ pub(super) fn wrap(text: &str, width: usize) -> Vec<String> {
 }
 
 /// Serialize spans to one ANSI line, truncated to `cols` display
-/// columns with `…`. Truncation happens on the PLAIN text span by
-/// span — an escape can never be split, and a dropped span drops
-/// its styling with it.
+/// columns with `…`. The cut is decided ONCE over the plain text of
+/// the whole row and then handed out across the spans — an escape can
+/// never be split, and a dropped span drops its styling with it.
+///
+/// The marker belongs to the row, so it is drawn outside every span's
+/// escapes and in the default colour, where it used to inherit the
+/// styling of whichever span it ended.
 pub(super) fn emit(spans: &[Span], color: &str, cols: usize) -> String {
+    // ONE cut for the whole row, then distributed back over the
+    // spans. Truncating span by span let a span that exactly filled
+    // the width end the row with no ellipsis while a later span was
+    // dropped entirely -- so a row said something different depending
+    // on whether the cursor was on it, `emit_selected` taking the
+    // whole line and this one not (a-row-truncates-the-same-way-
+    // selected-or-not).
+    //
+    // Distributed, never re-cut: a second per-span truncation could
+    // land inside a grapheme the whole-row cut deliberately kept
+    // together, such as a variation selector and its base.
+    let whole: String = spans.iter().map(|Span(_, t)| t.as_str()).collect();
+    let cut = cut_to(&whole, cols);
+    let mut rest = cut.kept.as_str();
     let mut out = String::new();
-    let mut used = 0;
     for Span(style, text) in spans {
-        let remaining = cols.saturating_sub(used);
-        if remaining == 0 {
+        if rest.is_empty() {
             break;
         }
-        let piece = truncate_to(text, remaining);
-        used += display_width(&piece);
-        let truncated_here = piece.ends_with('…') && !text.ends_with('…');
+        // By CHARS: `kept` is a prefix of the concatenation, so each
+        // span's share is its own length until the prefix runs out.
+        let n = text.chars().count().min(rest.chars().count());
+        let end = rest.char_indices().nth(n).map_or(rest.len(), |(i, _)| i);
+        let (piece, tail) = rest.split_at(end);
+        let piece = piece.to_string();
+        rest = tail;
         match style {
             Style::Plain => out.push_str(&piece),
             Style::Dim => out.push_str(&format!("\x1b[2m{piece}\x1b[0m")),
@@ -149,9 +169,13 @@ pub(super) fn emit(spans: &[Span], color: &str, cols: usize) -> String {
             Style::Italic => out.push_str(&format!("\x1b[3m{piece}\x1b[0m")),
             Style::Bold => out.push_str(&format!("\x1b[1m{piece}\x1b[0m")),
         }
-        if truncated_here {
-            break;
-        }
+    }
+    // The marker is the ROW's, not any span's: it says the row was
+    // cut, and it is owed exactly when the whole-row cut dropped
+    // something -- never because a span's own text happens to end in
+    // one.
+    if cut.marks(cols) {
+        out.push('…');
     }
     out
 }
@@ -468,11 +492,47 @@ pub(super) fn display_width(s: &str) -> usize {
 /// Width-aware (emoji count as 2) so a kept double-width char
 /// can't push the line past the pane edge.
 pub(super) fn truncate_to(s: &str, cols: usize) -> String {
+    let cut = cut_to(s, cols);
+    if cut.marks(cols) {
+        format!("{}…", cut.kept)
+    } else {
+        cut.kept
+    }
+}
+
+/// What survives a cut to `cols`, and WHETHER anything was dropped.
+///
+/// `dropped` is carried rather than inferred from a trailing `…`: the
+/// text may legitimately end in one, and a row that fits must keep its
+/// own ellipsis without being read as truncated (codex 3d2e4f9).
+///
+/// A column is reserved for the marker whenever a cut happens, so the
+/// caller can append it without overflowing.
+pub(super) struct Cut {
+    pub(super) kept: String,
+    pub(super) dropped: bool,
+}
+
+impl Cut {
+    /// Whether a marker is owed AND has room to be drawn.
+    ///
+    /// Two different questions: at zero columns content was still
+    /// dropped, but there is nowhere to say so, and a `…` there would
+    /// overflow a budget of nothing. Asked through one method so the
+    /// two callers cannot answer it differently -- which is how the
+    /// paths came to disagree in the first place.
+    pub(super) fn marks(&self, cols: usize) -> bool {
+        self.dropped && cols > 0
+    }
+}
+
+pub(super) fn cut_to(s: &str, cols: usize) -> Cut {
+    let fits = |kept: String, dropped: bool| Cut { kept, dropped };
     if display_width(s) <= cols {
-        return s.to_string();
+        return fits(s.to_string(), false);
     }
     if cols == 0 {
-        return String::new();
+        return fits(String::new(), true);
     }
     // Keep chars while they fit in cols-1 (reserving 1 for `…`).
     let mut t = String::new();
@@ -502,8 +562,7 @@ pub(super) fn truncate_to(s: &str, cols: usize) -> String {
     {
         t.pop();
     }
-    t.push('…');
-    t
+    fits(t, true)
 }
 
 /// `U+FE00`–`U+FE0F`: a mark that belongs to the char BEFORE it and
@@ -527,6 +586,200 @@ pub(crate) fn strip_leading_emoji(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// A row says the same thing whether or not the cursor is on it.
+    ///
+    /// `emit` used to truncate span by span, so a span that exactly
+    /// filled the width ended the row with NO ellipsis while a later
+    /// span was dropped whole -- and `emit_selected`, which cuts the
+    /// concatenation, added one. Moving the cursor onto a row changed
+    /// what the row said, and the unselected form was the misleading
+    /// one: `ab` looks complete, `a…` admits it is not.
+    #[test]
+    fn a_row_says_the_same_thing_selected_or_not() {
+        use super::Style;
+        let rows: Vec<Vec<super::Span>> = vec![
+            // The demonstrated case: span 0 exactly fills 2 columns.
+            vec![
+                super::Span(Style::Plain, "ab".into()),
+                super::Span(Style::Dim, "cdef".into()),
+            ],
+            // A wide glyph on the boundary.
+            vec![
+                super::Span(Style::Plain, "\u{1F4A4}".into()),
+                super::Span(Style::Plain, " idle".into()),
+            ],
+            // A variation-selector pair, which must not be split by
+            // the distribution either.
+            vec![
+                super::Span(Style::Plain, "\u{2601}\u{FE0F}".into()),
+                super::Span(Style::Plain, " remote".into()),
+            ],
+            // An empty span in the middle, and a single one.
+            vec![
+                super::Span(Style::Plain, "ab".into()),
+                super::Span(Style::Dim, String::new()),
+                super::Span(Style::Bold, "cd".into()),
+            ],
+            vec![super::Span(Style::Plain, "abcdef".into())],
+        ];
+        for spans in &rows {
+            let whole: String = spans.iter().map(|s| s.1.clone()).collect();
+            for cols in 0..=super::display_width(&whole) + 2 {
+                let dim = strip(&super::emit(spans, "32", cols));
+                // The band pads to the full width ON PURPOSE; only the
+                // text has to agree.
+                let sel = strip(&super::emit_selected(spans, cols))
+                    .trim_end()
+                    .to_string();
+                assert_eq!(
+                    dim.trim_end(),
+                    sel,
+                    "{whole:?} at {cols} cols: unselected {dim:?} vs selected {sel:?}",
+                );
+                assert!(
+                    super::display_width(dim.trim_end()) <= cols,
+                    "{whole:?} at {cols} cols overflows: {dim:?}",
+                );
+            }
+        }
+    }
+
+    /// Each span's style lands on its OWN characters after the cut.
+    ///
+    /// The distribution hands out the whole-row prefix, and a mistake
+    /// there moves the style boundary without changing a visible
+    /// character -- so the parity test, which strips ANSI, cannot see
+    /// it. Asserted on the escapes.
+    #[test]
+    fn the_cut_moves_no_characters_between_styles() {
+        use super::Style;
+        let spans = vec![
+            super::Span(Style::Plain, "\u{1F4A4}".into()),
+            super::Span(Style::Dim, " idle".into()),
+        ];
+        // Width 7, cut to 5: a column goes to the marker, so the kept
+        // prefix is `💤 i` -- which falls INSIDE the second span.
+        assert_eq!(
+            super::emit(&spans, "32", 5),
+            "\u{1F4A4}\x1b[2m i\x1b[0m…",
+            "the wide glyph is span 0's and the space is span 1's",
+        );
+        // Counting the glyph's WIDTH rather than its length would give
+        // span 0 the space as well, moving the dim escape one right
+        // with every visible character unchanged.
+        assert_eq!(
+            super::display_width(&strip(&super::emit(&spans, "32", 5))),
+            5
+        );
+    }
+
+    /// A row that FITS keeps a literal ellipsis of its own.
+    ///
+    /// The old check inferred "was truncated" from a trailing `…`,
+    /// which a row can legitimately contain (codex 3d2e4f9).
+    #[test]
+    fn a_fitting_row_keeps_an_ellipsis_it_already_had() {
+        use super::Style;
+        let spans = vec![
+            super::Span(Style::Plain, "wait…".into()),
+            super::Span(Style::Dim, " more".into()),
+        ];
+        let whole = "wait… more";
+        assert_eq!(
+            strip(&super::emit(&spans, "32", 10)),
+            whole,
+            "it fits whole"
+        );
+        assert_eq!(super::truncate_to(whole, 10), whole);
+        // And one that IS cut still gets its marker, even though the
+        // kept text already ends in one. Two ellipses read oddly, but
+        // suppressing the second would make a truncated row look
+        // complete -- which is the bug this whole plan is about, and
+        // the reason `dropped` is carried rather than sniffed from
+        // the last character.
+        let cut = strip(&super::emit(&spans, "32", 6));
+        assert_eq!(cut, "wait……");
+        assert_eq!(
+            super::display_width(&cut),
+            6,
+            "and it fills the row exactly"
+        );
+
+        // The case that distinguishes carrying `dropped` from sniffing
+        // the text: a row whose WHOLE content ends in an ellipsis, and
+        // which is cut. Sniffing says "it already ends in one" and
+        // leaves the row looking complete.
+        let ends_in_one = vec![
+            super::Span(Style::Plain, "wait".into()),
+            super::Span(Style::Dim, " more…".into()),
+        ];
+        assert!(
+            "wait more…".ends_with('…'),
+            "the fixture must really end in one",
+        );
+        let cut = strip(&super::emit(&ends_in_one, "32", 6));
+        assert!(
+            cut.ends_with('…') && super::display_width(&cut) == 6,
+            "a cut row must say so even when its text ends in an ellipsis: {cut:?}",
+        );
+        assert_ne!(cut, "wait m", "which is what sniffing the text produces");
+    }
+
+    /// A cut inside a link keeps the link whole around what is left.
+    #[test]
+    fn a_cut_link_keeps_its_target_and_closes_itself() {
+        use super::Style;
+        let url = "https://example.invalid/a/very/long/target";
+        let spans = vec![
+            super::Span(Style::Link(url.to_string()), "a long label".into()),
+            super::Span(Style::Plain, " after".into()),
+        ];
+        let drawn = super::emit(&spans, "32", 6);
+        assert!(
+            drawn.contains(url),
+            "the target is not the thing being clipped"
+        );
+        assert_eq!(
+            drawn.matches("\x1b]8;;").count(),
+            2,
+            "one open and one close: {drawn:?}",
+        );
+        assert_eq!(strip(&drawn), "a lon…", "only the visible label is cut");
+    }
+
+    /// ANSI/OSC stripped, for comparing what the eye sees.
+    fn strip(line: &str) -> String {
+        let mut out = String::new();
+        let mut chars = line.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c != '\x1b' {
+                out.push(c);
+                continue;
+            }
+            match chars.peek() {
+                Some(']') => {
+                    while let Some(e) = chars.next() {
+                        if e == '\x07' {
+                            break;
+                        }
+                        if e == '\x1b' {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                _ => {
+                    for e in chars.by_ref() {
+                        if e == 'm' {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// A cut never separates a variation selector from its base --
     /// and never throws away a pair that fits.
     ///

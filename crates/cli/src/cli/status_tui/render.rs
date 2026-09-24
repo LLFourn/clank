@@ -3846,14 +3846,16 @@ mod tests {
         }
     }
 
-    /// The drawn row keeps the whole glyph, and both states agree
-    /// about it.
+    /// The drawn row keeps the whole glyph, and the two states draw
+    /// the same visible text at every width.
     ///
-    /// Selected rows go through `emit_selected` -- inverted, the whole
-    /// line truncated at once -- while unselected goes through `emit`,
-    /// which truncates span by span. A cut that split the pair showed
-    /// up in one path and not the other, which is how codex found it
-    /// at three columns (03c64bd).
+    /// The paths still differ in how they LOOK -- `emit_selected`
+    /// inverts the line and pads it to the full width, `emit` styles
+    /// each span -- but no longer in where they cut: both take one
+    /// `cut_to` decision over the whole row. They did differ once, and
+    /// a cut that split the variation-selector pair showed up in one
+    /// path and not the other, which is how codex found that at three
+    /// columns (03c64bd).
     #[test]
     fn the_row_keeps_the_whole_glyph_at_every_width_and_state() {
         use crate::cli::status_tui::remote::Shown::*;
@@ -3877,16 +3879,20 @@ mod tests {
                 );
             }
         }
-        // NOT asserted: that the two states render identically at
-        // every width. They do not, and it is not this icon's doing --
-        // `emit` truncates span by span and stops without an ellipsis
-        // when a span exactly fills the row, while `emit_selected`
-        // truncates the whole line and adds one. Plain spans
-        // ["ab", "cdef"] at 2 columns give "ab" against "a…", and the
-        // remote row differs at 9 for the same reason. That is
-        // `row_line`'s asymmetry, older than this plan and worth its
-        // own; pinning it here would be asserting something this
-        // change neither caused nor fixed.
+        // ASSERTED now, and deliberately not when this was written:
+        // `emit` truncated span by span and stopped without an
+        // ellipsis where `emit_selected` cut the whole line and added
+        // one, so the two states disagreed at 2 columns and at 9.
+        // That asymmetry was `row_line`'s rather than this icon's, it
+        // got its own plan, and this is the icon's stake in the
+        // result (a-row-truncates-the-same-way-selected-or-not).
+        for cols in 0..=display_width(&raw) + 2 {
+            assert_eq!(
+                seen(false, cols),
+                seen(true, cols),
+                "at {cols} cols the two states disagree",
+            );
+        }
         // And where the pair exactly fits, it is THERE -- the split
         // assertion alone is satisfied by dropping both.
         assert!(
