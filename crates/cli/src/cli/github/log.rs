@@ -62,6 +62,12 @@ pub(crate) const DISPLAY_CAP: usize = 200;
 pub(crate) enum Transport {
     Poll,
     Relay,
+    /// A line a command source's producer printed
+    /// (a-command-is-an-event-source-like-any-other). It shares this
+    /// log so it shares the lifecycle — `clank events list/show/ack`
+    /// finds it by the same directory glob, and an unacked one is
+    /// never compacted away.
+    Command,
 }
 
 impl Transport {
@@ -69,6 +75,7 @@ impl Transport {
         match self {
             Transport::Poll => "poll",
             Transport::Relay => "relay",
+            Transport::Command => "command",
         }
     }
 }

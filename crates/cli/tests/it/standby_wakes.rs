@@ -162,14 +162,25 @@ async fn a_standby_agents_messages_and_own_sources_still_wake_it() {
     let handle = clank::inbox::scan(repo, &label("sb"))[0].entry.file_stem();
     clank::inbox::done(repo, &label("sb"), &handle).unwrap();
 
-    let source =
-        serde_json::json!({ "kind": "command", "name": "done", "command": ["true"] }).to_string();
+    // A producer that EMITS. `["true"]` used to wake by completing;
+    // a source is a long-running producer now and its lines are the
+    // events (a-command-is-an-event-source-like-any-other).
+    let source = serde_json::json!({
+        "kind": "command",
+        "name": "done",
+        "command": [
+            "sh",
+            "-c",
+            r#"printf '{"id":"1","kind":"done","content":"finished"}\n'; sleep 300"#,
+        ],
+    })
+    .to_string();
     let items = tokio::time::timeout(
         common::race_deadline(repo),
         clank::cli::wait::items(wait_args(repo, "sb", false, vec![source])),
     )
     .await
-    .expect("the command's completion wakes the standby agent")
+    .expect("the producer's event wakes the standby agent")
     .unwrap()
     .expect("a wait reports its items");
     assert!(

@@ -83,19 +83,23 @@ pub async fn run(args: LogArgs) -> anyhow::Result<()> {
         })
         .collect();
 
-    // Github events interleave by time (log-timeline-github-events)
-    // unless excluded; a plan-scoped view is plan work only, so the
-    // repo-wide github stream stays out of it too.
-    let gh_events: Vec<crate::cli::github::timeline::MergedEvent> =
-        if args.no_github || plan_filter.is_some() {
-            Vec::new()
-        } else {
-            let snap = crate::cli::github::timeline::timeline_snapshot(&repo);
-            for n in &snap.notices {
-                eprintln!("log: {n}");
-            }
-            snap.events
-        };
+    // Events interleave by time (log-timeline-github-events); a
+    // plan-scoped view is plan work only, so the repo-wide stream
+    // stays out of it entirely.
+    //
+    // `--no-github` takes GITHUB out, and nothing else. It used to
+    // discard the whole snapshot, which was the same thing while
+    // github was the only backend and silently hid every command
+    // source the moment one wasn't (codex db5821e).
+    let gh_events: Vec<crate::cli::github::timeline::MergedEvent> = if plan_filter.is_some() {
+        Vec::new()
+    } else {
+        let snap = crate::cli::github::timeline::timeline_snapshot(&repo);
+        for n in &snap.notices {
+            eprintln!("log: {n}");
+        }
+        timeline_events_for(snap.events, args.no_github)
+    };
 
     if filtered.is_empty() && history.plain.is_empty() && gh_events.is_empty() {
         println!("no log events");
@@ -349,11 +353,61 @@ pub(crate) fn interleave_with_plain<'a>(
 /// textual markers (codex c917ba7).
 fn gh_colored_row(g: &crate::cli::github::timeline::MergedEvent, mark: &str) -> String {
     let line = gh_describe(g);
+    let badge = event_badge(g);
     if g.baseline {
-        format!("{DIM}gh {line}{mark}{Z}")
+        format!("{DIM}{badge} {line}{mark}{Z}")
     } else {
-        format!("{C}gh{Z} {line}{mark}")
+        format!("{C}{badge}{Z} {line}{mark}")
     }
+}
+
+/// Which of the timeline's events this invocation shows.
+///
+/// `--no-github` takes GITHUB out, and nothing else. It used to
+/// discard the whole snapshot, which was the same thing while github
+/// was the only backend and silently hid every command source the
+/// moment one wasn't (codex db5821e). Named rather than inlined so
+/// the rule is testable where it is written.
+pub(crate) fn timeline_events_for(
+    events: Vec<crate::cli::github::timeline::MergedEvent>,
+    no_github: bool,
+) -> Vec<crate::cli::github::timeline::MergedEvent> {
+    events
+        .into_iter()
+        .filter(|e| !no_github || e.backend != crate::cli::github::timeline::Backend::Github)
+        .collect()
+}
+
+/// The gutter badge for one event: its source's configured glyph, or
+/// the backend's default.
+///
+/// ONE answer, used by every printer. Hardcoding `gh` labelled every
+/// command source's events as github (codex 80e1fb9).
+pub(crate) fn event_badge(g: &crate::cli::github::timeline::MergedEvent) -> &str {
+    badge_of(g.glyph.as_deref(), g.backend)
+}
+
+/// The source's configured glyph wins; the default names the backend.
+///
+/// The glyph arrives ALREADY VALIDATED — `MergedEvent.glyph` is the
+/// snapshot's joined value, and `command_glyphs` refuses anything
+/// `glyph_refusal` rejects before it gets here. This doc used to say
+/// "trusted config" and "validated when the wait armed", which is the
+/// belief that let a newline reach a row (codex 9a53f39): config is
+/// not trusted for its origin, and a check at arm time says nothing
+/// about a value edited after it. A reader that obtains a glyph some
+/// OTHER way validates it itself.
+///
+/// Drawing it at all is the point — leaving it undrawn made the
+/// validation a guard with no feature behind it (codex db5821e).
+pub(crate) fn badge_of(
+    glyph: Option<&str>,
+    backend: crate::cli::github::timeline::Backend,
+) -> &str {
+    glyph.unwrap_or(match backend {
+        crate::cli::github::timeline::Backend::Github => "gh",
+        crate::cli::github::timeline::Backend::Command => "cmd",
+    })
 }
 
 /// One-line description shared by the oneline and human renderers —
@@ -367,15 +421,18 @@ fn gh_describe(g: &crate::cli::github::timeline::MergedEvent) -> String {
     if let Some(a) = &g.actor {
         out.push_str(&format!("{a}  "));
     }
-    out.push_str(&g.event);
+    out.push_str(&g.kind);
     if let Some(d) = &g.detail {
         out.push_str(&format!("/{d}"));
     }
-    out.push_str(&format!("  {}", g.repo));
+    out.push_str(&format!("  {}", g.source));
     if let Some(n) = g.number {
         out.push_str(&format!("#{n}"));
     }
-    if let Some(t) = &g.title {
+    if g.failure {
+        out.push_str("  (this SOURCE is broken, not the world)");
+    }
+    if let Some(t) = &g.content {
         out.push_str(&format!("  “{t}”"));
     }
     out
@@ -541,7 +598,7 @@ fn print_human(items: &[TimelineItem], repo: &Path, shas: &[CommitSha]) -> anyho
                 if c {
                     println!("{}", gh_colored_row(g, mark));
                 } else {
-                    println!("gh {}{mark}", gh_describe(g));
+                    println!("{} {}{mark}", event_badge(g), gh_describe(g));
                 }
                 if !g.seen_by.is_empty() {
                     println!("Seen-by: {}", g.seen_by.join(", "));
@@ -793,6 +850,12 @@ pub(crate) enum OnelineRow {
         baseline: bool,
         /// The event's display time (epoch seconds).
         at: u64,
+        /// Which backend produced it — the gutter badge's default.
+        /// Hardcoding `gh` labelled every command source's events as
+        /// github (codex 80e1fb9).
+        backend: crate::cli::github::timeline::Backend,
+        /// The source's configured glyph, which the badge prefers.
+        glyph: Option<String>,
     },
     /// A timeline-read notice (corrupt/foreign logs) surfaced as a
     /// dim row — the TUI's rendering of the snapshot's notices.
@@ -839,6 +902,8 @@ pub(crate) fn oneline_items_rows(
                     unhandled: g.unhandled,
                     baseline: g.baseline,
                     at: g.at,
+                    backend: g.backend,
+                    glyph: g.glyph.clone(),
                 });
             }
         }
@@ -976,6 +1041,8 @@ pub(crate) fn oneline_plain_lines(rows: &[OnelineRow]) -> Vec<String> {
                 line,
                 unhandled,
                 baseline,
+                backend,
+                glyph,
                 ..
             } => {
                 let mark = if *unhandled {
@@ -985,7 +1052,7 @@ pub(crate) fn oneline_plain_lines(rows: &[OnelineRow]) -> Vec<String> {
                 } else {
                     ""
                 };
-                format!("gh {line}{mark}")
+                format!("{} {line}{mark}", badge_of(glyph.as_deref(), *backend))
             }
             OnelineRow::Notice(n) => format!("({n})"),
             OnelineRow::PlainCommit {
@@ -1071,7 +1138,7 @@ fn print_oneline(items: &[TimelineItem], repo: &Path, shas: &[CommitSha]) -> any
                 if c {
                     println!("{}", gh_colored_row(g, mark));
                 } else {
-                    println!("gh {}{mark}", gh_describe(g));
+                    println!("{} {}{mark}", event_badge(g), gh_describe(g));
                 }
             }
         }
@@ -1214,6 +1281,28 @@ enum LogJsonRow<'a> {
         unhandled: bool,
         baseline: bool,
     },
+    /// A command source's event. Its OWN shape, because the two
+    /// genuinely differ: there is no repo, number, actor or url, and
+    /// there is a `failure` flag that github has no analogue for.
+    /// Emitting these as `github_event` with the source name in
+    /// `repo` and the content in `title` was a lie the consumer had
+    /// no way to detect (codex 80e1fb9).
+    #[serde(rename = "command_event")]
+    Command {
+        ts: i64,
+        source: &'a str,
+        /// The sub-kind, named `event` like github's because the DTO
+        /// is tagged on `kind`.
+        event: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        content: Option<&'a str>,
+        /// The SOURCE is broken, rather than something it observed.
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        failure: bool,
+        seen_by: &'a [String],
+        unhandled: bool,
+        baseline: bool,
+    },
 }
 
 fn print_json(items: &[TimelineItem], repo: &Path, shas: &[CommitSha]) -> anyhow::Result<()> {
@@ -1248,18 +1337,31 @@ fn json_items<'a>(
             TimelineItem::Github(_, g) => {
                 out.extend(json_rows(&chunk, reviews));
                 chunk.clear();
-                out.push(LogJsonRow::Github {
-                    ts: i64::try_from(g.at).unwrap_or(i64::MAX),
-                    repo: &g.repo,
-                    event: &g.event,
-                    detail: g.detail.as_deref(),
-                    number: g.number,
-                    title: g.title.as_deref(),
-                    actor: g.actor.as_deref(),
-                    url: g.url.as_deref(),
-                    seen_by: &g.seen_by,
-                    unhandled: g.unhandled,
-                    baseline: g.baseline,
+                let ts = i64::try_from(g.at).unwrap_or(i64::MAX);
+                out.push(match g.backend {
+                    crate::cli::github::timeline::Backend::Github => LogJsonRow::Github {
+                        ts,
+                        repo: &g.source,
+                        event: &g.kind,
+                        detail: g.detail.as_deref(),
+                        number: g.number,
+                        title: g.content.as_deref(),
+                        actor: g.actor.as_deref(),
+                        url: g.url.as_deref(),
+                        seen_by: &g.seen_by,
+                        unhandled: g.unhandled,
+                        baseline: g.baseline,
+                    },
+                    crate::cli::github::timeline::Backend::Command => LogJsonRow::Command {
+                        ts,
+                        source: &g.source,
+                        event: &g.kind,
+                        content: g.content.as_deref(),
+                        failure: g.failure,
+                        seen_by: &g.seen_by,
+                        unhandled: g.unhandled,
+                        baseline: g.baseline,
+                    },
                 });
             }
         }
@@ -1353,11 +1455,14 @@ mod json_output_tests {
     fn gh(at: u64, key_hint: &str, unhandled: bool) -> crate::cli::github::timeline::MergedEvent {
         crate::cli::github::timeline::MergedEvent {
             at,
-            repo: "o/r".into(),
-            event: "pr_comment".into(),
+            backend: crate::cli::github::timeline::Backend::Github,
+            glyph: None,
+            source: "o/r".into(),
+            kind: "pr_comment".into(),
+            content: Some(key_hint.into()),
+            failure: false,
             detail: Some("review".into()),
             number: Some(12),
-            title: Some(key_hint.into()),
             actor: Some("alice".into()),
             url: None,
             seen_by: vec!["claude".into()],
@@ -1393,7 +1498,7 @@ mod json_output_tests {
         let shape: Vec<&str> = items
             .iter()
             .map(|i| match i {
-                TimelineItem::Github(_, g) => g.title.as_deref().unwrap(),
+                TimelineItem::Github(_, g) => g.content.as_deref().unwrap(),
                 TimelineItem::Repo(LogEvent::AdHoc { subject, .. }) => subject.as_str(),
                 _ => "?",
             })
@@ -1408,14 +1513,16 @@ mod json_output_tests {
             items
                 .iter()
                 .find_map(|i| match i {
-                    TimelineItem::Github(idx, g) if g.title.as_deref() == Some(title) => Some(*idx),
+                    TimelineItem::Github(idx, g) if g.content.as_deref() == Some(title) => {
+                        Some(*idx)
+                    }
                     _ => None,
                 })
                 .unwrap()
         };
-        assert_eq!(gh_events[idx_of("lead")].title.as_deref(), Some("lead"));
+        assert_eq!(gh_events[idx_of("lead")].content.as_deref(), Some("lead"));
         assert_eq!(
-            gh_events[idx_of("between")].title.as_deref(),
+            gh_events[idx_of("between")].content.as_deref(),
             Some("between")
         );
         assert_eq!(idx_of("lead"), 2, "original position, not display order");
@@ -1475,7 +1582,10 @@ mod json_output_tests {
             .iter()
             .map(|r| match r {
                 OnelineRow::Header { plan } => plan.as_deref().unwrap_or("adhoc"),
-                OnelineRow::Github { .. } => "gh",
+                OnelineRow::Github { backend, .. } => match backend {
+                    crate::cli::github::timeline::Backend::Github => "gh",
+                    crate::cli::github::timeline::Backend::Command => "cmd",
+                },
                 OnelineRow::Commit { .. } => "commit",
                 _ => "other",
             })
@@ -1507,6 +1617,123 @@ mod json_output_tests {
             lines[0].starts_with("gh ") && lines[0].ends_with(" ⚠"),
             "{lines:?}"
         );
+    }
+
+    /// `--no-github` takes GITHUB out, and nothing else.
+    ///
+    /// It discarded the whole snapshot, which was the same thing
+    /// while github was the only backend — and silently hid every
+    /// command source the moment one wasn't (codex db5821e).
+    #[test]
+    fn no_github_hides_github_events_and_keeps_command_ones() {
+        let ev = |backend, source: &str| crate::cli::github::timeline::MergedEvent {
+            at: 150,
+            backend,
+            glyph: None,
+            source: source.into(),
+            kind: "k".into(),
+            content: None,
+            failure: false,
+            detail: None,
+            number: None,
+            actor: None,
+            url: None,
+            seen_by: Vec::new(),
+            members: Vec::new(),
+            unhandled: true,
+            baseline: false,
+        };
+        let all = vec![
+            ev(crate::cli::github::timeline::Backend::Github, "o/r"),
+            ev(crate::cli::github::timeline::Backend::Command, "deploys"),
+        ];
+
+        let sources = |v: Vec<crate::cli::github::timeline::MergedEvent>| {
+            v.into_iter().map(|e| e.source).collect::<Vec<_>>()
+        };
+        assert_eq!(
+            sources(timeline_events_for(all.clone(), true)),
+            vec!["deploys"],
+            "the command source survives; only github is excluded",
+        );
+        assert_eq!(
+            sources(timeline_events_for(all, false)),
+            vec!["o/r", "deploys"],
+            "and without the flag, both — or this would pass by dropping everything",
+        );
+    }
+
+    /// A command event's LOG ROW and JSON say what it is.
+    ///
+    /// Every merged command event was emitted as `github_event` with
+    /// the source name in `repo` and the content in `title`, and the
+    /// gutter badge was hardcoded `gh` — a lie the consumer had no
+    /// way to detect, and the `failure` flag was dropped entirely
+    /// (codex 80e1fb9).
+    #[test]
+    fn a_command_events_row_and_json_are_not_dressed_up_as_github() {
+        let cmd = crate::cli::github::timeline::MergedEvent {
+            at: 150,
+            backend: crate::cli::github::timeline::Backend::Command,
+            glyph: None,
+            source: "deploys".into(),
+            kind: "clank.source-failure".into(),
+            content: Some("`sh -c ...` has stopped 3 times in a row".into()),
+            failure: true,
+            detail: None,
+            number: None,
+            actor: None,
+            url: None,
+            seen_by: vec!["claude".into()],
+            members: Vec::new(),
+            unhandled: true,
+            baseline: false,
+        };
+        let e = adhoc(100, "c");
+        let events: Vec<&LogEvent> = vec![&e];
+        let gh_events = vec![cmd];
+        let items = interleave(&events, &gh_events);
+
+        // THE ROW: its own badge.
+        let rows = oneline_items_rows(&items, &Default::default(), &Default::default());
+        let badge = rows
+            .iter()
+            .find_map(|r| match r {
+                OnelineRow::Github { backend, .. } => Some(*backend),
+                _ => None,
+            })
+            .expect("the command row is spliced in");
+        assert_eq!(badge, crate::cli::github::timeline::Backend::Command);
+        let lines = oneline_plain_lines(&rows);
+        assert!(
+            lines.iter().any(|l| l.starts_with("cmd ")),
+            "the gutter says what produced it: {lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.starts_with("gh ")),
+            "and never claims github: {lines:?}"
+        );
+        // A broken SOURCE reads as one, even here.
+        assert!(
+            lines.iter().any(|l| l.contains("this SOURCE is broken")),
+            "{lines:?}"
+        );
+
+        // THE JSON: its own shape, with no borrowed github fields.
+        let reviews = std::collections::BTreeMap::new();
+        let v = serde_json::to_value(json_items(&items, &reviews)).unwrap();
+        let row = v
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["kind"] == "command_event")
+            .expect("a command event is not a github_event");
+        assert_eq!(row["source"], "deploys");
+        assert_eq!(row["event"], "clank.source-failure");
+        assert_eq!(row["content"], "`sh -c ...` has stopped 3 times in a row");
+        assert_eq!(row["failure"], true, "the flag survives the JSON");
+        assert!(row.get("repo").is_none(), "no borrowed repo: {row}");
+        assert!(row.get("title").is_none(), "no borrowed title: {row}");
     }
 
     #[test]
@@ -1773,11 +2000,14 @@ mod tests {
         };
         let event = crate::cli::github::timeline::MergedEvent {
             at: 2,
-            repo: "o/r".into(),
-            event: "pr_comment".into(),
+            backend: crate::cli::github::timeline::Backend::Github,
+            glyph: None,
+            source: "o/r".into(),
+            kind: "pr_comment".into(),
+            content: None,
+            failure: false,
             detail: None,
             number: Some(1),
-            title: None,
             actor: None,
             url: None,
             seen_by: Vec::new(),

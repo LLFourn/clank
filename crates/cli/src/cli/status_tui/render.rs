@@ -1095,14 +1095,17 @@ pub(super) fn log_row_spans(
             line,
             unhandled,
             baseline,
+            backend,
+            glyph,
             ..
         } => {
             // Pre-watch history renders fully DIM — it's context, not
             // team activity (github-watch-resilience).
+            let badge = crate::cli::log::badge_of(glyph.as_deref(), *backend);
             let mut spans = if *baseline {
-                vec![dim(format!("gh {line} (pre-watch)"))]
+                vec![dim(format!("{badge} {line} (pre-watch)"))]
             } else {
-                vec![colored("36", "gh".to_string()), plain(format!(" {line}"))]
+                vec![colored("36", badge.to_string()), plain(format!(" {line}"))]
             };
             if *unhandled {
                 spans.push(colored("33", " ⚠".to_string()));
@@ -2891,8 +2894,16 @@ pub(super) fn render_event_detail(
     } else {
         "handled"
     };
+    // The row SAYS which backend produced it. Reading it off the
+    // carve-out instead labelled a sparse github event — no url, no
+    // number, no actor — as a command (codex 80e1fb9).
+    let origin = match (ev.backend, ev.failure) {
+        (_, true) => "source BROKEN",
+        (crate::cli::github::timeline::Backend::Github, _) => "github",
+        (crate::cli::github::timeline::Backend::Command, _) => "command",
+    };
     out.push(region_rule(
-        &format!("github · {}", ev.repo),
+        &format!("{origin} · {}", ev.source),
         state_hint,
         true,
         cols,
@@ -2973,13 +2984,20 @@ pub(super) fn render_event_detail(
         .as_deref()
         .map(|d| format!(" ({d})"))
         .unwrap_or_default();
-    fact(&mut body, "event", format!("{}{detail}", clean(&ev.event)));
+    fact(&mut body, "event", format!("{}{detail}", clean(&ev.kind)));
     fact(&mut body, "age", crate::cli::events::age(ev.at));
     if let Some(n) = ev.number {
         fact(&mut body, "number", format!("#{n}"));
     }
-    if let Some(t) = ev.title.as_deref() {
-        fact(&mut body, "title", clean(t));
+    if let Some(t) = ev.content.as_deref() {
+        // Github's word for it is `title`; every other backend just
+        // has content, and calling it a title is a small lie the
+        // operator has to see through.
+        let label = match ev.backend {
+            crate::cli::github::timeline::Backend::Github => "title",
+            crate::cli::github::timeline::Backend::Command => "content",
+        };
+        fact(&mut body, label, clean(t));
     }
     if let Some(a) = ev.actor.as_deref() {
         fact(&mut body, "actor", clean(a));
@@ -7358,11 +7376,14 @@ mod tests {
 
         let ev = crate::cli::github::timeline::MergedEvent {
             at: 0,
-            repo: "o/r".into(),
-            event: "pr_comment".into(),
+            backend: crate::cli::github::timeline::Backend::Github,
+            glyph: None,
+            source: "o/r".into(),
+            kind: "pr_comment".into(),
+            failure: false,
             detail: None,
             number: Some(12),
-            title: Some("Add the widget".into()),
+            content: Some("Add the widget".into()),
             actor: Some("hubot".into()),
             url: Some("https://github.com/o/r/pull/12".into()),
             seen_by: vec!["alpha".into()],
@@ -7412,6 +7433,86 @@ mod tests {
         );
     }
 
+    /// The event PAGE renders a command event, and does not dress it
+    /// up as github.
+    ///
+    /// The timeline carrying command rows is only half of it: this is
+    /// the surface an operator actually reads, and a page that says
+    /// "github · deploys" or prints an empty PR number is worse than
+    /// one that dropped the row (codex 4e47a2a).
+    #[test]
+    fn the_event_page_renders_a_command_event_without_githubs_extras() {
+        let ev = crate::cli::github::timeline::MergedEvent {
+            at: 0,
+            backend: crate::cli::github::timeline::Backend::Command,
+            glyph: None,
+            source: "deploys".into(),
+            kind: "deployed".into(),
+            failure: false,
+            content: Some("prod is live".into()),
+            detail: None,
+            number: None,
+            actor: None,
+            url: None,
+            seen_by: vec!["claude".into()],
+            unhandled: true,
+            baseline: false,
+            members: vec![crate::cli::github::timeline::MemberRef {
+                key: crate::cli::github::timeline::MemberKey {
+                    agent: "claude".into(),
+                    source: "command-deploys-0000abcd".into(),
+                    seq: 7,
+                    ident: String::new(),
+                },
+                acked: false,
+                transport: crate::cli::github::log::Transport::Command,
+                content: None,
+            }],
+        };
+        let ep = super::super::input::EventPage {
+            target: ev.members[0].key.clone(),
+            retained: ev.members.iter().map(|m| m.key.clone()).collect(),
+            event: ev,
+            prompts: Vec::new(),
+            scroll: 0,
+            content: None,
+        };
+        let (lines, _) =
+            render_event_detail(&ep, &super::super::input::actions_for(&ep), 0, 80, 60);
+        let joined = lines.join("\n");
+
+        // The HEADING, uppercased branding, is where the page says
+        // what kind of thing this is.
+        assert!(
+            joined.contains("COMMAND \u{b7} DEPLOYS"),
+            "the heading names the source: {joined}"
+        );
+        assert!(
+            !joined.contains("GITHUB"),
+            "a command source is not a repo, and the page must not say it is: {joined}"
+        );
+        assert!(joined.contains("deployed"), "its kind: {joined}");
+        assert!(joined.contains("prod is live"), "its content: {joined}");
+        // Its ack target is SOURCE-SCOPED, so acking it cannot reach
+        // another source's row at the same sequence.
+        assert!(
+            joined.contains("command-deploys-0000abcd@7"),
+            "the copy row addresses its own source: {joined}"
+        );
+        // The content's label is not github's word for it.
+        assert!(
+            joined.contains("content") && !joined.contains("title"),
+            "a command event has content, not a title: {joined}"
+        );
+        // Github's carve-out leaves no empty facts behind.
+        for absent in ["number", "actor", "url"] {
+            assert!(
+                !joined.contains(&format!("{absent}:")),
+                "`{absent}` is github's alone and must not render blank: {joined}"
+            );
+        }
+    }
+
     #[test]
     fn event_page_renders_actions_members_and_attributed_prompts() {
         // tui-github-event-page: the page shows its actions (browser
@@ -7433,11 +7534,14 @@ mod tests {
         };
         let ev = MergedEvent {
             at: 1,
-            repo: "o/r".into(),
-            event: "pr_comment".into(),
+            backend: crate::cli::github::timeline::Backend::Github,
+            glyph: None,
+            source: "o/r".into(),
+            kind: "pr_comment".into(),
+            failure: false,
             detail: Some("review".into()),
             number: Some(12),
-            title: Some("Add the widget".into()),
+            content: Some("Add the widget".into()),
             actor: Some("hubot".into()),
             url: Some("https://github.com/o/r/pull/12".into()),
             seen_by: vec!["alpha".into(), "beta".into()],

@@ -360,6 +360,7 @@ dependencies = [
  "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",
+ "unicode-width 0.2.2",
  "url",
  "which",
  "wincode",

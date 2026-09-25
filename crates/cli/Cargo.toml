@@ -4,6 +4,12 @@ version = "0.0.1"
 edition = "2024"
 
 [dependencies]
+# The scalar-width/property source of truth for the config's glyph
+# boundary. NOT for rendering: `status_tui::text` keeps its own
+# UCD-generated WIDE table, and a glyph must satisfy BOTH or the row
+# will not lay out the way validation promised (codex 408c756).
+unicode-width = "0.2"
+
 tokio = { version = "1", features = ["full"] }
 # github polling transport (github-http-client-and-realtime M1):
 # typed statuses/headers instead of parsing gh CLI output. rustls, no

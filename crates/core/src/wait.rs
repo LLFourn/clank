@@ -229,13 +229,43 @@ pub enum WaitItem {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         content: Option<ContentRef>,
     },
-    /// …and a command source completing (its exit IS the wake).
-    /// `exit_code` is `None` for a signal-killed child.
+    /// …and one event from a command source
+    /// (a-command-is-an-event-source-like-any-other): a line its
+    /// producer printed, deduplicated by the id the producer gave it.
+    ///
+    /// Milestone 1 keeps this its own variant; milestone 2 collapses
+    /// it and `GithubEvent` onto one shape with github's extras in a
+    /// carve-out.
     CommandEvent {
+        /// The configured source name — what the row is labelled with.
         name: String,
-        exit_code: Option<i32>,
-        /// Last ≤1 KiB of interleaved stdout+stderr.
-        output_tail: String,
+        /// The producer's own id, the dedup identity. Compared for
+        /// EQUALITY and nothing else: never ordered, never a resume
+        /// point, never parsed.
+        id: String,
+        /// The producer's `kind`, named `event` here because the enum
+        /// is internally tagged on `kind`, exactly as `GithubEvent`
+        /// names its sub-kind. Defaults to the source's name.
+        event: String,
+        /// The text a reader sees, control bytes already stripped.
+        content: String,
+        /// The producer's timestamp when it gave one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        at: Option<u64>,
+        /// Set when this is the source reporting that it cannot RUN,
+        /// rather than something it observed. A producer cannot forge
+        /// it: the kind is clank's own.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        failure: bool,
+        /// What to pass `clank events ack` to finish this one.
+        ///
+        /// Stamped at PRESENTATION time from the row's own sequence,
+        /// exactly as `GithubEvent` stamps `instructions`: the WAL
+        /// stores no copy, so appending is not a two-step write and
+        /// legacy bytes are unchanged. Absent means the event was
+        /// never logged and there is nothing to ack.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selector: Option<String>,
     },
     /// The open review's DRAFT changed under master
     /// (`the-review-session-watches-its-pr`). Master only, produced by
@@ -312,6 +342,124 @@ pub enum WaitItem {
         round: u64,
         next: PrMasterNext,
     },
+}
+
+/// One event, whatever produced it
+/// (a-command-is-an-event-source-like-any-other, milestone 2).
+///
+/// A PROJECTION, not the stored shape. The two persisted variants
+/// stay separate because they cannot be merged without a hand-written
+/// deserializer: `content` already means two different things on the
+/// wire — a typed [`ContentRef`] object on a github row, a plain
+/// string on a command row — so one variant cannot hold both and
+/// every github row already written would stop parsing. That is a
+/// durable-format migration, and the pending work it would put at
+/// risk is the exact thing this plan exists to protect.
+///
+/// What DOES collapse is every reader. Before this there were two
+/// near-identical arms in `describe`, in the wait's human renderer,
+/// and in the TUI, each pulling differently-named fields to render
+/// the same row. A third backend needed a third arm in each. Now it
+/// needs none.
+///
+/// Identity is deliberately absent: a command event carries its
+/// producer's id, and a github event's identity is the WAL row's
+/// `feed_id`/`action_key`, which the inspector already surfaces from
+/// [`EventRow`](crate::wait). A field that is always `None` for one
+/// source is the null-carrying this projection exists to remove.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventView<'a> {
+    /// What produced it: a repo for github, the configured name for a
+    /// command source.
+    pub source: &'a str,
+    /// The sub-kind within that source (`pr_comment`, `deployed`).
+    pub kind: &'a str,
+    /// The text a reader shows. Absent rather than empty, so readers
+    /// do not each re-decide what an empty string means.
+    pub content: Option<&'a str>,
+    /// The producer's own timestamp when it gave one. Github's event
+    /// time lives on the WAL row, not the item.
+    pub at: Option<u64>,
+    /// The watch's standing instructions (github-watch-prompts).
+    pub instructions: Option<&'a str>,
+    /// What to pass `clank events ack`, once a presenter has stamped
+    /// it from the row's sequence.
+    pub selector: Option<&'a str>,
+    /// The SOURCE is broken, rather than something it observed.
+    pub failure: bool,
+    /// The carve-out: what only github has.
+    pub github: Option<GithubBits<'a>>,
+}
+
+/// Github's extras — the things no other backend can supply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GithubBits<'a> {
+    /// Which payload class produced it, when it matters.
+    pub detail: Option<&'a str>,
+    pub number: Option<u64>,
+    pub actor: Option<&'a str>,
+    /// The actionable pointer at the thing that happened.
+    pub url: Option<&'a str>,
+    /// Which object carries this event's body.
+    pub content: Option<&'a ContentRef>,
+}
+
+impl WaitItem {
+    /// This item as an event, or `None` if it is not one.
+    ///
+    /// The one place the two persisted shapes are reconciled. Adding
+    /// a backend means adding an arm HERE and nowhere else.
+    pub fn event_view(&self) -> Option<EventView<'_>> {
+        match self {
+            WaitItem::GithubEvent {
+                repo,
+                event,
+                detail,
+                number,
+                title,
+                actor,
+                url,
+                instructions,
+                content,
+            } => Some(EventView {
+                source: repo,
+                kind: event,
+                // Github's displayable text IS the title; `content`
+                // there names an OBJECT, and rides the carve-out.
+                content: title.as_deref().filter(|t| !t.is_empty()),
+                at: None,
+                instructions: instructions.as_deref(),
+                selector: None,
+                failure: false,
+                github: Some(GithubBits {
+                    detail: detail.as_deref(),
+                    number: *number,
+                    actor: actor.as_deref(),
+                    url: url.as_deref(),
+                    content: content.as_ref(),
+                }),
+            }),
+            WaitItem::CommandEvent {
+                name,
+                event,
+                content,
+                at,
+                failure,
+                selector,
+                ..
+            } => Some(EventView {
+                source: name,
+                kind: event,
+                content: Some(content.as_str()).filter(|c| !c.is_empty()),
+                at: *at,
+                instructions: None,
+                selector: selector.as_deref(),
+                failure: *failure,
+                github: None,
+            }),
+            _ => None,
+        }
+    }
 }
 
 /// All facts about HEAD the invariant check needs, sans-io. The CLI

@@ -62,15 +62,27 @@ fn cmd_event(name: &str, argv: &[&str]) -> String {
     serde_json::json!({ "kind": "command", "name": name, "command": argv }).to_string()
 }
 
+/// A printed EVENT wakes a parked wait.
+///
+/// It used to be the command's completion
+/// (a-command-is-an-event-source-like-any-other): a source is a
+/// long-running producer now, so exiting is not news — a line is.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn command_completion_wakes_a_parked_wait() {
+async fn a_printed_event_wakes_a_parked_wait() {
     let _serial = common::serial();
     let env = idle_env();
     let repo = env.repo();
-    let ev = cmd_event("probe", &["sh", "-c", "sleep 0.4; echo the-payload"]);
+    let ev = cmd_event(
+        "probe",
+        &[
+            "sh",
+            "-c",
+            r#"sleep 0.4; printf '{"id":"1","kind":"probe","content":"the-payload"}\n'; sleep 300"#,
+        ],
+    );
     clank::cli::wait::run(wait_args(repo, vec![ev]))
         .await
-        .expect("the command's completion is the wake");
+        .expect("a line the producer printed is the wake");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -83,14 +95,22 @@ async fn returning_kills_the_whole_process_group() {
     // on it: only a group kill reaps the sleep.
     let script = format!("sleep 300 & echo $! > '{}'; wait", pidfile.display());
     let stuck = cmd_event("stuck", &["sh", "-c", &script]);
-    // A second source that DOES complete supplies the wake. The wait
-    // used to be ended by its own timeout; with the flag gone, the
-    // teardown path under test is reached the way production reaches
-    // it — by a wake (remove-wait-timeout).
-    let waker = cmd_event("waker", &["sh", "-c", "sleep 1.5"]);
+    // A second source EMITS to supply the wake. The wait used to be
+    // ended by its own timeout; with the flag gone, the teardown path
+    // under test is reached the way production reaches it — by a wake
+    // (remove-wait-timeout). It emits rather than completing, because
+    // completing is no longer a wake.
+    let waker = cmd_event(
+        "waker",
+        &[
+            "sh",
+            "-c",
+            r#"sleep 1.5; printf '{"id":"1","kind":"waker","content":"go"}\n'; sleep 300"#,
+        ],
+    );
     clank::cli::wait::run(wait_args(repo, vec![stuck, waker]))
         .await
-        .expect("the waker's completion returns the wait");
+        .expect("the waker's event returns the wait");
     let pid: i32 = std::fs::read_to_string(&pidfile)
         .expect("grandchild pidfile written")
         .trim()
@@ -110,28 +130,6 @@ async fn returning_kills_the_whole_process_group() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn chatty_output_is_bounded_and_signals_report_null_exit() {
-    // Both contracts via the JSON the wait would emit — exercised at
-    // the source-runner level through a real parked wait: a child that
-    // spews 100 KiB then exits still wakes with a bounded tail, and a
-    // self-killed child wakes with a null exit code. The emitted JSON
-    // goes to stdout (not capturable in-process), so these assert the
-    // OBSERVABLE contract: the wait returns Ok (woke) promptly rather
-    // than hanging, for both shapes.
-    let env = idle_env();
-    let repo = env.repo();
-    let chatty = cmd_event("chatty", &["sh", "-c", "yes xxxxxxxx | head -c 100000"]);
-    clank::cli::wait::run(wait_args(repo, vec![chatty]))
-        .await
-        .expect("bounded ring: a chatty child still wakes the wait");
-
-    let signaled = cmd_event("selfkill", &["sh", "-c", "kill -9 $$"]);
-    clank::cli::wait::run(wait_args(repo, vec![signaled]))
-        .await
-        .expect("a signal-killed child still wakes the wait");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn zero_source_wait_parks_to_its_timeout() {
     // A wait with NO event sources parks to its deadline and returns
     // parked. (The no-hot-loop fuse itself is pinned
@@ -141,76 +139,6 @@ async fn zero_source_wait_parks_to_its_timeout() {
     let env = idle_env();
     let repo = env.repo();
     common::assert_stays_parked(repo, wait_args(repo, vec![]), "idle with no sources").await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn root_exit_wakes_even_with_a_pipe_holding_descendant() {
-    // codex fc7a4ff: "command COMPLETING is the wake" means ROOT exit,
-    // not pipe EOF. The root backgrounds a sleeper that INHERITS
-    // stdout (holding the pipe open), then exits immediately. The wait
-    // must wake PROMPTLY on root exit — not stall until the sleeper
-    // ends or the timeout — and the sleeper must be group-killed.
-    let env = idle_env();
-    let repo = env.repo();
-    let pidfile = repo.join("holder.pid");
-    // `sleep 300 &` inherits stdout; the root echoes and exits. The
-    // 300s descendant IS the proof: if the code waited for pipe EOF
-    // instead of root exit, the wait would blow past its 20s timeout
-    // and return Err — so `run()` returning Ok within the timeout is
-    // itself the "root exit is the wake" assertion (no flaky
-    // wall-clock threshold under parallel load — codex fc7a4ff).
-    let script = format!("sleep 300 & echo $! > '{}'; echo done", pidfile.display());
-    let ev = cmd_event("root", &["sh", "-c", &script]);
-    clank::cli::wait::run(wait_args(repo, vec![ev]))
-        .await
-        .expect("root exit wakes within the timeout, despite the pipe-holding descendant");
-    let pid: i32 = std::fs::read_to_string(&pidfile)
-        .expect("descendant pidfile")
-        .trim()
-        .parse()
-        .unwrap();
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let alive = Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .status()
-        .unwrap()
-        .success();
-    assert!(
-        !alive,
-        "the pipe-holding descendant {pid} must be group-killed"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn root_exit_wakes_even_with_a_continuously_writing_descendant() {
-    // codex a69ddd8: a descendant that CONTINUOUSLY writes to the
-    // inherited pipe keeps every post-exit read succeeding — the
-    // per-read quiet timeout never trips. The absolute drain deadline
-    // must still complete the wake. `yes` writes forever to the
-    // inherited stdout; the root records its pid and exits.
-    let env = idle_env();
-    let repo = env.repo();
-    let pidfile = repo.join("yes.pid");
-    let script = format!("yes & echo $! > '{}'; echo done", pidfile.display());
-    let ev = cmd_event("root", &["sh", "-c", &script]);
-    clank::cli::wait::run(wait_args(repo, vec![ev]))
-        .await
-        .expect("root exit wakes despite a continuously-writing descendant");
-    let pid: i32 = std::fs::read_to_string(&pidfile)
-        .expect("descendant pidfile")
-        .trim()
-        .parse()
-        .unwrap();
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let alive = Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .status()
-        .unwrap()
-        .success();
-    assert!(
-        !alive,
-        "the continuously-writing descendant {pid} must be group-killed"
-    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -364,4 +292,91 @@ async fn malformed_event_json_is_an_arm_time_error() {
         format!("{err:#}").contains("invalid --event"),
         "error names the offending input: {err:#}"
     );
+}
+
+/// A command source that could never work fails the ARM, rather than
+/// printing from inside its task and leaving the wait running
+/// without it.
+///
+/// Both of these used to arm fine and then quietly return from the
+/// source task, so the operator got a wait that looked healthy and
+/// watched nothing (codex 072e459). A source the wait cannot run is
+/// a configuration error, and the wait refuses.
+#[tokio::test]
+async fn a_command_source_that_cannot_run_fails_the_arm() {
+    let _serial = common::serial();
+    let env = idle_env();
+    let repo = env.repo();
+
+    let empty = r#"{"kind":"command","name":"deploys","command":[]}"#;
+    let err = clank::cli::wait::run(wait_args(repo, vec![empty.into()]))
+        .await
+        .expect_err("an empty command has nothing to run");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("deploys") && msg.contains("empty command"),
+        "the error names the source and what is wrong: {msg}"
+    );
+
+    // A two-cell glyph would misalign every TUI row after it, and
+    // refusing at render is too late — so it refuses at arm.
+    let wide = r#"{"kind":"command","name":"noisy","command":["true"],"glyph":"💤"}"#;
+    let err = clank::cli::wait::run(wait_args(repo, vec![wide.into()]))
+        .await
+        .expect_err("a two-column glyph cannot sit in a one-column cell");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("noisy") && msg.contains("glyph"),
+        "the error names the source and the glyph: {msg}"
+    );
+
+    // The companion — that a VALID source is not refused — is a lib
+    // test (`cli::wait::tests::arm_time_validation_refuses_only_what_cannot_run`).
+    // It cannot live here: arming a good source PARKS, and an idle
+    // wait has no timeout to end it (remove-wait-timeout), so the
+    // only thing that would return is the backoff's failure event
+    // several seconds later. A test that depends on that is timing
+    // the constants, not the refusal.
+}
+
+/// A producer whose descendant holds the pipe open still wakes the
+/// wait, and the descendant dies with it.
+///
+/// Replaces three tests of the one-shot contract
+/// (a-command-is-an-event-source-like-any-other): root exit is no
+/// longer a wake, so "root exit wakes despite a pipe-holding /
+/// continuously-writing descendant" cannot be asserted here. The
+/// hazard those protected — a held pipe stalling the source — is
+/// asserted where the restart is observable, in
+/// `cli::wait::tests::a_pipe_holding_descendant_does_not_stall_the_restart`.
+/// What is integration-level is that the event still arrives and the
+/// group is still killed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pipe_holding_descendant_neither_blocks_the_wake_nor_survives_it() {
+    let _serial = common::serial();
+    let env = idle_env();
+    let repo = env.repo();
+    let pidfile = repo.join("holder.pid");
+    // `yes` inherits stdout AND writes to it forever: the pipe never
+    // reaches EOF and never goes quiet.
+    let script = format!(
+        r#"yes > /dev/null & echo $! > '{}'; sleep 300 & printf '{{"id":"1","kind":"k","content":"emitted"}}\n'; sleep 300"#,
+        pidfile.display()
+    );
+    let ev = cmd_event("holder", &["sh", "-c", &script]);
+    clank::cli::wait::run(wait_args(repo, vec![ev]))
+        .await
+        .expect("the event arrives despite a descendant holding the pipe");
+    let pid: i32 = std::fs::read_to_string(&pidfile)
+        .expect("descendant pidfile")
+        .trim()
+        .parse()
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let alive = Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .unwrap()
+        .success();
+    assert!(!alive, "descendant {pid} must die with the wait");
 }

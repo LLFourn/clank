@@ -85,20 +85,60 @@ pub(crate) fn resolve_content_ref<'a>(
     Some(first)
 }
 
+/// Which backend produced an event. CARRIED, never inferred.
+///
+/// The first version of this read it off the carve-out — github if a
+/// url, number or actor was present — and that was wrong in both
+/// directions: a sparse github row with none of the three read as a
+/// command event, and a command source named like a repo read as
+/// github (codex 80e1fb9). Which backend produced a row is a fact
+/// the row knows; guessing it from what the payload happens to
+/// contain is a false model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Backend {
+    Github,
+    Command,
+}
+
 /// One merged timeline entry.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub(crate) struct MergedEvent {
+    /// What KIND of backend produced it — the carve-out's presence is
+    /// a payload fact, not provenance.
+    pub(crate) backend: Backend,
+    /// The source's configured glyph, joined from the agent's CURRENT
+    /// config at presentation time — like a watch's prompt, and for
+    /// the same reason: it is display config, so editing it retitles
+    /// events already logged and the WAL stores no copy.
+    ///
+    /// Trusted because it comes from config, and validated for a
+    /// one-column display width when the wait arms. A producer never
+    /// reaches it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) glyph: Option<String>,
     /// Earliest display time across copies: each copy's github-side
     /// `event_at` when known, else its ingest time.
     pub(crate) at: u64,
-    pub(crate) repo: String,
-    pub(crate) event: String,
+    /// What produced it — a repo for github, the configured name for
+    /// a command source. Named `source`, not `repo`, because it is
+    /// no longer always a repo
+    /// (a-command-is-an-event-source-like-any-other).
+    pub(crate) source: String,
+    /// The sub-kind within that source.
+    pub(crate) kind: String,
+    /// The text a reader shows: github's title, a command event's
+    /// content.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) content: Option<String>,
+    /// This SOURCE is broken, rather than something it observed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) failure: bool,
+    // ── the github carve-out: absent for every other backend ──
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) detail: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) number: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) actor: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -143,6 +183,8 @@ struct Copy {
     ident: String,
     transport: crate::cli::github::log::Transport,
     display_at: u64,
+    backend: Backend,
+    glyph: Option<String>,
     aliases: Vec<(String, String)>,
     item: WaitItem,
     acked: bool,
@@ -167,6 +209,11 @@ pub(crate) fn timeline_snapshot(repo: &Path) -> TimelineSnapshot {
     };
     for agent in agents.flatten() {
         let label = agent.file_name().to_string_lossy().into_owned();
+        // Source key -> glyph, from this agent's CURRENT config. The
+        // glyph is presentation config, never stored in the WAL, so
+        // it is joined here exactly as a watch's prompt is
+        // (github-watch-prompts).
+        let glyphs = command_glyphs(repo, &label, &mut notices);
         let events_dir = agent.path().join("events");
         let Ok(files) = std::fs::read_dir(&events_dir) else {
             continue;
@@ -190,18 +237,43 @@ pub(crate) fn timeline_snapshot(repo: &Path) -> TimelineSnapshot {
                             read.foreign
                         ));
                     }
-                    // Non-github items can't merge and would render as
-                    // blank entries — filter, don't blank (codex
-                    // 92e9deb). (The github wait path only logs github
-                    // events today, so this is belt.)
+                    // Anything that projects as an EVENT belongs here;
+                    // non-events can't merge and would render as blank
+                    // entries, so they are filtered rather than blanked
+                    // (codex 92e9deb). This used to test for
+                    // `GithubEvent` and said so — "the github wait path
+                    // only logs github events today, so this is belt" —
+                    // which stopped being true the moment command
+                    // sources shared this log, turning the belt into a
+                    // silent drop (codex 4e47a2a).
                     copies.extend(read.rows.into_iter().filter_map(|r| {
-                        let WaitItem::GithubEvent {
-                            repo: event_repo, ..
-                        } = &r.item
-                        else {
-                            return None;
+                        let v = r.item.event_view()?;
+                        // NAMESPACED by backend and by the identity
+                        // that backend actually owns. Scoping on the
+                        // display source alone collided a command
+                        // source named `o/r` emitting id `123` with
+                        // github repo `o/r` at feed id `123` — one
+                        // merged entry, and the page's ack fanout then
+                        // acknowledged both (codex 80e1fb9). Github
+                        // keeps its repo, because its aliases must
+                        // cross agents' watches of the SAME repo;
+                        // a command source keys on its WAL stem, which
+                        // is its durable identity.
+                        let ns = match v.github {
+                            Some(_) => format!("gh:{}", v.source),
+                            None => format!("cmd:{stem}"),
                         };
-                        let event_repo = event_repo.clone();
+                        let backend = match v.github {
+                            Some(_) => Backend::Github,
+                            None => Backend::Command,
+                        };
+                        // The PRODUCER's time when it gave one: a
+                        // command source stores it on the item, and
+                        // rows written before the envelope carried it
+                        // would otherwise display as ingested-now and
+                        // sort as new (codex 80e1fb9).
+                        let display_at = r.event_at.or(v.at).unwrap_or(r.at);
+                        let event_repo = ns;
                         let mut aliases = Vec::new();
                         if let Some(id) = &r.feed_id {
                             aliases.push((event_repo.clone(), format!("f:{id}")));
@@ -215,7 +287,9 @@ pub(crate) fn timeline_snapshot(repo: &Path) -> TimelineSnapshot {
                             seq: r.seq,
                             ident: r.ident,
                             transport: r.transport,
-                            display_at: r.event_at.unwrap_or(r.at),
+                            display_at,
+                            backend,
+                            glyph: glyphs.get(stem).cloned(),
                             aliases,
                             item: r.item,
                             acked: r.acked,
@@ -236,6 +310,51 @@ pub(crate) fn timeline_snapshot(repo: &Path) -> TimelineSnapshot {
         events: merge(copies),
         notices: notices.into_iter().collect(),
     }
+}
+
+/// This agent's configured command-source glyphs, keyed by the WAL
+/// stem its events are filed under.
+///
+/// VALIDATED HERE, not trusted for having come from config. This
+/// reader deliberately loads the CURRENT config, independently of
+/// any wait — so an operator can edit a glyph after the events were
+/// logged, or open the log before the next arm, and neither path has
+/// run the arm-time check. A newline got through and broke every row
+/// after it (codex 9a53f39). Provenance is not a substitute for
+/// checking the value.
+///
+/// A refused glyph is REPORTED and dropped, so the event still shows
+/// with the backend's default badge: a bad character is a reason to
+/// lose the character, never the event. A source configured only via
+/// CLI `--event` has no config entry and falls back the same way.
+fn command_glyphs(
+    repo: &Path,
+    label: &str,
+    notices: &mut std::collections::BTreeSet<String>,
+) -> HashMap<String, String> {
+    let Ok(author) = clank_core::ids::AgentLabel::parse(label) else {
+        return HashMap::new();
+    };
+    let Ok(Some(cfg)) = crate::agent_store::load_agent_config(repo, &author) else {
+        return HashMap::new();
+    };
+    cfg.wait_events
+        .iter()
+        .filter_map(|s| match s {
+            clank_core::agent_config::WaitEventSource::Command(c) => {
+                let g = c.glyph.clone()?;
+                if let Some(why) = crate::cli::command_source::glyph_refusal(&g) {
+                    notices.insert(format!(
+                        "{label}: command source `{}` glyph {why} — showing the default badge",
+                        c.name
+                    ));
+                    return None;
+                }
+                Some((c.source_key(), g))
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 /// Union-find over copies sharing any alias; keyless copies stay
@@ -284,31 +403,22 @@ fn merge(copies: Vec<Copy>) -> Vec<MergedEvent> {
             let first = |get: &dyn Fn(&WaitItem) -> Option<String>| {
                 members.iter().find_map(|&i| get(&copies[i].item))
             };
-            let gh = |item: &WaitItem| match item {
-                WaitItem::GithubEvent {
-                    repo,
-                    event,
-                    detail,
-                    number,
-                    title,
-                    actor,
-                    url,
-                    // Presentation-time stamp; WAL rows never carry it.
-                    instructions: _,
-                    content: _,
-                } => Some((
-                    repo.clone(),
-                    event.clone(),
-                    detail.clone(),
-                    *number,
-                    title.clone(),
-                    actor.clone(),
-                    url.clone(),
-                )),
-                _ => None,
-            };
-            let (repo, event, detail, number, ..) =
-                gh(&copies[members[0]].item).unwrap_or_default();
+            // ONE extraction for every backend. `first` then fills
+            // each optional from the earliest member that has it, so a
+            // copy logged before a field existed does not blank it.
+            let (source, kind, detail, number, failure) = copies[members[0]]
+                .item
+                .event_view()
+                .map(|v| {
+                    (
+                        v.source.to_string(),
+                        v.kind.to_string(),
+                        v.github.as_ref().and_then(|g| g.detail).map(str::to_owned),
+                        v.github.as_ref().and_then(|g| g.number),
+                        v.failure,
+                    )
+                })
+                .unwrap_or_default();
             let mut seen_by: Vec<String> =
                 members.iter().map(|&i| copies[i].agent.clone()).collect();
             seen_by.sort();
@@ -324,22 +434,39 @@ fn merge(copies: Vec<Copy>) -> Vec<MergedEvent> {
                     },
                     acked: copies[i].acked,
                     transport: copies[i].transport,
-                    content: match &copies[i].item {
-                        WaitItem::GithubEvent { content, .. } => content.clone(),
-                        _ => None,
-                    },
+                    content: copies[i]
+                        .item
+                        .event_view()
+                        .and_then(|v| v.github.and_then(|g| g.content.cloned())),
                 })
                 .collect();
             member_refs.sort_by(|a, b| a.key.cmp(&b.key));
             let merged = MergedEvent {
                 at: copies[members[0]].display_at,
-                repo,
-                event,
+                // Provenance, from the first member in the same total
+                // order every other field uses.
+                backend: copies[members[0]].backend,
+                // First-some in the same total member order every
+                // other field uses: one agent configuring a glyph is
+                // enough, and a copy from an agent that did not
+                // never blanks it.
+                glyph: members.iter().find_map(|&i| copies[i].glyph.clone()),
+                source,
+                kind,
                 detail,
                 number,
-                title: first(&|i| gh(i).and_then(|g| g.4)),
-                actor: first(&|i| gh(i).and_then(|g| g.5)),
-                url: first(&|i| gh(i).and_then(|g| g.6)),
+                failure,
+                content: first(&|i| i.event_view().and_then(|v| v.content).map(str::to_owned)),
+                actor: first(&|i| {
+                    i.event_view()
+                        .and_then(|v| v.github?.actor)
+                        .map(str::to_owned)
+                }),
+                url: first(&|i| {
+                    i.event_view()
+                        .and_then(|v| v.github?.url)
+                        .map(str::to_owned)
+                }),
                 seen_by,
                 members: member_refs,
                 unhandled: members.iter().any(|&i| !copies[i].acked),
@@ -428,6 +555,425 @@ mod tests {
     use super::*;
     use crate::cli::github::log::Transport;
     use std::path::PathBuf;
+
+    /// A COMMAND event reaches the timeline, keeps its own source,
+    /// and does not steal github's carve-out.
+    ///
+    /// The filter here tested for `GithubEvent` and said why: "the
+    /// github wait path only logs github events today, so this is
+    /// belt." That stopped being true the moment command sources
+    /// shared this WAL, and the belt became a silent drop — both
+    /// rows pending, both projecting, and only one reaching the TUI
+    /// (codex 4e47a2a).
+    #[test]
+    fn a_command_event_reaches_the_timeline_beside_a_github_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let events = crate::agent_store::agents_root(repo)
+            .join("claude")
+            .join("events");
+        std::fs::create_dir_all(&events).unwrap();
+
+        let mut gh = EventLog::open(&events, "github-o-r-aaaa").unwrap();
+        gh.append_inbox(
+            crate::cli::github::log::Transport::Poll,
+            Some("f-1"),
+            None,
+            Some(100),
+            &item("o/r", 12, Some("Add the widget")),
+        )
+        .unwrap();
+
+        let mut cmd = EventLog::open(&events, "command-deploys-0000abcd").unwrap();
+        cmd.append_inbox(
+            crate::cli::github::log::Transport::Command,
+            Some("sha-abc"),
+            None,
+            Some(200),
+            &WaitItem::CommandEvent {
+                name: "deploys".into(),
+                id: "sha-abc".into(),
+                event: "deployed".into(),
+                content: "prod is live".into(),
+                at: None,
+                failure: false,
+                selector: None,
+            },
+        )
+        .unwrap();
+
+        let snap = timeline_snapshot(repo);
+        assert!(snap.notices.is_empty(), "{:?}", snap.notices);
+        assert_eq!(
+            snap.events.len(),
+            2,
+            "both events belong on the timeline: {:?}",
+            snap.events,
+        );
+
+        let c = snap
+            .events
+            .iter()
+            .find(|e| e.source == "deploys")
+            .expect("the command event is not dropped");
+        assert_eq!(c.kind, "deployed");
+        assert_eq!(c.content.as_deref(), Some("prod is live"));
+        assert!(c.unhandled, "still owed");
+        // The carve-out is github's alone — a command event must not
+        // sprout a PR number or an actor.
+        assert_eq!(
+            (c.number, c.actor.as_deref(), c.url.as_deref()),
+            (None, None, None)
+        );
+        // Its ack target is source-scoped and addresses ITS row.
+        assert_eq!(c.members.len(), 1);
+        assert_eq!(c.members[0].key.source, "command-deploys-0000abcd");
+
+        let g = snap
+            .events
+            .iter()
+            .find(|e| e.source == "o/r")
+            .expect("the github event still arrives");
+        assert_eq!(g.number, Some(12));
+        assert_eq!(g.content.as_deref(), Some("Add the widget"));
+        assert_eq!(g.actor.as_deref(), Some("alice"));
+        assert_eq!(g.members[0].key.source, "github-o-r-aaaa");
+    }
+
+    /// Two backends, the same NAME and the same ID, and they stay
+    /// two events.
+    ///
+    /// Aliases were scoped on the display source, which a command
+    /// source can set to anything: a source named `o/r` emitting id
+    /// `123` merged with github repo `o/r` at feed id `123`, and the
+    /// page's ack fanout then acknowledged the unrelated command
+    /// event along with the github one (codex 80e1fb9).
+    #[test]
+    fn a_command_source_named_like_a_repo_never_merges_with_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let events = crate::agent_store::agents_root(repo)
+            .join("claude")
+            .join("events");
+        std::fs::create_dir_all(&events).unwrap();
+
+        EventLog::open(&events, "github-o-r-aaaa")
+            .unwrap()
+            .append_inbox(
+                crate::cli::github::log::Transport::Poll,
+                Some("123"),
+                None,
+                Some(100),
+                &item("o/r", 12, Some("the github one")),
+            )
+            .unwrap();
+        EventLog::open(&events, "command-o-r-0000abcd")
+            .unwrap()
+            .append_inbox(
+                crate::cli::github::log::Transport::Command,
+                Some("123"),
+                None,
+                Some(200),
+                &WaitItem::CommandEvent {
+                    name: "o/r".into(),
+                    id: "123".into(),
+                    event: "deployed".into(),
+                    content: "the command one".into(),
+                    at: Some(200),
+                    failure: false,
+                    selector: None,
+                },
+            )
+            .unwrap();
+
+        let snap = timeline_snapshot(repo);
+        assert_eq!(
+            snap.events.len(),
+            2,
+            "same name, same id, different backends: still two events: {:?}",
+            snap.events,
+        );
+        // And each ack target addresses only its own WAL.
+        let mut sources: Vec<&str> = snap
+            .events
+            .iter()
+            .flat_map(|e| e.members.iter().map(|m| m.key.source.as_str()))
+            .collect();
+        sources.sort();
+        assert_eq!(sources, ["command-o-r-0000abcd", "github-o-r-aaaa"]);
+        for e in &snap.events {
+            assert_eq!(
+                e.members.len(),
+                1,
+                "acking one must not fan out to the other: {e:?}",
+            );
+        }
+    }
+
+    /// The configured GLYPH reaches the row.
+    ///
+    /// `CommandSource.glyph` is documented as the character the log
+    /// and the TUI draw this source's events with, and this plan
+    /// added load-time validation for it — while nothing drew it. A
+    /// validator for a contract no code implements is a guard with
+    /// no feature behind it (codex db5821e).
+    #[test]
+    fn a_configured_glyph_reaches_the_row_and_absence_falls_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let agents = crate::agent_store::agents_root(repo);
+        let events = agents.join("claude").join("events");
+        std::fs::create_dir_all(&events).unwrap();
+
+        let glyphed = clank_core::agent_config::CommandSource {
+            name: "deploys".into(),
+            command: vec!["true".into()],
+            glyph: Some("*".into()),
+        };
+        let plain = clank_core::agent_config::CommandSource {
+            name: "builds".into(),
+            command: vec!["true".into()],
+            glyph: None,
+        };
+        let cfg = clank_core::agent_config::AgentConfig {
+            wait_events: vec![
+                clank_core::agent_config::WaitEventSource::Command(glyphed.clone()),
+                clank_core::agent_config::WaitEventSource::Command(plain.clone()),
+            ],
+            ..Default::default()
+        };
+        std::fs::write(
+            agents.join("claude").join("config.json"),
+            serde_json::to_string(&cfg).unwrap(),
+        )
+        .unwrap();
+
+        for (src, id) in [(&glyphed, "a"), (&plain, "b")] {
+            EventLog::open(&events, &src.source_key())
+                .unwrap()
+                .append_inbox(
+                    crate::cli::github::log::Transport::Command,
+                    Some(id),
+                    None,
+                    Some(100),
+                    &WaitItem::CommandEvent {
+                        name: src.name.clone(),
+                        id: id.into(),
+                        event: "ran".into(),
+                        content: "x".into(),
+                        at: Some(100),
+                        failure: false,
+                        selector: None,
+                    },
+                )
+                .unwrap();
+        }
+
+        let snap = timeline_snapshot(repo);
+        let glyph_of = |source: &str| {
+            snap.events
+                .iter()
+                .find(|e| e.source == source)
+                .unwrap_or_else(|| panic!("{source} is on the timeline"))
+                .glyph
+                .clone()
+        };
+        assert_eq!(glyph_of("deploys").as_deref(), Some("*"));
+        assert!(
+            snap.notices.is_empty(),
+            "a valid glyph is quiet: {:?}",
+            snap.notices
+        );
+        assert_eq!(
+            glyph_of("builds"),
+            None,
+            "no glyph configured means the backend's default badge",
+        );
+
+        // And it reaches the actual printed row.
+        let items: Vec<crate::cli::log::TimelineItem> = snap
+            .events
+            .iter()
+            .enumerate()
+            .map(|(i, e)| crate::cli::log::TimelineItem::Github(i, e))
+            .collect();
+        let rows =
+            crate::cli::log::oneline_items_rows(&items, &Default::default(), &Default::default());
+        let lines = crate::cli::log::oneline_plain_lines(&rows);
+        assert!(
+            lines.iter().any(|l| l.starts_with("* ")),
+            "the configured glyph is the gutter badge: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.starts_with("cmd ")),
+            "and an unconfigured source keeps the default: {lines:?}"
+        );
+    }
+
+    /// A glyph EDITED after the events were logged is still checked.
+    ///
+    /// The join reads CURRENT config, independently of any wait, so
+    /// nothing here has run the arm-time validation: an operator can
+    /// change the glyph and open the log without arming again. A
+    /// newline got through and broke every row after it (codex
+    /// 9a53f39) — trusting the config's origin says nothing about
+    /// its current value.
+    #[test]
+    fn a_glyph_edited_after_the_fact_is_refused_and_the_event_survives() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let agents = crate::agent_store::agents_root(repo);
+        let events = agents.join("claude").join("events");
+        std::fs::create_dir_all(&events).unwrap();
+
+        let src = clank_core::agent_config::CommandSource {
+            name: "deploys".into(),
+            command: vec!["true".into()],
+            glyph: Some("*".into()),
+        };
+        EventLog::open(&events, &src.source_key())
+            .unwrap()
+            .append_inbox(
+                crate::cli::github::log::Transport::Command,
+                Some("a"),
+                None,
+                Some(100),
+                &WaitItem::CommandEvent {
+                    name: "deploys".into(),
+                    id: "a".into(),
+                    event: "ran".into(),
+                    content: "x".into(),
+                    at: Some(100),
+                    failure: false,
+                    selector: None,
+                },
+            )
+            .unwrap();
+
+        let write_glyph = |g: &str| {
+            let cfg = clank_core::agent_config::AgentConfig {
+                wait_events: vec![clank_core::agent_config::WaitEventSource::Command(
+                    clank_core::agent_config::CommandSource {
+                        glyph: Some(g.to_string()),
+                        ..src.clone()
+                    },
+                )],
+                ..Default::default()
+            };
+            std::fs::write(
+                agents.join("claude").join("config.json"),
+                serde_json::to_string(&cfg).unwrap(),
+            )
+            .unwrap();
+        };
+
+        // Each of these passes JSON deserialization and each breaks
+        // the row: a newline moves the cursor, a sleeping emoji takes
+        // two columns, and a base plus a combining mark is two
+        // scalars in a one-cell slot.
+        for bad in ["\n", "\u{1F4A4}", "e\u{0301}"] {
+            write_glyph(bad);
+            let snap = timeline_snapshot(repo);
+            assert_eq!(snap.events.len(), 1, "the EVENT survives a bad glyph");
+            assert_eq!(
+                snap.events[0].glyph, None,
+                "{bad:?} must not reach the renderer",
+            );
+            assert!(
+                snap.notices.iter().any(|n| n.contains("deploys")),
+                "and the operator is told which source: {:?}",
+                snap.notices,
+            );
+        }
+
+        // Fixing it fixes it, with no arm in between.
+        write_glyph("*");
+        let snap = timeline_snapshot(repo);
+        assert_eq!(snap.events[0].glyph.as_deref(), Some("*"));
+        assert!(snap.notices.is_empty(), "{:?}", snap.notices);
+    }
+
+    /// A SPARSE github event is still a github event.
+    ///
+    /// The backend used to be read off the carve-out, so a row with
+    /// no url, number or actor — which every `branch_push` is —
+    /// reported itself as a command source (codex 80e1fb9).
+    #[test]
+    fn a_github_event_with_no_extras_is_still_github() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let events = crate::agent_store::agents_root(repo)
+            .join("claude")
+            .join("events");
+        std::fs::create_dir_all(&events).unwrap();
+        EventLog::open(&events, "github-o-r-aaaa")
+            .unwrap()
+            .append_inbox(
+                crate::cli::github::log::Transport::Poll,
+                Some("f-1"),
+                None,
+                Some(100),
+                &WaitItem::GithubEvent {
+                    repo: "o/r".into(),
+                    event: "branch_push".into(),
+                    detail: None,
+                    number: None,
+                    title: None,
+                    actor: None,
+                    url: None,
+                    instructions: None,
+                    content: None,
+                },
+            )
+            .unwrap();
+
+        let snap = timeline_snapshot(repo);
+        assert_eq!(snap.events.len(), 1);
+        assert_eq!(snap.events[0].backend, Backend::Github);
+    }
+
+    /// A command event's own timestamp reaches the timeline.
+    ///
+    /// The envelope carries it now, and rows written before it did
+    /// fall back to the item — otherwise a replayed or backfilled
+    /// event displays as ingested-now and sorts as new (codex
+    /// 80e1fb9).
+    #[test]
+    fn a_command_events_producer_time_survives_an_empty_envelope() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let events = crate::agent_store::agents_root(repo)
+            .join("claude")
+            .join("events");
+        std::fs::create_dir_all(&events).unwrap();
+        EventLog::open(&events, "command-deploys-0000abcd")
+            .unwrap()
+            .append_inbox(
+                crate::cli::github::log::Transport::Command,
+                Some("sha-abc"),
+                None,
+                // EMPTY envelope, as every row written before the
+                // supervisor populated it.
+                None,
+                &WaitItem::CommandEvent {
+                    name: "deploys".into(),
+                    id: "sha-abc".into(),
+                    event: "deployed".into(),
+                    content: "prod is live".into(),
+                    at: Some(123),
+                    failure: false,
+                    selector: None,
+                },
+            )
+            .unwrap();
+
+        let snap = timeline_snapshot(repo);
+        assert_eq!(snap.events.len(), 1);
+        assert_eq!(
+            snap.events[0].at, 123,
+            "the producer's time, not the ingest epoch",
+        );
+    }
 
     fn item(repo: &str, n: u64, title: Option<&str>) -> WaitItem {
         WaitItem::GithubEvent {
@@ -576,7 +1122,7 @@ mod tests {
         let merged = timeline_snapshot(&repo).events;
         assert_eq!(merged.len(), 1, "bridged into one entry: {merged:?}");
         assert_eq!(merged[0].at, 1_000, "earliest time wins");
-        assert_eq!(merged[0].title.as_deref(), Some("fix the thing"));
+        assert_eq!(merged[0].content.as_deref(), Some("fix the thing"));
         assert!(merged[0].unhandled);
     }
 

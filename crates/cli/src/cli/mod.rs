@@ -15,6 +15,7 @@ pub mod attending;
 pub mod auto;
 pub mod block;
 pub mod command;
+pub mod command_source;
 pub mod config;
 pub mod diff;
 pub mod doctor;

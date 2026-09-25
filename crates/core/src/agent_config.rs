@@ -217,15 +217,61 @@ impl GithubEventKind {
     }
 }
 
-/// Spawn a command when the wait arms; its COMPLETION is the wake.
+/// A long-running producer streaming JSONL events
+/// (a-command-is-an-event-source-like-any-other). One object per line
+/// on stdout is one event; stderr is diagnostics. Supervised: it is
+/// expected to stay up, restarted with backoff when it does not.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommandSource {
-    /// Labels the wake item.
+    /// Labels the wake item, and IDENTIFIES the source: its durable
+    /// state — resume token and decision window — is keyed on this
+    /// alone. See [`CommandSource::source_key`].
     pub name: String,
     /// Argv — program + args, NO implicit shell (write
     /// `["sh", "-c", "…"]` to get one). Runs in its own process
     /// group; the group is killed when the wait exits without it.
     pub command: Vec<String>,
+    /// The single character the log and the TUI draw this source's
+    /// events with. Config, not per-line, so an untrusted producer
+    /// cannot reach the renderer's layout; validated at load for a
+    /// display width of exactly one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub glyph: Option<String>,
+}
+
+impl CommandSource {
+    /// The identity its durable state is filed under.
+    ///
+    /// The NAME alone. Not the argv (fixing a path in a command does
+    /// not make it a different source), not the filter (see `kinds`),
+    /// not the glyph (cosmetic) — the same reasoning that keeps a
+    /// github watch's prompt out of its key.
+    ///
+    /// Slug PLUS a hash of the whole name, as the github key does.
+    /// The slug alone is lossy — `build/test` and `build-test` both
+    /// flatten to `build-test` — and this key owns the ingest lease
+    /// and the resume/decision state, so a collision would make two
+    /// unrelated sources contend for one lease and advance each
+    /// other's checkpoint past events they never saw (codex c6dc55f).
+    pub fn source_key(&self) -> String {
+        let slug: String = self
+            .name
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_') {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        let mut h: u32 = 0x811c_9dc5;
+        for b in self.name.as_bytes() {
+            h ^= u32::from(*b);
+            h = h.wrapping_mul(0x0100_0193);
+        }
+        format!("command-{slug}-{h:08x}")
+    }
 }
 
 /// Resolve a session's effective auto-mode from the per-agent
@@ -332,6 +378,70 @@ pub struct Session {
 
 #[cfg(test)]
 mod tests {
+    fn cmd(name: &str) -> CommandSource {
+        CommandSource {
+            name: name.into(),
+            command: vec!["true".into()],
+            glyph: None,
+        }
+    }
+
+    /// Names that SLUG the same must not key the same.
+    ///
+    /// The key owns the ingest lease and the resume/decision state,
+    /// so a collision makes two unrelated sources contend for one
+    /// lease and advance each other's checkpoint past events they
+    /// never saw (codex c6dc55f).
+    #[test]
+    fn distinct_names_never_share_a_key() {
+        let colliding = [
+            ("build/test", "build-test"),
+            ("a b", "a-b"),
+            ("ci:deploy", "ci-deploy"),
+            ("café", "caf-"),
+        ];
+        for (a, b) in colliding {
+            assert_ne!(
+                cmd(a).source_key(),
+                cmd(b).source_key(),
+                "`{a}` and `{b}` slug alike and must still key apart",
+            );
+        }
+        // And the same name keys the same, every time.
+        assert_eq!(
+            cmd("build/test").source_key(),
+            cmd("build/test").source_key()
+        );
+    }
+
+    /// The key is the NAME's alone: everything else may change
+    /// without orphaning the source's durable state.
+    ///
+    /// Re-keying is not free — the old state file is stranded, the
+    /// window it held is lost, and a widened filter would re-offer
+    /// every event still in the producer's reach.
+    #[test]
+    fn the_key_survives_every_change_but_a_rename() {
+        let base = cmd("deploys");
+        let key = base.source_key();
+
+        let mut argv = base.clone();
+        argv.command = vec!["sh".into(), "-c".into(), "other".into()];
+        assert_eq!(
+            argv.source_key(),
+            key,
+            "fixing a command is not a new source"
+        );
+
+        let mut glyph = base.clone();
+        glyph.glyph = Some("*".into());
+        assert_eq!(glyph.source_key(), key, "the glyph is cosmetic");
+
+        let mut renamed = base.clone();
+        renamed.name = "deploys-2".into();
+        assert_ne!(renamed.source_key(), key, "a rename IS a new source");
+    }
+
     use super::*;
 
     fn session_id(s: &str) -> SessionId {

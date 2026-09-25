@@ -34,7 +34,7 @@ use super::status::{StatusSnapshot, spawn_sigwinch_forwarder, watch_status_paths
 
 mod event_content;
 pub(crate) mod lease;
-mod text;
+pub(crate) mod text;
 // Re-export for `open_zellij`'s tab/pane renamer, which strips the same
 // stale lamp prefix. (The IO shell itself uses no text primitives — the
 // view modules do.)
@@ -780,7 +780,7 @@ fn retarget_event_page(
     if content_needs_refetch(ep.content.as_ref().map(|c| &c.target), now.as_ref()) {
         ep.content = now.map(|target| {
             *next_generation += 1;
-            fetch = Some((ep.event.repo.clone(), target.clone(), *next_generation));
+            fetch = Some((ep.event.source.clone(), target.clone(), *next_generation));
             event_content::ContentSlot::requesting(target, *next_generation)
         });
     }
@@ -3850,7 +3850,7 @@ pub(crate) async fn run_tui(
                                             slot.retry(content_generation);
                                             spawn_content_fetch(
                                                 &ev_tx_content,
-                                                live.event.repo.clone(),
+                                                live.event.source.clone(),
                                                 slot.target.clone(),
                                                 content_generation,
                                             );
@@ -4174,7 +4174,7 @@ pub(crate) async fn run_tui(
                                             content_generation += 1;
                                             spawn_content_fetch(
                                                 &ev_tx_content,
-                                                ev.repo.clone(),
+                                                ev.source.clone(),
                                                 target.clone(),
                                                 content_generation,
                                             );
@@ -4912,11 +4912,14 @@ pub(crate) mod tests {
     ) -> crate::cli::github::timeline::MergedEvent {
         crate::cli::github::timeline::MergedEvent {
             at: 1,
-            repo: "o/r".into(),
-            event: "issue_opened".into(),
+            backend: crate::cli::github::timeline::Backend::Github,
+            glyph: None,
+            source: "o/r".into(),
+            kind: "issue_opened".into(),
+            failure: false,
             detail: None,
             number: None,
-            title: None,
+            content: None,
             actor: None,
             url: None,
             seen_by: members.iter().map(|m| m.key.agent.clone()).collect(),

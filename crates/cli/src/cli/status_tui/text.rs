@@ -208,7 +208,7 @@ pub(super) fn row_line(spans: &[Span], selected: bool, color: &str, cols: usize)
 /// Every line a renderer emits must be a single terminal row — a raw
 /// `initial_prompt` with newlines would otherwise inject extra rows and
 /// break the clamp.
-pub(super) fn one_line(s: &str, cols: usize) -> String {
+pub(crate) fn one_line(s: &str, cols: usize) -> String {
     let first: String = strip_escapes(s)
         .lines()
         .next()
@@ -484,7 +484,7 @@ pub(super) fn char_width(c: char) -> usize {
     if hit.is_ok() { 2 } else { 1 }
 }
 
-pub(super) fn display_width(s: &str) -> usize {
+pub(crate) fn display_width(s: &str) -> usize {
     s.chars().map(char_width).sum()
 }
 

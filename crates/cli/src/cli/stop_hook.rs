@@ -1847,8 +1847,13 @@ pub(crate) struct WaitItem {
     url: Option<String>,
     /// The watch's operator prompt (github-watch-prompts).
     instructions: Option<String>,
-    exit_code: Option<i64>,
-    output_tail: Option<String>,
+    /// A command event's payload
+    /// (a-command-is-an-event-source-like-any-other). `event` and
+    /// `title` above are shared with the github item.
+    content: Option<String>,
+    failure: Option<bool>,
+    /// What `clank events ack` takes for this one.
+    selector: Option<String>,
     /// A draft change's payload (the-review-session-watches-its-pr).
     /// `pr` is shared with the pr-review items above.
     comment: Option<u64>,
@@ -1941,16 +1946,14 @@ pub(crate) fn discharge_of(kind: &str, reason: Option<&str>) -> Option<Discharge
         "draft_changed" => {
             OneShot("read the draft before your next round; do not reply to it, and do not ack it")
         }
-        // REPEATING, despite looking like a one-off. Command sources
-        // are spawned once per wait, and every stop-hook re-arm starts
-        // them again — so a source that exits immediately re-fires on
-        // every re-arm (extra-wait-events). Classifying it from the
-        // single wait process rather than the re-arm loop is how it
-        // read as one-shot.
-        "command_event" => Until(
-            "fires again on every re-arm unless the source BLOCKS until a real event — \
-             change or remove the command source to stop it",
-        ),
+        // Same discharge as a github event, because it is the same
+        // WAL: a command source's event is durable, re-presented on
+        // every arm, and finished by an ack
+        // (a-command-is-an-event-source-like-any-other). It used to
+        // say "change or remove the command source" — true when an
+        // exiting producer WAS the event, and advice to break the
+        // watch now that one isn't.
+        "command_event" => Until("fires until the event is acked — `clank events ack`"),
         "for_commit" | "for_finished" | "for_blocked" => ObserverOnly,
         // Unknown/future kinds render WITHOUT a condition rather than
         // guessing: the subprocess boundary stays fail-soft.
@@ -2150,18 +2153,29 @@ fn render_wait_items_ref(items: &[&WaitItem], label: &AgentLabel, role: Role) ->
             }
             "command_event" => {
                 let name = item.name.as_deref().unwrap_or("?");
-                let exit = match item.exit_code {
-                    Some(c) => format!("exit {c}"),
-                    None => "signaled".to_string(),
-                };
-                let snip = item
-                    .output_tail
+                let event = item.event.as_deref().unwrap_or("?");
+                let content = item
+                    .content
                     .as_deref()
-                    .and_then(|t| t.lines().last())
-                    .filter(|l| !l.is_empty())
-                    .map(|l| format!(": {l}"))
+                    .filter(|c| !c.is_empty())
+                    .map(|c| format!(": {c}"))
                     .unwrap_or_default();
-                out.push_str(&format!("  - command: {name} {exit}{snip}\n"));
+                // A source reporting itself broken is not news about
+                // the world, and the remedy is not to act on it.
+                let lead = if item.failure.unwrap_or(false) {
+                    "command source BROKEN"
+                } else {
+                    "command"
+                };
+                // Named here, not left to a `clank events list`: the
+                // line that says an event is owed should say how to
+                // finish it.
+                let ack = item
+                    .selector
+                    .as_deref()
+                    .map(|s| format!(" — ack `clank events ack {s}`"))
+                    .unwrap_or_default();
+                out.push_str(&format!("  - {lead}: {name} {event}{content}{ack}\n"));
             }
             "draft_changed" => {
                 let pr = item.pr.map(|n| format!("#{n}")).unwrap_or("?".into());
@@ -2865,11 +2879,17 @@ mod tests {
         }
     }
 
-    /// The DRIFT GUARD. An exhaustive match over the core enum, so
-    /// adding a `WaitItem` variant without classifying it fails to
-    /// compile. String matching on the hook's loose projection cannot
-    /// give exhaustiveness, which is how `fix_commit_tag` reached the
-    /// catchall unnoticed in the first place.
+    /// The DRIFT GUARD, and only half of one. Exhaustive over the
+    /// core enum, so adding a `WaitItem` variant stops the build here
+    /// and lands its author in the test below. String matching on the
+    /// hook's loose projection cannot give exhaustiveness, which is
+    /// how `fix_commit_tag` reached the catchall unnoticed.
+    ///
+    /// What it cannot do is prove the new tag reached a list in that
+    /// test — nothing links the two but a reader. It was DEAD until
+    /// `a-command-is-an-event-source-like-any-other`, guarding
+    /// nothing while `command_event`'s classification went stale
+    /// underneath it, which is the other way this drifts.
     fn wire_tag_of(item: &clank_core::wait::WaitItem) -> &'static str {
         use clank_core::wait::WaitItem as W;
         match item {
@@ -2929,13 +2949,29 @@ mod tests {
             "unblocked",
             "blocked",
             "idle",
-            // Re-armed command sources re-fire; see `discharge_of`.
+            // A command event is a WAL row like a github one, owed
+            // until it is acked.
             "command_event",
         ];
         for k in repeating {
             assert!(
                 matches!(discharge_of(k, None), Some(Until(_))),
                 "{k} repeats and must state what ends it"
+            );
+        }
+        // An event owed until it is ACKED must say so by naming the
+        // command. `Until(_)` alone passed while `command_event`
+        // still told the agent to change or remove its source — true
+        // when an exiting producer WAS the event, and advice to break
+        // the watch once it is a WAL row
+        // (a-command-is-an-event-source-like-any-other).
+        for k in ["github_event", "command_event"] {
+            let Some(Until(t)) = discharge_of(k, None) else {
+                panic!("{k} must state what ends it")
+            };
+            assert!(
+                t.contains("acked") && t.contains("clank events ack"),
+                "{k} is discharged by an ack and must name it: {t}",
             );
         }
         for k in ["finished", "adhoc_settled", "draft_changed"] {
@@ -2951,6 +2987,14 @@ mod tests {
                 "{k} is watcher delivery, classified rather than skipped"
             );
         }
+        // Keeps the compile-time half above LIVE. Dead, it compiles
+        // whatever the enum does and guards nothing.
+        assert_eq!(
+            wire_tag_of(&clank_core::wait::WaitItem::Idle {
+                prompt: String::new(),
+            }),
+            "idle",
+        );
     }
 
     #[test]
@@ -3861,6 +3905,52 @@ mod tests {
         );
     }
 
+    /// A source reporting ITSELF broken does not read as news about
+    /// the world.
+    ///
+    /// The agent's remedy is different — the watch is not working, so
+    /// there is nothing out there to act on — and an item that reads
+    /// like an ordinary event invites acting on it.
+    #[test]
+    fn a_broken_source_does_not_read_as_something_it_observed() {
+        let wire = |failure| {
+            serde_json::json!({
+                "items": [serde_json::to_value(crate::cli::wait::render_json(
+                    &clank_core::wait::WaitItem::CommandEvent {
+                        name: "deploys".into(),
+                        id: "x".into(),
+                        event: "e".into(),
+                        content: "`sh -c ...` has stopped 3 times in a row".into(),
+                        at: None,
+                        failure,
+                        selector: Some("command-deploys-0000abcd@2".into()),
+                    },
+                ))
+                .unwrap()]
+            })
+        };
+        let label = AgentLabel::parse("codex").unwrap();
+        let render = |failure| {
+            let items = parse_wait_json(wire(failure).to_string().as_bytes()).unwrap();
+            render_wait_items(&items, &label, Role::Reviewer)
+        };
+        let broken = render(true);
+        assert!(
+            broken.contains("command source BROKEN: deploys"),
+            "{broken}"
+        );
+        assert!(
+            !render(false).contains("BROKEN"),
+            "an ordinary event is not a breakage"
+        );
+        // Still ackable: a report the agent cannot finish wakes it
+        // forever.
+        assert!(
+            broken.contains("clank events ack command-deploys-0000abcd@2"),
+            "{broken}",
+        );
+    }
+
     #[test]
     fn external_wake_hints_render_their_payload() {
         // external-wake-hints-carry-payload: the codex in-hook hints
@@ -3879,12 +3969,23 @@ mod tests {
                     "actor": "hubot",
                     "url": "https://github.com/o/r/pull/12"
                 },
-                {
-                    "kind": "command_event",
-                    "name": "signal",
-                    "exit_code": null,
-                    "output_tail": "line one\nlast line"
-                },
+                // The REAL wire, serialized from a real item: the
+                // last fixture here was hand-written and still
+                // carried `exit_code`/`output_tail` long after the
+                // wake stopped having them
+                // (a-command-is-an-event-source-like-any-other).
+                serde_json::to_value(crate::cli::wait::render_json(
+                    &clank_core::wait::WaitItem::CommandEvent {
+                        name: "signal".into(),
+                        id: "sha-abc".into(),
+                        event: "deployed".into(),
+                        content: "prod is live".into(),
+                        at: None,
+                        failure: false,
+                        selector: Some("command-signal-0000abcd@7".into()),
+                    },
+                ))
+                .unwrap(),
                 { "kind": "some_future_kind", "plan": "p", "sha": "abcdef123456789" }
             ]
         });
@@ -3899,8 +4000,11 @@ mod tests {
             "github hint carries the payload: {out}"
         );
         assert!(
-            out.contains("  - command: signal signaled: last line"),
-            "command hint carries name/exit/tail snippet: {out}"
+            out.contains(
+                "  - command: signal deployed: prod is live — ack \
+                 `clank events ack command-signal-0000abcd@7`"
+            ),
+            "the command hint carries the payload AND how to finish it: {out}"
         );
         // Unknown future kinds still fall through loose (fail-soft).
         assert!(

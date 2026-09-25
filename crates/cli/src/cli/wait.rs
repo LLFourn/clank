@@ -700,15 +700,35 @@ pub(crate) fn resolve_wait_event_sources(
             .map_err(|e| anyhow::anyhow!("invalid --event `{raw}`: {e}"))?;
         sources.push((item, SourceOrigin::Cli));
     }
-    // Validate durations at ARM time so a bad `poll_interval` fails
-    // loud here, not silently substituting the default deep in the
-    // poll loop (codex ef1861a).
+    // Validate at ARM time so a bad source fails LOUD here, rather
+    // than silently substituting a default deep in a poll loop
+    // (codex ef1861a) or printing from inside a task that then
+    // returns, leaving the wait armed without the source the
+    // operator configured (codex 072e459).
     for (source, _) in &sources {
-        if let clank_core::agent_config::WaitEventSource::Github(g) = source
-            && let Some(pi) = g.poll_interval.as_deref()
-        {
-            parse_duration_str(pi)
-                .map_err(|e| anyhow::anyhow!("invalid poll_interval `{pi}` for {}: {e}", g.repo))?;
+        match source {
+            clank_core::agent_config::WaitEventSource::Github(g) => {
+                if let Some(pi) = g.poll_interval.as_deref() {
+                    parse_duration_str(pi).map_err(|e| {
+                        anyhow::anyhow!("invalid poll_interval `{pi}` for {}: {e}", g.repo)
+                    })?;
+                }
+            }
+            clank_core::agent_config::WaitEventSource::Command(c) => {
+                if c.command.is_empty() {
+                    anyhow::bail!(
+                        "command source `{}` has an empty command: there is nothing to run",
+                        c.name
+                    );
+                }
+                if let Some(why) = c
+                    .glyph
+                    .as_deref()
+                    .and_then(crate::cli::command_source::glyph_refusal)
+                {
+                    anyhow::bail!("command source `{}` glyph {why}", c.name);
+                }
+            }
         }
     }
     Ok(sources)
@@ -802,7 +822,11 @@ impl EventSources {
         for (source, origin) in sources {
             match source {
                 WaitEventSource::Command(c) => {
-                    tasks.push(tokio::spawn(run_command_source(c.clone(), tx.clone())));
+                    tasks.push(tokio::spawn(run_command_source(
+                        c.clone(),
+                        tx.clone(),
+                        events_dir.map(std::path::Path::to_path_buf),
+                    )));
                 }
                 WaitEventSource::Github(g) => {
                     tasks.push(tokio::spawn(
@@ -881,95 +905,335 @@ impl RingTail {
     }
 }
 
-/// One command source: spawn the argv in its own process group, stream
-/// stdout+stderr into a 1 KiB ring, and deliver a `CommandEvent` when
-/// it completes — the completion IS the wake. Spawn/exec failures
-/// degrade to a stderr warning, never the wait.
+/// One command source: a supervised producer streaming JSONL.
+///
+/// The argv is spawned in its own process group and expected to STAY
+/// up, printing one JSON object per line on stdout; stderr is
+/// diagnostics. `clank wait` aborts its sources when it returns, so a
+/// restart is the normal path between arms and not an exception —
+/// what makes that lossless is the backend's own state directory,
+/// plus a dedup index that never forgets an id it has ingested.
+///
+/// Spawn failures degrade to a warning and a backoff, never the wait;
+/// a source that cannot run becomes an EVENT once the streak passes
+/// `FAILURES_BEFORE_SURFACING`, because an agent waiting on a
+/// producer that will never start should find out.
 async fn run_command_source(
     src: clank_core::agent_config::CommandSource,
     tx: tokio::sync::mpsc::UnboundedSender<WaitItem>,
+    events_dir: Option<std::path::PathBuf>,
 ) {
-    use tokio::io::AsyncReadExt;
-    let Some((program, rest)) = src.command.split_first() else {
+    use crate::cli::command_source as cs;
+
+    // `resolve_wait_event_sources` refuses both of these at ARM time,
+    // so reaching them means a caller that built sources another way.
+    // Kept as the last line of defence, not as the diagnosis: an
+    // operator learns about a bad source when the wait refuses to
+    // arm, not from a line in a log nobody reads.
+    if src.command.is_empty() {
         eprintln!("wait: command source `{}` has an empty argv", src.name);
         return;
+    }
+    if let Some(why) = src.glyph.as_deref().and_then(cs::glyph_refusal) {
+        eprintln!("wait: command source `{}` glyph {why}", src.name);
+        return;
+    }
+    let key = src.source_key();
+    // No events dir (an ad-hoc wait) means no durable dedup: the
+    // source still runs, it just cannot remember. Same degradation
+    // the github sources take, in a temp dir that dies with the wait.
+    let scratch = events_dir.is_none().then(tempfile::tempdir);
+    let store_dir = match (&events_dir, &scratch) {
+        (Some(d), _) => d.clone(),
+        (None, Some(Ok(tmp))) => tmp.path().to_path_buf(),
+        _ => std::path::PathBuf::from("."),
     };
-    let mut cmd = tokio::process::Command::new(program);
-    cmd.args(rest)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0)
-        .kill_on_drop(true);
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("wait: command source `{}` failed to spawn: {e}", src.name);
-            return;
-        }
-    };
-    let _group = GroupKill(child.id());
-    // Read stdout AND stderr concurrently INLINE — no detached tasks,
-    // so aborting this source task cancels the reads too (codex
-    // 907acd5). The ROOT child's exit is completion (codex fc7a4ff): a
-    // descendant that inherited a pipe keeps it open past root exit, so
-    // we must NOT block for EOF — Phase 1 races reads against
-    // `child.wait()` and breaks on exit; Phase 2 best-effort drains
-    // whatever bytes are already buffered (bounded), then the group
-    // guard kills any lingering descendants.
-    let mut ring = RingTail::new(1024);
-    let mut out = child.stdout.take();
-    let mut err = child.stderr.take();
-    let mut obuf = [0u8; 1024];
-    let mut ebuf = [0u8; 1024];
-    // Phase 1: until the root child exits.
-    let status = loop {
-        tokio::select! {
-            s = child.wait() => break s,
-            r = async { out.as_mut().unwrap().read(&mut obuf).await }, if out.is_some() => {
-                match r {
-                    Ok(0) | Err(_) => out = None,
-                    Ok(n) => ring.push(&obuf[..n]),
-                }
+
+    // ONE writer per source, and everyone else TAILS — the same
+    // lifecycle `github/supervisor.rs` runs, for the same reasons.
+    // Two waits would otherwise each spawn the user's command and
+    // each allocate sequences from their own handle, so two events
+    // would land on one seq and a single ack would cover both (codex
+    // 43f5ed8). But a contender that simply RETURNED was its own
+    // bug: nothing else tails command rows for that wait, so it
+    // received neither the pending backlog nor anything the holder
+    // logged afterwards, and it never took over when the holder left
+    // (codex 072e459).
+    //
+    // Carried across the phases: what THIS process has already put in
+    // front of its agent. A takeover must not re-present the rows it
+    // presented while tailing.
+    let mut presented: std::collections::HashSet<(u64, String)> = Default::default();
+    let mut warned_tail = false;
+    loop {
+        match crate::cli::github::log::IngestLease::try_acquire(&store_dir, &key) {
+            Ok(Some(lease)) => {
+                run_leased_command_source(&src, &tx, &store_dir, &key, &mut presented, events_dir)
+                    .await;
+                drop(lease);
+                return;
             }
-            r = async { err.as_mut().unwrap().read(&mut ebuf).await }, if err.is_some() => {
-                match r {
-                    Ok(0) | Err(_) => err = None,
-                    Ok(n) => ring.push(&ebuf[..n]),
+            Ok(None) => {
+                if !warned_tail {
+                    eprintln!(
+                        "wait: command source `{}` — another wait is already running this \
+                         source for this agent; tailing its event log instead",
+                        src.name
+                    );
+                    warned_tail = true;
                 }
+                // `read_rows` is the read-only inspector: a tailer
+                // must never quarantine a log it does not own.
+                if let Ok(log) = crate::cli::github::log::EventLog::open(&store_dir, &key)
+                    && let Ok(Some(read)) = log.read_rows()
+                {
+                    for row in read.rows {
+                        if row.acked || !presented.insert((row.seq, row.ident.clone())) {
+                            continue;
+                        }
+                        let mut item = row.item;
+                        cs::stamp_selector(&mut item, &key, row.seq);
+                        if tx.send(item).is_err() {
+                            return;
+                        }
+                    }
+                }
+                tokio::time::sleep(cs::TAIL_INTERVAL).await;
             }
-        }
-    };
-    // Phase 2: root exited — grab already-buffered bytes, then STOP.
-    // Two bounds together, so no descendant behavior can stall the
-    // wake (codex a69ddd8): each read has a short quiet-timeout (a
-    // pipe held open but silent returns fast) AND the whole drain runs
-    // under one ABSOLUTE deadline (a descendant writing CONTINUOUSLY —
-    // e.g. a background `yes` — can't keep the reads succeeding
-    // forever). Whichever fires first, we emit and the group guard
-    // kills what's left. The ring is bounded, so cancelling mid-read
-    // loses nothing that matters.
-    async fn drain_until_quiet<R: AsyncReadExt + Unpin>(pipe: &mut Option<R>, ring: &mut RingTail) {
-        while let Some(p) = pipe.as_mut() {
-            let mut buf = [0u8; 1024];
-            match tokio::time::timeout(Duration::from_millis(20), p.read(&mut buf)).await {
-                Ok(Ok(n)) if n > 0 => ring.push(&buf[..n]),
-                _ => break, // EOF, error, or quiet within the budget
+            Err(e) => {
+                eprintln!(
+                    "wait: command source `{}` cannot take its ingest lease: {e}",
+                    src.name
+                );
+                return;
             }
         }
     }
-    let _ = tokio::time::timeout(Duration::from_millis(100), async {
-        drain_until_quiet(&mut out, &mut ring).await;
-        drain_until_quiet(&mut err, &mut ring).await;
-    })
-    .await;
-    let exit_code = status.ok().and_then(|s| s.code());
-    let output_tail = ring.into_string();
-    let _ = tx.send(WaitItem::CommandEvent {
-        name: src.name,
-        exit_code,
-        output_tail,
-    });
+}
+
+/// The LEASE HOLDER's runtime: it alone spawns the producer and
+/// writes the log.
+async fn run_leased_command_source(
+    src: &clank_core::agent_config::CommandSource,
+    tx: &tokio::sync::mpsc::UnboundedSender<WaitItem>,
+    store_dir: &std::path::Path,
+    key: &str,
+    presented: &mut std::collections::HashSet<(u64, String)>,
+    events_dir: Option<std::path::PathBuf>,
+) {
+    use crate::cli::command_source as cs;
+    use tokio::io::AsyncBufReadExt;
+
+    let src = src.clone();
+    let store_dir = store_dir.to_path_buf();
+    let key = key.to_string();
+    let mut seen = cs::Seen::at(&store_dir, &key);
+    // The SAME log github writes, so `clank events list/show/ack`
+    // finds a command event by the same directory glob and an agent
+    // has a supported way to finish handling one.
+    let mut log = match crate::cli::github::log::EventLog::open(&store_dir, &key) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!(
+                "wait: command source `{}` cannot open its log: {e}",
+                src.name
+            );
+            return;
+        }
+    };
+    // The backend's OWN directory, which clank creates and never
+    // reads. Whatever cursor or cache it keeps lives here — the
+    // counterpart of clank no longer holding a resume point for it.
+    let state_dir = events_dir
+        .as_deref()
+        .and_then(|d| d.parent())
+        .map(|agent| cs::backend_state_dir(agent, &src));
+    if let Some(dir) = state_dir.as_deref() {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            eprintln!(
+                "wait: command source `{}` state dir {}: {e}",
+                src.name,
+                dir.display()
+            );
+        }
+    }
+    // LOAD, not read: this is what restores the sequence allocator
+    // from the persisted records. `EventLog::open` starts it at 1,
+    // and a supervisor that only ever read rows re-issued seq 1 on
+    // every arm — two distinct events sharing a selector, with one
+    // plain ack marking both handled (codex 43f5ed8). It is also the
+    // path that quarantines a corrupt log, so the warning below can
+    // now be fulfilled by the arm that prints it.
+    let loaded = log.load();
+    if loaded.log_quarantined {
+        eprintln!(
+            "wait: command source `{}` had a corrupt log — quarantined, starting fresh",
+            src.name
+        );
+        // The index is DERIVED from the log. Quarantine moves the
+        // log aside, so nothing is accounted for any more and every
+        // id must be new again — otherwise a surviving `.seen` entry
+        // suppresses the producer's replay of a pending event the
+        // inbox no longer holds, and that event is unrecoverable
+        // (codex 072e459).
+        if let Err(e) = seen.forget_all() {
+            eprintln!(
+                "wait: command source `{}` could not clear its id index after \
+                 quarantine ({e}); a replay may be refused for an event the log no \
+                 longer has",
+                src.name
+            );
+        }
+    }
+    // The WAL is AUTHORITATIVE for what has been ingested; the index
+    // is derived. An id the log still vouches for has an event, so
+    // recovering them repairs an index that a crash between the
+    // append and its write left incomplete — without minting a
+    // second event for an id the log already accounts for.
+    seen.recover(loaded.feed_ids);
+    // RE-PRESENT what is still owed, before the producer starts.
+    // This is the other half of at-least-once: a stored event stays
+    // the agent's until it is acked, and a wake that returned without
+    // an ack must offer it again.
+    for entry in loaded.unhandled {
+        // A takeover has already presented some of these while it was
+        // tailing; re-presenting is for a NEW arm, not a new phase of
+        // the same one.
+        if !presented.insert((entry.seq, entry.ident.clone())) {
+            continue;
+        }
+        let mut item = entry.item;
+        cs::stamp_selector(&mut item, &key, entry.seq);
+        if tx.send(item).is_err() {
+            return;
+        }
+    }
+
+    let mut failures: u32 = 0;
+
+    loop {
+        let started = std::time::Instant::now();
+        let mut cmd = tokio::process::Command::new(&src.command[0]);
+        cmd.args(&src.command[1..])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0)
+            .kill_on_drop(true);
+        // Its own directory, for whatever it needs to remember.
+        match state_dir.as_deref() {
+            Some(dir) => cmd.env("CLANK_SOURCE_STATE_DIR", dir),
+            None => cmd.env_remove("CLANK_SOURCE_STATE_DIR"),
+        };
+        let child = match cmd.spawn() {
+            Ok(c) => Some(c),
+            Err(e) => {
+                eprintln!("wait: command source `{}` failed to spawn: {e}", src.name);
+                None
+            }
+        };
+        if let Some(mut child) = child {
+            let _group = GroupKill(child.id());
+            let stdout = child.stdout.take();
+            let stderr = child.stderr.take();
+            if let Some(err) = stderr {
+                // Diagnostics, not events: surfaced for a human
+                // reading the wait's own output, never ingested.
+                let name = src.name.clone();
+                tokio::spawn(async move {
+                    let mut lines = tokio::io::BufReader::new(err).lines();
+                    while let Ok(Some(l)) = lines.next_line().await {
+                        eprintln!("wait: command source `{name}`: {l}");
+                    }
+                });
+            }
+            if let Some(out) = stdout {
+                let mut lines = tokio::io::BufReader::new(out).lines();
+                // The root's EXIT ends a run, not the pipe's EOF. A
+                // descendant that inherited stdout holds the pipe open
+                // past the root's death, and waiting for EOF would
+                // leave a dead producer un-restarted for as long as
+                // that descendant lives (codex fc7a4ff, whose test
+                // caught this the second time round).
+                loop {
+                    let raw = tokio::select! {
+                        line = lines.next_line() => match line {
+                            Ok(Some(raw)) => raw,
+                            _ => break,
+                        },
+                        _ = child.wait() => {
+                            // Best-effort: take whatever is already
+                            // buffered, then stop. Bounded, so a
+                            // chatty descendant cannot hold the run
+                            // open by writing.
+                            let _ = tokio::time::timeout(
+                                Duration::from_millis(100),
+                                async {
+                                    while let Ok(Some(raw)) = lines.next_line().await {
+                                        if let Some(what) =
+                                            cs::ingest_line(&src, &seen, &raw)
+                                        {
+                                            if !cs::apply(
+                                                what,
+                                                &key,
+                                                &mut log,
+                                                &mut seen,
+                                                |item| tx.send(item).is_ok(),
+                                            ) {
+                                                break;
+                                            }
+                                        }
+                                    }
+                                },
+                            )
+                            .await;
+                            break;
+                        }
+                    };
+                    let Some(what) = cs::ingest_line(&src, &seen, &raw) else {
+                        continue;
+                    };
+                    if let cs::Ingested::Refuse(why) = &what {
+                        eprintln!("wait: command source `{}` refused a line: {why}", src.name);
+                    }
+                    // The payload-before-checkpoint ordering lives in
+                    // `apply`, where a test can inject a sink that
+                    // fails and watch the resume point NOT move. A
+                    // second copy of that ordering here would be a
+                    // second place for it to be wrong.
+                    if !cs::apply(what, &key, &mut log, &mut seen, |item| {
+                        tx.send(item).is_ok()
+                    }) {
+                        return;
+                    }
+                }
+            }
+            let _ = child.wait().await;
+        }
+        // A run long enough to count as healthy clears the streak, so
+        // a producer restarted nightly does not creep to the cap.
+        if started.elapsed() >= cs::HEALTHY_RUN {
+            failures = 0;
+        }
+        failures = failures.saturating_add(1);
+        if failures == cs::FAILURES_BEFORE_SURFACING {
+            let live = cs::report_failure(
+                &src,
+                &key,
+                &mut log,
+                &mut seen,
+                &format!(
+                    "`{}` has stopped {failures} times in a row and is being restarted",
+                    src.command.join(" ")
+                ),
+                |item| tx.send(item).is_ok(),
+            );
+            if !live {
+                return;
+            }
+        }
+        tokio::time::sleep(cs::backoff(failures)).await;
+    }
 }
 
 /// Check blocks for the calling agent. An `Unblocked` answer is
@@ -1204,8 +1468,17 @@ pub(crate) enum WaitJsonItem<'a> {
     #[serde(rename = "command_event")]
     CommandEvent {
         name: &'a str,
-        exit_code: Option<i32>,
-        output_tail: &'a str,
+        id: &'a str,
+        event: &'a str,
+        content: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        at: Option<u64>,
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        failure: bool,
+        /// What to pass `clank events ack`. Absent only when the
+        /// event was never logged, and then there is nothing to ack.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        selector: Option<&'a str>,
     },
     #[serde(rename = "draft_changed")]
     DraftChanged {
@@ -1366,12 +1639,20 @@ pub(crate) fn render_json(item: &WaitItem) -> WaitJsonItem<'_> {
         },
         WaitItem::CommandEvent {
             name,
-            exit_code,
-            output_tail,
+            id,
+            event,
+            content,
+            at,
+            failure,
+            selector,
         } => WaitJsonItem::CommandEvent {
             name,
-            exit_code: *exit_code,
-            output_tail,
+            id,
+            event,
+            content,
+            at: *at,
+            failure: *failure,
+            selector: selector.as_deref(),
         },
         WaitItem::ForCommit { sha, subject } => WaitJsonItem::ForCommit {
             sha: sha.as_str(),
@@ -1509,48 +1790,6 @@ fn render_human(item: &WaitItem) -> String {
             "message  {handle}  {}  {subject}",
             crate::inbox::sender_words(from.as_deref(), repo.as_deref())
         ),
-        WaitItem::GithubEvent {
-            repo,
-            event,
-            detail,
-            number,
-            title,
-            actor,
-            url,
-            instructions,
-            content: _,
-        } => {
-            // Segments joined uniformly so absent optionals leave no
-            // dangling separators; the URL rides along — it's the
-            // actionable pointer (external-wake-hints-carry-payload).
-            let detail = detail
-                .as_deref()
-                .map(|d| format!(" ({d})"))
-                .unwrap_or_default();
-            let mut parts = vec![format!("github   {event}{detail}"), repo.clone()];
-            if let Some(n) = number {
-                parts.push(format!("#{n}"));
-            }
-            if let Some(t) = title.as_deref().filter(|t| !t.is_empty()) {
-                parts.push(t.to_string());
-            }
-            if let Some(a) = actor.as_deref() {
-                parts.push(format!("by {a}"));
-            }
-            if let Some(u) = url.as_deref() {
-                parts.push(u.to_string());
-            }
-            let mut line = parts.join("  ");
-            // The operator's per-watch prompt rides as ONE indented
-            // follow-on line: control chars collapse (same treatment
-            // as PR titles — operator text must not restructure the
-            // item list), full text lives in `clank events show`.
-            if let Some(i) = instructions.as_deref().filter(|i| !i.trim().is_empty()) {
-                line.push_str("\n         ↳ ");
-                line.push_str(&one_line(i, 300));
-            }
-            line
-        }
         WaitItem::DraftChanged {
             pr,
             comment,
@@ -1565,19 +1804,66 @@ fn render_human(item: &WaitItem) -> String {
             };
             format!("draft    #{pr}  {}{about}  (r{revision})", change.wire())
         }
-        WaitItem::CommandEvent {
-            name,
-            exit_code,
-            output_tail,
-        } => {
-            let exit = match exit_code {
-                Some(c) => format!("exit {c}"),
-                None => "signaled".to_string(),
+        // ONE arm for every event source. The github and command
+        // variants had separate arms building the same line from
+        // differently-named fields; a third backend needed a third
+        // (a-command-is-an-event-source-like-any-other).
+        e @ (WaitItem::GithubEvent { .. } | WaitItem::CommandEvent { .. }) => {
+            let Some(v) = e.event_view() else {
+                unreachable!("both event variants project")
             };
-            // One line: the tail rides in json; the human line shows a
-            // single-line snippet.
-            let snippet = output_tail.lines().last().unwrap_or("");
-            format!("command  {name}  {exit}  {snippet}")
+            // A source reporting ITSELF broken reads differently from
+            // something it observed: the agent is not being told about
+            // the world, it is being told the watch is not working.
+            let lead = if v.failure {
+                "source!".to_string()
+            } else if v.github.is_some() {
+                "github  ".to_string()
+            } else {
+                "command ".to_string()
+            };
+            let detail = v
+                .github
+                .as_ref()
+                .and_then(|g| g.detail)
+                .map(|d| format!(" ({d})"))
+                .unwrap_or_default();
+            // Segments joined uniformly so absent optionals leave no
+            // dangling separators.
+            let mut parts = vec![format!("{lead} {}{detail}", v.kind), v.source.to_string()];
+            if let Some(g) = &v.github {
+                if let Some(n) = g.number {
+                    parts.push(format!("#{n}"));
+                }
+            }
+            if let Some(c) = v.content {
+                parts.push(c.to_string());
+            }
+            if let Some(g) = &v.github {
+                if let Some(a) = g.actor {
+                    parts.push(format!("by {a}"));
+                }
+                // The URL rides along — it is the actionable pointer
+                // (external-wake-hints-carry-payload).
+                if let Some(u) = g.url {
+                    parts.push(u.to_string());
+                }
+            }
+            // The line that says an event is owed should say how to
+            // finish it.
+            if let Some(s) = v.selector {
+                parts.push(format!("(ack {s})"));
+            }
+            let mut line = parts.join("  ");
+            // The operator's per-watch prompt rides as ONE indented
+            // follow-on line: control chars collapse (same treatment
+            // as PR titles — operator text must not restructure the
+            // item list), full text lives in `clank events show`.
+            if let Some(i) = v.instructions.filter(|i| !i.trim().is_empty()) {
+                line.push_str("\n         \u{21b3} ");
+                line.push_str(&one_line(i, 300));
+            }
+            line
         }
         WaitItem::ForCommit { sha, subject } => {
             format!("for-commit    {}  {subject}", short(sha))
@@ -1727,61 +2013,796 @@ mod tests {
         clank_core::agent_config::CommandSource {
             name: name.into(),
             command: argv.iter().map(|s| s.to_string()).collect(),
+            glyph: None,
         }
     }
 
-    async fn run_one_command(src: clank_core::agent_config::CommandSource) -> WaitItem {
+    /// Run a supervised source until `want` items arrive, then stop
+    /// it. The supervisor loops forever by design, so a test says how
+    /// many events it is waiting for rather than awaiting completion.
+    async fn collect(
+        src: clank_core::agent_config::CommandSource,
+        dir: Option<std::path::PathBuf>,
+        want: usize,
+    ) -> Vec<WaitItem> {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        run_command_source(src, tx).await;
-        rx.recv()
-            .await
-            .expect("a command source emits exactly one item")
+        let task = tokio::spawn(run_command_source(src, tx, dir));
+        let mut out = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(20), async {
+            while out.len() < want {
+                match rx.recv().await {
+                    Some(i) => out.push(i),
+                    None => break,
+                }
+            }
+        })
+        .await;
+        // AWAITED, not just signalled. The source holds an ingest
+        // lease and a process group; an abort that is never joined
+        // leaves both alive for as long as the runtime takes to
+        // unwind it, so a second arm in the SAME process finds the
+        // lease held and does nothing. Production gets this free —
+        // each arm is its own process — which is exactly why a test
+        // has to ask for it.
+        task.abort();
+        let _ = task.await;
+        out
     }
 
+    /// Block until the source's ingest lease is free again.
+    ///
+    /// A re-arm is a fresh PROCESS in production, so the previous
+    /// holder's fd is closed by exit and the lease is always free. In
+    /// one test process it is released when the aborted task is
+    /// dropped, which is runtime timing — so an arm-two test that
+    /// just starts would intermittently find the lease held, return
+    /// immediately, and look like a source that produced nothing.
+    /// Waiting for it here makes the handoff the test's business
+    /// rather than the scheduler's.
+    async fn lease_released(events: &std::path::Path, key: &str) {
+        for _ in 0..200 {
+            match crate::cli::github::log::IngestLease::try_acquire(events, key) {
+                Ok(Some(_)) => return,
+                _ => tokio::time::sleep(Duration::from_millis(25)).await,
+            }
+        }
+        panic!("the previous arm never released the ingest lease for `{key}`");
+    }
+
+    fn selector_of(item: &WaitItem) -> String {
+        match item {
+            WaitItem::CommandEvent { selector, .. } => selector
+                .clone()
+                .expect("a presented event says how to ack it"),
+            other => panic!("expected a command event, got {other:?}"),
+        }
+    }
+
+    /// TWO ARMS of the real supervisor: the second must not re-issue
+    /// the first's sequence.
+    ///
+    /// `EventLog::open` starts the allocator at 1, and only `load`
+    /// restores it from the persisted records. A supervisor that read
+    /// rows without loading handed arm 2's event the same seq as arm
+    /// 1's — one selector for two events, and the plain ack of the
+    /// first marking the second handled before anyone saw it (codex
+    /// 43f5ed8).
+    ///
+    /// Through `run_command_source`, not the helpers: the mechanism
+    /// has its own tests in `events.rs`, and a mechanism nobody calls
+    /// is what this is about. The sibling re-arm test only REPLAYS
+    /// old rows, so no append ever follows a re-arm there.
     #[tokio::test]
-    async fn command_event_carries_exit_code_and_bounded_tail() {
-        let item =
-            run_one_command(command_source("ok", &["sh", "-c", "printf hello; exit 7"])).await;
+    async fn a_second_arm_does_not_reuse_the_first_arms_sequence() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().to_path_buf();
+        let one = |id: &str| {
+            command_source(
+                "deploys",
+                &[
+                    "sh",
+                    "-c",
+                    // One event, then block: the producer must not
+                    // end the run, so this is a re-arm and not a
+                    // restart.
+                    Box::leak(
+                        format!(r#"printf '{{"id":"{id}","content":"x"}}\n'; sleep 300"#)
+                            .into_boxed_str(),
+                    ),
+                ],
+            )
+        };
+
+        let first = collect(one("A"), Some(events.clone()), 1).await;
+        let sel_a = selector_of(&first[0]);
+        // Handled through the PUBLIC path, as an agent would.
+        let key = one("A").source_key();
+        crate::cli::github::log::EventLog::open(&events, &key)
+            .unwrap()
+            .append_ack(
+                sel_a
+                    .rsplit_once('@')
+                    .expect("source-qualified")
+                    .1
+                    .parse()
+                    .unwrap(),
+            )
+            .unwrap();
+
+        // ARM 2: a fresh supervisor over the same directory.
+        lease_released(&events, &key).await;
+        let second = collect(one("B"), Some(events.clone()), 1).await;
+        assert_eq!(second.len(), 1, "arm 2 presented nothing");
+        let sel_b = selector_of(&second[0]);
+        assert_ne!(
+            sel_a, sel_b,
+            "a second arm reusing the sequence makes one ack cover two events",
+        );
+
+        // And the acked one stays acked while the new one is owed.
+        let rows = crate::cli::github::log::EventLog::open(&events, &key)
+            .unwrap()
+            .read_rows()
+            .unwrap()
+            .unwrap()
+            .rows;
+        assert_eq!(rows.len(), 2, "two distinct events");
+        let owed: Vec<u64> = rows.iter().filter(|r| !r.acked).map(|r| r.seq).collect();
+        assert_eq!(owed.len(), 1, "exactly one is still owed: {rows:?}");
+        assert_eq!(
+            format!("{key}@{}", owed[0]),
+            sel_b,
+            "and it is the one the second arm just presented",
+        );
+    }
+
+    /// The SUPERVISOR reconciles its index from the log.
+    ///
+    /// `Seen::recover` has its own test, and so does the crash gap it
+    /// repairs — but a supervisor that never CALLED it would pass
+    /// both, because neither can see the call site. What only this
+    /// can show is a replay after the index is gone: the log still
+    /// vouches for the id, so no second event appears.
+    #[tokio::test]
+    async fn the_supervisor_repairs_its_index_from_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().to_path_buf();
+        // Same NAME in both arms, so the same source key and the
+        // same WAL. Arm 2's producer REPLAYS the first id and then
+        // sends a new one — explicitly allowed, since avoiding
+        // resends is the backend's business.
+        let producer = |lines: &str| {
+            command_source(
+                "deploys",
+                &[
+                    "sh",
+                    "-c",
+                    Box::leak(format!("printf '{lines}'; sleep 300").into_boxed_str()),
+                ],
+            )
+        };
+        let key = producer("").source_key();
+
+        let first = collect(
+            producer(r#"{"id":"same","content":"x"}\n"#),
+            Some(events.clone()),
+            1,
+        )
+        .await;
+        assert_eq!(first.len(), 1, "arm 1 presents it once");
+
+        // THE CRASH GAP, forced: the row is in the log, the index is
+        // not. Exactly what a death between the two writes leaves.
+        std::fs::remove_dir_all(events.join(format!("{key}.seen"))).unwrap();
+
+        // Arm 2 owes the unacked row and the producer replays its id,
+        // then sends a new one. Waiting for the NEW id is what proves
+        // the replay was already handled — without it this would
+        // assert on a race.
+        lease_released(&events, &key).await;
+        let second = collect(
+            producer(r#"{"id":"same","content":"x"}\n{"id":"next","content":"y"}\n"#),
+            Some(events.clone()),
+            2,
+        )
+        .await;
+        assert_eq!(second.len(), 2, "the owed row and the new event");
+
+        let rows = crate::cli::github::log::EventLog::open(&events, &key)
+            .unwrap()
+            .read_rows()
+            .unwrap()
+            .unwrap()
+            .rows;
+        assert_eq!(
+            rows.len(),
+            2,
+            "the log already held `same`; a lost index must not mint a second row for it: {rows:?}",
+        );
+    }
+
+    /// MILESTONE 2: a github event and a command event project to
+    /// the same row, and github keeps what only it has.
+    ///
+    /// The two had separate rendering arms pulling differently-named
+    /// fields to build the same line, in three places. This asserts
+    /// the shared shape by rendering both and comparing structure —
+    /// not by calling `event_view` twice, which would only prove the
+    /// projection agrees with itself.
+    #[test]
+    fn a_github_event_and_a_command_event_render_as_one_row() {
+        let gh = WaitItem::GithubEvent {
+            repo: "o/r".into(),
+            event: "pr_comment".into(),
+            detail: Some("review".into()),
+            number: Some(12),
+            title: Some("Add the widget".into()),
+            actor: Some("hubot".into()),
+            url: Some("https://github.com/o/r/pull/12".into()),
+            instructions: None,
+            content: None,
+        };
+        let cmd = WaitItem::CommandEvent {
+            name: "deploys".into(),
+            id: "sha-abc".into(),
+            event: "deployed".into(),
+            content: "prod is live".into(),
+            at: None,
+            failure: false,
+            selector: Some("command-deploys-0000abcd@7".into()),
+        };
+
+        let gh_line = render_human(&gh);
+        let cmd_line = render_human(&cmd);
+        // Both name their SOURCE and their KIND, in that shape.
+        assert!(
+            gh_line.contains("pr_comment") && gh_line.contains("o/r"),
+            "{gh_line}"
+        );
+        assert!(
+            cmd_line.contains("deployed") && cmd_line.contains("deploys"),
+            "{cmd_line}"
+        );
+        // Both show their content the same way.
+        assert!(gh_line.contains("Add the widget"), "{gh_line}");
+        assert!(cmd_line.contains("prod is live"), "{cmd_line}");
+
+        // THE CARVE-OUT: github keeps its link, its number and its
+        // actor. Losing these is the way a shared shape goes wrong.
+        assert!(
+            gh_line.contains("https://github.com/o/r/pull/12"),
+            "{gh_line}"
+        );
+        assert!(
+            gh_line.contains("#12") && gh_line.contains("by hubot"),
+            "{gh_line}"
+        );
+        assert!(
+            gh_line.contains("(review)"),
+            "the sub-kind survives: {gh_line}"
+        );
+        // And the command event keeps what only it has.
+        assert!(
+            cmd_line.contains("ack command-deploys-0000abcd@7"),
+            "{cmd_line}"
+        );
+
+        // A source reporting ITSELF broken is marked as such, and
+        // does not read as news about the world.
+        let broken = WaitItem::CommandEvent {
+            name: "deploys".into(),
+            id: "clank.source-failure:x".into(),
+            event: "clank.source-failure".into(),
+            content: "`sh -c ...` has stopped 3 times in a row".into(),
+            at: None,
+            failure: true,
+            selector: Some("command-deploys-0000abcd@9".into()),
+        };
+        let broken_line = render_human(&broken);
+        assert!(
+            !broken_line.starts_with("command") && !broken_line.starts_with("github"),
+            "a breakage must not read like an observation: {broken_line}",
+        );
+        assert!(
+            broken_line.contains("ack command-deploys-0000abcd@9"),
+            "{broken_line}"
+        );
+    }
+
+    /// Arm-time validation refuses what cannot run, and ONLY that.
+    ///
+    /// The integration side proves `wait` refuses to arm; this side
+    /// proves it does not refuse a source that is fine — without it,
+    /// a validator that rejected everything would pass there.
+    #[test]
+    fn arm_time_validation_refuses_only_what_cannot_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let author = AgentLabel::parse("rev").unwrap();
+        let resolve = |json: &str| {
+            resolve_wait_event_sources(repo, &author, &[json.to_string()])
+                .err()
+                .map(|e| format!("{e:#}"))
+        };
+
+        let fine = resolve(r#"{"kind":"command","name":"fine","command":["true"],"glyph":"*"}"#);
+        assert_eq!(fine, None, "a runnable source with a one-cell glyph arms");
+        // No glyph at all is fine too — it is optional.
+        assert_eq!(
+            resolve(r#"{"kind":"command","name":"plain","command":["true"]}"#),
+            None,
+        );
+
+        let empty = resolve(r#"{"kind":"command","name":"deploys","command":[]}"#)
+            .expect("an empty command has nothing to run");
+        assert!(
+            empty.contains("deploys") && empty.contains("empty command"),
+            "{empty}"
+        );
+
+        let wide = resolve(&format!(
+            r#"{{"kind":"command","name":"noisy","command":["true"],"glyph":"{}"}}"#,
+            '\u{1F4A4}'
+        ))
+        .expect("a two-column glyph cannot sit in a one-column cell");
+        assert!(wide.contains("noisy") && wide.contains("glyph"), "{wide}");
+    }
+
+    /// A quarantined log takes its index with it.
+    ///
+    /// `load` moves a corrupt WAL aside and returns no pending
+    /// events — but the `.seen` entries survived, and `ingest_line`
+    /// still believed them. So the producer's replay of a pending
+    /// event was refused on behalf of an inbox that no longer held
+    /// it: the event was unrecoverable by any route (codex 072e459).
+    ///
+    /// The index is DERIVED. When the thing it describes is thrown
+    /// away, it must go too.
+    #[tokio::test]
+    async fn a_quarantined_log_does_not_leave_its_index_refusing_the_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().to_path_buf();
+        let producer = command_source(
+            "deploys",
+            &[
+                "sh",
+                "-c",
+                r#"printf '{"id":"pending","content":"owed"}\n'; sleep 300"#,
+            ],
+        );
+        let key = producer.source_key();
+
+        // ARM 1: one event, logged and left UNACKED.
+        let first = collect(producer.clone(), Some(events.clone()), 1).await;
+        assert_eq!(first.len(), 1);
+        assert_eq!(
+            crate::cli::command_source::Seen::at(&events, &key).known("pending"),
+            crate::cli::command_source::Known::Yes,
+        );
+
+        // CORRUPT the WAL's interior — not a torn tail, which is a
+        // normal crash artifact and is dropped rather than
+        // quarantined.
+        let log_path = events.join(format!("{key}.jsonl"));
+        let text = std::fs::read_to_string(&log_path).unwrap();
+        std::fs::write(&log_path, format!("not json at all\n{text}")).unwrap();
+
+        // ARM 2: the same producer replays the same id. The log is
+        // quarantined, so the inbox has lost the event — the replay
+        // is the ONLY way it comes back, and it must not be refused.
+        lease_released(&events, &key).await;
+        let second = collect(producer, Some(events.clone()), 1).await;
+        assert_eq!(
+            second.len(),
+            1,
+            "the replay must be accepted: the quarantined inbox no longer holds it",
+        );
+        assert_eq!(event_parts(&second[0]).0, "pending");
+
+        assert!(
+            events.join(format!("{key}.jsonl.corrupt")).exists(),
+            "the corrupt log is preserved as evidence",
+        );
+        let rows = crate::cli::github::log::EventLog::open(&events, &key)
+            .unwrap()
+            .read_rows()
+            .unwrap()
+            .unwrap()
+            .rows;
+        assert_eq!(rows.len(), 1, "and the fresh log holds it again: {rows:?}");
+        assert!(!rows[0].acked, "still owed");
+    }
+
+    /// Only ONE wait runs the producer — and the other one TAILS,
+    /// receives what the holder logs, and takes over when it leaves.
+    ///
+    /// The previous version of this test asserted the contender
+    /// simply returned, which pinned a bug: nothing else tails
+    /// command rows for that wait, so it got neither the pending
+    /// backlog nor anything logged afterwards, and never took over
+    /// (codex 072e459). One producer is only half the contract.
+    #[tokio::test]
+    async fn a_non_holder_tails_and_takes_over_without_a_second_producer() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().to_path_buf();
+        // Each RUN appends a line, so the file counts producer spawns
+        // across both supervisors.
+        let marks = dir.path().join("runs");
+        let producer = |id: &str| {
+            command_source(
+                "deploys",
+                &[
+                    "sh",
+                    "-c",
+                    Box::leak(
+                        format!(
+                            r#"printf 'run\n' >> {}; printf '{{"id":"{id}","content":"x"}}\n'; sleep 300"#,
+                            marks.display()
+                        )
+                        .into_boxed_str(),
+                    ),
+                ],
+            )
+        };
+        let key = producer("x").source_key();
+
+        // SEPARATE channels, so "who received what" is answerable.
+        let (tx_a, mut rx_a) = tokio::sync::mpsc::unbounded_channel();
+        let (tx_b, mut rx_b) = tokio::sync::mpsc::unbounded_channel();
+
+        let holder = tokio::spawn(run_command_source(
+            producer("owned"),
+            tx_a,
+            Some(events.clone()),
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_secs(20), rx_a.recv())
+                .await
+                .is_ok(),
+            "the holder never produced",
+        );
+
+        // The follower must receive the holder's row WITHOUT running
+        // a producer of its own.
+        let follower = tokio::spawn(run_command_source(
+            producer("contender"),
+            tx_b,
+            Some(events.clone()),
+        ));
+        let tailed = tokio::time::timeout(Duration::from_secs(20), rx_b.recv())
+            .await
+            .expect("the follower must receive the holder's row, not sit idle")
+            .expect("channel open");
+        assert_eq!(
+            event_parts(&tailed).0,
+            "owned",
+            "the follower presents what the HOLDER logged",
+        );
+        assert!(
+            selector_of(&tailed).starts_with(&key),
+            "and a tailed row is ackable like any other: {tailed:?}",
+        );
+        assert_eq!(
+            std::fs::read_to_string(&marks)
+                .unwrap_or_default()
+                .lines()
+                .count(),
+            1,
+            "the follower must not spawn the user's command",
+        );
+
+        // TAKEOVER: the holder leaves, the follower gets the lease
+        // and starts its own producer — exactly one more run.
+        holder.abort();
+        let _ = holder.await;
+        let taken = tokio::time::timeout(Duration::from_secs(20), rx_b.recv())
+            .await
+            .expect("the follower must take over when the holder leaves")
+            .expect("channel open");
+        assert_eq!(
+            event_parts(&taken).0,
+            "contender",
+            "after takeover it runs its OWN producer",
+        );
+        assert_eq!(
+            std::fs::read_to_string(&marks)
+                .unwrap_or_default()
+                .lines()
+                .count(),
+            2,
+            "one producer at a time, and exactly one more after takeover",
+        );
+
+        // And it did not re-present, on taking the lease, the row it
+        // already handed over while tailing.
+        let mut again = Vec::new();
+        while let Ok(i) = rx_b.try_recv() {
+            again.push(i);
+        }
+        assert!(
+            !again.iter().any(|i| event_parts(i).0 == "owned"),
+            "a takeover must not re-present what this process already presented: {again:?}",
+        );
+
+        follower.abort();
+        let _ = follower.await;
+    }
+
+    fn event_parts(item: &WaitItem) -> (&str, &str, &str) {
         match item {
             WaitItem::CommandEvent {
-                name,
-                exit_code,
-                output_tail,
-            } => {
-                assert_eq!(name, "ok");
-                assert_eq!(exit_code, Some(7));
-                assert_eq!(output_tail, "hello");
-            }
+                id, event, content, ..
+            } => (id, event, content),
             other => panic!("expected CommandEvent, got {other:?}"),
         }
     }
 
+    /// Each JSONL line a producer prints is one event.
     #[tokio::test]
-    async fn command_event_tail_is_bounded_to_the_last_kib() {
-        // 100 KiB of output → exactly the last 1024 bytes survive.
-        let item = run_one_command(command_source(
-            "chatty",
-            &["sh", "-c", "yes x | head -c 100000"],
-        ))
+    async fn a_producer_streams_its_lines_as_events() {
+        let items = collect(
+            command_source(
+                "deploys",
+                &[
+                    "sh",
+                    "-c",
+                    r#"printf '{"id":"1","kind":"deploy","content":"one"}\n{"id":"2","kind":"deploy","content":"two"}\n'"#,
+                ],
+            ),
+            None,
+            2,
+        )
         .await;
-        match item {
-            WaitItem::CommandEvent { output_tail, .. } => {
-                assert_eq!(output_tail.len(), 1024, "ring keeps exactly the cap");
-                assert!(output_tail.bytes().all(|b| b == b'x' || b == b'\n'));
-            }
-            other => panic!("expected CommandEvent, got {other:?}"),
-        }
+        assert_eq!(items.len(), 2);
+        assert_eq!(event_parts(&items[0]), ("1", "deploy", "one"));
+        assert_eq!(event_parts(&items[1]), ("2", "deploy", "two"));
     }
 
+    /// One bad line does not cost every later event.
     #[tokio::test]
-    async fn signal_killed_command_reports_null_exit_code() {
-        let item = run_one_command(command_source("selfkill", &["sh", "-c", "kill -9 $$"])).await;
-        match item {
-            WaitItem::CommandEvent { exit_code, .. } => {
-                assert_eq!(exit_code, None, "a signaled child has no exit code");
-            }
-            other => panic!("expected CommandEvent, got {other:?}"),
-        }
+    async fn a_refused_line_does_not_stop_the_stream() {
+        let items = collect(
+            command_source(
+                "mixed",
+                &[
+                    "sh",
+                    "-c",
+                    r#"printf '{"id":"1","kind":"k","content":"before"}\nnot json\n{"kind":"k"}\n{"id":"2","kind":"k","content":"after"}\n'"#,
+                ],
+            ),
+            None,
+            2,
+        )
+        .await;
+        assert_eq!(items.len(), 2, "the good lines both arrive");
+        assert_eq!(event_parts(&items[0]).2, "before");
+        assert_eq!(
+            event_parts(&items[1]).2,
+            "after",
+            "a malformed line and an id-less one are skipped, not fatal",
+        );
+    }
+
+    /// Every line is an event: clank does no filtering, so a `kind`
+    /// it was not "expecting" still arrives.
+    ///
+    /// Replaces a filter test. What counts as an event is the
+    /// backend's business now — one that wants filtering takes it as
+    /// arguments in its own command.
+    #[tokio::test]
+    async fn every_kind_arrives_because_clank_does_not_filter() {
+        let items = collect(
+            command_source(
+                "unfiltered",
+                &[
+                    "sh",
+                    "-c",
+                    r#"printf '{"id":"1","kind":"chatter","content":"a"}\n{"id":"2","kind":"deploy","content":"b"}\n'"#,
+                ],
+            ),
+            None,
+            2,
+        )
+        .await;
+        assert_eq!(items.len(), 2, "both kinds are events");
+        assert_eq!(event_parts(&items[0]).1, "chatter");
+        assert_eq!(event_parts(&items[1]).1, "deploy");
+    }
+
+    /// A producer cannot report ITSELF broken: the failure kind is
+    /// A producer cannot report ITSELF broken: the failure kind is
+    /// clank's own, so "this source is not working" can never be
+    /// something the source said.
+    #[tokio::test]
+    async fn a_producer_cannot_forge_a_failure_event() {
+        let items = collect(
+            command_source(
+                "liar",
+                &[
+                    "sh",
+                    "-c",
+                    &format!(
+                        r#"printf '{{"id":"1","kind":"{k}","content":"fake"}}\n{{"id":"2","kind":"real","content":"ok"}}\n'"#,
+                        k = crate::cli::command_source::FAILURE_KIND
+                    ),
+                ],
+            ),
+            None,
+            1,
+        )
+        .await;
+        assert_eq!(items.len(), 1);
+        assert_eq!(event_parts(&items[0]).2, "ok", "the forged line is refused");
+    }
+
+    /// The SUPERVISOR re-presents what is still owed, before the
+    /// producer runs.
+    ///
+    /// The WAL's unacked rows are readable on their own, but a
+    /// supervisor that never re-presented them would pass every other
+    /// test here — new lines still arrive, dedup still works. What
+    /// only the call site can show is an event stored by a PREVIOUS
+    /// arm reaching the agent again, which is the whole of
+    /// at-least-once across a wake.
+    #[tokio::test]
+    async fn the_supervisor_re_presents_unacked_work_from_a_previous_arm() {
+        let dir = tempfile::tempdir().unwrap();
+        // A producer that prints NOTHING: the only thing that can
+        // arrive is what a previous arm left owed.
+        let src = command_source("owed", &["sh", "-c", "sleep 300"]);
+        let key = src.source_key();
+
+        let mut log = crate::cli::github::log::EventLog::open(dir.path(), &key).unwrap();
+        let stored = WaitItem::CommandEvent {
+            name: "owed".into(),
+            id: "left-over".into(),
+            event: "k".into(),
+            content: "from the last arm".into(),
+            at: None,
+            failure: false,
+            selector: None,
+        };
+        let seq = log
+            .append_inbox(
+                crate::cli::github::log::Transport::Command,
+                Some("left-over"),
+                None,
+                None,
+                &stored,
+            )
+            .unwrap();
+
+        let items = collect(src, Some(dir.path().to_path_buf()), 1).await;
+        assert_eq!(items.len(), 1, "the owed event is presented again");
+        assert_eq!(
+            event_parts(&items[0]),
+            ("left-over", "k", "from the last arm"),
+            "and with its payload, not just its id",
+        );
+        // Re-presented means presented PROPERLY: an event the agent
+        // cannot ack would wake it forever.
+        let WaitItem::CommandEvent { selector, .. } = &items[0] else {
+            panic!("expected a command event")
+        };
+        assert_eq!(
+            selector.as_deref(),
+            Some(format!("{key}@{seq}").as_str()),
+            "a re-presented event still says how to finish itself",
+        );
+    }
+
+    /// THE HANDOVER: the backend gets its OWN directory, and clank
+    /// never reads it.
+    ///
+    /// This replaces the resume token. Clank no longer holds a cursor
+    /// on a backend's behalf — it hands over a private directory and
+    /// the backend keeps whatever it needs there. The producer proves
+    /// it by writing to the directory and reporting the path back as
+    /// an event.
+    #[tokio::test]
+    async fn the_backend_gets_a_private_directory_clank_does_not_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events");
+        std::fs::create_dir_all(&events).unwrap();
+        let src = command_source(
+            "stateful",
+            &[
+                "sh",
+                "-c",
+                r#"printf 'cursor' > "$CLANK_SOURCE_STATE_DIR/mine"; printf '{"id":"1","kind":"k","content":"%s"}\n' "$CLANK_SOURCE_STATE_DIR"; sleep 300"#,
+            ],
+        );
+        let items = collect(src, Some(events.clone()), 1).await;
+        assert_eq!(items.len(), 1);
+        let reported = event_parts(&items[0]).2.to_string();
+        assert!(
+            reported.contains("/sources/") && reported.contains("command-stateful-"),
+            "the directory is keyed by the SOURCE KEY, which is one safe \
+             component and cannot collide or escape: {reported}",
+        );
+
+        let own = std::path::Path::new(&reported);
+        assert!(own.is_dir(), "clank creates it BEFORE the command starts");
+        assert_eq!(
+            std::fs::read_to_string(own.join("mine")).unwrap(),
+            "cursor",
+            "and what the backend wrote is still there",
+        );
+        // Clank's own storage is elsewhere: nothing it keeps lives in
+        // the backend's directory, and it reads nothing from it.
+        assert!(
+            !own.starts_with(&events),
+            "the backend's directory is not inside clank's event storage",
+        );
+    }
+
+    /// A descendant holding the pipe open does not stall a restart.
+    ///
+    /// The root backgrounds a sleeper that INHERITS stdout, prints an
+    /// event, and exits. Waiting for pipe EOF instead of root exit
+    /// would leave the dead producer un-restarted for as long as the
+    /// sleeper lives — five minutes here, indefinitely in production.
+    /// Two events means it came back (codex fc7a4ff's hazard, in the
+    /// streaming model).
+    #[tokio::test]
+    async fn a_pipe_holding_descendant_does_not_stall_the_restart() {
+        let items = collect(
+            command_source(
+                "held",
+                &[
+                    "sh",
+                    "-c",
+                    r#"sleep 300 & printf '{"id":"r-%s","kind":"k","content":"ran"}\n' "$$""#,
+                ],
+            ),
+            None,
+            2,
+        )
+        .await;
+        assert_eq!(
+            items.len(),
+            2,
+            "the root exited and the source restarted, despite the held pipe",
+        );
+        assert_ne!(
+            event_parts(&items[0]).0,
+            event_parts(&items[1]).0,
+            "two runs, two pids",
+        );
+    }
+
+    /// A producer that DIES is restarted, and the events it printed
+    /// before dying still arrive.
+    ///
+    /// Replaces the exit-code assertion this test used to make: an
+    /// exit is no longer the event, so what matters is that a death
+    /// does not lose what came before it or end the source.
+    #[tokio::test]
+    async fn a_producer_that_dies_is_restarted_and_loses_nothing() {
+        let items = collect(
+            command_source(
+                "dying",
+                &[
+                    "sh",
+                    "-c",
+                    r#"printf '{"id":"a-%s","kind":"k","content":"alive"}\n' "$$"; kill -9 $$"#,
+                ],
+            ),
+            None,
+            2,
+        )
+        .await;
+        assert_eq!(
+            items.len(),
+            2,
+            "the line printed before the kill arrives, and the source comes back",
+        );
+        assert_eq!(event_parts(&items[0]).2, "alive");
+        assert_ne!(
+            event_parts(&items[0]).0,
+            event_parts(&items[1]).0,
+            "a restart is a new process, so its ids differ",
+        );
     }
 
     #[test]
@@ -1814,8 +2835,12 @@ mod tests {
         let ext = || {
             vec![WaitItem::CommandEvent {
                 name: "cmd".into(),
-                exit_code: Some(0),
-                output_tail: String::new(),
+                id: "1".into(),
+                event: "k".into(),
+                content: String::new(),
+                at: None,
+                failure: false,
+                selector: None,
             }]
         };
         // Both ready → one result with BOTH.
@@ -1840,8 +2865,12 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         tx.send(WaitItem::CommandEvent {
             name: "a".into(),
-            exit_code: Some(0),
-            output_tail: String::new(),
+            id: "1".into(),
+            event: "k".into(),
+            content: String::new(),
+            at: None,
+            failure: false,
+            selector: None,
         })
         .unwrap();
         let mut open = true;
@@ -2180,8 +3209,12 @@ mod tests {
         };
         let github = WaitItem::CommandEvent {
             name: "watch".into(),
-            exit_code: Some(0),
-            output_tail: String::new(),
+            id: "1".into(),
+            event: "k".into(),
+            content: String::new(),
+            at: None,
+            failure: false,
+            selector: None,
         };
         let mut for_standby = vec![item(12, 100, 1), github.clone()];
         drop_items_not_for(Role::Standby, &mut for_standby);
