@@ -1689,6 +1689,10 @@ async fn route(req: hyper::Request<hyper::body::Incoming>, peer: IpAddr, ctx: &C
         ("GET", "/agents/candidates") => agent_candidates(ctx).await,
         ("POST", "/agents") if !same_origin(&req, ctx) => text(403, "cross-origin", "text/plain"),
         ("POST", "/agents") => agent_action(req, ctx).await,
+        ("POST", "/blocks/answer") if !same_origin(&req, ctx) => {
+            text(403, "cross-origin", "text/plain")
+        }
+        ("POST", "/blocks/answer") => answer_block(req, ctx).await,
         ("POST", "/agents/reopen") if !same_origin(&req, ctx) => {
             text(403, "cross-origin", "text/plain")
         }
@@ -2597,6 +2601,49 @@ async fn agent_action(req: hyper::Request<hyper::body::Incoming>, ctx: &Ctx) -> 
             "application/json",
         ),
         None => text(500, "the agent action panicked", "text/plain"),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct BlockAnswerAsk {
+    agent: String,
+    name: String,
+    question: String,
+    answer: String,
+}
+
+async fn answer_block(req: hyper::Request<hyper::body::Incoming>, ctx: &Ctx) -> Resp {
+    let body = http_body_util::Limited::new(req.into_body(), 64 * 1024);
+    let Ok(bytes) = body.collect().await.map(|c| c.to_bytes()) else {
+        return text(413, "too long", "text/plain");
+    };
+    let Ok(ask) = serde_json::from_slice::<BlockAnswerAsk>(&bytes) else {
+        return text(400, "expected a block answer", "text/plain");
+    };
+    if *ctx.cancelled.borrow() {
+        return text(503, "the remote is off", "text/plain");
+    }
+    let repo = ctx.pages.repo.clone();
+    let done = ctx
+        .blocking
+        .run(move || {
+            crate::cli::block::answer_block(
+                &repo,
+                &ask.agent,
+                &ask.name,
+                &ask.answer,
+                Some(&ask.question),
+            )
+        })
+        .await;
+    match done {
+        Some(Ok(_)) => text(204, "", "text/plain"),
+        Some(Err(e)) => text(
+            409,
+            serde_json::json!({"why": format!("{e:#}")}).to_string(),
+            "application/json",
+        ),
+        None => text(500, "the block answer panicked", "text/plain"),
     }
 }
 
@@ -4846,6 +4893,10 @@ mod tests {
         // The queue's controls and the route they post to, together.
         assert!(PAGE.contains("'/queue'"), "the page asks the queue route");
         assert!(
+            PAGE.contains("'/blocks/answer'"),
+            "the page asks the block answer route"
+        );
+        assert!(
             PAGE.contains("data-handle") && PAGE.contains("data-do"),
             "and names an entry by its file, with what to do to it"
         );
@@ -5531,6 +5582,75 @@ mod tests {
             missing.status(),
             409,
             "a spent stash cannot be restored twice"
+        );
+        let _ = cancel.send(true);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn web_block_answer_uses_the_cli_write_and_refuses_replays() {
+        let (base, door, anon, cancel, _site, repo) = door_only().await;
+        let question = repo.path().join(".clank/agents/claude/blocks/why.md");
+        std::fs::create_dir_all(question.parent().unwrap()).unwrap();
+        std::fs::write(&question, "Which option?").unwrap();
+        let cookie = door
+            .open_session("token")
+            .map(|t| format!("{}={t}", door::COOKIE))
+            .unwrap();
+        let ask = |answer: &str, question: &str| {
+            serde_json::json!({
+                "agent": "claude", "name": "why", "question": question, "answer": answer
+            })
+        };
+        let send = |body: serde_json::Value| {
+            anon.post(format!("{base}/blocks/answer"))
+                .header("cookie", &cookie)
+                .header("origin", &base)
+                .json(&body)
+                .send()
+        };
+        assert_eq!(
+            anon.post(format!("{base}/blocks/answer"))
+                .header("origin", &base)
+                .json(&ask("yes", "Which option?"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            401
+        );
+        assert_eq!(
+            anon.post(format!("{base}/blocks/answer"))
+                .header("cookie", &cookie)
+                .json(&ask("yes", "Which option?"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            403
+        );
+        assert_eq!(send(ask(" ", "Which option?")).await.unwrap().status(), 409);
+        assert_eq!(
+            send(ask("yes", "Old question")).await.unwrap().status(),
+            409
+        );
+        assert!(
+            crate::cli::block::scan_blocks(repo.path())[0]
+                .answer
+                .is_none()
+        );
+        assert_eq!(
+            send(ask("yes", "Which option?")).await.unwrap().status(),
+            204
+        );
+        assert_eq!(
+            send(ask("no", "Which option?")).await.unwrap().status(),
+            409
+        );
+        assert_eq!(
+            crate::cli::block::scan_blocks(repo.path())[0]
+                .answer
+                .as_deref(),
+            Some("yes")
         );
         let _ = cancel.send(true);
     }

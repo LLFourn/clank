@@ -1,3 +1,4 @@
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use super::{BlockArgs, BlockCmd, BlockCreateArgs, BlockMigrateArgs, UnblockArgs, resolve_repo};
@@ -213,11 +214,7 @@ async fn run_create(args: BlockCreateArgs) -> anyhow::Result<()> {
 
 pub async fn run_unblock(args: UnblockArgs) -> anyhow::Result<()> {
     let repo = resolve_repo(args.repo.as_deref())?;
-
-    let dir = agents_root(&repo).join(&args.agent).join("unblocks");
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join(format!("{}.md", args.name));
-    std::fs::write(&path, &args.message)?;
+    let path = answer_block(&repo, &args.agent, &args.name, &args.message, None)?;
 
     println!(
         "unblocked {} as {}",
@@ -225,6 +222,53 @@ pub async fn run_unblock(args: UnblockArgs) -> anyhow::Result<()> {
         path.strip_prefix(&repo).unwrap_or(&path).display()
     );
     Ok(())
+}
+
+/// The one unblock write for CLI and web. `expected_question` is
+/// captured by a web form, so an edited question is not answered under
+/// the reader's feet. Hard-linking a complete staged file publishes at
+/// most one answer, even if two browsers submit together.
+pub(crate) fn answer_block(
+    repo: &Path,
+    agent: &str,
+    name: &str,
+    message: &str,
+    expected_question: Option<&str>,
+) -> anyhow::Result<PathBuf> {
+    use anyhow::Context as _;
+    let agent = clank_core::ids::AgentLabel::parse(agent)
+        .map_err(|e| anyhow::anyhow!("invalid agent label: {e}"))?;
+    if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\', '\0']) {
+        anyhow::bail!("invalid block name `{name}`");
+    }
+    let answer = message.trim();
+    if answer.is_empty() {
+        anyhow::bail!("write an answer before submitting");
+    }
+    let agent_root = agents_root(repo).join(agent.as_str());
+    let question_path = agent_root.join("blocks").join(format!("{name}.md"));
+    if !std::fs::symlink_metadata(&question_path).is_ok_and(|meta| meta.file_type().is_file()) {
+        anyhow::bail!("`{agent}` has no pending block named `{name}`");
+    }
+    let question = std::fs::read_to_string(&question_path)
+        .with_context(|| format!("reading block `{agent}/{name}`"))?;
+    if expected_question.is_some_and(|expected| expected != question) {
+        anyhow::bail!("the question for `{agent}/{name}` changed; read it again before answering");
+    }
+
+    let dir = agent_root.join("unblocks");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{name}.md"));
+    let mut staged = tempfile::NamedTempFile::new_in(&dir)?;
+    staged.write_all(answer.as_bytes())?;
+    staged.as_file().sync_all()?;
+    match std::fs::hard_link(staged.path(), &path) {
+        Ok(()) => Ok(path),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            anyhow::bail!("`{agent}/{name}` was already answered")
+        }
+        Err(e) => Err(e).with_context(|| format!("recording answer for `{agent}/{name}`")),
+    }
 }
 
 async fn run_clean(args: super::BlockCleanArgs) -> anyhow::Result<()> {
@@ -375,6 +419,41 @@ mod tests {
         let blocks = scan_blocks(dir.path());
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].answer.as_deref(), Some("Use Result<T>"));
+    }
+
+    #[test]
+    fn answer_requires_current_question_and_records_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        write(
+            &repo.join(".clank/agents/alice/blocks/why.md"),
+            "Which option?",
+        );
+        assert!(answer_block(repo, "alice", "why", " ", None).is_err());
+        assert!(answer_block(repo, "alice", "../why", "yes", None).is_err());
+        assert!(answer_block(repo, "alice", "missing", "yes", None).is_err());
+        assert!(
+            answer_block(repo, "alice", "why", "yes", Some("Old question"))
+                .unwrap_err()
+                .to_string()
+                .contains("changed")
+        );
+        assert!(scan_blocks(repo)[0].answer.is_none());
+        answer_block(
+            repo,
+            "alice",
+            "why",
+            "  first answer  ",
+            Some("Which option?"),
+        )
+        .unwrap();
+        assert!(
+            answer_block(repo, "alice", "why", "second answer", Some("Which option?"))
+                .unwrap_err()
+                .to_string()
+                .contains("already answered")
+        );
+        assert_eq!(scan_blocks(repo)[0].answer.as_deref(), Some("first answer"));
     }
 
     #[tokio::test]

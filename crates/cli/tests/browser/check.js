@@ -4,6 +4,45 @@ const ok = (name, cond, detail = '') => out.push(`${cond ? 'PASS' : 'FAIL'}  ${n
 
 (async () => {
   try {
+  // ---- blocks can be answered in the page without losing a draft on status refresh
+  {
+    const { browser, page, errors } = await open();
+    await page.evaluate(() => {
+      window.__rejectBlock = true;
+      window.fetch = async (url, opts) => {
+        window.__frames.push([url, opts && opts.body]);
+        if (url === '/blocks/answer' && window.__rejectBlock)
+          return { ok: false, status: 409, json: async () => ({ why: 'the question changed' }) };
+        return { ok: true, status: 204 };
+      };
+    });
+    const frame = () => facts([agent('claude', 'reviewer')], {
+      ledger: { plan: 'foo', gate: 'unreviewed', dirty: null, queue: [], stash: 0,
+        blocks: [{ agent: 'claude', name: 'which-option', question: 'Which option?\nExplain why.' }], rows: [] },
+    });
+    await page.evaluate((d) => window.__send('status', d), frame());
+    const block = page.locator('#strip form.block');
+    ok('pending block shows agent, name and full question',
+       await block.count() === 1 && (await block.textContent()).includes('claude · which-option')
+       && (await block.textContent()).includes('Which option?\nExplain why.'));
+    await page.fill('#strip textarea', 'Use the first option.');
+    await page.evaluate((d) => window.__send('status', d), frame());
+    ok('unchanged status preserves the answer draft', await page.inputValue('#strip textarea') === 'Use the first option.');
+    await page.click('#strip button[type=submit]');
+    await page.waitForFunction(() => document.querySelector('#strip .block-error').textContent.includes('question changed'));
+    ok('refused answer explains why and stays editable', await page.inputValue('#strip textarea') === 'Use the first option.'
+       && await page.locator('#strip form.block').count() === 1);
+    await page.evaluate(() => { window.__rejectBlock = false; });
+    await page.click('#strip button[type=submit]');
+    await page.waitForFunction(() => document.querySelector('#strip').hidden);
+    const sends = await page.evaluate(() => window.__frames.filter((f) => f[0] === '/blocks/answer').map((f) => JSON.parse(f[1])));
+    ok('answer carries block identity and question; success clears pending block', sends.length === 2
+       && sends[1].agent === 'claude' && sends[1].name === 'which-option'
+       && sends[1].question === 'Which option?\nExplain why.' && sends[1].answer === 'Use the first option.');
+    ok('block answer has no script errors', errors.length === 0, errors.join('; '));
+    await browser.close();
+  }
+
   // ---- the timeline button owns the tray at a phone width
   {
     const { browser, page, errors } = await open();

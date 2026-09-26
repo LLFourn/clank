@@ -1977,6 +1977,13 @@ pub(crate) struct Stashed {
     pub(crate) commits: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct PendingBlock {
+    pub(crate) agent: String,
+    pub(crate) name: String,
+    pub(crate) question: String,
+}
+
 /// What has been done, and what the repo is carrying.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct Ledger {
@@ -1989,7 +1996,7 @@ pub(crate) struct Ledger {
     pub(crate) queue: Vec<Queued>,
     pub(crate) stash: usize,
     pub(crate) stash_entries: Vec<Stashed>,
-    pub(crate) blocks: Vec<String>,
+    pub(crate) blocks: Vec<PendingBlock>,
     pub(crate) rows: Vec<LedgerRow>,
 }
 
@@ -2119,7 +2126,11 @@ pub(crate) fn web_facts(
             .blocks
             .iter()
             .filter(|b| b.answer.is_none())
-            .map(|b| b.question.clone())
+            .map(|b| PendingBlock {
+                agent: b.agent.clone(),
+                name: b.name.clone(),
+                question: b.question.clone(),
+            })
             .collect(),
         rows: ledger_rows(&snap.log_rows),
     };
@@ -6009,6 +6020,34 @@ pub(crate) mod tests {
         assert!(
             c.contains("dec0de") && c.contains("foo"),
             "the correction names the commit to amend and the plan the tag missed: {c}"
+        );
+    }
+
+    #[test]
+    fn web_facts_carry_only_pending_blocks_with_their_identity() {
+        let mut snap = crate::cli::status_tui::fixtures::snap(vec![], vec![]);
+        snap.blocks = vec![
+            crate::cli::block::BlockEntry {
+                agent: "claude".into(),
+                name: "which".into(),
+                question: "Which option?".into(),
+                answer: None,
+            },
+            crate::cli::block::BlockEntry {
+                agent: "codex".into(),
+                name: "done".into(),
+                question: "Why?".into(),
+                answer: Some("Because".into()),
+            },
+        ];
+        let facts = web_facts(&snap, &Default::default());
+        assert_eq!(
+            facts.ledger.blocks,
+            vec![PendingBlock {
+                agent: "claude".into(),
+                name: "which".into(),
+                question: "Which option?".into(),
+            }]
         );
     }
 

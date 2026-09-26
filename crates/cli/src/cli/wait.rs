@@ -3228,10 +3228,15 @@ mod tests {
         std::fs::create_dir_all(agent.join("blocks")).unwrap();
         std::fs::create_dir_all(agent.join("unblocks")).unwrap();
         std::fs::write(agent.join("blocks/q.md"), "why?").unwrap();
+        let before = check_blocks(repo, &AgentLabel::parse("claude").unwrap());
+        assert!(matches!(
+            before.items.as_slice(),
+            [WaitItem::Blocked { .. }]
+        ));
         // The flat answer path: written where the flat reader looks.
         // A split landing (reader flat, writer scoped) would leave the
         // pair unmatched and park the repo forever.
-        std::fs::write(agent.join("unblocks/q.md"), "because").unwrap();
+        crate::cli::block::answer_block(repo, "claude", "q", "because", None).unwrap();
 
         let br = check_blocks(repo, &AgentLabel::parse("claude").unwrap());
 

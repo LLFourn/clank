@@ -132,8 +132,16 @@
   .picker .opt .doing { color: var(--muted); font-size: 12px; margin-top: 2px; }
 
   /* An interruption, not chrome: here while it is true, gone after. */
-  .strip { grid-area: strip; padding: 9px 14px; background: color-mix(in srgb, var(--hue) 13%, var(--bezel)); border-top: 1px solid var(--edge); border-bottom: 1px solid var(--edge); font-size: 12px; white-space: pre-wrap; }
+  .strip { grid-area: strip; padding: 9px 14px; background: color-mix(in srgb, var(--hue) 13%, var(--bezel)); border-top: 1px solid var(--edge); border-bottom: 1px solid var(--edge); font-size: 12px; white-space: pre-wrap; max-height: 42vh; overflow-y: auto; }
   .strip .how { display: block; color: var(--muted); margin-top: 3px; }
+  .strip .block { margin-bottom: 10px; }
+  .strip .block:last-child { margin-bottom: 0; }
+  .strip .block-context { color: var(--muted); font-weight: 700; }
+  .strip .block-question { margin: 3px 0 6px; }
+  .strip textarea { display: block; width: 100%; box-sizing: border-box; min-height: 60px; resize: vertical; font: inherit; color: var(--ink); background: var(--base); border: 1px solid var(--edge); border-radius: 4px; padding: 6px; }
+  .strip .block button { margin-top: 6px; padding: 5px 9px; background: var(--hue-deep); color: white; border-radius: 4px; font-weight: 700; }
+  .strip .block button:disabled { opacity: .5; }
+  .strip .block-error { color: var(--ink); margin-left: 8px; }
 
   /* One agent. */
   .agent { grid-area: agent; display: grid; grid-template-rows: minmax(0, 1fr); min-height: 0; border-top: 1px solid var(--edge); }
@@ -852,16 +860,45 @@
   });
 
   // ---- an interruption, while it lasts ----
+  let stripDrawn = null;
   function paintStrip() {
     const asks = facts ? facts.ledger.blocks : [];
     const fix = facts && facts.correction;
+    const signature = JSON.stringify([asks, fix]);
+    if (signature === stripDrawn) return;
+    stripDrawn = signature;
     if (!asks.length && !fix) { stripEl.hidden = true; stripEl.innerHTML = ''; return; }
     stripEl.hidden = false;
     stripEl.innerHTML = [
-      ...asks.map((b) => `${esc(b)}<span class="how">Answer it at the terminal, or with clank block answer.</span>`),
+      ...asks.map((b) => `<form class="block" data-agent="${esc(b.agent)}" data-name="${esc(b.name)}"><div class="block-context">${esc(b.agent)} · ${esc(b.name)}</div><div class="block-question">${esc(b.question)}</div><textarea name="answer" aria-label="Answer ${esc(b.agent)}'s block ${esc(b.name)}" required></textarea><button type="submit">Answer block</button><span class="block-error" role="alert"></span></form>`),
       fix ? `${esc(fix)}<span class="how">${esc(masterLabel() || 'master')}'s to repair.</span>` : '',
     ].filter(Boolean).join('');
   }
+  stripEl.addEventListener('submit', async (e) => {
+    const form = e.target.closest('form.block'); if (!form) return;
+    e.preventDefault();
+    const answer = form.elements.answer.value.trim();
+    const error = form.querySelector('.block-error');
+    if (!answer) { error.textContent = 'Write an answer before submitting.'; return; }
+    const { agent, name } = form.dataset;
+    const block = facts?.ledger.blocks.find((b) => b.agent === agent && b.name === name);
+    if (!block) { error.textContent = 'This block is no longer pending.'; return; }
+    const button = form.querySelector('button'); button.disabled = true;
+    error.textContent = '';
+    try {
+      const reply = await fetch('/blocks/answer', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ agent, name, question: block.question, answer }) });
+      if (!reply.ok) {
+        const body = await reply.json().catch(() => ({}));
+        throw new Error(body.why || `Answer refused (${reply.status})`);
+      }
+      facts.ledger.blocks = facts.ledger.blocks.filter((b) => b.agent !== agent || b.name !== name);
+      stripDrawn = null;
+      paintStrip();
+    } catch (err) {
+      error.textContent = err.message || 'Could not answer the block.';
+      button.disabled = false;
+    }
+  });
 
   // ---- the agent ----
   function ensureViews(label) {
