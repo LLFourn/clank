@@ -15,7 +15,6 @@ pub mod fs_plan_state_lookup;
 pub mod fs_watcher;
 pub mod git_io;
 pub mod git_plumbing;
-pub mod hook_config;
 pub mod inbox;
 pub mod init_facts;
 pub mod owner_sentinel;
@@ -26,7 +25,6 @@ pub mod repo_watch;
 pub mod runtime;
 pub mod shell_quote;
 pub mod state_cache;
-pub mod wait_claim;
 pub mod worktree_facts;
 
 // Operator CLI subcommands. Local-only mutations.

@@ -29,7 +29,6 @@ mod rereview_integration;
 mod standby_wakes;
 mod stash_integration;
 mod status_log_integration;
-mod stop_hook_peek_no_hooks;
 mod tui_is_the_command;
 mod wait_config_reload;
 mod wait_event_sources;

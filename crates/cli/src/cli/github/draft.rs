@@ -192,11 +192,9 @@ fn comments_from(items: &[serde_json::Value]) -> anyhow::Result<Vec<DraftComment
 /// One observation: find the pending review, read it whole, and say
 /// what changed since the last observation.
 ///
-/// The horizon advances IN MEMORY only. The caller persists it after
-/// the changes have been delivered, so a crash in between costs a
-/// repeated wake rather than a lost one — which is the right way
-/// round for an item whose whole purpose is that master hears about
-/// the operator's edit.
+/// The horizon advances IN MEMORY only. The caller stages the resulting
+/// snapshot before appending its changes to the event log; a crash can
+/// then finish the staged ingest on the next arm.
 ///
 /// A read that failed, or a draft that would not hold still, leaves
 /// the horizon untouched and reports nothing. Absence is how this
@@ -256,16 +254,18 @@ enum Draft {
 pub(crate) struct DraftHorizon {
     revision: u64,
     draft: Draft,
-    /// Changes this watch has produced but not seen handed to master.
-    ///
-    /// A channel send is not a delivery: it succeeds while the
-    /// receiver is merely alive, and the wait can still fail, be
-    /// cancelled, or drop a queued item before returning (codex
-    /// 29431d9). These are written down BEFORE they are sent and
-    /// cleared only when a wait says it handed them over, so the
-    /// failure mode is a repeated wake rather than a lost edit.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    undelivered: Vec<DraftTransition>,
+    /// An observation staged before its event-log rows are appended.
+    /// This is an ingest transaction, not delivery state: the ordinary
+    /// event inbox owns every change until the agent explicitly acks it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending: Option<DraftBatch>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct DraftBatch {
+    revision: u64,
+    draft: Draft,
+    pub(crate) changes: Vec<DraftTransition>,
 }
 
 impl DraftHorizon {
@@ -281,21 +281,26 @@ impl DraftHorizon {
         }
     }
 
-    /// Record changes as owed to master until a wait says otherwise.
-    pub(crate) fn owe(&mut self, changes: &[DraftTransition]) {
-        self.undelivered.extend(changes.iter().cloned());
+    /// Stage the observed state before any event-log append. A later
+    /// source can finish this exact batch after a crash or handoff.
+    pub(crate) fn stage(&mut self, observed: &Self, changes: Vec<DraftTransition>) {
+        self.pending = Some(DraftBatch {
+            revision: observed.revision,
+            draft: observed.draft.clone(),
+            changes,
+        });
     }
 
-    /// What is owed but never handed over — what an earlier wait
-    /// produced and could not deliver.
-    pub(crate) fn owed(&self) -> Vec<DraftTransition> {
-        self.undelivered.clone()
+    pub(crate) fn pending(&self) -> Option<&DraftBatch> {
+        self.pending.as_ref()
     }
 
-    /// Master has been handed these revisions; stop owing them.
-    pub(crate) fn delivered(&mut self, revisions: &[u64]) {
-        self.undelivered
-            .retain(|t| !revisions.contains(&t.revision));
+    /// Called only after all pending changes have durable inbox rows.
+    pub(crate) fn commit_pending(&mut self) {
+        if let Some(batch) = self.pending.take() {
+            self.revision = batch.revision;
+            self.draft = batch.draft;
+        }
     }
 
     /// Absorb a snapshot written as `(id, body)` and report the
@@ -314,10 +319,6 @@ impl DraftHorizon {
                 })
                 .collect(),
         );
-        // Owed as well as observed, because that is what the driver
-        // does with them and the lifecycle's tests are about the
-        // difference between the two.
-        self.owe(&changes);
         changes.into_iter().map(|t| t.revision).collect()
     }
 
@@ -810,33 +811,6 @@ mod tests {
         );
         let second = h.absorb(1, vec![c(1, "a3", "T3"), c(2, "b2", "T2")]);
         assert_eq!(second.iter().map(|t| t.revision).collect::<Vec<_>>(), [3]);
-    }
-
-    #[test]
-    fn only_the_changes_that_reached_master_stop_being_owed() {
-        let mut h = DraftHorizon::started();
-        h.absorb(9, vec![c(1, "a", "T1"), c(2, "b", "T1"), c(3, "c", "T1")]);
-        let owed: Vec<DraftTransition> = h.owed();
-        assert!(
-            owed.is_empty(),
-            "nothing is owed until it is recorded as owed"
-        );
-
-        let changes = h.absorb(
-            9,
-            vec![c(1, "a2", "T2"), c(2, "b2", "T2"), c(3, "c2", "T2")],
-        );
-        h.owe(&changes);
-        assert_eq!(
-            h.owed().iter().map(|t| t.revision).collect::<Vec<_>>(),
-            [4, 5, 6]
-        );
-
-        // A wait can hand over some of what is owed and not the rest —
-        // a change produced after its items were collected is still
-        // owed, and clearing the lot would lose it.
-        h.delivered(&[4, 6]);
-        assert_eq!(h.owed().iter().map(|t| t.revision).collect::<Vec<_>>(), [5]);
     }
 
     #[test]

@@ -666,20 +666,6 @@ pub(super) fn scrollable_header(
                 plain(format!(" {}", a.label)),
                 dim(format!("  {}", tier_label(a.role))),
             ];
-            // ITS LAST TURN ENDED AND NOTHING WILL WAKE IT. Shown only
-            // for that one state: every other answer is a reason to
-            // say nothing, and a row annotated "healthy" on five
-            // separate grounds is noise nobody reads
-            // (the-turn-end-is-one-decision).
-            if let Some(since) = a.unreachable_since {
-                spans.push(colored(
-                    "33",
-                    format!(
-                        "  ⚠ no waker {}",
-                        crate::age::short(crate::age::elapsed(since))
-                    ),
-                ));
-            }
             // An attending agent is BLOCKED, not working, so the
             // hourglass replaces the spinner and its verb rather than
             // crowding in beside them — `⌛ working…` claims two things
@@ -3843,31 +3829,6 @@ mod tests {
     /// it is actually seen. Shown for that ONE state, because a row
     /// annotated "healthy" on five separate grounds is noise nobody
     /// reads (the-turn-end-is-one-decision).
-    #[test]
-    fn a_row_with_no_waker_is_marked_and_the_others_are_not() {
-        use crate::cli::status_tui::fixtures::two_agent_snap;
-        let drawn = |since: Option<i64>| {
-            let mut s = two_agent_snap();
-            s.agents[0].unreachable_since = since;
-            render(&s, 40, 120).join("\n")
-        };
-
-        // Nothing owed: the row says nothing about waking.
-        assert!(
-            !drawn(None).contains("no waker"),
-            "a row with nothing to report must stay quiet",
-        );
-
-        // Its last turn ended and nothing will wake it.
-        let shown = drawn(Some(crate::age::now() - 3_600));
-        assert!(shown.contains("no waker"), "{shown}");
-        // With HOW LONG, because "no waker" alone does not tell a
-        // human whether to act.
-        assert!(
-            shown.contains("no waker 1h"),
-            "the marker carries the elapsed: {shown}",
-        );
-    }
 
     /// The icon ASKS for the emoji, in both row states.
     ///

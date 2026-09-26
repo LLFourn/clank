@@ -108,8 +108,8 @@ fn oldest_obligation(
             // notification, an idle prompt, a preempt the panel
             // surfaces elsewhere (the `fix` gauge, the queue).
             WaitItem::Finished { .. }
-            | WaitItem::Idle { .. }
             | WaitItem::AdHocSettled { .. }
+            | WaitItem::Idle { .. }
             | WaitItem::FixCommitTag { .. }
             | WaitItem::MultiplePlansOpen { .. }
             | WaitItem::PromoteFromQueue { .. }

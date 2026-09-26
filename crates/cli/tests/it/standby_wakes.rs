@@ -42,11 +42,9 @@ fn label(s: &str) -> AgentLabel {
 fn wait_args(repo: &Path, author: &str, peek: bool, events: Vec<String>) -> WaitArgs {
     WaitArgs {
         repo: Some(repo.to_path_buf()),
-        tag: None,
         author: Some(author.into()),
         die_with_owner: false,
         deliver_to_session: None,
-        expected_generation: None,
         json: true,
         events,
         r#for: None,

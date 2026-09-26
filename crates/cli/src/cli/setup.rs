@@ -55,23 +55,17 @@ const OBSOLETE_SKILL: &str = "clank";
 const MASTER_DESC: &str = "Clank multi-agent workflow, MASTER role. Use ONLY when you are the master in a clank repo (implement plan milestones, promote/finish plans, manage the roster). Do NOT use as a reviewer or on standby — use clank-reviewer instead.";
 const REVIEWER_DESC: &str = "Clank multi-agent workflow, REVIEWER and STANDBY roles. Use ONLY when you are a reviewer or on standby in a clank repo. Do NOT use as the master — use clank-master instead.";
 
-/// How each tool's agents receive work (claude-stop-hook-minimal-hint):
-/// claude parks an armed background `clank wait` whose completion wake
-/// carries the items — the skill must teach the arm/act/re-arm loop.
-/// Codex is driven by the Stop hook blocking with the items directly.
-/// Both variants keep the shared hint sentence the tests pin.
+/// Claude's Stop hook owns its wait and returns the wake as a
+/// continuation. The agent ends its turn; it does not arm a task.
 const WORK_LOOP_CLAUDE: &str = "\
-- **Keep a `clank wait` armed.** End every turn with `clank wait`
-  running as its OWN background task (Bash, `run_in_background: true`).
-  Its completion is your wake: act on the items it printed IMMEDIATELY,
-  then re-arm `clank wait` and end your turn. If you stop with nothing
-  armed, the Stop hook reminds you to arm one. Run `clank status` if you
-  need more than the hint carries (short SHAs resolve wherever a `<sha>`
-  is wanted).
+- **Act on Stop-hook work immediately, then end your turn.** The Stop
+  hook watches for clank work and wakes you with the items. Run
+  `clank status` if you need more than the hint carries (short SHAs
+  resolve wherever a `<sha>` is wanted).
   Each item is a one-line hint: kind, plan, short sha.
-- **NEVER poll.** Do not run `clank wait` in the FOREGROUND and do not
-  re-run `clank status` waiting for state to change. The armed
-  background wait wakes you; do not spin.";
+- **Never poll.** Do not start a background `clank wait` or re-run
+  `clank status` while waiting. End your turn; the Stop hook owns the
+  wait and hands you new work.";
 
 /// Claude under the ASYNCREWAKE loop (claude-asyncrewake-work-loop):
 /// the Stop hook parks the watcher itself and work arrives as a
@@ -86,8 +80,7 @@ const WORK_LOOP_CLAUDE_ASYNC: &str = "\
   the hint carries (short SHAs resolve wherever a `<sha>` is wanted).
   Each item is a one-line hint: kind, plan, short sha.
 - **NEVER run `clank wait` yourself**, foreground or background —
-  the parked hook already holds this session's one wait; a second
-  duplicates deliveries. Do not re-run `clank status` waiting for
+  the hook owns the wait and presents pending work. Do not re-run `clank status` waiting for
   state to change. End your turn; work finds you.";
 
 const WORK_LOOP_CODEX: &str = "\
@@ -836,7 +829,7 @@ fn install_claude_hooks(
 }
 
 /// SessionStart companion: binds the launched session to its label,
-/// mints the wait generation and delivers catch-up context. Fast — it
+/// delivers catch-up context. Fast — it
 /// must never hold a session start hostage.
 struct SessionStartHook;
 impl HookKind for SessionStartHook {
@@ -1523,16 +1516,11 @@ mod tests {
 
     #[test]
     fn work_loop_teaches_the_per_tool_delivery_model() {
-        // claude-stop-hook-minimal-hint: claude agents park an armed
-        // background `clank wait` whose completion wake carries the
-        // items; codex agents are driven by the Stop hook blocking
-        // with the items directly.
+        // Claude and Codex both let the Stop hook own the wait.
         let mc = compose_skill(Role::Master, Tool::Claude);
         let mx = compose_skill(Role::Master, Tool::Codex);
-        assert!(mc.contains("Keep a `clank wait` armed"));
-        assert!(mc.contains("run_in_background"));
-        assert!(mc.contains("re-arm"));
-        assert!(!mc.contains("Act on Stop-hook work"));
+        assert!(mc.contains("Stop hook owns the"));
+        assert!(!mc.contains("run_in_background"));
         assert!(mx.contains("Act on Stop-hook work IMMEDIATELY"));
         assert!(!mx.contains("run_in_background"));
         // opencode is plugin-driven: work is INJECTED as a prompt;
@@ -1543,9 +1531,7 @@ mod tests {
         assert!(mo.contains("NEVER run `clank wait` yourself"));
         assert!(!mo.contains("Keep a `clank wait` armed"));
         assert!(!mo.contains("run_in_background"));
-        // claude under asyncrewake flips to the same work-finds-you
-        // model (claude-asyncrewake-work-loop); legacy compose is
-        // byte-stable arm-the-wait.
+        // Async Claude also keeps the wait in its Stop hook.
         let ma = compose_skill_with(Role::Master, Tool::Claude, true);
         assert!(ma.contains("Work arrives on its own"));
         assert!(ma.contains("NEVER run `clank wait` yourself"));
@@ -1579,8 +1565,8 @@ mod tests {
         let s = PR_REVIEW_SKILL_BODY;
         assert!(s.contains("Do not answer it"), "the one rule this wake has");
         assert!(
-            s.contains("There is nothing to ack"),
-            "an awareness item with an ack instruction would grow a workflow"
+            s.contains("clank events ack <selector>"),
+            "draft changes remain pending until explicitly acked"
         );
         assert!(
             s.contains("your OWN writes"),
@@ -2265,18 +2251,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), legacy);
-    }
-
-    #[test]
-    fn bind_fails_when_generation_cannot_persist() {
-        // codex 1483318: an ownership claim that cannot persist its
-        // revocation must FAIL — wait.gen as a DIRECTORY makes the
-        // write deterministically impossible.
-        let tmp = tempfile::tempdir().unwrap();
-        let agent_dir = tmp.path();
-        std::fs::create_dir_all(agent_dir.join("wait.gen")).unwrap();
-        let err = crate::agent_store::mint_wait_generation(agent_dir).unwrap_err();
-        assert!(err.to_string().contains("wait.gen"), "{err}");
     }
 
     #[test]

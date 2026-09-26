@@ -309,24 +309,16 @@ impl Role {
     }
 }
 
-/// Work-item event that can trigger a configured shell hook.
+/// Event that can trigger a configured shell hook.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum HookEvent {
-    MasterWork,
-    ReviewerWork,
-    PlanFinalized,
-    Idle,
     Blocked,
 }
 
 impl HookEvent {
     pub fn as_str(self) -> &'static str {
         match self {
-            HookEvent::MasterWork => "master-work",
-            HookEvent::ReviewerWork => "reviewer-work",
-            HookEvent::PlanFinalized => "plan-finalized",
-            HookEvent::Idle => "idle",
             HookEvent::Blocked => "blocked",
         }
     }

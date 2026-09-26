@@ -232,14 +232,6 @@ pub struct FinishSection {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct HooksSection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub master_work: Option<Option<String>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reviewer_work: Option<Option<String>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub plan_finalized: Option<Option<String>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub idle: Option<Option<String>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked: Option<Option<String>>,
     /// Forward-compat catchall for hook event names this build
     /// doesn't know about yet. `serde_json::Value` (NOT
@@ -347,13 +339,7 @@ fn apply_layer(cfg: &mut Config, path: Option<&Path>) -> BTreeSet<String> {
         }
     }
     if let Some(hooks) = parsed.hooks {
-        for event in [
-            HookEvent::MasterWork,
-            HookEvent::ReviewerWork,
-            HookEvent::PlanFinalized,
-            HookEvent::Idle,
-            HookEvent::Blocked,
-        ] {
+        for event in [HookEvent::Blocked] {
             if let Some(v) = hooks.get(event) {
                 cfg.hooks.insert(event, v);
                 present.insert(format!("hooks.{}", event_to_key_name(event)));
@@ -431,34 +417,6 @@ pub static KEY_CATALOG: &[KeyDef] = &[
         type_desc: "bool",
         default: "false",
         help: "Require [plan] or [misc] commit title prefixes",
-    },
-    KeyDef {
-        section: "hooks",
-        name: "master_work",
-        type_desc: "string|null",
-        default: "null",
-        help: "Shell command to run when master has new work",
-    },
-    KeyDef {
-        section: "hooks",
-        name: "reviewer_work",
-        type_desc: "string|null",
-        default: "null",
-        help: "Shell command to run when a reviewer has work",
-    },
-    KeyDef {
-        section: "hooks",
-        name: "plan_finalized",
-        type_desc: "string|null",
-        default: "null",
-        help: "Shell command to run when a plan is finished",
-    },
-    KeyDef {
-        section: "hooks",
-        name: "idle",
-        type_desc: "string|null",
-        default: "null",
-        help: "Shell command to run on idle (no work)",
     },
     KeyDef {
         section: "hooks",
@@ -570,10 +528,6 @@ pub fn get_value(cfg: &Config, key: &str) -> String {
         "review.adhoc_feedback" => cfg.review.adhoc_feedback.to_string(),
         "review.plan_feedback" => cfg.review.plan_feedback.to_string(),
         "review.require_commit_prefix" => cfg.review.require_commit_prefix.to_string(),
-        "hooks.master_work" => hook_display(cfg.hooks.get(&HookEvent::MasterWork)),
-        "hooks.reviewer_work" => hook_display(cfg.hooks.get(&HookEvent::ReviewerWork)),
-        "hooks.plan_finalized" => hook_display(cfg.hooks.get(&HookEvent::PlanFinalized)),
-        "hooks.idle" => hook_display(cfg.hooks.get(&HookEvent::Idle)),
         "hooks.blocked" => hook_display(cfg.hooks.get(&HookEvent::Blocked)),
         "diff.editor.command" => cfg
             .diff
@@ -597,10 +551,6 @@ pub fn get_value(cfg: &Config, key: &str) -> String {
 
 fn event_to_key_name(event: HookEvent) -> &'static str {
     match event {
-        HookEvent::MasterWork => "master_work",
-        HookEvent::ReviewerWork => "reviewer_work",
-        HookEvent::PlanFinalized => "plan_finalized",
-        HookEvent::Idle => "idle",
         HookEvent::Blocked => "blocked",
     }
 }
@@ -614,10 +564,6 @@ fn key_to_json_path(key: &str) -> Option<&'static [&'static str]> {
         "review.adhoc_feedback" => Some(&["review", "adhoc_feedback"]),
         "review.plan_feedback" => Some(&["review", "plan_feedback"]),
         "review.require_commit_prefix" => Some(&["review", "require_commit_prefix"]),
-        "hooks.master_work" => Some(&["hooks", "master_work"]),
-        "hooks.reviewer_work" => Some(&["hooks", "reviewer_work"]),
-        "hooks.plan_finalized" => Some(&["hooks", "plan_finalized"]),
-        "hooks.idle" => Some(&["hooks", "idle"]),
         "hooks.blocked" => Some(&["hooks", "blocked"]),
         "diff.wait" => Some(&["diff", "wait"]),
         "diff.editor.command" => Some(&["diff", "editor", "command"]),
@@ -657,10 +603,6 @@ struct ReviewJson {
 
 #[derive(serde::Serialize)]
 struct HooksJson<'a> {
-    master_work: Option<&'a str>,
-    reviewer_work: Option<&'a str>,
-    plan_finalized: Option<&'a str>,
-    idle: Option<&'a str>,
     blocked: Option<&'a str>,
 }
 
@@ -684,10 +626,6 @@ impl<'a> From<&'a Config> for ConfigJson<'a> {
                 require_commit_prefix: cfg.review.require_commit_prefix,
             },
             hooks: HooksJson {
-                master_work: hook(HookEvent::MasterWork),
-                reviewer_work: hook(HookEvent::ReviewerWork),
-                plan_finalized: hook(HookEvent::PlanFinalized),
-                idle: hook(HookEvent::Idle),
                 blocked: hook(HookEvent::Blocked),
             },
             diff: DiffJson {
@@ -706,10 +644,6 @@ fn key_name(cmd: &ConfigKey) -> &'static str {
         ConfigKey::ReviewAdhocFeedback(_) => "review.adhoc_feedback",
         ConfigKey::ReviewPlanFeedback(_) => "review.plan_feedback",
         ConfigKey::ReviewRequireCommitPrefix(_) => "review.require_commit_prefix",
-        ConfigKey::HooksMasterWork(_) => "hooks.master_work",
-        ConfigKey::HooksReviewerWork(_) => "hooks.reviewer_work",
-        ConfigKey::HooksPlanFinalized(_) => "hooks.plan_finalized",
-        ConfigKey::HooksIdle(_) => "hooks.idle",
         ConfigKey::HooksBlocked(_) => "hooks.blocked",
         ConfigKey::DiffEditorCommand(_) => "diff.editor.command",
         ConfigKey::DiffWait(_) => "diff.wait",
@@ -722,10 +656,6 @@ fn key_args(cmd: &ConfigKey) -> &ConfigKeyArgs {
         ConfigKey::ReviewAdhocFeedback(a)
         | ConfigKey::ReviewPlanFeedback(a)
         | ConfigKey::ReviewRequireCommitPrefix(a)
-        | ConfigKey::HooksMasterWork(a)
-        | ConfigKey::HooksReviewerWork(a)
-        | ConfigKey::HooksPlanFinalized(a)
-        | ConfigKey::HooksIdle(a)
         | ConfigKey::HooksBlocked(a)
         | ConfigKey::DiffEditorCommand(a)
         | ConfigKey::DiffWait(a)
@@ -1004,25 +934,25 @@ mod tests {
         let repo_cfg = tmp.path().join(".clank/config.json");
         write(
             &repo_cfg,
-            r#"{"hooks": {"master_work": "notify master", "idle": "do idle"}}"#,
+            r#"{"hooks": {"blocked": "notify block", "master_work": "retired"}}"#,
         );
         let cfg = load_isolated(tmp.path());
         assert_eq!(
-            cfg.hooks[&HookEvent::MasterWork],
-            Some("notify master".to_string())
+            cfg.hooks[&HookEvent::Blocked],
+            Some("notify block".to_string())
         );
-        assert_eq!(cfg.hooks[&HookEvent::Idle], Some("do idle".to_string()));
+        assert_eq!(cfg.hooks.len(), 1, "retired wait hooks are ignored");
     }
 
     #[test]
-    fn hooks_kebab_alias_in_config_json() {
+    fn blocked_hook_loads_from_config_json() {
         let tmp = tempfile::tempdir().unwrap();
         let repo_cfg = tmp.path().join(".clank/config.json");
-        write(&repo_cfg, r#"{"hooks": {"master-work": "kebab-cmd"}}"#);
+        write(&repo_cfg, r#"{"hooks": {"blocked": "block-cmd"}}"#);
         let cfg = load_isolated(tmp.path());
         assert_eq!(
-            cfg.hooks[&HookEvent::MasterWork],
-            Some("kebab-cmd".to_string())
+            cfg.hooks[&HookEvent::Blocked],
+            Some("block-cmd".to_string())
         );
     }
 
@@ -1038,7 +968,7 @@ mod tests {
     #[test]
     fn get_value_returns_null_string_for_unset_hook() {
         let cfg = Config::default();
-        assert_eq!(get_value(&cfg, "hooks.master_work"), "null");
+        assert_eq!(get_value(&cfg, "hooks.blocked"), "null");
     }
 
     #[test]
@@ -1094,11 +1024,11 @@ mod tests {
     fn hook_set_true_writes_string_not_bool() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join(".clank")).unwrap();
-        set_repo_key(tmp.path(), &["hooks", "master_work"], "true", "string|null").unwrap();
+        set_repo_key(tmp.path(), &["hooks", "blocked"], "true", "string|null").unwrap();
         let body = std::fs::read_to_string(tmp.path().join(".clank/config.json")).unwrap();
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(
-            v["hooks"]["master_work"],
+            v["hooks"]["blocked"],
             serde_json::Value::String("true".into())
         );
     }
@@ -1107,10 +1037,10 @@ mod tests {
     fn hook_set_null_writes_json_null() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join(".clank")).unwrap();
-        set_repo_key(tmp.path(), &["hooks", "idle"], "null", "string|null").unwrap();
+        set_repo_key(tmp.path(), &["hooks", "blocked"], "null", "string|null").unwrap();
         let body = std::fs::read_to_string(tmp.path().join(".clank/config.json")).unwrap();
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert!(v["hooks"]["idle"].is_null());
+        assert!(v["hooks"]["blocked"].is_null());
     }
 
     #[test]
@@ -1315,8 +1245,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let file = RepoConfigFile {
             hooks: Some(HooksSection {
-                master_work: Some(Some("echo hello".into())),
-                idle: Some(None), // explicitly disabled
+                blocked: Some(Some("echo hello".into())),
                 ..Default::default()
             }),
             ..Default::default()
@@ -1326,20 +1255,12 @@ mod tests {
         std::fs::write(&path, serde_json::to_string_pretty(&file).unwrap()).unwrap();
         let cfg = load_with_home(tmp.path(), None);
         assert_eq!(
-            cfg.hooks.get(&HookEvent::MasterWork),
+            cfg.hooks.get(&HookEvent::Blocked),
             Some(&Some("echo hello".to_string())),
-            "master_work hook should round-trip; cfg.hooks={:?}",
+            "blocked hook should round-trip; cfg.hooks={:?}",
             cfg.hooks
         );
-        assert_eq!(
-            cfg.hooks.get(&HookEvent::Idle),
-            Some(&None),
-            "explicit null should round-trip as Some(None) (disable)"
-        );
-        assert!(
-            !cfg.hooks.contains_key(&HookEvent::ReviewerWork),
-            "unset hook must not appear in the loaded config"
-        );
+        assert_eq!(cfg.hooks.len(), 1);
     }
 
     #[test]
@@ -1350,13 +1271,13 @@ mod tests {
         // would silently drop them.
         let raw = r#"{
             "hooks": {
-                "master_work": "echo m",
+                "blocked": "echo m",
                 "some_future_event": "echo future"
             }
         }"#;
         let parsed: RepoConfigFile = serde_json::from_str(raw).unwrap();
         let hooks = parsed.hooks.as_ref().expect("hooks section present");
-        assert_eq!(hooks.master_work, Some(Some("echo m".to_string())));
+        assert_eq!(hooks.blocked, Some(Some("echo m".to_string())));
         assert_eq!(
             hooks.extra.get("some_future_event"),
             Some(&serde_json::Value::String("echo future".to_string())),
@@ -1385,7 +1306,7 @@ mod tests {
         // any JSON value round-trips intact.
         let raw = r#"{
             "hooks": {
-                "master_work": "echo m",
+                "blocked": "echo m",
                 "future_object_hook": {"cmd": "x", "args": ["a", "b"]},
                 "future_array_hook": ["echo", "first", "echo", "second"],
                 "future_number_hook": 42
@@ -1397,7 +1318,7 @@ mod tests {
         );
         let hooks = parsed.hooks.as_ref().expect("hooks section present");
         // Known typed field still parsed normally.
-        assert_eq!(hooks.master_work, Some(Some("echo m".to_string())));
+        assert_eq!(hooks.blocked, Some(Some("echo m".to_string())));
         // Non-string values preserved as raw Value.
         assert!(hooks.extra.get("future_object_hook").unwrap().is_object());
         assert!(hooks.extra.get("future_array_hook").unwrap().is_array());
@@ -1467,20 +1388,12 @@ mod tests {
     }
 
     #[test]
-    fn config_json_matches_prior_shape() {
-        // typed-json-not-json-macro: ConfigJson must serialize to the
-        // same keys+values the old `json!` produced for `clank config
-        // --json`. `json!` expresses the expected value; key order is
-        // irrelevant (`to_value` equality is order-independent).
-        //
-        // A set hook, an explicitly-disabled hook (Some(None)), and
-        // absent hooks must all match the prior
-        // `Option<&Option<String>>` serialization: set → string,
-        // disabled/absent → null.
+    fn config_json_exposes_only_the_supported_hook() {
+        // The JSON output has the one supported hook and no retired
+        // wait-hook keys. Key order is irrelevant.
         let mut cfg = Config::default();
         cfg.hooks
-            .insert(HookEvent::MasterWork, Some("notify".to_string()));
-        cfg.hooks.insert(HookEvent::Idle, None); // explicitly disabled
+            .insert(HookEvent::Blocked, Some("notify".to_string()));
         cfg.diff.editor = Some(LaunchConfig {
             command: Some("vim".to_string()),
             args: vec!["-c".to_string()],
@@ -1497,10 +1410,6 @@ mod tests {
                     "require_commit_prefix": cfg.review.require_commit_prefix,
                 },
                 "hooks": {
-                    "master_work": cfg.hooks.get(&HookEvent::MasterWork),
-                    "reviewer_work": cfg.hooks.get(&HookEvent::ReviewerWork),
-                    "plan_finalized": cfg.hooks.get(&HookEvent::PlanFinalized),
-                    "idle": cfg.hooks.get(&HookEvent::Idle),
                     "blocked": cfg.hooks.get(&HookEvent::Blocked),
                 },
                 "diff": {

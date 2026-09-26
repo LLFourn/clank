@@ -1906,14 +1906,6 @@ pub(crate) struct Position {
     pub(crate) label: String,
     pub(crate) role: String,
     pub(crate) owes: Option<Owed>,
-    /// When this agent's session last ENDED a turn. The EVIDENCE for
-    /// whether it is working, not the verdict: the verdict also needs
-    /// the newest turn, and turns reach the page on their own cadence
-    /// — a status frame is published when the repo changes, which a
-    /// long read-only turn never does (codex on 90c1740). The page
-    /// holds both and decides continuously; this is the half only the
-    /// server can see.
-    pub(crate) ended: Option<i64>,
     pub(crate) last: Option<String>,
     /// Whether clank can show this agent's transcript, or only its
     /// terminal.
@@ -2006,7 +1998,6 @@ pub(crate) struct WebFacts {
 pub(crate) fn web_facts(
     snap: &StatusSnapshot,
     with_transcript: &std::collections::BTreeSet<String>,
-    ended: &std::collections::BTreeMap<String, i64>,
 ) -> WebFacts {
     use clank_core::vocab::Role;
     let (lamp, plan) = render::bar_text(snap);
@@ -2062,7 +2053,6 @@ pub(crate) fn web_facts(
             label: a.label.clone(),
             role: render::tier_label(a.role).to_string(),
             owes: owed.remove(&a.label),
-            ended: ended.get(&a.label).copied(),
             last: last_act(snap, &a.label, a.role),
             transcript: with_transcript.contains(&a.label),
         })
@@ -2363,7 +2353,7 @@ fn paint_interval(spinner_visible: bool) -> Duration {
 /// waiter died, including across key repaints (codex 451c5dbc,
 /// grok 8aa2736120d7). The signature being ABLE to see it is not the
 /// same as the loop ever asking.
-struct WakerProbe {
+struct AttendanceProbe {
     at: std::time::Instant,
     fingerprint: u64,
 }
@@ -2376,8 +2366,8 @@ struct WakerProbe {
 ///
 /// Rate-limited around the probe, not inside it: a key storm turns
 /// this loop many times, and the reads are cheap but not free.
-fn waker_changed(
-    state: &mut WakerProbe,
+fn attendance_changed(
+    state: &mut AttendanceProbe,
     now: std::time::Instant,
     every: Duration,
     probe: impl FnOnce() -> u64,
@@ -2689,9 +2679,9 @@ pub(crate) async fn run_tui(
         .checked_sub(REBUILD_MIN)
         .unwrap_or_else(std::time::Instant::now);
     let mut refresh_pending = false;
-    let mut waker_probe = WakerProbe {
+    let mut waker_probe = AttendanceProbe {
         at: std::time::Instant::now(),
-        fingerprint: crate::cli::status::waker_fingerprint(&repo),
+        fingerprint: crate::cli::status::attendance_fingerprint(&repo),
     };
     // Labeled so a `Quit` key inside the per-key drain loop exits the
     // event loop, not just the inner `for`.
@@ -4312,12 +4302,12 @@ pub(crate) async fn run_tui(
             }
         }
 
-        // The one input with no event behind it. See `waker_changed`.
-        if waker_changed(
+        // The one input with no event behind it. See `attendance_changed`.
+        if attendance_changed(
             &mut waker_probe,
             std::time::Instant::now(),
             REBUILD_MIN,
-            || crate::cli::status::waker_fingerprint(&repo),
+            || crate::cli::status::attendance_fingerprint(&repo),
         ) {
             refresh_pending = true;
         }
@@ -5684,8 +5674,7 @@ pub(crate) mod tests {
             ),
             &[("claude", crate::cli::teams_config::RosterRole::Master)],
         );
-        let v =
-            serde_json::to_value(web_facts(&s, &Default::default(), &Default::default())).unwrap();
+        let v = serde_json::to_value(web_facts(&s, &Default::default())).unwrap();
 
         let keys = |x: &serde_json::Value| -> BTreeSet<String> {
             x.as_object()
@@ -5695,7 +5684,7 @@ pub(crate) mod tests {
         let set = |ks: &[&str]| -> BTreeSet<String> { ks.iter().map(|k| k.to_string()).collect() };
         assert_eq!(
             keys(&v["agents"][0]),
-            set(&["label", "role", "owes", "ended", "last", "transcript"]),
+            set(&["label", "role", "owes", "last", "transcript"]),
             "the picker and the header destructure an agent by these names"
         );
         assert_eq!(
@@ -5772,7 +5761,7 @@ pub(crate) mod tests {
         s.queue[1].path = std::path::PathBuf::from("/r/.clank/queue/100-sooner.md");
         s.queue.sort_by_key(|q| q.priority);
 
-        let facts = web_facts(&s, &Default::default(), &Default::default());
+        let facts = web_facts(&s, &Default::default());
         let queued: Vec<(&str, u16, &str)> = facts
             .ledger
             .queue
@@ -5831,7 +5820,7 @@ pub(crate) mod tests {
             summary: "fine".into(),
         }];
         let with = ["codex".to_string()].into_iter().collect();
-        let facts = web_facts(&s, &with, &Default::default());
+        let facts = web_facts(&s, &with);
         let (lamp, plan) = render::bar_text(&s);
         assert_eq!((facts.lamp.clone(), facts.plan.clone()), (lamp, plan));
         assert_eq!(facts.hue, derive::state_color(&s).hex());
@@ -5915,7 +5904,7 @@ pub(crate) mod tests {
                 extra_named: vec![],
             },
         });
-        let c = web_facts(&broken, &with, &Default::default())
+        let c = web_facts(&broken, &with)
             .correction
             .expect("a broken tag reaches the page");
         assert!(
@@ -6244,20 +6233,20 @@ pub(crate) mod tests {
     /// ever asks — which is how the reported failure survived its own
     /// regression (grok 8aa2736120d7).
     #[test]
-    fn the_panel_probes_for_a_dead_waker_between_filesystem_events() {
+    fn the_panel_probes_for_a_completed_attendance_between_filesystem_events() {
         let every = Duration::from_secs(1);
         let t0 = std::time::Instant::now();
-        let mut state = WakerProbe {
+        let mut state = AttendanceProbe {
             at: t0,
             fingerprint: 7,
         };
 
         // Too soon: it does not even ask. The probe panics to prove
         // the rate limit is around it, not inside it.
-        assert!(!waker_changed(&mut state, t0, every, || panic!(
+        assert!(!attendance_changed(&mut state, t0, every, || panic!(
             "probed inside the rate limit"
         )));
-        assert!(!waker_changed(
+        assert!(!attendance_changed(
             &mut state,
             t0 + Duration::from_millis(999),
             every,
@@ -6266,22 +6255,22 @@ pub(crate) mod tests {
 
         // Due, and nothing changed: no rebuild is asked for.
         let t1 = t0 + every;
-        assert!(!waker_changed(&mut state, t1, every, || 7));
+        assert!(!attendance_changed(&mut state, t1, every, || 7));
 
         // Due, and the verdict FLIPPED — a waiter died, with no file
         // touched. This is the raise the panel never made.
         let t2 = t1 + every;
-        assert!(waker_changed(&mut state, t2, every, || 9));
+        assert!(attendance_changed(&mut state, t2, every, || 9));
 
         // And it flips ONCE: the new verdict is now the baseline, so
         // an unchanged world does not rebuild every tick.
         let t3 = t2 + every;
-        assert!(!waker_changed(&mut state, t3, every, || 9));
+        assert!(!attendance_changed(&mut state, t3, every, || 9));
 
         // Back again is also a change — a waiter arriving matters as
         // much as one dying.
         let t4 = t3 + every;
-        assert!(waker_changed(&mut state, t4, every, || 7));
+        assert!(attendance_changed(&mut state, t4, every, || 7));
     }
 
     #[test]
@@ -7385,33 +7374,6 @@ pub(crate) mod tests {
             label: label.to_string(),
             session: bound(clank_core::vocab::Tool::Codex, id),
         }
-    }
-
-    #[test]
-    fn confirming_the_clear_releases_the_session_the_confirm_named() {
-        let repo = detail_repo();
-        bind(repo.path(), "codex", "session-a");
-        let dir = crate::agent_store::agents_root(repo.path()).join("codex");
-        let generation = crate::agent_store::read_wait_generation(&dir);
-        let mut s = two_agent_snap();
-        s.agents[1].session = Some(bound(clank_core::vocab::Tool::Codex, "session-a"));
-        let mut open = None;
-
-        let next = clear_target_session(
-            repo.path(),
-            &mut s,
-            Some(&target("codex", "session-a")),
-            &mut open,
-        );
-
-        assert!(open.is_none(), "a released binding opens no overlay");
-        assert_eq!(next, Mode::AgentDetail { idx: 1, sel: 0 });
-        assert_eq!(bound_id(repo.path(), "codex"), None);
-        assert!(
-            crate::agent_store::read_wait_generation(&dir) > generation,
-            "the parked wait is revoked"
-        );
-        assert!(s.agents[1].session.is_none(), "the page shows it unbound");
     }
 
     #[test]

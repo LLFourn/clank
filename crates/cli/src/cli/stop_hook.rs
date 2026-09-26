@@ -8,17 +8,10 @@
 //! per-tool wire shape (claude: exit 2 + stderr; codex: exit
 //! 0 + stdout JSON; everything else exit 0).
 //!
-//! Both tools now long-poll IN-HOOK, by different routes. **claude**
-//! parks inside an `asyncRewake` Stop hook, which runs in the
-//! background and wakes the session on exit 2 with the hook's stderr
-//! as a system reminder (claude-asyncrewake-work-loop). That replaced
-//! arming a background `clank wait`, which Claude Code's task reaper
-//! kills; the arm model SURVIVES for claude versions without the
-//! asyncRewake capability (`LoopPolicy::BackgroundArm`), which nudge
-//! and never park. **codex** has no async hook
-//! support at all — the field is parsed but unimplemented, and setting
-//! it makes codex SKIP the hook — so its hook blocks in-hook and
-//! returns the rendered items.
+//! Claude and Codex both keep the wait inside the Stop hook. Claude's
+//! asyncRewake mode delivers a system reminder on exit 2; its older
+//! synchronous mode and Codex also return the rendered work from the
+//! hook. A listed background wait does not change that decision.
 //!
 //! The poll has THREE terminators: a wake, its own deadline, or the
 //! hook's OWN death. The deadline is derived from the ceiling clank
@@ -43,8 +36,8 @@ use crate::agent_env::{Ambient, Process, resolve_identity_for_hook_in};
 use crate::agent_store::load_agent_config;
 use crate::lifecycle::AgentLabel;
 use clank_core::{
-    AutoMode, BgDisposition, CLAUDE_CONTINUATION_EXIT, CodexBlockDecision, HOOK_OK_EXIT, HookInput,
-    HookOutcome, Role, SilentReason, Tool, background_disposition, hook_io::TurnLeft,
+    AutoMode, CLAUDE_CONTINUATION_EXIT, CodexBlockDecision, HOOK_OK_EXIT, HookInput, HookOutcome,
+    Role, SilentReason, Tool,
 };
 
 pub async fn run(args: StopHookArgs) -> anyhow::Result<()> {
@@ -134,33 +127,12 @@ async fn compute_outcome_with(
         Err(e) => return outcome_of(&TurnDecision::Failed(format!("{e:#}"))),
     };
 
+    if !crate::agent_store::binding_matches(&repo, &label, tool, input.session_id.as_str()) {
+        return HookOutcome::Silent {
+            why: SilentReason::StaleBinding,
+        };
+    }
     let agent_dir = crate::agent_store::agents_root(&repo).join(label.as_str());
-    let turn_generation = crate::agent_store::read_wait_generation(&agent_dir);
-
-    // THE TURN ENDED. That is true before anything below decides what
-    // to do about it, so the stamp goes down at the first point the
-    // agent is known and not one branch later.
-    //
-    // It used to sit below the yield, which returns for a live
-    // registered wait — the commonest turn-end there is. Those turns
-    // recorded nothing, so an agent that had been yielding correctly
-    // for hours was indistinguishable from one that had never taken a
-    // turn, and the one diagnostic that would have named a stuck
-    // master said it had no history. Milestone 4 reads these stamps;
-    // a stamp only written on the paths that were already fine would
-    // report the health of the paths that never break.
-    //
-    // Best-effort: a turn-end must never fail over a note about one.
-    crate::agent_store::record_turn_end(
-        &agent_dir,
-        crate::age::now(),
-        input.session_id.as_str(),
-        turn_generation,
-        // Nothing has decided yet, and that is the point: the stamp
-        // lands first so a turn that dies mid-decision still says it
-        // ended. What it left is written again below.
-        None,
-    );
 
     // ONE EXIT, so the verdict below describes what the turn
     // actually did. `plan.left()` wrote its INTENT before the park,
@@ -169,24 +141,6 @@ async fn compute_outcome_with(
     // agent that had just been handed work was reported unreachable
     // (codex 01cd4b3f1a39).
     let outcome = async {
-        // Decide how the agent's in-flight background work affects this
-        // turn-end. A yield never runs a wait — Claude Code auto-wakes
-        // when the work completes, and running our own wait here would block
-        // that wake.
-        //
-        // A listed `clank wait` no longer reaches that branch: nothing the
-        // harness reports can prove one is watching, so it is Unknown and
-        // falls through to the paths that arm or nudge. The agent keeps a
-        // continuation either way (the-turn-end-is-one-decision).
-        // The registration token from a claim that already passed birth,
-        // session and incarnation. Without it a listed wait is Unknown,
-        // and Unknown does not suppress.
-        let registered = crate::wait_claim::registered_tag(
-            &agent_dir,
-            input.session_id.as_str(),
-            turn_generation,
-        );
-        let disposition = background_disposition(tool, &input, registered.as_deref());
         // Evidence, not effects: each of these is a read that says
         // nothing about who owns what, so they can all be taken before
         // anything decides. The errors travel IN the results and are
@@ -222,7 +176,6 @@ async fn compute_outcome_with(
         let plan = decide(TurnEvidence {
             tool,
             async_loop,
-            disposition,
             auto,
             role,
             proven,
@@ -237,7 +190,7 @@ async fn compute_outcome_with(
         }
 
         let (role, route) = match plan {
-            TurnPlan::Yield(decision) | TurnPlan::Decided(decision) => {
+            TurnPlan::Decided(decision) => {
                 return outcome_of(&decision);
             }
             // Both attended plans record the projection the TUI reads,
@@ -253,9 +206,20 @@ async fn compute_outcome_with(
             TurnPlan::Attend(proven) => {
                 record_attended(&agent_dir, proven.rec);
                 return outcome_of(
-                    &attend(&proven, &agent_dir, poll_deadline(started), || {
-                        proven.rec.work_alive()
-                    })
+                    &attend(
+                        &proven,
+                        &agent_dir,
+                        poll_deadline(started),
+                        || proven.rec.work_alive(),
+                        || {
+                            crate::agent_store::binding_matches(
+                                &repo,
+                                &label,
+                                tool,
+                                input.session_id.as_str(),
+                            )
+                        },
+                    )
                     .await,
                 );
             }
@@ -272,19 +236,10 @@ async fn compute_outcome_with(
                     &live_ids,
                     deadline_action(tool),
                     input.session_id.as_str(),
-                    turn_generation,
+                    tool,
                 )
                 .await
             }
-            TurnRoute::Peek => outcome_of(&decision_of_peek(
-                peek_items(&repo, &label).await,
-                &label,
-                role,
-                || nudge_reason(&input),
-            )),
-            TurnRoute::AskToArm => HookOutcome::Continue {
-                reason: nudge_reason(&input),
-            },
             TurnRoute::Wait => {
                 compute_wait_outcome(
                     &repo,
@@ -294,7 +249,7 @@ async fn compute_outcome_with(
                     &live_ids,
                     deadline_action(tool),
                     input.session_id.as_str(),
-                    turn_generation,
+                    tool,
                 )
                 .await
             }
@@ -305,243 +260,12 @@ async fn compute_outcome_with(
     }
     .await;
 
-    // What the turn LEFT, now that the effects have run.
-    //
-    // Derived from the outcome, which is sound HERE and was not for
-    // the waker: naming who wakes the agent needs evidence a label
-    // cannot carry, but asking whether the turn left a continuation
-    // at all is a property of the label itself.
-    if Fence::read(&agent_dir).admits(turn_generation) {
-        crate::agent_store::record_turn_end(
-            &agent_dir,
-            crate::age::now(),
-            input.session_id.as_str(),
-            turn_generation,
-            Some(left_of(&outcome)),
-        );
+    if !crate::agent_store::binding_matches(&repo, &label, tool, input.session_id.as_str()) {
+        return HookOutcome::Silent {
+            why: SilentReason::StaleBinding,
+        };
     }
     outcome
-}
-
-// ── the invariant, read from outside (the-turn-end-is-one-decision) ──
-
-/// What can wake an agent, as facts about LIVE PROCESSES rather than
-/// files that exist.
-///
-/// Every field here is a liveness answer, because the whole plan turns
-/// on `Unknown` not being a licence to sleep: a claim file proves
-/// nothing, a `ProcToken` that still holds its pid does.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct WakerEvidence {
-    /// The agent's effective auto mode.
-    pub(crate) auto: AutoMode,
-    /// When its last turn ended, and what that turn left behind.
-    /// `None` means no turn has ever ended.
-    pub(crate) turn_ended: Option<(i64, Option<TurnLeft>)>,
-    /// What the wait claim on disk says about this agent.
-    pub(crate) claim: ClaimState,
-    /// A hook parked inside this agent, by the pid its holder records
-    /// and the token that still holds it.
-    pub(crate) parked_hook: bool,
-    /// An attendance whose stored token still holds its pid; its
-    /// completion is the wake.
-    pub(crate) live_attendance: Option<String>,
-}
-
-/// What a `clank wait` claim says about THIS agent's current turn.
-///
-/// Attribution comes first, and death second. A claim from another
-/// session or a superseded incarnation is `Other` whether or not its
-/// process is alive: a stale wait somebody killed must not negate a
-/// live attendance this agent is genuinely being woken by (codex
-/// 392e6f6713b5).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ClaimState {
-    /// No claim file. NOT a receipt: the guard is dropped when
-    /// `wait::items` returns, before `wait::run` emits, so a wait can
-    /// be alive, blocked and undelivered with its claim already gone.
-    Absent,
-    /// Present and unreadable. Distinct from absence, because reading
-    /// it as absence turns a dead waiter into a clean departure.
-    Unreadable,
-    /// This agent's current waiter, alive.
-    Live(i32),
-    /// This agent's current waiter, and its process is gone. It never
-    /// unwound, so it never delivered.
-    Died,
-    /// Someone else's: another session, or a superseded incarnation.
-    /// Says nothing about this turn either way.
-    Other,
-}
-
-/// Whether anything will wake this agent, and what.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Reachability {
-    /// A live background `clank wait`.
-    Waiting(i32),
-    /// A hook parked in the agent right now.
-    Parked,
-    /// Live attended work whose completion wakes it.
-    Attending(String),
-    /// The agent asked not to be driven. Not a fault.
-    NotDriven,
-    /// No turn has ended yet, so there is nothing to be owed a wake
-    /// FROM.
-    NoTurnYet,
-    /// The last turn handed the agent a next step, so it is running
-    /// it or has ignored it — neither is "nothing will wake it", and
-    /// reporting it would fire on every healthy agent mid-turn.
-    Armed,
-    /// The stamp predates the field, or names something this build
-    /// does not know. Cannot say, so does not accuse.
-    Unknown,
-    /// THE REPORTABLE STATE: its last turn ended and nothing is
-    /// watching. This is the assertion the plan exists to make
-    /// checkable.
-    Unreachable { since: i64 },
-}
-
-/// What the completed turn LEFT for whoever reads it next.
-///
-/// Derived from the terminal outcome on purpose. Naming WHO wakes the
-/// agent cannot be read off a label — that is the whole finding of
-/// this plan — but "did this turn leave a continuation at all" is a
-/// property the label does carry, and the turn is over by the time
-/// this is asked.
-///
-/// Total over [`SilentReason`]: a new one must say which it is.
-fn left_of(outcome: &HookOutcome) -> TurnLeft {
-    match outcome {
-        // The agent has text it acts on.
-        HookOutcome::Continue { .. } => TurnLeft::Armed,
-        // The plugin owns the next wait; it consumes this control
-        // action without asking the model for another turn.
-        HookOutcome::RenewWait => TurnLeft::Armed,
-        HookOutcome::Diagnostic { .. } => TurnLeft::Failed,
-        HookOutcome::Silent { why } => match why {
-            // A waker was named and live AT THE TIME. Whether it
-            // still is, is the reader's question.
-            SilentReason::YieldArmed | SilentReason::AttendingBackgroundTask => TurnLeft::Yielded,
-            // Intentional stops, already explained.
-            SilentReason::AutoOff
-            | SilentReason::StaleGeneration
-            | SilentReason::WaiterAlreadyParked
-            | SilentReason::AttendanceCleared => TurnLeft::NotOurs,
-        },
-    }
-}
-
-/// Gather the waker evidence for one agent from disk.
-///
-/// The three liveness questions are asked HERE, where a process can
-/// be probed; `reachability` then decides over the answers.
-pub(crate) fn waker_evidence(
-    repo: &Path,
-    label: &AgentLabel,
-    auto: AutoMode,
-    // The session this agent is BOUND to. A wait whose completion
-    // goes anywhere else cannot wake it, however alive it is.
-    bound_session: Option<&str>,
-) -> WakerEvidence {
-    let agent_dir = crate::agent_store::agents_root(repo).join(label.as_str());
-    let generation = crate::agent_store::read_wait_generation(&agent_dir);
-    let claim = match crate::wait_claim::read_state(&agent_dir) {
-        crate::wait_claim::ClaimRead::Absent => ClaimState::Absent,
-        crate::wait_claim::ClaimRead::Unreadable => ClaimState::Unreadable,
-        // ATTRIBUTION FIRST. Whose waiter is this? A claim for
-        // another session or a dead incarnation is not this turn's,
-        // alive or dead.
-        crate::wait_claim::ClaimRead::Claim(claim)
-            if claim.generation != generation
-                || bound_session.is_some_and(|s| claim.session != s) =>
-        {
-            ClaimState::Other
-        }
-        crate::wait_claim::ClaimRead::Claim(claim) if claim.birth.still_holds(claim.pid) => {
-            ClaimState::Live(claim.pid)
-        }
-        crate::wait_claim::ClaimRead::Claim(_) => ClaimState::Died,
-    };
-    // From the identity the park RECORDED, never by taking its lock —
-    // see `parked_hook_alive`. A holder that cannot prove itself reads
-    // as "not parked", which risks a false report rather than a false
-    // silence, the direction this plan is about.
-    let parked_hook = parked_hook_alive(&agent_dir);
-    // The ATTENDED projection, not the marker: a successful attended
-    // turn CONSUMES its marker and re-records this, so reading the
-    // marker saw nothing immediately after the attendance that was
-    // working correctly (codex 01cd4b3f1a39).
-    let live_attendance = read_attended(&agent_dir).and_then(|rec| {
-        let pid = rec.pid?;
-        rec.token
-            .as_ref()
-            .is_some_and(|tok| tok.still_holds(pid))
-            .then_some(rec.task)
-    });
-    WakerEvidence {
-        auto,
-        turn_ended: crate::agent_store::read_turn_end(&agent_dir).map(|t| (t.at, t.left)),
-        claim,
-        parked_hook,
-        live_attendance,
-    }
-}
-
-/// The invariant, evaluated from outside the turn.
-///
-/// Reads as the invariant does: a turn clank is RESPONSIBLE FOR
-/// CONTINUING ends either armed, or yielding to a named waker that is
-/// live. `NotDriven` is the scope clause, not a hedge.
-pub(crate) fn reachability(ev: &WakerEvidence) -> Reachability {
-    if ev.auto == AutoMode::Off {
-        return Reachability::NotDriven;
-    }
-    let Some((since, left)) = ev.turn_ended else {
-        return Reachability::NoTurnYet;
-    };
-    match left {
-        // Handed a next step: mid-turn, or it ignored an instruction
-        // that now terminates by itself. Either way this check is not
-        // the one that catches it, and firing here is what makes a
-        // check nobody trusts.
-        Some(TurnLeft::Armed) => return Reachability::Armed,
-        Some(TurnLeft::NotOurs) => return Reachability::NotDriven,
-        // A stamp with no verdict, or one from a newer binary.
-        None => return Reachability::Unknown,
-        Some(TurnLeft::Yielded | TurnLeft::HookHeld | TurnLeft::Failed | TurnLeft::Nothing) => {}
-    }
-
-    // LIVE EVIDENCE FIRST. Nothing below may conclude that nobody can
-    // wake this agent while something demonstrably can — a stale
-    // claim somebody killed used to outrank a live attendance and
-    // report a healthy turn as abandoned (codex 392e6f6713b5).
-    if let ClaimState::Live(pid) = ev.claim {
-        return Reachability::Waiting(pid);
-    }
-    if ev.parked_hook {
-        return Reachability::Parked;
-    }
-    if let Some(task) = &ev.live_attendance {
-        return Reachability::Attending(task.clone());
-    }
-
-    match ev.claim {
-        // THIS agent's waiter, and its process is gone: it never
-        // unwound, so it never delivered.
-        ClaimState::Died => Reachability::Unreachable { since },
-        // A claim that vanished is NOT a receipt. The guard drops
-        // when `wait::items` returns, before `wait::run` emits, so
-        // the waiter can be alive, blocked and undelivered with no
-        // claim on disk. Cannot say, so does not accuse — and does
-        // not congratulate either.
-        ClaimState::Absent | ClaimState::Unreadable | ClaimState::Other
-            if left == Some(TurnLeft::Yielded) =>
-        {
-            Reachability::Unknown
-        }
-        // The turn left nothing, and nothing is watching.
-        _ => Reachability::Unreachable { since },
-    }
 }
 
 /// Everything the turn-end decision reads, gathered before any of it
@@ -555,7 +279,6 @@ pub(crate) fn reachability(ev: &WakerEvidence) -> Reachability {
 struct TurnEvidence<'a> {
     tool: Tool,
     async_loop: bool,
-    disposition: BgDisposition,
     /// The config error travels HERE rather than returning at the
     /// read, so a higher-priority branch still wins (codex 31b4b49f).
     auto: Result<AutoMode, String>,
@@ -565,9 +288,6 @@ struct TurnEvidence<'a> {
 
 /// What the turn does, once everything it reads has been read.
 enum TurnPlan<'a> {
-    /// Yielding to a waker. The attendance keeps running, so this is
-    /// the one plan that leaves the marker alone.
-    Yield(TurnDecision),
     /// Decided outright; nothing left to run.
     Decided(TurnDecision),
     /// Hold the check-in timer for this proven attendance.
@@ -606,8 +326,6 @@ impl TurnPlan<'_> {
     /// something a reader can check or a test can ask.
     fn takes_marker(&self) -> bool {
         match self {
-            // The attendance keeps running, so its marker stays.
-            TurnPlan::Yield(_) => false,
             // Declined for a reason that has nothing to do with the
             // work: this tool cannot deliver the wake. Deleting the
             // record would forget work that is still running.
@@ -626,11 +344,6 @@ impl TurnPlan<'_> {
 /// `compute_outcome_with`, so the only way to ask what a turn decides
 /// was to build a repo that reached that depth.
 fn decide(ev: TurnEvidence<'_>) -> TurnPlan<'_> {
-    // The yields first, and above the marker: they leave the
-    // attendance RUNNING.
-    if let Some(d) = decision_of_disposition(&ev.disposition) {
-        return TurnPlan::Yield(d);
-    }
     let role = match drive_gate(&ev.auto, &ev.role) {
         Err(decision) => return TurnPlan::Decided(decision),
         Ok(role) => role,
@@ -657,11 +370,7 @@ fn decide(ev: TurnEvidence<'_>) -> TurnPlan<'_> {
             TurnPlan::AttendedYield(proven)
         };
     }
-    TurnPlan::Drive(
-        role,
-        route(&ev.disposition, ev.async_loop, ev.tool),
-        declined,
-    )
+    TurnPlan::Drive(role, route(ev.async_loop, ev.tool), declined)
 }
 
 /// What a driving turn does next.
@@ -672,61 +381,28 @@ fn decide(ev: TurnEvidence<'_>) -> TurnPlan<'_> {
 enum TurnRoute {
     /// Park a waiter inside this hook.
     Park,
-    /// Ask whether the agent has work RIGHT NOW, then decide.
-    Peek,
-    /// Ask the agent to arm a tagged background wait.
-    AskToArm,
     /// Run the in-hook long poll.
     Wait,
     /// Nothing can drive this tool.
     Undrivable,
 }
 
-/// Whether this tool wakes the agent when a background task ENDS.
-///
-/// Claude does: `run_in_background` completion re-fires Stop, which is
-/// the wake every "yield to the work" decision depends on. The in-hook
-/// adapters do not — their only continuation is the hook's own output
-/// — so for them a listed task is not a waker and neither is an
-/// attendance whose completion nobody delivers. The hook must wait
-/// instead, and saying so is what removed the SILENT yield those
-/// tools used to take — `SilentReason::YieldUnproven`, whose
-/// disposition is now named [`BgDisposition::LiveWorkNoWake`] for the
-/// state it describes (the-turn-end-is-one-decision).
+/// Claude reports completion of an attended task to its session.
+/// The other adapters rely on the hook-owned wait for a continuation.
 fn wakes_on_background_completion(tool: Tool) -> bool {
     match loop_policy(tool) {
-        LoopPolicy::BackgroundArm => true,
+        LoopPolicy::TaskCompletionWake => true,
         LoopPolicy::InHookWait | LoopPolicy::Passive => false,
     }
 }
 
-/// What a driving turn does next, as a function of the three things
-/// that decide it.
-///
-/// The async-loop rule was TWO arms with identical bodies, one
-/// guarded on `NeedsWorkCheck` and one on everything else, which read
-/// as though the disposition mattered here. It does not: in that mode
-/// the PARK is the watcher, and a live background process coexists
-/// with the parked wait — its completion wakes via the task
-/// notification, work wakes via exit 2. Nudging the agent to arm a
-/// background wait instead would reintroduce the tracked-task loop
-/// the mode exists to delete (claude-asyncrewake-work-loop).
-fn route(disposition: &BgDisposition, async_loop: bool, tool: Tool) -> TurnRoute {
+/// Route a driving turn to its hook-owned wait.
+fn route(async_loop: bool, tool: Tool) -> TurnRoute {
     if async_loop {
         return TurnRoute::Park;
     }
-    // A process is live with no `clank wait` watching, and the answer
-    // depends on something no file can say. Ask.
-    if matches!(disposition, BgDisposition::NeedsWorkCheck) {
-        return TurnRoute::Peek;
-    }
     match loop_policy(tool) {
-        // LEGACY claude only: without a background task to check,
-        // this branch never waits in-hook. It asks the agent to arm
-        // a registered background wait. The peek route above handles
-        // the separate case of work already ready while another task
-        // is listed.
-        LoopPolicy::BackgroundArm => TurnRoute::AskToArm,
+        LoopPolicy::TaskCompletionWake => TurnRoute::Wait,
         // The in-hook long-poll + emit-with-items model: codex blocks
         // with the items; opencode's plugin injects work on
         // session.idle and renews an expired wait without a model
@@ -736,37 +412,6 @@ fn route(disposition: &BgDisposition, async_loop: bool, tool: Tool) -> TurnRoute
         // no grok adapter and no continuation could drive it. If
         // something wires this up anyway, say so.
         LoopPolicy::Passive => TurnRoute::Undrivable,
-    }
-}
-
-/// What the peek's answer means for the turn.
-///
-/// `Err` is the peek failing to run, not the agent being idle — the
-/// distinction is the whole reason this takes a `Result`.
-fn decision_of_peek(
-    items: Result<Vec<WaitItem>, String>,
-    label: &AgentLabel,
-    role: Role,
-    nudge: impl FnOnce() -> String,
-) -> TurnDecision {
-    match items {
-        // Hand over the work already found. Asking for a background
-        // wait here was the hot loop: it returns immediately for the
-        // same item. If the task blocks the work, the agent can await
-        // that task within this turn instead of ending unwatched.
-        Ok(items) if !items.is_empty() => TurnDecision::Arm(format!(
-            "{}\nIf your background task blocks this work, await its completion before ending this turn.",
-            render_wait_items(&items, label, role)
-        )),
-        // Idle (just committed, awaiting reviews). Nudge it to start
-        // a wait alongside the process, so EITHER the process
-        // finishing OR review work wakes it. Safe from looping: with
-        // no work the wait blocks and persists, and the next Stop
-        // sees it.
-        Ok(_) => TurnDecision::Arm(nudge()),
-        // We cannot decide whether an arm would loop. Surface the
-        // failure rather than silently ending with no proven waker.
-        Err(error) => TurnDecision::Failed(format!("hook: checking for work: {error}")),
     }
 }
 
@@ -795,9 +440,7 @@ fn drive_gate(
     // A FAILURE is not laundered into an answer. Defaulting to
     // Reviewer was the opposite of the conservative choice it claimed
     // to be: for an agent that is master it arms a poll that can
-    // never return, and where the tool allows one in-flight wait per
-    // session nothing can replace it — the session is dead until a
-    // human prompts it.
+    // never return, so the session may not hear about its work.
     //
     // So arm nothing, and SAY so. That failure cost hours of dead
     // session undiagnosable from outside; a quiet exit would rebuild
@@ -810,8 +453,8 @@ fn drive_gate(
 /// without the spawning wait path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LoopPolicy {
-    /// Background-armed wait; the hook only nudges (claude).
-    BackgroundArm,
+    /// Claude can wake when an attended background task completes.
+    TaskCompletionWake,
     /// In-hook long-poll; non-empty output is the continuation
     /// (codex blocks with it, opencode's plugin injects it).
     InHookWait,
@@ -875,7 +518,7 @@ fn deadline_outcome(action: DeadlineAction) -> HookOutcome {
 
 fn loop_policy(tool: Tool) -> LoopPolicy {
     match tool {
-        Tool::Claude => LoopPolicy::BackgroundArm,
+        Tool::Claude => LoopPolicy::TaskCompletionWake,
         Tool::Codex | Tool::OpenCode => LoopPolicy::InHookWait,
         Tool::Grok => LoopPolicy::Passive,
     }
@@ -908,9 +551,7 @@ struct SessionStartInput {
 /// label is bound to the id on stdin: on `startup` the first bind,
 /// on `clear` the rebind that keeps a session tracked across a new
 /// id, on `resume`/`compact` an idempotent re-assertion. The bind
-/// mints the wait generation as part of its claim, which is the
-/// stale-waiter revocation every session start needs anyway. A
-/// session clank did not launch has no label in its environment and
+/// records the current session binding. A session clank did not launch has no label in its environment and
 /// is identified by its id, as `clank as` bound it
 /// (a-session-binds-itself-at-start).
 fn session_started(
@@ -919,19 +560,30 @@ fn session_started(
     input: &SessionStartInput,
     launched_as: Option<&AgentLabel>,
     env: &dyn Ambient,
-) -> Option<AgentLabel> {
+) -> Option<(AgentLabel, Tool)> {
     let sid = clank_core::ids::SessionId::parse(&input.session_id).ok()?;
     match launched_as {
         Some(label) => {
+            let binding_tool = match crate::agent_store::resolve_tool(repo, label) {
+                Ok(tool) => tool,
+                Err(e) => {
+                    eprintln!(
+                        "clank: cannot resolve roster tool for `{label}` at session start: {e:#}"
+                    );
+                    return None;
+                }
+            };
             // Fail-open by POLICY: a session start is never broken by
             // clank state. A bind that fails leaves the previous
             // binding, and the Stop hook still resolves this session
             // by its label; the diagnostic names what did not happen.
-            if let Err(e) = crate::agent_store::bind_session_to_agent(repo, label, tool, &sid) {
+            if let Err(e) =
+                crate::agent_store::bind_session_to_agent(repo, label, binding_tool, &sid)
+            {
                 eprintln!(
                     "clank: could not bind `{}` to {} session {} ({}): {e:#}",
                     label.as_str(),
-                    tool.as_str(),
+                    binding_tool.as_str(),
                     sid.as_str(),
                     input.source.as_deref().unwrap_or("start"),
                 );
@@ -941,16 +593,11 @@ fn session_started(
                 // cannot start.
                 let _ = crate::agent_store::record_transcript(repo, label, &sid, path);
             }
-            Some(label.clone())
+            Some((label.clone(), binding_tool))
         }
         None => {
             let label = resolve_identity_for_hook_in(repo, tool, &sid, env).ok()?;
-            // Mint here — revoking any waiter surviving from a previous
-            // incarnation (whose wake pipe is dead, M0) — and discard
-            // the error by the same policy.
-            let agent_dir = crate::agent_store::agents_root(repo).join(label.as_str());
-            let _ = crate::agent_store::mint_wait_generation(&agent_dir);
-            Some(label)
+            Some((label, tool))
         }
     }
 }
@@ -975,7 +622,9 @@ async fn run_session_start(args: StopHookArgs) -> anyhow::Result<()> {
     };
     let tool: Tool = args.tool.into();
     let launched_as = crate::agent_env::explicit_label_in(&Process).ok().flatten();
-    let Some(label) = session_started(&repo, tool, &input, launched_as.as_ref(), &Process) else {
+    let Some((label, binding_tool)) =
+        session_started(&repo, tool, &input, launched_as.as_ref(), &Process)
+    else {
         return Ok(());
     };
 
@@ -1001,6 +650,9 @@ async fn run_session_start(args: StopHookArgs) -> anyhow::Result<()> {
     let Ok(role) = crate::agent_store::resolve_role(&repo, &label) else {
         return Ok(());
     };
+    if !crate::agent_store::binding_matches(&repo, &label, binding_tool, &input.session_id) {
+        return Ok(());
+    }
     println!(
         "{}",
         session_start_payload(&render_wait_items(&items, &label, role))
@@ -1022,105 +674,8 @@ fn session_start_payload(items_text: &str) -> serde_json::Value {
     })
 }
 
-// ── asyncrewake ownership + park (claude-asyncrewake-work-loop) ──
-// The wait child owns the live claim. Legacy hook holder records stay
-// readable for diagnostics until older installed hooks have exited.
-
-/// See [`crate::agent_store::read_wait_generation`] — minted by
-/// session BINDING and SessionStart alike.
-fn read_generation(agent_dir: &Path) -> u64 {
-    crate::agent_store::read_wait_generation(agent_dir)
-}
-
-/// Legacy hook-held park identity, read only while old hook processes
-/// can still be running. New waits publish their own claim instead.
-struct Holder {
-    generation: u64,
-    /// Absent on holders written before it existed.
-    pid: Option<i32>,
-    token: Option<crate::proc_identity::ProcToken>,
-}
-
-fn read_holder(agent_dir: &Path) -> Option<Holder> {
-    let raw = std::fs::read_to_string(agent_dir.join("wait.holder")).ok()?;
-    let mut parts = raw.split_whitespace();
-    let generation = parts.next()?.parse().ok()?;
-    let pid = parts.next().and_then(|p| p.parse().ok());
-    let token = parts
-        .next()
-        .and_then(|t| serde_json::from_str::<crate::proc_identity::ProcToken>(t).ok());
-    Some(Holder {
-        generation,
-        pid,
-        token,
-    })
-}
-
-/// The incarnation, and WHO is holding it — so a reader can ask
-/// whether this park is still alive without taking its lock.
-///
-/// Falls back to the bare generation on a platform that cannot mint a
-/// token. That reads as NOT parked, which risks a false warning
-/// rather than a false silence.
-#[cfg(test)]
-fn holder_line(generation: u64, pid: i32) -> String {
-    match crate::proc_identity::token_for(pid) {
-        Some(tok) => match serde_json::to_string(&tok) {
-            Ok(tok) => format!("{generation} {pid} {tok}\n"),
-            Err(_) => format!("{generation}\n"),
-        },
-        None => format!("{generation}\n"),
-    }
-}
-
-/// Whether a hook is parked in this agent RIGHT NOW, by the identity
-/// its holder records. `false` for a holder written before the pid
-/// existed — unknown, and this reader does not accuse.
-fn parked_hook_alive(agent_dir: &Path) -> bool {
-    let Some(holder) = read_holder(agent_dir) else {
-        return false;
-    };
-    if holder.generation != read_generation(agent_dir) {
-        return false;
-    }
-    match (holder.pid, holder.token) {
-        (Some(pid), Some(token)) => token.still_holds(pid),
-        _ => false,
-    }
-}
-
-/// Resolves when the generation file no longer reads `own_gen`.
-/// The incarnation whose output counts.
-///
-/// ONE question — "is this generation still the current one?" — where
-/// there were three spellings of it: `read_generation(d) != own_gen`
-/// in the poller, `holder_gen == Some(current_gen)` in the park's
-/// acquisition, and `read_generation(d) != my_gen` in the wake guard.
-/// The generation IS the fence, and what was wrong is that its job was
-/// spread across the mechanisms that ask it
-/// (the-turn-end-is-one-decision).
-///
-/// A fence does not stop an obsolete holder from RUNNING. It stops its
-/// output from counting, which is why every emission asks this and no
-/// caller tries to revoke anything.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Fence(u64);
-
-impl Fence {
-    fn read(agent_dir: &Path) -> Self {
-        Fence(read_generation(agent_dir))
-    }
-
-    /// Whether `generation` is still the one that counts.
-    fn admits(self, generation: u64) -> bool {
-        self.0 == generation
-    }
-}
-
-/// Park the SHARED long-poll under this session's generational
-/// lease. Work → Continue (claude's exit-2 + stderr wire IS the
-/// asyncRewake wake). An empty successful return from the normal wait
-/// is a broken wait contract and surfaces as Diagnostic.
+/// Park the hook-owned long poll. Work reaches Claude through its
+/// exit-2 continuation. An empty successful wait is diagnostic.
 async fn asyncrewake_park(
     repo: &Path,
     label: &AgentLabel,
@@ -1129,17 +684,8 @@ async fn asyncrewake_park(
     live_ids: &[String],
     on_deadline: DeadlineAction,
     session: &str,
-    generation: u64,
+    tool: Tool,
 ) -> HookOutcome {
-    let agent_dir = crate::agent_store::agents_root(repo).join(label.as_str());
-    if let Err(e) = std::fs::create_dir_all(&agent_dir) {
-        return HookOutcome::Diagnostic {
-            message: format!("hook: creating `{}`: {e}", agent_dir.display()),
-        };
-    }
-    // The child acquires the live claim before it observes or delivers
-    // work. Its claim is the park; this short-lived hook holds no
-    // lease and has no handoff retry of its own.
     compute_wait_outcome(
         repo,
         label,
@@ -1148,13 +694,12 @@ async fn asyncrewake_park(
         live_ids,
         on_deadline,
         session,
-        generation,
+        tool,
     )
     .await
 }
 
-/// The peek's ITEMS — shared by the work-check and SessionStart's
-/// catch-up context (claude-asyncrewake-work-loop).
+/// The peek's items for SessionStart catch-up context.
 /// Self-spawns `clank wait --peek --json` (side-effect-free: fires no
 /// hooks) and captures its stdout, never inheriting it into the hook's
 /// own protocol output.
@@ -1182,6 +727,7 @@ pub(crate) async fn peek_items(repo: &Path, label: &AgentLabel) -> Result<Vec<Wa
         Some(0) => {
             parse_wait_json(&output.stdout).map_err(|e| format!("peek stdout malformed: {e}"))
         }
+        Some(3) if output.stdout.is_empty() => Ok(Vec::new()),
         other => Err(format!(
             "peek exited {} stderr={}",
             other
@@ -1190,68 +736,6 @@ pub(crate) async fn peek_items(repo: &Path, label: &AgentLabel) -> Result<Vec<Wa
             String::from_utf8_lossy(&output.stderr).trim()
         )),
     }
-}
-
-/// The continuation that nudges the agent to arm its own backgrounded
-/// `clank wait` when no work is ready, and self-extinguishing: once
-/// armed, the next Stop is `YieldArmed`-silent.
-/// TERSE by the minimal-hint rule (terse-arm-wait-nudge): the skill docs
-/// teach the arm/act/re-arm loop, so the nudge states only the trigger
-/// plus the one detail models get wrong (run_in_background). Deliberately
-/// does NOT echo the task command lines: the agent knows what it
-/// backgrounded, and real commands (multi-clause `until …; do sleep …`
-/// one-liners) turned the nudge into a wall of shell that buried the
-/// instruction (lloyd, dark-skippy). Only the COUNT is stated. The two
-/// variants share the instruction core so they can't drift.
-/// A fresh registration token for one arm instruction.
-///
-/// It goes in the command the agent runs and comes back in the claim
-/// the wait publishes, which is what lets the next turn-end recognise
-/// that wait instead of asking for another one. Short and unguessable
-/// enough to be unique among an agent's live tasks; it is a
-/// correlation key, not a secret.
-fn arm_tag() -> String {
-    let pid = std::process::id() as u64;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    // FNV-1a over both, so a fast loop within one nanosecond tick
-    // still differs by pid and the value reads as opaque.
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in pid.to_le_bytes().iter().chain(now.to_le_bytes().iter()) {
-        h ^= u64::from(*b);
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    format!("{h:016x}")
-}
-
-fn nudge_reason(input: &HookInput) -> String {
-    // The instruction CARRIES the registration: the agent runs this
-    // exact command, so the token lands in the harness's task list and
-    // in the wait's claim, and the next turn-end can tell they are the
-    // same process (the-turn-end-is-one-decision).
-    let core = format!(
-        "run `clank wait --tag {}` (run_in_background: true), then end your turn.",
-        arm_tag()
-    );
-    let count = input
-        .background_tasks
-        .iter()
-        .filter(|t| !t.is_clank_wait())
-        .count();
-    if count == 0 {
-        return format!("Nothing is watching for clank work — {core}");
-    }
-    let what = if count > 1 {
-        format!("{count} background tasks")
-    } else {
-        "a background task".to_string()
-    };
-    format!(
-        "You ended your turn with {what} still running but nothing watching \
-         for clank work — also {core}"
-    )
 }
 
 use tokio::process::Command;
@@ -1264,7 +748,7 @@ use tokio::process::Command;
 /// corrects it on the next wake. The hook could not usefully supply
 /// one anyway — a role it resolved once would be exactly the fixed
 /// input that left a master's wait blocked forever on reviewer work.
-fn wait_argv(repo: &Path, label: &AgentLabel, session: &str, generation: u64) -> Vec<String> {
+fn wait_argv(repo: &Path, label: &AgentLabel, session: &str) -> Vec<String> {
     vec![
         "wait".into(),
         "--repo".into(),
@@ -1276,27 +760,29 @@ fn wait_argv(repo: &Path, label: &AgentLabel, session: &str, generation: u64) ->
         "--die-with-owner".into(),
         "--deliver-to-session".into(),
         session.into(),
-        "--expected-generation".into(),
-        generation.to_string(),
         "--json".into(),
     ]
 }
 
-fn wait_command(
-    exe: &Path,
-    repo: &Path,
-    label: &AgentLabel,
-    session: &str,
-    generation: u64,
-) -> Command {
+fn wait_command(exe: &Path, repo: &Path, label: &AgentLabel, session: &str, tool: Tool) -> Command {
     let mut cmd = Command::new(exe);
-    cmd.args(wait_argv(repo, label, session, generation))
+    cmd.args(wait_argv(repo, label, session))
         // Piped stdin IS the ownership channel. `OwnedWait::spawn`
         // refuses to proceed without it.
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    for key in crate::agent_env::SESSION_IDENTITY_VARS {
+        cmd.env_remove(key);
+    }
+    let key = match tool {
+        Tool::Claude => "CLAUDE_CODE_SESSION_ID",
+        Tool::Codex => "CODEX_THREAD_ID",
+        Tool::OpenCode => "OPENCODE_SESSION_ID",
+        Tool::Grok => "GROK_AGENT",
+    };
+    cmd.env(key, session);
     cmd
 }
 
@@ -1414,21 +900,20 @@ async fn compute_wait_outcome(
     live_ids: &[String],
     on_deadline: DeadlineAction,
     session: &str,
-    generation: u64,
+    tool: Tool,
 ) -> HookOutcome {
     // Fixed at hook entry, so everything below — current_exe, command
     // construction, the child spawn — is charged against it.
     let deadline = poll_deadline(started);
     let arm = || {
         let exe = std::env::current_exe().map_err(|e| format!("hook: current_exe failed: {e}"))?;
-        let mut cmd = wait_command(&exe, repo, label, session, generation);
+        let mut cmd = wait_command(&exe, repo, label, session, tool);
         Ok(OwnedWait::spawn(&mut cmd)?.run())
     };
     let result = await_wait_under_deadline(deadline, on_deadline, arm).await;
-    let agent_dir = crate::agent_store::agents_root(repo).join(label.as_str());
-    if !Fence::read(&agent_dir).admits(generation) {
+    if !crate::agent_store::binding_matches(repo, label, tool, session) {
         return HookOutcome::Silent {
-            why: SilentReason::StaleGeneration,
+            why: SilentReason::StaleBinding,
         };
     }
     match result {
@@ -1970,8 +1455,8 @@ struct Proven<'a> {
 // not the work's life.
 
 /// Names the attendance whose check-in is armed, by its identity
-/// (the marker's `since`). The timer's control file, on the
-/// `wait.holder` pattern: a newer attendance overwrites it, `--clear`
+/// (the marker's `since`). A newer attendance overwrites its control
+/// file, `--clear`
 /// removes it, and an unrelated turn-end leaves it alone — three
 /// states the timer can tell apart, where the `attended` projection
 /// (swept every entry) could not distinguish a clear from cleanup.
@@ -2032,7 +1517,7 @@ pub(crate) fn clear_attendance(agent_dir: &Path) -> std::io::Result<Cleared> {
 }
 
 /// How often the timer re-asks whether it is still worth waking:
-/// liveness, holder, generation. Each is a `kill(pid, 0)`, a
+/// liveness, holder, and current session binding. Each is a `kill(pid, 0)`, a
 /// proc-table read or a small file — nothing spawns.
 const CHECK_IN_POLL: std::time::Duration = std::time::Duration::from_secs(2);
 
@@ -2046,8 +1531,7 @@ const CHECK_IN_POLL: std::time::Duration = std::time::Duration::from_secs(2);
 /// live task (the-turn-end-is-one-decision).
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Disarmed {
-    /// A new incarnation claimed the label. This timer's output no
-    /// longer belongs to the current session.
+    /// The current session no longer holds the label.
     Superseded,
     /// The attended work ended. Its completion wake is already in
     /// flight, and that wake is the waker.
@@ -2066,18 +1550,17 @@ enum Disarmed {
 
 /// Hold the check-in timer for a PROVEN attendance, and emit its
 /// outcome. Arms the holder, then waits for the earliest of: the work
-/// ending, the holder changing, the generation changing, the ceiling,
+/// ending, the holder changing, the binding changing, the ceiling,
 /// or the bound — and only the bound, with the work still live, wakes.
 ///
-/// Liveness is injected so the whole composition can be driven under
-/// a paused clock; the holder and generation are read from
-/// `agent_dir` for real, so the three holder transitions are tested
-/// as the file states they are rather than as flags.
+/// Liveness and binding checks are injected so the composition can be
+/// driven under a paused clock; the holder is read from `agent_dir`.
 async fn attend(
     proven: &Proven<'_>,
     agent_dir: &Path,
     ceiling: std::time::Instant,
     mut work_alive: impl FnMut() -> bool,
+    still_bound: impl Fn() -> bool,
     // (returns the DECISION: the waker it names is what milestone 4
     // reads, and rendering here would erase it before anyone can.)
 ) -> TurnDecision {
@@ -2091,7 +1574,6 @@ async fn attend(
     if let Err(e) = std::fs::write(holder_path(agent_dir), &expect.since) {
         return TurnDecision::Failed(format!("hook: arming the check-in: {e}"));
     }
-    let my_gen = read_generation(agent_dir);
 
     let now = time::OffsetDateTime::now_utc();
     let remaining: std::time::Duration = (expect.due(now) - now)
@@ -2100,7 +1582,7 @@ async fn attend(
     let due = tokio::time::Instant::now() + remaining;
 
     let mut armed = || {
-        if !Fence::read(agent_dir).admits(my_gen) {
+        if !still_bound() {
             return Some(Disarmed::Superseded);
         }
         if !work_alive() {
@@ -2124,7 +1606,7 @@ async fn attend(
     };
     let decision = check_in_when_due(due, ceiling, &mut armed, check_in, attended).await;
     // Wake guard, as the park has: never emit for a dead incarnation.
-    if !Fence::read(agent_dir).admits(my_gen) {
+    if !still_bound() {
         return TurnDecision::NotOurs(NotOurs::Superseded);
     }
     // The holder is left as it is, on purpose. A compare-then-delete
@@ -2185,7 +1667,7 @@ fn disarm_decision(disarmed: Option<Disarmed>, attended: &TurnDecision) -> Optio
         // The waker is the task itself, named here because here is
         // where it was last proven live.
         Disarmed::WorkEnded => attended.clone(),
-        Disarmed::TakenOver => TurnDecision::NotOurs(NotOurs::AlreadyParked),
+        Disarmed::TakenOver => TurnDecision::NotOurs(NotOurs::AttendanceTakenOver),
         Disarmed::Cleared => TurnDecision::NotOurs(NotOurs::AttendanceCleared),
         Disarmed::Unreadable(e) => {
             TurnDecision::Failed(format!("hook: reading the check-in holder: {e}"))
@@ -2253,25 +1735,22 @@ fn record_attended(agent_dir: &Path, rec: &Attending) {
 /// Map the finished wait's output to an outcome. Pure, so the
 /// contract can be asserted without spawning anything.
 ///
-/// Every non-zero exit is a Diagnostic. There is no longer a code
-/// that means "expired quietly": an idle poll parks instead of
-/// self-expiring (remove-wait-timeout), so a wait that exits
-/// non-zero has genuinely failed and must be surfaced rather than
-/// swallowed as a routine idle.
+/// A superseded wait carries a distinct control envelope even though
+/// its process exits nonzero. Other nonzero exits are diagnostics.
 fn outcome_from_wait_output(
     output: &std::process::Output,
     label: &AgentLabel,
     role: Role,
     live_ids: &[String],
 ) -> HookOutcome {
+    if matches!(parse_wait_reply(&output.stdout), Ok(WaitReply::Superseded)) {
+        return HookOutcome::Silent {
+            why: SilentReason::StaleBinding,
+        };
+    }
     match output.status.code() {
         Some(0) => match parse_wait_reply(&output.stdout) {
-            Ok(WaitReply::Superseded) => HookOutcome::Silent {
-                why: SilentReason::StaleGeneration,
-            },
-            Ok(WaitReply::AlreadyParked) => HookOutcome::Silent {
-                why: SilentReason::WaiterAlreadyParked,
-            },
+            Ok(WaitReply::Superseded) => unreachable!("handled above"),
             Ok(WaitReply::Items(items)) if items.is_empty() => HookOutcome::Diagnostic {
                 message: "hook: non-peek wait exited successfully with no items".into(),
             },
@@ -2380,9 +1859,8 @@ pub(crate) enum NotOurs {
     /// A newer incarnation holds the label; this one's output does
     /// not count.
     Superseded,
-    /// Another live hook already holds this session's park, or a
-    /// newer attendance took the check-in timer.
-    AlreadyParked,
+    /// A newer attendance took the check-in timer.
+    AttendanceTakenOver,
     /// `clank attending --clear` cancelled the attendance this turn
     /// was holding a timer for.
     AttendanceCleared,
@@ -2397,10 +1875,6 @@ pub(crate) enum NotOurs {
 /// the second masquerade as the first (codex, d281959260a2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum YieldTo {
-    /// A background `clank wait` whose claim passed birth, session and
-    /// incarnation, and which the turn's task list still shows live.
-    /// `tag` is the token that joined the two.
-    RegisteredWait { tag: String },
     /// A background task the agent recorded, whose pid the stored
     /// token still holds.
     AttendedTask { task: String, pid: i32 },
@@ -2414,10 +1888,7 @@ pub(crate) enum YieldTo {
 /// derives the wire reason from it, which is why
 /// [`decision_from_label`] refuses to speak for it.
 #[cfg(test)]
-pub(crate) const EVIDENCED: &[SilentReason] = &[
-    SilentReason::YieldArmed,
-    SilentReason::AttendingBackgroundTask,
-];
+pub(crate) const EVIDENCED: &[SilentReason] = &[SilentReason::AttendingBackgroundTask];
 
 /// What a bare [`SilentReason`] can honestly be classified as.
 ///
@@ -2436,12 +1907,11 @@ pub(crate) fn decision_from_label(why: SilentReason) -> Option<TurnDecision> {
         // Nobody wakes this agent, and that is the answer rather than
         // a hole.
         SilentReason::AutoOff => Some(TurnDecision::NotOurs(NotOurs::AutoOff)),
-        SilentReason::StaleGeneration => Some(TurnDecision::NotOurs(NotOurs::Superseded)),
-        SilentReason::WaiterAlreadyParked => Some(TurnDecision::NotOurs(NotOurs::AlreadyParked)),
+        SilentReason::StaleBinding => Some(TurnDecision::NotOurs(NotOurs::Superseded)),
         SilentReason::AttendanceCleared => Some(TurnDecision::NotOurs(NotOurs::AttendanceCleared)),
         // Carries a waker, but not one this function may invent: the
         // token lives at the site. See `EVIDENCED`.
-        SilentReason::YieldArmed | SilentReason::AttendingBackgroundTask => None,
+        SilentReason::AttendingBackgroundTask => None,
     }
 }
 
@@ -2460,29 +1930,6 @@ fn attended_yield(proven: &Proven<'_>) -> TurnDecision {
     })
 }
 
-/// The turn's decision about its background work, or `None` when the
-/// disposition does not end the turn by itself.
-///
-/// Named rather than inlined at the call site so a test can reach the
-/// SAME mapping production uses. This is the one place that may build
-/// a `RegisteredWait`, because the token that proves it arrives here
-/// and nowhere later.
-pub(crate) fn decision_of_disposition(disposition: &BgDisposition) -> Option<TurnDecision> {
-    match disposition {
-        BgDisposition::YieldToWait { tag } => Some(TurnDecision::Yield(YieldTo::RegisteredWait {
-            tag: tag.clone(),
-        })),
-        // NOT a decision. This was a silent yield to work that will
-        // never wake the agent: the tools that reach it have no
-        // completion wake, so the turn ended with nothing watching and
-        // the hook's own wait — its only continuation — was skipped to
-        // get there. Falling through routes it to that wait.
-        BgDisposition::LiveWorkNoWake => None,
-        // Not decided by the background work alone.
-        BgDisposition::NeedsWorkCheck | BgDisposition::NoBackgroundWork => None,
-    }
-}
-
 /// The wire outcome a decision produces.
 ///
 /// This is the direction that keeps its evidence: the decision is
@@ -2494,16 +1941,13 @@ pub(crate) fn outcome_of(decision: &TurnDecision) -> HookOutcome {
             why: SilentReason::AutoOff,
         },
         TurnDecision::NotOurs(NotOurs::Superseded) => HookOutcome::Silent {
-            why: SilentReason::StaleGeneration,
+            why: SilentReason::StaleBinding,
         },
-        TurnDecision::NotOurs(NotOurs::AlreadyParked) => HookOutcome::Silent {
-            why: SilentReason::WaiterAlreadyParked,
+        TurnDecision::NotOurs(NotOurs::AttendanceTakenOver) => HookOutcome::Silent {
+            why: SilentReason::AttendanceCleared,
         },
         TurnDecision::NotOurs(NotOurs::AttendanceCleared) => HookOutcome::Silent {
             why: SilentReason::AttendanceCleared,
-        },
-        TurnDecision::Yield(YieldTo::RegisteredWait { .. }) => HookOutcome::Silent {
-            why: SilentReason::YieldArmed,
         },
         TurnDecision::Yield(YieldTo::AttendedTask { .. }) => HookOutcome::Silent {
             why: SilentReason::AttendingBackgroundTask,
@@ -2543,14 +1987,11 @@ struct WaitEnvelope {
     items: Vec<WaitItem>,
     #[serde(default)]
     superseded: bool,
-    #[serde(default)]
-    already_parked: bool,
 }
 
 enum WaitReply {
     Items(Vec<WaitItem>),
     Superseded,
-    AlreadyParked,
 }
 
 /// One `wait --json` item as the stop hook reads it. `kind` is the
@@ -2617,6 +2058,7 @@ pub(crate) struct WaitItem {
     pub(crate) plan: Option<String>,
     pub(crate) sha: Option<String>,
     finalized_at: Option<String>,
+    gate: Option<String>,
     next: Option<String>,
     pub(crate) reason: Option<Tag<clank_core::vocab::WaitingReason>>,
     prompt: Option<String>,
@@ -2624,8 +2066,6 @@ pub(crate) struct WaitItem {
     priority: Option<u64>,
     agent: Option<String>,
     answer: Option<String>,
-    /// Ad-hoc settle verdict (adhoc-continue-wake-investigation).
-    gate: Option<String>,
     pr: Option<u64>,
     round: Option<u64>,
     in_progress: Option<String>,
@@ -2689,28 +2129,18 @@ impl WaitItem {
 fn parse_wait_json(raw: &[u8]) -> Result<Vec<WaitItem>, String> {
     match parse_wait_reply(raw)? {
         WaitReply::Items(items) => Ok(items),
-        WaitReply::Superseded | WaitReply::AlreadyParked => {
-            Err("unexpected control response in a peek".into())
-        }
+        WaitReply::Superseded => Err("unexpected control response in a peek".into()),
     }
 }
 
 fn parse_wait_reply(raw: &[u8]) -> Result<WaitReply, String> {
     let envelope: WaitEnvelope =
         serde_json::from_slice(raw).map_err(|e| format!("not valid JSON: {e}"))?;
-    if envelope.superseded && envelope.already_parked {
-        return Err("wait returned conflicting control responses".into());
-    }
     if envelope.superseded {
         if !envelope.items.is_empty() {
             return Err("superseded wait also carried work items".into());
         }
         Ok(WaitReply::Superseded)
-    } else if envelope.already_parked {
-        if !envelope.items.is_empty() {
-            return Err("already parked wait also carried work items".into());
-        }
-        Ok(WaitReply::AlreadyParked)
     } else {
         Ok(WaitReply::Items(envelope.items))
     }
@@ -2737,9 +2167,6 @@ fn parse_wait_reply(raw: &[u8]) -> Result<WaitReply, String> {
 pub(crate) enum Discharge {
     /// Fires while a condition holds; the text says what ends it.
     Until(&'static str),
-    /// Fires on an edge and will not repeat. Carries WHY, so a
-    /// one-shot is a decision rather than an omission.
-    OneShot(&'static str),
     /// Watcher delivery, not stop-hook wake delivery.
     ObserverOnly,
     /// This kind, with this reason, has no condition to state.
@@ -2789,6 +2216,9 @@ pub(crate) fn discharge_of(
             }
         },
         K::Reviewer => Until("fires until you write feedback for that sha"),
+        K::Finished | K::AdHocSettled => {
+            Until("fires until the event is acked — `clank events ack`")
+        }
         K::FixCommitTag => Until("fires until the commit's plan tag is corrected"),
         K::MultiplePlansOpen => Until(
             "fires until one plan is active — `clank finish` one, or `clank stash push` the rest",
@@ -2806,14 +2236,7 @@ pub(crate) fn discharge_of(
              not answer it yourself",
         ),
         K::Idle => Until("fires while there is nothing else to do"),
-        K::Finished => OneShot("a finalize notice — it will not fire again for that sha"),
-        K::AdHocSettled => OneShot("a settle notice — it will not fire again for that sha"),
-        // Awareness. The observer records every change it reports, so
-        // this one is spent — and there is nothing to answer: replying
-        // to the operator's edit is what the watch must not cause.
-        K::DraftChanged => {
-            OneShot("read the draft before your next round; do not reply to it, and do not ack it")
-        }
+        K::DraftChanged => Until("read the draft, do not reply to the edit, then ack the event"),
         // Same discharge as a github event, because it is the same
         // WAL: a command source's event is durable, re-presented on
         // every arm, and finished by an ack
@@ -2844,7 +2267,7 @@ fn discharge_suffix(
         // NOT `↳` — that already marks a watch's standing
         // instructions (`github-watch-prompts`), and two meanings on
         // one glyph is how a reader stops trusting either.
-        Discharge::Until(t) | Discharge::OneShot(t) => format!("      · {t}\n"),
+        Discharge::Until(t) => format!("      · {t}\n"),
         Discharge::ObserverOnly | Discharge::Unconditioned => String::new(),
     }
 }
@@ -2856,8 +2279,7 @@ fn discharge_suffix(
 /// (the-nudge-names-the-command).
 ///
 /// Only wakes whose work IS the feedback on a sha, and only their own
-/// sha: a finalize notice carries the finalization commit, which is
-/// not the commit anyone wrote feedback on (codex on 4837ea8).
+/// sha.
 fn read_hint(item: &WaitItem) -> String {
     use clank_core::vocab::WaitingReason as R;
     use clank_core::wait::WaitKind as K;
@@ -2924,7 +2346,14 @@ fn render_wait_items_ref(items: &[&WaitItem], label: &AgentLabel, role: Role) ->
                 let reason = item.raw_reason();
                 out.push_str(&format!("  - master: {next} {plan} @ {short} ({reason})\n"));
             }
-            K::Finished => out.push_str(&format!("  - finished: {plan} @ {short}\n")),
+            K::Finished => {
+                let ack = item
+                    .selector
+                    .as_deref()
+                    .map(|s| format!(" — ack `clank events ack {s}`"))
+                    .unwrap_or_default();
+                out.push_str(&format!("  - finished: {plan} @ {short}{ack}\n"));
+            }
             K::Idle => {
                 let prompt = item.prompt.as_deref().unwrap_or("");
                 out.push_str(&format!("  - idle: {prompt}\n"));
@@ -2933,7 +2362,12 @@ fn render_wait_items_ref(items: &[&WaitItem], label: &AgentLabel, role: Role) ->
             K::AdHocRevise => out.push_str(&format!("  - adhoc-revise: {short}\n")),
             K::AdHocSettled => {
                 let gate = item.gate.as_deref().unwrap_or("?");
-                out.push_str(&format!("  - adhoc-settled: {short} (gate {gate})\n"));
+                let ack = item
+                    .selector
+                    .as_deref()
+                    .map(|s| format!(" — ack `clank events ack {s}`"))
+                    .unwrap_or_default();
+                out.push_str(&format!("  - adhoc-settled: {short} (gate {gate}){ack}\n"));
             }
             K::Message => {
                 let handle = item.handle.as_deref().unwrap_or("?");
@@ -3077,12 +2511,17 @@ fn render_wait_items_ref(items: &[&WaitItem], label: &AgentLabel, role: Role) ->
                 // comment are two changes: without it the second
                 // line reads as a duplicate of the first.
                 let r = item.revision.map(|r| format!(" r{r}")).unwrap_or_default();
+                let ack = item
+                    .selector
+                    .as_deref()
+                    .map(|s| format!(" — ack `clank events ack {s}`"))
+                    .unwrap_or_default();
                 match (item.comment, item.path.as_deref()) {
-                    (Some(c), Some(p)) => {
-                        out.push_str(&format!("  - draft {pr}: {change} {p} (comment {c}){r}\n"))
-                    }
+                    (Some(c), Some(p)) => out.push_str(&format!(
+                        "  - draft {pr}: {change} {p} (comment {c}){r}{ack}\n"
+                    )),
                     // `gone` is about the review, not a comment in it.
-                    _ => out.push_str(&format!("  - draft {pr}: {change}{r}\n")),
+                    _ => out.push_str(&format!("  - draft {pr}: {change}{r}{ack}\n")),
                 }
             }
             // Its OWN variant, not a `master` reason — `work_for`
@@ -3799,66 +3238,6 @@ mod tests {
     /// A YIELD NAMES THE WAKER THAT PROVED ITSELF — at the site that
     /// holds the proof.
     ///
-    /// This walks the real producer, `background_disposition`, rather
-    /// than handing a chosen label to a classifier. That distinction
-    /// is the whole finding: the same `SilentReason` family is
-    /// written by a path that proved a wait live and by one that
-    /// proved nothing, so a decision read back off the label called a
-    /// bare `sleep 60` a registered wait (codex, d281959260a2).
-    #[test]
-    fn a_yield_names_the_waker_that_proved_it() {
-        let listed = |cmd: &str| -> HookInput {
-            serde_json::from_value(serde_json::json!({
-                "session_id": "sess-yield", "cwd": "/tmp", "stop_hook_active": false,
-                "background_tasks": [{"id": "t1", "status": "running", "command": cmd}],
-            }))
-            .unwrap()
-        };
-        let decide = |tool, input: &HookInput, registered: Option<&str>| {
-            decision_of_disposition(&background_disposition(tool, input, registered))
-        };
-
-        // PROVEN: a live listed task IS the registered wait. The
-        // decision carries the token that joined them, and the wire
-        // label is derived FROM the decision.
-        let armed = listed("clank wait --tag deadbeef");
-        let d = decide(Tool::Claude, &armed, Some("deadbeef")).expect("a yield ends the turn");
-        assert_eq!(
-            d.waker(),
-            Some(&YieldTo::RegisteredWait {
-                tag: "deadbeef".into()
-            }),
-            "the waker is identified, not merely present",
-        );
-        assert_eq!(
-            outcome_of(&d),
-            HookOutcome::Silent {
-                why: SilentReason::YieldArmed
-            },
-        );
-
-        // NOT A YIELD AT ALL, and this is where the one codex named
-        // went: a plain sleep on a tool with no completion wake. It
-        // used to end the turn silently, naming nobody. It now decides
-        // nothing here, so the turn routes on to the hook's own wait —
-        // which is the only thing that can wake such a tool.
-        let sleeping = listed("sleep 60");
-        assert_eq!(
-            decide(Tool::Codex, &sleeping, None),
-            None,
-            "live work on a tool with no completion wake decides nothing",
-        );
-
-        // NOT PROVEN: a claim exists, but the listed wait carries a
-        // DIFFERENT token. Two live things that were never joined.
-        let other = listed("clank wait --tag cafe");
-        assert_eq!(
-            decide(Tool::Claude, &other, Some("deadbeef")).and_then(|d| d.waker().cloned()),
-            None,
-            "a claim that names another wait proves nothing about this one",
-        );
-    }
-
     /// THE GATHERER ASKS FOR LIVENESS, not for a file.
     ///
     /// `reachability` being right proves nothing about what is handed
@@ -3867,139 +3246,6 @@ mod tests {
     /// a wait that DIED leaves its claim behind, and reading that as
     /// a waker keeps the report silent on the one agent that is
     /// actually asleep.
-    #[test]
-    fn a_dead_wait_leaves_a_claim_and_is_not_a_waker() {
-        let dir = tempfile::tempdir().unwrap();
-        let repo = dir.path();
-        let label = AgentLabel::parse("rev").unwrap();
-        let agent_dir = crate::agent_store::agents_root(repo).join(label.as_str());
-        std::fs::create_dir_all(&agent_dir).unwrap();
-        let ev = || waker_evidence(repo, &label, AutoMode::On, Some("sess-live")).claim;
-
-        // No claim at all: nothing waiting, and nothing died waiting.
-        assert_eq!(ev(), ClaimState::Absent);
-
-        // THIS process, current incarnation, the bound session.
-        let incarnation = crate::agent_store::read_wait_generation(&agent_dir);
-        crate::wait_claim::publish(&agent_dir, "sess-live", incarnation, Some("tag".into()))
-            .unwrap();
-        assert_eq!(ev(), ClaimState::Live(std::process::id() as i32));
-
-        // SAME file, naming a pid the birth token does not belong to.
-        // pid 1 is always alive, so this is the number-was-reused case
-        // rather than the process-is-gone case, and it is
-        // deterministic where a made-up pid would race pid reuse.
-        let claim_path = crate::wait_claim::claim_path(&agent_dir);
-        let rewrite = |mutate: &dyn Fn(&mut serde_json::Value)| {
-            let mut claim: serde_json::Value =
-                serde_json::from_str(&std::fs::read_to_string(&claim_path).unwrap()).unwrap();
-            mutate(&mut claim);
-            std::fs::write(&claim_path, claim.to_string()).unwrap();
-            // The claim MUST still parse, or this tests
-            // deserialization rather than liveness — an earlier
-            // version wrote an unparseable birth and passed for that
-            // reason, so the birth-check mutant survived it.
-            assert!(
-                crate::wait_claim::read(&agent_dir).is_some(),
-                "the fixture must break liveness, not parsing",
-            );
-        };
-        rewrite(&|c| c["pid"] = serde_json::json!(1));
-        assert_eq!(ev(), ClaimState::Died, "a claim its process never unwound");
-
-        // UNREADABLE is not ABSENT. Replacing a dead wait's claim
-        // with something unparseable turned the warning into a false
-        // success, because the reader collapsed every failure to
-        // "no claim" (codex 392e6f6713b5).
-        std::fs::write(&claim_path, "{ not json").unwrap();
-        assert_eq!(ev(), ClaimState::Unreadable);
-        // A directory in its place is the same question asked by a
-        // different errno.
-        std::fs::remove_file(&claim_path).unwrap();
-        std::fs::create_dir(&claim_path).unwrap();
-        assert_eq!(ev(), ClaimState::Unreadable);
-        std::fs::remove_dir(&claim_path).unwrap();
-        assert_eq!(ev(), ClaimState::Absent, "and gone is gone");
-
-        // ALIVE, but its wake lands in another session. Process
-        // liveness is not delivery — the proof this plan already
-        // rejected for suppression, and it must not pass here either
-        // (codex 01cd4b3f1a39).
-        crate::wait_claim::publish(
-            &agent_dir,
-            "sess-elsewhere",
-            incarnation,
-            Some("tag".into()),
-        )
-        .unwrap();
-        assert_eq!(
-            ev(),
-            ClaimState::Other,
-            "a live wait for another session cannot wake this one",
-        );
-
-        // DEAD AND SOMEONE ELSE'''S. The combination is the one that
-        // matters: a wait launched for this label under a DIFFERENT
-        // session, then killed, leaves a real claim behind. Checking
-        // death before attribution called that corpse this agent'''s
-        // and let it negate a live attendance (codex 392e6f6713b5).
-        crate::wait_claim::publish(
-            &agent_dir,
-            "sess-elsewhere",
-            incarnation,
-            Some("tag".into()),
-        )
-        .unwrap();
-        rewrite(&|c| c["pid"] = serde_json::json!(1));
-        assert_eq!(
-            ev(),
-            ClaimState::Other,
-            "a dead claim that was never this agent'''s says nothing about it",
-        );
-
-        // And a claim from a SUPERSEDED incarnation: alive, bound
-        // here, and its output no longer counts.
-        crate::wait_claim::publish(&agent_dir, "sess-live", incarnation, Some("tag".into()))
-            .unwrap();
-        crate::agent_store::mint_wait_generation(&agent_dir).unwrap();
-        assert_eq!(ev(), ClaimState::Other);
-    }
-
-    /// An attendance is a waker only while its process is.
-    ///
-    /// The marker outlives the work by design — it is a file — so
-    /// reading its presence as liveness is the same mistake as
-    /// reading a claim's.
-    #[test]
-    fn an_attendance_whose_process_is_gone_is_not_a_waker() {
-        let dir = tempfile::tempdir().unwrap();
-        let repo = dir.path();
-        let label = AgentLabel::parse("rev").unwrap();
-        let agent_dir = crate::agent_store::agents_root(repo).join(label.as_str());
-        std::fs::create_dir_all(&agent_dir).unwrap();
-
-        // This process, its own token: live attended work.
-        let mut rec = expected(0, 300);
-        record_attended(&agent_dir, &rec);
-        assert_eq!(
-            waker_evidence(repo, &label, AutoMode::On, None).live_attendance,
-            Some(rec.task.clone()),
-        );
-
-        // The token belongs to THIS process, so it cannot hold pid 1
-        // — alive, and not the process this marker describes.
-        rec.pid = Some(1);
-        record_attended(&agent_dir, &rec);
-        assert!(
-            read_attended(&agent_dir).is_some(),
-            "the fixture must break liveness, not parsing",
-        );
-        assert_eq!(
-            waker_evidence(repo, &label, AutoMode::On, None).live_attendance,
-            None,
-            "a marker naming a process it does not identify is not a waker",
-        );
-    }
 
     /// A PARK SAYS WHO IS HOLDING IT, and a reader believes only that.
     ///
@@ -4009,46 +3255,6 @@ mod tests {
     /// in that window defers to a waiter that does not exist and ends
     /// its turn silent. A reader must not take a writer's lock to ask
     /// who holds it.
-    #[test]
-    fn a_park_records_who_holds_it_and_an_old_holder_claims_nothing() {
-        let dir = tempfile::tempdir().unwrap();
-        let agent_dir = dir.path();
-        let me = std::process::id() as i32;
-        let put = |line: &str| std::fs::write(agent_dir.join("wait.holder"), line).unwrap();
-        std::fs::write(agent_dir.join("wait.gen"), "7\n").unwrap();
-
-        // What the park writes: the incarnation AND its identity.
-        put(&holder_line(7, me));
-        let h = read_holder(agent_dir).expect("a holder it just wrote");
-        assert_eq!(h.generation, 7);
-        assert_eq!(h.pid, Some(me));
-        assert!(h.token.is_some(), "the identity is what makes it a fact");
-        assert!(parked_hook_alive(agent_dir), "this process is holding it");
-
-        // THE OLD FORMAT: a bare generation, on every repo that
-        // parked before this field existed. It must still parse, and
-        // it must claim nothing — unknown is not "a hook is parked".
-        put("7\n");
-        assert_eq!(read_holder(agent_dir).map(|h| h.generation), Some(7));
-        assert!(
-            !parked_hook_alive(agent_dir),
-            "a holder with no identity proves no park",
-        );
-
-        // A holder naming a pid its token does not belong to: pid 1 is
-        // alive and is not this process.
-        let mine = holder_line(7, me);
-        let token = mine.split_whitespace().nth(2).unwrap();
-        put(&format!("7 1 {token}\n"));
-        assert!(
-            !parked_hook_alive(agent_dir),
-            "a live pid the token does not identify is not the parker",
-        );
-
-        // And no holder at all.
-        std::fs::remove_file(agent_dir.join("wait.holder")).unwrap();
-        assert!(!parked_hook_alive(agent_dir));
-    }
 
     /// THE REAL HANDOFF: what a completed hook leaves, read back by
     /// the diagnostic.
@@ -4062,80 +3268,6 @@ mod tests {
     ///   verdict was written from the plan before the effect ran;
     /// - an attended turn CONSUMED its marker, so the reader looked
     ///   for an attendance that the successful path had just removed.
-    #[tokio::test]
-    async fn what_the_hook_leaves_is_what_the_reader_sees() {
-        use crate::cli::teams_config::{AgentDescription, RosterRole};
-        let dir = init_repo();
-        let repo = dir.path();
-        let label = bind(repo, "claude", "sess-handoff");
-        crate::agent_store::set_auto_mode(repo, &label, AutoMode::On).unwrap();
-        crate::cli::agent::add_repo_roster_agent(
-            repo,
-            &label,
-            AgentDescription {
-                tool: Tool::Claude,
-                launch: None,
-                initial_prompt: None,
-            },
-            RosterRole::Commit,
-        )
-        .unwrap();
-        crate::cli::agent::set_repo_master(repo, &label).unwrap();
-        let agent_dir = crate::agent_store::agents_root(repo).join(label.as_str());
-        let seen = || {
-            reachability(&waker_evidence(
-                repo,
-                &label,
-                AutoMode::On,
-                Some("sess-handoff"),
-            ))
-        };
-
-        // A TURN THAT ARMS. The idle claude hook asks the agent to
-        // start a tagged wait — that is a continuation, and the
-        // reader must not call it abandonment.
-        let bare: HookInput = serde_json::from_value(serde_json::json!({
-            "session_id": "sess-handoff", "cwd": "/tmp", "stop_hook_active": false,
-        }))
-        .unwrap();
-        let out = compute_outcome(Tool::Claude, Some(repo), bare).await;
-        assert!(
-            matches!(out, HookOutcome::Continue { .. }),
-            "an idle claude turn arms: {out:?}"
-        );
-        assert_eq!(
-            crate::agent_store::read_turn_end(&agent_dir).and_then(|t| t.left),
-            Some(TurnLeft::Armed),
-            "the stamp records what the turn DID, not what it planned",
-        );
-        assert_eq!(seen(), Reachability::Armed);
-
-        // A TURN THAT ATTENDS. The synchronous hook yields to proven
-        // live work, consuming the marker and re-recording the
-        // projection — which is the thing the reader must read.
-        write_provable_attending(&agent_dir, "t-live");
-        let attended: HookInput = serde_json::from_value(serde_json::json!({
-            "session_id": "sess-handoff", "cwd": "/tmp", "stop_hook_active": false,
-            "background_tasks": [{"id": "t-live", "status": "running", "command": "sleep 600"}],
-        }))
-        .unwrap();
-        let out = compute_outcome(Tool::Claude, Some(repo), attended).await;
-        assert_eq!(
-            out,
-            HookOutcome::Silent {
-                why: SilentReason::AttendingBackgroundTask
-            },
-        );
-        assert!(
-            !attending_path(&agent_dir).exists(),
-            "the successful path consumes its marker",
-        );
-        assert_eq!(
-            seen(),
-            Reachability::Attending("t-live".into()),
-            "and the reader must still see the attendance it yielded to",
-        );
-    }
 
     /// THE INVARIANT, READ FROM OUTSIDE — the assertion this whole
     /// plan exists to make checkable.
@@ -4144,155 +3276,6 @@ mod tests {
     /// wake the agent. Every other answer must be a REASON, because a
     /// check that cries wolf on healthy agents gets ignored, and this
     /// one has to be trusted the day a master is actually asleep.
-    #[test]
-    fn an_agent_whose_turn_ended_with_nothing_watching_is_reportable() {
-        let ev = |auto, turn_ended, claim, parked_hook, live_attendance| WakerEvidence {
-            auto,
-            turn_ended,
-            claim,
-            parked_hook,
-            live_attendance,
-        };
-        let yielded = Some((1_000i64, Some(TurnLeft::Yielded)));
-        let nothing = Some((1_000i64, Some(TurnLeft::Nothing)));
-
-        // THE BUG: driving, turn over, and THIS agent's waiter died —
-        // a claim its process never unwound.
-        assert_eq!(
-            reachability(&ev(AutoMode::On, yielded, ClaimState::Died, false, None)),
-            Reachability::Unreachable { since: 1_000 },
-        );
-
-        // A turn that left NOTHING, with no claim either.
-        assert_eq!(
-            reachability(&ev(AutoMode::On, nothing, ClaimState::Absent, false, None)),
-            Reachability::Unreachable { since: 1_000 },
-        );
-
-        // Each live waker answers it, and says which.
-        assert_eq!(
-            reachability(&ev(
-                AutoMode::On,
-                yielded,
-                ClaimState::Live(4321),
-                false,
-                None
-            )),
-            Reachability::Waiting(4321),
-        );
-        assert_eq!(
-            reachability(&ev(AutoMode::On, yielded, ClaimState::Absent, true, None)),
-            Reachability::Parked,
-        );
-        assert_eq!(
-            reachability(&ev(
-                AutoMode::On,
-                yielded,
-                ClaimState::Absent,
-                false,
-                Some("cargo build".into())
-            )),
-            Reachability::Attending("cargo build".into()),
-        );
-
-        // LIVE EVIDENCE OUTRANKS A DEAD CLAIM. A stale waiter
-        // somebody killed must not report a healthy attended turn as
-        // abandoned (codex 392e6f6713b5).
-        assert_eq!(
-            reachability(&ev(
-                AutoMode::On,
-                yielded,
-                ClaimState::Died,
-                false,
-                Some("cargo build".into())
-            )),
-            Reachability::Attending("cargo build".into()),
-        );
-        assert_eq!(
-            reachability(&ev(AutoMode::On, yielded, ClaimState::Died, true, None)),
-            Reachability::Parked,
-        );
-        // And an intentional stop is not overridden by one either.
-        assert_eq!(
-            reachability(&ev(
-                AutoMode::On,
-                Some((1_000, Some(TurnLeft::NotOurs))),
-                ClaimState::Died,
-                false,
-                None
-            )),
-            Reachability::NotDriven,
-        );
-
-        // A VANISHED CLAIM IS NOT A RECEIPT. The guard drops when
-        // `wait::items` returns, BEFORE `wait::run` emits, so the
-        // waiter can be alive, blocked and undelivered with nothing on
-        // disk. Unreadable says just as little. Neither accuses, and
-        // neither congratulates.
-        for claim in [
-            ClaimState::Absent,
-            ClaimState::Unreadable,
-            ClaimState::Other,
-        ] {
-            assert_eq!(
-                reachability(&ev(AutoMode::On, yielded, claim.clone(), false, None)),
-                Reachability::Unknown,
-                "{claim:?} after a yield cannot be read either way",
-            );
-        }
-
-        // But a turn that left NOTHING is not waiting on a receipt:
-        // there is nothing to have delivered.
-        for claim in [
-            ClaimState::Absent,
-            ClaimState::Unreadable,
-            ClaimState::Other,
-        ] {
-            assert_eq!(
-                reachability(&ev(AutoMode::On, nothing, claim.clone(), false, None)),
-                Reachability::Unreachable { since: 1_000 },
-                "{claim:?}",
-            );
-        }
-
-        // NOT REPORTABLE: a turn that handed the agent a next step.
-        // Verified against the live repo, where the running master
-        // was reported asleep until this arm existed.
-        assert_eq!(
-            reachability(&ev(
-                AutoMode::On,
-                Some((1_000, Some(TurnLeft::Armed))),
-                ClaimState::Absent,
-                false,
-                None
-            )),
-            Reachability::Armed,
-        );
-
-        // A stamp with no verdict cannot say, so it does not accuse.
-        assert_eq!(
-            reachability(&ev(
-                AutoMode::On,
-                Some((1_000, None)),
-                ClaimState::Absent,
-                false,
-                None
-            )),
-            Reachability::Unknown,
-        );
-
-        // Not a fault: asked not to be driven, or never ended a turn.
-        for turn in [yielded, None] {
-            assert_eq!(
-                reachability(&ev(AutoMode::Off, turn, ClaimState::Absent, false, None)),
-                Reachability::NotDriven,
-            );
-        }
-        assert_eq!(
-            reachability(&ev(AutoMode::On, None, ClaimState::Absent, false, None)),
-            Reachability::NoTurnYet,
-        );
-    }
 
     /// THE WHOLE DECISION, as a table.
     ///
@@ -4300,67 +3283,6 @@ mod tests {
     /// `compute_outcome_with`, so asking what a turn decides meant
     /// building a repo that reached that depth. This asks with
     /// values.
-    #[test]
-    fn the_turn_decision_is_a_table() {
-        let ev = |disposition, auto, role, proven| TurnEvidence {
-            tool: Tool::Claude,
-            async_loop: false,
-            disposition,
-            auto,
-            role,
-            proven,
-        };
-        let on = || Ok(AutoMode::On);
-        let master = || Ok(Role::Master);
-
-        // A yield outranks everything below it — including a config
-        // that will not parse and a role that will not resolve.
-        let plan = decide(ev(
-            BgDisposition::YieldToWait { tag: "t".into() },
-            Err("bad config".into()),
-            Err("no roster".into()),
-            None,
-        ));
-        assert!(matches!(
-            plan,
-            TurnPlan::Yield(TurnDecision::Yield(YieldTo::RegisteredWait { .. }))
-        ));
-        // And it is the ONLY plan that leaves the marker.
-        assert!(!plan.takes_marker());
-
-        // The gate's failures are decided, and they take the marker.
-        for (auto, role, want) in [
-            (
-                Err("bad config".into()),
-                master(),
-                TurnDecision::Failed("bad config".into()),
-            ),
-            (
-                Ok(AutoMode::Off),
-                master(),
-                TurnDecision::NotOurs(NotOurs::AutoOff),
-            ),
-            (
-                on(),
-                Err("no roster".into()),
-                TurnDecision::Failed("no roster".into()),
-            ),
-        ] {
-            let plan = decide(ev(BgDisposition::NoBackgroundWork, auto, role, None));
-            let TurnPlan::Decided(got) = &plan else {
-                panic!("expected a decision, got another plan")
-            };
-            assert_eq!(got, &want);
-            assert!(plan.takes_marker(), "only a yield leaves the marker");
-        }
-
-        // Driving, with nothing attended: the route decides.
-        let plan = decide(ev(BgDisposition::NoBackgroundWork, on(), master(), None));
-        assert!(matches!(
-            plan,
-            TurnPlan::Drive(Role::Master, TurnRoute::AskToArm, Attendance::None)
-        ));
-    }
 
     /// A PROVEN ATTENDANCE IS ATTENDED — and only a hook that
     /// outlives the turn holds its timer.
@@ -4374,7 +3296,6 @@ mod tests {
         let ev = |tool, async_loop| TurnEvidence {
             tool,
             async_loop,
-            disposition: BgDisposition::NoBackgroundWork,
             auto: Ok(AutoMode::On),
             role: Ok(Role::Master),
             proven: Some(Proven {
@@ -4424,7 +3345,6 @@ mod tests {
         let plan = decide(TurnEvidence {
             tool: Tool::Codex,
             async_loop: false,
-            disposition: BgDisposition::NoBackgroundWork,
             auto: Ok(AutoMode::On),
             role: Ok(Role::Master),
             proven: None,
@@ -4439,70 +3359,9 @@ mod tests {
     /// The async-loop rows are the point: the park is the watcher
     /// there, so the disposition changes nothing — a fact that was
     /// two arms with identical bodies and no way to ask about it.
-    #[test]
-    fn the_route_is_a_table() {
-        use BgDisposition as D;
-        let dispositions = [
-            D::NoBackgroundWork,
-            D::NeedsWorkCheck,
-            D::LiveWorkNoWake,
-            D::YieldToWait { tag: "t".into() },
-        ];
-
-        // ASYNC LOOP: always the park, whatever is listed and
-        // whatever the tool.
-        for d in &dispositions {
-            for tool in [Tool::Claude, Tool::Codex, Tool::OpenCode, Tool::Grok] {
-                assert_eq!(route(d, true, tool), TurnRoute::Park, "{d:?} {tool:?}");
-            }
-        }
-
-        // LEGACY: a live process with nothing watching is the one
-        // case that has to ask, and it asks for every tool.
-        for tool in [Tool::Claude, Tool::Codex, Tool::OpenCode, Tool::Grok] {
-            assert_eq!(route(&D::NeedsWorkCheck, false, tool), TurnRoute::Peek);
-        }
-
-        // Otherwise the tool's continuation model decides.
-        for d in [D::NoBackgroundWork, D::LiveWorkNoWake] {
-            assert_eq!(route(&d, false, Tool::Claude), TurnRoute::AskToArm);
-            assert_eq!(route(&d, false, Tool::Codex), TurnRoute::Wait);
-            assert_eq!(route(&d, false, Tool::OpenCode), TurnRoute::Wait);
-            assert_eq!(route(&d, false, Tool::Grok), TurnRoute::Undrivable);
-        }
-    }
 
     /// A failed peek reports the error; ready work is handed to the
     /// agent directly, never turned into an instant-returning wait.
-    #[test]
-    fn a_peek_arms_ready_work_or_reports_its_failure() {
-        let label = AgentLabel::parse("claude").unwrap();
-        let work = parse_wait_json(
-            br#"{"items":[{"kind":"master","plan":"plan-a","sha":"abc123456789","next":"continue","reason":"gate_continue"}]}"#,
-        )
-        .unwrap();
-        assert_eq!(
-            decision_of_peek(Ok(Vec::new()), &label, Role::Master, || "arm a wait"
-                .to_string()),
-            TurnDecision::Arm("arm a wait".into()),
-        );
-        assert_eq!(
-            decision_of_peek(Err("peek failed".into()), &label, Role::Master, || {
-                panic!("a failed peek must not produce an arm-wait nudge")
-            }),
-            TurnDecision::Failed("hook: checking for work: peek failed".into()),
-        );
-        let ready = decision_of_peek(Ok(work), &label, Role::Master, || {
-            panic!("ready work must not produce an arm-wait nudge")
-        });
-        let TurnDecision::Arm(reason) = ready else {
-            panic!("ready work must arm a continuation: {ready:?}");
-        };
-        assert!(reason.contains("master: continue plan-a @ abc123456789"));
-        assert!(reason.contains("Act on these items now."));
-        assert!(reason.contains("await its completion before ending this turn"));
-        assert!(!reason.contains("clank wait --tag"));
-    }
 
     /// THE DRIVE GATE, as a table.
     ///
@@ -4566,59 +3425,6 @@ mod tests {
     /// Two identity paths, two different answers to "can a broken
     /// config be reached at all" — which is why the evidence
     /// migration has to carry this branch rather than assume it away.
-    #[tokio::test]
-    async fn a_live_wait_outranks_an_unreadable_config_under_a_stated_label() {
-        let dir = init_repo();
-        let repo = dir.path();
-        let label = AgentLabel::parse("rev").unwrap();
-        let agent_dir = crate::agent_store::agents_root(repo).join(label.as_str());
-        std::fs::create_dir_all(&agent_dir).unwrap();
-
-        // No binding: identity comes from the stated label alone, so
-        // nothing reads a config to resolve it.
-        let stated = crate::agent_env::Stated::saying(&[("CLANK_AGENT", "rev")]);
-        std::fs::write(agent_dir.join("config.json"), "{ not json").unwrap();
-        assert!(
-            crate::agent_store::load_agent_config(repo, &label).is_err(),
-            "the fixture must actually break the strict read",
-        );
-
-        let incarnation = crate::agent_store::read_wait_generation(&agent_dir);
-        crate::wait_claim::publish(
-            &agent_dir,
-            "sess-stated-cfg",
-            incarnation,
-            Some("beef01".into()),
-        )
-        .unwrap();
-        let watched: HookInput = serde_json::from_value(serde_json::json!({
-            "session_id": "sess-stated-cfg", "cwd": "/tmp", "stop_hook_active": false,
-            "background_tasks": [
-                {"id": "t1", "status": "running", "command": "clank wait --tag beef01"}
-            ],
-        }))
-        .unwrap();
-        assert_eq!(
-            compute_outcome_in(Tool::Claude, Some(repo), watched, &stated).await,
-            HookOutcome::Silent {
-                why: SilentReason::YieldArmed
-            },
-            "the wait is watching; the config it never reads cannot outrank it",
-        );
-
-        // And with nothing watching, that same config IS the answer.
-        let bare: HookInput = serde_json::from_value(serde_json::json!({
-            "session_id": "sess-stated-cfg", "cwd": "/tmp", "stop_hook_active": false,
-        }))
-        .unwrap();
-        assert!(
-            matches!(
-                compute_outcome_in(Tool::Claude, Some(repo), bare, &stated).await,
-                HookOutcome::Diagnostic { .. }
-            ),
-            "with no waker the unreadable config is what the turn reports",
-        );
-    }
 
     /// A LIVE WAKER OUTRANKS A BROKEN ROSTER.
     ///
@@ -4633,63 +3439,6 @@ mod tests {
     /// Branch priority was positional and therefore untested. If a
     /// later change hoists the read, whether by moving the statement
     /// or by filling a `TurnEvidence`, this is what says so.
-    #[tokio::test]
-    async fn a_live_registered_wait_outranks_a_role_that_will_not_resolve() {
-        let dir = init_repo();
-        let repo = dir.path();
-        let label = bind(repo, "claude", "sess-priority");
-        crate::agent_store::set_auto_mode(repo, &label, AutoMode::On).unwrap();
-        let agent_dir = crate::agent_store::agents_root(repo).join(label.as_str());
-
-        // The roster is what is broken: this agent is bound and
-        // auto-on, but in no roster, so its ROLE cannot be resolved.
-        // Not the agent config — that file also holds the session
-        // binding, so corrupting it fails identity resolution one
-        // step earlier and proves nothing about this ordering.
-        assert!(
-            crate::agent_store::resolve_role(repo, &label).is_err(),
-            "the fixture must actually break the read below the yield",
-        );
-
-        let incarnation = crate::agent_store::read_wait_generation(&agent_dir);
-        crate::wait_claim::publish(
-            &agent_dir,
-            "sess-priority",
-            incarnation,
-            Some("deadbeef".into()),
-        )
-        .unwrap();
-        let input: HookInput = serde_json::from_value(serde_json::json!({
-            "session_id": "sess-priority", "cwd": "/tmp", "stop_hook_active": false,
-            "background_tasks": [
-                {"id": "t1", "status": "running", "command": "clank wait --tag deadbeef"}
-            ],
-        }))
-        .unwrap();
-
-        assert_eq!(
-            compute_outcome(Tool::Claude, Some(repo), input).await,
-            HookOutcome::Silent {
-                why: SilentReason::YieldArmed
-            },
-            "the wait is watching this agent; the roster it never reads cannot outrank it",
-        );
-
-        // And with nothing watching, the SAME broken config is the
-        // answer — so the test above is about precedence, not about
-        // the config being harmless.
-        let bare: HookInput = serde_json::from_value(serde_json::json!({
-            "session_id": "sess-priority", "cwd": "/tmp", "stop_hook_active": false,
-        }))
-        .unwrap();
-        assert!(
-            matches!(
-                compute_outcome(Tool::Claude, Some(repo), bare).await,
-                HookOutcome::Diagnostic { .. }
-            ),
-            "with no waker the unresolvable role is what the turn reports",
-        );
-    }
 
     /// WHO TAKES THE ATTENDANCE MARKER.
     ///
@@ -4701,56 +3450,6 @@ mod tests {
     /// Now it is a rule with two halves, and both are asserted —
     /// `auto_off_still_consumes_the_marker` covers the driving side
     /// from the other direction.
-    #[tokio::test]
-    async fn a_yielding_turn_leaves_the_marker_and_a_driving_one_takes_it() {
-        let dir = init_repo();
-        let repo = dir.path();
-        let label = bind(repo, "claude", "sess-marker");
-        crate::agent_store::set_auto_mode(repo, &label, AutoMode::On).unwrap();
-        let agent_dir = crate::agent_store::agents_root(repo).join(label.as_str());
-        std::fs::create_dir_all(&agent_dir).unwrap();
-
-        // YIELDING: a live registered wait. The attendance is still
-        // running, so its marker must survive the turn.
-        write_attending(&agent_dir, "task-42");
-        let incarnation = crate::agent_store::read_wait_generation(&agent_dir);
-        crate::wait_claim::publish(
-            &agent_dir,
-            "sess-marker",
-            incarnation,
-            Some("feed01".into()),
-        )
-        .unwrap();
-        let watched: HookInput = serde_json::from_value(serde_json::json!({
-            "session_id": "sess-marker", "cwd": "/tmp", "stop_hook_active": false,
-            "background_tasks": [
-                {"id": "t1", "status": "running", "command": "clank wait --tag feed01"}
-            ],
-        }))
-        .unwrap();
-        assert_eq!(
-            compute_outcome(Tool::Claude, Some(repo), watched).await,
-            HookOutcome::Silent {
-                why: SilentReason::YieldArmed
-            },
-        );
-        assert!(
-            attending_path(&agent_dir).exists(),
-            "a yield leaves the attendance running, so its marker stays",
-        );
-
-        // DRIVING: nothing watching. Past the gate, the turn owns the
-        // marker and the next turn must not see it.
-        let bare: HookInput = serde_json::from_value(serde_json::json!({
-            "session_id": "sess-marker", "cwd": "/tmp", "stop_hook_active": false,
-        }))
-        .unwrap();
-        let _ = compute_outcome(Tool::Claude, Some(repo), bare).await;
-        assert!(
-            !attending_path(&agent_dir).exists(),
-            "a driving turn takes the marker with it",
-        );
-    }
 
     /// A YIELDING TURN STILL ENDED.
     ///
@@ -4762,60 +3461,6 @@ mod tests {
     /// history said it had never run. Milestone 4 reads these
     /// stamps, and a stamp written only on the paths that already
     /// work reports the health of the paths that never break.
-    #[tokio::test]
-    async fn every_turn_end_is_recorded_including_the_ones_that_yield() {
-        use crate::cli::teams_config::{AgentDescription, RosterRole};
-        let dir = init_repo();
-        let repo = dir.path();
-        let label = bind(repo, "claude", "sess-stamp");
-        crate::agent_store::set_auto_mode(repo, &label, AutoMode::On).unwrap();
-        crate::cli::agent::add_repo_roster_agent(
-            repo,
-            &label,
-            AgentDescription {
-                tool: Tool::Claude,
-                launch: None,
-                initial_prompt: None,
-            },
-            RosterRole::Commit,
-        )
-        .unwrap();
-        crate::cli::agent::set_repo_master(repo, &label).unwrap();
-        let agent_dir = crate::agent_store::agents_root(repo).join(label.as_str());
-
-        // A REGISTERED, live wait: the turn yields to it.
-        let incarnation = crate::agent_store::read_wait_generation(&agent_dir);
-        crate::wait_claim::publish(
-            &agent_dir,
-            "sess-stamp",
-            incarnation,
-            Some("deadbeef".into()),
-        )
-        .unwrap();
-        let yielding: HookInput = serde_json::from_value(serde_json::json!({
-            "session_id": "sess-stamp", "cwd": "/tmp", "stop_hook_active": false,
-            "background_tasks": [
-                {"id": "t1", "status": "running", "command": "clank wait --tag deadbeef"}
-            ],
-        }))
-        .unwrap();
-
-        assert!(
-            crate::agent_store::read_turn_end(&agent_dir).is_none(),
-            "nothing has ended yet"
-        );
-        let out = compute_outcome(Tool::Claude, Some(repo), yielding).await;
-        assert_eq!(
-            out,
-            HookOutcome::Silent {
-                why: SilentReason::YieldArmed
-            },
-            "the turn yields to the wait it can name",
-        );
-        let stamp = crate::agent_store::read_turn_end(&agent_dir)
-            .expect("a turn that yielded is still a turn that ended");
-        assert_eq!(stamp.session, "sess-stamp");
-    }
 
     /// AN UNREADABLE HOLDER IS NOT A CANCELLATION.
     ///
@@ -4904,7 +3549,7 @@ mod tests {
         };
         // The work has already ended, so the first poll disarms and
         // the completion wake is the waker.
-        let decision = attend(&proven, dir.path(), far_ceiling(), || false).await;
+        let decision = attend(&proven, dir.path(), far_ceiling(), || false, || true).await;
         assert_eq!(
             decision.waker(),
             Some(&YieldTo::AttendedTask {
@@ -4962,12 +3607,7 @@ mod tests {
     #[test]
     fn every_silence_is_intentional_or_evidenced() {
         use SilentReason as S;
-        let intentional = [
-            S::AutoOff,
-            S::StaleGeneration,
-            S::WaiterAlreadyParked,
-            S::AttendanceCleared,
-        ];
+        let intentional = [S::AutoOff, S::StaleBinding, S::AttendanceCleared];
 
         for why in SilentReason::ALL {
             let buckets = [intentional.contains(why), EVIDENCED.contains(why)];
@@ -5081,9 +3721,7 @@ mod tests {
         assert!(t.contains("CANNOT") && t.contains("human"), "{t}");
         assert!(t.contains("not answer it yourself"), "{t}");
 
-        for k in [K::Finished, K::AdHocSettled, K::DraftChanged] {
-            assert!(matches!(discharge_of(k, None), OneShot(_)), "{k:?}");
-        }
+        assert!(matches!(discharge_of(K::DraftChanged, None), Until(_)));
         for k in [K::ForCommit, K::ForFinished, K::ForBlocked] {
             assert_eq!(discharge_of(k, None), ObserverOnly, "{k:?}");
         }
@@ -5123,14 +3761,9 @@ mod tests {
         assert_eq!(R::parse("some_new_reason"), None);
     }
 
-    /// A second sha, distinct from `FULL_SHA`: what a finalization
-    /// commit is to the commit that was reviewed.
-    const OTHER_SHA: &str = "fedcba9876543210fedcba9876543210fedcba98";
-
     /// The wake that sends a master to feedback names what reads it,
     /// on that wake's own sha. Nothing else does: a reviewer WRITES
-    /// feedback, a continue has none to read, and a finalize notice
-    /// carries the finalization commit rather than the reviewed one
+    /// feedback, and a continue has none to read
     /// (the-nudge-names-the-command).
     #[test]
     fn the_wakes_about_feedback_name_what_reads_it() {
@@ -5152,32 +3785,10 @@ mod tests {
             assert!(out.contains(&reads), "{about_feedback}: {out}");
         }
 
-        // Both shas on one item: the hint names the REVIEWED one. A
-        // finalize wake can carry the finalization commit too, and
-        // reading feedback on that one finds none (codex on 4837ea8).
-        let out = render(serde_json::json!({
-            "kind":"master","plan":"p","sha":FULL_SHA,"finalized_at":OTHER_SHA,
-            "next":"finalize","reason":"ready_to_finalize","gate":"finished"
-        }));
-        assert!(out.contains(&reads), "{out}");
-        assert!(
-            !out.contains(&format!("feedback read --commit {}", &OTHER_SHA[..12])),
-            "not the commit the finalization made: {out}"
-        );
-        // And with only that later sha, there is nothing to read.
-        let out = render(serde_json::json!({
-            "kind":"master","plan":"p","finalized_at":OTHER_SHA,
-            "next":"finalize","reason":"ready_to_finalize","gate":"finished"
-        }));
-        assert!(!out.contains("feedback read"), "{out}");
-
         for not_about_feedback in [
             serde_json::json!({"kind":"master","plan":"p","sha":FULL_SHA,
               "next":"continue","reason":"gate_continue","gate":"continued"}),
             serde_json::json!({"kind":"reviewer","plan":"p","sha":FULL_SHA}),
-            // The finalize NOTICE: its sha is the finalization commit,
-            // which nobody wrote feedback on.
-            serde_json::json!({"kind":"finished","plan":"p","finalized_at":FULL_SHA}),
         ] {
             let out = render(not_about_feedback.clone());
             assert!(
@@ -5513,20 +4124,6 @@ mod tests {
     }
 
     /// Adding an adapter must force an answer rather than inherit one.
-    #[test]
-    fn every_adapter_answers_the_deadline_question() {
-        assert_eq!(deadline_action(Tool::Claude), DeadlineAction::ReArm);
-        assert_eq!(deadline_action(Tool::Codex), DeadlineAction::ReArm);
-        assert_eq!(deadline_action(Tool::OpenCode), DeadlineAction::RenewWait);
-        assert_eq!(deadline_action(Tool::Grok), DeadlineAction::Fail);
-        assert_eq!(left_of(&HookOutcome::RenewWait), TurnLeft::Armed);
-        assert!(
-            include_str!("setup_assets/opencode_plugin.js").contains(&format!(
-                "const RENEW_WAIT_WIRE = '{OPENCODE_RENEW_WAIT_WIRE}'"
-            )),
-            "the Rust renewal wire and installed plugin must agree"
-        );
-    }
 
     /// BOTH adapters surface an impossible empty success as a failure.
     ///
@@ -5574,15 +4171,15 @@ mod tests {
     fn a_superseded_wait_is_not_an_empty_success() {
         use std::os::unix::process::ExitStatusExt;
         let output = std::process::Output {
-            status: std::process::ExitStatus::from_raw(0),
+            status: std::process::ExitStatus::from_raw(1 << 8),
             stdout: br#"{"items":[],"superseded":true}"#.to_vec(),
-            stderr: Vec::new(),
+            stderr: b"wait for grok cannot continue: session binding changed".to_vec(),
         };
         let label = AgentLabel::parse("claude").unwrap();
         assert_eq!(
             outcome_from_wait_output(&output, &label, Role::Master, &[]),
             HookOutcome::Silent {
-                why: SilentReason::StaleGeneration
+                why: SilentReason::StaleBinding
             }
         );
         assert!(
@@ -5592,56 +4189,25 @@ mod tests {
     }
 
     #[test]
-    fn a_second_hook_defers_to_the_wait_child_that_holds_the_claim() {
-        use std::os::unix::process::ExitStatusExt;
-        let output = std::process::Output {
-            status: std::process::ExitStatus::from_raw(0),
-            stdout: br#"{"items":[],"already_parked":true}"#.to_vec(),
-            stderr: Vec::new(),
-        };
-        let label = AgentLabel::parse("claude").unwrap();
-        assert_eq!(
-            outcome_from_wait_output(&output, &label, Role::Master, &[]),
-            HookOutcome::Silent {
-                why: SilentReason::WaiterAlreadyParked
-            }
-        );
-        assert!(parse_wait_json(&output.stdout).is_err());
-    }
-
-    /// ONE fence, asked by everything that emits.
-    ///
-    /// The park's acquisition, its abort and the wake guard each spelled
-    /// this comparison differently, which is how the generation's job
-    /// ended up spread across the mechanisms that ask it. The point of
-    /// naming it is that a reader can check all three say the same
-    /// thing (the-turn-end-is-one-decision).
-    #[test]
-    fn the_fence_admits_only_the_current_incarnation() {
-        let dir = tempfile::tempdir().unwrap();
-        let agent_dir = dir.path();
-
-        // Absent reads as 0, and 0 is a real incarnation — the
-        // pre-generation state, which must still be admitted or every
-        // such repo's hook suppresses itself.
-        assert_eq!(Fence::read(agent_dir), Fence(0));
-        assert!(Fence::read(agent_dir).admits(0));
-
-        let mine = crate::agent_store::mint_wait_generation(agent_dir).unwrap();
-        assert!(Fence::read(agent_dir).admits(mine), "just minted");
-        assert!(
-            !Fence::read(agent_dir).admits(mine - 1),
-            "a predecessor's output does not count",
-        );
-
-        // A NEWER incarnation takes over, and the fence stops admitting
-        // the older one WITHOUT touching it. That is what a fence is
-        // here: it does not stop an obsolete holder running, it stops
-        // its output counting.
-        let newer = crate::agent_store::mint_wait_generation(agent_dir).unwrap();
-        assert!(newer > mine);
-        assert!(!Fence::read(agent_dir).admits(mine));
-        assert!(Fence::read(agent_dir).admits(newer));
+    fn listed_background_wait_does_not_take_stops_wait() {
+        let mut input = hook_input("session-16", None);
+        input
+            .background_tasks
+            .push(clank_core::hook_io::BackgroundTask {
+                id: Some("task-1".into()),
+                status: Some("completed".into()),
+                command: Some("clank wait --author codex".into()),
+            });
+        assert!(matches!(
+            decide(TurnEvidence {
+                tool: Tool::Codex,
+                async_loop: false,
+                auto: Ok(AutoMode::On),
+                role: Ok(Role::Master),
+                proven: prove_attendance(None, &input),
+            }),
+            TurnPlan::Drive(Role::Master, TurnRoute::Wait, Attendance::None)
+        ));
     }
 
     fn start_input(session: &str, source: &str) -> SessionStartInput {
@@ -5661,71 +4227,24 @@ mod tests {
             .map(|s| (s.tool, s.id.as_str().to_string()))
     }
 
+    fn roster_agent(repo: &Path, label: &AgentLabel, tool: Tool) {
+        crate::cli::agent::add_repo_roster_agent(
+            repo,
+            label,
+            crate::cli::teams_config::AgentDescription {
+                tool,
+                launch: None,
+                initial_prompt: None,
+            },
+            crate::cli::teams_config::RosterRole::Master,
+        )
+        .unwrap();
+    }
+
     /// A session clank launched binds itself: `startup` is the first
     /// bind, `clear` the rebind that keeps a cleared session tracked,
     /// `resume` and `compact` re-assert. Nothing was typed in the
     /// session (a-session-binds-itself-at-start).
-    #[test]
-    fn a_launched_session_binds_and_rebinds_from_its_label() {
-        let dir = init_repo();
-        let repo = dir.path();
-        let codex = AgentLabel::parse("codex").unwrap();
-        let first = "01a08361-f112-75d0-a49f-2e35b104e3b6";
-        let got = session_started(
-            repo,
-            Tool::Codex,
-            &start_input(first, "startup"),
-            Some(&codex),
-            &stated(),
-        );
-        assert_eq!(got.as_ref().map(|l| l.as_str()), Some("codex"));
-        assert_eq!(
-            bound_session(repo, "codex"),
-            Some((Tool::Codex, first.to_string())),
-            "bound on startup, with the tool the hook was installed for"
-        );
-        let generation = crate::agent_store::read_wait_generation(
-            &crate::agent_store::agents_root(repo).join("codex"),
-        );
-
-        // /clear: a new id for the same process.
-        let cleared = "01a08361-ffff-75d0-a49f-2e35b104e3b6";
-        session_started(
-            repo,
-            Tool::Codex,
-            &start_input(cleared, "clear"),
-            Some(&codex),
-            &stated(),
-        );
-        assert_eq!(
-            bound_session(repo, "codex"),
-            Some((Tool::Codex, cleared.to_string())),
-            "the report: the binding follows the new id"
-        );
-        assert_ne!(
-            crate::agent_store::read_wait_generation(
-                &crate::agent_store::agents_root(repo).join("codex")
-            ),
-            generation,
-            "a bind is a claim: the generation moved, revoking any stale waiter"
-        );
-
-        // resume / compact: idempotent re-assertions of the same id.
-        for source in ["resume", "compact"] {
-            session_started(
-                repo,
-                Tool::Codex,
-                &start_input(cleared, source),
-                Some(&codex),
-                &stated(),
-            );
-            assert_eq!(
-                bound_session(repo, "codex"),
-                Some((Tool::Codex, cleared.to_string())),
-                "{source}"
-            );
-        }
-    }
 
     /// A label that another agent held is cleared off it by the bind:
     /// one session, one label.
@@ -5736,6 +4255,7 @@ mod tests {
         let sid = "01a08361-f112-75d0-a49f-2e35b104e3b6";
         bind_tool(repo, "old", sid, Tool::Codex);
         let new = AgentLabel::parse("new").unwrap();
+        roster_agent(repo, &new, Tool::Codex);
         session_started(
             repo,
             Tool::Codex,
@@ -5748,6 +4268,26 @@ mod tests {
             Some((Tool::Codex, sid.to_string()))
         );
         assert_eq!(bound_session(repo, "old"), None);
+    }
+
+    #[test]
+    fn claude_compatible_grok_start_binds_the_roster_tool() {
+        let dir = init_repo();
+        let repo = dir.path();
+        let label = AgentLabel::parse("grok").unwrap();
+        roster_agent(repo, &label, Tool::Grok);
+        let sid = "01a0dd00-5b0f-7dc0-b418-24054b5112cf";
+        let mut input = start_input(sid, "resume");
+        input.transcript_path = Some("/tmp/.grok/updates.jsonl".into());
+        let got = session_started(repo, Tool::Claude, &input, Some(&label), &stated());
+        assert_eq!(got, Some((label.clone(), Tool::Grok)));
+        assert_eq!(bound_session(repo, "grok"), Some((Tool::Grok, sid.into())));
+        assert!(crate::agent_store::binding_matches(
+            repo,
+            &label,
+            Tool::Grok,
+            sid
+        ));
     }
 
     /// No label in the environment: a session clank did not launch.
@@ -5782,7 +4322,7 @@ mod tests {
             None,
             &stated(),
         );
-        assert_eq!(got.as_ref().map(|l| l.as_str()), Some("claude"));
+        assert_eq!(got.as_ref().map(|(l, _)| l.as_str()), Some("claude"));
     }
 
     #[test]
@@ -5877,46 +4417,6 @@ mod tests {
     /// Run the same decoded Stop path as production with no ambient
     /// variables. Ending a turn must leave the session's claim and
     /// waiter generation intact even when no display is attached.
-    #[tokio::test]
-    async fn a_displayless_stop_preserves_the_binding() {
-        let dir = init_repo();
-        let repo = dir.path();
-        let label = bind_tool(repo, "codex", "sess-displayless", Tool::Codex);
-        crate::agent_store::set_auto_mode(repo, &label, AutoMode::Off).unwrap();
-        let agent_dir = crate::agent_store::agents_root(repo).join(label.as_str());
-        let before = std::fs::read(agent_dir.join("config.json")).unwrap();
-        let generation = crate::agent_store::read_wait_generation(&agent_dir);
-        let args = StopHookArgs {
-            tool: crate::cli::ToolArg::Codex,
-            repo: Some(repo.to_path_buf()),
-            session_start: false,
-            loop_mode: None,
-        };
-
-        let outcome = stop_input(
-            &args,
-            hook_input("sess-displayless", Some("done")),
-            std::time::Instant::now(),
-            &stated(),
-        )
-        .await;
-        assert_eq!(
-            outcome,
-            HookOutcome::Silent {
-                why: SilentReason::AutoOff
-            }
-        );
-        assert_eq!(
-            std::fs::read(agent_dir.join("config.json")).unwrap(),
-            before,
-            "the installed Stop path must preserve the binding file",
-        );
-        assert_eq!(
-            crate::agent_store::read_wait_generation(&agent_dir),
-            generation,
-            "the installed Stop path must not revoke the waiter",
-        );
-    }
 
     /// The second early return. `AutoMode::Off` exits above everything
     /// clank does, so it is the same shape as the empty-items route —
@@ -6015,7 +4515,7 @@ mod tests {
     /// the production behaviour, and is precisely why a developer's
     /// exported copy of it used to decide four tests.
     #[tokio::test]
-    async fn a_stated_override_outranks_the_session_binding() {
+    async fn a_stated_override_cannot_emit_for_an_unbound_label() {
         let dir = init_repo();
         let repo = dir.path();
         let label = bind(repo, "codex", "sess-stated-override");
@@ -6035,7 +4535,10 @@ mod tests {
                 message.contains("somebody-else"),
                 "the stated override decided the identity, not the binding: {message}"
             ),
-            other => panic!("expected the stated label to be used: {other:?}"),
+            HookOutcome::Silent {
+                why: SilentReason::StaleBinding,
+            } => {}
+            other => panic!("a label that is not bound cannot emit: {other:?}"),
         }
 
         assert_eq!(
@@ -6077,125 +4580,6 @@ mod tests {
         );
     }
 
-    /// OBEYING THE ARM INSTRUCTION ENDS IT.
-    ///
-    /// Removing the unproven yield closed the permanent-sleep path
-    /// and opened a worse-behaved one: every listed wait stayed
-    /// `Unknown`, so the hook re-issued the same instruction on every
-    /// stop and the agent accumulated waiters — three turns, three
-    /// live waits, all healthy and all ignored (codex bedc480).
-    /// "A nudge repeats" was not a usable loop.
-    ///
-    /// The instruction carries a registration token now. This walks
-    /// the real cycle: nudge, obey, and assert the NEXT stop is quiet.
-    /// Asserting only "not YieldArmed", as the version this replaces
-    /// did, passes for the hot loop it was meant to rule out.
-    #[tokio::test]
-    async fn obeying_the_arm_instruction_stops_the_asking() {
-        use crate::cli::teams_config::{AgentDescription, RosterRole};
-        let dir = init_repo();
-        let repo = dir.path();
-        let label = bind(repo, "claude", "sess-armed");
-        crate::agent_store::set_auto_mode(repo, &label, AutoMode::On).unwrap();
-        crate::cli::agent::add_repo_roster_agent(
-            repo,
-            &label,
-            AgentDescription {
-                tool: Tool::Claude,
-                launch: None,
-                initial_prompt: None,
-            },
-            RosterRole::Commit,
-        )
-        .unwrap();
-        crate::cli::agent::set_repo_master(repo, &label).unwrap();
-        let agent_dir = crate::agent_store::agents_root(repo).join(label.as_str());
-
-        // TURN 1: nothing watching, so the hook asks — and the ask
-        // carries the token the agent is to run with.
-        let bare: HookInput = serde_json::from_value(serde_json::json!({
-            "session_id": "sess-armed", "cwd": "/tmp", "stop_hook_active": false,
-        }))
-        .unwrap();
-        let HookOutcome::Continue { reason } =
-            compute_outcome(Tool::Claude, Some(repo), bare).await
-        else {
-            panic!("an idle claude turn is asked to arm a wait")
-        };
-        let tag = reason
-            .split("--tag ")
-            .nth(1)
-            .and_then(|r| r.split('`').next())
-            .expect("the instruction carries a registration token")
-            .to_string();
-
-        // The agent OBEYS: that command is now a live listed task,
-        // and the wait it started publishes the same token.
-        let obeyed: HookInput = serde_json::from_value(serde_json::json!({
-            "session_id": "sess-armed", "cwd": "/tmp", "stop_hook_active": false,
-            "background_tasks": [
-                {"id": "t1", "status": "running", "command": format!("clank wait --tag {tag}")}
-            ],
-        }))
-        .unwrap();
-        let now = crate::agent_store::read_wait_generation(&agent_dir);
-        crate::wait_claim::publish(&agent_dir, "sess-armed", now, Some(tag.clone())).unwrap();
-
-        // TURN 2: the hook recognises the wait it asked for and says
-        // nothing. THIS is the terminating condition the loop lacked.
-        assert_eq!(
-            compute_outcome(Tool::Claude, Some(repo), obeyed).await,
-            HookOutcome::Silent {
-                why: SilentReason::YieldArmed
-            },
-            "the hook must not ask again for a wait it can name",
-        );
-    }
-
-    /// An UNREGISTERED wait still does not take the turn.
-    ///
-    /// The token is the only thing that makes a listed task
-    /// nameable. Without it a claim proves a live process in the
-    /// right session at the current incarnation — and still not that
-    /// the LISTED task is that process, which is what three earlier
-    /// predicates each got wrong (codex 07c7d8d).
-    #[tokio::test]
-    async fn an_unregistered_background_wait_never_silences_the_turn() {
-        let dir = init_repo();
-        let repo = dir.path();
-        bind(repo, "codex", "sess-armed");
-
-        let input = || -> HookInput {
-            serde_json::from_value(serde_json::json!({
-                "session_id": "sess-armed", "cwd": "/tmp", "stop_hook_active": false,
-                "background_tasks": [
-                    {"id": "t1", "status": "running",
-                     "command": "cd /tmp; clank wait --author codex"}
-                ],
-            }))
-            .unwrap()
-        };
-        let yielded = |o: &HookOutcome| {
-            *o == HookOutcome::Silent {
-                why: SilentReason::YieldArmed,
-            }
-        };
-
-        assert!(!yielded(
-            &compute_outcome(Tool::Claude, Some(repo), input()).await
-        ));
-
-        // A claim that passes birth, session and incarnation — and a
-        // listed command that does not carry its token.
-        let agent_dir = crate::agent_store::agents_root(repo).join("codex");
-        let now = crate::agent_store::read_wait_generation(&agent_dir);
-        crate::wait_claim::publish(&agent_dir, "sess-armed", now, Some("other".into())).unwrap();
-        assert!(
-            !yielded(&compute_outcome(Tool::Claude, Some(repo), input()).await),
-            "a token that names no listed task names nothing",
-        );
-    }
-
     #[tokio::test]
     async fn unresolved_identity_is_a_diagnostic() {
         // A session with NO binding: the hook fired but can't tell who it
@@ -6209,7 +4593,7 @@ mod tests {
     }
 
     #[test]
-    fn a_draft_change_says_what_moved_and_that_nothing_is_owed() {
+    fn a_draft_change_says_what_moved_and_how_to_ack_it() {
         // Built from wait's ACTUAL --json field names, the same wire
         // the hook consumes.
         let raw = serde_json::json!({
@@ -6219,7 +4603,8 @@ mod tests {
                 "comment": 4088032661u64,
                 "path": "crates/cli/src/lib.rs",
                 "change": "edited",
-                "revision": 3
+                "revision": 3,
+                "selector": "draft-pr-12-run-1:3"
             }]
         });
         let items = parse_wait_json(raw.to_string().as_bytes()).unwrap();
@@ -6230,16 +4615,36 @@ mod tests {
             "the hint says what moved rather than `? @ ?`: {out}"
         );
         assert!(
-            out.contains("read the draft before your next round"),
+            out.contains("read the draft"),
             "and what to do with it: {out}"
         );
         assert!(
-            out.contains("do not reply to it"),
-            "awareness must not read as a request to answer the operator: {out}"
+            out.contains("do not reply to the edit")
+                && out.contains("clank events ack draft-pr-12-run-1:3"),
+            "the draft is read, then explicitly acked: {out}"
         );
         assert!(
-            !out.contains("fires until"),
-            "it is spent once reported, so it must not claim a condition that ends it: {out}"
+            out.contains("then ack the event"),
+            "the debt remains until ack: {out}"
+        );
+    }
+
+    #[test]
+    fn lifecycle_events_name_their_ack_and_repeat_condition() {
+        let out = items_text(&[
+            serde_json::json!({"kind":"finished", "plan":"done", "finalized_at":FULL_SHA,
+                "selector":"repo-lifecycle@1"}),
+            serde_json::json!({"kind":"adhoc_settled", "sha":FULL_SHA, "gate":"continued",
+                "selector":"repo-lifecycle@2"}),
+        ]);
+        assert!(out.contains("finished: done"), "{out}");
+        assert!(out.contains("adhoc-settled:"), "{out}");
+        assert!(out.contains("clank events ack repo-lifecycle@1"), "{out}");
+        assert!(out.contains("clank events ack repo-lifecycle@2"), "{out}");
+        assert_eq!(
+            out.matches("fires until the event is acked").count(),
+            2,
+            "{out}"
         );
     }
 
@@ -6370,131 +4775,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn nudge_states_the_count_and_never_echoes_commands() {
-        // lloyd (dark-skippy): real background commands are multi-clause
-        // shell one-liners; echoing them buried the instruction. The nudge
-        // states only THAT something is running (and how many) — no
-        // command text ever reaches the agent.
-        let monster = "until [ -s /tmp/x.output ]; do sleep 3; done; grep -iE \"FILL|error\" /tmp/x.output | head -20";
-        let input: HookInput = serde_json::from_value(serde_json::json!({
-            "session_id": "sess-nudge-test",
-            "cwd": "/tmp",
-            "stop_hook_active": false,
-            "background_tasks": [
-                {"id": "t1", "status": "running", "command": monster},
-                {"id": "t2", "status": "running", "command": monster},
-                {"id": "t3", "status": "running", "command": "cd /tmp && clank wait --author codex"},
-            ],
-        }))
-        .unwrap();
-        let reason = nudge_reason(&input);
-        assert!(
-            reason.contains("2 background tasks"),
-            "counts non-clank-wait tasks: {reason}"
-        );
-        assert!(
-            !reason.contains("until") && !reason.contains("/tmp/x.output"),
-            "no command text leaks: {reason}"
-        );
-        // The instruction core: command + the run_in_background detail.
-        assert!(
-            reason.contains("run `clank wait --tag ")
-                && reason.contains("(run_in_background: true)")
-        );
-        assert!(reason.contains("run_in_background: true"));
-        assert!(!reason.contains("Bash tool"), "terse: no tool tutorial");
-
-        // Singular wording for one task.
-        let one: HookInput = serde_json::from_value(serde_json::json!({
-            "session_id": "sess-nudge-test",
-            "cwd": "/tmp",
-            "stop_hook_active": false,
-            "background_tasks": [{"id": "t1", "status": "running", "command": "cargo build"}],
-        }))
-        .unwrap();
-        let reason = nudge_reason(&one);
-        assert!(
-            reason.contains("a background task still running"),
-            "{reason}"
-        );
-        assert!(!reason.contains("cargo"), "no command text: {reason}");
-    }
-
-    #[tokio::test]
-    async fn claude_without_background_work_nudges_to_arm_wait() {
-        // With no background task, Claude's legacy idle branch returns
-        // the arm-the-wait hint and never runs the in-hook wait —
-        // even when work exists RIGHT NOW (here: a dirty plan file the
-        // master must commit, which a wait would return immediately).
-        // The armed wait's completion wake is what delivers the items.
-        use crate::cli::teams_config::{AgentDescription, RosterRole};
-        let dir = init_repo();
-        let repo = dir.path();
-        let label = bind(repo, "claude", "sess-claude-idle");
-        crate::agent_store::set_auto_mode(repo, &label, AutoMode::On).unwrap();
-        crate::cli::agent::add_repo_roster_agent(
-            repo,
-            &label,
-            AgentDescription {
-                tool: Tool::Claude,
-                launch: None,
-                initial_prompt: None,
-            },
-            RosterRole::Commit,
-        )
-        .unwrap();
-        crate::cli::agent::set_repo_master(repo, &label).unwrap();
-        std::fs::create_dir_all(repo.join(".clank/plans")).unwrap();
-        std::fs::write(repo.join(".clank/plans/some-plan.md"), "# some-plan\n").unwrap();
-
-        let input = hook_input("sess-claude-idle", None);
-        let outcome = compute_outcome(Tool::Claude, Some(repo), input).await;
-        let HookOutcome::Continue { reason } = &outcome else {
-            panic!("expected the arm-the-wait Continue, got {outcome:?}");
-        };
-        assert!(
-            reason.contains("Nothing is watching for clank work"),
-            "{reason}"
-        );
-        assert!(
-            reason.contains("run `clank wait --tag ")
-                && reason.contains("(run_in_background: true)"),
-            "{reason}"
-        );
-        assert!(
-            !reason.contains("some-plan") && !reason.contains("  - "),
-            "the hint must carry no work items: {reason}"
-        );
-    }
-
-    #[test]
-    fn idle_nudge_keeps_the_instruction_without_a_background_preamble() {
-        let input: HookInput = serde_json::from_value(serde_json::json!({
-            "session_id": "sess-idle-nudge",
-            "cwd": "/tmp",
-            "stop_hook_active": false,
-            "background_tasks": [],
-        }))
-        .unwrap();
-        let reason = nudge_reason(&input);
-        assert!(
-            reason.contains("Nothing is watching for clank work"),
-            "{reason}"
-        );
-        assert!(
-            reason.contains("run `clank wait --tag ")
-                && reason.contains("(run_in_background: true)"),
-            "{reason}"
-        );
-        assert!(reason.contains("run_in_background: true"), "{reason}");
-        assert!(!reason.contains("Bash tool"), "terse: {reason}");
-        assert!(
-            !reason.contains("still running"),
-            "no background-task preamble when idle: {reason}"
-        );
-    }
-
     /// Deserialize `json!` values through the real `WaitItem` path —
     /// the same typed parse the production stop hook uses — then
     /// render. Exercises both the deserialize and the projection.
@@ -6600,20 +4880,6 @@ mod tests {
     }
 
     #[test]
-    fn adhoc_settled_renders_the_verdict_one_liner() {
-        // The settle wake (adhoc-continue-wake-investigation): short
-        // sha + verdict, nothing else — there is no follow-on work
-        // command to teach.
-        let out = items_text(&[
-            serde_json::json!({"kind": "adhoc_settled", "sha": FULL_SHA, "gate": "continued"}),
-            serde_json::json!({"kind": "adhoc_settled", "sha": FULL_SHA, "gate": "finished"}),
-        ]);
-        let short = short_sha(FULL_SHA);
-        assert!(out.contains(&format!("  - adhoc-settled: {short} (gate continued)\n")));
-        assert!(out.contains(&format!("  - adhoc-settled: {short} (gate finished)\n")));
-    }
-
-    #[test]
     fn multiple_plans_open_nudge_carries_the_ordered_remedies() {
         // The one deliberately non-minimal nudge: the remedies are
         // parameterized by the plan names, so they ride in the wake
@@ -6700,67 +4966,6 @@ mod tests {
             matches!(empty, HookOutcome::Diagnostic { .. }),
             "empty normal wait must surface, got {empty:?}"
         );
-    }
-
-    #[test]
-    fn the_in_hook_wait_argv_carries_the_ownership_flag() {
-        let argv = wait_argv(
-            Path::new("/repo"),
-            &AgentLabel::parse("codex").unwrap(),
-            "session-16",
-            7,
-        );
-        assert!(
-            argv.iter().any(|a| a == "--die-with-owner"),
-            "without this the in-hook wait has no bound at all: {argv:?}"
-        );
-        assert!(
-            argv.windows(2)
-                .any(|pair| pair == ["--deliver-to-session", "session-16"])
-        );
-        assert!(
-            argv.windows(2)
-                .any(|pair| pair == ["--expected-generation", "7"])
-        );
-        // Absence assertions over a flag the CLI no longer accepts.
-        // These are reachable, not ceremony: this inspects what the
-        // BUILDER produces, before clap sees it, so re-adding either
-        // flag here fails the test. And it must — a hook injecting a
-        // flag `clank wait` rejects would break the wait outright, at
-        // runtime, in production.
-        assert!(
-            !argv.iter().any(|a| a == "--timeout"),
-            "the flag is gone: {argv:?}"
-        );
-        assert!(
-            !argv.iter().any(|a| a == "--role"),
-            "role is derived from identity; the hook must not pin one: {argv:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn owned_wait_refuses_a_child_with_no_ownership_pipe() {
-        // The degradation codex flagged: `stdin.take()` yielding None
-        // must be a hard error, not a silently unowned wait that
-        // outlives a killed hook.
-        let mut bare = Command::new("true");
-        bare.stdin(Stdio::null());
-        let err = match OwnedWait::spawn(&mut bare) {
-            Err(e) => e,
-            Ok(_) => panic!("a child with no ownership pipe must be refused"),
-        };
-        assert!(err.contains("ownership"), "explains the refusal: {err}");
-
-        // And the real builder DOES pipe stdin, so construction works.
-        let owned = OwnedWait::spawn(&mut wait_command(
-            Path::new("true"),
-            Path::new("/repo"),
-            &AgentLabel::parse("codex").unwrap(),
-            "session-16",
-            7,
-        ))
-        .expect("the hook's own command must carry the pipe");
-        let _ = owned.run().await;
     }
 
     #[tokio::test]
@@ -6858,9 +5063,13 @@ mod tests {
             rec,
             task_id: "bq1x2y3z4".into(),
         };
-        let out = attend(&proven, dir, ceiling, || {
-            alive.load(std::sync::atomic::Ordering::SeqCst)
-        })
+        let out = attend(
+            &proven,
+            dir,
+            ceiling,
+            || alive.load(std::sync::atomic::Ordering::SeqCst),
+            || true,
+        )
         .await;
         side.abort();
         (outcome_of(&out), tokio::time::Instant::now() - start)
@@ -7006,7 +5215,7 @@ mod tests {
         assert_eq!(
             out,
             HookOutcome::Silent {
-                why: SilentReason::WaiterAlreadyParked
+                why: SilentReason::AttendanceCleared
             },
             "a newer attendance owns the check-in"
         );
@@ -7079,31 +5288,6 @@ mod tests {
         assert!(waited_the_bound(took), "{took:?}");
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn a_generation_change_silences_the_timer() {
-        let dir = tempfile::tempdir().unwrap();
-        let rec = expected(0, 300);
-        let agent_dir = dir.path().to_path_buf();
-        let (out, took) = attend_with(
-            dir.path(),
-            &rec,
-            far_ceiling(),
-            flag(true),
-            move || {
-                crate::agent_store::mint_wait_generation(&agent_dir).unwrap();
-            },
-            std::time::Duration::from_secs(60),
-        )
-        .await;
-        assert_eq!(
-            out,
-            HookOutcome::Silent {
-                why: SilentReason::StaleGeneration
-            }
-        );
-        assert!(took < FIVE_M);
-    }
-
     /// A DISARM IN THE LAST WINDOW still reports itself.
     ///
     /// The poll loop checks every 2s, so a takeover that lands
@@ -7133,7 +5317,7 @@ mod tests {
         assert_eq!(
             out,
             HookOutcome::Silent {
-                why: SilentReason::WaiterAlreadyParked
+                why: SilentReason::AttendanceCleared
             },
             "a takeover in the last window is still a takeover, not a live attendance",
         );

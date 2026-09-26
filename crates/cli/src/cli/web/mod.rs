@@ -208,30 +208,12 @@ impl Panes for Zellij {
 /// transcripts are being tailed — empty for the seed, which is
 /// published before anything is tailed.
 pub(crate) fn status_payload(
-    repo: &Path,
+    _repo: &Path,
     snap: &crate::cli::status::StatusSnapshot,
     with: &std::collections::BTreeSet<String>,
 ) -> serde_json::Value {
-    // When each agent last ENDED a turn. A stamp belongs to the
-    // session and incarnation that wrote it: a rebound label or a
-    // reminted wait must not be read against its predecessor's
-    // clock. Whether that means WORKING is the page's to decide —
-    // it needs the newest turn too, and turns arrive on their own
-    // cadence: a long read-only turn changes nothing this status
-    // frame is published for (codex on 90c1740).
-    let ended: std::collections::BTreeMap<String, i64> = snap
-        .agents
-        .iter()
-        .filter_map(|a| {
-            let dir = crate::agent_store::agents_root(repo).join(&a.label);
-            let stamp = crate::agent_store::read_turn_end(&dir)?;
-            (a.session.as_ref().map(|s| s.id.as_str()) == Some(stamp.session.as_str())
-                && stamp.generation == crate::agent_store::read_wait_generation(&dir))
-            .then(|| (a.label.clone(), stamp.at))
-        })
-        .collect();
     serde_json::json!({
-        "facts": crate::cli::status_tui::web_facts(snap, with, &ended),
+        "facts": crate::cli::status_tui::web_facts(snap, with),
         "snapshot": snap.to_json(),
     })
 }

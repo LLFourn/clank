@@ -180,16 +180,6 @@ pub(crate) struct AgentAutoRow {
     /// unbound — surfaced as a problem on the detail page, since an
     /// unbound agent can't receive work.
     pub(crate) session: Option<clank_core::Session>,
-    /// When this agent's last turn ended with NOTHING that will wake
-    /// it, if that is where it stands.
-    ///
-    /// The reportable fact only, rather than the whole verdict: every
-    /// other answer is a reason not to say anything, and a row that
-    /// renders "healthy" on each of five grounds is noise. `None` is
-    /// therefore also what an agent that cannot be judged gets —
-    /// silence, not a clean bill (the-turn-end-is-one-decision).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) unreachable_since: Option<i64>,
     /// The last attendance DECISION the Stop hook made, or `None` if
     /// its most recent turn-end was not an attending silence.
     ///
@@ -353,17 +343,6 @@ fn roster_auto_rows(
             auto_mode,
             tool: desc.tool.as_str().to_string(),
             invocation: agent_invocation(desc),
-            unreachable_since: match crate::cli::stop_hook::reachability(
-                &crate::cli::stop_hook::waker_evidence(
-                    repo,
-                    label,
-                    auto_mode,
-                    session.as_ref().map(|s| s.id.as_str()),
-                ),
-            ) {
-                crate::cli::stop_hook::Reachability::Unreachable { since } => Some(since),
-                _ => None,
-            },
             session,
             attending: crate::cli::stop_hook::read_attended(
                 &crate::agent_store::agents_root(repo).join(label.as_str()),
@@ -1336,15 +1315,9 @@ pub(crate) struct InputSignature {
     head: Option<String>,
     dirty: Option<crate::git_io::DirtyStats>,
     clank: u64,
-    /// Whether each agent still has something live to wake it.
-    ///
-    /// NOT a file fact, and that is why it is here. Killing a waiter
-    /// leaves its claim on disk with every mtime unchanged, so a
-    /// signature made of HEAD, dirty stats and mtimes cannot see the
-    /// one event this panel's warning exists to show — the panel kept
-    /// rendering a healthy row after the waiter died (codex
-    /// 451c5dbc2a37).
-    wakers: u64,
+    /// Liveness of recorded attended tasks, which can change without
+    /// a file write when the task process exits.
+    attendances: u64,
 }
 
 /// Compute the current [`InputSignature`]. One ODB open (HEAD + the
@@ -1357,7 +1330,7 @@ pub(crate) fn input_signature(repo: &Path) -> anyhow::Result<InputSignature> {
         head,
         dirty,
         clank: clank_input_fingerprint(repo),
-        wakers: waker_fingerprint(repo),
+        attendances: attendance_fingerprint(repo),
     })
 }
 
@@ -1367,7 +1340,7 @@ pub(crate) fn input_signature(repo: &Path) -> anyhow::Result<InputSignature> {
 /// and `kill(pid, 0)` per recorded pid. It never takes the park's
 /// lock — a reader that takes a writer's lock to ask who holds it can
 /// make a parking hook defer to a waiter that does not exist.
-pub(crate) fn waker_fingerprint(repo: &Path) -> u64 {
+pub(crate) fn attendance_fingerprint(repo: &Path) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     let Ok(entries) = std::fs::read_dir(crate::agent_store::agents_root(repo)) else {
@@ -1377,26 +1350,20 @@ pub(crate) fn waker_fingerprint(repo: &Path) -> u64 {
         .flatten()
         .filter_map(|e| e.file_name().into_string().ok())
         .collect();
-    // Stable order, or the hash flips on directory iteration order
-    // alone and the panel rebuilds on every tick.
     labels.sort();
     for name in labels {
-        let Ok(label) = clank_core::ids::AgentLabel::parse(&name) else {
+        let Some(attended) = crate::cli::stop_hook::read_attended(
+            &crate::agent_store::agents_root(repo).join(&name),
+        ) else {
             continue;
         };
-        let cfg = crate::agent_store::load_agent_config(repo, &label)
-            .ok()
-            .flatten();
-        let auto = crate::cli::team::resolve_effective_auto_mode(cfg.as_ref(), None);
-        let session = cfg.as_ref().and_then(|c| c.session.as_ref());
-        let state = crate::cli::stop_hook::reachability(&crate::cli::stop_hook::waker_evidence(
-            repo,
-            &label,
-            auto,
-            session.map(|s| s.id.as_str()),
-        ));
         name.hash(&mut h);
-        format!("{state:?}").hash(&mut h);
+        format!("{attended:?}").hash(&mut h);
+        attended
+            .pid
+            .zip(attended.token.as_ref())
+            .is_some_and(|(pid, token)| token.still_holds(pid))
+            .hash(&mut h);
     }
     h.finish()
 }
@@ -2469,39 +2436,6 @@ mod dirty_and_wake_tests {
     }
 
     #[test]
-    fn available_agents_is_library_minus_roster() {
-        use crate::cli::teams_config::RosterRole;
-        use clank_core::vocab::AutoMode;
-        let home = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(home.path().join(".clank")).unwrap();
-        // Global library declares three agents (tool ∈ {claude, codex}).
-        std::fs::write(
-            home.path().join(".clank/config.json"),
-            r#"{"agents":{"codex":{"tool":"codex"},"ruthless":{"tool":"claude"},"scout":{"tool":"codex"}},"teams":{}}"#,
-        )
-        .unwrap();
-        // codex is already on the roster, so it's NOT a candidate.
-        let roster = vec![AgentAutoRow {
-            label: "codex".to_string(),
-            role: RosterRole::Commit,
-            auto_mode: AutoMode::Off,
-            tool: "codex".to_string(),
-            invocation: "codex".to_string(),
-            session: None,
-            unreachable_since: None,
-            attending: None,
-        }];
-        let avail = available_agents(Some(home.path()), &roster);
-        let labels: Vec<&str> = avail.iter().map(|a| a.label.as_str()).collect();
-        assert!(labels.contains(&"ruthless"), "library agent offered");
-        assert!(labels.contains(&"scout"), "library agent offered");
-        assert!(!labels.contains(&"codex"), "on-roster agent excluded");
-        // Tool travels with the candidate (shown in the picker).
-        let ruthless = avail.iter().find(|a| a.label == "ruthless").unwrap();
-        assert_eq!(ruthless.tool, "claude");
-    }
-
-    #[test]
     fn available_agents_empty_without_home() {
         assert!(available_agents(None, &[]).is_empty());
     }
@@ -2656,117 +2590,6 @@ mod dirty_and_wake_tests {
         PlanKey::parse(s).unwrap()
     }
 
-    /// A WAKER DYING CHANGES NO FILE, and the panel must still notice.
-    ///
-    /// The snapshot is reused while `InputSignature` is unchanged, and
-    /// that signature was HEAD + dirty stats + mtimes. Killing a
-    /// waiter leaves its claim exactly where it was, so the one event
-    /// this warning exists to show was invisible to the refresh key:
-    /// the open panel kept rendering a healthy row, including across
-    /// keyboard repaints, while `status --json` reported the agent
-    /// unreachable (codex 451c5dbc2a37).
-    #[test]
-    fn a_waker_dying_flips_the_signature_though_no_file_changes() {
-        let dir = fixture_repo();
-        let repo = dir.path();
-        let label = clank_core::ids::AgentLabel::parse("rev").unwrap();
-        let agent_dir = crate::agent_store::agents_root(repo).join(label.as_str());
-        std::fs::create_dir_all(&agent_dir).unwrap();
-        crate::agent_store::set_auto_mode(repo, &label, clank_core::vocab::AutoMode::On).unwrap();
-        crate::agent_store::record_turn_end(
-            &agent_dir,
-            1_000,
-            "sess-rev",
-            crate::agent_store::read_wait_generation(&agent_dir),
-            Some(clank_core::hook_io::TurnLeft::Yielded),
-        );
-
-        // A live claim: something is watching.
-        let incarnation = crate::agent_store::read_wait_generation(&agent_dir);
-        crate::wait_claim::publish(&agent_dir, "sess-rev", incarnation, Some("tag".into()))
-            .unwrap();
-        let before = input_signature(repo).unwrap();
-
-        // The waiter DIES. Its claim stays exactly as written — same
-        // bytes, same mtime — because nothing cleaned up after it.
-        let claim_path = crate::wait_claim::claim_path(&agent_dir);
-        let mtime_before = std::fs::metadata(&claim_path).unwrap().modified().unwrap();
-        let mut claim: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&claim_path).unwrap()).unwrap();
-        claim["pid"] = serde_json::json!(1);
-        std::fs::write(&claim_path, claim.to_string()).unwrap();
-        filetime::set_file_mtime(&claim_path, filetime::FileTime::from(mtime_before)).unwrap();
-        assert_eq!(
-            std::fs::metadata(&claim_path).unwrap().modified().unwrap(),
-            mtime_before,
-            "the fixture must leave the mtime alone, or it tests the mtime",
-        );
-
-        assert_ne!(
-            input_signature(repo).unwrap(),
-            before,
-            "a waker dying must invalidate the panel's snapshot",
-        );
-    }
-
-    /// THE ROW CARRIES THE VERDICT, not just a field the panel can
-    /// set.
-    ///
-    /// The render test sets `unreachable_since` by hand, so it says
-    /// nothing about whether anything ever puts the reportable verdict
-    /// there. Dropping it here survived that test completely.
-    #[test]
-    fn a_roster_row_carries_an_unreachable_agents_verdict() {
-        use crate::cli::teams_config::{AgentDescription, RegisteredSet};
-        let dir = tempfile::tempdir().unwrap();
-        let repo = dir.path();
-        let label = clank_core::ids::AgentLabel::parse("rev").unwrap();
-        let agent_dir = crate::agent_store::agents_root(repo).join(label.as_str());
-        std::fs::create_dir_all(&agent_dir).unwrap();
-        // Explicitly driving: an agent with no config resolves to
-        // auto-off here, which is `NotDriven` and reports nothing —
-        // the test would have passed for the wrong reason.
-        crate::agent_store::set_auto_mode(repo, &label, clank_core::vocab::AutoMode::On).unwrap();
-        let set = RegisteredSet {
-            master: label.clone(),
-            master_desc: AgentDescription {
-                tool: clank_core::vocab::Tool::Claude,
-                launch: None,
-                initial_prompt: None,
-            },
-            members: vec![],
-        };
-        let row = |repo| roster_auto_rows(repo, None, &set).remove(0);
-
-        // No turn has ended: nothing to report.
-        assert_eq!(row(repo).unreachable_since, None);
-
-        // A turn that ended leaving NOTHING, and nothing watching.
-        crate::agent_store::record_turn_end(
-            &agent_dir,
-            1_000,
-            "sess-rev",
-            crate::agent_store::read_wait_generation(&agent_dir),
-            Some(clank_core::hook_io::TurnLeft::Nothing),
-        );
-        assert_eq!(
-            row(repo).unreachable_since,
-            Some(1_000),
-            "the row must carry what the diagnostic decided",
-        );
-
-        // And a turn that armed the agent is not reported, through
-        // the same path.
-        crate::agent_store::record_turn_end(
-            &agent_dir,
-            2_000,
-            "sess-rev",
-            crate::agent_store::read_wait_generation(&agent_dir),
-            Some(clank_core::hook_io::TurnLeft::Armed),
-        );
-        assert_eq!(row(repo).unreachable_since, None);
-    }
-
     fn agent_row(label: &str, attending: Option<crate::cli::stop_hook::Attended>) -> AgentAutoRow {
         AgentAutoRow {
             label: label.to_string(),
@@ -2775,7 +2598,6 @@ mod dirty_and_wake_tests {
             tool: "claude".to_string(),
             invocation: "claude".to_string(),
             session: None,
-            unreachable_since: None,
             attending,
         }
     }

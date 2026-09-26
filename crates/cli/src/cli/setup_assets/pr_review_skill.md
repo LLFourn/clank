@@ -23,7 +23,7 @@ review GitHub allows per user per PR.
   or does not. Whether a review goes out as APPROVE or REQUEST_CHANGES
   is not yours to decide, and a published review cannot be recalled.
 
-## `draft` wakes — awareness, and nothing else
+## `draft` wakes — read, then ack
 
 While master is parked with a review open, clank re-reads the pending
 review and wakes master with a `draft` item for each change: a comment
@@ -34,7 +34,9 @@ or submitted by the human).
 are integrating against what is actually there, and carry on. Replying
 to the operator's edit, or "fixing" it, is the one thing these wakes
 must not cause — the human editing the draft is the intended workflow,
-not a request for discussion. There is nothing to ack.
+not a request for discussion. Then run `clank events ack <selector>`
+for each draft event. Until you ack it, the event remains in the inbox
+and may wake another wait.
 
 You will see your OWN writes this way too, usually once after a round
 of drafting. That is deliberate: all agents share one `gh` identity

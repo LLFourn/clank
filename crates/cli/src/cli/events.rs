@@ -326,6 +326,30 @@ fn display_id(rows: &[Sourced], s: &Sourced) -> Selector {
 /// (a-command-is-an-event-source-like-any-other). What github alone
 /// has rides `github`, which is the carve-out.
 fn describe(item: &WaitItem) -> String {
+    if let WaitItem::Finished {
+        plan, finalized_at, ..
+    } = item
+    {
+        return format!("finished  {plan}  {finalized_at}");
+    }
+    if let WaitItem::AdHocSettled { sha, gate, .. } = item {
+        return format!("adhoc-settled  {sha}  gate {}", gate.as_str());
+    }
+    if let WaitItem::DraftChanged {
+        pr,
+        comment,
+        path,
+        change,
+        revision,
+        ..
+    } = item
+    {
+        let about = match (comment, path.as_deref()) {
+            (Some(id), Some(path)) => format!("  {path}  comment {id}"),
+            _ => String::new(),
+        };
+        return format!("draft/{}  PR #{pr}{about}  (r{revision})", change.wire());
+    }
     let Some(v) = item.event_view() else {
         return format!("{item:?}");
     };
@@ -627,6 +651,35 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn a_draft_change_uses_the_same_inbox_and_ack_as_other_events() {
+        let dir = tempdir();
+        let key = "draft-pr-7-run-11";
+        let mut log = EventLog::open(&dir, key).unwrap();
+        log.load();
+        let draft = WaitItem::DraftChanged {
+            pr: 7,
+            instance: 11,
+            comment: Some(42),
+            path: Some("src/lib.rs".into()),
+            change: clank_core::pr_review::DraftChange::Added,
+            revision: 1,
+            selector: None,
+        };
+        let seq = log
+            .append_inbox(Transport::Draft, None, Some("draft:7:11:1"), None, &draft)
+            .unwrap();
+        let rows = read_all(&dir).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].row.acked);
+        assert_eq!(rows[0].row.item, draft);
+        assert!(describe(&rows[0].row.item).contains("PR #7"));
+        let target = resolve_ack_target(&dir, &rows, key, seq, &rows[0].row.ident).unwrap();
+        append_ack_target(&target).unwrap();
+        let rows = read_all(&dir).unwrap();
+        assert!(rows[0].row.acked);
     }
 
     /// The selector grammar round-trips, and it is ONE grammar.

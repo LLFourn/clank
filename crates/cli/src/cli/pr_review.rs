@@ -45,6 +45,37 @@ fn draft_horizon_path(repo: &Path, pr: u32, instance: u64) -> PathBuf {
     pr_dir(repo, pr).join(format!("draft-{instance}.json"))
 }
 
+/// Each master has its own observation horizon and event inbox. If the
+/// master changes, its successor starts from the review's empty seed
+/// and sees the current draft rather than inheriting observations
+/// logged only in the predecessor's inbox.
+fn actor_horizon_path(repo: &Path, pr: u32, instance: u64, author: &AgentLabel) -> PathBuf {
+    pr_dir(repo, pr).join(format!("draft-{instance}-{}.json", author.as_str()))
+}
+
+fn load_actor_horizon(repo: &Path, pr: u32, instance: u64, author: &AgentLabel) -> DraftHorizon {
+    std::fs::read_to_string(actor_horizon_path(repo, pr, instance, author))
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_else(|| load_draft_horizon(repo, pr, instance))
+}
+
+fn save_actor_horizon(
+    repo: &Path,
+    pr: u32,
+    instance: u64,
+    author: &AgentLabel,
+    horizon: &DraftHorizon,
+) -> anyhow::Result<()> {
+    let dir = pr_dir(repo, pr);
+    write_into_existing(
+        &actor_horizon_path(repo, pr, instance, author),
+        &dir,
+        serde_json::to_string_pretty(horizon)?.as_bytes(),
+    )
+    .with_context(|| format!("PR #{pr}'s review is gone; its draft horizon was not written"))
+}
+
 /// A horizon that cannot be read is a horizon that has seen nothing:
 /// the next snapshot re-baselines silently. Presenting an unreadable
 /// file as "everything changed" would spam master for a corrupt
@@ -73,19 +104,6 @@ fn save_draft_horizon(
         serde_json::to_string_pretty(horizon)?.as_bytes(),
     )
     .with_context(|| format!("PR #{pr}'s review is gone; its draft horizon was not written"))
-}
-
-/// A wait handed these revisions to master, so the watch stops owing
-/// them. Called on the wait's return path — the only point at which
-/// an item has actually reached master — and only after the sources
-/// are shut down, so nothing is writing the file concurrently.
-pub fn draft_changes_delivered(repo: &Path, pr: u32, instance: u64, revisions: &[u64]) {
-    let mut horizon = load_draft_horizon(repo, pr, instance);
-    horizon.delivered(revisions);
-    if let Err(e) = save_draft_horizon(repo, pr, instance, &horizon) {
-        // The review ended in the meantime; the debt died with it.
-        let _ = e;
-    }
 }
 
 fn reviewer_path(repo: &Path, pr: u32, label: &AgentLabel) -> PathBuf {
@@ -512,68 +530,167 @@ pub async fn run_draft_source(
 ) {
     let reader = crate::cli::github::draft::production_reader(slug);
     let roster = repo.clone();
-    let still_mine = move || draft_watch_belongs_to(&roster, &author);
-    drive_draft_source(&repo, pr, &still_mine, &reader, tx, interval).await
+    let owner = author.clone();
+    let still_mine = move || draft_watch_belongs_to(&roster, &owner);
+    drive_draft_source(&repo, pr, &author, &still_mine, &reader, tx, interval).await
 }
 
-/// `still_mine` answers "is this watch's agent still master". It is a
-/// question rather than a roster, because the answer can change while
-/// a read is in flight and the driver has to ask it again after.
+/// One observer per review run writes the inbox; other waits follow its log.
+/// The lease and WAL belong to the agent, while the snapshot belongs to
+/// this review run. A staged snapshot makes a crash between append and
+/// horizon advance retryable without turning presentation into an ack.
 async fn drive_draft_source<R: crate::cli::github::draft::DraftReader, F: Fn() -> bool>(
     repo: &Path,
     pr: u32,
+    author: &AgentLabel,
     still_mine: &F,
     reader: &R,
     tx: tokio::sync::mpsc::UnboundedSender<clank_core::wait::WaitItem>,
     interval: std::time::Duration,
 ) {
-    // The watch belongs to ONE RUN of the review, not to the wait and
-    // not to the PR. A check that a review merely exists cannot say
-    // that: finish-then-start during an in-flight read would pass it,
-    // and this task would then write the dead run's observation over
-    // the fresh run's baseline (codex 66f7789).
-    let Some(mine) = owning_instance(repo, pr) else {
+    use crate::cli::github::log::{EventLog, IngestLease};
+    let Some(instance) = owning_instance(repo, pr) else {
         return;
     };
-    let mut horizon = load_draft_horizon(repo, pr, mine);
-
-    // Anything an earlier wait produced and could not hand over goes
-    // first. Within THIS process each change is sent once: the debt is
-    // what survives a wait that died, not a reason to repeat itself
-    // tick after tick.
-    if !send_all(pr, mine, &tx, &horizon.owed()) {
-        return;
-    }
-
+    let events_dir = crate::agent_store::agents_root(repo)
+        .join(author.as_str())
+        .join("events");
+    let key = format!("draft-pr-{pr}-run-{instance}");
+    let mut presented = std::collections::HashSet::new();
     loop {
-        let observed = crate::cli::github::draft::observe(reader, pr, &mut horizon).await;
-        // Checked AFTER the read, not before it: the read is where the
-        // review can end underneath us.
-        if owning_instance(repo, pr) != Some(mine) {
+        if owning_instance(repo, pr) != Some(instance) || !still_mine() {
             return;
         }
-        // The watch is MASTER's. A demotion mid-read leaves the review
-        // instance perfectly valid, so the instance check cannot see
-        // it — and two waits writing one run's horizon lose each
-        // other's changes (codex edf3a63).
-        if !still_mine() {
-            return;
-        }
-        match observed {
-            Ok(changes) => {
-                // Written down BEFORE they are sent, so a wait that
-                // dies between the two leaves the debt standing.
-                horizon.owe(&changes);
-                if let Err(e) = save_draft_horizon(repo, pr, mine, &horizon) {
-                    eprintln!("wait: draft watch on #{pr}: {e}");
-                    return;
+        match IngestLease::try_acquire(&events_dir, &key) {
+            Ok(Some(_lease)) => {
+                if let Err(e) = ingest_draft(
+                    repo,
+                    pr,
+                    instance,
+                    author,
+                    still_mine,
+                    reader,
+                    &events_dir,
+                    &key,
+                    &tx,
+                    &mut presented,
+                    interval,
+                )
+                .await
+                {
+                    eprintln!("wait: draft watch on #{pr}: {e:#}");
                 }
-                if !send_all(pr, mine, &tx, &changes) {
-                    return;
-                }
+                return;
             }
-            // A watch that cannot read is not a wait that should end.
-            Err(e) => eprintln!("wait: draft watch on #{pr}: {e}"),
+            Ok(None) => {
+                if let Ok(log) = EventLog::open(&events_dir, &key)
+                    && !present_draft_rows(&log, &key, &tx, &mut presented)
+                {
+                    return;
+                }
+                tokio::time::sleep(interval.min(std::time::Duration::from_secs(1))).await;
+            }
+            Err(e) => {
+                eprintln!("wait: draft watch on #{pr}: {e}");
+                return;
+            }
+        }
+    }
+}
+
+fn present_draft_rows(
+    log: &crate::cli::github::log::EventLog,
+    key: &str,
+    tx: &tokio::sync::mpsc::UnboundedSender<clank_core::wait::WaitItem>,
+    presented: &mut std::collections::HashSet<(u64, String)>,
+) -> bool {
+    let Ok(Some(read)) = log.read_rows() else {
+        return true;
+    };
+    for row in read.rows {
+        if row.acked || !presented.insert((row.seq, row.ident.clone())) {
+            continue;
+        }
+        let mut item = row.item;
+        if let clank_core::wait::WaitItem::DraftChanged { selector, .. } = &mut item {
+            *selector = Some(crate::cli::events::Selector::qualified(key, row.seq).to_string());
+        }
+        if tx.send(item).is_err() {
+            return false;
+        }
+    }
+    true
+}
+
+async fn ingest_draft<R: crate::cli::github::draft::DraftReader, F: Fn() -> bool>(
+    repo: &Path,
+    pr: u32,
+    instance: u64,
+    author: &AgentLabel,
+    still_mine: &F,
+    reader: &R,
+    events_dir: &Path,
+    key: &str,
+    tx: &tokio::sync::mpsc::UnboundedSender<clank_core::wait::WaitItem>,
+    presented: &mut std::collections::HashSet<(u64, String)>,
+    interval: std::time::Duration,
+) -> anyhow::Result<()> {
+    use crate::cli::github::log::{EventLog, Transport};
+    let mut log = EventLog::open(events_dir, key)?;
+    log.load();
+    let mut horizon = load_actor_horizon(repo, pr, instance, author);
+    loop {
+        if owning_instance(repo, pr) != Some(instance) || !still_mine() {
+            return Ok(());
+        }
+        if horizon.pending().is_none() {
+            let mut observed = horizon.clone();
+            match crate::cli::github::draft::observe(reader, pr, &mut observed).await {
+                Ok(changes) => {
+                    if owning_instance(repo, pr) != Some(instance) || !still_mine() {
+                        return Ok(());
+                    }
+                    horizon.stage(&observed, changes);
+                    save_actor_horizon(repo, pr, instance, author, &horizon)?;
+                }
+                Err(e) => eprintln!("wait: draft watch on #{pr}: {e}"),
+            }
+        }
+        if let Some(batch) = horizon.pending() {
+            let existing: std::collections::HashSet<_> = log
+                .read_rows()?
+                .into_iter()
+                .flat_map(|r| r.rows)
+                .filter_map(|r| r.action_key)
+                .collect();
+            for change in &batch.changes {
+                if owning_instance(repo, pr) != Some(instance) || !still_mine() {
+                    return Ok(());
+                }
+                let action = format!(
+                    "draft:{pr}:{instance}:{}:{}",
+                    author.as_str(),
+                    change.revision
+                );
+                if existing.contains(&action) {
+                    continue;
+                }
+                let item = clank_core::wait::WaitItem::DraftChanged {
+                    pr,
+                    instance,
+                    comment: change.comment,
+                    path: change.path.clone(),
+                    change: change.change,
+                    revision: change.revision,
+                    selector: None,
+                };
+                log.append_inbox(Transport::Draft, None, Some(&action), None, &item)?;
+            }
+            horizon.commit_pending();
+            save_actor_horizon(repo, pr, instance, author, &horizon)?;
+        }
+        if !present_draft_rows(&log, key, tx, presented) {
+            return Ok(());
         }
         tokio::time::sleep(interval).await;
     }
@@ -593,37 +710,11 @@ pub fn draft_watch_belongs_to(repo: &Path, author: &AgentLabel) -> bool {
 /// The instance token of the review this watch belongs to, or `None`
 /// when there is no review or it predates instance tokens — in which
 /// case the watch owns nothing and does not run.
-fn owning_instance(repo: &Path, pr: u32) -> Option<u64> {
+pub(crate) fn owning_instance(repo: &Path, pr: u32) -> Option<u64> {
     match load_state(repo, pr) {
         Ok(s) if s.instance != 0 => Some(s.instance),
         _ => None,
     }
-}
-
-/// `false` when the channel is gone, which ends the watch with the
-/// debt intact.
-fn send_all(
-    pr: u32,
-    instance: u64,
-    tx: &tokio::sync::mpsc::UnboundedSender<clank_core::wait::WaitItem>,
-    changes: &[crate::cli::github::draft::DraftTransition],
-) -> bool {
-    for t in changes.iter().cloned() {
-        if tx
-            .send(clank_core::wait::WaitItem::DraftChanged {
-                pr,
-                instance,
-                comment: t.comment,
-                path: t.path,
-                change: t.change,
-                revision: t.revision,
-            })
-            .is_err()
-        {
-            return false;
-        }
-    }
-    true
 }
 
 /// Record a reviewer's verdict for the current round.
@@ -1472,145 +1563,231 @@ mod tests {
         );
     }
 
-    /// A draft scripted tick by tick; exhausted -> the last answer
-    /// repeats, which is what an unchanging draft looks like.
-    struct Scripted(
-        std::sync::Mutex<std::collections::VecDeque<anyhow::Result<Vec<&'static str>>>>,
-    );
+    #[derive(Clone)]
+    struct MutableDraft {
+        body: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    }
 
-    impl crate::cli::github::draft::DraftReader for Scripted {
+    impl crate::cli::github::draft::DraftReader for MutableDraft {
         async fn pending_review(&self, _: u32) -> anyhow::Result<Option<u64>> {
-            Ok(Some(9))
+            Ok(self.body.lock().unwrap().as_ref().map(|_| 9))
         }
         async fn read(
             &self,
             _: u32,
             _: u64,
         ) -> anyhow::Result<Vec<crate::cli::github::draft::DraftComment>> {
-            let step = self
-                .0
+            Ok(self
+                .body
                 .lock()
                 .unwrap()
-                .pop_front()
-                .unwrap_or_else(|| Ok(vec!["last"]));
-            Ok(step?
-                .into_iter()
+                .iter()
                 .map(|body| crate::cli::github::draft::DraftComment {
                     id: 1,
                     path: "f.rs".into(),
-                    body: body.into(),
+                    body: body.clone(),
                     updated_at: "T".into(),
                 })
                 .collect())
         }
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn the_watch_delivers_each_change_once_and_remembers_it_across_waits() {
-        let (repo, run) = scratch(7);
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let reader = Scripted(std::sync::Mutex::new(
-            [
-                Ok(vec!["drafted"]),
-                Ok(vec!["the operator edited it"]),
-                Err(anyhow::anyhow!("github is down")),
-                Ok(vec!["and again"]),
-            ]
-            .into(),
-        ));
+    async fn next_draft(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<clank_core::wait::WaitItem>,
+    ) -> clank_core::wait::WaitItem {
+        tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap()
+    }
 
-        let task = tokio::spawn({
-            let repo = repo.clone();
-            async move {
-                // The task is aborted below, exactly as the wait does
-                // on every return path.
-                let _ = tokio::time::timeout(
-                    std::time::Duration::from_secs(600),
-                    drive_draft_source(
-                        &repo,
-                        7,
-                        &|| true,
-                        &reader,
-                        tx,
-                        std::time::Duration::from_secs(60),
-                    ),
+    #[tokio::test]
+    async fn concurrent_draft_waits_share_acked_events_and_a_new_run_is_separate() {
+        use crate::cli::github::log::EventLog;
+        let (repo, run) = scratch(7);
+        let author = AgentLabel::parse("master").unwrap();
+        let events = crate::agent_store::agents_root(&repo)
+            .join(author.as_str())
+            .join("events");
+        let key = format!("draft-pr-7-run-{run}");
+        let draft = MutableDraft {
+            body: std::sync::Arc::new(std::sync::Mutex::new(Some("one".into()))),
+        };
+        let spawn = |repo: PathBuf, draft: MutableDraft| {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let task = tokio::spawn(async move {
+                let author = AgentLabel::parse("master").unwrap();
+                drive_draft_source(
+                    &repo,
+                    7,
+                    &author,
+                    &|| true,
+                    &draft,
+                    tx,
+                    std::time::Duration::from_millis(20),
                 )
                 .await;
-            }
-        });
-        tokio::time::sleep(std::time::Duration::from_secs(200)).await;
-        task.abort();
-
-        let mut seen = Vec::new();
-        while let Ok(item) = rx.try_recv() {
-            match item {
-                clank_core::wait::WaitItem::DraftChanged { revision, .. } => seen.push(revision),
-                other => panic!("unexpected {other:?}"),
-            }
-        }
+            });
+            (task, rx)
+        };
+        let (first, mut a) = spawn(repo.clone(), draft.clone());
+        let (second, mut b) = spawn(repo.clone(), draft.clone());
+        let one_a = next_draft(&mut a).await;
+        let one_b = next_draft(&mut b).await;
+        assert_eq!(one_a, one_b, "both waits see the same unacked inbox row");
+        assert!(matches!(
+            one_a,
+            clank_core::wait::WaitItem::DraftChanged { revision: 1, .. }
+        ));
+        first.abort();
+        second.abort();
+        let _ = first.await;
+        let _ = second.await;
+        let mut log = EventLog::open(&events, &key).unwrap();
+        log.load();
+        let rows = log.read_rows().unwrap().unwrap().rows;
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].acked);
+        let (again, mut c) = spawn(repo.clone(), draft.clone());
         assert_eq!(
-            seen,
-            [1, 2, 3],
-            "the review was anchored empty, so master's own first comment IS a change; \
-             the failed read reports nothing; and each change is delivered once"
+            next_draft(&mut c).await,
+            one_a,
+            "a printed event remains pending"
         );
-
-        // The horizon outlived the watch, so the next wait picks up
-        // where this one left off. A horizon that was never saved
-        // would ALSO be silent here — it would baseline afresh — so
-        // the revision is what tells the two apart.
-        let mut next = load_draft_horizon(&repo, 7, run);
+        again.abort();
+        let _ = again.await;
+        log.append_ack(rows[0].seq).unwrap();
+        let (after_ack, mut d) = spawn(repo.clone(), draft.clone());
         assert!(
-            next.absorb_snapshot(9, &[(1, "and again")]).is_empty(),
-            "what this wait already reported is not reported again"
+            tokio::time::timeout(std::time::Duration::from_millis(100), d.recv())
+                .await
+                .is_err(),
+            "explicit ack stops the old wake"
         );
-        assert_eq!(
-            next.absorb_snapshot(9, &[(1, "something new")]),
-            [4],
-            "and the count continues, which a re-baselined horizon could not do"
+        *draft.body.lock().unwrap() = Some("edited".into());
+        assert!(matches!(
+            next_draft(&mut d).await,
+            clank_core::wait::WaitItem::DraftChanged {
+                revision: 2,
+                change: clank_core::pr_review::DraftChange::Edited,
+                ..
+            }
+        ));
+        *draft.body.lock().unwrap() = None;
+        assert!(matches!(
+            next_draft(&mut d).await,
+            clank_core::wait::WaitItem::DraftChanged {
+                change: clank_core::pr_review::DraftChange::Gone,
+                ..
+            }
+        ));
+        after_ack.abort();
+        let _ = after_ack.await;
+        let new_run = restart(&repo, 7);
+        assert_ne!(new_run, run);
+        assert_ne!(format!("draft-pr-7-run-{new_run}"), key);
+        assert!(
+            load_actor_horizon(&repo, 7, new_run, &author)
+                .pending()
+                .is_none()
         );
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn a_change_nobody_received_is_not_spent() {
-        // The ordering — deliver, THEN persist — only shows itself
-        // when delivery does not happen. Dropping the receiver is the
-        // one way a test can make that true.
+    #[tokio::test]
+    async fn staged_draft_ingest_survives_a_restart_without_duplicate_rows() {
+        use crate::cli::github::log::{EventLog, Transport};
         let (repo, run) = scratch(7);
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let reader = Scripted(std::sync::Mutex::new(
-            [Ok(vec!["drafted"]), Ok(vec!["edited"])].into(),
-        ));
-
-        // Baseline while someone is listening.
+        let author = AgentLabel::parse("master").unwrap();
+        let events = crate::agent_store::agents_root(&repo)
+            .join(author.as_str())
+            .join("events");
+        let key = format!("draft-pr-7-run-{run}");
+        let reader = MutableDraft {
+            body: std::sync::Arc::new(std::sync::Mutex::new(Some("one".into()))),
+        };
+        let mut horizon = load_actor_horizon(&repo, 7, run, &author);
+        let mut observed = horizon.clone();
+        let changes = crate::cli::github::draft::observe(&reader, 7, &mut observed)
+            .await
+            .unwrap();
+        assert_eq!(changes.len(), 1);
+        horizon.stage(&observed, changes);
+        save_actor_horizon(&repo, 7, run, &author, &horizon).unwrap();
+        // A process died after writing the stage but before the WAL.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let task = tokio::spawn({
             let repo = repo.clone();
+            let reader = reader.clone();
             async move {
-                let _ = tokio::time::timeout(
-                    std::time::Duration::from_secs(600),
-                    drive_draft_source(
-                        &repo,
-                        7,
-                        &|| true,
-                        &reader,
-                        tx,
-                        std::time::Duration::from_secs(60),
-                    ),
+                let author = AgentLabel::parse("master").unwrap();
+                drive_draft_source(
+                    &repo,
+                    7,
+                    &author,
+                    &|| true,
+                    &reader,
+                    tx,
+                    std::time::Duration::from_millis(20),
                 )
                 .await;
             }
         });
-        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-        drop(rx);
-        tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+        let item = next_draft(&mut rx).await;
         task.abort();
-
-        let next = load_draft_horizon(&repo, 7, run);
+        let _ = task.await;
+        assert!(matches!(
+            item,
+            clank_core::wait::WaitItem::DraftChanged { revision: 1, .. }
+        ));
+        assert!(
+            load_actor_horizon(&repo, 7, run, &author)
+                .pending()
+                .is_none()
+        );
+        let mut log = EventLog::open(&events, &key).unwrap();
+        log.load();
+        let rows = log.read_rows().unwrap().unwrap().rows;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].transport, Transport::Draft);
+        // A second crash after the append but before stage commit
+        // retries the batch and sees its stable action key.
+        let mut staged = DraftHorizon::started();
+        let mut observed = staged.clone();
+        let changes = crate::cli::github::draft::observe(&reader, 7, &mut observed)
+            .await
+            .unwrap();
+        staged.stage(&observed, changes);
+        save_actor_horizon(&repo, 7, run, &author, &staged).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn({
+            let repo = repo.clone();
+            let reader = reader.clone();
+            async move {
+                let author = AgentLabel::parse("master").unwrap();
+                drive_draft_source(
+                    &repo,
+                    7,
+                    &author,
+                    &|| true,
+                    &reader,
+                    tx,
+                    std::time::Duration::from_millis(20),
+                )
+                .await;
+            }
+        });
+        assert_eq!(next_draft(&mut rx).await, item);
+        task.abort();
+        let _ = task.await;
         assert_eq!(
-            next.owed().iter().map(|t| t.revision).collect::<Vec<_>>(),
-            [1, 2],
-            "nothing here ever reached master — no wait returned — so both changes are \
-             still owed, including the one produced after the receiver went away"
+            EventLog::open(&events, &key)
+                .unwrap()
+                .read_rows()
+                .unwrap()
+                .unwrap()
+                .rows
+                .len(),
+            1
         );
     }
 
@@ -1628,6 +1805,7 @@ mod tests {
             drive_draft_source(
                 repo,
                 pr,
+                &AgentLabel::parse("master").unwrap(),
                 &|| true,
                 reader,
                 tx,
@@ -1671,87 +1849,6 @@ mod tests {
         save_state(repo, pr, &fresh).unwrap();
         save_draft_horizon(repo, pr, fresh.instance, &DraftHorizon::started()).unwrap();
         fresh.instance
-    }
-
-    #[test]
-    fn an_old_waits_acknowledgement_cannot_spend_a_new_runs_change() {
-        // Revisions restart at 1 for each run, so acknowledging by
-        // `(pr, revision)` alone lets run A's late acknowledgement
-        // delete run B's revision 1 — a change nobody has seen
-        // (codex 96dbec8).
-        let (repo, a) = scratch(7);
-        let mut horizon_a = load_draft_horizon(&repo, 7, a);
-        assert_eq!(horizon_a.absorb_snapshot(9, &[(1, "run A's comment")]), [1]);
-        save_draft_horizon(&repo, 7, a, &horizon_a).unwrap();
-
-        let b = restart(&repo, 7);
-        let mut horizon_b = load_draft_horizon(&repo, 7, b);
-        assert_eq!(
-            horizon_b.absorb_snapshot(9, &[(1, "run B's comment")]),
-            [1],
-            "run B's first change is revision 1 as well"
-        );
-        save_draft_horizon(&repo, 7, b, &horizon_b).unwrap();
-
-        // Run A's wait finally prints, and acknowledges ITS revision 1.
-        draft_changes_delivered(&repo, 7, a, &[1]);
-
-        assert_eq!(
-            load_draft_horizon(&repo, 7, b)
-                .owed()
-                .iter()
-                .map(|t| t.revision)
-                .collect::<Vec<_>>(),
-            [1],
-            "run B still owes its own change, which nobody has seen"
-        );
-        assert!(
-            load_draft_horizon(&repo, 7, a).owed().is_empty(),
-            "and run A's own debt is what was settled"
-        );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_demotion_mid_read_neither_wakes_nor_spends_the_change() {
-        // A demotion leaves the review instance perfectly valid, so
-        // the instance check cannot see it. Two waits writing one
-        // run's horizon lose each other's changes, and an item
-        // returned by the demoted agent would be ACKED — settling a
-        // debt owed to whoever is master now (codex edf3a63).
-        let (repo, run) = scratch(7);
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let demoted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-
-        let racer = {
-            let demoted = demoted.clone();
-            move || demoted.store(true, std::sync::atomic::Ordering::SeqCst)
-        };
-        let still_mine = {
-            let demoted = demoted.clone();
-            move || !demoted.load(std::sync::atomic::Ordering::SeqCst)
-        };
-        tokio::time::timeout(
-            std::time::Duration::from_secs(600),
-            drive_draft_source(
-                &repo,
-                7,
-                &still_mine,
-                &RacingRead(racer),
-                tx,
-                std::time::Duration::from_secs(60),
-            ),
-        )
-        .await
-        .expect("a watch that is no longer master's must stop");
-
-        assert!(
-            rx.try_recv().is_err(),
-            "the demoted agent does not wake with a change it no longer owns"
-        );
-        assert!(
-            load_draft_horizon(&repo, 7, run).owed().is_empty(),
-            "and it wrote nothing, so the change is still there for the real master to find"
-        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -1807,45 +1904,6 @@ mod tests {
             !draft_horizon_path(&repo, 7, run).exists()
                 || load_draft_horizon(&repo, 7, run) != load_draft_horizon(&repo, 7, b),
             "and whatever the dead run wrote, it wrote to its OWN file"
-        );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn the_watch_ends_with_the_review_and_leaves_no_husk() {
-        // Finishing or aborting while master is parked need not
-        // produce another item, so the wait stays parked and nothing
-        // else would stop this (codex 29431d9).
-        let (repo, _run) = scratch(7);
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let reader = Scripted(std::sync::Mutex::new([Ok(vec!["drafted"])].into()));
-
-        let task = tokio::spawn({
-            let repo = repo.clone();
-            async move {
-                drive_draft_source(
-                    &repo,
-                    7,
-                    &|| true,
-                    &reader,
-                    tx,
-                    std::time::Duration::from_secs(60),
-                )
-                .await
-            }
-        });
-        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-
-        std::fs::remove_dir_all(pr_dir(&repo, 7)).unwrap();
-        tokio::time::sleep(std::time::Duration::from_secs(120)).await;
-
-        assert!(
-            task.is_finished(),
-            "the watch stops with the review that owns it"
-        );
-        assert!(
-            !pr_dir(&repo, 7).exists(),
-            "and no read landing late rebuilds the scratch directory — a husk with a \
-             draft.json and no pr.json makes `start` refuse to restart that PR"
         );
     }
 

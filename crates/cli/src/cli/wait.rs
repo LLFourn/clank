@@ -6,19 +6,13 @@
 //! not orthogonal to who it is.
 //!
 //! The roster's master watches for plans where the gate has moved on
-//! without master, and additionally receives `Finished` notices when
-//! a watched plan transitions into `finished_plans` (the notice is
-//! what fires the `plan_finalized` hook). A reviewer watches for
-//! plans whose latest reviewable commit needs its opinion — and ONLY
-//! that: a finish is a notification with no reviewer action, so it
-//! never wakes a reviewer (`finish-does-not-wake-reviewers`).
+//! without master. A reviewer watches for plans whose latest reviewable
+//! commit needs its opinion.
 //!
 //! `wait` folds the repo, runs `RepoState::derive_status` (which
 //! threads `wait::compute_gate` over every plan), filters the
 //! result through `RepoState::work_for` for the agent's
-//! perspective, then — for master only — concatenates any
-//! `detect_finished` notices from a startup snapshot. When the
-//! initial fold finds at least one item it prints it and exits;
+//! perspective. When the initial fold finds at least one item it prints it and exits;
 //! otherwise it watches the filesystem for changes that could
 //! plausibly flip the projection and refolds on each debounced
 //! event.
@@ -30,197 +24,118 @@ use std::time::Duration;
 
 use super::{WaitArgs, resolve_repo};
 use crate::cli::block::scan_blocks;
-use crate::hook_config::{self, HookFiring};
 use crate::lifecycle::{AgentLabel, CommitSha, PlanKey};
 use clank_core::Role;
-use clank_core::vocab::HookEvent;
-use clank_core::wait::{StartupSnapshot, WaitItem, detect_finished};
+use clank_core::wait::WaitItem;
 
-/// The incarnation that started this wait no longer owns the label.
-/// `run` turns this into a control envelope for a hook-owned wait;
-/// other callers simply stop without claiming to have delivered work.
-#[derive(Debug, thiserror::Error)]
-#[error("wait incarnation was superseded")]
-struct WaitSuperseded;
+/// A wait launched inside a harness is allowed to emit only while that
+/// exact tool/session still holds the label. A terminal wait with no
+/// session remains a direct, unclaimed observer.
+#[derive(Debug, Clone)]
+struct WaitBinding(Option<(clank_core::Tool, clank_core::SessionId)>);
 
 #[derive(Debug, thiserror::Error)]
-#[error("another wait is already parked for this session")]
-struct WaitAlreadyParked;
+#[error("{0}")]
+struct WaitSuperseded(String);
 
-fn ensure_current(agent_dir: &Path, generation: u64) -> anyhow::Result<()> {
-    if crate::agent_store::read_wait_generation(agent_dir) != generation {
-        return Err(WaitSuperseded.into());
+#[derive(Debug, thiserror::Error)]
+#[error("wait --peek found no work for this agent")]
+pub(crate) struct WaitNoWork;
+
+impl WaitBinding {
+    fn capture(args: &WaitArgs) -> anyhow::Result<Self> {
+        let detected = crate::agent_env::detect_session_from_env()?;
+        if let Some(expected) = args.deliver_to_session.as_deref() {
+            let Some((_, session)) = detected.as_ref() else {
+                return Err(WaitSuperseded(format!(
+                    "wait cannot deliver to session {expected}: no session was detected in this process"
+                ))
+                .into());
+            };
+            if session.as_str() != expected {
+                return Err(WaitSuperseded(format!(
+                    "wait cannot deliver to session {expected}: this process belongs to session {}",
+                    session.as_str()
+                ))
+                .into());
+            }
+        }
+        Ok(Self(detected))
     }
-    Ok(())
-}
 
-fn firings_from_items(items: &[WaitItem]) -> Vec<HookFiring> {
-    items
-        .iter()
-        .filter_map(|item| match item {
-            WaitItem::Master {
-                plan,
-                sha,
-                next,
-                gate,
-                ..
-            } => Some(HookFiring {
-                event: HookEvent::MasterWork,
-                plan: plan.clone(),
-                sha: sha.clone(),
-                gate: Some(*gate),
-                next: Some(format!("{next:?}").to_lowercase()),
-            }),
-            WaitItem::Reviewer { plan, sha, .. } => Some(HookFiring {
-                event: HookEvent::ReviewerWork,
-                plan: plan.clone(),
-                sha: sha.clone(),
-                gate: None,
-                next: None,
-            }),
-            WaitItem::Finished { plan, finalized_at } => Some(HookFiring {
-                event: HookEvent::PlanFinalized,
-                plan: plan.clone(),
-                sha: finalized_at.clone(),
-                gate: None,
-                next: None,
-            }),
-            // A broken HEAD tag proactively pulls master back to amend
-            // (commit-tag-fixup-is-first-class-state) — previously it
-            // yielded no firing, so the bad commit woke the REVIEWER
-            // while the master correction sat passive. Keyed to the
-            // first real plan the violation implicates (the touched
-            // plan, then a named-but-untouched one); the pure
-            // unknown-tag case names no real plan, so it has no hook
-            // key and stays a self-poll pull.
-            WaitItem::FixCommitTag { sha, violation } => violation
-                .untagged_touched
-                .iter()
-                .chain(violation.extra_named.iter())
-                .next()
-                .map(|plan| HookFiring {
-                    event: HookEvent::MasterWork,
-                    plan: plan.clone(),
-                    sha: sha.clone(),
-                    gate: None,
-                    next: Some("fix-commit-tag".to_string()),
-                }),
-            // Multiple open plans proactively pull master back, like
-            // the tag correction: keyed to the plan in progress (the
-            // one whose flow the overlap interrupts).
-            WaitItem::MultiplePlansOpen {
-                in_progress, sha, ..
-            } => Some(HookFiring {
-                event: HookEvent::MasterWork,
-                plan: in_progress.clone(),
-                sha: sha.clone(),
-                gate: None,
-                next: Some("multiple-plans-open".to_string()),
-            }),
-            WaitItem::Idle { .. }
-            | WaitItem::AdHocReview { .. }
-            | WaitItem::AdHocRevise { .. }
-            // Settle notices surface via the wait/stop-hook pull like
-            // the other ad-hoc items — HookFiring is plan-keyed and
-            // ad-hoc commits have no plan.
-            | WaitItem::AdHocSettled { .. }
-            | WaitItem::PromoteFromQueue { .. }
-            | WaitItem::Message { .. }
-            | WaitItem::Blocked { .. }
-            | WaitItem::Unblocked { .. }
-            // Observer items never fire hooks: the observer path is
-            // side-effect-free by contract (wait-for-observer-mode)
-            // and never calls firings anyway.
-            | WaitItem::ForCommit { .. }
-            | WaitItem::ForFinished { .. }
-            | WaitItem::ForBlocked { .. }
-            // External wake sources fire no lifecycle hooks (MVP —
-            // extra-wait-events).
-            | WaitItem::GithubEvent { .. }
-            | WaitItem::CommandEvent { .. }
-            // Awareness is not an obligation: nothing is owed, so
-            // there is no lifecycle moment to fire on.
-            | WaitItem::DraftChanged { .. }
-            // PR-review items surface via the stop-hook's `clank wait`
-            // pull (like ad-hoc/queue items) rather than a dedicated
-            // proactive OS hook — HookFiring is plan+sha keyed and PR
-            // items are pr+round keyed.
-            | WaitItem::PrReviewer { .. }
-            | WaitItem::PrMaster { .. } => None,
-        })
-        .collect()
+    fn ensure_current(&self, repo: &Path, author: &AgentLabel) -> anyhow::Result<()> {
+        let Some((tool, session)) = &self.0 else {
+            return Ok(());
+        };
+        let bound = crate::agent_store::binding_matches(repo, author, *tool, session.as_str());
+        if !bound {
+            let current = crate::agent_store::load_agent_config(repo, author)
+                .ok()
+                .flatten()
+                .and_then(|cfg| cfg.session)
+                .map(|s| format!("{} session {}", s.tool.as_str(), s.id.as_str()))
+                .unwrap_or_else(|| "no current session".into());
+            return Err(WaitSuperseded(format!(
+                "wait for {author} cannot continue: this {} session {} does not own the label ({current}); run `clank as {author}` inside the intended session",
+                tool.as_str(),
+                session.as_str(),
+            ))
+            .into());
+        }
+        Ok(())
+    }
 }
 
 pub async fn run(args: WaitArgs) -> anyhow::Result<()> {
     let json = args.json;
+    let peek = args.peek;
     let repo = resolve_repo(args.repo.as_deref())?;
+    let boundary = if args.r#for.is_some() {
+        None
+    } else {
+        let author = match args.author.as_deref() {
+            Some(raw) => AgentLabel::parse(raw)?,
+            None => crate::agent_env::resolve_identity_from_env(&repo)?,
+        };
+        let binding = match WaitBinding::capture(&args) {
+            Ok(binding) => binding,
+            Err(e) if e.is::<WaitSuperseded>() => return superseded_error(e, json),
+            Err(e) => return Err(e),
+        };
+        Some((author, binding))
+    };
     let result = match items(args).await {
-        Err(e) if e.is::<WaitSuperseded>() => {
-            if json {
-                println!(
-                    "{}",
-                    serde_json::to_string(&SupersededEnvelope {
-                        items: [],
-                        superseded: true,
-                    })?
-                );
-            }
-            return Ok(());
-        }
-        Err(e) if e.is::<WaitAlreadyParked>() => {
-            if json {
-                println!(
-                    "{}",
-                    serde_json::json!({"items": [], "already_parked": true})
-                );
-            }
-            return Ok(());
-        }
+        Err(e) if e.is::<WaitSuperseded>() => return superseded_error(e, json),
         other => other?,
     };
     if let Some(items) = result {
+        if let Some((author, binding)) = boundary {
+            if let Err(e) = binding.ensure_current(&repo, &author) {
+                return superseded_error(e, json);
+            }
+        }
+        if items.is_empty() {
+            if peek {
+                return Err(WaitNoWork.into());
+            }
+            anyhow::bail!("wait ended without work; the waiter returned an empty result");
+        }
         emit(&items, json);
-        // Printed is delivered. A channel send is not: it succeeds
-        // while the receiver is alive, and this wait could still have
-        // failed or been cancelled between the send and here, leaving
-        // the watch's only copy of a change gone (codex 29431d9). So
-        // the draft watch is told AFTER the items are out, and only
-        // then stops owing them.
-        mark_drafts_delivered(&repo, &items);
     }
     Ok(())
 }
 
-/// Tell each PR review's draft watch which of its changes reached
-/// master. The sources are already shut down by the time `items`
-/// returns, so nothing else is writing those files.
-fn mark_drafts_delivered(repo: &std::path::Path, items: &[WaitItem]) {
-    for ((pr, instance), revisions) in deliveries(items) {
-        crate::cli::pr_review::draft_changes_delivered(repo, pr, instance, &revisions);
+fn superseded_error(error: anyhow::Error, json: bool) -> anyhow::Result<()> {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string(&SupersededEnvelope {
+                items: [],
+                superseded: true,
+            })?
+        );
     }
-}
-
-/// Which revisions of which review RUN this wait handed over.
-///
-/// Keyed by run, not by PR: revisions restart at 1 for each run, so
-/// acknowledging by `(pr, revision)` lets a wait that started before a
-/// restart settle a debt belonging to the run that replaced it — a
-/// change nobody has seen (codex 96dbec8).
-fn deliveries(items: &[WaitItem]) -> std::collections::BTreeMap<(u32, u64), Vec<u64>> {
-    let mut owed: std::collections::BTreeMap<(u32, u64), Vec<u64>> =
-        std::collections::BTreeMap::new();
-    for item in items {
-        if let WaitItem::DraftChanged {
-            pr,
-            instance,
-            revision,
-            ..
-        } = item
-        {
-            owed.entry((*pr, *instance)).or_default().push(*revision);
-        }
-    }
-    owed
+    Err(error)
 }
 
 /// What this wait wakes with — the same items `run` prints — or `None`
@@ -268,30 +183,8 @@ pub async fn items(args: WaitArgs) -> anyhow::Result<Option<Vec<WaitItem>>> {
     // is fail-soft there (wait-reloads-config-per-refold).
     let mut inputs = derive_wait_inputs(&repo, &author)?;
 
-    // SAY SO. The stop hook decides whether to yield a turn to a
-    // background wait, and the harness's task list is not evidence —
-    // its own doc says it names tasks that already finished, so a
-    // completed wait silenced every later turn-end permanently. Clank
-    // started this process, so this process can publish what it is
-    // (the-turn-end-is-one-decision). Dropped on exit; a wait that
-    // dies leaves a record whose birth check fails, which reads the
-    // same.
-    let agent_dir = crate::agent_store::agents_root(&repo).join(author.as_str());
-    let generation = args
-        .expected_generation
-        .unwrap_or_else(|| crate::agent_store::read_wait_generation(&agent_dir));
-    let _claim = WaitClaimGuard::acquire(
-        &agent_dir,
-        &author,
-        args.peek,
-        args.tag.clone(),
-        generation,
-        args.deliver_to_session.as_deref(),
-    )
-    .await?;
-    if !args.peek {
-        ensure_current(&agent_dir, generation)?;
-    }
+    let binding = WaitBinding::capture(&args)?;
+    binding.ensure_current(&repo, &author)?;
 
     let policy = if args.no_cache {
         crate::rebuild::CachePolicy::Bypass
@@ -301,12 +194,8 @@ pub async fn items(args: WaitArgs) -> anyhow::Result<Option<Vec<WaitItem>>> {
     let initial_state = crate::rebuild::rebuild_repo_with_policy(&repo, policy)
         .await
         .map_err(|e| anyhow::anyhow!("failed to fold repo `{}`: {e}", repo.display()))?;
-    if !args.peek {
-        ensure_current(&agent_dir, generation)?;
-    }
+    binding.ensure_current(&repo, &author)?;
 
-    // Derived BEFORE the snapshot so it can capture arm-time ad-hoc
-    // gate states (detect_adhoc_settled needs "pending at arm").
     // A broken HEAD tag is a derived, dominating state
     // (commit-tag-fixup-is-first-class-state): derive_status yields
     // the correction and work_for routes master to the FixCommitTag
@@ -319,59 +208,37 @@ pub async fn items(args: WaitArgs) -> anyhow::Result<Option<Vec<WaitItem>>> {
             .fold
             .derive_status(&reviews, &inputs.work_policy, head.as_ref())
     };
-    let snapshot = StartupSnapshot::capture(&initial_state.fold, &initial_status.ad_hoc);
+    let initial_lifecycle = if inputs.role == Role::Master {
+        sync_lifecycle_events(&repo, &author, &initial_status, &initial_state.fold)?
+    } else {
+        Vec::new()
+    };
 
-    let initial_suppress_all;
     {
         let br = check_blocks(&repo, &author);
-        initial_suppress_all = br.suppress_all;
         let has_answer = br
             .items
             .iter()
             .any(|i| matches!(i, WaitItem::Unblocked { .. }));
         if has_answer {
-            if !args.peek {
-                ensure_current(&agent_dir, generation)?;
-            }
+            binding.ensure_current(&repo, &author)?;
             return Ok(Some(br.items));
         }
 
         if !br.suppress_all {
-            let items = items_for(
+            let mut items = items_for(
                 &repo,
                 &author,
                 &inputs,
                 &initial_status,
                 &initial_state.fold,
-                &snapshot,
             );
+            items.extend(initial_lifecycle);
             if !items.is_empty() {
-                if !args.peek {
-                    ensure_current(&agent_dir, generation)?;
-                }
-                // `--peek` is a pure probe: report work-presence, fire NO
-                // lifecycle hooks (the Stop hook may peek on every stop).
-                if !args.peek {
-                    for firing in &firings_from_items(&items) {
-                        hook_config::run_hook(&repo, &inputs.hook_config, firing);
-                    }
-                }
+                binding.ensure_current(&repo, &author)?;
                 return Ok(Some(items));
             }
         } // !suppress_all
-    }
-
-    // A master with nothing active and nothing queued is idle. A pending
-    // block parks this agent entirely (`initial_suppress_all`), so
-    // reaching here means there is no block to work around. The idle
-    // hook is a side effect; `--peek` must not fire it.
-    if !initial_suppress_all
-        && !args.peek
-        && inputs.role == Role::Master
-        && initial_state.fold.plans.is_empty()
-    {
-        ensure_current(&agent_dir, generation)?;
-        hook_config::run_idle_hook(&repo, &inputs.hook_config);
     }
 
     // `--peek`: the initial pass found no actionable work → report empty
@@ -451,7 +318,7 @@ pub async fn items(args: WaitArgs) -> anyhow::Result<Option<Vec<WaitItem>>> {
             }
             // The same beat that notices repo changes also notices a
             // new incarnation. No second hook-side poller is needed.
-            ensure_current(&agent_dir, generation)?;
+            binding.ensure_current(&repo, &author)?;
             // Drain items queued before/at this beat (whichever branch
             // woke us) so a repo-branch win doesn't strand a ready
             // external item (codex 1bbb61d).
@@ -481,6 +348,20 @@ pub async fn items(args: WaitArgs) -> anyhow::Result<Option<Vec<WaitItem>>> {
             // return then funnels through the single boundary below so a
             // final drain catches items that arrived DURING the refold
             // (`await`) — none is ever dropped (codex 907acd5).
+            let state = crate::rebuild::rebuild_repo_with_policy(&repo, policy)
+                .await
+                .map_err(|e| anyhow::anyhow!("failed to fold repo `{}`: {e}", repo.display()))?;
+            let reviews =
+                crate::fs_plan_state_lookup::FsPlanStateLookup::new(&repo, state.head.as_ref());
+            let head = crate::git_io::head_commit_at(&repo, &state);
+            let status = state
+                .fold
+                .derive_status(&reviews, &inputs.work_policy, head.as_ref());
+            let lifecycle = if inputs.role == Role::Master {
+                sync_lifecycle_events(&repo, &author, &status, &state.fold)?
+            } else {
+                Vec::new()
+            };
             let br = check_blocks(&repo, &author);
             let has_answer = br
                 .items
@@ -491,24 +372,10 @@ pub async fn items(args: WaitArgs) -> anyhow::Result<Option<Vec<WaitItem>>> {
             } else if br.suppress_all {
                 None
             } else {
-                let state = crate::rebuild::rebuild_repo_with_policy(&repo, policy)
-                    .await
-                    .map_err(|e| {
-                        anyhow::anyhow!("failed to fold repo `{}`: {e}", repo.display())
-                    })?;
-                let reviews =
-                    crate::fs_plan_state_lookup::FsPlanStateLookup::new(&repo, state.head.as_ref());
-                // Commit-tag correction is derived (see initial-pass note).
-                let head = crate::git_io::head_commit_at(&repo, &state);
-                let status = state
-                    .fold
-                    .derive_status(&reviews, &inputs.work_policy, head.as_ref());
-                let items = items_for(&repo, &author, &inputs, &status, &state.fold, &snapshot);
+                let mut items = items_for(&repo, &author, &inputs, &status, &state.fold);
+                items.extend(lifecycle);
                 if !items.is_empty() {
-                    ensure_current(&agent_dir, generation)?;
-                    for firing in &firings_from_items(&items) {
-                        hook_config::run_hook(&repo, &inputs.hook_config, firing);
-                    }
+                    binding.ensure_current(&repo, &author)?;
                     Some(items)
                 } else {
                     None
@@ -519,9 +386,9 @@ pub async fn items(args: WaitArgs) -> anyhow::Result<Option<Vec<WaitItem>>> {
             // produced during the refold, then repo + external merge into
             // ONE result. Park only when BOTH are empty (codex 907acd5).
             drain_external(&mut sources.rx, &mut sources_open, &mut external);
-            drop_items_not_for(inputs.role, &mut external);
+            drop_items_not_for(&repo, inputs.role, &mut external);
             if let Some(items) = combine_beat_result(repo_items, external) {
-                ensure_current(&agent_dir, generation)?;
+                binding.ensure_current(&repo, &author)?;
                 return Ok(items);
             }
         }
@@ -631,10 +498,8 @@ async fn run_observer(
 }
 
 /// The observer's delta anchor: repo facts at startup that `--for`
-/// events are measured against. Deliberately NOT
-/// [`StartupSnapshot`]: that one only watches plans active at capture
-/// time, but an observer must fire for a plan that is introduced AND
-/// finalized after it starts.
+/// events are measured against. An observer must fire for a plan that
+/// is introduced AND finalized after it starts.
 struct ObserverBaseline {
     head: Option<CommitSha>,
     /// Every (plan, finalize sha) pair already in history.
@@ -724,7 +589,6 @@ fn observe_events(
 struct WaitInputs {
     role: Role,
     work_policy: clank_core::wait::WorkPolicy,
-    hook_config: std::collections::BTreeMap<HookEvent, Option<String>>,
 }
 
 fn derive_wait_inputs(repo: &Path, author: &AgentLabel) -> anyhow::Result<WaitInputs> {
@@ -750,7 +614,6 @@ fn derive_wait_inputs(repo: &Path, author: &AgentLabel) -> anyhow::Result<WaitIn
             plan_reviewers: tiers.plan,
             final_reviewers: tiers.final_,
         },
-        hook_config: config.hooks,
     })
 }
 
@@ -827,10 +690,14 @@ pub(crate) fn resolve_wait_event_sources(
 /// wake, so a demotion mid-wait drops what the old watch queued rather
 /// than returning it — returning it would ACK it, settling a debt owed
 /// to the agent that is master now (codex edf3a63).
-fn drop_items_not_for(role: Role, external: &mut Vec<WaitItem>) {
-    if role != Role::Master {
-        external.retain(|i| !matches!(i, WaitItem::DraftChanged { .. }));
-    }
+fn drop_items_not_for(repo: &Path, role: Role, external: &mut Vec<WaitItem>) {
+    external.retain(|item| match item {
+        WaitItem::DraftChanged { pr, instance, .. } => {
+            role == Role::Master
+                && crate::cli::pr_review::owning_instance(repo, *pr) == Some(*instance)
+        }
+        _ => true,
+    });
 }
 
 fn combine_beat_result(
@@ -984,175 +851,6 @@ impl RingTail {
     }
     pub(crate) fn into_string(self) -> String {
         String::from_utf8_lossy(&Vec::from(self.buf)).into_owned()
-    }
-}
-
-/// Publishes this wait's claim for as long as it runs.
-///
-/// RAII, because the interesting case is the one that does not exit
-/// cleanly: every return path from a long function is a place to
-/// forget, and a stale claim is worse than none — it is the exact
-/// false-liveness this record exists to remove. A drop also covers
-/// the abort paths the wait has several of.
-struct WaitClaimGuard {
-    agent_dir: std::path::PathBuf,
-    /// What THIS guard wrote. Withdrawal is compare-and-delete
-    /// against it, so an older wait exiting after a successor has
-    /// taken over cannot erase the successor's record (codex
-    /// 2f38deb).
-    mine: Option<crate::wait_claim::WaitClaim>,
-}
-
-impl WaitClaimGuard {
-    async fn acquire(
-        agent_dir: &Path,
-        author: &AgentLabel,
-        probe: bool,
-        tag: Option<String>,
-        generation: u64,
-        delivery_session: Option<&str>,
-    ) -> anyhow::Result<Self> {
-        Self::acquire_until(
-            agent_dir,
-            author,
-            probe,
-            tag,
-            generation,
-            delivery_session,
-            tokio::time::Instant::now() + std::time::Duration::from_secs(6),
-        )
-        .await
-    }
-
-    async fn acquire_until(
-        agent_dir: &Path,
-        author: &AgentLabel,
-        probe: bool,
-        tag: Option<String>,
-        generation: u64,
-        delivery_session: Option<&str>,
-        deadline: tokio::time::Instant,
-    ) -> anyhow::Result<Self> {
-        let mut guard = Self {
-            agent_dir: agent_dir.to_path_buf(),
-            mine: None,
-        };
-        if probe {
-            return Ok(guard);
-        }
-        let session = delivery_session
-            .map(str::to_owned)
-            .or_else(crate::wait_claim::launch_session);
-        let Some(session) = session else {
-            // A terminal-launched wait has no session it can claim
-            // to wake. It still watches, but never suppresses a hook.
-            return Ok(guard);
-        };
-
-        loop {
-            ensure_current(agent_dir, generation)?;
-            match crate::wait_claim::try_acquire(agent_dir, &session, generation, tag.clone()) {
-                Ok(crate::wait_claim::Admission::Taken(claim)) => {
-                    guard.mine = Some(claim);
-                    ensure_current(agent_dir, generation)?;
-                    return Ok(guard);
-                }
-                Ok(crate::wait_claim::Admission::Held(holder))
-                    if holder.generation == generation && holder.session == session =>
-                {
-                    return Err(WaitAlreadyParked.into());
-                }
-                Ok(crate::wait_claim::Admission::Held(holder)) => {
-                    if tokio::time::Instant::now() >= deadline {
-                        anyhow::bail!(
-                            "wait: live predecessor pid {} (generation {}, session {}) did not release its claim before the handoff deadline for `{author}`",
-                            holder.pid,
-                            holder.generation,
-                            holder.session
-                        );
-                    }
-                    // The predecessor notices the generation change
-                    // on its existing beat and compare-withdraws. A
-                    // successor is admitted only after that release
-                    // or the exact birth identity has exited.
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                }
-                Err(e) => return Err(anyhow::anyhow!("wait: acquiring claim for `{author}`: {e}")),
-            }
-        }
-    }
-
-    /// `probe` skips publication entirely: `--peek` is a read-only
-    /// question about an agent, not a waiter.
-    #[cfg(test)]
-    fn publish_in(
-        agent_dir: &Path,
-        author: &AgentLabel,
-        probe: bool,
-        tag: Option<String>,
-        generation: u64,
-        session: Option<&str>,
-        ambient: &dyn crate::agent_env::Ambient,
-    ) -> Self {
-        // A SECOND waiter for one agent is worth saying out loud.
-        // Milestone 3 makes this a takeover; today it is a
-        // diagnostic, which is the difference between a known hazard
-        // and a silent one.
-        if !probe && let Some(pid) = crate::wait_claim::other_live_wait(agent_dir) {
-            eprintln!(
-                "wait: `{author}` already has a live wait (pid {pid}); two waiters both \
-                 return work and only one is read"
-            );
-        }
-        let mine = (!probe)
-            .then(|| Self::write(agent_dir, author, tag, generation, session, ambient))
-            .flatten();
-        Self {
-            agent_dir: agent_dir.to_path_buf(),
-            mine,
-        }
-    }
-
-    #[cfg(test)]
-    fn write(
-        agent_dir: &Path,
-        author: &AgentLabel,
-        tag: Option<String>,
-        generation: u64,
-        session: Option<&str>,
-        ambient: &dyn crate::agent_env::Ambient,
-    ) -> Option<crate::wait_claim::WaitClaim> {
-        // The session this process was LAUNCHED INSIDE — where its
-        // completion wake actually goes. Not the label's bound
-        // session: that is a roster fact, and copying it let a
-        // terminal-launched wait claim a session it could never wake
-        // (codex 2f38deb). A wait with no harness around it claims
-        // nothing, which is correct — nothing is waiting on it.
-        let session = match session {
-            Some(session) => session.to_owned(),
-            None => crate::wait_claim::launch_session_in(ambient)?,
-        };
-        if ensure_current(agent_dir, generation).is_err() {
-            return None;
-        }
-        match crate::wait_claim::publish(agent_dir, &session, generation, tag) {
-            Ok(claim) => Some(claim),
-            Err(e) => {
-                // Best-effort: a wait that cannot describe itself
-                // still watches. What it loses is being PROVABLY
-                // live, which costs a nudge rather than a wake.
-                eprintln!("wait: could not publish the wait claim for `{author}`: {e}");
-                None
-            }
-        }
-    }
-}
-
-impl Drop for WaitClaimGuard {
-    fn drop(&mut self) {
-        if let Some(mine) = &self.mine {
-            crate::wait_claim::withdraw_mine(&self.agent_dir, mine);
-        }
     }
 }
 
@@ -1535,6 +1233,106 @@ fn check_blocks(repo: &Path, author: &AgentLabel) -> BlockResult {
     result
 }
 
+const LIFECYCLE_SOURCE: &str = "repo-lifecycle";
+const LIFECYCLE_BASELINE: &str = "repo-lifecycle:baseline:v1";
+
+/// Ingest repo transitions before returning any wake. One waiter
+/// writes under the source lease; every waiter reads the same inbox.
+/// A later arm therefore sees the transition until it is acked, even
+/// when the waiter that first observed it has disappeared.
+fn sync_lifecycle_events(
+    repo: &Path,
+    author: &AgentLabel,
+    status: &clank_core::wait::WorkStatus,
+    fold: &clank_core::repo_state::RepoState,
+) -> anyhow::Result<Vec<WaitItem>> {
+    use crate::cli::github::log::{EventLog, IngestLease, Transport};
+
+    let dir = crate::agent_store::agents_root(repo)
+        .join(author.as_str())
+        .join("events");
+    // This source holds its lease only for one synchronous refold. A
+    // contender should wait for that short write, then ingest and
+    // read the same rows; returning an empty read during the write
+    // would make `--peek` and a newly armed wait miss the transition.
+    let mut lease = None;
+    for _ in 0..100 {
+        if let Some(found) = IngestLease::try_acquire(&dir, LIFECYCLE_SOURCE)? {
+            lease = Some(found);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let lease = lease.ok_or_else(|| anyhow::anyhow!("lifecycle event ingest remains busy"))?;
+    {
+        let _lease = lease;
+        let mut log = EventLog::open(&dir, LIFECYCLE_SOURCE)?;
+        log.load();
+        let mut seen = log
+            .all_action_keys()?
+            .ok_or_else(|| anyhow::anyhow!("lifecycle event log is corrupt"))?;
+        let baseline = !seen.contains(LIFECYCLE_BASELINE);
+        let mut transitions = Vec::new();
+        for finished in &fold.finished_plans {
+            transitions.push((
+                format!("finished:{}:{}", finished.plan, finished.finalized_at),
+                WaitItem::Finished {
+                    plan: finished.plan.clone(),
+                    finalized_at: finished.finalized_at.clone(),
+                    selector: None,
+                },
+            ));
+        }
+        for ad_hoc in &status.ad_hoc {
+            if ad_hoc.is_settled() {
+                transitions.push((
+                    format!("adhoc:{}:{}", ad_hoc.sha, ad_hoc.gate.as_str()),
+                    WaitItem::AdHocSettled {
+                        sha: ad_hoc.sha.clone(),
+                        gate: ad_hoc.gate,
+                        selector: None,
+                    },
+                ));
+            }
+        }
+        for (key, item) in transitions {
+            if !seen.insert(key.clone()) {
+                continue;
+            }
+            if baseline {
+                log.append_handled_inbox(Transport::Repo, &key, &item)?;
+            } else {
+                log.append_inbox(Transport::Repo, None, Some(&key), None, &item)?;
+            }
+        }
+        if baseline {
+            log.append_observation(None, Some(LIFECYCLE_BASELINE), true)?;
+        }
+    }
+    let log = EventLog::open(&dir, LIFECYCLE_SOURCE)?;
+    let rows = log
+        .read_rows()?
+        .ok_or_else(|| anyhow::anyhow!("lifecycle event log is corrupt"))?;
+    let mut pending = Vec::new();
+    for row in rows.rows {
+        if row.acked {
+            continue;
+        }
+        let mut item = row.item;
+        let selector =
+            crate::cli::events::Selector::qualified(LIFECYCLE_SOURCE, row.seq).to_string();
+        match &mut item {
+            WaitItem::Finished { selector: slot, .. }
+            | WaitItem::AdHocSettled { selector: slot, .. } => {
+                *slot = Some(selector);
+                pending.push(item);
+            }
+            _ => {}
+        }
+    }
+    Ok(pending)
+}
+
 /// Everything this agent is woken for at one fold: its repo work, the
 /// master's notices, the queue when the master has nothing active, and
 /// its pending messages. The initial pass and every refold ask this one
@@ -1546,19 +1344,9 @@ fn items_for(
     inputs: &WaitInputs,
     status: &clank_core::wait::WorkStatus,
     fold: &clank_core::repo_state::RepoState,
-    snapshot: &StartupSnapshot,
 ) -> Vec<WaitItem> {
     let mut items = status.work_for(author, inputs.role);
-    // Finished and ad-hoc settles are NOTIFICATIONS only the master
-    // acts on; handed to a reviewer they would wake it for nothing
-    // (`finish-does-not-wake-reviewers`, adhoc-continue-wake-
-    // investigation).
     if inputs.role == Role::Master {
-        items.extend(detect_finished(snapshot, fold));
-        items.extend(clank_core::wait::detect_adhoc_settled(
-            snapshot,
-            &status.ad_hoc,
-        ));
         if items.is_empty() && fold.plans.is_empty() {
             let queue = crate::cli::queue::scan_queue_no_dups(repo).unwrap_or_else(|e| {
                 eprintln!("wait: {e}");
@@ -1673,8 +1461,8 @@ pub(crate) enum WaitJsonItem<'a> {
     #[serde(rename = "finished")]
     Finished {
         plan: &'a str,
-        plan_path: String,
         finalized_at: &'a str,
+        selector: Option<&'a str>,
     },
     #[serde(rename = "idle")]
     Idle { prompt: &'a str },
@@ -1686,7 +1474,11 @@ pub(crate) enum WaitJsonItem<'a> {
     #[serde(rename = "adhoc_revise")]
     AdHocRevise { sha: &'a str },
     #[serde(rename = "adhoc_settled")]
-    AdHocSettled { sha: &'a str, gate: &'a str },
+    AdHocSettled {
+        sha: &'a str,
+        gate: &'a str,
+        selector: Option<&'a str>,
+    },
     #[serde(rename = "fix_commit_tag")]
     FixCommitTag {
         sha: &'a str,
@@ -1751,6 +1543,8 @@ pub(crate) enum WaitJsonItem<'a> {
         path: Option<&'a str>,
         change: &'a str,
         revision: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        selector: Option<&'a str>,
     },
     #[serde(rename = "for_commit")]
     ForCommit { sha: &'a str, subject: &'a str },
@@ -1810,10 +1604,14 @@ pub(crate) fn render_json(item: &WaitItem) -> WaitJsonItem<'_> {
             sha: sha.as_str(),
             feedback_path,
         },
-        WaitItem::Finished { plan, finalized_at } => WaitJsonItem::Finished {
+        WaitItem::Finished {
+            plan,
+            finalized_at,
+            selector,
+        } => WaitJsonItem::Finished {
             plan: plan.as_str(),
-            plan_path: plan_path(plan),
             finalized_at: finalized_at.as_str(),
+            selector: selector.as_deref(),
         },
         WaitItem::Idle { prompt } => WaitJsonItem::Idle { prompt },
         WaitItem::AdHocReview { sha, feedback_path } => WaitJsonItem::AdHocReview {
@@ -1821,9 +1619,14 @@ pub(crate) fn render_json(item: &WaitItem) -> WaitJsonItem<'_> {
             feedback_path,
         },
         WaitItem::AdHocRevise { sha } => WaitJsonItem::AdHocRevise { sha: sha.as_str() },
-        WaitItem::AdHocSettled { sha, gate } => WaitJsonItem::AdHocSettled {
+        WaitItem::AdHocSettled {
+            sha,
+            gate,
+            selector,
+        } => WaitJsonItem::AdHocSettled {
             sha: sha.as_str(),
             gate: gate.as_str(),
+            selector: selector.as_deref(),
         },
         WaitItem::FixCommitTag { sha, violation } => WaitJsonItem::FixCommitTag {
             sha: sha.as_str(),
@@ -1888,6 +1691,7 @@ pub(crate) fn render_json(item: &WaitItem) -> WaitJsonItem<'_> {
             path,
             change,
             revision,
+            selector,
         } => WaitJsonItem::DraftChanged {
             pr: *pr,
             instance: *instance,
@@ -1895,6 +1699,7 @@ pub(crate) fn render_json(item: &WaitItem) -> WaitJsonItem<'_> {
             path: path.as_deref(),
             change: change.wire(),
             revision: *revision,
+            selector: selector.as_deref(),
         },
         WaitItem::CommandEvent {
             name,
@@ -1970,19 +1775,31 @@ fn render_human(item: &WaitItem) -> String {
             sha = short(sha),
             feedback_path = feedback_path,
         ),
-        WaitItem::Finished { plan, finalized_at } => format!(
-            "finished {plan}  {sha}",
-            plan = plan.as_str(),
-            sha = short(finalized_at),
+        WaitItem::Finished {
+            plan,
+            finalized_at,
+            selector,
+        } => format!(
+            "finished {}  {}  ack: clank events ack {}",
+            plan.as_str(),
+            short(finalized_at),
+            selector.as_deref().unwrap_or("?")
         ),
         WaitItem::Idle { prompt } => format!("idle     {prompt}"),
         WaitItem::AdHocReview { sha, .. } => {
             format!("adhoc-review  {}  write feedback", short(sha),)
         }
         WaitItem::AdHocRevise { sha } => format!("adhoc-revise  {}  address changes", short(sha)),
-        WaitItem::AdHocSettled { sha, gate } => {
-            format!("adhoc-settled  {}  gate {}", short(sha), gate.as_str())
-        }
+        WaitItem::AdHocSettled {
+            sha,
+            gate,
+            selector,
+        } => format!(
+            "adhoc-settled  {}  gate {}  ack: clank events ack {}",
+            short(sha),
+            gate.as_str(),
+            selector.as_deref().unwrap_or("?")
+        ),
         WaitItem::FixCommitTag { sha, violation } => {
             let mut parts: Vec<String> = Vec::new();
             if !violation.untagged_touched.is_empty() {
@@ -2055,13 +1872,21 @@ fn render_human(item: &WaitItem) -> String {
             path,
             change,
             revision,
+            selector,
             ..
         } => {
             let about = match (comment, path.as_deref()) {
                 (Some(c), Some(p)) => format!("  {p}  comment {c}"),
                 _ => String::new(),
             };
-            format!("draft    #{pr}  {}{about}  (r{revision})", change.wire())
+            let ack = selector
+                .as_deref()
+                .map(|s| format!("  (ack {s})"))
+                .unwrap_or_default();
+            format!(
+                "draft    #{pr}  {}{about}  (r{revision}){ack}",
+                change.wire()
+            )
         }
         // ONE arm for every event source. The github and command
         // variants had separate arms building the same line from
@@ -2265,6 +2090,137 @@ pub(crate) fn parse_duration_str(raw: &str) -> anyhow::Result<Option<Duration>> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn lifecycle_status(
+        gate: Option<clank_core::vocab::CommitGateState>,
+    ) -> clank_core::wait::WorkStatus {
+        clank_core::wait::WorkStatus {
+            plans: Vec::new(),
+            ad_hoc: gate
+                .into_iter()
+                .map(|gate| clank_core::wait::AdHocWorkState {
+                    sha: CommitSha::parse(&"a".repeat(40)).unwrap(),
+                    gate,
+                    handover: Default::default(),
+                })
+                .collect(),
+            pr_reviews: Vec::new(),
+            head_correction: None,
+            multi_plan_open: None,
+        }
+    }
+
+    #[test]
+    fn lifecycle_events_replay_to_two_waits_until_explicit_ack() {
+        use clank_core::repo_state::FinishedPlan;
+        use clank_core::vocab::CommitGateState;
+        let dir = tempfile::tempdir().unwrap();
+        let author = AgentLabel::parse("codex").unwrap();
+        let mut fold = clank_core::repo_state::RepoState::default();
+        let pending = lifecycle_status(Some(CommitGateState::Unreviewed));
+        assert!(
+            sync_lifecycle_events(dir.path(), &author, &pending, &fold)
+                .unwrap()
+                .is_empty()
+        );
+
+        fold.finished_plans.push(FinishedPlan {
+            plan: PlanKey::parse("done").unwrap(),
+            intro: CommitSha::parse(&"1".repeat(40)).unwrap(),
+            finalized_at: CommitSha::parse(&"2".repeat(40)).unwrap(),
+        });
+        let settled = lifecycle_status(Some(CommitGateState::Continued));
+        let first = sync_lifecycle_events(dir.path(), &author, &settled, &fold).unwrap();
+        let second = sync_lifecycle_events(dir.path(), &author, &settled, &fold).unwrap();
+        assert_eq!(first, second, "a later wait sees the same unacked events");
+        assert_eq!(first.len(), 2);
+        let events = crate::agent_store::agents_root(dir.path()).join("codex/events");
+        let mut log = crate::cli::github::log::EventLog::open(&events, LIFECYCLE_SOURCE).unwrap();
+        assert_eq!(
+            log.read_rows().unwrap().unwrap().rows.len(),
+            2,
+            "one durable row per transition"
+        );
+        let selector = match &first[0] {
+            WaitItem::Finished {
+                selector: Some(s), ..
+            } => s,
+            other => panic!("expected a finished event, got {other:?}"),
+        };
+        let id: crate::cli::events::Selector = selector.parse().unwrap();
+        log.append_ack(id.seq).unwrap();
+        let remaining = sync_lifecycle_events(dir.path(), &author, &settled, &fold).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert!(matches!(remaining[0], WaitItem::AdHocSettled { .. }));
+        assert_eq!(
+            log.read_rows().unwrap().unwrap().rows.len(),
+            2,
+            "ack does not mint another event"
+        );
+    }
+
+    #[test]
+    fn lifecycle_baseline_does_not_wake_for_old_finalizations() {
+        use clank_core::repo_state::FinishedPlan;
+        let dir = tempfile::tempdir().unwrap();
+        let author = AgentLabel::parse("codex").unwrap();
+        let mut fold = clank_core::repo_state::RepoState::default();
+        let finished = |plan: &str, digit: char| FinishedPlan {
+            plan: PlanKey::parse(plan).unwrap(),
+            intro: CommitSha::parse(&"1".repeat(40)).unwrap(),
+            finalized_at: CommitSha::parse(&digit.to_string().repeat(40)).unwrap(),
+        };
+        fold.finished_plans.push(finished("old", '2'));
+        let status = lifecycle_status(None);
+        assert!(
+            sync_lifecycle_events(dir.path(), &author, &status, &fold)
+                .unwrap()
+                .is_empty()
+        );
+        fold.finished_plans.push(finished("new", '3'));
+        assert_eq!(
+            sync_lifecycle_events(dir.path(), &author, &status, &fold)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn same_session_waits_coexist_and_rebind_revokes_only_other_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let label = AgentLabel::parse("codex").unwrap();
+        let a = clank_core::SessionId::parse("session-a1").unwrap();
+        let b = clank_core::SessionId::parse("session-b2").unwrap();
+        let ours = WaitBinding(Some((clank_core::Tool::Codex, a.clone())));
+        let another = ours.clone();
+        crate::agent_store::bind_session_to_agent(repo, &label, clank_core::Tool::Codex, &a)
+            .unwrap();
+        ours.ensure_current(repo, &label).unwrap();
+        another.ensure_current(repo, &label).unwrap();
+        // Repeated SessionStart for the same session changes config's
+        // timestamp, but cannot invalidate either live wait.
+        crate::agent_store::bind_session_to_agent(repo, &label, clank_core::Tool::Codex, &a)
+            .unwrap();
+        ours.ensure_current(repo, &label).unwrap();
+        another.ensure_current(repo, &label).unwrap();
+        crate::agent_store::bind_session_to_agent(repo, &label, clank_core::Tool::Codex, &b)
+            .unwrap();
+        assert!(
+            ours.ensure_current(repo, &label)
+                .unwrap_err()
+                .is::<WaitSuperseded>()
+        );
+        let successor = WaitBinding(Some((clank_core::Tool::Codex, b.clone())));
+        successor.ensure_current(repo, &label).unwrap();
+        crate::agent_store::release_binding(repo, &label, &b).unwrap();
+        assert!(successor.ensure_current(repo, &label).is_err());
+        let agent_dir = crate::agent_store::agents_root(repo).join(label.as_str());
+        for name in ["wait.gen", "wait.claim", "turn.end"] {
+            assert!(!agent_dir.join(name).exists(), "{name} must not be created");
+        }
+    }
 
     #[test]
     fn supersession_has_a_distinct_wait_wire() {
@@ -2584,161 +2540,6 @@ mod tests {
     /// terminal-launched wait claimed the label's bound session and
     /// silenced a session it could never wake, and a `--peek` probe
     /// overwrote a parked waiter's claim and deleted it on return.
-    #[test]
-    fn a_guard_claims_only_its_own_launch_and_withdraws_only_its_own_record() {
-        let dir = tempfile::tempdir().unwrap();
-        let repo = dir.path();
-        let author = AgentLabel::parse("rev").unwrap();
-        let agent_dir = crate::agent_store::agents_root(repo).join(author.as_str());
-        std::fs::create_dir_all(&agent_dir).unwrap();
-
-        let launched_in =
-            |sid: &str| crate::agent_env::Stated::saying(&[("CLAUDE_CODE_SESSION_ID", sid)]);
-        let sid = "55555555-5555-5555-5555-555555555555";
-        let nowhere = crate::agent_env::Stated::saying(&[]);
-
-        // NO HARNESS around it: a terminal-launched wait has nowhere
-        // to deliver a completion wake, so it claims nothing. The
-        // roster's bound session is not evidence about THIS process.
-        {
-            let _g =
-                WaitClaimGuard::publish_in(&agent_dir, &author, false, None, 0, None, &nowhere);
-            assert_eq!(
-                crate::wait_claim::read(&agent_dir),
-                None,
-                "a wait with no harness must not claim a session it cannot wake",
-            );
-        }
-
-        // Launched INSIDE a session: claims it, and the claim proves.
-        let live = WaitClaimGuard::publish_in(
-            &agent_dir,
-            &author,
-            false,
-            None,
-            0,
-            None,
-            &launched_in(sid),
-        );
-        let claim = crate::wait_claim::read(&agent_dir).expect("published");
-        assert!(crate::wait_claim::proves(&claim, sid, 0));
-
-        // A PEEK is a question about an agent, not a waiter. It
-        // publishes nothing and, on return, removes nothing.
-        {
-            let _probe = WaitClaimGuard::publish_in(
-                &agent_dir,
-                &author,
-                true,
-                None,
-                0,
-                None,
-                &launched_in(sid),
-            );
-        }
-        assert_eq!(
-            crate::wait_claim::read(&agent_dir),
-            Some(claim.clone()),
-            "a probe must not disturb a live waiter's claim",
-        );
-
-        drop(live);
-        assert_eq!(
-            crate::wait_claim::read(&agent_dir),
-            None,
-            "the claim does not outlive the wait that made it",
-        );
-    }
-
-    #[test]
-    fn hook_wait_claims_explicit_delivery_session_only_while_its_generation_is_current() {
-        let dir = tempfile::tempdir().unwrap();
-        let author = AgentLabel::parse("codex").unwrap();
-        let agent_dir = crate::agent_store::agents_root(dir.path()).join(author.as_str());
-        std::fs::create_dir_all(&agent_dir).unwrap();
-        let inherited = crate::agent_env::Stated::saying(&[("CODEX_THREAD_ID", "stale-daemon")]);
-
-        let live = WaitClaimGuard::publish_in(
-            &agent_dir,
-            &author,
-            false,
-            None,
-            0,
-            Some("pane-16"),
-            &inherited,
-        );
-        let claim =
-            crate::wait_claim::read(&agent_dir).expect("hook child claims its delivery session");
-        assert!(crate::wait_claim::proves(&claim, "pane-16", 0));
-        assert!(!crate::wait_claim::proves(&claim, "stale-daemon", 0));
-
-        std::fs::write(agent_dir.join("wait.gen"), "1\n").unwrap();
-        let stale = WaitClaimGuard::publish_in(
-            &agent_dir,
-            &author,
-            false,
-            None,
-            0,
-            Some("pane-16"),
-            &inherited,
-        );
-        assert!(
-            stale.mine.is_none(),
-            "old hook must not publish after supersession"
-        );
-        assert_eq!(crate::wait_claim::read(&agent_dir), Some(claim));
-        drop(stale);
-        drop(live);
-    }
-
-    #[tokio::test]
-    async fn successor_wait_starts_only_after_the_live_claim_is_released() {
-        let dir = tempfile::tempdir().unwrap();
-        let author = AgentLabel::parse("codex").unwrap();
-        let agent_dir = crate::agent_store::agents_root(dir.path()).join(author.as_str());
-        std::fs::create_dir_all(&agent_dir).unwrap();
-        let first = WaitClaimGuard::acquire(&agent_dir, &author, false, None, 0, Some("old"))
-            .await
-            .unwrap();
-        let duplicate = WaitClaimGuard::acquire(&agent_dir, &author, false, None, 0, Some("old"))
-            .await
-            .err()
-            .expect("same-session duplicate must stop");
-        assert!(duplicate.is::<WaitAlreadyParked>());
-
-        std::fs::write(agent_dir.join("wait.gen"), "1\n").unwrap();
-        let stuck = WaitClaimGuard::acquire_until(
-            &agent_dir,
-            &author,
-            false,
-            None,
-            1,
-            Some("new"),
-            tokio::time::Instant::now(),
-        )
-        .await
-        .err()
-        .expect("a live predecessor past the bound must fail");
-        assert!(format!("{stuck:#}").contains("did not release its claim"));
-        let pending = WaitClaimGuard::acquire(&agent_dir, &author, false, None, 1, Some("new"));
-        tokio::pin!(pending);
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(50), &mut pending)
-                .await
-                .is_err(),
-            "the successor may not replace a live predecessor"
-        );
-        drop(first);
-        let next = tokio::time::timeout(std::time::Duration::from_secs(1), pending)
-            .await
-            .expect("the release wakes the retry")
-            .unwrap();
-        assert!(crate::wait_claim::proves(
-            next.mine.as_ref().expect("new claim"),
-            "new",
-            1
-        ));
-    }
 
     /// Arm-time validation refuses what cannot run, and ONLY that.    /// Arm-time validation refuses what cannot run, and ONLY that.
     ///
@@ -3444,44 +3245,6 @@ mod tests {
         );
     }
 
-    // ── commit-tag-fixup-is-first-class-state ──────────────────
-
-    #[test]
-    fn fix_commit_tag_fires_master_hook_keyed_to_touched_plan() {
-        // Previously FixCommitTag yielded no firing — the bad commit
-        // woke the REVIEWER while the master correction sat passive.
-        // Now it proactively pulls master back, keyed to the touched
-        // plan.
-        let item = WaitItem::FixCommitTag {
-            sha: sha("aaaa"),
-            violation: clank_core::wait::HeadTagViolation {
-                unknown: vec!["plan".into()],
-                untagged_touched: vec![PlanKey::parse("real").unwrap()],
-                extra_named: vec![],
-            },
-        };
-        let firings = firings_from_items(std::slice::from_ref(&item));
-        assert_eq!(firings.len(), 1, "a proactive master firing");
-        assert_eq!(firings[0].event, HookEvent::MasterWork);
-        assert_eq!(firings[0].plan.as_str(), "real");
-        assert_eq!(firings[0].next.as_deref(), Some("fix-commit-tag"));
-    }
-
-    #[test]
-    fn fix_commit_tag_unknown_only_has_no_hook_key() {
-        // T = ∅ unknown-tag case names no real plan → no HookFiring
-        // (nothing to key it to), as before.
-        let item = WaitItem::FixCommitTag {
-            sha: sha("aaaa"),
-            violation: clank_core::wait::HeadTagViolation {
-                unknown: vec!["ghost".into()],
-                untagged_touched: vec![],
-                extra_named: vec![],
-            },
-        };
-        assert!(firings_from_items(std::slice::from_ref(&item)).is_empty());
-    }
-
     #[test]
     fn fix_commit_tag_human_line_names_all_three_kinds() {
         let item = WaitItem::FixCommitTag {
@@ -3500,25 +3263,6 @@ mod tests {
             "names the tagged-but-untouched plan"
         );
         assert!(line.contains("plan"), "names the unknown tag");
-    }
-
-    #[test]
-    fn fix_commit_tag_hint_offers_dropping_the_tag() {
-        // The unknown-tag case (committed `[plan]` for a plan that doesn't
-        // exist) is usually an ad-hoc commit that shouldn't be tagged at
-        // all — the hint must surface REMOVING the tag as an explicit
-        // option, not bury it (commit-tag-guidance).
-        let item = WaitItem::FixCommitTag {
-            sha: sha("bbbb"),
-            violation: clank_core::wait::HeadTagViolation {
-                unknown: vec!["nope".into()],
-                untagged_touched: vec![],
-                extra_named: vec![],
-            },
-        };
-        let line = render_human(&item).to_lowercase();
-        assert!(line.contains("remove"), "offers removing the tag: {line}");
-        assert!(line.contains("ad-hoc"), "names the ad-hoc case: {line}");
     }
 
     #[test]
@@ -3633,110 +3377,6 @@ mod tests {
     }
 
     #[test]
-    fn human_lines_carry_no_tutorial() {
-        let item = |pr: u32, instance: u64, revision: u64| WaitItem::DraftChanged {
-            pr,
-            instance,
-            comment: Some(1),
-            path: Some("f.rs".into()),
-            change: clank_core::pr_review::DraftChange::Edited,
-            revision,
-        };
-        let github = WaitItem::CommandEvent {
-            name: "watch".into(),
-            id: "1".into(),
-            event: "k".into(),
-            content: String::new(),
-            at: None,
-            failure: false,
-            selector: None,
-        };
-        let mut for_standby = vec![item(12, 100, 1), github.clone()];
-        drop_items_not_for(Role::Standby, &mut for_standby);
-        assert_eq!(
-            for_standby,
-            std::slice::from_ref(&github),
-            "a demoted agent must not be handed master's draft change: returning it \
-             would acknowledge it away from the agent it is owed to"
-        );
-        let mut for_master = vec![item(12, 100, 1), github.clone()];
-        drop_items_not_for(Role::Master, &mut for_master);
-        assert_eq!(for_master.len(), 2);
-        let mut other_sources = vec![github.clone()];
-        drop_items_not_for(Role::Reviewer, &mut other_sources);
-        assert_eq!(
-            other_sources,
-            std::slice::from_ref(&github),
-            "and an operator's own sources are none of this filter's business"
-        );
-
-        let draft_item = |pr: u32, instance: u64, revision: u64| WaitItem::DraftChanged {
-            pr,
-            instance,
-            comment: Some(1),
-            path: Some("f.rs".into()),
-            change: clank_core::pr_review::DraftChange::Edited,
-            revision,
-        };
-        let grouped = deliveries(&[
-            draft_item(12, 100, 1),
-            draft_item(12, 200, 1),
-            draft_item(12, 100, 2),
-            WaitItem::Idle {
-                prompt: "nothing".into(),
-            },
-        ]);
-        assert_eq!(
-            grouped.into_iter().collect::<Vec<_>>(),
-            [((12, 100), vec![1, 2]), ((12, 200), vec![1])],
-            "one PR, two runs, both with a revision 1 — acknowledged separately or one \
-             settles a debt that is not its own"
-        );
-
-        let draft = render_human(&WaitItem::DraftChanged {
-            pr: 12,
-            instance: 77,
-            comment: Some(4088032661),
-            path: Some("crates/cli/src/lib.rs".into()),
-            change: clank_core::pr_review::DraftChange::Removed,
-            revision: 3,
-        });
-        assert_eq!(
-            draft,
-            "draft    #12  removed  crates/cli/src/lib.rs  comment 4088032661  (r3)"
-        );
-        let wire = serde_json::to_value(render_json(&WaitItem::DraftChanged {
-            pr: 12,
-            instance: 77,
-            comment: Some(4088032661),
-            path: Some("crates/cli/src/lib.rs".into()),
-            change: clank_core::pr_review::DraftChange::Removed,
-            revision: 3,
-        }))
-        .unwrap();
-        assert_eq!(wire["kind"], "draft_changed");
-        assert_eq!(wire["change"], "removed");
-        assert_eq!(wire["revision"], 3);
-
-        let promote = render_human(&WaitItem::PromoteFromQueue {
-            name: "some-plan".into(),
-            priority: 300,
-        });
-        assert_eq!(promote, "promote  some-plan  (priority 300)");
-
-        let blocked = render_human(&WaitItem::Blocked {
-            agent: "claude".into(),
-            name: "q".into(),
-            question: "should we?".into(),
-        });
-        assert_eq!(blocked, "blocked  claude/q  (awaiting human)");
-        assert!(
-            !blocked.contains("should we?"),
-            "block question is for the human, not the woken agent"
-        );
-    }
-
-    #[test]
     fn json_keeps_structured_fields_including_full_sha_and_question() {
         // Parity = same DATA, different format (ruthless concern
         // 3): json keeps the structured fields a consumer needs —
@@ -3782,18 +3422,14 @@ mod tests {
         use clank_core::wait::WaitKind;
 
         let sha = CommitSha::parse(&"a".repeat(40)).unwrap();
-        // One item per kind whose spelling could drift — the three
-        // the two vocabularies disagree about, plus a control.
+        // One item per kind whose spelling could drift — the two
+        // vocabularies disagree about, plus a control.
         let items = [
             WaitItem::AdHocReview {
                 sha: sha.clone(),
                 feedback_path: String::new(),
             },
             WaitItem::AdHocRevise { sha: sha.clone() },
-            WaitItem::AdHocSettled {
-                sha: sha.clone(),
-                gate: clank_core::vocab::CommitGateState::Finished,
-            },
             WaitItem::Idle {
                 prompt: String::new(),
             },
@@ -3856,19 +3492,6 @@ mod tests {
                 }),
             ),
             (
-                serde_json::to_value(render_json(&WaitItem::Finished {
-                    plan: PlanKey::parse("foo").unwrap(),
-                    finalized_at: sha("abc"),
-                }))
-                .unwrap(),
-                serde_json::json!({
-                    "kind": "finished",
-                    "plan": "foo",
-                    "plan_path": ".clank/plans/foo.md",
-                    "finalized_at": sha("abc").as_str(),
-                }),
-            ),
-            (
                 serde_json::to_value(render_json(&WaitItem::Idle {
                     prompt: "go".into(),
                 }))
@@ -3891,18 +3514,6 @@ mod tests {
                 serde_json::to_value(render_json(&WaitItem::AdHocRevise { sha: sha("abc") }))
                     .unwrap(),
                 serde_json::json!({ "kind": "adhoc_revise", "sha": sha("abc").as_str() }),
-            ),
-            (
-                serde_json::to_value(render_json(&WaitItem::AdHocSettled {
-                    sha: sha("abc"),
-                    gate: clank_core::vocab::CommitGateState::Continued,
-                }))
-                .unwrap(),
-                serde_json::json!({
-                    "kind": "adhoc_settled",
-                    "sha": sha("abc").as_str(),
-                    "gate": "continued",
-                }),
             ),
             (
                 serde_json::to_value(render_json(&WaitItem::FixCommitTag {
@@ -4052,28 +3663,6 @@ mod tests {
             render_human(&blocked),
             "for-blocked   codex/q  (awaiting human)"
         );
-    }
-
-    #[test]
-    fn observer_items_never_fire_hooks() {
-        // The observer path is side-effect-free by contract; even if
-        // its items ever flowed through the firing projection, they
-        // must map to none.
-        let items = [
-            WaitItem::ForCommit {
-                sha: sha("abc"),
-                subject: "s".into(),
-            },
-            WaitItem::ForFinished {
-                plan: PlanKey::parse("foo").unwrap(),
-                sha: sha("abc"),
-            },
-            WaitItem::ForBlocked {
-                agent: "a".into(),
-                name: "n".into(),
-            },
-        ];
-        assert!(firings_from_items(&items).is_empty());
     }
 
     #[test]

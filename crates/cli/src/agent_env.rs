@@ -21,10 +21,10 @@ use crate::agent_store::load_all_agent_configs_lossy;
 
 const ENV_CLAUDE_SESSION: &str = "CLAUDE_CODE_SESSION_ID";
 const ENV_CODEX_SESSION: &str = "CODEX_THREAD_ID";
-/// Grok sets NO session id in tool subprocess envs — only this marker
-/// (grok-first-class P2). Detection resolves the session as the
-/// newest session dir for the cwd (see [`grok_session_for_cwd`]).
+/// Grok's marker is present in tool subprocesses. Older versions did
+/// not export the id; those still use the newest session dir for cwd.
 const ENV_GROK_MARKER: &str = "GROK_AGENT";
+const ENV_GROK_SESSION: &str = "GROK_SESSION_ID";
 /// Injected by the clank opencode PLUGIN via opencode's `shell.env`
 /// hook — opencode itself exports no session id
 /// (opencode-agent-tool M0). Present iff the shell call carried the
@@ -49,6 +49,7 @@ pub(crate) const SESSION_IDENTITY_VARS: &[&str] = &[
     ENV_CODEX_SESSION,
     ENV_OPENCODE_SESSION,
     ENV_GROK_MARKER,
+    ENV_GROK_SESSION,
     ENV_CLANK_AGENT,
     ENV_CLANK_BOOTSTRAP_SESSION,
 ];
@@ -177,6 +178,7 @@ pub(crate) fn detect_session_in(env: &dyn Ambient) -> Result<Option<(Tool, Sessi
             env.var(ENV_CLAUDE_SESSION),
         ),
         (ENV_CODEX_SESSION, Tool::Codex, env.var(ENV_CODEX_SESSION)),
+        (ENV_GROK_SESSION, Tool::Grok, env.var(ENV_GROK_SESSION)),
         (
             ENV_OPENCODE_SESSION,
             Tool::OpenCode,
@@ -185,9 +187,8 @@ pub(crate) fn detect_session_in(env: &dyn Ambient) -> Result<Option<(Tool, Sessi
     ])?;
     match explicit {
         Some((tool, raw)) => Ok(Some((tool, parse_session_id(&raw, tool)?))),
-        // Grok last: its marker carries no session id, and an explicit
-        // claude/codex session var (even one leaked from a parent
-        // shell) is stronger evidence than the bare marker.
+        // Older Grok sessions expose only a marker. Explicit session
+        // ids take precedence over that fallback.
         None => {
             // Blank marker = scrubbed-by-blanking, same as the
             // explicit vars above.
@@ -271,7 +272,7 @@ fn parse_session_id(raw: &str, tool: Tool) -> Result<SessionId, EnvError> {
         var: match tool {
             Tool::Claude => ENV_CLAUDE_SESSION,
             Tool::Codex => ENV_CODEX_SESSION,
-            Tool::Grok => ENV_GROK_MARKER,
+            Tool::Grok => ENV_GROK_SESSION,
             Tool::OpenCode => ENV_OPENCODE_SESSION,
         },
         value: raw.to_string(),
@@ -492,6 +493,17 @@ mod tests {
             None,
             "no stated home and cwd means no session — not the real ones"
         );
+    }
+
+    #[test]
+    fn grok_explicit_session_id_beats_the_newest_directory_fallback() {
+        let sid = "01a0dd00-5b0f-7dc0-b418-24054b5112cf";
+        let detected = detect_session_in(&Stated::saying(&[
+            (ENV_GROK_MARKER, "1"),
+            (ENV_GROK_SESSION, sid),
+        ]))
+        .unwrap();
+        assert_eq!(detected, Some((Tool::Grok, SessionId::parse(sid).unwrap())));
     }
 
     fn cands(

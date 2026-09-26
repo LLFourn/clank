@@ -265,10 +265,12 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
     }
 }
 
-/// Map error variants to exit codes. Defaults to 1. `wait` no longer
-/// has an expected non-zero exit: it parks until a wake, a real
-/// error, or owner death (remove-wait-timeout), so exit 2 is free.
+/// Map error variants to exit codes. An empty one-shot wait uses 3 so
+/// the SessionStart probe can distinguish idle from a failed probe.
 pub fn exit_code_for(err: &anyhow::Error) -> i32 {
+    if err.downcast_ref::<crate::cli::wait::WaitNoWork>().is_some() {
+        return 3;
+    }
     if err
         .downcast_ref::<crate::cli::doctor::DoctorFailed>()
         .is_some()
@@ -394,27 +396,6 @@ mod tests {
             quickstart.contains("clank open"),
             "the Quickstart must contain the step that starts the agents"
         );
-    }
-
-    /// An empty `--tag` is refused at the ARGUMENT, not published.
-    ///
-    /// A registration token that every command string contains names
-    /// everything, and therefore nothing — it would hand the hook a
-    /// match against any stale listed task (codex 6402a09).
-    #[test]
-    fn an_empty_registration_tag_is_refused() {
-        for bad in ["", "   "] {
-            assert!(
-                Cli::try_parse_from(["clank", "wait", "--tag", bad]).is_err(),
-                "an empty tag must not parse: {bad:?}"
-            );
-        }
-        // A real one parses, and arrives trimmed.
-        let parsed = Cli::try_parse_from(["clank", "wait", "--tag", " abc123 "]).unwrap();
-        let crate::cli::command::Command::Wait(args) = parsed.command else {
-            panic!("expected wait")
-        };
-        assert_eq!(args.tag.as_deref(), Some("abc123"));
     }
 
     #[test]

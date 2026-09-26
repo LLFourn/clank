@@ -723,32 +723,6 @@
     return wanted === 'transcript' && !hasTranscript(label) ? 'terminal' : wanted;
   }
 
-  // Whoever is on screen is who /say reaches, so the button follows
-  // the shown agent's pane and nothing else.
-  // Whether an agent is mid-turn, decided HERE because only here are
-  // both halves live: the server's turn-end stamp arrives with the
-  // status, and turns arrive on their own — a long read-only turn
-  // changes nothing a status frame is published for.
-  //
-  // `unknown` whenever the evidence cannot answer, which is the
-  // normal case rather than an edge: two of the four harnesses have
-  // no transcript adapter and grok's hooks are passive, so no end is
-  // ever recorded for them.
-  //
-  // A tie reads as NOT working. The hook fires in the same second as
-  // a turn's last message most of the time and these are epoch
-  // seconds, so `>=` would leave an idle agent busy forever after
-  // nearly every turn; `>` is wrong only until the next turn lands.
-  const newestOf = (label) => {
-    const mine = agents.get(label);
-    return mine ? mine.turns.reduce((m, t) => (t.at != null && t.at > m ? t.at : m), -1) : -1;
-  };
-  function workingOf(label) {
-    const a = roster().find((x) => x.label === label);
-    if (!a || !a.transcript || a.ended == null) return 'unknown';
-    return newestOf(label) > a.ended ? 'yes' : 'no';
-  }
-
   // Stop was pressed, and nothing has happened since. Suppression is
   // scoped to the ACTIVITY it stopped — the pane, the incarnation,
   // and how far the transcript had got — and then DERIVED rather than
@@ -775,7 +749,7 @@
     // button and let the same instruction go twice (codex on
     // 37014d0).
     send.disabled = !p || p.closed || pending > 0 || sending > 0;
-    stopBtn.hidden = !p || p.closed || workingOf(shown) === 'no' || stopping(shown);
+    stopBtn.hidden = !p || p.closed || stopping(shown);
   }
   function show(label) {
     shown = label;

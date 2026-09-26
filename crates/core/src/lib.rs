@@ -31,8 +31,7 @@
 //! - [`wait`] — gate computation and agent-perspective wait
 //!   surface: [`wait::compute_gate`] is the single gate-state
 //!   function; [`repo_state::RepoState::derive_status`] folds it
-//!   over every plan; `detect_finished` finds plans that flipped
-//!   to finished since startup.
+//!   over every plan.
 //! - [`api`] — wire-shape response DTOs (`FinishPreviewResponse`,
 //!   `RewritePreviewResponse`, …) produced by the CLI's preview
 //!   builders.
@@ -80,7 +79,7 @@ pub use ids::{
 
 pub use agent_config::{AgentConfig, Session};
 pub use hook_io::{
-    BackgroundTask, BgDisposition, CLAUDE_CONTINUATION_EXIT, CodexBlockDecision, HOOK_OK_EXIT,
-    HookInput, HookOutcome, SilentReason, background_disposition,
+    BackgroundTask, CLAUDE_CONTINUATION_EXIT, CodexBlockDecision, HOOK_OK_EXIT, HookInput,
+    HookOutcome, SilentReason,
 };
 pub use identity::{IdentityInputs, ResolveError, resolve_agent_identity};

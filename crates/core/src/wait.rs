@@ -7,12 +7,8 @@
 //! - [`RepoState::derive_status`] (impl on `RepoState`) — folds
 //!   `compute_gate` over every plan and produces the
 //!   role-flavored [`WaitItem`]s `clank wait` emits.
-//! - [`detect_finished`] — pure comparison between a startup
-//!   snapshot of watched plans and the current `RepoState`.
-//!   Emits `WaitItem::Finished` for every watched plan that
-//!   newly transitioned into `finished_plans` since startup.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
@@ -112,9 +108,7 @@ impl ContentRef {
 }
 
 /// Flat tagged list `wait` returns from one refold round.
-/// Actionable items (`Master`, `Reviewer`) and terminal events
-/// (`Finished`) sit at the same level. Empty list at the call
-/// site means "no outcome, keep blocking."
+/// Empty list at the call site means "no outcome, keep blocking."
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WaitItem {
@@ -130,9 +124,13 @@ pub enum WaitItem {
         sha: CommitSha,
         feedback_path: String,
     },
+    /// A plan finalized after this agent's lifecycle inbox began.
+    /// Replayed until the master acknowledges the event.
     Finished {
         plan: PlanKey,
         finalized_at: CommitSha,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selector: Option<String>,
     },
     Idle {
         prompt: String,
@@ -144,15 +142,12 @@ pub enum WaitItem {
     AdHocRevise {
         sha: CommitSha,
     },
-    /// An ad-hoc commit's gate settled (Continued/Finished) during
-    /// this wait. Notification, not work — the reviewers made the
-    /// verdict and no follow-on item exists, but master's loop must
-    /// wake to move on (adhoc-continue-wake-investigation). Master
-    /// only, like [`WaitItem::Finished`]; produced by
-    /// [`detect_adhoc_settled`], never by `work_for`.
+    /// An ad-hoc gate reached a terminal verdict. Replayed until ack.
     AdHocSettled {
         sha: CommitSha,
         gate: crate::vocab::CommitGateState,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selector: Option<String>,
     },
     /// Master's HEAD commit's `[..]` tag doesn't match the plan files
     /// its diff touched (`commit-tag-fixup-is-first-class-state`).
@@ -302,6 +297,10 @@ pub enum WaitItem {
         /// The observer's count of changes it has reported for this
         /// review. Monotonic across rounds.
         revision: u64,
+        /// What to pass `clank events ack`. Stamped when presenting a
+        /// logged change; absent on legacy, unlogged draft wakes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selector: Option<String>,
     },
     /// Observer-mode events (`wait --for`, wait-for-observer-mode):
     /// produced only by the CLI observer path, never by `work_for`.
@@ -534,7 +533,7 @@ impl WaitItem {
 
     /// This item as an event, or `None` if it is not one.
     ///
-    /// The one place the two persisted shapes are reconciled. Adding
+    /// The one place the persisted event shapes are reconciled. Adding
     /// a backend means adding an arm HERE and nowhere else.
     pub fn event_view(&self) -> Option<EventView<'_>> {
         match self {
@@ -582,6 +581,21 @@ impl WaitItem {
                 instructions: None,
                 selector: selector.as_deref(),
                 failure: *failure,
+                github: None,
+            }),
+            WaitItem::DraftChanged {
+                path,
+                change,
+                selector,
+                ..
+            } => Some(EventView {
+                source: "PR draft",
+                kind: change.wire(),
+                content: path.as_deref(),
+                at: None,
+                instructions: None,
+                selector: selector.as_deref(),
+                failure: false,
                 github: None,
             }),
             _ => None,
@@ -698,57 +712,6 @@ pub fn head_tag_violation(
             untagged_touched,
             extra_named,
         })
-    }
-}
-
-/// Snapshot taken once at `wait` startup. `detect_finished` and
-/// `detect_adhoc_settled` compare the current state against this to
-/// decide which watched plans / ad-hoc gates newly transitioned
-/// during the wait.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StartupSnapshot {
-    /// Plan keys this wait is responsible for: the active plan keys
-    /// at startup. (All team members watch every plan — there is no
-    /// per-agent plan filter.)
-    pub watched: BTreeSet<PlanKey>,
-    /// Finalize SHAs already present at startup, keyed by plan.
-    /// A watched plan is "newly finished" iff its current
-    /// `FinishedPlan` entry has a `finalized_at` NOT in this set.
-    /// The set-per-plan stays correct across re-intro /
-    /// re-finalize cycles.
-    pub finished_at_startup: BTreeMap<PlanKey, BTreeSet<CommitSha>>,
-    /// Ad-hoc commit shas whose gate had NOT settled
-    /// (Continued/Finished) when the wait armed. Broader than
-    /// [`AdHocWorkState::is_open`] on purpose: a wait armed during
-    /// `ContinuedPendingGate` (the gate-reviewers' window, master
-    /// asleep) or `Blocked` must still wake when the verdict lands.
-    /// `detect_adhoc_settled` emits for exactly these shas once
-    /// their gate settles.
-    pub adhoc_pending_at_startup: BTreeSet<CommitSha>,
-}
-
-impl StartupSnapshot {
-    /// Build from the initial fold. The watched set is every active
-    /// plan at startup (all team members watch every plan).
-    pub fn capture(state: &RepoState, ad_hoc: &[AdHocWorkState]) -> Self {
-        let watched: BTreeSet<PlanKey> = state.plans.keys().cloned().collect();
-        let mut finished_at_startup: BTreeMap<PlanKey, BTreeSet<CommitSha>> = BTreeMap::new();
-        for fp in &state.finished_plans {
-            finished_at_startup
-                .entry(fp.plan.clone())
-                .or_default()
-                .insert(fp.finalized_at.clone());
-        }
-        let adhoc_pending_at_startup = ad_hoc
-            .iter()
-            .filter(|a| !a.is_settled())
-            .map(|a| a.sha.clone())
-            .collect();
-        Self {
-            watched,
-            finished_at_startup,
-            adhoc_pending_at_startup,
-        }
     }
 }
 
@@ -1953,60 +1916,10 @@ impl WorkStatus {
     }
 }
 
-/// Plan-key-ordered `Finished` items for every watched plan that
-/// transitioned into `finished_plans` since the snapshot. Re-intro /
-/// re-finalize cycles produce a new item iff the `finalized_at`
-/// SHA wasn't in the snapshot's per-plan set.
-pub fn detect_finished(snapshot: &StartupSnapshot, current: &RepoState) -> Vec<WaitItem> {
-    let mut out: BTreeMap<PlanKey, CommitSha> = BTreeMap::new();
-    for fp in &current.finished_plans {
-        if !snapshot.watched.contains(&fp.plan) {
-            continue;
-        }
-        let known = snapshot
-            .finished_at_startup
-            .get(&fp.plan)
-            .map(|set| set.contains(&fp.finalized_at))
-            .unwrap_or(false);
-        if known {
-            continue;
-        }
-        // If a plan finalized multiple times since startup (extreme
-        // edge case), surface the latest one. `finished_plans` is
-        // append-only so the last entry per plan wins.
-        out.insert(fp.plan.clone(), fp.finalized_at.clone());
-    }
-    out.into_iter()
-        .map(|(plan, finalized_at)| WaitItem::Finished { plan, finalized_at })
-        .collect()
-}
-
-/// The ad-hoc analogue of [`detect_finished`]: emit
-/// [`WaitItem::AdHocSettled`] for every sha the snapshot captured as
-/// pending whose gate has since settled (Continued/Finished). Both
-/// verdicts ride the same item. A settled-at-arm sha was never
-/// captured, so re-arming after the wake emits nothing — once per
-/// parked wait by construction. Shas that vanished from the current
-/// ad-hoc set (a plan started, new commits landed) emit nothing:
-/// only a positively observed settle wakes.
-pub fn detect_adhoc_settled(
-    snapshot: &StartupSnapshot,
-    current: &[AdHocWorkState],
-) -> Vec<WaitItem> {
-    current
-        .iter()
-        .filter(|a| a.is_settled() && snapshot.adhoc_pending_at_startup.contains(&a.sha))
-        .map(|a| WaitItem::AdHocSettled {
-            sha: a.sha.clone(),
-            gate: a.gate,
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::repo_state::{FinishedPlan, PlanState};
+    use crate::repo_state::PlanState;
     use crate::vocab::{CommitGateState, PlanWorktreeStatus};
 
     /// Every name round-trips, and no two kinds share one.
@@ -3034,203 +2947,6 @@ mod tests {
             master_work.is_empty(),
             "master has no work while reviewers are still owed"
         );
-    }
-
-    // ============ detect_finished ============
-
-    fn state_with(finished: Vec<FinishedPlan>) -> RepoState {
-        let mut s = RepoState::default();
-        s.finished_plans = finished;
-        s
-    }
-
-    fn finished(stem: &str, intro_hex: &str, finalized_hex: &str) -> FinishedPlan {
-        FinishedPlan {
-            plan: plan(stem),
-            intro: sha(intro_hex),
-            finalized_at: sha(finalized_hex),
-        }
-    }
-
-    fn snap(watched: &[&str], finished_at_startup: &[(&str, &str)]) -> StartupSnapshot {
-        let mut s = StartupSnapshot {
-            watched: watched.iter().map(|k| plan(k)).collect(),
-            finished_at_startup: BTreeMap::new(),
-            adhoc_pending_at_startup: BTreeSet::new(),
-        };
-        for (k, sh) in finished_at_startup {
-            s.finished_at_startup
-                .entry(plan(k))
-                .or_default()
-                .insert(sha(sh));
-        }
-        s
-    }
-
-    #[test]
-    fn watched_plan_newly_finished_emits_one_item() {
-        let s = state_with(vec![finished("a", "1111", "2222")]);
-        let snap = snap(&["a"], &[]);
-        let out = detect_finished(&snap, &s);
-        assert_eq!(out.len(), 1);
-        assert!(matches!(
-            &out[0],
-            WaitItem::Finished { plan: p, finalized_at }
-                if p == &plan("a") && finalized_at == &sha("2222")
-        ));
-    }
-
-    #[test]
-    fn watched_plan_finalize_already_known_emits_no_item() {
-        let s = state_with(vec![finished("a", "1111", "2222")]);
-        let snap = snap(&["a"], &[("a", "2222")]);
-        assert!(detect_finished(&snap, &s).is_empty());
-    }
-
-    #[test]
-    fn re_finalize_with_new_sha_emits_item() {
-        // Plan a was finalized at 2222 at startup; it then got
-        // re-introduced and re-finalized at 3333. The snapshot's
-        // per-plan set tracks "what was known," so the new sha
-        // emits a fresh notice.
-        let s = state_with(vec![
-            finished("a", "1111", "2222"),
-            finished("a", "4444", "3333"),
-        ]);
-        let snap = snap(&["a"], &[("a", "2222")]);
-        let out = detect_finished(&snap, &s);
-        assert_eq!(out.len(), 1);
-        assert!(matches!(
-            &out[0],
-            WaitItem::Finished { finalized_at, .. } if finalized_at == &sha("3333")
-        ));
-    }
-
-    #[test]
-    fn unwatched_plan_finished_emits_no_item() {
-        let s = state_with(vec![finished("b", "1111", "2222")]);
-        let snap = snap(&["a"], &[]);
-        assert!(detect_finished(&snap, &s).is_empty());
-    }
-
-    #[test]
-    fn multiple_watched_plans_finished_yields_plan_key_order() {
-        let s = state_with(vec![
-            finished("z", "1111", "2222"),
-            finished("a", "3333", "4444"),
-            finished("m", "5555", "6666"),
-        ]);
-        let snap = snap(&["a", "m", "z"], &[]);
-        let out = detect_finished(&snap, &s);
-        let plans: Vec<&str> = out
-            .iter()
-            .map(|i| match i {
-                WaitItem::Finished { plan, .. } => plan.as_str(),
-                _ => panic!("expected Finished"),
-            })
-            .collect();
-        assert_eq!(plans, vec!["a", "m", "z"]);
-    }
-
-    #[test]
-    fn snapshot_capture_watches_all_active_plans() {
-        let mut state = RepoState::default();
-        state.plans.insert(plan("a"), PlanState::default());
-        state.plans.insert(plan("b"), PlanState::default());
-        let snap = StartupSnapshot::capture(&state, &[]);
-        assert_eq!(snap.watched.len(), 2);
-        assert!(snap.watched.contains(&plan("a")));
-        assert!(snap.watched.contains(&plan("b")));
-    }
-
-    #[test]
-    fn adhoc_settled_fires_for_pending_at_arm_shas_only() {
-        let adhoc = |s: &str, gate| AdHocWorkState {
-            sha: sha(s),
-            gate,
-            handover: Handover::default(),
-        };
-        // Armed while: aaa unreviewed, bbb changes-requested, ccc
-        // pending-gate, ddd blocked, eee already continued.
-        let at_arm = vec![
-            adhoc("aaa", CommitGateState::Unreviewed),
-            adhoc("bbb", CommitGateState::ChangesRequested),
-            adhoc("ccc", CommitGateState::ContinuedPendingGate),
-            adhoc("ddd", CommitGateState::Blocked),
-            adhoc("eee", CommitGateState::Continued),
-        ];
-        let snap = StartupSnapshot::capture(&RepoState::default(), &at_arm);
-        assert!(
-            !snap.adhoc_pending_at_startup.contains(&sha("eee")),
-            "settled-at-arm shas are never captured"
-        );
-
-        // Later beat: everything settled; fff appeared post-arm
-        // already settled.
-        let now = vec![
-            adhoc("aaa", CommitGateState::Continued),
-            adhoc("bbb", CommitGateState::Continued),
-            adhoc("ccc", CommitGateState::Continued),
-            adhoc("ddd", CommitGateState::Finished),
-            adhoc("eee", CommitGateState::Continued),
-            adhoc("fff", CommitGateState::Continued),
-        ];
-        let items = detect_adhoc_settled(&snap, &now);
-        let settled: Vec<(CommitSha, CommitGateState)> = items
-            .iter()
-            .map(|i| match i {
-                WaitItem::AdHocSettled { sha, gate } => (sha.clone(), *gate),
-                other => panic!("unexpected item {other:?}"),
-            })
-            .collect();
-        assert_eq!(
-            settled,
-            vec![
-                (sha("aaa"), CommitGateState::Continued),
-                (sha("bbb"), CommitGateState::Continued),
-                (sha("ccc"), CommitGateState::Continued),
-                (sha("ddd"), CommitGateState::Finished),
-            ],
-            "every pending-at-arm settle emits (incl. pending-gate and \
-             blocked windows); eee was settled at arm and fff appeared \
-             settled — neither wakes"
-        );
-
-        // Re-arm after the wake: all settled at capture → nothing
-        // pending → the same verdicts never emit twice.
-        let resnap = StartupSnapshot::capture(&RepoState::default(), &now);
-        assert!(detect_adhoc_settled(&resnap, &now).is_empty());
-    }
-
-    #[test]
-    fn adhoc_settled_is_silent_while_still_pending_or_vanished() {
-        let at_arm = vec![AdHocWorkState {
-            sha: sha("aaa"),
-            gate: CommitGateState::Unreviewed,
-            handover: Handover::default(),
-        }];
-        let snap = StartupSnapshot::capture(&RepoState::default(), &at_arm);
-        // Still open → no wake.
-        assert!(detect_adhoc_settled(&snap, &at_arm).is_empty());
-        // Verdict window states are not settles either.
-        for gate in [
-            CommitGateState::ContinuedPendingGate,
-            CommitGateState::Blocked,
-            CommitGateState::ChangesRequested,
-        ] {
-            let now = vec![AdHocWorkState {
-                sha: sha("aaa"),
-                gate,
-                handover: Handover::default(),
-            }];
-            assert!(
-                detect_adhoc_settled(&snap, &now).is_empty(),
-                "{gate:?} must not emit"
-            );
-        }
-        // Sha gone from the ad-hoc set (plan started / new commits):
-        // no positively observed settle → no wake.
-        assert!(detect_adhoc_settled(&snap, &[]).is_empty());
     }
 
     // ============ derive_status ad-hoc + blocks ============

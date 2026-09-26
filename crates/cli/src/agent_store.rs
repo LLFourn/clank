@@ -45,6 +45,16 @@ pub fn load_agent_config(repo: &Path, label: &AgentLabel) -> anyhow::Result<Opti
     load_json(&path).with_context(|| format!("reading `{}`", path.display()))
 }
 
+/// Whether the current binding still assigns this label to this tool and session.
+/// An unreadable or absent config cannot authorize a wake.
+pub(crate) fn binding_matches(repo: &Path, label: &AgentLabel, tool: Tool, session: &str) -> bool {
+    load_agent_config(repo, label)
+        .ok()
+        .flatten()
+        .and_then(|cfg| cfg.session)
+        .is_some_and(|s| s.tool == tool && s.id.as_str() == session)
+}
+
 /// Write this agent's config to disk atomically. Creates parent
 /// dirs if needed.
 pub fn save_agent_config(repo: &Path, label: &AgentLabel, cfg: &AgentConfig) -> anyhow::Result<()> {
@@ -116,6 +126,28 @@ pub fn resolve_role(repo: &Path, label: &AgentLabel) -> anyhow::Result<clank_cor
         }),
         None => Err(no_team_configured()),
     }
+}
+
+/// The tool declared for a label in this repo's roster. Hook adapter
+/// flags describe a wire protocol; the roster describes which agent
+/// actually owns the session.
+pub fn resolve_tool(repo: &Path, label: &AgentLabel) -> anyhow::Result<Tool> {
+    let Some(set) = try_resolve_via_team(repo)? else {
+        return Err(no_team_configured());
+    };
+    if &set.master == label {
+        return Ok(set.master_desc.tool);
+    }
+    set.members
+        .iter()
+        .find(|member| &member.label == label)
+        .map(|member| member.desc.tool)
+        .ok_or_else(|| {
+            RoleResolutionError::NotRegistered {
+                label: label.clone(),
+            }
+            .into()
+        })
 }
 
 /// Best-effort role text for diagnostic/status surfaces.
@@ -524,113 +556,10 @@ pub struct BindOutcome {
 /// session uniqueness invariant can't be re-introduced by a
 /// caller that forgets the clear-stale step.
 ///
-/// Ordering: load all configs STRICT (parse errors propagate),
-/// identify stale, write the target FIRST (so a partial failure
-/// on stale-clear leaves a ghost binding rather than no
-/// binding), then clear stale. Preserves auto_mode and
-/// wait_events on the target's existing config.
-/// The agent's current wait GENERATION
-/// (claude-asyncrewake-work-loop): `wait.gen` beside the skeleton;
-/// absent or unparseable reads 0. Minted (bumped) by every claim of
-/// the label — a session BINDING and a SessionStart — so a waiter
-/// surviving a dead incarnation is revoked the moment a successor
-/// exists.
-pub(crate) fn read_wait_generation(agent_dir: &Path) -> u64 {
-    std::fs::read_to_string(agent_dir.join("wait.gen"))
-        .ok()
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(0)
-}
-
-/// When this agent's session last ENDED a turn, and which session and
-/// incarnation it was: `<epoch> <session> <generation>`.
-///
-/// Three fields because one is not enough. A stamp belongs to the
-/// session that wrote it — a rebound label or a reminted incarnation
-/// must not be measured against its predecessor's clock — and the
-/// epoch alone cannot say which.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct TurnEnd {
-    pub(crate) at: i64,
-    pub(crate) session: String,
-    pub(crate) generation: u64,
-    /// What the turn left behind. `None` on stamps written before
-    /// this field existed, and on the stamp's first write — which
-    /// lands before anything has decided, because the turn ended
-    /// whatever is decided about it.
-    pub(crate) left: Option<clank_core::hook_io::TurnLeft>,
-}
-
-pub(crate) fn read_turn_end(agent_dir: &Path) -> Option<TurnEnd> {
-    let raw = std::fs::read_to_string(agent_dir.join("turn.end")).ok()?;
-    let mut parts = raw.trim().split(' ');
-    Some(TurnEnd {
-        at: parts.next()?.parse().ok()?,
-        session: parts.next()?.to_string(),
-        generation: parts.next()?.parse().ok()?,
-        // Absent on a three-field stamp, and `None` for a token this
-        // build has no arm for. Both mean "cannot say", which is the
-        // safe direction: a reader that cannot say does not report.
-        left: parts.next().and_then(clank_core::hook_io::TurnLeft::parse),
-    })
-}
-
-/// Record that this session just ended a turn. Best-effort by policy:
-/// the hook that calls this must never fail a turn-end over a note
-/// about one.
-pub(crate) fn record_turn_end(
-    agent_dir: &Path,
-    at: i64,
-    session: &str,
-    generation: u64,
-    left: Option<clank_core::hook_io::TurnLeft>,
-) {
-    if std::fs::create_dir_all(agent_dir).is_err() {
-        return;
-    }
-    // A plain write, like `wait.gen` beside it: a torn or missing
-    // stamp reads as `None`, which is `Unknown`, which shows Stop —
-    // the harmless direction, so atomicity would be buying nothing.
-    let tail = left.map(|l| format!(" {}", l.as_str())).unwrap_or_default();
-    let _ = std::fs::write(
-        agent_dir.join("turn.end"),
-        format!("{at} {session} {generation}{tail}\n"),
-    );
-}
-
-/// Bump the generation. FALLIBLE — the caller owns the policy: a
-/// session BINDING must propagate (an ownership claim that cannot
-/// persist its revocation would leave a dead predecessor's waiter
-/// holding the lease forever — codex 1483318), while SessionStart
-/// explicitly discards to stay fail-open.
-pub(crate) fn mint_wait_generation(agent_dir: &Path) -> anyhow::Result<u64> {
-    let next = read_wait_generation(agent_dir).wrapping_add(1);
-    std::fs::create_dir_all(agent_dir)
-        .with_context(|| format!("creating `{}`", agent_dir.display()))?;
-    let gen_path = agent_dir.join("wait.gen");
-    std::fs::write(&gen_path, format!("{next}\n"))
-        .with_context(|| format!("writing `{}`", gen_path.display()))?;
-    Ok(next)
-}
-
-/// Release `label` — but only if `session` is still the session
-/// holding it. Returns whether it was released.
-///
-/// COMPARE-and-clear, never clear. The caller is a session that has
-/// decided it should stop being this label (its pane is gone), and by
-/// the time it reaches that conclusion the roster may already have
-/// reopened the label in a FRESH pane under a new session. Clearing
-/// unconditionally would take the replacement's binding away and bump
-/// its generation, revoking the wait of the agent that just took over
-/// — the paneless process killing its own successor (codex on
-/// 6303167).
-///
-/// The generation is minted for the same reason a BINDING mints one:
-/// a wait parked under the old identity must not survive the identity
-/// (codex 1483318). This is how an agent that lost its pane stops
-/// being that label — the process may linger, but nothing will hand
-/// it work again, and the roster's next reconcile opens a fresh pane
-/// for the label it still wants.
+/// Release `label` only while `session` still holds it. The compare
+/// and clear run under the label's binding lock, so an old pane cannot
+/// clear a successor's binding. Waiters check this config before they
+/// present work and stop when it changes.
 pub fn release_binding(
     repo: &Path,
     label: &AgentLabel,
@@ -648,8 +577,6 @@ fn release_locked(repo: &Path, label: &AgentLabel, session: &SessionId) -> anyho
         return Ok(false);
     }
     cfg.session = None;
-    mint_wait_generation(&agents_root(repo).join(label.as_str()))
-        .context("revoking the released agent's parked wait")?;
     save_agent_config(repo, label, &cfg)?;
     Ok(true)
 }
@@ -657,7 +584,7 @@ fn release_locked(repo: &Path, label: &AgentLabel, session: &SessionId) -> anyho
 /// Serializes every ownership transition on ONE label's binding.
 ///
 /// Comparing the session before clearing is not enough on its own:
-/// read, compare, mint and write are four steps, and a replacement
+/// read, compare and write are separate steps, and a replacement
 /// binding that lands between the read and the write is overwritten
 /// by a decision made before it existed (codex on 7e1a33e). Both
 /// sides of the transition — claiming the label and releasing it —
@@ -750,15 +677,6 @@ pub fn bind_session_to_agent(
         updated_at: now,
         transcript: None,
     });
-    // A binding is an ownership CLAIM on the label: mint the wait
-    // generation FIRST, so a completed claim can never exist without
-    // its revocation persisted (codex 1483318) — any waiter
-    // surviving a dead predecessor self-revokes (its wake pipe is
-    // dead, M0). SessionStart minting alone cannot cover the
-    // FRESH-session case: it fires before the session is bound
-    // (observed live, M2 e2e).
-    mint_wait_generation(&agents_root(repo).join(label.as_str()))
-        .context("persisting the wait-generation ownership claim")?;
     save_agent_config(repo, label, &cfg)?;
     // Dropped before any OTHER label is touched: one lock at a time is
     // what keeps two crossing binds from deadlocking on each other.
@@ -821,48 +739,8 @@ mod tests {
     ///
     /// Verified against this repo before the change: every agent read
     /// as `left: None`, which is "cannot say" and does not accuse.
-    #[test]
-    fn a_turn_end_stamp_without_a_verdict_still_reads() {
-        use clank_core::hook_io::TurnLeft;
-        let dir = tempfile::tempdir().unwrap();
-        let write = |raw: &str| {
-            std::fs::write(dir.path().join("turn.end"), raw).unwrap();
-            read_turn_end(dir.path()).expect("a stamp must still parse")
-        };
-
-        let old = write("1700000000 sess-old 3\n");
-        assert_eq!(old.at, 1_700_000_000);
-        assert_eq!(old.session, "sess-old");
-        assert_eq!(old.generation, 3);
-        assert_eq!(old.left, None, "no verdict is not a verdict of none");
-
-        let new = write("1700000000 sess-new 3 yielded\n");
-        assert_eq!(new.left, Some(TurnLeft::Yielded));
-        assert_eq!(new.session, "sess-new", "the fields before it still land");
-
-        // A token from a NEWER binary: unknown, never guessed.
-        assert_eq!(write("1700000000 sess-future 3 telepathy\n").left, None);
-    }
 
     /// Every verdict survives the file it is written to.
-    #[test]
-    fn every_turn_verdict_round_trips() {
-        use clank_core::hook_io::TurnLeft;
-        let dir = tempfile::tempdir().unwrap();
-        for left in TurnLeft::ALL {
-            record_turn_end(dir.path(), 42, "sess", 7, Some(*left));
-            let got = read_turn_end(dir.path()).expect("just written");
-            assert_eq!(got.left, Some(*left), "{left:?}");
-            assert_eq!(
-                (got.at, got.session.as_str(), got.generation),
-                (42, "sess", 7)
-            );
-        }
-        // And a stamp written with no verdict reads back as none.
-        record_turn_end(dir.path(), 42, "sess", 7, None);
-        assert_eq!(read_turn_end(dir.path()).unwrap().left, None);
-    }
-
     use super::*;
     use crate::cli::teams_config::{AgentDescription, RegisteredMember, RegisteredSet, RosterRole};
     use clank_core::vocab::{Role, Tool};
@@ -873,83 +751,14 @@ mod tests {
 
     /// Releasing the label is the death an agent that lost its pane
     /// can perform on itself: it stops being the label, and the wait
-    /// generation goes with it so anything parked in that name is
+    /// binding goes with it so anything parked in that name is
     /// revoked rather than left to collect work
     /// (nothing-refuses-in-silence).
-    #[test]
-    fn releasing_forgets_the_session_and_revokes_its_parked_wait() {
-        let dir = tempfile::tempdir().unwrap();
-        let repo = dir.path();
-        let l = label("glm");
-        let sid = sess("e30f2b50-4cef-4955-86a0-fbfe64a768b3");
-        bind_session_to_agent(repo, &l, Tool::Claude, &sid).unwrap();
-        let armed = read_wait_generation(&agents_root(repo).join(l.as_str()));
-
-        assert!(
-            release_binding(repo, &l, &sid).unwrap(),
-            "it held the label"
-        );
-
-        assert!(
-            load_agent_config(repo, &l)
-                .unwrap()
-                .unwrap()
-                .session
-                .is_none(),
-            "no longer that session's label"
-        );
-        assert_ne!(
-            read_wait_generation(&agents_root(repo).join(l.as_str())),
-            armed,
-            "a new generation revokes whatever was parked under the old identity"
-        );
-        // Nothing left to release, and nothing to churn for a label
-        // someone else may take next.
-        let after = read_wait_generation(&agents_root(repo).join(l.as_str()));
-        assert!(!release_binding(repo, &l, &sid).unwrap());
-        assert_eq!(
-            read_wait_generation(&agents_root(repo).join(l.as_str())),
-            after
-        );
-    }
 
     /// The race this is compare-and-clear for: the roster reopens the
     /// label in a fresh pane, and only THEN does the old paneless
     /// process reach its Stop hook. It must not take the
     /// replacement's binding with it.
-    #[test]
-    fn a_paneless_session_cannot_release_its_successors_binding() {
-        let dir = tempfile::tempdir().unwrap();
-        let repo = dir.path();
-        let l = label("glm");
-        let (old, new) = (
-            sess("e30f2b50-4cef-4955-86a0-fbfe64a768b3"),
-            sess("11111111-2222-3333-4444-555555555555"),
-        );
-        bind_session_to_agent(repo, &l, Tool::Claude, &old).unwrap();
-        bind_session_to_agent(repo, &l, Tool::Claude, &new).unwrap();
-        let armed = read_wait_generation(&agents_root(repo).join(l.as_str()));
-
-        assert!(
-            !release_binding(repo, &l, &old).unwrap(),
-            "the old session no longer holds the label, so it releases nothing"
-        );
-
-        assert_eq!(
-            load_agent_config(repo, &l)
-                .unwrap()
-                .unwrap()
-                .session
-                .map(|s| s.id),
-            Some(new),
-            "the replacement keeps the label"
-        );
-        assert_eq!(
-            read_wait_generation(&agents_root(repo).join(l.as_str())),
-            armed,
-            "and its parked wait is not revoked out from under it"
-        );
-    }
 
     /// Comparing is not enough if the compare and the write are not
     /// the same moment. This pins the SERIALIZATION: while the
@@ -957,71 +766,6 @@ mod tests {
     /// replacement that binds inside that window is read by the
     /// release when it finally runs, not overwritten by a decision
     /// taken before it existed (codex on 7e1a33e).
-    #[test]
-    fn a_release_cannot_straddle_a_rebind() {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, Ordering};
-        let dir = tempfile::tempdir().unwrap();
-        let repo = dir.path().to_path_buf();
-        let l = label("glm");
-        let (old, new) = (
-            sess("e30f2b50-4cef-4955-86a0-fbfe64a768b3"),
-            sess("11111111-2222-3333-4444-555555555555"),
-        );
-        bind_session_to_agent(&repo, &l, Tool::Claude, &old).unwrap();
-
-        let held = binding_lock(&repo, &l).unwrap();
-        let done = Arc::new(AtomicBool::new(false));
-        let releaser = {
-            let (repo, l, old, done) = (repo.clone(), l.clone(), old.clone(), done.clone());
-            std::thread::spawn(move || {
-                let out = release_binding(&repo, &l, &old);
-                done.store(true, Ordering::SeqCst);
-                out.unwrap()
-            })
-        };
-
-        // It must still be waiting: this is the window in which a
-        // lock-free release does its damage.
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        assert!(
-            !done.load(Ordering::SeqCst),
-            "a release must wait for the label's lock, not act on a stale read"
-        );
-
-        // The replacement takes the label inside that window — what
-        // `bind_session_to_agent` does under this same lock.
-        let mut cfg = load_agent_config(&repo, &l).unwrap().unwrap_or_default();
-        cfg.session = Some(Session {
-            id: new.clone(),
-            tool: Tool::Claude,
-            updated_at: "2026-09-11T09:27:15Z".to_string(),
-            transcript: None,
-        });
-        mint_wait_generation(&agents_root(&repo).join(l.as_str())).unwrap();
-        save_agent_config(&repo, &l, &cfg).unwrap();
-        let armed = read_wait_generation(&agents_root(&repo).join(l.as_str()));
-        drop(held);
-
-        assert!(
-            !releaser.join().unwrap(),
-            "the release finds the label already someone else's and gives up"
-        );
-        assert_eq!(
-            load_agent_config(&repo, &l)
-                .unwrap()
-                .unwrap()
-                .session
-                .map(|s| s.id),
-            Some(new),
-            "the replacement still holds the label"
-        );
-        assert_eq!(
-            read_wait_generation(&agents_root(&repo).join(l.as_str())),
-            armed,
-            "and its parked wait was never revoked"
-        );
-    }
 
     /// The transcript path is recorded only while the session that
     /// reported it still holds the label — a path arriving after a
