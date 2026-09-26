@@ -1023,6 +1023,7 @@ fn apply_detail_action(
             let next = flip_auto(auto_mode);
             if crate::agent_store::set_auto_mode(repo, &label, next).is_ok() {
                 snapshot.agents[idx].auto_mode = next;
+                snapshot.agents[idx].auto_mode_explicit = Some(next);
             }
             Mode::AgentDetail { idx, sel }
         }
@@ -1911,6 +1912,10 @@ pub(crate) struct Position {
     /// The bound session scopes messages waiting for transcript proof.
     pub(crate) session: Option<String>,
     pub(crate) role: String,
+    /// Effective auto mode and its per-agent override, if one exists.
+    pub(crate) auto: clank_core::vocab::AutoMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) auto_explicit: Option<clank_core::vocab::AutoMode>,
     pub(crate) owes: Option<Owed>,
     pub(crate) last: Option<String>,
     /// Whether clank can show this agent's transcript, or only its
@@ -2073,6 +2078,8 @@ pub(crate) fn web_facts(
             invocation: a.invocation.clone(),
             session: a.session.as_ref().map(|s| s.id.as_str().to_string()),
             role: render::tier_label(a.role).to_string(),
+            auto: a.auto_mode,
+            auto_explicit: a.auto_mode_explicit,
             owes: owed.remove(&a.label),
             last: last_act(snap, &a.label, a.role),
             transcript: with_transcript.contains(&a.label),
@@ -3516,6 +3523,7 @@ pub(crate) async fn run_tui(
                                             .is_ok()
                                             {
                                                 snapshot.agents[i].auto_mode = next;
+                                                snapshot.agents[i].auto_mode_explicit = Some(next);
                                             }
                                         }
                                     }
@@ -5752,6 +5760,7 @@ pub(crate) mod tests {
             clank_core::vocab::Tool::Claude,
             "bound-session",
         ));
+        s.agents[0].auto_mode_explicit = Some(clank_core::vocab::AutoMode::On);
         let v = serde_json::to_value(web_facts(&s, &Default::default())).unwrap();
         assert_eq!(v["agents"][0]["session"], "bound-session");
 
@@ -5769,6 +5778,8 @@ pub(crate) mod tests {
                 "invocation",
                 "session",
                 "role",
+                "auto",
+                "auto_explicit",
                 "owes",
                 "last",
                 "transcript"

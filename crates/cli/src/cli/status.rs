@@ -157,8 +157,8 @@ pub struct StatusSnapshot {
 }
 
 /// One team agent as the TUI's agent panel sees it: its label,
-/// roster role, and EFFECTIVE auto-mode. The auto-mode is the
-/// *armed* state (takes effect at that agent's next Stop-hook
+/// roster role, effective auto-mode, and optional per-agent override.
+/// The auto-mode is the *armed* state (takes effect at that agent's next Stop-hook
 /// decision), NOT a live run indicator.
 #[derive(serde::Serialize)]
 pub(crate) struct AgentAutoRow {
@@ -169,6 +169,10 @@ pub(crate) struct AgentAutoRow {
     pub(crate) role: crate::cli::teams_config::RosterRole,
     #[serde(rename = "auto")]
     pub(crate) auto_mode: clank_core::vocab::AutoMode,
+    /// `None` means the effective value comes from the user default
+    /// or the built-in off default, as `clank auto status --json` says.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) auto_mode_explicit: Option<clank_core::vocab::AutoMode>,
     /// Roster `AgentDescription` facts the detail page surfaces: the
     /// tool and the invocation that runs it (launch command + args, or
     /// the bare tool).
@@ -341,6 +345,7 @@ fn roster_auto_rows(
             label: label.as_str().to_string(),
             role,
             auto_mode,
+            auto_mode_explicit: cfg.as_ref().and_then(|c| c.auto_mode),
             tool: desc.tool.as_str().to_string(),
             invocation: agent_invocation(desc),
             session,
@@ -2595,6 +2600,7 @@ mod dirty_and_wake_tests {
             label: label.to_string(),
             role: crate::cli::teams_config::RosterRole::Master,
             auto_mode: clank_core::vocab::AutoMode::On,
+            auto_mode_explicit: None,
             tool: "claude".to_string(),
             invocation: "claude".to_string(),
             session: None,

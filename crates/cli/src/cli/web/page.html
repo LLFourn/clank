@@ -292,7 +292,7 @@
   .ledger .team .member { border-top: 1px solid var(--edge); padding: 8px 0; }
   .ledger .team .member summary span { color: var(--muted); font: 12px var(--mono); margin-left: 8px; }
   .ledger .team .member pre { white-space: pre-wrap; overflow-wrap: anywhere; font: 12px var(--mono); margin: 7px 0; }
-  .ledger .team .member .binding { color: var(--muted); font: 12px var(--mono); }
+  .ledger .team .member .binding, .ledger .team .member .auto-state { color: var(--muted); font: 12px var(--mono); }
   .ledger .team .controls { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; margin: 8px 0; }
   .ledger .team input, .ledger .team select { min-width: 0; padding: 5px; border: 1px solid var(--edge); border-radius: 4px; background: var(--base); color: var(--ink); font: 12px var(--mono); }
   .ledger .team input { flex: 1 1 110px; }
@@ -1489,7 +1489,7 @@
   }
   $('team').addEventListener('toggle', () => { if ($('team').open) loadLibrary(); });
   function paintTeam(agents) {
-    const sig = JSON.stringify(agents.map((a) => [a.label, a.role, a.tool, a.invocation, a.session, paneState(a.label)]));
+    const sig = JSON.stringify(agents.map((a) => [a.label, a.role, a.tool, a.invocation, a.session, a.auto, a.auto_explicit, paneState(a.label)]));
     if (sig === teamDrawn) return;
     teamDrawn = sig;
     const rows = $('team-rows');
@@ -1498,13 +1498,16 @@
       .map((el) => [el.closest('.member').dataset.label, el.value]));
     rows.innerHTML = agents.map((a) => {
       const name = esc(a.label), master = a.role === 'master';
+      const auto = a.auto === 'on' ? 'on' : 'off', nextAuto = auto === 'on' ? 'off' : 'on';
       const tier = master ? '' : `<label>review tier <select data-do="review" aria-label="Review tier for ${name}">`
         + reviewKinds.map((kind) => `<option value="${kind}"${a.role === kind ? ' selected' : ''}>${kind === 'standby' ? 'standby (no reviews)' : kind}</option>`).join('')
         + '</select></label>';
       return `<details class="member" data-label="${name}"><summary>${name}<span>${esc(a.role)} · ${esc(a.tool || '')}</span></summary>`
         + `<pre>${esc(a.invocation || a.tool || '')}</pre>`
         + `<div class="binding">${a.session ? `session ${esc(a.session)}` : 'unbound — the agent binds its own session'} · ${paneState(a.label)}</div>`
+        + `<div class="auto-state">Auto ${auto} · ${a.auto_explicit == null ? 'inherited' : 'set for this agent'}</div>`
         + `<div class="controls">${tier}${master ? '' : '<button type="button" data-do="promote">Promote to master</button>'}`
+        + `<button type="button" data-do="auto_mode" data-mode="${nextAuto}">Turn auto ${nextAuto}</button>`
         + `${a.session ? `<button type="button" data-do="clear_session" data-session="${esc(a.session)}">Clear session</button>` : ''}`
         + `${paneState(a.label) === 'pane missing' ? '<button type="button" data-do="reopen">Reopen pane</button>' : ''}`
         + `<input class="swap" list="team-library" aria-label="Replace ${name} with agent" placeholder="replacement agent">`
@@ -1588,6 +1591,17 @@
       const armed = $('team-rows').querySelector(`.member[data-label="${CSS.escape(armedAgent)}"] button[data-do="remove"]`);
       if (armed) { armed.classList.remove('armed'); armed.textContent = 'Remove'; }
       armedAgent = null;
+    }
+    if (action === 'auto_mode') {
+      const mode = button.dataset.mode;
+      button.disabled = true;
+      askAgent({ do: 'auto_mode', label, mode }).then((ok) => {
+        if (ok) {
+          const agent = roster().find((a) => a.label === label);
+          if (agent) { agent.auto = mode; agent.auto_explicit = mode; paintTeam(roster()); }
+        } else button.disabled = false;
+      });
+      return;
     }
     if (action === 'remove') {
       if (armedAgent !== label) {

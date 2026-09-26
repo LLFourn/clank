@@ -1966,6 +1966,7 @@ mod tests {
                     crate::cli::teams_config::RosterRole::Commit
                 },
                 auto_mode: clank_core::vocab::AutoMode::On,
+                auto_mode_explicit: None,
                 tool: "claude".into(),
                 invocation: "claude".into(),
                 session: None,
@@ -3183,6 +3184,7 @@ mod tests {
                     label: "claude".into(),
                     role: crate::cli::teams_config::RosterRole::Master,
                     auto_mode: clank_core::vocab::AutoMode::On,
+                    auto_mode_explicit: None,
                     tool: "claude".into(),
                     invocation: "claude".into(),
                     session: None,
@@ -3193,6 +3195,7 @@ mod tests {
                     label: "codex".into(),
                     role: crate::cli::teams_config::RosterRole::Commit,
                     auto_mode: clank_core::vocab::AutoMode::On,
+                    auto_mode_explicit: None,
                     tool: "codex".into(),
                     invocation: "codex".into(),
                     session: None,

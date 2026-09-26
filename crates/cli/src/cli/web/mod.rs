@@ -2473,6 +2473,10 @@ enum AgentAsk {
         label: String,
         session: String,
     },
+    AutoMode {
+        label: String,
+        mode: clank_core::vocab::AutoMode,
+    },
 }
 
 /// Repo-roster mutations go through the same cores as the TUI. None
@@ -2526,6 +2530,14 @@ fn perform_agent_action(repo: &Path, home: Option<&Path>, ask: AgentAsk) -> anyh
                 );
             }
             Ok(())
+        }
+        AgentAsk::AutoMode { label, mode } => {
+            let label = parse(&label)?;
+            let roster = crate::agent_store::load_repo_config_required(repo)?;
+            if !roster.agents.contains_key(&label) {
+                anyhow::bail!("`{label}` is no longer on the roster");
+            }
+            crate::agent_store::set_auto_mode(repo, &label, mode)
         }
     }
 }
@@ -5708,6 +5720,117 @@ mod tests {
         assert!(
             !cfg.agents
                 .contains_key(&AgentLabel::parse("replacement").unwrap())
+        );
+        let _ = cancel.send(true);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn web_auto_mode_shows_inheritance_and_uses_the_cli_write() {
+        use clank_core::ids::AgentLabel;
+        use clank_core::vocab::AutoMode;
+
+        let (base, door, anon, cancel, home, repo) = door_only().await;
+        let p = repo.path();
+        std::fs::create_dir_all(p.join(".clank")).unwrap();
+        std::fs::write(
+            p.join(".clank/config.json"),
+            r#"{"agents":{"codex":{"tool":"codex","role":"master"},"grok":{"tool":"grok","role":"commit"},"claude":{"tool":"claude","role":"final"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(p.join("readme"), "base\n").unwrap();
+        for args in [vec!["add", "-A"], vec!["commit", "--quiet", "-m", "base"]] {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(p)
+                .args(&args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        crate::cli::team::write_user_config(
+            home.path(),
+            &crate::cli::teams_config::UserConfigFile {
+                auto: Some(AutoMode::On),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let label = |s| AgentLabel::parse(s).unwrap();
+        crate::agent_store::set_auto_mode(p, &label("grok"), AutoMode::On).unwrap();
+        crate::agent_store::set_auto_mode(p, &label("claude"), AutoMode::Off).unwrap();
+
+        let snap = crate::cli::status::snapshot(p, Some(home.path()))
+            .await
+            .unwrap();
+        let facts = status_payload(p, &snap, &Default::default());
+        let agents = facts["facts"]["agents"].as_array().unwrap();
+        let agent = |name: &str| agents.iter().find(|a| a["label"] == name).unwrap();
+        assert_eq!(agent("codex")["auto"], "on");
+        assert!(agent("codex")["auto_explicit"].is_null());
+        assert_eq!(agent("grok")["auto"], "on");
+        assert_eq!(agent("grok")["auto_explicit"], "on");
+        assert_eq!(agent("claude")["auto"], "off");
+        assert_eq!(agent("claude")["auto_explicit"], "off");
+
+        let cookie = door
+            .open_session("token")
+            .map(|t| format!("{}={t}", door::COOKIE))
+            .unwrap();
+        let ask = |label: &str, mode: &str| {
+            anon.post(format!("{base}/agents"))
+                .header("cookie", &cookie)
+                .header("origin", &base)
+                .json(&serde_json::json!({"do":"auto_mode","label":label,"mode":mode}))
+                .send()
+        };
+        assert_eq!(ask("codex", "off").await.unwrap().status(), 204);
+        let cfg = crate::agent_store::load_agent_config(p, &label("codex"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(cfg.auto_mode, Some(AutoMode::Off));
+        // This is the resolver `clank auto status` uses.
+        assert_eq!(
+            crate::cli::team::resolve_effective_auto_mode(Some(&cfg), Some(home.path())),
+            AutoMode::Off
+        );
+        let after = crate::cli::status::snapshot(p, Some(home.path()))
+            .await
+            .unwrap();
+        let changed = status_payload(p, &after, &Default::default());
+        let codex = changed["facts"]["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["label"] == "codex")
+            .unwrap();
+        assert_eq!(codex["auto"], "off");
+        assert_eq!(codex["auto_explicit"], "off");
+
+        // A failed config read prevents the write, and the route says why.
+        let broken = p.join(".clank/agents/grok/config.json");
+        std::fs::write(&broken, "not-json").unwrap();
+        let refused_write = ask("grok", "off").await.unwrap();
+        assert_eq!(refused_write.status(), 409);
+        assert!(refused_write.text().await.unwrap().contains("grok"));
+        assert_eq!(std::fs::read_to_string(&broken).unwrap(), "not-json");
+
+        let refused = ask("departed", "on").await.unwrap();
+        assert_eq!(refused.status(), 409);
+        assert!(
+            refused
+                .text()
+                .await
+                .unwrap()
+                .contains("no longer on the roster")
+        );
+        assert!(
+            crate::agent_store::load_agent_config(p, &label("departed"))
+                .unwrap()
+                .is_none()
         );
         let _ = cancel.send(true);
     }

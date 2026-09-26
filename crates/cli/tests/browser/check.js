@@ -326,6 +326,53 @@ const ok = (name, cond, detail = '') => out.push(`${cond ? 'PASS' : 'FAIL'}  ${n
     await browser.close();
   }
 
+  // ---- auto mode shows effective and inherited state for each agent
+  {
+    const { browser, page, errors } = await open();
+    await page.evaluate(() => {
+      window.__autoRefused = true;
+      window.fetch = async (url, opts) => {
+        window.__frames.push([url, opts?.body]);
+        if (url === '/agents/candidates') return { ok: true, json: async () => [] };
+        if (url === '/agents' && JSON.parse(opts.body).do === 'auto_mode' && window.__autoRefused)
+          return { ok: false, status: 409, text: async () => '{"why":"agent config could not be written"}' };
+        return { ok: true, status: 204 };
+      };
+    });
+    await page.evaluate((d) => window.__send('status', d), facts([
+      { ...agent('codex', 'master'), tool: 'codex', auto: 'on' },
+      { ...agent('grok', 'commit'), tool: 'grok', auto: 'on', auto_explicit: 'on' },
+      { ...agent('claude', 'final'), tool: 'claude', auto: 'off', auto_explicit: 'off' },
+    ]));
+    await page.click('#more');
+    await page.click('#team > summary');
+    for (const name of ['codex', 'grok', 'claude'])
+      await page.click(`.team .member[data-label="${name}"] > summary`);
+    const row = (name) => `.team .member[data-label="${name}"]`;
+    ok('inherited on, explicit on, and explicit off are distinct',
+       (await page.textContent(`${row('codex')} .auto-state`)).includes('Auto on · inherited')
+       && (await page.textContent(`${row('grok')} .auto-state`)).includes('Auto on · set for this agent')
+       && (await page.textContent(`${row('claude')} .auto-state`)).includes('Auto off · set for this agent'));
+    await page.click(`${row('codex')} button[data-do="auto_mode"]`);
+    await page.waitForFunction(() => document.querySelector('#team-why').textContent.includes('could not be written'));
+    ok('a refused write explains itself without changing the displayed mode',
+       (await page.textContent(`${row('codex')} .auto-state`)).includes('Auto on · inherited')
+       && !(await page.isDisabled(`${row('codex')} button[data-do="auto_mode"]`)));
+    await page.evaluate(() => { window.__autoRefused = false; });
+    await page.click(`${row('codex')} button[data-do="auto_mode"]`);
+    await page.waitForFunction(() => document.querySelector('.member[data-label="codex"] .auto-state').textContent.includes('Auto off'));
+    const asks = await page.evaluate(() => window.__frames.filter((f) => f[0] === '/agents')
+      .map((f) => JSON.parse(f[1])).filter((a) => a.do === 'auto_mode'));
+    ok('a successful toggle writes the requested mode and updates immediately',
+       asks.length === 2 && asks.every((a) => a.label === 'codex' && a.mode === 'off')
+       && (await page.textContent(`${row('codex')} .auto-state`)).includes('Auto off · set for this agent'));
+    await page.click(`${row('claude')} button[data-do="auto_mode"]`);
+    await page.waitForFunction(() => document.querySelector('.member[data-label="claude"] .auto-state').textContent.includes('Auto on'));
+    ok('off can be turned on', (await page.textContent(`${row('claude')} .auto-state`)).includes('Auto on · set for this agent'));
+    ok('auto mode controls have no script errors', errors.length === 0, errors.join('; '));
+    await browser.close();
+  }
+
   // ---- session clearing and pane recovery use separate agent actions
   {
     const { browser, page, errors } = await open();
