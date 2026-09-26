@@ -1440,15 +1440,30 @@ fn codex_submit_argv(pane: &str) -> Vec<String> {
     .collect()
 }
 
-/// Interrupt whatever `pane` is doing: byte 27, Escape, which is how
-/// a harness's own user stops it. Sent the same way Return is.
-///
-/// Harmless at an idle prompt, which is what makes the page able to
-/// offer it whenever an agent MIGHT be working — see `Working`.
-pub(crate) fn stop_pane(session: &str, pane: &str) -> anyhow::Result<()> {
+/// Grok cancels a running turn with Ctrl+C; Esc only shows a hint.
+/// Other harnesses use Escape. Select the key from the pane's tool,
+/// never from an inherited environment variable in the web server.
+fn stop_argv(pane: &str, tool: clank_core::vocab::Tool) -> Vec<String> {
+    let byte = if tool == clank_core::vocab::Tool::Grok {
+        "3"
+    } else {
+        "27"
+    };
+    ["action", "write", "-p", pane, byte]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+
+pub(crate) fn stop_pane(
+    session: &str,
+    pane: &str,
+    tool: clank_core::vocab::Tool,
+) -> anyhow::Result<()> {
+    let argv = stop_argv(pane, tool);
     let out = std::process::Command::new("zellij")
         .args(["--session", session])
-        .args(["action", "write", "-p", pane, "27"])
+        .args(&argv)
         .output()?;
     if !out.status.success() {
         anyhow::bail!(
@@ -4348,6 +4363,22 @@ dead-one [Created 10h ago] (EXITED - attach to resurrect)
                 "117"
             ]
         );
+    }
+
+    #[test]
+    fn the_stop_key_follows_the_panes_tool() {
+        use clank_core::vocab::Tool;
+        assert_eq!(
+            stop_argv("terminal_15", Tool::Grok),
+            ["action", "write", "-p", "terminal_15", "3"]
+        );
+        for tool in [Tool::Claude, Tool::Codex, Tool::OpenCode] {
+            assert_eq!(
+                stop_argv("terminal_16", tool),
+                ["action", "write", "-p", "terminal_16", "27"],
+                "{tool:?} still receives Escape"
+            );
+        }
     }
 
     /// The convention is deterministic per repo, and it is only a

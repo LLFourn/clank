@@ -732,10 +732,15 @@
   // a new session in the SAME pane looked like the old one (codex on
   // 210afee).
   const stopped = new Map();
+  const grokStop = (label) => roster().some((a) => a.label === label && a.tool === 'grok');
   function stopping(label) {
     const s = stopped.get(label);
     if (!s) return false;
     if (paneOf.get(label) !== s.pane) return false;         // a new pane is new work
+    // Grok's first Ctrl+C can clear a draft without cancelling the
+    // running turn. Let the person retry after a short pause; only a
+    // fresh press sends another key.
+    if (grokStop(label) && Date.now() >= s.retryAt) return false;
     const w = agents.get(label);
     if (!w) return true;                                    // no transcript: nothing can say otherwise
     if (w.session !== s.session || w.generation !== s.generation) return false;
@@ -1273,18 +1278,20 @@
       session: w && w.session,
       generation: w && w.generation,
       rev: revisionOf(label),
+      retryAt: Date.now() + 2000,
     });
     syncSend();
     try {
       const r = await fetch('/stop', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ pane: pid }) });
       if (!r.ok) throw new Error(await r.text());
+      sentEl.textContent = grokStop(label) ? 'Ctrl+C sent; retry only if it cleared a draft' : '';
+      if (grokStop(label)) setTimeout(() => { if (shown === label) syncSend(); }, 2000);
     } catch (err) {
       // It was not stopped, so the button must come back — the agent
       // is still running and this is the only way to try again.
       if (stopped.get(label)?.pane === pid) stopped.delete(label);
       syncSend();
-      sentEl.textContent = 'Not stopped';
-      setTimeout(() => { sentEl.textContent = ''; }, 1500);
+      sentEl.textContent = `Not stopped: ${err.message || String(err)}`;
       console.error(err);
     }
   });

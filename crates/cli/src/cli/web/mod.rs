@@ -185,6 +185,23 @@ impl Zellij {
     }
 }
 
+/// Resolve the tool from this repo's current agent table, not from
+/// the web server's inherited environment or a pane title.
+fn pane_tool(
+    repo: &Path,
+    table: &[PaneMeta],
+    pane: &str,
+) -> anyhow::Result<clank_core::vocab::Tool> {
+    let label = table
+        .iter()
+        .find(|entry| entry.id == pane)
+        .ok_or_else(|| anyhow::anyhow!("pane `{pane}` is not an agent in this repo"))?
+        .label
+        .as_str();
+    let label = clank_core::ids::AgentLabel::parse(label)?;
+    crate::agent_store::resolve_tool(repo, &label)
+}
+
 impl Panes for Zellij {
     fn session(&self) -> &str {
         &self.session
@@ -223,7 +240,12 @@ impl Panes for Zellij {
         open_zellij::say_to_pane(&self.session, pane, text)
     }
     fn stop(&self, pane: &str) -> anyhow::Result<()> {
-        open_zellij::stop_pane(&self.session, pane)
+        let panes = open_zellij::snapshot_panes_in(&self.session).ok_or_else(|| {
+            anyhow::anyhow!("zellij did not answer for session `{}`", self.session)
+        })?;
+        let table = open_zellij::agent_pane_table(&panes, &self.repo);
+        let tool = pane_tool(&self.repo, &table, pane)?;
+        open_zellij::stop_pane(&self.session, pane, tool)
     }
 }
 
@@ -2182,11 +2204,9 @@ async fn upload(req: hyper::Request<hyper::body::Incoming>, ctx: &Ctx) -> Resp {
     )
 }
 
-/// Interrupt the shown agent: Escape to its pane.
-///
-/// Offered whenever an agent MIGHT be working, so it must be safe
-/// when it is not — Escape at an idle prompt does nothing, which is
-/// what lets the page stop needing certainty.
+/// Interrupt the shown agent with its harness's own control key.
+/// Offered whenever an agent might be working; a successful response
+/// means the key was delivered, not that a turn is known to have ended.
 async fn stop(req: hyper::Request<hyper::body::Incoming>, ctx: &Ctx) -> Resp {
     let body = http_body_util::Limited::new(req.into_body(), 4 * 1024);
     let Ok(bytes) = body.collect().await.map(|c| c.to_bytes()) else {
@@ -2291,6 +2311,39 @@ async fn say(req: hyper::Request<hyper::body::Incoming>, ctx: &Ctx) -> Resp {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_stop_resolves_the_tool_of_the_target_pane() {
+        use super::*;
+        use clank_core::vocab::Tool;
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join(".clank")).unwrap();
+        std::fs::write(
+            repo.path().join(".clank/config.json"),
+            r#"{"agents":{"grok":{"tool":"grok","role":"master"},"claude":{"tool":"claude","role":"commit"}}}"#,
+        )
+        .unwrap();
+        let table = ["grok", "claude"]
+            .into_iter()
+            .enumerate()
+            .map(|(i, label)| PaneMeta {
+                id: format!("terminal_{i}"),
+                label: label.into(),
+                columns: 80,
+                rows: 24,
+                exited: false,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            pane_tool(repo.path(), &table, "terminal_0").unwrap(),
+            Tool::Grok
+        );
+        assert_eq!(
+            pane_tool(repo.path(), &table, "terminal_1").unwrap(),
+            Tool::Claude
+        );
+        assert!(pane_tool(repo.path(), &table, "terminal_2").is_err());
+    }
+
     /// The REAL head, captured off a live quick tunnel. Everything
     /// this repair exists for is in these bytes: the key and the
     /// version arrive, the two hop-by-hop fields do not, and the
@@ -4761,6 +4814,16 @@ mod tests {
     /// transcript together, without driving a person's Grok session.
     struct GrokPanes {
         history: PathBuf,
+        state: Arc<Mutex<GrokPaneState>>,
+    }
+
+    #[derive(Default)]
+    struct GrokPaneState {
+        busy: bool,
+        draft: bool,
+        queued: Option<String>,
+        refuse_stop: bool,
+        interrupted: bool,
     }
 
     impl Panes for GrokPanes {
@@ -4782,6 +4845,12 @@ mod tests {
         fn say(&self, pane: &str, text: &str) -> anyhow::Result<()> {
             anyhow::ensure!(pane == "terminal_77", "unknown Grok pane");
             anyhow::ensure!(text != "fail", "Grok pane refused the message");
+            let mut state = self.state.lock().unwrap();
+            if state.busy {
+                state.queued = Some(text.to_string());
+                return Ok(());
+            }
+            drop(state);
             use std::io::Write;
             let mut file = std::fs::OpenOptions::new()
                 .append(true)
@@ -4798,7 +4867,32 @@ mod tests {
             )?;
             Ok(())
         }
-        fn stop(&self, _pane: &str) -> anyhow::Result<()> {
+        fn stop(&self, pane: &str) -> anyhow::Result<()> {
+            anyhow::ensure!(pane == "terminal_77", "unknown Grok pane");
+            let mut state = self.state.lock().unwrap();
+            anyhow::ensure!(!state.refuse_stop, "Grok interrupt could not be delivered");
+            if state.draft {
+                state.draft = false;
+                return Ok(());
+            }
+            state.interrupted = true;
+            state.busy = false;
+            if let Some(queued) = state.queued.take() {
+                use std::io::Write;
+                let mut file = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&self.history)?;
+                writeln!(
+                    file,
+                    "{}",
+                    serde_json::json!({"type":"user","content":[{"type":"text","text":queued}]})
+                )?;
+                writeln!(
+                    file,
+                    "{}",
+                    serde_json::json!({"type":"assistant","content":"queued reply after interrupt"})
+                )?;
+            }
             Ok(())
         }
     }
@@ -4860,10 +4954,14 @@ mod tests {
             AutoMode::On,
         )];
         let door = Arc::new(door::Door::new(Some(home.path().to_path_buf())));
+        let state = Arc::new(Mutex::new(GrokPaneState::default()));
         let instance = Instance::start(
             repo.path().to_path_buf(),
             Some(home.path().to_path_buf()),
-            Arc::new(GrokPanes { history }),
+            Arc::new(GrokPanes {
+                history: history.clone(),
+                state: state.clone(),
+            }),
             door.clone(),
             Startup {
                 tunnel: None,
@@ -4941,6 +5039,75 @@ mod tests {
                 .unwrap()
                 .contains("Grok pane refused the message")
         );
+
+        // Grok's fixture queues a prompt while busy. A refused Stop
+        // leaves it queued; one delivered Ctrl+C clears a local draft,
+        // and a second reaches the running turn.
+        state.lock().unwrap().busy = true;
+        let queued = client
+            .post(format!("{}/say", instance.url))
+            .header("origin", &instance.url)
+            .header("cookie", &cookie)
+            .json(&serde_json::json!({"pane":"terminal_77","text":"queued question"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(queued.status(), 204);
+        assert!(state.lock().unwrap().queued.is_some());
+        state.lock().unwrap().refuse_stop = true;
+        let refused = client
+            .post(format!("{}/stop", instance.url))
+            .header("origin", &instance.url)
+            .header("cookie", &cookie)
+            .json(&serde_json::json!({"pane":"terminal_77"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), 502);
+        assert!(
+            refused
+                .text()
+                .await
+                .unwrap()
+                .contains("Grok interrupt could not be delivered")
+        );
+        assert!(!state.lock().unwrap().interrupted);
+        {
+            let mut state = state.lock().unwrap();
+            state.refuse_stop = false;
+            state.draft = true;
+        }
+        let stopped = client
+            .post(format!("{}/stop", instance.url))
+            .header("origin", &instance.url)
+            .header("cookie", &cookie)
+            .json(&serde_json::json!({"pane":"terminal_77"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(stopped.status(), 204);
+        assert!(!state.lock().unwrap().interrupted);
+        assert!(!state.lock().unwrap().draft);
+        let stopped = client
+            .post(format!("{}/stop", instance.url))
+            .header("origin", &instance.url)
+            .header("cookie", &cookie)
+            .json(&serde_json::json!({"pane":"terminal_77"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(stopped.status(), 204);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(6);
+        while !frames.contains("queued reply after interrupt") {
+            let frame = tokio::time::timeout_at(deadline, peer.next())
+                .await
+                .expect("queued Grok reply frame")
+                .unwrap()
+                .unwrap();
+            frames.push_str(frame.to_text().unwrap());
+        }
+        assert!(state.lock().unwrap().interrupted);
+        assert!(frames.contains("queued question"));
         drop(peer);
         instance.stop().await;
     }

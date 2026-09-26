@@ -57,7 +57,7 @@ const ok = (name, cond, detail = '') => out.push(`${cond ? 'PASS' : 'FAIL'}  ${n
   {
     const { browser, page, errors } = await open();
     await page.evaluate((d) => window.__send('status', d), facts([
-      agent('grok', 'master', null, null, true),
+      { ...agent('grok', 'master', null, null, true), tool: 'grok' },
     ]));
     await page.evaluate((d) => window.__send('panes', d), panes(['grok']));
     await page.evaluate((d) => window.__send('turns', d), turns('grok', [
@@ -86,6 +86,21 @@ const ok = (name, cond, detail = '') => out.push(`${cond ? 'PASS' : 'FAIL'}  ${n
     await page.click('#send');
     await page.waitForTimeout(40);
     ok('a Grok send failure names its reason', (await page.textContent('#sent')).includes('Grok pane refused the message'));
+    await page.evaluate(() => {
+      window.fetch = async () => ({ ok: false, status: 502, text: async () => 'Grok interrupt could not be delivered' });
+    });
+    await page.click('#stop');
+    await page.waitForTimeout(40);
+    ok('a Grok interrupt failure names its reason', (await page.textContent('#sent')).includes('Grok interrupt could not be delivered'));
+    ok('a failed Grok Stop can be retried', await page.isVisible('#stop'));
+    await page.evaluate(() => {
+      window.fetch = async () => ({ ok: true, status: 204, text: async () => '' });
+    });
+    await page.click('#stop');
+    ok('a delivered Grok Stop settles briefly', await page.isHidden('#stop'));
+    ok('Grok Stop explains when to retry', (await page.textContent('#sent')).includes('if it cleared a draft'));
+    await page.waitForTimeout(2100);
+    ok('Grok Stop can be tried again if a draft absorbed Ctrl+C', await page.isVisible('#stop'));
     ok('Grok chat has no script errors', errors.length === 0, errors.join('; '));
     await browser.close();
   }
@@ -242,7 +257,7 @@ const ok = (name, cond, detail = '') => out.push(`${cond ? 'PASS' : 'FAIL'}  ${n
     await page.click('#stop');
     await page.waitForTimeout(60);
     ok('a failed Stop can be retried', await page.isVisible('#stop'));
-    ok('and says so', (await page.textContent('#sent')).includes('Not stopped'));
+    ok('and names the refusal', (await page.textContent('#sent')).includes('Not stopped: boom'));
     ok('no errors around Stop', errors.length === 0, errors.join('; '));
   }
 

@@ -1904,6 +1904,8 @@ pub(crate) struct Owed {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct Position {
     pub(crate) label: String,
+    /// The harness whose terminal control keys apply to this agent.
+    pub(crate) tool: String,
     pub(crate) role: String,
     pub(crate) owes: Option<Owed>,
     pub(crate) last: Option<String>,
@@ -2051,6 +2053,7 @@ pub(crate) fn web_facts(
         .into_iter()
         .map(|a| Position {
             label: a.label.clone(),
+            tool: a.tool.clone(),
             role: render::tier_label(a.role).to_string(),
             owes: owed.remove(&a.label),
             last: last_act(snap, &a.label, a.role),
@@ -5684,7 +5687,7 @@ pub(crate) mod tests {
         let set = |ks: &[&str]| -> BTreeSet<String> { ks.iter().map(|k| k.to_string()).collect() };
         assert_eq!(
             keys(&v["agents"][0]),
-            set(&["label", "role", "owes", "last", "transcript"]),
+            set(&["label", "tool", "role", "owes", "last", "transcript"]),
             "the picker and the header destructure an agent by these names"
         );
         assert_eq!(
