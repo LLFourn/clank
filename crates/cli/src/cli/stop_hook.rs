@@ -42,7 +42,6 @@ use super::{StopHookArgs, resolve_repo};
 use crate::agent_env::{Ambient, Process, resolve_identity_for_hook_in};
 use crate::agent_store::load_agent_config;
 use crate::lifecycle::AgentLabel;
-use clank_core::ids::SessionId;
 use clank_core::{
     AutoMode, BgDisposition, CLAUDE_CONTINUATION_EXIT, CodexBlockDecision, HOOK_OK_EXIT, HookInput,
     HookOutcome, Role, SilentReason, Tool, background_disposition, hook_io::TurnLeft,
@@ -57,320 +56,24 @@ pub async fn run(args: StopHookArgs) -> anyhow::Result<()> {
     // where the waiting begins.
     let started = std::time::Instant::now();
     let tool: Tool = args.tool.into();
-    let async_loop =
-        tool == Tool::Claude && args.loop_mode == Some(crate::cli::LoopModeArg::Asyncrewake);
     let outcome = match read_hook_stdin() {
-        Ok(input) => {
-            match orphaned_by_its_pane(args.repo.as_deref(), &input.session_id, &Process) {
-                Some(message) => HookOutcome::Diagnostic { message },
-                None => {
-                    compute_outcome_with(
-                        tool,
-                        args.repo.as_deref(),
-                        input,
-                        async_loop,
-                        started,
-                        &Process,
-                    )
-                    .await
-                }
-            }
-        }
+        Ok(input) => stop_input(&args, input, started, &Process).await,
         Err(e) => HookOutcome::Diagnostic { message: e },
     };
     emit_and_exit(outcome, tool);
 }
 
-/// Has this agent outlived the pane it was given? Then stop being
-/// that agent, and say so.
-///
-/// Asked before anything else the hook does, because everything else
-/// assumes the session is still the one clank opened. A pane closed
-/// out from under a process leaves it unreachable by the roster, by
-/// the human who closed it, and by the reconciler — still bound,
-/// still parked, still able to file reviews. That is what `glm` did
-/// (nothing-refuses-in-silence).
-///
-/// The hook runner is not the agent. Codex runs hooks in a long-lived
-/// app-server daemon that keeps the pane id of whichever pane started
-/// it. That id can be gone while `resume <session>` is alive in
-/// another pane, and releasing on it unbinds a live agent at every
-/// Stop. The id is evidence only when no listed pane is still running
-/// this session. A swap into the roster pane fires no SessionStart, so
-/// the same look binds the label before it considers a release.
-///
-/// Releasing the label is the death available here: clank cannot end
-/// a process it cannot safely identify — the hook's parent is a
-/// shell, not the agent — but it can stop being the label. The wait
-/// generation goes with it, revoking anything parked, and the
-/// roster's next pass opens a fresh pane for the label it still
-/// wants.
-///
-/// Released against THIS hook's session id, never the label alone: by
-/// the time a paneless process gets here the roster may already have
-/// reopened the label under a new session, and clearing it blind
-/// would revoke the successor's wait (codex on 6303167). The identity
-/// still comes from the environment — that is what says which label
-/// this process is — but the release is keyed by the session the
-/// harness itself reports.
-///
-/// `None` — carry on — for every case that is not positive evidence
-/// of a lost pane (see [`crate::cli::open_zellij::pane_is_gone`]),
-/// including a session bound by hand with `clank as`, which never had
-/// a pane of clank's.
-fn orphaned_by_its_pane(
-    repo: Option<&Path>,
-    session: &SessionId,
+/// The decoded Stop turn, shared by the installed hook and tests.
+async fn stop_input(
+    args: &StopHookArgs,
+    input: HookInput,
+    started: std::time::Instant,
     env: &dyn Ambient,
-) -> Option<String> {
-    if let Ok(repo) = crate::cli::resolve_repo(repo) {
-        let _ = adopt_hook_session(&repo, session);
-    }
-    orphaned_by_its_pane_with(
-        repo,
-        session,
-        env,
-        crate::cli::open_zellij::own_pane_is_gone,
-        || {
-            let Ok(repo) = crate::cli::resolve_repo(repo) else {
-                return true;
-            };
-            !session_proven_gone(&repo, session)
-        },
-    )
-}
-
-fn orphaned_by_its_pane_with(
-    repo: Option<&Path>,
-    session: &SessionId,
-    env: &dyn Ambient,
-    pane_is_gone: impl FnOnce() -> bool,
-    session_has_pane: impl FnOnce() -> bool,
-) -> Option<String> {
-    if !pane_is_gone() || session_has_pane() {
-        return None;
-    }
-    let repo = crate::cli::resolve_repo(repo).ok()?;
-    let label = crate::agent_env::resolve_identity_in(&repo, env).ok()?;
-    // Three outcomes, three sentences. Collapsing the failure into
-    // "someone else holds it" would report a binding that is STILL
-    // THERE as safely handed over — in the plan about refusals you can
-    // see (codex on 7e1a33e).
-    let note = match crate::agent_store::release_binding(&repo, &label, session) {
-        Ok(true) => String::new(),
-        Ok(false) => " (another session already holds the label)".to_string(),
-        Err(e) => format!(" — but its binding could NOT be cleared: {e:#}"),
-    };
-    Some(format!(
-        "hook: this session's pane is gone, so it is no longer `{}`{}. \
-         An agent lives in its pane; nothing more will be routed here. \
-         Close this session — the roster reopens the label in a fresh pane.",
-        label.as_str(),
-        note
-    ))
-}
-
-/// Bind `session` to the roster pane that is actually running it.
-///
-/// Returns that label when the process table and the listing agree,
-/// whether or not the bind had to be written. The hook runner's
-/// `CLANK_AGENT` is not consulted: a daemon started in another pane
-/// would claim the session for the wrong label, or for none.
-fn adopt_hook_session(repo: &Path, session: &SessionId) -> Option<AgentLabel> {
-    let panes = crate::cli::open_zellij::snapshot_panes()?;
-    let ps = process_table().ok()?;
-    let pairs = crate::cli::open_zellij::agent_panes_by_command(&panes, repo);
-    let wanted: Vec<(u32, String)> = pairs
-        .into_iter()
-        .filter_map(|(id, label)| {
-            id.strip_prefix("terminal_")
-                .and_then(|n| n.parse().ok())
-                .map(|pane| (pane, label))
-        })
-        .collect();
-    let found = bindings_to_adopt(&ps, &wanted)
-        .into_iter()
-        .find(|(_, _, sid)| *sid == session.as_str())?;
-    let agent = AgentLabel::parse(found.1).ok()?;
-    let set = crate::agent_store::try_resolve_via_team(repo)
-        .ok()
-        .flatten()?;
-    let tool = tool_on_roster(&set, &agent)?;
-    ensure_bound(repo, &agent, tool, session);
-    remember_pane(repo, &agent, found.0);
-    Some(agent)
-}
-
-/// Same adoption for every roster pane in a listing. The status TUI
-/// calls this on a refresh, so a zellij swap binds without waiting for
-/// a hook that a swap does not fire.
-pub(crate) fn adopt_sessions_in_panes(repo: &Path, panes: &[crate::cli::open_zellij::ZellijPane]) {
-    let Ok(ps) = process_table() else {
-        return;
-    };
-    let pairs = crate::cli::open_zellij::agent_panes_by_command(panes, repo);
-    let wanted: Vec<(u32, String)> = pairs
-        .into_iter()
-        .filter_map(|(id, label)| {
-            id.strip_prefix("terminal_")
-                .and_then(|n| n.parse().ok())
-                .map(|pane| (pane, label))
-        })
-        .collect();
-    let Some(set) = crate::agent_store::try_resolve_via_team(repo)
-        .ok()
-        .flatten()
-    else {
-        return;
-    };
-    for (pane, label, sid) in bindings_to_adopt(&ps, &wanted) {
-        let Ok(agent) = AgentLabel::parse(label) else {
-            continue;
-        };
-        let Ok(session) = SessionId::parse(sid) else {
-            continue;
-        };
-        let Some(tool) = tool_on_roster(&set, &agent) else {
-            continue;
-        };
-        ensure_bound(repo, &agent, tool, &session);
-        remember_pane(repo, &agent, pane);
-    }
-}
-
-fn tool_on_roster(
-    set: &crate::cli::teams_config::RegisteredSet,
-    label: &AgentLabel,
-) -> Option<Tool> {
-    if &set.master == label {
-        return Some(set.master_desc.tool);
-    }
-    set.members
-        .iter()
-        .find(|m| &m.label == label)
-        .map(|m| m.desc.tool)
-}
-
-/// Already holding this session: leave the generation alone. A repeated
-/// resume or a refresh must not revoke the waiter it just claimed.
-fn ensure_bound(repo: &Path, label: &AgentLabel, tool: Tool, session: &SessionId) {
-    if let Ok(Some(cfg)) = crate::agent_store::load_agent_config(repo, label) {
-        if cfg.session.as_ref().is_some_and(|s| &s.id == session) {
-            return;
-        }
-    }
-    let _ = crate::agent_store::bind_session_to_agent(repo, label, tool, session);
-}
-
-/// A missing `ps` line is not a death. Release only after this session
-/// was positively tied to a pane and that pane is no longer listed.
-fn session_proven_gone(repo: &Path, session: &SessionId) -> bool {
-    let Some(live) = crate::cli::open_zellij::live_terminal_pane_ids() else {
-        return false;
-    };
-    let Ok(ps) = process_table() else {
-        return false;
-    };
-    if running_sessions(&ps)
-        .iter()
-        .any(|r| r.session == session.as_str() && live.contains(&r.pane))
-    {
-        return false;
-    }
-    match remembered_pane(repo, session) {
-        Some(pane) => !live.contains(&pane),
-        None => false,
-    }
-}
-
-fn remembered_pane(repo: &Path, session: &SessionId) -> Option<u32> {
-    let all = crate::agent_store::load_all_agent_configs(repo).ok()?;
-    let (label, _) = all
-        .into_iter()
-        .find(|(_, cfg)| cfg.session.as_ref().is_some_and(|s| &s.id == session))?;
-    let text = std::fs::read_to_string(pane_path(repo, &label)).ok()?;
-    text.trim().parse().ok()
-}
-
-fn remember_pane(repo: &Path, label: &AgentLabel, pane: u32) {
-    let path = pane_path(repo, label);
-    let wanted = format!("{pane}\n");
-    if std::fs::read_to_string(&path).ok().as_deref() == Some(wanted.as_str()) {
-        return;
-    }
-    let _ = std::fs::write(path, wanted);
-}
-
-fn pane_path(repo: &Path, label: &AgentLabel) -> std::path::PathBuf {
-    crate::agent_store::agents_root(repo)
-        .join(label.as_str())
-        .join("session.pane")
-}
-
-fn process_table() -> std::io::Result<String> {
-    let out = std::process::Command::new("ps")
-        .args(["-axwwE", "-o", "pid=,command="])
-        .output()?;
-    if !out.status.success() {
-        return Err(std::io::Error::other("ps failed"));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-}
-
-struct RunningSession<'a> {
-    pane: u32,
-    session: &'a str,
-}
-
-fn running_sessions(ps: &str) -> Vec<RunningSession<'_>> {
-    ps.lines().filter_map(running_session_on).collect()
-}
-
-fn running_session_on(line: &str) -> Option<RunningSession<'_>> {
-    let pane = zellij_pane_id_on(line)?;
-    let session = session_token_on(line)?;
-    Some(RunningSession { pane, session })
-}
-
-/// `(pane, label, session)` for roster panes whose process is a resume
-/// of a session. The daemon's line has a pane id and no session, so it
-/// cannot adopt.
-fn bindings_to_adopt<'a>(ps: &'a str, panes: &'a [(u32, String)]) -> Vec<(u32, &'a str, &'a str)> {
-    let running = running_sessions(ps);
-    panes
-        .iter()
-        .filter_map(|(pane, label)| {
-            running
-                .iter()
-                .find(|r| r.pane == *pane)
-                .map(|r| (*pane, label.as_str(), r.session))
-        })
-        .collect()
-}
-
-fn session_token_on(line: &str) -> Option<&str> {
-    for key in ["resume ", "--resume "] {
-        let Some(rest) = line.split(key).nth(1) else {
-            continue;
-        };
-        let token = rest.split_whitespace().next()?;
-        if looks_like_session(token) {
-            return Some(token);
-        }
-    }
-    None
-}
-
-fn looks_like_session(token: &str) -> bool {
-    token.len() >= 32
-        && token.contains('-')
-        && token.bytes().all(|c| c.is_ascii_hexdigit() || c == b'-')
-}
-
-fn zellij_pane_id_on(line: &str) -> Option<u32> {
-    let rest = line.split("ZELLIJ_PANE_ID=").nth(1)?;
-    let num: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-    num.parse().ok()
+) -> HookOutcome {
+    let tool: Tool = args.tool.into();
+    let async_loop =
+        tool == Tool::Claude && args.loop_mode == Some(crate::cli::LoopModeArg::Asyncrewake);
+    compute_outcome_with(tool, args.repo.as_deref(), input, async_loop, started, env).await
 }
 
 /// Test-facing wrapper: production routes through
@@ -1218,13 +921,6 @@ fn session_started(
     env: &dyn Ambient,
 ) -> Option<AgentLabel> {
     let sid = clank_core::ids::SessionId::parse(&input.session_id).ok()?;
-    // The process in the roster pane outranks the hook runner. A swap
-    // and a resume both land here when the daemon's label is stale or
-    // absent; when the process is not visible, the runner's label
-    // still binds as before.
-    if let Some(label) = adopt_hook_session(repo, &sid) {
-        return Some(label);
-    }
     match launched_as {
         Some(label) => {
             // Fail-open by POLICY: a session start is never broken by
@@ -2177,7 +1873,7 @@ pub(crate) struct MarkerFields<'a> {
 
 /// The attendance marker's own clock. Seconds are kept here — an
 /// expectation is a BUDGET (`45s/5m`), read against a bound that is
-/// often minutes, not an age glanced at across the pane.
+/// often minutes, not an age glanced at during a turn.
 fn short_duration(d: time::Duration) -> String {
     crate::age::short(d.whole_seconds())
 }
@@ -3517,101 +3213,6 @@ mod tests {
         let sid = clank_core::ids::SessionId::parse(session).unwrap();
         crate::agent_store::bind_session_to_agent(repo, &label, tool, &sid).unwrap();
         label
-    }
-
-    /// The hook runner's pane can be gone while the session is still
-    /// inside a listed pane. That is not a death. A session in no
-    /// listed pane still is, for every tool.
-    #[test]
-    fn a_stale_runner_pane_does_not_unbind_a_session_that_still_has_one() {
-        let repo = init_repo();
-        let sid = SessionId::parse("codex-session-in-pane-16").unwrap();
-        let codex = bind_tool(repo.path(), "codex", sid.as_str(), Tool::Codex);
-        let agent_dir = crate::agent_store::agents_root(repo.path()).join("codex");
-        let generation = crate::agent_store::read_wait_generation(&agent_dir);
-        let env = crate::agent_env::Stated::saying(&[("CLANK_AGENT", "codex")]);
-
-        assert!(
-            orphaned_by_its_pane_with(Some(repo.path()), &sid, &env, || true, || true).is_none()
-        );
-        assert_eq!(
-            crate::agent_store::load_agent_config(repo.path(), &codex)
-                .unwrap()
-                .unwrap()
-                .session
-                .unwrap()
-                .id,
-            sid,
-        );
-        assert_eq!(
-            crate::agent_store::read_wait_generation(&agent_dir),
-            generation,
-            "a false orphan decision must not revoke the wait generation",
-        );
-
-        let claude_sid = SessionId::parse("claude-session-in-pane-17").unwrap();
-        let claude = bind(repo.path(), "claude", claude_sid.as_str());
-        let claude_env = crate::agent_env::Stated::saying(&[("CLANK_AGENT", "claude")]);
-        assert!(
-            orphaned_by_its_pane_with(
-                Some(repo.path()),
-                &claude_sid,
-                &claude_env,
-                || true,
-                || false,
-            )
-            .unwrap()
-            .contains("this session's pane is gone")
-        );
-        assert!(
-            crate::agent_store::load_agent_config(repo.path(), &claude)
-                .unwrap()
-                .unwrap()
-                .session
-                .is_none(),
-        );
-    }
-
-    #[test]
-    fn a_resume_in_a_roster_pane_is_that_panes_session() {
-        let sid = "01a0dad2-9c8b-7c00-90a7-93e18892593b";
-        let ps = format!(
-            "42714 codex app-server ZELLIJ_PANE_ID=1 CLANK_AGENT=codex\n\
-             8528 codex resume {sid} --cd /repo ZELLIJ_PANE_ID=16\n"
-        );
-        let panes = vec![(16u32, "codex".to_string()), (3, "ruthless".to_string())];
-        assert_eq!(bindings_to_adopt(&ps, &panes), vec![(16, "codex", sid)]);
-        assert!(running_sessions("8528 codex resume not-an-id ZELLIJ_PANE_ID=16").is_empty());
-    }
-
-    #[test]
-    fn an_unchanged_pane_snapshot_does_not_rewrite_the_watched_file() {
-        let repo = init_repo();
-        let label = bind_tool(repo.path(), "codex", "sess-pane-write", Tool::Codex);
-        remember_pane(repo.path(), &label, 16);
-        let path = pane_path(repo.path(), &label);
-        let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(&path)
-            .unwrap()
-            .set_times(std::fs::FileTimes::new().set_modified(old))
-            .unwrap();
-        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
-
-        remember_pane(repo.path(), &label, 16);
-        assert_eq!(
-            std::fs::metadata(&path).unwrap().modified().unwrap(),
-            before,
-            "the gate watches this directory, so an unchanged snapshot must not rewrite the file",
-        );
-
-        remember_pane(repo.path(), &label, 17);
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "17\n");
-        assert_ne!(
-            std::fs::metadata(&path).unwrap().modified().unwrap(),
-            before
-        );
     }
 
     fn write_attending(dir: &Path, task: &str) {
@@ -6270,6 +5871,50 @@ mod tests {
             HookOutcome::Silent {
                 why: SilentReason::AutoOff
             }
+        );
+    }
+
+    /// Run the same decoded Stop path as production with no ambient
+    /// variables. Ending a turn must leave the session's claim and
+    /// waiter generation intact even when no display is attached.
+    #[tokio::test]
+    async fn a_displayless_stop_preserves_the_binding() {
+        let dir = init_repo();
+        let repo = dir.path();
+        let label = bind_tool(repo, "codex", "sess-displayless", Tool::Codex);
+        crate::agent_store::set_auto_mode(repo, &label, AutoMode::Off).unwrap();
+        let agent_dir = crate::agent_store::agents_root(repo).join(label.as_str());
+        let before = std::fs::read(agent_dir.join("config.json")).unwrap();
+        let generation = crate::agent_store::read_wait_generation(&agent_dir);
+        let args = StopHookArgs {
+            tool: crate::cli::ToolArg::Codex,
+            repo: Some(repo.to_path_buf()),
+            session_start: false,
+            loop_mode: None,
+        };
+
+        let outcome = stop_input(
+            &args,
+            hook_input("sess-displayless", Some("done")),
+            std::time::Instant::now(),
+            &stated(),
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            HookOutcome::Silent {
+                why: SilentReason::AutoOff
+            }
+        );
+        assert_eq!(
+            std::fs::read(agent_dir.join("config.json")).unwrap(),
+            before,
+            "the installed Stop path must preserve the binding file",
+        );
+        assert_eq!(
+            crate::agent_store::read_wait_generation(&agent_dir),
+            generation,
+            "the installed Stop path must not revoke the waiter",
         );
     }
 

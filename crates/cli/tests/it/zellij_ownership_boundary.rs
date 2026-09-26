@@ -42,8 +42,8 @@ const SPAWNER: &str = "cli/open_zellij.rs";
 const MUTATION_CALLERS: &[&str] = &[SPAWNER, "cli/status_tui/zellij.rs"];
 
 /// Pane MUTATIONS. Reads (`snapshot_panes`, `agent_pane_pairs`,
-/// `reviewers_are_stacked`, …) are fine anywhere — observing panes
-/// creates no second owner. Only changing them does.
+/// `reviewers_are_stacked`, …) create no second owner. The Stop hook
+/// has its own stricter boundary below: it cannot observe panes at all.
 const PANE_MUTATIONS: &[&str] = &[
     "focus_pane",
     "add_reviewer_pane",
@@ -177,4 +177,20 @@ fn scanner_catches_both_ways_around_the_seam() {
     );
     assert!(is_gate("crates/cli/tests/zellij_ownership_boundary.rs"));
     assert!(!is_gate("crates/cli/src/cli/status_tui/mod.rs"));
+}
+
+/// The Stop hook is core turn handling. Pane identity and lifetime
+/// belong to the TUI's Zellij layer, including test helpers and
+/// comments that might otherwise invite a new hook-side check.
+#[test]
+fn stop_hook_has_no_zellij_or_pane_dependency() {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/cli/stop_hook.rs");
+    let source = std::fs::read_to_string(path).expect("read Stop hook source");
+    let lower = source.to_ascii_lowercase();
+    for forbidden in ["zellij", "pane"] {
+        assert!(
+            !lower.contains(forbidden),
+            "Stop hook source must not name {forbidden}; keep pane observation in the TUI",
+        );
+    }
 }

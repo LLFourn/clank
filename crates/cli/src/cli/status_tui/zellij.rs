@@ -12,6 +12,133 @@ use super::input::Presence;
 use super::strip_leading_emoji;
 use crate::cli::open_zellij::agent_pane_title;
 use crate::cli::status::StatusSnapshot;
+use crate::lifecycle::AgentLabel;
+use clank_core::Tool;
+use clank_core::ids::SessionId;
+
+/// A refresh can see a session moved into a roster pane without a
+/// SessionStart event. Match the running session to that pane here,
+/// where the listing belongs, and leave hook identity pane agnostic.
+fn adopt_sessions_in_panes(repo: &std::path::Path, panes: &[crate::cli::open_zellij::ZellijPane]) {
+    let Ok(ps) = process_table() else {
+        return;
+    };
+    let wanted: Vec<(u32, String)> = crate::cli::open_zellij::agent_panes_by_command(panes, repo)
+        .into_iter()
+        .filter_map(|(id, label)| {
+            id.strip_prefix("terminal_")
+                .and_then(|n| n.parse().ok())
+                .map(|pane| (pane, label))
+        })
+        .collect();
+    let Some(set) = crate::agent_store::try_resolve_via_team(repo)
+        .ok()
+        .flatten()
+    else {
+        return;
+    };
+    for (_, label, sid) in bindings_to_adopt(&ps, &wanted) {
+        let Ok(agent) = AgentLabel::parse(label) else {
+            continue;
+        };
+        let Ok(session) = SessionId::parse(sid) else {
+            continue;
+        };
+        let Some(tool) = tool_on_roster(&set, &agent) else {
+            continue;
+        };
+        ensure_bound(repo, &agent, tool, &session);
+    }
+}
+
+fn tool_on_roster(
+    set: &crate::cli::teams_config::RegisteredSet,
+    label: &AgentLabel,
+) -> Option<Tool> {
+    if &set.master == label {
+        return Some(set.master_desc.tool);
+    }
+    set.members
+        .iter()
+        .find(|m| &m.label == label)
+        .map(|m| m.desc.tool)
+}
+
+/// A repeated refresh must not revoke a waiter by rebinding the same
+/// session and minting a new generation.
+fn ensure_bound(repo: &std::path::Path, label: &AgentLabel, tool: Tool, session: &SessionId) {
+    if let Ok(Some(cfg)) = crate::agent_store::load_agent_config(repo, label) {
+        if cfg.session.as_ref().is_some_and(|s| &s.id == session) {
+            return;
+        }
+    }
+    let _ = crate::agent_store::bind_session_to_agent(repo, label, tool, session);
+}
+
+fn process_table() -> std::io::Result<String> {
+    let out = std::process::Command::new("ps")
+        .args(["-axwwE", "-o", "pid=,command="])
+        .output()?;
+    if !out.status.success() {
+        return Err(std::io::Error::other("ps failed"));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+struct RunningSession<'a> {
+    pane: u32,
+    session: &'a str,
+}
+
+fn running_sessions(ps: &str) -> Vec<RunningSession<'_>> {
+    ps.lines().filter_map(running_session_on).collect()
+}
+
+fn running_session_on(line: &str) -> Option<RunningSession<'_>> {
+    let pane = zellij_pane_id_on(line)?;
+    let session = session_token_on(line)?;
+    Some(RunningSession { pane, session })
+}
+
+/// The daemon's process line has a pane id but no resume token, so it
+/// cannot claim the session running in another pane.
+fn bindings_to_adopt<'a>(ps: &'a str, panes: &'a [(u32, String)]) -> Vec<(u32, &'a str, &'a str)> {
+    let running = running_sessions(ps);
+    panes
+        .iter()
+        .filter_map(|(pane, label)| {
+            running
+                .iter()
+                .find(|r| r.pane == *pane)
+                .map(|r| (*pane, label.as_str(), r.session))
+        })
+        .collect()
+}
+
+fn session_token_on(line: &str) -> Option<&str> {
+    for key in ["resume ", "--resume "] {
+        let Some(rest) = line.split(key).nth(1) else {
+            continue;
+        };
+        let token = rest.split_whitespace().next()?;
+        if looks_like_session(token) {
+            return Some(token);
+        }
+    }
+    None
+}
+
+fn looks_like_session(token: &str) -> bool {
+    token.len() >= 32
+        && token.contains('-')
+        && token.bytes().all(|c| c.is_ascii_hexdigit() || c == b'-')
+}
+
+fn zellij_pane_id_on(line: &str) -> Option<u32> {
+    let rest = line.split("ZELLIJ_PANE_ID=").nth(1)?;
+    let num: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    num.parse().ok()
+}
 
 /// The current zellij tab's `(stable id, name)`, or `None` outside
 /// zellij or if the query fails. Parses `zellij action
@@ -457,7 +584,7 @@ impl PaneIo for ZellijPaneIo<'_> {
         let snap = crate::cli::open_zellij::snapshot_panes()?;
         // A refresh is the only thing that sees a swapped-in process.
         // SessionStart does not fire for a pane that was already running.
-        crate::cli::stop_hook::adopt_sessions_in_panes(self.repo, &snap);
+        adopt_sessions_in_panes(self.repo, &snap);
         Some(snap)
     }
     fn pairs(&mut self, snap: &Self::Snap) -> Vec<(String, bool)> {
@@ -1240,6 +1367,18 @@ mod tests {
     use super::*;
     use crate::cli::status_tui::fixtures::{plan_state, reviewer_missing, snap};
     use clank_core::plan_view::WaitingOn;
+
+    #[test]
+    fn a_resumed_session_is_adopted_from_its_roster_pane() {
+        let sid = "01a0dad2-9c8b-7c00-90a7-93e18892593b";
+        let ps = format!(
+            "42714 codex app-server ZELLIJ_PANE_ID=1 CLANK_AGENT=codex\n\
+             8528 codex resume {sid} --cd /repo ZELLIJ_PANE_ID=16\n"
+        );
+        let panes = vec![(16u32, "codex".to_string()), (3, "ruthless".to_string())];
+        assert_eq!(bindings_to_adopt(&ps, &panes), vec![(16, "codex", sid)]);
+        assert!(running_sessions("8528 codex resume not-an-id ZELLIJ_PANE_ID=16").is_empty());
+    }
 
     // ── zellij-is-the-workspace: the tab indicator, fake-backed ──
 
