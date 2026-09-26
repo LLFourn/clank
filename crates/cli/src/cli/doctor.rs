@@ -160,9 +160,6 @@ pub fn repo_checks(
     // redundant and a drift hazard.
     out.push(check_root_has_no_clank_rules(repo));
 
-    // .claude/settings.local.json permissions.
-    out.push(check_claude_perms(repo));
-
     // User zellij layout template, when configured: parse + marker
     // presence (`zellij-layout-config-around-agent-panes`). Checked
     // BEFORE the team-resolution early-returns so a broken template
@@ -628,65 +625,6 @@ fn check_root_has_no_clank_rules(repo: &Path) -> CheckResult {
             format!(
                 "redundant `.clank/` rule(s): {} — remove them; `.clank/.gitignore` is the single source of truth",
                 offenders.join(", ")
-            ),
-        )
-    }
-}
-
-fn check_claude_perms(repo: &Path) -> CheckResult {
-    const SECTION: &str = "repo";
-    const NAME: &str = ".claude/settings.local.json";
-    const REQUIRED: &[&str] = &[
-        "Write(.clank/agents/**)",
-        "Edit(.clank/agents/**)",
-        "Read(.clank/agents/**)",
-    ];
-    let path = repo.join(".claude/settings.local.json");
-    let body = match std::fs::read_to_string(&path) {
-        Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return CheckResult::warn(
-                SECTION,
-                NAME,
-                "missing — run `clank init` to write the agent edit-permission rules".to_string(),
-            );
-        }
-        Err(e) => return CheckResult::fail(SECTION, NAME, format!("read failed: {e}")),
-    };
-    let v: serde_json::Value = match serde_json::from_str(&body) {
-        Ok(v) => v,
-        Err(e) => return CheckResult::fail(SECTION, NAME, format!("parse failed: {e}")),
-    };
-    let allow = match v
-        .get("permissions")
-        .and_then(|p| p.get("allow"))
-        .and_then(|a| a.as_array())
-    {
-        Some(a) => a,
-        None => {
-            return CheckResult::warn(
-                SECTION,
-                NAME,
-                "missing `permissions.allow` array — run `clank init`".to_string(),
-            );
-        }
-    };
-    let entries: Vec<&str> = allow.iter().filter_map(|x| x.as_str()).collect();
-    let missing: Vec<&&str> = REQUIRED.iter().filter(|r| !entries.contains(r)).collect();
-    if missing.is_empty() {
-        CheckResult::ok(
-            SECTION,
-            NAME,
-            "all three agent edit-permission rules present".to_string(),
-        )
-    } else {
-        let names: Vec<String> = missing.iter().map(|s| (**s).to_string()).collect();
-        CheckResult::warn(
-            SECTION,
-            NAME,
-            format!(
-                "missing rules: {} — run `clank init` to add",
-                names.join(", ")
             ),
         )
     }
@@ -1436,18 +1374,6 @@ mod tests {
             .find(|r| r.name == "agent: kimi")
             .expect("agent check ran");
         assert_eq!(agent.status, CheckStatus::Warn);
-    }
-
-    #[test]
-    fn repo_checks_warn_on_missing_claude_perms() {
-        let dir = init_git_repo();
-        let results = repo_checks(dir.path(), None, None);
-        let perm = results
-            .iter()
-            .find(|r| r.name == ".claude/settings.local.json")
-            .expect("perms check ran");
-        assert_eq!(perm.status, CheckStatus::Warn);
-        assert!(perm.message.contains("clank init"));
     }
 
     /// The report a human reads names the agent, how long it has

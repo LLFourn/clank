@@ -423,7 +423,7 @@ fn init_needed_when_clank_dir_missing() {
 }
 
 #[test]
-fn init_needed_when_claude_permissions_missing() {
+fn missing_claude_permissions_are_not_an_init_gap() {
     let home = tempfile::tempdir().unwrap();
     let dir = init_repo();
     let repo = dir.path();
@@ -435,8 +435,8 @@ fn init_needed_when_claude_permissions_missing() {
     let v = run_open(repo, home.path());
     let gaps = gap_kinds(&v);
     assert!(
-        gaps.iter().any(|g| g == "missing_claude_permissions"),
-        "expected missing_claude_permissions; got {gaps:?}"
+        !gaps.iter().any(|g| g == "missing_claude_permissions"),
+        "Claude permissions are no longer managed by clank: {gaps:?}"
     );
 }
 
@@ -453,7 +453,7 @@ fn init_needed_when_post_rewrite_hook_absent() {
     write(
         repo,
         ".claude/settings.local.json",
-        r#"{"permissions":{"allow":["Write(.clank/agents/**)","Edit(.clank/agents/**)","Read(.clank/agents/**)"]}}"#,
+        r#"{"permissions":{"allow":["Bash(ls *)"]}}"#,
     );
     let v = run_open(repo, home.path());
     let gaps = gap_kinds(&v);

@@ -2,8 +2,8 @@
 //! nothing (`teams-based-agent-registration`, lloyd 2026-06-09):
 //!
 //! - write `.clank/.gitignore`,
-//! - write `.claude/settings.local.json` with claude
-//!   edit-permission rules for `.clank/agents/**`,
+//! - remove legacy clank permission rules from an existing
+//!   `.claude/settings.local.json` without changing operator rules,
 //! - install the `post-rewrite` git hook,
 //! - warn if an ancestor ignore rule swallows any tracked `.clank/`
 //!   plan artifact path,
@@ -18,17 +18,15 @@
 
 use std::path::Path;
 
-use anyhow::Context;
-
 use super::{InitArgs, resolve_repo};
 
 use crate::init_facts::{
-    CLAUDE_ALLOW_RULES, POST_REWRITE_BODY, POST_REWRITE_MARKER, clank_gitignore_body,
-    classify_gitignore_body,
+    POST_REWRITE_BODY, POST_REWRITE_MARKER, clank_gitignore_body, classify_gitignore_body,
 };
 
 /// `clank init` is pure repo setup: scaffold `.clank/`, install
-/// the git hook + claude perms, and (optionally) pick a team.
+/// the git hook, retire legacy Claude permissions, and optionally
+/// pick a team.
 /// It does NOT bind sessions, read agent env vars
 /// (`CLAUDE_CODE_SESSION_ID` / `CODEX_THREAD_ID`), prompt for an
 /// identity, or assign any role — that's `clank as`'s job. Plan:
@@ -37,7 +35,7 @@ use crate::init_facts::{
 pub async fn run(args: InitArgs) -> anyhow::Result<()> {
     let repo = resolve_repo(args.repo.as_deref())?;
     write_scaffold(&repo)?;
-    write_claude_perms(&repo)?;
+    migrate_claude_perms(&repo)?;
     write_post_rewrite_hook(&repo, args.force_hooks)?;
     warn_if_globally_excluded(&repo);
 
@@ -269,61 +267,77 @@ fn check_one(repo: &Path, rel: &str) {
     );
 }
 
-/// Write/merge `.claude/settings.local.json` with the
-/// `permissions.allow` rules that let claude edit
-/// `.clank/agents/**` (the agent's own dir) without prompting on
-/// every Write/Edit. Tag-merge: never clobber unrelated allow
-/// entries the user may have added.
-///
-/// Codex's permission model is shell-command-based, not file-path-
-/// based, so there's no equivalent file to write for codex —
-/// its sandbox already permits writes inside the workspace.
-fn write_claude_perms(repo: &Path) -> anyhow::Result<()> {
-    let claude_dir = repo.join(".claude");
-    let path = claude_dir.join("settings.local.json");
+/// The three approvals older `clank init` versions wrote into every
+/// repo. They remain here only as exact migration matches.
+const LEGACY_CLAUDE_ALLOW_RULES: &[&str] = &[
+    "Write(.clank/agents/**)",
+    "Edit(.clank/agents/**)",
+    "Read(.clank/agents/**)",
+];
 
-    let mut value: serde_json::Value = match std::fs::read_to_string(&path) {
-        Ok(s) => serde_json::from_str(&s)
-            .with_context(|| format!("parsing `{}` as JSON", path.display()))?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            serde_json::Value::Object(serde_json::Map::new())
+/// Retire clank's blanket Claude approvals on re-init. An absent or
+/// unparsable operator file is untouched; a file with no matching
+/// rules is byte-identical; a file clank alone wrote is removed.
+fn migrate_claude_perms(repo: &Path) -> anyhow::Result<()> {
+    let path = repo.join(".claude/settings.local.json");
+    let body = match std::fs::read_to_string(&path) {
+        Ok(body) => body,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            eprintln!(
+                "warning: cannot read {} for legacy permission cleanup: {e}",
+                path.display()
+            );
+            return Ok(());
         }
-        Err(e) => return Err(e.into()),
     };
-
-    let obj = value
-        .as_object_mut()
-        .ok_or_else(|| anyhow::anyhow!("{} is not a JSON object", path.display()))?;
-    let permissions = obj
-        .entry("permissions".to_string())
-        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
-    let permissions = permissions
-        .as_object_mut()
-        .ok_or_else(|| anyhow::anyhow!("`permissions` is not a JSON object"))?;
-    let allow = permissions
-        .entry("allow".to_string())
-        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
-    let allow = allow
-        .as_array_mut()
-        .ok_or_else(|| anyhow::anyhow!("`permissions.allow` is not a JSON array"))?;
-
-    let mut added = false;
-    for rule in CLAUDE_ALLOW_RULES {
-        let exists = allow.iter().any(|v| v.as_str() == Some(*rule));
-        if !exists {
-            allow.push(serde_json::Value::String((*rule).into()));
-            added = true;
+    let mut value: serde_json::Value = match serde_json::from_str(&body) {
+        Ok(value) => value,
+        Err(e) => {
+            eprintln!(
+                "warning: cannot parse {} for legacy permission cleanup: {e}",
+                path.display()
+            );
+            return Ok(());
         }
+    };
+    let Some(allow) = value
+        .get_mut("permissions")
+        .and_then(|p| p.get_mut("allow"))
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return Ok(());
+    };
+    let before = allow.len();
+    allow.retain(|entry| {
+        !entry
+            .as_str()
+            .is_some_and(|s| LEGACY_CLAUDE_ALLOW_RULES.contains(&s))
+    });
+    if allow.len() == before {
+        return Ok(());
     }
-
-    std::fs::create_dir_all(&claude_dir)?;
-    let serialized = serde_json::to_string_pretty(&value)?;
-    std::fs::write(&path, format!("{serialized}\n"))?;
-    if added {
-        println!("wrote claude permissions to {}", path.display());
+    let only_empty_permissions = value.as_object().is_some_and(|obj| {
+        obj.len() == 1
+            && obj
+                .get("permissions")
+                .and_then(serde_json::Value::as_object)
+                .is_some_and(|p| {
+                    p.len() == 1
+                        && p.get("allow")
+                            .and_then(serde_json::Value::as_array)
+                            .is_some_and(Vec::is_empty)
+                })
+    });
+    if only_empty_permissions {
+        std::fs::remove_file(&path)?;
     } else {
-        println!("{} already has clank permissions", path.display());
+        std::fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string_pretty(&value)?),
+        )?;
     }
+    println!("removed legacy clank permissions from {}", path.display());
     Ok(())
 }
 
@@ -629,52 +643,75 @@ mod tests {
         assert!(!matched_by_clank_gitignore(".clank/.gitignore:1:plans/"));
     }
 
-    #[test]
-    fn writes_claude_perms_creates_file_with_allow_rules() {
+    #[tokio::test]
+    async fn fresh_init_writes_no_claude_permission_file() {
         let dir = init_repo();
-        write_claude_perms(dir.path()).unwrap();
-        let body = std::fs::read_to_string(dir.path().join(".claude/settings.local.json")).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-        let allow = v["permissions"]["allow"].as_array().unwrap();
-        let entries: Vec<&str> = allow.iter().filter_map(|x| x.as_str()).collect();
-        assert!(entries.contains(&"Write(.clank/agents/**)"));
-        assert!(entries.contains(&"Edit(.clank/agents/**)"));
-        assert!(entries.contains(&"Read(.clank/agents/**)"));
+        run(InitArgs {
+            repo: Some(dir.path().to_path_buf()),
+            force_hooks: false,
+            force: false,
+            team: None,
+        })
+        .await
+        .unwrap();
+        assert!(!dir.path().join(".claude/settings.local.json").exists());
     }
 
     #[test]
-    fn writes_claude_perms_preserves_existing_allow_entries() {
+    fn migration_removes_a_file_containing_only_clank_rules() {
         let dir = init_repo();
-        let claude_dir = dir.path().join(".claude");
-        std::fs::create_dir_all(&claude_dir).unwrap();
+        let path = dir.path().join(".claude/settings.local.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(
-            claude_dir.join("settings.local.json"),
-            r#"{"permissions":{"allow":["Bash(ls *)"]}}"#,
+            &path,
+            r#"{"permissions":{"allow":["Write(.clank/agents/**)","Edit(.clank/agents/**)","Read(.clank/agents/**)"]}}"#,
         )
         .unwrap();
-        write_claude_perms(dir.path()).unwrap();
-        let body = std::fs::read_to_string(dir.path().join(".claude/settings.local.json")).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-        let allow = v["permissions"]["allow"].as_array().unwrap();
-        let entries: Vec<&str> = allow.iter().filter_map(|x| x.as_str()).collect();
-        assert!(entries.contains(&"Bash(ls *)"), "existing entry dropped");
-        assert!(entries.contains(&"Write(.clank/agents/**)"));
+        migrate_claude_perms(dir.path()).unwrap();
+        assert!(!path.exists(), "clank-only settings file should disappear");
+        migrate_claude_perms(dir.path()).unwrap();
+        assert!(!path.exists(), "migration is idempotent");
     }
 
     #[test]
-    fn writes_claude_perms_is_idempotent() {
+    fn migration_preserves_unrelated_settings_and_rules() {
         let dir = init_repo();
-        write_claude_perms(dir.path()).unwrap();
-        write_claude_perms(dir.path()).unwrap();
-        let body = std::fs::read_to_string(dir.path().join(".claude/settings.local.json")).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-        let allow = v["permissions"]["allow"].as_array().unwrap();
-        // Three entries, no duplicates after re-run.
-        let writes = allow
-            .iter()
-            .filter(|x| x.as_str() == Some("Write(.clank/agents/**)"))
-            .count();
-        assert_eq!(writes, 1, "duplicate entry on re-run");
+        let path = dir.path().join(".claude/settings.local.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"theme":"operator","permissions":{"deny":["Bash(rm *)"],"allow":["Bash(ls *)","Read(.clank/agents/**)","Edit(.clank/agents/**)","Write(.clank/agents/**)","Bash(git *)"]}}"#,
+        )
+        .unwrap();
+        migrate_claude_perms(dir.path()).unwrap();
+        let after = std::fs::read_to_string(&path).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&after).unwrap();
+        assert_eq!(value["theme"], "operator");
+        assert_eq!(
+            value["permissions"]["deny"],
+            serde_json::json!(["Bash(rm *)"])
+        );
+        assert_eq!(
+            value["permissions"]["allow"],
+            serde_json::json!(["Bash(ls *)", "Bash(git *)"]),
+        );
+        migrate_claude_perms(dir.path()).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), after);
+    }
+
+    #[test]
+    fn migration_leaves_operator_and_unparseable_files_byte_identical() {
+        let dir = init_repo();
+        let path = dir.path().join(".claude/settings.local.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        for body in [
+            " { \"permissions\": { \"allow\": [\"Bash(ls *)\"] } }\n",
+            "not json\n",
+        ] {
+            std::fs::write(&path, body).unwrap();
+            migrate_claude_perms(dir.path()).unwrap();
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), body);
+        }
     }
 
     #[test]

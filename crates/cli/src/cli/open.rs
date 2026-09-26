@@ -79,10 +79,6 @@ pub enum InitGap {
     /// `.clank/.gitignore` is absent or matches a known legacy
     /// body that init silently upgrades.
     MissingClankGitignore,
-    /// `.claude/settings.local.json` is absent or its
-    /// `permissions.allow` array doesn't include one or more
-    /// of clank's rules.
-    MissingClaudePermissions,
     /// `hooks/post-rewrite` is absent, or it carries the clank
     /// marker but its body has drifted from the canonical
     /// `POST_REWRITE_BODY`.
@@ -94,7 +90,6 @@ impl InitGap {
         match self {
             InitGap::MissingClankDir => "missing_clank_dir",
             InitGap::MissingClankGitignore => "missing_clank_gitignore",
-            InitGap::MissingClaudePermissions => "missing_claude_permissions",
             InitGap::MissingPostRewriteHook => "missing_post_rewrite_hook",
         }
     }
@@ -358,9 +353,8 @@ pub async fn inspect(requested: &str, home: Option<&Path>) -> anyhow::Result<Ope
 /// gaps + drift warnings.
 fn probe_init_state(repo: &Path) -> (Vec<InitGap>, Vec<String>) {
     use crate::init_facts::{
-        ClaudePermsState, GitignoreState, HookState, clank_gitignore_path,
-        classify_clank_gitignore, classify_claude_perms, classify_post_rewrite_hook,
-        claude_perms_path, post_rewrite_hook_path,
+        GitignoreState, HookState, clank_gitignore_path, classify_clank_gitignore,
+        classify_post_rewrite_hook, post_rewrite_hook_path,
     };
     let mut gaps = Vec::new();
     let mut warnings = Vec::new();
@@ -382,21 +376,6 @@ fn probe_init_state(repo: &Path) -> (Vec<InitGap>, Vec<String>) {
             ));
         }
         GitignoreState::Canonical => {}
-    }
-
-    match classify_claude_perms(repo) {
-        ClaudePermsState::Missing | ClaudePermsState::NeedsPatch { .. } => {
-            gaps.push(InitGap::MissingClaudePermissions);
-        }
-        ClaudePermsState::Drifted => {
-            warnings.push(format!(
-                "`{}` isn't valid JSON / lacks `permissions.allow`; \
-                 clank init won't repair this. Fix the file by hand \
-                 or delete it.",
-                claude_perms_path(repo).display()
-            ));
-        }
-        ClaudePermsState::Complete => {}
     }
 
     match classify_post_rewrite_hook(repo) {
