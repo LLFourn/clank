@@ -1,13 +1,14 @@
 //! What an agent said, read from the harness's own transcript.
 //!
 //! `zellij subscribe` hands us rendered cells — the output of each
-//! tool's TUI. Two harnesses also keep the conversation itself, as
+//! tool's TUI. Three harnesses also keep the conversation itself, as
 //! JSONL clank can read: Claude Code, one file per session, one line
 //! per completed content block; codex, one rollout per session, one
-//! `response_item` per completed item. Neither streams tokens, so a
+//! `response_item` per completed item; Grok, one chat history per
+//! session. These files do not stream tokens, so a
 //! transcript is near-live: a paragraph lands when it is finished.
 //!
-//! Both reduce to one shape, [`Turn`], through one adapter each. The
+//! All reduce to one shape, [`Turn`], through one adapter each. The
 //! adapters are pure over a line and tested on lines shaped from the
 //! real files on the machine this was built on, with the content
 //! redacted.
@@ -316,15 +317,24 @@ pub(crate) enum Parsed {
 
 /// Whether clank can read this harness's transcript at all.
 pub(crate) fn has_adapter(tool: Tool) -> bool {
-    matches!(tool, Tool::Claude | Tool::Codex)
+    matches!(tool, Tool::Claude | Tool::Codex | Tool::Grok)
 }
 
 /// Every turn or output on one line, for `tool`. A harness without
 /// an adapter, and every line that is bookkeeping, yields nothing.
+#[cfg(test)]
 pub(crate) fn parse(tool: Tool, line: &str) -> Vec<Parsed> {
+    parse_at(tool, line, 0)
+}
+
+/// Grok does not assign IDs to chat messages. The byte offset of a
+/// complete JSONL record stays stable across the initial window and
+/// later polls, even when messages have identical text.
+pub(crate) fn parse_at(tool: Tool, line: &str, offset: u64) -> Vec<Parsed> {
     match tool {
         Tool::Claude => claude::parse(line),
         Tool::Codex => codex::parse(line),
+        Tool::Grok => grok::parse(line, offset),
         _ => Vec::new(),
     }
 }
@@ -653,10 +663,112 @@ mod codex {
     }
 }
 
+mod grok {
+    use super::*;
+
+    pub(super) fn parse(line: &str, offset: u64) -> Vec<Parsed> {
+        let Ok(e) = serde_json::from_str::<serde_json::Value>(line) else {
+            return Vec::new();
+        };
+        let id = |part: &str| format!("grok:{offset}:{part}");
+        match e.get("type").and_then(|v| v.as_str()) {
+            Some("user") => {
+                let text = e.get("content").map(text_of).unwrap_or_default();
+                if text.is_empty() {
+                    return Vec::new();
+                }
+                vec![Parsed::Turn(Turn {
+                    id: id("user"),
+                    at: None,
+                    who: if e.get("synthetic_reason").and_then(|v| v.as_str()).is_some()
+                        || is_harness_text(&text)
+                    {
+                        Who::Harness
+                    } else {
+                        Who::Person
+                    },
+                    body: Body::prose(text),
+                })]
+            }
+            Some("assistant") => {
+                let mut out = Vec::new();
+                let text = e.get("content").map(text_of).unwrap_or_default();
+                if !text.is_empty() {
+                    out.push(Parsed::Turn(Turn {
+                        id: id("assistant"),
+                        at: None,
+                        who: Who::Agent,
+                        body: Body::prose(text),
+                    }));
+                }
+                if let Some(calls) = e.get("tool_calls").and_then(|v| v.as_array()) {
+                    for call in calls {
+                        let Some(call_id) = call.get("id").and_then(|v| v.as_str()) else {
+                            continue;
+                        };
+                        let name = call
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("tool")
+                            .to_string();
+                        let input = call
+                            .get("arguments")
+                            .map(|v| {
+                                v.as_str()
+                                    .map(str::to_string)
+                                    .unwrap_or_else(|| v.to_string())
+                            })
+                            .unwrap_or_default();
+                        let Told { title, detail } = told(&name, &input);
+                        out.push(Parsed::Turn(Turn {
+                            id: format!("grok-tool:{call_id}"),
+                            at: None,
+                            who: Who::Agent,
+                            body: Body::Tool {
+                                name,
+                                input,
+                                title,
+                                detail,
+                                output: None,
+                                images: Vec::new(),
+                            },
+                        }));
+                    }
+                }
+                out
+            }
+            Some("tool_result") => {
+                let Some(call_id) = e.get("tool_call_id").and_then(|v| v.as_str()) else {
+                    return Vec::new();
+                };
+                vec![Parsed::ToolOutput {
+                    id: format!("grok-tool:{call_id}"),
+                    output: e.get("content").map(text_of).unwrap_or_default(),
+                    images: e.get("content").map(images_in).unwrap_or_default(),
+                }]
+            }
+            Some("reasoning") => {
+                let text = e.get("summary").map(text_of).unwrap_or_default();
+                if text.is_empty() {
+                    return Vec::new();
+                }
+                vec![Parsed::Turn(Turn {
+                    id: id("reasoning"),
+                    at: None,
+                    who: Who::Agent,
+                    body: Body::Thinking { text },
+                })]
+            }
+            _ => Vec::new(),
+        }
+    }
+}
+
 /// Where a bound session's transcript is, or `None` when there is
 /// none to read. A recorded path (Claude's SessionStart says it)
 /// wins; Claude without one falls back to the derivation the harness
-/// uses; codex is found by its session id under its sessions dir.
+/// uses; codex is found by its session id under its sessions dir;
+/// Grok's path is derived from the working directory and session id.
 pub(crate) fn transcript_path(
     tool: Tool,
     session_id: &str,
@@ -679,8 +791,32 @@ pub(crate) fn transcript_path(
             );
             pick_newest(found)
         }
+        Tool::Grok => Some(
+            recorded
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| grok_derived(session_id, cwd, home)),
+        ),
         _ => None,
     }
+}
+
+/// Grok stores one chat history per session beneath the percent-encoded
+/// absolute working directory. The expected path is useful even before
+/// the file exists: the tail can begin as soon as Grok first writes it.
+fn grok_derived(session_id: &str, cwd: &Path, home: &Path) -> PathBuf {
+    let mut encoded = String::new();
+    for byte in cwd.to_string_lossy().as_bytes() {
+        if byte.is_ascii_alphanumeric() || b"-._~".contains(byte) {
+            encoded.push(*byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    home.join(".grok")
+        .join("sessions")
+        .join(encoded)
+        .join(session_id)
+        .join("chat_history.jsonl")
 }
 
 /// `~/.claude/projects/<cwd with every separator as '-'>/<id>.jsonl`.
@@ -738,15 +874,21 @@ pub(crate) struct Tail {
 }
 
 pub(crate) struct Polled {
-    pub(crate) lines: Vec<String>,
+    pub(crate) lines: Vec<TranscriptLine>,
     pub(crate) reset: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct TranscriptLine {
+    pub(crate) offset: u64,
+    pub(crate) text: String,
 }
 
 impl Tail {
     /// Open at the file's end, returning the whole lines within the
     /// last `window` bytes — the files run to hundreds of megabytes
     /// and the page wants the last few screens, not the history.
-    pub(crate) fn open(path: &Path, window: u64) -> std::io::Result<(Self, Vec<String>)> {
+    pub(crate) fn open(path: &Path, window: u64) -> std::io::Result<(Self, Vec<TranscriptLine>)> {
         use std::io::{Read, Seek, SeekFrom};
         let mut file = std::fs::File::open(path)?;
         let len = file.metadata()?.len();
@@ -762,15 +904,15 @@ impl Tail {
         // the tail of a line we did not read the head of. Whatever
         // follows the LAST newline is a record still being written —
         // kept, so it completes on a later poll rather than vanishing.
-        let body: &[u8] = if start > 0 {
+        let (body, body_start): (&[u8], u64) = if start > 0 {
             match buf.iter().position(|b| *b == b'\n') {
-                Some(i) => &buf[i + 1..],
-                None => &[],
+                Some(i) => (&buf[i + 1..], start + i as u64 + 1),
+                None => (&[], pos),
             }
         } else {
-            &buf
+            (&buf, 0)
         };
-        let (lines, partial) = whole_lines(body);
+        let (lines, partial) = whole_lines(body, body_start);
         Ok((
             Self {
                 path: path.to_path_buf(),
@@ -800,10 +942,11 @@ impl Tail {
         file.seek(SeekFrom::Start(self.pos))?;
         let mut fresh = Vec::new();
         file.read_to_end(&mut fresh)?;
+        let base = self.pos - self.partial.len() as u64;
         self.pos += fresh.len() as u64;
         let mut buf = std::mem::take(&mut self.partial);
         buf.extend_from_slice(&fresh);
-        let (lines, rest) = whole_lines(&buf);
+        let (lines, rest) = whole_lines(&buf, base);
         self.partial = rest;
         Ok(Polled {
             lines,
@@ -814,14 +957,21 @@ impl Tail {
 
 /// Complete lines, and the bytes after the last newline — a line
 /// still being written is not parsed until it ends.
-fn whole_lines(buf: &[u8]) -> (Vec<String>, Vec<u8>) {
+fn whole_lines(buf: &[u8], base: u64) -> (Vec<TranscriptLine>, Vec<u8>) {
     let Some(last_nl) = buf.iter().rposition(|b| *b == b'\n') else {
         return (Vec::new(), buf.to_vec());
     };
-    let lines = String::from_utf8_lossy(&buf[..last_nl])
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .map(str::to_string)
+    let mut offset = base;
+    let lines = buf[..=last_nl]
+        .split_inclusive(|b| *b == b'\n')
+        .filter_map(|bytes| {
+            let at = offset;
+            offset += bytes.len() as u64;
+            let text = String::from_utf8_lossy(bytes)
+                .trim_end_matches(['\r', '\n'])
+                .to_string();
+            (!text.trim().is_empty()).then_some(TranscriptLine { offset: at, text })
+        })
         .collect();
     (lines, buf[last_nl + 1..].to_vec())
 }
@@ -1161,9 +1311,9 @@ mod tests {
         assert!(parse(Tool::Claude, "not json").is_empty());
         assert!(
             parse(Tool::Grok, CLAUDE.lines().next().unwrap()).is_empty(),
-            "no adapter, no turns"
+            "another harness's line is not a Grok turn"
         );
-        assert!(!has_adapter(Tool::OpenCode) && has_adapter(Tool::Claude));
+        assert!(!has_adapter(Tool::OpenCode) && has_adapter(Tool::Grok));
     }
 
     #[test]
@@ -1222,7 +1372,61 @@ mod tests {
         );
         assert_eq!(
             transcript_path(Tool::Grok, "x", None, cwd, home.path()),
-            None
+            Some(
+                home.path()
+                    .join(".grok/sessions/%2FUsers%2Flloyd%2Fsrc%2Fclank/x/chat_history.jsonl")
+            )
+        );
+        assert_eq!(
+            transcript_path(
+                Tool::Grok,
+                "x",
+                Some(Path::new("/recorded/history.jsonl")),
+                cwd,
+                home.path()
+            ),
+            Some(PathBuf::from("/recorded/history.jsonl"))
+        );
+    }
+
+    #[test]
+    fn grok_chat_history_has_people_replies_tools_and_private_reasoning() {
+        let user = r#"{"type":"user","content":[{"type":"text","text":"hello"}]}"#;
+        let first = parse_at(Tool::Grok, user, 13);
+        let second = parse_at(Tool::Grok, user, 91);
+        assert_eq!(turn(&first[0]).id, "grok:13:user");
+        assert_eq!(turn(&first[0]).who, Who::Person);
+        assert_ne!(
+            turn(&first[0]).id,
+            turn(&second[0]).id,
+            "identical prompts are distinct"
+        );
+        let synthetic = r#"{"type":"user","content":[{"type":"text","text":"wake"}],"synthetic_reason":"task_completed"}"#;
+        assert_eq!(
+            turn(&parse_at(Tool::Grok, synthetic, 120)[0]).who,
+            Who::Harness
+        );
+        let assistant = r#"{"type":"assistant","content":"Done","tool_calls":[{"id":"call-1","name":"shell","arguments":"{\"command\":\"pwd\"}"},{"id":"call-2","name":"Read","arguments":"{\"file_path\":\"a.rs\"}"}]}"#;
+        let parsed = parse_at(Tool::Grok, assistant, 200);
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(turn(&parsed[0]).id, "grok:200:assistant");
+        assert_eq!(turn(&parsed[1]).id, "grok-tool:call-1");
+        assert_eq!(turn(&parsed[2]).id, "grok-tool:call-2");
+        let result = r#"{"type":"tool_result","tool_call_id":"call-2","content":"file text"}"#;
+        assert!(
+            matches!(&parse_at(Tool::Grok, result, 400)[0], Parsed::ToolOutput { id, output, .. } if id == "grok-tool:call-2" && output == "file text")
+        );
+        let reasoning = r#"{"type":"reasoning","summary":[{"type":"summary_text","text":"Checking the file"}],"encrypted_content":"secret"}"#;
+        assert!(
+            matches!(&turn(&parse_at(Tool::Grok, reasoning, 500)[0]).body, Body::Thinking { text } if text == "Checking the file")
+        );
+        assert!(
+            parse_at(
+                Tool::Grok,
+                r#"{"type":"reasoning","encrypted_content":"secret"}"#,
+                600
+            )
+            .is_empty()
         );
     }
 
@@ -1443,16 +1647,22 @@ mod tests {
         write!(f, r#"{{"n":2,"text":"half"#).unwrap();
         f.flush().unwrap();
         let (mut tail, lines) = Tail::open(&path, 1 << 20).unwrap();
-        assert_eq!(lines, vec![r#"{"n":1}"#], "only the whole line at open");
+        assert_eq!(
+            lines.iter().map(|l| l.text.as_str()).collect::<Vec<_>>(),
+            vec![r#"{"n":1}"#],
+            "only the whole line at open"
+        );
+        assert_eq!(lines[0].offset, 0);
         write!(f, r#" of it"}}"#).unwrap();
         writeln!(f).unwrap();
         f.flush().unwrap();
         let p = tail.poll().unwrap();
         assert_eq!(
-            p.lines,
+            p.lines.iter().map(|l| l.text.as_str()).collect::<Vec<_>>(),
             vec![r#"{"n":2,"text":"half of it"}"#],
             "the record, once, whole"
         );
+        assert_eq!(p.lines[0].offset, r#"{"n":1}"#.len() as u64 + 1);
         assert!(tail.poll().unwrap().lines.is_empty(), "and never again");
     }
 
@@ -1475,11 +1685,11 @@ mod tests {
             lines.len()
         );
         assert!(
-            lines[0].starts_with('{') && lines[0].ends_with('}'),
+            lines[0].text.starts_with('{') && lines[0].text.ends_with('}'),
             "no half line: {}",
-            lines[0]
+            lines[0].text
         );
-        assert!(lines.last().unwrap().contains("\"n\":49"));
+        assert!(lines.last().unwrap().text.contains("\"n\":49"));
 
         assert!(
             tail.poll().unwrap().lines.is_empty(),
@@ -1495,12 +1705,24 @@ mod tests {
         writeln!(f, r#"{{"n":51}}"#).unwrap();
         f.flush().unwrap();
         let p = tail.poll().unwrap();
-        assert_eq!(p.lines, vec![r#"{"n":50}"#, r#"{"n":51}"#]);
+        assert_eq!(
+            p.lines.iter().map(|l| l.text.as_str()).collect::<Vec<_>>(),
+            vec![r#"{"n":50}"#, r#"{"n":51}"#]
+        );
+        assert_eq!(
+            p.lines[0].offset,
+            std::fs::metadata(&path).unwrap().len()
+                - p.lines.iter().map(|l| l.text.len() as u64 + 1).sum::<u64>()
+        );
         assert!(!p.reset);
 
         std::fs::write(&path, "{\"n\":0}\n").unwrap();
         let p = tail.poll().unwrap();
         assert!(p.reset, "a shrink is a new generation");
-        assert_eq!(p.lines, vec![r#"{"n":0}"#]);
+        assert_eq!(
+            p.lines.iter().map(|l| l.text.as_str()).collect::<Vec<_>>(),
+            vec![r#"{"n":0}"#]
+        );
+        assert_eq!(p.lines[0].offset, 0);
     }
 }

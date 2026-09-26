@@ -1,4 +1,4 @@
-const { open, done, facts, agent, panes, turns } = require('./harness');
+const { open, done, facts, agent, panes, text, turns } = require('./harness');
 const out = [];
 const ok = (name, cond, detail = '') => out.push(`${cond ? 'PASS' : 'FAIL'}  ${name}${detail ? '  — ' + detail : ''}`);
 
@@ -49,6 +49,44 @@ const ok = (name, cond, detail = '') => out.push(`${cond ? 'PASS' : 'FAIL'}  ${n
     const after = await page.textContent('#whoname');
     ok('auto resolves as soon as the box is empty', after === 'codex', `header says ${after}`);
     ok('send follows the new recipient', !(await page.isDisabled('#send')));
+    await browser.close();
+  }
+
+  // ---- Grok uses the transcript, sends through the same composer,
+  // and keeps its terminal view reachable.
+  {
+    const { browser, page, errors } = await open();
+    await page.evaluate((d) => window.__send('status', d), facts([
+      agent('grok', 'master', null, null, true),
+    ]));
+    await page.evaluate((d) => window.__send('panes', d), panes(['grok']));
+    await page.evaluate((d) => window.__send('turns', d), turns('grok', [
+      text('grok:0:user', 'person', 'earlier question', 'earlier question'),
+      text('grok:61:assistant', 'agent', 'earlier answer', 'earlier answer'),
+    ]));
+    ok('Grok opens in chat mode', await page.isVisible('.view.transcript.on'));
+    ok('Grok history is readable', (await page.textContent('.view.transcript.on')).includes('earlier answer'));
+    await page.fill('#text', 'new question');
+    await page.click('#send');
+    await page.waitForTimeout(40);
+    const sent = await page.evaluate(() => window.__frames.find((f) => f[0] === '/say'));
+    ok('Grok receives the submitted message', sent && JSON.parse(sent[1]).pane === 'pane-grok' && JSON.parse(sent[1]).text === 'new question');
+    await page.evaluate((d) => window.__send('turn', d), {
+      agent: 'grok', session: 's1', generation: 1,
+      turn: text('grok:200:assistant', 'agent', 'reply from Grok', 'reply from Grok'),
+    });
+    ok('the resulting Grok reply appears', (await page.textContent('.view.transcript.on')).includes('reply from Grok'));
+    await page.click('#mode-terminal');
+    ok('the Grok terminal stays available', await page.isVisible('.view.terminal.on'));
+    await page.click('#mode-transcript');
+    await page.evaluate(() => {
+      window.fetch = async () => ({ ok: false, status: 502, text: async () => 'Grok pane refused the message' });
+    });
+    await page.fill('#text', 'fail');
+    await page.click('#send');
+    await page.waitForTimeout(40);
+    ok('a Grok send failure names its reason', (await page.textContent('#sent')).includes('Grok pane refused the message'));
+    ok('Grok chat has no script errors', errors.length === 0, errors.join('; '));
     await browser.close();
   }
 
@@ -492,7 +530,7 @@ const ok = (name, cond, detail = '') => out.push(`${cond ? 'PASS' : 'FAIL'}  ${n
     await page.waitForTimeout(60);
     ok('a failed send gives the words back', (await page.inputValue('#text')) === 'please run the tests',
        await page.inputValue('#text'));
-    ok('and says so', (await page.textContent('#sent')).includes('Not sent'));
+    ok('and names the failure', (await page.textContent('#sent')).includes('Not sent: no'));
     ok('no errors around the two races', errors.length === 0, errors.join('; '));
   }
 

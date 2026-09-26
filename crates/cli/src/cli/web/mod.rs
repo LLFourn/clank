@@ -681,6 +681,7 @@ fn subscribe(panes: &dyn Panes, table: &[PaneMeta], feed: &Feed) -> Option<Subsc
 /// records for the tail is the guarantee.
 struct TailHandle {
     session: String,
+    tool: clank_core::vocab::Tool,
     path: PathBuf,
     stop: Arc<std::sync::atomic::AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -704,7 +705,7 @@ impl Drop for TailHandle {
 
 /// Which transcript each agent on the roster should be showing: the
 /// bound session's file, for harnesses that keep one.
-type Wanted = std::collections::HashMap<String, (String, PathBuf)>;
+type Wanted = std::collections::HashMap<String, (String, clank_core::vocab::Tool, PathBuf)>;
 
 /// Start a tail for every bound agent whose harness keeps a
 /// transcript, stop the tails of agents rebound elsewhere, moved to
@@ -741,7 +742,10 @@ fn reconcile_tails(
             if let Some(path) =
                 transcript::transcript_path(session.tool, session.id.as_str(), recorded, repo, home)
             {
-                wanted.insert(a.label.clone(), (session.id.as_str().to_string(), path));
+                wanted.insert(
+                    a.label.clone(),
+                    (session.id.as_str().to_string(), session.tool, path),
+                );
             }
         }
     }
@@ -770,9 +774,9 @@ fn retarget_tails(
     let gone: Vec<String> = tails
         .iter()
         .filter(|(label, h)| {
-            !wanted
-                .get(*label)
-                .is_some_and(|(sid, path)| sid == &h.session && path == &h.path)
+            !wanted.get(*label).is_some_and(|(sid, tool, path)| {
+                sid == &h.session && tool == &h.tool && path == &h.path
+            })
         })
         .map(|(label, _)| label.clone())
         .collect();
@@ -786,7 +790,7 @@ fn retarget_tails(
             feed.claim_turns(&label, *next_owner, None);
         }
     }
-    for (label, (session, path)) in wanted {
+    for (label, (session, tool, path)) in wanted {
         if tails.contains_key(label) {
             continue;
         }
@@ -794,19 +798,22 @@ fn retarget_tails(
         let owner = *next_owner;
         feed.claim_turns(label, owner, Some(session));
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let (feed, label2, session2, path2, stop2) = (
+        let (feed, label2, session2, tool2, path2, stop2) = (
             feed.clone(),
             label.clone(),
             session.clone(),
+            *tool,
             path.clone(),
             stop.clone(),
         );
-        let thread =
-            std::thread::spawn(move || run_tail(feed, label2, owner, session2, path2, stop2));
+        let thread = std::thread::spawn(move || {
+            run_tail(feed, label2, owner, session2, tool2, path2, stop2)
+        });
         tails.insert(
             label.clone(),
             TailHandle {
                 session: session.clone(),
+                tool: *tool,
                 path: path.clone(),
                 stop,
                 thread: Some(thread),
@@ -827,15 +834,11 @@ fn run_tail(
     agent: String,
     owner: u64,
     session: String,
+    tool: clank_core::vocab::Tool,
     path: PathBuf,
     stop: Arc<std::sync::atomic::AtomicBool>,
 ) {
     use std::sync::atomic::Ordering;
-    let tool = if path.to_string_lossy().contains("/.codex/") {
-        clank_core::vocab::Tool::Codex
-    } else {
-        clank_core::vocab::Tool::Claude
-    };
     // The file may not exist yet: a session that has not spoken.
     let (mut tail, lines) = loop {
         if stop.load(Ordering::Relaxed) {
@@ -874,7 +877,7 @@ fn run_tail(
             continue;
         }
         for line in &polled.lines {
-            for parsed in transcript::parse(tool, line) {
+            for parsed in transcript::parse_at(tool, &line.text, line.offset) {
                 match parsed {
                     transcript::Parsed::Turn(t) => {
                         feed.turn(&agent, owner, &session, generation, t)
@@ -891,10 +894,13 @@ fn run_tail(
 /// A window of lines as turns, with each tool's output already on
 /// its call — the batch equivalent of what the live path does one
 /// line at a time.
-fn window_turns(tool: clank_core::vocab::Tool, lines: &[String]) -> Vec<transcript::Turn> {
+fn window_turns(
+    tool: clank_core::vocab::Tool,
+    lines: &[transcript::TranscriptLine],
+) -> Vec<transcript::Turn> {
     let mut turns: Vec<transcript::Turn> = Vec::new();
     for line in lines {
-        for parsed in transcript::parse(tool, line) {
+        for parsed in transcript::parse_at(tool, &line.text, line.offset) {
             match parsed {
                 transcript::Parsed::Turn(t) => turns.push(t),
                 transcript::Parsed::ToolOutput { id, output, images } => {
@@ -2547,7 +2553,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = |n: &str| dir.path().join(n);
         let mut wanted = Wanted::default();
-        wanted.insert("claude".into(), ("s1".into(), file("s1.jsonl")));
+        wanted.insert(
+            "claude".into(),
+            (
+                "s1".into(),
+                clank_core::vocab::Tool::Claude,
+                file("s1.jsonl"),
+            ),
+        );
         let with = retarget_tails(
             &wanted,
             &roster,
@@ -2562,7 +2575,14 @@ mod tests {
         assert_eq!(feed.snapshot().turns["claude"].turns.len(), 1);
 
         let (_, mut rx) = feed.connect();
-        wanted.insert("claude".into(), ("s2".into(), file("s2.jsonl")));
+        wanted.insert(
+            "claude".into(),
+            (
+                "s2".into(),
+                clank_core::vocab::Tool::Claude,
+                file("s2.jsonl"),
+            ),
+        );
         retarget_tails(
             &wanted,
             &roster,
@@ -4734,6 +4754,195 @@ mod tests {
         fn stop(&self, _pane: &str) -> anyhow::Result<()> {
             Ok(())
         }
+    }
+
+    /// A dummy Grok pane writes a reply to the same history the web
+    /// tail reads. This checks the server's real send route and live
+    /// transcript together, without driving a person's Grok session.
+    struct GrokPanes {
+        history: PathBuf,
+    }
+
+    impl Panes for GrokPanes {
+        fn session(&self) -> &str {
+            "grok-test"
+        }
+        fn table(&self) -> Option<Vec<PaneMeta>> {
+            Some(vec![PaneMeta {
+                id: "terminal_77".into(),
+                label: "grok".into(),
+                columns: 80,
+                rows: 24,
+                exited: false,
+            }])
+        }
+        fn subscribe(&self, _ids: &[String]) -> Option<SubscribeChild> {
+            None
+        }
+        fn say(&self, pane: &str, text: &str) -> anyhow::Result<()> {
+            anyhow::ensure!(pane == "terminal_77", "unknown Grok pane");
+            anyhow::ensure!(text != "fail", "Grok pane refused the message");
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&self.history)?;
+            writeln!(
+                file,
+                "{}",
+                serde_json::json!({"type":"user","content":[{"type":"text","text":text}]})
+            )?;
+            writeln!(
+                file,
+                "{}",
+                serde_json::json!({"type":"assistant","content":"reply from dummy Grok"})
+            )?;
+            Ok(())
+        }
+        fn stop(&self, _pane: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dummy_grok_repo_chats_through_the_web_route_and_stream() {
+        use crate::cli::status_tui::fixtures::{agent_row, snap};
+        use clank_core::agent_config::{AgentConfig, Session};
+        use clank_core::ids::{AgentLabel, SessionId};
+        use clank_core::vocab::{AutoMode, Tool};
+        use futures_util::StreamExt;
+
+        let repo = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "--quiet"])
+                .current_dir(repo.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::create_dir_all(repo.path().join(".clank")).unwrap();
+        std::fs::write(
+            repo.path().join(".clank/config.json"),
+            r#"{"agents":{"grok":{"tool":"grok","role":"master"}}}"#,
+        )
+        .unwrap();
+        let session = "grok-test-session";
+        let history =
+            transcript::transcript_path(Tool::Grok, session, None, repo.path(), home.path())
+                .unwrap();
+        std::fs::create_dir_all(history.parent().unwrap()).unwrap();
+        std::fs::write(
+            &history,
+            r#"{"type":"user","content":[{"type":"text","text":"earlier question"}]}
+{"type":"assistant","content":"earlier answer"}
+"#,
+        )
+        .unwrap();
+        crate::agent_store::save_agent_config(
+            repo.path(),
+            &AgentLabel::parse("grok").unwrap(),
+            &AgentConfig {
+                session: Some(Session {
+                    id: SessionId::parse(session).unwrap(),
+                    tool: Tool::Grok,
+                    updated_at: "2026-09-26T00:00:00Z".into(),
+                    transcript: None,
+                }),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut s = snap(vec![], vec![]);
+        s.agents = vec![agent_row(
+            "grok",
+            crate::cli::teams_config::RosterRole::Master,
+            AutoMode::On,
+        )];
+        let door = Arc::new(door::Door::new(Some(home.path().to_path_buf())));
+        let instance = Instance::start(
+            repo.path().to_path_buf(),
+            Some(home.path().to_path_buf()),
+            Arc::new(GrokPanes { history }),
+            door.clone(),
+            Startup {
+                tunnel: None,
+                poll: std::time::Duration::from_secs(3600),
+                grace: std::time::Duration::from_millis(200),
+                seed: status_payload(repo.path(), &s, &Default::default()),
+            },
+        )
+        .await
+        .unwrap();
+        instance.observe(&s);
+        let opened = door.open_session("token").unwrap();
+        let cookie = format!("{}={opened}", door::COOKIE);
+        let host = instance.url.trim_start_matches("http://").to_string();
+        let (mut peer, _) =
+            tokio_tungstenite::connect_async(socket_to(&host, "/events", Some(&cookie)))
+                .await
+                .unwrap();
+        let mut frames = String::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(6);
+        while !frames.contains("earlier answer") {
+            let frame = tokio::time::timeout_at(deadline, peer.next())
+                .await
+                .expect("Grok transcript frame")
+                .unwrap()
+                .unwrap();
+            frames.push_str(frame.to_text().unwrap());
+        }
+        assert!(
+            frames.contains("\"transcript\":true"),
+            "Grok opens in chat mode: {frames}"
+        );
+        assert!(
+            frames.contains("terminal_77"),
+            "the terminal view remains available: {frames}"
+        );
+
+        let client = reqwest::Client::new();
+        let sent = client
+            .post(format!("{}/say", instance.url))
+            .header("origin", &instance.url)
+            .header("cookie", &cookie)
+            .json(&serde_json::json!({"pane":"terminal_77","text":"new question"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(sent.status(), 204);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(6);
+        while !frames.contains("reply from dummy Grok") {
+            let frame = tokio::time::timeout_at(deadline, peer.next())
+                .await
+                .expect("Grok reply frame")
+                .unwrap()
+                .unwrap();
+            frames.push_str(frame.to_text().unwrap());
+        }
+        assert!(
+            frames.contains("new question"),
+            "the submitted prompt appears: {frames}"
+        );
+
+        let failed = client
+            .post(format!("{}/say", instance.url))
+            .header("origin", &instance.url)
+            .header("cookie", &cookie)
+            .json(&serde_json::json!({"pane":"terminal_77","text":"fail"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(failed.status(), 502);
+        assert!(
+            failed
+                .text()
+                .await
+                .unwrap()
+                .contains("Grok pane refused the message")
+        );
+        drop(peer);
+        instance.stop().await;
     }
 
     /// The seed reaches a browser through the RUNNING remote, not just

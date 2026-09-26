@@ -230,7 +230,7 @@
   .say button.stop { background: none; color: var(--ink); border: 1px solid var(--edge); border-radius: 999px; padding: 6px 14px; }
   .say button.attach { min-width: 36px; min-height: 36px; font-size: 22px; line-height: 1; color: var(--muted); display: inline-flex; align-items: center; justify-content: center; }
   .say button.send:disabled { opacity: 0.4; cursor: default; }
-  .say .sent { color: var(--muted); font-size: 12px; white-space: nowrap; }
+  .say .sent { color: var(--muted); font-size: 12px; min-width: 0; overflow-wrap: anywhere; }
 
   /* The ledger: a drawer on a phone, a column on a desk. */
   .ledger { display: none; background: var(--bezel); border-left: 1px solid var(--edge); overflow: auto; font-size: 13px; }
@@ -334,7 +334,7 @@
       <div class="tools">
         <button class="attach" id="attach" type="button" aria-label="Attach a file">+</button>
         <input class="file" id="file" type="file" accept="image/png,image/jpeg,image/gif,image/webp,application/pdf,text/plain,text/markdown,text/csv,application/json" hidden>
-        <span class="sent" id="sent"></span>
+        <span class="sent" id="sent" role="status" aria-live="polite"></span>
         <button class="stop" id="stop" type="button" hidden aria-label="Stop the shown agent">Stop</button>
         <button class="send" id="send" type="submit" disabled>Send</button>
       </div>
@@ -1323,7 +1323,7 @@
       // since, which is the order they were written in.
       input.value = input.value ? `${text} ${input.value}` : text;
       resize();
-      sentEl.textContent = 'Not sent';
+      sentEl.textContent = `Not sent: ${err.message || String(err)}`;
       console.error(err);
     } finally {
       sending -= 1;
