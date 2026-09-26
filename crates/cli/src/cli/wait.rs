@@ -36,6 +36,24 @@ use clank_core::Role;
 use clank_core::vocab::HookEvent;
 use clank_core::wait::{StartupSnapshot, WaitItem, detect_finished};
 
+/// The incarnation that started this wait no longer owns the label.
+/// `run` turns this into a control envelope for a hook-owned wait;
+/// other callers simply stop without claiming to have delivered work.
+#[derive(Debug, thiserror::Error)]
+#[error("wait incarnation was superseded")]
+struct WaitSuperseded;
+
+#[derive(Debug, thiserror::Error)]
+#[error("another wait is already parked for this session")]
+struct WaitAlreadyParked;
+
+fn ensure_current(agent_dir: &Path, generation: u64) -> anyhow::Result<()> {
+    if crate::agent_store::read_wait_generation(agent_dir) != generation {
+        return Err(WaitSuperseded.into());
+    }
+    Ok(())
+}
+
 fn firings_from_items(items: &[WaitItem]) -> Vec<HookFiring> {
     items
         .iter()
@@ -136,7 +154,31 @@ fn firings_from_items(items: &[WaitItem]) -> Vec<HookFiring> {
 pub async fn run(args: WaitArgs) -> anyhow::Result<()> {
     let json = args.json;
     let repo = resolve_repo(args.repo.as_deref())?;
-    if let Some(items) = items(args).await? {
+    let result = match items(args).await {
+        Err(e) if e.is::<WaitSuperseded>() => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&SupersededEnvelope {
+                        items: [],
+                        superseded: true,
+                    })?
+                );
+            }
+            return Ok(());
+        }
+        Err(e) if e.is::<WaitAlreadyParked>() => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({"items": [], "already_parked": true})
+                );
+            }
+            return Ok(());
+        }
+        other => other?,
+    };
+    if let Some(items) = result {
         emit(&items, json);
         // Printed is delivered. A channel send is not: it succeeds
         // while the receiver is alive, and this wait could still have
@@ -226,6 +268,31 @@ pub async fn items(args: WaitArgs) -> anyhow::Result<Option<Vec<WaitItem>>> {
     // is fail-soft there (wait-reloads-config-per-refold).
     let mut inputs = derive_wait_inputs(&repo, &author)?;
 
+    // SAY SO. The stop hook decides whether to yield a turn to a
+    // background wait, and the harness's task list is not evidence —
+    // its own doc says it names tasks that already finished, so a
+    // completed wait silenced every later turn-end permanently. Clank
+    // started this process, so this process can publish what it is
+    // (the-turn-end-is-one-decision). Dropped on exit; a wait that
+    // dies leaves a record whose birth check fails, which reads the
+    // same.
+    let agent_dir = crate::agent_store::agents_root(&repo).join(author.as_str());
+    let generation = args
+        .expected_generation
+        .unwrap_or_else(|| crate::agent_store::read_wait_generation(&agent_dir));
+    let _claim = WaitClaimGuard::acquire(
+        &agent_dir,
+        &author,
+        args.peek,
+        args.tag.clone(),
+        generation,
+        args.deliver_to_session.as_deref(),
+    )
+    .await?;
+    if !args.peek {
+        ensure_current(&agent_dir, generation)?;
+    }
+
     let policy = if args.no_cache {
         crate::rebuild::CachePolicy::Bypass
     } else {
@@ -234,6 +301,9 @@ pub async fn items(args: WaitArgs) -> anyhow::Result<Option<Vec<WaitItem>>> {
     let initial_state = crate::rebuild::rebuild_repo_with_policy(&repo, policy)
         .await
         .map_err(|e| anyhow::anyhow!("failed to fold repo `{}`: {e}", repo.display()))?;
+    if !args.peek {
+        ensure_current(&agent_dir, generation)?;
+    }
 
     // Derived BEFORE the snapshot so it can capture arm-time ad-hoc
     // gate states (detect_adhoc_settled needs "pending at arm").
@@ -260,6 +330,9 @@ pub async fn items(args: WaitArgs) -> anyhow::Result<Option<Vec<WaitItem>>> {
             .iter()
             .any(|i| matches!(i, WaitItem::Unblocked { .. }));
         if has_answer {
+            if !args.peek {
+                ensure_current(&agent_dir, generation)?;
+            }
             return Ok(Some(br.items));
         }
 
@@ -273,6 +346,9 @@ pub async fn items(args: WaitArgs) -> anyhow::Result<Option<Vec<WaitItem>>> {
                 &snapshot,
             );
             if !items.is_empty() {
+                if !args.peek {
+                    ensure_current(&agent_dir, generation)?;
+                }
                 // `--peek` is a pure probe: report work-presence, fire NO
                 // lifecycle hooks (the Stop hook may peek on every stop).
                 if !args.peek {
@@ -294,6 +370,7 @@ pub async fn items(args: WaitArgs) -> anyhow::Result<Option<Vec<WaitItem>>> {
         && inputs.role == Role::Master
         && initial_state.fold.plans.is_empty()
     {
+        ensure_current(&agent_dir, generation)?;
         hook_config::run_idle_hook(&repo, &inputs.hook_config);
     }
 
@@ -372,6 +449,9 @@ pub async fn items(args: WaitArgs) -> anyhow::Result<Option<Vec<WaitItem>>> {
                     }
                 }
             }
+            // The same beat that notices repo changes also notices a
+            // new incarnation. No second hook-side poller is needed.
+            ensure_current(&agent_dir, generation)?;
             // Drain items queued before/at this beat (whichever branch
             // woke us) so a repo-branch win doesn't strand a ready
             // external item (codex 1bbb61d).
@@ -425,6 +505,7 @@ pub async fn items(args: WaitArgs) -> anyhow::Result<Option<Vec<WaitItem>>> {
                     .derive_status(&reviews, &inputs.work_policy, head.as_ref());
                 let items = items_for(&repo, &author, &inputs, &status, &state.fold, &snapshot);
                 if !items.is_empty() {
+                    ensure_current(&agent_dir, generation)?;
                     for firing in &firings_from_items(&items) {
                         hook_config::run_hook(&repo, &inputs.hook_config, firing);
                     }
@@ -440,6 +521,7 @@ pub async fn items(args: WaitArgs) -> anyhow::Result<Option<Vec<WaitItem>>> {
             drain_external(&mut sources.rx, &mut sources_open, &mut external);
             drop_items_not_for(inputs.role, &mut external);
             if let Some(items) = combine_beat_result(repo_items, external) {
+                ensure_current(&agent_dir, generation)?;
                 return Ok(items);
             }
         }
@@ -758,7 +840,7 @@ fn combine_beat_result(
     match repo_items {
         Some(mut items) => {
             items.extend(external);
-            Some(items)
+            (!items.is_empty()).then_some(items)
         }
         None if !external.is_empty() => Some(external),
         None => None,
@@ -902,6 +984,175 @@ impl RingTail {
     }
     pub(crate) fn into_string(self) -> String {
         String::from_utf8_lossy(&Vec::from(self.buf)).into_owned()
+    }
+}
+
+/// Publishes this wait's claim for as long as it runs.
+///
+/// RAII, because the interesting case is the one that does not exit
+/// cleanly: every return path from a long function is a place to
+/// forget, and a stale claim is worse than none — it is the exact
+/// false-liveness this record exists to remove. A drop also covers
+/// the abort paths the wait has several of.
+struct WaitClaimGuard {
+    agent_dir: std::path::PathBuf,
+    /// What THIS guard wrote. Withdrawal is compare-and-delete
+    /// against it, so an older wait exiting after a successor has
+    /// taken over cannot erase the successor's record (codex
+    /// 2f38deb).
+    mine: Option<crate::wait_claim::WaitClaim>,
+}
+
+impl WaitClaimGuard {
+    async fn acquire(
+        agent_dir: &Path,
+        author: &AgentLabel,
+        probe: bool,
+        tag: Option<String>,
+        generation: u64,
+        delivery_session: Option<&str>,
+    ) -> anyhow::Result<Self> {
+        Self::acquire_until(
+            agent_dir,
+            author,
+            probe,
+            tag,
+            generation,
+            delivery_session,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(6),
+        )
+        .await
+    }
+
+    async fn acquire_until(
+        agent_dir: &Path,
+        author: &AgentLabel,
+        probe: bool,
+        tag: Option<String>,
+        generation: u64,
+        delivery_session: Option<&str>,
+        deadline: tokio::time::Instant,
+    ) -> anyhow::Result<Self> {
+        let mut guard = Self {
+            agent_dir: agent_dir.to_path_buf(),
+            mine: None,
+        };
+        if probe {
+            return Ok(guard);
+        }
+        let session = delivery_session
+            .map(str::to_owned)
+            .or_else(crate::wait_claim::launch_session);
+        let Some(session) = session else {
+            // A terminal-launched wait has no session it can claim
+            // to wake. It still watches, but never suppresses a hook.
+            return Ok(guard);
+        };
+
+        loop {
+            ensure_current(agent_dir, generation)?;
+            match crate::wait_claim::try_acquire(agent_dir, &session, generation, tag.clone()) {
+                Ok(crate::wait_claim::Admission::Taken(claim)) => {
+                    guard.mine = Some(claim);
+                    ensure_current(agent_dir, generation)?;
+                    return Ok(guard);
+                }
+                Ok(crate::wait_claim::Admission::Held(holder))
+                    if holder.generation == generation && holder.session == session =>
+                {
+                    return Err(WaitAlreadyParked.into());
+                }
+                Ok(crate::wait_claim::Admission::Held(holder)) => {
+                    if tokio::time::Instant::now() >= deadline {
+                        anyhow::bail!(
+                            "wait: live predecessor pid {} (generation {}, session {}) did not release its claim before the handoff deadline for `{author}`",
+                            holder.pid,
+                            holder.generation,
+                            holder.session
+                        );
+                    }
+                    // The predecessor notices the generation change
+                    // on its existing beat and compare-withdraws. A
+                    // successor is admitted only after that release
+                    // or the exact birth identity has exited.
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                Err(e) => return Err(anyhow::anyhow!("wait: acquiring claim for `{author}`: {e}")),
+            }
+        }
+    }
+
+    /// `probe` skips publication entirely: `--peek` is a read-only
+    /// question about an agent, not a waiter.
+    #[cfg(test)]
+    fn publish_in(
+        agent_dir: &Path,
+        author: &AgentLabel,
+        probe: bool,
+        tag: Option<String>,
+        generation: u64,
+        session: Option<&str>,
+        ambient: &dyn crate::agent_env::Ambient,
+    ) -> Self {
+        // A SECOND waiter for one agent is worth saying out loud.
+        // Milestone 3 makes this a takeover; today it is a
+        // diagnostic, which is the difference between a known hazard
+        // and a silent one.
+        if !probe && let Some(pid) = crate::wait_claim::other_live_wait(agent_dir) {
+            eprintln!(
+                "wait: `{author}` already has a live wait (pid {pid}); two waiters both \
+                 return work and only one is read"
+            );
+        }
+        let mine = (!probe)
+            .then(|| Self::write(agent_dir, author, tag, generation, session, ambient))
+            .flatten();
+        Self {
+            agent_dir: agent_dir.to_path_buf(),
+            mine,
+        }
+    }
+
+    #[cfg(test)]
+    fn write(
+        agent_dir: &Path,
+        author: &AgentLabel,
+        tag: Option<String>,
+        generation: u64,
+        session: Option<&str>,
+        ambient: &dyn crate::agent_env::Ambient,
+    ) -> Option<crate::wait_claim::WaitClaim> {
+        // The session this process was LAUNCHED INSIDE — where its
+        // completion wake actually goes. Not the label's bound
+        // session: that is a roster fact, and copying it let a
+        // terminal-launched wait claim a session it could never wake
+        // (codex 2f38deb). A wait with no harness around it claims
+        // nothing, which is correct — nothing is waiting on it.
+        let session = match session {
+            Some(session) => session.to_owned(),
+            None => crate::wait_claim::launch_session_in(ambient)?,
+        };
+        if ensure_current(agent_dir, generation).is_err() {
+            return None;
+        }
+        match crate::wait_claim::publish(agent_dir, &session, generation, tag) {
+            Ok(claim) => Some(claim),
+            Err(e) => {
+                // Best-effort: a wait that cannot describe itself
+                // still watches. What it loses is being PROVABLY
+                // live, which costs a nudge rather than a wake.
+                eprintln!("wait: could not publish the wait claim for `{author}`: {e}");
+                None
+            }
+        }
+    }
+}
+
+impl Drop for WaitClaimGuard {
+    fn drop(&mut self) {
+        if let Some(mine) = &self.mine {
+            crate::wait_claim::withdraw_mine(&self.agent_dir, mine);
+        }
     }
 }
 
@@ -1358,6 +1609,14 @@ fn queue_promote_outcome(queue: &[crate::cli::queue::QueueEntry]) -> Vec<WaitIte
 #[derive(serde::Serialize)]
 struct WaitEnvelope<'a> {
     items: Vec<WaitJsonItem<'a>>,
+}
+
+/// A control result, not an empty successful wait. The hook must
+/// suppress this obsolete incarnation rather than call it idle.
+#[derive(serde::Serialize)]
+struct SupersededEnvelope {
+    items: [(); 0],
+    superseded: bool,
 }
 
 fn emit(items: &[WaitItem], json: bool) {
@@ -2007,6 +2266,16 @@ pub(crate) fn parse_duration_str(raw: &str) -> anyhow::Result<Option<Duration>> 
 mod tests {
     use super::*;
 
+    #[test]
+    fn supersession_has_a_distinct_wait_wire() {
+        let value = serde_json::to_value(SupersededEnvelope {
+            items: [],
+            superseded: true,
+        })
+        .unwrap();
+        assert_eq!(value, serde_json::json!({"items": [], "superseded": true}));
+    }
+
     // ── extra-wait-events: command source field contracts ──────
 
     fn command_source(name: &str, argv: &[&str]) -> clank_core::agent_config::CommandSource {
@@ -2309,7 +2578,169 @@ mod tests {
         );
     }
 
-    /// Arm-time validation refuses what cannot run, and ONLY that.
+    /// What a guard may claim, and what it must leave alone.
+    ///
+    /// Both halves came from a public-CLI probe (codex 2f38deb): a
+    /// terminal-launched wait claimed the label's bound session and
+    /// silenced a session it could never wake, and a `--peek` probe
+    /// overwrote a parked waiter's claim and deleted it on return.
+    #[test]
+    fn a_guard_claims_only_its_own_launch_and_withdraws_only_its_own_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let author = AgentLabel::parse("rev").unwrap();
+        let agent_dir = crate::agent_store::agents_root(repo).join(author.as_str());
+        std::fs::create_dir_all(&agent_dir).unwrap();
+
+        let launched_in =
+            |sid: &str| crate::agent_env::Stated::saying(&[("CLAUDE_CODE_SESSION_ID", sid)]);
+        let sid = "55555555-5555-5555-5555-555555555555";
+        let nowhere = crate::agent_env::Stated::saying(&[]);
+
+        // NO HARNESS around it: a terminal-launched wait has nowhere
+        // to deliver a completion wake, so it claims nothing. The
+        // roster's bound session is not evidence about THIS process.
+        {
+            let _g =
+                WaitClaimGuard::publish_in(&agent_dir, &author, false, None, 0, None, &nowhere);
+            assert_eq!(
+                crate::wait_claim::read(&agent_dir),
+                None,
+                "a wait with no harness must not claim a session it cannot wake",
+            );
+        }
+
+        // Launched INSIDE a session: claims it, and the claim proves.
+        let live = WaitClaimGuard::publish_in(
+            &agent_dir,
+            &author,
+            false,
+            None,
+            0,
+            None,
+            &launched_in(sid),
+        );
+        let claim = crate::wait_claim::read(&agent_dir).expect("published");
+        assert!(crate::wait_claim::proves(&claim, sid, 0));
+
+        // A PEEK is a question about an agent, not a waiter. It
+        // publishes nothing and, on return, removes nothing.
+        {
+            let _probe = WaitClaimGuard::publish_in(
+                &agent_dir,
+                &author,
+                true,
+                None,
+                0,
+                None,
+                &launched_in(sid),
+            );
+        }
+        assert_eq!(
+            crate::wait_claim::read(&agent_dir),
+            Some(claim.clone()),
+            "a probe must not disturb a live waiter's claim",
+        );
+
+        drop(live);
+        assert_eq!(
+            crate::wait_claim::read(&agent_dir),
+            None,
+            "the claim does not outlive the wait that made it",
+        );
+    }
+
+    #[test]
+    fn hook_wait_claims_explicit_delivery_session_only_while_its_generation_is_current() {
+        let dir = tempfile::tempdir().unwrap();
+        let author = AgentLabel::parse("codex").unwrap();
+        let agent_dir = crate::agent_store::agents_root(dir.path()).join(author.as_str());
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let inherited = crate::agent_env::Stated::saying(&[("CODEX_THREAD_ID", "stale-daemon")]);
+
+        let live = WaitClaimGuard::publish_in(
+            &agent_dir,
+            &author,
+            false,
+            None,
+            0,
+            Some("pane-16"),
+            &inherited,
+        );
+        let claim =
+            crate::wait_claim::read(&agent_dir).expect("hook child claims its delivery session");
+        assert!(crate::wait_claim::proves(&claim, "pane-16", 0));
+        assert!(!crate::wait_claim::proves(&claim, "stale-daemon", 0));
+
+        std::fs::write(agent_dir.join("wait.gen"), "1\n").unwrap();
+        let stale = WaitClaimGuard::publish_in(
+            &agent_dir,
+            &author,
+            false,
+            None,
+            0,
+            Some("pane-16"),
+            &inherited,
+        );
+        assert!(
+            stale.mine.is_none(),
+            "old hook must not publish after supersession"
+        );
+        assert_eq!(crate::wait_claim::read(&agent_dir), Some(claim));
+        drop(stale);
+        drop(live);
+    }
+
+    #[tokio::test]
+    async fn successor_wait_starts_only_after_the_live_claim_is_released() {
+        let dir = tempfile::tempdir().unwrap();
+        let author = AgentLabel::parse("codex").unwrap();
+        let agent_dir = crate::agent_store::agents_root(dir.path()).join(author.as_str());
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let first = WaitClaimGuard::acquire(&agent_dir, &author, false, None, 0, Some("old"))
+            .await
+            .unwrap();
+        let duplicate = WaitClaimGuard::acquire(&agent_dir, &author, false, None, 0, Some("old"))
+            .await
+            .err()
+            .expect("same-session duplicate must stop");
+        assert!(duplicate.is::<WaitAlreadyParked>());
+
+        std::fs::write(agent_dir.join("wait.gen"), "1\n").unwrap();
+        let stuck = WaitClaimGuard::acquire_until(
+            &agent_dir,
+            &author,
+            false,
+            None,
+            1,
+            Some("new"),
+            tokio::time::Instant::now(),
+        )
+        .await
+        .err()
+        .expect("a live predecessor past the bound must fail");
+        assert!(format!("{stuck:#}").contains("did not release its claim"));
+        let pending = WaitClaimGuard::acquire(&agent_dir, &author, false, None, 1, Some("new"));
+        tokio::pin!(pending);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut pending)
+                .await
+                .is_err(),
+            "the successor may not replace a live predecessor"
+        );
+        drop(first);
+        let next = tokio::time::timeout(std::time::Duration::from_secs(1), pending)
+            .await
+            .expect("the release wakes the retry")
+            .unwrap();
+        assert!(crate::wait_claim::proves(
+            next.mine.as_ref().expect("new claim"),
+            "new",
+            1
+        ));
+    }
+
+    /// Arm-time validation refuses what cannot run, and ONLY that.    /// Arm-time validation refuses what cannot run, and ONLY that.
     ///
     /// The integration side proves `wait` refuses to arm; this side
     /// proves it does not refuse a source that is fine — without it,
@@ -2854,6 +3285,10 @@ mod tests {
         assert_eq!(combine_beat_result(repo(), Vec::new()).unwrap().len(), 1);
         // Both empty → park.
         assert!(combine_beat_result(None, Vec::new()).is_none());
+        assert!(
+            combine_beat_result(Some(Vec::new()), Vec::new()).is_none(),
+            "an empty repo result must not make a normal wait exit",
+        );
     }
 
     #[test]
@@ -3330,6 +3765,56 @@ mod tests {
     // contract the stop-hook parses. `json!` here expresses the
     // EXPECTED value (the ban is on production output code); key order
     // is irrelevant — `to_value` equality is order-independent.
+
+    /// `WaitItem::kind()` names the tag the WAKE emits.
+    ///
+    /// Two vocabularies exist and they disagree: `WaitItem` derives
+    /// `rename_all`, so its own serialization says `ad_hoc_review`,
+    /// while the wake's `WaitJsonItem` renames that variant to
+    /// `adhoc_review` — and the wake is what the stop hook parses.
+    /// `WaitKind` models the wake, so this is the test that keeps it
+    /// honest; comparing against `WaitItem`'s derive instead would
+    /// have pinned the wrong spelling for three variants, and a kind
+    /// that never matches classifies nothing
+    /// (the-turn-end-is-one-decision).
+    #[test]
+    fn a_kind_names_the_tag_the_wake_emits() {
+        use clank_core::wait::WaitKind;
+
+        let sha = CommitSha::parse(&"a".repeat(40)).unwrap();
+        // One item per kind whose spelling could drift — the three
+        // the two vocabularies disagree about, plus a control.
+        let items = [
+            WaitItem::AdHocReview {
+                sha: sha.clone(),
+                feedback_path: String::new(),
+            },
+            WaitItem::AdHocRevise { sha: sha.clone() },
+            WaitItem::AdHocSettled {
+                sha: sha.clone(),
+                gate: clank_core::vocab::CommitGateState::Finished,
+            },
+            WaitItem::Idle {
+                prompt: String::new(),
+            },
+        ];
+        for item in items {
+            let wake = serde_json::to_value(render_json(&item)).unwrap();
+            let tag = wake.get("kind").and_then(|k| k.as_str()).expect("tagged");
+            assert_eq!(
+                item.kind().as_str(),
+                tag,
+                "{item:?} reports `{}` but the wake emits `{tag}`",
+                item.kind().as_str(),
+            );
+            assert_eq!(
+                WaitKind::parse(tag),
+                Some(item.kind()),
+                "and it parses back"
+            );
+        }
+    }
+
     #[test]
     fn wait_json_items_serialize_to_the_stable_shape() {
         use clank_core::vocab::WaitingReason;

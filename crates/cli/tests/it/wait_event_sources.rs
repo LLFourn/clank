@@ -33,8 +33,11 @@ fn write(repo: &Path, rel: &str, body: &str) {
 fn wait_args(repo: &Path, events: Vec<String>) -> WaitArgs {
     WaitArgs {
         repo: Some(repo.to_path_buf()),
+        tag: None,
         author: Some("rev".into()),
         die_with_owner: false,
+        deliver_to_session: None,
+        expected_generation: None,
         json: true,
         events,
         r#for: None,
@@ -294,7 +297,68 @@ async fn malformed_event_json_is_an_arm_time_error() {
     );
 }
 
-/// A command source that could never work fails the ARM, rather than
+/// A WAIT CLAIMS THE SESSION IT WAS LAUNCHED IN, NEVER THE ROSTER'S.
+///
+/// The claim says where this process's completion wake goes. An
+/// earlier version copied the label's BOUND session out of config — a
+/// roster fact, not a delivery fact — so a wait launched anywhere
+/// claimed the bound session, and a stale listed task then silenced
+/// that session's turns (codex 2f38deb).
+///
+/// Asserted as a DIFFERENCE rather than an equality, because the
+/// ambient session depends on where the suite runs: under a harness
+/// the test process inherits one, and from a bare terminal it has
+/// none and claims nothing. Both are correct; claiming the bound
+/// session is not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_wait_claims_its_launch_session_not_the_rosters() {
+    let _serial = common::serial();
+    let env = idle_env();
+    let repo = env.repo().to_path_buf();
+    let agent_dir = clank::agent_store::agents_root(&repo).join("rev");
+
+    // BOUND, so the roster has a session to be wrongly copied. That
+    // is the whole trap: binding is what made the old code claim.
+    let bound = "44444444-4444-4444-4444-444444444444";
+    clank::agent_store::bind_session_to_agent(
+        &repo,
+        &clank_core::ids::AgentLabel::parse("rev").unwrap(),
+        clank_core::vocab::Tool::Codex,
+        &clank_core::ids::SessionId::parse(bound).unwrap(),
+    )
+    .unwrap();
+
+    let handle = tokio::spawn(clank::cli::wait::run(wait_args(&repo, vec![])));
+    let mut claim = None;
+    for _ in 0..40 {
+        claim = clank::wait_claim::read(&agent_dir);
+        if claim.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    handle.abort();
+    let _ = handle.await;
+
+    match claim {
+        // Launched inside a harness: it claims THAT session.
+        Some(c) => assert_ne!(
+            c.session, bound,
+            "the claim copied the roster's bound session instead of its own launch",
+        ),
+        // No harness around it: nothing to deliver a wake to, so
+        // nothing claimed.
+        None => {
+            assert_eq!(
+                clank::wait_claim::launch_session(),
+                None,
+                "a wait inside a session must publish a claim",
+            );
+        }
+    }
+}
+
+/// A command source that could never work fails the ARM,/// A command source that could never work fails the ARM,/// A command source that could never work fails the ARM, rather than
 /// printing from inside its task and leaving the wait running
 /// without it.
 ///

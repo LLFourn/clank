@@ -1934,6 +1934,22 @@ pub(crate) fn own_pane_is_gone() -> bool {
     pane_is_gone(session.as_deref(), pane.as_deref(), listing.as_deref())
 }
 
+/// Terminal pane ids in this process's zellij session.
+///
+/// `None` when there is no session or the listing failed — the same
+/// "the read told us nothing" that [`pane_is_gone`] refuses to treat
+/// as a death. Plugin panes are left out; their ids collide with
+/// terminal ids.
+pub(crate) fn live_terminal_pane_ids() -> Option<Vec<u32>> {
+    Some(
+        snapshot_panes()?
+            .into_iter()
+            .filter(|p| !p.is_plugin)
+            .map(|p| p.id)
+            .collect(),
+    )
+}
+
 /// The `new-pane` argv, split out so it is assertable without
 /// spawning a zellij. Never `--stacked`: where the pane belongs is the
 /// layout's decision, applied right after.

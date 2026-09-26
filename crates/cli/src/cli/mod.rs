@@ -515,6 +515,19 @@ pub struct StatusArgs {
     pub tui: bool,
 }
 
+/// An empty `--tag` is refused at the CLI.
+///
+/// It would be published as a registration that every command string
+/// contains, which is a token that names everything and therefore
+/// nothing (codex 6402a09).
+fn non_empty_tag(raw: &str) -> Result<String, String> {
+    let t = raw.trim();
+    if t.is_empty() {
+        return Err("a registration tag cannot be empty".into());
+    }
+    Ok(t.to_string())
+}
+
 #[derive(Args, Debug)]
 pub struct WaitArgs {
     /// Repo root. Defaults to the cwd's git toplevel.
@@ -536,6 +549,13 @@ pub struct WaitArgs {
     /// `clank wait < /dev/null` does not exit the moment it starts.
     #[arg(long)]
     pub die_with_owner: bool,
+    /// The hook's own session and incarnation. Hidden because a
+    /// normal background wait derives delivery from its environment;
+    /// the hook runner may have inherited a different pane's env.
+    #[arg(long, hide = true, requires_all = ["die_with_owner", "expected_generation"])]
+    pub deliver_to_session: Option<String>,
+    #[arg(long, hide = true, requires_all = ["die_with_owner", "deliver_to_session"])]
+    pub expected_generation: Option<u64>,
     /// Emit JSON instead of the human rendering.
     #[arg(short = 'j', long)]
     pub json: bool,
@@ -545,6 +565,18 @@ pub struct WaitArgs {
     /// Repeatable.
     #[arg(long = "event", value_name = "JSON")]
     pub events: Vec<String>,
+    /// REGISTRATION token, issued by the stop hook's arm instruction
+    /// (the-turn-end-is-one-decision).
+    ///
+    /// The hook can see a background task's `command` but never its
+    /// pid, so nothing otherwise ties a listed task to a running
+    /// process — and every attempt to infer that tie proved something
+    /// else. This token is in both: the command the agent ran, and
+    /// the claim this wait publishes. Matching them is what lets the
+    /// hook yield a turn to a wait it can actually name, instead of
+    /// re-issuing the arm instruction forever.
+    #[arg(long = "tag", value_name = "TOKEN", value_parser = non_empty_tag)]
+    pub tag: Option<String>,
     /// OBSERVE the repo instead of waiting for own work: block until
     /// the given event lands, counting only events AFTER the wait
     /// starts. For watching a foreign repo (pair with --repo) — no

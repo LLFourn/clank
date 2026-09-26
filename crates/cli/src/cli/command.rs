@@ -396,6 +396,27 @@ mod tests {
         );
     }
 
+    /// An empty `--tag` is refused at the ARGUMENT, not published.
+    ///
+    /// A registration token that every command string contains names
+    /// everything, and therefore nothing — it would hand the hook a
+    /// match against any stale listed task (codex 6402a09).
+    #[test]
+    fn an_empty_registration_tag_is_refused() {
+        for bad in ["", "   "] {
+            assert!(
+                Cli::try_parse_from(["clank", "wait", "--tag", bad]).is_err(),
+                "an empty tag must not parse: {bad:?}"
+            );
+        }
+        // A real one parses, and arrives trimmed.
+        let parsed = Cli::try_parse_from(["clank", "wait", "--tag", " abc123 "]).unwrap();
+        let crate::cli::command::Command::Wait(args) = parsed.command else {
+            panic!("expected wait")
+        };
+        assert_eq!(args.tag.as_deref(), Some("abc123"));
+    }
+
     #[test]
     fn queue_unqueue_parses() {
         let parsed = Cli::try_parse_from(["clank", "queue", "unqueue", "foo"]).unwrap();

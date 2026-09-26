@@ -35,8 +35,11 @@ fn write(repo: &Path, rel: &str, body: &str) {
 fn wait_args(repo: &Path, author: &str, peek: bool) -> WaitArgs {
     WaitArgs {
         repo: Some(repo.to_path_buf()),
+        tag: None,
         author: Some(author.into()),
         die_with_owner: false,
+        deliver_to_session: None,
+        expected_generation: None,
         json: true,
         events: Vec::new(),
         r#for: None,
@@ -164,4 +167,31 @@ async fn a_landing_message_wakes_a_parked_wait() {
         .expect("the wait returns")
         .expect("a wait reports its items");
     assert_eq!(subjects(&items), ["wake up"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_superseded_wait_exits_on_its_existing_beat() {
+    let _serial = common::serial();
+    let env = idle_env();
+    let repo = env.repo();
+    let gen_path = repo.join(".clank/agents/rev/wait.gen");
+    let old: u64 = std::fs::read_to_string(&gen_path)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0);
+
+    let waiter = tokio::spawn(clank::cli::wait::items(wait_args(repo, "rev", false)));
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    write(
+        repo,
+        ".clank/agents/rev/wait.gen",
+        &format!("{}\n", old + 1),
+    );
+
+    let error = tokio::time::timeout(Duration::from_secs(5), waiter)
+        .await
+        .expect("the existing wait beat must notice supersession")
+        .expect("wait task join")
+        .expect_err("an obsolete wait cannot deliver work");
+    assert!(error.to_string().contains("superseded"), "{error:#}");
 }

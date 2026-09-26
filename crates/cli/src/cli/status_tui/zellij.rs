@@ -454,7 +454,11 @@ struct ZellijPaneIo<'a> {
 impl PaneIo for ZellijPaneIo<'_> {
     type Snap = Vec<crate::cli::open_zellij::ZellijPane>;
     fn snapshot(&mut self) -> Option<Self::Snap> {
-        crate::cli::open_zellij::snapshot_panes()
+        let snap = crate::cli::open_zellij::snapshot_panes()?;
+        // A refresh is the only thing that sees a swapped-in process.
+        // SessionStart does not fire for a pane that was already running.
+        crate::cli::stop_hook::adopt_sessions_in_panes(self.repo, &snap);
+        Some(snap)
     }
     fn pairs(&mut self, snap: &Self::Snap) -> Vec<(String, bool)> {
         crate::cli::open_zellij::agent_pane_pairs(snap, self.repo)
@@ -1801,6 +1805,7 @@ mod tests {
                 tool: "claude".into(),
                 invocation: "claude".into(),
                 session: None,
+                unreachable_since: None,
                 attending: None,
             })
             .collect();
@@ -2997,6 +3002,7 @@ mod tests {
                     tool: "claude".into(),
                     invocation: "claude".into(),
                     session: None,
+                    unreachable_since: None,
                     attending: None,
                 },
                 crate::cli::status::AgentAutoRow {
@@ -3006,6 +3012,7 @@ mod tests {
                     tool: "codex".into(),
                     invocation: "codex".into(),
                     session: None,
+                    unreachable_since: None,
                     attending: None,
                 },
             ];

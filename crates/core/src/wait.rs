@@ -344,6 +344,102 @@ pub enum WaitItem {
     },
 }
 
+/// The `kind` tag on a [`WaitItem`], as a closed set
+/// (the-turn-end-is-one-decision).
+///
+/// `WaitItem` is serialized with `#[serde(tag = "kind")]`, and the
+/// stop hook reads that JSON back from a subprocess it spawned with
+/// `current_exe` — its own binary. It used to land the discriminant
+/// in an `Option<String>` and then maintain the variant list by hand
+/// in four places, which is how `fix_commit_tag` reached a catchall
+/// unnoticed and how `command_event`'s classification went stale for
+/// three commits.
+///
+/// [`WaitItem::kind`] is the one definition. Adding a variant fails
+/// to compile THERE, in core, before any consumer is reached.
+///
+/// **The vocabulary is the WAKE WIRE's, which is `WaitJsonItem`'s
+/// renamed tags — not `WaitItem`'s own serialization.** The two
+/// disagree: `WaitItem::AdHocReview` serializes as `ad_hoc_review`
+/// (the derive's `rename_all`), while the wake emits `adhoc_review`
+/// (an explicit rename). The hook parses the wake, so that is the
+/// set this models. Deriving `rename_all` here would have quietly
+/// produced the other spelling for three variants, and a kind that
+/// never matches classifies nothing — which is why
+/// `a_kind_names_the_tag_the_wake_emits` compares against the real
+/// serialized wake rather than against a derive.
+/// Declares the kind vocabulary ONCE.
+///
+/// The enum, `as_str`, `parse` and `ALL` all come from this single
+/// list, because three of them used to be separate tables and only
+/// two were exhaustive: adding a variant with its `as_str` and
+/// `kind()` arms while forgetting `ALL` compiled fine and made
+/// `parse` return `None` for a kind this very binary emits — an
+/// unknown-tag fallback reached by forgetting a second table rather
+/// than by meeting a newer binary (codex bf22b5b).
+macro_rules! wake_kinds {
+    ($($variant:ident => $tag:literal),+ $(,)?) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        pub enum WaitKind {
+            $($variant),+
+        }
+
+        impl WaitKind {
+            /// The wire tag, as the wake emits it.
+            pub fn as_str(self) -> &'static str {
+                match self {
+                    $(WaitKind::$variant => $tag),+
+                }
+            }
+
+            /// Parse a wire tag. `None` ONLY for a tag this build has
+            /// no arm for.
+            ///
+            /// The fail-soft boundary, and one of exactly two: the
+            /// binary on disk can be replaced by `cargo install`
+            /// while an agent is parked, so a hook may read a tag
+            /// from a newer `wait`. It renders loose rather than
+            /// breaking the read — and nothing past this point
+            /// handles a string.
+            pub fn parse(tag: &str) -> Option<Self> {
+                Some(match tag {
+                    $($tag => WaitKind::$variant,)+
+                    _ => return None,
+                })
+            }
+
+            /// Every kind. Generated, so it cannot omit one.
+            pub const ALL: &'static [WaitKind] = &[$(WaitKind::$variant),+];
+        }
+    };
+}
+
+wake_kinds! {
+    Master => "master",
+    Reviewer => "reviewer",
+    Finished => "finished",
+    Idle => "idle",
+    // The wake renames these three; `WaitItem`'s own `rename_all`
+    // derive spells them `ad_hoc_*`. The hook parses the WAKE.
+    AdHocReview => "adhoc_review",
+    AdHocRevise => "adhoc_revise",
+    AdHocSettled => "adhoc_settled",
+    FixCommitTag => "fix_commit_tag",
+    MultiplePlansOpen => "multiple_plans_open",
+    PromoteFromQueue => "promote_from_queue",
+    Message => "message",
+    GithubEvent => "github_event",
+    CommandEvent => "command_event",
+    DraftChanged => "draft_changed",
+    ForCommit => "for_commit",
+    ForFinished => "for_finished",
+    ForBlocked => "for_blocked",
+    Blocked => "blocked",
+    Unblocked => "unblocked",
+    PrReviewer => "pr_reviewer",
+    PrMaster => "pr_master",
+}
+
 /// One event, whatever produced it
 /// (a-command-is-an-event-source-like-any-other, milestone 2).
 ///
@@ -405,6 +501,37 @@ pub struct GithubBits<'a> {
 }
 
 impl WaitItem {
+    /// This item's wire tag, as a type.
+    ///
+    /// Exhaustive on purpose: a new variant stops the build HERE,
+    /// which is the whole mechanism. Every consumer that branches on
+    /// the kind goes through this.
+    pub fn kind(&self) -> WaitKind {
+        match self {
+            WaitItem::Master { .. } => WaitKind::Master,
+            WaitItem::Reviewer { .. } => WaitKind::Reviewer,
+            WaitItem::Finished { .. } => WaitKind::Finished,
+            WaitItem::Idle { .. } => WaitKind::Idle,
+            WaitItem::AdHocReview { .. } => WaitKind::AdHocReview,
+            WaitItem::AdHocRevise { .. } => WaitKind::AdHocRevise,
+            WaitItem::AdHocSettled { .. } => WaitKind::AdHocSettled,
+            WaitItem::FixCommitTag { .. } => WaitKind::FixCommitTag,
+            WaitItem::MultiplePlansOpen { .. } => WaitKind::MultiplePlansOpen,
+            WaitItem::PromoteFromQueue { .. } => WaitKind::PromoteFromQueue,
+            WaitItem::Message { .. } => WaitKind::Message,
+            WaitItem::GithubEvent { .. } => WaitKind::GithubEvent,
+            WaitItem::CommandEvent { .. } => WaitKind::CommandEvent,
+            WaitItem::DraftChanged { .. } => WaitKind::DraftChanged,
+            WaitItem::ForCommit { .. } => WaitKind::ForCommit,
+            WaitItem::ForFinished { .. } => WaitKind::ForFinished,
+            WaitItem::ForBlocked { .. } => WaitKind::ForBlocked,
+            WaitItem::Blocked { .. } => WaitKind::Blocked,
+            WaitItem::Unblocked { .. } => WaitKind::Unblocked,
+            WaitItem::PrReviewer { .. } => WaitKind::PrReviewer,
+            WaitItem::PrMaster { .. } => WaitKind::PrMaster,
+        }
+    }
+
     /// This item as an event, or `None` if it is not one.
     ///
     /// The one place the two persisted shapes are reconciled. Adding
@@ -1881,6 +2008,27 @@ mod tests {
     use super::*;
     use crate::repo_state::{FinishedPlan, PlanState};
     use crate::vocab::{CommitGateState, PlanWorktreeStatus};
+
+    /// Every name round-trips, and no two kinds share one.
+    ///
+    /// `parse` searches `ALL` by `as_str`, so a duplicated name would
+    /// make one kind unreachable rather than fail to compile.
+    #[test]
+    fn a_kinds_name_round_trips_and_is_unique() {
+        let mut names: Vec<&str> = WaitKind::ALL.iter().map(|k| k.as_str()).collect();
+        let total = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), total, "two kinds share a wire name");
+
+        for k in WaitKind::ALL {
+            assert_eq!(WaitKind::parse(k.as_str()), Some(*k), "{k:?}");
+        }
+        // A tag from a newer binary reads as absent rather than
+        // breaking the parse — the one fail-soft this design keeps.
+        assert_eq!(WaitKind::parse("some_future_kind"), None);
+        assert_eq!(WaitKind::parse(""), None);
+    }
 
     fn plan(s: &str) -> PlanKey {
         PlanKey::parse(s).unwrap()

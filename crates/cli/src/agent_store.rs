@@ -554,6 +554,11 @@ pub(crate) struct TurnEnd {
     pub(crate) at: i64,
     pub(crate) session: String,
     pub(crate) generation: u64,
+    /// What the turn left behind. `None` on stamps written before
+    /// this field existed, and on the stamp's first write — which
+    /// lands before anything has decided, because the turn ended
+    /// whatever is decided about it.
+    pub(crate) left: Option<clank_core::hook_io::TurnLeft>,
 }
 
 pub(crate) fn read_turn_end(agent_dir: &Path) -> Option<TurnEnd> {
@@ -563,22 +568,33 @@ pub(crate) fn read_turn_end(agent_dir: &Path) -> Option<TurnEnd> {
         at: parts.next()?.parse().ok()?,
         session: parts.next()?.to_string(),
         generation: parts.next()?.parse().ok()?,
+        // Absent on a three-field stamp, and `None` for a token this
+        // build has no arm for. Both mean "cannot say", which is the
+        // safe direction: a reader that cannot say does not report.
+        left: parts.next().and_then(clank_core::hook_io::TurnLeft::parse),
     })
 }
 
 /// Record that this session just ended a turn. Best-effort by policy:
 /// the hook that calls this must never fail a turn-end over a note
 /// about one.
-pub(crate) fn record_turn_end(agent_dir: &Path, at: i64, session: &str, generation: u64) {
+pub(crate) fn record_turn_end(
+    agent_dir: &Path,
+    at: i64,
+    session: &str,
+    generation: u64,
+    left: Option<clank_core::hook_io::TurnLeft>,
+) {
     if std::fs::create_dir_all(agent_dir).is_err() {
         return;
     }
     // A plain write, like `wait.gen` beside it: a torn or missing
     // stamp reads as `None`, which is `Unknown`, which shows Stop —
     // the harmless direction, so atomicity would be buying nothing.
+    let tail = left.map(|l| format!(" {}", l.as_str())).unwrap_or_default();
     let _ = std::fs::write(
         agent_dir.join("turn.end"),
-        format!("{at} {session} {generation}\n"),
+        format!("{at} {session} {generation}{tail}\n"),
     );
 }
 
@@ -799,6 +815,54 @@ fn save_json<T: serde::Serialize>(path: &Path, value: &T) -> anyhow::Result<()> 
 
 #[cfg(test)]
 mod tests {
+    /// THE OLD BYTES. A three-field stamp is on every existing repo's
+    /// disk right now, and a reader that fails on one would report
+    /// every agent as having never ended a turn.
+    ///
+    /// Verified against this repo before the change: every agent read
+    /// as `left: None`, which is "cannot say" and does not accuse.
+    #[test]
+    fn a_turn_end_stamp_without_a_verdict_still_reads() {
+        use clank_core::hook_io::TurnLeft;
+        let dir = tempfile::tempdir().unwrap();
+        let write = |raw: &str| {
+            std::fs::write(dir.path().join("turn.end"), raw).unwrap();
+            read_turn_end(dir.path()).expect("a stamp must still parse")
+        };
+
+        let old = write("1700000000 sess-old 3\n");
+        assert_eq!(old.at, 1_700_000_000);
+        assert_eq!(old.session, "sess-old");
+        assert_eq!(old.generation, 3);
+        assert_eq!(old.left, None, "no verdict is not a verdict of none");
+
+        let new = write("1700000000 sess-new 3 yielded\n");
+        assert_eq!(new.left, Some(TurnLeft::Yielded));
+        assert_eq!(new.session, "sess-new", "the fields before it still land");
+
+        // A token from a NEWER binary: unknown, never guessed.
+        assert_eq!(write("1700000000 sess-future 3 telepathy\n").left, None);
+    }
+
+    /// Every verdict survives the file it is written to.
+    #[test]
+    fn every_turn_verdict_round_trips() {
+        use clank_core::hook_io::TurnLeft;
+        let dir = tempfile::tempdir().unwrap();
+        for left in TurnLeft::ALL {
+            record_turn_end(dir.path(), 42, "sess", 7, Some(*left));
+            let got = read_turn_end(dir.path()).expect("just written");
+            assert_eq!(got.left, Some(*left), "{left:?}");
+            assert_eq!(
+                (got.at, got.session.as_str(), got.generation),
+                (42, "sess", 7)
+            );
+        }
+        // And a stamp written with no verdict reads back as none.
+        record_turn_end(dir.path(), 42, "sess", 7, None);
+        assert_eq!(read_turn_end(dir.path()).unwrap().left, None);
+    }
+
     use super::*;
     use crate::cli::teams_config::{AgentDescription, RegisteredMember, RegisteredSet, RosterRole};
     use clank_core::vocab::{Role, Tool};

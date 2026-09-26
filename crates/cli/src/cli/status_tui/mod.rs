@@ -2354,6 +2354,44 @@ fn paint_interval(spinner_visible: bool) -> Duration {
     }
 }
 
+/// The panel's own probe for a waker that died.
+///
+/// Every other snapshot input announces itself: a watcher event fires
+/// because a file changed. A waiter being killed changes NO file, so
+/// nothing raises `refresh_pending` and the loop redraws the snapshot
+/// it already holds — the panel kept showing a healthy row after the
+/// waiter died, including across key repaints (codex 451c5dbc,
+/// grok 8aa2736120d7). The signature being ABLE to see it is not the
+/// same as the loop ever asking.
+struct WakerProbe {
+    at: std::time::Instant,
+    fingerprint: u64,
+}
+
+/// Ask, at most once per `every`, whether the verdict changed.
+///
+/// `true` means "raise `refresh_pending`" — the nothing-changed gate
+/// still decides whether a rebuild follows, so a flip costs one
+/// signature check rather than an unconditional refold.
+///
+/// Rate-limited around the probe, not inside it: a key storm turns
+/// this loop many times, and the reads are cheap but not free.
+fn waker_changed(
+    state: &mut WakerProbe,
+    now: std::time::Instant,
+    every: Duration,
+    probe: impl FnOnce() -> u64,
+) -> bool {
+    if now.duration_since(state.at) < every {
+        return false;
+    }
+    state.at = now;
+    let fingerprint = probe();
+    let changed = fingerprint != state.fingerprint;
+    state.fingerprint = fingerprint;
+    changed
+}
+
 /// The loop's recv timeout: the `base` cadence (spinner tick when one is
 /// visible, else the idle backstop), shortened to the time left before a
 /// DEFERRED refresh may run — so a coalesced burst still rebuilds within
@@ -2651,6 +2689,10 @@ pub(crate) async fn run_tui(
         .checked_sub(REBUILD_MIN)
         .unwrap_or_else(std::time::Instant::now);
     let mut refresh_pending = false;
+    let mut waker_probe = WakerProbe {
+        at: std::time::Instant::now(),
+        fingerprint: crate::cli::status::waker_fingerprint(&repo),
+    };
     // Labeled so a `Quit` key inside the per-key drain loop exits the
     // event loop, not just the inner `for`.
     'evloop: loop {
@@ -4267,6 +4309,16 @@ pub(crate) async fn run_tui(
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 anyhow::bail!("event channel disconnected")
             }
+        }
+
+        // The one input with no event behind it. See `waker_changed`.
+        if waker_changed(
+            &mut waker_probe,
+            std::time::Instant::now(),
+            REBUILD_MIN,
+            || crate::cli::status::waker_fingerprint(&repo),
+        ) {
+            refresh_pending = true;
         }
 
         // Trailing-edge refresh flush: the COALESCED snapshot rebuild, run
@@ -6179,6 +6231,56 @@ pub(crate) mod tests {
             IDLE_TICK.as_secs(),
             crate::age::COARSE_RESOLUTION_SECS
         );
+    }
+
+    /// THE PANEL ASKS, on its own turns, whether a waker died.
+    ///
+    /// Every other input announces itself with a watcher event. This
+    /// one does not: killing a waiter changes no file, so nothing
+    /// raises `refresh_pending` and the loop repaints the snapshot it
+    /// holds. A test that calls `input_signature` itself proves the
+    /// signature CAN see it and says nothing about whether the loop
+    /// ever asks — which is how the reported failure survived its own
+    /// regression (grok 8aa2736120d7).
+    #[test]
+    fn the_panel_probes_for_a_dead_waker_between_filesystem_events() {
+        let every = Duration::from_secs(1);
+        let t0 = std::time::Instant::now();
+        let mut state = WakerProbe {
+            at: t0,
+            fingerprint: 7,
+        };
+
+        // Too soon: it does not even ask. The probe panics to prove
+        // the rate limit is around it, not inside it.
+        assert!(!waker_changed(&mut state, t0, every, || panic!(
+            "probed inside the rate limit"
+        )));
+        assert!(!waker_changed(
+            &mut state,
+            t0 + Duration::from_millis(999),
+            every,
+            || panic!("probed inside the rate limit")
+        ));
+
+        // Due, and nothing changed: no rebuild is asked for.
+        let t1 = t0 + every;
+        assert!(!waker_changed(&mut state, t1, every, || 7));
+
+        // Due, and the verdict FLIPPED — a waiter died, with no file
+        // touched. This is the raise the panel never made.
+        let t2 = t1 + every;
+        assert!(waker_changed(&mut state, t2, every, || 9));
+
+        // And it flips ONCE: the new verdict is now the baseline, so
+        // an unchanged world does not rebuild every tick.
+        let t3 = t2 + every;
+        assert!(!waker_changed(&mut state, t3, every, || 9));
+
+        // Back again is also a change — a waiter arriving matters as
+        // much as one dying.
+        let t4 = t3 + every;
+        assert!(waker_changed(&mut state, t4, every, || 7));
     }
 
     #[test]

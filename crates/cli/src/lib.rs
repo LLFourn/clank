@@ -26,6 +26,7 @@ pub mod repo_watch;
 pub mod runtime;
 pub mod shell_quote;
 pub mod state_cache;
+pub mod wait_claim;
 pub mod worktree_facts;
 
 // Operator CLI subcommands. Local-only mutations.

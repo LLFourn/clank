@@ -159,40 +159,62 @@ impl CommitGateState {
     }
 }
 
-/// Why the named role is currently the bottleneck.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WaitingReason {
+/// Declares the waiting-reason vocabulary ONCE.
+///
+/// Enum, `as_str`, `parse` and `ALL` from one list. They were three
+/// tables, and omitting a variant from `ALL` compiled while making
+/// its emitted reason unparseable — a wake this binary writes and
+/// cannot read back, carrying no condition (codex bf22b5b).
+macro_rules! waiting_reasons {
+    ($($(#[$doc:meta])* $variant:ident => $tag:literal),+ $(,)?) => {
+        /// Why the named role is currently the bottleneck.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        pub enum WaitingReason {
+            $($(#[$doc])* $variant),+
+        }
+
+        impl WaitingReason {
+            pub fn as_str(self) -> &'static str {
+                match self {
+                    $(WaitingReason::$variant => $tag),+
+                }
+            }
+
+            /// Parse a wire reason. `None` ONLY for one this build
+            /// has no arm for — the second and last fail-soft at the
+            /// hook's parse boundary (the-turn-end-is-one-decision).
+            pub fn parse(s: &str) -> Option<Self> {
+                Some(match s {
+                    $($tag => WaitingReason::$variant,)+
+                    _ => return None,
+                })
+            }
+
+            /// Every reason. Generated, so it cannot omit one.
+            pub const ALL: &'static [WaitingReason] = &[$(WaitingReason::$variant),+];
+        }
+    };
+}
+
+waiting_reasons! {
     /// Plan is frozen. No work for either role.
-    SessionFinished,
+    SessionFinished => "session_finished",
     /// Plan body has uncommitted changes in the worktree. Master
     /// commits to release blocked reviews.
-    CommitPlanRevision,
+    CommitPlanRevision => "commit_plan_revision",
     /// REQUEST_CHANGES on the latest reviewable commit; master
     /// addresses and commits.
-    AddressCommitChanges,
+    AddressCommitChanges => "address_commit_changes",
     /// Gate is FINISHED + worktree clean — master should run
     /// `clank finish`.
-    ReadyToFinalize,
+    ReadyToFinalize => "ready_to_finalize",
     /// Latest reviewable commit is CONTINUE (not FINISHED). Master
     /// keeps working — more impl, more docs, more tests, or
     /// nudge a reviewer to upgrade to FINISHED.
-    GateContinue,
+    GateContinue => "gate_continue",
     /// Latest reviewable commit hasn't been reviewed yet.
-    CommitNeedsReview,
-}
-
-impl WaitingReason {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            WaitingReason::SessionFinished => "session_finished",
-            WaitingReason::CommitPlanRevision => "commit_plan_revision",
-            WaitingReason::AddressCommitChanges => "address_commit_changes",
-            WaitingReason::ReadyToFinalize => "ready_to_finalize",
-            WaitingReason::GateContinue => "gate_continue",
-            WaitingReason::CommitNeedsReview => "commit_needs_review",
-        }
-    }
+    CommitNeedsReview => "commit_needs_review",
 }
 
 /// Which agent CLI an agent process is running inside. Used by
@@ -320,6 +342,32 @@ impl_display_via_as_str! {
     AutoMode,
     Role,
     HookEvent,
+}
+
+#[cfg(test)]
+mod waiting_reason_tests {
+    use super::WaitingReason;
+
+    /// `as_str` says exactly what the `rename_all` derive writes.
+    ///
+    /// Two sources for one string: the macro's literal and serde's
+    /// derive. A reason the hook compares against and the wire never
+    /// carries classifies nothing, silently — the same drift that hit
+    /// `WaitKind`'s ad-hoc variants (the-turn-end-is-one-decision).
+    #[test]
+    fn a_reasons_name_is_the_one_serde_writes() {
+        for r in WaitingReason::ALL {
+            let wire = serde_json::to_value(r).unwrap();
+            assert_eq!(
+                wire.as_str(),
+                Some(r.as_str()),
+                "{r:?} serializes as {wire} but names itself {}",
+                r.as_str(),
+            );
+            assert_eq!(WaitingReason::parse(r.as_str()), Some(*r), "round trip");
+        }
+        assert_eq!(WaitingReason::parse("some_new_reason"), None);
+    }
 }
 
 #[cfg(test)]

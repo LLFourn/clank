@@ -2682,11 +2682,12 @@ mod tests {
         );
         // The latch clears when the human prompts again.
         assert!(src.contains("aborted.delete(id)"));
-        // Checked at BOTH points: before arming, and again at
-        // injection, since the abort can be observed on either side of
-        // the triggering idle.
-        assert_eq!(src.matches("aborted.has(id)").count(), 2);
+        // Checked before arming, before renewing after a deadline,
+        // and before injection. The abort can arrive on either side
+        // of the idle or while the wait is in flight.
+        assert_eq!(src.matches("aborted.has(id)").count(), 3);
         let arm = src.find("inflight.add(id)").expect("arm site");
+        let release = src.find("inflight.delete(id)").expect("wait release");
         let inject = src
             .find("client.session.promptAsync(")
             .expect("injection site");
@@ -2696,8 +2697,12 @@ mod tests {
             .collect();
         assert!(checks[0] < arm, "the arm-time check must precede arming");
         assert!(
-            checks[1] > arm && checks[1] < inject,
-            "the injection-time check must sit between the wait and the injection"
+            checks[1] > release && checks[1] < inject,
+            "the renewal-time check must follow the wait release"
+        );
+        assert!(
+            checks[2] > checks[1] && checks[2] < inject,
+            "the injection-time check must follow renewal and precede injection"
         );
     }
 

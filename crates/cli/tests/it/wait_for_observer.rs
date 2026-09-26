@@ -35,10 +35,13 @@ fn write(repo: &Path, rel: &str, body: &str) {
 fn observer_args(repo: &Path, event: WaitFor) -> WaitArgs {
     WaitArgs {
         repo: Some(repo.to_path_buf()),
+        tag: None,
         // The observer never resolves identity: author/role stay None
         // and no session env or binding exists in the fixture.
         author: None,
         die_with_owner: false,
+        deliver_to_session: None,
+        expected_generation: None,
         json: true,
         events: Vec::new(),
         r#for: Some(event),

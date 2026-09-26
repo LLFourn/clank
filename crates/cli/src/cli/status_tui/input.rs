@@ -3537,6 +3537,7 @@ mod tests {
             tool: "codex".into(),
             invocation: "codex".into(),
             session: None,
+            unreachable_since: None,
             attending: None,
         }];
         let mut shown = None;
@@ -4273,6 +4274,7 @@ mod tests {
                 tool: "claude".to_string(),
                 invocation: "claude".to_string(),
                 session: None,
+                unreachable_since: None,
                 attending: attending
                     .contains(&i)
                     .then(|| crate::cli::stop_hook::Attended {

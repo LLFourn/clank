@@ -22,6 +22,7 @@ mod inbox_wakes;
 mod no_json_literal_config_writes;
 mod no_ngrok;
 mod open_integration;
+mod panel_probes_wakers;
 mod pick_integration;
 mod pr_review_integration;
 mod rereview_integration;

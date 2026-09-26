@@ -381,6 +381,25 @@ pub fn repo_checks(
             CheckResult::ok(SECTION, format!("agent: {}", label.as_str()), base_msg)
         };
         out.push(agent_check);
+
+        // THE INVARIANT, where a human sees it: a turn that ended
+        // with nothing that will wake the agent
+        // (the-turn-end-is-one-decision). Every other check here is
+        // about setup; this one is about an agent that is set up
+        // correctly and asleep anyway, which is the failure that
+        // cost hours and was invisible from outside.
+        let auto = crate::cli::team::resolve_effective_auto_mode(Some(&cfg), home);
+        out.push(reachability_check(
+            SECTION,
+            label,
+            &crate::cli::stop_hook::reachability(&crate::cli::stop_hook::waker_evidence(
+                repo,
+                label,
+                auto,
+                cfg.session.as_ref().map(|s| s.id.as_str()),
+            )),
+            crate::age::now(),
+        ));
     }
 
     // Orphan-skeleton check: walk .clank/agents/ and flag any
@@ -416,6 +435,60 @@ pub fn repo_checks(
     }
 
     out
+}
+
+/// Render one agent's reachability.
+///
+/// Pure, so the WARN that matters can be asserted without a repo, a
+/// process or a clock.
+fn reachability_check(
+    section: &'static str,
+    label: &AgentLabel,
+    state: &crate::cli::stop_hook::Reachability,
+    now: i64,
+) -> CheckResult {
+    use crate::cli::stop_hook::Reachability as R;
+    let name = format!("wake: {}", label.as_str());
+    match state {
+        R::Waiting(pid) => {
+            CheckResult::ok(section, name, format!("a live `clank wait` (pid {pid})"))
+        }
+        R::Parked => CheckResult::ok(section, name, "a hook is parked in this agent".to_string()),
+        R::Attending(task) => CheckResult::ok(
+            section,
+            name,
+            format!("attending `{task}`; its completion is the wake"),
+        ),
+        R::NotDriven => CheckResult::ok(section, name, "auto mode is off".to_string()),
+        R::NoTurnYet => CheckResult::ok(section, name, "no turn has ended yet".to_string()),
+        R::Armed => CheckResult::ok(
+            section,
+            name,
+            "its last turn end handed it a next step".to_string(),
+        ),
+        // Covers both "the stamp predates this verdict" and "its
+        // waker left no trace either way" — neither is a fault, and
+        // neither is a clean bill of health. The check says what it
+        // knows.
+        R::Unknown => CheckResult::ok(section, name, "cannot say what is watching it".to_string()),
+        // WARN, not FAIL: an agent can legitimately be mid-turn with
+        // nothing parked, and a turn long enough to look like this
+        // usually registers what it is waiting on
+        // (`clank run` / `clank attending`). Failing the whole doctor
+        // run on a busy agent would be the noise that gets a check
+        // ignored.
+        R::Unreachable { since } => CheckResult::warn(
+            section,
+            name,
+            format!(
+                "last turn ended {} ago and nothing will wake it: no live \
+                 `clank wait`, no parked hook, no attended work. If it is not \
+                 mid-turn it is asleep — `clank agent start {}` or ping it",
+                crate::age::coarse(now.saturating_sub(*since)),
+                label.as_str(),
+            ),
+        ),
+    }
 }
 
 /// Probe whether git considers `rel` ignored. If `expect_tracked`,
@@ -1375,6 +1448,43 @@ mod tests {
             .expect("perms check ran");
         assert_eq!(perm.status, CheckStatus::Warn);
         assert!(perm.message.contains("clank init"));
+    }
+
+    /// The report a human reads names the agent, how long it has
+    /// been asleep, and what to do — and only warns for the one
+    /// state that is a fault.
+    #[test]
+    fn only_an_unreachable_agent_warns() {
+        use crate::cli::stop_hook::Reachability as R;
+        let label = AgentLabel::parse("rev").unwrap();
+        let at = |state| reachability_check("repo", &label, state, 10_000);
+
+        for healthy in [
+            R::Waiting(4321),
+            R::Parked,
+            R::Attending("cargo build".into()),
+            R::NotDriven,
+            R::NoTurnYet,
+        ] {
+            let got = reachability_check("repo", &label, &healthy, 10_000);
+            assert_eq!(got.status, CheckStatus::Ok, "{healthy:?} -> {got:?}");
+        }
+
+        let got = at(&R::Unreachable { since: 7_000 });
+        assert_eq!(got.status, CheckStatus::Warn);
+        assert!(got.name.contains("rev"), "names the agent: {}", got.name);
+        // The elapsed time, not the timestamp: "asleep since epoch
+        // 7000" is not something a human acts on.
+        assert!(
+            got.message.contains("50m") || got.message.contains("49m"),
+            "says how long: {}",
+            got.message
+        );
+        assert!(
+            got.message.contains("clank agent start rev"),
+            "says what to do: {}",
+            got.message
+        );
     }
 
     #[test]

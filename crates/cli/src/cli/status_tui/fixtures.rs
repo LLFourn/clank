@@ -22,6 +22,7 @@ pub(crate) fn agent_row(
         tool: "claude".to_string(),
         invocation: "claude".to_string(),
         session: None,
+        unreachable_since: None,
         attending: None,
     }
 }
@@ -155,6 +156,7 @@ pub(crate) fn with_agents(
             tool: "claude".to_string(),
             invocation: "claude".to_string(),
             session: None,
+            unreachable_since: None,
             attending: None,
         })
         .collect();

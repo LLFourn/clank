@@ -45,8 +45,11 @@ fn set_hook(repo: &Path, event: &str, cmd: &str) {
 fn wait_args(repo: &Path, author: &str, peek: bool) -> WaitArgs {
     WaitArgs {
         repo: Some(repo.to_path_buf()),
+        tag: None,
         author: Some(author.into()),
         die_with_owner: false,
+        deliver_to_session: None,
+        expected_generation: None,
         json: true,
         events: Vec::new(),
         r#for: None,

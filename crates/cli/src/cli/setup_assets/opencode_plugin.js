@@ -39,6 +39,11 @@
 // - Diagnostics (exit 0 + stderr) surface as a TUI toast and a log
 //   entry, never as an injected prompt: a model turn spent on a
 //   diagnostic re-arms the same diagnostic on that turn's idle.
+// - A deadline returns a renewal control message. The plugin starts
+//   another wait while the session is still idle, without creating a
+//   model turn or relying on another session.idle event.
+
+const RENEW_WAIT_WIRE = '{"clank":"renew_wait"}'
 
 const FOREIGN_IDENTITY_VARS = [
   "CLAUDE_CODE_SESSION_ID",
@@ -125,6 +130,7 @@ export const ClankPlugin = async ({ client, $, directory }) => {
     const seen = activity.get(id) ?? 0
     let continuation = ""
     let diagnostic = ""
+    let renew = false
     try {
       // The full HookInput shape — stop_hook_active is REQUIRED by
       // the parser (a partial shape is silently swallowed: the hook
@@ -139,7 +145,9 @@ export const ClankPlugin = async ({ client, $, directory }) => {
         .quiet()
         .nothrow()
       if (proc.exitCode === 0) {
-        continuation = proc.stdout.toString().trim()
+        const output = proc.stdout.toString().trim()
+        if (output === RENEW_WAIT_WIRE) renew = true
+        else continuation = output
         diagnostic = proc.stderr.toString().trim()
       } else {
         log("stop-hook non-zero exit", { sessionID: id, exitCode: proc.exitCode })
@@ -153,6 +161,18 @@ export const ClankPlugin = async ({ client, $, directory }) => {
       // (as an awaited synchronous prompt() would) makes the loop
       // deliver once and go dormant (codex d7c8908).
       inflight.delete(id)
+    }
+    if (renew) {
+      // The old wait's ceiling is a new arm, not a prompt. Verify
+      // idleness again because the user may have started a turn while
+      // the old wait was ending. The generation also guards a turn
+      // starting during the asynchronous status check.
+      if ((activity.get(id) ?? 0) !== seen || aborted.has(id)) return
+      void (async () => {
+        if (await isIdle(id)) await arm(id, "deadline", seen)
+        else log("renew dropped: session no longer idle", { sessionID: id })
+      })().catch((e) => log("renew failed", { sessionID: id, error: String(e) }))
+      return
     }
     if (!continuation) {
       // Exit 0 + stderr is a Diagnostic. Toast + log, never a prompt:

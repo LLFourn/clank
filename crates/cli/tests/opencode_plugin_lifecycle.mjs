@@ -458,4 +458,54 @@ const setToken = (v) => {
   )
 }
 
+// 11. A wait reaching its own ceiling renews through the plugin,
+// without spending a model turn or waiting for another idle event.
+// Empty output still means quiescent (auto-off, for example).
+{
+  const s = makeSection()
+  const R = "ses_0renew0000000000000000000"
+  const hooks = await ClankPlugin({ client: s.client2, $: s.$f, directory: "/fake/repo" })
+  s.results.push(
+    { exitCode: 0, stdout: '{"clank":"renew_wait"}\n', stderr: "" },
+    { exitCode: 0, stdout: "renewed-work\n", stderr: "" },
+  )
+  await hooks.event({ event: { type: "session.idle", properties: { sessionID: R } } })
+  await settle()
+  assert(s.armSessions.length === 2, `deadline must start one new wait: ${JSON.stringify(s.armSessions)}`)
+  assert(s.injections2.length === 1 && s.injections2[0] === R, "only renewed work prompts")
+  assert(s.toasts2.length === 0, "renewal is not a diagnostic")
+  s.results.push({ exitCode: 0, stdout: "", stderr: "" })
+  await hooks.event({ event: { type: "session.idle", properties: { sessionID: R } } })
+  await settle()
+  assert(s.armSessions.length === 3, "an ordinary empty result does not renew")
+}
+
+// A deadline cannot arm into a session that became busy. A new user
+// turn during the status call invalidates the renewal too.
+{
+  const s = makeSection()
+  const R = "ses_0renewbusy000000000000000"
+  const hooks = await ClankPlugin({ client: s.client2, $: s.$f, directory: "/fake/repo" })
+  s.statuses.set(R, "busy")
+  s.results.push({ exitCode: 0, stdout: '{"clank":"renew_wait"}\n', stderr: "" })
+  await hooks.event({ event: { type: "session.idle", properties: { sessionID: R } } })
+  await settle()
+  assert(s.armSessions.length === 1, "busy session must not renew")
+
+  s.statuses.delete(R)
+  s.state.deferStatus = true
+  s.results.push({ exitCode: 0, stdout: '{"clank":"renew_wait"}\n', stderr: "" })
+  await hooks.event({ event: { type: "session.idle", properties: { sessionID: R } } })
+  await settle()
+  await hooks.event({
+    event: {
+      type: "message.updated",
+      properties: { sessionID: R, info: { id: "renew_user_turn", role: "user" } },
+    },
+  })
+  s.statusReleases.forEach((release) => release())
+  await settle()
+  assert(s.armSessions.length === 2, "a user turn during status check must cancel renewal")
+}
+
 console.log("OK")
