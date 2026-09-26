@@ -2257,17 +2257,38 @@ async fn stop(req: hyper::Request<hyper::body::Incoming>, ctx: &Ctx) -> Resp {
 #[derive(serde::Deserialize)]
 #[serde(tag = "do", rename_all = "lowercase")]
 enum QueueAsk {
-    Promote { handle: String },
-    Unqueue { handle: String },
-    Priority { handle: String, priority: u16 },
+    Add {
+        name: String,
+        priority: u16,
+        body: String,
+    },
+    Open {
+        handle: String,
+    },
+    Save {
+        handle: String,
+        original: String,
+        revision: String,
+        body: String,
+    },
+    Promote {
+        handle: String,
+    },
+    Unqueue {
+        handle: String,
+    },
+    Priority {
+        handle: String,
+        priority: u16,
+    },
 }
 
-/// Promote, unqueue or reprioritise one queued plan — the primitives
+/// Create, edit, promote, unqueue or reprioritise a queued plan — the primitives
 /// the pane's own page calls, so promoting means one thing on both
 /// surfaces. Blocking work (the queue's files, and a promote's commit)
 /// runs off the loop, as a say does.
 async fn queue_action(req: hyper::Request<hyper::body::Incoming>, ctx: &Ctx) -> Resp {
-    let body = http_body_util::Limited::new(req.into_body(), 4 * 1024);
+    let body = http_body_util::Limited::new(req.into_body(), 512 * 1024);
     let Ok(bytes) = body.collect().await.map(|c| c.to_bytes()) else {
         return text(413, "too long", "text/plain");
     };
@@ -2280,25 +2301,62 @@ async fn queue_action(req: hyper::Request<hyper::body::Incoming>, ctx: &Ctx) -> 
     let repo = ctx.pages.repo.clone();
     let done = ctx
         .blocking
-        .run(move || {
+        .run(move || -> anyhow::Result<Option<serde_json::Value>> {
             use crate::cli::queue;
-            let handle = match &ask {
-                QueueAsk::Promote { handle }
-                | QueueAsk::Unqueue { handle }
-                | QueueAsk::Priority { handle, .. } => handle.clone(),
-            };
-            let entry = queue::entry_by_stem(&repo, &handle)?;
             match ask {
-                QueueAsk::Promote { .. } => queue::promote_entry(&repo, &entry),
-                QueueAsk::Unqueue { .. } => queue::unqueue_entry(&repo, &entry).map(|_| ()),
-                QueueAsk::Priority { priority, .. } => {
-                    queue::set_priority_of(&repo, &entry, priority).map(|_| ())
+                QueueAsk::Add {
+                    name,
+                    priority,
+                    body,
+                } => {
+                    queue::add(
+                        &repo,
+                        &name,
+                        priority,
+                        queue::BodySource {
+                            raw: body,
+                            kind: queue::BodySourceKind::Inline,
+                        },
+                    )?;
+                    Ok(None)
+                }
+                QueueAsk::Open { handle } => {
+                    let (entry, body, revision) = queue::read_entry(&repo, &handle)?;
+                    Ok(Some(serde_json::json!({
+                        "handle": handle, "name": entry.name,
+                        "priority": entry.priority, "body": body, "revision": revision,
+                    })))
+                }
+                QueueAsk::Save {
+                    handle,
+                    original,
+                    revision,
+                    body,
+                } => {
+                    queue::save_entry(&repo, &handle, &original, &revision, body)?;
+                    Ok(None)
+                }
+                QueueAsk::Promote { handle } => {
+                    let entry = queue::entry_by_stem(&repo, &handle)?;
+                    queue::promote_entry(&repo, &entry)?;
+                    Ok(None)
+                }
+                QueueAsk::Unqueue { handle } => {
+                    let entry = queue::entry_by_stem(&repo, &handle)?;
+                    queue::unqueue_entry(&repo, &entry)?;
+                    Ok(None)
+                }
+                QueueAsk::Priority { handle, priority } => {
+                    let entry = queue::entry_by_stem(&repo, &handle)?;
+                    queue::set_priority_of(&repo, &entry, priority)?;
+                    Ok(None)
                 }
             }
         })
         .await;
     match done {
-        Some(Ok(())) => text(204, "", "text/plain"),
+        Some(Ok(None)) => text(204, "", "text/plain"),
+        Some(Ok(Some(source))) => text(200, source.to_string(), "application/json"),
         // A refusal is the repo's answer — the queue moved, a draft of
         // that name is already there — and the phone is where you are
         // least able to go and look, so it is said rather than dropped.
@@ -4984,6 +5042,110 @@ mod tests {
             std::fs::read_to_string(repo.path().join(".clank/drafts/foo.md"))
                 .unwrap()
                 .contains("the first")
+        );
+        let _ = cancel.send(true);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn queued_markdown_editor_creates_reads_and_refuses_stale_saves() {
+        let (base, door, anon, cancel, _site, repo) = door_only().await;
+        let cookie = door
+            .open_session("token")
+            .map(|t| format!("{}={t}", door::COOKIE))
+            .unwrap();
+        let ask = |body: serde_json::Value| {
+            let r = anon
+                .post(format!("{base}/queue"))
+                .header("origin", &base)
+                .header("cookie", &cookie)
+                .json(&body);
+            async move { r.send().await.unwrap() }
+        };
+
+        assert_eq!(
+            ask(
+                serde_json::json!({"do":"add","name":"later","priority":500,"body":"First draft\n"})
+            )
+            .await
+            .status(),
+            204
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join(".clank/queue/500-later.md")).unwrap(),
+            "# later\nFirst draft\n"
+        );
+        let opened: serde_json::Value = ask(serde_json::json!({"do":"open","handle":"500-later"}))
+            .await
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(opened["body"], "# later\nFirst draft\n");
+        let original = opened["body"].as_str().unwrap();
+        let revision = opened["revision"].as_str().unwrap();
+        assert_eq!(
+            ask(serde_json::json!({"do":"save","handle":"500-later","original":original,"revision":revision,"body":"# later\nRevised\n"}))
+                .await.status(),
+            204
+        );
+        let stale = ask(serde_json::json!({"do":"save","handle":"500-later","original":original,"revision":revision,"body":"# later\nOld tab\n"})).await;
+        assert_eq!(stale.status(), 409);
+        let why: serde_json::Value = stale.json().await.unwrap();
+        assert!(
+            why["why"]
+                .as_str()
+                .unwrap()
+                .contains("changed since it was opened")
+        );
+        assert_eq!(
+            ask(serde_json::json!({"do":"priority","handle":"500-later","priority":100}))
+                .await
+                .status(),
+            204
+        );
+        let stale_handle = ask(serde_json::json!({"do":"save","handle":"500-later","original":"# later\nRevised\n","revision":revision,"body":"# later\nWrong file\n"})).await;
+        assert_eq!(stale_handle.status(), 409);
+        assert!(
+            stale_handle.json::<serde_json::Value>().await.unwrap()["why"]
+                .as_str()
+                .unwrap()
+                .contains("no longer in the queue")
+        );
+        std::fs::write(repo.path().join(".clank/queue/500-later.md"), original).unwrap();
+        let replaced = ask(serde_json::json!({"do":"save","handle":"500-later","original":original,"revision":revision,"body":"# later\nWrong file\n"})).await;
+        assert_eq!(
+            replaced.status(),
+            409,
+            "a replacement with identical Markdown is another file"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join(".clank/queue/500-later.md")).unwrap(),
+            original
+        );
+        std::fs::remove_file(repo.path().join(".clank/queue/500-later.md")).unwrap();
+        assert_eq!(
+            ask(serde_json::json!({"do":"add","name":"urgent","priority":50,"body":"Urgent\n"}))
+                .await
+                .status(),
+            204
+        );
+        let entries = crate::cli::queue::scan_queue(repo.path());
+        assert_eq!(
+            entries.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(),
+            ["urgent", "later"]
+        );
+        assert_eq!(
+            std::fs::read_to_string(&entries[1].path).unwrap(),
+            "# later\nRevised\n"
+        );
+        assert!(!repo.path().join(".clank/queue/500-later.md").exists());
+        let invalid =
+            ask(serde_json::json!({"do":"add","name":"../escape","priority":500,"body":"x"})).await;
+        assert_eq!(invalid.status(), 409);
+        assert!(
+            invalid.json::<serde_json::Value>().await.unwrap()["why"]
+                .as_str()
+                .unwrap()
+                .contains("invalid plan name")
         );
         let _ = cancel.send(true);
     }

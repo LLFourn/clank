@@ -259,6 +259,16 @@
   .ledger .queue .q .pri { flex: 0 0 auto; width: 3.4em; padding: 2px 4px; border: 1px solid var(--edge); border-radius: 3px; background: var(--base); color: var(--muted); font-family: var(--mono); font-size: 12px; text-align: right; }
   .ledger .queue .q button { flex: 0 0 auto; color: var(--muted); font-size: 12px; padding: 2px 4px; }
   .ledger .queue .q button.armed { color: var(--ink); font-weight: 700; }
+  .ledger .queue-tools { padding: 5px 14px; border-bottom: 1px solid var(--edge); }
+  .ledger .queue-tools button { color: var(--hue); font-size: 12px; }
+  .ledger .queue-editor { padding: 10px 14px; border-bottom: 1px solid var(--edge); }
+  .ledger .queue-editor[hidden] { display: none; }
+  .ledger .queue-editor form { display: grid; gap: 8px; }
+  .ledger .queue-editor label { display: grid; gap: 3px; color: var(--muted); font-size: 12px; }
+  .ledger .queue-editor label[hidden] { display: none; }
+  .ledger .queue-editor input, .ledger .queue-editor textarea { box-sizing: border-box; width: 100%; padding: 6px; border: 1px solid var(--edge); border-radius: 4px; background: var(--base); color: var(--ink); font: 12px var(--mono); }
+  .ledger .queue-editor textarea { min-height: 180px; resize: vertical; }
+  .ledger .queue-editor .controls { display: flex; gap: 10px; }
   .ledger .team { padding: 8px 14px; border-bottom: 1px solid var(--edge); }
   .ledger .team summary { cursor: pointer; font-family: var(--plate); font-weight: 700; }
   .ledger .team .member { border-top: 1px solid var(--edge); padding: 8px 0; }
@@ -383,7 +393,16 @@
       <div class="why" id="team-why" role="status" aria-live="polite" hidden></div>
     </details>
     <div class="queue" id="queue"></div>
-    <div class="qwhy" id="qwhy" hidden></div>
+    <div class="queue-tools"><button type="button" id="queue-new">New queued plan</button></div>
+    <section class="queue-editor" id="queue-editor" hidden>
+      <form id="queue-edit-form">
+        <label>Name <input id="queue-name" required placeholder="plan-name"></label>
+        <label>Priority <input id="queue-priority" type="number" min="0" max="999" required value="500"></label>
+        <label>Markdown source <textarea id="queue-body" required spellcheck="false" placeholder="# plan-name&#10;&#10;Describe the work"></textarea></label>
+        <div class="controls"><button type="submit">Save plan</button><button type="button" id="queue-cancel">Cancel</button></div>
+      </form>
+    </section>
+    <div class="qwhy" id="qwhy" role="status" aria-live="polite" hidden></div>
     <div class="rows" id="rows"></div>
   </aside>
 
@@ -1180,7 +1199,7 @@
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify(body),
       });
-      if (r.ok) return;
+      if (r.ok) return r.status === 200 ? await r.json() : {};
       // A refusal is the repo's answer — the queue moved under the
       // phone, a draft of that name is already there — and saying it
       // is the whole difference from nothing happening.
@@ -1189,7 +1208,51 @@
     } catch (err) {
       queueWhy('could not reach clank');
     }
+    return null;
   }
+  let editorHandle = null, editorOriginal = '', editorRevision = '';
+  $('queue-new').addEventListener('click', () => {
+    editorHandle = null;
+    editorOriginal = '';
+    editorRevision = '';
+    $('queue-name').readOnly = false;
+    $('queue-priority').closest('label').hidden = false;
+    $('queue-name').value = '';
+    $('queue-priority').value = '500';
+    $('queue-body').value = '';
+    $('queue-editor').hidden = false;
+    $('queue-name').focus();
+  });
+  $('queue-cancel').addEventListener('click', () => { $('queue-editor').hidden = true; });
+  async function openQueueEditor(handle) {
+    const source = await askQueue({ do: 'open', handle });
+    if (!source) return;
+    editorHandle = source.handle;
+    editorOriginal = source.body;
+    editorRevision = source.revision;
+    $('queue-name').readOnly = true;
+    $('queue-priority').closest('label').hidden = true;
+    $('queue-name').value = source.name;
+    $('queue-priority').value = String(source.priority);
+    $('queue-body').value = source.body;
+    $('queue-editor').hidden = false;
+    $('queue-body').focus();
+  }
+  $('queue-edit-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const priority = Number($('queue-priority').value);
+    if (!Number.isInteger(priority) || priority < 0 || priority > 999) {
+      queueWhy('a priority is 0 to 999');
+      return;
+    }
+    const body = $('queue-body').value;
+    const saved = editorHandle
+      ? await askQueue({ do: 'save', handle: editorHandle, original: editorOriginal, revision: editorRevision, body })
+      : await askQueue({ do: 'add', name: $('queue-name').value, priority, body });
+    if (!saved) return;
+    $('queue-editor').hidden = true;
+    queueWhy('Saved.');
+  });
   // What is queued, in the order it will run. Named by its file,
   // which is what an action names back: two queued files can parse to
   // one name (the-queue-is-workable-from-the-phone).
@@ -1223,6 +1286,7 @@
         + queue.map((q) => `<div class="q" data-handle="${esc(q.handle)}">`
           + `<span class="nm">${esc(q.name)}</span>`
           + `<input class="pri" inputmode="numeric" value="${esc(String(q.priority).padStart(3, '0'))}" aria-label="priority of ${esc(q.name)}">`
+          + `<button data-edit="source" aria-label="Edit ${esc(q.name)} Markdown">edit</button>`
           + `<button data-do="promote">promote</button>`
           + `<button data-do="unqueue">unqueue</button>`
           + `</div>`).join('')
@@ -1254,6 +1318,8 @@
   }
 
   $('queue').addEventListener('click', (e) => {
+    const edit = e.target.closest('button[data-edit]');
+    if (edit) { disarm(); openQueueEditor(edit.closest('.q').dataset.handle); return; }
     const btn = e.target.closest('button[data-do]');
     if (!btn) { disarm(); return; }
     const row = btn.closest('.q');

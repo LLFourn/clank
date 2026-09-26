@@ -1,3 +1,4 @@
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use super::{QueueArgs, QueueCmd, resolve_repo};
@@ -278,7 +279,11 @@ pub(crate) fn add(
     let dir = queue_dir(repo);
     std::fs::create_dir_all(&dir)?;
     let dest = dir.join(priority_dir::file_name(priority, name));
-    std::fs::write(&dest, body)?;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&dest)?
+        .write_all(body.as_bytes())?;
     // The queue entry is the record now — consume the draft. Strictly
     // after the write so a failed write leaves the draft for a retry;
     // best-effort, since the add itself already succeeded.
@@ -348,6 +353,67 @@ pub fn entry_by_stem(repo: &Path, stem: &str) -> anyhow::Result<QueueEntry> {
         .into_iter()
         .find(|e| e.file_stem() == stem)
         .ok_or_else(|| anyhow::anyhow!("`{stem}` is no longer in the queue"))
+}
+
+/// Read the Markdown source of exactly the queued file the page names.
+pub fn read_entry(repo: &Path, stem: &str) -> anyhow::Result<(QueueEntry, String, String)> {
+    let entry = entry_by_stem(repo, stem)?;
+    let mut file = std::fs::File::open(&entry.path)
+        .map_err(|e| anyhow::anyhow!("opening queued plan `{stem}`: {e}"))?;
+    let mut body = String::new();
+    file.read_to_string(&mut body)?;
+    let stamp = revision(&file.metadata()?);
+    if stamp != revision(&std::fs::metadata(&entry.path)?) {
+        anyhow::bail!("queued plan `{stem}` moved while it was opened; reopen it");
+    }
+    Ok((entry, body, stamp))
+}
+
+/// Save an editor's document only while its handle and original source
+/// still match. Opening without `create` cannot resurrect a moved entry.
+pub fn save_entry(
+    repo: &Path,
+    stem: &str,
+    expected: &str,
+    expected_revision: &str,
+    body: String,
+) -> anyhow::Result<()> {
+    let entry = entry_by_stem(repo, stem)?;
+    let body = normalize_and_validate(
+        &entry.name,
+        BodySource {
+            raw: body,
+            kind: BodySourceKind::Inline,
+        },
+    )?;
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&entry.path)
+        .map_err(|e| anyhow::anyhow!("opening queued plan `{stem}`: {e}"))?;
+    let mut current = String::new();
+    file.read_to_string(&mut current)?;
+    if current != expected
+        || revision(&file.metadata()?) != expected_revision
+        || revision(&std::fs::metadata(&entry.path)?) != expected_revision
+    {
+        anyhow::bail!("queued plan `{stem}` changed since it was opened; reopen it before saving");
+    }
+    file.set_len(0)?;
+    std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(0))?;
+    file.write_all(body.as_bytes())?;
+    Ok(())
+}
+
+fn revision(meta: &std::fs::Metadata) -> String {
+    use std::os::unix::fs::MetadataExt;
+    format!(
+        "{}:{}:{}:{}",
+        meta.dev(),
+        meta.ino(),
+        meta.ctime(),
+        meta.ctime_nsec()
+    )
 }
 
 /// Change THIS entry's priority. The primitive both the name-addressed

@@ -4,6 +4,64 @@ const ok = (name, cond, detail = '') => out.push(`${cond ? 'PASS' : 'FAIL'}  ${n
 
 (async () => {
   try {
+  // ---- queued Markdown can be created, opened, edited and reordered
+  {
+    const { browser, page, errors } = await open();
+    await page.evaluate(() => {
+      window.fetch = async (url, opts) => {
+        const ask = JSON.parse(opts.body);
+        window.__frames.push([url, opts.body]);
+        if (ask.do === 'open') return { ok: true, status: 200, json: async () => ({
+          handle: ask.handle, name: 'later', priority: 500, body: '# later\nFirst draft\n', revision: 'r1',
+        }) };
+        if (ask.do === 'save' && ask.body.includes('refused'))
+          return { ok: false, status: 409, json: async () => ({ why: 'changed since it was opened' }) };
+        return { ok: true, status: 204 };
+      };
+    });
+    const frame = (queue) => facts([], { ledger: {
+      plan: 'foo', gate: 'unreviewed', dirty: null, queue, stash: 0, blocks: [], rows: [],
+    } });
+    await page.evaluate((d) => window.__send('status', d), frame([]));
+    await page.click('#more');
+    await page.click('#queue-new');
+    await page.fill('#queue-name', 'later');
+    await page.fill('#queue-priority', '500');
+    await page.fill('#queue-body', '# later\nFirst draft\n');
+    await page.click('#queue-edit-form button[type=submit]');
+    const asks = () => page.evaluate(() => window.__frames.filter((f) => f[0] === '/queue').map((f) => JSON.parse(f[1])));
+    await page.waitForFunction(() => document.querySelector('#queue-editor').hidden);
+    ok('new queued plan sends its Markdown and priority', (await asks()).some((a) =>
+       a.do === 'add' && a.name === 'later' && a.priority === 500 && a.body === '# later\nFirst draft\n'));
+    await page.evaluate((d) => window.__send('status', d), frame([{ handle: '500-later', name: 'later', priority: 500 }]));
+    await page.click('#queue button[data-edit]');
+    ok('edit opens the queued Markdown source', await page.inputValue('#queue-body') === '# later\nFirst draft\n');
+    await page.fill('#queue-body', '# later\nRevised\n');
+    await page.click('#queue-edit-form button[type=submit]');
+    await page.waitForFunction(() => document.querySelector('#queue-editor').hidden);
+    ok('save carries the original source for stale edit refusal', (await asks()).some((a) =>
+       a.do === 'save' && a.handle === '500-later' && a.original === '# later\nFirst draft\n' && a.revision === 'r1'
+       && a.body === '# later\nRevised\n'));
+    await page.fill('#queue input.pri', '100');
+    await page.locator('#queue input.pri').dispatchEvent('change');
+    ok('priority change addresses the same file', (await asks()).some((a) =>
+       a.do === 'priority' && a.handle === '500-later' && a.priority === 100));
+    await page.evaluate((d) => window.__send('status', d), frame([
+      { handle: '050-urgent', name: 'urgent', priority: 50 },
+      { handle: '100-later', name: 'later', priority: 100 },
+    ]));
+    ok('queue redraw shows the new order', await page.locator('#queue .q .nm').allTextContents()
+       .then((names) => names.join(',') === 'urgent,later'));
+    await page.click('#queue .q[data-handle="100-later"] button[data-edit]');
+    await page.fill('#queue-body', '# later\nrefused\n');
+    await page.click('#queue-edit-form button[type=submit]');
+    await page.waitForFunction(() => document.querySelector('#qwhy').textContent.includes('changed since'));
+    ok('a failed save explains itself and keeps the editor', await page.isVisible('#queue-editor')
+       && (await page.textContent('#qwhy')).includes('changed since it was opened'));
+    ok('queued editor has no script errors', errors.length === 0, errors.join('; '));
+    await browser.close();
+  }
+
   // ---- Chat explains unavailable states and opens a Codex conversation
   {
     const { browser, page, errors } = await open();
