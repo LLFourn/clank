@@ -75,7 +75,7 @@
   /* The header: the shown agent, said once, and what it owes. */
   .bar {
     grid-area: bar; position: relative;
-    display: grid; grid-template-columns: minmax(0, 1fr) auto;
+    display: grid; grid-template-columns: minmax(0, 1fr);
     padding: 6px 14px 8px;
   }
   /* The repo, then the agent, on one line: a page about a repo says
@@ -93,9 +93,6 @@
   .bar .who .away { display: none; width: 7px; height: 7px; border-radius: 50%; background: var(--hue); animation: breathe 2.4s ease-in-out infinite; }
   .bar .who.elsewhere .away { display: inline-block; }
   .bar .who .tag { color: var(--muted); font-size: 11px; }
-  .bar .more { grid-column: 2; min-height: 44px; margin: -8px -8px 0 0; padding: 0 10px; border: 1px solid var(--edge); border-radius: 999px; color: var(--ink); font-size: 12px; font-weight: 700; display: inline-flex; align-items: center; justify-content: center; }
-  /* The open tray covers the header, so its own button stays above it. */
-  .bar .more[aria-pressed="true"] { position: fixed; top: 6px; right: 6px; z-index: 3; margin: 0; color: #fff; background: var(--hue-deep); border-color: var(--hue-deep); }
   .state { grid-column: 1 / -1; display: flex; align-items: baseline; gap: 14px; margin-top: 1px; }
   .state .doing { flex: 1 1 auto; min-width: 0; color: var(--muted); font-size: 12px; }
   .doing { display: flex; align-items: baseline; gap: 9px; }
@@ -255,9 +252,8 @@
   .say button.send:disabled { opacity: 0.4; cursor: default; }
   .say .sent { color: var(--muted); font-size: 12px; min-width: 0; overflow-wrap: anywhere; }
 
-  /* The ledger: a drawer on a phone, a column on a desk. */
-  .ledger { display: none; background: var(--bezel); border-left: 1px solid var(--edge); overflow: auto; font-size: 13px; }
-  .ledger.open { display: block; position: fixed; inset: 0; z-index: 2; border: 0; padding-top: 50px; }
+  /* The ledger uses the main view on a phone and a column on a desk. */
+  .ledger { display: none; grid-area: agent; min-height: 0; background: var(--bezel); overflow: auto; font-size: 13px; }
   .ledger .lhead { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; padding: 10px 14px 8px; }
   .ledger .lhead .session { font-family: var(--plate); font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .ledger .forget { color: var(--muted); font-size: 12px; margin-left: auto; }
@@ -352,14 +348,18 @@
   .row.review .glyph.v-unmarked { color: var(--muted); }
   .row.notice .main { color: var(--muted); }
 
+  @media (max-width: 959px) {
+    body.timeline-active .agent, body.timeline-active .say { display: none; }
+    body.timeline-active .ledger { display: block; border-top: 1px solid var(--edge); }
+  }
   @media (min-width: 960px) {
     body {
       grid-template-columns: 1fr 38ch;
       grid-template-areas: "bar ledger" "strip ledger" "agent ledger" "say ledger";
     }
-    .bar .more { display: none; }
+    #mode-timeline { display: none; }
     .ledger { display: block; grid-area: ledger; }
-    .ledger.open { position: static; padding-top: 0; border-left: 1px solid var(--edge); }
+    .ledger { border-left: 1px solid var(--edge); }
   }
 </style>
 </head>
@@ -371,12 +371,12 @@
       <span class="name" id="whoname"></span><span class="caret">▾</span><span class="away"></span><span class="tag" id="autotag">auto</span>
       </button>
     </div>
-    <button class="more" id="more" type="button" aria-controls="ledger" aria-expanded="false" aria-pressed="false">Timeline</button>
     <div class="state">
       <span class="doing" id="doing"></span>
       <span class="modes">
-        <button id="mode-transcript" data-mode="transcript" aria-controls="chat-reason" aria-expanded="false">Chat</button>
-        <button id="mode-terminal" data-mode="terminal">terminal</button>
+        <button id="mode-transcript" data-mode="transcript" aria-controls="chat-reason" aria-expanded="false" aria-pressed="false">Chat</button>
+        <button id="mode-terminal" data-mode="terminal" aria-pressed="false">terminal</button>
+        <button id="mode-timeline" data-mode="timeline" aria-controls="ledger" aria-pressed="false">Timeline</button>
       </span>
     </div>
     <div class="chat-reason" id="chat-reason" role="dialog" aria-label="Why Chat is unavailable" hidden><span id="chat-reason-text"></span><button id="chat-reason-close" type="button">Close</button></div>
@@ -525,7 +525,9 @@
   const whoEl = $('who'), whoName = $('whoname'), autoTag = $('autotag'), doingEl = $('doing');
   const projectEl = $('project');
   const pickerEl = $('picker'), stripEl = $('strip');
-  const modeBtns = { transcript: $('mode-transcript'), terminal: $('mode-terminal') };
+  const modeBtns = { transcript: $('mode-transcript'), terminal: $('mode-terminal'), timeline: $('mode-timeline') };
+  const narrowTimeline = window.matchMedia('(max-width: 959px)');
+  let timelineOpen = false;
   const chatReasonEl = $('chat-reason'), chatReasonText = $('chat-reason-text');
   const form = $('say'), input = $('text'), send = $('send'), sentEl = $('sent'), stopBtn = $('stop');
   /*__CLANK_COMPOSER__*/
@@ -975,15 +977,18 @@
     if (shown !== label || hasTranscript(label)) closeChatReason();
     shown = label;
     if (!chatReasonEl.hidden) chatReasonText.textContent = chatReason(label);
-    const mode = label ? modeFor(label) : null;
+    const agentMode = label ? modeFor(label) : null;
+    const mode = timelineOpen && narrowTimeline.matches ? 'timeline' : agentMode;
+    document.body.classList.toggle('timeline-active', mode === 'timeline');
     for (const [m, btn] of Object.entries(modeBtns)) {
       btn.classList.toggle('on', m === mode);
-      btn.disabled = m !== 'transcript' && !label;
+      btn.setAttribute('aria-pressed', String(m === mode));
+      btn.disabled = m === 'terminal' && !label;
       if (m === 'transcript') btn.setAttribute('aria-disabled', String(!label || !hasTranscript(label)));
     }
     for (const [l, v] of views) {
-      v.transcript.classList.toggle('on', l === label && mode === 'transcript');
-      v.terminal.classList.toggle('on', l === label && mode === 'terminal');
+      v.transcript.classList.toggle('on', l === label && agentMode === 'transcript');
+      v.terminal.classList.toggle('on', l === label && agentMode === 'terminal');
     }
     syncSend();
     input.placeholder = label ? `Say something to ${label}` : 'Say something';
@@ -993,10 +998,20 @@
   }
   for (const [m, btn] of Object.entries(modeBtns)) btn.addEventListener('click', () => {
     if (!$('plan-view').hidden) closeSitePage(false);
+    if (m === 'timeline') {
+      timelineOpen = true;
+      closeChatReason();
+      show(shown);
+      return;
+    }
     if (m === 'transcript' && !hasTranscript(shown)) { openChatReason(); return; }
     if (!shown) return;
     closeChatReason();
+    timelineOpen = false;
     modes[shown] = m; remember('clank.modes', modes); show(shown);
+  });
+  window.addEventListener('resize', () => {
+    if (timelineOpen && !narrowTimeline.matches) { timelineOpen = false; show(shown); }
   });
 
   // Turns are rendered ONCE and updated in place, keyed by id: a
@@ -1695,26 +1710,27 @@
       return `<div class="row ${r.kind}"><span class="main">${main}</span><span class="age">${esc(r.age || '')}</span></div>`;
     }).join('');
   }
-  function setTimelineOpen(open) {
-    ledgerEl.classList.toggle('open', open);
-    $('more').setAttribute('aria-pressed', String(open));
-    $('more').setAttribute('aria-expanded', String(open));
-  }
-  $('more').addEventListener('click', () => setTimelineOpen(!ledgerEl.classList.contains('open')));
+  let planReturnTimeline = false;
   function openSitePage(url, title) {
+    planReturnTimeline = timelineOpen && narrowTimeline.matches;
+    timelineOpen = false;
+    show(shown);
     $('plan-title').textContent = title || 'Plan page';
+    $('plan-back').textContent = planReturnTimeline ? '← Timeline' : '← Agents';
     $('plan-frame').title = title || 'Plan page';
     $('plan-frame').src = url.href;
     $('views').hidden = true;
     $('plan-view').hidden = false;
-    setTimelineOpen(false);
     $('plan-back').focus();
   }
   function closeSitePage(focusWho = true) {
     $('plan-view').hidden = true;
     $('plan-frame').removeAttribute('src');
     $('views').hidden = false;
-    if (focusWho) $('who').focus();
+    timelineOpen = planReturnTimeline && narrowTimeline.matches;
+    planReturnTimeline = false;
+    show(shown);
+    if (focusWho) (timelineOpen ? modeBtns.timeline : whoEl).focus();
   }
   $('plan-back').addEventListener('click', () => closeSitePage());
   ledgerEl.addEventListener('click', (e) => {

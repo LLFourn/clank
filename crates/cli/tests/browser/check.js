@@ -43,32 +43,44 @@ const ok = (name, cond, detail = '') => out.push(`${cond ? 'PASS' : 'FAIL'}  ${n
     await browser.close();
   }
 
-  // ---- the timeline button owns the tray at a phone width
+  // ---- Timeline is a peer of Chat and terminal on a phone
   {
     const { browser, page, errors } = await open();
-    const button = page.locator('#more');
-    const resting = await button.evaluate((el) => getComputedStyle(el).backgroundColor);
-    ok('timeline has one button and no separate Close control',
+    const button = page.locator('#mode-timeline');
+    ok('Timeline sits beside Chat and terminal',
        await button.textContent() === 'Timeline' && await button.getAttribute('aria-controls') === 'ledger'
-       && await page.locator('#close').count() === 0);
+       && await page.locator('.state .modes > button').count() === 3
+       && await page.locator('.bar > #more').count() === 0);
     await button.click();
-    const pressed = await button.evaluate((el) => getComputedStyle(el).backgroundColor);
-    ok('first press opens the tray and visibly presses its button',
-       await page.locator('#ledger').evaluate((el) => el.classList.contains('open'))
+    const layout = await page.evaluate(() => {
+      const ledger = document.querySelector('#ledger').getBoundingClientRect();
+      const bar = document.querySelector('.bar').getBoundingClientRect();
+      return { top: ledger.top, barBottom: bar.bottom, width: ledger.width,
+        position: getComputedStyle(document.querySelector('#ledger')).position };
+    });
+    ok('Timeline uses the main content area without covering the header',
+       await page.isVisible('#ledger') && await page.isHidden('.agent') && await page.isHidden('#say')
        && await button.getAttribute('aria-pressed') === 'true'
-       && await button.getAttribute('aria-expanded') === 'true'
-       && pressed !== resting && pressed !== 'rgba(0, 0, 0, 0)');
-    await button.click();
-    ok('second press closes the tray and releases its button',
-       !(await page.locator('#ledger').evaluate((el) => el.classList.contains('open')))
-       && await button.getAttribute('aria-pressed') === 'false'
-       && await button.getAttribute('aria-expanded') === 'false');
+       && layout.position !== 'fixed' && layout.top >= layout.barBottom && layout.width > 300);
+    await page.evaluate((d) => window.__send('status', d), facts([agent('codex', 'master')]));
+    ok('a status update leaves Timeline selected', await page.isVisible('#ledger')
+       && await button.getAttribute('aria-pressed') === 'true');
+    await page.click('#mode-terminal');
+    ok('terminal tab restores the agent view and composer',
+       await page.isHidden('#ledger') && await page.isVisible('.agent') && await page.isVisible('#say')
+       && await button.getAttribute('aria-pressed') === 'false');
     await button.focus();
     await page.keyboard.press('Enter');
-    ok('Enter opens the tray from the focused button', await button.getAttribute('aria-pressed') === 'true');
+    ok('Enter selects Timeline', await button.getAttribute('aria-pressed') === 'true');
     await page.keyboard.press('Space');
-    ok('Space closes the tray from the focused button', await button.getAttribute('aria-pressed') === 'false');
-    ok('timeline toggle has no script errors', errors.length === 0, errors.join('; '));
+    ok('Space keeps the selected tab open', await button.getAttribute('aria-pressed') === 'true');
+    await page.setViewportSize({ width: 1100, height: 780 });
+    ok('wide screen keeps the ledger as a sidebar and hides its tab',
+       await page.isVisible('#ledger') && await page.isVisible('.agent') && await page.isHidden('#mode-timeline'));
+    await page.setViewportSize({ width: 390, height: 780 });
+    ok('returning to phone size restores the agent mode',
+       await page.isHidden('#ledger') && await page.isVisible('.agent'));
+    ok('timeline tabs have no script errors', errors.length === 0, errors.join('; '));
     await browser.close();
   }
 
@@ -89,12 +101,12 @@ const ok = (name, cond, detail = '') => out.push(`${cond ? 'PASS' : 'FAIL'}  ${n
       ledger: { plan: 'foo', gate: 'continued', dirty: null, queue: [], stash: 0, blocks: [],
         rows: [{ kind: 'header', text: 'foo', page: 'plan/foo.html' }] },
     }));
-    await page.click('#more');
+    await page.click('#mode-timeline');
     await page.click('#rows .row.header a');
     const embedded = page.frameLocator('#plan-frame');
     await embedded.locator('h1').waitFor();
     ok('selecting a plan keeps the agent chrome and top-level URL', page.url() === top
-       && await page.isVisible('#who') && await page.isVisible('#more')
+       && await page.isVisible('#who') && await page.isVisible('#mode-timeline')
        && await page.isVisible('#plan-view') && await page.isHidden('#views')
        && await page.locator('#plan-frame').evaluate((el) => el.getBoundingClientRect().height > 200));
     ok('the plan keeps its prose and generated stylesheet',
@@ -107,10 +119,11 @@ const ok = (name, cond, detail = '') => out.push(`${cond ? 'PASS' : 'FAIL'}  ${n
        && await embedded.locator('h1').textContent() === 'Commit abc123'
        && await page.isVisible('#plan-back'));
     await page.click('#plan-back');
-    await page.click('#more');
+    ok('Back returns to the Timeline tab', await page.isVisible('#ledger')
+       && await page.isHidden('.agent') && await page.getAttribute('#mode-timeline', 'aria-pressed') === 'true');
     await page.click('#team > summary');
-    ok('the return path reaches agents and team', page.url() === top
-       && await page.isHidden('#plan-view') && await page.isVisible('#views')
+    ok('the return path reaches the timeline and team', page.url() === top
+       && await page.isHidden('#plan-view') && await page.isVisible('#ledger')
        && await page.isVisible('#team-rows'));
     ok('embedded plan has no script errors', errors.length === 0, errors.join('; '));
     await browser.close();
@@ -135,7 +148,7 @@ const ok = (name, cond, detail = '') => out.push(`${cond ? 'PASS' : 'FAIL'}  ${n
       plan: 'foo', gate: 'unreviewed', dirty: null, queue, stash: 0, blocks: [], rows: [],
     } });
     await page.evaluate((d) => window.__send('status', d), frame([]));
-    await page.click('#more');
+    await page.click('#mode-timeline');
     await page.click('#queue-new');
     await page.fill('#queue-name', 'later');
     await page.fill('#queue-priority', '500');
@@ -200,7 +213,7 @@ const ok = (name, cond, detail = '') => out.push(`${cond ? 'PASS' : 'FAIL'}  ${n
       { stem: 'foo', commits: 2, waiting_for: 'dependency', ready: false },
       { stem: 'other', commits: 1, waiting_for: null, ready: true },
     ]));
-    await page.click('#more');
+    await page.click('#mode-timeline');
     ok('the stash list shows both plans and readiness',
        (await page.locator('#stash-list .item').count()) === 2
        && (await page.textContent('#stash-list')).includes('ready'));
@@ -306,7 +319,7 @@ const ok = (name, cond, detail = '') => out.push(`${cond ? 'PASS' : 'FAIL'}  ${n
       { ...agent('grok', role), tool: 'grok', invocation: 'grok', session: null },
     ]);
     await page.evaluate((d) => window.__send('status', d), team());
-    await page.click('#more');
+    await page.click('#mode-timeline');
     await page.click('#team > summary');
     await page.waitForFunction(() => document.querySelector('#team-library option')?.value === 'replacement');
     await page.click('.team .member[data-label="claude"] > summary');
@@ -383,7 +396,7 @@ const ok = (name, cond, detail = '') => out.push(`${cond ? 'PASS' : 'FAIL'}  ${n
       { ...agent('grok', 'commit'), tool: 'grok', auto: 'on', auto_explicit: 'on' },
       { ...agent('claude', 'final'), tool: 'claude', auto: 'off', auto_explicit: 'off' },
     ]));
-    await page.click('#more');
+    await page.click('#mode-timeline');
     await page.click('#team > summary');
     for (const name of ['codex', 'grok', 'claude'])
       await page.click(`.team .member[data-label="${name}"] > summary`);
@@ -432,7 +445,7 @@ const ok = (name, cond, detail = '') => out.push(`${cond ? 'PASS' : 'FAIL'}  ${n
     ]);
     await page.evaluate((d) => window.__send('status', d), team('session-one'));
     await page.evaluate((d) => window.__send('panes', d), panes(['codex']));
-    await page.click('#more');
+    await page.click('#mode-timeline');
     await page.click('#team > summary');
     await page.click('.team .member[data-label="codex"] > summary');
     await page.click('.team .member[data-label="grok"] > summary');
@@ -1403,10 +1416,10 @@ const ok = (name, cond, detail = '') => out.push(`${cond ? 'PASS' : 'FAIL'}  ${n
       await page.waitForTimeout(40);
       const m = await page.evaluate(() => ({
         doc: document.documentElement.scrollWidth,
-        more: Math.round(document.querySelector('#more').getBoundingClientRect().right),
+        timeline: Math.round(document.querySelector('#mode-timeline').getBoundingClientRect().right),
         name: Math.round(document.querySelector('#whoname').getBoundingClientRect().width),
       }));
-      ok(`long names still fit at ${w}px`, m.doc <= w && m.more <= w, JSON.stringify(m));
+      ok(`long names still fit at ${w}px`, m.doc <= w && m.timeline <= w, JSON.stringify(m));
       ok(`and the agent keeps room at ${w}px`, m.name > 40, JSON.stringify(m));
     }
     ok('no errors around naming', errors.length === 0, errors.join('; '));
@@ -1428,7 +1441,7 @@ const ok = (name, cond, detail = '') => out.push(`${cond ? 'PASS' : 'FAIL'}  ${n
       { kind: 'header', glyph: null, sha: null, text: 'duo', author: null, verdict: null, age: null, page: 'plan/duo.html' },
       { kind: 'commit', glyph: '⚑', sha: 'def4560', text: 'wrap it up', author: null, verdict: null, age: '9m', page: 'commit/def4560.html' },
     ]);
-    await page.click('#more');
+    await page.click('#mode-timeline');
     await page.waitForTimeout(40);
 
     const compact = page.locator('.row.commit').first();
