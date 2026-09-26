@@ -62,6 +62,65 @@ const ok = (name, cond, detail = '') => out.push(`${cond ? 'PASS' : 'FAIL'}  ${n
     await browser.close();
   }
 
+  // ---- stashed plans expose their source and require a confirmed restore
+  {
+    const { browser, page, errors } = await open();
+    await page.evaluate(() => {
+      window.__rejectStash = true;
+      window.fetch = async (url, opts) => {
+        const ask = JSON.parse(opts.body);
+        window.__frames.push([url, opts.body]);
+        if (url === '/stash' && ask.do === 'open') return {
+          ok: true, status: 200, json: async () => ({ stem: ask.stem, revision: 'stash-r1',
+            body: `# ${ask.stem}\n\nthe stashed plan\n`, commits: 2, waiting_for: 'dependency' }),
+        };
+        if (url === '/stash' && window.__rejectStash) return {
+          ok: false, status: 409, json: async () => ({ why: 'stashed plan changed since it was opened' }),
+        };
+        return { ok: true, status: 204 };
+      };
+    });
+    const frame = (stash_entries) => facts([], { ledger: {
+      plan: null, gate: null, dirty: null, queue: [], stash: stash_entries.length,
+      stash_entries, blocks: [], rows: [],
+    } });
+    await page.evaluate((d) => window.__send('status', d), frame([
+      { stem: 'foo', commits: 2, waiting_for: 'dependency', ready: false },
+      { stem: 'other', commits: 1, waiting_for: null, ready: true },
+    ]));
+    await page.click('#more');
+    ok('the stash list shows both plans and readiness',
+       (await page.locator('#stash-list .item').count()) === 2
+       && (await page.textContent('#stash-list')).includes('ready'));
+    await page.click('#stash-list .item[data-stem="foo"] button');
+    ok('the stashed plan opens with its Markdown and dependency',
+       (await page.textContent('#stash-body')).includes('the stashed plan')
+       && (await page.textContent('#stash-meta')).includes('dependency'));
+    ok('the TUI HTML action is available', (await page.getAttribute('#stash-html', 'href')) === 'html/stash/foo.html');
+    const restores = () => page.evaluate(() => window.__frames.filter((f) =>
+      f[0] === '/stash' && JSON.parse(f[1]).do === 'restore').map((f) => JSON.parse(f[1])));
+    await page.click('#stash-restore');
+    ok('restore waits for a second click', (await restores()).length === 0);
+    await page.click('#stash-restore');
+    await page.waitForFunction(() => document.querySelector('#stash-why').textContent.includes('changed since'));
+    ok('a refused restore stays open and explains why', await page.isVisible('#stash-detail')
+       && (await page.textContent('#stash-why')).includes('changed since'));
+    ok('restore names the opened stash revision', (await restores()).some((a) =>
+       a.stem === 'foo' && a.revision === 'stash-r1'));
+    await page.evaluate(() => { window.__rejectStash = false; });
+    await page.click('#stash-restore');
+    await page.click('#stash-restore');
+    await page.waitForFunction(() => document.querySelector('#stash-detail').hidden);
+    await page.evaluate((d) => window.__send('status', d), frame([
+      { stem: 'other', commits: 1, waiting_for: null, ready: true },
+    ]));
+    ok('restoring one stash leaves the other visible',
+       await page.locator('#stash-list .item').count() === 1
+       && (await page.textContent('#stash-list')).includes('other'));
+    ok('stash controls have no script errors', errors.length === 0, errors.join('; '));
+    await browser.close();
+  }
+
   // ---- Chat explains unavailable states and opens a Codex conversation
   {
     const { browser, page, errors } = await open();

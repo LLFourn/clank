@@ -1964,6 +1964,14 @@ pub(crate) struct Queued {
     pub(crate) handle: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct Stashed {
+    pub(crate) stem: String,
+    pub(crate) waiting_for: Option<String>,
+    pub(crate) ready: bool,
+    pub(crate) commits: usize,
+}
+
 /// What has been done, and what the repo is carrying.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct Ledger {
@@ -1975,6 +1983,7 @@ pub(crate) struct Ledger {
     /// second thing to keep true (the-queue-is-workable-from-the-phone).
     pub(crate) queue: Vec<Queued>,
     pub(crate) stash: usize,
+    pub(crate) stash_entries: Vec<Stashed>,
     pub(crate) blocks: Vec<String>,
     pub(crate) rows: Vec<LedgerRow>,
 }
@@ -2089,6 +2098,16 @@ pub(crate) fn web_facts(
             })
             .collect(),
         stash: snap.stash.len(),
+        stash_entries: snap
+            .stash
+            .iter()
+            .map(|s| Stashed {
+                stem: s.stem.clone(),
+                waiting_for: s.waiting_for.clone(),
+                ready: s.ready,
+                commits: s.commits,
+            })
+            .collect(),
         blocks: snap
             .blocks
             .iter()

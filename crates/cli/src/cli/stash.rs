@@ -18,6 +18,7 @@
 //! every reader resolves an item through the merged scan and uses the
 //! RECORD'S OWN `git_ref` — never a stem-constructed path.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
@@ -77,6 +78,55 @@ fn find_record_path(repo: &Path, stem: &str) -> Option<PathBuf> {
     }
     let legacy = legacy_dir(repo).join(format!("{stem}.json"));
     legacy.is_file().then_some(legacy)
+}
+
+fn record_revision(meta: &std::fs::Metadata, body: &str) -> String {
+    use std::os::unix::fs::MetadataExt;
+    format!(
+        "{}:{}:{}:{}:{}",
+        meta.dev(),
+        meta.ino(),
+        meta.ctime(),
+        meta.ctime_nsec(),
+        blake3::hash(body.as_bytes())
+    )
+}
+
+fn load_record(repo: &Path, stem: &str) -> anyhow::Result<(PathBuf, StashRecord, String)> {
+    let path = find_record_path(repo, stem)
+        .ok_or_else(|| anyhow::anyhow!("`{stem}` is not stashed (see `clank stash list`)"))?;
+    let mut file =
+        std::fs::File::open(&path).with_context(|| format!("opening `{}`", path.display()))?;
+    let mut body = String::new();
+    file.read_to_string(&mut body)
+        .with_context(|| format!("reading `{}`", path.display()))?;
+    let stamp = record_revision(&file.metadata()?, &body);
+    let current = std::fs::metadata(&path)?;
+    if stamp != record_revision(&current, &body) {
+        anyhow::bail!("stashed plan `{stem}` changed while it was opened; reopen it");
+    }
+    let record =
+        serde_json::from_str(&body).with_context(|| format!("parsing `{}`", path.display()))?;
+    Ok((path, record, stamp))
+}
+
+/// The TUI's stashed-plan page reads the Markdown from the record's
+/// protective ref. Return the same source with a revision for web
+/// restore, which must still name this particular stash.
+pub(crate) fn read_stashed(
+    repo: &Path,
+    stem: &str,
+) -> anyhow::Result<(StashRecord, String, String)> {
+    if !scan_stash(repo).iter().any(|(name, _)| name == stem) {
+        anyhow::bail!("`{stem}` is not stashed (see `clank stash list`)");
+    }
+    let (_, record, revision) = load_record(repo, stem)?;
+    let tip = crate::git_io::resolve_commit(repo, &record.git_ref)
+        .ok_or_else(|| anyhow::anyhow!("protective ref `{}` is gone", record.git_ref))?;
+    let plan_rel = crate::init_facts::plan_md_rel(stem);
+    let markdown = crate::git_io::show_blob(repo, &tip, Path::new(&plan_rel))
+        .with_context(|| format!("reading stashed plan `{stem}` from `{}`", record.git_ref))?;
+    Ok((record, markdown, revision))
 }
 
 /// Read every stash record — the MERGED new+legacy scan (a new record
@@ -451,17 +501,27 @@ pub(crate) async fn run_pop_inner(
     repo_override: Option<&Path>,
     plan: Option<&str>,
 ) -> anyhow::Result<()> {
+    run_pop_checked(repo_override, plan, None).await
+}
+
+/// Restore only the stash whose revision the caller opened. The CLI
+/// and TUI pass no revision; the web page passes one from `read_stashed`.
+pub(crate) async fn run_pop_checked(
+    repo_override: Option<&Path>,
+    plan: Option<&str>,
+    expected_revision: Option<&str>,
+) -> anyhow::Result<()> {
     let repo = super::resolve_repo(repo_override)?;
     let stem = resolve_stashed(&scan_stash(&repo), plan)?;
 
     // Merged lookup: the record may live at the new or the legacy path;
     // its `git_ref` names the protective ref either way.
-    let sp = find_record_path(&repo, &stem)
-        .ok_or_else(|| anyhow::anyhow!("`{stem}` is not stashed (see `clank stash list`)"))?;
-    let body =
-        std::fs::read_to_string(&sp).with_context(|| format!("reading `{}`", sp.display()))?;
-    let record: StashRecord =
-        serde_json::from_str(&body).with_context(|| format!("parsing `{}`", sp.display()))?;
+    let (sp, record, revision) = load_record(&repo, &stem)?;
+    if expected_revision.is_some_and(|want| want != revision) {
+        anyhow::bail!(
+            "stashed plan `{stem}` changed since it was opened; reopen it before restoring"
+        );
+    }
 
     // A re-promoted plan with the same stem would collide with the
     // restored plan file; fail closed.

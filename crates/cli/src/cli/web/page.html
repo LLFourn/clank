@@ -269,6 +269,18 @@
   .ledger .queue-editor input, .ledger .queue-editor textarea { box-sizing: border-box; width: 100%; padding: 6px; border: 1px solid var(--edge); border-radius: 4px; background: var(--base); color: var(--ink); font: 12px var(--mono); }
   .ledger .queue-editor textarea { min-height: 180px; resize: vertical; }
   .ledger .queue-editor .controls { display: flex; gap: 10px; }
+  .ledger .stash-list, .ledger .stash-detail { padding: 8px 14px; border-bottom: 1px solid var(--edge); }
+  .ledger .stash-list:empty, .ledger .stash-detail[hidden] { display: none; }
+  .ledger .stash-list .head { color: var(--muted); font-size: 12px; padding-bottom: 4px; }
+  .ledger .stash-list .item { display: flex; align-items: baseline; gap: 8px; padding: 3px 0; }
+  .ledger .stash-list .name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ledger .stash-list .note, .ledger .stash-detail .meta { color: var(--muted); font-size: 12px; }
+  .ledger .stash-list button, .ledger .stash-detail button, .ledger .stash-list a, .ledger .stash-detail a { color: var(--hue); font-size: 12px; }
+  .ledger .stash-detail .controls { display: flex; gap: 12px; padding: 8px 0; }
+  .ledger .stash-detail .controls [hidden], .ledger .stash-detail pre[hidden] { display: none; }
+  .ledger .stash-detail button.armed { color: var(--bad, #d05a4a); font-weight: 700; }
+  .ledger .stash-detail pre { white-space: pre-wrap; overflow-wrap: anywhere; font: 12px var(--mono); max-height: 45vh; overflow-y: auto; }
+  .ledger .stash-detail .why { color: var(--bad, #d05a4a); font-size: 12px; }
   .ledger .team { padding: 8px 14px; border-bottom: 1px solid var(--edge); }
   .ledger .team summary { cursor: pointer; font-family: var(--plate); font-weight: 700; }
   .ledger .team .member { border-top: 1px solid var(--edge); padding: 8px 0; }
@@ -403,6 +415,13 @@
       </form>
     </section>
     <div class="qwhy" id="qwhy" role="status" aria-live="polite" hidden></div>
+    <div class="stash-list" id="stash-list"></div>
+    <section class="stash-detail" id="stash-detail" hidden>
+      <strong id="stash-title"></strong><div class="meta" id="stash-meta"></div>
+      <div class="controls"><a id="stash-html" target="_blank" rel="noopener">Open HTML</a><button type="button" id="stash-restore">Restore</button><button type="button" id="stash-close">Close</button></div>
+      <pre id="stash-body"></pre>
+      <div class="why" id="stash-why" role="status" aria-live="polite" hidden></div>
+    </section>
     <div class="rows" id="rows"></div>
   </aside>
 
@@ -1347,6 +1366,84 @@
     askQueue({ do: 'priority', handle: input.closest('.q').dataset.handle, priority });
   });
 
+  // ---- stashed plans ----
+  let stashDrawn = null, openedStash = null, armedRestore = false;
+  function stashWhy(message) {
+    const box = $('stash-why');
+    box.textContent = message || '';
+    box.hidden = !message;
+  }
+  function paintStash(entries) {
+    const sig = JSON.stringify(entries);
+    if (sig === stashDrawn) return;
+    stashDrawn = sig;
+    $('stash-list').innerHTML = entries.length
+      ? `<div class="head">stashed</div>` + entries.map((s) =>
+          `<div class="item" data-stem="${esc(s.stem)}">`
+          + `<span class="name">${esc(s.stem)}</span>`
+          + `<span class="note">${s.commits} commit${s.commits === 1 ? '' : 's'}${s.ready ? ' · ready' : s.waiting_for ? ' · waiting' : ''}</span>`
+          + `<button type="button" data-open="stash">view</button>`
+          + `<a href="html/stash/${encodeURIComponent(s.stem)}.html" target="_blank" rel="noopener">HTML</a>`
+          + `</div>`).join('')
+      : '';
+  }
+  async function askStash(body) {
+    stashWhy('');
+    try {
+      const r = await fetch('/stash', {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+      });
+      if (r.ok) return r.status === 200 ? await r.json() : {};
+      const said = await r.json().catch(() => null);
+      stashWhy((said && said.why) || 'the stash refused that');
+    } catch (err) { stashWhy('could not reach clank'); }
+    return null;
+  }
+  $('stash-list').addEventListener('click', async (e) => {
+    const button = e.target.closest('button[data-open]');
+    if (!button) return;
+    const stem = button.closest('.item').dataset.stem;
+    const source = await askStash({ do: 'open', stem });
+    if (!source) {
+      openedStash = null;
+      $('stash-title').textContent = stem;
+      $('stash-meta').textContent = '';
+      $('stash-html').hidden = true;
+      $('stash-restore').hidden = true;
+      $('stash-body').hidden = true;
+      $('stash-detail').hidden = false;
+      return;
+    }
+    openedStash = source;
+    armedRestore = false;
+    $('stash-restore').textContent = 'Restore';
+    $('stash-restore').classList.remove('armed');
+    $('stash-title').textContent = source.stem;
+    $('stash-meta').textContent = `${source.commits} commit${source.commits === 1 ? '' : 's'}`
+      + (source.waiting_for ? ` · waiting for ${source.waiting_for}` : '');
+    $('stash-html').href = `html/stash/${encodeURIComponent(source.stem)}.html`;
+    $('stash-body').textContent = source.body;
+    $('stash-html').hidden = false;
+    $('stash-restore').hidden = false;
+    $('stash-body').hidden = false;
+    $('stash-detail').hidden = false;
+  });
+  $('stash-close').addEventListener('click', () => { $('stash-detail').hidden = true; openedStash = null; });
+  $('stash-restore').addEventListener('click', async () => {
+    if (!openedStash) return;
+    if (!armedRestore) {
+      armedRestore = true;
+      $('stash-restore').textContent = 'Restore?';
+      $('stash-restore').classList.add('armed');
+      return;
+    }
+    armedRestore = false;
+    $('stash-restore').textContent = 'Restore';
+    $('stash-restore').classList.remove('armed');
+    const result = await askStash({ do: 'restore', stem: openedStash.stem, revision: openedStash.revision });
+    if (result) { openedStash = null; $('stash-detail').hidden = true; }
+  });
+
   // ---- the repo team ----
   const reviewKinds = ['commit', 'plan', 'final', 'gate', 'standby'];
   let teamDrawn = null, library = [], armedAgent = null;
@@ -1473,6 +1570,7 @@
     ].join('');
     paintTeam(facts.agents);
     paintQueue(L.queue);
+    paintStash(L.stash_entries || []);
     // A row's page is the clank html one, in a window of its own. The
     // builder writes a plan's name verbatim, spaces and all; the link
     // encodes each segment and the server decodes it.

@@ -1673,6 +1673,8 @@ async fn route(req: hyper::Request<hyper::body::Incoming>, peer: IpAddr, ctx: &C
         ("POST", "/stop") => stop(req, ctx).await,
         ("POST", "/queue") if !same_origin(&req, ctx) => text(403, "cross-origin", "text/plain"),
         ("POST", "/queue") => queue_action(req, ctx).await,
+        ("POST", "/stash") if !same_origin(&req, ctx) => text(403, "cross-origin", "text/plain"),
+        ("POST", "/stash") => stash_action(req, ctx).await,
         ("GET", "/agents/candidates") => agent_candidates(ctx).await,
         ("POST", "/agents") if !same_origin(&req, ctx) => text(403, "cross-origin", "text/plain"),
         ("POST", "/agents") => agent_action(req, ctx).await,
@@ -2366,6 +2368,67 @@ async fn queue_action(req: hyper::Request<hyper::body::Incoming>, ctx: &Ctx) -> 
             "application/json",
         ),
         None => text(500, "the queue's work panicked", "text/plain"),
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(tag = "do", rename_all = "lowercase")]
+enum StashAsk {
+    Open { stem: String },
+    Restore { stem: String, revision: String },
+}
+
+/// Inspect the TUI's stashed-plan source or restore the exact stash the
+/// page opened. Restoring replays commits, so it runs on a blocking
+/// worker rather than holding the web server's event loop.
+async fn stash_action(req: hyper::Request<hyper::body::Incoming>, ctx: &Ctx) -> Resp {
+    let body = http_body_util::Limited::new(req.into_body(), 4 * 1024);
+    let Ok(bytes) = body.collect().await.map(|c| c.to_bytes()) else {
+        return text(413, "too long", "text/plain");
+    };
+    let Ok(ask) = serde_json::from_slice::<StashAsk>(&bytes) else {
+        return text(400, "expected stash action and stem", "text/plain");
+    };
+    if *ctx.cancelled.borrow() {
+        return text(503, "the remote is off", "text/plain");
+    }
+    let repo = ctx.pages.repo.clone();
+    let runtime = tokio::runtime::Handle::current();
+    let done = ctx
+        .blocking
+        .run(move || -> anyhow::Result<Option<serde_json::Value>> {
+            match ask {
+                StashAsk::Open { stem } => {
+                    let (record, markdown, revision) =
+                        crate::cli::stash::read_stashed(&repo, &stem)?;
+                    Ok(Some(serde_json::json!({
+                        "stem": stem,
+                        "body": markdown,
+                        "revision": revision,
+                        "commits": record.shas.len(),
+                        "waiting_for": record.waiting_for,
+                    })))
+                }
+                StashAsk::Restore { stem, revision } => {
+                    runtime.block_on(crate::cli::stash::run_pop_checked(
+                        Some(&repo),
+                        Some(&stem),
+                        Some(&revision),
+                    ))?;
+                    Ok(None)
+                }
+            }
+        })
+        .await;
+    match done {
+        Some(Ok(None)) => text(204, "", "text/plain"),
+        Some(Ok(Some(source))) => text(200, source.to_string(), "application/json"),
+        Some(Err(e)) => text(
+            409,
+            serde_json::json!({ "why": format!("{e:#}") }).to_string(),
+            "application/json",
+        ),
+        None => text(500, "the stash's work panicked", "text/plain"),
     }
 }
 
@@ -5146,6 +5209,182 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("invalid plan name")
+        );
+        let _ = cancel.send(true);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn web_stash_inspection_and_restore_follow_the_tui_state() {
+        let (base, door, anon, cancel, _site, repo) = door_only().await;
+        let p = repo.path();
+        let git = |args: &[&str]| -> String {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(p)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        };
+        std::fs::create_dir_all(p.join(".clank/plans")).unwrap();
+        std::fs::write(p.join(".clank/.gitignore"), "/stash/\n/shelved/\n/cache/\n").unwrap();
+        std::fs::write(
+            p.join(".clank/config.json"),
+            r#"{"agents":{"claude":{"tool":"claude","role":"master"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(p.join("base.rs"), "// base\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "--quiet", "-m", "base"]);
+        std::fs::write(p.join(".clank/plans/foo.md"), "# foo\n\nthe stashed plan\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "--quiet", "-m", "[foo] intro"]);
+        let sha = git(&["rev-parse", "HEAD"]);
+        git(&["update-ref", "refs/clank/stash/foo", &sha]);
+        git(&["reset", "--hard", "HEAD^"]);
+        let record_path = p.join(".clank/stash/foo.json");
+        std::fs::create_dir_all(record_path.parent().unwrap()).unwrap();
+        let record = crate::cli::stash::StashRecord {
+            shas: vec![sha],
+            git_ref: "refs/clank/stash/foo".into(),
+            waiting_for: None,
+        };
+        std::fs::write(&record_path, serde_json::to_string(&record).unwrap()).unwrap();
+        let before = crate::cli::status::snapshot(p, None).await.unwrap();
+        assert_eq!(before.stash[0].stem, "foo", "the TUI sees the stash");
+        let facts = crate::cli::status_tui::web_facts(&before, &Default::default());
+        assert_eq!(facts.ledger.stash_entries[0].stem, "foo");
+
+        let cookie = door
+            .open_session("token")
+            .map(|t| format!("{}={t}", door::COOKIE))
+            .unwrap();
+        let ask = |body: serde_json::Value, cookie: Option<String>, origin: bool| {
+            let mut r = anon.post(format!("{base}/stash")).json(&body);
+            if let Some(cookie) = cookie {
+                r = r.header("cookie", cookie);
+            }
+            if origin {
+                r = r.header("origin", &base);
+            }
+            async move { r.send().await.unwrap() }
+        };
+        assert_eq!(
+            ask(serde_json::json!({"do":"open","stem":"foo"}), None, true)
+                .await
+                .status(),
+            401
+        );
+        assert_eq!(
+            ask(
+                serde_json::json!({"do":"open","stem":"foo"}),
+                Some(cookie.clone()),
+                false
+            )
+            .await
+            .status(),
+            403
+        );
+        let opened: serde_json::Value = ask(
+            serde_json::json!({"do":"open","stem":"foo"}),
+            Some(cookie.clone()),
+            true,
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+        assert_eq!(opened["body"], "# foo\n\nthe stashed plan\n");
+        assert_eq!(opened["commits"], 1);
+        let revision = opened["revision"].as_str().unwrap();
+
+        let other_path = p.join(".clank/stash/other.json");
+        let other = crate::cli::stash::StashRecord {
+            shas: vec![git(&["rev-parse", "refs/clank/stash/foo"])],
+            git_ref: "refs/clank/stash/foo".into(),
+            waiting_for: Some("unrelated".into()),
+        };
+        std::fs::write(&other_path, serde_json::to_string(&other).unwrap()).unwrap();
+        let wrong_plan = ask(
+            serde_json::json!({"do":"restore","stem":"other","revision":revision}),
+            Some(cookie.clone()),
+            true,
+        )
+        .await;
+        assert_eq!(
+            wrong_plan.status(),
+            409,
+            "foo's revision cannot restore another stash"
+        );
+        assert!(other_path.exists() && record_path.exists());
+        std::fs::remove_file(other_path).unwrap();
+
+        let changed = crate::cli::stash::StashRecord {
+            waiting_for: Some("later".into()),
+            ..record
+        };
+        std::fs::write(&record_path, serde_json::to_string(&changed).unwrap()).unwrap();
+        let stale = ask(
+            serde_json::json!({"do":"restore","stem":"foo","revision":revision}),
+            Some(cookie.clone()),
+            true,
+        )
+        .await;
+        assert_eq!(stale.status(), 409);
+        assert!(
+            stale.json::<serde_json::Value>().await.unwrap()["why"]
+                .as_str()
+                .unwrap()
+                .contains("changed since it was opened")
+        );
+        assert!(!p.join(".clank/plans/foo.md").exists());
+        assert_eq!(crate::cli::stash::scan_stash(p).len(), 1);
+        let fresh: serde_json::Value = ask(
+            serde_json::json!({"do":"open","stem":"foo"}),
+            Some(cookie.clone()),
+            true,
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+        let restored = ask(
+            serde_json::json!({"do":"restore","stem":"foo","revision":fresh["revision"]}),
+            Some(cookie.clone()),
+            true,
+        )
+        .await;
+        assert_eq!(
+            restored.status(),
+            204,
+            "{}",
+            restored.text().await.unwrap_or_default()
+        );
+        assert_eq!(
+            std::fs::read_to_string(p.join(".clank/plans/foo.md")).unwrap(),
+            "# foo\n\nthe stashed plan\n"
+        );
+        let after = crate::cli::status::snapshot(p, None).await.unwrap();
+        assert!(
+            after.stash.is_empty(),
+            "the TUI no longer shows the restored stash"
+        );
+        assert!(after.plans.iter().any(|plan| plan.plan.as_str() == "foo"));
+        let missing = ask(
+            serde_json::json!({"do":"restore","stem":"foo","revision":fresh["revision"]}),
+            Some(cookie),
+            true,
+        )
+        .await;
+        assert_eq!(
+            missing.status(),
+            409,
+            "a spent stash cannot be restored twice"
         );
         let _ = cancel.send(true);
     }
