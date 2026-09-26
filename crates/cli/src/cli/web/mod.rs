@@ -4821,6 +4821,8 @@ mod tests {
     struct GrokPaneState {
         busy: bool,
         draft: bool,
+        hold_send: bool,
+        held: Option<String>,
         queued: Option<String>,
         refuse_stop: bool,
         interrupted: bool,
@@ -4848,6 +4850,10 @@ mod tests {
             let mut state = self.state.lock().unwrap();
             if state.busy {
                 state.queued = Some(text.to_string());
+                return Ok(());
+            }
+            if state.hold_send {
+                state.held = Some(text.to_string());
                 return Ok(());
             }
             drop(state);
@@ -4955,6 +4961,7 @@ mod tests {
         )];
         let door = Arc::new(door::Door::new(Some(home.path().to_path_buf())));
         let state = Arc::new(Mutex::new(GrokPaneState::default()));
+        state.lock().unwrap().hold_send = true;
         let instance = Instance::start(
             repo.path().to_path_buf(),
             Some(home.path().to_path_buf()),
@@ -5009,6 +5016,37 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(sent.status(), 204);
+        // A successful /say only means the pane accepted the text.
+        // Grok may write its transcript later.
+        assert!(
+            !std::fs::read_to_string(&history)
+                .unwrap()
+                .contains("new question")
+        );
+        let held = {
+            let mut state = state.lock().unwrap();
+            state.hold_send = false;
+            state.held.take().unwrap()
+        };
+        {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&history)
+                .unwrap();
+            writeln!(
+                file,
+                "{}",
+                serde_json::json!({"type":"user","content":[{"type":"text","text":held}]})
+            )
+            .unwrap();
+            writeln!(
+                file,
+                "{}",
+                serde_json::json!({"type":"assistant","content":"reply from dummy Grok"})
+            )
+            .unwrap();
+        }
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(6);
         while !frames.contains("reply from dummy Grok") {
             let frame = tokio::time::timeout_at(deadline, peer.next())

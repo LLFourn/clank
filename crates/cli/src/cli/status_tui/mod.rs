@@ -1906,6 +1906,8 @@ pub(crate) struct Position {
     pub(crate) label: String,
     /// The harness whose terminal control keys apply to this agent.
     pub(crate) tool: String,
+    /// The bound session scopes messages waiting for transcript proof.
+    pub(crate) session: Option<String>,
     pub(crate) role: String,
     pub(crate) owes: Option<Owed>,
     pub(crate) last: Option<String>,
@@ -2054,6 +2056,7 @@ pub(crate) fn web_facts(
         .map(|a| Position {
             label: a.label.clone(),
             tool: a.tool.clone(),
+            session: a.session.as_ref().map(|s| s.id.as_str().to_string()),
             role: render::tier_label(a.role).to_string(),
             owes: owed.remove(&a.label),
             last: last_act(snap, &a.label, a.role),
@@ -5663,7 +5666,7 @@ pub(crate) mod tests {
     fn the_page_reads_only_fields_the_facts_have() {
         use std::collections::BTreeSet;
         const PAGE: &str = include_str!("../web/page.html");
-        let s = fixtures::with_agents(
+        let mut s = fixtures::with_agents(
             fixtures::snap(
                 vec![fixtures::plan_state_at(
                     "foo",
@@ -5677,7 +5680,12 @@ pub(crate) mod tests {
             ),
             &[("claude", crate::cli::teams_config::RosterRole::Master)],
         );
+        s.agents[0].session = Some(fixtures::bound(
+            clank_core::vocab::Tool::Claude,
+            "bound-session",
+        ));
         let v = serde_json::to_value(web_facts(&s, &Default::default())).unwrap();
+        assert_eq!(v["agents"][0]["session"], "bound-session");
 
         let keys = |x: &serde_json::Value| -> BTreeSet<String> {
             x.as_object()
@@ -5687,7 +5695,15 @@ pub(crate) mod tests {
         let set = |ks: &[&str]| -> BTreeSet<String> { ks.iter().map(|k| k.to_string()).collect() };
         assert_eq!(
             keys(&v["agents"][0]),
-            set(&["label", "tool", "role", "owes", "last", "transcript"]),
+            set(&[
+                "label",
+                "tool",
+                "session",
+                "role",
+                "owes",
+                "last",
+                "transcript"
+            ]),
             "the picker and the header destructure an agent by these names"
         );
         assert_eq!(

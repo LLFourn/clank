@@ -39,7 +39,7 @@ const panes = (labels) => ({ panes: labels.map((l) => ({ id: 'pane-' + l, label:
 
 let server, port, browser;
 // `deny`: a browser that refuses site data, where even READING
-// localStorage throws — a private window, or storage blocked.
+// either store throws — a private window, or storage blocked.
 async function open(deny) {
   if (!server) {
     server = http.createServer((req, res) => { res.setHeader('content-type', 'text/html'); res.end(PAGE); });
@@ -55,7 +55,11 @@ async function open(deny) {
   const errors = [];
   page.on('pageerror', (e) => errors.push(e.message));
   await ctx.addInitScript(STUB);
-  if (deny) await ctx.addInitScript(`Object.defineProperty(window, 'localStorage', { get() { throw new Error('Access is denied for this document.'); } });`);
+  if (deny) await ctx.addInitScript(`
+    for (const name of ['localStorage', 'sessionStorage']) {
+      Object.defineProperty(window, name, { get() { throw new Error('Access is denied for this document.'); } });
+    }
+  `);
   await page.goto(`http://127.0.0.1:${port}/`);
   // A page that died on load never gets here: the socket is the
   // first thing its script does.

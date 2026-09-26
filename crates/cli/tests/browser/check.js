@@ -27,6 +27,165 @@ const ok = (name, cond, detail = '') => out.push(`${cond ? 'PASS' : 'FAIL'}  ${n
     await browser.close();
   }
 
+  // ---- submitted chat messages wait for transcript proof
+  {
+    const { browser, page, errors } = await open();
+    const grok = (session) => facts([{ ...agent('grok', 'master', null, null, true), session, tool: 'grok' }]);
+    await page.evaluate((d) => window.__send('status', d), grok('s1'));
+    await page.evaluate((d) => window.__send('panes', d), panes(['grok']));
+    await page.evaluate((d) => window.__send('turns', d), turns('grok', [
+      text('old', 'person', 'hello', 'hello'),
+    ]));
+    await page.evaluate(() => {
+      window.__sayReply = null;
+      window.fetch = (url) => url === '/say'
+        ? new Promise((resolve) => { window.__sayReply = resolve; })
+        : Promise.resolve({ ok: true, status: 204, text: async () => '' });
+    });
+    await page.fill('#text', 'hello');
+    await page.click('#send');
+    ok('submitted text appears while /say is in flight',
+       await page.locator('.turn.outgoing').count() === 1
+       && (await page.textContent('.turn.outgoing')).includes('Sending'));
+    await page.evaluate(() => window.__sayReply({ ok: true, status: 204, text: async () => '' }));
+    await page.waitForTimeout(40);
+    ok('a send response still waits for transcript',
+       (await page.textContent('.turn.outgoing')).includes('Waiting for transcript'));
+    await page.evaluate((d) => window.__send('status', d), facts([
+      { ...agent('grok', 'master', null, null, true), session: 's1', tool: 'grok' },
+      agent('codex', 'commit', { verb: 'reviewing', object: 'work', since: Math.floor(Date.now()/1000) - 10 }),
+    ]));
+    ok('pending submission keeps its recipient on screen', await page.textContent('#whoname') === 'grok');
+    await page.click('#who');
+    await page.click('.picker .opt[data-key="pin:grok"]');
+    await page.evaluate((d) => window.__send('turns', d), turns('grok', [
+      text('old', 'person', 'hello', 'hello'),
+    ]));
+    ok('an old identical turn cannot settle the new send', await page.locator('.turn.outgoing').count() === 1);
+    await page.evaluate((d) => window.__send('turn', d), {
+      agent: 'grok', session: 's1', generation: 1,
+      turn: text('new', 'person', 'hello', 'hello'),
+    });
+    ok('the recorded message replaces the pending copy',
+       await page.locator('.turn.outgoing').count() === 0
+       && await page.locator('.turn.person').count() === 2);
+
+    await page.evaluate(() => {
+      window.fetch = async () => ({ ok: true, status: 204, text: async () => '' });
+    });
+    for (let i = 0; i < 2; i++) {
+      await page.fill('#text', 'same words');
+      await page.click('#send');
+      await page.waitForTimeout(30);
+    }
+    ok('identical submissions have separate pending rows', await page.locator('.turn.outgoing').count() === 2);
+    await page.evaluate((d) => window.__send('turn', d), {
+      agent: 'grok', session: 's1', generation: 1,
+      turn: text('same-1', 'person', 'same words', 'same words'),
+    });
+    ok('one recorded turn settles only one submission', await page.locator('.turn.outgoing').count() === 1);
+    await page.evaluate((d) => window.__send('turns', d), turns('grok', [
+      text('old', 'person', 'hello', 'hello'),
+      text('new', 'person', 'hello', 'hello'),
+      text('same-1', 'person', 'same words', 'same words'),
+    ]));
+    ok('a replay cannot settle the other identical submission', await page.locator('.turn.outgoing').count() === 1);
+    await page.evaluate((d) => window.__send('turn', d), {
+      agent: 'grok', session: 's1', generation: 1,
+      turn: text('same-2', 'person', 'same words', 'same words'),
+    });
+    ok('both settled copies appear once', await page.locator('.turn.outgoing').count() === 0
+       && await page.locator('.turn.person').count() === 4);
+
+    await page.evaluate(() => {
+      window.fetch = async () => ({ ok: false, status: 502, text: async () => 'pane unavailable' });
+    });
+    await page.fill('#text', 'retry me');
+    await page.click('#send');
+    await page.waitForTimeout(40);
+    ok('failure appears beside the message', (await page.textContent('.turn.outgoing.failed')).includes('pane unavailable'));
+    ok('the failed message remains editable for retry', await page.inputValue('#text') === 'retry me');
+    await page.fill('#text', '');
+    await page.click('.turn.outgoing.failed .retry');
+    ok('the failed row can restore its text for retry', await page.inputValue('#text') === 'retry me');
+    await page.evaluate(() => {
+      window.fetch = async () => ({ ok: true, status: 204, text: async () => '' });
+    });
+    await page.click('#send');
+    await page.waitForTimeout(40);
+    ok('retry reuses the failed row', await page.locator('.turn.outgoing').count() === 1
+       && (await page.textContent('.turn.outgoing')).includes('Waiting for transcript'));
+    await page.evaluate((d) => window.__send('turn', d), {
+      agent: 'grok', session: 's1', generation: 1,
+      turn: text('retried', 'person', 'retry me', 'retry me'),
+    });
+    ok('the retry settles without a duplicate', await page.locator('.turn.outgoing').count() === 0);
+
+    await page.evaluate(() => {
+      window.fetch = async () => ({ ok: false, status: 502, text: async () => 'transport lost' });
+    });
+    await page.fill('#text', 'late proof');
+    await page.click('#send');
+    await page.waitForTimeout(40);
+    await page.evaluate((d) => window.__send('turn', d), {
+      agent: 'grok', session: 's1', generation: 1,
+      turn: text('late', 'person', 'late proof', 'late proof'),
+    });
+    ok('transcript proof clears a late send failure', await page.locator('.turn.outgoing').count() === 0
+       && await page.inputValue('#text') === ''
+       && (await page.textContent('#sent')).includes('Recorded in transcript'));
+    await page.evaluate(() => {
+      window.fetch = async () => ({ ok: true, status: 204, text: async () => '' });
+    });
+    await page.fill('#text', 'survive refresh');
+    await page.click('#send');
+    await page.waitForTimeout(40);
+    await page.evaluate(() => localStorage.removeItem('clank.selection'));
+    await page.reload();
+    await page.waitForFunction(() => !!window.__sock);
+    const competing = (session) => facts([
+      { ...agent('grok', 'master', null, null, true), session, tool: 'grok' },
+      agent('codex', 'commit', { verb: 'reviewing', object: 'work', since: Math.floor(Date.now()/1000) - 10 }),
+    ]);
+    await page.evaluate((d) => window.__send('status', d), competing('s1'));
+    await page.evaluate((d) => window.__send('panes', d), panes(['grok']));
+    await page.evaluate((d) => window.__send('turns', d), turns('grok', []));
+    ok('refresh retains the pending message for the same session',
+       await page.textContent('#whoname') === 'grok'
+       && (await page.textContent('.turn.outgoing')).includes('survive refresh'));
+    await page.evaluate((d) => window.__send('status', d), competing('s2'));
+    await page.evaluate((d) => window.__send('turns', d), { agent: 'grok', session: 's2', generation: 1, turns: [] });
+    ok('a new session cannot inherit the pending message', await page.locator('.turn.outgoing').count() === 0
+       && await page.textContent('#whoname') === 'codex');
+    await page.click('#who');
+    await page.click('.picker .opt[data-key="pin:grok"]');
+    await page.fill('#text', 'dismiss me');
+    await page.click('#send');
+    await page.waitForTimeout(40);
+    ok('an unconfirmed send can be dismissed', await page.locator('.turn.outgoing').count() === 1);
+    await page.click('.turn.outgoing .dismiss');
+    ok('dismiss removes the pending row', await page.locator('.turn.outgoing').count() === 0);
+    ok('pending chat has no script errors', errors.length === 0, errors.join('; '));
+    await browser.close();
+  }
+
+  // ---- blocked storage cannot prevent a chat submission
+  {
+    const { browser, page, errors } = await open(true);
+    await page.evaluate((d) => window.__send('status', d), facts([
+      { ...agent('grok', 'master', null, null, true), session: 's1', tool: 'grok' },
+    ]));
+    await page.evaluate((d) => window.__send('panes', d), panes(['grok']));
+    await page.evaluate((d) => window.__send('turns', d), turns('grok', []));
+    await page.fill('#text', 'still send');
+    await page.click('#send');
+    await page.waitForTimeout(40);
+    ok('storage refusal still sends chat', await page.evaluate(() => window.__frames.some((f) => f[0] === '/say')));
+    ok('storage refusal still shows pending', await page.locator('.turn.outgoing').count() === 1);
+    ok('storage refusal has no script errors', errors.length === 0, errors.join('; '));
+    await browser.close();
+  }
+
   // ---- P2: a successful send releases the draft and auto moves on
   {
     const { browser, page } = await open();

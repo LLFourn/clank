@@ -147,6 +147,11 @@
   /* What the person said is a block of its own, so who is speaking
      needs no label. */
   .turn.person { margin: 14px 0; padding: 12px 14px; background: var(--bezel); border: 1px solid var(--edge); border-radius: 10px; }
+  .turn.outgoing { border-style: dashed; }
+  .turn.outgoing .text { white-space: pre-wrap; }
+  .turn.outgoing .delivery { display: block; margin-top: 6px; color: var(--muted); font: 12px var(--mono); overflow-wrap: anywhere; }
+  .turn.outgoing.failed .delivery { color: var(--bad, #d05a4a); }
+  .turn.outgoing .retry, .turn.outgoing .dismiss { margin: 6px 12px 0 0; color: var(--hue-deep); font: 12px var(--mono); text-decoration: underline; }
   .turn .text { overflow-wrap: anywhere; }
   .turn.harness .text { color: var(--muted); font-size: 13px; }
   .turn.thinking .text { color: var(--muted); }
@@ -522,6 +527,22 @@
   };
   const remember = (key, value) => { try { localStorage.setItem(key, JSON.stringify(value)); } catch (err) {} };
   const modes = remembered('clank.modes', {});
+  // A refresh in this tab keeps unconfirmed sends visible. Storage is
+  // optional: a browser that refuses it still sends normally.
+  const OUTBOX_KEY = 'clank.chat.outbox';
+  const outbox = (() => {
+    try {
+      const saved = JSON.parse(sessionStorage.getItem(OUTBOX_KEY) || '[]');
+      return Array.isArray(saved) ? saved.filter((e) =>
+        e && typeof e.id === 'string' && typeof e.agent === 'string'
+        && typeof e.session === 'string' && typeof e.text === 'string'
+        && Array.isArray(e.seen) && ['sending', 'sent', 'failed', 'uncertain'].includes(e.state)
+      ).map((e) => ({ ...e, state: e.state === 'sending' ? 'uncertain' : e.state })) : [];
+    } catch (err) { return []; }
+  })();
+  const keepOutbox = () => {
+    try { sessionStorage.setItem(OUTBOX_KEY, JSON.stringify(outbox)); } catch (err) {}
+  };
   // Auto follows the turn; a pin names one agent. Kept, so a
   // deliberate pin survives a reload and a phone waking up.
   let selection = (() => {
@@ -542,6 +563,48 @@
   // being resynced; anything genuinely new does, whatever its clock
   // says.
   const revisionOf = (label) => agents.get(label)?.rev ?? 0;
+  const boundSession = (label) => {
+    const a = roster().find((r) => r.label === label);
+    return a && Object.prototype.hasOwnProperty.call(a, 'session')
+      ? a.session : agents.get(label)?.session || null;
+  };
+  const priorPeople = (label, session, text) => {
+    const w = agents.get(label);
+    return w && w.session === session
+      ? w.turns.filter((t) => t.who === 'person' && t.body.kind === 'text' && t.body.text === text).map((t) => `${w.generation}:${t.id}`)
+      : [];
+  };
+  function reconcileOutbox(label) {
+    const w = agents.get(label);
+    if (!w || !w.session || w.session !== boundSession(label)) return;
+    const claimed = new Set();
+    let changed = false;
+    for (let i = 0; i < outbox.length; ) {
+      const entry = outbox[i];
+      if (entry.agent !== label || entry.session !== w.session) { i++; continue; }
+      const found = w.turns.find((t) =>
+        t.who === 'person' && t.body.kind === 'text' && t.body.text === entry.text
+        && !entry.seen.includes(`${w.generation}:${t.id}`) && !claimed.has(t.id)
+      );
+      if (!found) { i++; continue; }
+      claimed.add(found.id);
+      entry.recorded = true;
+      if (entry.state === 'failed' && shown === label && input.value === entry.text) {
+        input.value = '';
+        resize();
+      }
+      if (entry.state === 'failed' && shown === label) sentEl.textContent = 'Recorded in transcript';
+      outbox.splice(i, 1); changed = true;
+      // A later identical submission must not claim this same turn
+      // on the next replay, after the first entry has been removed.
+      for (const later of outbox.slice(i)) {
+        if (later.agent === label && later.session === w.session && later.text === found.body.text) {
+          later.seen.push(`${w.generation}:${found.id}`);
+        }
+      }
+    }
+    if (changed) keepOutbox();
+  }
 
   function applyTurns(d) {
     const was = agents.get(d.agent);
@@ -555,6 +618,7 @@
       turns: d.turns.slice(),
       rev: (was?.rev ?? 0) + (changed ? 1 : 0),
     });
+    reconcileOutbox(d.agent);
     if (d.agent === shown) { paintTranscript(d.agent); syncSend(); }
   }
   function applyTurn(d) {
@@ -564,6 +628,7 @@
     if (i < 0 || mark(w.turns[i]) !== mark(d.turn)) w.rev = (w.rev ?? 0) + 1;
     if (i >= 0) w.turns[i] = d.turn; else w.turns.push(d.turn);
     if (w.turns.length > 200) w.turns.splice(0, w.turns.length - 200);
+    reconcileOutbox(d.agent);
     // After the turn is in, not before: `workingOf` reads the newest
     // one, so asking first would answer about the previous turn.
     if (d.agent === shown) { paintTranscript(d.agent); syncSend(); }
@@ -588,6 +653,10 @@
       selection = { auto: true };           // the pinned agent left the roster
       keepSelection();
     }
+    const waiting = [...outbox].reverse().find((e) =>
+      roster().some((a) => a.label === e.agent && boundSession(a.label) === e.session)
+    );
+    if (waiting) return waiting.agent;
     return upNow() || masterLabel();
   }
   // The one place the view moves by itself. What is in the say box was
@@ -602,6 +671,10 @@
     // so an automatic move mid-upload would attach a photo to the
     // wrong agent (codex on a757522).
     if (input.value !== '' || pending > 0 || sending > 0) return;
+    // A submitted message owns the view until the bound transcript
+    // records it. Moving as soon as the box empties would hide the
+    // pending message the sender is waiting to see.
+    if (outbox.some((e) => e.agent === shown && e.session === boundSession(shown) && e.state !== 'failed')) return;
     const want = target();
     if (want !== shown) show(want);
   }
@@ -868,12 +941,59 @@
     return el.nextElementSibling;
   }
 
+  function placeOutgoing(box, entry, cursor) {
+    const id = `out:${entry.id}`;
+    let el = box.querySelector(`[data-id="${CSS.escape(id)}"]`);
+    if (!el) {
+      el = document.createElement('div');
+      el.dataset.id = id;
+      el.innerHTML = '<div class="text"></div><span class="delivery"></span><button class="retry" type="button">Edit and retry</button><button class="dismiss" type="button">Dismiss</button>';
+      box.insertBefore(el, cursor);
+    } else if (el !== cursor) {
+      box.insertBefore(el, cursor);
+    }
+    el.className = `turn person outgoing ${entry.state}`;
+    el.querySelector('.text').textContent = entry.text;
+    el.querySelector('.delivery').textContent = entry.state === 'failed'
+      ? `Not sent: ${entry.reason || 'delivery failed'}`
+      : entry.state === 'sending' ? 'Sending…'
+      : entry.state === 'uncertain' ? 'Delivery unconfirmed after refresh'
+      : 'Waiting for transcript…';
+    el.querySelector('.retry').hidden = entry.state !== 'failed';
+    el.querySelector('.dismiss').hidden = entry.state === 'sending';
+    return el.nextElementSibling;
+  }
+
+  viewsEl.addEventListener('click', (e) => {
+    const button = e.target.closest('button.retry, button.dismiss');
+    if (!button) return;
+    const id = button.closest('.turn.outgoing')?.dataset.id?.slice(4);
+    const entry = outbox.find((x) => x.id === id && x.agent === shown && x.session === boundSession(shown));
+    if (!entry) return;
+    if (button.classList.contains('dismiss')) {
+      outbox.splice(outbox.indexOf(entry), 1);
+      keepOutbox();
+      paintTranscript(shown);
+      retarget();
+      return;
+    }
+    if (entry.state !== 'failed') return;
+    if (input.value && input.value !== entry.text) {
+      sentEl.textContent = 'Finish the current draft before retrying';
+      return;
+    }
+    input.value = entry.text;
+    resize();
+    input.focus();
+  });
+
   function paintTranscript(label) {
     const v = views.get(label); if (!v) return;
     const box = v.transcript.querySelector('.turns');
     const w = agents.get(label);
     const shown = (w ? w.turns : []).filter((t) => t.who !== 'harness');
-    if (!shown.length) { box.innerHTML = `<div class="turn empty-note"><span class="text">Nothing said yet.</span></div>`; return; }
+    const outgoing = outbox.filter((e) => e.agent === label && e.session === boundSession(label));
+    if (!shown.length && !outgoing.length) { box.innerHTML = `<div class="turn empty-note"><span class="text">Nothing said yet.</span></div>`; return; }
     if (box.querySelector('.empty-note')) box.innerHTML = '';
     const atBottom = v.transcript.scrollTop + v.transcript.clientHeight >= v.transcript.scrollHeight - 40;
     const keep = new Set();
@@ -924,6 +1044,10 @@
       for (const t of slot.turns) { mine.add(t.id); mc = placeTurn(box, members, t, mc); }
       for (const el of [...members.children]) if (!mine.has(el.dataset.id)) el.remove();
       cursor = g.nextElementSibling;
+    }
+    for (const entry of outgoing) {
+      keep.add(`out:${entry.id}`);
+      cursor = placeOutgoing(box, entry, cursor);
     }
     for (const el of [...box.children]) if (!keep.has(el.dataset.id)) el.remove();
     if (atBottom) v.transcript.scrollTop = v.transcript.scrollHeight;
@@ -1124,6 +1248,19 @@
   // ---- status ----
   function onStatus(d) {
     facts = d.facts;
+    let pruned = false;
+    const prunedLabels = new Set();
+    for (let i = outbox.length - 1; i >= 0; i--) {
+      const a = roster().find((r) => r.label === outbox[i].agent);
+      if (a && Object.prototype.hasOwnProperty.call(a, 'session') && a.session !== outbox[i].session) {
+        prunedLabels.add(outbox[i].agent);
+        outbox.splice(i, 1); pruned = true;
+      }
+    }
+    if (pruned) {
+      keepOutbox();
+      for (const label of prunedLabels) paintTranscript(label);
+    }
     heard = true;
     document.documentElement.style.setProperty('--hue', facts.hue || '#5f5fff');
     for (const a of roster()) ensureViews(a.label);
@@ -1314,24 +1451,61 @@
     input.value = '';
     resize();
     sending += 1;
+    const session = boundSession(shownWas);
+    let outgoing = null;
+    if (hasTranscript(shownWas) && session) {
+      outgoing = [...outbox].reverse().find((entry) =>
+        entry.agent === shownWas && entry.session === session
+        && entry.text === text && entry.state === 'failed'
+      );
+      if (!outgoing) {
+        outgoing = { id: globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`,
+          agent: shownWas, session, text, seen: [], state: 'sending', reason: '' };
+        outbox.push(outgoing);
+      }
+      outgoing.seen = priorPeople(shownWas, session, text);
+      outgoing.state = 'sending'; outgoing.reason = '';
+      keepOutbox();
+      paintTranscript(shownWas);
+    }
     syncSend();
 
     send.disabled = true;
     try {
       const r = await fetch('/say', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ pane: pid, text }) });
       if (!r.ok) throw new Error(await r.text());
+      if (outgoing && outbox.includes(outgoing)) {
+        outgoing.state = 'sent';
+        keepOutbox();
+        paintTranscript(shownWas);
+      }
       // Setting .value fires no input event, so the draft's release
       // has to say so itself.
-      sentEl.textContent = 'Sent'; setTimeout(() => { sentEl.textContent = ''; }, 1500);
+      const receipt = outgoing && !outgoing.recorded ? 'Sent to pane' : 'Sent';
+      sentEl.textContent = receipt;
+      setTimeout(() => { if (sentEl.textContent === receipt) sentEl.textContent = ''; }, 1500);
       stopped.delete(shownWas);       // new work: whatever was stopped is not any more
       retarget();
     } catch (err) {
-      // It never went, so give it back — in front of anything typed
-      // since, which is the order they were written in.
-      input.value = input.value ? `${text} ${input.value}` : text;
-      resize();
-      sentEl.textContent = `Not sent: ${err.message || String(err)}`;
-      console.error(err);
+      const recorded = outgoing?.recorded === true;
+      if (recorded) {
+        // A late transport error cannot undo a turn the transcript
+        // already proves the agent received.
+        sentEl.textContent = 'Recorded in transcript';
+      } else {
+        if (outgoing && outbox.includes(outgoing)) {
+          outgoing.state = 'failed';
+          outgoing.reason = err.message || String(err);
+          keepOutbox();
+          paintTranscript(shownWas);
+        }
+        // It never went, so give it back — in front of anything typed
+        // since, which is the order they were written in.
+        input.value = input.value ? `${text} ${input.value}` : text;
+        resize();
+        sentEl.textContent = `Not sent: ${err.message || String(err)}`;
+        console.error(err);
+      }
     } finally {
       sending -= 1;
       syncSend();
