@@ -116,7 +116,7 @@ fn bindings_to_adopt<'a>(ps: &'a str, panes: &'a [(u32, String)]) -> Vec<(u32, &
 }
 
 fn session_token_on(line: &str) -> Option<&str> {
-    for key in ["resume ", "--resume "] {
+    for key in ["resume ", "--resume ", "--session "] {
         let Some(rest) = line.split(key).nth(1) else {
             continue;
         };
@@ -129,15 +129,39 @@ fn session_token_on(line: &str) -> Option<&str> {
 }
 
 fn looks_like_session(token: &str) -> bool {
-    token.len() >= 32
+    (token.len() >= 32
         && token.contains('-')
-        && token.bytes().all(|c| c.is_ascii_hexdigit() || c == b'-')
+        && token.bytes().all(|c| c.is_ascii_hexdigit() || c == b'-'))
+        || (token.len() >= 12
+            && token.starts_with("ses_")
+            && token
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || c == b'_'))
 }
 
 fn zellij_pane_id_on(line: &str) -> Option<u32> {
     let rest = line.split("ZELLIJ_PANE_ID=").nth(1)?;
     let num: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
     num.parse().ok()
+}
+
+/// Only positive process evidence turns a missing pane into a lost
+/// pane. A stale binding by itself keeps the ordinary `?` mark.
+fn lost_bound_labels(
+    bound: &[(String, Tool, String)],
+    panes: &std::collections::BTreeSet<String>,
+    processes: &std::collections::BTreeSet<String>,
+    claude_background: &std::collections::BTreeSet<String>,
+) -> std::collections::BTreeSet<String> {
+    bound
+        .iter()
+        .filter(|(label, tool, id)| {
+            !panes.contains(label)
+                && (processes.contains(id)
+                    || (*tool == Tool::Claude && claude_background.contains(id)))
+        })
+        .map(|(label, _, _)| label.clone())
+        .collect()
 }
 
 /// The current zellij tab's `(stable id, name)`, or `None` outside
@@ -571,6 +595,9 @@ pub(super) trait PaneIo {
     /// agents — the retitler's map, read off the same listing presence
     /// uses. The ROLE is the roster's, not the pane's.
     fn title_rows(&mut self, snap: &Self::Snap) -> Vec<(String, String)>;
+    /// Bound agents with no pane but a process still holding their
+    /// session. Read only; this never starts or reconnects an agent.
+    fn lost_labels(&mut self, snap: &Self::Snap) -> std::collections::BTreeSet<String>;
 }
 
 /// The real zellij-backed [`PaneIo`].
@@ -655,6 +682,50 @@ impl PaneIo for ZellijPaneIo<'_> {
     }
     fn title_rows(&mut self, snap: &Self::Snap) -> Vec<(String, String)> {
         crate::cli::open_zellij::agent_panes_by_command(snap, self.repo)
+    }
+    fn lost_labels(&mut self, snap: &Self::Snap) -> std::collections::BTreeSet<String> {
+        let panes = crate::cli::open_zellij::live_agent_labels(snap, self.repo);
+        let Ok(configs) = crate::agent_store::load_all_agent_configs(self.repo) else {
+            return Default::default();
+        };
+        let bound: Vec<(String, Tool, String)> = configs
+            .into_iter()
+            .filter_map(|(label, cfg)| {
+                let session = cfg.session?;
+                Some((
+                    label.as_str().to_string(),
+                    session.tool,
+                    session.id.to_string(),
+                ))
+            })
+            .filter(|(label, _, _)| !panes.contains(label))
+            .collect();
+        if bound.is_empty() {
+            return Default::default();
+        }
+        let processes: std::collections::BTreeSet<String> = process_table()
+            .ok()
+            .into_iter()
+            .flat_map(|ps| {
+                ps.lines()
+                    .filter_map(session_token_on)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let claude_background = if bound
+            .iter()
+            .any(|(_, tool, id)| *tool == Tool::Claude && !processes.contains(id))
+        {
+            crate::cli::session_holder::claude_agents_listing("claude".to_string())
+                .into_iter()
+                .filter(|agent| agent.kind == "background")
+                .map(|agent| agent.session_id)
+                .collect()
+        } else {
+            Default::default()
+        };
+        lost_bound_labels(&bound, &panes, &processes, &claude_background)
     }
 }
 
@@ -1016,6 +1087,9 @@ impl<I: PaneIo> PaneIo for Observed<'_, I> {
     fn title_rows(&mut self, snap: &Self::Snap) -> Vec<(String, String)> {
         self.inner.title_rows(snap)
     }
+    fn lost_labels(&mut self, snap: &Self::Snap) -> std::collections::BTreeSet<String> {
+        self.inner.lost_labels(snap)
+    }
 }
 
 /// A message to the reconciliation worker. Roster views and glyph data
@@ -1051,6 +1125,8 @@ pub(super) enum Report {
     /// This repo's labels with a live pane; `None` when the listing
     /// did not answer — unknown, which is not absent.
     Presence(Option<std::collections::BTreeSet<String>>),
+    /// A change in the labels whose bound process outlived its pane.
+    Lost(std::collections::BTreeSet<String>),
     Reopened(String, ReopenOutcome),
 }
 
@@ -1058,7 +1134,8 @@ pub(super) enum Report {
 /// on its own. A pane closed by hand or a process that exits changes
 /// nothing under the repo, so nothing else would ever ask
 /// (the-tui-knows-whether-a-pane-is-open). One ~25 ms listing per
-/// period per TUI.
+/// period per TUI, followed by a process check only for bound agents
+/// whose pane is missing.
 pub(super) const PRESENCE_PERIOD: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The worker's per-batch state: the reconciler AND the retitler,
@@ -1070,6 +1147,7 @@ pub(super) const PRESENCE_PERIOD: std::time::Duration = std::time::Duration::fro
 struct WorkerState {
     reconciler: PaneReconciler,
     panes: PaneStatus,
+    lost: std::collections::BTreeSet<String>,
     /// The last roster view handled — cached (pane, label, role) rows
     /// are only trustworthy while the roster TARGET is unchanged.
     last_roster: Option<RosterView>,
@@ -1080,6 +1158,7 @@ impl WorkerState {
         Self {
             reconciler: PaneReconciler::new(),
             panes: PaneStatus::new(),
+            lost: Default::default(),
             last_roster: None,
         }
     }
@@ -1140,6 +1219,14 @@ impl WorkerState {
             reports.push(Report::Presence(
                 listing.as_ref().map(|snap| io.live_labels(snap)),
             ));
+            let lost = listing
+                .as_ref()
+                .map(|snap| io.lost_labels(snap))
+                .unwrap_or_default();
+            if lost != self.lost {
+                self.lost = lost.clone();
+                reports.push(Report::Lost(lost));
+            }
         }
         reports
     }
@@ -1164,6 +1251,7 @@ pub(super) struct ReconcileWorker {
     /// The last presence report; `None` until one arrives or when the
     /// last listing did not answer.
     presence: Option<std::collections::BTreeSet<String>>,
+    lost: std::collections::BTreeSet<String>,
     /// Reopen answers not yet handed to the loop — the worker's, and
     /// those that needed no worker (there is none outside zellij).
     answered: Vec<(String, ReopenOutcome)>,
@@ -1172,8 +1260,8 @@ pub(super) struct ReconcileWorker {
 impl ReconcileWorker {
     /// Spawns the worker — a no-op handle outside zellij (no thread,
     /// sends go nowhere). `wake` is called after a batch that produced
-    /// reopen outcomes, so the loop paints them without waiting for its
-    /// next event.
+    /// a report, so the loop paints changed presence or lost-process
+    /// marks without waiting for its next event.
     pub(super) fn spawn(repo: std::path::PathBuf, wake: impl Fn() + Send + 'static) -> Self {
         if !crate::cli::open_zellij::in_session() {
             return Self {
@@ -1182,6 +1270,7 @@ impl ReconcileWorker {
                 report_rx: None,
                 reach: ZellijReach::NotInSession,
                 presence: None,
+                lost: Default::default(),
                 answered: Vec::new(),
             };
         }
@@ -1234,6 +1323,7 @@ impl ReconcileWorker {
             report_rx: Some(report_rx),
             reach: ZellijReach::Unknown,
             presence: None,
+            lost: Default::default(),
             answered: Vec::new(),
         }
     }
@@ -1245,6 +1335,7 @@ impl ReconcileWorker {
                 match r {
                     Report::Reach(reach) => self.reach = reach,
                     Report::Presence(live) => self.presence = live,
+                    Report::Lost(lost) => self.lost = lost,
                     Report::Reopened(label, outcome) => self.answered.push((label, outcome)),
                 }
             }
@@ -1265,6 +1356,11 @@ impl ReconcileWorker {
     pub(super) fn presence(&mut self) -> Option<std::collections::BTreeSet<String>> {
         self.drain();
         self.presence.clone()
+    }
+
+    pub(super) fn lost(&mut self) -> std::collections::BTreeSet<String> {
+        self.drain();
+        self.lost.clone()
     }
 
     /// Ask the worker to list panes now. Non-blocking.
@@ -1369,6 +1465,32 @@ mod tests {
     use clank_core::plan_view::WaitingOn;
 
     #[test]
+    fn lost_requires_a_bound_running_session_without_a_pane() {
+        use std::collections::BTreeSet;
+        let bound = vec![
+            ("claude".to_string(), Tool::Claude, "c1".to_string()),
+            ("codex".to_string(), Tool::Codex, "x1".to_string()),
+            ("exited".to_string(), Tool::Codex, "x2".to_string()),
+        ];
+        let set = |items: &[&str]| {
+            items
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect::<BTreeSet<_>>()
+        };
+        assert_eq!(
+            lost_bound_labels(&bound, &set(&["codex"]), &set(&["c1", "x1"]), &set(&[])),
+            set(&["claude"]),
+            "a live process with no pane is lost; a shown or exited one is not",
+        );
+        assert_eq!(
+            lost_bound_labels(&bound, &set(&[]), &set(&[]), &set(&["c1"])),
+            set(&["claude"]),
+            "Claude's background session listing is also positive process evidence",
+        );
+    }
+
+    #[test]
     fn a_resumed_session_is_adopted_from_its_roster_pane() {
         let sid = "01a0dad2-9c8b-7c00-90a7-93e18892593b";
         let ps = format!(
@@ -1378,6 +1500,10 @@ mod tests {
         let panes = vec![(16u32, "codex".to_string()), (3, "ruthless".to_string())];
         assert_eq!(bindings_to_adopt(&ps, &panes), vec![(16, "codex", sid)]);
         assert!(running_sessions("8528 codex resume not-an-id ZELLIJ_PANE_ID=16").is_empty());
+        assert_eq!(
+            session_token_on("opencode --session ses_0af1b2c3d4e5f607"),
+            Some("ses_0af1b2c3d4e5f607"),
+        );
     }
 
     // ── zellij-is-the-workspace: the tab indicator, fake-backed ──
@@ -1449,6 +1575,7 @@ mod tests {
             report_rx: None,
             reach: ZellijReach::NotInSession,
             presence: None,
+            lost: Default::default(),
             answered: Vec::new(),
         };
         assert_eq!(w.reach(), ZellijReach::NotInSession);
@@ -1466,6 +1593,7 @@ mod tests {
             report_rx: Some(rx),
             reach: ZellijReach::Connected,
             presence: None,
+            lost: Default::default(),
             answered: Vec::new(),
         };
         // Nothing reported yet: the last value stands, and this must
@@ -1682,6 +1810,7 @@ mod tests {
         /// Labels whose panes are all EXITED: listed by `pairs`, absent
         /// from `live_labels`.
         dead: std::collections::BTreeSet<String>,
+        lost: std::collections::BTreeSet<String>,
         /// Scripted retitler rows per listing; default derives them from
         /// the snapshot's pairs as `terminal_<label>`.
         title_rows: std::collections::VecDeque<Vec<(String, String)>>,
@@ -1720,6 +1849,7 @@ mod tests {
                 focus_captures: 0,
                 add_results: std::collections::VecDeque::new(),
                 dead: std::collections::BTreeSet::new(),
+                lost: std::collections::BTreeSet::new(),
                 title_rows: std::collections::VecDeque::new(),
                 placed_results: std::collections::VecDeque::new(),
                 verify_placed: std::collections::VecDeque::new(),
@@ -1815,6 +1945,9 @@ mod tests {
             snap.iter()
                 .map(|(l, _)| (format!("terminal_{l}"), l.clone()))
                 .collect()
+        }
+        fn lost_labels(&mut self, _snap: &Self::Snap) -> std::collections::BTreeSet<String> {
+            self.lost.clone()
         }
     }
 
@@ -2835,6 +2968,25 @@ mod tests {
     }
 
     #[test]
+    fn a_probe_reports_lost_processes_without_changing_panes() {
+        let mut state = WorkerState::new();
+        let mut io = FakeIo::new(vec![Some(Vec::new()), Some(Vec::new())]);
+        io.lost.insert("codex".to_string());
+        let batch = || WorkerBatch {
+            probe: true,
+            ..Default::default()
+        };
+        let first = state.handle(batch(), &mut io, |_, _| {});
+        assert!(first.contains(&Report::Lost(["codex".to_string()].into())));
+        assert!(io.log.is_empty(), "a lost mark has no pane effects");
+
+        io.lost.clear();
+        let second = state.handle(batch(), &mut io, |_, _| {});
+        assert!(second.contains(&Report::Lost(Default::default())));
+        assert!(io.log.is_empty(), "clearing the mark has no pane effects");
+    }
+
+    #[test]
     fn a_hand_close_shows_as_missing_and_offers_reopen_with_nothing_else_moving() {
         // Two probes, no roster or refresh between them, the live set
         // shrinks: the mark goes ▶ → ? and the page GAINS its reopen
@@ -2954,6 +3106,7 @@ mod tests {
             report_rx: None,
             reach: ZellijReach::NotInSession,
             presence: None,
+            lost: Default::default(),
             answered: Vec::new(),
         };
         w.reopen("r1");

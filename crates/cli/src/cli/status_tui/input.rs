@@ -1982,6 +1982,9 @@ pub(super) struct PanelView<'a> {
     /// This repo's labels with a live pane, as the worker last listed
     /// them; `None` until a listing answers, or outside zellij.
     pub(super) presence: Option<std::collections::BTreeSet<String>>,
+    /// Bound sessions whose process is still running after their pane
+    /// disappeared. Read-only worker observation for the agent mark.
+    pub(super) lost: std::collections::BTreeSet<String>,
 }
 
 impl<'a> PanelView<'a> {
@@ -2010,6 +2013,7 @@ impl<'a> PanelView<'a> {
             remote_detail: None,
             remote_page: None,
             presence: None,
+            lost: Default::default(),
         }
     }
 }

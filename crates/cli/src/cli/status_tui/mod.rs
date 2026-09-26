@@ -2862,6 +2862,7 @@ pub(crate) async fn run_tui(
             remote_detail: remote_detail.as_deref(),
             remote_page: remote_page.as_ref(),
             presence,
+            lost: reconcile_worker.lost(),
         };
         // An overlay mounted here is drawn by the branch at the TOP of
         // the loop, which this pass is already past: without going

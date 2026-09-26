@@ -92,7 +92,7 @@ pub(crate) fn find(
 }
 
 /// `claude agents --json` needs no TTY. Any failure is an empty listing.
-fn claude_agents_listing(program: String) -> Vec<ClaudeSession> {
+pub(crate) fn claude_agents_listing(program: String) -> Vec<ClaudeSession> {
     std::process::Command::new(program)
         .args(["agents", "--json"])
         .stdin(std::process::Stdio::null())

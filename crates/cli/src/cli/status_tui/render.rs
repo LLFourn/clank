@@ -31,9 +31,9 @@ pub(super) fn tier_label(role: crate::cli::teams_config::RosterRole) -> &'static
 
 /// The agent's mark in a FIXED [`MARK_FIELD`]-wide field — `▶`
 /// (playing, green) when auto runs the agent's loop, `⏸` (paused,
-/// dim) when parked, and `?` (dim) when the agent has no live pane:
-/// an agent that is not open is not playing, whatever its auto-mode
-/// says (the-tui-knows-whether-a-pane-is-open). Padding the glyph
+/// dim) when parked, and `?` (dim) when the agent has no live pane.
+/// [`agent_mark`] replaces `?` with `!` only for a bound process that
+/// outlived its pane. Padding the glyph
 /// into a fixed field (not relying on the glyphs happening to share
 /// a width) is what keeps the name column from jittering between
 /// rows.
@@ -46,6 +46,16 @@ pub(super) fn auto_mark(mode: clank_core::vocab::AutoMode, presence: Presence) -
     };
     let pad = MARK_FIELD.saturating_sub(display_width(glyph));
     Span(style, format!("{glyph}{}", " ".repeat(pad)))
+}
+
+fn agent_mark(mode: clank_core::vocab::AutoMode, presence: Presence, lost: bool) -> Span {
+    if lost && presence == Presence::Missing {
+        let glyph = "!";
+        let pad = MARK_FIELD.saturating_sub(display_width(glyph));
+        Span(Style::Color("33"), format!("{glyph}{}", " ".repeat(pad)))
+    } else {
+        auto_mark(mode, presence)
+    }
 }
 
 /// The `dirty` gauge: `+12` green, `−3` red (GitHub convention),
@@ -648,7 +658,11 @@ pub(super) fn scrollable_header(
         };
         for (i, a) in snap.agents.iter().enumerate() {
             let mut spans = vec![
-                auto_mark(a.auto_mode, view.presence_of(&a.label)),
+                agent_mark(
+                    a.auto_mode,
+                    view.presence_of(&a.label),
+                    view.lost.contains(&a.label),
+                ),
                 plain(format!(" {}", a.label)),
                 dim(format!("  {}", tier_label(a.role))),
             ];
@@ -4983,6 +4997,7 @@ mod tests {
                             remote_detail: None,
                             remote_page: None,
                             presence: None,
+                            lost: Default::default(),
                             lift,
                         };
                         let header_len = scrollable_header(s, rows, 60, 0, &view).len();
@@ -5028,6 +5043,7 @@ mod tests {
             remote_detail: None,
             remote_page: None,
             presence: None,
+            lost: Default::default(),
             lift,
         }
     }
@@ -5248,6 +5264,7 @@ mod tests {
             remote_detail: None,
             remote_page: None,
             presence: None,
+            lost: Default::default(),
         };
         let rule_of = |offset: usize| {
             let out = render_at(&s, 12, 60, offset, 0, &view).0;
@@ -6688,6 +6705,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_bound_running_agent_without_a_pane_has_the_lost_mark() {
+        let s = two_agent_snap();
+        let label = s.agents[0].label.clone();
+        let mut view = PanelView::just(Mode::AgentPanel { sel: 0 });
+        view.presence = Some(Default::default());
+        view.lost.insert(label.clone());
+        let row = |view: &PanelView<'_>| {
+            render_at(&s, 40, 80, 0, 0, view)
+                .0
+                .iter()
+                .map(|line| visible(line))
+                .find(|line| line.contains(&format!(" {label}")))
+                .expect("agent row")
+        };
+        assert!(row(&view).starts_with('!'), "the lost process is marked");
+        view.presence = Some([label.clone()].into_iter().collect());
+        assert!(
+            !row(&view).starts_with('!'),
+            "a visible pane takes precedence over stale loss evidence"
+        );
+        view.presence = Some(Default::default());
+        view.lost.clear();
+        assert!(
+            row(&view).starts_with('?'),
+            "an exited process has no lost mark"
+        );
+    }
+
     /// The reopen row leaves when the pane comes back; a cursor that was
     /// on it lands on a real row, not past the end.
     #[test]
@@ -6818,6 +6864,7 @@ mod tests {
                 remote_detail: None,
                 remote_page: None,
                 presence: None,
+                lost: Default::default(),
             },
         )
         .0;
@@ -6870,6 +6917,7 @@ mod tests {
             remote_detail: None,
             remote_page: None,
             presence: None,
+            lost: Default::default(),
         };
 
         // Tiny pane: never more lines than rows, and no element spans
@@ -6977,6 +7025,7 @@ mod tests {
                 remote_detail: None,
                 remote_page: None,
                 presence: None,
+                lost: Default::default(),
             },
         )
         .0
@@ -7386,6 +7435,7 @@ mod tests {
             remote_detail: None,
             remote_page: None,
             presence: None,
+            lost: Default::default(),
         };
         let lines = render_at(&s, 40, 80, 0, 0, &view).0;
         assert!(
