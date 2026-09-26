@@ -108,7 +108,10 @@
   .state .modes { flex: 0 0 auto; display: flex; gap: 11px; font-size: 12px; }
   .state .modes button { color: var(--muted); padding: 2px 0; border-bottom: 2px solid transparent; }
   .state .modes button.on { color: var(--ink); border-bottom-color: var(--ink); }
-  .state .modes button:disabled { opacity: 0.4; cursor: default; }
+  .state .modes button:disabled, .state .modes button[aria-disabled="true"] { opacity: 0.4; }
+  .state .modes button[aria-disabled="true"] { cursor: help; }
+  .chat-reason { position: absolute; top: 100%; right: 8px; z-index: 5; width: min(330px, calc(100vw - 16px)); padding: 12px; background: var(--bezel); border: 1px solid var(--edge); border-radius: 8px; box-shadow: 0 18px 44px rgba(0, 0, 0, .5); font-size: 13px; }
+  .chat-reason button { display: block; margin: 9px 0 0 auto; color: var(--hue-deep); text-decoration: underline; }
   @keyframes breathe { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
   @media (prefers-reduced-motion: reduce) { .dot, .away { animation: none; } }
 
@@ -323,10 +326,11 @@
     <div class="state">
       <span class="doing" id="doing"></span>
       <span class="modes">
-        <button id="mode-transcript" data-mode="transcript">transcript</button>
+        <button id="mode-transcript" data-mode="transcript" aria-controls="chat-reason" aria-expanded="false">Chat</button>
         <button id="mode-terminal" data-mode="terminal">terminal</button>
       </span>
     </div>
+    <div class="chat-reason" id="chat-reason" role="dialog" aria-label="Why Chat is unavailable" hidden><span id="chat-reason-text"></span><button id="chat-reason-close" type="button">Close</button></div>
     <div class="picker" id="picker" role="listbox" aria-label="Choose an agent" hidden></div>
   </header>
   <div class="strip" id="strip" hidden></div>
@@ -437,6 +441,7 @@
   const projectEl = $('project');
   const pickerEl = $('picker'), stripEl = $('strip');
   const modeBtns = { transcript: $('mode-transcript'), terminal: $('mode-terminal') };
+  const chatReasonEl = $('chat-reason'), chatReasonText = $('chat-reason-text');
   const form = $('say'), input = $('text'), send = $('send'), sentEl = $('sent'), stopBtn = $('stop');
   /*__CLANK_COMPOSER__*/
   // The box's height is the script's to set: a textarea has none of
@@ -593,7 +598,7 @@
         input.value = '';
         resize();
       }
-      if (entry.state === 'failed' && shown === label) sentEl.textContent = 'Recorded in transcript';
+      if (entry.state === 'failed' && shown === label) sentEl.textContent = 'Recorded in Chat history';
       outbox.splice(i, 1); changed = true;
       // A later identical submission must not claim this same turn
       // on the next replay, after the first entry has been removed.
@@ -791,6 +796,27 @@
   }
 
   function hasTranscript(label) { return !!roster().find((a) => a.label === label)?.transcript; }
+  function chatReason(label) {
+    if (!label) return heard ? 'No agent is selected.' : 'Waiting for this session to report its agents.';
+    const a = roster().find((row) => row.label === label);
+    if (!a) return `${label} has left the roster.`;
+    return a.chat_unavailable_reason || (a.session
+      ? 'Chat history is not available yet.' : 'This agent has no bound session.');
+  }
+  function closeChatReason() {
+    chatReasonEl.hidden = true;
+    modeBtns.transcript.setAttribute('aria-expanded', 'false');
+  }
+  function openChatReason() {
+    chatReasonText.textContent = chatReason(shown);
+    chatReasonEl.hidden = false;
+    modeBtns.transcript.setAttribute('aria-expanded', 'true');
+  }
+  $('chat-reason-close').addEventListener('click', () => { closeChatReason(); modeBtns.transcript.focus(); });
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !chatReasonEl.hidden) closeChatReason(); });
+  document.addEventListener('click', (e) => {
+    if (!chatReasonEl.hidden && !chatReasonEl.contains(e.target) && e.target !== modeBtns.transcript) closeChatReason();
+  });
   function modeFor(label) {
     const wanted = modes[label] || (hasTranscript(label) ? 'transcript' : 'terminal');
     return wanted === 'transcript' && !hasTranscript(label) ? 'terminal' : wanted;
@@ -830,11 +856,14 @@
     stopBtn.hidden = !p || p.closed || stopping(shown);
   }
   function show(label) {
+    if (shown !== label || hasTranscript(label)) closeChatReason();
     shown = label;
+    if (!chatReasonEl.hidden) chatReasonText.textContent = chatReason(label);
     const mode = label ? modeFor(label) : null;
     for (const [m, btn] of Object.entries(modeBtns)) {
       btn.classList.toggle('on', m === mode);
-      btn.disabled = !label || (m === 'transcript' && !hasTranscript(label));
+      btn.disabled = m !== 'transcript' && !label;
+      if (m === 'transcript') btn.setAttribute('aria-disabled', String(!label || !hasTranscript(label)));
     }
     for (const [l, v] of views) {
       v.transcript.classList.toggle('on', l === label && mode === 'transcript');
@@ -846,7 +875,12 @@
     if (label) { paintTranscript(label); if (p && !p.closed) views.get(label).term.scrollToBottom(); }
     paintHeader();
   }
-  for (const [m, btn] of Object.entries(modeBtns)) btn.addEventListener('click', () => { if (!shown) return; modes[shown] = m; remember('clank.modes', modes); show(shown); });
+  for (const [m, btn] of Object.entries(modeBtns)) btn.addEventListener('click', () => {
+    if (m === 'transcript' && !hasTranscript(shown)) { openChatReason(); return; }
+    if (!shown) return;
+    closeChatReason();
+    modes[shown] = m; remember('clank.modes', modes); show(shown);
+  });
 
   // Turns are rendered ONCE and updated in place, keyed by id: a
   // repaint that rebuilt them would close every <details> the reader
@@ -958,7 +992,7 @@
       ? `Not sent: ${entry.reason || 'delivery failed'}`
       : entry.state === 'sending' ? 'Sending…'
       : entry.state === 'uncertain' ? 'Delivery unconfirmed after refresh'
-      : 'Waiting for transcript…';
+      : 'Waiting for Chat history…';
     el.querySelector('.retry').hidden = entry.state !== 'failed';
     el.querySelector('.dismiss').hidden = entry.state === 'sending';
     return el.nextElementSibling;
@@ -1491,7 +1525,7 @@
       if (recorded) {
         // A late transport error cannot undo a turn the transcript
         // already proves the agent received.
-        sentEl.textContent = 'Recorded in transcript';
+        sentEl.textContent = 'Recorded in Chat history';
       } else {
         if (outgoing && outbox.includes(outgoing)) {
           outgoing.state = 'failed';

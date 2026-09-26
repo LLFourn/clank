@@ -767,7 +767,7 @@ mod grok {
 /// Where a bound session's transcript is, or `None` when there is
 /// none to read. A recorded path (Claude's SessionStart says it)
 /// wins; Claude without one falls back to the derivation the harness
-/// uses; codex is found by its session id under its sessions dir;
+/// uses; codex without one is found by its session id under its sessions dir;
 /// Grok's path is derived from the working directory and session id.
 pub(crate) fn transcript_path(
     tool: Tool,
@@ -783,6 +783,9 @@ pub(crate) fn transcript_path(
                 .unwrap_or_else(|| claude_derived(session_id, cwd, home)),
         ),
         Tool::Codex => {
+            if let Some(path) = recorded {
+                return Some(path.to_path_buf());
+            }
             let mut found = Vec::new();
             codex_candidates(
                 &home.join(".codex").join("sessions"),
@@ -1317,7 +1320,7 @@ mod tests {
     }
 
     #[test]
-    fn the_path_is_recorded_else_derived_for_claude_and_found_by_id_for_codex() {
+    fn the_path_is_recorded_else_derived_or_found_by_id() {
         let home = tempfile::tempdir().unwrap();
         let cwd = Path::new("/Users/lloyd/src/clank");
         assert_eq!(
@@ -1341,6 +1344,16 @@ mod tests {
         assert_eq!(
             transcript_path(Tool::Codex, "id1", None, cwd, home.path()),
             None
+        );
+        assert_eq!(
+            transcript_path(
+                Tool::Codex,
+                "id1",
+                Some(Path::new("/recorded/codex.jsonl")),
+                cwd,
+                home.path(),
+            ),
+            Some(PathBuf::from("/recorded/codex.jsonl"))
         );
         let day = home.path().join(".codex/sessions/2026/08/27");
         std::fs::create_dir_all(&day).unwrap();

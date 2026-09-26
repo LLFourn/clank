@@ -4,6 +4,63 @@ const ok = (name, cond, detail = '') => out.push(`${cond ? 'PASS' : 'FAIL'}  ${n
 
 (async () => {
   try {
+  // ---- Chat explains unavailable states and opens a Codex conversation
+  {
+    const { browser, page, errors } = await open();
+    ok('the mode is named Chat', await page.textContent('#mode-transcript') === 'Chat');
+    await page.click('#mode-transcript');
+    ok('before status, Chat explains why it cannot open',
+       await page.isVisible('#chat-reason')
+       && (await page.textContent('#chat-reason')).includes('Waiting for this session'));
+    await page.click('#chat-reason-close');
+    await page.evaluate((d) => window.__send('status', d), facts([]));
+    await page.click('#mode-transcript');
+    ok('without an agent, Chat explains why it cannot open',
+       await page.isVisible('#chat-reason')
+       && (await page.textContent('#chat-reason')).includes('No agent is selected'));
+    await page.click('#chat-reason-close');
+
+    await page.evaluate((d) => window.__send('status', d), facts([
+      { ...agent('codex', 'master', null, null, true), tool: 'codex', session: 's1' },
+    ]));
+    await page.evaluate((d) => window.__send('panes', d), panes(['codex']));
+    await page.evaluate((d) => window.__send('turns', d), turns('codex', [
+      text('c1', 'person', 'Codex fixture question', 'Codex fixture question'),
+      text('c2', 'agent', 'Codex fixture answer', 'Codex fixture answer'),
+    ]));
+    ok('Codex Chat opens when history exists', await page.isVisible('.view.transcript.on')
+       && (await page.textContent('.view.transcript.on')).includes('Codex fixture answer'));
+
+    const reasons = [
+      'This agent has no session binding.',
+      'This agent has no bound session.',
+      "This agent's tool does not provide Chat history.",
+      'Clank has no home directory to find Chat history.',
+      'No Chat history file was found for this bound session.',
+      "Clank could not read this agent's session binding.",
+      "This agent's label is invalid.",
+    ];
+    for (const reason of reasons) {
+      await page.evaluate((d) => window.__send('status', d), facts([
+        { ...agent('codex', 'master'), tool: 'codex', session: 's1', chat_unavailable_reason: reason },
+      ]));
+      ok('unavailable Chat is clickable', !(await page.isDisabled('#mode-transcript'))
+         && await page.getAttribute('#mode-transcript', 'aria-disabled') === 'true');
+      await page.click('#mode-transcript');
+      ok(`Chat explains ${reason}`, await page.isVisible('#chat-reason')
+         && await page.textContent('#chat-reason-text') === reason);
+      await page.click('#chat-reason-close');
+    }
+    await page.fill('#text', 'hold Codex');
+    await page.evaluate((d) => window.__send('status', d), facts([]));
+    await page.click('#mode-transcript');
+    ok('a departed agent gets its own Chat reason',
+       await page.isVisible('#chat-reason')
+       && (await page.textContent('#chat-reason')).includes('codex has left the roster'));
+    ok('Chat availability has no script errors', errors.length === 0, errors.join('; '));
+    await browser.close();
+  }
+
   // ---- P1: the draft's recipient survives the roster losing its agent
   {
     const { browser, page } = await open();
@@ -50,7 +107,7 @@ const ok = (name, cond, detail = '') => out.push(`${cond ? 'PASS' : 'FAIL'}  ${n
     await page.evaluate(() => window.__sayReply({ ok: true, status: 204, text: async () => '' }));
     await page.waitForTimeout(40);
     ok('a send response still waits for transcript',
-       (await page.textContent('.turn.outgoing')).includes('Waiting for transcript'));
+       (await page.textContent('.turn.outgoing')).includes('Waiting for Chat history'));
     await page.evaluate((d) => window.__send('status', d), facts([
       { ...agent('grok', 'master', null, null, true), session: 's1', tool: 'grok' },
       agent('codex', 'commit', { verb: 'reviewing', object: 'work', since: Math.floor(Date.now()/1000) - 10 }),
@@ -114,7 +171,7 @@ const ok = (name, cond, detail = '') => out.push(`${cond ? 'PASS' : 'FAIL'}  ${n
     await page.click('#send');
     await page.waitForTimeout(40);
     ok('retry reuses the failed row', await page.locator('.turn.outgoing').count() === 1
-       && (await page.textContent('.turn.outgoing')).includes('Waiting for transcript'));
+       && (await page.textContent('.turn.outgoing')).includes('Waiting for Chat history'));
     await page.evaluate((d) => window.__send('turn', d), {
       agent: 'grok', session: 's1', generation: 1,
       turn: text('retried', 'person', 'retry me', 'retry me'),
@@ -133,7 +190,7 @@ const ok = (name, cond, detail = '') => out.push(`${cond ? 'PASS' : 'FAIL'}  ${n
     });
     ok('transcript proof clears a late send failure', await page.locator('.turn.outgoing').count() === 0
        && await page.inputValue('#text') === ''
-       && (await page.textContent('#sent')).includes('Recorded in transcript'));
+       && (await page.textContent('#sent')).includes('Recorded in Chat history'));
     await page.evaluate(() => {
       window.fetch = async () => ({ ok: true, status: 204, text: async () => '' });
     });

@@ -249,17 +249,26 @@ impl Panes for Zellij {
     }
 }
 
+#[derive(Default)]
+pub(crate) struct ChatStatus {
+    following: std::collections::BTreeSet<String>,
+    unavailable: std::collections::HashMap<String, String>,
+}
+
 /// The status frame: the TUI's own derivation of what the page
-/// shows, and the snapshot beneath it. `with` is the set whose
-/// transcripts are being tailed — empty for the seed, which is
-/// published before anything is tailed.
+/// shows, and the snapshot beneath it. The seed has no tails yet;
+/// `observe` replaces it with the actual Chat availability.
 pub(crate) fn status_payload(
     _repo: &Path,
     snap: &crate::cli::status::StatusSnapshot,
-    with: &std::collections::BTreeSet<String>,
+    chat: &ChatStatus,
 ) -> serde_json::Value {
+    let mut facts = crate::cli::status_tui::web_facts(snap, &chat.following);
+    for agent in &mut facts.agents {
+        agent.chat_unavailable_reason = chat.unavailable.get(&agent.label).cloned();
+    }
     serde_json::json!({
-        "facts": crate::cli::status_tui::web_facts(snap, with),
+        "facts": facts,
         "snapshot": snap.to_json(),
     })
 }
@@ -493,7 +502,7 @@ impl Instance {
     /// transcript tails are retargeted to the roster's bindings, and
     /// the site is rebuilt in the background.
     pub(crate) fn observe(&self, snap: &crate::cli::status::StatusSnapshot) {
-        let with = {
+        let chat = {
             let mut tails = self.tails.lock().unwrap_or_else(|e| e.into_inner());
             tails.reap();
             let Tails {
@@ -511,7 +520,7 @@ impl Instance {
                 next_owner,
             )
         };
-        self.feed.status(status_payload(&self.repo, snap, &with));
+        self.feed.status(status_payload(&self.repo, snap, &chat));
         if let Some(b) = &self.builder {
             b.request();
         }
@@ -729,6 +738,27 @@ impl Drop for TailHandle {
 /// bound session's file, for harnesses that keep one.
 type Wanted = std::collections::HashMap<String, (String, clank_core::vocab::Tool, PathBuf)>;
 
+fn chat_source(
+    repo: &Path,
+    home: Option<&Path>,
+    name: &str,
+) -> Result<(String, clank_core::vocab::Tool, PathBuf), &'static str> {
+    let label =
+        crate::lifecycle::AgentLabel::parse(name).map_err(|_| "This agent's label is invalid.")?;
+    let cfg = crate::agent_store::load_agent_config(repo, &label)
+        .map_err(|_| "Clank could not read this agent's session binding.")?
+        .ok_or("This agent has no session binding.")?;
+    let session = cfg.session.ok_or("This agent has no bound session.")?;
+    if !transcript::has_adapter(session.tool) {
+        return Err("This agent's tool does not provide Chat history.");
+    }
+    let home = home.ok_or("Clank has no home directory to find Chat history.")?;
+    let recorded = session.transcript.as_deref().map(Path::new);
+    let path = transcript::transcript_path(session.tool, session.id.as_str(), recorded, repo, home)
+        .ok_or("No Chat history file was found for this bound session.")?;
+    Ok((session.id.as_str().to_string(), session.tool, path))
+}
+
 /// Start a tail for every bound agent whose harness keeps a
 /// transcript, stop the tails of agents rebound elsewhere, moved to
 /// another file, or gone, and say which agents have one. A new
@@ -744,35 +774,22 @@ fn reconcile_tails(
     tails: &mut std::collections::HashMap<String, TailHandle>,
     retired: &mut Vec<TailHandle>,
     next_owner: &mut u64,
-) -> std::collections::BTreeSet<String> {
+) -> ChatStatus {
     let mut wanted = Wanted::default();
-    if let Some(home) = home {
-        for a in &snap.agents {
-            let Ok(label) = crate::lifecycle::AgentLabel::parse(&a.label) else {
-                continue;
-            };
-            let Ok(Some(cfg)) = crate::agent_store::load_agent_config(repo, &label) else {
-                continue;
-            };
-            let Some(session) = cfg.session else {
-                continue;
-            };
-            if !transcript::has_adapter(session.tool) {
-                continue;
+    let mut chat = ChatStatus::default();
+    for a in &snap.agents {
+        match chat_source(repo, home, &a.label) {
+            Ok(source) => {
+                wanted.insert(a.label.clone(), source);
             }
-            let recorded = session.transcript.as_deref().map(Path::new);
-            if let Some(path) =
-                transcript::transcript_path(session.tool, session.id.as_str(), recorded, repo, home)
-            {
-                wanted.insert(
-                    a.label.clone(),
-                    (session.id.as_str().to_string(), session.tool, path),
-                );
+            Err(reason) => {
+                chat.unavailable.insert(a.label.clone(), reason.to_string());
             }
         }
     }
     let roster = snap.agents.iter().map(|a| a.label.clone()).collect();
-    retarget_tails(&wanted, &roster, feed, tails, retired, next_owner)
+    chat.following = retarget_tails(&wanted, &roster, feed, tails, retired, next_owner);
+    chat
 }
 
 /// The window an agent shows is decided HERE, synchronously, and the
@@ -2589,6 +2606,111 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn codex_chat_uses_recorded_history_and_unavailable_reasons_are_specific() {
+        use crate::cli::status_tui::fixtures::{agent_row, bound, snap};
+        use clank_core::agent_config::{AgentConfig, Session};
+        use clank_core::ids::{AgentLabel, SessionId};
+        use clank_core::vocab::{AutoMode, Tool};
+
+        let repo = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let label = AgentLabel::parse("codex").unwrap();
+        assert_eq!(
+            chat_source(repo.path(), Some(home.path()), "codex"),
+            Err("This agent has no session binding.")
+        );
+        crate::agent_store::save_agent_config(repo.path(), &label, &AgentConfig::default())
+            .unwrap();
+        assert_eq!(
+            chat_source(repo.path(), Some(home.path()), "codex"),
+            Err("This agent has no bound session.")
+        );
+
+        let mut cfg = AgentConfig {
+            session: Some(Session {
+                id: SessionId::parse("codex-fixture").unwrap(),
+                tool: Tool::OpenCode,
+                updated_at: "2026-09-26T00:00:00Z".into(),
+                transcript: None,
+            }),
+            ..Default::default()
+        };
+        crate::agent_store::save_agent_config(repo.path(), &label, &cfg).unwrap();
+        assert_eq!(
+            chat_source(repo.path(), Some(home.path()), "codex"),
+            Err("This agent's tool does not provide Chat history.")
+        );
+
+        cfg.session.as_mut().unwrap().tool = Tool::Codex;
+        crate::agent_store::save_agent_config(repo.path(), &label, &cfg).unwrap();
+        assert_eq!(
+            chat_source(repo.path(), None, "codex"),
+            Err("Clank has no home directory to find Chat history.")
+        );
+        assert_eq!(
+            chat_source(repo.path(), Some(home.path()), "codex"),
+            Err("No Chat history file was found for this bound session.")
+        );
+
+        let history = home.path().join("recorded-codex.jsonl");
+        std::fs::write(&history, include_str!("fixtures/codex.jsonl")).unwrap();
+        cfg.session.as_mut().unwrap().transcript = Some(history.to_string_lossy().to_string());
+        crate::agent_store::save_agent_config(repo.path(), &label, &cfg).unwrap();
+        let (session, tool, path) = chat_source(repo.path(), Some(home.path()), "codex").unwrap();
+        assert_eq!(
+            (session.as_str(), tool, path.as_path()),
+            ("codex-fixture", Tool::Codex, history.as_path())
+        );
+        let (_, lines) = transcript::Tail::open(&path, TAIL_WINDOW).unwrap();
+        assert!(window_turns(tool, &lines).iter().any(|turn|
+            matches!(&turn.body, transcript::Body::Text { text, .. } if text == "review commit 693d129")));
+
+        let mut s = snap(vec![], vec![]);
+        s.agents = vec![agent_row(
+            "codex",
+            crate::cli::teams_config::RosterRole::Master,
+            AutoMode::On,
+        )];
+        s.agents[0].session = Some(bound(Tool::Codex, "codex-fixture"));
+        let mut chat = ChatStatus::default();
+        chat.following.insert("codex".into());
+        let payload = status_payload(repo.path(), &s, &chat);
+        assert_eq!(payload["facts"]["agents"][0]["transcript"], true);
+        assert_eq!(
+            payload["facts"]["agents"][0]["chat_unavailable_reason"],
+            serde_json::Value::Null
+        );
+
+        cfg.session = None;
+        crate::agent_store::save_agent_config(repo.path(), &label, &cfg).unwrap();
+        let mut chat = ChatStatus::default();
+        chat.unavailable.insert(
+            "codex".into(),
+            chat_source(repo.path(), Some(home.path()), "codex")
+                .unwrap_err()
+                .into(),
+        );
+        let payload = status_payload(repo.path(), &s, &chat);
+        assert_eq!(
+            payload["facts"]["agents"][0]["chat_unavailable_reason"],
+            "This agent has no bound session."
+        );
+        assert_eq!(
+            chat_source(repo.path(), Some(home.path()), "a/b"),
+            Err("This agent's label is invalid.")
+        );
+        std::fs::write(
+            repo.path().join(".clank/agents/codex/config.json"),
+            "not json",
+        )
+        .unwrap();
+        assert_eq!(
+            chat_source(repo.path(), Some(home.path()), "codex"),
+            Err("Clank could not read this agent's session binding.")
+        );
+    }
 
     /// Moving a binding replaces the shown window at once, empty and
     /// scoped to the new session; clearing it (or moving it to a

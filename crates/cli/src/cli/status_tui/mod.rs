@@ -1914,6 +1914,9 @@ pub(crate) struct Position {
     /// Whether clank can show this agent's transcript, or only its
     /// terminal.
     pub(crate) transcript: bool,
+    /// Why Chat cannot open when there is no transcript to follow.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) chat_unavailable_reason: Option<String>,
 }
 
 /// One row of the ledger: the TUI's log row as data, in the TUI's
@@ -2061,6 +2064,7 @@ pub(crate) fn web_facts(
             owes: owed.remove(&a.label),
             last: last_act(snap, &a.label, a.role),
             transcript: with_transcript.contains(&a.label),
+            chat_unavailable_reason: None,
         })
         .collect();
 
