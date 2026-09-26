@@ -1906,6 +1906,8 @@ pub(crate) struct Position {
     pub(crate) label: String,
     /// The harness whose terminal control keys apply to this agent.
     pub(crate) tool: String,
+    /// The configured launch command shown on the agent detail page.
+    pub(crate) invocation: String,
     /// The bound session scopes messages waiting for transcript proof.
     pub(crate) session: Option<String>,
     pub(crate) role: String,
@@ -2059,6 +2061,7 @@ pub(crate) fn web_facts(
         .map(|a| Position {
             label: a.label.clone(),
             tool: a.tool.clone(),
+            invocation: a.invocation.clone(),
             session: a.session.as_ref().map(|s| s.id.as_str().to_string()),
             role: render::tier_label(a.role).to_string(),
             owes: owed.remove(&a.label),
@@ -5702,6 +5705,7 @@ pub(crate) mod tests {
             set(&[
                 "label",
                 "tool",
+                "invocation",
                 "session",
                 "role",
                 "owes",

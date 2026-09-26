@@ -1642,8 +1642,31 @@ pub fn remove_global_agent(home: &Path, label: &AgentLabel) -> anyhow::Result<()
 /// Remove an agent from THIS repo's roster. Errors if the label
 /// isn't on the roster.
 pub fn remove_repo_agent(repo: &Path, label: &AgentLabel) -> anyhow::Result<()> {
+    remove_repo_agent_with_policy(repo, label, true)
+}
+
+/// The TUI's remove action is offered to reviewers only. The web
+/// action uses this guard as well, so a crafted request cannot remove
+/// the master merely because the button is absent from its page.
+pub fn remove_repo_reviewer(repo: &Path, label: &AgentLabel) -> anyhow::Result<()> {
+    remove_repo_agent_with_policy(repo, label, false)
+}
+
+fn remove_repo_agent_with_policy(
+    repo: &Path,
+    label: &AgentLabel,
+    allow_master: bool,
+) -> anyhow::Result<()> {
     let mut repo_cfg = read_repo_config(repo)?;
     let before = repo_cfg.clone();
+    if !allow_master
+        && repo_cfg
+            .agents
+            .get(label)
+            .is_some_and(|agent| agent.role == RosterRole::Master)
+    {
+        anyhow::bail!("the master cannot be removed from the team; promote another agent first");
+    }
     if repo_cfg.agents.remove(label).is_none() {
         anyhow::bail!("agent `{}` is not on this repo's roster", label.as_str());
     }

@@ -259,6 +259,19 @@
   .ledger .queue .q .pri { flex: 0 0 auto; width: 3.4em; padding: 2px 4px; border: 1px solid var(--edge); border-radius: 3px; background: var(--base); color: var(--muted); font-family: var(--mono); font-size: 12px; text-align: right; }
   .ledger .queue .q button { flex: 0 0 auto; color: var(--muted); font-size: 12px; padding: 2px 4px; }
   .ledger .queue .q button.armed { color: var(--ink); font-weight: 700; }
+  .ledger .team { padding: 8px 14px; border-bottom: 1px solid var(--edge); }
+  .ledger .team summary { cursor: pointer; font-family: var(--plate); font-weight: 700; }
+  .ledger .team .member { border-top: 1px solid var(--edge); padding: 8px 0; }
+  .ledger .team .member summary span { color: var(--muted); font: 12px var(--mono); margin-left: 8px; }
+  .ledger .team .member pre { white-space: pre-wrap; overflow-wrap: anywhere; font: 12px var(--mono); margin: 7px 0; }
+  .ledger .team .member .binding { color: var(--muted); font: 12px var(--mono); }
+  .ledger .team .controls { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; margin: 8px 0; }
+  .ledger .team input, .ledger .team select { min-width: 0; padding: 5px; border: 1px solid var(--edge); border-radius: 4px; background: var(--base); color: var(--ink); font: 12px var(--mono); }
+  .ledger .team input { flex: 1 1 110px; }
+  .ledger .team button { padding: 5px; color: var(--hue-deep); text-decoration: underline; font: 12px var(--mono); }
+  .ledger .team button.armed { color: var(--bad, #d05a4a); font-weight: 700; }
+  .ledger .team .why { color: var(--bad, #d05a4a); font: 12px var(--mono); overflow-wrap: anywhere; }
+  .ledger .team .why.ok { color: var(--muted); }
   .ledger .qwhy { color: var(--bad, #d05a4a); font-size: 12px; padding: 0 14px 8px; }
   .ledger .rows { padding: 6px 0; }
   .row { display: grid; grid-template-columns: 1fr auto; gap: 8px; padding: 2px 14px; white-space: nowrap; overflow: hidden; }
@@ -353,6 +366,22 @@
   <aside class="ledger" id="ledger">
     <div class="lhead"><span class="session" id="session"></span><button class="forget" id="forget">forget this device</button><button class="close" id="close">close</button></div>
     <div class="facts" id="facts"></div>
+    <details class="team" id="team">
+      <summary>Manage team</summary>
+      <div id="team-rows"></div>
+      <form id="team-add"><div class="controls">
+        <input id="team-add-name" aria-label="Agent name" placeholder="agent name" list="team-library" required>
+        <datalist id="team-library"></datalist>
+        <select id="team-add-tool" aria-label="Agent tool">
+          <option value="">from library</option><option value="claude">Claude</option><option value="codex">Codex</option><option value="grok">Grok</option><option value="opencode">OpenCode</option>
+        </select>
+        <select id="team-add-review" aria-label="Review tier">
+          <option value="commit">commit</option><option value="plan">plan</option><option value="final">final</option><option value="gate">gate</option><option value="standby">standby (no reviews)</option>
+        </select>
+        <button type="submit">Add agent</button>
+      </div></form>
+      <div class="why" id="team-why" role="status" aria-live="polite" hidden></div>
+    </details>
     <div class="queue" id="queue"></div>
     <div class="qwhy" id="qwhy" hidden></div>
     <div class="rows" id="rows"></div>
@@ -1252,6 +1281,120 @@
     askQueue({ do: 'priority', handle: input.closest('.q').dataset.handle, priority });
   });
 
+  // ---- the repo team ----
+  const reviewKinds = ['commit', 'plan', 'final', 'gate', 'standby'];
+  let teamDrawn = null, library = [], armedAgent = null;
+  function teamWhy(message) {
+    const box = $('team-why');
+    box.textContent = message || '';
+    box.classList.toggle('ok', !!message && message.startsWith('Saved.'));
+    box.hidden = !message;
+  }
+  function paintLibrary() {
+    const present = new Set(roster().map((a) => a.label));
+    $('team-library').innerHTML = library.filter((a) => !present.has(a.label))
+      .map((a) => `<option value="${esc(a.label)}" label="${esc(a.tool)}"></option>`).join('');
+  }
+  async function loadLibrary() {
+    try {
+      const r = await fetch('/agents/candidates');
+      if (!r.ok) throw new Error(await r.text());
+      library = await r.json();
+      paintLibrary();
+    } catch (err) { teamWhy(`Could not list library agents: ${err.message || String(err)}`); }
+  }
+  $('team').addEventListener('toggle', () => { if ($('team').open) loadLibrary(); });
+  function paintTeam(agents) {
+    const sig = JSON.stringify(agents.map((a) => [a.label, a.role, a.tool, a.invocation, a.session]));
+    if (sig === teamDrawn) return;
+    teamDrawn = sig;
+    const rows = $('team-rows');
+    const open = new Set([...rows.querySelectorAll('.member[open]')].map((el) => el.dataset.label));
+    const swapping = new Map([...rows.querySelectorAll('.member input.swap')]
+      .map((el) => [el.closest('.member').dataset.label, el.value]));
+    rows.innerHTML = agents.map((a) => {
+      const name = esc(a.label), master = a.role === 'master';
+      const tier = master ? '' : `<label>review tier <select data-do="review" aria-label="Review tier for ${name}">`
+        + reviewKinds.map((kind) => `<option value="${kind}"${a.role === kind ? ' selected' : ''}>${kind === 'standby' ? 'standby (no reviews)' : kind}</option>`).join('')
+        + '</select></label>';
+      return `<details class="member" data-label="${name}"><summary>${name}<span>${esc(a.role)} · ${esc(a.tool || '')}</span></summary>`
+        + `<pre>${esc(a.invocation || a.tool || '')}</pre>`
+        + `<div class="binding">${a.session ? `session ${esc(a.session)}` : 'unbound — the agent binds its own session'}</div>`
+        + `<div class="controls">${tier}${master ? '' : '<button type="button" data-do="promote">Promote to master</button>'}`
+        + `<input class="swap" list="team-library" aria-label="Replace ${name} with agent" placeholder="replacement agent">`
+        + `<button type="button" data-do="swap">Swap</button>`
+        + `${master ? '' : '<button type="button" data-do="remove">Remove</button>'}</div></details>`;
+    }).join('');
+    for (const row of rows.querySelectorAll('.member')) {
+      if (open.has(row.dataset.label)) row.open = true;
+      const value = swapping.get(row.dataset.label);
+      if (value) row.querySelector('input.swap').value = value;
+    }
+    paintLibrary();
+    armedAgent = null;
+  }
+  async function askAgent(ask) {
+    teamWhy('');
+    try {
+      const r = await fetch('/agents', {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(ask),
+      });
+      if (!r.ok) {
+        const body = await r.text();
+        let why = body;
+        try { why = JSON.parse(body).why || body; } catch (err) {}
+        throw new Error(why || 'the team refused that change');
+      }
+      teamWhy('Saved. The team will update shortly.');
+      return true;
+    } catch (err) {
+      teamWhy(err.message || String(err));
+      return false;
+    }
+  }
+  $('team-add').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const name = $('team-add-name').value.trim();
+    if (!name) return;
+    const ok = await askAgent({ do: 'add', label: name,
+      tool: $('team-add-tool').value || null, review: $('team-add-review').value });
+    if (ok) $('team-add-name').value = '';
+  });
+  $('team-rows').addEventListener('change', async (e) => {
+    const select = e.target.closest('select[data-do="review"]');
+    if (!select) return;
+    const label = select.closest('.member').dataset.label;
+    const ok = await askAgent({ do: 'review', label, review: select.value });
+    if (!ok) select.value = roster().find((a) => a.label === label)?.role || 'commit';
+  });
+  $('team-rows').addEventListener('click', (e) => {
+    const button = e.target.closest('button[data-do]');
+    if (!button) return;
+    const row = button.closest('.member'), label = row.dataset.label, action = button.dataset.do;
+    if (action !== 'remove' && armedAgent) {
+      const armed = $('team-rows').querySelector(`.member[data-label="${CSS.escape(armedAgent)}"] button[data-do="remove"]`);
+      if (armed) { armed.classList.remove('armed'); armed.textContent = 'Remove'; }
+      armedAgent = null;
+    }
+    if (action === 'remove') {
+      if (armedAgent !== label) {
+        if (armedAgent) {
+          const armed = $('team-rows').querySelector(`.member[data-label="${CSS.escape(armedAgent)}"] button[data-do="remove"]`);
+          if (armed) { armed.classList.remove('armed'); armed.textContent = 'Remove'; }
+        }
+        armedAgent = label;
+        button.classList.add('armed'); button.textContent = 'Remove?';
+        return;
+      }
+      armedAgent = null;
+    }
+    if (action === 'swap') {
+      const into = row.querySelector('input.swap').value.trim();
+      if (!into) { teamWhy('Choose a replacement agent first.'); return; }
+      askAgent({ do: 'swap', label, into });
+    } else askAgent({ do: action, label });
+  });
+
   // ---- the ledger ----
   function paintLedger() {
     if (!facts) return;
@@ -1262,6 +1405,7 @@
       L.dirty ? `<div class="line">dirty ${esc(L.dirty)}</div>` : '',
       (L.queue.length || L.stash) ? `<div class="line">${L.queue.length ? `${L.queue.length} queued` : ''}${L.queue.length && L.stash ? ', ' : ''}${L.stash ? `${L.stash} stashed` : ''}</div>` : '',
     ].join('');
+    paintTeam(facts.agents);
     paintQueue(L.queue);
     // A row's page is the clank html one, in a window of its own. The
     // builder writes a plan's name verbatim, spaces and all; the link

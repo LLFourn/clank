@@ -434,6 +434,7 @@ impl Instance {
             panes.session().to_string(),
             repo.clone(),
             site_dir(&repo),
+            home.clone(),
             cancelled.clone(),
             blocking.clone(),
             door_for_serve,
@@ -1194,6 +1195,7 @@ async fn serve(
     session: String,
     repo: PathBuf,
     site: PathBuf,
+    home: Option<PathBuf>,
     mut cancelled: tokio::sync::watch::Receiver<bool>,
     blocking: Arc<Blocking>,
     door: Arc<door::Door>,
@@ -1221,6 +1223,7 @@ async fn serve(
         blocking,
         page: Arc::from(page_for(&session)),
         pages: Pages { repo, site },
+        home,
         workers: Mutex::new(tokio::task::JoinSet::new()),
         cancelled: cancelled.clone(),
         door,
@@ -1336,6 +1339,7 @@ struct Ctx {
     blocking: Arc<Blocking>,
     page: Arc<str>,
     pages: Pages,
+    home: Option<PathBuf>,
     /// The accept loop's set: connections, and the SSE forwarders
     /// they start, so none is detached.
     workers: Mutex<tokio::task::JoinSet<()>>,
@@ -1669,6 +1673,9 @@ async fn route(req: hyper::Request<hyper::body::Incoming>, peer: IpAddr, ctx: &C
         ("POST", "/stop") => stop(req, ctx).await,
         ("POST", "/queue") if !same_origin(&req, ctx) => text(403, "cross-origin", "text/plain"),
         ("POST", "/queue") => queue_action(req, ctx).await,
+        ("GET", "/agents/candidates") => agent_candidates(ctx).await,
+        ("POST", "/agents") if !same_origin(&req, ctx) => text(403, "cross-origin", "text/plain"),
+        ("POST", "/agents") => agent_action(req, ctx).await,
         ("POST", "/upload") if !same_origin(&req, ctx) => text(403, "cross-origin", "text/plain"),
         ("POST", "/upload") => upload(req, ctx).await,
         ("GET", p) if p.starts_with("/html/") => site_page(&ctx.pages, &p["/html/".len()..]),
@@ -2304,6 +2311,128 @@ async fn queue_action(req: hyper::Request<hyper::body::Incoming>, ctx: &Ctx) -> 
     }
 }
 
+#[derive(serde::Deserialize)]
+#[serde(tag = "do", rename_all = "snake_case")]
+enum AgentAsk {
+    Add {
+        label: String,
+        tool: Option<clank_core::vocab::Tool>,
+        review: crate::cli::teams_config::ReviewKind,
+    },
+    Review {
+        label: String,
+        review: crate::cli::teams_config::ReviewKind,
+    },
+    Promote {
+        label: String,
+    },
+    Swap {
+        label: String,
+        into: String,
+    },
+    Remove {
+        label: String,
+    },
+}
+
+/// Repo-roster mutations go through the same cores as the TUI. None
+/// of these operations binds a session or starts a pane; the TUI's
+/// reconciler observes the config write and owns the resulting pane.
+fn perform_agent_action(repo: &Path, home: Option<&Path>, ask: AgentAsk) -> anyhow::Result<()> {
+    use crate::cli::agent;
+    use clank_core::ids::AgentLabel;
+    let parse = |raw: &str| {
+        AgentLabel::parse(raw).map_err(|e| anyhow::anyhow!("invalid agent label `{raw}`: {e}"))
+    };
+    match ask {
+        AgentAsk::Add {
+            label,
+            tool,
+            review,
+        } => {
+            let label = parse(&label)?;
+            let role = review.into();
+            match tool {
+                Some(tool) => agent::add_repo_roster_agent(
+                    repo,
+                    &label,
+                    crate::cli::teams_config::AgentDescription {
+                        tool,
+                        launch: None,
+                        initial_prompt: None,
+                    },
+                    role,
+                ),
+                None => agent::add_repo_roster_agent_by_name(repo, home, &label, role),
+            }
+        }
+        AgentAsk::Review { label, review } => agent::set_repo_review(repo, &parse(&label)?, review),
+        AgentAsk::Promote { label } => agent::set_repo_master(repo, &parse(&label)?),
+        AgentAsk::Swap { label, into } => {
+            agent::swap_repo_agent(repo, home, &parse(&label)?, &parse(&into)?)
+        }
+        AgentAsk::Remove { label } => agent::remove_repo_reviewer(repo, &parse(&label)?),
+    }
+}
+
+fn library_candidates(home: Option<&Path>) -> anyhow::Result<serde_json::Value> {
+    let home = home.ok_or_else(|| anyhow::anyhow!("no home directory for the agent library"))?;
+    let cfg = crate::cli::team::read_user_config(home)?;
+    Ok(serde_json::Value::Array(
+        cfg.agents
+            .into_iter()
+            .map(|(label, desc)| {
+                serde_json::json!({"label": label.as_str(), "tool": desc.tool.as_str()})
+            })
+            .collect(),
+    ))
+}
+
+async fn agent_candidates(ctx: &Ctx) -> Resp {
+    let home = ctx.home.clone();
+    let done = ctx
+        .blocking
+        .run(move || library_candidates(home.as_deref()))
+        .await;
+    match done {
+        Some(Ok(value)) => text(200, value.to_string(), "application/json"),
+        Some(Err(e)) => text(
+            409,
+            serde_json::json!({"why": format!("{e:#}")}).to_string(),
+            "application/json",
+        ),
+        None => text(500, "the agent library read panicked", "text/plain"),
+    }
+}
+
+async fn agent_action(req: hyper::Request<hyper::body::Incoming>, ctx: &Ctx) -> Resp {
+    let body = http_body_util::Limited::new(req.into_body(), 4 * 1024);
+    let Ok(bytes) = body.collect().await.map(|c| c.to_bytes()) else {
+        return text(413, "too long", "text/plain");
+    };
+    let Ok(ask) = serde_json::from_slice::<AgentAsk>(&bytes) else {
+        return text(400, "expected an agent action", "text/plain");
+    };
+    if *ctx.cancelled.borrow() {
+        return text(503, "the remote is off", "text/plain");
+    }
+    let repo = ctx.pages.repo.clone();
+    let home = ctx.home.clone();
+    let done = ctx
+        .blocking
+        .run(move || perform_agent_action(&repo, home.as_deref(), ask))
+        .await;
+    match done {
+        Some(Ok(())) => text(204, "", "text/plain"),
+        Some(Err(e)) => text(
+            409,
+            serde_json::json!({"why": format!("{e:#}")}).to_string(),
+            "application/json",
+        ),
+        None => text(500, "the agent action panicked", "text/plain"),
+    }
+}
+
 async fn say(req: hyper::Request<hyper::body::Incoming>, ctx: &Ctx) -> Resp {
     let body = http_body_util::Limited::new(req.into_body(), 64 * 1024);
     let Ok(bytes) = body.collect().await.map(|c| c.to_bytes()) else {
@@ -2861,6 +2990,7 @@ mod tests {
                     "clank-test".to_string(),
                     repo,
                     site,
+                    None,
                     cancelled,
                     Arc::new(Blocking::default()),
                     door,
@@ -2954,6 +3084,7 @@ mod tests {
                     "clank-test".to_string(),
                     repo,
                     site,
+                    None,
                     cancelled,
                     Arc::new(Blocking::default()),
                     door,
@@ -3460,6 +3591,7 @@ mod tests {
                     "clank-test".to_string(),
                     repo,
                     site,
+                    None,
                     cancelled,
                     Arc::new(Blocking::default()),
                     door,
@@ -4856,6 +4988,263 @@ mod tests {
         let _ = cancel.send(true);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn web_agent_actions_use_roster_cores_and_preserve_binding() {
+        use clank_core::agent_config::{AgentConfig, Session};
+        use clank_core::ids::{AgentLabel, SessionId};
+        use clank_core::vocab::Tool;
+
+        let (base, door, anon, cancel, site, repo) = door_only().await;
+        let cookie = door
+            .open_session("token")
+            .map(|t| format!("{}={t}", door::COOKIE))
+            .unwrap();
+        let add = serde_json::json!({"do":"add","label":"codex","tool":"codex","review":"commit"});
+        assert_eq!(
+            anon.post(format!("{base}/agents"))
+                .header("origin", &base)
+                .json(&add)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            401
+        );
+        assert_eq!(
+            anon.post(format!("{base}/agents"))
+                .header("cookie", &cookie)
+                .json(&add)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            403
+        );
+        let ask = |body: serde_json::Value| {
+            anon.post(format!("{base}/agents"))
+                .header("cookie", &cookie)
+                .header("origin", &base)
+                .json(&body)
+                .send()
+        };
+        assert_eq!(ask(add).await.unwrap().status(), 204);
+        assert_eq!(
+            ask(serde_json::json!({"do":"add","label":"grok","tool":"grok","review":"plan"}))
+                .await
+                .unwrap()
+                .status(),
+            204
+        );
+
+        let codex = AgentLabel::parse("codex").unwrap();
+        let bound = Session {
+            id: SessionId::parse("web-agent-session").unwrap(),
+            tool: Tool::Codex,
+            updated_at: "2026-09-26T00:00:00Z".into(),
+            transcript: None,
+        };
+        crate::agent_store::save_agent_config(
+            repo.path(),
+            &codex,
+            &AgentConfig {
+                session: Some(bound.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            ask(serde_json::json!({"do":"promote","label":"codex"}))
+                .await
+                .unwrap()
+                .status(),
+            204
+        );
+        assert_eq!(
+            ask(serde_json::json!({"do":"review","label":"grok","review":"gate"}))
+                .await
+                .unwrap()
+                .status(),
+            204
+        );
+        let cfg = crate::agent_store::load_repo_config(&repo.path().join(".clank/config.json"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            cfg.agents[&codex].role,
+            crate::cli::teams_config::RosterRole::Master
+        );
+        assert_eq!(
+            cfg.agents[&AgentLabel::parse("grok").unwrap()].role,
+            crate::cli::teams_config::RosterRole::Gate
+        );
+        for name in ["spare", "replacement"] {
+            crate::cli::agent::declare_global_agent(
+                site.path(),
+                &AgentLabel::parse(name).unwrap(),
+                crate::cli::teams_config::AgentDescription {
+                    tool: Tool::Grok,
+                    launch: None,
+                    initial_prompt: None,
+                },
+            )
+            .unwrap();
+        }
+        let candidates: serde_json::Value = anon
+            .get(format!("{base}/agents/candidates"))
+            .header("cookie", &cookie)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(
+            candidates
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["label"] == "replacement" && row["tool"] == "grok")
+        );
+        assert_eq!(
+            ask(serde_json::json!({"do":"add","label":"spare","tool":null,"review":"standby"}))
+                .await
+                .unwrap()
+                .status(),
+            204
+        );
+        assert_eq!(
+            ask(serde_json::json!({"do":"swap","label":"grok","into":"replacement"}))
+                .await
+                .unwrap()
+                .status(),
+            204
+        );
+        let cfg = crate::agent_store::load_repo_config(&repo.path().join(".clank/config.json"))
+            .unwrap()
+            .unwrap();
+        assert!(!cfg.agents.contains_key(&AgentLabel::parse("grok").unwrap()));
+        assert_eq!(
+            cfg.agents[&AgentLabel::parse("replacement").unwrap()].role,
+            crate::cli::teams_config::RosterRole::Gate
+        );
+        assert_eq!(
+            crate::agent_store::load_agent_config(repo.path(), &codex)
+                .unwrap()
+                .unwrap()
+                .session
+                .as_ref()
+                .unwrap()
+                .id,
+            bound.id
+        );
+
+        let refused = ask(serde_json::json!({"do":"remove","label":"codex"}))
+            .await
+            .unwrap();
+        assert_eq!(
+            refused.status(),
+            409,
+            "master removal is absent in the TUI too"
+        );
+        assert!(
+            refused
+                .text()
+                .await
+                .unwrap()
+                .contains("master cannot be removed")
+        );
+        assert_eq!(
+            ask(serde_json::json!({"do":"remove","label":"replacement"}))
+                .await
+                .unwrap()
+                .status(),
+            204
+        );
+        assert_eq!(
+            ask(serde_json::json!({"do":"remove","label":"spare"}))
+                .await
+                .unwrap()
+                .status(),
+            204
+        );
+        let cfg = crate::agent_store::load_repo_config(&repo.path().join(".clank/config.json"))
+            .unwrap()
+            .unwrap();
+        assert!(
+            !cfg.agents
+                .contains_key(&AgentLabel::parse("replacement").unwrap())
+        );
+        let _ = cancel.send(true);
+    }
+
+    #[test]
+    fn web_agent_library_add_and_swap_leave_sessions_to_the_agents() {
+        use clank_core::ids::AgentLabel;
+        use clank_core::vocab::Tool;
+        let repo = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        for name in ["r1", "r2"] {
+            crate::cli::agent::declare_global_agent(
+                home.path(),
+                &AgentLabel::parse(name).unwrap(),
+                crate::cli::teams_config::AgentDescription {
+                    tool: Tool::Codex,
+                    launch: None,
+                    initial_prompt: None,
+                },
+            )
+            .unwrap();
+        }
+        let candidates = library_candidates(Some(home.path())).unwrap();
+        assert_eq!(candidates.as_array().unwrap().len(), 2);
+        assert!(
+            candidates
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["label"] == "r2" && row["tool"] == "codex")
+        );
+        perform_agent_action(
+            repo.path(),
+            Some(home.path()),
+            AgentAsk::Add {
+                label: "r1".into(),
+                tool: None,
+                review: crate::cli::teams_config::ReviewKind::Commit,
+            },
+        )
+        .unwrap();
+        assert!(
+            crate::agent_store::load_agent_config(repo.path(), &AgentLabel::parse("r1").unwrap())
+                .unwrap()
+                .and_then(|cfg| cfg.session)
+                .is_none()
+        );
+        perform_agent_action(
+            repo.path(),
+            Some(home.path()),
+            AgentAsk::Swap {
+                label: "r1".into(),
+                into: "r2".into(),
+            },
+        )
+        .unwrap();
+        let cfg = crate::agent_store::load_repo_config(&repo.path().join(".clank/config.json"))
+            .unwrap()
+            .unwrap();
+        assert!(!cfg.agents.contains_key(&AgentLabel::parse("r1").unwrap()));
+        assert_eq!(
+            cfg.agents[&AgentLabel::parse("r2").unwrap()].role,
+            crate::cli::teams_config::RosterRole::Commit
+        );
+        assert!(
+            crate::agent_store::load_agent_config(repo.path(), &AgentLabel::parse("r2").unwrap())
+                .unwrap()
+                .and_then(|cfg| cfg.session)
+                .is_none()
+        );
+    }
+
     /// A promote from the phone is the pane's promote: the body it
     /// named becomes the active plan and its intro is committed, and
     /// the sibling that parses to the same name stays queued — which
@@ -5585,7 +5974,8 @@ mod tests {
                     stopper,
                     "clank-test".to_string(),
                     repo,
-                    pages,
+                    pages.clone(),
+                    Some(pages),
                     cancelled,
                     Arc::new(Blocking::default()),
                     door,

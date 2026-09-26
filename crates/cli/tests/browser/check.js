@@ -61,6 +61,81 @@ const ok = (name, cond, detail = '') => out.push(`${cond ? 'PASS' : 'FAIL'}  ${n
     await browser.close();
   }
 
+  // ---- repo team management uses the same roster actions as the TUI
+  {
+    const { browser, page, errors } = await open();
+    await page.evaluate(() => {
+      const original = window.fetch;
+      window.fetch = (url, opts) => url === '/agents/candidates'
+        ? Promise.resolve({ ok: true, json: async () => [
+            { label: 'replacement', tool: 'codex' }, { label: 'spare', tool: 'grok' },
+          ] })
+        : original(url, opts);
+    });
+    const team = (role = 'commit') => facts([
+      { ...agent('claude', 'master'), tool: 'claude', invocation: 'claude --safe', session: 'session-one' },
+      { ...agent('grok', role), tool: 'grok', invocation: 'grok', session: null },
+    ]);
+    await page.evaluate((d) => window.__send('status', d), team());
+    await page.click('#more');
+    await page.click('#team > summary');
+    await page.waitForFunction(() => document.querySelector('#team-library option')?.value === 'replacement');
+    await page.click('.team .member[data-label="claude"] > summary');
+    ok('agent configuration shows invocation and binding',
+       (await page.textContent('.team .member[data-label="claude"]')).includes('claude --safe')
+       && (await page.textContent('.team .member[data-label="claude"]')).includes('session-one'));
+
+    await page.fill('#team-add-name', 'codex');
+    await page.selectOption('#team-add-tool', 'codex');
+    await page.selectOption('#team-add-review', 'gate');
+    await page.click('#team-add button');
+    const actions = () => page.evaluate(() => window.__frames.filter((f) => f[0] === '/agents').map((f) => JSON.parse(f[1])));
+    ok('adding an inline agent sends its tool and tier',
+       (await actions()).some((a) => a.do === 'add' && a.label === 'codex' && a.tool === 'codex' && a.review === 'gate'));
+    await page.fill('#team-add-name', 'spare');
+    await page.selectOption('#team-add-tool', '');
+    await page.selectOption('#team-add-review', 'plan');
+    await page.click('#team-add button');
+    ok('adding a library agent keeps its saved configuration',
+       (await actions()).some((a) => a.do === 'add' && a.label === 'spare' && a.tool === null && a.review === 'plan'));
+    await page.evaluate((d) => window.__send('status', d), facts([
+      ...team().facts.agents,
+      { ...agent('codex', 'gate'), tool: 'codex', invocation: 'codex', session: null },
+    ]));
+    ok('a roster update shows the added agent', await page.locator('.team .member[data-label="codex"]').count() === 1);
+
+    await page.click('.team .member[data-label="grok"] > summary');
+    await page.selectOption('.team .member[data-label="grok"] select[data-do="review"]', 'final');
+    ok('review tier changes use the agent action',
+       (await actions()).some((a) => a.do === 'review' && a.label === 'grok' && a.review === 'final'));
+    await page.click('.team .member[data-label="grok"] button[data-do="promote"]');
+    ok('master promotion uses the agent action',
+       (await actions()).some((a) => a.do === 'promote' && a.label === 'grok'));
+    await page.fill('.team .member[data-label="claude"] input.swap', 'replacement');
+    await page.click('.team .member[data-label="claude"] button[data-do="swap"]');
+    ok('swapping an agent uses the library name',
+       (await actions()).some((a) => a.do === 'swap' && a.label === 'claude' && a.into === 'replacement'));
+
+    const beforeRemove = (await actions()).length;
+    await page.click('.team .member[data-label="grok"] button[data-do="remove"]');
+    ok('removal waits for a second click', (await actions()).length === beforeRemove);
+    await page.click('.team .member[data-label="grok"] button[data-do="remove"]');
+    ok('confirmed removal uses the agent action',
+       (await actions()).some((a) => a.do === 'remove' && a.label === 'grok'));
+    await page.evaluate(() => {
+      window.fetch = async (url) => url === '/agents'
+        ? { ok: false, status: 409, text: async () => '{"why":"agent is already on this roster"}' }
+        : { ok: true, status: 204, text: async () => '' };
+    });
+    await page.fill('#team-add-name', 'codex');
+    await page.click('#team-add button');
+    ok('a refused action explains itself and preserves the form',
+       (await page.textContent('#team-why')).includes('already on this roster')
+       && await page.inputValue('#team-add-name') === 'codex');
+    ok('team management has no script errors', errors.length === 0, errors.join('; '));
+    await browser.close();
+  }
+
   // ---- P1: the draft's recipient survives the roster losing its agent
   {
     const { browser, page } = await open();
