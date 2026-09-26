@@ -285,7 +285,12 @@ pub(crate) struct Startup {
     pub(crate) grace: std::time::Duration,
     /// Published before the server can answer anyone; see `start`.
     pub(crate) seed: serde_json::Value,
+    /// The TUI's pane reconciler, reached through its event loop.
+    pub(crate) reopen: Option<Reopener>,
 }
+
+pub(crate) type Reopener =
+    Arc<dyn Fn(String) -> tokio::sync::oneshot::Receiver<Result<String, String>> + Send + Sync>;
 
 /// A running remote: everything it started, owned here, ended
 /// together. The listener and its connections, the pane poll and the
@@ -395,6 +400,7 @@ impl Instance {
             poll,
             grace,
             seed,
+            reopen,
         } = how;
         let table = panes
             .table()
@@ -431,6 +437,7 @@ impl Instance {
             feed.clone(),
             sayer,
             stopper,
+            reopen,
             panes.session().to_string(),
             repo.clone(),
             site_dir(&repo),
@@ -1192,6 +1199,7 @@ async fn serve(
     feed: Feed,
     sayer: Sayer,
     stopper: Stopper,
+    reopen: Option<Reopener>,
     session: String,
     repo: PathBuf,
     site: PathBuf,
@@ -1220,6 +1228,7 @@ async fn serve(
         feed,
         sayer,
         stopper,
+        reopen,
         blocking,
         page: Arc::from(page_for(&session)),
         pages: Pages { repo, site },
@@ -1336,6 +1345,7 @@ struct Ctx {
     feed: Feed,
     sayer: Sayer,
     stopper: Stopper,
+    reopen: Option<Reopener>,
     blocking: Arc<Blocking>,
     page: Arc<str>,
     pages: Pages,
@@ -1678,6 +1688,10 @@ async fn route(req: hyper::Request<hyper::body::Incoming>, peer: IpAddr, ctx: &C
         ("GET", "/agents/candidates") => agent_candidates(ctx).await,
         ("POST", "/agents") if !same_origin(&req, ctx) => text(403, "cross-origin", "text/plain"),
         ("POST", "/agents") => agent_action(req, ctx).await,
+        ("POST", "/agents/reopen") if !same_origin(&req, ctx) => {
+            text(403, "cross-origin", "text/plain")
+        }
+        ("POST", "/agents/reopen") => reopen_agent(req, ctx).await,
         ("POST", "/upload") if !same_origin(&req, ctx) => text(403, "cross-origin", "text/plain"),
         ("POST", "/upload") => upload(req, ctx).await,
         ("GET", p) if p.starts_with("/html/") => site_page(&ctx.pages, &p["/html/".len()..]),
@@ -2454,6 +2468,10 @@ enum AgentAsk {
     Remove {
         label: String,
     },
+    ClearSession {
+        label: String,
+        session: String,
+    },
 }
 
 /// Repo-roster mutations go through the same cores as the TUI. None
@@ -2493,6 +2511,21 @@ fn perform_agent_action(repo: &Path, home: Option<&Path>, ask: AgentAsk) -> anyh
             agent::swap_repo_agent(repo, home, &parse(&label)?, &parse(&into)?)
         }
         AgentAsk::Remove { label } => agent::remove_repo_reviewer(repo, &parse(&label)?),
+        AgentAsk::ClearSession { label, session } => {
+            let label = parse(&label)?;
+            let roster = crate::agent_store::load_repo_config_required(repo)?;
+            if !roster.agents.contains_key(&label) {
+                anyhow::bail!("`{label}` is no longer on the roster");
+            }
+            let id = clank_core::ids::SessionId::parse(&session)
+                .map_err(|e| anyhow::anyhow!("invalid session id `{session}`: {e}"))?;
+            if !crate::agent_store::release_binding(repo, &label, &id)? {
+                anyhow::bail!(
+                    "`{label}` is no longer bound to {session}: its binding changed after the confirm showed it"
+                );
+            }
+            Ok(())
+        }
     }
 }
 
@@ -2551,6 +2584,103 @@ async fn agent_action(req: hyper::Request<hyper::body::Incoming>, ctx: &Ctx) -> 
             "application/json",
         ),
         None => text(500, "the agent action panicked", "text/plain"),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct ReopenAsk {
+    label: String,
+}
+
+/// A reopen request crosses into the TUI loop, then its existing
+/// reconciler lists and creates the pane. The server checks the roster
+/// and its latest pane table first; neither path binds a session.
+async fn reopen_agent(req: hyper::Request<hyper::body::Incoming>, ctx: &Ctx) -> Resp {
+    let body = http_body_util::Limited::new(req.into_body(), 4 * 1024);
+    let Ok(bytes) = body.collect().await.map(|c| c.to_bytes()) else {
+        return text(413, "too long", "text/plain");
+    };
+    let Ok(ask) = serde_json::from_slice::<ReopenAsk>(&bytes) else {
+        return text(400, "expected agent label", "text/plain");
+    };
+    if *ctx.cancelled.borrow() {
+        return text(503, "the remote is off", "text/plain");
+    }
+    let Some(reopen) = &ctx.reopen else {
+        return text(
+            503,
+            serde_json::json!({"why":"the TUI pane reconciler is unavailable"}).to_string(),
+            "application/json",
+        );
+    };
+    let label = match clank_core::ids::AgentLabel::parse(&ask.label) {
+        Ok(label) => label,
+        Err(e) => {
+            return text(
+                409,
+                serde_json::json!({"why":format!("invalid agent label: {e}")}).to_string(),
+                "application/json",
+            );
+        }
+    };
+    let repo = ctx.pages.repo.clone();
+    let name = label.as_str().to_string();
+    let present = ctx
+        .blocking
+        .run(move || -> anyhow::Result<bool> {
+            Ok(crate::agent_store::load_repo_config_required(&repo)?
+                .agents
+                .contains_key(&label))
+        })
+        .await;
+    match present {
+        Some(Ok(true)) => {}
+        Some(Ok(false)) => {
+            return text(
+                409,
+                serde_json::json!({"why":format!("`{name}` is no longer on the roster")})
+                    .to_string(),
+                "application/json",
+            );
+        }
+        Some(Err(e)) => {
+            return text(
+                409,
+                serde_json::json!({"why":format!("{e:#}")}).to_string(),
+                "application/json",
+            );
+        }
+        None => return text(500, "the roster read panicked", "text/plain"),
+    }
+    if ctx.feed.has_live_pane(&name) {
+        return text(
+            409,
+            serde_json::json!({"why":format!("`{name}` already has a live pane")}).to_string(),
+            "application/json",
+        );
+    }
+    let answer = tokio::time::timeout(std::time::Duration::from_secs(30), reopen(name)).await;
+    match answer {
+        Ok(Ok(Ok(message))) => text(
+            200,
+            serde_json::json!({"message":message}).to_string(),
+            "application/json",
+        ),
+        Ok(Ok(Err(why))) => text(
+            409,
+            serde_json::json!({"why":why}).to_string(),
+            "application/json",
+        ),
+        Ok(Err(_)) => text(
+            503,
+            serde_json::json!({"why":"the TUI pane reconciler stopped"}).to_string(),
+            "application/json",
+        ),
+        Err(_) => text(
+            504,
+            serde_json::json!({"why":"the TUI pane reconciler did not answer"}).to_string(),
+            "application/json",
+        ),
     }
 }
 
@@ -3108,6 +3238,7 @@ mod tests {
                     feed,
                     sayer,
                     stopper,
+                    None,
                     "clank-test".to_string(),
                     repo,
                     site,
@@ -3202,6 +3333,7 @@ mod tests {
                     feed,
                     sayer,
                     stopper,
+                    None,
                     "clank-test".to_string(),
                     repo,
                     site,
@@ -3709,6 +3841,7 @@ mod tests {
                     feed,
                     sayer,
                     stopper,
+                    None,
                     "clank-test".to_string(),
                     repo,
                     site,
@@ -5578,6 +5711,206 @@ mod tests {
         let _ = cancel.send(true);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn web_session_clear_and_reopen_keep_binding_and_pane_ownership_separate() {
+        use clank_core::ids::{AgentLabel, SessionId};
+        use clank_core::vocab::Tool;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let refuse = Arc::new(AtomicBool::new(true));
+        let called: Arc<Mutex<Vec<String>>> = Arc::default();
+        let reopener: Reopener = {
+            let refuse = refuse.clone();
+            let called = called.clone();
+            Arc::new(move |label| {
+                called.lock().unwrap().push(label.clone());
+                let (reply, answer) = tokio::sync::oneshot::channel();
+                let result = if refuse.load(Ordering::SeqCst) {
+                    Err("zellij did not create a pane".to_string())
+                } else {
+                    Ok(format!("reopened `{label}`'s pane"))
+                };
+                let _ = reply.send(result);
+                answer
+            })
+        };
+        let (base, door, anon, cancel, _site, repo, feed) =
+            door_only_with_reopen(Some(reopener)).await;
+        let p = repo.path();
+        std::fs::create_dir_all(p.join(".clank")).unwrap();
+        std::fs::write(
+            p.join(".clank/config.json"),
+            r#"{"agents":{"codex":{"tool":"codex","role":"master"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(p.join("readme"), "base\n").unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(p)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["add", "-A"]);
+        git(&["commit", "--quiet", "-m", "base"]);
+        let label = AgentLabel::parse("codex").unwrap();
+        let old = SessionId::parse("11111111-1111-4111-8111-111111111111").unwrap();
+        let new = SessionId::parse("22222222-2222-4222-8222-222222222222").unwrap();
+        crate::agent_store::bind_session_to_agent(p, &label, Tool::Codex, &old).unwrap();
+        let cookie = door
+            .open_session("token")
+            .map(|t| format!("{}={t}", door::COOKIE))
+            .unwrap();
+        let ask = |path: &str, body: serde_json::Value, cookie: Option<String>, origin: bool| {
+            let mut r = anon.post(format!("{base}{path}")).json(&body);
+            if let Some(cookie) = cookie {
+                r = r.header("cookie", cookie);
+            }
+            if origin {
+                r = r.header("origin", &base);
+            }
+            async move { r.send().await.unwrap() }
+        };
+        let clear =
+            serde_json::json!({"do":"clear_session","label":"codex","session":old.as_str()});
+        assert_eq!(
+            ask("/agents", clear.clone(), None, true).await.status(),
+            401
+        );
+        assert_eq!(
+            ask("/agents", clear.clone(), Some(cookie.clone()), false)
+                .await
+                .status(),
+            403
+        );
+        assert_eq!(
+            ask("/agents", clear.clone(), Some(cookie.clone()), true)
+                .await
+                .status(),
+            204
+        );
+        let after_clear = crate::cli::status::snapshot(p, None).await.unwrap();
+        assert!(
+            after_clear
+                .agents
+                .iter()
+                .find(|a| a.label == "codex")
+                .unwrap()
+                .session
+                .is_none()
+        );
+
+        // The binding changes while the first session's confirmation is open.
+        crate::agent_store::bind_session_to_agent(p, &label, Tool::Codex, &old).unwrap();
+        crate::agent_store::bind_session_to_agent(p, &label, Tool::Codex, &new).unwrap();
+        let changed = ask("/agents", clear, Some(cookie.clone()), true).await;
+        assert_eq!(changed.status(), 409);
+        assert!(
+            changed.json::<serde_json::Value>().await.unwrap()["why"]
+                .as_str()
+                .unwrap()
+                .contains("binding changed after the confirm")
+        );
+        assert_eq!(
+            crate::agent_store::load_agent_config(p, &label)
+                .unwrap()
+                .unwrap()
+                .session
+                .unwrap()
+                .id,
+            new
+        );
+
+        let reopen = serde_json::json!({"label":"codex"});
+        feed.panes(vec![PaneMeta {
+            id: "pane-codex".into(),
+            label: "codex".into(),
+            columns: 80,
+            rows: 24,
+            exited: false,
+        }]);
+        let already = ask("/agents/reopen", reopen.clone(), Some(cookie.clone()), true).await;
+        assert_eq!(already.status(), 409);
+        assert!(
+            already.json::<serde_json::Value>().await.unwrap()["why"]
+                .as_str()
+                .unwrap()
+                .contains("already has a live pane")
+        );
+        assert!(called.lock().unwrap().is_empty());
+        feed.panes(Vec::new());
+        assert_eq!(
+            ask("/agents/reopen", reopen.clone(), None, true)
+                .await
+                .status(),
+            401
+        );
+        assert_eq!(
+            ask(
+                "/agents/reopen",
+                reopen.clone(),
+                Some(cookie.clone()),
+                false
+            )
+            .await
+            .status(),
+            403
+        );
+        let refused = ask("/agents/reopen", reopen.clone(), Some(cookie.clone()), true).await;
+        assert_eq!(refused.status(), 409);
+        assert!(
+            refused.json::<serde_json::Value>().await.unwrap()["why"]
+                .as_str()
+                .unwrap()
+                .contains("did not create")
+        );
+        refuse.store(false, Ordering::SeqCst);
+        let opened = ask("/agents/reopen", reopen, Some(cookie.clone()), true).await;
+        assert_eq!(opened.status(), 200);
+        assert!(
+            opened.json::<serde_json::Value>().await.unwrap()["message"]
+                .as_str()
+                .unwrap()
+                .contains("reopened")
+        );
+        assert_eq!(called.lock().unwrap().as_slice(), ["codex", "codex"]);
+        assert_eq!(
+            crate::agent_store::load_agent_config(p, &label)
+                .unwrap()
+                .unwrap()
+                .session
+                .unwrap()
+                .id,
+            new,
+            "a pane reopen never binds or clears the agent session"
+        );
+
+        std::fs::write(p.join(".clank/config.json"), r#"{"agents":{}}"#).unwrap();
+        assert_eq!(
+            ask(
+                "/agents/reopen",
+                serde_json::json!({"label":"codex"}),
+                Some(cookie),
+                true
+            )
+            .await
+            .status(),
+            409
+        );
+        assert_eq!(
+            called.lock().unwrap().len(),
+            2,
+            "a departed agent never reaches the reconciler"
+        );
+        let _ = cancel.send(true);
+    }
+
     #[test]
     fn web_agent_library_add_and_swap_leave_sessions_to_the_agents() {
         use clank_core::ids::AgentLabel;
@@ -5887,6 +6220,7 @@ mod tests {
                 poll: std::time::Duration::from_secs(3600),
                 grace: std::time::Duration::from_millis(200),
                 seed: status_payload(repo.path(), &s, &Default::default()),
+                reopen: None,
             },
         )
         .await
@@ -6097,6 +6431,7 @@ mod tests {
                 poll: std::time::Duration::from_secs(3600),
                 grace: std::time::Duration::from_millis(200),
                 seed: status_payload(repo.path(), &s, &Default::default()),
+                reopen: None,
             },
         )
         .await
@@ -6338,6 +6673,21 @@ mod tests {
         tempfile::TempDir,
         tempfile::TempDir,
     ) {
+        let (base, door, anon, cancel, site, repo, _) = door_only_with_reopen(None).await;
+        (base, door, anon, cancel, site, repo)
+    }
+
+    async fn door_only_with_reopen(
+        reopen: Option<Reopener>,
+    ) -> (
+        String,
+        Arc<door::Door>,
+        reqwest::Client,
+        tokio::sync::watch::Sender<bool>,
+        tempfile::TempDir,
+        tempfile::TempDir,
+        Feed,
+    ) {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
             .unwrap();
@@ -6362,17 +6712,20 @@ mod tests {
         }
         let (cancel, cancelled) = tokio::sync::watch::channel(false);
         let door = Arc::new(door::Door::new(Some(site.path().to_path_buf())));
+        let feed = Feed::new(16);
         tokio::spawn({
             let (repo, pages) = (repo.path().to_path_buf(), site.path().to_path_buf());
             let door = door.clone();
+            let feed = feed.clone();
             let sayer: Sayer = Arc::new(|_, _| Ok(()));
             let stopper: Stopper = Arc::new(|_| Ok(()));
             async move {
                 serve(
                     listener,
-                    Feed::new(16),
+                    feed,
                     sayer,
                     stopper,
+                    reopen,
                     "clank-test".to_string(),
                     repo,
                     pages.clone(),
@@ -6398,6 +6751,7 @@ mod tests {
             cancel,
             site,
             repo,
+            feed,
         )
     }
 

@@ -2566,6 +2566,18 @@ pub(crate) async fn run_tui(
     // drains. A blocking `read` on stdin IS the notification (no
     // polling).
     let (ev_tx, ev_rx) = mpsc::channel::<Ev>();
+    let (web_reopen_tx, web_reopen_rx) =
+        mpsc::channel::<(String, tokio::sync::oneshot::Sender<Result<String, String>>)>();
+    let web_reopen: crate::cli::web::Reopener = {
+        let wake = ev_tx.clone();
+        std::sync::Arc::new(move |label| {
+            let (reply, answer) = tokio::sync::oneshot::channel();
+            if web_reopen_tx.send((label, reply)).is_ok() {
+                let _ = wake.send(Ev::Remote);
+            }
+            answer
+        })
+    };
 
     // Declared BEFORE the alt-screen guard: reverse drop order joins
     // the worker AFTER the terminal is restored, on every exit path
@@ -2598,6 +2610,7 @@ pub(crate) async fn run_tui(
                 let _ = wake.send(Ev::Remote);
             }),
         )
+        .reopen_through(web_reopen)
         .tunnel_from({
             let home = home.clone();
             std::sync::Arc::new(move || crate::cli::web::tunnel::configured(home.as_deref()))
@@ -2711,6 +2724,14 @@ pub(crate) async fn run_tui(
         .checked_sub(REBUILD_MIN)
         .unwrap_or_else(std::time::Instant::now);
     let mut refresh_pending = false;
+    // Explicit reopen outcomes are returned in request order. A TUI
+    // keypress owns a slot too, so a simultaneous web request cannot
+    // mistake the keypress's answer for its own.
+    let mut reopen_pending: std::collections::VecDeque<(
+        String,
+        Option<tokio::sync::oneshot::Sender<Result<String, String>>>,
+    )> = Default::default();
+    let mut reopen_outcomes_pending = Vec::new();
     let mut waker_probe = AttendanceProbe {
         at: std::time::Instant::now(),
         fingerprint: crate::cli::status::attendance_fingerprint(&repo),
@@ -2718,6 +2739,26 @@ pub(crate) async fn run_tui(
     // Labeled so a `Quit` key inside the per-key drain loop exits the
     // event loop, not just the inner `for`.
     'evloop: loop {
+        for (label, answer) in web_reopen_rx.try_iter() {
+            reopen_pending.push_back((label.clone(), Some(answer)));
+            reconcile_worker.reopen(&label);
+        }
+        // Answer web requests even while a document overlay owns the TUI.
+        // Keep the outcomes for the normal panel path to paint afterward.
+        let reopen_outcomes = reconcile_worker.outcomes();
+        for (label, outcome) in &reopen_outcomes {
+            if let Some(index) = reopen_pending.iter().position(|(name, _)| name == label)
+                && let Some((_, Some(answer))) = reopen_pending.remove(index)
+            {
+                let message = outcome.describe(label);
+                let _ = answer.send(if *outcome == zellij::ReopenOutcome::Reopened {
+                    Ok(message)
+                } else {
+                    Err(message)
+                });
+            }
+        }
+        reopen_outcomes_pending.extend(reopen_outcomes);
         let (rows, cols) = term_size();
         // Every pass, before any render: see the fn's invariant doc.
         enforce_panel_tops_log(mode, &mut log);
@@ -2892,7 +2933,7 @@ pub(crate) async fn run_tui(
         // nothing animating that is the 60-second idle tick (codex on
         // 6303167).
         if mount_reopen_outcomes(
-            reconcile_worker.outcomes(),
+            std::mem::take(&mut reopen_outcomes_pending),
             mode,
             &mut snapshot,
             &mut detail,
@@ -3614,6 +3655,7 @@ pub(crate) async fn run_tui(
                                     if action == DetailAction::Reopen
                                         && let Some(agent) = snapshot.agents.get(idx)
                                     {
+                                        reopen_pending.push_back((agent.label.clone(), None));
                                         reconcile_worker.reopen(&agent.label);
                                     }
                                 }

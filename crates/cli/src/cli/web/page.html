@@ -587,6 +587,7 @@
   let heard = false;
   const panes = new Map();                  // pane id → { meta, closed }
   const paneOf = new Map();                 // label → pane id
+  let paneHeard = false;
   const agents = new Map();                 // label → { session, generation, turns[] }  (mirrors PageModel)
   const views = new Map();                  // label → { transcript: el, terminal: el, term }
   let shown = null;                         // the agent on screen
@@ -1156,6 +1157,8 @@
 
   // ---- panes (terminal mode) ----
   function onPanes(d) {
+    paneHeard = true;
+    paneOf.clear();
     const seen = new Set();
     for (const meta of d.panes) {
       seen.add(meta.id);
@@ -1170,6 +1173,7 @@
     }
     for (const id of [...panes.keys()]) if (!seen.has(id)) panes.delete(id);
     if (shown) show(shown);
+    if (facts) paintTeam(facts.agents);
   }
   function onPane(d) {
     const p = panes.get(d.pane_id); if (!p) return;
@@ -1446,7 +1450,12 @@
 
   // ---- the repo team ----
   const reviewKinds = ['commit', 'plan', 'final', 'gate', 'standby'];
-  let teamDrawn = null, library = [], armedAgent = null;
+  let teamDrawn = null, library = [], armedAgent = null, armedClear = null;
+  const paneState = (label) => {
+    if (!paneHeard) return 'checking pane';
+    const pane = panes.get(paneOf.get(label));
+    return pane && !pane.closed ? 'pane live' : 'pane missing';
+  };
   function teamWhy(message) {
     const box = $('team-why');
     box.textContent = message || '';
@@ -1468,7 +1477,7 @@
   }
   $('team').addEventListener('toggle', () => { if ($('team').open) loadLibrary(); });
   function paintTeam(agents) {
-    const sig = JSON.stringify(agents.map((a) => [a.label, a.role, a.tool, a.invocation, a.session]));
+    const sig = JSON.stringify(agents.map((a) => [a.label, a.role, a.tool, a.invocation, a.session, paneState(a.label)]));
     if (sig === teamDrawn) return;
     teamDrawn = sig;
     const rows = $('team-rows');
@@ -1482,8 +1491,10 @@
         + '</select></label>';
       return `<details class="member" data-label="${name}"><summary>${name}<span>${esc(a.role)} · ${esc(a.tool || '')}</span></summary>`
         + `<pre>${esc(a.invocation || a.tool || '')}</pre>`
-        + `<div class="binding">${a.session ? `session ${esc(a.session)}` : 'unbound — the agent binds its own session'}</div>`
+        + `<div class="binding">${a.session ? `session ${esc(a.session)}` : 'unbound — the agent binds its own session'} · ${paneState(a.label)}</div>`
         + `<div class="controls">${tier}${master ? '' : '<button type="button" data-do="promote">Promote to master</button>'}`
+        + `${a.session ? `<button type="button" data-do="clear_session" data-session="${esc(a.session)}">Clear session</button>` : ''}`
+        + `${paneState(a.label) === 'pane missing' ? '<button type="button" data-do="reopen">Reopen pane</button>' : ''}`
         + `<input class="swap" list="team-library" aria-label="Replace ${name} with agent" placeholder="replacement agent">`
         + `<button type="button" data-do="swap">Swap</button>`
         + `${master ? '' : '<button type="button" data-do="remove">Remove</button>'}</div></details>`;
@@ -1495,6 +1506,12 @@
     }
     paintLibrary();
     armedAgent = null;
+    if (armedClear) {
+      const button = rows.querySelector(`.member[data-label="${CSS.escape(armedClear.label)}"] button[data-do="clear_session"]`);
+      if (button && button.dataset.session === armedClear.session) {
+        button.classList.add('armed'); button.textContent = 'Clear session?';
+      } else armedClear = null;
+    }
   }
   async function askAgent(ask) {
     teamWhy('');
@@ -1508,7 +1525,7 @@
         try { why = JSON.parse(body).why || body; } catch (err) {}
         throw new Error(why || 'the team refused that change');
       }
-      teamWhy('Saved. The team will update shortly.');
+      teamWhy(ask.do === 'clear_session' ? 'Saved. Session cleared; status will update shortly.' : 'Saved. The team will update shortly.');
       return true;
     } catch (err) {
       teamWhy(err.message || String(err));
@@ -1534,6 +1551,27 @@
     const button = e.target.closest('button[data-do]');
     if (!button) return;
     const row = button.closest('.member'), label = row.dataset.label, action = button.dataset.do;
+    if (action === 'clear_session') {
+      const session = button.dataset.session;
+      if (!armedClear || armedClear.label !== label || armedClear.session !== session) {
+        const old = $('team-rows').querySelector('button[data-do="clear_session"].armed');
+        if (old) { old.classList.remove('armed'); old.textContent = 'Clear session'; }
+        armedClear = { label, session };
+        button.classList.add('armed'); button.textContent = 'Clear session?';
+        teamWhy(`Clear ${label}'s binding to ${session}?`);
+      } else {
+        armedClear = null;
+        button.classList.remove('armed'); button.textContent = 'Clear session';
+        askAgent({ do: 'clear_session', label, session });
+      }
+      return;
+    }
+    if (armedClear) {
+      const old = $('team-rows').querySelector('button[data-do="clear_session"].armed');
+      if (old) { old.classList.remove('armed'); old.textContent = 'Clear session'; }
+      armedClear = null;
+    }
+    if (action === 'reopen') { askReopen(label); return; }
     if (action !== 'remove' && armedAgent) {
       const armed = $('team-rows').querySelector(`.member[data-label="${CSS.escape(armedAgent)}"] button[data-do="remove"]`);
       if (armed) { armed.classList.remove('armed'); armed.textContent = 'Remove'; }
@@ -1557,6 +1595,16 @@
       askAgent({ do: 'swap', label, into });
     } else askAgent({ do: action, label });
   });
+  async function askReopen(label) {
+    teamWhy('');
+    try {
+      const r = await fetch('/agents/reopen', {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ label }),
+      });
+      const answer = await r.json();
+      teamWhy(r.ok ? `Saved. ${answer.message}` : answer.why || 'the pane could not be reopened');
+    } catch (err) { teamWhy('could not reach the pane reconciler'); }
+  }
 
   // ---- the ledger ----
   function paintLedger() {

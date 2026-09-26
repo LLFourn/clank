@@ -208,6 +208,15 @@ pub(crate) struct Feed {
 }
 
 impl Feed {
+    /// The latest pane table the page and its actions both use. The
+    /// reconciler checks again before any reopen changes the layout.
+    pub(crate) fn has_live_pane(&self, label: &str) -> bool {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state
+            .panes
+            .iter()
+            .any(|p| p.label == label && !p.exited && !state.closed.contains(&p.id))
+    }
     /// `capacity` frames of lag before a slow browser is resynced from
     /// state instead of catching up.
     pub(crate) fn new(capacity: usize) -> Self {
@@ -705,6 +714,27 @@ mod tests {
             ]),
             TableChange::Membership
         );
+    }
+
+    #[test]
+    fn reopen_availability_tracks_live_closed_and_departed_panes() {
+        let feed = Feed::new(8);
+        assert!(!feed.has_live_pane("codex"));
+        feed.panes(vec![meta("terminal_5", "codex", 120)]);
+        assert!(feed.has_live_pane("codex"));
+        assert!(!feed.has_live_pane("grok"));
+        feed.event(SubscribeEvent {
+            event: "pane_closed".into(),
+            pane_id: Some("terminal_5".into()),
+            viewport: None,
+            scrollback: None,
+            is_initial: false,
+        });
+        assert!(!feed.has_live_pane("codex"));
+        feed.panes(vec![meta("terminal_6", "codex", 120)]);
+        assert!(feed.has_live_pane("codex"));
+        feed.panes(Vec::new());
+        assert!(!feed.has_live_pane("codex"));
     }
 
     /// Only the columns changed: the page is told so it can resize

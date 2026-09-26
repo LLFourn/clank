@@ -147,6 +147,7 @@ pub(super) struct Remote<O: Opener> {
     generation: u64,
     outcomes: Arc<Mutex<Vec<(u64, Outcome)>>>,
     wake: Arc<dyn Fn() + Send + Sync>,
+    reopen: Option<crate::cli::web::Reopener>,
 }
 
 impl<O: Opener> Remote<O> {
@@ -176,7 +177,14 @@ impl<O: Opener> Remote<O> {
             generation: 0,
             outcomes: Arc::new(Mutex::new(Vec::new())),
             wake,
+            reopen: None,
         }
+    }
+
+    /// Forward web reopen requests to this TUI's pane reconciler.
+    pub(super) fn reopen_through(mut self, reopen: crate::cli::web::Reopener) -> Self {
+        self.reopen = Some(reopen);
+        self
     }
 
     /// Where the tunnel provider is read from at each start.
@@ -290,6 +298,7 @@ impl<O: Opener> Remote<O> {
                 // (codex on 369e74e).
                 let panes = self.panes.clone();
                 let door = self.door.clone();
+                let reopen = self.reopen.clone();
                 let tunnel = self.tunnel.clone();
                 // What the TUI knows NOW, carried into the start so
                 // the feed has facts before it can answer a browser:
@@ -323,6 +332,7 @@ impl<O: Opener> Remote<O> {
                                     poll,
                                     grace,
                                     seed,
+                                    reopen,
                                 },
                             )
                             .await

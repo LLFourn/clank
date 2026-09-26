@@ -253,6 +253,62 @@ const ok = (name, cond, detail = '') => out.push(`${cond ? 'PASS' : 'FAIL'}  ${n
     await browser.close();
   }
 
+  // ---- session clearing and pane recovery use separate agent actions
+  {
+    const { browser, page, errors } = await open();
+    await page.evaluate(() => {
+      window.__refuseReopen = true;
+      window.fetch = async (url, opts) => {
+        window.__frames.push([url, opts?.body]);
+        if (url === '/agents/candidates') return { ok: true, json: async () => [] };
+        if (url === '/agents/reopen') return window.__refuseReopen
+          ? { ok: false, status: 409, json: async () => ({ why: 'zellij refused to create a pane' }) }
+          : { ok: true, status: 200, json: async () => ({ message: 'pane reopened' }) };
+        return { ok: true, status: 204 };
+      };
+    });
+    const team = (session) => facts([
+      { ...agent('codex', 'master'), tool: 'codex', session },
+      { ...agent('grok', 'commit'), tool: 'grok', session: null },
+    ]);
+    await page.evaluate((d) => window.__send('status', d), team('session-one'));
+    await page.evaluate((d) => window.__send('panes', d), panes(['codex']));
+    await page.click('#more');
+    await page.click('#team > summary');
+    await page.click('.team .member[data-label="codex"] > summary');
+    await page.click('.team .member[data-label="grok"] > summary');
+    const codex = '.team .member[data-label="codex"]';
+    const grok = '.team .member[data-label="grok"]';
+    const clears = () => page.evaluate(() => window.__frames.filter((f) => f[0] === '/agents'
+      && JSON.parse(f[1]).do === 'clear_session').map((f) => JSON.parse(f[1])));
+    ok('a live pane offers session clearing but no reopen',
+       await page.locator(`${codex} button[data-do="clear_session"]`).count() === 1
+       && await page.locator(`${codex} button[data-do="reopen"]`).count() === 0);
+    ok('an unbound missing pane offers reopen but no clearing',
+       await page.locator(`${grok} button[data-do="clear_session"]`).count() === 0
+       && await page.locator(`${grok} button[data-do="reopen"]`).count() === 1);
+    await page.click(`${codex} button[data-do="clear_session"]`);
+    ok('clearing waits for confirmation', (await clears()).length === 0);
+    await page.evaluate((d) => window.__send('status', d), team('session-two'));
+    ok('a changed binding cancels the old confirmation',
+       await page.textContent(`${codex} button[data-do="clear_session"]`) === 'Clear session');
+    await page.click(`${codex} button[data-do="clear_session"]`);
+    ok('the new binding also needs confirmation', (await clears()).length === 0);
+    await page.click(`${codex} button[data-do="clear_session"]`);
+    ok('clear names the confirmed binding', (await clears()).length === 1
+       && (await clears())[0].session === 'session-two');
+    await page.click(`${grok} button[data-do="reopen"]`);
+    await page.waitForFunction(() => document.querySelector('#team-why').textContent.includes('zellij refused'));
+    ok('reopen refusal is shown beside the action', (await page.textContent('#team-why')).includes('zellij refused'));
+    await page.evaluate(() => { window.__refuseReopen = false; });
+    await page.click(`${grok} button[data-do="reopen"]`);
+    await page.waitForFunction(() => document.querySelector('#team-why').textContent.includes('pane reopened'));
+    await page.evaluate((d) => window.__send('panes', d), panes(['codex', 'grok']));
+    ok('the live pane update removes reopen', await page.locator(`${grok} button[data-do="reopen"]`).count() === 0);
+    ok('session and pane controls have no script errors', errors.length === 0, errors.join('; '));
+    await browser.close();
+  }
+
   // ---- P1: the draft's recipient survives the roster losing its agent
   {
     const { browser, page } = await open();
