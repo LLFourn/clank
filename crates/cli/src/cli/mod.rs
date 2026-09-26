@@ -14,6 +14,7 @@ pub mod as_cmd;
 pub mod attending;
 pub mod auto;
 pub mod block;
+pub(crate) mod codex_chat;
 pub mod command;
 pub mod command_source;
 pub mod config;

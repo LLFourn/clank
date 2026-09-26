@@ -1408,6 +1408,8 @@ pub(crate) fn subscribe_panes(session: &str, panes: &[String]) -> Option<Subscri
 /// flag. Enter is byte 13 through `write`, not a newline through
 /// `write-chars`: a newline is what a multi-line paste is made of,
 /// and a chat prompt treats those differently from Return.
+/// Codex uses its own submit sequence below; a bare CR can insert a
+/// newline even after the paste-burst window has elapsed.
 ///
 /// Not a pane MUTATION in the ownership gate's sense: typing into a
 /// pane leaves its place in the layout to the reconciler, which is
@@ -1425,6 +1427,17 @@ pub(crate) fn say_argvs(pane: &str, text: &str) -> Option<[Vec<String>; 2]> {
         .map(|s| s.to_string())
         .collect();
     Some([chars, enter])
+}
+
+/// Kitty keyboard protocol's Enter press: CSI 13;1:1u. Codex's TUI
+/// distinguishes this from the raw CR used by shells and other agents.
+fn codex_submit_argv(pane: &str) -> Vec<String> {
+    [
+        "action", "write", "-p", pane, "27", "91", "49", "51", "59", "49", "58", "49", "117",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
 }
 
 /// Interrupt whatever `pane` is doing: byte 27, Escape, which is how
@@ -1448,10 +1461,31 @@ pub(crate) fn stop_pane(session: &str, pane: &str) -> anyhow::Result<()> {
 
 /// Say `text` to `pane` in `session` and press Enter.
 pub(crate) fn say_to_pane(session: &str, pane: &str, text: &str) -> anyhow::Result<()> {
+    say_to_pane_with_delay(session, pane, text, false)
+}
+
+/// Codex can treat Enter immediately after injected text as a pasted
+/// newline. Its terminal fallback waits past the paste-burst window,
+/// then sends a kitty-protocol Enter press. A held Stop hook may still
+/// queue the prompt; `codex_chat` handles that when available.
+pub(crate) fn say_to_codex_pane(session: &str, pane: &str, text: &str) -> anyhow::Result<()> {
+    say_to_pane_with_delay(session, pane, text, true)
+}
+
+fn say_to_pane_with_delay(
+    session: &str,
+    pane: &str,
+    text: &str,
+    delay: bool,
+) -> anyhow::Result<()> {
     let Some(argvs) = say_argvs(pane, text) else {
         return Ok(());
     };
-    for argv in argvs {
+    for (i, mut argv) in argvs.into_iter().enumerate() {
+        if i == 1 && delay {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            argv = codex_submit_argv(pane);
+        }
         let out = std::process::Command::new("zellij")
             .args(["--session", session])
             .args(&argv)
@@ -4296,6 +4330,24 @@ dead-one [Created 10h ago] (EXITED - attach to resurrect)
         );
         assert_eq!(enter, vec!["action", "write", "-p", "terminal_3", "13"]);
         assert_eq!(say_argvs("terminal_3", ""), None);
+        assert_eq!(
+            codex_submit_argv("terminal_3"),
+            vec![
+                "action",
+                "write",
+                "-p",
+                "terminal_3",
+                "27",
+                "91",
+                "49",
+                "51",
+                "59",
+                "49",
+                "58",
+                "49",
+                "117"
+            ]
+        );
     }
 
     /// The convention is deterministic per repo, and it is only a

@@ -329,7 +329,14 @@ auto-mode drives it:
   `clank doctor` flags drift.
 - **codex** — its Stop hook long-polls `clank wait` in-hook and blocks
   with the items (the poll parks until work, the hook-runner
-  ceiling, or the hook's own death).
+  ceiling, or the hook's own death). Remote chat uses the local Codex
+  app-server control socket to start a turn, steer ongoing work, or
+  release a completed turn whose Stop hook is still waiting. If that
+  socket or Codex's experimental turn-list endpoint is unavailable,
+  remote chat falls back to terminal input with a delay and a
+  kitty-protocol Enter press. That fallback can leave a submitted
+  message queued behind the held Stop hook; use the remote Stop button
+  to release it.
 - **grok** — has no active hooks; its skill (and the auto-on launch
   prompt from `clank agent start`) teach it to arm the background
   wait itself.

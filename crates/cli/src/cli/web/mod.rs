@@ -25,6 +25,7 @@ use std::sync::{Arc, Mutex};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
 
+use crate::cli::codex_chat;
 use crate::cli::open_zellij::{self, PaneMeta, SubscribeChild};
 use feed::{Feed, SubscribeEvent, TableChange};
 
@@ -196,6 +197,29 @@ impl Panes for Zellij {
         open_zellij::subscribe_panes(&self.session, ids)
     }
     fn say(&self, pane: &str, text: &str) -> anyhow::Result<()> {
+        if let Some(panes) = open_zellij::snapshot_panes_in(&self.session) {
+            let label = open_zellij::agent_pane_table(&panes, &self.repo)
+                .into_iter()
+                .find(|entry| entry.id == pane)
+                .and_then(|entry| clank_core::ids::AgentLabel::parse(&entry.label).ok());
+            if let Some(label) = label
+                && matches!(
+                    crate::agent_store::resolve_tool(&self.repo, &label),
+                    Ok(clank_core::vocab::Tool::Codex)
+                )
+            {
+                if let Some(bound) = crate::agent_store::load_agent_config(&self.repo, &label)
+                    .ok()
+                    .flatten()
+                    .and_then(|cfg| cfg.session)
+                    && bound.tool == clank_core::vocab::Tool::Codex
+                    && codex_chat::send(&bound.id.to_string(), text)?
+                {
+                    return Ok(());
+                }
+                return open_zellij::say_to_codex_pane(&self.session, pane, text);
+            }
+        }
         open_zellij::say_to_pane(&self.session, pane, text)
     }
     fn stop(&self, pane: &str) -> anyhow::Result<()> {
