@@ -4,6 +4,35 @@ const ok = (name, cond, detail = '') => out.push(`${cond ? 'PASS' : 'FAIL'}  ${n
 
 (async () => {
   try {
+  // ---- the timeline button owns the tray at a phone width
+  {
+    const { browser, page, errors } = await open();
+    const button = page.locator('#more');
+    const resting = await button.evaluate((el) => getComputedStyle(el).backgroundColor);
+    ok('timeline has one button and no separate Close control',
+       await button.textContent() === 'Timeline' && await button.getAttribute('aria-controls') === 'ledger'
+       && await page.locator('#close').count() === 0);
+    await button.click();
+    const pressed = await button.evaluate((el) => getComputedStyle(el).backgroundColor);
+    ok('first press opens the tray and visibly presses its button',
+       await page.locator('#ledger').evaluate((el) => el.classList.contains('open'))
+       && await button.getAttribute('aria-pressed') === 'true'
+       && await button.getAttribute('aria-expanded') === 'true'
+       && pressed !== resting && pressed !== 'rgba(0, 0, 0, 0)');
+    await button.click();
+    ok('second press closes the tray and releases its button',
+       !(await page.locator('#ledger').evaluate((el) => el.classList.contains('open')))
+       && await button.getAttribute('aria-pressed') === 'false'
+       && await button.getAttribute('aria-expanded') === 'false');
+    await button.focus();
+    await page.keyboard.press('Enter');
+    ok('Enter opens the tray from the focused button', await button.getAttribute('aria-pressed') === 'true');
+    await page.keyboard.press('Space');
+    ok('Space closes the tray from the focused button', await button.getAttribute('aria-pressed') === 'false');
+    ok('timeline toggle has no script errors', errors.length === 0, errors.join('; '));
+    await browser.close();
+  }
+
   // ---- queued Markdown can be created, opened, edited and reordered
   {
     const { browser, page, errors } = await open();

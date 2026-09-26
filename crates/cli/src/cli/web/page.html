@@ -93,7 +93,9 @@
   .bar .who .away { display: none; width: 7px; height: 7px; border-radius: 50%; background: var(--hue); animation: breathe 2.4s ease-in-out infinite; }
   .bar .who.elsewhere .away { display: inline-block; }
   .bar .who .tag { color: var(--muted); font-size: 11px; }
-  .bar .more { grid-column: 2; min-width: 44px; min-height: 44px; margin: -8px -12px 0 0; font-size: 20px; letter-spacing: 2px; color: var(--ink); display: inline-flex; align-items: center; justify-content: center; }
+  .bar .more { grid-column: 2; min-height: 44px; margin: -8px -8px 0 0; padding: 0 10px; border: 1px solid var(--edge); border-radius: 999px; color: var(--ink); font-size: 12px; font-weight: 700; display: inline-flex; align-items: center; justify-content: center; }
+  /* The open tray covers the header, so its own button stays above it. */
+  .bar .more[aria-pressed="true"] { position: fixed; top: 6px; right: 6px; z-index: 3; margin: 0; color: #fff; background: var(--hue-deep); border-color: var(--hue-deep); }
   .state { grid-column: 1 / -1; display: flex; align-items: baseline; gap: 14px; margin-top: 1px; }
   .state .doing { flex: 1 1 auto; min-width: 0; color: var(--muted); font-size: 12px; }
   .doing { display: flex; align-items: baseline; gap: 9px; }
@@ -242,10 +244,9 @@
 
   /* The ledger: a drawer on a phone, a column on a desk. */
   .ledger { display: none; background: var(--bezel); border-left: 1px solid var(--edge); overflow: auto; font-size: 13px; }
-  .ledger.open { display: block; position: fixed; inset: 0; z-index: 2; border: 0; }
+  .ledger.open { display: block; position: fixed; inset: 0; z-index: 2; border: 0; padding-top: 50px; }
   .ledger .lhead { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; padding: 10px 14px 8px; }
   .ledger .lhead .session { font-family: var(--plate); font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .ledger .close { color: var(--muted); }
   .ledger .forget { color: var(--muted); font-size: 12px; margin-left: auto; }
   .ledger .facts { padding: 6px 14px 10px; border-bottom: 1px solid var(--edge); }
   .ledger .facts .plan { font-family: var(--plate); font-weight: 700; }
@@ -345,7 +346,7 @@
     }
     .bar .more { display: none; }
     .ledger { display: block; grid-area: ledger; }
-    .ledger .close { display: none; }
+    .ledger.open { position: static; padding-top: 0; border-left: 1px solid var(--edge); }
   }
 </style>
 </head>
@@ -357,7 +358,7 @@
       <span class="name" id="whoname"></span><span class="caret">▾</span><span class="away"></span><span class="tag" id="autotag">auto</span>
       </button>
     </div>
-    <button class="more" id="more" aria-label="Open the ledger">···</button>
+    <button class="more" id="more" type="button" aria-controls="ledger" aria-expanded="false" aria-pressed="false">Timeline</button>
     <div class="state">
       <span class="doing" id="doing"></span>
       <span class="modes">
@@ -386,7 +387,7 @@
   </form>
   <div class="viewer" id="viewer" role="dialog" aria-label="Full-size image"></div>
   <aside class="ledger" id="ledger">
-    <div class="lhead"><span class="session" id="session"></span><button class="forget" id="forget">forget this device</button><button class="close" id="close">close</button></div>
+    <div class="lhead"><span class="session" id="session"></span><button class="forget" id="forget">forget this device</button></div>
     <div class="facts" id="facts"></div>
     <details class="team" id="team">
       <summary>Manage team</summary>
@@ -1632,8 +1633,11 @@
       return `<div class="row ${r.kind}"><span class="main">${main}</span><span class="age">${esc(r.age || '')}</span></div>`;
     }).join('');
   }
-  $('more').addEventListener('click', () => ledgerEl.classList.add('open'));
-  $('close').addEventListener('click', () => ledgerEl.classList.remove('open'));
+  $('more').addEventListener('click', () => {
+    const open = ledgerEl.classList.toggle('open');
+    $('more').setAttribute('aria-pressed', String(open));
+    $('more').setAttribute('aria-expanded', String(open));
+  });
 
   // ---- status ----
   function onStatus(d) {
