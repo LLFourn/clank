@@ -89,6 +89,7 @@ fn policy(nonce: &str) -> String {
          media-src 'self' blob:; \
          font-src 'self'; \
          connect-src 'self'; \
+         frame-src 'self'; \
          form-action 'self'; \
          base-uri 'none'; \
          frame-ancestors 'none'"
@@ -6617,6 +6618,7 @@ mod tests {
                 "img-src 'self' data:",
                 "font-src 'self'",
                 "connect-src 'self'",
+                "frame-src 'self'",
                 "frame-ancestors 'none'",
             ] {
                 assert!(policy.contains(named), "{what} wants {named}: {policy}");

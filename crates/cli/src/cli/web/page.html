@@ -136,8 +136,13 @@
   .strip .how { display: block; color: var(--muted); margin-top: 3px; }
 
   /* One agent. */
-  .agent { grid-area: agent; display: grid; min-height: 0; border-top: 1px solid var(--edge); }
+  .agent { grid-area: agent; display: grid; grid-template-rows: minmax(0, 1fr); min-height: 0; border-top: 1px solid var(--edge); }
   .views { position: relative; min-height: 0; }
+  .plan-view { min-width: 0; min-height: 0; display: grid; grid-template-rows: auto minmax(0, 1fr); background: var(--base); }
+  .plan-view .head { display: flex; align-items: center; gap: 12px; padding: 8px 14px; border-bottom: 1px solid var(--edge); }
+  .plan-view .head button { flex: 0 0 auto; color: var(--hue-deep); font-weight: 700; }
+  .plan-view .head span { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; color: var(--muted); }
+  .plan-view iframe { display: block; width: 100%; height: 100%; min-height: 0; border: 0; background: var(--base); }
   .view { position: absolute; inset: 0; overflow: auto; display: none; }
   .view.on { display: block; }
   .empty { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: var(--muted); padding: 24px; text-align: center; }
@@ -372,6 +377,10 @@
   <div class="strip" id="strip" hidden></div>
   <div class="agent">
     <div class="views" id="views"><div class="empty" id="empty">Waiting for this session…</div></div>
+    <section class="plan-view" id="plan-view" aria-labelledby="plan-title" hidden>
+      <div class="head"><button id="plan-back" type="button">← Agents</button><span id="plan-title"></span></div>
+      <iframe id="plan-frame" title="Plan page" sandbox="allow-same-origin"></iframe>
+    </section>
   </div>
   <form class="say" id="say">
     <div class="bubble">
@@ -419,7 +428,7 @@
     <div class="stash-list" id="stash-list"></div>
     <section class="stash-detail" id="stash-detail" hidden>
       <strong id="stash-title"></strong><div class="meta" id="stash-meta"></div>
-      <div class="controls"><a id="stash-html" target="_blank" rel="noopener">Open HTML</a><button type="button" id="stash-restore">Restore</button><button type="button" id="stash-close">Close</button></div>
+      <div class="controls"><a id="stash-html">Open HTML</a><button type="button" id="stash-restore">Restore</button><button type="button" id="stash-close">Close</button></div>
       <pre id="stash-body"></pre>
       <div class="why" id="stash-why" role="status" aria-live="polite" hidden></div>
     </section>
@@ -821,6 +830,7 @@
   whoEl.addEventListener('click', () => openPicker(pickerEl.hidden));
   pickerEl.addEventListener('click', (e) => {
     const opt = e.target.closest('.opt'); if (!opt) return;
+    if (!$('plan-view').hidden) closeSitePage(false);
     const k = opt.dataset.key;
     selection = k === 'auto' ? { auto: true } : { label: k.slice(4) };
     keepSelection();
@@ -945,6 +955,7 @@
     paintHeader();
   }
   for (const [m, btn] of Object.entries(modeBtns)) btn.addEventListener('click', () => {
+    if (!$('plan-view').hidden) closeSitePage(false);
     if (m === 'transcript' && !hasTranscript(shown)) { openChatReason(); return; }
     if (!shown) return;
     closeChatReason();
@@ -1388,7 +1399,7 @@
           + `<span class="name">${esc(s.stem)}</span>`
           + `<span class="note">${s.commits} commit${s.commits === 1 ? '' : 's'}${s.ready ? ' · ready' : s.waiting_for ? ' · waiting' : ''}</span>`
           + `<button type="button" data-open="stash">view</button>`
-          + `<a href="html/stash/${encodeURIComponent(s.stem)}.html" target="_blank" rel="noopener">HTML</a>`
+          + `<a href="html/stash/${encodeURIComponent(s.stem)}.html">HTML</a>`
           + `</div>`).join('')
       : '';
   }
@@ -1620,11 +1631,11 @@
     paintTeam(facts.agents);
     paintQueue(L.queue);
     paintStash(L.stash_entries || []);
-    // A row's page is the clank html one, in a window of its own. The
+    // A row's page is the clank html one, in the agent site's viewer. The
     // builder writes a plan's name verbatim, spaces and all; the link
     // encodes each segment and the server decodes it.
     const href = (page) => 'html/' + page.split('/').map(encodeURIComponent).join('/');
-    const link = (r, inner) => r.page ? `<a href="${esc(href(r.page))}" target="_blank" rel="noopener">${inner}</a>` : inner;
+    const link = (r, inner) => r.page ? `<a href="${esc(href(r.page))}">${inner}</a>` : inner;
     $('rows').innerHTML = L.rows.map((r) => {
       const main = r.kind === 'header' ? link(r, esc(r.text))
         : r.kind === 'commit' ? `<span class="glyph">${esc(r.glyph || '')}</span>${link(r, `<span class="sha">${esc(r.sha || '')}</span>`)} ${r.stands_for ? `<span class="plan">${esc(r.stands_for)}</span>` : esc(r.text)}`
@@ -1633,10 +1644,35 @@
       return `<div class="row ${r.kind}"><span class="main">${main}</span><span class="age">${esc(r.age || '')}</span></div>`;
     }).join('');
   }
-  $('more').addEventListener('click', () => {
-    const open = ledgerEl.classList.toggle('open');
+  function setTimelineOpen(open) {
+    ledgerEl.classList.toggle('open', open);
     $('more').setAttribute('aria-pressed', String(open));
     $('more').setAttribute('aria-expanded', String(open));
+  }
+  $('more').addEventListener('click', () => setTimelineOpen(!ledgerEl.classList.contains('open')));
+  function openSitePage(url, title) {
+    $('plan-title').textContent = title || 'Plan page';
+    $('plan-frame').title = title || 'Plan page';
+    $('plan-frame').src = url.href;
+    $('views').hidden = true;
+    $('plan-view').hidden = false;
+    setTimelineOpen(false);
+    $('plan-back').focus();
+  }
+  function closeSitePage(focusWho = true) {
+    $('plan-view').hidden = true;
+    $('plan-frame').removeAttribute('src');
+    $('views').hidden = false;
+    if (focusWho) $('who').focus();
+  }
+  $('plan-back').addEventListener('click', () => closeSitePage());
+  ledgerEl.addEventListener('click', (e) => {
+    const link = e.target.closest('a[href]');
+    if (!link || !ledgerEl.contains(link)) return;
+    const url = new URL(link.href);
+    if (url.origin !== location.origin || !url.pathname.startsWith('/html/')) return;
+    e.preventDefault();
+    openSitePage(url, link.textContent.trim());
   });
 
   // ---- status ----

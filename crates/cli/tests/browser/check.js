@@ -33,6 +33,50 @@ const ok = (name, cond, detail = '') => out.push(`${cond ? 'PASS' : 'FAIL'}  ${n
     await browser.close();
   }
 
+  // ---- generated plan pages stay inside the agent website
+  {
+    const { browser, page, errors } = await open();
+    const top = page.url();
+    await page.route('**/html/**', (route) => {
+      const path = new URL(route.request().url()).pathname;
+      const body = path === '/html/style.css' ? 'h1 { color: rgb(18, 52, 86); }'
+        : path === '/html/plan/foo.html' ? '<!doctype html><link rel="stylesheet" href="../style.css"><main><h1>Plan foo</h1><p>Readable <strong>milestone</strong></p><a href="../commit/abc123.html">Open commit</a></main>'
+        : path === '/html/commit/abc123.html' ? '<!doctype html><link rel="stylesheet" href="../style.css"><main><h1>Commit abc123</h1><a href="../plan/foo.html">Back to plan</a></main>'
+        : '<h1>Missing page</h1>';
+      route.fulfill({ status: path === '/html/style.css' || path === '/html/plan/foo.html' || path === '/html/commit/abc123.html' ? 200 : 404,
+        contentType: path.endsWith('.css') ? 'text/css' : 'text/html', body });
+    });
+    await page.evaluate((d) => window.__send('status', d), facts([agent('codex', 'master')], {
+      ledger: { plan: 'foo', gate: 'continued', dirty: null, queue: [], stash: 0, blocks: [],
+        rows: [{ kind: 'header', text: 'foo', page: 'plan/foo.html' }] },
+    }));
+    await page.click('#more');
+    await page.click('#rows .row.header a');
+    const embedded = page.frameLocator('#plan-frame');
+    await embedded.locator('h1').waitFor();
+    ok('selecting a plan keeps the agent chrome and top-level URL', page.url() === top
+       && await page.isVisible('#who') && await page.isVisible('#more')
+       && await page.isVisible('#plan-view') && await page.isHidden('#views')
+       && await page.locator('#plan-frame').evaluate((el) => el.getBoundingClientRect().height > 200));
+    ok('the plan keeps its prose and generated stylesheet',
+       await embedded.locator('h1').textContent() === 'Plan foo'
+       && (await embedded.locator('p').textContent()).includes('Readable milestone')
+       && await embedded.locator('h1').evaluate((el) => getComputedStyle(el).color) === 'rgb(18, 52, 86)');
+    await embedded.locator('a').click();
+    await embedded.locator('h1').filter({ hasText: 'Commit abc123' }).waitFor();
+    ok('plan links navigate inside the viewer', page.url() === top
+       && await embedded.locator('h1').textContent() === 'Commit abc123'
+       && await page.isVisible('#plan-back'));
+    await page.click('#plan-back');
+    await page.click('#more');
+    await page.click('#team > summary');
+    ok('the return path reaches agents and team', page.url() === top
+       && await page.isHidden('#plan-view') && await page.isVisible('#views')
+       && await page.isVisible('#team-rows'));
+    ok('embedded plan has no script errors', errors.length === 0, errors.join('; '));
+    await browser.close();
+  }
+
   // ---- queued Markdown can be created, opened, edited and reordered
   {
     const { browser, page, errors } = await open();
