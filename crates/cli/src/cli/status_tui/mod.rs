@@ -2620,7 +2620,6 @@ pub(crate) async fn run_tui(
                         as std::sync::Arc<dyn crate::cli::web::Panes>,
                 )
             }),
-            std::sync::Arc::new(crate::cli::web::door::Door::new(home.clone())),
             crate::cli::web::PANE_POLL,
             crate::cli::web::STOP_GRACE,
             remote::Browser,
@@ -2754,6 +2753,10 @@ pub(crate) async fn run_tui(
         at: std::time::Instant::now(),
         fingerprint: crate::cli::status::attendance_fingerprint(&repo),
     };
+    let mut admin_page_cache: Option<RemotePage> = None;
+    let mut admin_page_shown = None;
+    let mut admin_page_error: Option<String> = None;
+    let mut admin_refresh = false;
     // Labeled so a `Quit` key inside the per-key drain loop exits the
     // event loop, not just the inner `for`.
     'evloop: loop {
@@ -2892,7 +2895,7 @@ pub(crate) async fn run_tui(
         // the overlay mounts over any page, and the loop goes round
         // to draw it, as a reopen's does. Drained before the view
         // borrows the switch for its row.
-        if let Some(n) = remote.drain(&snapshot).pop() {
+        if let Some(n) = remote.drain(&snapshot).await.pop() {
             detail = Some(Overlay::notice(n));
             continue;
         }
@@ -2912,18 +2915,52 @@ pub(crate) async fn run_tui(
         ) {
             clear_target = None;
         }
-        let remote_detail = remote.detail();
-        // Every page that READS the door, not just the one that used to
-        // hold its contents. The token page and the sessions page were
-        // added without this and got `RemotePage::default()` instead:
-        // a blank credential, and a session list so empty that nothing
-        // could be revoked.
-        let remote_page = crate::cli::status_tui::input::reads_the_door(mode).then(|| {
-            crate::cli::status_tui::input::RemotePage {
-                token: remote.door().token().unwrap_or_default(),
-                sessions: remote.door().sessions().unwrap_or_default(),
+        let shown = remote.shown();
+        // Keep the host's answer while one of its pages is open. A
+        // repaint can happen every 120ms; only entering a page, a
+        // state change, or a mutation needs another network request.
+        if reads_server_admin(mode) {
+            if admin_page_cache.is_none() || admin_page_shown != Some(shown) || admin_refresh {
+                admin_page_shown = Some(shown);
+                admin_refresh = false;
+                admin_page_error = None;
+                let mut fetch_failed = false;
+                admin_page_cache = Some(match remote.admin_state().await {
+                    Ok(Some(state)) => RemotePage {
+                        token: state.token,
+                        sessions: state.sessions,
+                        admin_available: true,
+                    },
+                    Ok(None) => RemotePage {
+                        admin_available: false,
+                        ..Default::default()
+                    },
+                    Err(error) => {
+                        fetch_failed = true;
+                        let why = format!("{error:#}");
+                        admin_page_error = Some(why.clone());
+                        detail = Some(Overlay::error("server controls unavailable".into(), why));
+                        RemotePage {
+                            admin_available: false,
+                            ..Default::default()
+                        }
+                    }
+                });
+                if fetch_failed {
+                    continue;
+                }
             }
-        });
+        } else {
+            admin_page_cache = None;
+            admin_page_shown = None;
+            admin_page_error = None;
+        }
+        let remote_page = admin_page_cache.as_ref();
+        let remote_detail = match (remote.detail(), admin_page_error.as_deref()) {
+            (Some(detail), Some(error)) => Some(format!("{detail} · server controls: {error}")),
+            (None, Some(error)) => Some(format!("server controls: {error}")),
+            (detail, None) => detail,
+        };
         let view = PanelView {
             wait_page: wait_page.as_ref(),
             seen_session: seen_session.as_ref(),
@@ -2939,9 +2976,9 @@ pub(crate) async fn run_tui(
             // A non-blocking drain: the worker reports after each
             // batch, the loop never waits on zellij to paint.
             reach: reconcile_worker.reach(),
-            remote: remote.shown(),
+            remote: shown,
             remote_detail: remote_detail.as_deref(),
-            remote_page: remote_page.as_ref(),
+            remote_page,
             presence,
             lost: reconcile_worker.lost(),
         };
@@ -3236,9 +3273,10 @@ pub(crate) async fn run_tui(
                             use crate::cli::status_tui::input::{RemoteAction, RemoteNav};
                             // The rows the key was pressed on are the
                             // rows that were PAINTED, not a fresh
-                            // read: what the door holds now may differ.
-                            let actions = crate::cli::status_tui::input::remote_actions(
+                            // read: the host's state may have changed.
+                            let actions = crate::cli::status_tui::input::remote_actions_for(
                                 remote.shown() == remote::Shown::On,
+                                remote_page.is_some_and(|page| page.admin_available),
                             );
                             let sel = sel.min(actions.len().saturating_sub(1));
                             match crate::cli::status_tui::input::remote_page_nav(sel, &actions, k) {
@@ -3260,9 +3298,11 @@ pub(crate) async fn run_tui(
                                         detail = Some(Overlay::notice(n));
                                     }
                                 }
-                                RemoteNav::Activate(RemoteAction::Open) => remote.open_again(),
+                                RemoteNav::Activate(RemoteAction::Open) => {
+                                    remote.open_again().await
+                                }
                                 RemoteNav::Activate(RemoteAction::Phone) => {
-                                    if let Some(url) = remote.link() {
+                                    if let Some(url) = remote.link().await {
                                         detail =
                                             Some(Overlay::link("link a phone".to_string(), url));
                                     }
@@ -3371,12 +3411,13 @@ pub(crate) async fn run_tui(
                                     };
                                 }
                                 TokenNav::Rotate => {
-                                    if let Err(e) = remote.door().rotate_token() {
+                                    if let Err(e) = remote.rotate_token().await {
                                         detail = Some(Overlay::error(
                                             "token not rotated".to_string(),
                                             format!("{e:#}"),
                                         ));
                                     }
+                                    admin_refresh = true;
                                     // A new credential is a new
                                     // document: read it from the top.
                                     mode = Mode::TokenPage { scroll: 0 };
@@ -3387,7 +3428,7 @@ pub(crate) async fn run_tui(
                         }
                         Mode::SessionsPage { sel } => {
                             use crate::cli::status_tui::input::SessionsNav;
-                            let page = remote_page.clone().unwrap_or_default();
+                            let page = remote_page.cloned().unwrap_or_default();
                             let count = page.sessions.len();
                             match crate::cli::status_tui::input::sessions_page_nav(sel, count, k) {
                                 SessionsNav::Quit => break 'evloop,
@@ -3399,13 +3440,14 @@ pub(crate) async fn run_tui(
                                     // The rows the key was pressed on are
                                     // the rows that were PAINTED.
                                     if let Some(s) = page.sessions.get(at)
-                                        && let Err(e) = remote.door().revoke_session(&s.id_hash)
+                                        && let Err(e) = remote.revoke_session(&s.id_hash).await
                                     {
                                         detail = Some(Overlay::error(
                                             "session not revoked".to_string(),
                                             format!("{e:#}"),
                                         ));
                                     }
+                                    admin_refresh = true;
                                     mode = Mode::SessionsPage {
                                         sel: at.min(count.saturating_sub(2)),
                                     };
@@ -3544,7 +3586,7 @@ pub(crate) async fn run_tui(
                                         detail = Some(Overlay::notice(n));
                                     }
                                 }
-                                PanelAction::OpenRemote => remote.open_again(),
+                                PanelAction::OpenRemote => remote.open_again().await,
                                 PanelAction::OpenRemotePage => mode = Mode::RemotePage { sel: 0 },
                                 PanelAction::OpenPicker => {
                                     // Read the candidates FRESH right now.
@@ -5752,7 +5794,7 @@ pub(crate) mod tests {
     #[test]
     fn the_page_reads_only_fields_the_facts_have() {
         use std::collections::BTreeSet;
-        const PAGE: &str = include_str!("../web/page.html");
+        const PAGE: &str = clank_web::assets::PAGE;
         let mut s = fixtures::with_agents(
             fixtures::snap(
                 vec![fixtures::plan_state_at(

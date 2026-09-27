@@ -211,7 +211,10 @@ pub(super) fn render_at(
     if let Mode::RemotePage { sel } = mode {
         let empty = RemotePage::default();
         let page = view.remote_page.unwrap_or(&empty);
-        let actions = remote_actions(view.remote == crate::cli::status_tui::remote::Shown::On);
+        let actions = remote_actions_for(
+            view.remote == crate::cli::status_tui::remote::Shown::On,
+            page.admin_available,
+        );
         let sel = sel.min(actions.len().saturating_sub(1));
         return render_remote_page(
             view.remote,
@@ -1918,19 +1921,21 @@ pub(super) fn render_remote_page(
                     label: "serving",
                     on: matches!(remote, Shown::On | Shown::Starting),
                     desc: match remote {
-                        Shown::Unconfigured => {
-                            "no tunnel is configured, so there is nowhere to serve it"
-                        }
+                        Shown::Unconfigured => "no host or tunnel is configured",
                         Shown::Starting => "coming up",
                         Shown::Stopping => "going down",
-                        _ => "serve this repo through the tunnel",
+                        _ => "connect this repo to the configured host",
                     },
                 },
                 RemoteAction::Open => MenuRow::Action {
                     key,
                     label: "open in the browser",
                     value: None,
-                    desc: "a one-time link, on this machine",
+                    desc: if page.admin_available {
+                        "a one-time link, on this machine"
+                    } else {
+                        "open using the host's login policy"
+                    },
                     danger: false,
                 },
                 RemoteAction::Phone => MenuRow::Action {
@@ -5621,9 +5626,10 @@ mod tests {
                 created: "2026-09-14T10:01:00Z".into(),
                 last_seen: "2026-09-15T08:30:00Z".into(),
             }],
+            admin_available: true,
         };
         let text = |shown: Shown, detail: Option<&str>| {
-            let actions = remote_actions(shown == Shown::On);
+            let actions = remote_actions_for(shown == Shown::On, true);
             render_remote_page(shown, detail, &page, &actions, 0, 40, 80)
                 .0
                 .iter()
@@ -5673,18 +5679,26 @@ mod tests {
         // Every painted row is a row a key acts on: the menu's line
         // count is the blocks the rows produce, and nothing besides.
         assert_eq!(
-            remote_actions(true).len(),
+            remote_actions_for(true, true).len(),
             5,
             "switch, open, phone, token, sessions"
         );
 
         let empty = RemotePage::default();
-        let bare = render_remote_page(Shown::Off, None, &empty, &remote_actions(false), 0, 40, 80)
-            .0
-            .iter()
-            .map(|l| strip_escapes(l))
-            .collect::<Vec<_>>()
-            .join("\n");
+        let bare = render_remote_page(
+            Shown::Off,
+            None,
+            &empty,
+            &remote_actions_for(false, true),
+            0,
+            40,
+            80,
+        )
+        .0
+        .iter()
+        .map(|l| strip_escapes(l))
+        .collect::<Vec<_>>()
+        .join("\n");
         assert!(bare.contains("none open"), "{bare}");
     }
 
@@ -5695,6 +5709,7 @@ mod tests {
         let page = RemotePage {
             token: "TOKEN-abcdefghijklmnopqrstuvwxyz0123456789".into(),
             sessions: vec![],
+            admin_available: true,
         };
         // Narrow enough to force a wrap: a credential is typed
         // elsewhere, so it must never be elided.
@@ -5718,6 +5733,7 @@ mod tests {
         let page = RemotePage {
             token: token.into(),
             sessions: Vec::new(),
+            admin_available: true,
         };
         let drawn = |cols: usize| {
             render_token_page(&page, 0, 60, cols)
@@ -5827,6 +5843,7 @@ mod tests {
         let page = RemotePage {
             token: token.into(),
             sessions: vec![],
+            admin_available: true,
         };
         // The case codex named: 8 rows, 24 columns.
         let (_, total) = render_token_page(&page, 0, 8, 24);
@@ -5865,7 +5882,7 @@ mod tests {
     fn a_long_failure_reason_never_costs_the_menu() {
         use crate::cli::status_tui::remote::Shown;
         let page = RemotePage::default();
-        let actions = remote_actions(false);
+        let actions = remote_actions_for(false, true);
         let reason = "not reachable through the tunnel: ".to_string()
             + &(0..30)
                 .map(|i| format!("cause {i} of the chain"))
@@ -5921,6 +5938,7 @@ mod tests {
                     last_seen: "2026-09-02T03:04:00Z".into(),
                 })
                 .collect(),
+            admin_available: true,
         };
         let shown = render_sessions_page(&page, 0, 30, 60)
             .0
@@ -5967,6 +5985,7 @@ mod tests {
         let page = RemotePage {
             token: token.into(),
             sessions: Vec::new(),
+            admin_available: true,
         };
         for cols in [80, 48, 40, 30, 24] {
             let lines = render_token_page(&page, 0, 40, cols)

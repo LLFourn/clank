@@ -268,6 +268,57 @@ pub struct HooksSection {
 pub struct WebSection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub port: Option<u16>,
+    /// Attach this repo to a separately started host instead of
+    /// launching the default local Cloudflare host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attach: Option<WebAttach>,
+}
+
+/// Connector credentials stay in the gitignored repo config. The
+/// browser URL belongs to the host's own login policy.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WebAttach {
+    pub endpoint: String,
+    pub session: String,
+    pub credential: String,
+    pub browser_url: String,
+}
+
+impl WebAttach {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.session.is_empty() && self.session.len() <= 128,
+            "web.attach.session must contain 1–128 bytes"
+        );
+        anyhow::ensure!(
+            !self.credential.is_empty(),
+            "web.attach.credential is empty"
+        );
+        let endpoint = url::Url::parse(&self.endpoint)?;
+        let browser = url::Url::parse(&self.browser_url)?;
+        let safe = |url: &url::Url, secure: &str, local: &str| {
+            let loopback = url.host_str().is_some_and(|host| {
+                host.eq_ignore_ascii_case("localhost")
+                    || host
+                        .parse::<std::net::IpAddr>()
+                        .is_ok_and(|address| address.is_loopback())
+            });
+            (url.scheme() == secure || (url.scheme() == local && loopback))
+                && url.host_str().is_some()
+                && url.username().is_empty()
+                && url.password().is_none()
+                && url.fragment().is_none()
+        };
+        anyhow::ensure!(
+            safe(&endpoint, "wss", "ws"),
+            "web.attach.endpoint must use wss, or ws on loopback"
+        );
+        anyhow::ensure!(
+            safe(&browser, "https", "http"),
+            "web.attach.browser_url must use https, or http on loopback"
+        );
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -851,6 +902,41 @@ pub(crate) fn set_key_if_absent(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn existing_web_host_requires_encrypted_remote_urls() {
+        let mut attach = WebAttach {
+            endpoint: "wss://host.example/connector".into(),
+            session: "team".into(),
+            credential: "connector-secret".into(),
+            browser_url: "https://host.example/team".into(),
+        };
+        attach.validate().unwrap();
+        attach.endpoint = "ws://host.example/connector".into();
+        assert!(attach.validate().is_err());
+        attach.endpoint = "ws://127.0.0.1:1234/connector".into();
+        attach.browser_url = "http://localhost:1234/team".into();
+        attach.validate().unwrap();
+        attach.browser_url = "http://host.example/team".into();
+        assert!(attach.validate().is_err());
+    }
+
+    #[test]
+    fn recording_the_local_port_keeps_an_existing_host_attachment() {
+        let repo = tempfile::tempdir().unwrap();
+        let path = repo.path().join(".clank/config.json");
+        write(
+            &path,
+            r#"{"web":{"attach":{"endpoint":"wss://host.example/connector","session":"team","credential":"secret","browser_url":"https://host.example/team"}}}"#,
+        );
+        crate::agent_store::record_web_port(repo.path(), 1234).unwrap();
+        let web = crate::agent_store::load_repo_config_required(repo.path())
+            .unwrap()
+            .web
+            .unwrap();
+        assert_eq!(web.port, Some(1234));
+        assert_eq!(web.attach.unwrap().session, "team");
+    }
 
     fn write(path: &Path, body: &str) {
         if let Some(parent) = path.parent() {

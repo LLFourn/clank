@@ -1027,16 +1027,18 @@ pub(super) enum RemoteAction {
 
 /// The remote page's rows. The two links are ABSENT while the
 /// remote is off rather than shown and inert: there is no URL to
-/// link into. The token is always there — it is the same token
-/// whether the remote is up or not.
-pub(super) fn remote_actions(on: bool) -> Vec<RemoteAction> {
+/// link into. Token and session controls belong only to the owned
+/// default host.
+pub(super) fn remote_actions_for(on: bool, admin: bool) -> Vec<RemoteAction> {
     let mut out = vec![RemoteAction::Switch];
     if on {
         out.push(RemoteAction::Open);
         out.push(RemoteAction::Phone);
     }
-    out.push(RemoteAction::Token);
-    out.push(RemoteAction::Sessions);
+    if admin {
+        out.push(RemoteAction::Token);
+        out.push(RemoteAction::Sessions);
+    }
     // No `back` row: `esc` is already the way out and already in the
     // hint, and a row that duplicates a key is a row that can be
     // selected by accident.
@@ -1188,8 +1190,8 @@ pub(super) fn priority_page_nav(value: u16, key: Key) -> PriorityNav {
 
 /// The page a remote row opens, if it opens one.
 ///
-/// Named rather than inlined so the frame can ask which modes READ THE
-/// DOOR and get an answer that cannot drift from the rows: a page
+/// Named rather than inlined so the loop can ask which modes need
+/// server administration data and get an answer that cannot drift from the rows: a page
 /// opened from here without its data shows a blank credential and an
 /// empty session list, which is what happened.
 pub(super) fn remote_destination(a: &RemoteAction) -> Option<Mode> {
@@ -1200,8 +1202,8 @@ pub(super) fn remote_destination(a: &RemoteAction) -> Option<Mode> {
     }
 }
 
-/// Whether this mode needs the door read for its frame.
-pub(super) fn reads_the_door(mode: Mode) -> bool {
+/// Whether this mode needs the cached host administration state.
+pub(super) fn reads_server_admin(mode: Mode) -> bool {
     matches!(
         mode,
         Mode::RemotePage { .. } | Mode::TokenPage { .. } | Mode::SessionsPage { .. }
@@ -1265,12 +1267,23 @@ pub(super) fn sessions_page_nav(sel: usize, count: usize, key: Key) -> SessionsN
     }
 }
 
-/// What the remote page shows, read from the door for the frame.
-#[derive(Debug, Clone, Default)]
+/// What the remote page shows, fetched from the running host.
+#[derive(Debug, Clone)]
 pub(super) struct RemotePage {
     /// This machine's token, as the row prints it for pasting.
     pub(super) token: String,
     pub(super) sessions: Vec<crate::cli::web::door::SessionRecord>,
+    pub(super) admin_available: bool,
+}
+
+impl Default for RemotePage {
+    fn default() -> Self {
+        Self {
+            token: String::new(),
+            sessions: Vec::new(),
+            admin_available: true,
+        }
+    }
 }
 
 pub(super) fn agent_detail_nav(sel: usize, actions: &[DetailAction], key: Key) -> DetailNav {
@@ -3902,10 +3915,12 @@ mod tests {
     #[test]
     fn the_remote_page_is_all_rows_and_no_content() {
         use RemoteAction::*;
-        let off = remote_actions(false);
+        let off = remote_actions_for(false, true);
         assert_eq!(off, vec![Switch, Token, Sessions]);
-        let on = remote_actions(true);
+        let on = remote_actions_for(true, true);
         assert_eq!(on, vec![Switch, Open, Phone, Token, Sessions]);
+        assert_eq!(remote_actions_for(true, false), vec![Switch, Open, Phone]);
+        assert_eq!(remote_actions_for(false, false), vec![Switch]);
         // No `back` row: esc is the way out, and it is in the hint.
         assert!(!on.iter().any(|a| remote_action_key(a) == "esc"));
 
@@ -3944,29 +3959,29 @@ mod tests {
         assert_eq!(remote_page_nav(0, &on, Key::Quit), RemoteNav::Quit);
     }
 
-    /// A page opened from the remote menu must have the door read for
+    /// A page opened from the remote menu must have host state for
     /// it. Both new pages shipped without that: the token page drew a
     /// blank credential and the sessions page said `none open`, so no
     /// real session could be revoked. The rows and the frame agree
     /// HERE, once, rather than in two places that can drift.
     #[test]
-    fn every_page_a_remote_row_opens_reads_the_door() {
+    fn every_page_a_remote_row_opens_reads_server_admin() {
         for on in [false, true] {
-            for a in remote_actions(on) {
+            for a in remote_actions_for(on, true) {
                 let Some(dest) = remote_destination(&a) else {
                     continue;
                 };
                 assert!(
-                    reads_the_door(dest),
-                    "{a:?} opens {dest:?}, which would be drawn with no door data"
+                    reads_server_admin(dest),
+                    "{a:?} opens {dest:?}, which would be drawn with no host data"
                 );
             }
         }
         // And the page they are opened FROM reads it too.
-        assert!(reads_the_door(Mode::RemotePage { sel: 0 }));
-        // Pages that do not touch the door do not pay for it.
-        assert!(!reads_the_door(Mode::LogScroll));
-        assert!(!reads_the_door(Mode::AgentDetail { idx: 0, sel: 0 }));
+        assert!(reads_server_admin(Mode::RemotePage { sel: 0 }));
+        // Other pages do not fetch host administration state.
+        assert!(!reads_server_admin(Mode::LogScroll));
+        assert!(!reads_server_admin(Mode::AgentDetail { idx: 0, sel: 0 }));
         // The rows that ACT rather than navigate open nothing.
         assert_eq!(remote_destination(&RemoteAction::Switch), None);
         assert_eq!(remote_destination(&RemoteAction::Open), None);

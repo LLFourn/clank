@@ -4,8 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>clank</title>
-<link rel="stylesheet" href="/xterm.css">
-<script src="/xterm.js"></script>
+<link rel="stylesheet" href="__CLANK_BASE_PATH__xterm.css">
+<script src="__CLANK_BASE_PATH__xterm.js"></script>
 <style>
   /* The face, declared here and served from this binary: the
      stylesheet that used to declare it was fetched from Google, on a
@@ -15,7 +15,7 @@
     font-style: normal;
     font-weight: 700;
     font-display: swap;
-    src: url("/plate.woff2") format("woff2");
+    src: url("__CLANK_BASE_PATH__plate.woff2") format("woff2");
   }
   :root {
     --base: #faf9f7;
@@ -111,6 +111,7 @@
   .state .modes button[aria-disabled="true"] { cursor: help; }
   .chat-reason { position: absolute; top: 100%; right: 8px; z-index: 5; width: min(330px, calc(100vw - 16px)); padding: 12px; background: var(--bezel); border: 1px solid var(--edge); border-radius: 8px; box-shadow: 0 18px 44px rgba(0, 0, 0, .5); font-size: 13px; }
   .chat-reason button { display: block; margin: 9px 0 0 auto; color: var(--hue-deep); text-decoration: underline; }
+  .bridge-error { grid-column: 1 / -1; margin-top: 6px; padding: 7px 9px; color: var(--changes); background: var(--bezel); border: 1px solid var(--changes); border-radius: 5px; overflow-wrap: anywhere; }
   @keyframes breathe { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
   @media (prefers-reduced-motion: reduce) { .dot, .away { animation: none; } }
 
@@ -381,6 +382,7 @@
     </div>
     <div class="chat-reason" id="chat-reason" role="dialog" aria-label="Why Chat is unavailable" hidden><span id="chat-reason-text"></span><button id="chat-reason-close" type="button">Close</button></div>
     <div class="picker" id="picker" role="listbox" aria-label="Choose an agent" hidden></div>
+    <div class="bridge-error" id="bridge-error" role="alert" hidden></div>
   </header>
   <div class="strip" id="strip" hidden></div>
   <div class="agent">
@@ -446,6 +448,21 @@
 <script nonce="__CLANK_NONCE__">
 (() => {
   const $ = (id) => document.getElementById(id);
+  const web = window.CLANK_WEB_CONFIG || {base:'/',hosted:false,login:'/login',signout:null};
+  const route = (path) => web.base + path.replace(/^\/+/, '');
+  async function actionFailure(reply) {
+    let body;
+    try { body = await reply.text(); } catch (err) {
+      const failure = new Error('response lost after dispatch');
+      failure.outcomeUnknown = true;
+      return failure;
+    }
+    let details = null;
+    try { details = JSON.parse(body); } catch (err) {}
+    const failure = new Error(details?.why || body || `Request failed (${reply.status})`);
+    failure.outcomeUnknown = details?.code === 'outcome_unknown';
+    return failure;
+  }
   // The credential this browser signs itself back in with. A store
   // that throws — private browsing, storage off — is a browser that
   // pastes the token again, not a page that breaks.
@@ -469,7 +486,7 @@
   // The page holds the state and performs the effects; `doorStep` owns
   // what follows what -- including whether a provisioning reply that
   // lands after a forget may still be written.
-  let door = doorStart({ stored: keep.get(), tried: false });
+  let door = web.hosted ? { sealed: false } : doorStart({ stored: keep.get(), tried: false });
   const perform = (fx) => {
     switch (fx.do) {
       case 'store': keep.set(fx.token); return;
@@ -507,7 +524,7 @@
   // inline script is the whole page (a-page-that-does-not-parse-is-not-a-page).
   async function provision() {
     try {
-      const r = await fetch('/token');
+      const r = await fetch(route('/token'));
       if (!r.ok) return;
       const { token } = await r.json();
       // Dispatched, not decided: the forget this was racing may have
@@ -516,11 +533,11 @@
       dispatch({ t: 'provisionReply', token });
     } catch (err) {}
   }
-  provision();
+  if (!web.hosted) provision();
   // Arriving here IS the confirmation that the cookie stuck, so the
   // sign-in page's one-shot guard is spent: a cookie lost later is
   // signed back in rather than left at the form (login.html).
-  dispatch({ t: 'signedIn' });
+  if (!web.hosted) dispatch({ t: 'signedIn' });
   const viewsEl = $('views'), emptyEl = $('empty');
   const whoEl = $('who'), whoName = $('whoname'), autoTag = $('autotag'), doingEl = $('doing');
   const projectEl = $('project');
@@ -529,6 +546,7 @@
   const narrowTimeline = window.matchMedia('(max-width: 959px)');
   let timelineOpen = false;
   const chatReasonEl = $('chat-reason'), chatReasonText = $('chat-reason-text');
+  const bridgeErrorEl = $('bridge-error');
   const form = $('say'), input = $('text'), send = $('send'), sentEl = $('sent'), stopBtn = $('stop');
   /*__CLANK_COMPOSER__*/
   // The box's height is the script's to set: a textarea has none of
@@ -584,14 +602,26 @@
   // next load would ask for the token again and be remembered against
   // the user's wishes.
   const forgetEl = $('forget');
+  if (web.hosted && !web.signout) forgetEl.hidden = true;
   async function forgetAtDoor() {
     forgetEl.disabled = true;
     forgetEl.textContent = 'forgetting…';
     let ok = false;
-    try { ok = (await fetch('/forget', { method: 'POST' })).ok; } catch (err) {}
+    try { ok = (await fetch(route('/forget'), { method: 'POST' })).ok; } catch (err) {}
     dispatch({ t: 'forgetReply', ok });
   }
-  forgetEl.addEventListener('click', () => dispatch({ t: 'forget' }));
+  forgetEl.addEventListener('click', async () => {
+    if (!web.hosted) return dispatch({ t: 'forget' });
+    forgetEl.disabled = true;
+    try {
+      const reply = await fetch(web.signout, { method: 'POST' });
+      if (!reply.ok) throw new Error('sign out refused');
+      location.replace(web.login);
+    } catch (err) {
+      forgetEl.disabled = false;
+      forgetEl.textContent = 'could not sign out — try again';
+    }
+  });
 
   // The TUI's coarse ladder: seconds under a minute read `now`.
   const coarse = (secs) => { const s = Math.max(0, secs); if (s < 60) return 'now'; if (s < 3600) return Math.floor(s / 60) + 'm'; if (s < 86400) return Math.floor(s / 3600) + 'h'; return Math.floor(s / 86400) + 'd'; };
@@ -888,7 +918,7 @@
     const button = form.querySelector('button'); button.disabled = true;
     error.textContent = '';
     try {
-      const reply = await fetch('/blocks/answer', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ agent, name, question: block.question, answer }) });
+      const reply = await fetch(route('/blocks/answer'), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ agent, name, question: block.question, answer }) });
       if (!reply.ok) {
         const body = await reply.json().catch(() => ({}));
         throw new Error(body.why || `Answer refused (${reply.status})`);
@@ -957,7 +987,7 @@
     // Grok's first Ctrl+C can clear a draft without cancelling the
     // running turn. Let the person retry after a short pause; only a
     // fresh press sends another key.
-    if (grokStop(label) && Date.now() >= s.retryAt) return false;
+    if (grokStop(label) && !s.uncertain && Date.now() >= s.retryAt) return false;
     const w = agents.get(label);
     if (!w) return true;                                    // no transcript: nothing can say otherwise
     if (w.session !== s.session || w.generation !== s.generation) return false;
@@ -1123,7 +1153,7 @@
     el.querySelector('.delivery').textContent = entry.state === 'failed'
       ? `Not sent: ${entry.reason || 'delivery failed'}`
       : entry.state === 'sending' ? 'Sending…'
-      : entry.state === 'uncertain' ? 'Delivery unconfirmed after refresh'
+      : entry.state === 'uncertain' ? 'Delivery unconfirmed — check Chat history before retrying'
       : 'Waiting for Chat history…';
     el.querySelector('.retry').hidden = entry.state !== 'failed';
     el.querySelector('.dismiss').hidden = entry.state === 'sending';
@@ -1281,7 +1311,7 @@
   async function askQueue(body) {
     queueWhy('');
     try {
-      const r = await fetch('/queue', {
+      const r = await fetch(route('/queue'), {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify(body),
@@ -1458,7 +1488,7 @@
   async function askStash(body) {
     stashWhy('');
     try {
-      const r = await fetch('/stash', {
+      const r = await fetch(route('/stash'), {
         method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
       });
       if (r.ok) return r.status === 200 ? await r.json() : {};
@@ -1533,7 +1563,7 @@
   }
   async function loadLibrary() {
     try {
-      const r = await fetch('/agents/candidates');
+      const r = await fetch(route('/agents/candidates'));
       if (!r.ok) throw new Error(await r.text());
       library = await r.json();
       paintLibrary();
@@ -1583,7 +1613,7 @@
   async function askAgent(ask) {
     teamWhy('');
     try {
-      const r = await fetch('/agents', {
+      const r = await fetch(route('/agents'), {
         method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(ask),
       });
       if (!r.ok) {
@@ -1676,7 +1706,7 @@
   async function askReopen(label) {
     teamWhy('');
     try {
-      const r = await fetch('/agents/reopen', {
+      const r = await fetch(route('/agents/reopen'), {
         method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ label }),
       });
       const answer = await r.json();
@@ -1737,7 +1767,7 @@
     const link = e.target.closest('a[href]');
     if (!link || !ledgerEl.contains(link)) return;
     const url = new URL(link.href);
-    if (url.origin !== location.origin || !url.pathname.startsWith('/html/')) return;
+    if (url.origin !== location.origin || !url.pathname.startsWith(route('/html/'))) return;
     e.preventDefault();
     openSitePage(url, link.textContent.trim());
   });
@@ -1790,7 +1820,7 @@
   function connect() {
     if (closedForGood) return;
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    socket = new WebSocket(`${proto}//${location.host}/events`);
+    socket = new WebSocket(`${proto}//${location.host}${route('/events')}`);
     socket.onopen = () => { retry = 0; live = true; paintHeader(); paintEmpty(); };
     socket.onmessage = (e) => deliver(e.data);
     // Unlike an EventSource, a socket does not retry itself. A close
@@ -1805,12 +1835,23 @@
       // flight when the button was pressed answers 401 either way.
       try {
         if (door.sealed) return;
-        const gone = (await fetch('/whoami')).status === 401;
+        const gone = (await fetch(route('/whoami'))).status === 401;
         if (door.sealed) return;
         if (gone) {
           closedForGood = true;
-          location.replace('/login');
+          location.replace(web.login);
           return;
+        }
+        const bridgeReply = await fetch(route('/bridge/status'));
+        if (bridgeReply.ok) {
+          const status = await bridgeReply.json();
+          if (status.failure?.code === 'snapshot_too_large' || status.failure?.code === 'update_too_large') {
+            closedForGood = true;
+            bridgeErrorEl.textContent = status.failure.why;
+            bridgeErrorEl.hidden = false;
+            sentEl.textContent = status.failure.why;
+            return;
+          }
         }
       } catch (err) {}
       if (door.sealed) return;
@@ -1838,7 +1879,7 @@
     pending += 1;
     syncSend();                       // Send waits for it
     try {
-      const r = await fetch('/upload', { method: 'POST', headers: { 'content-type': file.type || 'application/octet-stream' }, body: file });
+      const r = await fetch(route('/upload'), { method: 'POST', headers: { 'content-type': file.type || 'application/octet-stream' }, body: file });
       if (!r.ok) throw new Error(await r.text());
       const { path } = await r.json();
       input.value = input.value ? `${input.value} ${path}` : path;
@@ -1915,17 +1956,24 @@
       retryAt: Date.now() + 2000,
     });
     syncSend();
+    let answered = false;
     try {
-      const r = await fetch('/stop', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ pane: pid }) });
-      if (!r.ok) throw new Error(await r.text());
+      const r = await fetch(route('/stop'), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ pane: pid, label, session: boundSession(label) }) });
+      answered = true;
+      if (!r.ok) throw await actionFailure(r);
       sentEl.textContent = grokStop(label) ? 'Ctrl+C sent; retry only if it cleared a draft' : '';
       if (grokStop(label)) setTimeout(() => { if (shown === label) syncSend(); }, 2000);
     } catch (err) {
-      // It was not stopped, so the button must come back — the agent
-      // is still running and this is the only way to try again.
-      if (stopped.get(label)?.pane === pid) stopped.delete(label);
+      const uncertain = err.outcomeUnknown || !answered;
+      const mark = stopped.get(label);
+      if (mark?.pane === pid) {
+        if (uncertain) mark.uncertain = true;
+        else stopped.delete(label);
+      }
       syncSend();
-      sentEl.textContent = `Not stopped: ${err.message || String(err)}`;
+      sentEl.textContent = uncertain
+        ? 'Stop outcome unknown — check agent activity before trying again'
+        : `Not stopped: ${err.message || String(err)}`;
       console.error(err);
     }
   });
@@ -1968,9 +2016,11 @@
     syncSend();
 
     send.disabled = true;
+    let answered = false;
     try {
-      const r = await fetch('/say', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ pane: pid, text }) });
-      if (!r.ok) throw new Error(await r.text());
+      const r = await fetch(route('/say'), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ pane: pid, label: shownWas, session, text }) });
+      answered = true;
+      if (!r.ok) throw await actionFailure(r);
       if (outgoing && outbox.includes(outgoing)) {
         outgoing.state = 'sent';
         keepOutbox();
@@ -1985,10 +2035,20 @@
       retarget();
     } catch (err) {
       const recorded = outgoing?.recorded === true;
+      const uncertain = err.outcomeUnknown || !answered;
       if (recorded) {
         // A late transport error cannot undo a turn the transcript
         // already proves the agent received.
         sentEl.textContent = 'Recorded in Chat history';
+      } else if (uncertain) {
+        if (outgoing && outbox.includes(outgoing)) {
+          outgoing.state = 'uncertain';
+          outgoing.reason = err.message || String(err);
+          keepOutbox();
+          paintTranscript(shownWas);
+        }
+        sentEl.textContent = 'Delivery unknown — check Chat history before retrying';
+        console.error(err);
       } else {
         if (outgoing && outbox.includes(outgoing)) {
           outgoing.state = 'failed';

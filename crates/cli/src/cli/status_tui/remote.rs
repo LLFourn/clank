@@ -1,28 +1,34 @@
-//! The remote switch: the repo's page, served from inside the TUI as
-//! one owned [`Instance`]. Switched on from the row, it binds the
-//! port the repo remembers and the browser is sent there; switched
-//! off, or the TUI closed, everything it started is ended and joined
-//! (clank-tui-runs-the-remote-in-process).
+//! The remote switch: start an owned web host child and attach this
+//! repo's session over the bridge. Switched off, or the TUI closed,
+//! the connector and child are ended and joined.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use crate::cli::web::door::{Door, Link};
-use crate::cli::web::{Instance, Panes};
+use crate::cli::web::BridgeInstance as Instance;
+use crate::cli::web::Panes;
 
-/// What the tunnel source last said, as the row draws it.
+/// What the selected host source last said, as the row draws it.
 enum Configured {
-    /// No tunnel in the config: the switch refuses.
+    /// Neither a tunnel nor an existing host is configured.
     Absent,
-    /// A tunnel the source could build.
+    /// A local tunnel or existing host is configured.
     Ready,
-    /// A tunnel IS configured but could not be built — a retired
+    /// A host is configured but could not be used — a retired
     /// provider, a config that will not parse. The reason is the
     /// operator's to see; "not configured" is not it.
     Broken(String),
 }
 
-/// What the row says beside `remote` when no tunnel is configured.
+enum Target {
+    Local(
+        Arc<dyn crate::cli::web::tunnel::Provider>,
+        std::time::Duration,
+    ),
+    Existing(crate::cli::config::WebAttach),
+}
+
+/// What the row says beside `remote` when no host is configured.
 const UNCONFIGURED: &str = "not configured";
 
 /// And what the switch says when it is thrown anyway.
@@ -30,7 +36,8 @@ const UNCONFIGURED_HOW: &str = "No remote is configured, so there is nowhere to 
      Add a tunnel to ~/.clank/config.json, for example:\n\n\
      \"remote\": { \"tunnel\": { \"provider\": \"quick\" } }\n\n\
      `quick` needs no account, no domain and nothing installed; \
-     `command` runs any binary that forwards the port.";
+     `command` runs any binary that forwards the port. To attach to \
+     an existing host, set web.attach in this repo's .clank/config.json.";
 
 /// What the bar and the row draw.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -98,6 +105,20 @@ pub(super) type TunnelSource = Arc<
         + Sync,
 >;
 
+fn configured_target(
+    repo: &std::path::Path,
+    tunnel: &TunnelSource,
+) -> anyhow::Result<Option<Target>> {
+    if let Some(attach) = crate::agent_store::load_repo_config_required(repo)?
+        .web
+        .and_then(|web| web.attach)
+    {
+        attach.validate()?;
+        return Ok(Some(Target::Existing(attach)));
+    }
+    Ok(tunnel()?.map(|(provider, grace)| Target::Local(provider, grace)))
+}
+
 /// Starting and stopping are tasks in flight, held so the TUI's exit
 /// can wait for them; the loop is never inside either (codex on
 /// 55db154).
@@ -125,10 +146,6 @@ pub(super) struct Remote<O: Opener> {
     repo: PathBuf,
     home: Option<PathBuf>,
     panes: PanesSource,
-    /// The door outlives any one instance: its token and sessions
-    /// are the user's, shown and revoked from the row whether the
-    /// remote is on or off.
-    door: Arc<Door>,
     tunnel: TunnelSource,
     /// What the tunnel source last said. For DRAWING only — the row
     /// is painted far more often than the config changes, so it
@@ -157,7 +174,6 @@ impl<O: Opener> Remote<O> {
         repo: PathBuf,
         home: Option<PathBuf>,
         panes: PanesSource,
-        door: Arc<Door>,
         poll: std::time::Duration,
         grace: std::time::Duration,
         opener: O,
@@ -167,7 +183,6 @@ impl<O: Opener> Remote<O> {
             repo,
             home,
             panes,
-            door,
             tunnel: Arc::new(|| Ok(None)),
             configured: std::cell::RefCell::new(Configured::Absent),
             poll,
@@ -201,7 +216,7 @@ impl<O: Opener> Remote<O> {
     /// a retired one, a config that will not parse — must not be
     /// reported as no tunnel at all (codex on 5149876).
     fn recheck_configured(&self) {
-        *self.configured.borrow_mut() = match (self.tunnel)() {
+        *self.configured.borrow_mut() = match configured_target(&self.repo, &self.tunnel) {
             Ok(Some(_)) => Configured::Ready,
             Ok(None) => Configured::Absent,
             Err(e) => Configured::Broken(format!("{e:#}")),
@@ -209,14 +224,19 @@ impl<O: Opener> Remote<O> {
     }
 
     pub(super) fn shown(&self) -> Shown {
-        match self.state {
+        match &self.state {
             State::Off => match &*self.configured.borrow() {
                 Configured::Absent => Shown::Unconfigured,
                 Configured::Broken(_) => Shown::Failed,
                 Configured::Ready => Shown::Off,
             },
             State::Starting { .. } => Shown::Starting,
-            State::On { .. } => Shown::On,
+            State::On { instance } => {
+                if instance.connection_problem().is_some() {
+                    return Shown::Failed;
+                }
+                Shown::On
+            }
             State::Stopping { .. } => Shown::Stopping,
             State::Failed { .. } => Shown::Failed,
         }
@@ -226,12 +246,16 @@ impl<O: Opener> Remote<O> {
     /// reason when failed, nothing otherwise.
     pub(super) fn detail(&self) -> Option<String> {
         match &self.state {
-            State::On { instance } => Some(
-                instance
+            State::On { instance } => {
+                let base = instance
                     .public_url
                     .clone()
-                    .unwrap_or_else(|| instance.url.clone()),
-            ),
+                    .unwrap_or_else(|| instance.url.clone());
+                if let Some(why) = instance.connection_problem() {
+                    return Some(format!("{base} · {why}"));
+                }
+                Some(base)
+            }
             State::Failed { why } => Some(why.clone()),
             State::Off => match &*self.configured.borrow() {
                 Configured::Absent => Some(UNCONFIGURED.to_string()),
@@ -297,9 +321,9 @@ impl<O: Opener> Remote<O> {
                 // synchronously, which is not the loop's to wait for
                 // (codex on 369e74e).
                 let panes = self.panes.clone();
-                let door = self.door.clone();
                 let reopen = self.reopen.clone();
                 let tunnel = self.tunnel.clone();
+                let bridge_wake = self.wake.clone();
                 // What the TUI knows NOW, carried into the start so
                 // the feed has facts before it can answer a browser:
                 // the snapshot cannot be carried (it is not `Clone`),
@@ -308,14 +332,15 @@ impl<O: Opener> Remote<O> {
                 let seed = crate::cli::web::status_payload(&self.repo, snap, &Default::default());
                 let (abort, abandoned) = tokio::sync::watch::channel(false);
                 let task = tokio::spawn(async move {
-                    let found = tokio::task::spawn_blocking(move || Ok((panes()?, tunnel()?)))
-                        .await
-                        .unwrap_or_else(|_| Err(anyhow::anyhow!("finding zellij panicked")));
+                    let target_repo = repo.clone();
+                    let found = tokio::task::spawn_blocking(move || {
+                        Ok((panes()?, configured_target(&target_repo, &tunnel)?))
+                    })
+                    .await
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("finding zellij panicked")));
                     let started = match found {
-                        // THE gate: the tunnel read fresh, beside the
-                        // panes, in the same task that starts. A
-                        // remote with none is not started at all.
-                        Ok((panes, Some((provider, tunnel_grace)))) => {
+                        // The host choice is read fresh beside the panes.
+                        Ok((panes, Some(Target::Local(provider, tunnel_grace)))) => {
                             let start = crate::cli::web::tunnel::Start {
                                 provider,
                                 grace: tunnel_grace,
@@ -326,14 +351,31 @@ impl<O: Opener> Remote<O> {
                                 repo,
                                 home,
                                 panes,
-                                door,
                                 crate::cli::web::Startup {
                                     tunnel: Some(start),
                                     poll,
                                     grace,
                                     seed,
                                     reopen,
+                                    wake: Some(bridge_wake),
                                 },
+                            )
+                            .await
+                        }
+                        Ok((panes, Some(Target::Existing(target)))) => {
+                            Instance::attach(
+                                repo,
+                                home,
+                                panes,
+                                crate::cli::web::Startup {
+                                    tunnel: None,
+                                    poll,
+                                    grace,
+                                    seed,
+                                    reopen,
+                                    wake: Some(bridge_wake),
+                                },
+                                target,
                             )
                             .await
                         }
@@ -363,15 +405,16 @@ impl<O: Opener> Remote<O> {
 
     /// Send the browser in again — through a fresh login link, so
     /// the desktop needs no ceremony; nothing unless on.
-    pub(super) fn open_again(&mut self) {
-        if let Some(url) = self.link() {
+    pub(super) async fn open_again(&mut self) {
+        if let Some(url) = self.link().await {
             let report = self.reporter();
             self.opener.open(&url, report);
         }
     }
 
-    /// A one-time link into the running remote: the tunnel's proven
-    /// URL when there is one, else the local one.
+    /// The default host gets a one-time login link at its proven
+    /// tunnel URL (or local URL). An existing host gets its own
+    /// browser URL, so its own login policy applies.
     ///
     /// ONE link, not one per destination. The row's `detail` already
     /// preferred the public URL while the browser was sent to
@@ -379,25 +422,44 @@ impl<O: Opener> Remote<O> {
     /// exactly how the two came to disagree. The instance's URL, not
     /// the config's: a domain changed while the remote is on belongs
     /// to the next start (codex on 6f60efa).
-    pub(super) fn link(&self) -> Option<String> {
+    pub(super) async fn link(&self) -> Option<String> {
         match &self.state {
             State::On { instance } => {
                 let base = instance
                     .public_url
                     .clone()
                     .unwrap_or_else(|| instance.url.clone());
-                Some(format!(
-                    "{}/login?t={}",
-                    base.trim_end_matches('/'),
-                    self.door.mint(Link::Login)
-                ))
+                if !instance.owns_host() {
+                    return Some(base);
+                }
+                let token = instance.admin_link().await.ok()?;
+                Some(format!("{}/login?t={token}", base.trim_end_matches('/')))
             }
             _ => None,
         }
     }
 
-    pub(super) fn door(&self) -> &Arc<Door> {
-        &self.door
+    pub(super) async fn admin_state(&self) -> anyhow::Result<Option<crate::cli::web::AdminState>> {
+        match &self.state {
+            State::On { instance } if instance.admin_available() => {
+                Ok(Some(instance.admin_state().await?))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    pub(super) async fn rotate_token(&self) -> anyhow::Result<()> {
+        let State::On { instance } = &self.state else {
+            anyhow::bail!("the host is not running");
+        };
+        instance.admin_rotate().await
+    }
+
+    pub(super) async fn revoke_session(&self, id_hash: &str) -> anyhow::Result<()> {
+        let State::On { instance } = &self.state else {
+            anyhow::bail!("the host is not running");
+        };
+        instance.admin_revoke(id_hash).await
     }
 
     /// End the remote, everything joined: the TUI's exit path, where
@@ -438,7 +500,7 @@ impl<O: Opener> Remote<O> {
     /// a stop that finished is off. Outcomes of an earlier generation
     /// are nothing — except an instance, which is stopped, since
     /// nothing else will.
-    pub(super) fn drain(&mut self, snap: &crate::cli::status::StatusSnapshot) -> Vec<Notice> {
+    pub(super) async fn drain(&mut self, snap: &crate::cli::status::StatusSnapshot) -> Vec<Notice> {
         let queued: Vec<(u64, Outcome)> =
             std::mem::take(&mut *self.outcomes.lock().unwrap_or_else(|e| e.into_inner()));
         let mut notices = Vec::new();
@@ -453,7 +515,7 @@ impl<O: Opener> Remote<O> {
                 (Outcome::Started(instance), State::Starting { .. }) => {
                     instance.observe(snap);
                     self.state = State::On { instance };
-                    self.open_again();
+                    self.open_again().await;
                 }
                 (Outcome::Started(instance), _) => {
                     tokio::spawn(instance.stop());
@@ -560,6 +622,104 @@ impl Opener for Browser {
 #[cfg(test)]
 mod tests {
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_existing_host_uses_its_login_and_keeps_its_own_lifetime() {
+        use crate::cli::config::{WebAttach, WebSection};
+
+        let repo = repo_with_config();
+        let home = repo.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let host = clank_web_cloudflare::host::Host::start(
+            0,
+            "existing-session".into(),
+            Some(home.clone()),
+        )
+        .await
+        .unwrap();
+        let browser_url = host.local_url.clone();
+        let mut config = crate::agent_store::load_repo_config_required(repo.path()).unwrap();
+        config.web = Some(WebSection {
+            port: None,
+            attach: Some(WebAttach {
+                endpoint: host.connector_url.clone(),
+                session: "existing-session".into(),
+                credential: host.credential.clone(),
+                browser_url: browser_url.clone(),
+            }),
+        });
+        crate::agent_store::write_typed_config(&repo.path().join(".clank/config.json"), &config)
+            .unwrap();
+        let rec = Recorder::default();
+        let mut remote = Remote::new(
+            repo.path().to_path_buf(),
+            Some(home.clone()),
+            Arc::new(|| {
+                Ok(Arc::new(FakePanes {
+                    answers: true,
+                    slow: std::time::Duration::ZERO,
+                }) as Arc<dyn Panes>)
+            }),
+            crate::cli::web::PANE_POLL,
+            crate::cli::web::STOP_GRACE,
+            rec.clone(),
+            Arc::new(|| {}),
+        )
+        .tunnel_from(Arc::new(|| {
+            panic!("an existing host needs no local tunnel")
+        }));
+        assert_eq!(remote.shown(), Shown::Off);
+        assert!(remote.admin_state().await.unwrap().is_none());
+        let snap = snap();
+        remote.toggle(&snap);
+        assert!(settle(&mut remote, &snap).await.is_empty());
+        assert_eq!(remote.shown(), Shown::On);
+        assert_eq!(remote.link().await.as_deref(), Some(browser_url.as_str()));
+        assert_eq!(
+            rec.opened.lock().unwrap().as_slice(),
+            &[browser_url.clone()]
+        );
+        assert!(remote.admin_state().await.unwrap().is_none());
+        assert_eq!(
+            crate::cli::status_tui::input::remote_actions_for(
+                true,
+                remote.admin_state().await.unwrap().is_some(),
+            ),
+            vec![
+                crate::cli::status_tui::input::RemoteAction::Switch,
+                crate::cli::status_tui::input::RemoteAction::Open,
+                crate::cli::status_tui::input::RemoteAction::Phone,
+            ]
+        );
+        remote.stop().await;
+        assert!(
+            reqwest::get(format!("{browser_url}/instance"))
+                .await
+                .unwrap()
+                .status()
+                .is_success()
+        );
+        host.stop().await;
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_repo_config_hides_admin_controls() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir(repo.path().join(".clank")).unwrap();
+        std::fs::write(repo.path().join(".clank/config.json"), "not json").unwrap();
+        let remote = Remote::new(
+            repo.path().to_path_buf(),
+            None,
+            Arc::new(|| panic!("no panes requested")),
+            crate::cli::web::PANE_POLL,
+            crate::cli::web::STOP_GRACE,
+            Recorder::default(),
+            Arc::new(|| {}),
+        )
+        .tunnel_from(Arc::new(|| Ok(None)));
+        assert_eq!(remote.shown(), Shown::Failed);
+        assert!(remote.admin_state().await.unwrap().is_none());
+    }
+
     /// The browser is sent where the row says. ONE link, so the two
     /// cannot drift: the bug was a `detail` that preferred the tunnel
     /// while the opener preferred loopback.
@@ -573,7 +733,7 @@ mod tests {
         assert_eq!(r.shown(), Shown::On);
 
         let shown = r.detail().expect("on, so the row shows a URL");
-        let link = r.link().expect("on, so there is a link");
+        let link = r.link().await.expect("on, so there is a link");
         assert!(
             link.starts_with(&format!("{shown}/login?t=")),
             "the link is built on the URL the row shows: {link} vs {shown}"
@@ -717,12 +877,11 @@ mod tests {
         });
         let r = Remote::new(
             repo.to_path_buf(),
-            Some(home),
+            Some(home.clone()),
             Arc::new(move || {
                 std::thread::sleep(slow);
                 Ok(Arc::new(FakePanes { answers, slow }) as Arc<dyn Panes>)
             }),
-            Arc::new(Door::new(None)),
             poll,
             grace,
             rec.clone(),
@@ -758,7 +917,6 @@ mod tests {
                     slow: std::time::Duration::ZERO,
                 }) as Arc<dyn Panes>)
             }),
-            Arc::new(Door::new(None)),
             crate::cli::web::PANE_POLL,
             crate::cli::web::STOP_GRACE,
             rec.clone(),
@@ -817,7 +975,6 @@ mod tests {
                     slow: std::time::Duration::ZERO,
                 }) as Arc<dyn Panes>)
             }),
-            Arc::new(Door::new(None)),
             crate::cli::web::PANE_POLL,
             crate::cli::web::STOP_GRACE,
             rec.clone(),
@@ -863,7 +1020,6 @@ mod tests {
                         slow: std::time::Duration::ZERO,
                     }) as Arc<dyn Panes>)
                 }),
-                Arc::new(Door::new(None)),
                 crate::cli::web::PANE_POLL,
                 crate::cli::web::STOP_GRACE,
                 rec.clone(),
@@ -1068,7 +1224,6 @@ mod tests {
                     slow: std::time::Duration::ZERO,
                 }) as Arc<dyn Panes>)
             }),
-            Arc::new(Door::new(None)),
             crate::cli::web::PANE_POLL,
             crate::cli::web::STOP_GRACE,
             Recorder::default(),
@@ -1213,7 +1368,6 @@ mod tests {
                     slow: std::time::Duration::ZERO,
                 }) as Arc<dyn Panes>)
             }),
-            Arc::new(Door::new(None)),
             crate::cli::web::PANE_POLL,
             crate::cli::web::STOP_GRACE,
             rec.clone(),
@@ -1314,7 +1468,7 @@ mod tests {
     ) -> Vec<Notice> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
-            let notices = r.drain(snap);
+            let notices = r.drain(snap).await;
             if !matches!(r.shown(), Shown::Starting | Shown::Stopping)
                 || std::time::Instant::now() > deadline
             {
@@ -1429,7 +1583,7 @@ mod tests {
             socket
         };
         assert!(opening.contains("\"facts\""), "{opening}");
-        r.open_again();
+        r.open_again().await;
         assert_eq!(rec.opened.lock().unwrap().len(), 2);
 
         let pressed = std::time::Instant::now();
@@ -1519,7 +1673,7 @@ mod tests {
         (rec.reports.lock().unwrap()[0])(Outcome::BrowserFailed {
             why: "no opener".into(),
         });
-        let notices = r.drain(&snap);
+        let notices = r.drain(&snap).await;
         assert_eq!(notices.len(), 1);
         assert!(
             notices[0]
@@ -1541,7 +1695,7 @@ mod tests {
         r.toggle(&snap);
         settle(&mut r, &snap).await;
         (rec.reports.lock().unwrap()[0])(Outcome::BrowserFailed { why: "late".into() });
-        assert!(r.drain(&snap).is_empty(), "an earlier start's opener");
+        assert!(r.drain(&snap).await.is_empty(), "an earlier start's opener");
         r.stop().await;
     }
 }

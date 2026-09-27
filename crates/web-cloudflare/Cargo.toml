@@ -1,0 +1,37 @@
+[package]
+name = "clank-web-cloudflare"
+version = "0.0.1"
+edition = "2024"
+
+[features]
+test-support = []
+
+[dependencies]
+clank-web = { path = "../web" }
+anyhow = "1"
+async-trait = "0.1"
+base64 = "0.22"
+blake3 = "1"
+cloudflare-quick-tunnel = "0.3"
+futures-util = { version = "0.3", features = ["std"] }
+getrandom = "0.3"
+hickory-client = "0.24"
+hickory-resolver = "0.24"
+http-body-util = "0.1"
+hyper = { version = "1", default-features = false, features = ["server", "http1"] }
+hyper-tungstenite = "0.30"
+hyper-util = { version = "0.1", features = ["tokio"] }
+libc = "0.2"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+subtle = "2"
+tempfile = "3"
+time = { version = "0.3", features = ["formatting", "parsing"] }
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+url = "2"
+
+[dev-dependencies]
+sha1 = "0.11.0"
+tokio = { version = "1", features = ["test-util"] }

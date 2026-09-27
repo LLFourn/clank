@@ -11,6 +11,7 @@ edition = "2024"
 unicode-width = "0.2"
 
 tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
 # github polling transport (github-http-client-and-realtime M1):
 # typed statuses/headers instead of parsing gh CLI output. rustls, no
 # default features — no openssl linkage.
@@ -37,7 +38,7 @@ signal-hook = "0.3"
 # Hashing
 blake3 = "1"
 # Only to serve the vendored decoder compressed: 251 KiB of it, 56 on
-# the wire (see `web/vendor/README.md`).
+# the wire (see `../web/assets/vendor/README.md`).
 flate2 = "1"
 
 # Path canonicalization
@@ -45,6 +46,8 @@ dunce = "1"
 
 # Shared core types (closed-vocab enums, identifiers, response DTOs).
 clank-core = { path = "../core", features = ["cache-encoding"] }
+clank-web = { path = "../web" }
+clank-web-cloudflare = { path = "../web-cloudflare" }
 wincode = { version = "0.5", features = ["derive"] }
 
 # JSON
@@ -129,11 +132,19 @@ path = "src/main.rs"
 # test target is one fewer binary to link and assess.
 test = false
 
+# The TUI starts this sibling process. Installing `clank` must install
+# the host too, rather than relying on a separately built workspace bin.
+[[bin]]
+name = "clank-web-cloudflare"
+path = "src/bin/clank-web-cloudflare.rs"
+test = false
+
 [dev-dependencies]
+clank-web-cloudflare = { path = "../web-cloudflare", features = ["test-support"] }
 # Only to answer a handshake by hand in the live connector test.
 sha1 = "0.11.0"
 # test-only: the vendored assets are checked against the digest their
-# registry publishes, which is a sha256 (see web/vendor/README.md).
+# registry publishes, which is a sha256 (see ../web/assets/vendor/README.md).
 sha2 = "0.11"
 # test-only: the pages the binary ships are PARSED, so a script that
 # cannot run cannot ship (a-page-that-does-not-parse-is-not-a-page).

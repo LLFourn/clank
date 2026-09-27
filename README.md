@@ -58,7 +58,9 @@ cd clank
 cargo install --path crates/cli --locked
 ```
 
-That puts `clank` on your `$PATH`. Keep `--locked`: without it
+That puts `clank` and its `clank-web-cloudflare` host process on your
+`$PATH`. The TUI starts that sibling executable when you turn on the
+remote. Keep `--locked`: without it
 `cargo install` ignores the committed `Cargo.lock` and re-resolves
 every dependency to the newest semver-compatible version.
 
@@ -178,15 +180,22 @@ pages. `--watch` gives a live non-fullscreen view; `-j` emits JSON.
 
 Enter selects whatever the cursor is on; every screen shows its own
 keys along the bottom. The `remote` row under the agent list is the
-remote: Space there (or `r` from the log view) is the switch, which
-serves this repo's page from inside the TUI on the port the repo
-remembers — sampled from the OS the first time and kept in
-`.clank/config.json` — and sends your browser in; switching off, or
-closing the TUI, stops it and everything it started. The glyph
+remote: Space there (or `r` from the log view) is the switch. In the
+default mode, the TUI starts a separate host process on the port the
+repo remembers in `.clank/config.json`, attaches this repo to it,
+and sends your browser in. Switching off, or closing the TUI, stops
+that owned host. When this repo names an existing host instead, the
+switch attaches to it and leaves it running when detached. The glyph
 beside the zellij one at the bar's right end shows its state from
 any page.
 
-The page is behind a door, and the key is one token. Enter on the
+To attach to a separately operated host, see the
+[custom host example](crates/web/examples/README.md) for the `web.attach`
+configuration and the host-side browser and connector credentials. The
+[embedding guide](crates/web/README.md) describes the public service,
+protocol, authentication, and route contracts.
+
+The default host's page is behind a door, and the key is one token. Enter on the
 row opens the remote page, which prints it; paste it into the page
 and you are in. It is minted on first use and kept at user level in
 `~/.clank/config.json` under `remote.token`, so it is the same token
@@ -201,10 +210,10 @@ is good for one use within five minutes. Sessions last thirty days,
 hashed in `~/.clank/remote-sessions.json`, and the page lists them;
 Backspace revokes one, and a revoked session's stream ends at once.
 
-A phone reaches the page through a tunnel, and there is no remote
-without one: with nothing configured the row reads `not configured`
-and the switch refuses, because a page on loopback reaches nobody.
-Configure it once in `~/.clank/config.json` under `remote.tunnel`:
+A phone reaches the default host through a tunnel. With neither a
+tunnel nor an existing host configured, the row reads `not configured`
+and the switch refuses. Configure the default tunnel once in
+`~/.clank/config.json` under `remote.tunnel`:
 
 - `{"provider": "quick"}` — no account, no domain, nothing to
   install. An ephemeral `*.trycloudflare.com` handed out at start,
@@ -218,6 +227,27 @@ Configure it once in `~/.clank/config.json` under `remote.tunnel`:
   link first. With a `url` (`"https://clank.example.com"`, a named
   cloudflared tunnel) the hostname is yours and is claimed before
   the child runs.
+
+To attach this repo to a host started elsewhere, put this in the
+repo's gitignored `.clank/config.json` instead:
+
+```json
+"web": {
+  "attach": {
+    "endpoint": "wss://host.example/connector",
+    "session": "team",
+    "credential": "connector-secret-from-the-host",
+    "browser_url": "https://host.example/team"
+  }
+}
+```
+
+The TUI connects outward using the same session protocol as the
+locally started host. Switching it off detaches this repo and leaves
+that host running. The host owns browser login and must give the TUI
+the connector credential separately; the TUI's token and session
+controls are omitted for this mode. Plain `ws` and `http` are accepted
+only for loopback hosts.
 
 ngrok has no provider of its own — it wanted an account before
 anything worked, and a reserved domain on top of that — but its agent

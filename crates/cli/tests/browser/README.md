@@ -1,4 +1,4 @@
-# Browser checks for `web/page.html`
+# Browser checks for `crates/web/assets/page.html`
 
 The page is JavaScript, and `cargo test` cannot run it: a renamed field
 or a clipped element is not an error there, just a blank space. These

@@ -6,9 +6,10 @@
 //! late browser blank panes until the agent next prints. This keeps
 //! the LATEST of everything and hands each connection that state
 //! before the live stream — in the one order that cannot lose an
-//! update between the two (see [`Feed::connect`]).
+//! update between the two (see [`Feed::bridge_connect`]).
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::broadcast;
@@ -204,7 +205,8 @@ pub(crate) fn diff_table(old: &[PaneMeta], new: &[PaneMeta]) -> TableChange {
 #[derive(Clone)]
 pub(crate) struct Feed {
     state: Arc<Mutex<Retained>>,
-    tx: broadcast::Sender<String>,
+    bridge_tx: broadcast::Sender<clank_web::bridge::Update>,
+    bridge_sequence: Arc<AtomicU64>,
 }
 
 impl Feed {
@@ -217,51 +219,66 @@ impl Feed {
             .iter()
             .any(|p| p.label == label && !p.exited && !state.closed.contains(&p.id))
     }
-    /// `capacity` frames of lag before a slow browser is resynced from
-    /// state instead of catching up.
-    pub(crate) fn new(capacity: usize) -> Self {
-        let (tx, _) = broadcast::channel(capacity.max(1));
+    /// A slow connector is resynced from retained state after two
+    /// outstanding updates; browsers subscribe to the host's copy.
+    pub(crate) fn new() -> Self {
+        // Each bridge update carries a full replacement image. Keep only
+        // two; a slow connector resubscribes and receives the latest image.
+        let (bridge_tx, _) = broadcast::channel(2);
         Self {
             state: Arc::new(Mutex::new(Retained::default())),
-            tx,
+            bridge_tx,
+            bridge_sequence: Arc::new(AtomicU64::new(0)),
         }
     }
 
     /// Change the state and broadcast what changed, under one lock.
     ///
     /// The lock is held across the send on purpose: it is what makes
-    /// [`Self::connect`]'s order sufficient. A connection subscribes,
+    /// [`Self::bridge_connect`]'s order sufficient. A connection subscribes,
     /// then reads the state. Any publish that completes before its
     /// read is in the state it reads; any publish that completes
     /// after is in the receiver it already holds. Nothing falls
     /// between.
     fn publish(&self, apply: impl FnOnce(&mut Retained) -> Vec<String>) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        for frame in apply(&mut state) {
-            let _ = self.tx.send(frame);
+        let live = apply(&mut state);
+        if live.is_empty() {
+            return;
+        }
+        let sequence = self.bridge_sequence.fetch_add(1, Ordering::Relaxed) + 1;
+        if self.bridge_tx.receiver_count() > 0 {
+            let delta = clank_web::service::BrowserDelta { live };
+            let _ = self.bridge_tx.send(clank_web::bridge::Update {
+                sequence,
+                state: serde_json::to_value(delta).expect("browser delta serializes"),
+            });
         }
     }
 
-    /// A browser arrives: everything so far, then a receiver for
-    /// everything after. Subscribe FIRST, then read — see `publish`.
-    pub(crate) fn connect(&self) -> (Vec<String>, broadcast::Receiver<String>) {
-        let rx = self.tx.subscribe();
-        let frames = self
-            .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .frames();
-        (frames, rx)
-    }
-
-    /// A browser that fell behind gets the state again rather than a
-    /// hole in its stream. Every frame is a full repaint, so a resync
-    /// is only ever redundant, never wrong.
-    pub(crate) fn resync(&self) -> Vec<String> {
-        self.state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .frames()
+    /// Atomic replay plus future updates for the outbound repo connector.
+    /// Subscribe first, then read under the same lock as `publish`; a
+    /// publication is either in the image or in the receiver.
+    pub(crate) fn bridge_connect(
+        &self,
+    ) -> (
+        clank_web::bridge::Snapshot,
+        broadcast::Receiver<clank_web::bridge::Update>,
+    ) {
+        let updates = self.bridge_tx.subscribe();
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let sequence = self.bridge_sequence.load(Ordering::Relaxed);
+        let state = clank_web::service::BrowserFrames {
+            replay: state.frames(),
+            live: Vec::new(),
+        };
+        (
+            clank_web::bridge::Snapshot {
+                sequence,
+                state: serde_json::to_value(state).expect("browser frames serialize"),
+            },
+            updates,
+        )
     }
 
     pub(crate) fn status(&self, data: serde_json::Value) {
@@ -516,6 +533,44 @@ impl PageModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+
+    struct Frames {
+        updates: broadcast::Receiver<clank_web::bridge::Update>,
+        pending: VecDeque<String>,
+    }
+
+    impl Frames {
+        fn try_recv(&mut self) -> Result<String, broadcast::error::TryRecvError> {
+            if let Some(frame) = self.pending.pop_front() {
+                return Ok(frame);
+            }
+            let update = self.updates.try_recv()?;
+            let delta: clank_web::service::BrowserDelta =
+                serde_json::from_value(update.state).expect("the shipping bridge delta");
+            self.pending.extend(delta.live);
+            self.pending
+                .pop_front()
+                .ok_or(broadcast::error::TryRecvError::Empty)
+        }
+    }
+
+    fn test_connect(feed: &Feed) -> (Vec<String>, Frames) {
+        let (snapshot, updates) = feed.bridge_connect();
+        let image: clank_web::service::BrowserFrames =
+            serde_json::from_value(snapshot.state).expect("the shipping bridge image");
+        (
+            image.replay,
+            Frames {
+                updates,
+                pending: VecDeque::new(),
+            },
+        )
+    }
+
+    fn test_snapshot(feed: &Feed) -> Vec<String> {
+        test_connect(feed).0
+    }
 
     const FIXTURE: &str = include_str!("fixtures/subscribe.jsonl");
 
@@ -565,7 +620,7 @@ mod tests {
             serde_json::from_str(r#"{"event":"pane_resized","pane_id":"terminal_5","cols":80}"#)
                 .unwrap();
         assert_eq!(ev.event, "pane_resized");
-        let feed = Feed::new(8);
+        let feed = Feed::new();
         feed.event(ev);
         assert_eq!(feed.snapshot(), Retained::default(), "ignored, not stored");
     }
@@ -589,14 +644,14 @@ mod tests {
     /// status, before any live frame.
     #[test]
     fn a_late_browser_receives_the_state_first() {
-        let feed = Feed::new(8);
+        let feed = Feed::new();
         feed.panes(vec![meta("terminal_5", "claude", 120)]);
         for ev in fixture_events().into_iter().take(1) {
             feed.event(ev);
         }
         feed.status(serde_json::json!({"lamp": "🔨 CLAUDE working"}));
 
-        let (frames, _rx) = feed.connect();
+        let (frames, _rx) = test_connect(&feed);
         assert_eq!(frames.len(), 3);
         assert!(frames[0].starts_with("event: panes\n"), "the table first");
         assert!(frames[1].starts_with("event: status\n"));
@@ -612,11 +667,11 @@ mod tests {
     /// gives everything.
     #[test]
     fn reconnecting_while_quiet_is_not_blank() {
-        let feed = Feed::new(8);
+        let feed = Feed::new();
         feed.panes(vec![meta("terminal_5", "claude", 120)]);
         feed.event(fixture_events().remove(1));
-        let (first, _) = feed.connect();
-        let (again, mut rx) = feed.connect();
+        let (first, _) = test_connect(&feed);
+        let (again, mut rx) = test_connect(&feed);
         assert_eq!(first, again, "the same full picture, nothing live");
         assert!(
             matches!(rx.try_recv(), Err(broadcast::error::TryRecvError::Empty)),
@@ -624,18 +679,59 @@ mod tests {
         );
     }
 
+    #[test]
+    fn bridge_image_and_updates_share_the_feed_order() {
+        let feed = Feed::new();
+        feed.panes(vec![meta("terminal_5", "claude", 120)]);
+        let (snapshot, mut updates) = feed.bridge_connect();
+        let initial: clank_web::service::BrowserFrames =
+            serde_json::from_value(snapshot.state).unwrap();
+        assert!(initial.replay[0].starts_with("event: panes\n"));
+        assert!(initial.live.is_empty());
+
+        feed.status(serde_json::json!({"phase":"first"}));
+        let first = updates.try_recv().unwrap();
+        assert_eq!(first.sequence, snapshot.sequence + 1);
+        let frames: clank_web::service::BrowserDelta = serde_json::from_value(first.state).unwrap();
+        assert_eq!(frames.live.len(), 1);
+        assert!(frames.live[0].contains("first"));
+
+        feed.status(serde_json::json!({"phase":"second"}));
+        let second = updates.try_recv().unwrap();
+        assert_eq!(second.sequence, first.sequence + 1);
+        let frames: clank_web::service::BrowserDelta =
+            serde_json::from_value(second.state).unwrap();
+        assert!(frames.live[0].contains("second"));
+
+        for phase in ["third", "fourth", "fifth"] {
+            feed.status(serde_json::json!({"phase":phase}));
+        }
+        assert!(matches!(
+            updates.try_recv(),
+            Err(broadcast::error::TryRecvError::Lagged(_))
+        ));
+        let (resynced, _) = feed.bridge_connect();
+        assert_eq!(resynced.sequence, second.sequence + 3);
+        let frames: clank_web::service::BrowserFrames =
+            serde_json::from_value(resynced.state).unwrap();
+        assert!(frames.replay.iter().any(|frame| frame.contains("fifth")));
+    }
+
     /// The race the order exists for: a publish that lands between a
     /// connection's subscribe and its read is delivered — on the
     /// stream, or already in the state, never lost.
     #[test]
     fn a_publish_between_subscribe_and_read_is_delivered() {
-        let feed = Feed::new(8);
+        let feed = Feed::new();
         feed.panes(vec![meta("terminal_5", "claude", 120)]);
-        // What `connect` does, taken apart so a publish can be put
-        // in the middle.
-        let mut rx = feed.tx.subscribe();
+        // What the shipping bridge does, taken apart so a publish
+        // can be put in the middle.
+        let mut rx = Frames {
+            updates: feed.bridge_tx.subscribe(),
+            pending: VecDeque::new(),
+        };
         feed.event(fixture_events().remove(0));
-        let frames = feed.resync();
+        let frames = test_snapshot(&feed);
         let live: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         let saw_viewport = frames
             .iter()
@@ -644,24 +740,24 @@ mod tests {
         assert!(saw_viewport, "in the state, in the stream, or both");
     }
 
-    /// `connect` subscribes BEFORE it reads — proven by holding the
-    /// state lock: a `connect` on another thread must register its
+    /// The shipping bridge subscribes BEFORE it reads — proven by holding the
+    /// state lock: a `bridge_connect` on another thread must register its
     /// receiver while still blocked on the read. Read-then-subscribe
     /// would block first and register nothing until the lock frees,
     /// and that is the window a publish falls through.
     #[test]
-    fn connect_subscribes_before_it_reads() {
-        let feed = Feed::new(8);
+    fn bridge_connect_subscribes_before_it_reads() {
+        let feed = Feed::new();
         let held = feed.state.lock().unwrap();
         let connecting = {
             let feed = feed.clone();
-            std::thread::spawn(move || feed.connect())
+            std::thread::spawn(move || feed.bridge_connect())
         };
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while feed.tx.receiver_count() == 0 {
+        while feed.bridge_tx.receiver_count() == 0 {
             assert!(
                 std::time::Instant::now() < deadline,
-                "connect never subscribed while the read was blocked"
+                "bridge_connect never subscribed while the read was blocked"
             );
             std::thread::yield_now();
         }
@@ -670,17 +766,19 @@ mod tests {
             "still blocked on the read, as it must be"
         );
         drop(held);
-        let (frames, _rx) = connecting.join().unwrap();
-        assert!(!frames.is_empty());
+        let (snapshot, _rx) = connecting.join().unwrap();
+        let frames: clank_web::service::BrowserFrames =
+            serde_json::from_value(snapshot.state).unwrap();
+        assert!(!frames.replay.is_empty());
     }
 
     /// A browser the broadcast reports as lagged is given the state
     /// again; every frame is a full repaint, so redundancy is safe.
     #[test]
     fn a_lagged_browser_is_resynced_from_state() {
-        let feed = Feed::new(2);
+        let feed = Feed::new();
         feed.panes(vec![meta("terminal_5", "claude", 120)]);
-        let (_, mut rx) = feed.connect();
+        let (_, mut rx) = test_connect(&feed);
         for _ in 0..5 {
             feed.event(fixture_events().remove(1));
         }
@@ -688,7 +786,7 @@ mod tests {
             rx.try_recv(),
             Err(broadcast::error::TryRecvError::Lagged(_))
         ));
-        let frames = feed.resync();
+        let frames = test_snapshot(&feed);
         assert!(frames.iter().any(|f| f.starts_with("event: pane\n")));
     }
 
@@ -697,7 +795,7 @@ mod tests {
     /// the subscription is restarted with it.
     #[test]
     fn a_pane_appearing_later_changes_membership() {
-        let feed = Feed::new(8);
+        let feed = Feed::new();
         assert_eq!(
             feed.panes(vec![meta("terminal_5", "claude", 120)]),
             TableChange::Membership
@@ -718,7 +816,7 @@ mod tests {
 
     #[test]
     fn reopen_availability_tracks_live_closed_and_departed_panes() {
-        let feed = Feed::new(8);
+        let feed = Feed::new();
         assert!(!feed.has_live_pane("codex"));
         feed.panes(vec![meta("terminal_5", "codex", 120)]);
         assert!(feed.has_live_pane("codex"));
@@ -742,9 +840,9 @@ mod tests {
     /// sizes — stands.
     #[test]
     fn a_resize_alone_is_meta_not_membership() {
-        let feed = Feed::new(8);
+        let feed = Feed::new();
         feed.panes(vec![meta("terminal_5", "claude", 120)]);
-        let (_, mut rx) = feed.connect();
+        let (_, mut rx) = test_connect(&feed);
         assert_eq!(
             feed.panes(vec![meta("terminal_5", "claude", 80)]),
             TableChange::Meta
@@ -758,9 +856,9 @@ mod tests {
     /// pane reopens it the same way, before its content.
     #[test]
     fn a_close_from_the_child_lands_before_the_next_listing() {
-        let feed = Feed::new(8);
+        let feed = Feed::new();
         feed.panes(vec![meta("terminal_5", "claude", 120)]);
-        let (_, mut rx) = feed.connect();
+        let (_, mut rx) = test_connect(&feed);
         feed.event(fixture_events().remove(2));
         assert!(feed.snapshot().closed.contains("terminal_5"));
         let frame = rx.try_recv().unwrap();
@@ -790,11 +888,11 @@ mod tests {
     /// 56d1e6a — a browser probe showed the overlay gone).
     #[test]
     fn a_replayed_viewport_cannot_reopen_a_closed_pane() {
-        let feed = Feed::new(8);
+        let feed = Feed::new();
         feed.panes(vec![meta("terminal_5", "claude", 120)]);
         feed.event(fixture_events().remove(0));
         feed.event(fixture_events().remove(2));
-        let (frames, _) = feed.connect();
+        let (frames, _) = test_connect(&feed);
         assert!(frames[0].contains("\"closed\":[\"terminal_5\"]"));
         let content: Vec<&String> = frames
             .iter()
@@ -856,7 +954,7 @@ mod tests {
     /// and every real turn after it would be dropped as stale.
     #[test]
     fn a_superseded_tail_cannot_reset_the_window() {
-        let feed = Feed::new(16);
+        let feed = Feed::new();
         feed.claim_turns("claude", 1, Some("s1"));
         feed.turns_reset("claude", 1, "s1", 1, vec![say("a", "one")]);
         feed.claim_turns("claude", 2, Some("s2"));
@@ -886,10 +984,10 @@ mod tests {
     /// tail can then fill it.
     #[test]
     fn a_claim_shows_the_new_scope_before_anything_is_read() {
-        let feed = Feed::new(16);
+        let feed = Feed::new();
         feed.claim_turns("claude", 1, Some("s1"));
         feed.turns_reset("claude", 1, "s1", 1, vec![say("a", "one")]);
-        let (_, mut rx) = feed.connect();
+        let (_, mut rx) = test_connect(&feed);
         feed.claim_turns("claude", 2, Some("s2"));
         let mut page = PageModel::default();
         page.apply(&rx.try_recv().unwrap());
@@ -902,7 +1000,7 @@ mod tests {
                 owner: 0
             }
         );
-        let (snapshot, _) = feed.connect();
+        let (snapshot, _) = test_connect(&feed);
         let mut fresh = PageModel::default();
         for f in &snapshot {
             fresh.apply(f);
@@ -934,10 +1032,10 @@ mod tests {
     /// it twice, and the upsert by id absorbs that.
     #[test]
     fn a_turn_delivered_twice_is_one_turn_on_the_page() {
-        let feed = Feed::new(16);
+        let feed = Feed::new();
         feed.claim_turns("claude", 1, Some("s1"));
         feed.turns_reset("claude", 1, "s1", 1, vec![say("a", "one")]);
-        let (snapshot, mut rx) = feed.connect();
+        let (snapshot, mut rx) = test_connect(&feed);
         feed.turn("claude", 1, "s1", 1, say("b", "two"));
         let mut page = PageModel::default();
         for f in &snapshot {
@@ -946,8 +1044,7 @@ mod tests {
         // What the handoff can do: the same turn from the snapshot's
         // successor AND the stream.
         page.apply(
-            &feed
-                .resync()
+            &test_snapshot(&feed)
                 .into_iter()
                 .find(|f| f.starts_with("event: turns\n"))
                 .unwrap(),
@@ -964,12 +1061,12 @@ mod tests {
     /// doubling it, and a lag resync is only ever redundant.
     #[test]
     fn a_reconnect_replaces_the_window() {
-        let feed = Feed::new(16);
+        let feed = Feed::new();
         feed.claim_turns("claude", 1, Some("s1"));
         feed.turns_reset("claude", 1, "s1", 1, vec![say("a", "one"), say("b", "two")]);
         let mut page = PageModel::default();
         for _ in 0..3 {
-            for f in feed.resync() {
+            for f in test_snapshot(&feed) {
                 page.apply(&f);
             }
         }
@@ -980,10 +1077,10 @@ mod tests {
     /// the same id — no attach message, no ordering to get wrong.
     #[test]
     fn a_tools_output_lands_on_the_tools_own_turn() {
-        let feed = Feed::new(16);
+        let feed = Feed::new();
         feed.claim_turns("claude", 1, Some("s1"));
         feed.turns_reset("claude", 1, "s1", 1, vec![call("toolu_01")]);
-        let (frames, mut rx) = feed.connect();
+        let (frames, mut rx) = test_connect(&feed);
         feed.tool_output("claude", 1, "s1", 1, "toolu_01", "ok".into(), vec![]);
         let mut page = PageModel::default();
         for f in frames {
@@ -1003,10 +1100,10 @@ mod tests {
     /// generation clears what was there.
     #[test]
     fn stale_turns_are_dropped_and_a_new_generation_clears() {
-        let feed = Feed::new(16);
+        let feed = Feed::new();
         feed.claim_turns("claude", 1, Some("s1"));
         feed.turns_reset("claude", 1, "s1", 1, vec![say("a", "one")]);
-        let (frames, mut rx) = feed.connect();
+        let (frames, mut rx) = test_connect(&feed);
         feed.turn("claude", 1, "s1", 0, say("old-gen", "x"));
         feed.turn("claude", 1, "s0", 1, say("old-session", "x"));
         assert!(rx.try_recv().is_err(), "the feed forwards neither");
@@ -1042,7 +1139,7 @@ mod tests {
     /// page alike.
     #[test]
     fn the_window_keeps_the_last_turns_only() {
-        let feed = Feed::new(16);
+        let feed = Feed::new();
         let many: Vec<Turn> = (0..TURNS_KEPT + 5)
             .map(|i| say(&format!("t{i}"), "x"))
             .collect();
@@ -1058,7 +1155,7 @@ mod tests {
     /// next browser as if it were live.
     #[test]
     fn a_dropped_pane_takes_its_viewport_with_it() {
-        let feed = Feed::new(8);
+        let feed = Feed::new();
         feed.panes(vec![
             meta("terminal_5", "claude", 120),
             meta("terminal_9", "codex", 60),

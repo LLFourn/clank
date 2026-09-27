@@ -315,9 +315,12 @@ name = "clank"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "async-trait",
  "base64 0.22.1",
  "blake3",
  "clank-core",
+ "clank-web",
+ "clank-web-cloudflare",
  "clap",
  "cloudflare-quick-tunnel",
  "dunce",
@@ -373,6 +376,58 @@ dependencies = [
  "serde",
  "serde_json",
  "wincode",
+]
+
+[[package]]
+name = "clank-web"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "futures-util",
+ "getrandom 0.3.4",
+ "http-body-util",
+ "hyper",
+ "hyper-tungstenite",
+ "hyper-util",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "subtle",
+ "tokio",
+ "tokio-tungstenite",
+ "url",
+]
+
+[[package]]
+name = "clank-web-cloudflare"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64 0.22.1",
+ "blake3",
+ "clank-web",
+ "cloudflare-quick-tunnel",
+ "futures-util",
+ "getrandom 0.3.4",
+ "hickory-client",
+ "hickory-resolver",
+ "http-body-util",
+ "hyper",
+ "hyper-tungstenite",
+ "hyper-util",
+ "libc",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha1 0.11.0",
+ "subtle",
+ "tempfile",
+ "time",
+ "tokio",
+ "tokio-tungstenite",
+ "url",
 ]
 
 [[package]]

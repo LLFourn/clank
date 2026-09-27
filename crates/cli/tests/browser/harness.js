@@ -5,7 +5,7 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 
-const PAGE = fs.readFileSync(path.join(__dirname, '../../src/cli/web/page.html'), 'utf8')
+const PAGE = fs.readFileSync(path.join(__dirname, '../../../web/assets/page.html'), 'utf8')
   .replace(/<link[^>]*>/g, '')
   .replace(/<script src=[^>]*><\/script>/g, '<script>window.Terminal=function(){return{open(){},write(){},resize(){},scrollToBottom(){}}};</script>');
 

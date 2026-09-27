@@ -1,8 +1,8 @@
 //! Reads a script the way a browser will, for the tests that stand
 //! between this binary and a page that cannot run.
 //!
-//! Two surfaces ship JavaScript from this binary: the remote's pages
-//! (`web/mod.rs`) and the generated site (`html.rs`). A SyntaxError in
+//! Two surfaces ship JavaScript from this binary: the web session
+//! (`clank-web` and its default host) and the generated site (`html.rs`). A SyntaxError in
 //! an inline script is the whole page, and it is silent — the build
 //! succeeds, the file still contains every string a grep looks for,
 //! and nothing works. One guard for that fault, not one per surface.
@@ -146,5 +146,105 @@ mod tests {
         assert_eq!(tags[0].body, "a()");
         assert_eq!(tags[1].attrs, "type=\"module\"");
         assert_eq!(tags[2].attrs, "nonce=\"x\"");
+    }
+
+    #[test]
+    fn the_shipped_web_pages_and_vendor_scripts_parse() {
+        let session = clank_web::assets::render_page(clank_web::assets::PageOptions {
+            session: "team",
+            base_path: "/",
+            auth: clank_web::assets::BrowserAuth::ClankDoor {
+                script: clank_web_cloudflare::DOOR_JS,
+            },
+        })
+        .unwrap();
+        let login = clank_web_cloudflare::LOGIN
+            .replace("/*__CLANK_DOOR__*/", clank_web_cloudflare::DOOR_JS);
+        for (name, page) in [("session", session), ("login", login)] {
+            assert!(
+                !page.contains("/*__CLANK_DOOR__*/"),
+                "{name} embeds Door decisions"
+            );
+            assert!(
+                !page.contains("/*__CLANK_COMPOSER__*/"),
+                "{name} embeds the composer"
+            );
+            let mut inline = 0;
+            for tag in script_tags(&page) {
+                if tag.attrs.contains("src=") {
+                    assert_eq!(
+                        tag.attrs, "src=\"/xterm.js\"",
+                        "{name} loads only an inventoried local script"
+                    );
+                    continue;
+                }
+                let kind = if tag.attrs.contains("type=\"module\"") {
+                    Kind::Module
+                } else {
+                    assert!(
+                        tag.attrs.contains("nonce="),
+                        "{name} inline script has a nonce"
+                    );
+                    Kind::Classic
+                };
+                parse_as(tag.body, kind)
+                    .unwrap_or_else(|error| panic!("{name} inline script does not parse: {error}"));
+                inline += 1;
+            }
+            assert!(inline > 0, "{name} shipped no checked inline script");
+            for (at, _) in page.match_indices("//") {
+                let before = &page[..at];
+                if before.ends_with("http:") || before.ends_with("https:") {
+                    panic!(
+                        "{name} names an external host: {}",
+                        &page[at..(at + 50).min(page.len())]
+                    );
+                }
+            }
+        }
+        parse_js(clank_web::assets::XTERM_JS).expect("shipped terminal script parses");
+        parse_js(clank_web::assets::JSQR).expect("shipped QR decoder parses");
+    }
+
+    #[test]
+    fn shipped_vendor_assets_match_their_notice() {
+        for (name, bytes, digest, license) in [
+            (
+                "jsQR.js",
+                clank_web::assets::JSQR.as_bytes(),
+                "bc40c8a15196236b2314db0856f72ca0b49980cd5413b8c852a7349f5fee0859",
+                "Apache-2.0",
+            ),
+            (
+                "xterm.js",
+                clank_web::assets::XTERM_JS.as_bytes(),
+                "4196e242ef1cf4c2adead8d97f4a772a69576076f70b095e004b4abbb049e7bf",
+                "MIT",
+            ),
+            (
+                "xterm.css",
+                clank_web::assets::XTERM_CSS.as_bytes(),
+                "f7f724aea2bb620a6482bfb8e4bdecfae1152b0c7facef55fbda61f3b6cfedb2",
+                "MIT",
+            ),
+            (
+                "plate.woff2",
+                clank_web::assets::PLATE_FONT,
+                "723569a183da9c0bb9fb829bd3a3fb3c6e044e0ad405a6feb6fce8a45480fb52",
+                "OFL-1.1",
+            ),
+        ] {
+            use sha2::Digest;
+            let actual: String = sha2::Sha256::digest(bytes)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            assert_eq!(actual, digest, "{name} changed from the documented build");
+            assert!(
+                clank_web::assets::VENDOR_NOTICE.contains(digest)
+                    && clank_web::assets::VENDOR_NOTICE.contains(license),
+                "{name} and its license are documented"
+            );
+        }
     }
 }
