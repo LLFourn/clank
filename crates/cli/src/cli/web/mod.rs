@@ -787,6 +787,9 @@ fn prune_attachments(dir: &Path) {
 #[derive(serde::Deserialize)]
 #[serde(tag = "do", rename_all = "lowercase")]
 enum QueueAsk {
+    Preview {
+        body: String,
+    },
     Add {
         name: String,
         priority: u16,
@@ -819,13 +822,27 @@ enum QueueAsk {
 /// runs off the loop, as a say does.
 fn perform_queue_action(repo: &Path, ask: QueueAsk) -> anyhow::Result<Option<serde_json::Value>> {
     use crate::cli::queue;
+    let location = |path: &Path| -> anyhow::Result<serde_json::Value> {
+        let handle = path
+            .file_stem()
+            .ok_or_else(|| anyhow::anyhow!("queued plan has no file stem"))?
+            .to_string_lossy()
+            .into_owned();
+        Ok(serde_json::json!({
+            "handle": handle,
+            "page": crate::cli::html::queue_page_for_stem(&handle),
+        }))
+    };
     match ask {
+        QueueAsk::Preview { body } => Ok(Some(serde_json::json!({
+            "html": crate::cli::html::render_markdown(&body)
+        }))),
         QueueAsk::Add {
             name,
             priority,
             body,
         } => {
-            queue::add(
+            let path = queue::add(
                 repo,
                 &name,
                 priority,
@@ -834,7 +851,7 @@ fn perform_queue_action(repo: &Path, ask: QueueAsk) -> anyhow::Result<Option<ser
                     kind: queue::BodySourceKind::Inline,
                 },
             )?;
-            Ok(None)
+            Ok(Some(location(&path)?))
         }
         QueueAsk::Open { handle } => {
             let (entry, body, revision) = queue::read_entry(repo, &handle)?;
@@ -863,8 +880,8 @@ fn perform_queue_action(repo: &Path, ask: QueueAsk) -> anyhow::Result<Option<ser
         }
         QueueAsk::Priority { handle, priority } => {
             let entry = queue::entry_by_stem(repo, &handle)?;
-            queue::set_priority_of(repo, &entry, priority)?;
-            Ok(None)
+            let path = queue::set_priority_of(repo, &entry, priority)?;
+            Ok(Some(location(&path)?))
         }
     }
 }
@@ -1014,6 +1031,56 @@ fn library_candidates(home: Option<&Path>) -> anyhow::Result<serde_json::Value> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn queue_page_actions_return_exact_new_location_and_safe_preview() {
+        let repo = tempfile::tempdir().unwrap();
+        let preview = perform_queue_action(
+            repo.path(),
+            QueueAsk::Preview {
+                body: "# Plan\n<script>alert(1)</script>".into(),
+            },
+        )
+        .unwrap()
+        .unwrap();
+        let rendered = preview["html"].as_str().unwrap();
+        assert!(rendered.contains("Plan"));
+        assert!(!rendered.contains("<script>"));
+
+        let added = perform_queue_action(
+            repo.path(),
+            QueueAsk::Add {
+                name: "sample".into(),
+                priority: 500,
+                body: "# sample\n\nThe work.\n".into(),
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(added["handle"], "500-sample");
+        assert_eq!(added["page"], "queue/500-sample.html");
+
+        let moved = perform_queue_action(
+            repo.path(),
+            QueueAsk::Priority {
+                handle: "500-sample".into(),
+                priority: 100,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(moved["handle"], "100-sample");
+        assert_eq!(moved["page"], "queue/100-sample.html");
+        assert!(
+            perform_queue_action(
+                repo.path(),
+                QueueAsk::Open {
+                    handle: "500-sample".into(),
+                },
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn site_resources_are_named_pages_and_cannot_escape_the_repo() {

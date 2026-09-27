@@ -1,6 +1,15 @@
 const { open, done, facts, agent, panes, text, turns } = require('./harness');
 const out = [];
 const ok = (name, cond, detail = '') => out.push(`${cond ? 'PASS' : 'FAIL'}  ${name}${detail ? '  — ' + detail : ''}`);
+// Playwright treats aria-disabled as disabled for locator.click(), even
+// though this tab has no native disabled attribute: it opens the reason
+// why Chat is unavailable. A pointer click still uses browser hit testing,
+// so covering the button or making it inert fails the following assertions.
+const clickUnavailableChat = async (page) => {
+  const box = await page.locator('#mode-transcript').boundingBox();
+  if (!box) throw new Error('unavailable Chat tab is not visible');
+  await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+};
 
 (async () => {
   try {
@@ -75,12 +84,74 @@ const ok = (name, cond, detail = '') => out.push(`${cond ? 'PASS' : 'FAIL'}  ${n
     await page.keyboard.press('Space');
     ok('Space keeps the selected tab open', await button.getAttribute('aria-pressed') === 'true');
     await page.setViewportSize({ width: 1100, height: 780 });
+    await page.waitForFunction(() => !document.body.classList.contains('timeline-active'));
     ok('wide screen keeps the ledger as a sidebar and hides its tab',
        await page.isVisible('#ledger') && await page.isVisible('.agent') && await page.isHidden('#mode-timeline'));
     await page.setViewportSize({ width: 390, height: 780 });
     ok('returning to phone size restores the agent mode',
        await page.isHidden('#ledger') && await page.isVisible('.agent'));
     ok('timeline tabs have no script errors', errors.length === 0, errors.join('; '));
+    await browser.close();
+  }
+
+  // ---- generated plan pages stay inside the agent website
+  // ---- Timeline contains navigation only, at phone and desktop widths
+  {
+    const { browser, page, errors } = await open();
+    await page.evaluate((d) => window.__send('status', d), facts([agent('codex', 'master')], {
+      ledger: { plan: 'foo', gate: 'continued', dirty: null,
+        queue: [{ handle: '500-foo', name: 'foo', priority: 500, page: 'queue/500-foo.html' }],
+        stash: 1, stash_entries: [{ stem: 'bar', commits: 2, ready: true, page: 'stash/bar.html' }],
+        blocks: [], rows: [{ kind: 'header', text: 'foo', page: 'plan/foo.html' }],
+      },
+    }));
+    const boundary = () => page.evaluate(() => {
+      const ledger = document.querySelector('#ledger');
+      const forbidden = 'form,input,textarea,select,details,[contenteditable]:not([contenteditable="false"]),[onclick],[onchange],[onsubmit],.queue-editor,.stash-detail,.team,.management-page';
+      const buttons = [...ledger.querySelectorAll('button')].filter((b) => b.dataset.navOnly !== 'true');
+      const links = [...ledger.querySelectorAll('a[href]')].filter((a) => {
+        const url = new URL(a.href);
+        return url.origin !== location.origin || !(url.pathname.startsWith('/html/')
+          || ['#new-queued-plan', '#manage-team', '#device-settings'].includes(url.hash));
+      });
+      return { forbidden: ledger.querySelectorAll(forbidden).length, buttons: buttons.length, links: links.length };
+    });
+    await page.click('#mode-timeline');
+    const phone = await boundary();
+    ok('phone Timeline contains only summary and navigation',
+       phone.forbidden === 0 && phone.buttons === 0 && phone.links === 0, JSON.stringify(phone));
+    await page.click('#manage-team');
+    ok('team link opens a full management page', await page.isVisible('#team-page')
+       && await page.isHidden('#ledger') && await page.isHidden('#plan-frame'));
+    await page.click('#plan-back');
+    await page.click('#device-settings');
+    ok('device link opens settings in the main area', await page.isVisible('#device-page')
+       && await page.isHidden('#ledger') && await page.isVisible('#forget'));
+    await page.evaluate(() => {
+      window.fetch = async (url, opts) => {
+        window.__frames.push([url, opts?.body]);
+        return { ok: url !== '/forget', status: url === '/forget' ? 409 : 204 };
+      };
+    });
+    await page.click('#forget');
+    await page.waitForFunction(() => document.querySelector('#forget').textContent.includes('could not sign out'));
+    ok('device sign-out refusal stays on its settings page', await page.isVisible('#device-page')
+       && await page.isEnabled('#forget')
+       && await page.evaluate(() => window.__frames.some((f) => f[0] === '/forget')));
+    await page.click('#plan-back');
+    await page.click('#queue-new');
+    ok('new-plan link opens its editor in the main area', await page.isVisible('#queue-editor')
+       && await page.isHidden('#ledger'));
+    await page.click('#plan-back');
+    await page.setViewportSize({ width: 1100, height: 780 });
+    const wide = await boundary();
+    ok('desktop Timeline contains only summary and navigation',
+       wide.forbidden === 0 && wide.buttons === 0 && wide.links === 0, JSON.stringify(wide));
+    await page.click('#manage-team');
+    ok('desktop management uses the main area beside Timeline', await page.isVisible('#team-page')
+       && await page.isVisible('#ledger')
+       && await page.locator('#team-page').evaluate((el) => el.getBoundingClientRect().width > 500));
+    ok('Timeline boundary has no script errors', errors.length === 0, errors.join('; '));
     await browser.close();
   }
 
@@ -121,26 +192,99 @@ const ok = (name, cond, detail = '') => out.push(`${cond ? 'PASS' : 'FAIL'}  ${n
     await page.click('#plan-back');
     ok('Back returns to the Timeline tab', await page.isVisible('#ledger')
        && await page.isHidden('.agent') && await page.getAttribute('#mode-timeline', 'aria-pressed') === 'true');
-    await page.click('#team > summary');
-    ok('the return path reaches the timeline and team', page.url() === top
-       && await page.isHidden('#plan-view') && await page.isVisible('#ledger')
-       && await page.isVisible('#team-rows'));
+    await page.click('#manage-team');
+    ok('the return path reaches team management outside Timeline', page.url() === top
+       && await page.isVisible('#plan-view') && await page.isHidden('#ledger')
+       && await page.isVisible('#team-page') && await page.isVisible('#team-rows'));
     ok('embedded plan has no script errors', errors.length === 0, errors.join('; '));
+    await browser.close();
+  }
+
+  // ---- queue and stash names open their exact generated pages
+  {
+    const { browser, page, errors } = await open();
+    const pages = {
+      '/html/queue/100-same.html': '<main><h1>First queued copy</h1><p>Its full rendered body is readable.</p></main>',
+      '/html/queue/900-same.html': '<main><h1>Second queued copy</h1><p>The other file has its own page.</p></main>',
+      '/html/stash/same.html': '<main><h1>Stashed copy</h1><p>Two commits and a dependency.</p></main>',
+    };
+    await page.route('**/html/**', (route) => {
+      const path = new URL(route.request().url()).pathname;
+      route.fulfill({ status: pages[path] ? 200 : 404, contentType: 'text/html', body: pages[path] || 'Missing page' });
+    });
+    const frame = (rows) => facts([], { ledger: {
+      plan: null, gate: null, dirty: null,
+      queue: [
+        { handle: '100-same', name: 'same', priority: 100, page: 'queue/100-same.html' },
+        { handle: '900-same', name: 'same', priority: 900, page: 'queue/900-same.html' },
+      ],
+      stash: 1, stash_entries: [{ stem: 'same', commits: 2, waiting_for: 'other', ready: false, page: 'stash/same.html' }],
+      blocks: [], rows,
+    } });
+    const rows = Array.from({ length: 65 }, (_, i) => ({ kind: 'notice', text: `Ledger row ${i}`, age: '' }));
+    await page.evaluate((d) => window.__send('status', d), frame(rows));
+    await page.click('#mode-timeline');
+    ok('equal queue names carry distinct generated-page targets',
+       await page.getAttribute('#queue .q[data-handle="100-same"] a.nm', 'href') === 'html/queue/100-same.html'
+       && await page.getAttribute('#queue .q[data-handle="900-same"] a.nm', 'href') === 'html/queue/900-same.html');
+    await page.evaluate(() => { document.querySelector('#ledger').scrollTop = 70; });
+    const before = await page.evaluate(() => document.querySelector('#ledger').scrollTop);
+    await page.click('#queue .q[data-handle="100-same"] a.nm');
+    const embedded = page.frameLocator('#plan-frame');
+    await embedded.locator('h1').waitFor();
+    ok('queued name opens full rendered Markdown outside Timeline',
+       await embedded.locator('h1').textContent() === 'First queued copy'
+       && (await embedded.locator('p').textContent()).includes('full rendered body')
+       && await page.isVisible('#plan-view') && await page.isHidden('#ledger')
+       && await page.textContent('#plan-back') === '← Timeline');
+    await page.evaluate((d) => window.__send('status', d), frame(rows.slice(0, 64)));
+    ok('a status frame keeps the exact selected queue page',
+       (await page.getAttribute('#plan-frame', 'src')).endsWith('/html/queue/100-same.html')
+       && await embedded.locator('h1').textContent() === 'First queued copy');
+    await page.click('#plan-back');
+    const after = await page.evaluate(() => document.querySelector('#ledger').scrollTop);
+    ok('Back returns to Timeline at its scroll position',
+       await page.isVisible('#ledger') && await page.isHidden('#plan-view')
+       && await page.getAttribute('#mode-timeline', 'aria-pressed') === 'true' && Math.abs(after - before) <= 2);
+    await page.click('#queue .q[data-handle="900-same"] a.open');
+    await embedded.locator('h1').filter({ hasText: 'Second queued copy' }).waitFor();
+    ok('Open plan keeps same-name queue entries separate', await embedded.locator('h1').textContent() === 'Second queued copy');
+    await page.click('#plan-back');
+    await page.setViewportSize({ width: 1100, height: 780 });
+    await page.click('#stash-list .item[data-stem="same"] a.name');
+    await embedded.locator('h1').filter({ hasText: 'Stashed copy' }).waitFor();
+    ok('wide stashed page occupies main area with Timeline beside it',
+       await page.isVisible('#plan-view') && await page.isVisible('#ledger')
+       && await embedded.locator('h1').textContent() === 'Stashed copy'
+       && await page.textContent('#plan-back') === '← Agents');
+    await page.evaluate(() => { document.querySelector('#ledger').scrollTop = 180; });
+    const wideScroll = await page.evaluate(() => document.querySelector('#ledger').scrollTop);
+    await page.click('#plan-back');
+    const afterWide = await page.evaluate(() => document.querySelector('#ledger').scrollTop);
+    ok('wide Back keeps the sidebar scroll and focuses its entry',
+       await page.isHidden('#plan-view')
+       && await page.evaluate(() => document.activeElement?.matches('#stash-list .item[data-stem="same"] a.name'))
+       && wideScroll > 0 && Math.abs(afterWide - wideScroll) <= 2);
+    ok('queued and stashed navigation has no script errors', errors.length === 0, errors.join('; '));
     await browser.close();
   }
 
   // ---- queued Markdown can be created, opened, edited and reordered
   {
     const { browser, page, errors } = await open();
+    await page.route('**/html/queue/**', (route) => route.fulfill({ status: 200, contentType: 'text/html', body: '<main><h1>later</h1><p>Rendered queued plan</p></main>' }));
     await page.evaluate(() => {
       window.fetch = async (url, opts) => {
         const ask = JSON.parse(opts.body);
         window.__frames.push([url, opts.body]);
+        if (ask.do === 'preview') return { ok: true, status: 200, json: async () => ({ html: '<h1>Preview</h1><p>Edited Markdown</p>' }) };
         if (ask.do === 'open') return { ok: true, status: 200, json: async () => ({
           handle: ask.handle, name: 'later', priority: 500, body: '# later\nFirst draft\n', revision: 'r1',
         }) };
         if (ask.do === 'save' && ask.body.includes('refused'))
           return { ok: false, status: 409, json: async () => ({ why: 'changed since it was opened' }) };
+        if (ask.do === 'add') return { ok: true, status: 200, json: async () => ({ handle: '500-later', page: 'queue/500-later.html' }) };
+        if (ask.do === 'priority') return { ok: true, status: 200, json: async () => ({ handle: '100-later', page: 'queue/100-later.html' }) };
         return { ok: true, status: 204 };
       };
     });
@@ -150,46 +294,159 @@ const ok = (name, cond, detail = '') => out.push(`${cond ? 'PASS' : 'FAIL'}  ${n
     await page.evaluate((d) => window.__send('status', d), frame([]));
     await page.click('#mode-timeline');
     await page.click('#queue-new');
+    ok('new plan editor occupies the main area outside Timeline', await page.isVisible('#queue-editor')
+       && await page.isHidden('#ledger') && await page.locator('#ledger textarea, #ledger form#queue-edit-form').count() === 0);
     await page.fill('#queue-name', 'later');
     await page.fill('#queue-priority', '500');
     await page.fill('#queue-body', '# later\nFirst draft\n');
+    await page.waitForFunction(() => document.querySelector('#queue-preview').textContent.includes('Edited Markdown'));
+    ok('new plan has a rendered preview beside its source', await page.isVisible('#queue-preview'));
     await page.click('#queue-edit-form button[type=submit]');
     const asks = () => page.evaluate(() => window.__frames.filter((f) => f[0] === '/queue').map((f) => JSON.parse(f[1])));
     await page.waitForFunction(() => document.querySelector('#queue-editor').hidden);
     ok('new queued plan sends its Markdown and priority', (await asks()).some((a) =>
        a.do === 'add' && a.name === 'later' && a.priority === 500 && a.body === '# later\nFirst draft\n'));
-    await page.evaluate((d) => window.__send('status', d), frame([{ handle: '500-later', name: 'later', priority: 500 }]));
-    await page.click('#queue button[data-edit]');
+    await page.evaluate((d) => window.__send('status', d), frame([{ handle: '500-later', name: 'later', priority: 500, page: 'queue/500-later.html' }]));
+    ok('creation opens the newly rendered page when it appears', await page.isVisible('#plan-frame')
+       && await page.isVisible('#queue-page-tools')
+       && (await page.locator('#plan-frame').getAttribute('src')).includes('500-later.html'));
+    await page.click('#plan-back');
+    ok('Timeline queue row contains navigation and read-only priority',
+       await page.locator('#queue .q button, #queue .q input, #queue .q form').count() === 0
+       && await page.locator('#queue .q a[href]').count() === 2);
+    await page.click('#queue .q[data-handle="500-later"] a.nm');
+    await page.click('#queue-open-edit');
     ok('edit opens the queued Markdown source', await page.inputValue('#queue-body') === '# later\nFirst draft\n');
     await page.fill('#queue-body', '# later\nRevised\n');
+    await page.evaluate((d) => window.__send('status', d), frame([{ handle: '500-later', name: 'later', priority: 500, page: 'queue/500-later.html' }]));
+    ok('a status frame preserves the page draft and focus', await page.inputValue('#queue-body') === '# later\nRevised\n'
+       && await page.evaluate(() => document.activeElement?.id === 'queue-body') && await page.isVisible('#queue-editor'));
     await page.click('#queue-edit-form button[type=submit]');
     await page.waitForFunction(() => document.querySelector('#queue-editor').hidden);
     ok('save carries the original source for stale edit refusal', (await asks()).some((a) =>
        a.do === 'save' && a.handle === '500-later' && a.original === '# later\nFirst draft\n' && a.revision === 'r1'
        && a.body === '# later\nRevised\n'));
-    await page.fill('#queue input.pri', '100');
-    await page.locator('#queue input.pri').dispatchEvent('change');
+    await page.fill('#queue-page-priority', '100');
+    await page.click('#queue-set-priority');
     ok('priority change addresses the same file', (await asks()).some((a) =>
        a.do === 'priority' && a.handle === '500-later' && a.priority === 100));
     await page.evaluate((d) => window.__send('status', d), frame([
-      { handle: '050-urgent', name: 'urgent', priority: 50 },
-      { handle: '100-later', name: 'later', priority: 100 },
+      { handle: '300-later', name: 'later', priority: 300, page: 'queue/300-later.html' },
+    ]));
+    ok('missing priority target reports an unknown outcome instead of waiting forever',
+       await page.isVisible('#queue-result')
+       && (await page.textContent('#qwhy')).includes('absent from the latest status')
+       && await page.isHidden('#queue-page-tools'));
+    await page.evaluate((d) => window.__send('status', d), frame([
+      { handle: '050-urgent', name: 'urgent', priority: 50, page: 'queue/050-urgent.html' },
+      { handle: '100-later', name: 'later', priority: 100, page: 'queue/100-later.html' },
     ]));
     ok('queue redraw shows the new order', await page.locator('#queue .q .nm').allTextContents()
-       .then((names) => names.join(',') === 'urgent,later'));
-    await page.click('#queue .q[data-handle="100-later"] button[data-edit]');
+       .then((names) => names.join(',') === 'urgent,later') && await page.isVisible('#queue-page-tools')
+       && (await page.locator('#plan-frame').getAttribute('src')).includes('100-later.html'));
+    await page.click('#queue-open-edit');
+    ok('edit after priority change targets the moved handle', (await asks()).some((a) =>
+       a.do === 'open' && a.handle === '100-later'));
     await page.fill('#queue-body', '# later\nrefused\n');
     await page.click('#queue-edit-form button[type=submit]');
     await page.waitForFunction(() => document.querySelector('#qwhy').textContent.includes('changed since'));
     ok('a failed save explains itself and keeps the editor', await page.isVisible('#queue-editor')
        && (await page.textContent('#qwhy')).includes('changed since it was opened'));
+    await page.click('#queue-cancel');
+    ok('Cancel returns to the rendered plan without saving the draft', await page.isVisible('#plan-frame')
+       && await page.isHidden('#queue-editor') && await page.isVisible('#queue-page-tools'));
     ok('queued editor has no script errors', errors.length === 0, errors.join('; '));
+    await browser.close();
+  }
+
+  // ---- page actions use exact queue handles and stay on the owning page
+  {
+    const { browser, page, errors } = await open();
+    await page.route('**/html/queue/**', (route) => route.fulfill({ status: 200, contentType: 'text/html', body: '<main><h1>Queued plan</h1></main>' }));
+    await page.evaluate(() => {
+      window.fetch = async (url, opts) => {
+        const ask = JSON.parse(opts.body);
+        window.__frames.push([url, opts.body]);
+        if (ask.do === 'open') return { ok: true, status: 200, json: async () => ({
+          handle: ask.handle, name: 'same', priority: ask.handle.startsWith('100') ? 100 : 200,
+          body: '# same\n' + 'A long section.\n'.repeat(120), revision: 'r1',
+        }) };
+        if (ask.do === 'preview') return { ok: true, status: 200, json: async () => ({ html: '<h1>same</h1>' }) };
+        if (ask.do === 'promote' && window.__refusePromote) return { ok: false, status: 409, json: async () => ({
+          why: 'ambiguous queue item; candidates: 100-same.md, 200-same.md',
+        }) };
+        return { ok: true, status: 204 };
+      };
+    });
+    const entries = [
+      { handle: '100-same', name: 'same', priority: 100, page: 'queue/100-same.html' },
+      { handle: '200-same', name: 'same', priority: 200, page: 'queue/200-same.html' },
+    ];
+    const frame = (queue) => facts([], { ledger: {
+      plan: 'foo', gate: 'unreviewed', dirty: null, queue, stash: 0, blocks: [], rows: [],
+    } });
+    const asks = () => page.evaluate(() => window.__frames.filter((f) => f[0] === '/queue').map((f) => JSON.parse(f[1])));
+    await page.evaluate((d) => window.__send('status', d), frame(entries));
+    await page.click('#mode-timeline');
+    await page.click('#queue .q[data-handle="100-same"] a.nm');
+    await page.click('#queue-open-edit');
+    const phone = await page.evaluate(() => ({
+      editor: document.querySelector('#queue-editor').getBoundingClientRect().width,
+      page: document.querySelector('#plan-view').getBoundingClientRect().width,
+      scroll: document.querySelector('#queue-editor').scrollHeight > document.querySelector('#queue-editor').clientHeight,
+    }));
+    ok('phone editor uses the page width and scrolls long Markdown', phone.editor > 300
+       && Math.abs(phone.editor - phone.page) < 2 && phone.scroll);
+    await page.fill('#queue-body', '# same\nUnsaved change\n');
+    await page.evaluate((d) => window.__send('status', d), frame(entries));
+    ok('same-name status refresh keeps the exact draft and focus', await page.inputValue('#queue-body') === '# same\nUnsaved change\n'
+       && await page.evaluate(() => document.activeElement?.id === 'queue-body'));
+    await page.setViewportSize({ width: 1100, height: 780 });
+    const wide = await page.evaluate(() => {
+      const main = document.querySelector('#queue-editor .editor-main').getBoundingClientRect();
+      const source = document.querySelector('#queue-body').getBoundingClientRect();
+      const preview = document.querySelector('#queue-preview').parentElement.getBoundingClientRect();
+      return { main: main.width, source: source.width, preview: preview.width, sourceX: source.x, previewX: preview.x };
+    });
+    ok('wide editor has readable source and preview columns', wide.main > 500 && wide.source > 220
+       && wide.preview > 220 && wide.previewX > wide.sourceX, JSON.stringify(wide));
+    await page.click('#queue-cancel');
+    await page.evaluate(() => { window.__refusePromote = true; });
+    await page.click('#queue-promote');
+    ok('promotion asks for confirmation on the plan page', await page.textContent('#queue-promote') === 'Promote?'
+       && !(await asks()).some((a) => a.do === 'promote'));
+    await page.click('#queue-promote');
+    ok('ambiguous refusal stays on the selected page and names both stems', await page.isVisible('#plan-frame')
+       && (await page.textContent('#qwhy')).includes('100-same.md, 200-same.md')
+       && (await asks()).filter((a) => a.do === 'promote').every((a) => a.handle === '100-same'));
+    await page.evaluate((d) => window.__send('status', d), frame([entries[1]]));
+    ok('lost exact handle becomes stale without selecting its namesake', await page.isDisabled('#queue-promote')
+       && (await page.textContent('#qwhy')).includes('moved or left'));
+    await page.click('#plan-back');
+    await page.click('#queue .q[data-handle="200-same"] a.nm');
+    await page.click('#queue-unqueue');
+    await page.click('#queue-unqueue');
+    ok('unqueue acts on the second exact handle and shows a result page', await page.isVisible('#queue-result')
+       && await page.isHidden('#queue-page-tools') && (await asks()).some((a) => a.do === 'unqueue' && a.handle === '200-same'));
+    await page.click('#plan-back');
+    await page.evaluate(() => { window.__refusePromote = false; });
+    await page.evaluate((d) => window.__send('status', d), frame(entries));
+    await page.click('#queue .q[data-handle="100-same"] a.nm');
+    await page.click('#queue-promote');
+    await page.click('#queue-promote');
+    ok('successful promotion has a result and cannot be resubmitted', await page.isVisible('#queue-result')
+       && await page.isHidden('#queue-page-tools')
+       && (await asks()).filter((a) => a.do === 'promote').at(-1).handle === '100-same');
+    ok('exact-handle page actions have no script errors', errors.length === 0, errors.join('; '));
     await browser.close();
   }
 
   // ---- stashed plans expose their source and require a confirmed restore
   {
     const { browser, page, errors } = await open();
+    await page.route('**/html/stash/**', (route) => route.fulfill({ status: 200, contentType: 'text/html',
+      body: `<main><h1>Stashed plan</h1><p>waiting for dependency</p><h2>Stashed commits</h2><ul><li>first</li><li>second</li></ul><article>${'<p>the stashed plan</p>'.repeat(100)}</article></main>`,
+    }));
     await page.evaluate(() => {
       window.__rejectStash = true;
       window.fetch = async (url, opts) => {
@@ -210,38 +467,64 @@ const ok = (name, cond, detail = '') => out.push(`${cond ? 'PASS' : 'FAIL'}  ${n
       stash_entries, blocks: [], rows: [],
     } });
     await page.evaluate((d) => window.__send('status', d), frame([
-      { stem: 'foo', commits: 2, waiting_for: 'dependency', ready: false },
-      { stem: 'other', commits: 1, waiting_for: null, ready: true },
+      { stem: 'foo', commits: 2, waiting_for: 'dependency', ready: false, page: 'stash/foo.html' },
+      { stem: 'other', commits: 1, waiting_for: null, ready: true, page: 'stash/other.html' },
     ]));
     await page.click('#mode-timeline');
     ok('the stash list shows both plans and readiness',
        (await page.locator('#stash-list .item').count()) === 2
        && (await page.textContent('#stash-list')).includes('ready'));
-    await page.click('#stash-list .item[data-stem="foo"] button');
-    ok('the stashed plan opens with its Markdown and dependency',
-       (await page.textContent('#stash-body')).includes('the stashed plan')
-       && (await page.textContent('#stash-meta')).includes('dependency'));
-    ok('the TUI HTML action is available', (await page.getAttribute('#stash-html', 'href')) === 'html/stash/foo.html');
+    ok('Timeline stash rows contain navigation without content or action controls',
+       await page.locator('#stash-list button, #stash-list form, #stash-list pre, #stash-detail').count() === 0
+       && await page.locator('#stash-list .item[data-stem="foo"] a[href]').count() === 2);
+    await page.click('#stash-list .item[data-stem="foo"] a.name');
+    const embedded = page.frameLocator('#plan-frame');
+    await embedded.locator('article').waitFor();
+    await page.waitForFunction(() => !document.querySelector('#stash-restore').disabled);
+    ok('stash page shows rendered body, dependency and commit history',
+       await page.isVisible('#plan-view') && await page.isHidden('#ledger')
+       && (await embedded.locator('article').textContent()).includes('the stashed plan')
+       && (await embedded.locator('ul').textContent()).includes('second')
+       && (await page.textContent('#stash-page-state')).includes('dependency'));
+    const phone = await page.evaluate(() => ({
+      page: document.querySelector('#plan-view').getBoundingClientRect().width,
+      frame: document.querySelector('#plan-frame').getBoundingClientRect().width,
+    }));
+    ok('long stash page uses the phone content width', phone.page > 300 && Math.abs(phone.page - phone.frame) < 2);
+    await page.setViewportSize({ width: 1100, height: 780 });
+    ok('stash detail occupies the wide main area', await page.isVisible('#plan-view') && await page.isVisible('#ledger'));
     const restores = () => page.evaluate(() => window.__frames.filter((f) =>
       f[0] === '/stash' && JSON.parse(f[1]).do === 'restore').map((f) => JSON.parse(f[1])));
     await page.click('#stash-restore');
-    ok('restore waits for a second click', (await restores()).length === 0);
+    ok('restore confirmation belongs to the page', (await restores()).length === 0
+       && await page.textContent('#stash-restore') === 'Restore?');
     await page.click('#stash-restore');
     await page.waitForFunction(() => document.querySelector('#stash-why').textContent.includes('changed since'));
-    ok('a refused restore stays open and explains why', await page.isVisible('#stash-detail')
-       && (await page.textContent('#stash-why')).includes('changed since'));
+    ok('a refused restore stays on the page and requires a fresh revision', await page.isVisible('#plan-frame')
+       && (await page.textContent('#stash-why')).includes('changed since')
+       && await page.isDisabled('#stash-restore') && await page.isEnabled('#stash-refresh'));
     ok('restore names the opened stash revision', (await restores()).some((a) =>
        a.stem === 'foo' && a.revision === 'stash-r1'));
     await page.evaluate(() => { window.__rejectStash = false; });
+    await page.click('#stash-refresh');
+    await page.waitForFunction(() => !document.querySelector('#stash-restore').disabled);
     await page.click('#stash-restore');
     await page.click('#stash-restore');
-    await page.waitForFunction(() => document.querySelector('#stash-detail').hidden);
+    await page.waitForFunction(() => !document.querySelector('#stash-result').hidden);
+    ok('successful restore leaves a result page without a stale action', await page.isVisible('#stash-result')
+       && await page.isHidden('#stash-page-tools') && await page.isHidden('#plan-frame'));
     await page.evaluate((d) => window.__send('status', d), frame([
-      { stem: 'other', commits: 1, waiting_for: null, ready: true },
+      { stem: 'other', commits: 1, waiting_for: null, ready: true, page: 'stash/other.html' },
     ]));
+    await page.click('#plan-back');
     ok('restoring one stash leaves the other visible',
        await page.locator('#stash-list .item').count() === 1
        && (await page.textContent('#stash-list')).includes('other'));
+    await page.click('#stash-list .item[data-stem="other"] a.name');
+    await page.evaluate((d) => window.__send('status', d), frame([]));
+    ok('a removed stash is stale without retargeting Restore', await page.isDisabled('#stash-restore')
+       && (await page.textContent('#stash-why')).includes('restored elsewhere')
+       && (await restores()).every((a) => a.stem === 'foo'));
     ok('stash controls have no script errors', errors.length === 0, errors.join('; '));
     await browser.close();
   }
@@ -256,7 +539,7 @@ const ok = (name, cond, detail = '') => out.push(`${cond ? 'PASS' : 'FAIL'}  ${n
        && (await page.textContent('#chat-reason')).includes('Waiting for this session'));
     await page.click('#chat-reason-close');
     await page.evaluate((d) => window.__send('status', d), facts([]));
-    await page.click('#mode-transcript');
+    await clickUnavailableChat(page);
     ok('without an agent, Chat explains why it cannot open',
        await page.isVisible('#chat-reason')
        && (await page.textContent('#chat-reason')).includes('No agent is selected'));
@@ -286,16 +569,16 @@ const ok = (name, cond, detail = '') => out.push(`${cond ? 'PASS' : 'FAIL'}  ${n
       await page.evaluate((d) => window.__send('status', d), facts([
         { ...agent('codex', 'master'), tool: 'codex', session: 's1', chat_unavailable_reason: reason },
       ]));
-      ok('unavailable Chat is clickable', !(await page.isDisabled('#mode-transcript'))
+      ok('unavailable Chat opens its explanation', await page.getAttribute('#mode-transcript', 'disabled') === null
          && await page.getAttribute('#mode-transcript', 'aria-disabled') === 'true');
-      await page.click('#mode-transcript');
+      await clickUnavailableChat(page);
       ok(`Chat explains ${reason}`, await page.isVisible('#chat-reason')
          && await page.textContent('#chat-reason-text') === reason);
       await page.click('#chat-reason-close');
     }
     await page.fill('#text', 'hold Codex');
     await page.evaluate((d) => window.__send('status', d), facts([]));
-    await page.click('#mode-transcript');
+    await clickUnavailableChat(page);
     ok('a departed agent gets its own Chat reason',
        await page.isVisible('#chat-reason')
        && (await page.textContent('#chat-reason')).includes('codex has left the roster'));
@@ -320,7 +603,7 @@ const ok = (name, cond, detail = '') => out.push(`${cond ? 'PASS' : 'FAIL'}  ${n
     ]);
     await page.evaluate((d) => window.__send('status', d), team());
     await page.click('#mode-timeline');
-    await page.click('#team > summary');
+    await page.click('#manage-team');
     await page.waitForFunction(() => document.querySelector('#team-library option')?.value === 'replacement');
     await page.click('.team .member[data-label="claude"] > summary');
     ok('agent configuration shows invocation and binding',
@@ -330,6 +613,14 @@ const ok = (name, cond, detail = '') => out.push(`${cond ? 'PASS' : 'FAIL'}  ${n
     await page.fill('#team-add-name', 'codex');
     await page.selectOption('#team-add-tool', 'codex');
     await page.selectOption('#team-add-review', 'gate');
+    await page.focus('#team-add-name');
+    await page.evaluate((d) => window.__send('status', d), facts([
+      ...team().facts.agents,
+      { ...agent('observer', 'standby'), tool: 'codex', invocation: 'codex', session: null },
+    ]));
+    ok('roster status preserves the management page draft and focus', await page.isVisible('#team-page')
+       && await page.inputValue('#team-add-name') === 'codex'
+       && await page.evaluate(() => document.activeElement?.id === 'team-add-name'));
     await page.click('#team-add button');
     const actions = () => page.evaluate(() => window.__frames.filter((f) => f[0] === '/agents').map((f) => JSON.parse(f[1])));
     ok('adding an inline agent sends its tool and tier',
@@ -397,7 +688,7 @@ const ok = (name, cond, detail = '') => out.push(`${cond ? 'PASS' : 'FAIL'}  ${n
       { ...agent('claude', 'final'), tool: 'claude', auto: 'off', auto_explicit: 'off' },
     ]));
     await page.click('#mode-timeline');
-    await page.click('#team > summary');
+    await page.click('#manage-team');
     for (const name of ['codex', 'grok', 'claude'])
       await page.click(`.team .member[data-label="${name}"] > summary`);
     const row = (name) => `.team .member[data-label="${name}"]`;
@@ -446,7 +737,7 @@ const ok = (name, cond, detail = '') => out.push(`${cond ? 'PASS' : 'FAIL'}  ${n
     await page.evaluate((d) => window.__send('status', d), team('session-one'));
     await page.evaluate((d) => window.__send('panes', d), panes(['codex']));
     await page.click('#mode-timeline');
-    await page.click('#team > summary');
+    await page.click('#manage-team');
     await page.click('.team .member[data-label="codex"] > summary');
     await page.click('.team .member[data-label="grok"] > summary');
     const codex = '.team .member[data-label="codex"]';
@@ -829,8 +1120,9 @@ const ok = (name, cond, detail = '') => out.push(`${cond ? 'PASS' : 'FAIL'}  ${n
   {
     const { page, errors } = await open();
     const now = Math.floor(Date.now() / 1000);
-    // `ended` is the server's half; the newest TURN is the other, and
-    // it arrives on its own cadence.
+    // 80f01612 removed workingOf(shown) from Stop visibility, leaving
+    // the old stamp/tie assertions stale. Stop now follows the live
+    // pane while Chat's stamp and turns arrive on separate cadences.
     const say = (readable, ended) => page.evaluate(([r, e]) => window.__send('status', {
       facts: {
         lamp: 'l', plan: 'foo', hue: '#5f5fff', correction: null,
@@ -846,7 +1138,7 @@ const ok = (name, cond, detail = '') => out.push(`${cond ? 'PASS' : 'FAIL'}  ${n
     await say(true, now);
     await page.evaluate((d) => window.__send('panes', d), panes(['claude']));
     await page.evaluate((d) => window.__send('turns', d), turns('claude', []));
-    ok('a stamp with nothing after it is idle', await page.isHidden('#stop'));
+    ok('an open pane offers Stop even before Chat activity arrives', await page.isVisible('#stop'));
 
     // The case that made this evidence rather than a verdict: a turn
     // arrives with NO new status frame behind it.
@@ -856,7 +1148,7 @@ const ok = (name, cond, detail = '') => out.push(`${cond ? 'PASS' : 'FAIL'}  ${n
     ok('and Send is untouched', !(await page.isDisabled('#send')));
 
     await say(true, now + 5);
-    ok('a tie is not evidence of work', await page.isHidden('#stop'));
+    ok('a Chat timestamp tie does not hide the pane Stop control', await page.isVisible('#stop'));
     await say(false, now);
     ok('no transcript adapter means doubt, which shows Stop', await page.isVisible('#stop'));
     await say(true, null);

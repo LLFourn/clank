@@ -1967,6 +1967,7 @@ pub(crate) struct Queued {
     pub(crate) name: String,
     pub(crate) priority: u16,
     pub(crate) handle: String,
+    pub(crate) page: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -1975,6 +1976,7 @@ pub(crate) struct Stashed {
     pub(crate) waiting_for: Option<String>,
     pub(crate) ready: bool,
     pub(crate) commits: usize,
+    pub(crate) page: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -2101,14 +2103,18 @@ pub(crate) fn web_facts(
         queue: snap
             .queue
             .iter()
-            .map(|q| Queued {
-                name: q.name.clone(),
-                priority: q.priority,
-                handle: q
+            .map(|q| {
+                let handle = q
                     .path
                     .file_stem()
                     .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_default(),
+                    .unwrap_or_default();
+                Queued {
+                    name: q.name.clone(),
+                    priority: q.priority,
+                    page: crate::cli::html::queue_page_for_stem(&handle),
+                    handle,
+                }
             })
             .collect(),
         stash: snap.stash.len(),
@@ -2120,6 +2126,7 @@ pub(crate) fn web_facts(
                 waiting_for: s.waiting_for.clone(),
                 ready: s.ready,
                 commits: s.commits,
+                page: crate::cli::html::stash_page_for_stem(&s.stem),
             })
             .collect(),
         blocks: snap
@@ -5912,19 +5919,36 @@ pub(crate) mod tests {
         s.queue[1].priority = 100;
         s.queue[1].path = std::path::PathBuf::from("/r/.clank/queue/100-sooner.md");
         s.queue.sort_by_key(|q| q.priority);
+        s.stash.push(crate::cli::status::StashItemView {
+            stem: "later".to_string(),
+            waiting_for: None,
+            ready: true,
+            commits: 2,
+        });
 
         let facts = web_facts(&s, &Default::default());
-        let queued: Vec<(&str, u16, &str)> = facts
+        let queued: Vec<(&str, u16, &str, &str)> = facts
             .ledger
             .queue
             .iter()
-            .map(|q| (q.name.as_str(), q.priority, q.handle.as_str()))
+            .map(|q| {
+                (
+                    q.name.as_str(),
+                    q.priority,
+                    q.handle.as_str(),
+                    q.page.as_str(),
+                )
+            })
             .collect();
         assert_eq!(
             queued,
-            [("sooner", 100, "100-sooner"), ("later", 900, "900-later")],
-            "the order the queue runs them, each by its file"
+            [
+                ("sooner", 100, "100-sooner", "queue/100-sooner.html"),
+                ("later", 900, "900-later", "queue/900-later.html"),
+            ],
+            "the order the queue runs them, each with its exact page"
         );
+        assert_eq!(facts.ledger.stash_entries[0].page, "stash/later.html");
 
         // The count the page shows is these entries; there is no
         // second number to keep true.

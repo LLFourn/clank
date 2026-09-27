@@ -144,11 +144,41 @@
   /* One agent. */
   .agent { grid-area: agent; display: grid; grid-template-rows: minmax(0, 1fr); min-height: 0; border-top: 1px solid var(--edge); }
   .views { position: relative; min-height: 0; }
-  .plan-view { min-width: 0; min-height: 0; display: grid; grid-template-rows: auto minmax(0, 1fr); background: var(--base); }
+  .plan-view { min-width: 0; min-height: 0; display: grid; grid-template-rows: auto auto auto minmax(0, 1fr); background: var(--base); }
+  .plan-view [hidden] { display: none !important; }
   .plan-view .head { display: flex; align-items: center; gap: 12px; padding: 8px 14px; border-bottom: 1px solid var(--edge); }
   .plan-view .head button { flex: 0 0 auto; color: var(--hue-deep); font-weight: 700; }
   .plan-view .head span { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; color: var(--muted); }
-  .plan-view iframe { display: block; width: 100%; height: 100%; min-height: 0; border: 0; background: var(--base); }
+  .plan-view .queue-page-tools { grid-row: 2; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 8px 14px; border-bottom: 1px solid var(--edge); }
+  .plan-view .stash-page-tools { grid-row: 2; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 8px 14px; border-bottom: 1px solid var(--edge); }
+  .plan-view .stash-page-tools .stash-state { margin-right: auto; color: var(--muted); font-size: 12px; }
+  .plan-view .queue-page-tools button, .plan-view .queue-editor button { color: var(--hue-deep); font-weight: 700; }
+  .plan-view .stash-page-tools button { color: var(--hue-deep); font-weight: 700; }
+  .plan-view .queue-page-tools label { display: flex; align-items: center; gap: 5px; margin-left: auto; font-size: 12px; }
+  .plan-view .queue-page-tools input { width: 4em; }
+  .plan-view .qwhy { grid-row: 3; padding: 8px 14px; color: var(--bad, #d05a4a); border-bottom: 1px solid var(--edge); }
+  .plan-view .stash-why { grid-row: 3; padding: 8px 14px; color: var(--bad, #d05a4a); border-bottom: 1px solid var(--edge); }
+  .plan-view iframe, .plan-view .queue-editor, .plan-view .queue-result, .plan-view .stash-result, .plan-view .management-page { grid-row: 4; min-height: 0; }
+  .plan-view iframe { display: block; width: 100%; height: 100%; border: 0; background: var(--base); }
+  .plan-view .queue-editor { overflow: auto; padding: 12px 14px; }
+  .plan-view .queue-editor form { display: grid; grid-template-rows: auto minmax(0, 1fr) auto; min-height: 100%; gap: 12px; }
+  .plan-view .queue-editor .editor-head, .plan-view .queue-editor .controls { display: flex; flex-wrap: wrap; align-items: end; gap: 12px; }
+  .plan-view .queue-editor label { display: grid; gap: 4px; min-width: 0; font-size: 12px; color: var(--muted); }
+  .plan-view .queue-editor input, .plan-view .queue-editor textarea { box-sizing: border-box; border: 1px solid var(--edge); border-radius: 4px; background: var(--base); color: var(--ink); padding: 8px; font: 14px var(--mono); }
+  .plan-view .queue-editor .editor-main { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; min-height: 0; }
+  .plan-view .queue-editor .editor-main label { min-height: 0; }
+  .plan-view .queue-editor textarea { width: 100%; height: 100%; min-height: 240px; resize: none; }
+  .plan-view .queue-editor .preview { min-height: 0; overflow: auto; border: 1px solid var(--edge); padding: 10px; }
+  .plan-view .queue-editor .preview strong { display: block; margin-bottom: 10px; color: var(--muted); }
+  .plan-view .queue-result, .plan-view .stash-result { padding: 24px; overflow: auto; }
+  .plan-view .management-page { overflow: auto; padding: 18px 24px 40px; }
+  .plan-view .management-page h2 { font-family: var(--plate); font-size: 22px; margin: 0 0 16px; }
+  .plan-view .management-page p { max-width: 58ch; line-height: 1.45; }
+  .plan-view .management-page .forget { color: var(--hue-deep); font-weight: 700; }
+  @media (max-width: 700px) {
+    .plan-view .queue-editor .editor-main { grid-template-columns: 1fr; grid-template-rows: minmax(260px, 1fr) minmax(240px, 1fr); }
+    .plan-view .queue-editor .preview { min-height: 220px; }
+  }
   .view { position: absolute; inset: 0; overflow: auto; display: none; }
   .view.on { display: block; }
   .empty { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: var(--muted); padding: 24px; text-align: center; }
@@ -257,7 +287,8 @@
   .ledger { display: none; grid-area: agent; min-height: 0; background: var(--bezel); overflow: auto; font-size: 13px; }
   .ledger .lhead { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; padding: 10px 14px 8px; }
   .ledger .lhead .session { font-family: var(--plate); font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .ledger .forget { color: var(--muted); font-size: 12px; margin-left: auto; }
+  .ledger .management-links { display: flex; gap: 12px; padding: 8px 14px; border-bottom: 1px solid var(--edge); }
+  .ledger .management-links a { color: var(--hue-deep); font-size: 12px; }
   .ledger .facts { padding: 6px 14px 10px; border-bottom: 1px solid var(--edge); }
   .ledger .facts .plan { font-family: var(--plate); font-weight: 700; }
   .ledger .facts .gate { color: var(--hue); }
@@ -267,45 +298,30 @@
   .ledger .queue .head { color: var(--muted); font-size: 12px; padding: 4px 0; }
   .ledger .queue .q { display: flex; align-items: baseline; gap: 8px; padding: 3px 0; }
   .ledger .queue .q .nm { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .ledger .queue .q .pri { flex: 0 0 auto; width: 3.4em; padding: 2px 4px; border: 1px solid var(--edge); border-radius: 3px; background: var(--base); color: var(--muted); font-family: var(--mono); font-size: 12px; text-align: right; }
-  .ledger .queue .q button { flex: 0 0 auto; color: var(--muted); font-size: 12px; padding: 2px 4px; }
-  .ledger .queue .q button.armed { color: var(--ink); font-weight: 700; }
+  .ledger .queue .q a.nm, .ledger .queue .q a.open { color: var(--hue-deep); }
+  .ledger .queue .q .pri { flex: 0 0 auto; color: var(--muted); font-family: var(--mono); font-size: 12px; }
   .ledger .queue-tools { padding: 5px 14px; border-bottom: 1px solid var(--edge); }
-  .ledger .queue-tools button { color: var(--hue); font-size: 12px; }
-  .ledger .queue-editor { padding: 10px 14px; border-bottom: 1px solid var(--edge); }
-  .ledger .queue-editor[hidden] { display: none; }
-  .ledger .queue-editor form { display: grid; gap: 8px; }
-  .ledger .queue-editor label { display: grid; gap: 3px; color: var(--muted); font-size: 12px; }
-  .ledger .queue-editor label[hidden] { display: none; }
-  .ledger .queue-editor input, .ledger .queue-editor textarea { box-sizing: border-box; width: 100%; padding: 6px; border: 1px solid var(--edge); border-radius: 4px; background: var(--base); color: var(--ink); font: 12px var(--mono); }
-  .ledger .queue-editor textarea { min-height: 180px; resize: vertical; }
-  .ledger .queue-editor .controls { display: flex; gap: 10px; }
-  .ledger .stash-list, .ledger .stash-detail { padding: 8px 14px; border-bottom: 1px solid var(--edge); }
-  .ledger .stash-list:empty, .ledger .stash-detail[hidden] { display: none; }
+  .ledger .queue-tools a { color: var(--hue); font-size: 12px; }
+  .ledger .stash-list { padding: 8px 14px; border-bottom: 1px solid var(--edge); }
+  .ledger .stash-list:empty { display: none; }
   .ledger .stash-list .head { color: var(--muted); font-size: 12px; padding-bottom: 4px; }
   .ledger .stash-list .item { display: flex; align-items: baseline; gap: 8px; padding: 3px 0; }
   .ledger .stash-list .name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .ledger .stash-list .note, .ledger .stash-detail .meta { color: var(--muted); font-size: 12px; }
-  .ledger .stash-list button, .ledger .stash-detail button, .ledger .stash-list a, .ledger .stash-detail a { color: var(--hue); font-size: 12px; }
-  .ledger .stash-detail .controls { display: flex; gap: 12px; padding: 8px 0; }
-  .ledger .stash-detail .controls [hidden], .ledger .stash-detail pre[hidden] { display: none; }
-  .ledger .stash-detail button.armed { color: var(--bad, #d05a4a); font-weight: 700; }
-  .ledger .stash-detail pre { white-space: pre-wrap; overflow-wrap: anywhere; font: 12px var(--mono); max-height: 45vh; overflow-y: auto; }
-  .ledger .stash-detail .why { color: var(--bad, #d05a4a); font-size: 12px; }
-  .ledger .team { padding: 8px 14px; border-bottom: 1px solid var(--edge); }
-  .ledger .team summary { cursor: pointer; font-family: var(--plate); font-weight: 700; }
-  .ledger .team .member { border-top: 1px solid var(--edge); padding: 8px 0; }
-  .ledger .team .member summary span { color: var(--muted); font: 12px var(--mono); margin-left: 8px; }
-  .ledger .team .member pre { white-space: pre-wrap; overflow-wrap: anywhere; font: 12px var(--mono); margin: 7px 0; }
-  .ledger .team .member .binding, .ledger .team .member .auto-state { color: var(--muted); font: 12px var(--mono); }
-  .ledger .team .controls { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; margin: 8px 0; }
-  .ledger .team input, .ledger .team select { min-width: 0; padding: 5px; border: 1px solid var(--edge); border-radius: 4px; background: var(--base); color: var(--ink); font: 12px var(--mono); }
-  .ledger .team input { flex: 1 1 110px; }
-  .ledger .team button { padding: 5px; color: var(--hue-deep); text-decoration: underline; font: 12px var(--mono); }
-  .ledger .team button.armed { color: var(--bad, #d05a4a); font-weight: 700; }
-  .ledger .team .why { color: var(--bad, #d05a4a); font: 12px var(--mono); overflow-wrap: anywhere; }
-  .ledger .team .why.ok { color: var(--muted); }
-  .ledger .qwhy { color: var(--bad, #d05a4a); font-size: 12px; padding: 0 14px 8px; }
+  .ledger .stash-list a.name { color: var(--hue-deep); }
+  .ledger .stash-list .note { color: var(--muted); font-size: 12px; }
+  .ledger .stash-list a { color: var(--hue); font-size: 12px; }
+  .management-page .team .member { border-top: 1px solid var(--edge); padding: 12px 0; }
+  .management-page .team .member summary { cursor: pointer; font-family: var(--plate); font-weight: 700; }
+  .management-page .team .member summary span { color: var(--muted); font: 12px var(--mono); margin-left: 8px; }
+  .management-page .team .member pre { white-space: pre-wrap; overflow-wrap: anywhere; font: 12px var(--mono); margin: 7px 0; }
+  .management-page .team .member .binding, .management-page .team .member .auto-state { color: var(--muted); font: 12px var(--mono); }
+  .management-page .team .controls { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; margin: 8px 0; }
+  .management-page .team input, .management-page .team select { min-width: 0; padding: 7px; border: 1px solid var(--edge); border-radius: 4px; background: var(--base); color: var(--ink); font: 13px var(--mono); }
+  .management-page .team input { flex: 1 1 140px; }
+  .management-page .team button { padding: 5px; color: var(--hue-deep); text-decoration: underline; font: 13px var(--mono); }
+  .management-page .team button.armed { color: var(--bad, #d05a4a); font-weight: 700; }
+  .management-page .team .why { color: var(--bad, #d05a4a); font: 13px var(--mono); overflow-wrap: anywhere; }
+  .management-page .team .why.ok { color: var(--muted); }
   .ledger .rows { padding: 6px 0; }
   .row { display: grid; grid-template-columns: 1fr auto; gap: 8px; padding: 2px 14px; white-space: nowrap; overflow: hidden; }
   .row .main { overflow: hidden; text-overflow: ellipsis; }
@@ -389,7 +405,59 @@
     <div class="views" id="views"><div class="empty" id="empty">Waiting for this session…</div></div>
     <section class="plan-view" id="plan-view" aria-labelledby="plan-title" hidden>
       <div class="head"><button id="plan-back" type="button">← Agents</button><span id="plan-title"></span></div>
+      <div class="queue-page-tools" id="queue-page-tools" hidden>
+        <button type="button" id="queue-open-edit">Edit Markdown</button>
+        <label>Priority <input id="queue-page-priority" type="number" min="0" max="999"></label>
+        <button type="button" id="queue-set-priority">Set</button>
+        <button type="button" id="queue-promote">Promote</button>
+        <button type="button" id="queue-unqueue">Unqueue</button>
+      </div>
+      <div class="stash-page-tools" id="stash-page-tools" hidden>
+        <span class="stash-state" id="stash-page-state"></span>
+        <button type="button" id="stash-refresh">Refresh</button>
+        <button type="button" id="stash-restore">Restore</button>
+      </div>
+      <div class="qwhy" id="qwhy" role="status" aria-live="polite" hidden></div>
+      <div class="stash-why" id="stash-why" role="status" aria-live="polite" hidden></div>
       <iframe id="plan-frame" title="Plan page" sandbox="allow-same-origin"></iframe>
+      <section class="queue-editor" id="queue-editor" hidden>
+        <form id="queue-edit-form">
+          <div class="editor-head">
+            <label id="queue-name-label">Name <input id="queue-name" required placeholder="plan-name"></label>
+            <label id="queue-priority-label">Priority <input id="queue-priority" type="number" min="0" max="999" required value="500"></label>
+          </div>
+          <div class="editor-main">
+            <label>Markdown source <textarea id="queue-body" required spellcheck="false" placeholder="# plan-name&#10;&#10;Describe the work"></textarea></label>
+            <div class="preview"><strong>Preview</strong><div class="prose" id="queue-preview"></div></div>
+          </div>
+          <div class="controls"><button type="submit">Save plan</button><button type="button" id="queue-cancel">Cancel</button></div>
+        </form>
+      </section>
+      <div class="queue-result" id="queue-result" hidden><h2 id="queue-result-title"></h2><p>Use Back to return to the plan list.</p></div>
+      <div class="stash-result" id="stash-result" hidden><h2>Plan restored</h2><p>Use Back to return to the plan list.</p></div>
+      <section class="management-page" id="team-page" hidden>
+        <h2>Manage team</h2>
+        <div class="team" id="team">
+          <div id="team-rows"></div>
+          <form id="team-add"><div class="controls">
+            <input id="team-add-name" aria-label="Agent name" placeholder="agent name" list="team-library" required>
+            <datalist id="team-library"></datalist>
+            <select id="team-add-tool" aria-label="Agent tool">
+              <option value="">from library</option><option value="claude">Claude</option><option value="codex">Codex</option><option value="grok">Grok</option><option value="opencode">OpenCode</option>
+            </select>
+            <select id="team-add-review" aria-label="Review tier">
+              <option value="commit">commit</option><option value="plan">plan</option><option value="final">final</option><option value="gate">gate</option><option value="standby">standby (no reviews)</option>
+            </select>
+            <button type="submit">Add agent</button>
+          </div></form>
+          <div class="why" id="team-why" role="status" aria-live="polite" hidden></div>
+        </div>
+      </section>
+      <section class="management-page" id="device-page" hidden>
+        <h2>Device settings</h2>
+        <p>Sign out this browser and forget its saved access to this session.</p>
+        <button class="forget" id="forget" type="button">Forget this device</button>
+      </section>
     </section>
   </div>
   <form class="say" id="say">
@@ -406,42 +474,15 @@
   </form>
   <div class="viewer" id="viewer" role="dialog" aria-label="Full-size image"></div>
   <aside class="ledger" id="ledger">
-    <div class="lhead"><span class="session" id="session"></span><button class="forget" id="forget">forget this device</button></div>
+    <div class="lhead"><span class="session" id="session"></span></div>
     <div class="facts" id="facts"></div>
-    <details class="team" id="team">
-      <summary>Manage team</summary>
-      <div id="team-rows"></div>
-      <form id="team-add"><div class="controls">
-        <input id="team-add-name" aria-label="Agent name" placeholder="agent name" list="team-library" required>
-        <datalist id="team-library"></datalist>
-        <select id="team-add-tool" aria-label="Agent tool">
-          <option value="">from library</option><option value="claude">Claude</option><option value="codex">Codex</option><option value="grok">Grok</option><option value="opencode">OpenCode</option>
-        </select>
-        <select id="team-add-review" aria-label="Review tier">
-          <option value="commit">commit</option><option value="plan">plan</option><option value="final">final</option><option value="gate">gate</option><option value="standby">standby (no reviews)</option>
-        </select>
-        <button type="submit">Add agent</button>
-      </div></form>
-      <div class="why" id="team-why" role="status" aria-live="polite" hidden></div>
-    </details>
+    <nav class="management-links" aria-label="Management pages">
+      <a id="manage-team" href="#manage-team">Manage team</a>
+      <a id="device-settings" href="#device-settings">Device settings</a>
+    </nav>
     <div class="queue" id="queue"></div>
-    <div class="queue-tools"><button type="button" id="queue-new">New queued plan</button></div>
-    <section class="queue-editor" id="queue-editor" hidden>
-      <form id="queue-edit-form">
-        <label>Name <input id="queue-name" required placeholder="plan-name"></label>
-        <label>Priority <input id="queue-priority" type="number" min="0" max="999" required value="500"></label>
-        <label>Markdown source <textarea id="queue-body" required spellcheck="false" placeholder="# plan-name&#10;&#10;Describe the work"></textarea></label>
-        <div class="controls"><button type="submit">Save plan</button><button type="button" id="queue-cancel">Cancel</button></div>
-      </form>
-    </section>
-    <div class="qwhy" id="qwhy" role="status" aria-live="polite" hidden></div>
+    <div class="queue-tools"><a href="#new-queued-plan" id="queue-new">New queued plan</a></div>
     <div class="stash-list" id="stash-list"></div>
-    <section class="stash-detail" id="stash-detail" hidden>
-      <strong id="stash-title"></strong><div class="meta" id="stash-meta"></div>
-      <div class="controls"><a id="stash-html">Open HTML</a><button type="button" id="stash-restore">Restore</button><button type="button" id="stash-close">Close</button></div>
-      <pre id="stash-body"></pre>
-      <div class="why" id="stash-why" role="status" aria-live="polite" hidden></div>
-    </section>
     <div class="rows" id="rows"></div>
   </aside>
 
@@ -602,7 +643,10 @@
   // next load would ask for the token again and be remembered against
   // the user's wishes.
   const forgetEl = $('forget');
-  if (web.hosted && !web.signout) forgetEl.hidden = true;
+  if (web.hosted && !web.signout) {
+    forgetEl.hidden = true;
+    $('device-settings').hidden = true;
+  }
   async function forgetAtDoor() {
     forgetEl.disabled = true;
     forgetEl.textContent = 'forgetting…';
@@ -1275,41 +1319,37 @@
   }
 
   // ---- the queue ----
-  // Two taps for what cannot be taken back, as the pane asks before it
-  // promotes: the first arms the button and says so, the second does
-  // it. A redraw disarms, so an action cannot ride a row that moved.
-  let armed = null;
-  // The queue as last DRAWN, and what was said about the last action.
-  // A status frame arrives for anything — a file changing, an agent
-  // speaking — and redrawing rows that did not change would take the
-  // priority someone is typing, the button they armed, and the
-  // refusal they have not read yet (codex on 22e5fbe).
-  let queueDrawn = null;
-  let queueSaid = '';
-  function disarm() {
-    armed = null;
-    for (const b of $('queue').querySelectorAll('button[data-do]')) {
-      b.classList.remove('armed');
-      b.textContent = b.dataset.do;
-    }
-  }
+  // Page locations arrive with the exact handles in the status frame.
+  // Encode each path segment for the URL; do not reconstruct an entry
+  // from its display name here.
+  const siteHref = (page) => 'html/' + page.split('/').map(encodeURIComponent).join('/');
+  let queueDrawn = null, queuePage = null, queueSaid = '';
+  let armedQueueAction = null, previewTimer = null, previewSequence = 0;
   function queueWhy(text) {
     queueSaid = text || '';
     paintQueueWhy();
   }
-  // Outside the list, because the refusal outlives it: the entry a
-  // request was refused FOR is often the one another surface has just
-  // taken, and an empty queue is exactly when the reason matters
-  // (codex on 66488eb).
   function paintQueueWhy() {
     const box = $('qwhy');
     box.textContent = queueSaid;
     box.hidden = !queueSaid;
   }
-  // The page does not edit its own copy of the queue: it asks, and the
-  // status frame the change wakes is what redraws it.
-  async function askQueue(body) {
-    queueWhy('');
+  function paintQueuePage() {
+    const isQueue = queuePage?.kind === 'queue';
+    const finished = !!queuePage?.result;
+    const editing = !finished && !!queuePage?.editing;
+    $('queue-page-tools').hidden = !isQueue || editing || finished;
+    $('queue-editor').hidden = !editing;
+    $('queue-result').hidden = !finished;
+    $('plan-frame').hidden = editing || finished || queuePage?.kind === 'new';
+    if (isQueue && !editing && !finished) $('queue-page-priority').value = String(queuePage.priority);
+    for (const id of ['queue-open-edit', 'queue-page-priority', 'queue-set-priority', 'queue-promote', 'queue-unqueue']) {
+      $(id).disabled = !!queuePage?.stale || !!queuePage?.pending;
+    }
+    if (finished) $('queue-result-title').textContent = queuePage.result;
+  }
+  async function askQueue(body, silent = false) {
+    if (!silent) queueWhy('');
     try {
       const r = await fetch(route('/queue'), {
         method: 'POST',
@@ -1321,155 +1361,212 @@
       // phone, a draft of that name is already there — and saying it
       // is the whole difference from nothing happening.
       const said = await r.json().catch(() => null);
-      queueWhy((said && said.why) || 'the queue refused that');
+      if (!silent) queueWhy((said && said.why) || 'the queue refused that');
     } catch (err) {
-      queueWhy('could not reach clank');
+      if (!silent) queueWhy('could not reach clank');
     }
     return null;
   }
   let editorHandle = null, editorOriginal = '', editorRevision = '';
-  $('queue-new').addEventListener('click', () => {
+  $('queue-new').addEventListener('click', (e) => {
+    e.preventDefault();
+    openSitePage(null, 'New queued plan', { kind: 'new', editing: true });
     editorHandle = null;
     editorOriginal = '';
     editorRevision = '';
-    $('queue-name').readOnly = false;
-    $('queue-priority').closest('label').hidden = false;
+    $('queue-name-label').hidden = false;
+    $('queue-priority-label').hidden = false;
     $('queue-name').value = '';
     $('queue-priority').value = '500';
     $('queue-body').value = '';
-    $('queue-editor').hidden = false;
+    scheduleQueuePreview();
     $('queue-name').focus();
   });
-  $('queue-cancel').addEventListener('click', () => { $('queue-editor').hidden = true; });
+  $('queue-cancel').addEventListener('click', () => {
+    if (queuePage?.kind === 'new') { closeSitePage(); return; }
+    if (queuePage?.kind === 'queue') {
+      queuePage.editing = false;
+      queueWhy('');
+      paintQueuePage();
+      $('queue-open-edit').focus();
+    }
+  });
   async function openQueueEditor(handle) {
+    const selected = queuePage;
     const source = await askQueue({ do: 'open', handle });
-    if (!source) return;
+    if (!source || selected !== queuePage) return;
     editorHandle = source.handle;
     editorOriginal = source.body;
     editorRevision = source.revision;
-    $('queue-name').readOnly = true;
-    $('queue-priority').closest('label').hidden = true;
+    $('queue-name-label').hidden = true;
+    $('queue-priority-label').hidden = true;
     $('queue-name').value = source.name;
     $('queue-priority').value = String(source.priority);
     $('queue-body').value = source.body;
-    $('queue-editor').hidden = false;
+    queuePage.editing = true;
+    paintQueuePage();
+    scheduleQueuePreview();
     $('queue-body').focus();
   }
+  function scheduleQueuePreview() {
+    clearTimeout(previewTimer);
+    const version = ++previewSequence;
+    previewTimer = setTimeout(async () => {
+      const body = $('queue-body').value;
+      const answer = await askQueue({ do: 'preview', body }, true);
+      if (version !== previewSequence || !queuePage?.editing) return;
+      // The repo renderer escapes raw HTML and filters unsafe links.
+      $('queue-preview').innerHTML = answer?.html || '<p>Preview unavailable.</p>';
+    }, 200);
+  }
+  $('queue-body').addEventListener('input', scheduleQueuePreview);
   $('queue-edit-form').addEventListener('submit', async (e) => {
     e.preventDefault();
+    if (!queuePage?.editing) return;
     const priority = Number($('queue-priority').value);
     if (!Number.isInteger(priority) || priority < 0 || priority > 999) {
       queueWhy('a priority is 0 to 999');
       return;
     }
     const body = $('queue-body').value;
+    const selected = queuePage;
     const saved = editorHandle
       ? await askQueue({ do: 'save', handle: editorHandle, original: editorOriginal, revision: editorRevision, body })
       : await askQueue({ do: 'add', name: $('queue-name').value, priority, body });
-    if (!saved) return;
-    $('queue-editor').hidden = true;
-    queueWhy('Saved.');
+    if (!saved || selected !== queuePage) return;
+    if (selected.kind === 'new') {
+      Object.assign(selected, {
+        kind: 'queue', handle: saved.handle, page: saved.page,
+        name: $('queue-name').value, priority, editing: false,
+        pending: saved, pendingAction: 'created',
+      });
+      selected.result = 'Queued plan created';
+      queueWhy('Created. Waiting for the rendered plan page.');
+    } else {
+      selected.editing = false;
+      selected.reloadWhenReady = true;
+      queueWhy('Saved. The rendered page will refresh with the next status update.');
+    }
+    paintQueuePage();
   });
   // What is queued, in the order it will run. Named by its file,
   // which is what an action names back: two queued files can parse to
   // one name (the-queue-is-workable-from-the-phone).
   //
-  // Redrawn only when the queue itself changed, and what someone was
-  // in the middle of is carried across that redraw by HANDLE — except
-  // for an entry that moved or left, whose pending edit is no longer
-  // about anything that is there.
+  // The list is navigation and read-only priority. Actions belong to
+  // the page, addressed by this exact handle.
   function paintQueue(queue) {
     const box = $('queue');
     const sig = JSON.stringify(queue);
     if (sig === queueDrawn) return;
-    const was = queueDrawn === null ? [] : JSON.parse(queueDrawn);
-    const before = new Map(was.map((q) => [q.handle, q.priority]));
-    // A half-typed priority belongs to the handle, not to the node
-    // that is about to be replaced.
-    const typing = {};
-    for (const input of box.querySelectorAll('input.pri')) {
-      if (input.value !== input.defaultValue) {
-        typing[input.closest('.q').dataset.handle] = input.value;
-      }
-    }
-    const held = document.activeElement;
-    const focused = held && held.closest && held.closest('.q')
-      ? held.closest('.q').dataset.handle
-      : null;
-    const wasArmed = armed;
+    const focused = document.activeElement?.closest('.q')?.dataset.handle;
     queueDrawn = sig;
     box.innerHTML = queue.length
       ? `<div class="head">queued</div>`
         + queue.map((q) => `<div class="q" data-handle="${esc(q.handle)}">`
-          + `<span class="nm">${esc(q.name)}</span>`
-          + `<input class="pri" inputmode="numeric" value="${esc(String(q.priority).padStart(3, '0'))}" aria-label="priority of ${esc(q.name)}">`
-          + `<button data-edit="source" aria-label="Edit ${esc(q.name)} Markdown">edit</button>`
-          + `<button data-do="promote">promote</button>`
-          + `<button data-do="unqueue">unqueue</button>`
+          + (q.page ? `<a class="nm" href="${esc(siteHref(q.page))}">${esc(q.name)}</a>` : `<span class="nm">${esc(q.name)}</span>`)
+          + `<span class="pri" aria-label="priority ${esc(String(q.priority))}">${esc(String(q.priority).padStart(3, '0'))}</span>`
+          + (q.page ? `<a class="open" href="${esc(siteHref(q.page))}">Open plan</a>` : '')
           + `</div>`).join('')
       : '';
-    armed = null;
-    // An entry still there, unmoved, keeps what was being done to it.
-    const settled = (handle) => queue.some(
-      (q) => q.handle === handle && before.get(handle) === q.priority,
-    );
-    for (const [handle, value] of Object.entries(typing)) {
-      if (!settled(handle)) continue;
-      const input = box.querySelector(`.q[data-handle="${CSS.escape(handle)}"] input.pri`);
-      if (input) input.value = value;
-    }
-    if (wasArmed && settled(wasArmed.split(':')[0])) {
-      const [handle, what] = wasArmed.split(':');
-      const btn = box.querySelector(`.q[data-handle="${CSS.escape(handle)}"] button[data-do="${what}"]`);
-      if (btn) {
-        armed = wasArmed;
-        btn.classList.add('armed');
-        btn.textContent = `${what}?`;
+    if (focused) box.querySelector(`.q[data-handle="${CSS.escape(focused)}"] a.nm`)?.focus();
+  }
+  function reconcileQueuePage(queue) {
+    if (queuePage?.kind !== 'queue' || queuePage.result && !queuePage.pending) return;
+    if (queuePage.pending) {
+      const moved = queue.find((q) => q.handle === queuePage.pending.handle);
+      if (!moved) {
+        queuePage.stale = true;
+        queuePage.result = 'Queued plan unavailable';
+        queueWhy('The queued entry is absent from the latest status. Return to Timeline and open its current entry.');
+        paintQueuePage();
+        return;
       }
+      const notice = queuePage.pendingAction === 'created' ? 'Created.' : 'Priority updated.';
+      Object.assign(queuePage, { handle: moved.handle, page: moved.page, priority: moved.priority,
+        pending: null, pendingAction: null, result: null, stale: false });
+      $('plan-frame').src = new URL(siteHref(moved.page), location.href).href;
+      $('plan-title').textContent = moved.name;
+      queueWhy(notice);
+      paintQueuePage();
+      return;
     }
-    if (focused && settled(focused)) {
-      const input = box.querySelector(`.q[data-handle="${CSS.escape(focused)}"] input.pri`);
-      if (input) input.focus();
+    if (!queue.some((q) => q.handle === queuePage.handle)) {
+      if (!queuePage.stale) {
+        queuePage.stale = true;
+        queueWhy('This queued entry moved or left. Return to Timeline and open its current entry.');
+        paintQueuePage();
+      }
+    } else if (queuePage.reloadWhenReady) {
+      queuePage.reloadWhenReady = false;
+      $('plan-frame').src = new URL(siteHref(queuePage.page), location.href).href + '?updated=' + Date.now();
     }
-    paintQueueWhy();
+  }
+  $('queue-open-edit').addEventListener('click', () => {
+    if (queuePage?.kind === 'queue' && !queuePage.stale) {
+      armedQueueAction = null;
+      $('queue-promote').textContent = 'Promote';
+      $('queue-unqueue').textContent = 'Unqueue';
+      openQueueEditor(queuePage.handle);
+    }
+  });
+  $('queue-set-priority').addEventListener('click', async () => {
+    if (queuePage?.kind !== 'queue' || queuePage.stale) return;
+    const priority = Number($('queue-page-priority').value);
+    if (!Number.isInteger(priority) || priority < 0 || priority > 999) { queueWhy('Priority must be 0 to 999.'); return; }
+    const selected = queuePage;
+    armedQueueAction = null;
+    $('queue-promote').textContent = 'Promote';
+    $('queue-unqueue').textContent = 'Unqueue';
+    const moved = await askQueue({ do: 'priority', handle: selected.handle, priority });
+    if (!moved || selected !== queuePage) return;
+    selected.pending = moved;
+    selected.result = 'Priority changed';
+    queueWhy('Waiting for the refreshed plan page. Back returns to Timeline.');
+    paintQueuePage();
+  });
+  for (const action of ['promote', 'unqueue']) {
+    const button = $(action === 'promote' ? 'queue-promote' : 'queue-unqueue');
+    button.addEventListener('click', async () => {
+      if (queuePage?.kind !== 'queue' || queuePage.stale) return;
+      if (armedQueueAction !== action) {
+        $('queue-promote').textContent = 'Promote';
+        $('queue-unqueue').textContent = 'Unqueue';
+        armedQueueAction = action;
+        button.textContent = action === 'promote' ? 'Promote?' : 'Unqueue?';
+        queueWhy('Press again to confirm.');
+        return;
+      }
+      armedQueueAction = null;
+      button.textContent = action === 'promote' ? 'Promote' : 'Unqueue';
+      const selected = queuePage;
+      const done = await askQueue({ do: action, handle: selected.handle });
+      if (!done || selected !== queuePage) return;
+      selected.result = action === 'promote' ? 'Plan promoted' : 'Plan unqueued';
+      queueWhy(action === 'promote' ? 'Promoted. Return to Timeline for the active plan.' : 'Unqueued. Return to Timeline for the updated list.');
+      paintQueuePage();
+    });
   }
 
-  $('queue').addEventListener('click', (e) => {
-    const edit = e.target.closest('button[data-edit]');
-    if (edit) { disarm(); openQueueEditor(edit.closest('.q').dataset.handle); return; }
-    const btn = e.target.closest('button[data-do]');
-    if (!btn) { disarm(); return; }
-    const row = btn.closest('.q');
-    const key = `${row.dataset.handle}:${btn.dataset.do}`;
-    if (armed !== key) {
-      disarm();
-      armed = key;
-      btn.classList.add('armed');
-      btn.textContent = `${btn.dataset.do}?`;
-      return;
-    }
-    disarm();
-    askQueue({ do: btn.dataset.do, handle: row.dataset.handle });
-  });
-  // A priority is a number, not a decision to confirm: it is undone by
-  // typing another one.
-  $('queue').addEventListener('change', (e) => {
-    const input = e.target.closest('input.pri');
-    if (!input) return;
-    const priority = Number(input.value);
-    if (!Number.isInteger(priority) || priority < 0 || priority > 999) {
-      queueWhy('a priority is 0 to 999');
-      return;
-    }
-    askQueue({ do: 'priority', handle: input.closest('.q').dataset.handle, priority });
-  });
-
   // ---- stashed plans ----
-  let stashDrawn = null, openedStash = null, armedRestore = false;
+  let stashDrawn = null, stashPage = null;
   function stashWhy(message) {
     const box = $('stash-why');
     box.textContent = message || '';
     box.hidden = !message;
+  }
+  function paintStashPage() {
+    const selected = !!stashPage;
+    $('stash-page-tools').hidden = !selected || !!stashPage?.result;
+    $('stash-result').hidden = !stashPage?.result;
+    $('stash-restore').textContent = stashPage?.armed ? 'Restore?' : 'Restore';
+    $('stash-restore').disabled = !stashPage?.source || !!stashPage?.stale || !!stashPage?.busy || !!stashPage?.loading;
+    $('stash-refresh').disabled = !!stashPage?.stale || !!stashPage?.busy || !!stashPage?.loading;
+    if (selected) {
+      $('stash-page-state').textContent = `${stashPage.commits} commit${stashPage.commits === 1 ? '' : 's'}`
+        + (stashPage.waiting_for ? ` · waiting for ${stashPage.waiting_for}` : stashPage.ready ? ' · ready' : '');
+    }
+    if (selected && stashPage.result) $('plan-frame').hidden = true;
   }
   function paintStash(entries) {
     const sig = JSON.stringify(entries);
@@ -1478,10 +1575,9 @@
     $('stash-list').innerHTML = entries.length
       ? `<div class="head">stashed</div>` + entries.map((s) =>
           `<div class="item" data-stem="${esc(s.stem)}">`
-          + `<span class="name">${esc(s.stem)}</span>`
+          + (s.page ? `<a class="name" href="${esc(siteHref(s.page))}">${esc(s.stem)}</a>` : `<span class="name">${esc(s.stem)}</span>`)
           + `<span class="note">${s.commits} commit${s.commits === 1 ? '' : 's'}${s.ready ? ' · ready' : s.waiting_for ? ' · waiting' : ''}</span>`
-          + `<button type="button" data-open="stash">view</button>`
-          + `<a href="html/stash/${encodeURIComponent(s.stem)}.html">HTML</a>`
+          + (s.page ? `<a href="${esc(siteHref(s.page))}">Open plan</a>` : '')
           + `</div>`).join('')
       : '';
   }
@@ -1497,49 +1593,62 @@
     } catch (err) { stashWhy('could not reach clank'); }
     return null;
   }
-  $('stash-list').addEventListener('click', async (e) => {
-    const button = e.target.closest('button[data-open]');
-    if (!button) return;
-    const stem = button.closest('.item').dataset.stem;
-    const source = await askStash({ do: 'open', stem });
-    if (!source) {
-      openedStash = null;
-      $('stash-title').textContent = stem;
-      $('stash-meta').textContent = '';
-      $('stash-html').hidden = true;
-      $('stash-restore').hidden = true;
-      $('stash-body').hidden = true;
-      $('stash-detail').hidden = false;
+  async function loadStashSource(selected, refresh = false) {
+    selected.loading = true;
+    paintStashPage();
+    const source = await askStash({ do: 'open', stem: selected.stem });
+    if (selected !== stashPage) return;
+    selected.loading = false;
+    if (selected.stale) {
+      stashWhy('This stash moved or was restored elsewhere. Return to Timeline and open its current entry.');
+      paintStashPage();
       return;
     }
-    openedStash = source;
-    armedRestore = false;
-    $('stash-restore').textContent = 'Restore';
-    $('stash-restore').classList.remove('armed');
-    $('stash-title').textContent = source.stem;
-    $('stash-meta').textContent = `${source.commits} commit${source.commits === 1 ? '' : 's'}`
-      + (source.waiting_for ? ` · waiting for ${source.waiting_for}` : '');
-    $('stash-html').href = `html/stash/${encodeURIComponent(source.stem)}.html`;
-    $('stash-body').textContent = source.body;
-    $('stash-html').hidden = false;
-    $('stash-restore').hidden = false;
-    $('stash-body').hidden = false;
-    $('stash-detail').hidden = false;
+    selected.source = source;
+    selected.armed = false;
+    if (source) {
+      selected.commits = source.commits;
+      selected.waiting_for = source.waiting_for;
+      if (refresh) $('plan-frame').src = new URL(siteHref(selected.page), location.href).href + '?updated=' + Date.now();
+    }
+    paintStashPage();
+  }
+  function reconcileStashPage(entries) {
+    if (!stashPage || stashPage.result || stashPage.stale) return;
+    if (!entries.some((s) => s.stem === stashPage.stem)) {
+      stashPage.stale = true;
+      stashPage.source = null;
+      stashPage.armed = false;
+      stashWhy('This stash moved or was restored elsewhere. Return to Timeline and open its current entry.');
+      paintStashPage();
+    }
+  }
+  $('stash-refresh').addEventListener('click', () => {
+    if (stashPage && !stashPage.stale && !stashPage.busy && !stashPage.loading) loadStashSource(stashPage, true);
   });
-  $('stash-close').addEventListener('click', () => { $('stash-detail').hidden = true; openedStash = null; });
   $('stash-restore').addEventListener('click', async () => {
-    if (!openedStash) return;
-    if (!armedRestore) {
-      armedRestore = true;
-      $('stash-restore').textContent = 'Restore?';
-      $('stash-restore').classList.add('armed');
+    if (!stashPage?.source || stashPage.stale || stashPage.busy || stashPage.loading) return;
+    if (!stashPage.armed) {
+      stashPage.armed = true;
+      paintStashPage();
+      stashWhy('Press again to confirm Restore.');
       return;
     }
-    armedRestore = false;
-    $('stash-restore').textContent = 'Restore';
-    $('stash-restore').classList.remove('armed');
-    const result = await askStash({ do: 'restore', stem: openedStash.stem, revision: openedStash.revision });
-    if (result) { openedStash = null; $('stash-detail').hidden = true; }
+    const selected = stashPage;
+    selected.armed = false;
+    selected.busy = true;
+    paintStashPage();
+    const result = await askStash({ do: 'restore', stem: selected.stem, revision: selected.source.revision });
+    if (selected !== stashPage) return;
+    selected.busy = false;
+    if (result) {
+      selected.result = true;
+      selected.source = null;
+      stashWhy('Restored. Return to Timeline for the active plan.');
+    } else {
+      selected.source = null;
+    }
+    paintStashPage();
   });
 
   // ---- the repo team ----
@@ -1569,7 +1678,6 @@
       paintLibrary();
     } catch (err) { teamWhy(`Could not list library agents: ${err.message || String(err)}`); }
   }
-  $('team').addEventListener('toggle', () => { if ($('team').open) loadLibrary(); });
   function paintTeam(agents) {
     const sig = JSON.stringify(agents.map((a) => [a.label, a.role, a.tool, a.invocation, a.session, a.auto, a.auto_explicit, paneState(a.label)]));
     if (sig === teamDrawn) return;
@@ -1727,11 +1835,12 @@
     paintTeam(facts.agents);
     paintQueue(L.queue);
     paintStash(L.stash_entries || []);
+    reconcileQueuePage(L.queue);
+    reconcileStashPage(L.stash_entries || []);
     // A row's page is the clank html one, in the agent site's viewer. The
     // builder writes a plan's name verbatim, spaces and all; the link
     // encodes each segment and the server decodes it.
-    const href = (page) => 'html/' + page.split('/').map(encodeURIComponent).join('/');
-    const link = (r, inner) => r.page ? `<a href="${esc(href(r.page))}">${inner}</a>` : inner;
+    const link = (r, inner) => r.page ? `<a href="${esc(siteHref(r.page))}">${inner}</a>` : inner;
     $('rows').innerHTML = L.rows.map((r) => {
       const main = r.kind === 'header' ? link(r, esc(r.text))
         : r.kind === 'commit' ? `<span class="glyph">${esc(r.glyph || '')}</span>${link(r, `<span class="sha">${esc(r.sha || '')}</span>`)} ${r.stands_for ? `<span class="plan">${esc(r.stands_for)}</span>` : esc(r.text)}`
@@ -1740,36 +1849,86 @@
       return `<div class="row ${r.kind}"><span class="main">${main}</span><span class="age">${esc(r.age || '')}</span></div>`;
     }).join('');
   }
-  let planReturnTimeline = false;
-  function openSitePage(url, title) {
+  let planReturnTimeline = false, planTimelineScroll = 0, planReturnHref = '', managementPage = null;
+  function paintManagementPage() {
+    $('team-page').hidden = managementPage !== 'team';
+    $('device-page').hidden = managementPage !== 'device';
+    if (managementPage) $('plan-frame').hidden = true;
+  }
+  function openSitePage(url, title, selected = null, returnHref = '') {
     planReturnTimeline = timelineOpen && narrowTimeline.matches;
+    planTimelineScroll = ledgerEl.scrollTop;
+    planReturnHref = returnHref || url?.href || '';
+    queuePage = selected?.kind === 'queue' || selected?.kind === 'new' ? selected : null;
+    stashPage = selected?.kind === 'stash' ? selected : null;
+    managementPage = selected?.kind === 'team' || selected?.kind === 'device' ? selected.kind : null;
+    armedQueueAction = null;
+    queueWhy('');
+    stashWhy('');
     timelineOpen = false;
     show(shown);
     $('plan-title').textContent = title || 'Plan page';
     $('plan-back').textContent = planReturnTimeline ? '← Timeline' : '← Agents';
     $('plan-frame').title = title || 'Plan page';
-    $('plan-frame').src = url.href;
+    if (url) $('plan-frame').src = url.href;
+    else $('plan-frame').removeAttribute('src');
+    paintQueuePage();
+    paintStashPage();
+    paintManagementPage();
     $('views').hidden = true;
     $('plan-view').hidden = false;
     $('plan-back').focus();
+    if (stashPage) loadStashSource(stashPage);
   }
   function closeSitePage(focusWho = true) {
+    clearTimeout(previewTimer);
+    previewSequence++;
     $('plan-view').hidden = true;
     $('plan-frame').removeAttribute('src');
     $('views').hidden = false;
-    timelineOpen = planReturnTimeline && narrowTimeline.matches;
+    queuePage = null;
+    stashPage = null;
+    managementPage = null;
+    armedQueueAction = null;
+    $('queue-promote').textContent = 'Promote';
+    $('queue-unqueue').textContent = 'Unqueue';
+    paintQueuePage();
+    paintStashPage();
+    paintManagementPage();
+    const returningToTimeline = planReturnTimeline && narrowTimeline.matches;
+    timelineOpen = returningToTimeline;
     planReturnTimeline = false;
     show(shown);
-    if (focusWho) (timelineOpen ? modeBtns.timeline : whoEl).focus();
+    if (returningToTimeline) ledgerEl.scrollTop = planTimelineScroll;
+    if (focusWho) {
+      const original = [...ledgerEl.querySelectorAll('a[href]')].find((a) => a.href === planReturnHref);
+      (timelineOpen ? modeBtns.timeline : original || whoEl).focus();
+    }
+    planReturnHref = '';
   }
   $('plan-back').addEventListener('click', () => closeSitePage());
+  $('manage-team').addEventListener('click', (e) => {
+    e.preventDefault();
+    openSitePage(null, 'Manage team', { kind: 'team' }, e.currentTarget.href);
+    loadLibrary();
+  });
+  $('device-settings').addEventListener('click', (e) => {
+    e.preventDefault();
+    openSitePage(null, 'Device settings', { kind: 'device' }, e.currentTarget.href);
+  });
   ledgerEl.addEventListener('click', (e) => {
     const link = e.target.closest('a[href]');
     if (!link || !ledgerEl.contains(link)) return;
     const url = new URL(link.href);
     if (url.origin !== location.origin || !url.pathname.startsWith(route('/html/'))) return;
     e.preventDefault();
-    openSitePage(url, link.textContent.trim());
+    const row = link.closest('#queue .q');
+    const q = row && facts?.ledger?.queue?.find((entry) => entry.handle === row.dataset.handle);
+    const stashRow = link.closest('#stash-list .item');
+    const s = stashRow && facts?.ledger?.stash_entries?.find((entry) => entry.stem === stashRow.dataset.stem);
+    const selected = q ? { kind: 'queue', handle: q.handle, name: q.name, priority: q.priority, page: q.page }
+      : s ? { kind: 'stash', stem: s.stem, page: s.page, commits: s.commits, waiting_for: s.waiting_for, ready: s.ready } : null;
+    openSitePage(url, q?.name || s?.stem || link.textContent.trim(), selected);
   });
 
   // ---- status ----

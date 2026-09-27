@@ -34,5 +34,6 @@ mod wait_config_reload;
 mod wait_event_sources;
 mod wait_for_observer;
 mod web_host_process;
+mod web_timeline_boundary;
 mod zellij_cost_boundary;
 mod zellij_ownership_boundary;

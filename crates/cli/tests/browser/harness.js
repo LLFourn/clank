@@ -6,6 +6,8 @@ const fs = require('fs');
 const path = require('path');
 
 const PAGE = fs.readFileSync(path.join(__dirname, '../../../web/assets/page.html'), 'utf8')
+  .replace('/*__CLANK_DOOR__*/', fs.readFileSync(path.join(__dirname, '../../../web-cloudflare/assets/door.js'), 'utf8'))
+  .replace('/*__CLANK_COMPOSER__*/', fs.readFileSync(path.join(__dirname, '../../../web/assets/composer.js'), 'utf8'))
   .replace(/<link[^>]*>/g, '')
   .replace(/<script src=[^>]*><\/script>/g, '<script>window.Terminal=function(){return{open(){},write(){},resize(){},scrollToBottom(){}}};</script>');
 

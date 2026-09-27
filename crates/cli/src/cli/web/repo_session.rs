@@ -498,10 +498,11 @@ mod tests {
         let repo = git_repo();
         let backend = backend(repo.path(), None);
         let queue = |ask| BrowserRequest::Queue { ask };
-        assert_eq!(
-            ask(&backend, queue(serde_json::json!({"do":"add","name":"later","priority":500,"body":"First draft\n"}))).await.status,
-            204
-        );
+        let added = ask(&backend, queue(serde_json::json!({"do":"add","name":"later","priority":500,"body":"First draft\n"}))).await;
+        assert_eq!(added.status, 200);
+        let added: serde_json::Value = serde_json::from_str(&added.body).unwrap();
+        assert_eq!(added["handle"], "500-later");
+        assert_eq!(added["page"], "queue/500-later.html");
         let opened = ask(
             &backend,
             queue(serde_json::json!({"do":"open","handle":"500-later"})),
@@ -522,15 +523,15 @@ mod tests {
         .await;
         assert_eq!(stale.status, 409);
         assert!(stale.body.contains("changed since it was opened"));
-        assert_eq!(
-            ask(
-                &backend,
-                queue(serde_json::json!({"do":"priority","handle":"500-later","priority":100}))
-            )
-            .await
-            .status,
-            204
-        );
+        let moved = ask(
+            &backend,
+            queue(serde_json::json!({"do":"priority","handle":"500-later","priority":100})),
+        )
+        .await;
+        assert_eq!(moved.status, 200);
+        let moved: serde_json::Value = serde_json::from_str(&moved.body).unwrap();
+        assert_eq!(moved["handle"], "100-later");
+        assert_eq!(moved["page"], "queue/100-later.html");
         assert!(repo.path().join(".clank/queue/100-later.md").exists());
         assert_eq!(
             ask(

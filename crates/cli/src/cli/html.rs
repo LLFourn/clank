@@ -249,7 +249,7 @@ async fn resolve_open_target_path(
         // Pages are keyed by FILE STEM, the one handle unique per entry;
         // a bare name still works while it names one file.
         let entry = crate::cli::queue::resolve_entry(repo, handle)?;
-        return Ok(out_dir.join(format!("queue/{}.html", entry.file_stem())));
+        return Ok(out_dir.join(queue_page_for_stem(&entry.file_stem())));
     }
     if let Some(name) = args.stash.as_deref() {
         let known = crate::cli::stash::scan_stash(repo)
@@ -258,7 +258,7 @@ async fn resolve_open_target_path(
         if !known {
             anyhow::bail!("`{name}` is not stashed (see `clank stash list`)");
         }
-        return Ok(out_dir.join(format!("stash/{name}.html")));
+        return Ok(out_dir.join(stash_page_for_stem(name)));
     }
     match args.plan.as_deref() {
         Some(raw) => {
@@ -273,6 +273,17 @@ async fn resolve_open_target_path(
         }
         None => Ok(out_dir.join("index.html")),
     }
+}
+
+/// Relative generated-page locations for identities already resolved
+/// by the queue or stash. The web status frame and the HTML writer use
+/// these same paths, so a browser link cannot target a different entry.
+pub(crate) fn queue_page_for_stem(stem: &str) -> String {
+    format!("queue/{stem}.html")
+}
+
+pub(crate) fn stash_page_for_stem(stem: &str) -> String {
+    format!("stash/{stem}.html")
 }
 
 /// Queue pages — always fully re-rendered: the queue changes without
@@ -293,7 +304,7 @@ fn write_queue_pages(
     for entry in &queue_entries {
         let body = std::fs::read_to_string(&entry.path).unwrap_or_default();
         let page = render_queue_page(&entry.name, entry.priority, &body);
-        std::fs::write(queue_dir.join(format!("{}.html", entry.file_stem())), page)?;
+        std::fs::write(out_dir.join(queue_page_for_stem(&entry.file_stem())), page)?;
     }
     Ok(queue_entries)
 }
@@ -469,7 +480,7 @@ async fn build_site(
             })
             .collect();
         let page = render_stash_page(stem, record.waiting_for.as_deref(), &commits, &body);
-        std::fs::write(stash_out.join(format!("{stem}.html")), page)?;
+        std::fs::write(out_dir.join(stash_page_for_stem(stem)), page)?;
     }
 
     let queue_entries = write_queue_pages(repo, out_dir)?;
