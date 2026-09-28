@@ -1089,6 +1089,17 @@ fn breaker_spans(name: &str, cols: usize) -> Vec<Span> {
 /// author column is constant regardless of verdict.
 pub(super) const MARK_FIELD: usize = 2;
 
+/// The narrowest pane at which a command event's content stays
+/// reachable in full.
+///
+/// MEASURED, not chosen: at 4 the two-space indent plus a glyph of
+/// display width 2 still fits, so both ASCII and CJK content survive
+/// whole. At 3 a wide glyph is truncated; at 1-2 even ASCII loses
+/// characters behind the indent. `render_at` clamps to `cols.max(1)`,
+/// so those widths are reachable and the page must still render
+/// without panicking there — it simply cannot promise every glyph.
+pub(super) const MIN_EVENT_BODY_COLS: usize = 4;
+
 /// The narrowest pane at which an event row still shows its state.
 ///
 /// A floor, not a wish: `render_at` clamps to `cols.max(1)`, so there
@@ -3075,14 +3086,40 @@ pub(super) fn render_event_detail(
         fact(&mut body, "number", format!("#{n}"));
     }
     if let Some(t) = ev.content.as_deref() {
+        use crate::cli::github::timeline::Backend;
         // Github's word for it is `title`; every other backend just
         // has content, and calling it a title is a small lie the
         // operator has to see through.
-        let label = match ev.backend {
-            crate::cli::github::timeline::Backend::Github => "title",
-            crate::cli::github::timeline::Backend::Command => "content",
-        };
-        fact(&mut body, label, clean(t));
+        //
+        // The DIFFERENCE is not only the word. A title is one short
+        // line and a fact row is the right shape for it. A command
+        // source's content is arbitrary output, and the fact row
+        // flattened its newlines into spaces and then let `emit` clip
+        // it at the pane edge — so everything past one pane width was
+        // not merely off-screen but unreachable, because the page
+        // scrolls by LINE and this had been made one line.
+        let blank = t.trim().is_empty();
+        if ev.backend == Backend::Github || blank {
+            let label = match ev.backend {
+                Backend::Github => "title",
+                Backend::Command => "content",
+            };
+            fact(&mut body, label, clean(t));
+        } else {
+            body.push(emit(&[dim("  content".to_string())], "", cols));
+            // The same display-width wrap the github body and the
+            // standing prompts use, at the same post-indent width.
+            let width = cols.saturating_sub(4).max(1);
+            for line in crate::cli::events::sanitize_multiline(t).lines() {
+                if line.is_empty() {
+                    body.push(String::new());
+                    continue;
+                }
+                for wrapped in super::text::wrap(line, width) {
+                    body.push(emit(&[plain(format!("  {wrapped}"))], "", cols));
+                }
+            }
+        }
     }
     if let Some(a) = ev.actor.as_deref() {
         fact(&mut body, "actor", clean(a));
@@ -7569,6 +7606,154 @@ mod tests {
             body_at < facts_at && body_at < members_at,
             "the fetched body must precede the facts ({facts_at}) and the \
              copy rows ({members_at}), got body at {body_at}:\n{joined}"
+        );
+    }
+
+    /// A COMMAND EVENT'S CONTENT IS A BODY, and keeps every line.
+    ///
+    /// The fact row flattened newlines into spaces and then let `emit`
+    /// clip the result, so everything past one pane width was not
+    /// off-screen but UNREACHABLE: the page scrolls by line, and the
+    /// content had been made one line. Asserted through the rendered
+    /// page, because that is where both of those happened.
+    #[test]
+    fn a_command_events_content_keeps_its_lines() {
+        let page = |content: &str, cols: usize| {
+            let ev = crate::cli::github::timeline::MergedEvent {
+                at: 0,
+                backend: crate::cli::github::timeline::Backend::Command,
+                glyph: None,
+                source: "deploys".into(),
+                kind: "deployed".into(),
+                failure: false,
+                content: Some(content.into()),
+                detail: None,
+                number: None,
+                actor: None,
+                url: None,
+                seen_by: vec!["claude".into()],
+                unhandled: true,
+                baseline: false,
+                members: vec![crate::cli::github::timeline::MemberRef {
+                    key: crate::cli::github::timeline::MemberKey {
+                        agent: "claude".into(),
+                        source: "command-deploys-0000abcd".into(),
+                        seq: 7,
+                        ident: String::new(),
+                    },
+                    acked: false,
+                    transport: crate::cli::github::log::Transport::Command,
+                    content: None,
+                }],
+            };
+            let ep = super::super::input::EventPage {
+                target: ev.members[0].key.clone(),
+                retained: ev.members.iter().map(|m| m.key.clone()).collect(),
+                event: ev,
+                prompts: Vec::new(),
+                scroll: 0,
+                content: None,
+            };
+            // A tall pane so nothing is lost to the scroll WINDOW —
+            // this test is about the body, not about paging.
+            render_event_detail(&ep, &[], 0, 200, cols)
+                .0
+                .iter()
+                .map(|l| visible(l))
+                .collect::<Vec<_>>()
+        };
+
+        // Its own line structure survives, blank line included.
+        let out = page("step one ok\nstep two ok\n\nall done", 80);
+        for want in ["step one ok", "step two ok", "all done"] {
+            assert!(
+                out.iter().any(|l| l.trim() == want),
+                "each line of its own: missing {want:?} in {out:?}",
+            );
+        }
+        assert!(
+            !out.iter().any(|l| l.contains("step one ok step two ok")),
+            "the lines must not be flattened into one: {out:?}",
+        );
+
+        // A line longer than the pane WRAPS instead of being clipped,
+        // so every word stays reachable through the page's scroll.
+        let long = "alpha bravo charlie delta echo foxtrot golf hotel india juliet";
+        let out = page(long, 40);
+        let body: String = out.join(" ");
+        for word in long.split_whitespace() {
+            assert!(body.contains(word), "{word:?} was clipped away: {out:?}");
+        }
+        assert!(
+            out.iter().all(|l| display_width(l) <= 40),
+            "and nothing overflows the pane: {out:?}",
+        );
+
+        // Wide glyphs are measured by DISPLAY width, not scalar count,
+        // so CJK content does not lose its tail.
+        let cjk = "部署完了しました本番環境は稼働中です確認してください";
+        let out = page(cjk, 30);
+        let body: String = out.join("");
+        assert!(
+            cjk.chars().all(|c| body.contains(c)),
+            "every wide glyph stays reachable: {out:?}",
+        );
+        assert!(
+            out.iter().all(|l| display_width(l) <= 30),
+            "and still inside the pane: {out:?}",
+        );
+
+        // THE FLOOR, at the boundary rather than comfortably above it.
+        // Both scripts survive whole at `MIN_EVENT_BODY_COLS`, which is
+        // what makes the no-loss contract truthful instead of unbounded.
+        for text in ["alpha bravo charlie", "部署完了本番"] {
+            let out = page(text, super::MIN_EVENT_BODY_COLS);
+            let body: String = out.join("");
+            for ch in text.chars().filter(|c| !c.is_whitespace()) {
+                assert!(
+                    body.contains(ch),
+                    "{ch:?} lost at the stated floor of {}: {out:?}",
+                    super::MIN_EVENT_BODY_COLS,
+                );
+            }
+            assert!(
+                out.iter()
+                    .all(|l| display_width(l) <= super::MIN_EVENT_BODY_COLS),
+                "and nothing overflows it: {out:?}",
+            );
+        }
+
+        // BELOW the floor the page still renders. It promises nothing
+        // about completeness there, but it must not panic or overflow.
+        for cols in 1..super::MIN_EVENT_BODY_COLS {
+            let out = page("部署完了本番", cols);
+            assert!(
+                out.iter().all(|l| display_width(l) <= cols),
+                "a pane narrower than the floor still fits its own width: {out:?}",
+            );
+        }
+
+        // Whitespace-only content keeps the old one-line fact rather
+        // than opening an empty region. Asserted POSITIONALLY: the
+        // body path emits a `content` label too, so merely finding the
+        // word proves nothing — what separates them is whether a blank
+        // body line follows it before the next fact.
+        let out = page("   ", 80);
+        let at = out
+            .iter()
+            .position(|l| l.trim_start().starts_with("content"))
+            .unwrap_or_else(|| panic!("no content row at all: {out:?}"));
+        let copies = out
+            .iter()
+            .position(|l| l.trim_start().starts_with("copies"))
+            .unwrap_or_else(|| panic!("no copies row: {out:?}"));
+        assert_eq!(
+            copies - at,
+            2,
+            "an empty content stays ONE fact row: the body path would \
+             add its label plus a rendered blank line here, which is \
+             the empty region this must not open: {:?}",
+            &out[at..=copies],
         );
     }
 
