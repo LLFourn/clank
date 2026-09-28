@@ -5242,6 +5242,143 @@ pub(crate) mod tests {
         );
     }
 
+    /// AN EVENT OFFERS ITS OBJECT AND THE THREAD AROUND IT.
+    ///
+    /// Both, whenever both exist. One row resolving a single URL had
+    /// to choose, and chose the object — so the moment a fetch
+    /// succeeded, the way back to the pull request disappeared.
+    ///
+    /// The container is derived from repo + number + KIND, so it works
+    /// for a row recorded before any of this, whose `url` is null. That
+    /// is the dead-end page from the report.
+    #[test]
+    fn an_event_opens_its_object_and_its_container() {
+        use super::input::{actions_for, event_container_url};
+        let mut ev = mk_event(vec![mk_member("alpha", 1, "f:1", true)]);
+        ev.kind = "pr_comment".into();
+        ev.number = Some(602);
+        ev.url = Some("https://github.com/o/r/pull/602#discussion_r7".into());
+        let ep = EventPage {
+            target: ev.members[0].key.clone(),
+            retained: ev.members.iter().map(|m| m.key.clone()).collect(),
+            event: ev,
+            prompts: Vec::new(),
+            scroll: 0,
+            content: None,
+        };
+
+        // Two actions, two DIFFERENT addresses.
+        assert_eq!(
+            event_action_effect(&ep, EventAction::OpenBrowser),
+            EventEffect::Open("https://github.com/o/r/pull/602#discussion_r7".into()),
+        );
+        assert_eq!(
+            event_action_effect(&ep, EventAction::OpenContainer),
+            EventEffect::Open("https://github.com/o/r/pull/602".into()),
+        );
+        let offered = actions_for(&ep);
+        assert!(
+            offered.contains(&EventAction::OpenBrowser)
+                && offered.contains(&EventAction::OpenContainer),
+            "a page with both must offer both: {offered:?}",
+        );
+
+        // READY, which is the state that matters: the fetch succeeded,
+        // so `event_open_url` prefers the FETCHED object's link. That
+        // is exactly when a single row would have dropped the
+        // container, so it is where both must be offered.
+        let mut ready = ep.clone();
+        // An OLD row: recorded before the classifier learned to store
+        // the anchored link, so its `url` is the container's. The
+        // fetch supplies the anchor. If the browser action fell back
+        // to the record here, both rows would open the same page and
+        // the anchored link would be lost on every pre-existing event.
+        ready.event.url = Some("https://github.com/o/r/pull/602".into());
+        ready.content = Some(super::event_content::ContentSlot {
+            target: clank_core::wait::ContentRef::ReviewComment { id: 7 },
+            generation: 1,
+            state: super::event_content::ContentState::Ready(super::event_content::EventBody {
+                body: "looks wrong to me".into(),
+                author: Some("LLFourn".into()),
+                url: Some("https://github.com/o/r/pull/602#discussion_r7".into()),
+            }),
+        });
+        let offered = actions_for(&ready);
+        assert!(
+            offered.contains(&EventAction::OpenBrowser)
+                && offered.contains(&EventAction::OpenContainer),
+            "a fetched body must not cost the page its container: {offered:?}",
+        );
+        let object = event_action_effect(&ready, EventAction::OpenBrowser);
+        let container = event_action_effect(&ready, EventAction::OpenContainer);
+        assert_eq!(
+            object,
+            EventEffect::Open("https://github.com/o/r/pull/602#discussion_r7".into()),
+        );
+        assert_eq!(
+            container,
+            EventEffect::Open("https://github.com/o/r/pull/602".into()),
+        );
+        assert_ne!(object, container, "two actions, two addresses");
+
+        // UNAVAILABLE, on a row recorded before any of this: `url` is
+        // null and the object 404s. This is the reported page.
+        let mut dead = ep.clone();
+        dead.event.url = None;
+        dead.content = Some(super::event_content::ContentSlot {
+            target: clank_core::wait::ContentRef::ReviewComment { id: 7 },
+            generation: 1,
+            state: super::event_content::ContentState::Unavailable(
+                "no longer on GitHub (deleted, or not visible to this token)".into(),
+            ),
+        });
+        assert_eq!(
+            event_action_effect(&dead, EventAction::OpenBrowser),
+            EventEffect::None,
+        );
+        assert_eq!(
+            event_action_effect(&dead, EventAction::OpenContainer),
+            EventEffect::Open("https://github.com/o/r/pull/602".into()),
+            "a deleted comment still belongs to a pull request",
+        );
+        let offered = actions_for(&dead);
+        assert!(
+            offered.contains(&EventAction::OpenContainer)
+                && !offered.contains(&EventAction::OpenBrowser),
+            "the dead-end page offers the thread and nothing that 404s: {offered:?}",
+        );
+
+        // The KIND picks the path; a number alone cannot.
+        let mut issue = ep.event.clone();
+        issue.kind = "issue_comment".into();
+        assert_eq!(
+            event_container_url(&issue).as_deref(),
+            Some("https://github.com/o/r/issues/602"),
+        );
+
+        // No number, a kind with no container, and a command source
+        // each name nothing rather than a guessed address.
+        let mut bare = ep.event.clone();
+        bare.number = None;
+        assert_eq!(event_container_url(&bare), None, "no number, no container");
+
+        let mut push = ep.event.clone();
+        push.kind = "branch_push".into();
+        assert_eq!(
+            event_container_url(&push),
+            None,
+            "a push names no container"
+        );
+
+        let mut cmd = ep.event.clone();
+        cmd.backend = crate::cli::github::timeline::Backend::Command;
+        assert_eq!(
+            event_container_url(&cmd),
+            None,
+            "a command source is not a github repo",
+        );
+    }
+
     #[test]
     fn event_prompts_dedup_and_attribute() {
         // tui-github-event-page: identical member prompts collapse

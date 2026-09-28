@@ -1498,6 +1498,19 @@ pub(super) struct EventPage {
 pub(super) enum EventAction {
     /// Open the event URL via the platform opener.
     OpenBrowser,
+    /// Open the pull request or issue the event belongs to.
+    ///
+    /// Its OWN action rather than a fallback inside `OpenBrowser`,
+    /// because the two coexist: the event URL is anchored at the
+    /// comment or review, and a reader who wants the thread around it
+    /// wants a different address. One row resolving a single URL had
+    /// to drop one of them, and dropped the thread exactly when the
+    /// fetch succeeded.
+    ///
+    /// It is also what remains when the object is GONE: a deleted
+    /// review comment still belongs to a PR, so a row that can no
+    /// longer be fetched is not a dead end.
+    OpenContainer,
     /// Ack every unhandled copy (the fanout through the shared core).
     Ack,
     /// Re-request the GitHub body. Offered ONLY while the content is
@@ -1516,6 +1529,7 @@ pub(super) enum EventAction {
 pub(super) fn event_action_key(a: EventAction) -> (Key, &'static str) {
     match a {
         EventAction::OpenBrowser => (Key::Html, "o"),
+        EventAction::OpenContainer => (Key::Char(b'c'), "c"),
         // The physical letter, NOT `Key::Focus`: that variant is Tab
         // too, and acking every copy is destructive.
         EventAction::Ack => (Key::Char(b'a'), "a"),
@@ -1539,10 +1553,18 @@ pub(super) fn event_hotkey(key: Key, actions: &[EventAction]) -> Option<EventAct
 /// The event page's actions in display order: unavailable actions are
 /// OMITTED (no URL → no browser row; fully handled → no ack row),
 /// matching how the other pages degrade.
-pub(super) fn event_actions(has_url: bool, unhandled: bool, retryable: bool) -> Vec<EventAction> {
+pub(super) fn event_actions(
+    has_url: bool,
+    has_container: bool,
+    unhandled: bool,
+    retryable: bool,
+) -> Vec<EventAction> {
     let mut out = Vec::new();
     if has_url {
         out.push(EventAction::OpenBrowser);
+    }
+    if has_container {
+        out.push(EventAction::OpenContainer);
     }
     if unhandled {
         out.push(EventAction::Ack);
@@ -1559,6 +1581,7 @@ pub(super) fn event_actions(has_url: bool, unhandled: bool, retryable: bool) -> 
 pub(super) fn actions_for(ep: &EventPage) -> Vec<EventAction> {
     event_actions(
         event_open_url(ep).is_some(),
+        event_container_url(&ep.event).is_some(),
         ep.event.unhandled,
         ep.content.as_ref().is_some_and(|c| c.state.is_retryable()),
     )
@@ -1751,9 +1774,39 @@ pub(super) fn presence_in(
     }
 }
 
+/// The browser address of the pull request or issue this event
+/// belongs to, or `None` when the event does not name one.
+///
+/// Derived from the KIND, never guessed from the number: a number
+/// alone cannot say whether `/pull/` or `/issues/` is the right path,
+/// and GitHub redirecting one to the other is not a reason to record
+/// the wrong one. A kind that is not one of these families — a branch
+/// push, a command source's event — names no container at all.
+///
+/// Derived at RENDER time on purpose. Every row already written
+/// carries no container URL, and the event log is append-only, so
+/// deriving is what makes those rows openable too.
+pub(super) fn event_container_url(
+    ev: &crate::cli::github::timeline::MergedEvent,
+) -> Option<String> {
+    use crate::cli::github::timeline::Backend;
+    if ev.backend != Backend::Github {
+        return None;
+    }
+    let number = ev.number?;
+    let path = match ev.kind.as_str() {
+        "pr_opened" | "pr_updated" | "pr_merged" | "pr_comment" | "ci_passed" | "ci_failed" => {
+            "pull"
+        }
+        "issue_opened" | "issue_closed" | "issue_comment" => "issues",
+        _ => return None,
+    };
+    Some(format!("https://github.com/{}/{path}/{number}", ev.source))
+}
+
 /// The URL the browser action opens: the FETCHED object's own link
-/// when we have it — for a comment that is the anchored permalink the
-/// event record never carried — else the record's issue/PR URL.
+/// when we have it — for a comment that is the anchored permalink —
+/// else whatever the event record carried.
 pub(super) fn event_open_url(ep: &EventPage) -> Option<String> {
     if let Some(slot) = &ep.content
         && let super::event_content::ContentState::Ready(b) = &slot.state
@@ -1786,6 +1839,9 @@ pub(super) enum EventEffect {
 
 pub(super) fn event_action_effect(ep: &EventPage, a: EventAction) -> EventEffect {
     match a {
+        EventAction::OpenContainer => event_container_url(&ep.event)
+            .map(EventEffect::Open)
+            .unwrap_or(EventEffect::None),
         EventAction::OpenBrowser => event_open_url(ep)
             .map(EventEffect::Open)
             .unwrap_or(EventEffect::None),
@@ -2536,7 +2592,7 @@ mod tests {
         // A no-URL event has no browser row and a handled event has no
         // ack row; their keys must be inert rather than firing at
         // something that is not there.
-        let none: Vec<EventAction> = event_actions(false, false, false);
+        let none: Vec<EventAction> = event_actions(false, false, false, false);
         assert_eq!(event_hotkey(Key::Html, &none), None, "no URL → `o` inert");
         assert_eq!(
             event_hotkey(Key::Char(b'a'), &none),
@@ -2544,7 +2600,7 @@ mod tests {
             "handled → ack inert"
         );
 
-        let both = event_actions(true, true, false);
+        let both = event_actions(true, false, true, false);
         assert_eq!(
             event_hotkey(Key::Html, &both),
             Some(EventAction::OpenBrowser)
@@ -2562,7 +2618,7 @@ mod tests {
             assert_eq!(keys.len(), 1, "one key per byte here: {keys:?}");
             keys[0]
         };
-        let actions = event_actions(true, true, false);
+        let actions = event_actions(true, false, true, false);
 
         let tab = key_of(b"\t");
         assert_eq!(tab, Key::Focus, "Tab stays the focus key");
@@ -2630,7 +2686,7 @@ mod tests {
         // open-in-browser and ack are pinned here without spawning
         // anything, exactly like the plan page's nav.
         use super::{EventAction, EventNav, event_actions, event_detail_nav};
-        let actions = event_actions(true, true, false);
+        let actions = event_actions(true, false, true, false);
         assert_eq!(
             actions,
             vec![
@@ -2681,7 +2737,7 @@ mod tests {
         );
         // Degraded menu: no URL, handled → only Back, and Enter on it
         // closes.
-        let only_back = event_actions(false, false, false);
+        let only_back = event_actions(false, false, false, false);
         assert_eq!(
             event_detail_nav(0, &only_back, Key::Enter, 5, 0),
             EventNav::Act(EventAction::Back)

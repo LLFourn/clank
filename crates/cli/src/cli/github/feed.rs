@@ -239,12 +239,10 @@ pub(crate) fn classify_event(
             title: obj
                 .get("title")
                 .and_then(|t| t.as_str())
+                .filter(|s| !s.is_empty())
                 .map(str::to_string),
             actor: actor.map(str::to_string),
-            url: obj
-                .get("html_url")
-                .and_then(|u| u.as_str())
-                .map(str::to_string),
+            url: subject_url(payload, obj),
             instructions: None,
             content: content_ref(kind, detail, payload, obj),
         },
@@ -265,6 +263,37 @@ fn comment_ns_container(detail: Option<&str>) -> (&'static str, &'static str) {
         Some("issue_comment_on_pr") => ("pr_issue_comment", "comment"),
         _ => ("issue_comment", "comment"),
     }
+}
+
+/// A non-empty `html_url` on this object, if it has one.
+fn html_url(v: &serde_json::Value) -> Option<String> {
+    v.get("html_url")
+        .and_then(|u| u.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// The browser link for the object this event is ABOUT.
+///
+/// The container's link is the FALLBACK, not the answer: a comment
+/// carries its own anchored `html_url`, which opens the thing the
+/// event announced instead of the top of a long thread.
+///
+/// Shared by both classifiers on purpose. They see different payloads
+/// — the Events API sends a `pull_request` stub of five keys with no
+/// `html_url` at all, a webhook sends the full object — and two copies
+/// of this decision is how the poll came to record no link for every
+/// review comment while the webhook recorded its PR's.
+///
+/// Only `html_url` is ever read. The stub's `url` is an
+/// `api.github.com` address, which is not something an operator can
+/// open, so the absence of a link is the honest answer there.
+fn subject_url(payload: &serde_json::Value, obj: &serde_json::Value) -> Option<String> {
+    payload
+        .get("comment")
+        .and_then(html_url)
+        .or_else(|| payload.get("review").and_then(html_url))
+        .or_else(|| html_url(obj))
 }
 
 /// Which object carries this event's body
@@ -507,12 +536,10 @@ pub(crate) fn classify_webhook(
             title: obj
                 .get("title")
                 .and_then(|t| t.as_str())
+                .filter(|s| !s.is_empty())
                 .map(str::to_string),
             actor: actor.map(str::to_string),
-            url: obj
-                .get("html_url")
-                .and_then(|u| u.as_str())
-                .map(str::to_string),
+            url: subject_url(payload, obj),
             instructions: None,
             content: content_ref(kind, detail, payload, obj),
         },
@@ -1351,6 +1378,273 @@ pub(super) mod tests {
         };
         assert_eq!(title.as_deref(), Some("Add the widget"));
         assert_eq!(url.as_deref(), Some("https://github.com/o/r/pull/12"));
+    }
+
+    /// THE SUBJECT'S OWN LINK, for each transport's REAL payload.
+    ///
+    /// The two classifiers see different shapes, so a fixture from one
+    /// proves nothing about the other. The poll reads the Events API,
+    /// whose `pull_request` for a review-comment event is five keys —
+    /// `base, head, id, number, url` — with no `html_url` at all; a
+    /// webhook sends the full object. Feeding a full PR to the poll's
+    /// classifier is what let `url: null` go unnoticed on every
+    /// poll-sourced review comment.
+    #[test]
+    fn an_event_links_to_the_object_it_announces() {
+        let all = &[GithubEventKind::PrComment];
+        // The Events API stub, verbatim in shape.
+        let stub = serde_json::json!({
+            "base": {}, "head": {}, "id": 1, "number": 602,
+            "url": "https://api.github.com/repos/o/r/pulls/602"
+        });
+        let poll = serde_json::json!({
+            "type": "PullRequestReviewCommentEvent",
+            "actor": {"login": "x"},
+            "payload": {
+                "action": "created",
+                "comment": {"id": 7, "html_url": "https://github.com/o/r/pull/602#discussion_r7"},
+                "pull_request": stub,
+            }
+        });
+        let got = classify_event("o/r", &poll, all, Some("me"), false, &[]).expect("classified");
+        let WaitItem::GithubEvent { url, title, .. } = &got.item else {
+            panic!("not a github event")
+        };
+        assert_eq!(
+            url.as_deref(),
+            Some("https://github.com/o/r/pull/602#discussion_r7"),
+            "the poll must record the comment's anchored link, not the stub's api url",
+        );
+        assert_eq!(
+            title.as_deref(),
+            None,
+            "the stub carries no title to record"
+        );
+
+        // The webhook's full pull_request: the comment still wins.
+        let hook = serde_json::json!({
+            "action": "created",
+            "sender": {"login": "x"},
+            "comment": {"id": 7, "html_url": "https://github.com/o/r/pull/602#discussion_r7"},
+            "pull_request": {
+                "number": 602, "title": "t",
+                "html_url": "https://github.com/o/r/pull/602"
+            }
+        });
+        let got = classify_webhook(
+            "o/r",
+            "pull_request_review_comment",
+            &hook,
+            all,
+            Some("me"),
+            false,
+            &[],
+        )
+        .expect("classified");
+        let WaitItem::GithubEvent { url, title, .. } = &got.item else {
+            panic!("not a github event")
+        };
+        assert_eq!(
+            url.as_deref(),
+            Some("https://github.com/o/r/pull/602#discussion_r7"),
+            "the anchored comment beats the container, on this transport too",
+        );
+        assert_eq!(title.as_deref(), Some("t"));
+
+        // A review carries its own link under a different key.
+        let review = serde_json::json!({
+            "action": "submitted",
+            "sender": {"login": "x"},
+            "review": {"id": 9, "html_url": "https://github.com/o/r/pull/587#pullrequestreview-9"},
+            "pull_request": {"number": 587, "html_url": "https://github.com/o/r/pull/587"}
+        });
+        let got = classify_webhook(
+            "o/r",
+            "pull_request_review",
+            &review,
+            all,
+            Some("me"),
+            false,
+            &[],
+        )
+        .expect("classified");
+        let WaitItem::GithubEvent { url, .. } = &got.item else {
+            panic!("not a github event")
+        };
+        assert_eq!(
+            url.as_deref(),
+            Some("https://github.com/o/r/pull/587#pullrequestreview-9"),
+        );
+
+        // No object link: the container is the fallback, and a payload
+        // with neither records NOTHING rather than an api address.
+        let bare = serde_json::json!({
+            "type": "PullRequestReviewCommentEvent",
+            "actor": {"login": "x"},
+            "payload": {
+                "action": "created",
+                "comment": {"id": 7},
+                "pull_request": stub,
+            }
+        });
+        let got = classify_event("o/r", &bare, all, Some("me"), false, &[]).expect("classified");
+        let WaitItem::GithubEvent { url, .. } = &got.item else {
+            panic!("not a github event")
+        };
+        assert_eq!(
+            url.as_deref(),
+            None,
+            "an api.github.com url is not a link an operator can open",
+        );
+
+        // EMPTY is not a link. GitHub returning "" for either field
+        // would otherwise record a url that opens nothing and a title
+        // that renders as a blank, which read as content rather than
+        // as absence.
+        let empty = serde_json::json!({
+            "action": "created",
+            "sender": {"login": "x"},
+            "comment": {"id": 7, "html_url": ""},
+            "pull_request": {
+                "number": 602, "title": "",
+                "html_url": "https://github.com/o/r/pull/602"
+            }
+        });
+        let got = classify_webhook(
+            "o/r",
+            "pull_request_review_comment",
+            &empty,
+            all,
+            Some("me"),
+            false,
+            &[],
+        )
+        .expect("classified");
+        let WaitItem::GithubEvent { url, title, .. } = &got.item else {
+            panic!("not a github event")
+        };
+        assert_eq!(
+            url.as_deref(),
+            Some("https://github.com/o/r/pull/602"),
+            "an empty comment link falls through to the container",
+        );
+        assert_eq!(
+            title.as_deref(),
+            None,
+            "an empty title is absent, not blank"
+        );
+    }
+
+    /// THE REST OF THE FAMILIES, at their real entry points.
+    ///
+    /// Each kind reaches the shared rule down its own branch and reads
+    /// its own payload key, so the review-comment case above proves
+    /// none of them. A submitted review is the one that has to be
+    /// driven on the POLL as well: that is where the `pull_request` is
+    /// the five-key stub, so the container cannot cover for a missing
+    /// `payload.review.html_url`.
+    #[test]
+    fn every_comment_family_links_to_its_own_object() {
+        let all = &[GithubEventKind::PrComment, GithubEventKind::IssueComment];
+        let url_of = |c: &Classified| {
+            let WaitItem::GithubEvent { url, .. } = &c.item else {
+                panic!("not a github event")
+            };
+            url.clone()
+        };
+        let stub = serde_json::json!({
+            "base": {}, "head": {}, "id": 1, "number": 587,
+            "url": "https://api.github.com/repos/o/r/pulls/587"
+        });
+
+        // A submitted review, on the POLL, against the real stub.
+        let poll_review = serde_json::json!({
+            "type": "PullRequestReviewEvent",
+            "actor": {"login": "x"},
+            "payload": {
+                "action": "created",
+                "review": {"id": 9, "html_url": "https://github.com/o/r/pull/587#pullrequestreview-9"},
+                "pull_request": stub,
+            }
+        });
+        assert_eq!(
+            url_of(
+                &classify_event("o/r", &poll_review, all, Some("me"), false, &[])
+                    .expect("classified")
+            ),
+            Some("https://github.com/o/r/pull/587#pullrequestreview-9".into()),
+            "a poll review must use its own link; the stub has none to fall back on",
+        );
+
+        // An issue comment, on the poll. The container here is a FULL
+        // issue, so the anchored link has to beat a link that exists.
+        let issue = serde_json::json!({
+            "number": 12, "title": "t",
+            "html_url": "https://github.com/o/r/issues/12"
+        });
+        let poll_issue = serde_json::json!({
+            "type": "IssueCommentEvent",
+            "actor": {"login": "x"},
+            "payload": {
+                "action": "created",
+                "comment": {"id": 5, "html_url": "https://github.com/o/r/issues/12#issuecomment-5"},
+                "issue": issue,
+            }
+        });
+        assert_eq!(
+            url_of(
+                &classify_event("o/r", &poll_issue, all, Some("me"), false, &[])
+                    .expect("classified")
+            ),
+            Some("https://github.com/o/r/issues/12#issuecomment-5".into()),
+            "the comment's anchor, not the top of the thread",
+        );
+
+        // The same family on the webhook.
+        let hook_issue = serde_json::json!({
+            "action": "created",
+            "sender": {"login": "x"},
+            "comment": {"id": 5, "html_url": "https://github.com/o/r/issues/12#issuecomment-5"},
+            "issue": issue,
+        });
+        assert_eq!(
+            url_of(
+                &classify_webhook(
+                    "o/r",
+                    "issue_comment",
+                    &hook_issue,
+                    all,
+                    Some("me"),
+                    false,
+                    &[]
+                )
+                .expect("classified")
+            ),
+            Some("https://github.com/o/r/issues/12#issuecomment-5".into()),
+        );
+
+        // A comment on a PR's conversation tab is the same resource
+        // and must answer the same way.
+        let pr_issue = serde_json::json!({
+            "number": 12, "title": "t", "pull_request": {},
+            "html_url": "https://github.com/o/r/pull/12"
+        });
+        let poll_pr_issue = serde_json::json!({
+            "type": "IssueCommentEvent",
+            "actor": {"login": "x"},
+            "payload": {
+                "action": "created",
+                "comment": {"id": 5, "html_url": "https://github.com/o/r/pull/12#issuecomment-5"},
+                "issue": pr_issue,
+            }
+        });
+        assert_eq!(
+            url_of(
+                &classify_event("o/r", &poll_pr_issue, all, Some("me"), false, &[])
+                    .expect("classified")
+            ),
+            Some("https://github.com/o/r/pull/12#issuecomment-5".into()),
+        );
     }
 
     #[test]

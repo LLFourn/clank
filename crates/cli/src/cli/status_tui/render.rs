@@ -2882,7 +2882,16 @@ fn event_action_row(a: EventAction) -> (&'static str, &'static str, &'static str
     // must be one fact (tui-event-page-hotkeys).
     let key = super::input::event_action_key(a).1;
     match a {
-        EventAction::OpenBrowser => (key, "open in browser", "launch the event URL"),
+        // Generic ON PURPOSE. This row serves every kind: a
+        // pr_comment's anchored comment, a pr_opened's pull request,
+        // a branch_push's compare. Naming one of them makes the row
+        // lie on the others.
+        EventAction::OpenBrowser => (key, "open in browser", "launch what this event announced"),
+        EventAction::OpenContainer => (
+            key,
+            "open the conversation",
+            "launch the pull request or issue it belongs to",
+        ),
         EventAction::Ack => (key, "ack", "mark every agent's copy handled"),
         EventAction::Retry => (key, "retry", "request the body from GitHub again"),
         EventAction::Back => (key, "back", "return to the log"),
@@ -7632,7 +7641,7 @@ mod tests {
             scroll: 0,
             content: None,
         };
-        let actions = event_actions(true, true, false);
+        let actions = event_actions(true, false, true, false);
         let (out, _) = render_event_detail(&ep, &actions, 0, 40, 90);
         let text: String = out
             .iter()
@@ -7717,12 +7726,12 @@ mod tests {
         assert_eq!(one.len(), 1, "{one:?}");
 
         // No URL + fully handled: those actions are OMITTED.
-        let actions = event_actions(false, false, false);
+        let actions = event_actions(false, false, false, false);
         assert_eq!(actions, vec![super::super::input::EventAction::Back]);
     }
 
     fn actions_full() -> Vec<super::super::input::EventAction> {
-        event_actions(true, true, false)
+        event_actions(true, false, true, false)
     }
 
     #[test]
