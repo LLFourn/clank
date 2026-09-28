@@ -1089,6 +1089,52 @@ fn breaker_spans(name: &str, cols: usize) -> Vec<Span> {
 /// author column is constant regardless of verdict.
 pub(super) const MARK_FIELD: usize = 2;
 
+/// The narrowest pane at which an event row still shows its state.
+///
+/// A floor, not a wish: `render_at` clamps to `cols.max(1)`, so there
+/// is no width at which every row kind stays legible and "always
+/// visible" would be unkeepable. Below this the pane is degraded for
+/// every row kind alike. Above it, the state is leftmost in the row's
+/// own spans, so truncation eats the describe line first.
+pub(super) const MIN_EVENT_STATE_COLS: u16 = 20;
+
+/// Whether this event still wants someone, in a fixed
+/// [`MARK_FIELD`]-wide column at the start of the row's own spans.
+///
+/// BOTH states are marked. Rendering "handled" as the absence of a
+/// mark made it identical to a row that simply says nothing about it,
+/// which is the whole defect: a timeline you have worked through was a
+/// wall of unmarked rows.
+///
+/// A blank is kept for pre-watch history, and that is what makes the
+/// blank mean something: those events existed before the watch and
+/// were never anyone's to answer, so "no mark" reads as "not yours"
+/// rather than as "handled, or unmentioned, cannot tell".
+///
+/// `?` is the verdict vocabulary's own word for unmarked
+/// (`log::verdict_mark`), so it carries the right sense here. `✓`
+/// overlaps with an approved review, which is why this one is DIM and
+/// in a different column on a different row kind: the coloured `✓` of
+/// a verdict and the receding `✓` of a handled event never appear in
+/// the same place.
+fn event_mark(baseline: bool, unhandled: bool) -> Span {
+    let field = |glyph: &str| {
+        format!(
+            "{glyph}{}",
+            " ".repeat(MARK_FIELD.saturating_sub(display_width(glyph)))
+        )
+    };
+    match (baseline, unhandled) {
+        (true, _) => dim(field("")),
+        // Magenta ON PURPOSE: not the warning colour, because work you
+        // have not looked at yet is not a fault, and not the badge's
+        // cyan or a verdict's green/red, which already mean other
+        // things in this list.
+        (false, true) => colored("35", field("?")),
+        (false, false) => dim(field("✓")),
+    }
+}
+
 /// Style one log row for a pane `cols` wide. An umbrella header is a
 /// breaker across the whole pane (a-plan-name-is-a-breaker); commit
 /// shas are dim at column 2 with plain subjects; review marks
@@ -1119,13 +1165,21 @@ pub(super) fn log_row_spans(
             // Pre-watch history renders fully DIM — it's context, not
             // team activity (github-watch-resilience).
             let badge = crate::cli::log::badge_of(glyph.as_deref(), *backend);
-            let mut spans = if *baseline {
-                vec![dim(format!("{badge} {line} (pre-watch)"))]
+            let mut spans = vec![event_mark(*baseline, *unhandled)];
+            if *baseline {
+                spans.push(dim(format!("{badge} {line} (pre-watch)")));
             } else {
-                vec![colored("36", badge.to_string()), plain(format!(" {line}"))]
-            };
-            if *unhandled {
-                spans.push(colored("33", " ⚠".to_string()));
+                // The badge recedes with the state: colour is for the
+                // rows that still want someone. The describe line stays
+                // plain either way, which is what keeps a handled row
+                // from reading as pre-watch history — that one is dim
+                // all through.
+                spans.push(if *unhandled {
+                    colored("36", badge.to_string())
+                } else {
+                    dim(badge.to_string())
+                });
+                spans.push(plain(format!(" {line}")));
             }
             spans
         }
@@ -2915,12 +2969,15 @@ pub(super) fn render_event_detail(
     let ev = &ep.event;
     let clean = |s: &str| crate::cli::events::sanitize_multiline(s).replace('\n', " ");
     let mut out: Vec<String> = Vec::new();
+    // The SAME glyphs the timeline row uses. A page that called this
+    // state something else made the reader translate between two
+    // surfaces describing one fact.
     let state_hint = if ev.baseline {
         "pre-watch history"
     } else if ev.unhandled {
-        "UNHANDLED"
+        "? unanswered"
     } else {
-        "handled"
+        "✓ handled"
     };
     // The row SAYS which backend produced it. Reading it off the
     // carve-out instead labelled a sparse github event — no url, no
@@ -3036,7 +3093,11 @@ pub(super) fn render_event_detail(
     body.push(String::new());
     body.push(emit(&[dim("  copies".to_string())], "", cols));
     for m in &ev.members {
-        let state = if m.acked { "handled" } else { "UNHANDLED" };
+        let state = if m.acked {
+            "✓ handled"
+        } else {
+            "? unanswered"
+        };
         body.push(emit(
             &[plain(format!(
                 "    {}  {}@{}  {}  {}",
@@ -7654,11 +7715,11 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains("alpha  github-o-r-aaaa@3  poll  UNHANDLED"),
+            text.contains("alpha  github-o-r-aaaa@3  poll  ? unanswered"),
             "{text}"
         );
         assert!(
-            text.contains("beta  github-o-r-aaaa@3  relay  handled"),
+            text.contains("beta  github-o-r-aaaa@3  relay  ✓ handled"),
             "{text}"
         );
         assert!(text.contains("[alpha] triage and reply"), "{text}");
@@ -7973,6 +8034,207 @@ mod tests {
             visible(line_with(&out, "⌛")).contains("cargo test"),
             "the wait's own clock is the marker's"
         );
+    }
+
+    /// THE STATE LEADS EVERY EVENT ROW, in a column of its own.
+    ///
+    /// Asserted on the RENDERED row, gutter included, because the row
+    /// an operator sees is `age_gutter` plus what `log_row_spans`
+    /// builds — testing the spans alone would prove nothing about
+    /// where the mark lands or what survives a narrow pane.
+    #[test]
+    fn an_event_row_says_whether_it_wants_someone() {
+        use crate::cli::log::OnelineRow;
+        let now = crate::age::now();
+        let ev = |line: &str, unhandled: bool, baseline: bool, backend| OnelineRow::Github {
+            event_idx: 0,
+            line: line.into(),
+            unhandled,
+            baseline,
+            at: (now - 60) as u64,
+            backend,
+            glyph: None,
+        };
+        use crate::cli::github::timeline::Backend;
+        let mut s = snap_with_log(&[]);
+        s.log_rows = vec![
+            ev("LLFourn commented on o/r#602", true, false, Backend::Github),
+            ev("LLFourn merged o/r#601", false, false, Backend::Github),
+            ev("older thing on o/r#500", false, true, Backend::Github),
+            ev("story: a thing happened", true, false, Backend::Command),
+        ];
+        let out = render(&s, 40, 80);
+
+        let wants = visible(line_with(&out, "o/r#602"));
+        let handled = visible(line_with(&out, "o/r#601"));
+        let prewatch = visible(line_with(&out, "o/r#500"));
+        let cmd = visible(line_with(&out, "a thing happened"));
+
+        // Both states are MARKED. Neither is the absence of the other.
+        assert!(wants.contains("? gh"), "unanswered must say so: {wants:?}");
+        assert!(handled.contains("✓ gh"), "handled must say so: {handled:?}");
+        assert!(
+            prewatch.contains("  gh") && !prewatch.contains('?') && !prewatch.contains('✓'),
+            "pre-watch was never anyone's to answer, so it carries no mark: {prewatch:?}",
+        );
+        assert_ne!(
+            handled, prewatch,
+            "a handled row must not read as pre-watch history",
+        );
+
+        // The same marks mean the same thing on a command source.
+        assert!(cmd.contains("? cmd"), "a cmd event marks alike: {cmd:?}");
+
+        // The marks land in ONE column across rows whose describe
+        // lines differ in length.
+        let col = |l: &str| l.find(['?', '✓']).or_else(|| l.find("  gh"));
+        assert_eq!(
+            col(&wants),
+            col(&handled),
+            "marks must align: {wants:?} {handled:?}"
+        );
+
+        // The old trailing mark is gone, and not replaced by a second
+        // one: two marks for one fact is how the next one drifts.
+        for l in [&wants, &handled, &prewatch, &cmd] {
+            assert!(!l.contains('⚠'), "the trailing warning is gone: {l:?}");
+        }
+
+        // STYLE, not just text: `visible` strips escapes, so the
+        // recede is invisible to every assertion above. Colour is for
+        // the rows that still want someone.
+        let spans_of = |row: &OnelineRow| log_row_spans(row, 0, &Default::default(), 80);
+        let wants_spans = spans_of(&s.log_rows[0]);
+        let handled_spans = spans_of(&s.log_rows[1]);
+        assert!(
+            matches!(wants_spans[0].0, Style::Color("35")),
+            "the unanswered mark carries colour",
+        );
+        assert!(
+            matches!(handled_spans[0].0, Style::Dim),
+            "the handled mark recedes",
+        );
+        assert!(
+            matches!(wants_spans[1].0, Style::Color("36")),
+            "an unanswered row keeps its badge colour",
+        );
+        assert!(
+            matches!(handled_spans[1].0, Style::Dim),
+            "a handled row's badge recedes with it",
+        );
+        assert!(
+            matches!(handled_spans[2].0, Style::Plain),
+            "but its describe line stays plain, so it is not pre-watch",
+        );
+
+        // At the stated floor the state survives; the describe line is
+        // what truncation takes.
+        let narrow = render(&s, 40, super::MIN_EVENT_STATE_COLS);
+        let row = visible(line_with(&narrow, "?"));
+        assert!(
+            row.contains('?'),
+            "the state must survive the narrowest supported pane: {row:?}",
+        );
+        assert!(
+            !row.contains("o/r#602"),
+            "and the describe line is what goes first: {row:?}",
+        );
+    }
+
+    /// ACKING THE LAST COPY FLIPS THE ROW, and acking one of several
+    /// does not.
+    ///
+    /// Driven through the real `MergedEvent` -> row builder rather
+    /// than by setting `unhandled` on a row: that field is what the
+    /// whole mark hangs on, so a test that writes it directly proves
+    /// only that `event_mark` matches itself. The other half of the
+    /// chain — copies to `unhandled`, `any(!acked)` — is merge()'s,
+    /// and timeline.rs pins it there.
+    #[test]
+    fn the_row_follows_the_copies_that_are_still_owed() {
+        use crate::cli::github::timeline::{Backend, MemberKey, MemberRef, MergedEvent};
+        let member = |agent: &str, acked: bool| MemberRef {
+            key: MemberKey {
+                agent: agent.into(),
+                source: "github-o-r".into(),
+                seq: 1,
+                ident: "i".into(),
+            },
+            acked,
+            transport: crate::cli::github::log::Transport::Poll,
+            content: None,
+        };
+        let event = |members: Vec<MemberRef>| MergedEvent {
+            backend: Backend::Github,
+            glyph: None,
+            at: 1,
+            source: "o/r".into(),
+            kind: "pr_comment".into(),
+            content: Some("LLFourn commented on o/r#602".into()),
+            failure: false,
+            detail: None,
+            number: Some(602),
+            actor: Some("LLFourn".into()),
+            url: None,
+            seen_by: members.iter().map(|m| m.key.agent.clone()).collect(),
+            unhandled: members.iter().any(|m| !m.acked),
+            baseline: false,
+            members,
+        };
+        let mark_of = |ev: &MergedEvent| {
+            let rows = crate::cli::log::oneline_items_rows(
+                &[crate::cli::log::TimelineItem::Github(0, ev)],
+                &Default::default(),
+                &Default::default(),
+            );
+            let Some(row) = rows.first() else {
+                panic!("no row built")
+            };
+            let spans = log_row_spans(row, 0, &Default::default(), 80);
+            spans[0].1.trim().to_string()
+        };
+
+        // Two copies, one acked: still owed by the other.
+        let mixed = event(vec![member("alpha", true), member("beta", false)]);
+        assert_eq!(mark_of(&mixed), "?", "one ack of two leaves it owed");
+
+        // The LAST copy acks: the row flips, with no other change.
+        let all = event(vec![member("alpha", true), member("beta", true)]);
+        assert_eq!(mark_of(&all), "✓", "the last ack settles the row");
+
+        // And the page says the same words about the same two events.
+        for (ev, want) in [(&mixed, "? unanswered"), (&all, "✓ handled")] {
+            let page = super::super::input::EventPage {
+                target: ev.members[0].key.clone(),
+                retained: ev.members.iter().map(|m| m.key.clone()).collect(),
+                event: (*ev).clone(),
+                prompts: Vec::new(),
+                scroll: 0,
+                content: None,
+            };
+            let out = render_event_detail(&page, &[], 0, 40, 80);
+            // The HEADER specifically, not merely somewhere on the
+            // page: the per-copy rows carry these words too, so a
+            // page-wide `contains` passes with the header reverted.
+            // `region_rule` UPPERCASES its title, which is what tells
+            // the header apart from the per-copy rows that name the
+            // same source in lower case.
+            let header = out
+                .0
+                .iter()
+                .find(|l| visible(l).contains("GITHUB · O/R"))
+                .unwrap_or_else(|| panic!("no header in {:?}", out.0));
+            assert!(
+                visible(header).contains(want),
+                "the header must say what the row says: want {want:?} in {header:?}",
+            );
+            // And each copy says it in the same words.
+            let copies = out.0.join("\n");
+            assert!(
+                visible(&copies).contains(want),
+                "a copy must say it too: want {want:?}",
+            );
+        }
     }
 
     /// Every event in the log LEADS with how long ago it happened,
