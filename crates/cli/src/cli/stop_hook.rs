@@ -1,31 +1,89 @@
-//! `clank stop-hook --tool <claude|codex>` — the Stop-hook
-//! adapter installed into `~/.claude/settings.json` and
-//! `~/.codex/hooks.json` by `clank setup`.
+//! `clank stop-hook` — the hook adapters `clank setup` installs into
+//! `~/.claude/settings.json` and `~/.codex/hooks.json`.
 //!
-//! Reads the hook stdin JSON via `clank_core::HookInput`,
-//! computes a [`HookOutcome`] based on the calling agent's
-//! `AgentConfig.auto_mode`, and renders the outcome to the
-//! per-tool wire shape (claude: exit 2 + stderr; codex: exit
-//! 0 + stdout JSON; everything else exit 0).
+//! TWO adapters live here, for two different hook events with two
+//! different contracts. Each is a short algorithm, and the code below
+//! is those algorithms in order.
 //!
-//! Claude and Codex both keep the wait inside the Stop hook. Claude's
-//! asyncRewake mode delivers a system reminder on exit 2; its older
-//! synchronous mode and Codex also return the rendered work from the
-//! hook. A listed background wait does not change that decision.
+//! # A Stop turn
 //!
-//! The poll has THREE terminators: a wake, its own deadline, or the
-//! hook's OWN death. The deadline is derived from the ceiling clank
-//! writes into the hook config and expires cleanly BELOW it, because
-//! being killed at the ceiling surfaces to the user as a failed hook
+//! 1. **Identify.** Repo from `--repo`, else the stdin `cwd`; label
+//!    from the environment, else the binding. If the binding no longer
+//!    names this session and this tool, be Silent — someone else is
+//!    this label now.
+//! 2. **Gather.** Reads with no effects, all of them taken before
+//!    anything decides: auto mode (absent means "unset, inherit the
+//!    `~/.clank` default", never "off"), role, the attendance marker,
+//!    and whether that marker's recorded process is provably still the
+//!    process it recorded.
+//! 3. **Decide** — [`decide`], one pure function of that evidence. The
+//!    ORDER is the content: an unreadable config outranks auto-off,
+//!    auto-off outranks an unresolvable role, and only an agent that is
+//!    driving ever hears about its roster.
+//! 4. **Leave** — [`leave_projection`] applies the plan's
+//!    [`Projection`] to the marker and the decision record, once,
+//!    before any arm returns, so no exit can skip it.
+//! 5. **Run** the one effect the decision names: the hook-owned wait,
+//!    the check-in timer, or nothing.
+//! 6. **Re-check the binding** before emitting. A park can outlive the
+//!    incarnation that armed it.
+//! 7. **Render** — [`emit_and_exit`] writes the tool's wire shape.
+//!
+//! Its whole state is three files under `.clank/agents/<label>/`, and
+//! there is no fourth: `attending` (the agent's intent for ONE yield,
+//! written by `clank run` / `clank attending`, consumed here),
+//! `attended` (the projection `clank status` and the TUI read), and
+//! `attending.holder` (the identity of an armed check-in timer).
+//!
+//! # A SessionStart (`--session-start`)
+//!
+//! A different event with a different contract, so it does not share
+//! the steps above: read stdin; bind the session clank launched to its
+//! label, or identify one it did not launch by its id; stop if auto is
+//! off; peek for pending work; and if there is any, and the binding
+//! still holds, surface it on `additionalContext` so a resumed session
+//! catches up instead of waiting for its first turn-end.
+//!
+//! **Fail-open at every step, by policy:** a session start must never
+//! be broken by clank state, so every error path exits 0 and the
+//! session starts regardless. Most return QUIETLY and are meant to.
+//! The only paths that speak are the two bind-side failures in
+//! [`session_started`] — a roster tool that will not resolve, and a
+//! bind that did not land — where the diagnostic names what did not
+//! happen and the previous binding survives.
+//!
+//! # The exit contracts
+//!
+//! They are two, and they share only "never fail the agent". Reading
+//! one as the other is what merging the adapters into a single
+//! paragraph invites.
+//!
+//! **A Stop turn.** Exit 2 is Claude's continuation channel and
+//! NOTHING else: a `Continue` for Claude exits
+//! [`CLAUDE_CONTINUATION_EXIT`], which is how work reaches the
+//! session. Every other outcome — Silent, Diagnostic, Codex's block
+//! JSON, OpenCode's renew wire — exits [`HOOK_OK_EXIT`]. The
+//! invariant is about FAILURE, not about zero: **no Stop error path
+//! exits non-zero**, because every one of them becomes a
+//! [`HookOutcome::Diagnostic`] that exits 0 with a human-readable
+//! stderr line. A non-zero exit from any Stop path but Claude's
+//! continuation is a clank bug.
+//!
+//! **A SessionStart.** It produces no [`HookOutcome`] at all, so it
+//! has no Diagnostic and no continuation: every path exits 0. Its
+//! errors return QUIETLY, and the two bind-side failures that speak
+//! print to stderr and still exit 0.
+//!
+//! # The poll
+//!
+//! It has THREE terminators: a wake, its own deadline, or the hook's
+//! OWN death. The deadline is derived from the ceiling clank writes
+//! into the hook config and expires cleanly BELOW it, because being
+//! killed at the ceiling surfaces to the user as a failed hook
 //! (codex-idle-is-not-a-hook-failure). Death it learns by holding the
 //! write end of the wait's stdin pipe (remove-wait-timeout): if this
 //! process is killed — SIGKILL included, where no destructor runs —
 //! the pipe closes and the wait reaps itself.
-//!
-//! **The hook NEVER fails the agent.** Every error path
-//! produces [`HookOutcome::Diagnostic`] which exits 0 with a
-//! human-readable stderr line. A non-zero exit from this binary
-//! is a clank bug.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -134,12 +192,12 @@ async fn compute_outcome_with(
     }
     let agent_dir = crate::agent_store::agents_root(&repo).join(label.as_str());
 
-    // ONE EXIT, so the verdict below describes what the turn
-    // actually did. `plan.left()` wrote its INTENT before the park,
-    // the wait and the peek ran, and nothing updated it — so a hook
-    // that returned exit 2 with work still read `hook_held`, and the
-    // agent that had just been handed work was reported unreachable
-    // (codex 01cd4b3f1a39).
+    // ONE EXIT, so what is reported is what the turn actually did.
+    // The turn used to record its INTENT before parking, and nothing
+    // updated that record once the wait returned — so a hook that
+    // ended by handing an agent work still described itself as
+    // waiting, and that agent was reported unreachable (codex
+    // 01cd4b3f1a39).
     let outcome = async {
         // Evidence, not effects: each of these is a read that says
         // nothing about who owns what, so they can all be taken before
@@ -181,30 +239,23 @@ async fn compute_outcome_with(
             proven,
         });
 
-        // The marker is the turn's now — unless the plan yields, which
-        // leaves the attendance RUNNING. `AutoMode::Off` and the
-        // empty-items path both used to exit above the old reap, which is
-        // how markers outlived their turn.
-        if plan.takes_marker() {
-            clear_attending(&agent_dir);
-        }
+        // Both files, once, from the plan — before any arm returns, so
+        // no exit can skip it. `AutoMode::Off` and the empty-items path
+        // both used to exit above the old reap, which is how markers
+        // outlived their turn.
+        leave_projection(&agent_dir, plan.projection());
 
         let (role, route) = match plan {
             TurnPlan::Decided(decision) => {
                 return outcome_of(&decision);
             }
-            // Both attended plans record the projection the TUI reads,
-            // re-recorded after the clear above took it. Only the timer
-            // differs.
             TurnPlan::AttendedYield(proven) => {
-                record_attended(&agent_dir, proven.rec);
                 // The proof is in hand HERE — a pid the stored token
                 // still holds — so the decision is built here and the
                 // label falls out of it.
                 return outcome_of(&attended_yield(&proven));
             }
             TurnPlan::Attend(proven) => {
-                record_attended(&agent_dir, proven.rec);
                 return outcome_of(
                     &attend(
                         &proven,
@@ -227,19 +278,6 @@ async fn compute_outcome_with(
         };
 
         match route {
-            TurnRoute::Park => {
-                asyncrewake_park(
-                    &repo,
-                    &label,
-                    role,
-                    started,
-                    &live_ids,
-                    deadline_action(tool),
-                    input.session_id.as_str(),
-                    tool,
-                )
-                .await
-            }
             TurnRoute::Wait => {
                 compute_wait_outcome(
                     &repo,
@@ -318,22 +356,42 @@ pub(crate) enum Attendance {
     Declined,
 }
 
-impl TurnPlan<'_> {
-    /// Whether this turn takes the attendance marker with it.
+/// What the turn leaves in the agent's two attendance files.
+///
+/// The marker and the projection move TOGETHER — a turn that takes
+/// the marker also replaces what the projection says about it — so
+/// one value decides both and one function applies it. It used to be
+/// a `takes_marker()` bool that deleted both files, plus two
+/// `record_attended` calls putting one of them back, so `attended`
+/// briefly said the wrong thing and two call sites had to agree about
+/// when.
+enum Projection<'a> {
+    /// Yielded to this attendance: take the marker and record the
+    /// decision. The record is all a human ever sees of it — the
+    /// marker is gone within the turn, which is too short to observe.
+    Attended(&'a Attending),
+    /// Took the marker with nothing to show for it. What remains must
+    /// describe THIS turn-end and no earlier one.
+    Empty,
+    /// DECLINED: this tool cannot deliver the completion wake, which
+    /// says nothing about the work. It is still running and the record
+    /// still describes it, so neither file moves.
+    Untouched,
+}
+
+impl<'a> TurnPlan<'a> {
+    /// What this turn leaves behind.
     ///
     /// Was the ORDER of two statements — a yield returned above the
     /// consume and left it, everything below took it — which is not
     /// something a reader can check or a test can ask.
-    fn takes_marker(&self) -> bool {
+    fn projection(&self) -> Projection<'a> {
         match self {
-            // Declined for a reason that has nothing to do with the
-            // work: this tool cannot deliver the wake. Deleting the
-            // record would forget work that is still running.
-            TurnPlan::Drive(_, _, Attendance::Declined) => false,
-            TurnPlan::Decided(_)
-            | TurnPlan::Attend(_)
-            | TurnPlan::AttendedYield(_)
-            | TurnPlan::Drive(_, _, Attendance::None) => true,
+            TurnPlan::Attend(proven) | TurnPlan::AttendedYield(proven) => {
+                Projection::Attended(proven.rec)
+            }
+            TurnPlan::Drive(_, _, Attendance::Declined) => Projection::Untouched,
+            TurnPlan::Decided(_) | TurnPlan::Drive(_, _, Attendance::None) => Projection::Empty,
         }
     }
 }
@@ -370,7 +428,7 @@ fn decide(ev: TurnEvidence<'_>) -> TurnPlan<'_> {
             TurnPlan::AttendedYield(proven)
         };
     }
-    TurnPlan::Drive(role, route(ev.async_loop, ev.tool), declined)
+    TurnPlan::Drive(role, route(ev.tool), declined)
 }
 
 /// What a driving turn does next.
@@ -379,9 +437,9 @@ fn decide(ev: TurnEvidence<'_>) -> TurnPlan<'_> {
 /// read, and the effect itself is the caller's to run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TurnRoute {
-    /// Park a waiter inside this hook.
-    Park,
-    /// Run the in-hook long poll.
+    /// Run the hook-owned long poll. Every adapter that can be driven
+    /// takes this one path, in either loop mode — the asyncrewake
+    /// "park" was a second name for it, with the same call behind it.
     Wait,
     /// Nothing can drive this tool.
     Undrivable,
@@ -397,10 +455,13 @@ fn wakes_on_background_completion(tool: Tool) -> bool {
 }
 
 /// Route a driving turn to its hook-owned wait.
-fn route(async_loop: bool, tool: Tool) -> TurnRoute {
-    if async_loop {
-        return TurnRoute::Park;
-    }
+///
+/// The loop mode is NOT an input. `--loop asyncrewake` says the hook
+/// may outlive the turn, and that changes exactly one thing: whether
+/// a proven attendance holds the check-in timer. It never changed
+/// where a driving turn goes, though it used to select an arm that
+/// spelled the same call differently.
+fn route(tool: Tool) -> TurnRoute {
     match loop_policy(tool) {
         LoopPolicy::TaskCompletionWake => TurnRoute::Wait,
         // The in-hook long-poll + emit-with-items model: codex blocks
@@ -527,6 +588,15 @@ fn loop_policy(tool: Tool) -> LoopPolicy {
 /// The SessionStart payload both tools send: claude documents it,
 /// codex 0.153 carries the same fields (read from the schema in its
 /// binary and confirmed with a hook that echoed its stdin).
+// ── the SessionStart adapter (a-session-binds-itself-at-start) ──
+// A DIFFERENT hook event, sharing this file and nothing else: it does
+// not take a Stop turn, touches none of the Stop turn's three files,
+// and fails open where the Stop path diagnoses. It runs from here
+// through [`peek_items`], which no Stop path calls.
+// Kept here rather than extracted: the split that would pay has to
+// move ~3000 lines of tests with it, and a test lost in that move is
+// invisible, which is a worse failure than a long file.
+
 #[derive(serde::Deserialize)]
 struct SessionStartInput {
     session_id: String,
@@ -674,36 +744,11 @@ fn session_start_payload(items_text: &str) -> serde_json::Value {
     })
 }
 
-/// Park the hook-owned long poll. Work reaches Claude through its
-/// exit-2 continuation. An empty successful wait is diagnostic.
-async fn asyncrewake_park(
-    repo: &Path,
-    label: &AgentLabel,
-    role: Role,
-    started: std::time::Instant,
-    live_ids: &[String],
-    on_deadline: DeadlineAction,
-    session: &str,
-    tool: Tool,
-) -> HookOutcome {
-    compute_wait_outcome(
-        repo,
-        label,
-        role,
-        started,
-        live_ids,
-        on_deadline,
-        session,
-        tool,
-    )
-    .await
-}
-
 /// The peek's items for SessionStart catch-up context.
 /// Self-spawns `clank wait --peek --json` (side-effect-free: fires no
 /// hooks) and captures its stdout, never inheriting it into the hook's
 /// own protocol output.
-pub(crate) async fn peek_items(repo: &Path, label: &AgentLabel) -> Result<Vec<WaitItem>, String> {
+async fn peek_items(repo: &Path, label: &AgentLabel) -> Result<Vec<WaitItem>, String> {
     use tokio::process::Command;
 
     let exe = std::env::current_exe().map_err(|e| format!("current_exe failed: {e}"))?;
@@ -974,7 +1019,6 @@ fn attending_path(agent_dir: &Path) -> PathBuf {
     agent_dir.join("attending")
 }
 
-/// Where the hook records the attendance decision it last made.
 /// Read an agent's attendance record STRAIGHT FROM DISK.
 ///
 /// For decisions that must not run against cached state. The TUI's
@@ -987,23 +1031,11 @@ pub(crate) fn read_attended_now(repo: &Path, label: &str) -> Option<Attended> {
     serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
 }
 
+/// Where the hook records the attendance decision it last made.
 fn attended_path(agent_dir: &Path) -> PathBuf {
     agent_dir.join("attended")
 }
 
-/// The agent's intent for ONE yield: "I am ending my turn because I
-/// am waiting on this, do not nudge me for this yield."
-///
-/// Consumed by the Stop hook that reads it, so it silences at most
-/// one turn-end and can never outlive the turn that wrote it. That
-/// is the whole safety argument, and it needs no liveness check:
-/// staleness requires surviving, and this cannot.
-///
-/// The earlier design stored the same words as a claim about a
-/// DURATION — "X is running, stay silent until it stops" — which had
-/// to remain true over time, so it needed reaping, and the only
-/// reaper was the Stop hook the marker silenced. A reviewer sat
-/// mute for three hours on that.
 /// WHICH live-work signal may satisfy a marker.
 ///
 /// Without this the two correlation paths leak into each other: a
@@ -1076,6 +1108,36 @@ pub(crate) fn now_rfc3339() -> String {
         .unwrap_or_default()
 }
 
+/// The agent's intent for ONE yield: "I am ending my turn because I
+/// am waiting on this, do not nudge me for this yield."
+///
+/// READ as evidence, and consumed separately from the read. A turn
+/// reads it before deciding anything and takes it only if the plan it
+/// then forms says to: [`TurnPlan::projection`] keeps the marker
+/// when the turn DECLINED the attendance, because declining says this
+/// tool cannot deliver the completion wake — the work is still
+/// running and the record still describes it. So a marker CAN outlive
+/// the turn that read it, and it is removed only by a turn that takes
+/// it or by `clank attending --clear`.
+///
+/// It is not believed on its word either. [`prove_attendance`] yields
+/// attendance evidence only for a marker whose recorded process is
+/// still the process it recorded — a pid the stored token still holds
+/// — because pids are reused and a dead task delivers no wake.
+///
+/// An unproven marker therefore suppresses NOTHING by itself: it
+/// supplies no evidence, and the turn decides exactly as it would
+/// with no marker at all. What that is depends on the gates BEFORE
+/// it, since [`drive_gate`] runs first — auto off is silent, and an
+/// unreadable config, an unresolvable role or a passive adapter is a
+/// diagnostic, marker or no marker. Only a turn that is already
+/// driving reaches the hook-owned wait.
+///
+/// What it is NOT is a claim about a DURATION. The earlier design
+/// stored the same words as "X is running, stay silent until it
+/// stops", which had to remain true over time, so it needed reaping,
+/// and the only reaper was the Stop hook the marker silenced. A
+/// reviewer sat mute for three hours on that.
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Attending {
     pub(crate) task: String,
@@ -1371,17 +1433,6 @@ pub(crate) fn read_attended(agent_dir: &Path) -> Option<Attended> {
     serde_json::from_str::<Attended>(&raw).ok()
 }
 
-/// Take the marker, and take it WHATEVER happens next.
-///
-/// Unconditional and early by design. Every way the old code failed to
-/// reap was "the hook ran but never reached the marker" — auto off,
-/// no work, or the task still reported live — so the only deletion
-/// that closes them is one no branch can skip. Read-then-delete, never
-/// delete-if-used: a marker that survives a Stop for any reason is the
-/// duration-scoped bug returning.
-///
-/// The stale decision record goes with it, so what remains describes
-/// THIS turn-end and no earlier one.
 /// READ the marker. No effect, so it can be gathered as evidence
 /// before anything decides what the turn does.
 ///
@@ -1401,21 +1452,46 @@ fn read_attending(agent_dir: &Path) -> Option<Attending> {
 
 /// TAKE the marker: this turn owns it and the next must not see it.
 ///
+/// ONE job, and its name is the whole of it. It used to delete the
+/// projection too, which the two attended arms then wrote back — so
+/// "take the marker" meant two files and half of it was undone a few
+/// lines later.
+///
 /// Best-effort, as the read is. A marker that outlives its turn is
 /// how a finished task kept suppressing wakes.
 fn clear_attending(agent_dir: &Path) {
     let _ = std::fs::remove_file(attending_path(agent_dir));
-    let _ = std::fs::remove_file(attended_path(agent_dir));
 }
 
-/// Both, for the callers that have no decision to interleave.
+/// Apply the turn's [`Projection`] to both files. The ONLY writer of
+/// either, so what is on disk after a turn is a function of what that
+/// turn decided, and not of which arm returned.
 ///
-/// Production no longer has one: the hook reads early and clears
-/// after deciding, which is the whole point of the split.
+/// Best-effort throughout: a marker that outlives its turn silences an
+/// agent, while a projection that outlives its turn misinforms a
+/// status line. Neither is worth failing a hook over.
+fn leave_projection(agent_dir: &Path, projection: Projection<'_>) {
+    match projection {
+        Projection::Untouched => {}
+        Projection::Empty => {
+            clear_attending(agent_dir);
+            let _ = std::fs::remove_file(attended_path(agent_dir));
+        }
+        Projection::Attended(rec) => {
+            clear_attending(agent_dir);
+            record_attended(agent_dir, rec);
+        }
+    }
+}
+
+/// Read the marker and leave nothing, for tests with no plan to form.
+///
+/// Production has no such caller: it reads early, decides, and applies
+/// one projection, which is the whole point of the split.
 #[cfg(test)]
 fn consume_attending(agent_dir: &Path) -> Option<Attending> {
     let rec = read_attending(agent_dir);
-    clear_attending(agent_dir);
+    leave_projection(agent_dir, Projection::Empty);
     rec
 }
 
@@ -1888,7 +1964,7 @@ pub(crate) enum YieldTo {
 /// derives the wire reason from it, which is why
 /// [`decision_from_label`] refuses to speak for it.
 #[cfg(test)]
-pub(crate) const EVIDENCED: &[SilentReason] = &[SilentReason::AttendingBackgroundTask];
+const EVIDENCED: &[SilentReason] = &[SilentReason::AttendingBackgroundTask];
 
 /// What a bare [`SilentReason`] can honestly be classified as.
 ///
@@ -1902,7 +1978,7 @@ pub(crate) const EVIDENCED: &[SilentReason] = &[SilentReason::AttendingBackgroun
 /// its author must either give it an intent or build its decision at
 /// the producing site.
 #[cfg(test)]
-pub(crate) fn decision_from_label(why: SilentReason) -> Option<TurnDecision> {
+fn decision_from_label(why: SilentReason) -> Option<TurnDecision> {
     match why {
         // Nobody wakes this agent, and that is the answer rather than
         // a hole.
@@ -1974,6 +2050,11 @@ impl TurnDecision {
         }
     }
 }
+
+// ── the wait's wire, and how its items are phrased ──
+// Not the turn algorithm: this is the protocol the hook speaks to its
+// own `clank wait` child, and the wording an agent is woken with. The
+// Stop path uses it at step 5 and SessionStart at its peek.
 
 /// Owned, presence-tolerant mirror of `wait`'s `--json` envelope.
 /// The stop hook consumes its OWN subprocess output across a
@@ -3235,55 +3316,6 @@ mod tests {
         }
     }
 
-    /// A YIELD NAMES THE WAKER THAT PROVED ITSELF — at the site that
-    /// holds the proof.
-    ///
-    /// THE GATHERER ASKS FOR LIVENESS, not for a file.
-    ///
-    /// `reachability` being right proves nothing about what is handed
-    /// to it. Downgrading this to "a claim exists" survived the whole
-    /// suite — and it is the exact failure the check exists to catch:
-    /// a wait that DIED leaves its claim behind, and reading that as
-    /// a waker keeps the report silent on the one agent that is
-    /// actually asleep.
-
-    /// A PARK SAYS WHO IS HOLDING IT, and a reader believes only that.
-    ///
-    /// The alternative was to probe `wait.lock`: taking that exclusive
-    /// lock — even for the instant before dropping it — is
-    /// indistinguishable from a parker taking it, so a hook arriving
-    /// in that window defers to a waiter that does not exist and ends
-    /// its turn silent. A reader must not take a writer's lock to ask
-    /// who holds it.
-
-    /// THE REAL HANDOFF: what a completed hook leaves, read back by
-    /// the diagnostic.
-    ///
-    /// Every earlier test here built the reader's input by hand, so
-    /// none of them could see that the hook and the reader disagreed.
-    /// Two real turns did, and both were reported asleep while
-    /// working correctly (codex 01cd4b3f1a39):
-    ///
-    /// - a turn that ARMED the agent stamped `hook_held`, because the
-    ///   verdict was written from the plan before the effect ran;
-    /// - an attended turn CONSUMED its marker, so the reader looked
-    ///   for an attendance that the successful path had just removed.
-
-    /// THE INVARIANT, READ FROM OUTSIDE — the assertion this whole
-    /// plan exists to make checkable.
-    ///
-    /// The reported state is a turn that ENDED with nothing live to
-    /// wake the agent. Every other answer must be a REASON, because a
-    /// check that cries wolf on healthy agents gets ignored, and this
-    /// one has to be trusted the day a master is actually asleep.
-
-    /// THE WHOLE DECISION, as a table.
-    ///
-    /// Each branch here was a `return` at a different depth of
-    /// `compute_outcome_with`, so asking what a turn decides meant
-    /// building a repo that reached that depth. This asks with
-    /// values.
-
     /// A PROVEN ATTENDANCE IS ATTENDED — and only a hook that
     /// outlives the turn holds its timer.
     ///
@@ -3311,9 +3343,14 @@ mod tests {
             decide(ev(Tool::Claude, false)),
             TurnPlan::AttendedYield(_)
         ));
-        // Both own the marker: the attendance was proven from it.
-        assert!(decide(ev(Tool::Claude, true)).takes_marker());
-        assert!(decide(ev(Tool::Claude, false)).takes_marker());
+        // Both take the marker and leave the record: the attendance
+        // was proven from it, and the record is all anyone can see.
+        for async_loop in [true, false] {
+            assert!(matches!(
+                decide(ev(Tool::Claude, async_loop)).projection(),
+                Projection::Attended(_)
+            ));
+        }
 
         // A TOOL WITH NO COMPLETION WAKE attends nothing. Yielding to
         // the task would name a wake nobody delivers, and the marker
@@ -3335,7 +3372,7 @@ mod tests {
             // plan was not a `Yield`, and that flag was what cleared
             // it (grok 36518be9bfd9).
             assert!(
-                !plan.takes_marker(),
+                matches!(plan.projection(), Projection::Untouched),
                 "{tool:?} declined the attendance; it must not take its marker",
             );
         }
@@ -3350,18 +3387,110 @@ mod tests {
             proven: None,
         });
         assert!(matches!(plan, TurnPlan::Drive(_, _, Attendance::None)));
-        assert!(plan.takes_marker());
+        assert!(matches!(plan.projection(), Projection::Empty));
+    }
+
+    /// WHAT A TURN LEAVES, as a table — read off the files.
+    ///
+    /// The plan's `projection()` is only a claim; this drives the one
+    /// writer and reads both paths back, because the bug this replaces
+    /// was not in a predicate. It was that `attended` was DELETED by
+    /// the marker sweep and written back by whichever arm needed it,
+    /// so the file said the wrong thing in between and the two call
+    /// sites had to agree about when.
+    #[test]
+    fn what_a_turn_leaves_is_a_function_of_its_plan() {
+        let rec = expected(0, 300);
+        let seed = |dir: &Path| {
+            std::fs::write(
+                attending_path(dir),
+                serde_json::to_string(&rec).expect("marker"),
+            )
+            .expect("seed marker");
+            record_attended(dir, &rec);
+            assert!(attending_path(dir).exists() && attended_path(dir).exists());
+        };
+
+        // Attended: the marker is taken, the record is left.
+        let d = tempfile::tempdir().unwrap();
+        seed(d.path());
+        leave_projection(d.path(), Projection::Attended(&rec));
+        assert!(!attending_path(d.path()).exists(), "marker must be taken");
+        assert_eq!(
+            read_attended(d.path()).map(|a| a.task),
+            Some(rec.task.clone()),
+            "the record is the only thing a human sees of the marker",
+        );
+
+        // Empty: both go, so nothing describes an earlier turn-end.
+        let d = tempfile::tempdir().unwrap();
+        seed(d.path());
+        leave_projection(d.path(), Projection::Empty);
+        assert!(!attending_path(d.path()).exists(), "marker must be taken");
+        assert!(
+            !attended_path(d.path()).exists(),
+            "a turn with nothing to show must leave nothing",
+        );
+
+        // Untouched: a declined attendance is still running, so the
+        // marker AND the record it describes both survive.
+        let d = tempfile::tempdir().unwrap();
+        seed(d.path());
+        leave_projection(d.path(), Projection::Untouched);
+        assert!(
+            attending_path(d.path()).exists(),
+            "declining must not forget work that is still running",
+        );
+        assert!(attended_path(d.path()).exists(), "nor its record");
     }
 
     /// THE ROUTE, as a table.
     ///
-    /// Every tool against every disposition, in both loop modes.
-    /// The async-loop rows are the point: the park is the watcher
-    /// there, so the disposition changes nothing — a fact that was
-    /// two arms with identical bodies and no way to ask about it.
+    /// Every tool answers, and only two answers exist: the hook-owned
+    /// wait, or nothing can drive this adapter. One route for every
+    /// drivable tool is what makes `an_empty_wait_is_diagnostic` true
+    /// everywhere — it is the structural claim that test used to make
+    /// by counting occurrences of a function name.
+    #[test]
+    fn the_route_is_a_table() {
+        for (tool, want) in [
+            (Tool::Claude, TurnRoute::Wait),
+            (Tool::Codex, TurnRoute::Wait),
+            (Tool::OpenCode, TurnRoute::Wait),
+            (Tool::Grok, TurnRoute::Undrivable),
+        ] {
+            assert_eq!(route(tool), want, "{tool:?} routes elsewhere");
+        }
+    }
 
-    /// A failed peek reports the error; ready work is handed to the
-    /// agent directly, never turned into an instant-returning wait.
+    /// THE LOOP MODE CHOOSES A TIMER, NEVER A ROUTE.
+    ///
+    /// `--loop asyncrewake` says one thing — this hook can outlive the
+    /// turn — and the code must say it once. It decides whether a
+    /// proven attendance holds the check-in timer; it does not decide
+    /// where a driving turn goes. That used to be two match arms with
+    /// identical bodies, which no test could ask about, so a branch
+    /// that had stopped branching stayed for a release.
+    #[test]
+    fn the_loop_mode_changes_the_timer_not_the_route() {
+        let route_in = |tool, async_loop| match decide(TurnEvidence {
+            tool,
+            async_loop,
+            auto: Ok(AutoMode::On),
+            role: Ok(Role::Master),
+            proven: None,
+        }) {
+            TurnPlan::Drive(_, route, _) => Some(route),
+            _ => None,
+        };
+        for tool in [Tool::Claude, Tool::Codex, Tool::OpenCode, Tool::Grok] {
+            assert_eq!(
+                route_in(tool, true),
+                route_in(tool, false),
+                "{tool:?} routes differently per loop mode",
+            );
+        }
+    }
 
     /// THE DRIVE GATE, as a table.
     ///
@@ -3409,58 +3538,6 @@ mod tests {
             );
         }
     }
-
-    /// A LIVE WAKER OUTRANKS AN UNREADABLE CONFIG — under an
-    /// EXPLICIT label.
-    ///
-    /// I called this unreachable, reasoning that config.json also
-    /// holds the session binding so an unparseable one fails identity
-    /// first. That is true only of the FALLBACK path.
-    /// `resolve_identity_for_hook_in` returns `CLANK_AGENT` before it
-    /// reads any config, so under an explicit label identity succeeds,
-    /// the strict load below the yield is the first read to fail, and
-    /// the yield above it wins (codex efe2f6286cf0, reproduced
-    /// through the CLI).
-    ///
-    /// Two identity paths, two different answers to "can a broken
-    /// config be reached at all" — which is why the evidence
-    /// migration has to carry this branch rather than assume it away.
-
-    /// A LIVE WAKER OUTRANKS A BROKEN ROSTER.
-    ///
-    /// The tripwire for the hoist this plan's own wording invites.
-    /// The yields short-circuit ABOVE the role read, so an agent
-    /// whose role cannot be resolved still yields to the wait that is
-    /// demonstrably watching it. Gathering evidence "once up front"
-    /// would read the roster first and turn the same turn into a
-    /// diagnostic — an agent being woken correctly would start
-    /// reporting a failure instead (codex 31b4b49f).
-    ///
-    /// Branch priority was positional and therefore untested. If a
-    /// later change hoists the read, whether by moving the statement
-    /// or by filling a `TurnEvidence`, this is what says so.
-
-    /// WHO TAKES THE ATTENDANCE MARKER.
-    ///
-    /// The rule was the ORDER of two statements: a turn that yielded
-    /// returned above the consume and left the marker; everything
-    /// below took it. Nothing said so, and the read that could not be
-    /// moved was a read welded to a delete.
-    ///
-    /// Now it is a rule with two halves, and both are asserted —
-    /// `auto_off_still_consumes_the_marker` covers the driving side
-    /// from the other direction.
-
-    /// A YIELDING TURN STILL ENDED.
-    ///
-    /// The stamp sat below the yield, which is the commonest
-    /// turn-end there is: an agent yielding correctly to a live
-    /// registered wait recorded NOTHING, so it looked identical to
-    /// one that had never taken a turn. That is the shape of the
-    /// reported bug — a master that had not been woken, whose
-    /// history said it had never run. Milestone 4 reads these
-    /// stamps, and a stamp written only on the paths that already
-    /// work reports the health of the paths that never break.
 
     /// AN UNREADABLE HOLDER IS NOT A CANCELLATION.
     ///
@@ -3560,6 +3637,55 @@ mod tests {
         );
     }
 
+    /// THE HOLDER OUTLIVES ITS TIMER, ON PURPOSE.
+    ///
+    /// `attend` arms the holder and never removes it. A
+    /// compare-then-delete has a window in which it deletes a NEWER
+    /// attendance's holder and silences that timer — the wrong
+    /// direction — and a stale holder costs nothing, because only a
+    /// live timer ever compares against it.
+    ///
+    /// Correctness resting on an ABSENCE needs a name, or the tidying
+    /// edit that adds the delete reads as an improvement and nothing
+    /// fails. This is that name: removal belongs to
+    /// `clank attending --clear` alone, which the second half asserts
+    /// so the test says who DOES own it rather than only who does not.
+    #[tokio::test(start_paused = true)]
+    async fn the_armed_holder_is_left_for_the_next_attendance() {
+        let dir = tempfile::tempdir().unwrap();
+        let rec = expected(0, 300);
+        let since = rec
+            .expect
+            .as_ref()
+            .expect("the fixture expects")
+            .since
+            .clone();
+        let proven = Proven {
+            rec: &rec,
+            task_id: "bq1x2y3z4".into(),
+        };
+        // The work has already ended, so the timer disarms at once and
+        // returns — the ordinary way an attended turn finishes.
+        let _ = attend(&proven, dir.path(), far_ceiling(), || false, || true).await;
+
+        assert_eq!(
+            std::fs::read_to_string(holder_path(dir.path()))
+                .ok()
+                .as_deref(),
+            Some(since.as_str()),
+            "a finished timer must leave its holder, identity intact",
+        );
+
+        // And `--clear` is what takes it, so the absence this relies on
+        // has exactly one owner.
+        let cleared = clear_attendance(dir.path()).expect("clear");
+        assert!(cleared.check_in, "--clear reports the holder it removed");
+        assert!(
+            !holder_path(dir.path()).exists(),
+            "--clear owns the removal the hook declines to do",
+        );
+    }
+
     /// The attended waker is IDENTIFIED — the task the marker
     /// correlated and the pid its token still holds.
     ///
@@ -3621,9 +3747,18 @@ mod tests {
         // An intentional stop is the one case a bare label settles:
         // its whole content IS the label.
         for why in intentional {
+            let decision = decision_from_label(why).expect("an intentional stop is settled");
             assert!(
-                matches!(decision_from_label(why), Some(TurnDecision::NotOurs(_))),
+                matches!(decision, TurnDecision::NotOurs(_)),
                 "{why:?} is an intentional stop",
+            );
+            // `NotOurs` names nobody ON PURPOSE, which was a claim in
+            // `waker`'s doc that nothing asked about: every use of it
+            // asserted a `Yield`.
+            assert_eq!(
+                decision.waker(),
+                None,
+                "{why:?} stops without naming a waker",
             );
         }
 
@@ -4123,20 +4258,17 @@ mod tests {
         );
     }
 
-    /// Adding an adapter must force an answer rather than inherit one.
-
-    /// BOTH adapters surface an impossible empty success as a failure.
+    /// An impossible empty success is a failure, for every adapter.
     ///
     /// The normal wait has no successful empty exit: `--peek` returns
-    /// empty, but neither adapter passes it. Both callers of
-    /// `compute_wait_outcome` must therefore surface an empty result
-    /// from their child, including Claude's parked path.
-    ///
-    /// A note about which paths reach a hole is worth no more than its
-    /// accuracy, so this asserts it rather than asking a reader to
-    /// trust the comment.
+    /// empty, but no adapter passes it. There is ONE driving path, so
+    /// surfacing it here surfaces it everywhere — which
+    /// `the_route_is_a_table` is what proves, rather than the count of
+    /// `compute_wait_outcome(` occurrences this test used to assert.
+    /// That count pinned a forwarding wrapper whose body was the same
+    /// call, so the duplication was the thing being protected.
     #[test]
-    fn an_empty_wait_is_diagnostic_on_both_adapters() {
+    fn an_empty_wait_is_diagnostic() {
         use std::os::unix::process::ExitStatusExt;
         let label = AgentLabel::parse("rev").unwrap();
         let empty = std::process::Output {
@@ -4150,21 +4282,6 @@ mod tests {
                 message: "hook: non-peek wait exited successfully with no items".into()
             },
         );
-
-        // And BOTH callers of `compute_wait_outcome` render through it,
-        // so neither adapter is exempt. Checked in source because a
-        // real wait child would block this unit test.
-        let src = include_str!("stop_hook.rs");
-        let production = src
-            .split_once("#[cfg(test)]\nmod tests {")
-            .expect("test module follows the production code")
-            .0;
-        let callers = production.matches("compute_wait_outcome(").count();
-        assert_eq!(
-            callers, 3,
-            "expected the definition plus both production call sites; an empty result must fail on both paths",
-        );
-        assert!(production.contains("    compute_wait_outcome(\n        repo,"));
     }
 
     #[test]
@@ -4240,11 +4357,6 @@ mod tests {
         )
         .unwrap();
     }
-
-    /// A session clank launched binds itself: `startup` is the first
-    /// bind, `clear` the rebind that keeps a cleared session tracked,
-    /// `resume` and `compact` re-assert. Nothing was typed in the
-    /// session (a-session-binds-itself-at-start).
 
     /// A label that another agent held is cleared off it by the bind:
     /// one session, one label.
@@ -4413,10 +4525,6 @@ mod tests {
             }
         );
     }
-
-    /// Run the same decoded Stop path as production with no ambient
-    /// variables. Ending a turn must leave the session's claim and
-    /// waiter generation intact even when no display is attached.
 
     /// The second early return. `AutoMode::Off` exits above everything
     /// clank does, so it is the same shape as the empty-items route —

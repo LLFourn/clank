@@ -3828,13 +3828,6 @@ pub(super) fn render_error_doc(
 
 #[cfg(test)]
 mod tests {
-    /// AN AGENT WITH NO WAKER SAYS SO, ON ITS OWN ROW.
-    ///
-    /// The doctor half of this reports on demand; the panel is where
-    /// it is actually seen. Shown for that ONE state, because a row
-    /// annotated "healthy" on five separate grounds is noise nobody
-    /// reads (the-turn-end-is-one-decision).
-
     /// The icon ASKS for the emoji, in both row states.
     ///
     /// A bare `U+2601` has two presentations and leaves the choice to

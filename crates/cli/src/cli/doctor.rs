@@ -1303,10 +1303,6 @@ mod tests {
         assert_eq!(agent.status, CheckStatus::Warn);
     }
 
-    /// The report a human reads names the agent, how long it has
-    /// been asleep, and what to do — and only warns for the one
-    /// state that is a fault.
-
     #[test]
     fn check_skill_file_ok_on_match() {
         let dir = tempfile::tempdir().unwrap();

@@ -2534,13 +2534,6 @@ mod tests {
         );
     }
 
-    /// What a guard may claim, and what it must leave alone.
-    ///
-    /// Both halves came from a public-CLI probe (codex 2f38deb): a
-    /// terminal-launched wait claimed the label's bound session and
-    /// silenced a session it could never wake, and a `--peek` probe
-    /// overwrote a parked waiter's claim and deleted it on return.
-
     /// Arm-time validation refuses what cannot run, and ONLY that.    /// Arm-time validation refuses what cannot run, and ONLY that.
     ///
     /// The integration side proves `wait` refuses to arm; this side

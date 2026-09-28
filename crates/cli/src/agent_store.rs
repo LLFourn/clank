@@ -733,14 +733,6 @@ fn save_json<T: serde::Serialize>(path: &Path, value: &T) -> anyhow::Result<()> 
 
 #[cfg(test)]
 mod tests {
-    /// THE OLD BYTES. A three-field stamp is on every existing repo's
-    /// disk right now, and a reader that fails on one would report
-    /// every agent as having never ended a turn.
-    ///
-    /// Verified against this repo before the change: every agent read
-    /// as `left: None`, which is "cannot say" and does not accuse.
-
-    /// Every verdict survives the file it is written to.
     use super::*;
     use crate::cli::teams_config::{AgentDescription, RegisteredMember, RegisteredSet, RosterRole};
     use clank_core::vocab::{Role, Tool};
@@ -748,24 +740,6 @@ mod tests {
     fn label(s: &str) -> AgentLabel {
         AgentLabel::parse(s).unwrap()
     }
-
-    /// Releasing the label is the death an agent that lost its pane
-    /// can perform on itself: it stops being the label, and the wait
-    /// binding goes with it so anything parked in that name is
-    /// revoked rather than left to collect work
-    /// (nothing-refuses-in-silence).
-
-    /// The race this is compare-and-clear for: the roster reopens the
-    /// label in a fresh pane, and only THEN does the old paneless
-    /// process reach its Stop hook. It must not take the
-    /// replacement's binding with it.
-
-    /// Comparing is not enough if the compare and the write are not
-    /// the same moment. This pins the SERIALIZATION: while the
-    /// label's lock is held, a release cannot proceed — so a
-    /// replacement that binds inside that window is read by the
-    /// release when it finally runs, not overwritten by a decision
-    /// taken before it existed (codex on 7e1a33e).
 
     /// The transcript path is recorded only while the session that
     /// reported it still holds the label — a path arriving after a
